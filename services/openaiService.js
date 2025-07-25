@@ -1,46 +1,51 @@
-const { OpenAI } = require('openai');
+const OpenAI = require('openai');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 async function processImage(imageUrl) {
-  const prompt = `
-You are an expert product analyst. Analyze the image and return a JSON object with the following fields:
-
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a product recognition assistant. Given an image URL, return JSON describing the products in the photo, including:
 - product_name
 - product_title
 - category
 - description
-- condition (new, lightly used, used, unserviceable)
-- confidence (0.0–1.0)
-- price_estimate (in USD)
-- marketing_images (optional placeholder URLs)
+- condition (used, lightly used, unserviceable, new)
+- confidence (0-1)
+- price_estimate
+- marketing_images (array of URLs)`
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Please analyze this product image and return the JSON:' },
+            { type: 'image_url', image_url: { url: imageUrl } }
+          ]
+        }
+      ],
+      max_tokens: 1000,
+      temperature: 0.4
+    });
 
-Only return valid JSON — no commentary or explanation.
-`;
+    const message = response.choices[0].message.content;
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o',
-    max_tokens: 400,
-    temperature: 0.4,
-    messages: [
-      {
-        role: 'system',
-        content: 'You are a helpful assistant that returns structured JSON product data.'
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: imageUrl } }
-        ]
-      }
-    ]
-  });
+    // Find the first JSON block in the text
+    const jsonStart = message.indexOf('{');
+    const jsonEnd = message.lastIndexOf('}');
 
-  const jsonMatch = response.choices[0]?.message?.content?.match(/{[\\s\\S]+}/);
-  const result = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+    if (jsonStart === -1 || jsonEnd === -1) {
+      throw new Error('No JSON found in OpenAI response');
+    }
 
-  if (!result) throw new Error('Failed to parse OpenAI response');
-  return result;
+    const jsonText = message.slice(jsonStart, jsonEnd + 1);
+    return JSON.parse(jsonText);
+  } catch (err) {
+    console.error('🛑 OpenAI Vision error:', err);
+    throw new Error('Failed to parse OpenAI response');
+  }
 }
 
 module.exports = { processImage };
