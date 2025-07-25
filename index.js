@@ -3,7 +3,7 @@ const express = require('express');
 const multer = require('multer');
 const mongoose = require('mongoose');
 const { processImage } = require('./services/openaiService');
-const { uploadToS3 } = require('./services/s3Service');
+const { uploadToCloudinary } = require('./services/cloudinaryService');
 const Product = require('./models/Product');
 
 const app = express();
@@ -22,7 +22,7 @@ mongoose.connect(process.env.MONGODB_URI, {
 // ✅ Upload route
 app.post('/api/upload', upload.single('photo'), async (req, res) => {
   try {
-    const fileUrl = await uploadToS3(req.file);
+    const fileUrl = await uploadToCloudinary(req.file);
     const result = await processImage(fileUrl);
 
     const product = new Product({
