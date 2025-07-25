@@ -17,9 +17,9 @@ You are an expert product analyst. Analyze the image and return a JSON object wi
 
 Only return a JSON object. Do not include commentary.
 `;
-
+});
   const response = await openai.chat.completions.create({
-    model: 'gpt-4-vision-preview',
+    model: 'gpt-4o',
     max_tokens: 400,
     temperature: 0.4,
     messages: [
