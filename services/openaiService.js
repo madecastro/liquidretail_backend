@@ -46,7 +46,7 @@ async function processImage(imageUrl) {
     const dalleRes = await openai.images.generate({
       model: 'dall-e-3',
       prompt: `Professional e-commerce marketing photo of a ${productData.product_title || productData.product_name}`,
-      n: 2,
+      n: 1,
       size: '1024x1024'
     });
 
