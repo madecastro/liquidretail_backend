@@ -41,11 +41,36 @@ app.post('/api/upload', upload.single('photo'), async (req, res) => {
 // ✅ Get all products
 app.get('/api/products', async (req, res) => {
   try {
-    const products = await Product.find().sort({ createdAt: -1 });
+    const { truck, date } = req.query;
+    const filter = {};
+
+    if (truck) {
+      filter.truck_number = truck;
+    }
+
+    if (date) {
+      const start = new Date(date);
+      const end = new Date(date);
+      end.setDate(end.getDate() + 1);
+      filter.createdAt = { $gte: start, $lt: end };
+    }
+
+    const products = await Product.find(filter).sort({ createdAt: -1 });
     res.status(200).json(products);
   } catch (err) {
-    console.error('Error fetching products:', err);
+    console.error('Error filtering products:', err);
     res.status(500).json({ error: 'Failed to fetch products' });
+  }
+});
+// ✅ Delete one product
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const deleted = await Product.findByIdAndDelete(req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'Product not found' });
+    res.status(200).json({ message: 'Product deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting product:', err);
+    res.status(500).json({ error: 'Failed to delete product' });
   }
 });
 
