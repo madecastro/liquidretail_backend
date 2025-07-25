@@ -1,23 +1,22 @@
 const { OpenAI } = require('openai');
-
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 async function processImage(imageUrl) {
   const prompt = `
-You are an expert product analyst. Analyze the image and return a JSON object with the following:
+You are an expert product analyst. Analyze the image and return a JSON object with the following fields:
 
-- product_name (short noun phrase)
-- product_title (short marketing title)
-- category (broad > subcategory format)
-- description (one short sentence)
+- product_name
+- product_title
+- category
+- description
 - condition (new, lightly used, used, unserviceable)
-- confidence (float 0–1 on how certain you are about the product match)
+- confidence (0.0–1.0)
 - price_estimate (in USD)
-- marketing_images (array of 2 relevant URLs, optional or placeholders)
+- marketing_images (optional placeholder URLs)
 
-Only return a JSON object. Do not include commentary.
+Only return valid JSON — no commentary or explanation.
 `;
-});
+
   const response = await openai.chat.completions.create({
     model: 'gpt-4o',
     max_tokens: 400,
@@ -37,11 +36,10 @@ Only return a JSON object. Do not include commentary.
     ]
   });
 
-  const jsonMatch = response.choices[0]?.message?.content?.match(/{[\s\S]+}/);
+  const jsonMatch = response.choices[0]?.message?.content?.match(/{[\\s\\S]+}/);
   const result = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
 
-  if (!result) throw new Error('Unable to parse product result from OpenAI');
-
+  if (!result) throw new Error('Failed to parse OpenAI response');
   return result;
 }
 
