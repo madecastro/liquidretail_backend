@@ -38,17 +38,18 @@ app.post('/api/upload', upload.single('photo'), async (req, res) => {
   }
 });
 
-// ✅ Health check route (for Render to verify)
-app.get('/api/health', (req, res) => {
-  res.status(200).send('API is running ✅');
+// ✅ Get all products
+app.get('/api/products', async (req, res) => {
+  try {
+    const products = await Product.find().sort({ createdAt: -1 });
+    res.status(200).json(products);
+  } catch (err) {
+    console.error('Error fetching products:', err);
+    res.status(500).json({ error: 'Failed to fetch products' });
+  }
 });
 
-// ✅ Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
-// ✅ New: Get one product
+// ✅ Get one product
 app.get('/api/products/:id', async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
@@ -60,7 +61,7 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// ✅ New: Update product
+// ✅ Update product
 app.put('/api/products/:id', express.json(), async (req, res) => {
   try {
     const updated = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -72,7 +73,7 @@ app.put('/api/products/:id', express.json(), async (req, res) => {
   }
 });
 
-// ✅ New: Simulate Amazon product match
+// ✅ Simulate Amazon product match
 app.post('/api/products/:id/match-amazon', express.json(), async (req, res) => {
   try {
     const { query } = req.body;
@@ -98,4 +99,15 @@ app.post('/api/products/:id/match-amazon', express.json(), async (req, res) => {
     console.error('Error simulating Amazon match:', err);
     res.status(500).json({ error: 'Failed to search Amazon catalog' });
   }
+});
+
+// ✅ Health check route (for Render to verify)
+app.get('/api/health', (req, res) => {
+  res.status(200).send('API is running ✅');
+});
+
+// ✅ Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
