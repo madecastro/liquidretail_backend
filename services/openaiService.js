@@ -42,6 +42,16 @@ async function processImage(imageUrl) {
     const jsonText = message.slice(jsonStart, jsonEnd + 1);
     const productData = JSON.parse(jsonText);
 
+    // 🧼 Sanitize price_estimate
+    if (typeof productData.price_estimate === 'string') {
+      const match = productData.price_estimate.match(/\d+/);
+      if (match) {
+        productData.price_estimate = parseInt(match[0]);
+      } else {
+        productData.price_estimate = 0;
+      }
+    }
+
     // Step 2: Generate marketing images with DALL·E
     const dalleRes = await openai.images.generate({
       model: 'dall-e-3',
