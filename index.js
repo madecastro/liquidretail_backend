@@ -5,6 +5,8 @@ const mongoose = require('mongoose');
 const { processImage } = require('./services/openaiService');
 const { uploadToCloudinary } = require('./services/cloudinaryService');
 const Product = require('./models/Product');
+const { pushProductToShopify } = require('./services/pushToShopify');
+
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
@@ -37,7 +39,21 @@ app.post('/api/upload', upload.single('photo'), async (req, res) => {
     res.status(500).json({ error: 'Failed to process image' });
   }
 });
+app.post('/api/products/:id/push-to-shopify', async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ error: 'Product not found' });
 
+    const shopifyProduct = await pushProductToShopify(product);
+    res.status(200).json({
+      message: '✅ Product pushed to Shopify as draft',
+      shopify_product: shopifyProduct
+    });
+  } catch (err) {
+    console.error('Shopify push error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to push product to Shopify' });
+  }
+});
 // ✅ Get all products
 app.get('/api/products', async (req, res) => {
   try {
