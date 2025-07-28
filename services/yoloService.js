@@ -13,7 +13,7 @@ async function detectMultipleProducts(imageBuffer) {
     const form = new FormData();
     form.append('image', imageBuffer, { filename: 'upload.jpg' });
 
-    const res = await axios.post('https://yolo-microservice.onrender.com', form, {
+    const res = await axios.post('https://yolo-microservice.onrender.com/detect', form, {
       headers: form.getHeaders(),
       responseType: 'json'
     });
