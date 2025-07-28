@@ -7,15 +7,15 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-async function uploadToCloudinary(file) {
+async function uploadBufferToCloudinary(file) {
   const result = await cloudinary.uploader.upload(file.path, {
-    folder: 'liquidretail', // Optional: groups uploads
+    folder: 'liquidretail',
     use_filename: true,
     unique_filename: false,
     overwrite: false
   });
 
-  return result.secure_url; // ✅ Public HTTPS image URL
+  return result.secure_url;
 }
 
-module.exports = { uploadToCloudinary };
+module.exports = { uploadBufferToCloudinary };
