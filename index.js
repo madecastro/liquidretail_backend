@@ -6,12 +6,14 @@ const { processImage } = require('./services/openaiService');
 const { uploadToCloudinary } = require('./services/cloudinaryService');
 const Product = require('./models/Product');
 const { pushProductToShopify } = require('./services/pushToShopify');
+const uploadRoutes = require('./routes/upload');
 
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
 app.use(express.json());
+app.use('/api/upload', uploadRoutes);
 
 // ✅ Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
@@ -21,24 +23,6 @@ mongoose.connect(process.env.MONGODB_URI, {
 .then(() => console.log('✅ Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));
 
-// ✅ Upload route
-app.post('/api/upload', upload.single('photo'), async (req, res) => {
-  try {
-    const fileUrl = await uploadToCloudinary(req.file);
-    const result = await processImage(fileUrl);
-
-    const product = new Product({
-      image_url: fileUrl,
-      ...result
-    });
-
-    await product.save();
-    res.status(200).json(product);
-  } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ error: 'Failed to process image' });
-  }
-});
 app.post('/api/products/:id/push-to-shopify', async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);

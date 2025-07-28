@@ -12,8 +12,12 @@ const productSchema = new mongoose.Schema({
   price_estimate: Number,
   marketing_images: [String],
   shopify_status: { type: String, default: 'pending' },
-  location: String,
-  delivery_date: String
+  location: String, // consider renaming or combining with delivery_location
+  delivery_location: String,
+  delivery_date: String,
+  delivery_time: String,
+  fallback_used: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
 });
 
 module.exports = mongoose.model('Product', productSchema);

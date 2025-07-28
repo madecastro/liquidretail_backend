@@ -1,5 +1,6 @@
 const OpenAI = require('openai');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const JSON5 = require('json5');
 
 async function processImage(imageUrl) {
   try {
@@ -36,7 +37,7 @@ async function processImage(imageUrl) {
     if (!match) {
       throw new Error('No valid JSON block found in OpenAI response');
     }
-    const productData = JSON.parse(match[0]);
+    const productData = JSON5.parse(match[0]);
 
     // 🧼 Ensure numeric price
     if (typeof productData.price_estimate === 'string') {
