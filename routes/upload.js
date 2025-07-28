@@ -4,7 +4,7 @@ const router = express.Router();
 
 const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
 const { detectMultipleProducts } = require('../services/yoloService');
-const { processImage } = require('../services/openai');
+const { processImage } = require('../services/openaiService');
 const { fallbackAmazonSearch } = require('../services/amazonService');
 const Product = require('../models/Product');
 
