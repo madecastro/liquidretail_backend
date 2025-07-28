@@ -3,7 +3,7 @@ const express = require('express');
 const multer = require('multer');
 const router = express.Router();
 
-const { uploadBufferToCloudinary } = require('../services/cloudinary');
+const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
 const { detectMultipleProducts } = require('../services/yoloService');
 const { describeImage } = require('../services/openai');
 const { fallbackAmazonSearch } = require('../services/amazonService');
