@@ -26,7 +26,7 @@ router.post('/', upload.single('photo'), async (req, res) => {
       const { secure_url: image_url } = await uploadBufferToCloudinary(cropBuffer);
 
       // Step 3: Use OpenAI to describe the image
-      let productData = await describeImage(image_url);
+      let productData = await processImage(image_url);
 
       // Step 4: Fallback if confidence is low
       if (productData.confidence < 0.6) {
