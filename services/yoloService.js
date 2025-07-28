@@ -1,4 +1,3 @@
-// /services/yoloService.js
 const axios = require('axios');
 const FormData = require('form-data');
 
@@ -13,20 +12,29 @@ async function detectMultipleProducts(imageBuffer) {
     const form = new FormData();
     form.append('image', imageBuffer, { filename: 'upload.jpg' });
 
-    const res = await axios.post('https://yolo-microservice.onrender.com/detect', form, {
-      headers: form.getHeaders(),
-      responseType: 'json'
-    });
+    console.log('➡️ Sending image to YOLO microservice...');
 
-    // Expected response: [{ base64: '...', confidence: 0.85 }, ...]
-    const detections = res.data;
+    const start = Date.now();
+    const res = await axios.post(
+      'https://yolo-microservice.onrender.com/detect',
+      form,
+      {
+        headers: form.getHeaders(),
+        timeout: 20000, // 20 seconds
+        responseType: 'json'
+      }
+    );
 
-    return detections.map(det => ({
+    const duration = Date.now() - start;
+    console.log(`✅ YOLO responded in ${duration}ms`);
+    console.log(`📦 Received ${res.data.length} detections`);
+
+    return res.data.map(det => ({
       cropBuffer: Buffer.from(det.base64, 'base64'),
       confidence: det.confidence
     }));
   } catch (err) {
-    console.error('YOLO detection failed:', err.message);
+    console.error('❌ YOLO detection failed:', err.response?.data || err.message || err);
     throw new Error('Object detection failed');
   }
 }
