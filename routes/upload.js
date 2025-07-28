@@ -33,7 +33,9 @@ router.post('/', upload.single('photo'), async (req, res) => {
       const { secure_url: image_url } = await uploadBufferToCloudinary(cropBuffer);
 
       console.log('🧠 Describing product with OpenAI...');
+      console.time('🧠 OpenAI');
       let productData = await processImage(image_url);
+      console.timeEnd('🧠 OpenAI');
 
       if (productData.confidence < 0.6) {
         console.log(`🟡 Low confidence (${productData.confidence}). Using Amazon fallback...`);
@@ -63,7 +65,7 @@ router.post('/', upload.single('photo'), async (req, res) => {
       console.log(`✅ Saved product ${saved._id}`);
       results.push(saved);
     }
-
+    console.log('✅ All products saved. Sending response...');
     res.status(200).json(results);
   } catch (err) {
     console.error('Upload error:', err.message || err);
