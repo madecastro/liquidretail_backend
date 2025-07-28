@@ -1,5 +1,5 @@
 const cloudinary = require('cloudinary').v2;
-const path = require('path');
+const streamifier = require('streamifier');
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -7,15 +7,20 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-async function uploadBufferToCloudinary(file) {
-  const result = await cloudinary.uploader.upload(file.path, {
-    folder: 'liquidretail',
-    use_filename: true,
-    unique_filename: false,
-    overwrite: false
-  });
+function uploadBufferToCloudinary(buffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream({
+      folder: 'liquidretail',
+      use_filename: true,
+      unique_filename: false,
+      overwrite: false
+    }, (err, result) => {
+      if (err) return reject(err);
+      resolve(result);
+    });
 
-  return result.secure_url;
+    streamifier.createReadStream(buffer).pipe(stream);
+  });
 }
 
 module.exports = { uploadBufferToCloudinary };
