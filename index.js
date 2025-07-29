@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const app = express();
 const multer = require('multer');
 const mongoose = require('mongoose');
 const { processImage } = require('./services/openaiService');
@@ -8,10 +9,8 @@ const Product = require('./models/Product');
 const { pushProductToShopify } = require('./services/pushToShopify');
 const uploadRoutes = require('./routes/upload');
 const jobRoutes = require('./routes/jobs');
-app.use('/api/jobs', jobRoutes);
 
 
-const app = express();
 const upload = multer({ dest: 'uploads/' });
 
 app.use(express.json());
