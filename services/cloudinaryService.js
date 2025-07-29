@@ -11,7 +11,7 @@ function uploadBufferToCloudinary(buffer) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream({
       folder: 'liquidretail',
-      use_filename: true,
+      public_id: `product-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       unique_filename: false,
       overwrite: false
     }, (err, result) => {
