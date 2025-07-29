@@ -1,15 +1,14 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const Job = require('./models/Job');
 const Product = require('./models/Product');
-const crypto = require('crypto'); // at the top of file
 
 const { detectMultipleProducts } = require('./services/yoloService');
 const { uploadBufferToCloudinary } = require('./services/cloudinaryService');
 const { processImage } = require('./services/openaiService');
 const { fallbackAmazonSearch } = require('./services/amazonService');
 
-// ✅ Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true
@@ -39,9 +38,6 @@ async function processJobsLoop() {
       const detections = await detectMultipleProducts(job.fileBuffer);
       console.log(`🔍 YOLO detected ${detections.length} product(s)`);
 
-      const hash = crypto.createHash('md5').update(cropBuffer).digest('hex');
-      console.log(`📦 Crop size: ${cropBuffer.length} bytes | hash: ${hash}`);
-
       if (!Array.isArray(detections) || detections.length === 0) {
         throw new Error('No products detected in image');
       }
@@ -50,6 +46,9 @@ async function processJobsLoop() {
 
       for (const { cropBuffer } of detections) {
         try {
+          const hash = crypto.createHash('md5').update(cropBuffer).digest('hex');
+          console.log(`📦 Crop size: ${cropBuffer.length} bytes | hash: ${hash}`);
+
           const { secure_url: image_url } = await uploadBufferToCloudinary(cropBuffer);
           console.log('📸 Uploaded to Cloudinary:', image_url);
 
