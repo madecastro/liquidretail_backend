@@ -15,6 +15,7 @@ const upload = multer({ dest: 'uploads/' });
 
 app.use(express.json());
 app.use('/api/upload', uploadRoutes);
+app.use('/api/jobs', jobRoutes);
 
 // ✅ Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
