@@ -7,6 +7,8 @@ const { uploadToCloudinary } = require('./services/cloudinaryService');
 const Product = require('./models/Product');
 const { pushProductToShopify } = require('./services/pushToShopify');
 const uploadRoutes = require('./routes/upload');
+const jobRoutes = require('./routes/jobs');
+app.use('/api/jobs', jobRoutes);
 
 
 const app = express();
@@ -97,6 +99,12 @@ app.put('/api/products/:id', express.json(), async (req, res) => {
     res.status(500).json({ error: 'Failed to update product' });
   }
 });
+
+// 🔁 Run job queue processor if enabled
+if (process.env.RUN_WORKER === 'true') {
+  console.log('🔄 Starting background job processor (worker.js)...');
+  require('./worker');
+};
 
 // ✅ Simulate Amazon product match
 app.post('/api/products/:id/match-amazon', express.json(), async (req, res) => {
