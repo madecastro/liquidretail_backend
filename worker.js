@@ -2,6 +2,7 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 const Job = require('./models/Job');
 const Product = require('./models/Product');
+const crypto = require('crypto'); // at the top of file
 
 const { detectMultipleProducts } = require('./services/yoloService');
 const { uploadBufferToCloudinary } = require('./services/cloudinaryService');
@@ -37,6 +38,9 @@ async function processJobsLoop() {
 
       const detections = await detectMultipleProducts(job.fileBuffer);
       console.log(`🔍 YOLO detected ${detections.length} product(s)`);
+
+      const hash = crypto.createHash('md5').update(cropBuffer).digest('hex');
+      console.log(`📦 Crop size: ${cropBuffer.length} bytes | hash: ${hash}`);
 
       if (!Array.isArray(detections) || detections.length === 0) {
         throw new Error('No products detected in image');
