@@ -14,7 +14,7 @@ async function detectMultipleProducts(imageBuffer) {
       {
         headers: form.getHeaders(),
         responseType: 'json',
-        timeout: 15000
+        timeout: 60000
       }
     );
 
