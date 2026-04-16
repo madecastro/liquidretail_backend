@@ -5,7 +5,7 @@ const JSON5 = require('json5');
 async function processImage(imageUrl) {
   try {
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: 'gpt-4.1',
       messages: [
         {
           role: 'system',
