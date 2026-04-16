@@ -67,6 +67,9 @@ app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ error: 'Product not found' });
     const shopifyProduct = await pushProductToShopify(product);
+    product.shopify_status = 'published';
+    product.shopify_url = `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/products/${shopifyProduct.id}`;
+    await product.save();
     res.status(200).json({ message: '✅ Product pushed to Shopify as draft', shopify_product: shopifyProduct });
   } catch (err) {
     console.error('Shopify push error:', err.response?.data || err.message);
