@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const Job = require('./models/Job');
 const Product = require('./models/Product');
 
-const { detectMultipleProducts } = require('./services/yoloService');
+const { detectMultipleProducts, detectFromVideo } = require('./services/yoloService');
 const { uploadBufferToCloudinary } = require('./services/cloudinaryService');
 const { processImage } = require('./services/openaiService');
 const { fallbackAmazonSearch } = require('./services/amazonService');
@@ -33,10 +33,13 @@ async function processJobsLoop() {
         continue;
       }
 
-      console.log(`🧩 Processing job ${job._id}`);
+      console.log(`🧩 Processing job ${job._id} (${job.fileType || 'image'})`);
 
-      const detections = await detectMultipleProducts(job.fileBuffer);
-      console.log(`🔍 YOLO detected ${detections.length} product(s)`);
+      const isVideo = job.fileType === 'video';
+      const detections = isVideo
+        ? await detectFromVideo(job.fileBuffer, 'upload.mp4')
+        : await detectMultipleProducts(job.fileBuffer);
+      console.log(`🔍 YOLO detected ${detections.length} unique product(s)`);
 
       if (!Array.isArray(detections) || detections.length === 0) {
         throw new Error('No products detected in image');

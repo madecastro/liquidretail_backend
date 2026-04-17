@@ -7,10 +7,12 @@ const jobSchema = new mongoose.Schema({
     default: 'queued'
   },
   fileBuffer: Buffer,
+  fileType: { type: String, enum: ['image', 'video'], default: 'image' },
   error: String,
   products: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
   createdAt: { type: Date, default: Date.now },
-  completedAt: Date
+  completedAt: Date,
+  metadata: { type: mongoose.Schema.Types.Mixed }
 });
 
 module.exports = mongoose.model('Job', jobSchema);
