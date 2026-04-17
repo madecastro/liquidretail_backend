@@ -21,16 +21,30 @@ router.post('/', upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'File required' });
 
   const isVideo = (req.file.mimetype || '').startsWith('video/');
+  const sizeMB = (req.file.size / 1024 / 1024).toFixed(1);
+  console.log(`📥 /api/detect ${isVideo ? 'VIDEO' : 'IMAGE'} ${req.file.originalname} (${sizeMB}MB, ${req.file.mimetype})`);
+
   try {
     const result = isVideo
       ? await runVideoPipeline(req.file)
       : await runImagePipeline(req.file);
     res.json(result);
   } catch (err) {
-    console.error('Detection error:', err);
-    res.status(500).json({ error: 'Detection failed', message: err.message });
+    console.error(`❌ Detection error at stage [${err.stage || 'unknown'}]:`, err);
+    res.status(500).json({
+      error: 'Detection failed',
+      stage: err.stage || 'unknown',
+      message: err.message
+    });
   }
 });
+
+function stageError(stage, err) {
+  const e = new Error(err.message || String(err));
+  e.stage = stage;
+  e.cause = err;
+  return e;
+}
 
 // POST /api/detect/process
 // Accept approved detections, queue a pre-cropped job
@@ -100,7 +114,12 @@ async function runImagePipeline(file) {
 // 5. GPT-4.1 NER on transcript segments
 // 6. Subjects/text/crops/judge on hero frame
 async function runVideoPipeline(file) {
-  const videoUpload = await uploadBufferToCloudinary(file.buffer, { resourceType: 'video' });
+  let videoUpload;
+  try {
+    videoUpload = await uploadBufferToCloudinary(file.buffer, { resourceType: 'video' });
+  } catch (err) {
+    throw stageError('cloudinary-video-upload', err);
+  }
   const videoUrl = videoUpload.secure_url;
   console.log(`🎞️  Video uploaded: ${videoUrl}`);
 
