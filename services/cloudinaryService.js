@@ -7,18 +7,20 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-function uploadBufferToCloudinary(buffer) {
+function uploadBufferToCloudinary(buffer, opts = {}) {
   return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream({
+    const uploadOpts = {
       folder: 'liquidretail',
       public_id: `product-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       unique_filename: false,
-      overwrite: false
-    }, (err, result) => {
+      overwrite: false,
+      resource_type: opts.resourceType || 'image',
+      ...(opts.publicId ? { public_id: opts.publicId } : {})
+    };
+    const stream = cloudinary.uploader.upload_stream(uploadOpts, (err, result) => {
       if (err) return reject(err);
       resolve(result);
     });
-
     streamifier.createReadStream(buffer).pipe(stream);
   });
 }

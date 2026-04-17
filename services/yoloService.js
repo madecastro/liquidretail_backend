@@ -24,7 +24,7 @@ async function _callYolo(url, form) {
       timeout: 300000
     });
 
-    const { width, height, detections } = res.data;
+    const { width, height, detections, hero_frame } = res.data;
     console.log(`✅ YOLO responded: ${res.status} — ${detections?.length ?? 0} detection(s)`);
 
     if (!Array.isArray(detections) || detections.length === 0) {
@@ -34,6 +34,7 @@ async function _callYolo(url, form) {
     return {
       width,
       height,
+      heroFrameBase64: hero_frame || null,
       detections: detections.map((det, i) => ({
         id: `p${i + 1}`,
         cropBuffer: Buffer.from(det.base64, 'base64'),
@@ -44,7 +45,8 @@ async function _callYolo(url, form) {
         y2: det.y2,
         className: det.class_name,
         imgWidth: det.img_width,
-        imgHeight: det.img_height
+        imgHeight: det.img_height,
+        firstSeenSec: det.first_seen_sec ?? null
       }))
     };
   } catch (err) {
