@@ -21,19 +21,32 @@ async function _callYolo(url, form) {
     const res = await axios.post(url, form, {
       headers: form.getHeaders(),
       responseType: 'json',
-      timeout: 300000  // 5 min — video processing takes longer
+      timeout: 300000
     });
 
-    console.log(`✅ YOLO responded: ${res.status} — ${res.data.length} detection(s)`);
+    const { width, height, detections } = res.data;
+    console.log(`✅ YOLO responded: ${res.status} — ${detections?.length ?? 0} detection(s)`);
 
-    if (!Array.isArray(res.data) || res.data.length === 0) {
+    if (!Array.isArray(detections) || detections.length === 0) {
       throw new Error('No objects detected');
     }
 
-    return res.data.map(det => ({
-      cropBuffer: Buffer.from(det.base64, 'base64'),
-      confidence: det.confidence
-    }));
+    return {
+      width,
+      height,
+      detections: detections.map((det, i) => ({
+        id: `p${i + 1}`,
+        cropBuffer: Buffer.from(det.base64, 'base64'),
+        confidence: det.confidence,
+        x1: det.x1,
+        y1: det.y1,
+        x2: det.x2,
+        y2: det.y2,
+        className: det.class_name,
+        imgWidth: det.img_width,
+        imgHeight: det.img_height
+      }))
+    };
   } catch (err) {
     console.error('❌ YOLO detection failed:', err.response?.data || err.message);
     throw new Error('Object detection failed');
