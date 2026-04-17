@@ -11,6 +11,7 @@ const { pushProductToShopify } = require('./services/pushToShopify');
 const uploadRoutes = require('./routes/upload');
 const jobRoutes = require('./routes/jobs');
 const authRoutes = require('./routes/auth');
+const detectRoutes = require('./routes/detect');
 const requireAuth = require('./middleware/requireAuth');
 
 const app = express();
@@ -61,6 +62,7 @@ app.use('/auth', authRoutes);
 app.use(express.json());
 app.use('/api/upload', requireAuth, uploadRoutes);
 app.use('/api/jobs', requireAuth, jobRoutes);
+app.use('/api/detect', requireAuth, detectRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
   try {

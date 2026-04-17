@@ -7,7 +7,8 @@ const jobSchema = new mongoose.Schema({
     default: 'queued'
   },
   fileBuffer: Buffer,
-  fileType: { type: String, enum: ['image', 'video'], default: 'image' },
+  fileType: { type: String, enum: ['image', 'video', 'pre-cropped'], default: 'image' },
+  detectionData: { type: mongoose.Schema.Types.Mixed }, // used by pre-cropped jobs
   error: String,
   products: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
   createdAt: { type: Date, default: Date.now },
