@@ -7,9 +7,19 @@ const jobSchema = new mongoose.Schema({
     default: 'queued'
   },
   fileBuffer: Buffer,
-  fileType: { type: String, enum: ['image', 'video', 'pre-cropped'], default: 'image' },
-  detectionData: { type: mongoose.Schema.Types.Mixed }, // used by pre-cropped jobs
+  fileUrl: String,                // Cloudinary URL (used by detect-* jobs so the worker can re-fetch)
+  fileMimeType: String,
+  fileName: String,
+  fileType: {
+    type: String,
+    enum: ['image', 'video', 'pre-cropped', 'detect-image', 'detect-video'],
+    default: 'image'
+  },
+  detectionData:   { type: mongoose.Schema.Types.Mixed }, // input — old pre-cropped jobs
+  detectionResult: { type: mongoose.Schema.Types.Mixed }, // output — detect pipeline result
+  detectionStage:  String,        // current pipeline step (for progress UI)
   error: String,
+  errorStage: String,
   products: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
   createdAt: { type: Date, default: Date.now },
   completedAt: Date,

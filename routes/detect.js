@@ -3,12 +3,6 @@ const multer = require('multer');
 const router = express.Router();
 const Job = require('../models/Job');
 const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
-const { detectMultipleProducts, detectFromVideo } = require('../services/yoloService');
-const { detectSubjectsAndText } = require('../services/subjectTextService');
-const { generateSmartCrops } = require('../services/smartCropService');
-const { judgeDetections } = require('../services/judgeService');
-const { transcribeAudio } = require('../services/whisperService');
-const { extractEntities } = require('../services/nerService');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -16,38 +10,62 @@ const upload = multer({
 });
 
 // POST /api/detect
-// Detects video vs image by mime type and runs appropriate pipeline.
+// Async: upload file to Cloudinary, queue a detect-* job, return 202 { jobId }.
+// The worker picks it up and runs the full pipeline (see worker.js).
 router.post('/', upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'File required' });
 
   const isVideo = (req.file.mimetype || '').startsWith('video/');
   const sizeMB = (req.file.size / 1024 / 1024).toFixed(1);
-  console.log(`📥 /api/detect ${isVideo ? 'VIDEO' : 'IMAGE'} ${req.file.originalname} (${sizeMB}MB, ${req.file.mimetype})`);
+  console.log(`📥 /api/detect ${isVideo ? 'VIDEO' : 'IMAGE'} ${req.file.originalname} (${sizeMB}MB)`);
+
+  let metadata = {};
+  try { metadata = JSON.parse(req.body.metadata || '{}'); } catch {}
 
   try {
-    const result = isVideo
-      ? await runVideoPipeline(req.file)
-      : await runImagePipeline(req.file);
-    res.json(result);
-  } catch (err) {
-    console.error(`❌ Detection error at stage [${err.stage || 'unknown'}]:`, err);
-    res.status(500).json({
-      error: 'Detection failed',
-      stage: err.stage || 'unknown',
-      message: err.message
+    const uploaded = await uploadBufferToCloudinary(req.file.buffer, {
+      resourceType: isVideo ? 'video' : 'image'
     });
+
+    const job = new Job({
+      fileType: isVideo ? 'detect-video' : 'detect-image',
+      fileUrl: uploaded.secure_url,
+      fileMimeType: req.file.mimetype,
+      fileName: req.file.originalname,
+      status: 'queued',
+      detectionStage: 'queued',
+      metadata
+    });
+    await job.save();
+    console.log(`🆕 Detect job queued: ${job._id} (${job.fileType})`);
+    res.status(202).json({ jobId: job._id });
+  } catch (err) {
+    console.error('Upload/queue error:', err);
+    res.status(500).json({ error: 'Failed to queue detection job', message: err.message });
   }
 });
 
-function stageError(stage, err) {
-  const e = new Error(err.message || String(err));
-  e.stage = stage;
-  e.cause = err;
-  return e;
-}
+// GET /api/detect/status/:jobId
+// Poll endpoint for the frontend
+router.get('/status/:jobId', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    res.json({
+      jobId: job._id,
+      status: job.status,
+      stage: job.detectionStage,
+      result: job.status === 'completed' ? job.detectionResult : null,
+      error: job.status === 'failed' ? job.error : null,
+      errorStage: job.status === 'failed' ? job.errorStage : null
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch status', message: err.message });
+  }
+});
 
 // POST /api/detect/process
-// Accept approved detections, queue a pre-cropped job
+// Accept approved detections, queue a pre-cropped job for the main pipeline
 router.post('/process', express.json(), async (req, res) => {
   try {
     const { imageUrl, approvedBoxes, metadata } = req.body;
@@ -68,122 +86,5 @@ router.post('/process', express.json(), async (req, res) => {
     res.status(500).json({ error: 'Failed to queue job', message: err.message });
   }
 });
-
-// ── Image pipeline ────────────────────────────────────────────
-async function runImagePipeline(file) {
-  const { secure_url: imageUrl, width, height } = await uploadBufferToCloudinary(file.buffer);
-  console.log(`📸 Image uploaded: ${imageUrl} (${width}x${height})`);
-
-  let products = [];
-  try {
-    const yolo = await detectMultipleProducts(file.buffer);
-    products = yolo.detections;
-    console.log(`🔍 YOLO: ${products.length} product(s)`);
-  } catch (err) { console.warn('⚠️  YOLO:', err.message); }
-
-  let subjects = [], text = [];
-  try {
-    const st = await detectSubjectsAndText(imageUrl);
-    subjects = st.subjects; text = st.text;
-    console.log(`🧠 GPT: ${subjects.length} subject(s), ${text.length} text region(s)`);
-  } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
-
-  const imgW = width || 1024;
-  const imgH = height || 768;
-  const crops = generateSmartCrops(imgW, imgH, subjects, text);
-
-  let judge = null;
-  try {
-    judge = await judgeDetections({ imageUrl, products, subjects, text, crops });
-  } catch (err) { console.warn('⚠️  Judge:', err.message); }
-
-  return {
-    type: 'image',
-    imageUrl,
-    width: imgW, height: imgH,
-    products: products.map(({ cropBuffer, ...p }) => p),
-    subjects, text, crops, judge
-  };
-}
-
-// ── Video pipeline ────────────────────────────────────────────
-// 1. Upload video to Cloudinary (for reference playback)
-// 2. YOLO /detect-video → deduped product clippings + hero frame + per-detection timestamps
-// 3. Upload hero frame as separate image → heroImageUrl (used by subject/text/crop panels)
-// 4. Whisper transcription of audio
-// 5. GPT-4.1 NER on transcript segments
-// 6. Subjects/text/crops/judge on hero frame
-async function runVideoPipeline(file) {
-  let videoUpload;
-  try {
-    videoUpload = await uploadBufferToCloudinary(file.buffer, { resourceType: 'video' });
-  } catch (err) {
-    throw stageError('cloudinary-video-upload', err);
-  }
-  const videoUrl = videoUpload.secure_url;
-  console.log(`🎞️  Video uploaded: ${videoUrl}`);
-
-  let products = [];
-  let heroBuffer = null;
-  let heroImageUrl = null;
-  let imgW = 1024, imgH = 768;
-
-  try {
-    const yolo = await detectFromVideo(file.buffer, file.originalname);
-    products = yolo.detections;
-    imgW = yolo.width || imgW;
-    imgH = yolo.height || imgH;
-    if (yolo.heroFrameBase64) {
-      heroBuffer = Buffer.from(yolo.heroFrameBase64, 'base64');
-      const up = await uploadBufferToCloudinary(heroBuffer, { resourceType: 'image' });
-      heroImageUrl = up.secure_url;
-      console.log(`🖼️  Hero frame uploaded: ${heroImageUrl}`);
-    }
-    console.log(`🔍 YOLO video: ${products.length} product(s)`);
-  } catch (err) { console.warn('⚠️  YOLO video:', err.message); }
-
-  let transcript = null;
-  let entities = [];
-  try {
-    transcript = await transcribeAudio(file.buffer, file.originalname);
-    if (transcript) {
-      console.log(`🎙️  Transcript: ${transcript.segments.length} segment(s), ${transcript.duration.toFixed(1)}s`);
-      entities = await extractEntities(transcript);
-      console.log(`🏷️  NER: ${entities.length} entit${entities.length === 1 ? 'y' : 'ies'}`);
-    }
-  } catch (err) { console.warn('⚠️  Transcription/NER:', err.message); }
-
-  let subjects = [], text = [];
-  if (heroImageUrl) {
-    try {
-      const st = await detectSubjectsAndText(heroImageUrl);
-      subjects = st.subjects; text = st.text;
-    } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
-  }
-
-  const crops = generateSmartCrops(imgW, imgH, subjects, text);
-
-  let judge = null;
-  if (heroImageUrl) {
-    try {
-      judge = await judgeDetections({ imageUrl: heroImageUrl, products, subjects, text, crops });
-    } catch (err) { console.warn('⚠️  Judge:', err.message); }
-  }
-
-  return {
-    type: 'video',
-    videoUrl,
-    imageUrl: heroImageUrl,         // used by panels for overlays
-    width: imgW, height: imgH,
-    products: products.map(({ cropBuffer, ...p }) => p),
-    subjects, text, crops, judge,
-    transcript: transcript ? {
-      text: transcript.text,
-      duration: transcript.duration,
-      segments: transcript.segments,
-      entities
-    } : null
-  };
-}
 
 module.exports = router;
