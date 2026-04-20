@@ -1,7 +1,9 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 
-const GEMINI_MODEL = 'gemini-2.5-flash-image-preview';
+// Image-generation-capable Gemini models have been through several renames.
+// Override via GEMINI_IMAGE_MODEL if the default 404s in your region/API version.
+const GEMINI_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-2.0-flash-preview-image-generation';
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
@@ -40,7 +42,12 @@ async function runImageGen(prompt, sourceUrl) {
   const sourceBuffer = await fetchBuffer(sourceUrl);
   const sourceBase64 = sourceBuffer.toString('base64');
 
-  const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+  const model = genAI.getGenerativeModel({
+    model: GEMINI_MODEL,
+    // Image-generation models require IMAGE in responseModalities
+    generationConfig: { responseModalities: ['IMAGE', 'TEXT'] }
+  });
+
   const result = await model.generateContent([
     prompt,
     { inlineData: { mimeType: 'image/png', data: sourceBase64 } }
