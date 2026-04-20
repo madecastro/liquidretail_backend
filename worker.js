@@ -158,6 +158,14 @@ async function runDetectVideoPipeline(job, buffer) {
   await setStage(job, 'smart-crops');
   const crops = generateSmartCrops(imgW, imgH, subjects, text);
 
+  // For video jobs, attach a Cloudinary video-transform URL to each crop candidate
+  // so the UI can preview the fully cropped clip (every frame re-framed to the ratio).
+  for (const ratio of Object.keys(crops)) {
+    for (const c of crops[ratio]) {
+      c.videoUrl = buildCloudinaryCropUrl(job.fileUrl, c);
+    }
+  }
+
   let judge = null;
   if (heroImageUrl) {
     await setStage(job, 'judge');
@@ -180,6 +188,17 @@ async function runDetectVideoPipeline(job, buffer) {
       entities
     } : null
   };
+}
+
+// Build a Cloudinary video transform URL that crops every frame to the given rect.
+// Source URL shape: https://res.cloudinary.com/<cloud>/video/upload/v123.../path.mp4
+// We insert a transform between "/upload/" and the rest.
+function buildCloudinaryCropUrl(videoUrl, crop) {
+  if (!videoUrl || !videoUrl.includes('/upload/')) return null;
+  const w = Math.max(1, crop.x2 - crop.x1);
+  const h = Math.max(1, crop.y2 - crop.y1);
+  const transform = `c_crop,w_${w},h_${h},x_${crop.x1},y_${crop.y1}`;
+  return videoUrl.replace('/upload/', `/upload/${transform}/`);
 }
 
 // ──────────────────────────────────────────────────────────────
