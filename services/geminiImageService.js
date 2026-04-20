@@ -1,15 +1,15 @@
-const { GoogleGenAI } = require('@google/genai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 
 const GEMINI_MODEL = 'gemini-2.5-flash-image-preview';
-const ai = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+const genAI = process.env.GEMINI_API_KEY
+  ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
 
-function isEnabled() { return !!ai; }
+function isEnabled() { return !!genAI; }
 
 async function extendImage(sourceUrl, targetRatio, subjectDescription) {
-  if (!ai) throw new Error('GEMINI_API_KEY not set');
+  if (!genAI) throw new Error('GEMINI_API_KEY not set');
 
   const prompt =
     `Extend this product photograph naturally to a ${targetRatio} aspect ratio canvas. ` +
@@ -22,7 +22,7 @@ async function extendImage(sourceUrl, targetRatio, subjectDescription) {
 }
 
 async function generateFresh(sourceUrl, targetRatio, subjectDescription) {
-  if (!ai) throw new Error('GEMINI_API_KEY not set');
+  if (!genAI) throw new Error('GEMINI_API_KEY not set');
 
   const prompt =
     `Create a new professional e-commerce product photograph at ${targetRatio} aspect ratio. ` +
@@ -40,18 +40,13 @@ async function runImageGen(prompt, sourceUrl) {
   const sourceBuffer = await fetchBuffer(sourceUrl);
   const sourceBase64 = sourceBuffer.toString('base64');
 
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{
-      role: 'user',
-      parts: [
-        { text: prompt },
-        { inlineData: { mimeType: 'image/png', data: sourceBase64 } }
-      ]
-    }]
-  });
+  const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+  const result = await model.generateContent([
+    prompt,
+    { inlineData: { mimeType: 'image/png', data: sourceBase64 } }
+  ]);
 
-  const parts = response?.candidates?.[0]?.content?.parts || [];
+  const parts = result?.response?.candidates?.[0]?.content?.parts || [];
   for (const part of parts) {
     if (part.inlineData?.data) return part.inlineData.data;
   }
