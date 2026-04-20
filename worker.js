@@ -11,7 +11,8 @@ const { processImage } = require('./services/openaiService');
 const { fallbackAmazonSearch } = require('./services/amazonService');
 const { detectSubjectsAndText } = require('./services/subjectTextService');
 const { generateSmartCrops, computeSafeRect } = require('./services/smartCropService');
-const { judgeDetections } = require('./services/judgeService');
+const { judgeDetections, judgeExtendedCrops } = require('./services/judgeService');
+const { generateExtendedCrops } = require('./services/extendedCropsService');
 const { transcribeAudio } = require('./services/whisperService');
 const { extractEntities } = require('./services/nerService');
 
@@ -108,12 +109,30 @@ async function runDetectImagePipeline(job, buffer) {
     judge = await judgeDetections({ imageUrl: job.fileUrl, products, subjects, text, crops, safeRect });
   } catch (err) { console.warn('⚠️  Judge:', err.message); }
 
+  await setStage(job, 'extended-crops');
+  const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
+  let extendedCrops = {}, extendedJudge = {};
+  try {
+    extendedCrops = await generateExtendedCrops({
+      sourceImageUrl: job.fileUrl,
+      sourceVideoUrl: null,
+      smartCrops: crops, judge, primarySubject: primarySubjectDesc, isVideo: false
+    });
+    const totalCandidates = Object.values(extendedCrops).reduce((a, arr) => a + arr.length, 0);
+    console.log(`🖼️   Extended crops: ${totalCandidates} candidate(s) across ${Object.keys(extendedCrops).length} ratios`);
+    if (totalCandidates > 0) {
+      await setStage(job, 'judge-extended');
+      extendedJudge = await judgeExtendedCrops(extendedCrops);
+    }
+  } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
+
   return {
     type: 'image',
     imageUrl: job.fileUrl,
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
-    subjects, text, crops, judge, safeRect
+    subjects, text, crops, judge, safeRect,
+    extendedCrops, extendedJudge
   };
 }
 
@@ -181,6 +200,25 @@ async function runDetectVideoPipeline(job, buffer) {
     } catch (err) { console.warn('⚠️  Judge:', err.message); }
   }
 
+  let extendedCrops = {}, extendedJudge = {};
+  if (heroImageUrl) {
+    await setStage(job, 'extended-crops');
+    const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
+    try {
+      extendedCrops = await generateExtendedCrops({
+        sourceImageUrl: heroImageUrl,
+        sourceVideoUrl: job.fileUrl,
+        smartCrops: crops, judge, primarySubject: primarySubjectDesc, isVideo: true
+      });
+      const totalCandidates = Object.values(extendedCrops).reduce((a, arr) => a + arr.length, 0);
+      console.log(`🖼️   Extended crops (video): ${totalCandidates} candidate(s)`);
+      if (totalCandidates > 0) {
+        await setStage(job, 'judge-extended');
+        extendedJudge = await judgeExtendedCrops(extendedCrops);
+      }
+    } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
+  }
+
   return {
     type: 'video',
     videoUrl: job.fileUrl,
@@ -188,6 +226,7 @@ async function runDetectVideoPipeline(job, buffer) {
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
     subjects, text, crops, judge, safeRect,
+    extendedCrops, extendedJudge,
     transcript: transcript ? {
       text: transcript.text,
       duration: transcript.duration,

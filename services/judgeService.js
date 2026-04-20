@@ -69,4 +69,55 @@ Return ONLY valid JSON. No markdown, no explanation outside the JSON.`
   };
 }
 
-module.exports = { judgeDetections };
+// Judge extended-ratio crops (9:16 and 1.91:1). Each candidate is a fully-
+// rendered image URL produced by a different provider/strategy. We pass the
+// URLs directly to GPT-4.1 as image inputs and ask for one winner per ratio.
+async function judgeExtendedCrops(extendedCrops) {
+  const ratios = Object.keys(extendedCrops).filter(r => extendedCrops[r].length > 0);
+  if (ratios.length === 0) return {};
+
+  // Build multi-image content
+  const imageParts = [];
+  const indexLines = [];
+  for (const ratio of ratios) {
+    for (const c of extendedCrops[ratio]) {
+      indexLines.push(`[${ratio}] ${c.id} — ${c.label} (${c.provider}, ${c.variant})`);
+      imageParts.push({ type: 'image_url', image_url: { url: c.imageUrl } });
+    }
+  }
+
+  const prompt =
+    `Below are candidate outputs for additional aspect ratios. Each candidate is identified by an id of the form ` +
+    `"<ratio>-<variant>-<provider>" (plus "<ratio>-blurred" for Cloudinary blurred-pad variants).\n\n` +
+    `Candidates:\n${indexLines.join('\n')}\n\n` +
+    `Evaluate each ratio group independently. For each ratio, pick the single best candidate for e-commerce ` +
+    `marketing use — consider subject fidelity (identity/shape preserved), background quality, overall ` +
+    `composition, and absence of artifacts. Return ONLY JSON in this shape:\n` +
+    `{ "${ratios.join('": { "winnerId": "...", "reasoning": "..." }, "')}": { "winnerId": "...", "reasoning": "..." } }`;
+
+  const OpenAI = require('openai');
+  const localOpenai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  const response = await localOpenai.chat.completions.create({
+    model: 'gpt-4.1',
+    messages: [{
+      role: 'user',
+      content: [{ type: 'text', text: prompt }, ...imageParts]
+    }],
+    max_tokens: 1000,
+    temperature: 0.3
+  });
+
+  const raw = response.choices[0].message.content.trim();
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('Extended-crops judge returned no JSON');
+
+  const parsed = JSON5.parse(match[0]);
+  const out = {};
+  for (const ratio of ratios) {
+    out[ratio] = parsed[ratio] || { winnerId: extendedCrops[ratio][0].id, reasoning: '' };
+  }
+  return out;
+}
+
+module.exports = { judgeDetections, judgeExtendedCrops };
