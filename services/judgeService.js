@@ -3,12 +3,13 @@ const JSON5 = require('json5');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-async function judgeDetections({ imageUrl, products, subjects, text, crops }) {
+async function judgeDetections({ imageUrl, products, subjects, text, crops, safeRect }) {
   const payload = {
     products: products.map(p => ({ id: p.id, className: p.className, confidence: p.confidence, x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2 })),
     subjects,
     text,
-    crops
+    crops,
+    ...(safeRect ? { safeRect } : {})
   };
 
   const response = await openai.chat.completions.create({
@@ -31,6 +32,9 @@ async function judgeDetections({ imageUrl, products, subjects, text, crops }) {
 "crop_1_1": { "winnerId": "1:1-1"|"1:1-2"|"1:1-3", "reasoning": "..." }
 "crop_4_5": { "winnerId": "4:5-1"|"4:5-2"|"4:5-3", "reasoning": "..." }
   Which crop best frames the main subject for e-commerce use?
+  If "safeRect" is present, it is the union bounding box of the subject across
+  all sampled video frames — prefer crops that fully contain it so the subject
+  stays in frame throughout the clip.
 
 Return ONLY valid JSON. No markdown, no explanation outside the JSON.`
       },

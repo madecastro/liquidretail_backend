@@ -10,7 +10,7 @@ const { uploadBufferToCloudinary } = require('./services/cloudinaryService');
 const { processImage } = require('./services/openaiService');
 const { fallbackAmazonSearch } = require('./services/amazonService');
 const { detectSubjectsAndText } = require('./services/subjectTextService');
-const { generateSmartCrops } = require('./services/smartCropService');
+const { generateSmartCrops, computeSafeRect } = require('./services/smartCropService');
 const { judgeDetections } = require('./services/judgeService');
 const { transcribeAudio } = require('./services/whisperService');
 const { extractEntities } = require('./services/nerService');
@@ -98,12 +98,14 @@ async function runDetectImagePipeline(job, buffer) {
   const imgH = products[0]?.imgHeight || 768;
 
   await setStage(job, 'smart-crops');
-  const crops = generateSmartCrops(imgW, imgH, subjects, text);
+  const safeRect = computeSafeRect(products, subjects, imgW, imgH);
+  if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
+  const crops = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
 
   await setStage(job, 'judge');
   let judge = null;
   try {
-    judge = await judgeDetections({ imageUrl: job.fileUrl, products, subjects, text, crops });
+    judge = await judgeDetections({ imageUrl: job.fileUrl, products, subjects, text, crops, safeRect });
   } catch (err) { console.warn('⚠️  Judge:', err.message); }
 
   return {
@@ -111,7 +113,7 @@ async function runDetectImagePipeline(job, buffer) {
     imageUrl: job.fileUrl,
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
-    subjects, text, crops, judge
+    subjects, text, crops, judge, safeRect
   };
 }
 
@@ -156,10 +158,15 @@ async function runDetectVideoPipeline(job, buffer) {
   }
 
   await setStage(job, 'smart-crops');
-  const crops = generateSmartCrops(imgW, imgH, subjects, text);
+  // Safe envelope = union of all deduped YOLO detections (each captured from
+  // the frame where it first appeared) + primary GPT subjects on the hero frame.
+  // This approximates where the subject-of-interest lives across the whole clip.
+  const safeRect = computeSafeRect(products, subjects, imgW, imgH);
+  if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
+  const crops = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
 
-  // For video jobs, attach a Cloudinary video-transform URL to each crop candidate
-  // so the UI can preview the fully cropped clip (every frame re-framed to the ratio).
+  // Attach a Cloudinary video-transform URL to each crop candidate so the UI
+  // can preview the fully cropped clip (every frame re-framed to the ratio).
   for (const ratio of Object.keys(crops)) {
     for (const c of crops[ratio]) {
       c.videoUrl = buildCloudinaryCropUrl(job.fileUrl, c);
@@ -170,7 +177,7 @@ async function runDetectVideoPipeline(job, buffer) {
   if (heroImageUrl) {
     await setStage(job, 'judge');
     try {
-      judge = await judgeDetections({ imageUrl: heroImageUrl, products, subjects, text, crops });
+      judge = await judgeDetections({ imageUrl: heroImageUrl, products, subjects, text, crops, safeRect });
     } catch (err) { console.warn('⚠️  Judge:', err.message); }
   }
 
@@ -180,7 +187,7 @@ async function runDetectVideoPipeline(job, buffer) {
     imageUrl: heroImageUrl,
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
-    subjects, text, crops, judge,
+    subjects, text, crops, judge, safeRect,
     transcript: transcript ? {
       text: transcript.text,
       duration: transcript.duration,
