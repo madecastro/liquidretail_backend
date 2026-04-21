@@ -24,25 +24,22 @@ async function _callYolo(url, form) {
       timeout: 300000
     });
 
-    const { width, height, detections, hero_frame } = res.data;
-    console.log(`✅ YOLO responded: ${res.status} — ${detections?.length ?? 0} detection(s)`);
-
-    if (!Array.isArray(detections) || detections.length === 0) {
-      throw new Error('No objects detected');
-    }
+    const { width, height, detections, hero_frame, hero_frame_sec, hero_reason, video_duration_sec } = res.data;
+    const list = Array.isArray(detections) ? detections : [];
+    console.log(`✅ YOLO responded: ${res.status} — ${list.length} detection(s)`);
 
     return {
       width,
       height,
       heroFrameBase64: hero_frame || null,
-      detections: detections.map((det, i) => ({
+      heroFrameSec: hero_frame_sec ?? null,
+      heroReason: hero_reason || null,
+      videoDurationSec: video_duration_sec ?? null,
+      detections: list.map((det, i) => ({
         id: `p${i + 1}`,
         cropBuffer: Buffer.from(det.base64, 'base64'),
         confidence: det.confidence,
-        x1: det.x1,
-        y1: det.y1,
-        x2: det.x2,
-        y2: det.y2,
+        x1: det.x1, y1: det.y1, x2: det.x2, y2: det.y2,
         className: det.class_name,
         imgWidth: det.img_width,
         imgHeight: det.img_height,

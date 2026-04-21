@@ -67,16 +67,25 @@ async function processDetectJob(job) {
   const isVideo = job.fileType === 'detect-video';
   const fileBuffer = await downloadBuffer(job.fileUrl, 'file-download');
 
+  // Stage timings are accumulated on the job (updated by setStage) and passed
+  // into the final result so the UI can show where time was spent.
+  job._stageTimings = {};
+  job._stageStartedAt = Date.now();
+
   const result = isVideo
     ? await runDetectVideoPipeline(job, fileBuffer)
     : await runDetectImagePipeline(job, fileBuffer);
+
+  // Close out the final stage
+  finalizeStage(job);
+  result.stageTimings = job._stageTimings;
 
   job.status = 'completed';
   job.detectionStage = 'done';
   job.detectionResult = result;
   job.completedAt = new Date();
   await job.save();
-  console.log(`🎉 Detect job ${job._id} completed`);
+  console.log(`🎉 Detect job ${job._id} completed in ${Object.values(job._stageTimings).reduce((a, n) => a + n, 0)}ms`);
 }
 
 async function runDetectImagePipeline(job, buffer) {
@@ -111,13 +120,15 @@ async function runDetectImagePipeline(job, buffer) {
 
   await setStage(job, 'extended-crops');
   const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
-  let extendedCrops = {}, extendedJudge = {};
+  let extendedCrops = {}, extendedErrors = {}, extendedJudge = {};
   try {
-    extendedCrops = await generateExtendedCrops({
+    const { candidates, errors } = await generateExtendedCrops({
       sourceImageUrl: job.fileUrl,
       sourceVideoUrl: null,
       smartCrops: crops, judge, primarySubject: primarySubjectDesc, isVideo: false
     });
+    extendedCrops = candidates;
+    extendedErrors = errors;
     const totalCandidates = Object.values(extendedCrops).reduce((a, arr) => a + arr.length, 0);
     console.log(`🖼️   Extended crops: ${totalCandidates} candidate(s) across ${Object.keys(extendedCrops).length} ratios`);
     if (totalCandidates > 0) {
@@ -132,7 +143,7 @@ async function runDetectImagePipeline(job, buffer) {
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
     subjects, text, crops, judge, safeRect,
-    extendedCrops, extendedJudge
+    extendedCrops, extendedErrors, extendedJudge
   };
 }
 
@@ -140,6 +151,9 @@ async function runDetectVideoPipeline(job, buffer) {
   await setStage(job, 'yolo-video');
   let products = [];
   let heroImageUrl = null;
+  let heroFrameSec = null;
+  let heroReason = null;
+  let videoDurationSec = null;
   let imgW = 1024, imgH = 768;
 
   try {
@@ -147,11 +161,14 @@ async function runDetectVideoPipeline(job, buffer) {
     products = yolo.detections;
     imgW = yolo.width || imgW;
     imgH = yolo.height || imgH;
+    heroFrameSec = yolo.heroFrameSec;
+    heroReason = yolo.heroReason;
+    videoDurationSec = yolo.videoDurationSec;
     if (yolo.heroFrameBase64) {
       const heroBuf = Buffer.from(yolo.heroFrameBase64, 'base64');
       const up = await uploadBufferToCloudinary(heroBuf, { resourceType: 'image' });
       heroImageUrl = up.secure_url;
-      console.log(`🖼️  Hero frame uploaded: ${heroImageUrl}`);
+      console.log(`🖼️  Hero frame @ ${heroFrameSec}s (${heroReason}): ${heroImageUrl}`);
     }
   } catch (err) { console.warn('⚠️  YOLO video:', err.message); }
 
@@ -200,16 +217,18 @@ async function runDetectVideoPipeline(job, buffer) {
     } catch (err) { console.warn('⚠️  Judge:', err.message); }
   }
 
-  let extendedCrops = {}, extendedJudge = {};
+  let extendedCrops = {}, extendedErrors = {}, extendedJudge = {};
   if (heroImageUrl) {
     await setStage(job, 'extended-crops');
     const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
     try {
-      extendedCrops = await generateExtendedCrops({
+      const { candidates, errors } = await generateExtendedCrops({
         sourceImageUrl: heroImageUrl,
         sourceVideoUrl: job.fileUrl,
         smartCrops: crops, judge, primarySubject: primarySubjectDesc, isVideo: true
       });
+      extendedCrops = candidates;
+      extendedErrors = errors;
       const totalCandidates = Object.values(extendedCrops).reduce((a, arr) => a + arr.length, 0);
       console.log(`🖼️   Extended crops (video): ${totalCandidates} candidate(s)`);
       if (totalCandidates > 0) {
@@ -223,10 +242,11 @@ async function runDetectVideoPipeline(job, buffer) {
     type: 'video',
     videoUrl: job.fileUrl,
     imageUrl: heroImageUrl,
+    heroFrameSec, heroReason, videoDurationSec,
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
     subjects, text, crops, judge, safeRect,
-    extendedCrops, extendedJudge,
+    extendedCrops, extendedErrors, extendedJudge,
     transcript: transcript ? {
       text: transcript.text,
       duration: transcript.duration,
@@ -393,9 +413,20 @@ async function downloadBuffer(url, label) {
 }
 
 async function setStage(job, stage) {
+  finalizeStage(job);
+  job._stageCurrent = stage;
+  job._stageStartedAt = Date.now();
   job.detectionStage = stage;
   await job.save();
   console.log(`   → ${stage}`);
+}
+
+function finalizeStage(job) {
+  if (job._stageCurrent && job._stageStartedAt) {
+    const elapsed = Date.now() - job._stageStartedAt;
+    job._stageTimings = job._stageTimings || {};
+    job._stageTimings[job._stageCurrent] = (job._stageTimings[job._stageCurrent] || 0) + elapsed;
+  }
 }
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }

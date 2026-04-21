@@ -18,9 +18,10 @@ const NEW_RATIOS = {
 //   primarySubject    — description string or null
 //   isVideo           — bool
 //
-// Returns: { '9:16': [candidate, ...], '1.91:1': [candidate, ...] }
+// Returns: { candidates: { '9:16': [...], '1.91:1': [...] }, errors: { '9:16': [...], '1.91:1': [...] } }
 async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrops, judge, primarySubject, isVideo }) {
   const output = { '9:16': [], '1.91:1': [] };
+  const errors = { '9:16': [], '1.91:1': [] };
 
   for (const [newRatio, { baseRatio, cloudinaryAr }] of Object.entries(NEW_RATIOS)) {
     const judgeKey = 'crop_' + baseRatio.replace(':', '_');
@@ -72,30 +73,32 @@ async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrop
     }
 
     const settled = await Promise.allSettled(tasks);
-    for (const s of settled) {
-      if (s.status === 'fulfilled' && s.value) output[newRatio].push(s.value);
-      else if (s.status === 'rejected') console.warn(`⚠️  Candidate failed: ${s.reason?.message || s.reason}`);
-    }
+    settled.forEach((s, i) => {
+      if (s.status === 'fulfilled' && s.value?.imageUrl) output[newRatio].push(s.value);
+      else if (s.status === 'fulfilled' && s.value?._error) errors[newRatio].push(s.value._error);
+      else if (s.status === 'rejected') {
+        errors[newRatio].push({ label: 'Unknown', provider: 'unknown', variant: 'unknown', error: s.reason?.message || String(s.reason) });
+        console.warn(`⚠️  Candidate rejected: ${s.reason?.message || s.reason}`);
+      }
+    });
   }
 
-  return output;
+  return { candidates: output, errors };
 }
 
 async function makeProviderCandidate({ id, label, provider, variant, generator, newRatio, cloudinaryAr, isVideo, sourceVideoUrl, baseCrop }) {
   try {
     const imgBuffer = await generator();
     const up = await uploadBufferToCloudinary(imgBuffer, { resourceType: 'image' });
-    // Post-crop to exact aspect ratio via Cloudinary (gpt-image-1 sizes are approximate)
     const imageUrl = buildExactArUrl(up.secure_url, cloudinaryAr);
     let videoUrl = null;
     if (isVideo && sourceVideoUrl) {
-      // Composite: the generated still as background, original video overlaid at original ratio in center
       videoUrl = buildBackgroundCompositeVideoUrl(up.public_id, sourceVideoUrl, baseCrop, cloudinaryAr);
     }
     return { id, label, provider, variant, imageUrl, videoUrl };
   } catch (err) {
     console.warn(`⚠️  ${label} failed: ${err.message}`);
-    return null;
+    return { _error: { id, label, provider, variant, error: err.message } };
   }
 }
 
