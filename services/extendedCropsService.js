@@ -87,6 +87,7 @@ async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrop
 }
 
 async function makeProviderCandidate({ id, label, provider, variant, generator, newRatio, cloudinaryAr, isVideo, sourceVideoUrl, baseCrop }) {
+  const t0 = Date.now();
   try {
     const imgBuffer = await generator();
     const up = await uploadBufferToCloudinary(imgBuffer, { resourceType: 'image' });
@@ -95,9 +96,10 @@ async function makeProviderCandidate({ id, label, provider, variant, generator, 
     if (isVideo && sourceVideoUrl) {
       videoUrl = buildBackgroundCompositeVideoUrl(up.public_id, sourceVideoUrl, baseCrop, cloudinaryAr);
     }
+    console.log(`   ✓ ${label} [${newRatio}] ready in ${Date.now() - t0}ms`);
     return { id, label, provider, variant, imageUrl, videoUrl };
   } catch (err) {
-    console.warn(`⚠️  ${label} failed: ${err.message}`);
+    console.warn(`   ✗ ${label} [${newRatio}] failed in ${Date.now() - t0}ms: ${err.message}`);
     return { _error: { id, label, provider, variant, error: err.message } };
   }
 }
