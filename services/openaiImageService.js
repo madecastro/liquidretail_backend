@@ -64,10 +64,22 @@ async function generateFresh(sourceUrl, targetRatio, subjectDescription) {
 }
 
 // ── Helpers ──
+// Insert c_pad AFTER any existing transforms (e.g. c_crop). Cloudinary applies
+// transforms left-to-right, so placing c_pad before c_crop would pad the raw
+// source first and then try to crop with coords that no longer match — breaking
+// outpainting entirely. We insert right before the /v<num>/ segment.
 function buildPaddedTransparentUrl(url, w, h) {
   if (!url.includes('/upload/')) return url;
-  const base = url.replace(/\.(jpg|jpeg|png|webp)$/i, '.png');
-  return base.replace('/upload/', `/upload/c_pad,w_${w},h_${h},b_transparent/`);
+  // Force PNG output so the transparent padding survives
+  let png = url.replace(/\.(jpg|jpeg|webp)(\?|$)/i, '.png$2');
+  if (!/\.png(\?|$)/i.test(png)) png += '.png';
+  const transform = `c_pad,w_${w},h_${h},b_transparent`;
+  if (/\/v\d+\//.test(png)) {
+    // Insert the new transform after the existing transforms, before /v<num>/
+    return png.replace(/\/(v\d+\/)/, `/${transform}/$1`);
+  }
+  // Fallback: no version in URL — append as the only/first transform
+  return png.replace('/upload/', `/upload/${transform}/`);
 }
 
 async function fetchBuffer(url) {
