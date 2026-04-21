@@ -37,8 +37,9 @@ async function listAvailableImageModels() {
   }
 }
 
-async function extendImage(sourceUrl, targetRatio, subjectDescription) {
+async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription) {
   if (!genAI) throw new Error('GEMINI_API_KEY not set');
+  const cropUrl = buildCropUrl(sourceUrl, baseCrop);
 
   const prompt =
     `Extend this product photograph naturally to a ${targetRatio} aspect ratio canvas. ` +
@@ -46,12 +47,13 @@ async function extendImage(sourceUrl, targetRatio, subjectDescription) {
     `Extend the existing background outward, matching lighting, color palette, texture, and style. ` +
     `Do not introduce new objects. Output a single image at ${targetRatio} aspect ratio.`;
 
-  const base64 = await runImageGen(prompt, sourceUrl);
+  const base64 = await runImageGen(prompt, cropUrl);
   return Buffer.from(base64, 'base64');
 }
 
-async function generateFresh(sourceUrl, targetRatio, subjectDescription) {
+async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription) {
   if (!genAI) throw new Error('GEMINI_API_KEY not set');
+  const cropUrl = buildCropUrl(sourceUrl, baseCrop);
 
   const prompt =
     `Create a new professional e-commerce product photograph at ${targetRatio} aspect ratio. ` +
@@ -61,8 +63,17 @@ async function generateFresh(sourceUrl, targetRatio, subjectDescription) {
     `Use soft professional lighting with the subject as the clear focal point. ` +
     `Output a single image at ${targetRatio} aspect ratio.`;
 
-  const base64 = await runImageGen(prompt, sourceUrl);
+  const base64 = await runImageGen(prompt, cropUrl);
   return Buffer.from(base64, 'base64');
+}
+
+function buildCropUrl(sourceUrl, baseCrop) {
+  if (!sourceUrl || !sourceUrl.includes('/upload/')) return sourceUrl;
+  const cw = Math.max(1, baseCrop.x2 - baseCrop.x1);
+  const ch = Math.max(1, baseCrop.y2 - baseCrop.y1);
+  const crop = `c_crop,w_${cw},h_${ch},x_${baseCrop.x1},y_${baseCrop.y1}`;
+  if (/\/v\d+\//.test(sourceUrl)) return sourceUrl.replace(/\/(v\d+\/)/, `/${crop}/$1`);
+  return sourceUrl.replace('/upload/', `/upload/${crop}/`);
 }
 
 async function runImageGen(prompt, sourceUrl) {

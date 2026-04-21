@@ -108,7 +108,7 @@ async function runDetectImagePipeline(job, buffer) {
   const imgH = products[0]?.imgHeight || 768;
 
   await setStage(job, 'smart-crops');
-  const safeRect = computeSafeRect(products, subjects, imgW, imgH);
+  const safeRect = computeSafeRect(products, subjects, imgW, imgH, text);
   if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
   const crops = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
 
@@ -197,7 +197,7 @@ async function runDetectVideoPipeline(job, buffer) {
   // Safe envelope = union of all deduped YOLO detections (each captured from
   // the frame where it first appeared) + primary GPT subjects on the hero frame.
   // This approximates where the subject-of-interest lives across the whole clip.
-  const safeRect = computeSafeRect(products, subjects, imgW, imgH);
+  const safeRect = computeSafeRect(products, subjects, imgW, imgH, text);
   if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
   const crops = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
 

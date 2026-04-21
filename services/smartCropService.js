@@ -143,9 +143,12 @@ function clampInt(v, min, max) {
   return Math.round(Math.min(max, Math.max(min, v)));
 }
 
-// Compute the union bounding box of YOLO detections + primary-role GPT subjects.
+// Compute the union bounding box of YOLO detections + primary-role GPT subjects
+// + (optionally) text regions. Text is included by default so the crop engine
+// never bisects a product label/brand/part-number block — a partial "RIDG..."
+// reads as noise, while a fully-contained "RIDGID" stays useful to buyers.
 // Returns pixel coords in the hero-frame coordinate system, or null if no signal.
-function computeSafeRect(products, subjects, imgW, imgH) {
+function computeSafeRect(products, subjects, imgW, imgH, textRegions = []) {
   const boxes = [];
   for (const p of products || []) {
     boxes.push({ x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2 });
@@ -157,6 +160,12 @@ function computeSafeRect(products, subjects, imgW, imgH) {
         x2: s.x2 * imgW, y2: s.y2 * imgH
       });
     }
+  }
+  for (const t of textRegions || []) {
+    boxes.push({
+      x1: t.x1 * imgW, y1: t.y1 * imgH,
+      x2: t.x2 * imgW, y2: t.y2 * imgH
+    });
   }
   if (!boxes.length) return null;
   return {
