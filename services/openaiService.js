@@ -2,7 +2,14 @@ const OpenAI = require('openai');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const JSON5 = require('json5');
 
+// Identify a product from a cropped image via GPT-4.1 vision. DALL-E marketing
+// image generation is a *best-effort* follow-up — if it fails (rate limit,
+// content policy, org verification delay), we still return the identification
+// so the product can be saved.
 async function processImage(imageUrl) {
+  let productData;
+
+  // ── 1. Identification (required) ──
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4.1',
@@ -16,7 +23,9 @@ async function processImage(imageUrl) {
 - description
 - condition (used, lightly used, unserviceable, new)
 - confidence (0 to 1)
-- price_estimate`
+- price_estimate
+
+Return ONLY the JSON object. No markdown fences, no prose before or after.`
         },
         {
           role: 'user',
@@ -32,41 +41,39 @@ async function processImage(imageUrl) {
 
     const message = response.choices[0].message.content;
 
-    // ✅ Robust JSON extraction
-    const match = message.match(/\{[\s\S]*?\}/);
-    if (!match) {
-      throw new Error('No valid JSON block found in OpenAI response');
-    }
-    const productData = JSON5.parse(match[0]);
+    // Greedy match so nested JSON (e.g. attributes, dimensions) is captured in full.
+    const match = message.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('No JSON block found in GPT response');
+    productData = JSON5.parse(match[0]);
 
-    // 🧼 Ensure numeric price
+    // Normalize types
     if (typeof productData.price_estimate === 'string') {
-      const match = productData.price_estimate.match(/\d+/);
-      productData.price_estimate = match ? parseInt(match[0], 10) : 0;
+      const n = productData.price_estimate.match(/\d+/);
+      productData.price_estimate = n ? parseInt(n[0], 10) : 0;
     }
-
-    // 🧠 Normalize confidence
-    productData.confidence = Math.min(1, Math.max(0, parseFloat(productData.confidence || 0.5)));
-
-    // 🛡️ Default titles if missing
+    productData.confidence   = Math.min(1, Math.max(0, parseFloat(productData.confidence) || 0.5));
     productData.product_name = productData.product_name || 'Unknown Product';
     productData.product_title = productData.product_title || productData.product_name;
+  } catch (err) {
+    console.error('🛑 OpenAI identify failed:', err.status || '', err.code || '', err.message || err);
+    throw new Error(`Product identification failed: ${err.message || err}`);
+  }
 
-    // 🎨 Generate marketing images
+  // ── 2. DALL-E marketing image (best-effort, failures don't abort) ──
+  productData.marketing_images = [];
+  try {
     const dalleRes = await openai.images.generate({
       model: 'dall-e-3',
       prompt: `Professional e-commerce marketing photo of a ${productData.product_title}`,
       n: 1,
       size: '1024x1024'
     });
-
     productData.marketing_images = dalleRes.data.map(img => img.url);
-
-    return productData;
   } catch (err) {
-    console.error('🛑 OpenAI error:', err);
-    throw new Error('Failed to process image with OpenAI');
+    console.warn(`⚠️  DALL-E marketing image failed (${err.status || ''} ${err.code || ''}): ${err.message || err} — saving product without marketing image`);
   }
+
+  return productData;
 }
 
 module.exports = { processImage };
