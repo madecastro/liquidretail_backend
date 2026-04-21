@@ -51,7 +51,10 @@ async function discoverModels() {
     }));
 
     const supportsGen = m => m.methods.includes('generateContent');
-    const nameMatches = n => /image|vision|2\.\d-flash/i.test(n);
+    // Must have "image" or "imagen" in the name to actually output images.
+    // Older regex matched any "2.X-flash" which pulled in text-only models
+    // like gemini-2.5-flash and caused 400 "only supports text output" errors.
+    const nameMatches = n => /(^|-)imag(e|en)(-|$)/i.test(n);
 
     const imgCapable = all.filter(m => supportsGen(m) && nameMatches(m.name)).map(m => m.name);
     const allGen     = all.filter(supportsGen).map(m => m.name);
@@ -143,9 +146,11 @@ async function runImageGen(prompt, sourceUrl) {
       lastErr = new Error(`${modelName}: no image data in response (text-only model)`);
     } catch (err) {
       lastErr = err;
-      // 404 / not found → try next. Auth/quota errors → stop so we don't hammer the API.
+      // Keep trying next candidate on: 404, unknown method, text-only (wrong modality),
+      // unsupported arguments. Stop on auth/quota so we don't hammer the API.
       const msg = err.message || '';
-      if (!/404|not found|not supported/i.test(msg)) break;
+      const skippable = /404|not found|not supported|only supports text|modalit|unsupported/i;
+      if (!skippable.test(msg)) break;
     }
   }
   throw lastErr || new Error('Gemini image generation failed (no model succeeded)');
