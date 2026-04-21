@@ -3,6 +3,7 @@ const multer = require('multer');
 const router = express.Router();
 const Job = require('../models/Job');
 const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
+const geminiImg = require('../services/geminiImageService');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -84,6 +85,19 @@ router.post('/process', express.json(), async (req, res) => {
   } catch (err) {
     console.error('Process error:', err);
     res.status(500).json({ error: 'Failed to queue job', message: err.message });
+  }
+});
+
+// Diagnostic: GET /api/detect/gemini-models
+// Returns the list of Gemini models this API key can see (and which ones look
+// image-generation-capable). Useful for diagnosing 404s without deploy cycles.
+router.get('/gemini-models', async (req, res) => {
+  try {
+    if (!geminiImg.isEnabled()) return res.json({ enabled: false, reason: 'GEMINI_API_KEY not set' });
+    const models = await geminiImg.discoverModels();
+    res.json({ enabled: true, imageCapable: models });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

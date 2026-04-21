@@ -1,40 +1,74 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 
-// Image-gen model naming has churned. We try an ordered list until one works,
-// then cache the winner for the rest of the process.
-const MODEL_FALLBACKS = [
-  process.env.GEMINI_IMAGE_MODEL,                          // user override, if set
+// Override via GEMINI_IMAGE_MODEL if you want to lock to a specific model name.
+// Otherwise we probe ListModels at startup and pick the first image-capable one.
+const USER_OVERRIDE = process.env.GEMINI_IMAGE_MODEL;
+
+// Known-good model names tried in order as a secondary fallback after ListModels.
+const KNOWN_MODELS = [
   'gemini-2.5-flash-image-preview',
+  'gemini-2.5-flash-image',
   'gemini-2.0-flash-exp-image-generation',
   'gemini-2.0-flash-preview-image-generation'
-].filter(Boolean);
-
-let cachedWorkingModel = null;
+];
 
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
 
+let cachedWorkingModel = null;
+let discoveredCandidates = null; // populated by probe on first use
+
 function isEnabled() { return !!genAI; }
 
-// List all models the API key can see. Useful for debugging 404s —
-// run on first failure so the Render logs show the actual available names.
-async function listAvailableImageModels() {
+// Discover every model this API key can see (ListModels via REST — the SDK
+// doesn't expose this directly). Filter to anything plausibly image-generation
+// capable: name mentions image OR it's a gemini-*-flash variant.
+async function discoverModels() {
+  if (discoveredCandidates !== null) return discoveredCandidates;
+  if (!process.env.GEMINI_API_KEY) { discoveredCandidates = []; return []; }
+
   try {
     const res = await axios.get(
       `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`,
       { timeout: 15000 }
     );
-    const all = res.data?.models || [];
-    return all.filter(m =>
-      (m.supportedGenerationMethods || []).includes('generateContent') &&
-      /(image|vision|imagen|2\.\d-flash)/i.test(m.name)
-    ).map(m => m.name.replace(/^models\//, ''));
+    const all = (res.data?.models || []).map(m => ({
+      name: (m.name || '').replace(/^models\//, ''),
+      methods: m.supportedGenerationMethods || []
+    }));
+
+    const supportsGen = m => m.methods.includes('generateContent');
+    const nameMatches = n => /image|vision|2\.\d-flash/i.test(n);
+
+    const imgCapable = all.filter(m => supportsGen(m) && nameMatches(m.name)).map(m => m.name);
+    const allGen     = all.filter(supportsGen).map(m => m.name);
+
+    console.log(`🔎 Gemini ListModels: ${all.length} total, ${allGen.length} support generateContent, ${imgCapable.length} look image-capable`);
+    if (imgCapable.length) console.log(`   image-capable: ${imgCapable.join(', ')}`);
+    if (allGen.length && !imgCapable.length) console.log(`   (none matched image-name regex — all generate-capable: ${allGen.join(', ')})`);
+
+    discoveredCandidates = imgCapable;
+    return discoveredCandidates;
   } catch (err) {
-    console.warn('ListModels probe failed:', err.message);
+    console.warn('⚠️  Gemini ListModels failed:', err.response?.data || err.message);
+    discoveredCandidates = [];
     return [];
   }
+}
+
+// Build the ordered list of model names to try for this call.
+async function candidateModels() {
+  const ordered = [];
+  if (USER_OVERRIDE) ordered.push(USER_OVERRIDE);
+  if (cachedWorkingModel && !ordered.includes(cachedWorkingModel)) ordered.push(cachedWorkingModel);
+
+  const discovered = await discoverModels();
+  for (const n of discovered) if (!ordered.includes(n)) ordered.push(n);
+  for (const n of KNOWN_MODELS) if (!ordered.includes(n)) ordered.push(n);
+
+  return ordered;
 }
 
 async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription) {
@@ -47,8 +81,7 @@ async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription)
     `Extend the existing background outward, matching lighting, color palette, texture, and style. ` +
     `Do not introduce new objects. Output a single image at ${targetRatio} aspect ratio.`;
 
-  const base64 = await runImageGen(prompt, cropUrl);
-  return Buffer.from(base64, 'base64');
+  return Buffer.from(await runImageGen(prompt, cropUrl), 'base64');
 }
 
 async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription) {
@@ -63,27 +96,17 @@ async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescriptio
     `Use soft professional lighting with the subject as the clear focal point. ` +
     `Output a single image at ${targetRatio} aspect ratio.`;
 
-  const base64 = await runImageGen(prompt, cropUrl);
-  return Buffer.from(base64, 'base64');
-}
-
-function buildCropUrl(sourceUrl, baseCrop) {
-  if (!sourceUrl || !sourceUrl.includes('/upload/')) return sourceUrl;
-  const cw = Math.max(1, baseCrop.x2 - baseCrop.x1);
-  const ch = Math.max(1, baseCrop.y2 - baseCrop.y1);
-  const crop = `c_crop,w_${cw},h_${ch},x_${baseCrop.x1},y_${baseCrop.y1}`;
-  if (/\/v\d+\//.test(sourceUrl)) return sourceUrl.replace(/\/(v\d+\/)/, `/${crop}/$1`);
-  return sourceUrl.replace('/upload/', `/upload/${crop}/`);
+  return Buffer.from(await runImageGen(prompt, cropUrl), 'base64');
 }
 
 async function runImageGen(prompt, sourceUrl) {
   const sourceBuffer = await fetchBuffer(sourceUrl);
   const sourceBase64 = sourceBuffer.toString('base64');
+  const candidates = await candidateModels();
 
-  // If we already know a working model, try it first.
-  const candidates = cachedWorkingModel
-    ? [cachedWorkingModel, ...MODEL_FALLBACKS.filter(m => m !== cachedWorkingModel)]
-    : [...MODEL_FALLBACKS];
+  if (!candidates.length) {
+    throw new Error('No Gemini models available for this API key. Check Gemini API access in your Google Cloud project.');
+  }
 
   let lastErr = null;
   for (const modelName of candidates) {
@@ -101,31 +124,29 @@ async function runImageGen(prompt, sourceUrl) {
         if (part.inlineData?.data) {
           if (cachedWorkingModel !== modelName) {
             cachedWorkingModel = modelName;
-            console.log(`✅ Gemini image model: ${modelName} (cached)`);
+            console.log(`✅ Gemini cached working model: ${modelName}`);
           }
           return part.inlineData.data;
         }
       }
-      lastErr = new Error(`${modelName}: no image data in response`);
+      lastErr = new Error(`${modelName}: no image data in response (text-only model)`);
     } catch (err) {
       lastErr = err;
-      // 404 = wrong name → try next. Anything else (403/429/etc.) → surface immediately.
-      if (!/404/.test(err.message)) break;
+      // 404 / not found → try next. Auth/quota errors → stop so we don't hammer the API.
+      const msg = err.message || '';
+      if (!/404|not found|not supported/i.test(msg)) break;
     }
   }
-
-  // On complete failure, probe ListModels once so the Render logs show available model names
-  if (!cachedWorkingModel) {
-    const available = await listAvailableImageModels();
-    if (available.length) {
-      console.warn(`ℹ️   Available image-capable Gemini models for this key: ${available.join(', ')}`);
-      console.warn(`     Set GEMINI_IMAGE_MODEL=<name> to use one.`);
-    } else {
-      console.warn(`ℹ️   No image-capable Gemini models returned by ListModels for this key.`);
-    }
-  }
-
   throw lastErr || new Error('Gemini image generation failed (no model succeeded)');
+}
+
+function buildCropUrl(sourceUrl, baseCrop) {
+  if (!sourceUrl || !sourceUrl.includes('/upload/')) return sourceUrl;
+  const cw = Math.max(1, baseCrop.x2 - baseCrop.x1);
+  const ch = Math.max(1, baseCrop.y2 - baseCrop.y1);
+  const crop = `c_crop,w_${cw},h_${ch},x_${baseCrop.x1},y_${baseCrop.y1}`;
+  if (/\/v\d+\//.test(sourceUrl)) return sourceUrl.replace(/\/(v\d+\/)/, `/${crop}/$1`);
+  return sourceUrl.replace('/upload/', `/upload/${crop}/`);
 }
 
 async function fetchBuffer(url) {
@@ -133,4 +154,7 @@ async function fetchBuffer(url) {
   return Buffer.from(res.data);
 }
 
-module.exports = { extendImage, generateFresh, isEnabled };
+// Probe once at module load so the Render log tells us what's available.
+if (genAI) discoverModels();
+
+module.exports = { extendImage, generateFresh, isEnabled, discoverModels };
