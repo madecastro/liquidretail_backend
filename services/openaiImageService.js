@@ -35,8 +35,9 @@ async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription)
   const maskPng   = await buildOutpaintMask(placedX, placedY, placedW, placedH, canvasW, canvasH);
 
   const prompt =
-    `Outpaint this image. The central opaque region contains a product photograph that you MUST preserve byte-for-byte — do not modify, redraw, or regenerate any of its pixels. Generate new content ONLY in the transparent padded regions. Extend the existing background naturally from the edges of the preserved region: match lighting direction, color palette, perspective, and surface texture. Do not add new objects. The output should feel like a seamlessly wider/taller version of the same photograph.` +
-    (subjectDescription ? ` The preserved subject is: ${subjectDescription}.` : '');
+    `TASK: Outpainting / image-extension only. The provided image has a centered product photograph surrounded by transparent padding. The MASK marks the padded regions as editable (transparent) and the product region as preserved (opaque). ` +
+    `STRICT RULES: (1) Do NOT change, redraw, recolor, or regenerate the product, its shape, its packaging, its label, or any of its pixels. (2) Only fill the mask-editable regions. (3) Extend the surrounding background (surface, lighting, color, texture) naturally outward from the edges of the preserved region — like zooming out on the same photograph. (4) Do not add props, text, or new objects. ` +
+    (subjectDescription ? `The preserved product is: ${subjectDescription}.` : '');
 
   const res = await openai.images.edit({
     model: 'gpt-image-1',
@@ -85,10 +86,11 @@ function buildCropAndPadUrl(sourceUrl, baseCrop, canvasW, canvasH) {
   const cw = Math.max(1, baseCrop.x2 - baseCrop.x1);
   const ch = Math.max(1, baseCrop.y2 - baseCrop.y1);
   const crop = `c_crop,w_${cw},h_${ch},x_${baseCrop.x1},y_${baseCrop.y1}`;
-  const pad  = `c_pad,w_${canvasW},h_${canvasH},b_transparent`;
+  // f_png forces alpha-capable output; without it Cloudinary may downgrade to JPEG
+  // and the "transparent padding" becomes solid black — breaking outpainting entirely.
+  const pad  = `c_pad,w_${canvasW},h_${canvasH},b_transparent,f_png`;
   let url = sourceUrl.replace(/\.(jpg|jpeg|webp)(\?|$)/i, '.png$2');
   if (!/\.png(\?|$)/i.test(url)) url += '.png';
-  // Insert crop+pad as two sequential transforms before /v<num>/
   if (/\/v\d+\//.test(url)) {
     return url.replace(/\/(v\d+\/)/, `/${crop}/${pad}/$1`);
   }

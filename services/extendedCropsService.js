@@ -96,7 +96,7 @@ async function makeProviderCandidate({ id, label, provider, variant, generator, 
     if (isVideo && sourceVideoUrl) {
       videoUrl = buildBackgroundCompositeVideoUrl(up.public_id, sourceVideoUrl, baseCrop, cloudinaryAr);
     }
-    console.log(`   ✓ ${label} [${newRatio}] ready in ${Date.now() - t0}ms`);
+    console.log(`   ✓ ${label} [${newRatio}] ready in ${Date.now() - t0}ms → ${imageUrl}`);
     return { id, label, provider, variant, imageUrl, videoUrl };
   } catch (err) {
     console.warn(`   ✗ ${label} [${newRatio}] failed in ${Date.now() - t0}ms: ${err.message}`);

@@ -7,11 +7,18 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+let _counter = 0;
+function _uniqueId() {
+  // 8 chars of base36 random + monotonic counter → effectively zero collision risk
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `product-${Date.now()}-${++_counter}-${rand}`;
+}
+
 function uploadBufferToCloudinary(buffer, opts = {}) {
   return new Promise((resolve, reject) => {
     const uploadOpts = {
       folder: 'liquidretail',
-      public_id: `product-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      public_id: _uniqueId(),
       unique_filename: false,
       overwrite: false,
       resource_type: opts.resourceType || 'image',
