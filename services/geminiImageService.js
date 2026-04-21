@@ -13,9 +13,20 @@ const KNOWN_MODELS = [
   'gemini-2.0-flash-preview-image-generation'
 ];
 
-const genAI = process.env.GEMINI_API_KEY
-  ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
-  : null;
+// Fingerprint the key so we can tell from logs whether the env var is actually
+// arriving (without ever logging the key itself).
+const _rawKey = process.env.GEMINI_API_KEY || '';
+const _trimmedKey = _rawKey.trim().replace(/^['"]|['"]$/g, ''); // strip accidental quotes/whitespace
+if (_rawKey) {
+  const fp = _trimmedKey.length > 8
+    ? `${_trimmedKey.slice(0, 4)}…${_trimmedKey.slice(-4)}`
+    : '<too short>';
+  console.log(`🔑 Gemini key: length=${_trimmedKey.length} fingerprint=${fp}${_rawKey !== _trimmedKey ? ' (stripped surrounding quotes/whitespace)' : ''}`);
+} else {
+  console.log('🔑 Gemini key: NOT SET (GEMINI_API_KEY env var empty)');
+}
+
+const genAI = _trimmedKey ? new GoogleGenerativeAI(_trimmedKey) : null;
 
 let cachedWorkingModel = null;
 let discoveredCandidates = null; // populated by probe on first use
@@ -27,11 +38,11 @@ function isEnabled() { return !!genAI; }
 // capable: name mentions image OR it's a gemini-*-flash variant.
 async function discoverModels() {
   if (discoveredCandidates !== null) return discoveredCandidates;
-  if (!process.env.GEMINI_API_KEY) { discoveredCandidates = []; return []; }
+  if (!_trimmedKey) { discoveredCandidates = []; return []; }
 
   try {
     const res = await axios.get(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(_trimmedKey)}`,
       { timeout: 15000 }
     );
     const all = (res.data?.models || []).map(m => ({
