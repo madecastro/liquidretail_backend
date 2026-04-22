@@ -95,14 +95,40 @@ TEXT TREATMENT:
 // ─────────────────────────────────────────────────────────────────────────────
 //  Extended-ratio judge — 9:16, 1.91:1. Each candidate is a fully-rendered
 //  image from a different provider/variant. Scoring is stricter here because
-//  AI-generated outputs have specific failure modes (artifacts, subject drift).
+//  AI-generated outputs have specific failure modes (artifacts, subject drift,
+//  and — most commercially dangerous — garbled labels and logos).
+//
+//  Call signature accepts either the old shape (extendedCrops map) for back-
+//  compat, or the new shape ({candidates, sourceImageUrl, text, primarySubject})
+//  which gives the judge the reference material it needs to actually evaluate
+//  label/logo fidelity.
 // ─────────────────────────────────────────────────────────────────────────────
-async function judgeExtendedCrops(extendedCrops) {
+async function judgeExtendedCrops(arg) {
+  const extendedCrops = arg?.candidates || arg;
+  const sourceImageUrl = arg?.sourceImageUrl || null;
+  const detectedText = Array.isArray(arg?.text) ? arg.text : [];
+  const primarySubject = arg?.primarySubject || null;
+
   const ratios = Object.keys(extendedCrops).filter(r => extendedCrops[r].length > 0);
   if (ratios.length === 0) return {};
 
+  // Build reference material the judge needs to evaluate label/logo fidelity
+  const textStrings = detectedText
+    .filter(t => t.content && t.confidence > 0.5)
+    .slice(0, 20)
+    .map(t => `"${t.content}" (${t.type || 'text'})`)
+    .join(', ');
+  const referenceBlock = [];
+  if (sourceImageUrl) referenceBlock.push('The FIRST image below is the SOURCE (ground truth for labels, logos, subject identity).');
+  if (primarySubject) referenceBlock.push(`Primary subject: ${primarySubject}.`);
+  if (textStrings) referenceBlock.push(`Text/labels visible on the source that MUST be preserved exactly in candidates: ${textStrings}.`);
+
+  // Build image list: source first (if available), then candidates in order
   const imageParts = [];
   const indexLines = [];
+  if (sourceImageUrl) {
+    imageParts.push({ type: 'image_url', image_url: { url: sourceImageUrl } });
+  }
   for (const ratio of ratios) {
     for (const c of extendedCrops[ratio]) {
       indexLines.push(`[${ratio}] ${c.id} — ${c.label} (provider=${c.provider}, variant=${c.variant})`);
@@ -115,23 +141,25 @@ async function judgeExtendedCrops(extendedCrops) {
     .join(',\n  ');
 
   const prompt =
-    `Below are candidate outputs for extended aspect ratios. Each candidate is identified ` +
-    `by id of the form "<ratio>-<variant>-<provider>" (or "<ratio>-blurred" for Cloudinary ` +
-    `blurred-pad variants).\n\n` +
-    `Candidates (in the same order as the images that follow):\n${indexLines.join('\n')}\n\n` +
-    `SCORING RUBRIC — rate every candidate on 5 dimensions (0–10 integers):\n` +
-    `  - subject_fidelity      : identity / shape / material preserved vs the source product.\n` +
-    `  - artifact_freedom      : no warping, seam lines, repeated textures, garbled text, extra limbs, color shifts.\n` +
+    (referenceBlock.length ? referenceBlock.join('\n') + '\n\n' : '') +
+    `Candidates (in the same order as the images that follow the source reference):\n${indexLines.join('\n')}\n\n` +
+    `SCORING RUBRIC — rate every candidate on 6 dimensions (0–10 integers). ` +
+    `LABEL/LOGO FIDELITY IS THE HIGHEST-STAKES DIMENSION and is strictly weighted in rejection rules.\n\n` +
+    `  - label_logo_fidelity   : every label, brand mark, product name, size/volume, and logo on the source must appear in the candidate UNCHANGED, with identical text spelling, identical typography, correct logo shape and proportion. Garbled letters, swapped characters, warped logos, misaligned brand marks, or missing labels are FATAL — score low.\n` +
+    `  - subject_fidelity      : overall identity / shape / material of the product preserved vs the source.\n` +
+    `  - artifact_freedom      : no warping, seam lines, repeated textures, extra limbs, color shifts.\n` +
     `  - lighting_consistency  : light direction, color temperature, shadows cohere across the frame.\n` +
     `  - background_cohesion   : palette, texture, style match; no awkward transitions or mismatched content.\n` +
     `  - aspect_compliance     : fills the target ratio cleanly — not stretched, squeezed, or letterboxed.\n\n` +
-    `HARD-REJECT RULES (set "rejected" to a short reason; still provide low dimension scores):\n` +
-    `  - variant="extension" with subject_fidelity < 9    → "extension altered subject"\n` +
-    `  - variant="generation" with subject_fidelity < 6   → "generation unrecognizable"\n` +
-    `  - any visible seam line, garbled label, or duplicate/ghost subject → "visible artifact"\n` +
-    `  - aspect_compliance < 5 (letterboxed/stretched)    → "aspect broken"\n\n` +
-    `TOTAL = sum of dimensions. Winner = highest total among NON-rejected candidates for that ratio. ` +
-    `Only pick from rejected set if every candidate was rejected; note this in reasoning.\n\n` +
+    `HARD-REJECT RULES (set "rejected" to a short reason; still provide dimension scores):\n` +
+    `  - label_logo_fidelity < 8 when the source has any labels/logos   → "label/logo degraded"\n` +
+    `  - variant="extension" with subject_fidelity < 9                  → "extension altered subject"\n` +
+    `  - variant="generation" with subject_fidelity < 6                 → "generation unrecognizable"\n` +
+    `  - any visible seam line, garbled text, or duplicate/ghost subject → "visible artifact"\n` +
+    `  - aspect_compliance < 5 (letterboxed/stretched)                  → "aspect broken"\n\n` +
+    `TOTAL = sum of all 6 dimensions (out of 60). Winner = highest total among NON-rejected candidates. ` +
+    `If every candidate is rejected, pick the least-bad one from the rejected set and say so in reasoning.\n` +
+    `Tie-breaker priority: label_logo_fidelity > subject_fidelity > artifact_freedom > others.\n\n` +
     `Return ONLY JSON matching this exact shape (no prose outside):\n` +
     `{\n  ${schemaLines}\n}`;
 

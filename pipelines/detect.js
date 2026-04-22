@@ -90,7 +90,12 @@ async function runDetectImagePipeline(job, buffer) {
     console.log(`🖼️   Extended crops: ${totalCandidates} candidate(s) across ${Object.keys(extendedCrops).length} ratios`);
     if (totalCandidates > 0) {
       await setStage(job, 'judge-extended');
-      extendedJudge = await judgeExtendedCrops(extendedCrops);
+      extendedJudge = await judgeExtendedCrops({
+        candidates: extendedCrops,
+        sourceImageUrl: job.fileUrl,
+        text,
+        primarySubject: primarySubjectDesc
+      });
     }
   } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
 
@@ -190,7 +195,12 @@ async function runDetectVideoPipeline(job, buffer) {
       console.log(`🖼️   Extended crops (video): ${totalCandidates} candidate(s)`);
       if (totalCandidates > 0) {
         await setStage(job, 'judge-extended');
-        extendedJudge = await judgeExtendedCrops(extendedCrops);
+        extendedJudge = await judgeExtendedCrops({
+          candidates: extendedCrops,
+          sourceImageUrl: heroImageUrl,
+          text,
+          primarySubject: primarySubjectDesc
+        });
       }
     } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
   }
