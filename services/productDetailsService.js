@@ -47,7 +47,11 @@ async function fetchProductDetails(identification) {
       const prodRes = await serp({
         engine: 'google_product',
         product_id: top.product_id,
-        gl: COUNTRY
+        gl: COUNTRY,
+        // Without reviews=1, SerpAPI returns rating + count in product_results
+        // but leaves reviews_results.reviews empty — the review tab is only
+        // populated on explicit request.
+        reviews: 1
       });
       productData  = prodRes?.product_results || null;
       reviewsBlock = prodRes?.reviews_results || null;
