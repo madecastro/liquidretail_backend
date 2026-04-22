@@ -123,44 +123,57 @@ async function judgeExtendedCrops(arg) {
   if (primarySubject) referenceBlock.push(`Primary subject: ${primarySubject}.`);
   if (textStrings) referenceBlock.push(`Text/labels visible on the source that MUST be preserved exactly in candidates: ${textStrings}.`);
 
-  // Build image list: source first (if available), then candidates in order
+  // Blind the judge to provider identity. GPT-4.1 judging gpt-image-1 vs Gemini
+  // shows strong self-preference — every winner came out OpenAI-made even when
+  // Gemini preserved labels better. We present candidates with neutral slot
+  // letters in a shuffled order per ratio and map back to real ids afterward.
+  // Variant (extension/generation) IS still exposed because per-variant
+  // rejection rules depend on it.
+  const slotPlans = {}; // ratio -> [{ slot, candidate }]
+  for (const ratio of ratios) {
+    const shuffled = extendedCrops[ratio].slice().sort(() => Math.random() - 0.5);
+    slotPlans[ratio] = shuffled.map((c, i) => ({ slot: SLOT_LETTERS[i], candidate: c }));
+  }
+
+  // Build image list: source first (if available), then candidates in slot order per ratio.
   const imageParts = [];
   const indexLines = [];
   if (sourceImageUrl) {
     imageParts.push({ type: 'image_url', image_url: { url: sourceImageUrl } });
   }
   for (const ratio of ratios) {
-    for (const c of extendedCrops[ratio]) {
-      indexLines.push(`[${ratio}] ${c.id} — ${c.label} (provider=${c.provider}, variant=${c.variant})`);
+    for (const { slot, candidate: c } of slotPlans[ratio]) {
+      indexLines.push(`[${ratio}] slot ${slot} — variant=${c.variant}`);
       imageParts.push({ type: 'image_url', image_url: { url: c.imageUrl } });
     }
   }
 
   const schemaLines = ratios
-    .map(r => `"${r}": { "winnerId": "...", "reasoning": "...", "scores": { "<id>": { "total": 0, "dimensions": {...}, "rejected": null | "reason" }, ... } }`)
+    .map(r => `"${r}": { "winnerSlot": "A", "reasoning": "...", "scores": { "A": { "dimensions": {...}, "rejected": null | "reason" }, ... } }`)
     .join(',\n  ');
 
   const prompt =
     (referenceBlock.length ? referenceBlock.join('\n') + '\n\n' : '') +
     `Candidates (in the same order as the images that follow the source reference):\n${indexLines.join('\n')}\n\n` +
     `SCORING RUBRIC — rate every candidate on 6 dimensions (0–10 integers). ` +
-    `LABEL/LOGO FIDELITY IS THE HIGHEST-STAKES DIMENSION and is strictly weighted in rejection rules.\n\n` +
-    `  - label_logo_fidelity   : every label, brand mark, product name, size/volume, and logo on the source must appear in the candidate UNCHANGED, with identical text spelling, identical typography, correct logo shape and proportion. Garbled letters, swapped characters, warped logos, misaligned brand marks, or missing labels are FATAL — score low.\n` +
-    `  - subject_fidelity      : overall identity / shape / material of the product preserved vs the source.\n` +
-    `  - artifact_freedom      : no warping, seam lines, repeated textures, extra limbs, color shifts.\n` +
-    `  - lighting_consistency  : light direction, color temperature, shadows cohere across the frame.\n` +
-    `  - background_cohesion   : palette, texture, style match; no awkward transitions or mismatched content.\n` +
-    `  - aspect_compliance     : fills the target ratio cleanly — not stretched, squeezed, or letterboxed.\n\n` +
+    `Each dimension has a WEIGHT. Final score = Σ(dimension × weight), max ${EXTENDED_MAX_TOTAL}. ` +
+    `LABEL/LOGO FIDELITY and SUBJECT FIDELITY are the commercial dealbreakers and are weighted 3× each — ` +
+    `a candidate that LOOKS prettier but mangles labels or mutates the subject must lose.\n\n` +
+    `  - label_logo_fidelity  (×3): every label, brand mark, product name, size/volume, and logo on the source must appear in the candidate UNCHANGED — identical text spelling, identical typography, correct logo shape and proportion. Garbled letters, swapped characters, warped logos, misaligned brand marks, or missing labels are FATAL.\n` +
+    `  - subject_fidelity     (×3): overall identity / shape / material of the product preserved vs the source.\n` +
+    `  - artifact_freedom     (×2): no warping, seam lines, repeated textures, extra limbs, color shifts.\n` +
+    `  - lighting_consistency (×1): light direction, color temperature, shadows cohere across the frame.\n` +
+    `  - background_cohesion  (×1): palette, texture, style match; no awkward transitions or mismatched content.\n` +
+    `  - aspect_compliance    (×1): fills the target ratio cleanly — not stretched, squeezed, or letterboxed.\n\n` +
     `HARD-REJECT RULES (set "rejected" to a short reason; still provide dimension scores):\n` +
-    `  - label_logo_fidelity < 8 when the source has any labels/logos   → "label/logo degraded"\n` +
-    `  - variant="extension" with subject_fidelity < 9                  → "extension altered subject"\n` +
-    `  - variant="generation" with subject_fidelity < 6                 → "generation unrecognizable"\n` +
-    `  - any visible seam line, garbled text, or duplicate/ghost subject → "visible artifact"\n` +
+    `  - label_logo_fidelity < 9 when the source has any labels/logos   → "label/logo degraded"\n` +
+    `  - variant="extension"  with subject_fidelity < 9                 → "extension altered subject"\n` +
+    `  - variant="generation" with subject_fidelity < 8                 → "generation unrecognizable"\n` +
+    `  - artifact_freedom < 7                                           → "visible artifact"\n` +
     `  - aspect_compliance < 5 (letterboxed/stretched)                  → "aspect broken"\n\n` +
-    `TOTAL = sum of all 6 dimensions (out of 60). Winner = highest total among NON-rejected candidates. ` +
-    `If every candidate is rejected, pick the least-bad one from the rejected set and say so in reasoning.\n` +
+    `Winner = highest weighted total among NON-rejected candidates. If every candidate is rejected, pick the least-bad one and say so in reasoning.\n` +
     `Tie-breaker priority: label_logo_fidelity > subject_fidelity > artifact_freedom > others.\n\n` +
-    `Return ONLY JSON matching this exact shape (no prose outside):\n` +
+    `Return ONLY JSON matching this exact shape (no prose outside). Use slot letters as keys — do NOT reference provider names:\n` +
     `{\n  ${schemaLines}\n}`;
 
   const response = await openai.chat.completions.create({
@@ -177,11 +190,46 @@ async function judgeExtendedCrops(arg) {
   const raw = response.choices[0].message.content.trim();
   const parsed = safeParseJSON(raw);
 
+  // Remap slot-keyed judgement back to real-candidate-id keyed judgement.
   const out = {};
   for (const ratio of ratios) {
-    out[ratio] = normalizeCropJudgement(parsed[ratio], extendedCrops[ratio]);
+    const plan = slotPlans[ratio];
+    const ratioRaw = parsed[ratio] || {};
+    const rekeyedScores = {};
+    for (const { slot, candidate: c } of plan) {
+      if (ratioRaw.scores?.[slot]) rekeyedScores[c.id] = ratioRaw.scores[slot];
+    }
+    const winnerId = plan.find(p => p.slot === ratioRaw.winnerSlot)?.candidate?.id;
+    out[ratio] = normalizeCropJudgement(
+      { winnerId, reasoning: ratioRaw.reasoning, scores: rekeyedScores },
+      extendedCrops[ratio],
+      weightedTotalExtended
+    );
   }
   return out;
+}
+
+// Extended-ratio dimension weights. Label/logo fidelity and subject fidelity
+// are the commercial dealbreakers (3× each); artifact freedom is 2×; aesthetic
+// dimensions are 1×. Max total = (3+3+2+1+1+1) × 10 = 110.
+const EXTENDED_WEIGHTS = {
+  label_logo_fidelity:  3,
+  subject_fidelity:     3,
+  artifact_freedom:     2,
+  lighting_consistency: 1,
+  background_cohesion:  1,
+  aspect_compliance:    1
+};
+const EXTENDED_MAX_TOTAL = 110;
+const SLOT_LETTERS = 'ABCDEFGHIJKL';
+
+function weightedTotalExtended(dims) {
+  if (!dims || typeof dims !== 'object') return 0;
+  let sum = 0;
+  for (const [k, w] of Object.entries(EXTENDED_WEIGHTS)) {
+    sum += (Number(dims[k]) || 0) * w;
+  }
+  return sum;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,9 +246,11 @@ function safeParseJSON(raw) {
 
 // Ensure the judge's ratio-level judgment has a winnerId, reasoning, and a
 // complete scores map keyed by candidate id (filling in gaps so the UI never
-// crashes on missing entries).
-function normalizeCropJudgement(raw, candidates) {
+// crashes on missing entries). `totalFn` lets the extended rubric inject a
+// weighted total; base ratios fall back to a plain dimension sum.
+function normalizeCropJudgement(raw, candidates, totalFn) {
   const list = candidates || [];
+  const computeTotal = totalFn || sumDimensions;
   const emptyScore = { total: 0, dimensions: {}, rejected: null };
 
   const scores = {};
@@ -208,7 +258,7 @@ function normalizeCropJudgement(raw, candidates) {
     const s = raw?.scores?.[c.id];
     if (s) {
       scores[c.id] = {
-        total: Number(s.total) || sumDimensions(s.dimensions),
+        total: computeTotal(s.dimensions || {}),
         dimensions: s.dimensions || {},
         rejected: s.rejected || null
       };
