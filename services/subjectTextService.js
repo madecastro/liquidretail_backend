@@ -3,8 +3,19 @@ const JSON5 = require('json5');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Single GPT-4.1 call: returns both subjects and text regions with normalized coords
-async function detectSubjectsAndText(imageUrl) {
+// Single GPT-4.1 call: returns both subjects and text regions with normalized coords.
+// Optional `hints` (brand / category / caption) come from the upload form and
+// help the model pick the correct primary subject and write a richer description.
+async function detectSubjectsAndText(imageUrl, hints = {}) {
+  const { brand, category, caption } = hints;
+  const hintLines = [];
+  if (brand)    hintLines.push(`- User states the BRAND is: ${brand}`);
+  if (category) hintLines.push(`- User states the CATEGORY is: ${category}`);
+  if (caption)  hintLines.push(`- User's caption: "${caption}"`);
+  const hintBlock = hintLines.length
+    ? `\n\nUSER HINTS (use these to pick which subject is PRIMARY and to enrich its description):\n${hintLines.join('\n')}`
+    : '';
+
   const response = await openai.chat.completions.create({
     model: 'gpt-4.1',
     messages: [
@@ -19,6 +30,8 @@ async function detectSubjectsAndText(imageUrl) {
 "text": array of readable text regions. Each item:
   { "id": "t1", "content": "exact text", "type": "product_label"|"brand"|"serial"|"warning"|"general", "x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0, "confidence": 0.0-1.0 }
   Coordinates are normalized 0-1.
+
+The PRIMARY subject's description should be detailed enough to search for it online — include material, color, cut/silhouette, notable features, and any product name/label you can read.${hintBlock}
 
 Return ONLY valid JSON, no markdown, no explanation.`
       },

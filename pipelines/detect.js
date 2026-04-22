@@ -16,6 +16,7 @@ const { judgeDetections, judgeExtendedCrops } = require('../services/judgeServic
 const { generateExtendedCrops } = require('../services/extendedCropsService');
 const { transcribeAudio } = require('../services/whisperService');
 const { extractEntities } = require('../services/nerService');
+const { findProductMatches } = require('../services/productMatchService');
 
 const { downloadBuffer, setStage, finalizeStage } = require('./shared');
 
@@ -57,7 +58,11 @@ async function runDetectImagePipeline(job, buffer) {
   await setStage(job, 'subjects-text');
   let subjects = [], text = [];
   try {
-    const st = await detectSubjectsAndText(job.fileUrl);
+    const st = await detectSubjectsAndText(job.fileUrl, {
+      brand: job.metadata?.brand,
+      category: job.metadata?.category,
+      caption: job.metadata?.caption
+    });
     subjects = st.subjects; text = st.text;
   } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
 
@@ -99,13 +104,28 @@ async function runDetectImagePipeline(job, buffer) {
     }
   } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
 
+  await setStage(job, 'product-match');
+  let productMatches = null;
+  try {
+    productMatches = await findProductMatches({
+      brand:          job.metadata?.brand,
+      category:       job.metadata?.category,
+      caption:        job.metadata?.caption,
+      primarySubject: primarySubjectDesc,
+      textDetected:   text.map(t => t.content).filter(Boolean),
+      imageUrl:       job.fileUrl
+    });
+    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
+  } catch (err) { console.warn('⚠️  Product match:', err.message); }
+
   return {
     type: 'image',
     imageUrl: job.fileUrl,
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
     subjects, text, crops, judge, safeRect,
-    extendedCrops, extendedErrors, extendedJudge
+    extendedCrops, extendedErrors, extendedJudge,
+    productMatches
   };
 }
 
@@ -150,7 +170,11 @@ async function runDetectVideoPipeline(job, buffer) {
   if (heroImageUrl) {
     await setStage(job, 'subjects-text');
     try {
-      const st = await detectSubjectsAndText(heroImageUrl);
+      const st = await detectSubjectsAndText(heroImageUrl, {
+        brand: job.metadata?.brand,
+        category: job.metadata?.category,
+        caption: job.metadata?.caption
+      });
       subjects = st.subjects; text = st.text;
     } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
   }
@@ -179,10 +203,12 @@ async function runDetectVideoPipeline(job, buffer) {
     } catch (err) { console.warn('⚠️  Judge:', err.message); }
   }
 
+  // Hoisted so both the extended-crops and product-match stages can see it.
+  const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
+
   let extendedCrops = {}, extendedErrors = {}, extendedJudge = {};
   if (heroImageUrl) {
     await setStage(job, 'extended-crops');
-    const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
     try {
       const { candidates, errors } = await generateExtendedCrops({
         sourceImageUrl: heroImageUrl,
@@ -205,6 +231,20 @@ async function runDetectVideoPipeline(job, buffer) {
     } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
   }
 
+  await setStage(job, 'product-match');
+  let productMatches = null;
+  try {
+    productMatches = await findProductMatches({
+      brand:          job.metadata?.brand,
+      category:       job.metadata?.category,
+      caption:        job.metadata?.caption,
+      primarySubject: primarySubjectDesc,
+      textDetected:   text.map(t => t.content).filter(Boolean),
+      imageUrl:       heroImageUrl
+    });
+    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
+  } catch (err) { console.warn('⚠️  Product match:', err.message); }
+
   return {
     type: 'video',
     videoUrl: job.fileUrl,
@@ -214,6 +254,7 @@ async function runDetectVideoPipeline(job, buffer) {
     products: products.map(({ cropBuffer, ...p }) => p),
     subjects, text, crops, judge, safeRect,
     extendedCrops, extendedErrors, extendedJudge,
+    productMatches,
     transcript: transcript ? {
       text: transcript.text,
       duration: transcript.duration,
