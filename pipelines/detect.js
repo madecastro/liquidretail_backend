@@ -266,11 +266,16 @@ async function runDetectVideoPipeline(job, buffer) {
 
 // Build a Cloudinary video transform URL that crops every frame to a given rect.
 // Source URL shape: https://res.cloudinary.com/<cloud>/video/upload/v123.../path.mp4
+// Insert the transform after existing ones (anchored on /v<num>/) so downstream
+// transforms can be chained without transform-order bugs.
 function buildCloudinaryCropUrl(videoUrl, crop) {
   if (!videoUrl || !videoUrl.includes('/upload/')) return null;
   const w = Math.max(1, crop.x2 - crop.x1);
   const h = Math.max(1, crop.y2 - crop.y1);
   const transform = `c_crop,w_${w},h_${h},x_${crop.x1},y_${crop.y1}`;
+  if (/\/v\d+\//.test(videoUrl)) {
+    return videoUrl.replace(/\/(v\d+\/)/, `/${transform}/$1`);
+  }
   return videoUrl.replace('/upload/', `/upload/${transform}/`);
 }
 
