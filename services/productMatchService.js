@@ -8,6 +8,7 @@
 
 const geminiSearch = require('./providers/geminiSearchProvider');
 const googleLens   = require('./providers/googleLensProvider');
+const { identifyProduct } = require('./productReasoner');
 
 const PROVIDERS = [
   geminiSearch,
@@ -49,8 +50,25 @@ async function findProductMatches({ brand, category, caption, primarySubject, te
     }
   }
 
+  // Synthesis: ask GPT-4.1 to triangulate across all provider evidence and
+  // produce a single identified product + certainty. Providers remain on the
+  // response as the evidence trail.
+  let identification = null;
+  if (totalMatches > 0) {
+    try {
+      identification = await identifyProduct({
+        brand, category, caption, primarySubject, textDetected, imageUrl, providers
+      });
+      console.log(`🔎 Identification: ${identification.productName || '(none)'} — ${identification.certaintyLabel} (${(identification.certainty * 100).toFixed(0)}%)`);
+    } catch (err) {
+      console.warn(`   ✗ productReasoner: ${err.message}`);
+      errors.reasoner = err.message;
+    }
+  }
+
   return {
     query: { brand, category, caption, primarySubject, textDetected },
+    identification,
     providers,
     errors,
     skipped,
