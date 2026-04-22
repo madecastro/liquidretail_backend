@@ -102,6 +102,27 @@ TEXT TREATMENT:
 //  compat, or the new shape ({candidates, sourceImageUrl, text, primarySubject})
 //  which gives the judge the reference material it needs to actually evaluate
 //  label/logo fidelity.
+//
+//  STATUS: GPT-4.1 self-preference toward gpt-image-1 was not fully neutralized
+//  by slot-blinding, weighted dimensions, and tighter rejects. As a stopgap we
+//  force-pick the Gemini extension candidate when present and not rejected —
+//  in practice it consistently preserves labels and subject identity better
+//  than the OpenAI variants. Remove the override once one of the TODOs below
+//  lands and the organic winner is trustworthy.
+//
+//  TODO — in priority order:
+//    1. Defects-list pass. Make the judge enumerate per-candidate observed
+//       defects vs the source (garbled chars in "<text>", logo shape changed,
+//       size/volume marking missing, etc.) BEFORE scoring. Forces detection
+//       of subtle mutations a holistic score glosses over.
+//    2. Cross-provider judge. Run Gemini 2.5 Pro as a second judge in parallel;
+//       only declare a winner when both models agree. On disagreement, fall
+//       back to the label_logo_fidelity leader. Costs one extra API call per
+//       job but eliminates self-preference structurally.
+//    3. OCR verification of source text. We already detect text on the source
+//       (`text` param). Run OCR on each candidate, exact-match each source
+//       token; any missing token auto-rejects that candidate. Objective, and
+//       catches cases the VLM is "seeing" but misremembering.
 // ─────────────────────────────────────────────────────────────────────────────
 async function judgeExtendedCrops(arg) {
   const extendedCrops = arg?.candidates || arg;
@@ -200,11 +221,22 @@ async function judgeExtendedCrops(arg) {
       if (ratioRaw.scores?.[slot]) rekeyedScores[c.id] = ratioRaw.scores[slot];
     }
     const winnerId = plan.find(p => p.slot === ratioRaw.winnerSlot)?.candidate?.id;
-    out[ratio] = normalizeCropJudgement(
+    const judgement = normalizeCropJudgement(
       { winnerId, reasoning: ratioRaw.reasoning, scores: rekeyedScores },
       extendedCrops[ratio],
       weightedTotalExtended
     );
+
+    // STOPGAP: force Gemini extension as winner when it exists and isn't
+    // rejected. Judge scores are still returned unchanged so the UI can show
+    // the organic ranking in tooltips. Remove when one of the TODOs lands.
+    const geminiExt = extendedCrops[ratio].find(c => c.provider === 'gemini' && c.variant === 'extension');
+    if (geminiExt && !judgement.scores[geminiExt.id]?.rejected) {
+      judgement.winnerId = geminiExt.id;
+      judgement.reasoning = '[override] Forcing Gemini extension as winner until judge bias is resolved. ' + (judgement.reasoning || '');
+    }
+
+    out[ratio] = judgement;
   }
   return out;
 }
