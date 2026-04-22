@@ -9,7 +9,20 @@ const PROVIDER_NAME = 'google-lens';
 const ENDPOINT = 'https://serpapi.com/search.json';
 const COUNTRY  = process.env.SERPAPI_COUNTRY || 'us';
 
-function isEnabled() { return !!process.env.SERPAPI_API_KEY; }
+// Fingerprint the SerpAPI key at module load so the Render log tells us
+// whether Render is actually delivering the env var (without logging the key).
+const _rawKey = process.env.SERPAPI_API_KEY || '';
+const _trimmedKey = _rawKey.trim().replace(/^['"]|['"]$/g, '');
+if (_rawKey) {
+  const fp = _trimmedKey.length > 8
+    ? `${_trimmedKey.slice(0, 4)}…${_trimmedKey.slice(-4)}`
+    : '<too short>';
+  console.log(`🔑 SerpAPI key: length=${_trimmedKey.length} fingerprint=${fp}${_rawKey !== _trimmedKey ? ' (stripped quotes/whitespace)' : ''}`);
+} else {
+  console.log('🔑 SerpAPI key: NOT SET (SERPAPI_API_KEY env var empty)');
+}
+
+function isEnabled() { return !!_trimmedKey; }
 
 async function match({ imageUrl, brand, category }) {
   if (!isEnabled()) throw new Error('SERPAPI_API_KEY not set');
@@ -20,7 +33,7 @@ async function match({ imageUrl, brand, category }) {
     engine: 'google_lens',
     url: imageUrl,
     country: COUNTRY,
-    api_key: process.env.SERPAPI_API_KEY
+    api_key: _trimmedKey
   };
   // Optional narrowing hint — SerpAPI supports a `q` param that filters lens results
   if (brand || category) {
