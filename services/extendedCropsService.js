@@ -10,14 +10,15 @@ const NEW_RATIOS = {
 
 // Generate candidate outputs for each new ratio.
 //
-// For video jobs, every candidate shares the same video URL: the source video
-// cropped to the subject bbox, then padded to the target aspect ratio with a
-// blurred background. The distinguishing part of each candidate is the STILL
-// image (AI-generated background, or blurred pad of the hero frame). We
-// explicitly do NOT try to composite the source video onto the AI-generated
-// still — Cloudinary image-typed assets can't be used as the base of a
-// /video/upload/ URL, so that kind of composite is unreliable with the public
-// Cloudinary transform API alone.
+// For video jobs, every candidate shares the same video URL: the TikTok-style
+// self-underlay — a blurred, filled-to-target-AR copy of the source video sits
+// behind an unmodified (letterboxed) copy of the same video. Same source,
+// different transform layers. The distinguishing part of each candidate is the
+// STILL image (AI-generated background, or soft-pad of the hero frame). We
+// explicitly do NOT composite the source video onto the AI-generated still —
+// Cloudinary image-typed assets can't be used as the base of a /video/upload/
+// URL, so that kind of composite is unreliable with the public Cloudinary
+// transform API alone.
 async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrops, judge, primarySubject, isVideo }) {
   const output = { '9:16': [], '1.91:1': [] };
   const errors = { '9:16': [], '1.91:1': [] };
@@ -30,9 +31,11 @@ async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrop
     if (!baseCrop) { console.warn(`⚠️  No base ${baseRatio} crop available for ${newRatio}`); continue; }
 
     // Shared video URL for every candidate on a video job:
-    //   source video  →  crop to subject bbox  →  pad to target ratio w/ blurred bars
+    //   blurred self-fill as background + unmodified source letterboxed on top.
+    // The subject stays in its original frame position; the bars are a moving,
+    // heavily-blurred copy of the same clip (TikTok / Reels reformat look).
     const sharedVideoUrl = (isVideo && sourceVideoUrl)
-      ? buildBlurredPadVideoUrl(buildCropUrl(sourceVideoUrl, baseCrop, 'video'), cloudinaryAr)
+      ? buildSelfUnderlayVideoUrl(sourceVideoUrl, cloudinaryAr)
       : null;
 
     const tasks = [];
@@ -105,11 +108,9 @@ async function makeProviderCandidate({ id, label, provider, variant, generator, 
 
 // ── Cloudinary URL builders ──
 //
-// Cloudinary applies transforms left-to-right in the URL path. When a URL
-// already has a transform (e.g. c_crop from buildCropUrl) and we're adding
-// another (e.g. c_pad), we MUST insert the new transform AFTER the existing
-// ones, not at the front. The /v\d+/ version segment is a stable anchor —
-// every Cloudinary secure_url from an upload has it.
+// Cloudinary applies transforms left-to-right in the URL path. insertTransform
+// anchors on the /v\d+/ version segment (present on every secure_url from an
+// upload), so chained transforms stay in the order they were added.
 
 function insertTransform(url, transform) {
   if (!url || !url.includes('/upload/')) return url;
@@ -120,25 +121,40 @@ function insertTransform(url, transform) {
   return url.replace('/upload/', `/upload/${transform}/`);
 }
 
-function buildCropUrl(sourceUrl, baseCrop, kind) {
-  if (!sourceUrl || !sourceUrl.includes('/upload/')) return sourceUrl;
-  const w = Math.max(1, baseCrop.x2 - baseCrop.x1);
-  const h = Math.max(1, baseCrop.y2 - baseCrop.y1);
-  let url = insertTransform(sourceUrl, `c_crop,w_${w},h_${h},x_${baseCrop.x1},y_${baseCrop.y1}`);
-  if (kind === 'image' && !/\.(jpg|jpeg|png|webp)$/i.test(url)) url += '.jpg';
-  return url;
-}
-
 function buildExactArUrl(imageUrl, ar) {
   return insertTransform(imageUrl, `c_fill,ar_${ar},g_auto`);
 }
 
+// b_blurred requires a Cloudinary add-on that isn't on our plan (returns 400
+// "Invalid color name blurred"). b_auto:predominant_gradient is always-available
+// and produces a visually similar soft-color pad for still images.
 function buildBlurredPadImageUrl(sourceUrl, ar) {
-  return insertTransform(sourceUrl, `c_pad,ar_${ar},b_blurred`);
+  return insertTransform(sourceUrl, `c_pad,ar_${ar},b_auto:predominant_gradient`);
 }
 
-function buildBlurredPadVideoUrl(videoUrl, ar) {
-  return insertTransform(videoUrl, `c_pad,ar_${ar},b_blurred`);
+// TikTok / Reels reformat pattern:
+//   base:    source video filled to target AR + heavy blur  → the "bars"
+//   overlay: SAME source video fit inside the canvas, AR preserved → crisp subject
+// Cloudinary references the overlay by public_id with slashes → colons, e.g.
+// `liquidretail/foo-bar` becomes `liquidretail:foo-bar`. `fl_relative,w_1.0,h_1.0`
+// sizes the overlay to 100% of the base canvas; `c_fit` then shrinks it to
+// preserve its own AR (letterboxing), exposing the blurred bars behind.
+function buildSelfUnderlayVideoUrl(sourceVideoUrl, ar) {
+  if (!sourceVideoUrl || !sourceVideoUrl.includes('/upload/')) return sourceVideoUrl;
+  const publicId = extractCloudinaryPublicId(sourceVideoUrl);
+  if (!publicId) return sourceVideoUrl;
+  const overlayRef = publicId.replace(/\//g, ':');
+  const transform = [
+    `c_fill,ar_${ar},e_blur:1500`,
+    `l_video:${overlayRef},c_fit,fl_relative,w_1.0,h_1.0`,
+    `fl_layer_apply`
+  ].join('/');
+  return insertTransform(sourceVideoUrl, transform);
+}
+
+function extractCloudinaryPublicId(url) {
+  const m = url.match(/\/v\d+\/(.+?)\.[a-z0-9]+(?:\?|$)/i);
+  return m ? m[1] : null;
 }
 
 module.exports = { generateExtendedCrops, NEW_RATIOS };
