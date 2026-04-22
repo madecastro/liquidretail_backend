@@ -44,19 +44,25 @@ async function fetchProductDetails(identification) {
   let productData = null, reviewsBlock = null;
   if (top.product_id) {
     try {
+      // NOTE: passing `reviews: 1` here was rejected by SerpAPI with HTTP 400
+      // ("Request failed with status code 400") — that flag isn't accepted on
+      // this engine/plan in the form we tried. To get the actual reviews tab,
+      // the right path is likely a follow-up call using the
+      // reviews_results.link / serpapi_endpoint returned by this base call.
+      // TODO: read serpapi_endpoint from prodRes.reviews_results and chain a
+      // second call for the full review list once we confirm the shape.
       const prodRes = await serp({
         engine: 'google_product',
         product_id: top.product_id,
-        gl: COUNTRY,
-        // Without reviews=1, SerpAPI returns rating + count in product_results
-        // but leaves reviews_results.reviews empty — the review tab is only
-        // populated on explicit request.
-        reviews: 1
+        gl: COUNTRY
       });
       productData  = prodRes?.product_results || null;
       reviewsBlock = prodRes?.reviews_results || null;
     } catch (err) {
-      console.warn(`   ⚠️  google_product(${top.product_id}) failed: ${err.message}`);
+      // Surface SerpAPI's own error body — axios's err.message is just the
+      // generic status line, the useful detail is in err.response.data.
+      const serpMsg = err.response?.data?.error || err.response?.data?.message || JSON.stringify(err.response?.data || {}).slice(0, 200);
+      console.warn(`   ⚠️  google_product(${top.product_id}) failed: ${err.message}${serpMsg ? ` — ${serpMsg}` : ''}`);
     }
   }
 
