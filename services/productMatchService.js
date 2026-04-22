@@ -9,6 +9,7 @@
 const geminiSearch = require('./providers/geminiSearchProvider');
 const googleLens   = require('./providers/googleLensProvider');
 const { identifyProduct } = require('./productReasoner');
+const productDetails = require('./productDetailsService');
 
 const PROVIDERS = [
   geminiSearch,
@@ -63,6 +64,22 @@ async function findProductMatches({ brand, category, caption, primarySubject, te
     } catch (err) {
       console.warn(`   ✗ productReasoner: ${err.message}`);
       errors.reasoner = err.message;
+    }
+  }
+
+  // Enrichment: once we have a named product with at least low-confidence,
+  // pull structured price + reviews from Google Shopping/Google Product.
+  // Attaches to identification.details; errors degrade gracefully.
+  if (identification?.productName && identification.certainty >= 0.3) {
+    if (productDetails.isEnabled()) {
+      try {
+        identification.details = await productDetails.fetchProductDetails(identification);
+      } catch (err) {
+        console.warn(`   ✗ productDetails: ${err.message}`);
+        errors.productDetails = err.message;
+      }
+    } else {
+      skipped.push('product-details (SERPAPI_API_KEY not set)');
     }
   }
 
