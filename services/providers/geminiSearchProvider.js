@@ -1,6 +1,11 @@
 // Gemini grounded search — text-based product discovery via Google Search tool.
 // Given brand/category/subject-description, Gemini formulates a query, hits Google,
-// and returns retailer URLs + snippets grounded in real web results.
+// and returns retailer URLs grounded in real web results.
+//
+// Key detail: when the google_search tool is enabled, Gemini produces free-form
+// text with inline citations — it does NOT reliably honor a "return JSON" prompt.
+// So we pull match URLs/titles directly from response.groundingMetadata
+// (the authoritative source list) and use the text body as the reasoning.
 
 const axios = require('axios');
 
@@ -14,65 +19,68 @@ async function match({ brand, category, caption, primarySubject, textDetected = 
   if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
 
   const queryParts = [];
-  if (brand)          queryParts.push(`brand: ${brand}`);
-  if (category)       queryParts.push(`category: ${category}`);
-  if (primarySubject) queryParts.push(`product description: ${primarySubject}`);
-  if (caption)        queryParts.push(`caption: "${caption}"`);
-  if (textDetected.length) queryParts.push(`text visible on product: ${textDetected.map(t => `"${t}"`).join(', ')}`);
+  if (brand)          queryParts.push(`Brand: ${brand}`);
+  if (category)       queryParts.push(`Category: ${category}`);
+  if (primarySubject) queryParts.push(`Product description: ${primarySubject}`);
+  if (caption)        queryParts.push(`Caption: "${caption}"`);
+  if (textDetected.length) queryParts.push(`Text visible on product: ${textDetected.map(t => `"${t}"`).join(', ')}`);
 
   const prompt =
-    `You are a product-matching assistant. Using Google Search, find where the following product is sold online. ` +
-    `Return up to 8 distinct matches, preferring major retailers and the brand's own site.\n\n` +
-    `Product details:\n${queryParts.join('\n')}\n\n` +
-    `Return ONLY valid JSON (no markdown, no prose) in this exact shape:\n` +
-    `{\n` +
-    `  "reasoning": "one-sentence explanation of how you interpreted the query",\n` +
-    `  "query_used": "the actual search query text you issued to Google",\n` +
-    `  "matches": [\n` +
-    `    { "title": "...", "url": "...", "retailer": "domain.com", "price": "optional string like '$49.00'", "snippet": "brief description" }\n` +
-    `  ]\n` +
-    `}`;
+    `Use Google Search to find where this product is sold online. Prefer the brand's own site ` +
+    `and major retailers. Return a concise one-paragraph summary explaining which product you ` +
+    `identified and which retailers carry it. Cite every retailer with a link so I can browse them.\n\n` +
+    `Product details:\n${queryParts.join('\n')}`;
 
   const t0 = Date.now();
   const res = await axios.post(
     `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
     {
-      contents: [{ parts: [{ text: prompt }] }],
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
       tools: [{ google_search: {} }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 2000 }
+      generationConfig: { temperature: 0.2, maxOutputTokens: 1200 }
     },
     { timeout: 30000 }
   );
 
-  const candidates = res.data?.candidates || [];
-  const parts = candidates[0]?.content?.parts || [];
-  const text = parts.map(p => p.text || '').join('\n');
-  const groundingMeta = candidates[0]?.groundingMetadata || null;
+  const candidate = res.data?.candidates?.[0];
+  const reasoningText = (candidate?.content?.parts || [])
+    .map(p => p.text || '')
+    .join(' ')
+    .trim();
 
-  // Extract JSON from response
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('Gemini search returned no JSON');
-  const parsed = JSON.parse(jsonMatch[0]);
+  // Pull matches directly from grounding metadata — this is the authoritative
+  // URL list that Google returned for this search, not something we parse from prose.
+  const chunks = candidate?.groundingMetadata?.groundingChunks || [];
+  const seen = new Set();
+  const matches = [];
+  for (const chunk of chunks) {
+    const uri = chunk?.web?.uri;
+    if (!uri || seen.has(uri)) continue;
+    seen.add(uri);
+    matches.push({
+      title: chunk.web?.title || extractDomain(uri),
+      url: uri,
+      retailer: extractDomain(uri),
+      priceHint: null,           // not available from grounding chunks
+      snippet: '',               // ditto; could derive from groundingSupports if desired
+      thumbnail: null,
+      source: PROVIDER_NAME
+    });
+    if (matches.length >= 10) break;
+  }
 
-  const matches = (parsed.matches || []).map(m => ({
-    title: m.title || '',
-    url: m.url || '',
-    retailer: m.retailer || extractDomain(m.url),
-    priceHint: m.price || null,
-    snippet: m.snippet || '',
-    thumbnail: null,
-    source: PROVIDER_NAME
-  })).filter(m => m.url);
+  // queryUsed: Gemini doesn't expose the literal query it issued, but the
+  // web search queries are sometimes in groundingMetadata.webSearchQueries.
+  const searchQueries = candidate?.groundingMetadata?.webSearchQueries || [];
 
-  console.log(`   ✓ ${PROVIDER_NAME}: ${matches.length} match(es) in ${Date.now() - t0}ms`);
+  console.log(`   ✓ ${PROVIDER_NAME}: ${matches.length} match(es) in ${Date.now() - t0}ms (queries: ${searchQueries.join(' | ') || 'n/a'})`);
 
   return {
     provider: PROVIDER_NAME,
-    reasoning: parsed.reasoning || '',
-    queryUsed: parsed.query_used || queryParts.join(' | '),
+    reasoning: reasoningText || 'Grounded Google Search returned no narrative text.',
+    queryUsed: searchQueries[0] || queryParts.join(' | '),
     matches,
-    groundingUrls: (groundingMeta?.groundingChunks || [])
-      .map(c => c.web?.uri).filter(Boolean).slice(0, 10)
+    groundingUrls: chunks.map(c => c.web?.uri).filter(Boolean).slice(0, 10)
   };
 }
 
