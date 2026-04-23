@@ -134,6 +134,8 @@ async function assembleResult(run) {
     width:      detection?.width  || media.width  || 0,
     height:     detection?.height || media.height || 0,
 
+    rights:     media.rights || { approved: false },
+
     heroFrameSec:     detection?.heroFrameSec     ?? null,
     heroReason:       detection?.heroReason       || null,
     videoDurationSec: detection?.videoDurationSec ?? null,
