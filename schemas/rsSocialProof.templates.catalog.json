@@ -1,0 +1,479 @@
+{
+  "catalog_id": "reach_social_social_proof_templates",
+  "version": "1.0.0",
+  "status": "locked",
+  "family": "social_proof",
+  "description": "Canonical social-proof template library for Reach Social ad generation.",
+  "global_rules": {
+    "all_templates_support_video": true,
+    "supported_aspect_ratios": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
+    "supported_entry_points": ["product", "post"],
+    "supported_post_types": ["branded", "ugc"],
+    "global_content_modules": [
+      "brand",
+      "product",
+      "ugc",
+      "creator",
+      "social_proof",
+      "performance_metrics",
+      "cta",
+      "trust_markers",
+      "copy"
+    ],
+    "global_render_principles": [
+      "Templates must remain legible and compelling on mobile first.",
+      "Social proof should be visually obvious within the first glance.",
+      "A product or offer should always be visually anchored somewhere in the composition unless explicitly proof-only.",
+      "Video behavior must preserve readability and prioritize one primary motion zone.",
+      "All templates must degrade gracefully to image-only mode if video is unavailable."
+    ]
+  },
+  "templates": [
+    {
+      "id": "testimonial_spotlight",
+      "name": "Testimonial Spotlight",
+      "status": "active",
+      "ui_label": "Testimonial Spotlight",
+      "tagline": "One strong quote. One clear product. One clean conversion story.",
+      "purpose": "Highlight a single high-quality testimonial as the hero proof element, supported by product, rating, and review count.",
+      "summary": "A quote-first template designed to make one customer testimonial feel premium, credible, and conversion-oriented.",
+      "preset_architecture": {
+        "base_family": "quote_focus",
+        "overlay_package": "rating_bar",
+        "copy_system": "headline_quote_cta",
+        "motion_system": "subtle_product_motion"
+      },
+      "emphasis": "quote-first",
+      "primary_proof_types": ["testimonial", "rating", "review_count"],
+      "supported_entry_points": [
+        { "type": "product", "priority": "high", "behavior": "Preferred entry point. Product is primary and testimonial supports conversion." },
+        { "type": "post", "priority": "medium", "behavior": "Allowed when a testimonial or quote can be derived from UGC, review, or creator text." }
+      ],
+      "supported_post_types": [
+        { "type": "branded", "support_level": "supported" },
+        { "type": "ugc", "support_level": "supported" }
+      ],
+      "ideal_use_cases": [
+        "hero product ads with one standout review",
+        "customer favorite campaigns",
+        "landing-page-style social ads",
+        "high trust conversion creatives"
+      ],
+      "required_content": {
+        "must_have": ["product.name", "cta.text"],
+        "must_have_any": [
+          ["social_proof.primary_quote", "social_proof.quotes[0]", "copy.headline"]
+        ]
+      },
+      "preferred_content": [
+        "product.hero_image",
+        "social_proof.rating",
+        "social_proof.review_count",
+        "social_proof.primary_quote.author_name",
+        "brand.logo",
+        "trust_markers.badges"
+      ],
+      "optional_content": [
+        "product.price",
+        "product.secondary_image",
+        "copy.subheadline",
+        "trusted_by_count",
+        "offer_text"
+      ],
+      "content_priority": ["primary_quote", "headline", "product_hero", "rating_summary", "cta"],
+      "copy_strategy": {
+        "headline_role": "frames the proof",
+        "subheadline_role": "supports the quote or offer",
+        "primary_copy_role": "testimonial text is the hero message",
+        "cta_role": "clear and direct"
+      },
+      "visual_character": {
+        "tone": ["clean", "premium", "modern", "trustworthy"],
+        "density": "low_to_medium",
+        "style_bias": "editorial_social_proof"
+      },
+      "video_support": {
+        "supported": true,
+        "primary_video_role": "product hero motion or soft background motion",
+        "preferred_motion_zone": "product_media",
+        "motion_intensity": "subtle",
+        "rules": [
+          "Quote card remains pinned and legible over motion.",
+          "Only one primary video area should animate prominently.",
+          "Background motion must be softened with overlay treatment."
+        ]
+      },
+      "proof_modules": {
+        "allowed": ["primary_quote", "rating_summary", "review_count", "proof_badges", "trusted_by_text"],
+        "discouraged": ["dense multi-quote stacks", "heavy engagement chips"]
+      },
+      "selection_rules": [
+        "Prefer this template when one testimonial is clearly stronger than all others.",
+        "Prefer this template when product trust and clarity matter more than creator personality.",
+        "Do not use as default when the proof is mainly engagement-driven or creator-led."
+      ],
+      "distinctive_features": [
+        "single hero quote",
+        "elevated testimonial treatment",
+        "minimal clutter",
+        "clean proof bar"
+      ]
+    },
+    {
+      "id": "ugc_split_screen",
+      "name": "UGC Split-Screen",
+      "status": "active",
+      "ui_label": "UGC Split-Screen",
+      "tagline": "Real content on one side. Product conversion on the other.",
+      "purpose": "Pair a creator or UGC asset with the product in a split composition that makes the proof feel authentic and shoppable.",
+      "summary": "A dual-panel template where social proof comes from a creator, customer, or post asset, balanced against a product panel.",
+      "preset_architecture": {
+        "base_family": "split_focus",
+        "overlay_package": "quote_bubble",
+        "copy_system": "creator_quote_cta",
+        "motion_system": "primary_panel_motion"
+      },
+      "emphasis": "ugc-first",
+      "primary_proof_types": ["ugc", "creator_quote", "engagement", "social_context"],
+      "supported_entry_points": [
+        { "type": "post", "priority": "highest", "behavior": "Best fit when starting from a branded or UGC post." },
+        { "type": "product", "priority": "supported", "behavior": "Allowed if a matched creator/lifestyle/UGC asset is available or can be resolved." }
+      ],
+      "supported_post_types": [
+        { "type": "branded", "support_level": "supported", "behavior": "Can use branded post as the social panel." },
+        { "type": "ugc", "support_level": "preferred", "behavior": "Best fit. UGC permissions state matters operationally, but the template concept remains the same." }
+      ],
+      "ideal_use_cases": [
+        "creator-inspired product ads",
+        "UGC conversion units",
+        "split-view mobile ads",
+        "post-to-product conversion creatives"
+      ],
+      "required_content": {
+        "must_have": ["product.name", "cta.text"],
+        "must_have_any": [
+          ["ugc.image_or_video", "creator.portrait_image_or_video"],
+          ["product.hero_image_or_video"],
+          ["social_proof.primary_quote", "ugc.caption", "copy.headline"]
+        ]
+      },
+      "preferred_content": [
+        "creator.handle",
+        "creator.name",
+        "ugc.likes",
+        "ugc.comments",
+        "product.hero_image",
+        "social_proof.proof_badges"
+      ],
+      "optional_content": [
+        "creator.avatar",
+        "platform_name",
+        "product.price",
+        "rating_summary",
+        "trust_badges"
+      ],
+      "content_priority": [
+        "ugc_or_creator_media",
+        "product_media",
+        "quote_or_caption",
+        "creator_identity",
+        "engagement_row",
+        "cta"
+      ],
+      "copy_strategy": {
+        "headline_role": "secondary support to the quote or caption",
+        "subheadline_role": "optional reinforcement",
+        "primary_copy_role": "UGC quote or caption drives the message",
+        "cta_role": "conversion anchor"
+      },
+      "visual_character": {
+        "tone": ["fresh", "social", "high-trust", "mobile-native"],
+        "density": "medium",
+        "style_bias": "creator_meets_product"
+      },
+      "video_support": {
+        "supported": true,
+        "primary_video_role": "creator/UGC panel",
+        "preferred_motion_zone": "ugc_panel",
+        "motion_intensity": "dynamic",
+        "rules": [
+          "If both UGC and product have video, only one should autoplay prominently.",
+          "The quote/caption overlay must stay readable over motion.",
+          "The composition should still work as an image-only split layout."
+        ]
+      },
+      "proof_modules": {
+        "allowed": ["creator_quote", "engagement_chips", "creator_handle", "proof_badges", "light_rating_support"],
+        "discouraged": ["dense multi-review stacks", "heavy metric tables"]
+      },
+      "selection_rules": [
+        "Prefer this template when the creative should feel native to social.",
+        "Prefer this template when a creator, customer, or post asset is a major strength.",
+        "Do not use when there is no viable companion social asset."
+      ],
+      "distinctive_features": [
+        "split visual system",
+        "UGC/product tension",
+        "creator identity row",
+        "engagement-aware storytelling"
+      ]
+    },
+    {
+      "id": "review_collage",
+      "name": "Review Collage",
+      "status": "active",
+      "ui_label": "Review Collage",
+      "tagline": "Many voices. One product. Dense, convincing proof.",
+      "purpose": "Surround a hero product with multiple reviews or review snippets to create a high-density social-proof composition.",
+      "summary": "A review-rich template that makes the product feel validated by many customers at once.",
+      "preset_architecture": {
+        "base_family": "grid_showcase",
+        "overlay_package": "review_cards",
+        "copy_system": "headline_summary_cta",
+        "motion_system": "hero_only_motion"
+      },
+      "emphasis": "review-density",
+      "primary_proof_types": ["multiple_reviews", "rating", "review_count", "review_chips"],
+      "supported_entry_points": [
+        { "type": "product", "priority": "highest", "behavior": "Preferred entry point. Product remains the center of gravity." },
+        { "type": "post", "priority": "supported", "behavior": "Allowed if the system can aggregate relevant review or testimonial content around the product." }
+      ],
+      "supported_post_types": [
+        { "type": "branded", "support_level": "supported" },
+        { "type": "ugc", "support_level": "supported" }
+      ],
+      "ideal_use_cases": [
+        "best seller social proof ads",
+        "high-volume review creatives",
+        "Amazon-style validation storytelling",
+        "customer consensus messaging"
+      ],
+      "required_content": {
+        "must_have": ["cta.text"],
+        "must_have_any": [
+          ["product.hero_image_or_video"],
+          ["social_proof.quotes[0]", "social_proof.secondary_quotes"]
+        ]
+      },
+      "preferred_content": [
+        "social_proof.rating",
+        "social_proof.review_count",
+        "3_to_5_short_quotes",
+        "product.badges",
+        "copy.headline"
+      ],
+      "optional_content": [
+        "reviewer_names",
+        "reviewer_avatars",
+        "trusted_by_text",
+        "price",
+        "subheadline"
+      ],
+      "content_priority": ["product_hero", "review_card_stack", "rating_summary", "headline", "cta"],
+      "copy_strategy": {
+        "headline_role": "frames the review consensus",
+        "subheadline_role": "optional supporting message",
+        "primary_copy_role": "review card system is the main copy experience",
+        "cta_role": "bottom-line conversion action"
+      },
+      "visual_character": {
+        "tone": ["credible", "high-conviction", "rich", "social-proof-heavy"],
+        "density": "medium_to_high",
+        "style_bias": "product_centered_review_wall"
+      },
+      "video_support": {
+        "supported": true,
+        "primary_video_role": "hero product only",
+        "preferred_motion_zone": "center_hero",
+        "motion_intensity": "minimal",
+        "rules": [
+          "Review cards remain static and readable.",
+          "Motion should be confined to the hero media area.",
+          "If no video exists, layout remains fully viable as a static collage."
+        ]
+      },
+      "proof_modules": {
+        "allowed": ["rating_summary", "review_count", "review_cards", "review_chips", "product_badges"],
+        "discouraged": ["large creator identity treatment", "heavy engagement metrics"]
+      },
+      "selection_rules": [
+        "Prefer this template when multiple short reviews are available.",
+        "Prefer this template when the proof comes from consensus rather than one hero quote.",
+        "Do not use when only one meaningful proof statement exists."
+      ],
+      "distinctive_features": [
+        "product in the center",
+        "surrounding review cards",
+        "proof density",
+        "consensus-driven storytelling"
+      ]
+    },
+    {
+      "id": "results_proof",
+      "name": "Results Proof",
+      "status": "active",
+      "ui_label": "Results Proof",
+      "tagline": "Lead with measurable outcomes and back them with trust.",
+      "purpose": "Turn ratings, performance metrics, customer counts, or outcome claims into the main persuasive device.",
+      "summary": "A metrics-first template where proof is driven by measurable outcomes rather than purely emotional testimonials.",
+      "preset_architecture": {
+        "base_family": "metrics_first",
+        "overlay_package": "stat_cards",
+        "copy_system": "headline_metrics_quote_cta",
+        "motion_system": "structured_metrics_motion"
+      },
+      "emphasis": "metrics-first",
+      "primary_proof_types": ["performance_metrics", "rating", "review_count", "trusted_by_count", "testimonial_support"],
+      "supported_entry_points": [
+        { "type": "product", "priority": "highest", "behavior": "Preferred when product-level metrics or trust data are available." },
+        { "type": "post", "priority": "supported", "behavior": "Allowed when post or campaign data can support a performance narrative." }
+      ],
+      "supported_post_types": [
+        { "type": "branded", "support_level": "supported" },
+        { "type": "ugc", "support_level": "supported" }
+      ],
+      "ideal_use_cases": [
+        "trusted by X customers",
+        "rating and review volume ads",
+        "stat-driven conversion creative",
+        "outcome-oriented brand proof"
+      ],
+      "required_content": {
+        "must_have": ["copy.headline", "cta.text"],
+        "must_have_any": [["performance_metrics[0]", "performance_metrics[1]"]]
+      },
+      "preferred_content": [
+        "social_proof.primary_quote",
+        "social_proof.rating",
+        "social_proof.review_count",
+        "product.hero_image_or_video",
+        "trusted_by_count"
+      ],
+      "optional_content": ["supporting_media", "subheadline", "proof_badges", "secondary_quote"],
+      "content_priority": ["headline", "metrics_row", "supporting_quote", "product_or_support_media", "trust_footer", "cta"],
+      "copy_strategy": {
+        "headline_role": "states the main result or promise",
+        "subheadline_role": "adds context",
+        "primary_copy_role": "metrics are the main proof language",
+        "cta_role": "action after trust is established"
+      },
+      "visual_character": {
+        "tone": ["confident", "structured", "credible", "conversion-oriented"],
+        "density": "medium",
+        "style_bias": "performance_dashboard_meets_ad"
+      },
+      "video_support": {
+        "supported": true,
+        "primary_video_role": "supportive demo or result-reinforcing motion",
+        "preferred_motion_zone": "support_media",
+        "motion_intensity": "structured",
+        "rules": [
+          "Metrics remain stable and readable over motion.",
+          "Motion should reinforce the proof narrative, not distract from it.",
+          "Metric cards can animate subtly, but the numeric content must remain clear."
+        ]
+      },
+      "proof_modules": {
+        "allowed": ["metric_cards", "rating_summary", "review_count", "trusted_by_text", "supporting_quote"],
+        "discouraged": ["creator-heavy treatment", "dense review collage behavior"]
+      },
+      "selection_rules": [
+        "Prefer this template when quantitative proof is the strongest asset.",
+        "Prefer this template when the campaign needs authority and clarity.",
+        "Do not use when the only usable proof is emotional or creator-led."
+      ],
+      "distinctive_features": [
+        "stat-first hierarchy",
+        "structured proof row",
+        "high clarity",
+        "confidence and authority"
+      ]
+    },
+    {
+      "id": "creator_endorsement",
+      "name": "Creator Endorsement",
+      "status": "active",
+      "ui_label": "Creator Endorsement",
+      "tagline": "A trusted face recommending a product with clear social validation.",
+      "purpose": "Make the creator or endorser the hero while still grounding the composition in product and trust signals.",
+      "summary": "A creator-first template where the recommendation itself is the core proof mechanism.",
+      "preset_architecture": {
+        "base_family": "creator_led",
+        "overlay_package": "trust_ribbon",
+        "copy_system": "creator_quote_product_cta",
+        "motion_system": "creator_primary_motion"
+      },
+      "emphasis": "creator-first",
+      "primary_proof_types": ["creator_quote", "creator_identity", "trust_ribbon", "product_support", "social_badges"],
+      "supported_entry_points": [
+        { "type": "post", "priority": "highest", "behavior": "Preferred when starting from a creator, influencer, or social post." },
+        { "type": "product", "priority": "supported", "behavior": "Allowed if a creator asset or matched post exists." }
+      ],
+      "supported_post_types": [
+        { "type": "branded", "support_level": "supported" },
+        { "type": "ugc", "support_level": "preferred" }
+      ],
+      "ideal_use_cases": [
+        "creator recommendation ads",
+        "influencer-inspired creative",
+        "expert pick or favorite product ads",
+        "founder/creator trust-led campaigns"
+      ],
+      "required_content": {
+        "must_have": ["cta.text"],
+        "must_have_any": [
+          ["creator.portrait_image_or_video", "ugc.image_or_video"],
+          ["product.hero_image_or_video"],
+          ["social_proof.primary_quote", "copy.headline"]
+        ]
+      },
+      "preferred_content": [
+        "creator.name",
+        "creator.handle",
+        "product.hero_image",
+        "social_proof.proof_badges",
+        "trusted_by_text",
+        "brand.logo"
+      ],
+      "optional_content": ["creator.avatar", "rating_summary", "offer_text", "secondary_product_media"],
+      "content_priority": ["creator_media", "endorsement_quote", "product_support", "trust_ribbon", "cta"],
+      "copy_strategy": {
+        "headline_role": "secondary to the endorsement",
+        "subheadline_role": "optional supporting claim",
+        "primary_copy_role": "creator quote is the message anchor",
+        "cta_role": "shoppable handoff"
+      },
+      "visual_character": {
+        "tone": ["charismatic", "aspirational", "high-trust", "social-native"],
+        "density": "medium",
+        "style_bias": "personality_led_conversion"
+      },
+      "video_support": {
+        "supported": true,
+        "primary_video_role": "creator portrait or creator clip",
+        "preferred_motion_zone": "creator_zone",
+        "motion_intensity": "creator-led",
+        "rules": [
+          "Creator motion is the primary storytelling engine.",
+          "Product motion, if present, should be secondary or inset.",
+          "Quote and CTA remain pinned and legible while creator media plays."
+        ]
+      },
+      "proof_modules": {
+        "allowed": ["creator_identity", "creator_quote", "proof_badges", "trust_ribbon", "light_rating_support"],
+        "discouraged": ["dense multi-review collage", "metric-heavy tables"]
+      },
+      "selection_rules": [
+        "Prefer this template when a creator face or identity is a major asset.",
+        "Prefer this template when endorsement quality is stronger than raw review density.",
+        "Do not use when no credible creator or human focal asset exists."
+      ],
+      "distinctive_features": [
+        "creator as hero",
+        "endorsement quote",
+        "product as support",
+        "trust ribbon behavior"
+      ]
+    }
+  ]
+}

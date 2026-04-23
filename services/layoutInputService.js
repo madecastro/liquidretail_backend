@@ -1,34 +1,63 @@
-// Layout input service. On-demand per (mediaId, template, aspectRatio) →
-// assembled RS Social Proof Creative Input JSON the downstream renderer
-// consumes. Cached via LayoutInputArtifact (unique on that tuple); repeat
-// requests return the cache unless `refresh: true` is passed.
+// Layout input service. On-demand builder: given (mediaId, template,
+// aspectRatio), assembles the canonical RS Social Proof Creative Input JSON
+// the renderer consumes. One Gemini structured-output call derives
+// subjective fields (quotes, copy, benefits, badges, theme hints, CTA,
+// trusted_by_text); everything else is deterministic mapping from detect
+// artifacts + Brand catalog + Media metadata.
 //
-// One LLM call per build: Gemini 2.5 Pro with structured output derives the
-// subjective fields (quotes, copy, benefits, badges, theme hints). Everything
-// else is direct mapping / deterministic transformation from the detect
-// artifacts + Brand catalog + Media metadata. See docs in repo on the
-// mapping; when a field has no source we emit null / omit per schema.
+// OUTPUT SHAPE — canonical paths as defined by the normalized template
+// schema. Each top-level module:
+//
+//   template, aspect_ratio
+//   theme:          { style, background_style, emphasis }
+//   brand:          { name, tagline, logo, primary_color, ...,
+//                     font_family, tone[] }
+//   product:        { id, name, category, price, currency, description,
+//                     short_benefits[], badges[],
+//                     hero_media: { image, video },
+//                     secondary_media: { image, video } }
+//   creator:        { name, handle, platform, avatar,
+//                     portrait_media: { image, video } }
+//   ugc:            { post_id, platform, post_type, caption,
+//                     media: { image, video },
+//                     likes, comments, shares, saves,
+//                     rights_approved }
+//   social_proof:   { rating_value, review_count, trusted_by_text,
+//                     proof_badges[],
+//                     primary_quote: {...}, secondary_quotes[] }
+//   performance:    { engagement: { likes, comments, shares, saves, views },
+//                     metrics[] }
+//   cta:            { text, url, subtext, offer_text }
+//   trust:          { retailer_logos[], trusted_by_text,
+//                     certifications[], press_mentions[] }
+//   copy:           { headline, subheadline, eyebrow,
+//                     highlight_text, disclaimer }
+//   layout_options: { show_logo, show_price, show_rating, ... }
+//   defaults:       { fallback_quote, fallback_headline, cta_text,
+//                     product_name }
+//
+// Cached by (mediaId, template, aspectRatio) unique-indexed
+// LayoutInputArtifact; `refresh: true` bypasses.
 
 const axios = require('axios');
 
 const Media                  = require('../models/Media');
-const DetectRun              = require('../models/DetectRun');
 const DetectionArtifact      = require('../models/DetectionArtifact');
 const CropArtifact           = require('../models/CropArtifact');
 const ExtendedCropArtifact   = require('../models/ExtendedCropArtifact');
 const ProductMatchArtifact   = require('../models/ProductMatchArtifact');
 const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
 const { findBrandByName }    = require('./brandCatalogService');
+const registry               = require('./templateRegistry');
 
-const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
+const GEMINI_MODEL    = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
-const TEMPLATES = ['testimonial_spotlight', 'ugc_split_screen', 'review_collage', 'results_proof', 'creator_endorsement'];
-const ASPECT_RATIOS = ['1:1', '4:5', '9:16', '16:9', '1.91:1'];
+// Until webhook ingestion lands, every detect-uploaded Media is treated as
+// Instagram creator UGC — the uploader is standing in for a creator's post.
+const DEFAULT_CREATOR_PLATFORM = 'instagram';
+const DEFAULT_POST_TYPE        = 'ugc';
 
-// Derivation response schema enforced via Gemini responseSchema. These are the
-// fields the LLM is actually responsible for — everything else is assembled
-// deterministically from detect artifacts.
 const DERIVATION_SCHEMA = {
   type: 'object',
   properties: {
@@ -47,8 +76,8 @@ const DERIVATION_SCHEMA = {
         required: ['text', 'source']
       }
     },
-    short_benefits: { type: 'array', items: { type: 'string' } },
-    badges:         { type: 'array', items: { type: 'string' } },
+    short_benefits:   { type: 'array', items: { type: 'string' } },
+    badges:           { type: 'array', items: { type: 'string' } },
     copy: {
       type: 'object',
       properties: {
@@ -67,6 +96,7 @@ const DERIVATION_SCHEMA = {
       },
       required: ['text']
     },
+    trusted_by_text:  { type: 'string' },
     tone:             { type: 'array', items: { type: 'string' } },
     theme_style:      { type: 'string', enum: ['clean', 'modern', 'editorial', 'bold', 'playful', 'luxury'] },
     background_style: { type: 'string', enum: ['solid', 'gradient', 'soft-blur', 'card-stack', 'minimal'] },
@@ -75,27 +105,26 @@ const DERIVATION_SCHEMA = {
   required: ['cta', 'copy', 'theme_style', 'emphasis']
 };
 
+// ──────────────────────────────────────────────────────────────
+//  Public entry point
+// ──────────────────────────────────────────────────────────────
 async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, refresh = false }) {
-  if (!TEMPLATES.includes(template))         throw badRequest(`Unknown template: ${template}`);
-  if (!ASPECT_RATIOS.includes(aspectRatio))  throw badRequest(`Unknown aspect_ratio: ${aspectRatio}`);
+  if (!registry.getNormalized(template)) throw badRequest(`Unknown template: ${template}`);
+  const supportedRatios = registry.getSupportedAspectRatios(template);
+  if (!supportedRatios.includes(aspectRatio))
+    throw badRequest(`Template ${template} does not support aspect ratio ${aspectRatio}`);
 
-  // Cache lookup
   if (!refresh) {
     const cached = await LayoutInputArtifact.findOne({ mediaId, template, aspectRatio }).lean();
     if (cached) return cached.input;
   }
 
-  // Load media + all latest artifacts
   const ctx = await loadContext(mediaId);
   if (!ctx) throw notFound(`Media ${mediaId} not found`);
 
-  // Run the single derivation LLM call
   const derivation = await runDerivation(ctx, template, aspectRatio, options);
-
-  // Assemble the full input
   const input = assembleInput(ctx, template, aspectRatio, options, derivation);
 
-  // Cache it (replace any prior doc for the same tuple)
   await LayoutInputArtifact.findOneAndReplace(
     { mediaId, template, aspectRatio },
     {
@@ -113,32 +142,79 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   return input;
 }
 
+// ──────────────────────────────────────────────────────────────
+//  Preflight — "which templates does this Media's data support?"
+//  Runs the assembler with a cheap stub derivation (no LLM) so the
+//  validator can be exercised against every template for free. Used by the
+//  /candidates endpoint to power template pickers in the UI.
+// ──────────────────────────────────────────────────────────────
+async function getCandidatesForMedia(mediaId, aspectRatio) {
+  const ctx = await loadContext(mediaId);
+  if (!ctx) throw notFound(`Media ${mediaId} not found`);
+
+  const stubDerivation = stubDerivationFromCtx(ctx);
+  const results = [];
+  for (const tmpl of registry.NORMALIZED.templates) {
+    if (!tmpl.aspect_ratios?.supported?.includes(aspectRatio)) {
+      results.push({ template_id: tmpl.template_id, ok: false, reason: `ratio ${aspectRatio} not supported by this template` });
+      continue;
+    }
+    const input = assembleInput(ctx, tmpl.template_id, aspectRatio, {}, stubDerivation);
+    results.push(registry.validateInputAgainstTemplate(input, tmpl.template_id));
+  }
+  return results;
+}
+
+function stubDerivationFromCtx(ctx) {
+  const details = ctx.match?.identification?.details || {};
+  const hasReviewSummary = !!details.reviewSummary?.summary;
+  const productName = ctx.match?.identification?.productName;
+  return {
+    quotes: hasReviewSummary ? [{ text: 'customer quote', source: 'review' }] : [],
+    short_benefits: hasReviewSummary ? ['benefit'] : [],
+    badges: typeof details.rating === 'number' && details.rating >= 4.5 ? ['top rated'] : [],
+    copy: {
+      headline:       productName ? `About ${productName}` : 'Social proof',
+      subheadline:    '',
+      eyebrow:        ctx.match?.identification?.brand || '',
+      highlight_text: ''
+    },
+    cta: { text: 'Shop now' },
+    trusted_by_text:  typeof details.reviewCount === 'number' && details.reviewCount >= 50 ? `Trusted by ${details.reviewCount}+ customers` : '',
+    tone:             [],
+    theme_style:      'clean',
+    background_style: 'soft-blur',
+    emphasis:         'product-first'
+  };
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Context loader
+// ──────────────────────────────────────────────────────────────
 async function loadContext(mediaId) {
   const media = await Media.findById(mediaId).lean();
   if (!media) return null;
-  const runId = media.latestArtifacts?.detection ? await mostRecentRunIdFor(media.latestArtifacts.detection) : null;
+
   const [detection, crops, extended, match] = await Promise.all([
-    media.latestArtifacts?.detection    ? DetectionArtifact.findById(media.latestArtifacts.detection).lean()    : null,
-    media.latestArtifacts?.crops        ? CropArtifact.findById(media.latestArtifacts.crops).lean()              : null,
-    media.latestArtifacts?.extended     ? ExtendedCropArtifact.findById(media.latestArtifacts.extended).lean()   : null,
-    media.latestArtifacts?.match        ? ProductMatchArtifact.findById(media.latestArtifacts.match).lean()      : null
+    media.latestArtifacts?.detection ? DetectionArtifact.findById(media.latestArtifacts.detection).lean()    : null,
+    media.latestArtifacts?.crops     ? CropArtifact.findById(media.latestArtifacts.crops).lean()              : null,
+    media.latestArtifacts?.extended  ? ExtendedCropArtifact.findById(media.latestArtifacts.extended).lean()   : null,
+    media.latestArtifacts?.match     ? ProductMatchArtifact.findById(media.latestArtifacts.match).lean()      : null
   ]);
+  const runId = detection?.runId || null;
   const brandName = match?.identification?.brand || media.metadata?.brand || null;
-  const brand = brandName ? await findBrandByName(brandName).then(b => b?.toObject?.() || b).catch(() => null) : null;
+  const brand = brandName
+    ? await findBrandByName(brandName).then(b => b?.toObject?.() || b).catch(() => null)
+    : null;
+
   return { media, detection, crops, extended, match, brand, runId };
 }
 
-async function mostRecentRunIdFor(artifactId) {
-  const a = await DetectionArtifact.findById(artifactId).select('runId').lean();
-  return a?.runId || null;
-}
-
+// ──────────────────────────────────────────────────────────────
+//  Derivation LLM
+// ──────────────────────────────────────────────────────────────
 async function runDerivation(ctx, template, aspectRatio, options) {
-  if (!process.env.GEMINI_API_KEY) {
-    // No LLM — return a safe minimum so assembly still produces a valid
-    // (if bland) input.
-    return fallbackDerivation(ctx);
-  }
+  if (!process.env.GEMINI_API_KEY) return fallbackDerivation(ctx);
 
   const prompt = buildDerivationPrompt(ctx, template, aspectRatio, options);
 
@@ -157,7 +233,6 @@ async function runDerivation(ctx, template, aspectRatio, options) {
       },
       { timeout: 45000 }
     );
-
     const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) {
       console.warn(`   ⚠️  layout-derivation: empty response (finishReason=${res.data?.candidates?.[0]?.finishReason})`);
@@ -193,21 +268,21 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   }
   lines.push('');
   lines.push('SOCIAL CONTEXT:');
-  lines.push(`  Platform: ${media.source}`);
-  if (media.metadata?.caption) lines.push(`  Caption: "${media.metadata.caption}"`);
+  lines.push(`  Platform: ${DEFAULT_CREATOR_PLATFORM} (simulated; real ingestion will supply this)`);
+  if (media.metadata?.caption)       lines.push(`  Caption: "${media.metadata.caption}"`);
+  if (media.metadata?.creatorName)   lines.push(`  Creator: ${media.metadata.creatorName}`);
+  if (media.metadata?.creatorHandle) lines.push(`  Handle: ${media.metadata.creatorHandle}`);
   if (media.platformStats) {
     const s = media.platformStats;
     const stats = ['likes','comments','shares','saves','views'].map(k => s[k] != null ? `${k}=${s[k]}` : null).filter(Boolean).join(', ');
-    if (stats) lines.push(`  Stats: ${stats}`);
+    if (stats) lines.push(`  Engagement stats: ${stats}`);
   }
   if (detection?.transcript?.text) lines.push(`  Transcript: "${String(detection.transcript.text).slice(0, 800)}"`);
   lines.push('');
   lines.push('REVIEW SIGNAL:');
-  if (typeof details.rating === 'number')     lines.push(`  Rating: ${details.rating}`);
+  if (typeof details.rating === 'number')      lines.push(`  Rating: ${details.rating}`);
   if (typeof details.reviewCount === 'number') lines.push(`  Review count: ${details.reviewCount}`);
-  if (details.reviewSummary?.summary) {
-    lines.push(`  Review summary: ${details.reviewSummary.summary}`);
-  }
+  if (details.reviewSummary?.summary)          lines.push(`  Review summary: ${details.reviewSummary.summary}`);
   lines.push('');
   if (detection?.background) {
     const bg = detection.background;
@@ -218,10 +293,8 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     if (bg.setting)     lines.push(`  Setting: ${bg.setting}`);
     lines.push('');
   }
-  // Brand demographics feed PERSONA-DRIVEN notional quote generation. If
-  // the brand catalog has target personas (enriched from the brand URL),
-  // the LLM authors quotes as voice-of-persona, using the review summary
-  // as grounding for WHAT those personas would care about.
+
+  // Demographics → persona-authored notional quotes
   const demos = Array.isArray(ctx.brand?.demographics) ? ctx.brand.demographics.slice(0, 5) : [];
   if (demos.length) {
     lines.push('BRAND KEY PERSONAS (use these as quote authors):');
@@ -237,18 +310,19 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   }
 
   lines.push(`TASK:`);
-  lines.push(`Produce JSON that matches the provided schema. Rules:`);
+  lines.push(`Produce JSON matching the schema. Rules:`);
   lines.push(`- "copy.headline" ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
   lines.push(`- "short_benefits" ≤ 5 items, each ≤ 6 words, phrased as concrete buyer benefits (not specs).`);
-  lines.push(`- "badges" ≤ 4 items, each 1–3 words. Only emit a badge the signal actually supports (e.g. "4.7★ rated" only if rating ≥ 4.5).`);
+  lines.push(`- "badges" ≤ 4 items, each 1–3 words. Only emit a badge the signal supports (e.g. "4.7★ rated" only if rating ≥ 4.5).`);
   if (demos.length) {
-    lines.push(`- "quotes" up to 6 NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name should be the persona's name (e.g. "Saltwater Joe"); author_title is a one-phrase identity cue (e.g. "charter captain, FL"); source="testimonial" for review-like quotes or "ugc" for caption-style. Ground WHAT they say in the review summary so the substance is true even though the author is notional. verified=true only if the brand has well-documented social proof. Keep each quote ≤ 22 words; mix lengths and angles across quotes.`);
+    lines.push(`- "quotes" up to 6 NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name is the persona's name; author_title is a one-phrase identity cue; source="testimonial" or "ugc". Ground substance in the review summary. verified=true only if the brand has well-documented social proof. ≤ 22 words per quote; mix lengths.`);
   } else {
-    lines.push(`- "quotes" up to 6 short notional reviews/comments drawn from the review summary. Keep author_name null and source="review" unless caption signal clearly implies a creator; verified=false unless clearly endorsed. ≤ 20 words per quote.`);
+    lines.push(`- "quotes" up to 6 short notional reviews/comments drawn from the review summary. author_name can be null; source="review" unless signal clearly implies creator/ugc. verified=false unless clearly endorsed. ≤ 20 words per quote.`);
   }
-  lines.push(`- "cta.text" ≤ 3 words, imperative voice (e.g. "Shop now", "See reviews"). "offer_text" only if price/offer data supports it; otherwise omit.`);
-  lines.push(`- "tone" 2–4 single-word descriptors matching the brand + caption voice.`);
-  lines.push(`- "theme_style" / "background_style" / "emphasis" pick values best suited to the template and available signal.`);
+  lines.push(`- "cta.text" ≤ 3 words, imperative voice (e.g. "Shop now"). "offer_text" only if price/offer data supports it.`);
+  lines.push(`- "trusted_by_text" only if review_count ≥ 50 — format "Trusted by Xk+ customers" or similar. Otherwise omit.`);
+  lines.push(`- "tone" 2–4 single-word descriptors matching brand + caption voice.`);
+  lines.push(`- "theme_style" / "background_style" / "emphasis" pick values best suited to the template and signal.`);
   lines.push(`If a field has no real signal, prefer omitting over fabricating.`);
   return lines.join('\n');
 }
@@ -271,12 +345,13 @@ function fallbackDerivation(ctx) {
     short_benefits: [],
     badges: [],
     copy: {
-      headline:    ident.productName ? `Meet ${ident.productName}` : 'See why customers love it',
-      subheadline: '',
-      eyebrow:     ident.brand || '',
+      headline:       ident.productName ? `Meet ${ident.productName}` : 'See why customers love it',
+      subheadline:    '',
+      eyebrow:        ident.brand || '',
       highlight_text: ''
     },
     cta: { text: 'Shop now' },
+    trusted_by_text:  '',
     tone: [],
     theme_style:      'clean',
     background_style: 'soft-blur',
@@ -284,18 +359,26 @@ function fallbackDerivation(ctx) {
   };
 }
 
-// ── Assembly ─────────────────────────────────────────────────────────────
-
+// ──────────────────────────────────────────────────────────────
+//  Canonical assembly
+// ──────────────────────────────────────────────────────────────
 function assembleInput(ctx, template, aspectRatio, options, derivation) {
-  const { media, detection, crops, extended, match, brand } = ctx;
+  const { media, detection, match, brand } = ctx;
   const ident   = match?.identification || {};
   const details = ident.details || {};
   const palette = detection?.background?.palette || [];
 
-  const hero      = pickHeroImageUrl(ctx, aspectRatio);
-  const secondary = pickSecondaryImageUrl(ctx, aspectRatio);
+  const heroMedia      = pickHeroMedia(ctx, aspectRatio);
+  const secondaryMedia = pickSecondaryMedia(ctx, aspectRatio);
+  const creatorMedia   = pickCreatorMedia(ctx);
+  const ugcMedia       = creatorMedia;  // detect uploads == creator post asset
+
+  const quotes = Array.isArray(derivation.quotes) ? derivation.quotes : [];
+  const primaryQuote = quotes[0] ? { ...quotes[0] } : null;
+  const secondaryQuotes = quotes.slice(1).map(q => ({ ...q }));
 
   const rightsApproved = !!media.rights?.approved;
+  const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
 
   const input = {
     template,
@@ -308,9 +391,9 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     },
 
     brand: {
-      name:            ident.brand || media.metadata?.brand || brand?.name || 'Brand',
+      name:            brandName,
       tagline:         brand?.tagline || undefined,
-      logo_url:        brand?.logoUrl || undefined,
+      logo:            brand?.logoUrl || undefined,
       primary_color:   brand?.primaryColor   || palette[0] || undefined,
       secondary_color: brand?.secondaryColor || palette[1] || undefined,
       accent_color:    brand?.accentColor    || palette[2] || undefined,
@@ -319,47 +402,67 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     },
 
     product: {
-      id:             details.productId || undefined,
-      name:           ident.productName || details.title || 'Product',
-      category:       media.metadata?.category || firstYoloCategory(detection) || undefined,
-      price:          details.price?.value ?? details.price?.display ?? undefined,
-      currency:       details.price?.currency || undefined,
-      hero_image_url: hero || media.fileUrl,
-      secondary_image_url: secondary || undefined,
-      description:    details.description || detection?.primarySubjectDesc || undefined,
+      id:            details.productId || undefined,
+      name:          ident.productName || details.title || 'Product',
+      category:      media.metadata?.category || firstYoloCategory(detection) || undefined,
+      price:         details.price?.value ?? details.price?.display ?? undefined,
+      currency:      details.price?.currency || undefined,
+      description:   details.description || detection?.primarySubjectDesc || undefined,
       short_benefits: limitArray(derivation.short_benefits, 5),
-      badges:         limitArray(derivation.badges, 4)
+      badges:         limitArray(derivation.badges, 4),
+      hero_media:      mediaPair(heroMedia),
+      secondary_media: mediaPair(secondaryMedia)
+    },
+
+    creator: {
+      name:     media.metadata?.creatorName   || undefined,
+      handle:   media.metadata?.creatorHandle || undefined,
+      platform: DEFAULT_CREATOR_PLATFORM,
+      avatar:   undefined,                                // not derived yet; future persona-avatar gen slot
+      portrait_media: mediaPair(creatorMedia)
     },
 
     ugc: {
-      post_id:        media.externalId,
-      platform:       normalizePlatform(media.source),
-      image_url:      detection?.imageUrl || media.fileUrl,
-      caption:        media.metadata?.caption || undefined,
-      creator_name:   media.metadata?.creatorName   || undefined,
-      creator_handle: media.metadata?.creatorHandle || undefined,
-      likes:          media.platformStats?.likes    ?? undefined,
-      comments:       media.platformStats?.comments ?? undefined,
-      shares:         media.platformStats?.shares   ?? undefined,
-      saves:          media.platformStats?.saves    ?? undefined,
-      rights_approved: rightsApproved,
-      post_type:       media.source === 'manual_upload' ? 'branded' : 'ugc'
+      post_id:         media.externalId,
+      platform:        DEFAULT_CREATOR_PLATFORM,
+      post_type:       DEFAULT_POST_TYPE,
+      caption:         media.metadata?.caption || undefined,
+      media:           mediaPair(ugcMedia),
+      likes:           media.platformStats?.likes    ?? undefined,
+      comments:        media.platformStats?.comments ?? undefined,
+      shares:          media.platformStats?.shares   ?? undefined,
+      saves:           media.platformStats?.saves    ?? undefined,
+      rights_approved: rightsApproved
     },
 
     social_proof: {
-      rating:       typeof details.rating === 'number' ? details.rating : undefined,
-      review_count: typeof details.reviewCount === 'number' ? details.reviewCount : undefined,
-      proof_badges: limitArray(derivation.badges, 4),
-      quotes:       limitArray(derivation.quotes, 6)
+      rating_value:    typeof details.rating === 'number' ? details.rating : undefined,
+      review_count:    typeof details.reviewCount === 'number' ? details.reviewCount : undefined,
+      trusted_by_text: derivation.trusted_by_text || trustedByFromStats(details) || undefined,
+      proof_badges:    limitArray(derivation.badges, 4),
+      primary_quote:   primaryQuote || undefined,
+      secondary_quotes: secondaryQuotes.length ? secondaryQuotes : undefined
     },
 
-    performance_metrics: buildPerformanceMetrics(media, match),
+    performance: {
+      engagement: stripEmpty({
+        likes:    media.platformStats?.likes    ?? undefined,
+        comments: media.platformStats?.comments ?? undefined,
+        shares:   media.platformStats?.shares   ?? undefined,
+        saves:    media.platformStats?.saves    ?? undefined,
+        views:    media.platformStats?.views    ?? undefined
+      }),
+      metrics: buildPerformanceMetrics(media, match)
+    },
 
     cta: mergeCta(derivation.cta, options.cta, details),
 
-    trust_markers: {
-      retailer_logos: buildRetailerLogos(details.sellers)
-    },
+    trust: stripEmpty({
+      retailer_logos:  buildRetailerLogos(details.sellers),
+      trusted_by_text: derivation.trusted_by_text || trustedByFromStats(details) || undefined,
+      certifications:  undefined,
+      press_mentions:  undefined
+    }),
 
     copy: stripEmpty({
       headline:       derivation.copy?.headline,
@@ -370,51 +473,97 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     }),
 
     layout_options: options.layout_options || {
-      show_logo:          !!brand?.logoUrl,
-      show_price:         !!(details.price?.display || details.price?.value),
-      show_rating:        typeof details.rating === 'number',
-      show_review_count:  typeof details.reviewCount === 'number',
-      show_creator_handle: !!media.metadata?.creatorHandle && rightsApproved,
-      show_engagement:    !!media.platformStats && rightsApproved,
-      show_badges:        (derivation.badges?.length || 0) > 0,
-      show_cta:           true
+      show_logo:           !!brand?.logoUrl,
+      show_price:          !!(details.price?.display || details.price?.value),
+      show_rating:         typeof details.rating === 'number',
+      show_review_count:   typeof details.reviewCount === 'number',
+      show_creator_handle: !!media.metadata?.creatorHandle,
+      show_engagement:     !!media.platformStats && rightsApproved,
+      show_badges:         (derivation.badges?.length || 0) > 0,
+      show_cta:            true
+    },
+
+    defaults: {
+      fallback_quote:    'Customers love it.',
+      fallback_headline: brandName ? `See why ${brandName} customers come back` : 'See why they come back',
+      cta_text:          'Shop now',
+      product_name:      ident.productName || 'This product'
     }
   };
 
   return stripUndefinedDeep(input);
 }
 
-function pickHeroImageUrl(ctx, ratio) {
-  const { detection, crops, extended } = ctx;
-  const base = ['5:4', '1:1', '4:5'];
-  if (base.includes(ratio)) {
-    const winnerId = crops?.winners?.[ratio];
-    const list = crops?.smartCrops?.[ratio] || [];
+// ──────────────────────────────────────────────────────────────
+//  Media resolution helpers
+// ──────────────────────────────────────────────────────────────
+function pickHeroMedia(ctx, aspectRatio) {
+  const { media, detection, crops, extended } = ctx;
+  const out = { image: null, video: null };
+  const baseRatios = ['5:4', '1:1', '4:5'];
+
+  if (baseRatios.includes(aspectRatio)) {
+    const winnerId = crops?.winners?.[aspectRatio];
+    const list = crops?.smartCrops?.[aspectRatio] || [];
     const winner = list.find(c => c.id === winnerId) || list[0];
-    if (winner && detection?.imageUrl) return buildCloudinaryCropUrl(detection.imageUrl, winner);
+    if (winner && detection?.imageUrl) {
+      out.image = buildCloudinaryCropUrl(detection.imageUrl, winner);
+    }
+    if (media.fileType === 'video' && media.fileUrl && winner) {
+      out.video = buildCloudinaryCropUrl(media.fileUrl, winner);
+    }
+  } else if (aspectRatio === '9:16' || aspectRatio === '1.91:1') {
+    const winnerRef = extended?.selectedWinners?.[aspectRatio]?.candidateId;
+    const list = extended?.candidates?.[aspectRatio] || [];
+    const winner = list.find(c => c.id === winnerRef)
+      || list.find(c => c.provider === 'gemini')
+      || list[0];
+    if (winner?.imageUrl) out.image = winner.imageUrl;
+    if (winner?.videoUrl) out.video = winner.videoUrl;
+  } else if (aspectRatio === '16:9') {
+    // Not produced yet — best-effort fallback to any base ratio winner.
+    for (const r of ['5:4', '1:1', '4:5']) {
+      const m = pickHeroMedia(ctx, r);
+      if (m.image) return m;
+    }
   }
-  if (ratio === '9:16' || ratio === '1.91:1') {
-    const winnerRef = extended?.selectedWinners?.[ratio]?.candidateId;
-    const list = extended?.candidates?.[ratio] || [];
-    const winner = list.find(c => c.id === winnerRef) || list.find(c => c.provider === 'gemini') || list[0];
-    if (winner?.imageUrl) return winner.imageUrl;
-  }
-  // 16:9 isn't produced yet — fall back to source.
-  return detection?.imageUrl || null;
+  return out;
 }
 
-function pickSecondaryImageUrl(ctx, heroRatio) {
-  // Pick a different ratio's winner as the secondary, preferring a contrasting
-  // orientation (portrait hero → landscape secondary and vice versa).
-  const order = heroRatio === '9:16' || heroRatio === '4:5'
+function pickSecondaryMedia(ctx, heroRatio) {
+  const order = (heroRatio === '9:16' || heroRatio === '4:5')
     ? ['1.91:1', '5:4', '1:1', '4:5', '9:16']
     : ['4:5', '1:1', '9:16', '1.91:1', '5:4'];
+  const heroImage = pickHeroMedia(ctx, heroRatio).image;
   for (const r of order) {
     if (r === heroRatio) continue;
-    const url = pickHeroImageUrl(ctx, r);
-    if (url && url !== pickHeroImageUrl(ctx, heroRatio)) return url;
+    const m = pickHeroMedia(ctx, r);
+    if (m.image && m.image !== heroImage) return m;
   }
-  return null;
+  return { image: null, video: null };
+}
+
+// Creator / UGC portrait media. Detect-uploaded Media is treated as creator
+// content: for video, hero frame = image, source URL = video; for image,
+// source URL = image, video = null.
+function pickCreatorMedia(ctx) {
+  const { media, detection } = ctx;
+  const out = { image: null, video: null };
+  if (media.fileType === 'video') {
+    out.image = detection?.imageUrl || media.fileUrl;
+    out.video = media.fileUrl;
+  } else {
+    out.image = media.fileUrl;
+  }
+  return out;
+}
+
+function mediaPair(p) {
+  if (!p) return undefined;
+  const obj = {};
+  if (p.image) obj.image = p.image;
+  if (p.video) obj.video = p.video;
+  return Object.keys(obj).length ? obj : undefined;
 }
 
 function buildCloudinaryCropUrl(sourceUrl, crop) {
@@ -427,15 +576,12 @@ function buildCloudinaryCropUrl(sourceUrl, crop) {
   return sourceUrl.replace('/upload/', `/upload/${transform}/`);
 }
 
+// ──────────────────────────────────────────────────────────────
+//  Assorted helpers
+// ──────────────────────────────────────────────────────────────
 function firstYoloCategory(detection) {
   const det = (detection?.yoloProducts || []).find(d => d.identification?.category);
   return det?.identification?.category || null;
-}
-
-function normalizePlatform(source) {
-  if (!source) return 'other';
-  const map = { meta: 'facebook', instagram: 'instagram', tiktok: 'tiktok', youtube: 'youtube', manual_upload: 'other' };
-  return map[source] || 'other';
 }
 
 function buildPerformanceMetrics(media, match) {
@@ -445,11 +591,18 @@ function buildPerformanceMetrics(media, match) {
   if (typeof stats.likes    === 'number' && stats.likes    > 0) metrics.push({ label: 'Likes',    value: formatCount(stats.likes) });
   if (typeof stats.comments === 'number' && stats.comments > 0) metrics.push({ label: 'Comments', value: formatCount(stats.comments) });
   if (typeof stats.shares   === 'number' && stats.shares   > 0) metrics.push({ label: 'Shares',   value: formatCount(stats.shares) });
-  const rating = match?.identification?.details?.rating;
+  const rating      = match?.identification?.details?.rating;
   const reviewCount = match?.identification?.details?.reviewCount;
-  if (typeof rating === 'number')      metrics.push({ label: 'Rating',      value: `${rating.toFixed(1)}★` });
-  if (typeof reviewCount === 'number') metrics.push({ label: 'Reviews',     value: formatCount(reviewCount) });
+  if (typeof rating === 'number')      metrics.push({ label: 'Rating',  value: `${rating.toFixed(1)}★` });
+  if (typeof reviewCount === 'number') metrics.push({ label: 'Reviews', value: formatCount(reviewCount) });
   return metrics.slice(0, 6);
+}
+
+function trustedByFromStats(details) {
+  if (typeof details.reviewCount === 'number' && details.reviewCount >= 50) {
+    return `Trusted by ${formatCount(details.reviewCount)}+ customers`;
+  }
+  return null;
 }
 
 function formatCount(n) {
@@ -478,7 +631,9 @@ function domainFromUrl(url) {
 }
 
 function mergeCta(derivedCta, callerCta, details) {
-  const primarySellerUrl = Array.isArray(details.sellers) && details.sellers[0]?.link ? details.sellers[0].link : null;
+  const primarySellerUrl = Array.isArray(details.sellers) && details.sellers[0]?.link
+    ? details.sellers[0].link
+    : null;
   return stripEmpty({
     text:       callerCta?.text       || derivedCta?.text       || 'Shop now',
     url:        callerCta?.url        || primarySellerUrl       || undefined,
@@ -493,9 +648,11 @@ function limitArray(arr, max) {
 }
 
 function stripEmpty(obj) {
+  if (!obj) return undefined;
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
     if (v == null || v === '') continue;
+    if (Array.isArray(v) && v.length === 0) continue;
     out[k] = v;
   }
   return Object.keys(out).length ? out : undefined;
@@ -521,4 +678,11 @@ function stripUndefinedDeep(obj) {
 function badRequest(msg) { const e = new Error(msg); e.status = 400; return e; }
 function notFound(msg)   { const e = new Error(msg); e.status = 404; return e; }
 
-module.exports = { buildLayoutInput, TEMPLATES, ASPECT_RATIOS };
+module.exports = {
+  buildLayoutInput,
+  getCandidatesForMedia,
+  // Exported for tests / future preview UI:
+  assembleInput,
+  stubDerivationFromCtx,
+  loadContext
+};

@@ -1,0 +1,730 @@
+{
+  "templates": [
+    {
+      "template_id": "testimonial_spotlight",
+      "version": "1.0.0",
+      "status": "active",
+      "supports_video": true,
+      "family": "social_proof",
+      "layout": {
+        "base_family": "quote_focus",
+        "overlay_package": "rating_bar",
+        "copy_system": "headline_quote_cta",
+        "motion_system": "subtle_product_motion"
+      },
+      "aspect_ratios": {
+        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
+        "preferred": ["1:1", "4:5", "9:16"]
+      },
+      "zones": {
+        "hero": {
+          "id": "hero_quote",
+          "type": "text_card",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "social_proof.primary_quote.text",
+              "copy.headline",
+              "defaults.fallback_quote"
+            ]
+          },
+          "limits": {
+            "max_chars": {
+              "1:1": 140,
+              "4:5": 160,
+              "9:16": 180,
+              "16:9": 120,
+              "1.91:1": 110
+            }
+          }
+        },
+        "support_media": {
+          "id": "support_media",
+          "type": "media",
+          "required": false,
+          "slot_binding": {
+            "source_priority": [
+              "product.hero_media.video",
+              "product.hero_media.image",
+              "creator.portrait_media.video",
+              "creator.portrait_media.image",
+              "media.background_media.video",
+              "media.background_media.image"
+            ]
+          },
+          "media_rules": {
+            "accepted_kinds": ["image", "video"],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "rating_bar": {
+          "id": "rating_bar",
+          "type": "proof_bar",
+          "required": false,
+          "slot_binding": {
+            "source_priority": [
+              "social_proof.rating_value",
+              "social_proof.review_count",
+              "trust.trusted_by_text"
+            ]
+          }
+        },
+        "product_meta": {
+          "id": "product_meta",
+          "type": "meta_block",
+          "required": true,
+          "slot_binding": {
+            "name": ["product.name", "defaults.product_name"],
+            "price": ["product.price"],
+            "badges": ["product.badges", "social_proof.proof_badges"]
+          }
+        },
+        "cta": {
+          "id": "cta",
+          "type": "button",
+          "required": true,
+          "slot_binding": {
+            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
+            "url": ["cta.url"]
+          }
+        }
+      },
+      "render_order": ["brand", "hero", "support_media", "rating_bar", "product_meta", "cta", "legal"],
+      "slot_adapter": {
+        "brand.logo": ["brand.logo"],
+        "brand.brand_name": ["brand.name"],
+        "brand.eyebrow": ["copy.eyebrow", "brand.tagline"],
+        "copy.headline": ["copy.headline", "social_proof.primary_quote.text"],
+        "copy.subheadline": ["copy.subheadline"],
+        "copy.cta_text": ["cta.text", "copy.cta_text"],
+        "social_proof.primary_quote.text": ["social_proof.primary_quote.text", "social_proof.quotes.0.text"],
+        "social_proof.primary_quote.author_name": [
+          "social_proof.primary_quote.author_name",
+          "social_proof.quotes.0.author_name",
+          "creator.name"
+        ],
+        "social_proof.rating_value": ["social_proof.rating_value", "social_proof.rating"],
+        "social_proof.review_count": ["social_proof.review_count"],
+        "trust.trusted_by_text": ["trust.trusted_by_text", "social_proof.trusted_by_text"],
+        "product.name": ["product.name"],
+        "product.price": ["product.price"],
+        "product.badges": ["product.badges", "social_proof.proof_badges"],
+        "product.hero_media.image": ["product.hero_media.image", "product.image"],
+        "product.hero_media.video": ["product.hero_media.video"]
+      },
+      "visibility_rules": {
+        "show_brand_logo": true,
+        "show_rating_bar_only_if_any_present": true,
+        "show_price_only_if_present": true,
+        "show_badges_max": 2
+      },
+      "truncation_rules": {
+        "headline_max_lines": 3,
+        "subheadline_max_lines": 2,
+        "quote_max_lines": 4,
+        "cta_max_chars": 24,
+        "product_name_max_lines": 2
+      },
+      "motion_policy": {
+        "max_concurrent_motion_slots": 1,
+        "preferred_hero_video_slot": "support_media",
+        "allow_background_video": true,
+        "mute_required": true,
+        "loop_required": true,
+        "autoplay_required": true,
+        "text_overlay_requires_scrim": true,
+        "animation_style": "subtle"
+      },
+      "fallback_policy": {
+        "if_no_quote": "use copy.headline as hero card",
+        "if_no_support_media": "render static gradient panel",
+        "if_no_rating_data": "hide rating bar",
+        "if_no_price": "hide price",
+        "if_video_missing_poster": "generate from first frame or fall back to image"
+      },
+      "validation": {
+        "required_any_of": [["social_proof.primary_quote.text", "copy.headline"]],
+        "required_all_of": ["product.name", "cta.text"]
+      }
+    },
+    {
+      "template_id": "ugc_split_screen",
+      "version": "1.0.0",
+      "status": "active",
+      "supports_video": true,
+      "family": "social_proof",
+      "layout": {
+        "base_family": "split_focus",
+        "overlay_package": "quote_bubble",
+        "copy_system": "creator_quote_cta",
+        "motion_system": "primary_panel_motion"
+      },
+      "aspect_ratios": {
+        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
+        "preferred": ["1:1", "4:5", "9:16"]
+      },
+      "zones": {
+        "left_panel": {
+          "id": "ugc_panel",
+          "type": "media",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "creator.portrait_media.video",
+              "creator.portrait_media.image",
+              "ugc.media.video",
+              "ugc.media.image"
+            ]
+          },
+          "media_rules": {
+            "accepted_kinds": ["image", "video"],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "right_panel": {
+          "id": "product_panel",
+          "type": "media",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "product.hero_media.video",
+              "product.hero_media.image",
+              "product.secondary_media.image"
+            ]
+          },
+          "media_rules": {
+            "accepted_kinds": ["image", "video"],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "quote_bubble": {
+          "id": "quote_bubble",
+          "type": "text_card",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "social_proof.primary_quote.text",
+              "ugc.caption",
+              "copy.headline",
+              "defaults.fallback_quote"
+            ]
+          },
+          "limits": {
+            "max_chars": {
+              "1:1": 110,
+              "4:5": 130,
+              "9:16": 140,
+              "16:9": 90,
+              "1.91:1": 80
+            }
+          }
+        },
+        "engagement_row": {
+          "id": "engagement_row",
+          "type": "chip_row",
+          "required": false,
+          "slot_binding": {
+            "likes": ["performance.engagement.likes", "ugc.likes"],
+            "comments": ["performance.engagement.comments", "ugc.comments"],
+            "proof_badges": ["social_proof.proof_badges", "product.badges"]
+          }
+        },
+        "identity_row": {
+          "id": "identity_row",
+          "type": "identity",
+          "required": true,
+          "slot_binding": {
+            "creator_name": ["creator.name", "ugc.creator_name"],
+            "creator_handle": ["creator.handle", "ugc.creator_handle"],
+            "platform": ["creator.platform", "ugc.platform"]
+          }
+        },
+        "cta": {
+          "id": "cta",
+          "type": "button",
+          "required": true,
+          "slot_binding": {
+            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
+            "url": ["cta.url"]
+          }
+        }
+      },
+      "render_order": ["brand", "left_panel", "right_panel", "quote_bubble", "engagement_row", "identity_row", "cta", "legal"],
+      "slot_adapter": {
+        "creator.name": ["ugc.creator_name", "creator.name"],
+        "creator.handle": ["ugc.creator_handle", "creator.handle"],
+        "creator.platform": ["ugc.platform", "creator.platform"],
+        "creator.portrait_media.image": ["ugc.media.image", "creator.portrait_media.image"],
+        "creator.portrait_media.video": ["ugc.media.video", "creator.portrait_media.video"],
+        "ugc.caption": ["ugc.caption"],
+        "ugc.likes": ["ugc.likes"],
+        "ugc.comments": ["ugc.comments"],
+        "product.name": ["product.name"],
+        "product.hero_media.image": ["product.hero_media.image", "product.image"],
+        "product.hero_media.video": ["product.hero_media.video"],
+        "social_proof.primary_quote.text": [
+          "social_proof.primary_quote.text",
+          "social_proof.quotes.0.text",
+          "ugc.caption"
+        ],
+        "social_proof.proof_badges": ["social_proof.proof_badges", "product.badges"],
+        "copy.cta_text": ["cta.text", "copy.cta_text"]
+      },
+      "visibility_rules": {
+        "show_creator_handle": true,
+        "show_platform_badge": true,
+        "show_engagement_row_only_if_any_present": true,
+        "show_rights_status_only_if_post_type_is_ugc": true
+      },
+      "truncation_rules": {
+        "quote_max_lines": 4,
+        "creator_name_max_chars": 28,
+        "creator_handle_max_chars": 24,
+        "cta_max_chars": 24
+      },
+      "motion_policy": {
+        "max_concurrent_motion_slots": 1,
+        "preferred_hero_video_slot": "left_panel",
+        "allow_background_video": false,
+        "mute_required": true,
+        "loop_required": true,
+        "autoplay_required": true,
+        "if_both_panels_are_video": "autoplay left_panel only, freeze right_panel to poster",
+        "text_overlay_requires_scrim": true,
+        "animation_style": "dynamic"
+      },
+      "fallback_policy": {
+        "if_no_creator_media": "use product.hero_media in left_panel",
+        "if_no_product_media": "use creator media full bleed",
+        "if_no_quote": "use ugc.caption",
+        "if_no_engagement_data": "hide engagement row",
+        "if_no_creator_handle": "show creator name only"
+      },
+      "validation": {
+        "required_all_of": ["product.name", "cta.text"],
+        "required_any_of": [
+          ["creator.portrait_media.video", "creator.portrait_media.image", "ugc.media.video", "ugc.media.image"],
+          ["product.hero_media.video", "product.hero_media.image"],
+          ["social_proof.primary_quote.text", "ugc.caption", "copy.headline"]
+        ]
+      }
+    },
+    {
+      "template_id": "review_collage",
+      "version": "1.0.0",
+      "status": "active",
+      "supports_video": true,
+      "family": "social_proof",
+      "layout": {
+        "base_family": "grid_showcase",
+        "overlay_package": "review_cards",
+        "copy_system": "headline_summary_cta",
+        "motion_system": "hero_only_motion"
+      },
+      "aspect_ratios": {
+        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
+        "preferred": ["1:1", "4:5"]
+      },
+      "zones": {
+        "center_hero": {
+          "id": "center_hero",
+          "type": "media",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "product.hero_media.video",
+              "product.hero_media.image",
+              "product.secondary_media.image"
+            ]
+          },
+          "media_rules": {
+            "accepted_kinds": ["image", "video"],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "review_cards": {
+          "id": "review_cards",
+          "type": "review_card_stack",
+          "required": true,
+          "slot_binding": {
+            "source_priority": ["social_proof.secondary_quotes", "social_proof.quotes"]
+          },
+          "limits": {
+            "max_items": {
+              "1:1": 4,
+              "4:5": 5,
+              "9:16": 5,
+              "16:9": 3,
+              "1.91:1": 3
+            },
+            "quote_max_chars": 90
+          }
+        },
+        "summary_badge": {
+          "id": "summary_badge",
+          "type": "summary",
+          "required": true,
+          "slot_binding": {
+            "rating_value": ["social_proof.rating_value", "social_proof.rating"],
+            "review_count": ["social_proof.review_count"],
+            "trusted_by_text": ["trust.trusted_by_text"]
+          }
+        },
+        "headline": {
+          "id": "headline",
+          "type": "text",
+          "required": false,
+          "slot_binding": {
+            "source_priority": ["copy.headline", "defaults.fallback_headline"]
+          }
+        },
+        "cta": {
+          "id": "cta",
+          "type": "button",
+          "required": true,
+          "slot_binding": {
+            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
+            "url": ["cta.url"]
+          }
+        }
+      },
+      "render_order": ["brand", "headline", "center_hero", "review_cards", "summary_badge", "cta", "legal"],
+      "slot_adapter": {
+        "product.hero_media.image": ["product.hero_media.image", "product.image"],
+        "product.hero_media.video": ["product.hero_media.video"],
+        "social_proof.secondary_quotes": ["social_proof.secondary_quotes", "social_proof.quotes"],
+        "social_proof.rating_value": ["social_proof.rating_value", "social_proof.rating"],
+        "social_proof.review_count": ["social_proof.review_count"],
+        "trust.trusted_by_text": ["trust.trusted_by_text"],
+        "copy.headline": ["copy.headline"],
+        "copy.cta_text": ["cta.text", "copy.cta_text"]
+      },
+      "visibility_rules": {
+        "show_headline_if_present": true,
+        "show_review_cards_min": 2,
+        "show_review_cards_max": 5,
+        "show_summary_badge_only_if_rating_or_review_count_present": true
+      },
+      "truncation_rules": {
+        "headline_max_lines": 2,
+        "review_card_max_lines": 4,
+        "review_author_max_chars": 22,
+        "cta_max_chars": 24
+      },
+      "motion_policy": {
+        "max_concurrent_motion_slots": 1,
+        "preferred_hero_video_slot": "center_hero",
+        "allow_background_video": false,
+        "mute_required": true,
+        "loop_required": true,
+        "autoplay_required": true,
+        "review_cards_are_static": true,
+        "animation_style": "minimal"
+      },
+      "fallback_policy": {
+        "if_no_video_or_image": "replace center_hero with brand color block",
+        "if_only_one_quote": "repeat as primary and secondary style variants disabled",
+        "if_no_rating_or_review_count": "hide summary badge",
+        "if_no_headline": "use brand tagline"
+      },
+      "validation": {
+        "required_all_of": ["cta.text"],
+        "required_any_of": [
+          ["product.hero_media.video", "product.hero_media.image"],
+          ["social_proof.secondary_quotes", "social_proof.quotes"]
+        ]
+      }
+    },
+    {
+      "template_id": "results_proof",
+      "version": "1.0.0",
+      "status": "active",
+      "supports_video": true,
+      "family": "social_proof",
+      "layout": {
+        "base_family": "metrics_first",
+        "overlay_package": "stat_cards",
+        "copy_system": "headline_metrics_quote_cta",
+        "motion_system": "structured_metrics_motion"
+      },
+      "aspect_ratios": {
+        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
+        "preferred": ["1:1", "4:5", "16:9"]
+      },
+      "zones": {
+        "headline": {
+          "id": "headline",
+          "type": "text",
+          "required": true,
+          "slot_binding": {
+            "source_priority": ["copy.headline", "defaults.fallback_headline"]
+          }
+        },
+        "metric_row": {
+          "id": "metric_row",
+          "type": "metrics",
+          "required": true,
+          "slot_binding": {
+            "source_priority": ["performance.metrics"]
+          },
+          "limits": {
+            "max_items": {
+              "1:1": 3,
+              "4:5": 3,
+              "9:16": 4,
+              "16:9": 4,
+              "1.91:1": 4
+            }
+          }
+        },
+        "proof_quote": {
+          "id": "proof_quote",
+          "type": "text_card",
+          "required": false,
+          "slot_binding": {
+            "source_priority": [
+              "social_proof.primary_quote.text",
+              "social_proof.quotes.0.text",
+              "copy.subheadline"
+            ]
+          }
+        },
+        "support_media": {
+          "id": "support_media",
+          "type": "media",
+          "required": false,
+          "slot_binding": {
+            "source_priority": [
+              "media.supporting_media.0.video",
+              "media.supporting_media.0.image",
+              "product.hero_media.video",
+              "product.hero_media.image",
+              "media.background_media.video",
+              "media.background_media.image"
+            ]
+          },
+          "media_rules": {
+            "accepted_kinds": ["image", "video"],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "trust_footer": {
+          "id": "trust_footer",
+          "type": "proof_footer",
+          "required": false,
+          "slot_binding": {
+            "rating_value": ["social_proof.rating_value", "social_proof.rating"],
+            "review_count": ["social_proof.review_count"],
+            "trusted_by_text": ["trust.trusted_by_text"]
+          }
+        },
+        "cta": {
+          "id": "cta",
+          "type": "button",
+          "required": true,
+          "slot_binding": {
+            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
+            "url": ["cta.url"]
+          }
+        }
+      },
+      "render_order": ["brand", "headline", "metric_row", "proof_quote", "support_media", "trust_footer", "cta", "legal"],
+      "slot_adapter": {
+        "copy.headline": ["copy.headline"],
+        "copy.subheadline": ["copy.subheadline"],
+        "performance.metrics": ["performance.metrics"],
+        "social_proof.primary_quote.text": ["social_proof.primary_quote.text", "social_proof.quotes.0.text"],
+        "product.hero_media.image": ["product.hero_media.image", "product.image"],
+        "product.hero_media.video": ["product.hero_media.video"],
+        "media.supporting_media.0.image": ["media.supporting_media.0.image"],
+        "media.supporting_media.0.video": ["media.supporting_media.0.video"],
+        "social_proof.rating_value": ["social_proof.rating_value", "social_proof.rating"],
+        "social_proof.review_count": ["social_proof.review_count"],
+        "trust.trusted_by_text": ["trust.trusted_by_text"],
+        "copy.cta_text": ["cta.text", "copy.cta_text"]
+      },
+      "visibility_rules": {
+        "show_metric_row_min": 2,
+        "show_metric_row_max": 4,
+        "show_proof_quote_if_present": true,
+        "show_support_media_if_present": true,
+        "show_trust_footer_only_if_any_present": true
+      },
+      "truncation_rules": {
+        "headline_max_lines": 2,
+        "metric_label_max_chars": 18,
+        "metric_value_max_chars": 16,
+        "quote_max_lines": 3,
+        "cta_max_chars": 24
+      },
+      "motion_policy": {
+        "max_concurrent_motion_slots": 1,
+        "preferred_hero_video_slot": "support_media",
+        "allow_background_video": true,
+        "mute_required": true,
+        "loop_required": true,
+        "autoplay_required": true,
+        "metric_value_motion": "count_up_optional",
+        "metric_labels_static": true,
+        "text_overlay_requires_scrim": true,
+        "animation_style": "structured"
+      },
+      "fallback_policy": {
+        "if_no_metrics": "template_invalid",
+        "if_only_one_metric": "duplicate layout disabled, use stacked single stat mode",
+        "if_no_support_media": "render metrics-only mode",
+        "if_no_quote": "omit proof_quote block",
+        "if_no_trust_footer": "compress CTA upward"
+      },
+      "validation": {
+        "required_all_of": ["copy.headline", "cta.text"],
+        "required_any_of": [["performance.metrics"]],
+        "minimum_counts": { "performance.metrics": 2 }
+      }
+    },
+    {
+      "template_id": "creator_endorsement",
+      "version": "1.0.0",
+      "status": "active",
+      "supports_video": true,
+      "family": "social_proof",
+      "layout": {
+        "base_family": "creator_led",
+        "overlay_package": "trust_ribbon",
+        "copy_system": "creator_quote_product_cta",
+        "motion_system": "creator_primary_motion"
+      },
+      "aspect_ratios": {
+        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
+        "preferred": ["1:1", "4:5", "9:16"]
+      },
+      "zones": {
+        "creator_zone": {
+          "id": "creator_zone",
+          "type": "media",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "creator.portrait_media.video",
+              "creator.portrait_media.image",
+              "ugc.media.video",
+              "ugc.media.image"
+            ]
+          },
+          "media_rules": {
+            "accepted_kinds": ["image", "video"],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "endorsement_quote": {
+          "id": "endorsement_quote",
+          "type": "text_card",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "social_proof.primary_quote.text",
+              "social_proof.quotes.0.text",
+              "copy.headline"
+            ]
+          }
+        },
+        "product_zone": {
+          "id": "product_zone",
+          "type": "media",
+          "required": true,
+          "slot_binding": {
+            "source_priority": [
+              "product.hero_media.video",
+              "product.hero_media.image",
+              "product.secondary_media.image"
+            ]
+          },
+          "media_rules": {
+            "accepted_kinds": ["image", "video"],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "social_ribbon": {
+          "id": "social_ribbon",
+          "type": "ribbon",
+          "required": false,
+          "slot_binding": {
+            "creator_handle": ["creator.handle", "ugc.creator_handle"],
+            "proof_badges": ["social_proof.proof_badges", "product.badges"],
+            "trusted_by_text": ["trust.trusted_by_text"]
+          }
+        },
+        "cta": {
+          "id": "cta",
+          "type": "button",
+          "required": true,
+          "slot_binding": {
+            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
+            "url": ["cta.url"]
+          }
+        }
+      },
+      "render_order": ["brand", "creator_zone", "endorsement_quote", "product_zone", "social_ribbon", "cta", "legal"],
+      "slot_adapter": {
+        "creator.name": ["ugc.creator_name", "creator.name"],
+        "creator.handle": ["ugc.creator_handle", "creator.handle"],
+        "creator.portrait_media.image": ["ugc.media.image", "creator.portrait_media.image"],
+        "creator.portrait_media.video": ["ugc.media.video", "creator.portrait_media.video"],
+        "product.hero_media.image": ["product.hero_media.image", "product.image"],
+        "product.hero_media.video": ["product.hero_media.video"],
+        "social_proof.primary_quote.text": [
+          "social_proof.primary_quote.text",
+          "social_proof.quotes.0.text",
+          "copy.headline"
+        ],
+        "social_proof.proof_badges": ["social_proof.proof_badges", "product.badges"],
+        "trust.trusted_by_text": ["trust.trusted_by_text"],
+        "copy.cta_text": ["cta.text", "copy.cta_text"]
+      },
+      "visibility_rules": {
+        "show_creator_handle": true,
+        "show_social_ribbon_only_if_any_present": true,
+        "show_brand_logo": true,
+        "show_product_zone_as_inset_on_mobile_if_creator_video_present": true
+      },
+      "truncation_rules": {
+        "quote_max_lines": 4,
+        "creator_name_max_chars": 26,
+        "creator_handle_max_chars": 24,
+        "cta_max_chars": 24
+      },
+      "motion_policy": {
+        "max_concurrent_motion_slots": 1,
+        "preferred_hero_video_slot": "creator_zone",
+        "allow_background_video": false,
+        "mute_required": true,
+        "loop_required": true,
+        "autoplay_required": true,
+        "if_creator_and_product_are_both_video": "autoplay creator_zone only, render product_zone as poster or tap-to-play secondary",
+        "text_overlay_requires_scrim": true,
+        "animation_style": "creator_led"
+      },
+      "fallback_policy": {
+        "if_no_creator_media": "use product media as primary and convert template to simplified endorsement mode",
+        "if_no_product_media": "render product name and badges only",
+        "if_no_quote": "use copy.headline",
+        "if_no_social_ribbon_data": "hide ribbon"
+      },
+      "validation": {
+        "required_all_of": ["cta.text"],
+        "required_any_of": [
+          ["creator.portrait_media.video", "creator.portrait_media.image", "ugc.media.video", "ugc.media.image"],
+          ["product.hero_media.video", "product.hero_media.image"],
+          ["social_proof.primary_quote.text", "social_proof.quotes.0.text", "copy.headline"]
+        ]
+      }
+    }
+  ]
+}
