@@ -1,14 +1,31 @@
 // Overlay zone analysis — given a finished crop image, ask Gemini Vision to
-// identify safe regions where an ad-layout generator can place logos, copy,
-// CTAs, and social-proof elements. Output is a structured JSON artifact that
-// downstream layout services consume by job_id.
+// identify REGIONS THAT SHOULD NOT RECEIVE OVERLAYS, each with a strictness
+// score. The downstream ad-layout generator (and the review UI) computes the
+// safe overlay region as "the whole frame minus active restrictions", where
+// a conservation slider controls which restrictions are active.
 //
-// Per-image output shape (the unit of analysis):
+// Design change from v1: v1 produced per-role zones (logo, headline, CTA, …)
+// pre-sized and pre-located by the model. That pushed layout decisions into
+// analysis and made a single image reusable only if the downstream product
+// had the same role taxonomy. v2 returns ONLY the negative space — the
+// layout generator decides where each overlay goes inside the computed safe
+// region.
+//
+// Per-image output shape:
 //   {
-//     densityGrid: { cols, rows, cells: number[][] },   // 0 = empty, 1 = busy
-//     zones:           [{ id, role, rectPct, contrastBg, score, reason }],
-//     forbiddenRects:  [{ rectPct, reason }]
+//     densityGrid:  { cols, rows, cells: number[][] },   // 0 = empty, 1 = busy
+//     restrictions: [{ id, rectPct, classification, strictness, reason }]
 //   }
+//
+// Strictness is 0.0–1.0. A UI / layout consumer picks a conservation level S
+// (0..1) and treats any restriction where `strictness >= 1 − S` as active.
+// Hard rules:
+//   - The primary product / subject is ALWAYS at strictness 1.0.
+//   - Any visible face gets at least 0.9.
+//   - Secondary subjects (other products, other people, prominent props)
+//     land in 0.6–0.8.
+//   - Preserve-worthy text / signage lands in 0.4–0.6.
+//   - Incidental objects land in 0.2–0.3.
 //
 // rectPct uses fractional (0..1) coordinates so the artifact is
 // resolution-independent — the layout generator places overlays on any output
@@ -19,9 +36,9 @@ const axios = require('axios');
 const MODEL = process.env.GEMINI_VISION_MODEL || 'gemini-2.5-pro';
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
-// Roles a zone can be assigned. Stable contract — adding/removing values is a
-// breaking change for any downstream layout generator.
-const ZONE_ROLES = ['logo', 'headline', 'product_detail', 'comments', 'social_stats', 'cta'];
+// Restriction classification taxonomy. Stable contract — adding values is
+// backward-compatible, renaming/removing them is not.
+const RESTRICTION_CLASSES = ['product', 'face', 'secondary_subject', 'text', 'object', 'other'];
 
 function isEnabled() { return !!process.env.GEMINI_API_KEY; }
 
@@ -39,33 +56,21 @@ const RESPONSE_SCHEMA = {
       },
       required: ['cols', 'rows', 'cells']
     },
-    zones: {
+    restrictions: {
       type: 'array',
       items: {
         type: 'object',
         properties: {
-          role: { type: 'string', enum: ZONE_ROLES },
-          rectPct: rectPctSchema(),
-          contrastBg: { type: 'string', enum: ['dark', 'light', 'mixed'] },
-          score: { type: 'number' },
-          reason: { type: 'string' }
+          rectPct:        rectPctSchema(),
+          classification: { type: 'string', enum: RESTRICTION_CLASSES },
+          strictness:     { type: 'number' },
+          reason:         { type: 'string' }
         },
-        required: ['role', 'rectPct', 'contrastBg', 'score', 'reason']
-      }
-    },
-    forbiddenRects: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          rectPct: rectPctSchema(),
-          reason: { type: 'string' }
-        },
-        required: ['rectPct', 'reason']
+        required: ['rectPct', 'classification', 'strictness', 'reason']
       }
     }
   },
-  required: ['densityGrid', 'zones', 'forbiddenRects']
+  required: ['densityGrid', 'restrictions']
 };
 
 function rectPctSchema() {
@@ -147,15 +152,21 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
       return null;
     }
 
-    // Stamp ids on zones so the UI can React-key them and the layout generator
-    // can reference specific zones across runs.
+    // Stamp ids + clamp strictness so the UI can React-key each restriction
+    // and the layout generator can trust the numeric range.
     const stamped = {
-      densityGrid:    sanitizeGrid(parsed.densityGrid),
-      zones:          (parsed.zones || []).map((z, i) => ({ id: `z${i + 1}`, ...z })),
-      forbiddenRects: parsed.forbiddenRects || []
+      densityGrid:  sanitizeGrid(parsed.densityGrid),
+      restrictions: (parsed.restrictions || []).map((r, i) => ({
+        id:             `r${i + 1}`,
+        rectPct:        r.rectPct,
+        classification: RESTRICTION_CLASSES.includes(r.classification) ? r.classification : 'other',
+        strictness:     Math.max(0, Math.min(1, Number(r.strictness) || 0)),
+        reason:         typeof r.reason === 'string' ? r.reason : ''
+      }))
     };
 
-    console.log(`   ✓ overlay-zones[${label}]: ${stamped.zones.length} zone(s), ${stamped.forbiddenRects.length} forbidden in ${Date.now() - t0}ms`);
+    const hard = stamped.restrictions.filter(r => r.strictness >= 0.9).length;
+    console.log(`   ✓ overlay-zones[${label}]: ${stamped.restrictions.length} restriction(s) (${hard} hard) in ${Date.now() - t0}ms`);
     return stamped;
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
@@ -167,31 +178,29 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
 function buildPrompt(ratio) {
   return (
     `You are analyzing a finished marketing-creative image at aspect ratio ${ratio || 'unspecified'}. ` +
-    `Identify regions where an ad-layout generator could safely place overlay elements WITHOUT covering the product, label/logo on the product, or human face/eyes.\n\n` +
+    `A downstream ad-layout generator needs to know which regions of the frame it MUST NOT cover with overlays (logo, headline, comments, CTAs, etc.). Your job is to identify those regions and rate each with a strictness score. The layout generator separately controls a "conservation level" slider that decides which strictness threshold to enforce.\n\n` +
 
     `Return:\n` +
     `1) densityGrid — a visual-busyness heatmap. Use a SMALL grid to keep output compact: 8×6 for landscape, 6×8 for portrait, 6×10 for very tall (9:16). Each cell is a number 0–1 rounded to 1 decimal (e.g. 0.0, 0.3, 1.0): 0 = empty/uniform background, 1 = visually busy / contains subject / detailed texture.\n\n` +
 
-    `2) zones — 4 to 8 candidate overlay rectangles. Each zone:\n` +
-    `   - role: one of ${JSON.stringify(ZONE_ROLES)}\n` +
-    `       • logo            — small (5–15% of frame), corner-preferred, very calm bg\n` +
-    `       • headline        — wide horizontal band, ≤25% of frame height, top or bottom third\n` +
-    `       • product_detail  — short label-style text near (but NOT overlapping) the product\n` +
-    `       • comments        — TikTok/Reels-style stack, narrow vertical column, side-of-frame\n` +
-    `       • social_stats    — small horizontal pill (likes/views/etc), corner or near comments\n` +
-    `       • cta             — prominent button, 15–35% of frame width, bottom third typically\n` +
-    `   - rectPct: { x1, y1, x2, y2 } as fractions of the image dimensions, where (0,0) is top-left and (1,1) is bottom-right. x2 > x1 and y2 > y1.\n` +
-    `   - contrastBg: "dark" (overlay text should be light), "light" (overlay text dark), or "mixed" (needs a backdrop chip).\n` +
-    `   - score: 0–1, your confidence this zone is genuinely safe and visually pleasant.\n` +
-    `   - reason: one short sentence (≤20 words) explaining WHY this region is safe.\n\n` +
+    `2) restrictions — an array of regions where overlays should be avoided. Each entry:\n` +
+    `   - rectPct: { x1, y1, x2, y2 } as fractions of the image dimensions, (0,0) top-left, (1,1) bottom-right. x2 > x1 and y2 > y1.\n` +
+    `   - classification: one of ${JSON.stringify(RESTRICTION_CLASSES)}\n` +
+    `   - strictness: 0.0–1.0. Higher = more important to preserve. Scoring guidance:\n` +
+    `       • product             → 1.0   (the primary product or primary subject — ALWAYS 1.0, hard rule, never overlay)\n` +
+    `       • face                → 0.9   (any human face or eyes)\n` +
+    `       • secondary_subject   → 0.6 to 0.8   (another person, another product, a prominent prop)\n` +
+    `       • text                → 0.4 to 0.6   (brand text, labels, signage that's preserve-worthy)\n` +
+    `       • object              → 0.2 to 0.3   (incidental objects, non-critical props)\n` +
+    `       • other               → your judgement within 0.1 to 0.5\n` +
+    `   - reason: one short sentence (≤20 words) identifying what's in the rect.\n\n` +
 
-    `3) forbiddenRects — regions overlays must NEVER cover. Always include the primary subject's bounding rect and any visible logo or label on the product. Each entry has rectPct and a one-sentence reason.\n\n` +
-
-    `Rules:\n` +
-    `- Zones SHOULD NOT overlap forbiddenRects. Zones MAY overlap each other (the layout generator picks one of several candidates per role).\n` +
-    `- Prefer the rule of thirds. Avoid placing zones dead-center unless the subject is off-center.\n` +
-    `- Skip a role entirely rather than emit a low-quality zone for it. Better to return 4 strong zones than 8 mediocre ones.\n` +
-    `- Coordinates strictly within [0, 1].`
+    `HARD RULES:\n` +
+    `- Include ONE restriction with classification="product" and strictness=1.0 covering the primary product / subject. This is non-negotiable.\n` +
+    `- If any face is visible, include it at strictness ≥ 0.9.\n` +
+    `- Err on the side of MORE restrictions with LOWER strictness rather than fewer — the slider lets the user dial in conservation level; missing a region entirely means it can never be protected.\n` +
+    `- Coordinates strictly within [0, 1]. Rects should tightly bound their subject, not include generous padding.\n` +
+    `- Do NOT suggest where overlays SHOULD go — only where they must NOT. The safe area is computed as "the whole frame minus active restrictions".`
   );
 }
 
@@ -220,4 +229,4 @@ function downsampledCloudinaryUrl(url, maxWidth) {
   return url.replace('/upload/', `/upload/${transform}/`);
 }
 
-module.exports = { analyzeOverlayZones, isEnabled, ZONE_ROLES };
+module.exports = { analyzeOverlayZones, isEnabled, RESTRICTION_CLASSES };
