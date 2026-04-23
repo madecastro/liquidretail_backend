@@ -24,6 +24,7 @@ const { extractEntities } = require('../services/nerService');
 const { findProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
+const { upsertBrandStub } = require('../services/brandCatalogService');
 
 const Media               = require('../models/Media');
 const DetectionArtifact   = require('../models/DetectionArtifact');
@@ -212,6 +213,17 @@ async function runImagePipeline(run, media, buffer) {
     totalMatches:   productMatches.totalMatches,
     identification: productMatches.identification || null
   }) : null;
+
+  // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
+  // sighting, seeded with the detection background palette; later runs touch
+  // the same doc without overwriting curated fields. Non-fatal on error.
+  if (productMatches?.identification?.brand) {
+    await upsertBrandStub({
+      name:             productMatches.identification.brand,
+      paletteSeed:      background?.palette,
+      firstSeenMediaId: media._id
+    });
+  }
 
   // ── Overlay zones ──
   await setRunStage(run, 'overlay-zones');
@@ -426,6 +438,17 @@ async function runVideoPipeline(run, media, buffer) {
     totalMatches:   productMatches.totalMatches,
     identification: productMatches.identification || null
   }) : null;
+
+  // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
+  // sighting, seeded with the detection background palette; later runs touch
+  // the same doc without overwriting curated fields. Non-fatal on error.
+  if (productMatches?.identification?.brand) {
+    await upsertBrandStub({
+      name:             productMatches.identification.brand,
+      paletteSeed:      background?.palette,
+      firstSeenMediaId: media._id
+    });
+  }
 
   // ── Overlay zones ──
   await setRunStage(run, 'overlay-zones');

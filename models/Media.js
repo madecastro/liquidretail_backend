@@ -59,6 +59,17 @@ const mediaSchema = new mongoose.Schema({
     updatedAt: Date
   },
 
+  // Creator / platform rights approval. Set via the detect review UI for
+  // now; will move to a dedicated rights-management screen later. The
+  // layout generator refuses to populate `ugc.rights_approved = true` on
+  // creative inputs unless `rights.approved === true`.
+  rights: {
+    approved:   { type: Boolean, default: false },
+    approvedBy: String,                  // user id / email who toggled
+    approvedAt: Date,
+    notes:      String                   // optional context / license source
+  },
+
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
