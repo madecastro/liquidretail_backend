@@ -316,6 +316,25 @@ function buildCloudinaryCropUrl(videoUrl, crop) {
 //   }
 // Always: artifact[ratio][variantKey]. `analysis` is null when Gemini failed
 // for that specific image (non-fatal; other slots still populate).
+//
+// TODO — video-specific refinements. Currently both the image and video
+// pipelines run this stage identically against a single still (hero frame for
+// video), which means zones are derived from a single moment in time and can
+// collide with the subject later in the clip. In priority order:
+//   A. Pass the cross-frame `safeRect` (already computed on video jobs — union
+//      of YOLO detections across frames + primary GPT subjects) into the
+//      Gemini prompt as an explicit forbidden rect. Eliminates the worst
+//      class of failure (overlay ends up under the subject mid-playback).
+//      ~15-line change: thread safeRect through runOverlayZoneAnalysis and
+//      inject into analyzeOverlayZones's prompt when present.
+//   B. Multi-frame analysis. Sample 3 frames (start / middle / end) per
+//      ratio, union the forbidden rects, intersect the safe zones, take the
+//      worst contrastBg per zone. 3× API cost per video job.
+//   C. Analyze the actually-rendered self-underlay video. Use Cloudinary
+//      `so_<sec>` transform to extract N frames from the composed output URL
+//      (what users actually see playing), not the hero frame. Highest
+//      fidelity, highest cost. Only worth doing once the ad-layout generator
+//      exists and surfaces real overlay-on-video failures.
 async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops }) {
   const inputs = pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops });
   if (!inputs.length) return {};
