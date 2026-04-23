@@ -117,17 +117,26 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
         }],
         generationConfig: {
           temperature: 0.2,
-          maxOutputTokens: 2500,
+          // 2.5 Pro's thinking tokens count against this same budget. 2500 was
+          // being consumed almost entirely by thinking, leaving the structured
+          // output truncated or empty.
+          maxOutputTokens: 8192,
+          // Cap thinking so we reliably have headroom for the JSON body.
+          thinkingConfig: { thinkingBudget: 2048 },
           responseMimeType: 'application/json',
           responseSchema: RESPONSE_SCHEMA
         }
       },
-      { timeout: 45000 }
+      { timeout: 60000 }
     );
 
-    const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const candidate = res.data?.candidates?.[0];
+    const text = candidate?.content?.parts?.[0]?.text;
     if (!text) {
-      console.warn(`   ⚠️  overlay-zones[${label}]: empty response`);
+      const finishReason = candidate?.finishReason || 'unknown';
+      const usage = res.data?.usageMetadata || {};
+      const blockReason = res.data?.promptFeedback?.blockReason;
+      console.warn(`   ⚠️  overlay-zones[${label}]: empty response (finishReason=${finishReason}${blockReason ? ` blockReason=${blockReason}` : ''}, tokens in=${usage.promptTokenCount || '?'} out=${usage.candidatesTokenCount || 0} thought=${usage.thoughtsTokenCount || 0} total=${usage.totalTokenCount || '?'})`);
       return null;
     }
 
@@ -161,7 +170,7 @@ function buildPrompt(ratio) {
     `Identify regions where an ad-layout generator could safely place overlay elements WITHOUT covering the product, label/logo on the product, or human face/eyes.\n\n` +
 
     `Return:\n` +
-    `1) densityGrid — a visual-busyness heatmap. cols × rows grid (use 12×9 for landscape, 9×12 for portrait, 9×16 for very tall). Each cell is a number 0–1: 0 = empty/uniform background, 1 = visually busy / contains subject / detailed texture.\n\n` +
+    `1) densityGrid — a visual-busyness heatmap. Use a SMALL grid to keep output compact: 8×6 for landscape, 6×8 for portrait, 6×10 for very tall (9:16). Each cell is a number 0–1 rounded to 1 decimal (e.g. 0.0, 0.3, 1.0): 0 = empty/uniform background, 1 = visually busy / contains subject / detailed texture.\n\n` +
 
     `2) zones — 4 to 8 candidate overlay rectangles. Each zone:\n` +
     `   - role: one of ${JSON.stringify(ZONE_ROLES)}\n` +
