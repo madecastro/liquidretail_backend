@@ -19,10 +19,20 @@ function normalizeBrandName(name) {
     .replace(/\s+/g, ' ');
 }
 
+const demographicSchema = new mongoose.Schema({
+  name:         { type: String, required: true },   // e.g. "Saltwater Joe"
+  description:  String,                              // one-line persona
+  interests:    [String],                            // what they care about
+  painPoints:   [String],                            // what they worry about
+  toneHint:     String,                              // how they speak
+  avatarUrl:    String                               // optional, future — generated avatar image
+}, { _id: false });
+
 const brandSchema = new mongoose.Schema({
   nameNormalized: { type: String, required: true, unique: true, index: true },
   name:           { type: String, required: true },
 
+  websiteUrl:     String,                            // user-supplied on upload; seed for enrichment
   tagline:        String,
   logoUrl:        String,
   primaryColor:   String,
@@ -30,10 +40,13 @@ const brandSchema = new mongoose.Schema({
   accentColor:    String,
   fontFamily:     String,
   tone:           [String],
+  demographics:   [demographicSchema],               // key target personas for notional quotes
 
-  // Provenance: how did this Brand doc first get created? Stub = auto from
-  // detect pipeline. Curated = an ops user has manually enriched it.
-  source:         { type: String, enum: ['stub', 'curated'], default: 'stub' },
+  // Provenance. stub = auto-created from detect with minimal data.
+  // enriched = brandEnrichmentService successfully filled in fields from
+  // the websiteUrl. curated = a human edited it; never overwritten.
+  source:         { type: String, enum: ['stub', 'enriched', 'curated'], default: 'stub' },
+  enrichedAt:     Date,
 
   // If stub, which Media was the first to surface this brand — useful for
   // auditing where a brand came from.

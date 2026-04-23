@@ -215,13 +215,16 @@ async function runImagePipeline(run, media, buffer) {
   }) : null;
 
   // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
-  // sighting, seeded with the detection background palette; later runs touch
-  // the same doc without overwriting curated fields. Non-fatal on error.
+  // sighting, seeded with the detection background palette and the
+  // upload-form's Brand URL if present. The upsert is non-blocking for
+  // enrichment — brandCatalogService fires enrichment in the background
+  // when it first sees a websiteUrl for a non-curated Brand.
   if (productMatches?.identification?.brand) {
     await upsertBrandStub({
       name:             productMatches.identification.brand,
       paletteSeed:      background?.palette,
-      firstSeenMediaId: media._id
+      firstSeenMediaId: media._id,
+      websiteUrl:       media.metadata?.brandUrl || null
     });
   }
 
@@ -440,13 +443,16 @@ async function runVideoPipeline(run, media, buffer) {
   }) : null;
 
   // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
-  // sighting, seeded with the detection background palette; later runs touch
-  // the same doc without overwriting curated fields. Non-fatal on error.
+  // sighting, seeded with the detection background palette and the
+  // upload-form's Brand URL if present. The upsert is non-blocking for
+  // enrichment — brandCatalogService fires enrichment in the background
+  // when it first sees a websiteUrl for a non-curated Brand.
   if (productMatches?.identification?.brand) {
     await upsertBrandStub({
       name:             productMatches.identification.brand,
       paletteSeed:      background?.palette,
-      firstSeenMediaId: media._id
+      firstSeenMediaId: media._id,
+      websiteUrl:       media.metadata?.brandUrl || null
     });
   }
 

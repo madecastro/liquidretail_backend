@@ -218,12 +218,34 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     if (bg.setting)     lines.push(`  Setting: ${bg.setting}`);
     lines.push('');
   }
+  // Brand demographics feed PERSONA-DRIVEN notional quote generation. If
+  // the brand catalog has target personas (enriched from the brand URL),
+  // the LLM authors quotes as voice-of-persona, using the review summary
+  // as grounding for WHAT those personas would care about.
+  const demos = Array.isArray(ctx.brand?.demographics) ? ctx.brand.demographics.slice(0, 5) : [];
+  if (demos.length) {
+    lines.push('BRAND KEY PERSONAS (use these as quote authors):');
+    demos.forEach((d, i) => {
+      const parts = [];
+      if (d.description) parts.push(d.description);
+      if (Array.isArray(d.interests)  && d.interests.length)  parts.push(`cares about: ${d.interests.join(', ')}`);
+      if (Array.isArray(d.painPoints) && d.painPoints.length) parts.push(`worried about: ${d.painPoints.join(', ')}`);
+      if (d.toneHint) parts.push(`voice: ${d.toneHint}`);
+      lines.push(`  ${i + 1}. ${d.name} — ${parts.join(' · ')}`);
+    });
+    lines.push('');
+  }
+
   lines.push(`TASK:`);
   lines.push(`Produce JSON that matches the provided schema. Rules:`);
   lines.push(`- "copy.headline" ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
   lines.push(`- "short_benefits" ≤ 5 items, each ≤ 6 words, phrased as concrete buyer benefits (not specs).`);
   lines.push(`- "badges" ≤ 4 items, each 1–3 words. Only emit a badge the signal actually supports (e.g. "4.7★ rated" only if rating ≥ 4.5).`);
-  lines.push(`- "quotes" up to 6. Synthesize from the review summary — do NOT invent specific reviewer names. Set author_name to null and source="review" unless signal is obviously creator/ugc. Set verified=false unless clearly endorsed. Keep text ≤ 20 words per quote.`);
+  if (demos.length) {
+    lines.push(`- "quotes" up to 6 NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name should be the persona's name (e.g. "Saltwater Joe"); author_title is a one-phrase identity cue (e.g. "charter captain, FL"); source="testimonial" for review-like quotes or "ugc" for caption-style. Ground WHAT they say in the review summary so the substance is true even though the author is notional. verified=true only if the brand has well-documented social proof. Keep each quote ≤ 22 words; mix lengths and angles across quotes.`);
+  } else {
+    lines.push(`- "quotes" up to 6 short notional reviews/comments drawn from the review summary. Keep author_name null and source="review" unless caption signal clearly implies a creator; verified=false unless clearly endorsed. ≤ 20 words per quote.`);
+  }
   lines.push(`- "cta.text" ≤ 3 words, imperative voice (e.g. "Shop now", "See reviews"). "offer_text" only if price/offer data supports it; otherwise omit.`);
   lines.push(`- "tone" 2–4 single-word descriptors matching the brand + caption voice.`);
   lines.push(`- "theme_style" / "background_style" / "emphasis" pick values best suited to the template and available signal.`);
