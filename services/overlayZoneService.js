@@ -32,9 +32,15 @@
 // size by multiplying by the final canvas dimensions.
 
 const axios = require('axios');
+const sharp = require('sharp');
 
 const MODEL = process.env.GEMINI_VISION_MODEL || 'gemini-2.5-pro';
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+
+// Artifact schema version. Consumers should read this and refuse (or warn)
+// on unknown majors. Bump when a field is removed/renamed; additive changes
+// (new optional fields) don't require a bump.
+const SCHEMA_VERSION = '2.1';
 
 // Restriction classification taxonomy. Stable contract — adding values is
 // backward-compatible, renaming/removing them is not.
@@ -98,10 +104,20 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
   // for spatial-zone reasoning — we don't need full resolution here.
   const fetchUrl = downsampledCloudinaryUrl(imageUrl, 1024);
   let imageBase64, mimeType;
+  // Analyzed-image dimensions — attached to the artifact so a layout generator
+  // can compute absolute pixel rects without a second lookup (rectPct stays
+  // fractional; these are informational / for pixel-exact overlap math).
+  let imageWidth = null, imageHeight = null;
   try {
     const imgRes = await axios.get(fetchUrl, { responseType: 'arraybuffer', timeout: 20000 });
-    imageBase64 = Buffer.from(imgRes.data).toString('base64');
+    const buf = Buffer.from(imgRes.data);
+    imageBase64 = buf.toString('base64');
     mimeType = imgRes.headers['content-type'] || 'image/jpeg';
+    try {
+      const meta = await sharp(buf).metadata();
+      imageWidth  = meta.width  || null;
+      imageHeight = meta.height || null;
+    } catch (_) { /* probe is best-effort; dimensions stay null on failure */ }
   } catch (err) {
     console.warn(`   ⚠️  overlay-zones[${label}]: image fetch failed: ${err.message}`);
     return null;
@@ -154,19 +170,28 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
 
     // Stamp ids + clamp strictness so the UI can React-key each restriction
     // and the layout generator can trust the numeric range.
+    const restrictions = (parsed.restrictions || []).map((r, i) => ({
+      id:             `r${i + 1}`,
+      rectPct:        r.rectPct,
+      classification: RESTRICTION_CLASSES.includes(r.classification) ? r.classification : 'other',
+      strictness:     Math.max(0, Math.min(1, Number(r.strictness) || 0)),
+      reason:         typeof r.reason === 'string' ? r.reason : ''
+    }));
+
     const stamped = {
-      densityGrid:  sanitizeGrid(parsed.densityGrid),
-      restrictions: (parsed.restrictions || []).map((r, i) => ({
-        id:             `r${i + 1}`,
-        rectPct:        r.rectPct,
-        classification: RESTRICTION_CLASSES.includes(r.classification) ? r.classification : 'other',
-        strictness:     Math.max(0, Math.min(1, Number(r.strictness) || 0)),
-        reason:         typeof r.reason === 'string' ? r.reason : ''
-      }))
+      schemaVersion:         SCHEMA_VERSION,
+      imageWidth,
+      imageHeight,
+      densityGrid:           sanitizeGrid(parsed.densityGrid),
+      restrictions,
+      // Explicit hot-path lookup: the hard-rule product rect. Derivable from
+      // restrictions[] but emitting it top-level saves every consumer from
+      // writing the same filter.
+      primarySubjectRectPct: derivePrimarySubjectRectPct(restrictions)
     };
 
-    const hard = stamped.restrictions.filter(r => r.strictness >= 0.9).length;
-    console.log(`   ✓ overlay-zones[${label}]: ${stamped.restrictions.length} restriction(s) (${hard} hard) in ${Date.now() - t0}ms`);
+    const hard = restrictions.filter(r => r.strictness >= 0.9).length;
+    console.log(`   ✓ overlay-zones[${label}]: ${restrictions.length} restriction(s) (${hard} hard) ${imageWidth}x${imageHeight} in ${Date.now() - t0}ms`);
     return stamped;
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
@@ -204,6 +229,17 @@ function buildPrompt(ratio) {
   );
 }
 
+// Pick the hard-rule product rect from the restrictions list. The prompt
+// contract guarantees exactly one restriction with classification='product'
+// and strictness=1.0, but we fall back to the highest-strictness product
+// candidate if the model emits variations.
+function derivePrimarySubjectRectPct(restrictions) {
+  const products = (restrictions || [])
+    .filter(r => r.classification === 'product')
+    .sort((a, b) => (b.strictness || 0) - (a.strictness || 0));
+  return products[0]?.rectPct || null;
+}
+
 function sanitizeGrid(grid) {
   if (!grid || !Array.isArray(grid.cells)) return { cols: 0, rows: 0, cells: [] };
   const rows = grid.cells.length;
@@ -229,4 +265,4 @@ function downsampledCloudinaryUrl(url, maxWidth) {
   return url.replace('/upload/', `/upload/${transform}/`);
 }
 
-module.exports = { analyzeOverlayZones, isEnabled, RESTRICTION_CLASSES };
+module.exports = { analyzeOverlayZones, isEnabled, RESTRICTION_CLASSES, SCHEMA_VERSION };
