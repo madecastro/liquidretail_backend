@@ -38,9 +38,10 @@ const MODEL = process.env.GEMINI_VISION_MODEL || 'gemini-2.5-pro';
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
 // Artifact schema version. Consumers should read this and refuse (or warn)
-// on unknown majors. Bump when a field is removed/renamed; additive changes
-// (new optional fields) don't require a bump.
-const SCHEMA_VERSION = '2.1';
+// on unknown majors. 3.0 added brightnessGrid and broke the top-level
+// per-ratio shape (variants are now an array rather than provider-keyed
+// object — see pipelines/detect.js::runOverlayZoneAnalysis).
+const SCHEMA_VERSION = '3.0';
 
 // Restriction classification taxonomy. Stable contract — adding values is
 // backward-compatible, renaming/removing them is not.
@@ -104,17 +105,20 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
   // for spatial-zone reasoning — we don't need full resolution here.
   const fetchUrl = downsampledCloudinaryUrl(imageUrl, 1024);
   let imageBase64, mimeType;
+  // Kept in scope so we can also derive the brightness grid from the same
+  // bytes later — avoids a second download.
+  let imgBuf = null;
   // Analyzed-image dimensions — attached to the artifact so a layout generator
   // can compute absolute pixel rects without a second lookup (rectPct stays
   // fractional; these are informational / for pixel-exact overlap math).
   let imageWidth = null, imageHeight = null;
   try {
     const imgRes = await axios.get(fetchUrl, { responseType: 'arraybuffer', timeout: 20000 });
-    const buf = Buffer.from(imgRes.data);
-    imageBase64 = buf.toString('base64');
+    imgBuf = Buffer.from(imgRes.data);
+    imageBase64 = imgBuf.toString('base64');
     mimeType = imgRes.headers['content-type'] || 'image/jpeg';
     try {
-      const meta = await sharp(buf).metadata();
+      const meta = await sharp(imgBuf).metadata();
       imageWidth  = meta.width  || null;
       imageHeight = meta.height || null;
     } catch (_) { /* probe is best-effort; dimensions stay null on failure */ }
@@ -178,11 +182,27 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
       reason:         typeof r.reason === 'string' ? r.reason : ''
     }));
 
+    const densityGrid = sanitizeGrid(parsed.densityGrid);
+
+    // Brightness grid — same dimensions as densityGrid so consumers can
+    // correlate "busy-ness" with "is this area dark or bright" for the same
+    // cell. Used by layout generators to pick text color (white on dark
+    // regions, black on light). Computed server-side via sharp so it's
+    // deterministic, not model-inferred.
+    const gridCols = densityGrid.cols || 6;
+    const gridRows = densityGrid.rows || 6;
+    let brightnessGrid = { cols: gridCols, rows: gridRows, cells: [] };
+    if (imgBuf) {
+      try { brightnessGrid = await computeBrightnessGrid(imgBuf, gridCols, gridRows); }
+      catch (err) { console.warn(`   ⚠️  overlay-zones[${label}]: brightness grid failed: ${err.message}`); }
+    }
+
     const stamped = {
       schemaVersion:         SCHEMA_VERSION,
       imageWidth,
       imageHeight,
-      densityGrid:           sanitizeGrid(parsed.densityGrid),
+      densityGrid,
+      brightnessGrid,
       restrictions,
       // Explicit hot-path lookup: the hard-rule product rect. Derivable from
       // restrictions[] but emitting it top-level saves every consumer from
@@ -191,7 +211,7 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
     };
 
     const hard = restrictions.filter(r => r.strictness >= 0.9).length;
-    console.log(`   ✓ overlay-zones[${label}]: ${restrictions.length} restriction(s) (${hard} hard) ${imageWidth}x${imageHeight} in ${Date.now() - t0}ms`);
+    console.log(`   ✓ overlay-zones[${label}]: ${restrictions.length} restriction(s) (${hard} hard) ${imageWidth}x${imageHeight} brightness-grid ${gridCols}x${gridRows} in ${Date.now() - t0}ms`);
     return stamped;
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
@@ -227,6 +247,29 @@ function buildPrompt(ratio) {
     `- Coordinates strictly within [0, 1]. Rects should tightly bound their subject, not include generous padding.\n` +
     `- Do NOT suggest where overlays SHOULD go — only where they must NOT. The safe area is computed as "the whole frame minus active restrictions".`
   );
+}
+
+// Average luminance per cell at the same dimensions as Gemini's densityGrid.
+// Each cell is a number 0..1 where 0=black, 1=white. Layout consumers can
+// sample the cell that overlaps their intended overlay placement to pick
+// text color — dark text on bright cells, light text on dark cells.
+async function computeBrightnessGrid(buf, cols, rows) {
+  if (!cols || !rows) return { cols: 0, rows: 0, cells: [] };
+  const raw = await sharp(buf)
+    .greyscale()
+    .resize(cols, rows, { fit: 'fill' })
+    .raw()
+    .toBuffer();
+  const cells = [];
+  for (let r = 0; r < rows; r++) {
+    const row = [];
+    for (let c = 0; c < cols; c++) {
+      // 2-decimal rounding keeps the artifact compact.
+      row.push(Math.round((raw[r * cols + c] / 255) * 100) / 100);
+    }
+    cells.push(row);
+  }
+  return { cols, rows, cells };
 }
 
 // Pick the hard-rule product rect from the restrictions list. The prompt

@@ -494,6 +494,15 @@ function buildCloudinaryCropUrl(videoUrl, crop) {
 // + both Gemini-extended candidates per extended ratio) and asks Gemini Vision
 // for overlay zones per image, in parallel.
 //
+// Output shape (schemaVersion 3.0) — per-ratio ARRAY of variant entries so
+// adding a new provider is purely additive and consumers can iterate without
+// knowing variant-key names ahead of time:
+//   {
+//     '<ratio>': [
+//       { provider, variant, candidateId, imageUrl, analysis }  // ...or null analysis on per-image failure
+//     ]
+//   }
+//
 // TODO — video-specific refinements. Currently both the image and video
 // pipelines run this stage identically against a single still (hero frame for
 // video), which means zones are derived from a single moment in time and can
@@ -517,16 +526,17 @@ async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCr
   const artifact = {};
   inputs.forEach((input, idx) => {
     const analysis = settled[idx].status === 'fulfilled' ? settled[idx].value : null;
-    artifact[input.ratio] = artifact[input.ratio] || {};
-    artifact[input.ratio][input.variantKey] = {
+    artifact[input.ratio] = artifact[input.ratio] || [];
+    artifact[input.ratio].push({
+      provider:    input.provider,
+      variant:     input.variant,
       candidateId: input.candidateId,
       imageUrl:    input.imageUrl,
       analysis
-    };
+    });
   });
 
-  const ok = inputs.reduce((a, input) =>
-    a + (artifact[input.ratio][input.variantKey].analysis ? 1 : 0), 0);
+  const ok = Object.values(artifact).flat().filter(e => e.analysis).length;
   console.log(`🎯 Overlay zones: ${ok}/${inputs.length} analyses complete`);
   return artifact;
 }
@@ -548,7 +558,7 @@ function pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops }) 
     const imageUrl = buildCloudinaryCropUrl(sourceImageUrl, winner);
     if (!imageUrl) continue;
     inputs.push({
-      ratio, variantKey: 'base', candidateId: winner.id, imageUrl,
+      ratio, provider: null, variant: 'base', candidateId: winner.id, imageUrl,
       label: `${ratio} base`
     });
   }
@@ -559,7 +569,7 @@ function pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops }) 
       const cand = list.find(c => c.provider === 'gemini' && c.variant === variant);
       if (!cand?.imageUrl) continue;
       inputs.push({
-        ratio, variantKey: `gemini_${variant}`, candidateId: cand.id, imageUrl: cand.imageUrl,
+        ratio, provider: 'gemini', variant, candidateId: cand.id, imageUrl: cand.imageUrl,
         label: `${ratio} gem-${variant}`
       });
     }
