@@ -123,19 +123,38 @@ async function fetchReviewSummary({ productName, brand, variant }) {
       {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 700 }
+        generationConfig: {
+          temperature: 0.2,
+          // 700 tokens was truncating summaries mid-sentence once the
+          // 150–250 word body + any thinking overhead exceeded the ceiling.
+          // Raised to leave a comfortable margin for well-reviewed products
+          // where the model wants to run the full 250 words.
+          maxOutputTokens: 2000,
+          // Cap thinking so it never starves the actual output. Flash's
+          // thinking is lighter than Pro but this guards against regressions
+          // if GEMINI_SEARCH_MODEL is pointed at Pro later.
+          thinkingConfig: { thinkingBudget: 512 }
+        }
       },
-      { timeout: 30000 }
+      { timeout: 45000 }
     );
 
     const candidate = res.data?.candidates?.[0];
+    const finishReason = candidate?.finishReason || 'unknown';
     const summary = (candidate?.content?.parts || [])
       .map(p => p.text || '')
       .join(' ')
       .trim();
     if (!summary) {
-      console.log(`   ○ gemini-reviews: empty summary for "${descriptor}" in ${Date.now() - t0}ms`);
+      const usage = res.data?.usageMetadata || {};
+      console.log(`   ○ gemini-reviews: empty summary for "${descriptor}" (finishReason=${finishReason}, tokens out=${usage.candidatesTokenCount || 0} thought=${usage.thoughtsTokenCount || 0}) in ${Date.now() - t0}ms`);
       return null;
+    }
+    // Surface truncation so we notice immediately in logs rather than only
+    // when a user complains the summary ends mid-word.
+    if (finishReason === 'MAX_TOKENS') {
+      const usage = res.data?.usageMetadata || {};
+      console.warn(`   ⚠️  gemini-reviews: hit MAX_TOKENS for "${descriptor}" (out=${usage.candidatesTokenCount || 0} thought=${usage.thoughtsTokenCount || 0}) — summary may be truncated`);
     }
 
     const seen = new Set();
