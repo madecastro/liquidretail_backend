@@ -17,6 +17,7 @@ const { generateExtendedCrops } = require('../services/extendedCropsService');
 const { transcribeAudio } = require('../services/whisperService');
 const { extractEntities } = require('../services/nerService');
 const { findProductMatches } = require('../services/productMatchService');
+const { analyzeOverlayZones } = require('../services/overlayZoneService');
 
 const { downloadBuffer, setStage, finalizeStage } = require('./shared');
 
@@ -118,6 +119,15 @@ async function runDetectImagePipeline(job, buffer) {
     console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
+  await setStage(job, 'overlay-zones');
+  let overlayZones = {};
+  try {
+    overlayZones = await runOverlayZoneAnalysis({
+      sourceImageUrl: job.fileUrl,
+      crops, judge, extendedCrops
+    });
+  } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
+
   return {
     type: 'image',
     imageUrl: job.fileUrl,
@@ -125,7 +135,8 @@ async function runDetectImagePipeline(job, buffer) {
     products: products.map(({ cropBuffer, ...p }) => p),
     subjects, text, crops, judge, safeRect,
     extendedCrops, extendedErrors, extendedJudge,
-    productMatches
+    productMatches,
+    overlayZones
   };
 }
 
@@ -245,6 +256,17 @@ async function runDetectVideoPipeline(job, buffer) {
     console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
+  await setStage(job, 'overlay-zones');
+  let overlayZones = {};
+  if (heroImageUrl) {
+    try {
+      overlayZones = await runOverlayZoneAnalysis({
+        sourceImageUrl: heroImageUrl,
+        crops, judge, extendedCrops
+      });
+    } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
+  }
+
   return {
     type: 'video',
     videoUrl: job.fileUrl,
@@ -255,6 +277,7 @@ async function runDetectVideoPipeline(job, buffer) {
     subjects, text, crops, judge, safeRect,
     extendedCrops, extendedErrors, extendedJudge,
     productMatches,
+    overlayZones,
     transcript: transcript ? {
       text: transcript.text,
       duration: transcript.duration,
@@ -277,6 +300,92 @@ function buildCloudinaryCropUrl(videoUrl, crop) {
     return videoUrl.replace(/\/(v\d+\/)/, `/${transform}/$1`);
   }
   return videoUrl.replace('/upload/', `/upload/${transform}/`);
+}
+
+// Layout-preprocessing stage. Picks the input images (base-ratio judge winners
+// + both Gemini-extended candidates per extended ratio) and asks Gemini Vision
+// for overlay zones per image, in parallel.
+//
+// Artifact shape — stable contract for downstream ad-layout generator:
+//   {
+//     '5:4':   { base:             { candidateId, imageUrl, analysis } },
+//     '1:1':   { base:             { ... } },
+//     '4:5':   { base:             { ... } },
+//     '9:16':  { gemini_extension: { ... }, gemini_generation: { ... } },
+//     '1.91:1':{ gemini_extension: { ... }, gemini_generation: { ... } }
+//   }
+// Always: artifact[ratio][variantKey]. `analysis` is null when Gemini failed
+// for that specific image (non-fatal; other slots still populate).
+async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops }) {
+  const inputs = pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops });
+  if (!inputs.length) return {};
+
+  const settled = await Promise.allSettled(inputs.map(i =>
+    analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio })
+  ));
+
+  const artifact = {};
+  inputs.forEach((input, idx) => {
+    const analysis = settled[idx].status === 'fulfilled' ? settled[idx].value : null;
+    artifact[input.ratio] = artifact[input.ratio] || {};
+    artifact[input.ratio][input.variantKey] = {
+      candidateId: input.candidateId,
+      imageUrl:    input.imageUrl,
+      analysis
+    };
+  });
+
+  const ok = inputs.reduce((a, input) =>
+    a + (artifact[input.ratio][input.variantKey].analysis ? 1 : 0), 0);
+  console.log(`🎯 Overlay zones: ${ok}/${inputs.length} analyses complete`);
+  return artifact;
+}
+
+// Select the images to analyze. Base ratios → judge winner cropped from the
+// source via Cloudinary c_crop. Extended ratios → Gemini extension + Gemini
+// generation candidates (both, as requested — OpenAI variants are skipped
+// here; fidelity bias against them has been confirmed).
+function pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops }) {
+  const inputs = [];
+  if (!sourceImageUrl) return inputs;
+
+  const baseRatios = [
+    { ratio: '5:4', judgeKey: 'crop_5_4' },
+    { ratio: '1:1', judgeKey: 'crop_1_1' },
+    { ratio: '4:5', judgeKey: 'crop_4_5' }
+  ];
+  for (const { ratio, judgeKey } of baseRatios) {
+    const winnerId = judge?.[judgeKey]?.winnerId;
+    const list = crops?.[ratio] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0];
+    if (!winner) continue;
+    const imageUrl = buildCloudinaryCropUrl(sourceImageUrl, winner);
+    if (!imageUrl) continue;
+    inputs.push({
+      ratio,
+      variantKey:  'base',
+      candidateId: winner.id,
+      imageUrl,
+      label: `${ratio} base`
+    });
+  }
+
+  for (const ratio of ['9:16', '1.91:1']) {
+    const list = extendedCrops?.[ratio] || [];
+    for (const variant of ['extension', 'generation']) {
+      const cand = list.find(c => c.provider === 'gemini' && c.variant === variant);
+      if (!cand?.imageUrl) continue;
+      inputs.push({
+        ratio,
+        variantKey:  `gemini_${variant}`,
+        candidateId: cand.id,
+        imageUrl:    cand.imageUrl,
+        label: `${ratio} gem-${variant}`
+      });
+    }
+  }
+
+  return inputs;
 }
 
 module.exports = { processDetectJob };
