@@ -5,6 +5,14 @@
 // trusted_by_text); everything else is deterministic mapping from detect
 // artifacts + Brand catalog + Media metadata.
 //
+// MEDIA-PAIR CONVENTION (per renderer spec §7.4 — "poster is required for
+// every video slot"): whenever we emit a media pair like
+// `product.hero_media: { image, video }` or `creator.portrait_media: {...}`,
+// the `image` field is the video's poster. The renderer uses it for the
+// pre-autoplay still and for video-unsupported placements. We always
+// populate both when a video is available — the pairing is guaranteed by
+// pickHeroMedia / pickCreatorMedia below.
+//
 // OUTPUT SHAPE — canonical paths as defined by the normalized template
 // schema. Each top-level module:
 //

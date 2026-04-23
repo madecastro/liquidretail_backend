@@ -4,17 +4,21 @@
 // asking "what does template X look like?" or "does this input satisfy
 // template Y?"
 //
-// The three schemas:
-//   1. schemas/rsSocialProof.templates.catalog.json   — selection rules,
-//      purpose, copy strategy, visual character. Human-read, UI-surfaced.
-//   2. schemas/rsSocialProof.templates.normalized.json — per-zone slot
-//      bindings, slot_adapter fallbacks, validation block. The contract.
-//   3. schemas/rsSocialProof.canvas.v1.json           — 25 ratio-specific
-//      canvas variants (5 templates × 5 ratios). Geometry the renderer
-//      consumes to place zones.
+// The four canonical specs (all under server/schemas/):
+//   1. rsSocialProof.templates.catalog.json   — selection rules, purpose,
+//      copy strategy, visual character. Human-read, UI-surfaced.
+//   2. rsSocialProof.templates.normalized.json — per-zone slot bindings,
+//      slot_adapter fallbacks, validation block. The contract.
+//   3. rsSocialProof.canvas.v1.json            — 25 ratio-specific canvas
+//      variants (5 templates × 5 ratios) + masters + global rules.
+//      Geometry the renderer consumes to place zones.
+//   4. rsSocialProof.renderer.v1.md            — renderer behavior spec:
+//      slot fill order, collapse rules, truncation, media fit, video/
+//      poster behavior, scrim, mobile obstruction, empty-state fallbacks.
+//      Prose — the eventual renderer service pins to this.
 //
-// Schemas are READ-ONLY at runtime. Updates land as PRs against the JSON
-// files; the service reboots to pick them up.
+// Schemas are READ-ONLY at runtime. Updates land as PRs against the files;
+// the service reboots to pick them up.
 
 const fs = require('fs');
 const path = require('path');
