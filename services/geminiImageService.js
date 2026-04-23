@@ -85,7 +85,7 @@ async function candidateModels() {
   return ordered;
 }
 
-async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription) {
+async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription, background) {
   if (!genAI) throw new Error('GEMINI_API_KEY not set');
   const cropUrl = buildCropUrl(sourceUrl, baseCrop);
 
@@ -93,24 +93,50 @@ async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription)
     `Extend this product photograph naturally to a ${targetRatio} aspect ratio canvas. ` +
     `Preserve the subject${subjectDescription ? ` (${subjectDescription})` : ''} exactly — same identity, shape, proportion, and position. ` +
     `Extend the existing background outward, matching lighting, color palette, texture, and style. ` +
+    formatBackgroundForExtension(background) +
     `Do not introduce new objects. Output a single image at ${targetRatio} aspect ratio.`;
 
   return Buffer.from(await runImageGen(prompt, cropUrl), 'base64');
 }
 
-async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription) {
+async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription, background) {
   if (!genAI) throw new Error('GEMINI_API_KEY not set');
   const cropUrl = buildCropUrl(sourceUrl, baseCrop);
 
   const prompt =
     `Create a new professional e-commerce product photograph at ${targetRatio} aspect ratio. ` +
     `Use the subject${subjectDescription ? ` (${subjectDescription})` : ''} from the reference image — ` +
-    `preserve its identity, shape, material, and approximate pose. Replace the background with a clean, ` +
-    `modern, brand-neutral studio or lifestyle scene appropriate for marketing. ` +
-    `Use soft professional lighting with the subject as the clear focal point. ` +
+    `preserve its identity, shape, material, and approximate pose. ` +
+    formatBackgroundForGeneration(background) +
+    `The subject is the clear focal point. ` +
     `Output a single image at ${targetRatio} aspect ratio.`;
 
   return Buffer.from(await runImageGen(prompt, cropUrl), 'base64');
+}
+
+// EXTENSION: preserve existing scene. GENERATION: reuse stylistic cues.
+function formatBackgroundForExtension(bg) {
+  if (!bg) return '';
+  const notes = [bg.description, bg.notes].filter(Boolean).join('. ');
+  const bits = [];
+  if (bg.setting)  bits.push(`setting: ${bg.setting}`);
+  if (bg.lighting) bits.push(`lighting: ${bg.lighting}`);
+  if (bg.style)    bits.push(`style: ${bg.style}`);
+  if (bg.palette?.length) bits.push(`palette: ${bg.palette.join(', ')}`);
+  const hint = bits.length ? `(${bits.join('; ')}) ` : '';
+  return (notes || bits.length) ? `Scene context to match: ${hint}${notes}. ` : '';
+}
+
+function formatBackgroundForGeneration(bg) {
+  if (!bg) {
+    return 'Replace the background with a clean, modern, brand-neutral studio or lifestyle scene appropriate for marketing. Use soft professional lighting. ';
+  }
+  const setting  = bg.setting  || 'clean marketing';
+  const lighting = bg.lighting || 'soft professional lighting';
+  const style    = bg.style    || 'photorealistic';
+  const palette  = bg.palette?.length ? ` Echo the original scene's palette (${bg.palette.join(', ')}).` : '';
+  const notes    = bg.notes    ? ` ${bg.notes}` : '';
+  return `Build a ${setting} scene consistent with the original image in a ${style} style with ${lighting}.${palette}${notes} `;
 }
 
 async function runImageGen(prompt, sourceUrl) {

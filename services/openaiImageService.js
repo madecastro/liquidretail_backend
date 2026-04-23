@@ -15,7 +15,7 @@ const RATIO_TO_SIZE = {
 // explicit mask where the source region is opaque and the padding is transparent.
 // gpt-image-1 repaints ONLY the mask's transparent areas, preserving the source
 // byte-for-byte. Without a mask it frequently regenerates the whole scene.
-async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription) {
+async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription, background) {
   const size = RATIO_TO_SIZE[targetRatio];
   if (!size) throw new Error(`Unsupported ratio ${targetRatio}`);
   const [canvasW, canvasH] = size.split('x').map(Number);
@@ -37,7 +37,8 @@ async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription)
   const prompt =
     `TASK: Outpainting / image-extension only. The provided image has a centered product photograph surrounded by transparent padding. The MASK marks the padded regions as editable (transparent) and the product region as preserved (opaque). ` +
     `STRICT RULES: (1) Do NOT change, redraw, recolor, or regenerate the product, its shape, its packaging, its label, or any of its pixels. (2) Only fill the mask-editable regions. (3) Extend the surrounding background (surface, lighting, color, texture) naturally outward from the edges of the preserved region — like zooming out on the same photograph. (4) Do not add props, text, or new objects. ` +
-    (subjectDescription ? `The preserved product is: ${subjectDescription}.` : '');
+    (subjectDescription ? `The preserved product is: ${subjectDescription}. ` : '') +
+    formatBackgroundForExtension(background);
 
   const res = await openai.images.edit({
     model: 'gpt-image-1',
@@ -52,7 +53,7 @@ async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription)
 
 // Fresh generation: take the source crop, regenerate the background around the
 // subject at the new aspect ratio. No mask — model has latitude to change bg.
-async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription) {
+async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription, background) {
   const size = RATIO_TO_SIZE[targetRatio];
   if (!size) throw new Error(`Unsupported ratio ${targetRatio}`);
 
@@ -63,8 +64,8 @@ async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescriptio
     `Create a new professional e-commerce product photograph at ${targetRatio} aspect ratio. ` +
     `Feature the subject${subjectDescription ? ` (${subjectDescription})` : ''} from the reference image — ` +
     `preserve its identity, shape, material, and approximate pose. ` +
-    `Place it against a clean, modern, brand-neutral studio or lifestyle scene appropriate for marketing. ` +
-    `Use soft professional lighting. The subject must be the clear focal point.`;
+    formatBackgroundForGeneration(background) +
+    `The subject must be the clear focal point.`;
 
   const res = await openai.images.edit({
     model: 'gpt-image-1',
@@ -128,5 +129,34 @@ async function fetchBuffer(url) {
 }
 
 function base64ToBuffer(b64) { return Buffer.from(b64, 'base64'); }
+
+// Background-context formatters. These lift the structured background
+// analysis (from subjectTextService) into short prose the AI model can use.
+// For EXTENSION (outpainting) we bias toward preservation — "match the
+// existing scene's X/Y/Z". For FRESH GENERATION we bias toward reuse of
+// style characteristics since the background is being re-drawn.
+function formatBackgroundForExtension(bg) {
+  if (!bg) return '';
+  const parts = [];
+  if (bg.setting)    parts.push(`setting is ${bg.setting}`);
+  if (bg.lighting)   parts.push(`lighting is ${bg.lighting}`);
+  if (bg.style)      parts.push(`style is ${bg.style}`);
+  if (bg.palette?.length) parts.push(`dominant background colors: ${bg.palette.join(', ')}`);
+  if (!parts.length && !bg.description && !bg.notes) return '';
+  const prose = parts.length ? `(${parts.join('; ')}) ` : '';
+  return `Match the existing scene: ${prose}${bg.description || ''}${bg.notes ? ' ' + bg.notes : ''}`.trim() + '.';
+}
+
+function formatBackgroundForGeneration(bg) {
+  if (!bg) {
+    return 'Place it against a clean, modern, brand-neutral studio or lifestyle scene appropriate for marketing. Use soft professional lighting. ';
+  }
+  const setting  = bg.setting  || 'clean marketing';
+  const lighting = bg.lighting || 'soft professional lighting';
+  const style    = bg.style    || 'photorealistic';
+  const palette  = bg.palette?.length ? ` Echo the original scene's palette (${bg.palette.join(', ')}).` : '';
+  const notes    = bg.notes    ? ` ${bg.notes}` : '';
+  return `Place it in a ${setting} scene consistent with the original image, in a ${style} style with ${lighting}.${palette}${notes} `;
+}
 
 module.exports = { extendImage, generateFresh };

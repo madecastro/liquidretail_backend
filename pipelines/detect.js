@@ -18,6 +18,7 @@ const { transcribeAudio } = require('../services/whisperService');
 const { extractEntities } = require('../services/nerService');
 const { findProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
+const { identifyYoloDetections } = require('../services/yoloIdentifyService');
 
 const { downloadBuffer, setStage, finalizeStage } = require('./shared');
 
@@ -56,15 +57,26 @@ async function runDetectImagePipeline(job, buffer) {
     console.log(`🔍 YOLO: ${products.length} product(s)`);
   } catch (err) { console.warn('⚠️  YOLO:', err.message); }
 
+  await setStage(job, 'yolo-identify');
+  try {
+    if (products.length) {
+      const ids = await identifyYoloDetections(products, {
+        brand: job.metadata?.brand,
+        category: job.metadata?.category
+      });
+      console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
+    }
+  } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
+
   await setStage(job, 'subjects-text');
-  let subjects = [], text = [];
+  let subjects = [], text = [], background = null;
   try {
     const st = await detectSubjectsAndText(job.fileUrl, {
       brand: job.metadata?.brand,
       category: job.metadata?.category,
       caption: job.metadata?.caption
     });
-    subjects = st.subjects; text = st.text;
+    subjects = st.subjects; text = st.text; background = st.background;
   } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
 
   const imgW = products[0]?.imgWidth  || 1024;
@@ -81,14 +93,16 @@ async function runDetectImagePipeline(job, buffer) {
     judge = await judgeDetections({ imageUrl: job.fileUrl, products, subjects, text, crops, safeRect });
   } catch (err) { console.warn('⚠️  Judge:', err.message); }
 
+  const primarySubjectDesc = resolvePrimarySubjectDesc(subjects, judge);
+
   await setStage(job, 'extended-crops');
-  const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
   let extendedCrops = {}, extendedErrors = {}, extendedJudge = {};
   try {
     const { candidates, errors } = await generateExtendedCrops({
       sourceImageUrl: job.fileUrl,
       sourceVideoUrl: null,
-      smartCrops: crops, judge, primarySubject: primarySubjectDesc, isVideo: false
+      smartCrops: crops, judge, primarySubject: primarySubjectDesc,
+      background, isVideo: false
     });
     extendedCrops = candidates;
     extendedErrors = errors;
@@ -133,7 +147,8 @@ async function runDetectImagePipeline(job, buffer) {
     imageUrl: job.fileUrl,
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
-    subjects, text, crops, judge, safeRect,
+    subjects, text, background, crops, judge, safeRect,
+    primarySubjectDesc,
     extendedCrops, extendedErrors, extendedJudge,
     productMatches,
     overlayZones
@@ -165,6 +180,17 @@ async function runDetectVideoPipeline(job, buffer) {
     }
   } catch (err) { console.warn('⚠️  YOLO video:', err.message); }
 
+  await setStage(job, 'yolo-identify');
+  try {
+    if (products.length) {
+      const ids = await identifyYoloDetections(products, {
+        brand: job.metadata?.brand,
+        category: job.metadata?.category
+      });
+      console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
+    }
+  } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
+
   await setStage(job, 'transcribe');
   let transcript = null, entities = [];
   try {
@@ -177,7 +203,7 @@ async function runDetectVideoPipeline(job, buffer) {
     }
   } catch (err) { console.warn('⚠️  Transcription/NER:', err.message); }
 
-  let subjects = [], text = [];
+  let subjects = [], text = [], background = null;
   if (heroImageUrl) {
     await setStage(job, 'subjects-text');
     try {
@@ -186,7 +212,7 @@ async function runDetectVideoPipeline(job, buffer) {
         category: job.metadata?.category,
         caption: job.metadata?.caption
       });
-      subjects = st.subjects; text = st.text;
+      subjects = st.subjects; text = st.text; background = st.background;
     } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
   }
 
@@ -215,7 +241,9 @@ async function runDetectVideoPipeline(job, buffer) {
   }
 
   // Hoisted so both the extended-crops and product-match stages can see it.
-  const primarySubjectDesc = (subjects.find(s => s.role === 'primary') || {}).description || null;
+  // Judge's primaryId is preferred over GPT's role field — the judge sees YOLO
+  // + GPT subjects together and can arbitrate when they disagree.
+  const primarySubjectDesc = resolvePrimarySubjectDesc(subjects, judge);
 
   let extendedCrops = {}, extendedErrors = {}, extendedJudge = {};
   if (heroImageUrl) {
@@ -224,7 +252,8 @@ async function runDetectVideoPipeline(job, buffer) {
       const { candidates, errors } = await generateExtendedCrops({
         sourceImageUrl: heroImageUrl,
         sourceVideoUrl: job.fileUrl,
-        smartCrops: crops, judge, primarySubject: primarySubjectDesc, isVideo: true
+        smartCrops: crops, judge, primarySubject: primarySubjectDesc,
+        background, isVideo: true
       });
       extendedCrops = candidates;
       extendedErrors = errors;
@@ -274,7 +303,8 @@ async function runDetectVideoPipeline(job, buffer) {
     heroFrameSec, heroReason, videoDurationSec,
     width: imgW, height: imgH,
     products: products.map(({ cropBuffer, ...p }) => p),
-    subjects, text, crops, judge, safeRect,
+    subjects, text, background, crops, judge, safeRect,
+    primarySubjectDesc,
     extendedCrops, extendedErrors, extendedJudge,
     productMatches,
     overlayZones,
@@ -405,6 +435,18 @@ function pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops }) 
   }
 
   return inputs;
+}
+
+// Primary-subject description resolver. The judge sees both YOLO products and
+// GPT subjects at once, so its `judge.subjects.primaryId` is the authoritative
+// pick when available. Fall back to GPT's own role=primary tag when the judge
+// didn't run (e.g. its stage failed) or didn't identify a primary.
+function resolvePrimarySubjectDesc(subjects, judge) {
+  if (!subjects || subjects.length === 0) return null;
+  const judgePrimaryId = judge?.subjects?.primaryId;
+  const byJudge = judgePrimaryId ? subjects.find(s => s.id === judgePrimaryId) : null;
+  const byRole  = subjects.find(s => s.role === 'primary');
+  return (byJudge || byRole || {}).description || null;
 }
 
 module.exports = { processDetectJob };

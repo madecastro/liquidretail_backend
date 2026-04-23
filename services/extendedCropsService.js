@@ -19,7 +19,7 @@ const NEW_RATIOS = {
 // Cloudinary image-typed assets can't be used as the base of a /video/upload/
 // URL, so that kind of composite is unreliable with the public Cloudinary
 // transform API alone.
-async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrops, judge, primarySubject, isVideo }) {
+async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrops, judge, primarySubject, background, isVideo }) {
   const output = { '9:16': [], '1.91:1': [] };
   const errors = { '9:16': [], '1.91:1': [] };
 
@@ -40,26 +40,28 @@ async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrop
 
     const tasks = [];
 
-    // AI providers receive sourceUrl + baseCrop and build their own transform URLs.
+    // AI providers receive sourceUrl + baseCrop + subject + background and
+    // build their own transform URLs. `background` (from subjectTextService)
+    // gives them the scene style/palette/lighting to preserve or extend.
     tasks.push(makeProviderCandidate({
       id: `${newRatio}-ext-openai`, label: 'OpenAI extension', provider: 'openai', variant: 'extension',
-      generator: () => openaiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject),
+      generator: () => openaiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
       newRatio, cloudinaryAr, sharedVideoUrl
     }));
     tasks.push(makeProviderCandidate({
       id: `${newRatio}-gen-openai`, label: 'OpenAI generation', provider: 'openai', variant: 'generation',
-      generator: () => openaiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject),
+      generator: () => openaiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
       newRatio, cloudinaryAr, sharedVideoUrl
     }));
     if (geminiImg.isEnabled()) {
       tasks.push(makeProviderCandidate({
         id: `${newRatio}-ext-gemini`, label: 'Gemini extension', provider: 'gemini', variant: 'extension',
-        generator: () => geminiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject),
+        generator: () => geminiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
         newRatio, cloudinaryAr, sharedVideoUrl
       }));
       tasks.push(makeProviderCandidate({
         id: `${newRatio}-gen-gemini`, label: 'Gemini generation', provider: 'gemini', variant: 'generation',
-        generator: () => geminiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject),
+        generator: () => geminiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
         newRatio, cloudinaryAr, sharedVideoUrl
       }));
     }
