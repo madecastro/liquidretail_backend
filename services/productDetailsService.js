@@ -1,17 +1,25 @@
 // Product details enrichment — given an identified product, fetch structured
-// price, specs, and Google reviews via SerpAPI's Google Shopping + Google
-// Product engines. Runs AFTER the reasoner has committed to a product name,
-// so the query is precise.
+// price and seller data via SerpAPI's Google Shopping engine, plus an
+// LLM-summarized review snapshot via Gemini grounded search.
 //
-// Two API calls per product:
-//   1. google_shopping: price comparison across sellers (cheap, reliable)
-//   2. google_product:  full details + reviews for the top product_id
-// Second call only fires if the first returns a product_id.
+// HISTORY: The old pipeline also used SerpAPI's `google_product` engine for
+// description, full specs, rating distribution, and individual review text.
+// Google retired that API (SerpAPI now returns HTTP 400 "The Google Product
+// service is no longer offered by Google" on every call), so we've dropped
+// that step. Rating and review count still come from google_shopping; review
+// TEXT is now a Gemini-generated narrative summary grounded in real web pages
+// rather than raw Google review rows.
+//
+// Pipeline:
+//   1. google_shopping (SerpAPI) — price / sellers / rating / review-count
+//   2. gemini-reviews (grounded) — narrative review summary + cited sources
+// The two calls run in parallel; neither needs the other's output.
 
 const axios = require('axios');
 
 const ENDPOINT = 'https://serpapi.com/search.json';
 const COUNTRY  = process.env.SERPAPI_COUNTRY || 'us';
+const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
 
 const _rawKey = process.env.SERPAPI_API_KEY || '';
 const _key    = _rawKey.trim().replace(/^['"]|['"]$/g, '');
@@ -26,45 +34,28 @@ async function fetchProductDetails(identification) {
   const query = [identification.brand, identification.productName, identification.variant]
     .filter(Boolean).join(' ').trim();
 
-  // ── 1. Google Shopping: price + seller comparison ──
-  const shopping = await serp({
-    engine: 'google_shopping',
-    q: query,
-    gl: COUNTRY
-  });
-  const shoppingResults = shopping?.shopping_results || [];
+  // Run shopping search and Gemini review summary in parallel — independent inputs.
+  const [shoppingSettled, reviewSummarySettled] = await Promise.allSettled([
+    serp({ engine: 'google_shopping', q: query, gl: COUNTRY }),
+    fetchReviewSummary({
+      productName: identification.productName,
+      brand:       identification.brand,
+      variant:     identification.variant
+    })
+  ]);
+
+  if (shoppingSettled.status !== 'fulfilled') {
+    console.warn(`   ⚠️  google_shopping failed in ${Date.now() - t0}ms: ${shoppingSettled.reason?.message || shoppingSettled.reason}`);
+    return null;
+  }
+  const shoppingResults = shoppingSettled.value?.shopping_results || [];
   if (!shoppingResults.length) {
     console.log(`   ○ product-details: no google_shopping results for "${query}" in ${Date.now() - t0}ms`);
     return null;
   }
 
   const top = shoppingResults[0];
-
-  // ── 2. Google Product (only if we got a product_id) ──
-  let productData = null, reviewsBlock = null;
-  if (top.product_id) {
-    try {
-      // NOTE: passing `reviews: 1` here was rejected by SerpAPI with HTTP 400
-      // ("Request failed with status code 400") — that flag isn't accepted on
-      // this engine/plan in the form we tried. To get the actual reviews tab,
-      // the right path is likely a follow-up call using the
-      // reviews_results.link / serpapi_endpoint returned by this base call.
-      // TODO: read serpapi_endpoint from prodRes.reviews_results and chain a
-      // second call for the full review list once we confirm the shape.
-      const prodRes = await serp({
-        engine: 'google_product',
-        product_id: top.product_id,
-        gl: COUNTRY
-      });
-      productData  = prodRes?.product_results || null;
-      reviewsBlock = prodRes?.reviews_results || null;
-    } catch (err) {
-      // Surface SerpAPI's own error body — axios's err.message is just the
-      // generic status line, the useful detail is in err.response.data.
-      const serpMsg = err.response?.data?.error || err.response?.data?.message || JSON.stringify(err.response?.data || {}).slice(0, 200);
-      console.warn(`   ⚠️  google_product(${top.product_id}) failed: ${err.message}${serpMsg ? ` — ${serpMsg}` : ''}`);
-    }
-  }
+  const reviewSummary = reviewSummarySettled.status === 'fulfilled' ? reviewSummarySettled.value : null;
 
   // Aggregate sellers across top 8 shopping results so the user sees a real
   // price-comparison table.
@@ -79,43 +70,100 @@ async function fetchProductDetails(identification) {
     reviewCount:    r.reviews || null
   })).filter(s => s.link);
 
-  // Reviews: normalize SerpAPI's shape into our own
-  const reviews = (reviewsBlock?.reviews || []).slice(0, 10).map(r => ({
-    rating: r.rating || null,
-    title:  r.title || '',
-    text:   r.text || r.snippet || '',
-    author: r.author || r.name || '',
-    date:   r.date || '',
-    source: r.source || ''
-  }));
-
-  const ratingDistribution = (reviewsBlock?.ratings || []).map(r => ({
-    stars:  r.stars || 0,
-    count:  r.amount || r.count || 0
-  }));
-
   const result = {
-    title:        productData?.title || top.title || identification.productName,
-    description:  productData?.description || top.description || null,
-    thumbnail:    productData?.media?.[0]?.link || top.thumbnail || identification.primaryThumbnail || null,
+    title:        top.title || identification.productName,
+    description:  null,                // google_product retired — no description source
+    thumbnail:    top.thumbnail || identification.primaryThumbnail || null,
     price: {
-      display:     top.price || (productData?.prices && productData.prices[0]) || null,
+      display:     top.price || null,
       value:       typeof top.extracted_price === 'number' ? top.extracted_price : null,
       currency:    top.currency || 'USD'
     },
-    rating:       typeof (productData?.rating) === 'number' ? productData.rating
-                  : typeof top.rating === 'number' ? top.rating : null,
-    reviewCount:  productData?.reviews || top.reviews || 0,
-    ratingDistribution,
-    reviews,
+    rating:       typeof top.rating === 'number' ? top.rating : null,
+    reviewCount:  top.reviews || 0,
+    ratingDistribution: [],            // google_product retired — no distribution source
+    reviews:      [],                  // google_product retired — use reviewSummary instead
+    reviewSummary,                     // { summary, sources[], queries[] } or null
     sellers,
-    specs:        productData?.specifications || productData?.specs || {},
+    specs:        {},                  // google_product retired — no specs source
     productId:    top.product_id || null,
-    source:       'serpapi-shopping+product'
+    source:       'serpapi-shopping+gemini-reviews'
   };
 
-  console.log(`   ✓ product-details: ${sellers.length} seller(s), ${reviews.length} review(s), rating=${result.rating ?? 'n/a'}, price=${result.price.display ?? 'n/a'} in ${Date.now() - t0}ms`);
+  console.log(`   ✓ product-details: ${sellers.length} seller(s), reviewSummary=${reviewSummary ? `${reviewSummary.sources.length} src` : 'no'}, rating=${result.rating ?? 'n/a'}, price=${result.price.display ?? 'n/a'} in ${Date.now() - t0}ms`);
   return result;
+}
+
+// Gemini grounded search → narrative review summary. Returns
+// { summary, sources, queries } or null if Gemini isn't configured or the call
+// fails. Mirrors the grounded-search pattern used in geminiSearchProvider.js:
+// text body is taken from response content parts, cited sources come from
+// groundingMetadata.groundingChunks (authoritative URL list, not prose parsing).
+async function fetchReviewSummary({ productName, brand, variant }) {
+  if (!process.env.GEMINI_API_KEY) return null;
+  if (!productName) return null;
+
+  const descriptor = [brand, productName, variant].filter(Boolean).join(' ');
+  const prompt =
+    `Using Google Search, find recent online reviews of "${descriptor}" and write a concise, ` +
+    `balanced review summary (150–250 words). Cover in natural prose:\n` +
+    `  • what buyers consistently praise\n` +
+    `  • common complaints or concerns\n` +
+    `  • notes on durability, quality, or fit/sizing\n` +
+    `  • typical use cases the product excels at\n` +
+    `  • value-for-money impressions\n\n` +
+    `Weight recent reviews higher. Synthesize trends — do NOT include individual review quotes or star ratings. ` +
+    `If the product has very limited reviews, say so plainly.`;
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  const t0 = Date.now();
+  try {
+    const res = await axios.post(
+      `${endpoint}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+      {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ google_search: {} }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 700 }
+      },
+      { timeout: 30000 }
+    );
+
+    const candidate = res.data?.candidates?.[0];
+    const summary = (candidate?.content?.parts || [])
+      .map(p => p.text || '')
+      .join(' ')
+      .trim();
+    if (!summary) {
+      console.log(`   ○ gemini-reviews: empty summary for "${descriptor}" in ${Date.now() - t0}ms`);
+      return null;
+    }
+
+    const seen = new Set();
+    const sources = [];
+    for (const chunk of (candidate?.groundingMetadata?.groundingChunks || [])) {
+      const uri = chunk?.web?.uri;
+      if (!uri || seen.has(uri)) continue;
+      seen.add(uri);
+      sources.push({
+        url: uri,
+        title: chunk.web?.title || extractDomain(uri),
+        domain: extractDomain(uri)
+      });
+      if (sources.length >= 8) break;
+    }
+    const queries = candidate?.groundingMetadata?.webSearchQueries || [];
+
+    console.log(`   ✓ gemini-reviews: ${summary.length}ch summary, ${sources.length} source(s) in ${Date.now() - t0}ms`);
+    return { summary, sources, queries };
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.message;
+    console.warn(`   ⚠️  gemini-reviews failed in ${Date.now() - t0}ms: ${detail}`);
+    return null;
+  }
+}
+
+function extractDomain(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
 
 async function serp(params) {
