@@ -338,10 +338,16 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
   lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
   lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
+  // Quote length target depends on template — narrow zones (split-screen
+  // quote_bubble, review_collage cards) clip on mobile when quotes run long.
+  const quoteLengthRule = (template === 'ugc_split_screen' || template === 'review_collage')
+    ? '10–14 words and UNDER 90 characters each (split-screen / collage zones clip at 4 lines on narrow canvases)'
+    : '12–18 words, ≤ 120 characters each';
+
   if (demos.length) {
-    lines.push(`- "quotes" ${quoteTarget} NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name is the persona's name; author_title is a one-phrase identity cue; source="testimonial" or "ugc". Ground substance in the review summary. verified=true only if the brand has well-documented social proof. ≤ 22 words per quote; mix lengths and angles.`);
+    lines.push(`- "quotes" ${quoteTarget} NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name is the persona's name; author_title is a one-phrase identity cue; source="testimonial" or "ugc". Ground substance in the review summary. verified=true only if the brand has well-documented social proof. Target ${quoteLengthRule}. Mix angles across quotes.`);
   } else {
-    lines.push(`- "quotes" ${quoteTarget} short notional reviews/comments drawn from the review summary. author_name can be null; source="review" unless signal clearly implies creator/ugc. verified=false unless clearly endorsed. ≤ 20 words per quote; mix angles.`);
+    lines.push(`- "quotes" ${quoteTarget} short notional reviews/comments drawn from the review summary. author_name can be null; source="review" unless signal clearly implies creator/ugc. verified=false unless clearly endorsed. Target ${quoteLengthRule}. Mix angles.`);
   }
   lines.push(`- "cta.text" REQUIRED, ≤ 3 words, imperative voice (e.g. "Shop now"). "offer_text" only if price/offer data supports it.`);
   lines.push(`- "trusted_by_text" preferred if review_count ≥ 50 — format "Trusted by Xk+ customers", "Loved by Nk shoppers", etc.`);
@@ -443,11 +449,21 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   const rightsApproved = !!media.rights?.approved;
   const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
 
-  // Prefer LLM-emitted badges; otherwise synthesize from rating/review data
-  // so badge zones on templates have something concrete to show.
-  const derivedBadges = Array.isArray(derivation.badges) && derivation.badges.length
-    ? derivation.badges
-    : defaultBadgesFromSignal(details);
+  // Badge set assembly. Take LLM-emitted badges if any, then supplement with
+  // rating/review defaults to ensure badge_row / engagement_row zones have
+  // at least ~2 items. Dedupe case-insensitively so we don't repeat a
+  // "Top rated" the LLM already wrote.
+  const llmBadges = Array.isArray(derivation.badges) ? derivation.badges.filter(Boolean) : [];
+  const defaultBadges = defaultBadgesFromSignal(details);
+  const seenBadges = new Set(llmBadges.map(b => String(b).toLowerCase()));
+  const derivedBadges = [...llmBadges];
+  for (const b of defaultBadges) {
+    if (derivedBadges.length >= 4) break;
+    if (!seenBadges.has(b.toLowerCase())) {
+      derivedBadges.push(b);
+      seenBadges.add(b.toLowerCase());
+    }
+  }
 
   const input = {
     template,
@@ -566,12 +582,34 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
 // ──────────────────────────────────────────────────────────────
 //  Media resolution helpers
 // ──────────────────────────────────────────────────────────────
+// Product hero media resolution.
+//
+// IMPORTANT: the smart-crop judge is optimized for "best crop of the subject
+// of interest". On creator UGC where the product is being worn, that subject
+// is almost always the PERSON — so using the judge winner for product.hero
+// ends up showing the same person as creator.portrait_media, collapsing the
+// visual distinction split-screen templates rely on.
+//
+// Preference order for base ratios:
+//   1. High-confidence YOLO product bbox (tight crop of the actual product)
+//   2. Judge winner smart crop (subject-of-interest)
+//
+// For extended ratios (9:16, 1.91:1) we still use the AI-extended Gemini
+// winner because those are purpose-built hero assets.
 function pickHeroMedia(ctx, aspectRatio) {
   const { media, detection, crops, extended } = ctx;
   const out = { image: null, video: null };
   const baseRatios = ['5:4', '1:1', '4:5'];
 
   if (baseRatios.includes(aspectRatio)) {
+    const product = pickTopYoloProduct(detection);
+    if (product && detection?.imageUrl) {
+      out.image = buildCloudinaryCropUrl(detection.imageUrl, product);
+      if (media.fileType === 'video' && media.fileUrl) {
+        out.video = buildCloudinaryCropUrl(media.fileUrl, product);
+      }
+      return out;
+    }
     const winnerId = crops?.winners?.[aspectRatio];
     const list = crops?.smartCrops?.[aspectRatio] || [];
     const winner = list.find(c => c.id === winnerId) || list[0];
@@ -597,6 +635,29 @@ function pickHeroMedia(ctx, aspectRatio) {
     }
   }
   return out;
+}
+
+// Pick the best YOLO product detection to use as a tight product crop.
+// Ranks by confidence × area (so the model doesn't pick a tiny 0.95 sunglasses
+// detection over a larger 0.82 shirt). Returns null if no detection is
+// confident enough to trust.
+function pickTopYoloProduct(detection) {
+  const dets = Array.isArray(detection?.yoloProducts) ? detection.yoloProducts : [];
+  if (!dets.length) return null;
+  const MIN_CONF = 0.55;
+  const scored = dets
+    .map(d => {
+      const conf = typeof d.confidence === 'number' ? d.confidence : 0;
+      if (conf < MIN_CONF) return null;
+      const w = Math.max(0, (d.x2 || 0) - (d.x1 || 0));
+      const h = Math.max(0, (d.y2 || 0) - (d.y1 || 0));
+      const area = w * h;
+      if (!area) return null;
+      return { det: d, score: conf * Math.sqrt(area) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+  return scored[0]?.det || null;
 }
 
 function pickSecondaryMedia(ctx, heroRatio) {
