@@ -67,8 +67,10 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // docs with a mismatching version are treated as cache misses and forced
 // to re-derive. 2.1 added the optional `placement` block for overlay-mode
 // templates. 2.2 added `placement.decisions[]` — the per-element
-// placement trace used by the preview's inspector panel.
-const INPUT_SCHEMA_VERSION = '2.2';
+// placement trace used by the preview's inspector panel. 2.3 added
+// `placement.analysis` (restrictions, grids, primarySubjectRectPct) and
+// `placement.usingFallbackImage` for the universal debug overlay.
+const INPUT_SCHEMA_VERSION = '2.3';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -615,16 +617,21 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
 // `placement` block to attach to the input, or null if no analyzed image
 // is available for this aspect ratio.
 function computeOverlayPlacement(ctx, aspectRatio, options, content) {
+  // Pick the analyzed image for this ratio. If none is available (e.g.
+  // detect didn't run overlay zones for this ratio, or Gemini failed for
+  // this variant), fall back to the media source — placement will run
+  // against empty restrictions so elements still get placed. The user can
+  // then see in the debug trace that "no analysis — placement is not
+  // subject-aware" rather than getting a blank preview.
   const overlayPick = pickOverlayBackground(ctx, aspectRatio);
-  if (!overlayPick.image) return null;
+  const usingFallbackImage = !overlayPick.image;
+  const image = overlayPick.image || ctx.media?.fileUrl || null;
+  if (!image) return null;  // no image at all; give up
 
-  // Conservation level: caller can override; default 0.5 (mid).
   const conservation = typeof options?.conservation === 'number'
     ? Math.max(0, Math.min(1, options.conservation))
     : 0.5;
 
-  // Canvas pixel dims from the canonical canvas spec (so font-scale math
-  // matches the renderer's coordinate space).
   const canvasSpec = registry.getCanvas(overlayCanonicalParent('testimonial_overlay'), aspectRatio);
   const canvasW = canvasSpec?.canvas?.width  || 1000;
   const canvasH = canvasSpec?.canvas?.height || 1000;
@@ -632,7 +639,7 @@ function computeOverlayPlacement(ctx, aspectRatio, options, content) {
   const result = placeOverlays({
     canvasW, canvasH,
     aspectRatio,
-    analysis:     overlayPick.analysis,
+    analysis:     overlayPick.analysis,  // may be null — placement handles it
     conservation,
     content,
     brandColors:  {
@@ -642,16 +649,28 @@ function computeOverlayPlacement(ctx, aspectRatio, options, content) {
     }
   });
 
+  // Surface the analysis data the debug UI needs to visualize keep-outs.
+  // Analysis may be null — the UI renders "no analysis" messaging in that
+  // case and skips the restriction-bbox layer.
+  const analysisSummary = overlayPick.analysis ? {
+    restrictions:          overlayPick.analysis.restrictions || [],
+    primarySubjectRectPct: overlayPick.analysis.primarySubjectRectPct || null,
+    densityGrid:           overlayPick.analysis.densityGrid || null,
+    brightnessGrid:        overlayPick.analysis.brightnessGrid || null
+  } : null;
+
   return {
     mode:            result.mode,                  // 'overlay' | 'inset'
     conservation,
+    usingFallbackImage,                            // true → image isn't analyzed
     backgroundMedia: {
-      image: overlayPick.image,
+      image,
       video: overlayPick.video || null,
       ...(result.backgroundMedia || {})
     },
     backgroundColor: result.backgroundMedia?.backgroundColor || null,
     imageRect:       result.backgroundMedia?.imageRect || null,
+    analysis:        analysisSummary,
     elements:        result.elements,
     decisions:       result.decisions || [],
     failedRequired:  result.failedRequired
