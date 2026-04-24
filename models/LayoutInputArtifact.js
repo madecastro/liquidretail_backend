@@ -19,6 +19,13 @@ const layoutInputArtifactSchema = new mongoose.Schema({
   template:    { type: String, required: true },
   aspectRatio: { type: String, required: true },
 
+  // Semver of the input shape. Bump when the canonical path structure
+  // changes (e.g. v1 → v2 moved hero_image_url → hero_media.image, split
+  // creator out of ugc). buildLayoutInput refuses to serve a cached doc
+  // whose schemaVersion doesn't match the current INPUT_SCHEMA_VERSION,
+  // forcing a re-derivation.
+  schemaVersion: { type: String },
+
   input:       { type: mongoose.Schema.Types.Mixed, required: true },
   derivation:  { type: mongoose.Schema.Types.Mixed },
 

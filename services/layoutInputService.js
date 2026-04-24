@@ -61,6 +61,11 @@ const registry               = require('./templateRegistry');
 const GEMINI_MODEL    = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
+// Bump when the canonical input shape changes — cached LayoutInputArtifact
+// docs with a mismatching version are treated as cache misses and forced
+// to re-derive. Current = v2 (post canonical-path reshape).
+const INPUT_SCHEMA_VERSION = '2.0';
+
 // Until webhook ingestion lands, every detect-uploaded Media is treated as
 // Instagram creator UGC — the uploader is standing in for a creator's post.
 const DEFAULT_CREATOR_PLATFORM = 'instagram';
@@ -124,7 +129,11 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
 
   if (!refresh) {
     const cached = await LayoutInputArtifact.findOne({ mediaId, template, aspectRatio }).lean();
-    if (cached) return cached.input;
+    // Cache hit only if the stored schema version matches what we emit today.
+    // Without this check, v1 cached docs (with old paths like hero_image_url)
+    // get served even though the renderer now reads hero_media.image —
+    // resulting in blank zones across the preview until an explicit refresh.
+    if (cached && cached.schemaVersion === INPUT_SCHEMA_VERSION) return cached.input;
   }
 
   const ctx = await loadContext(mediaId);
@@ -140,6 +149,7 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
       runId: ctx.runId || null,
       template,
       aspectRatio,
+      schemaVersion: INPUT_SCHEMA_VERSION,
       input,
       derivation,
       createdAt: new Date()
@@ -317,21 +327,27 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     lines.push('');
   }
 
+  // Per-template quote count targets. review_collage stacks multiple cards,
+  // so we push the LLM to produce enough to actually fill the stacks.
+  const quoteTarget = template === 'review_collage'      ? 'AT LEAST 4, ideally 5 or 6'
+                    : template === 'testimonial_spotlight' ? 'at least 1 strong hero quote plus 2–3 supporting'
+                    : 'at least 2, ideally 3–5';
+
   lines.push(`TASK:`);
   lines.push(`Produce JSON matching the schema. Rules:`);
-  lines.push(`- "copy.headline" ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
-  lines.push(`- "short_benefits" ≤ 5 items, each ≤ 6 words, phrased as concrete buyer benefits (not specs).`);
-  lines.push(`- "badges" ≤ 4 items, each 1–3 words. Only emit a badge the signal supports (e.g. "4.7★ rated" only if rating ≥ 4.5).`);
+  lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
+  lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
+  lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
   if (demos.length) {
-    lines.push(`- "quotes" up to 6 NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name is the persona's name; author_title is a one-phrase identity cue; source="testimonial" or "ugc". Ground substance in the review summary. verified=true only if the brand has well-documented social proof. ≤ 22 words per quote; mix lengths.`);
+    lines.push(`- "quotes" ${quoteTarget} NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name is the persona's name; author_title is a one-phrase identity cue; source="testimonial" or "ugc". Ground substance in the review summary. verified=true only if the brand has well-documented social proof. ≤ 22 words per quote; mix lengths and angles.`);
   } else {
-    lines.push(`- "quotes" up to 6 short notional reviews/comments drawn from the review summary. author_name can be null; source="review" unless signal clearly implies creator/ugc. verified=false unless clearly endorsed. ≤ 20 words per quote.`);
+    lines.push(`- "quotes" ${quoteTarget} short notional reviews/comments drawn from the review summary. author_name can be null; source="review" unless signal clearly implies creator/ugc. verified=false unless clearly endorsed. ≤ 20 words per quote; mix angles.`);
   }
-  lines.push(`- "cta.text" ≤ 3 words, imperative voice (e.g. "Shop now"). "offer_text" only if price/offer data supports it.`);
-  lines.push(`- "trusted_by_text" only if review_count ≥ 50 — format "Trusted by Xk+ customers" or similar. Otherwise omit.`);
+  lines.push(`- "cta.text" REQUIRED, ≤ 3 words, imperative voice (e.g. "Shop now"). "offer_text" only if price/offer data supports it.`);
+  lines.push(`- "trusted_by_text" preferred if review_count ≥ 50 — format "Trusted by Xk+ customers", "Loved by Nk shoppers", etc.`);
   lines.push(`- "tone" 2–4 single-word descriptors matching brand + caption voice.`);
   lines.push(`- "theme_style" / "background_style" / "emphasis" pick values best suited to the template and signal.`);
-  lines.push(`If a field has no real signal, prefer omitting over fabricating.`);
+  lines.push(`Goal: the output must FILL the template's visible zones. If a template needs multiple quotes / badges / benefits and you have enough source material, produce them. Do not invent specific reviewer names, retailer names, or pricing that aren't grounded in the data.`);
   return lines.join('\n');
 }
 
@@ -344,6 +360,36 @@ function templateIntent(template) {
     case 'creator_endorsement':   return 'creator persona + quote + product, social-first tone';
     default:                      return '';
   }
+}
+
+// If Gemini returned zero quotes but the review summary is present, carve a
+// short primary quote from its first sentence. Keeps hero zones populated in
+// the low-signal case. Never invents text — only surfaces what Gemini
+// already wrote in the review-summary step.
+function synthesizeQuoteFromReviewSummary(ctx) {
+  const summary = ctx.match?.identification?.details?.reviewSummary?.summary;
+  if (!summary || typeof summary !== 'string') return null;
+  const first = summary.trim().split(/(?<=[.!?])\s+/)[0];
+  if (!first || first.length < 20 || first.length > 220) return null;
+  return {
+    text:     first,
+    source:   'review',
+    verified: false
+  };
+}
+
+// Rating/review-driven badge defaults when the LLM returned none. Fills the
+// badge_row / product.badges / social_proof.proof_badges slots that
+// otherwise render as placeholders.
+function defaultBadgesFromSignal(details) {
+  const out = [];
+  if (typeof details.rating === 'number' && details.rating >= 4.5) out.push('Top rated');
+  if (typeof details.reviewCount === 'number') {
+    if (details.reviewCount >= 10000) out.push('10k+ reviews');
+    else if (details.reviewCount >= 1000) out.push('1k+ reviews');
+    else if (details.reviewCount >= 100)  out.push('100+ reviews');
+  }
+  return out;
 }
 
 function fallbackDerivation(ctx) {
@@ -381,12 +427,27 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   const creatorMedia   = pickCreatorMedia(ctx);
   const ugcMedia       = creatorMedia;  // detect uploads == creator post asset
 
-  const quotes = Array.isArray(derivation.quotes) ? derivation.quotes : [];
+  const quotes = Array.isArray(derivation.quotes) ? derivation.quotes.slice() : [];
+
+  // Synthesis fallback — if the LLM emitted no quotes but a review summary
+  // exists, carve the first sentence out as a primary quote so hero zones
+  // aren't blank. Cheap, deterministic, and clearly grounded.
+  if (quotes.length === 0) {
+    const syn = synthesizeQuoteFromReviewSummary(ctx);
+    if (syn) quotes.push(syn);
+  }
+
   const primaryQuote = quotes[0] ? { ...quotes[0] } : null;
   const secondaryQuotes = quotes.slice(1).map(q => ({ ...q }));
 
   const rightsApproved = !!media.rights?.approved;
   const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
+
+  // Prefer LLM-emitted badges; otherwise synthesize from rating/review data
+  // so badge zones on templates have something concrete to show.
+  const derivedBadges = Array.isArray(derivation.badges) && derivation.badges.length
+    ? derivation.badges
+    : defaultBadgesFromSignal(details);
 
   const input = {
     template,
@@ -417,7 +478,7 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       currency:      details.price?.currency || undefined,
       description:   details.description || detection?.primarySubjectDesc || undefined,
       short_benefits: limitArray(derivation.short_benefits, 5),
-      badges:         limitArray(derivation.badges, 4),
+      badges:         limitArray(derivedBadges, 4),
       hero_media:      mediaPair(heroMedia),
       secondary_media: mediaPair(secondaryMedia)
     },
@@ -447,7 +508,7 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       rating_value:    typeof details.rating === 'number' ? details.rating : undefined,
       review_count:    typeof details.reviewCount === 'number' ? details.reviewCount : undefined,
       trusted_by_text: derivation.trusted_by_text || trustedByFromStats(details) || undefined,
-      proof_badges:    limitArray(derivation.badges, 4),
+      proof_badges:    limitArray(derivedBadges, 4),
       primary_quote:   primaryQuote || undefined,
       secondary_quotes: secondaryQuotes.length ? secondaryQuotes : undefined
     },
