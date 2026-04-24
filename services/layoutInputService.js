@@ -944,8 +944,12 @@ function stripUndefinedDeep(obj) {
       if (v === undefined) continue;
       const cleaned = stripUndefinedDeep(v);
       if (cleaned === undefined) continue;
+      if (cleaned === null) continue;   // drop null fields (placement block emits some)
       if (Array.isArray(cleaned) && cleaned.length === 0) continue;
-      if (typeof cleaned === 'object' && !Array.isArray(cleaned) && Object.keys(cleaned).length === 0) continue;
+      // typeof null === 'object' is the JS gotcha that originally tripped this
+      // — the explicit `cleaned !== null` is belt-and-suspenders against any
+      // future code path that lets a null reach here.
+      if (cleaned !== null && typeof cleaned === 'object' && !Array.isArray(cleaned) && Object.keys(cleaned).length === 0) continue;
       out[k] = cleaned;
     }
     return out;
