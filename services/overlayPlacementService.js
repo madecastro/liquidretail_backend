@@ -34,82 +34,97 @@ const SCRIM_BRIGHTNESS_GAP_K   = 0.85;   // multiplier on |bg-text| → scrim op
 // ── Placement entry point ────────────────────────────────────────────────
 
 function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, conservation = 0.5, content, brandColors, aspectRatio }) {
-  const elements = buildElementSpecs(content);
-  const result = tryPlace({ canvasW, canvasH, analysis, conservation, elements, content, mode: 'overlay' });
+  // Build specs for ALL possible elements (including those skipped for
+  // missing source data) so the decision trace is complete.
+  const { specs: elements, skipped } = buildElementSpecs(content);
+  const result = tryPlace({ canvasW, canvasH, analysis, conservation, elements, content, mode: 'overlay', skippedSpecs: skipped });
 
   // Fallback: if any required element failed, retry in inset mode.
   if (result.failedRequired.length > 0) {
-    const inset = tryInset({ canvasW, canvasH, analysis, conservation, elements, content, brandColors, aspectRatio });
+    const inset = tryInset({ canvasW, canvasH, analysis, conservation, elements, content, brandColors, aspectRatio, skippedSpecs: skipped });
     if (inset && inset.failedRequired.length < result.failedRequired.length) return inset;
   }
 
   return result;
 }
 
-// Build the priority-ordered element list from the resolved layout-input
-// content. Each element knows its required size hints and preferred region.
+// Build the full ordered element spec list. Each spec includes the source
+// data path it needs, so we can distinguish ATTEMPTED-BUT-DROPPED from
+// NEVER-ATTEMPTED-DUE-TO-MISSING-DATA in the decision trace.
+//
+// Returns { specs: [...active specs in priority order],
+//           skipped: [...specs that never got attempted because source
+//                     data was null] }
 function buildElementSpecs(content) {
-  const hasLogo     = !!content?.brand?.logo;
-  const hasHeadline = !!content?.copy?.headline;
-  const hasProduct  = !!content?.product?.name;
-  const hasRating   = typeof content?.social_proof?.rating_value === 'number';
-  const hasCta      = !!content?.cta?.text;
-  const hasQuote    = !!content?.social_proof?.primary_quote?.text;
+  const all = [
+    {
+      id: 'logo', kind: 'logo', priority: 1, required: true,
+      slot: 'brand.logo', region: 'top-left',
+      sizePct:   { w: 0.14, h: 0.06 },
+      sizeBounds:{ minW: 0.08, maxW: 0.20, minH: 0.04, maxH: 0.09 },
+      contentLength: 0,
+      _hasSource: !!content?.brand?.logo,
+      _missingPath: 'brand.logo'
+    },
+    {
+      id: 'headline', kind: 'text', priority: 2, required: true,
+      slot: 'copy.headline', region: 'top-band',
+      sizePct:   { w: 0.84, h: 0.13 },
+      sizeBounds:{ minW: 0.50, maxW: 0.92, minH: 0.08, maxH: 0.20 },
+      contentLength: (content?.copy?.headline || '').length,
+      scaleText: true,
+      maxLines: 2,
+      _hasSource: !!content?.copy?.headline,
+      _missingPath: 'copy.headline'
+    },
+    {
+      id: 'product_meta', kind: 'meta_group', priority: 3, required: true,
+      slots: ['product.name', 'product.price', 'social_proof.rating_value', 'social_proof.review_count'],
+      region: 'mid-band',
+      sizePct:   { w: 0.60, h: 0.10 },
+      sizeBounds:{ minW: 0.36, maxW: 0.78, minH: 0.07, maxH: 0.15 },
+      contentLength: (content?.product?.name || '').length + 12,
+      scaleText: true,
+      _hasSource: !!content?.product?.name || typeof content?.social_proof?.rating_value === 'number',
+      _missingPath: 'product.name OR social_proof.rating_value'
+    },
+    {
+      id: 'cta', kind: 'button', priority: 4, required: true,
+      slot: 'cta.text', region: 'bottom-third',
+      sizePct:   { w: 0.36, h: 0.08 },
+      sizeBounds:{ minW: 0.24, maxW: 0.50, minH: 0.06, maxH: 0.12 },
+      contentLength: (content?.cta?.text || '').length,
+      _hasSource: !!content?.cta?.text,
+      _missingPath: 'cta.text'
+    },
+    {
+      id: 'quote', kind: 'quote_card', priority: 5, required: false,
+      slot: 'social_proof.primary_quote', region: 'flex',
+      sizePct:   { w: 0.62, h: 0.20 },
+      sizeBounds:{ minW: 0.40, maxW: 0.86, minH: 0.10, maxH: 0.30 },
+      contentLength: (content?.social_proof?.primary_quote?.text || '').length,
+      truncate: 'ellipsis',
+      maxLines: 4,
+      _hasSource: !!content?.social_proof?.primary_quote?.text,
+      _missingPath: 'social_proof.primary_quote.text'
+    }
+  ];
 
-  const elements = [];
-
-  if (hasLogo) elements.push({
-    id: 'logo', kind: 'logo', priority: 1, required: true,
-    slot: 'brand.logo', region: 'top-left',
-    sizePct:   { w: 0.14, h: 0.06 },
-    sizeBounds:{ minW: 0.08, maxW: 0.20, minH: 0.04, maxH: 0.09 },
-    contentLength: 0
-  });
-
-  if (hasHeadline) elements.push({
-    id: 'headline', kind: 'text', priority: 2, required: true,
-    slot: 'copy.headline', region: 'top-band',
-    sizePct:   { w: 0.84, h: 0.13 },
-    sizeBounds:{ minW: 0.50, maxW: 0.92, minH: 0.08, maxH: 0.20 },
-    contentLength: (content.copy.headline || '').length,
-    scaleText: true,
-    maxLines: 2
-  });
-
-  if (hasProduct || hasRating) elements.push({
-    id: 'product_meta', kind: 'meta_group', priority: 3, required: true,
-    slots: ['product.name', 'product.price', 'social_proof.rating_value', 'social_proof.review_count'],
-    region: 'mid-band',
-    sizePct:   { w: 0.60, h: 0.10 },
-    sizeBounds:{ minW: 0.36, maxW: 0.78, minH: 0.07, maxH: 0.15 },
-    contentLength: (content.product?.name || '').length + 12 /* allow rating row */,
-    scaleText: true
-  });
-
-  if (hasCta) elements.push({
-    id: 'cta', kind: 'button', priority: 4, required: true,
-    slot: 'cta.text', region: 'bottom-third',
-    sizePct:   { w: 0.36, h: 0.08 },
-    sizeBounds:{ minW: 0.24, maxW: 0.50, minH: 0.06, maxH: 0.12 },
-    contentLength: (content.cta?.text || '').length
-  });
-
-  if (hasQuote) elements.push({
-    id: 'quote', kind: 'quote_card', priority: 5, required: false,
-    slot: 'social_proof.primary_quote', region: 'flex',
-    sizePct:   { w: 0.62, h: 0.20 },
-    sizeBounds:{ minW: 0.40, maxW: 0.86, minH: 0.10, maxH: 0.30 },
-    contentLength: (content.social_proof?.primary_quote?.text || '').length,
-    truncate: 'ellipsis',
-    maxLines: 4
-  });
-
-  return elements;
+  const specs = all.filter(s => s._hasSource);
+  const skipped = all.filter(s => !s._hasSource).map(s => ({
+    id: s.id,
+    priority: s.priority,
+    required: s.required,
+    region: s.region,
+    state: 'skipped',
+    reason: `no source data (${s._missingPath} missing)`
+  }));
+  return { specs, skipped };
 }
 
 // ── Core greedy pass ─────────────────────────────────────────────────────
 
-function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content, mode, availableRegions }) {
+function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content, mode, availableRegions, skippedSpecs }) {
   const threshold = 1 - conservation;
 
   const restrictions = (analysis?.restrictions || []).map(r => ({
@@ -120,10 +135,13 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
 
   const consumed = [];
   const placed = [];
+  const decisions = [...(skippedSpecs || [])]; // include missing-data skips in the trace
   const failedRequired = [];
 
   for (const el of elements) {
     const candidates = generateCandidates(el, availableRegions);
+    const nCandidates = candidates.length;
+
     const legal = candidates.filter(c =>
       withinCanvas(c) &&
       !overlapsAnyHard(c, hardKeepOut) &&
@@ -132,11 +150,15 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     );
 
     let pick = null;
+    let state = 'placed';
+    let reason = `placed in ${el.region}`;
+
     if (legal.length) {
       pick = legal.reduce((best, c) => {
         const s = score(c, el, analysis, consumed);
         return s > (best.s ?? -Infinity) ? { c, s } : best;
       }, {}).c;
+      reason = `placed in ${el.region} (${legal.length}/${nCandidates} legal candidates)`;
     } else if (el.required) {
       // Last-resort: ignore SOFT overlap entirely; only avoid HARD + consumed.
       const fallback = candidates.filter(c =>
@@ -147,11 +169,34 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
           const s = score(c, el, analysis, consumed);
           return s > (best.s ?? -Infinity) ? { c, s } : best;
         }, {}).c;
+        state = 'fallback-placed';
+        reason = `forced into ${el.region} — no candidates respected the 10% subject-overlap budget; relaxed to avoid hard keep-out only (${fallback.length}/${nCandidates})`;
       }
     }
 
     if (!pick) {
-      if (el.required) failedRequired.push(el.id);
+      if (el.required) {
+        failedRequired.push(el.id);
+        decisions.push({
+          id: el.id, priority: el.priority, required: el.required, region: el.region,
+          state: 'failed-required',
+          reason: hardKeepOut.length
+            ? `no legal candidate — hard keep-out (product/subject) overlapped every option in ${el.region} (${nCandidates} candidates evaluated)`
+            : softKeepOut.length
+              ? `no legal candidate — conservation level excluded every option in ${el.region}`
+              : `no legal candidate — geometry couldn't fit the required size in ${el.region}`,
+          candidatesEvaluated: nCandidates,
+          candidatesLegal: 0
+        });
+      } else {
+        decisions.push({
+          id: el.id, priority: el.priority, required: el.required, region: el.region,
+          state: 'dropped',
+          reason: `optional element — no safe area found in ${el.region} (${nCandidates} candidates evaluated, ${legal.length} legal)`,
+          candidatesEvaluated: nCandidates,
+          candidatesLegal: legal.length
+        });
+      }
       continue;
     }
 
@@ -174,12 +219,33 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
       truncate:  el.truncate
     });
     consumed.push(pick);
+
+    decisions.push({
+      id: el.id, priority: el.priority, required: el.required, region: el.region,
+      state,
+      reason,
+      rectPct: pick,
+      textColor,
+      scrim: { type: scrim.type, opacity: Number(scrim.opacity.toFixed(2)), direction: scrim.direction },
+      fontScale: Number(fontScale.toFixed(2)),
+      stats: {
+        candidatesEvaluated: nCandidates,
+        candidatesLegal: legal.length,
+        bgBrightness: Number(brightness.toFixed(2)),
+        bgDensity: Number(density.toFixed(2))
+      }
+    });
   }
+
+  // Sort the decision trace by priority so the UI renders in the order
+  // the algorithm considered elements.
+  decisions.sort((a, b) => (a.priority || 99) - (b.priority || 99));
 
   return {
     mode,
     backgroundMedia: { useFullBleedImage: true },
     elements: placed,
+    decisions,
     failedRequired
   };
 }

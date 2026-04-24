@@ -66,8 +66,9 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // Bump when the canonical input shape changes — cached LayoutInputArtifact
 // docs with a mismatching version are treated as cache misses and forced
 // to re-derive. 2.1 added the optional `placement` block for overlay-mode
-// templates (testimonial_overlay).
-const INPUT_SCHEMA_VERSION = '2.1';
+// templates. 2.2 added `placement.decisions[]` — the per-element
+// placement trace used by the preview's inspector panel.
+const INPUT_SCHEMA_VERSION = '2.2';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -652,6 +653,7 @@ function computeOverlayPlacement(ctx, aspectRatio, options, content) {
     backgroundColor: result.backgroundMedia?.backgroundColor || null,
     imageRect:       result.backgroundMedia?.imageRect || null,
     elements:        result.elements,
+    decisions:       result.decisions || [],
     failedRequired:  result.failedRequired
   };
 }
