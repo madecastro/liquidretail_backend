@@ -14,6 +14,7 @@ const authRoutes = require('./routes/auth');
 const detectRoutes = require('./routes/detect');
 const layoutRoutes = require('./routes/layout');
 const mediaRoutes  = require('./routes/media');
+const aiLayoutRoutes = require('./routes/aiLayouts');
 const requireAuth = require('./middleware/requireAuth');
 
 const app = express();
@@ -67,6 +68,7 @@ app.use('/api/jobs', requireAuth, jobRoutes);
 app.use('/api/detect', requireAuth, detectRoutes);
 app.use('/api/layout-input', requireAuth, layoutRoutes);
 app.use('/api/media', requireAuth, mediaRoutes);
+app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
   try {
