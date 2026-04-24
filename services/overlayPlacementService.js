@@ -52,6 +52,18 @@ function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, conservation 
 // data path it needs, so we can distinguish ATTEMPTED-BUT-DROPPED from
 // NEVER-ATTEMPTED-DUE-TO-MISSING-DATA in the decision trace.
 //
+// SHAPE VARIANTS: each spec now declares multiple shape variants so the
+// candidate generator can try e.g. a 1-line horizontal headline OR a
+// 2-line stacked narrow-column headline. When the preferred shape is
+// blocked by subject keep-outs, scoring falls through to the secondary
+// shape rather than declaring the element unplaceable. Each shape carries:
+//   - variant:     label for downstream renderer ('horizontal'/'stacked-2'/…)
+//   - sizePct:     nominal width/height in canvas fractions
+//   - sizeBounds:  min/max bounds for width-multiplier search
+//   - maxLines:    how many text lines the container accommodates
+//   - layout:      'inline' | 'stack' — hint to renderer for meta_group
+//   - preferBonus: score bonus (+) for preferred shapes, (-) for last-resort
+//
 // Returns { specs: [...active specs in priority order],
 //           skipped: [...specs that never got attempted because source
 //                     data was null] }
@@ -60,20 +72,32 @@ function buildElementSpecs(content) {
     {
       id: 'logo', kind: 'logo', priority: 1, required: true,
       slot: 'brand.logo', region: 'top-left',
-      sizePct:   { w: 0.14, h: 0.06 },
-      sizeBounds:{ minW: 0.08, maxW: 0.20, minH: 0.04, maxH: 0.09 },
       contentLength: 0,
+      shapes: [
+        // Preferred: wordmark-shaped horizontal rect.
+        { variant: 'horizontal', sizePct: { w: 0.14, h: 0.06 }, sizeBounds: { minW: 0.08, maxW: 0.20, minH: 0.04, maxH: 0.07 }, maxLines: 1, layout: 'inline', preferBonus: 0.6 },
+        // Mark-only square — compresses the logo into tight corners if the
+        // wordmark's row is obstructed by a subject keep-out.
+        { variant: 'square',     sizePct: { w: 0.08, h: 0.08 }, sizeBounds: { minW: 0.06, maxW: 0.11, minH: 0.06, maxH: 0.11 }, maxLines: 1, layout: 'inline', preferBonus: -0.2 }
+      ],
       _hasSource: !!content?.brand?.logo,
       _missingPath: 'brand.logo'
     },
     {
       id: 'headline', kind: 'text', priority: 2, required: true,
       slot: 'copy.headline', region: 'top-band',
-      sizePct:   { w: 0.84, h: 0.13 },
-      sizeBounds:{ minW: 0.50, maxW: 0.92, minH: 0.08, maxH: 0.20 },
       contentLength: (content?.copy?.headline || '').length,
       scaleText: true,
-      maxLines: 2,
+      shapes: [
+        // Preferred: 1-line wide strip — the classic top banner headline.
+        { variant: 'horizontal', sizePct: { w: 0.84, h: 0.13 }, sizeBounds: { minW: 0.56, maxW: 0.92, minH: 0.08, maxH: 0.18 }, maxLines: 1, layout: 'inline', preferBonus: 0.6 },
+        // 2-line stacked — narrower column, ~40% less width. Fits when the
+        // frame has a centered subject cutting the horizontal band in half.
+        { variant: 'stacked-2',  sizePct: { w: 0.60, h: 0.20 }, sizeBounds: { minW: 0.40, maxW: 0.72, minH: 0.14, maxH: 0.28 }, maxLines: 2, layout: 'stack',  preferBonus: 0.0 },
+        // 3-line narrow column — last-resort for very portrait frames
+        // (9:16 with a central subject) where only a thin side-rail is legal.
+        { variant: 'stacked-3',  sizePct: { w: 0.42, h: 0.28 }, sizeBounds: { minW: 0.28, maxW: 0.54, minH: 0.20, maxH: 0.38 }, maxLines: 3, layout: 'stack',  preferBonus: -0.3 }
+      ],
       _hasSource: !!content?.copy?.headline,
       _missingPath: 'copy.headline'
     },
@@ -81,30 +105,49 @@ function buildElementSpecs(content) {
       id: 'product_meta', kind: 'meta_group', priority: 3, required: true,
       slots: ['product.name', 'product.price', 'social_proof.rating_value', 'social_proof.review_count'],
       region: 'mid-band',
-      sizePct:   { w: 0.60, h: 0.10 },
-      sizeBounds:{ minW: 0.36, maxW: 0.78, minH: 0.07, maxH: 0.15 },
       contentLength: (content?.product?.name || '').length + 12,
       scaleText: true,
+      shapes: [
+        // Preferred: name+price and rating stacked on 2 inline-ish lines.
+        { variant: 'inline',     sizePct: { w: 0.60, h: 0.10 }, sizeBounds: { minW: 0.38, maxW: 0.78, minH: 0.07, maxH: 0.14 }, maxLines: 2, layout: 'inline', preferBonus: 0.4 },
+        // Full-width slim — for bottom-third placement above CTA.
+        { variant: 'inline-wide',sizePct: { w: 0.76, h: 0.08 }, sizeBounds: { minW: 0.52, maxW: 0.88, minH: 0.06, maxH: 0.11 }, maxLines: 2, layout: 'inline', preferBonus: 0.2 },
+        // Stacked column — name / stars / count vertically. Works in a
+        // side-rail on portrait frames.
+        { variant: 'stacked',    sizePct: { w: 0.34, h: 0.20 }, sizeBounds: { minW: 0.22, maxW: 0.46, minH: 0.14, maxH: 0.28 }, maxLines: 3, layout: 'stack',  preferBonus: -0.2 }
+      ],
       _hasSource: !!content?.product?.name || typeof content?.social_proof?.rating_value === 'number',
       _missingPath: 'product.name OR social_proof.rating_value'
     },
     {
       id: 'cta', kind: 'button', priority: 4, required: true,
       slot: 'cta.text', region: 'bottom-third',
-      sizePct:   { w: 0.36, h: 0.08 },
-      sizeBounds:{ minW: 0.24, maxW: 0.50, minH: 0.06, maxH: 0.12 },
       contentLength: (content?.cta?.text || '').length,
+      shapes: [
+        // Preferred: classic horizontal button.
+        { variant: 'horizontal', sizePct: { w: 0.36, h: 0.08 }, sizeBounds: { minW: 0.24, maxW: 0.50, minH: 0.06, maxH: 0.11 }, maxLines: 1, layout: 'inline', preferBonus: 0.5 },
+        // Wide slim pill — sits under the image nicely in inset mode.
+        { variant: 'pill-wide',  sizePct: { w: 0.52, h: 0.07 }, sizeBounds: { minW: 0.36, maxW: 0.72, minH: 0.05, maxH: 0.09 }, maxLines: 1, layout: 'inline', preferBonus: 0.1 },
+        // Narrow tall pill — tight horizontal space, e.g. squeezed next to
+        // a centered subject at the bottom of a portrait frame.
+        { variant: 'pill-narrow',sizePct: { w: 0.22, h: 0.10 }, sizeBounds: { minW: 0.16, maxW: 0.30, minH: 0.08, maxH: 0.14 }, maxLines: 1, layout: 'inline', preferBonus: -0.3 }
+      ],
       _hasSource: !!content?.cta?.text,
       _missingPath: 'cta.text'
     },
     {
       id: 'quote', kind: 'quote_card', priority: 5, required: false,
       slot: 'social_proof.primary_quote', region: 'flex',
-      sizePct:   { w: 0.62, h: 0.20 },
-      sizeBounds:{ minW: 0.40, maxW: 0.86, minH: 0.10, maxH: 0.30 },
       contentLength: (content?.social_proof?.primary_quote?.text || '').length,
       truncate: 'ellipsis',
-      maxLines: 4,
+      shapes: [
+        // Preferred: medium card with 4 lines of body copy.
+        { variant: 'card',       sizePct: { w: 0.62, h: 0.20 }, sizeBounds: { minW: 0.44, maxW: 0.82, minH: 0.14, maxH: 0.28 }, maxLines: 4, layout: 'inline', preferBonus: 0.4 },
+        // Wide thin card — less vertical footprint, good for 16:9 / 1.91:1.
+        { variant: 'card-wide',  sizePct: { w: 0.78, h: 0.16 }, sizeBounds: { minW: 0.58, maxW: 0.90, minH: 0.12, maxH: 0.22 }, maxLines: 3, layout: 'inline', preferBonus: 0.1 },
+        // Narrow tall column — wraps to 6 lines; fits a portrait side-rail.
+        { variant: 'card-narrow',sizePct: { w: 0.38, h: 0.30 }, sizeBounds: { minW: 0.26, maxW: 0.50, minH: 0.22, maxH: 0.40 }, maxLines: 6, layout: 'inline', preferBonus: -0.2 }
+      ],
       _hasSource: !!content?.social_proof?.primary_quote?.text,
       _missingPath: 'social_proof.primary_quote.text'
     }
@@ -204,18 +247,24 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     const density    = sampleAvg(analysis?.densityGrid, pick);
     const textColor  = brightness < 0.5 ? '#FFFFFF' : '#0A0A0A';
     const scrim      = computeAdaptiveScrim(textColor, brightness, density, pick);
-    const fontScale  = el.scaleText ? recommendFontScale(el, pick, canvasW, canvasH) : 1;
+    // Shape-aware font scale: maxLines comes from the picked candidate's
+    // shape variant (horizontal headline → 1, stacked-3 → 3), so content
+    // length divides by the right line budget.
+    const pickMaxLines = pick.maxLines || 2;
+    const fontScale  = el.scaleText ? recommendFontScale(el, pick, canvasW, canvasH, pickMaxLines) : 1;
 
     placed.push({
       id:        el.id,
       kind:      el.kind,
       slot:      el.slot,
       slots:     el.slots,
-      rectPct:   pick,
+      rectPct:   { x1: pick.x1, y1: pick.y1, x2: pick.x2, y2: pick.y2 },
+      variant:   pick.variant,
+      layout:    pick.layout,
+      maxLines:  pickMaxLines,
       textColor,
       scrim,
       fontScale,
-      maxLines:  el.maxLines,
       truncate:  el.truncate
     });
     consumed.push(pick);
@@ -223,8 +272,11 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     decisions.push({
       id: el.id, priority: el.priority, required: el.required, region: el.region,
       state,
-      reason,
-      rectPct: pick,
+      reason: `${reason} [${pick.variant}/${pick.layout}, ${pickMaxLines} line(s)]`,
+      rectPct: { x1: pick.x1, y1: pick.y1, x2: pick.x2, y2: pick.y2 },
+      variant: pick.variant,
+      layout:  pick.layout,
+      maxLines: pickMaxLines,
       textColor,
       scrim: { type: scrim.type, opacity: Number(scrim.opacity.toFixed(2)), direction: scrim.direction },
       fontScale: Number(fontScale.toFixed(2)),
@@ -290,6 +342,9 @@ function tryInset({ canvasW, canvasH, analysis, conservation, elements, content,
     mode: 'inset',
     backgroundMedia: { useFullBleedImage: false, imageRect, backgroundColor: brandColors?.primary || '#1f2937' },
     elements: sub.elements,
+    // Pass the decision trace through so the inspector panel shows WHY
+    // inset was invoked and how each element fared in the bands.
+    decisions: sub.decisions || [],
     failedRequired: sub.failedRequired
   };
 }
@@ -354,77 +409,116 @@ function computeInsetPlan(aspectRatio) {
 // ── Candidate generation per region ─────────────────────────────────────
 
 function generateCandidates(el, availableRegions) {
-  // If availableRegions are explicitly provided (inset mode), candidates
-  // come from inside those bands.
+  const out = [];
+  // Loop shape variants so a single element gets horizontal + stacked +
+  // column candidates. Each candidate carries the shape's variant/maxLines/
+  // layout/preferBonus so downstream scoring and the renderer can respect
+  // the chosen shape.
+  for (const shape of el.shapes) {
+    for (const c of candidatesForShape(el, shape, availableRegions)) {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+// Produce candidate rects for a single shape variant. Tags each output
+// rect with its shape metadata so scoring + placement echo the variant.
+function candidatesForShape(el, shape, availableRegions) {
+  const out = [];
+  const tag = (r) => Object.assign(r, {
+    variant:     shape.variant,
+    maxLines:    shape.maxLines,
+    layout:      shape.layout,
+    preferBonus: shape.preferBonus || 0
+  });
+
+  // Inset mode: candidates come from inside explicit bands. Skip shapes
+  // that can't fit the band without violating their minW/minH — a shape's
+  // minimum size is the point below which the container becomes
+  // unreadable (a 2-line headline squeezed into a 6%-tall band is worse
+  // than falling through to the 1-line horizontal variant instead).
   if (availableRegions && availableRegions.length) {
-    const out = [];
     for (const band of availableRegions) {
-      const bw = band.x2 - band.x1, bh = band.y2 - band.y1;
-      // Ideal-sized centered candidate
-      const w = Math.min(el.sizeBounds.maxW, Math.max(el.sizeBounds.minW, el.sizePct.w));
-      const h = Math.min(el.sizeBounds.maxH, Math.max(el.sizeBounds.minH, Math.min(el.sizePct.h, bh - 0.005)));
+      const bh = band.y2 - band.y1;
+      const bw = band.x2 - band.x1;
+      if (shape.sizeBounds.minW > bw - 0.005) continue;
+      if (shape.sizeBounds.minH > bh - 0.005) continue;
+      const w = Math.min(shape.sizeBounds.maxW, Math.max(shape.sizeBounds.minW, Math.min(shape.sizePct.w, bw - 0.005)));
+      const h = Math.min(shape.sizeBounds.maxH, Math.max(shape.sizeBounds.minH, Math.min(shape.sizePct.h, bh - 0.005)));
       const cx = (band.x1 + band.x2) / 2;
       const cy = (band.y1 + band.y2) / 2;
-      out.push({ x1: cx - w/2, y1: cy - h/2, x2: cx + w/2, y2: cy + h/2 });
-      // Anchored variants
-      out.push({ x1: band.x1, y1: cy - h/2, x2: band.x1 + w, y2: cy + h/2 });
-      out.push({ x1: band.x2 - w, y1: cy - h/2, x2: band.x2, y2: cy + h/2 });
+      out.push(tag({ x1: cx - w/2,     y1: cy - h/2, x2: cx - w/2 + w, y2: cy - h/2 + h }));
+      out.push(tag({ x1: band.x1,      y1: cy - h/2, x2: band.x1 + w,  y2: cy - h/2 + h }));
+      out.push(tag({ x1: band.x2 - w,  y1: cy - h/2, x2: band.x2,      y2: cy - h/2 + h }));
     }
     return out;
   }
 
-  // Free placement on the full canvas — region-driven candidates.
-  const out = [];
-  const w = el.sizePct.w;
-  const h = el.sizePct.h;
-  const widths  = [w, w * 0.85, w * 0.70, w * 1.10].filter(v => v >= el.sizeBounds.minW && v <= el.sizeBounds.maxW);
+  // Full-canvas candidates: sweep width multipliers × position anchors.
+  const w = shape.sizePct.w;
+  const h = shape.sizePct.h;
+  const widths = [w, w * 0.85, w * 0.70, w * 1.10].filter(v => v >= shape.sizeBounds.minW && v <= shape.sizeBounds.maxW);
+  const heights = [h]; // height is currently fixed per shape; shape catalog already expresses vertical variants.
 
-  switch (el.region) {
-    case 'top-left':
-      for (const ww of widths) {
-        out.push({ x1: 0.04, y1: 0.04, x2: 0.04 + ww, y2: 0.04 + h });
-        out.push({ x1: 0.05, y1: 0.06, x2: 0.05 + ww, y2: 0.06 + h });
-      }
-      break;
-    case 'top-right':
-      for (const ww of widths) {
-        out.push({ x1: 0.96 - ww, y1: 0.04, x2: 0.96, y2: 0.04 + h });
-      }
-      break;
-    case 'top-band':
-      for (const y of [0.06, 0.10, 0.14, 0.18]) {
+  for (const hh of heights) {
+    switch (el.region) {
+      case 'top-left':
         for (const ww of widths) {
-          out.push({ x1: (1 - ww) / 2, y1: y, x2: (1 - ww) / 2 + ww, y2: y + h });
-          out.push({ x1: 0.05, y1: y, x2: 0.05 + ww, y2: y + h });
+          out.push(tag({ x1: 0.04, y1: 0.04, x2: 0.04 + ww, y2: 0.04 + hh }));
+          out.push(tag({ x1: 0.05, y1: 0.06, x2: 0.05 + ww, y2: 0.06 + hh }));
         }
-      }
-      break;
-    case 'mid-band':
-      for (const y of [0.36, 0.42, 0.48, 0.54, 0.60]) {
+        break;
+      case 'top-right':
         for (const ww of widths) {
-          out.push({ x1: (1 - ww) / 2, y1: y, x2: (1 - ww) / 2 + ww, y2: y + h });
-          out.push({ x1: 0.05, y1: y, x2: 0.05 + ww, y2: y + h });
-          out.push({ x1: 0.95 - ww, y1: y, x2: 0.95, y2: y + h });
+          out.push(tag({ x1: 0.96 - ww, y1: 0.04, x2: 0.96, y2: 0.04 + hh }));
         }
-      }
-      break;
-    case 'bottom-third':
-      for (const y of [0.74, 0.80, 0.85, 0.88]) {
-        for (const ww of widths) {
-          out.push({ x1: (1 - ww) / 2, y1: y, x2: (1 - ww) / 2 + ww, y2: y + h });
-          out.push({ x1: 0.05, y1: y, x2: 0.05 + ww, y2: y + h });
-          out.push({ x1: 0.95 - ww, y1: y, x2: 0.95, y2: y + h });
+        break;
+      case 'top-band':
+        for (const y of [0.06, 0.10, 0.14, 0.18]) {
+          for (const ww of widths) {
+            out.push(tag({ x1: (1 - ww) / 2, y1: y, x2: (1 - ww) / 2 + ww, y2: y + hh }));
+            out.push(tag({ x1: 0.05,         y1: y, x2: 0.05 + ww,         y2: y + hh }));
+            // Side-rail anchors so tall-narrow shapes can hug the edges
+            // when a subject blocks the centered band.
+            out.push(tag({ x1: 0.95 - ww,    y1: y, x2: 0.95,              y2: y + hh }));
+          }
         }
-      }
-      break;
-    case 'flex':
-    default:
-      for (const y of [0.18, 0.32, 0.50, 0.64, 0.74]) {
-        for (const x of [0.05, 0.20, 0.40, (1 - w) / 2]) {
-          out.push({ x1: x, y1: y, x2: x + w, y2: y + h });
+        break;
+      case 'mid-band':
+        for (const y of [0.32, 0.40, 0.48, 0.56, 0.64]) {
+          for (const ww of widths) {
+            out.push(tag({ x1: (1 - ww) / 2, y1: y, x2: (1 - ww) / 2 + ww, y2: y + hh }));
+            out.push(tag({ x1: 0.05,         y1: y, x2: 0.05 + ww,         y2: y + hh }));
+            out.push(tag({ x1: 0.95 - ww,    y1: y, x2: 0.95,              y2: y + hh }));
+          }
         }
-      }
-      break;
+        break;
+      case 'bottom-third':
+        for (const y of [0.68, 0.74, 0.80, 0.85, 0.90]) {
+          for (const ww of widths) {
+            // Skip candidates whose bottom edge exceeds the canvas — common
+            // for tall pill-narrow CTAs at the lowest anchor.
+            if (y + hh > 0.99) continue;
+            out.push(tag({ x1: (1 - ww) / 2, y1: y, x2: (1 - ww) / 2 + ww, y2: y + hh }));
+            out.push(tag({ x1: 0.05,         y1: y, x2: 0.05 + ww,         y2: y + hh }));
+            out.push(tag({ x1: 0.95 - ww,    y1: y, x2: 0.95,              y2: y + hh }));
+          }
+        }
+        break;
+      case 'flex':
+      default:
+        // Dense sweep — quotes can go almost anywhere; let scoring decide.
+        for (const y of [0.10, 0.22, 0.34, 0.46, 0.58, 0.70]) {
+          for (const ww of widths) {
+            if (y + hh > 0.99) continue;
+            out.push(tag({ x1: 0.04,         y1: y, x2: 0.04 + ww,         y2: y + hh }));
+            out.push(tag({ x1: (1 - ww) / 2, y1: y, x2: (1 - ww) / 2 + ww, y2: y + hh }));
+            out.push(tag({ x1: 0.96 - ww,    y1: y, x2: 0.96,              y2: y + hh }));
+          }
+        }
+        break;
+    }
   }
   return out;
 }
@@ -486,7 +580,14 @@ function score(cand, el, analysis, consumed) {
     const cd = Math.hypot(((c.x1 + c.x2)/2) - cx, ((c.y1 + c.y2)/2) - cy);
     if (cd < 0.15) crowding += (0.15 - cd) * 4;
   }
-  return -(density * 5 + variance * 3 + dist * 1.2 + crowding);
+
+  // Shape preference: horizontal/inline variants get a bonus; stacked or
+  // pill-narrow shapes carry a penalty so they only win when no preferred-
+  // shape candidate is legal. Magnitude is tuned so the preference doesn't
+  // override the density/anchor signals — it only breaks near-ties.
+  const shapeBonus = cand.preferBonus || 0;
+
+  return -(density * 5 + variance * 3 + dist * 1.2 + crowding) + shapeBonus;
 }
 
 function regionAnchor(region) {
@@ -564,13 +665,13 @@ function computeAdaptiveScrim(textColor, brightness, density, rect) {
   };
 }
 
-function recommendFontScale(el, rect, canvasW, canvasH) {
+function recommendFontScale(el, rect, canvasW, canvasH, maxLinesOverride) {
   // Heuristic: estimate how many characters fit at the default font size,
   // recommend a scale factor down (never up). The renderer/preview can
   // refine via measure-and-shrink at draw time.
   const widthPx  = (rect.x2 - rect.x1) * canvasW;
   const heightPx = (rect.y2 - rect.y1) * canvasH;
-  const lines = el.maxLines || 2;
+  const lines = maxLinesOverride || el.maxLines || 2;
   const baseFontPx   = Math.min(heightPx / lines / 1.25, widthPx / 14);
   const charsPerLine = Math.max(8, Math.floor(widthPx / (baseFontPx * 0.55)));
   const estimatedLines = Math.ceil(el.contentLength / charsPerLine);

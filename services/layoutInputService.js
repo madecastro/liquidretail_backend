@@ -69,8 +69,12 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // templates. 2.2 added `placement.decisions[]` — the per-element
 // placement trace used by the preview's inspector panel. 2.3 added
 // `placement.analysis` (restrictions, grids, primarySubjectRectPct) and
-// `placement.usingFallbackImage` for the universal debug overlay.
-const INPUT_SCHEMA_VERSION = '2.3';
+// `placement.usingFallbackImage` for the universal debug overlay. 2.4
+// added shape-variant metadata on each placed element (variant, layout,
+// maxLines) — the placement algorithm now considers horizontal + stacked
+// + narrow-column candidates per element, so rects can land in much
+// tighter spaces than before.
+const INPUT_SCHEMA_VERSION = '2.4';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
