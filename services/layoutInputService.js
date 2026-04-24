@@ -674,11 +674,42 @@ function pickSecondaryMedia(ctx, heroRatio) {
 }
 
 // Creator / UGC portrait media. Detect-uploaded Media is treated as creator
-// content: for video, hero frame = image, source URL = video; for image,
-// source URL = image, video = null.
+// content. We prefer the judge's subject-preserving smart crop over the raw
+// source so a creator panel (often tall) doesn't chop heads when the
+// renderer's object-fit takes over.
+//
+// Priority on base ratios (which is where creator panels live in 1:1 / 4:5 /
+// 9:16 templates):
+//   1. smartCrops['4:5'] winner  — tallest subject-preserving crop, best fit
+//      for vertical creator panels
+//   2. smartCrops['1:1'] winner  — square; works for most creator zones
+//   3. smartCrops['5:4'] winner  — wide fallback
+//   4. raw source URL (previous behavior)
+//
+// Video uses the same crop rect applied to the source video via c_crop.
 function pickCreatorMedia(ctx) {
-  const { media, detection } = ctx;
+  const { media, detection, crops } = ctx;
   const out = { image: null, video: null };
+
+  const tryRatios = ['4:5', '1:1', '5:4'];
+  let winner = null;
+  for (const r of tryRatios) {
+    const winnerId = crops?.winners?.[r];
+    const list = crops?.smartCrops?.[r] || [];
+    const found = list.find(c => c.id === winnerId) || list[0];
+    if (found) { winner = found; break; }
+  }
+
+  if (winner && detection?.imageUrl) {
+    out.image = buildCloudinaryCropUrl(detection.imageUrl, winner);
+    if (media.fileType === 'video' && media.fileUrl) {
+      out.video = buildCloudinaryCropUrl(media.fileUrl, winner);
+    }
+    return out;
+  }
+
+  // Raw-source fallback if no crops exist (pre-detect-pipeline media, or
+  // detect failed partway).
   if (media.fileType === 'video') {
     out.image = detection?.imageUrl || media.fileUrl;
     out.video = media.fileUrl;
