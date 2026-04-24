@@ -45,6 +45,9 @@ router.post('/', express.json(), async (req, res) => {
     res.json(response);
   } catch (err) {
     const status = err.status || 500;
+    // Print the full stack to Render logs so we can diagnose 500s without
+    // the request needing a repro.
+    console.error(`❌ POST /api/layout-input failed (${status}): ${err.message}\n${err.stack || ''}`);
     res.status(status).json({ error: err.message || 'Layout input generation failed' });
   }
 });
@@ -92,6 +95,7 @@ router.get('/candidates/:mediaId', async (req, res) => {
     });
   } catch (err) {
     const status = err.status || 500;
+    console.error(`❌ GET /api/layout-input/candidates/${req.params.mediaId} failed (${status}): ${err.message}\n${err.stack || ''}`);
     res.status(status).json({ error: err.message || 'Candidate preflight failed' });
   }
 });
