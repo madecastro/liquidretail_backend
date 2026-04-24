@@ -184,8 +184,15 @@ async function getCandidatesForMedia(mediaId, aspectRatio) {
       results.push({ template_id: tmpl.template_id, ok: false, reason: `ratio ${aspectRatio} not supported by this template` });
       continue;
     }
-    const input = assembleInput(ctx, tmpl.template_id, aspectRatio, {}, stubDerivation);
-    results.push(registry.validateInputAgainstTemplate(input, tmpl.template_id));
+    // Per-template try/catch so one bad assembly (e.g. a new template
+    // missing a derivation field) doesn't 500 the whole candidates list.
+    try {
+      const input = assembleInput(ctx, tmpl.template_id, aspectRatio, {}, stubDerivation);
+      results.push(registry.validateInputAgainstTemplate(input, tmpl.template_id));
+    } catch (err) {
+      console.warn(`   ⚠️  candidate preflight failed for ${tmpl.template_id}: ${err.message}`);
+      results.push({ template_id: tmpl.template_id, ok: false, reason: `preflight error: ${err.message}` });
+    }
   }
   return results;
 }
@@ -587,10 +594,16 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   // Overlay-mode templates (testimonial_overlay, etc.) carry a `placement`
   // block computed from the picked image's overlay-zone analysis. The
   // renderer reads placement.elements[] for resolved rects/text colors/scrim
-  // instead of the canonical canvas geometry.
+  // instead of the canonical canvas geometry. Errors here must NEVER take
+  // down the whole assembly — surface as null placement and let the caller
+  // / preview decide what to do.
   if (OVERLAY_MODE_TEMPLATES.has(template)) {
-    const placement = computeOverlayPlacement(ctx, aspectRatio, options, input);
-    if (placement) input.placement = placement;
+    try {
+      const placement = computeOverlayPlacement(ctx, aspectRatio, options, input);
+      if (placement) input.placement = placement;
+    } catch (err) {
+      console.warn(`   ⚠️  overlay placement failed for ${template} ${aspectRatio}: ${err.message}`);
+    }
   }
 
   return stripUndefinedDeep(input);
