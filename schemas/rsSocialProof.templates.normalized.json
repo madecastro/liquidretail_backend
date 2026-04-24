@@ -588,6 +588,70 @@
       }
     },
     {
+      "template_id": "testimonial_overlay",
+      "version": "1.0.0",
+      "status": "active",
+      "supports_video": true,
+      "family": "social_proof",
+      "render_mode": "overlay_on_image",
+      "layout": {
+        "base_family": "image_overlay",
+        "overlay_package": "adaptive_scrim",
+        "copy_system": "logo_headline_product_cta_quote",
+        "motion_system": "subtle_image_motion"
+      },
+      "aspect_ratios": {
+        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
+        "preferred": ["1:1", "4:5", "9:16"]
+      },
+      "render_order": ["background_media", "scrim", "logo", "headline", "product_meta", "cta", "quote"],
+      "placement_policy": {
+        "algorithm": "greedy_priority_with_overlap_budget",
+        "subject_overlap_budget_pct": 10,
+        "hard_no_overlay_strictness_floor": 0.95,
+        "fallback_modes": ["inset_with_brand_color_bands"],
+        "element_priority_order": [
+          { "id": "logo",         "required": true,  "region_hint": "top-left" },
+          { "id": "headline",     "required": true,  "region_hint": "top-band",     "scale_text_to_fit": true },
+          { "id": "product_meta", "required": true,  "region_hint": "mid-band",     "scale_text_to_fit": true },
+          { "id": "cta",          "required": true,  "region_hint": "bottom-third" },
+          { "id": "quote",        "required": false, "region_hint": "flex",         "truncate": "ellipsis" }
+        ]
+      },
+      "visibility_rules": {
+        "show_brand_logo": true,
+        "show_yellow_stars_for_rating": true,
+        "drop_quote_if_no_safe_area": true
+      },
+      "truncation_rules": {
+        "headline_max_lines": 3,
+        "product_name_max_lines": 1,
+        "quote_max_lines": 4,
+        "cta_max_chars": 24
+      },
+      "motion_policy": {
+        "max_concurrent_motion_slots": 1,
+        "preferred_hero_video_slot": "background_media",
+        "allow_background_video": true,
+        "mute_required": true,
+        "loop_required": true,
+        "autoplay_required": true,
+        "text_overlay_requires_scrim": true,
+        "animation_style": "subtle"
+      },
+      "fallback_policy": {
+        "if_no_safe_area_for_required": "switch_to_inset_mode_with_brand_color_bands",
+        "if_no_quote_safe_area": "drop_quote_block",
+        "if_no_overlay_analysis": "skip_template_invalid"
+      },
+      "validation": {
+        "required_all_of": ["brand.logo", "copy.headline", "product.name", "cta.text"],
+        "required_any_of": [
+          ["product.hero_media.image", "creator.portrait_media.image", "ugc.media.image"]
+        ]
+      }
+    },
+    {
       "template_id": "creator_endorsement",
       "version": "1.0.0",
       "status": "active",

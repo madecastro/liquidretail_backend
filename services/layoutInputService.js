@@ -54,8 +54,10 @@ const DetectionArtifact      = require('../models/DetectionArtifact');
 const CropArtifact           = require('../models/CropArtifact');
 const ExtendedCropArtifact   = require('../models/ExtendedCropArtifact');
 const ProductMatchArtifact   = require('../models/ProductMatchArtifact');
+const OverlayZoneArtifact    = require('../models/OverlayZoneArtifact');
 const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
 const { findBrandByName }    = require('./brandCatalogService');
+const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
 
 const GEMINI_MODEL    = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
@@ -63,8 +65,13 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 
 // Bump when the canonical input shape changes — cached LayoutInputArtifact
 // docs with a mismatching version are treated as cache misses and forced
-// to re-derive. Current = v2 (post canonical-path reshape).
-const INPUT_SCHEMA_VERSION = '2.0';
+// to re-derive. 2.1 added the optional `placement` block for overlay-mode
+// templates (testimonial_overlay).
+const INPUT_SCHEMA_VERSION = '2.1';
+
+// Templates that render via the overlay-on-image placement algorithm
+// instead of the canonical canvas-zone composition.
+const OVERLAY_MODE_TEMPLATES = new Set(['testimonial_overlay']);
 
 // Until webhook ingestion lands, every detect-uploaded Media is treated as
 // Instagram creator UGC — the uploader is standing in for a creator's post.
@@ -213,11 +220,12 @@ async function loadContext(mediaId) {
   const media = await Media.findById(mediaId).lean();
   if (!media) return null;
 
-  const [detection, crops, extended, match] = await Promise.all([
-    media.latestArtifacts?.detection ? DetectionArtifact.findById(media.latestArtifacts.detection).lean()    : null,
-    media.latestArtifacts?.crops     ? CropArtifact.findById(media.latestArtifacts.crops).lean()              : null,
-    media.latestArtifacts?.extended  ? ExtendedCropArtifact.findById(media.latestArtifacts.extended).lean()   : null,
-    media.latestArtifacts?.match     ? ProductMatchArtifact.findById(media.latestArtifacts.match).lean()      : null
+  const [detection, crops, extended, match, overlayZones] = await Promise.all([
+    media.latestArtifacts?.detection    ? DetectionArtifact.findById(media.latestArtifacts.detection).lean()    : null,
+    media.latestArtifacts?.crops        ? CropArtifact.findById(media.latestArtifacts.crops).lean()              : null,
+    media.latestArtifacts?.extended     ? ExtendedCropArtifact.findById(media.latestArtifacts.extended).lean()   : null,
+    media.latestArtifacts?.match        ? ProductMatchArtifact.findById(media.latestArtifacts.match).lean()      : null,
+    media.latestArtifacts?.overlayZones ? OverlayZoneArtifact.findById(media.latestArtifacts.overlayZones).lean(): null
   ]);
   const runId = detection?.runId || null;
   const brandName = match?.identification?.brand || media.metadata?.brand || null;
@@ -225,7 +233,7 @@ async function loadContext(mediaId) {
     ? await findBrandByName(brandName).then(b => b?.toObject?.() || b).catch(() => null)
     : null;
 
-  return { media, detection, crops, extended, match, brand, runId };
+  return { media, detection, crops, extended, match, overlayZones, brand, runId };
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -576,7 +584,103 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     }
   };
 
+  // Overlay-mode templates (testimonial_overlay, etc.) carry a `placement`
+  // block computed from the picked image's overlay-zone analysis. The
+  // renderer reads placement.elements[] for resolved rects/text colors/scrim
+  // instead of the canonical canvas geometry.
+  if (OVERLAY_MODE_TEMPLATES.has(template)) {
+    const placement = computeOverlayPlacement(ctx, aspectRatio, options, input);
+    if (placement) input.placement = placement;
+  }
+
   return stripUndefinedDeep(input);
+}
+
+// Picks the analyzed image to use as full-bleed background and runs the
+// placement algorithm against its overlay-zone analysis. Returns the
+// `placement` block to attach to the input, or null if no analyzed image
+// is available for this aspect ratio.
+function computeOverlayPlacement(ctx, aspectRatio, options, content) {
+  const overlayPick = pickOverlayBackground(ctx, aspectRatio);
+  if (!overlayPick.image) return null;
+
+  // Conservation level: caller can override; default 0.5 (mid).
+  const conservation = typeof options?.conservation === 'number'
+    ? Math.max(0, Math.min(1, options.conservation))
+    : 0.5;
+
+  // Canvas pixel dims from the canonical canvas spec (so font-scale math
+  // matches the renderer's coordinate space).
+  const canvasSpec = registry.getCanvas(overlayCanonicalParent('testimonial_overlay'), aspectRatio);
+  const canvasW = canvasSpec?.canvas?.width  || 1000;
+  const canvasH = canvasSpec?.canvas?.height || 1000;
+
+  const result = placeOverlays({
+    canvasW, canvasH,
+    aspectRatio,
+    analysis:     overlayPick.analysis,
+    conservation,
+    content,
+    brandColors:  {
+      primary:   content?.brand?.primary_color   || null,
+      secondary: content?.brand?.secondary_color || null,
+      accent:    content?.brand?.accent_color    || null
+    }
+  });
+
+  return {
+    mode:            result.mode,                  // 'overlay' | 'inset'
+    conservation,
+    backgroundMedia: {
+      image: overlayPick.image,
+      video: overlayPick.video || null,
+      ...(result.backgroundMedia || {})
+    },
+    backgroundColor: result.backgroundMedia?.backgroundColor || null,
+    imageRect:       result.backgroundMedia?.imageRect || null,
+    elements:        result.elements,
+    failedRequired:  result.failedRequired
+  };
+}
+
+// Map an overlay-mode template to its canonical "parent" so we can look up
+// canvas pixel dims for the same aspect ratio. Today there's only one
+// overlay variant; this is a stub for future ones.
+function overlayCanonicalParent(overlayTemplate) {
+  switch (overlayTemplate) {
+    case 'testimonial_overlay': return 'testimonial_spotlight';
+    default: return overlayTemplate;
+  }
+}
+
+// For overlay templates, pick the analyzed image to use as the full-bleed
+// canvas. Base ratios → 'base' variant (smart-crop winner). Extended
+// ratios → 'gemini_extension' variant.
+function pickOverlayBackground(ctx, aspectRatio) {
+  const out = { image: null, video: null, analysis: null };
+  const overlay = ctx.overlayZones?.zones?.[aspectRatio];
+  if (!overlay) return out;
+
+  const baseRatios = ['5:4', '1:1', '4:5'];
+  const preferKey = baseRatios.includes(aspectRatio) ? 'base' : 'gemini_extension';
+
+  // Handle both possible artifact shapes:
+  //   v3 array: [{ provider, variant, candidateId, imageUrl, analysis }]
+  //   legacy keyed: { '<variantKey>': { ... } }
+  let entry = null;
+  if (Array.isArray(overlay)) {
+    entry = overlay.find(e => {
+      if (preferKey === 'base') return e.variant === 'base';
+      return e.provider === 'gemini' && e.variant === 'extension';
+    }) || overlay.find(e => !!e.imageUrl);
+  } else if (typeof overlay === 'object') {
+    entry = overlay[preferKey] || Object.values(overlay).find(v => v?.imageUrl);
+  }
+  if (!entry) return out;
+
+  out.image = entry.imageUrl || null;
+  out.analysis = entry.analysis || null;
+  return out;
 }
 
 // ──────────────────────────────────────────────────────────────

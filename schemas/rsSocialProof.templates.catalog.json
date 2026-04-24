@@ -390,6 +390,94 @@
       ]
     },
     {
+      "id": "testimonial_overlay",
+      "name": "Testimonial Overlay",
+      "status": "active",
+      "ui_label": "Testimonial Overlay",
+      "tagline": "The image is the ad. Logo, headline, product, CTA, and quote sit on top in safe zones.",
+      "purpose": "Image-as-canvas variant of testimonial_spotlight. The hero photo fills the entire frame; required elements (logo, headline, product+rating, CTA) are placed dynamically in subject-safe regions using the detect pipeline's overlay-zone analysis. Quote is optional — drops if no safe room remains.",
+      "summary": "Renders the full image as the canvas and overlays elements at runtime in safe zones determined per image. No fixed canvas zones; placement is computed from each image's restrictions/density/brightness analysis.",
+      "preset_architecture": {
+        "base_family": "image_overlay",
+        "overlay_package": "adaptive_scrim",
+        "copy_system": "logo_headline_product_cta_quote",
+        "motion_system": "subtle_image_motion"
+      },
+      "render_mode": "overlay_on_image",
+      "emphasis": "image-first",
+      "primary_proof_types": ["image_subject", "rating", "review_count", "testimonial"],
+      "supported_entry_points": [
+        { "type": "post", "priority": "highest", "behavior": "Best fit when starting from a creator/UGC post — the image dominates and is the emotional hook." },
+        { "type": "product", "priority": "supported", "behavior": "Allowed when product hero imagery is strong enough to carry the frame." }
+      ],
+      "supported_post_types": [
+        { "type": "branded", "support_level": "supported" },
+        { "type": "ugc", "support_level": "preferred" }
+      ],
+      "ideal_use_cases": [
+        "creator UGC product ads where the image is the emotional hook",
+        "lifestyle / aspirational product placements",
+        "any media where the image already tells the story and overlays add commerce signals"
+      ],
+      "required_content": {
+        "must_have": ["brand.logo", "copy.headline", "product.name", "cta.text"],
+        "must_have_any": [
+          ["product.hero_media.image", "creator.portrait_media.image"]
+        ]
+      },
+      "preferred_content": [
+        "social_proof.rating_value",
+        "social_proof.review_count",
+        "social_proof.primary_quote.text",
+        "brand.primary_color",
+        "brand.accent_color"
+      ],
+      "optional_content": [
+        "social_proof.primary_quote",
+        "product.price",
+        "copy.subheadline"
+      ],
+      "content_priority": ["logo", "headline", "product_meta", "cta", "quote"],
+      "copy_strategy": {
+        "headline_role": "primary message anchor",
+        "subheadline_role": "rare — used only if room",
+        "primary_copy_role": "headline drives, quote supplements when present",
+        "cta_role": "always-on conversion anchor"
+      },
+      "visual_character": {
+        "tone": ["bold", "image-led", "social-native", "mobile-first"],
+        "density": "low",
+        "style_bias": "creative_photography_with_overlays"
+      },
+      "video_support": {
+        "supported": true,
+        "primary_video_role": "background image OR background video",
+        "preferred_motion_zone": "background",
+        "motion_intensity": "subtle",
+        "rules": [
+          "All overlays must remain pinned and legible while the bg plays.",
+          "Adaptive scrim required behind text on bright/busy bg regions.",
+          "Image-only mode is the canonical fallback — video is decorative."
+        ]
+      },
+      "proof_modules": {
+        "allowed": ["rating_summary", "review_count", "primary_quote"],
+        "discouraged": ["dense multi-quote stacks", "metric tables"]
+      },
+      "selection_rules": [
+        "Prefer when the image is already a strong creative — no need to compose around it.",
+        "Prefer for UGC / creator media where authenticity matters more than information density.",
+        "Skip when the image is poor quality or the subject occupies the entire frame leaving no safe overlay area (renderer auto-falls back to inset mode in that case)."
+      ],
+      "distinctive_features": [
+        "no fixed canvas zones — placement computed per image",
+        "10% subject overlap budget for non-product restrictions",
+        "adaptive scrim strength based on bg/text contrast gap",
+        "inset fallback when no safe overlay area exists",
+        "yellow star rating display"
+      ]
+    },
+    {
       "id": "creator_endorsement",
       "name": "Creator Endorsement",
       "status": "active",
