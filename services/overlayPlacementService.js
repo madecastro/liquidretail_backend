@@ -140,6 +140,11 @@ function buildElementSpecs(content) {
       slot: 'social_proof.primary_quote', region: 'flex',
       contentLength: (content?.social_proof?.primary_quote?.text || '').length,
       truncate: 'ellipsis',
+      // Quote is allowed to sit up to 50% over the primary subject —
+      // testimonial-style overlays commonly land a speech-bubble-like
+      // block partially on top of the person or product so the eye
+      // reads them as linked. Measured as (intersection / quoteRectArea).
+      allowedHardOverlapPct: 0.5,
       shapes: [
         // Preferred: medium card with 4 lines of body copy.
         { variant: 'card',       sizePct: { w: 0.62, h: 0.20 }, sizeBounds: { minW: 0.44, maxW: 0.82, minH: 0.14, maxH: 0.28 }, maxLines: 4, layout: 'inline', preferBonus: 0.4 },
@@ -185,9 +190,10 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     const candidates = generateCandidates(el, availableRegions);
     const nCandidates = candidates.length;
 
+    const hardAllow = el.allowedHardOverlapPct || 0;
     const legal = candidates.filter(c =>
       withinCanvas(c) &&
-      !overlapsAnyHard(c, hardKeepOut) &&
+      !overlapsAnyHard(c, hardKeepOut, hardAllow) &&
       softOverlapWithinLimit(c, softKeepOut, el) &&
       !overlapsAnyConsumed(c, consumed)
     );
@@ -205,7 +211,7 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     } else if (el.required) {
       // Last-resort: ignore SOFT overlap entirely; only avoid HARD + consumed.
       const fallback = candidates.filter(c =>
-        withinCanvas(c) && !overlapsAnyHard(c, hardKeepOut) && !overlapsAnyConsumed(c, consumed)
+        withinCanvas(c) && !overlapsAnyHard(c, hardKeepOut, hardAllow) && !overlapsAnyConsumed(c, consumed)
       );
       if (fallback.length) {
         pick = fallback.reduce((best, c) => {
@@ -538,8 +544,21 @@ function rectIntersectionArea(a, b) {
   const h = Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1);
   return w * h;
 }
-function overlapsAnyHard(cand, hardKeepOut) {
-  return hardKeepOut.some(k => rectsIntersect(cand, k.rect));
+function overlapsAnyHard(cand, hardKeepOut, allowedHardOverlapPct = 0) {
+  if (allowedHardOverlapPct <= 0) {
+    return hardKeepOut.some(k => rectsIntersect(cand, k.rect));
+  }
+  // Per-element allowance: rect may overlap hard keep-outs up to N% of
+  // the candidate's own area (not the keep-out's). Used for elements
+  // like testimonial quotes that look natural sitting partially on the
+  // subject — the overlap "links" the two visually.
+  const candArea = rectArea(cand) || 1;
+  for (const k of hardKeepOut) {
+    if (!rectsIntersect(cand, k.rect)) continue;
+    const overlap = rectIntersectionArea(cand, k.rect);
+    if ((overlap / candArea) > allowedHardOverlapPct) return true;
+  }
+  return false;
 }
 function overlapsAnyConsumed(cand, consumed) {
   return consumed.some(c => rectIntersectionArea(cand, c) > 0.0005);
