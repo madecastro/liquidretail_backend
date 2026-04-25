@@ -88,6 +88,11 @@ function buildElementSpecs(content) {
       slot: 'copy.headline', region: 'top-band',
       contentLength: (content?.copy?.headline || '').length,
       scaleText: true,
+      // Headlines commonly bleed onto the subject in real ads (sky over
+      // the person's shoulder, etc.). Allow up to 25% of the headline's
+      // own area to sit on the primary subject so we keep overlay mode
+      // and avoid falling to inset bands when the subject is wide.
+      allowedHardOverlapPct: 0.25,
       shapes: [
         // Preferred: 1-line wide strip — the classic top banner headline.
         { variant: 'horizontal', sizePct: { w: 0.84, h: 0.13 }, sizeBounds: { minW: 0.56, maxW: 0.92, minH: 0.08, maxH: 0.18 }, maxLines: 1, layout: 'inline', preferBonus: 0.6 },
@@ -107,6 +112,10 @@ function buildElementSpecs(content) {
       region: 'mid-band',
       contentLength: (content?.product?.name || '').length + 12,
       scaleText: true,
+      // Same as headline: allow up to 25% overlap with the primary
+      // subject so the meta block can land in mid-band side-rails even
+      // when the subject is centered.
+      allowedHardOverlapPct: 0.25,
       shapes: [
         // Preferred: name+price and rating stacked on 2 inline-ish lines.
         { variant: 'inline',     sizePct: { w: 0.60, h: 0.10 }, sizeBounds: { minW: 0.38, maxW: 0.78, minH: 0.07, maxH: 0.14 }, maxLines: 2, layout: 'inline', preferBonus: 0.4 },
@@ -439,19 +448,23 @@ function candidatesForShape(el, shape, availableRegions) {
     preferBonus: shape.preferBonus || 0
   });
 
-  // Inset mode: candidates come from inside explicit bands. Skip shapes
-  // that can't fit the band without violating their minW/minH — a shape's
-  // minimum size is the point below which the container becomes
-  // unreadable (a 2-line headline squeezed into a 6%-tall band is worse
-  // than falling through to the 1-line horizontal variant instead).
+  // Inset mode: candidates come from inside explicit bands. We keep
+  // shape selection generous here — inset bands sit on a flat brand-
+  // color background (no image clutter), so a slightly-undersized
+  // container is still legible. Skip a shape only when even an absolute
+  // floor (0.04 of canvas) won't fit; otherwise clamp to the band.
+  const ABS_FLOOR = 0.04;
   if (availableRegions && availableRegions.length) {
     for (const band of availableRegions) {
       const bh = band.y2 - band.y1;
       const bw = band.x2 - band.x1;
-      if (shape.sizeBounds.minW > bw - 0.005) continue;
-      if (shape.sizeBounds.minH > bh - 0.005) continue;
-      const w = Math.min(shape.sizeBounds.maxW, Math.max(shape.sizeBounds.minW, Math.min(shape.sizePct.w, bw - 0.005)));
-      const h = Math.min(shape.sizeBounds.maxH, Math.max(shape.sizeBounds.minH, Math.min(shape.sizePct.h, bh - 0.005)));
+      if (bw < ABS_FLOOR || bh < ABS_FLOOR) continue;
+      // Width: prefer shape's nominal but never exceed band, with
+      // shape.sizeBounds.minW only as a soft target.
+      const w = Math.min(bw - 0.005, Math.max(ABS_FLOOR, shape.sizePct.w));
+      // Height: prefer shape's nominal but always fit the band — minH
+      // is advisory in inset, not enforced.
+      const h = Math.min(bh - 0.005, Math.max(ABS_FLOOR, shape.sizePct.h));
       const cx = (band.x1 + band.x2) / 2;
       const cy = (band.y1 + band.y2) / 2;
       out.push(tag({ x1: cx - w/2,     y1: cy - h/2, x2: cx - w/2 + w, y2: cy - h/2 + h }));
