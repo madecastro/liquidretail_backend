@@ -62,10 +62,19 @@ async function upsertBrandStub({ name, paletteSeed, firstSeenMediaId, websiteUrl
     }
   }
 
-  if (doc.websiteUrl && doc.source === 'stub') {
+  // Trigger enrichment when (a) the brand is still a stub, OR (b) the
+  // Brandfetch source hasn't been attempted yet on this brand. The
+  // second condition lets us backfill brands that were enriched before
+  // Brandfetch was wired up (or before BRANDFETCH_API_KEY was set).
+  const sourcesAttempted = new Set(doc.enrichmentSources || []);
+  const needsBrandfetch  = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
+  const shouldEnrich     = !!doc.websiteUrl && (doc.source === 'stub' || needsBrandfetch);
+  if (shouldEnrich) {
     // Fire-and-forget. Require here to avoid a circular-require at module
     // load time (enrichment service does NOT import brandCatalogService).
     const { enrichBrandFromUrl } = require('./brandEnrichmentService');
+    const reason = doc.source === 'stub' ? 'stub' : 'backfill brandfetch';
+    console.log(`🌐 brand enrichment queued for "${name}" (${reason})`);
     enrichBrandFromUrl(doc._id).catch(err =>
       console.warn(`   ⚠️  brand enrichment fire-and-forget failed for "${name}": ${err.message}`)
     );

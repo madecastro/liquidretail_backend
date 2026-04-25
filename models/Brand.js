@@ -55,6 +55,13 @@ const brandSchema = new mongoose.Schema({
   // schema property names exactly: 'logoUrl', 'primaryColor', etc.
   curatedFields:  [String],
 
+  // Which auto-enrichment sources have been ATTEMPTED on this brand
+  // (regardless of whether each returned data). Drives re-enrichment
+  // logic — if 'brandfetch' is missing, we re-run enrichment so the
+  // brand-kit lookup can backfill. Values: 'brandfetch' | 'scraped' |
+  // 'gpt'. Resets only when curation explicitly removes a field.
+  enrichmentSources: [String],
+
   // If stub, which Media was the first to surface this brand — useful for
   // auditing where a brand came from.
   firstSeenMediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },

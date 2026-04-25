@@ -54,18 +54,41 @@ async function enrichBrandFromUrl(brandId) {
   const brand = await Brand.findById(brandId);
   if (!brand)             return { ok: false, reason: 'brand not found' };
   if (!brand.websiteUrl)  return { ok: false, reason: 'no websiteUrl' };
-  if (brand.source === 'curated') return { ok: false, reason: 'curated — refusing to overwrite' };
-  if (brand.source === 'enriched') return { ok: false, reason: 'already enriched' };
-  if (!process.env.OPENAI_API_KEY) return { ok: false, reason: 'OPENAI_API_KEY not set' };
+
+  // Per-field protection (curatedFields) replaces the old wholesale
+  // 'curated' / 'enriched' bail-outs. We re-run enrichment whenever an
+  // auto-source is missing from the attempted list — Brandfetch is the
+  // most common gap (e.g. older brands enriched before the API key was
+  // configured) and it's the highest-quality source so we want to
+  // backfill it whenever we can.
+  const sourcesAttempted = new Set(brand.enrichmentSources || []);
+  const wantBrandfetch   = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
+  const wantScraped      = !sourcesAttempted.has('scraped');
+  const wantGpt          = !!process.env.OPENAI_API_KEY && !sourcesAttempted.has('gpt');
+
+  if (!wantBrandfetch && !wantScraped && !wantGpt) {
+    return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
+  }
 
   const t0 = Date.now();
-  console.log(`🌐 brand enrichment: fetching ${brand.websiteUrl} for "${brand.name}"`);
+  const planParts = [];
+  if (wantBrandfetch) planParts.push('brandfetch');
+  if (wantScraped)    planParts.push('scrape');
+  if (wantGpt)        planParts.push('gpt');
+  console.log(`🌐 brand enrichment: ${brand.websiteUrl} for "${brand.name}" — running ${planParts.join('+')}${sourcesAttempted.size ? ` (already have: ${[...sourcesAttempted].join(', ')})` : ''}`);
 
   // ── Tier 1: Brandfetch ──
-  // Hits the brand kit API for native logo + colors + fonts. No-ops if no
-  // API key is configured. Fields here are PREFERRED over later tiers.
+  // Hits the brand kit API for native logo + colors + fonts. Skipped
+  // if no API key OR if already attempted on a previous run.
   const hostname = hostnameFromUrl(brand.websiteUrl);
-  const bf = hostname ? await brandfetchLookup(hostname) : null;
+  const bf = (wantBrandfetch && hostname) ? await brandfetchLookup(hostname) : null;
+  if (wantBrandfetch && bf) {
+    const filled = [];
+    for (const k of ['logoUrl', 'primaryColor', 'secondaryColor', 'accentColor', 'fontFamily']) {
+      if (bf[k]) filled.push(`${k}=${bf[k].length > 50 ? bf[k].slice(0, 47) + '…' : bf[k]}`);
+    }
+    console.log(`   · brandfetch returned: ${filled.join(', ') || '(empty)'}`);
+  }
 
   // ── Tier 2: Homepage HTML ──
   let html = '';
@@ -105,11 +128,11 @@ async function enrichBrandFromUrl(brandId) {
   }
 
   // ── Tier 3: GPT-4.1 text extraction ──
-  // Skipped when we have no usable text (bot-blocked) but Brandfetch
-  // already filled the visual identity — we still want to ship that
-  // partial enrichment rather than block on unavailable text.
+  // Skipped when we have no usable text (bot-blocked) OR when GPT was
+  // already attempted on a previous run. Brandfetch alone can ship
+  // partial enrichment without GPT.
   let enrichment = {};
-  if (!skipLLM) {
+  if (!skipLLM && wantGpt) {
     const prompt =
       `You are analyzing the homepage of "${brand.name}" (${brand.websiteUrl}) to fill a brand catalog entry.\n\n` +
       `Source text from the homepage (HTML stripped):\n"""\n${textContent}\n"""\n\n` +
@@ -144,22 +167,72 @@ async function enrichBrandFromUrl(brandId) {
   // ── Merge — priority: Brandfetch > HTML scrape > meta theme-color > GPT > existing ──
   // Per-field curation lock: any field listed in brand.curatedFields was
   // explicitly set by a human and is protected from auto-overwrite.
+  // Brandfetch values OVERRIDE existing ones (highest reliability source);
+  // they remain blocked only by curatedFields.
   const isCurated = (k) => Array.isArray(brand.curatedFields) && brand.curatedFields.includes(k);
-  const setIf = (k, v) => { if (!isCurated(k) && v != null) brand[k] = v; };
+  const overrides = []; // [{ field, oldVal, newVal, source }] — for logging
+  const setIf = (k, v, source) => {
+    if (isCurated(k)) return;
+    if (v == null || v === brand[k]) return;
+    overrides.push({ field: k, oldVal: brand[k], newVal: v, source });
+    brand[k] = v;
+  };
 
-  const finalLogo =
-    bf?.logoUrl              ||
-    scrapedLogoUrl           ||
-    brand.logoUrl            ||
-    googleFaviconFallback(hostname);
+  // Walk priority chain per field; remember which source actually wins
+  // so the log line can attribute correctly.
+  const pick = (...cands) => {
+    for (const [val, src] of cands) if (val != null) return [val, src];
+    return [null, null];
+  };
 
-  setIf('logoUrl',        finalLogo);
-  setIf('fontFamily',     bf?.fontFamily      || scrapedFontFamily      || brand.fontFamily || null);
-  setIf('primaryColor',   bf?.primaryColor    || metaThemeColor          || enrichment.primaryColor   || brand.primaryColor);
-  setIf('secondaryColor', bf?.secondaryColor  || enrichment.secondaryColor || brand.secondaryColor);
-  setIf('accentColor',    bf?.accentColor     || enrichment.accentColor    || brand.accentColor);
-  setIf('tagline',        enrichment.tagline  || bf?.description           || brand.tagline);
-  if (!isCurated('tone')) brand.tone = Array.isArray(enrichment.tone) && enrichment.tone.length ? enrichment.tone : brand.tone;
+  let [logoVal, logoSrc] = pick(
+    [bf?.logoUrl, 'brandfetch'],
+    [scrapedLogoUrl, 'scraped'],
+    [brand.logoUrl, 'existing'],
+    [googleFaviconFallback(hostname), 'google-favicon']
+  );
+  setIf('logoUrl', logoVal, logoSrc);
+
+  let [fontVal, fontSrc] = pick(
+    [bf?.fontFamily, 'brandfetch'],
+    [scrapedFontFamily, 'scraped'],
+    [brand.fontFamily, 'existing']
+  );
+  setIf('fontFamily', fontVal, fontSrc);
+
+  let [primaryVal, primarySrc] = pick(
+    [bf?.primaryColor, 'brandfetch'],
+    [metaThemeColor, 'meta-theme-color'],
+    [enrichment.primaryColor, 'gpt'],
+    [brand.primaryColor, 'existing']
+  );
+  setIf('primaryColor', primaryVal, primarySrc);
+
+  let [secondaryVal, secondarySrc] = pick(
+    [bf?.secondaryColor, 'brandfetch'],
+    [enrichment.secondaryColor, 'gpt'],
+    [brand.secondaryColor, 'existing']
+  );
+  setIf('secondaryColor', secondaryVal, secondarySrc);
+
+  let [accentVal, accentSrc] = pick(
+    [bf?.accentColor, 'brandfetch'],
+    [enrichment.accentColor, 'gpt'],
+    [brand.accentColor, 'existing']
+  );
+  setIf('accentColor', accentVal, accentSrc);
+
+  let [taglineVal, taglineSrc] = pick(
+    [enrichment.tagline, 'gpt'],
+    [bf?.description, 'brandfetch'],
+    [brand.tagline, 'existing']
+  );
+  setIf('tagline', taglineVal, taglineSrc);
+
+  if (!isCurated('tone') && Array.isArray(enrichment.tone) && enrichment.tone.length) {
+    overrides.push({ field: 'tone', oldVal: brand.tone, newVal: enrichment.tone, source: 'gpt' });
+    brand.tone = enrichment.tone;
+  }
   if (!isCurated('demographics') && Array.isArray(enrichment.demographics) && enrichment.demographics.length) {
     brand.demographics = enrichment.demographics.slice(0, 6).map(d => ({
       name:        d.name,
@@ -169,17 +242,38 @@ async function enrichBrandFromUrl(brandId) {
       toneHint:    d.toneHint || ''
     }));
   }
+  // Track which sources we ATTEMPTED on this run so subsequent runs
+  // know whether to backfill (e.g. Brandfetch came online later).
+  const newSourcesAttempted = new Set(brand.enrichmentSources || []);
+  if (wantBrandfetch) newSourcesAttempted.add('brandfetch');
+  if (wantScraped)    newSourcesAttempted.add('scraped');
+  if (wantGpt && !skipLLM) newSourcesAttempted.add('gpt');
+  brand.enrichmentSources = [...newSourcesAttempted];
+
   brand.source = 'enriched';
   brand.enrichedAt = new Date();
   await brand.save();
 
-  const sources = [
-    bf ? 'brandfetch' : null,
-    scrapedLogoUrl || scrapedFontFamily ? 'scraped' : null,
-    !skipLLM ? 'gpt' : null
+  // Per-field override log — fire-and-forget calls go to the same
+  // server log stream, so this is the only visibility into what the
+  // background enrichment actually changed.
+  if (overrides.length) {
+    for (const o of overrides) {
+      const oldStr = o.oldVal == null ? '∅' : (typeof o.oldVal === 'string' && o.oldVal.length > 40 ? o.oldVal.slice(0, 37) + '…' : o.oldVal);
+      const newStr = o.newVal == null ? '∅' : (typeof o.newVal === 'string' && o.newVal.length > 40 ? o.newVal.slice(0, 37) + '…' : o.newVal);
+      console.log(`   · ${brand.name}.${o.field}: ${JSON.stringify(oldStr)} → ${JSON.stringify(newStr)} [${o.source}]`);
+    }
+  } else {
+    console.log(`   · ${brand.name}: no field changes (all sources returned matching or curated values)`);
+  }
+
+  const ranThisTime = [
+    wantBrandfetch ? 'brandfetch' : null,
+    wantScraped    ? 'scraped'    : null,
+    (wantGpt && !skipLLM) ? 'gpt'  : null
   ].filter(Boolean).join('+');
-  console.log(`   ✓ brand enrichment done for "${brand.name}" via ${sources}: ${brand.demographics?.length || 0} demographic(s) in ${Date.now() - t0}ms`);
-  return { ok: true, brand };
+  console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
+  return { ok: true, brand, overrides };
 }
 
 function extractTextFromHtml(html) {
