@@ -81,4 +81,31 @@ async function findBrandByName(name) {
   return Brand.findOne({ nameNormalized: normalized });
 }
 
-module.exports = { upsertBrandStub, findBrandByName };
+// Set a curated asset on a brand (e.g. user-uploaded logo). Adds the
+// field name to brand.curatedFields so subsequent auto-enrichment runs
+// know to skip it. Idempotent — calling twice with the same value is a
+// no-op. If the brand doesn't exist yet, creates a stub first so the
+// curation can attach.
+async function setCuratedAsset({ name, fieldName, value, websiteUrl, firstSeenMediaId }) {
+  if (!name || !fieldName || value == null) return null;
+  const normalized = normalizeBrandName(name);
+  if (!normalized) return null;
+
+  // Ensure a brand doc exists for this name (stub if new). Pass websiteUrl
+  // through so the enrichment-trigger path still fires for non-curated
+  // fields like tagline / tone / personas.
+  let brand = await Brand.findOne({ nameNormalized: normalized });
+  if (!brand) {
+    brand = await upsertBrandStub({ name, paletteSeed: [], firstSeenMediaId, websiteUrl });
+    if (!brand) return null;
+  }
+
+  brand[fieldName] = value;
+  if (!Array.isArray(brand.curatedFields)) brand.curatedFields = [];
+  if (!brand.curatedFields.includes(fieldName)) brand.curatedFields.push(fieldName);
+  brand.updatedAt = new Date();
+  await brand.save();
+  return brand;
+}
+
+module.exports = { upsertBrandStub, findBrandByName, setCuratedAsset };

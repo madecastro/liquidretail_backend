@@ -142,20 +142,25 @@ async function enrichBrandFromUrl(brandId) {
   }
 
   // ── Merge — priority: Brandfetch > HTML scrape > meta theme-color > GPT > existing ──
+  // Per-field curation lock: any field listed in brand.curatedFields was
+  // explicitly set by a human and is protected from auto-overwrite.
+  const isCurated = (k) => Array.isArray(brand.curatedFields) && brand.curatedFields.includes(k);
+  const setIf = (k, v) => { if (!isCurated(k) && v != null) brand[k] = v; };
+
   const finalLogo =
     bf?.logoUrl              ||
     scrapedLogoUrl           ||
     brand.logoUrl            ||
     googleFaviconFallback(hostname);
 
-  brand.logoUrl        = finalLogo;
-  brand.fontFamily     = bf?.fontFamily      || scrapedFontFamily      || brand.fontFamily || null;
-  brand.primaryColor   = bf?.primaryColor    || metaThemeColor          || enrichment.primaryColor   || brand.primaryColor;
-  brand.secondaryColor = bf?.secondaryColor  || enrichment.secondaryColor || brand.secondaryColor;
-  brand.accentColor    = bf?.accentColor     || enrichment.accentColor    || brand.accentColor;
-  brand.tagline        = enrichment.tagline  || bf?.description           || brand.tagline;
-  brand.tone           = Array.isArray(enrichment.tone) && enrichment.tone.length ? enrichment.tone : brand.tone;
-  if (Array.isArray(enrichment.demographics) && enrichment.demographics.length) {
+  setIf('logoUrl',        finalLogo);
+  setIf('fontFamily',     bf?.fontFamily      || scrapedFontFamily      || brand.fontFamily || null);
+  setIf('primaryColor',   bf?.primaryColor    || metaThemeColor          || enrichment.primaryColor   || brand.primaryColor);
+  setIf('secondaryColor', bf?.secondaryColor  || enrichment.secondaryColor || brand.secondaryColor);
+  setIf('accentColor',    bf?.accentColor     || enrichment.accentColor    || brand.accentColor);
+  setIf('tagline',        enrichment.tagline  || bf?.description           || brand.tagline);
+  if (!isCurated('tone')) brand.tone = Array.isArray(enrichment.tone) && enrichment.tone.length ? enrichment.tone : brand.tone;
+  if (!isCurated('demographics') && Array.isArray(enrichment.demographics) && enrichment.demographics.length) {
     brand.demographics = enrichment.demographics.slice(0, 6).map(d => ({
       name:        d.name,
       description: d.description || '',

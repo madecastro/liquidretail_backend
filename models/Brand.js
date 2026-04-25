@@ -48,6 +48,13 @@ const brandSchema = new mongoose.Schema({
   source:         { type: String, enum: ['stub', 'enriched', 'curated'], default: 'stub' },
   enrichedAt:     Date,
 
+  // Per-field curation lock. Listed field names are protected from
+  // auto-enrichment overwrite even when source='stub'/'enriched'. Lets a
+  // user upload one curated asset (e.g. logoUrl) without losing the
+  // benefit of automated enrichment for the rest. Field names match
+  // schema property names exactly: 'logoUrl', 'primaryColor', etc.
+  curatedFields:  [String],
+
   // If stub, which Media was the first to surface this brand — useful for
   // auditing where a brand came from.
   firstSeenMediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },

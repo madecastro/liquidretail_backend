@@ -15,6 +15,7 @@ const Job = require('../models/Job');
 
 const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
 const geminiImg = require('../services/geminiImageService');
+const { setCuratedAsset } = require('../services/brandCatalogService');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -29,18 +30,23 @@ const upload = multer({
 // Future webhook ingestion endpoints (Meta / TikTok / IG) will create the
 // Media with their platform-supplied externalId and follow the same
 // "DetectRun.create then return runId" pattern.
-router.post('/', upload.single('photo'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'File required' });
+router.post('/', upload.fields([
+  { name: 'photo',     maxCount: 1 },
+  { name: 'brandLogo', maxCount: 1 }
+]), async (req, res) => {
+  const photoFile = req.files?.photo?.[0];
+  const logoFile  = req.files?.brandLogo?.[0];
+  if (!photoFile) return res.status(400).json({ error: 'File required' });
 
-  const isVideo = (req.file.mimetype || '').startsWith('video/');
-  const sizeMB = (req.file.size / 1024 / 1024).toFixed(1);
-  console.log(`📥 /api/detect ${isVideo ? 'VIDEO' : 'IMAGE'} ${req.file.originalname} (${sizeMB}MB)`);
+  const isVideo = (photoFile.mimetype || '').startsWith('video/');
+  const sizeMB = (photoFile.size / 1024 / 1024).toFixed(1);
+  console.log(`📥 /api/detect ${isVideo ? 'VIDEO' : 'IMAGE'} ${photoFile.originalname} (${sizeMB}MB)${logoFile ? ` + brand logo ${logoFile.originalname}` : ''}`);
 
   let metadata = {};
   try { metadata = JSON.parse(req.body.metadata || '{}'); } catch {}
 
   try {
-    const uploaded = await uploadBufferToCloudinary(req.file.buffer, {
+    const uploaded = await uploadBufferToCloudinary(photoFile.buffer, {
       resourceType: isVideo ? 'video' : 'image'
     });
 
@@ -54,10 +60,42 @@ router.post('/', upload.single('photo'), async (req, res) => {
       sourceUrl:    null,
       fileType:     isVideo ? 'video' : 'image',
       fileUrl:      uploaded.secure_url,
-      fileMimeType: req.file.mimetype,
-      fileName:     req.file.originalname,
+      fileMimeType: photoFile.mimetype,
+      fileName:     photoFile.originalname,
       metadata
     });
+
+    // ── Curated brand logo (optional) ──
+    // If the user attached a logo file in the form, upload it and write
+    // the URL onto the Brand catalog as a curated asset (protected from
+    // future enrichment overwrite). Brand identity hints the user
+    // typed (brand name + brand URL) live in metadata.brand and
+    // metadata.brandUrl already, so we have everything needed to
+    // identify which Brand row to attach to.
+    if (logoFile) {
+      try {
+        const logoUploaded = await uploadBufferToCloudinary(logoFile.buffer, {
+          resourceType: 'image',
+          folder: 'brand_logos'
+        });
+        const brandName = (metadata.brand || '').trim();
+        if (brandName) {
+          await setCuratedAsset({
+            name:       brandName,
+            fieldName:  'logoUrl',
+            value:      logoUploaded.secure_url,
+            websiteUrl: metadata.brandUrl || null,
+            firstSeenMediaId: media._id
+          });
+          console.log(`🏷️   Brand "${brandName}" logo curated → ${logoUploaded.secure_url}`);
+        } else {
+          console.warn('⚠️  brandLogo uploaded without a brand name — skipping curation');
+        }
+      } catch (err) {
+        // Non-fatal — detection should still proceed if logo upload fails.
+        console.warn('⚠️  brandLogo upload/curation failed:', err.message);
+      }
+    }
 
     const run = await DetectRun.create({
       mediaId: media._id,
