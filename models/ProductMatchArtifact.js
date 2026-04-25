@@ -18,6 +18,18 @@ const productMatchArtifactSchema = new mongoose.Schema({
   identification: mongoose.Schema.Types.Mixed,
   // { productName, brand, certainty, certaintyLabel, details: { ...SerpAPI... + reviewSummary } }
 
+  // Decision-tree outputs from productMatchService — additive over the
+  // legacy `identification` field above so older consumers don't break.
+  // outcome ∈ { 'confirmed', 'lookup_from_yolo', 'lookup_from_gemini',
+  //             'category', 'branding', 'do_not_use' }
+  outcome:          { type: String, index: true },
+  outcomeReasoning: String,
+  winner:           String,        // 'yolo' | 'gemini' | 'agree' | null
+  // Brand-level fallback collection page (filled when outcome='category')
+  brandCategory:    mongoose.Schema.Types.Mixed,
+  // Brand-level reviews (filled when outcome='branding')
+  brandReviews:     mongoose.Schema.Types.Mixed,
+
   createdAt: { type: Date, default: Date.now }
 });
 

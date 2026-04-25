@@ -73,8 +73,11 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // added shape-variant metadata on each placed element (variant, layout,
 // maxLines) — the placement algorithm now considers horizontal + stacked
 // + narrow-column candidates per element, so rects can land in much
-// tighter spaces than before.
-const INPUT_SCHEMA_VERSION = '2.4';
+// tighter spaces than before. 2.5 wires the matching-service decision
+// tree outcomes into the input: 'category' overrides cta to the brand
+// collection page, 'branding' injects brand-reviews quotes + ratings,
+// 'do_not_use' hard-stops layout assembly.
+const INPUT_SCHEMA_VERSION = '2.5';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -152,6 +155,14 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
 
   const ctx = await loadContext(mediaId);
   if (!ctx) throw notFound(`Media ${mediaId} not found`);
+
+  // Hard-stop: matching service flagged this Media as 'do_not_use'
+  // (typically multi-brand contention). Templates can't safely render
+  // ad creative for it; surface a clear error rather than producing
+  // ambiguous output.
+  if (ctx.match?.outcome === 'do_not_use') {
+    throw badRequest(`Media flagged as do_not_use by product matching: ${ctx.match.outcomeReasoning || 'multiple brands detected'}`);
+  }
 
   const derivation = await runDerivation(ctx, template, aspectRatio, options);
   const input = assembleInput(ctx, template, aspectRatio, options, derivation);
@@ -465,6 +476,15 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     if (syn) quotes.push(syn);
   }
 
+  // Branding-outcome quote injection. When the matching service couldn't
+  // identify a specific product but did pull brand-level reviews, use
+  // those quotes so the testimonial templates still have hero copy.
+  if (ctx.match?.outcome === 'branding' && Array.isArray(ctx.match?.brandReviews?.quotes)) {
+    for (const q of ctx.match.brandReviews.quotes) {
+      if (q?.text) quotes.push({ text: q.text, author_name: q.author || q.source || 'Verified buyer' });
+    }
+  }
+
   const primaryQuote = quotes[0] ? { ...quotes[0] } : null;
   const secondaryQuotes = quotes.slice(1).map(q => ({ ...q }));
 
@@ -543,8 +563,17 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     },
 
     social_proof: {
-      rating_value:    typeof details.rating === 'number' ? details.rating : undefined,
-      review_count:    typeof details.reviewCount === 'number' ? details.reviewCount : undefined,
+      // For 'branding' outcome (no SKU) fall back to brand-level rating /
+      // review_count from Gemini brand-reviews lookup so the proof bar
+      // isn't blank when only brand sentiment is available.
+      rating_value:    typeof details.rating === 'number'
+                          ? details.rating
+                          : (ctx.match?.outcome === 'branding' && typeof ctx.match?.brandReviews?.rating === 'number'
+                              ? ctx.match.brandReviews.rating : undefined),
+      review_count:    typeof details.reviewCount === 'number'
+                          ? details.reviewCount
+                          : (ctx.match?.outcome === 'branding' && typeof ctx.match?.brandReviews?.reviewCount === 'number'
+                              ? ctx.match.brandReviews.reviewCount : undefined),
       trusted_by_text: derivation.trusted_by_text || trustedByFromStats(details) || undefined,
       proof_badges:    limitArray(derivedBadges, 4),
       primary_quote:   primaryQuote || undefined,
@@ -562,7 +591,11 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       metrics: buildPerformanceMetrics(media, match)
     },
 
-    cta: mergeCta(derivation.cta, options.cta, details),
+    cta: mergeCta(derivation.cta, options.cta, details, {
+      outcome:       ctx.match?.outcome,
+      brandCategory: ctx.match?.brandCategory,
+      brandUrl:      ctx.brand?.websiteUrl || ctx.media?.metadata?.brandUrl || null
+    }),
 
     trust: stripEmpty({
       retailer_logos:  buildRetailerLogos(details.sellers),
@@ -933,15 +966,37 @@ function domainFromUrl(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return null; }
 }
 
-function mergeCta(derivedCta, callerCta, details) {
+// CTA assembly is outcome-aware:
+//   - default            → "Shop now" + first SerpAPI seller URL
+//   - 'category'         → "Shop the Collection" + brandCategory.url
+//                          (breadcrumb surfaced as cta.subtext)
+//   - 'branding'         → "Shop the Brand" + brand homepage URL
+//                          (no specific product, send to brand site)
+function mergeCta(derivedCta, callerCta, details, outcomeCtx) {
   const primarySellerUrl = Array.isArray(details.sellers) && details.sellers[0]?.link
     ? details.sellers[0].link
     : null;
+  const outcome  = outcomeCtx?.outcome || null;
+  const brandCat = outcomeCtx?.brandCategory || null;
+  const brandUrl = outcomeCtx?.brandUrl || null;
+
+  let outcomeText = null;
+  let outcomeUrl  = null;
+  let outcomeSubtext = null;
+  if (outcome === 'category' && brandCat?.url) {
+    outcomeText    = 'Shop the Collection';
+    outcomeUrl     = brandCat.url;
+    outcomeSubtext = brandCat.breadcrumb || undefined;
+  } else if (outcome === 'branding' && brandUrl) {
+    outcomeText = 'Shop the Brand';
+    outcomeUrl  = brandUrl;
+  }
+
   return stripEmpty({
-    text:       callerCta?.text       || derivedCta?.text       || 'Shop now',
-    url:        callerCta?.url        || primarySellerUrl       || undefined,
-    subtext:    callerCta?.subtext    || derivedCta?.subtext    || undefined,
-    offer_text: callerCta?.offer_text || derivedCta?.offer_text || undefined
+    text:       callerCta?.text       || outcomeText             || derivedCta?.text       || 'Shop now',
+    url:        callerCta?.url        || outcomeUrl              || primarySellerUrl       || brandUrl       || undefined,
+    subtext:    callerCta?.subtext    || outcomeSubtext          || derivedCta?.subtext    || undefined,
+    offer_text: callerCta?.offer_text || derivedCta?.offer_text  || undefined
   });
 }
 

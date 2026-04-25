@@ -196,22 +196,31 @@ async function runImagePipeline(run, media, buffer) {
   try {
     productMatches = await findProductMatches({
       brand:          media.metadata?.brand,
+      brandUrl:       media.metadata?.brandUrl,
       category:       media.metadata?.category,
       caption:        media.metadata?.caption,
       primarySubject: primarySubjectDesc,
       textDetected:   text.map(t => t.content).filter(Boolean),
-      imageUrl:       sourceUrl
+      imageUrl:       sourceUrl,
+      // YOLO+GPT enriched identifications drive the decision tree
+      // (multi-brand contention, confidence comparison vs Gemini).
+      yoloIdentifications: products
     });
     console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
   const matchDoc = productMatches ? await ProductMatchArtifact.create({
     mediaId: media._id, runId: run._id,
-    query:          productMatches.query,
-    providers:      productMatches.providers,
-    errors:         productMatches.errors,
-    totalMatches:   productMatches.totalMatches,
-    identification: productMatches.identification || null
+    query:            productMatches.query,
+    providers:        productMatches.providers,
+    errors:           productMatches.errors,
+    totalMatches:     productMatches.totalMatches,
+    identification:   productMatches.identification || null,
+    outcome:          productMatches.outcome || null,
+    outcomeReasoning: productMatches.outcomeReasoning || null,
+    winner:           productMatches.winner || null,
+    brandCategory:    productMatches.brandCategory || null,
+    brandReviews:     productMatches.brandReviews || null
   }) : null;
 
   // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
@@ -424,22 +433,29 @@ async function runVideoPipeline(run, media, buffer) {
   try {
     productMatches = await findProductMatches({
       brand:          media.metadata?.brand,
+      brandUrl:       media.metadata?.brandUrl,
       category:       media.metadata?.category,
       caption:        media.metadata?.caption,
       primarySubject: primarySubjectDesc,
       textDetected:   text.map(t => t.content).filter(Boolean),
-      imageUrl:       heroImageUrl
+      imageUrl:       heroImageUrl,
+      yoloIdentifications: products
     });
     console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
   const matchDoc = productMatches ? await ProductMatchArtifact.create({
     mediaId: media._id, runId: run._id,
-    query:          productMatches.query,
-    providers:      productMatches.providers,
-    errors:         productMatches.errors,
-    totalMatches:   productMatches.totalMatches,
-    identification: productMatches.identification || null
+    query:            productMatches.query,
+    providers:        productMatches.providers,
+    errors:           productMatches.errors,
+    totalMatches:     productMatches.totalMatches,
+    identification:   productMatches.identification || null,
+    outcome:          productMatches.outcome || null,
+    outcomeReasoning: productMatches.outcomeReasoning || null,
+    winner:           productMatches.winner || null,
+    brandCategory:    productMatches.brandCategory || null,
+    brandReviews:     productMatches.brandReviews || null
   }) : null;
 
   // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
