@@ -30,6 +30,18 @@ const SOFT_OVERLAP_PCT         = 0.10;   // up to 10% of a soft restriction may 
 const SOFT_OVERLAP_PCT_LOOSE   = 0.25;   // strictness < 0.5 → loosen further
 const MIN_FONT_SCALE           = 0.55;   // never scale text below 55% of base
 const SCRIM_BRIGHTNESS_GAP_K   = 0.85;   // multiplier on |bg-text| → scrim opacity
+// Gemini's overlay-zone restrictions consistently include 8-15% padding
+// around the actual subject silhouette (the prompt asks for tight bounds
+// but visual models err generous). Shrink each restriction inward by N%
+// per side to recover the canvas area that was never really off-limits.
+const RESTRICTION_INSET_PCT    = 0.04;
+// Density-aware legality: a candidate that overlaps a hard restriction
+// is rescued if the densityGrid sample inside the intersection is below
+// this threshold — meaning the overlap falls in an empty pocket of the
+// bbox (sky around the head, water around the legs) rather than on the
+// subject itself. Cells score 0..1; person silhouettes typically land
+// 0.6+, sky/water 0.0-0.15.
+const DENSITY_EMPTY_THRESHOLD  = 0.20;
 
 // ── Placement entry point ────────────────────────────────────────────────
 
@@ -184,11 +196,17 @@ function buildElementSpecs(content) {
 function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content, mode, availableRegions, skippedSpecs }) {
   const threshold = 1 - conservation;
 
+  // Tighten each restriction inward — Gemini's bboxes pad generously
+  // around the actual subject. Don't shrink below a sensible minimum
+  // size (5% canvas dimension) so we don't accidentally annihilate a
+  // small far-away product restriction.
   const restrictions = (analysis?.restrictions || []).map(r => ({
-    rect: r.rectPct, strictness: r.strictness ?? 1
+    rect: shrinkRect(r.rectPct, RESTRICTION_INSET_PCT, 0.05),
+    strictness: r.strictness ?? 1
   }));
   const hardKeepOut = restrictions.filter(r => r.strictness >= HARD_STRICTNESS_FLOOR);
   const softKeepOut = restrictions.filter(r => r.strictness >= threshold && r.strictness < HARD_STRICTNESS_FLOOR);
+  const densityGrid = analysis?.densityGrid || null;
 
   const consumed = [];
   const placed = [];
@@ -202,7 +220,7 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     const hardAllow = el.allowedHardOverlapPct || 0;
     const legal = candidates.filter(c =>
       withinCanvas(c) &&
-      !overlapsAnyHard(c, hardKeepOut, hardAllow) &&
+      !overlapsAnyHard(c, hardKeepOut, hardAllow, densityGrid) &&
       softOverlapWithinLimit(c, softKeepOut, el) &&
       !overlapsAnyConsumed(c, consumed)
     );
@@ -220,7 +238,7 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     } else if (el.required) {
       // Last-resort: ignore SOFT overlap entirely; only avoid HARD + consumed.
       const fallback = candidates.filter(c =>
-        withinCanvas(c) && !overlapsAnyHard(c, hardKeepOut, hardAllow) && !overlapsAnyConsumed(c, consumed)
+        withinCanvas(c) && !overlapsAnyHard(c, hardKeepOut, hardAllow, densityGrid) && !overlapsAnyConsumed(c, consumed)
       );
       if (fallback.length) {
         pick = fallback.reduce((best, c) => {
@@ -557,14 +575,40 @@ function rectIntersectionArea(a, b) {
   const h = Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1);
   return w * h;
 }
-function overlapsAnyHard(cand, hardKeepOut, allowedHardOverlapPct = 0) {
+function overlapsAnyHard(cand, hardKeepOut, allowedHardOverlapPct = 0, densityGrid = null) {
+  // Density-aware path: if we have a densityGrid, weight each
+  // intersection by the average busyness of the cells it covers — an
+  // intersection through low-density cells (sky around the head, water
+  // around the legs) is in an empty pocket of the bbox and shouldn't
+  // count as real overlap with the subject. Allows headlines/CTAs into
+  // the negative space inside a person-shaped restriction.
+  if (densityGrid) {
+    const candArea = rectArea(cand) || 1;
+    let effectiveOverlapTotal = 0;
+    for (const k of hardKeepOut) {
+      if (!rectsIntersect(cand, k.rect)) continue;
+      const inter = {
+        x1: Math.max(cand.x1, k.rect.x1),
+        y1: Math.max(cand.y1, k.rect.y1),
+        x2: Math.min(cand.x2, k.rect.x2),
+        y2: Math.min(cand.y2, k.rect.y2)
+      };
+      const interArea = rectArea(inter);
+      if (interArea <= 0) continue;
+      const density = sampleAvg(densityGrid, inter);
+      // Below the empty threshold the intersection is visually background
+      // and counts as zero. Above it, scale the area by density so a half-
+      // dense overlap costs half as much as a fully-dense one. Cap at 1.
+      const weight = density < DENSITY_EMPTY_THRESHOLD ? 0 : Math.min(1, density);
+      effectiveOverlapTotal += interArea * weight;
+    }
+    return (effectiveOverlapTotal / candArea) > allowedHardOverlapPct;
+  }
+
+  // No densityGrid: legacy strict check, with the per-element allowance.
   if (allowedHardOverlapPct <= 0) {
     return hardKeepOut.some(k => rectsIntersect(cand, k.rect));
   }
-  // Per-element allowance: rect may overlap hard keep-outs up to N% of
-  // the candidate's own area (not the keep-out's). Used for elements
-  // like testimonial quotes that look natural sitting partially on the
-  // subject — the overlap "links" the two visually.
   const candArea = rectArea(cand) || 1;
   for (const k of hardKeepOut) {
     if (!rectsIntersect(cand, k.rect)) continue;
@@ -572,6 +616,25 @@ function overlapsAnyHard(cand, hardKeepOut, allowedHardOverlapPct = 0) {
     if ((overlap / candArea) > allowedHardOverlapPct) return true;
   }
   return false;
+}
+
+// Shrink a rect inward by `inset` (fraction of canvas) on each side
+// while preserving a minimum dimension. Used to tighten Gemini's
+// generously-padded restriction bboxes back toward the actual subject.
+function shrinkRect(rect, inset, minDim = 0.05) {
+  if (!rect || inset <= 0) return rect;
+  const w = rect.x2 - rect.x1;
+  const h = rect.y2 - rect.y1;
+  // Don't shrink past minDim — keeps small/distant subject boxes from
+  // collapsing to a point.
+  const ix = Math.min(inset, Math.max(0, (w - minDim) / 2));
+  const iy = Math.min(inset, Math.max(0, (h - minDim) / 2));
+  return {
+    x1: rect.x1 + ix,
+    y1: rect.y1 + iy,
+    x2: rect.x2 - ix,
+    y2: rect.y2 - iy
+  };
 }
 function overlapsAnyConsumed(cand, consumed) {
   return consumed.some(c => rectIntersectionArea(cand, c) > 0.0005);
