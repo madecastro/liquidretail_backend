@@ -2,6 +2,63 @@ const express = require('express');
 const router = express.Router();
 const Media = require('../models/Media');
 
+// GET /api/media
+// Paginated list of media — most recent first. Supports `?ready=true` to
+// filter to media with at least the detection artifact attached (the
+// minimum needed for the layout-input service to assemble a creative
+// preview). Optional `?limit=N` (default 24, capped at 100) and
+// `?offset=N` for pagination.
+//
+// Each row carries enough for a thumbnail picker: id, fileUrl,
+// fileType, fileName, source, brand (from metadata.brand), createdAt,
+// rightsApproved, and a `ready` flag indicating whether layout-input
+// will succeed for this media.
+router.get('/', async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit, 10) || 24, 100);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const onlyReady = req.query.ready === 'true';
+
+    const filter = onlyReady
+      ? { 'latestArtifacts.detection': { $ne: null } }
+      : {};
+
+    const [docs, total] = await Promise.all([
+      Media.find(filter)
+        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt')
+        .sort({ createdAt: -1 })
+        .skip(offset)
+        .limit(limit)
+        .lean(),
+      Media.countDocuments(filter)
+    ]);
+
+    const media = docs.map(d => ({
+      mediaId:        d._id,
+      source:         d.source,
+      externalId:     d.externalId,
+      fileType:       d.fileType,
+      fileUrl:        d.fileUrl,
+      fileName:       d.fileName,
+      brand:          d.metadata?.brand || null,
+      caption:        d.metadata?.caption || null,
+      rightsApproved: !!d.rights?.approved,
+      ready:          !!d.latestArtifacts?.detection,
+      createdAt:      d.createdAt
+    }));
+
+    res.json({
+      media,
+      total,
+      limit,
+      offset,
+      hasMore: offset + media.length < total
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Media list failed' });
+  }
+});
+
 // PATCH /api/media/:mediaId/rights
 // Body: { approved: boolean, approvedBy?: string, notes?: string }
 // Toggles the creator-rights flag used by the layout generator to decide
