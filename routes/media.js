@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Media = require('../models/Media');
+const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 
 // GET /api/media
 // Paginated list of media — most recent first. Supports `?ready=true` to
@@ -56,6 +57,25 @@ router.get('/', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Media list failed' });
+  }
+});
+
+// GET /api/media/:mediaId/match
+// Returns the latest ProductMatchArtifact for the given media — used by
+// the Matching tab on the ad-generation preview to surface decision-tree
+// outcome, per-provider evidence, brand-category fallback, and brand
+// reviews. 404 if the detect run hasn't reached product-match yet.
+router.get('/:mediaId/match', async (req, res) => {
+  try {
+    const media = await Media.findById(req.params.mediaId).select('latestArtifacts').lean();
+    if (!media) return res.status(404).json({ error: 'Media not found' });
+    const matchId = media.latestArtifacts?.match;
+    if (!matchId) return res.status(404).json({ error: 'No match artifact for this media yet' });
+    const match = await ProductMatchArtifact.findById(matchId).lean();
+    if (!match) return res.status(404).json({ error: 'Match artifact missing from collection' });
+    res.json({ match });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Match lookup failed' });
   }
 });
 
