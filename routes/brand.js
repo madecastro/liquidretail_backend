@@ -227,7 +227,12 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
 
 function serializeBrand(b) {
   return {
+    // Both id and _id are returned for frontend compat — GET /api/brand/:id
+    // uses .lean() and returns the doc with _id; this serialized response
+    // gets used after PATCH and the brand page does fetches keyed on
+    // either form.
     id:           String(b._id),
+    _id:          String(b._id),
     name:         b.name,
     slug:         b.nameNormalized,
     tagline:      b.tagline || null,
