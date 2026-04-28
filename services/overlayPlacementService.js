@@ -85,12 +85,14 @@ function buildElementSpecs(content) {
       id: 'logo', kind: 'logo', priority: 1, required: true,
       slot: 'brand.logo', region: 'top-left',
       contentLength: 0,
+      // Logo must always render at a recognizable size and always at
+      // the top — both are non-negotiable. minW 0.14 / minH 0.06 is
+      // the floor (matches the visible Pelagic logo proportions in
+      // the calibration screenshot). Square mark-only variant removed
+      // since it'd never satisfy the new floor anyway.
+      pinTop: true,
       shapes: [
-        // Preferred: wordmark-shaped horizontal rect.
-        { variant: 'horizontal', sizePct: { w: 0.14, h: 0.06 }, sizeBounds: { minW: 0.08, maxW: 0.20, minH: 0.04, maxH: 0.07 }, maxLines: 1, layout: 'inline', preferBonus: 0.6 },
-        // Mark-only square — compresses the logo into tight corners if the
-        // wordmark's row is obstructed by a subject keep-out.
-        { variant: 'square',     sizePct: { w: 0.08, h: 0.08 }, sizeBounds: { minW: 0.06, maxW: 0.11, minH: 0.06, maxH: 0.11 }, maxLines: 1, layout: 'inline', preferBonus: -0.2 }
+        { variant: 'horizontal', sizePct: { w: 0.14, h: 0.06 }, sizeBounds: { minW: 0.14, maxW: 0.22, minH: 0.06, maxH: 0.09 }, maxLines: 1, layout: 'inline', preferBonus: 0.6 }
       ],
       _hasSource: !!content?.brand?.logo,
       _missingPath: 'brand.logo'
@@ -499,7 +501,19 @@ function candidatesForShape(el, shape, availableRegions) {
   // floor (0.04 of canvas) won't fit; otherwise clamp to the band.
   const ABS_FLOOR = 0.04;
   if (availableRegions && availableRegions.length) {
-    for (const band of availableRegions) {
+    // pinTop: restrict to bands whose vertical center is in the top
+    // half of the canvas. Used by the logo so it never lands at the
+    // bottom band on a portrait inset. Landscape insets (left/right
+    // side-bands) span full height — both pass the filter, so for
+    // landscape the constraint is effectively moot. If filtering would
+    // empty the list (no top-half bands), fall back to all bands so
+    // we don't drop the element entirely.
+    let bands = availableRegions;
+    if (el.pinTop) {
+      const top = availableRegions.filter(b => ((b.y1 + b.y2) / 2) < 0.5);
+      if (top.length) bands = top;
+    }
+    for (const band of bands) {
       const bh = band.y2 - band.y1;
       const bw = band.x2 - band.x1;
       if (bw < ABS_FLOOR || bh < ABS_FLOOR) continue;
