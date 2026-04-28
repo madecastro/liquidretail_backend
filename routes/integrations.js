@@ -29,6 +29,7 @@ const geminiSearch = require('../services/providers/geminiSearchProvider');
 const { verifySignature, processWebhookPayload } = require('../services/instagramWebhookService');
 const metaAds = require('../services/metaAdsOAuthService');
 const googleAds = require('../services/googleAdsOAuthService');
+const { syncCampaigns, getCampaignStatus } = require('../services/campaignSyncService');
 
 const FRONTEND_URL = 'https://liquidretail.netlify.app';
 
@@ -1150,6 +1151,60 @@ router.patch('/google-ads/:credentialId/selection', express.json(), async (req, 
     res.status(500).json({ error: err.message || 'selection update failed' });
   }
 });
+
+// ── Campaign sync routes (Phase B-4) ──────────────────────────────────
+// One pair per platform. /campaign-status is the cheap read used by
+// the brand-page card to show count + last-synced. /sync-campaigns
+// dispatches into campaignSyncService which orchestrates per-platform
+// adapters and returns aggregated counts.
+
+function makeCampaignStatusHandler(platform) {
+  return async (req, res) => {
+    try {
+      const brandId = req.headers['x-brand-id'];
+      if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+      // Tenant guard via the credential.
+      const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+        brandId, type: platform
+      })).select('_id').lean();
+      if (!cred) return res.json({ connected: false, count: 0, lastSyncedAt: null });
+      const status = await getCampaignStatus(brandId, platform);
+      res.json(status);
+    } catch (err) {
+      res.status(500).json({ error: err.message || 'campaign status failed' });
+    }
+  };
+}
+
+function makeCampaignSyncHandler(platform) {
+  return async (req, res) => {
+    try {
+      const brandId = req.headers['x-brand-id'];
+      if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+      const credentialId = req.query.credentialId || null;
+      const credFilter = credentialId
+        ? { _id: credentialId, brandId, type: platform, status: 'active' }
+        : { brandId, type: platform, status: 'active' };
+      const cred = await IntegrationCredential.findOne(tenantFilter(req, credFilter)).select('_id').lean();
+      if (!cred) return res.status(404).json({ error: `no active ${platform} credential for this brand` });
+      const result = await syncCampaigns({
+        brandId,
+        platform,
+        ...(credentialId ? { credentialId } : {})
+      });
+      if (!result.ok) return res.status(400).json(result);
+      res.json(result);
+    } catch (err) {
+      console.error(`${platform} sync-campaigns failed:`, err);
+      res.status(500).json({ error: err.message || 'campaign sync failed' });
+    }
+  };
+}
+
+router.get('/meta-ads/campaign-status',  makeCampaignStatusHandler('meta-ads'));
+router.post('/meta-ads/sync-campaigns',  makeCampaignSyncHandler('meta-ads'));
+router.get('/google-ads/campaign-status', makeCampaignStatusHandler('google-ads'));
+router.post('/google-ads/sync-campaigns', makeCampaignSyncHandler('google-ads'));
 
 router.delete('/google-ads/:credentialId', async (req, res) => {
   try {
