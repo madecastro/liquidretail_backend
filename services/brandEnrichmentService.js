@@ -495,11 +495,14 @@ function isValidFontName(s) {
   if (!s || typeof s !== 'string') return false;
   const v = s.trim();
   if (!v) return false;
-  if (/^var\s*\(/i.test(v))    return false;  // CSS var()
-  if (v.includes('--'))         return false; // CSS custom property fragment
-  if (/[(){}<>;]/.test(v))      return false; // any structural CSS chars
-  if (/[\n\r\t]/.test(v))       return false; // page-scrape garbage (e.g. "Foo\nMenu")
-  if (v.length > 60)            return false; // real family names are short
+  if (v.length > 60) return false;            // real family names are short
+  // Google Fonts family names are letters + spaces, optionally with a
+  // numeric suffix like "Source Sans 3". Anything else — CSS var()s,
+  // page-scrape garbage with newlines, or foundry names with weight
+  // suffixes like "NHaasGroteskDSPro-55Rg" (Adobe Typekit) — would
+  // never load from fonts.googleapis.com so we reject it and let the
+  // chain fall through to GPT-suggested or tone-default.
+  if (!/^[A-Za-z][A-Za-z0-9 ]*$/.test(v)) return false;
   return true;
 }
 
