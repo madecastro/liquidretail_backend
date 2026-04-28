@@ -14,11 +14,14 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 
 const IntegrationCredential = require('../models/IntegrationCredential');
+const CatalogProduct = require('../models/CatalogProduct');
+const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const { tenantFilter } = require('../middleware/tenantHelpers');
 const { encrypt } = require('../services/integrationCryptoService');
 const ig = require('../services/instagramOAuthService');
 const { syncCatalog, getCatalogStatus } = require('../services/catalogSyncService');
 const { syncPosts, getPostsStatus } = require('../services/postSyncService');
+const geminiSearch = require('../services/providers/geminiSearchProvider');
 
 const FRONTEND_URL = 'https://liquidretail.netlify.app';
 
@@ -197,6 +200,148 @@ router.post('/instagram/sync-catalog', async (req, res) => {
     res.status(500).json({ error: err.message || 'catalog sync failed' });
   }
 });
+
+// ── Catalog browser (V2 #1) ──────────────────────────────────────────
+// GET /api/integrations/instagram/catalog
+//   ?limit=24 &offset=0
+//   &category=<substring> &hasReviews=1 &inStock=1
+//   &q=<title-substring>
+// Returns paginated CatalogProduct rows for the active brand, with
+// per-row match-traffic counts and a list of distinct categories for
+// the filter dropdown.
+router.get('/instagram/catalog', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+
+    // Tenant guard via the credential lookup — confirms the brand
+    // belongs to the active advertiser before returning catalog rows.
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      brandId, type: 'instagram'
+    })).select('_id').lean();
+    if (!cred) return res.status(404).json({ error: 'no Instagram integration for this brand' });
+
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10)  || 24, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const filter = { brandId, source: 'ig-catalog' };
+    if (req.query.category) {
+      filter.category = new RegExp(escapeRegex(String(req.query.category)), 'i');
+    }
+    if (req.query.q) {
+      const re = new RegExp(escapeRegex(String(req.query.q)), 'i');
+      filter.$or = [{ title: re }, { description: re }];
+    }
+    if (req.query.inStock === '1') {
+      filter.availability = /in stock/i;
+    }
+    if (req.query.hasReviews === '1') {
+      filter['productReviews.quotes.0'] = { $exists: true };
+    }
+
+    const [rows, total, distinctCategories] = await Promise.all([
+      CatalogProduct.find(filter)
+        .select('externalId title description category brand price currency availability imageUrl productUrl productReviews lastSyncedAt')
+        .sort({ lastSyncedAt: -1 })
+        .skip(offset)
+        .limit(limit)
+        .lean(),
+      CatalogProduct.countDocuments(filter),
+      // Categories list — small enough to compute every call on most
+      // catalogs (< 200 distinct values typical).
+      CatalogProduct.distinct('category', { brandId, source: 'ig-catalog' })
+    ]);
+
+    // Match-traffic count: how many ProductMatchArtifacts reference each
+    // catalog row in the current page. One aggregation pulls all counts.
+    const ids = rows.map(r => r._id);
+    const matchCounts = ids.length ? await ProductMatchArtifact.aggregate([
+      { $match: { catalogProductId: { $in: ids } } },
+      { $group: { _id: '$catalogProductId', count: { $sum: 1 } } }
+    ]) : [];
+    const matchCountMap = new Map(matchCounts.map(c => [String(c._id), c.count]));
+
+    const products = rows.map(r => ({
+      id:           String(r._id),
+      externalId:   r.externalId,
+      title:        r.title,
+      description:  r.description || null,
+      category:     r.category || null,
+      brand:        r.brand || null,
+      price:        r.price ?? null,
+      currency:     r.currency || null,
+      availability: r.availability || null,
+      imageUrl:     r.imageUrl || null,
+      productUrl:   r.productUrl || null,
+      hasReviews:   !!(r.productReviews?.quotes?.length),
+      reviewsRating: r.productReviews?.rating ?? null,
+      reviewsCount:  r.productReviews?.reviewCount ?? null,
+      reviewsFetchedAt: r.productReviews?.fetchedAt || null,
+      matchCount:   matchCountMap.get(String(r._id)) || 0,
+      lastSyncedAt: r.lastSyncedAt || null
+    }));
+
+    res.json({
+      products,
+      total,
+      offset,
+      limit,
+      hasMore:    offset + products.length < total,
+      categories: distinctCategories.filter(Boolean).sort()
+    });
+  } catch (err) {
+    console.error('catalog browse failed:', err);
+    res.status(500).json({ error: err.message || 'catalog browse failed' });
+  }
+});
+
+// POST /api/integrations/instagram/catalog/:productId/refresh-reviews
+// Forces a fresh productReviews lookup synchronously and writes the
+// result back to the CatalogProduct row. Foreground (~10-15s) so the
+// UI can show the new quotes immediately on response.
+router.post('/instagram/catalog/:productId/refresh-reviews', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+
+    // Tenant guard — confirm the catalog row belongs to a brand
+    // owned by this advertiser.
+    const product = await CatalogProduct.findOne({
+      _id: req.params.productId, brandId, source: 'ig-catalog'
+    });
+    if (!product) return res.status(404).json({ error: 'catalog product not found' });
+
+    // Need the parent Brand for the brand-name parameter that goes
+    // into the search query.
+    const Brand = require('../models/Brand');
+    const brand = await Brand.findOne(tenantFilter(req, { _id: brandId })).select('name').lean();
+
+    const fresh = await geminiSearch.lookupProductReviews({
+      productName: product.title,
+      brandName:   brand?.name,
+      productUrl:  product.productUrl
+    });
+    if (!fresh) {
+      return res.status(502).json({ error: 'review lookup returned no result' });
+    }
+
+    const reviews = Object.assign({}, fresh, { fetchedAt: new Date() });
+    product.productReviews = reviews;
+    await product.save();
+
+    res.json({
+      ok: true,
+      productReviews: reviews
+    });
+  } catch (err) {
+    console.error('product reviews refresh failed:', err);
+    res.status(500).json({ error: err.message || 'product reviews refresh failed' });
+  }
+});
+
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 // ── Posts status ─────────────────────────────────────────────────────
 router.get('/instagram/posts-status', async (req, res) => {
