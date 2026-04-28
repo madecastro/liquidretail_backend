@@ -512,6 +512,47 @@ router.patch('/instagram/sync-settings', express.json(), async (req, res) => {
   }
 });
 
+// ── Comment-reply settings (V3 #3) ───────────────────────────────────
+router.get('/instagram/comment-reply', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const brand = await Brand.findOne(tenantFilter(req, { _id: brandId })).select('commentReply').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    res.json({
+      commentReply: brand.commentReply || {
+        enabled: false, template: 'Shop this look: {productUrl}', dailyCap: 25
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'comment-reply fetch failed' });
+  }
+});
+
+router.patch('/instagram/comment-reply', express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const brand = await Brand.findOne(tenantFilter(req, { _id: brandId }));
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const body = req.body || {};
+    const cr = brand.commentReply || {};
+    if (typeof body.enabled === 'boolean') cr.enabled = body.enabled;
+    if (typeof body.template === 'string') {
+      const t = body.template.trim();
+      if (t.length > 280) return res.status(400).json({ error: 'template must be ≤ 280 chars' });
+      cr.template = t;
+    }
+    if (Number.isFinite(body.dailyCap)) cr.dailyCap = Math.max(0, Math.min(500, Number(body.dailyCap)));
+    brand.commentReply = cr;
+    await brand.save();
+    res.json({ commentReply: brand.commentReply });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'comment-reply update failed' });
+  }
+});
+
 // ── Disconnect ───────────────────────────────────────────────────────
 // DELETE /instagram — revokes ALL active IG credentials for the brand.
 // DELETE /instagram/:credentialId — revokes one specific credential

@@ -130,6 +130,16 @@ const brandSchema = new mongoose.Schema({
     postsCadenceHours:    { type: Number,  default: 1 }
   },
 
+  // V3 #3 — auto-reply with a comment on IG-sourced posts when detect
+  // produces a confident product_match. Per-brand opt-in. Template
+  // supports {productUrl}, {productName}, {brandName} placeholders.
+  // dailyCap caps replies per UTC day to avoid hammering at-scale.
+  commentReply: {
+    enabled:   { type: Boolean, default: false },
+    template:  { type: String,  default: 'Shop this look: {productUrl}' },
+    dailyCap:  { type: Number,  default: 25 }
+  },
+
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });

@@ -28,7 +28,11 @@ const SCOPES = [
   'pages_show_list',
   'pages_read_engagement',
   'business_management',
-  'catalog_management'
+  'catalog_management',
+  // V3 #3 — required for posting reply comments on the brand's IG
+  // posts. Brands that connected before this scope was added must
+  // reconnect to enable the comment-reply feature.
+  'instagram_manage_comments'
 ];
 
 function getConfig() {

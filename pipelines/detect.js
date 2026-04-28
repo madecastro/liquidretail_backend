@@ -24,6 +24,7 @@ const { extractEntities } = require('../services/nerService');
 const { findProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
+const { maybePostMatchReply } = require('../services/instagramCommentService');
 // Brand catalog mutations no longer happen inside the detect pipeline
 // — Brand creation + enrichment is a user-driven concern triggered by
 // POST /api/brand (or PATCH /api/brand/:id). Detect can still
@@ -238,6 +239,16 @@ async function runImagePipeline(run, media, buffer) {
     } : null,
     productReviews:   productMatches.productReviews || null
   }) : null;
+
+  // V3 #3 — auto-comment on the original IG post when this Media came
+  // from Instagram and produced a confident product_match with a
+  // productUrl. Fire-and-forget; the service guards on brand opt-in,
+  // daily cap, and idempotency. Errors are swallowed so detect never
+  // fails because of an opportunistic comment.
+  if (productMatches && media.source === 'instagram') {
+    maybePostMatchReply({ media, productMatch: productMatches })
+      .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
+  }
 
   // (Brand-catalog upsert removed — brands are now created intentionally
   // via the picker / members UI, not auto-stubbed from media uploads.
@@ -477,6 +488,16 @@ async function runVideoPipeline(run, media, buffer) {
     } : null,
     productReviews:   productMatches.productReviews || null
   }) : null;
+
+  // V3 #3 — auto-comment on the original IG post when this Media came
+  // from Instagram and produced a confident product_match with a
+  // productUrl. Fire-and-forget; the service guards on brand opt-in,
+  // daily cap, and idempotency. Errors are swallowed so detect never
+  // fails because of an opportunistic comment.
+  if (productMatches && media.source === 'instagram') {
+    maybePostMatchReply({ media, productMatch: productMatches })
+      .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
+  }
 
   // (Brand-catalog upsert removed — brands are now created intentionally
   // via the picker / members UI, not auto-stubbed from media uploads.
