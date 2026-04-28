@@ -117,6 +117,20 @@ router.post('/', express.json(), async (req, res) => {
   }
 });
 
+// GET /api/brand/:id
+// Full Brand catalog doc by ObjectId, scoped to the current
+// Advertiser. Used by the Brand details page (brand.html) to
+// hydrate the edit form.
+router.get('/:id', async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    res.json({ brand });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'brand fetch failed' });
+  }
+});
+
 // PATCH /api/brand/:id
 // Partial update for editable brand fields. Curated-aware — any
 // field set explicitly here is added to brand.curatedFields so
