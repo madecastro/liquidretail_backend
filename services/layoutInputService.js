@@ -85,7 +85,11 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // and surfaces brandCategory (OpenAI category enrichment) on every
 // product outcome — cta.subtext carries the breadcrumb so the
 // collection is always one click away even when the SKU resolves.
-const INPUT_SCHEMA_VERSION = '2.7';
+// 2.8 surfaces a video URL on placement.backgroundMedia.video for
+// overlay-mode templates when the source Media is a video — the
+// preview / renderer uses the video as the hero asset with the
+// still image as the pre-autoplay poster.
+const INPUT_SCHEMA_VERSION = '2.8';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -817,7 +821,7 @@ function pickOverlayBackground(ctx, aspectRatio) {
   const preferKey = baseRatios.includes(aspectRatio) ? 'base' : 'gemini_extension';
 
   // Handle both possible artifact shapes:
-  //   v3 array: [{ provider, variant, candidateId, imageUrl, analysis }]
+  //   v3 array: [{ provider, variant, candidateId, imageUrl, videoUrl?, analysis }]
   //   legacy keyed: { '<variantKey>': { ... } }
   let entry = null;
   if (Array.isArray(overlay)) {
@@ -832,6 +836,21 @@ function pickOverlayBackground(ctx, aspectRatio) {
 
   out.image = entry.imageUrl || null;
   out.analysis = entry.analysis || null;
+
+  // When the source Media is a video, surface a video URL alongside
+  // the image so the preview / renderer can use the video as the
+  // hero asset (with the still image as the pre-autoplay poster).
+  // Preference order:
+  //   1. entry.videoUrl — if the artifact carries a per-variant video crop
+  //   2. ctx.media.fileUrl — the original uploaded video, full clip,
+  //      letterboxed/cropped via object-fit at render time
+  // Extended ratios (9:16 / 1.91:1 / 16:9 from base 4:5 / 5:4) generally
+  // don't have a true per-ratio video — Gemini extension is image-only
+  // — so we fall back to the source video and accept a less-perfect
+  // crop. Better than a static image when the source IS a video.
+  if (ctx.media?.fileType === 'video') {
+    out.video = entry.videoUrl || ctx.media.fileUrl || null;
+  }
   return out;
 }
 
