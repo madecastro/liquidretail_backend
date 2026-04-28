@@ -32,21 +32,26 @@
 const geminiSearch = require('./providers/geminiSearchProvider');
 const googleLens   = require('./providers/googleLensProvider');
 const { identifyProduct } = require('./productReasoner');
-const productDetails = require('./productDetailsService');
+const productDetails  = require('./productDetailsService');
+const productCategory = require('./productCategoryService');
 
 const PROVIDERS = [
   geminiSearch,
   googleLens
 ];
 
-const CONFIDENCE_FLOOR = 0.80;   // below this, fall back to brand-category
-// YOLO+GPT is the authoritative "is there a product?" oracle. Gemini
-// grounded search will return matches for ANY query (it's a web search
-// tool, not a product detector), so we cannot trust Gemini's matches as
-// evidence that a product exists. PRODUCT_FLOOR is the minimum YOLO+GPT
-// confidence required to consider that a real product was detected.
-// Below this, we fall through to 'branding' regardless of Gemini.
-const PRODUCT_FLOOR = 0.50;
+// ── Decision-tree thresholds ─────────────────────────────────────────
+// PRODUCT_FLOOR — YOLO+GPT below this is treated as "no product detected".
+//                 YOLO+GPT is the authoritative product oracle (Gemini
+//                 search returns matches for ANY query). Below 0.7 → no
+//                 product, regardless of Gemini.
+// HIGH_CONFIDENCE — single-source confidence to call a product_match.
+// CATEGORY_BAND  — when at least one signal lands in (LOW, HIGH) range
+//                 we fall back to product_category.
+const PRODUCT_FLOOR    = 0.70;
+const HIGH_CONFIDENCE  = 0.85;
+const CATEGORY_LOWER   = 0.69;   // > 0.69 (i.e. ≥ 0.70 effectively)
+const CATEGORY_UPPER   = 0.84;   // ≤ 0.84
 
 async function findProductMatches({
   brand, category, caption, primarySubject, textDetected, imageUrl,
@@ -101,13 +106,35 @@ async function findProductMatches({
     geminiIdentification: identification,
     brand, brandUrl, category
   });
-  const { outcome, outcomeReasoning, brandCategory, brandReviews, winner } = decision;
+  const { outcome, outcomeReasoning, winner } = decision;
+  let { brandCategory, brandReviews } = decision;
 
-  // ── Enrichment: only fetch SKU details when we actually have a product ──
-  // ('confirmed', 'lookup_from_yolo', 'lookup_from_gemini' all imply a real
-  // product. 'category', 'branding', 'do_not_use' don't have a SKU to enrich.)
-  const productOutcomes = new Set(['confirmed', 'lookup_from_yolo', 'lookup_from_gemini']);
-  if (productOutcomes.has(outcome) && identification?.productName && identification.certainty >= 0.3) {
+  // ── Post-decision enrichment per outcome ──────────────────────────
+  // Pick the best YOLO product up here so winner='yolo' enrichment can
+  // use it without re-running the filter.
+  const yoloProductIds = (yoloIdentifications || [])
+    .map(d => d?.identification)
+    .filter(id => id && (id.confidence || 0) >= PRODUCT_FLOOR
+                 && typeof id.label === 'string' && id.label.trim().length > 0)
+    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  const yoloTop = yoloProductIds[0] || null;
+
+  // YOLO-winner: override identification.productName/brand with YOLO's
+  // label so downstream consumers see the YOLO-identified product.
+  // identification.details (URL/price/etc.) stays from Gemini's first
+  // pass — best-effort enrichment for v1; future work can do a targeted
+  // Gemini lookup keyed on YOLO's label for higher fidelity.
+  if (outcome === 'product_match' && winner === 'yolo' && yoloTop) {
+    if (!identification) identification = {};
+    identification.productName = yoloTop.label;
+    if (yoloTop.brand) identification.brand = yoloTop.brand;
+    identification.certainty = yoloTop.confidence;
+    identification.certaintyLabel = 'yolo-winner';
+    console.log(`   · YOLO winner override: identification.productName → "${yoloTop.label}"`);
+  }
+
+  // SKU details — only fetch when we have a confident product to look up.
+  if (outcome === 'product_match' && identification?.productName && (identification.certainty || 0) >= 0.3) {
     if (productDetails.isEnabled()) {
       try {
         identification.details = await productDetails.fetchProductDetails(identification);
@@ -120,7 +147,40 @@ async function findProductMatches({
     }
   }
 
-  console.log(`🎯 Match outcome: ${outcome} — ${outcomeReasoning}`);
+  // OpenAI brand-collection enrichment — runs for EVERY identified
+  // product (product_match) AND for product_category (where it's the
+  // primary signal). Every identified product should know which brand
+  // collection it belongs to.
+  if (outcome === 'product_match' || outcome === 'product_category') {
+    const productLabel = identification?.productName
+                       || yoloTop?.label
+                       || category;
+    const productDescription = yoloTop?.description || null;
+    const productCategoryHint = yoloTop?.category || category;
+    if (productLabel && productCategory.isEnabled()) {
+      try {
+        brandCategory = await productCategory.enrichProductCategory({
+          brandName: brand,
+          brandUrl,
+          productLabel,
+          productCategory: productCategoryHint,
+          productDescription
+        });
+      } catch (err) {
+        console.warn(`   ✗ productCategory: ${err.message}`);
+        errors.productCategory = err.message;
+      }
+    } else if (!productCategory.isEnabled()) {
+      skipped.push('product-category (OPENAI_API_KEY not set)');
+    }
+  }
+
+  // Brand reviews — only for brand_match outcomes.
+  if (outcome === 'brand_match') {
+    brandReviews = await tryLookupBrandReviews(brand, brandUrl);
+  }
+
+  console.log(`🎯 Match outcome: ${outcome}${winner ? ` (winner=${winner})` : ''} — ${outcomeReasoning}`);
 
   return {
     query: { brand, brandUrl, category, caption, primarySubject, textDetected },
@@ -141,6 +201,27 @@ async function findProductMatches({
 }
 
 // ── Decision tree ────────────────────────────────────────────────────
+//
+// Outcomes:
+//   product_match    — confident specific-product identification.
+//                       winner ∈ { 'agree', 'yolo', 'gemini' }
+//   product_category — no high-confidence SKU but enough mid-range
+//                       signal to land on the brand's collection page.
+//                       winner = whichever side had higher conf.
+//   brand_match      — no trustworthy product signal; brand-only ad.
+//                       winner = null. Brand reviews fetched separately.
+//   do_not_use       — multi-brand contention; cannot generate creative.
+//
+// Threshold table (yC = YOLO+GPT product conf if ≥ PRODUCT_FLOOR else 0;
+//                  gC = Gemini reasoner certainty):
+//
+//   1. multi-brand (≥2 brands in YOLO at conf ≥ 0.7) → do_not_use
+//   2. yC > 0 AND gC > 0 AND same product               → product_match (agree)
+//   3. yC == 0 AND gC ≥ 0.85                            → product_match (gemini)
+//   4. yC ≥ 0.85 AND yC > gC                            → product_match (yolo)
+//   5. gC ≥ 0.85 AND gC > yC                            → product_match (gemini)
+//   6. yC > 0 AND max(yC, gC) ∈ (0.69, 0.84]           → product_category
+//   7. (catch-all)                                       → brand_match
 async function runDecisionTree({
   yoloIdentifications,
   geminiIdentification,
@@ -148,14 +229,11 @@ async function runDecisionTree({
   brandUrl,
   category
 }) {
-  // Filter YOLO identifications to those with a meaningful confidence
-  // — sub-threshold rogue tags shouldn't trigger multi-brand contention.
   const yoloIds = (yoloIdentifications || [])
     .map(d => d?.identification)
     .filter(id => id && typeof id.confidence === 'number');
 
-  // 1. Multi-brand contention. (Earliest check — wholly different
-  // failure mode than the rest of the tree.)
+  // 1. Multi-brand contention.
   const distinctBrands = new Set(
     yoloIds
       .filter(id => id.confidence >= 0.7 && id.brand)
@@ -163,96 +241,65 @@ async function runDecisionTree({
       .filter(Boolean)
   );
   if (distinctBrands.size >= 2) {
-    return {
-      outcome: 'do_not_use',
-      outcomeReasoning: `multiple brands detected on the same Media (${[...distinctBrands].join(', ')}); creative would be ambiguous`,
-      winner: null,
-      brandCategory: null,
-      brandReviews: null
-    };
+    return baseOutcome('do_not_use', null,
+      `multiple brands detected on the same Media (${[...distinctBrands].join(', ')}); creative would be ambiguous`);
   }
 
-  // 2. YOLO+GPT product detection — authoritative.
-  // Gemini grounded search ALWAYS returns something (it's a search
-  // tool, not a product detector), so we cannot use Gemini as evidence
-  // that a product exists. We trust YOLO+GPT: if no detection has
-  // confidence >= PRODUCT_FLOOR with a meaningful label, there is no
-  // product, period. Outcome is 'branding' and we don't bother
-  // comparing against Gemini's matches.
+  // YOLO product candidates — must clear floor AND have a label.
   const yoloProductIds = yoloIds
     .filter(id => (id.confidence || 0) >= PRODUCT_FLOOR
                  && typeof id.label === 'string'
                  && id.label.trim().length > 0)
     .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
-
-  if (yoloProductIds.length === 0) {
-    const topYoloConf = yoloIds.length
-      ? Math.max(...yoloIds.map(id => id.confidence || 0))
-      : 0;
-    const brandReviews = await tryLookupBrandReviews(brand, brandUrl);
-    return {
-      outcome: 'branding',
-      outcomeReasoning: yoloIds.length
-        ? `YOLO+GPT did not detect a product above ${(PRODUCT_FLOOR*100).toFixed(0)}% confidence (best was ${(topYoloConf*100).toFixed(0)}%); Gemini matches ignored — treating as brand content`
-        : 'YOLO+GPT returned no detections; treating as brand content',
-      winner: null,
-      brandCategory: null,
-      brandReviews
-    };
-  }
-
-  // 3+. YOLO confirmed a product exists; now compare against Gemini.
-  const yoloTop    = yoloProductIds[0];
-  const yoloConf   = yoloTop.confidence || 0;
+  const yoloTop = yoloProductIds[0] || null;
+  const yC      = yoloTop?.confidence || 0;
   const geminiTop  = geminiIdentification || null;
-  const geminiConf = geminiTop?.certainty || 0;
+  const gC         = geminiTop?.certainty || 0;
+  const hasGeminiProduct = !!geminiTop?.productName;
 
-  // 3. Both agree → confirmed (no extra lookup).
-  if (geminiTop?.productName && sameProduct(yoloTop, geminiTop)) {
-    return {
-      outcome: 'confirmed',
-      outcomeReasoning: `YOLO+GPT and Gemini both identified "${geminiTop.productName}"`,
-      winner: 'agree',
-      brandCategory: null,
-      brandReviews: null
-    };
+  // 2. Both agree.
+  if (yoloTop && hasGeminiProduct && sameProduct(yoloTop, geminiTop)) {
+    return baseOutcome('product_match', 'agree',
+      `YOLO+GPT (${pct(yC)}) and Gemini (${pct(gC)}) both identified "${geminiTop.productName}"`);
   }
 
-  // 4. Low confidence everywhere → fall back to brand category.
-  if (Math.max(yoloConf, geminiConf) < CONFIDENCE_FLOOR) {
-    const brandCategory = await tryLookupBrandCategoryUrl({
-      brandUrl,
-      brandName: brand,
-      label:    yoloTop.label || yoloTop.description,
-      category: yoloTop.category || category
-    });
-    return {
-      outcome: 'category',
-      outcomeReasoning: `low confidence (yolo ${(yoloConf*100).toFixed(0)}%, gemini ${(geminiConf*100).toFixed(0)}% — both below ${(CONFIDENCE_FLOOR*100).toFixed(0)}%); falling back to brand collection page`,
-      winner: yoloConf >= geminiConf ? 'yolo' : 'gemini',
-      brandCategory,
-      brandReviews: null
-    };
+  // 3. Gemini-only high confidence.
+  if (!yoloTop && gC >= HIGH_CONFIDENCE && hasGeminiProduct) {
+    return baseOutcome('product_match', 'gemini',
+      `YOLO+GPT detected no product; Gemini search confidently identified "${geminiTop.productName}" (${pct(gC)})`);
   }
 
-  // 5/6. Confidence threshold met — pick the higher one.
-  if (yoloConf >= geminiConf) {
-    return {
-      outcome: 'lookup_from_yolo',
-      outcomeReasoning: `YOLO+GPT (${(yoloConf*100).toFixed(0)}%) identified "${yoloTop.label}" with higher confidence than Gemini search (${(geminiConf*100).toFixed(0)}%)`,
-      winner: 'yolo',
-      brandCategory: null,
-      brandReviews: null
-    };
+  // 4. YOLO wins high.
+  if (yC >= HIGH_CONFIDENCE && yC > gC) {
+    return baseOutcome('product_match', 'yolo',
+      `YOLO+GPT (${pct(yC)}) identified "${yoloTop.label}" with higher confidence than Gemini (${pct(gC)}) — Gemini will enrich`);
   }
-  return {
-    outcome: 'lookup_from_gemini',
-    outcomeReasoning: `Gemini search (${(geminiConf*100).toFixed(0)}%) identified "${geminiTop.productName}" with higher confidence than YOLO+GPT (${(yoloConf*100).toFixed(0)}%)`,
-    winner: 'gemini',
-    brandCategory: null,
-    brandReviews: null
-  };
+
+  // 5. Gemini wins high.
+  if (gC >= HIGH_CONFIDENCE && gC > yC && hasGeminiProduct) {
+    return baseOutcome('product_match', 'gemini',
+      `Gemini (${pct(gC)}) identified "${geminiTop.productName}" with higher confidence than YOLO+GPT (${pct(yC)})`);
+  }
+
+  // 6. Mid-range — YOLO must have detected SOMETHING (Gemini alone in
+  // mid range isn't trustworthy — it'll find anything). Max signal must
+  // be in (LOWER, UPPER].
+  const maxConf = Math.max(yC, gC);
+  if (yoloTop && maxConf > CATEGORY_LOWER && maxConf <= CATEGORY_UPPER) {
+    return baseOutcome('product_category', yC >= gC ? 'yolo' : 'gemini',
+      `mid-confidence signal (yolo ${pct(yC)}, gemini ${pct(gC)}); falling back to brand collection page`);
+  }
+
+  // 7. Brand fallback.
+  return baseOutcome('brand_match', null,
+    `no trustworthy product signal (yolo ${pct(yC)}, gemini ${pct(gC)}); treating as brand content`);
 }
+
+function baseOutcome(outcome, winner, reasoning) {
+  return { outcome, winner, outcomeReasoning: reasoning,
+           brandCategory: null, brandReviews: null };
+}
+function pct(n) { return `${(n * 100).toFixed(0)}%`; }
 
 // Loose product equality — two identifications point at the same thing
 // when their normalized labels share a substantial token overlap. We

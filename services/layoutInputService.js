@@ -80,8 +80,12 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // prompt + defaults brand-focused when outcome='branding' — headline,
 // quotes, cta, and fallback strings shift from product-shaped to
 // brand-shaped so a Media without a real product produces brand
-// creative, not invented product copy.
-const INPUT_SCHEMA_VERSION = '2.6';
+// creative, not invented product copy. 2.7 renames outcomes to the
+// product_match / product_category / brand_match / do_not_use family
+// and surfaces brandCategory (OpenAI category enrichment) on every
+// product outcome — cta.subtext carries the breadcrumb so the
+// collection is always one click away even when the SKU resolves.
+const INPUT_SCHEMA_VERSION = '2.7';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -304,7 +308,7 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   const { media, detection, match, brand } = ctx;
   const ident = match?.identification || {};
   const details = ident.details || {};
-  const isBranding = match?.outcome === 'branding';
+  const isBranding = match?.outcome === 'brand_match';
   const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
   const lines = [];
 
@@ -552,7 +556,7 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   // Branding-outcome quote injection. When the matching service couldn't
   // identify a specific product but did pull brand-level reviews, use
   // those quotes so the testimonial templates still have hero copy.
-  if (ctx.match?.outcome === 'branding' && Array.isArray(ctx.match?.brandReviews?.quotes)) {
+  if (ctx.match?.outcome === 'brand_match' && Array.isArray(ctx.match?.brandReviews?.quotes)) {
     for (const q of ctx.match.brandReviews.quotes) {
       if (q?.text) quotes.push({ text: q.text, author_name: q.author || q.source || 'Verified buyer' });
     }
@@ -641,11 +645,11 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       // isn't blank when only brand sentiment is available.
       rating_value:    typeof details.rating === 'number'
                           ? details.rating
-                          : (ctx.match?.outcome === 'branding' && typeof ctx.match?.brandReviews?.rating === 'number'
+                          : (ctx.match?.outcome === 'brand_match' && typeof ctx.match?.brandReviews?.rating === 'number'
                               ? ctx.match.brandReviews.rating : undefined),
       review_count:    typeof details.reviewCount === 'number'
                           ? details.reviewCount
-                          : (ctx.match?.outcome === 'branding' && typeof ctx.match?.brandReviews?.reviewCount === 'number'
+                          : (ctx.match?.outcome === 'brand_match' && typeof ctx.match?.brandReviews?.reviewCount === 'number'
                               ? ctx.match.brandReviews.reviewCount : undefined),
       trusted_by_text: derivation.trusted_by_text || trustedByFromStats(details) || undefined,
       proof_badges:    limitArray(derivedBadges, 4),
@@ -697,14 +701,14 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     },
 
     defaults: {
-      fallback_quote:    ctx.match?.outcome === 'branding'
+      fallback_quote:    ctx.match?.outcome === 'brand_match'
                             ? `Made for people like us.`
                             : 'Customers love it.',
-      fallback_headline: ctx.match?.outcome === 'branding'
+      fallback_headline: ctx.match?.outcome === 'brand_match'
                             ? (brandName ? `Built for the ${brandName} community` : 'Built for our community')
                             : (brandName ? `See why ${brandName} customers come back` : 'See why they come back'),
-      cta_text:          ctx.match?.outcome === 'branding' ? 'Shop the brand' : 'Shop now',
-      product_name:      ident.productName || (ctx.match?.outcome === 'branding' ? brandName || 'This brand' : 'This product')
+      cta_text:          ctx.match?.outcome === 'brand_match' ? 'Shop the brand' : 'Shop now',
+      product_name:      ident.productName || (ctx.match?.outcome === 'brand_match' ? brandName || 'This brand' : 'This product')
     }
   };
 
@@ -1060,11 +1064,17 @@ function mergeCta(derivedCta, callerCta, details, outcomeCtx) {
   let outcomeText = null;
   let outcomeUrl  = null;
   let outcomeSubtext = null;
-  if (outcome === 'category' && brandCat?.url) {
+  if (outcome === 'product_category' && brandCat?.url) {
     outcomeText    = 'Shop the Collection';
     outcomeUrl     = brandCat.url;
     outcomeSubtext = brandCat.breadcrumb || undefined;
-  } else if (outcome === 'branding' && brandUrl) {
+  } else if (outcome === 'product_match' && brandCat?.url) {
+    // Even confident product matches get a category-page CTA fallback
+    // — useful when the SKU URL 404s downstream.
+    outcomeText    = null;        // keep the "Shop now" / derivation default
+    outcomeUrl     = null;        // primarySellerUrl wins; brandCat is a backup
+    outcomeSubtext = brandCat.breadcrumb || undefined;
+  } else if (outcome === 'brand_match' && brandUrl) {
     outcomeText = 'Shop the Brand';
     outcomeUrl  = brandUrl;
   }
