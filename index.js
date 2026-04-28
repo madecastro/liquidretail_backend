@@ -50,7 +50,11 @@ passport.use(new GoogleStrategy({
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     const email = profile.emails?.[0]?.value || '';
-    if (!email.endsWith('@floodqrf.com')) return done(null, false);
+    // TEMPORARILY OPEN: any verified Google account can sign in.
+    // TODO: gate this before going public — invite-token table, domain
+    // allowlist on Advertiser, or waitlist flow. Until then we still
+    // require Google to have given us a non-empty email.
+    if (!email) return done(null, false);
 
     // Upsert the User row so we have a place to attach advertiserId,
     // role, last-login etc. Session still carries the lightweight
