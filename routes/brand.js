@@ -203,9 +203,23 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
       return res.status(400).json({ error: 'brand has no websiteUrl — set one via PATCH first' });
     }
     brand.enrichmentSources = [];
+    // Auto-unlock any field that's currently empty. A curated lock on an
+    // empty value defeats the user's intent — they cleared it because
+    // they want enrichment to fill it. Non-empty curated fields stay
+    // protected.
+    const isEmpty = (v) => v == null || v === '' || (Array.isArray(v) && v.length === 0);
+    const unlocked = [];
+    brand.curatedFields = (brand.curatedFields || []).filter(k => {
+      if (isEmpty(brand[k])) { unlocked.push(k); return false; }
+      return true;
+    });
+    if (unlocked.includes('fontFamily')) brand.fontSource = null;
+    if (unlocked.length) {
+      console.log(`   · refresh: unlocked empty curated fields for "${brand.name}": ${unlocked.join(', ')}`);
+    }
     await brand.save();
     triggerEnrichment(brand, 'manual refresh');
-    res.json({ ok: true, queued: true });
+    res.json({ ok: true, queued: true, unlocked });
   } catch (err) {
     res.status(500).json({ error: err.message || 'refresh failed' });
   }
