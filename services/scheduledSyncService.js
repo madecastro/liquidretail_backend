@@ -56,16 +56,18 @@ async function runDueSyncs() {
       const postsCadenceMs   = (settings.postsCadenceHours   || 1)  * 3600 * 1000;
 
       // ── Catalog ──
+      // Pass credentialId so syncCatalog runs only this row, not all
+      // siblings — otherwise multi-page brands would multi-sync.
       if (cred.catalogId) {
         const due = !cred.lastCatalogSyncAt
                   || (now - new Date(cred.lastCatalogSyncAt).getTime()) >= catalogCadenceMs;
         if (due) {
           try {
-            const result = await syncCatalog(cred.brandId);
+            const result = await syncCatalog(cred.brandId, { credentialId: cred._id });
             if (result.ok) summary.catalogsSynced++;
-            else summary.errors.push({ brandId: cred.brandId, kind: 'catalog', reason: result.reason });
+            else summary.errors.push({ brandId: cred.brandId, credentialId: String(cred._id), kind: 'catalog', reason: result.reason });
           } catch (err) {
-            summary.errors.push({ brandId: cred.brandId, kind: 'catalog', reason: err.message });
+            summary.errors.push({ brandId: cred.brandId, credentialId: String(cred._id), kind: 'catalog', reason: err.message });
           }
         }
       }
@@ -77,14 +79,15 @@ async function runDueSyncs() {
         if (due) {
           try {
             const result = await syncPosts(cred.brandId, {
-              limit: 25,
+              credentialId:      cred._id,
+              limit:             25,
               dailyDetectRunCap: settings.dailyDetectRunCap ?? 50,
-              trigger: 'instagram-sync'
+              trigger:           'instagram-sync'
             });
             if (result.ok) summary.postsSynced++;
-            else summary.errors.push({ brandId: cred.brandId, kind: 'posts', reason: result.reason });
+            else summary.errors.push({ brandId: cred.brandId, credentialId: String(cred._id), kind: 'posts', reason: result.reason });
           } catch (err) {
-            summary.errors.push({ brandId: cred.brandId, kind: 'posts', reason: err.message });
+            summary.errors.push({ brandId: cred.brandId, credentialId: String(cred._id), kind: 'posts', reason: err.message });
           }
         }
       }

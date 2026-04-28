@@ -48,21 +48,58 @@ function parseCurrency(rawPrice, rawCurrency) {
   return null;
 }
 
+// Public entry — V2 #5 multi-page aware. When options.credentialId is
+// set, sync just that one credential; otherwise iterate every active
+// IG credential for the brand that has a catalogId. Aggregates the
+// per-credential results.
 async function syncCatalog(brandId, options = {}) {
   const t0 = Date.now();
-  const cred = await IntegrationCredential.findOne({
-    brandId,
-    type: 'instagram',
-    status: 'active'
-  });
-  if (!cred)              return { ok: false, reason: 'no active Instagram credential' };
-  if (!cred.catalogId)    return { ok: false, reason: 'credential has no catalogId — re-connect Instagram so we can pick a catalog' };
+  const credFilter = {
+    brandId, type: 'instagram', status: 'active', catalogId: { $exists: true, $ne: null }
+  };
+  if (options.credentialId) credFilter._id = options.credentialId;
+
+  const creds = await IntegrationCredential.find(credFilter);
+  if (!creds.length) {
+    return { ok: false, reason: options.credentialId
+        ? 'credential not found or has no catalogId'
+        : 'no active Instagram credential with a catalogId for this brand' };
+  }
+
+  // Multi-credential path: aggregate per-credential results.
+  if (creds.length > 1 && !options.credentialId) {
+    const aggregated = { ok: true, fetched: 0, added: 0, updated: 0, errors: 0, totalCount: 0, perCredential: [] };
+    for (const c of creds) {
+      const r = await syncCatalogForCred(c);
+      aggregated.perCredential.push({ credentialId: String(c._id), igUsername: c.igUsername, ...r });
+      if (r.ok) {
+        aggregated.fetched += r.fetched || 0;
+        aggregated.added   += r.added   || 0;
+        aggregated.updated += r.updated || 0;
+        aggregated.errors  += r.errors  || 0;
+        aggregated.totalCount = r.totalCount; // last wins; total is brand-wide either way
+      }
+    }
+    aggregated.durationMs = Date.now() - t0;
+    return aggregated;
+  }
+
+  // Single-credential path.
+  const result = await syncCatalogForCred(creds[0]);
+  result.durationMs = Date.now() - t0;
+  return result;
+}
+
+async function syncCatalogForCred(cred) {
+  const t0 = Date.now();
+  const brandId = cred.brandId;
+  if (!cred.catalogId) return { ok: false, reason: `credential ${cred._id} has no catalogId` };
 
   let token;
   try { token = decrypt(cred.accessTokenEnc); }
   catch (err) { return { ok: false, reason: `token decrypt failed: ${err.message}` }; }
 
-  console.log(`📦 catalog sync starting: brand=${brandId} catalog=${cred.catalogId}`);
+  console.log(`📦 catalog sync starting: brand=${brandId} catalog=${cred.catalogId} (cred=${cred._id})`);
 
   let url = `${META_GRAPH_ROOT}/${cred.catalogId}/products`;
   let params = { fields: FIELDS, limit: PAGE_SIZE, access_token: token };

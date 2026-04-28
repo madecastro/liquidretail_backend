@@ -34,24 +34,87 @@ const POST_FIELDS = [
 ].join(',');
 const CHILD_FIELDS = ['id', 'media_type', 'media_url', 'thumbnail_url'].join(',');
 
+// V2 #5 multi-page aware. When options.credentialId is set, sync just
+// that one credential; otherwise iterate every active IG credential
+// for the brand that has an igUserId. The dailyDetectRunCap (V2 #4)
+// is brand-wide, so we count once at the top and decrement across
+// per-credential ingestion.
 async function syncPosts(brandId, options = {}) {
+  const t0 = Date.now();
+  const credFilter = {
+    brandId, type: 'instagram', status: 'active', igUserId: { $exists: true, $ne: null }
+  };
+  if (options.credentialId) credFilter._id = options.credentialId;
+
+  const creds = await IntegrationCredential.find(credFilter);
+  if (!creds.length) {
+    return { ok: false, reason: options.credentialId
+        ? 'credential not found or has no igUserId'
+        : 'no active Instagram credential with an igUserId for this brand' };
+  }
+
+  // Multi-credential path.
+  if (creds.length > 1 && !options.credentialId) {
+    const aggregated = { ok: true, fetched: 0, ingested: 0, skipped: 0, capSkipped: 0, errors: 0, queuedRunIds: [], perCredential: [] };
+    // Pre-compute brand-wide remaining cap once. Each per-cred run
+    // updates a shared remaining counter passed via options so the
+    // cap doesn't double-count.
+    let remaining = options.dailyDetectRunCap == null
+      ? null
+      : await capRemaining(creds[0].advertiserId, options.dailyDetectRunCap);
+    for (const c of creds) {
+      const r = await syncPostsForCred(c, { ...options, capRemaining: remaining });
+      aggregated.perCredential.push({ credentialId: String(c._id), igUsername: c.igUsername, ...r });
+      if (r.ok) {
+        aggregated.fetched     += r.fetched     || 0;
+        aggregated.ingested    += r.ingested    || 0;
+        aggregated.skipped     += r.skipped     || 0;
+        aggregated.capSkipped  += r.capSkipped  || 0;
+        aggregated.errors      += r.errors      || 0;
+        aggregated.queuedRunIds.push(...(r.queuedRunIds || []));
+        if (remaining != null) remaining = Math.max(0, remaining - (r.queuedRunIds?.length || 0));
+      }
+    }
+    aggregated.durationMs = Date.now() - t0;
+    return aggregated;
+  }
+
+  const result = await syncPostsForCred(creds[0], options);
+  result.durationMs = Date.now() - t0;
+  return result;
+}
+
+// Count today's auto-queued DetectRuns for an advertiser, return how
+// many slots remain under the cap. Used by the multi-credential path
+// to spread the cap across credentials.
+async function capRemaining(advertiserId, cap) {
+  const startOfDay = new Date();
+  startOfDay.setUTCHours(0, 0, 0, 0);
+  const todayCount = await DetectRun.countDocuments({
+    advertiserId,
+    createdAt: { $gte: startOfDay },
+    trigger:   'instagram-sync'
+  });
+  return Math.max(0, cap - todayCount);
+}
+
+async function syncPostsForCred(cred, options = {}) {
   const limit = Math.min(options.limit || DEFAULT_LIMIT, 50);
-  // V2 #4 — when called from the scheduler, options.dailyDetectRunCap
-  // is set so we throttle DetectRuns. Manual sync passes null and
-  // every new post enqueues a run.
-  const dailyCap = options.dailyDetectRunCap == null ? null : Math.max(0, Number(options.dailyDetectRunCap) || 0);
   const trigger  = options.trigger || 'instagram-sync';
   const t0 = Date.now();
-
-  const cred = await IntegrationCredential.findOne({
-    brandId, type: 'instagram', status: 'active'
-  });
-  if (!cred)              return { ok: false, reason: 'no active Instagram credential' };
-  if (!cred.igUserId)     return { ok: false, reason: 'credential has no igUserId — re-connect Instagram from a Page that owns an IG Business account' };
+  if (!cred.igUserId) return { ok: false, reason: `credential ${cred._id} has no igUserId` };
 
   let token;
   try { token = decrypt(cred.accessTokenEnc); }
   catch (err) { return { ok: false, reason: `token decrypt failed: ${err.message}` }; }
+
+  const brandId = cred.brandId;
+  // Cap can come from one of two paths:
+  //   - options.capRemaining: pre-computed by the multi-credential
+  //     orchestrator so siblings share the cap correctly.
+  //   - options.dailyDetectRunCap: single-credential path; we count
+  //     today's runs ourselves.
+  const dailyCap = options.dailyDetectRunCap == null ? null : Math.max(0, Number(options.dailyDetectRunCap) || 0);
 
   // Pull metadata we'll attach to each Media so detect's downstream
   // brand/category lookups work without the upload-form context.
@@ -75,20 +138,14 @@ async function syncPosts(brandId, options = {}) {
     return { ok: false, reason: `Meta error: ${detail}` };
   }
 
-  // Compute remaining cap if dailyCap was passed. Counts auto-queued
-  // DetectRuns for this brand created today (UTC midnight floor).
+  // Resolve runsRemaining from the orchestrator-provided value (multi-
+  // credential path) or compute it ourselves (single-credential path).
   let runsRemaining = null;
-  if (dailyCap != null) {
-    const startOfDay = new Date();
-    startOfDay.setUTCHours(0, 0, 0, 0);
-    const todayCount = await DetectRun.countDocuments({
-      advertiserId: cred.advertiserId,
-      mediaId:      { $exists: true },
-      createdAt:    { $gte: startOfDay },
-      trigger:      'instagram-sync'
-    });
-    runsRemaining = Math.max(0, dailyCap - todayCount);
-    console.log(`   · IG post sync cap check: ${todayCount}/${dailyCap} runs today; ${runsRemaining} remaining`);
+  if (options.capRemaining != null) {
+    runsRemaining = Math.max(0, Number(options.capRemaining) || 0);
+  } else if (dailyCap != null) {
+    runsRemaining = await capRemaining(cred.advertiserId, dailyCap);
+    console.log(`   · IG post sync cap check: ${dailyCap - runsRemaining}/${dailyCap} runs today; ${runsRemaining} remaining`);
   }
 
   const summary = {

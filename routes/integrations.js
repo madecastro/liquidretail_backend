@@ -44,19 +44,23 @@ function summarize(cred) {
 }
 
 // ── Status ────────────────────────────────────────────────────────────
-// Returns the active IG credential for the current Brand (or null).
+// V2 #5 — returns ALL active IG credentials for the brand. The first
+// element is also returned as `credential` for backwards compatibility
+// with single-page consumers.
 router.get('/instagram/status', async (req, res) => {
   try {
     const brandId = req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
-    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+    const creds = await IntegrationCredential.find(tenantFilter(req, {
       brandId,
       type:   'instagram',
       status: 'active'
-    })).lean();
+    })).sort({ connectedAt: 1 }).lean();
+    const summarized = creds.map(summarize);
     res.json({
-      configured: ig.isConfigured(),
-      credential: summarize(cred)
+      configured:  ig.isConfigured(),
+      credential:  summarized[0] || null,
+      credentials: summarized
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'status lookup failed' });
@@ -125,15 +129,12 @@ router.get('/instagram/callback', async (req, res) => {
 
     const summary = await ig.fetchAccountSummary(long.access_token);
 
-    // Revoke any previous active credential for this brand+type — there's
-    // only ever one active per (brandId, type) per the partial unique index.
-    await IntegrationCredential.updateMany(
-      { brandId: payload.brandId, type: 'instagram', status: 'active' },
-      { $set: { status: 'revoked', revokedAt: new Date() } }
-    );
-
+    // V2 #5: multi-page. Reconnecting the SAME IG account refreshes the
+    // existing row (new token, scopes, expiry); a different IG account
+    // adds a second active credential alongside the first. Brands can
+    // hold N active credentials as long as their igUserIds differ.
     const expiresAt = long.expires_in ? new Date(Date.now() + long.expires_in * 1000) : null;
-    const cred = await IntegrationCredential.create({
+    const update = {
       advertiserId:   payload.advertiserId,
       brandId:        payload.brandId,
       type:           'instagram',
@@ -146,12 +147,30 @@ router.get('/instagram/callback', async (req, res) => {
       pageId:         summary.pageId,
       pageName:       summary.pageName,
       catalogId:      summary.catalogId,
-      metaUserId:     summary.metaUserId,
-      connectedBy:    payload.userId,
-      connectedAt:    new Date()
-    });
+      metaUserId:     summary.metaUserId
+    };
 
-    console.log(`✅ IG connected: brand=${payload.brandId} ig=@${summary.igUsername || '?'} page=${summary.pageName || '?'} catalog=${summary.catalogId || '∅'}`);
+    let cred;
+    if (summary.igUserId) {
+      cred = await IntegrationCredential.findOneAndUpdate(
+        { brandId: payload.brandId, type: 'instagram', status: 'active', igUserId: summary.igUserId },
+        {
+          $set: update,
+          $setOnInsert: { connectedBy: payload.userId, connectedAt: new Date() }
+        },
+        { upsert: true, new: true }
+      );
+    } else {
+      // No igUserId resolved (Page without an IG Business account).
+      // Don't merge with sibling credentials — insert fresh.
+      cred = await IntegrationCredential.create({
+        ...update,
+        connectedBy: payload.userId,
+        connectedAt: new Date()
+      });
+    }
+
+    console.log(`✅ IG connected: brand=${payload.brandId} ig=@${summary.igUsername || '?'} page=${summary.pageName || '?'} catalog=${summary.catalogId || '∅'} cred=${cred._id}`);
     bounce('connected', summary.igUsername || summary.pageName || 'connected');
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
@@ -187,12 +206,15 @@ router.post('/instagram/sync-catalog', async (req, res) => {
   try {
     const brandId = req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
-    // tenant guard via credential — confirms the brand belongs to this advertiser
-    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
-      brandId, type: 'instagram', status: 'active'
-    })).select('_id').lean();
+    const credentialId = req.query.credentialId || null;
+    // Tenant guard — confirm the brand has at least one active credential
+    // (or the specific credentialId belongs to this advertiser).
+    const credFilter = credentialId
+      ? { _id: credentialId, brandId, type: 'instagram', status: 'active' }
+      : { brandId, type: 'instagram', status: 'active' };
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, credFilter)).select('_id').lean();
     if (!cred) return res.status(404).json({ error: 'no active Instagram credential for this brand' });
-    const result = await syncCatalog(brandId);
+    const result = await syncCatalog(brandId, credentialId ? { credentialId } : {});
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
   } catch (err) {
@@ -367,12 +389,17 @@ router.post('/instagram/sync-posts', express.json(), async (req, res) => {
   try {
     const brandId = req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
-    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
-      brandId, type: 'instagram', status: 'active'
-    })).select('_id').lean();
+    const credentialId = req.query.credentialId || null;
+    const credFilter = credentialId
+      ? { _id: credentialId, brandId, type: 'instagram', status: 'active' }
+      : { brandId, type: 'instagram', status: 'active' };
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, credFilter)).select('_id').lean();
     if (!cred) return res.status(404).json({ error: 'no active Instagram credential for this brand' });
     const limit = Math.min(Number(req.body?.limit) || 25, 50);
-    const result = await syncPosts(brandId, { limit });
+    const result = await syncPosts(brandId, {
+      limit,
+      ...(credentialId ? { credentialId } : {})
+    });
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
   } catch (err) {
@@ -428,6 +455,9 @@ router.patch('/instagram/sync-settings', express.json(), async (req, res) => {
 });
 
 // ── Disconnect ───────────────────────────────────────────────────────
+// DELETE /instagram — revokes ALL active IG credentials for the brand.
+// DELETE /instagram/:credentialId — revokes one specific credential
+//   (V2 #5; required when a brand has multiple connected accounts).
 router.delete('/instagram', async (req, res) => {
   try {
     const brandId = req.headers['x-brand-id'];
@@ -437,6 +467,22 @@ router.delete('/instagram', async (req, res) => {
       { $set: { status: 'revoked', revokedAt: new Date(), revokedBy: req.user.userId || req.user.id } }
     );
     res.json({ ok: true, revoked: result.modifiedCount || 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'disconnect failed' });
+  }
+});
+
+router.delete('/instagram/:credentialId', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOneAndUpdate(
+      tenantFilter(req, { _id: req.params.credentialId, brandId, type: 'instagram', status: 'active' }),
+      { $set: { status: 'revoked', revokedAt: new Date(), revokedBy: req.user.userId || req.user.id } },
+      { new: true }
+    );
+    if (!cred) return res.status(404).json({ error: 'credential not found or already revoked' });
+    res.json({ ok: true, credentialId: String(cred._id) });
   } catch (err) {
     res.status(500).json({ error: err.message || 'disconnect failed' });
   }

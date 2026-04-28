@@ -58,11 +58,18 @@ const integrationCredentialSchema = new mongoose.Schema({
   lastCatalogSyncAt: Date,
   lastPostsSyncAt:   Date
 
-// One ACTIVE credential of a given type per Brand. Revoked rows
-// remain (audit) and don't conflict because the partial filter
-// excludes them.
+// V2 #5 — multi-page support. Compound unique index on
+// (brandId, type, igUserId) so a brand can hold more than one active
+// IG credential, but cannot connect the same IG account twice. Revoked
+// rows are excluded from the partial filter so they don't conflict.
+//
+// MIGRATION NOTE: V1 shipped a (brandId, type) unique index named
+// "brandId_1_type_1". After deploying this change you must drop the
+// legacy index manually — Mongoose only adds new indexes, it doesn't
+// remove obsolete ones:
+//   db.integrationcredentials.dropIndex("brandId_1_type_1")
 integrationCredentialSchema.index(
-  { brandId: 1, type: 1 },
+  { brandId: 1, type: 1, igUserId: 1 },
   { unique: true, partialFilterExpression: { status: 'active' } }
 );
 
