@@ -57,7 +57,12 @@ const brandSchema = new mongoose.Schema({
   // 'suggested'   — GPT-4.1 derived from brand tone/summary (best-effort)
   // 'tone-default'— hardcoded tone→font safety net when GPT also failed
   // 'curated'     — set explicitly by a human via PATCH /api/brand/:id
-  fontSource:     { type: String, enum: ['brandfetch', 'scraped', 'suggested', 'tone-default', 'curated'], default: null },
+  // null is included in the enum so brands that pre-date this field
+  // (or rows where every enrichment tier returned no font) pass
+  // validation. Mongoose's enum check rejects null even on non-
+  // required fields when a default isn't matched, so we explicitly
+  // allow it here.
+  fontSource:     { type: String, enum: ['brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
   tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
   hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
   tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')
