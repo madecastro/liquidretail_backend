@@ -17,6 +17,7 @@ const { processDetectRun }       = require('./pipelines/detect');
 const { processPreCroppedJob }   = require('./pipelines/bridge');
 const { processLegacyUploadJob } = require('./pipelines/inventory');
 const { sleep }                  = require('./pipelines/shared');
+const { startScheduler }         = require('./services/scheduledSyncService');
 
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
@@ -24,6 +25,10 @@ mongoose.connect(process.env.MONGODB_URI, {
 }).then(() => {
   console.log('🔌 Connected to MongoDB');
   processQueueLoop();
+  // Scheduled IG sync — independent timer so it doesn't compete with
+  // the queue loop for cycles. Catalog daily, posts hourly per Brand
+  // settings; cap-aware DetectRun enqueueing.
+  startScheduler();
 }).catch(err => console.error('MongoDB error:', err));
 
 async function processQueueLoop() {

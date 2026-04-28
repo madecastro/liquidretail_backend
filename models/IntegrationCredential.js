@@ -49,8 +49,14 @@ const integrationCredentialSchema = new mongoose.Schema({
   connectedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   revokedAt:    Date,
   revokedBy:    { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  lastUsedAt:   Date
-});
+  lastUsedAt:   Date,
+
+  // Auto-sync timestamps (V2 #4) — populated by scheduledSyncService
+  // so the next tick can decide whether each tier is due. Manual
+  // syncs also touch these to avoid the scheduler immediately
+  // re-running what the user just kicked off by hand.
+  lastCatalogSyncAt: Date,
+  lastPostsSyncAt:   Date
 
 // One ACTIVE credential of a given type per Brand. Revoked rows
 // remain (audit) and don't conflict because the partial filter

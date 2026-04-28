@@ -118,6 +118,18 @@ const brandSchema = new mongoose.Schema({
   // auditing where a brand came from.
   firstSeenMediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },
 
+  // Phase V2 #4 — auto-sync settings for connected integrations. When
+  // autoSyncEnabled is true, the worker's scheduled sweep pulls catalog
+  // (~daily) and posts (~hourly) for any active credential under this
+  // brand. dailyDetectRunCap throttles the post sync so a single brand
+  // can't burn through compute by posting frequently.
+  syncSettings: {
+    autoSyncEnabled:      { type: Boolean, default: false },
+    dailyDetectRunCap:    { type: Number,  default: 50 },
+    catalogCadenceHours:  { type: Number,  default: 24 },
+    postsCadenceHours:    { type: Number,  default: 1 }
+  },
+
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });

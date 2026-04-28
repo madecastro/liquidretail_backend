@@ -36,6 +36,11 @@ const CHILD_FIELDS = ['id', 'media_type', 'media_url', 'thumbnail_url'].join(','
 
 async function syncPosts(brandId, options = {}) {
   const limit = Math.min(options.limit || DEFAULT_LIMIT, 50);
+  // V2 #4 — when called from the scheduler, options.dailyDetectRunCap
+  // is set so we throttle DetectRuns. Manual sync passes null and
+  // every new post enqueues a run.
+  const dailyCap = options.dailyDetectRunCap == null ? null : Math.max(0, Number(options.dailyDetectRunCap) || 0);
+  const trigger  = options.trigger || 'instagram-sync';
   const t0 = Date.now();
 
   const cred = await IntegrationCredential.findOne({
@@ -70,10 +75,27 @@ async function syncPosts(brandId, options = {}) {
     return { ok: false, reason: `Meta error: ${detail}` };
   }
 
+  // Compute remaining cap if dailyCap was passed. Counts auto-queued
+  // DetectRuns for this brand created today (UTC midnight floor).
+  let runsRemaining = null;
+  if (dailyCap != null) {
+    const startOfDay = new Date();
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    const todayCount = await DetectRun.countDocuments({
+      advertiserId: cred.advertiserId,
+      mediaId:      { $exists: true },
+      createdAt:    { $gte: startOfDay },
+      trigger:      'instagram-sync'
+    });
+    runsRemaining = Math.max(0, dailyCap - todayCount);
+    console.log(`   · IG post sync cap check: ${todayCount}/${dailyCap} runs today; ${runsRemaining} remaining`);
+  }
+
   const summary = {
     fetched:  posts.length,
     ingested: 0,
     skipped:  0,
+    capSkipped: 0,
     errors:   0,
     queuedRunIds: []
   };
@@ -86,11 +108,23 @@ async function syncPosts(brandId, options = {}) {
     const existing = await Media.findOne({ source: 'instagram', externalId }).select('_id').lean();
     if (existing) { summary.skipped++; continue; }
 
+    // Cap check — when out of remaining runs, still ingest the Media
+    // (cheap, idempotent) but don't enqueue a DetectRun. Tomorrow's
+    // sweep can pick them up if cadence allows.
+    const enqueueRun = (runsRemaining == null) || runsRemaining > 0;
+
     try {
-      const ingested = await ingestPost({ post, cred, brandName, brandUrl, token });
-      if (ingested?.runId) {
+      const ingested = await ingestPost({
+        post, cred, brandName, brandUrl, token, enqueueRun, trigger
+      });
+      if (ingested?.mediaId) {
         summary.ingested++;
-        summary.queuedRunIds.push(String(ingested.runId));
+        if (ingested.runId) {
+          summary.queuedRunIds.push(String(ingested.runId));
+          if (runsRemaining != null) runsRemaining--;
+        } else if (runsRemaining === 0) {
+          summary.capSkipped++;
+        }
       } else {
         summary.errors++;
       }
@@ -101,6 +135,7 @@ async function syncPosts(brandId, options = {}) {
   }
 
   cred.lastUsedAt = new Date();
+  cred.lastPostsSyncAt = new Date();
   await cred.save();
 
   console.log(`📸 IG post sync done: brand=${brandId} fetched=${summary.fetched} ingested=${summary.ingested} skipped=${summary.skipped} errors=${summary.errors} in ${Date.now() - t0}ms`);
@@ -114,7 +149,7 @@ async function syncPosts(brandId, options = {}) {
 
 // Ingest a single post: resolve its primary media URL (handles carousels),
 // mirror to Cloudinary, create Media + DetectRun.
-async function ingestPost({ post, cred, brandName, brandUrl, token }) {
+async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun = true, trigger = 'instagram-sync' }) {
   const externalId = String(post.id);
   const mediaType = post.media_type;       // IMAGE | VIDEO | CAROUSEL_ALBUM
   const permalink = post.permalink || null;
@@ -199,13 +234,20 @@ async function ingestPost({ post, cred, brandName, brandUrl, token }) {
     throw err;
   }
 
+  // Don't enqueue if the caller is rate-capped — Media is still
+  // ingested so a future sync (or manual trigger) can run detect.
+  if (!enqueueRun) {
+    console.log(`   · ingested IG post ${externalId} → Media ${media._id} (DetectRun deferred — daily cap reached)`);
+    return { runId: null, mediaId: media._id };
+  }
+
   // Only enqueue a DetectRun for FRESH inserts. If this Media existed
   // before this sync, we already queued a run for it. The check below
   // is the cheapest way to discriminate: count runs for this media.
   const existingRunCount = await DetectRun.countDocuments({ mediaId: media._id });
   if (existingRunCount > 0) {
     console.log(`   · post ${externalId} already had ${existingRunCount} DetectRun(s) — skipping enqueue`);
-    return { runId: null };
+    return { runId: null, mediaId: media._id };
   }
 
   const run = await DetectRun.create({
@@ -213,7 +255,7 @@ async function ingestPost({ post, cred, brandName, brandUrl, token }) {
     mediaId:      media._id,
     status:       'queued',
     stage:        'queued',
-    trigger:      'instagram-sync'
+    trigger
   });
   console.log(`   · ingested IG post ${externalId} → Media ${media._id} + DetectRun ${run._id}`);
   return { runId: run._id, mediaId: media._id };

@@ -138,8 +138,10 @@ async function syncCatalog(brandId, options = {}) {
     }
   }
 
-  // Update credential last-used so disconnected/expired tokens surface.
+  // Update credential last-used + last-catalog-sync so the scheduler
+  // knows when this tier last completed.
   cred.lastUsedAt = new Date();
+  cred.lastCatalogSyncAt = new Date();
   await cred.save();
 
   const totalCount = await CatalogProduct.countDocuments({ brandId, source: 'ig-catalog' });

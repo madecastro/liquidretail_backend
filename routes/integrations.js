@@ -381,6 +381,52 @@ router.post('/instagram/sync-posts', express.json(), async (req, res) => {
   }
 });
 
+// ── Sync settings (V2 #4) ────────────────────────────────────────────
+// GET  /api/integrations/instagram/sync-settings — current Brand.syncSettings
+// PATCH /api/integrations/instagram/sync-settings — body: { autoSyncEnabled, dailyDetectRunCap }
+const Brand = require('../models/Brand');
+router.get('/instagram/sync-settings', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const brand = await Brand.findOne(tenantFilter(req, { _id: brandId })).select('syncSettings').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    res.json({
+      syncSettings: brand.syncSettings || {
+        autoSyncEnabled: false,
+        dailyDetectRunCap: 50,
+        catalogCadenceHours: 24,
+        postsCadenceHours: 1
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'sync-settings fetch failed' });
+  }
+});
+
+router.patch('/instagram/sync-settings', express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const brand = await Brand.findOne(tenantFilter(req, { _id: brandId }));
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const body = req.body || {};
+    const settings = brand.syncSettings || {};
+    if (typeof body.autoSyncEnabled === 'boolean') settings.autoSyncEnabled = body.autoSyncEnabled;
+    if (Number.isFinite(body.dailyDetectRunCap))   settings.dailyDetectRunCap   = Math.max(0, Math.min(1000, Number(body.dailyDetectRunCap)));
+    if (Number.isFinite(body.catalogCadenceHours)) settings.catalogCadenceHours = Math.max(1, Math.min(168, Number(body.catalogCadenceHours)));
+    if (Number.isFinite(body.postsCadenceHours))   settings.postsCadenceHours   = Math.max(1, Math.min(168, Number(body.postsCadenceHours)));
+    brand.syncSettings = settings;
+    await brand.save();
+
+    res.json({ syncSettings: brand.syncSettings });
+  } catch (err) {
+    console.error('sync-settings update failed:', err);
+    res.status(500).json({ error: err.message || 'sync-settings update failed' });
+  }
+});
+
 // ── Disconnect ───────────────────────────────────────────────────────
 router.delete('/instagram', async (req, res) => {
   try {
