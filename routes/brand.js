@@ -41,7 +41,7 @@ router.get('/by-name/:name', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const brands = await Brand.find(tenantFilter(req))
-      .select('name nameNormalized logoUrl websiteUrl primaryColor source enrichmentSources curatedFields createdAt')
+      .select('name nameNormalized logoUrl websiteUrl primaryColor fontFamily fontSource source enrichmentSources curatedFields createdAt')
       .sort({ name: 1 })
       .lean();
     res.json({
@@ -130,6 +130,8 @@ router.patch('/:id', express.json(), async (req, res) => {
     const editable = ['name', 'websiteUrl', 'tagline', 'summary', 'logoUrl',
                       'primaryColor', 'secondaryColor', 'accentColor', 'fontFamily',
                       'tone', 'hashtags', 'tags'];
+    // If the user explicitly sets fontFamily, that's curated.
+    const fontTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'fontFamily');
     const before = { websiteUrl: brand.websiteUrl };
     const curatedSet = new Set(brand.curatedFields || []);
 
@@ -145,6 +147,7 @@ router.patch('/:id', express.json(), async (req, res) => {
       brand.nameNormalized = normalizeBrandName(brand.name);
     }
     brand.curatedFields = [...curatedSet];
+    if (fontTouched) brand.fontSource = 'curated';
     await brand.save();
 
     // Re-enrich when the websiteUrl actually changed (new domain →
@@ -201,6 +204,7 @@ function serializeBrand(b) {
     secondaryColor: b.secondaryColor || null,
     accentColor:  b.accentColor || null,
     fontFamily:   b.fontFamily || null,
+    fontSource:   b.fontSource || null,
     tone:         b.tone || [],
     hashtags:     b.hashtags || [],
     tags:         b.tags || [],

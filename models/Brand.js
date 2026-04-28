@@ -50,6 +50,14 @@ const brandSchema = new mongoose.Schema({
   secondaryColor: String,
   accentColor:    String,
   fontFamily:     String,
+  // Provenance of fontFamily — drives the "(suggested)" UI hint and
+  // lets curation distinguish a real brand font from an approximation.
+  // 'brandfetch'  — pulled from Brandfetch's brand-kit API
+  // 'scraped'     — parsed from a Google Fonts <link> on the homepage
+  // 'suggested'   — GPT-4.1 derived from brand tone/summary (best-effort)
+  // 'tone-default'— hardcoded tone→font safety net when GPT also failed
+  // 'curated'     — set explicitly by a human via PATCH /api/brand/:id
+  fontSource:     { type: String, enum: ['brandfetch', 'scraped', 'suggested', 'tone-default', 'curated'], default: null },
   tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
   hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
   tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')

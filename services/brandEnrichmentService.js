@@ -36,6 +36,7 @@ const ENRICHMENT_SCHEMA = {
     primaryColor:   { type: 'string' },
     secondaryColor: { type: 'string' },
     accentColor:    { type: 'string' },
+    fontSuggestion: { type: 'string' },
     demographics: {
       type: 'array',
       items: {
@@ -149,6 +150,13 @@ async function enrichBrandFromUrl(brandId) {
       `- "hashtags": 5–10 hashtags this brand commonly uses on social, INCLUDING the # symbol (e.g. ["#pelagic","#offshore","#anglerlife"]). Pull from observed campaigns, common community tags, or the brand's category vernacular. Omit only if the brand has no plausible social presence.\n` +
       `- "tags": 5–10 lowercase keyword tags WITHOUT the # symbol — short search/category descriptors of what this brand sells or stands for (e.g. ["fishing","performance","apparel","outdoor","sun-protection"]). Concrete and indexable.\n` +
       `- "primaryColor" / "secondaryColor" / "accentColor": 6-digit hex strings (e.g. "#0a2540"). Use meta theme-color or visible brand colors when detectable; otherwise best-guess from positioning/category. Omit if truly no signal.\n` +
+      `- "fontSuggestion": ONE Google Fonts family name that fits this brand's personality based on its tone, summary, and category. Must be a REAL Google Fonts family — pick from common, well-supported choices. Examples by feel:\n` +
+      `    rugged/outdoors  → "Bebas Neue", "Oswald", "Anton"\n` +
+      `    premium/editorial → "Playfair Display", "Lora", "Cormorant Garamond"\n` +
+      `    technical/modern  → "Inter", "DM Sans", "IBM Plex Sans"\n` +
+      `    playful/friendly  → "Poppins", "Nunito", "Quicksand"\n` +
+      `    minimal/clean     → "Manrope", "DM Sans", "Work Sans"\n` +
+      `  This is a SUGGESTION used only when the brand's actual font isn't detectable — pick the single best fit.\n` +
       `- "demographics": 3–5 key target customer personas this brand clearly serves. Each persona:\n` +
       `    • "name": short, memorable (e.g. "Saltwater Joe", "Weekend Warrior", "Urban Professional")\n` +
       `    • "description": one sentence (≤ 20 words) describing who they are\n` +
@@ -202,12 +210,27 @@ async function enrichBrandFromUrl(brandId) {
   );
   setIf('logoUrl', logoVal, logoSrc);
 
+  // Font resolution chain. High-confidence sources first
+  // (Brandfetch / scraped Google Fonts), then GPT-suggested based on
+  // brand personality, then a tone-based hardcoded safety net so
+  // every brand gets a usable font instead of system-ui defaults.
+  // Tracked on brand.fontSource so the UI can mark approximated
+  // fonts as "(suggested)".
+  const toneDefault = toneToDefaultFont(enrichment.tone || brand.tone);
   let [fontVal, fontSrc] = pick(
     [bf?.fontFamily, 'brandfetch'],
     [scrapedFontFamily, 'scraped'],
+    [enrichment.fontSuggestion, 'suggested'],
+    [toneDefault, 'tone-default'],
     [brand.fontFamily, 'existing']
   );
   setIf('fontFamily', fontVal, fontSrc);
+  // Persist the source label on the brand so /api/brand returns it
+  // and the Brand Object tab can show "(suggested)" / "(scraped)".
+  // Don't overwrite a curated-source label.
+  if (brand.fontSource !== 'curated' && fontSrc && fontSrc !== 'existing') {
+    brand.fontSource = fontSrc;
+  }
 
   let [primaryVal, primarySrc] = pick(
     [bf?.primaryColor, 'brandfetch'],
@@ -408,6 +431,41 @@ function extractGoogleFontsFamily(html) {
 function googleFaviconFallback(hostname) {
   if (!hostname) return null;
   return `https://www.google.com/s2/favicons?domain=${hostname}&sz=128`;
+}
+
+// Last-resort font picker: maps tone descriptors to a curated set of
+// well-known Google Fonts. Used only when Brandfetch + scraping +
+// GPT all failed to surface a font. Returns null if nothing matches.
+const TONE_FONT_MAP = {
+  rugged:    'Bebas Neue',
+  bold:      'Bebas Neue',
+  loud:      'Anton',
+  energetic: 'Oswald',
+  outdoors:  'Oswald',
+  premium:   'Playfair Display',
+  luxury:    'Playfair Display',
+  refined:   'Cormorant Garamond',
+  elegant:   'Cormorant Garamond',
+  editorial: 'Lora',
+  technical: 'Inter',
+  modern:    'Inter',
+  professional: 'Inter',
+  practical: 'IBM Plex Sans',
+  clean:     'DM Sans',
+  minimal:   'DM Sans',
+  playful:   'Poppins',
+  friendly:  'Poppins',
+  warm:      'Nunito',
+  casual:    'Nunito',
+  fun:       'Quicksand'
+};
+function toneToDefaultFont(tones) {
+  if (!Array.isArray(tones) || tones.length === 0) return null;
+  for (const t of tones) {
+    const key = String(t).trim().toLowerCase();
+    if (TONE_FONT_MAP[key]) return TONE_FONT_MAP[key];
+  }
+  return null;
 }
 
 // Case-insensitive de-duplication, preserving first occurrence's casing.
