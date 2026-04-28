@@ -27,6 +27,7 @@ const { syncCatalog, getCatalogStatus } = require('../services/catalogSyncServic
 const { syncPosts, getPostsStatus } = require('../services/postSyncService');
 const geminiSearch = require('../services/providers/geminiSearchProvider');
 const { verifySignature, processWebhookPayload } = require('../services/instagramWebhookService');
+const metaAds = require('../services/metaAdsOAuthService');
 
 const FRONTEND_URL = 'https://liquidretail.netlify.app';
 
@@ -694,6 +695,230 @@ router.delete('/instagram/:credentialId', async (req, res) => {
     res.json({ ok: true, credentialId: String(cred._id) });
   } catch (err) {
     res.status(500).json({ error: err.message || 'disconnect failed' });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════
+//  META ADS — Marketing API (Ad Platforms Phase A)
+// ═════════════════════════════════════════════════════════════════════
+
+function summarizeAds(cred) {
+  if (!cred) return null;
+  const pd = cred.platformData || {};
+  return {
+    id:               String(cred._id),
+    type:             cred.type,
+    status:           cred.status,
+    pending:          cred.status === 'pending',
+    adAccountId:      pd.adAccountId      || null,
+    adAccountName:    pd.adAccountName    || null,
+    accountIdNumeric: pd.accountIdNumeric || null,
+    currency:         pd.currency         || null,
+    timezone:         pd.timezone         || null,
+    businessId:       pd.businessId       || null,
+    businessName:     pd.businessName     || null,
+    expiresAt:        cred.expiresAt      || null,
+    connectedAt:      cred.connectedAt    || null
+  };
+}
+
+// GET /meta-ads/status — list active + pending Meta Ads credentials.
+router.get('/meta-ads/status', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const creds = await IntegrationCredential.find(tenantFilter(req, {
+      brandId, type: 'meta-ads', status: { $in: ['active', 'pending'] }
+    })).sort({ connectedAt: 1 }).lean();
+    res.json({
+      configured:  metaAds.isConfigured(),
+      credentials: creds.map(summarizeAds)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'meta-ads status failed' });
+  }
+});
+
+// POST /meta-ads/connect — returns the Meta authorize URL with a
+// signed state token carrying brand context and a 'meta-ads-oauth'
+// purpose so the callback knows which flow it's serving.
+router.post('/meta-ads/connect', express.json(), async (req, res) => {
+  try {
+    if (!metaAds.isConfigured()) {
+      return res.status(501).json({ error: 'Meta Ads OAuth not configured (set META_APP_ID, META_APP_SECRET, META_ADS_REDIRECT_URI)' });
+    }
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+
+    const state = jwt.sign(
+      {
+        purpose:      'meta-ads-oauth',
+        userId:       String(req.user.userId || req.user.id),
+        advertiserId: String(req.advertiserId),
+        brandId:      String(brandId),
+        nonce:        Math.random().toString(36).slice(2)
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+    res.json({ authorizeUrl: metaAds.buildAuthorizeUrl({ state }) });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'meta-ads connect init failed' });
+  }
+});
+
+// GET /meta-ads/callback — Meta redirects here after consent. Auth
+// bypass configured in index.js (path === '/meta-ads/callback'); the
+// JWT state is the trust anchor.
+router.get('/meta-ads/callback', async (req, res) => {
+  const { code, state, error: oauthError, error_description } = req.query;
+  const bounce = (status, msg, setupId) => {
+    const params = new URLSearchParams({ ads_status: status });
+    if (msg)     params.set('ads_msg', msg);
+    if (setupId) params.set('ads_setup', setupId);
+    res.redirect(`${FRONTEND_URL}/brand.html?${params.toString()}`);
+  };
+
+  if (oauthError) return bounce('denied', String(error_description || oauthError));
+  if (!code || !state) return bounce('error', 'missing code or state');
+
+  let payload;
+  try {
+    payload = jwt.verify(String(state), process.env.JWT_SECRET);
+    if (payload.purpose !== 'meta-ads-oauth') throw new Error('wrong purpose');
+  } catch (err) {
+    return bounce('error', `invalid state: ${err.message}`);
+  }
+
+  try {
+    const short = await metaAds.exchangeCodeForToken(String(code));
+    if (!short?.access_token) throw new Error('no access_token in code-exchange response');
+    const long = await metaAds.exchangeForLongLivedToken(short.access_token);
+    if (!long?.access_token) throw new Error('no access_token in long-lived exchange');
+    const metaUserId = await metaAds.fetchMetaUserId(long.access_token);
+
+    const expiresAt = long.expires_in ? new Date(Date.now() + long.expires_in * 1000) : null;
+    const cred = await IntegrationCredential.create({
+      advertiserId:   payload.advertiserId,
+      brandId:        payload.brandId,
+      type:           'meta-ads',
+      status:         'pending',
+      accessTokenEnc: encrypt(long.access_token),
+      expiresAt,
+      scopes:         metaAds.SCOPES,
+      metaUserId,
+      connectedBy:    payload.userId,
+      connectedAt:    new Date()
+    });
+    console.log(`🔑 Meta Ads token captured (pending selection): brand=${payload.brandId} cred=${cred._id}`);
+    return bounce('pending', 'pick an ad account', String(cred._id));
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.message;
+    console.warn(`   ⚠️  Meta Ads callback failed: ${detail}`);
+    return bounce('error', detail);
+  }
+});
+
+// GET /meta-ads/:credentialId/options — list ad accounts the token
+// can access. Drives the picker UI.
+router.get('/meta-ads/:credentialId/options', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      _id: req.params.credentialId, brandId, type: 'meta-ads',
+      status: { $in: ['pending', 'active'] }
+    }));
+    if (!cred) return res.status(404).json({ error: 'credential not found or revoked' });
+
+    const { decrypt } = require('../services/integrationCryptoService');
+    let token;
+    try { token = decrypt(cred.accessTokenEnc); }
+    catch (err) { return res.status(500).json({ error: `token decrypt failed: ${err.message}` }); }
+
+    const adAccounts = await metaAds.listAdAccounts(token);
+    res.json({
+      options: { adAccounts },
+      current: { adAccountId: cred.platformData?.adAccountId || null }
+    });
+  } catch (err) {
+    console.error('meta-ads options failed:', err);
+    res.status(500).json({ error: err.message || 'options enumerate failed' });
+  }
+});
+
+// PATCH /meta-ads/:credentialId/selection
+// Body: { adAccountId }
+//   Validates the picked id is in the token-accessible accounts, then
+//   updates the credential and flips status to 'active'.
+router.patch('/meta-ads/:credentialId/selection', express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      _id: req.params.credentialId, brandId, type: 'meta-ads',
+      status: { $in: ['pending', 'active'] }
+    }));
+    if (!cred) return res.status(404).json({ error: 'credential not found or revoked' });
+
+    const adAccountId = (req.body || {}).adAccountId;
+    if (!adAccountId) return res.status(400).json({ error: 'adAccountId required' });
+
+    const { decrypt } = require('../services/integrationCryptoService');
+    let token;
+    try { token = decrypt(cred.accessTokenEnc); }
+    catch (err) { return res.status(500).json({ error: `token decrypt failed: ${err.message}` }); }
+
+    const accounts = await metaAds.listAdAccounts(token);
+    const matched  = accounts.find(a => a.id === adAccountId);
+    if (!matched) return res.status(400).json({ error: 'adAccountId not in token-accessible ad accounts' });
+
+    // Cross-credential conflict check — same brand can't bind the
+    // same ad account twice.
+    const conflict = await IntegrationCredential.findOne({
+      _id:      { $ne: cred._id },
+      brandId, type: 'meta-ads', status: 'active',
+      'platformData.adAccountId': adAccountId
+    }).select('_id').lean();
+    if (conflict) {
+      return res.status(409).json({ error: `Another active credential already binds ${matched.name || adAccountId}; disconnect it first.` });
+    }
+
+    cred.platformData = {
+      adAccountId:      matched.id,
+      adAccountName:    matched.name || null,
+      accountIdNumeric: matched.accountIdNumeric || null,
+      currency:         matched.currency || null,
+      timezone:         matched.timezone || null,
+      businessId:       matched.business?.id   || null,
+      businessName:     matched.business?.name || null
+    };
+    cred.markModified('platformData');
+    cred.status = 'active';
+    await cred.save();
+
+    console.log(`✅ Meta Ads selection finalized: brand=${brandId} cred=${cred._id} adAccount=${matched.name || matched.id}`);
+    res.json({ ok: true, credential: summarizeAds(cred) });
+  } catch (err) {
+    console.error('meta-ads selection failed:', err);
+    res.status(500).json({ error: err.message || 'selection update failed' });
+  }
+});
+
+// DELETE /meta-ads/:credentialId — revoke a single Meta Ads cred.
+router.delete('/meta-ads/:credentialId', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOneAndUpdate(
+      tenantFilter(req, { _id: req.params.credentialId, brandId, type: 'meta-ads', status: { $in: ['active', 'pending'] } }),
+      { $set: { status: 'revoked', revokedAt: new Date(), revokedBy: req.user.userId || req.user.id } },
+      { new: true }
+    );
+    if (!cred) return res.status(404).json({ error: 'credential not found or already revoked' });
+    res.json({ ok: true, credentialId: String(cred._id) });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'meta-ads disconnect failed' });
   }
 });
 

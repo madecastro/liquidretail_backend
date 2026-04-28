@@ -15,7 +15,7 @@ const integrationCredentialSchema = new mongoose.Schema({
   advertiserId: { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', required: true, index: true },
   brandId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',      required: true, index: true },
 
-  type:   { type: String, enum: ['instagram'], required: true },
+  type:   { type: String, enum: ['instagram', 'meta-ads', 'google-ads'], required: true },
   // 'pending' = token captured but the user hasn't picked which Page /
   // IG Business account / catalog to bind yet (V2.5 picker flow).
   // Pending rows skip sync and the partial-unique-active index.
@@ -47,6 +47,14 @@ const integrationCredentialSchema = new mongoose.Schema({
   igUsername:   String,
   pageName:     String,
 
+  // Generic per-platform identifiers + display fields. Shape varies
+  // by type:
+  //   meta-ads   → { adAccountId, adAccountName, accountIdNumeric, currency, timezone, businessId, businessName }
+  //   google-ads → { customerId, customerName, managerCustomerId, currencyCode, timeZone }
+  // Kept Mixed so each platform can evolve its identifier shape
+  // without a schema migration.
+  platformData: mongoose.Schema.Types.Mixed,
+
   // Audit trail
   connectedAt:  { type: Date, default: Date.now },
   connectedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -64,17 +72,50 @@ const integrationCredentialSchema = new mongoose.Schema({
 
 // V2 #5 — multi-page support. Compound unique index on
 // (brandId, type, igUserId) so a brand can hold more than one active
-// IG credential, but cannot connect the same IG account twice. Revoked
-// rows are excluded from the partial filter so they don't conflict.
+// IG credential but cannot connect the same IG account twice. Limited
+// to IG rows so meta-ads / google-ads rows (which have null igUserId)
+// don't false-match each other.
 //
-// MIGRATION NOTE: V1 shipped a (brandId, type) unique index named
-// "brandId_1_type_1". After deploying this change you must drop the
-// legacy index manually — Mongoose only adds new indexes, it doesn't
-// remove obsolete ones:
-//   db.integrationcredentials.dropIndex("brandId_1_type_1")
+// MIGRATION NOTE: drop legacy indexes manually after deploying:
+//   db.integrationcredentials.dropIndex("brandId_1_type_1")        // V1 → V2#5
+//   db.integrationcredentials.dropIndex("brandId_1_type_1_igUserId_1") // V2#5 → Ad Platforms Phase A
 integrationCredentialSchema.index(
   { brandId: 1, type: 1, igUserId: 1 },
-  { unique: true, partialFilterExpression: { status: 'active' } }
+  {
+    unique: true,
+    partialFilterExpression: {
+      status: 'active',
+      type:   'instagram',
+      igUserId: { $exists: true }
+    }
+  }
+);
+
+// Ad Platforms Phase A — meta-ads + google-ads each scoped on their
+// own external account id (stored under platformData.adAccountId or
+// platformData.customerId). One active credential per ad account
+// per Brand; revoked rows excluded.
+integrationCredentialSchema.index(
+  { brandId: 1, type: 1, 'platformData.adAccountId': 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      status: 'active',
+      type:   'meta-ads',
+      'platformData.adAccountId': { $exists: true }
+    }
+  }
+);
+integrationCredentialSchema.index(
+  { brandId: 1, type: 1, 'platformData.customerId': 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      status: 'active',
+      type:   'google-ads',
+      'platformData.customerId': { $exists: true }
+    }
+  }
 );
 
 module.exports = mongoose.model('IntegrationCredential', integrationCredentialSchema);
