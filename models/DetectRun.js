@@ -19,7 +19,7 @@ const detectRunSchema = new mongoose.Schema({
   stage:      String,                                  // current stage for progress UI
   stageTimings: { type: mongoose.Schema.Types.Mixed, default: {} },
 
-  trigger:    { type: String, enum: ['upload', 'webhook', 'manual_rerun'], default: 'upload' },
+  trigger:    { type: String, enum: ['upload', 'webhook', 'manual_rerun', 'instagram-sync'], default: 'upload' },
   pipelineVersion: String,
   modelVersions:   { type: mongoose.Schema.Types.Mixed, default: {} },
 

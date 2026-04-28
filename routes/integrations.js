@@ -18,6 +18,7 @@ const { tenantFilter } = require('../middleware/tenantHelpers');
 const { encrypt } = require('../services/integrationCryptoService');
 const ig = require('../services/instagramOAuthService');
 const { syncCatalog, getCatalogStatus } = require('../services/catalogSyncService');
+const { syncPosts, getPostsStatus } = require('../services/postSyncService');
 
 const FRONTEND_URL = 'https://liquidretail.netlify.app';
 
@@ -194,6 +195,44 @@ router.post('/instagram/sync-catalog', async (req, res) => {
   } catch (err) {
     console.error('catalog sync failed:', err);
     res.status(500).json({ error: err.message || 'catalog sync failed' });
+  }
+});
+
+// ── Posts status ─────────────────────────────────────────────────────
+router.get('/instagram/posts-status', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      brandId, type: 'instagram', status: 'active'
+    })).select('_id').lean();
+    if (!cred) return res.json({ connected: false, postCount: 0, lastIngestedAt: null });
+    const status = await getPostsStatus(brandId);
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'posts status failed' });
+  }
+});
+
+// ── Posts sync ───────────────────────────────────────────────────────
+// Pulls recent IG posts/reels, mirrors media to Cloudinary, creates
+// Media + DetectRun for each NEW post. Idempotent — already-ingested
+// posts skip. Foreground; capped at 50 posts per call.
+router.post('/instagram/sync-posts', express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      brandId, type: 'instagram', status: 'active'
+    })).select('_id').lean();
+    if (!cred) return res.status(404).json({ error: 'no active Instagram credential for this brand' });
+    const limit = Math.min(Number(req.body?.limit) || 25, 50);
+    const result = await syncPosts(brandId, { limit });
+    if (!result.ok) return res.status(400).json(result);
+    res.json(result);
+  } catch (err) {
+    console.error('IG post sync failed:', err);
+    res.status(500).json({ error: err.message || 'IG post sync failed' });
   }
 });
 

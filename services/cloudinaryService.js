@@ -32,4 +32,19 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
   });
 }
 
-module.exports = { uploadBufferToCloudinary };
+// Mirror a remote URL into Cloudinary. Used by the IG post sync — Meta's
+// CDN URLs expire after a few hours, so we hand the URL to Cloudinary's
+// fetch loader to land a permanent copy. Returns the upload result.
+function uploadUrlToCloudinary(remoteUrl, opts = {}) {
+  return cloudinary.uploader.upload(remoteUrl, {
+    folder: 'liquidretail',
+    public_id: _uniqueId(),
+    unique_filename: false,
+    overwrite: false,
+    resource_type: opts.resourceType || 'image',
+    ...(opts.folder    ? { folder: opts.folder } : {}),
+    ...(opts.publicId  ? { public_id: opts.publicId } : {})
+  });
+}
+
+module.exports = { uploadBufferToCloudinary, uploadUrlToCloudinary };
