@@ -21,6 +21,7 @@ const meRoutes     = require('./routes/me');
 const onboardingRoutes = require('./routes/onboarding');
 const invitationRoutes = require('./routes/invitations');
 const memberRoutes     = require('./routes/members');
+const integrationRoutes = require('./routes/integrations');
 const aiLayoutRoutes = require('./routes/aiLayouts');
 const requireAuth = require('./middleware/requireAuth');
 
@@ -116,6 +117,14 @@ app.use('/api/invitations', (req, res, next) => {
   return requireAuth(req, res, next);
 }, invitationRoutes);
 app.use('/api/members',     requireAuth, memberRoutes);
+// Integrations: Meta OAuth callback comes from a browser redirect with
+// no JWT — security on /instagram/callback comes from the signed state
+// param, not a session. Skip global requireAuth for that path; require
+// auth on every other integrations endpoint.
+app.use('/api/integrations', (req, res, next) => {
+  if (req.path === '/instagram/callback') return next();
+  return requireAuth(req, res, next);
+}, integrationRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
