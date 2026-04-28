@@ -144,16 +144,20 @@ router.patch('/:id', express.json(), async (req, res) => {
     const editable = ['name', 'websiteUrl', 'tagline', 'summary', 'logoUrl',
                       'primaryColor', 'secondaryColor', 'accentColor', 'fontFamily',
                       'tone', 'hashtags', 'tags'];
-    // If the user explicitly sets fontFamily, that's curated.
     const fontTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'fontFamily');
+    const fontCleared = fontTouched && (req.body.fontFamily == null || req.body.fontFamily === '');
     const before = { websiteUrl: brand.websiteUrl };
     const curatedSet = new Set(brand.curatedFields || []);
 
     for (const k of editable) {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
         const v = req.body[k];
-        brand[k] = v == null || v === '' ? null : v;
-        curatedSet.add(k);
+        const isEmpty = v == null || v === '' || (Array.isArray(v) && v.length === 0);
+        brand[k] = isEmpty ? (Array.isArray(v) ? [] : null) : v;
+        // Clearing a field is a request to RE-enrich it, not lock the
+        // empty value as curated. Setting a value is curation.
+        if (isEmpty) curatedSet.delete(k);
+        else         curatedSet.add(k);
       }
     }
     // Renormalize the slug if name changed.
@@ -161,7 +165,9 @@ router.patch('/:id', express.json(), async (req, res) => {
       brand.nameNormalized = normalizeBrandName(brand.name);
     }
     brand.curatedFields = [...curatedSet];
-    if (fontTouched) brand.fontSource = 'curated';
+    // Font provenance: setting a value = 'curated'; clearing = null so
+    // the next enrichment can re-attribute it to whichever tier wins.
+    if (fontTouched) brand.fontSource = fontCleared ? null : 'curated';
     await brand.save();
 
     // Re-enrich when the websiteUrl actually changed (new domain →
