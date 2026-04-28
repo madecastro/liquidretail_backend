@@ -49,6 +49,13 @@ router.get('/', async (req, res) => {
       fileName:       d.fileName,
       brand:          d.metadata?.brand || null,
       caption:        d.metadata?.caption || null,
+      // IG-sourced extras — null for manual uploads. Surfaced so the
+      // inventory picker can show a "Instagram post / reel" pill and
+      // link out to the original permalink.
+      permalink:      d.metadata?.permalink || null,
+      postedAt:       d.metadata?.postedAt || null,
+      creatorHandle:  d.metadata?.creatorHandle || null,
+      postType:       d.metadata?.postType || null,
       rightsApproved: !!d.rights?.approved,
       ready:          !!d.latestArtifacts?.detection,
       createdAt:      d.createdAt

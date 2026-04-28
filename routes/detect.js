@@ -217,7 +217,20 @@ async function assembleResult(run) {
     overlayZones: overlayZones?.zones || {},
 
     transcript: detection?.transcript || null,
-    stageTimings
+    stageTimings,
+
+    // Origin metadata — surfaced so the UI can show "Instagram post"
+    // vs "Manual upload" pills and (for IG-sourced) link out to the
+    // permalink and show creator handle / posted date.
+    mediaSource: {
+      source:        media.source,
+      externalId:    media.externalId,
+      sourceUrl:     media.sourceUrl  || null,
+      permalink:     media.metadata?.permalink || null,
+      postedAt:      media.metadata?.postedAt || null,
+      creatorHandle: media.metadata?.creatorHandle || null,
+      postType:      media.metadata?.postType || null
+    }
   };
 }
 
