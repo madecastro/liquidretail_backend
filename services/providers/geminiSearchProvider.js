@@ -160,54 +160,102 @@ async function lookupBrandCategoryUrl({ brandUrl, brandName, label, category }) 
 // specific product was identifiable — surfaces overall brand sentiment
 // quotes that downstream templates can use in place of product reviews.
 // Returns { quotes: [{ text, author?, source? }], rating?, reviewCount?, reasoning }.
+// Two-pass: grounded-search Gemini returns prose (it ignores JSON
+// formatting requests when the google_search tool is enabled), so we
+// run a second plain call with responseMimeType: application/json to
+// structure the narrative into typed fields.
 async function lookupBrandReviews({ brandName, brandUrl }) {
   if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
   if (!brandName) return null;
 
   const t0 = Date.now();
-  const prompt =
+
+  // ── Pass 1: grounded narrative ──
+  const searchPrompt =
     `Use Google Search to find what real customers say about the BRAND ${brandName}` +
     (brandUrl ? ` (${brandUrl})` : '') +
-    `. We're not looking for a specific product — we want the brand's overall ` +
-    `reputation: what people consistently praise, common quotes from review aggregators ` +
-    `(Trustpilot, Sitejabber, Better Business Bureau, Reddit, brand site testimonials).\n\n` +
-    `Respond as JSON only (no preamble):\n` +
-    `{\n` +
-    `  "quotes":     [ { "text": "...", "author": "name or handle if known", "source": "domain or platform" }, ... 3 to 6 ],\n` +
-    `  "rating":     <average star rating across sources, 0-5, or null>,\n` +
-    `  "reviewCount":<approximate total review count seen, or null>,\n` +
-    `  "summary":    "one sentence on overall brand sentiment"\n` +
-    `}`;
+    `. Surface 4-6 SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) from review ` +
+    `aggregators (Trustpilot, Sitejabber, BBB), Reddit threads, and brand-site testimonials. ` +
+    `For each quote, name the source platform and the author/handle if visible. Also note the ` +
+    `overall average star rating (0-5) and approximate total review count if you can see them, ` +
+    `plus a one-sentence summary of the brand's reputation. Write naturally — do not format as JSON.`;
 
-  let res;
+  let searchRes;
   try {
-    res = await axios.post(
+    searchRes = await axios.post(
       `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
       {
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 1200 }
+        generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
       },
       { timeout: 30000 }
     );
   } catch (err) {
-    console.warn(`   ⚠️  brand-reviews lookup failed: ${err.message}`);
+    console.warn(`   ⚠️  brand-reviews search failed: ${err.message}`);
     return null;
   }
 
-  const candidate = res.data?.candidates?.[0];
-  const text = (candidate?.content?.parts || []).map(p => p.text || '').join(' ').trim();
+  const searchCand = searchRes.data?.candidates?.[0];
+  const narrative = (searchCand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
+  const sourceDomains = (searchCand?.groundingMetadata?.groundingChunks || [])
+    .map(c => c.web?.uri && extractDomain(c.web.uri))
+    .filter(Boolean)
+    .filter((d, i, a) => a.indexOf(d) === i)
+    .slice(0, 10);
 
-  // Find the JSON object in the response (Gemini sometimes wraps it in
-  // markdown despite the prompt).
+  if (!narrative || narrative.length < 100) {
+    console.warn(`   · brand-reviews: search returned no narrative for ${brandName}`);
+    return { quotes: [], rating: null, reviewCount: null, summary: null, source: PROVIDER_NAME };
+  }
+
+  // ── Pass 2: structure as JSON ──
+  // Plain Gemini call (no tools) with JSON mime — reliably honors
+  // formatting when there's no google_search tool muddying things.
+  const structurePrompt =
+    `Convert the following brand-review narrative into structured JSON.\n\n` +
+    `Brand: ${brandName}\n` +
+    (sourceDomains.length ? `Sources cited: ${sourceDomains.join(', ')}\n` : '') +
+    `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
+    `Return EXACTLY this shape (no commentary, no markdown):\n` +
+    `{\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null" }, 3-6 entries ],\n` +
+    `  "rating":      <number 0-5 or null>,\n` +
+    `  "reviewCount": <integer or null>,\n` +
+    `  "summary":     "one sentence on overall brand sentiment"\n` +
+    `}\n` +
+    `Use direct quotes verbatim from the narrative; do NOT paraphrase or invent quotes that aren't present.`;
+
+  let structRes;
+  try {
+    structRes = await axios.post(
+      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+      {
+        contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 1200,
+          responseMimeType: 'application/json'
+        }
+      },
+      { timeout: 30000 }
+    );
+  } catch (err) {
+    console.warn(`   ⚠️  brand-reviews structuring failed: ${err.message}`);
+    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
+  }
+
+  const structCand = structRes.data?.candidates?.[0];
+  const jsonText = (structCand?.content?.parts || []).map(p => p.text || '').join('').trim();
+
   let parsed = null;
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    try { parsed = JSON.parse(jsonMatch[0]); } catch (_) { /* fall through */ }
+  try { parsed = JSON.parse(jsonText); } catch (_) {
+    const m = jsonText.match(/\{[\s\S]*\}/);
+    if (m) { try { parsed = JSON.parse(m[0]); } catch (_) {} }
   }
   if (!parsed) {
-    console.warn(`   · brand-reviews: no parsable JSON for ${brandName}`);
-    return { quotes: [], rating: null, reviewCount: null, summary: text.slice(0, 200), source: PROVIDER_NAME };
+    console.warn(`   · brand-reviews: structuring produced no parsable JSON for ${brandName}`);
+    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
   }
 
   const result = {
@@ -217,7 +265,7 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
     summary:     parsed.summary || null,
     source:      PROVIDER_NAME
   };
-  console.log(`   ✓ brand-reviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''}${result.reviewCount != null ? ` · ${result.reviewCount.toLocaleString()} reviews` : ''} (${Date.now() - t0}ms)`);
+  console.log(`   ✓ brand-reviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''}${result.reviewCount != null ? ` · ${result.reviewCount.toLocaleString()} reviews` : ''} (${Date.now() - t0}ms, two-pass)`);
   return result;
 }
 
