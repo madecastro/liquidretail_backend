@@ -201,6 +201,7 @@ async function runImagePipeline(run, media, buffer) {
     productMatches = await findProductMatches({
       brand:          media.metadata?.brand,
       brandUrl:       media.metadata?.brandUrl,
+      advertiserId:   media.advertiserId || null,
       category:       media.metadata?.category,
       caption:        media.metadata?.caption,
       primarySubject: primarySubjectDesc,
@@ -430,6 +431,7 @@ async function runVideoPipeline(run, media, buffer) {
     productMatches = await findProductMatches({
       brand:          media.metadata?.brand,
       brandUrl:       media.metadata?.brandUrl,
+      advertiserId:   media.advertiserId || null,
       category:       media.metadata?.category,
       caption:        media.metadata?.caption,
       primarySubject: primarySubjectDesc,

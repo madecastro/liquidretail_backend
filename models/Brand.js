@@ -67,10 +67,25 @@ const brandSchema = new mongoose.Schema({
 
   // Which auto-enrichment sources have been ATTEMPTED on this brand
   // (regardless of whether each returned data). Drives re-enrichment
-  // logic — if 'brandfetch' is missing, we re-run enrichment so the
-  // brand-kit lookup can backfill. Values: 'brandfetch' | 'scraped' |
-  // 'gpt'. Resets only when curation explicitly removes a field.
+  // logic — if a tier is missing, we re-run enrichment so it can
+  // backfill. Values: 'brandfetch' | 'scraped' | 'gpt' | 'brand-reviews'.
+  // Resets when curation explicitly removes a field, when the
+  // websiteUrl changes, or via /refresh-enrichment.
   enrichmentSources: [String],
+
+  // Brand-level review snapshot. Populated by enrichBrandFromUrl
+  // (Tier 4 — Gemini grounded search for "<brand> reviews"). Cached
+  // on Brand so per-Media brand_match outcomes share one fetch
+  // rather than re-querying Gemini every detect run. Refreshed via
+  // POST /api/brand/:id/refresh-enrichment or when stale (TTL
+  // checked at consumer side).
+  // Shape:
+  //   { quotes: [{ text, author, source }],
+  //     rating: 0-5 | null,
+  //     reviewCount: number | null,
+  //     summary: string | null,
+  //     fetchedAt: Date }
+  brandReviews:    mongoose.Schema.Types.Mixed,
 
   // If stub, which Media was the first to surface this brand — useful for
   // auditing where a brand came from.

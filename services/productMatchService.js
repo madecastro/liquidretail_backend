@@ -34,6 +34,13 @@ const googleLens   = require('./providers/googleLensProvider');
 const { identifyProduct } = require('./productReasoner');
 const productDetails  = require('./productDetailsService');
 const productCategory = require('./productCategoryService');
+const Brand           = require('../models/Brand');
+const { normalizeBrandName } = require('../models/Brand');
+
+// How long a cached Brand.brandReviews snapshot is considered fresh
+// before we re-fetch. 30 days — brand sentiment moves slowly enough
+// that older data is still representative for ad creative.
+const BRAND_REVIEWS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 const PROVIDERS = [
   geminiSearch,
@@ -56,6 +63,7 @@ const CATEGORY_UPPER   = 0.84;   // ≤ 0.84
 async function findProductMatches({
   brand, category, caption, primarySubject, textDetected, imageUrl,
   brandUrl,                     // brand homepage (used by category + branding lookups)
+  advertiserId = null,          // tenant scope — needed to find the cached Brand for brand-reviews lookup
   yoloIdentifications = []      // [{ identification: { label, brand, category, confidence, ... } }]
 }) {
   const enabled = PROVIDERS.filter(p => p.isEnabled());
@@ -175,9 +183,13 @@ async function findProductMatches({
     }
   }
 
-  // Brand reviews — only for brand_match outcomes.
+  // Brand reviews — only for brand_match outcomes. Read from the
+  // cached Brand.brandReviews (Phase: standalone branding) when
+  // available + fresh; fall back to a fresh Gemini call otherwise.
+  // Note the cached version still gets persisted to the per-Media
+  // ProductMatchArtifact for audit / historical record.
   if (outcome === 'brand_match') {
-    brandReviews = await tryLookupBrandReviews(brand, brandUrl);
+    brandReviews = await fetchBrandReviewsCachedOrFresh({ brand, brandUrl, advertiserId });
   }
 
   console.log(`🎯 Match outcome: ${outcome}${winner ? ` (winner=${winner})` : ''} — ${outcomeReasoning}`);
@@ -343,6 +355,59 @@ async function tryLookupBrandReviews(brandName, brandUrl) {
     console.warn(`   ⚠️  brand-reviews lookup failed: ${err.message}`);
     return null;
   }
+}
+
+// Cache-aware brand-reviews fetch. Resolution order:
+//   1. If we can locate the Brand row by (advertiserId, normalized name)
+//      AND it has brandReviews with a fetchedAt within TTL → return cached.
+//   2. If we found the Brand but cache is missing/stale → fetch fresh,
+//      WRITE to Brand for next time, return.
+//   3. If we couldn't find a Brand (advertiser hasn't created one for
+//      this name yet) → fetch fresh, don't write, return.
+// Returns null if every path fails — caller persists null to artifact.
+async function fetchBrandReviewsCachedOrFresh({ brand: brandName, brandUrl, advertiserId }) {
+  if (!brandName) return null;
+
+  let brandDoc = null;
+  if (advertiserId) {
+    const normalized = normalizeBrandName(brandName);
+    if (normalized) {
+      brandDoc = await Brand.findOne({ advertiserId, nameNormalized: normalized });
+    }
+  }
+
+  // Cache hit?
+  if (brandDoc?.brandReviews?.quotes?.length) {
+    const fetchedAt = brandDoc.brandReviews.fetchedAt
+      ? new Date(brandDoc.brandReviews.fetchedAt).getTime() : 0;
+    const ageMs = Date.now() - fetchedAt;
+    if (ageMs < BRAND_REVIEWS_TTL_MS) {
+      console.log(`   · brand-reviews: cache hit for "${brandName}" (age ${Math.round(ageMs / 86400000)}d)`);
+      return brandDoc.brandReviews;
+    }
+    console.log(`   · brand-reviews: cache stale for "${brandName}" (age ${Math.round(ageMs / 86400000)}d > 30d), refetching`);
+  }
+
+  // Fresh fetch.
+  const fresh = await tryLookupBrandReviews(brandName, brandUrl);
+  if (!fresh || !Array.isArray(fresh.quotes) || fresh.quotes.length === 0) return fresh;
+
+  // Write back to the catalog if we have a row to write to.
+  if (brandDoc) {
+    try {
+      brandDoc.brandReviews = Object.assign({}, fresh, { fetchedAt: new Date() });
+      // Keep enrichmentSources in sync so /refresh-enrichment can
+      // detect 'brand-reviews' was attempted.
+      const sources = new Set(brandDoc.enrichmentSources || []);
+      sources.add('brand-reviews');
+      brandDoc.enrichmentSources = [...sources];
+      await brandDoc.save();
+      console.log(`   · brand-reviews: cached on Brand "${brandName}"`);
+    } catch (err) {
+      console.warn(`   ⚠️  brand-reviews cache write failed for "${brandName}": ${err.message}`);
+    }
+  }
+  return fresh;
 }
 
 module.exports = { findProductMatches };

@@ -20,6 +20,7 @@ const OpenAI = require('openai');
 
 const Brand = require('../models/Brand');
 const { lookupBrand: brandfetchLookup } = require('./brandfetchService');
+const { lookupBrandReviews } = require('./providers/geminiSearchProvider');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MAX_HTML_CHARS = 25000;
@@ -65,16 +66,18 @@ async function enrichBrandFromUrl(brandId) {
   const wantBrandfetch   = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
   const wantScraped      = !sourcesAttempted.has('scraped');
   const wantGpt          = !!process.env.OPENAI_API_KEY && !sourcesAttempted.has('gpt');
+  const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
 
-  if (!wantBrandfetch && !wantScraped && !wantGpt) {
+  if (!wantBrandfetch && !wantScraped && !wantGpt && !wantBrandReviews) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
 
   const t0 = Date.now();
   const planParts = [];
-  if (wantBrandfetch) planParts.push('brandfetch');
-  if (wantScraped)    planParts.push('scrape');
-  if (wantGpt)        planParts.push('gpt');
+  if (wantBrandfetch)   planParts.push('brandfetch');
+  if (wantScraped)      planParts.push('scrape');
+  if (wantGpt)          planParts.push('gpt');
+  if (wantBrandReviews) planParts.push('brand-reviews');
   console.log(`🌐 brand enrichment: ${brand.websiteUrl} for "${brand.name}" — running ${planParts.join('+')}${sourcesAttempted.size ? ` (already have: ${[...sourcesAttempted].join(', ')})` : ''}`);
 
   // ── Tier 1: Brandfetch ──
@@ -242,12 +245,41 @@ async function enrichBrandFromUrl(brandId) {
       toneHint:    d.toneHint || ''
     }));
   }
+
+  // ── Tier 4: Brand reviews (Gemini grounded search) ──
+  // Caches brand-level review snapshot on the Brand catalog so per-
+  // Media brand_match outcomes share one fetch instead of re-querying
+  // Gemini every detect run. Skipped when curation has explicitly
+  // marked the field protected.
+  let brandReviewsResult = null;
+  if (wantBrandReviews && !isCurated('brandReviews')) {
+    try {
+      brandReviewsResult = await lookupBrandReviews({
+        brandName: brand.name,
+        brandUrl:  brand.websiteUrl
+      });
+      if (brandReviewsResult && Array.isArray(brandReviewsResult.quotes) && brandReviewsResult.quotes.length) {
+        brandReviewsResult.fetchedAt = new Date();
+        brand.brandReviews = brandReviewsResult;
+        overrides.push({
+          field: 'brandReviews',
+          oldVal: '(none)',
+          newVal: `${brandReviewsResult.quotes.length} quote(s)${brandReviewsResult.rating ? `, ${brandReviewsResult.rating.toFixed(1)}★` : ''}`,
+          source: 'gemini-search'
+        });
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  brand-reviews tier failed for "${brand.name}": ${err.message}`);
+    }
+  }
+
   // Track which sources we ATTEMPTED on this run so subsequent runs
   // know whether to backfill (e.g. Brandfetch came online later).
   const newSourcesAttempted = new Set(brand.enrichmentSources || []);
-  if (wantBrandfetch) newSourcesAttempted.add('brandfetch');
-  if (wantScraped)    newSourcesAttempted.add('scraped');
+  if (wantBrandfetch)   newSourcesAttempted.add('brandfetch');
+  if (wantScraped)      newSourcesAttempted.add('scraped');
   if (wantGpt && !skipLLM) newSourcesAttempted.add('gpt');
+  if (wantBrandReviews) newSourcesAttempted.add('brand-reviews');
   brand.enrichmentSources = [...newSourcesAttempted];
 
   brand.source = 'enriched';
@@ -270,9 +302,10 @@ async function enrichBrandFromUrl(brandId) {
   const ranThisTime = [
     wantBrandfetch ? 'brandfetch' : null,
     wantScraped    ? 'scraped'    : null,
-    (wantGpt && !skipLLM) ? 'gpt'  : null
+    (wantGpt && !skipLLM) ? 'gpt'  : null,
+    wantBrandReviews ? 'brand-reviews' : null
   ].filter(Boolean).join('+');
-  console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
+  console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), ${brand.brandReviews?.quotes?.length || 0} brand review(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
   return { ok: true, brand, overrides };
 }
 
