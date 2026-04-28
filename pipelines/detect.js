@@ -24,7 +24,11 @@ const { extractEntities } = require('../services/nerService');
 const { findProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
-const { upsertBrandStub } = require('../services/brandCatalogService');
+// Brand catalog mutations no longer happen inside the detect pipeline
+// — Brand creation + enrichment is a user-driven concern triggered by
+// POST /api/brand (or PATCH /api/brand/:id). Detect can still
+// IDENTIFY a brand name on the Media, but linking that to the
+// Advertiser's brand catalog is the picker / members UI's job.
 
 const Media               = require('../models/Media');
 const DetectionArtifact   = require('../models/DetectionArtifact');
@@ -223,19 +227,11 @@ async function runImagePipeline(run, media, buffer) {
     brandReviews:     productMatches.brandReviews || null
   }) : null;
 
-  // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
-  // sighting, seeded with the detection background palette and the
-  // upload-form's Brand URL if present. The upsert is non-blocking for
-  // enrichment — brandCatalogService fires enrichment in the background
-  // when it first sees a websiteUrl for a non-curated Brand.
-  if (productMatches?.identification?.brand) {
-    await upsertBrandStub({
-      name:             productMatches.identification.brand,
-      paletteSeed:      background?.palette,
-      firstSeenMediaId: media._id,
-      websiteUrl:       media.metadata?.brandUrl || null
-    });
-  }
+  // (Brand-catalog upsert removed — brands are now created intentionally
+  // via the picker / members UI, not auto-stubbed from media uploads.
+  // The matching service still resolves productMatches.identification.brand
+  // as a name string for downstream copy generation; if the user wants
+  // that brand in their catalog, they create it explicitly.)
 
   // ── Overlay zones ──
   await setRunStage(run, 'overlay-zones');
@@ -458,19 +454,11 @@ async function runVideoPipeline(run, media, buffer) {
     brandReviews:     productMatches.brandReviews || null
   }) : null;
 
-  // Opportunistic brand-catalog upsert. Creates a stub Brand doc on first
-  // sighting, seeded with the detection background palette and the
-  // upload-form's Brand URL if present. The upsert is non-blocking for
-  // enrichment — brandCatalogService fires enrichment in the background
-  // when it first sees a websiteUrl for a non-curated Brand.
-  if (productMatches?.identification?.brand) {
-    await upsertBrandStub({
-      name:             productMatches.identification.brand,
-      paletteSeed:      background?.palette,
-      firstSeenMediaId: media._id,
-      websiteUrl:       media.metadata?.brandUrl || null
-    });
-  }
+  // (Brand-catalog upsert removed — brands are now created intentionally
+  // via the picker / members UI, not auto-stubbed from media uploads.
+  // The matching service still resolves productMatches.identification.brand
+  // as a name string for downstream copy generation; if the user wants
+  // that brand in their catalog, they create it explicitly.)
 
   // ── Overlay zones ──
   await setRunStage(run, 'overlay-zones');
