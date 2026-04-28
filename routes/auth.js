@@ -11,7 +11,13 @@ router.get('/google/callback',
   passport.authenticate('google', { failureRedirect: `${FRONTEND_URL}/login.html?error=1` }),
   (req, res) => {
     const token = jwt.sign(
-      { id: req.user.id, email: req.user.email, name: req.user.name, photo: req.user.photo },
+      {
+        id:     req.user.id,         // Google profile id (legacy, kept for compat)
+        userId: req.user.userId,     // persisted User._id — requireAuth re-fetches for fresh advertiserId
+        email:  req.user.email,
+        name:   req.user.name,
+        photo:  req.user.photo
+      },
       process.env.JWT_SECRET,
       { expiresIn: '24h' }
     );

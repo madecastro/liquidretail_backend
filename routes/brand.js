@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Brand = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
+const { tenantFilter } = require('../middleware/tenantHelpers');
 
 // GET /api/brand/by-name/:name
 // Returns the full Brand catalog document for a given brand name (case
@@ -12,7 +13,7 @@ router.get('/by-name/:name', async (req, res) => {
   try {
     const normalized = normalizeBrandName(req.params.name);
     if (!normalized) return res.status(400).json({ error: 'invalid brand name' });
-    const brand = await Brand.findOne({ nameNormalized: normalized }).lean();
+    const brand = await Brand.findOne(tenantFilter(req, { nameNormalized: normalized })).lean();
     if (!brand) return res.status(404).json({ error: 'brand not found', searched: normalized });
     res.json({ brand });
   } catch (err) {

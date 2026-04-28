@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 
 const { generateAiLayouts, DEFAULT_VARIANTS, DEFAULT_ASPECT_RATIOS } = require('../services/aiLayoutStudioService');
+const { assertMediaInTenant } = require('../middleware/tenantHelpers');
 
 // POST /api/ai-layouts/generate
 // Body: { mediaId, variants?, aspectRatios?, quality? }
@@ -14,6 +15,7 @@ router.post('/generate', express.json(), async (req, res) => {
   try {
     const { mediaId, variants, aspectRatios, quality } = req.body || {};
     if (!mediaId) return res.status(400).json({ error: 'mediaId required' });
+    await assertMediaInTenant(mediaId, req);
     const result = await generateAiLayouts({ mediaId, variants, aspectRatios, quality });
     res.json(result);
   } catch (err) {

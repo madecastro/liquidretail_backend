@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Media = require('../models/Media');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
+const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 
 // GET /api/media
 // Paginated list of media — most recent first. Supports `?ready=true` to
@@ -20,9 +21,9 @@ router.get('/', async (req, res) => {
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     const onlyReady = req.query.ready === 'true';
 
-    const filter = onlyReady
+    const filter = tenantFilter(req, onlyReady
       ? { 'latestArtifacts.detection': { $ne: null } }
-      : {};
+      : {});
 
     const [docs, total] = await Promise.all([
       Media.find(filter)
@@ -67,15 +68,14 @@ router.get('/', async (req, res) => {
 // reviews. 404 if the detect run hasn't reached product-match yet.
 router.get('/:mediaId/match', async (req, res) => {
   try {
-    const media = await Media.findById(req.params.mediaId).select('latestArtifacts').lean();
-    if (!media) return res.status(404).json({ error: 'Media not found' });
+    const media = await assertMediaInTenant(req.params.mediaId, req);
     const matchId = media.latestArtifacts?.match;
     if (!matchId) return res.status(404).json({ error: 'No match artifact for this media yet' });
     const match = await ProductMatchArtifact.findById(matchId).lean();
     if (!match) return res.status(404).json({ error: 'Match artifact missing from collection' });
     res.json({ match });
   } catch (err) {
-    res.status(500).json({ error: err.message || 'Match lookup failed' });
+    res.status(err.status || 500).json({ error: err.message || 'Match lookup failed' });
   }
 });
 
@@ -106,7 +106,13 @@ router.patch('/:mediaId/rights', express.json(), async (req, res) => {
           ...(typeof notes === 'string' ? { 'rights.notes': notes } : {})
         };
 
-    const media = await Media.findByIdAndUpdate(mediaId, { $set: update }, { new: true });
+    // Tenant-scoped update — Media._id alone isn't enough; cross-tenant
+    // updates must 404 to avoid information leak.
+    const media = await Media.findOneAndUpdate(
+      tenantFilter(req, { _id: mediaId }),
+      { $set: update },
+      { new: true }
+    );
     if (!media) return res.status(404).json({ error: 'Media not found' });
 
     res.json({

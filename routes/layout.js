@@ -3,6 +3,7 @@ const router = express.Router();
 
 const { buildLayoutInput, getCandidatesForMedia } = require('../services/layoutInputService');
 const registry = require('../services/templateRegistry');
+const { assertMediaInTenant } = require('../middleware/tenantHelpers');
 
 // POST /api/layout-input
 // Body: { mediaId, template, aspect_ratio, options?, refresh? }
@@ -24,6 +25,10 @@ router.post('/', express.json(), async (req, res) => {
     if (!mediaId || !template || !aspectRatio) {
       return res.status(400).json({ error: 'mediaId, template, aspect_ratio required' });
     }
+
+    // Tenant assertion — 404s rather than 403s on cross-tenant access
+    // so the existence of the row isn't leaked.
+    await assertMediaInTenant(mediaId, req);
 
     const input = await buildLayoutInput({
       mediaId, template, aspectRatio, options: options || {}, refresh: !!refresh
@@ -87,6 +92,7 @@ router.get('/canvas', (req, res) => {
 router.get('/candidates/:mediaId', async (req, res) => {
   try {
     const aspectRatio = req.query.aspect_ratio || '1:1';
+    await assertMediaInTenant(req.params.mediaId, req);
     const candidates = await getCandidatesForMedia(req.params.mediaId, aspectRatio);
     res.json({
       media_id: req.params.mediaId,

@@ -16,6 +16,7 @@ const Job = require('../models/Job');
 const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
 const geminiImg = require('../services/geminiImageService');
 const { setCuratedAsset } = require('../services/brandCatalogService');
+const { assertMediaInTenant, assertRunInTenant, tenantFilter } = require('../middleware/tenantHelpers');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -55,6 +56,7 @@ router.post('/', upload.fields([
     const externalId = `manual_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
     const media = await Media.create({
+      advertiserId: req.advertiserId,
       externalId,
       source:       'manual_upload',
       sourceUrl:    null,
@@ -98,6 +100,7 @@ router.post('/', upload.fields([
     }
 
     const run = await DetectRun.create({
+      advertiserId: req.advertiserId,
       mediaId: media._id,
       status:  'queued',
       stage:   'queued',
@@ -122,8 +125,10 @@ router.post('/', upload.fields([
 // storage is normalized; this endpoint denormalizes for caller convenience.
 router.get('/status/:runId', async (req, res) => {
   try {
-    const run = await DetectRun.findById(req.params.runId);
-    if (!run) return res.status(404).json({ error: 'DetectRun not found' });
+    // Tenant-scoped lookup; falls back to parent-Media check for legacy
+    // runs that pre-date the phase-1 backfill.
+    const runLean = await assertRunInTenant(req.params.runId, req);
+    const run = await DetectRun.findById(runLean._id);
 
     let result = null;
     if (run.status === 'completed' || run.status === 'failed') {
@@ -141,7 +146,7 @@ router.get('/status/:runId', async (req, res) => {
       errorStage: run.status === 'failed' ? run.errorStage : null
     });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch status', message: err.message });
+    res.status(err.status || 500).json({ error: 'Failed to fetch status', message: err.message });
   }
 });
 
