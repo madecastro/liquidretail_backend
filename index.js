@@ -19,6 +19,8 @@ const mediaRoutes  = require('./routes/media');
 const brandRoutes  = require('./routes/brand');
 const meRoutes     = require('./routes/me');
 const onboardingRoutes = require('./routes/onboarding');
+const invitationRoutes = require('./routes/invitations');
+const memberRoutes     = require('./routes/members');
 const aiLayoutRoutes = require('./routes/aiLayouts');
 const requireAuth = require('./middleware/requireAuth');
 
@@ -104,6 +106,16 @@ app.use('/api/me',    requireAuth, meRoutes);
 // they can create one. Mounting requireAuth here would 403 every
 // onboarding attempt.
 app.use('/api/onboarding', onboardingRoutes);
+// Invitations: management routes (POST/GET list/DELETE :id) need
+// requireAuth, but the /by-token preview is public and /by-token/accept
+// uses requireUserOnly internally. Skip global requireAuth on the
+// /by-token paths so anonymous preview + auth-only-not-membership
+// accept both work.
+app.use('/api/invitations', (req, res, next) => {
+  if (req.path.startsWith('/by-token/') || req.path === '/by-token') return next();
+  return requireAuth(req, res, next);
+}, invitationRoutes);
+app.use('/api/members',     requireAuth, memberRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
