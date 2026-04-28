@@ -125,24 +125,37 @@ async function enrichBrandFromUrl(brandId) {
   const scrapedLogoUrl     = extractAppleTouchIcon(html, brand.websiteUrl);
   const scrapedFontFamily  = extractGoogleFontsFamily(html);
 
-  const textContent = extractTextFromHtml(html).slice(0, MAX_HTML_CHARS);
-  // If HTML was bot-blocked but Brandfetch gave us colors/logo/fonts, we
-  // can still write that visual data and skip the GPT-text step gracefully.
+  const rawTextContent = extractTextFromHtml(html).slice(0, MAX_HTML_CHARS);
+  // JS-rendered SPAs (Next.js, Shopify Hydrogen, etc.) leave almost
+  // nothing readable in the initial HTML. If Brandfetch gave us a
+  // description we use that as substitute context so GPT can still
+  // produce tagline/summary/tone/personas/hashtags/tags/fontSuggestion.
+  const htmlTooShort = rawTextContent.length < 200;
+  const bfDescription = [bf?.description, bf?.longDescription].filter(Boolean).join('\n\n');
+  const usingBfFallback = htmlTooShort && bfDescription.length >= 80;
+  const textContent = usingBfFallback ? bfDescription : rawTextContent;
+  const sourceLabel = usingBfFallback ? 'Brandfetch description (homepage HTML was JS-rendered)' : 'the homepage (HTML stripped)';
+
+  if (usingBfFallback) {
+    console.log(`   · GPT input swap: HTML scrape too short (${rawTextContent.length} chars) — using Brandfetch description (${bfDescription.length} chars) as context`);
+  }
+
+  // Without usable text AND without Brandfetch data, there's nothing to ship.
   const skipLLM = textContent.length < 200;
   if (skipLLM && !bf) {
-    console.warn(`   ⚠️  brand enrichment: ${brand.websiteUrl} returned too little text (${textContent.length} chars) — likely bot-blocked, no Brandfetch fallback`);
+    console.warn(`   ⚠️  brand enrichment: ${brand.websiteUrl} returned too little text (${rawTextContent.length} chars) — likely bot-blocked, no Brandfetch fallback`);
     return { ok: false, reason: 'too little text and no Brandfetch data' };
   }
 
   // ── Tier 3: GPT-4.1 text extraction ──
-  // Skipped when we have no usable text (bot-blocked) OR when GPT was
-  // already attempted on a previous run. Brandfetch alone can ship
-  // partial enrichment without GPT.
+  // Skipped when we have no usable text (bot-blocked, no Brandfetch
+  // description) OR when GPT was already attempted on a previous run.
+  // Brandfetch alone can ship partial enrichment without GPT.
   let enrichment = {};
   if (!skipLLM && wantGpt) {
     const prompt =
-      `You are analyzing the homepage of "${brand.name}" (${brand.websiteUrl}) to fill a brand catalog entry.\n\n` +
-      `Source text from the homepage (HTML stripped):\n"""\n${textContent}\n"""\n\n` +
+      `You are analyzing "${brand.name}" (${brand.websiteUrl}) to fill a brand catalog entry.\n\n` +
+      `Source text from ${sourceLabel}:\n"""\n${textContent}\n"""\n\n` +
       `Return JSON matching the schema. Rules:\n` +
       `- "tagline": one line (≤ 12 words), the brand's own positioning if visible on the page; omit if you can't find it.\n` +
       `- "summary": 2–4 sentences describing who the brand is, what they make, who they serve, and what makes them distinct. Written for someone who has never heard of them. Avoid marketing fluff — concrete and specific.\n` +
@@ -217,10 +230,16 @@ async function enrichBrandFromUrl(brandId) {
   // Tracked on brand.fontSource so the UI can mark approximated
   // fonts as "(suggested)".
   const toneDefault = toneToDefaultFont(enrichment.tone || brand.tone);
+  // Brandfetch occasionally returns a CSS variable reference instead of
+  // a real font name — reject those so we fall through to a usable tier.
+  const bfFont = isValidFontName(bf?.fontFamily) ? bf.fontFamily : null;
+  if (bf?.fontFamily && !bfFont) {
+    console.log(`   · brandfetch font rejected (not a real family name): ${bf.fontFamily}`);
+  }
   let [fontVal, fontSrc] = pick(
-    [bf?.fontFamily, 'brandfetch'],
-    [scrapedFontFamily, 'scraped'],
-    [enrichment.fontSuggestion, 'suggested'],
+    [bfFont, 'brandfetch'],
+    [isValidFontName(scrapedFontFamily) ? scrapedFontFamily : null, 'scraped'],
+    [isValidFontName(enrichment.fontSuggestion) ? enrichment.fontSuggestion : null, 'suggested'],
     [toneDefault, 'tone-default'],
     [brand.fontFamily, 'existing']
   );
@@ -466,6 +485,21 @@ function toneToDefaultFont(tones) {
     if (TONE_FONT_MAP[key]) return TONE_FONT_MAP[key];
   }
   return null;
+}
+
+// Reject font values that aren't real font-family names. Brandfetch
+// occasionally returns CSS variable references (e.g. "var(--sl-font-sans)")
+// when a site's stylesheet routes its font through a custom property —
+// those are useless to us and need to fall through to the next tier.
+function isValidFontName(s) {
+  if (!s || typeof s !== 'string') return false;
+  const v = s.trim();
+  if (!v) return false;
+  if (/^var\s*\(/i.test(v)) return false;     // CSS var()
+  if (v.includes('--'))      return false;    // CSS custom property fragment
+  if (/[(){}<>;]/.test(v))   return false;    // any structural CSS chars
+  if (v.length > 60)         return false;    // real family names are short
+  return true;
 }
 
 // Case-insensitive de-duplication, preserving first occurrence's casing.
