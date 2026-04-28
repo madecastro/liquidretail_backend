@@ -24,19 +24,26 @@ const ADS_API_ROOT    = `https://googleads.googleapis.com/${ADS_API_VERSION}`;
 const SCOPES = ['https://www.googleapis.com/auth/adwords'];
 
 function getOAuthConfig() {
-  const clientId     = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  // Dedicated GOOGLE_ADS_* env vars take precedence so the Google
+  // Cloud project that owns the live Google Ads developer token can
+  // be different from the project used for user signin. Falls back
+  // to the shared signin client for backward compat with deployments
+  // that haven't switched yet.
+  const clientId     = process.env.GOOGLE_ADS_CLIENT_ID     || process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET;
   const redirectUri  = process.env.GOOGLE_ADS_REDIRECT_URI;
   if (!clientId || !clientSecret || !redirectUri) {
-    throw new Error('Google Ads OAuth not configured (set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_ADS_REDIRECT_URI)');
+    throw new Error('Google Ads OAuth not configured (set GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET, GOOGLE_ADS_REDIRECT_URI — or fall back to the shared GOOGLE_CLIENT_ID/SECRET)');
   }
   return { clientId, clientSecret, redirectUri };
 }
 
 function isConfigured() {
-  return !!(process.env.GOOGLE_CLIENT_ID
-         && process.env.GOOGLE_CLIENT_SECRET
-         && process.env.GOOGLE_ADS_REDIRECT_URI);
+  const hasClient = !!(process.env.GOOGLE_ADS_CLIENT_ID
+                    || process.env.GOOGLE_CLIENT_ID);
+  const hasSecret = !!(process.env.GOOGLE_ADS_CLIENT_SECRET
+                    || process.env.GOOGLE_CLIENT_SECRET);
+  return !!(hasClient && hasSecret && process.env.GOOGLE_ADS_REDIRECT_URI);
 }
 
 function isDevTokenConfigured() {
