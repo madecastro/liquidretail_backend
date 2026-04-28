@@ -142,8 +142,8 @@ router.patch('/:id', express.json(), async (req, res) => {
     if (!brand) return res.status(404).json({ error: 'brand not found' });
 
     const editable = ['name', 'websiteUrl', 'tagline', 'summary', 'logoUrl',
-                      'primaryColor', 'secondaryColor', 'accentColor', 'fontFamily',
-                      'tone', 'hashtags', 'tags'];
+                      'primaryColor', 'secondaryColor', 'accentColor', 'fontColor',
+                      'fontFamily', 'tone', 'hashtags', 'tags'];
     const fontTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'fontFamily');
     const fontCleared = fontTouched && (req.body.fontFamily == null || req.body.fontFamily === '');
     const before = { websiteUrl: brand.websiteUrl };
@@ -237,6 +237,7 @@ function serializeBrand(b) {
     primaryColor: b.primaryColor || null,
     secondaryColor: b.secondaryColor || null,
     accentColor:  b.accentColor || null,
+    fontColor:    b.fontColor || null,
     fontFamily:   b.fontFamily || null,
     fontSource:   b.fontSource || null,
     tone:         b.tone || [],

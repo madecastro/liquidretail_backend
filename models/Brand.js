@@ -49,6 +49,10 @@ const brandSchema = new mongoose.Schema({
   primaryColor:   String,
   secondaryColor: String,
   accentColor:    String,
+  // Brand's canonical text/font color — what they use for body and
+  // headline copy on their own site. Captured from Brandfetch's
+  // `text`-type color when present; GPT-suggested otherwise.
+  fontColor:      String,
   fontFamily:     String,
   // Provenance of fontFamily — drives the "(suggested)" UI hint and
   // lets curation distinguish a real brand font from an approximation.

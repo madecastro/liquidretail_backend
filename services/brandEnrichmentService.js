@@ -36,6 +36,7 @@ const ENRICHMENT_SCHEMA = {
     primaryColor:   { type: 'string' },
     secondaryColor: { type: 'string' },
     accentColor:    { type: 'string' },
+    fontColor:      { type: 'string' },
     fontSuggestion: { type: 'string' },
     demographics: {
       type: 'array',
@@ -191,6 +192,7 @@ async function runEnrichment(brand, brandId) {
       `- "hashtags": 5–10 hashtags this brand commonly uses on social, INCLUDING the # symbol (e.g. ["#pelagic","#offshore","#anglerlife"]). Pull from observed campaigns, common community tags, or the brand's category vernacular. Omit only if the brand has no plausible social presence.\n` +
       `- "tags": 5–10 lowercase keyword tags WITHOUT the # symbol — short search/category descriptors of what this brand sells or stands for (e.g. ["fishing","performance","apparel","outdoor","sun-protection"]). Concrete and indexable.\n` +
       `- "primaryColor" / "secondaryColor" / "accentColor": 6-digit hex strings (e.g. "#0a2540"). Use meta theme-color or visible brand colors when detectable; otherwise best-guess from positioning/category. Omit if truly no signal.\n` +
+      `- "fontColor": 6-digit hex string for the brand's body-text color (the color they use for headlines and paragraph copy on their own site). Typically near-black for light-themed brands ("#111111" / "#1a1a1a") or near-white for dark-themed ones ("#f5f5f5"). Omit if truly indeterminable.\n` +
       `- "fontSuggestion": ONE Google Fonts family name that fits this brand's personality based on its tone, summary, and category. Must be a REAL Google Fonts family — pick from common, well-supported choices. Examples by feel:\n` +
       `    rugged/outdoors  → "Bebas Neue", "Oswald", "Anton"\n` +
       `    premium/editorial → "Playfair Display", "Lora", "Cormorant Garamond"\n` +
@@ -300,6 +302,13 @@ async function runEnrichment(brand, brandId) {
     [brand.accentColor, 'existing']
   );
   setIf('accentColor', accentVal, accentSrc);
+
+  let [fontColorVal, fontColorSrc] = pick(
+    [bf?.fontColor, 'brandfetch'],
+    [enrichment.fontColor, 'gpt'],
+    [brand.fontColor, 'existing']
+  );
+  setIf('fontColor', fontColorVal, fontColorSrc);
 
   let [taglineVal, taglineSrc] = pick(
     [enrichment.tagline, 'gpt'],

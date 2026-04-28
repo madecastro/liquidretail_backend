@@ -49,6 +49,10 @@ async function lookupBrand(domain) {
     primaryColor:   pickColor(data.colors, ['brand', 'accent', 'dark']),
     secondaryColor: pickColor(data.colors, ['dark', 'secondary', 'brand']),
     accentColor:    pickColor(data.colors, ['accent', 'brand']),
+    // Brand's text/copy color. Brandfetch tags this with type='text'
+    // when known. Fall back to dark — brands without an explicit text
+    // token nearly always use a dark color for body copy.
+    fontColor:      pickColor(data.colors, ['text', 'dark']),
     fontFamily:     pickFont(data.fonts),
     socialLinks:    normalizeLinks(data.links)
   };
