@@ -22,6 +22,7 @@ const ig = require('../services/instagramOAuthService');
 const { syncCatalog, getCatalogStatus } = require('../services/catalogSyncService');
 const { syncPosts, getPostsStatus } = require('../services/postSyncService');
 const geminiSearch = require('../services/providers/geminiSearchProvider');
+const { verifySignature, processWebhookPayload } = require('../services/instagramWebhookService');
 
 const FRONTEND_URL = 'https://liquidretail.netlify.app';
 
@@ -222,6 +223,61 @@ router.post('/instagram/sync-catalog', async (req, res) => {
     res.status(500).json({ error: err.message || 'catalog sync failed' });
   }
 });
+
+// ── Webhook (V3 #1) ──────────────────────────────────────────────────
+// Meta hits this endpoint directly; auth bypass is configured in
+// index.js (path === '/instagram/webhook' skips requireAuth). Security
+// comes from:
+//   - GET: matching hub.verify_token against META_WEBHOOK_VERIFY_TOKEN
+//   - POST: HMAC-SHA256 signature verification using META_APP_SECRET
+//
+// The POST handler captures the raw body via the express.json verify
+// callback so we can compute the HMAC over the byte-for-byte payload
+// Meta sent.
+
+// GET — verification handshake. Meta sends:
+//   ?hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=<challenge>
+// We echo the challenge if the token matches.
+router.get('/instagram/webhook', (req, res) => {
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  const expected  = process.env.META_WEBHOOK_VERIFY_TOKEN;
+  if (!expected) return res.status(503).send('Webhook not configured');
+  if (mode === 'subscribe' && token === expected && challenge) {
+    console.log('✅ IG webhook verification handshake OK');
+    return res.status(200).send(String(challenge));
+  }
+  console.warn(`   ⚠️  IG webhook verification failed (mode=${mode}, token-match=${token === expected})`);
+  return res.status(403).send('Forbidden');
+});
+
+// POST — receive events. Captures the raw body so we can verify the
+// HMAC signature before trusting the JSON.
+router.post('/instagram/webhook',
+  express.json({
+    verify: (req, _res, buf) => { req.rawBody = buf; }
+  }),
+  async (req, res) => {
+    const sig = req.get('x-hub-signature-256');
+    if (!verifySignature(req.rawBody, sig)) {
+      console.warn(`   ⚠️  IG webhook signature mismatch (sig=${sig?.slice(0, 16) || 'none'}…)`);
+      return res.status(401).send('Invalid signature');
+    }
+    // Respond 200 ASAP — Meta retries on non-2xx and we don't want to
+    // hold the request open while we ingest. Run processing async.
+    res.status(200).send('OK');
+    try {
+      const result = await processWebhookPayload(req.body);
+      const summary = (result.processed || [])
+        .map(p => `${p.field || '?'}=${p.ok ? (p.skipped ? 'skip' : 'ok') : 'fail'}`)
+        .join(' ');
+      console.log(`📬 IG webhook processed: ${summary || '(empty)'}`);
+    } catch (err) {
+      console.error('IG webhook processing failed:', err);
+    }
+  }
+);
 
 // ── Catalog browser (V2 #1) ──────────────────────────────────────────
 // GET /api/integrations/instagram/catalog

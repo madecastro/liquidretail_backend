@@ -123,6 +123,7 @@ app.use('/api/members',     requireAuth, memberRoutes);
 // auth on every other integrations endpoint.
 app.use('/api/integrations', (req, res, next) => {
   if (req.path === '/instagram/callback') return next();
+  if (req.path === '/instagram/webhook')  return next();
   return requireAuth(req, res, next);
 }, integrationRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);

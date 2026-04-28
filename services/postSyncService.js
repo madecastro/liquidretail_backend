@@ -90,10 +90,12 @@ async function syncPosts(brandId, options = {}) {
 async function capRemaining(advertiserId, cap) {
   const startOfDay = new Date();
   startOfDay.setUTCHours(0, 0, 0, 0);
+  // Count both polled-sync AND webhook-triggered runs — the cap is
+  // about total automated IG compute, not the delivery mechanism.
   const todayCount = await DetectRun.countDocuments({
     advertiserId,
     createdAt: { $gte: startOfDay },
-    trigger:   'instagram-sync'
+    trigger:   { $in: ['instagram-sync', 'webhook'] }
   });
   return Math.max(0, cap - todayCount);
 }
@@ -335,4 +337,4 @@ async function getPostsStatus(brandId) {
   };
 }
 
-module.exports = { syncPosts, getPostsStatus };
+module.exports = { syncPosts, getPostsStatus, ingestPost, capRemaining };
