@@ -16,7 +16,7 @@ const Campaign = require('../models/Campaign');
 // (minus brandId / advertiserId / credentialId / platform — the
 // orchestrator stamps those).
 const ADAPTERS = {
-  // 'meta-ads':  require('./metaAdsCampaignService'),    // B-2
+  'meta-ads':  require('./metaAdsCampaignService'),    // B-2
   // 'google-ads': require('./googleAdsCampaignService'), // B-3
 };
 
