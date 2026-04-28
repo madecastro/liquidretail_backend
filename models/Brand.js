@@ -29,7 +29,17 @@ const demographicSchema = new mongoose.Schema({
 }, { _id: false });
 
 const brandSchema = new mongoose.Schema({
-  nameNormalized: { type: String, required: true, unique: true, index: true },
+  // Tenant scope. Nullable until the Phase 1.4 backfill assigns
+  // existing rows to a default Advertiser. After the backfill we
+  // enforce non-null at the application layer; the unique index
+  // below is compound (advertiserId + nameNormalized) so two
+  // Advertisers can each have their own "Pelagic".
+  advertiserId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', index: true, default: null },
+
+  // Normalized lookup key — unique PER ADVERTISER (see compound index
+  // below). The legacy global-unique constraint was replaced; if both
+  // exist, the migration script drops the old one.
+  nameNormalized: { type: String, required: true, index: true },
   name:           { type: String, required: true },
 
   websiteUrl:     String,                            // user-supplied on upload; seed for enrichment
@@ -71,6 +81,12 @@ const brandSchema = new mongoose.Schema({
 });
 
 brandSchema.pre('save', function(next) { this.updatedAt = Date.now(); next(); });
+
+// Compound unique key — one "Pelagic" per Advertiser, but multiple
+// Advertisers can each have their own. The migration script drops
+// the legacy single-field unique index on nameNormalized and
+// creates this compound one in its place.
+brandSchema.index({ advertiserId: 1, nameNormalized: 1 }, { unique: true });
 
 module.exports = mongoose.model('Brand', brandSchema);
 module.exports.normalizeBrandName = normalizeBrandName;

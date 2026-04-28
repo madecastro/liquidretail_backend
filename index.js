@@ -7,6 +7,8 @@ const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const mongoose = require('mongoose');
 const multer = require('multer');
 const Product = require('./models/Product');
+const User = require('./models/User');
+const Advertiser = require('./models/Advertiser');
 const { pushProductToShopify } = require('./services/pushToShopify');
 const uploadRoutes = require('./routes/upload');
 const jobRoutes = require('./routes/jobs');
@@ -40,17 +42,41 @@ passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
   callbackURL: process.env.GOOGLE_CALLBACK_URL
-}, (accessToken, refreshToken, profile, done) => {
-  const email = profile.emails?.[0]?.value || '';
-  if (!email.endsWith('@floodqrf.com')) {
-    return done(null, false);
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    const email = profile.emails?.[0]?.value || '';
+    if (!email.endsWith('@floodqrf.com')) return done(null, false);
+
+    // Upsert the User row so we have a place to attach advertiserId,
+    // role, last-login etc. Session still carries the lightweight
+    // Google profile shape downstream consumers expect; the persisted
+    // User doc is enriched with advertiserId on next-login or via the
+    // backfill migration.
+    const userDoc = await User.findOneAndUpdate(
+      { googleId: profile.id },
+      {
+        $set: {
+          email,
+          displayName: profile.displayName,
+          photoUrl:    profile.photos?.[0]?.value || null,
+          lastLoginAt: new Date()
+        },
+        $setOnInsert: { googleId: profile.id }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return done(null, {
+      id:           profile.id,
+      userId:       userDoc._id,        // ← persisted User._id for downstream lookups
+      advertiserId: userDoc.advertiserId, // ← null until backfill / signup flow assigns one
+      name:         profile.displayName,
+      email,
+      photo:        profile.photos?.[0]?.value
+    });
+  } catch (err) {
+    return done(err);
   }
-  return done(null, {
-    id: profile.id,
-    name: profile.displayName,
-    email,
-    photo: profile.photos?.[0]?.value
-  });
 }));
 
 passport.serializeUser((user, done) => done(null, user));
