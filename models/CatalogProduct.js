@@ -1,0 +1,53 @@
+// Brand-scoped catalog product, populated from third-party inventory
+// sources (V1: Instagram Commerce / Meta Catalog). Distinct from the
+// legacy `Product` model which is the truck/Shopify inventory path —
+// this one is brand catalog data the matching service consults at
+// detect time.
+//
+// Idempotency: (brandId, externalId) is the natural key. Re-syncs
+// upsert in place so reruns don't multiply rows.
+
+const mongoose = require('mongoose');
+
+const catalogProductSchema = new mongoose.Schema({
+  advertiserId: { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', required: true, index: true },
+  brandId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',      required: true, index: true },
+
+  // External identity. `source` lets us add TikTok / Shopify catalogs
+  // later without a second model. `externalId` is whatever the source
+  // calls its product ID (Meta's product_item id, the merchant's
+  // retailer_id, etc).
+  source:       { type: String, enum: ['ig-catalog'], required: true, index: true },
+  externalId:   { type: String, required: true, index: true },
+  retailerId:   String,    // merchant SKU when distinct from externalId
+
+  // Display + commerce
+  title:        { type: String, required: true },
+  description:  String,
+  brand:        String,    // Meta's "brand" field (often the brand name)
+  category:     String,    // Meta's category string (taxonomy varies)
+  price:        Number,    // numeric only — currency stored separately
+  currency:     String,
+  availability: String,    // "in stock" | "out of stock" | etc.
+
+  // Imagery
+  imageUrl:        String,    // primary image
+  additionalImages: [String], // up to N alt views
+
+  // Destination
+  productUrl:   String,
+
+  // Provenance + raw payload for debugging / future field unlocks.
+  // Limited to ~8KB so a chatty source doesn't bloat the doc.
+  rawData:      mongoose.Schema.Types.Mixed,
+
+  firstSeenAt:  { type: Date, default: Date.now },
+  lastSyncedAt: { type: Date, default: Date.now }
+});
+
+// Natural key: one row per (brand, externalId).
+catalogProductSchema.index({ brandId: 1, externalId: 1 }, { unique: true });
+// Match-service lookups: by brand + category and by brand + text.
+catalogProductSchema.index({ brandId: 1, category: 1 });
+
+module.exports = mongoose.model('CatalogProduct', catalogProductSchema);

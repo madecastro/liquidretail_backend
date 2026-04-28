@@ -17,6 +17,7 @@ const IntegrationCredential = require('../models/IntegrationCredential');
 const { tenantFilter } = require('../middleware/tenantHelpers');
 const { encrypt } = require('../services/integrationCryptoService');
 const ig = require('../services/instagramOAuthService');
+const { syncCatalog, getCatalogStatus } = require('../services/catalogSyncService');
 
 const FRONTEND_URL = 'https://liquidretail.netlify.app';
 
@@ -152,6 +153,47 @@ router.get('/instagram/callback', async (req, res) => {
     const detail = err.response?.data?.error?.message || err.message;
     console.warn(`   ⚠️  IG callback failed: ${detail}`);
     bounce('error', detail);
+  }
+});
+
+// ── Catalog status ───────────────────────────────────────────────────
+// Lightweight endpoint for the brand page to render item count +
+// last-synced timestamp without pulling every CatalogProduct row.
+router.get('/instagram/catalog-status', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    // tenant guard: only return status for credentials in this advertiser
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      brandId, type: 'instagram', status: 'active'
+    })).select('_id').lean();
+    if (!cred) return res.json({ connected: false, itemCount: 0, lastSyncedAt: null });
+    const status = await getCatalogStatus(brandId);
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'catalog status failed' });
+  }
+});
+
+// ── Catalog sync ─────────────────────────────────────────────────────
+// Foreground sync — paginates the Meta catalog and upserts
+// CatalogProduct rows. Capped at MAX_ITEMS per call (catalogSyncService).
+// Brands beyond the cap need V2 background sync.
+router.post('/instagram/sync-catalog', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    // tenant guard via credential — confirms the brand belongs to this advertiser
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      brandId, type: 'instagram', status: 'active'
+    })).select('_id').lean();
+    if (!cred) return res.status(404).json({ error: 'no active Instagram credential for this brand' });
+    const result = await syncCatalog(brandId);
+    if (!result.ok) return res.status(400).json(result);
+    res.json(result);
+  } catch (err) {
+    console.error('catalog sync failed:', err);
+    res.status(500).json({ error: err.message || 'catalog sync failed' });
   }
 });
 
