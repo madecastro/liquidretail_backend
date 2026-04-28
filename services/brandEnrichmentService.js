@@ -55,10 +55,35 @@ const ENRICHMENT_SCHEMA = {
   required: ['demographics']
 };
 
+// Atomic stage transition — independent of the in-memory `brand` doc
+// the function is mutating, so it works even before/around the final
+// brand.save() call. Failure is non-fatal (we never want enrichment
+// progress reporting to crash enrichment itself).
+async function setStage(brandId, stage) {
+  try {
+    await Brand.updateOne({ _id: brandId }, { $set: { enrichmentStage: stage } });
+  } catch (e) {
+    console.warn(`   ⚠️  enrichmentStage write failed for ${brandId}: ${e.message}`);
+  }
+}
+
 async function enrichBrandFromUrl(brandId) {
   const brand = await Brand.findById(brandId);
   if (!brand)             return { ok: false, reason: 'brand not found' };
   if (!brand.websiteUrl)  return { ok: false, reason: 'no websiteUrl' };
+
+  // Belt-and-suspenders: clear stage at the end of EVERY exit path
+  // (success, early return, thrown error). The final brand.save() also
+  // writes null because the in-memory `brand.enrichmentStage` is
+  // never mutated, but the explicit clear covers thrown errors.
+  try {
+    return await runEnrichment(brand, brandId);
+  } finally {
+    await setStage(brandId, null);
+  }
+}
+
+async function runEnrichment(brand, brandId) {
 
   // Per-field protection (curatedFields) replaces the old wholesale
   // 'curated' / 'enriched' bail-outs. We re-run enrichment whenever an
@@ -88,6 +113,7 @@ async function enrichBrandFromUrl(brandId) {
   // Hits the brand kit API for native logo + colors + fonts. Skipped
   // if no API key OR if already attempted on a previous run.
   const hostname = hostnameFromUrl(brand.websiteUrl);
+  if (wantBrandfetch && hostname) await setStage(brandId, 'brandfetch');
   const bf = (wantBrandfetch && hostname) ? await brandfetchLookup(hostname) : null;
   if (wantBrandfetch && bf) {
     const filled = [];
@@ -98,6 +124,7 @@ async function enrichBrandFromUrl(brandId) {
   }
 
   // ── Tier 2: Homepage HTML ──
+  if (wantScraped) await setStage(brandId, 'scraped');
   let html = '';
   let metaThemeColor = null;
   try {
@@ -153,6 +180,7 @@ async function enrichBrandFromUrl(brandId) {
   // Brandfetch alone can ship partial enrichment without GPT.
   let enrichment = {};
   if (!skipLLM && wantGpt) {
+    await setStage(brandId, 'gpt');
     const prompt =
       `You are analyzing "${brand.name}" (${brand.websiteUrl}) to fill a brand catalog entry.\n\n` +
       `Source text from ${sourceLabel}:\n"""\n${textContent}\n"""\n\n` +
@@ -327,6 +355,7 @@ async function enrichBrandFromUrl(brandId) {
   // marked the field protected.
   let brandReviewsResult = null;
   if (wantBrandReviews && !isCurated('brandReviews')) {
+    await setStage(brandId, 'brand-reviews');
     try {
       brandReviewsResult = await lookupBrandReviews({
         brandName: brand.name,

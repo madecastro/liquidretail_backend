@@ -89,6 +89,13 @@ const brandSchema = new mongoose.Schema({
   // websiteUrl changes, or via /refresh-enrichment.
   enrichmentSources: [String],
 
+  // Currently-running enrichment tier name, or null when nothing is
+  // running. Updated incrementally by enrichBrandFromUrl so the brand
+  // page can poll and show "Detecting brand kit (Brandfetch)…" etc.
+  // Values mirror enrichmentSources entries: 'brandfetch' | 'scraped'
+  // | 'gpt' | 'brand-reviews' | null.
+  enrichmentStage:    { type: String, default: null },
+
   // Brand-level review snapshot. Populated by enrichBrandFromUrl
   // (Tier 4 — Gemini grounded search for "<brand> reviews"). Cached
   // on Brand so per-Media brand_match outcomes share one fetch
