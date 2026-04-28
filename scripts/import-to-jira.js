@@ -9,8 +9,14 @@
 //   JIRA_BASE_URL          e.g. https://yourco.atlassian.net
 //   JIRA_EMAIL             your atlassian login email
 //   JIRA_API_TOKEN         from id.atlassian.com/manage-profile/security/api-tokens
-//   JIRA_PROJECT_KEY       e.g. LR
-//   JIRA_EPIC_LINK_FIELD   custom field id; default customfield_10014 (cloud standard)
+//   JIRA_PROJECT_KEY       e.g. RER
+//   JIRA_USE_LEGACY_EPIC_LINK  'true' for company-managed (classic) projects
+//                              that still use customfield_10014 as Epic Link.
+//                              Default: use the native `parent` field which is
+//                              correct for team-managed projects + modern
+//                              company-managed setups.
+//   JIRA_EPIC_LINK_FIELD   override the legacy custom field id (default
+//                          customfield_10014). Only used if JIRA_USE_LEGACY_EPIC_LINK=true.
 //   JIRA_EPIC_NAME_FIELD   custom field id; default customfield_10011 (company-managed only)
 //   JIRA_USE_EPIC_NAME_FIELD  set to 'true' if your Jira instance is company-managed
 //                             and requires Epic Name. Team-managed projects don't need it.
@@ -35,6 +41,10 @@ const JIRA_PROJECT_KEY = process.env.JIRA_PROJECT_KEY || '';
 const EPIC_LINK_FIELD  = process.env.JIRA_EPIC_LINK_FIELD || 'customfield_10014';
 const EPIC_NAME_FIELD  = process.env.JIRA_EPIC_NAME_FIELD || 'customfield_10011';
 const USE_EPIC_NAME    = String(process.env.JIRA_USE_EPIC_NAME_FIELD || '').toLowerCase() === 'true';
+// Default to the native `parent` field (team-managed projects + modern
+// company-managed). Legacy classic projects that still expose Epic
+// Link as a custom field should set JIRA_USE_LEGACY_EPIC_LINK=true.
+const USE_LEGACY_EPIC_LINK = String(process.env.JIRA_USE_LEGACY_EPIC_LINK || '').toLowerCase() === 'true';
 
 // ── args ─────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -112,8 +122,12 @@ function buildIssuePayload(row, epicKeyByName) {
   }
   if (!isEpic && row['Epic Link']) {
     const epicKey = epicKeyByName[row['Epic Link']];
-    if (epicKey) fields[EPIC_LINK_FIELD] = epicKey;
-    else         console.warn(`   ⚠️  ${row.Summary}: Epic Link "${row['Epic Link']}" — no matching epic created in this run`);
+    if (epicKey) {
+      if (USE_LEGACY_EPIC_LINK) fields[EPIC_LINK_FIELD] = epicKey;     // classic company-managed
+      else                      fields.parent = { key: epicKey };      // team-managed + modern company-managed
+    } else {
+      console.warn(`   ⚠️  ${row.Summary}: Epic Link "${row['Epic Link']}" — no matching epic created in this run`);
+    }
   }
   return { fields };
 }
