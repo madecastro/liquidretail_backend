@@ -40,6 +40,13 @@ const PROVIDERS = [
 ];
 
 const CONFIDENCE_FLOOR = 0.80;   // below this, fall back to brand-category
+// YOLO+GPT is the authoritative "is there a product?" oracle. Gemini
+// grounded search will return matches for ANY query (it's a web search
+// tool, not a product detector), so we cannot trust Gemini's matches as
+// evidence that a product exists. PRODUCT_FLOOR is the minimum YOLO+GPT
+// confidence required to consider that a real product was detected.
+// Below this, we fall through to 'branding' regardless of Gemini.
+const PRODUCT_FLOOR = 0.50;
 
 async function findProductMatches({
   brand, category, caption, primarySubject, textDetected, imageUrl,
@@ -147,7 +154,8 @@ async function runDecisionTree({
     .map(d => d?.identification)
     .filter(id => id && typeof id.confidence === 'number');
 
-  // 1. Multi-brand contention.
+  // 1. Multi-brand contention. (Earliest check — wholly different
+  // failure mode than the rest of the tree.)
   const distinctBrands = new Set(
     yoloIds
       .filter(id => id.confidence >= 0.7 && id.brand)
@@ -164,27 +172,43 @@ async function runDecisionTree({
     };
   }
 
-  // Pick the highest-confidence YOLO identification (after multi-brand check).
-  const yoloTop = yoloIds.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0] || null;
-  const yoloConf   = yoloTop?.confidence || 0;
-  const geminiTop  = geminiIdentification || null;
-  const geminiConf = geminiTop?.certainty || 0;
-  const haveAnyProduct = yoloTop || (geminiTop?.productName);
+  // 2. YOLO+GPT product detection — authoritative.
+  // Gemini grounded search ALWAYS returns something (it's a search
+  // tool, not a product detector), so we cannot use Gemini as evidence
+  // that a product exists. We trust YOLO+GPT: if no detection has
+  // confidence >= PRODUCT_FLOOR with a meaningful label, there is no
+  // product, period. Outcome is 'branding' and we don't bother
+  // comparing against Gemini's matches.
+  const yoloProductIds = yoloIds
+    .filter(id => (id.confidence || 0) >= PRODUCT_FLOOR
+                 && typeof id.label === 'string'
+                 && id.label.trim().length > 0)
+    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
 
-  // 2. Nothing detected → branding.
-  if (!haveAnyProduct) {
+  if (yoloProductIds.length === 0) {
+    const topYoloConf = yoloIds.length
+      ? Math.max(...yoloIds.map(id => id.confidence || 0))
+      : 0;
     const brandReviews = await tryLookupBrandReviews(brand, brandUrl);
     return {
       outcome: 'branding',
-      outcomeReasoning: 'no product identified by either YOLO+GPT or Gemini; treating as brand content',
+      outcomeReasoning: yoloIds.length
+        ? `YOLO+GPT did not detect a product above ${(PRODUCT_FLOOR*100).toFixed(0)}% confidence (best was ${(topYoloConf*100).toFixed(0)}%); Gemini matches ignored — treating as brand content`
+        : 'YOLO+GPT returned no detections; treating as brand content',
       winner: null,
       brandCategory: null,
       brandReviews
     };
   }
 
+  // 3+. YOLO confirmed a product exists; now compare against Gemini.
+  const yoloTop    = yoloProductIds[0];
+  const yoloConf   = yoloTop.confidence || 0;
+  const geminiTop  = geminiIdentification || null;
+  const geminiConf = geminiTop?.certainty || 0;
+
   // 3. Both agree → confirmed (no extra lookup).
-  if (yoloTop && geminiTop?.productName && sameProduct(yoloTop, geminiTop)) {
+  if (geminiTop?.productName && sameProduct(yoloTop, geminiTop)) {
     return {
       outcome: 'confirmed',
       outcomeReasoning: `YOLO+GPT and Gemini both identified "${geminiTop.productName}"`,
@@ -195,7 +219,7 @@ async function runDecisionTree({
   }
 
   // 4. Low confidence everywhere → fall back to brand category.
-  if (Math.max(yoloConf, geminiConf) < CONFIDENCE_FLOOR && yoloTop) {
+  if (Math.max(yoloConf, geminiConf) < CONFIDENCE_FLOOR) {
     const brandCategory = await tryLookupBrandCategoryUrl({
       brandUrl,
       brandName: brand,

@@ -76,8 +76,12 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // tighter spaces than before. 2.5 wires the matching-service decision
 // tree outcomes into the input: 'category' overrides cta to the brand
 // collection page, 'branding' injects brand-reviews quotes + ratings,
-// 'do_not_use' hard-stops layout assembly.
-const INPUT_SCHEMA_VERSION = '2.5';
+// 'do_not_use' hard-stops layout assembly. 2.6 makes the derivation
+// prompt + defaults brand-focused when outcome='branding' — headline,
+// quotes, cta, and fallback strings shift from product-shaped to
+// brand-shaped so a Media without a real product produces brand
+// creative, not invented product copy.
+const INPUT_SCHEMA_VERSION = '2.6';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -297,9 +301,11 @@ async function runDerivation(ctx, template, aspectRatio, options) {
 }
 
 function buildDerivationPrompt(ctx, template, aspectRatio, options) {
-  const { media, detection, match } = ctx;
+  const { media, detection, match, brand } = ctx;
   const ident = match?.identification || {};
   const details = ident.details || {};
+  const isBranding = match?.outcome === 'branding';
+  const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
   const lines = [];
 
   lines.push(`You are composing creative copy for a social-proof ad layout.`);
@@ -307,15 +313,33 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   lines.push(`Aspect ratio: ${aspectRatio}.`);
   if (options.tone_hint) lines.push(`Caller tone hint: ${options.tone_hint}.`);
   lines.push('');
-  lines.push('PRODUCT:');
-  if (ident.productName) lines.push(`  Name: ${ident.productName}`);
-  if (ident.brand)       lines.push(`  Brand: ${ident.brand}`);
-  if (media.metadata?.category) lines.push(`  Category: ${media.metadata.category}`);
-  if (details.price?.display)   lines.push(`  Price: ${details.price.display}`);
-  if (detection?.primarySubjectDesc) lines.push(`  Description: ${detection.primarySubjectDesc}`);
-  if (Array.isArray(detection?.text) && detection.text.length) {
-    const tokens = detection.text.slice(0, 10).map(t => `"${t.content}"`).filter(Boolean).join(', ');
-    if (tokens) lines.push(`  Text visible on product: ${tokens}`);
+
+  // Brand-mode banner — sets framing for the whole prompt up front so
+  // every TASK rule the model considers below is filtered through
+  // "brand-only, no product".
+  if (isBranding) {
+    lines.push('BRAND-ONLY MODE — NO SPECIFIC PRODUCT WAS IDENTIFIED');
+    lines.push(`The Media is brand content (no recognizable SKU). All copy must focus on the BRAND ITSELF — its values, its community, its category leadership — NOT on a specific product.`);
+    lines.push(`Do NOT invent a product name. Do NOT write headlines like "The best X" or "Try our Y". Write headlines that sell the brand.`);
+    lines.push('');
+    lines.push('BRAND:');
+    if (brandName)             lines.push(`  Name: ${brandName}`);
+    if (brand?.tagline)        lines.push(`  Tagline: ${brand.tagline}`);
+    if (Array.isArray(brand?.tone) && brand.tone.length) lines.push(`  Voice: ${brand.tone.join(', ')}`);
+    if (media.metadata?.category) lines.push(`  Category: ${media.metadata.category}`);
+    if (detection?.primarySubjectDesc) lines.push(`  Scene: ${detection.primarySubjectDesc}`);
+    if (match?.brandReviews?.summary) lines.push(`  Brand sentiment summary: ${match.brandReviews.summary}`);
+  } else {
+    lines.push('PRODUCT:');
+    if (ident.productName) lines.push(`  Name: ${ident.productName}`);
+    if (ident.brand)       lines.push(`  Brand: ${ident.brand}`);
+    if (media.metadata?.category) lines.push(`  Category: ${media.metadata.category}`);
+    if (details.price?.display)   lines.push(`  Price: ${details.price.display}`);
+    if (detection?.primarySubjectDesc) lines.push(`  Description: ${detection.primarySubjectDesc}`);
+    if (Array.isArray(detection?.text) && detection.text.length) {
+      const tokens = detection.text.slice(0, 10).map(t => `"${t.content}"`).filter(Boolean).join(', ');
+      if (tokens) lines.push(`  Text visible on product: ${tokens}`);
+    }
   }
   lines.push('');
   lines.push('SOCIAL CONTEXT:');
@@ -330,11 +354,31 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   }
   if (detection?.transcript?.text) lines.push(`  Transcript: "${String(detection.transcript.text).slice(0, 800)}"`);
   lines.push('');
-  lines.push('REVIEW SIGNAL:');
-  if (typeof details.rating === 'number')      lines.push(`  Rating: ${details.rating}`);
-  if (typeof details.reviewCount === 'number') lines.push(`  Review count: ${details.reviewCount}`);
-  if (details.reviewSummary?.summary)          lines.push(`  Review summary: ${details.reviewSummary.summary}`);
-  lines.push('');
+  if (isBranding) {
+    // Branding-mode review signal comes from brand-level Gemini search
+    // not product-level SerpAPI. Surface those quotes so the LLM can
+    // draw on real brand sentiment when authoring its own quotes.
+    const br = match?.brandReviews;
+    if (br) {
+      lines.push('BRAND REVIEW SIGNAL:');
+      if (typeof br.rating === 'number')      lines.push(`  Brand rating: ${br.rating}`);
+      if (typeof br.reviewCount === 'number') lines.push(`  Brand review count: ${br.reviewCount}`);
+      if (br.summary)                         lines.push(`  Brand sentiment: ${br.summary}`);
+      if (Array.isArray(br.quotes) && br.quotes.length) {
+        lines.push('  Real brand quotes (use these to inform tone, do NOT copy verbatim):');
+        for (const q of br.quotes.slice(0, 5)) {
+          lines.push(`    - "${q.text}"${q.author ? ` — ${q.author}` : ''}${q.source ? ` (${q.source})` : ''}`);
+        }
+      }
+      lines.push('');
+    }
+  } else {
+    lines.push('REVIEW SIGNAL:');
+    if (typeof details.rating === 'number')      lines.push(`  Rating: ${details.rating}`);
+    if (typeof details.reviewCount === 'number') lines.push(`  Review count: ${details.reviewCount}`);
+    if (details.reviewSummary?.summary)          lines.push(`  Review summary: ${details.reviewSummary.summary}`);
+    lines.push('');
+  }
   if (detection?.background) {
     const bg = detection.background;
     lines.push(`SCENE CONTEXT (for theme hints):`);
@@ -368,21 +412,50 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
 
   lines.push(`TASK:`);
   lines.push(`Produce JSON matching the schema. Rules:`);
-  lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
-  lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
-  lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
+
+  if (isBranding) {
+    // Brand-mode headline / quote rules. Override the product-shaped
+    // defaults so the LLM doesn't backslide into product-specific copy.
+    lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. Must be BRAND-FOCUSED, not product-specific.`);
+    lines.push(`    Good examples: "Built for the offshore life", "Why anglers trust ${brandName || 'us'}", "Made for every adventure", "${brandName || 'Brand'}: gear that lasts".`);
+    lines.push(`    Bad examples: "The best fishing shirt" (specific product), "Try the AquaTek Pro" (specific SKU), "50% off select items" (offer-specific).`);
+    lines.push(`- "subheadline" ≤ 15 words, expands the brand promise. "eyebrow" ≤ 3 words (e.g. brand category or audience). "highlight_text" ≤ 5 words.`);
+    lines.push(`- DO NOT emit "short_benefits" or product "badges" — there is no specific product. Use brand-level proof badges instead (e.g. "Trusted by anglers", "Family-owned since 2003", "${brand?.tone?.[0] || 'Premium'} quality").`);
+  } else {
+    lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
+    lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
+    lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
+  }
+
   // Quote length target depends on template — narrow zones (split-screen
   // quote_bubble, review_collage cards) clip on mobile when quotes run long.
   const quoteLengthRule = (template === 'ugc_split_screen' || template === 'review_collage')
     ? '10–14 words and UNDER 90 characters each (split-screen / collage zones clip at 4 lines on narrow canvases)'
     : '12–18 words, ≤ 120 characters each';
 
-  if (demos.length) {
+  if (isBranding) {
+    // Brand-mode quotes: about the BRAND, not a product.
+    lines.push(`- "quotes" ${quoteTarget} short notional brand-experience quotes. Each speaks to the BRAND — its values, community, what it stands for — NOT a specific product purchase.`);
+    if (demos.length) {
+      lines.push(`    Author each quote in the voice of one of the BRAND KEY PERSONAS above. author_name = persona name; author_title = persona one-phrase cue; source="testimonial" or "ugc".`);
+    } else {
+      lines.push(`    author_name can be null; source="review".`);
+    }
+    if (match?.brandReviews?.quotes?.length) {
+      lines.push(`    Use the BRAND REVIEW SIGNAL above as your tonal grounding — paraphrase, don't copy verbatim.`);
+    }
+    lines.push(`    Target ${quoteLengthRule}. Mix angles (community, values, longevity, fit-for-purpose).`);
+  } else if (demos.length) {
     lines.push(`- "quotes" ${quoteTarget} NOTIONAL persona-authored reviews/comments. Use the BRAND KEY PERSONAS above as the quote voices — match each quote to a persona's vocabulary, concerns, and tone. author_name is the persona's name; author_title is a one-phrase identity cue; source="testimonial" or "ugc". Ground substance in the review summary. verified=true only if the brand has well-documented social proof. Target ${quoteLengthRule}. Mix angles across quotes.`);
   } else {
     lines.push(`- "quotes" ${quoteTarget} short notional reviews/comments drawn from the review summary. author_name can be null; source="review" unless signal clearly implies creator/ugc. verified=false unless clearly endorsed. Target ${quoteLengthRule}. Mix angles.`);
   }
-  lines.push(`- "cta.text" REQUIRED, ≤ 3 words, imperative voice (e.g. "Shop now"). "offer_text" only if price/offer data supports it.`);
+
+  if (isBranding) {
+    lines.push(`- "cta.text" REQUIRED, ≤ 3 words, brand-shop imperative (e.g. "Shop the brand", "Discover", "Explore").`);
+  } else {
+    lines.push(`- "cta.text" REQUIRED, ≤ 3 words, imperative voice (e.g. "Shop now"). "offer_text" only if price/offer data supports it.`);
+  }
   lines.push(`- "trusted_by_text" preferred if review_count ≥ 50 — format "Trusted by Xk+ customers", "Loved by Nk shoppers", etc.`);
   lines.push(`- "tone" 2–4 single-word descriptors matching brand + caption voice.`);
   lines.push(`- "theme_style" / "background_style" / "emphasis" pick values best suited to the template and signal.`);
@@ -624,10 +697,14 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     },
 
     defaults: {
-      fallback_quote:    'Customers love it.',
-      fallback_headline: brandName ? `See why ${brandName} customers come back` : 'See why they come back',
-      cta_text:          'Shop now',
-      product_name:      ident.productName || 'This product'
+      fallback_quote:    ctx.match?.outcome === 'branding'
+                            ? `Made for people like us.`
+                            : 'Customers love it.',
+      fallback_headline: ctx.match?.outcome === 'branding'
+                            ? (brandName ? `Built for the ${brandName} community` : 'Built for our community')
+                            : (brandName ? `See why ${brandName} customers come back` : 'See why they come back'),
+      cta_text:          ctx.match?.outcome === 'branding' ? 'Shop the brand' : 'Shop now',
+      product_name:      ident.productName || (ctx.match?.outcome === 'branding' ? brandName || 'This brand' : 'This product')
     }
   };
 
