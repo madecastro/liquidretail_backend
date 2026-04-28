@@ -12,6 +12,10 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
+
+const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 const IntegrationCredential = require('../models/IntegrationCredential');
 const CatalogProduct = require('../models/CatalogProduct');
@@ -32,6 +36,7 @@ function summarize(cred) {
     id:           String(cred._id),
     type:         cred.type,
     status:       cred.status,
+    pending:      cred.status === 'pending',
     igUserId:     cred.igUserId   || null,
     igUsername:   cred.igUsername || null,
     pageId:       cred.pageId     || null,
@@ -52,10 +57,13 @@ router.get('/instagram/status', async (req, res) => {
   try {
     const brandId = req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    // Include pending alongside active so the UI can render a
+    // "Finish setup" CTA on credentials that captured the token but
+    // never had Page/IG/catalog selected.
     const creds = await IntegrationCredential.find(tenantFilter(req, {
       brandId,
       type:   'instagram',
-      status: 'active'
+      status: { $in: ['active', 'pending'] }
     })).sort({ connectedAt: 1 }).lean();
     const summarized = creds.map(summarize);
     res.json({
@@ -128,51 +136,39 @@ router.get('/instagram/callback', async (req, res) => {
     const long = await ig.exchangeForLongLivedToken(short.access_token);
     if (!long?.access_token) throw new Error('no access_token in long-lived exchange');
 
-    const summary = await ig.fetchAccountSummary(long.access_token);
+    // V2.5 picker flow: insert as 'pending' with the token but no
+    // Page/IG/catalog selection yet. Bounce to brand.html with
+    // ?ig_setup=<credentialId> so the picker modal can finalize.
+    // Also pull metaUserId so a re-OAuth from the same human merges
+    // with their existing pending row instead of creating duplicates.
+    let metaUserId = null;
+    try {
+      const me = await axios.get(`${META_GRAPH_ROOT}/me`, {
+        params: { fields: 'id,name', access_token: long.access_token },
+        timeout: 15000
+      });
+      metaUserId = me.data?.id || null;
+    } catch (_) { /* non-fatal — metaUserId stays null */ }
 
-    // V2 #5: multi-page. Reconnecting the SAME IG account refreshes the
-    // existing row (new token, scopes, expiry); a different IG account
-    // adds a second active credential alongside the first. Brands can
-    // hold N active credentials as long as their igUserIds differ.
     const expiresAt = long.expires_in ? new Date(Date.now() + long.expires_in * 1000) : null;
-    const update = {
+    const cred = await IntegrationCredential.create({
       advertiserId:   payload.advertiserId,
       brandId:        payload.brandId,
       type:           'instagram',
-      status:         'active',
+      status:         'pending',
       accessTokenEnc: encrypt(long.access_token),
       expiresAt,
       scopes:         ig.SCOPES,
-      igUserId:       summary.igUserId,
-      igUsername:     summary.igUsername,
-      pageId:         summary.pageId,
-      pageName:       summary.pageName,
-      catalogId:      summary.catalogId,
-      metaUserId:     summary.metaUserId
-    };
+      metaUserId,
+      connectedBy:    payload.userId,
+      connectedAt:    new Date()
+    });
 
-    let cred;
-    if (summary.igUserId) {
-      cred = await IntegrationCredential.findOneAndUpdate(
-        { brandId: payload.brandId, type: 'instagram', status: 'active', igUserId: summary.igUserId },
-        {
-          $set: update,
-          $setOnInsert: { connectedBy: payload.userId, connectedAt: new Date() }
-        },
-        { upsert: true, new: true }
-      );
-    } else {
-      // No igUserId resolved (Page without an IG Business account).
-      // Don't merge with sibling credentials — insert fresh.
-      cred = await IntegrationCredential.create({
-        ...update,
-        connectedBy: payload.userId,
-        connectedAt: new Date()
-      });
-    }
-
-    console.log(`✅ IG connected: brand=${payload.brandId} ig=@${summary.igUsername || '?'} page=${summary.pageName || '?'} catalog=${summary.catalogId || '∅'} cred=${cred._id}`);
-    bounce('connected', summary.igUsername || summary.pageName || 'connected');
+    console.log(`🔑 IG token captured (pending selection): brand=${payload.brandId} cred=${cred._id}`);
+    // Hand the credential id to the frontend so it can drive the
+    // picker modal. The bounce stays on brand.html for context.
+    const params = new URLSearchParams({ ig_status: 'pending', ig_setup: String(cred._id) });
+    res.redirect(`${FRONTEND_URL}/brand.html?${params.toString()}`);
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
     console.warn(`   ⚠️  IG callback failed: ${detail}`);
@@ -278,6 +274,120 @@ router.post('/instagram/webhook',
     }
   }
 );
+
+// ── Account picker (V2.5) ────────────────────────────────────────────
+// GET /instagram/:credentialId/options
+//   Decrypts the token and enumerates every Page + IG Business account
+//   + catalog the user granted us. Returns the union — frontend picker
+//   shows them all and lets the user choose which to bind to this brand.
+router.get('/instagram/:credentialId/options', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      _id: req.params.credentialId, brandId, type: 'instagram',
+      status: { $in: ['pending', 'active'] }
+    }));
+    if (!cred) return res.status(404).json({ error: 'credential not found or revoked' });
+
+    const { decrypt } = require('../services/integrationCryptoService');
+    let token;
+    try { token = decrypt(cred.accessTokenEnc); }
+    catch (err) { return res.status(500).json({ error: `token decrypt failed: ${err.message}` }); }
+
+    const opts = await ig.listAccountOptions(token);
+    res.json({
+      options: opts,
+      current: {
+        pageId:    cred.pageId    || null,
+        igUserId:  cred.igUserId  || null,
+        catalogId: cred.catalogId || null
+      }
+    });
+  } catch (err) {
+    console.error('options enumerate failed:', err);
+    res.status(500).json({ error: err.message || 'options enumerate failed' });
+  }
+});
+
+// PATCH /instagram/:credentialId/selection
+// Body: { pageId, igUserId?, catalogId? }
+//   Validates each picked id is in what the token can access, then
+//   updates the credential and flips status to 'active'. Re-callable
+//   later for "Switch account" — same endpoint.
+router.patch('/instagram/:credentialId/selection', express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      _id: req.params.credentialId, brandId, type: 'instagram',
+      status: { $in: ['pending', 'active'] }
+    }));
+    if (!cred) return res.status(404).json({ error: 'credential not found or revoked' });
+
+    const body = req.body || {};
+    const pageId    = body.pageId    || null;
+    const igUserId  = body.igUserId  || null;
+    const catalogId = body.catalogId || null;
+    if (!pageId) return res.status(400).json({ error: 'pageId required' });
+
+    // Validate against the token's actual access — defends against a
+    // user PATCHing arbitrary IDs.
+    const { decrypt } = require('../services/integrationCryptoService');
+    let token;
+    try { token = decrypt(cred.accessTokenEnc); }
+    catch (err) { return res.status(500).json({ error: `token decrypt failed: ${err.message}` }); }
+
+    const opts = await ig.listAccountOptions(token);
+    const matchedPage = opts.pages.find(p => p.id === pageId);
+    if (!matchedPage) return res.status(400).json({ error: 'pageId not in token-accessible Pages' });
+    if (igUserId && matchedPage.igBusinessAccount?.id !== igUserId) {
+      return res.status(400).json({ error: "igUserId doesn't belong to the chosen Page" });
+    }
+    if (catalogId && !opts.catalogs.find(c => c.id === catalogId)) {
+      return res.status(400).json({ error: 'catalogId not in token-accessible catalogs' });
+    }
+
+    // Multi-page uniqueness: if another active credential under this
+    // brand already binds the chosen igUserId, refuse — picker UX
+    // should surface the conflict and let the user disconnect the
+    // existing one first.
+    if (igUserId) {
+      const conflict = await IntegrationCredential.findOne({
+        _id:      { $ne: cred._id },
+        brandId, type: 'instagram', status: 'active', igUserId
+      }).select('_id').lean();
+      if (conflict) {
+        return res.status(409).json({ error: `Another active credential already binds @${matchedPage.igBusinessAccount?.username || igUserId}; disconnect it first.` });
+      }
+    }
+
+    cred.pageId     = pageId;
+    cred.pageName   = matchedPage.name || null;
+    cred.igUserId   = igUserId  || null;
+    cred.igUsername = igUserId ? (matchedPage.igBusinessAccount?.username || null) : null;
+    cred.catalogId  = catalogId || null;
+    cred.status     = 'active';
+    await cred.save();
+
+    console.log(`✅ IG selection finalized: brand=${brandId} cred=${cred._id} page=${matchedPage.name} ig=@${cred.igUsername || '∅'} catalog=${catalogId || '∅'}`);
+    res.json({
+      ok: true,
+      credential: {
+        id:        String(cred._id),
+        pageId:    cred.pageId,
+        pageName:  cred.pageName,
+        igUserId:  cred.igUserId,
+        igUsername: cred.igUsername,
+        catalogId: cred.catalogId,
+        status:    cred.status
+      }
+    });
+  } catch (err) {
+    console.error('selection update failed:', err);
+    res.status(500).json({ error: err.message || 'selection update failed' });
+  }
+});
 
 // ── Catalog browser (V2 #1) ──────────────────────────────────────────
 // GET /api/integrations/instagram/catalog

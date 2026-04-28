@@ -16,7 +16,10 @@ const integrationCredentialSchema = new mongoose.Schema({
   brandId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',      required: true, index: true },
 
   type:   { type: String, enum: ['instagram'], required: true },
-  status: { type: String, enum: ['active', 'revoked', 'expired'], default: 'active', index: true },
+  // 'pending' = token captured but the user hasn't picked which Page /
+  // IG Business account / catalog to bind yet (V2.5 picker flow).
+  // Pending rows skip sync and the partial-unique-active index.
+  status: { type: String, enum: ['active', 'revoked', 'expired', 'pending'], default: 'active', index: true },
 
   // Encrypted access token blob: { iv, authTag, ciphertext } base64
   // strings. Decryption happens only inside services that actually

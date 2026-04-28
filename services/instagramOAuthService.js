@@ -157,11 +157,67 @@ async function fetchAccountSummary(longLivedToken) {
   return summary;
 }
 
+// V2.5 — full enumeration of what the token can access. Used by the
+// account picker to show the user every Page + IG Business account +
+// catalog so they can choose which to bind to a Brand.
+async function listAccountOptions(accessToken) {
+  const out = { pages: [], catalogs: [] };
+
+  try {
+    const accounts = await axios.get(`${META_GRAPH_ROOT}/me/accounts`, {
+      params: { fields: 'id,name,instagram_business_account{id,username}', access_token: accessToken, limit: 100 },
+      timeout: 15000
+    });
+    for (const p of (accounts.data?.data || [])) {
+      out.pages.push({
+        id:                p.id,
+        name:              p.name || '',
+        igBusinessAccount: p.instagram_business_account ? {
+          id:       p.instagram_business_account.id,
+          username: p.instagram_business_account.username || null
+        } : null
+      });
+    }
+  } catch (err) {
+    console.warn(`   ⚠️  meta /me/accounts (full) failed: ${err.response?.data?.error?.message || err.message}`);
+  }
+
+  try {
+    const businesses = await axios.get(`${META_GRAPH_ROOT}/me/businesses`, {
+      params: { fields: 'id,name', access_token: accessToken, limit: 50 },
+      timeout: 15000
+    });
+    for (const biz of (businesses.data?.data || [])) {
+      try {
+        const catalogs = await axios.get(`${META_GRAPH_ROOT}/${biz.id}/owned_product_catalogs`, {
+          params: { fields: 'id,name,product_count', access_token: accessToken, limit: 50 },
+          timeout: 15000
+        });
+        for (const c of (catalogs.data?.data || [])) {
+          out.catalogs.push({
+            id:           c.id,
+            name:         c.name || '',
+            businessName: biz.name || '',
+            productCount: c.product_count ?? null
+          });
+        }
+      } catch (err) {
+        console.warn(`   ⚠️  meta business ${biz.id} catalogs failed: ${err.response?.data?.error?.message || err.message}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`   ⚠️  meta /me/businesses failed: ${err.response?.data?.error?.message || err.message}`);
+  }
+
+  return out;
+}
+
 module.exports = {
   buildAuthorizeUrl,
   exchangeCodeForToken,
   exchangeForLongLivedToken,
   fetchAccountSummary,
+  listAccountOptions,
   isConfigured,
   SCOPES
 };
