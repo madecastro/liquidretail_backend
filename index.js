@@ -17,6 +17,8 @@ const detectRoutes = require('./routes/detect');
 const layoutRoutes = require('./routes/layout');
 const mediaRoutes  = require('./routes/media');
 const brandRoutes  = require('./routes/brand');
+const meRoutes     = require('./routes/me');
+const onboardingRoutes = require('./routes/onboarding');
 const aiLayoutRoutes = require('./routes/aiLayouts');
 const requireAuth = require('./middleware/requireAuth');
 
@@ -96,6 +98,12 @@ app.use('/api/detect', requireAuth, detectRoutes);
 app.use('/api/layout-input', requireAuth, layoutRoutes);
 app.use('/api/media', requireAuth, mediaRoutes);
 app.use('/api/brand', requireAuth, brandRoutes);
+app.use('/api/me',    requireAuth, meRoutes);
+// Onboarding mounts WITHOUT requireAuth — its own middleware
+// (requireUserOnly) lets users without an Advertiser through so
+// they can create one. Mounting requireAuth here would 403 every
+// onboarding attempt.
+app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {

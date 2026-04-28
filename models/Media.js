@@ -13,12 +13,12 @@
 const mongoose = require('mongoose');
 
 const mediaSchema = new mongoose.Schema({
-  // Tenant scope. Nullable until the Phase 1.4 backfill assigns
-  // existing rows to a default Advertiser. Brand-level scoping
-  // (brandId) lands when the brand-context picker UI ships in
-  // Phase 3 — for now Media is identified to a brand via
-  // metadata.brand string lookup.
+  // Tenant scope.
   advertiserId:  { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', index: true, default: null },
+  // Brand scope. Set on upload from the active brand picker (or
+  // from form override). Nullable for legacy Media — frontend can
+  // still surface those by leaving the brandId filter off.
+  brandId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Brand', index: true, default: null },
 
   externalId:    { type: String, required: true },
   source:        {

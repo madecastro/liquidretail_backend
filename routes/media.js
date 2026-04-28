@@ -21,9 +21,14 @@ router.get('/', async (req, res) => {
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     const onlyReady = req.query.ready === 'true';
 
-    const filter = tenantFilter(req, onlyReady
+    // Optional brand filter — comes from ?brandId= query param OR
+    // the X-Brand-Id header (the picker injects it on every fetch).
+    const brandId = req.query.brandId || req.headers['x-brand-id'] || null;
+    const filterExtras = onlyReady
       ? { 'latestArtifacts.detection': { $ne: null } }
-      : {});
+      : {};
+    if (brandId) filterExtras.brandId = brandId;
+    const filter = tenantFilter(req, filterExtras);
 
     const [docs, total] = await Promise.all([
       Media.find(filter)

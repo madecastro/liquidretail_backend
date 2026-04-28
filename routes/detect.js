@@ -55,8 +55,15 @@ router.post('/', upload.fields([
     // index still applies. Webhooks will pass the real platform id.
     const externalId = `manual_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+    // Active brand context — comes from the X-Brand-Id header
+    // (set by the nav brand-picker on every API call) or an
+    // explicit brandId field on the upload form. Nullable so
+    // legacy callers without a brand context still work.
+    const brandId = req.headers['x-brand-id'] || req.body?.brandId || null;
+
     const media = await Media.create({
       advertiserId: req.advertiserId,
+      brandId:      brandId || null,
       externalId,
       source:       'manual_upload',
       sourceUrl:    null,
