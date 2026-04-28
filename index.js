@@ -125,6 +125,7 @@ app.use('/api/integrations', (req, res, next) => {
   if (req.path === '/instagram/callback') return next();
   if (req.path === '/instagram/webhook')  return next();
   if (req.path === '/meta-ads/callback')  return next();
+  if (req.path === '/google-ads/callback') return next();
   return requireAuth(req, res, next);
 }, integrationRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);

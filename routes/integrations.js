@@ -28,6 +28,7 @@ const { syncPosts, getPostsStatus } = require('../services/postSyncService');
 const geminiSearch = require('../services/providers/geminiSearchProvider');
 const { verifySignature, processWebhookPayload } = require('../services/instagramWebhookService');
 const metaAds = require('../services/metaAdsOAuthService');
+const googleAds = require('../services/googleAdsOAuthService');
 
 const FRONTEND_URL = 'https://liquidretail.netlify.app';
 
@@ -919,6 +920,250 @@ router.delete('/meta-ads/:credentialId', async (req, res) => {
     res.json({ ok: true, credentialId: String(cred._id) });
   } catch (err) {
     res.status(500).json({ error: err.message || 'meta-ads disconnect failed' });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════
+//  GOOGLE ADS — Google Ads API (Ad Platforms Phase A.2)
+// ═════════════════════════════════════════════════════════════════════
+
+function summarizeGoogleAds(cred) {
+  if (!cred) return null;
+  const pd = cred.platformData || {};
+  return {
+    id:               String(cred._id),
+    type:             cred.type,
+    status:           cred.status,
+    pending:          cred.status === 'pending',
+    customerId:       pd.customerId       || null,
+    customerName:     pd.customerName     || null,
+    currencyCode:     pd.currencyCode     || null,
+    timeZone:         pd.timeZone         || null,
+    managerCustomerId: pd.managerCustomerId || null,
+    expiresAt:        cred.expiresAt      || null,
+    connectedAt:      cred.connectedAt    || null
+  };
+}
+
+router.get('/google-ads/status', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const creds = await IntegrationCredential.find(tenantFilter(req, {
+      brandId, type: 'google-ads', status: { $in: ['active', 'pending'] }
+    })).sort({ connectedAt: 1 }).lean();
+    res.json({
+      configured:         googleAds.isConfigured(),
+      devTokenConfigured: googleAds.isDevTokenConfigured(),
+      credentials:        creds.map(summarizeGoogleAds)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'google-ads status failed' });
+  }
+});
+
+router.post('/google-ads/connect', express.json(), async (req, res) => {
+  try {
+    if (!googleAds.isConfigured()) {
+      return res.status(501).json({ error: 'Google Ads OAuth not configured (set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_ADS_REDIRECT_URI)' });
+    }
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const state = jwt.sign(
+      {
+        purpose:      'google-ads-oauth',
+        userId:       String(req.user.userId || req.user.id),
+        advertiserId: String(req.advertiserId),
+        brandId:      String(brandId),
+        nonce:        Math.random().toString(36).slice(2)
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+    res.json({ authorizeUrl: googleAds.buildAuthorizeUrl({ state }) });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'google-ads connect init failed' });
+  }
+});
+
+router.get('/google-ads/callback', async (req, res) => {
+  const { code, state, error: oauthError, error_description } = req.query;
+  const bounce = (status, msg, setupId) => {
+    const params = new URLSearchParams({ gads_status: status });
+    if (msg)     params.set('gads_msg', msg);
+    if (setupId) params.set('gads_setup', setupId);
+    res.redirect(`${FRONTEND_URL}/brand.html?${params.toString()}`);
+  };
+
+  if (oauthError) return bounce('denied', String(error_description || oauthError));
+  if (!code || !state) return bounce('error', 'missing code or state');
+
+  let payload;
+  try {
+    payload = jwt.verify(String(state), process.env.JWT_SECRET);
+    if (payload.purpose !== 'google-ads-oauth') throw new Error('wrong purpose');
+  } catch (err) {
+    return bounce('error', `invalid state: ${err.message}`);
+  }
+
+  try {
+    const tokens = await googleAds.exchangeCodeForTokens(String(code));
+    if (!tokens?.refresh_token) {
+      // No refresh_token usually means the user previously consented
+      // and Google didn't re-issue. The prompt='consent' on our
+      // authorize URL forces it; if we still hit this, something's
+      // misconfigured.
+      throw new Error('no refresh_token returned — re-authorize and ensure the consent screen actually appeared');
+    }
+    // Encrypt the refresh_token (the long-term secret); access tokens
+    // are minted on demand from it via refreshAccessToken().
+    const expiresAt = tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null;
+    const cred = await IntegrationCredential.create({
+      advertiserId:   payload.advertiserId,
+      brandId:        payload.brandId,
+      type:           'google-ads',
+      status:         'pending',
+      accessTokenEnc: encrypt(tokens.refresh_token),
+      expiresAt,
+      scopes:         googleAds.SCOPES,
+      connectedBy:    payload.userId,
+      connectedAt:    new Date()
+    });
+    console.log(`🔑 Google Ads token captured (pending selection): brand=${payload.brandId} cred=${cred._id}`);
+    return bounce('pending', 'pick a customer', String(cred._id));
+  } catch (err) {
+    const detail = err.response?.data?.error_description || err.response?.data?.error?.message || err.message;
+    console.warn(`   ⚠️  Google Ads callback failed: ${detail}`);
+    return bounce('error', detail);
+  }
+});
+
+// GET /google-ads/:credentialId/options — enumerate accessible
+// customers via listAccessibleCustomers + per-customer detail fetch.
+router.get('/google-ads/:credentialId/options', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      _id: req.params.credentialId, brandId, type: 'google-ads',
+      status: { $in: ['pending', 'active'] }
+    }));
+    if (!cred) return res.status(404).json({ error: 'credential not found or revoked' });
+
+    const { decrypt } = require('../services/integrationCryptoService');
+    let refreshToken;
+    try { refreshToken = decrypt(cred.accessTokenEnc); }
+    catch (err) { return res.status(500).json({ error: `token decrypt failed: ${err.message}` }); }
+
+    // Mint a fresh access token from the stored refresh_token.
+    let accessToken;
+    try {
+      const minted = await googleAds.refreshAccessToken(refreshToken);
+      accessToken = minted?.access_token;
+      if (!accessToken) throw new Error('refresh returned no access_token');
+    } catch (err) {
+      const detail = err.response?.data?.error_description || err.message;
+      return res.status(502).json({ error: `access-token refresh failed: ${detail}` });
+    }
+
+    if (!googleAds.isDevTokenConfigured()) {
+      return res.status(501).json({
+        error: 'GOOGLE_ADS_DEVELOPER_TOKEN not set on server — apply for one at https://ads.google.com/aw/apicenter and add it as an env var',
+        devTokenMissing: true
+      });
+    }
+
+    const customers = await googleAds.listCustomersWithDetails(accessToken);
+    res.json({
+      options: { customers: customers || [] },
+      current: { customerId: cred.platformData?.customerId || null }
+    });
+  } catch (err) {
+    console.error('google-ads options failed:', err);
+    res.status(500).json({ error: err.message || 'options enumerate failed' });
+  }
+});
+
+// PATCH /google-ads/:credentialId/selection
+// Body: { customerId, managerCustomerId? }
+router.patch('/google-ads/:credentialId/selection', express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      _id: req.params.credentialId, brandId, type: 'google-ads',
+      status: { $in: ['pending', 'active'] }
+    }));
+    if (!cred) return res.status(404).json({ error: 'credential not found or revoked' });
+
+    const customerId        = (req.body || {}).customerId;
+    const managerCustomerId = (req.body || {}).managerCustomerId || null;
+    if (!customerId) return res.status(400).json({ error: 'customerId required' });
+
+    // Validate against the user's accessible customers — defends
+    // against a user PATCHing arbitrary IDs.
+    const { decrypt } = require('../services/integrationCryptoService');
+    let refreshToken;
+    try { refreshToken = decrypt(cred.accessTokenEnc); }
+    catch (err) { return res.status(500).json({ error: `token decrypt failed: ${err.message}` }); }
+    let accessToken;
+    try {
+      const minted = await googleAds.refreshAccessToken(refreshToken);
+      accessToken = minted?.access_token;
+    } catch (err) {
+      return res.status(502).json({ error: `access-token refresh failed: ${err.message}` });
+    }
+    const customers = await googleAds.listAccessibleCustomers(accessToken);
+    if (!customers) return res.status(501).json({ error: 'GOOGLE_ADS_DEVELOPER_TOKEN not set' });
+    const matched = customers.find(c => c.customerId === customerId);
+    if (!matched) return res.status(400).json({ error: 'customerId not in token-accessible customers' });
+
+    // Cross-credential conflict check.
+    const conflict = await IntegrationCredential.findOne({
+      _id:      { $ne: cred._id },
+      brandId, type: 'google-ads', status: 'active',
+      'platformData.customerId': customerId
+    }).select('_id').lean();
+    if (conflict) {
+      return res.status(409).json({ error: `Another active credential already binds customer ${customerId}; disconnect it first.` });
+    }
+
+    // Pull human-readable details so the UI can show name + currency
+    // without re-querying.
+    const details = await googleAds.fetchCustomerDetails(customerId, accessToken);
+
+    cred.platformData = {
+      customerId,
+      customerName:      details?.descriptiveName || null,
+      currencyCode:      details?.currencyCode    || null,
+      timeZone:          details?.timeZone        || null,
+      managerCustomerId
+    };
+    cred.markModified('platformData');
+    cred.status = 'active';
+    await cred.save();
+
+    console.log(`✅ Google Ads selection finalized: brand=${brandId} cred=${cred._id} customer=${customerId} (${details?.descriptiveName || '?'})`);
+    res.json({ ok: true, credential: summarizeGoogleAds(cred) });
+  } catch (err) {
+    console.error('google-ads selection failed:', err);
+    res.status(500).json({ error: err.message || 'selection update failed' });
+  }
+});
+
+router.delete('/google-ads/:credentialId', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOneAndUpdate(
+      tenantFilter(req, { _id: req.params.credentialId, brandId, type: 'google-ads', status: { $in: ['active', 'pending'] } }),
+      { $set: { status: 'revoked', revokedAt: new Date(), revokedBy: req.user.userId || req.user.id } },
+      { new: true }
+    );
+    if (!cred) return res.status(404).json({ error: 'credential not found or already revoked' });
+    res.json({ ok: true, credentialId: String(cred._id) });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'google-ads disconnect failed' });
   }
 });
 
