@@ -21,7 +21,14 @@ router.get('/google/callback',
       process.env.JWT_SECRET,
       { expiresIn: '24h' }
     );
-    res.redirect(`${FRONTEND_URL}/#token=${token}&user=${encodeURIComponent(req.user.name)}`);
+    // Email is included so the frontend can store it for the
+    // invite-acceptance flow (compares signed-in email against the
+    // invite's email-bound recipient before showing accept).
+    res.redirect(
+      `${FRONTEND_URL}/#token=${token}` +
+      `&user=${encodeURIComponent(req.user.name)}` +
+      `&email=${encodeURIComponent(req.user.email)}`
+    );
   }
 );
 
