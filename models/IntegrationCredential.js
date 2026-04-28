@@ -57,6 +57,7 @@ const integrationCredentialSchema = new mongoose.Schema({
   // re-running what the user just kicked off by hand.
   lastCatalogSyncAt: Date,
   lastPostsSyncAt:   Date
+});
 
 // V2 #5 — multi-page support. Compound unique index on
 // (brandId, type, igUserId) so a brand can hold more than one active
