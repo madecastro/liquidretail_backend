@@ -199,13 +199,33 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
   // Tighten each restriction inward — Gemini's bboxes pad generously
   // around the actual subject. Don't shrink below a sensible minimum
   // size (5% canvas dimension) so we don't accidentally annihilate a
-  // small far-away product restriction.
-  const restrictions = (analysis?.restrictions || []).map(r => ({
-    rect: shrinkRect(r.rectPct, RESTRICTION_INSET_PCT, 0.05),
-    strictness: r.strictness ?? 1
-  }));
-  const hardKeepOut = restrictions.filter(r => r.strictness >= HARD_STRICTNESS_FLOOR);
-  const softKeepOut = restrictions.filter(r => r.strictness >= threshold && r.strictness < HARD_STRICTNESS_FLOOR);
+  // small far-away product restriction. Text restrictions are NOT
+  // shrunk — text bboxes already wrap visible glyphs tightly and any
+  // inset would expose actual letter edges to overlay.
+  const restrictions = (analysis?.restrictions || []).map(r => {
+    const isText = r.classification === 'text';
+    return {
+      rect: isText ? r.rectPct : shrinkRect(r.rectPct, RESTRICTION_INSET_PCT, 0.05),
+      strictness: r.strictness ?? 1,
+      classification: r.classification || null
+    };
+  });
+  // ABSOLUTE keep-outs — in-image text regions. No overlay element may
+  // overlap these regardless of conservation slider, soft budget, or
+  // per-element allowedHardOverlapPct. Text-on-text is unreadable; we
+  // never want our headline/quote/CTA stacked on top of detected
+  // signage, captions, or labels in the source image.
+  const textKeepOut = restrictions.filter(r => r.classification === 'text');
+  // Hard / soft keep-outs exclude text — text is handled by textKeepOut
+  // above with its own absolute check.
+  const hardKeepOut = restrictions.filter(r =>
+    r.classification !== 'text' && r.strictness >= HARD_STRICTNESS_FLOOR
+  );
+  const softKeepOut = restrictions.filter(r =>
+    r.classification !== 'text' &&
+    r.strictness >= threshold &&
+    r.strictness < HARD_STRICTNESS_FLOOR
+  );
   const densityGrid = analysis?.densityGrid || null;
 
   const consumed = [];
@@ -220,6 +240,7 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
     const hardAllow = el.allowedHardOverlapPct || 0;
     const legal = candidates.filter(c =>
       withinCanvas(c) &&
+      !overlapsAnyText(c, textKeepOut) &&
       !overlapsAnyHard(c, hardKeepOut, hardAllow, densityGrid) &&
       softOverlapWithinLimit(c, softKeepOut, el) &&
       !overlapsAnyConsumed(c, consumed)
@@ -236,9 +257,14 @@ function tryPlace({ canvasW, canvasH, analysis, conservation, elements, content,
       }, {}).c;
       reason = `placed in ${el.region} (${legal.length}/${nCandidates} legal candidates)`;
     } else if (el.required) {
-      // Last-resort: ignore SOFT overlap entirely; only avoid HARD + consumed.
+      // Last-resort: ignore SOFT overlap entirely; only avoid HARD +
+      // text + consumed. Text remains absolute even in the fallback —
+      // text-on-text is unreadable no matter how desperate placement is.
       const fallback = candidates.filter(c =>
-        withinCanvas(c) && !overlapsAnyHard(c, hardKeepOut, hardAllow, densityGrid) && !overlapsAnyConsumed(c, consumed)
+        withinCanvas(c) &&
+        !overlapsAnyText(c, textKeepOut) &&
+        !overlapsAnyHard(c, hardKeepOut, hardAllow, densityGrid) &&
+        !overlapsAnyConsumed(c, consumed)
       );
       if (fallback.length) {
         pick = fallback.reduce((best, c) => {
@@ -575,6 +601,14 @@ function rectIntersectionArea(a, b) {
   const h = Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1);
   return w * h;
 }
+// Absolute keep-out for in-image text. No element overlaps detected
+// text regions regardless of conservation, soft budgets, or per-element
+// allowedHardOverlapPct. Text-on-text is always unreadable.
+function overlapsAnyText(cand, textKeepOut) {
+  if (!Array.isArray(textKeepOut) || textKeepOut.length === 0) return false;
+  return textKeepOut.some(k => rectsIntersect(cand, k.rect));
+}
+
 function overlapsAnyHard(cand, hardKeepOut, allowedHardOverlapPct = 0, densityGrid = null) {
   // Density-aware path: if we have a densityGrid, weight each
   // intersection by the average busyness of the cells it covers — an
