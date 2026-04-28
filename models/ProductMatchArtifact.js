@@ -25,11 +25,26 @@ const productMatchArtifactSchema = new mongoose.Schema({
   //             'category', 'branding', 'do_not_use' }
   outcome:          { type: String, index: true },
   outcomeReasoning: String,
-  winner:           String,        // 'yolo' | 'gemini' | 'agree' | null
+  winner:           String,        // 'yolo' | 'gemini' | 'agree' | 'catalog' | null
   // Brand-level fallback collection page (filled when outcome='category')
   brandCategory:    mongoose.Schema.Types.Mixed,
   // Brand-level reviews (filled when outcome='branding')
   brandReviews:     mongoose.Schema.Types.Mixed,
+
+  // ── Catalog provenance (Phase C) ──
+  // matchSource: where the canonical product came from — 'ig-catalog'
+  // when a brand-catalog row won the match, 'gemini-search' when the
+  // remote provider chain won, 'both' when catalog + remote agreed.
+  // null for brand_match / do_not_use (no specific product picked).
+  matchSource:      { type: String, index: true },
+  // Ref to the matched CatalogProduct row when matchSource includes
+  // 'ig-catalog'. Lets downstream templates pull canonical title /
+  // imageUrl / productUrl directly from the brand's authoritative
+  // catalog instead of re-deriving from prose.
+  catalogProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null },
+  // Snapshot of the matched catalog row + its match score, for audit
+  // without requiring a join. Cleared on subsequent runs.
+  catalogMatch:     mongoose.Schema.Types.Mixed,
 
   createdAt: { type: Date, default: Date.now }
 });

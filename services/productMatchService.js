@@ -36,6 +36,7 @@ const productDetails  = require('./productDetailsService');
 const productCategory = require('./productCategoryService');
 const Brand           = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
+const CatalogProduct  = require('../models/CatalogProduct');
 
 // How long a cached Brand.brandReviews snapshot is considered fresh
 // before we re-fetch. 30 days — brand sentiment moves slowly enough
@@ -64,6 +65,7 @@ async function findProductMatches({
   brand, category, caption, primarySubject, textDetected, imageUrl,
   brandUrl,                     // brand homepage (used by category + branding lookups)
   advertiserId = null,          // tenant scope — needed to find the cached Brand for brand-reviews lookup
+  brandId      = null,          // Phase C — needed for catalog lookup against CatalogProduct
   yoloIdentifications = []      // [{ identification: { label, brand, category, confidence, ... } }]
 }) {
   const enabled = PROVIDERS.filter(p => p.isEnabled());
@@ -108,14 +110,59 @@ async function findProductMatches({
     }
   }
 
+  // ── Catalog lookup (Phase C) ──
+  // Search the brand's CatalogProduct rows for a text + category match
+  // against what YOLO+GPT and Gemini have surfaced. Brands without a
+  // synced catalog skip silently (returns null).
+  let catalogMatch = null;
+  if (brandId) {
+    try {
+      const yoloTopForCatalog = (yoloIdentifications || [])
+        .map(d => d?.identification)
+        .filter(id => id && (id.confidence || 0) >= PRODUCT_FLOOR && id.label)
+        .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0] || null;
+      catalogMatch = await findCatalogMatch({
+        brandId,
+        yoloTop:        yoloTopForCatalog,
+        geminiTop:      identification,
+        category,
+        // Phase C — also feed in the upstream pipeline artifacts so the
+        // scorer sees text detected on the product itself (often a SKU
+        // name or model number), the GPT-4.1 scene description, and the
+        // user-supplied caption.
+        caption,
+        primarySubject,
+        textDetected
+      });
+      if (catalogMatch) {
+        console.log(`📦 catalog match: "${catalogMatch.product.title}" (score ${catalogMatch.score.toFixed(2)}) — ${catalogMatch.reasoning}`);
+      }
+    } catch (err) {
+      console.warn(`   ✗ catalog lookup: ${err.message}`);
+      errors.catalogMatch = err.message;
+    }
+  }
+
   // ── DECISION TREE ─────────────────────────────────────────────────
   const decision = await runDecisionTree({
     yoloIdentifications,
     geminiIdentification: identification,
+    catalogMatch,
     brand, brandUrl, category
   });
   const { outcome, outcomeReasoning, winner } = decision;
   let { brandCategory, brandReviews } = decision;
+
+  // Provenance flags for the artifact. matchSource is 'ig-catalog'
+  // when the catalog won outright, 'both' when catalog agreed with
+  // remote signals, 'gemini-search' when remote signals won alone,
+  // null when there's no specific product (brand_match / do_not_use).
+  let matchSource = null;
+  if (outcome === 'product_match') {
+    if (winner === 'catalog')     matchSource = 'ig-catalog';
+    else if (catalogMatch?.score >= 0.5) matchSource = 'both';
+    else                          matchSource = 'gemini-search';
+  }
 
   // ── Post-decision enrichment per outcome ──────────────────────────
   // Pick the best YOLO product up here so winner='yolo' enrichment can
@@ -139,6 +186,26 @@ async function findProductMatches({
     identification.certainty = yoloTop.confidence;
     identification.certaintyLabel = 'yolo-winner';
     console.log(`   · YOLO winner override: identification.productName → "${yoloTop.label}"`);
+  }
+
+  // Catalog winner: identification points at the catalog row directly —
+  // canonical title + URL come from the brand's authoritative inventory,
+  // not derived from prose. details.url overrides whatever Gemini found
+  // (the brand's own product page beats third-party retailer URLs).
+  if (outcome === 'product_match' && winner === 'catalog' && catalogMatch?.product) {
+    if (!identification) identification = {};
+    const cp = catalogMatch.product;
+    identification.productName    = cp.title;
+    identification.certainty      = catalogMatch.score;
+    identification.certaintyLabel = 'catalog-winner';
+    identification.details = Object.assign({}, identification.details, {
+      url:        cp.productUrl || identification.details?.url || null,
+      imageUrl:   cp.imageUrl   || identification.details?.imageUrl || null,
+      price:      cp.price      != null ? cp.price : identification.details?.price,
+      currency:   cp.currency   || identification.details?.currency,
+      source:     'ig-catalog'
+    });
+    console.log(`   · catalog winner override: identification.productName → "${cp.title}" (URL ${cp.productUrl || '∅'})`);
   }
 
   // SKU details — only fetch when we have a confident product to look up.
@@ -206,9 +273,13 @@ async function findProductMatches({
     outcome,                  // 'confirmed' | 'lookup_from_yolo' | 'lookup_from_gemini' |
                               // 'category' | 'branding' | 'do_not_use'
     outcomeReasoning,         // human-readable why
-    winner,                   // 'yolo' | 'gemini' | 'agree' | null
+    winner,                   // 'yolo' | 'gemini' | 'agree' | 'catalog' | null
     brandCategory,            // { breadcrumb, url, confidence } or null
-    brandReviews              // { quotes, rating, reviewCount, summary } or null
+    brandReviews,             // { quotes, rating, reviewCount, summary } or null
+
+    // ── Phase C provenance ──
+    matchSource,              // 'ig-catalog' | 'gemini-search' | 'both' | null
+    catalogMatch              // { product, score, reasoning } when found, else null
   };
 }
 
@@ -237,6 +308,7 @@ async function findProductMatches({
 async function runDecisionTree({
   yoloIdentifications,
   geminiIdentification,
+  catalogMatch,
   brand,
   brandUrl,
   category
@@ -255,6 +327,14 @@ async function runDecisionTree({
   if (distinctBrands.size >= 2) {
     return baseOutcome('do_not_use', null,
       `multiple brands detected on the same Media (${[...distinctBrands].join(', ')}); creative would be ambiguous`);
+  }
+
+  // 1b. Confident catalog hit. The brand's own inventory telling us
+  // "yes, we sell this" is more authoritative than retailer-search
+  // matches. Skip directly to product_match (winner='catalog').
+  if (catalogMatch?.score >= HIGH_CONFIDENCE) {
+    return baseOutcome('product_match', 'catalog',
+      `catalog match "${catalogMatch.product.title}" (${pct(catalogMatch.score)}) — brand's authoritative inventory`);
   }
 
   // YOLO product candidates — must clear floor AND have a label.
@@ -408,6 +488,109 @@ async function fetchBrandReviewsCachedOrFresh({ brand: brandName, brandUrl, adve
     }
   }
   return fresh;
+}
+
+// ── Catalog match (Phase C) ──────────────────────────────────────────
+//
+// Searches the brand's CatalogProduct rows for a row whose title +
+// description has the highest weighted-overlap with every text signal
+// the detect pipeline produced for this Media — YOLO label, YOLO
+// description, Gemini-reasoner productName, OCR'd text on the product,
+// GPT-4.1 primarySubject, and the user-supplied caption.
+//
+// Score is a weighted recall (how many term tokens land in the catalog
+// row) summed across all signals and normalized 0-1. Catalog rows in
+// the same category as the YOLO category hint get a small bonus.
+//
+// Returns { product, score, reasoning, signalsUsed } or null when no
+// catalog row clears the floor.
+async function findCatalogMatch({
+  brandId, yoloTop, geminiTop, category,
+  caption, primarySubject, textDetected
+}) {
+  if (!brandId) return null;
+
+  const signals = [];
+  if (yoloTop?.label)         signals.push({ text: yoloTop.label,         weight: 1.0, src: 'yolo-label' });
+  if (yoloTop?.description)   signals.push({ text: yoloTop.description,   weight: 0.7, src: 'yolo-desc' });
+  if (geminiTop?.productName) signals.push({ text: geminiTop.productName, weight: 0.9, src: 'gemini-name' });
+  if (Array.isArray(textDetected)) {
+    for (const t of textDetected.filter(Boolean).slice(0, 8)) {
+      signals.push({ text: String(t), weight: 0.8, src: 'ocr-text' });
+    }
+  }
+  if (primarySubject) signals.push({ text: primarySubject, weight: 0.6, src: 'primary-subject' });
+  if (caption)        signals.push({ text: caption,        weight: 0.5, src: 'caption' });
+  if (!signals.length) return null;
+
+  // Cap the candidate pull. V1 brands typically have well under 500
+  // SKUs; V2 (CLIP embeddings + vector index) handles large catalogs.
+  const rows = await CatalogProduct
+    .find({ brandId, source: 'ig-catalog' })
+    .limit(500)
+    .select('title description category brand price currency imageUrl productUrl externalId')
+    .lean();
+  if (!rows.length) return null;
+
+  const cat = category ? String(category).toLowerCase().trim() : null;
+
+  let best = null;
+  for (const row of rows) {
+    const haystack = (`${row.title || ''} ${row.description || ''}`).toLowerCase();
+    const haystackTokens = new Set(tokenize(haystack));
+    if (!haystackTokens.size) continue;
+
+    let totalWeight = 0, matchedWeight = 0;
+    const matchedSrcs = new Set();
+    for (const sig of signals) {
+      const sigTokens = new Set(tokenize(sig.text));
+      if (!sigTokens.size) continue;
+      let shared = 0;
+      for (const t of sigTokens) if (haystackTokens.has(t)) shared++;
+      const overlap = shared / sigTokens.size; // term-recall — credit
+                                               // for proportion of the
+                                               // signal that hit
+      totalWeight   += sig.weight;
+      matchedWeight += sig.weight * overlap;
+      if (shared > 0) matchedSrcs.add(sig.src);
+    }
+    if (!totalWeight) continue;
+    let score = matchedWeight / totalWeight;
+
+    // Category bonus — caps at +0.10 to keep weighted overlap dominant.
+    if (cat && row.category) {
+      const rc = String(row.category).toLowerCase().trim();
+      if (rc === cat || rc.includes(cat) || cat.includes(rc)) {
+        score = Math.min(1, score + 0.10);
+      }
+    }
+
+    // Floor of 0.30 keeps incidental token noise (a, an, the surviving
+    // the stopword list) from yielding spurious matches.
+    if (score >= 0.30 && (!best || score > best.score)) {
+      best = {
+        product:     row,
+        score,
+        reasoning:   `weighted token overlap (${matchedSrcs.size}/${signals.length} signals hit: ${[...matchedSrcs].join(', ')})`,
+        signalsUsed: [...matchedSrcs]
+      };
+    }
+  }
+  return best;
+}
+
+// English stopwords + filler that pollutes overlap scoring otherwise.
+const CATALOG_STOPWORDS = new Set([
+  'the','and','for','with','from','that','this','these','those','your','their',
+  'are','was','were','has','have','had','will','can','more','than','about','our',
+  'all','any','its','too','use','via','very','just','also','most','some','only'
+]);
+function tokenize(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && !CATALOG_STOPWORDS.has(t));
 }
 
 module.exports = { findProductMatches };

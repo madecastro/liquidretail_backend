@@ -202,6 +202,7 @@ async function runImagePipeline(run, media, buffer) {
       brand:          media.metadata?.brand,
       brandUrl:       media.metadata?.brandUrl,
       advertiserId:   media.advertiserId || null,
+      brandId:        media.brandId || null,
       category:       media.metadata?.category,
       caption:        media.metadata?.caption,
       primarySubject: primarySubjectDesc,
@@ -211,7 +212,7 @@ async function runImagePipeline(run, media, buffer) {
       // (multi-brand contention, confidence comparison vs Gemini).
       yoloIdentifications: products
     });
-    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
+    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)${productMatches.matchSource ? ` (source=${productMatches.matchSource})` : ''}`);
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
   const matchDoc = productMatches ? await ProductMatchArtifact.create({
@@ -225,7 +226,16 @@ async function runImagePipeline(run, media, buffer) {
     outcomeReasoning: productMatches.outcomeReasoning || null,
     winner:           productMatches.winner || null,
     brandCategory:    productMatches.brandCategory || null,
-    brandReviews:     productMatches.brandReviews || null
+    brandReviews:     productMatches.brandReviews || null,
+    matchSource:      productMatches.matchSource || null,
+    catalogProductId: productMatches.catalogMatch?.product?._id || null,
+    catalogMatch:     productMatches.catalogMatch ? {
+      productId:   productMatches.catalogMatch.product._id,
+      title:       productMatches.catalogMatch.product.title,
+      score:       productMatches.catalogMatch.score,
+      reasoning:   productMatches.catalogMatch.reasoning,
+      signalsUsed: productMatches.catalogMatch.signalsUsed
+    } : null
   }) : null;
 
   // (Brand-catalog upsert removed — brands are now created intentionally
@@ -432,6 +442,7 @@ async function runVideoPipeline(run, media, buffer) {
       brand:          media.metadata?.brand,
       brandUrl:       media.metadata?.brandUrl,
       advertiserId:   media.advertiserId || null,
+      brandId:        media.brandId || null,
       category:       media.metadata?.category,
       caption:        media.metadata?.caption,
       primarySubject: primarySubjectDesc,
@@ -439,7 +450,7 @@ async function runVideoPipeline(run, media, buffer) {
       imageUrl:       heroImageUrl,
       yoloIdentifications: products
     });
-    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)`);
+    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)${productMatches.matchSource ? ` (source=${productMatches.matchSource})` : ''}`);
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
   const matchDoc = productMatches ? await ProductMatchArtifact.create({
@@ -453,7 +464,16 @@ async function runVideoPipeline(run, media, buffer) {
     outcomeReasoning: productMatches.outcomeReasoning || null,
     winner:           productMatches.winner || null,
     brandCategory:    productMatches.brandCategory || null,
-    brandReviews:     productMatches.brandReviews || null
+    brandReviews:     productMatches.brandReviews || null,
+    matchSource:      productMatches.matchSource || null,
+    catalogProductId: productMatches.catalogMatch?.product?._id || null,
+    catalogMatch:     productMatches.catalogMatch ? {
+      productId:   productMatches.catalogMatch.product._id,
+      title:       productMatches.catalogMatch.product.title,
+      score:       productMatches.catalogMatch.score,
+      reasoning:   productMatches.catalogMatch.reasoning,
+      signalsUsed: productMatches.catalogMatch.signalsUsed
+    } : null
   }) : null;
 
   // (Brand-catalog upsert removed — brands are now created intentionally
