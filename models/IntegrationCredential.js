@@ -66,8 +66,10 @@ const integrationCredentialSchema = new mongoose.Schema({
   // so the next tick can decide whether each tier is due. Manual
   // syncs also touch these to avoid the scheduler immediately
   // re-running what the user just kicked off by hand.
-  lastCatalogSyncAt: Date,
-  lastPostsSyncAt:   Date
+  lastCatalogSyncAt:  Date,
+  lastPostsSyncAt:    Date,
+  // Ad Platforms Phase B-1 — populated by campaignSyncService.
+  lastCampaignSyncAt: Date
 });
 
 // V2 #5 — multi-page support. Compound unique index on
