@@ -42,6 +42,10 @@ const CatalogProduct  = require('../models/CatalogProduct');
 // before we re-fetch. 30 days — brand sentiment moves slowly enough
 // that older data is still representative for ad creative.
 const BRAND_REVIEWS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Same TTL for product-level reviews on CatalogProduct.productReviews.
+// Reviews on a specific SKU evolve at roughly the same pace as brand
+// sentiment, so we reuse the same window.
+const PRODUCT_REVIEWS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 const PROVIDERS = [
   geminiSearch,
@@ -261,6 +265,21 @@ async function findProductMatches({
 
   console.log(`🎯 Match outcome: ${outcome}${winner ? ` (winner=${winner})` : ''} — ${outcomeReasoning}`);
 
+  // ── Lazy product-reviews (Phase E) ──
+  // When a catalog product won (or both signals agreed on it), fire-and-
+  // forget a Gemini grounded search for product-specific reviews and
+  // cache on CatalogProduct.productReviews. Subsequent matches on the
+  // same SKU read the cache. Skipped when reviews are still fresh.
+  let productReviews = null;
+  if (outcome === 'product_match' && catalogMatch?.product) {
+    productReviews = await maybeFetchProductReviewsCached({
+      catalogProductId: catalogMatch.product._id,
+      productName:      identification?.productName || catalogMatch.product.title,
+      brandName:        brand,
+      productUrl:       catalogMatch.product.productUrl
+    });
+  }
+
   return {
     query: { brand, brandUrl, category, caption, primarySubject, textDetected },
     identification,           // existing — single canonical product (from reasoner)
@@ -279,7 +298,12 @@ async function findProductMatches({
 
     // ── Phase C provenance ──
     matchSource,              // 'ig-catalog' | 'gemini-search' | 'both' | null
-    catalogMatch              // { product, score, reasoning } when found, else null
+    catalogMatch,             // { product, score, reasoning } when found, else null
+
+    // ── Phase E ──
+    // Cached product-level reviews from CatalogProduct (cache hit) or
+    // null if a fresh fetch was kicked off (background; appears next run).
+    productReviews
   };
 }
 
@@ -577,6 +601,55 @@ async function findCatalogMatch({
     }
   }
   return best;
+}
+
+// Cache-aware product-reviews resolver:
+//   1. Read CatalogProduct.productReviews.
+//   2. If fresh (< 30 days), return immediately — caller surfaces on artifact.
+//   3. If stale or missing, kick off a fire-and-forget Gemini lookup and
+//      return null. The next match on this SKU picks up the cached value.
+//
+// Fire-and-forget on miss means the current detect run finishes fast;
+// review quotes appear on subsequent runs / re-renders. Awaiting the
+// 10-15s Gemini call here would slow every detect that hits a fresh
+// catalog SKU.
+async function maybeFetchProductReviewsCached({ catalogProductId, productName, brandName, productUrl }) {
+  if (!catalogProductId || !productName) return null;
+
+  const row = await CatalogProduct.findById(catalogProductId).select('productReviews title').lean();
+  if (!row) return null;
+
+  // Cache hit?
+  const reviews = row.productReviews;
+  if (reviews?.quotes?.length) {
+    const fetchedAt = reviews.fetchedAt ? new Date(reviews.fetchedAt).getTime() : 0;
+    const ageMs = Date.now() - fetchedAt;
+    if (ageMs < PRODUCT_REVIEWS_TTL_MS) {
+      console.log(`   · product-reviews: cache hit for "${row.title}" (age ${Math.round(ageMs / 86400000)}d)`);
+      return reviews;
+    }
+    console.log(`   · product-reviews: cache stale for "${row.title}" (age ${Math.round(ageMs / 86400000)}d > 30d), refetching in background`);
+  } else {
+    console.log(`   · product-reviews: no cache for "${row.title}", fetching in background`);
+  }
+
+  // Fire-and-forget — don't block detect.
+  geminiSearch.lookupProductReviews({ productName, brandName, productUrl })
+    .then(async (fresh) => {
+      if (!fresh || !Array.isArray(fresh.quotes) || fresh.quotes.length === 0) return;
+      try {
+        await CatalogProduct.updateOne(
+          { _id: catalogProductId },
+          { $set: { productReviews: Object.assign({}, fresh, { fetchedAt: new Date() }) } }
+        );
+        console.log(`   · product-reviews: cached on CatalogProduct "${row.title}"`);
+      } catch (err) {
+        console.warn(`   ⚠️  product-reviews cache write failed for "${row.title}": ${err.message}`);
+      }
+    })
+    .catch(err => console.warn(`   ⚠️  product-reviews lookup failed for "${row.title}": ${err.message}`));
+
+  return null;
 }
 
 // English stopwords + filler that pollutes overlap scoring otherwise.

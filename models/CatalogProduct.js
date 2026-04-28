@@ -41,6 +41,17 @@ const catalogProductSchema = new mongoose.Schema({
   // Limited to ~8KB so a chatty source doesn't bloat the doc.
   rawData:      mongoose.Schema.Types.Mixed,
 
+  // Lazy-fetched product-level review snapshot. Populated the first
+  // time this row wins a product_match outcome via Gemini grounded
+  // search, then served from cache for ~30 days. Same shape as
+  // Brand.brandReviews so consumers can reuse the same render code.
+  //   { quotes: [{ text, author, source }],
+  //     rating: 0-5 | null,
+  //     reviewCount: number | null,
+  //     summary: string | null,
+  //     fetchedAt: Date }
+  productReviews: mongoose.Schema.Types.Mixed,
+
   firstSeenAt:  { type: Date, default: Date.now },
   lastSyncedAt: { type: Date, default: Date.now }
 });

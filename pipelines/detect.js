@@ -235,7 +235,8 @@ async function runImagePipeline(run, media, buffer) {
       score:       productMatches.catalogMatch.score,
       reasoning:   productMatches.catalogMatch.reasoning,
       signalsUsed: productMatches.catalogMatch.signalsUsed
-    } : null
+    } : null,
+    productReviews:   productMatches.productReviews || null
   }) : null;
 
   // (Brand-catalog upsert removed — brands are now created intentionally
@@ -473,7 +474,8 @@ async function runVideoPipeline(run, media, buffer) {
       score:       productMatches.catalogMatch.score,
       reasoning:   productMatches.catalogMatch.reasoning,
       signalsUsed: productMatches.catalogMatch.signalsUsed
-    } : null
+    } : null,
+    productReviews:   productMatches.productReviews || null
   }) : null;
 
   // (Brand-catalog upsert removed — brands are now created intentionally

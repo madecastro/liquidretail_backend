@@ -269,10 +269,120 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
   return result;
 }
 
+// Product-level reviews lookup. Same two-pass approach as
+// lookupBrandReviews — pass 1 grounded search returns prose, pass 2
+// plain Gemini call structures it as JSON. Shape mirrors
+// lookupBrandReviews so caller code can use identical render logic.
+async function lookupProductReviews({ productName, brandName, productUrl }) {
+  if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
+  if (!productName) return null;
+
+  const t0 = Date.now();
+  const productLabel = brandName ? `${brandName}'s "${productName}"` : `"${productName}"`;
+
+  // ── Pass 1: grounded narrative ──
+  const searchPrompt =
+    `Use Google Search to find what real customers say about the PRODUCT ${productLabel}` +
+    (productUrl ? ` (${productUrl})` : '') +
+    `. Surface 4-6 SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) — what reviewers ` +
+    `consistently call out about this exact product. Pull from retailer review sections, Reddit ` +
+    `discussions, YouTube review videos, and dedicated review sites. For each quote, name the ` +
+    `source platform and the author/handle if visible. Also note the average star rating (0-5) ` +
+    `and approximate review count if visible, plus a one-sentence summary of how reviewers feel ` +
+    `about this specific product. Write naturally — do not format as JSON.`;
+
+  let searchRes;
+  try {
+    searchRes = await axios.post(
+      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+      {
+        contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
+        tools: [{ google_search: {} }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
+      },
+      { timeout: 30000 }
+    );
+  } catch (err) {
+    console.warn(`   ⚠️  product-reviews search failed: ${err.message}`);
+    return null;
+  }
+
+  const searchCand = searchRes.data?.candidates?.[0];
+  const narrative = (searchCand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
+  const sourceDomains = (searchCand?.groundingMetadata?.groundingChunks || [])
+    .map(c => c.web?.uri && extractDomain(c.web.uri))
+    .filter(Boolean)
+    .filter((d, i, a) => a.indexOf(d) === i)
+    .slice(0, 10);
+
+  if (!narrative || narrative.length < 100) {
+    console.warn(`   · product-reviews: search returned no narrative for ${productLabel}`);
+    return { quotes: [], rating: null, reviewCount: null, summary: null, source: PROVIDER_NAME };
+  }
+
+  // ── Pass 2: structure as JSON ──
+  const structurePrompt =
+    `Convert the following product-review narrative into structured JSON.\n\n` +
+    `Product: ${productName}${brandName ? ` (brand: ${brandName})` : ''}\n` +
+    (sourceDomains.length ? `Sources cited: ${sourceDomains.join(', ')}\n` : '') +
+    `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
+    `Return EXACTLY this shape (no commentary, no markdown):\n` +
+    `{\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null" }, 3-6 entries ],\n` +
+    `  "rating":      <number 0-5 or null>,\n` +
+    `  "reviewCount": <integer or null>,\n` +
+    `  "summary":     "one sentence on overall product sentiment"\n` +
+    `}\n` +
+    `Use direct quotes verbatim from the narrative; do NOT paraphrase or invent quotes that aren't present.`;
+
+  let structRes;
+  try {
+    structRes = await axios.post(
+      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+      {
+        contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 1200,
+          responseMimeType: 'application/json'
+        }
+      },
+      { timeout: 30000 }
+    );
+  } catch (err) {
+    console.warn(`   ⚠️  product-reviews structuring failed: ${err.message}`);
+    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
+  }
+
+  const structCand = structRes.data?.candidates?.[0];
+  const jsonText = (structCand?.content?.parts || []).map(p => p.text || '').join('').trim();
+
+  let parsed = null;
+  try { parsed = JSON.parse(jsonText); } catch (_) {
+    const m = jsonText.match(/\{[\s\S]*\}/);
+    if (m) { try { parsed = JSON.parse(m[0]); } catch (_) {} }
+  }
+  if (!parsed) {
+    console.warn(`   · product-reviews: structuring produced no parsable JSON for ${productLabel}`);
+    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
+  }
+
+  const result = {
+    quotes:      Array.isArray(parsed.quotes) ? parsed.quotes.slice(0, 6).filter(q => q && q.text) : [],
+    rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
+    reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
+    summary:     parsed.summary || null,
+    source:      PROVIDER_NAME
+  };
+  console.log(`   ✓ product-reviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''}${result.reviewCount != null ? ` · ${result.reviewCount.toLocaleString()} reviews` : ''} (${Date.now() - t0}ms, two-pass)`);
+  return result;
+}
+
 module.exports = {
   match,
   isEnabled,
   PROVIDER_NAME,
   lookupBrandCategoryUrl,
-  lookupBrandReviews
+  lookupBrandReviews,
+  lookupProductReviews
 };

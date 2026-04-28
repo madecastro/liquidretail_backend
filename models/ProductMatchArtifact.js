@@ -45,6 +45,11 @@ const productMatchArtifactSchema = new mongoose.Schema({
   // Snapshot of the matched catalog row + its match score, for audit
   // without requiring a join. Cleared on subsequent runs.
   catalogMatch:     mongoose.Schema.Types.Mixed,
+  // Product-level reviews snapshot — present only on cache HITS at
+  // match time. Misses fire-and-forget and the value lands on the
+  // CatalogProduct for next time, so artifacts created before the
+  // background fetch finished will read null here.
+  productReviews:   mongoose.Schema.Types.Mixed,
 
   createdAt: { type: Date, default: Date.now }
 });
