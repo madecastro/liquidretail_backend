@@ -50,10 +50,37 @@ async function requireAuth(req, res, next) {
   // Pull all active memberships for this user — used for both the
   // active-advertiser resolution AND so /api/me can surface the
   // workspace switcher options without a second query.
-  const memberships = await AdvertiserMembership.find({
+  let memberships = await AdvertiserMembership.find({
     userId: user._id,
     status: 'active'
   }).sort({ acceptedAt: -1 }).lean();
+
+  // Self-heal: legacy users from Phase 1 have User.advertiserId set
+  // but no AdvertiserMembership row (Phase 4 migration may not have
+  // been run yet on this environment). Create the missing membership
+  // on first authenticated request so the user can proceed without
+  // a manual migration step. Idempotent — the (advertiserId, userId)
+  // partial unique index catches any race.
+  if (memberships.length === 0 && user.advertiserId) {
+    try {
+      await AdvertiserMembership.create({
+        advertiserId: user.advertiserId,
+        userId:       user._id,
+        email:        user.email,
+        role:         'owner',
+        status:       'active',
+        acceptedAt:   user.createdAt || new Date()
+      });
+      console.log(`✓ self-heal: created owner membership for ${user.email} → ${user.advertiserId}`);
+    } catch (err) {
+      // Race or duplicate — re-fetch and continue.
+      console.warn(`· self-heal membership create soft-failed for ${user.email}: ${err.message}`);
+    }
+    memberships = await AdvertiserMembership.find({
+      userId: user._id,
+      status: 'active'
+    }).sort({ acceptedAt: -1 }).lean();
+  }
 
   if (memberships.length === 0) {
     return res.status(403).json({
