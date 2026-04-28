@@ -127,8 +127,9 @@ router.patch('/:id', express.json(), async (req, res) => {
     const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
     if (!brand) return res.status(404).json({ error: 'brand not found' });
 
-    const editable = ['name', 'websiteUrl', 'tagline', 'logoUrl',
-                      'primaryColor', 'secondaryColor', 'accentColor', 'fontFamily'];
+    const editable = ['name', 'websiteUrl', 'tagline', 'summary', 'logoUrl',
+                      'primaryColor', 'secondaryColor', 'accentColor', 'fontFamily',
+                      'tone', 'hashtags', 'tags'];
     const before = { websiteUrl: brand.websiteUrl };
     const curatedSet = new Set(brand.curatedFields || []);
 
@@ -193,6 +194,7 @@ function serializeBrand(b) {
     name:         b.name,
     slug:         b.nameNormalized,
     tagline:      b.tagline || null,
+    summary:      b.summary || null,
     logoUrl:      b.logoUrl || null,
     websiteUrl:   b.websiteUrl || null,
     primaryColor: b.primaryColor || null,
@@ -200,6 +202,8 @@ function serializeBrand(b) {
     accentColor:  b.accentColor || null,
     fontFamily:   b.fontFamily || null,
     tone:         b.tone || [],
+    hashtags:     b.hashtags || [],
+    tags:         b.tags || [],
     source:       b.source,
     enrichmentSources: b.enrichmentSources || [],
     curatedFields:     b.curatedFields || []

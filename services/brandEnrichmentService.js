@@ -29,7 +29,10 @@ const ENRICHMENT_SCHEMA = {
   type: 'object',
   properties: {
     tagline:        { type: 'string' },
+    summary:        { type: 'string' },
     tone:           { type: 'array', items: { type: 'string' } },
+    hashtags:       { type: 'array', items: { type: 'string' } },
+    tags:           { type: 'array', items: { type: 'string' } },
     primaryColor:   { type: 'string' },
     secondaryColor: { type: 'string' },
     accentColor:    { type: 'string' },
@@ -140,8 +143,11 @@ async function enrichBrandFromUrl(brandId) {
       `You are analyzing the homepage of "${brand.name}" (${brand.websiteUrl}) to fill a brand catalog entry.\n\n` +
       `Source text from the homepage (HTML stripped):\n"""\n${textContent}\n"""\n\n` +
       `Return JSON matching the schema. Rules:\n` +
-      `- "tagline": one line, their own positioning if visible on the page; omit if you can't find it.\n` +
+      `- "tagline": one line (≤ 12 words), the brand's own positioning if visible on the page; omit if you can't find it.\n` +
+      `- "summary": 2–4 sentences describing who the brand is, what they make, who they serve, and what makes them distinct. Written for someone who has never heard of them. Avoid marketing fluff — concrete and specific.\n` +
       `- "tone": 2–5 single-word descriptors of the brand's voice (e.g. ["rugged","practical","technical"]).\n` +
+      `- "hashtags": 5–10 hashtags this brand commonly uses on social, INCLUDING the # symbol (e.g. ["#pelagic","#offshore","#anglerlife"]). Pull from observed campaigns, common community tags, or the brand's category vernacular. Omit only if the brand has no plausible social presence.\n` +
+      `- "tags": 5–10 lowercase keyword tags WITHOUT the # symbol — short search/category descriptors of what this brand sells or stands for (e.g. ["fishing","performance","apparel","outdoor","sun-protection"]). Concrete and indexable.\n` +
       `- "primaryColor" / "secondaryColor" / "accentColor": 6-digit hex strings (e.g. "#0a2540"). Use meta theme-color or visible brand colors when detectable; otherwise best-guess from positioning/category. Omit if truly no signal.\n` +
       `- "demographics": 3–5 key target customer personas this brand clearly serves. Each persona:\n` +
       `    • "name": short, memorable (e.g. "Saltwater Joe", "Weekend Warrior", "Urban Professional")\n` +
@@ -235,6 +241,32 @@ async function enrichBrandFromUrl(brandId) {
   if (!isCurated('tone') && Array.isArray(enrichment.tone) && enrichment.tone.length) {
     overrides.push({ field: 'tone', oldVal: brand.tone, newVal: enrichment.tone, source: 'gpt' });
     brand.tone = enrichment.tone;
+  }
+
+  // Verbose brand summary — paragraph-style. setIf prefers truthy
+  // values so it won't blow away existing text with an empty string.
+  setIf('summary', enrichment.summary || null, 'gpt');
+
+  // Hashtags + tags. We dedupe + cap. Hashtags get a leading # if
+  // GPT forgot it; tags are normalized to lowercase no-#.
+  if (!isCurated('hashtags') && Array.isArray(enrichment.hashtags) && enrichment.hashtags.length) {
+    const cleaned = dedupe(
+      enrichment.hashtags
+        .map(h => String(h).trim())
+        .filter(Boolean)
+        .map(h => h.startsWith('#') ? h : `#${h.replace(/^#+/, '')}`)
+    ).slice(0, 12);
+    overrides.push({ field: 'hashtags', oldVal: brand.hashtags, newVal: cleaned, source: 'gpt' });
+    brand.hashtags = cleaned;
+  }
+  if (!isCurated('tags') && Array.isArray(enrichment.tags) && enrichment.tags.length) {
+    const cleaned = dedupe(
+      enrichment.tags
+        .map(t => String(t).trim().toLowerCase().replace(/^#+/, ''))
+        .filter(Boolean)
+    ).slice(0, 12);
+    overrides.push({ field: 'tags', oldVal: brand.tags, newVal: cleaned, source: 'gpt' });
+    brand.tags = cleaned;
   }
   if (!isCurated('demographics') && Array.isArray(enrichment.demographics) && enrichment.demographics.length) {
     brand.demographics = enrichment.demographics.slice(0, 6).map(d => ({
@@ -376,6 +408,19 @@ function extractGoogleFontsFamily(html) {
 function googleFaviconFallback(hostname) {
   if (!hostname) return null;
   return `https://www.google.com/s2/favicons?domain=${hostname}&sz=128`;
+}
+
+// Case-insensitive de-duplication, preserving first occurrence's casing.
+function dedupe(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const v of arr) {
+    const key = v.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+  }
+  return out;
 }
 
 module.exports = { enrichBrandFromUrl };

@@ -43,13 +43,16 @@ const brandSchema = new mongoose.Schema({
   name:           { type: String, required: true },
 
   websiteUrl:     String,                            // user-supplied on upload; seed for enrichment
-  tagline:        String,
+  tagline:        String,                            // one-liner positioning (≤ 12 words)
+  summary:        String,                            // 2-4 sentence verbose brand description
   logoUrl:        String,
   primaryColor:   String,
   secondaryColor: String,
   accentColor:    String,
   fontFamily:     String,
-  tone:           [String],
+  tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
+  hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
+  tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')
   demographics:   [demographicSchema],               // key target personas for notional quotes
 
   // Provenance. stub = auto-created from detect with minimal data.
