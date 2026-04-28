@@ -24,7 +24,11 @@ const PAGE_SIZE = 100;
 const FIELDS = [
   'id', 'retailer_id', 'name', 'description', 'brand', 'category',
   'price', 'currency', 'availability', 'image_url',
-  'additional_image_urls', 'url'
+  'additional_image_urls', 'url',
+  // V3 #2 dedup signals — Meta only fills these when the merchant
+  // submitted them. gtin is the canonical barcode (EAN/UPC); mpn is
+  // the manufacturer part number used as fallback.
+  'gtin', 'mpn'
 ].join(',');
 
 // Meta returns price as a string like "29.99 USD". Strip the trailing
@@ -35,6 +39,18 @@ function parsePrice(raw) {
   const s = String(raw).trim();
   const m = s.match(/^([\d.]+)/);
   return m ? Number(m[1]) : null;
+}
+
+// Normalize gtin to a clean digit string. Meta sometimes returns it
+// with whitespace, stringified numbers with leading zeros, or even
+// empty strings. Returns null when there's nothing usable.
+function normalizeGtin(raw) {
+  if (raw == null) return null;
+  const cleaned = String(raw).trim().replace(/[^\d]/g, '');
+  // Valid GTINs are 8/12/13/14 digits (UPC-A/E, EAN-13, ITF-14).
+  // Reject anything outside that range — likely junk.
+  if (![8, 12, 13, 14].includes(cleaned.length)) return null;
+  return cleaned;
 }
 
 // Pull currency out of either the explicit `currency` field or the
@@ -133,6 +149,11 @@ async function syncCatalogForCred(cred) {
         source:          'ig-catalog',
         externalId,
         retailerId:      item.retailer_id || null,
+        // V3 #2 dedup keys — normalized so cross-tenant lookups
+        // match regardless of formatting (Meta sometimes wraps gtin
+        // in whitespace or pads with leading zeros).
+        gtin:            normalizeGtin(item.gtin),
+        mpn:             item.mpn ? String(item.mpn).trim() || null : null,
         title:           item.name || '(untitled)',
         description:     item.description || null,
         brand:           item.brand || null,

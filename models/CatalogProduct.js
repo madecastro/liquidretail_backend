@@ -21,6 +21,13 @@ const catalogProductSchema = new mongoose.Schema({
   externalId:   { type: String, required: true, index: true },
   retailerId:   String,    // merchant SKU when distinct from externalId
 
+  // V3 #2 — universal product identifiers used to dedup the same SKU
+  // across tenants. gtin = EAN/UPC barcode (the most reliable signal);
+  // mpn = manufacturer part number (fallback). Both indexed sparsely
+  // because Meta only fills them when the brand provides them.
+  gtin:         { type: String, index: true, sparse: true },
+  mpn:          { type: String, index: true, sparse: true },
+
   // Display + commerce
   title:        { type: String, required: true },
   description:  String,

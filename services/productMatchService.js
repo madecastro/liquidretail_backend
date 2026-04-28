@@ -616,10 +616,12 @@ async function findCatalogMatch({
 async function maybeFetchProductReviewsCached({ catalogProductId, productName, brandName, productUrl }) {
   if (!catalogProductId || !productName) return null;
 
-  const row = await CatalogProduct.findById(catalogProductId).select('productReviews title').lean();
+  // Pull dedup keys (gtin/mpn) so we can look up siblings — V3 #2.
+  const row = await CatalogProduct.findById(catalogProductId)
+    .select('productReviews title gtin mpn').lean();
   if (!row) return null;
 
-  // Cache hit?
+  // 1. Cache hit on this row?
   const reviews = row.productReviews;
   if (reviews?.quotes?.length) {
     const fetchedAt = reviews.fetchedAt ? new Date(reviews.fetchedAt).getTime() : 0;
@@ -628,12 +630,46 @@ async function maybeFetchProductReviewsCached({ catalogProductId, productName, b
       console.log(`   · product-reviews: cache hit for "${row.title}" (age ${Math.round(ageMs / 86400000)}d)`);
       return reviews;
     }
-    console.log(`   · product-reviews: cache stale for "${row.title}" (age ${Math.round(ageMs / 86400000)}d > 30d), refetching in background`);
+    console.log(`   · product-reviews: cache stale for "${row.title}" (age ${Math.round(ageMs / 86400000)}d > 30d), checking siblings`);
   } else {
-    console.log(`   · product-reviews: no cache for "${row.title}", fetching in background`);
+    console.log(`   · product-reviews: no cache for "${row.title}", checking siblings`);
   }
 
-  // Fire-and-forget — don't block detect.
+  // 2. Sibling hit — V3 #2 dedup. Same SKU sold under multiple
+  //    advertiser accounts (agencies, parent/child brands) shares
+  //    review data. Reviews are public (Trustpilot / Reddit / etc.)
+  //    so cross-tenant copy is fine. Search by gtin first (most
+  //    reliable), fall back to mpn.
+  if (row.gtin || row.mpn) {
+    const siblingFilter = { _id: { $ne: catalogProductId } };
+    if (row.gtin)      siblingFilter.gtin = row.gtin;
+    else if (row.mpn)  siblingFilter.mpn  = row.mpn;
+    const sibling = await CatalogProduct.findOne(siblingFilter)
+      .select('productReviews title')
+      .sort({ 'productReviews.fetchedAt': -1 })
+      .lean();
+    if (sibling?.productReviews?.quotes?.length) {
+      const sFetchedAt = sibling.productReviews.fetchedAt
+        ? new Date(sibling.productReviews.fetchedAt).getTime() : 0;
+      const sAgeMs = Date.now() - sFetchedAt;
+      if (sAgeMs < PRODUCT_REVIEWS_TTL_MS) {
+        const dedupKey = row.gtin ? `gtin=${row.gtin}` : `mpn=${row.mpn}`;
+        console.log(`   · product-reviews: sibling hit (${dedupKey}, age ${Math.round(sAgeMs / 86400000)}d) — copying from "${sibling.title}"`);
+        // Copy synchronously since we already have the data in hand.
+        try {
+          await CatalogProduct.updateOne(
+            { _id: catalogProductId },
+            { $set: { productReviews: sibling.productReviews } }
+          );
+        } catch (err) {
+          console.warn(`   ⚠️  sibling-copy write failed for "${row.title}": ${err.message}`);
+        }
+        return sibling.productReviews;
+      }
+    }
+  }
+
+  // 3. Fire-and-forget Gemini fetch — don't block detect.
   geminiSearch.lookupProductReviews({ productName, brandName, productUrl })
     .then(async (fresh) => {
       if (!fresh || !Array.isArray(fresh.quotes) || fresh.quotes.length === 0) return;

@@ -263,7 +263,7 @@ router.get('/instagram/catalog', async (req, res) => {
 
     const [rows, total, distinctCategories] = await Promise.all([
       CatalogProduct.find(filter)
-        .select('externalId title description category brand price currency availability imageUrl productUrl productReviews lastSyncedAt')
+        .select('externalId title description category brand price currency availability imageUrl productUrl productReviews lastSyncedAt gtin mpn')
         .sort({ lastSyncedAt: -1 })
         .skip(offset)
         .limit(limit)
@@ -300,6 +300,8 @@ router.get('/instagram/catalog', async (req, res) => {
       reviewsCount:  r.productReviews?.reviewCount ?? null,
       reviewsFetchedAt: r.productReviews?.fetchedAt || null,
       matchCount:   matchCountMap.get(String(r._id)) || 0,
+      gtin:         r.gtin || null,
+      mpn:          r.mpn  || null,
       lastSyncedAt: r.lastSyncedAt || null
     }));
 
