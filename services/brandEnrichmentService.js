@@ -495,10 +495,11 @@ function isValidFontName(s) {
   if (!s || typeof s !== 'string') return false;
   const v = s.trim();
   if (!v) return false;
-  if (/^var\s*\(/i.test(v)) return false;     // CSS var()
-  if (v.includes('--'))      return false;    // CSS custom property fragment
-  if (/[(){}<>;]/.test(v))   return false;    // any structural CSS chars
-  if (v.length > 60)         return false;    // real family names are short
+  if (/^var\s*\(/i.test(v))    return false;  // CSS var()
+  if (v.includes('--'))         return false; // CSS custom property fragment
+  if (/[(){}<>;]/.test(v))      return false; // any structural CSS chars
+  if (/[\n\r\t]/.test(v))       return false; // page-scrape garbage (e.g. "Foo\nMenu")
+  if (v.length > 60)            return false; // real family names are short
   return true;
 }
 
