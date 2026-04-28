@@ -10,6 +10,7 @@ const router  = express.Router();
 
 const Advertiser = require('../models/Advertiser');
 const Brand      = require('../models/Brand');
+const AdvertiserMembership = require('../models/AdvertiserMembership');
 const requireUserOnly = require('../middleware/requireUserOnly');
 
 // POST /api/onboarding/advertiser
@@ -71,10 +72,20 @@ router.post('/advertiser', requireUserOnly, express.json(), async (req, res) => 
       });
     }
 
-    // Attach the advertiser to the user's record so subsequent
-    // requireAuth hits succeed.
+    // Attach the advertiser to the user's record (Phase 1 backward
+    // compat — the field is still consulted in some legacy paths)
+    // AND create the AdvertiserMembership row that requireAuth (Phase
+    // 4) actually uses to resolve the active advertiser.
     req.userDoc.advertiserId = advertiser._id;
     await req.userDoc.save();
+    await AdvertiserMembership.create({
+      advertiserId: advertiser._id,
+      userId:       req.userDoc._id,
+      email:        req.userDoc.email,
+      role:         'owner',
+      status:       'active',
+      acceptedAt:   new Date()
+    });
 
     res.status(201).json({
       advertiser: {

@@ -15,13 +15,18 @@ const Brand      = require('../models/Brand');
 // the brand picker, and decide whether onboarding is required.
 router.get('/', async (req, res) => {
   try {
-    const [advertiser, brands] = await Promise.all([
+    // Hydrate every Advertiser the user belongs to so the workspace
+    // switcher can render names/slugs without an N+1 fetch.
+    const allAdvertiserIds = (req.allMemberships || []).map(m => m.advertiserId);
+    const [activeAdvertiser, brands, allAdvertisers] = await Promise.all([
       Advertiser.findById(req.advertiserId).lean(),
       Brand.find({ advertiserId: req.advertiserId })
         .select('name nameNormalized logoUrl websiteUrl source enrichmentSources curatedFields')
         .sort({ name: 1 })
-        .lean()
+        .lean(),
+      Advertiser.find({ _id: { $in: allAdvertiserIds } }).select('name slug plan status').lean()
     ]);
+    const advByid = new Map(allAdvertisers.map(a => [String(a._id), a]));
 
     res.json({
       user: {
@@ -31,13 +36,24 @@ router.get('/', async (req, res) => {
         photo:  req.user.photo,
         role:   req.user.role
       },
-      advertiser: advertiser ? {
-        id:    String(advertiser._id),
-        name:  advertiser.name,
-        slug:  advertiser.slug,
-        plan:  advertiser.plan,
-        status: advertiser.status
+      advertiser: activeAdvertiser ? {
+        id:    String(activeAdvertiser._id),
+        name:  activeAdvertiser.name,
+        slug:  activeAdvertiser.slug,
+        plan:  activeAdvertiser.plan,
+        status: activeAdvertiser.status
       } : null,
+      // Memberships drive the workspace switcher (Phase 4.3 UI).
+      memberships: (req.allMemberships || []).map(m => {
+        const a = advByid.get(String(m.advertiserId));
+        return {
+          advertiserId: String(m.advertiserId),
+          name:         a?.name || '(deleted)',
+          slug:         a?.slug || null,
+          role:         m.role,
+          isActive:     String(m.advertiserId) === req.advertiserId
+        };
+      }),
       brands: (brands || []).map(b => ({
         id:        String(b._id),
         name:      b.name,

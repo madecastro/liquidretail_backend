@@ -1,17 +1,28 @@
-// Auth middleware. Verifies the bearer JWT, then re-fetches the User
-// doc from the DB so req.advertiserId is always fresh (catches
-// changes from the backfill migration, future onboarding flows, or
-// admin-driven Advertiser reassignments without forcing re-login).
+// Auth middleware. Verifies the bearer JWT, then resolves the
+// active Advertiser via the AdvertiserMembership join table.
+//
+// Active-Advertiser resolution:
+//   1. If the request includes an X-Advertiser-Id header AND the
+//      user has an active membership for that Advertiser, use it.
+//   2. Else fall back to the user's first active membership (in
+//      acceptedAt order — most-recently joined wins ties).
+//   3. If the user has zero active memberships, 403 NO_ADVERTISER
+//      so the frontend routes to onboarding.
+//
+// req.user.role reflects the role on the SELECTED membership, so
+// permission checks downstream can branch on it (Phase 4.4 will
+// add per-route role guards; for now every authenticated role
+// retains current full access).
 //
 // Failure modes:
-//   401 — missing / invalid / expired token
-//   401 — user no longer exists (deleted account)
-//   403 — user exists but has no advertiserId yet (pre-backfill, or
-//          new signup before onboarding). Frontend should route to
-//          the onboarding / "create your advertiser" flow.
+//   401 — missing/invalid/expired token, or user gone
+//   403 NO_ADVERTISER — user has no active memberships yet
+//   403 ADVERTISER_FORBIDDEN — explicit X-Advertiser-Id header
+//        but user has no active membership there
 
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const AdvertiserMembership = require('../models/AdvertiserMembership');
 
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -25,9 +36,6 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
-  // Locate the persisted User row. Prefer the new userId claim (issued
-  // post-Phase-1); fall back to googleId for tokens that predate the
-  // claim (24h TTL, so existing sessions naturally migrate within a day).
   let user = null;
   if (payload.userId) {
     user = await User.findById(payload.userId).lean();
@@ -38,25 +46,50 @@ async function requireAuth(req, res, next) {
   if (!user) {
     return res.status(401).json({ error: 'User not found — please sign in again' });
   }
-  if (!user.advertiserId) {
+
+  // Pull all active memberships for this user — used for both the
+  // active-advertiser resolution AND so /api/me can surface the
+  // workspace switcher options without a second query.
+  const memberships = await AdvertiserMembership.find({
+    userId: user._id,
+    status: 'active'
+  }).sort({ acceptedAt: -1 }).lean();
+
+  if (memberships.length === 0) {
     return res.status(403).json({
       error: 'No advertiser context — complete onboarding to continue',
       code:  'NO_ADVERTISER'
     });
   }
 
-  // req.user keeps the lightweight session shape downstream code
-  // already expects + adds the persisted record fields.
+  // Pick active membership: explicit header > first by recency.
+  const requestedAdvertiserId = req.headers['x-advertiser-id'];
+  let active = null;
+  if (requestedAdvertiserId) {
+    active = memberships.find(m => String(m.advertiserId) === String(requestedAdvertiserId));
+    if (!active) {
+      return res.status(403).json({
+        error: 'You are not a member of the requested advertiser',
+        code:  'ADVERTISER_FORBIDDEN'
+      });
+    }
+  } else {
+    active = memberships[0];
+  }
+
   req.user = {
     id:           payload.id,
     userId:       String(user._id),
     email:        user.email,
     name:         user.displayName || payload.name,
     photo:        user.photoUrl || payload.photo,
-    advertiserId: String(user.advertiserId),
-    role:         user.role
+    advertiserId: String(active.advertiserId),
+    role:         active.role
   };
-  req.advertiserId = String(user.advertiserId);
+  req.advertiserId = String(active.advertiserId);
+  req.membership   = active;
+  // Memberships list available for /api/me without re-query.
+  req.allMemberships = memberships;
   next();
 }
 
