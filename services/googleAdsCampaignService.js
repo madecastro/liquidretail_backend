@@ -20,7 +20,7 @@ const axios = require('axios');
 const { decrypt } = require('./integrationCryptoService');
 const googleAds = require('./googleAdsOAuthService');
 
-const ADS_API_VERSION = process.env.GOOGLE_ADS_API_VERSION || 'v17';
+const ADS_API_VERSION = process.env.GOOGLE_ADS_API_VERSION || 'v19';
 const ADS_API_ROOT    = `https://googleads.googleapis.com/${ADS_API_VERSION}`;
 
 const MAX_CAMPAIGNS = 200;
