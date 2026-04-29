@@ -225,6 +225,45 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
   }
 });
 
+// ── Upload-6: per-brand auto-create toggle ──────────────────────────
+// uploadSettings.autoCreateFromDetect controls whether confident
+// detect matches auto-write draft CatalogProduct rows (Upload-4).
+// Off by default — drafts pile up if the user isn't actively
+// completing them in the catalog browser drafts tab (Upload-5).
+router.get('/:id/upload-settings', async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }))
+      .select('uploadSettings').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    res.json({
+      uploadSettings: brand.uploadSettings || { autoCreateFromDetect: false }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'upload-settings fetch failed' });
+  }
+});
+
+router.patch('/:id/upload-settings', express.json(), async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const body = req.body || {};
+    const settings = brand.uploadSettings || {};
+    if (typeof body.autoCreateFromDetect === 'boolean') {
+      settings.autoCreateFromDetect = body.autoCreateFromDetect;
+    }
+    brand.uploadSettings = settings;
+    brand.markModified('uploadSettings');
+    await brand.save();
+
+    res.json({ uploadSettings: brand.uploadSettings });
+  } catch (err) {
+    console.error('upload-settings update failed:', err);
+    res.status(500).json({ error: err.message || 'upload-settings update failed' });
+  }
+});
+
 function serializeBrand(b) {
   return {
     // Both id and _id are returned for frontend compat — GET /api/brand/:id
