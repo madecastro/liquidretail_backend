@@ -31,7 +31,10 @@ const metaAds = require('../services/metaAdsOAuthService');
 const googleAds = require('../services/googleAdsOAuthService');
 const { syncCampaigns, getCampaignStatus } = require('../services/campaignSyncService');
 
-const FRONTEND_URL = 'https://liquidretail.netlify.app';
+// Same FRONTEND_URL as auth.js — env-overridable so OAuth bounces
+// (IG / Meta Ads / Google Ads callbacks) land on the right domain
+// in dev / staging deployments. Default keeps prod working unchanged.
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://liquidretail.netlify.app';
 
 function summarize(cred) {
   if (!cred) return null;

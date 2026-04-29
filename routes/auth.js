@@ -3,7 +3,10 @@ const passport = require('passport');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
 
-const FRONTEND_URL = 'https://liquidretail.netlify.app';
+// Where to bounce the user after OAuth callbacks. Override via env
+// to point at a dev / staging frontend; falls back to prod when
+// unset so existing deploys behave unchanged.
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://liquidretail.netlify.app';
 
 router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 
