@@ -140,6 +140,15 @@ const brandSchema = new mongoose.Schema({
     dailyCap:  { type: Number,  default: 25 }
   },
 
+  // Upload Consolidation — per-brand controls for the unified upload
+  // flow. autoCreateFromDetect: when true, confident product_match
+  // outcomes auto-write draft CatalogProduct rows. Off by default so
+  // brands opt in deliberately (drafts need price + productUrl filled
+  // in before they're matchable).
+  uploadSettings: {
+    autoCreateFromDetect: { type: Boolean, default: false }
+  },
+
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });

@@ -16,10 +16,30 @@ const catalogProductSchema = new mongoose.Schema({
   // External identity. `source` lets us add TikTok / Shopify catalogs
   // later without a second model. `externalId` is whatever the source
   // calls its product ID (Meta's product_item id, the merchant's
-  // retailer_id, etc).
-  source:       { type: String, enum: ['ig-catalog'], required: true, index: true },
+  // retailer_id, etc). 'manual-upload' is for products users add
+  // directly via the Upload tab; 'detect-identified' is for drafts
+  // auto-created from confident detect matches when the brand has
+  // opted in.
+  source:       {
+    type: String,
+    enum: ['ig-catalog', 'manual-upload', 'detect-identified'],
+    required: true,
+    index: true
+  },
   externalId:   { type: String, required: true, index: true },
   retailerId:   String,    // merchant SKU when distinct from externalId
+
+  // Draft state — true when the row was auto-created from detect or
+  // a partial manual upload and is missing commerce-required fields
+  // (price, productUrl). The catalog browser filters drafts into a
+  // separate completion queue. Flip false once the user fills in
+  // the missing fields.
+  draft:        { type: Boolean, default: false, index: true },
+
+  // Back-pointer to the Media that triggered detect-identified
+  // creation. Lets the drafts UI deep-link "see this product in the
+  // detect view." Null for ig-catalog and manual-upload rows.
+  detectedFromMediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media', default: null },
 
   // V3 #2 — universal product identifiers used to dedup the same SKU
   // across tenants. gtin = EAN/UPC barcode (the most reliable signal);
@@ -67,5 +87,7 @@ const catalogProductSchema = new mongoose.Schema({
 catalogProductSchema.index({ brandId: 1, externalId: 1 }, { unique: true });
 // Match-service lookups: by brand + category and by brand + text.
 catalogProductSchema.index({ brandId: 1, category: 1 });
+// Drafts queue — fast filter for catalog-browser drafts tab.
+catalogProductSchema.index({ brandId: 1, draft: 1 });
 
 module.exports = mongoose.model('CatalogProduct', catalogProductSchema);
