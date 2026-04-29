@@ -3,15 +3,31 @@
 // data. The frontend's status endpoint assembles a unified result on the fly
 // (see routes/detect.js).
 //
-// Stage order is identical for image + video; video adds yolo-video,
-// transcribe, ner, and a few different inputs.
+// Lifecycle (run.stage values):
+//   queued → detect-fanout → crop-judge → enrich-fanout → finalize → done
 //
-//   yolo  →  yolo-identify  →  (transcribe → ner)?  →  subjects-text  →
-//   smart-crops  →  judge  →  extended-crops  →  judge-extended  →
-//   product-match  →  overlay-zones
+// Within each phase, sub-stages run as follows. Each sub-stage's duration is
+// recorded in run.stageTimings under its own key (e.g. yolo, subjects-text,
+// product-match) so the UI's timing panel still shows per-stage breakdowns.
 //
-// Each artifact is written immediately after its stage cluster completes so a
-// run that fails midway still leaves the partial work persisted.
+//   detect-fanout (Promise.allSettled)
+//     image:  [yolo → yolo-identify]  ‖  [subjects-text]
+//     video:  [yolo-video → yolo-identify → subjects-text(hero)]  ‖  [transcribe → ner]
+//
+//   crop-judge (sequential — judge depends on YOLO + subjects + crops)
+//     smart-crops → judge → CropArtifact persist
+//
+//   enrich-fanout (Promise.allSettled — independent post-judge work)
+//     [extended-crops → judge-extended → overlay-zones → ExtendedCrop+OverlayZone persist]
+//     ‖  [product-match → ProductMatchArtifact persist + side-effects]
+//
+// Each artifact is written immediately after its branch completes so a run
+// that fails midway still leaves the partial work persisted.
+//
+// Errors inside a stage are caught locally and degrade the run gracefully
+// (e.g. YOLO failure → products=[], pipeline continues). Promise.allSettled
+// at fan-out boundaries means one branch can still succeed if its sibling
+// blows up entirely.
 
 const { detectMultipleProducts, detectFromVideo } = require('../services/yoloService');
 const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
@@ -51,19 +67,13 @@ async function processDetectRun(run) {
 
   const buffer = await downloadBuffer(media.fileUrl, 'file-download');
 
-  // Per-run stage timing accumulator. Reset on each run so reruns don't carry
-  // residual numbers from a prior partial attempt.
   run.stageTimings = {};
-  run._stageCurrent = null;
-  run._stageStartedAt = null;
 
   if (media.fileType === 'video') {
     await runVideoPipeline(run, media, buffer);
   } else {
     await runImagePipeline(run, media, buffer);
   }
-
-  finalizeRunStage(run);
 
   run.status = 'completed';
   run.stage = 'done';
@@ -80,38 +90,19 @@ async function processDetectRun(run) {
 async function runImagePipeline(run, media, buffer) {
   const sourceUrl = media.fileUrl;
 
-  // ── YOLO ──
-  await setRunStage(run, 'yolo');
-  let products = [];
-  try {
-    const yolo = await detectMultipleProducts(buffer);
-    products = yolo.detections;
-    console.log(`🔍 YOLO: ${products.length} product(s)`);
-  } catch (err) { console.warn('⚠️  YOLO:', err.message); }
+  // ── Phase 1: detect fan-out ──
+  await setRunPhase(run, 'detect-fanout');
+  const [yoloRes, subjectsRes] = await Promise.allSettled([
+    runYoloChain(run, buffer, media),
+    runSubjectsTextChain(run, sourceUrl, media)
+  ]);
+  if (yoloRes.status === 'rejected')     console.warn('⚠️  YOLO chain rejected:', yoloRes.reason?.message);
+  if (subjectsRes.status === 'rejected') console.warn('⚠️  Subjects/text chain rejected:', subjectsRes.reason?.message);
 
-  // ── YOLO identify ──
-  await setRunStage(run, 'yolo-identify');
-  try {
-    if (products.length) {
-      const ids = await identifyYoloDetections(products, {
-        brand: media.metadata?.brand,
-        category: media.metadata?.category
-      });
-      console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
-    }
-  } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
-
-  // ── Subjects + text + background ──
-  await setRunStage(run, 'subjects-text');
-  let subjects = [], text = [], background = null;
-  try {
-    const st = await detectSubjectsAndText(sourceUrl, {
-      brand: media.metadata?.brand,
-      category: media.metadata?.category,
-      caption: media.metadata?.caption
-    });
-    subjects = st.subjects; text = st.text; background = st.background;
-  } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
+  const products = yoloRes.status === 'fulfilled' ? yoloRes.value : [];
+  const { subjects, text, background } = subjectsRes.status === 'fulfilled'
+    ? subjectsRes.value
+    : { subjects: [], text: [], background: null };
 
   const imgW = products[0]?.imgWidth  || 1024;
   const imgH = products[0]?.imgHeight || 768;
@@ -131,18 +122,21 @@ async function runImagePipeline(run, media, buffer) {
     subjects, text, background
   });
 
-  // ── Smart crops ──
-  await setRunStage(run, 'smart-crops');
+  // ── Phase 2: crop-judge bridge ──
+  await setRunPhase(run, 'crop-judge');
+
   const safeRect = computeSafeRect(products, subjects, imgW, imgH, text);
   if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
-  const crops = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
 
-  // ── Judge ──
-  await setRunStage(run, 'judge');
-  let judge = null;
-  try {
-    judge = await judgeDetections({ imageUrl: sourceUrl, products, subjects, text, crops, safeRect });
-  } catch (err) { console.warn('⚠️  Judge:', err.message); }
+  const crops = await timeStage(run, 'smart-crops', async () =>
+    generateSmartCrops(imgW, imgH, subjects, text, safeRect)
+  );
+
+  const judge = await timeStage(run, 'judge', async () => {
+    try {
+      return await judgeDetections({ imageUrl: sourceUrl, products, subjects, text, crops, safeRect });
+    } catch (err) { console.warn('⚠️  Judge:', err.message); return null; }
+  });
 
   const primarySubjectId   = resolvePrimarySubjectId(subjects, judge);
   const primarySubjectDesc = resolvePrimarySubjectDesc(subjects, judge);
@@ -164,82 +158,21 @@ async function runImagePipeline(run, media, buffer) {
     }
   });
 
-  // ── Extended crops + judge ──
-  await setRunStage(run, 'extended-crops');
-  let extendedCandidates = {}, extendedErrors = {}, extendedJudgeRes = {};
-  try {
-    const { candidates, errors } = await generateExtendedCrops({
-      sourceImageUrl: sourceUrl, sourceVideoUrl: null,
-      smartCrops: crops, judge, primarySubject: primarySubjectDesc,
-      background, isVideo: false
-    });
-    extendedCandidates = candidates;
-    extendedErrors = errors;
-    const totalCandidates = Object.values(extendedCandidates).reduce((a, arr) => a + arr.length, 0);
-    console.log(`🖼️   Extended crops: ${totalCandidates} candidate(s) across ${Object.keys(extendedCandidates).length} ratios`);
-    if (totalCandidates > 0) {
-      await setRunStage(run, 'judge-extended');
-      extendedJudgeRes = await judgeExtendedCrops({
-        candidates: extendedCandidates,
-        sourceImageUrl: sourceUrl,
-        text,
-        primarySubject: primarySubjectDesc
-      });
-    }
-  } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
+  // ── Phase 3: enrich fan-out ──
+  await setRunPhase(run, 'enrich-fanout');
+  const [extendedRes, matchRes] = await Promise.allSettled([
+    runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false),
+    runProductMatchChain(run, media, sourceUrl, products, primarySubjectDesc, text)
+  ]);
+  if (extendedRes.status === 'rejected') console.warn('⚠️  Extended/overlay chain rejected:', extendedRes.reason?.message);
+  if (matchRes.status === 'rejected')    console.warn('⚠️  Product match chain rejected:',     matchRes.reason?.message);
 
-  const extendedDoc = await ExtendedCropArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    candidates: extendedCandidates,
-    errors: extendedErrors,
-    judge: extendedJudgeRes,
-    selectedWinners: deriveSelectedWinners(extendedCandidates, extendedJudgeRes)
-  });
-
-  // ── Product match ──
-  await setRunStage(run, 'product-match');
-  let productMatches = null;
-  try {
-    productMatches = await findProductMatches({
-      brand:          media.metadata?.brand,
-      brandUrl:       media.metadata?.brandUrl,
-      advertiserId:   media.advertiserId || null,
-      brandId:        media.brandId || null,
-      category:       media.metadata?.category,
-      caption:        media.metadata?.caption,
-      primarySubject: primarySubjectDesc,
-      textDetected:   text.map(t => t.content).filter(Boolean),
-      imageUrl:       sourceUrl,
-      // YOLO+GPT enriched identifications drive the decision tree
-      // (multi-brand contention, confidence comparison vs Gemini).
-      yoloIdentifications: products
-    });
-    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)${productMatches.matchSource ? ` (source=${productMatches.matchSource})` : ''}`);
-  } catch (err) { console.warn('⚠️  Product match:', err.message); }
-
-  const matchDoc = productMatches ? await ProductMatchArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    query:            productMatches.query,
-    providers:        productMatches.providers,
-    errors:           productMatches.errors,
-    totalMatches:     productMatches.totalMatches,
-    identification:   productMatches.identification || null,
-    outcome:          productMatches.outcome || null,
-    outcomeReasoning: productMatches.outcomeReasoning || null,
-    winner:           productMatches.winner || null,
-    brandCategory:    productMatches.brandCategory || null,
-    brandReviews:     productMatches.brandReviews || null,
-    matchSource:      productMatches.matchSource || null,
-    catalogProductId: productMatches.catalogMatch?.product?._id || null,
-    catalogMatch:     productMatches.catalogMatch ? {
-      productId:   productMatches.catalogMatch.product._id,
-      title:       productMatches.catalogMatch.product.title,
-      score:       productMatches.catalogMatch.score,
-      reasoning:   productMatches.catalogMatch.reasoning,
-      signalsUsed: productMatches.catalogMatch.signalsUsed
-    } : null,
-    productReviews:   productMatches.productReviews || null
-  }) : null;
+  const { extendedDoc, overlayDoc } = extendedRes.status === 'fulfilled'
+    ? extendedRes.value
+    : { extendedDoc: null, overlayDoc: null };
+  const { productMatches, matchDoc } = matchRes.status === 'fulfilled'
+    ? matchRes.value
+    : { productMatches: null, matchDoc: null };
 
   // V3 #3 — auto-comment on the original IG post when this Media came
   // from Instagram and produced a confident product_match with a
@@ -265,32 +198,14 @@ async function runImagePipeline(run, media, buffer) {
     }).catch(err => console.warn(`   ⚠️  draft auto-create async failure: ${err.message}`));
   }
 
-  // (Brand-catalog upsert removed — brands are now created intentionally
-  // via the picker / members UI, not auto-stubbed from media uploads.
-  // The matching service still resolves productMatches.identification.brand
-  // as a name string for downstream copy generation; if the user wants
-  // that brand in their catalog, they create it explicitly.)
-
-  // ── Overlay zones ──
-  await setRunStage(run, 'overlay-zones');
-  let overlayZones = {};
-  try {
-    overlayZones = await runOverlayZoneAnalysis({
-      sourceImageUrl: sourceUrl, crops, judge, extendedCrops: extendedCandidates
-    });
-  } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
-
-  const overlayDoc = await OverlayZoneArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    zones: overlayZones
-  });
-
+  // ── Finalize ──
+  await setRunPhase(run, 'finalize');
   await updateMediaLatestArtifacts(media, {
     detection:    detectionDoc._id,
     crops:        cropDoc._id,
-    extended:     extendedDoc._id,
+    extended:     extendedDoc?._id,
     match:        matchDoc?._id,
-    overlayZones: overlayDoc._id
+    overlayZones: overlayDoc?._id
   });
 }
 
@@ -300,67 +215,49 @@ async function runImagePipeline(run, media, buffer) {
 async function runVideoPipeline(run, media, buffer) {
   const sourceVideoUrl = media.fileUrl;
 
-  // ── YOLO over the clip ──
-  await setRunStage(run, 'yolo-video');
-  let products = [];
-  let heroImageUrl = null;
-  let heroFrameSec = null, heroReason = null, videoDurationSec = null;
-  let imgW = 1024, imgH = 768;
+  // ── Phase 1: detect fan-out ──
+  // Branch A: yolo-video → yolo-identify → subjects-text(hero) — sequential
+  //   within branch because subjects-text needs the hero frame URL.
+  // Branch B: transcribe → ner — independent of YOLO, runs concurrently.
+  await setRunPhase(run, 'detect-fanout');
 
-  try {
-    const yolo = await detectFromVideo(buffer, media.fileName);
-    products = yolo.detections;
-    imgW = yolo.width  || imgW;
-    imgH = yolo.height || imgH;
-    heroFrameSec     = yolo.heroFrameSec;
-    heroReason       = yolo.heroReason;
-    videoDurationSec = yolo.videoDurationSec;
-    if (yolo.heroFrameBase64) {
-      const heroBuf = Buffer.from(yolo.heroFrameBase64, 'base64');
-      const up = await uploadBufferToCloudinary(heroBuf, { resourceType: 'image' });
-      heroImageUrl = up.secure_url;
-      console.log(`🖼️  Hero frame @ ${heroFrameSec}s (${heroReason}): ${heroImageUrl}`);
-    }
-  } catch (err) { console.warn('⚠️  YOLO video:', err.message); }
-
-  // ── YOLO identify ──
-  await setRunStage(run, 'yolo-identify');
-  try {
-    if (products.length) {
-      const ids = await identifyYoloDetections(products, {
-        brand: media.metadata?.brand,
-        category: media.metadata?.category
+  const yoloChain = (async () => {
+    const yoloOut = await runYoloVideoChain(run, buffer, media);
+    if (yoloOut.products.length) {
+      await timeStage(run, 'yolo-identify', async () => {
+        try {
+          const ids = await identifyYoloDetections(yoloOut.products, {
+            brand: media.metadata?.brand,
+            category: media.metadata?.category
+          });
+          console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
+        } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
       });
-      console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
     }
-  } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
-
-  // ── Transcribe + NER ──
-  await setRunStage(run, 'transcribe');
-  let transcript = null, entities = [];
-  try {
-    transcript = await transcribeAudio(buffer, media.fileName);
-    if (transcript) {
-      console.log(`🎙️  Transcript: ${transcript.segments.length} segments, ${transcript.duration.toFixed(1)}s`);
-      await setRunStage(run, 'ner');
-      entities = await extractEntities(transcript);
-      console.log(`🏷️  NER: ${entities.length} entities`);
-    }
-  } catch (err) { console.warn('⚠️  Transcription/NER:', err.message); }
-
-  // ── Subjects + text + background (on hero frame only) ──
-  let subjects = [], text = [], background = null;
-  if (heroImageUrl) {
-    await setRunStage(run, 'subjects-text');
-    try {
-      const st = await detectSubjectsAndText(heroImageUrl, {
-        brand: media.metadata?.brand,
-        category: media.metadata?.category,
-        caption: media.metadata?.caption
-      });
+    let subjects = [], text = [], background = null;
+    if (yoloOut.heroImageUrl) {
+      const st = await runSubjectsTextChain(run, yoloOut.heroImageUrl, media);
       subjects = st.subjects; text = st.text; background = st.background;
-    } catch (err) { console.warn('⚠️  Subject/text:', err.message); }
-  }
+    }
+    return { ...yoloOut, subjects, text, background };
+  })();
+
+  const transcribeChain = runTranscribeNerChain(run, buffer, media);
+
+  const [yoloRes, transcribeRes] = await Promise.allSettled([yoloChain, transcribeChain]);
+  if (yoloRes.status === 'rejected')       console.warn('⚠️  YOLO chain rejected:',       yoloRes.reason?.message);
+  if (transcribeRes.status === 'rejected') console.warn('⚠️  Transcribe chain rejected:', transcribeRes.reason?.message);
+
+  const yoloOut = yoloRes.status === 'fulfilled' ? yoloRes.value : {
+    products: [], imgW: 1024, imgH: 768, heroImageUrl: null,
+    heroFrameSec: null, heroReason: null, videoDurationSec: null,
+    subjects: [], text: [], background: null
+  };
+  const { transcript, entities } = transcribeRes.status === 'fulfilled'
+    ? transcribeRes.value
+    : { transcript: null, entities: [] };
+
+  const { products, imgW, imgH, heroImageUrl, heroFrameSec, heroReason, videoDurationSec, subjects, text, background } = yoloOut;
 
   // Persist Media dimensions + duration.
   media.width = imgW; media.height = imgH;
@@ -384,27 +281,29 @@ async function runVideoPipeline(run, media, buffer) {
     } : null
   });
 
-  // ── Smart crops ──
-  await setRunStage(run, 'smart-crops');
+  // ── Phase 2: crop-judge bridge ──
+  await setRunPhase(run, 'crop-judge');
+
   const safeRect = computeSafeRect(products, subjects, imgW, imgH, text);
   if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
-  const crops = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
 
-  // Attach a Cloudinary video-transform URL to each crop candidate so the UI
-  // can preview the fully cropped clip.
-  for (const ratio of Object.keys(crops)) {
-    for (const c of crops[ratio]) {
-      c.videoUrl = buildCloudinaryCropUrl(sourceVideoUrl, c);
+  const crops = await timeStage(run, 'smart-crops', async () => {
+    const c = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
+    // Attach a Cloudinary video-transform URL to each crop candidate so the UI
+    // can preview the fully cropped clip.
+    for (const ratio of Object.keys(c)) {
+      for (const cand of c[ratio]) cand.videoUrl = buildCloudinaryCropUrl(sourceVideoUrl, cand);
     }
-  }
+    return c;
+  });
 
-  // ── Judge ──
   let judge = null;
   if (heroImageUrl) {
-    await setRunStage(run, 'judge');
-    try {
-      judge = await judgeDetections({ imageUrl: heroImageUrl, products, subjects, text, crops, safeRect });
-    } catch (err) { console.warn('⚠️  Judge:', err.message); }
+    judge = await timeStage(run, 'judge', async () => {
+      try {
+        return await judgeDetections({ imageUrl: heroImageUrl, products, subjects, text, crops, safeRect });
+      } catch (err) { console.warn('⚠️  Judge:', err.message); return null; }
+    });
   }
 
   const primarySubjectId   = resolvePrimarySubjectId(subjects, judge);
@@ -426,59 +325,170 @@ async function runVideoPipeline(run, media, buffer) {
     }
   });
 
-  // ── Extended crops + judge ──
-  let extendedCandidates = {}, extendedErrors = {}, extendedJudgeRes = {};
-  if (heroImageUrl) {
-    await setRunStage(run, 'extended-crops');
-    try {
-      const { candidates, errors } = await generateExtendedCrops({
-        sourceImageUrl: heroImageUrl,
-        sourceVideoUrl: sourceVideoUrl,
-        smartCrops: crops, judge, primarySubject: primarySubjectDesc,
-        background, isVideo: true
-      });
-      extendedCandidates = candidates;
-      extendedErrors = errors;
-      const totalCandidates = Object.values(extendedCandidates).reduce((a, arr) => a + arr.length, 0);
-      console.log(`🖼️   Extended crops (video): ${totalCandidates} candidate(s)`);
-      if (totalCandidates > 0) {
-        await setRunStage(run, 'judge-extended');
-        extendedJudgeRes = await judgeExtendedCrops({
-          candidates: extendedCandidates,
-          sourceImageUrl: heroImageUrl,
-          text,
-          primarySubject: primarySubjectDesc
-        });
-      }
-    } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
+  // ── Phase 3: enrich fan-out ──
+  await setRunPhase(run, 'enrich-fanout');
+  const [extendedRes, matchRes] = await Promise.allSettled([
+    runExtendedAndOverlayChain(run, media, heroImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, true),
+    runProductMatchChain(run, media, heroImageUrl, products, primarySubjectDesc, text)
+  ]);
+  if (extendedRes.status === 'rejected') console.warn('⚠️  Extended/overlay chain rejected:', extendedRes.reason?.message);
+  if (matchRes.status === 'rejected')    console.warn('⚠️  Product match chain rejected:',     matchRes.reason?.message);
+
+  const { extendedDoc, overlayDoc } = extendedRes.status === 'fulfilled'
+    ? extendedRes.value
+    : { extendedDoc: null, overlayDoc: null };
+  const { productMatches, matchDoc } = matchRes.status === 'fulfilled'
+    ? matchRes.value
+    : { productMatches: null, matchDoc: null };
+
+  if (productMatches && media.source === 'instagram') {
+    maybePostMatchReply({ media, productMatch: productMatches })
+      .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
+  }
+  if (productMatches) {
+    maybeCreateDraftFromMatch({
+      media,
+      productMatch:  productMatches,
+      sceneImageUrl: heroImageUrl,
+      yoloProducts:  products
+    }).catch(err => console.warn(`   ⚠️  draft auto-create async failure: ${err.message}`));
   }
 
-  const extendedDoc = await ExtendedCropArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    candidates: extendedCandidates,
-    errors: extendedErrors,
-    judge: extendedJudgeRes,
-    selectedWinners: deriveSelectedWinners(extendedCandidates, extendedJudgeRes)
+  // ── Finalize ──
+  await setRunPhase(run, 'finalize');
+  await updateMediaLatestArtifacts(media, {
+    detection:    detectionDoc._id,
+    crops:        cropDoc._id,
+    extended:     extendedDoc?._id,
+    match:        matchDoc?._id,
+    overlayZones: overlayDoc?._id
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Stage chains — each is a self-contained leaf of the fan-out
+//  graph. They share the run object only to record per-sub-stage
+//  timings into run.stageTimings; persistence to MongoDB happens
+//  at phase boundaries (setRunPhase) so concurrent branches don't
+//  race on save().
+// ──────────────────────────────────────────────────────────────
+
+async function runYoloChain(run, buffer, media) {
+  const products = await timeStage(run, 'yolo', async () => {
+    try {
+      const yolo = await detectMultipleProducts(buffer);
+      console.log(`🔍 YOLO: ${yolo.detections.length} product(s)`);
+      return yolo.detections;
+    } catch (err) { console.warn('⚠️  YOLO:', err.message); return []; }
   });
 
-  // ── Product match ──
-  await setRunStage(run, 'product-match');
-  let productMatches = null;
-  try {
-    productMatches = await findProductMatches({
-      brand:          media.metadata?.brand,
-      brandUrl:       media.metadata?.brandUrl,
-      advertiserId:   media.advertiserId || null,
-      brandId:        media.brandId || null,
-      category:       media.metadata?.category,
-      caption:        media.metadata?.caption,
-      primarySubject: primarySubjectDesc,
-      textDetected:   text.map(t => t.content).filter(Boolean),
-      imageUrl:       heroImageUrl,
-      yoloIdentifications: products
+  if (products.length) {
+    await timeStage(run, 'yolo-identify', async () => {
+      try {
+        const ids = await identifyYoloDetections(products, {
+          brand: media.metadata?.brand,
+          category: media.metadata?.category
+        });
+        console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
+      } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
     });
-    console.log(`🔗 Product match: ${productMatches.totalMatches} total across ${Object.keys(productMatches.providers).length} provider(s)${productMatches.matchSource ? ` (source=${productMatches.matchSource})` : ''}`);
-  } catch (err) { console.warn('⚠️  Product match:', err.message); }
+  }
+
+  return products;
+}
+
+async function runYoloVideoChain(run, buffer, media) {
+  return await timeStage(run, 'yolo-video', async () => {
+    try {
+      const yolo = await detectFromVideo(buffer, media.fileName);
+      let heroImageUrl = null;
+      if (yolo.heroFrameBase64) {
+        const heroBuf = Buffer.from(yolo.heroFrameBase64, 'base64');
+        const up = await uploadBufferToCloudinary(heroBuf, { resourceType: 'image' });
+        heroImageUrl = up.secure_url;
+        console.log(`🖼️  Hero frame @ ${yolo.heroFrameSec}s (${yolo.heroReason}): ${heroImageUrl}`);
+      }
+      console.log(`🔍 YOLO (video): ${yolo.detections.length} product(s)`);
+      return {
+        products:         yolo.detections,
+        imgW:             yolo.width  || 1024,
+        imgH:             yolo.height || 768,
+        heroFrameSec:     yolo.heroFrameSec,
+        heroReason:       yolo.heroReason,
+        videoDurationSec: yolo.videoDurationSec,
+        heroImageUrl
+      };
+    } catch (err) {
+      console.warn('⚠️  YOLO video:', err.message);
+      return {
+        products: [], imgW: 1024, imgH: 768, heroImageUrl: null,
+        heroFrameSec: null, heroReason: null, videoDurationSec: null
+      };
+    }
+  });
+}
+
+async function runSubjectsTextChain(run, imageUrl, media) {
+  return await timeStage(run, 'subjects-text', async () => {
+    if (!imageUrl) return { subjects: [], text: [], background: null };
+    try {
+      const st = await detectSubjectsAndText(imageUrl, {
+        brand: media.metadata?.brand,
+        category: media.metadata?.category,
+        caption: media.metadata?.caption
+      });
+      return { subjects: st.subjects, text: st.text, background: st.background };
+    } catch (err) {
+      console.warn('⚠️  Subject/text:', err.message);
+      return { subjects: [], text: [], background: null };
+    }
+  });
+}
+
+async function runTranscribeNerChain(run, buffer, media) {
+  let transcript = null;
+  let entities = [];
+  await timeStage(run, 'transcribe', async () => {
+    try {
+      transcript = await transcribeAudio(buffer, media.fileName);
+      if (transcript) console.log(`🎙️  Transcript: ${transcript.segments.length} segments, ${transcript.duration.toFixed(1)}s`);
+    } catch (err) { console.warn('⚠️  Transcription:', err.message); }
+  });
+  if (transcript) {
+    await timeStage(run, 'ner', async () => {
+      try {
+        entities = await extractEntities(transcript);
+        console.log(`🏷️  NER: ${entities.length} entities`);
+      } catch (err) { console.warn('⚠️  NER:', err.message); }
+    });
+  }
+  return { transcript, entities };
+}
+
+async function runProductMatchChain(run, media, sourceImageUrl, products, primarySubjectDesc, text) {
+  const productMatches = await timeStage(run, 'product-match', async () => {
+    try {
+      const result = await findProductMatches({
+        brand:          media.metadata?.brand,
+        brandUrl:       media.metadata?.brandUrl,
+        advertiserId:   media.advertiserId || null,
+        brandId:        media.brandId || null,
+        category:       media.metadata?.category,
+        caption:        media.metadata?.caption,
+        primarySubject: primarySubjectDesc,
+        textDetected:   (text || []).map(t => t.content).filter(Boolean),
+        imageUrl:       sourceImageUrl,
+        // YOLO+GPT enriched identifications drive the decision tree
+        // (multi-brand contention, confidence comparison vs Gemini).
+        yoloIdentifications: products
+      });
+      console.log(`🔗 Product match: ${result.totalMatches} total across ${Object.keys(result.providers).length} provider(s)${result.matchSource ? ` (source=${result.matchSource})` : ''}`);
+      return result;
+    } catch (err) {
+      console.warn('⚠️  Product match:', err.message);
+      return null;
+    }
+  });
 
   const matchDoc = productMatches ? await ProductMatchArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
@@ -504,43 +514,59 @@ async function runVideoPipeline(run, media, buffer) {
     productReviews:   productMatches.productReviews || null
   }) : null;
 
-  // V3 #3 — auto-comment on the original IG post when this Media came
-  // from Instagram and produced a confident product_match with a
-  // productUrl. Fire-and-forget; the service guards on brand opt-in,
-  // daily cap, and idempotency. Errors are swallowed so detect never
-  // fails because of an opportunistic comment.
-  if (productMatches && media.source === 'instagram') {
-    maybePostMatchReply({ media, productMatch: productMatches })
-      .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
-  }
+  return { productMatches, matchDoc };
+}
 
-  // Upload-4 — same auto-create as the image path, with the video's
-  // hero frame as the scene image fallback (used only when Gemini
-  // didn't surface a product page imageUrl).
-  if (productMatches) {
-    maybeCreateDraftFromMatch({
-      media,
-      productMatch:  productMatches,
-      sceneImageUrl: heroImageUrl,
-      yoloProducts:  products
-    }).catch(err => console.warn(`   ⚠️  draft auto-create async failure: ${err.message}`));
-  }
+async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, isVideo) {
+  let extendedCandidates = {}, extendedErrors = {}, extendedJudgeRes = {};
 
-  // (Brand-catalog upsert removed — brands are now created intentionally
-  // via the picker / members UI, not auto-stubbed from media uploads.
-  // The matching service still resolves productMatches.identification.brand
-  // as a name string for downstream copy generation; if the user wants
-  // that brand in their catalog, they create it explicitly.)
+  if (sourceImageUrl) {
+    await timeStage(run, 'extended-crops', async () => {
+      try {
+        const { candidates, errors } = await generateExtendedCrops({
+          sourceImageUrl, sourceVideoUrl,
+          smartCrops: crops, judge, primarySubject: primarySubjectDesc,
+          background, isVideo
+        });
+        extendedCandidates = candidates;
+        extendedErrors = errors;
+        const totalCandidates = Object.values(extendedCandidates).reduce((a, arr) => a + arr.length, 0);
+        console.log(`🖼️   Extended crops${isVideo ? ' (video)' : ''}: ${totalCandidates} candidate(s) across ${Object.keys(extendedCandidates).length} ratios`);
+      } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
+    });
 
-  // ── Overlay zones ──
-  await setRunStage(run, 'overlay-zones');
-  let overlayZones = {};
-  if (heroImageUrl) {
-    try {
-      overlayZones = await runOverlayZoneAnalysis({
-        sourceImageUrl: heroImageUrl, crops, judge, extendedCrops: extendedCandidates
+    const totalCandidates = Object.values(extendedCandidates).reduce((a, arr) => a + arr.length, 0);
+    if (totalCandidates > 0) {
+      await timeStage(run, 'judge-extended', async () => {
+        try {
+          extendedJudgeRes = await judgeExtendedCrops({
+            candidates: extendedCandidates,
+            sourceImageUrl,
+            text,
+            primarySubject: primarySubjectDesc
+          });
+        } catch (err) { console.warn('⚠️  Judge extended:', err.message); }
       });
-    } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
+    }
+  }
+
+  const extendedDoc = await ExtendedCropArtifact.create({
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
+    candidates: extendedCandidates,
+    errors: extendedErrors,
+    judge: extendedJudgeRes,
+    selectedWinners: deriveSelectedWinners(extendedCandidates, extendedJudgeRes)
+  });
+
+  let overlayZones = {};
+  if (sourceImageUrl) {
+    await timeStage(run, 'overlay-zones', async () => {
+      try {
+        overlayZones = await runOverlayZoneAnalysis({
+          sourceImageUrl, crops, judge, extendedCrops: extendedCandidates
+        });
+      } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
+    });
   }
 
   const overlayDoc = await OverlayZoneArtifact.create({
@@ -548,37 +574,37 @@ async function runVideoPipeline(run, media, buffer) {
     zones: overlayZones
   });
 
-  await updateMediaLatestArtifacts(media, {
-    detection:    detectionDoc._id,
-    crops:        cropDoc._id,
-    extended:     extendedDoc._id,
-    match:        matchDoc?._id,
-    overlayZones: overlayDoc._id
-  });
+  return { extendedDoc, overlayDoc };
 }
 
 // ──────────────────────────────────────────────────────────────
 //  Helpers
 // ──────────────────────────────────────────────────────────────
 
-// Local stage helpers — write to run.stage + run.stageTimings (Mixed field
-// needs markModified to persist). The shared.setStage variant writes to
-// `detectionStage` which is the legacy Job model's field.
-async function setRunStage(run, stage) {
-  finalizeRunStage(run);
-  run._stageCurrent = stage;
-  run._stageStartedAt = Date.now();
-  run.stage = stage;
+// Phase boundary — writes run.stage and persists. Called at each fan-out /
+// bridge transition; sub-stage timings within a phase don't trigger saves
+// so concurrent branches can't race on Mongoose's serialization.
+async function setRunPhase(run, phase) {
+  run.stage = phase;
   await run.save();
-  console.log(`   → ${stage}`);
+  console.log(`   ⇒ phase: ${phase}`);
 }
 
-function finalizeRunStage(run) {
-  if (run._stageCurrent && run._stageStartedAt) {
-    const elapsed = Date.now() - run._stageStartedAt;
-    const timings = run.stageTimings || {};
-    timings[run._stageCurrent] = (timings[run._stageCurrent] || 0) + elapsed;
-    run.stageTimings = timings;
+// Sub-stage timing wrapper. Records elapsed ms in run.stageTimings under
+// `name`, even when the inner fn throws (try/finally). Multiple stages
+// within the same phase can run concurrently and each safely accumulates
+// its own duration — Node's single-threaded event loop ensures the
+// in-memory mutations are atomic; persistence happens on the next
+// setRunPhase() save.
+async function timeStage(run, name, fn) {
+  const t0 = Date.now();
+  console.log(`   → ${name}`);
+  try {
+    return await fn();
+  } finally {
+    const elapsed = Date.now() - t0;
+    run.stageTimings = run.stageTimings || {};
+    run.stageTimings[name] = (run.stageTimings[name] || 0) + elapsed;
     run.markModified('stageTimings');
   }
 }
