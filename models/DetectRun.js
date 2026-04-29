@@ -13,6 +13,7 @@ const mongoose = require('mongoose');
 
 const detectRunSchema = new mongoose.Schema({
   advertiserId: { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', index: true, default: null },
+  brandId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Brand', index: true, default: null },
   mediaId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Media', required: true, index: true },
 
   status:     { type: String, enum: ['queued', 'processing', 'completed', 'failed'], default: 'queued' },

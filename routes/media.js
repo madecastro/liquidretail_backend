@@ -180,4 +180,21 @@ router.post('/:mediaId/draft-product', async (req, res) => {
   }
 });
 
+// DELETE /api/media/:mediaId
+// Cascade: every artifact bound to this Media (DetectRun + 6 artifact
+// types), the Media row itself, and the Cloudinary asset (file +
+// thumbnail when present). Returns counts so the UI can confirm.
+router.delete('/:mediaId', async (req, res) => {
+  try {
+    // Tenant guard — assertMediaInTenant 404s on cross-tenant lookups.
+    await assertMediaInTenant(req.params.mediaId, req);
+    const { cascadeDeleteMedia } = require('../services/cascadeDeleteService');
+    const result = await cascadeDeleteMedia(req.params.mediaId);
+    if (!result.ok) return res.status(404).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'media delete failed' });
+  }
+});
+
 module.exports = router;

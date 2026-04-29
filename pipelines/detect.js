@@ -123,7 +123,7 @@ async function runImagePipeline(run, media, buffer) {
 
   // ── Detection artifact (preliminary — primary subject filled in after judge) ──
   const detectionDoc = await DetectionArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     type: 'image',
     width: imgW, height: imgH,
     imageUrl: sourceUrl,
@@ -154,7 +154,7 @@ async function runImagePipeline(run, media, buffer) {
   await detectionDoc.save();
 
   const cropDoc = await CropArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     smartCrops: crops,
     judge,
     winners: {
@@ -189,7 +189,7 @@ async function runImagePipeline(run, media, buffer) {
   } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
 
   const extendedDoc = await ExtendedCropArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     candidates: extendedCandidates,
     errors: extendedErrors,
     judge: extendedJudgeRes,
@@ -218,7 +218,7 @@ async function runImagePipeline(run, media, buffer) {
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
   const matchDoc = productMatches ? await ProductMatchArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     query:            productMatches.query,
     providers:        productMatches.providers,
     errors:           productMatches.errors,
@@ -281,7 +281,7 @@ async function runImagePipeline(run, media, buffer) {
   } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
 
   const overlayDoc = await OverlayZoneArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     zones: overlayZones
   });
 
@@ -368,7 +368,7 @@ async function runVideoPipeline(run, media, buffer) {
   await media.save();
 
   const detectionDoc = await DetectionArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     type: 'video',
     width: imgW, height: imgH,
     imageUrl: heroImageUrl,                 // hero frame (the canonical "still" for this video)
@@ -416,7 +416,7 @@ async function runVideoPipeline(run, media, buffer) {
   await detectionDoc.save();
 
   const cropDoc = await CropArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     smartCrops: crops,
     judge,
     winners: {
@@ -454,7 +454,7 @@ async function runVideoPipeline(run, media, buffer) {
   }
 
   const extendedDoc = await ExtendedCropArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     candidates: extendedCandidates,
     errors: extendedErrors,
     judge: extendedJudgeRes,
@@ -481,7 +481,7 @@ async function runVideoPipeline(run, media, buffer) {
   } catch (err) { console.warn('⚠️  Product match:', err.message); }
 
   const matchDoc = productMatches ? await ProductMatchArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     query:            productMatches.query,
     providers:        productMatches.providers,
     errors:           productMatches.errors,
@@ -544,7 +544,7 @@ async function runVideoPipeline(run, media, buffer) {
   }
 
   const overlayDoc = await OverlayZoneArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     zones: overlayZones
   });
 

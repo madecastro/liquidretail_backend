@@ -311,6 +311,7 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
 
   const run = await DetectRun.create({
     advertiserId: cred.advertiserId,
+    brandId:      cred.brandId,
     mediaId:      media._id,
     status:       'queued',
     stage:        'queued',

@@ -108,10 +108,11 @@ router.post('/', upload.fields([
 
     const run = await DetectRun.create({
       advertiserId: req.advertiserId,
-      mediaId: media._id,
-      status:  'queued',
-      stage:   'queued',
-      trigger: 'upload'
+      brandId:      media.brandId || null,
+      mediaId:      media._id,
+      status:       'queued',
+      stage:        'queued',
+      trigger:      'upload'
     });
 
     console.log(`🆕 Media ${media._id} + DetectRun ${run._id} queued`);

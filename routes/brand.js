@@ -225,6 +225,32 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
   }
 });
 
+// DELETE /api/brand/:id — full cascade. Body must include
+// { confirmName: <exact brand name> } as a type-to-confirm safety
+// gate against accidental deletion.
+router.delete('/:id', express.json(), async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const confirmName = (req.body?.confirmName || '').trim();
+    if (confirmName !== brand.name) {
+      return res.status(400).json({
+        error: 'confirmName must match the brand name exactly to delete',
+        expected: brand.name
+      });
+    }
+
+    const { cascadeDeleteBrand } = require('../services/cascadeDeleteService');
+    const result = await cascadeDeleteBrand(brand._id);
+    if (!result.ok) return res.status(500).json(result);
+    res.json(result);
+  } catch (err) {
+    console.error('brand delete failed:', err);
+    res.status(500).json({ error: err.message || 'brand delete failed' });
+  }
+});
+
 // ── Upload-6: per-brand auto-create toggle ──────────────────────────
 // uploadSettings.autoCreateFromDetect controls whether confident
 // detect matches auto-write draft CatalogProduct rows (Upload-4).

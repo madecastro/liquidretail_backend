@@ -15,6 +15,7 @@ const mongoose = require('mongoose');
 
 const layoutInputArtifactSchema = new mongoose.Schema({
   advertiserId: { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', index: true, default: null },
+  brandId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',      index: true, default: null },
   mediaId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Media', required: true, index: true },
   runId:       { type: mongoose.Schema.Types.ObjectId, ref: 'DetectRun' },   // which run's artifacts fed this
   template:    { type: String, required: true },
