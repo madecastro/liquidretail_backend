@@ -25,6 +25,7 @@ const { findProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
 const { maybePostMatchReply } = require('../services/instagramCommentService');
+const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
 // Brand catalog mutations no longer happen inside the detect pipeline
 // — Brand creation + enrichment is a user-driven concern triggered by
 // POST /api/brand (or PATCH /api/brand/:id). Detect can still
@@ -248,6 +249,20 @@ async function runImagePipeline(run, media, buffer) {
   if (productMatches && media.source === 'instagram') {
     maybePostMatchReply({ media, productMatch: productMatches })
       .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
+  }
+
+  // Upload-4 — when this brand opted into autoCreateFromDetect AND
+  // the match was confident AND no existing catalog row won, write a
+  // draft CatalogProduct so the SKU shows up in the brand's catalog
+  // for completion (price + productUrl). Fire-and-forget; the service
+  // guards on opt-in / outcome / certainty internally.
+  if (productMatches) {
+    maybeCreateDraftFromMatch({
+      media,
+      productMatch:  productMatches,
+      sceneImageUrl: sourceUrl,
+      yoloProducts:  products
+    }).catch(err => console.warn(`   ⚠️  draft auto-create async failure: ${err.message}`));
   }
 
   // (Brand-catalog upsert removed — brands are now created intentionally
@@ -497,6 +512,18 @@ async function runVideoPipeline(run, media, buffer) {
   if (productMatches && media.source === 'instagram') {
     maybePostMatchReply({ media, productMatch: productMatches })
       .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
+  }
+
+  // Upload-4 — same auto-create as the image path, with the video's
+  // hero frame as the scene image fallback (used only when Gemini
+  // didn't surface a product page imageUrl).
+  if (productMatches) {
+    maybeCreateDraftFromMatch({
+      media,
+      productMatch:  productMatches,
+      sceneImageUrl: heroImageUrl,
+      yoloProducts:  products
+    }).catch(err => console.warn(`   ⚠️  draft auto-create async failure: ${err.message}`));
   }
 
   // (Brand-catalog upsert removed — brands are now created intentionally
