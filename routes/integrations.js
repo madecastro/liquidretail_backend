@@ -438,7 +438,7 @@ router.get('/instagram/catalog', async (req, res) => {
       filter['productReviews.quotes.0'] = { $exists: true };
     }
 
-    const [rows, total, distinctCategories] = await Promise.all([
+    const [rows, total, distinctCategories, totalDrafts] = await Promise.all([
       CatalogProduct.find(filter)
         .select('externalId source draft title description category brand price currency availability imageUrl productUrl productReviews lastSyncedAt gtin mpn')
         .sort({ lastSyncedAt: -1 })
@@ -448,7 +448,11 @@ router.get('/instagram/catalog', async (req, res) => {
       CatalogProduct.countDocuments(filter),
       // Categories list — small enough to compute every call on most
       // catalogs (< 200 distinct values typical).
-      CatalogProduct.distinct('category', { brandId, source: 'ig-catalog' })
+      CatalogProduct.distinct('category', { brandId, source: 'ig-catalog' }),
+      // Brand-wide draft count (independent of current filter) so the
+      // browser header can show "12 drafts pending" as a CTA into the
+      // drafts queue.
+      CatalogProduct.countDocuments({ brandId, draft: true })
     ]);
 
     // Match-traffic count: how many ProductMatchArtifacts reference each
@@ -488,6 +492,7 @@ router.get('/instagram/catalog', async (req, res) => {
     res.json({
       products,
       total,
+      totalDrafts,
       offset,
       limit,
       hasMore:    offset + products.length < total,
@@ -496,6 +501,124 @@ router.get('/instagram/catalog', async (req, res) => {
   } catch (err) {
     console.error('catalog browse failed:', err);
     res.status(500).json({ error: err.message || 'catalog browse failed' });
+  }
+});
+
+// PATCH /api/integrations/instagram/catalog/:productId
+// Body: { title?, description?, category?, price?, currency?,
+//         productUrl?, gtin?, mpn?, availability?, imageUrl? }
+//
+// Update mutable fields on a CatalogProduct row. Auto-flips draft to
+// false the moment both price AND productUrl are populated — that's
+// the threshold for a row being "complete enough" to participate in
+// the matcher. Used by the drafts queue (Upload-5) for inline
+// completion + by future ops UI for general edits.
+//
+// Tenant guard: row's brandId must belong to active advertiser.
+router.patch('/instagram/catalog/:productId', express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+
+    const product = await CatalogProduct.findOne({
+      _id: req.params.productId,
+      brandId
+    });
+    if (!product) return res.status(404).json({ error: 'catalog product not found' });
+
+    // Tenant guard via the credential — confirms brand is owned by
+    // active advertiser. We don't have advertiserId on CatalogProduct
+    // queries by default but the IntegrationCredential check is the
+    // canonical scoping anchor for this brand.
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      brandId, type: 'instagram'
+    })).select('_id').lean();
+    if (!cred) return res.status(404).json({ error: 'no Instagram integration for this brand' });
+
+    const body = req.body || {};
+
+    // Per-field validation — mirrors Upload-3's product upload route.
+    if (body.title !== undefined) {
+      const t = String(body.title).trim();
+      if (!t) return res.status(400).json({ error: 'title cannot be empty' });
+      product.title = t;
+    }
+    if (body.description !== undefined) {
+      product.description = String(body.description).trim() || null;
+    }
+    if (body.category !== undefined) {
+      product.category = String(body.category).trim() || null;
+    }
+    if (body.price !== undefined) {
+      if (body.price === null || body.price === '') {
+        product.price = null;
+      } else {
+        const p = Number(body.price);
+        if (!Number.isFinite(p) || p < 0) {
+          return res.status(400).json({ error: 'price must be a non-negative number' });
+        }
+        product.price = p;
+      }
+    }
+    if (body.currency !== undefined) {
+      const c = String(body.currency || '').toUpperCase().trim();
+      if (c && !/^[A-Z]{3}$/.test(c)) {
+        return res.status(400).json({ error: 'currency must be 3-letter ISO code' });
+      }
+      product.currency = c || null;
+    }
+    if (body.productUrl !== undefined) {
+      const u = String(body.productUrl || '').trim();
+      if (u && !/^https?:\/\//.test(u)) {
+        return res.status(400).json({ error: 'productUrl must be http or https' });
+      }
+      product.productUrl = u || null;
+    }
+    if (body.gtin !== undefined) {
+      const cleaned = String(body.gtin || '').replace(/[^\d]/g, '');
+      product.gtin = (cleaned && [8, 12, 13, 14].includes(cleaned.length)) ? cleaned : null;
+    }
+    if (body.mpn !== undefined) {
+      product.mpn = String(body.mpn || '').trim() || null;
+    }
+    if (body.availability !== undefined) {
+      product.availability = String(body.availability || '').trim() || null;
+    }
+    if (body.imageUrl !== undefined) {
+      product.imageUrl = String(body.imageUrl || '').trim() || null;
+    }
+
+    // Recompute draft state — both price AND productUrl present means
+    // the row is matchable / shippable. Anything missing keeps it
+    // queued for completion.
+    product.draft = !(product.price != null && product.productUrl);
+    product.lastSyncedAt = new Date();
+    await product.save();
+
+    res.json({
+      ok: true,
+      product: {
+        id:           String(product._id),
+        _id:          String(product._id),
+        externalId:   product.externalId,
+        source:       product.source,
+        draft:        product.draft,
+        title:        product.title,
+        description:  product.description,
+        category:     product.category,
+        price:        product.price,
+        currency:     product.currency,
+        availability: product.availability,
+        imageUrl:     product.imageUrl,
+        productUrl:   product.productUrl,
+        gtin:         product.gtin,
+        mpn:          product.mpn,
+        lastSyncedAt: product.lastSyncedAt
+      }
+    });
+  } catch (err) {
+    console.error('catalog product PATCH failed:', err);
+    res.status(500).json({ error: err.message || 'catalog product update failed' });
   }
 });
 
