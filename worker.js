@@ -27,13 +27,20 @@ const { processLegacyUploadJob } = require('./pipelines/inventory');
 const { sleep }                  = require('./pipelines/shared');
 const { startScheduler }         = require('./services/scheduledSyncService');
 
-const CONCURRENCY = Math.max(1, Math.min(parseInt(process.env.WORKER_CONCURRENCY, 10) || 2, 16));
+const CONCURRENCY = Math.max(1, Math.min(parseInt(process.env.WORKER_CONCURRENCY, 10) || 2, 100));
+
+// Mongoose default pool is 100 max. With 50+ concurrent workers each
+// firing several queries per pipeline stage, we want a roomy pool to
+// avoid head-of-line blocking. Cap at 200 to stay well under typical
+// Atlas tier limits (M0 free = 500, M10 = 1500).
+const MONGO_POOL_SIZE = Math.max(50, Math.min(CONCURRENCY * 3, 200));
 
 mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
+  useNewUrlParser:    true,
+  useUnifiedTopology: true,
+  maxPoolSize:        MONGO_POOL_SIZE
 }).then(() => {
-  console.log(`🔌 Connected to MongoDB; starting ${CONCURRENCY} worker loop(s)`);
+  console.log(`🔌 Connected to MongoDB (pool=${MONGO_POOL_SIZE}); starting ${CONCURRENCY} worker loop(s)`);
   for (let i = 1; i <= CONCURRENCY; i++) {
     workerLoop(i).catch(err => console.error(`❌ worker[${i}] crashed:`, err));
   }

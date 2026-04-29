@@ -213,7 +213,14 @@ app.post('/api/products/:id/match-amazon', requireAuth, express.json(), async (r
 app.get('/api/health', (req, res) => res.status(200).send('API is running ✅'));
 
 // ── MongoDB ──────────────────────────────────────────────────────────────────
-mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser:    true,
+  useUnifiedTopology: true,
+  // When RUN_WORKER=true the same process handles both API and worker
+  // queries; size the pool to cover both. 200 stays well under Atlas
+  // tier limits (M0=500, M10=1500).
+  maxPoolSize:        200
+})
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
 
