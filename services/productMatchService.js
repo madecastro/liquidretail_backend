@@ -549,10 +549,13 @@ async function findCatalogMatch({
 
   // Cap the candidate pull. V1 brands typically have well under 500
   // SKUs; V2 (CLIP embeddings + vector index) handles large catalogs.
+  // Match across ig-catalog AND manual-upload sources, but exclude
+  // drafts — drafts have incomplete commerce data (no price /
+  // productUrl) and shouldn't be presented as confident matches.
   const rows = await CatalogProduct
-    .find({ brandId, source: 'ig-catalog' })
+    .find({ brandId, draft: { $ne: true } })
     .limit(500)
-    .select('title description category brand price currency imageUrl productUrl externalId')
+    .select('title description category brand price currency imageUrl productUrl externalId source')
     .lean();
   if (!rows.length) return null;
 

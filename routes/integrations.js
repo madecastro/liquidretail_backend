@@ -415,7 +415,15 @@ router.get('/instagram/catalog', async (req, res) => {
     const limit  = Math.min(Math.max(parseInt(req.query.limit, 10)  || 24, 1), 100);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
-    const filter = { brandId, source: 'ig-catalog' };
+    // Show all sources by default — ig-catalog + manual-upload +
+    // detect-identified — so manual products appear alongside IG ones.
+    // Pass ?source=<value> to filter (or ?source=draft for drafts only).
+    const filter = { brandId };
+    if (req.query.source === 'draft') {
+      filter.draft = true;
+    } else if (req.query.source) {
+      filter.source = String(req.query.source);
+    }
     if (req.query.category) {
       filter.category = new RegExp(escapeRegex(String(req.query.category)), 'i');
     }
@@ -432,7 +440,7 @@ router.get('/instagram/catalog', async (req, res) => {
 
     const [rows, total, distinctCategories] = await Promise.all([
       CatalogProduct.find(filter)
-        .select('externalId title description category brand price currency availability imageUrl productUrl productReviews lastSyncedAt gtin mpn')
+        .select('externalId source draft title description category brand price currency availability imageUrl productUrl productReviews lastSyncedAt gtin mpn')
         .sort({ lastSyncedAt: -1 })
         .skip(offset)
         .limit(limit)
@@ -454,7 +462,10 @@ router.get('/instagram/catalog', async (req, res) => {
 
     const products = rows.map(r => ({
       id:           String(r._id),
+      _id:          String(r._id),
       externalId:   r.externalId,
+      source:       r.source,
+      draft:        !!r.draft,
       title:        r.title,
       description:  r.description || null,
       category:     r.category || null,
