@@ -1,6 +1,5 @@
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
-const openaiImg = require('./openaiImageService');
-const geminiImg = require('./geminiImageService');
+const providers = require('./extendedCropsProviders');
 
 // The new ratios and which existing smart-crop ratio they extend from.
 const NEW_RATIOS = {
@@ -19,9 +18,20 @@ const NEW_RATIOS = {
 // Cloudinary image-typed assets can't be used as the base of a /video/upload/
 // URL, so that kind of composite is unreliable with the public Cloudinary
 // transform API alone.
+//
+// AI providers come from extendedCropsProviders.js — add or disable them
+// there. The orchestrator only knows about (provider, variant) tuples; it
+// hands each one the same input bundle and uploads whatever buffer comes
+// back to Cloudinary with the per-ratio AR-fit transform.
 async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrops, judge, primarySubject, background, isVideo }) {
-  const output = { '9:16': [], '1.91:1': [] };
-  const errors = { '9:16': [], '1.91:1': [] };
+  const output = {};
+  const errors = {};
+  for (const r of Object.keys(NEW_RATIOS)) { output[r] = []; errors[r] = []; }
+
+  const enabled = providers.filter(p => p.isEnabled());
+  if (!enabled.length) {
+    console.warn('⚠️  No extended-crop AI providers enabled — only Cloudinary blurred-pad will be produced (video only).');
+  }
 
   for (const [newRatio, { baseRatio, cloudinaryAr }] of Object.entries(NEW_RATIOS)) {
     const judgeKey = 'crop_' + baseRatio.replace(':', '_');
@@ -38,37 +48,22 @@ async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrop
       ? buildSelfUnderlayVideoUrl(sourceVideoUrl, cloudinaryAr)
       : null;
 
-    const tasks = [];
-
     // AI providers receive sourceUrl + baseCrop + subject + background and
-    // build their own transform URLs. `background` (from subjectTextService)
-    // gives them the scene style/palette/lighting to preserve or extend.
-    tasks.push(makeProviderCandidate({
-      id: `${newRatio}-ext-openai`, label: 'OpenAI extension', provider: 'openai', variant: 'extension',
-      generator: () => openaiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
+    // produce an image Buffer. `background` (from subjectTextService) carries
+    // scene style/palette/lighting so providers can preserve or extend it.
+    const tasks = enabled.map(p => makeProviderCandidate({
+      id:        `${newRatio}-${p.idSlug}-${p.provider}`,
+      label:     `${capitalize(p.provider)} ${p.variant}`,
+      provider:  p.provider,
+      variant:   p.variant,
+      generator: () => p.generate({ sourceImageUrl, baseCrop, newRatio, primarySubject, background }),
       newRatio, cloudinaryAr, sharedVideoUrl
     }));
-    tasks.push(makeProviderCandidate({
-      id: `${newRatio}-gen-openai`, label: 'OpenAI generation', provider: 'openai', variant: 'generation',
-      generator: () => openaiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
-      newRatio, cloudinaryAr, sharedVideoUrl
-    }));
-    if (geminiImg.isEnabled()) {
-      tasks.push(makeProviderCandidate({
-        id: `${newRatio}-ext-gemini`, label: 'Gemini extension', provider: 'gemini', variant: 'extension',
-        generator: () => geminiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
-        newRatio, cloudinaryAr, sharedVideoUrl
-      }));
-      tasks.push(makeProviderCandidate({
-        id: `${newRatio}-gen-gemini`, label: 'Gemini generation', provider: 'gemini', variant: 'generation',
-        generator: () => geminiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject, background),
-        newRatio, cloudinaryAr, sharedVideoUrl
-      }));
-    }
 
     // Video-only: blurred-pad candidate. Its still is the hero frame padded with
     // blurred bars; its video is the same sharedVideoUrl every other variant uses
-    // (consistent playback, different still preview).
+    // (consistent playback, different still preview). Lives outside the provider
+    // registry because it has no AI generator — pure Cloudinary transform.
     if (isVideo && sharedVideoUrl) {
       output[newRatio].push({
         id: `${newRatio}-blurred`,
@@ -93,6 +88,8 @@ async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrop
 
   return { candidates: output, errors };
 }
+
+function capitalize(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
 
 async function makeProviderCandidate({ id, label, provider, variant, generator, newRatio, cloudinaryAr, sharedVideoUrl }) {
   const t0 = Date.now();
