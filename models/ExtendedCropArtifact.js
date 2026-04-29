@@ -21,7 +21,7 @@ const extendedCropArtifactSchema = new mongoose.Schema({
   // per-ratio winnerId / reasoning / scores
 
   selectedWinners: { type: mongoose.Schema.Types.Mixed, default: {} },
-  // shape: { '9:16': { candidateId, source: 'judge'|'override' }, '1.91:1': {...} }
+  // shape: { '9:16': { candidateId, source: 'judge' }, '1.91:1': {...} }
 
   createdAt: { type: Date, default: Date.now }
 });

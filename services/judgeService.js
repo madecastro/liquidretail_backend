@@ -103,13 +103,6 @@ TEXT TREATMENT:
 //  which gives the judge the reference material it needs to actually evaluate
 //  label/logo fidelity.
 //
-//  STATUS: GPT-4.1 self-preference toward gpt-image-1 was not fully neutralized
-//  by slot-blinding, weighted dimensions, and tighter rejects. As a stopgap we
-//  force-pick the Gemini extension candidate when present and not rejected —
-//  in practice it consistently preserves labels and subject identity better
-//  than the OpenAI variants. Remove the override once one of the TODOs below
-//  lands and the organic winner is trustworthy.
-//
 //  TODO — in priority order:
 //    1. Defects-list pass. Make the judge enumerate per-candidate observed
 //       defects vs the source (garbled chars in "<text>", logo shape changed,
@@ -221,22 +214,11 @@ async function judgeExtendedCrops(arg) {
       if (ratioRaw.scores?.[slot]) rekeyedScores[c.id] = ratioRaw.scores[slot];
     }
     const winnerId = plan.find(p => p.slot === ratioRaw.winnerSlot)?.candidate?.id;
-    const judgement = normalizeCropJudgement(
+    out[ratio] = normalizeCropJudgement(
       { winnerId, reasoning: ratioRaw.reasoning, scores: rekeyedScores },
       extendedCrops[ratio],
       weightedTotalExtended
     );
-
-    // STOPGAP: force Gemini extension as winner when it exists and isn't
-    // rejected. Judge scores are still returned unchanged so the UI can show
-    // the organic ranking in tooltips. Remove when one of the TODOs lands.
-    const geminiExt = extendedCrops[ratio].find(c => c.provider === 'gemini' && c.variant === 'extension');
-    if (geminiExt && !judgement.scores[geminiExt.id]?.rejected) {
-      judgement.winnerId = geminiExt.id;
-      judgement.reasoning = '[override] Forcing Gemini extension as winner until judge bias is resolved. ' + (judgement.reasoning || '');
-    }
-
-    out[ratio] = judgement;
   }
   return out;
 }

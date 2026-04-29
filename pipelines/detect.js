@@ -722,16 +722,14 @@ function resolvePrimarySubjectDesc(subjects, judge) {
   return subjects.find(s => s.id === id)?.description || null;
 }
 
-// For each extended ratio, derive who actually got picked (after the override
-// rule in judgeService.judgeExtendedCrops's stopgap).
+// For each extended ratio, surface the judge's pick on the artifact for
+// downstream consumers that don't want to re-derive it from the scores map.
 function deriveSelectedWinners(candidates, judge) {
   const out = {};
   for (const ratio of Object.keys(candidates || {})) {
     const judgeWinner = judge?.[ratio]?.winnerId || null;
-    const reasoning   = judge?.[ratio]?.reasoning || '';
-    const isOverride  = reasoning.startsWith('[override]');
     if (judgeWinner) {
-      out[ratio] = { candidateId: judgeWinner, source: isOverride ? 'override' : 'judge' };
+      out[ratio] = { candidateId: judgeWinner, source: 'judge' };
     }
   }
   return out;
