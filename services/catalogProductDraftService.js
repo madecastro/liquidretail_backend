@@ -22,32 +22,40 @@ const CatalogProduct = require('../models/CatalogProduct');
 // the same threshold that makes it "confident enough" to draft.
 const HIGH_CONFIDENCE = 0.85;
 
-async function maybeCreateDraftFromMatch({ media, productMatch, sceneImageUrl, yoloProducts }) {
+// `force: true` bypasses the certainty threshold + brand opt-in
+// soft guards. Used by the Upload-7 manual "Save as draft product"
+// CTA — when a user explicitly clicks save, they're vouching for the
+// match even at lower confidence and even if the brand hasn't opted
+// into bulk auto-create.
+async function maybeCreateDraftFromMatch({ media, productMatch, sceneImageUrl, yoloProducts, force = false }) {
   try {
-    return await tryCreate({ media, productMatch, sceneImageUrl, yoloProducts });
+    return await tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, force });
   } catch (err) {
     console.warn(`   ⚠️  draft auto-create unexpected error: ${err.message}`);
     return { created: false, reason: `unexpected: ${err.message}` };
   }
 }
 
-async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts }) {
-  // ── Guards ───────────────────────────────────────────────────────
+async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, force }) {
+  // ── Hard guards (always enforced) ────────────────────────────────
   if (!media || !productMatch) return { created: false, reason: 'missing inputs' };
   if (!media.brandId || !media.advertiserId) return { created: false, reason: 'media has no brand/advertiser' };
   if (productMatch.outcome !== 'product_match') return { created: false, reason: `outcome=${productMatch.outcome}` };
   // Catalog already won → that row IS the product. Skip.
   if (productMatch.winner === 'catalog') return { created: false, reason: 'catalog match already exists' };
 
-  const certainty = productMatch.identification?.certainty || 0;
-  if (certainty < HIGH_CONFIDENCE) {
-    return { created: false, reason: `certainty ${certainty.toFixed(2)} < ${HIGH_CONFIDENCE}` };
+  // ── Soft guards (skipped on force=true) ──────────────────────────
+  if (!force) {
+    const certainty = productMatch.identification?.certainty || 0;
+    if (certainty < HIGH_CONFIDENCE) {
+      return { created: false, reason: `certainty ${certainty.toFixed(2)} < ${HIGH_CONFIDENCE}` };
+    }
   }
 
-  // Brand opt-in.
+  // Brand fetch is needed regardless (we populate row.brand from it).
   const brand = await Brand.findById(media.brandId).select('name uploadSettings').lean();
   if (!brand) return { created: false, reason: 'brand not found' };
-  if (!brand.uploadSettings?.autoCreateFromDetect) {
+  if (!force && !brand.uploadSettings?.autoCreateFromDetect) {
     return { created: false, reason: 'autoCreateFromDetect disabled for brand' };
   }
 

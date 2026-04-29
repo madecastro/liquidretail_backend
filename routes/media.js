@@ -3,6 +3,7 @@ const router = express.Router();
 const Media = require('../models/Media');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
+const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
 
 // GET /api/media
 // Paginated list of media — most recent first. Supports `?ready=true` to
@@ -133,6 +134,49 @@ router.patch('/:mediaId/rights', express.json(), async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Rights update failed' });
+  }
+});
+
+// POST /api/media/:mediaId/draft-product
+// Upload-7 — manual "Save as draft product" escape hatch. Reads the
+// latest ProductMatchArtifact for the media and forces a draft
+// CatalogProduct write via the same pipeline path Upload-4 uses,
+// bypassing the certainty + brand opt-in guards. Useful when:
+//   - autoCreateFromDetect is OFF but the user wants this one match
+//     in the catalog
+//   - the match was below the 0.85 confidence floor but the user
+//     manually verified it's correct
+router.post('/:mediaId/draft-product', async (req, res) => {
+  try {
+    const media = await assertMediaInTenant(req.params.mediaId, req);
+
+    // Latest match for this media — the response that's currently on
+    // the screen when the user clicked Save.
+    const match = await ProductMatchArtifact.findOne({ mediaId: media._id })
+      .sort({ createdAt: -1 })
+      .lean();
+    if (!match) return res.status(404).json({ error: 'no product match artifact for this media yet' });
+
+    const result = await maybeCreateDraftFromMatch({
+      media,
+      productMatch: {
+        outcome:        match.outcome,
+        winner:         match.winner,
+        identification: match.identification,
+        query:          match.query,
+        catalogMatch:   match.catalogMatch
+      },
+      sceneImageUrl: media.fileUrl,
+      yoloProducts:  [],   // category gets filled in by the user via the drafts editor
+      force:         true
+    });
+
+    if (!result.created) {
+      return res.status(400).json({ ok: false, ...result });
+    }
+    res.status(201).json({ ok: true, ...result });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'draft-product create failed' });
   }
 });
 
