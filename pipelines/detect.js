@@ -578,23 +578,25 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
       try {
         const doc = await ProductMatchArtifact.create({
           mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-          productIndex:        m.productIndex || null,
-          query:               m.query || productMatches.query,
-          providers:           m.providers || {},
-          errors:              m.errors    || {},
-          totalMatches:        productMatches.totalMatches || 0,
-          identification:      m.identification || null,
-          outcome:             m.outcome || null,
-          outcomeReasoning:    m.outcomeReasoning || null,
-          winner:              m.winner || null,
-          brandCategory:       m.brandCategory || null,
-          brandReviews:        m.brandReviews || null,
-          matchSource:         m.matchSource || null,
-          catalogProductId:    m.catalogProductId || null,
-          catalogMatch:        m.catalogMatch || null,
-          catalogVisualScore:  m.catalogVisualScore   || null,
+          productIndex:         m.productIndex || null,
+          query:                m.query || productMatches.query,
+          providers:            m.providers || {},
+          errors:               m.errors    || {},
+          totalMatches:         productMatches.totalMatches || 0,
+          identification:       m.identification || null,
+          outcome:              m.outcome || null,
+          outcomeReasoning:     m.outcomeReasoning || null,
+          winner:               m.winner || null,
+          brandCategory:        m.brandCategory || null,
+          brandReviews:         m.brandReviews || null,
+          matchSource:          m.matchSource || null,
+          catalogProductId:     m.catalogProductId || null,
+          catalogMatch:         m.catalogMatch || null,
+          catalogVisualScore:   m.catalogVisualScore   || null,
           catalogCombinedScore: m.catalogCombinedScore || null,
-          productReviews:      m.productReviews || null
+          productReviews:       m.productReviews || null,
+          enrichmentTiers:      m.enrichmentTiers || [],     // Phase 1.7b
+          recommendedProducts:  m.recommendedProducts || []  // Phase 1.7b
         });
         matchDocs.push(doc);
       } catch (err) {

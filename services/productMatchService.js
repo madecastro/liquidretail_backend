@@ -391,7 +391,27 @@ async function findPerProductMatches(args) {
   // Detect summary aggregation (Phase 0b consumer for Media.classification)
   const detectSummary = aggregateDetectSummary(matches, brand);
 
-  // Primary match for backward-compat aliasing
+  // ── Phase 1.7b — per-match enrichment fan-out ──
+  // Three-tiered (SKU / category / brand). Idempotent: each tier checks
+  // whether its target field is already populated (e.g. by the legacy
+  // findProductMatches scene-level path) and skips work that would
+  // duplicate. Catalog winners arrive un-enriched and get the full pass.
+  const enrichCtx = {
+    brand:        args.brand,
+    brandUrl:     args.brandUrl,
+    advertiserId: args.advertiserId,
+    brandId:      args.brandId,
+    category:     args.category
+  };
+  await Promise.all(matches.map(m =>
+    enrichOneMatchInPlace(m, enrichCtx).catch(err => {
+      console.warn(`   ⚠️  per-match enrichment[${m.productIndex || 'primary'}] failed: ${err.message}`);
+      return m;
+    })
+  ));
+
+  // Primary match for backward-compat aliasing (post-enrichment so the
+  // primary alias carries the enrichment results too).
   const primary = pickPrimaryMatch(matches);
 
   return {
@@ -415,6 +435,156 @@ async function findPerProductMatches(args) {
     catalogMatch:     primary?.catalogMatch    || sceneLevel?.catalogMatch    || null,
     productReviews:   primary?.productReviews  || sceneLevel?.productReviews  || null
   };
+}
+
+// ── Phase 1.7b — three-tier per-match enrichment ──
+//
+// Mutates the match record in place; returns it. Idempotent: each tier
+// checks whether its target field is already populated and skips
+// re-fetching (matters for the scene-level fallback path, where the
+// legacy findProductMatches has already enriched the primary identification).
+//
+// Tier 1 (SKU):       outcome=product_match + certainty>=0.3 →
+//                     productDetails (sellers/rating/reviewSummary) +
+//                     productReviews (Gemini grounded, cached on CatalogProduct)
+// Tier 2 (Category):  outcome=product_match OR product_category →
+//                     productCategoryService (brand collection breadcrumb)
+// Tier 3 (Brand):     outcome=product_category OR brand_match →
+//                     brandReviews (brand-level Gemini grounded reviews)
+// Recommended (bonus): outcome=product_category →
+//                     up to 5 sibling CatalogProducts in the same category
+async function enrichOneMatchInPlace(match, ctx) {
+  if (!match || !match.identification) return match;
+  const ident   = match.identification;
+  const outcome = match.outcome;
+  const tiers   = [];
+
+  // ── Tier 1 — SKU enrichment ──
+  if (outcome === 'product_match' && ident.productName && (ident.certainty || 0) >= 0.3) {
+    // productDetails — fire when commerce data is thin (catalog rows have
+    // price/url/imageUrl but rarely sellers/rating; scene matches start empty).
+    const needsCommerce = !ident.details?.rating
+                       || !Array.isArray(ident.details?.sellers)
+                       || !ident.details.sellers.length;
+    if (productDetails.isEnabled() && needsCommerce) {
+      try {
+        const d = await productDetails.fetchProductDetails(ident);
+        if (d) {
+          // Merge: SerpAPI commerce data fills in, but the catalog-row
+          // authoritative fields (url, imageUrl, price, currency,
+          // description, source) STAY when they're already set.
+          ident.details = {
+            ...d,
+            ...ident.details,
+            // Pull in commerce fields if they were missing
+            rating:        ident.details?.rating        ?? d.rating,
+            reviewCount:   ident.details?.reviewCount   ?? d.reviewCount,
+            sellers:       ident.details?.sellers?.length ? ident.details.sellers : d.sellers,
+            reviewSummary: ident.details?.reviewSummary || d.reviewSummary
+          };
+          tiers.push('sku');
+        }
+      } catch (err) {
+        console.warn(`   ⚠️  productDetails per-match[${match.productIndex || 'primary'}]: ${err.message}`);
+      }
+    } else if (ident.details?.rating || ident.details?.sellers?.length) {
+      tiers.push('sku');   // already enriched (legacy scene-level path); record the tier
+    }
+
+    // productReviews — cached on CatalogProduct row when present
+    if (match.catalogProductId && !match.productReviews) {
+      try {
+        match.productReviews = await maybeFetchProductReviewsCached({
+          catalogProductId: match.catalogProductId,
+          productName:      ident.productName,
+          brandName:        ident.brand,
+          productUrl:       ident.details?.url
+        });
+      } catch (err) {
+        console.warn(`   ⚠️  productReviews per-match[${match.productIndex || 'primary'}]: ${err.message}`);
+      }
+    }
+  }
+
+  // ── Tier 2 — Category breadcrumb (collection page on the brand's site) ──
+  if ((outcome === 'product_match' || outcome === 'product_category') && !match.brandCategory) {
+    if (productCategory.isEnabled()) {
+      // Inputs cascade SKU label → refined product label → refined category → run-scoped category.
+      // For category-confirmed reconciled products (Phase 1.5c), categoryLabel
+      // is the broader fallback if specific label gives nothing useful.
+      const productLabel = ident.productName
+                        || match.query?.productCrop?.categoryLabel
+                        || match.query?.productCrop?.label
+                        || ctx.category;
+      const productCategoryHint = match.query?.productCrop?.category || ctx.category;
+      const productDescription  = ident.details?.description || null;
+      if (productLabel) {
+        try {
+          match.brandCategory = await productCategory.enrichProductCategory({
+            brandName:       ctx.brand,
+            brandUrl:        ctx.brandUrl,
+            productLabel,
+            productCategory: productCategoryHint,
+            productDescription
+          });
+          if (match.brandCategory) tiers.push('category');
+        } catch (err) {
+          console.warn(`   ⚠️  productCategory per-match[${match.productIndex || 'primary'}]: ${err.message}`);
+        }
+      }
+    }
+  } else if (match.brandCategory) {
+    tiers.push('category');
+  }
+
+  // ── Tier 3 — Brand-level reviews (no SKU resolution) ──
+  if ((outcome === 'product_category' || outcome === 'brand_match') && !match.brandReviews) {
+    try {
+      match.brandReviews = await fetchBrandReviewsCachedOrFresh({
+        brand:        ctx.brand,
+        brandUrl:     ctx.brandUrl,
+        advertiserId: ctx.advertiserId
+      });
+      if (match.brandReviews) tiers.push('brand');
+    } catch (err) {
+      console.warn(`   ⚠️  brandReviews per-match[${match.productIndex || 'primary'}]: ${err.message}`);
+    }
+  } else if (match.brandReviews) {
+    tiers.push('brand');
+  }
+
+  // ── Recommended products (Phase 1.7b bonus) ──
+  // For category-confirmed matches that didn't resolve a specific SKU,
+  // surface up to 5 sibling CatalogProducts in the same category. Gives
+  // downstream layout/template generation a usable surface even without
+  // SKU-level identification — the "we know this is in your Mens > Tops
+  // category, here's what's recommended in that category" pattern.
+  if (outcome === 'product_category' && ctx.brandId && !match.recommendedProducts?.length) {
+    const cropCategory = match.query?.productCrop?.category || ctx.category;
+    if (cropCategory) {
+      try {
+        const recs = await CatalogProduct
+          .find({
+            brandId:  ctx.brandId,
+            draft:    { $ne: true },
+            category: { $regex: escapeRegex(cropCategory), $options: 'i' }
+          })
+          .sort({ updatedAt: -1 })
+          .limit(5)
+          .select('_id title description category brand price currency imageUrl productUrl externalId source')
+          .lean();
+        match.recommendedProducts = recs;
+        if (recs.length) {
+          console.log(`   · recommended[${match.productIndex || 'primary'}]: ${recs.length} sibling product(s) in category "${cropCategory}"`);
+        }
+      } catch (err) {
+        console.warn(`   ⚠️  recommendedProducts per-match[${match.productIndex || 'primary'}]: ${err.message}`);
+      }
+    }
+  }
+
+  match.enrichmentTiers = [...new Set(tiers)];
+  return match;
 }
 
 // ── Match-record builders ──

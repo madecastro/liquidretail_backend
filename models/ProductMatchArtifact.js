@@ -15,7 +15,7 @@ const productMatchArtifactSchema = new mongoose.Schema({
   // DetectionArtifact.refinedProducts[] array (or yoloProducts[] when
   // Phase 1.6 refinement fell back) that this match represents. Null on
   // legacy artifacts that pre-date the per-product split.
-  productIndex: { type: Number, default: null },
+  productIndex: { type: mongoose.Schema.Types.Mixed, default: null },
   // Combined catalog match score (max of text + visual). Persisted so
   // consumers can rank matches without re-deriving. Null on non-catalog
   // outcomes.
@@ -24,6 +24,18 @@ const productMatchArtifactSchema = new mongoose.Schema({
   // Vision similarity between the refined crop and the catalog candidate's
   // imageUrl). Null when not run.
   catalogVisualScore: { type: Number, default: null },
+  // Phase 1.7b — three-tier per-match enrichment surface:
+  //   tier 1 'sku'      — productDetails + productReviews fired (product_match outcomes)
+  //   tier 2 'category' — productCategory ran (product_match OR product_category outcomes; can fire alongside tier 1)
+  //   tier 3 'brand'    — brandReviews fired (product_category OR brand_match outcomes)
+  //   Multiple tiers can apply; stored as an array.
+  enrichmentTiers: { type: [String], default: [] },
+  // Phase 1.7b — recommended products surfaced for category-confirmed matches.
+  // When outcome='product_category', the per-match enrichment queries the
+  // brand's CatalogProduct collection for siblings in the same category and
+  // attaches up to 5 here. Lets the layout/template generator surface
+  // "recommended for you" content even when SKU-level identification missed.
+  recommendedProducts: { type: [mongoose.Schema.Types.Mixed], default: [] },
 
   query:        mongoose.Schema.Types.Mixed,
   // { brand, category, caption, primarySubject, textDetected[] }

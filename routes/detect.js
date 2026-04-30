@@ -170,13 +170,31 @@ async function assembleResult(run) {
   const media = await Media.findById(run.mediaId);
   if (!media) return null;
 
-  const [detection, crops, extended, match, overlayZones] = await Promise.all([
+  // Phase 1.7 — read ALL ProductMatchArtifact docs for the run (one per refined
+  // product). Sort with primary first (catalog winners outrank by combined
+  // score, then by certainty). Surface .productMatches (legacy primary alias)
+  // AND .productMatchesAll (full list) so existing UIs see no change while
+  // multi-product-aware UIs can iterate.
+  const [detection, crops, extended, allMatches, overlayZones] = await Promise.all([
     DetectionArtifact.findOne({ runId: run._id }).sort({ createdAt: -1 }).lean(),
     CropArtifact.findOne({ runId: run._id }).sort({ createdAt: -1 }).lean(),
     ExtendedCropArtifact.findOne({ runId: run._id }).sort({ createdAt: -1 }).lean(),
-    ProductMatchArtifact.findOne({ runId: run._id }).sort({ createdAt: -1 }).lean(),
+    ProductMatchArtifact.find({ runId: run._id }).sort({ createdAt: 1 }).lean(),
     OverlayZoneArtifact.findOne({ runId: run._id }).sort({ createdAt: -1 }).lean()
   ]);
+
+  // Rank matches: catalog winners first, then by combined catalog score,
+  // then by certainty. The first entry is the legacy "primary" exposed
+  // under .productMatches.
+  const rankedMatches = (allMatches || []).slice().sort((a, b) => {
+    const aCat = a.winner === 'catalog' ? 1 : 0;
+    const bCat = b.winner === 'catalog' ? 1 : 0;
+    if (aCat !== bCat) return bCat - aCat;
+    const aScore = a.catalogCombinedScore ?? a.identification?.certainty ?? 0;
+    const bScore = b.catalogCombinedScore ?? b.identification?.certainty ?? 0;
+    return bScore - aScore;
+  });
+  const match = rankedMatches[0] || null;
 
   const stageTimings = run.stageTimings && typeof run.stageTimings.toObject === 'function'
     ? run.stageTimings.toObject()
@@ -196,6 +214,7 @@ async function assembleResult(run) {
     videoDurationSec: detection?.videoDurationSec ?? null,
 
     products:   detection?.yoloProducts || [],
+    refinedProducts: detection?.refinedProducts || [],   // Phase 1.6
     subjects:   detection?.subjects     || [],
     text:       detection?.text         || [],
     background: detection?.background   || null,
@@ -209,6 +228,7 @@ async function assembleResult(run) {
     extendedErrors: extended?.errors     || {},
     extendedJudge:  extended?.judge      || {},
 
+    // Legacy alias — primary match flattened into the shape existing UIs read.
     productMatches: match
       ? {
           query:        match.query,
@@ -218,6 +238,31 @@ async function assembleResult(run) {
           identification: match.identification || null
         }
       : null,
+
+    // Phase 1.7 — full list of per-product matches with all enrichment surfaces.
+    // Multi-product-aware UIs iterate this; each entry is one refined product's
+    // complete match record.
+    productMatchesAll: rankedMatches.map(m => ({
+      productIndex:         m.productIndex || null,
+      query:                m.query || null,
+      identification:       m.identification || null,
+      outcome:              m.outcome || null,
+      outcomeReasoning:     m.outcomeReasoning || null,
+      winner:               m.winner || null,
+      matchSource:          m.matchSource || null,
+      catalogProductId:     m.catalogProductId || null,
+      catalogMatch:         m.catalogMatch || null,
+      catalogVisualScore:   m.catalogVisualScore   ?? null,
+      catalogCombinedScore: m.catalogCombinedScore ?? null,
+      brandCategory:        m.brandCategory || null,
+      brandReviews:         m.brandReviews || null,
+      productReviews:       m.productReviews || null,
+      enrichmentTiers:      m.enrichmentTiers || [],
+      recommendedProducts:  m.recommendedProducts || []
+    })),
+
+    // Phase 0a — Media classification block (provenance + run-scoped detect summary)
+    mediaClassification: media.classification || null,
 
     overlayZones: overlayZones?.zones || {},
 
