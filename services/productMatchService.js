@@ -310,6 +310,130 @@ async function findProductMatches({
   };
 }
 
+// ── Phase 1.8 — per-product provider runner ──
+//
+// Replaces the scene-level provider chain with a per-refined-product call.
+// Each refined product gets its own Gemini grounded search (multimodal,
+// seeded with the tight crop image) + Google Lens (with the tight crop URL).
+// The result is a per-product providers map + errors + totalMatches that
+// gets fed into productReasoner for a per-product identification.
+//
+// Returns: { providers, errors, totalMatches, skipped }
+async function runPerProductProviders(refined, ctx) {
+  const enabled = PROVIDERS.filter(p => p.isEnabled());
+  const skipped = PROVIDERS.filter(p => !p.isEnabled()).map(p => p.PROVIDER_NAME);
+
+  const tasks = enabled.map(p =>
+    p.match({
+      brand:          ctx.brand,
+      category:       refined.category || ctx.category,
+      caption:        ctx.caption,
+      primarySubject: refined.label,                 // ← per-product label seed (was scene-level primarySubject)
+      textDetected:   ctx.textDetected,
+      imageUrl:       refined.croppedImageUrl,        // ← per-product crop URL (Lens uses this)
+      cropImageUrl:   refined.croppedImageUrl         // ← multimodal seed for Gemini grounded search
+    })
+    .then(result => ({ status: 'ok', name: p.PROVIDER_NAME, result }))
+    .catch(err => ({ status: 'err', name: p.PROVIDER_NAME, error: err.message || String(err) }))
+  );
+  const settled = await Promise.all(tasks);
+
+  const providers = {};
+  const errors = {};
+  let totalMatches = 0;
+  for (const s of settled) {
+    if (s.status === 'ok') {
+      providers[s.name] = s.result;
+      totalMatches += s.result.matches.length;
+    } else {
+      errors[s.name] = s.error;
+      console.warn(`   ✗ per-product ${s.name}[${refined.id}]: ${s.error}`);
+    }
+  }
+  return { providers, errors, totalMatches, skipped };
+}
+
+// Per-product reasoner — same productReasoner.identifyProduct as before,
+// but seeded with per-product inputs instead of scene-level. Returns the
+// reasoner's structured identification or null when no provider hits.
+async function runPerProductReasoner(provResult, refined, ctx) {
+  if (!provResult || provResult.totalMatches === 0) return null;
+  try {
+    const ident = await identifyProduct({
+      brand:          ctx.brand,
+      category:       refined.category || ctx.category,
+      caption:        ctx.caption,
+      primarySubject: refined.label,
+      textDetected:   ctx.textDetected,
+      imageUrl:       refined.croppedImageUrl,
+      providers:      provResult.providers
+    });
+    if (ident) {
+      console.log(`   · per-product reasoner[${refined.id}]: "${ident.productName || '(none)'}" — ${ident.certaintyLabel} (${((ident.certainty || 0) * 100).toFixed(0)}%)`);
+    }
+    return ident;
+  } catch (err) {
+    console.warn(`   ⚠️  per-product reasoner[${refined.id}] failed: ${err.message}`);
+    return null;
+  }
+}
+
+// Build a match record from per-product provider+reasoner output.
+// Outcome derived from reasoner certainty (no multi-brand/decision-tree
+// scaffolding — that's a scene-level concern handled separately when no
+// refinedProducts exist). Multi-brand contention across refined products
+// gets surfaced via aggregateDetectSummary downstream.
+function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
+  const certainty = ident?.certainty || 0;
+  let outcome, winner, outcomeReasoning;
+  if (ident?.productName && certainty >= HIGH_CONFIDENCE) {
+    outcome = 'product_match';
+    winner  = 'gemini';
+    outcomeReasoning = `per-product Gemini search + reasoner identified "${ident.productName}" at ${(certainty * 100).toFixed(0)}% certainty`;
+  } else if (ident?.productName && certainty > CATEGORY_LOWER && certainty <= CATEGORY_UPPER) {
+    outcome = 'product_category';
+    winner  = 'gemini';
+    outcomeReasoning = `per-product reasoner: mid-confidence (${(certainty * 100).toFixed(0)}%); falling back to brand collection page`;
+  } else {
+    outcome = 'brand_match';
+    winner  = null;
+    outcomeReasoning = `per-product providers returned no trustworthy product signal (certainty ${(certainty * 100).toFixed(0)}%)`;
+  }
+
+  return {
+    productIndex: refined.id,
+    query: {
+      brand:          ctx.brand,
+      brandUrl:       ctx.brandUrl,
+      category:       refined.category || ctx.category,
+      caption:        ctx.caption,
+      primarySubject: refined.label,
+      textDetected:   ctx.textDetected,
+      productCrop: {
+        id:              refined.id,
+        label:           refined.label,
+        category:        refined.category,
+        x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
+        croppedImageUrl: refined.croppedImageUrl
+      }
+    },
+    identification:       ident,
+    outcome,
+    outcomeReasoning,
+    winner,
+    matchSource:          outcome === 'product_match' ? 'gemini-search' : null,
+    catalogProductId:     null,
+    catalogMatch:         null,
+    catalogVisualScore:   null,
+    catalogCombinedScore: null,
+    providers:            provResult.providers || {},
+    errors:               provResult.errors    || {},
+    productReviews:       null,                        // enrichment fan-out hydrates
+    brandCategory:        null,                        // ditto
+    brandReviews:         null
+  };
+}
+
 // ── Phase 1.7a — per-product orchestrator ──
 //
 // Wraps findProductMatches with per-refined-product catalog-first matching.
@@ -360,29 +484,62 @@ async function findPerProductMatches(args) {
     }
   }
 
-  // Run scene-level providers (legacy findProductMatches) UNLESS any catalog winner
+  // ── Phase 1.8 — per-product providers for non-catalog refined products ──
+  //
+  // When refinedProducts exist AND some didn't catalog-win, run providers
+  // (Gemini grounded search + Google Lens) PER refined product, seeded with
+  // that product's tight crop image + label — instead of the scene-level
+  // primarySubject / source image. Each per-product call gets its own
+  // reasoner pass producing a per-product identification.
+  //
+  // This closes the scene-leakage gap: non-catalog identifications no longer
+  // inherit "Man wearing fishing apparel on boat" as the search query — they
+  // get "Pelagic Gear bikini top" with the actual cropped image attached.
+  //
+  // The legacy scene-level findProductMatches call only fires when refined-
+  // Products is empty (e.g., video, or refinement failed entirely).
+  const needsProviders = refinedProducts.length
+    ? perRefinedCatalog.some(r => r.combinedScore < 0.80)
+    : true;
+
   let sceneLevel = null;
-  if (!anyCatalogWinner) {
+  let perProductProviderResults = [];
+  if (refinedProducts.length === 0 && needsProviders) {
+    // Legacy single-match fallback (no refined products at all)
     sceneLevel = await findProductMatches(args);
+  } else if (refinedProducts.length && needsProviders) {
+    // Per-product provider+reasoner for refined products that didn't catalog-win
+    perProductProviderResults = await Promise.all(refinedProducts.map(async (rp, i) => {
+      if (perRefinedCatalog[i]?.combinedScore >= 0.80) return null; // catalog winner; skip
+      const provResult = await runPerProductProviders(rp, args);
+      const ident      = await runPerProductReasoner(provResult, rp, args);
+      return { provResult, ident };
+    }));
+    const ranCount = perProductProviderResults.filter(r => r).length;
+    if (ranCount > 0) {
+      console.log(`📡 per-product providers ran on ${ranCount} of ${refinedProducts.length} refined product(s) (catalog miss path)`);
+    }
   } else {
-    console.log(`   · skipping scene-level providers (catalog winner exists run-scoped)`);
+    console.log(`   · all refined products are catalog winners; skipping providers entirely`);
   }
 
   // Build matches[] array
   const matches = [];
 
   if (refinedProducts.length) {
-    let sceneAssigned = false;       // tracks whether the scene-level identification has been assigned to a refined product yet
     refinedProducts.forEach((rp, i) => {
       const catRes = perRefinedCatalog[i] || {};
       if (catRes.combinedScore >= 0.80 && catRes.catalogMatch?.product) {
         matches.push(buildCatalogWinnerMatchRecord(rp, catRes, args));
-      } else if (sceneLevel && !sceneAssigned && sceneLevel.outcome !== 'do_not_use' && sceneLevel.identification?.productName) {
-        matches.push(buildSceneLevelMatchRecord(rp, sceneLevel, args));
-        sceneAssigned = true;
-      } else {
-        matches.push(buildRefinedFallbackRecord(rp, sceneLevel, args));
+        return;
       }
+      const provRes = perProductProviderResults[i];
+      if (provRes?.ident?.productName) {
+        matches.push(buildPerProductProviderMatchRecord(rp, provRes.provResult, provRes.ident, args));
+        return;
+      }
+      // Fall back to refined-only record (no catalog, no provider hit)
+      matches.push(buildRefinedFallbackRecord(rp, null, args));
     });
   } else if (sceneLevel) {
     // Legacy single-match path: no refinedProducts, just wrap scene-level

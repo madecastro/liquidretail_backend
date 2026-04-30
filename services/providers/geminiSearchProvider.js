@@ -15,7 +15,7 @@ const PROVIDER_NAME = 'gemini-search';
 
 function isEnabled() { return !!process.env.GEMINI_API_KEY; }
 
-async function match({ brand, category, caption, primarySubject, textDetected = [] }) {
+async function match({ brand, category, caption, primarySubject, textDetected = [], cropImageUrl = null }) {
   if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
 
   const queryParts = [];
@@ -25,17 +25,44 @@ async function match({ brand, category, caption, primarySubject, textDetected = 
   if (caption)        queryParts.push(`Caption: "${caption}"`);
   if (textDetected.length) queryParts.push(`Text visible on product: ${textDetected.map(t => `"${t}"`).join(', ')}`);
 
-  const prompt =
-    `Use Google Search to find where this product is sold online. Prefer the brand's own site ` +
-    `and major retailers. Return a concise one-paragraph summary explaining which product you ` +
-    `identified and which retailers carry it. Cite every retailer with a link so I can browse them.\n\n` +
-    `Product details:\n${queryParts.join('\n')}`;
+  // Phase 1.8 — multimodal grounded search. When the caller provides a tight
+  // per-product crop URL (Phase 1.6 refinement output), download it + send as
+  // inlineData so Gemini's grounded search sees the product visually instead
+  // of relying solely on the scene-level primarySubject text. The image
+  // grounds the query in actual visual evidence — eliminates the scene-leakage
+  // failure mode where Gemini picks a similar-looking product because the
+  // text seed described the broader scene.
+  let imagePart = null;
+  if (cropImageUrl) {
+    try {
+      const imgRes = await axios.get(cropImageUrl, { responseType: 'arraybuffer', timeout: 15000 });
+      const buf = Buffer.from(imgRes.data);
+      imagePart = { inlineData: { mimeType: 'image/jpeg', data: buf.toString('base64') } };
+    } catch (err) {
+      console.warn(`   ⚠️  ${PROVIDER_NAME}: cropImageUrl download failed (${err.message}); falling back to text-only`);
+    }
+  }
+
+  const prompt = imagePart
+    ? `Use Google Search to find where the SPECIFIC product shown in the attached image is sold ` +
+      `online — focus on the central product visible in the image, not surrounding context. ` +
+      `Prefer the brand's own site and major retailers. Return a concise one-paragraph summary ` +
+      `explaining which product you identified and which retailers carry it. Cite every retailer ` +
+      `with a link.\n\n` +
+      `Product details (use as a sanity check on what's visible):\n${queryParts.join('\n')}`
+    : `Use Google Search to find where this product is sold online. Prefer the brand's own site ` +
+      `and major retailers. Return a concise one-paragraph summary explaining which product you ` +
+      `identified and which retailers carry it. Cite every retailer with a link so I can browse them.\n\n` +
+      `Product details:\n${queryParts.join('\n')}`;
+
+  const parts = [{ text: prompt }];
+  if (imagePart) parts.push(imagePart);
 
   const t0 = Date.now();
   const res = await axios.post(
     `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
     {
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      contents: [{ role: 'user', parts }],
       tools: [{ google_search: {} }],
       generationConfig: { temperature: 0.2, maxOutputTokens: 1200 }
     },
