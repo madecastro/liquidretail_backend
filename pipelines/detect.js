@@ -155,6 +155,19 @@ async function runImagePipeline(run, media, buffer) {
   detectionDoc.primarySubjectDesc = primarySubjectDesc;
   await detectionDoc.save();
 
+  // Phase 2c — promote vision analysis onto Media (denormalized cache of
+  // the latest run's output). DetectionArtifact stays as the per-run
+  // audit record; Media has the LATEST.
+  media.subjects           = (subjects || []).map(s => ({ ...s }));
+  media.text               = (text     || []).map(t => ({ ...t }));
+  media.background         = background || null;
+  media.primarySubjectId   = primarySubjectId   || null;
+  media.primarySubjectDesc = primarySubjectDesc || null;
+  media.safeRect           = safeRect || null;
+  media.refinedProducts    = (refinedProducts || []).map(rp => ({ ...rp }));
+  media.lastDetectedAt     = new Date();
+  await media.save();
+
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     smartCrops: crops,
@@ -335,6 +348,18 @@ async function runVideoPipeline(run, media, buffer) {
   detectionDoc.primarySubjectId = primarySubjectId;
   detectionDoc.primarySubjectDesc = primarySubjectDesc;
   await detectionDoc.save();
+
+  // Phase 2c — promote vision analysis to Media (video path; refinedProducts
+  // stays empty until Phase 1.6 supports video).
+  media.subjects           = (subjects || []).map(s => ({ ...s }));
+  media.text               = (text     || []).map(t => ({ ...t }));
+  media.background         = background || null;
+  media.primarySubjectId   = primarySubjectId   || null;
+  media.primarySubjectDesc = primarySubjectDesc || null;
+  media.safeRect           = safeRect || null;
+  media.refinedProducts    = [];
+  media.lastDetectedAt     = new Date();
+  await media.save();
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
@@ -612,12 +637,46 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
   // Picks the highest-confidence catalog winner if any, else the first match.
   const primaryDoc = pickPrimaryDoc(matchDocs, productMatches?.matches || []);
 
+  // Phase 2d — denormalized match arrays on Media. Source of truth stays
+  // ProductMatchArtifact (per-run audit); these are the LATEST current
+  // state for fast reads ("what does this Media match right now?").
+  // Cleared and rewritten each detect run.
+  const matchedProducts   = [];
+  const matchedCategories = [];
+  const matches    = productMatches?.matches    || [];
+  matches.forEach((m, i) => {
+    const artifactId = matchDocs[i]?._id || null;
+    if (m.outcome === 'product_match' || m.outcome === 'product_category') {
+      const matchKind = m.winner === 'catalog'
+                          ? 'catalog'
+                          : (m.catalogProductId ? 'detect-identified' : 'inferred-no-row');
+      matchedProducts.push({
+        refinedProductId:        m.productIndex || null,
+        catalogProductId:        m.catalogProductId || null,
+        matchKind,
+        outcome:                 m.outcome,
+        confidence:              m.catalogCombinedScore ?? m.identification?.certainty ?? 0,
+        matchEvidenceArtifactId: artifactId
+      });
+    }
+    if (m.categoryId) {
+      matchedCategories.push({
+        categoryId:              m.categoryId,
+        refinedProductId:        m.productIndex || null,
+        confidence:              m.catalogCombinedScore ?? m.identification?.certainty ?? 0,
+        matchEvidenceArtifactId: artifactId
+      });
+    }
+  });
+  media.matchedProducts   = matchedProducts;
+  media.matchedCategories = matchedCategories;
+
   // Run-scoped detect summary (Phase 0b — populates Media.classification.detectSummary).
   if (productMatches?.detectSummary) {
     media.classification = media.classification || {};
     media.classification.detectSummary = productMatches.detectSummary;
-    try { await media.save(); } catch (err) { console.warn(`   ⚠️  failed to persist detectSummary: ${err.message}`); }
   }
+  try { await media.save(); } catch (err) { console.warn(`   ⚠️  failed to persist Media match denormalization: ${err.message}`); }
 
   return { productMatches, matchDoc: primaryDoc, matchDocs };
 }

@@ -66,6 +66,58 @@ const mediaSchema = new mongoose.Schema({
     overlayZones: { type: mongoose.Schema.Types.ObjectId, ref: 'OverlayZoneArtifact' }
   },
 
+  // Phase 2c — vision analysis promoted onto Media as denormalized cache
+  // of the LATEST run's output. DetectionArtifact stays as the per-run
+  // audit record (cross-run diffs queryable there). Consumers that want
+  // "what's in this Media right now" read directly from Media without
+  // joining through DetectionArtifact.
+  //
+  // Updated atomically with latestArtifacts.detection at end of detect-
+  // fanout phase. Stale only if a run failed mid-flight; cleared on next
+  // successful run.
+  subjects:           { type: [mongoose.Schema.Types.Mixed], default: [] },
+  text:               { type: [mongoose.Schema.Types.Mixed], default: [] },
+  background:         mongoose.Schema.Types.Mixed,
+  primarySubjectId:   String,
+  primarySubjectDesc: String,
+  safeRect:           mongoose.Schema.Types.Mixed,
+  // Refined products are the per-product tight crops produced by Phase 1.6
+  // (image-only). Carries source-image bbox + Cloudinary c_crop URL +
+  // label + category. Consumers iterate to get "what specific products
+  // are in this Media."
+  refinedProducts:    { type: [mongoose.Schema.Types.Mixed], default: [] },
+  lastDetectedAt:     Date,
+
+  // Phase 2d — relational match results denormalized for fast reads. The
+  // source of truth is ProductMatchArtifact (per-run audit), but these
+  // arrays are the LATEST current state. Consumers wanting "what products
+  // / categories does this Media match right now" read these directly.
+  //
+  // matchedProducts[] — one entry per refined product that produced a
+  //   confident outcome (product_match or product_category). Catalog
+  //   winners include the catalogProductId FK; competitor matches and
+  //   no-match-no-category outcomes are omitted from this array.
+  matchedProducts: [{
+    refinedProductId:        String,                                                           // 'r1', 'r2', ...
+    catalogProductId:        { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct' },  // null when match was inferred but ensure-skipped (competitor) or below floor
+    matchKind:               String,                                                           // 'catalog' | 'detect-identified' | 'inferred-no-row'
+    outcome:                 String,                                                           // 'product_match' | 'product_category'
+    confidence:              Number,                                                           // catalogCombinedScore || identification.certainty
+    matchEvidenceArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
+    _id: false
+  }],
+  // matchedCategories[] — one entry per refined product that resolved a
+  //   category leaf (via productCategoryService → findOrCreateCategoryTree).
+  //   Replaces the per-match brandCategory snapshot for "what categories
+  //   does this Media touch" reads.
+  matchedCategories: [{
+    categoryId:              { type: mongoose.Schema.Types.ObjectId, ref: 'Category' },
+    refinedProductId:        String,
+    confidence:              Number,
+    matchEvidenceArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
+    _id: false
+  }],
+
   // Computed downstream from artifacts; cached here so "find ad-suitable
   // media" is one indexed query instead of an aggregation across artifacts.
   adSuitability: {
