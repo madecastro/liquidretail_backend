@@ -79,6 +79,23 @@ const catalogProductSchema = new mongoose.Schema({
   //     fetchedAt: Date }
   productReviews: mongoose.Schema.Types.Mixed,
 
+  // ── Phase 2f — Immersive Product fields owned here (was on match artifact) ──
+  //
+  // CatalogProduct is the canonical home for product-page data. The
+  // match artifact references this row via FK; consumers join in to get
+  // commerce + review data in their authoritative form.
+  //
+  // Populated by productDetailsService.fetchProductDetails when called
+  // with this catalogProductId; refreshed every 30 days. Idempotent
+  // write-through.
+  rating:              Number,                            // 0-5 from Immersive product_results.rating
+  ratingDistribution:  { type: [mongoose.Schema.Types.Mixed], default: [] },  // [{stars, count}, ...] from Immersive
+  reviews:             { type: [mongoose.Schema.Types.Mixed], default: [] },  // individual review rows (top 10) from Immersive
+  specs:               { type: mongoose.Schema.Types.Mixed, default: null },  // Immersive product_results.specifications
+  sellers:             { type: [mongoose.Schema.Types.Mixed], default: [] },  // Aggregated google_shopping shopping_results
+  reviewSummary:       mongoose.Schema.Types.Mixed,                            // Gemini narrative — distinct from productReviews.summary
+  detailsRefreshedAt:  Date,                                                    // 30-day TTL marker for the four Immersive fields above
+
   // Phase 2a — FK to the leaf Category row this product belongs to
   // (e.g. the "Mens > Tops > Performance Shirts" leaf). Replaces the
   // freeform `category` string above as the relational link; the

@@ -648,7 +648,9 @@ async function enrichOneMatchInPlace(match, ctx) {
                        || !ident.details.sellers.length;
     if (productDetails.isEnabled() && needsCommerce) {
       try {
-        const d = await productDetails.fetchProductDetails(ident);
+        // Phase 2f — pass catalogProductId so productDetails writes-through
+        // to the CatalogProduct row + reads from cache on repeat hits.
+        const d = await productDetails.fetchProductDetails(ident, match.catalogProductId);
         if (d) {
           // Merge: SerpAPI commerce data fills in, but the catalog-row
           // authoritative fields (url, imageUrl, price, currency,

@@ -23,19 +23,40 @@
 //      Skipped (logged) when the top shopping result has no immersive token.
 
 const axios = require('axios');
+const CatalogProduct = require('../models/CatalogProduct');
 
 const ENDPOINT = 'https://serpapi.com/search.json';
 const COUNTRY  = process.env.SERPAPI_COUNTRY || 'us';
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
+const TTL_MS   = 30 * 24 * 60 * 60 * 1000;   // 30 days — matches productReviews/brandReviews
 
 const _rawKey = process.env.SERPAPI_API_KEY || '';
 const _key    = _rawKey.trim().replace(/^['"]|['"]$/g, '');
 
 function isEnabled() { return !!_key; }
 
-async function fetchProductDetails(identification) {
+// Phase 2f — accepts optional catalogProductId. When provided:
+//   1. If the CatalogProduct row has fresh detailsRefreshedAt (< 30 days),
+//      return the cached fields directly from the row (zero API cost).
+//   2. Otherwise fetch fresh + WRITE-THROUGH to the CatalogProduct row
+//      (rating, ratingDistribution, reviews[], specs, sellers[],
+//      reviewSummary, detailsRefreshedAt). Subsequent matches on the
+//      same SKU read from cache.
+//
+// Without a catalogProductId, behavior is unchanged from Phase 1.9 —
+// always fetches fresh, returns the merged result, no persistence.
+async function fetchProductDetails(identification, catalogProductId = null) {
   if (!isEnabled()) throw new Error('SERPAPI_API_KEY not set');
   if (!identification?.productName) return null;
+
+  // Cache read — skip the API calls entirely if the catalog row is fresh.
+  if (catalogProductId) {
+    const cached = await readFromCatalogCache(catalogProductId);
+    if (cached) {
+      console.log(`   ✓ product-details: cache hit on CatalogProduct ${catalogProductId} (refreshed ${Math.round((Date.now() - new Date(cached.detailsRefreshedAt).getTime()) / 86400000)}d ago)`);
+      return cached;
+    }
+  }
 
   const t0 = Date.now();
   const query = [identification.brand, identification.productName, identification.variant]
@@ -116,7 +137,82 @@ async function fetchProductDetails(identification) {
   };
 
   console.log(`   ✓ product-details: ${sellers.length} seller(s)${immersive ? ` + immersive (desc=${result.description ? '✓' : '∅'}, ${result.reviews.length} review row(s), ${Object.keys(result.specs).length} spec(s))` : ''}, reviewSummary=${reviewSummary ? `${reviewSummary.sources.length} src` : 'no'}, rating=${result.rating ?? 'n/a'}, price=${result.price.display ?? 'n/a'} in ${Date.now() - t0}ms`);
+
+  // Phase 2f — write-through to CatalogProduct row when a catalogProductId
+  // was provided. Persists the Immersive + commerce + Gemini fields onto
+  // the row as the canonical owner; future calls on the same SKU read
+  // from cache.
+  if (catalogProductId) {
+    try { await writeThroughToCatalogProduct(catalogProductId, result); }
+    catch (err) { console.warn(`   ⚠️  CatalogProduct write-through failed: ${err.message}`); }
+  }
+
   return result;
+}
+
+// Read cached Immersive + Gemini fields from a CatalogProduct row when
+// fresh (< TTL_MS old). Returns the same shape fetchProductDetails would
+// return, sourced from the row instead of the live APIs.
+async function readFromCatalogCache(catalogProductId) {
+  const cp = await CatalogProduct.findById(catalogProductId)
+    .select('title description imageUrl productUrl price currency rating ratingDistribution reviews specs sellers reviewSummary detailsRefreshedAt productReviews')
+    .lean();
+  if (!cp) return null;
+  const refreshedAt = cp.detailsRefreshedAt ? new Date(cp.detailsRefreshedAt).getTime() : 0;
+  if (!refreshedAt || Date.now() - refreshedAt > TTL_MS) return null;
+  return {
+    title:        cp.title,
+    description:  cp.description || null,
+    thumbnail:    cp.imageUrl || null,
+    price: {
+      display:    null,                           // computed display strings aren't cached; consumers can format from value/currency
+      value:      typeof cp.price === 'number' ? cp.price : null,
+      currency:   cp.currency || 'USD'
+    },
+    rating:             typeof cp.rating === 'number' ? cp.rating : null,
+    reviewCount:        cp.productReviews?.reviewCount ?? null,
+    ratingDistribution: cp.ratingDistribution || [],
+    reviews:            cp.reviews || [],
+    reviewSummary:      cp.reviewSummary || null,
+    sellers:            cp.sellers || [],
+    specs:              cp.specs || {},
+    productId:          null,
+    source:             'catalog-cache',
+    cachedFromCatalog:  true,
+    catalogProductId
+  };
+}
+
+// Persist the fetched product details onto the CatalogProduct row.
+// Uses $set with conditional inserts so authoritative fields (description,
+// imageUrl, productUrl) don't overwrite values the brand has explicitly
+// curated — only fills gaps. The Immersive fields (rating distribution,
+// reviews, specs, sellers, reviewSummary) refresh in place every call.
+async function writeThroughToCatalogProduct(catalogProductId, fetched) {
+  if (!fetched) return;
+  const cp = await CatalogProduct.findById(catalogProductId)
+    .select('description imageUrl price currency')
+    .lean();
+  if (!cp) return;
+
+  const setOps = {
+    rating:             fetched.rating ?? null,
+    ratingDistribution: fetched.ratingDistribution || [],
+    reviews:            fetched.reviews || [],
+    specs:              fetched.specs || {},
+    sellers:            fetched.sellers || [],
+    reviewSummary:      fetched.reviewSummary || null,
+    detailsRefreshedAt: new Date()
+  };
+  // Fill commerce gaps only — never overwrite curated brand data
+  if (!cp.description && fetched.description) setOps.description = fetched.description;
+  if (!cp.imageUrl    && fetched.thumbnail)   setOps.imageUrl    = fetched.thumbnail;
+  if (cp.price == null && typeof fetched.price?.value === 'number') {
+    setOps.price    = fetched.price.value;
+    setOps.currency = fetched.price.currency || 'USD';
+  }
+
+  await CatalogProduct.updateOne({ _id: catalogProductId }, { $set: setOps });
 }
 
 // Phase 1.9 — Google Immersive Product API call. Replaces the lost
