@@ -126,7 +126,10 @@ async function identifyChunk(chunk, hints, offset) {
       role: 'user',
       content: [{ type: 'text', text: prompt }, ...imageParts]
     }],
-    max_tokens: 1800,
+    // Multi-product per-crop output: each product entry is ~150 chars; a
+    // 24-crop chunk × 2-3 products each can run 8k+ chars. 1800 was tight;
+    // 3500 covers worst case while still bounded.
+    max_tokens: 3500,
     temperature: 0.2
   });
 

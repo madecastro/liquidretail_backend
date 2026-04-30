@@ -110,18 +110,40 @@ async function identifyChunkGemini(chunk, hints) {
         }],
         generationConfig: {
           temperature: 0.2,
-          maxOutputTokens: 2000,
+          // Multi-product per-crop verbose JSON adds up fast: ~150 chars per
+          // product entry; a batch of 16 crops × 2-3 products each can hit
+          // ~6-8k chars. 2000 was getting truncated mid-array. 6000 leaves
+          // comfortable headroom while still bounding cost.
+          maxOutputTokens: 6000,
           responseMimeType: 'application/json'
         }
       },
       { timeout: 45000 }
     );
-    const text = (res.data?.candidates?.[0]?.content?.parts || [])
+    const candidate = res.data?.candidates?.[0];
+    const finishReason = candidate?.finishReason || 'unknown';
+    const text = (candidate?.content?.parts || [])
       .map(p => p.text || '').join('').trim();
+
+    // Surface truncation visibly — silent MAX_TOKENS leads to JSON parse
+    // failures that look like model confusion but are actually a token
+    // ceiling problem.
+    if (finishReason === 'MAX_TOKENS') {
+      const usage = res.data?.usageMetadata || {};
+      console.warn(`   ⚠️  gemini-identify hit MAX_TOKENS (out=${usage.candidatesTokenCount || 0} chars=${text.length}) — response likely truncated`);
+    }
+
     try { parsed = JSON.parse(text); }
-    catch {
+    catch (parseErr) {
       const m = text.match(/\{[\s\S]*\}/);
-      if (m) parsed = JSON5.parse(m[0]);
+      if (m) {
+        try { parsed = JSON5.parse(m[0]); }
+        catch (json5Err) {
+          throw new Error(`response not parseable as JSON or JSON5 (text length ${text.length}, finishReason ${finishReason}): ${json5Err.message}`);
+        }
+      } else {
+        throw new Error(`response contained no JSON object (text length ${text.length}, finishReason ${finishReason})`);
+      }
     }
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
