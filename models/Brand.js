@@ -114,6 +114,19 @@ const brandSchema = new mongoose.Schema({
   //     fetchedAt: Date }
   brandReviews:    mongoose.Schema.Types.Mixed,
 
+  // Phase 1.7c — category-level reviews keyed by breadcrumb (e.g. "Mens >
+  // Tops > Performance Shirts"). Each entry is a Gemini grounded-search
+  // snapshot for THAT category on THIS brand. Used by category-level
+  // comments and as a fallback quote source when SKU-level productReviews
+  // are missing.
+  //   [
+  //     { categoryKey: <hashed breadcrumb>,
+  //       breadcrumb: 'Mens > Tops > Performance Shirts',
+  //       summary, quotes: [{ text, author, source }],
+  //       rating, reviewCount, sources, fetchedAt }
+  //   ]
+  categoryReviews: { type: [mongoose.Schema.Types.Mixed], default: [] },
+
   // If stub, which Media was the first to surface this brand — useful for
   // auditing where a brand came from.
   firstSeenMediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },
@@ -131,13 +144,36 @@ const brandSchema = new mongoose.Schema({
   },
 
   // V3 #3 — auto-reply with a comment on IG-sourced posts when detect
-  // produces a confident product_match. Per-brand opt-in. Template
-  // supports {productUrl}, {productName}, {brandName} placeholders.
-  // dailyCap caps replies per UTC day to avoid hammering at-scale.
+  // produces a confident product_match. Per-brand opt-in. Phase 1.7c
+  // expanded to support three comment types matching the three review
+  // tiers: product (SKU-level), category (collection-level), brand
+  // (brand-level).
+  //
+  // Each template supports a different variable set:
+  //   templateProduct  — {productName, productUrl, brandName, productQuote}
+  //   templateCategory — {breadcrumb, categoryUrl, brandName, categoryQuote}
+  //   templateBrand    — {brandName, brandUrl, brandQuote}
+  //
+  // Fallback chain (when a template's quote source is empty):
+  //   product_match  → product comment with productReviews quote
+  //                  → fallback to category comment with categoryReviews quote
+  //                  → fallback to brand comment with brandReviews quote
+  //   product_category → category comment with categoryReviews quote
+  //                    → fallback to brand comment with brandReviews quote
+  //   brand_match    → brand comment with brandReviews quote (no further fallback)
+  //
+  // Legacy `template` field is kept and read as a fallback for templateProduct
+  // when the new field is unset, so existing brands keep working.
   commentReply: {
-    enabled:   { type: Boolean, default: false },
-    template:  { type: String,  default: 'Shop this look: {productUrl}' },
-    dailyCap:  { type: Number,  default: 25 }
+    enabled:           { type: Boolean, default: false },
+    template:          { type: String,  default: 'Shop this look: {productUrl}' },   // legacy; back-compat alias for templateProduct
+    templateProduct:   { type: String,  default: '"{productQuote}" · Shop the {productName} → {productUrl}' },
+    templateCategory:  { type: String,  default: '"{categoryQuote}" · Shop {breadcrumb} → {categoryUrl}' },
+    templateBrand:     { type: String,  default: '"{brandQuote}" · Discover {brandName} → {brandUrl}' },
+    dailyCap:          { type: Number,  default: 25 },                                // total comments per UTC day
+    perMediaCap:       { type: Number,  default: 3 },                                 // max comments per single Media
+    fallbackToCategory:{ type: Boolean, default: true },                              // product → category fallback
+    fallbackToBrand:   { type: Boolean, default: true }                               // category → brand fallback
   },
 
   // Upload Consolidation — per-brand controls for the unified upload

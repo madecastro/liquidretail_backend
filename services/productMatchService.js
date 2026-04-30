@@ -35,6 +35,7 @@ const { identifyProduct } = require('./productReasoner');
 const productDetails  = require('./productDetailsService');
 const productCategory = require('./productCategoryService');
 const visualCatalogMatch = require('./visualCatalogMatchService');   // Phase 1.7
+const categoryReviewsSvc = require('./categoryReviewsService');       // Phase 1.7c
 const Brand           = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
 const CatalogProduct  = require('../models/CatalogProduct');
@@ -535,6 +536,27 @@ async function enrichOneMatchInPlace(match, ctx) {
     }
   } else if (match.brandCategory) {
     tiers.push('category');
+  }
+
+  // ── Tier 2.5 — Category-level reviews (Phase 1.7c) ──
+  // Fetched when we have a brandCategory breadcrumb. Used by category-level
+  // comments AND as a quote fallback for product-level comments when
+  // productReviews is empty. Cache-aware on Brand.categoryReviews; cache
+  // miss kicks off background fetch and returns null (next run picks up).
+  if ((outcome === 'product_match' || outcome === 'product_category') && match.brandCategory?.breadcrumb && !match.categoryReviews) {
+    try {
+      match.categoryReviews = await categoryReviewsSvc.maybeFetchCategoryReviewsCached({
+        brandId:    ctx.brandId,
+        brandName:  ctx.brand,
+        brandUrl:   ctx.brandUrl,
+        breadcrumb: match.brandCategory.breadcrumb
+      });
+      if (match.categoryReviews?.quotes?.length) tiers.push('categoryReviews');
+    } catch (err) {
+      console.warn(`   ⚠️  categoryReviews per-match[${match.productIndex || 'primary'}]: ${err.message}`);
+    }
+  } else if (match.categoryReviews?.quotes?.length) {
+    tiers.push('categoryReviews');
   }
 
   // ── Tier 3 — Brand-level reviews (no SKU resolution) ──

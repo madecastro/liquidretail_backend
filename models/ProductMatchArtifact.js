@@ -37,6 +37,14 @@ const productMatchArtifactSchema = new mongoose.Schema({
   // "recommended for you" content even when SKU-level identification missed.
   recommendedProducts: { type: [mongoose.Schema.Types.Mixed], default: [] },
 
+  // Phase 1.7c — category-level reviews snapshot for THIS specific category
+  // (keyed by brandCategory.breadcrumb). Distinct from brandReviews
+  // (overall brand sentiment) and productReviews (specific SKU sentiment).
+  // Fed by categoryReviewsService — cache-aware, may be null on first hit
+  // (background fetch lands on next run). Used by Phase 1.7c category-level
+  // comments and as a fallback quote source for product-level comments.
+  categoryReviews: mongoose.Schema.Types.Mixed,
+
   query:        mongoose.Schema.Types.Mixed,
   // { brand, category, caption, primarySubject, textDetected[] }
 

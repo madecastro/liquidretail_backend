@@ -595,8 +595,9 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
           catalogVisualScore:   m.catalogVisualScore   || null,
           catalogCombinedScore: m.catalogCombinedScore || null,
           productReviews:       m.productReviews || null,
-          enrichmentTiers:      m.enrichmentTiers || [],     // Phase 1.7b
-          recommendedProducts:  m.recommendedProducts || []  // Phase 1.7b
+          categoryReviews:      m.categoryReviews || null,    // Phase 1.7c
+          enrichmentTiers:      m.enrichmentTiers || [],      // Phase 1.7b
+          recommendedProducts:  m.recommendedProducts || []   // Phase 1.7b
         });
         matchDocs.push(doc);
       } catch (err) {

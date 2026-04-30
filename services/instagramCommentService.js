@@ -1,20 +1,31 @@
-// Auto-reply with a comment on the brand's own IG-sourced post when
-// detect produces a confident product_match. Per-brand opt-in
-// (Brand.commentReply.enabled), template-driven copy, daily cap to
-// prevent at-scale spamming.
+// Phase 1.7c — multi-product / multi-tier comment posting.
 //
-// Idempotency: Media.metadata.commentReplyAt is set on success and
-// blocks repeat replies on the same post. Re-running detect on a
-// Media that's already been commented on no-ops.
+// On a confident detect run, post one comment per high-confidence match
+// using the appropriate template tier:
 //
-// Tier ordering (the firing function below):
-//   1. Source check — Media must come from Instagram.
-//   2. Brand opt-in.
-//   3. Match outcome must be 'product_match' AND have a productUrl
-//      to link to (no point commenting "Shop this look:" with no URL).
-//   4. Daily cap.
-//   5. Idempotency.
-//   6. POST the comment via Graph API.
+//   product_match    → product comment    (productName + productUrl + productReviews quote)
+//   product_category → category comment   (breadcrumb + categoryUrl  + categoryReviews quote)
+//   brand_match      → brand comment      (brandName + brandUrl       + brandReviews quote)
+//
+// Progressive fallback ensures we NEVER post a quoteless comment:
+//   product_match → if productReviews quote missing AND brand has fallbackToCategory:
+//                   re-render as category comment with categoryReviews
+//                 → if also missing AND brand has fallbackToBrand:
+//                   re-render as brand comment with brandReviews
+//                 → if STILL missing, skip
+//   product_category → if categoryReviews missing AND fallbackToBrand:
+//                      re-render as brand comment with brandReviews
+//                    → if still missing, skip
+//   brand_match → if brandReviews missing, skip (no further fallback)
+//
+// Per-Media idempotency is per-product (media.metadata.commentReplies[]
+// tracks which productIndex values have been commented on). Re-running
+// detect on a Media that produced new matches surfaces those without
+// double-commenting on existing ones.
+//
+// Daily cap counts COMMENTS posted across all Media for the brand today
+// (was: count of Media commented on). Per-Media cap limits how many
+// comments fire from a single detect run.
 
 const axios = require('axios');
 
@@ -25,133 +36,275 @@ const { decrypt } = require('./integrationCryptoService');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
+const COMMENT_CHAR_LIMIT = 280;
 
-// Renders a comment from the brand's template + match data. Strips
-// unresolved placeholders so we never post literal "{productUrl}".
+// Renders a comment from a template + variables. Strips unresolved
+// placeholders so we never post literal "{productUrl}".
 function renderTemplate(template, vars) {
   return String(template || '')
-    .replace(/\{(productUrl|productName|brandName)\}/g, (_, key) => vars[key] || '')
+    .replace(/\{(productName|productUrl|productQuote|breadcrumb|categoryUrl|categoryQuote|brandName|brandUrl|brandQuote)\}/g, (_, key) => vars[key] || '')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-// Count today's auto-replies on this brand. Compares against daily cap.
-async function repliesToday(brandId) {
+// First quote from a reviews snapshot, truncated to a safe length so the
+// rendered comment fits IG's 280-char ceiling alongside URL + name.
+function pickQuote(reviews, maxChars = 140) {
+  const q = reviews?.quotes?.[0]?.text;
+  if (!q || typeof q !== 'string') return null;
+  const trimmed = q.trim().replace(/^["“]|["”]$/g, '');   // strip surrounding quotes — template re-adds them
+  if (trimmed.length <= maxChars) return trimmed;
+  return trimmed.slice(0, maxChars - 1).trimEnd() + '…';
+}
+
+// Count comments posted today across all Media for this brand. Replaces
+// the legacy "Media commented on today" count — a single multi-product
+// Media now contributes multiple comments to the cap.
+async function commentsPostedToday(brandId) {
   const startOfDay = new Date();
   startOfDay.setUTCHours(0, 0, 0, 0);
-  return Media.countDocuments({
-    brandId,
-    'metadata.commentReplyAt': { $gte: startOfDay }
-  });
+  const result = await Media.aggregate([
+    { $match: { brandId, 'metadata.commentReplies.postedAt': { $gte: startOfDay } } },
+    { $project: {
+        replies: {
+          $filter: {
+            input: { $ifNull: ['$metadata.commentReplies', []] },
+            as:    'r',
+            cond:  { $gte: ['$$r.postedAt', startOfDay] }
+          }
+        }
+      }
+    },
+    { $project: { count: { $size: '$replies' } } },
+    { $group: { _id: null, total: { $sum: '$count' } } }
+  ]);
+  return result[0]?.total || 0;
 }
 
-// Fire-and-forget entry from the detect pipeline. Returns
-//   { posted: true, commentId } on success
-//   { posted: false, reason } on any guard / failure.
-// All errors are caught — never throws — so the detect run never
-// fails because of an opportunistic auto-comment.
+// Has this productIndex on this Media already been commented on?
+function alreadyCommented(media, productIndex) {
+  const replies = media?.metadata?.commentReplies || [];
+  return replies.some(r => r && r.productIndex != null && String(r.productIndex) === String(productIndex));
+}
+
+// Phase 1.7c — main entry point. Iterates productMatch.matches and posts
+// one comment per high-confidence match (with fallback). Keeps the legacy
+// signature so pipelines/detect.js doesn't need updating; extracts
+// matches[] from productMatch when present.
 async function maybePostMatchReply({ media, productMatch }) {
   try {
-    return await tryPostMatchReply({ media, productMatch });
+    return await tryPostMatchReplies({ media, productMatch });
   } catch (err) {
     console.warn(`   ⚠️  comment-reply unexpected error: ${err.message}`);
-    return { posted: false, reason: `unexpected: ${err.message}` };
+    return { posted: 0, results: [], reason: `unexpected: ${err.message}` };
   }
 }
 
-async function tryPostMatchReply({ media, productMatch }) {
-  if (!media || !productMatch) return { posted: false, reason: 'missing inputs' };
-  if (media.source !== 'instagram') return { posted: false, reason: 'not an IG-sourced Media' };
-  if (productMatch.outcome !== 'product_match') return { posted: false, reason: `outcome=${productMatch.outcome}` };
-
-  const productUrl = productMatch.identification?.details?.url
-                  || productMatch.catalogMatch?.product?.productUrl
-                  || null;
-  if (!productUrl) return { posted: false, reason: 'no productUrl on identification' };
-
-  // Idempotency — already commented on this post?
-  if (media.metadata?.commentReplyAt) {
-    return { posted: false, reason: 'already commented on this Media' };
-  }
+async function tryPostMatchReplies({ media, productMatch }) {
+  if (!media || !productMatch) return { posted: 0, results: [], reason: 'missing inputs' };
+  if (media.source !== 'instagram') return { posted: 0, results: [], reason: 'not an IG-sourced Media' };
+  if (!media.brandId) return { posted: 0, results: [], reason: 'Media has no brandId' };
 
   // Brand opt-in.
-  if (!media.brandId) return { posted: false, reason: 'Media has no brandId' };
   const brand = await Brand.findById(media.brandId)
-    .select('name commentReply')
+    .select('name websiteUrl commentReply')
     .lean();
   if (!brand?.commentReply?.enabled) {
-    return { posted: false, reason: 'comment-reply disabled for brand' };
+    return { posted: 0, results: [], reason: 'comment-reply disabled for brand' };
   }
 
-  // Daily cap.
-  const cap = brand.commentReply.dailyCap ?? 25;
-  if (cap > 0) {
-    const todayCount = await repliesToday(media.brandId);
-    if (todayCount >= cap) {
-      console.log(`   · comment-reply: daily cap reached for brand ${brand.name} (${todayCount}/${cap})`);
-      return { posted: false, reason: 'daily cap reached', todayCount, cap };
-    }
-  }
-
-  // Resolve credential — match by IG account that posted this Media.
-  // Today the post sync writes media.metadata.creatorHandle but the
-  // canonical link is the credential whose igUsername matches OR which
-  // owns the IG account this externalId came from. Simplest: pick any
-  // active credential for this brand that has igUserId set; if multi-
-  // page, prefer the one whose username matches the post's creatorHandle.
+  // Resolve credential — prefer the IG account whose username matches
+  // the post's creatorHandle; fall back to first active.
   const creds = await IntegrationCredential.find({
     brandId: media.brandId, type: 'instagram', status: 'active',
     igUserId: { $exists: true, $ne: null }
   });
-  if (!creds.length) return { posted: false, reason: 'no active IG credential' };
+  if (!creds.length) return { posted: 0, results: [], reason: 'no active IG credential' };
   const handle = (media.metadata?.creatorHandle || '').toLowerCase();
   const cred = creds.find(c => (c.igUsername || '').toLowerCase() === handle) || creds[0];
 
-  // Render the comment.
-  const text = renderTemplate(brand.commentReply.template, {
-    productUrl,
-    productName: productMatch.identification?.productName || productMatch.catalogMatch?.product?.title || '',
-    brandName:   brand.name || ''
-  });
-  if (!text) return { posted: false, reason: 'rendered comment is empty' };
-  if (text.length > 280) {
-    // Hard cap on comment length — IG truncates anyway and keeping it
-    // tight avoids accidental novel-comments via misconfigured templates.
-    return { posted: false, reason: 'rendered comment too long (>280 chars)' };
-  }
-
   let token;
   try { token = decrypt(cred.accessTokenEnc); }
-  catch (err) { return { posted: false, reason: `token decrypt failed: ${err.message}` }; }
+  catch (err) { return { posted: 0, results: [], reason: `token decrypt failed: ${err.message}` }; }
 
-  // POST the comment via Graph API.
-  // Endpoint: POST /{ig-media-id}/comments?message=<text>&access_token=<token>
-  let response;
-  try {
-    response = await axios.post(
-      `${META_GRAPH_ROOT}/${media.externalId}/comments`,
-      null,
-      { params: { message: text, access_token: token }, timeout: 15000 }
-    );
-  } catch (err) {
-    const detail = err.response?.data?.error?.message || err.message;
-    console.warn(`   ⚠️  comment-reply POST failed for ${media.externalId}: ${detail}`);
-    return { posted: false, reason: `Meta error: ${detail}` };
+  // Daily cap snapshot at start (re-checked per comment to avoid races).
+  const dailyCap   = brand.commentReply.dailyCap   ?? 25;
+  const perMediaCap = brand.commentReply.perMediaCap ?? 3;
+
+  // Collect commentable matches. matches[] is the new shape; legacy
+  // single-result is wrapped in [productMatch] for backward compat.
+  const matches = Array.isArray(productMatch.matches) && productMatch.matches.length
+    ? productMatch.matches
+    : (productMatch.identification ? [productMatch] : []);
+
+  const commentable = matches.filter(m => isCommentable(m));
+  if (!commentable.length) {
+    return { posted: 0, results: [], reason: 'no commentable matches' };
   }
 
-  const commentId = response.data?.id || null;
-  // Stamp idempotency on Media so we never double-comment.
-  await Media.updateOne(
-    { _id: media._id },
-    { $set: {
-        'metadata.commentReplyAt': new Date(),
-        'metadata.commentReplyId': commentId,
-        'metadata.commentReplyText': text
+  // Per-comment loop. Stops at perMediaCap or dailyCap.
+  const results = [];
+  let postedThisRun = 0;
+  for (const m of commentable) {
+    if (perMediaCap > 0 && postedThisRun >= perMediaCap) {
+      results.push({ productIndex: m.productIndex, posted: false, reason: 'per-Media cap reached this run' });
+      break;
+    }
+    if (alreadyCommented(media, m.productIndex)) {
+      results.push({ productIndex: m.productIndex, posted: false, reason: 'already commented on this productIndex' });
+      continue;
+    }
+    if (dailyCap > 0) {
+      const todayCount = await commentsPostedToday(media.brandId);
+      if (todayCount >= dailyCap) {
+        results.push({ productIndex: m.productIndex, posted: false, reason: 'daily cap reached', todayCount, dailyCap });
+        break;
       }
     }
+
+    const result = await tryPostOneComment({ media, match: m, brand, cred, token });
+    results.push(result);
+    if (result.posted) {
+      postedThisRun++;
+      await stampCommentReply(media._id, {
+        productIndex: m.productIndex,
+        commentLevel: result.commentLevel,
+        commentId:    result.commentId,
+        text:         result.text,
+        postedAt:     new Date()
+      });
+    }
+  }
+
+  console.log(`💬 IG comment-reply: posted ${postedThisRun} comment(s) for ${media.externalId} from ${commentable.length} commentable match(es)`);
+  return { posted: postedThisRun, results };
+}
+
+// Decide whether a match qualifies for a comment.
+// product_match    — needs a productUrl
+// product_category — needs a brandCategory.url
+// brand_match      — needs a brand websiteUrl (resolved at render time)
+function isCommentable(match) {
+  if (!match) return false;
+  if (match.outcome === 'product_match') {
+    return !!(match.identification?.details?.url || match.catalogMatch?.product?.productUrl);
+  }
+  if (match.outcome === 'product_category') {
+    return !!match.brandCategory?.url;
+  }
+  if (match.outcome === 'brand_match') {
+    return true;   // brand_match always has a brand homepage fallback
+  }
+  return false;
+}
+
+// Build + post a single comment with progressive fallback. Returns
+//   { posted, commentId, text, commentLevel, reason }
+async function tryPostOneComment({ media, match, brand, cred, token }) {
+  const fallbackToCategory = brand.commentReply.fallbackToCategory !== false;
+  const fallbackToBrand    = brand.commentReply.fallbackToBrand    !== false;
+  const productIndex = match.productIndex;
+
+  // Try template tiers in order based on outcome + fallback rules.
+  const attempts = [];
+  if (match.outcome === 'product_match') {
+    attempts.push('product');
+    if (fallbackToCategory) attempts.push('category');
+    if (fallbackToBrand)    attempts.push('brand');
+  } else if (match.outcome === 'product_category') {
+    attempts.push('category');
+    if (fallbackToBrand) attempts.push('brand');
+  } else if (match.outcome === 'brand_match') {
+    attempts.push('brand');
+  }
+
+  for (const level of attempts) {
+    const rendered = renderForTier({ level, match, brand });
+    if (!rendered.text) continue;        // missing data for this tier; try next
+
+    if (rendered.text.length > COMMENT_CHAR_LIMIT) {
+      console.warn(`   ⚠️  comment-reply[${productIndex}/${level}] rendered ${rendered.text.length} chars (>280); skipping this tier`);
+      continue;
+    }
+
+    // POST to IG Graph API
+    let resp;
+    try {
+      resp = await axios.post(
+        `${META_GRAPH_ROOT}/${media.externalId}/comments`,
+        null,
+        { params: { message: rendered.text, access_token: token }, timeout: 15000 }
+      );
+    } catch (err) {
+      const detail = err.response?.data?.error?.message || err.message;
+      console.warn(`   ⚠️  comment-reply[${productIndex}/${level}] POST failed: ${detail}`);
+      return { productIndex, posted: false, reason: `Meta error: ${detail}` };
+    }
+
+    const commentId = resp.data?.id || null;
+    console.log(`💬 comment-reply[${productIndex}/${level}] posted on ${media.externalId} → ${commentId}: "${rendered.text}"`);
+    return {
+      productIndex,
+      posted:       true,
+      commentId,
+      commentLevel: level,
+      text:         rendered.text
+    };
+  }
+
+  return { productIndex, posted: false, reason: 'no tier had usable data (no quote, no URL, or all skipped)' };
+}
+
+// Render a comment for a specific tier. Returns { text } or { text: null }
+// if this tier doesn't have the data it needs (caller falls through to
+// the next tier in the chain).
+function renderForTier({ level, match, brand }) {
+  const ident = match.identification || {};
+  const brandName = brand.name || ident.brand || '';
+
+  if (level === 'product') {
+    const productUrl = ident.details?.url || match.catalogMatch?.product?.productUrl;
+    const productName = ident.productName || match.catalogMatch?.product?.title || '';
+    const productQuote = pickQuote(match.productReviews);
+    if (!productUrl || !productQuote) return { text: null };
+    return {
+      text: renderTemplate(brand.commentReply.templateProduct || brand.commentReply.template, {
+        productUrl, productName, brandName, productQuote
+      })
+    };
+  }
+
+  if (level === 'category') {
+    const categoryUrl = match.brandCategory?.url;
+    const breadcrumb  = match.brandCategory?.breadcrumb || '';
+    const categoryQuote = pickQuote(match.categoryReviews);
+    if (!categoryUrl || !categoryQuote) return { text: null };
+    return {
+      text: renderTemplate(brand.commentReply.templateCategory, {
+        categoryUrl, breadcrumb, brandName, categoryQuote
+      })
+    };
+  }
+
+  if (level === 'brand') {
+    const brandUrl = brand.websiteUrl || match.identification?.details?.url;
+    const brandQuote = pickQuote(match.brandReviews);
+    if (!brandUrl || !brandQuote) return { text: null };
+    return {
+      text: renderTemplate(brand.commentReply.templateBrand, {
+        brandUrl, brandName, brandQuote
+      })
+    };
+  }
+
+  return { text: null };
+}
+
+async function stampCommentReply(mediaId, entry) {
+  await Media.updateOne(
+    { _id: mediaId },
+    { $push: { 'metadata.commentReplies': entry } }
   );
-  console.log(`💬 comment-reply posted on ${media.externalId} → comment=${commentId}: "${text}"`);
-  return { posted: true, commentId, text };
 }
 
 module.exports = { maybePostMatchReply };

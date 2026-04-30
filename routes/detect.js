@@ -257,6 +257,7 @@ async function assembleResult(run) {
       brandCategory:        m.brandCategory || null,
       brandReviews:         m.brandReviews || null,
       productReviews:       m.productReviews || null,
+      categoryReviews:      m.categoryReviews || null,
       enrichmentTiers:      m.enrichmentTiers || [],
       recommendedProducts:  m.recommendedProducts || []
     })),
