@@ -65,9 +65,9 @@ const PROVIDERS = [
 // CATEGORY_BAND  — when at least one signal lands in (LOW, HIGH) range
 //                 we fall back to product_category.
 const PRODUCT_FLOOR    = 0.70;
-const HIGH_CONFIDENCE  = 0.85;
+const HIGH_CONFIDENCE  = 0.80;
 const CATEGORY_LOWER   = 0.69;   // > 0.69 (i.e. ≥ 0.70 effectively)
-const CATEGORY_UPPER   = 0.84;   // ≤ 0.84
+const CATEGORY_UPPER   = 0.79;   // ≤ 0.79
 
 async function findProductMatches({
   brand, category, caption, primarySubject, textDetected, imageUrl,
@@ -733,13 +733,16 @@ async function enrichOneMatchInPlace(match, ctx) {
         url:              match.brandCategory.url || null,
         firstSeenMediaId: ctx.mediaId || null
       });
-      // Backfill CatalogProduct.categoryRef when both ends now exist —
-      // ensures the leaf Category row's relatedProducts list builds up
-      // and the catalog row's relational link is set for future queries.
+      // Backfill CatalogProduct.categoryRef + category string when both ends
+      // now exist. ensureCatalogProductForMatch runs BEFORE category
+      // resolution, so the catalog row was created with the freeform query
+      // category (e.g. "apparel"); replace it with the breadcrumb leaf
+      // (e.g. "Mens > Tops > Hooded Performance Shirts") now that we have it.
       if (match.catalogProductId && match.categoryId) {
+        const breadcrumb = match.brandCategory?.breadcrumb || null;
         await CatalogProduct.updateOne(
           { _id: match.catalogProductId, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
-          { $set: { categoryRef: match.categoryId } }
+          { $set: { categoryRef: match.categoryId, ...(breadcrumb ? { category: breadcrumb } : {}) } }
         );
         await Category.updateOne(
           { _id: match.categoryId },
@@ -1051,7 +1054,19 @@ function aggregateDetectSummary(matches, activeBrand) {
 
 function brandsMatchLoose(a, b) {
   if (!a || !b) return false;       // require BOTH brands present for an own-vs-competitor decision
-  return normalizeBrand(a) === normalizeBrand(b);
+  const na = normalizeBrand(a);
+  const nb = normalizeBrand(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // Tolerate the common "short-name vs full-name" pattern: provider returns
+  // "Pelagic" while the active brand is "Pelagic Gear" (or vice versa).
+  // Match when one normalized form is a whole-token prefix of the other —
+  // but require ≥4 chars on the shorter side so a 3-letter coincidence
+  // (e.g. "Tom" matching "Tom Brown's School") doesn't sneak through.
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer  = na.length <= nb.length ? nb : na;
+  if (shorter.length < 4) return false;
+  return longer.startsWith(shorter + ' ');
 }
 
 function normalizeBrand(s) {
@@ -1518,20 +1533,15 @@ async function ensureCatalogProductForMatch(match, ctx) {
   if (!ident?.productName) return null;
   if (!ctx.brandId) return null;
 
-  // Brand-mismatch guard. Use the same loose normalize as Phase 1.7
-  // detectSummary aggregation.
   const activeBrand = ctx.brand;
   const identBrand  = ident.brand;
-  if (identBrand && activeBrand && !brandsMatchLoose(identBrand, activeBrand)) {
-    console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: brand mismatch (${identBrand} ≠ ${activeBrand}) — skipping (competitor)`);
-    return null;
-  }
-
   const slug = slugify(ident.productName);
   if (!slug) return null;
   const detectExternalId = `detect:${ctx.mediaId || 'unknown'}:${slug}`;
 
-  // 1. Exact externalId match (this Media + this productName already created a row)
+  // 1. Exact externalId match — runs BEFORE brand-mismatch guard so a row
+  //    we created on a prior run still resolves (the guard only governs
+  //    NEW row creation, not FK reuse for already-linked products).
   let existing = await CatalogProduct.findOne({
     brandId:    ctx.brandId,
     externalId: detectExternalId
@@ -1554,6 +1564,13 @@ async function ensureCatalogProductForMatch(match, ctx) {
   if (existing) {
     console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: existing row by title (source=${existing.source}) → ${existing._id}`);
     return existing._id;
+  }
+
+  // Brand-mismatch guard — gates NEW row creation only. Existing rows above
+  // are returned regardless so FK propagation works on subsequent runs.
+  if (identBrand && activeBrand && !brandsMatchLoose(identBrand, activeBrand)) {
+    console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: brand mismatch (${identBrand} ≠ ${activeBrand}) — skipping creation (competitor)`);
+    return null;
   }
 
   // 3. Create a new detect-identified row. Draft state is gated by the

@@ -44,7 +44,9 @@ const { identifyYoloDetectionsGemini, isEnabled: isGeminiIdentifyEnabled } = req
 const { reconcileEnrichments } = require('../services/enrichmentReconciler');
 const { refineDetectionCrops } = require('../services/cropRefineService');
 const { maybePostMatchReply } = require('../services/instagramCommentService');
-const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
+// Phase 2b: per-match draft creation now lives in productMatchService.
+// catalogProductDraftService is kept only for the manual Upload-7 escape
+// hatch (routes/media.js).
 // Brand catalog mutations no longer happen inside the detect pipeline
 // — Brand creation + enrichment is a user-driven concern triggered by
 // POST /api/brand (or PATCH /api/brand/:id). Detect can still
@@ -205,21 +207,14 @@ async function runImagePipeline(run, media, buffer) {
       .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
   }
 
-  // Upload-4 — when this brand opted into autoCreateFromDetect AND
-  // the match was confident AND no existing catalog row won, write a
-  // draft CatalogProduct so the SKU shows up in the brand's catalog
-  // for completion (price + productUrl). Fire-and-forget; the service
-  // guards on opt-in / outcome / certainty internally.
-  if (productMatches) {
-    maybeCreateDraftFromMatch({
-      media,
-      productMatch:  productMatches,
-      sceneImageUrl: sourceUrl,
-      yoloProducts:  products
-    }).catch(err => console.warn(`   ⚠️  draft auto-create async failure: ${err.message}`));
-  }
-
   // ── Finalize ──
+  // Phase 2b note: per-match draft CatalogProduct creation now happens
+  // inside productMatchService.enrichOneMatchInPlace (ensureCatalog-
+  // ProductForMatch). The legacy maybeCreateDraftFromMatch path was
+  // creating rows AFTER per-match enrichment, so the FK never propagated
+  // back to ProductMatchArtifact / Media.matchedProducts. Removed here;
+  // routes/media.js still uses the legacy service for the manual
+  // Upload-7 "Save as draft" escape hatch.
   await setRunPhase(run, 'finalize');
   await updateMediaLatestArtifacts(media, {
     detection:    detectionDoc._id,
@@ -394,16 +389,9 @@ async function runVideoPipeline(run, media, buffer) {
     maybePostMatchReply({ media, productMatch: productMatches })
       .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
   }
-  if (productMatches) {
-    maybeCreateDraftFromMatch({
-      media,
-      productMatch:  productMatches,
-      sceneImageUrl: heroImageUrl,
-      yoloProducts:  products
-    }).catch(err => console.warn(`   ⚠️  draft auto-create async failure: ${err.message}`));
-  }
-
   // ── Finalize ──
+  // Phase 2b — per-match draft creation moved into productMatchService.
+  // See note in the image pipeline above for rationale.
   await setRunPhase(run, 'finalize');
   await updateMediaLatestArtifacts(media, {
     detection:    detectionDoc._id,

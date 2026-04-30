@@ -130,9 +130,9 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
   const prompt = buildPrompt(ratio);
 
   try {
-    const res = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
-      {
+    const res = await postWithRetry({
+      url: `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+      body: {
         contents: [{
           role: 'user',
           parts: [
@@ -152,8 +152,9 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
           responseSchema: RESPONSE_SCHEMA
         }
       },
-      { timeout: 60000 }
-    );
+      timeout: 60000,
+      label
+    });
 
     const candidate = res.data?.candidates?.[0];
     const text = candidate?.content?.parts?.[0]?.text;
@@ -218,6 +219,33 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
     console.warn(`   ⚠️  overlay-zones[${label}] failed in ${Date.now() - t0}ms: ${detail}`);
     return null;
   }
+}
+
+// Gemini occasionally returns 429/503 with "model is currently experiencing
+// high demand" during overlay-zone fan-out (5 ratios in parallel hits the
+// rate limiter). Treat these as transient and retry with exponential
+// backoff + jitter. Hard errors (auth, malformed request) fail through
+// immediately — only retry on overload-class signals.
+async function postWithRetry({ url, body, timeout, label, maxAttempts = 3 }) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await axios.post(url, body, { timeout });
+    } catch (err) {
+      lastErr = err;
+      const status = err.response?.status;
+      const msg = err.response?.data?.error?.message || err.message || '';
+      const transient = status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+                     || /high demand|overloaded|rate limit|temporarily/i.test(msg);
+      if (!transient || attempt === maxAttempts) throw err;
+      const baseMs = 1000 * Math.pow(2, attempt - 1);     // 1s, 2s, 4s
+      const jitterMs = Math.floor(Math.random() * 500);
+      const waitMs = baseMs + jitterMs;
+      console.warn(`   · overlay-zones[${label}]: transient (${status || 'net'}) — retry ${attempt}/${maxAttempts - 1} in ${waitMs}ms`);
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
 }
 
 function buildPrompt(ratio) {

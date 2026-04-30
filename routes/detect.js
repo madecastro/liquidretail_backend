@@ -9,6 +9,8 @@ const CropArtifact        = require('../models/CropArtifact');
 const ExtendedCropArtifact = require('../models/ExtendedCropArtifact');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact  = require('../models/OverlayZoneArtifact');
+const CatalogProduct       = require('../models/CatalogProduct');
+const Category             = require('../models/Category');
 
 // Legacy Job model — used only by the pre-cropped → inventory bridge path.
 const Job = require('../models/Job');
@@ -196,6 +198,21 @@ async function assembleResult(run) {
   });
   const match = rankedMatches[0] || null;
 
+  // Phase 2g — batch-fetch canonical FK data so consumers can read the
+  // current source of truth alongside the legacy artifact snapshots.
+  // Snapshots stay in the response for backward compat; new fields
+  // `catalog` and `categoryDoc` carry the live CatalogProduct + Category
+  // rows. Drift between snapshot and canonical = artifact is older than
+  // the latest write-through (expected; snapshots are per-run audit).
+  const catalogIds = [...new Set(rankedMatches.map(m => m.catalogProductId).filter(Boolean).map(String))];
+  const categoryIds = [...new Set(rankedMatches.map(m => m.categoryId).filter(Boolean).map(String))];
+  const [catalogDocs, categoryDocs] = await Promise.all([
+    catalogIds.length ? CatalogProduct.find({ _id: { $in: catalogIds } }).lean() : [],
+    categoryIds.length ? Category.find({ _id: { $in: categoryIds } }).lean() : []
+  ]);
+  const catalogById = new Map(catalogDocs.map(d => [String(d._id), d]));
+  const categoryById = new Map(categoryDocs.map(d => [String(d._id), d]));
+
   const stageTimings = run.stageTimings && typeof run.stageTimings.toObject === 'function'
     ? run.stageTimings.toObject()
     : (run.stageTimings || {});
@@ -251,6 +268,7 @@ async function assembleResult(run) {
       winner:               m.winner || null,
       matchSource:          m.matchSource || null,
       catalogProductId:     m.catalogProductId || null,
+      categoryId:           m.categoryId || null,
       catalogMatch:         m.catalogMatch || null,
       catalogVisualScore:   m.catalogVisualScore   ?? null,
       catalogCombinedScore: m.catalogCombinedScore ?? null,
@@ -259,7 +277,11 @@ async function assembleResult(run) {
       productReviews:       m.productReviews || null,
       categoryReviews:      m.categoryReviews || null,
       enrichmentTiers:      m.enrichmentTiers || [],
-      recommendedProducts:  m.recommendedProducts || []
+      recommendedProducts:  m.recommendedProducts || [],
+      // Phase 2g — populated FK data (canonical source of truth).
+      // Consumers should prefer these over the snapshot fields above.
+      catalog:     m.catalogProductId ? (catalogById.get(String(m.catalogProductId)) || null) : null,
+      categoryDoc: m.categoryId       ? (categoryById.get(String(m.categoryId))       || null) : null
     })),
 
     // Phase 0a — Media classification block (provenance + run-scoped detect summary)

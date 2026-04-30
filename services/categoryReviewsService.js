@@ -220,12 +220,15 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
-    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null" }, 3-6 entries ],\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null" } ],\n` +
     `  "rating":      <number 0-5 or null>,\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall sentiment about this category"\n` +
     `}\n` +
-    `Use direct quotes verbatim from the narrative; do NOT paraphrase or invent quotes.`;
+    `QUOTE RULES (strict):\n` +
+    `- Each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative does not contain any verbatim customer quotes (e.g. it only summarizes sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments and label them as quotes, do NOT paraphrase, do NOT invent.\n` +
+    `- A real quote describes the customer's experience in their own voice (e.g. "best fishing shirt I've ever owned", "fits perfectly even on long offshore trips"). Meta-commentary about reviews ("category receives positive feedback", "reviewers note good comfort") is NOT a quote — exclude it.\n` +
+    `- Acceptable to return zero quotes. Better to return none than fakes.`;
 
   let structRes;
   try {
@@ -243,7 +246,7 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     );
   } catch (err) {
     console.warn(`   ⚠️  categoryReviews structuring failed: ${err.message}`);
-    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), sources: sourceDomains };
+    return { quotes: [], rating: null, reviewCount: null, summary: firstSentences(narrative, 2), sources: sourceDomains };
   }
 
   const text = (structRes.data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
@@ -254,11 +257,29 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
   }
   if (!parsed) {
-    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), sources: sourceDomains };
+    return { quotes: [], rating: null, reviewCount: null, summary: firstSentences(narrative, 2), sources: sourceDomains };
+  }
+
+  // Substring-validate quotes against the narrative — drop anything the
+  // model fabricated by chopping the summary into clauses (the failure mode
+  // we hit on the first smoke test). Match is whitespace-insensitive.
+  const narrNorm = narrative.toLowerCase().replace(/\s+/g, ' ').trim();
+  const validatedQuotes = (Array.isArray(parsed.quotes) ? parsed.quotes : [])
+    .filter(q => q?.text && typeof q.text === 'string')
+    .filter(q => {
+      const qNorm = q.text.toLowerCase().replace(/\s+/g, ' ').trim();
+      // Require both substring presence AND minimum length so 1-2 word
+      // clause-fragments ("comfort", "sun protection") get filtered out.
+      return qNorm.length >= 15 && narrNorm.includes(qNorm);
+    })
+    .slice(0, 6);
+  const droppedCount = (Array.isArray(parsed.quotes) ? parsed.quotes.length : 0) - validatedQuotes.length;
+  if (droppedCount > 0) {
+    console.log(`   · categoryReviews: dropped ${droppedCount} non-verbatim quote(s) for "${breadcrumb}"`);
   }
 
   const result = {
-    quotes:      Array.isArray(parsed.quotes) ? parsed.quotes.slice(0, 6).filter(q => q?.text) : [],
+    quotes:      validatedQuotes,
     rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
     reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
     summary:     parsed.summary || null,
@@ -266,6 +287,14 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
   };
   console.log(`   ✓ categoryReviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''} for "${breadcrumb}" (${Date.now() - t0}ms)`);
   return result;
+}
+
+// Sentence-boundary truncation — replaces brittle .slice(0, 200) which
+// cut mid-word. Returns up to N sentences from the start of the narrative.
+function firstSentences(s, n = 2) {
+  if (!s) return null;
+  const sentences = String(s).match(/[^.!?]+[.!?]+(\s|$)/g) || [String(s)];
+  return sentences.slice(0, n).join('').trim() || null;
 }
 
 function extractDomain(url) {

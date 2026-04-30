@@ -20,7 +20,7 @@ const CatalogProduct = require('../models/CatalogProduct');
 // Match the productMatchService HIGH_CONFIDENCE constant — same
 // threshold that makes a match "confident enough" for ad creative is
 // the same threshold that makes it "confident enough" to draft.
-const HIGH_CONFIDENCE = 0.85;
+const HIGH_CONFIDENCE = 0.80;
 
 // `force: true` bypasses the certainty threshold + brand opt-in
 // soft guards. Used by the Upload-7 manual "Save as draft product"
