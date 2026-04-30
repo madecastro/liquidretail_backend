@@ -45,10 +45,13 @@ function reconcileOne(det) {
 }
 
 function mergeProducts(gptProducts, geminiProducts, geminiUnavail) {
-  const matched = new Set();   // indices in geminiProducts already matched
+  const matched = new Set();         // indices in geminiProducts already merged
+  const gptUnmatched = [];            // GPT products not paired in pass 1
   const out = [];
 
-  // Pass 1 — for each GPT product, find the best Gemini match (if any).
+  // ── Pass 1 — strict SKU-level agreement (label-token Jaccard ≥ 0.5) ──
+  // Both engines see the SAME product at the SAME specificity. Confidence
+  // gets the agreement boost.
   for (const g of gptProducts) {
     let bestIdx = -1;
     let bestOverlap = 0;
@@ -62,26 +65,56 @@ function mergeProducts(gptProducts, geminiProducts, geminiUnavail) {
         bestOverlap = overlap;
       }
     }
-
     if (bestIdx >= 0) {
       matched.add(bestIdx);
-      const gem = geminiProducts[bestIdx];
-      out.push(buildAgreedProduct(g, gem));
-    } else if (geminiUnavail) {
-      // Gemini didn't run at all — passthrough with penalty so it's not
-      // mistakenly treated as a confirmed dual-engine signal.
-      out.push(buildSingleEngineProduct(g, 'gpt-only', 'gemini call unavailable'));
+      out.push(buildAgreedProduct(g, geminiProducts[bestIdx]));
     } else {
-      // Gemini ran but didn't see this product — could mean it's noise OR
-      // it's a real product Gemini missed. Penalty + flag for review.
-      out.push(buildSingleEngineProduct(g, 'gpt-only', 'GPT identified; Gemini did not'));
+      gptUnmatched.push(g);
     }
   }
 
-  // Pass 2 — Gemini products GPT didn't see.
+  // ── Pass 2 — category-confirmed agreement ──
+  // GPT and Gemini agree on (brand, category) but their LABELS differ in
+  // specificity — the classic "GPT says 'fishing shirt', Gemini says
+  // 'Aquatek Icon Sunshirt'" case. They're describing the same item at
+  // different resolutions; not competing interpretations.
+  //
+  // Both engines confirm at category level, so NO single-engine penalty.
+  // The more specific label becomes primary; the broader label is preserved
+  // as `categoryLabel` so Phase 1.7 catalog-first matching can use it as a
+  // fallback query when the specific label doesn't catalog-match.
+  for (const g of gptUnmatched) {
+    let bestIdx = -1;
+    let bestConf = 0;
+    for (let i = 0; i < geminiProducts.length; i++) {
+      if (matched.has(i)) continue;
+      if (!sameBrandAndCategory(g, geminiProducts[i])) continue;
+      const c = geminiProducts[i].confidence || 0;
+      if (c > bestConf) {
+        bestIdx = i;
+        bestConf = c;
+      }
+    }
+    if (bestIdx >= 0) {
+      matched.add(bestIdx);
+      out.push(buildCategoryConfirmedProduct(g, geminiProducts[bestIdx]));
+    } else if (geminiUnavail) {
+      // Gemini didn't run at all — single-engine penalty applies.
+      out.push(buildSingleEngineProduct(g, 'gpt-only', 'gemini call unavailable'));
+    } else {
+      // Gemini ran but neither matched at SKU level nor at brand+category
+      // level — this product is GPT's alone. Penalty stands.
+      out.push(buildSingleEngineProduct(g, 'gpt-only', 'GPT identified; Gemini did not corroborate at brand/category'));
+    }
+  }
+
+  // ── Pass 3 — Gemini products with no GPT pairing ──
+  // Same logic: if GPT had a brand+category match available, pass 2 caught
+  // it. Reaching pass 3 means Gemini saw a product GPT didn't — single
+  // engine penalty applies.
   for (let i = 0; i < geminiProducts.length; i++) {
     if (matched.has(i)) continue;
-    out.push(buildSingleEngineProduct(geminiProducts[i], 'gemini-only', 'Gemini identified; GPT did not'));
+    out.push(buildSingleEngineProduct(geminiProducts[i], 'gemini-only', 'Gemini identified; GPT did not corroborate'));
   }
 
   // Sort by confidence desc — primary product (alias target) is index 0.
@@ -104,6 +137,35 @@ function buildAgreedProduct(gpt, gemini) {
     sourceEngines: ['gpt', 'gemini'],
     agreement:    'agree',
     reasoning:    `both engines identified ${moreSpecific.label}`
+  };
+}
+
+// Engines confirm same brand+category but at different label specificity.
+// One says the broader category ("fishing shirt"), the other names the
+// specific SKU ("Aquatek Icon Sunshirt"). Both are valid signals about the
+// same product family — preserve the SKU as primary and the broader label
+// as `categoryLabel` (downstream catalog-first match can fall back to the
+// broader label when the specific one doesn't catalog-match).
+//
+// Confidence: max of the two raw values, NO single-engine penalty (both
+// engines did corroborate, just at different specificities). NO agreement
+// boost either — this is weaker than a full SKU-level agreement.
+function buildCategoryConfirmedProduct(gpt, gemini) {
+  const gptLen = (gpt.label || '').length;
+  const gemLen = (gemini.label || '').length;
+  const isGemMoreSpecific = gemLen > gptLen;
+  const specific = isGemMoreSpecific ? gemini : gpt;
+  const broader  = isGemMoreSpecific ? gpt    : gemini;
+  return {
+    label:         specific.label,
+    categoryLabel: broader.label && broader.label !== specific.label ? broader.label : null,
+    description:   specific.description || broader.description || '',
+    brand:         specific.brand || broader.brand || null,
+    category:      specific.category || broader.category || 'other',
+    confidence:    Math.max(specific.confidence || 0, broader.confidence || 0),
+    sourceEngines: ['gpt', 'gemini'],
+    agreement:     'category-confirmed',
+    reasoning:     `engines confirm same brand+category; ${isGemMoreSpecific ? 'Gemini' : 'GPT'} specified "${specific.label}", ${isGemMoreSpecific ? 'GPT' : 'Gemini'} provided category-level "${broader.label}"`
   };
 }
 
@@ -132,6 +194,13 @@ function productsLikelySame(a, b) {
   const cb = (b.category || 'other').toLowerCase();
   if (ca !== 'other' && cb !== 'other' && ca !== cb) return false;
   return true;
+}
+
+// Same brand AND same category — used by pass 2 (category-confirmed). Same
+// criteria as productsLikelySame but separated for naming clarity. Allows
+// label-level disagreement; just needs brand + category alignment.
+function sameBrandAndCategory(a, b) {
+  return productsLikelySame(a, b);
 }
 
 function brandsMatchLoose(a, b) {

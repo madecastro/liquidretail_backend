@@ -429,16 +429,18 @@ async function runYoloChain(run, buffer, media) {
       reconcileEnrichments(products);
       const summary = products.reduce((acc, d) => {
         const r = d.engines?.reconciled?.products || [];
-        acc.totalProducts += r.length;
-        acc.agreed       += r.filter(p => p.agreement === 'agree').length;
-        acc.gptOnly      += r.filter(p => p.agreement === 'gpt-only').length;
-        acc.geminiOnly   += r.filter(p => p.agreement === 'gemini-only').length;
+        acc.totalProducts    += r.length;
+        acc.agreed           += r.filter(p => p.agreement === 'agree').length;
+        acc.categoryConfirmed += r.filter(p => p.agreement === 'category-confirmed').length;
+        acc.gptOnly          += r.filter(p => p.agreement === 'gpt-only').length;
+        acc.geminiOnly       += r.filter(p => p.agreement === 'gemini-only').length;
         return acc;
-      }, { totalProducts: 0, agreed: 0, gptOnly: 0, geminiOnly: 0 });
+      }, { totalProducts: 0, agreed: 0, categoryConfirmed: 0, gptOnly: 0, geminiOnly: 0 });
       console.log(
         `🏷️   YOLO identify (dual-engine): ${products.length} crop(s) → ` +
         `${summary.totalProducts} reconciled product(s) ` +
-        `[${summary.agreed} agreed, ${summary.gptOnly} gpt-only, ${summary.geminiOnly} gemini-only]`
+        `[${summary.agreed} agreed, ${summary.categoryConfirmed} category-confirmed, ` +
+        `${summary.gptOnly} gpt-only, ${summary.geminiOnly} gemini-only]`
       );
     });
   }
