@@ -45,6 +45,13 @@ const productMatchArtifactSchema = new mongoose.Schema({
   // comments and as a fallback quote source for product-level comments.
   categoryReviews: mongoose.Schema.Types.Mixed,
 
+  // Phase 2a — FK to the matched leaf Category row (when brandCategory
+  // breadcrumb resolved). Lets consumers join through to category-owned
+  // data (categoryReviews, url, related products) instead of relying on
+  // the snapshotted brandCategory + categoryReviews fields above. The
+  // snapshots stay during migration as a deprecated read fallback.
+  categoryId: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null, index: true },
+
   query:        mongoose.Schema.Types.Mixed,
   // { brand, category, caption, primarySubject, textDetected[] }
 

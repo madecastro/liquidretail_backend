@@ -552,6 +552,7 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
         brandUrl:       media.metadata?.brandUrl,
         advertiserId:   media.advertiserId || null,
         brandId:        media.brandId || null,
+        mediaId:        media._id,                // Phase 2a/2b — for Category.firstSeenMediaId + catalog detectedFromMediaId
         category:       media.metadata?.category,
         caption:        media.metadata?.caption,
         primarySubject: primarySubjectDesc,
@@ -596,6 +597,7 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
           catalogCombinedScore: m.catalogCombinedScore || null,
           productReviews:       m.productReviews || null,
           categoryReviews:      m.categoryReviews || null,    // Phase 1.7c
+          categoryId:           m.categoryId || null,          // Phase 2a — FK to Category leaf
           enrichmentTiers:      m.enrichmentTiers || [],      // Phase 1.7b
           recommendedProducts:  m.recommendedProducts || []   // Phase 1.7b
         });

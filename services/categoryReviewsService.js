@@ -18,7 +18,9 @@
 //   - Phase 1.7c instagramCommentService category-level comment quotes
 
 const axios = require('axios');
-const Brand = require('../models/Brand');
+const Brand    = require('../models/Brand');
+const Category = require('../models/Category');
+const { breadcrumbToKey } = require('../models/Category');
 
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
 const ENDPOINT     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -26,74 +28,134 @@ const TTL_MS       = 30 * 24 * 60 * 60 * 1000;  // 30 days
 
 function isEnabled() { return !!process.env.GEMINI_API_KEY; }
 
-// Normalize a breadcrumb path for cache key purposes. "Mens > Tops > Performance Shirts"
-// and "Mens>Tops>Performance Shirts" should hash to the same key.
-function categoryKey(breadcrumb) {
-  return String(breadcrumb || '').toLowerCase()
-    .replace(/[^a-z0-9>]+/g, ' ')
-    .replace(/\s*>\s*/g, '>')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-// Cache-aware resolver. Fresh hit → returns now. Miss/stale → fires
-// background fetch + writes Brand.categoryReviews; returns null so the
-// current detect run finishes fast (the cached result lands on the next run).
-async function maybeFetchCategoryReviewsCached({ brandId, brandName, brandUrl, breadcrumb }) {
+// Cache-aware resolver. Phase 2a — reads from the Category collection
+// (one row per breadcrumb per brand). Falls back to legacy
+// Brand.categoryReviews[] subarray during migration so old runs that
+// pre-date Category-collection writes still resolve.
+//
+// Fresh hit → returns the cached snapshot now. Miss/stale → fires
+// background fetch + writes the Category row; returns null so the
+// current detect run finishes fast (cached result lands on next run).
+async function maybeFetchCategoryReviewsCached({ brandId, brandName, brandUrl, breadcrumb, categoryId = null }) {
   if (!brandId || !breadcrumb) return null;
-  const key = categoryKey(breadcrumb);
+  const key = breadcrumbToKey(breadcrumb);
   if (!key) return null;
 
-  const brand = await Brand.findById(brandId).select('name websiteUrl categoryReviews').lean();
-  if (!brand) return null;
-
-  // Cache hit?
-  const existing = (brand.categoryReviews || []).find(c => c.categoryKey === key);
-  if (existing) {
-    const fetchedAt = existing.fetchedAt ? new Date(existing.fetchedAt).getTime() : 0;
+  // Phase 2a primary read — Category collection by FK or breadcrumbKey.
+  let categoryRow = null;
+  if (categoryId) {
+    categoryRow = await Category.findById(categoryId).select('breadcrumb categoryReviews').lean();
+  }
+  if (!categoryRow) {
+    categoryRow = await Category.findOne({ brandId, breadcrumbKey: key }).select('breadcrumb categoryReviews').lean();
+  }
+  if (categoryRow?.categoryReviews) {
+    const r = categoryRow.categoryReviews;
+    const fetchedAt = r.fetchedAt ? new Date(r.fetchedAt).getTime() : 0;
     if (fetchedAt && Date.now() - fetchedAt < TTL_MS) {
-      return existing;
+      return r;
     }
   }
 
-  // Miss — fire background fetch; don't block the current run.
+  // Backward-compat fallback — read legacy Brand.categoryReviews[] subarray
+  // (will be removed in a follow-up after backfill migrates entries to Category rows).
+  const brand = await Brand.findById(brandId).select('name websiteUrl categoryReviews').lean();
+  if (!brand) return null;
+
+  const legacyEntry = (brand.categoryReviews || []).find(c => c.categoryKey === key);
+  if (legacyEntry?.fetchedAt) {
+    const fetchedAt = new Date(legacyEntry.fetchedAt).getTime();
+    if (Date.now() - fetchedAt < TTL_MS) {
+      // Lazy-promote the legacy entry into the Category collection on read
+      // so we stop reading the legacy array next time. Fire-and-forget.
+      promoteLegacyCategoryReviews({ brandId, breadcrumb, key, entry: legacyEntry })
+        .catch(err => console.warn(`   ⚠️  legacy categoryReviews promotion failed: ${err.message}`));
+      return legacyEntry;
+    }
+  }
+
+  // Stale or missing — fire background fetch.
   fetchAndCache({
     brandId,
     brandName: brandName || brand.name,
     brandUrl:  brandUrl  || brand.websiteUrl,
     breadcrumb,
-    key
+    categoryId
   }).catch(err => console.warn(`   ⚠️  categoryReviews background fetch failed: ${err.message}`));
   return null;
 }
 
-async function fetchAndCache({ brandId, brandName, brandUrl, breadcrumb, key }) {
+// Lazy migration: when we find a legacy Brand.categoryReviews[] entry on
+// read, promote it into the Category collection so subsequent reads use
+// the new path. Idempotent — only writes if the Category row doesn't
+// already have categoryReviews populated.
+async function promoteLegacyCategoryReviews({ brandId, breadcrumb, key, entry }) {
+  const Category = require('../models/Category');
+  const { findOrCreateCategoryTree } = Category;
+  const leafId = await findOrCreateCategoryTree({ brandId, breadcrumb });
+  if (!leafId) return;
+  await Category.updateOne(
+    { _id: leafId, $or: [{ categoryReviews: null }, { categoryReviews: { $exists: false } }] },
+    { $set: { categoryReviews: {
+      summary:     entry.summary || null,
+      quotes:      entry.quotes  || [],
+      rating:      entry.rating  ?? null,
+      reviewCount: entry.reviewCount ?? null,
+      sources:     entry.sources || [],
+      fetchedAt:   entry.fetchedAt
+    }}}
+  );
+}
+
+async function fetchAndCache({ brandId, brandName, brandUrl, breadcrumb, categoryId }) {
   const fresh = await fetchCategoryReviews({ brandName, brandUrl, breadcrumb });
   if (!fresh) return null;
 
-  // Upsert into the array. Replace existing entry for this category key.
-  await Brand.updateOne(
-    { _id: brandId },
-    {
-      $pull: { categoryReviews: { categoryKey: key } }
-    }
-  );
-  await Brand.updateOne(
-    { _id: brandId },
-    {
-      $push: {
+  // Phase 2a — write to Category row. Resolve the leaf id (find-or-create
+  // the tree) and set categoryReviews directly.
+  let leafId = categoryId;
+  if (!leafId) {
+    const { findOrCreateCategoryTree } = Category;
+    leafId = await findOrCreateCategoryTree({ brandId, breadcrumb });
+  }
+  if (leafId) {
+    await Category.updateOne(
+      { _id: leafId },
+      { $set: {
         categoryReviews: {
-          categoryKey: key,
-          breadcrumb,
           summary:     fresh.summary,
           quotes:      fresh.quotes || [],
           rating:      fresh.rating ?? null,
           reviewCount: fresh.reviewCount ?? null,
           sources:     fresh.sources || [],
           fetchedAt:   new Date()
-        }
+        },
+        lastSeenAt: new Date()
+      }}
+    );
+  }
+
+  // Backward-compat — also write to legacy Brand.categoryReviews[] until
+  // backfill migrates remaining consumers. Idempotent: replace existing
+  // entry for this categoryKey.
+  await Brand.updateOne(
+    { _id: brandId },
+    { $pull: { categoryReviews: { categoryKey: breadcrumbToKey(breadcrumb) } } }
+  );
+  await Brand.updateOne(
+    { _id: brandId },
+    { $push: {
+      categoryReviews: {
+        categoryKey: breadcrumbToKey(breadcrumb),
+        breadcrumb,
+        summary:     fresh.summary,
+        quotes:      fresh.quotes || [],
+        rating:      fresh.rating ?? null,
+        reviewCount: fresh.reviewCount ?? null,
+        sources:     fresh.sources || [],
+        fetchedAt:   new Date()
       }
-    }
+    }}
   );
   return fresh;
 }

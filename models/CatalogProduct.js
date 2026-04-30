@@ -79,6 +79,14 @@ const catalogProductSchema = new mongoose.Schema({
   //     fetchedAt: Date }
   productReviews: mongoose.Schema.Types.Mixed,
 
+  // Phase 2a — FK to the leaf Category row this product belongs to
+  // (e.g. the "Mens > Tops > Performance Shirts" leaf). Replaces the
+  // freeform `category` string above as the relational link; the
+  // string field stays for legacy + raw-source debugging. Resolved
+  // by findOrCreateCategoryTree at match time when productCategory
+  // service produces a breadcrumb.
+  categoryRef: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null, index: true },
+
   firstSeenAt:  { type: Date, default: Date.now },
   lastSyncedAt: { type: Date, default: Date.now }
 });

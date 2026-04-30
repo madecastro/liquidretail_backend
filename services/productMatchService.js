@@ -36,6 +36,8 @@ const productDetails  = require('./productDetailsService');
 const productCategory = require('./productCategoryService');
 const visualCatalogMatch = require('./visualCatalogMatchService');   // Phase 1.7
 const categoryReviewsSvc = require('./categoryReviewsService');       // Phase 1.7c
+const Category = require('../models/Category');                        // Phase 2a
+const { findOrCreateCategoryTree } = require('../models/Category');    // Phase 2a
 const Brand           = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
 const CatalogProduct  = require('../models/CatalogProduct');
@@ -559,6 +561,7 @@ async function findPerProductMatches(args) {
     brandUrl:     args.brandUrl,
     advertiserId: args.advertiserId,
     brandId:      args.brandId,
+    mediaId:      args.mediaId,        // Phase 2a/2b
     category:     args.category
   };
   await Promise.all(matches.map(m =>
@@ -616,6 +619,25 @@ async function enrichOneMatchInPlace(match, ctx) {
   const ident   = match.identification;
   const outcome = match.outcome;
   const tiers   = [];
+
+  // ── Phase 2b — always-create CatalogProduct for confident matches ──
+  // When the match has a confident product identification AND points at
+  // a brand we own AND is not already linked to a CatalogProduct, find-
+  // or-create one with source='detect-identified'. The Brand toggle
+  // uploadSettings.autoCreateFromDetect controls draft state (true →
+  // auto-promoted, false → draft awaiting review) — NOT whether the row
+  // is created. Result: every confident match has a CatalogProduct FK
+  // for downstream consumers (productReviews fetching, recommended
+  // products query, repeat-match speedup, layout-input lookup).
+  if (outcome === 'product_match' && !match.catalogProductId && ctx.brandId
+      && ident.productName && (ident.certainty || 0) >= 0.7) {
+    try {
+      const cpId = await ensureCatalogProductForMatch(match, ctx);
+      if (cpId) match.catalogProductId = cpId;
+    } catch (err) {
+      console.warn(`   ⚠️  ensureCatalogProductForMatch[${match.productIndex || 'primary'}]: ${err.message}`);
+    }
+  }
 
   // ── Tier 1 — SKU enrichment ──
   if (outcome === 'product_match' && ident.productName && (ident.certainty || 0) >= 0.3) {
@@ -693,6 +715,45 @@ async function enrichOneMatchInPlace(match, ctx) {
     }
   } else if (match.brandCategory) {
     tiers.push('category');
+  }
+
+  // ── Phase 2a — resolve the Category tree FK ──
+  // Once brandCategory.breadcrumb is set, find-or-create the Category tree
+  // (top-down by segment) and link the leaf Category._id onto the match
+  // and onto the catalog row when present. Replaces the snapshot-only
+  // brandCategory pattern with a relational link.
+  if (match.brandCategory?.breadcrumb && !match.categoryId && ctx.brandId) {
+    try {
+      match.categoryId = await findOrCreateCategoryTree({
+        brandId:          ctx.brandId,
+        advertiserId:     ctx.advertiserId,
+        breadcrumb:       match.brandCategory.breadcrumb,
+        url:              match.brandCategory.url || null,
+        firstSeenMediaId: ctx.mediaId || null
+      });
+      // Backfill CatalogProduct.categoryRef when both ends now exist —
+      // ensures the leaf Category row's relatedProducts list builds up
+      // and the catalog row's relational link is set for future queries.
+      if (match.catalogProductId && match.categoryId) {
+        await CatalogProduct.updateOne(
+          { _id: match.catalogProductId, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+          { $set: { categoryRef: match.categoryId } }
+        );
+        await Category.updateOne(
+          { _id: match.categoryId },
+          { $addToSet: { relatedProducts: match.catalogProductId } }
+        );
+      }
+      // Track which Media surfaced this category (denormalized cache)
+      if (ctx.mediaId && match.categoryId) {
+        await Category.updateOne(
+          { _id: match.categoryId },
+          { $addToSet: { relatedMedia: ctx.mediaId }, $set: { lastSeenAt: new Date() } }
+        );
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  category tree resolution[${match.productIndex || 'primary'}]: ${err.message}`);
+    }
   }
 
   // ── Tier 2.5 — Category-level reviews (Phase 1.7c) ──
@@ -1426,6 +1487,107 @@ async function findCatalogMatchByText({
 
 function escapeRegex(s) {
   return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ── Phase 2b — always-create CatalogProduct for non-catalog confident matches ──
+//
+// Called from enrichOneMatchInPlace. When a confident product_match arrives
+// without an existing catalogProductId (i.e. it came through the per-product
+// reasoner path or the legacy scene-level path), find-or-create a
+// CatalogProduct row so all product data (description, price, reviews, etc.)
+// has a single home — and so subsequent matches on the same SKU hit the
+// catalog directly.
+//
+// Brand toggle Brand.uploadSettings.autoCreateFromDetect controls DRAFT
+// STATE only (true → not draft, immediately visible; false → draft, queued
+// for user review). The row is created either way.
+//
+// Identity rules — try to find an existing row before creating:
+//   1. Exact (brandId, externalId='detect:<mediaId>:<slug>') match
+//   2. Exact (brandId, title-normalized, brand-normalized) match — covers
+//      the case where the SAME SKU was detected on a previous Media
+//   3. If neither: create a new row, source='detect-identified'
+//
+// Brand-mismatch guard: if identification.brand is set and doesn't match
+// the active brand, skip creation entirely. Competitor products don't
+// belong in the active brand's catalog.
+async function ensureCatalogProductForMatch(match, ctx) {
+  const ident = match.identification;
+  if (!ident?.productName) return null;
+  if (!ctx.brandId) return null;
+
+  // Brand-mismatch guard. Use the same loose normalize as Phase 1.7
+  // detectSummary aggregation.
+  const activeBrand = ctx.brand;
+  const identBrand  = ident.brand;
+  if (identBrand && activeBrand && !brandsMatchLoose(identBrand, activeBrand)) {
+    console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: brand mismatch (${identBrand} ≠ ${activeBrand}) — skipping (competitor)`);
+    return null;
+  }
+
+  const slug = slugify(ident.productName);
+  if (!slug) return null;
+  const detectExternalId = `detect:${ctx.mediaId || 'unknown'}:${slug}`;
+
+  // 1. Exact externalId match (this Media + this productName already created a row)
+  let existing = await CatalogProduct.findOne({
+    brandId:    ctx.brandId,
+    externalId: detectExternalId
+  }).select('_id source').lean();
+  if (existing) {
+    console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: existing row by externalId (source=${existing.source}) → ${existing._id}`);
+    return existing._id;
+  }
+
+  // 2. Title + brand match (same SKU detected on a different Media earlier)
+  const titleEsc = escapeRegex(ident.productName.trim());
+  const brandEsc = identBrand || activeBrand ? escapeRegex(identBrand || activeBrand) : null;
+  const titleQuery = {
+    brandId: ctx.brandId,
+    draft:   { $ne: true },              // exclude drafts (don't dedupe against incomplete rows)
+    title:   { $regex: `^${titleEsc}$`, $options: 'i' }
+  };
+  if (brandEsc) titleQuery.brand = { $regex: brandEsc, $options: 'i' };
+  existing = await CatalogProduct.findOne(titleQuery).select('_id source').lean();
+  if (existing) {
+    console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: existing row by title (source=${existing.source}) → ${existing._id}`);
+    return existing._id;
+  }
+
+  // 3. Create a new detect-identified row. Draft state is gated by the
+  // brand toggle: opted-in → not a draft (auto-promoted); opted-out → draft.
+  const brand = await Brand.findById(ctx.brandId).select('uploadSettings').lean();
+  const isDraft = !brand?.uploadSettings?.autoCreateFromDetect;
+
+  const cp = await CatalogProduct.create({
+    advertiserId:        ctx.advertiserId,
+    brandId:             ctx.brandId,
+    source:              'detect-identified',
+    externalId:          detectExternalId,
+    draft:               isDraft,
+    title:               ident.productName,
+    description:         ident.details?.description || null,
+    brand:               identBrand || activeBrand || null,
+    category:            ident.details?.category || match.query?.productCrop?.category || null,
+    price:               ident.details?.price?.value ?? null,
+    currency:            ident.details?.price?.currency || null,
+    imageUrl:            ident.details?.imageUrl || null,
+    productUrl:          ident.details?.url || null,
+    detectedFromMediaId: ctx.mediaId || null,
+    categoryRef:         match.categoryId || null,        // populated when category tree resolved
+    firstSeenAt:         new Date(),
+    lastSyncedAt:        new Date()
+  });
+  console.log(`📝 catalog row auto-created[${match.productIndex || 'primary'}]: "${ident.productName}" (draft=${isDraft}) → ${cp._id}`);
+  return cp._id;
+}
+
+function slugify(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
 }
 
 // ── Phase 1.7 — per-refined-product catalog-first match ──
