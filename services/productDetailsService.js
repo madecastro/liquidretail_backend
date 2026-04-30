@@ -1,19 +1,26 @@
 // Product details enrichment — given an identified product, fetch structured
-// price and seller data via SerpAPI's Google Shopping engine, plus an
-// LLM-summarized review snapshot via Gemini grounded search.
+// price, seller, description, review, and spec data.
 //
-// HISTORY: The old pipeline also used SerpAPI's `google_product` engine for
+// HISTORY: The old pipeline used SerpAPI's `google_product` engine for
 // description, full specs, rating distribution, and individual review text.
-// Google retired that API (SerpAPI now returns HTTP 400 "The Google Product
-// service is no longer offered by Google" on every call), so we've dropped
-// that step. Rating and review count still come from google_shopping; review
-// TEXT is now a Gemini-generated narrative summary grounded in real web pages
-// rather than raw Google review rows.
+// Google retired that engine. SerpApi published the Google Immersive Product
+// API as the official replacement for those exact fields, and Phase 1.9
+// wires it back in. The Gemini-generated narrative review summary stays —
+// it pulls from a broader source pool (Reddit, YouTube, Trustpilot, etc.)
+// than Immersive's Google-curated review rows, and the two complement each
+// other (narrative for hero copy; rows for review-collage UI variants).
 //
 // Pipeline:
-//   1. google_shopping (SerpAPI) — price / sellers / rating / review-count
-//   2. gemini-reviews (grounded) — narrative review summary + cited sources
-// The two calls run in parallel; neither needs the other's output.
+//   1. google_shopping  (SerpAPI) — price / sellers / rating / review-count + immersive token
+//   2. gemini-reviews   (grounded) — narrative review summary + cited sources
+//      (1 + 2 run in parallel)
+//   3. google_immersive_product (SerpAPI, Phase 1.9) — chained AFTER #1 returns
+//      using top.immersive_product_page_token. Provides:
+//        - description (manufacturer text)
+//        - rating_distribution (5-star breakdown)
+//        - reviews (individual review rows)
+//        - specifications (structured spec table)
+//      Skipped (logged) when the top shopping result has no immersive token.
 
 const axios = require('axios');
 
@@ -57,6 +64,24 @@ async function fetchProductDetails(identification) {
   const top = shoppingResults[0];
   const reviewSummary = reviewSummarySettled.status === 'fulfilled' ? reviewSummarySettled.value : null;
 
+  // Phase 1.9 — Google Immersive Product API for description/reviews/specs/
+  // ratingDistribution. Token comes from the top shopping result; absence
+  // is logged so we know how often it's missing in production.
+  const immersiveToken = top.immersive_product_page_token
+                      || top.serpapi_immersive_product_api
+                      || null;
+  let immersive = null;
+  if (immersiveToken) {
+    immersive = await fetchImmersiveProduct(immersiveToken).catch(err => {
+      console.warn(`   ⚠️  google_immersive_product failed: ${err.message}`);
+      return null;
+    });
+  } else {
+    console.log(`   ○ no immersive_product_page_token on top shopping result for "${query}" — description/specs/reviews fields will be null`);
+  }
+  const ip = immersive?.product_results || {};
+  const ipReviews = immersive?.reviews_results?.reviews || immersive?.user_reviews || [];
+
   // Aggregate sellers across top 8 shopping results so the user sees a real
   // price-comparison table.
   const sellers = shoppingResults.slice(0, 8).map(r => ({
@@ -71,27 +96,39 @@ async function fetchProductDetails(identification) {
   })).filter(s => s.link);
 
   const result = {
-    title:        top.title || identification.productName,
-    description:  null,                // google_product retired — no description source
-    thumbnail:    top.thumbnail || identification.primaryThumbnail || null,
+    title:        ip.title       || top.title       || identification.productName,
+    description:  ip.description || null,                                          // Phase 1.9 — RECOVERED via Immersive
+    thumbnail:    (Array.isArray(ip.images) && ip.images[0]) || top.thumbnail || identification.primaryThumbnail || null,
     price: {
       display:     top.price || null,
       value:       typeof top.extracted_price === 'number' ? top.extracted_price : null,
       currency:    top.currency || 'USD'
     },
-    rating:       typeof top.rating === 'number' ? top.rating : null,
-    reviewCount:  top.reviews || 0,
-    ratingDistribution: [],            // google_product retired — no distribution source
-    reviews:      [],                  // google_product retired — use reviewSummary instead
-    reviewSummary,                     // { summary, sources[], queries[] } or null
+    rating:       typeof ip.rating === 'number'  ? ip.rating  : (typeof top.rating === 'number' ? top.rating : null),
+    reviewCount:  typeof ip.reviews === 'number' ? ip.reviews : (top.reviews || 0),
+    ratingDistribution: ip.rating_distribution || [],                              // Phase 1.9 — RECOVERED
+    reviews:      Array.isArray(ipReviews) ? ipReviews.slice(0, 10) : [],          // Phase 1.9 — RECOVERED individual rows
+    reviewSummary,                                                                  // Gemini narrative — kept (broader source pool than Immersive's Google-curated rows)
     sellers,
-    specs:        {},                  // google_product retired — no specs source
-    productId:    top.product_id || null,
-    source:       'serpapi-shopping+gemini-reviews'
+    specs:        ip.specifications || ip.specs || {},                             // Phase 1.9 — RECOVERED
+    productId:    top.product_id || ip.product_id || null,
+    source:       immersive ? 'serpapi-shopping+immersive+gemini-reviews' : 'serpapi-shopping+gemini-reviews'
   };
 
-  console.log(`   ✓ product-details: ${sellers.length} seller(s), reviewSummary=${reviewSummary ? `${reviewSummary.sources.length} src` : 'no'}, rating=${result.rating ?? 'n/a'}, price=${result.price.display ?? 'n/a'} in ${Date.now() - t0}ms`);
+  console.log(`   ✓ product-details: ${sellers.length} seller(s)${immersive ? ` + immersive (desc=${result.description ? '✓' : '∅'}, ${result.reviews.length} review row(s), ${Object.keys(result.specs).length} spec(s))` : ''}, reviewSummary=${reviewSummary ? `${reviewSummary.sources.length} src` : 'no'}, rating=${result.rating ?? 'n/a'}, price=${result.price.display ?? 'n/a'} in ${Date.now() - t0}ms`);
   return result;
+}
+
+// Phase 1.9 — Google Immersive Product API call. Replaces the lost
+// google_product engine. Takes the immersive_product_page_token returned
+// on a google_shopping top result and resolves the full product page
+// (description / reviews / specs / rating distribution).
+async function fetchImmersiveProduct(pageToken) {
+  return serp({
+    engine:     'google_immersive_product',
+    page_token: pageToken,
+    gl:         COUNTRY
+  });
 }
 
 // Gemini grounded search → narrative review summary. Returns
