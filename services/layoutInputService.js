@@ -924,6 +924,11 @@ function pickTopYoloProduct(detection) {
     .map(d => {
       const conf = typeof d.confidence === 'number' ? d.confidence : 0;
       if (conf < MIN_CONF) return null;
+      // Phase 1.5 — skip detections GPT-4.1 enrichment marked as non-product
+      // (UI chrome, scroll arrows, watermarks). The raw YOLO confidence on
+      // these can still be high because YOLO matched a COCO class like
+      // 'frisbee' to a scroll arrow, but they're not real products.
+      if (d.identification?.label === 'non-product') return null;
       const w = Math.max(0, (d.x2 || 0) - (d.x1 || 0));
       const h = Math.max(0, (d.y2 || 0) - (d.y1 || 0));
       const area = w * h;
@@ -1016,7 +1021,11 @@ function buildCloudinaryCropUrl(sourceUrl, crop) {
 //  Assorted helpers
 // ──────────────────────────────────────────────────────────────
 function firstYoloCategory(detection) {
-  const det = (detection?.yoloProducts || []).find(d => d.identification?.category);
+  const det = (detection?.yoloProducts || []).find(d =>
+    d.identification?.category &&
+    d.identification.category !== 'non-product' &&
+    d.identification.label !== 'non-product'
+  );
   return det?.identification?.category || null;
 }
 

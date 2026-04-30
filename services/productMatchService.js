@@ -123,7 +123,7 @@ async function findProductMatches({
     try {
       const yoloTopForCatalog = (yoloIdentifications || [])
         .map(d => d?.identification)
-        .filter(id => id && (id.confidence || 0) >= PRODUCT_FLOOR && id.label)
+        .filter(id => id && (id.confidence || 0) >= PRODUCT_FLOOR && id.label && id.label !== 'non-product')
         .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0] || null;
       catalogMatch = await findCatalogMatch({
         brandId,
@@ -174,7 +174,8 @@ async function findProductMatches({
   const yoloProductIds = (yoloIdentifications || [])
     .map(d => d?.identification)
     .filter(id => id && (id.confidence || 0) >= PRODUCT_FLOOR
-                 && typeof id.label === 'string' && id.label.trim().length > 0)
+                 && typeof id.label === 'string' && id.label.trim().length > 0
+                 && id.label !== 'non-product')
     .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
   const yoloTop = yoloProductIds[0] || null;
 
@@ -361,11 +362,14 @@ async function runDecisionTree({
       `catalog match "${catalogMatch.product.title}" (${pct(catalogMatch.score)}) — brand's authoritative inventory`);
   }
 
-  // YOLO product candidates — must clear floor AND have a label.
+  // YOLO product candidates — must clear floor AND have a label AND not be
+  // explicitly marked non-product (Phase 1.5 escape hatch — prevents UI
+  // chrome / scroll arrows / watermarks from feeding the decision tree).
   const yoloProductIds = yoloIds
     .filter(id => (id.confidence || 0) >= PRODUCT_FLOOR
                  && typeof id.label === 'string'
-                 && id.label.trim().length > 0)
+                 && id.label.trim().length > 0
+                 && id.label !== 'non-product')
     .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
   const yoloTop = yoloProductIds[0] || null;
   const yC      = yoloTop?.confidence || 0;

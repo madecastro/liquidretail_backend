@@ -83,7 +83,7 @@ async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, for
   // useful as a description starter even when YOLO didn't fire.
   const yoloTop = (yoloProducts || [])
     .map(p => p?.identification)
-    .filter(id => id && id.label && (id.confidence || 0) >= 0.7)
+    .filter(id => id && id.label && id.label !== 'non-product' && (id.confidence || 0) >= 0.7)
     .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0] || null;
   const category = yoloTop?.category || null;
   const description = productMatch.identification?.details?.description
