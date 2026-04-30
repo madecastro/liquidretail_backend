@@ -18,6 +18,7 @@ const Job = require('../models/Job');
 const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
 const geminiImg = require('../services/geminiImageService');
 const { setCuratedAsset } = require('../services/brandCatalogService');
+const { hydrateMatch } = require('../services/productMatchHydration');
 const { assertMediaInTenant, assertRunInTenant, tenantFilter } = require('../middleware/tenantHelpers');
 
 const upload = multer({
@@ -188,7 +189,7 @@ async function assembleResult(run) {
   // Rank matches: catalog winners first, then by combined catalog score,
   // then by certainty. The first entry is the legacy "primary" exposed
   // under .productMatches.
-  const rankedMatches = (allMatches || []).slice().sort((a, b) => {
+  const rankedRaw = (allMatches || []).slice().sort((a, b) => {
     const aCat = a.winner === 'catalog' ? 1 : 0;
     const bCat = b.winner === 'catalog' ? 1 : 0;
     if (aCat !== bCat) return bCat - aCat;
@@ -196,16 +197,17 @@ async function assembleResult(run) {
     const bScore = b.catalogCombinedScore ?? b.identification?.certainty ?? 0;
     return bScore - aScore;
   });
+
+  // Phase 2g — hydrate every ranked match from canonical FK targets
+  // (CatalogProduct + Category + Brand). The legacy snapshot field paths
+  // on each entry now carry canonical data; the separate `catalog` and
+  // `categoryDoc` fields below expose the raw FK rows for clients that
+  // want them directly.
+  const rankedMatches = await Promise.all(rankedRaw.map(m => hydrateMatch(m)));
   const match = rankedMatches[0] || null;
 
-  // Phase 2g — batch-fetch canonical FK data so consumers can read the
-  // current source of truth alongside the legacy artifact snapshots.
-  // Snapshots stay in the response for backward compat; new fields
-  // `catalog` and `categoryDoc` carry the live CatalogProduct + Category
-  // rows. Drift between snapshot and canonical = artifact is older than
-  // the latest write-through (expected; snapshots are per-run audit).
-  const catalogIds = [...new Set(rankedMatches.map(m => m.catalogProductId).filter(Boolean).map(String))];
-  const categoryIds = [...new Set(rankedMatches.map(m => m.categoryId).filter(Boolean).map(String))];
+  const catalogIds = [...new Set(rankedRaw.map(m => m.catalogProductId).filter(Boolean).map(String))];
+  const categoryIds = [...new Set(rankedRaw.map(m => m.categoryId).filter(Boolean).map(String))];
   const [catalogDocs, categoryDocs] = await Promise.all([
     catalogIds.length ? CatalogProduct.find({ _id: { $in: catalogIds } }).lean() : [],
     categoryIds.length ? Category.find({ _id: { $in: categoryIds } }).lean() : []

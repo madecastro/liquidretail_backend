@@ -1,6 +1,18 @@
-// Stage 4 artifact: provider matches (Gemini grounded search, Google Lens,
-// future providers) + GPT-4.1 reasoner identification + SerpAPI shopping
-// details + Gemini-synthesized review summary.
+// Stage 4 artifact: per-run evidence record for one refined product's match.
+// Snapshot of providers + reasoner identification + decision-tree outcome.
+//
+// Phase 2e — snapshot copies of normalized data have been removed. Consumers
+// resolve the canonical state via FK joins (catalogProductId → CatalogProduct,
+// categoryId → Category, brandId → Brand) using productMatchHydration.
+// Removed fields:
+//   brandCategory     → derived from Category.breadcrumb / Category.url
+//   brandReviews      → Brand.brandReviews
+//   productReviews    → CatalogProduct.productReviews
+//   categoryReviews   → Category.categoryReviews
+//   identification.details → CatalogProduct (rating, reviews, sellers, …)
+//
+// Pre-Phase-2e artifacts retain their snapshots in the DB; hydrateMatch
+// falls back to those when the FK target is missing.
 
 const mongoose = require('mongoose');
 
@@ -37,19 +49,9 @@ const productMatchArtifactSchema = new mongoose.Schema({
   // "recommended for you" content even when SKU-level identification missed.
   recommendedProducts: { type: [mongoose.Schema.Types.Mixed], default: [] },
 
-  // Phase 1.7c — category-level reviews snapshot for THIS specific category
-  // (keyed by brandCategory.breadcrumb). Distinct from brandReviews
-  // (overall brand sentiment) and productReviews (specific SKU sentiment).
-  // Fed by categoryReviewsService — cache-aware, may be null on first hit
-  // (background fetch lands on next run). Used by Phase 1.7c category-level
-  // comments and as a fallback quote source for product-level comments.
-  categoryReviews: mongoose.Schema.Types.Mixed,
-
   // Phase 2a — FK to the matched leaf Category row (when brandCategory
-  // breadcrumb resolved). Lets consumers join through to category-owned
-  // data (categoryReviews, url, related products) instead of relying on
-  // the snapshotted brandCategory + categoryReviews fields above. The
-  // snapshots stay during migration as a deprecated read fallback.
+  // breadcrumb resolved). Consumers join through to Category for
+  // breadcrumb / url / categoryReviews instead of reading snapshots.
   categoryId: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null, index: true },
 
   query:        mongoose.Schema.Types.Mixed,
@@ -59,40 +61,25 @@ const productMatchArtifactSchema = new mongoose.Schema({
   errors:       { type: mongoose.Schema.Types.Mixed, default: {} },
   totalMatches: Number,
 
+  // Identification evidence — { productName, brand, certainty,
+  // certaintyLabel, reasoning, primaryUrl, primaryRetailer, primaryThumbnail,
+  // evidenceUrls[] }. Phase 2e dropped the nested `details` block; its
+  // commerce fields (rating, reviews, sellers, specs, …) live on the linked
+  // CatalogProduct row.
   identification: mongoose.Schema.Types.Mixed,
-  // { productName, brand, certainty, certaintyLabel, details: { ...SerpAPI... + reviewSummary } }
 
-  // Decision-tree outputs from productMatchService — additive over the
-  // legacy `identification` field above so older consumers don't break.
-  // outcome ∈ { 'confirmed', 'lookup_from_yolo', 'lookup_from_gemini',
-  //             'category', 'branding', 'do_not_use' }
+  // Decision-tree outputs.
   outcome:          { type: String, index: true },
   outcomeReasoning: String,
   winner:           String,        // 'yolo' | 'gemini' | 'agree' | 'catalog' | null
-  // Brand-level fallback collection page (filled when outcome='category')
-  brandCategory:    mongoose.Schema.Types.Mixed,
-  // Brand-level reviews (filled when outcome='branding')
-  brandReviews:     mongoose.Schema.Types.Mixed,
 
-  // ── Catalog provenance (Phase C) ──
-  // matchSource: where the canonical product came from — 'ig-catalog'
-  // when a brand-catalog row won the match, 'gemini-search' when the
-  // remote provider chain won, 'both' when catalog + remote agreed.
-  // null for brand_match / do_not_use (no specific product picked).
-  matchSource:      { type: String, index: true },
-  // Ref to the matched CatalogProduct row when matchSource includes
-  // 'ig-catalog'. Lets downstream templates pull canonical title /
-  // imageUrl / productUrl directly from the brand's authoritative
-  // catalog instead of re-deriving from prose.
+  // ── Catalog provenance ──
+  matchSource:      { type: String, index: true },   // 'ig-catalog' | 'gemini-search' | 'both' | null
   catalogProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null },
-  // Snapshot of the matched catalog row + its match score, for audit
-  // without requiring a join. Cleared on subsequent runs.
+  // Snapshot of the matched catalog candidate at run time (title +
+  // matchScore) — kept as evidence of WHY this row won. Distinct from
+  // catalogProductId which points at the live row.
   catalogMatch:     mongoose.Schema.Types.Mixed,
-  // Product-level reviews snapshot — present only on cache HITS at
-  // match time. Misses fire-and-forget and the value lands on the
-  // CatalogProduct for next time, so artifacts created before the
-  // background fetch finished will read null here.
-  productReviews:   mongoose.Schema.Types.Mixed,
 
   createdAt: { type: Date, default: Date.now }
 });

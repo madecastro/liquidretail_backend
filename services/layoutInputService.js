@@ -59,6 +59,7 @@ const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
 const { findBrandByName }    = require('./brandCatalogService');
 const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
+const { hydrateMatch }       = require('./productMatchHydration');
 
 const GEMINI_MODEL    = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -257,13 +258,18 @@ async function loadContext(mediaId) {
   const media = await Media.findById(mediaId).lean();
   if (!media) return null;
 
-  const [detection, crops, extended, match, overlayZones] = await Promise.all([
+  const [detection, crops, extended, rawMatch, overlayZones] = await Promise.all([
     media.latestArtifacts?.detection    ? DetectionArtifact.findById(media.latestArtifacts.detection).lean()    : null,
     media.latestArtifacts?.crops        ? CropArtifact.findById(media.latestArtifacts.crops).lean()              : null,
     media.latestArtifacts?.extended     ? ExtendedCropArtifact.findById(media.latestArtifacts.extended).lean()   : null,
     media.latestArtifacts?.match        ? ProductMatchArtifact.findById(media.latestArtifacts.match).lean()      : null,
     media.latestArtifacts?.overlayZones ? OverlayZoneArtifact.findById(media.latestArtifacts.overlayZones).lean(): null
   ]);
+  // Phase 2g — hydrate the artifact from canonical FK targets so consumers
+  // read CatalogProduct / Category / Brand state instead of stale snapshots.
+  // hydrateMatch is a no-op when match is null and falls back to snapshot
+  // fields when an FK target is missing (legacy pre-Phase-2 artifacts).
+  const match = await hydrateMatch(rawMatch);
   const runId = detection?.runId || null;
   const brandName = match?.identification?.brand || media.metadata?.brand || null;
   const brand = brandName

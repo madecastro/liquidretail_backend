@@ -590,6 +590,12 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
   if (productMatches?.matches?.length) {
     for (const m of productMatches.matches) {
       try {
+        // Phase 2e — strip identification.details. Commerce fields (rating,
+        // reviews, sellers, specs, price, url, imageUrl, description) now
+        // live on the linked CatalogProduct row and are read via
+        // productMatchHydration. Identification keeps its evidence fields
+        // (productName, brand, certainty, reasoning, primaryUrl, etc.).
+        const ident = m.identification ? stripDetailsFromIdentification(m.identification) : null;
         const doc = await ProductMatchArtifact.create({
           mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
           productIndex:         m.productIndex || null,
@@ -597,19 +603,15 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
           providers:            m.providers || {},
           errors:               m.errors    || {},
           totalMatches:         productMatches.totalMatches || 0,
-          identification:       m.identification || null,
+          identification:       ident,
           outcome:              m.outcome || null,
           outcomeReasoning:     m.outcomeReasoning || null,
           winner:               m.winner || null,
-          brandCategory:        m.brandCategory || null,
-          brandReviews:         m.brandReviews || null,
           matchSource:          m.matchSource || null,
           catalogProductId:     m.catalogProductId || null,
           catalogMatch:         m.catalogMatch || null,
           catalogVisualScore:   m.catalogVisualScore   || null,
           catalogCombinedScore: m.catalogCombinedScore || null,
-          productReviews:       m.productReviews || null,
-          categoryReviews:      m.categoryReviews || null,    // Phase 1.7c
           categoryId:           m.categoryId || null,          // Phase 2a — FK to Category leaf
           enrichmentTiers:      m.enrichmentTiers || [],      // Phase 1.7b
           recommendedProducts:  m.recommendedProducts || []   // Phase 1.7b
@@ -890,6 +892,16 @@ function resolvePrimarySubjectDesc(subjects, judge) {
   if (!subjects?.length) return null;
   const id = resolvePrimarySubjectId(subjects, judge);
   return subjects.find(s => s.id === id)?.description || null;
+}
+
+// Phase 2e — drop identification.details before persisting the artifact.
+// Commerce fields (rating, reviews, sellers, specs, price, url, imageUrl,
+// description) now live on the linked CatalogProduct; productMatchHydration
+// reattaches them at read time.
+function stripDetailsFromIdentification(ident) {
+  if (!ident || typeof ident !== 'object') return ident;
+  const { details, ...rest } = ident;
+  return rest;
 }
 
 // For each extended ratio, surface the judge's pick on the artifact for

@@ -33,6 +33,7 @@ const Brand = require('../models/Brand');
 const Media = require('../models/Media');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const { decrypt } = require('./integrationCryptoService');
+const { hydrateMatch } = require('./productMatchHydration');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -133,9 +134,14 @@ async function tryPostMatchReplies({ media, productMatch }) {
 
   // Collect commentable matches. matches[] is the new shape; legacy
   // single-result is wrapped in [productMatch] for backward compat.
-  const matches = Array.isArray(productMatch.matches) && productMatch.matches.length
+  const rawMatches = Array.isArray(productMatch.matches) && productMatch.matches.length
     ? productMatch.matches
     : (productMatch.identification ? [productMatch] : []);
+
+  // Phase 2g — hydrate every match from canonical FK targets BEFORE the
+  // isCommentable filter, since the filter reads brandCategory.url and
+  // identification.details.url which now live on Category / CatalogProduct.
+  const matches = await Promise.all(rawMatches.map(m => hydrateMatch(m)));
 
   const commentable = matches.filter(m => isCommentable(m));
   if (!commentable.length) {
