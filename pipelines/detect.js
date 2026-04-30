@@ -37,7 +37,7 @@ const { judgeDetections, judgeExtendedCrops } = require('../services/judgeServic
 const { generateExtendedCrops } = require('../services/extendedCropsService');
 const { transcribeAudio } = require('../services/whisperService');
 const { extractEntities } = require('../services/nerService');
-const { findProductMatches } = require('../services/productMatchService');
+const { findProductMatches, findPerProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
 const { identifyYoloDetectionsGemini, isEnabled: isGeminiIdentifyEnabled } = require('../services/geminiIdentifyService');
@@ -170,7 +170,7 @@ async function runImagePipeline(run, media, buffer) {
   await setRunPhase(run, 'enrich-fanout');
   const [extendedRes, matchRes] = await Promise.allSettled([
     runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false),
-    runProductMatchChain(run, media, sourceUrl, products, primarySubjectDesc, text)
+    runProductMatchChain(run, media, sourceUrl, products, primarySubjectDesc, text, refinedProducts)
   ]);
   if (extendedRes.status === 'rejected') console.warn('⚠️  Extended/overlay chain rejected:', extendedRes.reason?.message);
   if (matchRes.status === 'rejected')    console.warn('⚠️  Product match chain rejected:',     matchRes.reason?.message);
@@ -178,9 +178,9 @@ async function runImagePipeline(run, media, buffer) {
   const { extendedDoc, overlayDoc } = extendedRes.status === 'fulfilled'
     ? extendedRes.value
     : { extendedDoc: null, overlayDoc: null };
-  const { productMatches, matchDoc } = matchRes.status === 'fulfilled'
+  const { productMatches, matchDoc, matchDocs } = matchRes.status === 'fulfilled'
     ? matchRes.value
-    : { productMatches: null, matchDoc: null };
+    : { productMatches: null, matchDoc: null, matchDocs: [] };
 
   // V3 #3 — auto-comment on the original IG post when this Media came
   // from Instagram and produced a confident product_match with a
@@ -213,6 +213,7 @@ async function runImagePipeline(run, media, buffer) {
     crops:        cropDoc._id,
     extended:     extendedDoc?._id,
     match:        matchDoc?._id,
+    matches:      (matchDocs || []).map(d => d._id),
     overlayZones: overlayDoc?._id
   });
 }
@@ -350,7 +351,9 @@ async function runVideoPipeline(run, media, buffer) {
   await setRunPhase(run, 'enrich-fanout');
   const [extendedRes, matchRes] = await Promise.allSettled([
     runExtendedAndOverlayChain(run, media, heroImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, true),
-    runProductMatchChain(run, media, heroImageUrl, products, primarySubjectDesc, text)
+    // Video Phase 1.6 isn't wired yet (refinedProducts always [] for video) —
+    // findPerProductMatches falls through to the legacy single-match path.
+    runProductMatchChain(run, media, heroImageUrl, products, primarySubjectDesc, text, [])
   ]);
   if (extendedRes.status === 'rejected') console.warn('⚠️  Extended/overlay chain rejected:', extendedRes.reason?.message);
   if (matchRes.status === 'rejected')    console.warn('⚠️  Product match chain rejected:',     matchRes.reason?.message);
@@ -358,9 +361,9 @@ async function runVideoPipeline(run, media, buffer) {
   const { extendedDoc, overlayDoc } = extendedRes.status === 'fulfilled'
     ? extendedRes.value
     : { extendedDoc: null, overlayDoc: null };
-  const { productMatches, matchDoc } = matchRes.status === 'fulfilled'
+  const { productMatches, matchDoc, matchDocs } = matchRes.status === 'fulfilled'
     ? matchRes.value
-    : { productMatches: null, matchDoc: null };
+    : { productMatches: null, matchDoc: null, matchDocs: [] };
 
   if (productMatches && media.source === 'instagram') {
     maybePostMatchReply({ media, productMatch: productMatches })
@@ -382,6 +385,7 @@ async function runVideoPipeline(run, media, buffer) {
     crops:        cropDoc._id,
     extended:     extendedDoc?._id,
     match:        matchDoc?._id,
+    matches:      (matchDocs || []).map(d => d._id),
     overlayZones: overlayDoc?._id
   });
 }
@@ -537,10 +541,13 @@ async function runTranscribeNerChain(run, buffer, media) {
   return { transcript, entities };
 }
 
-async function runProductMatchChain(run, media, sourceImageUrl, products, primarySubjectDesc, text) {
+async function runProductMatchChain(run, media, sourceImageUrl, products, primarySubjectDesc, text, refinedProducts = []) {
   const productMatches = await timeStage(run, 'product-match', async () => {
     try {
-      const result = await findProductMatches({
+      // Phase 1.7 — per-product orchestrator. Uses refinedProducts (Phase 1.6
+      // output) for catalog-first matching when available; falls back to
+      // single scene-level match when refinedProducts is empty.
+      const result = await findPerProductMatches({
         brand:          media.metadata?.brand,
         brandUrl:       media.metadata?.brandUrl,
         advertiserId:   media.advertiserId || null,
@@ -550,11 +557,11 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
         primarySubject: primarySubjectDesc,
         textDetected:   (text || []).map(t => t.content).filter(Boolean),
         imageUrl:       sourceImageUrl,
-        // YOLO+GPT enriched identifications drive the decision tree
-        // (multi-brand contention, confidence comparison vs Gemini).
-        yoloIdentifications: products
+        yoloIdentifications: products,
+        refinedProducts
       });
-      console.log(`🔗 Product match: ${result.totalMatches} total across ${Object.keys(result.providers).length} provider(s)${result.matchSource ? ` (source=${result.matchSource})` : ''}`);
+      const matchCount = (result.matches || []).length;
+      console.log(`🔗 Product match: ${matchCount} per-product match(es) | scene-level totalMatches=${result.totalMatches} across ${Object.keys(result.providers || {}).length} provider(s)${result.matchSource ? ` (primary source=${result.matchSource})` : ''}`);
       return result;
     } catch (err) {
       console.warn('⚠️  Product match:', err.message);
@@ -562,31 +569,70 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
     }
   });
 
-  const matchDoc = productMatches ? await ProductMatchArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    query:            productMatches.query,
-    providers:        productMatches.providers,
-    errors:           productMatches.errors,
-    totalMatches:     productMatches.totalMatches,
-    identification:   productMatches.identification || null,
-    outcome:          productMatches.outcome || null,
-    outcomeReasoning: productMatches.outcomeReasoning || null,
-    winner:           productMatches.winner || null,
-    brandCategory:    productMatches.brandCategory || null,
-    brandReviews:     productMatches.brandReviews || null,
-    matchSource:      productMatches.matchSource || null,
-    catalogProductId: productMatches.catalogMatch?.product?._id || null,
-    catalogMatch:     productMatches.catalogMatch ? {
-      productId:   productMatches.catalogMatch.product._id,
-      title:       productMatches.catalogMatch.product.title,
-      score:       productMatches.catalogMatch.score,
-      reasoning:   productMatches.catalogMatch.reasoning,
-      signalsUsed: productMatches.catalogMatch.signalsUsed
-    } : null,
-    productReviews:   productMatches.productReviews || null
-  }) : null;
+  // Phase 1.7 — write ONE ProductMatchArtifact per match in result.matches.
+  // The legacy single-doc path (no refinedProducts) results in matches[1]
+  // and a single artifact written, so existing readers see the same shape.
+  const matchDocs = [];
+  if (productMatches?.matches?.length) {
+    for (const m of productMatches.matches) {
+      try {
+        const doc = await ProductMatchArtifact.create({
+          mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
+          productIndex:        m.productIndex || null,
+          query:               m.query || productMatches.query,
+          providers:           m.providers || {},
+          errors:              m.errors    || {},
+          totalMatches:        productMatches.totalMatches || 0,
+          identification:      m.identification || null,
+          outcome:             m.outcome || null,
+          outcomeReasoning:    m.outcomeReasoning || null,
+          winner:              m.winner || null,
+          brandCategory:       m.brandCategory || null,
+          brandReviews:        m.brandReviews || null,
+          matchSource:         m.matchSource || null,
+          catalogProductId:    m.catalogProductId || null,
+          catalogMatch:        m.catalogMatch || null,
+          catalogVisualScore:  m.catalogVisualScore   || null,
+          catalogCombinedScore: m.catalogCombinedScore || null,
+          productReviews:      m.productReviews || null
+        });
+        matchDocs.push(doc);
+      } catch (err) {
+        console.warn(`   ⚠️  ProductMatchArtifact.create failed for ${m.productIndex || 'primary'}: ${err.message}`);
+      }
+    }
+  }
 
-  return { productMatches, matchDoc };
+  // Primary match doc — for backward-compat Media.latestArtifacts.match (singular).
+  // Picks the highest-confidence catalog winner if any, else the first match.
+  const primaryDoc = pickPrimaryDoc(matchDocs, productMatches?.matches || []);
+
+  // Run-scoped detect summary (Phase 0b — populates Media.classification.detectSummary).
+  if (productMatches?.detectSummary) {
+    media.classification = media.classification || {};
+    media.classification.detectSummary = productMatches.detectSummary;
+    try { await media.save(); } catch (err) { console.warn(`   ⚠️  failed to persist detectSummary: ${err.message}`); }
+  }
+
+  return { productMatches, matchDoc: primaryDoc, matchDocs };
+}
+
+function pickPrimaryDoc(docs, matches) {
+  if (!docs.length) return null;
+  // Match each doc back to its source match record by productIndex
+  const byIndex = new Map();
+  matches.forEach(m => byIndex.set(m.productIndex || null, m));
+  // Catalog winner ranks first, then by combined catalog score, then by certainty
+  return docs.slice().sort((a, b) => {
+    const ma = byIndex.get(a.productIndex || null) || {};
+    const mb = byIndex.get(b.productIndex || null) || {};
+    const aCat = ma.winner === 'catalog' ? 1 : 0;
+    const bCat = mb.winner === 'catalog' ? 1 : 0;
+    if (aCat !== bCat) return bCat - aCat;
+    const aScore = ma.catalogCombinedScore ?? ma.identification?.certainty ?? 0;
+    const bScore = mb.catalogCombinedScore ?? mb.identification?.certainty ?? 0;
+    return bScore - aScore;
+  })[0];
 }
 
 async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, isVideo) {
@@ -810,6 +856,11 @@ function deriveSelectedWinners(candidates, judge) {
 // Update Media.latestArtifacts to point at the freshest artifacts. Skip slots
 // where the run produced nothing (preserve any existing pointer from a prior
 // successful run rather than clearing it).
+//
+// Phase 1.7 — `match` (singular) is the primary match (highest combined
+// catalog score, catalog winners outrank). `matches[]` is the full list
+// of per-product matches. Existing readers that only know about `match`
+// see the primary; multi-product readers can iterate `matches[]`.
 async function updateMediaLatestArtifacts(media, ids) {
   const existing = media.latestArtifacts || {};
   media.latestArtifacts = {
@@ -817,6 +868,9 @@ async function updateMediaLatestArtifacts(media, ids) {
     crops:        ids.crops        || existing.crops        || null,
     extended:     ids.extended     || existing.extended     || null,
     match:        ids.match        || existing.match        || null,
+    matches:      Array.isArray(ids.matches) && ids.matches.length
+                    ? ids.matches
+                    : (existing.matches || []),
     overlayZones: ids.overlayZones || existing.overlayZones || null
   };
   await media.save();

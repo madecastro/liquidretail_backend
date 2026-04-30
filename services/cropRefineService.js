@@ -142,6 +142,13 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
         x2:                sx2,
         y2:                sy2,
         label:             typeof box.label === 'string' && box.label.trim() ? box.label.trim() : (det.identification?.label || ''),
+        // Phase 1.7 — carry the upstream reconciled identification's category +
+        // brand + categoryLabel through. Catalog-first matching uses category
+        // for hard scoping the candidate pool, and categoryLabel as a
+        // fallback text query when the specific label doesn't catalog-match.
+        category:          det.identification?.category || null,
+        brand:             det.identification?.brand || null,
+        categoryLabel:     det.engines?.reconciled?.products?.[0]?.categoryLabel || null,
         confidence:        clampUnit(Number(box.confidence)),
         croppedImageUrl:   buildCloudinaryCropUrl(sourceImageUrl, sx1, sy1, sx2, sy2)
       });

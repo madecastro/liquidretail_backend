@@ -34,6 +34,7 @@ const googleLens   = require('./providers/googleLensProvider');
 const { identifyProduct } = require('./productReasoner');
 const productDetails  = require('./productDetailsService');
 const productCategory = require('./productCategoryService');
+const visualCatalogMatch = require('./visualCatalogMatchService');   // Phase 1.7
 const Brand           = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
 const CatalogProduct  = require('../models/CatalogProduct');
@@ -306,6 +307,348 @@ async function findProductMatches({
     // null if a fresh fetch was kicked off (background; appears next run).
     productReviews
   };
+}
+
+// ── Phase 1.7a — per-product orchestrator ──
+//
+// Wraps findProductMatches with per-refined-product catalog-first matching.
+// When refinedProducts is empty (video, refinement failed), behaves exactly
+// like findProductMatches — single scene-level match wrapped in a
+// matches[1] array for consistency.
+//
+// Contract:
+//   inputs:  same as findProductMatches PLUS refinedProducts[] (Phase 1.6)
+//   returns: {
+//     matches: [
+//       {
+//         productIndex,         // refined product id (e.g. 'r1')
+//         identification,       // per-product (from catalog row OR scene reasoner OR refined fallback)
+//         outcome, winner,
+//         catalogMatch, catalogVisualScore, catalogCombinedScore,
+//         providers, errors,    // scene-level — replicated only on the primary fallback match
+//         query, ...
+//       }, ...
+//     ],
+//     detectSummary: { outcome, matchedProducts, matchedCategories, detectedAt },
+//     // Plus all the legacy top-level fields, aliased to the primary match,
+//     // so existing callers (pipelines/detect.js writing one ProductMatchArtifact,
+//     // routes/detect.js, layoutInputService) keep working without change.
+//     query, identification, providers, errors, skipped, totalMatches,
+//     outcome, outcomeReasoning, winner,
+//     brandCategory, brandReviews,
+//     matchSource, catalogMatch, productReviews
+//   }
+async function findPerProductMatches(args) {
+  const { refinedProducts = [], brandId, caption, textDetected, brand } = args;
+
+  // Phase 1.7 — per-refined-product catalog-first (text + visual)
+  let perRefinedCatalog = [];
+  let anyCatalogWinner  = false;
+  if (refinedProducts.length && brandId) {
+    perRefinedCatalog = await Promise.all(refinedProducts.map(rp =>
+      catalogFirstMatchOneRefined(rp, { brandId, caption, textDetected })
+        .catch(err => {
+          console.warn(`   ⚠️  catalog-first[${rp.id}]: ${err.message}`);
+          return { combinedScore: 0, catalogMatch: null, visualResult: null };
+        })
+    ));
+    anyCatalogWinner = perRefinedCatalog.some(r => r.combinedScore >= 0.80);
+    const winnerCount = perRefinedCatalog.filter(r => r.combinedScore >= 0.80).length;
+    if (winnerCount > 0) {
+      console.log(`📦 catalog-first: ${winnerCount} of ${refinedProducts.length} refined product(s) hit catalog at combined ≥ 0.80`);
+    }
+  }
+
+  // Run scene-level providers (legacy findProductMatches) UNLESS any catalog winner
+  let sceneLevel = null;
+  if (!anyCatalogWinner) {
+    sceneLevel = await findProductMatches(args);
+  } else {
+    console.log(`   · skipping scene-level providers (catalog winner exists run-scoped)`);
+  }
+
+  // Build matches[] array
+  const matches = [];
+
+  if (refinedProducts.length) {
+    let sceneAssigned = false;       // tracks whether the scene-level identification has been assigned to a refined product yet
+    refinedProducts.forEach((rp, i) => {
+      const catRes = perRefinedCatalog[i] || {};
+      if (catRes.combinedScore >= 0.80 && catRes.catalogMatch?.product) {
+        matches.push(buildCatalogWinnerMatchRecord(rp, catRes, args));
+      } else if (sceneLevel && !sceneAssigned && sceneLevel.outcome !== 'do_not_use' && sceneLevel.identification?.productName) {
+        matches.push(buildSceneLevelMatchRecord(rp, sceneLevel, args));
+        sceneAssigned = true;
+      } else {
+        matches.push(buildRefinedFallbackRecord(rp, sceneLevel, args));
+      }
+    });
+  } else if (sceneLevel) {
+    // Legacy single-match path: no refinedProducts, just wrap scene-level
+    matches.push(convertSceneLevelToMatchRecord(sceneLevel, args));
+  }
+
+  // Detect summary aggregation (Phase 0b consumer for Media.classification)
+  const detectSummary = aggregateDetectSummary(matches, brand);
+
+  // Primary match for backward-compat aliasing
+  const primary = pickPrimaryMatch(matches);
+
+  return {
+    // ── Phase 1.7 outputs ──
+    matches,
+    detectSummary,
+
+    // ── Legacy aliases (primary match) ──
+    query:            primary?.query           || sceneLevel?.query           || { brand, brandUrl: args.brandUrl, category: args.category, caption, primarySubject: args.primarySubject, textDetected },
+    identification:   primary?.identification  || sceneLevel?.identification  || null,
+    providers:        sceneLevel?.providers    || {},
+    errors:           sceneLevel?.errors       || {},
+    skipped:          sceneLevel?.skipped      || [],
+    totalMatches:     sceneLevel?.totalMatches || 0,
+    outcome:          primary?.outcome         || sceneLevel?.outcome         || 'brand_match',
+    outcomeReasoning: primary?.outcomeReasoning|| sceneLevel?.outcomeReasoning|| '',
+    winner:           primary?.winner          || sceneLevel?.winner          || null,
+    brandCategory:    primary?.brandCategory   || sceneLevel?.brandCategory   || null,
+    brandReviews:     primary?.brandReviews    || sceneLevel?.brandReviews    || null,
+    matchSource:      primary?.matchSource     || sceneLevel?.matchSource     || null,
+    catalogMatch:     primary?.catalogMatch    || sceneLevel?.catalogMatch    || null,
+    productReviews:   primary?.productReviews  || sceneLevel?.productReviews  || null
+  };
+}
+
+// ── Match-record builders ──
+
+function buildCatalogWinnerMatchRecord(refined, catRes, args) {
+  const cp = catRes.catalogMatch.product;
+  return {
+    productIndex:        refined.id,
+    query: {
+      brand:          args.brand,
+      brandUrl:       args.brandUrl,
+      category:       args.category,
+      caption:        args.caption,
+      primarySubject: args.primarySubject,
+      textDetected:   args.textDetected,
+      productCrop: {
+        id:               refined.id,
+        label:            refined.label,
+        category:         refined.category,
+        x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
+        croppedImageUrl:  refined.croppedImageUrl
+      }
+    },
+    identification: {
+      productName:     cp.title,
+      brand:           cp.brand || args.brand,
+      certainty:       catRes.combinedScore,
+      certaintyLabel:  'catalog-winner',
+      reasoning:       `catalog text+visual match (text=${catRes.textScore.toFixed(2)}, visual=${catRes.visualScore.toFixed(2)})`,
+      details: {
+        title:        cp.title,
+        description:  cp.description || null,
+        category:     cp.category    || refined.category || null,
+        url:          cp.productUrl  || null,
+        imageUrl:     cp.imageUrl    || null,
+        price:        cp.price       || null,
+        currency:     cp.currency    || null,
+        productId:    cp._id ? String(cp._id) : null,
+        source:       'ig-catalog'
+      }
+    },
+    outcome:          'product_match',
+    outcomeReasoning: `catalog ${catRes.visualScore >= 0.5 ? 'text+visual' : 'text-only'} match at combined ${catRes.combinedScore.toFixed(2)}`,
+    winner:           'catalog',
+    brandCategory:    null,
+    brandReviews:     null,
+    matchSource:      'ig-catalog',
+    catalogProductId: cp._id || null,
+    catalogMatch: {
+      productId:   cp._id,
+      title:       cp.title,
+      score:       catRes.textScore,
+      reasoning:   catRes.catalogMatch.reasoning,
+      signalsUsed: catRes.catalogMatch.signalsUsed
+    },
+    catalogVisualScore:   catRes.visualScore,
+    catalogCombinedScore: catRes.combinedScore,
+    providers:        {},          // skipped — catalog won
+    errors:           {},
+    productReviews:   null         // can be hydrated lazily by consumer
+  };
+}
+
+function buildSceneLevelMatchRecord(refined, sceneLevel, args) {
+  return {
+    productIndex:    refined.id,
+    query: {
+      ...sceneLevel.query,
+      productCrop: {
+        id:              refined.id,
+        label:           refined.label,
+        category:        refined.category,
+        x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
+        croppedImageUrl: refined.croppedImageUrl
+      }
+    },
+    identification:   sceneLevel.identification,
+    outcome:          sceneLevel.outcome,
+    outcomeReasoning: sceneLevel.outcomeReasoning,
+    winner:           sceneLevel.winner,
+    brandCategory:    sceneLevel.brandCategory,
+    brandReviews:     sceneLevel.brandReviews,
+    matchSource:      sceneLevel.matchSource,
+    catalogProductId: sceneLevel.catalogMatch?.product?._id || null,
+    catalogMatch:     sceneLevel.catalogMatch || null,
+    catalogVisualScore:   null,
+    catalogCombinedScore: sceneLevel.catalogMatch?.score || null,
+    providers:        sceneLevel.providers || {},
+    errors:           sceneLevel.errors    || {},
+    productReviews:   sceneLevel.productReviews || null
+  };
+}
+
+function buildRefinedFallbackRecord(refined, sceneLevel, args) {
+  // Refined product has no catalog hit AND no scene-level identification.
+  // Build a minimal record from the refined product's own label/category.
+  return {
+    productIndex:    refined.id,
+    query: {
+      brand:          args.brand,
+      brandUrl:       args.brandUrl,
+      category:       args.category,
+      caption:        args.caption,
+      primarySubject: args.primarySubject,
+      textDetected:   args.textDetected,
+      productCrop: {
+        id:              refined.id,
+        label:           refined.label,
+        category:        refined.category,
+        x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
+        croppedImageUrl: refined.croppedImageUrl
+      }
+    },
+    identification: {
+      productName:    refined.label || null,
+      brand:          refined.brand || args.brand || null,
+      certainty:      Math.min(0.69, refined.confidence || 0.5),     // capped to mid-range — no SKU resolution
+      certaintyLabel: 'category-fallback',
+      reasoning:      'no catalog match and no scene-level identification; using refined product label',
+      details: {
+        category:     refined.category || null,
+        source:       'refined-yolo'
+      }
+    },
+    outcome:          refined.category && refined.category !== 'non-product' ? 'product_category' : 'brand_match',
+    outcomeReasoning: 'refined product had no catalog hit and scene-level providers did not produce a usable identification',
+    winner:           null,
+    brandCategory:    sceneLevel?.brandCategory || null,
+    brandReviews:     sceneLevel?.brandReviews  || null,
+    matchSource:      null,
+    catalogProductId: null,
+    catalogMatch:     null,
+    catalogVisualScore:   null,
+    catalogCombinedScore: null,
+    providers:        {},
+    errors:           {},
+    productReviews:   null
+  };
+}
+
+function convertSceneLevelToMatchRecord(sceneLevel, args) {
+  return {
+    productIndex:    null,                       // legacy — no refined product
+    query:           sceneLevel.query,
+    identification:  sceneLevel.identification,
+    outcome:         sceneLevel.outcome,
+    outcomeReasoning: sceneLevel.outcomeReasoning,
+    winner:          sceneLevel.winner,
+    brandCategory:   sceneLevel.brandCategory,
+    brandReviews:    sceneLevel.brandReviews,
+    matchSource:     sceneLevel.matchSource,
+    catalogProductId: sceneLevel.catalogMatch?.product?._id || null,
+    catalogMatch:    sceneLevel.catalogMatch || null,
+    catalogVisualScore:   null,
+    catalogCombinedScore: sceneLevel.catalogMatch?.score || null,
+    providers:       sceneLevel.providers || {},
+    errors:          sceneLevel.errors    || {},
+    productReviews:  sceneLevel.productReviews || null
+  };
+}
+
+// Pick the highest-scoring match for legacy aliasing. Catalog winners
+// outrank otherwise-equal matches.
+function pickPrimaryMatch(matches) {
+  if (!matches.length) return null;
+  return matches.slice().sort((a, b) => {
+    // Catalog winners first
+    const aCat = a.winner === 'catalog' ? 1 : 0;
+    const bCat = b.winner === 'catalog' ? 1 : 0;
+    if (aCat !== bCat) return bCat - aCat;
+    // Then by combined catalog score (or certainty if no catalog)
+    const aScore = a.catalogCombinedScore ?? a.identification?.certainty ?? 0;
+    const bScore = b.catalogCombinedScore ?? b.identification?.certainty ?? 0;
+    return bScore - aScore;
+  })[0];
+}
+
+// Aggregate run-scoped detect summary for Media.classification.detectSummary
+// (Phase 0b consumer). Outcome priority: own_product > competitor > category > no_products.
+function aggregateDetectSummary(matches, activeBrand) {
+  const matchedProducts   = [];
+  const matchedCategories = new Set();
+  let hasOwn        = false;
+  let hasCompetitor = false;
+  let hasCategory   = false;
+
+  for (const m of matches) {
+    const ident = m.identification || {};
+    if (ident.productName) {
+      matchedProducts.push({
+        name:      ident.productName,
+        brand:     ident.brand || null,
+        certainty: ident.certainty || 0
+      });
+    }
+    const cat = ident.details?.category || m.brandCategory?.breadcrumb || m.query?.productCrop?.category;
+    if (cat) matchedCategories.add(cat);
+
+    if (m.outcome === 'product_match') {
+      if (brandsMatchLoose(ident.brand, activeBrand)) hasOwn = true;
+      else if (ident.brand)                            hasCompetitor = true;
+    } else if (m.outcome === 'product_category') {
+      hasCategory = true;
+    } else if (m.outcome === 'do_not_use') {
+      hasCompetitor = true;     // multi-brand contention — treat as competitor signal
+    }
+  }
+
+  let outcome = 'no_products';
+  if (hasOwn && hasCompetitor)  outcome = 'mixed';
+  else if (hasOwn)              outcome = 'own_product';
+  else if (hasCompetitor)       outcome = 'competitor';
+  else if (hasCategory)         outcome = 'category';
+
+  return {
+    outcome,
+    matchedProducts,
+    matchedCategories: [...matchedCategories],
+    detectedAt: new Date()
+  };
+}
+
+function brandsMatchLoose(a, b) {
+  if (!a || !b) return false;       // require BOTH brands present for an own-vs-competitor decision
+  return normalizeBrand(a) === normalizeBrand(b);
+}
+
+function normalizeBrand(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[®™©]/g, '')
+    .replace(/\b(inc|co|llc|ltd|corp|corporation)\.?/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 // ── Decision tree ────────────────────────────────────────────────────
@@ -610,6 +953,192 @@ async function findCatalogMatch({
   return best;
 }
 
+// ── Phase 1.7 — text-only catalog scorer with category scoping ──
+//
+// Drops the AI-derived signals (yoloTop.label, geminiTop.productName,
+// primarySubject) the legacy findCatalogMatch above used. Those create a
+// circular feedback loop: model identifies "Aquatek Top" → we search the
+// catalog for "Aquatek Top" → catalog confirms what the model already
+// said. Catalog confirmation should come from INDEPENDENT signals.
+//
+// Inputs that survived the trim:
+//   - textDetected[] (OCR on the product itself — labels printed on the
+//     garment / packaging; SKU-grade signal when available)
+//   - caption (user-authored post caption — creator intent)
+//   - comments[] (future — IG post-comments sync)
+//
+// Optional category scoping (Phase 1.7 enhancement): when a confirmed
+// reconciled product has a category, restrict the candidate pool to
+// catalog rows whose category field substring-matches. Falls back to the
+// full-catalog scope if the filtered query returns < 3 candidates (so a
+// thin category-mismatch in the catalog doesn't mask a real match).
+//
+// Returns top-K candidates sorted by textScore desc, instead of a single
+// best match. Visual catalog matching (visualCatalogMatchService) then
+// arbitrates among them per refined product.
+async function findCatalogMatchByText({
+  brandId,
+  category,                     // optional category filter
+  caption,
+  textDetected = [],
+  comments     = [],
+  topK         = 3
+}) {
+  if (!brandId) return [];
+
+  // Build text-only signal list. Highest weight on OCR text (printed on
+  // the product itself = SKU-grade signal); caption next; comments last.
+  const signals = [];
+  for (const t of (textDetected || []).slice(0, 12)) {
+    const txt = typeof t === 'string' ? t : t?.content;
+    const conf = typeof t === 'object' ? Number(t?.confidence) : 1;
+    if (typeof txt === 'string' && txt.trim() && conf > 0.5) {
+      signals.push({ text: txt, weight: 1.0, src: 'ocr' });
+    }
+  }
+  if (caption && String(caption).trim()) {
+    signals.push({ text: String(caption), weight: 0.9, src: 'caption' });
+  }
+  for (const c of (comments || []).slice(0, 10)) {
+    const txt = typeof c === 'string' ? c : c?.text;
+    if (typeof txt === 'string' && txt.trim()) {
+      signals.push({ text: txt, weight: 0.7, src: 'comment' });
+    }
+  }
+  if (!signals.length) return [];
+
+  // Candidate pool — try category-scoped first, fall back to full catalog
+  // when the filter is too restrictive.
+  const baseQuery = { brandId, draft: { $ne: true } };
+  let rows = [];
+  if (category) {
+    const filtered = await CatalogProduct
+      .find({ ...baseQuery, category: { $regex: escapeRegex(category), $options: 'i' } })
+      .limit(500)
+      .select('title description category brand price currency imageUrl productUrl externalId source')
+      .lean();
+    if (filtered.length >= 3) {
+      rows = filtered;
+    } else {
+      console.log(`   · catalog text search: only ${filtered.length} category-scoped candidate(s) for "${category}"; broadening to full catalog`);
+    }
+  }
+  if (!rows.length) {
+    rows = await CatalogProduct
+      .find(baseQuery)
+      .limit(500)
+      .select('title description category brand price currency imageUrl productUrl externalId source')
+      .lean();
+  }
+  if (!rows.length) return [];
+
+  const cat = category ? String(category).toLowerCase().trim() : null;
+  const scored = [];
+
+  for (const row of rows) {
+    const haystack = (`${row.title || ''} ${row.description || ''}`).toLowerCase();
+    const haystackTokens = new Set(tokenize(haystack));
+    if (!haystackTokens.size) continue;
+
+    let totalWeight = 0, matchedWeight = 0;
+    const matchedSrcs = new Set();
+    for (const sig of signals) {
+      const sigTokens = new Set(tokenize(sig.text));
+      if (!sigTokens.size) continue;
+      let shared = 0;
+      for (const t of sigTokens) if (haystackTokens.has(t)) shared++;
+      const overlap = shared / sigTokens.size;
+      totalWeight   += sig.weight;
+      matchedWeight += sig.weight * overlap;
+      if (shared > 0) matchedSrcs.add(sig.src);
+    }
+    if (!totalWeight) continue;
+    let textScore = matchedWeight / totalWeight;
+
+    if (cat && row.category) {
+      const rc = String(row.category).toLowerCase().trim();
+      if (rc === cat || rc.includes(cat) || cat.includes(rc)) {
+        textScore = Math.min(1, textScore + 0.10);
+      }
+    }
+
+    if (textScore >= 0.30) {
+      scored.push({
+        product:     row,
+        textScore,
+        reasoning:   `weighted token overlap (${matchedSrcs.size} signal type(s) hit: ${[...matchedSrcs].join(', ')})`,
+        signalsUsed: [...matchedSrcs]
+      });
+    }
+  }
+
+  return scored.sort((a, b) => b.textScore - a.textScore).slice(0, topK);
+}
+
+function escapeRegex(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ── Phase 1.7 — per-refined-product catalog-first match ──
+//
+// For ONE refined product:
+//   1. Text catalog query (scoped to refined.category when set)
+//   2. Visual catalog match (Gemini Vision) on the top-K text candidates
+//   3. combined = max(textScore, visualScore)
+//   4. Return the best (highest combined) candidate + scores
+//
+// Returns:
+//   { combinedScore, textScore, visualScore, catalogMatch, visualResult }
+// where catalogMatch is the top-K-filtered single best per-refined match
+// (or null when no candidate cleared the floor).
+async function catalogFirstMatchOneRefined(refined, { brandId, caption, textDetected, comments }) {
+  if (!brandId || !refined) return { combinedScore: 0, catalogMatch: null, visualResult: null };
+
+  const textCandidates = await findCatalogMatchByText({
+    brandId,
+    category: refined.category || null,
+    caption,
+    textDetected,
+    comments,
+    topK: 3
+  });
+  if (!textCandidates.length) {
+    return { combinedScore: 0, catalogMatch: null, visualResult: null };
+  }
+
+  // Visual scoring for each top-K candidate (parallel — bounded to 3 calls).
+  const visualResults = await Promise.all(textCandidates.map(c =>
+    visualCatalogMatch.compareCropToCandidate({
+      cropImageUrl: refined.croppedImageUrl,
+      candidate:    c.product
+    }).catch(err => {
+      console.warn(`   ⚠️  visualCatalogMatch threw: ${err.message}`);
+      return null;
+    })
+  ));
+
+  let best = null;
+  for (let i = 0; i < textCandidates.length; i++) {
+    const cand = textCandidates[i];
+    const visual = visualResults[i];
+    const visualScore = visual?.isMatch ? Number(visual.score || 0) : 0;
+    const combined = Math.max(cand.textScore, visualScore);
+    if (!best || combined > best.combinedScore) {
+      best = {
+        catalogMatch: cand,
+        visualResult: visual,
+        textScore:    cand.textScore,
+        visualScore,
+        combinedScore: combined
+      };
+    }
+  }
+
+  if (!best) return { combinedScore: 0, catalogMatch: null, visualResult: null };
+  console.log(`   · catalog-first[${refined.id}]: text=${best.textScore.toFixed(2)} visual=${best.visualScore.toFixed(2)} combined=${best.combinedScore.toFixed(2)} → "${best.catalogMatch.product.title}"`);
+  return best;
+}
+
 // Cache-aware product-reviews resolver:
 //   1. Read CatalogProduct.productReviews.
 //   2. If fresh (< 30 days), return immediately — caller surfaces on artifact.
@@ -709,4 +1238,9 @@ function tokenize(s) {
     .filter(t => t.length >= 3 && !CATALOG_STOPWORDS.has(t));
 }
 
-module.exports = { findProductMatches };
+module.exports = {
+  findProductMatches,         // legacy single-match path (used internally as scene-level fallback)
+  findPerProductMatches,      // Phase 1.7 per-refined-product orchestrator
+  findCatalogMatchByText,     // Phase 1.7 text-only catalog scorer with category scoping
+  catalogFirstMatchOneRefined // Phase 1.7 per-product catalog-first (text + visual)
+};
