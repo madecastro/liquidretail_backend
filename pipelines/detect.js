@@ -40,6 +40,7 @@ const { extractEntities } = require('../services/nerService');
 const { findProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
+const { refineDetectionCrops } = require('../services/cropRefineService');
 const { maybePostMatchReply } = require('../services/instagramCommentService');
 const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
 // Brand catalog mutations no longer happen inside the detect pipeline
@@ -99,7 +100,11 @@ async function runImagePipeline(run, media, buffer) {
   if (yoloRes.status === 'rejected')     console.warn('⚠️  YOLO chain rejected:', yoloRes.reason?.message);
   if (subjectsRes.status === 'rejected') console.warn('⚠️  Subjects/text chain rejected:', subjectsRes.reason?.message);
 
-  const products = yoloRes.status === 'fulfilled' ? yoloRes.value : [];
+  const yoloChainOut = yoloRes.status === 'fulfilled'
+    ? yoloRes.value
+    : { products: [], refinedProducts: [] };
+  const products = yoloChainOut.products;
+  const refinedProducts = yoloChainOut.refinedProducts;
   const { subjects, text, background } = subjectsRes.status === 'fulfilled'
     ? subjectsRes.value
     : { subjects: [], text: [], background: null };
@@ -119,6 +124,7 @@ async function runImagePipeline(run, media, buffer) {
     width: imgW, height: imgH,
     imageUrl: sourceUrl,
     yoloProducts: products.map(({ cropBuffer, ...p }) => p),
+    refinedProducts,
     subjects, text, background
   });
 
@@ -272,6 +278,7 @@ async function runVideoPipeline(run, media, buffer) {
     videoUrl: sourceVideoUrl,
     heroFrameSec, heroReason, videoDurationSec,
     yoloProducts: products.map(({ cropBuffer, ...p }) => p),
+    refinedProducts: [],                    // Phase 1.6 is image-only for v1; video uses yoloIdentifications fallback in Phase 1.7
     subjects, text, background,
     transcript: transcript ? {
       text: transcript.text,
@@ -394,7 +401,28 @@ async function runYoloChain(run, buffer, media) {
     });
   }
 
-  return products;
+  // Phase 1.6 — bbox refinement on real-product survivors. Image-only for
+  // v1; video falls back to yoloIdentifications in Phase 1.7 (the
+  // microservice samples detections across frames so there's no single
+  // source URL to crop against the bboxes).
+  let refinedProducts = [];
+  const survivors = products.filter(p =>
+    p.identification?.label && p.identification.label !== 'non-product'
+  );
+  if (survivors.length && media.fileType === 'image') {
+    refinedProducts = await timeStage(run, 'crop-refine', async () => {
+      try {
+        const refined = await refineDetectionCrops(survivors, media.fileUrl);
+        console.log(`✂️   crop-refine: ${refined.length} refined product(s) from ${survivors.length} surviving detection(s)`);
+        return refined;
+      } catch (err) {
+        console.warn('⚠️  crop-refine:', err.message);
+        return [];
+      }
+    });
+  }
+
+  return { products, refinedProducts };
 }
 
 async function runYoloVideoChain(run, buffer, media) {

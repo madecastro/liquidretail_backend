@@ -10,6 +10,21 @@ const productMatchArtifactSchema = new mongoose.Schema({
   mediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media',     required: true, index: true },
   runId:   { type: mongoose.Schema.Types.ObjectId, ref: 'DetectRun', required: true, index: true },
 
+  // Phase 1.7 — multiple ProductMatchArtifact docs per detect run, one per
+  // refined product detection. productIndex is the index into the
+  // DetectionArtifact.refinedProducts[] array (or yoloProducts[] when
+  // Phase 1.6 refinement fell back) that this match represents. Null on
+  // legacy artifacts that pre-date the per-product split.
+  productIndex: { type: Number, default: null },
+  // Combined catalog match score (max of text + visual). Persisted so
+  // consumers can rank matches without re-deriving. Null on non-catalog
+  // outcomes.
+  catalogCombinedScore: { type: Number, default: null },
+  // Visual catalog match score from visualCatalogMatchService (Gemini
+  // Vision similarity between the refined crop and the catalog candidate's
+  // imageUrl). Null when not run.
+  catalogVisualScore: { type: Number, default: null },
+
   query:        mongoose.Schema.Types.Mixed,
   // { brand, category, caption, primarySubject, textDetected[] }
 

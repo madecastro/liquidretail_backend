@@ -27,6 +27,18 @@ const detectionArtifactSchema = new mongoose.Schema({
   // each: { id, className, confidence, x1, y1, x2, y2, firstSeenSec,
   //         identification: { label, description, brand, category, confidence } }
 
+  // Phase 1.6 — GPT-4.1 batch bbox refinement output. After the YOLO+OpenCV+
+  // gpt-4o-mini pipeline + Phase-1.5 non-product filter, each surviving
+  // detection is sent through one batched Vision call that returns tight
+  // per-item bboxes (1+ per input crop, since a 'person' container may yield
+  // bikini-top + bikini-bottom + accessories). Coordinates are in source-image
+  // pixel space (translated from the crop-relative GPT response). Each entry:
+  //   { id, sourceDetectionId, x1, y1, x2, y2, label, confidence,
+  //     croppedImageUrl }   // croppedImageUrl is a Cloudinary URL of the
+  //                         // tight crop, used for catalog visual matching.
+  // Empty array if Phase 1.6 fails (downstream falls back to yoloProducts).
+  refinedProducts:  [mongoose.Schema.Types.Mixed],
+
   subjects:           [mongoose.Schema.Types.Mixed],   // GPT subjects with role
   text:               [mongoose.Schema.Types.Mixed],   // GPT text regions
   background:         mongoose.Schema.Types.Mixed,     // { description, setting, palette[], lighting, style, notes }

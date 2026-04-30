@@ -54,7 +54,15 @@ const mediaSchema = new mongoose.Schema({
     detection:    { type: mongoose.Schema.Types.ObjectId, ref: 'DetectionArtifact' },
     crops:        { type: mongoose.Schema.Types.ObjectId, ref: 'CropArtifact' },
     extended:     { type: mongoose.Schema.Types.ObjectId, ref: 'ExtendedCropArtifact' },
+
+    // Phase 1.7 — match becomes per-product (one ProductMatchArtifact per
+    // refined detection). `match` (singular) stays as the PRIMARY match
+    // pointer (highest combined-score; catalog-winners outrank otherwise)
+    // so existing readers keep working without change. `matches` is the
+    // full list — readers that want all per-product matches read this.
     match:        { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
+    matches:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' }],
+
     overlayZones: { type: mongoose.Schema.Types.ObjectId, ref: 'OverlayZoneArtifact' }
   },
 
