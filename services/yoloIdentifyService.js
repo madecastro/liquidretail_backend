@@ -1,18 +1,23 @@
 // YOLO identification — batched GPT-4.1 Vision call that takes the in-memory
-// product crops from YOLO and attaches a short identification to each. Runs
-// after YOLO (image or video) and before subject-text so downstream stages
-// (subject-text, judge, matching) can see what's already been recognized.
+// product crops from YOLO and attaches structured identifications to each.
+// Runs in parallel with geminiIdentifyService (Phase 1.5c dual-engine
+// enrichment); enrichmentReconciler then merges the two engine outputs.
 //
-// One batched call per job — 20-30 crops fit comfortably in a single Vision
-// request. Each detection gets:
-//   identification: {
-//     label:       "short human-readable product name",
-//     description: "short sentence describing the item for product search",
-//     brand:       "brand if visible on the crop, else null",
-//     category:    "apparel" | "electronics" | "food_beverage" | "home" | "toys" |
-//                  "tools" | "beauty" | "sports" | "accessories" | "other",
-//     confidence:  0.0-1.0
+// MULTI-PRODUCT PER CROP (Phase 1.5c) — each crop can contain MULTIPLE
+// distinguishable retail products. A YOLO 'person' bbox is the common case
+// — a single crop containing both a shirt and a hat. Output shape per
+// detection now carries a products[] array, not a single identification:
+//
+//   det.engines.gpt = {
+//     products: [
+//       { label, description, brand, category, confidence },
+//       { label, description, brand, category, confidence },   // multi-product
+//       ...
+//     ]
 //   }
+//
+// Empty products array marks the crop as non-product (UI chrome, watermark,
+// etc.) — replaces the former label="non-product" sentinel.
 //
 // Design goal — feed the downstream matching/layout stages a structured
 // per-product anchor that's trustworthy for "how many products are in this
@@ -83,22 +88,35 @@ async function identifyChunk(chunk, hints, offset) {
 
   const prompt =
     `You will see ${imageParts.length} crops from a piece of social-media content. For each crop, ` +
-    `identify the specific product IF ONE IS CLEARLY VISIBLE. Crops are produced by a multi-stage ` +
-    `bounding-box proposer (YOLO + OpenCV contours + GPT-4o-mini) that does NOT filter for ` +
-    `product-ness — many crops will be UI chrome (scroll arrows, IG carousel indicators, ` +
-    `navigation icons), watermarks, partial human limbs, blank/blurry regions, or screenshot ` +
-    `artifacts. Mark those non-products explicitly. DO NOT confabulate a product label from the ` +
-    `brand/category context when the crop doesn't actually show a product.\n\n` +
+    `list EVERY DISTINGUISHABLE retail product visible — a single crop may contain multiple products ` +
+    `(e.g. a torso/person crop showing a shirt AND a hat, or a flat-lay showing several items). ` +
+    `Crops are produced by a multi-stage bounding-box proposer (YOLO + OpenCV contours + ` +
+    `GPT-4o-mini) that does NOT filter for product-ness — many crops will be UI chrome ` +
+    `(scroll arrows, IG carousel indicators, navigation icons), watermarks, partial human limbs, ` +
+    `blank/blurry regions, or screenshot artifacts. For those, return an EMPTY products array. ` +
+    `DO NOT confabulate a product label from brand/category context when the crop doesn't ` +
+    `actually show a product.\n\n` +
     `Images (in order):\n${indexLines.join('\n')}${hintBlock}\n\n` +
     `Return JSON:\n` +
-    `{ "items": [ { "index": 1, "label": "...", "description": "...", "brand": "..." | null, "category": "apparel|electronics|food_beverage|home|toys|tools|beauty|sports|accessories|non-product|other", "confidence": 0.0-1.0 }, ... ] }\n\n` +
-    `Guidance:\n` +
+    `{ "items": [\n` +
+    `  { "index": 1, "products": [\n` +
+    `    { "label": "Pelagic Gear bikini top", "description": "blue and white camo print bikini top", "brand": "Pelagic Gear", "category": "apparel", "confidence": 0.85 },\n` +
+    `    { "label": "Pelagic Gear trucker cap", "description": "gray mesh-back trucker cap", "brand": "Pelagic Gear", "category": "apparel", "confidence": 0.7 }\n` +
+    `  ]},\n` +
+    `  { "index": 2, "products": [] },\n` +
+    `  ...\n` +
+    `]}\n\n` +
+    `Guidance per product entry:\n` +
     `- "label" is short (3-8 words), e.g. "Pelagic Exo-Tech hooded fishing shirt"\n` +
-    `- "description" is 1 sentence including material / color / notable features for product search\n` +
+    `- "description" is 1 sentence including OBSERVED material / color / notable features (true to pixels — do not assert "quick-dry stretch fabric" if you can't see it)\n` +
     `- "brand" is only set when a brand name is VISIBLY identifiable on the crop itself; null otherwise (do not infer from context)\n` +
-    `- "confidence" reflects how certain you are of the SPECIFIC IDENTIFICATION (not just that something is there). A crop that "might be" a brand-X product but lacks a visible label should be 0.4-0.5, not 0.8.\n` +
-    `- IF THE CROP DOES NOT SHOW A RECOGNIZABLE RETAIL PRODUCT (UI overlay, scroll arrow, navigation chrome, IG carousel indicator, watermark, partial limb, blank/blurry area, screenshot artifact, decorative graphic), return: label="non-product", description="", brand=null, category="non-product", confidence=0.0. Do NOT invent a plausible-sounding label that fits the brand/category hints.\n` +
-    `- Return items ONLY for crops you can see. Always include an entry for every index 1..${imageParts.length}.\n` +
+    `- "category" is from the enum: apparel | electronics | food_beverage | home | toys | tools | beauty | sports | accessories | other\n` +
+    `- "confidence" reflects how certain you are of the SPECIFIC IDENTIFICATION (not just that something is there). A crop that "might be" a brand-X product but lacks a visible label should be 0.4-0.5, not 0.8.\n\n` +
+    `Per-crop rules:\n` +
+    `- products: [] (EMPTY ARRAY) when the crop is non-product: UI overlay, scroll arrow, navigation chrome, IG carousel indicator, watermark, partial limb, blank/blurry area, screenshot artifact, decorative graphic.\n` +
+    `- products: [single entry] when the crop tightly shows ONE identifiable product.\n` +
+    `- products: [multiple entries] when the crop contains 2+ distinguishable retail products. List each separately. Confidence per product reflects that specific item, not the crop overall.\n` +
+    `- Return one item entry for every index 1..${imageParts.length}, even if products is [].\n` +
     `Return ONLY valid JSON — no prose outside.`;
 
   const response = await openai.chat.completions.create({
@@ -131,35 +149,72 @@ async function identifyChunk(chunk, hints, offset) {
     const chunkIdx = promptIndexToChunk[promptIdx];
     if (chunkIdx == null) continue;
     const det = chunk[chunkIdx];
-    const identification = {
-      label:       typeof item.label === 'string' ? item.label : (det.className || ''),
-      description: typeof item.description === 'string' ? item.description : '',
-      brand:       typeof item.brand === 'string' && item.brand.trim() ? item.brand.trim() : null,
-      category:    typeof item.category === 'string' ? item.category : 'other',
-      confidence:  Math.max(0, Math.min(1, Number(item.confidence) || 0))
-    };
-    det.identification = identification;
-    summary.push({ id: det.id, ...identification });
+
+    // Phase 1.5c — multi-product output. Each crop yields products[] (0+).
+    const rawProducts = Array.isArray(item.products) ? item.products : [];
+    const products = rawProducts.map(p => normalizeProduct(p)).filter(Boolean);
+
+    det.engines = det.engines || {};
+    det.engines.gpt = { products };
+
+    // Backward-compat alias — set det.identification to the highest-confidence
+    // product (or non-product fallback). Reconciler may overwrite this with
+    // the merged primary product after Gemini results land.
+    det.identification = aliasFromProducts(products);
+
+    summary.push({
+      id: det.id,
+      productCount: products.length,
+      products: products.map(p => ({ label: p.label, brand: p.brand, confidence: p.confidence }))
+    });
   }
 
   // Fill in blanks for any detection the model skipped. Treat as non-product
-  // (matches the prompt's escape-hatch contract) so downstream filters drop
-  // them rather than letting a YOLO class name like 'frisbee' stand in as
-  // the product label.
-  chunk.forEach((det, i) => {
-    if (!det.identification) {
-      det.identification = {
-        label:       'non-product',
-        description: '',
-        brand:       null,
-        category:    'non-product',
-        confidence:  0
-      };
-      summary.push({ id: det.id, ...det.identification });
+  // (empty products array) — replaces the legacy label='non-product' sentinel
+  // so the new schema is consistent across all paths.
+  chunk.forEach((det) => {
+    if (!det.engines || !det.engines.gpt) {
+      det.engines = det.engines || {};
+      det.engines.gpt = { products: [] };
+      det.identification = nonProductIdentification();
+      summary.push({ id: det.id, productCount: 0, products: [] });
     }
   });
 
   return summary;
+}
+
+// Normalize a single product entry from the GPT response into the canonical
+// shape. Returns null on entries that fail validation (missing label, etc.).
+function normalizeProduct(p) {
+  if (!p || typeof p !== 'object') return null;
+  const label = typeof p.label === 'string' ? p.label.trim() : '';
+  if (!label) return null;
+  return {
+    label,
+    description: typeof p.description === 'string' ? p.description : '',
+    brand:       typeof p.brand === 'string' && p.brand.trim() ? p.brand.trim() : null,
+    category:    typeof p.category === 'string' ? p.category : 'other',
+    confidence:  Math.max(0, Math.min(1, Number(p.confidence) || 0))
+  };
+}
+
+// Pick the primary product for the legacy `det.identification` alias.
+// Highest-confidence wins; non-product fallback when products is empty.
+function aliasFromProducts(products) {
+  if (!products || !products.length) return nonProductIdentification();
+  const best = products.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
+  return { ...best };
+}
+
+function nonProductIdentification() {
+  return {
+    label:       'non-product',
+    description: '',
+    brand:       null,
+    category:    'non-product',
+    confidence:  0
+  };
 }
 
 module.exports = { identifyYoloDetections };

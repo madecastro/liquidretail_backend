@@ -40,6 +40,8 @@ const { extractEntities } = require('../services/nerService');
 const { findProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
+const { identifyYoloDetectionsGemini, isEnabled: isGeminiIdentifyEnabled } = require('../services/geminiIdentifyService');
+const { reconcileEnrichments } = require('../services/enrichmentReconciler');
 const { refineDetectionCrops } = require('../services/cropRefineService');
 const { maybePostMatchReply } = require('../services/instagramCommentService');
 const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
@@ -230,14 +232,26 @@ async function runVideoPipeline(run, media, buffer) {
   const yoloChain = (async () => {
     const yoloOut = await runYoloVideoChain(run, buffer, media);
     if (yoloOut.products.length) {
+      // Phase 1.5c — dual-engine enrichment (video). Same parallel pattern
+      // as the image path; reconciler merges into engines.reconciled.products.
       await timeStage(run, 'yolo-identify', async () => {
-        try {
-          const ids = await identifyYoloDetections(yoloOut.products, {
-            brand: media.metadata?.brand,
-            category: media.metadata?.category
-          });
-          console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
-        } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
+        const hints = { brand: media.metadata?.brand, category: media.metadata?.category };
+        const tasks = [identifyYoloDetections(yoloOut.products, hints).catch(err => {
+          console.warn('⚠️  GPT yolo-identify (video):', err.message);
+          return null;
+        })];
+        if (isGeminiIdentifyEnabled()) {
+          tasks.push(identifyYoloDetectionsGemini(yoloOut.products, hints).catch(err => {
+            console.warn('⚠️  Gemini yolo-identify (video):', err.message);
+            return null;
+          }));
+        } else {
+          yoloOut.products.forEach(p => { p.engines = p.engines || {}; p.engines.gemini = null; });
+        }
+        await Promise.all(tasks);
+        reconcileEnrichments(yoloOut.products);
+        const productCount = yoloOut.products.reduce((n, d) => n + (d.engines?.reconciled?.products?.length || 0), 0);
+        console.log(`🏷️   YOLO identify (video, dual-engine): ${yoloOut.products.length} crop(s) → ${productCount} reconciled product(s)`);
       });
     }
     let subjects = [], text = [], background = null;
@@ -390,14 +404,42 @@ async function runYoloChain(run, buffer, media) {
   });
 
   if (products.length) {
+    // Phase 1.5c — dual-engine enrichment. GPT-4.1 and Gemini Vision run in
+    // parallel on the same crops; reconciler merges per-detection products[]
+    // into engines.reconciled.products[] and updates the legacy
+    // det.identification alias. Gemini failures are non-fatal (GPT carries
+    // the run with single-engine penalty applied during reconciliation).
     await timeStage(run, 'yolo-identify', async () => {
-      try {
-        const ids = await identifyYoloDetections(products, {
-          brand: media.metadata?.brand,
-          category: media.metadata?.category
-        });
-        console.log(`🏷️   YOLO identify: ${ids.length} detection(s) enriched`);
-      } catch (err) { console.warn('⚠️  YOLO identify:', err.message); }
+      const hints = { brand: media.metadata?.brand, category: media.metadata?.category };
+      const tasks = [identifyYoloDetections(products, hints).catch(err => {
+        console.warn('⚠️  GPT yolo-identify:', err.message);
+        return null;
+      })];
+      if (isGeminiIdentifyEnabled()) {
+        tasks.push(identifyYoloDetectionsGemini(products, hints).catch(err => {
+          console.warn('⚠️  Gemini yolo-identify:', err.message);
+          return null;
+        }));
+      } else {
+        // Mark every detection as having no Gemini engine so reconciler
+        // applies the single-engine penalty to GPT-only outputs.
+        products.forEach(p => { p.engines = p.engines || {}; p.engines.gemini = null; });
+      }
+      await Promise.all(tasks);
+      reconcileEnrichments(products);
+      const summary = products.reduce((acc, d) => {
+        const r = d.engines?.reconciled?.products || [];
+        acc.totalProducts += r.length;
+        acc.agreed       += r.filter(p => p.agreement === 'agree').length;
+        acc.gptOnly      += r.filter(p => p.agreement === 'gpt-only').length;
+        acc.geminiOnly   += r.filter(p => p.agreement === 'gemini-only').length;
+        return acc;
+      }, { totalProducts: 0, agreed: 0, gptOnly: 0, geminiOnly: 0 });
+      console.log(
+        `🏷️   YOLO identify (dual-engine): ${products.length} crop(s) → ` +
+        `${summary.totalProducts} reconciled product(s) ` +
+        `[${summary.agreed} agreed, ${summary.gptOnly} gpt-only, ${summary.geminiOnly} gemini-only]`
+      );
     });
   }
 
