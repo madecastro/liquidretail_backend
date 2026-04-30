@@ -279,7 +279,12 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
             permalink,
             thumbnailUrl,
             ingestedFrom:  'instagram-post-sync'
-          }
+          },
+          // Phase 0a — provenance classification. /me/media returns posts
+          // FROM the brand's own account, so these are brand_produced.
+          // True UGC (tagged/mentioned posts) is a separate sync path
+          // (backlog #69) that will stamp 'ugc'.
+          classification: { socialPostType: 'brand_produced' }
         }
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }

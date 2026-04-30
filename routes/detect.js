@@ -71,7 +71,11 @@ router.post('/', upload.fields([
       fileUrl:      uploaded.secure_url,
       fileMimeType: photoFile.mimetype,
       fileName:     photoFile.originalname,
-      metadata
+      metadata,
+      // Phase 0a — provenance classification. Manual uploads have no
+      // platform context; downstream services (template selector,
+      // layoutInputService) treat manual_upload as "no UGC available".
+      classification: { socialPostType: 'manual_upload' }
     });
 
     // ── Curated brand logo (optional) ──

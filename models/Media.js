@@ -77,6 +77,53 @@ const mediaSchema = new mongoose.Schema({
     notes:      String                   // optional context / license source
   },
 
+  // Two-axis classification — stable on every Media so the canonical
+  // input shape and template selector can branch honestly.
+  //
+  //   socialPostType — provenance / origin (HOW this entered the system):
+  //     'brand_produced' — IG sync from /me/media (brand's own account); not UGC
+  //     'ugc'            — IG sync from /me/tags or branded-content (true creator
+  //                        content about the brand); future tag-pull flow (backlog #69)
+  //                        is the data source — until that ships, no Media should
+  //                        receive this value in production
+  //     'manual_upload'  — uploaded via the Upload form; no platform context
+  //     'other'          — legacy / unclassified default
+  //
+  //   detectSummary — what the detect pipeline found in the Media (filled in
+  //                   at end of detect; 'pending' until then):
+  //     outcome:
+  //       'own_product'   — match winner's brand matches the active brand context
+  //       'competitor'    — match winner's brand differs from the active brand
+  //       'category'      — no specific product but a category was inferred
+  //       'no_products'   — detect found nothing identifiable
+  //       'pending'       — detect hasn't completed yet
+  //     matchedProducts:   plain-text identifiers for now (debug-friendly);
+  //                        later: ObjectId refs to CatalogProduct
+  //     matchedCategories: category strings (apparel, electronics, ...)
+  //     detectedAt:        when the summary was last computed
+  classification: {
+    socialPostType: {
+      type: String,
+      enum: ['brand_produced', 'ugc', 'manual_upload', 'other'],
+      default: 'other'
+    },
+    detectSummary: {
+      outcome: {
+        type: String,
+        enum: ['own_product', 'competitor', 'category', 'no_products', 'pending'],
+        default: 'pending'
+      },
+      matchedProducts: [{
+        name:      String,
+        brand:     String,
+        certainty: Number,
+        _id: false
+      }],
+      matchedCategories: [String],
+      detectedAt: Date
+    }
+  },
+
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
