@@ -134,6 +134,18 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
       const h = sy2 - sy1;
       if (w <= 0 || h <= 0) continue;
 
+      // Confidence clamp: the LLM crop-refine call returns its own
+      // confidence for the box, but the refined product can never be
+      // MORE certain than the upstream identification it inherits brand
+      // and category from. A 0.96 box confidence on a 0.595 reconciled
+      // identification was inflating shaky single-engine signals into
+      // high-confidence refined products. Clamp to the upstream ceiling.
+      const upstreamConf = (det.identification?.confidence != null)
+        ? clampUnit(Number(det.identification.confidence))
+        : 1;
+      const boxConf = clampUnit(Number(box.confidence));
+      const refinedConfidence = Math.min(boxConf, upstreamConf);
+
       refined.push({
         id:                `r${counter++}`,
         sourceDetectionId: det.id,
@@ -149,7 +161,7 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
         category:          det.identification?.category || null,
         brand:             det.identification?.brand || null,
         categoryLabel:     det.engines?.reconciled?.products?.[0]?.categoryLabel || null,
-        confidence:        clampUnit(Number(box.confidence)),
+        confidence:        refinedConfidence,
         croppedImageUrl:   buildCloudinaryCropUrl(sourceImageUrl, sx1, sy1, sx2, sy2)
       });
     }

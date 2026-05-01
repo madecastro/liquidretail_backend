@@ -100,11 +100,13 @@ function mergeProducts(gptProducts, geminiProducts, geminiUnavail) {
       out.push(buildCategoryConfirmedProduct(g, geminiProducts[bestIdx]));
     } else if (geminiUnavail) {
       // Gemini didn't run at all — single-engine penalty applies.
-      out.push(buildSingleEngineProduct(g, 'gpt-only', 'gemini call unavailable'));
+      const sg = buildSingleEngineProduct(g, 'gpt-only', 'gemini call unavailable');
+      if (sg) out.push(sg);
     } else {
       // Gemini ran but neither matched at SKU level nor at brand+category
       // level — this product is GPT's alone. Penalty stands.
-      out.push(buildSingleEngineProduct(g, 'gpt-only', 'GPT identified; Gemini did not corroborate at brand/category'));
+      const sg = buildSingleEngineProduct(g, 'gpt-only', 'GPT identified; Gemini did not corroborate at brand/category');
+      if (sg) out.push(sg);
     }
   }
 
@@ -114,7 +116,8 @@ function mergeProducts(gptProducts, geminiProducts, geminiUnavail) {
   // engine penalty applies.
   for (let i = 0; i < geminiProducts.length; i++) {
     if (matched.has(i)) continue;
-    out.push(buildSingleEngineProduct(geminiProducts[i], 'gemini-only', 'Gemini identified; GPT did not corroborate'));
+    const sg = buildSingleEngineProduct(geminiProducts[i], 'gemini-only', 'Gemini identified; GPT did not corroborate');
+    if (sg) out.push(sg);
   }
 
   // Sort by confidence desc — primary product (alias target) is index 0.
@@ -169,13 +172,23 @@ function buildCategoryConfirmedProduct(gpt, gemini) {
   };
 }
 
+// Single-engine floor: a single-engine identification with post-penalty
+// confidence below this is a hallucination risk (one engine saw something
+// the other missed AND wasn't very sure about it). Returns null so the
+// caller can drop the product from the reconciled list.
+const SINGLE_ENGINE_FLOOR = 0.60;
+
 function buildSingleEngineProduct(p, agreement, reasoning) {
+  const penalized = Math.max(0, Math.min(1, (p.confidence || 0) * 0.85));    // single-engine penalty
+  if (penalized < SINGLE_ENGINE_FLOOR) {
+    return null;
+  }
   return {
     label:        p.label,
     description:  p.description || '',
     brand:        p.brand || null,
     category:     p.category || 'other',
-    confidence:   Math.max(0, Math.min(1, (p.confidence || 0) * 0.85)),    // single-engine penalty
+    confidence:   penalized,
     sourceEngines: [agreement === 'gpt-only' ? 'gpt' : 'gemini'],
     agreement,
     reasoning

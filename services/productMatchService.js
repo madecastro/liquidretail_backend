@@ -381,25 +381,95 @@ async function runPerProductReasoner(provResult, refined, ctx) {
 }
 
 // Build a match record from per-product provider+reasoner output.
-// Outcome derived from reasoner certainty (no multi-brand/decision-tree
-// scaffolding — that's a scene-level concern handled separately when no
-// refinedProducts exist). Multi-brand contention across refined products
-// gets surfaced via aggregateDetectSummary downstream.
+//
+// Outcome decision uses TWO confidences:
+//   - reasoner certainty: SKU-level claim from web-grounded providers
+//   - refined confidence: category-level claim from upstream dual-engine
+//                         (vision-based, often more confident at the
+//                         broader claim than the reasoner is at the SKU)
+//
+// Decision tree:
+//   reasoner.certainty ≥ HIGH_CONFIDENCE  → product_match (SKU-level hit)
+//   reasoner.certainty in mid AND refined ≥ HIGH_CONFIDENCE
+//                                          → product_match using REFINED
+//                                            label (broader claim still
+//                                            confident; SKU stays as
+//                                            secondary evidence)
+//   reasoner.certainty in mid              → product_category
+//   else                                   → brand_match
+//
+// Also enforces:
+//   - URL-type guard: reasoner's productName is only trusted when its
+//     primary evidence URL looks like a product page (e.g. /products/,
+//     /dp/, /p/). Marketing pages (/pages/, /blog/, /collections/, …)
+//     get the productName stripped — they're brand-level evidence only.
+//   - brand_match nulls out productName/variant/reasoning/primaryUrl/
+//     primaryThumbnail so consumers don't read fabricated SKUs.
 function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
-  const certainty = ident?.certainty || 0;
+  const reasonerCert = ident?.certainty || 0;
+  const refinedCert  = clampUnit(refined?.confidence ?? 0);
+
+  // URL-type guard — strip productName when the primary evidence URL
+  // doesn't look like a product page. Pelagic Gear's /pages/fleet hit
+  // generated a fabricated "PELAGIC Pro Team Fishing Boat (Fleet Series)"
+  // SKU; that page is editorial/marketing, not commerce.
+  let cleanedIdent = ident;
+  if (ident?.productName && !looksLikeProductUrl(ident.primaryUrl, ident.evidenceUrls)) {
+    cleanedIdent = {
+      ...ident,
+      productName: null,
+      variant:     null,
+      reasoning:   `evidence URL "${ident.primaryUrl || '(none)'}" is not a product page; productName stripped`
+    };
+  }
+
+  const cert = cleanedIdent?.certainty || 0;
   let outcome, winner, outcomeReasoning;
-  if (ident?.productName && certainty >= HIGH_CONFIDENCE) {
+  if (cleanedIdent?.productName && cert >= HIGH_CONFIDENCE) {
     outcome = 'product_match';
     winner  = 'gemini';
-    outcomeReasoning = `per-product Gemini search + reasoner identified "${ident.productName}" at ${(certainty * 100).toFixed(0)}% certainty`;
-  } else if (ident?.productName && certainty > CATEGORY_LOWER && certainty <= CATEGORY_UPPER) {
+    outcomeReasoning = `per-product reasoner identified "${cleanedIdent.productName}" at ${(cert * 100).toFixed(0)}% certainty`;
+  } else if (refinedCert >= HIGH_CONFIDENCE && refined.brand && cert >= 0.50) {
+    // Reasoner couldn't pin a SKU but the dual-engine is confident at
+    // brand+category level. Promote to product_match using the BROADER
+    // refined label so the high-confidence vision claim isn't lost.
+    outcome = 'product_match';
+    winner  = 'agree';
+    outcomeReasoning = `dual-engine refined identification "${refined.label}" at ${(refinedCert * 100).toFixed(0)}% (reasoner at ${(cert * 100).toFixed(0)}% on SKU "${cleanedIdent?.productName || 'n/a'}")`;
+    cleanedIdent = {
+      ...(cleanedIdent || {}),
+      productName: refined.label,
+      brand:       refined.brand,
+      certainty:   refinedCert,
+      certaintyLabel: 'high',
+      reasoning:   `Refined identification used (dual-engine ${(refinedCert * 100).toFixed(0)}% beat reasoner SKU at ${(cert * 100).toFixed(0)}%)`
+    };
+  } else if (cleanedIdent?.productName && cert > CATEGORY_LOWER && cert <= CATEGORY_UPPER) {
     outcome = 'product_category';
     winner  = 'gemini';
-    outcomeReasoning = `per-product reasoner: mid-confidence (${(certainty * 100).toFixed(0)}%); falling back to brand collection page`;
+    outcomeReasoning = `per-product reasoner: mid-confidence (${(cert * 100).toFixed(0)}%); falling back to brand collection page`;
   } else {
     outcome = 'brand_match';
     winner  = null;
-    outcomeReasoning = `per-product providers returned no trustworthy product signal (certainty ${(certainty * 100).toFixed(0)}%)`;
+    outcomeReasoning = `per-product providers returned no trustworthy product signal (certainty ${(cert * 100).toFixed(0)}%)`;
+    // Strip fabricated SKU info from brand_match identifications so
+    // consumers don't read low-confidence ghost products. Keep brand,
+    // certainty, evidenceUrls — those are real brand-level evidence.
+    if (cleanedIdent) {
+      cleanedIdent = {
+        brand:           cleanedIdent.brand || null,
+        certainty:       cleanedIdent.certainty ?? 0,
+        certaintyLabel:  cleanedIdent.certaintyLabel || 'low',
+        reasoning:       cleanedIdent.reasoning || '',
+        evidenceUrls:    cleanedIdent.evidenceUrls || [],
+        // Explicitly null these so the schema doesn't carry stale values.
+        productName:     null,
+        variant:         null,
+        primaryUrl:      null,
+        primaryRetailer: null,
+        primaryThumbnail: null
+      };
+    }
   }
 
   return {
@@ -415,11 +485,12 @@ function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
         id:              refined.id,
         label:           refined.label,
         category:        refined.category,
+        confidence:      refinedCert,                     // upstream dual-engine confidence
         x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
         croppedImageUrl: refined.croppedImageUrl
       }
     },
-    identification:       ident,
+    identification:       cleanedIdent,
     outcome,
     outcomeReasoning,
     winner,
@@ -434,6 +505,33 @@ function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
     brandCategory:        null,                        // ditto
     brandReviews:         null
   };
+}
+
+// Heuristic check — does this URL look like a product page (commerce),
+// or is it editorial/marketing? Used to gate productName trust in the
+// per-product reasoner output.
+function looksLikeProductUrl(primaryUrl, evidenceUrls) {
+  const PRODUCT_PATTERNS = /\/(products?|product-detail|item|sku|dp|p|gp\/product|pd\/|shop\/)\b/i;
+  const NON_PRODUCT_PATTERNS = /\/(pages|page|blog|news|article|post|category|categories|collections|collection|tag|search|about|team|fleet|community|gallery)\b/i;
+  const candidates = [primaryUrl, ...(Array.isArray(evidenceUrls) ? evidenceUrls.map(e => e?.url) : [])].filter(Boolean);
+  if (!candidates.length) return false;
+  // If ANY candidate URL matches a product pattern, accept. If the only
+  // URLs match non-product patterns, reject.
+  for (const u of candidates) {
+    if (PRODUCT_PATTERNS.test(u)) return true;
+  }
+  for (const u of candidates) {
+    if (NON_PRODUCT_PATTERNS.test(u)) return false;
+  }
+  // Ambiguous (e.g. domain root). Be conservative — reject so we fall
+  // through to brand_match instead of fabricating a SKU.
+  return false;
+}
+
+function clampUnit(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(1, v));
 }
 
 // ── Phase 1.7a — per-product orchestrator ──
