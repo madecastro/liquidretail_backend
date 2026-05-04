@@ -33,7 +33,101 @@ async function refineDetectionCrops(detections, sourceImageUrl) {
     const refined = await refineChunk(chunk, sourceImageUrl, offset);
     all.push(...refined);
   }
-  return all;
+  // Dedup pass — overlapping YOLO detections (e.g. a person bbox and a
+  // whole-image object bbox both containing the same glove) yield
+  // duplicate refined products after multi-product surfacing. Collapse
+  // them by spatial overlap + same brand/category, keeping the highest
+  // confidence and re-IDing sequentially.
+  return dedupRefinedProducts(all);
+}
+
+// IoU-based dedup. Two refined products are duplicates when they share
+// brand + category AND either (a) IoU ≥ 0.5 or (b) one bbox is contained
+// ≥80% inside the other. Brand match uses loose normalize (so "Pelagic"
+// and "Pelagic Gear" merge); category requires exact match (apparel vs
+// sports stays distinct so we don't collapse a glove and a fishing belt).
+function dedupRefinedProducts(refined) {
+  if (!Array.isArray(refined) || refined.length <= 1) return refined;
+  const sorted = refined.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  const kept = [];
+  let dropped = 0;
+  for (const r of sorted) {
+    const dup = kept.find(k => areDuplicateRefined(r, k));
+    if (dup) {
+      dropped++;
+      continue;
+    }
+    kept.push(r);
+  }
+  if (dropped > 0) {
+    console.log(`   · crop-refine dedup: dropped ${dropped} duplicate refined product(s) (${kept.length} kept of ${refined.length})`);
+  }
+  // Re-id sequentially so the visible IDs stay r1..rN with no gaps.
+  return kept.map((r, i) => ({ ...r, id: `r${i + 1}` }));
+}
+
+function areDuplicateRefined(a, b) {
+  if (!sameBrandLoose(a.brand, b.brand)) return false;
+  if ((a.category || null) !== (b.category || null)) return false;
+  if (computeIoU(a, b) >= 0.5) return true;
+  // Containment — small glove bbox inside a whole-image object bbox.
+  // Use the smaller of the two as the "small" half and check what
+  // fraction of it lies inside the larger.
+  const aArea = bboxArea(a);
+  const bArea = bboxArea(b);
+  const [small, large] = aArea <= bArea ? [a, b] : [b, a];
+  return containmentRatio(small, large) >= 0.80;
+}
+
+function computeIoU(a, b) {
+  const ix1 = Math.max(a.x1, b.x1);
+  const iy1 = Math.max(a.y1, b.y1);
+  const ix2 = Math.min(a.x2, b.x2);
+  const iy2 = Math.min(a.y2, b.y2);
+  if (ix2 <= ix1 || iy2 <= iy1) return 0;
+  const inter = (ix2 - ix1) * (iy2 - iy1);
+  const union = bboxArea(a) + bboxArea(b) - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+function containmentRatio(small, large) {
+  const ix1 = Math.max(small.x1, large.x1);
+  const iy1 = Math.max(small.y1, large.y1);
+  const ix2 = Math.min(small.x2, large.x2);
+  const iy2 = Math.min(small.y2, large.y2);
+  if (ix2 <= ix1 || iy2 <= iy1) return 0;
+  const inter = (ix2 - ix1) * (iy2 - iy1);
+  const smallA = bboxArea(small);
+  return smallA > 0 ? inter / smallA : 0;
+}
+
+function bboxArea(b) {
+  const w = Math.max(0, (b.x2 || 0) - (b.x1 || 0));
+  const h = Math.max(0, (b.y2 || 0) - (b.y1 || 0));
+  return w * h;
+}
+
+function sameBrandLoose(a, b) {
+  const na = normalizeBrandKey(a);
+  const nb = normalizeBrandKey(b);
+  if (!na && !nb) return true;     // both null/empty → treat as equal
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // Whole-token prefix tolerance (≥4 chars on the shorter side) so
+  // "Pelagic" matches "Pelagic Gear" — same logic as productMatchService.
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer  = na.length <= nb.length ? nb : na;
+  if (shorter.length < 4) return false;
+  return longer.startsWith(shorter + ' ');
+}
+
+function normalizeBrandKey(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[®™©]/g, '')
+    .replace(/\b(inc|co|llc|ltd|corp|corporation)\.?/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 async function refineChunk(chunk, sourceImageUrl, idOffset) {
