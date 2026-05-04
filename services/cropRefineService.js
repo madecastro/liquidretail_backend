@@ -50,36 +50,48 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
     promptIndexToChunk[promptIndex] = i;
     const dataUrl = `data:image/jpeg;base64,${det.cropBuffer.toString('base64')}`;
     imageParts.push({ type: 'image_url', image_url: { url: dataUrl } });
-    const label = det.identification?.label || det.className || 'product';
-    const cat   = det.identification?.category || 'other';
-    indexLines.push(`#${promptIndex} — labeled "${label}" (${cat})`);
+
+    // List ALL reconciled products for this crop (not just the primary).
+    // The upstream dual-engine reconciler often identifies multiple products
+    // inside a single YOLO bbox (e.g. a 'person' crop containing glove +
+    // cap + shirt + fighting belt). The LLM needs to know about all of
+    // them to produce one box per product.
+    const reconciled = det.engines?.reconciled?.products || [];
+    const products = reconciled.length
+      ? reconciled
+      : [{ label: det.identification?.label || det.className || 'product', category: det.identification?.category || 'other', brand: det.identification?.brand || null, confidence: det.identification?.confidence ?? null }];
+
+    const productLines = products.map((p, idx) => {
+      const conf = (typeof p.confidence === 'number') ? ` · ${(p.confidence * 100).toFixed(0)}%` : '';
+      const brand = p.brand ? ` · ${p.brand}` : '';
+      return `    ${idx + 1}. "${p.label}" (${p.category || 'other'})${brand}${conf}`;
+    }).join('\n');
+    indexLines.push(`#${promptIndex} — ${products.length} identified product(s):\n${productLines}`);
   });
 
   if (imageParts.length === 0) return [];
 
   const prompt =
-    `You will see ${imageParts.length} product crop(s). For each crop, return tight ` +
-    `bounding box(es) — NORMALIZED to [0.0, 1.0] relative to the crop's own dimensions ` +
-    `— covering JUST the labeled product. A single crop may show MULTIPLE distinguishable ` +
-    `products (e.g., a 'person' crop may contain both a bikini top and bikini bottoms — ` +
-    `return one box per item).\n\n` +
-    `Crops:\n${indexLines.join('\n')}\n\n` +
+    `You will see ${imageParts.length} crop image(s). For EACH crop, the upstream ` +
+    `vision pipeline has already identified one or more products inside it. Your job is ` +
+    `to return a tight bounding box for EACH identified product — NORMALIZED to [0.0, 1.0] ` +
+    `relative to the crop's own dimensions.\n\n` +
+    `Crops and their identified products:\n${indexLines.join('\n')}\n\n` +
     `Return JSON:\n` +
     `{ "items": [\n` +
-    `  { "index": 1, "boxes": [ { "x1": 0.12, "y1": 0.05, "x2": 0.85, "y2": 0.45, "label": "bikini top", "confidence": 0.9 } ] },\n` +
-    `  { "index": 2, "boxes": [\n` +
-    `    { "x1": 0.10, "y1": 0.05, "x2": 0.90, "y2": 0.45, "label": "bikini top", "confidence": 0.85 },\n` +
-    `    { "x1": 0.20, "y1": 0.55, "x2": 0.85, "y2": 0.95, "label": "bikini bottom", "confidence": 0.80 }\n` +
+    `  { "index": 1, "boxes": [\n` +
+    `    { "x1": 0.10, "y1": 0.05, "x2": 0.90, "y2": 0.45, "label": "bikini top", "confidence": 0.9 },\n` +
+    `    { "x1": 0.20, "y1": 0.55, "x2": 0.85, "y2": 0.95, "label": "bikini bottom", "confidence": 0.85 }\n` +
     `  ] }\n` +
     `]}\n\n` +
     `Guidance:\n` +
     `- Coordinates MUST be in [0, 1] relative to the input crop dimensions (0,0 = top-left)\n` +
-    `- "label" should be the specific product type (e.g., "bikini top", "leggings", "trucker hat") — refine the input label when possible\n` +
-    `- "confidence" reflects how cleanly the box isolates the labeled product\n` +
-    `- If the crop already tightly shows ONLY the labeled product, return one box at ~{x1:0.05, y1:0.05, x2:0.95, y2:0.95}\n` +
-    `- If the crop is unsuitable (too blurry, too small, no clear product, or shows only background after Phase 1.5 filtering somehow let it through), return an empty "boxes" array for that index\n` +
+    `- Return ONE box for EACH identified product listed for the crop. The "label" you return MUST closely match one of the identified product labels (verbatim or near-verbatim) so we can pair the box back to the source identification.\n` +
+    `- If a listed product is NOT actually visible in the crop, omit its box (don't fabricate one).\n` +
+    `- "confidence" reflects how cleanly your box isolates the labeled product (independent from the upstream identification confidence — both will be combined downstream).\n` +
+    `- If the entire crop tightly shows ONE product, return ~{x1:0.05, y1:0.05, x2:0.95, y2:0.95} for that label.\n` +
+    `- If the crop is unsuitable (too blurry, no products visible), return an empty "boxes" array.\n` +
     `- Return one item for every index 1..${imageParts.length}\n` +
-    `- Do NOT confabulate products that aren't visibly present\n` +
     `Return ONLY valid JSON — no prose outside.`;
 
   let parsed;
@@ -134,15 +146,24 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
       const h = sy2 - sy1;
       if (w <= 0 || h <= 0) continue;
 
-      // Confidence clamp: the LLM crop-refine call returns its own
-      // confidence for the box, but the refined product can never be
-      // MORE certain than the upstream identification it inherits brand
-      // and category from. A 0.96 box confidence on a 0.595 reconciled
-      // identification was inflating shaky single-engine signals into
-      // high-confidence refined products. Clamp to the upstream ceiling.
-      const upstreamConf = (det.identification?.confidence != null)
-        ? clampUnit(Number(det.identification.confidence))
-        : 1;
+      // Match the LLM-returned box to the SPECIFIC reconciled product it
+      // refers to (not just det.identification[0] which is only the primary).
+      // The LLM was told to return labels matching one of the identified
+      // products; we pair by token-overlap so each refined product carries
+      // its own brand / category / categoryLabel / source confidence.
+      const reconciled = det.engines?.reconciled?.products || [];
+      const matched = matchBoxToReconciled(box.label, reconciled) || null;
+
+      // Confidence clamp: refined.confidence ≤ matched reconciled product's
+      // confidence (or det.identification.confidence as fallback). The LLM
+      // box.confidence describes how tight the bbox is; the upstream
+      // reconciled confidence describes how sure we are the product is
+      // there. Take the min so refined never out-confidences its source.
+      const upstreamConf = (matched?.confidence != null
+        ? clampUnit(Number(matched.confidence))
+        : (det.identification?.confidence != null
+          ? clampUnit(Number(det.identification.confidence))
+          : 1));
       const boxConf = clampUnit(Number(box.confidence));
       const refinedConfidence = Math.min(boxConf, upstreamConf);
 
@@ -153,14 +174,15 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
         y1:                sy1,
         x2:                sx2,
         y2:                sy2,
-        label:             typeof box.label === 'string' && box.label.trim() ? box.label.trim() : (det.identification?.label || ''),
-        // Phase 1.7 — carry the upstream reconciled identification's category +
-        // brand + categoryLabel through. Catalog-first matching uses category
+        label:             matched?.label || (typeof box.label === 'string' && box.label.trim() ? box.label.trim() : (det.identification?.label || '')),
+        // Phase 1.7 — carry the matched reconciled product's category +
+        // brand + categoryLabel. Catalog-first matching uses category
         // for hard scoping the candidate pool, and categoryLabel as a
         // fallback text query when the specific label doesn't catalog-match.
-        category:          det.identification?.category || null,
-        brand:             det.identification?.brand || null,
-        categoryLabel:     det.engines?.reconciled?.products?.[0]?.categoryLabel || null,
+        category:          matched?.category || det.identification?.category || null,
+        brand:             matched?.brand || det.identification?.brand || null,
+        categoryLabel:     matched?.categoryLabel || null,
+        agreement:         matched?.agreement || null,
         confidence:        refinedConfidence,
         croppedImageUrl:   buildCloudinaryCropUrl(sourceImageUrl, sx1, sy1, sx2, sy2)
       });
@@ -174,6 +196,45 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
 function clampUnit(n) {
   if (typeof n !== 'number' || !isFinite(n)) return 0;
   return Math.max(0, Math.min(1, n));
+}
+
+// Pair an LLM-returned box label to one of the reconciled products
+// identified for the source crop. Token-Jaccard over normalized labels;
+// returns the highest-overlap reconciled entry, falling back to null when
+// none cross a soft threshold (caller treats null as "use det defaults").
+function matchBoxToReconciled(boxLabel, reconciledProducts) {
+  if (!boxLabel || !Array.isArray(reconciledProducts) || !reconciledProducts.length) return null;
+  const boxTokens = tokenize(boxLabel);
+  if (!boxTokens.size) return reconciledProducts[0] || null;
+  let best = null;
+  let bestScore = 0;
+  for (const r of reconciledProducts) {
+    const rTokens = tokenize(r.label || '');
+    if (!rTokens.size) continue;
+    const inter = [...boxTokens].filter(t => rTokens.has(t)).length;
+    const union = new Set([...boxTokens, ...rTokens]).size;
+    const score = union ? inter / union : 0;
+    if (score > bestScore) {
+      bestScore = score;
+      best = r;
+    }
+  }
+  // Soft threshold: 0.25 Jaccard catches "fishing glove" ↔ "Pelagic Gear
+  // fishing glove" without matching unrelated labels. Below threshold,
+  // fall back to the highest-confidence reconciled product as a safer
+  // default than nothing.
+  if (bestScore >= 0.25) return best;
+  return reconciledProducts[0] || null;
+}
+
+function tokenize(s) {
+  return new Set(
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length > 2)        // drop "a", "of", "the"
+  );
 }
 
 // Build a Cloudinary `c_crop` transform URL that returns the tight crop

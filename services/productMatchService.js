@@ -484,7 +484,10 @@ function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
       productCrop: {
         id:              refined.id,
         label:           refined.label,
+        categoryLabel:   refined.categoryLabel || null,   // broader label from category-confirmed reconciliation
         category:        refined.category,
+        brand:           refined.brand || null,
+        agreement:       refined.agreement || null,
         confidence:      refinedCert,                     // upstream dual-engine confidence
         x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
         croppedImageUrl: refined.croppedImageUrl
@@ -946,7 +949,11 @@ function buildCatalogWinnerMatchRecord(refined, catRes, args) {
       productCrop: {
         id:               refined.id,
         label:            refined.label,
+        categoryLabel:    refined.categoryLabel || null,
         category:         refined.category,
+        brand:            refined.brand || null,
+        agreement:        refined.agreement || null,
+        confidence:       clampUnit(refined.confidence ?? 0),
         x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
         croppedImageUrl:  refined.croppedImageUrl
       }
@@ -999,7 +1006,11 @@ function buildSceneLevelMatchRecord(refined, sceneLevel, args) {
       productCrop: {
         id:              refined.id,
         label:           refined.label,
+        categoryLabel:   refined.categoryLabel || null,
         category:        refined.category,
+        brand:           refined.brand || null,
+        agreement:       refined.agreement || null,
+        confidence:      clampUnit(refined.confidence ?? 0),
         x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
         croppedImageUrl: refined.croppedImageUrl
       }
@@ -1036,7 +1047,11 @@ function buildRefinedFallbackRecord(refined, sceneLevel, args) {
       productCrop: {
         id:              refined.id,
         label:           refined.label,
+        categoryLabel:   refined.categoryLabel || null,
         category:        refined.category,
+        brand:           refined.brand || null,
+        agreement:       refined.agreement || null,
+        confidence:      clampUnit(refined.confidence ?? 0),
         x1: refined.x1, y1: refined.y1, x2: refined.x2, y2: refined.y2,
         croppedImageUrl: refined.croppedImageUrl
       }
