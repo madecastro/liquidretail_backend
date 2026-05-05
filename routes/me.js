@@ -68,4 +68,61 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /api/me/deletion-preview
+// Dry-run the account-deletion plan so the UI can show the user what
+// will happen before they type their email to confirm. Returns
+// canDelete=false when the user is the sole owner of any advertiser
+// that has other active members — they have to promote a new owner
+// or remove those members first.
+router.get('/deletion-preview', async (req, res) => {
+  try {
+    const { planAccountDeletion } = require('../services/accountDeletionService');
+    const plan = await planAccountDeletion(req.user.userId);
+    res.json(plan);
+  } catch (err) {
+    console.error('account deletion preview failed:', err);
+    res.status(500).json({ error: err.message || 'preview failed' });
+  }
+});
+
+// DELETE /api/me
+// Permanently delete the current user. Body must include
+// { confirmEmail: <user's email> } as a type-to-confirm gate (the UI
+// uses the same UX as the brand DangerZone).
+//
+// Cascades:
+//   - Advertisers where the user is the sole member → full brand
+//     cascade for every brand, then memberships, then the advertiser.
+//   - Advertisers where other members exist → user's membership is
+//     soft-revoked (preserves audit trail).
+//   - The User row itself is hard-deleted.
+//
+// Sign-out is client-side (JWT in localStorage); the frontend clears
+// auth and redirects after a 200.
+router.delete('/', express.json(), async (req, res) => {
+  try {
+    const confirmEmail = String(req.body?.confirmEmail || '').trim().toLowerCase();
+    const myEmail      = String(req.user.email || '').trim().toLowerCase();
+    if (!confirmEmail || confirmEmail !== myEmail) {
+      return res.status(400).json({
+        error:    'confirmEmail must match your email exactly',
+        expected: myEmail
+      });
+    }
+    const { executeAccountDeletion } = require('../services/accountDeletionService');
+    const result = await executeAccountDeletion(req.user.userId);
+    res.json(result);
+  } catch (err) {
+    if (err.code === 'SOLE_OWNER_BLOCKED') {
+      return res.status(409).json({
+        error:    err.message,
+        code:     err.code,
+        blockers: err.blockers
+      });
+    }
+    console.error('account delete failed:', err);
+    res.status(500).json({ error: err.message || 'account delete failed' });
+  }
+});
+
 module.exports = router;
