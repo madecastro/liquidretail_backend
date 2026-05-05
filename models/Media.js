@@ -42,11 +42,13 @@ const mediaSchema = new mongoose.Schema({
   //   { brand, category, caption, postedAt, accountId, postType, hashtags[] }
 
   platformStats: {
-    views:      Number,
+    views:      Number,    // IG: impressions (image) or plays (video/reel)
     likes:      Number,
     comments:   Number,
     shares:     Number,
     saves:      Number,
+    reach:      Number,    // unique accounts reached — distinct from views
+    engagement: Number,    // total interactions (IG insights aggregate)
     fetchedAt:  Date
   },
 

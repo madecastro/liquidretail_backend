@@ -30,9 +30,66 @@ const DEFAULT_LIMIT = 50;
 
 const POST_FIELDS = [
   'id', 'media_type', 'media_url', 'thumbnail_url', 'permalink',
-  'caption', 'timestamp', 'username', 'is_comment_enabled'
+  'caption', 'timestamp', 'username', 'is_comment_enabled',
+  // Post analytics — basic engagement counters (no extra scope needed).
+  'like_count', 'comments_count'
 ].join(',');
 const CHILD_FIELDS = ['id', 'media_type', 'media_url', 'thumbnail_url'].join(',');
+
+// Insights metric set per media type. Reels have a different metric
+// taxonomy than feed photos/videos; calling the wrong set returns 400.
+const INSIGHTS_METRICS_FEED  = ['impressions', 'reach', 'engagement', 'saved'];
+const INSIGHTS_METRICS_REEL  = ['reach', 'plays', 'total_interactions', 'likes', 'comments', 'shares', 'saved'];
+const INSIGHTS_METRICS_VIDEO = ['impressions', 'reach', 'saved', 'video_views'];
+
+// Pull engagement insights for a single IG media. Requires the
+// instagram_manage_insights scope; creds without it (legacy) get null
+// and we fall back to the basic-endpoint counters.
+async function fetchPostInsights(externalId, mediaType, token) {
+  const metrics = mediaType === 'REEL'  ? INSIGHTS_METRICS_REEL
+                : mediaType === 'VIDEO' ? INSIGHTS_METRICS_VIDEO
+                :                         INSIGHTS_METRICS_FEED;
+  try {
+    const res = await axios.get(`${META_GRAPH_ROOT}/${externalId}/insights`, {
+      params:  { metric: metrics.join(','), access_token: token },
+      timeout: 12000
+    });
+    const out = {};
+    for (const row of (res.data?.data || [])) {
+      const v = row.values?.[0]?.value;
+      if (typeof v === 'number') out[row.name] = v;
+    }
+    return out;
+  } catch (err) {
+    // 100 = invalid metric for media type; 10 = scope missing; 200/190
+    // = permission. All graceful — caller falls back to basic counters.
+    return null;
+  }
+}
+
+// Map basic + insights fields onto our unified Media.platformStats
+// shape. Drops keys whose value is null/undefined so partial stats
+// from a legacy cred don't overwrite previously-populated fields.
+function buildPlatformStats(post, insights, mediaType) {
+  const isVideo = mediaType === 'VIDEO' || mediaType === 'REEL';
+  const stats = {
+    likes:      typeof post.like_count     === 'number' ? post.like_count     : null,
+    comments:   typeof post.comments_count === 'number' ? post.comments_count : null,
+    views:      isVideo
+                  ? (insights?.plays ?? insights?.video_views ?? null)
+                  : (insights?.impressions ?? null),
+    reach:      insights?.reach ?? null,
+    saves:      insights?.saved ?? null,
+    shares:     insights?.shares ?? null,
+    engagement: insights?.engagement ?? insights?.total_interactions ?? null,
+    fetchedAt:  new Date()
+  };
+  const out = {};
+  for (const [k, v] of Object.entries(stats)) {
+    if (v != null) out[k] = v;
+  }
+  return out;
+}
 
 // V2 #5 multi-page aware. When options.credentialId is set, sync just
 // that one credential; otherwise iterate every active IG credential
@@ -296,6 +353,20 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
       return { runId: null };
     }
     throw err;
+  }
+
+  // Refresh engagement stats on EVERY sync (not just first ingest) so
+  // re-runs catch new likes/comments/impressions. Insights endpoint is
+  // best-effort — creds without instagram_manage_insights still get
+  // like_count + comments_count from the basic /media response.
+  try {
+    const insights = await fetchPostInsights(externalId, resolvedType, token);
+    const stats = buildPlatformStats(post, insights, resolvedType);
+    if (Object.keys(stats).length > 0) {
+      await Media.updateOne({ _id: media._id }, { $set: { platformStats: stats } });
+    }
+  } catch (err) {
+    console.warn(`   ⚠️  platformStats update failed for ${externalId}: ${err.message}`);
   }
 
   // Don't enqueue if the caller is rate-capped — Media is still

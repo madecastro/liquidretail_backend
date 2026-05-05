@@ -32,7 +32,12 @@ const SCOPES = [
   // V3 #3 — required for posting reply comments on the brand's IG
   // posts. Brands that connected before this scope was added must
   // reconnect to enable the comment-reply feature.
-  'instagram_manage_comments'
+  'instagram_manage_comments',
+  // Post analytics — required for the /insights endpoint that returns
+  // impressions, reach, engagement, saved (and plays/shares for reels).
+  // like_count + comments_count come from the basic media endpoint and
+  // don't need this scope, so creds without it still get partial stats.
+  'instagram_manage_insights'
 ];
 
 function getConfig() {

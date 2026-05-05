@@ -170,21 +170,22 @@ router.get('/:id', async (req, res) => {
     const [category, sourceMedia] = await Promise.all([
       product.categoryRef ? Category.findById(product.categoryRef).lean() : null,
       product.detectedFromMediaId
-        ? Media.findById(product.detectedFromMediaId).select('externalId fileType fileUrl fileName source metadata createdAt').lean()
+        ? Media.findById(product.detectedFromMediaId).select('externalId fileType fileUrl fileName source metadata platformStats createdAt').lean()
         : null
     ]);
 
     res.json({
       product: projectDetail(product, category),
       sourceMedia: sourceMedia ? {
-        id:        String(sourceMedia._id),
-        externalId: sourceMedia.externalId,
-        fileType:  sourceMedia.fileType,
-        fileUrl:   sourceMedia.fileUrl,
-        fileName:  sourceMedia.fileName,
-        source:    sourceMedia.source,
-        permalink: sourceMedia.metadata?.permalink || null,
-        createdAt: sourceMedia.createdAt
+        id:            String(sourceMedia._id),
+        externalId:    sourceMedia.externalId,
+        fileType:      sourceMedia.fileType,
+        fileUrl:       sourceMedia.fileUrl,
+        fileName:      sourceMedia.fileName,
+        source:        sourceMedia.source,
+        permalink:     sourceMedia.metadata?.permalink || null,
+        createdAt:     sourceMedia.createdAt,
+        platformStats: sourceMedia.platformStats || null
       } : null
     });
   } catch (err) {
