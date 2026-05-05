@@ -41,6 +41,7 @@ const { findOrCreateCategoryTree } = require('../models/Category');    // Phase 
 const Brand           = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
 const CatalogProduct  = require('../models/CatalogProduct');
+const { loadBrandSafety, evaluatePostSafety } = require('./brandSafetyService');
 
 // How long a cached Brand.brandReviews snapshot is considered fresh
 // before we re-fetch. 30 days — brand sentiment moves slowly enough
@@ -569,6 +570,31 @@ function clampUnit(n) {
 async function findPerProductMatches(args) {
   const { refinedProducts = [], brandId, caption, textDetected, brand } = args;
 
+  // ── Phase 4 follow-up #5 — Brand Safety pre-check ──
+  // Short-circuits before any matcher work when the post's text-bearing
+  // signals (caption + OCR + comments) hit any of the brand's curated
+  // blocked topics. Returns a do_not_use-shaped result so
+  // layoutInputService hard-stops downstream creative assembly without
+  // having to touch every consumer.
+  if (brandId) {
+    const safetyConfig = await loadBrandSafety(brandId);
+    if (safetyConfig && safetyConfig.blockedTopics.length > 0) {
+      const evalResult = evaluatePostSafety(safetyConfig.blockedTopics, {
+        caption,
+        textDetected,
+        comments: args.comments
+      });
+      if (!evalResult.safe) {
+        const topicsHit = [...new Set(evalResult.hits.map(h => h.topic))];
+        const sample = evalResult.hits.slice(0, 3)
+          .map(h => `${h.topic}→"${h.snippet}" (${h.source})`)
+          .join('; ');
+        console.log(`🛡️  brand-safety block (${safetyConfig.brandName || brandId}): topics=[${topicsHit.join(', ')}] · ${sample}`);
+        return buildBrandSafetyBlockResult(args, topicsHit, evalResult.hits, safetyConfig.brandName);
+      }
+    }
+  }
+
   // Phase 1.7 — per-refined-product catalog-first (text + visual)
   let perRefinedCatalog = [];
   let anyCatalogWinner  = false;
@@ -696,6 +722,68 @@ async function findPerProductMatches(args) {
     matchSource:      primary?.matchSource     || sceneLevel?.matchSource     || null,
     catalogMatch:     primary?.catalogMatch    || sceneLevel?.catalogMatch    || null,
     productReviews:   primary?.productReviews  || sceneLevel?.productReviews  || null
+  };
+}
+
+// ── Phase 4 follow-up #5 — brand-safety short-circuit shape ──
+//
+// Mirrors the legacy return shape so existing consumers (routes/detect,
+// pipelines/detect, layoutInputService, ProductMatchArtifact persistence)
+// keep working unchanged. outcome=do_not_use is the existing hard-stop
+// signal layoutInputService already enforces.
+//
+// We include a single synthetic match record so detect.js writes a
+// ProductMatchArtifact with outcome=do_not_use, making the block
+// queryable in run history. matches[] entry has identification=null,
+// so enrichOneMatchInPlace short-circuits without firing any provider
+// work (Tier 1/2/3 enrichment all gate on identification).
+function buildBrandSafetyBlockResult(args, topicsHit, hits, brandName) {
+  const reasoning = `Post matched blocked topic(s) in ${brandName ? `"${brandName}"` : 'brand'} safety policy: ${topicsHit.join(', ')}`;
+  const query = {
+    brand:          args.brand,
+    brandUrl:       args.brandUrl,
+    category:       args.category,
+    caption:        args.caption,
+    primarySubject: args.primarySubject,
+    textDetected:   args.textDetected
+  };
+  const syntheticMatch = {
+    productIndex:     null,
+    query,
+    providers:        {},
+    errors:           {},
+    identification:   null,
+    outcome:          'do_not_use',
+    outcomeReasoning: reasoning,
+    winner:           null,
+    matchSource:      null,
+    catalogMatch:     null,
+    catalogProductId: null,
+    brandSafetyBlock: { topics: topicsHit, hits }
+  };
+  return {
+    matches:          [syntheticMatch],
+    detectSummary: {
+      outcome:           'brand_safety_block',
+      matchedProducts:   0,
+      matchedCategories: [],
+      detectedAt:        new Date()
+    },
+    query,
+    identification:   null,
+    providers:        {},
+    errors:           {},
+    skipped:          ['brand_safety'],
+    totalMatches:     0,
+    outcome:          'do_not_use',
+    outcomeReasoning: reasoning,
+    winner:           null,
+    brandCategory:    null,
+    brandReviews:     null,
+    matchSource:      null,
+    catalogMatch:     null,
+    productReviews:   null,
+    brandSafetyBlock: { topics: topicsHit, hits }
   };
 }
 
