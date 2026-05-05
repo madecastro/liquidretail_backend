@@ -110,6 +110,29 @@ const campaignSchema = new mongoose.Schema({
   // walking the nested ads.
   matchedProductIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', index: true }],
 
+  // Per-platform performance insights — populated by the adapters
+  // (Meta /insights or Google GAQL metrics.*) and refreshed every
+  // campaign sync. All currency-style fields are stored in micros
+  // (account-currency × 1e6) to match the budget block. ctr is a
+  // fraction (0–1); the UI multiplies for display. rangeDays records
+  // the time window the metrics cover ('lifetime' is null).
+  insights: {
+    impressions:           Number,
+    reach:                 Number,    // Meta-only; Google leaves null
+    clicks:                Number,
+    ctr:                   Number,    // 0–1 fraction
+    cpcMicros:             Number,
+    cpmMicros:             Number,
+    spendMicros:           Number,
+    frequency:             Number,    // Meta-only
+    conversions:           Number,
+    conversionValueMicros: Number,
+    videoViews:            Number,
+    currency:              String,
+    rangeDays:             Number,    // null = lifetime
+    fetchedAt:             Date
+  },
+
   // What this campaign is actually promoting, derived from the match
   // results + campaign objective. Drives Step 2 of the Generate Ads
   // wizard:

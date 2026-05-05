@@ -121,8 +121,119 @@ async function syncForCredential(cred) {
   }
   console.log(`🔗 Meta creative match: ${totalMatched} product association(s) across ${campaigns.length} campaign(s) in ${Date.now() - matchT0}ms`);
 
+  // Insights — one /act_<id>/insights?level=campaign call returns
+  // performance metrics for every campaign in the account (paginated).
+  // Best-effort: failures don't abort the sync, campaigns just save
+  // without insights.
+  try {
+    const insightsByCampaign = await fetchAccountInsights(adAccountId, token, currency);
+    let attached = 0;
+    for (const c of campaigns) {
+      const ins = insightsByCampaign.get(String(c.externalId));
+      if (ins) { c.insights = ins; attached++; }
+    }
+    console.log(`📊 Meta insights: attached to ${attached} of ${campaigns.length} campaign(s)`);
+  } catch (err) {
+    console.warn(`   ⚠️  Meta insights fetch failed: ${err.message}`);
+    errors.push({ scope: 'insights', reason: err.message });
+  }
+
   console.log(`📣 Meta campaign sync done: cred=${cred._id} campaigns=${campaigns.length} errors=${errors.length} in ${Date.now() - t0}ms`);
   return { ok: true, campaigns, errors };
+}
+
+// ── Insights fetch (account-level → per-campaign map) ────────────────
+
+const INSIGHT_FIELDS = [
+  'campaign_id',
+  'impressions','reach','clicks','ctr','cpc','cpm','spend','frequency',
+  'actions','action_values','video_p25_watched_actions'
+].join(',');
+
+async function fetchAccountInsights(adAccountId, token, currency) {
+  const out = new Map();
+  let url = `${META_GRAPH_ROOT}/${adAccountId}/insights`;
+  let params = {
+    fields:       INSIGHT_FIELDS,
+    level:        'campaign',
+    date_preset:  'maximum',     // lifetime; matches our schema's rangeDays=null
+    limit:        100,
+    access_token: token
+  };
+  let pages = 0;
+  while (url && pages < 20) {
+    let res;
+    try {
+      res = await axios.get(url, { params, timeout: 25000 });
+    } catch (err) {
+      const detail = err.response?.data?.error?.message || err.message;
+      throw new Error(detail);
+    }
+    for (const row of (res.data?.data || [])) {
+      const cid = row.campaign_id;
+      if (!cid) continue;
+      out.set(String(cid), normalizeMetaInsights(row, currency));
+    }
+    const next = res.data?.paging?.next;
+    url = next || null;
+    params = next ? null : params;
+    pages++;
+  }
+  return out;
+}
+
+function normalizeMetaInsights(row, currency) {
+  const purchases = pickActionTotal(row.actions, 'purchase')
+                || pickActionTotal(row.actions, 'omni_purchase')
+                || null;
+  const purchaseValue = pickActionTotal(row.action_values, 'purchase')
+                     || pickActionTotal(row.action_values, 'omni_purchase')
+                     || null;
+  const videoViews = pickActionTotal(row.video_p25_watched_actions, 'video_view')
+                  || pickActionTotal(row.actions, 'video_view')
+                  || null;
+
+  return {
+    impressions:           toInt(row.impressions),
+    reach:                 toInt(row.reach),
+    clicks:                toInt(row.clicks),
+    // Meta returns CTR as a percent (e.g. 1.23 for 1.23%); store as
+    // 0–1 fraction to match Google's native shape.
+    ctr:                   toFloat(row.ctr) != null ? toFloat(row.ctr) / 100 : null,
+    cpcMicros:             toMicros(row.cpc),
+    cpmMicros:             toMicros(row.cpm),
+    spendMicros:           toMicros(row.spend),
+    frequency:             toFloat(row.frequency),
+    conversions:           purchases != null ? Number(purchases) : null,
+    conversionValueMicros: purchaseValue != null ? Math.round(Number(purchaseValue) * 1_000_000) : null,
+    videoViews:            videoViews != null ? Number(videoViews) : null,
+    currency:              currency || null,
+    rangeDays:             null,         // 'maximum' = lifetime
+    fetchedAt:             new Date()
+  };
+}
+
+function pickActionTotal(actions, type) {
+  if (!Array.isArray(actions)) return null;
+  let total = 0;
+  let hit = false;
+  for (const a of actions) {
+    if (a?.action_type === type && a.value != null) {
+      const v = Number(a.value);
+      if (Number.isFinite(v)) { total += v; hit = true; }
+    }
+  }
+  return hit ? total : null;
+}
+
+function toInt(v)   { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null; }
+function toFloat(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+function toMicros(v) {
+  // Meta currency fields come as decimal strings in account-currency
+  // dollars/euros/etc. Multiply to micros for storage parity with the
+  // budget block.
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n * 1_000_000) : null;
 }
 
 // ── Normalization helpers ────────────────────────────────────────────

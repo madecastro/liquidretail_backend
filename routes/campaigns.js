@@ -25,7 +25,7 @@ router.get('/', async (req, res) => {
     if (req.query.status)   filter.status   = req.query.status;
 
     const rows = await Campaign.find(tenantFilter(req, filter))
-      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds kind adSets lastSyncedAt firstSeenAt')
+      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds kind insights adSets lastSyncedAt firstSeenAt')
       .sort({ lastSyncedAt: -1 })
       .lean();
 
@@ -44,6 +44,7 @@ router.get('/', async (req, res) => {
         matchedProductCount: (c.matchedProductIds || []).length,
         adSetCount:    (c.adSets || []).length,
         adCount:       (c.adSets || []).reduce((s, set) => s + (set.ads || []).length, 0),
+        insights:      c.insights || null,
         lastSyncedAt:  c.lastSyncedAt || null,
         firstSeenAt:   c.firstSeenAt || null
       }))
@@ -119,6 +120,7 @@ router.get('/:id/products', async (req, res) => {
       productSetIds: c.productSetIds || [],
       adSetCount:    (c.adSets || []).length,
       adCount:       (c.adSets || []).reduce((s, set) => s + (set.ads || []).length, 0),
+      insights:      c.insights || null,
       lastSyncedAt:  c.lastSyncedAt || null,
       // A few representative ad creatives so the UI can preview what
       // the operator's campaign actually looks like — caps at 6.

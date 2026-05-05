@@ -289,6 +289,35 @@ async function syncForCredential(cred) {
     console.warn(`   · asset_group listing groups: ${gaqlError(err)}`);
   }
 
+  // ── 5. Insights — metrics.* aggregated per campaign (lifetime) ──
+  // GAQL omits segments.date so each row is the lifetime aggregate
+  // for its campaign. Best-effort: failures don't abort the sync.
+  try {
+    const rows = await runGAQL(ctx, `
+      SELECT
+        campaign.id,
+        metrics.impressions, metrics.clicks, metrics.ctr,
+        metrics.average_cpc, metrics.average_cpm, metrics.cost_micros,
+        metrics.conversions, metrics.conversions_value,
+        metrics.video_views
+      FROM campaign
+      WHERE campaign.status != 'REMOVED'
+      LIMIT 1000
+    `);
+    let attached = 0;
+    for (const r of rows) {
+      const cid = r.campaign?.id;
+      const camp = campaignMap.get(cid);
+      if (!camp) continue;
+      camp.insights = normalizeGoogleInsights(r.metrics, ctx.currency);
+      attached++;
+    }
+    console.log(`📊 Google insights: attached to ${attached} of ${campaignMap.size} campaign(s)`);
+  } catch (err) {
+    console.warn(`   ⚠️  Google insights query failed: ${gaqlError(err)}`);
+    errors.push({ scope: 'insights', reason: gaqlError(err) });
+  }
+
   const campaigns = [...campaignMap.values()];
 
   // Creative-level matching against CatalogProduct (URL + collection +
@@ -347,6 +376,34 @@ async function runGAQL(ctx, query) {
     if (!pageToken) break;
   }
   return results;
+}
+
+// Map Google's metrics.* shape onto the unified Campaign.insights
+// shape. Google natively uses micros for currency fields and a
+// 0–1 fraction for ctr — both match our schema, so the conversion is
+// mostly a rename + safe-number coerce.
+function normalizeGoogleInsights(m, currency) {
+  if (!m) return null;
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    impressions:           m.impressions != null ? Math.round(num(m.impressions)) : null,
+    reach:                 null,        // not on metrics — Google exposes only for some report types
+    clicks:                m.clicks != null ? Math.round(num(m.clicks)) : null,
+    ctr:                   num(m.ctr),
+    cpcMicros:             num(m.averageCpc),
+    cpmMicros:             num(m.averageCpm),
+    spendMicros:           num(m.costMicros),
+    frequency:             null,
+    conversions:           num(m.conversions),
+    conversionValueMicros: m.conversionsValue != null ? Math.round(num(m.conversionsValue) * 1_000_000) : null,
+    videoViews:            m.videoViews != null ? Math.round(num(m.videoViews)) : null,
+    currency:              currency || null,
+    rangeDays:             null,
+    fetchedAt:             new Date()
+  };
 }
 
 // Normalize Google API errors into a short string for logging.
