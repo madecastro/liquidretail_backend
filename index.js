@@ -225,7 +225,23 @@ mongoose.connect(process.env.MONGODB_URI, {
   // tier limits (M0=500, M10=1500).
   maxPoolSize:        200
 })
-  .then(() => console.log('✅ Connected to MongoDB'))
+  .then(async () => {
+    console.log('✅ Connected to MongoDB');
+    // One-shot legacy-index cleanup. The IntegrationCredential schema
+    // moved from "one row per (brandId, type)" to per-account-id
+    // partial indexes; the old global-unique indexes have to be
+    // dropped or relinking ad accounts hits E11000. Idempotent — safe
+    // to run on every boot.
+    try {
+      const dropLegacyIntegrationIndexes = require('./scripts/dropLegacyIntegrationIndexes');
+      const r = await dropLegacyIntegrationIndexes();
+      if (r.dropped.length > 0) {
+        console.log(`✅ legacy-index cleanup: dropped=[${r.dropped.join(', ')}]`);
+      }
+    } catch (err) {
+      console.warn(`⚠️  legacy-index cleanup failed (non-fatal): ${err.message}`);
+    }
+  })
   .catch(err => console.error('MongoDB connection error:', err));
 
 if (process.env.RUN_WORKER === 'true') {
