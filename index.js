@@ -24,6 +24,7 @@ const memberRoutes     = require('./routes/members');
 const integrationRoutes = require('./routes/integrations');
 const aiLayoutRoutes = require('./routes/aiLayouts');
 const collectionRoutes = require('./routes/collections');
+const catalogRoutes = require('./routes/catalog');
 const requireAuth = require('./middleware/requireAuth');
 
 const app = express();
@@ -135,6 +136,7 @@ app.use('/api/integrations', (req, res, next) => {
 }, integrationRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);
 app.use('/api/collections', requireAuth, collectionRoutes);
+app.use('/api/catalog', requireAuth, catalogRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
   try {
