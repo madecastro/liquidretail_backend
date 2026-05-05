@@ -914,9 +914,14 @@ router.get('/meta-ads/status', async (req, res) => {
     const creds = await IntegrationCredential.find(tenantFilter(req, {
       brandId, type: 'meta-ads', status: { $in: ['active', 'pending'] }
     })).sort({ connectedAt: 1 }).lean();
+    const summarized = creds.map(summarizeAds);
     res.json({
       configured:  metaAds.isConfigured(),
-      credentials: creds.map(summarizeAds)
+      // Singular `credential` for the single-tile UI on the Brand
+      // page (matches /instagram/status); plural `credentials` for
+      // any caller that wants the full list.
+      credential:  summarized[0] || null,
+      credentials: summarized
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'meta-ads status failed' });
@@ -1139,10 +1144,12 @@ router.get('/google-ads/status', async (req, res) => {
     const creds = await IntegrationCredential.find(tenantFilter(req, {
       brandId, type: 'google-ads', status: { $in: ['active', 'pending'] }
     })).sort({ connectedAt: 1 }).lean();
+    const summarized = creds.map(summarizeGoogleAds);
     res.json({
       configured:         googleAds.isConfigured(),
       devTokenConfigured: googleAds.isDevTokenConfigured(),
-      credentials:        creds.map(summarizeGoogleAds)
+      credential:         summarized[0] || null,
+      credentials:        summarized
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'google-ads status failed' });
