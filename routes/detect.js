@@ -346,3 +346,7 @@ router.get('/gemini-models', async (req, res) => {
 });
 
 module.exports = router;
+// Phase A-1 — exported so the Media Library detail endpoint
+// (routes/media.js GET /:mediaId/detect) can reuse the same assembled
+// shape that /api/detect/status/:runId returns. Keyed by DetectRun.
+module.exports.assembleResult = assembleResult;

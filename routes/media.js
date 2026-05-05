@@ -1,9 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const Media = require('../models/Media');
+const DetectRun = require('../models/DetectRun');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
+const { assembleResult } = require('./detect');
 
 // GET /api/media
 // Paginated list of media — most recent first. Supports `?ready=true` to
@@ -33,7 +35,7 @@ router.get('/', async (req, res) => {
 
     const [docs, total] = await Promise.all([
       Media.find(filter)
-        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt')
+        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt matchedProducts primarySubjectLabel adSuitability classification width height')
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit)
@@ -41,26 +43,46 @@ router.get('/', async (req, res) => {
       Media.countDocuments(filter)
     ]);
 
-    const media = docs.map(d => ({
-      mediaId:        d._id,
-      source:         d.source,
-      externalId:     d.externalId,
-      fileType:       d.fileType,
-      fileUrl:        d.fileUrl,
-      fileName:       d.fileName,
-      brand:          d.metadata?.brand || null,
-      caption:        d.metadata?.caption || null,
-      // IG-sourced extras — null for manual uploads. Surfaced so the
-      // inventory picker can show a "Instagram post / reel" pill and
-      // link out to the original permalink.
-      permalink:      d.metadata?.permalink || null,
-      postedAt:       d.metadata?.postedAt || null,
-      creatorHandle:  d.metadata?.creatorHandle || null,
-      postType:       d.metadata?.postType || null,
-      rightsApproved: !!d.rights?.approved,
-      ready:          !!d.latestArtifacts?.detection,
-      createdAt:      d.createdAt
-    }));
+    const media = docs.map(d => {
+      // Phase A-1 — derive match-level pill from the primary matched
+      // product's outcome. UI buckets: 'high' (product_match), 'medium'
+      // (product_category), 'low' (brand_match), 'none' (no_products /
+      // no matchedProducts entries yet).
+      const primaryMatch = (d.matchedProducts || [])[0] || null;
+      const matchLevel = primaryMatch
+        ? (primaryMatch.outcome === 'product_match'    ? 'high'
+        :  primaryMatch.outcome === 'product_category' ? 'medium'
+        :  primaryMatch.outcome === 'brand_match'      ? 'low'
+        :  'none')
+        : 'none';
+      return {
+        mediaId:        d._id,
+        source:         d.source,
+        externalId:     d.externalId,
+        fileType:       d.fileType,
+        fileUrl:        d.fileUrl,
+        fileName:       d.fileName,
+        width:          d.width  || null,
+        height:         d.height || null,
+        brand:          d.metadata?.brand || null,
+        caption:        d.metadata?.caption || null,
+        // IG-sourced extras — null for manual uploads. Surfaced so the
+        // inventory picker can show a "Instagram post / reel" pill and
+        // link out to the original permalink.
+        permalink:      d.metadata?.permalink || null,
+        postedAt:       d.metadata?.postedAt || null,
+        creatorHandle:  d.metadata?.creatorHandle || null,
+        postType:       d.metadata?.postType || null,
+        rightsApproved: !!d.rights?.approved,
+        ready:          !!d.latestArtifacts?.detection,
+        createdAt:      d.createdAt,
+        // Phase A-1 fields used by the Media Library sidebar pill + chips
+        primarySubjectLabel: d.primarySubjectLabel || null,
+        matchLevel,
+        detectOutcome:  d.classification?.detectSummary?.outcome || null,
+        adReadiness:    typeof d.adSuitability?.score === 'number' ? d.adSuitability.score : null
+      };
+    });
 
     res.json({
       media,
@@ -71,6 +93,36 @@ router.get('/', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Media list failed' });
+  }
+});
+
+// GET /api/media/:mediaId/detect
+// Phase A-1 — assembled detect result keyed by mediaId (rather than runId
+// like /api/detect/status/:runId). Returns the same shape as the existing
+// status endpoint by finding the latest completed/failed DetectRun for
+// the media and delegating to assembleResult. The Media Library page uses
+// this so it doesn't have to discover the runId first.
+router.get('/:mediaId/detect', async (req, res) => {
+  try {
+    const media = await assertMediaInTenant(req.params.mediaId, req);
+    // Latest run for this media — completed first, falling back to any.
+    const run = await DetectRun.findOne({ mediaId: media._id, status: { $in: ['completed', 'failed'] } })
+      .sort({ createdAt: -1 });
+    if (!run) {
+      return res.status(404).json({ error: 'no completed detect run for this media yet' });
+    }
+    const result = await assembleResult(run);
+    res.json({
+      runId:   run._id,
+      mediaId: run.mediaId,
+      status:  run.status,
+      stage:   run.stage,
+      result,
+      error:      run.status === 'failed' ? run.error      : null,
+      errorStage: run.status === 'failed' ? run.errorStage : null
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'detect detail failed' });
   }
 });
 
