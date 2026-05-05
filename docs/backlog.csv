@@ -104,3 +104,5 @@ Summary,Description,Issue Type,Priority,Component,Labels,Epic Name,Epic Link
 
 
 
+"Real ad-render previews replacing PreviewCard placeholder","Phase 4 follow-up #7. Replace the static brand-page PreviewCard mock layout with a real RenderArtifact thumbnail. Depends on Phase 1 render service shipping. Hook the same /api/render endpoint the Creatives gallery uses; pick a representative product+template pair per brand.",Task,Medium,Render,render;ui;brand-page
+"Generate Ads wizard — wire backend","Hook the new Generate Ads wizard's Step 1 to GET /api/campaigns?brandId=X (filtered by syncedAt), Step 2 to a per-campaign filtered catalog endpoint (products detected in any media linked to the campaign's productSetIds), Step 3 to a templates-list endpoint, Step 4 to POST /api/ads/generate. Today the wizard ships skeleton-only — empty states + step state machine — pending these endpoints.",Story,High,Ad Generation,ad-generation;flow;wizard
