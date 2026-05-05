@@ -105,9 +105,24 @@ const campaignSchema = new mongoose.Schema({
 
   // Aggregated matched products across every ad in this campaign,
   // deduped. Filled at sync time from each ad's creative-level match
-  // (URL or text). The Generate Ads wizard reads this directly to
-  // pre-select products in Step 2 without walking the nested ads.
+  // (URL / text / product-set / collection). The Generate Ads wizard
+  // reads this directly to pre-select products in Step 2 without
+  // walking the nested ads.
   matchedProductIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', index: true }],
+
+  // What this campaign is actually promoting, derived from the match
+  // results + campaign objective. Drives Step 2 of the Generate Ads
+  // wizard:
+  //   'product'    — at least one ad resolves to a specific SKU
+  //                  (URL match, product-set expansion, or text match)
+  //   'collection' — only collection / category-level URLs resolved
+  //                  (e.g. /collections/summer-sale → all SKUs in that
+  //                  collection)
+  //   'brand'      — no SKU/collection resolution AND objective is
+  //                  awareness / traffic / video views — operator
+  //                  picks products manually from the full catalog
+  //   null         — unknown (legacy rows pre-derivation)
+  kind:          { type: String, enum: ['product', 'collection', 'brand', null], default: null },
 
   // Full raw payload from the platform — capped to ~16KB worth of
   // JSON. Useful for debugging and for fields we haven't mapped yet.

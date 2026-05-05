@@ -25,7 +25,7 @@ router.get('/', async (req, res) => {
     if (req.query.status)   filter.status   = req.query.status;
 
     const rows = await Campaign.find(tenantFilter(req, filter))
-      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds adSets lastSyncedAt firstSeenAt')
+      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds kind adSets lastSyncedAt firstSeenAt')
       .sort({ lastSyncedAt: -1 })
       .lean();
 
@@ -37,6 +37,7 @@ router.get('/', async (req, res) => {
         name:          c.name || '(unnamed)',
         status:        c.status || null,
         objective:     c.objective || null,
+        kind:          c.kind || null,
         budget:        c.budget || null,
         schedule:      c.schedule || null,
         productSetIds: c.productSetIds || [],
@@ -72,17 +73,14 @@ router.get('/:id', async (req, res) => {
 // method ('url' / 'text' / 'mixed') so the UI can show confidence.
 router.get('/:id/products', async (req, res) => {
   try {
-    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id }))
-      .select('brandId matchedProductIds adSets')
-      .lean();
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id })).lean();
     if (!c) return res.status(404).json({ error: 'campaign not found' });
 
     const productIds = c.matchedProductIds || [];
-    if (productIds.length === 0) return res.json({ products: [] });
 
-    // Walk the embedded ads to compute the highest-confidence match
-    // method per product. URL > mixed > text.
-    const methodPriority = { url: 3, mixed: 2, text: 1 };
+    // Highest-confidence match method per product (used by the wizard
+    // to badge each row). product-set > url > mixed > collection > text.
+    const methodPriority = { 'product-set': 5, url: 4, mixed: 3, collection: 2, text: 1 };
     const methodByProduct = new Map();
     for (const set of (c.adSets || [])) {
       for (const ad of (set.ads || [])) {
@@ -98,14 +96,37 @@ router.get('/:id/products', async (req, res) => {
       }
     }
 
-    const products = await CatalogProduct.find({
-      _id:     { $in: productIds },
-      brandId: c.brandId
-    })
-      .select('title description category brand price currency imageUrl productUrl externalId source')
-      .lean();
+    const products = productIds.length === 0
+      ? []
+      : await CatalogProduct.find({ _id: { $in: productIds }, brandId: c.brandId })
+          .select('title description category brand price currency imageUrl productUrl externalId source')
+          .lean();
+
+    // Campaign metadata for the Step 2 header — surfaced alongside the
+    // matched products so the operator can sanity-check what they're
+    // generating against (objective, audience, budget, schedule).
+    const campaignMeta = {
+      id:            String(c._id),
+      platform:      c.platform,
+      externalId:    c.externalId,
+      name:          c.name || '(unnamed)',
+      status:        c.status || null,
+      objective:     c.objective || null,
+      kind:          c.kind || null,
+      budget:        c.budget || null,
+      schedule:      c.schedule || null,
+      targeting:     c.targeting || null,
+      productSetIds: c.productSetIds || [],
+      adSetCount:    (c.adSets || []).length,
+      adCount:       (c.adSets || []).reduce((s, set) => s + (set.ads || []).length, 0),
+      lastSyncedAt:  c.lastSyncedAt || null,
+      // A few representative ad creatives so the UI can preview what
+      // the operator's campaign actually looks like — caps at 6.
+      sampleCreatives: collectSampleCreatives(c, 6)
+    };
 
     res.json({
+      campaign: campaignMeta,
       products: products.map(p => ({
         id:          String(p._id),
         title:       p.title,
@@ -126,5 +147,26 @@ router.get('/:id/products', async (req, res) => {
     res.status(500).json({ error: err.message || 'campaign products fetch failed' });
   }
 });
+
+function collectSampleCreatives(campaign, limit) {
+  const out = [];
+  for (const set of (campaign.adSets || [])) {
+    for (const ad of (set.ads || [])) {
+      if (!ad.creative) continue;
+      out.push({
+        adId:         ad.externalId,
+        title:        ad.creative.title || null,
+        body:         ad.creative.body || null,
+        imageUrl:     ad.creative.imageUrl || null,
+        thumbnailUrl: ad.creative.thumbnailUrl || null,
+        linkUrl:      ad.creative.linkUrl || null,
+        callToAction: ad.creative.callToAction || null,
+        matchMethod:  ad.matchMethod || null
+      });
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
 
 module.exports = router;

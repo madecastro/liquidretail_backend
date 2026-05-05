@@ -1,24 +1,45 @@
 // Creative → CatalogProduct matcher for synced Meta Ads campaigns.
 //
-// For each ad in a synced campaign, we extract the creative content
-// (caption, title, image, link) from Meta's Graph API, then match
-// against the brand's CatalogProduct rows by:
+// Layered cascade — each tier falls through to the next when it can't
+// resolve:
 //
-//   1. URL matching — unwrap Meta's l.facebook.com / l.instagram.com
-//      shim and compare hostname + path against CatalogProduct.productUrl.
-//      High confidence; one URL ≈ one product.
-//   2. Text similarity — weighted token overlap of the creative's
-//      title + body + link description against each candidate's
-//      title + description. Picks the top match above the 0.40
-//      threshold; reuses the same scoring shape as
-//      productMatchService.findCatalogMatchByText so the two paths
-//      stay calibrated.
-//   3. Image similarity — future. The schema reserves space for it
-//      but the matcher only runs URL + text today.
+//   Tier 1 — product_set_id expansion.
+//     DPA / Advantage+ ad sets carry a product_set_id; we hit Meta's
+//     /{product_set_id}/products endpoint and map each returned SKU
+//     back to CatalogProduct via retailer_id (→ externalId) or
+//     normalized url (→ productUrl). Highest confidence — Meta has
+//     done the matching for us.
+//
+//   Tier 2 — URL match.
+//     Per-ad creative.linkUrl → unwrap l.facebook.com / l.instagram.com
+//     redirects → exact + suffix match against CatalogProduct.productUrl.
+//     Falls through to Tier 2b (collection match) when the URL points
+//     at a category / collection page rather than a SKU.
+//
+//   Tier 2b — collection / category URL.
+//     URLs like /collections/summer-sale, /category/men, /shop/sale
+//     are resolved against CatalogProduct.category as a substring
+//     match. Returns every product in that category — wider net than
+//     a SKU match but still campaign-relevant.
+//
+//   Tier 3 — text similarity.
+//     Weighted token overlap of creative.title + body against each
+//     candidate's title + description, threshold 0.40.
+//
+//   Tier 4 — image similarity.
+//     Future. Schema reserves space; not yet implemented.
+//
+//   Fallback — campaignKind='brand'.
+//     When no tier resolves AND the campaign objective is awareness /
+//     traffic / engagement / video_views, the matcher returns nothing
+//     and the wizard's Step 2 surfaces a "brand-awareness campaign —
+//     pick products manually" empty state.
 //
 // Public entry: matchCampaignCreatives({ brandId, token, campaign })
-//   Mutates campaign.adSets[*].ads[*] in place with creative + match
-//   fields, returns the deduped matchedProductIds for the campaign.
+//   Mutates campaign.adSets[*].ads[*] in place and returns the deduped
+//   campaign-level matchedProductIds.
+// Public helper: deriveCampaignKind({ campaign, matchedAny })
+//   Returns 'product' | 'collection' | 'brand' for the schema field.
 
 const axios = require('axios');
 const CatalogProduct = require('../models/CatalogProduct');
@@ -26,7 +47,6 @@ const CatalogProduct = require('../models/CatalogProduct');
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
-// Minimal stopword list — same shape as productMatchService.tokenize.
 const STOPWORDS = new Set([
   'a','an','the','and','or','of','to','for','in','on','at','by','with',
   'is','are','was','were','be','been','being','this','that','these','those',
@@ -34,66 +54,113 @@ const STOPWORDS = new Set([
   'shop','now','buy','get','new','sale','off','only','today'
 ]);
 
-const URL_MATCH_CONFIDENCE  = 1.0;
 const TEXT_SCORE_THRESHOLD  = 0.40;
+
+// Common URL path segments that indicate a collection / category page
+// rather than a single product. Matches anywhere in the path.
+const COLLECTION_PATH_PATTERNS = [
+  /\/collections?\//i,
+  /\/category\//i,
+  /\/categories\//i,
+  /\/shop\//i,
+  /\/c\//i,
+  /\/department\//i,
+  /\/browse\//i
+];
+
+// Brand-awareness objectives where we shouldn't expect SKU resolution.
+const BRAND_OBJECTIVES = new Set([
+  'OUTCOME_AWARENESS', 'OUTCOME_TRAFFIC', 'OUTCOME_ENGAGEMENT',
+  'BRAND_AWARENESS', 'REACH', 'VIDEO_VIEWS', 'POST_ENGAGEMENT',
+  'PAGE_LIKES', 'EVENT_RESPONSES', 'MESSAGES'
+]);
 
 // ── Public entry ─────────────────────────────────────────────────────
 
 async function matchCampaignCreatives({ brandId, token, campaign }) {
   if (!brandId || !token || !campaign) return [];
-  // One pass to collect every distinct creativeId across the campaign.
+
+  // Pull the brand's catalog once. Limited projection keeps memory
+  // bounded for large catalogs.
+  const products = await CatalogProduct
+    .find({ brandId, draft: { $ne: true } })
+    .select('title description productUrl externalId imageUrl category')
+    .lean();
+  if (products.length === 0) return [];
+
+  // Pre-compute search indices once per sync.
+  const urlIndex   = buildUrlIndex(products);
+  const skuIndex   = buildSkuIndex(products);
+  const catIndex   = buildCategoryIndex(products);
+  const textIndex  = products.map(p => ({
+    product:    p,
+    haystackTokens: tokenize(`${p.title || ''} ${p.description || ''}`)
+  }));
+
+  // ── Tier 1 — expand product_set_id (DPA / Advantage+ campaigns) ──
+  // Each ad set may name one product set; resolve each unique id to
+  // a list of CatalogProduct._id once per sync.
+  const productSetIds = new Set();
+  for (const set of (campaign.adSets || [])) {
+    if (set.productSetId) productSetIds.add(set.productSetId);
+  }
+  const productSetMap = productSetIds.size > 0
+    ? await expandProductSets(Array.from(productSetIds), token, { urlIndex, skuIndex })
+    : new Map();
+
+  // ── Tier 2/3 — fetch creative content for ads without a productSet ──
   const creativeIds = new Set();
   for (const set of (campaign.adSets || [])) {
+    // Skip creative fetch for ads under an ad set whose productSet
+    // already resolved — Tier 1 alone is authoritative for them.
+    const setHasResolvedProductSet = set.productSetId && (productSetMap.get(set.productSetId)?.length || 0) > 0;
+    if (setHasResolvedProductSet) continue;
     for (const ad of (set.ads || [])) {
       const cid = ad.creativeRef?.creativeId;
       if (cid) creativeIds.add(String(cid));
     }
   }
-  if (creativeIds.size === 0) return [];
+  const creativeMap = creativeIds.size > 0
+    ? await fetchCreativeBatch(Array.from(creativeIds), token)
+    : new Map();
 
-  // Pull every creative's content in parallel. Meta tolerates this
-  // for a brand-sized fan-out; rate-limit handling stays simple.
-  const creativeMap = await fetchCreativeBatch(Array.from(creativeIds), token);
-
-  // Pull the brand's catalog once. Limited projection keeps memory
-  // reasonable even for large catalogs (50 fields × ~10K rows ≈ MB-scale).
-  const products = await CatalogProduct
-    .find({ brandId, draft: { $ne: true } })
-    .select('title description productUrl externalId imageUrl')
-    .lean();
-
-  if (products.length === 0) return [];
-
-  // Pre-compute search indices once per sync.
-  const urlIndex  = buildUrlIndex(products);
-  const textIndex = products.map(p => ({
-    product:    p,
-    haystackTokens: tokenize(`${p.title || ''} ${p.description || ''}`)
-  }));
-
+  // ── Per-ad resolution ─────────────────────────────────────────────
   const aggregated = new Set();
 
   for (const set of (campaign.adSets || [])) {
+    const productSetProducts = set.productSetId ? (productSetMap.get(set.productSetId) || []) : [];
+
     for (const ad of (set.ads || [])) {
+      // Tier 1 — product set wins outright when present.
+      if (productSetProducts.length > 0) {
+        ad.matchedProductIds = productSetProducts;
+        ad.matchMethod       = 'product-set';
+        for (const id of productSetProducts) aggregated.add(String(id));
+        // Still snapshot the creative so the UI can show the ad's
+        // image/caption alongside its matched products.
+        const cid = ad.creativeRef?.creativeId;
+        const cre = cid ? creativeMap.get(String(cid)) : null;
+        if (cre) ad.creative = creativeFields(extractCreativeContent(cre));
+        continue;
+      }
+
+      // Tier 2/3 — creative-driven matching.
       const cid = ad.creativeRef?.creativeId;
       const cre = cid ? creativeMap.get(String(cid)) : null;
-      if (!cre) continue;
+      if (!cre) {
+        ad.matchedProductIds = [];
+        ad.matchMethod       = null;
+        continue;
+      }
 
       const extracted = extractCreativeContent(cre);
-      ad.creative = {
-        imageUrl:     extracted.imageUrl     || null,
-        thumbnailUrl: extracted.thumbnailUrl || null,
-        linkUrl:      extracted.linkUrl      || null,
-        title:        extracted.title        || null,
-        body:         extracted.body         || null,
-        callToAction: extracted.callToAction || null
-      };
+      ad.creative = creativeFields(extracted);
 
-      const match = matchOne(extracted, urlIndex, textIndex);
+      const match = matchOne(extracted, { urlIndex, catIndex, textIndex });
       if (match) {
-        ad.matchedProductIds = [match.productId];
+        ad.matchedProductIds = match.productIds;
         ad.matchMethod       = match.method;
-        aggregated.add(String(match.productId));
+        for (const id of match.productIds) aggregated.add(String(id));
       } else {
         ad.matchedProductIds = [];
         ad.matchMethod       = null;
@@ -104,12 +171,95 @@ async function matchCampaignCreatives({ brandId, token, campaign }) {
   return Array.from(aggregated);
 }
 
+// ── Campaign kind derivation ─────────────────────────────────────────
+
+function deriveCampaignKind(campaign) {
+  // Walk every ad's matchMethod to figure out the dominant resolution
+  // tier. URL / product-set / text → 'product'; collection → 'collection';
+  // nothing → 'brand' if objective hints at brand awareness, else 'brand'
+  // as a safe default that surfaces the operator-pick fallback.
+  const methods = new Set();
+  for (const set of (campaign.adSets || [])) {
+    for (const ad of (set.ads || [])) {
+      if (ad.matchMethod) methods.add(ad.matchMethod);
+    }
+  }
+  if (methods.has('product-set') || methods.has('url') || methods.has('mixed') || methods.has('text')) {
+    return 'product';
+  }
+  if (methods.has('collection')) return 'collection';
+  // No matches resolved. Lean on objective to label brand-awareness.
+  const obj = String(campaign.objective || '').toUpperCase();
+  if (BRAND_OBJECTIVES.has(obj)) return 'brand';
+  return 'brand';
+}
+
+// ── Tier 1 — product set expansion ───────────────────────────────────
+
+async function expandProductSets(productSetIds, token, { urlIndex, skuIndex }) {
+  const fields = ['id','retailer_id','name','url'].join(',');
+  const out = new Map();
+
+  await Promise.all(productSetIds.map(async id => {
+    const matched = [];
+    let url = `${META_GRAPH_ROOT}/${id}/products`;
+    let params = { fields, access_token: token, limit: 100 };
+    let pages = 0;
+    while (url && pages < 10) {     // hard cap — 1000 SKUs per product set
+      let res;
+      try {
+        res = await axios.get(url, { params, timeout: 25000 });
+      } catch (err) {
+        const detail = err.response?.data?.error?.message || err.message;
+        const code   = err.response?.data?.error?.code;
+        // 100 / 803 = invalid id or no permission. Insufficient scope
+        // (catalog_management) is common — skip the set quietly so
+        // creative-level matching can still take over.
+        if (code === 100 || code === 803 || code === 200 || code === 190) {
+          if (pages === 0) {
+            console.log(`   · product set ${id} unreadable (${detail}) — falling through to creative match`);
+          }
+          break;
+        }
+        console.warn(`   ⚠️  product set ${id} fetch failed: ${detail}`);
+        break;
+      }
+      for (const row of (res.data?.data || [])) {
+        const productId = resolveCatalogProduct(row, { urlIndex, skuIndex });
+        if (productId) matched.push(productId);
+      }
+      const next = res.data?.paging?.next;
+      url = next || null;
+      params = next ? null : params;
+      pages++;
+    }
+    // Dedupe — Meta sometimes returns the same SKU twice across pages.
+    out.set(id, Array.from(new Set(matched.map(String))).map(s => matched.find(m => String(m) === s)));
+  }));
+
+  return out;
+}
+
+function resolveCatalogProduct(row, { urlIndex, skuIndex }) {
+  // retailer_id → CatalogProduct.externalId is the most reliable map
+  // (Meta carries through the merchant's SKU id when the catalog was
+  // ingested via feed / pixel).
+  if (row.retailer_id && skuIndex.has(String(row.retailer_id))) {
+    return skuIndex.get(String(row.retailer_id))._id;
+  }
+  // Fallback to url match.
+  if (row.url) {
+    const key = normalizeUrlKey(row.url);
+    if (key && urlIndex.has(key)) {
+      return urlIndex.get(key)._id;
+    }
+  }
+  return null;
+}
+
 // ── Creative fetch ───────────────────────────────────────────────────
 
 async function fetchCreativeBatch(creativeIds, token) {
-  // Meta's batch API supports up to 50 ops per request and each op is
-  // an arbitrary GET. Cheaper than N parallel HTTP calls when we have
-  // > 5 creatives to fetch. For < 5 we fall back to parallel singles.
   const fields = [
     'id','name',
     'image_url','thumbnail_url',
@@ -135,7 +285,6 @@ async function fetchCreativeBatch(creativeIds, token) {
     return map;
   }
 
-  // Batch path. Meta accepts the batch as a JSON-string POST param.
   for (let i = 0; i < creativeIds.length; i += 50) {
     const slice = creativeIds.slice(i, i + 50);
     const batch = slice.map(id => ({
@@ -164,10 +313,6 @@ async function fetchCreativeBatch(creativeIds, token) {
 
 // ── Creative content extraction ──────────────────────────────────────
 
-// Different Meta creative shapes put the same data in different
-// places. Page-post link ads use object_story_spec.link_data; dynamic
-// product ads use asset_feed_spec; image ads put image_url at the top
-// level. Pull from each, prefer the most specific.
 function extractCreativeContent(cre) {
   const linkData = cre.object_story_spec?.link_data || {};
   const videoData = cre.object_story_spec?.video_data || {};
@@ -191,7 +336,18 @@ function extractCreativeContent(cre) {
   return { title, body, linkUrl, imageUrl, thumbnailUrl, callToAction };
 }
 
-// ── URL matching ─────────────────────────────────────────────────────
+function creativeFields(extracted) {
+  return {
+    imageUrl:     extracted.imageUrl     || null,
+    thumbnailUrl: extracted.thumbnailUrl || null,
+    linkUrl:      extracted.linkUrl      || null,
+    title:        extracted.title        || null,
+    body:         extracted.body         || null,
+    callToAction: extracted.callToAction || null
+  };
+}
+
+// ── URL / SKU / category indices ─────────────────────────────────────
 
 function buildUrlIndex(products) {
   const byHostPath = new Map();
@@ -202,6 +358,29 @@ function buildUrlIndex(products) {
     if (!byHostPath.has(key)) byHostPath.set(key, p);
   }
   return byHostPath;
+}
+
+function buildSkuIndex(products) {
+  // CatalogProduct.externalId is the merchant's SKU id, matched
+  // against Meta's product.retailer_id during product-set expansion.
+  const byExternalId = new Map();
+  for (const p of products) {
+    if (p.externalId) byExternalId.set(String(p.externalId), p);
+  }
+  return byExternalId;
+}
+
+function buildCategoryIndex(products) {
+  // Lowercase normalized category → list of CatalogProducts in it.
+  // Used by collection-URL fallback.
+  const byCategory = new Map();
+  for (const p of products) {
+    const cat = (p.category || '').toLowerCase().trim();
+    if (!cat) continue;
+    if (!byCategory.has(cat)) byCategory.set(cat, []);
+    byCategory.get(cat).push(p);
+  }
+  return byCategory;
 }
 
 function normalizeUrlKey(rawUrl) {
@@ -215,9 +394,6 @@ function normalizeUrlKey(rawUrl) {
   }
 }
 
-// Meta wraps outbound URLs through l.facebook.com/l.php?u=ENCODED or
-// l.instagram.com/?u=ENCODED. Unwrap to the underlying destination.
-// Also handles plain URLs that don't need unwrapping.
 function unwrapMetaLink(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return null;
   try {
@@ -234,27 +410,64 @@ function unwrapMetaLink(rawUrl) {
   }
 }
 
-function matchByUrl(creativeUrl, urlIndex) {
-  const direct = unwrapMetaLink(creativeUrl);
-  const key = normalizeUrlKey(direct);
-  if (!key) return null;
+// ── URL matching (Tier 2 + 2b) ───────────────────────────────────────
 
-  // Exact host+path hit.
-  if (urlIndex.has(key)) {
-    return { productId: urlIndex.get(key)._id, method: 'url' };
+function isCollectionPath(parsedUrl) {
+  const path = parsedUrl.pathname || '';
+  return COLLECTION_PATH_PATTERNS.some(rx => rx.test(path));
+}
+
+function extractCollectionSlug(parsedUrl) {
+  // Take the path segment AFTER the collection-indicator and treat it
+  // as the slug. /collections/summer-sale → 'summer-sale';
+  // /shop/men/hats → 'men' (first segment after the marker).
+  const path = parsedUrl.pathname || '';
+  for (const rx of COLLECTION_PATH_PATTERNS) {
+    const m = path.match(new RegExp(rx.source + '([^/?#]+)', 'i'));
+    if (m && m[1]) return decodeURIComponent(m[1]).replace(/[-_+]/g, ' ').toLowerCase();
   }
-  // Prefix hit — the creative URL deep-links into a section that
-  // contains the product page (e.g. /collections/x/products/y vs
-  // /products/y). Match if the product's normalized URL is a suffix.
-  for (const [productKey, product] of urlIndex.entries()) {
-    if (key.endsWith(productKey) || productKey.endsWith(key)) {
-      return { productId: product._id, method: 'url' };
+  return null;
+}
+
+function matchByUrl(creativeUrl, { urlIndex, catIndex }) {
+  const direct = unwrapMetaLink(creativeUrl);
+  if (!direct) return null;
+
+  let parsed;
+  try { parsed = new URL(direct); } catch { return null; }
+
+  const key = normalizeUrlKey(direct);
+  // Tier 2 — exact + suffix SKU match.
+  if (key) {
+    if (urlIndex.has(key)) {
+      return { productIds: [urlIndex.get(key)._id], method: 'url' };
+    }
+    for (const [productKey, product] of urlIndex.entries()) {
+      if (key.endsWith(productKey) || productKey.endsWith(key)) {
+        return { productIds: [product._id], method: 'url' };
+      }
+    }
+  }
+  // Tier 2b — collection / category URL → return everything in that
+  // category.
+  if (isCollectionPath(parsed)) {
+    const slug = extractCollectionSlug(parsed);
+    if (slug) {
+      const ids = [];
+      for (const [cat, list] of catIndex.entries()) {
+        if (cat.includes(slug) || slug.includes(cat)) {
+          for (const p of list) ids.push(p._id);
+        }
+      }
+      if (ids.length > 0) {
+        return { productIds: Array.from(new Set(ids.map(String))).map(s => ids.find(i => String(i) === s)), method: 'collection' };
+      }
     }
   }
   return null;
 }
 
-// ── Text matching ────────────────────────────────────────────────────
+// ── Text matching (Tier 3) ───────────────────────────────────────────
 
 function tokenize(text) {
   if (!text) return new Set();
@@ -269,7 +482,7 @@ function tokenize(text) {
 function matchByText(extracted, textIndex) {
   const haystack = `${extracted.title || ''} ${extracted.body || ''}`;
   const queryTokens = tokenize(haystack);
-  if (queryTokens.size < 2) return null;     // not enough signal
+  if (queryTokens.size < 2) return null;
 
   let best = null;
   for (const { product, haystackTokens } of textIndex) {
@@ -281,31 +494,38 @@ function matchByText(extracted, textIndex) {
       best = { score, productId: product._id };
     }
   }
-  return best ? { productId: best.productId, method: 'text', score: best.score } : null;
+  return best ? { productIds: [best.productId], method: 'text', score: best.score } : null;
 }
 
-// ── Per-ad match ─────────────────────────────────────────────────────
+// ── Per-ad cascade ───────────────────────────────────────────────────
 
-function matchOne(extracted, urlIndex, textIndex) {
-  const url = extracted.linkUrl ? matchByUrl(extracted.linkUrl, urlIndex) : null;
-  if (url) {
-    const txt = matchByText(extracted, textIndex);
+function matchOne(extracted, indices) {
+  // Tier 2/2b — URL match (SKU, then collection fallback).
+  const url = extracted.linkUrl ? matchByUrl(extracted.linkUrl, indices) : null;
+  if (url && url.method === 'url') {
+    const txt = matchByText(extracted, indices.textIndex);
     return {
-      productId: url.productId,
-      method:    txt && String(txt.productId) === String(url.productId) ? 'mixed' : 'url'
+      productIds: url.productIds,
+      method:     txt && String(txt.productIds[0]) === String(url.productIds[0]) ? 'mixed' : 'url'
     };
   }
-  const txt = matchByText(extracted, textIndex);
-  if (txt) return { productId: txt.productId, method: 'text' };
+  if (url && url.method === 'collection') return url;
+
+  // Tier 3 — text match.
+  const txt = matchByText(extracted, indices.textIndex);
+  if (txt) return { productIds: txt.productIds, method: 'text' };
   return null;
 }
 
 module.exports = {
   matchCampaignCreatives,
+  deriveCampaignKind,
   // exported for tests / future reuse
   unwrapMetaLink,
   normalizeUrlKey,
   tokenize,
-  URL_MATCH_CONFIDENCE,
-  TEXT_SCORE_THRESHOLD
+  isCollectionPath,
+  extractCollectionSlug,
+  TEXT_SCORE_THRESHOLD,
+  BRAND_OBJECTIVES
 };

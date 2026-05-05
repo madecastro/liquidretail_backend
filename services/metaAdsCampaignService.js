@@ -13,7 +13,7 @@
 
 const axios = require('axios');
 const { decrypt } = require('./integrationCryptoService');
-const { matchCampaignCreatives } = require('./metaAdsCreativeMatcher');
+const { matchCampaignCreatives, deriveCampaignKind } = require('./metaAdsCreativeMatcher');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -111,10 +111,12 @@ async function syncForCredential(cred) {
         campaign: c
       });
       c.matchedProductIds = matchedIds;
+      c.kind              = deriveCampaignKind(c);
       totalMatched += matchedIds.length;
     } catch (err) {
       console.warn(`   ⚠️  creative-match failed for campaign ${c.externalId}: ${err.message}`);
       errors.push({ externalId: c.externalId, scope: 'creative-match', reason: err.message });
+      c.kind = deriveCampaignKind(c);    // still derive — likely 'brand'
     }
   }
   console.log(`🔗 Meta creative match: ${totalMatched} product association(s) across ${campaigns.length} campaign(s) in ${Date.now() - matchT0}ms`);

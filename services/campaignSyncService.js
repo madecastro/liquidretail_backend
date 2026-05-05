@@ -115,6 +115,7 @@ async function upsertCampaign(c) {
     productSetIds,
     adSets:        c.adSets || [],
     matchedProductIds: c.matchedProductIds || [],
+    kind:          c.kind || null,
     rawData:       c.rawData || null,
     lastSyncedAt:  new Date()
   };
