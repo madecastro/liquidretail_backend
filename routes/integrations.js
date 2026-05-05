@@ -1174,14 +1174,17 @@ router.post('/google-ads/connect', express.json(), async (req, res) => {
     }
     const brandId = req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+
+    const requestedRedirect = req.query.redirect || req.body?.redirect || null;
+
     const state = jwt.sign(
-      {
+      appendRedirectToState({
         purpose:      'google-ads-oauth',
         userId:       String(req.user.userId || req.user.id),
         advertiserId: String(req.advertiserId),
         brandId:      String(brandId),
         nonce:        Math.random().toString(36).slice(2)
-      },
+      }, requestedRedirect),
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
@@ -1193,11 +1196,12 @@ router.post('/google-ads/connect', express.json(), async (req, res) => {
 
 router.get('/google-ads/callback', async (req, res) => {
   const { code, state, error: oauthError, error_description } = req.query;
+  let bounceTarget = null;
   const bounce = (status, msg, setupId) => {
     const params = new URLSearchParams({ gads_status: status });
     if (msg)     params.set('gads_msg', msg);
     if (setupId) params.set('gads_setup', setupId);
-    res.redirect(`${FRONTEND_URL}/brand.html?${params.toString()}`);
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
   };
 
   if (oauthError) return bounce('denied', String(error_description || oauthError));
@@ -1207,6 +1211,7 @@ router.get('/google-ads/callback', async (req, res) => {
   try {
     payload = jwt.verify(String(state), process.env.JWT_SECRET);
     if (payload.purpose !== 'google-ads-oauth') throw new Error('wrong purpose');
+    bounceTarget = readRedirectFromState(payload);
   } catch (err) {
     return bounce('error', `invalid state: ${err.message}`);
   }
