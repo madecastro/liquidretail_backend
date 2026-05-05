@@ -305,7 +305,15 @@ async function assembleResult(run) {
       postedAt:      media.metadata?.postedAt || null,
       creatorHandle: media.metadata?.creatorHandle || null,
       postType:      media.metadata?.postType || null
-    }
+    },
+
+    // Phase A-0 derived display fields used by the Media Library
+    // Summary tab. Sourced from Media (populated at finalize stage).
+    primarySubjectLabel:   media.primarySubjectLabel   || null,
+    secondaryElementsTags: media.secondaryElementsTags || [],
+    technicalInsights:     media.technicalInsights     || null,
+    adSuitability:         media.adSuitability         || null,
+    platformStats:         media.platformStats         || null
   };
 }
 
