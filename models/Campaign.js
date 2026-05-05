@@ -23,7 +23,27 @@ const adSchema = new mongoose.Schema({
   // a render to it. Shape is platform-specific:
   //   meta:    { creativeId, creativeName? }
   //   google:  { adGroupAdResourceName, adType }
-  creativeRef:   mongoose.Schema.Types.Mixed
+  creativeRef:   mongoose.Schema.Types.Mixed,
+
+  // Snapshot of the creative content extracted from the platform —
+  // populated for Meta by metaAdsCreativeMatcher. Drives the URL +
+  // text matching against CatalogProduct that fills matchedProductIds
+  // below. Empty for ads whose creative we couldn't fetch.
+  creative: {
+    imageUrl:     String,
+    thumbnailUrl: String,
+    linkUrl:      String,
+    title:        String,
+    body:         String,
+    callToAction: String
+  },
+  // CatalogProducts this ad's creative is promoting, resolved at
+  // sync time. matchMethod records how each match was found so the
+  // UI can show confidence: 'url' (high — link unwrapped to a known
+  // CatalogProduct.productUrl), 'text' (token overlap on title/desc),
+  // 'mixed' (both fired), null when no match.
+  matchedProductIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct' }],
+  matchMethod:       String
 }, { _id: false });
 
 const adSetSchema = new mongoose.Schema({
@@ -82,6 +102,12 @@ const campaignSchema = new mongoose.Schema({
 
   // Embedded ad sets + their ads.
   adSets:        [adSetSchema],
+
+  // Aggregated matched products across every ad in this campaign,
+  // deduped. Filled at sync time from each ad's creative-level match
+  // (URL or text). The Generate Ads wizard reads this directly to
+  // pre-select products in Step 2 without walking the nested ads.
+  matchedProductIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', index: true }],
 
   // Full raw payload from the platform — capped to ~16KB worth of
   // JSON. Useful for debugging and for fields we haven't mapped yet.

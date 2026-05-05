@@ -8,6 +8,7 @@
 const express = require('express');
 const router = express.Router();
 const Campaign = require('../models/Campaign');
+const CatalogProduct = require('../models/CatalogProduct');
 const { tenantFilter } = require('../middleware/tenantHelpers');
 
 // GET /api/campaigns?brandId=X[&platform=meta-ads|google-ads][&status=ACTIVE]
@@ -24,7 +25,7 @@ router.get('/', async (req, res) => {
     if (req.query.status)   filter.status   = req.query.status;
 
     const rows = await Campaign.find(tenantFilter(req, filter))
-      .select('platform externalId name status objective budget schedule productSetIds adSets lastSyncedAt firstSeenAt')
+      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds adSets lastSyncedAt firstSeenAt')
       .sort({ lastSyncedAt: -1 })
       .lean();
 
@@ -39,6 +40,7 @@ router.get('/', async (req, res) => {
         budget:        c.budget || null,
         schedule:      c.schedule || null,
         productSetIds: c.productSetIds || [],
+        matchedProductCount: (c.matchedProductIds || []).length,
         adSetCount:    (c.adSets || []).length,
         adCount:       (c.adSets || []).reduce((s, set) => s + (set.ads || []).length, 0),
         lastSyncedAt:  c.lastSyncedAt || null,
@@ -61,6 +63,67 @@ router.get('/:id', async (req, res) => {
     res.json({ campaign: c });
   } catch (err) {
     res.status(500).json({ error: err.message || 'campaign fetch failed' });
+  }
+});
+
+// GET /api/campaigns/:id/products — hydrated CatalogProduct rows for
+// every matched product on this campaign. Drives the Generate Ads
+// wizard's Step 2 auto-select. Each row carries the per-ad match
+// method ('url' / 'text' / 'mixed') so the UI can show confidence.
+router.get('/:id/products', async (req, res) => {
+  try {
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id }))
+      .select('brandId matchedProductIds adSets')
+      .lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+
+    const productIds = c.matchedProductIds || [];
+    if (productIds.length === 0) return res.json({ products: [] });
+
+    // Walk the embedded ads to compute the highest-confidence match
+    // method per product. URL > mixed > text.
+    const methodPriority = { url: 3, mixed: 2, text: 1 };
+    const methodByProduct = new Map();
+    for (const set of (c.adSets || [])) {
+      for (const ad of (set.ads || [])) {
+        const method = ad.matchMethod;
+        if (!method) continue;
+        for (const pid of (ad.matchedProductIds || [])) {
+          const key = String(pid);
+          const prev = methodByProduct.get(key);
+          if (!prev || (methodPriority[method] || 0) > (methodPriority[prev] || 0)) {
+            methodByProduct.set(key, method);
+          }
+        }
+      }
+    }
+
+    const products = await CatalogProduct.find({
+      _id:     { $in: productIds },
+      brandId: c.brandId
+    })
+      .select('title description category brand price currency imageUrl productUrl externalId source')
+      .lean();
+
+    res.json({
+      products: products.map(p => ({
+        id:          String(p._id),
+        title:       p.title,
+        description: p.description || null,
+        category:    p.category || null,
+        brand:       p.brand || null,
+        price:       p.price || null,
+        currency:    p.currency || null,
+        imageUrl:    p.imageUrl || null,
+        productUrl:  p.productUrl || null,
+        externalId:  p.externalId || null,
+        source:      p.source || null,
+        matchMethod: methodByProduct.get(String(p._id)) || null
+      }))
+    });
+  } catch (err) {
+    console.error('campaign products fetch failed:', err);
+    res.status(500).json({ error: err.message || 'campaign products fetch failed' });
   }
 });
 

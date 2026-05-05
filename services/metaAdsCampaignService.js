@@ -13,6 +13,7 @@
 
 const axios = require('axios');
 const { decrypt } = require('./integrationCryptoService');
+const { matchCampaignCreatives } = require('./metaAdsCreativeMatcher');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -93,6 +94,30 @@ async function syncForCredential(cred) {
       url = null;
     }
   }
+
+  // Creative-level enrichment + product matching. Fetches each ad's
+  // creative content (caption / image / link) from the Graph API and
+  // resolves it to CatalogProduct rows via URL + text similarity.
+  // Mutates the in-memory normalized campaigns in place; the
+  // orchestrator's upsert then persists ad.creative, ad.matchedProductIds,
+  // and the top-level campaign.matchedProductIds aggregate.
+  const matchT0 = Date.now();
+  let totalMatched = 0;
+  for (const c of campaigns) {
+    try {
+      const matchedIds = await matchCampaignCreatives({
+        brandId: cred.brandId,
+        token,
+        campaign: c
+      });
+      c.matchedProductIds = matchedIds;
+      totalMatched += matchedIds.length;
+    } catch (err) {
+      console.warn(`   ⚠️  creative-match failed for campaign ${c.externalId}: ${err.message}`);
+      errors.push({ externalId: c.externalId, scope: 'creative-match', reason: err.message });
+    }
+  }
+  console.log(`🔗 Meta creative match: ${totalMatched} product association(s) across ${campaigns.length} campaign(s) in ${Date.now() - matchT0}ms`);
 
   console.log(`📣 Meta campaign sync done: cred=${cred._id} campaigns=${campaigns.length} errors=${errors.length} in ${Date.now() - t0}ms`);
   return { ok: true, campaigns, errors };
