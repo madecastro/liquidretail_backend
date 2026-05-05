@@ -189,7 +189,7 @@ async function runImagePipeline(run, media, buffer) {
   // ── Phase 3: enrich fan-out ──
   await setRunPhase(run, 'enrich-fanout');
   const [extendedRes, matchRes] = await Promise.allSettled([
-    runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false),
+    runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH }),
     runProductMatchChain(run, media, sourceUrl, products, primarySubjectDesc, text, refinedProducts)
   ]);
   if (extendedRes.status === 'rejected') console.warn('⚠️  Extended/overlay chain rejected:', extendedRes.reason?.message);
@@ -380,7 +380,7 @@ async function runVideoPipeline(run, media, buffer) {
   // ── Phase 3: enrich fan-out ──
   await setRunPhase(run, 'enrich-fanout');
   const [extendedRes, matchRes] = await Promise.allSettled([
-    runExtendedAndOverlayChain(run, media, heroImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, true),
+    runExtendedAndOverlayChain(run, media, heroImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, true, { safeRect, imgW, imgH }),
     // Video Phase 1.6 isn't wired yet (refinedProducts always [] for video) —
     // findPerProductMatches falls through to the legacy single-match path.
     runProductMatchChain(run, media, heroImageUrl, products, primarySubjectDesc, text, [])
@@ -712,7 +712,7 @@ function pickPrimaryDoc(docs, matches) {
   })[0];
 }
 
-async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, isVideo) {
+async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, isVideo, ctx = {}) {
   let extendedCandidates = {}, extendedErrors = {}, extendedJudgeRes = {};
 
   if (sourceImageUrl) {
@@ -753,12 +753,23 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
     selectedWinners: deriveSelectedWinners(extendedCandidates, extendedJudgeRes)
   });
 
+  // For video media, derive forbidden rects (in 0..1 fractions) from
+  // the cross-frame safeRect (already unioned across YOLO firstSeenSec
+  // bounds + primary subjects + text) plus platform UI bands for Reels.
+  // Single-still overlay analysis would otherwise miss subjects that
+  // appear briefly mid-clip and IG's caption / action overlays that
+  // aren't in the source frame at all.
+  const forbiddenRectsPct = isVideo
+    ? buildVideoForbiddenRects({ safeRect: ctx.safeRect, imgW: ctx.imgW, imgH: ctx.imgH, postType: media.metadata?.postType })
+    : null;
+
   let overlayZones = {};
   if (sourceImageUrl) {
     await timeStage(run, 'overlay-zones', async () => {
       try {
         overlayZones = await runOverlayZoneAnalysis({
-          sourceImageUrl, crops, judge, extendedCrops: extendedCandidates
+          sourceImageUrl, crops, judge, extendedCrops: extendedCandidates,
+          forbiddenRectsPct
         });
       } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
     });
@@ -805,6 +816,42 @@ async function timeStage(run, name, fn) {
 }
 
 // Cloudinary video-transform URL: crop every frame to a given rect.
+// Convert the cross-frame safeRect (pixel coords, union of YOLO
+// first-seen bounds + subjects + text across the clip) into 0..1
+// fractions for the Gemini overlay-zone prompt, plus stamp Reels-
+// specific platform UI bands (caption strip, share/save column,
+// audio/profile header) that aren't visible in the hero still but
+// will sit on top of the rendered creative at runtime. The result is
+// fed in as hard rules so the layout generator never places overlays
+// where the subject moves OR where IG's chrome will obscure them.
+function buildVideoForbiddenRects({ safeRect, imgW, imgH, postType }) {
+  const rects = [];
+
+  if (safeRect && imgW > 0 && imgH > 0) {
+    rects.push({
+      x1:     safeRect.x1 / imgW,
+      y1:     safeRect.y1 / imgH,
+      x2:     safeRect.x2 / imgW,
+      y2:     safeRect.y2 / imgH,
+      reason: 'cross-frame subject motion (union of YOLO + subjects + text across the video)'
+    });
+  }
+
+  // Reels carry a fixed UI overlay across all playback surfaces.
+  // Approximate bands (validated against IG mobile screenshots — exact
+  // pixels vary by device but these envelopes cover all of them):
+  //   top    ~6%   profile / audio chip
+  //   right  ~12%  like/comment/share/save column (last ~70% of height)
+  //   bottom ~22%  username + caption + sound credits
+  if (postType === 'REEL') {
+    rects.push({ x1: 0,    y1: 0,    x2: 1,    y2: 0.06, reason: 'Reels top UI (profile / audio)' });
+    rects.push({ x1: 0,    y1: 0.78, x2: 1,    y2: 1,    reason: 'Reels bottom UI (caption / sound credit)' });
+    rects.push({ x1: 0.88, y1: 0.30, x2: 1,    y2: 0.95, reason: 'Reels right action column (like / comment / share / save)' });
+  }
+
+  return rects.length > 0 ? rects : null;
+}
+
 function buildCloudinaryCropUrl(videoUrl, crop) {
   if (!videoUrl || !videoUrl.includes('/upload/')) return null;
   const w = Math.max(1, crop.x2 - crop.x1);
@@ -841,12 +888,12 @@ function buildCloudinaryCropUrl(videoUrl, crop) {
 //      ratio, union the forbidden rects, intersect the safe zones.
 //   C. Analyze the actually-rendered self-underlay video. Use Cloudinary
 //      `so_<sec>` transform to extract N frames from the composed output URL.
-async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops }) {
+async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops, forbiddenRectsPct }) {
   const inputs = pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops });
   if (!inputs.length) return {};
 
   const settled = await Promise.allSettled(inputs.map(i =>
-    analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio })
+    analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio, forbiddenRectsPct })
   ));
 
   const artifact = {};

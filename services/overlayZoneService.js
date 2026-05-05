@@ -94,7 +94,7 @@ function rectPctSchema() {
 // Analyze a single image. Returns the parsed analysis or null on any failure
 // (caller treats null as a non-fatal degradation — the layout generator can
 // still work for the other images on the same job).
-async function analyzeOverlayZones({ imageUrl, label, ratio }) {
+async function analyzeOverlayZones({ imageUrl, label, ratio, forbiddenRectsPct }) {
   if (!isEnabled()) return null;
   if (!imageUrl) return null;
 
@@ -127,7 +127,7 @@ async function analyzeOverlayZones({ imageUrl, label, ratio }) {
     return null;
   }
 
-  const prompt = buildPrompt(ratio);
+  const prompt = buildPrompt(ratio, forbiddenRectsPct);
 
   try {
     const res = await postWithRetry({
@@ -248,10 +248,18 @@ async function postWithRetry({ url, body, timeout, label, maxAttempts = 3 }) {
   throw lastErr;
 }
 
-function buildPrompt(ratio) {
+function buildPrompt(ratio, forbiddenRectsPct) {
+  // Caller-supplied forbidden rects (cross-frame safeRect for video,
+  // platform UI bands for Reels). Injected as hard rules at the top
+  // of the prompt so Gemini treats them as floor restrictions even
+  // when the still doesn't visibly contain the subject — the still is
+  // one frame and the rect represents motion across the whole clip.
+  const forbiddenBlock = formatForbiddenRectsBlock(forbiddenRectsPct);
+
   return (
     `You are analyzing a finished marketing-creative image at aspect ratio ${ratio || 'unspecified'}. ` +
     `A downstream ad-layout generator needs to know which regions of the frame it MUST NOT cover with overlays (logo, headline, comments, CTAs, etc.). Your job is to identify those regions and rate each with a strictness score. The layout generator separately controls a "conservation level" slider that decides which strictness threshold to enforce.\n\n` +
+    forbiddenBlock +
 
     `Return:\n` +
     `1) densityGrid — a visual-busyness heatmap. Use a SMALL grid to keep output compact: 8×6 for landscape, 6×8 for portrait, 6×10 for very tall (9:16). Each cell is a number 0–1 rounded to 1 decimal (e.g. 0.0, 0.3, 1.0): 0 = empty/uniform background, 1 = visually busy / contains subject / detailed texture.\n\n` +
@@ -275,6 +283,33 @@ function buildPrompt(ratio) {
     `- Coordinates strictly within [0, 1]. Rects should tightly bound their subject, not include generous padding.\n` +
     `- Do NOT suggest where overlays SHOULD go — only where they must NOT. The safe area is computed as "the whole frame minus active restrictions".`
   );
+}
+
+// Format caller-supplied forbidden rects (already in 0..1 fractions)
+// as a hard-rule block at the top of the overlay-zone prompt. Each
+// rect carries a `reason` so Gemini knows whether it's protecting a
+// moving subject (cross-frame safeRect) or a platform UI band (Reels
+// caption / actions strip).
+function formatForbiddenRectsBlock(rects) {
+  if (!Array.isArray(rects) || rects.length === 0) return '';
+  const lines = rects.map(r => {
+    const x1 = clamp01(Number(r.x1)).toFixed(3);
+    const y1 = clamp01(Number(r.y1)).toFixed(3);
+    const x2 = clamp01(Number(r.x2)).toFixed(3);
+    const y2 = clamp01(Number(r.y2)).toFixed(3);
+    const reason = r.reason ? ` — ${r.reason}` : '';
+    return `   • x1=${x1} y1=${y1} x2=${x2} y2=${y2}${reason}`;
+  });
+  return (
+    `CALLER-SUPPLIED FORBIDDEN REGIONS (hard rules, strictness=1.0):\n` +
+    `These rects were computed from cross-frame motion analysis and/or platform UI placements that aren't visible in this single still. INCLUDE each as a restriction with strictness=1.0 IN ADDITION to the regions you identify visually. Coordinates are 0..1 fractions of the image.\n` +
+    lines.join('\n') + '\n\n'
+  );
+}
+
+function clamp01(n) {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
 }
 
 // Average luminance per cell at the same dimensions as Gemini's densityGrid.
