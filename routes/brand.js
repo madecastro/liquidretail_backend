@@ -143,7 +143,8 @@ router.patch('/:id', express.json(), async (req, res) => {
 
     const editable = ['name', 'websiteUrl', 'tagline', 'summary', 'logoUrl',
                       'primaryColor', 'secondaryColor', 'accentColor', 'fontColor',
-                      'fontFamily', 'tone', 'hashtags', 'tags', 'demographics'];
+                      'fontFamily', 'tone', 'hashtags', 'tags', 'demographics',
+                      'brandSafety'];
     const fontTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'fontFamily');
     const fontCleared = fontTouched && (req.body.fontFamily == null || req.body.fontFamily === '');
     const before = { websiteUrl: brand.websiteUrl };

@@ -131,6 +131,23 @@ const brandSchema = new mongoose.Schema({
   // auditing where a brand came from.
   firstSeenMediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },
 
+  // Phase 4d — Brand Safety configuration. Composite risk score (0–100)
+  // surfaced on the Brand page; category narrows the auto-suggested
+  // blocked-topic list; blockedTopics[] is the operator-curated list
+  // of topics that should NOT appear in this brand's ads or matched
+  // media. The renderer / matcher are expected to consult these once
+  // wired (separate ticket — for now this is just a config surface).
+  // Risk score is computed from (a) blockedTopic violation rate seen
+  // across the brand's matched media and (b) category default risk
+  // weights. Operators can override via the Adjust Settings modal.
+  brandSafety: {
+    riskScore:    { type: Number, min: 0, max: 100, default: null },
+    category:     { type: String, default: null },          // 'Food & CPG' | 'Apparel' | etc.
+    blockedTopics: { type: [String], default: [] },         // ['Alcohol','Gambling','Guns','Hate Speech',...]
+    adjustedAt:   { type: Date,   default: null },
+    adjustedBy:   { type: String, default: null }           // userId/email of last editor
+  },
+
   // Phase V2 #4 — auto-sync settings for connected integrations. When
   // autoSyncEnabled is true, the worker's scheduled sweep pulls catalog
   // (~daily) and posts (~hourly) for any active credential under this
