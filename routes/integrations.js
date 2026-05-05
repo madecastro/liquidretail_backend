@@ -1091,6 +1091,17 @@ router.patch('/meta-ads/:credentialId/selection', express.json(), async (req, re
     await cred.save();
 
     console.log(`✅ Meta Ads selection finalized: brand=${brandId} cred=${cred._id} adAccount=${matched.name || matched.id}`);
+
+    // Fire-and-forget initial campaign sync so the Campaigns page has
+    // data the moment the user lands on it. The picker save returns
+    // immediately; the Graph API fetch + upsert runs in the background
+    // and stamps cred.lastCampaignSyncAt when it finishes.
+    syncCampaigns({ brandId, platform: 'meta-ads', credentialId: String(cred._id) })
+      .then(r => {
+        if (!r.ok) console.warn(`   ⚠️  initial meta-ads sync failed for ${cred._id}: ${r.reason || 'unknown'}`);
+      })
+      .catch(err => console.warn(`   ⚠️  initial meta-ads sync threw for ${cred._id}: ${err.message}`));
+
     res.json({ ok: true, credential: summarizeAds(cred) });
   } catch (err) {
     console.error('meta-ads selection failed:', err);
@@ -1338,6 +1349,16 @@ router.patch('/google-ads/:credentialId/selection', express.json(), async (req, 
     await cred.save();
 
     console.log(`✅ Google Ads selection finalized: brand=${brandId} cred=${cred._id} customer=${customerId} (${details?.descriptiveName || '?'})`);
+
+    // Same fire-and-forget pattern as the Meta Ads picker — populate
+    // campaigns immediately so the Campaigns page isn't empty after
+    // the user finishes setup.
+    syncCampaigns({ brandId, platform: 'google-ads', credentialId: String(cred._id) })
+      .then(r => {
+        if (!r.ok) console.warn(`   ⚠️  initial google-ads sync failed for ${cred._id}: ${r.reason || 'unknown'}`);
+      })
+      .catch(err => console.warn(`   ⚠️  initial google-ads sync threw for ${cred._id}: ${err.message}`));
+
     res.json({ ok: true, credential: summarizeGoogleAds(cred) });
   } catch (err) {
     console.error('google-ads selection failed:', err);
