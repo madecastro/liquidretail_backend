@@ -23,6 +23,7 @@ const LayoutInputArtifact   = require('../models/LayoutInputArtifact');
 const CatalogProduct        = require('../models/CatalogProduct');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const Campaign              = require('../models/Campaign');
+const Collection            = require('../models/Collection');
 const { deleteManyFromCloudinary } = require('./cloudinaryService');
 
 // ── Brand cascade ─────────────────────────────────────────────────────
@@ -91,7 +92,8 @@ async function cascadeDeleteBrand(brandId) {
     Media.deleteMany({ brandId }).then(r                 => directCounts.media                = r.deletedCount || 0),
     CatalogProduct.deleteMany({ brandId }).then(r        => directCounts.catalogProducts      = r.deletedCount || 0),
     IntegrationCredential.deleteMany({ brandId }).then(r => directCounts.integrationCreds     = r.deletedCount || 0),
-    Campaign.deleteMany({ brandId }).then(r              => directCounts.campaigns            = r.deletedCount || 0)
+    Campaign.deleteMany({ brandId }).then(r              => directCounts.campaigns            = r.deletedCount || 0),
+    Collection.deleteMany({ brandId }).then(r            => directCounts.collections          = r.deletedCount || 0)
   ]);
 
   // Step 4 — Brand itself.
@@ -152,6 +154,14 @@ async function cascadeDeleteMedia(mediaId) {
     LayoutInputArtifact.deleteMany({ mediaId }).then(r    => artifactCounts.layoutInputs       = r.deletedCount || 0)
   ]);
 
+  // Phase A-3 — pull this mediaId out of any Collection that references
+  // it. Bulk $pull is fast even with many collections; doc rewrite on
+  // each match is unavoidable but the working set is small.
+  const collectionPullRes = await Collection.updateMany(
+    { mediaIds: mediaId },
+    { $pull: { mediaIds: mediaId } }
+  );
+
   const mediaResult = await Media.deleteOne({ _id: mediaId });
 
   if (cloudUrls.length > 0) {
@@ -163,12 +173,13 @@ async function cascadeDeleteMedia(mediaId) {
       .catch(err => console.warn(`   ⚠️  media-cascade cloudinary cleanup failed: ${err.message}`));
   }
 
-  console.log(`🗑️  media-cascade done: media=${mediaId} artifacts=${Object.values(artifactCounts).reduce((s, n) => s + n, 0)} cloudUrls=${cloudUrls.length} in ${Date.now() - t0}ms`);
+  console.log(`🗑️  media-cascade done: media=${mediaId} artifacts=${Object.values(artifactCounts).reduce((s, n) => s + n, 0)} cloudUrls=${cloudUrls.length} collections=${collectionPullRes.modifiedCount || 0} in ${Date.now() - t0}ms`);
 
   return {
     ok: true,
     mediaId,
     artifactCounts,
+    collectionsPulled: collectionPullRes.modifiedCount || 0,
     mediaDeleted: mediaResult.deletedCount === 1,
     cloudinaryQueued: cloudUrls.length,
     durationMs: Date.now() - t0
