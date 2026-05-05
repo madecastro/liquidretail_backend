@@ -11,11 +11,24 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // help the model pick the correct primary subject and write a richer
 // description.
 //
+// Phase A-0 — also emits a small set of derived display fields used by the
+// Media Library page:
+//   primarySubjectLabel  — concise label ("Person (Runner)", "Bottle (Vacuum
+//                          Insulated)") suitable for a one-line UI chip
+//   secondaryElementsTags — short noun list extracted from secondary subjects
+//                          + background notes ("Mountain", "Trees", "Trail")
+//   background.mood       — 2–4 mood adjectives ("Active", "Adventurous")
+//   background.sceneType  — refined scene type ("Outdoor Trail", "Studio",
+//                          "Urban Street") — more specific than `setting`
+//
 // Output shape:
 //   {
 //     subjects:  [{ id, role, description, x1, y1, x2, y2 }],
 //     text:      [{ id, content, type, x1, y1, x2, y2, confidence }],
-//     background:{ description, setting, palette, lighting, style, notes }
+//     background:{ description, setting, palette, lighting, style, notes,
+//                  mood, sceneType },
+//     primarySubjectLabel:   string | null,
+//     secondaryElementsTags: string[]
 //   }
 async function detectSubjectsAndText(imageUrl, hints = {}) {
   const { brand, category, caption } = hints;
@@ -52,8 +65,14 @@ async function detectSubjectsAndText(imageUrl, hints = {}) {
     "palette":     ["#rrggbb", ...],                // 2–5 dominant hex colors of the BACKGROUND, not the subject
     "lighting":    "hard studio" | "soft diffused" | "golden hour" | "overcast" | "dim indoor" | "harsh overhead" | "backlit" | "flash" | "other",
     "style":       "photorealistic" | "editorial" | "lifestyle" | "minimalist" | "cluttered" | "high-contrast" | "muted" | "vibrant" | "other",
-    "notes":       "anything else an AI image generator should know to extend this scene — e.g. 'beach at low tide, sand texture visible, soft waves far left'"
+    "notes":       "anything else an AI image generator should know to extend this scene — e.g. 'beach at low tide, sand texture visible, soft waves far left'",
+    "mood":        ["adjective", ...],              // 2–4 mood/feeling adjectives describing the OVERALL emotional tone (e.g. ["active","adventurous"], ["calm","minimal"], ["festive","warm"])
+    "sceneType":   "concise scene-type label — a refinement of \"setting\" that adds context. Examples: \"Outdoor Trail\", \"Studio\", \"Urban Street\", \"Beach\", \"Office\", \"Kitchen\", \"Mountain Summit\". 1–3 words."
   }
+
+"primarySubjectLabel": a SHORT concise label for the primary subject suitable for a one-line UI chip. Format "<Noun> (<role/qualifier>)" when a role is meaningful, else just the noun. Examples: "Person (Runner)", "Person (Cyclist)", "Bottle (Vacuum Insulated)", "Sneakers", "Backpack", "Coffee Cup". Always derived from the chosen primary subject. Max 30 chars.
+
+"secondaryElementsTags": array of 2–6 short noun tags describing the OTHER notable elements visible in the frame (not the primary subject). Drawn from secondary subjects + background contents. Single-word or two-word tags, capitalized. Examples: ["Mountain", "Trees", "Trail"], ["Coffee Mug", "Notebook"], ["Skyline", "Crosswalk"]. Omit if nothing notable.
 
 The PRIMARY subject's description should be detailed enough to search for it online — include material, color, cut/silhouette, notable features, and any product name/label you can read.${hintBlock}
 
@@ -98,10 +117,27 @@ Return ONLY valid JSON, no markdown, no explanation.`
     palette:     Array.isArray(bg.palette) ? bg.palette.filter(c => typeof c === 'string').slice(0, 5) : [],
     lighting:    typeof bg.lighting === 'string' ? bg.lighting : '',
     style:       typeof bg.style === 'string' ? bg.style : '',
-    notes:       typeof bg.notes === 'string' ? bg.notes : ''
+    notes:       typeof bg.notes === 'string' ? bg.notes : '',
+    // Phase A-0 — small derived display fields
+    mood:        Array.isArray(bg.mood)
+                   ? bg.mood.filter(m => typeof m === 'string' && m.trim()).map(m => m.trim()).slice(0, 4)
+                   : [],
+    sceneType:   typeof bg.sceneType === 'string' ? bg.sceneType.trim().slice(0, 40) : ''
   };
 
-  return { subjects, text, background };
+  // Phase A-0 — concise primary-subject label + secondary element tags.
+  // Both are best-effort; UI handles missing values gracefully.
+  const primarySubjectLabel = (typeof parsed.primarySubjectLabel === 'string' && parsed.primarySubjectLabel.trim())
+    ? parsed.primarySubjectLabel.trim().slice(0, 30)
+    : null;
+  const secondaryElementsTags = Array.isArray(parsed.secondaryElementsTags)
+    ? parsed.secondaryElementsTags
+        .filter(t => typeof t === 'string' && t.trim())
+        .map(t => t.trim().slice(0, 30))
+        .slice(0, 6)
+    : [];
+
+  return { subjects, text, background, primarySubjectLabel, secondaryElementsTags };
 }
 
 function clamp(v) {

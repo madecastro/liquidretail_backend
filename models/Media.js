@@ -118,11 +118,30 @@ const mediaSchema = new mongoose.Schema({
     _id: false
   }],
 
-  // Computed downstream from artifacts; cached here so "find ad-suitable
-  // media" is one indexed query instead of an aggregation across artifacts.
+  // Phase A-0 — concise derived display fields used by the Media Library
+  // page so the UI doesn't have to recompute them from artifacts on every
+  // render. Populated at the end of detect by the finalize-stage derivation
+  // pass (subjectTextService extension + adSuitabilityService +
+  // imageQualityService).
+  primarySubjectLabel:   String,                                              // e.g. "Person (Runner)"
+  secondaryElementsTags: { type: [String], default: [] },                      // e.g. ["Mountain", "Trees", "Trail"]
+  technicalInsights: {
+    brightnessAvg:  Number,                                                    // 0..1, mean of overlay-zone brightness grid
+    densityAvg:     Number,                                                    // 0..1, mean of overlay-zone density grid
+    focusScore:     Number,                                                    // raw Laplacian variance
+    focusBucket:    String,                                                    // 'Soft' | 'Acceptable' | 'Sharp'
+    updatedAt:      Date
+  },
+
+  // Phase A-0 — Ad Readiness composite score + typed reason bullets. The
+  // Media Library Summary tab renders this directly. `reasons` carries
+  // {kind, label, severity} objects (severity ∈ positive | caution | negative)
+  // — broader than the prior [String] shape, so consumers should read the
+  // object form. Old String entries are tolerated but unused.
   adSuitability: {
-    score:     Number,
-    reasons:   [String],
+    score:     Number,                                                          // 0..10 composite, 1 decimal
+    reasons:   { type: [mongoose.Schema.Types.Mixed], default: [] },            // [{kind, label, severity}, ...]
+    metrics:   mongoose.Schema.Types.Mixed,                                     // raw signals consumed by the score (debug)
     updatedAt: Date
   },
 

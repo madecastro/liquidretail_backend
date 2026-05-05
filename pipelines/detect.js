@@ -39,6 +39,8 @@ const { transcribeAudio } = require('../services/whisperService');
 const { extractEntities } = require('../services/nerService');
 const { findProductMatches, findPerProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
+const { computeFocus } = require('../services/imageQualityService');
+const { scoreMedia } = require('../services/adSuitabilityService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
 const { identifyYoloDetectionsGemini, isEnabled: isGeminiIdentifyEnabled } = require('../services/geminiIdentifyService');
 const { reconcileEnrichments } = require('../services/enrichmentReconciler');
@@ -109,9 +111,9 @@ async function runImagePipeline(run, media, buffer) {
     : { products: [], refinedProducts: [] };
   const products = yoloChainOut.products;
   const refinedProducts = yoloChainOut.refinedProducts;
-  const { subjects, text, background } = subjectsRes.status === 'fulfilled'
+  const { subjects, text, background, primarySubjectLabel, secondaryElementsTags } = subjectsRes.status === 'fulfilled'
     ? subjectsRes.value
-    : { subjects: [], text: [], background: null };
+    : { subjects: [], text: [], background: null, primarySubjectLabel: null, secondaryElementsTags: [] };
 
   const imgW = products[0]?.imgWidth  || 1024;
   const imgH = products[0]?.imgHeight || 768;
@@ -160,14 +162,17 @@ async function runImagePipeline(run, media, buffer) {
   // Phase 2c — promote vision analysis onto Media (denormalized cache of
   // the latest run's output). DetectionArtifact stays as the per-run
   // audit record; Media has the LATEST.
-  media.subjects           = (subjects || []).map(s => ({ ...s }));
-  media.text               = (text     || []).map(t => ({ ...t }));
-  media.background         = background || null;
-  media.primarySubjectId   = primarySubjectId   || null;
-  media.primarySubjectDesc = primarySubjectDesc || null;
-  media.safeRect           = safeRect || null;
-  media.refinedProducts    = (refinedProducts || []).map(rp => ({ ...rp }));
-  media.lastDetectedAt     = new Date();
+  media.subjects             = (subjects || []).map(s => ({ ...s }));
+  media.text                 = (text     || []).map(t => ({ ...t }));
+  media.background           = background || null;
+  media.primarySubjectId     = primarySubjectId   || null;
+  media.primarySubjectDesc   = primarySubjectDesc || null;
+  // Phase A-0 — concise label + tags from subjectTextService extension
+  media.primarySubjectLabel  = primarySubjectLabel || null;
+  media.secondaryElementsTags = secondaryElementsTags || [];
+  media.safeRect             = safeRect || null;
+  media.refinedProducts      = (refinedProducts || []).map(rp => ({ ...rp }));
+  media.lastDetectedAt       = new Date();
   await media.save();
 
   const cropDoc = await CropArtifact.create({
@@ -224,6 +229,11 @@ async function runImagePipeline(run, media, buffer) {
     matches:      (matchDocs || []).map(d => d._id),
     overlayZones: overlayDoc?._id
   });
+
+  // Phase A-0 — derive Media Library display fields (focus, technical
+  // insights, ad readiness score + bullets). Cheap; runs synchronously
+  // at finalize so consumers don't recompute on every page render.
+  await applyMediaLibraryDerivations(media, buffer, overlayDoc, productMatches);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -401,6 +411,13 @@ async function runVideoPipeline(run, media, buffer) {
     matches:      (matchDocs || []).map(d => d._id),
     overlayZones: overlayDoc?._id
   });
+
+  // Phase A-0 — Media Library derivations. Video pipeline currently has
+  // no in-memory frame buffer (we extract via Cloudinary at hero point);
+  // focus is skipped for video. Everything else (overlay zones, refined
+  // products, primary subject rect) is already on Media. Future ticket:
+  // fetch heroImageUrl bytes here for focus on the still.
+  await applyMediaLibraryDerivations(media, null, overlayDoc, productMatches);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -519,17 +536,23 @@ async function runYoloVideoChain(run, buffer, media) {
 
 async function runSubjectsTextChain(run, imageUrl, media) {
   return await timeStage(run, 'subjects-text', async () => {
-    if (!imageUrl) return { subjects: [], text: [], background: null };
+    if (!imageUrl) return { subjects: [], text: [], background: null, primarySubjectLabel: null, secondaryElementsTags: [] };
     try {
       const st = await detectSubjectsAndText(imageUrl, {
         brand: media.metadata?.brand,
         category: media.metadata?.category,
         caption: media.metadata?.caption
       });
-      return { subjects: st.subjects, text: st.text, background: st.background };
+      return {
+        subjects: st.subjects,
+        text: st.text,
+        background: st.background,
+        primarySubjectLabel: st.primarySubjectLabel || null,
+        secondaryElementsTags: st.secondaryElementsTags || []
+      };
     } catch (err) {
       console.warn('⚠️  Subject/text:', err.message);
-      return { subjects: [], text: [], background: null };
+      return { subjects: [], text: [], background: null, primarySubjectLabel: null, secondaryElementsTags: [] };
     }
   });
 }
@@ -892,6 +915,115 @@ function resolvePrimarySubjectDesc(subjects, judge) {
   if (!subjects?.length) return null;
   const id = resolvePrimarySubjectId(subjects, judge);
   return subjects.find(s => s.id === id)?.description || null;
+}
+
+// Phase A-0 — finalize-stage Media Library derivations. Cheap, runs at
+// detect end. Pulls focus from the source-image buffer (when available),
+// pulls brightness/density averages from the overlay-zone grids,
+// composites the ad-readiness score + bullets via adSuitabilityService,
+// and writes everything onto Media.{technicalInsights, adSuitability}.
+//
+// All sub-steps are best-effort — a missing buffer or missing overlay
+// artifact only suppresses the dependent metric, never fails the run.
+async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, productMatches) {
+  try {
+    // 1. Focus — Laplacian variance on the source buffer
+    let focus = null;
+    if (sourceBuffer) {
+      try { focus = await computeFocus(sourceBuffer); }
+      catch (err) { console.warn(`   ⚠️  focus derivation failed: ${err.message}`); }
+    }
+
+    // 2. Brightness + density averages — from the OverlayZoneArtifact's
+    //    primary base-ratio grid (5:4 base if available, else any first
+    //    available variant). The grid was already computed during overlay-
+    //    zone analysis; we just average its cells.
+    const overlayZones = pickPrimaryOverlayZoneAnalysis(overlayDoc);
+    const brightnessAvg = averageGrid(overlayZones?.brightnessGrid);
+    const densityAvg    = averageGrid(overlayZones?.densityGrid);
+
+    media.technicalInsights = {
+      brightnessAvg: brightnessAvg ?? null,
+      densityAvg:    densityAvg    ?? null,
+      focusScore:    focus?.focusScore ?? null,
+      focusBucket:   focus?.focusBucket || null,
+      updatedAt:     new Date()
+    };
+
+    // 3. Ad readiness — composite score + reason bullets
+    const detectSummaryOutcome = media.classification?.detectSummary?.outcome || null;
+    const primarySubjectRectPct = subjectRectPctFromOverlay(overlayZones)
+                               || subjectRectPctFromMedia(media);
+    const suitability = scoreMedia({
+      refinedProducts: media.refinedProducts || [],
+      overlayZones,
+      focus,
+      text: media.text || [],
+      detectSummaryOutcome,
+      primarySubjectRectPct
+    });
+    media.adSuitability = {
+      score:     suitability.score,
+      reasons:   suitability.reasons,
+      metrics:   suitability.metrics,
+      updatedAt: new Date()
+    };
+
+    await media.save();
+    const positives = suitability.reasons.filter(r => r.severity === 'positive').length;
+    const cautions  = suitability.reasons.filter(r => r.severity === 'caution').length;
+    const negatives = suitability.reasons.filter(r => r.severity === 'negative').length;
+    console.log(`📊 ad-readiness: ${suitability.score.toFixed(1)}/10 (✓${positives} ⚠${cautions} ✗${negatives})${focus ? ` focus=${focus.focusBucket}` : ''}${brightnessAvg != null ? ` bright=${brightnessAvg.toFixed(2)}` : ''}${densityAvg != null ? ` density=${densityAvg.toFixed(2)}` : ''}`);
+  } catch (err) {
+    console.warn(`   ⚠️  media-library derivations failed (non-fatal): ${err.message}`);
+  }
+}
+
+// Pick the canonical overlay-zone analysis to use for technical insights.
+// OverlayZoneArtifact stores a per-ratio map; the 5:4 base variant is the
+// most representative of the source frame, falling back to whatever ran.
+function pickPrimaryOverlayZoneAnalysis(overlayDoc) {
+  if (!overlayDoc?.zones) return null;
+  const zones = overlayDoc.zones;
+  // Prefer base ratios (5:4, 1:1, 4:5) over extension/generation crops
+  for (const ratio of ['5:4', '1:1', '4:5']) {
+    const variants = zones[ratio];
+    if (Array.isArray(variants)) {
+      const baseVariant = variants.find(v => v?.variant === 'base' && v?.analysis) || variants.find(v => v?.analysis);
+      if (baseVariant?.analysis) return baseVariant.analysis;
+    }
+  }
+  // Fallback — any ratio with an analysis
+  for (const ratio of Object.keys(zones)) {
+    const variants = zones[ratio];
+    if (Array.isArray(variants)) {
+      const v = variants.find(x => x?.analysis);
+      if (v?.analysis) return v.analysis;
+    }
+  }
+  return null;
+}
+
+function averageGrid(grid) {
+  if (!grid?.cells?.length) return null;
+  const flat = grid.cells.flat();
+  if (!flat.length) return null;
+  return flat.reduce((s, v) => s + (Number(v) || 0), 0) / flat.length;
+}
+
+// Try to source a primary-subject rectPct from the overlay-zone analysis
+// first (already-derived hard-rule product rect), fall back to deriving
+// from the Media.subjects[] primary entry.
+function subjectRectPctFromOverlay(overlayZones) {
+  return overlayZones?.primarySubjectRectPct || null;
+}
+
+function subjectRectPctFromMedia(media) {
+  const primaryId = media.primarySubjectId;
+  const ps = (media.subjects || []).find(s => s?.id === primaryId)
+          || (media.subjects || []).find(s => s?.role === 'primary');
+  if (!ps) return null;
+  return { x1: ps.x1, y1: ps.y1, x2: ps.x2, y2: ps.y2 };
 }
 
 // Phase 2e — drop identification.details before persisting the artifact.
