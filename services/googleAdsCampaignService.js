@@ -19,6 +19,8 @@
 const axios = require('axios');
 const { decrypt } = require('./integrationCryptoService');
 const googleAds = require('./googleAdsOAuthService');
+const { matchCampaignCreatives, extractCreativeContent, creativeFields } = require('./googleAdsCreativeMatcher');
+const { deriveCampaignKind } = require('./creativeMatcherCore');
 
 const ADS_API_VERSION = process.env.GOOGLE_ADS_API_VERSION || 'v19';
 const ADS_API_ROOT    = `https://googleads.googleapis.com/${ADS_API_VERSION}`;
@@ -112,14 +114,28 @@ async function syncForCredential(cred) {
 
   const errors = [];
 
-  // ── 2. Ad groups + ads (one query, denormalized) ──
+  // ── 2. Ad groups + ads + creative content (one query, denormalized) ──
+  // Includes type-specific creative fields (RSA/RDA/ETA headlines +
+  // descriptions, image_url) plus universal final_urls so the matcher
+  // can resolve products without a second round-trip.
   try {
     const rows = await runGAQL(ctx, `
       SELECT
         campaign.id,
         ad_group.id, ad_group.name, ad_group.status, ad_group.type,
         ad_group_ad.status, ad_group_ad.resource_name,
-        ad_group_ad.ad.id, ad_group_ad.ad.name, ad_group_ad.ad.type
+        ad_group_ad.ad.id, ad_group_ad.ad.name, ad_group_ad.ad.type,
+        ad_group_ad.ad.final_urls,
+        ad_group_ad.ad.responsive_search_ad.headlines,
+        ad_group_ad.ad.responsive_search_ad.descriptions,
+        ad_group_ad.ad.responsive_display_ad.headlines,
+        ad_group_ad.ad.responsive_display_ad.descriptions,
+        ad_group_ad.ad.expanded_text_ad.headline_part1,
+        ad_group_ad.ad.expanded_text_ad.headline_part2,
+        ad_group_ad.ad.expanded_text_ad.headline_part3,
+        ad_group_ad.ad.expanded_text_ad.description,
+        ad_group_ad.ad.expanded_text_ad.description2,
+        ad_group_ad.ad.image_ad.image_url
       FROM ad_group_ad
       WHERE campaign.status != 'REMOVED' AND ad_group.status != 'REMOVED' AND ad_group_ad.status != 'REMOVED'
       LIMIT 5000
@@ -144,6 +160,7 @@ async function syncForCredential(cred) {
       }
       const ad = r.adGroupAd?.ad;
       if (ad?.id) {
+        const extracted = extractCreativeContent(r);
         adSet.ads.push({
           externalId: String(ad.id),
           name:       ad.name || '(unnamed)',
@@ -151,7 +168,8 @@ async function syncForCredential(cred) {
           creativeRef: {
             adGroupAdResourceName: r.adGroupAd?.resourceName || null,
             adType:                ad.type || null
-          }
+          },
+          creative: creativeFields(extracted)
         });
       }
     }
@@ -272,6 +290,30 @@ async function syncForCredential(cred) {
   }
 
   const campaigns = [...campaignMap.values()];
+
+  // Creative-level matching against CatalogProduct (URL + collection +
+  // text similarity). Operates entirely on the data already fetched
+  // above — no extra HTTP. Sets ad.matchedProductIds, ad.matchMethod,
+  // and the campaign-level matchedProductIds aggregate. campaign.kind
+  // gets derived from the matchMethods + per-adSet productSetId so PMax
+  // / Shopping campaigns label as 'product' even before we expand
+  // listing-group filters into Merchant Center SKU IDs.
+  const matchT0 = Date.now();
+  let totalMatched = 0;
+  for (const c of campaigns) {
+    try {
+      const matchedIds = await matchCampaignCreatives({ brandId: cred.brandId, campaign: c });
+      c.matchedProductIds = matchedIds;
+      c.kind              = deriveCampaignKind(c);
+      totalMatched += matchedIds.length;
+    } catch (err) {
+      console.warn(`   ⚠️  creative-match failed for campaign ${c.externalId}: ${err.message}`);
+      errors.push({ externalId: c.externalId, scope: 'creative-match', reason: err.message });
+      c.kind = deriveCampaignKind(c);
+    }
+  }
+  console.log(`🔗 Google creative match: ${totalMatched} product association(s) across ${campaigns.length} campaign(s) in ${Date.now() - matchT0}ms`);
+
   console.log(`📣 Google campaign sync done: cred=${cred._id} campaigns=${campaigns.length} errors=${errors.length} in ${Date.now() - t0}ms`);
   return { ok: true, campaigns, errors };
 }
