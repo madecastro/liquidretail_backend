@@ -291,6 +291,45 @@ router.patch('/:id/upload-settings', express.json(), async (req, res) => {
   }
 });
 
+// ── Phase 4 follow-up #6 — Persona avatar generation ───────────────
+// Generates a portrait illustration for brand.demographics[index] via
+// gpt-image-1, uploads it to Cloudinary, and patches avatarUrl onto
+// the persona row. Returns the updated persona so the frontend can
+// drop in the new tile without a second round-trip.
+router.post('/:id/personas/:index/avatar', express.json(), async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const idx = Number(req.params.index);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= (brand.demographics?.length || 0)) {
+      return res.status(400).json({ error: 'persona index out of range' });
+    }
+    const persona = brand.demographics[idx];
+    if (!persona?.name && !persona?.description) {
+      return res.status(400).json({ error: 'persona must have at least a name or description' });
+    }
+
+    const { generateAvatarForPersona } = require('../services/personaAvatarService');
+    const result = await generateAvatarForPersona(persona, {
+      category: brand.brandSafety?.category || null
+    });
+
+    brand.demographics[idx].avatarUrl = result.url;
+    brand.markModified('demographics');
+    await brand.save();
+
+    res.json({
+      index:   idx,
+      persona: brand.demographics[idx],
+      avatarUrl: result.url
+    });
+  } catch (err) {
+    console.error('persona avatar generation failed:', err);
+    res.status(500).json({ error: err.message || 'avatar generation failed' });
+  }
+});
+
 function serializeBrand(b) {
   return {
     // Both id and _id are returned for frontend compat — GET /api/brand/:id
