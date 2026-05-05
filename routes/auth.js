@@ -2,33 +2,10 @@ const express = require('express');
 const passport = require('passport');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
+const { FRONTEND_URL, validateFrontendOrigin } = require('../services/frontendOriginValidator');
 
-// Where to bounce the user after OAuth callbacks. Override via env
-// to point at a dev / staging frontend; falls back to prod when
-// unset so existing deploys behave unchanged.
-const FRONTEND_URL  = process.env.FRONTEND_URL  || 'https://liquidretail.netlify.app';
-// Allowlist of origins that can request a per-request redirect via
-// ?redirect= on /auth/google. Cohabitation use-case: the new Chakra
-// app on rsvite.netlify.app needs to receive the OAuth bounce on its
-// own origin while the legacy app at liquidretail.netlify.app keeps
-// working unchanged. Comma-separated list; falls back to FRONTEND_URL.
-const FRONTEND_URLS = (process.env.FRONTEND_URLS || FRONTEND_URL)
-  .split(',').map(s => s.trim()).filter(Boolean);
-
-// Validate a candidate redirect URL against the allowlist by ORIGIN
-// (scheme + host + port). Returns the bare origin when valid, null
-// otherwise. Path/query are stripped — we always bounce to the root.
-function validateRedirect(candidate) {
-  if (!candidate) return null;
-  let url;
-  try { url = new URL(candidate); } catch { return null; }
-  for (const allowed of FRONTEND_URLS) {
-    try {
-      if (new URL(allowed).origin === url.origin) return url.origin;
-    } catch {}
-  }
-  return null;
-}
+// Local alias kept for readability inside this file's flow.
+const validateRedirect = validateFrontendOrigin;
 
 // /auth/google — start OAuth. Optional ?redirect=<origin> tells the
 // callback where to bounce (allowlist-validated). The validated URL

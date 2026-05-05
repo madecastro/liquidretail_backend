@@ -31,10 +31,42 @@ const metaAds = require('../services/metaAdsOAuthService');
 const googleAds = require('../services/googleAdsOAuthService');
 const { syncCampaigns, getCampaignStatus } = require('../services/campaignSyncService');
 
-// Same FRONTEND_URL as auth.js — env-overridable so OAuth bounces
-// (IG / Meta Ads / Google Ads callbacks) land on the right domain
-// in dev / staging deployments. Default keeps prod working unchanged.
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://liquidretail.netlify.app';
+// Same FRONTEND_URL + allowlist as auth.js — env-overridable so OAuth
+// bounces (IG / Meta Ads / Google Ads callbacks) land on the right
+// domain in dev / staging / cohabitation deployments. Connect routes
+// accept ?redirect=<origin> (validated against FRONTEND_URLS) and
+// round-trip it through the OAuth state. Callbacks decode the state
+// and bounce back to that origin's /brand page. When no redirect is
+// supplied (legacy callers), falls back to FRONTEND_URL/brand.html.
+const { FRONTEND_URL, validateFrontendOrigin } = require('../services/frontendOriginValidator');
+
+// Pack the validated origin into a JWT field. Used by connect routes
+// when they generate state. Decoded on the corresponding callback.
+function appendRedirectToState(payload, requestedRedirect) {
+  const validated = validateFrontendOrigin(requestedRedirect);
+  if (validated) payload.redirect = validated;
+  return payload;
+}
+
+// Decode the redirect from a verified state payload (or null when
+// missing/invalid). Caller should fall back to FRONTEND_URL.
+function readRedirectFromState(statePayload) {
+  if (!statePayload) return null;
+  return validateFrontendOrigin(statePayload.redirect);
+}
+
+// Build the post-OAuth bounce URL. The new app uses /brand (Chakra
+// route) and reads ig_status/ig_setup query params. The legacy app
+// uses /brand.html. We pick by suffix based on whether the origin
+// was supplied via the allowlist (= new app) or fell through to
+// FRONTEND_URL default (= legacy).
+function buildIntegrationBounceUrl(origin, query) {
+  const usingDefault = !origin || origin === FRONTEND_URL;
+  const path = usingDefault ? '/brand.html' : '/brand';
+  const target = origin || FRONTEND_URL;
+  const qs = query ? `?${query}` : '';
+  return `${target}${path}${qs}`;
+}
 
 function summarize(cred) {
   if (!cred) return null;
@@ -94,14 +126,18 @@ router.post('/instagram/connect', express.json(), async (req, res) => {
     const brandId = req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
 
+    // ?redirect=<origin> in query OR { redirect } in body — either is
+    // valid. New app uses body; legacy callers can omit entirely.
+    const requestedRedirect = req.query.redirect || req.body?.redirect || null;
+
     const state = jwt.sign(
-      {
+      appendRedirectToState({
         purpose:      'ig-oauth',
         userId:       String(req.user.userId || req.user.id),
         advertiserId: String(req.advertiserId),
         brandId:      String(brandId),
         nonce:        Math.random().toString(36).slice(2)
-      },
+      }, requestedRedirect),
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
@@ -119,10 +155,16 @@ router.post('/instagram/connect', express.json(), async (req, res) => {
 // hash.
 router.get('/instagram/callback', async (req, res) => {
   const { code, state, error: oauthError, error_description } = req.query;
+  // Resolve the post-auth redirect target. We need to peek at the
+  // state payload to know which frontend the original request came
+  // from — but on hard errors (missing/invalid state) the safe
+  // fallback is the legacy default. Track via `bounceTarget` so the
+  // bounce helper below picks the right origin.
+  let bounceTarget = null;
   const bounce = (status, msg) => {
     const params = new URLSearchParams({ ig_status: status });
     if (msg) params.set('ig_msg', msg);
-    res.redirect(`${FRONTEND_URL}/brand.html?${params.toString()}`);
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
   };
 
   if (oauthError) return bounce('denied', String(error_description || oauthError));
@@ -132,6 +174,7 @@ router.get('/instagram/callback', async (req, res) => {
   try {
     payload = jwt.verify(String(state), process.env.JWT_SECRET);
     if (payload.purpose !== 'ig-oauth') throw new Error('wrong purpose');
+    bounceTarget = readRedirectFromState(payload);
   } catch (err) {
     return bounce('error', `invalid state: ${err.message}`);
   }
@@ -172,9 +215,11 @@ router.get('/instagram/callback', async (req, res) => {
 
     console.log(`🔑 IG token captured (pending selection): brand=${payload.brandId} cred=${cred._id}`);
     // Hand the credential id to the frontend so it can drive the
-    // picker modal. The bounce stays on brand.html for context.
+    // picker modal. Bounces to the originating frontend (new Chakra
+    // app on /brand or legacy on /brand.html) per state-encoded
+    // redirect, falling back to FRONTEND_URL.
     const params = new URLSearchParams({ ig_status: 'pending', ig_setup: String(cred._id) });
-    res.redirect(`${FRONTEND_URL}/brand.html?${params.toString()}`);
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
     console.warn(`   ⚠️  IG callback failed: ${detail}`);
@@ -889,14 +934,16 @@ router.post('/meta-ads/connect', express.json(), async (req, res) => {
     const brandId = req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
 
+    const requestedRedirect = req.query.redirect || req.body?.redirect || null;
+
     const state = jwt.sign(
-      {
+      appendRedirectToState({
         purpose:      'meta-ads-oauth',
         userId:       String(req.user.userId || req.user.id),
         advertiserId: String(req.advertiserId),
         brandId:      String(brandId),
         nonce:        Math.random().toString(36).slice(2)
-      },
+      }, requestedRedirect),
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
@@ -911,11 +958,12 @@ router.post('/meta-ads/connect', express.json(), async (req, res) => {
 // JWT state is the trust anchor.
 router.get('/meta-ads/callback', async (req, res) => {
   const { code, state, error: oauthError, error_description } = req.query;
+  let bounceTarget = null;
   const bounce = (status, msg, setupId) => {
     const params = new URLSearchParams({ ads_status: status });
     if (msg)     params.set('ads_msg', msg);
     if (setupId) params.set('ads_setup', setupId);
-    res.redirect(`${FRONTEND_URL}/brand.html?${params.toString()}`);
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
   };
 
   if (oauthError) return bounce('denied', String(error_description || oauthError));
@@ -925,6 +973,7 @@ router.get('/meta-ads/callback', async (req, res) => {
   try {
     payload = jwt.verify(String(state), process.env.JWT_SECRET);
     if (payload.purpose !== 'meta-ads-oauth') throw new Error('wrong purpose');
+    bounceTarget = readRedirectFromState(payload);
   } catch (err) {
     return bounce('error', `invalid state: ${err.message}`);
   }
