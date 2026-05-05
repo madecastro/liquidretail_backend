@@ -16,6 +16,9 @@ const Brand = require('../models/Brand');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const { syncCatalog } = require('./catalogSyncService');
 const { syncPosts }   = require('./postSyncService');
+const { syncCampaigns } = require('./campaignSyncService');
+
+const AD_PLATFORMS = ['meta-ads', 'google-ads'];
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute — cadence checks are
                                     // hourly+ so finer ticks waste cycles.
@@ -28,7 +31,7 @@ async function runDueSyncs() {
   inFlight = true;
   const t0 = Date.now();
   lastTickAt = t0;
-  const summary = { catalogsSynced: 0, postsSynced: 0, errors: [] };
+  const summary = { catalogsSynced: 0, postsSynced: 0, campaignsSynced: 0, errors: [] };
 
   try {
     // Pull every active IG credential whose Brand has auto-sync enabled.
@@ -92,12 +95,43 @@ async function runDueSyncs() {
         }
       }
     }
+
+    // ── Campaigns (Meta Ads + Google Ads) ──
+    // Separate query because the Brand cadence + the credential type
+    // are different from IG. Per-credential due-check on
+    // lastCampaignSyncAt; the orchestrator stamps it on success.
+    const adCreds = await IntegrationCredential.find({
+      brandId: { $in: brands.map(b => b._id) },
+      type:    { $in: AD_PLATFORMS },
+      status:  'active'
+    }).select('_id brandId type lastCampaignSyncAt').lean();
+
+    for (const cred of adCreds) {
+      const brand = brandsById.get(String(cred.brandId));
+      if (!brand) continue;
+      const settings = brand.syncSettings || {};
+      const cadenceMs = (settings.campaignCadenceHours || 6) * 3600 * 1000;
+      const due = !cred.lastCampaignSyncAt
+                || (now - new Date(cred.lastCampaignSyncAt).getTime()) >= cadenceMs;
+      if (!due) continue;
+      try {
+        const result = await syncCampaigns({
+          brandId:      cred.brandId,
+          platform:     cred.type,
+          credentialId: cred._id
+        });
+        if (result.ok) summary.campaignsSynced++;
+        else summary.errors.push({ brandId: cred.brandId, credentialId: String(cred._id), kind: 'campaigns', reason: result.reason });
+      } catch (err) {
+        summary.errors.push({ brandId: cred.brandId, credentialId: String(cred._id), kind: 'campaigns', reason: err.message });
+      }
+    }
   } finally {
     inFlight = false;
   }
 
-  if (summary.catalogsSynced || summary.postsSynced || summary.errors.length) {
-    console.log(`⏱  scheduled-sync tick: catalogs=${summary.catalogsSynced} posts=${summary.postsSynced} errors=${summary.errors.length} in ${Date.now() - t0}ms`);
+  if (summary.catalogsSynced || summary.postsSynced || summary.campaignsSynced || summary.errors.length) {
+    console.log(`⏱  scheduled-sync tick: catalogs=${summary.catalogsSynced} posts=${summary.postsSynced} campaigns=${summary.campaignsSynced} errors=${summary.errors.length} in ${Date.now() - t0}ms`);
   }
   return summary;
 }

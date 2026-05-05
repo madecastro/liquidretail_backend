@@ -157,7 +157,12 @@ const brandSchema = new mongoose.Schema({
     autoSyncEnabled:      { type: Boolean, default: false },
     dailyDetectRunCap:    { type: Number,  default: 50 },
     catalogCadenceHours:  { type: Number,  default: 24 },
-    postsCadenceHours:    { type: Number,  default: 1 }
+    postsCadenceHours:    { type: Number,  default: 1 },
+    // Ad Platforms Phase B-5 — how often the scheduler resyncs Meta /
+    // Google Ads campaigns (and re-runs the creative matcher). 6h is
+    // the default; campaigns mutate less than IG posts but more than
+    // a brand's catalog.
+    campaignCadenceHours: { type: Number,  default: 6 }
   },
 
   // V3 #3 — auto-reply with a comment on IG-sourced posts when detect
