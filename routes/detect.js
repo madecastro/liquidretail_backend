@@ -280,6 +280,10 @@ async function assembleResult(run) {
       categoryReviews:      m.categoryReviews || null,
       enrichmentTiers:      m.enrichmentTiers || [],
       recommendedProducts:  m.recommendedProducts || [],
+      // Phase A-3 — provider evidence for the EvidencePopover drill-in.
+      // Each provider key (e.g. 'gemini-search', 'google-lens') carries
+      // its own reasoning + matches[] with URLs + thumbnails.
+      providers:            m.providers || {},
       // Phase 2g — populated FK data (canonical source of truth).
       // Consumers should prefer these over the snapshot fields above.
       catalog:     m.catalogProductId ? (catalogById.get(String(m.catalogProductId)) || null) : null,
