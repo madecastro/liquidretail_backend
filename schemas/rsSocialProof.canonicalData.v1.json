@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "description": "Source of truth for the canonical-data namespace emitted by services/layoutInputService.assembleInput(). Every dotted-key path the normalized templates' slot_adapter / source_priority lists may reference must appear in this schema. Fields are grouped by namespace; each leaf carries an x-source (where the value originates) and x-emitted-when (the condition under which the field is populated; absent fields are stripped from the artifact).",
   "type": "object",
-  "required": ["template", "aspect_ratio", "brand", "product", "creator", "ugc", "social_proof", "performance", "cta", "trust", "copy", "layout_options"],
+  "required": ["template", "aspect_ratio", "brand", "product", "creator", "ugc", "social_proof", "performance", "cta", "trust", "copy", "media", "layout_options"],
   "properties": {
     "template":     { "type": "string", "description": "Template id this layout input was built for. Routing only.",   "x-source": "buildLayoutInput arg" },
     "aspect_ratio": { "type": "string", "description": "Aspect ratio variant of the canvas this layout input targets.", "x-source": "buildLayoutInput arg" },
@@ -156,6 +156,21 @@
         "eyebrow":        { "type": "string", "description": "≤3 words. Top-of-card supertitle.",         "x-source": "derivation.copy.eyebrow" },
         "highlight_text": { "type": "string", "description": "≤5 words. RESERVED — not bound today.",     "x-source": "derivation.copy.highlight_text" },
         "disclaimer":     { "type": "string", "description": "Optional legal/disclaimer line.",           "x-source": "options.disclaimer" }
+      }
+    },
+
+    "media": {
+      "type": "object",
+      "description": "Source-Media-derived signals — color palette + scene context extracted by the detect pipeline. Templates opt in via style_bindings (testimonial_overlay leads with media.palette for image-led mood; structured templates use brand.* and treat media.* as fallback).",
+      "properties": {
+        "palette":               { "type": "array", "items": { "type": "string" }, "description": "Dominance-ordered hex colors extracted from the source Media's background.", "x-source": "detection.background.palette" },
+        "palette_dominant":      { "type": "string", "description": "First entry of palette — most-dominant background color.", "x-source": "detection.background.palette[0]" },
+        "palette_accent":        { "type": "string", "description": "Second entry — typical secondary mood color.",          "x-source": "detection.background.palette[1]" },
+        "palette_neutral":       { "type": "string", "description": "Third entry — typical neutral / muted tone.",           "x-source": "detection.background.palette[2]" },
+        "background_setting":    { "type": "string", "description": "Scene setting label (e.g. 'studio', 'outdoor').",       "x-source": "detection.background.setting" },
+        "background_lighting":   { "type": "string", "description": "Lighting label (e.g. 'natural', 'dramatic').",          "x-source": "detection.background.lighting" },
+        "background_style":      { "type": "string", "description": "Visual style label (e.g. 'photorealistic').",           "x-source": "detection.background.style" },
+        "background_description":{ "type": "string", "description": "Free-text scene description for theme prompts.",        "x-source": "detection.background.description" }
       }
     },
 

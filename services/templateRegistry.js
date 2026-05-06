@@ -168,11 +168,39 @@ function isPresent(v) {
   return true;
 }
 
+// Resolve a template's style_bindings against an assembled input.
+// Each entry in style_bindings is { source_priority: [paths], default: <value> }
+// (per-field map for composite slots, but style_bindings are flat). Walk
+// the source_priority chain, return the first defined non-empty value;
+// fall through to default; finally to null. The renderer sets the
+// returned map as CSS custom properties.
+//
+// Special default sentinel: 'auto-from-brightness' is passed through
+// unresolved so the renderer can compute it from the brightness grid /
+// adjacent surface color at render time.
+function resolveStyleBindings(input, templateId) {
+  const spec = NORMALIZED_BY_ID[templateId];
+  const bindings = spec?.style_bindings || {};
+  const out = {};
+  for (const [name, b] of Object.entries(bindings)) {
+    if (!b || typeof b !== 'object') continue;
+    let resolved = null;
+    for (const p of (b.source_priority || [])) {
+      const v = getPath(input, p);
+      if (isPresent(v)) { resolved = v; break; }
+    }
+    if (resolved == null) resolved = b.default ?? null;
+    if (resolved != null) out[name] = resolved;
+  }
+  return out;
+}
+
 module.exports = {
   listTemplates,
   getCatalog, getNormalized, getCanvas, getCanvasMaster, getGlobalCanvasRules,
   getSupportedAspectRatios,
   validateInputAgainstTemplate,
+  resolveStyleBindings,
   getPath, isPresent,
   CATALOG, NORMALIZED, CANVAS
 };

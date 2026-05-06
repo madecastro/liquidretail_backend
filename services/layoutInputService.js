@@ -772,6 +772,23 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       disclaimer:     options.disclaimer
     }),
 
+    // Source-Media-derived palette + scene context. Templates opt in
+    // via style_bindings.source_priority (e.g. testimonial_overlay sets
+    // scrim_tint to ['media.palette.0', 'brand.primary_color'] so the
+    // image's dominant tone wins for image-led layouts; structured
+    // templates like results_proof keep brand.primary_color first).
+    // Empty when no detection has run.
+    media: {
+      palette:           palette || [],
+      palette_dominant:  palette[0] || null,
+      palette_accent:    palette[1] || null,
+      palette_neutral:   palette[2] || null,
+      background_setting:     detection?.background?.setting     || null,
+      background_lighting:    detection?.background?.lighting    || null,
+      background_style:       detection?.background?.style       || null,
+      background_description: detection?.background?.description || null
+    },
+
     layout_options: options.layout_options || {
       show_logo:           !!brand?.logoUrl,
       show_price:          !!(details.price?.display || details.price?.value),

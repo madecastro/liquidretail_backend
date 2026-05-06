@@ -745,12 +745,16 @@
         "if_no_overlay_analysis": "skip_template_invalid"
       },
       "style_bindings": {
-        "scrim_tint":           { "source_priority": ["brand.primary_color"], "default": "#000000" },
-        "headline_text_color":  { "default": "auto-from-brightness", "comment": "rendered atop scrim — picks white/black via brightness grid" },
+        "panel_bg":             { "source_priority": ["media.palette_dominant", "brand.primary_color"], "default": "#0B0B0B", "comment": "right-side content panel — leads with the source Media's dominant background color so the panel reads as an extension of the image" },
+        "scrim_tint":           { "source_priority": ["media.palette_dominant", "brand.primary_color"], "default": "#000000" },
+        "headline_text_color":  { "source_priority": ["media.palette_accent",   "brand.accent_color"],  "default": "auto-from-brightness", "comment": "image-led: pulls vibrant accent from the source media (flame orange, brand color, etc.) rather than brand-curated. Falls back to brightness-based contrast." },
+        "body_text_color":      { "default": "auto-from-brightness" },
         "rating_star_color":    { "default": "#FFD400", "comment": "yellow stars per catalog distinctive_features" },
-        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#FFFFFF" },
+        "cta_button_bg":        { "source_priority": ["media.palette_accent",   "brand.accent_color",   "brand.primary_color"], "default": "#FF6B35" },
         "cta_button_text":      { "default": "auto-from-brightness" },
-        "inset_band_color":     { "source_priority": ["brand.primary_color", "brand.accent_color"], "default": "#0B1020", "comment": "fallback inset mode bands" },
+        "accent_border_color":  { "source_priority": ["media.palette_accent",   "brand.accent_color"],  "default": "#FF6B35", "comment": "left-edge accent on quote card + section header underline" },
+        "section_header_color": { "source_priority": ["media.palette_accent",   "brand.accent_color"],  "default": "#FF6B35", "comment": "uppercase section eyebrow color (e.g. 'BUILT FOR HEAT LOVERS')" },
+        "inset_band_color":     { "source_priority": ["media.palette_dominant", "brand.primary_color", "brand.accent_color"], "default": "#0B1020", "comment": "fallback inset mode bands" },
         "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
         "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
       },

@@ -38,6 +38,11 @@ router.post('/', express.json(), async (req, res) => {
     const response = { input, validation };
     if (req.query.include === 'canvas') {
       response.canvas = registry.getCanvas(template, aspectRatio);
+      // Resolved style_bindings — walked source_priority chain, defaults
+      // applied. Returned alongside canvas because the renderer reads
+      // both together; saves a second round-trip and keeps the contract
+      // co-located with the spatial spec.
+      response.style_bindings = registry.resolveStyleBindings(input, template);
     }
 
     if (!validation.ok && !(options && options.allow_invalid)) {
