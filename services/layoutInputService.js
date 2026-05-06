@@ -103,7 +103,13 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // callouts badge_row) and switches the hero source to the 4:5 crop
 // for ALL testimonial_spotlight variants. Cached 2.9 docs need to
 // re-derive so the prompt's slot budgets reflect the new geometry.
-const INPUT_SCHEMA_VERSION = '3.0';
+// 3.1 tightens palette_vibrant: returns null when the palette is
+// monochromatic (most-saturated entry below VIBRANT_MIN_SATURATION),
+// instead of falling back to a near-dominant palette entry. Lets
+// the headline binding default cleanly to white for grayscale-ish
+// images. Cached 3.0 docs re-derive so a stored
+// palette_vibrant=#454545 (grey) gets nulled out.
+const INPUT_SCHEMA_VERSION = '3.1';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -884,8 +890,16 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       // eye-catching highlights (flame orange on black) are what the
       // creative should LEAD with. palette_vibrant fixes that for
       // image-led templates by walking the array and returning the
-      // entry with highest saturation. Falls back to palette_accent.
-      palette_vibrant:   pickVibrantColor(palette) || palette[1] || palette[0] || null,
+      // entry with highest saturation — but ONLY when that pick is
+      // actually saturated enough to read as a real accent. For
+      // monochromatic palettes (all shades of one color, e.g. a
+      // black-and-grey studio shot), pickVibrantColor returns null
+      // and we DO NOT silently fall back to palette[1]/[0] — that
+      // would re-introduce the close-to-dominant tone the threshold
+      // was meant to filter out. A null here lets every binding
+      // chained to palette_vibrant cascade to its brand-fallback or
+      // auto-from-brightness default.
+      palette_vibrant:   pickVibrantColor(palette),
       background_setting:     detection?.background?.setting     || null,
       background_lighting:    detection?.background?.lighting    || null,
       background_style:       detection?.background?.style       || null,
@@ -1212,6 +1226,15 @@ function mediaPair(p) {
 // striking highlights belong further in. Image-led templates lead with
 // the most-saturated color so headlines / CTAs / accents read as the
 // 'hero' color of the photograph rather than the muted background.
+// Minimum HSL saturation for a "vibrant" pick. Below this, the palette
+// is effectively monochromatic — every entry sits on the same color
+// family at different shades — and picking any one as the accent
+// would render too close to palette_dominant (the panel background)
+// for headline contrast. Returning null in that case lets the
+// style_binding chain fall through to brand.accent_color → auto-
+// from-brightness, which yields white-on-dark for the panel layouts.
+const VIBRANT_MIN_SATURATION = 0.30;
+
 function pickVibrantColor(palette) {
   if (!Array.isArray(palette) || palette.length === 0) return null;
   let best = null;
@@ -1224,6 +1247,7 @@ function pickVibrantColor(palette) {
       best = hex;
     }
   }
+  if (!best || bestScore < VIBRANT_MIN_SATURATION) return null;
   return best;
 }
 
