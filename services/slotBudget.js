@@ -100,9 +100,15 @@ function computeHeadlineBudget(zone, canvas) {
 // hairlines flanking the centered text. Reserve decoration_overhead_frac
 // of zone width so the rules stay visually present (don't collapse to
 // near-zero); the remaining width × char-advance gives the cap.
-function computeEyebrowBudget(zone, canvas) {
+//
+// fontScale comes from canvasVariant.zone_scalers.eyebrow_rules — when
+// the renderer scales the eyebrow font up (e.g. 2× to match the
+// reference creative), each glyph takes proportionally more horizontal
+// space so fewer chars fit per slot. The prompt embeds this reduced
+// max_chars so Gemini writes the eyebrow tight to the new geometry.
+function computeEyebrowBudget(zone, canvas, fontScale = 1) {
   const style = ZONE_STYLE.eyebrow_rules;
-  const fontPx     = emBasePx(canvas.width) * style.font_em;
+  const fontPx     = emBasePx(canvas.width) * style.font_em * fontScale;
   const glyphW     = fontPx * AVG_GLYPH_W_EM[style.glyph_class];
   const letterAdv  = fontPx * style.letter_spacing_em;
   const charAdvance = glyphW + letterAdv;
@@ -120,9 +126,17 @@ function computeEyebrowBudget(zone, canvas) {
 // Currently scoped to headline (display_script split) and eyebrow_rules,
 // since those are the slots whose decorations make naive char counts
 // wrong. Other zones rely on truncation_rules + auto-fit as before.
+//
+// canvasVariant.zone_scalers is the per-(template×ratio) multiplier map
+// (e.g. { eyebrow_rules: 2, proof_bar: 2 }) that the renderer also
+// reads. We feed the eyebrow's scaler into computeEyebrowBudget so the
+// prompt's max_chars matches the rendered geometry; without this the
+// prompt would budget for the unscaled font and Gemini would write
+// copy that overflows the larger glyphs.
 function computeSlotBudgets(canvasVariant) {
   if (!canvasVariant || !Array.isArray(canvasVariant.zones)) return {};
-  const canvas = canvasVariant.canvas || { width: 1000, height: 1000 };
+  const canvas  = canvasVariant.canvas || { width: 1000, height: 1000 };
+  const scalers = canvasVariant.zone_scalers || {};
   const out = {};
 
   const headlineZone = canvasVariant.zones.find(z =>
@@ -130,7 +144,10 @@ function computeSlotBudgets(canvasVariant) {
   if (headlineZone) out.headline = computeHeadlineBudget(headlineZone, canvas);
 
   const eyebrowZone = canvasVariant.zones.find(z => z.kind === 'eyebrow_rules');
-  if (eyebrowZone) out.eyebrow = computeEyebrowBudget(eyebrowZone, canvas);
+  if (eyebrowZone) {
+    const eyebrowScale = scalers[eyebrowZone.id] || scalers[eyebrowZone.kind] || 1;
+    out.eyebrow = computeEyebrowBudget(eyebrowZone, canvas, eyebrowScale);
+  }
 
   return out;
 }
