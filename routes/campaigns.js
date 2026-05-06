@@ -100,8 +100,32 @@ router.get('/:id/products', async (req, res) => {
     const products = productIds.length === 0
       ? []
       : await CatalogProduct.find({ _id: { $in: productIds }, brandId: c.brandId })
-          .select('title description category brand price currency imageUrl productUrl externalId source')
+          .select('title description category categoryRef brand price currency imageUrl productUrl externalId source')
           .lean();
+
+    // Category-pool expansion. Walk every matched product's categoryRef,
+    // collect the distinct set of categories the campaign touches, then
+    // pull sibling SKUs in those categories (excluding ones already
+    // matched directly). Caps at 24 to keep the response bounded.
+    // Drives the wizard's "Other products in matched categories"
+    // optional add-in: lets operators include category-mode SKUs the
+    // creative matcher couldn't resolve directly.
+    const matchedSet = new Set(products.map(p => String(p._id)));
+    const categoryRefs = Array.from(new Set(
+      products.map(p => p.categoryRef).filter(Boolean).map(String)
+    ));
+    const categoryPoolProducts = categoryRefs.length === 0
+      ? []
+      : await CatalogProduct.find({
+          brandId:     c.brandId,
+          categoryRef: { $in: categoryRefs },
+          draft:       { $ne: true },
+          _id:         { $nin: products.map(p => p._id) }
+        })
+          .select('title description category categoryRef brand price currency imageUrl productUrl externalId source')
+          .limit(24)
+          .lean();
+    void matchedSet;
 
     // Campaign metadata for the Step 2 header — surfaced alongside the
     // matched products so the operator can sanity-check what they're
@@ -127,22 +151,25 @@ router.get('/:id/products', async (req, res) => {
       sampleCreatives: collectSampleCreatives(c, 6)
     };
 
+    const projectProduct = (p, matchMethod) => ({
+      id:          String(p._id),
+      title:       p.title,
+      description: p.description || null,
+      category:    p.category || null,
+      brand:       p.brand || null,
+      price:       p.price || null,
+      currency:    p.currency || null,
+      imageUrl:    p.imageUrl || null,
+      productUrl:  p.productUrl || null,
+      externalId:  p.externalId || null,
+      source:      p.source || null,
+      matchMethod
+    });
+
     res.json({
       campaign: campaignMeta,
-      products: products.map(p => ({
-        id:          String(p._id),
-        title:       p.title,
-        description: p.description || null,
-        category:    p.category || null,
-        brand:       p.brand || null,
-        price:       p.price || null,
-        currency:    p.currency || null,
-        imageUrl:    p.imageUrl || null,
-        productUrl:  p.productUrl || null,
-        externalId:  p.externalId || null,
-        source:      p.source || null,
-        matchMethod: methodByProduct.get(String(p._id)) || null
-      }))
+      products: products.map(p => projectProduct(p, methodByProduct.get(String(p._id)) || null)),
+      categoryPoolProducts: categoryPoolProducts.map(p => projectProduct(p, 'category-sibling'))
     });
   } catch (err) {
     console.error('campaign products fetch failed:', err);

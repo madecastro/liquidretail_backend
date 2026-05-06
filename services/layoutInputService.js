@@ -56,6 +56,7 @@ const ExtendedCropArtifact   = require('../models/ExtendedCropArtifact');
 const ProductMatchArtifact   = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact    = require('../models/OverlayZoneArtifact');
 const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
+const CatalogProduct         = require('../models/CatalogProduct');
 const { findBrandByName }    = require('./brandCatalogService');
 const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
@@ -276,7 +277,28 @@ async function loadContext(mediaId) {
     ? await findBrandByName(brandName).then(b => b?.toObject?.() || b).catch(() => null)
     : null;
 
-  return { media, detection, crops, extended, match, overlayZones, brand, runId };
+  // Category-pool resolution. When the match resolves to a Category
+  // (either via the linked CatalogProduct.categoryRef or via the
+  // ProductMatchArtifact.categoryId stamped on product_category
+  // outcomes), pull sibling SKUs in the same category so templates and
+  // downstream consumers can fall back from "we don't have this exact
+  // SKU" to "here are products in this category". Capped at 12 so the
+  // canonical input doesn't bloat.
+  const categoryRefForPool = match?.identification?.details?.categoryRef || match?.categoryId || null;
+  const categoryPool = categoryRefForPool && match?.brandId
+    ? await CatalogProduct.find({
+        brandId:     match.brandId,
+        categoryRef: categoryRefForPool,
+        draft:       { $ne: true },
+        ...(match.catalogProductId ? { _id: { $ne: match.catalogProductId } } : {})
+      })
+        .select('title imageUrl productUrl price currency category')
+        .limit(12)
+        .lean()
+        .catch(err => { console.warn(`   ⚠️  categoryPool fetch failed: ${err.message}`); return []; })
+    : [];
+
+  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool };
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -643,7 +665,22 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       short_benefits: limitArray(derivation.short_benefits, 5),
       badges:         limitArray(derivedBadges, 4),
       hero_media:      mediaPair(heroMedia),
-      secondary_media: mediaPair(secondaryMedia)
+      secondary_media: mediaPair(secondaryMedia),
+      // Sibling SKUs in the matched category — populated when the match
+      // resolves to a Category (via CatalogProduct.categoryRef on a
+      // product_match, or via ProductMatchArtifact.categoryId on a
+      // product_category outcome). Templates can use this for
+      // category-mode fallback (e.g. "Other styles in this collection")
+      // when the primary product slot can't render.
+      category_pool: (ctx.categoryPool || []).map(p => ({
+        id:         String(p._id),
+        title:      p.title,
+        image_url:  p.imageUrl   || null,
+        product_url: p.productUrl || null,
+        price:      p.price      ?? null,
+        currency:   p.currency   || null,
+        category:   p.category   || null
+      }))
     },
 
     creator: {

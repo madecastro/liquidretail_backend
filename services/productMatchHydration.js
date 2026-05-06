@@ -27,7 +27,7 @@ async function hydrateMatch(match) {
   const [catalog, category, brand] = await Promise.all([
     match.catalogProductId
       ? CatalogProduct.findById(match.catalogProductId)
-          .select('productUrl imageUrl description price currency category rating ratingDistribution reviews specs sellers reviewSummary productReviews')
+          .select('productUrl imageUrl description price currency category categoryRef rating ratingDistribution reviews specs sellers reviewSummary productReviews')
           .lean()
       : null,
     match.categoryId
@@ -51,6 +51,7 @@ async function hydrateMatch(match) {
         imageUrl:           catalog.imageUrl         || snapDetails.imageUrl  || null,
         description:        catalog.description      || snapDetails.description || null,
         category:           catalog.category         || snapDetails.category  || null,
+        categoryRef:        catalog.categoryRef      || snapDetails.categoryRef || null,
         rating:             catalog.rating         ?? snapDetails.rating      ?? null,
         ratingDistribution: (catalog.ratingDistribution?.length ? catalog.ratingDistribution : snapDetails.ratingDistribution) || [],
         reviews:            (catalog.reviews?.length            ? catalog.reviews            : snapDetails.reviews)            || [],
