@@ -99,7 +99,7 @@
               "rect": { "x": 540, "y": 764, "w": 420, "h": 30 },
               "layer": "proof", "style_variant": "callouts", "max_items": 4 },
             { "id": "cta",           "kind": "cta",           "slot": "cta",
-              "rect": { "x": 540, "y": 820, "w": 320, "h": 50 },
+              "rect": { "x": 590, "y": 820, "w": 320, "h": 50 },
               "layer": "cta", "radius": 999 },
             { "id": "logo",          "kind": "logo",          "slot": "brand.logo",
               "rect": { "x": 540, "y": 32, "w": 160, "h": 40 },
