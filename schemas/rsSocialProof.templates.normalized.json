@@ -605,23 +605,75 @@
         "preferred": ["1:1", "4:5", "9:16"]
       },
       "render_order": ["background_media", "scrim", "logo", "headline", "product_meta", "cta", "quote"],
+      "background_binding": {
+        "slot_binding": {
+          "source_priority": ["product.hero_media", "creator.portrait_media", "ugc.media"]
+        },
+        "comment": "Source media fills the entire canvas — image is the ad. Mirrors validation.required_any_of so any of the three media pairs can serve as the canvas."
+      },
       "placement_policy": {
         "algorithm": "greedy_priority_with_overlap_budget",
         "subject_overlap_budget_pct": 10,
         "hard_no_overlay_strictness_floor": 0.95,
         "fallback_modes": ["inset_with_brand_color_bands"],
         "element_priority_order": [
-          { "id": "logo",         "required": true,  "region_hint": "top-left" },
-          { "id": "headline",     "required": true,  "region_hint": "top-band",     "scale_text_to_fit": true },
-          { "id": "product_meta", "required": true,  "region_hint": "mid-band",     "scale_text_to_fit": true },
-          { "id": "cta",          "required": true,  "region_hint": "bottom-third" },
-          { "id": "quote",        "required": false, "region_hint": "flex",         "truncate": "ellipsis" }
+          {
+            "id": "logo",
+            "required": true,
+            "region_hint": "top-left",
+            "slot_binding": { "source_priority": ["brand.logo"] }
+          },
+          {
+            "id": "headline",
+            "required": true,
+            "region_hint": "top-band",
+            "scale_text_to_fit": true,
+            "slot_binding": { "source_priority": ["copy.headline"] }
+          },
+          {
+            "id": "product_meta",
+            "required": true,
+            "region_hint": "mid-band",
+            "scale_text_to_fit": true,
+            "slot_binding": {
+              "fields": {
+                "name":         { "source_priority": ["product.name"] },
+                "price":        { "source_priority": ["product.price"] },
+                "currency":     { "source_priority": ["product.currency"] },
+                "rating":       { "source_priority": ["social_proof.rating_value"] },
+                "review_count": { "source_priority": ["social_proof.review_count"] }
+              }
+            }
+          },
+          {
+            "id": "cta",
+            "required": true,
+            "region_hint": "bottom-third",
+            "slot_binding": { "source_priority": ["cta.text"] }
+          },
+          {
+            "id": "quote",
+            "required": false,
+            "region_hint": "flex",
+            "truncate": "ellipsis",
+            "slot_binding": {
+              "fields": {
+                "text":   { "source_priority": ["social_proof.primary_quote.text"] },
+                "author": { "source_priority": ["social_proof.primary_quote.author_name"] }
+              }
+            }
+          }
         ]
       },
       "visibility_rules": {
         "show_brand_logo": true,
         "show_yellow_stars_for_rating": true,
-        "drop_quote_if_no_safe_area": true
+        "drop_quote_if_no_safe_area": true,
+        "rights_gate": {
+          "applies_to_paths": ["ugc.media", "ugc.media.image", "ugc.media.video", "ugc.caption", "ugc.likes", "ugc.comments"],
+          "requires": "ugc.rights_approved",
+          "comment": "When background_binding resolves to ugc.media, the rights flag must be true. Otherwise the resolution falls through to the next source_priority entry (product.hero_media → creator.portrait_media → ugc.media)."
+        }
       },
       "truncation_rules": {
         "headline_max_lines": 3,
