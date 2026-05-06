@@ -143,6 +143,18 @@
         "if_no_price": "hide price",
         "if_video_missing_poster": "generate from first frame or fall back to image"
       },
+      "style_bindings": {
+        "card_bg":              { "source_priority": ["brand.secondary_color"], "default": "#FFFFFF" },
+        "card_border":          { "source_priority": ["brand.primary_color"],   "default": "#E5E7EB" },
+        "proof_bar_bg":         { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "proof_bar_text":       { "default": "auto-from-brightness" },
+        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
+        "cta_button_text":      { "default": "auto-from-brightness" },
+        "rating_star_color":    { "default": "#FFD400" },
+        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
+        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+      },
       "validation": {
         "required_any_of": [["social_proof.primary_quote.text", "copy.headline"]],
         "required_all_of": ["product.name", "cta.text"]
@@ -303,6 +315,19 @@
         "if_no_engagement_data": "hide engagement row",
         "if_no_creator_handle": "show creator name only"
       },
+      "style_bindings": {
+        "panel_divider_color":  { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#FFFFFF" },
+        "quote_bubble_bg":      { "source_priority": ["brand.secondary_color"], "default": "#F3F4F6" },
+        "quote_bubble_text":    { "default": "auto-from-brightness" },
+        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
+        "cta_button_text":      { "default": "auto-from-brightness" },
+        "engagement_chip_bg":   { "default": "rgba(0,0,0,0.55)" },
+        "engagement_chip_text": { "default": "#FFFFFF" },
+        "creator_handle_color": { "source_priority": ["brand.accent_color"], "default": "#7A35E8" },
+        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
+        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+      },
       "validation": {
         "required_all_of": ["product.name", "cta.text"],
         "required_any_of": [
@@ -430,6 +455,20 @@
         "if_only_one_quote": "repeat as primary and secondary style variants disabled",
         "if_no_rating_or_review_count": "hide summary badge",
         "if_no_headline": "use brand tagline"
+      },
+      "style_bindings": {
+        "background_color":     { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "card_bg":              { "source_priority": ["brand.secondary_color"], "default": "#FFFFFF" },
+        "card_border":          { "default": "#E5E7EB" },
+        "card_text":            { "default": "auto-from-brightness" },
+        "headline_text_color":  { "default": "auto-from-brightness", "comment": "renders on brand.primary_color background" },
+        "rating_star_color":    { "default": "#FFD400" },
+        "summary_badge_bg":     { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#7A35E8" },
+        "summary_badge_text":   { "default": "auto-from-brightness" },
+        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
+        "cta_button_text":      { "default": "auto-from-brightness" },
+        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
+        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
       },
       "validation": {
         "required_all_of": ["cta.text"],
@@ -581,6 +620,19 @@
         "if_no_quote": "omit proof_quote block",
         "if_no_trust_footer": "compress CTA upward"
       },
+      "style_bindings": {
+        "stat_card_bg":         { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "stat_card_text":       { "default": "auto-from-brightness" },
+        "metric_accent_color":  { "source_priority": ["brand.accent_color"],    "default": "#7A35E8" },
+        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "rating_star_color":    { "default": "#FFD400" },
+        "trust_footer_bg":      { "source_priority": ["brand.secondary_color"], "default": "#F3F4F6" },
+        "trust_footer_text":    { "default": "auto-from-brightness" },
+        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
+        "cta_button_text":      { "default": "auto-from-brightness" },
+        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
+        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+      },
       "validation": {
         "required_all_of": ["copy.headline", "cta.text"],
         "required_any_of": [["performance.metrics"]],
@@ -695,6 +747,16 @@
         "if_no_safe_area_for_required": "switch_to_inset_mode_with_brand_color_bands",
         "if_no_quote_safe_area": "drop_quote_block",
         "if_no_overlay_analysis": "skip_template_invalid"
+      },
+      "style_bindings": {
+        "scrim_tint":           { "source_priority": ["brand.primary_color"], "default": "#000000" },
+        "headline_text_color":  { "default": "auto-from-brightness", "comment": "rendered atop scrim — picks white/black via brightness grid" },
+        "rating_star_color":    { "default": "#FFD400", "comment": "yellow stars per catalog distinctive_features" },
+        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#FFFFFF" },
+        "cta_button_text":      { "default": "auto-from-brightness" },
+        "inset_band_color":     { "source_priority": ["brand.primary_color", "brand.accent_color"], "default": "#0B1020", "comment": "fallback inset mode bands" },
+        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
+        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
       },
       "validation": {
         "required_all_of": ["brand.logo", "copy.headline", "product.name", "cta.text"],
@@ -832,6 +894,20 @@
         "if_no_product_media": "render product name and badges only",
         "if_no_quote": "use copy.headline",
         "if_no_social_ribbon_data": "hide ribbon"
+      },
+      "style_bindings": {
+        "trust_ribbon_bg":      { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#7A35E8" },
+        "trust_ribbon_text":    { "default": "auto-from-brightness" },
+        "creator_card_bg":      { "source_priority": ["brand.secondary_color"], "default": "#FFFFFF" },
+        "creator_card_text":    { "default": "auto-from-brightness" },
+        "creator_name_color":   { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "creator_handle_color": { "source_priority": ["brand.accent_color"],    "default": "#7A35E8" },
+        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
+        "rating_star_color":    { "default": "#FFD400" },
+        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
+        "cta_button_text":      { "default": "auto-from-brightness" },
+        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
+        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
       },
       "validation": {
         "required_all_of": ["cta.text"],
