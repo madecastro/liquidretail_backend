@@ -109,7 +109,12 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // the headline binding default cleanly to white for grayscale-ish
 // images. Cached 3.0 docs re-derive so a stored
 // palette_vibrant=#454545 (grey) gets nulled out.
-const INPUT_SCHEMA_VERSION = '3.1';
+// 3.2 adds a WCAG contrast guard on top of the saturation threshold.
+// Catches "all-blues" palettes where the most-saturated entry passes
+// the saturation gate but still blends with palette_dominant (panel
+// bg) because they share a hue family. Headlines fall through to
+// white when contrast against the dominant is below 4.0.
+const INPUT_SCHEMA_VERSION = '3.2';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -1227,13 +1232,21 @@ function mediaPair(p) {
 // the most-saturated color so headlines / CTAs / accents read as the
 // 'hero' color of the photograph rather than the muted background.
 // Minimum HSL saturation for a "vibrant" pick. Below this, the palette
-// is effectively monochromatic — every entry sits on the same color
-// family at different shades — and picking any one as the accent
-// would render too close to palette_dominant (the panel background)
-// for headline contrast. Returning null in that case lets the
-// style_binding chain fall through to brand.accent_color → auto-
-// from-brightness, which yields white-on-dark for the panel layouts.
+// is effectively monochromatic (every entry sits on the same color
+// family at different shades) and picking any one as the accent
+// renders too close to palette_dominant for headline contrast.
 const VIBRANT_MIN_SATURATION = 0.30;
+
+// Minimum WCAG contrast ratio between the vibrant pick and the
+// palette's dominant tone (which the panel background is bound to in
+// the testimonial_spotlight image-led layouts). A "blue-gray on dark
+// blue" palette passes the saturation gate (the blue-gray is
+// saturated enough) but the two colors still blend on the panel
+// because they share a hue. Contrast catches that — large-text WCAG
+// minimum is 3.0; we lift to 4.0 so a headline against the dark panel
+// always reads as a distinct foreground. Sub-threshold candidates fall
+// through to the white default.
+const VIBRANT_MIN_CONTRAST_VS_DOMINANT = 4.0;
 
 function pickVibrantColor(palette) {
   if (!Array.isArray(palette) || palette.length === 0) return null;
@@ -1248,7 +1261,34 @@ function pickVibrantColor(palette) {
     }
   }
   if (!best || bestScore < VIBRANT_MIN_SATURATION) return null;
+
+  const dominant = palette[0];
+  if (dominant) {
+    const cr = contrastRatio(best, dominant);
+    if (cr != null && cr < VIBRANT_MIN_CONTRAST_VS_DOMINANT) return null;
+  }
   return best;
+}
+
+function relativeLuminance(hex) {
+  if (typeof hex !== 'string') return null;
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const channels = [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff].map(v => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+function contrastRatio(hexA, hexB) {
+  const lA = relativeLuminance(hexA);
+  const lB = relativeLuminance(hexB);
+  if (lA == null || lB == null) return null;
+  const lighter = Math.max(lA, lB);
+  const darker  = Math.min(lA, lB);
+  return (lighter + 0.05) / (darker + 0.05);
 }
 
 function saturationOfHex(hex) {
