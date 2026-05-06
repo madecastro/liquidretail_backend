@@ -51,9 +51,10 @@
           "aspect_ratio": "1:1",
           "_layout_note": "Square split-panel: 4:5-source image LEFT (full-height half), dark content panel RIGHT. Mirrors the landscape design language (display_script headline + eyebrow_rules + with_verified_buyers proof_bar + with_author_photo quote_card + section_header + body_description + callouts badge_row + cta).",
           "zone_scalers": {
-            "proof_bar": 1.25,
+            "proof_bar":     1.25,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row":     2,
+            "quote_card":    { "font": 1.6 }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -120,9 +121,10 @@
           "aspect_ratio": "4:5",
           "_layout_note": "Portrait stacked split-panel: 4:5-source image on TOP (full-width 1000×625), dark content panel on BOTTOM (1000×625). Same design language as landscape — display_script headline + eyebrow_rules + with_verified_buyers proof_bar + with_author_photo quote_card + section_header + body_description + callouts badge_row + cta — laid out wider but shorter than 16:9.",
           "zone_scalers": {
-            "proof_bar": 1.5,
+            "proof_bar":     1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row":     2,
+            "quote_card":    { "font": 1.6 }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -189,9 +191,10 @@
           "aspect_ratio": "9:16",
           "_layout_note": "Stories split-panel: 4:5-source image on TOP (1000×889), dark content panel BOTTOM (1000×889). Headline + eyebrow_rules span full panel width; below the eyebrow the panel splits into a 60/40 two-column layout — LEFT (proof_bar / quote_card / section_header / product_meta) reads as the testimonial column, RIGHT (badge_row top, cta bottom) reads as the proof-and-action column.",
           "zone_scalers": {
-            "proof_bar": 1.5,
+            "proof_bar":     1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row":     2,
+            "quote_card":    { "font": 1.6 }
           },
           "canvas": {
             "unit_system": "normalized_1000",
