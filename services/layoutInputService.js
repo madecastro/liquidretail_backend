@@ -617,7 +617,18 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
 
     product: {
       id:            details.productId || undefined,
-      name:          ident.productName || details.title || 'Product',
+      // Catalog-first naming: when ProductMatchArtifact is linked to a
+      // CatalogProduct (match.catalogProductId set, hydrated into
+      // details.title), the brand's curated catalog title is
+      // authoritative. The matcher's identification.productName captures
+      // per-post contextual wording (variant, edition, colorway) and is
+      // useful when no catalog row is linked yet (brand_match outcome,
+      // or pre-Phase-2b legacy runs). Falls back to a generic 'Product'
+      // only when neither source has a value.
+      name:          (match?.catalogProductId
+                        ? (details.title || ident.productName)
+                        : (ident.productName || details.title))
+                     || 'Product',
       category:      media.metadata?.category || firstYoloCategory(detection) || undefined,
       price:         details.price?.value ?? details.price?.display ?? undefined,
       currency:      details.price?.currency || undefined,
