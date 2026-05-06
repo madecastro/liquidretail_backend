@@ -1,0 +1,226 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://reachsocial.example/schemas/rsSocialProof.canonicalData.v1.json",
+  "title": "Reach Social — Canonical Layout Input v1",
+  "version": "1.0.0",
+  "description": "Source of truth for the canonical-data namespace emitted by services/layoutInputService.assembleInput(). Every dotted-key path the normalized templates' slot_adapter / source_priority lists may reference must appear in this schema. Fields are grouped by namespace; each leaf carries an x-source (where the value originates) and x-emitted-when (the condition under which the field is populated; absent fields are stripped from the artifact).",
+  "type": "object",
+  "required": ["template", "aspect_ratio", "brand", "product", "creator", "ugc", "social_proof", "performance", "cta", "trust", "copy", "layout_options"],
+  "properties": {
+    "template":     { "type": "string", "description": "Template id this layout input was built for. Routing only.",   "x-source": "buildLayoutInput arg" },
+    "aspect_ratio": { "type": "string", "description": "Aspect ratio variant of the canvas this layout input targets.", "x-source": "buildLayoutInput arg" },
+
+    "theme": {
+      "type": "object",
+      "description": "Renderer styling hints (LLM-derived). Not bound through slot_adapter today; consumed by the renderer's treatment selection.",
+      "properties": {
+        "style":            { "type": "string", "description": "Overall visual style class.",            "x-source": "derivation.theme_style",      "x-emitted-when": "always (defaults to 'clean')" },
+        "background_style": { "type": "string", "description": "Background treatment.",                  "x-source": "derivation.background_style", "x-emitted-when": "always (defaults to 'soft-blur')" },
+        "emphasis":         { "type": "string", "description": "Hierarchy bias for primary persuasion.", "x-source": "derivation.emphasis",         "x-emitted-when": "always (defaults to 'product-first')" }
+      }
+    },
+
+    "brand": {
+      "type": "object",
+      "description": "Brand identity. Resolved from the matched Brand row.",
+      "properties": {
+        "name":            { "type": "string", "description": "Brand display name.",                                  "x-source": "ident.brand → media.metadata.brand → brand.name" },
+        "tagline":         { "type": "string", "description": "Short brand positioning statement.",                   "x-source": "Brand.tagline" },
+        "logo":            { "type": "string", "description": "URL to the brand logo asset.",                         "x-source": "Brand.logoUrl" },
+        "primary_color":   { "type": "string", "description": "Primary brand color (hex).",                           "x-source": "Brand.primaryColor → detection.background.palette[0]" },
+        "secondary_color": { "type": "string", "description": "Secondary brand color (hex).",                         "x-source": "Brand.secondaryColor → palette[1]" },
+        "accent_color":    { "type": "string", "description": "Accent brand color (hex).",                            "x-source": "Brand.accentColor → palette[2]" },
+        "font_family":     { "type": "string", "description": "Brand-canonical font family.",                         "x-source": "Brand.fontFamily" },
+        "tone":            { "type": "array",  "description": "Voice descriptors (1-word each).",                     "items": { "type": "string" }, "x-source": "Brand.tone → derivation.tone" }
+      }
+    },
+
+    "product": {
+      "type": "object",
+      "description": "Specific SKU being promoted. Catalog-first when match.catalogProductId is linked.",
+      "properties": {
+        "id":              { "type": "string",  "description": "CatalogProduct._id of the matched SKU.",                           "x-source": "details.productId",                    "x-emitted-when": "match.catalogProductId set" },
+        "name":            { "type": "string",  "description": "Product display name.",                                            "x-source": "details.title (catalog-first) or ident.productName", "x-emitted-when": "always (falls back to 'Product')" },
+        "category":        { "type": "string",  "description": "Catalog taxonomy category for the SKU.",                           "x-source": "details.category (catalog-first) → media.metadata.category → YOLO" },
+        "price":           { "type": "number",  "description": "Numeric price in account currency.",                               "x-source": "details.price.value | details.price.display" },
+        "currency":        { "type": "string",  "description": "ISO currency code.",                                               "x-source": "details.price.currency" },
+        "description":     { "type": "string",  "description": "Long-form product description.",                                   "x-source": "details.description → detection.primarySubjectDesc" },
+        "short_benefits":  { "type": "array",   "description": "3-5 buyer-facing benefit phrases.", "items": { "type": "string" }, "x-source": "derivation.short_benefits (LLM)", "x-emitted-when": "product mode only" },
+        "badges":          { "type": "array",   "description": "2-4 badge strings (rating tier, top rated, etc.).", "items": { "type": "string" }, "x-source": "derivation.badges + defaultBadgesFromSignal" },
+        "hero_media":      { "$ref": "#/definitions/MediaPair", "description": "Primary product media pair {image, video}." },
+        "secondary_media": { "$ref": "#/definitions/MediaPair", "description": "Alt-angle product media." },
+        "category_pool":   { "type": "array",   "description": "Up to 12 sibling SKUs in the matched category.", "items": { "$ref": "#/definitions/CategoryPoolEntry" }, "x-source": "CatalogProduct.find({ categoryRef })" }
+      }
+    },
+
+    "creator": {
+      "type": "object",
+      "description": "Originator of the source media (when applicable). Distinct from brand for UGC.",
+      "properties": {
+        "name":           { "type": "string", "description": "Creator display name.",                "x-source": "media.metadata.creatorName" },
+        "handle":         { "type": "string", "description": "Creator @-handle (no @ prefix).",      "x-source": "media.metadata.creatorHandle" },
+        "platform":       { "type": "string", "description": "Source platform identifier.",         "x-source": "DEFAULT_CREATOR_PLATFORM constant" },
+        "avatar":         { "type": "string", "description": "Creator avatar URL. RESERVED — not yet emitted; future persona-avatar generator slot." },
+        "portrait_media": { "$ref": "#/definitions/MediaPair", "description": "Creator-shot media (post photo/video)." }
+      }
+    },
+
+    "ugc": {
+      "type": "object",
+      "description": "User-generated content snapshot. The post being matched.",
+      "properties": {
+        "post_id":         { "type": "string",  "description": "Platform-side post id.",        "x-source": "media.externalId" },
+        "platform":        { "type": "string",  "description": "Source platform.",              "x-source": "DEFAULT_CREATOR_PLATFORM" },
+        "post_type":       { "type": "string",  "description": "Post type (image, video, reel).", "x-source": "DEFAULT_POST_TYPE" },
+        "caption":         { "type": "string",  "description": "Original post caption.",        "x-source": "media.metadata.caption" },
+        "media":           { "$ref": "#/definitions/MediaPair", "description": "UGC media pair." },
+        "likes":           { "type": "number",  "description": "Like count.",                   "x-source": "media.platformStats.likes" },
+        "comments":        { "type": "number",  "description": "Comment count.",                "x-source": "media.platformStats.comments" },
+        "shares":          { "type": "number",  "description": "Share count.",                  "x-source": "media.platformStats.shares" },
+        "saves":           { "type": "number",  "description": "Save count.",                   "x-source": "media.platformStats.saves" },
+        "rights_approved": { "type": "boolean", "description": "Operator-approved UGC-rights flag. RENDER GATE — UGC media slots must not render without this.", "x-source": "media.rights.approved" }
+      }
+    },
+
+    "social_proof": {
+      "type": "object",
+      "description": "Trust/proof signals — quotes, ratings, review counts, badges.",
+      "properties": {
+        "rating_value":     { "type": "number", "description": "0-5 numeric rating.",                        "x-source": "details.rating → brandReviews.rating (brand_match)" },
+        "review_count":     { "type": "number", "description": "Total review count.",                       "x-source": "details.reviewCount → brandReviews.reviewCount" },
+        "trusted_by_text":  { "type": "string", "description": "Human-readable trust phrase.",              "x-source": "derivation.trusted_by_text → trustedByFromStats" },
+        "proof_badges":     { "type": "array",  "description": "Mirrors product.badges for proof zones.",   "items": { "type": "string" } },
+        "primary_quote":    { "$ref": "#/definitions/Quote", "description": "Hero quote (first of derivation.quotes; synthesized from review summary if LLM emitted none)." },
+        "secondary_quotes": { "type": "array",  "description": "Remaining quotes after primary.",           "items": { "$ref": "#/definitions/Quote" } }
+      }
+    },
+
+    "performance": {
+      "type": "object",
+      "description": "Engagement + match metrics — drives results-proof template.",
+      "properties": {
+        "engagement": {
+          "type": "object",
+          "description": "Per-Media engagement counts (subset of media.platformStats — emitted only when populated).",
+          "properties": {
+            "likes":    { "type": "number" },
+            "comments": { "type": "number" },
+            "shares":   { "type": "number" },
+            "saves":    { "type": "number" },
+            "views":    { "type": "number" }
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "description": "Renderable metric rows — buildPerformanceMetrics output.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label":  { "type": "string" },
+              "value":  { "type": "string" },
+              "source": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+
+    "cta": {
+      "type": "object",
+      "description": "Call-to-action — derivation + caller-options + brand-URL fallback merge.",
+      "properties": {
+        "text":       { "type": "string", "description": "≤3-word imperative.",            "x-source": "derivation.cta.text → options.cta.text → defaults" },
+        "url":        { "type": "string", "description": "Landing URL.",                   "x-source": "derivation.cta.url → options.cta.url → details.url → brand.websiteUrl" },
+        "offer_text": { "type": "string", "description": "Optional offer phrase (e.g. '20% off').", "x-source": "derivation.cta.offer_text" }
+      }
+    },
+
+    "trust": {
+      "type": "object",
+      "description": "Trust signals separate from social_proof — retailers + certifications + press.",
+      "properties": {
+        "retailer_logos":  { "type": "array", "description": "Reseller logos pulled from CatalogProduct.sellers.", "items": { "$ref": "#/definitions/RetailerLogo" }, "x-source": "buildRetailerLogos(details.sellers)" },
+        "trusted_by_text": { "type": "string", "description": "Mirrored from social_proof.trusted_by_text for trust-zone bindings." },
+        "certifications":  { "type": "array", "description": "RESERVED — stub today.", "items": { "type": "string" } },
+        "press_mentions":  { "type": "array", "description": "RESERVED — stub today.", "items": { "type": "string" } }
+      }
+    },
+
+    "copy": {
+      "type": "object",
+      "description": "LLM-authored creative copy. Length-budgeted by template.",
+      "properties": {
+        "headline":       { "type": "string", "description": "≤8 words. REQUIRED in every template.",     "x-source": "derivation.copy.headline" },
+        "subheadline":    { "type": "string", "description": "≤15 words.",                                "x-source": "derivation.copy.subheadline" },
+        "eyebrow":        { "type": "string", "description": "≤3 words. Top-of-card supertitle.",         "x-source": "derivation.copy.eyebrow" },
+        "highlight_text": { "type": "string", "description": "≤5 words. RESERVED — not bound today.",     "x-source": "derivation.copy.highlight_text" },
+        "disclaimer":     { "type": "string", "description": "Optional legal/disclaimer line.",           "x-source": "options.disclaimer" }
+      }
+    },
+
+    "layout_options": {
+      "type": "object",
+      "description": "Boolean visibility hints. Not currently bound through visibility_rules — consumed ambiently by the renderer.",
+      "properties": {
+        "show_logo":           { "type": "boolean" },
+        "show_price":          { "type": "boolean" },
+        "show_rating":         { "type": "boolean" },
+        "show_review_count":   { "type": "boolean" },
+        "show_creator_handle": { "type": "boolean" },
+        "show_engagement":     { "type": "boolean", "description": "Gated on ugc.rights_approved." },
+        "show_badges":         { "type": "boolean" }
+      }
+    }
+  },
+
+  "definitions": {
+    "MediaPair": {
+      "type": "object",
+      "description": "Canonical poster-required media pair (renderer §7.4).",
+      "properties": {
+        "image": { "type": "string", "description": "Still-image URL (poster). Required even when video is set." },
+        "video": { "type": "string", "description": "Optional video URL — autoplay-capable in primary-motion zone." }
+      }
+    },
+    "Quote": {
+      "type": "object",
+      "properties": {
+        "text":        { "type": "string" },
+        "author_name": { "type": "string" },
+        "author_title":{ "type": "string" },
+        "source":      { "type": "string", "enum": ["review", "testimonial", "ugc"] },
+        "verified":    { "type": "boolean" }
+      }
+    },
+    "CategoryPoolEntry": {
+      "type": "object",
+      "properties": {
+        "id":          { "type": "string" },
+        "title":       { "type": "string" },
+        "image_url":   { "type": "string" },
+        "product_url": { "type": "string" },
+        "price":       { "type": "number" },
+        "currency":    { "type": "string" },
+        "category":    { "type": "string" }
+      }
+    },
+    "RetailerLogo": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "logo": { "type": "string" },
+        "url":  { "type": "string" }
+      }
+    }
+  },
+
+  "x-rules": {
+    "naming": "All paths in the normalized templates' slot_adapter and zones[].slot_binding.source_priority MUST resolve to a leaf in this schema. Out-of-schema references are dead source_priority entries.",
+    "presence-gaps": [
+      "media.background_media.* — referenced by some templates, not in this schema. Either add emit + schema or drop references.",
+      "media.supporting_media.* — same.",
+      "defaults.fallback_quote / defaults.fallback_headline — referenced as terminal fallback, not in schema. Either add a defaults emit or drop references."
+    ],
+    "rights-gate": "ugc.rights_approved is the schema-level RENDER GATE for any zone reading ugc.media.* — visibility_rules in normalized templates should enforce this."
+  }
+}
