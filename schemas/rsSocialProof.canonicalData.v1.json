@@ -47,8 +47,9 @@
         "description":     { "type": "string",  "description": "Long-form product description.",                                   "x-source": "details.description → detection.primarySubjectDesc" },
         "short_benefits":  { "type": "array",   "description": "3-5 buyer-facing benefit phrases.", "items": { "type": "string" }, "x-source": "derivation.short_benefits (LLM)", "x-emitted-when": "product mode only" },
         "badges":          { "type": "array",   "description": "2-4 badge strings (rating tier, top rated, etc.).", "items": { "type": "string" }, "x-source": "derivation.badges + defaultBadgesFromSignal" },
-        "hero_media":      { "$ref": "#/definitions/MediaPair", "description": "Primary product media pair {image, video}." },
-        "secondary_media": { "$ref": "#/definitions/MediaPair", "description": "Alt-angle product media." },
+        "hero_media":      { "$ref": "#/definitions/MediaPair", "description": "Primary product media pair {image, video} — source-Media-derived smart crop." },
+        "secondary_media": { "$ref": "#/definitions/MediaPair", "description": "Alt-angle product media — source-Media-derived smart crop." },
+        "image":           { "type": "string", "description": "Catalog stock image — direct CatalogProduct.imageUrl. Distinct from hero_media in that it's the brand's authoritative product photo, not a smart crop of the source Media. Use as a final fallback in canvas / background source_priority chains for templates that should still render when no source Media exists.", "x-source": "details.imageUrl (hydrated from CatalogProduct.imageUrl)", "x-emitted-when": "match.catalogProductId set AND CatalogProduct.imageUrl populated" },
         "category_pool":   { "type": "array",   "description": "Up to 12 sibling SKUs in the matched category.", "items": { "$ref": "#/definitions/CategoryPoolEntry" }, "x-source": "CatalogProduct.find({ categoryRef })" }
       }
     },

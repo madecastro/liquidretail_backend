@@ -607,9 +607,9 @@
       "render_order": ["background_media", "scrim", "logo", "headline", "product_meta", "cta", "quote"],
       "background_binding": {
         "slot_binding": {
-          "source_priority": ["product.hero_media", "creator.portrait_media", "ugc.media"]
+          "source_priority": ["product.hero_media", "creator.portrait_media", "ugc.media", "product.image"]
         },
-        "comment": "Source media fills the entire canvas — image is the ad. Mirrors validation.required_any_of so any of the three media pairs can serve as the canvas."
+        "comment": "Source media fills the entire canvas — image is the ad. The first three are source-Media-derived smart crops; product.image is the catalog stock fallback (direct CatalogProduct.imageUrl) so brands with only manual-upload catalog rows still render."
       },
       "placement_policy": {
         "algorithm": "greedy_priority_with_overlap_budget",
@@ -699,7 +699,7 @@
       "validation": {
         "required_all_of": ["brand.logo", "copy.headline", "product.name", "cta.text"],
         "required_any_of": [
-          ["product.hero_media.image", "creator.portrait_media.image", "ugc.media.image"]
+          ["product.hero_media.image", "creator.portrait_media.image", "ugc.media.image", "product.image"]
         ]
       }
     },

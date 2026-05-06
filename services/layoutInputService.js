@@ -666,6 +666,14 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       badges:         limitArray(derivedBadges, 4),
       hero_media:      mediaPair(heroMedia),
       secondary_media: mediaPair(secondaryMedia),
+      // Catalog-stock fallback. Direct CatalogProduct.imageUrl —
+      // distinct from hero_media which is always source-Media-derived
+      // (smart crops of the post being matched). Templates that want
+      // to gracefully degrade when no source Media exists (e.g. brands
+      // with only manual-upload catalog rows) put product.image at the
+      // end of their canvas/background source_priority chain. Empty
+      // when CatalogProduct isn't linked or has no imageUrl.
+      image:           details.imageUrl || undefined,
       // Sibling SKUs in the matched category — populated when the match
       // resolves to a Category (via CatalogProduct.categoryRef on a
       // product_match, or via ProductMatchArtifact.categoryId on a
