@@ -629,7 +629,14 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
                         ? (details.title || ident.productName)
                         : (ident.productName || details.title))
                      || 'Product',
-      category:      media.metadata?.category || firstYoloCategory(detection) || undefined,
+      // Catalog-first: when a CatalogProduct is linked, its category
+      // (Meta's catalog taxonomy via details.category) is authoritative.
+      // For unlinked / brand_match outcomes, fall back to the source
+      // Media's per-post category tag, then YOLO's coarse class.
+      category:      (match?.catalogProductId
+                        ? (details.category || media.metadata?.category || firstYoloCategory(detection))
+                        : (media.metadata?.category || firstYoloCategory(detection) || details.category))
+                     || undefined,
       price:         details.price?.value ?? details.price?.display ?? undefined,
       currency:      details.price?.currency || undefined,
       description:   details.description || detection?.primarySubjectDesc || undefined,
