@@ -97,7 +97,13 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // budgets (slotBudget.js). copy.headline is auto-joined from those
 // when present so legacy bindings still resolve. Cached 2.8 docs are
 // re-derived so the renderer's split-headline path can light up.
-const INPUT_SCHEMA_VERSION = '2.9';
+// 3.0 retargets testimonial_spotlight 1:1 + 4:5 to the new
+// split-panel design language (display_script headline, eyebrow_rules,
+// with_verified_buyers proof_bar, with_author_photo quote_card,
+// callouts badge_row) and switches the hero source to the 4:5 crop
+// for ALL testimonial_spotlight variants. Cached 2.9 docs need to
+// re-derive so the prompt's slot budgets reflect the new geometry.
+const INPUT_SCHEMA_VERSION = '3.0';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -634,7 +640,15 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   const details = ident.details || {};
   const palette = detection?.background?.palette || [];
 
-  const heroMedia      = pickHeroMedia(ctx, aspectRatio);
+  // testimonial_spotlight uses the 4:5 source crop for ALL canvas
+  // ratios — its layouts are built so the renderer's c_fill,g_auto
+  // chain can subject-aware-crop the 4:5 source into whatever rect the
+  // canvas asks for (full-bleed in landscape, left half in 1:1, top
+  // half in 4:5). Using the 4:5 source instead of a ratio-matched
+  // crop gives Cloudinary the most pixels to crop from and avoids
+  // double-cropping artifacts.
+  const heroSourceRatio = (template === 'testimonial_spotlight') ? '4:5' : aspectRatio;
+  const heroMedia      = pickHeroMedia(ctx, heroSourceRatio);
   const secondaryMedia = pickSecondaryMedia(ctx, aspectRatio);
   const creatorMedia   = pickCreatorMedia(ctx);
   const ugcMedia       = creatorMedia;  // detect uploads == creator post asset

@@ -49,338 +49,138 @@
         "1:1": {
           "template_id": "testimonial_spotlight",
           "aspect_ratio": "1:1",
+          "_layout_note": "Square split-panel: 4:5-source image LEFT (full-height half), dark content panel RIGHT. Mirrors the landscape design language (display_script headline + eyebrow_rules + with_verified_buyers proof_bar + with_author_photo quote_card + section_header + body_description + callouts badge_row + cta).",
+          "zone_scalers": {
+            "proof_bar": 1.5,
+            "eyebrow_rules": 2,
+            "badge_row": 2
+          },
           "canvas": {
             "unit_system": "normalized_1000",
             "width": 1000,
             "height": 1000,
-            "background": {
-              "style": "gradient"
-            }
+            "background": { "style": "split_panel" }
           },
           "safe_areas": {
-            "outer": {
-              "x": 48,
-              "y": 48,
-              "w": 904,
-              "h": 904
-            },
-            "text_primary": {
-              "x": 88,
-              "y": 88,
-              "w": 430,
-              "h": 460
-            },
-            "text_secondary": {
-              "x": 88,
-              "y": 560,
-              "w": 380,
-              "h": 150
-            },
-            "cta_safe": {
-              "x": 88,
-              "y": 760,
-              "w": 250,
-              "h": 96
-            },
-            "logo_safe": {
-              "x": 88,
-              "y": 48,
-              "w": 180,
-              "h": 72
-            },
-            "no_obstruction": {
-              "x": 0,
-              "y": 0,
-              "w": 1000,
-              "h": 1000
-            }
+            "outer":         { "x": 0,   "y": 0,   "w": 1000, "h": 1000 },
+            "text_primary":  { "x": 540, "y": 80,  "w": 420,  "h": 280 },
+            "text_secondary":{ "x": 540, "y": 380, "w": 420,  "h": 380 },
+            "cta_safe":      { "x": 540, "y": 800, "w": 420,  "h": 80 },
+            "logo_safe":     { "x": 540, "y": 32,  "w": 200,  "h": 56 },
+            "no_obstruction":{ "x": 0,   "y": 0,   "w": 500,  "h": 1000 }
           },
           "zones": [
-            {
-              "id": "support_media",
-              "kind": "media",
-              "slot": "product.hero_media",
-              "rect": {
-                "x": 560,
-                "y": 88,
-                "w": 352,
-                "h": 520
-              },
-              "layer": "media",
-              "fit": "subject_preserve",
-              "radius": 28,
-              "motion_role": "primary"
-            },
-            {
-              "id": "headline",
-              "kind": "text",
-              "slot": "copy.headline",
-              "rect": {
-                "x": 88,
-                "y": 110,
-                "w": 380,
-                "h": 90
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "quote_card",
-              "kind": "quote_card",
-              "slot": "social_proof.primary_quote",
-              "rect": {
-                "x": 88,
-                "y": 230,
-                "w": 410,
-                "h": 280
-              },
-              "layer": "proof",
-              "radius": 24,
-              "padding": 24,
-              "max_lines": 5
-            },
-            {
-              "id": "proof_bar",
-              "kind": "proof_bar",
-              "slot": [
-                "social_proof.rating_value",
-                "social_proof.review_count"
-              ],
-              "rect": {
-                "x": 88,
-                "y": 560,
-                "w": 330,
-                "h": 56
-              },
-              "layer": "proof",
-              "radius": 999
-            },
-            {
-              "id": "product_meta",
-              "kind": "text",
-              "slot": [
-                "product.name",
-                "product.price"
-              ],
-              "rect": {
-                "x": 560,
-                "y": 640,
-                "w": 300,
-                "h": 100
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "cta",
-              "kind": "cta",
-              "slot": "cta",
-              "rect": {
-                "x": 88,
-                "y": 772,
-                "w": 228,
-                "h": 72
-              },
-              "layer": "cta",
-              "radius": 999
-            },
-            {
-              "id": "logo",
-              "kind": "logo",
-              "slot": "brand.logo",
-              "rect": {
-                "x": 88,
-                "y": 56,
-                "w": 160,
-                "h": 48
-              },
-              "layer": "chrome"
-            }
+            { "id": "support_media", "kind": "media",         "slot": "product.hero_media",
+              "rect": { "x": 0, "y": 0, "w": 500, "h": 1000 },
+              "layer": "media", "fit": "subject_preserve", "motion_role": "primary" },
+            { "id": "panel",         "kind": "panel",         "slot": null,
+              "rect": { "x": 500, "y": 0, "w": 500, "h": 1000 },
+              "layer": "background" },
+            { "id": "headline",      "kind": "text",          "slot": "copy.headline",
+              "rect": { "x": 540, "y": 80, "w": 420, "h": 240 },
+              "layer": "copy", "style_variant": "display_script", "max_lines": 4 },
+            { "id": "eyebrow_rules", "kind": "eyebrow_rules", "slot": ["copy.subheadline", "brand.tagline"],
+              "rect": { "x": 540, "y": 334, "w": 420, "h": 14 },
+              "layer": "copy", "max_lines": 1 },
+            { "id": "proof_bar",     "kind": "proof_bar",     "slot": ["social_proof.rating_value", "social_proof.review_count"],
+              "rect": { "x": 540, "y": 362, "w": 420, "h": 38 },
+              "layer": "proof", "radius": 999, "style_variant": "with_verified_buyers" },
+            { "id": "quote_card",    "kind": "quote_card",    "slot": "social_proof.primary_quote",
+              "rect": { "x": 540, "y": 418, "w": 420, "h": 240 },
+              "layer": "proof", "radius": 8, "padding": 16, "max_lines": 5,
+              "style_variant": "with_author_photo" },
+            { "id": "section_header","kind": "text",          "slot": ["copy.eyebrow", "product.category", "brand.tagline"],
+              "rect": { "x": 540, "y": 674, "w": 420, "h": 14 },
+              "layer": "copy", "style_variant": "section_header", "max_lines": 1 },
+            { "id": "product_meta",  "kind": "text",          "slot": ["product.description", "brand.summary", "brand.tagline"],
+              "rect": { "x": 540, "y": 688, "w": 420, "h": 60 },
+              "layer": "copy", "style_variant": "body_description", "max_lines": 2 },
+            { "id": "badge_row",     "kind": "badge_row",     "slot": "product.badges",
+              "rect": { "x": 540, "y": 764, "w": 420, "h": 30 },
+              "layer": "proof", "style_variant": "callouts", "max_items": 4 },
+            { "id": "cta",           "kind": "cta",           "slot": "cta",
+              "rect": { "x": 540, "y": 820, "w": 320, "h": 50 },
+              "layer": "cta", "radius": 999 },
+            { "id": "logo",          "kind": "logo",          "slot": "brand.logo",
+              "rect": { "x": 540, "y": 32, "w": 160, "h": 40 },
+              "layer": "chrome" }
           ],
-          "layers": [
-            "background",
-            "media",
-            "scrim",
-            "copy",
-            "proof",
-            "chrome",
-            "cta"
-          ],
+          "layers": ["background", "media", "scrim", "copy", "proof", "chrome", "cta"],
           "motion_policy": {
             "max_concurrent_motion_zones": 1,
             "primary_motion_zone": "support_media",
             "secondary_motion_zone": null,
             "allow_background_video": true,
-            "text_scrim_required_over_video": true,
+            "text_scrim_required_over_video": false,
             "poster_fallback_required": true
           }
         },
         "4:5": {
           "template_id": "testimonial_spotlight",
           "aspect_ratio": "4:5",
+          "_layout_note": "Portrait stacked split-panel: 4:5-source image on TOP (full-width 1000×625), dark content panel on BOTTOM (1000×625). Same design language as landscape — display_script headline + eyebrow_rules + with_verified_buyers proof_bar + with_author_photo quote_card + section_header + body_description + callouts badge_row + cta — laid out wider but shorter than 16:9.",
+          "zone_scalers": {
+            "proof_bar": 1.5,
+            "eyebrow_rules": 2,
+            "badge_row": 2
+          },
           "canvas": {
             "unit_system": "normalized_1000",
             "width": 1000,
             "height": 1250,
-            "background": {
-              "style": "gradient"
-            }
+            "background": { "style": "split_panel" }
           },
           "safe_areas": {
-            "outer": {
-              "x": 48,
-              "y": 56,
-              "w": 904,
-              "h": 1138
-            },
-            "text_primary": {
-              "x": 76,
-              "y": 90,
-              "w": 430,
-              "h": 560
-            },
-            "text_secondary": {
-              "x": 76,
-              "y": 664,
-              "w": 390,
-              "h": 150
-            },
-            "cta_safe": {
-              "x": 76,
-              "y": 1010,
-              "w": 260,
-              "h": 82
-            },
-            "logo_safe": {
-              "x": 76,
-              "y": 56,
-              "w": 180,
-              "h": 40
-            },
-            "no_obstruction": {
-              "x": 0,
-              "y": 0,
-              "w": 1000,
-              "h": 1250
-            }
+            "outer":         { "x": 0,    "y": 0,    "w": 1000, "h": 1250 },
+            "text_primary":  { "x": 60,   "y": 665,  "w": 880,  "h": 220 },
+            "text_secondary":{ "x": 60,   "y": 890,  "w": 880,  "h": 240 },
+            "cta_safe":      { "x": 60,   "y": 1170, "w": 880,  "h": 80 },
+            "logo_safe":     { "x": 60,   "y": 32,   "w": 200,  "h": 56 },
+            "no_obstruction":{ "x": 0,    "y": 0,    "w": 1000, "h": 625 }
           },
           "zones": [
-            {
-              "id": "support_media",
-              "kind": "media",
-              "slot": "product.hero_media",
-              "rect": {
-                "x": 548,
-                "y": 96,
-                "w": 368,
-                "h": 670
-              },
-              "layer": "media",
-              "fit": "subject_preserve",
-              "radius": 28,
-              "motion_role": "primary"
-            },
-            {
-              "id": "headline",
-              "kind": "text",
-              "slot": "copy.headline",
-              "rect": {
-                "x": 76,
-                "y": 112,
-                "w": 392,
-                "h": 96
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "quote_card",
-              "kind": "quote_card",
-              "slot": "social_proof.primary_quote",
-              "rect": {
-                "x": 76,
-                "y": 238,
-                "w": 420,
-                "h": 360
-              },
-              "layer": "proof",
-              "radius": 24,
-              "padding": 24,
-              "max_lines": 6
-            },
-            {
-              "id": "proof_bar",
-              "kind": "proof_bar",
-              "slot": [
-                "social_proof.rating_value",
-                "social_proof.review_count"
-              ],
-              "rect": {
-                "x": 76,
-                "y": 640,
-                "w": 356,
-                "h": 58
-              },
-              "layer": "proof",
-              "radius": 999
-            },
-            {
-              "id": "product_meta",
-              "kind": "text",
-              "slot": [
-                "product.name",
-                "product.price"
-              ],
-              "rect": {
-                "x": 548,
-                "y": 796,
-                "w": 320,
-                "h": 110
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "cta",
-              "kind": "cta",
-              "slot": "cta",
-              "rect": {
-                "x": 76,
-                "y": 1016,
-                "w": 236,
-                "h": 76
-              },
-              "layer": "cta",
-              "radius": 999
-            },
-            {
-              "id": "logo",
-              "kind": "logo",
-              "slot": "brand.logo",
-              "rect": {
-                "x": 76,
-                "y": 60,
-                "w": 120,
-                "h": 32
-              },
-              "layer": "chrome"
-            }
+            { "id": "support_media", "kind": "media",         "slot": "product.hero_media",
+              "rect": { "x": 0, "y": 0, "w": 1000, "h": 625 },
+              "layer": "media", "fit": "subject_preserve", "motion_role": "primary" },
+            { "id": "panel",         "kind": "panel",         "slot": null,
+              "rect": { "x": 0, "y": 625, "w": 1000, "h": 625 },
+              "layer": "background" },
+            { "id": "headline",      "kind": "text",          "slot": "copy.headline",
+              "rect": { "x": 60, "y": 665, "w": 880, "h": 150 },
+              "layer": "copy", "style_variant": "display_script", "max_lines": 3 },
+            { "id": "eyebrow_rules", "kind": "eyebrow_rules", "slot": ["copy.subheadline", "brand.tagline"],
+              "rect": { "x": 60, "y": 825, "w": 880, "h": 12 },
+              "layer": "copy", "max_lines": 1 },
+            { "id": "proof_bar",     "kind": "proof_bar",     "slot": ["social_proof.rating_value", "social_proof.review_count"],
+              "rect": { "x": 60, "y": 847, "w": 880, "h": 32 },
+              "layer": "proof", "radius": 999, "style_variant": "with_verified_buyers" },
+            { "id": "quote_card",    "kind": "quote_card",    "slot": "social_proof.primary_quote",
+              "rect": { "x": 60, "y": 891, "w": 880, "h": 160 },
+              "layer": "proof", "radius": 8, "padding": 14, "max_lines": 4,
+              "style_variant": "with_author_photo" },
+            { "id": "section_header","kind": "text",          "slot": ["copy.eyebrow", "product.category", "brand.tagline"],
+              "rect": { "x": 60, "y": 1061, "w": 880, "h": 12 },
+              "layer": "copy", "style_variant": "section_header", "max_lines": 1 },
+            { "id": "product_meta",  "kind": "text",          "slot": ["product.description", "brand.summary", "brand.tagline"],
+              "rect": { "x": 60, "y": 1073, "w": 880, "h": 44 },
+              "layer": "copy", "style_variant": "body_description", "max_lines": 2 },
+            { "id": "badge_row",     "kind": "badge_row",     "slot": "product.badges",
+              "rect": { "x": 60, "y": 1129, "w": 880, "h": 24 },
+              "layer": "proof", "style_variant": "callouts", "max_items": 4 },
+            { "id": "cta",           "kind": "cta",           "slot": "cta",
+              "rect": { "x": 60, "y": 1170, "w": 320, "h": 40 },
+              "layer": "cta", "radius": 999 },
+            { "id": "logo",          "kind": "logo",          "slot": "brand.logo",
+              "rect": { "x": 60, "y": 32, "w": 160, "h": 40 },
+              "layer": "chrome" }
           ],
-          "layers": [
-            "background",
-            "media",
-            "scrim",
-            "copy",
-            "proof",
-            "chrome",
-            "cta"
-          ],
+          "layers": ["background", "media", "scrim", "copy", "proof", "chrome", "cta"],
           "motion_policy": {
             "max_concurrent_motion_zones": 1,
             "primary_motion_zone": "support_media",
             "secondary_motion_zone": null,
             "allow_background_video": true,
-            "text_scrim_required_over_video": true,
+            "text_scrim_required_over_video": false,
             "poster_fallback_required": true
           }
         },
