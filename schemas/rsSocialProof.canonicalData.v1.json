@@ -40,7 +40,7 @@
       "description": "Specific SKU being promoted. Catalog-first when match.catalogProductId is linked.",
       "properties": {
         "id":              { "type": "string",  "description": "CatalogProduct._id of the matched SKU.",                           "x-source": "details.productId",                    "x-emitted-when": "match.catalogProductId set" },
-        "name":            { "type": "string",  "description": "Product display name.",                                            "x-source": "details.title (catalog-first) or ident.productName", "x-emitted-when": "always (falls back to 'Product')" },
+        "name":            { "type": "string",  "description": "Product display name.",                                            "x-source": "details.title (catalog-first) → ident.productName → brand.name → 'Product' literal", "x-emitted-when": "always — brand_match falls through to brand.name so product_meta renders meaningfully" },
         "category":        { "type": "string",  "description": "Catalog taxonomy category for the SKU.",                           "x-source": "details.category (catalog-first) → media.metadata.category → YOLO" },
         "price":           { "type": "number",  "description": "Numeric price in account currency.",                               "x-source": "details.price.value | details.price.display" },
         "currency":        { "type": "string",  "description": "ISO currency code.",                                               "x-source": "details.price.currency" },

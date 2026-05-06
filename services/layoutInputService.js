@@ -639,17 +639,27 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
 
     product: {
       id:            details.productId || undefined,
-      // Catalog-first naming: when ProductMatchArtifact is linked to a
-      // CatalogProduct (match.catalogProductId set, hydrated into
-      // details.title), the brand's curated catalog title is
-      // authoritative. The matcher's identification.productName captures
-      // per-post contextual wording (variant, edition, colorway) and is
-      // useful when no catalog row is linked yet (brand_match outcome,
-      // or pre-Phase-2b legacy runs). Falls back to a generic 'Product'
-      // only when neither source has a value.
+      // Catalog-first naming chain:
+      //   details.title (CatalogProduct.title, hydrated)  — when linked
+      //   ident.productName (matcher's per-post output)   — when no link
+      //   brandName                                       — brand_match
+      //                                                     fallback so
+      //                                                     product_meta
+      //                                                     renders the
+      //                                                     brand name
+      //                                                     instead of a
+      //                                                     literal
+      //                                                     placeholder
+      //   'Product'                                       — last resort
+      //                                                     (no catalog,
+      //                                                     no model, no
+      //                                                     brand)
+      // Templates with product_meta in required_all_of stay valid for
+      // brand_match because a meaningful name is always present.
       name:          (match?.catalogProductId
                         ? (details.title || ident.productName)
                         : (ident.productName || details.title))
+                     || brandName
                      || 'Product',
       // Catalog-first: when a CatalogProduct is linked, its category
       // (Meta's catalog taxonomy via details.category) is authoritative.
