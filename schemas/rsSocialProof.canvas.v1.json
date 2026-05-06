@@ -559,7 +559,7 @@
           "_layout_note": "Landscape split-panel layout: full-bleed source media on the left 40%, dark content panel on the right 60% with stacked elements (headline / eyebrow_rules / proof_bar / quote_card / section_header / body / badge_row / cta).",
           "_zone_scalers_note": "Per-zone-id multipliers applied at render time to slot height + font-size (and any em-relative descendants). The slot budget calculator reads the same map so Gemini's max_chars for the eyebrow reflects the wider rendered glyphs. Adjust per ratio when the column visually under- or over-weights against the reference creative.",
           "zone_scalers": {
-            "proof_bar": 2,
+            "proof_bar": 1.5,
             "eyebrow_rules": 2,
             "badge_row": 2
           },
@@ -627,7 +627,7 @@
           "aspect_ratio": "1.91:1",
           "_layout_note": "Landscape split-panel layout — sibling of 16:9 with tighter vertical budget (524h vs 563h).",
           "zone_scalers": {
-            "proof_bar": 2,
+            "proof_bar": 1.5,
             "eyebrow_rules": 2,
             "badge_row": 2
           },
