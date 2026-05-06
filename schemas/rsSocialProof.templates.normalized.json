@@ -24,8 +24,7 @@
           "slot_binding": {
             "source_priority": [
               "social_proof.primary_quote.text",
-              "copy.headline",
-              "defaults.fallback_quote"
+              "copy.headline"
             ]
           },
           "limits": {
@@ -48,9 +47,9 @@
               "product.hero_media.image",
               "creator.portrait_media.video",
               "creator.portrait_media.image",
-              "media.background_media.video",
-              "media.background_media.image"
-            ]
+              "product.image"
+            ],
+            "comment": "Source-Media-derived smart crop wins when a post is the entry point (post → product match → smart crop sized for this slot's ratio). Catalog stock (product.image) is the final fallback when no source Media exists — e.g. running on a manual-upload-only catalog row. Crop is the renderer's responsibility (Cloudinary so_/c_crop transforms when the URL is Cloudinary, object-fit: cover otherwise)."
           },
           "media_rules": {
             "accepted_kinds": ["image", "video"],
@@ -75,8 +74,9 @@
           "type": "meta_block",
           "required": true,
           "slot_binding": {
-            "name": ["product.name", "defaults.product_name"],
+            "name": ["product.name"],
             "price": ["product.price"],
+            "currency": ["product.currency"],
             "badges": ["product.badges", "social_proof.proof_badges"]
           }
         },
@@ -85,33 +85,29 @@
           "type": "button",
           "required": true,
           "slot_binding": {
-            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
+            "text": ["cta.text"],
             "url": ["cta.url"]
           }
         }
       },
       "render_order": ["brand", "hero", "support_media", "rating_bar", "product_meta", "cta", "legal"],
       "slot_adapter": {
-        "brand.logo": ["brand.logo"],
-        "brand.brand_name": ["brand.name"],
-        "brand.eyebrow": ["copy.eyebrow", "brand.tagline"],
-        "copy.headline": ["copy.headline", "social_proof.primary_quote.text"],
-        "copy.subheadline": ["copy.subheadline"],
-        "copy.cta_text": ["cta.text", "copy.cta_text"],
-        "social_proof.primary_quote.text": ["social_proof.primary_quote.text", "social_proof.quotes.0.text"],
-        "social_proof.primary_quote.author_name": [
-          "social_proof.primary_quote.author_name",
-          "social_proof.quotes.0.author_name",
-          "creator.name"
-        ],
-        "social_proof.rating_value": ["social_proof.rating_value", "social_proof.rating"],
-        "social_proof.review_count": ["social_proof.review_count"],
-        "trust.trusted_by_text": ["trust.trusted_by_text", "social_proof.trusted_by_text"],
-        "product.name": ["product.name"],
-        "product.price": ["product.price"],
-        "product.badges": ["product.badges", "social_proof.proof_badges"],
-        "product.hero_media.image": ["product.hero_media.image", "product.image"],
-        "product.hero_media.video": ["product.hero_media.video"]
+        "brand.logo":           ["brand.logo"],
+        "brand.brand_name":     ["brand.name"],
+        "brand.eyebrow":        ["copy.eyebrow", "brand.tagline"],
+        "copy.headline":        ["copy.headline", "social_proof.primary_quote.text"],
+        "copy.subheadline":     ["copy.subheadline"],
+        "copy.cta_text":        ["cta.text"],
+        "social_proof.primary_quote.text":        ["social_proof.primary_quote.text"],
+        "social_proof.primary_quote.author_name": ["social_proof.primary_quote.author_name", "creator.name"],
+        "social_proof.rating_value":              ["social_proof.rating_value"],
+        "social_proof.review_count":              ["social_proof.review_count"],
+        "trust.trusted_by_text":                  ["trust.trusted_by_text", "social_proof.trusted_by_text"],
+        "product.name":                           ["product.name"],
+        "product.price":                          ["product.price"],
+        "product.badges":                         ["product.badges", "social_proof.proof_badges"],
+        "product.hero_media.image":               ["product.hero_media.image", "product.image"],
+        "product.hero_media.video":               ["product.hero_media.video"]
       },
       "visibility_rules": {
         "show_brand_logo": true,
