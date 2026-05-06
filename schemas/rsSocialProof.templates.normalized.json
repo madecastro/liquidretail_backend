@@ -140,16 +140,21 @@
         "if_video_missing_poster": "generate from first frame or fall back to image"
       },
       "style_bindings": {
-        "card_bg":              { "source_priority": ["brand.secondary_color"], "default": "#FFFFFF" },
-        "card_border":          { "source_priority": ["brand.primary_color"],   "default": "#E5E7EB" },
-        "proof_bar_bg":         { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "proof_bar_text":       { "default": "auto-from-brightness" },
-        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
-        "cta_button_text":      { "default": "auto-from-brightness" },
-        "rating_star_color":    { "default": "#FFD400" },
-        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
-        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+        "panel_bg":              { "source_priority": ["media.palette_dominant", "brand.primary_color"],   "default": "#0B0B0B", "comment": "right-side content panel for landscape variants — leads with source-Media's dominant tone so the panel reads as an extension of the image" },
+        "card_bg":               { "source_priority": ["media.palette_dominant", "brand.secondary_color"], "default": "#1A1A1A" },
+        "card_border":           { "source_priority": ["media.palette_accent",   "brand.primary_color"],   "default": "#FF6B35" },
+        "accent_border_color":   { "source_priority": ["media.palette_accent",   "brand.accent_color"],    "default": "#FF6B35" },
+        "section_header_color":  { "source_priority": ["media.palette_accent",   "brand.accent_color"],    "default": "#FF6B35" },
+        "headline_text_color":   { "source_priority": ["media.palette_accent",   "brand.accent_color"],    "default": "#FF6B35" },
+        "proof_bar_bg":          { "source_priority": ["brand.primary_color"], "default": "#1F1F1F" },
+        "proof_bar_text":        { "default": "auto-from-brightness" },
+        "proof_bar_border":      { "source_priority": ["media.palette_accent",   "brand.accent_color"],    "default": "#FF6B35" },
+        "open_quote_glyph_color":{ "source_priority": ["media.palette_accent",   "brand.accent_color"],    "default": "#FF6B35" },
+        "cta_button_bg":         { "source_priority": ["media.palette_accent",   "brand.accent_color", "brand.primary_color"], "default": "#FF6B35" },
+        "cta_button_text":       { "default": "auto-from-brightness" },
+        "rating_star_color":     { "default": "#FFD400" },
+        "font_family_headline":  { "source_priority": ["brand.font_family"], "default": "system-ui" },
+        "font_family_body":      { "source_priority": ["brand.font_family"], "default": "system-ui" }
       },
       "validation": {
         "required_any_of": [["social_proof.primary_quote.text", "copy.headline"]],

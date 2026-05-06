@@ -556,338 +556,132 @@
         "16:9": {
           "template_id": "testimonial_spotlight",
           "aspect_ratio": "16:9",
+          "_layout_note": "Landscape split-panel layout: full-bleed source media on the left 40%, dark content panel on the right 60% with stacked elements (headline / eyebrow_rules / proof_bar / quote_card / section_header / body / badge_row / cta).",
           "canvas": {
             "unit_system": "normalized_1000",
             "width": 1000,
             "height": 563,
             "background": {
-              "style": "gradient"
+              "style": "split_panel"
             }
           },
           "safe_areas": {
-            "outer": {
-              "x": 44,
-              "y": 36,
-              "w": 912,
-              "h": 491
-            },
-            "text_primary": {
-              "x": 68,
-              "y": 74,
-              "w": 360,
-              "h": 260
-            },
-            "text_secondary": {
-              "x": 68,
-              "y": 346,
-              "w": 300,
-              "h": 90
-            },
-            "cta_safe": {
-              "x": 68,
-              "y": 444,
-              "w": 220,
-              "h": 56
-            },
-            "logo_safe": {
-              "x": 68,
-              "y": 36,
-              "w": 160,
-              "h": 28
-            },
-            "no_obstruction": {
-              "x": 0,
-              "y": 0,
-              "w": 1000,
-              "h": 563
-            }
+            "outer":         { "x": 0,   "y": 0,   "w": 1000, "h": 563 },
+            "text_primary":  { "x": 452, "y": 32,  "w": 516,  "h": 200 },
+            "text_secondary":{ "x": 452, "y": 240, "w": 516,  "h": 220 },
+            "cta_safe":      { "x": 452, "y": 460, "w": 516,  "h": 80 },
+            "logo_safe":     { "x": 32,  "y": 32,  "w": 200,  "h": 56 },
+            "no_obstruction":{ "x": 0,   "y": 0,   "w": 400,  "h": 563 }
           },
           "zones": [
-            {
-              "id": "support_media",
-              "kind": "media",
-              "slot": "product.hero_media",
-              "rect": {
-                "x": 530,
-                "y": 56,
-                "w": 392,
-                "h": 328
-              },
-              "layer": "media",
-              "fit": "subject_preserve",
-              "radius": 24,
-              "motion_role": "primary"
-            },
-            {
-              "id": "headline",
-              "kind": "text",
-              "slot": "copy.headline",
-              "rect": {
-                "x": 68,
-                "y": 80,
-                "w": 330,
-                "h": 64
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "quote_card",
-              "kind": "quote_card",
-              "slot": "social_proof.primary_quote",
-              "rect": {
-                "x": 68,
-                "y": 156,
-                "w": 360,
-                "h": 158
-              },
-              "layer": "proof",
-              "radius": 20,
-              "padding": 20,
-              "max_lines": 4
-            },
-            {
-              "id": "proof_bar",
-              "kind": "proof_bar",
-              "slot": [
-                "social_proof.rating_value",
-                "social_proof.review_count"
-              ],
-              "rect": {
-                "x": 68,
-                "y": 330,
-                "w": 280,
-                "h": 42
-              },
-              "layer": "proof",
-              "radius": 999
-            },
-            {
-              "id": "product_meta",
-              "kind": "text",
-              "slot": [
-                "product.name",
-                "product.price"
-              ],
-              "rect": {
-                "x": 530,
-                "y": 398,
-                "w": 260,
-                "h": 72
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "cta",
-              "kind": "cta",
-              "slot": "cta",
-              "rect": {
-                "x": 68,
-                "y": 446,
-                "w": 208,
-                "h": 54
-              },
-              "layer": "cta",
-              "radius": 999
-            },
-            {
-              "id": "logo",
-              "kind": "logo",
-              "slot": "brand.logo",
-              "rect": {
-                "x": 68,
-                "y": 40,
-                "w": 120,
-                "h": 28
-              },
-              "layer": "chrome"
-            }
+            { "id": "support_media", "kind": "media",         "slot": "product.hero_media",
+              "rect": { "x": 0, "y": 0, "w": 400, "h": 563 },
+              "layer": "media", "fit": "subject_preserve", "motion_role": "primary" },
+            { "id": "panel",         "kind": "panel",         "slot": null,
+              "rect": { "x": 400, "y": 0, "w": 600, "h": 563 },
+              "layer": "background" },
+            { "id": "headline",      "kind": "text",          "slot": "copy.headline",
+              "rect": { "x": 452, "y": 32, "w": 516, "h": 120 },
+              "layer": "copy", "style_variant": "display_script", "max_lines": 3 },
+            { "id": "eyebrow_rules", "kind": "eyebrow_rules", "slot": "copy.subheadline",
+              "rect": { "x": 452, "y": 160, "w": 516, "h": 22 },
+              "layer": "copy", "max_lines": 1 },
+            { "id": "proof_bar",     "kind": "proof_bar",     "slot": ["social_proof.rating_value", "social_proof.review_count"],
+              "rect": { "x": 452, "y": 198, "w": 516, "h": 42 },
+              "layer": "proof", "radius": 999, "style_variant": "with_verified_buyers" },
+            { "id": "quote_card",    "kind": "quote_card",    "slot": "social_proof.primary_quote",
+              "rect": { "x": 452, "y": 254, "w": 516, "h": 100 },
+              "layer": "proof", "radius": 12, "padding": 18, "max_lines": 3,
+              "style_variant": "with_author_photo" },
+            { "id": "section_header","kind": "text",          "slot": ["copy.eyebrow", "product.category", "brand.tagline"],
+              "rect": { "x": 452, "y": 364, "w": 516, "h": 22 },
+              "layer": "copy", "style_variant": "section_header", "max_lines": 1 },
+            { "id": "product_meta",  "kind": "text",          "slot": ["product.description", "brand.summary", "brand.tagline"],
+              "rect": { "x": 452, "y": 388, "w": 516, "h": 32 },
+              "layer": "copy", "max_lines": 2 },
+            { "id": "badge_row",     "kind": "badge_row",     "slot": "product.badges",
+              "rect": { "x": 452, "y": 428, "w": 516, "h": 30 },
+              "layer": "proof", "style_variant": "callouts", "max_items": 4 },
+            { "id": "cta",           "kind": "cta",           "slot": "cta",
+              "rect": { "x": 452, "y": 470, "w": 516, "h": 54 },
+              "layer": "cta", "radius": 12 },
+            { "id": "logo",          "kind": "logo",          "slot": "brand.logo",
+              "rect": { "x": 32, "y": 36, "w": 160, "h": 48 },
+              "layer": "chrome" }
           ],
-          "layers": [
-            "background",
-            "media",
-            "scrim",
-            "copy",
-            "proof",
-            "chrome",
-            "cta"
-          ],
+          "layers": ["background", "media", "scrim", "copy", "proof", "chrome", "cta"],
           "motion_policy": {
             "max_concurrent_motion_zones": 1,
             "primary_motion_zone": "support_media",
             "secondary_motion_zone": null,
             "allow_background_video": true,
-            "text_scrim_required_over_video": true,
+            "text_scrim_required_over_video": false,
             "poster_fallback_required": true
           }
         },
         "1.91:1": {
           "template_id": "testimonial_spotlight",
           "aspect_ratio": "1.91:1",
+          "_layout_note": "Landscape split-panel layout — sibling of 16:9 with tighter vertical budget (524h vs 563h).",
           "canvas": {
             "unit_system": "normalized_1000",
             "width": 1000,
             "height": 524,
             "background": {
-              "style": "gradient"
+              "style": "split_panel"
             }
           },
           "safe_areas": {
-            "outer": {
-              "x": 42,
-              "y": 34,
-              "w": 916,
-              "h": 456
-            },
-            "text_primary": {
-              "x": 64,
-              "y": 72,
-              "w": 344,
-              "h": 234
-            },
-            "text_secondary": {
-              "x": 64,
-              "y": 316,
-              "w": 290,
-              "h": 90
-            },
-            "cta_safe": {
-              "x": 64,
-              "y": 422,
-              "w": 220,
-              "h": 54
-            },
-            "logo_safe": {
-              "x": 64,
-              "y": 34,
-              "w": 160,
-              "h": 28
-            },
-            "no_obstruction": {
-              "x": 0,
-              "y": 0,
-              "w": 1000,
-              "h": 524
-            }
+            "outer":         { "x": 0,   "y": 0,   "w": 1000, "h": 524 },
+            "text_primary":  { "x": 452, "y": 32,  "w": 516,  "h": 168 },
+            "text_secondary":{ "x": 452, "y": 210, "w": 516,  "h": 200 },
+            "cta_safe":      { "x": 452, "y": 416, "w": 516,  "h": 80 },
+            "logo_safe":     { "x": 32,  "y": 32,  "w": 200,  "h": 56 },
+            "no_obstruction":{ "x": 0,   "y": 0,   "w": 400,  "h": 524 }
           },
           "zones": [
-            {
-              "id": "support_media",
-              "kind": "media",
-              "slot": "product.hero_media",
-              "rect": {
-                "x": 544,
-                "y": 52,
-                "w": 372,
-                "h": 300
-              },
-              "layer": "media",
-              "fit": "subject_preserve",
-              "radius": 22,
-              "motion_role": "primary"
-            },
-            {
-              "id": "headline",
-              "kind": "text",
-              "slot": "copy.headline",
-              "rect": {
-                "x": 64,
-                "y": 78,
-                "w": 318,
-                "h": 60
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "quote_card",
-              "kind": "quote_card",
-              "slot": "social_proof.primary_quote",
-              "rect": {
-                "x": 64,
-                "y": 148,
-                "w": 350,
-                "h": 148
-              },
-              "layer": "proof",
-              "radius": 20,
-              "padding": 18,
-              "max_lines": 4
-            },
-            {
-              "id": "proof_bar",
-              "kind": "proof_bar",
-              "slot": [
-                "social_proof.rating_value",
-                "social_proof.review_count"
-              ],
-              "rect": {
-                "x": 64,
-                "y": 310,
-                "w": 276,
-                "h": 40
-              },
-              "layer": "proof",
-              "radius": 999
-            },
-            {
-              "id": "product_meta",
-              "kind": "text",
-              "slot": [
-                "product.name",
-                "product.price"
-              ],
-              "rect": {
-                "x": 544,
-                "y": 364,
-                "w": 250,
-                "h": 68
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "cta",
-              "kind": "cta",
-              "slot": "cta",
-              "rect": {
-                "x": 64,
-                "y": 424,
-                "w": 206,
-                "h": 52
-              },
-              "layer": "cta",
-              "radius": 999
-            },
-            {
-              "id": "logo",
-              "kind": "logo",
-              "slot": "brand.logo",
-              "rect": {
-                "x": 64,
-                "y": 36,
-                "w": 120,
-                "h": 28
-              },
-              "layer": "chrome"
-            }
+            { "id": "support_media", "kind": "media",         "slot": "product.hero_media",
+              "rect": { "x": 0, "y": 0, "w": 400, "h": 524 },
+              "layer": "media", "fit": "subject_preserve", "motion_role": "primary" },
+            { "id": "panel",         "kind": "panel",         "slot": null,
+              "rect": { "x": 400, "y": 0, "w": 600, "h": 524 },
+              "layer": "background" },
+            { "id": "headline",      "kind": "text",          "slot": "copy.headline",
+              "rect": { "x": 452, "y": 32, "w": 516, "h": 96 },
+              "layer": "copy", "style_variant": "display_script", "max_lines": 3 },
+            { "id": "eyebrow_rules", "kind": "eyebrow_rules", "slot": "copy.subheadline",
+              "rect": { "x": 452, "y": 136, "w": 516, "h": 22 },
+              "layer": "copy", "max_lines": 1 },
+            { "id": "proof_bar",     "kind": "proof_bar",     "slot": ["social_proof.rating_value", "social_proof.review_count"],
+              "rect": { "x": 452, "y": 174, "w": 516, "h": 40 },
+              "layer": "proof", "radius": 999, "style_variant": "with_verified_buyers" },
+            { "id": "quote_card",    "kind": "quote_card",    "slot": "social_proof.primary_quote",
+              "rect": { "x": 452, "y": 230, "w": 516, "h": 84 },
+              "layer": "proof", "radius": 12, "padding": 16, "max_lines": 3,
+              "style_variant": "with_author_photo" },
+            { "id": "section_header","kind": "text",          "slot": ["copy.eyebrow", "product.category", "brand.tagline"],
+              "rect": { "x": 452, "y": 326, "w": 516, "h": 22 },
+              "layer": "copy", "style_variant": "section_header", "max_lines": 1 },
+            { "id": "product_meta",  "kind": "text",          "slot": ["product.description", "brand.summary", "brand.tagline"],
+              "rect": { "x": 452, "y": 350, "w": 516, "h": 32 },
+              "layer": "copy", "max_lines": 2 },
+            { "id": "badge_row",     "kind": "badge_row",     "slot": "product.badges",
+              "rect": { "x": 452, "y": 388, "w": 516, "h": 28 },
+              "layer": "proof", "style_variant": "callouts", "max_items": 4 },
+            { "id": "cta",           "kind": "cta",           "slot": "cta",
+              "rect": { "x": 452, "y": 422, "w": 516, "h": 52 },
+              "layer": "cta", "radius": 12 },
+            { "id": "logo",          "kind": "logo",          "slot": "brand.logo",
+              "rect": { "x": 32, "y": 36, "w": 160, "h": 48 },
+              "layer": "chrome" }
           ],
-          "layers": [
-            "background",
-            "media",
-            "scrim",
-            "copy",
-            "proof",
-            "chrome",
-            "cta"
-          ],
+          "layers": ["background", "media", "scrim", "copy", "proof", "chrome", "cta"],
           "motion_policy": {
             "max_concurrent_motion_zones": 1,
             "primary_motion_zone": "support_media",
             "secondary_motion_zone": null,
             "allow_background_video": true,
-            "text_scrim_required_over_video": true,
+            "text_scrim_required_over_video": false,
             "poster_fallback_required": true
           }
         }
