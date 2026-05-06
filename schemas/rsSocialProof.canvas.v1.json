@@ -187,169 +187,69 @@
         "9:16": {
           "template_id": "testimonial_spotlight",
           "aspect_ratio": "9:16",
+          "_layout_note": "Stories split-panel: 4:5-source image on TOP (1000×889), dark content panel BOTTOM (1000×889). Headline + eyebrow_rules span full panel width; below the eyebrow the panel splits into a 60/40 two-column layout — LEFT (proof_bar / quote_card / section_header / product_meta) reads as the testimonial column, RIGHT (badge_row top, cta bottom) reads as the proof-and-action column.",
+          "zone_scalers": {
+            "proof_bar": 1.5,
+            "eyebrow_rules": 2,
+            "badge_row": 2
+          },
           "canvas": {
             "unit_system": "normalized_1000",
             "width": 1000,
             "height": 1778,
-            "background": {
-              "style": "gradient"
-            }
+            "background": { "style": "split_panel" }
           },
           "safe_areas": {
-            "outer": {
-              "x": 52,
-              "y": 72,
-              "w": 896,
-              "h": 1600
-            },
-            "text_primary": {
-              "x": 72,
-              "y": 120,
-              "w": 856,
-              "h": 540
-            },
-            "text_secondary": {
-              "x": 72,
-              "y": 1210,
-              "w": 520,
-              "h": 150
-            },
-            "cta_safe": {
-              "x": 72,
-              "y": 1460,
-              "w": 280,
-              "h": 84
-            },
-            "logo_safe": {
-              "x": 72,
-              "y": 72,
-              "w": 180,
-              "h": 40
-            },
-            "no_obstruction": {
-              "x": 0,
-              "y": 0,
-              "w": 1000,
-              "h": 1778
-            }
+            "outer":         { "x": 0,    "y": 0,    "w": 1000, "h": 1778 },
+            "text_primary":  { "x": 60,   "y": 949,  "w": 880,  "h": 266 },
+            "text_secondary":{ "x": 60,   "y": 1231, "w": 528,  "h": 487 },
+            "cta_safe":      { "x": 622,  "y": 1664, "w": 300,  "h": 54 },
+            "logo_safe":     { "x": 60,   "y": 900,  "w": 200,  "h": 32 },
+            "no_obstruction":{ "x": 0,    "y": 0,    "w": 1000, "h": 889 }
           },
           "zones": [
-            {
-              "id": "support_media",
-              "kind": "media",
-              "slot": "product.hero_media",
-              "rect": {
-                "x": 72,
-                "y": 760,
-                "w": 856,
-                "h": 520
-              },
-              "layer": "media",
-              "fit": "subject_preserve",
-              "radius": 30,
-              "motion_role": "primary"
-            },
-            {
-              "id": "headline",
-              "kind": "text",
-              "slot": "copy.headline",
-              "rect": {
-                "x": 72,
-                "y": 132,
-                "w": 620,
-                "h": 100
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "quote_card",
-              "kind": "quote_card",
-              "slot": "social_proof.primary_quote",
-              "rect": {
-                "x": 72,
-                "y": 260,
-                "w": 650,
-                "h": 360
-              },
-              "layer": "proof",
-              "radius": 24,
-              "padding": 28,
-              "max_lines": 6
-            },
-            {
-              "id": "proof_bar",
-              "kind": "proof_bar",
-              "slot": [
-                "social_proof.rating_value",
-                "social_proof.review_count"
-              ],
-              "rect": {
-                "x": 72,
-                "y": 1316,
-                "w": 420,
-                "h": 58
-              },
-              "layer": "proof",
-              "radius": 999
-            },
-            {
-              "id": "product_meta",
-              "kind": "text",
-              "slot": [
-                "product.name",
-                "product.price"
-              ],
-              "rect": {
-                "x": 72,
-                "y": 1388,
-                "w": 520,
-                "h": 110
-              },
-              "layer": "copy",
-              "max_lines": 2
-            },
-            {
-              "id": "cta",
-              "kind": "cta",
-              "slot": "cta",
-              "rect": {
-                "x": 72,
-                "y": 1508,
-                "w": 252,
-                "h": 76
-              },
-              "layer": "cta",
-              "radius": 999
-            },
-            {
-              "id": "logo",
-              "kind": "logo",
-              "slot": "brand.logo",
-              "rect": {
-                "x": 72,
-                "y": 82,
-                "w": 120,
-                "h": 32
-              },
-              "layer": "chrome"
-            }
+            { "id": "support_media", "kind": "media",         "slot": "product.hero_media",
+              "rect": { "x": 0, "y": 0, "w": 1000, "h": 889 },
+              "layer": "media", "fit": "subject_preserve", "motion_role": "primary" },
+            { "id": "panel",         "kind": "panel",         "slot": null,
+              "rect": { "x": 0, "y": 889, "w": 1000, "h": 889 },
+              "layer": "background" },
+            { "id": "logo",          "kind": "logo",          "slot": "brand.logo",
+              "rect": { "x": 60, "y": 900, "w": 160, "h": 32 },
+              "layer": "chrome" },
+            { "id": "headline",      "kind": "text",          "slot": "copy.headline",
+              "rect": { "x": 60, "y": 949, "w": 880, "h": 240 },
+              "layer": "copy", "style_variant": "display_script", "max_lines": 4 },
+            { "id": "eyebrow_rules", "kind": "eyebrow_rules", "slot": ["copy.subheadline", "brand.tagline"],
+              "rect": { "x": 60, "y": 1201, "w": 880, "h": 14 },
+              "layer": "copy", "max_lines": 1 },
+            { "id": "proof_bar",     "kind": "proof_bar",     "slot": ["social_proof.rating_value", "social_proof.review_count"],
+              "rect": { "x": 60, "y": 1231, "w": 528, "h": 32 },
+              "layer": "proof", "radius": 999, "style_variant": "with_verified_buyers", "column": "left" },
+            { "id": "quote_card",    "kind": "quote_card",    "slot": "social_proof.primary_quote",
+              "rect": { "x": 60, "y": 1277, "w": 528, "h": 371 },
+              "layer": "proof", "radius": 8, "padding": 16, "max_lines": 8,
+              "style_variant": "with_author_photo", "column": "left" },
+            { "id": "section_header","kind": "text",          "slot": ["copy.eyebrow", "product.category", "brand.tagline"],
+              "rect": { "x": 60, "y": 1662, "w": 528, "h": 12 },
+              "layer": "copy", "style_variant": "section_header", "max_lines": 1, "column": "left" },
+            { "id": "product_meta",  "kind": "text",          "slot": ["product.description", "brand.summary", "brand.tagline"],
+              "rect": { "x": 60, "y": 1674, "w": 528, "h": 44 },
+              "layer": "copy", "style_variant": "body_description", "max_lines": 2, "column": "left" },
+            { "id": "badge_row",     "kind": "badge_row",     "slot": "product.badges",
+              "rect": { "x": 604, "y": 1231, "w": 336, "h": 24 },
+              "layer": "proof", "style_variant": "callouts", "max_items": 4, "column": "right" },
+            { "id": "cta",           "kind": "cta",           "slot": "cta",
+              "rect": { "x": 622, "y": 1664, "w": 300, "h": 54 },
+              "layer": "cta", "radius": 999, "column": "right" }
           ],
-          "layers": [
-            "background",
-            "media",
-            "scrim",
-            "copy",
-            "proof",
-            "chrome",
-            "cta"
-          ],
+          "layers": ["background", "media", "scrim", "copy", "proof", "chrome", "cta"],
           "motion_policy": {
             "max_concurrent_motion_zones": 1,
             "primary_motion_zone": "support_media",
             "secondary_motion_zone": null,
             "allow_background_video": true,
-            "text_scrim_required_over_video": true,
+            "text_scrim_required_over_video": false,
             "poster_fallback_required": true
           }
         },
