@@ -13,8 +13,18 @@
         "motion_system": "subtle_product_motion"
       },
       "aspect_ratios": {
-        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
-        "preferred": ["1:1", "4:5", "9:16"]
+        "supported": [
+          "1:1",
+          "4:5",
+          "9:16",
+          "16:9",
+          "1.91:1"
+        ],
+        "preferred": [
+          "1:1",
+          "4:5",
+          "9:16"
+        ]
       },
       "zones": {
         "hero": {
@@ -52,7 +62,10 @@
             "comment": "Source-Media-derived smart crop wins when a post is the entry point (post → product match → smart crop sized for this slot's ratio). Catalog stock (product.image) is the final fallback when no source Media exists — e.g. running on a manual-upload-only catalog row. Crop is the renderer's responsibility (Cloudinary so_/c_crop transforms when the URL is Cloudinary, object-fit: cover otherwise)."
           },
           "media_rules": {
-            "accepted_kinds": ["image", "video"],
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
             "crop_mode": "subject_preserve",
             "poster_required_for_video": true
           }
@@ -74,10 +87,19 @@
           "type": "meta_block",
           "required": true,
           "slot_binding": {
-            "name": ["product.name"],
-            "price": ["product.price"],
-            "currency": ["product.currency"],
-            "badges": ["product.badges", "social_proof.proof_badges"]
+            "name": [
+              "product.name"
+            ],
+            "price": [
+              "product.price"
+            ],
+            "currency": [
+              "product.currency"
+            ],
+            "badges": [
+              "product.badges",
+              "social_proof.proof_badges"
+            ]
           }
         },
         "cta": {
@@ -85,29 +107,79 @@
           "type": "button",
           "required": true,
           "slot_binding": {
-            "text": ["cta.text"],
-            "url": ["cta.url"]
+            "text": [
+              "cta.text"
+            ],
+            "url": [
+              "cta.url"
+            ]
           }
         }
       },
-      "render_order": ["brand", "hero", "support_media", "rating_bar", "product_meta", "cta", "legal"],
+      "render_order": [
+        "brand",
+        "hero",
+        "support_media",
+        "rating_bar",
+        "product_meta",
+        "cta",
+        "legal"
+      ],
       "slot_adapter": {
-        "brand.logo":           ["brand.logo"],
-        "brand.brand_name":     ["brand.name"],
-        "brand.eyebrow":        ["copy.eyebrow", "brand.tagline"],
-        "copy.headline":        ["copy.headline", "social_proof.primary_quote.text"],
-        "copy.subheadline":     ["copy.subheadline"],
-        "copy.cta_text":        ["cta.text"],
-        "social_proof.primary_quote.text":        ["social_proof.primary_quote.text"],
-        "social_proof.primary_quote.author_name": ["social_proof.primary_quote.author_name", "creator.name"],
-        "social_proof.rating_value":              ["social_proof.rating_value"],
-        "social_proof.review_count":              ["social_proof.review_count"],
-        "trust.trusted_by_text":                  ["trust.trusted_by_text", "social_proof.trusted_by_text"],
-        "product.name":                           ["product.name"],
-        "product.price":                          ["product.price"],
-        "product.badges":                         ["product.badges", "social_proof.proof_badges"],
-        "product.hero_media.image":               ["product.hero_media.image", "product.image"],
-        "product.hero_media.video":               ["product.hero_media.video"]
+        "brand.logo": [
+          "brand.logo"
+        ],
+        "brand.brand_name": [
+          "brand.name"
+        ],
+        "brand.eyebrow": [
+          "copy.eyebrow",
+          "brand.tagline"
+        ],
+        "copy.headline": [
+          "copy.headline",
+          "social_proof.primary_quote.text"
+        ],
+        "copy.subheadline": [
+          "copy.subheadline"
+        ],
+        "copy.cta_text": [
+          "cta.text"
+        ],
+        "social_proof.primary_quote.text": [
+          "social_proof.primary_quote.text"
+        ],
+        "social_proof.primary_quote.author_name": [
+          "social_proof.primary_quote.author_name",
+          "creator.name"
+        ],
+        "social_proof.rating_value": [
+          "social_proof.rating_value"
+        ],
+        "social_proof.review_count": [
+          "social_proof.review_count"
+        ],
+        "trust.trusted_by_text": [
+          "trust.trusted_by_text",
+          "social_proof.trusted_by_text"
+        ],
+        "product.name": [
+          "product.name"
+        ],
+        "product.price": [
+          "product.price"
+        ],
+        "product.badges": [
+          "product.badges",
+          "social_proof.proof_badges"
+        ],
+        "product.hero_media.image": [
+          "product.hero_media.image",
+          "product.image"
+        ],
+        "product.hero_media.video": [
+          "product.hero_media.video"
+        ]
       },
       "visibility_rules": {
         "show_brand_logo": true,
@@ -140,119 +212,212 @@
         "if_video_missing_poster": "generate from first frame or fall back to image"
       },
       "style_bindings": {
-        "panel_bg":              { "source_priority": ["media.palette_dominant", "brand.primary_color"],   "default": "#0B0B0B", "comment": "right-side content panel for landscape variants — leads with source-Media's dominant tone so the panel reads as an extension of the image" },
-        "card_bg":               { "source_priority": ["media.palette_dominant", "brand.secondary_color"], "default": "#1A1A1A" },
-        "card_border":           { "source_priority": ["media.palette_vibrant", "media.palette_accent", "brand.primary_color"], "default": "#FF6B35" },
-        "accent_border_color":   { "source_priority": ["media.palette_vibrant", "media.palette_accent", "brand.accent_color"],  "default": "#FF6B35" },
-        "section_header_color":  { "source_priority": ["media.palette_vibrant", "media.palette_accent", "brand.accent_color"],  "default": "#FF6B35" },
-        "headline_text_color":   { "source_priority": ["media.palette_vibrant"],  "default": "#FFFFFF", "comment": "image-led: vibrant image color when one exists. For monochromatic palettes (all entries within VIBRANT_MIN_SATURATION of grey), palette_vibrant emits null and the headline defaults to white — never falls through to palette_accent (which is just palette[1] and reads close to the dark panel) nor brand.accent_color (image-led templates intentionally don't substitute brand color for an image color)." },
-        "proof_bar_bg":          { "source_priority": ["media.palette_dominant", "brand.primary_color"],   "default": "#1F1F1F", "comment": "renderer applies an 8% white lift via color-mix so the bar is visually distinct from the panel without needing a separate palette slot" },
-        "proof_bar_text":        { "default": "auto-from-brightness" },
-        "proof_bar_border":      { "source_priority": ["media.palette_vibrant", "media.palette_accent", "brand.accent_color"],  "default": "#FF6B35" },
-        "open_quote_glyph_color":{ "source_priority": ["media.palette_vibrant", "media.palette_accent", "brand.accent_color"],  "default": "#FF6B35" },
-        "cta_button_bg":         { "source_priority": ["media.palette_vibrant", "media.palette_accent", "brand.accent_color", "brand.primary_color"], "default": "#FF6B35" },
-        "cta_button_text":       { "default": "auto-from-brightness" },
-        "rating_star_color":     { "default": "#FFD400" },
-        "font_family_headline":  { "source_priority": ["brand.font_family"], "default": "Knewave, Bungee, system-ui", "comment": "responsive: brand-curated display font wins. Falls through to the brushy display stack." },
-        "font_family_body":      { "default": "Inter, system-ui, sans-serif", "comment": "fixed Inter-style sans for everything except the headline. Per the reference creative's typography." }
+        "panel_bg": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.primary_color"
+          ],
+          "default": "#0B0B0B",
+          "comment": "right-side content panel for landscape variants — leads with source-Media's dominant tone so the panel reads as an extension of the image"
+        },
+        "card_bg": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.secondary_color"
+          ],
+          "default": "#1A1A1A"
+        },
+        "card_border": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.primary_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "accent_border_color": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "section_header_color": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "headline_text_color": {
+          "source_priority": [
+            "media.palette_vibrant"
+          ],
+          "default": "#FFFFFF",
+          "comment": "image-led: vibrant image color when one exists. For monochromatic palettes (all entries within VIBRANT_MIN_SATURATION of grey), palette_vibrant emits null and the headline defaults to white — never falls through to palette_accent (which is just palette[1] and reads close to the dark panel) nor brand.accent_color (image-led templates intentionally don't substitute brand color for an image color)."
+        },
+        "proof_bar_bg": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.primary_color"
+          ],
+          "default": "#1F1F1F",
+          "comment": "renderer applies an 8% white lift via color-mix so the bar is visually distinct from the panel without needing a separate palette slot"
+        },
+        "proof_bar_text": {
+          "default": "auto-from-brightness"
+        },
+        "proof_bar_border": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "open_quote_glyph_color": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "cta_button_bg": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "cta_button_text": {
+          "default": "auto-from-brightness"
+        },
+        "rating_star_color": {
+          "default": "#FFD400"
+        },
+        "font_family_headline": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "Knewave, Bungee, system-ui",
+          "comment": "responsive: brand-curated display font wins. Falls through to the brushy display stack."
+        },
+        "font_family_body": {
+          "default": "Inter, system-ui, sans-serif",
+          "comment": "fixed Inter-style sans for everything except the headline. Per the reference creative's typography."
+        }
       },
       "validation": {
-        "required_any_of": [["social_proof.primary_quote.text", "copy.headline"]],
-        "required_all_of": ["product.name", "cta.text"]
+        "required_any_of": [
+          [
+            "social_proof.primary_quote.text",
+            "copy.headline"
+          ]
+        ],
+        "required_all_of": [
+          "product.name",
+          "cta.text"
+        ]
       }
     },
     {
       "template_id": "ugc_split_screen",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "status": "active",
       "supports_video": true,
       "family": "social_proof",
       "layout": {
-        "base_family": "split_focus",
-        "overlay_package": "quote_bubble",
-        "copy_system": "creator_quote_cta",
-        "motion_system": "primary_panel_motion"
+        "base_family": "split_panel",
+        "overlay_package": "rating_bar",
+        "copy_system": "headline_description_cta",
+        "motion_system": "subtle_product_motion"
       },
       "aspect_ratios": {
-        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
-        "preferred": ["1:1", "4:5", "9:16"]
+        "supported": [
+          "1:1",
+          "4:5",
+          "9:16",
+          "16:9",
+          "1.91:1"
+        ],
+        "preferred": [
+          "1:1",
+          "4:5",
+          "9:16"
+        ]
       },
       "zones": {
-        "left_panel": {
-          "id": "ugc_panel",
-          "type": "media",
+        "hero": {
+          "id": "section_header",
+          "type": "text",
           "required": true,
           "slot_binding": {
             "source_priority": [
-              "creator.portrait_media.video",
-              "creator.portrait_media.image",
-              "ugc.media.video",
-              "ugc.media.image"
-            ]
-          },
-          "media_rules": {
-            "accepted_kinds": ["image", "video"],
-            "crop_mode": "subject_preserve",
-            "poster_required_for_video": true
-          }
-        },
-        "right_panel": {
-          "id": "product_panel",
-          "type": "media",
-          "required": true,
-          "slot_binding": {
-            "source_priority": [
-              "product.hero_media.video",
-              "product.hero_media.image",
-              "product.secondary_media.image"
-            ]
-          },
-          "media_rules": {
-            "accepted_kinds": ["image", "video"],
-            "crop_mode": "subject_preserve",
-            "poster_required_for_video": true
-          }
-        },
-        "quote_bubble": {
-          "id": "quote_bubble",
-          "type": "text_card",
-          "required": true,
-          "slot_binding": {
-            "source_priority": [
-              "social_proof.primary_quote.text",
-              "ugc.caption",
-              "copy.headline",
-              "defaults.fallback_quote"
+              "copy.eyebrow",
+              "product.category",
+              "brand.tagline"
             ]
           },
           "limits": {
             "max_chars": {
-              "1:1": 110,
-              "4:5": 130,
-              "9:16": 140,
-              "16:9": 90,
-              "1.91:1": 80
+              "1:1": 30,
+              "4:5": 60,
+              "9:16": 60,
+              "16:9": 50,
+              "1.91:1": 50
             }
           }
         },
-        "engagement_row": {
-          "id": "engagement_row",
-          "type": "chip_row",
-          "required": false,
-          "slot_binding": {
-            "likes": ["performance.engagement.likes", "ugc.likes"],
-            "comments": ["performance.engagement.comments", "ugc.comments"],
-            "proof_badges": ["social_proof.proof_badges", "product.badges"]
-          }
-        },
-        "identity_row": {
-          "id": "identity_row",
-          "type": "identity",
+        "body": {
+          "id": "product_meta",
+          "type": "text",
           "required": true,
           "slot_binding": {
-            "creator_name": ["creator.name", "ugc.creator_name"],
-            "creator_handle": ["creator.handle", "ugc.creator_handle"],
-            "platform": ["creator.platform", "ugc.platform"]
+            "source_priority": [
+              "product.description",
+              "brand.summary",
+              "brand.tagline"
+            ]
+          }
+        },
+        "support_media": {
+          "id": "support_media",
+          "type": "media",
+          "required": false,
+          "slot_binding": {
+            "source_priority": [
+              "product.hero_media.video",
+              "product.hero_media.image",
+              "creator.portrait_media.video",
+              "creator.portrait_media.image",
+              "product.image"
+            ],
+            "comment": "Source-Media-derived smart crop wins. 4:5 source crop is the hero across all ratios — Cloudinary c_fill,g_auto smart-crops to whatever rect the canvas asks for."
+          },
+          "media_rules": {
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
+            "crop_mode": "subject_preserve",
+            "poster_required_for_video": true
+          }
+        },
+        "rating_bar": {
+          "id": "rating_bar",
+          "type": "proof_bar",
+          "required": false,
+          "slot_binding": {
+            "source_priority": [
+              "social_proof.rating_value",
+              "social_proof.review_count",
+              "trust.trusted_by_text"
+            ]
           }
         },
         "cta": {
@@ -260,81 +425,224 @@
           "type": "button",
           "required": true,
           "slot_binding": {
-            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
-            "url": ["cta.url"]
+            "text": [
+              "cta.text"
+            ],
+            "url": [
+              "cta.url"
+            ]
           }
         }
       },
-      "render_order": ["brand", "left_panel", "right_panel", "quote_bubble", "engagement_row", "identity_row", "cta", "legal"],
+      "render_order": [
+        "brand",
+        "support_media",
+        "hero",
+        "body",
+        "rating_bar",
+        "cta",
+        "legal"
+      ],
       "slot_adapter": {
-        "creator.name": ["ugc.creator_name", "creator.name"],
-        "creator.handle": ["ugc.creator_handle", "creator.handle"],
-        "creator.platform": ["ugc.platform", "creator.platform"],
-        "creator.portrait_media.image": ["ugc.media.image", "creator.portrait_media.image"],
-        "creator.portrait_media.video": ["ugc.media.video", "creator.portrait_media.video"],
-        "ugc.caption": ["ugc.caption"],
-        "ugc.likes": ["ugc.likes"],
-        "ugc.comments": ["ugc.comments"],
-        "product.name": ["product.name"],
-        "product.hero_media.image": ["product.hero_media.image", "product.image"],
-        "product.hero_media.video": ["product.hero_media.video"],
-        "social_proof.primary_quote.text": [
-          "social_proof.primary_quote.text",
-          "social_proof.quotes.0.text",
-          "ugc.caption"
+        "brand.logo": [
+          "brand.logo"
         ],
-        "social_proof.proof_badges": ["social_proof.proof_badges", "product.badges"],
-        "copy.cta_text": ["cta.text", "copy.cta_text"]
+        "brand.brand_name": [
+          "brand.name"
+        ],
+        "brand.eyebrow": [
+          "copy.eyebrow",
+          "brand.tagline"
+        ],
+        "copy.headline": [
+          "copy.headline"
+        ],
+        "copy.headline_lead": [
+          "copy.headline_lead"
+        ],
+        "copy.headline_main": [
+          "copy.headline_main"
+        ],
+        "copy.subheadline": [
+          "copy.subheadline",
+          "brand.tagline"
+        ],
+        "copy.eyebrow": [
+          "copy.eyebrow",
+          "product.category",
+          "brand.tagline"
+        ],
+        "copy.cta_text": [
+          "cta.text"
+        ],
+        "social_proof.rating_value": [
+          "social_proof.rating_value"
+        ],
+        "social_proof.review_count": [
+          "social_proof.review_count"
+        ],
+        "trust.trusted_by_text": [
+          "trust.trusted_by_text",
+          "social_proof.trusted_by_text"
+        ],
+        "product.name": [
+          "product.name"
+        ],
+        "product.description": [
+          "product.description",
+          "brand.summary",
+          "brand.tagline"
+        ],
+        "product.category": [
+          "product.category"
+        ],
+        "product.badges": [
+          "product.badges",
+          "social_proof.proof_badges"
+        ],
+        "product.hero_media.image": [
+          "product.hero_media.image",
+          "product.image"
+        ],
+        "product.hero_media.video": [
+          "product.hero_media.video"
+        ]
       },
       "visibility_rules": {
-        "show_creator_handle": true,
-        "show_platform_badge": true,
-        "show_engagement_row_only_if_any_present": true,
-        "show_rights_status_only_if_post_type_is_ugc": true
+        "show_brand_logo": true,
+        "show_rating_bar_only_if_any_present": true,
+        "show_badges_max": 4
       },
       "truncation_rules": {
-        "quote_max_lines": 4,
-        "creator_name_max_chars": 28,
-        "creator_handle_max_chars": 24,
+        "headline_max_lines": 3,
+        "subheadline_max_lines": 2,
+        "product_description_max_lines": 12,
         "cta_max_chars": 24
       },
       "motion_policy": {
         "max_concurrent_motion_slots": 1,
-        "preferred_hero_video_slot": "left_panel",
-        "allow_background_video": false,
+        "preferred_hero_video_slot": "support_media",
+        "allow_background_video": true,
         "mute_required": true,
         "loop_required": true,
         "autoplay_required": true,
-        "if_both_panels_are_video": "autoplay left_panel only, freeze right_panel to poster",
-        "text_overlay_requires_scrim": true,
-        "animation_style": "dynamic"
+        "text_overlay_requires_scrim": false,
+        "animation_style": "subtle"
       },
       "fallback_policy": {
-        "if_no_creator_media": "use product.hero_media in left_panel",
-        "if_no_product_media": "use creator media full bleed",
-        "if_no_quote": "use ugc.caption",
-        "if_no_engagement_data": "hide engagement row",
-        "if_no_creator_handle": "show creator name only"
+        "if_no_section_header": "use brand.tagline",
+        "if_no_description": "use brand.summary, then brand.tagline",
+        "if_no_support_media": "render solid panel using palette_dominant",
+        "if_no_rating_data": "hide rating bar",
+        "if_video_missing_poster": "generate from first frame or fall back to image"
       },
       "style_bindings": {
-        "panel_divider_color":  { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#FFFFFF" },
-        "quote_bubble_bg":      { "source_priority": ["brand.secondary_color"], "default": "#F3F4F6" },
-        "quote_bubble_text":    { "default": "auto-from-brightness" },
-        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
-        "cta_button_text":      { "default": "auto-from-brightness" },
-        "engagement_chip_bg":   { "default": "rgba(0,0,0,0.55)" },
-        "engagement_chip_text": { "default": "#FFFFFF" },
-        "creator_handle_color": { "source_priority": ["brand.accent_color"], "default": "#7A35E8" },
-        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
-        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+        "panel_bg": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.primary_color"
+          ],
+          "default": "#0B0B0B",
+          "comment": "split-panel content surface — leads with source-Media's dominant tone so the panel reads as an extension of the image"
+        },
+        "card_bg": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.secondary_color"
+          ],
+          "default": "#1A1A1A"
+        },
+        "card_border": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.primary_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "accent_border_color": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "section_header_color": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "headline_text_color": {
+          "source_priority": [
+            "media.palette_vibrant"
+          ],
+          "default": "#FFFFFF",
+          "comment": "image-led: vibrant image color when one exists. Monochromatic palettes default to white."
+        },
+        "proof_bar_bg": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.primary_color"
+          ],
+          "default": "#1F1F1F"
+        },
+        "proof_bar_text": {
+          "default": "auto-from-brightness"
+        },
+        "proof_bar_border": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "cta_button_bg": {
+          "source_priority": [
+            "media.palette_vibrant",
+            "media.palette_accent",
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "cta_button_text": {
+          "default": "auto-from-brightness"
+        },
+        "rating_star_color": {
+          "default": "#FFD400"
+        },
+        "font_family_headline": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "Knewave, Bungee, system-ui"
+        },
+        "font_family_body": {
+          "default": "Inter, system-ui, sans-serif"
+        }
       },
       "validation": {
-        "required_all_of": ["product.name", "cta.text"],
+        "required_all_of": [
+          "product.name",
+          "cta.text"
+        ],
         "required_any_of": [
-          ["creator.portrait_media.video", "creator.portrait_media.image", "ugc.media.video", "ugc.media.image"],
-          ["product.hero_media.video", "product.hero_media.image"],
-          ["social_proof.primary_quote.text", "ugc.caption", "copy.headline"]
+          [
+            "product.description",
+            "brand.summary",
+            "brand.tagline"
+          ],
+          [
+            "product.hero_media.image",
+            "creator.portrait_media.image",
+            "ugc.media.image",
+            "product.image"
+          ]
         ]
       }
     },
@@ -351,8 +659,17 @@
         "motion_system": "hero_only_motion"
       },
       "aspect_ratios": {
-        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
-        "preferred": ["1:1", "4:5"]
+        "supported": [
+          "1:1",
+          "4:5",
+          "9:16",
+          "16:9",
+          "1.91:1"
+        ],
+        "preferred": [
+          "1:1",
+          "4:5"
+        ]
       },
       "zones": {
         "center_hero": {
@@ -367,7 +684,10 @@
             ]
           },
           "media_rules": {
-            "accepted_kinds": ["image", "video"],
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
             "crop_mode": "subject_preserve",
             "poster_required_for_video": true
           }
@@ -377,7 +697,10 @@
           "type": "review_card_stack",
           "required": true,
           "slot_binding": {
-            "source_priority": ["social_proof.secondary_quotes", "social_proof.quotes"]
+            "source_priority": [
+              "social_proof.secondary_quotes",
+              "social_proof.quotes"
+            ]
           },
           "limits": {
             "max_items": {
@@ -395,9 +718,16 @@
           "type": "summary",
           "required": true,
           "slot_binding": {
-            "rating_value": ["social_proof.rating_value", "social_proof.rating"],
-            "review_count": ["social_proof.review_count"],
-            "trusted_by_text": ["trust.trusted_by_text"]
+            "rating_value": [
+              "social_proof.rating_value",
+              "social_proof.rating"
+            ],
+            "review_count": [
+              "social_proof.review_count"
+            ],
+            "trusted_by_text": [
+              "trust.trusted_by_text"
+            ]
           }
         },
         "headline": {
@@ -405,7 +735,10 @@
           "type": "text",
           "required": false,
           "slot_binding": {
-            "source_priority": ["copy.headline", "defaults.fallback_headline"]
+            "source_priority": [
+              "copy.headline",
+              "defaults.fallback_headline"
+            ]
           }
         },
         "cta": {
@@ -413,21 +746,55 @@
           "type": "button",
           "required": true,
           "slot_binding": {
-            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
-            "url": ["cta.url"]
+            "text": [
+              "copy.cta_text",
+              "cta.text",
+              "defaults.cta_text"
+            ],
+            "url": [
+              "cta.url"
+            ]
           }
         }
       },
-      "render_order": ["brand", "headline", "center_hero", "review_cards", "summary_badge", "cta", "legal"],
+      "render_order": [
+        "brand",
+        "headline",
+        "center_hero",
+        "review_cards",
+        "summary_badge",
+        "cta",
+        "legal"
+      ],
       "slot_adapter": {
-        "product.hero_media.image": ["product.hero_media.image", "product.image"],
-        "product.hero_media.video": ["product.hero_media.video"],
-        "social_proof.secondary_quotes": ["social_proof.secondary_quotes", "social_proof.quotes"],
-        "social_proof.rating_value": ["social_proof.rating_value", "social_proof.rating"],
-        "social_proof.review_count": ["social_proof.review_count"],
-        "trust.trusted_by_text": ["trust.trusted_by_text"],
-        "copy.headline": ["copy.headline"],
-        "copy.cta_text": ["cta.text", "copy.cta_text"]
+        "product.hero_media.image": [
+          "product.hero_media.image",
+          "product.image"
+        ],
+        "product.hero_media.video": [
+          "product.hero_media.video"
+        ],
+        "social_proof.secondary_quotes": [
+          "social_proof.secondary_quotes",
+          "social_proof.quotes"
+        ],
+        "social_proof.rating_value": [
+          "social_proof.rating_value",
+          "social_proof.rating"
+        ],
+        "social_proof.review_count": [
+          "social_proof.review_count"
+        ],
+        "trust.trusted_by_text": [
+          "trust.trusted_by_text"
+        ],
+        "copy.headline": [
+          "copy.headline"
+        ],
+        "copy.cta_text": [
+          "cta.text",
+          "copy.cta_text"
+        ]
       },
       "visibility_rules": {
         "show_headline_if_present": true,
@@ -458,24 +825,77 @@
         "if_no_headline": "use brand tagline"
       },
       "style_bindings": {
-        "background_color":     { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "card_bg":              { "source_priority": ["brand.secondary_color"], "default": "#FFFFFF" },
-        "card_border":          { "default": "#E5E7EB" },
-        "card_text":            { "default": "auto-from-brightness" },
-        "headline_text_color":  { "default": "auto-from-brightness", "comment": "renders on brand.primary_color background" },
-        "rating_star_color":    { "default": "#FFD400" },
-        "summary_badge_bg":     { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#7A35E8" },
-        "summary_badge_text":   { "default": "auto-from-brightness" },
-        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
-        "cta_button_text":      { "default": "auto-from-brightness" },
-        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
-        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+        "background_color": {
+          "source_priority": [
+            "brand.primary_color"
+          ],
+          "default": "#0B1020"
+        },
+        "card_bg": {
+          "source_priority": [
+            "brand.secondary_color"
+          ],
+          "default": "#FFFFFF"
+        },
+        "card_border": {
+          "default": "#E5E7EB"
+        },
+        "card_text": {
+          "default": "auto-from-brightness"
+        },
+        "headline_text_color": {
+          "default": "auto-from-brightness",
+          "comment": "renders on brand.primary_color background"
+        },
+        "rating_star_color": {
+          "default": "#FFD400"
+        },
+        "summary_badge_bg": {
+          "source_priority": [
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#7A35E8"
+        },
+        "summary_badge_text": {
+          "default": "auto-from-brightness"
+        },
+        "cta_button_bg": {
+          "source_priority": [
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#000000"
+        },
+        "cta_button_text": {
+          "default": "auto-from-brightness"
+        },
+        "font_family_headline": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        },
+        "font_family_body": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        }
       },
       "validation": {
-        "required_all_of": ["cta.text"],
+        "required_all_of": [
+          "cta.text"
+        ],
         "required_any_of": [
-          ["product.hero_media.video", "product.hero_media.image"],
-          ["social_proof.secondary_quotes", "social_proof.quotes"]
+          [
+            "product.hero_media.video",
+            "product.hero_media.image"
+          ],
+          [
+            "social_proof.secondary_quotes",
+            "social_proof.quotes"
+          ]
         ]
       }
     },
@@ -492,8 +912,18 @@
         "motion_system": "structured_metrics_motion"
       },
       "aspect_ratios": {
-        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
-        "preferred": ["1:1", "4:5", "16:9"]
+        "supported": [
+          "1:1",
+          "4:5",
+          "9:16",
+          "16:9",
+          "1.91:1"
+        ],
+        "preferred": [
+          "1:1",
+          "4:5",
+          "16:9"
+        ]
       },
       "zones": {
         "headline": {
@@ -501,7 +931,10 @@
           "type": "text",
           "required": true,
           "slot_binding": {
-            "source_priority": ["copy.headline", "defaults.fallback_headline"]
+            "source_priority": [
+              "copy.headline",
+              "defaults.fallback_headline"
+            ]
           }
         },
         "metric_row": {
@@ -509,7 +942,9 @@
           "type": "metrics",
           "required": true,
           "slot_binding": {
-            "source_priority": ["performance.metrics"]
+            "source_priority": [
+              "performance.metrics"
+            ]
           },
           "limits": {
             "max_items": {
@@ -548,7 +983,10 @@
             ]
           },
           "media_rules": {
-            "accepted_kinds": ["image", "video"],
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
             "crop_mode": "subject_preserve",
             "poster_required_for_video": true
           }
@@ -558,9 +996,16 @@
           "type": "proof_footer",
           "required": false,
           "slot_binding": {
-            "rating_value": ["social_proof.rating_value", "social_proof.rating"],
-            "review_count": ["social_proof.review_count"],
-            "trusted_by_text": ["trust.trusted_by_text"]
+            "rating_value": [
+              "social_proof.rating_value",
+              "social_proof.rating"
+            ],
+            "review_count": [
+              "social_proof.review_count"
+            ],
+            "trusted_by_text": [
+              "trust.trusted_by_text"
+            ]
           }
         },
         "cta": {
@@ -568,25 +1013,68 @@
           "type": "button",
           "required": true,
           "slot_binding": {
-            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
-            "url": ["cta.url"]
+            "text": [
+              "copy.cta_text",
+              "cta.text",
+              "defaults.cta_text"
+            ],
+            "url": [
+              "cta.url"
+            ]
           }
         }
       },
-      "render_order": ["brand", "headline", "metric_row", "proof_quote", "support_media", "trust_footer", "cta", "legal"],
+      "render_order": [
+        "brand",
+        "headline",
+        "metric_row",
+        "proof_quote",
+        "support_media",
+        "trust_footer",
+        "cta",
+        "legal"
+      ],
       "slot_adapter": {
-        "copy.headline": ["copy.headline"],
-        "copy.subheadline": ["copy.subheadline"],
-        "performance.metrics": ["performance.metrics"],
-        "social_proof.primary_quote.text": ["social_proof.primary_quote.text", "social_proof.quotes.0.text"],
-        "product.hero_media.image": ["product.hero_media.image", "product.image"],
-        "product.hero_media.video": ["product.hero_media.video"],
-        "media.supporting_media.0.image": ["media.supporting_media.0.image"],
-        "media.supporting_media.0.video": ["media.supporting_media.0.video"],
-        "social_proof.rating_value": ["social_proof.rating_value", "social_proof.rating"],
-        "social_proof.review_count": ["social_proof.review_count"],
-        "trust.trusted_by_text": ["trust.trusted_by_text"],
-        "copy.cta_text": ["cta.text", "copy.cta_text"]
+        "copy.headline": [
+          "copy.headline"
+        ],
+        "copy.subheadline": [
+          "copy.subheadline"
+        ],
+        "performance.metrics": [
+          "performance.metrics"
+        ],
+        "social_proof.primary_quote.text": [
+          "social_proof.primary_quote.text",
+          "social_proof.quotes.0.text"
+        ],
+        "product.hero_media.image": [
+          "product.hero_media.image",
+          "product.image"
+        ],
+        "product.hero_media.video": [
+          "product.hero_media.video"
+        ],
+        "media.supporting_media.0.image": [
+          "media.supporting_media.0.image"
+        ],
+        "media.supporting_media.0.video": [
+          "media.supporting_media.0.video"
+        ],
+        "social_proof.rating_value": [
+          "social_proof.rating_value",
+          "social_proof.rating"
+        ],
+        "social_proof.review_count": [
+          "social_proof.review_count"
+        ],
+        "trust.trusted_by_text": [
+          "trust.trusted_by_text"
+        ],
+        "copy.cta_text": [
+          "cta.text",
+          "copy.cta_text"
+        ]
       },
       "visibility_rules": {
         "show_metric_row_min": 2,
@@ -622,22 +1110,75 @@
         "if_no_trust_footer": "compress CTA upward"
       },
       "style_bindings": {
-        "stat_card_bg":         { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "stat_card_text":       { "default": "auto-from-brightness" },
-        "metric_accent_color":  { "source_priority": ["brand.accent_color"],    "default": "#7A35E8" },
-        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "rating_star_color":    { "default": "#FFD400" },
-        "trust_footer_bg":      { "source_priority": ["brand.secondary_color"], "default": "#F3F4F6" },
-        "trust_footer_text":    { "default": "auto-from-brightness" },
-        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
-        "cta_button_text":      { "default": "auto-from-brightness" },
-        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
-        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+        "stat_card_bg": {
+          "source_priority": [
+            "brand.primary_color"
+          ],
+          "default": "#0B1020"
+        },
+        "stat_card_text": {
+          "default": "auto-from-brightness"
+        },
+        "metric_accent_color": {
+          "source_priority": [
+            "brand.accent_color"
+          ],
+          "default": "#7A35E8"
+        },
+        "headline_text_color": {
+          "source_priority": [
+            "brand.primary_color"
+          ],
+          "default": "#0B1020"
+        },
+        "rating_star_color": {
+          "default": "#FFD400"
+        },
+        "trust_footer_bg": {
+          "source_priority": [
+            "brand.secondary_color"
+          ],
+          "default": "#F3F4F6"
+        },
+        "trust_footer_text": {
+          "default": "auto-from-brightness"
+        },
+        "cta_button_bg": {
+          "source_priority": [
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#000000"
+        },
+        "cta_button_text": {
+          "default": "auto-from-brightness"
+        },
+        "font_family_headline": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        },
+        "font_family_body": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        }
       },
       "validation": {
-        "required_all_of": ["copy.headline", "cta.text"],
-        "required_any_of": [["performance.metrics"]],
-        "minimum_counts": { "performance.metrics": 2 }
+        "required_all_of": [
+          "copy.headline",
+          "cta.text"
+        ],
+        "required_any_of": [
+          [
+            "performance.metrics"
+          ]
+        ],
+        "minimum_counts": {
+          "performance.metrics": 2
+        }
       }
     },
     {
@@ -654,13 +1195,36 @@
         "motion_system": "subtle_image_motion"
       },
       "aspect_ratios": {
-        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
-        "preferred": ["1:1", "4:5", "9:16"]
+        "supported": [
+          "1:1",
+          "4:5",
+          "9:16",
+          "16:9",
+          "1.91:1"
+        ],
+        "preferred": [
+          "1:1",
+          "4:5",
+          "9:16"
+        ]
       },
-      "render_order": ["background_media", "scrim", "logo", "headline", "product_meta", "cta", "quote"],
+      "render_order": [
+        "background_media",
+        "scrim",
+        "logo",
+        "headline",
+        "product_meta",
+        "cta",
+        "quote"
+      ],
       "background_binding": {
         "slot_binding": {
-          "source_priority": ["product.hero_media", "creator.portrait_media", "ugc.media", "product.image"]
+          "source_priority": [
+            "product.hero_media",
+            "creator.portrait_media",
+            "ugc.media",
+            "product.image"
+          ]
         },
         "comment": "Source media fills the entire canvas — image is the ad. The first three are source-Media-derived smart crops; product.image is the catalog stock fallback (direct CatalogProduct.imageUrl) so brands with only manual-upload catalog rows still render."
       },
@@ -668,20 +1232,30 @@
         "algorithm": "greedy_priority_with_overlap_budget",
         "subject_overlap_budget_pct": 10,
         "hard_no_overlay_strictness_floor": 0.95,
-        "fallback_modes": ["inset_with_brand_color_bands"],
+        "fallback_modes": [
+          "inset_with_brand_color_bands"
+        ],
         "element_priority_order": [
           {
             "id": "logo",
             "required": true,
             "region_hint": "top-left",
-            "slot_binding": { "source_priority": ["brand.logo"] }
+            "slot_binding": {
+              "source_priority": [
+                "brand.logo"
+              ]
+            }
           },
           {
             "id": "headline",
             "required": true,
             "region_hint": "top-band",
             "scale_text_to_fit": true,
-            "slot_binding": { "source_priority": ["copy.headline"] }
+            "slot_binding": {
+              "source_priority": [
+                "copy.headline"
+              ]
+            }
           },
           {
             "id": "product_meta",
@@ -690,11 +1264,31 @@
             "scale_text_to_fit": true,
             "slot_binding": {
               "fields": {
-                "name":         { "source_priority": ["product.name"] },
-                "price":        { "source_priority": ["product.price"] },
-                "currency":     { "source_priority": ["product.currency"] },
-                "rating":       { "source_priority": ["social_proof.rating_value"] },
-                "review_count": { "source_priority": ["social_proof.review_count"] }
+                "name": {
+                  "source_priority": [
+                    "product.name"
+                  ]
+                },
+                "price": {
+                  "source_priority": [
+                    "product.price"
+                  ]
+                },
+                "currency": {
+                  "source_priority": [
+                    "product.currency"
+                  ]
+                },
+                "rating": {
+                  "source_priority": [
+                    "social_proof.rating_value"
+                  ]
+                },
+                "review_count": {
+                  "source_priority": [
+                    "social_proof.review_count"
+                  ]
+                }
               }
             }
           },
@@ -702,7 +1296,11 @@
             "id": "cta",
             "required": true,
             "region_hint": "bottom-third",
-            "slot_binding": { "source_priority": ["cta.text"] }
+            "slot_binding": {
+              "source_priority": [
+                "cta.text"
+              ]
+            }
           },
           {
             "id": "quote",
@@ -711,8 +1309,16 @@
             "truncate": "ellipsis",
             "slot_binding": {
               "fields": {
-                "text":   { "source_priority": ["social_proof.primary_quote.text"] },
-                "author": { "source_priority": ["social_proof.primary_quote.author_name"] }
+                "text": {
+                  "source_priority": [
+                    "social_proof.primary_quote.text"
+                  ]
+                },
+                "author": {
+                  "source_priority": [
+                    "social_proof.primary_quote.author_name"
+                  ]
+                }
               }
             }
           }
@@ -723,7 +1329,14 @@
         "show_yellow_stars_for_rating": true,
         "drop_quote_if_no_safe_area": true,
         "rights_gate": {
-          "applies_to_paths": ["ugc.media", "ugc.media.image", "ugc.media.video", "ugc.caption", "ugc.likes", "ugc.comments"],
+          "applies_to_paths": [
+            "ugc.media",
+            "ugc.media.image",
+            "ugc.media.video",
+            "ugc.caption",
+            "ugc.likes",
+            "ugc.comments"
+          ],
           "requires": "ugc.rights_approved",
           "comment": "When background_binding resolves to ugc.media, the rights flag must be true. Otherwise the resolution falls through to the next source_priority entry (product.hero_media → creator.portrait_media → ugc.media)."
         }
@@ -750,23 +1363,99 @@
         "if_no_overlay_analysis": "skip_template_invalid"
       },
       "style_bindings": {
-        "panel_bg":             { "source_priority": ["media.palette_dominant", "brand.primary_color"], "default": "#0B0B0B", "comment": "right-side content panel — leads with the source Media's dominant background color so the panel reads as an extension of the image" },
-        "scrim_tint":           { "source_priority": ["media.palette_dominant", "brand.primary_color"], "default": "#000000" },
-        "headline_text_color":  { "source_priority": ["media.palette_accent",   "brand.accent_color"],  "default": "auto-from-brightness", "comment": "image-led: pulls vibrant accent from the source media (flame orange, brand color, etc.) rather than brand-curated. Falls back to brightness-based contrast." },
-        "body_text_color":      { "default": "auto-from-brightness" },
-        "rating_star_color":    { "default": "#FFD400", "comment": "yellow stars per catalog distinctive_features" },
-        "cta_button_bg":        { "source_priority": ["media.palette_accent",   "brand.accent_color",   "brand.primary_color"], "default": "#FF6B35" },
-        "cta_button_text":      { "default": "auto-from-brightness" },
-        "accent_border_color":  { "source_priority": ["media.palette_accent",   "brand.accent_color"],  "default": "#FF6B35", "comment": "left-edge accent on quote card + section header underline" },
-        "section_header_color": { "source_priority": ["media.palette_accent",   "brand.accent_color"],  "default": "#FF6B35", "comment": "uppercase section eyebrow color (e.g. 'BUILT FOR HEAT LOVERS')" },
-        "inset_band_color":     { "source_priority": ["media.palette_dominant", "brand.primary_color", "brand.accent_color"], "default": "#0B1020", "comment": "fallback inset mode bands" },
-        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
-        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+        "panel_bg": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.primary_color"
+          ],
+          "default": "#0B0B0B",
+          "comment": "right-side content panel — leads with the source Media's dominant background color so the panel reads as an extension of the image"
+        },
+        "scrim_tint": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.primary_color"
+          ],
+          "default": "#000000"
+        },
+        "headline_text_color": {
+          "source_priority": [
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "auto-from-brightness",
+          "comment": "image-led: pulls vibrant accent from the source media (flame orange, brand color, etc.) rather than brand-curated. Falls back to brightness-based contrast."
+        },
+        "body_text_color": {
+          "default": "auto-from-brightness"
+        },
+        "rating_star_color": {
+          "default": "#FFD400",
+          "comment": "yellow stars per catalog distinctive_features"
+        },
+        "cta_button_bg": {
+          "source_priority": [
+            "media.palette_accent",
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#FF6B35"
+        },
+        "cta_button_text": {
+          "default": "auto-from-brightness"
+        },
+        "accent_border_color": {
+          "source_priority": [
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35",
+          "comment": "left-edge accent on quote card + section header underline"
+        },
+        "section_header_color": {
+          "source_priority": [
+            "media.palette_accent",
+            "brand.accent_color"
+          ],
+          "default": "#FF6B35",
+          "comment": "uppercase section eyebrow color (e.g. 'BUILT FOR HEAT LOVERS')"
+        },
+        "inset_band_color": {
+          "source_priority": [
+            "media.palette_dominant",
+            "brand.primary_color",
+            "brand.accent_color"
+          ],
+          "default": "#0B1020",
+          "comment": "fallback inset mode bands"
+        },
+        "font_family_headline": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        },
+        "font_family_body": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        }
       },
       "validation": {
-        "required_all_of": ["brand.logo", "copy.headline", "product.name", "cta.text"],
+        "required_all_of": [
+          "brand.logo",
+          "copy.headline",
+          "product.name",
+          "cta.text"
+        ],
         "required_any_of": [
-          ["product.hero_media.image", "creator.portrait_media.image", "ugc.media.image", "product.image"]
+          [
+            "product.hero_media.image",
+            "creator.portrait_media.image",
+            "ugc.media.image",
+            "product.image"
+          ]
         ]
       }
     },
@@ -783,8 +1472,18 @@
         "motion_system": "creator_primary_motion"
       },
       "aspect_ratios": {
-        "supported": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
-        "preferred": ["1:1", "4:5", "9:16"]
+        "supported": [
+          "1:1",
+          "4:5",
+          "9:16",
+          "16:9",
+          "1.91:1"
+        ],
+        "preferred": [
+          "1:1",
+          "4:5",
+          "9:16"
+        ]
       },
       "zones": {
         "creator_zone": {
@@ -800,7 +1499,10 @@
             ]
           },
           "media_rules": {
-            "accepted_kinds": ["image", "video"],
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
             "crop_mode": "subject_preserve",
             "poster_required_for_video": true
           }
@@ -829,7 +1531,10 @@
             ]
           },
           "media_rules": {
-            "accepted_kinds": ["image", "video"],
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
             "crop_mode": "subject_preserve",
             "poster_required_for_video": true
           }
@@ -839,9 +1544,17 @@
           "type": "ribbon",
           "required": false,
           "slot_binding": {
-            "creator_handle": ["creator.handle", "ugc.creator_handle"],
-            "proof_badges": ["social_proof.proof_badges", "product.badges"],
-            "trusted_by_text": ["trust.trusted_by_text"]
+            "creator_handle": [
+              "creator.handle",
+              "ugc.creator_handle"
+            ],
+            "proof_badges": [
+              "social_proof.proof_badges",
+              "product.badges"
+            ],
+            "trusted_by_text": [
+              "trust.trusted_by_text"
+            ]
           }
         },
         "cta": {
@@ -849,27 +1562,66 @@
           "type": "button",
           "required": true,
           "slot_binding": {
-            "text": ["copy.cta_text", "cta.text", "defaults.cta_text"],
-            "url": ["cta.url"]
+            "text": [
+              "copy.cta_text",
+              "cta.text",
+              "defaults.cta_text"
+            ],
+            "url": [
+              "cta.url"
+            ]
           }
         }
       },
-      "render_order": ["brand", "creator_zone", "endorsement_quote", "product_zone", "social_ribbon", "cta", "legal"],
+      "render_order": [
+        "brand",
+        "creator_zone",
+        "endorsement_quote",
+        "product_zone",
+        "social_ribbon",
+        "cta",
+        "legal"
+      ],
       "slot_adapter": {
-        "creator.name": ["ugc.creator_name", "creator.name"],
-        "creator.handle": ["ugc.creator_handle", "creator.handle"],
-        "creator.portrait_media.image": ["ugc.media.image", "creator.portrait_media.image"],
-        "creator.portrait_media.video": ["ugc.media.video", "creator.portrait_media.video"],
-        "product.hero_media.image": ["product.hero_media.image", "product.image"],
-        "product.hero_media.video": ["product.hero_media.video"],
+        "creator.name": [
+          "ugc.creator_name",
+          "creator.name"
+        ],
+        "creator.handle": [
+          "ugc.creator_handle",
+          "creator.handle"
+        ],
+        "creator.portrait_media.image": [
+          "ugc.media.image",
+          "creator.portrait_media.image"
+        ],
+        "creator.portrait_media.video": [
+          "ugc.media.video",
+          "creator.portrait_media.video"
+        ],
+        "product.hero_media.image": [
+          "product.hero_media.image",
+          "product.image"
+        ],
+        "product.hero_media.video": [
+          "product.hero_media.video"
+        ],
         "social_proof.primary_quote.text": [
           "social_proof.primary_quote.text",
           "social_proof.quotes.0.text",
           "copy.headline"
         ],
-        "social_proof.proof_badges": ["social_proof.proof_badges", "product.badges"],
-        "trust.trusted_by_text": ["trust.trusted_by_text"],
-        "copy.cta_text": ["cta.text", "copy.cta_text"]
+        "social_proof.proof_badges": [
+          "social_proof.proof_badges",
+          "product.badges"
+        ],
+        "trust.trusted_by_text": [
+          "trust.trusted_by_text"
+        ],
+        "copy.cta_text": [
+          "cta.text",
+          "copy.cta_text"
+        ]
       },
       "visibility_rules": {
         "show_creator_handle": true,
@@ -901,25 +1653,89 @@
         "if_no_social_ribbon_data": "hide ribbon"
       },
       "style_bindings": {
-        "trust_ribbon_bg":      { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#7A35E8" },
-        "trust_ribbon_text":    { "default": "auto-from-brightness" },
-        "creator_card_bg":      { "source_priority": ["brand.secondary_color"], "default": "#FFFFFF" },
-        "creator_card_text":    { "default": "auto-from-brightness" },
-        "creator_name_color":   { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "creator_handle_color": { "source_priority": ["brand.accent_color"],    "default": "#7A35E8" },
-        "headline_text_color":  { "source_priority": ["brand.primary_color"],   "default": "#0B1020" },
-        "rating_star_color":    { "default": "#FFD400" },
-        "cta_button_bg":        { "source_priority": ["brand.accent_color", "brand.primary_color"], "default": "#000000" },
-        "cta_button_text":      { "default": "auto-from-brightness" },
-        "font_family_headline": { "source_priority": ["brand.font_family"], "default": "system-ui" },
-        "font_family_body":     { "source_priority": ["brand.font_family"], "default": "system-ui" }
+        "trust_ribbon_bg": {
+          "source_priority": [
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#7A35E8"
+        },
+        "trust_ribbon_text": {
+          "default": "auto-from-brightness"
+        },
+        "creator_card_bg": {
+          "source_priority": [
+            "brand.secondary_color"
+          ],
+          "default": "#FFFFFF"
+        },
+        "creator_card_text": {
+          "default": "auto-from-brightness"
+        },
+        "creator_name_color": {
+          "source_priority": [
+            "brand.primary_color"
+          ],
+          "default": "#0B1020"
+        },
+        "creator_handle_color": {
+          "source_priority": [
+            "brand.accent_color"
+          ],
+          "default": "#7A35E8"
+        },
+        "headline_text_color": {
+          "source_priority": [
+            "brand.primary_color"
+          ],
+          "default": "#0B1020"
+        },
+        "rating_star_color": {
+          "default": "#FFD400"
+        },
+        "cta_button_bg": {
+          "source_priority": [
+            "brand.accent_color",
+            "brand.primary_color"
+          ],
+          "default": "#000000"
+        },
+        "cta_button_text": {
+          "default": "auto-from-brightness"
+        },
+        "font_family_headline": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        },
+        "font_family_body": {
+          "source_priority": [
+            "brand.font_family"
+          ],
+          "default": "system-ui"
+        }
       },
       "validation": {
-        "required_all_of": ["cta.text"],
+        "required_all_of": [
+          "cta.text"
+        ],
         "required_any_of": [
-          ["creator.portrait_media.video", "creator.portrait_media.image", "ugc.media.video", "ugc.media.image"],
-          ["product.hero_media.video", "product.hero_media.image"],
-          ["social_proof.primary_quote.text", "social_proof.quotes.0.text", "copy.headline"]
+          [
+            "creator.portrait_media.video",
+            "creator.portrait_media.image",
+            "ugc.media.video",
+            "ugc.media.image"
+          ],
+          [
+            "product.hero_media.video",
+            "product.hero_media.image"
+          ],
+          [
+            "social_proof.primary_quote.text",
+            "social_proof.quotes.0.text",
+            "copy.headline"
+          ]
         ]
       }
     }

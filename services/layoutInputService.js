@@ -114,7 +114,14 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // the saturation gate but still blends with palette_dominant (panel
 // bg) because they share a hue family. Headlines fall through to
 // white when contrast against the dominant is below 4.0.
-const INPUT_SCHEMA_VERSION = '3.2';
+// 3.3 retargets ugc_split_screen to the testimonial_spotlight design
+// language: image-led split panel + display_script headline +
+// eyebrow_rules + with_verified_buyers proof_bar + section_header +
+// product_meta + callouts badge_row + cta. testimonial_spotlight no
+// longer has section_header / product_meta. Hero source crop now
+// 4:5 for both templates (was just testimonial_spotlight). Cached
+// docs re-derive against the new validation + slot bindings.
+const INPUT_SCHEMA_VERSION = '3.3';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -651,14 +658,16 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   const details = ident.details || {};
   const palette = detection?.background?.palette || [];
 
-  // testimonial_spotlight uses the 4:5 source crop for ALL canvas
-  // ratios — its layouts are built so the renderer's c_fill,g_auto
-  // chain can subject-aware-crop the 4:5 source into whatever rect the
-  // canvas asks for (full-bleed in landscape, left half in 1:1, top
-  // half in 4:5). Using the 4:5 source instead of a ratio-matched
-  // crop gives Cloudinary the most pixels to crop from and avoids
+  // testimonial_spotlight + ugc_split_screen share the image-led
+  // split-panel layout and both use the 4:5 source crop for ALL
+  // canvas ratios — Cloudinary's c_fill,g_auto chain subject-aware-
+  // crops the 4:5 source into whatever rect the canvas asks for
+  // (full-bleed in landscape, left half in 1:1, top half in 4:5 /
+  // 9:16). Using the 4:5 source instead of a ratio-matched crop
+  // gives Cloudinary the most pixels to crop from and avoids
   // double-cropping artifacts.
-  const heroSourceRatio = (template === 'testimonial_spotlight') ? '4:5' : aspectRatio;
+  const SPLIT_PANEL_TEMPLATES = new Set(['testimonial_spotlight', 'ugc_split_screen']);
+  const heroSourceRatio = SPLIT_PANEL_TEMPLATES.has(template) ? '4:5' : aspectRatio;
   const heroMedia      = pickHeroMedia(ctx, heroSourceRatio);
   const secondaryMedia = pickSecondaryMedia(ctx, aspectRatio);
   const creatorMedia   = pickCreatorMedia(ctx);
