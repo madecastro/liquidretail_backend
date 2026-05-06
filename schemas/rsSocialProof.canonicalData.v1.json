@@ -167,6 +167,7 @@
         "palette_dominant":      { "type": "string", "description": "First entry of palette — most-dominant background color.", "x-source": "detection.background.palette[0]" },
         "palette_accent":        { "type": "string", "description": "Second entry — typical secondary mood color.",          "x-source": "detection.background.palette[1]" },
         "palette_neutral":       { "type": "string", "description": "Third entry — typical neutral / muted tone.",           "x-source": "detection.background.palette[2]" },
+        "palette_vibrant":       { "type": "string", "description": "Most-saturated color from the palette regardless of dominance rank. Image-led templates lead with this so headlines/CTAs/accents read as the photo's hero color, not the dominant backdrop.", "x-source": "argmax(saturation, palette[*])" },
         "background_setting":    { "type": "string", "description": "Scene setting label (e.g. 'studio', 'outdoor').",       "x-source": "detection.background.setting" },
         "background_lighting":   { "type": "string", "description": "Lighting label (e.g. 'natural', 'dramatic').",          "x-source": "detection.background.lighting" },
         "background_style":      { "type": "string", "description": "Visual style label (e.g. 'photorealistic').",           "x-source": "detection.background.style" },

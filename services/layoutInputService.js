@@ -766,8 +766,17 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
 
     copy: stripEmpty({
       headline:       derivation.copy?.headline,
-      subheadline:    derivation.copy?.subheadline,
-      eyebrow:        derivation.copy?.eyebrow,
+      // Subheadline + eyebrow fallbacks: many landscape templates
+      // bind these directly (eyebrow_rules zone, section_header zone)
+      // and the derivation LLM doesn't always produce them. When empty,
+      // fall through to brand.tagline (subheadline) or brand.tone[0] +
+      // an action verb / category (eyebrow). Keeps the panel populated
+      // for brand_match outcomes the LLM under-emits on.
+      subheadline:    derivation.copy?.subheadline || brand?.tagline || undefined,
+      eyebrow:        derivation.copy?.eyebrow
+                       || (Array.isArray(brand?.tone) && brand.tone[0] ? `Built for ${String(brand.tone[0]).toLowerCase()}` : null)
+                       || media.metadata?.category
+                       || undefined,
       highlight_text: derivation.copy?.highlight_text,
       disclaimer:     options.disclaimer
     }),
@@ -783,6 +792,14 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
       palette_dominant:  palette[0] || null,
       palette_accent:    palette[1] || null,
       palette_neutral:   palette[2] || null,
+      // Most-saturated color from the palette regardless of dominance
+      // rank. The detect pipeline returns palette[] in dominance order,
+      // which puts a deep-black backdrop at index 0 even when the
+      // eye-catching highlights (flame orange on black) are what the
+      // creative should LEAD with. palette_vibrant fixes that for
+      // image-led templates by walking the array and returning the
+      // entry with highest saturation. Falls back to palette_accent.
+      palette_vibrant:   pickVibrantColor(palette) || palette[1] || palette[0] || null,
       background_setting:     detection?.background?.setting     || null,
       background_lighting:    detection?.background?.lighting    || null,
       background_style:       detection?.background?.style       || null,
@@ -1101,6 +1118,43 @@ function mediaPair(p) {
   if (p.image) obj.image = p.image;
   if (p.video) obj.video = p.video;
   return Object.keys(obj).length ? obj : undefined;
+}
+
+// Walk a palette and return the entry with the highest HSL saturation.
+// detect.background.palette is dominance-ordered (most-pixels-first),
+// which puts a black/grey backdrop at index 0 even when the visually
+// striking highlights belong further in. Image-led templates lead with
+// the most-saturated color so headlines / CTAs / accents read as the
+// 'hero' color of the photograph rather than the muted background.
+function pickVibrantColor(palette) {
+  if (!Array.isArray(palette) || palette.length === 0) return null;
+  let best = null;
+  let bestScore = -1;
+  for (const hex of palette) {
+    const sat = saturationOfHex(hex);
+    if (sat == null) continue;
+    if (sat > bestScore) {
+      bestScore = sat;
+      best = hex;
+    }
+  }
+  return best;
+}
+
+function saturationOfHex(hex) {
+  if (typeof hex !== 'string') return null;
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const r = ((n >> 16) & 0xff) / 255;
+  const g = ((n >>  8) & 0xff) / 255;
+  const b = (n & 0xff)         / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const L = (max + min) / 2;
+  if (max === min) return 0;
+  const d = max - min;
+  return L > 0.5 ? d / (2 - max - min) : d / (max + min);
 }
 
 function buildCloudinaryCropUrl(sourceUrl, crop) {
