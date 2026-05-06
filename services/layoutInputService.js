@@ -61,6 +61,7 @@ const { findBrandByName }    = require('./brandCatalogService');
 const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
+const { computeSlotBudgets } = require('./slotBudget');
 
 const GEMINI_MODEL    = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -91,7 +92,12 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // overlay-mode templates when the source Media is a video — the
 // preview / renderer uses the video as the hero asset with the
 // still image as the pre-autoplay poster.
-const INPUT_SCHEMA_VERSION = '2.8';
+// 2.9 adds copy.headline_lead + copy.headline_main — the slot-aware
+// split fields the derivation prompt now writes against per-slot char
+// budgets (slotBudget.js). copy.headline is auto-joined from those
+// when present so legacy bindings still resolve. Cached 2.8 docs are
+// re-derived so the renderer's split-headline path can light up.
+const INPUT_SCHEMA_VERSION = '2.9';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -125,7 +131,17 @@ const DERIVATION_SCHEMA = {
     copy: {
       type: 'object',
       properties: {
+        // headline_lead + headline_main render as a stacked
+        // display-script split (small lead phrase over a larger main
+        // phrase). When the prompt provides per-slot char budgets, the
+        // LLM writes these directly — the prompt accounts for the
+        // half-size lead so the chars cap on each piece is honored.
+        // headline (legacy combined string) is kept for templates that
+        // don't use the split; assembleInput joins lead+main into it
+        // when both are present so existing zones still resolve.
         headline:       { type: 'string' },
+        headline_lead:  { type: 'string' },
+        headline_main:  { type: 'string' },
         subheadline:    { type: 'string' },
         eyebrow:        { type: 'string' },
         highlight_text: { type: 'string' }
@@ -449,16 +465,54 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   lines.push(`TASK:`);
   lines.push(`Produce JSON matching the schema. Rules:`);
 
+  // Slot-aware char budgets — derived from the canvas variant's actual
+  // headline + eyebrow rect dimensions, font scale, and decoration
+  // overhead (display_script lead/main split, eyebrow_rules hairlines).
+  // When present, these are HARD caps the LLM must write to; the
+  // word-count rules below are softer guidance.
+  const canvasVariant = registry.CANVAS.templates?.[template]?.variants?.[aspectRatio] || null;
+  const slotBudgets   = canvasVariant ? computeSlotBudgets(canvasVariant) : {};
+  const useSplitHeadline = !!slotBudgets.headline;
+
   if (isBranding) {
     // Brand-mode headline / quote rules. Override the product-shaped
     // defaults so the LLM doesn't backslide into product-specific copy.
-    lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. Must be BRAND-FOCUSED, not product-specific.`);
-    lines.push(`    Good examples: "Built for the offshore life", "Why anglers trust ${brandName || 'us'}", "Made for every adventure", "${brandName || 'Brand'}: gear that lasts".`);
-    lines.push(`    Bad examples: "The best fishing shirt" (specific product), "Try the AquaTek Pro" (specific SKU), "50% off select items" (offer-specific).`);
-    lines.push(`- "subheadline" ≤ 15 words, expands the brand promise. "eyebrow" ≤ 3 words (e.g. brand category or audience). "highlight_text" ≤ 5 words.`);
+    if (useSplitHeadline) {
+      const hb = slotBudgets.headline;
+      lines.push(`- "copy.headline_lead" REQUIRED — the small first clause of a stacked display-script headline. MAX ${hb.lead.max_chars} characters, ${hb.lead.max_lines} line, ~${hb.lead.max_words} words. This clause renders at HALF the size of headline_main, so it can hold a setup phrase ("WHY ANGLERS LOVE", "BUILT FOR THE", "SAY HELLO TO").`);
+      lines.push(`- "copy.headline_main" REQUIRED — the large second clause that completes the headline. MAX ${hb.main.max_chars} characters across ${hb.main.max_lines} line(s), ~${hb.main.max_words} words. This is the punch ("THE OFFSHORE LIFE", "EVERY ADVENTURE", "CRISPY OIL"). Keep it BRAND-FOCUSED, not product-specific.`);
+      lines.push(`    Together they must read as ONE headline: lead + " " + main. Good: lead="WHY ANGLERS TRUST" / main="${(brandName || 'THIS BRAND').toUpperCase()}". Bad: a complete sentence in the lead.`);
+      lines.push(`- Also emit "copy.headline" as the joined "<headline_lead> <headline_main>" string for downstream compatibility.`);
+    } else {
+      lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. Must be BRAND-FOCUSED, not product-specific.`);
+      lines.push(`    Good examples: "Built for the offshore life", "Why anglers trust ${brandName || 'us'}", "Made for every adventure", "${brandName || 'Brand'}: gear that lasts".`);
+      lines.push(`    Bad examples: "The best fishing shirt" (specific product), "Try the AquaTek Pro" (specific SKU), "50% off select items" (offer-specific).`);
+    }
+    if (slotBudgets.eyebrow) {
+      const eb = slotBudgets.eyebrow;
+      lines.push(`- "copy.subheadline" REQUIRED — renders as a centered all-caps phrase between two horizontal hairlines. MAX ${eb.max_chars} characters (the hairlines reserve ~30% of the slot width on each side, so the text stays readable; longer strings collapse the rules). ~${eb.max_words} words. Use punchy three-beat phrasing like "REAL HEAT. REAL FLAVOR. REAL RESULTS." or "CRAFTED. TESTED. LOVED.".`);
+      lines.push(`- "eyebrow" ≤ 3 words (e.g. brand category or audience). "highlight_text" ≤ 5 words.`);
+    } else {
+      lines.push(`- "subheadline" ≤ 15 words, expands the brand promise. "eyebrow" ≤ 3 words (e.g. brand category or audience). "highlight_text" ≤ 5 words.`);
+    }
     lines.push(`- DO NOT emit "short_benefits" or product "badges" — there is no specific product. Use brand-level proof badges instead (e.g. "Trusted by anglers", "Family-owned since 2003", "${brand?.tone?.[0] || 'Premium'} quality").`);
   } else {
-    lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
+    if (useSplitHeadline) {
+      const hb = slotBudgets.headline;
+      lines.push(`- "copy.headline_lead" REQUIRED — the small first clause of a stacked display-script headline. MAX ${hb.lead.max_chars} characters, ${hb.lead.max_lines} line, ~${hb.lead.max_words} words. Renders at HALF the size of headline_main, so it carries a setup phrase ("SAY HELLO TO", "MEET THE", "SOMETHING NEW IS").`);
+      lines.push(`- "copy.headline_main" REQUIRED — the large second clause. MAX ${hb.main.max_chars} characters across ${hb.main.max_lines} line(s), ~${hb.main.max_words} words. The punch ("HOT CRISPY OIL", "COMING IN HOT", "THE NEW ESSENTIAL").`);
+      lines.push(`    Together: lead + " " + main reads as one headline. Bad: full sentence in lead, or a clause that doesn't grammatically chain into main.`);
+      lines.push(`- Also emit "copy.headline" as the joined "<headline_lead> <headline_main>" string for downstream compatibility.`);
+    } else {
+      lines.push(`- "copy.headline" REQUIRED, ≤ 8 words.`);
+    }
+    if (slotBudgets.eyebrow) {
+      const eb = slotBudgets.eyebrow;
+      lines.push(`- "copy.subheadline" REQUIRED — renders as a centered all-caps phrase between two horizontal hairlines. MAX ${eb.max_chars} characters (the hairlines reserve ~30% of the slot width on each side; longer strings collapse the rules). ~${eb.max_words} words. Three-beat phrasing reads best: "REAL HEAT. REAL FLAVOR. REAL RESULTS.".`);
+      lines.push(`- "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
+    } else {
+      lines.push(`- "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
+    }
     lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
     lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
   }
@@ -497,6 +551,16 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   lines.push(`- "theme_style" / "background_style" / "emphasis" pick values best suited to the template and signal.`);
   lines.push(`Goal: the output must FILL the template's visible zones. If a template needs multiple quotes / badges / benefits and you have enough source material, produce them. Do not invent specific reviewer names, retailer names, or pricing that aren't grounded in the data.`);
   return lines.join('\n');
+}
+
+// Join headline_lead + headline_main into a single string for slot
+// bindings that read copy.headline directly. Trims and collapses
+// whitespace so an empty lead doesn't leave a leading space.
+function joinHeadlineParts(lead, main) {
+  const a = (lead || '').trim();
+  const b = (main || '').trim();
+  if (!a && !b) return undefined;
+  return [a, b].filter(Boolean).join(' ');
 }
 
 function templateIntent(template) {
@@ -765,7 +829,15 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
     }),
 
     copy: stripEmpty({
-      headline:       derivation.copy?.headline,
+      // headline_lead / headline_main are the slot-aware split fields the
+      // derivation prompt asks the LLM to write to when the canvas variant
+      // uses display_script. headline is the joined fallback — when the
+      // LLM emitted lead+main but no joined string, synthesize it so
+      // existing slot bindings on `copy.headline` keep resolving.
+      headline_lead:  derivation.copy?.headline_lead,
+      headline_main:  derivation.copy?.headline_main,
+      headline:       derivation.copy?.headline
+                       || joinHeadlineParts(derivation.copy?.headline_lead, derivation.copy?.headline_main),
       // Subheadline + eyebrow fallbacks: many landscape templates
       // bind these directly (eyebrow_rules zone, section_header zone)
       // and the derivation LLM doesn't always produce them. When empty,
