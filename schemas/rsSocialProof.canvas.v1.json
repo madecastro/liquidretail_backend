@@ -253,7 +253,7 @@
         "4:5": {
           "template_id": "testimonial_spotlight",
           "aspect_ratio": "4:5",
-          "_layout_note": "Portrait stacked split-panel: 4:5-source image on TOP (full-width 1000×625), dark content panel on BOTTOM (1000×625). Same design language as landscape — display_script headline + eyebrow_rules + with_verified_buyers proof_bar + with_author_photo quote_card + section_header + body_description + callouts badge_row + cta — laid out wider but shorter than 16:9.",
+          "_layout_note": "Portrait stacked split-panel: 4:5-source image on TOP (full-width 1000×625), dark content panel BOTTOM (1000×625). Headline + eyebrow_rules span full panel width; below the eyebrow the panel splits into a 60/40 two-column layout — LEFT (proof_bar / quote_card) testimonial column, RIGHT (badge_row top, cta pinned bottom) proof-and-action column. Mirrors 9:16's two-column structure.",
           "zone_scalers": {
             "headline": 2,
             "proof_bar": 1.5,
@@ -282,19 +282,19 @@
               "x": 60,
               "y": 665,
               "w": 880,
-              "h": 220
+              "h": 172
             },
             "text_secondary": {
               "x": 60,
-              "y": 890,
-              "w": 880,
-              "h": 240
+              "y": 847,
+              "w": 528,
+              "h": 363
             },
             "cta_safe": {
-              "x": 60,
+              "x": 622,
               "y": 1170,
-              "w": 880,
-              "h": 80
+              "w": 300,
+              "h": 40
             },
             "logo_safe": {
               "x": 60,
@@ -376,12 +376,13 @@
               "rect": {
                 "x": 60,
                 "y": 847,
-                "w": 880,
+                "w": 528,
                 "h": 32
               },
               "layer": "proof",
               "radius": 999,
-              "style_variant": "with_verified_buyers"
+              "style_variant": "with_verified_buyers",
+              "column": "left"
             },
             {
               "id": "quote_card",
@@ -389,42 +390,45 @@
               "slot": "social_proof.primary_quote",
               "rect": {
                 "x": 60,
-                "y": 891,
-                "w": 880,
-                "h": 215
+                "y": 893,
+                "w": 528,
+                "h": 317
               },
               "layer": "proof",
               "radius": 8,
-              "padding": 14,
-              "max_lines": 5,
-              "style_variant": "with_author_photo"
+              "padding": 16,
+              "max_lines": 8,
+              "style_variant": "with_author_photo",
+              "column": "left"
             },
             {
               "id": "badge_row",
               "kind": "badge_row",
               "slot": "product.badges",
               "rect": {
-                "x": 60,
-                "y": 1122,
-                "w": 880,
+                "x": 604,
+                "y": 847,
+                "w": 336,
                 "h": 24
               },
               "layer": "proof",
               "style_variant": "callouts",
-              "max_items": 4
+              "max_items": 4,
+              "column": "right"
             },
             {
               "id": "cta",
               "kind": "cta",
               "slot": "cta",
               "rect": {
-                "x": 60,
+                "x": 622,
                 "y": 1170,
-                "w": 320,
+                "w": 300,
                 "h": 40
               },
               "layer": "cta",
-              "radius": 999
+              "radius": 999,
+              "column": "right"
             },
             {
               "id": "logo",
@@ -1315,7 +1319,7 @@
         "4:5": {
           "template_id": "ugc_split_screen",
           "aspect_ratio": "4:5",
-          "_layout_note": "Portrait stacked split-panel: 4:5-source image on TOP (full-width 1000×625), dark content panel on BOTTOM (1000×625). Mirrors testimonial_spotlight 4:5 with section_header + product_meta replacing the quote_card slot.",
+          "_layout_note": "Portrait stacked split-panel: 4:5-source image on TOP (full-width 1000×625), dark content panel BOTTOM (1000×625). Headline + eyebrow_rules span full panel width; below the eyebrow the panel splits into a 60/40 two-column layout — LEFT (proof_bar / section_header / product_meta) description column, RIGHT (badge_row top, cta pinned bottom) proof-and-action column. Mirrors 9:16's two-column structure.",
           "zone_scalers": {
             "headline": 2,
             "proof_bar": 1.5,
@@ -1341,19 +1345,19 @@
               "x": 60,
               "y": 665,
               "w": 880,
-              "h": 220
+              "h": 172
             },
             "text_secondary": {
               "x": 60,
-              "y": 890,
-              "w": 880,
-              "h": 240
+              "y": 847,
+              "w": 528,
+              "h": 363
             },
             "cta_safe": {
-              "x": 60,
+              "x": 622,
               "y": 1170,
-              "w": 880,
-              "h": 80
+              "w": 300,
+              "h": 40
             },
             "logo_safe": {
               "x": 60,
@@ -1435,12 +1439,13 @@
               "rect": {
                 "x": 60,
                 "y": 847,
-                "w": 880,
+                "w": 528,
                 "h": 32
               },
               "layer": "proof",
               "radius": 999,
-              "style_variant": "with_verified_buyers"
+              "style_variant": "with_verified_buyers",
+              "column": "left"
             },
             {
               "id": "section_header",
@@ -1452,13 +1457,14 @@
               ],
               "rect": {
                 "x": 60,
-                "y": 891,
-                "w": 880,
-                "h": 12
+                "y": 893,
+                "w": 528,
+                "h": 14
               },
               "layer": "copy",
               "style_variant": "section_header",
-              "max_lines": 1
+              "max_lines": 1,
+              "column": "left"
             },
             {
               "id": "product_meta",
@@ -1470,40 +1476,43 @@
               ],
               "rect": {
                 "x": 60,
-                "y": 907,
-                "w": 880,
-                "h": 199
+                "y": 911,
+                "w": 528,
+                "h": 299
               },
               "layer": "copy",
               "style_variant": "body_description",
-              "max_lines": 10
+              "max_lines": 14,
+              "column": "left"
             },
             {
               "id": "badge_row",
               "kind": "badge_row",
               "slot": "product.badges",
               "rect": {
-                "x": 60,
-                "y": 1122,
-                "w": 880,
+                "x": 604,
+                "y": 847,
+                "w": 336,
                 "h": 24
               },
               "layer": "proof",
               "style_variant": "callouts",
-              "max_items": 4
+              "max_items": 4,
+              "column": "right"
             },
             {
               "id": "cta",
               "kind": "cta",
               "slot": "cta",
               "rect": {
-                "x": 60,
+                "x": 622,
                 "y": 1170,
-                "w": 320,
+                "w": 300,
                 "h": 40
               },
               "layer": "cta",
-              "radius": 999
+              "radius": 999,
+              "column": "right"
             },
             {
               "id": "logo",
