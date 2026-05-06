@@ -51,7 +51,7 @@
           "aspect_ratio": "1:1",
           "_layout_note": "Square split-panel: 4:5-source image LEFT (full-height half), dark content panel RIGHT. Mirrors the landscape design language (display_script headline + eyebrow_rules + with_verified_buyers proof_bar + with_author_photo quote_card + section_header + body_description + callouts badge_row + cta).",
           "zone_scalers": {
-            "proof_bar": 1.5,
+            "proof_bar": 1.25,
             "eyebrow_rules": 2,
             "badge_row": 2
           },
