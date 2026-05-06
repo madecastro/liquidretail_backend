@@ -66,7 +66,38 @@ function listTemplates() {
 
 function getCatalog(id)            { return CATALOG_BY_ID[id] || null; }
 function getNormalized(id)         { return NORMALIZED_BY_ID[id] || null; }
-function getCanvas(id, aspectRatio){ return CANVAS.templates?.[id]?.variants?.[aspectRatio] || null; }
+function getCanvas(id, aspectRatio) {
+  const variant = CANVAS.templates?.[id]?.variants?.[aspectRatio];
+  if (!variant) return null;
+  // Merge per-template truncation_rules into per-zone max_lines /
+  // max_chars so the renderer reads ONE authoritative value. Template
+  // truncation_rules win when present (editorial intent); the canvas
+  // zone's own max_lines is the geometric fallback. Without this,
+  // headline_max_lines: 3 in the template silently lost to
+  // zone.max_lines: 2 from the canvas spec.
+  const tr = NORMALIZED_BY_ID[id]?.truncation_rules || {};
+  const zones = (variant.zones || []).map(z => {
+    const override = pickTruncationOverride(z, tr);
+    if (override.max_lines == null && override.max_chars == null) return z;
+    return { ...z, ...override };
+  });
+  return { ...variant, zones };
+}
+
+// Map a zone's id+kind to the matching truncation_rules entry.
+// truncation_rules names don't 1:1 match zone ids (zone 'product_meta'
+// reads 'product_name_max_lines'; any zone whose id mentions 'quote'
+// reads 'quote_max_lines'), so the mapping is explicit.
+function pickTruncationOverride(zone, tr) {
+  const out = {};
+  const zid = zone.id || '';
+  if (zid === 'headline'     && tr.headline_max_lines)      out.max_lines = tr.headline_max_lines;
+  if (zid === 'subheadline'  && tr.subheadline_max_lines)   out.max_lines = tr.subheadline_max_lines;
+  if (zid === 'product_meta' && tr.product_name_max_lines)  out.max_lines = tr.product_name_max_lines;
+  if (/quote/.test(zid)      && tr.quote_max_lines)         out.max_lines = tr.quote_max_lines;
+  if (zid === 'cta'          && tr.cta_max_chars)           out.max_chars = tr.cta_max_chars;
+  return out;
+}
 function getCanvasMaster(id)       { return CANVAS.templates?.[id]?.master || null; }
 function getGlobalCanvasRules()    { return CANVAS.global_canvas_rules || {}; }
 function getSupportedAspectRatios(id) {
