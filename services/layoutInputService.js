@@ -121,7 +121,10 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // longer has section_header / product_meta. Hero source crop now
 // 4:5 for both templates (was just testimonial_spotlight). Cached
 // docs re-derive against the new validation + slot bindings.
-const INPUT_SCHEMA_VERSION = '3.3';
+// 3.4 dials VIBRANT_MIN_SATURATION 0.30 → 0.40 so more borderline
+// palettes (tan/beige product photography, low-saturation lifestyle
+// shots) fall through to the white-headline default.
+const INPUT_SCHEMA_VERSION = '3.4';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -1244,7 +1247,7 @@ function mediaPair(p) {
 // is effectively monochromatic (every entry sits on the same color
 // family at different shades) and picking any one as the accent
 // renders too close to palette_dominant for headline contrast.
-const VIBRANT_MIN_SATURATION = 0.30;
+const VIBRANT_MIN_SATURATION = 0.40;
 
 // Minimum WCAG contrast ratio between the vibrant pick and the
 // palette's dominant tone (which the panel background is bound to in
