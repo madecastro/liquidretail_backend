@@ -179,6 +179,13 @@ const FRONTEND_URL       = process.env.FRONTEND_URL       || 'http://localhost:5
 const RENDER_AUTH_TOKEN  = process.env.RENDER_AUTH_TOKEN  || null;
 const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '20000', 10);
 
+console.log(
+  `🎬 renderService config — ` +
+  `FRONTEND_URL=${FRONTEND_URL} ` +
+  `RENDER_AUTH_TOKEN=${RENDER_AUTH_TOKEN ? `set(${RENDER_AUTH_TOKEN.length} chars)` : 'MISSING'} ` +
+  `RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS}`
+);
+
 async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
