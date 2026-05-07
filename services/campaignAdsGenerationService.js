@@ -5,7 +5,7 @@
 //
 // Decision rules (mirrors the design ratified with the operator):
 //
-//   1. Branding campaign (campaign.kind === 'branding'):
+//   1. Branding campaign (campaign.kind === 'brand'):
 //      → all creatives use brand_match media for brandId.
 //      → productId on each creative is null.
 //      → operator-picked products/media on the wizard payload are
@@ -74,8 +74,12 @@ async function expandWizardJob({
   if (!campaign) throw new Error(`Campaign not found: ${campaignId}`);
 
   const brandId      = String(campaign.brandId);
+  // campaign.kind enum is ['product','collection','brand', null]; null
+  // legacy rows are treated as promotional. The Ad doc's campaignKind
+  // field stores whatever string we pass through here so it stays
+  // queryable.
   const campaignKind = campaign.kind || 'promotional';
-  const isBranding   = campaignKind === 'branding';
+  const isBranding   = campaignKind === 'brand';
   const allowedTemplates = templateIds.filter(t => SUPPORTED_TEMPLATES.has(t));
 
   if (!allowedTemplates.length) {

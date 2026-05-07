@@ -62,11 +62,29 @@ const campaignSchema = new mongoose.Schema({
   brandId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',      required: true, index: true },
   // Which IntegrationCredential this campaign was pulled through.
   // Lets sync re-resolve the right token without re-querying every
-  // active credential per platform.
-  credentialId:  { type: mongoose.Schema.Types.ObjectId, ref: 'IntegrationCredential', required: true, index: true },
+  // active credential per platform. Not required for reach-social
+  // campaigns — those originate in our app, no external credential.
+  credentialId:  {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'IntegrationCredential',
+    required: function() { return this.platform !== 'reach-social'; },
+    index: true
+  },
 
-  platform:      { type: String, enum: ['meta-ads', 'google-ads'], required: true, index: true },
-  externalId:    { type: String, required: true },
+  // 'reach-social' = campaign created inside our app via the quick
+  // campaign builder. No external sync; treated as the source of
+  // truth for its name/kind/products. Phase 2 may add an opt-in
+  // "publish to Meta/Google" path that mirrors this row to the
+  // platform side and switches credentialId on.
+  platform:      { type: String, enum: ['meta-ads', 'google-ads', 'reach-social'], required: true, index: true },
+  // For platform-synced campaigns this is the platform's id. For
+  // reach-social campaigns we synthesize one at create time
+  // (`rs_<ObjectId>`) so the (brandId, platform, externalId) unique
+  // index still has a value to enforce.
+  externalId:    {
+    type: String,
+    required: function() { return this.platform !== 'reach-social'; }
+  },
 
   name:          { type: String, required: true },
   status:        String,
@@ -140,7 +158,10 @@ const campaignSchema = new mongoose.Schema({
   //                  (URL match, product-set expansion, or text match)
   //   'collection' — only collection / category-level URLs resolved
   //                  (e.g. /collections/summer-sale → all SKUs in that
-  //                  collection)
+  //                  collection). Only set by platform sync today; the
+  //                  in-app quick builder doesn't expose 'collection'
+  //                  yet (re-introduce when we ship Shopify-style
+  //                  collection imports).
   //   'brand'      — no SKU/collection resolution AND objective is
   //                  awareness / traffic / video views — operator
   //                  picks products manually from the full catalog

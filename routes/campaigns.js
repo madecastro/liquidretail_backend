@@ -1,9 +1,15 @@
-// Campaign read API for the Campaigns page + Generate Ads wizard.
+// Campaign read + quick-create API for the Campaigns page + Generate
+// Ads wizard.
 //
-// Source of truth is the Campaign collection (synced via
-// campaignSyncService.syncCampaigns from the platform adapters).
-// These routes are read-only — sync is triggered separately via
-// /api/integrations/{meta-ads,google-ads}/sync-campaigns.
+// Synced campaigns (platform = meta-ads | google-ads) are populated
+// by campaignSyncService.syncCampaigns from the platform adapters —
+// sync is triggered separately via /api/integrations/{meta-ads,
+// google-ads}/sync-campaigns.
+//
+// Quick-create campaigns (platform = reach-social) originate inside
+// the app via the New Campaign modal on the Campaigns page. They
+// carry a synthetic externalId derived from the doc's _id and have
+// no IntegrationCredential — the app itself is the source of truth.
 
 const express = require('express');
 const router = express.Router();
@@ -174,6 +180,77 @@ router.get('/:id/products', async (req, res) => {
   } catch (err) {
     console.error('campaign products fetch failed:', err);
     res.status(500).json({ error: err.message || 'campaign products fetch failed' });
+  }
+});
+
+// POST /api/campaigns
+// Body: { name, kind: 'brand'|'product', productIds?: string[] }
+// Quick campaign builder — creates a reach-social platform Campaign
+// scoped to the requesting brand. Returns the new campaign's id so
+// the caller can redirect into /generate-ads?campaignId=X.
+router.post('/', express.json(), async (req, res) => {
+  try {
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId)        return res.status(400).json({ error: 'brandId required' });
+    if (!req.advertiserId) return res.status(400).json({ error: 'advertiser context missing' });
+
+    const { name, kind, productIds = [] } = req.body || {};
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'name required' });
+    }
+    if (!['brand', 'product'].includes(kind)) {
+      return res.status(400).json({ error: "kind must be 'brand' or 'product'" });
+    }
+    if (!Array.isArray(productIds)) {
+      return res.status(400).json({ error: 'productIds must be an array' });
+    }
+
+    // Tenant assertion on every passed productId — drop any that
+    // don't belong to the requesting brand rather than 400-ing the
+    // whole request, so a stale picker doesn't block creation.
+    const validProducts = productIds.length === 0
+      ? []
+      : await CatalogProduct.find({
+          _id: { $in: productIds },
+          brandId
+        }).select('_id').lean();
+    const validProductIds = validProducts.map(p => p._id);
+
+    // Pre-allocate _id so we can stamp externalId in the same insert.
+    const _id = new (require('mongoose')).Types.ObjectId();
+    const externalId = `rs_${_id.toString()}`;
+
+    const campaign = await Campaign.create({
+      _id,
+      advertiserId: req.advertiserId,
+      brandId,
+      platform:    'reach-social',
+      externalId,
+      name:        String(name).trim(),
+      kind,
+      status:      'ACTIVE',
+      // matchedProductIds is what the wizard's Step 2 reads to
+      // pre-select. Stamp at create time so re-launching the wizard
+      // later restores the operator's selection.
+      matchedProductIds: validProductIds,
+      adSets:      []
+    });
+
+    res.status(201).json({
+      campaign: {
+        id:                  String(campaign._id),
+        platform:            campaign.platform,
+        externalId:          campaign.externalId,
+        name:                campaign.name,
+        kind:                campaign.kind,
+        status:              campaign.status,
+        matchedProductCount: validProductIds.length,
+        productSetIds:       []
+      }
+    });
+  } catch (err) {
+    console.error('campaign create failed:', err);
+    res.status(500).json({ error: err.message || 'campaign create failed' });
   }
 });
 

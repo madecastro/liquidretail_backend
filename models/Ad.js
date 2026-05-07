@@ -36,7 +36,7 @@ const adSchema = new mongoose.Schema({
   template:       { type: String, required: true, index: true },
   aspectRatio:    { type: String, required: true },
   mediaSource:    { type: String, enum: ['product_match', 'product_category', 'brand_match'], required: true },
-  campaignKind:   { type: String },                     // 'branding' | 'promotional' | other custom kind
+  campaignKind:   { type: String },                     // 'brand' | 'promotional' | 'product' | 'collection' (mirrors campaign.kind, null treated as 'promotional')
 
   // ── Render output ────────────────────────────────────────────────
   kind:               { type: String, enum: ['image', 'video'], default: 'image' },  // V1 always 'image'
