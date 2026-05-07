@@ -164,15 +164,7 @@ async function renderOne(run, job, creative, index) {
         { _id: run._id },
         {
           $inc: { failed: 1 },
-          $push: { errors: {
-            index,
-            stage:       result.stage  || 'unknown',
-            template:    creative.template,
-            aspectRatio: creative.aspectRatio,
-            mediaId:     creative.mediaId   ? String(creative.mediaId)   : null,
-            productId:   creative.productId ? String(creative.productId) : null,
-            message:     result.error || 'unknown'
-          } }
+          $push: { errors: buildErrorEntry(creative, index, result.stage, result.error) }
         }
       );
     }
@@ -181,18 +173,38 @@ async function renderOne(run, job, creative, index) {
       { _id: run._id },
       {
         $inc: { failed: 1 },
-        $push: { errors: {
-          index,
-          stage:       'crash',
-          template:    creative.template,
-          aspectRatio: creative.aspectRatio,
-          mediaId:     creative.mediaId   ? String(creative.mediaId)   : null,
-          productId:   creative.productId ? String(creative.productId) : null,
-          message:     err.message || String(err)
-        } }
+        $push: { errors: buildErrorEntry(creative, index, 'crash', err) }
       }
     );
   }
+}
+
+// Normalize an error (string | Error | {stage, message, retryable}) into a
+// flat row that fits CampaignRun.errors[]. The renderService surfaces
+// per-stage errors as objects, so we have to extract .message rather
+// than letting Mongoose stringify the whole object (which fails the
+// String cast on errors[].message).
+function buildErrorEntry(creative, index, stageHint, errLike) {
+  const errStage = (errLike && typeof errLike === 'object' && errLike.stage)
+    ? errLike.stage
+    : (stageHint || 'unknown');
+  let message;
+  if (errLike instanceof Error) {
+    message = errLike.message || String(errLike);
+  } else if (errLike && typeof errLike === 'object') {
+    message = errLike.message || JSON.stringify(errLike);
+  } else {
+    message = errLike ? String(errLike) : 'unknown';
+  }
+  return {
+    index,
+    stage:       errStage,
+    template:    creative.template,
+    aspectRatio: creative.aspectRatio,
+    mediaId:     creative.mediaId   ? String(creative.mediaId)   : null,
+    productId:   creative.productId ? String(creative.productId) : null,
+    message
+  };
 }
 
 // GET /api/ads/runs/:runId — poll endpoint for the progress UI.
