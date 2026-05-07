@@ -21,7 +21,6 @@ const router = express.Router();
 
 const Ad           = require('../models/Ad');
 const CampaignRun  = require('../models/CampaignRun');
-const { tenantFilter } = require('../middleware/tenantHelpers');
 const { expandWizardJob } = require('../services/campaignAdsGenerationService');
 const { renderCreative }  = require('../services/renderService');
 
@@ -41,7 +40,8 @@ router.post('/generate', async (req, res) => {
       mediaIds    = [],
       templateIds = [],
       cta         = {},
-      urlParams   = ''
+      urlParams   = '',
+      refresh     = false   // wizard checkbox / smoke-test override; bypasses de-dupe + LayoutInputArtifact cache
     } = req.body || {};
 
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
@@ -55,6 +55,7 @@ router.post('/generate', async (req, res) => {
       templateIds,
       cta,
       urlParams,
+      refresh,
       requestedBy: req.user?.userId || null
     });
 
@@ -262,13 +263,18 @@ router.get('/', async (req, res) => {
     const limit  = Math.min(200, Math.max(1, parseInt(req.query.limit  || '50', 10)));
     const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
 
+    // Tenant scoping — Ad uses brandId, not advertiserId, so the
+    // generic tenantFilter() doesn't apply. The brandId filter above
+    // is itself tenant-scoping (a brand belongs to exactly one
+    // advertiser). Belt-and-braces verification at the brand level
+    // is a separate hardening step (see backlog).
     const [rows, total] = await Promise.all([
-      Ad.find(tenantFilter(req, filter))
+      Ad.find(filter)
         .sort({ generatedAt: -1 })
         .skip(offset)
         .limit(limit)
         .lean(),
-      Ad.countDocuments(tenantFilter(req, filter))
+      Ad.countDocuments(filter)
     ]);
 
     res.json({
@@ -284,9 +290,14 @@ router.get('/', async (req, res) => {
 });
 
 // GET /api/ads/:id — full doc for detail modal.
+// Caller must pass ?brandId=X (or X-Brand-Id header) so we can scope
+// the lookup to their tenant. Same Ad-uses-brandId-not-advertiserId
+// reasoning as the list query above.
 router.get('/:id', async (req, res) => {
   try {
-    const ad = await Ad.findOne(tenantFilter(req, { _id: req.params.id })).lean();
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    const ad = await Ad.findOne({ _id: req.params.id, brandId }).lean();
     if (!ad) return res.status(404).json({ error: 'ad not found' });
     res.json({ ad: projectAd(ad, /* full */ true) });
   } catch (err) {

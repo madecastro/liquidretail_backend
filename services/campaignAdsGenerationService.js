@@ -65,7 +65,8 @@ async function expandWizardJob({
   templateIds  = [],
   cta          = {},
   urlParams    = '',
-  requestedBy  = null
+  requestedBy  = null,
+  refresh      = false   // bypass de-dupe + LayoutInputArtifact cache when true
 }) {
   if (!campaignId) throw new Error('campaignId required');
 
@@ -142,7 +143,7 @@ async function expandWizardJob({
     creatives,
     options: {
       skipValidationFailures: true,
-      refresh:                false,
+      refresh:                !!refresh,
       topMediaPerProduct:     DEFAULT_TOP_MEDIA_PER_PRODUCT
     }
   };
