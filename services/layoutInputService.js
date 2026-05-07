@@ -129,7 +129,18 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // testimonial_spotlight + ugc_split_screen to drop palette_accent —
 // it's dominance-ranked palette[1] and can be a near-white off-tone
 // that washes out the white CTA text.
-const INPUT_SCHEMA_VERSION = '3.5';
+// 3.6 drops the 4:5 hero-source override on testimonial_spotlight +
+// ugc_split_screen — pickHeroMedia now uses the canvas ratio's own
+// crop (with the existing closest-match fallback for 16:9). Cached
+// 3.5 docs re-derive so support_media URLs swap to the per-ratio
+// crop winner.
+// 3.7 picks the hero source by MEDIA SLOT ratio, not canvas ratio.
+// For split-panel layouts the slot is half-canvas (1:1 canvas →
+// 1:2 slot) so the canvas-matched crop forces a heavy second crop.
+// pickHeroSourceRatio finds the closest of {5:4, 1:1, 4:5, 9:16,
+// 1.91:1} to the slot's actual w/h. Net effect: 1:1 → 9:16 source,
+// 4:5 → 1.91:1, 9:16 → 1:1, 16:9 + 1.91:1 → 4:5.
+const INPUT_SCHEMA_VERSION = '3.7';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -666,16 +677,17 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   const details = ident.details || {};
   const palette = detection?.background?.palette || [];
 
-  // testimonial_spotlight + ugc_split_screen share the image-led
-  // split-panel layout and both use the 4:5 source crop for ALL
-  // canvas ratios — Cloudinary's c_fill,g_auto chain subject-aware-
-  // crops the 4:5 source into whatever rect the canvas asks for
-  // (full-bleed in landscape, left half in 1:1, top half in 4:5 /
-  // 9:16). Using the 4:5 source instead of a ratio-matched crop
-  // gives Cloudinary the most pixels to crop from and avoids
-  // double-cropping artifacts.
-  const SPLIT_PANEL_TEMPLATES = new Set(['testimonial_spotlight', 'ugc_split_screen']);
-  const heroSourceRatio = SPLIT_PANEL_TEMPLATES.has(template) ? '4:5' : aspectRatio;
+  // Hero source crop matches the MEDIA SLOT'S ratio (not the canvas
+  // ratio). For split-panel layouts the image slot is half-canvas
+  // (1:1 canvas → 500×1000 → 1:2 slot) which differs significantly
+  // from the canvas ratio — sourcing the canvas-matched crop forces
+  // Cloudinary to do a heavy second crop and lose subject framing.
+  // Picking the closest available source ratio (9:16 for a 1:2 slot)
+  // gives Cloudinary the right framing to start from. Falls back to
+  // canvas ratio when the canvas variant or its media zone can't be
+  // resolved.
+  const canvasVariantForHero = registry.CANVAS.templates?.[template]?.variants?.[aspectRatio] || null;
+  const heroSourceRatio = pickHeroSourceRatio(canvasVariantForHero) || aspectRatio;
   const heroMedia      = pickHeroMedia(ctx, heroSourceRatio);
   const secondaryMedia = pickSecondaryMedia(ctx, aspectRatio);
   const creatorMedia   = pickCreatorMedia(ctx);
@@ -1106,6 +1118,36 @@ function pickOverlayBackground(ctx, aspectRatio) {
 //
 // For extended ratios (9:16, 1.91:1) we still use the AI-extended Gemini
 // winner because those are purpose-built hero assets.
+// Available source crop ratios. Order matters only on ties (first
+// wins for equidistant matches). Base ratios come from CropArtifact
+// smart-crops; 9:16 + 1.91:1 come from ExtendedCropArtifact.
+const HERO_SOURCE_OPTIONS = [
+  { name: '5:4',    value: 5/4 },
+  { name: '1:1',    value: 1 },
+  { name: '4:5',    value: 4/5 },
+  { name: '9:16',   value: 9/16 },
+  { name: '1.91:1', value: 1.91 }
+];
+
+// Find the available hero source crop whose ratio is closest to the
+// media slot's rect ratio in this canvas variant. Returns null if
+// the variant doesn't have a media zone bound to product.hero_media.
+function pickHeroSourceRatio(canvasVariant) {
+  if (!canvasVariant || !Array.isArray(canvasVariant.zones)) return null;
+  const media = canvasVariant.zones.find(z =>
+    z.kind === 'media' && z.slot === 'product.hero_media');
+  if (!media || !media.rect) return null;
+  const slotW = media.rect.w, slotH = media.rect.h;
+  if (!slotW || !slotH) return null;
+  const target = slotW / slotH;
+  let best = null, bestDiff = Infinity;
+  for (const opt of HERO_SOURCE_OPTIONS) {
+    const d = Math.abs(opt.value - target);
+    if (d < bestDiff) { bestDiff = d; best = opt.name; }
+  }
+  return best;
+}
+
 function pickHeroMedia(ctx, aspectRatio) {
   const { media, detection, crops, extended } = ctx;
   const out = { image: null, video: null };
