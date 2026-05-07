@@ -175,7 +175,14 @@ async function deriveStage(req) {
 // to the Netlify URL) without code changes. PUPPETEER_EXECUTABLE_PATH
 // + headless flags also driven by env so a custom Chromium binary
 // can be slotted in (Render free tier doesn't have Chrome OOTB).
-const FRONTEND_URL       = process.env.FRONTEND_URL       || 'http://localhost:5173';
+// Resolution order: FRONTEND_URL → first entry of FRONTEND_URLS →
+// localhost dev fallback. The plural var is the canonical OAuth
+// allowlist (frontendOriginValidator), so deployments that only set
+// FRONTEND_URLS still get the renderer pointed at the legacy site
+// (which publishes ads.html) without an extra env var.
+const FRONTEND_URL = process.env.FRONTEND_URL
+  || (process.env.FRONTEND_URLS || '').split(',').map(s => s.trim()).filter(Boolean)[0]
+  || 'http://localhost:5173';
 const RENDER_AUTH_TOKEN  = process.env.RENDER_AUTH_TOKEN  || null;
 const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '20000', 10);
 
