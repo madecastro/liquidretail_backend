@@ -17,10 +17,13 @@ function _uniqueId() {
 function uploadBufferToCloudinary(buffer, opts = {}) {
   return new Promise((resolve, reject) => {
     const uploadOpts = {
-      folder: 'liquidretail',
+      folder: opts.folder || 'liquidretail',
       public_id: _uniqueId(),
       unique_filename: false,
-      overwrite: false,
+      // overwrite=true so re-renders of the same (campaignId, derivationDigest)
+      // can replace the existing asset without orphaning. Caller-side de-dupe
+      // (in renderService) usually short-circuits before we get here.
+      overwrite: opts.overwrite ?? false,
       resource_type: opts.resourceType || 'image',
       ...(opts.publicId ? { public_id: opts.publicId } : {})
     };

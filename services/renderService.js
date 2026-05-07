@@ -34,6 +34,7 @@ const CatalogProduct        = require('../models/CatalogProduct');
 const LayoutInputArtifact   = require('../models/LayoutInputArtifact');
 const registry              = require('./templateRegistry');
 const { buildLayoutInput }  = require('./layoutInputService');
+const { uploadBufferToCloudinary } = require('./cloudinaryService');
 
 // ── Tunables ─────────────────────────────────────────────────────────
 
@@ -102,11 +103,12 @@ async function renderCreative(req) {
   let upload;
   try {
     upload = await uploadStage(renderOutput, {
-      brandId:    req.brandId,
-      campaignId: req.campaignId,
-      mediaId:    req.creative.mediaId,
-      template:   req.creative.template,
-      aspectRatio: req.creative.aspectRatio
+      brandId:          req.brandId,
+      campaignId:       req.campaignId,
+      mediaId:          req.creative.mediaId,
+      template:         req.creative.template,
+      aspectRatio:      req.creative.aspectRatio,
+      derivationDigest
     });
   } catch (err) {
     return failed(jobId, 'upload', err);
@@ -238,22 +240,34 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
   }
 }
 
-// PHASE-1A STUB. Real implementation: cloudinary.uploader.upload_stream
-// with options { folder, public_id, resource_type, overwrite: true }.
-// Public ID format keeps duplicates trivially diff-able.
+// Upload the rendered PNG buffer to Cloudinary. Folder per
+// (brand, campaign) so the ads page can prefix-list / soft-delete
+// per campaign. Public ID is deterministic on inputs + a short
+// derivation hash so re-renders of the same combo overwrite the
+// previous asset rather than orphaning it. The caller (renderService)
+// already short-circuits identical renders via derivationDigest so
+// in normal operation each call here uploads exactly once.
 async function uploadStage(renderOutput, ctx) {
   const folder = `ads/${ctx.brandId}/${ctx.campaignId}`;
   const shortMedia = String(ctx.mediaId).slice(-8);
-  const publicId = `${ctx.aspectRatio.replace(/[:.]/g, '_')}-${ctx.template}-${shortMedia}`;
-  const fakeUrl = `https://res.cloudinary.com/PLACEHOLDER/image/upload/${folder}/${publicId}.png`;
+  const shortDigest = (ctx.derivationDigest || '').slice(0, 8) || crypto.randomBytes(4).toString('hex');
+  const publicId = `${ctx.aspectRatio.replace(/[:.]/g, '_')}-${ctx.template}-${shortMedia}-${shortDigest}`;
+
+  const result = await uploadBufferToCloudinary(renderOutput.buffer, {
+    folder,
+    publicId,
+    resourceType: 'image',
+    overwrite:    true
+  });
+
   return {
-    cloudinaryPublicId: `${folder}/${publicId}`,
-    renderUrl: fakeUrl,
-    posterUrl: null,
-    bytes:     renderOutput.bytes,
-    width:     renderOutput.width,
-    height:    renderOutput.height,
-    durationMs: null
+    cloudinaryPublicId: result.public_id,
+    renderUrl:          result.secure_url || result.url,
+    posterUrl:          null,
+    bytes:              result.bytes  || renderOutput.bytes,
+    width:              result.width  || renderOutput.width,
+    height:             result.height || renderOutput.height,
+    durationMs:         null
   };
 }
 
