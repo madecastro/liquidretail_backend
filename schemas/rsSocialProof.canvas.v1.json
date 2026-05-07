@@ -190,7 +190,8 @@
               "radius": 8,
               "padding": 16,
               "max_lines": 6,
-              "style_variant": "with_author_photo"
+              "style_variant": "with_author_photo",
+              "min_h_fraction": 0.75
             },
             {
               "id": "badge_row",
