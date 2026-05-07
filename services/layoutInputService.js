@@ -146,7 +146,13 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // OVERLAY_MODE_TEMPLATES. Both have white-default headline,
 // brand font_family_headline, dark-gray chip bg behind headline +
 // quote text.
-const INPUT_SCHEMA_VERSION = '3.8';
+// 3.9 fixes the placement engine ignoring the normalized template's
+// element_priority_order — placeOverlays now accepts an elementIds
+// filter, threaded through from layoutInputService. Without this
+// the hardcoded element specs in overlayPlacementService place
+// EVERY element regardless of template (testimonial_overlay was
+// still placing product_meta).
+const INPUT_SCHEMA_VERSION = '3.9';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -977,7 +983,7 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   // / preview decide what to do.
   if (OVERLAY_MODE_TEMPLATES.has(template)) {
     try {
-      const placement = computeOverlayPlacement(ctx, aspectRatio, options, input);
+      const placement = computeOverlayPlacement(ctx, aspectRatio, options, input, template);
       if (placement) input.placement = placement;
     } catch (err) {
       console.warn(`   ⚠️  overlay placement failed for ${template} ${aspectRatio}: ${err.message}`);
@@ -991,7 +997,7 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
 // placement algorithm against its overlay-zone analysis. Returns the
 // `placement` block to attach to the input, or null if no analyzed image
 // is available for this aspect ratio.
-function computeOverlayPlacement(ctx, aspectRatio, options, content) {
+function computeOverlayPlacement(ctx, aspectRatio, options, content, template) {
   // Pick the analyzed image for this ratio. If none is available (e.g.
   // detect didn't run overlay zones for this ratio, or Gemini failed for
   // this variant), fall back to the media source — placement will run
@@ -1011,12 +1017,22 @@ function computeOverlayPlacement(ctx, aspectRatio, options, content) {
   const canvasW = canvasSpec?.canvas?.width  || 1000;
   const canvasH = canvasSpec?.canvas?.height || 1000;
 
+  // Per-template element filter — the placement engine's hardcoded
+  // spec list includes every possible overlay element, but each
+  // template's normalized.element_priority_order narrows what should
+  // actually be attempted. Without this filter, testimonial_overlay
+  // (logo + headline + quote + cta) would still place product_meta.
+  const tplNormalized = registry.getNormalized(template);
+  const elementIds = (tplNormalized?.placement_policy?.element_priority_order || [])
+    .map(e => e.id);
+
   const result = placeOverlays({
     canvasW, canvasH,
     aspectRatio,
     analysis:     overlayPick.analysis,  // may be null — placement handles it
     conservation,
     content,
+    elementIds:   elementIds.length ? elementIds : undefined,
     brandColors:  {
       primary:   content?.brand?.primary_color   || null,
       secondary: content?.brand?.secondary_color || null,

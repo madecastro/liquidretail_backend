@@ -45,10 +45,21 @@ const DENSITY_EMPTY_THRESHOLD  = 0.20;
 
 // ── Placement entry point ────────────────────────────────────────────────
 
-function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, conservation = 0.5, content, brandColors, aspectRatio }) {
+function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, conservation = 0.5, content, brandColors, aspectRatio, elementIds }) {
   // Build specs for ALL possible elements (including those skipped for
   // missing source data) so the decision trace is complete.
-  const { specs: elements, skipped } = buildElementSpecs(content);
+  let { specs: elements, skipped } = buildElementSpecs(content);
+  // Per-template element filter. When the caller passes elementIds
+  // (from the normalized template's element_priority_order), restrict
+  // both attempted specs and skipped specs to that set. Without this
+  // every overlay template tries to place every hardcoded element
+  // regardless of what the template actually wants — testimonial_overlay
+  // ends up with product_meta even though its element list omits it.
+  if (Array.isArray(elementIds) && elementIds.length) {
+    const allowed = new Set(elementIds);
+    elements = elements.filter(s => allowed.has(s.id));
+    skipped  = skipped.filter(s => allowed.has(s.id));
+  }
   const result = tryPlace({ canvasW, canvasH, analysis, conservation, elements, content, mode: 'overlay', skippedSpecs: skipped });
 
   // Fallback: if any required element failed, retry in inset mode.

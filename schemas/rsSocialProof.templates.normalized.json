@@ -1211,8 +1211,8 @@
         "scrim",
         "logo",
         "headline",
-        "cta",
-        "quote"
+        "quote",
+        "cta"
       ],
       "background_binding": {
         "slot_binding": {
