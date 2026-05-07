@@ -326,6 +326,9 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
         inline:   { width: el.style.width, height: el.style.height, transform: el.style.transform },
         computed: { width: cs.width, height: cs.height, display: cs.display, position: cs.position, transform: cs.transform },
         innerLen: el.innerHTML.length,
+        innerHead: el.innerHTML.slice(0, 250),
+        zoneCount: el.querySelectorAll('.tp-zone').length,
+        imgCount:  el.querySelectorAll('img').length,
         ancestors: ancestorChain
       };
     });
@@ -333,6 +336,11 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
     if (!stageInfo.rect.w || !stageInfo.rect.h) {
       throw new Error(`#tpStage has zero size — diagnostic: ${JSON.stringify(stageInfo)}`);
     }
+    // Sanity log every render — easy to spot blank captures at a glance.
+    console.log(
+      `   🔬 [render] stage zones=${stageInfo.zoneCount} imgs=${stageInfo.imgCount} ` +
+      `innerLen=${stageInfo.innerLen} (${stageInfo.rect.w}×${stageInfo.rect.h})`
+    );
 
     // Clip-based screenshot via page.screenshot rather than the
     // elementHandle.screenshot path — sidesteps Puppeteer's ancestor-
