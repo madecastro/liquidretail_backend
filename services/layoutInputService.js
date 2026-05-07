@@ -140,11 +140,17 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // pickHeroSourceRatio finds the closest of {5:4, 1:1, 4:5, 9:16,
 // 1.91:1} to the slot's actual w/h. Net effect: 1:1 → 9:16 source,
 // 4:5 → 1.91:1, 9:16 → 1:1, 16:9 + 1.91:1 → 4:5.
-const INPUT_SCHEMA_VERSION = '3.7';
+// 3.8 branches testimonial_overlay → testimonial_overlay (slim:
+// logo + headline + quote + cta) + new product_overlay (logo +
+// headline + product_meta + cta). product_overlay added to
+// OVERLAY_MODE_TEMPLATES. Both have white-default headline,
+// brand font_family_headline, dark-gray chip bg behind headline +
+// quote text.
+const INPUT_SCHEMA_VERSION = '3.8';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
-const OVERLAY_MODE_TEMPLATES = new Set(['testimonial_overlay']);
+const OVERLAY_MODE_TEMPLATES = new Set(['testimonial_overlay', 'product_overlay']);
 
 // Until webhook ingestion lands, every detect-uploaded Media is treated as
 // Instagram creator UGC — the uploader is standing in for a creator's post.

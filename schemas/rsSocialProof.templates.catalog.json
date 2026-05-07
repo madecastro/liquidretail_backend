@@ -6,9 +6,21 @@
   "description": "Canonical social-proof template library for Reach Social ad generation.",
   "global_rules": {
     "all_templates_support_video": true,
-    "supported_aspect_ratios": ["1:1", "4:5", "9:16", "16:9", "1.91:1"],
-    "supported_entry_points": ["product", "post"],
-    "supported_post_types": ["branded", "ugc"],
+    "supported_aspect_ratios": [
+      "1:1",
+      "4:5",
+      "9:16",
+      "16:9",
+      "1.91:1"
+    ],
+    "supported_entry_points": [
+      "product",
+      "post"
+    ],
+    "supported_post_types": [
+      "branded",
+      "ugc"
+    ],
     "global_content_modules": [
       "brand",
       "product",
@@ -44,14 +56,32 @@
         "motion_system": "subtle_product_motion"
       },
       "emphasis": "quote-first",
-      "primary_proof_types": ["testimonial", "rating", "review_count"],
+      "primary_proof_types": [
+        "testimonial",
+        "rating",
+        "review_count"
+      ],
       "supported_entry_points": [
-        { "type": "product", "priority": "high", "behavior": "Preferred entry point. Product is primary and testimonial supports conversion." },
-        { "type": "post", "priority": "medium", "behavior": "Allowed when a testimonial or quote can be derived from UGC, review, or creator text." }
+        {
+          "type": "product",
+          "priority": "high",
+          "behavior": "Preferred entry point. Product is primary and testimonial supports conversion."
+        },
+        {
+          "type": "post",
+          "priority": "medium",
+          "behavior": "Allowed when a testimonial or quote can be derived from UGC, review, or creator text."
+        }
       ],
       "supported_post_types": [
-        { "type": "branded", "support_level": "supported" },
-        { "type": "ugc", "support_level": "supported" }
+        {
+          "type": "branded",
+          "support_level": "supported"
+        },
+        {
+          "type": "ugc",
+          "support_level": "supported"
+        }
       ],
       "ideal_use_cases": [
         "hero product ads with one standout review",
@@ -60,9 +90,16 @@
         "high trust conversion creatives"
       ],
       "required_content": {
-        "must_have": ["product.name", "cta.text"],
+        "must_have": [
+          "product.name",
+          "cta.text"
+        ],
         "must_have_any": [
-          ["social_proof.primary_quote", "social_proof.quotes[0]", "copy.headline"]
+          [
+            "social_proof.primary_quote",
+            "social_proof.quotes[0]",
+            "copy.headline"
+          ]
         ]
       },
       "preferred_content": [
@@ -80,7 +117,13 @@
         "trusted_by_count",
         "offer_text"
       ],
-      "content_priority": ["primary_quote", "headline", "product_hero", "rating_summary", "cta"],
+      "content_priority": [
+        "primary_quote",
+        "headline",
+        "product_hero",
+        "rating_summary",
+        "cta"
+      ],
       "copy_strategy": {
         "headline_role": "frames the proof",
         "subheadline_role": "supports the quote or offer",
@@ -88,7 +131,12 @@
         "cta_role": "clear and direct"
       },
       "visual_character": {
-        "tone": ["clean", "premium", "modern", "trustworthy"],
+        "tone": [
+          "clean",
+          "premium",
+          "modern",
+          "trustworthy"
+        ],
         "density": "low_to_medium",
         "style_bias": "editorial_social_proof"
       },
@@ -104,8 +152,17 @@
         ]
       },
       "proof_modules": {
-        "allowed": ["primary_quote", "rating_summary", "review_count", "proof_badges", "trusted_by_text"],
-        "discouraged": ["dense multi-quote stacks", "heavy engagement chips"]
+        "allowed": [
+          "primary_quote",
+          "rating_summary",
+          "review_count",
+          "proof_badges",
+          "trusted_by_text"
+        ],
+        "discouraged": [
+          "dense multi-quote stacks",
+          "heavy engagement chips"
+        ]
       },
       "selection_rules": [
         "Prefer this template when one testimonial is clearly stronger than all others.",
@@ -134,14 +191,35 @@
         "motion_system": "primary_panel_motion"
       },
       "emphasis": "ugc-first",
-      "primary_proof_types": ["ugc", "creator_quote", "engagement", "social_context"],
+      "primary_proof_types": [
+        "ugc",
+        "creator_quote",
+        "engagement",
+        "social_context"
+      ],
       "supported_entry_points": [
-        { "type": "post", "priority": "highest", "behavior": "Best fit when starting from a branded or UGC post." },
-        { "type": "product", "priority": "supported", "behavior": "Allowed if a matched creator/lifestyle/UGC asset is available or can be resolved." }
+        {
+          "type": "post",
+          "priority": "highest",
+          "behavior": "Best fit when starting from a branded or UGC post."
+        },
+        {
+          "type": "product",
+          "priority": "supported",
+          "behavior": "Allowed if a matched creator/lifestyle/UGC asset is available or can be resolved."
+        }
       ],
       "supported_post_types": [
-        { "type": "branded", "support_level": "supported", "behavior": "Can use branded post as the social panel." },
-        { "type": "ugc", "support_level": "preferred", "behavior": "Best fit. UGC permissions state matters operationally, but the template concept remains the same." }
+        {
+          "type": "branded",
+          "support_level": "supported",
+          "behavior": "Can use branded post as the social panel."
+        },
+        {
+          "type": "ugc",
+          "support_level": "preferred",
+          "behavior": "Best fit. UGC permissions state matters operationally, but the template concept remains the same."
+        }
       ],
       "ideal_use_cases": [
         "creator-inspired product ads",
@@ -150,11 +228,23 @@
         "post-to-product conversion creatives"
       ],
       "required_content": {
-        "must_have": ["product.name", "cta.text"],
+        "must_have": [
+          "product.name",
+          "cta.text"
+        ],
         "must_have_any": [
-          ["ugc.image_or_video", "creator.portrait_image_or_video"],
-          ["product.hero_image_or_video"],
-          ["social_proof.primary_quote", "ugc.caption", "copy.headline"]
+          [
+            "ugc.image_or_video",
+            "creator.portrait_image_or_video"
+          ],
+          [
+            "product.hero_image_or_video"
+          ],
+          [
+            "social_proof.primary_quote",
+            "ugc.caption",
+            "copy.headline"
+          ]
         ]
       },
       "preferred_content": [
@@ -187,7 +277,12 @@
         "cta_role": "conversion anchor"
       },
       "visual_character": {
-        "tone": ["fresh", "social", "high-trust", "mobile-native"],
+        "tone": [
+          "fresh",
+          "social",
+          "high-trust",
+          "mobile-native"
+        ],
         "density": "medium",
         "style_bias": "creator_meets_product"
       },
@@ -203,8 +298,17 @@
         ]
       },
       "proof_modules": {
-        "allowed": ["creator_quote", "engagement_chips", "creator_handle", "proof_badges", "light_rating_support"],
-        "discouraged": ["dense multi-review stacks", "heavy metric tables"]
+        "allowed": [
+          "creator_quote",
+          "engagement_chips",
+          "creator_handle",
+          "proof_badges",
+          "light_rating_support"
+        ],
+        "discouraged": [
+          "dense multi-review stacks",
+          "heavy metric tables"
+        ]
       },
       "selection_rules": [
         "Prefer this template when the creative should feel native to social.",
@@ -233,14 +337,33 @@
         "motion_system": "hero_only_motion"
       },
       "emphasis": "review-density",
-      "primary_proof_types": ["multiple_reviews", "rating", "review_count", "review_chips"],
+      "primary_proof_types": [
+        "multiple_reviews",
+        "rating",
+        "review_count",
+        "review_chips"
+      ],
       "supported_entry_points": [
-        { "type": "product", "priority": "highest", "behavior": "Preferred entry point. Product remains the center of gravity." },
-        { "type": "post", "priority": "supported", "behavior": "Allowed if the system can aggregate relevant review or testimonial content around the product." }
+        {
+          "type": "product",
+          "priority": "highest",
+          "behavior": "Preferred entry point. Product remains the center of gravity."
+        },
+        {
+          "type": "post",
+          "priority": "supported",
+          "behavior": "Allowed if the system can aggregate relevant review or testimonial content around the product."
+        }
       ],
       "supported_post_types": [
-        { "type": "branded", "support_level": "supported" },
-        { "type": "ugc", "support_level": "supported" }
+        {
+          "type": "branded",
+          "support_level": "supported"
+        },
+        {
+          "type": "ugc",
+          "support_level": "supported"
+        }
       ],
       "ideal_use_cases": [
         "best seller social proof ads",
@@ -249,10 +372,17 @@
         "customer consensus messaging"
       ],
       "required_content": {
-        "must_have": ["cta.text"],
+        "must_have": [
+          "cta.text"
+        ],
         "must_have_any": [
-          ["product.hero_image_or_video"],
-          ["social_proof.quotes[0]", "social_proof.secondary_quotes"]
+          [
+            "product.hero_image_or_video"
+          ],
+          [
+            "social_proof.quotes[0]",
+            "social_proof.secondary_quotes"
+          ]
         ]
       },
       "preferred_content": [
@@ -269,7 +399,13 @@
         "price",
         "subheadline"
       ],
-      "content_priority": ["product_hero", "review_card_stack", "rating_summary", "headline", "cta"],
+      "content_priority": [
+        "product_hero",
+        "review_card_stack",
+        "rating_summary",
+        "headline",
+        "cta"
+      ],
       "copy_strategy": {
         "headline_role": "frames the review consensus",
         "subheadline_role": "optional supporting message",
@@ -277,7 +413,12 @@
         "cta_role": "bottom-line conversion action"
       },
       "visual_character": {
-        "tone": ["credible", "high-conviction", "rich", "social-proof-heavy"],
+        "tone": [
+          "credible",
+          "high-conviction",
+          "rich",
+          "social-proof-heavy"
+        ],
         "density": "medium_to_high",
         "style_bias": "product_centered_review_wall"
       },
@@ -293,8 +434,17 @@
         ]
       },
       "proof_modules": {
-        "allowed": ["rating_summary", "review_count", "review_cards", "review_chips", "product_badges"],
-        "discouraged": ["large creator identity treatment", "heavy engagement metrics"]
+        "allowed": [
+          "rating_summary",
+          "review_count",
+          "review_cards",
+          "review_chips",
+          "product_badges"
+        ],
+        "discouraged": [
+          "large creator identity treatment",
+          "heavy engagement metrics"
+        ]
       },
       "selection_rules": [
         "Prefer this template when multiple short reviews are available.",
@@ -323,14 +473,34 @@
         "motion_system": "structured_metrics_motion"
       },
       "emphasis": "metrics-first",
-      "primary_proof_types": ["performance_metrics", "rating", "review_count", "trusted_by_count", "testimonial_support"],
+      "primary_proof_types": [
+        "performance_metrics",
+        "rating",
+        "review_count",
+        "trusted_by_count",
+        "testimonial_support"
+      ],
       "supported_entry_points": [
-        { "type": "product", "priority": "highest", "behavior": "Preferred when product-level metrics or trust data are available." },
-        { "type": "post", "priority": "supported", "behavior": "Allowed when post or campaign data can support a performance narrative." }
+        {
+          "type": "product",
+          "priority": "highest",
+          "behavior": "Preferred when product-level metrics or trust data are available."
+        },
+        {
+          "type": "post",
+          "priority": "supported",
+          "behavior": "Allowed when post or campaign data can support a performance narrative."
+        }
       ],
       "supported_post_types": [
-        { "type": "branded", "support_level": "supported" },
-        { "type": "ugc", "support_level": "supported" }
+        {
+          "type": "branded",
+          "support_level": "supported"
+        },
+        {
+          "type": "ugc",
+          "support_level": "supported"
+        }
       ],
       "ideal_use_cases": [
         "trusted by X customers",
@@ -339,8 +509,16 @@
         "outcome-oriented brand proof"
       ],
       "required_content": {
-        "must_have": ["copy.headline", "cta.text"],
-        "must_have_any": [["performance_metrics[0]", "performance_metrics[1]"]]
+        "must_have": [
+          "copy.headline",
+          "cta.text"
+        ],
+        "must_have_any": [
+          [
+            "performance_metrics[0]",
+            "performance_metrics[1]"
+          ]
+        ]
       },
       "preferred_content": [
         "social_proof.primary_quote",
@@ -349,8 +527,20 @@
         "product.hero_image_or_video",
         "trusted_by_count"
       ],
-      "optional_content": ["supporting_media", "subheadline", "proof_badges", "secondary_quote"],
-      "content_priority": ["headline", "metrics_row", "supporting_quote", "product_or_support_media", "trust_footer", "cta"],
+      "optional_content": [
+        "supporting_media",
+        "subheadline",
+        "proof_badges",
+        "secondary_quote"
+      ],
+      "content_priority": [
+        "headline",
+        "metrics_row",
+        "supporting_quote",
+        "product_or_support_media",
+        "trust_footer",
+        "cta"
+      ],
       "copy_strategy": {
         "headline_role": "states the main result or promise",
         "subheadline_role": "adds context",
@@ -358,7 +548,12 @@
         "cta_role": "action after trust is established"
       },
       "visual_character": {
-        "tone": ["confident", "structured", "credible", "conversion-oriented"],
+        "tone": [
+          "confident",
+          "structured",
+          "credible",
+          "conversion-oriented"
+        ],
         "density": "medium",
         "style_bias": "performance_dashboard_meets_ad"
       },
@@ -374,8 +569,17 @@
         ]
       },
       "proof_modules": {
-        "allowed": ["metric_cards", "rating_summary", "review_count", "trusted_by_text", "supporting_quote"],
-        "discouraged": ["creator-heavy treatment", "dense review collage behavior"]
+        "allowed": [
+          "metric_cards",
+          "rating_summary",
+          "review_count",
+          "trusted_by_text",
+          "supporting_quote"
+        ],
+        "discouraged": [
+          "creator-heavy treatment",
+          "dense review collage behavior"
+        ]
       },
       "selection_rules": [
         "Prefer this template when quantitative proof is the strongest asset.",
@@ -405,14 +609,33 @@
       },
       "render_mode": "overlay_on_image",
       "emphasis": "image-first",
-      "primary_proof_types": ["image_subject", "rating", "review_count", "testimonial"],
+      "primary_proof_types": [
+        "image_subject",
+        "rating",
+        "review_count",
+        "testimonial"
+      ],
       "supported_entry_points": [
-        { "type": "post", "priority": "highest", "behavior": "Best fit when starting from a creator/UGC post — the image dominates and is the emotional hook." },
-        { "type": "product", "priority": "supported", "behavior": "Allowed when product hero imagery is strong enough to carry the frame." }
+        {
+          "type": "post",
+          "priority": "highest",
+          "behavior": "Best fit when starting from a creator/UGC post — the image dominates and is the emotional hook."
+        },
+        {
+          "type": "product",
+          "priority": "supported",
+          "behavior": "Allowed when product hero imagery is strong enough to carry the frame."
+        }
       ],
       "supported_post_types": [
-        { "type": "branded", "support_level": "supported" },
-        { "type": "ugc", "support_level": "preferred" }
+        {
+          "type": "branded",
+          "support_level": "supported"
+        },
+        {
+          "type": "ugc",
+          "support_level": "preferred"
+        }
       ],
       "ideal_use_cases": [
         "creator UGC product ads where the image is the emotional hook",
@@ -420,9 +643,17 @@
         "any media where the image already tells the story and overlays add commerce signals"
       ],
       "required_content": {
-        "must_have": ["brand.logo", "copy.headline", "product.name", "cta.text"],
+        "must_have": [
+          "brand.logo",
+          "copy.headline",
+          "product.name",
+          "cta.text"
+        ],
         "must_have_any": [
-          ["product.hero_media.image", "creator.portrait_media.image"]
+          [
+            "product.hero_media.image",
+            "creator.portrait_media.image"
+          ]
         ]
       },
       "preferred_content": [
@@ -437,7 +668,13 @@
         "product.price",
         "copy.subheadline"
       ],
-      "content_priority": ["logo", "headline", "product_meta", "cta", "quote"],
+      "content_priority": [
+        "logo",
+        "headline",
+        "product_meta",
+        "cta",
+        "quote"
+      ],
       "copy_strategy": {
         "headline_role": "primary message anchor",
         "subheadline_role": "rare — used only if room",
@@ -445,7 +682,12 @@
         "cta_role": "always-on conversion anchor"
       },
       "visual_character": {
-        "tone": ["bold", "image-led", "social-native", "mobile-first"],
+        "tone": [
+          "bold",
+          "image-led",
+          "social-native",
+          "mobile-first"
+        ],
         "density": "low",
         "style_bias": "creative_photography_with_overlays"
       },
@@ -461,8 +703,146 @@
         ]
       },
       "proof_modules": {
-        "allowed": ["rating_summary", "review_count", "primary_quote"],
-        "discouraged": ["dense multi-quote stacks", "metric tables"]
+        "allowed": [
+          "rating_summary",
+          "review_count",
+          "primary_quote"
+        ],
+        "discouraged": [
+          "dense multi-quote stacks",
+          "metric tables"
+        ]
+      },
+      "selection_rules": [
+        "Prefer when the image is already a strong creative — no need to compose around it.",
+        "Prefer for UGC / creator media where authenticity matters more than information density.",
+        "Skip when the image is poor quality or the subject occupies the entire frame leaving no safe overlay area (renderer auto-falls back to inset mode in that case)."
+      ],
+      "distinctive_features": [
+        "no fixed canvas zones — placement computed per image",
+        "10% subject overlap budget for non-product restrictions",
+        "adaptive scrim strength based on bg/text contrast gap",
+        "inset fallback when no safe overlay area exists",
+        "yellow star rating display"
+      ]
+    },
+    {
+      "id": "product_overlay",
+      "name": "Product Overlay",
+      "status": "active",
+      "ui_label": "Product Overlay",
+      "tagline": "The image is the ad. Logo, headline, product card (image + name + price), and CTA sit on top in safe zones.",
+      "purpose": "Image-as-canvas overlay focused on a specific product. The hero photo fills the entire frame; logo, headline, a product card (catalog image + name + price), and CTA are placed in subject-safe regions using the detect pipeline's overlay-zone analysis.",
+      "summary": "Product-focused sibling of testimonial_overlay. Renders the full image as the canvas and overlays the product card + CTA at runtime in safe zones.",
+      "preset_architecture": {
+        "base_family": "image_overlay",
+        "overlay_package": "adaptive_scrim",
+        "copy_system": "logo_headline_product_cta",
+        "motion_system": "subtle_image_motion"
+      },
+      "render_mode": "overlay_on_image",
+      "emphasis": "image-first",
+      "primary_proof_types": [
+        "image_subject",
+        "product_meta"
+      ],
+      "supported_entry_points": [
+        {
+          "type": "post",
+          "priority": "highest",
+          "behavior": "Best fit when starting from a creator/UGC post — the image dominates and is the emotional hook."
+        },
+        {
+          "type": "product",
+          "priority": "supported",
+          "behavior": "Allowed when product hero imagery is strong enough to carry the frame."
+        }
+      ],
+      "supported_post_types": [
+        {
+          "type": "branded",
+          "support_level": "supported"
+        },
+        {
+          "type": "ugc",
+          "support_level": "preferred"
+        }
+      ],
+      "ideal_use_cases": [
+        "creator UGC product ads where the image is the emotional hook",
+        "lifestyle / aspirational product placements",
+        "any media where the image already tells the story and overlays add commerce signals"
+      ],
+      "required_content": {
+        "must_have": [
+          "brand.logo",
+          "copy.headline",
+          "product.name",
+          "cta.text"
+        ],
+        "must_have_any": [
+          [
+            "product.hero_media.image",
+            "creator.portrait_media.image"
+          ]
+        ]
+      },
+      "preferred_content": [
+        "social_proof.rating_value",
+        "social_proof.review_count",
+        "social_proof.primary_quote.text",
+        "brand.primary_color",
+        "brand.accent_color"
+      ],
+      "optional_content": [
+        "social_proof.primary_quote",
+        "product.price",
+        "copy.subheadline"
+      ],
+      "content_priority": [
+        "logo",
+        "headline",
+        "product_meta",
+        "cta",
+        "quote"
+      ],
+      "copy_strategy": {
+        "headline_role": "primary message anchor",
+        "subheadline_role": "rare — used only if room",
+        "primary_copy_role": "headline drives, quote supplements when present",
+        "cta_role": "always-on conversion anchor"
+      },
+      "visual_character": {
+        "tone": [
+          "bold",
+          "image-led",
+          "social-native",
+          "mobile-first"
+        ],
+        "density": "low",
+        "style_bias": "creative_photography_with_overlays"
+      },
+      "video_support": {
+        "supported": true,
+        "primary_video_role": "background image OR background video",
+        "preferred_motion_zone": "background",
+        "motion_intensity": "subtle",
+        "rules": [
+          "All overlays must remain pinned and legible while the bg plays.",
+          "Adaptive scrim required behind text on bright/busy bg regions.",
+          "Image-only mode is the canonical fallback — video is decorative."
+        ]
+      },
+      "proof_modules": {
+        "allowed": [
+          "rating_summary",
+          "review_count",
+          "primary_quote"
+        ],
+        "discouraged": [
+          "dense multi-quote stacks",
+          "metric tables"
+        ]
       },
       "selection_rules": [
         "Prefer when the image is already a strong creative — no need to compose around it.",
@@ -492,14 +872,34 @@
         "motion_system": "creator_primary_motion"
       },
       "emphasis": "creator-first",
-      "primary_proof_types": ["creator_quote", "creator_identity", "trust_ribbon", "product_support", "social_badges"],
+      "primary_proof_types": [
+        "creator_quote",
+        "creator_identity",
+        "trust_ribbon",
+        "product_support",
+        "social_badges"
+      ],
       "supported_entry_points": [
-        { "type": "post", "priority": "highest", "behavior": "Preferred when starting from a creator, influencer, or social post." },
-        { "type": "product", "priority": "supported", "behavior": "Allowed if a creator asset or matched post exists." }
+        {
+          "type": "post",
+          "priority": "highest",
+          "behavior": "Preferred when starting from a creator, influencer, or social post."
+        },
+        {
+          "type": "product",
+          "priority": "supported",
+          "behavior": "Allowed if a creator asset or matched post exists."
+        }
       ],
       "supported_post_types": [
-        { "type": "branded", "support_level": "supported" },
-        { "type": "ugc", "support_level": "preferred" }
+        {
+          "type": "branded",
+          "support_level": "supported"
+        },
+        {
+          "type": "ugc",
+          "support_level": "preferred"
+        }
       ],
       "ideal_use_cases": [
         "creator recommendation ads",
@@ -508,11 +908,21 @@
         "founder/creator trust-led campaigns"
       ],
       "required_content": {
-        "must_have": ["cta.text"],
+        "must_have": [
+          "cta.text"
+        ],
         "must_have_any": [
-          ["creator.portrait_image_or_video", "ugc.image_or_video"],
-          ["product.hero_image_or_video"],
-          ["social_proof.primary_quote", "copy.headline"]
+          [
+            "creator.portrait_image_or_video",
+            "ugc.image_or_video"
+          ],
+          [
+            "product.hero_image_or_video"
+          ],
+          [
+            "social_proof.primary_quote",
+            "copy.headline"
+          ]
         ]
       },
       "preferred_content": [
@@ -523,8 +933,19 @@
         "trusted_by_text",
         "brand.logo"
       ],
-      "optional_content": ["creator.avatar", "rating_summary", "offer_text", "secondary_product_media"],
-      "content_priority": ["creator_media", "endorsement_quote", "product_support", "trust_ribbon", "cta"],
+      "optional_content": [
+        "creator.avatar",
+        "rating_summary",
+        "offer_text",
+        "secondary_product_media"
+      ],
+      "content_priority": [
+        "creator_media",
+        "endorsement_quote",
+        "product_support",
+        "trust_ribbon",
+        "cta"
+      ],
       "copy_strategy": {
         "headline_role": "secondary to the endorsement",
         "subheadline_role": "optional supporting claim",
@@ -532,7 +953,12 @@
         "cta_role": "shoppable handoff"
       },
       "visual_character": {
-        "tone": ["charismatic", "aspirational", "high-trust", "social-native"],
+        "tone": [
+          "charismatic",
+          "aspirational",
+          "high-trust",
+          "social-native"
+        ],
         "density": "medium",
         "style_bias": "personality_led_conversion"
       },
@@ -548,8 +974,17 @@
         ]
       },
       "proof_modules": {
-        "allowed": ["creator_identity", "creator_quote", "proof_badges", "trust_ribbon", "light_rating_support"],
-        "discouraged": ["dense multi-review collage", "metric-heavy tables"]
+        "allowed": [
+          "creator_identity",
+          "creator_quote",
+          "proof_badges",
+          "trust_ribbon",
+          "light_rating_support"
+        ],
+        "discouraged": [
+          "dense multi-review collage",
+          "metric-heavy tables"
+        ]
       },
       "selection_rules": [
         "Prefer this template when a creator face or identity is a major asset.",
