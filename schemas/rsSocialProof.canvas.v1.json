@@ -624,7 +624,8 @@
               "padding": 16,
               "max_lines": 9,
               "style_variant": "with_author_photo",
-              "column": "left"
+              "column": "left",
+              "min_h_fraction": 0.4
             },
             {
               "id": "badge_row",
@@ -818,7 +819,8 @@
               "radius": 8,
               "padding": 14,
               "max_lines": 4,
-              "style_variant": "with_author_photo"
+              "style_variant": "with_author_photo",
+              "min_h_fraction": 1.0
             },
             {
               "id": "badge_row",
@@ -1009,7 +1011,8 @@
               "radius": 8,
               "padding": 12,
               "max_lines": 4,
-              "style_variant": "with_author_photo"
+              "style_variant": "with_author_photo",
+              "min_h_fraction": 1.0
             },
             {
               "id": "badge_row",
