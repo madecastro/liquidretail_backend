@@ -88,14 +88,23 @@ async function renderCreative(req) {
   }
 
   // 3. de-dupe — has this exact creative been rendered before?
+  // Skipped when req.options.refresh is true so a smoke-test re-fire
+  // produces fresh renders instead of returning blank Ads cached
+  // during earlier broken deploys. Long-term fix is campaignRunIds[]
+  // as an array on Ad (see backlog) so dedupe-hit Ads still surface
+  // under the current run's filter.
   const derivationDigest = computeDerivationDigest(input, req);
-  const existing = await Ad.findOne({
-    campaignId: req.campaignId,
-    derivationDigest
-  }).lean();
-  if (existing) {
-    console.log(`   ♻️  ${tag} dedupe hit — reusing Ad ${existing._id} (digest=${derivationDigest.slice(0,8)})`);
-    return success(jobId, existing);
+  if (!req.options?.refresh) {
+    const existing = await Ad.findOne({
+      campaignId: req.campaignId,
+      derivationDigest
+    }).lean();
+    if (existing) {
+      console.log(`   ♻️  ${tag} dedupe hit — reusing Ad ${existing._id} (digest=${derivationDigest.slice(0,8)})`);
+      return success(jobId, existing);
+    }
+  } else {
+    console.log(`   🔄 ${tag} refresh=true — skipping Ad dedupe (digest=${derivationDigest.slice(0,8)})`);
   }
 
   // 4. render — Puppeteer screenshot
