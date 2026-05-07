@@ -214,6 +214,19 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
     const page = await browser.newPage();
     await page.setViewport({ width: dims.w, height: dims.h, deviceScaleFactor: 1 });
 
+    // Capture every signal the headless page emits so a 20s timeout
+    // surfaces *why* — empty hang vs apiFetch 401 vs JS exception
+    // vs CSP block. Cap each list to keep error messages bounded.
+    const pageEvents = [];
+    const push = (s) => { if (pageEvents.length < 60) pageEvents.push(s); };
+    page.on('console',       (msg) => push(`[console.${msg.type()}] ${msg.text()}`));
+    page.on('pageerror',     (err) => push(`[pageerror] ${err.message}`));
+    page.on('requestfailed', (req) => push(`[requestfailed] ${req.url()} — ${req.failure()?.errorText || 'unknown'}`));
+    page.on('response',      (res) => {
+      const s = res.status();
+      if (s >= 400) push(`[response ${s}] ${res.url()}`);
+    });
+
     // Auth: render-token via cookie so /api/* requests from the page
     // are authenticated. The route handler that calls renderCreative
     // forwards the operator's auth token via env-fallback for now;
@@ -230,10 +243,19 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
     }
 
     await page.goto(url.toString(), { waitUntil: 'networkidle0', timeout: RENDER_TIMEOUT_MS });
-    await page.waitForFunction(
-      'window.__tpRenderReady === true || typeof window.__tpRenderError === "string"',
-      { timeout: RENDER_TIMEOUT_MS }
-    );
+    try {
+      await page.waitForFunction(
+        'window.__tpRenderReady === true || typeof window.__tpRenderError === "string"',
+        { timeout: RENDER_TIMEOUT_MS }
+      );
+    } catch (waitErr) {
+      // Re-throw with the captured page signals appended so the
+      // CampaignRun.errors[] entry tells us what actually happened.
+      const tail = pageEvents.length
+        ? `\n  page signals (last ${pageEvents.length}):\n    ${pageEvents.join('\n    ')}`
+        : '\n  (no page signals captured — page likely never executed JS)';
+      throw new Error(`${waitErr.message}${tail}`);
+    }
     const renderError = await page.evaluate(() => window.__tpRenderError || null);
     if (renderError) throw new Error(`render-mode bootstrap failed: ${renderError}`);
 
