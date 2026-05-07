@@ -152,7 +152,15 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // the hardcoded element specs in overlayPlacementService place
 // EVERY element regardless of template (testimonial_overlay was
 // still placing product_meta).
-const INPUT_SCHEMA_VERSION = '3.9';
+// 4.0 rewrites overlay placement to a 4-box anchored algorithm
+// (logo TL, cta BR, headline upper-half least-violating, quote /
+// product_meta lower-half least-violating). Inset fallback + shape
+// variant cascade + priority cascade are gone. Placement now runs
+// BEFORE derivation so the chosen box dimensions can constrain
+// Gemini's headline + cta + quote copy length via a new
+// overlayBoxes prompt section. Cached docs re-derive against the
+// new placement + budgets.
+const INPUT_SCHEMA_VERSION = '4.0';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -249,8 +257,23 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
     throw badRequest(`Media flagged as do_not_use by product matching: ${ctx.match.outcomeReasoning || 'multiple brands detected'}`);
   }
 
-  const derivation = await runDerivation(ctx, template, aspectRatio, options);
-  const input = assembleInput(ctx, template, aspectRatio, options, derivation);
+  // For overlay-mode templates, run placement BEFORE derivation so the
+  // chosen box dimensions can constrain the LLM's headline + cta copy
+  // length. Canvas-zone templates run derivation first as before
+  // (their slot budgets come from canvas.zones, not placement).
+  let precomputedPlacement = null;
+  let overlayBoxes = null;
+  if (OVERLAY_MODE_TEMPLATES.has(template)) {
+    try {
+      precomputedPlacement = computeOverlayPlacement(ctx, aspectRatio, options, /* content */ ctx, template);
+      overlayBoxes = extractOverlayBoxes(precomputedPlacement, aspectRatio);
+    } catch (err) {
+      console.warn(`   ⚠️  overlay placement (pre-derivation) failed for ${template} ${aspectRatio}: ${err.message}`);
+    }
+  }
+
+  const derivation = await runDerivation(ctx, template, aspectRatio, { ...options, overlayBoxes });
+  const input = assembleInput(ctx, template, aspectRatio, options, derivation, precomputedPlacement);
 
   await LayoutInputArtifact.findOneAndReplace(
     { mediaId, template, aspectRatio },
@@ -529,6 +552,14 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   const slotBudgets   = canvasVariant ? computeSlotBudgets(canvasVariant) : {};
   const useSplitHeadline = !!slotBudgets.headline;
 
+  // Overlay-mode templates run placement BEFORE derivation; the box
+  // dimensions for headline / cta / quote are passed in via
+  // options.overlayBoxes. Convert each to a char-budget hint and
+  // surface as prompt rules so the LLM writes copy that fits the
+  // chosen rect rather than relying on auto-fit shrinkage.
+  const overlayBoxes = options.overlayBoxes || null;
+  const overlayBoxBudgets = overlayBoxes ? overlayBoxesToBudgets(overlayBoxes) : null;
+
   if (isBranding) {
     // Brand-mode headline / quote rules. Override the product-shaped
     // defaults so the LLM doesn't backslide into product-specific copy.
@@ -570,6 +601,25 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     }
     lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
     lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
+  }
+
+  // Overlay-template box-aware caps (testimonial_overlay, product_overlay).
+  // The placement engine reserved boxes BEFORE derivation; tell the LLM
+  // exactly how many chars / lines fit each box. Hard caps that override
+  // the word-count guidance above.
+  if (overlayBoxBudgets) {
+    if (overlayBoxBudgets.headline) {
+      const hb = overlayBoxBudgets.headline;
+      lines.push(`- "copy.headline" REQUIRED — overlay placement box is ${hb.w_px}×${hb.h_px}px. MAX ${hb.max_chars} characters across ${hb.max_lines} line(s), ~${hb.max_words} words. Write to FIT the box exactly; auto-fit shrinkage at render time is the safety net, not the goal.`);
+    }
+    if (overlayBoxBudgets.cta) {
+      const cb = overlayBoxBudgets.cta;
+      lines.push(`- "cta.text" REQUIRED — overlay button box is ${cb.w_px}×${cb.h_px}px. MAX ${cb.max_chars} characters, 1 line, ~${cb.max_words} words. Imperative voice, e.g. "Shop now", "Get yours", "Discover".`);
+    }
+    if (overlayBoxBudgets.quote) {
+      const qb = overlayBoxBudgets.quote;
+      lines.push(`- "quotes[0].text" — overlay quote box is ${qb.w_px}×${qb.h_px}px. MAX ${qb.max_chars} characters across ${qb.max_lines} line(s). Notional review/testimonial sentence; keep it tight.`);
+    }
   }
 
   // Quote length target depends on template — narrow zones (split-screen
@@ -683,7 +733,7 @@ function fallbackDerivation(ctx) {
 // ──────────────────────────────────────────────────────────────
 //  Canonical assembly
 // ──────────────────────────────────────────────────────────────
-function assembleInput(ctx, template, aspectRatio, options, derivation) {
+function assembleInput(ctx, template, aspectRatio, options, derivation, precomputedPlacement) {
   const { media, detection, match, brand } = ctx;
   const ident   = match?.identification || {};
   const details = ident.details || {};
@@ -982,11 +1032,20 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
   // down the whole assembly — surface as null placement and let the caller
   // / preview decide what to do.
   if (OVERLAY_MODE_TEMPLATES.has(template)) {
-    try {
-      const placement = computeOverlayPlacement(ctx, aspectRatio, options, input, template);
-      if (placement) input.placement = placement;
-    } catch (err) {
-      console.warn(`   ⚠️  overlay placement failed for ${template} ${aspectRatio}: ${err.message}`);
+    // Reuse the precomputed placement when buildLayoutInput passed
+    // it in — avoids running the placement search twice (once before
+    // derivation for box dims, again here for the input). Falls
+    // back to recomputing when assembleInput is called from a
+    // path that didn't precompute (preflight / candidates etc.).
+    if (precomputedPlacement) {
+      input.placement = precomputedPlacement;
+    } else {
+      try {
+        const placement = computeOverlayPlacement(ctx, aspectRatio, options, input, template);
+        if (placement) input.placement = placement;
+      } catch (err) {
+        console.warn(`   ⚠️  overlay placement failed for ${template} ${aspectRatio}: ${err.message}`);
+      }
     }
   }
 
@@ -997,6 +1056,89 @@ function assembleInput(ctx, template, aspectRatio, options, derivation) {
 // placement algorithm against its overlay-zone analysis. Returns the
 // `placement` block to attach to the input, or null if no analyzed image
 // is available for this aspect ratio.
+// Convert overlay box dimensions (w_px × h_px) into char-budget hints
+// for the derivation prompt. Per-element font-size assumptions match
+// the renderer's renderOverlay* functions:
+//   headline: 1.55em base × stage emBase (canvasW/22) ≈ 70px on a
+//             1000-wide canvas. We use a per-rect estimate instead —
+//             font scales to fit the box height (~0.7 of h_px for 1
+//             line, half that for 2 lines).
+//   cta:      ~0.85em × emBase ≈ 38px. Single line.
+//   quote:    ~0.95em × emBase ≈ 43px. Multi-line.
+// Average glyph advance ~0.5 em for display fonts, ~0.55 for body.
+function overlayBoxesToBudgets(boxes) {
+  if (!boxes) return null;
+  const out = {};
+  if (boxes.headline) {
+    const w = boxes.headline.w_px, h = boxes.headline.h_px;
+    // Headline tries 1 line first; max_lines = floor(h / lineHeight).
+    const fontPx = Math.min(h * 0.6, w * 0.08);  // bigger of "fits 1 line" or "fits width-aware"
+    const lineH  = fontPx * 1.05;
+    const maxLines = Math.max(1, Math.min(2, Math.floor(h / lineH)));
+    const charW = fontPx * 0.5;
+    const charsPerLine = Math.max(8, Math.floor(w / charW));
+    out.headline = {
+      w_px: w, h_px: h,
+      max_chars: charsPerLine * maxLines,
+      max_lines: maxLines,
+      max_words: Math.max(2, Math.floor((charsPerLine * maxLines) / 5))
+    };
+  }
+  if (boxes.cta) {
+    const w = boxes.cta.w_px, h = boxes.cta.h_px;
+    const fontPx = h * 0.45;
+    const charW = fontPx * 0.55;
+    const charsPerLine = Math.max(6, Math.floor((w * 0.85) / charW));  // 0.85 = padding for button pill
+    out.cta = {
+      w_px: w, h_px: h,
+      max_chars: Math.min(24, charsPerLine),
+      max_words: Math.max(1, Math.floor(charsPerLine / 5))
+    };
+  }
+  if (boxes.quote) {
+    const w = boxes.quote.w_px, h = boxes.quote.h_px;
+    const fontPx = Math.min(h * 0.18, 26);  // smaller, multi-line
+    const lineH  = fontPx * 1.3;
+    const maxLines = Math.max(2, Math.min(4, Math.floor(h / lineH) - 1));  // reserve 1 line for attribution
+    const charW = fontPx * 0.55;
+    const charsPerLine = Math.max(20, Math.floor((w * 0.9) / charW));
+    out.quote = {
+      w_px: w, h_px: h,
+      max_chars: charsPerLine * maxLines,
+      max_lines: maxLines
+    };
+  }
+  return out;
+}
+
+// Convert overlay placement.elements[] into a {headline, cta, quote}
+// box dimensions map for the derivation prompt. Each entry carries
+// the box's px width × height (canvas-normalized) so the prompt can
+// estimate char-budget caps. Returns null if no boxes were placed.
+function extractOverlayBoxes(placement, aspectRatio) {
+  if (!placement || !Array.isArray(placement.elements)) return null;
+  const dims = CANVAS_PIXEL_DIMS[aspectRatio] || { w: 1000, h: 1000 };
+  const out = {};
+  for (const el of placement.elements) {
+    if (!el?.rectPct) continue;
+    const wPx = (el.rectPct.x2 - el.rectPct.x1) * dims.w;
+    const hPx = (el.rectPct.y2 - el.rectPct.y1) * dims.h;
+    out[el.id] = { w_px: Math.round(wPx), h_px: Math.round(hPx) };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// Canvas pixel dimensions per ratio — used for converting overlay
+// box %s to absolute px for char-budget estimation. Mirrors what
+// templatePreview.js applyCanvasSize uses as the stage size.
+const CANVAS_PIXEL_DIMS = {
+  '1:1':    { w: 1000, h: 1000 },
+  '4:5':    { w: 1000, h: 1250 },
+  '9:16':   { w: 1000, h: 1778 },
+  '16:9':   { w: 1000, h: 563  },
+  '1.91:1': { w: 1000, h: 524  }
+};
+
 function computeOverlayPlacement(ctx, aspectRatio, options, content, template) {
   // Pick the analyzed image for this ratio. If none is available (e.g.
   // detect didn't run overlay zones for this ratio, or Gemini failed for
