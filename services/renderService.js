@@ -26,6 +26,7 @@
 // duplicate to Cloudinary.
 
 const crypto = require('crypto');
+const puppeteer = require('puppeteer');
 
 const Ad                    = require('../models/Ad');
 const Media                 = require('../models/Media');
@@ -90,7 +91,8 @@ async function renderCreative(req) {
       layoutInputArtifactId,
       template:    req.creative.template,
       aspectRatio: req.creative.aspectRatio,
-      expectedKind: req.creative.expectedKind
+      expectedKind: req.creative.expectedKind,
+      mediaId:     req.creative.mediaId
     });
   } catch (err) {
     return failed(jobId, 'render', err);
@@ -159,29 +161,81 @@ async function deriveStage(req) {
   return { input, layoutInputArtifactId: artifact?._id || null };
 }
 
-// PHASE-1A STUB. Real implementation: spin up Puppeteer, navigate to
-// /ads.html?media=X&template=Y&ratio=Z&renderMode=1, wait for the
-// renderer's "ready" signal (window.__tpRenderReady === true), screenshot
-// the #tpStage element. For video-source media, the rendered HTML
-// already paints the source video as background via <video autoplay
-// loop>; the screenshot captures one frame as the static V1 ad.
-async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind }) {
+// Spin up Puppeteer, navigate to /ads.html?media=X&template=Y&ratio=Z
+// &renderMode=1, wait for the renderer's "ready" signal
+// (window.__tpRenderReady === true), screenshot the #tpStage element.
+// For video-source media the rendered HTML paints the source video as
+// background via <video autoplay loop>; the screenshot captures one
+// frame as the static V1 ad.
+//
+// Tunables come from env so the deploy can swap between local
+// (FRONTEND_URL=http://localhost:5173) and Render (FRONTEND_URL set
+// to the Netlify URL) without code changes. PUPPETEER_EXECUTABLE_PATH
+// + headless flags also driven by env so a custom Chromium binary
+// can be slotted in (Render free tier doesn't have Chrome OOTB).
+const FRONTEND_URL       = process.env.FRONTEND_URL       || 'http://localhost:5173';
+const RENDER_AUTH_TOKEN  = process.env.RENDER_AUTH_TOKEN  || null;
+const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '20000', 10);
+
+async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
-  // Placeholder: 1×1 transparent PNG. Production swap-in is a real
-  // Puppeteer screenshot at canvas dims; everything downstream
-  // (upload + persist) consumes the buffer through the same shape.
-  const buffer = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=',
-    'base64'
-  );
-  return {
-    buffer,
-    contentType: 'image/png',
-    width:  dims.w,
-    height: dims.h,
-    bytes:  buffer.length,
-    kind:   'image'   // V1 always image; Phase 2 may set 'video'
-  };
+  const url = new URL(`${FRONTEND_URL}/ads.html`);
+  url.searchParams.set('renderMode', '1');
+  url.searchParams.set('media', mediaId);
+  url.searchParams.set('template', template);
+  url.searchParams.set('ratio', aspectRatio);
+
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage'
+      ]
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: dims.w, height: dims.h, deviceScaleFactor: 1 });
+
+    // Auth: render-token via cookie so /api/* requests from the page
+    // are authenticated. The route handler that calls renderCreative
+    // forwards the operator's auth token via env-fallback for now;
+    // proper per-request token threading lands when we wire the queue.
+    if (RENDER_AUTH_TOKEN) {
+      const cookieDomain = new URL(FRONTEND_URL).hostname;
+      await page.setCookie({
+        name:   'auth',
+        value:  RENDER_AUTH_TOKEN,
+        domain: cookieDomain,
+        path:   '/',
+        httpOnly: false
+      });
+    }
+
+    await page.goto(url.toString(), { waitUntil: 'networkidle0', timeout: RENDER_TIMEOUT_MS });
+    await page.waitForFunction(
+      'window.__tpRenderReady === true || typeof window.__tpRenderError === "string"',
+      { timeout: RENDER_TIMEOUT_MS }
+    );
+    const renderError = await page.evaluate(() => window.__tpRenderError || null);
+    if (renderError) throw new Error(`render-mode bootstrap failed: ${renderError}`);
+
+    const stage = await page.$('#tpStage');
+    if (!stage) throw new Error('#tpStage not found in rendered page');
+    const buffer = await stage.screenshot({ type: 'png', omitBackground: false });
+
+    return {
+      buffer,
+      contentType: 'image/png',
+      width:  dims.w,
+      height: dims.h,
+      bytes:  buffer.length,
+      kind:   'image'
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 // PHASE-1A STUB. Real implementation: cloudinary.uploader.upload_stream
