@@ -104,10 +104,11 @@ async function renderCreative(req) {
     const t = Date.now();
     renderOutput = await renderStage({
       layoutInputArtifactId,
-      template:    req.creative.template,
-      aspectRatio: req.creative.aspectRatio,
+      template:     req.creative.template,
+      aspectRatio:  req.creative.aspectRatio,
       expectedKind: req.creative.expectedKind,
-      mediaId:     req.creative.mediaId
+      mediaId:      req.creative.mediaId,
+      brandId:      req.brandId
     });
     stages.render = Date.now() - t;
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB)`);
@@ -220,7 +221,7 @@ console.log(
   `RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS}`
 );
 
-async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId }) {
+async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
   url.searchParams.set('renderMode', '1');
@@ -254,19 +255,21 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
       if (s >= 400) push(`[response ${s}] ${res.url()}`);
     });
 
-    // Auth: render-token via cookie so /api/* requests from the page
-    // are authenticated. The route handler that calls renderCreative
-    // forwards the operator's auth token via env-fallback for now;
-    // proper per-request token threading lands when we wire the queue.
+    // Auth: legacy /ads.html bootstraps via auth.js, which reads
+    // localStorage.auth_token (NOT a cookie) and redirects to
+    // /login.html when missing. Seed localStorage on the about:blank
+    // origin BEFORE navigation so the value is visible by the time
+    // ads.html's auth.js runs. brand_id is similarly read from
+    // localStorage and forwarded as X-Brand-Id; advertiser is
+    // resolved server-side via the JWT's membership lookup, so we
+    // don't need to seed advertiser_id.
     if (RENDER_AUTH_TOKEN) {
-      const cookieDomain = new URL(FRONTEND_URL).hostname;
-      await page.setCookie({
-        name:   'auth',
-        value:  RENDER_AUTH_TOKEN,
-        domain: cookieDomain,
-        path:   '/',
-        httpOnly: false
-      });
+      await page.evaluateOnNewDocument((token, bId) => {
+        try {
+          if (token) localStorage.setItem('auth_token', token);
+          if (bId)   localStorage.setItem('brand_id',   bId);
+        } catch (_) { /* localStorage may be sandboxed pre-navigation; will retry post-goto */ }
+      }, RENDER_AUTH_TOKEN, brandId || '');
     }
 
     await page.goto(url.toString(), { waitUntil: 'networkidle0', timeout: RENDER_TIMEOUT_MS });
