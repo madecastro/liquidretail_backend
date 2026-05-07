@@ -212,7 +212,10 @@ const FRONTEND_URL = process.env.FRONTEND_URL
   || (process.env.FRONTEND_URLS || '').split(',').map(s => s.trim()).filter(Boolean)[0]
   || 'http://localhost:5173';
 const RENDER_AUTH_TOKEN  = process.env.RENDER_AUTH_TOKEN  || null;
-const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '20000', 10);
+// 35s default — covers cold-start backend + image fetch from
+// Cloudinary/IG CDN + double-RAF settle. Override via env if a
+// specific deploy needs more (heavy templates) or less (tight CI).
+const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '35000', 10);
 
 console.log(
   `🎬 renderService config — ` +
