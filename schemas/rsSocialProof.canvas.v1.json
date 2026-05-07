@@ -684,7 +684,9 @@
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
             "badge_row": 2,
-            "quote_card": { "font": 1.6 }
+            "quote_card": {
+              "font": 1.6
+            }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -821,7 +823,7 @@
               "padding": 14,
               "max_lines": 2,
               "style_variant": "with_author_photo",
-              "min_h_fraction": 1.0
+              "min_h_fraction": 1
             },
             {
               "id": "badge_row",
@@ -877,7 +879,9 @@
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
             "badge_row": 2,
-            "quote_card": { "font": 1.6 }
+            "quote_card": {
+              "font": 1.6
+            }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -1014,7 +1018,7 @@
               "padding": 12,
               "max_lines": 2,
               "style_variant": "with_author_photo",
-              "min_h_fraction": 1.0
+              "min_h_fraction": 1
             },
             {
               "id": "badge_row",
@@ -1074,7 +1078,6 @@
           "headline",
           "eyebrow_rules",
           "proof_bar",
-          "section_header",
           "product_meta",
           "badge_row",
           "cta",
@@ -1083,7 +1086,6 @@
         "hierarchy": [
           "support_media",
           "headline",
-          "section_header",
           "product_meta",
           "proof_bar",
           "cta"
@@ -1107,7 +1109,10 @@
           "zone_scalers": {
             "proof_bar": 1.25,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row": 2,
+            "product_meta": {
+              "font": 1.6
+            }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -1230,24 +1235,6 @@
               "style_variant": "with_verified_buyers"
             },
             {
-              "id": "section_header",
-              "kind": "text",
-              "slot": [
-                "copy.eyebrow",
-                "product.category",
-                "brand.tagline"
-              ],
-              "rect": {
-                "x": 540,
-                "y": 418,
-                "w": 420,
-                "h": 14
-              },
-              "layer": "copy",
-              "style_variant": "section_header",
-              "max_lines": 1
-            },
-            {
               "id": "product_meta",
               "kind": "text",
               "slot": [
@@ -1257,13 +1244,14 @@
               ],
               "rect": {
                 "x": 540,
-                "y": 436,
+                "y": 418,
                 "w": 420,
-                "h": 282
+                "h": 300
               },
               "layer": "copy",
               "style_variant": "body_description",
-              "max_lines": 12
+              "max_lines": 6,
+              "min_h_fraction": 0.75
             },
             {
               "id": "badge_row",
@@ -1331,7 +1319,10 @@
             "headline": 2,
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row": 2,
+            "product_meta": {
+              "font": 1.6
+            }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -1455,25 +1446,6 @@
               "column": "left"
             },
             {
-              "id": "section_header",
-              "kind": "text",
-              "slot": [
-                "copy.eyebrow",
-                "product.category",
-                "brand.tagline"
-              ],
-              "rect": {
-                "x": 60,
-                "y": 893,
-                "w": 528,
-                "h": 14
-              },
-              "layer": "copy",
-              "style_variant": "section_header",
-              "max_lines": 1,
-              "column": "left"
-            },
-            {
               "id": "product_meta",
               "kind": "text",
               "slot": [
@@ -1483,14 +1455,15 @@
               ],
               "rect": {
                 "x": 60,
-                "y": 911,
+                "y": 893,
                 "w": 528,
-                "h": 299
+                "h": 317
               },
               "layer": "copy",
               "style_variant": "body_description",
-              "max_lines": 14,
-              "column": "left"
+              "max_lines": 8,
+              "column": "left",
+              "min_h_fraction": 0.75
             },
             {
               "id": "badge_row",
@@ -1560,7 +1533,10 @@
             "headline": 2,
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row": 2,
+            "product_meta": {
+              "font": 1.6
+            }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -1696,25 +1672,6 @@
               "column": "left"
             },
             {
-              "id": "section_header",
-              "kind": "text",
-              "slot": [
-                "copy.eyebrow",
-                "product.category",
-                "brand.tagline"
-              ],
-              "rect": {
-                "x": 60,
-                "y": 1277,
-                "w": 528,
-                "h": 14
-              },
-              "layer": "copy",
-              "style_variant": "section_header",
-              "max_lines": 1,
-              "column": "left"
-            },
-            {
               "id": "product_meta",
               "kind": "text",
               "slot": [
@@ -1724,14 +1681,15 @@
               ],
               "rect": {
                 "x": 60,
-                "y": 1295,
+                "y": 1277,
                 "w": 528,
-                "h": 423
+                "h": 441
               },
               "layer": "copy",
               "style_variant": "body_description",
-              "max_lines": 18,
-              "column": "left"
+              "max_lines": 9,
+              "column": "left",
+              "min_h_fraction": 0.4
             },
             {
               "id": "badge_row",
@@ -1788,7 +1746,10 @@
           "zone_scalers": {
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row": 2,
+            "product_meta": {
+              "font": 1.6
+            }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -1911,24 +1872,6 @@
               "style_variant": "with_verified_buyers"
             },
             {
-              "id": "section_header",
-              "kind": "text",
-              "slot": [
-                "copy.eyebrow",
-                "product.category",
-                "brand.tagline"
-              ],
-              "rect": {
-                "x": 452,
-                "y": 307,
-                "w": 516,
-                "h": 12
-              },
-              "layer": "copy",
-              "style_variant": "section_header",
-              "max_lines": 1
-            },
-            {
               "id": "product_meta",
               "kind": "text",
               "slot": [
@@ -1938,13 +1881,14 @@
               ],
               "rect": {
                 "x": 452,
-                "y": 323,
+                "y": 307,
                 "w": 516,
-                "h": 120
+                "h": 136
               },
               "layer": "copy",
               "style_variant": "body_description",
-              "max_lines": 7
+              "max_lines": 2,
+              "min_h_fraction": 1
             },
             {
               "id": "badge_row",
@@ -1999,7 +1943,10 @@
           "zone_scalers": {
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row": 2,
+            "product_meta": {
+              "font": 1.6
+            }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -2122,24 +2069,6 @@
               "style_variant": "with_verified_buyers"
             },
             {
-              "id": "section_header",
-              "kind": "text",
-              "slot": [
-                "copy.eyebrow",
-                "product.category",
-                "brand.tagline"
-              ],
-              "rect": {
-                "x": 452,
-                "y": 280,
-                "w": 516,
-                "h": 10
-              },
-              "layer": "copy",
-              "style_variant": "section_header",
-              "max_lines": 1
-            },
-            {
               "id": "product_meta",
               "kind": "text",
               "slot": [
@@ -2149,13 +2078,14 @@
               ],
               "rect": {
                 "x": 452,
-                "y": 294,
+                "y": 280,
                 "w": 516,
-                "h": 100
+                "h": 114
               },
               "layer": "copy",
               "style_variant": "body_description",
-              "max_lines": 6
+              "max_lines": 2,
+              "min_h_fraction": 1
             },
             {
               "id": "badge_row",
