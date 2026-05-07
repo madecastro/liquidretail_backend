@@ -1236,11 +1236,11 @@
             },
             {
               "id": "product_meta",
-              "kind": "text",
+              "kind": "product_card",
               "slot": [
-                "product.description",
-                "brand.summary",
-                "brand.tagline"
+                "product.image",
+                "product.name",
+                "product.price"
               ],
               "rect": {
                 "x": 540,
@@ -1249,9 +1249,11 @@
                 "h": 300
               },
               "layer": "copy",
-              "style_variant": "body_description",
+              "style_variant": "with_thumbnail",
               "max_lines": 6,
-              "min_h_fraction": 0.75
+              "min_h_fraction": 0.75,
+              "padding": 14,
+              "radius": 8
             },
             {
               "id": "badge_row",
@@ -1447,11 +1449,11 @@
             },
             {
               "id": "product_meta",
-              "kind": "text",
+              "kind": "product_card",
               "slot": [
-                "product.description",
-                "brand.summary",
-                "brand.tagline"
+                "product.image",
+                "product.name",
+                "product.price"
               ],
               "rect": {
                 "x": 60,
@@ -1460,10 +1462,12 @@
                 "h": 317
               },
               "layer": "copy",
-              "style_variant": "body_description",
+              "style_variant": "with_thumbnail",
               "max_lines": 8,
               "column": "left",
-              "min_h_fraction": 0.75
+              "min_h_fraction": 0.75,
+              "padding": 14,
+              "radius": 8
             },
             {
               "id": "badge_row",
@@ -1673,11 +1677,11 @@
             },
             {
               "id": "product_meta",
-              "kind": "text",
+              "kind": "product_card",
               "slot": [
-                "product.description",
-                "brand.summary",
-                "brand.tagline"
+                "product.image",
+                "product.name",
+                "product.price"
               ],
               "rect": {
                 "x": 60,
@@ -1686,10 +1690,12 @@
                 "h": 441
               },
               "layer": "copy",
-              "style_variant": "body_description",
+              "style_variant": "with_thumbnail",
               "max_lines": 9,
               "column": "left",
-              "min_h_fraction": 0.4
+              "min_h_fraction": 0.4,
+              "padding": 14,
+              "radius": 8
             },
             {
               "id": "badge_row",
@@ -1873,11 +1879,11 @@
             },
             {
               "id": "product_meta",
-              "kind": "text",
+              "kind": "product_card",
               "slot": [
-                "product.description",
-                "brand.summary",
-                "brand.tagline"
+                "product.image",
+                "product.name",
+                "product.price"
               ],
               "rect": {
                 "x": 452,
@@ -1886,9 +1892,11 @@
                 "h": 136
               },
               "layer": "copy",
-              "style_variant": "body_description",
+              "style_variant": "with_thumbnail",
               "max_lines": 2,
-              "min_h_fraction": 1
+              "min_h_fraction": 1,
+              "padding": 14,
+              "radius": 8
             },
             {
               "id": "badge_row",
@@ -2070,11 +2078,11 @@
             },
             {
               "id": "product_meta",
-              "kind": "text",
+              "kind": "product_card",
               "slot": [
-                "product.description",
-                "brand.summary",
-                "brand.tagline"
+                "product.image",
+                "product.name",
+                "product.price"
               ],
               "rect": {
                 "x": 452,
@@ -2083,9 +2091,11 @@
                 "h": 114
               },
               "layer": "copy",
-              "style_variant": "body_description",
+              "style_variant": "with_thumbnail",
               "max_lines": 2,
-              "min_h_fraction": 1
+              "min_h_fraction": 1,
+              "padding": 14,
+              "radius": 8
             },
             {
               "id": "badge_row",
