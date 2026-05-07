@@ -683,7 +683,8 @@
           "zone_scalers": {
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row": 2,
+            "quote_card": { "font": 1.6 }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -818,7 +819,7 @@
               "layer": "proof",
               "radius": 8,
               "padding": 14,
-              "max_lines": 4,
+              "max_lines": 2,
               "style_variant": "with_author_photo",
               "min_h_fraction": 1.0
             },
@@ -875,7 +876,8 @@
           "zone_scalers": {
             "proof_bar": 1.5,
             "eyebrow_rules": 2,
-            "badge_row": 2
+            "badge_row": 2,
+            "quote_card": { "font": 1.6 }
           },
           "canvas": {
             "unit_system": "normalized_1000",
@@ -1010,7 +1012,7 @@
               "layer": "proof",
               "radius": 8,
               "padding": 12,
-              "max_lines": 4,
+              "max_lines": 2,
               "style_variant": "with_author_photo",
               "min_h_fraction": 1.0
             },

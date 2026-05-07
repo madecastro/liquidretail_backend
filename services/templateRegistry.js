@@ -94,7 +94,15 @@ function pickTruncationOverride(zone, tr) {
   if (zid === 'headline'     && tr.headline_max_lines)      out.max_lines = tr.headline_max_lines;
   if (zid === 'subheadline'  && tr.subheadline_max_lines)   out.max_lines = tr.subheadline_max_lines;
   if (zid === 'product_meta' && tr.product_name_max_lines)  out.max_lines = tr.product_name_max_lines;
-  if (/quote/.test(zid)      && tr.quote_max_lines)         out.max_lines = tr.quote_max_lines;
+  // truncation_rules.quote_max_lines acts as a CAP — canvas zone
+  // max_lines can go lower (e.g. 16:9 / 1.91:1 quote_card capping at
+  // 2 lines for the tighter landscape slots) but not higher than
+  // the editorial cap.
+  if (/quote/.test(zid) && tr.quote_max_lines) {
+    out.max_lines = (zone.max_lines != null)
+      ? Math.min(zone.max_lines, tr.quote_max_lines)
+      : tr.quote_max_lines;
+  }
   if (zid === 'cta'          && tr.cta_max_chars)           out.max_chars = tr.cta_max_chars;
   return out;
 }
