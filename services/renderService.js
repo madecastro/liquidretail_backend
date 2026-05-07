@@ -289,9 +289,55 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
     const renderError = await page.evaluate(() => window.__tpRenderError || null);
     if (renderError) throw new Error(`render-mode bootstrap failed: ${renderError}`);
 
-    const stage = await page.$('#tpStage');
-    if (!stage) throw new Error('#tpStage not found in rendered page');
-    const buffer = await stage.screenshot({ type: 'png', omitBackground: false });
+    // Read the stage's actual layout state — capturing this before
+    // screenshot lets us throw a useful diagnostic when the canvas
+    // didn't size, instead of the opaque "Node has 0 width" error
+    // from elementHandle.screenshot.
+    const stageInfo = await page.evaluate(() => {
+      const el = document.getElementById('tpStage');
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      const cs = window.getComputedStyle(el);
+      const ancestorChain = [];
+      let cur = el.parentElement;
+      while (cur && cur !== document.body && ancestorChain.length < 8) {
+        const acs = window.getComputedStyle(cur);
+        const ar = cur.getBoundingClientRect();
+        ancestorChain.push({
+          tag: cur.tagName.toLowerCase(),
+          id: cur.id || null,
+          cls: cur.className || null,
+          display: acs.display,
+          width: Math.round(ar.width),
+          height: Math.round(ar.height)
+        });
+        cur = cur.parentElement;
+      }
+      return {
+        rect:     { x: r.x, y: r.y, w: r.width, h: r.height },
+        inline:   { width: el.style.width, height: el.style.height, transform: el.style.transform },
+        computed: { width: cs.width, height: cs.height, display: cs.display, position: cs.position, transform: cs.transform },
+        innerLen: el.innerHTML.length,
+        ancestors: ancestorChain
+      };
+    });
+    if (!stageInfo) throw new Error('#tpStage not found in rendered page');
+    if (!stageInfo.rect.w || !stageInfo.rect.h) {
+      throw new Error(`#tpStage has zero size — diagnostic: ${JSON.stringify(stageInfo)}`);
+    }
+
+    // Clip-based screenshot via page.screenshot rather than the
+    // elementHandle.screenshot path — sidesteps Puppeteer's ancestor-
+    // visibility check and works as long as the rect is non-empty.
+    const buffer = await page.screenshot({
+      type: 'png',
+      clip: {
+        x:      stageInfo.rect.x,
+        y:      stageInfo.rect.y,
+        width:  stageInfo.rect.w,
+        height: stageInfo.rect.h
+      }
+    });
 
     return {
       buffer,
