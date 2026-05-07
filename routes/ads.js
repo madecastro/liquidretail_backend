@@ -55,7 +55,7 @@ router.post('/generate', async (req, res) => {
       templateIds,
       cta,
       urlParams,
-      requestedBy: req.user?.id ? String(req.user.id) : null
+      requestedBy: req.user?.userId || null
     });
 
     if (!job.creatives.length) {
@@ -76,7 +76,7 @@ router.post('/generate', async (req, res) => {
       campaignKind: job.campaignKind,
       total:        job.creatives.length,
       status:       'running',
-      requestedBy:  req.user?.id || null,
+      requestedBy:  req.user?.userId || null,
       startedAt:    new Date()
     });
 
