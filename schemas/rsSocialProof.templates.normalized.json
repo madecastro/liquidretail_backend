@@ -288,11 +288,10 @@
         "cta_button_bg": {
           "source_priority": [
             "media.palette_vibrant",
-            "media.palette_accent",
-            "brand.accent_color",
-            "brand.primary_color"
+            "brand.accent_color"
           ],
-          "default": "#FF6B35"
+          "default": "#FF6B35",
+          "comment": "Image-led: vibrant image color when one passes the saturation+contrast gates. Otherwise brand accent or default orange — NEVER palette_accent (palette[1] is dominance-ranked and can be a near-white off-tone that washes out white CTA text)."
         },
         "cta_button_text": {
           "default": "auto-from-brightness"
@@ -604,11 +603,10 @@
         "cta_button_bg": {
           "source_priority": [
             "media.palette_vibrant",
-            "media.palette_accent",
-            "brand.accent_color",
-            "brand.primary_color"
+            "brand.accent_color"
           ],
-          "default": "#FF6B35"
+          "default": "#FF6B35",
+          "comment": "Image-led: vibrant image color when one passes the saturation+contrast gates. Otherwise brand accent or default orange — NEVER palette_accent (palette[1] is dominance-ranked and can be a near-white off-tone that washes out white CTA text)."
         },
         "cta_button_text": {
           "default": "auto-from-brightness"

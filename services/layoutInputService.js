@@ -124,7 +124,12 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 // 3.4 dials VIBRANT_MIN_SATURATION 0.30 → 0.40 so more borderline
 // palettes (tan/beige product photography, low-saturation lifestyle
 // shots) fall through to the white-headline default.
-const INPUT_SCHEMA_VERSION = '3.4';
+// 3.5 dials thresholds way up: saturation 0.40 → 0.80, contrast 4.0
+// → 8.0 (AAA territory). Tightens cta_button_bg chain for
+// testimonial_spotlight + ugc_split_screen to drop palette_accent —
+// it's dominance-ranked palette[1] and can be a near-white off-tone
+// that washes out the white CTA text.
+const INPUT_SCHEMA_VERSION = '3.5';
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -1247,18 +1252,17 @@ function mediaPair(p) {
 // is effectively monochromatic (every entry sits on the same color
 // family at different shades) and picking any one as the accent
 // renders too close to palette_dominant for headline contrast.
-const VIBRANT_MIN_SATURATION = 0.40;
+// 0.80 is intentionally aggressive — only deeply saturated tones
+// (the flame in the HCO reference, a brand-orange logo on neutrals)
+// pass. Borderline colors fall through to the white default.
+const VIBRANT_MIN_SATURATION = 0.80;
 
 // Minimum WCAG contrast ratio between the vibrant pick and the
 // palette's dominant tone (which the panel background is bound to in
-// the testimonial_spotlight image-led layouts). A "blue-gray on dark
-// blue" palette passes the saturation gate (the blue-gray is
-// saturated enough) but the two colors still blend on the panel
-// because they share a hue. Contrast catches that — large-text WCAG
-// minimum is 3.0; we lift to 4.0 so a headline against the dark panel
-// always reads as a distinct foreground. Sub-threshold candidates fall
-// through to the white default.
-const VIBRANT_MIN_CONTRAST_VS_DOMINANT = 4.0;
+// the image-led split-panel layouts). 8.0 is AAA-territory — even
+// a high-saturation pick that happens to share a hue family with the
+// panel will fail this gate and fall through to the white default.
+const VIBRANT_MIN_CONTRAST_VS_DOMINANT = 8.0;
 
 function pickVibrantColor(palette) {
   if (!Array.isArray(palette) || palette.length === 0) return null;
