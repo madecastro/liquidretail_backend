@@ -52,14 +52,24 @@ const CANVAS_DIMS = {
 
 async function renderCreative(req) {
   const jobId = req.jobId || crypto.randomBytes(8).toString('hex');
+  const { template, aspectRatio, mediaId } = req.creative || {};
+  const tag = `[render ${req.campaignRunId || '-'}#${jobId}]`;
+  const stages = {};
+  const t0 = Date.now();
+
+  console.log(`🎬 ${tag} start — ${template}/${aspectRatio} media=${mediaId} product=${req.creative?.productId || '-'}`);
 
   // 1. derive — build / load the LayoutInputArtifact
   let input, layoutInputArtifactId;
   try {
+    const t = Date.now();
     const r = await deriveStage(req);
     input = r.input;
     layoutInputArtifactId = r.layoutInputArtifactId;
+    stages.derive = Date.now() - t;
+    console.log(`   📐 ${tag} derive ok in ${stages.derive}ms (artifact=${layoutInputArtifactId || 'none'})`);
   } catch (err) {
+    console.error(`   ❌ ${tag} derive: ${err.message || err}`);
     return failed(jobId, 'derive', err);
   }
 
@@ -72,7 +82,9 @@ async function renderCreative(req) {
     if (validation.minCountFailures && Object.keys(validation.minCountFailures).length) {
       reasons.push(`minCount=${Object.keys(validation.minCountFailures).join(',')}`);
     }
-    return { jobId, status: 'skipped', skipReason: `template validation: ${reasons.join('; ') || 'unknown'}` };
+    const reason = `template validation: ${reasons.join('; ') || 'unknown'}`;
+    console.log(`   ⏭️  ${tag} skipped — ${reason}`);
+    return { jobId, status: 'skipped', skipReason: reason };
   }
 
   // 3. de-dupe — has this exact creative been rendered before?
@@ -82,12 +94,14 @@ async function renderCreative(req) {
     derivationDigest
   }).lean();
   if (existing) {
+    console.log(`   ♻️  ${tag} dedupe hit — reusing Ad ${existing._id} (digest=${derivationDigest.slice(0,8)})`);
     return success(jobId, existing);
   }
 
-  // 4. render — Puppeteer screenshot (STUBBED in Phase 1A)
+  // 4. render — Puppeteer screenshot
   let renderOutput;
   try {
+    const t = Date.now();
     renderOutput = await renderStage({
       layoutInputArtifactId,
       template:    req.creative.template,
@@ -95,13 +109,17 @@ async function renderCreative(req) {
       expectedKind: req.creative.expectedKind,
       mediaId:     req.creative.mediaId
     });
+    stages.render = Date.now() - t;
+    console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB)`);
   } catch (err) {
+    console.error(`   ❌ ${tag} render: ${err.message || err}`);
     return failed(jobId, 'render', err);
   }
 
-  // 5. upload — Cloudinary (STUBBED in Phase 1A)
+  // 5. upload — Cloudinary
   let upload;
   try {
+    const t = Date.now();
     upload = await uploadStage(renderOutput, {
       brandId:          req.brandId,
       campaignId:       req.campaignId,
@@ -110,13 +128,17 @@ async function renderCreative(req) {
       aspectRatio:      req.creative.aspectRatio,
       derivationDigest
     });
+    stages.upload = Date.now() - t;
+    console.log(`   ☁️  ${tag} upload ok in ${stages.upload}ms (publicId=${upload.cloudinaryPublicId})`);
   } catch (err) {
+    console.error(`   ❌ ${tag} upload: ${err.message || err}`);
     return failed(jobId, 'upload', err);
   }
 
   // 6. persist — Ad doc
   let ad;
   try {
+    const t = Date.now();
     ad = await persistStage({
       req,
       input,
@@ -125,10 +147,15 @@ async function renderCreative(req) {
       renderOutput,
       upload
     });
+    stages.persist = Date.now() - t;
+    console.log(`   💾 ${tag} persist ok in ${stages.persist}ms (Ad ${ad._id})`);
   } catch (err) {
+    console.error(`   ❌ ${tag} persist: ${err.message || err}`);
     return failed(jobId, 'persist', err);
   }
 
+  const totalMs = Date.now() - t0;
+  console.log(`🎉 ${tag} done in ${totalMs}ms (derive=${stages.derive||0} render=${stages.render||0} upload=${stages.upload||0} persist=${stages.persist||0})`);
   return success(jobId, ad.toObject ? ad.toObject() : ad);
 }
 

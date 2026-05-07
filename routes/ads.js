@@ -113,6 +113,12 @@ router.post('/generate', async (req, res) => {
 // the CampaignRun doc as each creative finishes so the frontend's
 // poller can show real-time progress.
 async function runRenderLoop(run, job) {
+  const t0 = Date.now();
+  console.log(
+    `🚀 [campaignRun ${run.runId}] start — ${job.creatives.length} creative(s) ` +
+    `concurrency=${RENDER_CONCURRENCY} brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
+  );
+
   const queue = job.creatives.map((c, i) => ({ creative: c, index: i }));
   let inflight = 0;
   let next     = 0;
@@ -124,7 +130,7 @@ async function runRenderLoop(run, job) {
         inflight++;
         renderOne(run, job, creative, index)
           .catch(err => {
-            console.error(`❌ render ${run.runId}#${index} crashed:`, err);
+            console.error(`❌ [campaignRun ${run.runId}] #${index} dispatch crash:`, err.message || err);
           })
           .finally(() => {
             inflight--;
@@ -139,6 +145,12 @@ async function runRenderLoop(run, job) {
   await CampaignRun.updateOne(
     { _id: run._id },
     { status: 'done', completedAt: new Date() }
+  );
+  const totalMs = Date.now() - t0;
+  const final = await CampaignRun.findById(run._id).select('succeeded skipped failed').lean();
+  console.log(
+    `🎉 [campaignRun ${run.runId}] done in ${totalMs}ms — ` +
+    `${final?.succeeded || 0} succeeded · ${final?.skipped || 0} skipped · ${final?.failed || 0} failed`
   );
 }
 
