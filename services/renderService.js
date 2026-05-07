@@ -287,7 +287,12 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
       throw new Error(`${waitErr.message}${tail}`);
     }
     const renderError = await page.evaluate(() => window.__tpRenderError || null);
-    if (renderError) throw new Error(`render-mode bootstrap failed: ${renderError}`);
+    if (renderError) {
+      const tail = pageEvents.length
+        ? `\n  page signals (last ${pageEvents.length}):\n    ${pageEvents.join('\n    ')}`
+        : '';
+      throw new Error(`render-mode bootstrap failed: ${renderError}${tail}`);
+    }
 
     // Read the stage's actual layout state — capturing this before
     // screenshot lets us throw a useful diagnostic when the canvas
