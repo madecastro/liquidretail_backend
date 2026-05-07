@@ -400,7 +400,8 @@
               "padding": 16,
               "max_lines": 8,
               "style_variant": "with_author_photo",
-              "column": "left"
+              "column": "left",
+              "min_h_fraction": 0.75
             },
             {
               "id": "badge_row",
