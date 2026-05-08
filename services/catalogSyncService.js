@@ -205,6 +205,17 @@ async function syncCatalogForCred(cred) {
   const totalCount = await CatalogProduct.countDocuments({ brandId, source: 'ig-catalog' });
   console.log(`📦 catalog sync done: brand=${brandId} fetched=${fetched} added=${added} updated=${updated} errors=${errors} total=${totalCount} in ${Date.now() - t0}ms`);
 
+  // Trigger the product-path detect pipeline for any product that
+  // doesn't yet have an imageMediaId. Each product gets one DetectRun
+  // for the hero + up to MAX_ALT_IMAGES alt runs. Idempotent — re-syncs
+  // skip products whose imageMediaId is already populated.
+  try {
+    const { enqueueBrandProductDetects } = require('./catalogProductDetectService');
+    await enqueueBrandProductDetects(brandId);
+  } catch (err) {
+    console.warn(`   ⚠️  product-path detect enqueue failed: ${err.message}`);
+  }
+
   return {
     ok: true,
     fetched,

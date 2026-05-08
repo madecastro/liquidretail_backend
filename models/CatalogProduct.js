@@ -58,8 +58,20 @@ const catalogProductSchema = new mongoose.Schema({
   availability: String,    // "in stock" | "out of stock" | etc.
 
   // Imagery
-  imageUrl:        String,    // primary image
-  additionalImages: [String], // up to N alt views
+  imageUrl:        String,    // primary image (hero)
+  additionalImages: [String], // alt views — capped at 4 by the
+                              // product-path detect trigger so a
+                              // long-tail of look-alike alts doesn't
+                              // multiply pipeline cost without value.
+
+  // Wrapper Media docs created by catalogProductDetectService when
+  // the catalog sync triggers the product-path detect pipeline.
+  // imageMediaId points at the hero's Media (full artifact set);
+  // additionalImageMediaIds[] points at the alt wrappers (crops +
+  // palette only). Empty/absent until the first product-path run
+  // completes for this product.
+  imageMediaId:            { type: mongoose.Schema.Types.ObjectId, ref: 'Media', default: null },
+  additionalImageMediaIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Media' }],
 
   // Destination
   productUrl:   String,

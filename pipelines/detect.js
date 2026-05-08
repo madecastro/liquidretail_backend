@@ -77,7 +77,13 @@ async function processDetectRun(run) {
 
   run.stageTimings = {};
 
-  if (media.fileType === 'video') {
+  if (media.source === 'catalog-product') {
+    // Catalog images are clean, isolated, single-product. Skip the
+    // YOLO/identify/match chain (we already know what the product is)
+    // and run a trimmed pipeline focused on building ad-ready crops.
+    // Hero gets crops + judge; alts get crops only.
+    await runCatalogProductPipeline(run, media, buffer);
+  } else if (media.fileType === 'video') {
     await runVideoPipeline(run, media, buffer);
   } else {
     await runImagePipeline(run, media, buffer);
@@ -419,6 +425,93 @@ async function runVideoPipeline(run, media, buffer) {
   // products, primary subject rect) is already on Media. Future ticket:
   // fetch heroImageUrl bytes here for focus on the still.
   await applyMediaLibraryDerivations(media, null, overlayDoc, productMatches);
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Catalog-product pipeline (the product path)
+//
+//  Trimmed pipeline for clean, isolated catalog images. Skips
+//  YOLO/identify/match/reasoner/safety (we already know the product)
+//  and focuses on producing ad-ready crops + a color palette.
+//
+//  Hero (metadata.imageRole === 'hero') — full trim:
+//      smart-crops → judge → CropArtifact persist
+//  Alt  (metadata.imageRole === 'alt')  — stripped:
+//      smart-crops → CropArtifact persist (no judge, no winners)
+//
+//  Cost per hero ≈ $0.010 (judge); per alt ≈ $0.
+//  Time per hero ≈ 3-5s; per alt ≈ 1-2s.
+// ──────────────────────────────────────────────────────────────
+async function runCatalogProductPipeline(run, media, buffer) {
+  const sharp = require('sharp');
+  const sourceUrl = media.fileUrl;
+  const isHero = media.metadata?.imageRole !== 'alt';   // default to hero when role missing
+
+  // 1. Image dimensions (sharp metadata — no API cost).
+  await setRunPhase(run, 'detect-fanout');
+  const meta = await timeStage(run, 'image-meta', async () => {
+    return sharp(buffer).metadata();
+  });
+  const imgW = meta.width  || 1024;
+  const imgH = meta.height || 1024;
+
+  media.width  = imgW;
+  media.height = imgH;
+
+  // 2. Detection artifact — minimal stand-in so latestArtifacts.detection
+  //    isn't null. No products / subjects / text on the catalog path.
+  const detectionDoc = await DetectionArtifact.create({
+    mediaId: media._id, runId: run._id,
+    advertiserId: media.advertiserId, brandId: media.brandId,
+    width: imgW, height: imgH,
+    products: [], subjects: [], text: [],
+    background: null,
+    safeRect: null,
+    primarySubjectId:   null,
+    primarySubjectDesc: null
+  });
+
+  // 3. Smart crops at every supported ratio. No subjects/text inputs
+  //    for the catalog path — the cropper falls back to centered
+  //    crops which is exactly what an isolated product photo wants.
+  await setRunPhase(run, 'crop-judge');
+  const crops = await timeStage(run, 'smart-crops', async () =>
+    generateSmartCrops(imgW, imgH, [], [], null)
+  );
+
+  // 4. Judge — hero only. Picks the best framing per ratio.
+  let judge = null;
+  if (isHero) {
+    judge = await timeStage(run, 'judge', async () => {
+      try {
+        return await judgeDetections({ imageUrl: sourceUrl, products: [], subjects: [], text: [], crops, safeRect: null });
+      } catch (err) { console.warn('⚠️  Catalog-path judge:', err.message); return null; }
+    });
+  }
+
+  const cropDoc = await CropArtifact.create({
+    mediaId: media._id, runId: run._id,
+    advertiserId: media.advertiserId, brandId: media.brandId,
+    smartCrops: crops,
+    judge,
+    winners: {
+      '5:4': judge?.crop_5_4?.winnerId || null,
+      '1:1': judge?.crop_1_1?.winnerId || null,
+      '4:5': judge?.crop_4_5?.winnerId || null
+    }
+  });
+
+  // 5. Finalize. The catalog path doesn't fan out into match/overlay/
+  //    extended-crops in V1 — those are deferred until we see real
+  //    operator demand for "promote alt to template overlay" or
+  //    cross-product matching.
+  await setRunPhase(run, 'finalize');
+  await updateMediaLatestArtifacts(media, {
+    detection: detectionDoc._id,
+    crops:     cropDoc._id
+  });
+
+  console.log(`📦 catalog-product detect (${isHero ? 'hero' : 'alt'}) done — crops=${crops.length}, judge=${judge ? 'yes' : 'skipped'}`);
 }
 
 // ──────────────────────────────────────────────────────────────
