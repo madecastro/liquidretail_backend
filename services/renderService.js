@@ -222,10 +222,12 @@ const FRONTEND_URL = process.env.FRONTEND_URL
   || (process.env.FRONTEND_URLS || '').split(',').map(s => s.trim()).filter(Boolean)[0]
   || 'http://localhost:5173';
 const RENDER_AUTH_TOKEN  = process.env.RENDER_AUTH_TOKEN  || null;
-// 35s default — covers cold-start backend + image fetch from
-// Cloudinary/IG CDN + double-RAF settle. Override via env if a
-// specific deploy needs more (heavy templates) or less (tight CI).
-const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '35000', 10);
+// 60s default — covers cold-start backend + image fetch from
+// Cloudinary/IG CDN + double-RAF settle, with headroom for tail-of-
+// run renders where Chromium memory pressure slows asset fetches.
+// Override via env if a specific deploy needs more (heavy templates)
+// or less (tight CI).
+const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '60000', 10);
 
 // Decode the token's payload (without verifying) so the boot log can
 // surface exp + user identity. Helps an operator confirm at a glance
@@ -325,7 +327,13 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
       }, authToken, brandId || '');
     }
 
-    await page.goto(url.toString(), { waitUntil: 'networkidle0', timeout: RENDER_TIMEOUT_MS });
+    // waitUntil: 'domcontentloaded' rather than 'networkidle0' — the
+    // renderer signals readiness via window.__tpRenderReady (waited
+    // for below), which already implies all assets it needed have
+    // loaded. networkidle0 was a redundant double-wait that stalled
+    // tail-of-run renders when Chromium memory pressure slowed
+    // background fetches enough to never reach the 0-in-flight gate.
+    await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: RENDER_TIMEOUT_MS });
     try {
       await page.waitForFunction(
         'window.__tpRenderReady === true || typeof window.__tpRenderError === "string"',
