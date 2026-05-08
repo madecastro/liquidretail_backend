@@ -412,6 +412,15 @@ router.get('/:id/onboarding-status', async (req, res) => {
       Campaign.countDocuments({ brandId: brand._id, platform: 'reach-social' })
     ]);
 
+    // Live activity — what the system is "doing right now" for this
+    // brand. Drives the floating ActivityBar at the top of the app
+    // shell. Resolution order:
+    //   1. Most-recent DetectRun in 'processing' (real-time stage info)
+    //   2. Brand enrichment in flight (no tone yet AND created recently)
+    //   3. Catalog/post/campaign sync running (no persistent signal —
+    //      handwave via the queue tail when nothing else is in flight)
+    const liveActivity = await deriveLiveActivity(brand, productMediaIdSet, productRuns, mediaRuns);
+
     res.json({
       enrichment,
       catalog: {
@@ -430,13 +439,69 @@ router.get('/:id/onboarding-status', async (req, res) => {
         google:       googleCampaigns,
         reachSocial:  reachCampaigns,
         total:        metaCampaigns + googleCampaigns + reachCampaigns
-      }
+      },
+      liveActivity
     });
   } catch (err) {
     console.error('onboarding-status failed:', err);
     res.status(500).json({ error: err.message || 'onboarding-status failed' });
   }
 });
+
+// Friendly stage names for the ActivityBar. DetectRun.stage is the
+// pipeline phase (set via setRunPhase in pipelines/detect.js); we
+// flatten + humanize so the bar reads naturally rather than leaking
+// implementation labels.
+const STAGE_LABELS = {
+  'queued':         'Queued',
+  'image-meta':     'Reading image',
+  'detect-fanout':  'Detecting products',
+  'crop-judge':     'AI cropping',
+  'enrich-fanout':  'AI matching media to products',
+  'finalize':       'Finalizing'
+};
+
+async function deriveLiveActivity(brand, productMediaIdSet, productRuns, mediaRuns) {
+  // 1. Active DetectRun? Look for the most-recent processing run scoped
+  //    to this brand. Catalog-product runs are joined by mediaId set;
+  //    for everything else we filter by brandId directly.
+  const activeRun = await DetectRun.findOne({
+    status: 'processing',
+    $or: [
+      { mediaId: { $in: productMediaIdSet } },
+      { brandId: brand._id, mediaId: { $nin: productMediaIdSet } }
+    ]
+  }).sort({ startedAt: -1 }).select('stage mediaId').lean();
+
+  if (activeRun) {
+    const isProductPath = productMediaIdSet.some(id => String(id) === String(activeRun.mediaId));
+    const stageLabel    = STAGE_LABELS[activeRun.stage] || 'Processing';
+    return {
+      active: true,
+      stage:  stageLabel,
+      sub:    isProductPath ? 'Catalog product' : 'Customer post'
+    };
+  }
+
+  // 2. Brand enrichment in flight — no tone yet, and the brand was
+  //    created in the last 10 minutes (older brands without tone are
+  //    enrichment failures, not in-flight runs).
+  const enrichmentRecent = brand.firstSeenAt && (Date.now() - new Date(brand.firstSeenAt).getTime() < 10 * 60 * 1000);
+  if (enrichmentRecent && (!brand.tone || brand.tone.length === 0)) {
+    return { active: true, stage: 'Deriving brand details', sub: brand.name };
+  }
+
+  // 3. Anything queued (about to start) — surface so the bar isn't
+  //    immediately blank between dispatches.
+  if (productRuns.queued > 0) {
+    return { active: true, stage: 'Queued: catalog product detect', sub: `${productRuns.queued} pending` };
+  }
+  if (mediaRuns.queued > 0) {
+    return { active: true, stage: 'Queued: post detect', sub: `${mediaRuns.queued} pending` };
+  }
+
+  return { active: false, stage: null, sub: null };
+}
 
 // Helper — group DetectRuns by status for either catalog-product
 // media (when productPath=true) or everything else under the brand.
