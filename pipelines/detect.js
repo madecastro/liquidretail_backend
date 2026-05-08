@@ -100,14 +100,20 @@ async function processDetectRun(run) {
 
 // ──────────────────────────────────────────────────────────────
 //  Image pipeline
+//
+//  Optional sourceUrlOverride lets the video pipeline reuse this
+//  function on a hero-frame JPEG without monkey-patching media.fileUrl.
+//  When set, every "analyze the source image" call (Gemini Vision,
+//  judge, product match, extended crops) targets the override URL
+//  while the Media doc itself keeps its real (.mp4) fileUrl on disk.
 // ──────────────────────────────────────────────────────────────
-async function runImagePipeline(run, media, buffer) {
-  const sourceUrl = media.fileUrl;
+async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
+  const sourceUrl = sourceUrlOverride || media.fileUrl;
 
   // ── Phase 1: detect fan-out ──
   await setRunPhase(run, 'detect-fanout');
   const [yoloRes, subjectsRes] = await Promise.allSettled([
-    runYoloChain(run, buffer, media),
+    runYoloChain(run, buffer, media, sourceUrl),
     runSubjectsTextChain(run, sourceUrl, media)
   ]);
   if (yoloRes.status === 'rejected')     console.warn('⚠️  YOLO chain rejected:', yoloRes.reason?.message);
@@ -257,125 +263,93 @@ async function runImagePipeline(run, media, buffer) {
 // ──────────────────────────────────────────────────────────────
 //  Video pipeline
 // ──────────────────────────────────────────────────────────────
-// V2 video path — minimal pipeline.
+// V3 video path — analyze the hero frame as if it were an image.
 //
-// Videos take a stripped path: YOLO finds the hero subject, smart-crops
-// generate against that bbox, done. We deliberately skip Whisper/NER,
-// Gemini subjects-text, judge, product-match, extended crops, and
-// overlay-zone analysis. Rationale: most video UGC has thin captions
-// and the full pipeline's per-video cost (>$0.10, ~30-60s) wasn't
-// returning useful product attribution.
+// We extract the canonical hero frame from the video (existing
+// runYoloVideoChain), then hand the JPEG to runImagePipeline so it
+// goes through the full subjects/text/judge/product-match/extended
+// chain. After the image pipeline returns we patch the resulting
+// DetectionArtifact + CropArtifact with video-specific data:
 //
-// To keep videos selectable in ad generation, we still emit a
-// brand_match ProductMatchArtifact so they surface in brand-mode
-// creative seeds (campaignAdsGenerationService.seedFromBrandOnly).
-// Operators who want catalog attribution on a specific video can
-// re-run it via a manual full-pipeline trigger (backlog).
+//   - DetectionArtifact.type → 'video', videoUrl + frame metadata
+//   - CropArtifact.smartCrops[*][*].videoUrl → Cloudinary c_crop URL
+//     against the source .mp4, so the UI ribbon plays cropped clips
+//
+// Cost trade: we pay image-pipeline cost (~\$0.05 + ~25s) per video
+// to get product attribution. Whisper/NER stays disabled — captions
+// are surface-level, the visual hero carries more product signal.
 async function runVideoPipeline(run, media, buffer) {
   const sourceVideoUrl = media.fileUrl;
 
-  // ── Phase 1: YOLO hero detection only ──
+  // ── Phase 1: extract hero frame ──
   await setRunPhase(run, 'detect-fanout');
-  let yoloOut;
+  let videoOut;
   try {
-    yoloOut = await runYoloVideoChain(run, buffer, media);
+    videoOut = await runYoloVideoChain(run, buffer, media);
   } catch (err) {
-    console.warn('⚠️  YOLO chain rejected:', err.message);
-    yoloOut = {
-      products: [], imgW: 1024, imgH: 768,
-      heroImageUrl: null, heroFrameSec: null, heroReason: null,
-      videoDurationSec: null
+    console.warn('⚠️  YOLO video chain rejected:', err.message);
+    videoOut = {
+      heroImageUrl: null, heroFrameSec: null, heroReason: 'yolo-rejected',
+      videoDurationSec: null, imgW: 1024, imgH: 768
     };
   }
-  const { products, imgW, imgH, heroImageUrl, heroFrameSec, heroReason, videoDurationSec } = yoloOut;
-
-  // Persist Media dimensions + duration.
-  media.width = imgW; media.height = imgH;
+  const { heroImageUrl, heroFrameSec, heroReason, videoDurationSec, imgW, imgH } = videoOut;
   if (videoDurationSec) media.durationSec = videoDurationSec;
-  await media.save();
 
-  const detectionDoc = await DetectionArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    type: 'video',
-    width: imgW, height: imgH,
-    imageUrl: heroImageUrl,
-    videoUrl: sourceVideoUrl,
-    heroFrameSec, heroReason, videoDurationSec,
-    yoloProducts: products.map(({ cropBuffer, ...p }) => p),
-    refinedProducts: [],
-    subjects: [], text: [], background: null,
-    transcript: null,
-    safeRect: null,
-    primarySubjectId: null,
-    primarySubjectDesc: null
-  });
-
-  // ── Phase 2: crops only (no judge) ──
-  await setRunPhase(run, 'crop-judge');
-
-  const safeRect = computeSafeRect(products, [], imgW, imgH, []);
-  if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
-
-  const crops = await timeStage(run, 'smart-crops', async () => {
-    const c = generateSmartCrops(imgW, imgH, [], [], safeRect);
-    for (const ratio of Object.keys(c)) {
-      for (const cand of c[ratio]) cand.videoUrl = buildCloudinaryCropUrl(sourceVideoUrl, cand);
-    }
-    return c;
-  });
-
-  detectionDoc.safeRect = safeRect || null;
-  await detectionDoc.save();
-
-  media.safeRect       = safeRect || null;
-  media.lastDetectedAt = new Date();
-  await media.save();
-
-  const cropDoc = await CropArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    smartCrops: crops,
-    judge: null,
-    winners: { '5:4': null, '1:1': null, '4:5': null }
-  });
-
-  // ── Phase 3: brand_match PMA so videos still seed ad generation ──
-  // No catalog matching, no Gemini visual compare — we just stamp the
-  // video as brand content. campaignAdsGenerationService picks these up
-  // via seedFromBrandOnly when the operator runs a brand-mode campaign
-  // or a promotional campaign with no product/media picks.
-  let matchDoc = null;
-  try {
-    matchDoc = await ProductMatchArtifact.create({
-      mediaId:      media._id,
-      runId:        run._id,
-      advertiserId: media.advertiserId,
-      brandId:      media.brandId,
-      outcome:      'brand_match',
-      catalogProductId: null,
-      categoryId:       null,
-      identification: { brand: media.metadata?.brand || null, certainty: null }
+  if (!heroImageUrl) {
+    console.warn(`⚠️  Video ${media._id} produced no hero frame — minimal artifacts only`);
+    media.lastDetectedAt = new Date();
+    await media.save();
+    const detectionDoc = await DetectionArtifact.create({
+      mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
+      type: 'video', width: imgW, height: imgH,
+      imageUrl: null, videoUrl: sourceVideoUrl,
+      heroFrameSec: null, heroReason: heroReason || 'no-hero-frame', videoDurationSec,
+      yoloProducts: [], refinedProducts: [], subjects: [], text: [], background: null, transcript: null,
+      safeRect: null, primarySubjectId: null, primarySubjectDesc: null
     });
-  } catch (err) {
-    console.warn(`⚠️  brand_match PMA create failed for video ${media._id}: ${err.message}`);
+    await setRunPhase(run, 'finalize');
+    await updateMediaLatestArtifacts(media, { detection: detectionDoc._id });
+    return;
   }
 
-  // Mark detect summary so the UI pill / catalog list show the right
-  // "video — brand content" state instead of "no match".
-  media.classification = media.classification || {};
-  media.classification.detectSummary = {
-    ...(media.classification.detectSummary || {}),
-    outcome: 'brand_match'
-  };
-  await media.save();
+  // ── Phase 2: download hero JPEG and run the full image pipeline ──
+  const heroBuffer = await downloadBuffer(heroImageUrl, 'video-hero-download');
+  await runImagePipeline(run, media, heroBuffer, heroImageUrl);
 
-  // ── Finalize ──
-  await setRunPhase(run, 'finalize');
-  await updateMediaLatestArtifacts(media, {
-    detection: detectionDoc._id,
-    crops:     cropDoc._id,
-    match:     matchDoc?._id,
-    matches:   matchDoc ? [matchDoc._id] : []
-  });
+  // ── Phase 3: augment artifacts with video-specific data ──
+  // The image pipeline persisted DetectionArtifact.type = 'image' and
+  // didn't know about the .mp4. Patch both the detection record and
+  // the crop record so consumers can play cropped clips and the UI
+  // can tell this came from a video.
+  await DetectionArtifact.updateOne(
+    { mediaId: media._id, runId: run._id },
+    { $set: {
+        type:             'video',
+        videoUrl:         sourceVideoUrl,
+        heroFrameSec,
+        heroReason,
+        videoDurationSec
+    }}
+  );
+
+  // The image pipeline's CropArtifact has coordinate-only smartCrops.
+  // Decorate each candidate with a Cloudinary c_crop video URL so the
+  // ribbon's cropped-clip playback works (mirrors the image-pipeline
+  // crops which carry imageUrl-only — frontend builds video URLs on
+  // the fly via buildCloudinaryVideoCropUrl from format.ts).
+  const cropDoc = await CropArtifact.findOne({ mediaId: media._id, runId: run._id });
+  if (cropDoc?.smartCrops) {
+    for (const ratio of Object.keys(cropDoc.smartCrops)) {
+      const list = cropDoc.smartCrops[ratio];
+      if (!Array.isArray(list)) continue;
+      for (const cand of list) {
+        cand.videoUrl = buildCloudinaryCropUrl(sourceVideoUrl, cand);
+      }
+    }
+    cropDoc.markModified('smartCrops');
+    await cropDoc.save();
+  }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -474,7 +448,8 @@ async function runCatalogProductPipeline(run, media, buffer) {
 //  race on save().
 // ──────────────────────────────────────────────────────────────
 
-async function runYoloChain(run, buffer, media) {
+async function runYoloChain(run, buffer, media, sourceUrlOverride = null) {
+  const refineSourceUrl = sourceUrlOverride || media.fileUrl;
   const products = await timeStage(run, 'yolo', async () => {
     try {
       const yolo = await detectMultipleProducts(buffer);
@@ -533,10 +508,14 @@ async function runYoloChain(run, buffer, media) {
   const survivors = products.filter(p =>
     p.identification?.label && p.identification.label !== 'non-product'
   );
-  if (survivors.length && media.fileType === 'image') {
+  // Allow refinement to run for video media too — when called from
+  // runVideoPipeline, sourceUrlOverride is the hero-frame JPEG URL,
+  // so refineDetectionCrops can do its image-side work normally.
+  const canRefine = !!refineSourceUrl && (media.fileType === 'image' || sourceUrlOverride);
+  if (survivors.length && canRefine) {
     refinedProducts = await timeStage(run, 'crop-refine', async () => {
       try {
-        const refined = await refineDetectionCrops(survivors, media.fileUrl);
+        const refined = await refineDetectionCrops(survivors, refineSourceUrl);
         console.log(`✂️   crop-refine: ${refined.length} refined product(s) from ${survivors.length} surviving detection(s)`);
         return refined;
       } catch (err) {
