@@ -1282,15 +1282,19 @@ function pickOverlayBackground(ctx, aspectRatio) {
 //
 // For extended ratios (9:16, 1.91:1) we still use the AI-extended Gemini
 // winner because those are purpose-built hero assets.
-// Available source crop ratios. Order matters only on ties (first
-// wins for equidistant matches). Base ratios come from CropArtifact
-// smart-crops; 9:16 + 1.91:1 come from ExtendedCropArtifact.
+// Available source crop ratios. Limited to BASE smart-crop ratios
+// only — extended ratios (9:16, 1.91:1) are AI-generated stills that
+// (a) are lazy-enriched and may not exist for fresh detect runs and
+// (b) wedge oddly when the slot's actual ratio differs from theirs.
+// Cloudinary's c_fill,g_auto reshapes the base crop into the target
+// slot using subject-aware gravity, which gives a cleaner result
+// than handing it a near-but-not-exact extended crop.
+//
+// Order matters only on ties (first wins for equidistant matches).
 const HERO_SOURCE_OPTIONS = [
-  { name: '5:4',    value: 5/4 },
-  { name: '1:1',    value: 1 },
-  { name: '4:5',    value: 4/5 },
-  { name: '9:16',   value: 9/16 },
-  { name: '1.91:1', value: 1.91 }
+  { name: '5:4', value: 5/4 },
+  { name: '1:1', value: 1 },
+  { name: '4:5', value: 4/5 }
 ];
 
 // Find the available hero source crop whose ratio is closest to the
