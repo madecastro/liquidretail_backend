@@ -46,12 +46,20 @@ const registry              = require('./templateRegistry');
 
 // Templates currently shipping. Render service only handles these in V1
 // (per the deferred render-service plan saved 2026-05-06).
+// testimonial_overlay + product_overlay are temporarily gated off the
+// wizard until layout polish lands — keep them in the set so any
+// hand-crafted API call still works, but the UI hides them.
 const SUPPORTED_TEMPLATES = new Set([
   'testimonial_spotlight',
   'ugc_split_screen',
   'testimonial_overlay',
   'product_overlay'
 ]);
+
+// Aspect ratios we're shipping ad output for in V1. Templates may
+// declare more (4:5 / 1.91:1 / 5:4) but we filter the cartesian here
+// so a single source of truth controls what reaches the renderer.
+const SHIPPING_RATIOS = new Set(['1:1', '9:16', '16:9']);
 
 const DEFAULT_TOP_MEDIA_PER_PRODUCT = 1;
 const BRAND_ONLY_MEDIA_LIMIT        = 5; // when no products are selected
@@ -118,7 +126,8 @@ async function expandWizardJob({
     for (const templateId of allowedTemplates) {
       const tpl = registry.getNormalized(templateId);
       if (!tpl) continue;
-      const ratios = tpl.aspect_ratios?.supported || [];
+      const ratios = (tpl.aspect_ratios?.supported || [])
+        .filter(r => SHIPPING_RATIOS.has(r));
       for (const aspectRatio of ratios) {
         creatives.push({
           productId:        seed.productId,

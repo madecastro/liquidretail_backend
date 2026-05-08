@@ -38,7 +38,7 @@ const RENDER_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || '2', 10);
 // 20-render run takes long enough that tail renders accumulate
 // Chromium memory pressure. 5 keeps a single run inside one
 // Chromium-warm window.
-const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '5', 10);
+const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '10', 10);
 
 // POST /api/ads/generate
 // Body: { campaignId, productIds, mediaIds, templateIds, cta:{text,url}, urlParams }
