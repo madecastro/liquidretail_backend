@@ -13,6 +13,24 @@ const Brand      = require('../models/Brand');
 const AdvertiserMembership = require('../models/AdvertiserMembership');
 const requireUserOnly = require('../middleware/requireUserOnly');
 
+// Email-domain allowlist for self-serve workspace creation. Comma-
+// separated env var; empty/unset means no allowlist (open signup —
+// useful in dev). Matched against the lowercased domain of the
+// signed-in user's email. Without this gate any Google account
+// could spin up an Advertiser, which isn't what we want at launch.
+function parseAllowedDomains() {
+  const raw = process.env.WORKSPACE_SIGNUP_ALLOWED_DOMAINS || '';
+  return raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+
+function isEmailDomainAllowed(email) {
+  const allowed = parseAllowedDomains();
+  if (allowed.length === 0) return true;       // open mode — dev / no env set
+  const domain = String(email || '').split('@')[1]?.toLowerCase();
+  if (!domain) return false;
+  return allowed.includes(domain);
+}
+
 // POST /api/onboarding/advertiser
 // Body: { name: string, brandName?: string, brandWebsiteUrl?: string }
 //
@@ -30,6 +48,18 @@ router.post('/advertiser', requireUserOnly, express.json(), async (req, res) => 
       return res.status(409).json({
         error: 'User already has an advertiser',
         advertiser: existing ? { id: String(existing._id), name: existing.name, slug: existing.slug } : null
+      });
+    }
+
+    // Domain allowlist gate. Skipped when WORKSPACE_SIGNUP_ALLOWED_DOMAINS
+    // is unset (dev). In prod this prevents random Google accounts from
+    // spinning up Advertisers — only emails on listed domains may
+    // self-serve. Existing invite acceptances bypass this entirely
+    // (they go through invitations.js, not here).
+    if (!isEmailDomainAllowed(req.userDoc.email)) {
+      return res.status(403).json({
+        error: 'Self-serve workspace creation is restricted. Contact your account team for access.',
+        code:  'DOMAIN_NOT_ALLOWED'
       });
     }
 
@@ -105,6 +135,29 @@ router.post('/advertiser', requireUserOnly, express.json(), async (req, res) => 
   } catch (err) {
     console.error('onboarding/advertiser failed:', err);
     res.status(500).json({ error: err.message || 'Onboarding failed' });
+  }
+});
+
+// GET /api/onboarding/eligibility
+// Returns whether the signed-in user is allowed to self-create an
+// Advertiser. Drives the OnboardingPage's "Create workspace" CTA —
+// users not on the allowlist see the contact-admin path instead of
+// a button that would 403 anyway. Always-200; the answer is the
+// payload, not the status code.
+router.get('/eligibility', requireUserOnly, async (req, res) => {
+  try {
+    const hasAdvertiser = !!req.userDoc.advertiserId;
+    const domainAllowed = isEmailDomainAllowed(req.userDoc.email);
+    res.json({
+      email:           req.userDoc.email,
+      hasAdvertiser,
+      canSelfCreate:   !hasAdvertiser && domainAllowed,
+      reason:          hasAdvertiser     ? 'already_has_advertiser'
+                     : !domainAllowed    ? 'domain_not_allowed'
+                     :                     null
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'eligibility check failed' });
   }
 });
 
