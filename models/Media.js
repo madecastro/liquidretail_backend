@@ -191,7 +191,13 @@ const mediaSchema = new mongoose.Schema({
     detectSummary: {
       outcome: {
         type: String,
-        enum: ['own_product', 'competitor', 'category', 'no_products', 'pending'],
+        // 'mixed'      — own-product AND competitor signals on the same Media
+        //                (e.g. UGC frame with multiple brands). Treated as
+        //                competitor by adSuitabilityService.
+        // 'do_not_use' — brand-safety hard-stop or multi-brand block from
+        //                productMatchService. Not currently emitted into
+        //                detectSummary today, but reserved.
+        enum: ['own_product', 'competitor', 'mixed', 'category', 'no_products', 'do_not_use', 'pending'],
         default: 'pending'
       },
       matchedProducts: [{
