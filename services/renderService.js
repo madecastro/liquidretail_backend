@@ -117,7 +117,8 @@ async function renderCreative(req) {
       aspectRatio:  req.creative.aspectRatio,
       expectedKind: req.creative.expectedKind,
       mediaId:      req.creative.mediaId,
-      brandId:      req.brandId
+      brandId:      req.brandId,
+      authToken:    req.authToken || null
     });
     stages.render = Date.now() - t;
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB)`);
@@ -267,7 +268,7 @@ function decodeTokenPayload(token) {
   );
 })();
 
-async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId }) {
+async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
   url.searchParams.set('renderMode', '1');
@@ -309,13 +310,19 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
     // localStorage and forwarded as X-Brand-Id; advertiser is
     // resolved server-side via the JWT's membership lookup, so we
     // don't need to seed advertiser_id.
-    if (RENDER_AUTH_TOKEN) {
+    // Prefer the per-request authToken (signed by routes/ads.js per
+    // generate call, ~1h TTL) over the static RENDER_AUTH_TOKEN env
+    // var. Env stays as a fallback for ad-hoc/local invocations that
+    // don't carry a per-request token, but the production path no
+    // longer depends on it.
+    const authToken = (typeof reqAuthToken !== 'undefined' && reqAuthToken) || RENDER_AUTH_TOKEN;
+    if (authToken) {
       await page.evaluateOnNewDocument((token, bId) => {
         try {
           if (token) localStorage.setItem('auth_token', token);
           if (bId)   localStorage.setItem('brand_id',   bId);
         } catch (_) { /* localStorage may be sandboxed pre-navigation; will retry post-goto */ }
-      }, RENDER_AUTH_TOKEN, brandId || '');
+      }, authToken, brandId || '');
     }
 
     await page.goto(url.toString(), { waitUntil: 'networkidle0', timeout: RENDER_TIMEOUT_MS });

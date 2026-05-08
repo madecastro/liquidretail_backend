@@ -17,6 +17,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
+const jwt = require('jsonwebtoken');
 const router = express.Router();
 
 const Ad           = require('../models/Ad');
@@ -68,7 +69,25 @@ router.post('/generate', async (req, res) => {
 
     const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 
-    // 2. Create the run doc up front so the frontend can poll
+    // 2. Mint a short-lived JWT for the render service to authenticate
+    //    inside Puppeteer. Same shape as the OAuth-callback token so
+    //    requireAuth resolves req.user the same way; 1h TTL is plenty
+    //    for the longest batch and short enough to bound blast radius
+    //    if the token leaked. Replaces the long-lived RENDER_AUTH_TOKEN
+    //    env var that operators had to hand-refresh every 24h.
+    const renderToken = jwt.sign(
+      {
+        id:     req.user?.id,
+        userId: req.user?.userId,
+        email:  req.user?.email,
+        name:   req.user?.name,
+        photo:  req.user?.photo
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    // 3. Create the run doc up front so the frontend can poll
     //    immediately on the redirect.
     const run = await CampaignRun.create({
       runId,
@@ -92,10 +111,10 @@ router.post('/generate', async (req, res) => {
       status:        'running'
     });
 
-    // 4. Fire-and-forget the render loop. setImmediate yields the
+    // 5. Fire-and-forget the render loop. setImmediate yields the
     //    HTTP response first, then renders happen behind the scenes.
     setImmediate(() => {
-      runRenderLoop(run, job).catch(err => {
+      runRenderLoop(run, job, renderToken).catch(err => {
         console.error(`❌ campaign run ${runId} crashed:`, err);
         CampaignRun.updateOne(
           { _id: run._id },
@@ -113,7 +132,7 @@ router.post('/generate', async (req, res) => {
 // Background render loop. Runs after the response has flushed; updates
 // the CampaignRun doc as each creative finishes so the frontend's
 // poller can show real-time progress.
-async function runRenderLoop(run, job) {
+async function runRenderLoop(run, job, renderToken) {
   const t0 = Date.now();
   console.log(
     `🚀 [campaignRun ${run.runId}] start — ${job.creatives.length} creative(s) ` +
@@ -129,7 +148,7 @@ async function runRenderLoop(run, job) {
       while (inflight < RENDER_CONCURRENCY && next < queue.length) {
         const { creative, index } = queue[next++];
         inflight++;
-        renderOne(run, job, creative, index)
+        renderOne(run, job, creative, index, renderToken)
           .catch(err => {
             console.error(`❌ [campaignRun ${run.runId}] #${index} dispatch crash:`, err.message || err);
           })
@@ -155,7 +174,7 @@ async function runRenderLoop(run, job) {
   );
 }
 
-async function renderOne(run, job, creative, index) {
+async function renderOne(run, job, creative, index, renderToken) {
   try {
     const result = await renderCreative({
       jobId:         crypto.randomBytes(8).toString('hex'),
@@ -165,6 +184,7 @@ async function renderOne(run, job, creative, index) {
       campaignKind:  job.campaignKind,
       creative,
       cta:           job.cta,
+      authToken:     renderToken,
       options:       { refresh: !!job.options.refresh }
     });
 
