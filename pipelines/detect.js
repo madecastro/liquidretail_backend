@@ -61,6 +61,7 @@ const CropArtifact        = require('../models/CropArtifact');
 const ExtendedCropArtifact = require('../models/ExtendedCropArtifact');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact  = require('../models/OverlayZoneArtifact');
+const Comment              = require('../models/Comment');
 
 const { downloadBuffer } = require('./shared');
 
@@ -580,6 +581,19 @@ async function runTranscribeNerChain(run, buffer, media) {
 async function runProductMatchChain(run, media, sourceImageUrl, products, primarySubjectDesc, text, refinedProducts = []) {
   const productMatches = await timeStage(run, 'product-match', async () => {
     try {
+      // Inbound comments — fed into brand-safety eval inside
+      // productMatchService alongside caption + OCR text. The Comment
+      // collection is populated on demand by mediaInsightsService
+      // (operator hits Refresh on the Media detail tab); when nothing
+      // is stored yet, brand-safety silently degrades to caption +
+      // OCR only — same behavior as before this wiring landed.
+      const commentRows = await Comment.find({ mediaId: media._id })
+        .select('text')
+        .limit(500)
+        .lean()
+        .catch(() => []);
+      const commentTexts = commentRows.map(c => c.text).filter(Boolean);
+
       // Phase 1.7 — per-product orchestrator. Uses refinedProducts (Phase 1.6
       // output) for catalog-first matching when available; falls back to
       // single scene-level match when refinedProducts is empty.
@@ -593,6 +607,7 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
         caption:        media.metadata?.caption,
         primarySubject: primarySubjectDesc,
         textDetected:   (text || []).map(t => t.content).filter(Boolean),
+        comments:       commentTexts,
         imageUrl:       sourceImageUrl,
         yoloIdentifications: products,
         refinedProducts
