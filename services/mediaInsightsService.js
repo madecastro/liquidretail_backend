@@ -52,7 +52,7 @@ async function refreshInsightsForMedia(mediaId) {
 
   const cred = await findCredForMedia(media);
   if (!cred) return { ok: false, reason: 'no active Instagram credential for this brand' };
-  const token = decrypt(cred.tokenCipher);
+  const token = decrypt(cred.accessTokenEnc);
 
   const basic = await fetchPostBasic(media.externalId, token);
   if (!basic) return { ok: false, reason: 'failed to fetch post basics (auth or post deleted)' };
@@ -76,7 +76,7 @@ async function fetchCommentsForMedia(mediaId) {
 
   const cred = await findCredForMedia(media);
   if (!cred) return { ok: false, reason: 'no active Instagram credential for this brand' };
-  const token = decrypt(cred.tokenCipher);
+  const token = decrypt(cred.accessTokenEnc);
 
   let url = `${META_GRAPH_ROOT}/${media.externalId}/comments`;
   let params = { fields: COMMENT_FIELDS, limit: COMMENT_PAGE_SIZE, access_token: token };
