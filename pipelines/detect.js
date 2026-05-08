@@ -193,21 +193,20 @@ async function runImagePipeline(run, media, buffer) {
     }
   });
 
-  // ── Phase 3: enrich fan-out ──
+  // ── Phase 3: product-match (critical path) ──
+  // Extended-crops + overlay-zones are NOT on the critical path —
+  // they're polish for ad rendering and the renderer can fall back
+  // to defaults when missing. Keeping them inline blocks the run for
+  // ~15-25s per post (Gemini image gen + overlay-zone analysis fan-
+  // out). Defer them to a fire-and-forget lazy chain that backfills
+  // Media.latestArtifacts when it lands.
   await setRunPhase(run, 'enrich-fanout');
-  const [extendedRes, matchRes] = await Promise.allSettled([
-    runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH }),
-    runProductMatchChain(run, media, sourceUrl, products, primarySubjectDesc, text, refinedProducts)
-  ]);
-  if (extendedRes.status === 'rejected') console.warn('⚠️  Extended/overlay chain rejected:', extendedRes.reason?.message);
-  if (matchRes.status === 'rejected')    console.warn('⚠️  Product match chain rejected:',     matchRes.reason?.message);
-
-  const { extendedDoc, overlayDoc } = extendedRes.status === 'fulfilled'
-    ? extendedRes.value
-    : { extendedDoc: null, overlayDoc: null };
-  const { productMatches, matchDoc, matchDocs } = matchRes.status === 'fulfilled'
-    ? matchRes.value
-    : { productMatches: null, matchDoc: null, matchDocs: [] };
+  const matchRes = await runProductMatchChain(run, media, sourceUrl, products, primarySubjectDesc, text, refinedProducts)
+    .catch(err => {
+      console.warn('⚠️  Product match chain rejected:', err.message);
+      return null;
+    });
+  const { productMatches, matchDoc, matchDocs } = matchRes || { productMatches: null, matchDoc: null, matchDocs: [] };
 
   // V3 #3 — auto-comment on the original IG post when this Media came
   // from Instagram and produced a confident product_match with a
@@ -219,7 +218,7 @@ async function runImagePipeline(run, media, buffer) {
       .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
   }
 
-  // ── Finalize ──
+  // ── Finalize critical path ──
   // Phase 2b note: per-match draft CatalogProduct creation now happens
   // inside productMatchService.enrichOneMatchInPlace (ensureCatalog-
   // ProductForMatch). The legacy maybeCreateDraftFromMatch path was
@@ -231,16 +230,28 @@ async function runImagePipeline(run, media, buffer) {
   await updateMediaLatestArtifacts(media, {
     detection:    detectionDoc._id,
     crops:        cropDoc._id,
-    extended:     extendedDoc?._id,
     match:        matchDoc?._id,
-    matches:      (matchDocs || []).map(d => d._id),
-    overlayZones: overlayDoc?._id
+    matches:      (matchDocs || []).map(d => d._id)
+    // extended + overlayZones land via the lazy chain below.
   });
 
-  // Phase A-0 — derive Media Library display fields (focus, technical
-  // insights, ad readiness score + bullets). Cheap; runs synchronously
-  // at finalize so consumers don't recompute on every page render.
-  await applyMediaLibraryDerivations(media, buffer, overlayDoc, productMatches);
+  // ── Lazy enrichment (off the critical path) ──
+  // Fire-and-forget. The DetectRun's status flips to 'completed' as
+  // soon as this function returns (caller calls run.save()); these
+  // artifacts populate Media.latestArtifacts when they're ready.
+  // Failure is logged but non-fatal — extended-crops + overlay-zones
+  // are optional polish. applyMediaLibraryDerivations rides along
+  // since it consumes overlayDoc.
+  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH })
+    .then(async ({ extendedDoc, overlayDoc }) => {
+      await updateMediaLatestArtifacts(media, {
+        extended:     extendedDoc?._id,
+        overlayZones: overlayDoc?._id
+      });
+      await applyMediaLibraryDerivations(media, buffer, overlayDoc, productMatches);
+      console.log(`🎨 lazy enrichment landed for media ${media._id}`);
+    })
+    .catch(err => console.warn(`   ⚠️  lazy enrichment failed for media ${media._id}: ${err.message}`));
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -384,47 +395,45 @@ async function runVideoPipeline(run, media, buffer) {
     }
   });
 
-  // ── Phase 3: enrich fan-out ──
+  // ── Phase 3: product-match (critical path; extended deferred — see image pipeline note) ──
   await setRunPhase(run, 'enrich-fanout');
-  const [extendedRes, matchRes] = await Promise.allSettled([
-    runExtendedAndOverlayChain(run, media, heroImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, true, { safeRect, imgW, imgH }),
-    // Video Phase 1.6 isn't wired yet (refinedProducts always [] for video) —
-    // findPerProductMatches falls through to the legacy single-match path.
-    runProductMatchChain(run, media, heroImageUrl, products, primarySubjectDesc, text, [])
-  ]);
-  if (extendedRes.status === 'rejected') console.warn('⚠️  Extended/overlay chain rejected:', extendedRes.reason?.message);
-  if (matchRes.status === 'rejected')    console.warn('⚠️  Product match chain rejected:',     matchRes.reason?.message);
-
-  const { extendedDoc, overlayDoc } = extendedRes.status === 'fulfilled'
-    ? extendedRes.value
-    : { extendedDoc: null, overlayDoc: null };
-  const { productMatches, matchDoc, matchDocs } = matchRes.status === 'fulfilled'
-    ? matchRes.value
-    : { productMatches: null, matchDoc: null, matchDocs: [] };
+  // Video Phase 1.6 isn't wired yet (refinedProducts always [] for video) —
+  // findPerProductMatches falls through to the legacy single-match path.
+  const matchRes = await runProductMatchChain(run, media, heroImageUrl, products, primarySubjectDesc, text, [])
+    .catch(err => {
+      console.warn('⚠️  Product match chain rejected:', err.message);
+      return null;
+    });
+  const { productMatches, matchDoc, matchDocs } = matchRes || { productMatches: null, matchDoc: null, matchDocs: [] };
 
   if (productMatches && media.source === 'instagram') {
     maybePostMatchReply({ media, productMatch: productMatches })
       .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
   }
-  // ── Finalize ──
-  // Phase 2b — per-match draft creation moved into productMatchService.
-  // See note in the image pipeline above for rationale.
+  // ── Finalize critical path ──
   await setRunPhase(run, 'finalize');
   await updateMediaLatestArtifacts(media, {
     detection:    detectionDoc._id,
     crops:        cropDoc._id,
-    extended:     extendedDoc?._id,
     match:        matchDoc?._id,
-    matches:      (matchDocs || []).map(d => d._id),
-    overlayZones: overlayDoc?._id
+    matches:      (matchDocs || []).map(d => d._id)
+    // extended + overlayZones land via the lazy chain below.
   });
 
-  // Phase A-0 — Media Library derivations. Video pipeline currently has
-  // no in-memory frame buffer (we extract via Cloudinary at hero point);
-  // focus is skipped for video. Everything else (overlay zones, refined
-  // products, primary subject rect) is already on Media. Future ticket:
-  // fetch heroImageUrl bytes here for focus on the still.
-  await applyMediaLibraryDerivations(media, null, overlayDoc, productMatches);
+  // ── Lazy enrichment (off the critical path) ──
+  // Same defer as the image pipeline. Media-library derivations
+  // pass a null buffer for video (frame extraction happens via
+  // Cloudinary at hero point — focus is skipped on video).
+  runExtendedAndOverlayChain(run, media, heroImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, true, { safeRect, imgW, imgH })
+    .then(async ({ extendedDoc, overlayDoc }) => {
+      await updateMediaLatestArtifacts(media, {
+        extended:     extendedDoc?._id,
+        overlayZones: overlayDoc?._id
+      });
+      await applyMediaLibraryDerivations(media, null, overlayDoc, productMatches);
+      console.log(`🎨 lazy enrichment landed for media ${media._id} (video)`);
+    })
+    .catch(err => console.warn(`   ⚠️  lazy enrichment failed for media ${media._id} (video): ${err.message}`));
 }
 
 // ──────────────────────────────────────────────────────────────
