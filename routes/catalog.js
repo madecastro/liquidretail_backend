@@ -19,6 +19,7 @@
 
 const express = require('express');
 const router  = express.Router();
+const mongoose = require('mongoose');
 
 const CatalogProduct        = require('../models/CatalogProduct');
 const Media                 = require('../models/Media');
@@ -126,9 +127,21 @@ router.get('/', async (req, res) => {
     // UGC matches stack at the top. Done as a single aggregation so
     // pagination is correct across the full ranked set (a per-page
     // join wouldn't move a high-traffic product on page 4 to page 1).
+    //
+    // Mongoose's find() auto-casts string ids → ObjectId based on the
+    // schema; aggregate() does NOT. Re-cast brandId / advertiserId
+    // here so the $match stage hits the same docs countDocuments does.
+    const aggFilter = { ...filter };
+    if (typeof aggFilter.brandId === 'string' && mongoose.Types.ObjectId.isValid(aggFilter.brandId)) {
+      aggFilter.brandId = new mongoose.Types.ObjectId(aggFilter.brandId);
+    }
+    if (typeof aggFilter.advertiserId === 'string' && mongoose.Types.ObjectId.isValid(aggFilter.advertiserId)) {
+      aggFilter.advertiserId = new mongoose.Types.ObjectId(aggFilter.advertiserId);
+    }
+
     const [rows, total, distinctCategories, totalDrafts] = await Promise.all([
       CatalogProduct.aggregate([
-        { $match: filter },
+        { $match: aggFilter },
         { $lookup: {
             from:         'productmatchartifacts',
             localField:   '_id',
