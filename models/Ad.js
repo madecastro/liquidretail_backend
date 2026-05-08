@@ -21,7 +21,11 @@ const mongoose = require('mongoose');
 const adSchema = new mongoose.Schema({
   // ── Tenancy + grouping ───────────────────────────────────────────
   brandId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',    required: true, index: true },
-  campaignId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', required: true, index: true },
+  // Nullable so ads can be unlinked from a campaign via the
+  // campaign detail page's "Remove ad" action. Orphans still
+  // appear in the brand-scoped /api/ads gallery; only the
+  // per-campaign filter excludes them.
+  campaignId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', default: null, index: true },
   // Groups all creatives produced by one click of the Generate Ads
   // button. Lets the ads page show "this batch was generated together"
   // and supports re-running a campaign without losing the audit trail.

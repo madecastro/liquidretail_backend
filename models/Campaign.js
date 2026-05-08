@@ -118,6 +118,14 @@ const campaignSchema = new mongoose.Schema({
   // walking nested ads. Empty when the campaign isn't product-driven.
   productSetIds: [String],
 
+  // Operator-curated Media linked to this campaign. Synced campaigns
+  // typically don't carry media directly (their content is on the
+  // Ads side); reach-social campaigns set this from the quick-builder
+  // media picker, and the campaign detail page lets the operator
+  // add/remove media after creation. Drives the wizard's pre-fill
+  // when re-launching from /campaigns.
+  mediaIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Media', index: true }],
+
   // Embedded ad sets + their ads.
   adSets:        [adSetSchema],
 

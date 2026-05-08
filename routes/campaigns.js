@@ -12,9 +12,12 @@
 // no IntegrationCredential — the app itself is the source of truth.
 
 const express = require('express');
+const mongoose = require('mongoose');
 const router = express.Router();
 const Campaign = require('../models/Campaign');
 const CatalogProduct = require('../models/CatalogProduct');
+const Media = require('../models/Media');
+const Ad = require('../models/Ad');
 const { tenantFilter } = require('../middleware/tenantHelpers');
 
 // GET /api/campaigns?brandId=X[&platform=meta-ads|google-ads][&status=ACTIVE]
@@ -31,9 +34,17 @@ router.get('/', async (req, res) => {
     if (req.query.status)   filter.status   = req.query.status;
 
     const rows = await Campaign.find(tenantFilter(req, filter))
-      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds kind insights adSets lastSyncedAt firstSeenAt')
+      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds mediaIds kind insights adSets lastSyncedAt firstSeenAt')
       .sort({ lastSyncedAt: -1 })
       .lean();
+
+    // Generated-ad count per campaign (ads tied to the campaign via
+    // Ad.campaignId, includes drafts/live/archived but excludes
+    // orphan ads where Ad.campaignId is null after an unlink).
+    // Single aggregate keeps it cheap regardless of campaign count.
+    const renderedAdCounts = rows.length === 0
+      ? new Map()
+      : await aggregateAdCounts(rows.map(c => c._id), brandId);
 
     res.json({
       campaigns: rows.map(c => ({
@@ -48,8 +59,13 @@ router.get('/', async (req, res) => {
         schedule:      c.schedule || null,
         productSetIds: c.productSetIds || [],
         matchedProductCount: (c.matchedProductIds || []).length,
+        mediaCount:    (c.mediaIds || []).length,
         adSetCount:    (c.adSets || []).length,
-        adCount:       (c.adSets || []).reduce((s, set) => s + (set.ads || []).length, 0),
+        // Sum of platform-side ad-set ads (synced campaigns) — left
+        // intact for compatibility; renderedAdCount is the new field
+        // for in-app rendered creatives.
+        adCount:           (c.adSets || []).reduce((s, set) => s + (set.ads || []).length, 0),
+        renderedAdCount:   renderedAdCounts.get(String(c._id)) || 0,
         insights:      c.insights || null,
         lastSyncedAt:  c.lastSyncedAt || null,
         firstSeenAt:   c.firstSeenAt || null
@@ -194,20 +210,20 @@ router.post('/', express.json(), async (req, res) => {
     if (!brandId)        return res.status(400).json({ error: 'brandId required' });
     if (!req.advertiserId) return res.status(400).json({ error: 'advertiser context missing' });
 
-    const { name, kind, productIds = [] } = req.body || {};
+    const { name, kind, productIds = [], mediaIds = [] } = req.body || {};
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: 'name required' });
     }
     if (!['brand', 'product'].includes(kind)) {
       return res.status(400).json({ error: "kind must be 'brand' or 'product'" });
     }
-    if (!Array.isArray(productIds)) {
-      return res.status(400).json({ error: 'productIds must be an array' });
+    if (!Array.isArray(productIds) || !Array.isArray(mediaIds)) {
+      return res.status(400).json({ error: 'productIds and mediaIds must be arrays' });
     }
 
-    // Tenant assertion on every passed productId — drop any that
-    // don't belong to the requesting brand rather than 400-ing the
-    // whole request, so a stale picker doesn't block creation.
+    // Tenant assertion on every passed product/media id — drop any
+    // that don't belong to the requesting brand rather than 400-ing
+    // the whole request, so a stale picker doesn't block creation.
     const validProducts = productIds.length === 0
       ? []
       : await CatalogProduct.find({
@@ -215,6 +231,13 @@ router.post('/', express.json(), async (req, res) => {
           brandId
         }).select('_id').lean();
     const validProductIds = validProducts.map(p => p._id);
+    const validMediaList = mediaIds.length === 0
+      ? []
+      : await Media.find({
+          _id: { $in: mediaIds },
+          brandId
+        }).select('_id').lean();
+    const validMediaIds = validMediaList.map(m => m._id);
 
     // Pre-allocate _id so we can stamp externalId in the same insert.
     const _id = new (require('mongoose')).Types.ObjectId();
@@ -231,8 +254,10 @@ router.post('/', express.json(), async (req, res) => {
       status:      'ACTIVE',
       // matchedProductIds is what the wizard's Step 2 reads to
       // pre-select. Stamp at create time so re-launching the wizard
-      // later restores the operator's selection.
+      // later restores the operator's selection. mediaIds carries
+      // the same intent for media pre-selection.
       matchedProductIds: validProductIds,
+      mediaIds:          validMediaIds,
       adSets:      []
     });
 
@@ -245,6 +270,8 @@ router.post('/', express.json(), async (req, res) => {
         kind:                campaign.kind,
         status:              campaign.status,
         matchedProductCount: validProductIds.length,
+        mediaCount:          validMediaIds.length,
+        renderedAdCount:     0,
         productSetIds:       []
       }
     });
@@ -253,6 +280,179 @@ router.post('/', express.json(), async (req, res) => {
     res.status(500).json({ error: err.message || 'campaign create failed' });
   }
 });
+
+// PATCH /api/campaigns/:id — edit campaign-level fields.
+// Body: { name?, kind? } — additional fields can be added as the
+// detail page grows. Only reach-social campaigns are mutable
+// today; synced campaigns reflect platform state and edits would
+// drift away from the source of truth.
+router.patch('/:id', express.json(), async (req, res) => {
+  try {
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id }));
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    if (c.platform !== 'reach-social') {
+      return res.status(409).json({ error: 'only reach-social campaigns are editable' });
+    }
+    const { name, kind } = req.body || {};
+    if (name != null) {
+      const trimmed = String(name).trim();
+      if (!trimmed) return res.status(400).json({ error: 'name cannot be empty' });
+      c.name = trimmed;
+    }
+    if (kind != null) {
+      if (!['brand', 'product', 'collection', null].includes(kind)) {
+        return res.status(400).json({ error: 'invalid kind' });
+      }
+      c.kind = kind;
+    }
+    await c.save();
+    res.json({ campaign: { id: String(c._id), name: c.name, kind: c.kind } });
+  } catch (err) {
+    console.error('campaign patch failed:', err);
+    res.status(500).json({ error: err.message || 'campaign update failed' });
+  }
+});
+
+// POST /api/campaigns/:id/products  body: { productIds: string[] }
+// Add products to the campaign's matchedProductIds. $addToSet is
+// used so duplicates are silently ignored. Validates each product
+// belongs to the same brand.
+router.post('/:id/products', express.json(), async (req, res) => {
+  try {
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id })).lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    const { productIds = [] } = req.body || {};
+    if (!Array.isArray(productIds)) return res.status(400).json({ error: 'productIds must be an array' });
+    const valid = productIds.length === 0
+      ? []
+      : await CatalogProduct.find({ _id: { $in: productIds }, brandId: c.brandId }).select('_id').lean();
+    const ids = valid.map(p => p._id);
+    if (ids.length === 0) return res.json({ added: 0, total: (c.matchedProductIds || []).length });
+    const updated = await Campaign.findByIdAndUpdate(
+      c._id,
+      { $addToSet: { matchedProductIds: { $each: ids } } },
+      { new: true }
+    ).select('matchedProductIds').lean();
+    res.json({ added: ids.length, total: (updated?.matchedProductIds || []).length });
+  } catch (err) {
+    console.error('campaign add products failed:', err);
+    res.status(500).json({ error: err.message || 'add products failed' });
+  }
+});
+
+// DELETE /api/campaigns/:id/products/:productId
+router.delete('/:id/products/:productId', async (req, res) => {
+  try {
+    const c = await Campaign.findOneAndUpdate(
+      tenantFilter(req, { _id: req.params.id }),
+      { $pull: { matchedProductIds: req.params.productId } },
+      { new: true }
+    ).select('matchedProductIds').lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    res.json({ removed: req.params.productId, total: (c.matchedProductIds || []).length });
+  } catch (err) {
+    console.error('campaign remove product failed:', err);
+    res.status(500).json({ error: err.message || 'remove product failed' });
+  }
+});
+
+// POST /api/campaigns/:id/media  body: { mediaIds: string[] }
+router.post('/:id/media', express.json(), async (req, res) => {
+  try {
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id })).lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    const { mediaIds = [] } = req.body || {};
+    if (!Array.isArray(mediaIds)) return res.status(400).json({ error: 'mediaIds must be an array' });
+    const valid = mediaIds.length === 0
+      ? []
+      : await Media.find({ _id: { $in: mediaIds }, brandId: c.brandId }).select('_id').lean();
+    const ids = valid.map(m => m._id);
+    if (ids.length === 0) return res.json({ added: 0, total: (c.mediaIds || []).length });
+    const updated = await Campaign.findByIdAndUpdate(
+      c._id,
+      { $addToSet: { mediaIds: { $each: ids } } },
+      { new: true }
+    ).select('mediaIds').lean();
+    res.json({ added: ids.length, total: (updated?.mediaIds || []).length });
+  } catch (err) {
+    console.error('campaign add media failed:', err);
+    res.status(500).json({ error: err.message || 'add media failed' });
+  }
+});
+
+// DELETE /api/campaigns/:id/media/:mediaId
+router.delete('/:id/media/:mediaId', async (req, res) => {
+  try {
+    const c = await Campaign.findOneAndUpdate(
+      tenantFilter(req, { _id: req.params.id }),
+      { $pull: { mediaIds: req.params.mediaId } },
+      { new: true }
+    ).select('mediaIds').lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    res.json({ removed: req.params.mediaId, total: (c.mediaIds || []).length });
+  } catch (err) {
+    console.error('campaign remove media failed:', err);
+    res.status(500).json({ error: err.message || 'remove media failed' });
+  }
+});
+
+// GET /api/campaigns/:id/media — hydrated Media docs for the campaign.
+router.get('/:id/media', async (req, res) => {
+  try {
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id })).select('mediaIds brandId').lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    const ids = (c.mediaIds || []).map(String);
+    const rows = ids.length === 0 ? [] : await Media.find({ _id: { $in: ids } }).lean();
+    res.json({
+      media: rows.map(m => ({
+        mediaId:   String(m._id),
+        fileType:  m.fileType,
+        fileUrl:   m.fileUrl,
+        caption:   m.caption || null,
+        source:    m.source || null
+      }))
+    });
+  } catch (err) {
+    console.error('campaign media fetch failed:', err);
+    res.status(500).json({ error: err.message || 'media fetch failed' });
+  }
+});
+
+// DELETE /api/campaigns/:id/ads/:adId — UNLINK (Ad.campaignId = null).
+// Ad doc + Cloudinary asset stay; only the campaign association is
+// dropped. The ad still surfaces in /ads (orphan) but no longer
+// appears in this campaign's view.
+router.delete('/:id/ads/:adId', async (req, res) => {
+  try {
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id })).select('_id brandId').lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    const ad = await Ad.findOneAndUpdate(
+      { _id: req.params.adId, campaignId: c._id, brandId: c.brandId },
+      { campaignId: null, updatedAt: new Date() },
+      { new: true }
+    ).select('_id').lean();
+    if (!ad) return res.status(404).json({ error: 'ad not found in this campaign' });
+    res.json({ unlinked: req.params.adId });
+  } catch (err) {
+    console.error('campaign unlink ad failed:', err);
+    res.status(500).json({ error: err.message || 'unlink failed' });
+  }
+});
+
+// Helper: build campaignId → renderedAdCount map for a list of
+// campaign ids in a single aggregate call.
+async function aggregateAdCounts(campaignIds, brandId) {
+  const results = await Ad.aggregate([
+    { $match: {
+      brandId:    new mongoose.Types.ObjectId(String(brandId)),
+      campaignId: { $in: campaignIds.map(id => new mongoose.Types.ObjectId(String(id))) }
+    } },
+    { $group: { _id: '$campaignId', count: { $sum: 1 } } }
+  ]);
+  const map = new Map();
+  for (const r of results) map.set(String(r._id), r.count);
+  return map;
+}
 
 function collectSampleCreatives(campaign, limit) {
   const out = [];
