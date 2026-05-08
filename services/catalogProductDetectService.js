@@ -27,6 +27,7 @@ const MAX_ALT_IMAGES = 4;
 // Returns { enqueued: { hero, alts }, skipped: bool, reason? }.
 async function enqueueProductDetect(product) {
   if (!product.imageUrl) {
+    console.log(`   · catalog-product detect skip[${product._id}]: no hero imageUrl`);
     return { skipped: true, reason: 'product has no hero imageUrl' };
   }
 
@@ -35,6 +36,11 @@ async function enqueueProductDetect(product) {
   if (product.imageMediaId) {
     return { skipped: true, reason: 'already detected (imageMediaId set)' };
   }
+
+  console.log(
+    `   · catalog-product detect enqueue[${product._id}]: ` +
+    `"${(product.title || '').slice(0, 40)}" hero=1 alts=${(product.additionalImages || []).length}`
+  );
 
   const enqueued = { hero: null, alts: [] };
 

@@ -225,19 +225,26 @@ mediaSchema.pre('save', function(next) {
   next();
 });
 
-// Post-save event-trigger — when a new Instagram Media lands,
-// kick off mediaInsightsService.fetchCommentsForMedia in the
-// background. Same "lambda when record lands" pattern: zero
-// coupling to the caller (post-sync / webhook / future routes
-// all benefit), fire-and-forget so the save itself isn't slowed
-// down. Brand-safety eval inside the detect pipeline reads from
-// the Comment collection so populating it before the DetectRun
-// gets to its product-match phase tightens UGC matching quality.
+// Post-save event-trigger — when a new Instagram Media lands, kick
+// off the full insights refresh + comment fetch in the background.
+// Same "lambda when record lands" pattern: zero coupling to the
+// caller (post-sync / webhook / future routes all benefit),
+// fire-and-forget so the save itself isn't slowed.
+//
+// Why both calls:
+//   - fetchCommentsForMedia populates the Comment collection that
+//     brand-safety eval reads from inside the detect pipeline.
+//   - refreshInsightsForMedia pulls the full platformStats payload
+//     (likes/comments/views/reach/saves/shares/engagement) — the
+//     post-sync ingest captures the basic counters but only when
+//     the credential has the instagram_manage_insights scope, and
+//     even then only for the first page. Auto-refreshing on insert
+//     means ad-suitability scoring and the Insights tab don't
+//     stare at empty platformStats.
 //
 // Guards:
-//   - IG only (V1 — TikTok/Meta have different comment APIs)
-//   - Image only (video comment ingest deferred — different
-//     pagination + lower payoff)
+//   - IG only (V1 — TikTok/Meta have different APIs)
+//   - Image only (video pagination differs + low payoff)
 //   - Inserts only (skip on every plain field update)
 mediaSchema.post('save', function(doc) {
   if (!doc._wasNew) return;
@@ -245,14 +252,23 @@ mediaSchema.post('save', function(doc) {
   if (doc.fileType !== 'image') return;
   setImmediate(() => {
     try {
-      const { fetchCommentsForMedia } = require('../services/mediaInsightsService');
-      fetchCommentsForMedia(doc._id)
-        .then(r => {
+      const { fetchCommentsForMedia, refreshInsightsForMedia } = require('../services/mediaInsightsService');
+      // Run both in parallel — they hit different IG Graph endpoints
+      // and don't depend on each other.
+      Promise.allSettled([
+        fetchCommentsForMedia(doc._id).then(r => {
           if (r?.ok) console.log(`💬 auto-fetched ${r.upserted || 0} comment(s) for media ${doc._id}`);
+          else if (r?.reason) console.warn(`   ⚠️  auto-comment-fetch skipped for ${doc._id}: ${r.reason}`);
+        }),
+        refreshInsightsForMedia(doc._id).then(r => {
+          if (r?.ok) console.log(`📊 auto-refreshed analytics for media ${doc._id}`);
+          else if (r?.reason) console.warn(`   ⚠️  auto-analytics-refresh skipped for ${doc._id}: ${r.reason}`);
         })
-        .catch(err => console.warn(`   ⚠️  auto-comment-fetch failed for media ${doc._id}: ${err.message}`));
+      ]).catch(err => {
+        console.warn(`   ⚠️  auto-insights dispatch failed for ${doc._id}: ${err.message}`);
+      });
     } catch (err) {
-      console.warn(`   ⚠️  auto-comment-fetch dispatch failed: ${err.message}`);
+      console.warn(`   ⚠️  auto-insights dispatch failed: ${err.message}`);
     }
   });
 });
