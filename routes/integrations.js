@@ -422,6 +422,36 @@ router.patch('/instagram/:credentialId/selection', express.json(), async (req, r
     await cred.save();
 
     console.log(`✅ IG selection finalized: brand=${brandId} cred=${cred._id} page=${matchedPage.name} ig=@${cred.igUsername || '∅'} catalog=${catalogId || '∅'}`);
+
+    // Auto-trigger catalog + post syncs the moment the picker
+    // commits — same pattern the Meta Ads picker uses to fire
+    // campaign sync on finalize. Operator doesn't need to make
+    // it back to /onboarding/connect for the bulk ingest to start.
+    // setImmediate so the picker response isn't blocked on the
+    // (potentially 60s) sync work.
+    if (cred.catalogId) {
+      setImmediate(async () => {
+        try {
+          const { syncCatalog } = require('../services/catalogSyncService');
+          const r = await syncCatalog(String(brandId), { credentialId: cred._id });
+          console.log(`📦 auto-triggered catalog sync after IG finalize: ok=${r.ok} fetched=${r.fetched || 0}`);
+        } catch (err) {
+          console.warn(`   ⚠️  auto-trigger catalog sync failed: ${err.message}`);
+        }
+      });
+    }
+    if (cred.igUserId) {
+      setImmediate(async () => {
+        try {
+          const { syncPosts } = require('../services/postSyncService');
+          const r = await syncPosts(String(brandId), { credentialId: cred._id, limit: 25 });
+          console.log(`📸 auto-triggered post sync after IG finalize: ok=${r.ok} ingested=${r.ingested || 0}`);
+        } catch (err) {
+          console.warn(`   ⚠️  auto-trigger post sync failed: ${err.message}`);
+        }
+      });
+    }
+
     res.json({
       ok: true,
       credential: {
