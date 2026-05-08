@@ -3,6 +3,11 @@ const router = express.Router();
 const Brand = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
 const { tenantFilter } = require('../middleware/tenantHelpers');
+const DetectRun = require('../models/DetectRun');
+const Media = require('../models/Media');
+const CatalogProduct = require('../models/CatalogProduct');
+const Campaign = require('../models/Campaign');
+const IntegrationCredential = require('../models/IntegrationCredential');
 
 // Fire-and-forget enrichment trigger. Imported lazily to avoid the
 // circular require that originally pushed enrichment scheduling into
@@ -357,6 +362,95 @@ function serializeBrand(b) {
     enrichmentSources: b.enrichmentSources || [],
     curatedFields:     b.curatedFields || []
   };
+}
+
+// GET /api/brand/:id/onboarding-status
+// Aggregates per-pipeline progress for the post-onboarding status
+// panel: enrichment, catalog sync, product-path detect, IG sync,
+// media-path detect, campaign sync. All counts are scoped to the
+// brand. Cheap — six small queries, no fan-out. The frontend polls
+// this until everything's terminal.
+router.get('/:id/onboarding-status', async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    // Enrichment derives from Brand fields populating in waves.
+    const enrichment = {
+      stage: brand.enrichmentStage || (brand.tone ? 'done' : 'pending'),
+      hasLogo:        !!brand.logoUrl,
+      hasColors:      !!(brand.primaryColor || brand.accentColor),
+      hasTone:        !!(brand.tone && brand.tone.length > 0),
+      hasPersonas:    !!(brand.demographics && brand.demographics.length > 0),
+      hasSummary:     !!brand.summary,
+      hasReviews:     !!(brand.brandReviews?.summary || (brand.brandReviews?.quotes || []).length > 0)
+    };
+
+    // Catalog sync state — connection + product count.
+    const catalogCred = await IntegrationCredential.findOne({
+      brandId: brand._id, type: 'instagram', status: 'active'
+    }).select('catalogId lastCatalogSyncAt').lean();
+    const productCount = await CatalogProduct.countDocuments({ brandId: brand._id });
+
+    // Detect-run rollups, split by source so the panel can show
+    // catalog-product runs distinctly from media-path runs.
+    const productMediaIds = await Media.find({ brandId: brand._id, source: 'catalog-product' })
+      .select('_id').lean();
+    const productMediaIdSet = productMediaIds.map(m => m._id);
+    const [productRuns, mediaRuns] = await Promise.all([
+      bucketRunsByStatus(productMediaIdSet, true),
+      bucketRunsByStatus(productMediaIdSet, false, brand._id)
+    ]);
+
+    // IG posts state — credential + post count.
+    const postCount = await Media.countDocuments({ brandId: brand._id, source: 'instagram' });
+
+    // Campaigns sync state — count by platform.
+    const [metaCampaigns, googleCampaigns, reachCampaigns] = await Promise.all([
+      Campaign.countDocuments({ brandId: brand._id, platform: 'meta-ads' }),
+      Campaign.countDocuments({ brandId: brand._id, platform: 'google-ads' }),
+      Campaign.countDocuments({ brandId: brand._id, platform: 'reach-social' })
+    ]);
+
+    res.json({
+      enrichment,
+      catalog: {
+        connected:        !!catalogCred?.catalogId,
+        lastSyncedAt:     catalogCred?.lastCatalogSyncAt || null,
+        productCount
+      },
+      productDetect: productRuns,
+      social: {
+        connected:        !!catalogCred,
+        postCount
+      },
+      mediaDetect: mediaRuns,
+      campaigns: {
+        meta:         metaCampaigns,
+        google:       googleCampaigns,
+        reachSocial:  reachCampaigns,
+        total:        metaCampaigns + googleCampaigns + reachCampaigns
+      }
+    });
+  } catch (err) {
+    console.error('onboarding-status failed:', err);
+    res.status(500).json({ error: err.message || 'onboarding-status failed' });
+  }
+});
+
+// Helper — group DetectRuns by status for either catalog-product
+// media (when productPath=true) or everything else under the brand.
+async function bucketRunsByStatus(productMediaIdSet, productPath, brandId) {
+  const filter = productPath
+    ? { mediaId: { $in: productMediaIdSet } }
+    : { brandId, mediaId: { $nin: productMediaIdSet } };
+  const rows = await DetectRun.aggregate([
+    { $match: filter },
+    { $group: { _id: '$status', n: { $sum: 1 } } }
+  ]);
+  const out = { queued: 0, processing: 0, completed: 0, failed: 0 };
+  for (const r of rows) if (out[r._id] !== undefined) out[r._id] = r.n;
+  return out;
 }
 
 module.exports = router;

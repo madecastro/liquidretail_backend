@@ -391,6 +391,11 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
     mediaId:      media._id,
     status:       'queued',
     stage:        'queued',
+    // Bulk IG ingest runs queue behind catalog-product runs so the
+    // visual catalog index is populated before media-path matches
+    // start querying it. Manual re-runs / single-media triggers
+    // stay at priority 1.
+    priority:     2,
     trigger
   });
   console.log(`   · ingested IG post ${externalId} → Media ${media._id} + DetectRun ${run._id}`);

@@ -59,7 +59,11 @@ async function workerLoop(workerId) {
       run = await DetectRun.findOneAndUpdate(
         { status: 'queued' },
         { status: 'processing', startedAt: new Date() },
-        { new: true, sort: { createdAt: 1 } }
+        // Lower priority drains first. Catalog-product runs default to
+        // 1; IG-post runs are stamped with 2 by postSyncService so the
+        // product visual index is built before media-path matches.
+        // FIFO within a priority band via createdAt.
+        { new: true, sort: { priority: 1, createdAt: 1 } }
       );
     } catch (err) {
       console.error(`❌ ${tag} DetectRun poll failed:`, err.message);

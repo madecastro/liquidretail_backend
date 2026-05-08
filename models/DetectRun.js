@@ -20,7 +20,15 @@ const detectRunSchema = new mongoose.Schema({
   stage:      String,                                  // current stage for progress UI
   stageTimings: { type: mongoose.Schema.Types.Mixed, default: {} },
 
-  trigger:    { type: String, enum: ['upload', 'webhook', 'manual_rerun', 'instagram-sync'], default: 'upload' },
+  trigger:    { type: String, enum: ['upload', 'webhook', 'manual_rerun', 'instagram-sync', 'catalog-sync'], default: 'upload' },
+
+  // Lower runs first. Catalog-product runs (priority=1, default) drain
+  // before IG-post runs (priority=2) so the visual catalog index is
+  // populated before media-path matches start querying it. Manual
+  // re-runs / uploads stay at priority=1 so operator-initiated work
+  // doesn't queue behind a backlog of bulk posts.
+  priority:   { type: Number, default: 1, index: true },
+
   pipelineVersion: String,
   modelVersions:   { type: mongoose.Schema.Types.Mixed, default: {} },
 
@@ -32,8 +40,9 @@ const detectRunSchema = new mongoose.Schema({
   completedAt: Date
 });
 
-// Worker polls by status; primary index is (status, createdAt) so oldest-first
-// FIFO is cheap.
-detectRunSchema.index({ status: 1, createdAt: 1 });
+// Worker polls by status; sort by (priority, createdAt) so high-priority
+// catalog-product runs drain before bulk IG-post runs while preserving
+// FIFO within a priority band.
+detectRunSchema.index({ status: 1, priority: 1, createdAt: 1 });
 
 module.exports = mongoose.model('DetectRun', detectRunSchema);
