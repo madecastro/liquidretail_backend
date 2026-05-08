@@ -24,6 +24,9 @@ const Ad           = require('../models/Ad');
 const CampaignRun  = require('../models/CampaignRun');
 const { expandWizardJob } = require('../services/campaignAdsGenerationService');
 const { renderCreative }  = require('../services/renderService');
+const { deleteFromCloudinary } = require('../services/cloudinaryService');
+
+const AD_STATUSES = ['draft', 'live', 'archived'];
 
 // Render concurrency. Puppeteer + Cloudinary is the bottleneck;
 // running too many in parallel on the small Render instance OOMs
@@ -306,6 +309,51 @@ router.get('/', async (req, res) => {
   } catch (err) {
     console.error('ads list failed:', err);
     res.status(500).json({ error: err.message || 'ads list failed' });
+  }
+});
+
+// PATCH /api/ads/:id — flip status. Body: { status: 'draft' | 'live' | 'archived' }.
+// Caller passes ?brandId or X-Brand-Id so the lookup is tenant-scoped.
+router.patch('/:id', express.json(), async (req, res) => {
+  try {
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    const { status } = req.body || {};
+    if (!AD_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${AD_STATUSES.join(', ')}` });
+    }
+    const ad = await Ad.findOneAndUpdate(
+      { _id: req.params.id, brandId },
+      { status, updatedAt: new Date() },
+      { new: true }
+    ).lean();
+    if (!ad) return res.status(404).json({ error: 'ad not found' });
+    res.json({ ad: projectAd(ad, /* full */ true) });
+  } catch (err) {
+    console.error('ad patch failed:', err);
+    res.status(500).json({ error: err.message || 'ad update failed' });
+  }
+});
+
+// DELETE /api/ads/:id — remove the Ad doc and best-effort destroy
+// the Cloudinary asset. Cloudinary errors are surfaced as warnings
+// in the response but never block the Mongo delete; orphaned
+// Cloudinary assets are easier to clean up later than orphaned Ad
+// docs pointing at dead URLs.
+router.delete('/:id', async (req, res) => {
+  try {
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    const ad = await Ad.findOneAndDelete({ _id: req.params.id, brandId }).lean();
+    if (!ad) return res.status(404).json({ error: 'ad not found' });
+    let cloudinary = null;
+    if (ad.renderUrl) {
+      cloudinary = await deleteFromCloudinary(ad.renderUrl);
+    }
+    res.json({ ok: true, id: String(ad._id), cloudinary });
+  } catch (err) {
+    console.error('ad delete failed:', err);
+    res.status(500).json({ error: err.message || 'ad delete failed' });
   }
 });
 
