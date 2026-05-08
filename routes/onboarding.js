@@ -11,6 +11,8 @@ const router  = express.Router();
 const Advertiser = require('../models/Advertiser');
 const Brand      = require('../models/Brand');
 const AdvertiserMembership = require('../models/AdvertiserMembership');
+const IntegrationCredential = require('../models/IntegrationCredential');
+const requireAuth = require('../middleware/requireAuth');
 const requireUserOnly = require('../middleware/requireUserOnly');
 
 // Email-domain allowlist for self-serve workspace creation. Comma-
@@ -158,6 +160,85 @@ router.get('/eligibility', requireUserOnly, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'eligibility check failed' });
+  }
+});
+
+// POST /api/onboarding/dispatch-syncs
+// Fire the post-onboarding sync fan-out (catalog + posts + campaigns)
+// SERVER-SIDE so the requests can't be aborted by client navigation.
+//
+// Background: the connect page used to fire each sync as a separate
+// fetch from the browser, then navigate to /brand. The syncs run
+// synchronously server-side (catalog ~8s, posts ~52s), so the
+// browser would abort the in-flight requests as the page unloaded —
+// none of them reached completion. Now the connect page calls this
+// one endpoint, which fans out to the underlying services via
+// setImmediate (returns 202 in ms), then navigates safely.
+//
+// Idempotent: each sync service already de-dupes on
+// (brand, externalId) so re-firing is harmless.
+router.post('/dispatch-syncs', requireAuth, express.json(), async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'] || req.body?.brandId;
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+
+    // Confirm brand belongs to caller's advertiser before scheduling
+    // any work for it.
+    const brand = await Brand.findOne({ _id: brandId, advertiserId: req.advertiserId }).select('_id').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    // Inspect connected creds so we only dispatch what's actually
+    // useful. No-op when nothing's connected (still 202 — caller
+    // doesn't need to special-case the empty case).
+    const [igCred, metaCred, googleCred] = await Promise.all([
+      IntegrationCredential.findOne({ brandId, type: 'instagram',  status: 'active' }).select('_id').lean(),
+      IntegrationCredential.findOne({ brandId, type: 'meta-ads',   status: 'active' }).select('_id').lean(),
+      IntegrationCredential.findOne({ brandId, type: 'google-ads', status: 'active' }).select('_id').lean()
+    ]);
+
+    const dispatched = [];
+    if (igCred) {
+      dispatched.push('catalog', 'posts');
+      setImmediate(async () => {
+        try {
+          const { syncCatalog } = require('../services/catalogSyncService');
+          const r = await syncCatalog(String(brandId), {});
+          console.log(`📦 dispatched catalog sync: ok=${r.ok} fetched=${r.fetched || 0}`);
+        } catch (err) { console.warn(`⚠️  dispatched catalog sync failed: ${err.message}`); }
+      });
+      setImmediate(async () => {
+        try {
+          const { syncPosts } = require('../services/postSyncService');
+          const r = await syncPosts(String(brandId), {});
+          console.log(`📸 dispatched post sync: ok=${r.ok} ingested=${r.ingested || 0}`);
+        } catch (err) { console.warn(`⚠️  dispatched post sync failed: ${err.message}`); }
+      });
+    }
+    if (metaCred) {
+      dispatched.push('meta-campaigns');
+      setImmediate(async () => {
+        try {
+          const { syncCampaigns } = require('../services/campaignSyncService');
+          const r = await syncCampaigns({ brandId: String(brandId), platform: 'meta-ads' });
+          console.log(`📣 dispatched meta-ads sync: upserted=${r?.upserted || 0}`);
+        } catch (err) { console.warn(`⚠️  dispatched meta-ads sync failed: ${err.message}`); }
+      });
+    }
+    if (googleCred) {
+      dispatched.push('google-campaigns');
+      setImmediate(async () => {
+        try {
+          const { syncCampaigns } = require('../services/campaignSyncService');
+          const r = await syncCampaigns({ brandId: String(brandId), platform: 'google-ads' });
+          console.log(`📣 dispatched google-ads sync: upserted=${r?.upserted || 0}`);
+        } catch (err) { console.warn(`⚠️  dispatched google-ads sync failed: ${err.message}`); }
+      });
+    }
+
+    res.status(202).json({ dispatched });
+  } catch (err) {
+    console.error('dispatch-syncs failed:', err);
+    res.status(500).json({ error: err.message || 'dispatch failed' });
   }
 });
 
