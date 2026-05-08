@@ -216,6 +216,45 @@ const mediaSchema = new mongoose.Schema({
 });
 
 mediaSchema.index({ source: 1, externalId: 1 }, { unique: true });
-mediaSchema.pre('save', function(next) { this.updatedAt = Date.now(); next(); });
+mediaSchema.pre('save', function(next) {
+  this.updatedAt = Date.now();
+  // Capture insert-vs-update so the post('save') hook below can
+  // fire only on new inserts. `isNew` is reset to false by Mongoose
+  // before post hooks run, so we have to stash it ourselves.
+  this._wasNew = this.isNew;
+  next();
+});
+
+// Post-save event-trigger — when a new Instagram Media lands,
+// kick off mediaInsightsService.fetchCommentsForMedia in the
+// background. Same "lambda when record lands" pattern: zero
+// coupling to the caller (post-sync / webhook / future routes
+// all benefit), fire-and-forget so the save itself isn't slowed
+// down. Brand-safety eval inside the detect pipeline reads from
+// the Comment collection so populating it before the DetectRun
+// gets to its product-match phase tightens UGC matching quality.
+//
+// Guards:
+//   - IG only (V1 — TikTok/Meta have different comment APIs)
+//   - Image only (video comment ingest deferred — different
+//     pagination + lower payoff)
+//   - Inserts only (skip on every plain field update)
+mediaSchema.post('save', function(doc) {
+  if (!doc._wasNew) return;
+  if (doc.source !== 'instagram') return;
+  if (doc.fileType !== 'image') return;
+  setImmediate(() => {
+    try {
+      const { fetchCommentsForMedia } = require('../services/mediaInsightsService');
+      fetchCommentsForMedia(doc._id)
+        .then(r => {
+          if (r?.ok) console.log(`💬 auto-fetched ${r.upserted || 0} comment(s) for media ${doc._id}`);
+        })
+        .catch(err => console.warn(`   ⚠️  auto-comment-fetch failed for media ${doc._id}: ${err.message}`));
+    } catch (err) {
+      console.warn(`   ⚠️  auto-comment-fetch dispatch failed: ${err.message}`);
+    }
+  });
+});
 
 module.exports = mongoose.model('Media', mediaSchema);
