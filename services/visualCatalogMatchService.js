@@ -73,7 +73,23 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
         generationConfig: {
           temperature: 0.1,
           maxOutputTokens: 400,
-          responseMimeType: 'application/json'
+          responseMimeType: 'application/json',
+          // Schema-enforced output. Without this, Gemini sometimes
+          // returns prose with embedded JSON, malformed JSON missing
+          // a closing brace, or fields wrapped in markdown — all of
+          // which surfaced as "unparseable response" warnings.
+          // responseSchema forces a structurally valid JSON match
+          // for our exact field set; the parser below becomes
+          // belt-and-braces rather than load-bearing.
+          responseSchema: {
+            type: 'object',
+            properties: {
+              isMatch:   { type: 'boolean' },
+              score:     { type: 'number' },
+              reasoning: { type: 'string' }
+            },
+            required: ['isMatch', 'score', 'reasoning']
+          }
         }
       },
       { timeout: 30000 }
@@ -109,10 +125,24 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
 
 async function downloadImage(url) {
   try {
-    const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+    // Shopify CDN (cdn.shopify.com) returns errors to header-less
+    // axios calls — sometimes 403, sometimes empty bodies, sometimes
+    // CORS-shaped failures. A real-looking User-Agent + Accept header
+    // gets through cleanly. Same shape for any other CDN that's
+    // sensitive to bot signatures.
+    const res = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout:      15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ReachSocial/1.0; +https://reachsocial.io)',
+        'Accept':     'image/*,*/*;q=0.8'
+      }
+    });
     return Buffer.from(res.data);
   } catch (err) {
-    console.warn(`   ⚠️  visualCatalogMatch: failed to download ${url}: ${err.message}`);
+    const status = err.response?.status;
+    const reason = status ? `HTTP ${status}` : (err.code || err.message || 'unknown');
+    console.warn(`   ⚠️  visualCatalogMatch: failed to download ${url} (${reason})`);
     return null;
   }
 }
