@@ -461,6 +461,7 @@ async function runCatalogProductPipeline(run, media, buffer) {
   // 2. Detection artifact — minimal stand-in so latestArtifacts.detection
   //    isn't null. No products / subjects / text on the catalog path.
   const detectionDoc = await DetectionArtifact.create({
+    type: 'image',                                  // catalog products are always still images
     mediaId: media._id, runId: run._id,
     advertiserId: media.advertiserId, brandId: media.brandId,
     width: imgW, height: imgH,
