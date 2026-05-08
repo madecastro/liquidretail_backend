@@ -257,64 +257,37 @@ async function runImagePipeline(run, media, buffer) {
 // ──────────────────────────────────────────────────────────────
 //  Video pipeline
 // ──────────────────────────────────────────────────────────────
+// V2 video path — minimal pipeline.
+//
+// Videos take a stripped path: YOLO finds the hero subject, smart-crops
+// generate against that bbox, done. We deliberately skip Whisper/NER,
+// Gemini subjects-text, judge, product-match, extended crops, and
+// overlay-zone analysis. Rationale: most video UGC has thin captions
+// and the full pipeline's per-video cost (>$0.10, ~30-60s) wasn't
+// returning useful product attribution.
+//
+// To keep videos selectable in ad generation, we still emit a
+// brand_match ProductMatchArtifact so they surface in brand-mode
+// creative seeds (campaignAdsGenerationService.seedFromBrandOnly).
+// Operators who want catalog attribution on a specific video can
+// re-run it via a manual full-pipeline trigger (backlog).
 async function runVideoPipeline(run, media, buffer) {
   const sourceVideoUrl = media.fileUrl;
 
-  // ── Phase 1: detect fan-out ──
-  // Branch A: yolo-video → yolo-identify → subjects-text(hero) — sequential
-  //   within branch because subjects-text needs the hero frame URL.
-  // Branch B: transcribe → ner — independent of YOLO, runs concurrently.
+  // ── Phase 1: YOLO hero detection only ──
   await setRunPhase(run, 'detect-fanout');
-
-  const yoloChain = (async () => {
-    const yoloOut = await runYoloVideoChain(run, buffer, media);
-    if (yoloOut.products.length) {
-      // Phase 1.5c — dual-engine enrichment (video). Same parallel pattern
-      // as the image path; reconciler merges into engines.reconciled.products.
-      await timeStage(run, 'yolo-identify', async () => {
-        const hints = { brand: media.metadata?.brand, category: media.metadata?.category };
-        const tasks = [identifyYoloDetections(yoloOut.products, hints).catch(err => {
-          console.warn('⚠️  GPT yolo-identify (video):', err.message);
-          return null;
-        })];
-        if (isGeminiIdentifyEnabled()) {
-          tasks.push(identifyYoloDetectionsGemini(yoloOut.products, hints).catch(err => {
-            console.warn('⚠️  Gemini yolo-identify (video):', err.message);
-            return null;
-          }));
-        } else {
-          yoloOut.products.forEach(p => { p.engines = p.engines || {}; p.engines.gemini = null; });
-        }
-        await Promise.all(tasks);
-        reconcileEnrichments(yoloOut.products);
-        const productCount = yoloOut.products.reduce((n, d) => n + (d.engines?.reconciled?.products?.length || 0), 0);
-        console.log(`🏷️   YOLO identify (video, dual-engine): ${yoloOut.products.length} crop(s) → ${productCount} reconciled product(s)`);
-      });
-    }
-    let subjects = [], text = [], background = null;
-    if (yoloOut.heroImageUrl) {
-      const st = await runSubjectsTextChain(run, yoloOut.heroImageUrl, media);
-      subjects = st.subjects; text = st.text; background = st.background;
-    }
-    return { ...yoloOut, subjects, text, background };
-  })();
-
-  const transcribeChain = runTranscribeNerChain(run, buffer, media);
-
-  const [yoloRes, transcribeRes] = await Promise.allSettled([yoloChain, transcribeChain]);
-  if (yoloRes.status === 'rejected')       console.warn('⚠️  YOLO chain rejected:',       yoloRes.reason?.message);
-  if (transcribeRes.status === 'rejected') console.warn('⚠️  Transcribe chain rejected:', transcribeRes.reason?.message);
-
-  const yoloOut = yoloRes.status === 'fulfilled' ? yoloRes.value : {
-    products: [], imgW: 1024, imgH: 768, heroImageUrl: null,
-    heroFrameSec: null, heroReason: null, videoDurationSec: null,
-    subjects: [], text: [], background: null
-  };
-  const { transcript, entities } = transcribeRes.status === 'fulfilled'
-    ? transcribeRes.value
-    : { transcript: null, entities: [] };
-
-  const { products, imgW, imgH, heroImageUrl, heroFrameSec, heroReason, videoDurationSec, subjects, text, background } = yoloOut;
+  let yoloOut;
+  try {
+    yoloOut = await runYoloVideoChain(run, buffer, media);
+  } catch (err) {
+    console.warn('⚠️  YOLO chain rejected:', err.message);
+    yoloOut = {
+      products: [], imgW: 1024, imgH: 768,
+      heroImageUrl: null, heroFrameSec: null, heroReason: null,
+      videoDurationSec: null
+    };
+  }
+  const { products, imgW, imgH, heroImageUrl, heroFrameSec, heroReason, videoDurationSec } = yoloOut;
 
   // Persist Media dimensions + duration.
   media.width = imgW; media.height = imgH;
@@ -325,115 +298,84 @@ async function runVideoPipeline(run, media, buffer) {
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     type: 'video',
     width: imgW, height: imgH,
-    imageUrl: heroImageUrl,                 // hero frame (the canonical "still" for this video)
+    imageUrl: heroImageUrl,
     videoUrl: sourceVideoUrl,
     heroFrameSec, heroReason, videoDurationSec,
     yoloProducts: products.map(({ cropBuffer, ...p }) => p),
-    refinedProducts: [],                    // Phase 1.6 is image-only for v1; video uses yoloIdentifications fallback in Phase 1.7
-    subjects, text, background,
-    transcript: transcript ? {
-      text: transcript.text,
-      duration: transcript.duration,
-      segments: transcript.segments,
-      entities
-    } : null
+    refinedProducts: [],
+    subjects: [], text: [], background: null,
+    transcript: null,
+    safeRect: null,
+    primarySubjectId: null,
+    primarySubjectDesc: null
   });
 
-  // ── Phase 2: crop-judge bridge ──
+  // ── Phase 2: crops only (no judge) ──
   await setRunPhase(run, 'crop-judge');
 
-  const safeRect = computeSafeRect(products, subjects, imgW, imgH, text);
+  const safeRect = computeSafeRect(products, [], imgW, imgH, []);
   if (safeRect) console.log(`🛟  Safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
 
   const crops = await timeStage(run, 'smart-crops', async () => {
-    const c = generateSmartCrops(imgW, imgH, subjects, text, safeRect);
-    // Attach a Cloudinary video-transform URL to each crop candidate so the UI
-    // can preview the fully cropped clip.
+    const c = generateSmartCrops(imgW, imgH, [], [], safeRect);
     for (const ratio of Object.keys(c)) {
       for (const cand of c[ratio]) cand.videoUrl = buildCloudinaryCropUrl(sourceVideoUrl, cand);
     }
     return c;
   });
 
-  let judge = null;
-  if (heroImageUrl) {
-    judge = await timeStage(run, 'judge', async () => {
-      try {
-        return await judgeDetections({ imageUrl: heroImageUrl, products, subjects, text, crops, safeRect });
-      } catch (err) { console.warn('⚠️  Judge:', err.message); return null; }
-    });
-  }
-
-  const primarySubjectId   = resolvePrimarySubjectId(subjects, judge);
-  const primarySubjectDesc = resolvePrimarySubjectDesc(subjects, judge);
-
   detectionDoc.safeRect = safeRect || null;
-  detectionDoc.primarySubjectId = primarySubjectId;
-  detectionDoc.primarySubjectDesc = primarySubjectDesc;
   await detectionDoc.save();
 
-  // Phase 2c — promote vision analysis to Media (video path; refinedProducts
-  // stays empty until Phase 1.6 supports video).
-  media.subjects           = (subjects || []).map(s => ({ ...s }));
-  media.text               = (text     || []).map(t => ({ ...t }));
-  media.background         = background || null;
-  media.primarySubjectId   = primarySubjectId   || null;
-  media.primarySubjectDesc = primarySubjectDesc || null;
-  media.safeRect           = safeRect || null;
-  media.refinedProducts    = [];
-  media.lastDetectedAt     = new Date();
+  media.safeRect       = safeRect || null;
+  media.lastDetectedAt = new Date();
   await media.save();
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     smartCrops: crops,
-    judge,
-    winners: {
-      '5:4': judge?.crop_5_4?.winnerId || null,
-      '1:1': judge?.crop_1_1?.winnerId || null,
-      '4:5': judge?.crop_4_5?.winnerId || null
-    }
+    judge: null,
+    winners: { '5:4': null, '1:1': null, '4:5': null }
   });
 
-  // ── Phase 3: product-match (critical path; extended deferred — see image pipeline note) ──
-  await setRunPhase(run, 'enrich-fanout');
-  // Video Phase 1.6 isn't wired yet (refinedProducts always [] for video) —
-  // findPerProductMatches falls through to the legacy single-match path.
-  const matchRes = await runProductMatchChain(run, media, heroImageUrl, products, primarySubjectDesc, text, [])
-    .catch(err => {
-      console.warn('⚠️  Product match chain rejected:', err.message);
-      return null;
+  // ── Phase 3: brand_match PMA so videos still seed ad generation ──
+  // No catalog matching, no Gemini visual compare — we just stamp the
+  // video as brand content. campaignAdsGenerationService picks these up
+  // via seedFromBrandOnly when the operator runs a brand-mode campaign
+  // or a promotional campaign with no product/media picks.
+  let matchDoc = null;
+  try {
+    matchDoc = await ProductMatchArtifact.create({
+      mediaId:      media._id,
+      runId:        run._id,
+      advertiserId: media.advertiserId,
+      brandId:      media.brandId,
+      outcome:      'brand_match',
+      catalogProductId: null,
+      categoryId:       null,
+      identification: { brand: media.metadata?.brand || null, certainty: null }
     });
-  const { productMatches, matchDoc, matchDocs } = matchRes || { productMatches: null, matchDoc: null, matchDocs: [] };
-
-  if (productMatches && media.source === 'instagram') {
-    maybePostMatchReply({ media, productMatch: productMatches })
-      .catch(err => console.warn(`   ⚠️  comment-reply async failure: ${err.message}`));
+  } catch (err) {
+    console.warn(`⚠️  brand_match PMA create failed for video ${media._id}: ${err.message}`);
   }
-  // ── Finalize critical path ──
+
+  // Mark detect summary so the UI pill / catalog list show the right
+  // "video — brand content" state instead of "no match".
+  media.classification = media.classification || {};
+  media.classification.detectSummary = {
+    ...(media.classification.detectSummary || {}),
+    outcome: 'brand_match'
+  };
+  await media.save();
+
+  // ── Finalize ──
   await setRunPhase(run, 'finalize');
   await updateMediaLatestArtifacts(media, {
-    detection:    detectionDoc._id,
-    crops:        cropDoc._id,
-    match:        matchDoc?._id,
-    matches:      (matchDocs || []).map(d => d._id)
-    // extended + overlayZones land via the lazy chain below.
+    detection: detectionDoc._id,
+    crops:     cropDoc._id,
+    match:     matchDoc?._id,
+    matches:   matchDoc ? [matchDoc._id] : []
   });
-
-  // ── Lazy enrichment (off the critical path) ──
-  // Same defer as the image pipeline. Media-library derivations
-  // pass a null buffer for video (frame extraction happens via
-  // Cloudinary at hero point — focus is skipped on video).
-  runExtendedAndOverlayChain(run, media, heroImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, true, { safeRect, imgW, imgH })
-    .then(async ({ extendedDoc, overlayDoc }) => {
-      await updateMediaLatestArtifacts(media, {
-        extended:     extendedDoc?._id,
-        overlayZones: overlayDoc?._id
-      });
-      await applyMediaLibraryDerivations(media, null, overlayDoc, productMatches);
-      console.log(`🎨 lazy enrichment landed for media ${media._id} (video)`);
-    })
-    .catch(err => console.warn(`   ⚠️  lazy enrichment failed for media ${media._id} (video): ${err.message}`));
 }
 
 // ──────────────────────────────────────────────────────────────
