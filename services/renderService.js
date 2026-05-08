@@ -226,12 +226,46 @@ const RENDER_AUTH_TOKEN  = process.env.RENDER_AUTH_TOKEN  || null;
 // specific deploy needs more (heavy templates) or less (tight CI).
 const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '35000', 10);
 
-console.log(
-  `🎬 renderService config — ` +
-  `FRONTEND_URL=${FRONTEND_URL} ` +
-  `RENDER_AUTH_TOKEN=${RENDER_AUTH_TOKEN ? `set(${RENDER_AUTH_TOKEN.length} chars)` : 'MISSING'} ` +
-  `RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS}`
-);
+// Decode the token's payload (without verifying) so the boot log can
+// surface exp + user identity. Helps an operator confirm at a glance
+// whether the env-stamped JWT is still valid before kicking a render
+// run that would otherwise 401 silently. JWT secret rotation on the
+// API side would still produce 401s — those need a real verify.
+function decodeTokenPayload(token) {
+  if (!token) return null;
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const json = Buffer.from(parts[1], 'base64url').toString('utf8');
+    return JSON.parse(json);
+  } catch (_) {
+    return null;
+  }
+}
+
+(function logRenderConfig() {
+  const payload = decodeTokenPayload(RENDER_AUTH_TOKEN);
+  let tokenSummary = 'MISSING';
+  if (RENDER_AUTH_TOKEN) {
+    if (payload) {
+      const exp = payload.exp ? new Date(payload.exp * 1000) : null;
+      const expiredAlready = exp ? Date.now() > exp.getTime() : false;
+      const expLabel = exp ? exp.toISOString() : 'no-exp';
+      const userBit = payload.userId || payload.id || 'no-user';
+      tokenSummary =
+        `set(${RENDER_AUTH_TOKEN.length} chars, user=${String(userBit).slice(0, 8)}, ` +
+        `exp=${expLabel}${expiredAlready ? ' EXPIRED' : ''})`;
+    } else {
+      tokenSummary = `set(${RENDER_AUTH_TOKEN.length} chars, undecodable)`;
+    }
+  }
+  console.log(
+    `🎬 renderService config — ` +
+    `FRONTEND_URL=${FRONTEND_URL} ` +
+    `RENDER_AUTH_TOKEN=${tokenSummary} ` +
+    `RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS}`
+  );
+})();
 
 async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
