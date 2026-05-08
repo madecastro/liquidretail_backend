@@ -3,8 +3,10 @@ const router = express.Router();
 const Media = require('../models/Media');
 const DetectRun = require('../models/DetectRun');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
+const Comment = require('../models/Comment');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
+const { refreshInsightsForMedia, fetchCommentsForMedia } = require('../services/mediaInsightsService');
 const { assembleResult } = require('./detect');
 
 // GET /api/media
@@ -246,6 +248,70 @@ router.delete('/:mediaId', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || 'media delete failed' });
+  }
+});
+
+// GET /api/media/:mediaId/comments?limit=50&offset=0
+// Paginated, newest-first. Comments are populated by the
+// mediaInsightsService refresh — empty until the operator hits
+// the Refresh button (or a future scheduled cron) for this Media.
+router.get('/:mediaId/comments', async (req, res) => {
+  try {
+    await assertMediaInTenant(req.params.mediaId, req);
+    const limit  = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const [rows, total] = await Promise.all([
+      Comment.find({ mediaId: req.params.mediaId })
+        .sort({ postedAt: -1 })
+        .skip(offset)
+        .limit(limit)
+        .lean(),
+      Comment.countDocuments({ mediaId: req.params.mediaId })
+    ]);
+
+    res.json({
+      comments: rows.map(c => ({
+        id:             String(c._id),
+        externalId:     c.externalId,
+        text:           c.text,
+        authorUsername: c.authorUsername,
+        likeCount:      c.likeCount || 0,
+        postedAt:       c.postedAt,
+        fetchedAt:      c.fetchedAt
+      })),
+      total, limit, offset
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'comments fetch failed' });
+  }
+});
+
+// POST /api/media/:mediaId/refresh-insights
+// Operator-triggered refresh from the Media detail panel. Pulls
+// fresh post analytics + inbound comments for this Media in one
+// call. Returns the updated platformStats and comment counts so
+// the UI can mirror locally without a follow-up GET.
+router.post('/:mediaId/refresh-insights', async (req, res) => {
+  try {
+    await assertMediaInTenant(req.params.mediaId, req);
+    const [statsResult, commentsResult] = await Promise.all([
+      refreshInsightsForMedia(req.params.mediaId),
+      fetchCommentsForMedia(req.params.mediaId)
+    ]);
+    res.json({
+      ok:        statsResult.ok || commentsResult.ok,
+      stats:     statsResult.ok    ? statsResult.stats    : null,
+      statsError: statsResult.ok    ? null : statsResult.reason,
+      comments:  commentsResult.ok ? {
+                   fetched:     commentsResult.fetched,
+                   upserted:    commentsResult.upserted,
+                   totalStored: commentsResult.totalStored
+                 } : null,
+      commentsError: commentsResult.ok ? null : commentsResult.reason
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'refresh failed' });
   }
 });
 
