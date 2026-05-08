@@ -33,6 +33,11 @@ router.get('/', async (req, res) => {
       ? { 'latestArtifacts.detection': { $ne: null } }
       : {};
     if (brandId) filterExtras.brandId = brandId;
+    // Hide catalog-product wrapper Media — these are internal artifacts
+    // for fanning detect across a SKU's hero+alt images. Surfacing them
+    // in the Uploaded Media list confuses operators (they show up as
+    // "248 items" alongside 25 real IG posts).
+    filterExtras.source = { $ne: 'catalog-product' };
     const filter = tenantFilter(req, filterExtras);
 
     const [docs, total] = await Promise.all([
