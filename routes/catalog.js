@@ -122,31 +122,38 @@ router.get('/', async (req, res) => {
     if (req.query.inStock === '1') filter.availability = /in stock/i;
     if (req.query.hasReviews === '1') filter['productReviews.quotes.0'] = { $exists: true };
 
+    // Sort by matchCount desc → lastSyncedAt desc so products with
+    // UGC matches stack at the top. Done as a single aggregation so
+    // pagination is correct across the full ranked set (a per-page
+    // join wouldn't move a high-traffic product on page 4 to page 1).
     const [rows, total, distinctCategories, totalDrafts] = await Promise.all([
-      CatalogProduct.find(filter)
-        .select('externalId source draft title brand category price currency availability imageUrl productUrl rating reviews gtin mpn detectedFromMediaId firstSeenAt lastSyncedAt')
-        .sort({ lastSyncedAt: -1 })
-        .skip(offset)
-        .limit(limit)
-        .lean(),
+      CatalogProduct.aggregate([
+        { $match: filter },
+        { $lookup: {
+            from:         'productmatchartifacts',
+            localField:   '_id',
+            foreignField: 'catalogProductId',
+            as:           'matches'
+        }},
+        { $addFields: { matchCount: { $size: '$matches' } } },
+        { $sort: { matchCount: -1, lastSyncedAt: -1 } },
+        { $skip:  offset },
+        { $limit: limit },
+        { $project: {
+            externalId: 1, source: 1, draft: 1, title: 1, brand: 1, category: 1,
+            price: 1, currency: 1, availability: 1, imageUrl: 1, productUrl: 1,
+            rating: 1, reviews: 1, gtin: 1, mpn: 1,
+            detectedFromMediaId: 1, firstSeenAt: 1, lastSyncedAt: 1,
+            matchCount: 1
+        }}
+      ]),
       CatalogProduct.countDocuments(filter),
       CatalogProduct.distinct('category', { brandId }),
       CatalogProduct.countDocuments(tenantFilter(req, { brandId, draft: true }))
     ]);
 
-    // Match-traffic count: how many ProductMatchArtifacts reference each
-    // catalog row in the current page. One aggregation pulls all counts.
-    const ids = rows.map(r => r._id);
-    const matchCounts = ids.length
-      ? await ProductMatchArtifact.aggregate([
-          { $match: { catalogProductId: { $in: ids } } },
-          { $group: { _id: '$catalogProductId', count: { $sum: 1 } } }
-        ])
-      : [];
-    const matchMap = new Map(matchCounts.map(c => [String(c._id), c.count]));
-
     res.json({
-      products: rows.map(r => projectListRow(r, matchMap.get(String(r._id)) || 0)),
+      products: rows.map(r => projectListRow(r, r.matchCount || 0)),
       total,
       limit,
       offset,
