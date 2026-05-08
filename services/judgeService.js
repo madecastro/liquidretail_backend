@@ -309,22 +309,29 @@ function sumDimensions(dims) {
 }
 
 // Retry helper for the judge-extended OpenAI call. Cloudinary CDN
-// edge propagation can lag behind upload completion by a few hundred
-// ms; OpenAI's vision fetcher hits the URL before it's live and
-// returns a 400 with a "Timeout while downloading" message. Wait
-// briefly and try once more.
+// edge propagation on transformed URLs can take 3–5s under load —
+// OpenAI's vision fetcher hits the URL before it's live and 400s
+// with "Timeout while downloading". Two retries with growing
+// backoff (1.5s, 4s) covers the slowest propagation we've observed
+// without holding the run hostage.
 async function callOpenAIWithCloudinaryRetry(payload) {
-  try {
-    return await openai.chat.completions.create(payload);
-  } catch (err) {
-    const isCloudinaryRace =
-      err?.status === 400 &&
-      /Timeout while downloading/i.test(err?.message || '');
-    if (!isCloudinaryRace) throw err;
-    console.log('   ↻ judge-extended retry after Cloudinary CDN race');
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    return await openai.chat.completions.create(payload);
+  const delays = [1500, 4000];   // ms before each retry
+  let lastErr;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      return await openai.chat.completions.create(payload);
+    } catch (err) {
+      lastErr = err;
+      const isCloudinaryRace =
+        err?.status === 400 &&
+        /Timeout while downloading/i.test(err?.message || '');
+      if (!isCloudinaryRace) throw err;
+      if (attempt === delays.length) break;   // out of retries
+      console.log(`   ↻ judge-extended retry ${attempt + 1}/${delays.length} after Cloudinary CDN race`);
+      await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+    }
   }
+  throw lastErr;
 }
 
 module.exports = { judgeDetections, judgeExtendedCrops };

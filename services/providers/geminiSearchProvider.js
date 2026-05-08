@@ -262,7 +262,31 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
         generationConfig: {
           temperature: 0.1,
           maxOutputTokens: 1200,
-          responseMimeType: 'application/json'
+          responseMimeType: 'application/json',
+          // Same schema as product-reviews below — Gemini's freeform
+          // JSON output is unreliable enough that the parser fallback
+          // was firing often. Constrains the response shape.
+          responseSchema: {
+            type: 'object',
+            properties: {
+              quotes: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    text:   { type: 'string' },
+                    author: { type: 'string', nullable: true },
+                    source: { type: 'string', nullable: true }
+                  },
+                  required: ['text']
+                }
+              },
+              rating:      { type: 'number',  nullable: true },
+              reviewCount: { type: 'integer', nullable: true },
+              summary:     { type: 'string',  nullable: true }
+            },
+            required: ['quotes']
+          }
         }
       },
       { timeout: 30000 }
@@ -371,7 +395,33 @@ async function lookupProductReviews({ productName, brandName, productUrl }) {
         generationConfig: {
           temperature: 0.1,
           maxOutputTokens: 1200,
-          responseMimeType: 'application/json'
+          responseMimeType: 'application/json',
+          // Schema-enforced output to eliminate "structuring produced
+          // no parsable JSON" warnings — Gemini was returning markdown-
+          // wrapped JSON, prose with embedded JSON, or fields with
+          // wrong types. responseSchema constrains output to exactly
+          // our shape; the parser below becomes a safety net.
+          responseSchema: {
+            type: 'object',
+            properties: {
+              quotes: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    text:   { type: 'string' },
+                    author: { type: 'string', nullable: true },
+                    source: { type: 'string', nullable: true }
+                  },
+                  required: ['text']
+                }
+              },
+              rating:      { type: 'number',  nullable: true },
+              reviewCount: { type: 'integer', nullable: true },
+              summary:     { type: 'string',  nullable: true }
+            },
+            required: ['quotes']
+          }
         }
       },
       { timeout: 30000 }
