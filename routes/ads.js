@@ -33,6 +33,13 @@ const AD_STATUSES = ['draft', 'live', 'archived'];
 // Chromium. 2 in flight at once is a safe starting point.
 const RENDER_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || '2', 10);
 
+// Hard cap on creatives per generation. Cartesian expansion
+// (products × templates × supported ratios) blows up fast and a
+// 20-render run takes long enough that tail renders accumulate
+// Chromium memory pressure. 5 keeps a single run inside one
+// Chromium-warm window.
+const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '5', 10);
+
 // POST /api/ads/generate
 // Body: { campaignId, productIds, mediaIds, templateIds, cta:{text,url}, urlParams }
 // Response: 202 Accepted { campaignRunId, total, status: 'running' }
@@ -68,6 +75,17 @@ router.post('/generate', async (req, res) => {
         error: 'No renderable creatives — no media available for the selected products / templates',
         job
       });
+    }
+
+    // Cap creatives per run. The wizard's cartesian (products ×
+    // templates × supported ratios) routinely produces 20+ creatives,
+    // which both blows past Chromium's warm-window and produces more
+    // ads than an operator wants to triage in one batch.
+    if (job.creatives.length > MAX_CREATIVES_PER_RUN) {
+      console.log(
+        `   ✂️  capping creatives ${job.creatives.length} → ${MAX_CREATIVES_PER_RUN} (campaign=${campaignId})`
+      );
+      job.creatives = job.creatives.slice(0, MAX_CREATIVES_PER_RUN);
     }
 
     const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
