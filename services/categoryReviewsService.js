@@ -191,7 +191,7 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
         tools: [{ google_search: {} }],
         generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
       },
-      { timeout: 30000 }
+      { timeout: 45000 }    // bumped from 30s — gemini grounded search w/ tools regularly lands at 30-40s under load
     );
   } catch (err) {
     console.warn(`   ⚠️  categoryReviews search failed: ${err.message}`);
@@ -242,7 +242,7 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
           responseMimeType: 'application/json'
         }
       },
-      { timeout: 30000 }
+      { timeout: 45000 }    // bumped from 30s — gemini grounded search w/ tools regularly lands at 30-40s under load
     );
   } catch (err) {
     console.warn(`   ⚠️  categoryReviews structuring failed: ${err.message}`);

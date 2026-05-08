@@ -180,21 +180,30 @@ router.get('/eligibility', requireUserOnly, async (req, res) => {
 router.post('/dispatch-syncs', requireAuth, express.json(), async (req, res) => {
   try {
     const brandId = req.headers['x-brand-id'] || req.body?.brandId;
+    console.log(`🚦 dispatch-syncs called: brand=${brandId} advertiser=${req.advertiserId}`);
     if (!brandId) return res.status(400).json({ error: 'brandId required' });
 
     // Confirm brand belongs to caller's advertiser before scheduling
     // any work for it.
     const brand = await Brand.findOne({ _id: brandId, advertiserId: req.advertiserId }).select('_id').lean();
-    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    if (!brand) {
+      console.warn(`🚦 dispatch-syncs: brand ${brandId} not found under advertiser ${req.advertiserId}`);
+      return res.status(404).json({ error: 'brand not found' });
+    }
 
     // Inspect connected creds so we only dispatch what's actually
-    // useful. No-op when nothing's connected (still 202 — caller
-    // doesn't need to special-case the empty case).
+    // useful. We accept 'pending' too because the picker may not
+    // have promoted to 'active' yet — both meta/IG creds spend a
+    // few seconds in pending while the picker UI runs. The sync
+    // services themselves filter on status='active', so dispatching
+    // a sync against a pending cred is a harmless no-op rather than
+    // a dropped intent.
     const [igCred, metaCred, googleCred] = await Promise.all([
-      IntegrationCredential.findOne({ brandId, type: 'instagram',  status: 'active' }).select('_id').lean(),
-      IntegrationCredential.findOne({ brandId, type: 'meta-ads',   status: 'active' }).select('_id').lean(),
-      IntegrationCredential.findOne({ brandId, type: 'google-ads', status: 'active' }).select('_id').lean()
+      IntegrationCredential.findOne({ brandId, type: 'instagram',  status: { $in: ['active', 'pending'] } }).select('_id status').lean(),
+      IntegrationCredential.findOne({ brandId, type: 'meta-ads',   status: { $in: ['active', 'pending'] } }).select('_id status').lean(),
+      IntegrationCredential.findOne({ brandId, type: 'google-ads', status: { $in: ['active', 'pending'] } }).select('_id status').lean()
     ]);
+    console.log(`🚦 dispatch-syncs creds: ig=${igCred ? igCred.status : 'none'} meta=${metaCred ? metaCred.status : 'none'} google=${googleCred ? googleCred.status : 'none'}`);
 
     const dispatched = [];
     if (igCred) {

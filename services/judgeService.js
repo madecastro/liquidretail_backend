@@ -190,7 +190,12 @@ async function judgeExtendedCrops(arg) {
     `Return ONLY JSON matching this exact shape (no prose outside). Use slot letters as keys — do NOT reference provider names:\n` +
     `{\n  ${schemaLines}\n}`;
 
-  const response = await openai.chat.completions.create({
+  // OpenAI's vision endpoint occasionally 400s with "Timeout while
+  // downloading <cloudinary-url>" right after we've uploaded the
+  // candidate images — Cloudinary CDN edge propagation hasn't caught
+  // up by the time OpenAI's fetcher hits it. Retry once after a
+  // brief delay; the URL is almost always live by then.
+  const response = await callOpenAIWithCloudinaryRetry({
     model: 'gpt-4.1',
     response_format: { type: 'json_object' },
     messages: [{
@@ -301,6 +306,25 @@ function normalizeCropJudgement(raw, candidates, totalFn) {
 function sumDimensions(dims) {
   if (!dims || typeof dims !== 'object') return 0;
   return Object.values(dims).reduce((a, n) => a + (Number(n) || 0), 0);
+}
+
+// Retry helper for the judge-extended OpenAI call. Cloudinary CDN
+// edge propagation can lag behind upload completion by a few hundred
+// ms; OpenAI's vision fetcher hits the URL before it's live and
+// returns a 400 with a "Timeout while downloading" message. Wait
+// briefly and try once more.
+async function callOpenAIWithCloudinaryRetry(payload) {
+  try {
+    return await openai.chat.completions.create(payload);
+  } catch (err) {
+    const isCloudinaryRace =
+      err?.status === 400 &&
+      /Timeout while downloading/i.test(err?.message || '');
+    if (!isCloudinaryRace) throw err;
+    console.log('   ↻ judge-extended retry after Cloudinary CDN race');
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    return await openai.chat.completions.create(payload);
+  }
 }
 
 module.exports = { judgeDetections, judgeExtendedCrops };
