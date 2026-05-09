@@ -220,6 +220,10 @@
           "default": "#0B0B0B",
           "comment": "right-side content panel for landscape variants — leads with source-Media's dominant tone so the panel reads as an extension of the image"
         },
+        "panel_text_color": {
+          "default": "auto-from-brightness",
+          "comment": "panel-attached secondary text (eyebrow, badges) reads this; renderer derives readable B/W against the resolved panel_bg via tpReadableOn. Catches white-on-cream when palette_dominant is light."
+        },
         "card_bg": {
           "source_priority": [
             "media.palette_dominant",
@@ -543,6 +547,10 @@
           ],
           "default": "#0B0B0B",
           "comment": "split-panel content surface — leads with source-Media's dominant tone so the panel reads as an extension of the image"
+        },
+        "panel_text_color": {
+          "default": "auto-from-brightness",
+          "comment": "panel-attached secondary text (eyebrow, badges) reads this; renderer derives readable B/W against the resolved panel_bg via tpReadableOn. Catches white-on-cream when palette_dominant is light."
         },
         "card_bg": {
           "source_priority": [
