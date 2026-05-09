@@ -3,40 +3,39 @@
 // fully-resolved RenderCampaignJob the render service can iterate
 // without making content/media decisions.
 //
-// Decision rules (mirrors the design ratified with the operator):
+// Decision rules:
 //
-//   1. Branding campaign (campaign.kind === 'brand'):
-//      → all creatives use brand_match media for brandId.
-//      → productId on each creative is null.
-//      → operator-picked products/media on the wizard payload are
-//        IGNORED for selection purposes (they may still be tracked on
-//        the campaign for analytics/CTA, but creative content is brand-only).
+//   Operator picks (mediaIds + productIds) always win. The seeder
+//   honors them regardless of campaign.kind — brand campaigns can
+//   still feature specific media if the operator picked them. The
+//   campaignKind field flows through to downstream copy derivation
+//   so brand-mode tone can fire even when productId is set.
 //
-//   2. Promotional, no products + no media:
-//      → fall through to brand-only path (same as branding).
+//   1. No picks (productIds.length === 0 && mediaIds.length === 0):
+//      → seedFromBrandOnly. Pulls top brand_match media for brandId,
+//        productId: null on every seed.
 //
-//   3. Promotional, mediaIds present (library-entry deep-link):
+//   2. mediaIds present (library-entry deep-link / picker selection):
 //      → for each media, dispatch by ProductMatchArtifact.outcome:
 //          product_match    → feature match.catalogProductId
 //          product_category → feature first match.recommendedProducts[]
 //                             entry (already-attached siblings)
 //          brand_match      → productId: null
+//          (no PMA)         → productId: null (brand_match fallback)
 //      → mediaSource on the creative records WHICH rung supplied the
 //        media so the render service can tag the resulting Ad doc.
 //
-//   4. Promotional, productIds present (catalog-entry / wizard Step 2):
+//   3. productIds present (catalog-entry / wizard Step 2):
 //      → for each productId, simpler cascade:
 //          product_match media for THIS productId → top-suitability winner
 //          else                                   → brand_match media
 //      → category_match is NOT auto-fallback in this path; that's
-//        reserved for path (3) where the operator chose the media.
+//        reserved for path (2) where the operator chose the media.
 //
-//   5. Both mediaIds and productIds: union — each contributes
-//      creatives independently.
-//
-// campaignKind is always threaded through the resulting job so
-// downstream derivation can flip to brand-mode copy regardless of
-// whether a productId is set on a given creative.
+//   4. Both mediaIds and productIds: union — each contributes
+//      creatives independently. dedupeSeeds collapses (productId|null,
+//      mediaId) duplicates that result from picking the same media via
+//      both library + catalog paths.
 
 const Campaign              = require('../models/Campaign');
 const Media                 = require('../models/Media');
@@ -87,7 +86,6 @@ async function expandWizardJob({
   // field stores whatever string we pass through here so it stays
   // queryable.
   const campaignKind = campaign.kind || 'promotional';
-  const isBranding   = campaignKind === 'brand';
   const allowedTemplates = templateIds.filter(t => SUPPORTED_TEMPLATES.has(t));
 
   if (!allowedTemplates.length) {
@@ -95,9 +93,16 @@ async function expandWizardJob({
   }
 
   // ── 1. Build creative seeds ({productId, mediaId, mediaSource}) ──
+  //
+  // Operator picks (productIds, mediaIds) ALWAYS win. The previous
+  // implementation special-cased campaignKind === 'brand' to ignore
+  // picks entirely and auto-pull top brand_match media — fine for
+  // synced campaigns that don't have a picker UI, but the new
+  // wizard's ribbon picker explicitly lets operators choose for
+  // brand campaigns too. Honor the picks; only fall back to
+  // brand-only when nothing was picked.
   let seeds = [];
-
-  const useBrandOnly = isBranding || (productIds.length === 0 && mediaIds.length === 0);
+  const useBrandOnly = productIds.length === 0 && mediaIds.length === 0;
 
   if (useBrandOnly) {
     seeds = await seedFromBrandOnly(brandId, BRAND_ONLY_MEDIA_LIMIT);
