@@ -346,6 +346,97 @@ router.post('/process', express.json(), async (req, res) => {
   }
 });
 
+// POST /api/detect/rematch
+// Re-queue detect runs for media whose latest run produced no useful
+// product attribution (i.e., no PMA with outcome in
+// {'product_match', 'product_category'}). Used when an operator wants
+// another pass after fixing matcher tuning, refreshing the catalog,
+// or when transient API failures (Gemini timeouts, rate limits) left
+// a batch under-matched.
+//
+// Body:
+//   {
+//     brandId:  string                  // required
+//     mediaIds: string[]   (optional)   // explicit list; takes precedence over the auto-filter
+//     fileType: 'video' | 'image' (opt) // narrow the auto-filter to one type
+//     limit:    number     (optional)   // safety cap, default 50
+//   }
+//
+// Response:
+//   { enqueued: number, mediaIds: string[], runIds: string[] }
+//
+// New DetectRuns are stamped with trigger='manual-rematch' + priority=1
+// so they jump ahead of routine catalog/ig-sync runs.
+router.post('/rematch', express.json(), async (req, res) => {
+  try {
+    const brandId = req.body?.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+
+    const explicit  = Array.isArray(req.body?.mediaIds) ? req.body.mediaIds : null;
+    const fileType  = req.body?.fileType || null;
+    const limit     = Math.min(Math.max(parseInt(req.body?.limit, 10) || 50, 1), 200);
+
+    let mediaDocs;
+    if (explicit?.length) {
+      // Explicit list — tenant-assert each, then take whatever passes.
+      mediaDocs = await Media.find(tenantFilter(req, {
+        _id:     { $in: explicit },
+        brandId
+      })).select('_id fileType').lean();
+    } else {
+      // Auto-filter: media for this brand whose PMA outcomes don't
+      // include product_match or product_category. Two-step because a
+      // single media has multiple PMAs (one per refined product) — we
+      // need to verify NONE of them is a strong match.
+      const strongMatchMediaIds = await ProductMatchArtifact.distinct('mediaId', {
+        brandId,
+        outcome: { $in: ['product_match', 'product_category'] }
+      });
+      const strongSet = new Set(strongMatchMediaIds.map(id => String(id)));
+
+      const mediaFilter = tenantFilter(req, { brandId });
+      if (fileType) mediaFilter.fileType = fileType;
+
+      const allBrandMedia = await Media.find(mediaFilter)
+        .select('_id fileType')
+        .lean();
+
+      mediaDocs = allBrandMedia.filter(m => !strongSet.has(String(m._id))).slice(0, limit);
+    }
+
+    if (!mediaDocs.length) {
+      return res.json({ enqueued: 0, mediaIds: [], runIds: [], reason: 'no media matched filter' });
+    }
+
+    // Look up advertiserId for each (denormalized stamp on DetectRun).
+    const mediaWithAdv = await Media.find({ _id: { $in: mediaDocs.map(m => m._id) } })
+      .select('_id advertiserId brandId')
+      .lean();
+
+    const runs = [];
+    for (const m of mediaWithAdv) {
+      const run = await DetectRun.create({
+        advertiserId: m.advertiserId,
+        brandId:      m.brandId,
+        mediaId:      m._id,
+        trigger:      'manual-rematch',
+        priority:     1
+      });
+      runs.push(run);
+    }
+
+    console.log(`🔁 manual-rematch: enqueued ${runs.length} run(s) for brand ${brandId} (filter=${explicit ? 'explicit' : 'auto'})`);
+    res.status(202).json({
+      enqueued: runs.length,
+      mediaIds: mediaWithAdv.map(m => String(m._id)),
+      runIds:   runs.map(r => String(r._id))
+    });
+  } catch (err) {
+    console.error('rematch failed:', err);
+    res.status(500).json({ error: err.message || 'rematch failed' });
+  }
+});
+
 // Diagnostic: GET /api/detect/gemini-models
 router.get('/gemini-models', async (req, res) => {
   try {

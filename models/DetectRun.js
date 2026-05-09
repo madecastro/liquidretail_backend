@@ -20,7 +20,7 @@ const detectRunSchema = new mongoose.Schema({
   stage:      String,                                  // current stage for progress UI
   stageTimings: { type: mongoose.Schema.Types.Mixed, default: {} },
 
-  trigger:    { type: String, enum: ['upload', 'webhook', 'manual_rerun', 'instagram-sync', 'catalog-sync'], default: 'upload' },
+  trigger:    { type: String, enum: ['upload', 'webhook', 'manual_rerun', 'manual-rematch', 'instagram-sync', 'catalog-sync'], default: 'upload' },
 
   // Lower runs first. Catalog-product runs (priority=1, default) drain
   // before IG-post runs (priority=2) so the visual catalog index is
