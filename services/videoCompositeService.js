@@ -92,11 +92,16 @@ function buildVideoCompositeUrl({
   //    once the overlay lands).
   transforms.push(`c_lpad,w_${cw},h_${ch},g_north_west,x_${slotX},y_${slotY},b_black`);
 
-  // 4. Apply the canvas-sized overlay PNG. l_fetch lets us reference
-  //    any HTTPS URL without needing the overlay to live in the same
-  //    cloud or have a known public_id.
+  // 4. Apply the canvas-sized overlay PNG. Cloudinary syntax for
+  //    overlays is two slash-separated groups:
+  //      Group A: l_fetch:<b64>,<overlay's own transforms>   → sizes the overlay
+  //      Group B: fl_layer_apply,<positioning>                → composites it
+  //    Putting fl_layer_apply in the SAME comma-group as the overlay's
+  //    w/h (or before them) silently breaks the layer apply — the
+  //    response either 404s or returns the base asset un-overlaid.
   const fetched = `l_fetch:${base64UrlEncode(overlayImageUrl)}`;
-  transforms.push(`${fetched},fl_layer_apply,w_${cw},h_${ch},g_north_west,x_0,y_0`);
+  transforms.push(`${fetched},w_${cw},h_${ch}`);
+  transforms.push(`fl_layer_apply,g_north_west,x_0,y_0`);
 
   // Splice the transform chain into the source URL right after /video/upload/.
   const compositeChain = transforms.join('/');
