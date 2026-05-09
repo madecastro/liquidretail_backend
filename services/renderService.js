@@ -31,10 +31,18 @@ const puppeteer = require('puppeteer');
 const Ad                    = require('../models/Ad');
 const Media                 = require('../models/Media');
 const CatalogProduct        = require('../models/CatalogProduct');
+const CropArtifact          = require('../models/CropArtifact');
 const LayoutInputArtifact   = require('../models/LayoutInputArtifact');
 const registry              = require('./templateRegistry');
 const { buildLayoutInput }  = require('./layoutInputService');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
+const { buildVideoCompositeUrl } = require('./videoCompositeService');
+
+// Templates whose canvas variants have a clean media slot (kind:'media',
+// slot:'product.hero_media'). Only these templates render as video in V1
+// — full-bleed templates (testimonial_overlay, product_overlay) would
+// need transparent pixels in the foreground and are deferred.
+const VIDEO_TEMPLATES = new Set(['ugc_split_screen', 'testimonial_spotlight']);
 
 // ── Tunables ─────────────────────────────────────────────────────────
 
@@ -107,6 +115,16 @@ async function renderCreative(req) {
     console.log(`   🔄 ${tag} refresh=true — skipping Ad dedupe (digest=${derivationDigest.slice(0,8)})`);
   }
 
+  // Decide image vs video branch. Video requires (a) source Media is
+  // a video, (b) the template has a media slot we can punch through.
+  // When (a) is true but (b) isn't, fall back to the static-image path
+  // — runVideoPipeline already populated layoutInput with a hero-frame
+  // image, so the static render produces a valid (still) creative.
+  const sourceMedia = await Media.findById(req.creative.mediaId).select('fileType fileUrl latestArtifacts').lean();
+  const isVideoSource = sourceMedia?.fileType === 'video';
+  const supportsVideoTemplate = VIDEO_TEMPLATES.has(req.creative.template);
+  const useVideoBranch = isVideoSource && supportsVideoTemplate && sourceMedia?.fileUrl?.includes('/video/upload/');
+
   // 4. render — Puppeteer screenshot
   let renderOutput;
   try {
@@ -118,16 +136,19 @@ async function renderCreative(req) {
       expectedKind: req.creative.expectedKind,
       mediaId:      req.creative.mediaId,
       brandId:      req.brandId,
-      authToken:    req.authToken || null
+      authToken:    req.authToken || null,
+      renderMode:   useVideoBranch ? 'video-overlay' : 'static'
     });
     stages.render = Date.now() - t;
-    console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB)`);
+    console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB, mode=${useVideoBranch ? 'video-overlay' : 'static'})`);
   } catch (err) {
     console.error(`   ❌ ${tag} render: ${err.message || err}`);
     return failed(jobId, 'render', err);
   }
 
-  // 5. upload — Cloudinary
+  // 5. upload — Cloudinary. For video, the uploaded PNG is the OVERLAY
+  // (transparent in the media slot); we then build a Cloudinary video
+  // composite URL that layers it over the cropped source video.
   let upload;
   try {
     const t = Date.now();
@@ -137,13 +158,38 @@ async function renderCreative(req) {
       mediaId:          req.creative.mediaId,
       template:         req.creative.template,
       aspectRatio:      req.creative.aspectRatio,
-      derivationDigest
+      derivationDigest,
+      isOverlay:        useVideoBranch
     });
     stages.upload = Date.now() - t;
     console.log(`   ☁️  ${tag} upload ok in ${stages.upload}ms (publicId=${upload.cloudinaryPublicId})`);
   } catch (err) {
     console.error(`   ❌ ${tag} upload: ${err.message || err}`);
     return failed(jobId, 'upload', err);
+  }
+
+  // 5b. video composite — chain Cloudinary transforms to overlay the
+  // PNG on the source video. Failure here falls through to the static
+  // PNG output (the renderUrl just stays the PNG, kind stays 'image')
+  // so video doesn't completely block the run.
+  let videoComposite = null;
+  if (useVideoBranch) {
+    try {
+      videoComposite = await composeVideoOutput({
+        media:        sourceMedia,
+        template:     req.creative.template,
+        aspectRatio:  req.creative.aspectRatio,
+        overlayUrl:   upload.renderUrl
+      });
+      if (videoComposite) {
+        console.log(`   🎞️  ${tag} video composite ok (${videoComposite.compositeUrl.length} chars)`);
+      } else {
+        console.warn(`   ⚠️  ${tag} video composite returned null — falling back to static PNG`);
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  ${tag} video composite failed: ${err.message} — falling back to static PNG`);
+      videoComposite = null;
+    }
   }
 
   // 6. persist — Ad doc
@@ -156,7 +202,8 @@ async function renderCreative(req) {
       layoutInputArtifactId,
       derivationDigest,
       renderOutput,
-      upload
+      upload,
+      videoComposite
     });
     stages.persist = Date.now() - t;
     console.log(`   💾 ${tag} persist ok in ${stages.persist}ms (Ad ${ad._id})`);
@@ -270,13 +317,18 @@ function decodeTokenPayload(token) {
   );
 })();
 
-async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken }) {
+async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static' }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
-  url.searchParams.set('renderMode', '1');
+  // renderMode = 'static' → opaque PNG of full canvas (image media or
+  // image fallback for video). renderMode = 'video-overlay' → transparent
+  // -slot PNG that Cloudinary composites onto a cropped source video.
+  const renderModeParam = renderMode === 'video-overlay' ? 'video-overlay' : '1';
+  url.searchParams.set('renderMode', renderModeParam);
   url.searchParams.set('media', mediaId);
   url.searchParams.set('template', template);
   url.searchParams.set('ratio', aspectRatio);
+  const isVideoOverlay = renderMode === 'video-overlay';
 
   let browser;
   try {
@@ -405,6 +457,11 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
     // visibility check and works as long as the rect is non-empty.
     const buffer = await page.screenshot({
       type: 'png',
+      // omitBackground only emits transparent pixels in video-overlay
+      // mode (where the renderer leaves canvas + media slot transparent
+      // by design). Static renders keep the default opaque background
+      // so brand fills / gradients reach the PNG.
+      omitBackground: isVideoOverlay,
       clip: {
         x:      stageInfo.rect.x,
         y:      stageInfo.rect.y,
@@ -434,10 +491,11 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
 // already short-circuits identical renders via derivationDigest so
 // in normal operation each call here uploads exactly once.
 async function uploadStage(renderOutput, ctx) {
-  const folder = `ads/${ctx.brandId}/${ctx.campaignId}`;
+  const folder = `ads/${ctx.brandId}/${ctx.campaignId}${ctx.isOverlay ? '/overlay' : ''}`;
   const shortMedia = String(ctx.mediaId).slice(-8);
   const shortDigest = (ctx.derivationDigest || '').slice(0, 8) || crypto.randomBytes(4).toString('hex');
-  const publicId = `${ctx.aspectRatio.replace(/[:.]/g, '_')}-${ctx.template}-${shortMedia}-${shortDigest}`;
+  const overlaySuffix = ctx.isOverlay ? '-overlay' : '';
+  const publicId = `${ctx.aspectRatio.replace(/[:.]/g, '_')}-${ctx.template}-${shortMedia}-${shortDigest}${overlaySuffix}`;
 
   const result = await uploadBufferToCloudinary(renderOutput.buffer, {
     folder,
@@ -457,8 +515,13 @@ async function uploadStage(renderOutput, ctx) {
   };
 }
 
-async function persistStage({ req, input, layoutInputArtifactId, derivationDigest, renderOutput, upload }) {
+async function persistStage({ req, input, layoutInputArtifactId, derivationDigest, renderOutput, upload, videoComposite }) {
   const copy = extractCopySnapshot(input);
+  // Video branch — renderUrl is the Cloudinary composite (.mp4),
+  // posterUrl is the overlay PNG (used as a static fallback in
+  // contexts that can't play video, e.g. the Ads gallery thumbnails
+  // before they request the full asset).
+  const isVideo = !!videoComposite;
   return Ad.create({
     brandId:               req.brandId,
     campaignId:            req.campaignId,
@@ -470,9 +533,9 @@ async function persistStage({ req, input, layoutInputArtifactId, derivationDiges
     aspectRatio:           req.creative.aspectRatio,
     mediaSource:           req.creative.mediaSource,
     campaignKind:          req.campaignKind || null,
-    kind:                  renderOutput.kind || 'image',
-    renderUrl:             upload.renderUrl,
-    posterUrl:             upload.posterUrl,
+    kind:                  isVideo ? 'video' : (renderOutput.kind || 'image'),
+    renderUrl:             isVideo ? videoComposite.compositeUrl : upload.renderUrl,
+    posterUrl:             isVideo ? upload.renderUrl : upload.posterUrl,
     cloudinaryPublicId:    upload.cloudinaryPublicId,
     width:                 upload.width,
     height:                upload.height,
@@ -485,6 +548,59 @@ async function persistStage({ req, input, layoutInputArtifactId, derivationDiges
     derivationDigest,
     generatedAt:           new Date()
   });
+}
+
+// ── Video composite helper ───────────────────────────────────────────
+
+// Pick the base smart-crop ratio (5:4 / 1:1 / 4:5) closest to the
+// slot's shape. Mirrors layoutInputService.pickHeroSourceRatio so the
+// cropped clip matches the source crop the layout input was built
+// against. Returns '1:1' as a sane default when the rect is missing.
+function _pickClosestBaseRatio(rect) {
+  if (!rect?.w || !rect?.h) return '1:1';
+  const target = rect.w / rect.h;
+  const opts = [
+    { name: '5:4', value: 5/4 },
+    { name: '1:1', value: 1   },
+    { name: '4:5', value: 4/5 }
+  ];
+  let best = opts[0], bestDiff = Math.abs(opts[0].value - target);
+  for (const o of opts) {
+    const d = Math.abs(o.value - target);
+    if (d < bestDiff) { bestDiff = d; best = o; }
+  }
+  return best.name;
+}
+
+async function composeVideoOutput({ media, template, aspectRatio, overlayUrl }) {
+  const canvasVariant = registry.CANVAS?.templates?.[template]?.variants?.[aspectRatio];
+  if (!canvasVariant) return null;
+  const canvasDims = { w: canvasVariant.canvas?.width, h: canvasVariant.canvas?.height };
+  const slotZone = (canvasVariant.zones || []).find(z =>
+    z.kind === 'media' && z.slot === 'product.hero_media');
+  if (!slotZone?.rect) return null;
+
+  const cropDoc = media.latestArtifacts?.crops
+    ? await CropArtifact.findById(media.latestArtifacts.crops).lean()
+    : null;
+  const slotRatio = _pickClosestBaseRatio(slotZone.rect);
+  const winnerId = cropDoc?.winners?.[slotRatio] || null;
+  const list = cropDoc?.smartCrops?.[slotRatio] || [];
+  const winner = list.find(c => c.id === winnerId) || list[0] || null;
+  const smartCropBbox = winner ? {
+    x1: Number(winner.x1), y1: Number(winner.y1),
+    x2: Number(winner.x2), y2: Number(winner.y2)
+  } : null;
+
+  const compositeUrl = buildVideoCompositeUrl({
+    sourceVideoUrl: media.fileUrl,
+    overlayImageUrl: overlayUrl,
+    canvasDims,
+    slotRect: slotZone.rect,
+    smartCropBbox
+  });
+  if (!compositeUrl) return null;
+  return { compositeUrl, slotRect: slotZone.rect, canvasDims, smartCropBbox };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
