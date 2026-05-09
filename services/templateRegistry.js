@@ -22,6 +22,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { applyContrastGuard } = require('../utils/contrastGuard');
 
 const SCHEMAS_DIR = path.join(__dirname, '..', 'schemas');
 
@@ -199,6 +200,15 @@ function resolveStyleBindings(input, templateId) {
     }
     if (resolved == null) resolved = b.default ?? null;
     if (resolved != null) out[name] = resolved;
+  }
+  // Post-resolution WCAG contrast guard for canvas-zone templates —
+  // overrides text bindings whose resolved hex fails to read against
+  // the resolved adjacent surface bg. No-op for templates without
+  // pair definitions (e.g. overlay-on-image templates).
+  const { overrides } = applyContrastGuard(out, templateId);
+  if (overrides.length) {
+    console.log(`   ✎ contrast-guard[${templateId}]: ${overrides.length} override(s)`,
+      overrides.map(o => `${o.textKey} ${o.from}→${o.to} (vs ${o.bgKey} ${o.bg}, ratio ${o.ratio})`).join('; '));
   }
   return out;
 }

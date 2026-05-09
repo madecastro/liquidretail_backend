@@ -48,6 +48,24 @@ const SCAN_STEPS = 12;
 const SUBJECT_OVERLAP_WEIGHT = 100;
 const DENSITY_WEIGHT         = 30;
 
+// ── Brightness-derived contrast tunables ─────────────────────────────
+// Average luminance bands (0..1, sampled from brightnessGrid under the
+// placed rect). DARK = use light text on a dark scrim (or none).
+// BRIGHT = use dark text on a light scrim. MID is the failure-prone
+// band — text in the 0.40–0.60 range will fail without help, so we
+// always paint a dark scrim there and use light text.
+const BRIGHTNESS_DARK_MAX   = 0.40;
+const BRIGHTNESS_BRIGHT_MIN = 0.60;
+
+// Range = (max − min) across cells the rect covers. High range = busy
+// area where text could land on both light AND dark cells; even a
+// well-chosen text color fails on half the area, so we escalate scrim.
+const RANGE_BUSY_THRESHOLD = 0.50;
+const RANGE_VARIED_THRESHOLD = 0.30;
+
+// CTA is small + critical — never let it sit naked on the image.
+const CTA_MIN_SCRIM_OPACITY = 0.30;
+
 // ── Entry point ──────────────────────────────────────────────────────
 
 function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, content, brandColors, aspectRatio, elementIds }) {
@@ -56,11 +74,19 @@ function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, content, bran
   const decisions  = [];
   const skipped    = [];
 
+  // brightnessGrid (when present on the analysis) drives per-element
+  // textColor + scrim via sampleBrightnessUnderRect → deriveContrast.
+  // null when no analysis ran for this ratio — element falls back to
+  // legacy white-on-no-scrim (chip-bg in the renderer carries it).
+  const brightnessGrid = analysis?.brightnessGrid || null;
+  const sampleAt = (rect) => brightnessGrid ? sampleBrightnessUnderRect(rect, brightnessGrid) : null;
+
   // Anchored: logo (top-left)
   if (allowed.has('logo')) {
     if (content?.brand?.logo) {
-      elements.push(makeOverlayElement('logo', LOGO_RECT));
-      decisions.push({ id: 'logo', state: 'placed', mode: 'anchored-tl', rectPct: LOGO_RECT });
+      const brightness = sampleAt(LOGO_RECT);
+      elements.push(makeOverlayElement('logo', LOGO_RECT, brightness));
+      decisions.push({ id: 'logo', state: 'placed', mode: 'anchored-tl', rectPct: LOGO_RECT, brightness });
     } else {
       skipped.push({ id: 'logo', reason: 'no brand.logo source', _missingPath: 'brand.logo' });
     }
@@ -71,15 +97,17 @@ function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, content, bran
   // placement, so gating on content?.cta?.text would skip the box
   // before Gemini has a chance to fill it.
   if (allowed.has('cta')) {
-    elements.push(makeOverlayElement('cta', CTA_RECT));
-    decisions.push({ id: 'cta', state: 'placed', mode: 'anchored-br', rectPct: CTA_RECT });
+    const brightness = sampleAt(CTA_RECT);
+    elements.push(makeOverlayElement('cta', CTA_RECT, brightness));
+    decisions.push({ id: 'cta', state: 'placed', mode: 'anchored-br', rectPct: CTA_RECT, brightness });
   }
 
   // Floating: headline (upper half, least-violating)
   if (allowed.has('headline')) {
     const rect = findLeastViolatingRect(analysis, HEADLINE_BOX);
-    elements.push(makeOverlayElement('headline', rect));
-    decisions.push({ id: 'headline', state: 'placed', mode: 'least-violating-upper', rectPct: rect });
+    const brightness = sampleAt(rect);
+    elements.push(makeOverlayElement('headline', rect, brightness));
+    decisions.push({ id: 'headline', state: 'placed', mode: 'least-violating-upper', rectPct: rect, brightness });
   }
 
   // Floating: lower-half slot. testimonial_overlay → quote;
@@ -98,8 +126,9 @@ function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, content, bran
       : true;
     if (sourcePresent) {
       const rect = findLeastViolatingRect(analysis, LOWER_BOX);
-      elements.push(makeOverlayElement(lowerKind, rect));
-      decisions.push({ id: lowerKind, state: 'placed', mode: 'least-violating-lower', rectPct: rect });
+      const brightness = sampleAt(rect);
+      elements.push(makeOverlayElement(lowerKind, rect, brightness));
+      decisions.push({ id: lowerKind, state: 'placed', mode: 'least-violating-lower', rectPct: rect, brightness });
     } else {
       skipped.push({ id: lowerKind, reason: 'no product.name or product.image', _missingPath: 'product.name OR product.image' });
     }
@@ -122,16 +151,23 @@ function placeOverlays({ canvasW = 1000, canvasH = 1000, analysis, content, bran
 // Build a placed-element record matching the renderer's expectations.
 // rectPct is in canvas fractions; variant + maxLines are downstream
 // hints for the per-element render functions in templatePreview.js.
-// scrim is left as a no-op chip-bg style is now applied by the
-// renderer via style_bindings (testimonial_overlay / product_overlay
-// have headline_chip_bg + quote_chip_bg in their normalized template).
-function makeOverlayElement(id, rectPct) {
+// brightness (optional): { avg, min, max, range } sampled from the
+// overlay-zone brightnessGrid under rectPct. When present, drives a
+// per-element textColor + scrim choice via deriveContrast(). When
+// absent (no analysis, or rect outside grid), falls back to the legacy
+// white-on-no-scrim baseline that the renderer's chip-bg handles.
+function makeOverlayElement(id, rectPct, brightness) {
+  const contrast = brightness ? deriveContrast(brightness, id) : {
+    scrim: { type: 'none', opacity: 0 },
+    textColor: '#FFFFFF'
+  };
   const base = {
     id,
     rectPct,
     fontScale: 1,
-    scrim: { type: 'none', opacity: 0 },
-    textColor: '#FFFFFF'
+    scrim:     contrast.scrim,
+    textColor: contrast.textColor,
+    brightness: brightness || null
   };
   switch (id) {
     case 'logo':
@@ -241,4 +277,93 @@ function sampleDensity(rect, grid) {
   return totalArea > 0 ? weighted / totalArea : 0;
 }
 
-module.exports = { placeOverlays };
+// ── Brightness sampling + contrast derivation ────────────────────────
+
+// Sample the brightnessGrid under a rect. Returns area-weighted avg
+// (matches sampleDensity) plus min/max/range so consumers can detect
+// "busy" regions where text would land on cells of mixed luminance.
+// Returns null when the grid is missing, malformed, or doesn't overlap
+// the rect at all (caller falls back to non-brightness defaults).
+function sampleBrightnessUnderRect(rect, grid) {
+  if (!grid || !Array.isArray(grid.cells) || !grid.cols || !grid.rows) return null;
+  const cellsAreNested = Array.isArray(grid.cells[0]);
+
+  let weighted = 0;
+  let totalArea = 0;
+  let min = Infinity;
+  let max = -Infinity;
+  for (let r = 0; r < grid.rows; r++) {
+    for (let c = 0; c < grid.cols; c++) {
+      const cell = {
+        x1: c / grid.cols,
+        y1: r / grid.rows,
+        x2: (c + 1) / grid.cols,
+        y2: (r + 1) / grid.rows
+      };
+      const area = rectOverlapArea(rect, cell);
+      if (area <= 0) continue;
+      const v = cellsAreNested ? grid.cells[r][c] : grid.cells[r * grid.cols + c];
+      const value = Number(v) || 0;
+      weighted += value * area;
+      totalArea += area;
+      if (value < min) min = value;
+      if (value > max) max = value;
+    }
+  }
+  if (totalArea <= 0) return null;
+  const avg = weighted / totalArea;
+  return {
+    avg:   round2(avg),
+    min:   round2(min),
+    max:   round2(max),
+    range: round2(max - min)
+  };
+}
+
+function round2(n) { return Math.round(n * 100) / 100; }
+
+// Derive a text color + scrim spec from the brightness stats sampled
+// under the placed rect. Rules (tunable as we look at real renders):
+//
+//   - DARK bg   (avg < 0.40): light text, scrim only when range is busy
+//   - BRIGHT bg (avg > 0.60): dark text on a light scrim
+//   - MID bg    (0.40–0.60): light text + dark scrim — mid is the
+//     hardest band, always paint a scrim there
+//   - High range (>0.50)   : escalate scrim opacity by +0.15 — text
+//     would land on cells of mixed luminance otherwise
+//   - CTA element          : floor scrim opacity at CTA_MIN_SCRIM_OPACITY
+//     (small, critical, never naked on the image)
+function deriveContrast(brightness, elementId) {
+  const { avg, range } = brightness;
+
+  let textColor;
+  let scrim;
+  if (avg < BRIGHTNESS_DARK_MAX) {
+    textColor = '#FFFFFF';
+    scrim = range >= RANGE_VARIED_THRESHOLD
+      ? { type: 'gradient-dark', opacity: 0.30 }
+      : { type: 'none',          opacity: 0    };
+  } else if (avg > BRIGHTNESS_BRIGHT_MIN) {
+    textColor = '#0A0A0A';
+    scrim = { type: 'gradient-light', opacity: range >= RANGE_VARIED_THRESHOLD ? 0.55 : 0.40 };
+  } else {
+    // MID — most failure-prone band. Always scrim, light text.
+    textColor = '#FFFFFF';
+    scrim = { type: 'gradient-dark', opacity: 0.50 };
+  }
+
+  if (range >= RANGE_BUSY_THRESHOLD && scrim.type !== 'none') {
+    scrim = { ...scrim, opacity: Math.min(0.95, scrim.opacity + 0.15) };
+  }
+
+  if (elementId === 'cta' && (scrim.type === 'none' || scrim.opacity < CTA_MIN_SCRIM_OPACITY)) {
+    scrim = {
+      type:    scrim.type === 'none' ? (textColor === '#FFFFFF' ? 'gradient-dark' : 'gradient-light') : scrim.type,
+      opacity: CTA_MIN_SCRIM_OPACITY
+    };
+  }
+
+  return { textColor, scrim };
+}
+
+module.exports = { placeOverlays, sampleBrightnessUnderRect, deriveContrast };
