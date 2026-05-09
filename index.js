@@ -23,7 +23,6 @@ const invitationRoutes = require('./routes/invitations');
 const memberRoutes     = require('./routes/members');
 const integrationRoutes = require('./routes/integrations');
 const aiLayoutRoutes = require('./routes/aiLayouts');
-const collectionRoutes = require('./routes/collections');
 const catalogRoutes = require('./routes/catalog');
 const campaignRoutes = require('./routes/campaigns');
 const adsRoutes = require('./routes/ads');
@@ -137,7 +136,6 @@ app.use('/api/integrations', (req, res, next) => {
   return requireAuth(req, res, next);
 }, integrationRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);
-app.use('/api/collections', requireAuth, collectionRoutes);
 app.use('/api/catalog', requireAuth, catalogRoutes);
 app.use('/api/campaigns', requireAuth, campaignRoutes);
 app.use('/api/ads',       requireAuth, adsRoutes);
