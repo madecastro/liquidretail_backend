@@ -184,17 +184,38 @@ async function seedFromBrandOnly(brandId, topN) {
 
 // Path 3: media-driven (library entry). Operator picked a specific media.
 // Look up its match outcome to decide what product to feature.
+//
+// IMPORTANT: when the operator EXPLICITLY picks a media, we always
+// honor the pick — even when no useful PMA exists (no_products /
+// missing artifact / unrecognized outcome). The fallback is a
+// brand_match seed (productId:null) so the ad still renders against
+// the picked media's content. Silently dropping operator picks was
+// causing "the media I selected had nothing to do with the ads"
+// confusion.
 async function seedFromMedia(brandId, mediaId) {
   const match = await ProductMatchArtifact.findOne({ mediaId })
     .sort({ createdAt: -1 })
     .lean();
-  if (!match) return null;
   const media = await Media.findById(mediaId).select('adSuitability').lean();
   const score = media?.adSuitability?.score ?? null;
 
+  // Brand-match fallback honored on the explicit pick. Used by every
+  // path below that fails to produce a stronger seed.
+  const brandFallback = {
+    productId:        null,
+    mediaId:          String(mediaId),
+    mediaSource:      'brand_match',
+    suitabilityScore: score
+  };
+
+  if (!match) {
+    console.log(`   · seedFromMedia[${mediaId}]: no PMA — falling back to brand_match`);
+    return brandFallback;
+  }
+
   switch (match.outcome) {
     case 'product_match':
-      if (!match.catalogProductId) return null;
+      if (!match.catalogProductId) return brandFallback;
       return {
         productId:        String(match.catalogProductId),
         mediaId:          String(mediaId),
@@ -207,9 +228,9 @@ async function seedFromMedia(brandId, mediaId) {
       // empty, fall through to a category lookup.
       const sibling = (Array.isArray(match.recommendedProducts) && match.recommendedProducts[0])
                     || await firstCategorySibling(brandId, match.categoryId);
-      if (!sibling) return null;
+      if (!sibling) return brandFallback;
       const siblingId = sibling._id || sibling.id || sibling.catalogProductId;
-      if (!siblingId) return null;
+      if (!siblingId) return brandFallback;
       return {
         productId:        String(siblingId),
         mediaId:          String(mediaId),
@@ -218,14 +239,13 @@ async function seedFromMedia(brandId, mediaId) {
       };
     }
     case 'brand_match':
-      return {
-        productId:        null,
-        mediaId:          String(mediaId),
-        mediaSource:      'brand_match',
-        suitabilityScore: score
-      };
+      return brandFallback;
     default:
-      return null; // do_not_use, unknown
+      // 'no_products', 'do_not_use', or any unrecognized outcome:
+      // the operator picked it explicitly, so render against it as
+      // brand content rather than dropping the pick.
+      console.log(`   · seedFromMedia[${mediaId}]: outcome='${match.outcome}' — falling back to brand_match`);
+      return brandFallback;
   }
 }
 
