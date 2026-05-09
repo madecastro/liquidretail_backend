@@ -303,11 +303,13 @@ router.get('/runs/:runId', async (req, res) => {
 // Response: { compositeUrl, slotRect, canvasDims, smartCropBbox }
 router.post('/preview-video-composite', express.json(), async (req, res) => {
   try {
-    const { mediaId, template, aspectRatio, overlayImageUrl } = req.body || {};
+    const { mediaId, template, aspectRatio, overlayImageUrl, overlayPublicId } = req.body || {};
     if (!mediaId)         return res.status(400).json({ error: 'mediaId required' });
     if (!template)        return res.status(400).json({ error: 'template required' });
     if (!aspectRatio)     return res.status(400).json({ error: 'aspectRatio required' });
-    if (!overlayImageUrl) return res.status(400).json({ error: 'overlayImageUrl required' });
+    if (!overlayImageUrl && !overlayPublicId) {
+      return res.status(400).json({ error: 'overlayImageUrl or overlayPublicId required' });
+    }
 
     const media = await Media.findById(mediaId).lean();
     if (!media) return res.status(404).json({ error: `media not found: ${mediaId}` });
@@ -346,6 +348,7 @@ router.post('/preview-video-composite', express.json(), async (req, res) => {
 
     const compositeUrl = buildVideoCompositeUrl({
       sourceVideoUrl: media.fileUrl,
+      overlayPublicId,
       overlayImageUrl,
       canvasDims,
       slotRect: slotZone.rect,

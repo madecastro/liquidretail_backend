@@ -176,10 +176,11 @@ async function renderCreative(req) {
   if (useVideoBranch) {
     try {
       videoComposite = await composeVideoOutput({
-        media:        sourceMedia,
-        template:     req.creative.template,
-        aspectRatio:  req.creative.aspectRatio,
-        overlayUrl:   upload.renderUrl
+        media:            sourceMedia,
+        template:         req.creative.template,
+        aspectRatio:      req.creative.aspectRatio,
+        overlayUrl:       upload.renderUrl,
+        overlayPublicId:  upload.cloudinaryPublicId
       });
       if (videoComposite) {
         console.log(`   🎞️  ${tag} video composite ok (${videoComposite.compositeUrl.length} chars)`);
@@ -572,7 +573,7 @@ function _pickClosestBaseRatio(rect) {
   return best.name;
 }
 
-async function composeVideoOutput({ media, template, aspectRatio, overlayUrl }) {
+async function composeVideoOutput({ media, template, aspectRatio, overlayUrl, overlayPublicId }) {
   const canvasVariant = registry.CANVAS?.templates?.[template]?.variants?.[aspectRatio];
   if (!canvasVariant) return null;
   const canvasDims = { w: canvasVariant.canvas?.width, h: canvasVariant.canvas?.height };
@@ -593,7 +594,8 @@ async function composeVideoOutput({ media, template, aspectRatio, overlayUrl }) 
   } : null;
 
   const compositeUrl = buildVideoCompositeUrl({
-    sourceVideoUrl: media.fileUrl,
+    sourceVideoUrl:  media.fileUrl,
+    overlayPublicId,
     overlayImageUrl: overlayUrl,
     canvasDims,
     slotRect: slotZone.rect,
