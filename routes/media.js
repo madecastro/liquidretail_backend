@@ -4,6 +4,7 @@ const Media = require('../models/Media');
 const DetectRun = require('../models/DetectRun');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const Comment = require('../models/Comment');
+const CatalogProduct = require('../models/CatalogProduct');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 const { maybeCreateDraftFromMatch } = require('../services/catalogProductDraftService');
 const { refreshInsightsForMedia, fetchCommentsForMedia } = require('../services/mediaInsightsService');
@@ -148,6 +149,56 @@ router.get('/:mediaId/match', async (req, res) => {
     res.json({ match });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || 'Match lookup failed' });
+  }
+});
+
+// GET /api/media/:mediaId/related-products
+// Surfaces the catalog products this media matched to, ordered by
+// confidence. Drives the Generate Ads picker's "media → products"
+// bring-in: pick a media, get the products it'll seed creatives
+// against. Reads Media.matchedProducts[] (denormalized cache of the
+// latest run's PMAs) so the response is one round-trip.
+router.get('/:mediaId/related-products', async (req, res) => {
+  try {
+    const media = await assertMediaInTenant(req.params.mediaId, req);
+    const entries = (media.matchedProducts || [])
+      .filter(m => m.catalogProductId)
+      .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    if (!entries.length) return res.json({ products: [] });
+
+    const productIds = entries.map(e => e.catalogProductId);
+    const products = await CatalogProduct.find({
+      _id:     { $in: productIds },
+      brandId: media.brandId
+    })
+      .select('title brand category price currency imageUrl productUrl externalId source')
+      .lean();
+    const byId = new Map(products.map(p => [String(p._id), p]));
+
+    res.json({
+      products: entries
+        .map(e => {
+          const p = byId.get(String(e.catalogProductId));
+          if (!p) return null;
+          return {
+            id:         String(p._id),
+            title:      p.title,
+            brand:      p.brand || null,
+            category:   p.category || null,
+            price:      p.price ?? null,
+            currency:   p.currency || null,
+            imageUrl:   p.imageUrl || null,
+            productUrl: p.productUrl || null,
+            externalId: p.externalId || null,
+            source:     p.source || null,
+            outcome:    e.outcome || null,
+            confidence: e.confidence || null
+          };
+        })
+        .filter(Boolean)
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'related-products lookup failed' });
   }
 });
 

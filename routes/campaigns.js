@@ -84,7 +84,68 @@ router.get('/:id', async (req, res) => {
   try {
     const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id })).lean();
     if (!c) return res.status(404).json({ error: 'campaign not found' });
-    res.json({ campaign: c });
+
+    // Pinned items — operator-curated products + media on the campaign
+    // that aren't yet used by any Ad. Surfaced so the campaign detail
+    // page can show what's queued for ad generation, and so the
+    // Generate Ads flow from a campaign row can pre-fill them. An
+    // item "moves out" of pinned the moment any Ad references it via
+    // Ad.productId / Ad.mediaId.
+    const productIdsOnCampaign = (c.matchedProductIds || []).map(id => String(id));
+    const mediaIdsOnCampaign   = (c.mediaIds || []).map(id => String(id));
+
+    const [productsUsedOnAds, mediaUsedOnAds] = await Promise.all([
+      productIdsOnCampaign.length === 0
+        ? Promise.resolve([])
+        : Ad.distinct('productId', { campaignId: c._id, productId: { $in: productIdsOnCampaign } }),
+      mediaIdsOnCampaign.length === 0
+        ? Promise.resolve([])
+        : Ad.distinct('mediaId', { campaignId: c._id, mediaId: { $in: mediaIdsOnCampaign } })
+    ]);
+    const usedProductSet = new Set(productsUsedOnAds.map(id => String(id)));
+    const usedMediaSet   = new Set(mediaUsedOnAds.map(id => String(id)));
+
+    const pinnedProductIds = productIdsOnCampaign.filter(id => !usedProductSet.has(id));
+    const pinnedMediaIds   = mediaIdsOnCampaign.filter(id => !usedMediaSet.has(id));
+
+    const [pinnedProducts, pinnedMedia] = await Promise.all([
+      pinnedProductIds.length === 0
+        ? Promise.resolve([])
+        : CatalogProduct.find({ _id: { $in: pinnedProductIds }, brandId: c.brandId })
+            .select('title brand category price currency imageUrl productUrl externalId source')
+            .lean(),
+      pinnedMediaIds.length === 0
+        ? Promise.resolve([])
+        : Media.find({ _id: { $in: pinnedMediaIds } })
+            .select('externalId source fileType fileUrl metadata primarySubjectLabel')
+            .lean()
+    ]);
+
+    res.json({
+      campaign: c,
+      pinnedProducts: pinnedProducts.map(p => ({
+        id:         String(p._id),
+        title:      p.title,
+        brand:      p.brand || null,
+        category:   p.category || null,
+        price:      p.price ?? null,
+        currency:   p.currency || null,
+        imageUrl:   p.imageUrl || null,
+        productUrl: p.productUrl || null,
+        externalId: p.externalId || null,
+        source:     p.source || null
+      })),
+      pinnedMedia: pinnedMedia.map(m => ({
+        id:                  String(m._id),
+        externalId:          m.externalId || null,
+        source:              m.source,
+        fileType:            m.fileType,
+        fileUrl:             m.fileUrl,
+        creatorHandle:       m.metadata?.creatorHandle || null,
+        permalink:           m.metadata?.permalink || null,
+        primarySubjectLabel: m.primarySubjectLabel || null
+      }))
+    });
   } catch (err) {
     res.status(500).json({ error: err.message || 'campaign fetch failed' });
   }
