@@ -35,16 +35,18 @@ const BODY_THRESHOLD         = WCAG_AA_NORMAL;  // 4.5 — proof bar, etc.
 //   threshold: WCAG contrast ratio below which the text gets flipped
 const CONTRAST_PAIRS = {
   testimonial_spotlight: [
-    { text: 'headline_text_color',  bg: 'panel_bg',       threshold: HEADLINE_THRESHOLD },
-    { text: 'section_header_color', bg: 'panel_bg',       threshold: SECTION_HEAD_THRESHOLD },
-    { text: 'cta_button_text',      bg: 'cta_button_bg',  threshold: BODY_THRESHOLD },
-    { text: 'proof_bar_text',       bg: 'proof_bar_bg',   threshold: BODY_THRESHOLD }
+    { text: 'headline_text_color',   bg: 'panel_bg',       threshold: HEADLINE_THRESHOLD },
+    { text: 'section_header_color',  bg: 'panel_bg',       threshold: SECTION_HEAD_THRESHOLD },
+    { text: 'accent_border_color',   bg: 'panel_bg',       threshold: WCAG_AA_LARGE       },
+    { text: 'cta_button_text',       bg: 'cta_button_bg',  threshold: BODY_THRESHOLD      },
+    { text: 'proof_bar_text',        bg: 'proof_bar_bg',   threshold: BODY_THRESHOLD      }
   ],
   ugc_split_screen: [
-    { text: 'headline_text_color',  bg: 'panel_bg',       threshold: HEADLINE_THRESHOLD },
-    { text: 'section_header_color', bg: 'panel_bg',       threshold: SECTION_HEAD_THRESHOLD },
-    { text: 'cta_button_text',      bg: 'cta_button_bg',  threshold: BODY_THRESHOLD },
-    { text: 'proof_bar_text',       bg: 'proof_bar_bg',   threshold: BODY_THRESHOLD }
+    { text: 'headline_text_color',   bg: 'panel_bg',       threshold: HEADLINE_THRESHOLD },
+    { text: 'section_header_color',  bg: 'panel_bg',       threshold: SECTION_HEAD_THRESHOLD },
+    { text: 'accent_border_color',   bg: 'panel_bg',       threshold: WCAG_AA_LARGE       },
+    { text: 'cta_button_text',       bg: 'cta_button_bg',  threshold: BODY_THRESHOLD      },
+    { text: 'proof_bar_text',        bg: 'proof_bar_bg',   threshold: BODY_THRESHOLD      }
   ]
   // Overlay templates intentionally absent — they use brightness-grid
   // sampling against the actual image pixels, not pair contrast.
