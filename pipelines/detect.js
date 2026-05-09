@@ -92,6 +92,9 @@ async function processDetectRun(run) {
   run.status = 'completed';
   run.stage = 'done';
   run.completedAt = new Date();
+  // flags is Mixed — Mongoose won't auto-detect nested mutation,
+  // so explicitly mark it modified before save.
+  if (run.flags && Object.keys(run.flags).length) run.markModified('flags');
   await run.save();
 
   const totalMs = Object.values(run.stageTimings || {}).reduce((a, n) => a + n, 0);
@@ -116,7 +119,12 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
     runYoloChain(run, buffer, media, sourceUrl),
     runSubjectsTextChain(run, sourceUrl, media)
   ]);
-  if (yoloRes.status === 'rejected')     console.warn('⚠️  YOLO chain rejected:', yoloRes.reason?.message);
+  if (yoloRes.status === 'rejected') {
+    console.warn('⚠️  YOLO chain rejected:', yoloRes.reason?.message);
+    run.flags = run.flags || {};
+    run.flags.yoloFailed = true;
+    run.flags.yoloError  = yoloRes.reason?.message || 'chain rejected';
+  }
   if (subjectsRes.status === 'rejected') console.warn('⚠️  Subjects/text chain rejected:', subjectsRes.reason?.message);
 
   const yoloChainOut = yoloRes.status === 'fulfilled'
@@ -455,7 +463,17 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null) {
       const yolo = await detectMultipleProducts(buffer);
       console.log(`🔍 YOLO: ${yolo.detections.length} product(s)`);
       return yolo.detections;
-    } catch (err) { console.warn('⚠️  YOLO:', err.message); return []; }
+    } catch (err) {
+      // Stamp a non-fatal flag so the rematch endpoint can target
+      // these runs specifically — without it, a YOLO timeout looks
+      // identical to a legitimately empty image (default centered
+      // crops, completed status).
+      console.warn('⚠️  YOLO:', err.message);
+      run.flags = run.flags || {};
+      run.flags.yoloFailed = true;
+      run.flags.yoloError  = err.message || 'yolo call failed';
+      return [];
+    }
   });
 
   if (products.length) {
@@ -551,6 +569,12 @@ async function runYoloVideoChain(run, buffer, media) {
       };
     } catch (err) {
       console.warn('⚠️  YOLO video:', err.message);
+      // Same non-fatal flag the image path uses — when YOLO video
+      // crashes, the run lands at minimal artifacts and the rematch
+      // endpoint should be able to find it.
+      run.flags = run.flags || {};
+      run.flags.yoloFailed = true;
+      run.flags.yoloError  = err.message || 'yolo-video call failed';
       return {
         products: [], imgW: 1024, imgH: 768, heroImageUrl: null,
         heroFrameSec: null, heroReason: null, videoDurationSec: null

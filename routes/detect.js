@@ -356,10 +356,12 @@ router.post('/process', express.json(), async (req, res) => {
 //
 // Body:
 //   {
-//     brandId:  string                  // required
-//     mediaIds: string[]   (optional)   // explicit list; takes precedence over the auto-filter
-//     fileType: 'video' | 'image' (opt) // narrow the auto-filter to one type
-//     limit:    number     (optional)   // safety cap, default 50
+//     brandId:          string                  // required
+//     mediaIds:         string[]   (optional)   // explicit list; takes precedence over the auto-filter
+//     fileType:         'video'|'image' (opt)   // narrow the auto-filter to one type
+//     onlyYoloFailures: bool       (optional)   // restrict to runs with flags.yoloFailed=true
+//                                                  (silent YOLO crashes that fell back to centered crops)
+//     limit:            number     (optional)   // safety cap, default 50
 //   }
 //
 // Response:
@@ -372,9 +374,10 @@ router.post('/rematch', express.json(), async (req, res) => {
     const brandId = req.body?.brandId || req.headers['x-brand-id'];
     if (!brandId) return res.status(400).json({ error: 'brandId required' });
 
-    const explicit  = Array.isArray(req.body?.mediaIds) ? req.body.mediaIds : null;
-    const fileType  = req.body?.fileType || null;
-    const limit     = Math.min(Math.max(parseInt(req.body?.limit, 10) || 50, 1), 200);
+    const explicit          = Array.isArray(req.body?.mediaIds) ? req.body.mediaIds : null;
+    const fileType          = req.body?.fileType || null;
+    const onlyYoloFailures  = req.body?.onlyYoloFailures === true;
+    const limit             = Math.min(Math.max(parseInt(req.body?.limit, 10) || 50, 1), 200);
 
     let mediaDocs;
     if (explicit?.length) {
@@ -383,6 +386,19 @@ router.post('/rematch', express.json(), async (req, res) => {
         _id:     { $in: explicit },
         brandId
       })).select('_id fileType').lean();
+    } else if (onlyYoloFailures) {
+      // Targeted retry — only re-run media whose latest DetectRun has
+      // flags.yoloFailed set. Useful when YOLO was unstable and a
+      // batch silently fell back to centered crops.
+      const failedRuns = await DetectRun.find({
+        brandId,
+        'flags.yoloFailed': true
+      }).sort({ createdAt: -1 }).select('mediaId').lean();
+      const failedMediaIds = Array.from(new Set(failedRuns.map(r => String(r.mediaId))));
+
+      const mediaFilter = tenantFilter(req, { brandId, _id: { $in: failedMediaIds } });
+      if (fileType) mediaFilter.fileType = fileType;
+      mediaDocs = await Media.find(mediaFilter).select('_id fileType').limit(limit).lean();
     } else {
       // Auto-filter: media for this brand whose PMA outcomes don't
       // include product_match or product_category. Two-step because a

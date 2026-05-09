@@ -35,6 +35,19 @@ const detectRunSchema = new mongoose.Schema({
   error:      String,
   errorStage: String,
 
+  // Non-fatal observability flags. Pipeline stages that can fail
+  // silently (e.g. YOLO returning 0 detections after a timeout / OOM /
+  // 5xx — the run completes with default centered crops, looking
+  // healthy from the outside) stamp markers here so we can find them
+  // later for re-run targeting.
+  //
+  //   yoloFailed:  true when runYoloChain caught a YOLO error or the
+  //                outer Promise.allSettled rejected — i.e. the run
+  //                continued without product bboxes. Distinct from
+  //                "0 products legitimately visible".
+  //   yoloError:   short description of what failed
+  flags: { type: mongoose.Schema.Types.Mixed, default: {} },
+
   createdAt:   { type: Date, default: Date.now, index: true },
   startedAt:   Date,
   completedAt: Date
