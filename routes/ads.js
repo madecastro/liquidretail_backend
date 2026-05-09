@@ -21,10 +21,14 @@ const jwt = require('jsonwebtoken');
 const router = express.Router();
 
 const Ad           = require('../models/Ad');
+const Media        = require('../models/Media');
+const CropArtifact = require('../models/CropArtifact');
 const CampaignRun  = require('../models/CampaignRun');
 const { expandWizardJob } = require('../services/campaignAdsGenerationService');
 const { renderCreative }  = require('../services/renderService');
 const { deleteFromCloudinary } = require('../services/cloudinaryService');
+const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
+const registry = require('../services/templateRegistry');
 
 const AD_STATUSES = ['draft', 'live', 'archived'];
 
@@ -288,6 +292,97 @@ router.get('/runs/:runId', async (req, res) => {
     res.status(500).json({ error: err.message || 'run fetch failed' });
   }
 });
+
+// POST /api/ads/preview-video-composite
+// Diagnostic endpoint — given a video Media + template + ratio + an
+// already-uploaded transparent-slot overlay PNG URL, return the
+// Cloudinary composite video URL. Useful for previewing the V1
+// video render before wiring it through the full Puppeteer path.
+//
+// Body: { mediaId, template, aspectRatio, overlayImageUrl }
+// Response: { compositeUrl, slotRect, canvasDims, smartCropBbox }
+router.post('/preview-video-composite', express.json(), async (req, res) => {
+  try {
+    const { mediaId, template, aspectRatio, overlayImageUrl } = req.body || {};
+    if (!mediaId)         return res.status(400).json({ error: 'mediaId required' });
+    if (!template)        return res.status(400).json({ error: 'template required' });
+    if (!aspectRatio)     return res.status(400).json({ error: 'aspectRatio required' });
+    if (!overlayImageUrl) return res.status(400).json({ error: 'overlayImageUrl required' });
+
+    const media = await Media.findById(mediaId).lean();
+    if (!media) return res.status(404).json({ error: `media not found: ${mediaId}` });
+    if (media.fileType !== 'video') {
+      return res.status(400).json({ error: `media ${mediaId} is not video (fileType=${media.fileType})` });
+    }
+    if (!media.fileUrl?.includes('/video/upload/')) {
+      return res.status(400).json({ error: 'media.fileUrl is not a Cloudinary /video/upload/ URL' });
+    }
+
+    const canvasVariant = registry.CANVAS?.templates?.[template]?.variants?.[aspectRatio];
+    if (!canvasVariant) {
+      return res.status(400).json({ error: `no canvas variant for ${template}/${aspectRatio}` });
+    }
+    const canvasDims = { w: canvasVariant.canvas?.width, h: canvasVariant.canvas?.height };
+    const slotZone = (canvasVariant.zones || []).find(z =>
+      z.kind === 'media' && z.slot === 'product.hero_media');
+    if (!slotZone?.rect) {
+      return res.status(400).json({ error: `template ${template}/${aspectRatio} has no media slot — fall back to image render` });
+    }
+
+    // Smart-crop bbox (subject-aware framing on the source video). Pull
+    // the judge winner for the SLOT'S source ratio so the cropped clip
+    // matches the slot proportions.
+    const cropDoc = media.latestArtifacts?.crops
+      ? await CropArtifact.findById(media.latestArtifacts.crops).lean()
+      : null;
+    const slotRatioName = pickClosestBaseRatio(slotZone.rect);
+    const winnerId = cropDoc?.winners?.[slotRatioName] || null;
+    const list = cropDoc?.smartCrops?.[slotRatioName] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0] || null;
+    const smartCropBbox = winner ? {
+      x1: Number(winner.x1), y1: Number(winner.y1),
+      x2: Number(winner.x2), y2: Number(winner.y2)
+    } : null;
+
+    const compositeUrl = buildVideoCompositeUrl({
+      sourceVideoUrl: media.fileUrl,
+      overlayImageUrl,
+      canvasDims,
+      slotRect: slotZone.rect,
+      smartCropBbox
+    });
+
+    res.json({
+      compositeUrl,
+      sourceVideoUrl: media.fileUrl,
+      canvasDims,
+      slotRect: slotZone.rect,
+      slotSourceRatio: slotRatioName,
+      smartCropBbox
+    });
+  } catch (err) {
+    console.error('preview-video-composite failed:', err);
+    res.status(500).json({ error: err.message || 'preview failed' });
+  }
+});
+
+// Pick the base smart-crop ratio (5:4, 1:1, 4:5) closest to the slot's
+// shape — same logic the layout-input service uses for hero source crops.
+function pickClosestBaseRatio(rect) {
+  if (!rect?.w || !rect?.h) return '1:1';
+  const target = rect.w / rect.h;
+  const opts = [
+    { name: '5:4', value: 5/4 },
+    { name: '1:1', value: 1   },
+    { name: '4:5', value: 4/5 }
+  ];
+  let best = opts[0], bestDiff = Math.abs(opts[0].value - target);
+  for (const o of opts) {
+    const d = Math.abs(o.value - target);
+    if (d < bestDiff) { bestDiff = d; best = o; }
+  }
+  return best.name;
+}
 
 // GET /api/ads?brandId=X[&campaignId=Y][&status=draft|live|archived][&template=...][&aspectRatio=...][&limit=50]
 router.get('/', async (req, res) => {
