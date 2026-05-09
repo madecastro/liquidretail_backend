@@ -23,6 +23,7 @@ const router = express.Router();
 const Ad           = require('../models/Ad');
 const Media        = require('../models/Media');
 const CropArtifact = require('../models/CropArtifact');
+const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
 const { expandWizardJob } = require('../services/campaignAdsGenerationService');
 const { renderCreative }  = require('../services/renderService');
@@ -111,6 +112,26 @@ router.post('/generate', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '1h' }
     );
+
+    // 2b. Persist the operator's picks back to the campaign so the
+    //     campaign's pinned strip reflects what was used. $addToSet
+    //     keeps re-runs idempotent (duplicates collapse). Picks made
+    //     via the wizard's deep-link entry points (Media Library +
+    //     Catalog Browser → Generate Ads) wouldn't otherwise land on
+    //     the campaign — only the explicit "Add to Campaign" affordance
+    //     wrote to those arrays before this.
+    if (productIds.length || mediaIds.length) {
+      const setOps = {};
+      if (productIds.length) setOps.matchedProductIds = { $each: productIds };
+      if (mediaIds.length)   setOps.mediaIds          = { $each: mediaIds };
+      await Campaign.updateOne(
+        { _id: campaignId },
+        { $addToSet: setOps }
+      ).catch(err => {
+        // Non-fatal — the ads still generate; we just lose the pin.
+        console.warn(`   ⚠️  campaign pin failed for ${campaignId}: ${err.message}`);
+      });
+    }
 
     // 3. Create the run doc up front so the frontend can poll
     //    immediately on the redirect.
