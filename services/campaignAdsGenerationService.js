@@ -119,26 +119,52 @@ async function expandWizardJob({
   seeds = dedupeSeeds(seeds);
 
   // ── 2. Cartesian with templates × supportedAspectRatios ──────────
+  //
+  // Order: ratio × template × seed (i.e. iterate seeds in the OUTER
+  // position only after all template/ratio combos for the current
+  // ratio). This way, when MAX_CREATIVES_PER_RUN slices the result,
+  // every seed gets representation before any seed gets a second
+  // creative. With 3 seeds × 2 templates × 3 ratios = 18 combos
+  // sliced to 6, we land 1 creative per (ratio, template) pair
+  // distributed across seeds — instead of 6 creatives for seed 0
+  // and zero for the rest.
+  const seedFileTypes = new Map(
+    (await Media.find({ _id: { $in: seeds.map(s => s.mediaId) } })
+      .select('_id fileType').lean())
+      .map(m => [String(m._id), m.fileType])
+  );
   const creatives = [];
-  for (const seed of seeds) {
-    const media = await Media.findById(seed.mediaId).select('fileType').lean();
-    const expectedKind = media?.fileType === 'video' ? 'video' : 'image';
-    for (const templateId of allowedTemplates) {
-      const tpl = registry.getNormalized(templateId);
-      if (!tpl) continue;
-      const ratios = (tpl.aspect_ratios?.supported || [])
-        .filter(r => SHIPPING_RATIOS.has(r));
-      for (const aspectRatio of ratios) {
-        creatives.push({
-          productId:        seed.productId,
-          mediaId:          seed.mediaId,
-          mediaSource:      seed.mediaSource,
-          suitabilityScore: seed.suitabilityScore,
-          template:         templateId,
-          aspectRatio,
-          expectedKind
-        });
-      }
+  // Build the (template, ratio) grid once so we can interleave seeds
+  // across it. Each entry is the set of seeds the template/ratio
+  // combo accepts (templates declare their supported ratios; we
+  // intersect with SHIPPING_RATIOS).
+  const grid = [];
+  for (const templateId of allowedTemplates) {
+    const tpl = registry.getNormalized(templateId);
+    if (!tpl) continue;
+    const ratios = (tpl.aspect_ratios?.supported || [])
+      .filter(r => SHIPPING_RATIOS.has(r));
+    for (const aspectRatio of ratios) {
+      grid.push({ templateId, aspectRatio });
+    }
+  }
+  // Round-robin: each pass picks one (template, ratio) cell and
+  // emits creatives across every seed before moving to the next
+  // cell. Concretely, the first 3 emitted (with 3 seeds) cover
+  // {seed0, seed1, seed2} on the first cell; the next 3 cover
+  // them on the second cell, etc.
+  for (const cell of grid) {
+    for (const seed of seeds) {
+      const expectedKind = seedFileTypes.get(String(seed.mediaId)) === 'video' ? 'video' : 'image';
+      creatives.push({
+        productId:        seed.productId,
+        mediaId:          seed.mediaId,
+        mediaSource:      seed.mediaSource,
+        suitabilityScore: seed.suitabilityScore,
+        template:         cell.templateId,
+        aspectRatio:      cell.aspectRatio,
+        expectedKind
+      });
     }
   }
 

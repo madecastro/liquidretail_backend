@@ -1322,22 +1322,32 @@ function pickHeroMedia(ctx, aspectRatio) {
   const baseRatios = ['5:4', '1:1', '4:5'];
 
   if (baseRatios.includes(aspectRatio)) {
+    // Priority order:
+    //   1. judge smart-crop winner — composition-aware, matches what
+    //      the operator sees as the "winner" in the media-library
+    //      ribbon. This is the right hero for ads in almost every case.
+    //   2. first available smart crop for this ratio (judge missing
+    //      or picked nothing).
+    //   3. tight YOLO product crop — last resort when there are no
+    //      smart crops at all (e.g. catalog-product alts that skip
+    //      judge AND have no YOLO products).
+    const winnerId = crops?.winners?.[aspectRatio];
+    const list = crops?.smartCrops?.[aspectRatio] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0] || null;
+    if (winner && detection?.imageUrl) {
+      out.image = buildCloudinaryCropUrl(detection.imageUrl, winner);
+      if (media.fileType === 'video' && media.fileUrl) {
+        out.video = buildCloudinaryCropUrl(media.fileUrl, winner);
+      }
+      return out;
+    }
+    // No smart crop for this ratio — fall back to YOLO product crop.
     const product = pickTopYoloProduct(detection);
     if (product && detection?.imageUrl) {
       out.image = buildCloudinaryCropUrl(detection.imageUrl, product);
       if (media.fileType === 'video' && media.fileUrl) {
         out.video = buildCloudinaryCropUrl(media.fileUrl, product);
       }
-      return out;
-    }
-    const winnerId = crops?.winners?.[aspectRatio];
-    const list = crops?.smartCrops?.[aspectRatio] || [];
-    const winner = list.find(c => c.id === winnerId) || list[0];
-    if (winner && detection?.imageUrl) {
-      out.image = buildCloudinaryCropUrl(detection.imageUrl, winner);
-    }
-    if (media.fileType === 'video' && media.fileUrl && winner) {
-      out.video = buildCloudinaryCropUrl(media.fileUrl, winner);
     }
   } else if (aspectRatio === '9:16' || aspectRatio === '1.91:1') {
     const winnerRef = extended?.selectedWinners?.[aspectRatio]?.candidateId;
