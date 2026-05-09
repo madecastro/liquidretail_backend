@@ -39,6 +39,12 @@ router.get('/', async (req, res) => {
     // in the Uploaded Media list confuses operators (they show up as
     // "248 items" alongside 25 real IG posts).
     filterExtras.source = { $ne: 'catalog-product' };
+    // ?ids=a,b,c — explicit-id batch lookup. Lets the Generate Ads
+    // wizard hydrate pre-selected media that aren't in the first page.
+    // Bypasses pagination (returns up to 100 in one call) but still
+    // applies tenant + brand scoping so it's safe.
+    const idsParam = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (idsParam.length) filterExtras._id = { $in: idsParam.slice(0, 100) };
     const filter = tenantFilter(req, filterExtras);
 
     const [docs, total] = await Promise.all([

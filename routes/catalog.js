@@ -108,6 +108,10 @@ router.get('/', async (req, res) => {
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     const filter = tenantFilter(req, { brandId });
+    // ?ids=a,b,c — batch hydration for the Generate Ads picker.
+    // Bypasses sort/pagination but stays inside tenant + brand scope.
+    const idsParam = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (idsParam.length) filter._id = { $in: idsParam.slice(0, 100) };
     if (req.query.source === 'draft') {
       filter.draft = true;
     } else if (req.query.source) {
