@@ -3,6 +3,7 @@ const router = express.Router();
 const Media = require('../models/Media');
 const DetectRun = require('../models/DetectRun');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
+const DetectionArtifact = require('../models/DetectionArtifact');
 const Comment = require('../models/Comment');
 const CatalogProduct = require('../models/CatalogProduct');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
@@ -140,18 +141,48 @@ router.get('/:mediaId/detect', async (req, res) => {
   }
 });
 
+// Classify why latestArtifacts.match is null. The endpoint returns this
+// as `reason` so the UI can distinguish "still in flight" from terminal
+// "can't ever match" cases (which look identical otherwise).
+//
+// Reasons emitted:
+//   detect_not_run         — no detection artifact at all
+//   video_no_hero_frame    — video early-exit (heroReason set, no frame picked)
+//   detect_incomplete      — image detect didn't finish (no crops artifact)
+//   no_products_matched    — match phase ran, found nothing matchable
+async function classifyMissingMatchReason(media) {
+  const detectionId = media.latestArtifacts?.detection;
+  if (!detectionId) return 'detect_not_run';
+  const detection = await DetectionArtifact.findById(detectionId)
+    .select({ type: 1, heroReason: 1 }).lean();
+  if (!detection) return 'detect_not_run';
+  if (detection.type === 'video' && detection.heroReason && !media.latestArtifacts?.crops) {
+    return 'video_no_hero_frame';
+  }
+  if (!media.latestArtifacts?.crops) return 'detect_incomplete';
+  return 'no_products_matched';
+}
+
 // GET /api/media/:mediaId/match
 // Returns the latest ProductMatchArtifact for the given media — used by
 // the Matching tab on the ad-generation preview to surface decision-tree
 // outcome, per-provider evidence, brand-category fallback, and brand
-// reviews. 404 if the detect run hasn't reached product-match yet.
+// reviews. Returns 200 with `{ match: null, reason }` when no match
+// artifact exists — the UI uses `reason` to decide what to render.
 router.get('/:mediaId/match', async (req, res) => {
   try {
     const media = await assertMediaInTenant(req.params.mediaId, req);
     const matchId = media.latestArtifacts?.match;
-    if (!matchId) return res.status(404).json({ error: 'No match artifact for this media yet' });
+    if (!matchId) {
+      // 200 with reason instead of 404 — the absence of a match isn't always
+      // an error. Distinguish terminal "no match possible" states (video
+      // early-exit, detect incomplete) from "matched zero products" so the
+      // UI can render an appropriate empty state.
+      const reason = await classifyMissingMatchReason(media);
+      return res.json({ match: null, reason });
+    }
     const match = await ProductMatchArtifact.findById(matchId).lean();
-    if (!match) return res.status(404).json({ error: 'Match artifact missing from collection' });
+    if (!match) return res.json({ match: null, reason: 'artifact_missing_from_collection' });
     res.json({ match });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || 'Match lookup failed' });
