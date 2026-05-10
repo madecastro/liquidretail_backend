@@ -30,7 +30,7 @@
 // blows up entirely.
 
 const { detectMultipleProducts, detectFromVideo } = require('../services/yoloService');
-const { uploadBufferToCloudinary } = require('../services/cloudinaryService');
+const { uploadBufferToCloudinary, uploadUrlToCloudinary } = require('../services/cloudinaryService');
 const { detectSubjectsAndText } = require('../services/subjectTextService');
 const { generateSmartCrops, computeSafeRect } = require('../services/smartCropService');
 const { judgeDetections, judgeExtendedCrops } = require('../services/judgeService');
@@ -301,8 +301,29 @@ async function runVideoPipeline(run, media, buffer) {
       videoDurationSec: null, imgW: 1024, imgH: 768
     };
   }
-  const { heroImageUrl, heroFrameSec, heroReason, videoDurationSec, imgW, imgH } = videoOut;
+  let { heroImageUrl, heroFrameSec, heroReason } = videoOut;
+  const { videoDurationSec, imgW, imgH } = videoOut;
   if (videoDurationSec) media.durationSec = videoDurationSec;
+
+  // Fallback hero: when YOLO video can't pick a frame, try the IG/Reel
+  // cover thumbnail captured at ingest. Meta's CDN URL expires, so mirror
+  // to Cloudinary first — postSyncService only mirrors media_url, not
+  // thumbnail_url. Worse than a YOLO-picked frame (cover is typically a
+  // static title card) but any frame > no frame for downstream matching.
+  if (!heroImageUrl && media.metadata?.thumbnailUrl) {
+    try {
+      const mirrored = await uploadUrlToCloudinary(media.metadata.thumbnailUrl, {
+        resourceType: 'image',
+        folder:       'instagram'
+      });
+      heroImageUrl = mirrored.secure_url;
+      heroFrameSec = 0;
+      heroReason   = 'ig-thumbnail-fallback';
+      console.log(`🪝 IG thumbnail fallback for ${media._id} → ${heroImageUrl}`);
+    } catch (err) {
+      console.warn(`⚠️  IG thumbnail mirror failed for ${media._id}: ${err.message}`);
+    }
+  }
 
   if (!heroImageUrl) {
     console.warn(`⚠️  Video ${media._id} produced no hero frame — minimal artifacts only`);
