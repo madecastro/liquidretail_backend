@@ -186,6 +186,92 @@ router.post('/generate', async (req, res) => {
   }
 });
 
+// POST /api/ads/runs
+// Body: { campaignId }
+// "Generate more from this campaign" — picks the next N queued ads
+// and renders them in a new CampaignRun. No re-queueing; just drains
+// inventory that expandWizardJob already created.
+// Response: 202 Accepted { campaignRunId, total, queuedRemaining, status }
+router.post('/runs', express.json(), async (req, res) => {
+  try {
+    const { campaignId } = req.body || {};
+    if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
+
+    const campaign = await Campaign.findById(campaignId).lean();
+    if (!campaign) return res.status(404).json({ error: 'campaign not found' });
+
+    const adIds = await selectAdsForRun({ campaignId, limit: MAX_CREATIVES_PER_RUN });
+    if (!adIds.length) {
+      return res.status(422).json({ error: 'No queued ads remaining for this campaign' });
+    }
+
+    const queuedRemaining = Math.max(0,
+      (await Ad.countDocuments({ campaignId, status: 'queued' })) - adIds.length
+    );
+
+    const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+    const renderToken = jwt.sign(
+      {
+        id:     req.user?.id,
+        userId: req.user?.userId,
+        email:  req.user?.email,
+        name:   req.user?.name,
+        photo:  req.user?.photo
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    await Ad.updateMany(
+      { _id: { $in: adIds } },
+      { $set: { campaignRunId: runId, status: 'rendering', updatedAt: new Date() } }
+    );
+
+    const run = await CampaignRun.create({
+      runId,
+      brandId:      String(campaign.brandId),
+      campaignId:   String(campaign._id),
+      campaignKind: campaign.kind || 'promotional',
+      total:        adIds.length,
+      status:       'running',
+      requestedBy:  req.user?.userId || null,
+      startedAt:    new Date()
+    });
+
+    res.status(202).json({
+      campaignRunId:   runId,
+      campaignId:      String(campaign._id),
+      brandId:         String(campaign.brandId),
+      campaignKind:    campaign.kind || 'promotional',
+      total:           adIds.length,
+      queuedRemaining,
+      status:          'running'
+    });
+
+    // Reuse the same runRenderLoop. job arg only carries the brand /
+    // campaign metadata renderOne needs to thread into renderCreative.
+    const job = {
+      brandId:      String(campaign.brandId),
+      campaignId:   String(campaign._id),
+      campaignKind: campaign.kind || 'promotional'
+    };
+    setImmediate(() => {
+      runRenderLoop(run, job, adIds, renderToken).catch(err => {
+        console.error(`❌ campaign run ${runId} crashed:`, err);
+        CampaignRun.updateOne(
+          { _id: run._id },
+          { status: 'failed', completedAt: new Date() }
+        ).catch(() => {});
+      });
+    });
+
+  } catch (err) {
+    console.error('ads runs (queued drain) failed:', err);
+    res.status(500).json({ error: err.message || 'ads runs failed' });
+  }
+});
+
 // Background render loop. Runs after the response has flushed; updates
 // the CampaignRun doc as each render finishes so the frontend's
 // poller can show real-time progress.
@@ -349,19 +435,27 @@ router.get('/runs/:runId', async (req, res) => {
     if (!brandId) return res.status(400).json({ error: 'brandId required' });
     const run = await CampaignRun.findOne({ runId: req.params.runId, brandId }).lean();
     if (!run) return res.status(404).json({ error: 'run not found' });
+    // queuedRemaining drives the "Generate more" affordance on the
+    // Ads page — the button only makes sense when the campaign has
+    // more queued inventory to drain.
+    const queuedRemaining = await Ad.countDocuments({
+      campaignId: run.campaignId,
+      status:     'queued'
+    });
     res.json({
-      runId:        run.runId,
-      brandId:      String(run.brandId),
-      campaignId:   String(run.campaignId),
-      campaignKind: run.campaignKind,
-      total:        run.total,
-      succeeded:    run.succeeded,
-      skipped:      run.skipped,
-      failed:       run.failed,
-      status:       run.status,
-      errors:       run.errors || [],
-      startedAt:    run.startedAt,
-      completedAt:  run.completedAt
+      runId:           run.runId,
+      brandId:         String(run.brandId),
+      campaignId:      String(run.campaignId),
+      campaignKind:    run.campaignKind,
+      total:           run.total,
+      succeeded:       run.succeeded,
+      skipped:         run.skipped,
+      failed:          run.failed,
+      status:          run.status,
+      queuedRemaining,
+      errors:          run.errors || [],
+      startedAt:       run.startedAt,
+      completedAt:     run.completedAt
     });
   } catch (err) {
     console.error('run fetch failed:', err);
