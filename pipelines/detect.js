@@ -397,56 +397,100 @@ async function runVideoPipeline(run, media, buffer) {
 //  Time per hero ≈ 3-5s; per alt ≈ 1-2s.
 // ──────────────────────────────────────────────────────────────
 async function runCatalogProductPipeline(run, media, buffer) {
-  const sharp = require('sharp');
   const sourceUrl = media.fileUrl;
-  const isHero = media.metadata?.imageRole !== 'alt';   // default to hero when role missing
+  const isHero = media.metadata?.imageRole !== 'alt';
 
-  // 1. Image dimensions (sharp metadata — no API cost).
+  // ── Phase 1: detect fan-out — YOLO (skip identify) ‖ subjects/text ──
+  // We run the same vision passes as UGC media so catalog images carry
+  // safe-overlay zones, density + brightness grids, palette, etc. — the
+  // ad pipeline can then use catalog images as first-class creative
+  // sources. The only stage we skip is the dual-engine product identify
+  // (catalog metadata is the source of truth for brand/category/label).
   await setRunPhase(run, 'detect-fanout');
-  const meta = await timeStage(run, 'image-meta', async () => {
-    return sharp(buffer).metadata();
-  });
-  const imgW = meta.width  || 1024;
-  const imgH = meta.height || 1024;
+  const [yoloRes, subjectsRes] = await Promise.allSettled([
+    runYoloChain(run, buffer, media, sourceUrl, { skipIdentify: true }),
+    runSubjectsTextChain(run, sourceUrl, media)
+  ]);
+  if (yoloRes.status === 'rejected') {
+    console.warn('⚠️  Catalog YOLO chain rejected:', yoloRes.reason?.message);
+    run.flags = run.flags || {};
+    run.flags.yoloFailed = true;
+    run.flags.yoloError  = yoloRes.reason?.message || 'chain rejected';
+  }
+  if (subjectsRes.status === 'rejected') {
+    console.warn('⚠️  Catalog subjects/text chain rejected:', subjectsRes.reason?.message);
+  }
 
+  const yoloChainOut = yoloRes.status === 'fulfilled'
+    ? yoloRes.value
+    : { products: [], refinedProducts: [] };
+  const products = yoloChainOut.products;
+  const refinedProducts = yoloChainOut.refinedProducts;
+  const { subjects, text, background, primarySubjectLabel, secondaryElementsTags } = subjectsRes.status === 'fulfilled'
+    ? subjectsRes.value
+    : { subjects: [], text: [], background: null, primarySubjectLabel: null, secondaryElementsTags: [] };
+
+  const imgW = products[0]?.imgWidth  || 1024;
+  const imgH = products[0]?.imgHeight || 1024;
   media.width  = imgW;
   media.height = imgH;
+  await media.save();
 
-  // 2. Detection artifact — minimal stand-in so latestArtifacts.detection
-  //    isn't null. No products / subjects / text on the catalog path.
   const detectionDoc = await DetectionArtifact.create({
-    type: 'image',                                  // catalog products are always still images
-    mediaId: media._id, runId: run._id,
-    advertiserId: media.advertiserId, brandId: media.brandId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
+    type: 'image',
     width: imgW, height: imgH,
-    products: [], subjects: [], text: [],
-    background: null,
-    safeRect: null,
-    primarySubjectId:   null,
-    primarySubjectDesc: null
+    imageUrl: sourceUrl,
+    yoloProducts: products.map(({ cropBuffer, ...p }) => p),
+    refinedProducts,
+    subjects, text, background
   });
 
-  // 3. Smart crops at every supported ratio. No subjects/text inputs
-  //    for the catalog path — the cropper falls back to centered
-  //    crops which is exactly what an isolated product photo wants.
+  // ── Phase 2: crop-judge (sequential — judge depends on YOLO + subjects + crops) ──
   await setRunPhase(run, 'crop-judge');
+
+  const safeRect = computeSafeRect(products, subjects, imgW, imgH, text);
+  if (safeRect) console.log(`🛟  Catalog safe envelope: (${safeRect.x1.toFixed(0)}, ${safeRect.y1.toFixed(0)}) → (${safeRect.x2.toFixed(0)}, ${safeRect.y2.toFixed(0)})`);
+
   const crops = await timeStage(run, 'smart-crops', async () =>
-    generateSmartCrops(imgW, imgH, [], [], null)
+    generateSmartCrops(imgW, imgH, subjects, text, safeRect)
   );
 
-  // 4. Judge — hero only. Picks the best framing per ratio.
+  // Judge only on hero — alts share the same SKU and don't need their
+  // own per-ratio winner picks (matching uses the YOLO refined crops,
+  // not the judged framings).
   let judge = null;
   if (isHero) {
     judge = await timeStage(run, 'judge', async () => {
       try {
-        return await judgeDetections({ imageUrl: sourceUrl, products: [], subjects: [], text: [], crops, safeRect: null });
+        return await judgeDetections({ imageUrl: sourceUrl, products, subjects, text, crops, safeRect });
       } catch (err) { console.warn('⚠️  Catalog-path judge:', err.message); return null; }
     });
   }
 
+  const primarySubjectId   = resolvePrimarySubjectId(subjects, judge);
+  const primarySubjectDesc = resolvePrimarySubjectDesc(subjects, judge);
+
+  detectionDoc.safeRect = safeRect || null;
+  detectionDoc.primarySubjectId = primarySubjectId;
+  detectionDoc.primarySubjectDesc = primarySubjectDesc;
+  await detectionDoc.save();
+
+  // Promote vision analysis onto Media (denormalized cache of latest run).
+  media.subjects              = (subjects || []).map(s => ({ ...s }));
+  media.text                  = (text     || []).map(t => ({ ...t }));
+  media.background            = background || null;
+  media.primarySubjectId      = primarySubjectId   || null;
+  media.primarySubjectDesc    = primarySubjectDesc || null;
+  media.primarySubjectLabel   = primarySubjectLabel || null;
+  media.secondaryElementsTags = secondaryElementsTags || [];
+  media.safeRect              = safeRect || null;
+  media.refinedProducts       = (refinedProducts || []).map(rp => ({ ...rp }));
+  media.lastDetectedAt        = new Date();
+  await media.save();
+
   const cropDoc = await CropArtifact.create({
-    mediaId: media._id, runId: run._id,
-    advertiserId: media.advertiserId, brandId: media.brandId,
+    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
     smartCrops: crops,
     judge,
     winners: {
@@ -456,17 +500,30 @@ async function runCatalogProductPipeline(run, media, buffer) {
     }
   });
 
-  // 5. Finalize. The catalog path doesn't fan out into match/overlay/
-  //    extended-crops in V1 — those are deferred until we see real
-  //    operator demand for "promote alt to template overlay" or
-  //    cross-product matching.
+  // ── Finalize critical path — no match phase for catalog products ──
   await setRunPhase(run, 'finalize');
   await updateMediaLatestArtifacts(media, {
     detection: detectionDoc._id,
     crops:     cropDoc._id
+    // extended + overlayZones land via the lazy chain below.
   });
 
-  console.log(`📦 catalog-product detect (${isHero ? 'hero' : 'alt'}) done — crops=${crops.length}, judge=${judge ? 'yes' : 'skipped'}`);
+  // ── Lazy enrichment — extended-crops + overlay-zones (brightnessGrid) ──
+  // Same fire-and-forget pattern as UGC. Catalog images get the same
+  // overlay-mode treatment so overlay-on-image templates can render
+  // catalog products directly.
+  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH })
+    .then(async ({ extendedDoc, overlayDoc }) => {
+      await updateMediaLatestArtifacts(media, {
+        extended:     extendedDoc?._id,
+        overlayZones: overlayDoc?._id
+      });
+      await applyMediaLibraryDerivations(media, buffer, overlayDoc, null);
+      console.log(`🎨 catalog-product lazy enrichment landed for media ${media._id}`);
+    })
+    .catch(err => console.warn(`   ⚠️  catalog-product lazy enrichment failed for media ${media._id}: ${err.message}`));
+
+  console.log(`📦 catalog-product detect (${isHero ? 'hero' : 'alt'}) done — YOLO=${products.length}, refined=${refinedProducts.length}, subjects=${subjects.length}, judge=${judge ? 'yes' : 'skipped'}`);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -477,8 +534,14 @@ async function runCatalogProductPipeline(run, media, buffer) {
 //  race on save().
 // ──────────────────────────────────────────────────────────────
 
-async function runYoloChain(run, buffer, media, sourceUrlOverride = null) {
+async function runYoloChain(run, buffer, media, sourceUrlOverride = null, options = {}) {
   const refineSourceUrl = sourceUrlOverride || media.fileUrl;
+  // skipIdentify: catalog-product images already know their SKU from the
+  // catalog row. Run YOLO + crop-refine to get tight per-product crops,
+  // but skip the dual-engine identify + reconciler (the brand/category
+  // would just disagree with the source-of-truth catalog metadata).
+  // refineDetectionCrops then treats every detection as a survivor.
+  const skipIdentify = !!options.skipIdentify;
   const products = await timeStage(run, 'yolo', async () => {
     try {
       const yolo = await detectMultipleProducts(buffer);
@@ -497,7 +560,7 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null) {
     }
   });
 
-  if (products.length) {
+  if (products.length && !skipIdentify) {
     // Phase 1.5c — dual-engine enrichment. GPT-4.1 and Gemini Vision run in
     // parallel on the same crops; reconciler merges per-detection products[]
     // into engines.reconciled.products[] and updates the legacy
@@ -543,10 +606,15 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null) {
   // v1; video falls back to yoloIdentifications in Phase 1.7 (the
   // microservice samples detections across frames so there's no single
   // source URL to crop against the bboxes).
+  // When skipIdentify is on (catalog-product path), there is no
+  // identification.label to gate on — treat every detection as a survivor
+  // since YOLO crops of catalog images are presumed to BE the product.
   let refinedProducts = [];
-  const survivors = products.filter(p =>
-    p.identification?.label && p.identification.label !== 'non-product'
-  );
+  const survivors = skipIdentify
+    ? products.slice()
+    : products.filter(p =>
+        p.identification?.label && p.identification.label !== 'non-product'
+      );
   // Allow refinement to run for video media too — when called from
   // runVideoPipeline, sourceUrlOverride is the hero-frame JPEG URL,
   // so refineDetectionCrops can do its image-side work normally.

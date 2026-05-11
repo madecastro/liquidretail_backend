@@ -40,7 +40,9 @@ const Category = require('../models/Category');                        // Phase 
 const { findOrCreateCategoryTree } = require('../models/Category');    // Phase 2a
 const Brand           = require('../models/Brand');
 const { normalizeBrandName } = require('../models/Brand');
-const CatalogProduct  = require('../models/CatalogProduct');
+const CatalogProduct     = require('../models/CatalogProduct');
+const Media              = require('../models/Media');
+const DetectionArtifact  = require('../models/DetectionArtifact');
 const { loadBrandSafety, evaluatePostSafety } = require('./brandSafetyService');
 
 // How long a cached Brand.brandReviews snapshot is considered fresh
@@ -1822,6 +1824,66 @@ function slugify(s) {
 //   { combinedScore, textScore, visualScore, catalogMatch, visualResult }
 // where catalogMatch is the top-K-filtered single best per-refined match
 // (or null when no candidate cleared the floor).
+// Compare a UGC refined crop against EVERY visual representation of a
+// catalog product: the canonical product.imageUrl AND any per-image
+// refined crops persisted by the catalog-product detect pipeline (top-1
+// highest-confidence crop per catalog Media). Returns the best result
+// across all targets — { isMatch, score, reasoning, matchedAgainst }
+// where matchedAgainst is the URL of the winning catalog-side image.
+//
+// Falls back to imageUrl-only when the catalog product has no per-image
+// refined crops yet (early ingest, YOLO failure on the catalog image).
+async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product) {
+  if (!ugcCropImageUrl || !product) return null;
+
+  const catalogCrops = await loadCatalogRefinedCropUrls(product._id);
+  const targets = new Set();
+  if (product.imageUrl) targets.add(product.imageUrl);
+  for (const url of catalogCrops) targets.add(url);
+  if (!targets.size) return null;
+
+  const results = await Promise.all([...targets].map(async (url) => {
+    const r = await visualCatalogMatch.compareCropToCandidate({
+      cropImageUrl: ugcCropImageUrl,
+      candidate:    { imageUrl: url, title: product.title }
+    });
+    return r ? { ...r, matchedAgainst: url } : null;
+  }));
+
+  let best = null;
+  for (const r of results) {
+    if (!r) continue;
+    if (!best || (r.score || 0) > (best.score || 0)) best = r;
+  }
+  return best;
+}
+
+// Pull the top-1 highest-confidence refined YOLO crop URL from EACH
+// catalog-product Media tied to the given CatalogProduct. Returns []
+// when no catalog Media exists yet or none have refined crops.
+async function loadCatalogRefinedCropUrls(catalogProductId) {
+  if (!catalogProductId) return [];
+  const medias = await Media.find(
+    { source: 'catalog-product', 'metadata.catalogProductId': catalogProductId },
+    { latestArtifacts: 1 }
+  ).lean();
+  if (!medias.length) return [];
+  const detectionIds = medias.map(m => m.latestArtifacts?.detection).filter(Boolean);
+  if (!detectionIds.length) return [];
+  const detections = await DetectionArtifact.find(
+    { _id: { $in: detectionIds } },
+    { refinedProducts: 1 }
+  ).lean();
+  const urls = [];
+  for (const det of detections) {
+    const top = (det.refinedProducts || [])
+      .filter(rp => rp.croppedImageUrl)
+      .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
+    if (top?.croppedImageUrl) urls.push(top.croppedImageUrl);
+  }
+  return urls;
+}
+
 async function catalogFirstMatchOneRefined(refined, { brandId, caption, textDetected, comments }) {
   if (!brandId || !refined) return { combinedScore: 0, catalogMatch: null, visualResult: null };
 
@@ -1837,15 +1899,16 @@ async function catalogFirstMatchOneRefined(refined, { brandId, caption, textDete
     return { combinedScore: 0, catalogMatch: null, visualResult: null };
   }
 
-  // Visual scoring for each top-K candidate (parallel — bounded to 3 calls).
+  // Visual scoring per text candidate: compare the UGC refined crop
+  // against the candidate's hero imageUrl PLUS any per-image refined
+  // crops persisted by the catalog-product detect pipeline. Best score
+  // across all catalog-side images wins.
   const visualResults = await Promise.all(textCandidates.map(c =>
-    visualCatalogMatch.compareCropToCandidate({
-      cropImageUrl: refined.croppedImageUrl,
-      candidate:    c.product
-    }).catch(err => {
-      console.warn(`   ⚠️  visualCatalogMatch threw: ${err.message}`);
-      return null;
-    })
+    compareUgcCropToCatalogProduct(refined.croppedImageUrl, c.product)
+      .catch(err => {
+        console.warn(`   ⚠️  visualCatalogMatch threw: ${err.message}`);
+        return null;
+      })
   ));
 
   let best = null;
