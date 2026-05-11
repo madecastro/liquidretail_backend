@@ -42,9 +42,12 @@ const { FRONTEND_URL, validateFrontendOrigin } = require('../services/frontendOr
 
 // Pack the validated origin into a JWT field. Used by connect routes
 // when they generate state. Decoded on the corresponding callback.
-function appendRedirectToState(payload, requestedRedirect) {
+// onboarding=true also threads through so the callback bounce can
+// target /onboarding/connect instead of /brand.
+function appendRedirectToState(payload, requestedRedirect, opts = {}) {
   const validated = validateFrontendOrigin(requestedRedirect);
   if (validated) payload.redirect = validated;
+  if (opts.onboarding) payload.onboarding = true;
   return payload;
 }
 
@@ -55,14 +58,28 @@ function readRedirectFromState(statePayload) {
   return validateFrontendOrigin(statePayload.redirect);
 }
 
+// Decode the onboarding flag from a verified state payload.
+function readOnboardingFromState(statePayload) {
+  return !!(statePayload && statePayload.onboarding === true);
+}
+
 // Build the post-OAuth bounce URL. The new app uses /brand (Chakra
 // route) and reads ig_status/ig_setup query params. The legacy app
 // uses /brand.html. We pick by suffix based on whether the origin
 // was supplied via the allowlist (= new app) or fell through to
 // FRONTEND_URL default (= legacy).
-function buildIntegrationBounceUrl(origin, query) {
+//
+// When the original connect call set onboarding=true (encoded into
+// OAuth state, then passed through here), bounce to
+// /onboarding/connect instead of /brand. The onboarding Connect page
+// owns its own copy of the picker modals so credentials finalize
+// without an intermediate /brand visit.
+function buildIntegrationBounceUrl(origin, query, opts = {}) {
   const usingDefault = !origin || origin === FRONTEND_URL;
-  const path = usingDefault ? '/brand.html' : '/brand';
+  const onboarding = !!opts.onboarding;
+  const path = usingDefault
+    ? '/brand.html'                              // legacy app — no onboarding wizard
+    : (onboarding ? '/onboarding/connect' : '/brand');
   const target = origin || FRONTEND_URL;
   const qs = query ? `?${query}` : '';
   return `${target}${path}${qs}`;
@@ -129,6 +146,10 @@ router.post('/instagram/connect', express.json(), async (req, res) => {
     // ?redirect=<origin> in query OR { redirect } in body — either is
     // valid. New app uses body; legacy callers can omit entirely.
     const requestedRedirect = req.query.redirect || req.body?.redirect || null;
+    // onboarding=true threads through OAuth state so the callback bounces
+    // to /onboarding/connect instead of /brand. Sent by ConnectPage so
+    // the picker modal runs in onboarding, not after a /brand detour.
+    const onboarding = req.body?.onboarding === true || req.query.onboarding === 'true';
 
     const state = jwt.sign(
       appendRedirectToState({
@@ -137,7 +158,7 @@ router.post('/instagram/connect', express.json(), async (req, res) => {
         advertiserId: String(req.advertiserId),
         brandId:      String(brandId),
         nonce:        Math.random().toString(36).slice(2)
-      }, requestedRedirect),
+      }, requestedRedirect, { onboarding }),
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
@@ -161,10 +182,11 @@ router.get('/instagram/callback', async (req, res) => {
   // fallback is the legacy default. Track via `bounceTarget` so the
   // bounce helper below picks the right origin.
   let bounceTarget = null;
+  let bounceOnboarding = false;
   const bounce = (status, msg) => {
     const params = new URLSearchParams({ ig_status: status });
     if (msg) params.set('ig_msg', msg);
-    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString(), { onboarding: bounceOnboarding }));
   };
 
   if (oauthError) return bounce('denied', String(error_description || oauthError));
@@ -175,6 +197,7 @@ router.get('/instagram/callback', async (req, res) => {
     payload = jwt.verify(String(state), process.env.JWT_SECRET);
     if (payload.purpose !== 'ig-oauth') throw new Error('wrong purpose');
     bounceTarget = readRedirectFromState(payload);
+    bounceOnboarding = readOnboardingFromState(payload);
   } catch (err) {
     return bounce('error', `invalid state: ${err.message}`);
   }
@@ -219,7 +242,7 @@ router.get('/instagram/callback', async (req, res) => {
     // app on /brand or legacy on /brand.html) per state-encoded
     // redirect, falling back to FRONTEND_URL.
     const params = new URLSearchParams({ ig_status: 'pending', ig_setup: String(cred._id) });
-    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString(), { onboarding: bounceOnboarding }));
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
     console.warn(`   ⚠️  IG callback failed: ${detail}`);
@@ -970,6 +993,7 @@ router.post('/meta-ads/connect', express.json(), async (req, res) => {
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
 
     const requestedRedirect = req.query.redirect || req.body?.redirect || null;
+    const onboarding = req.body?.onboarding === true || req.query.onboarding === 'true';
 
     const state = jwt.sign(
       appendRedirectToState({
@@ -978,7 +1002,7 @@ router.post('/meta-ads/connect', express.json(), async (req, res) => {
         advertiserId: String(req.advertiserId),
         brandId:      String(brandId),
         nonce:        Math.random().toString(36).slice(2)
-      }, requestedRedirect),
+      }, requestedRedirect, { onboarding }),
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
@@ -994,11 +1018,12 @@ router.post('/meta-ads/connect', express.json(), async (req, res) => {
 router.get('/meta-ads/callback', async (req, res) => {
   const { code, state, error: oauthError, error_description } = req.query;
   let bounceTarget = null;
+  let bounceOnboarding = false;
   const bounce = (status, msg, setupId) => {
     const params = new URLSearchParams({ ads_status: status });
     if (msg)     params.set('ads_msg', msg);
     if (setupId) params.set('ads_setup', setupId);
-    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString(), { onboarding: bounceOnboarding }));
   };
 
   if (oauthError) return bounce('denied', String(error_description || oauthError));
@@ -1009,6 +1034,7 @@ router.get('/meta-ads/callback', async (req, res) => {
     payload = jwt.verify(String(state), process.env.JWT_SECRET);
     if (payload.purpose !== 'meta-ads-oauth') throw new Error('wrong purpose');
     bounceTarget = readRedirectFromState(payload);
+    bounceOnboarding = readOnboardingFromState(payload);
   } catch (err) {
     return bounce('error', `invalid state: ${err.message}`);
   }
@@ -1206,6 +1232,7 @@ router.post('/google-ads/connect', express.json(), async (req, res) => {
     if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
 
     const requestedRedirect = req.query.redirect || req.body?.redirect || null;
+    const onboarding = req.body?.onboarding === true || req.query.onboarding === 'true';
 
     const state = jwt.sign(
       appendRedirectToState({
@@ -1214,7 +1241,7 @@ router.post('/google-ads/connect', express.json(), async (req, res) => {
         advertiserId: String(req.advertiserId),
         brandId:      String(brandId),
         nonce:        Math.random().toString(36).slice(2)
-      }, requestedRedirect),
+      }, requestedRedirect, { onboarding }),
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
@@ -1227,11 +1254,12 @@ router.post('/google-ads/connect', express.json(), async (req, res) => {
 router.get('/google-ads/callback', async (req, res) => {
   const { code, state, error: oauthError, error_description } = req.query;
   let bounceTarget = null;
+  let bounceOnboarding = false;
   const bounce = (status, msg, setupId) => {
     const params = new URLSearchParams({ gads_status: status });
     if (msg)     params.set('gads_msg', msg);
     if (setupId) params.set('gads_setup', setupId);
-    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString()));
+    res.redirect(buildIntegrationBounceUrl(bounceTarget, params.toString(), { onboarding: bounceOnboarding }));
   };
 
   if (oauthError) return bounce('denied', String(error_description || oauthError));
@@ -1242,6 +1270,7 @@ router.get('/google-ads/callback', async (req, res) => {
     payload = jwt.verify(String(state), process.env.JWT_SECRET);
     if (payload.purpose !== 'google-ads-oauth') throw new Error('wrong purpose');
     bounceTarget = readRedirectFromState(payload);
+    bounceOnboarding = readOnboardingFromState(payload);
   } catch (err) {
     return bounce('error', `invalid state: ${err.message}`);
   }
