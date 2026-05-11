@@ -18,8 +18,10 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
 
-const Job       = require('./models/Job');
-const DetectRun = require('./models/DetectRun');
+const Job          = require('./models/Job');
+const DetectRun    = require('./models/DetectRun');
+const Ad           = require('./models/Ad');
+const CampaignRun  = require('./models/CampaignRun');
 
 const { processDetectRun }       = require('./pipelines/detect');
 const { processPreCroppedJob }   = require('./pipelines/bridge');
@@ -28,6 +30,14 @@ const { sleep }                  = require('./pipelines/shared');
 const { startScheduler }         = require('./services/scheduledSyncService');
 
 const CONCURRENCY = Math.max(1, Math.min(parseInt(process.env.WORKER_CONCURRENCY, 10) || 2, 100));
+
+// Orphan reaper tuning. STALE_MIN is the threshold past which a claimed
+// (status: 'processing' / 'rendering' / 'running') doc is presumed
+// abandoned — the original holder died without releasing it. Conservative
+// 15 min default so legitimately slow work isn't reaped mid-flight.
+// REAP_INTERVAL_MIN drives the periodic sweep alongside the startup pass.
+const REAP_STALE_MIN     = Math.max(1, parseInt(process.env.REAP_STALE_MIN, 10)     || 15);
+const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 10)  || 5);
 
 // Mongoose default pool is 100 max. With 50+ concurrent workers each
 // firing several queries per pipeline stage, we want a roomy pool to
@@ -39,8 +49,19 @@ mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser:    true,
   useUnifiedTopology: true,
   maxPoolSize:        MONGO_POOL_SIZE
-}).then(() => {
+}).then(async () => {
   console.log(`🔌 Connected to MongoDB (pool=${MONGO_POOL_SIZE}); starting ${CONCURRENCY} worker loop(s)`);
+
+  // Orphan reaper — catches DetectRun / Ad / CampaignRun docs left in
+  // their "claimed" states (processing / rendering / running) when the
+  // holder process died without releasing them. Runs once at boot
+  // (catches crashes since last restart) and on a timer (catches
+  // mid-run crashes of the web service while this worker stays alive).
+  await reapOrphans().catch(err => console.warn(`⚠️  initial reap failed: ${err.message}`));
+  setInterval(() => {
+    reapOrphans().catch(err => console.warn(`⚠️  periodic reap failed: ${err.message}`));
+  }, REAP_INTERVAL_MIN * 60 * 1000);
+
   for (let i = 1; i <= CONCURRENCY; i++) {
     workerLoop(i).catch(err => console.error(`❌ worker[${i}] crashed:`, err));
   }
@@ -49,6 +70,46 @@ mongoose.connect(process.env.MONGODB_URI, {
   // settings; cap-aware DetectRun enqueueing.
   startScheduler();
 }).catch(err => console.error('MongoDB error:', err));
+
+// Sweep for orphaned in-flight docs. Cheap (3 indexed updateMany calls);
+// safe to run frequently. Logs only when something was reaped so a
+// healthy system doesn't fill logs with no-ops.
+async function reapOrphans() {
+  const cutoff = new Date(Date.now() - REAP_STALE_MIN * 60 * 1000);
+
+  // DetectRun: stuck in 'processing' → reset to 'queued' so the next
+  // worker loop iteration claims it. The original holder is presumed
+  // dead. errorStage stamped so the rerun is auditable.
+  const detects = await DetectRun.updateMany(
+    { status: 'processing', startedAt: { $lt: cutoff } },
+    { $set: { status: 'queued', errorStage: 'orphan-reset' } }
+  );
+
+  // Ad: stuck in 'rendering' → back to 'queued' and clear campaignRunId
+  // so the next selectAdsForRun pass re-picks it on a fresh run. The
+  // failed run's CampaignRun stays as audit; the Ad just re-enters the queue.
+  const ads = await Ad.updateMany(
+    { status: 'rendering', updatedAt: { $lt: cutoff } },
+    { $set: { status: 'queued', campaignRunId: null, updatedAt: new Date() } }
+  );
+
+  // CampaignRun: stuck 'running' → mark 'failed' with completedAt so
+  // the frontend poller resolves. The individual Ads inside the run
+  // were handled by the Ad sweep above.
+  const runs = await CampaignRun.updateMany(
+    { status: 'running', startedAt: { $lt: cutoff } },
+    { $set: { status: 'failed', completedAt: new Date() } }
+  );
+
+  const total = (detects.modifiedCount || 0) + (ads.modifiedCount || 0) + (runs.modifiedCount || 0);
+  if (total > 0) {
+    console.log(
+      `🧹 reaped: ${detects.modifiedCount || 0} DetectRun · ` +
+      `${ads.modifiedCount || 0} Ad · ${runs.modifiedCount || 0} CampaignRun ` +
+      `(stale > ${REAP_STALE_MIN}m)`
+    );
+  }
+}
 
 async function workerLoop(workerId) {
   const tag = `[W${workerId}]`;
