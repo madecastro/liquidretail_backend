@@ -472,6 +472,13 @@ router.get('/', async (req, res) => {
     const filter = { brandId };
     if (req.query.campaignId)  filter.campaignId  = req.query.campaignId;
     if (req.query.status)      filter.status      = req.query.status;
+    // ?rendered=true → only ads that have actually been rendered to
+    // Cloudinary (status in draft|live|archived). Used by surfaces that
+    // shouldn't surface the queue (campaign-detail Ads section, etc.).
+    // Ignored when an explicit status= is also set.
+    if (req.query.rendered === 'true' && !req.query.status) {
+      filter.status = { $in: ['draft', 'live', 'archived'] };
+    }
     if (req.query.template)    filter.template    = req.query.template;
     if (req.query.aspectRatio) filter.aspectRatio = req.query.aspectRatio;
 
