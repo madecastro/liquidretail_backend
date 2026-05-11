@@ -345,6 +345,11 @@ async function renderOne(run, job, adId, index, renderToken) {
       campaignRunId: run.runId,
       brandId:       job.brandId,
       campaignKind:  job.campaignKind,
+      // variantKind + productId thread through so buildLayoutInput
+      // can swap the product source (UGC match vs catalog product
+      // direct) and gate UGC-only slots (creator, ugc, engagement).
+      variantKind:   ad.variantKind,
+      productId:     ad.productId ? String(ad.productId) : null,
       creative,
       cta:           { text: ad.ctaText, url: ad.ctaUrl, params: ad.ctaUrlParams },
       authToken:     renderToken,

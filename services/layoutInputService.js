@@ -246,7 +246,7 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
     if (cached && cached.schemaVersion === INPUT_SCHEMA_VERSION) return cached.input;
   }
 
-  const ctx = await loadContext(mediaId);
+  const ctx = await loadContext(mediaId, options);
   if (!ctx) throw notFound(`Media ${mediaId} not found`);
 
   // Hard-stop: matching service flagged this Media as 'do_not_use'
@@ -349,7 +349,7 @@ function stubDerivationFromCtx(ctx) {
 // ──────────────────────────────────────────────────────────────
 //  Context loader
 // ──────────────────────────────────────────────────────────────
-async function loadContext(mediaId) {
+async function loadContext(mediaId, options = {}) {
   const media = await Media.findById(mediaId).lean();
   if (!media) return null;
 
@@ -364,7 +364,19 @@ async function loadContext(mediaId) {
   // read CatalogProduct / Category / Brand state instead of stale snapshots.
   // hydrateMatch is a no-op when match is null and falls back to snapshot
   // fields when an FK target is missing (legacy pre-Phase-2 artifacts).
-  const match = await hydrateMatch(rawMatch);
+  let match = await hydrateMatch(rawMatch);
+
+  // Product-image variant path: when the wizard tagged this Ad with a
+  // productId AND the Media has no PMA (typical for catalog-product
+  // Media, which skips the match phase), synthesize a stub-match from
+  // the CatalogProduct so the existing slot-assembly code can read
+  // details.* the same way it does for matched UGC.
+  if (!match && options.productId) {
+    const cp = await CatalogProduct.findById(options.productId).lean();
+    if (cp) {
+      match = synthesizeMatchFromCatalogProduct(cp);
+    }
+  }
   const runId = detection?.runId || null;
   const brandName = match?.identification?.brand || media.metadata?.brand || null;
   const brand = brandName
@@ -393,6 +405,43 @@ async function loadContext(mediaId) {
     : [];
 
   return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool };
+}
+
+// Build a stub ProductMatchArtifact-shaped object from a CatalogProduct.
+// Used in the product_image variant path where the source Media is a
+// catalog product image (no PMA) — the wizard knows the product, so
+// we project its details into the same shape the matched-UGC path
+// expects and let the existing slot-assembly code do its thing.
+function synthesizeMatchFromCatalogProduct(cp) {
+  if (!cp) return null;
+  return {
+    outcome:          'product_match',
+    winner:           'catalog',
+    catalogProductId: cp._id,
+    categoryId:       cp.categoryRef || null,
+    brandId:          cp.brandId || null,
+    identification: {
+      productName: cp.title || null,
+      brand:       cp.brand || null,
+      certainty:   1.0,
+      details: {
+        productId:   cp._id,
+        title:       cp.title       || null,
+        imageUrl:    cp.imageUrl    || null,
+        productUrl:  cp.productUrl  || null,
+        category:    cp.category    || null,
+        categoryRef: cp.categoryRef || null,
+        price: cp.price != null ? {
+          value:    cp.price,
+          currency: cp.currency,
+          display:  cp.priceDisplay || (typeof cp.price === 'number' ? `$${cp.price.toFixed(2)}` : String(cp.price))
+        } : null,
+        rating:      cp.rating      ?? null,
+        reviewCount: cp.reviewCount ?? null,
+        description: cp.description || null
+      }
+    }
+  };
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -738,6 +787,12 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
   const ident   = match?.identification || {};
   const details = ident.details || {};
   const palette = detection?.background?.palette || [];
+  // product_image variant uses the catalog product directly as the
+  // visual + content source. Suppress UGC-only blocks (creator,
+  // ugc, performance.engagement) so the renderer doesn't pull
+  // creator handles, post captions, or social signals that don't
+  // exist for a catalog hero shot.
+  const isProductImage = options.variantKind === 'product_image';
 
   // Hero source crop matches the MEDIA SLOT'S ratio (not the canvas
   // ratio). For split-panel layouts the image slot is half-canvas
@@ -881,7 +936,7 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
       }))
     },
 
-    creator: {
+    creator: isProductImage ? {} : {
       name:     media.metadata?.creatorName   || undefined,
       handle:   media.metadata?.creatorHandle || undefined,
       platform: DEFAULT_CREATOR_PLATFORM,
@@ -889,7 +944,7 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
       portrait_media: mediaPair(creatorMedia)
     },
 
-    ugc: {
+    ugc: isProductImage ? {} : {
       post_id:         media.externalId,
       platform:        DEFAULT_CREATOR_PLATFORM,
       post_type:       DEFAULT_POST_TYPE,
@@ -921,14 +976,14 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
     },
 
     performance: {
-      engagement: stripEmpty({
+      engagement: isProductImage ? {} : stripEmpty({
         likes:    media.platformStats?.likes    ?? undefined,
         comments: media.platformStats?.comments ?? undefined,
         shares:   media.platformStats?.shares   ?? undefined,
         saves:    media.platformStats?.saves    ?? undefined,
         views:    media.platformStats?.views    ?? undefined
       }),
-      metrics: buildPerformanceMetrics(media, match)
+      metrics: isProductImage ? [] : buildPerformanceMetrics(media, match)
     },
 
     cta: mergeCta(derivation.cta, options.cta, details, {

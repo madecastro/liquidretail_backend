@@ -206,6 +206,10 @@ async function deriveStage(req) {
   // re-derive based on INPUT_SCHEMA_VERSION + the refresh option.
   // Threads campaignKind + cta into derivation options so the prompt
   // can flip to brand-mode copy or compose a CTA-aware imperative.
+  // variantKind + productId from the queued Ad drive the slot
+  // assembly: variantKind='product_image' uses the catalog product
+  // directly as the source of product info AND silences UGC-only
+  // slots (creator, ugc, engagement).
   const input = await buildLayoutInput({
     mediaId,
     template,
@@ -214,7 +218,9 @@ async function deriveStage(req) {
     options: {
       campaignKind: req.campaignKind || null,
       ctaText:      req.cta?.text     || null,
-      ctaUrl:       req.cta?.url      || null
+      ctaUrl:       req.cta?.url      || null,
+      variantKind:  req.variantKind   || 'ugc',
+      productId:    req.productId     || null
     }
   });
 

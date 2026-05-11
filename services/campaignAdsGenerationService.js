@@ -56,6 +56,18 @@ const SUPPORTED_TEMPLATES = new Set([
   'product_overlay'
 ]);
 
+// Per-template variant whitelist. Some templates are inherently UGC
+// (the design IS a creator quote over a real-world photo) and don't
+// make sense for a catalog hero shot; others work for either source.
+// Cartesian is filtered by this map so we don't queue combos that
+// will look obviously wrong.
+const TEMPLATE_SUPPORTS_VARIANT = {
+  testimonial_spotlight: new Set(['ugc', 'product_image']),
+  ugc_split_screen:      new Set(['ugc', 'product_image']),
+  testimonial_overlay:   new Set(['ugc']),                       // creator quote over UGC photo — needs UGC source
+  product_overlay:       new Set(['ugc', 'product_image'])
+};
+
 // Aspect ratios we're shipping ad output for in V1.
 const SHIPPING_RATIOS = new Set(['1:1', '9:16', '16:9']);
 
@@ -185,6 +197,11 @@ async function expandWizardJob({
   const payloads = [];
   for (const seed of seeds) {
     for (const cell of grid) {
+      // Drop combos where the seed's variantKind isn't supported by the
+      // template. e.g. testimonial_overlay is UGC-only — product_image
+      // seeds for it would queue and then fail/look wrong at render.
+      const supports = TEMPLATE_SUPPORTS_VARIANT[cell.templateId];
+      if (supports && !supports.has(seed.variantKind)) continue;
       const identityDigest = computeIdentityDigest({
         campaignId,
         productId:    seed.productId,
