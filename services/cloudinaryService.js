@@ -20,9 +20,9 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
       folder: opts.folder || 'liquidretail',
       public_id: _uniqueId(),
       unique_filename: false,
-      // overwrite=true so re-renders of the same (campaignId, derivationDigest)
+      // overwrite=true so re-renders of the same (campaignId, identityDigest)
       // can replace the existing asset without orphaning. Caller-side de-dupe
-      // (in renderService) usually short-circuits before we get here.
+      // (queue-time unique index) usually short-circuits before we get here.
       overwrite: opts.overwrite ?? false,
       resource_type: opts.resourceType || 'image',
       ...(opts.publicId ? { public_id: opts.publicId } : {})

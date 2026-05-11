@@ -25,12 +25,15 @@ const Media        = require('../models/Media');
 const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
-const { expandWizardJob } = require('../services/campaignAdsGenerationService');
+const { expandWizardJob, selectAdsForRun } = require('../services/campaignAdsGenerationService');
 const { renderCreative }  = require('../services/renderService');
 const { deleteFromCloudinary } = require('../services/cloudinaryService');
 const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
 const registry = require('../services/templateRegistry');
 
+// Lifecycle states the PATCH endpoint can flip an Ad into. queued /
+// rendering / failed are set by the pipeline only — operators don't
+// manually drive those.
 const AD_STATUSES = ['draft', 'live', 'archived'];
 
 // Render concurrency. Puppeteer + Cloudinary is the bottleneck;
@@ -63,7 +66,9 @@ router.post('/generate', async (req, res) => {
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
 
-    // 1. Expand the wizard payload into a fully-resolved RenderCampaignJob.
+    // 1. Expand the wizard payload — bulk-queues every viable combination as
+    //    Ad docs with status='queued'. Re-running with the same picks is
+    //    idempotent (unique index on campaignId+identityDigest swallows dups).
     const job = await expandWizardJob({
       campaignId,
       productIds,
@@ -71,26 +76,25 @@ router.post('/generate', async (req, res) => {
       templateIds,
       cta,
       urlParams,
-      refresh,
       requestedBy: req.user?.userId || null
     });
 
-    if (!job.creatives.length) {
+    if (job.queuedCount === 0) {
       return res.status(422).json({
         error: 'No renderable creatives — no media available for the selected products / templates',
         job
       });
     }
 
-    // Cap creatives per run. The wizard's cartesian (products ×
-    // templates × supported ratios) routinely produces 20+ creatives,
-    // which both blows past Chromium's warm-window and produces more
-    // ads than an operator wants to triage in one batch.
-    if (job.creatives.length > MAX_CREATIVES_PER_RUN) {
-      console.log(
-        `   ✂️  capping creatives ${job.creatives.length} → ${MAX_CREATIVES_PER_RUN} (campaign=${campaignId})`
-      );
-      job.creatives = job.creatives.slice(0, MAX_CREATIVES_PER_RUN);
+    // 2. Pick the top N queued ads for this run, ranked by readinessScore.
+    //    Subsequent "render more" passes will draw the next N from what
+    //    remains queued.
+    const adIds = await selectAdsForRun({ campaignId, limit: MAX_CREATIVES_PER_RUN });
+    if (!adIds.length) {
+      return res.status(422).json({
+        error: 'No queued ads selected for this run (selection returned empty)',
+        job
+      });
     }
 
     const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
@@ -133,34 +137,41 @@ router.post('/generate', async (req, res) => {
       });
     }
 
-    // 3. Create the run doc up front so the frontend can poll
-    //    immediately on the redirect.
+    // 3. Mark the selected ads as picked for this run + stamp campaignRunId.
+    //    Done up-front so a server restart leaves the doc in a recognizable
+    //    rendering state rather than orphaned-but-queued.
+    await Ad.updateMany(
+      { _id: { $in: adIds } },
+      { $set: { campaignRunId: runId, status: 'rendering', updatedAt: new Date() } }
+    );
+
+    // 4. Create the run doc.
     const run = await CampaignRun.create({
       runId,
       brandId:      job.brandId,
       campaignId:   job.campaignId,
       campaignKind: job.campaignKind,
-      total:        job.creatives.length,
+      total:        adIds.length,
       status:       'running',
       requestedBy:  req.user?.userId || null,
       startedAt:    new Date()
     });
 
-    // 3. Respond 202 — frontend redirects to /ads?campaignRunId=X and
-    //    starts polling /api/ads/runs/:runId for progress.
+    // 5. Respond 202 — frontend redirects to /ads?campaignRunId=X and
+    //    polls /api/ads/runs/:runId for progress.
     res.status(202).json({
       campaignRunId: runId,
       campaignId:    job.campaignId,
       brandId:       job.brandId,
       campaignKind:  job.campaignKind,
-      total:         job.creatives.length,
+      total:         adIds.length,
+      queuedRemaining: Math.max(0, job.queuedCount - adIds.length),
       status:        'running'
     });
 
-    // 5. Fire-and-forget the render loop. setImmediate yields the
-    //    HTTP response first, then renders happen behind the scenes.
+    // 6. Fire-and-forget the render loop.
     setImmediate(() => {
-      runRenderLoop(run, job, renderToken).catch(err => {
+      runRenderLoop(run, job, adIds, renderToken).catch(err => {
         console.error(`❌ campaign run ${runId} crashed:`, err);
         CampaignRun.updateOne(
           { _id: run._id },
@@ -176,25 +187,25 @@ router.post('/generate', async (req, res) => {
 });
 
 // Background render loop. Runs after the response has flushed; updates
-// the CampaignRun doc as each creative finishes so the frontend's
+// the CampaignRun doc as each render finishes so the frontend's
 // poller can show real-time progress.
-async function runRenderLoop(run, job, renderToken) {
+async function runRenderLoop(run, job, adIds, renderToken) {
   const t0 = Date.now();
   console.log(
-    `🚀 [campaignRun ${run.runId}] start — ${job.creatives.length} creative(s) ` +
+    `🚀 [campaignRun ${run.runId}] start — ${adIds.length} ad(s) ` +
     `concurrency=${RENDER_CONCURRENCY} brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
   );
 
-  const queue = job.creatives.map((c, i) => ({ creative: c, index: i }));
+  const queue = adIds.map((adId, i) => ({ adId, index: i }));
   let inflight = 0;
   let next     = 0;
 
   await new Promise((resolve) => {
     const dispatch = () => {
       while (inflight < RENDER_CONCURRENCY && next < queue.length) {
-        const { creative, index } = queue[next++];
+        const { adId, index } = queue[next++];
         inflight++;
-        renderOne(run, job, creative, index, renderToken)
+        renderOne(run, job, adId, index, renderToken)
           .catch(err => {
             console.error(`❌ [campaignRun ${run.runId}] #${index} dispatch crash:`, err.message || err);
           })
@@ -220,18 +231,38 @@ async function runRenderLoop(run, job, renderToken) {
   );
 }
 
-async function renderOne(run, job, creative, index, renderToken) {
+async function renderOne(run, job, adId, index, renderToken) {
+  // Fetch the queued Ad doc and shape it into the request the
+  // render service expects. The doc carries everything the old
+  // in-memory creative descriptor used to provide.
+  const ad = await Ad.findById(adId).lean();
+  if (!ad) {
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      { $inc: { failed: 1 }, $push: { errors: { index, stage: 'fetch', message: `Ad ${adId} not found` } } }
+    );
+    return;
+  }
+  const creative = {
+    mediaId:     String(ad.mediaId),
+    productId:   ad.productId ? String(ad.productId) : null,
+    template:    ad.template,
+    aspectRatio: ad.aspectRatio,
+    matchTier:   ad.matchTier,
+    variantKind: ad.variantKind
+  };
   try {
     const result = await renderCreative({
       jobId:         crypto.randomBytes(8).toString('hex'),
+      adId:          String(ad._id),
       campaignId:    job.campaignId,
       campaignRunId: run.runId,
       brandId:       job.brandId,
       campaignKind:  job.campaignKind,
       creative,
-      cta:           job.cta,
+      cta:           { text: ad.ctaText, url: ad.ctaUrl, params: ad.ctaUrlParams },
       authToken:     renderToken,
-      options:       { refresh: !!job.options.refresh }
+      options:       {}
     });
 
     if (result.status === 'success') {
@@ -246,6 +277,19 @@ async function renderOne(run, job, creative, index, renderToken) {
           $push: { errors: buildErrorEntry(creative, index, result.stage, result.error) }
         }
       );
+      // Mark the Ad failed with diagnostic context.
+      const errMsg = typeof result.error === 'object' ? (result.error.message || JSON.stringify(result.error)) : String(result.error || 'unknown');
+      await Ad.updateOne(
+        { _id: adId },
+        {
+          $set: {
+            status:      'failed',
+            renderError: { message: errMsg, stage: result.stage || 'unknown', at: new Date() },
+            updatedAt:   new Date()
+          },
+          $inc: { renderAttempts: 1 }
+        }
+      );
     }
   } catch (err) {
     await CampaignRun.updateOne(
@@ -253,6 +297,17 @@ async function renderOne(run, job, creative, index, renderToken) {
       {
         $inc: { failed: 1 },
         $push: { errors: buildErrorEntry(creative, index, 'crash', err) }
+      }
+    );
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status:      'failed',
+          renderError: { message: err.message || String(err), stage: 'crash', at: new Date() },
+          updatedAt:   new Date()
+        },
+        $inc: { renderAttempts: 1 }
       }
     );
   }
@@ -514,13 +569,15 @@ function projectAd(ad, full = false) {
   const base = {
     id:                 String(ad._id),
     brandId:            String(ad.brandId),
-    campaignId:         String(ad.campaignId),
+    campaignId:         ad.campaignId ? String(ad.campaignId) : null,
     campaignRunId:      ad.campaignRunId,
     mediaId:            ad.mediaId   ? String(ad.mediaId)   : null,
     productId:          ad.productId ? String(ad.productId) : null,
     template:           ad.template,
     aspectRatio:        ad.aspectRatio,
-    mediaSource:        ad.mediaSource,
+    matchTier:          ad.matchTier,
+    variantKind:        ad.variantKind,
+    readinessScore:     ad.readinessScore,
     campaignKind:       ad.campaignKind,
     kind:               ad.kind,
     renderUrl:          ad.renderUrl,
@@ -530,16 +587,21 @@ function projectAd(ad, full = false) {
     bytes:              ad.bytes,
     durationMs:         ad.durationMs,
     copy:               ad.copy || {},
+    ctaText:            ad.ctaText,
     ctaUrl:             ad.ctaUrl,
     ctaUrlParams:       ad.ctaUrlParams,
     status:             ad.status,
+    queuedAt:           ad.queuedAt,
+    renderedAt:         ad.renderedAt,
     generatedAt:        ad.generatedAt,
     createdAt:          ad.createdAt
   };
   if (full) {
     base.layoutInputArtifactId = ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null;
     base.cloudinaryPublicId    = ad.cloudinaryPublicId;
-    base.derivationDigest      = ad.derivationDigest;
+    base.identityDigest        = ad.identityDigest;
+    base.renderError           = ad.renderError || null;
+    base.renderAttempts        = ad.renderAttempts || 0;
   }
   return base;
 }

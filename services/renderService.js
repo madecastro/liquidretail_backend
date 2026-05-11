@@ -1,5 +1,7 @@
-// renderService — turns one creative entry from a RenderCampaignJob
-// into a rendered Ad doc. Single function entry: renderCreative(req).
+// renderService — renders one queued Ad doc. Single function entry:
+// renderCreative(req). req.adId references an Ad with status='queued'
+// (just transitioned to 'rendering' by the run loop); the service
+// updates the SAME doc in place rather than creating a new one.
 //
 // Pipeline (5 stages, each with its own error.stage label):
 //
@@ -7,23 +9,12 @@
 //   validate  → templateRegistry.validateInputAgainstTemplate
 //   render    → Puppeteer screenshot of /ads.html?...&renderMode=1
 //   upload    → Cloudinary, folder ads/{brandId}/{campaignId}
-//   persist   → Ad.create + de-dupe by derivationDigest
+//   persist   → Ad.findByIdAndUpdate — backfill renderUrl, cloudinaryPublicId,
+//               copy snapshot, dimensions; flip status → 'draft'
 //
-// V1 simplifications (matching the deferred render-service plan):
-//   - kind is always 'image' — even for video-source media, we render
-//     a static PNG using the source's poster frame as the rendered
-//     background. Phase 2 adds true video output (MP4 via FFmpeg
-//     composite of source video + overlay PNG).
-//   - render + upload stages are STUBBED with Phase-1A placeholders
-//     so the contract + persistence path can ship and be exercised
-//     end-to-end before the Puppeteer/Cloudinary heavy lifting lands.
-//   - Pre-flight via templateRegistry.validateInputAgainstTemplate;
-//     skipped renders never touch Cloudinary.
-//
-// derivationDigest is sha256 of a canonical-form payload of
-// {copy, cta, mediaId, template, aspectRatio} so re-rendering with
-// identical inputs returns the existing Ad rather than uploading a
-// duplicate to Cloudinary.
+// Dedup: handled at queue time via the (campaignId, identityDigest)
+// unique index on Ad. The render service no longer dedupes — by the
+// time a queued Ad reaches us, it's already been verified unique.
 
 const crypto = require('crypto');
 const puppeteer = require('puppeteer');
@@ -62,6 +53,12 @@ async function renderCreative(req) {
   const jobId = req.jobId || crypto.randomBytes(8).toString('hex');
   const { template, aspectRatio, mediaId } = req.creative || {};
   const tag = `[render ${req.campaignRunId || '-'}#${jobId}]`;
+
+  // Load the queued Ad doc up front. identityDigest is needed for the
+  // upload filename so re-renders of the same (campaign, identity)
+  // overwrite the existing Cloudinary asset rather than orphaning.
+  const adDoc = req.adId ? await Ad.findById(req.adId).select('identityDigest').lean() : null;
+  const identityDigest = adDoc?.identityDigest || null;
   const stages = {};
   const t0 = Date.now();
 
@@ -95,25 +92,9 @@ async function renderCreative(req) {
     return { jobId, status: 'skipped', skipReason: reason };
   }
 
-  // 3. de-dupe — has this exact creative been rendered before?
-  // Skipped when req.options.refresh is true so a smoke-test re-fire
-  // produces fresh renders instead of returning blank Ads cached
-  // during earlier broken deploys. Long-term fix is campaignRunIds[]
-  // as an array on Ad (see backlog) so dedupe-hit Ads still surface
-  // under the current run's filter.
-  const derivationDigest = computeDerivationDigest(input, req);
-  if (!req.options?.refresh) {
-    const existing = await Ad.findOne({
-      campaignId: req.campaignId,
-      derivationDigest
-    }).lean();
-    if (existing) {
-      console.log(`   ♻️  ${tag} dedupe hit — reusing Ad ${existing._id} (digest=${derivationDigest.slice(0,8)})`);
-      return success(jobId, existing);
-    }
-  } else {
-    console.log(`   🔄 ${tag} refresh=true — skipping Ad dedupe (digest=${derivationDigest.slice(0,8)})`);
-  }
+  // Dedup is handled at queue time via the (campaignId, identityDigest)
+  // unique index — same inputs never produce two queued Ad docs in the
+  // first place. No per-render dedup check needed.
 
   // Decide image vs video branch. Video requires (a) source Media is
   // a video, (b) the template has a media slot we can punch through.
@@ -158,7 +139,7 @@ async function renderCreative(req) {
       mediaId:          req.creative.mediaId,
       template:         req.creative.template,
       aspectRatio:      req.creative.aspectRatio,
-      derivationDigest,
+      identityDigest,
       isOverlay:        useVideoBranch
     });
     stages.upload = Date.now() - t;
@@ -201,7 +182,6 @@ async function renderCreative(req) {
       req,
       input,
       layoutInputArtifactId,
-      derivationDigest,
       renderOutput,
       upload,
       videoComposite
@@ -494,7 +474,7 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
 async function uploadStage(renderOutput, ctx) {
   const folder = `ads/${ctx.brandId}/${ctx.campaignId}${ctx.isOverlay ? '/overlay' : ''}`;
   const shortMedia = String(ctx.mediaId).slice(-8);
-  const shortDigest = (ctx.derivationDigest || '').slice(0, 8) || crypto.randomBytes(4).toString('hex');
+  const shortDigest = (ctx.identityDigest || '').slice(0, 8) || crypto.randomBytes(4).toString('hex');
   const overlaySuffix = ctx.isOverlay ? '-overlay' : '';
   const publicId = `${ctx.aspectRatio.replace(/[:.]/g, '_')}-${ctx.template}-${shortMedia}-${shortDigest}${overlaySuffix}`;
 
@@ -516,39 +496,38 @@ async function uploadStage(renderOutput, ctx) {
   };
 }
 
-async function persistStage({ req, input, layoutInputArtifactId, derivationDigest, renderOutput, upload, videoComposite }) {
+async function persistStage({ req, input, layoutInputArtifactId, renderOutput, upload, videoComposite }) {
   const copy = extractCopySnapshot(input);
-  // Video branch — renderUrl is the Cloudinary composite (.mp4),
-  // posterUrl is the overlay PNG (used as a static fallback in
-  // contexts that can't play video, e.g. the Ads gallery thumbnails
-  // before they request the full asset).
   const isVideo = !!videoComposite;
-  return Ad.create({
-    brandId:               req.brandId,
-    campaignId:            req.campaignId,
-    campaignRunId:         req.campaignRunId,
-    layoutInputArtifactId,
-    mediaId:               req.creative.mediaId,
-    productId:             req.creative.productId || null,
-    template:              req.creative.template,
-    aspectRatio:           req.creative.aspectRatio,
-    mediaSource:           req.creative.mediaSource,
-    campaignKind:          req.campaignKind || null,
-    kind:                  isVideo ? 'video' : (renderOutput.kind || 'image'),
-    renderUrl:             isVideo ? videoComposite.compositeUrl : upload.renderUrl,
-    posterUrl:             isVideo ? upload.renderUrl : upload.posterUrl,
-    cloudinaryPublicId:    upload.cloudinaryPublicId,
-    width:                 upload.width,
-    height:                upload.height,
-    bytes:                 upload.bytes,
-    durationMs:            upload.durationMs,
-    copy,
-    ctaUrl:                req.cta?.url    || '',
-    ctaUrlParams:          req.cta?.params || '',
-    status:                'draft',
-    derivationDigest,
-    generatedAt:           new Date()
-  });
+  // Update the existing queued Ad doc (status='rendering' was stamped
+  // when the run loop selected it). Backfill all the render-output
+  // fields and flip status → 'draft'. The Ad's identity fields
+  // (campaignId, mediaId, productId, template, aspectRatio, matchTier,
+  // variantKind, identityDigest) stay as they were at queue time.
+  if (!req.adId) {
+    throw new Error('persistStage: req.adId required (the queued Ad to update)');
+  }
+  const update = {
+    $set: {
+      layoutInputArtifactId,
+      kind:               isVideo ? 'video' : (renderOutput.kind || 'image'),
+      renderUrl:          isVideo ? videoComposite.compositeUrl : upload.renderUrl,
+      posterUrl:          isVideo ? upload.renderUrl : upload.posterUrl,
+      cloudinaryPublicId: upload.cloudinaryPublicId,
+      width:              upload.width,
+      height:             upload.height,
+      bytes:              upload.bytes,
+      durationMs:         upload.durationMs,
+      copy,
+      status:             'draft',
+      renderedAt:         new Date(),
+      updatedAt:          new Date()
+    },
+    $inc: { renderAttempts: 1 }
+  };
+  const ad = await Ad.findByIdAndUpdate(req.adId, update, { new: true }).lean();
+  if (!ad) throw new Error(`persistStage: Ad ${req.adId} not found`);
+  return ad;
 }
 
 // ── Video composite helper ───────────────────────────────────────────
@@ -607,37 +586,6 @@ async function composeVideoOutput({ media, template, aspectRatio, overlayUrl, ov
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-// Stable canonical-form sha256 over the inputs that determine the
-// rendered output. Two creatives with the same digest = same render,
-// so we skip and return the existing Ad doc.
-function computeDerivationDigest(input, req) {
-  const payload = {
-    mediaId:     req.creative.mediaId,
-    template:    req.creative.template,
-    aspectRatio: req.creative.aspectRatio,
-    cta: {
-      text:   req.cta?.text   || '',
-      url:    req.cta?.url    || '',
-      params: req.cta?.params || ''
-    },
-    copy: {
-      headline:      input?.copy?.headline       || '',
-      headline_lead: input?.copy?.headline_lead  || '',
-      headline_main: input?.copy?.headline_main  || '',
-      subheadline:   input?.copy?.subheadline    || '',
-      eyebrow:       input?.copy?.eyebrow        || '',
-      quote:         input?.social_proof?.primary_quote?.text || '',
-      cta_text:      input?.cta?.text            || ''
-    },
-    product: {
-      name:  input?.product?.name  || '',
-      price: input?.product?.price || ''
-    }
-  };
-  const json = JSON.stringify(payload, Object.keys(payload).sort());
-  return crypto.createHash('sha256').update(json).digest('hex').slice(0, 32);
-}
-
 function extractCopySnapshot(input) {
   const price = input?.product?.price;
   const priceStr = typeof price === 'string' ? price
@@ -679,7 +627,7 @@ function success(jobId, ad) {
       height:                ad.height,
       bytes:                 ad.bytes,
       durationMs:            ad.durationMs,
-      derivationDigest:      ad.derivationDigest
+      identityDigest:        ad.identityDigest
     }
   };
 }

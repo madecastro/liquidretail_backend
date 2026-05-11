@@ -1,91 +1,153 @@
-// Ad — a single rendered creative produced by the render service.
+// Ad — one (campaign × product × media × template × ratio × variant)
+// combination, persisted at queue time and updated as it moves through
+// the render lifecycle.
 //
-// Backed by the Generate Ads wizard flow:
-//   campaign → campaignAdsGenerationService.expandWizardJob()
-//            → for each creative entry: renderService.renderCreative()
-//            → Ad.create({...})
+// Lifecycle:
+//   queued     — created by expandWizardJob; no render output yet
+//   rendering  — picked up by a CampaignRun; Puppeteer in flight
+//   draft      — render succeeded; ready to publish
+//   live       — operator published
+//   archived   — soft-deleted
+//   failed     — render attempt failed; preserved for diagnostics
+//                (no auto-retry; operator-initiated only)
 //
-// The Ad doc captures EVERYTHING the ads page needs to render its
-// row + thumbnail without joining back to the LayoutInputArtifact:
-// the URL, the copy snapshot, the linkage to the source media /
-// product / template / canvas ratio, and the lifecycle state.
+// Dedup: identityDigest is sha256 over the IDENTITY inputs (campaignId,
+// productId, mediaId, template, aspectRatio, variantKind, cta*). Same
+// inputs → same digest → unique index on (campaignId, identityDigest)
+// rejects duplicate queue inserts. Same digest also implies same
+// rendered output, so render-time skip can use it too.
 //
-// derivationDigest is a sha256 over the resolved copy + cta + slot
-// keys; re-rendering an identical (mediaId, template, aspectRatio,
-// copy, cta) tuple produces the same digest, which the render
-// service uses to skip and return the existing Ad rather than
-// burning Cloudinary on duplicate output.
+// Copy snapshot is filled at RENDER time, not queue time — the
+// LayoutInputArtifact derivation (Gemini-backed copy gen with per-
+// template character constraints) is expensive and we only want to
+// pay for ads we actually render.
 
 const mongoose = require('mongoose');
 
 const adSchema = new mongoose.Schema({
   // ── Tenancy + grouping ───────────────────────────────────────────
-  brandId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',    required: true, index: true },
-  // Nullable so ads can be unlinked from a campaign via the
-  // campaign detail page's "Remove ad" action. Orphans still
-  // appear in the brand-scoped /api/ads gallery; only the
-  // per-campaign filter excludes them.
-  campaignId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', default: null, index: true },
-  // Groups all creatives produced by one click of the Generate Ads
-  // button. Lets the ads page show "this batch was generated together"
-  // and supports re-running a campaign without losing the audit trail.
-  campaignRunId: { type: String, required: true, index: true },
+  brandId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',    required: true, index: true },
+  campaignId: { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', default: null,  index: true },
+
+  // The run that selected this Ad for rendering. Null while queued;
+  // stamped when a render run picks the Ad; preserved on completion
+  // (or failure) so we can audit which run touched which Ad.
+  campaignRunId: { type: String, default: null, index: true },
 
   // ── Source linkage ───────────────────────────────────────────────
-  layoutInputArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'LayoutInputArtifact' },
-  mediaId:               { type: mongoose.Schema.Types.ObjectId, ref: 'Media',  required: true, index: true },
-  productId:             { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null, index: true },
+  mediaId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Media',          required: true, index: true },
+  productId: { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null,  index: true },
+
+  // Resolved at render time when buildLayoutInput runs. Null while queued.
+  layoutInputArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'LayoutInputArtifact', default: null },
 
   // ── Generation context ───────────────────────────────────────────
-  template:       { type: String, required: true, index: true },
-  aspectRatio:    { type: String, required: true },
-  mediaSource:    { type: String, enum: ['product_match', 'product_category', 'brand_match'], required: true },
-  campaignKind:   { type: String },                     // 'brand' | 'promotional' | 'product' | 'collection' (mirrors campaign.kind, null treated as 'promotional')
+  template:     { type: String, required: true, index: true },
+  aspectRatio:  { type: String, required: true },
+  campaignKind: { type: String, default: null },                       // 'brand' | 'promotional' | 'product' | 'collection'
 
-  // ── Render output ────────────────────────────────────────────────
-  kind:               { type: String, enum: ['image', 'video'], default: 'image' },  // V1 always 'image'
-  renderUrl:          { type: String, required: true },                              // primary URL — PNG in V1
-  posterUrl:          { type: String, default: null },                               // video poster — null in V1
-  cloudinaryPublicId: { type: String, required: true, index: true },
-  width:              { type: Number, required: true },                              // px
-  height:             { type: Number, required: true },                              // px
-  bytes:              { type: Number, default: null },
-  durationMs:         { type: Number, default: null },                               // video only
-
-  // ── Copy snapshot ────────────────────────────────────────────────
-  // Read-time convenience for the ads page list / detail card so we
-  // don't have to round-trip the LayoutInputArtifact for every row.
-  // Resolved at render time from the canonical input.
-  copy: {
-    headline:     String,
-    cta_text:     String,
-    quote:        String,
-    productName:  String,
-    productPrice: String
+  // Which match outcome produced this Ad. brand_only is the no-pick
+  // path (no operator picks → top brand_match media wide).
+  matchTier: {
+    type:     String,
+    enum:     ['product_match', 'product_category', 'brand_match', 'brand_only'],
+    required: true,
+    index:    true
   },
 
-  // ── CTA (operator-provided) ──────────────────────────────────────
-  ctaUrl:       { type: String },
-  ctaUrlParams: { type: String, default: '' },
+  // Which visual asset drives the ad:
+  //   product_image — catalog product photo as the media slot
+  //   ugc           — UGC media that matched as the media slot
+  variantKind: {
+    type:     String,
+    enum:     ['product_image', 'ugc'],
+    required: true,
+    index:    true
+  },
+
+  // Denormalized at queue time so the selection query can sort
+  // without joining Media. Combines Media.adSuitability.score and a
+  // match-tier weight (product_match > product_category > brand_match
+  // > brand_only). 0..1, null when neither signal is available.
+  readinessScore: { type: Number, default: null, index: true },
 
   // ── Lifecycle ────────────────────────────────────────────────────
-  status:           { type: String, enum: ['draft', 'live', 'archived'], default: 'draft', index: true },
-  derivationDigest: { type: String, required: true, index: true },                   // sha256 — de-dupe key
+  status: {
+    type:     String,
+    enum:     ['queued', 'rendering', 'draft', 'live', 'archived', 'failed'],
+    default:  'queued',
+    required: true,
+    index:    true
+  },
 
+  // sha256 over identity inputs (campaignId, productId, mediaId,
+  // template, aspectRatio, variantKind, ctaText, ctaUrl, ctaUrlParams).
+  // Computed at queue time; unique per campaign.
+  identityDigest: { type: String, required: true, index: true },
+
+  // ── Render output (all null until render lands) ──────────────────
+  kind:               { type: String, enum: ['image', 'video'], default: 'image' },
+  renderUrl:          { type: String, default: null },
+  posterUrl:          { type: String, default: null },
+  // Sparse index — queued ads carry null, only rendered ads contribute.
+  cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },
+  width:              { type: Number, default: null },
+  height:             { type: Number, default: null },
+  bytes:              { type: Number, default: null },
+  durationMs:         { type: Number, default: null },
+
+  // Render diagnostics. renderError is populated when status='failed';
+  // renderAttempts counts every attempt regardless of outcome.
+  renderError: {
+    message: { type: String },
+    stage:   { type: String },
+    at:      { type: Date }
+  },
+  renderAttempts: { type: Number, default: 0 },
+
+  // ── Copy snapshot — filled at render time ────────────────────────
+  // Cached resolution of the LayoutInputArtifact's derived copy so
+  // the ads page list doesn't have to round-trip the artifact for
+  // every row. Null while queued.
+  copy: {
+    headline:     { type: String, default: null },
+    cta_text:     { type: String, default: null },
+    quote:        { type: String, default: null },
+    productName:  { type: String, default: null },
+    productPrice: { type: String, default: null }
+  },
+
+  // ── CTA (operator-provided, set at queue time) ───────────────────
+  ctaText:      { type: String, default: '' },
+  ctaUrl:       { type: String, default: '' },
+  ctaUrlParams: { type: String, default: '' },
+
+  // ── Timing ───────────────────────────────────────────────────────
+  queuedAt:    { type: Date, default: Date.now },
+  renderedAt:  { type: Date, default: null },
+  // generatedAt kept as the legacy "this ad first existed" timestamp.
+  // For the new flow it equals queuedAt; existing readers that order
+  // by generatedAt still work.
   generatedAt: { type: Date, default: Date.now },
   createdAt:   { type: Date, default: Date.now },
   updatedAt:   { type: Date, default: Date.now }
 }, {
-  timestamps: false   // explicit createdAt/updatedAt above
+  timestamps: false
 });
 
-// De-dupe lookup. Same (campaignId, derivationDigest) pair = same
-// rendered creative; render service uses this to skip duplicate work.
-adSchema.index({ campaignId: 1, derivationDigest: 1 });
+// Dedup at queue time. Same campaign + identity = skip the insert.
+// Per-campaign unique — different campaigns can hold the same combo
+// (an intentional duplicate from a separate operator action).
+adSchema.index({ campaignId: 1, identityDigest: 1 }, { unique: true });
 
-// Ads-page filtered listings. brandId + status is the primary query
-// (e.g., "show me all live ads for this brand"); add campaignId for
-// campaign-scoped views.
+// Selection query — "next N queued ads for this campaign, ranked by
+// readiness." Drives the render loop's pick.
+adSchema.index({ campaignId: 1, status: 1, readinessScore: -1 });
+
+// Run audit — "what did run X render?"
+adSchema.index({ campaignRunId: 1, status: 1 });
+
+// Ads-page filtered listings (kept).
 adSchema.index({ brandId: 1, status: 1, generatedAt: -1 });
 adSchema.index({ campaignId: 1, generatedAt: -1 });
 

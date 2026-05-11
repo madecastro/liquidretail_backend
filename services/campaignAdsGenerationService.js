@@ -1,53 +1,54 @@
-// Campaign → Render expansion. Single entry point: the Generate Ads
-// wizard. Takes operator selections + the chosen campaign and emits a
-// fully-resolved RenderCampaignJob the render service can iterate
-// without making content/media decisions.
+// Campaign → Queue expansion. Single entry point: the Generate Ads
+// wizard. Takes operator selections + the chosen campaign, expands
+// to ALL viable (product × media × template × ratio × variant)
+// combinations, and persists each as a queued Ad doc.
 //
-// Decision rules:
+// The render run then picks the top N from the queued inventory by
+// readinessScore — leftover queued ads stay for subsequent
+// "render more from this campaign" passes.
 //
-//   Operator picks (mediaIds + productIds) always win. The seeder
-//   honors them regardless of campaign.kind — brand campaigns can
-//   still feature specific media if the operator picked them. The
-//   campaignKind field flows through to downstream copy derivation
-//   so brand-mode tone can fire even when productId is set.
+// Seed rules (per operator pick):
 //
-//   1. No picks (productIds.length === 0 && mediaIds.length === 0):
-//      → seedFromBrandOnly. Pulls top brand_match media for brandId,
-//        productId: null on every seed.
+//   1. No picks (brand-only):
+//      → every brand_match media (capped by BRAND_ONLY_MEDIA_LIMIT)
+//        emits a `ugc` variant seed with productId:null and
+//        matchTier='brand_only'.
 //
-//   2. mediaIds present (library-entry deep-link / picker selection):
+//   2. mediaIds (media-driven, library entry):
 //      → for each media, dispatch by ProductMatchArtifact.outcome:
-//          product_match    → feature match.catalogProductId
-//          product_category → feature first match.recommendedProducts[]
-//                             entry (already-attached siblings)
-//          brand_match      → productId: null
-//          (no PMA)         → productId: null (brand_match fallback)
-//      → mediaSource on the creative records WHICH rung supplied the
-//        media so the render service can tag the resulting Ad doc.
+//          product_match    → one ugc seed featuring match.catalogProductId,
+//                             matchTier='product_match'
+//          product_category → one ugc seed per recommendedProduct,
+//                             matchTier='product_category'
+//          brand_match      → one ugc seed with productId:null,
+//                             matchTier='brand_match'
+//          (no PMA)         → fall back to brand_match
 //
-//   3. productIds present (catalog-entry / wizard Step 2):
-//      → for each productId, simpler cascade:
-//          product_match media for THIS productId → top-suitability winner
-//          else                                   → brand_match media
-//      → category_match is NOT auto-fallback in this path; that's
-//        reserved for path (2) where the operator chose the media.
+//   3. productIds (product-driven, catalog entry):
+//      → for each productId, gather EVERY matched media:
+//          all product_match media   → ugc seeds, matchTier='product_match'
+//          all product_category media (where this product is in
+//             recommendedProducts) → ugc seeds, matchTier='product_category'
+//          all brand_match media (productId attached for tracking)
+//                                  → ugc seeds, matchTier='brand_match'
+//        Plus ONE product_image seed per product — uses the catalog
+//        product's hero Media doc as the media slot, productId set,
+//        matchTier inherits 'product_match' (the product IS the SKU).
 //
-//   4. Both mediaIds and productIds: union — each contributes
-//      creatives independently. dedupeSeeds collapses (productId|null,
-//      mediaId) duplicates that result from picking the same media via
-//      both library + catalog paths.
+// Cartesian expansion across seeds × allowedTemplates × ratios is
+// then bulk-inserted; per-campaign unique index on identityDigest
+// rejects duplicates so this is idempotent (re-running with the
+// same picks doesn't double-queue).
+
+const crypto = require('crypto');
 
 const Campaign              = require('../models/Campaign');
 const Media                 = require('../models/Media');
 const CatalogProduct        = require('../models/CatalogProduct');
 const ProductMatchArtifact  = require('../models/ProductMatchArtifact');
+const Ad                    = require('../models/Ad');
 const registry              = require('./templateRegistry');
 
-// Templates currently shipping. Render service only handles these in V1
-// (per the deferred render-service plan saved 2026-05-06).
-// testimonial_overlay + product_overlay are temporarily gated off the
-// wizard until layout polish lands — keep them in the set so any
-// hand-crafted API call still works, but the UI hides them.
 const SUPPORTED_TEMPLATES = new Set([
   'testimonial_spotlight',
   'ugc_split_screen',
@@ -55,16 +56,72 @@ const SUPPORTED_TEMPLATES = new Set([
   'product_overlay'
 ]);
 
-// Aspect ratios we're shipping ad output for in V1. Templates may
-// declare more (4:5 / 1.91:1 / 5:4) but we filter the cartesian here
-// so a single source of truth controls what reaches the renderer.
+// Aspect ratios we're shipping ad output for in V1.
 const SHIPPING_RATIOS = new Set(['1:1', '9:16', '16:9']);
 
-const DEFAULT_TOP_MEDIA_PER_PRODUCT = 1;
-const BRAND_ONLY_MEDIA_LIMIT        = 5; // when no products are selected
+// Brand-only inventory cap. Without picks, this limits how many of
+// the brand's brand_match media get pulled into the queue.
+const BRAND_ONLY_MEDIA_LIMIT = 25;
+
+// Readiness scoring weights — match tier carries the lion's share of
+// signal. adSuitability is per-media quality; tier weight is per-
+// (media,product) match quality. Combined multiplicatively.
+const TIER_WEIGHTS = {
+  product_match:    1.0,
+  product_category: 0.8,
+  brand_match:      0.6,
+  brand_only:       0.5
+};
+
+// Catalog product images don't carry a meaningful Media.adSuitability
+// (the score is tuned for UGC composition signals — face/subject
+// quality, scene density, etc.). Use a fixed quality assumption.
+const PRODUCT_IMAGE_QUALITY = 0.7;
+
+// Video media is consistently subpar for static ad output. Skip the
+// adSuitability lookup entirely and leave readinessScore null so the
+// selection query (sorted desc) ranks videos LAST.
+function readinessScoreFor(matchTier, fileType, adSuitabilityScore) {
+  if (fileType === 'video') return null;
+  const tier = TIER_WEIGHTS[matchTier] ?? 0.5;
+  const quality = adSuitabilityScore ?? 0.5;
+  return Number((tier * quality).toFixed(4));
+}
+
+function readinessScoreForProductImage(matchTier) {
+  const tier = TIER_WEIGHTS[matchTier] ?? 0.5;
+  return Number((tier * PRODUCT_IMAGE_QUALITY).toFixed(4));
+}
+
+// sha256 over the identity inputs that uniquely define an Ad in the
+// queue. Same digest on the same campaign = same Ad = unique index
+// rejects the duplicate insert.
+function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, ctaText, ctaUrl, ctaUrlParams }) {
+  const payload = JSON.stringify({
+    campaignId:   String(campaignId),
+    productId:    productId ? String(productId) : null,
+    mediaId:      String(mediaId),
+    template,
+    aspectRatio,
+    variantKind,
+    ctaText:      String(ctaText || ''),
+    ctaUrl:       String(ctaUrl  || ''),
+    ctaUrlParams: String(ctaUrlParams || '')
+  });
+  return crypto.createHash('sha256').update(payload).digest('hex');
+}
 
 // ── Public API ───────────────────────────────────────────────────────
 
+// Expand the wizard payload into queued Ad docs.
+// Returns:
+//   {
+//     campaignId, brandId, campaignKind,
+//     queuedCount,        — total Ad docs in this campaign with status='queued' after this call
+//     newlyQueued,        — number of new docs inserted by THIS call
+//     alreadyQueued,      — number of combinations that were already queued
+//     newAdIds            — ObjectIds of the docs newly inserted (for immediate selection)
+//   }
 async function expandWizardJob({
   campaignId,
   productIds   = [],
@@ -72,8 +129,7 @@ async function expandWizardJob({
   templateIds  = [],
   cta          = {},
   urlParams    = '',
-  requestedBy  = null,
-  refresh      = false   // bypass de-dupe + LayoutInputArtifact cache when true
+  requestedBy  = null
 }) {
   if (!campaignId) throw new Error('campaignId required');
 
@@ -81,68 +137,40 @@ async function expandWizardJob({
   if (!campaign) throw new Error(`Campaign not found: ${campaignId}`);
 
   const brandId      = String(campaign.brandId);
-  // campaign.kind enum is ['product','collection','brand', null]; null
-  // legacy rows are treated as promotional. The Ad doc's campaignKind
-  // field stores whatever string we pass through here so it stays
-  // queryable.
   const campaignKind = campaign.kind || 'promotional';
   const allowedTemplates = templateIds.filter(t => SUPPORTED_TEMPLATES.has(t));
-
   if (!allowedTemplates.length) {
     throw new Error(`No supported templates in selection. V1 supports: ${Array.from(SUPPORTED_TEMPLATES).join(', ')}`);
   }
 
-  // ── 1. Build creative seeds ({productId, mediaId, mediaSource}) ──
-  //
-  // Operator picks (productIds, mediaIds) ALWAYS win. The previous
-  // implementation special-cased campaignKind === 'brand' to ignore
-  // picks entirely and auto-pull top brand_match media — fine for
-  // synced campaigns that don't have a picker UI, but the new
-  // wizard's ribbon picker explicitly lets operators choose for
-  // brand campaigns too. Honor the picks; only fall back to
-  // brand-only when nothing was picked.
-  let seeds = [];
+  const ctaText      = String(cta.text || '');
+  const ctaUrl       = String(cta.url  || '');
+  const ctaUrlParams = String(urlParams || '').replace(/^[?&]/, '');
+
+  // ── 1. Build seeds — flat list of {productId, mediaId, matchTier, variantKind, suitabilityScore, fileType} ──
   const useBrandOnly = productIds.length === 0 && mediaIds.length === 0;
+  let seeds = [];
 
   if (useBrandOnly) {
     seeds = await seedFromBrandOnly(brandId, BRAND_ONLY_MEDIA_LIMIT);
   } else {
-    // Library-entry: each operator-picked media → seed via match outcome.
     for (const mediaId of mediaIds) {
-      const seed = await seedFromMedia(brandId, mediaId);
-      if (seed) seeds.push(seed);
+      const mediaSeeds = await seedsFromMedia(brandId, mediaId);
+      seeds.push(...mediaSeeds);
     }
-    // Catalog/wizard-entry: each operator-picked product → cascade.
     for (const productId of productIds) {
-      const productSeeds = await seedsFromProduct(brandId, productId, DEFAULT_TOP_MEDIA_PER_PRODUCT);
+      const productSeeds = await seedsFromProduct(brandId, productId);
       seeds.push(...productSeeds);
     }
   }
 
-  // De-dupe by (productId|null, mediaId) so picking the same media via
-  // both library + catalog paths doesn't double-render.
+  // Dedup by (productId|null, mediaId, variantKind) — picking the
+  // same product via both library + catalog paths shouldn't queue
+  // it twice in this pass. (Cross-pass dedup is handled by the
+  // unique index at insert time.)
   seeds = dedupeSeeds(seeds);
 
-  // ── 2. Cartesian with templates × supportedAspectRatios ──────────
-  //
-  // Order: ratio × template × seed (i.e. iterate seeds in the OUTER
-  // position only after all template/ratio combos for the current
-  // ratio). This way, when MAX_CREATIVES_PER_RUN slices the result,
-  // every seed gets representation before any seed gets a second
-  // creative. With 3 seeds × 2 templates × 3 ratios = 18 combos
-  // sliced to 6, we land 1 creative per (ratio, template) pair
-  // distributed across seeds — instead of 6 creatives for seed 0
-  // and zero for the rest.
-  const seedFileTypes = new Map(
-    (await Media.find({ _id: { $in: seeds.map(s => s.mediaId) } })
-      .select('_id fileType').lean())
-      .map(m => [String(m._id), m.fileType])
-  );
-  const creatives = [];
-  // Build the (template, ratio) grid once so we can interleave seeds
-  // across it. Each entry is the set of seeds the template/ratio
-  // combo accepts (templates declare their supported ratios; we
-  // intersect with SHIPPING_RATIOS).
+  // ── 2. Cartesian: seeds × allowedTemplates × (template ratios ∩ SHIPPING_RATIOS) ──
   const grid = [];
   for (const templateId of allowedTemplates) {
     const tpl = registry.getNormalized(templateId);
@@ -153,50 +181,112 @@ async function expandWizardJob({
       grid.push({ templateId, aspectRatio });
     }
   }
-  // Round-robin: each pass picks one (template, ratio) cell and
-  // emits creatives across every seed before moving to the next
-  // cell. Concretely, the first 3 emitted (with 3 seeds) cover
-  // {seed0, seed1, seed2} on the first cell; the next 3 cover
-  // them on the second cell, etc.
-  for (const cell of grid) {
-    for (const seed of seeds) {
-      const expectedKind = seedFileTypes.get(String(seed.mediaId)) === 'video' ? 'video' : 'image';
-      creatives.push({
-        productId:        seed.productId,
-        mediaId:          seed.mediaId,
-        mediaSource:      seed.mediaSource,
-        suitabilityScore: seed.suitabilityScore,
-        template:         cell.templateId,
-        aspectRatio:      cell.aspectRatio,
-        expectedKind
+
+  const payloads = [];
+  for (const seed of seeds) {
+    for (const cell of grid) {
+      const identityDigest = computeIdentityDigest({
+        campaignId,
+        productId:    seed.productId,
+        mediaId:      seed.mediaId,
+        template:     cell.templateId,
+        aspectRatio:  cell.aspectRatio,
+        variantKind:  seed.variantKind,
+        ctaText, ctaUrl, ctaUrlParams
+      });
+      const readinessScore = seed.variantKind === 'product_image'
+        ? readinessScoreForProductImage(seed.matchTier)
+        : readinessScoreFor(seed.matchTier, seed.fileType, seed.suitabilityScore);
+      payloads.push({
+        brandId,
+        campaignId,
+        campaignRunId:  null,
+        mediaId:        seed.mediaId,
+        productId:      seed.productId,
+        template:       cell.templateId,
+        aspectRatio:    cell.aspectRatio,
+        campaignKind,
+        matchTier:      seed.matchTier,
+        variantKind:    seed.variantKind,
+        readinessScore,
+        status:         'queued',
+        identityDigest,
+        ctaText, ctaUrl, ctaUrlParams,
+        queuedAt:       new Date(),
+        generatedAt:    new Date()
       });
     }
   }
 
+  if (!payloads.length) {
+    return {
+      campaignId: String(campaignId), brandId, campaignKind,
+      queuedCount: await Ad.countDocuments({ campaignId, status: 'queued' }),
+      newlyQueued: 0, alreadyQueued: 0, newAdIds: []
+    };
+  }
+
+  // ── 3. Bulk insert — { ordered: false } so dup-key errors per
+  // (campaignId, identityDigest) don't abort the rest of the batch.
+  let inserted = [];
+  try {
+    inserted = await Ad.insertMany(payloads, { ordered: false });
+  } catch (err) {
+    // BulkWriteError carries successful inserts in result.insertedIds
+    // alongside writeErrors[]. Extract the successes and continue.
+    if (err.writeErrors && err.result?.insertedIds) {
+      const insertedIds = err.result.insertedIds || {};
+      inserted = Object.values(insertedIds);
+      // Re-fetch to get full docs (insertedIds is just IDs, not docs)
+      if (inserted.length) {
+        inserted = await Ad.find({ _id: { $in: inserted } }).lean();
+      }
+    } else if (err.code === 11000) {
+      // Single-doc dup — nothing inserted
+      inserted = [];
+    } else {
+      throw err;
+    }
+  }
+
+  const newAdIds = inserted.map(d => String(d._id || d));
+  const alreadyQueued = payloads.length - newAdIds.length;
+  const queuedCount = await Ad.countDocuments({ campaignId, status: 'queued' });
+
+  console.log(
+    `📦 expandWizardJob: campaign=${campaignId} seeds=${seeds.length} cartesian=${payloads.length} ` +
+    `newlyQueued=${newAdIds.length} alreadyQueued=${alreadyQueued} totalQueued=${queuedCount}`
+  );
+
   return {
-    campaignId:   String(campaign._id),
+    campaignId: String(campaignId),
     brandId,
     campaignKind,
-    requestedAt:  new Date().toISOString(),
-    requestedBy,
-    cta: {
-      text:    String(cta.text || ''),
-      url:     String(cta.url  || ''),
-      params:  String(urlParams || '').replace(/^[?&]/, '')
-    },
-    creatives,
-    options: {
-      skipValidationFailures: true,
-      refresh:                !!refresh,
-      topMediaPerProduct:     DEFAULT_TOP_MEDIA_PER_PRODUCT
-    }
+    queuedCount,
+    newlyQueued: newAdIds.length,
+    alreadyQueued,
+    newAdIds,
+    cta: { text: ctaText, url: ctaUrl, params: ctaUrlParams },
+    requestedBy
   };
+}
+
+// Selection — "next N queued ads for this campaign, ranked by
+// readinessScore desc (videos with null score sort last, FIFO by
+// queuedAt as tiebreaker)." Returns Ad IDs (strings).
+async function selectAdsForRun({ campaignId, limit }) {
+  const rows = await Ad.find({ campaignId, status: 'queued' })
+    .sort({ readinessScore: -1, queuedAt: 1 })
+    .limit(limit)
+    .select('_id')
+    .lean();
+  return rows.map(r => String(r._id));
 }
 
 // ── Seed builders ────────────────────────────────────────────────────
 
-// Path 1+2: brand-only mode. Pull all brand_match media for this brand,
-// rank by suitability, take top N. productId is null.
+// Brand-only mode — pull all brand_match media for this brand, rank
+// by suitability, take top N. productId stays null.
 async function seedFromBrandOnly(brandId, topN) {
   const matches = await ProductMatchArtifact.find({
     brandId,
@@ -204,144 +294,190 @@ async function seedFromBrandOnly(brandId, topN) {
   }).select('mediaId').lean();
   if (!matches.length) return [];
   const mediaIds = Array.from(new Set(matches.map(m => String(m.mediaId))));
-  const ranked = await rankBySuitability(mediaIds, topN);
+  const medias = await loadMediasForScoring(mediaIds);
+  const ranked = medias
+    .sort((a, b) => (b.adSuitability?.score ?? -1) - (a.adSuitability?.score ?? -1))
+    .slice(0, topN);
   return ranked.map(m => ({
     productId:        null,
     mediaId:          String(m._id),
-    mediaSource:      'brand_match',
+    matchTier:        'brand_only',
+    variantKind:      'ugc',
+    fileType:         m.fileType,
     suitabilityScore: m.adSuitability?.score ?? null
   }));
 }
 
-// Path 3: media-driven (library entry). Operator picked a specific media.
-// Look up its match outcome to decide what product to feature.
-//
-// IMPORTANT: when the operator EXPLICITLY picks a media, we always
-// honor the pick — even when no useful PMA exists (no_products /
-// missing artifact / unrecognized outcome). The fallback is a
-// brand_match seed (productId:null) so the ad still renders against
-// the picked media's content. Silently dropping operator picks was
-// causing "the media I selected had nothing to do with the ads"
-// confusion.
-async function seedFromMedia(brandId, mediaId) {
+// Media-driven (library entry). Operator picked a specific media —
+// dispatch by its PMA outcome. Emits 0..N seeds (a product_category
+// outcome with multiple recommendedProducts emits one seed per
+// product, all sharing the same mediaId).
+async function seedsFromMedia(brandId, mediaId) {
   const match = await ProductMatchArtifact.findOne({ mediaId })
     .sort({ createdAt: -1 })
     .lean();
-  const media = await Media.findById(mediaId).select('adSuitability').lean();
-  const score = media?.adSuitability?.score ?? null;
+  const media = await Media.findById(mediaId).select('adSuitability fileType').lean();
+  if (!media) return [];
+  const fileType = media.fileType;
+  const score    = media.adSuitability?.score ?? null;
 
-  // Brand-match fallback honored on the explicit pick. Used by every
-  // path below that fails to produce a stronger seed.
   const brandFallback = {
     productId:        null,
     mediaId:          String(mediaId),
-    mediaSource:      'brand_match',
+    matchTier:        'brand_match',
+    variantKind:      'ugc',
+    fileType,
     suitabilityScore: score
   };
 
-  if (!match) {
-    console.log(`   · seedFromMedia[${mediaId}]: no PMA — falling back to brand_match`);
-    return brandFallback;
-  }
+  if (!match) return [brandFallback];
 
   switch (match.outcome) {
     case 'product_match':
-      if (!match.catalogProductId) return brandFallback;
-      return {
+      if (!match.catalogProductId) return [brandFallback];
+      return [{
         productId:        String(match.catalogProductId),
         mediaId:          String(mediaId),
-        mediaSource:      'product_match',
+        matchTier:        'product_match',
+        variantKind:      'ugc',
+        fileType,
         suitabilityScore: score
-      };
+      }];
     case 'product_category': {
-      // Feature the first attached recommendedProduct (a sibling SKU
-      // already populated at match time). If recommendedProducts is
-      // empty, fall through to a category lookup.
-      const sibling = (Array.isArray(match.recommendedProducts) && match.recommendedProducts[0])
-                    || await firstCategorySibling(brandId, match.categoryId);
-      if (!sibling) return brandFallback;
-      const siblingId = sibling._id || sibling.id || sibling.catalogProductId;
-      if (!siblingId) return brandFallback;
-      return {
-        productId:        String(siblingId),
-        mediaId:          String(mediaId),
-        mediaSource:      'product_category',
-        suitabilityScore: score
-      };
+      const recs = Array.isArray(match.recommendedProducts) ? match.recommendedProducts : [];
+      if (!recs.length) {
+        const sibling = await firstCategorySibling(brandId, match.categoryId);
+        if (!sibling) return [brandFallback];
+        return [{
+          productId:        String(sibling._id),
+          mediaId:          String(mediaId),
+          matchTier:        'product_category',
+          variantKind:      'ugc',
+          fileType,
+          suitabilityScore: score
+        }];
+      }
+      return recs
+        .map(r => r._id || r.id || r.catalogProductId)
+        .filter(Boolean)
+        .map(pid => ({
+          productId:        String(pid),
+          mediaId:          String(mediaId),
+          matchTier:        'product_category',
+          variantKind:      'ugc',
+          fileType,
+          suitabilityScore: score
+        }));
     }
     case 'brand_match':
-      return brandFallback;
+      return [brandFallback];
     default:
-      // 'no_products', 'do_not_use', or any unrecognized outcome:
-      // the operator picked it explicitly, so render against it as
-      // brand content rather than dropping the pick.
-      console.log(`   · seedFromMedia[${mediaId}]: outcome='${match.outcome}' — falling back to brand_match`);
-      return brandFallback;
+      // 'no_products', 'do_not_use', or unknown — honor the pick as brand content.
+      return [brandFallback];
   }
 }
 
-// Path 4: product-driven (catalog entry / wizard Step 2). Operator
-// picked a productId. Try product_match media first; fall back to
-// brand_match.
-async function seedsFromProduct(brandId, productId, topN) {
-  // product_match: matches whose catalogProductId === this productId.
+// Product-driven (catalog entry / wizard Step 2). Operator picked a
+// productId. Gather EVERY matched media across all match tiers PLUS
+// emit one product_image seed for the catalog product's own hero.
+async function seedsFromProduct(brandId, productId) {
+  const seeds = [];
+
+  // Tier 1 — product_match: media whose PMA points directly at this product.
   const productMatches = await ProductMatchArtifact.find({
     brandId,
     catalogProductId: productId,
     outcome: 'product_match'
   }).select('mediaId').lean();
-
-  if (productMatches.length) {
-    const mediaIds = Array.from(new Set(productMatches.map(m => String(m.mediaId))));
-    const ranked = await rankBySuitability(mediaIds, topN);
-    return ranked.map(m => ({
-      productId:        String(productId),
-      mediaId:          String(m._id),
-      mediaSource:      'product_match',
-      suitabilityScore: m.adSuitability?.score ?? null
-    }));
+  const productMatchMediaIds = Array.from(new Set(productMatches.map(m => String(m.mediaId))));
+  if (productMatchMediaIds.length) {
+    const medias = await loadMediasForScoring(productMatchMediaIds);
+    for (const m of medias) {
+      seeds.push({
+        productId:        String(productId),
+        mediaId:          String(m._id),
+        matchTier:        'product_match',
+        variantKind:      'ugc',
+        fileType:         m.fileType,
+        suitabilityScore: m.adSuitability?.score ?? null
+      });
+    }
   }
 
-  // Fall through to brand_match — operator's productId stays attached
-  // (we still want the ad to be tagged to that product for tracking +
-  // CTA URL composition), but the visual content comes from brand
-  // assets.
+  // Tier 2 — product_category: media whose PMA has this product in
+  // recommendedProducts[]. Mongo array-element match by _id.
+  const categoryMatches = await ProductMatchArtifact.find({
+    brandId,
+    outcome: 'product_category',
+    'recommendedProducts._id': productId
+  }).select('mediaId').lean();
+  const categoryMediaIds = Array.from(new Set(categoryMatches.map(m => String(m.mediaId))));
+  if (categoryMediaIds.length) {
+    const medias = await loadMediasForScoring(categoryMediaIds);
+    for (const m of medias) {
+      seeds.push({
+        productId:        String(productId),
+        mediaId:          String(m._id),
+        matchTier:        'product_category',
+        variantKind:      'ugc',
+        fileType:         m.fileType,
+        suitabilityScore: m.adSuitability?.score ?? null
+      });
+    }
+  }
+
+  // Tier 3 — brand_match fallback: tag the productId onto brand media
+  // so the ad is still attributed to the product for CTA/tracking.
   const brandMatches = await ProductMatchArtifact.find({
     brandId,
     outcome: 'brand_match'
   }).select('mediaId').lean();
+  const brandMatchMediaIds = Array.from(new Set(brandMatches.map(m => String(m.mediaId))));
+  if (brandMatchMediaIds.length) {
+    const medias = await loadMediasForScoring(brandMatchMediaIds);
+    for (const m of medias) {
+      seeds.push({
+        productId:        String(productId),
+        mediaId:          String(m._id),
+        matchTier:        'brand_match',
+        variantKind:      'ugc',
+        fileType:         m.fileType,
+        suitabilityScore: m.adSuitability?.score ?? null
+      });
+    }
+  }
 
-  if (!brandMatches.length) return [];
-  const mediaIds = Array.from(new Set(brandMatches.map(m => String(m.mediaId))));
-  const ranked = await rankBySuitability(mediaIds, topN);
-  return ranked.map(m => ({
-    productId:        String(productId),
-    mediaId:          String(m._id),
-    mediaSource:      'brand_match',
-    suitabilityScore: m.adSuitability?.score ?? null
-  }));
+  // Tier 0 — product_image: use the catalog product's hero Media as
+  // the visual slot. Find the catalog-product Media doc tied to this
+  // CatalogProduct (imageRole='hero', source='catalog-product').
+  const heroMedia = await Media.findOne({
+    source: 'catalog-product',
+    'metadata.catalogProductId': productId,
+    'metadata.imageRole': 'hero'
+  }).select('_id fileType adSuitability').lean();
+  if (heroMedia) {
+    seeds.push({
+      productId:        String(productId),
+      mediaId:          String(heroMedia._id),
+      matchTier:        'product_match',     // the product IS the SKU here
+      variantKind:      'product_image',
+      fileType:         heroMedia.fileType,
+      suitabilityScore: heroMedia.adSuitability?.score ?? null
+    });
+  }
+
+  return seeds;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-// Rank a list of mediaIds by adSuitability.score (desc, nulls last).
-// Returns Media docs (not just IDs) so callers can attach the score to
-// the seed. Limit applied AFTER sorting so the top-N actually get the
-// best-scored docs.
-async function rankBySuitability(mediaIds, topN) {
+async function loadMediasForScoring(mediaIds) {
   if (!mediaIds.length) return [];
-  const docs = await Media.find({ _id: { $in: mediaIds } })
+  return Media.find({ _id: { $in: mediaIds } })
     .select('_id adSuitability fileType')
     .lean();
-  return docs
-    .sort((a, b) => (b.adSuitability?.score ?? -1) - (a.adSuitability?.score ?? -1))
-    .slice(0, topN);
 }
 
-// Fallback when ProductMatchArtifact.recommendedProducts is empty
-// (older artifacts pre-Phase 1.7b). Pulls the first non-draft sibling
-// CatalogProduct in the same category. Best-effort — returns null when
-// no category is set.
 async function firstCategorySibling(brandId, categoryId) {
   if (!categoryId) return null;
   return CatalogProduct.findOne({
@@ -355,7 +491,7 @@ function dedupeSeeds(seeds) {
   const seen = new Set();
   const out = [];
   for (const s of seeds) {
-    const key = `${s.productId || 'NULL'}|${s.mediaId}`;
+    const key = `${s.productId || 'NULL'}|${s.mediaId}|${s.variantKind}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(s);
@@ -363,4 +499,9 @@ function dedupeSeeds(seeds) {
   return out;
 }
 
-module.exports = { expandWizardJob, SUPPORTED_TEMPLATES };
+module.exports = {
+  expandWizardJob,
+  selectAdsForRun,
+  computeIdentityDigest,
+  SUPPORTED_TEMPLATES
+};
