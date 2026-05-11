@@ -26,7 +26,12 @@ const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 // Default page size + cap. IG Business returns ~25 by default; we ask
 // for 50. Hard cap of 50 per call keeps the foreground request inside
 // a reasonable HTTP timeout (mirroring + upserts are the slow part).
-const DEFAULT_LIMIT = 50;
+// Number of posts to pull per /me/media fetch. Meta's Graph API
+// accepts up to 100 in a single request. Bump POST_FETCH_LIMIT (env)
+// to raise the per-sync ceiling; default 50 keeps existing behavior.
+// True pagination (paging.next) is a follow-up — this just lifts the
+// single-request ceiling.
+const DEFAULT_LIMIT = Math.max(1, Math.min(parseInt(process.env.POST_FETCH_LIMIT, 10) || 50, 100));
 
 const POST_FIELDS = [
   'id', 'media_type', 'media_url', 'thumbnail_url', 'permalink',
@@ -158,7 +163,7 @@ async function capRemaining(advertiserId, cap) {
 }
 
 async function syncPostsForCred(cred, options = {}) {
-  const limit = Math.min(options.limit || DEFAULT_LIMIT, 50);
+  const limit = Math.min(options.limit || DEFAULT_LIMIT, DEFAULT_LIMIT);
   const trigger  = options.trigger || 'instagram-sync';
   const t0 = Date.now();
   if (!cred.igUserId) return { ok: false, reason: `credential ${cred._id} has no igUserId` };

@@ -135,8 +135,19 @@ async function enqueueBrandProductDetects(brandId) {
 
 // Mirror the source URL to Cloudinary (so the source's CDN expiry
 // doesn't break the index later) and create a wrapper Media doc.
-// Returns the new Media or null when mirroring fails.
+// Idempotent: when a Media with the synthetic externalId already
+// exists (re-sync, concurrent enqueue, scheduler-overlap), return
+// the existing doc instead of E11000-ing on the (source, externalId)
+// unique index.
 async function materializeImage({ sourceUrl, product, imageRole }) {
+  const externalId = `cp_${product._id}_${imageRole}_${hashShort(sourceUrl)}`;
+
+  // Fast path — if the Media doc already exists, skip the Cloudinary
+  // mirror (expensive) and return it. The mirror is best-effort
+  // anyway; a prior successful pass already paid for it.
+  const existing = await Media.findOne({ source: 'catalog-product', externalId });
+  if (existing) return existing;
+
   let mirroredUrl;
   try {
     const result = await uploadUrlToCloudinary(sourceUrl, {
@@ -151,26 +162,30 @@ async function materializeImage({ sourceUrl, product, imageRole }) {
     mirroredUrl = sourceUrl;
   }
 
-  // Synthetic externalId — combine the catalog product id with the
-  // role + URL hash so the (source, externalId) unique index doesn't
-  // collide if a SKU shares an image with another SKU.
-  const externalId = `cp_${product._id}_${imageRole}_${hashShort(sourceUrl)}`;
-
-  return Media.create({
-    advertiserId: product.advertiserId,
-    brandId:      product.brandId,
-    source:       'catalog-product',
-    externalId,
-    fileType:     'image',
-    fileUrl:      mirroredUrl,
-    metadata: {
-      catalogProductId: product._id,
-      imageRole,                              // 'hero' | 'alt'
-      brand:            product.brand || null,
-      category:         product.category || null,
-      productTitle:     product.title || null
+  try {
+    return await Media.create({
+      advertiserId: product.advertiserId,
+      brandId:      product.brandId,
+      source:       'catalog-product',
+      externalId,
+      fileType:     'image',
+      fileUrl:      mirroredUrl,
+      metadata: {
+        catalogProductId: product._id,
+        imageRole,                              // 'hero' | 'alt'
+        brand:            product.brand || null,
+        category:         product.category || null,
+        productTitle:     product.title || null
+      }
+    });
+  } catch (err) {
+    // Lost the race to a concurrent caller — the Media doc was
+    // inserted between our findOne and create. Re-fetch and return.
+    if (err.code === 11000) {
+      return await Media.findOne({ source: 'catalog-product', externalId });
     }
-  });
+    throw err;
+  }
 }
 
 function hashShort(s) {
