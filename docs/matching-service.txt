@@ -1,0 +1,324 @@
+MATCHING SERVICE — END-TO-END
+============================================
+
+Purpose
+-------
+Decide what product (if any) a Media represents, with enough confidence
+and provenance for downstream ad generation to attribute the creative
+to the right SKU. Runs as the critical-path final stage of detect (after
+YOLO + identify + smart-crops + judge).
+
+Code home: server/services/productMatchService.js
+Entry from detect: pipelines/detect.js → runProductMatchChain →
+                    findPerProductMatches
+
+
+High-level flow
+---------------
+The match service is per-refined-product. Each surviving YOLO detection
+(after Phase 1.5c dual-engine identify + Phase 1.6 refineDetectionCrops)
+arrives with:
+
+  - refined.croppedImageUrl   tight Cloudinary crop of just this product
+  - refined.label             reconciled product name
+  - refined.category          reconciled category
+  - refined.brand             reconciled brand
+  - refined.confidence        post-reconciliation confidence
+
+For each refined product, the service runs:
+
+  1. Brand-safety pre-check (short-circuit)
+  2. Catalog-first matching      text scorer  +  visual scorer
+  3. Per-product providers       (only when catalog miss)
+  4. Per-product reasoner        (decides outcome from provider output)
+  5. Decision-tree outcome assignment
+  6. ProductMatchArtifact.create — one per refined product
+
+A scene-level legacy path (findProductMatches) handles the case where
+no refinedProducts exist (typically video where refinement was skipped).
+
+
+Stage 1 — Brand-safety pre-check
+--------------------------------
+Loads brand.safetyConfig.blockedTopics. Evaluates the post's text-bearing
+signals (caption + OCR + comments) against the topic list. If any topic
+hits, returns a 'do_not_use' shaped result that hard-stops downstream
+creative assembly.
+
+Code: productMatchService.js → loadBrandSafety, evaluatePostSafety,
+      buildBrandSafetyBlockResult
+
+
+Stage 2 — Catalog-first (per refined product)
+---------------------------------------------
+catalogFirstMatchOneRefined(refined, { brandId, caption, textDetected, comments })
+
+Text side — findCatalogMatchByText(brandId, refined.category, caption,
+                                    textDetected, comments, topK: 3)
+  Pulls top-3 catalog candidates ranked by text similarity over
+  candidate.title, candidate.tags, captions, OCR, comments. Each
+  candidate carries a textScore 0..1.
+
+Visual side — compareUgcCropToCatalogProduct(refined.croppedImageUrl,
+                                              candidate.product)
+  For each text candidate, compares the UGC refined crop against EVERY
+  visual representation of the candidate catalog product:
+    a. product.imageUrl                   — canonical hero URL
+    b. All per-image refined YOLO crops persisted by the catalog-product
+       detect pipeline (one per catalog Media for that SKU; gathered by
+       loadCatalogRefinedCropUrls). Top-1 highest-confidence crop per
+       catalog Media.
+  Calls visualCatalogMatch.compareCropToCandidate against each target
+  in parallel, picks the best { isMatch, score, matchedAgainst }.
+  Falls back to imageUrl-only when no refined crops are persisted yet
+  (early ingest / YOLO failure on the catalog image).
+
+Visual gate — visualCatalogMatch (services/visualCatalogMatchService.js)
+  Gemini Vision call. Prompt: "decide whether the candidate shows the
+  SAME specific SKU as the target — same brand line, same color/
+  pattern, same size/cut/style. Variations within the same product
+  family that are clearly different SKUs (e.g. different colorways)
+  should be marked NOT a match." Returns
+  { isMatch: bool, score: 0..1, reasoning: string }.
+
+Combined score for the candidate:
+  combined = max(textScore, visualScore)
+
+Best candidate across the top-3 (highest combined) is selected. If
+combined >= 0.80, this refined product is a catalog winner and the
+providers stage is SKIPPED.
+
+
+Stage 3 — Per-product providers (catalog miss path)
+---------------------------------------------------
+Runs only when catalog-first didn't win at >= 0.80 for this refined
+product. Seeds providers with refined.croppedImageUrl + refined.label
+(NOT scene-level primarySubject — this avoids "Man wearing fishing
+apparel on boat" leaking into per-product queries).
+
+Providers (parallel):
+  - Gemini grounded search (services/providers/geminiProvider.js)
+  - Google Lens                 (services/providers/lensProvider.js)
+  - more registerable via providers/<name>.js
+
+Each provider returns:
+  - matches[]    candidate product listings with URLs + metadata
+  - errors[]     non-fatal per-provider failures
+  - elapsed_ms   timing
+
+Code: runPerProductProviders(rp, args) → reconciled into provResult
+
+
+Stage 4 — Per-product reasoner
+------------------------------
+runPerProductReasoner(provResult, rp, args) — Gemini call that takes
+the provider output + the refined product context and emits a single
+identification:
+  { productName, productUrl, brand, certainty, reasoning }
+
+When providers produced nothing usable, the reasoner returns null and
+this refined product becomes 'no_products' on the outcome dial.
+
+
+Stage 5 — Decision-tree outcome assignment
+------------------------------------------
+Per refined product, the outcome is one of:
+
+  product_match       Catalog winner OR reasoner produced a confident
+                      identification that maps to an existing
+                      CatalogProduct row. catalogProductId is set.
+
+  product_category    Reasoner produced an identification but it
+                      doesn't map to a catalog row (the brand sells
+                      something LIKE this but not this exact SKU).
+                      categoryId is set; recommendedProducts[] is
+                      populated with sibling SKUs in the same category.
+
+  brand_match         No useful product identification but the post
+                      is clearly brand content (caption / hashtags /
+                      visual brand cues). Treated as brand content
+                      downstream; brand-level reviews substitute for
+                      product reviews.
+
+  no_products         Nothing identifiable. Defaults applied.
+
+  do_not_use          Brand-safety block (Stage 1) OR multi-brand
+                      contention (post features competing brands).
+
+Decision tree (top-down, first match wins):
+  1. brand-safety block            → do_not_use
+  2. multi-brand contention         → do_not_use
+  3. no signal anywhere             → brand_match (preferred) or no_products
+  4. catalog winner (combined>=0.8) → product_match (catalogProductId set)
+  5. reasoner found exact SKU       → product_match (catalogProductId set)
+  6. reasoner found category sibling→ product_category
+  7. low confidence everywhere      → category lookup or brand_match
+
+
+Stage 6 — Per-product persistence
+---------------------------------
+One ProductMatchArtifact.create per refined product. Each doc carries:
+  - mediaId, runId, brandId, advertiserId
+  - productIndex          ordinal within the run
+  - outcome               from the decision tree
+  - winner                'catalog' | 'reasoner' | 'brand' | null
+  - identification        { label, brand, category, productName,
+                            productUrl, certainty }
+  - catalogProductId      FK when product_match
+  - categoryId            FK when product_category
+  - catalogMatch          { textScore, visualScore, combinedScore }
+  - catalogCombinedScore  flat field for sorting
+  - enrichmentTiers       provider evidence
+  - recommendedProducts[] sibling SKUs (product_category path)
+
+After all per-product docs are persisted:
+
+pickPrimaryDoc(matchDocs, productMatches.matches)
+  Selects the run's "primary" match — catalog winners outrank
+  reasoner picks; ties broken by combined score, then certainty.
+  Written to Media.latestArtifacts.match (singular, back-compat).
+  All match docs land in Media.latestArtifacts.matches[] (plural).
+
+Media-level denormalization (Phase 2d):
+  matchedProducts[]    per-product { refinedProductId, catalogProductId,
+                                     matchKind, outcome, confidence,
+                                     matchEvidenceArtifactId }
+  matchedCategories[]  per-category { categoryId, refinedProductId,
+                                      confidence, matchEvidenceArtifactId }
+
+CatalogProduct-side mirror (2026-05-11):
+  matchedMedia[]       per-media { mediaId, matchTier, confidence,
+                                   refinedProductId,
+                                   matchEvidenceArtifactId, matchedAt }
+  matchTier values:
+    product_match     — Media's PMA pointed exactly at this product
+    product_category  — this product was in the PMA's recommendedProducts[]
+  brand_match is NOT mirrored here — it isn't per-product (would require
+  writing every brand_match media to every product in the brand).
+  brand-tier seeds remain a PMA query at wizard expansion time.
+
+  Write path: detect's mirrorMatchesToCatalogProducts(mediaId,
+  matchedProducts) runs after media.save(). Groups entries by
+  catalogProductId, then bulkWrites a pull-current-then-push-new
+  sweep per product so re-runs of the same Media replace prior
+  entries rather than accumulating duplicates.
+
+  Index: CatalogProduct.matchedMedia.mediaId — drives the wizard's
+  seedsFromProduct read and any future "what products did this media
+  match?" reverse-lookup queries.
+
+Run-scoped summary (Phase 0b):
+  Media.classification.detectSummary = {
+    outcome, matchedProducts, matchedCategories, detectedAt
+  }
+
+
+Scene-level fallback (legacy)
+-----------------------------
+findProductMatches(args) — the pre-Phase-1.7 single-match scene-level
+path. Runs only when refinedProducts.length === 0 (no YOLO survivors
+or refinement was disabled, e.g. on videos before the hero-frame
+landing). Uses scene-level primarySubject + source image URL as the
+provider query seed. Reasoner produces one identification for the
+whole Media.
+
+Worth knowing: this path can't leverage the catalog-side refined crop
+comparison (it has no per-product UGC crop to compare). It falls back
+to scene-level visual against catalog hero imageUrls only.
+
+
+Cost & latency
+--------------
+Per refined product (catalog winner path):
+  ~3 text-scorer Mongo queries (cheap)
+  ~3 × N visual Gemini calls (N = catalog imagery per candidate,
+    typically 1 hero + 1-3 alt refined crops = 4-12 Gemini calls)
+  Cost ~$0.005-0.02
+  Latency ~2-6s
+
+Per refined product (catalog miss path):
+  All of the above
+  + Per-product Gemini grounded search call (~2-5s, ~$0.005)
+  + Per-product Google Lens call (~3-8s, ~$0.005-0.02)
+  + Per-product reasoner Gemini call (~3-6s, ~$0.005)
+  Cost ~$0.02-0.05
+  Latency ~10-25s
+
+Per Media end-to-end (assuming 3 refined products, mixed paths):
+  Cost ~$0.05-0.15
+  Latency ~15-45s
+
+Catalog-first is the cost optimization: hitting at >= 0.80 combined
+SKIPS the providers entirely. Per-product visual coverage (multi-image
+comparison from the catalog detect pipeline) was added 2026-05-11
+specifically to raise the catalog-first hit rate on lifestyle hero
+shots where text-only matching is noisy.
+
+
+Downstream — wizard seed builders
+---------------------------------
+The Generate Ads wizard's seed builders (campaignAdsGenerationService.js)
+read the denormalizations directly — no PMA lookup at expansion time
+for the per-product tiers:
+
+  seedsFromMedia(brandId, mediaId)
+    Reads Media.matchedProducts[]. Emits ONE seed per matched product
+    (across all per-product tiers — product_match + product_category).
+    A picture matched against 3 different SKUs produces 3 seeds, each
+    becoming its own ad combinations downstream. Falls back to a
+    single brand_match seed (productId:null) only when matchedProducts
+    is empty.
+
+  seedsFromProduct(brandId, productId)
+    Reads CatalogProduct.matchedMedia[] for product_match +
+    product_category tiers (one doc read, no PMA query). brand_match
+    tier stays a PMA query (not denormalized — see CatalogProduct
+    mirror section above). Plus one product_image seed using the
+    catalog hero Media doc as the visual slot.
+
+Pre-2026-05-11, seedsFromMedia consulted only the LATEST PMA for a
+media. With multiple refined-product matches per Media common (one
+IG post → shirt + hat + shoes), this dropped all but the most recent
+product from the seed list. The denormalization closes that gap.
+
+
+Recent architectural changes worth knowing
+------------------------------------------
+2026-05-11 — bidirectional Media↔CatalogProduct denormalization.
+             CatalogProduct.matchedMedia[] added as a mirror of
+             Media.matchedProducts. detect.mirrorMatchesToCatalogProducts
+             writes both sides on every successful match.
+             seedsFromMedia + seedsFromProduct rewritten to read the
+             denormalizations instead of querying PMAs. Closes the
+             "only latest match becomes a seed" gap.
+
+2026-05-11 — catalog-product detect pipeline expanded to run full vision
+             stack (YOLO + subjects/text + overlay zones + brightness).
+             Each catalog product image now produces refined YOLO crops
+             that match service can compare against.
+
+2026-05-11 — visualCatalogMatch caller (catalogFirstMatchOneRefined)
+             expanded from imageUrl-only to multi-image comparison.
+             Helper loadCatalogRefinedCropUrls(catalogProductId) gathers
+             refined crops from all catalog-product Media for the SKU.
+             Cost: 4× Gemini visual calls per text candidate (was 1×).
+
+2026-05-09 — brand-safety pre-check moved before any matcher work.
+             Saves provider cost on posts that would be blocked anyway.
+
+Phase 1.7  — per-refined-product catalog matching introduced. Before
+             this, the entire scene was one match attempt against the
+             catalog. Now each YOLO detection has its own catalog hunt.
+
+
+Key paths to read for deeper understanding
+------------------------------------------
+server/services/productMatchService.js          ← orchestrator
+server/services/visualCatalogMatchService.js    ← Gemini visual gate
+server/services/enrichmentReconciler.js         ← Phase 1.5c reconciler
+server/services/cropRefineService.js            ← Phase 1.6 refinement
+server/services/providers/                       ← Gemini, Lens providers
+server/services/productReasoner.js              ← per-product reasoner
+server/models/ProductMatchArtifact.js           ← per-match doc shape
+server/pipelines/detect.js → runProductMatchChain
+server/pipelines/detect.js → runCatalogProductPipeline

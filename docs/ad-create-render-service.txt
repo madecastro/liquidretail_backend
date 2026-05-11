@@ -1,0 +1,397 @@
+AD CREATE & RENDER SERVICE — END-TO-END
+============================================
+
+Purpose
+-------
+Turn operator selections from the Generate Ads wizard into a queue of
+viable ad combinations, then drain that queue through Puppeteer into
+rendered creatives on Cloudinary. Queue-first architecture: every
+combination is persisted up front; render is a separate selection
+pass that drains the inventory.
+
+Architecture shift landed 2026-05-11. Previous model built an
+in-memory cartesian, sliced to a cap, dropped the rest. New model
+persists everything and renders the top N per run.
+
+
+High-level flow
+---------------
+POST /api/ads/generate
+  ↓
+1. expandWizardJob     — seeds × templates × ratios × variants → bulk
+                         insertMany of Ad docs with status='queued'
+  ↓
+2. selectAdsForRun     — pick top N queued by readinessScore desc
+  ↓
+3. mark rendering      — selected Ads flipped to status='rendering',
+                         campaignRunId stamped
+  ↓
+4. CampaignRun.create  — batch tracker doc
+  ↓
+5. 202 response        — frontend redirects, starts polling
+  ↓
+6. runRenderLoop       — setImmediate; concurrency-bounded dispatch
+   ↓
+   renderOne(adId) for each picked Ad:
+     ↓
+     renderCreative(req)   — derive → validate → render → upload → persist
+       success: Ad → status='draft' + render output backfilled
+       failure: Ad → status='failed' + renderError diagnostics
+
+
+Stage 1 — expandWizardJob (services/campaignAdsGenerationService.js)
+--------------------------------------------------------------------
+Inputs:
+  campaignId, productIds[], mediaIds[], templateIds[], cta, urlParams,
+  requestedBy
+
+Seed expansion rules (per operator pick):
+
+  1. No picks (brand-only):
+     → top BRAND_ONLY_MEDIA_LIMIT (25) brand_match media for the
+       brand, ranked by adSuitability. Emit ugc seeds with
+       productId:null and matchTier='brand_only'.
+
+  2. mediaIds (library entry — operator picked a specific Media):
+     → Read Media.matchedProducts[] directly. Emit ONE ugc seed
+       per matched product (across all per-product tiers).
+
+         matched product (outcome=product_match)
+            → ugc seed, productId=catalogProductId,
+              matchTier='product_match'
+         matched product (outcome=product_category)
+            → ugc seed, productId=catalogProductId,
+              matchTier='product_category'
+         no matches OR all matches missing catalogProductId
+            → 1 brand_match seed, productId:null
+
+     Pre-2026-05-11 this consulted only the LATEST PMA for the
+     media. With multiple refined-product matches per Media common
+     (one IG post → shirt + hat + shoes), this dropped all but the
+     most recent. The denormalized Media.matchedProducts read
+     emits every match as its own seed.
+
+  3. productIds (catalog entry — operator picked a product):
+     → Read CatalogProduct.matchedMedia[] for the per-product tiers
+       (product_match + product_category):
+
+         CatalogProduct.matchedMedia
+            → ugc seed per entry, matchTier from the array
+
+     → Union in ALL brand_match media for the brand (queried from
+       ProductMatchArtifact — not denormalized on CatalogProduct
+       since brand_match isn't per-product):
+
+         brand_match PMAs for brandId
+            → ugc seed with productId tagged, matchTier='brand_match'
+
+     → PLUS ONE product_image seed per product —
+       uses the catalog product's hero Media doc as the visual slot,
+       variantKind='product_image', matchTier='product_match' (the
+       product IS the SKU here)
+
+  4. Both productIds + mediaIds: union, then dedupeSeeds by
+     (productId|null, mediaId, variantKind).
+
+Cartesian expansion:
+  for each seed:
+    for each (template, aspectRatio) cell in
+        allowedTemplates × intersect(template.ratios, SHIPPING_RATIOS):
+      payload = {
+        brandId, campaignId, mediaId, productId,
+        template, aspectRatio, campaignKind,
+        matchTier, variantKind,
+        readinessScore: computed (see below),
+        status: 'queued',
+        identityDigest: sha256(canonical-form identity),
+        cta*, queuedAt, generatedAt
+      }
+      payloads.push(payload)
+
+  SHIPPING_RATIOS = { '1:1', '9:16', '16:9' }   — V1 only
+
+Bulk insert:
+  Ad.insertMany(payloads, { ordered: false })
+
+  { ordered: false } means dup-key errors on the
+  (campaignId, identityDigest) unique index don't abort the batch.
+  Idempotent: re-running with the same picks queues only new combos.
+
+Readiness score computation:
+  TIER_WEIGHTS = {
+    product_match:    1.0,
+    product_category: 0.8,
+    brand_match:      0.6,
+    brand_only:       0.5
+  }
+
+  variantKind='product_image':
+    score = tierWeight × 0.7  (constant — catalog hero quality)
+
+  variantKind='ugc', fileType='image':
+    score = tierWeight × (Media.adSuitability.score ?? 0.5)
+
+  variantKind='ugc', fileType='video':
+    score = null
+    (videos are consistently subpar for static ad output; nulls sort
+     LAST in the selection query so videos are never picked unless
+     every image-tier ad has been rendered first)
+
+Returns:
+  {
+    campaignId, brandId, campaignKind,
+    queuedCount,    — total Ad{status:'queued'} for the campaign
+    newlyQueued,    — inserted in this call
+    alreadyQueued,  — combos already in the queue (insert no-op)
+    newAdIds        — ObjectIds of the docs just inserted
+  }
+
+
+Stage 2 — selectAdsForRun
+-------------------------
+Inputs:  { campaignId, limit }
+Output:  Ad IDs (strings) to render this batch
+
+Query:
+  Ad.find({ campaignId, status: 'queued' })
+    .sort({ readinessScore: -1, queuedAt: 1 })
+    .limit(limit)
+
+readinessScore: -1 puts null videos last automatically (Mongo desc
+sort).
+queuedAt: 1 as secondary key gives FIFO among equal-readiness ads.
+
+MAX_CREATIVES_PER_RUN (env, default 6) is the limit. Bounded because
+Puppeteer + Cloudinary OOMs Chromium past ~2 in-flight; six is
+"two templates × three ratios for one seed" baseline.
+
+Multiple runs of the same campaign DON'T re-queue ads — selection
+just keeps draining the existing queue.
+
+
+Stage 3 — Mark selected Ads as rendering
+----------------------------------------
+Ad.updateMany(
+  { _id: { $in: adIds } },
+  { $set: { campaignRunId: runId, status: 'rendering' } }
+)
+
+Up-front so a server restart leaves the docs in a recognizable
+in-flight state (operator can see "rendering" on the Ads page)
+rather than orphaned-but-queued.
+
+
+Stage 4 — CampaignRun
+---------------------
+A batch tracker doc, models/CampaignRun.js:
+  runId, brandId, campaignId, campaignKind,
+  total, succeeded, skipped, failed,
+  status: 'running' | 'done' | 'failed',
+  errors: [{ index, stage, template, aspectRatio, mediaId, productId, message }],
+  startedAt, completedAt
+
+Used by GET /api/ads/runs/:runId for polling progress from the
+frontend after the 202.
+
+
+Stage 5 — runRenderLoop (routes/ads.js)
+---------------------------------------
+fire-and-forget after the 202 flushes. Iterates picked Ad IDs with
+RENDER_CONCURRENCY (env, default 2) in flight. Each Ad goes through
+renderOne(run, job, adId, index, renderToken).
+
+renderOne flow:
+  1. Fetch Ad doc by adId.
+  2. Shape into the creative descriptor renderService expects.
+  3. Call renderCreative({adId, campaignId, campaignRunId, brandId,
+                          campaignKind, creative, cta, authToken}).
+  4. On 'success' → CampaignRun.succeeded++
+  5. On 'skipped' → CampaignRun.skipped++ (template validation failed)
+  6. On 'failed' → CampaignRun.failed++ + push to errors[]
+                  + Ad.updateOne(status='failed', renderError stamped,
+                                  renderAttempts++)
+  7. On crash → same as failed with stage='crash'
+
+When the queue drains, CampaignRun.status → 'done'.
+
+
+Stage 6 — renderCreative (services/renderService.js)
+----------------------------------------------------
+Five-stage pipeline. Each stage labels its errors so CampaignRun.errors[]
+records which step failed.
+
+  derive   → buildLayoutInput(mediaId, template, aspectRatio, options)
+             Re-uses cached LayoutInputArtifact when schemaVersion
+             matches; otherwise runs Gemini-backed copy derivation +
+             slot resolution. options threads campaignKind + cta so
+             the prompt flips to brand-mode copy or composes the
+             right CTA imperative.
+
+  validate → templateRegistry.validateInputAgainstTemplate(input, template)
+             Pre-flight check against the template's normalized
+             required_all_of / required_any_of / minCount rules.
+             Failures return status:'skipped' (doesn't count as
+             render failure — the inputs just couldn't satisfy the
+             template).
+
+  render   → renderStage({ layoutInputArtifactId, template, ratio,
+                            mediaId, brandId, authToken, renderMode })
+             Spins up Puppeteer, navigates to
+             FRONTEND_URL/ads.html?...&renderMode=1 (with the auth
+             token in cookie/URL so requireAuth resolves req.user),
+             waits for window.__tpRenderReady === true, screenshots
+             #tpStage. renderMode 'video-overlay' produces a
+             transparent-slot overlay PNG; 'static' produces the full
+             rendered image.
+
+  upload   → uploadStage(renderOutput, ctx)
+             Cloudinary upload, folder ads/{brandId}/{campaignId}.
+             publicId: {ratio}-{template}-{shortMedia}-{shortIdentityDigest}
+             (deterministic; overwrite=true so the same identityDigest
+             always overwrites the prior asset).
+             Returns { renderUrl, cloudinaryPublicId, width, height,
+                      bytes, durationMs, posterUrl? }.
+
+  composeVideoOutput (video branch only):
+             Chains Cloudinary transforms to overlay the PNG on the
+             cropped source video. Builds the slot-aware c_crop URL
+             via buildVideoCompositeUrl (services/videoCompositeService.js).
+             Failure falls through to the static PNG.
+
+  persist  → Ad.findByIdAndUpdate(adId, {
+               renderUrl, posterUrl, cloudinaryPublicId,
+               width, height, bytes, durationMs,
+               kind, copy: extractCopySnapshot(input),
+               status: 'draft',
+               renderedAt: new Date()
+             }, { $inc: { renderAttempts: 1 } })
+             Same doc that was queued — updates in place. The Ad's
+             identity fields (campaignId, mediaId, productId, template,
+             aspectRatio, matchTier, variantKind, identityDigest) stay
+             as they were at queue time.
+
+Total per render: ~3-15s (derive 1-5s, render 2-8s, upload 1-3s,
+                          persist <100ms)
+
+
+Ad lifecycle states
+-------------------
+queued     created by expandWizardJob; no render output; awaiting selection
+rendering  selected by selectAdsForRun; Puppeteer in flight
+draft      render succeeded; default ready-to-publish state
+live       operator promoted via PATCH /api/ads/:id (status='live')
+archived   operator soft-deleted via PATCH (status='archived')
+failed     render failed; renderError on doc; no auto-retry
+
+Operators only drive draft → live → archived (and back). The pipeline
+manages queued / rendering / failed automatically.
+
+
+Identity digest (queue-time dedup)
+----------------------------------
+identityDigest = sha256(JSON.stringify({
+  campaignId, productId, mediaId, template, aspectRatio,
+  variantKind, ctaText, ctaUrl, ctaUrlParams
+}))
+
+Computed in computeIdentityDigest (campaignAdsGenerationService.js).
+Unique index on Ad: { campaignId: 1, identityDigest: 1 } unique.
+
+  Same identity in the same campaign = same digest = unique-index
+  rejects the duplicate insert.
+  Different campaigns can have the same combo (intentional — separate
+  operator action).
+
+Removed the render-time derivationDigest dedup (it was based on
+resolved copy and ran on every render). Identity-based queue-time
+dedup is cheaper and earlier.
+
+
+Cloudinary asset path
+---------------------
+folder:    ads/{brandId}/{campaignId}{isOverlay ? '/overlay' : ''}
+publicId:  {ratio}-{template}-{shortMedia}-{shortDigest}{overlaySuffix}
+
+  shortMedia  = String(mediaId).slice(-8)
+  shortDigest = identityDigest.slice(0, 8)
+  overlaySuffix = '-overlay' for the transparent video overlay PNG
+
+overwrite: true — same identityDigest always lands at the same publicId,
+so a re-render replaces (no orphans).
+
+
+Endpoints
+---------
+POST   /api/ads/generate                  start a run
+GET    /api/ads/runs/:runId               poll batch progress
+GET    /api/ads                            list ads (filter by status,
+                                           campaignId, template, ratio)
+GET    /api/ads/:id                        full doc for detail modal
+PATCH  /api/ads/:id                        status: draft|live|archived
+DELETE /api/ads/:id                        remove + best-effort
+                                           Cloudinary destroy
+POST   /api/ads/preview-video-composite   diagnostic: build a video
+                                           composite URL without
+                                           rendering
+
+
+Operational limits
+------------------
+RENDER_CONCURRENCY        env, default 2    in-flight Puppeteer renders
+MAX_CREATIVES_PER_RUN     env, default 6    cap per CampaignRun
+SHIPPING_RATIOS           hardcoded         1:1, 9:16, 16:9
+SUPPORTED_TEMPLATES       hardcoded         testimonial_spotlight,
+                                            ugc_split_screen,
+                                            testimonial_overlay,
+                                            product_overlay
+BRAND_ONLY_MEDIA_LIMIT    25                brand-only seed pool
+
+Raising MAX_CREATIVES_PER_RUN: each run drains more queued ads but
+takes proportionally longer. Bottleneck is Chromium memory at 2-3
+parallel; bumping concurrency without bumping the Render instance
+size will OOM.
+
+
+Known gaps / things that will fail today
+----------------------------------------
+1. variantKind='product_image' ads queue but render fails. Templates
+   currently expect UGC-shaped media slots; catalog hero media doesn't
+   produce the same content (no creator handle, no caption, etc.).
+   Template-side support for product_image is next on the roadmap.
+
+2. Videos rarely render because readinessScore=null sorts them last.
+   Drain images first; if you want a video, manually pick one via
+   the Media Library's deep-link.
+
+3. No "render more from this campaign" UI button. Workaround: hit
+   Generate Ads again with the same picks — expandWizardJob is
+   idempotent (unique index swallows dups), then selectAdsForRun
+   picks the next-best queued ads.
+
+4. Failed ads have no retry UI. Workaround: delete the failed ad,
+   re-queue via Generate Ads. The unique index makes this clean.
+
+5. CampaignRun.errors[] caps errors per run. Failed Ads also carry
+   their own renderError so diagnostics survive on the doc.
+
+
+Key paths to read for deeper understanding
+------------------------------------------
+server/models/Ad.js                            ← schema + indexes
+server/models/CampaignRun.js                   ← batch tracker
+server/services/campaignAdsGenerationService.js
+  expandWizardJob               ← queue builder
+  selectAdsForRun               ← selection by readiness
+  computeIdentityDigest         ← dedup key
+  seedFromBrandOnly / seedsFromMedia / seedsFromProduct
+server/services/renderService.js
+  renderCreative                ← 5-stage pipeline
+  persistStage                  ← Ad update-in-place
+  renderStage                   ← Puppeteer
+  uploadStage                   ← Cloudinary
+  composeVideoOutput            ← video composite URL builder
+server/services/videoCompositeService.js       ← Cloudinary video URL
+server/routes/ads.js
+  POST /generate                ← orchestration
+  runRenderLoop / renderOne     ← background loop
+  projectAd                     ← API response shape
