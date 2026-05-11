@@ -61,6 +61,7 @@ const CropArtifact        = require('../models/CropArtifact');
 const ExtendedCropArtifact = require('../models/ExtendedCropArtifact');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact  = require('../models/OverlayZoneArtifact');
+const CatalogProduct       = require('../models/CatalogProduct');
 const Comment              = require('../models/Comment');
 
 const { downloadBuffer } = require('./shared');
@@ -843,7 +844,59 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
   }
   try { await media.save(); } catch (err) { console.warn(`   ⚠️  failed to persist Media match denormalization: ${err.message}`); }
 
+  // Bidirectional denormalization — mirror matchedProducts onto each
+  // CatalogProduct.matchedMedia so seedsFromProduct can iterate without
+  // querying ProductMatchArtifact. Re-runs replace prior entries for
+  // this Media (pull-then-push pattern) so the array doesn't accumulate
+  // duplicates across DetectRuns.
+  await mirrorMatchesToCatalogProducts(media._id, matchedProducts);
+
   return { productMatches, matchDoc: primaryDoc, matchDocs };
+}
+
+// Group matchedProducts by catalogProductId and bulkWrite a
+// pull-current-then-push-new sweep per product. Idempotent: re-running
+// detect for the same Media replaces the prior entries rather than
+// accumulating duplicates.
+async function mirrorMatchesToCatalogProducts(mediaId, matchedProducts) {
+  const byCatalogProduct = new Map();
+  for (const mp of matchedProducts) {
+    if (!mp.catalogProductId) continue;
+    const cpId = String(mp.catalogProductId);
+    const tier = mp.outcome === 'product_match' ? 'product_match' : 'product_category';
+    const entry = {
+      mediaId,
+      matchTier:               tier,
+      confidence:              mp.confidence,
+      refinedProductId:        mp.refinedProductId,
+      matchEvidenceArtifactId: mp.matchEvidenceArtifactId,
+      matchedAt:               new Date()
+    };
+    if (!byCatalogProduct.has(cpId)) byCatalogProduct.set(cpId, []);
+    byCatalogProduct.get(cpId).push(entry);
+  }
+  if (!byCatalogProduct.size) return;
+
+  const bulkOps = [];
+  for (const [cpId, entries] of byCatalogProduct.entries()) {
+    bulkOps.push({
+      updateOne: {
+        filter: { _id: cpId },
+        update: { $pull: { matchedMedia: { mediaId } } }
+      }
+    });
+    bulkOps.push({
+      updateOne: {
+        filter: { _id: cpId },
+        update: { $push: { matchedMedia: { $each: entries } } }
+      }
+    });
+  }
+  try {
+    await CatalogProduct.bulkWrite(bulkOps, { ordered: true });
+  } catch (err) {
+    console.warn(`   ⚠️  failed to mirror matches to CatalogProduct.matchedMedia: ${err.message}`);
+  }
 }
 
 function pickPrimaryDoc(docs, matches) {

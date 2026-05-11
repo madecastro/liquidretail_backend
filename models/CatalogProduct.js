@@ -116,6 +116,28 @@ const catalogProductSchema = new mongoose.Schema({
   // service produces a breadcrumb.
   categoryRef: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null, index: true },
 
+  // Bidirectional match denormalization — mirror of Media.matchedProducts.
+  // Populated by detect after each DetectRun completes the match phase.
+  // matchTier:
+  //   product_match     — Media's PMA pointed exactly at this product
+  //   product_category  — this product was in the PMA's recommendedProducts[]
+  // brand_match is NOT mirrored here — it isn't per-product (would require
+  // writing every brand_match media to every product in the brand). Brand-
+  // tier seeds stay a query at expansion time.
+  //
+  // Idempotency: dedup on (mediaId, matchEvidenceArtifactId) at write time
+  // via $pull + $addToSet, so re-running detect for the same media replaces
+  // the prior entry rather than accumulating duplicates.
+  matchedMedia: [{
+    mediaId:                 { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },
+    matchTier:               String,   // 'product_match' | 'product_category'
+    confidence:              Number,
+    refinedProductId:        String,
+    matchEvidenceArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
+    matchedAt:               Date,
+    _id: false
+  }],
+
   firstSeenAt:  { type: Date, default: Date.now },
   lastSyncedAt: { type: Date, default: Date.now }
 });
@@ -126,5 +148,8 @@ catalogProductSchema.index({ brandId: 1, externalId: 1 }, { unique: true });
 catalogProductSchema.index({ brandId: 1, category: 1 });
 // Drafts queue — fast filter for catalog-browser drafts tab.
 catalogProductSchema.index({ brandId: 1, draft: 1 });
+// Inverse-lookup for "what products did this media match" reads —
+// matchedMedia.mediaId is the natural key for the per-product seed pass.
+catalogProductSchema.index({ 'matchedMedia.mediaId': 1 });
 
 module.exports = mongoose.model('CatalogProduct', catalogProductSchema);

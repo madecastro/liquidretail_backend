@@ -309,125 +309,80 @@ async function seedFromBrandOnly(brandId, topN) {
 }
 
 // Media-driven (library entry). Operator picked a specific media —
-// dispatch by its PMA outcome. Emits 0..N seeds (a product_category
-// outcome with multiple recommendedProducts emits one seed per
-// product, all sharing the same mediaId).
+// iterate Media.matchedProducts to emit ONE seed per matched product
+// (across ALL match tiers — not just the latest PMA's product). When
+// the media has no product matches at all (or none with a catalog
+// FK), fall back to a single brand_match seed so the operator's
+// explicit pick still produces an ad.
 async function seedsFromMedia(brandId, mediaId) {
-  const match = await ProductMatchArtifact.findOne({ mediaId })
-    .sort({ createdAt: -1 })
+  const media = await Media.findById(mediaId)
+    .select('matchedProducts adSuitability fileType')
     .lean();
-  const media = await Media.findById(mediaId).select('adSuitability fileType').lean();
   if (!media) return [];
   const fileType = media.fileType;
   const score    = media.adSuitability?.score ?? null;
 
-  const brandFallback = {
-    productId:        null,
+  const productMatches = (media.matchedProducts || []).filter(mp => mp.catalogProductId);
+  if (!productMatches.length) {
+    return [{
+      productId:        null,
+      mediaId:          String(mediaId),
+      matchTier:        'brand_match',
+      variantKind:      'ugc',
+      fileType,
+      suitabilityScore: score
+    }];
+  }
+
+  return productMatches.map(mp => ({
+    productId:        String(mp.catalogProductId),
     mediaId:          String(mediaId),
-    matchTier:        'brand_match',
+    matchTier:        mp.outcome === 'product_match' ? 'product_match' : 'product_category',
     variantKind:      'ugc',
     fileType,
     suitabilityScore: score
-  };
-
-  if (!match) return [brandFallback];
-
-  switch (match.outcome) {
-    case 'product_match':
-      if (!match.catalogProductId) return [brandFallback];
-      return [{
-        productId:        String(match.catalogProductId),
-        mediaId:          String(mediaId),
-        matchTier:        'product_match',
-        variantKind:      'ugc',
-        fileType,
-        suitabilityScore: score
-      }];
-    case 'product_category': {
-      const recs = Array.isArray(match.recommendedProducts) ? match.recommendedProducts : [];
-      if (!recs.length) {
-        const sibling = await firstCategorySibling(brandId, match.categoryId);
-        if (!sibling) return [brandFallback];
-        return [{
-          productId:        String(sibling._id),
-          mediaId:          String(mediaId),
-          matchTier:        'product_category',
-          variantKind:      'ugc',
-          fileType,
-          suitabilityScore: score
-        }];
-      }
-      return recs
-        .map(r => r._id || r.id || r.catalogProductId)
-        .filter(Boolean)
-        .map(pid => ({
-          productId:        String(pid),
-          mediaId:          String(mediaId),
-          matchTier:        'product_category',
-          variantKind:      'ugc',
-          fileType,
-          suitabilityScore: score
-        }));
-    }
-    case 'brand_match':
-      return [brandFallback];
-    default:
-      // 'no_products', 'do_not_use', or unknown — honor the pick as brand content.
-      return [brandFallback];
-  }
+  }));
 }
 
 // Product-driven (catalog entry / wizard Step 2). Operator picked a
-// productId. Gather EVERY matched media across all match tiers PLUS
-// emit one product_image seed for the catalog product's own hero.
+// productId. Pulls every matched media across product_match +
+// product_category tiers from CatalogProduct.matchedMedia[] (the
+// denormalized mirror written by detect), unions in brand_match
+// media for the brand (intentionally NOT denormalized — it isn't
+// per-product), and emits one product_image seed for the catalog
+// product's own hero.
 async function seedsFromProduct(brandId, productId) {
   const seeds = [];
 
-  // Tier 1 — product_match: media whose PMA points directly at this product.
-  const productMatches = await ProductMatchArtifact.find({
-    brandId,
-    catalogProductId: productId,
-    outcome: 'product_match'
-  }).select('mediaId').lean();
-  const productMatchMediaIds = Array.from(new Set(productMatches.map(m => String(m.mediaId))));
-  if (productMatchMediaIds.length) {
-    const medias = await loadMediasForScoring(productMatchMediaIds);
-    for (const m of medias) {
-      seeds.push({
-        productId:        String(productId),
-        mediaId:          String(m._id),
-        matchTier:        'product_match',
-        variantKind:      'ugc',
-        fileType:         m.fileType,
-        suitabilityScore: m.adSuitability?.score ?? null
-      });
-    }
-  }
+  const product = await CatalogProduct.findById(productId)
+    .select('matchedMedia')
+    .lean();
 
-  // Tier 2 — product_category: media whose PMA has this product in
-  // recommendedProducts[]. Mongo array-element match by _id.
-  const categoryMatches = await ProductMatchArtifact.find({
-    brandId,
-    outcome: 'product_category',
-    'recommendedProducts._id': productId
-  }).select('mediaId').lean();
-  const categoryMediaIds = Array.from(new Set(categoryMatches.map(m => String(m.mediaId))));
-  if (categoryMediaIds.length) {
-    const medias = await loadMediasForScoring(categoryMediaIds);
-    for (const m of medias) {
+  // Tiers 1 + 2 — product_match + product_category from the
+  // denormalized mirror. Bulk-load the referenced Media docs so we
+  // can score by adSuitability + grab fileType.
+  if (product?.matchedMedia?.length) {
+    const mediaIds = Array.from(new Set(product.matchedMedia.map(mm => String(mm.mediaId))));
+    const medias = await loadMediasForScoring(mediaIds);
+    const mediaById = new Map(medias.map(m => [String(m._id), m]));
+    for (const mm of product.matchedMedia) {
+      const media = mediaById.get(String(mm.mediaId));
+      if (!media) continue;
       seeds.push({
         productId:        String(productId),
-        mediaId:          String(m._id),
-        matchTier:        'product_category',
+        mediaId:          String(mm.mediaId),
+        matchTier:        mm.matchTier,
         variantKind:      'ugc',
-        fileType:         m.fileType,
-        suitabilityScore: m.adSuitability?.score ?? null
+        fileType:         media.fileType,
+        suitabilityScore: media.adSuitability?.score ?? null
       });
     }
   }
 
   // Tier 3 — brand_match fallback: tag the productId onto brand media
-  // so the ad is still attributed to the product for CTA/tracking.
+  // so the ad is still attributed for CTA/tracking. Not denormalized
+  // on CatalogProduct (would require writing every brand_match media
+  // to every product in the brand), so this stays a PMA query.
   const brandMatches = await ProductMatchArtifact.find({
     brandId,
     outcome: 'brand_match'
@@ -448,8 +403,7 @@ async function seedsFromProduct(brandId, productId) {
   }
 
   // Tier 0 — product_image: use the catalog product's hero Media as
-  // the visual slot. Find the catalog-product Media doc tied to this
-  // CatalogProduct (imageRole='hero', source='catalog-product').
+  // the visual slot.
   const heroMedia = await Media.findOne({
     source: 'catalog-product',
     'metadata.catalogProductId': productId,
@@ -476,15 +430,6 @@ async function loadMediasForScoring(mediaIds) {
   return Media.find({ _id: { $in: mediaIds } })
     .select('_id adSuitability fileType')
     .lean();
-}
-
-async function firstCategorySibling(brandId, categoryId) {
-  if (!categoryId) return null;
-  return CatalogProduct.findOne({
-    brandId,
-    categoryRef: categoryId,
-    draft: { $ne: true }
-  }).select('_id title imageUrl').lean();
 }
 
 function dedupeSeeds(seeds) {
