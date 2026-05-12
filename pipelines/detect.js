@@ -916,7 +916,25 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
     media.classification = media.classification || {};
     media.classification.detectSummary = productMatches.detectSummary;
   }
-  try { await media.save(); } catch (err) { console.warn(`   ⚠️  failed to persist Media match denormalization: ${err.message}`); }
+  // updateOne, not save() — Mongoose's dirty-field tracker still has
+  // the earlier denorm assignments (subjects/text/refinedProducts)
+  // flagged as modified, so a save() here would re-run those with a
+  // stale __v and trip "No matching document found". updateOne writes
+  // exactly the match-denorm fields and skips the version check.
+  try {
+    await Media.updateOne(
+      { _id: media._id },
+      { $set: {
+          matchedProducts,
+          matchedCategories,
+          ...(productMatches?.detectSummary
+              ? { 'classification.detectSummary': productMatches.detectSummary }
+              : {})
+      } }
+    );
+  } catch (err) {
+    console.warn(`   ⚠️  failed to persist Media match denormalization: ${err.message}`);
+  }
 
   // Bidirectional denormalization — mirror matchedProducts onto each
   // CatalogProduct.matchedMedia so seedsFromProduct can iterate without
@@ -1277,13 +1295,14 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
     const brightnessAvg = averageGrid(overlayZones?.brightnessGrid);
     const densityAvg    = averageGrid(overlayZones?.densityGrid);
 
-    media.technicalInsights = {
+    const technicalInsights = {
       brightnessAvg: brightnessAvg ?? null,
       densityAvg:    densityAvg    ?? null,
       focusScore:    focus?.focusScore ?? null,
       focusBucket:   focus?.focusBucket || null,
       updatedAt:     new Date()
     };
+    media.technicalInsights = technicalInsights;
 
     // 3. Ad readiness — composite score + reason bullets
     const detectSummaryOutcome = media.classification?.detectSummary?.outcome || null;
@@ -1297,14 +1316,21 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
       detectSummaryOutcome,
       primarySubjectRectPct
     });
-    media.adSuitability = {
+    const adSuitability = {
       score:     suitability.score,
       reasons:   suitability.reasons,
       metrics:   suitability.metrics,
       updatedAt: new Date()
     };
+    media.adSuitability = adSuitability;
 
-    await media.save();
+    // updateOne, not save() — same rationale as the denorm + match
+    // writes earlier in the pipeline. Save() would re-flush stale
+    // dirty fields with a stale __v.
+    await Media.updateOne(
+      { _id: media._id },
+      { $set: { technicalInsights, adSuitability } }
+    );
     const positives = suitability.reasons.filter(r => r.severity === 'positive').length;
     const cautions  = suitability.reasons.filter(r => r.severity === 'caution').length;
     const negatives = suitability.reasons.filter(r => r.severity === 'negative').length;
@@ -1394,7 +1420,7 @@ function deriveSelectedWinners(candidates, judge) {
 // see the primary; multi-product readers can iterate `matches[]`.
 async function updateMediaLatestArtifacts(media, ids) {
   const existing = media.latestArtifacts || {};
-  media.latestArtifacts = {
+  const latestArtifacts = {
     detection:    ids.detection    || existing.detection    || null,
     crops:        ids.crops        || existing.crops        || null,
     extended:     ids.extended     || existing.extended     || null,
@@ -1404,7 +1430,14 @@ async function updateMediaLatestArtifacts(media, ids) {
                     : (existing.matches || []),
     overlayZones: ids.overlayZones || existing.overlayZones || null
   };
-  await media.save();
+  media.latestArtifacts = latestArtifacts;
+  // updateOne, not save() — earlier pipeline phases populated
+  // subjects/text/refinedProducts/etc. via Object.assign after
+  // their own updateOne writes; those fields remain flagged in
+  // Mongoose's dirty tracker on this in-memory doc, so save()
+  // would try to flush them too with a stale __v and trip
+  // "No matching document found ... version 0".
+  await Media.updateOne({ _id: media._id }, { $set: { latestArtifacts } });
 }
 
 module.exports = { processDetectRun };
