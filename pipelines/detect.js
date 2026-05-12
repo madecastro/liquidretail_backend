@@ -114,6 +114,21 @@ async function processDetectRun(run) {
 async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   const sourceUrl = sourceUrlOverride || media.fileUrl;
 
+  // Read true image dimensions via sharp BEFORE the YOLO chain so smart
+  // crops are always generated in the correct pixel space, even when
+  // YOLO returns no products (formerly fell back to 1024×768 — that
+  // produced wildly off Cloudinary c_crop URLs against the real asset).
+  const sharp = require('sharp');
+  let imgW = 1024;
+  let imgH = 768;
+  try {
+    const meta = await sharp(buffer).metadata();
+    imgW = meta.width  || imgW;
+    imgH = meta.height || imgH;
+  } catch (err) {
+    console.warn(`   ⚠️  sharp metadata failed for ${media._id}: ${err.message} — using ${imgW}x${imgH}`);
+  }
+
   // ── Phase 1: detect fan-out ──
   await setRunPhase(run, 'detect-fanout');
   const [yoloRes, subjectsRes] = await Promise.allSettled([
@@ -136,9 +151,6 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   const { subjects, text, background, primarySubjectLabel, secondaryElementsTags } = subjectsRes.status === 'fulfilled'
     ? subjectsRes.value
     : { subjects: [], text: [], background: null, primarySubjectLabel: null, secondaryElementsTags: [] };
-
-  const imgW = products[0]?.imgWidth  || 1024;
-  const imgH = products[0]?.imgHeight || 768;
 
   // Persist Media dimensions so consumers can query without loading artifacts.
   media.width  = imgW;
@@ -426,6 +438,22 @@ async function runCatalogProductPipeline(run, media, buffer) {
   const sourceUrl = media.fileUrl;
   const isHero = media.metadata?.imageRole !== 'alt';
 
+  // True image dimensions via sharp BEFORE the fan-out so smart crops
+  // are always generated against the asset's actual pixel space.
+  // Catalog images often have YOLO produce zero detections (clean
+  // studio shots), and falling back to 1024x1024 made downstream
+  // c_crop URLs land on the wrong region.
+  const sharp = require('sharp');
+  let imgW = 1024;
+  let imgH = 1024;
+  try {
+    const meta = await sharp(buffer).metadata();
+    imgW = meta.width  || imgW;
+    imgH = meta.height || imgH;
+  } catch (err) {
+    console.warn(`   ⚠️  sharp metadata failed for catalog ${media._id}: ${err.message} — using ${imgW}x${imgH}`);
+  }
+
   // ── Phase 1: detect fan-out — YOLO (skip identify) ‖ subjects/text ──
   // We run the same vision passes as UGC media so catalog images carry
   // safe-overlay zones, density + brightness grids, palette, etc. — the
@@ -456,8 +484,6 @@ async function runCatalogProductPipeline(run, media, buffer) {
     ? subjectsRes.value
     : { subjects: [], text: [], background: null, primarySubjectLabel: null, secondaryElementsTags: [] };
 
-  const imgW = products[0]?.imgWidth  || 1024;
-  const imgH = products[0]?.imgHeight || 1024;
   media.width  = imgW;
   media.height = imgH;
   await media.save();
