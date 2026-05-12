@@ -38,7 +38,11 @@ function isConfigured() {
   return !!(process.env.META_APP_ID && process.env.META_APP_SECRET && process.env.META_ADS_REDIRECT_URI);
 }
 
-function buildAuthorizeUrl({ state }) {
+// forceAssetPicker=true → adds auth_type=reauthorize so Meta re-shows
+// the business-asset granting dialog. See instagramOAuthService for the
+// full rationale; same caveat applies to Meta Ads since both flows
+// share the Meta Business Login dance.
+function buildAuthorizeUrl({ state, forceAssetPicker = false }) {
   const { appId, redirectUri } = getConfig();
   const params = new URLSearchParams({
     client_id:     appId,
@@ -47,6 +51,7 @@ function buildAuthorizeUrl({ state }) {
     response_type: 'code',
     state
   });
+  if (forceAssetPicker) params.set('auth_type', 'reauthorize');
   return `${META_OAUTH_ROOT}?${params.toString()}`;
 }
 

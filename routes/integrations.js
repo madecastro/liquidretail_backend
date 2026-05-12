@@ -63,6 +63,28 @@ function readOnboardingFromState(statePayload) {
   return !!(statePayload && statePayload.onboarding === true);
 }
 
+// Additional-brand mode: true when the advertiser has at least one
+// OTHER brand with an active/pending credential of this integration
+// type. Used by the connect routes to force-show the asset picker
+// (Meta: auth_type=reauthorize, Google: prompt=select_account) so the
+// operator can grant access to a different business account / IG page
+// / ad account for the new brand. Without this nudge, the existing
+// session silently re-issues a token scoped to the same assets as
+// before — invisible to the operator, blocking second-brand setup.
+async function isAdditionalBrandConnect({ req, integrationType, currentBrandId }) {
+  try {
+    const filter = tenantFilter(req, {
+      type:    integrationType,
+      brandId: { $ne: currentBrandId },
+      status:  { $in: ['active', 'pending'] }
+    });
+    const sibling = await IntegrationCredential.findOne(filter).select('_id').lean();
+    return !!sibling;
+  } catch (_err) {
+    return false;
+  }
+}
+
 // Build the post-OAuth bounce URL. The new app uses /brand (Chakra
 // route) and reads ig_status/ig_setup query params. The legacy app
 // uses /brand.html. We pick by suffix based on whether the origin
@@ -121,10 +143,14 @@ router.get('/instagram/status', async (req, res) => {
       status: { $in: ['active', 'pending'] }
     })).sort({ connectedAt: 1 }).lean();
     const summarized = creds.map(summarize);
+    const additionalBrandMode = await isAdditionalBrandConnect({
+      req, integrationType: 'instagram', currentBrandId: String(brandId)
+    });
     res.json({
       configured:  ig.isConfigured(),
       credential:  summarized[0] || null,
-      credentials: summarized
+      credentials: summarized,
+      additionalBrandMode
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'status lookup failed' });
@@ -162,7 +188,10 @@ router.post('/instagram/connect', express.json(), async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
-    const authorizeUrl = ig.buildAuthorizeUrl({ state });
+    const forceAssetPicker = await isAdditionalBrandConnect({
+      req, integrationType: 'instagram', currentBrandId: String(brandId)
+    });
+    const authorizeUrl = ig.buildAuthorizeUrl({ state, forceAssetPicker });
     res.json({ authorizeUrl });
   } catch (err) {
     res.status(500).json({ error: err.message || 'connect init failed' });
@@ -968,13 +997,17 @@ router.get('/meta-ads/status', async (req, res) => {
       brandId, type: 'meta-ads', status: { $in: ['active', 'pending'] }
     })).sort({ connectedAt: 1 }).lean();
     const summarized = creds.map(summarizeAds);
+    const additionalBrandMode = await isAdditionalBrandConnect({
+      req, integrationType: 'meta-ads', currentBrandId: String(brandId)
+    });
     res.json({
       configured:  metaAds.isConfigured(),
       // Singular `credential` for the single-tile UI on the Brand
       // page (matches /instagram/status); plural `credentials` for
       // any caller that wants the full list.
       credential:  summarized[0] || null,
-      credentials: summarized
+      credentials: summarized,
+      additionalBrandMode
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'meta-ads status failed' });
@@ -1006,7 +1039,10 @@ router.post('/meta-ads/connect', express.json(), async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
-    res.json({ authorizeUrl: metaAds.buildAuthorizeUrl({ state }) });
+    const forceAssetPicker = await isAdditionalBrandConnect({
+      req, integrationType: 'meta-ads', currentBrandId: String(brandId)
+    });
+    res.json({ authorizeUrl: metaAds.buildAuthorizeUrl({ state, forceAssetPicker }) });
   } catch (err) {
     res.status(500).json({ error: err.message || 'meta-ads connect init failed' });
   }
@@ -1212,11 +1248,15 @@ router.get('/google-ads/status', async (req, res) => {
       brandId, type: 'google-ads', status: { $in: ['active', 'pending'] }
     })).sort({ connectedAt: 1 }).lean();
     const summarized = creds.map(summarizeGoogleAds);
+    const additionalBrandMode = await isAdditionalBrandConnect({
+      req, integrationType: 'google-ads', currentBrandId: String(brandId)
+    });
     res.json({
       configured:         googleAds.isConfigured(),
       devTokenConfigured: googleAds.isDevTokenConfigured(),
       credential:         summarized[0] || null,
-      credentials:        summarized
+      credentials:        summarized,
+      additionalBrandMode
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'google-ads status failed' });
@@ -1245,7 +1285,10 @@ router.post('/google-ads/connect', express.json(), async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
-    res.json({ authorizeUrl: googleAds.buildAuthorizeUrl({ state }) });
+    const forceAccountSwitch = await isAdditionalBrandConnect({
+      req, integrationType: 'google-ads', currentBrandId: String(brandId)
+    });
+    res.json({ authorizeUrl: googleAds.buildAuthorizeUrl({ state, forceAccountSwitch }) });
   } catch (err) {
     res.status(500).json({ error: err.message || 'google-ads connect init failed' });
   }

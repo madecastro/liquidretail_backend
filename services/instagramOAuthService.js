@@ -54,7 +54,14 @@ function isConfigured() {
   return !!(process.env.META_APP_ID && process.env.META_APP_SECRET && process.env.META_REDIRECT_URI);
 }
 
-function buildAuthorizeUrl({ state }) {
+// forceAssetPicker=true → adds auth_type=reauthorize so Meta re-shows
+// the business-asset granting dialog. Used in additional-brand mode:
+// when the advertiser already has an IG cred under a different brand,
+// the user's existing Meta session would otherwise skip the picker and
+// re-issue a token scoped to the same business accounts as before —
+// invisible to the operator, so they can't grant access to a new
+// Business Account for the second brand.
+function buildAuthorizeUrl({ state, forceAssetPicker = false }) {
   const { appId, redirectUri } = getConfig();
   const params = new URLSearchParams({
     client_id:     appId,
@@ -63,6 +70,7 @@ function buildAuthorizeUrl({ state }) {
     response_type: 'code',
     state
   });
+  if (forceAssetPicker) params.set('auth_type', 'reauthorize');
   return `${META_OAUTH_ROOT}?${params.toString()}`;
 }
 

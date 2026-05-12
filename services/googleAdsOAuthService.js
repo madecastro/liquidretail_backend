@@ -53,7 +53,12 @@ function isDevTokenConfigured() {
   return !!process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
 }
 
-function buildAuthorizeUrl({ state }) {
+// forceAccountSwitch=true → adds `select_account` to the prompt so
+// Google shows the account chooser. Without it, an existing browser
+// session silently re-issues tokens for the same Google account,
+// preventing the operator from connecting a different Google Ads
+// login under a second brand.
+function buildAuthorizeUrl({ state, forceAccountSwitch = false }) {
   const { clientId, redirectUri } = getOAuthConfig();
   const params = new URLSearchParams({
     client_id:     clientId,
@@ -63,7 +68,7 @@ function buildAuthorizeUrl({ state }) {
     // access_type=offline + prompt=consent forces a refresh_token to
     // be issued (Google omits it on subsequent consents otherwise).
     access_type:   'offline',
-    prompt:        'consent',
+    prompt:        forceAccountSwitch ? 'consent select_account' : 'consent',
     state
   });
   return `${OAUTH_AUTHORIZE}?${params.toString()}`;
