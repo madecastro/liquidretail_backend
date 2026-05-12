@@ -196,18 +196,32 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   // Phase 2c — promote vision analysis onto Media (denormalized cache of
   // the latest run's output). DetectionArtifact stays as the per-run
   // audit record; Media has the LATEST.
-  media.subjects             = (subjects || []).map(s => ({ ...s }));
-  media.text                 = (text     || []).map(t => ({ ...t }));
-  media.background           = background || null;
-  media.primarySubjectId     = primarySubjectId   || null;
-  media.primarySubjectDesc   = primarySubjectDesc || null;
-  // Phase A-0 — concise label + tags from subjectTextService extension
-  media.primarySubjectLabel  = primarySubjectLabel || null;
-  media.secondaryElementsTags = secondaryElementsTags || [];
-  media.safeRect             = safeRect || null;
-  media.refinedProducts      = (refinedProducts || []).map(rp => ({ ...rp }));
-  media.lastDetectedAt       = new Date();
-  await media.save();
+  //
+  // Written via updateOne rather than media.save() — these fields are
+  // array-bearing, which makes Mongoose include __v in the save filter.
+  // The partial unique index on DetectRun already guarantees one
+  // in-flight run per Media, so optimistic concurrency adds no safety
+  // here; on a stale in-memory __v (e.g. when postSyncService's
+  // findOneAndUpdate-then-updateOne creation sequence leaves the doc at
+  // __v=0 in DB while the in-memory tracker disagrees), save() throws
+  // "No matching document found ... version 0". updateOne sidesteps
+  // both — last-write-wins is correct for this denorm cache.
+  const denorm = {
+    subjects:             (subjects || []).map(s => ({ ...s })),
+    text:                 (text     || []).map(t => ({ ...t })),
+    background:           background || null,
+    primarySubjectId:     primarySubjectId   || null,
+    primarySubjectDesc:   primarySubjectDesc || null,
+    primarySubjectLabel:  primarySubjectLabel || null,
+    secondaryElementsTags: secondaryElementsTags || [],
+    safeRect:             safeRect || null,
+    refinedProducts:      (refinedProducts || []).map(rp => ({ ...rp })),
+    lastDetectedAt:       new Date()
+  };
+  await Media.updateOne({ _id: media._id }, { $set: denorm });
+  // Keep the in-memory media in sync — subsequent stages (productMatch,
+  // applyMediaLibraryDerivations) read these fields directly off the doc.
+  Object.assign(media, denorm);
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
@@ -529,17 +543,23 @@ async function runCatalogProductPipeline(run, media, buffer) {
   await detectionDoc.save();
 
   // Promote vision analysis onto Media (denormalized cache of latest run).
-  media.subjects              = (subjects || []).map(s => ({ ...s }));
-  media.text                  = (text     || []).map(t => ({ ...t }));
-  media.background            = background || null;
-  media.primarySubjectId      = primarySubjectId   || null;
-  media.primarySubjectDesc    = primarySubjectDesc || null;
-  media.primarySubjectLabel   = primarySubjectLabel || null;
-  media.secondaryElementsTags = secondaryElementsTags || [];
-  media.safeRect              = safeRect || null;
-  media.refinedProducts       = (refinedProducts || []).map(rp => ({ ...rp }));
-  media.lastDetectedAt        = new Date();
-  await media.save();
+  // updateOne, not save() — see runImagePipeline for the rationale
+  // (array-bearing save() trips Mongoose's __v check on a fresh Media
+  // doc whose in-memory version is stale relative to DB).
+  const denormCp = {
+    subjects:              (subjects || []).map(s => ({ ...s })),
+    text:                  (text     || []).map(t => ({ ...t })),
+    background:            background || null,
+    primarySubjectId:      primarySubjectId   || null,
+    primarySubjectDesc:    primarySubjectDesc || null,
+    primarySubjectLabel:   primarySubjectLabel || null,
+    secondaryElementsTags: secondaryElementsTags || [],
+    safeRect:              safeRect || null,
+    refinedProducts:       (refinedProducts || []).map(rp => ({ ...rp })),
+    lastDetectedAt:        new Date()
+  };
+  await Media.updateOne({ _id: media._id }, { $set: denormCp });
+  Object.assign(media, denormCp);
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
