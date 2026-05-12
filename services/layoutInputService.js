@@ -48,6 +48,7 @@
 // LayoutInputArtifact; `refresh: true` bypasses.
 
 const axios = require('axios');
+const mongoose = require('mongoose');
 
 const Media                  = require('../models/Media');
 const DetectionArtifact      = require('../models/DetectionArtifact');
@@ -416,9 +417,14 @@ async function loadContext(mediaId, options = {}) {
     // raw uncropped Shopify URL. Per-ratio judge winners are picked the
     // same way as the main hero — slot consumers get a c_crop transform
     // URL keyed to the slot's ratio.
+    // metadata.catalogProductId stored as ObjectId; cast string forms
+    // so api → service hops don't lose the match.
+    const productOid = mongoose.isValidObjectId(options.productId)
+      ? new mongoose.Types.ObjectId(String(options.productId))
+      : options.productId;
     const heroMediaDoc = await Media.findOne({
       source: 'catalog-product',
-      'metadata.catalogProductId': options.productId,
+      'metadata.catalogProductId': productOid,
       'metadata.imageRole': 'hero'
     })
       .select('_id fileUrl latestArtifacts')

@@ -41,6 +41,7 @@
 // same picks doesn't double-queue).
 
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 
 const Campaign              = require('../models/Campaign');
 const Media                 = require('../models/Media');
@@ -48,6 +49,14 @@ const CatalogProduct        = require('../models/CatalogProduct');
 const ProductMatchArtifact  = require('../models/ProductMatchArtifact');
 const Ad                    = require('../models/Ad');
 const registry              = require('./templateRegistry');
+
+// Cast a string/ObjectId to ObjectId. Required when querying
+// metadata.catalogProductId (Mixed type) — Mongoose doesn't auto-cast
+// inside Mixed, so string from req.body won't match the stored ObjectId.
+function toObjectId(id) {
+  if (id instanceof mongoose.Types.ObjectId) return id;
+  return mongoose.isValidObjectId(id) ? new mongoose.Types.ObjectId(String(id)) : null;
+}
 
 const SUPPORTED_TEMPLATES = new Set([
   'testimonial_spotlight',
@@ -420,12 +429,14 @@ async function seedsFromProduct(brandId, productId) {
   }
 
   // Tier 0 — product_image: use the catalog product's hero Media as
-  // the visual slot.
-  const heroMedia = await Media.findOne({
+  // the visual slot. metadata.catalogProductId is stored as ObjectId;
+  // cast before the find so a string productId from the API matches.
+  const productOid = toObjectId(productId);
+  const heroMedia = productOid ? await Media.findOne({
     source: 'catalog-product',
-    'metadata.catalogProductId': productId,
+    'metadata.catalogProductId': productOid,
     'metadata.imageRole': 'hero'
-  }).select('_id fileType adSuitability').lean();
+  }).select('_id fileType adSuitability').lean() : null;
   if (heroMedia) {
     seeds.push({
       productId:        String(productId),

@@ -29,6 +29,8 @@
 //   2. require + register it below
 //   3. Its output slot in the response appears automatically; no call-site changes.
 
+const mongoose = require('mongoose');
+
 const geminiSearch = require('./providers/geminiSearchProvider');
 const googleLens   = require('./providers/googleLensProvider');
 const { identifyProduct } = require('./productReasoner');
@@ -1889,8 +1891,13 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product) {
 // Returns [] when no catalog Media exists yet or none have refined crops.
 async function loadCatalogRefinedCropUrls(catalogProductId) {
   if (!catalogProductId) return [];
+  // metadata.catalogProductId stored as ObjectId; string callers
+  // (e.g. from a serialized PMA query) need a cast or the find misses.
+  const productOid = mongoose.isValidObjectId(catalogProductId)
+    ? new mongoose.Types.ObjectId(String(catalogProductId))
+    : catalogProductId;
   const medias = await Media.find(
-    { source: 'catalog-product', 'metadata.catalogProductId': catalogProductId },
+    { source: 'catalog-product', 'metadata.catalogProductId': productOid },
     { latestArtifacts: 1, 'metadata.imageRole': 1 }
   ).lean();
   if (!medias.length) return [];
