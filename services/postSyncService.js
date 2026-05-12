@@ -390,19 +390,38 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
     return { runId: null, mediaId: media._id };
   }
 
-  const run = await DetectRun.create({
-    advertiserId: cred.advertiserId,
-    brandId:      cred.brandId,
-    mediaId:      media._id,
-    status:       'queued',
-    stage:        'queued',
-    // Bulk IG ingest runs queue behind catalog-product runs so the
-    // visual catalog index is populated before media-path matches
-    // start querying it. Manual re-runs / single-media triggers
-    // stay at priority 1.
-    priority:     2,
-    trigger
-  });
+  let run;
+  try {
+    run = await DetectRun.create({
+      advertiserId: cred.advertiserId,
+      brandId:      cred.brandId,
+      mediaId:      media._id,
+      status:       'queued',
+      stage:        'queued',
+      // Bulk IG ingest runs queue behind catalog-product runs so the
+      // visual catalog index is populated before media-path matches
+      // start querying it. Manual re-runs / single-media triggers
+      // stay at priority 1.
+      priority:     2,
+      trigger
+    });
+  } catch (err) {
+    // Concurrent sync (boot-tick + interval-tick + manual sync racing)
+    // beat us to the create. The DetectRun model's partial unique index
+    // on (mediaId, status in queued/processing) catches the dup. Return
+    // the existing in-flight run so the caller's idempotency stays clean.
+    if (err.code === 11000) {
+      const existing = await DetectRun.findOne({
+        mediaId: media._id,
+        status:  { $in: ['queued', 'processing'] }
+      }).lean();
+      if (existing) {
+        console.log(`   · post ${externalId} → DetectRun already in flight (${existing._id}), skipping duplicate`);
+        return { runId: existing._id, mediaId: media._id };
+      }
+    }
+    throw err;
+  }
   console.log(`   · ingested IG post ${externalId} → Media ${media._id} + DetectRun ${run._id}`);
   return { runId: run._id, mediaId: media._id };
 }

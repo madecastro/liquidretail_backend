@@ -58,4 +58,21 @@ const detectRunSchema = new mongoose.Schema({
 // FIFO within a priority band.
 detectRunSchema.index({ status: 1, priority: 1, createdAt: 1 });
 
+// Idempotency guard: at most ONE DetectRun per Media in an in-flight
+// state (queued OR processing). Concurrent enqueue paths — scheduler
+// boot-tick + interval-tick + manual sync, or two scheduler ticks
+// overlapping while a slow ingest is mid-loop — would otherwise
+// .create() duplicate runs for the same Media. The unique partial
+// index makes the second insert hit E11000; the caller catches it
+// and treats it as "already enqueued, no-op." Completed/failed runs
+// are NOT covered by the filter so re-detection can still create a
+// new run after a previous one terminates.
+detectRunSchema.index(
+  { mediaId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { status: { $in: ['queued', 'processing'] } }
+  }
+);
+
 module.exports = mongoose.model('DetectRun', detectRunSchema);

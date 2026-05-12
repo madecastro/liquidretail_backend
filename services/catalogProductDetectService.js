@@ -52,13 +52,8 @@ async function enqueueProductDetect(product) {
       imageRole:    'hero'
     });
     if (heroMedia) {
-      const run = await DetectRun.create({
-        advertiserId: product.advertiserId,
-        brandId:      product.brandId,
-        mediaId:      heroMedia._id,
-        trigger:      'catalog-sync'
-      });
-      enqueued.hero = { mediaId: String(heroMedia._id), runId: String(run._id) };
+      const run = await createDetectRunIfAbsent(heroMedia, product);
+      if (run) enqueued.hero = { mediaId: String(heroMedia._id), runId: String(run._id) };
     }
   } catch (err) {
     console.warn(`⚠️  catalog-product[${product._id}] hero detect enqueue failed: ${err.message}`);
@@ -77,13 +72,8 @@ async function enqueueProductDetect(product) {
         imageRole:    'alt'
       });
       if (altMedia) {
-        const run = await DetectRun.create({
-          advertiserId: product.advertiserId,
-          brandId:      product.brandId,
-          mediaId:      altMedia._id,
-          trigger:      'catalog-sync'
-        });
-        enqueued.alts.push({ mediaId: String(altMedia._id), runId: String(run._id) });
+        const run = await createDetectRunIfAbsent(altMedia, product);
+        if (run) enqueued.alts.push({ mediaId: String(altMedia._id), runId: String(run._id) });
       }
     } catch (err) {
       console.warn(`⚠️  catalog-product[${product._id}] alt detect enqueue failed: ${err.message}`);
@@ -129,6 +119,37 @@ async function enqueueBrandProductDetects(brandId) {
     `heroes=${heroEnqueued} alts=${altEnqueued} skipped=${skipped} (of ${products.length})`
   );
   return { heroEnqueued, altEnqueued, skipped, total: products.length };
+}
+
+// Create a DetectRun for this Media only if one isn't already in-flight.
+// The DetectRun model's partial unique index on (mediaId, status in
+// queued/processing) makes concurrent .create() calls hit E11000;
+// we swallow that and return the existing in-flight run instead.
+// Net effect: at most one in-flight DetectRun per Media, regardless of
+// how many sync paths race to enqueue it.
+async function createDetectRunIfAbsent(media, product) {
+  try {
+    return await DetectRun.create({
+      advertiserId: product.advertiserId,
+      brandId:      product.brandId,
+      mediaId:      media._id,
+      trigger:      'catalog-sync'
+    });
+  } catch (err) {
+    if (err.code === 11000) {
+      // Concurrent enqueue beat us to it. Return the existing in-flight run.
+      const existing = await DetectRun.findOne({
+        mediaId: media._id,
+        status:  { $in: ['queued', 'processing'] }
+      }).lean();
+      if (existing) {
+        console.log(`   · catalog-product[${product._id}] detect already enqueued for ${media._id} — skipping duplicate`);
+        return existing;
+      }
+      return null;
+    }
+    throw err;
+  }
 }
 
 // ── Internals ───────────────────────────────────────────────────────
