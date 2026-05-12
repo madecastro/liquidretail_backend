@@ -12,6 +12,7 @@
 
 const OpenAI = require('openai');
 const JSON5  = require('json5');
+const { getCoarseBreadcrumb } = require('./categoryClassifier');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -80,8 +81,25 @@ async function enrichProductCategory({ brandName, brandUrl, productLabel, produc
     return null;
   }
 
+  let breadcrumb = typeof parsed.breadcrumb === 'string' ? parsed.breadcrumb.trim() : null;
+
+  // Prepend the coarse enum breadcrumb so the fine leaf becomes a
+  // descendant of the coarse Category root that catalogSyncService
+  // stamps at sync time. Without this, GPT-4.1 returns brand-site nav
+  // paths like "Shop > Pasta" that live in a disconnected subtree
+  // from the coarse "Food & Beverage" root — and the pre-match filter
+  // (findCatalogMatchByText) wouldn't catch the upgraded products
+  // because they're outside the coarse subtree. Skip prefixing when
+  // GPT already prefixed it (defensive) or when no coarse mapping
+  // exists for the enum hint.
+  const coarseRoot = getCoarseBreadcrumb(productCategory);
+  if (breadcrumb && coarseRoot) {
+    const startsWithCoarse = breadcrumb.toLowerCase().startsWith(coarseRoot.toLowerCase());
+    if (!startsWithCoarse) breadcrumb = `${coarseRoot} > ${breadcrumb}`;
+  }
+
   const result = {
-    breadcrumb: typeof parsed.breadcrumb === 'string' ? parsed.breadcrumb.trim() : null,
+    breadcrumb,
     url:        typeof parsed.url === 'string' && /^https?:\/\//.test(parsed.url) ? parsed.url.trim() : null,
     confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5,
     reasoning:  typeof parsed.reasoning === 'string' ? parsed.reasoning : null,

@@ -31,6 +31,7 @@
 
 const mongoose = require('mongoose');
 
+const { getCoarseSubtreeIds } = require('./categoryClassifier');
 const geminiSearch = require('./providers/geminiSearchProvider');
 const googleLens   = require('./providers/googleLensProvider');
 const { identifyProduct } = require('./productReasoner');
@@ -926,15 +927,18 @@ async function enrichOneMatchInPlace(match, ctx) {
         url:              match.brandCategory.url || null,
         firstSeenMediaId: ctx.mediaId || null
       });
-      // Backfill CatalogProduct.categoryRef + category string when both ends
-      // now exist. ensureCatalogProductForMatch runs BEFORE category
-      // resolution, so the catalog row was created with the freeform query
-      // category (e.g. "apparel"); replace it with the breadcrumb leaf
-      // (e.g. "Mens > Tops > Hooded Performance Shirts") now that we have it.
+      // Upgrade CatalogProduct.categoryRef to the fine-grained leaf.
+      // catalogSyncService stamps a COARSE Category leaf at sync time
+      // (e.g. "Food & Beverage", depth=0); productCategoryService's
+      // breadcrumb is prefixed with that same coarse root so the new
+      // leaf is a deeper descendant of the coarse root. Overwriting is
+      // safe — the fine leaf is strictly more specific than the coarse
+      // one, and the coarse subtree still covers it for filter
+      // purposes.
       if (match.catalogProductId && match.categoryId) {
         const breadcrumb = match.brandCategory?.breadcrumb || null;
         await CatalogProduct.updateOne(
-          { _id: match.catalogProductId, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+          { _id: match.catalogProductId },
           { $set: { categoryRef: match.categoryId, ...(breadcrumb ? { category: breadcrumb } : {}) } }
         );
         await Category.updateOne(
@@ -1650,17 +1654,35 @@ async function findCatalogMatchByText({
     draft:            { $ne: true },
     isPrimaryVariant: { $ne: false }
   };
+  // Category filter: map the refined product's coarse enum (e.g.
+  // 'food_beverage') to its Category subtree (the coarse root +
+  // descendants that productCategoryService has upgraded). Rows are
+  // stamped via:
+  //   - catalogSyncService → coarse leaf (depth 0) for every new
+  //     CatalogProduct via heuristic inferCoarseEnum
+  //   - productMatchService → fine leaf (depth 1+) after a successful
+  //     match resolves productCategoryService's GPT-4.1 breadcrumb
+  // Both end up under the same coarse root, so a single categoryRef ∈
+  // subtreeIds query catches both.
   let rows = [];
   if (category) {
-    const filtered = await CatalogProduct
-      .find({ ...baseQuery, category: { $regex: escapeRegex(category), $options: 'i' } })
-      .limit(500)
-      .select('title description category brand price currency imageUrl productUrl externalId source')
-      .lean();
-    if (filtered.length >= 3) {
-      rows = filtered;
+    const subtreeIds = await getCoarseSubtreeIds({ brandId, enumCategory: category });
+    if (subtreeIds.length) {
+      const filtered = await CatalogProduct
+        .find({ ...baseQuery, categoryRef: { $in: subtreeIds } })
+        .limit(500)
+        .select('title description category brand price currency imageUrl productUrl externalId source')
+        .lean();
+      if (filtered.length >= 3) {
+        rows = filtered;
+      } else {
+        console.log(`   · catalog text search: only ${filtered.length} category-scoped candidate(s) for "${category}" (${subtreeIds.length} subtree node(s)); broadening to full catalog`);
+      }
     } else {
-      console.log(`   · catalog text search: only ${filtered.length} category-scoped candidate(s) for "${category}"; broadening to full catalog`);
+      // Coarse enum doesn't map to any Category subtree for this brand
+      // yet — either it's 'other'/unrecognized OR no products of that
+      // bucket have been synced. Skip the filter and use full catalog.
+      console.log(`   · catalog text search: no Category subtree for "${category}"; broadening to full catalog`);
     }
   }
   if (!rows.length) {

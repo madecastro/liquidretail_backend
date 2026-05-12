@@ -12,6 +12,7 @@ const axios = require('axios');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const CatalogProduct = require('../models/CatalogProduct');
 const { decrypt } = require('./integrationCryptoService');
+const { inferCoarseEnum, resolveCoarseCategoryRef } = require('./categoryClassifier');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -183,6 +184,36 @@ async function syncCatalogForCred(cred) {
         // updatedExisting=false means this was an insert.
         if (result?.lastErrorObject?.updatedExisting) updated++;
         else                                          added++;
+
+        // Stamp a COARSE Category leaf on rows that don't already have
+        // a fine-grained categoryRef. Heuristic on Meta's category +
+        // title — best-effort; nothing breaks if it can't classify.
+        // This is what makes findCatalogMatchByText's pre-match filter
+        // hit on freshly-synced rows. Match-time productCategoryService
+        // later upgrades this to a fine-grained descendant leaf when
+        // the row wins a real match.
+        const row = result.value || result;
+        if (row && !row.categoryRef) {
+          try {
+            const enumCategory = inferCoarseEnum(item.category, item.name);
+            if (enumCategory) {
+              const coarseRef = await resolveCoarseCategoryRef({
+                brandId:      cred.brandId,
+                advertiserId: cred.advertiserId,
+                enumCategory
+              });
+              if (coarseRef) {
+                await CatalogProduct.updateOne(
+                  { _id: row._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+                  { $set: { categoryRef: coarseRef } }
+                );
+              }
+            }
+          } catch (err) {
+            // Best-effort — never let category stamping break a sync.
+            console.warn(`   ⚠️  coarse-category stamp failed for ${externalId}: ${err.message}`);
+          }
+        }
       } catch (err) {
         console.warn(`   ⚠️  upsert failed for ${externalId}: ${err.message}`);
         errors++;
