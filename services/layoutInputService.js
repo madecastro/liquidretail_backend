@@ -850,35 +850,40 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
   const creatorMedia   = pickCreatorMedia(ctx);
   const ugcMedia       = creatorMedia;  // detect uploads == creator post asset
 
-  const quotes = Array.isArray(derivation.quotes) ? derivation.quotes.slice() : [];
+  // Quote source priority — real reviews first, LLM-authored next,
+  // synthesis last. Real quotes (cached productReviews + brandReviews
+  // for brand_match outcomes) are higher-trust than anything the
+  // LLM generates, so they win the primary-quote slot. LLM quotes
+  // fill secondaries and supply additional perspectives. Synthesis
+  // from review summary is a last resort for blank-zone prevention.
+  const realQuotes = [];
 
-  // Synthesis fallback — if the LLM emitted no quotes but a review summary
-  // exists, carve the first sentence out as a primary quote so hero zones
-  // aren't blank. Cheap, deterministic, and clearly grounded.
-  if (quotes.length === 0) {
-    const syn = synthesizeQuoteFromReviewSummary(ctx);
-    if (syn) quotes.push(syn);
-  }
-
-  // Real product-level review quotes (cached on the CatalogProduct via
-  // maybeFetchProductReviewsCached). Mostly relevant for product_image
-  // variants where there's no UGC caption to mine, but useful as a
-  // grounded backup for UGC variants too — append rather than replace
-  // so LLM-authored quotes still rank ahead.
   const productQuotes = details.productReviews?.quotes;
   if (Array.isArray(productQuotes) && productQuotes.length) {
     for (const q of productQuotes) {
-      if (q?.text) quotes.push({ text: q.text, author_name: q.author || q.source || 'Verified buyer' });
+      if (q?.text) realQuotes.push({ text: q.text, author_name: q.author || q.source || 'Verified buyer' });
     }
   }
 
-  // Branding-outcome quote injection. When the matching service couldn't
-  // identify a specific product but did pull brand-level reviews, use
-  // those quotes so the testimonial templates still have hero copy.
+  // Brand-level review quotes when the matching service couldn't
+  // identify a specific product but did pull brand sentiment.
   if (ctx.match?.outcome === 'brand_match' && Array.isArray(ctx.match?.brandReviews?.quotes)) {
     for (const q of ctx.match.brandReviews.quotes) {
-      if (q?.text) quotes.push({ text: q.text, author_name: q.author || q.source || 'Verified buyer' });
+      if (q?.text) realQuotes.push({ text: q.text, author_name: q.author || q.source || 'Verified buyer' });
     }
+  }
+
+  const llmQuotes = Array.isArray(derivation.quotes) ? derivation.quotes.slice() : [];
+
+  // Real first, LLM second.
+  const quotes = [...realQuotes, ...llmQuotes];
+
+  // Last-resort synthesis when both real and LLM came up empty but
+  // a review summary exists — carve the first sentence out so hero
+  // zones aren't blank. Cheap, deterministic, and clearly grounded.
+  if (quotes.length === 0) {
+    const syn = synthesizeQuoteFromReviewSummary(ctx);
+    if (syn) quotes.push(syn);
   }
 
   const primaryQuote = quotes[0] ? { ...quotes[0] } : null;
