@@ -53,7 +53,17 @@ async function fetchProductDetails(identification, catalogProductId = null) {
   if (catalogProductId) {
     const cached = await readFromCatalogCache(catalogProductId);
     if (cached) {
-      console.log(`   ✓ product-details: cache hit on CatalogProduct ${catalogProductId} (refreshed ${Math.round((Date.now() - new Date(cached.detailsRefreshedAt).getTime()) / 86400000)}d ago)`);
+      // Guard the age display — detailsRefreshedAt is missing on rows
+      // populated from older code paths (or freshly drafted by
+      // ensureCatalogProductForMatch), so the subtraction was returning
+      // NaN and the log read "refreshed NaNd ago".
+      const refreshedTs = cached.detailsRefreshedAt
+        ? new Date(cached.detailsRefreshedAt).getTime()
+        : null;
+      const ageDisplay = refreshedTs && Number.isFinite(refreshedTs)
+        ? `${Math.round((Date.now() - refreshedTs) / 86400000)}d ago`
+        : 'unknown age';
+      console.log(`   ✓ product-details: cache hit on CatalogProduct ${catalogProductId} (refreshed ${ageDisplay})`);
       return cached;
     }
   }

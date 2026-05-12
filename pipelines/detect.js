@@ -44,7 +44,7 @@ const { scoreMedia } = require('../services/adSuitabilityService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
 const { identifyYoloDetectionsGemini, isEnabled: isGeminiIdentifyEnabled } = require('../services/geminiIdentifyService');
 const { reconcileEnrichments } = require('../services/enrichmentReconciler');
-const { refineDetectionCrops } = require('../services/cropRefineService');
+const { refineDetectionCrops, dedupYoloDetections } = require('../services/cropRefineService');
 const { maybePostMatchReply } = require('../services/instagramCommentService');
 // Phase 2b: per-match draft creation now lives in productMatchService.
 // catalogProductDraftService is kept only for the manual Upload-7 escape
@@ -621,7 +621,17 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
     try {
       const yolo = await detectMultipleProducts(buffer);
       console.log(`🔍 YOLO: ${yolo.detections.length} product(s)`);
-      return yolo.detections;
+      // Bbox-dedup before identify so the dual-engine call only runs
+      // on distinct objects. YOLO sometimes returns two overlapping
+      // detections for the same physical thing; running identify on
+      // both wastes a full GPT + Gemini round-trip per duplicate, and
+      // the redundancy is only caught later in dedupRefinedProducts.
+      const deduped = dedupYoloDetections(yolo.detections);
+      const dropped = yolo.detections.length - deduped.length;
+      if (dropped > 0) {
+        console.log(`   · YOLO bbox-dedup: collapsed ${dropped} overlapping detection(s) (${deduped.length} kept)`);
+      }
+      return deduped;
     } catch (err) {
       // Stamp a non-fatal flag so the rematch endpoint can target
       // these runs specifically — without it, a YOLO timeout looks

@@ -23,6 +23,37 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MAX_DETECTIONS_PER_CALL = 16;   // smaller than yoloIdentify (24) — refinement prompt is heavier per item
 
+// Pre-identify YOLO dedup. YOLO occasionally emits overlapping bboxes
+// for the same physical object — e.g. one "bottle" detection plus a
+// near-identical second "bottle" detection at slightly different
+// coordinates, or a tight crop nested inside a whole-image fallback.
+// Without this pass, dual-engine identify (GPT-4.1 + Gemini Vision)
+// runs on every duplicate, and the redundancy is only caught later in
+// dedupRefinedProducts — wasting one full identify round-trip per
+// duplicate. Higher IoU threshold (0.7) than the post-identify dedup
+// because adjacent distinct items can share ~0.5 overlap; we only
+// collapse here when we're confident two detections describe the same
+// physical thing.
+function dedupYoloDetections(detections) {
+  if (!Array.isArray(detections) || detections.length <= 1) return detections || [];
+  const sorted = detections.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  const kept = [];
+  for (const d of sorted) {
+    const dup = kept.find(k => isOverlappingSameClass(d, k));
+    if (!dup) kept.push(d);
+  }
+  return kept;
+}
+
+function isOverlappingSameClass(a, b) {
+  if ((a.className || '') !== (b.className || '')) return false;
+  if (computeIoU(a, b) >= 0.7) return true;
+  const aArea = bboxArea(a);
+  const bArea = bboxArea(b);
+  const [small, large] = aArea <= bArea ? [a, b] : [b, a];
+  return containmentRatio(small, large) >= 0.9;
+}
+
 async function refineDetectionCrops(detections, sourceImageUrl) {
   if (!Array.isArray(detections) || !detections.length) return [];
 
@@ -67,6 +98,15 @@ function dedupRefinedProducts(refined) {
 }
 
 function areDuplicateRefined(a, b) {
+  // Same identified productName collapses regardless of bbox position.
+  // Scenes with multiple instances of the same SKU (e.g. 18 jars of
+  // pasta on a shelf) used to emit 18 refined products, each driving a
+  // separate visualCatalogMatch fan-out against the catalog. The
+  // matcher's job is "what's in this scene", not "how many instances";
+  // the bbox/area dedup below doesn't catch physically-separated
+  // duplicates. Keep the highest-confidence representative so the
+  // visual match still runs against a clean crop.
+  if (sameIdentifiedProduct(a, b)) return true;
   if (!sameBrandLoose(a.brand, b.brand)) return false;
   if ((a.category || null) !== (b.category || null)) return false;
   if (computeIoU(a, b) >= 0.5) return true;
@@ -77,6 +117,18 @@ function areDuplicateRefined(a, b) {
   const bArea = bboxArea(b);
   const [small, large] = aArea <= bArea ? [a, b] : [b, a];
   return containmentRatio(small, large) >= 0.80;
+}
+
+function sameIdentifiedProduct(a, b) {
+  const aName = (a.identification?.productName || '').toLowerCase().trim();
+  const bName = (b.identification?.productName || '').toLowerCase().trim();
+  if (!aName || !bName) return false;
+  if (aName !== bName) return false;
+  // Also require the brand to match — a generic name like "hat" could
+  // collide across brands. sameBrandLoose accepts both nulls as a
+  // match, which is safe here (both nulls means we have no brand
+  // signal either way and the productName is the only key).
+  return sameBrandLoose(a.identification?.brand || a.brand, b.identification?.brand || b.brand);
 }
 
 function computeIoU(a, b) {
@@ -117,8 +169,14 @@ function sameBrandLoose(a, b) {
   // "Pelagic" matches "Pelagic Gear" — same logic as productMatchService.
   const shorter = na.length <= nb.length ? na : nb;
   const longer  = na.length <= nb.length ? nb : na;
-  if (shorter.length < 4) return false;
-  return longer.startsWith(shorter + ' ');
+  if (shorter.length >= 4 && longer.startsWith(shorter + ' ')) return true;
+  // Abbreviation tolerance — "HCO" ↔ "Hot Crispy Oil". Mirror of
+  // productMatchService.brandsMatchLoose.
+  if (shorter.length >= 2 && shorter.length <= 5 && !shorter.includes(' ')) {
+    const abbrev = longer.split(/\s+/).filter(Boolean).map(w => w[0]).join('');
+    if (abbrev === shorter) return true;
+  }
+  return false;
 }
 
 function normalizeBrandKey(s) {
@@ -353,4 +411,4 @@ function buildCloudinaryCropUrl(sourceUrl, x1, y1, x2, y2) {
   return sourceUrl.replace('/upload/', `/upload/${transform}/`);
 }
 
-module.exports = { refineDetectionCrops };
+module.exports = { refineDetectionCrops, dedupYoloDetections };

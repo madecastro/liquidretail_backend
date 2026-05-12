@@ -1274,8 +1274,18 @@ function brandsMatchLoose(a, b) {
   // (e.g. "Tom" matching "Tom Brown's School") doesn't sneak through.
   const shorter = na.length <= nb.length ? na : nb;
   const longer  = na.length <= nb.length ? nb : na;
-  if (shorter.length < 4) return false;
-  return longer.startsWith(shorter + ' ');
+  if (shorter.length >= 4 && longer.startsWith(shorter + ' ')) return true;
+  // Abbreviation match — e.g. detect returns "HCO" while the registered
+  // brand is "Hot Crispy Oil", or vice versa. Treat the shorter side as
+  // an acronym candidate when it's 2-5 contiguous chars; build the
+  // first-letter abbreviation of the longer side and compare. Captures
+  // the common brand-shorthand case without giving up the false-positive
+  // protection that the 4-char prefix rule provides.
+  if (shorter.length >= 2 && shorter.length <= 5 && !shorter.includes(' ')) {
+    const abbrev = longer.split(/\s+/).filter(Boolean).map(w => w[0]).join('');
+    if (abbrev === shorter) return true;
+  }
+  return false;
 }
 
 function normalizeBrand(s) {
