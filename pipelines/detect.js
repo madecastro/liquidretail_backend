@@ -560,11 +560,14 @@ async function runCatalogProductPipeline(run, media, buffer) {
     // extended + overlayZones land via the lazy chain below.
   });
 
-  // ── Lazy enrichment — extended-crops + overlay-zones (brightnessGrid) ──
-  // Same fire-and-forget pattern as UGC. Catalog images get the same
-  // overlay-mode treatment so overlay-on-image templates can render
-  // catalog products directly.
-  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH })
+  // ── Lazy enrichment — overlay-zones only (extended-crops skipped) ──
+  // Overlay zones power brightness-grid + safe-zone restrictions on
+  // catalog product images so overlay-mode templates render properly.
+  // Extended-crops (gpt-image-1 / Gemini Imagen variant generation) is
+  // skipped — catalog hero shots are clean and isolated; AI extension
+  // costs $0.10-0.30 per Media without meaningful quality lift over
+  // Cloudinary c_crop on a centered product.
+  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH, skipExtendedCrops: true })
     .then(async ({ extendedDoc, overlayDoc }) => {
       await updateMediaLatestArtifacts(media, {
         extended:     extendedDoc?._id,
@@ -971,7 +974,16 @@ function pickPrimaryDoc(docs, matches) {
 async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVideoUrl, crops, judge, primarySubjectDesc, background, text, isVideo, ctx = {}) {
   let extendedCandidates = {}, extendedErrors = {}, extendedJudgeRes = {};
 
-  if (sourceImageUrl) {
+  // ctx.skipExtendedCrops bypasses the gpt-image-1 / Gemini Imagen
+  // generation entirely. Catalog product images are clean isolated
+  // studio shots — AI extension to 9:16 / 1.91:1 wastes $0.10-0.30
+  // per Media without meaningful quality lift over plain Cloudinary
+  // c_crop. Overlay-zones (brightness grid + restrictions) still
+  // runs because it's cheap (~$0.01) and powers the overlay-mode
+  // contrast guards.
+  const skipExtended = !!ctx.skipExtendedCrops;
+
+  if (sourceImageUrl && !skipExtended) {
     await timeStage(run, 'extended-crops', async () => {
       try {
         const { candidates, errors } = await generateExtendedCrops({
