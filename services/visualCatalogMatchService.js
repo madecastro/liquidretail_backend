@@ -72,7 +72,11 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
         }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 400,
+          // Bumped from 400 — verbose reasoning was occasionally
+          // truncating the JSON mid-string and hitting the
+          // unparseable-response branch. Reasoning is one sentence
+          // by prompt, so 800 is comfortable headroom.
+          maxOutputTokens: 800,
           responseMimeType: 'application/json',
           // Schema-enforced output. Without this, Gemini sometimes
           // returns prose with embedded JSON, malformed JSON missing
@@ -100,7 +104,9 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
     return null;
   }
 
-  const text = (res.data?.candidates?.[0]?.content?.parts || [])
+  const respCandidate = res.data?.candidates?.[0];
+  const finishReason = respCandidate?.finishReason || null;
+  const text = (respCandidate?.content?.parts || [])
     .map(p => p.text || '').join('').trim();
   let parsed;
   try { parsed = JSON.parse(text); }
@@ -109,7 +115,17 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
     if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
   }
   if (!parsed) {
-    console.warn(`   ⚠️  visualCatalogMatch: unparseable response in ${Date.now() - t0}ms`);
+    // Capture enough detail to diagnose without spamming the log.
+    // finishReason is the most useful signal — STOP/MAX_TOKENS/SAFETY/
+    // RECITATION map to distinct failure modes. text preview helps
+    // when the body is non-JSON prose despite responseSchema.
+    const preview = text ? text.slice(0, 200).replace(/\s+/g, ' ') : '<empty>';
+    const blockReason = res.data?.promptFeedback?.blockReason || null;
+    console.warn(
+      `   ⚠️  visualCatalogMatch: unparseable response in ${Date.now() - t0}ms ` +
+      `(finishReason=${finishReason || 'none'}${blockReason ? `, blockReason=${blockReason}` : ''}, ` +
+      `textLen=${text.length}, preview="${preview}")`
+    );
     return null;
   }
 
