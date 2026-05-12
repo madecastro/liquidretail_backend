@@ -290,28 +290,31 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
 async function runVideoPipeline(run, media, buffer) {
   const sourceVideoUrl = media.fileUrl;
 
-  // ── Phase 1: extract hero frame ──
+  // ── Phase 1: pick a hero frame ──
+  //
+  // Two-source policy, IG-thumbnail-first:
+  //
+  //   1. IG/Reel cover thumbnail (media.metadata.thumbnailUrl) — present
+  //      for every IG video post syncService captures. Cheap (1 Cloudinary
+  //      mirror call) and the creator's chosen cover is typically more
+  //      product-forward than YOLO's "highest-detection-count" sampling.
+  //
+  //   2. YOLO video chain (queue-bottlenecked, ~30-60s, ~90% no-hero-frame
+  //      failure rate observed) — only for media without a thumbnail
+  //      (manual desktop uploads, non-IG sources).
+  //
+  // Flipping the order from YOLO-first → thumbnail-first save the entire
+  // YOLO video round-trip on every IG video, which is a huge chunk of
+  // the worker's wall-clock and YOLO's queue depth.
   await setRunPhase(run, 'detect-fanout');
-  let videoOut;
-  try {
-    videoOut = await runYoloVideoChain(run, buffer, media);
-  } catch (err) {
-    console.warn('⚠️  YOLO video chain rejected:', err.message);
-    videoOut = {
-      heroImageUrl: null, heroFrameSec: null, heroReason: 'yolo-rejected',
-      videoDurationSec: null, imgW: 1024, imgH: 768
-    };
-  }
-  let { heroImageUrl, heroFrameSec, heroReason } = videoOut;
-  const { videoDurationSec, imgW, imgH } = videoOut;
-  if (videoDurationSec) media.durationSec = videoDurationSec;
+  let heroImageUrl = null;
+  let heroFrameSec = null;
+  let heroReason   = null;
+  let videoDurationSec = null;
+  let imgW = 1024;
+  let imgH = 768;
 
-  // Fallback hero: when YOLO video can't pick a frame, try the IG/Reel
-  // cover thumbnail captured at ingest. Meta's CDN URL expires, so mirror
-  // to Cloudinary first — postSyncService only mirrors media_url, not
-  // thumbnail_url. Worse than a YOLO-picked frame (cover is typically a
-  // static title card) but any frame > no frame for downstream matching.
-  if (!heroImageUrl && media.metadata?.thumbnailUrl) {
+  if (media.metadata?.thumbnailUrl) {
     try {
       const mirrored = await uploadUrlToCloudinary(media.metadata.thumbnailUrl, {
         resourceType: 'image',
@@ -319,12 +322,34 @@ async function runVideoPipeline(run, media, buffer) {
       });
       heroImageUrl = mirrored.secure_url;
       heroFrameSec = 0;
-      heroReason   = 'ig-thumbnail-fallback';
-      console.log(`🪝 IG thumbnail fallback for ${media._id} → ${heroImageUrl}`);
+      heroReason   = 'ig-thumbnail';
+      console.log(`🪝 IG thumbnail hero for ${media._id} → ${heroImageUrl}`);
     } catch (err) {
       console.warn(`⚠️  IG thumbnail mirror failed for ${media._id}: ${err.message}`);
     }
   }
+
+  // YOLO video fallback — only when there's no thumbnail to use.
+  if (!heroImageUrl) {
+    let videoOut;
+    try {
+      videoOut = await runYoloVideoChain(run, buffer, media);
+    } catch (err) {
+      console.warn('⚠️  YOLO video chain rejected:', err.message);
+      videoOut = {
+        heroImageUrl: null, heroFrameSec: null, heroReason: 'yolo-rejected',
+        videoDurationSec: null, imgW: 1024, imgH: 768
+      };
+    }
+    heroImageUrl     = videoOut.heroImageUrl;
+    heroFrameSec     = videoOut.heroFrameSec;
+    heroReason       = videoOut.heroReason;
+    videoDurationSec = videoOut.videoDurationSec;
+    imgW             = videoOut.imgW || imgW;
+    imgH             = videoOut.imgH || imgH;
+  }
+
+  if (videoDurationSec) media.durationSec = videoDurationSec;
 
   if (!heroImageUrl) {
     console.warn(`⚠️  Video ${media._id} produced no hero frame — minimal artifacts only`);
