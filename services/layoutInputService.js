@@ -432,20 +432,22 @@ function buildIdentificationFromCatalogProduct(cp) {
     brand:       cp.brand || null,
     certainty:   1.0,
     details: {
-      productId:   cp._id,
-      title:       cp.title       || null,
-      imageUrl:    cp.imageUrl    || null,
-      productUrl:  cp.productUrl  || null,
-      category:    cp.category    || null,
-      categoryRef: cp.categoryRef || null,
+      productId:     cp._id,
+      title:         cp.title       || null,
+      imageUrl:      cp.imageUrl    || null,
+      productUrl:    cp.productUrl  || null,
+      category:      cp.category    || null,
+      categoryRef:   cp.categoryRef || null,
       price: cp.price != null ? {
         value:    cp.price,
         currency: cp.currency,
         display:  cp.priceDisplay || (typeof cp.price === 'number' ? `$${cp.price.toFixed(2)}` : String(cp.price))
       } : null,
-      rating:      cp.rating      ?? null,
-      reviewCount: cp.reviewCount ?? null,
-      description: cp.description || null
+      rating:        cp.rating        ?? null,
+      reviewCount:   cp.reviewCount   ?? null,
+      reviewSummary: cp.reviewSummary || null,
+      productReviews: cp.productReviews || null,
+      description:   cp.description   || null
     }
   };
 }
@@ -505,6 +507,7 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   const ident = match?.identification || {};
   const details = ident.details || {};
   const isBranding = match?.outcome === 'brand_match';
+  const isProductImage = options.variantKind === 'product_image';
   const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
   const lines = [];
 
@@ -542,18 +545,24 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     }
   }
   lines.push('');
-  lines.push('SOCIAL CONTEXT:');
-  lines.push(`  Platform: ${DEFAULT_CREATOR_PLATFORM} (simulated; real ingestion will supply this)`);
-  if (media.metadata?.caption)       lines.push(`  Caption: "${media.metadata.caption}"`);
-  if (media.metadata?.creatorName)   lines.push(`  Creator: ${media.metadata.creatorName}`);
-  if (media.metadata?.creatorHandle) lines.push(`  Handle: ${media.metadata.creatorHandle}`);
-  if (media.platformStats) {
-    const s = media.platformStats;
-    const stats = ['likes','comments','shares','saves','views'].map(k => s[k] != null ? `${k}=${s[k]}` : null).filter(Boolean).join(', ');
-    if (stats) lines.push(`  Engagement stats: ${stats}`);
+  // SOCIAL CONTEXT only applies to UGC variants — catalog-product Media
+  // has no creator / caption / engagement. Skipping the section
+  // entirely (instead of emitting an empty one) keeps the prompt
+  // focused on product copy when variantKind === 'product_image'.
+  if (!isProductImage) {
+    lines.push('SOCIAL CONTEXT:');
+    lines.push(`  Platform: ${DEFAULT_CREATOR_PLATFORM} (simulated; real ingestion will supply this)`);
+    if (media.metadata?.caption)       lines.push(`  Caption: "${media.metadata.caption}"`);
+    if (media.metadata?.creatorName)   lines.push(`  Creator: ${media.metadata.creatorName}`);
+    if (media.metadata?.creatorHandle) lines.push(`  Handle: ${media.metadata.creatorHandle}`);
+    if (media.platformStats) {
+      const s = media.platformStats;
+      const stats = ['likes','comments','shares','saves','views'].map(k => s[k] != null ? `${k}=${s[k]}` : null).filter(Boolean).join(', ');
+      if (stats) lines.push(`  Engagement stats: ${stats}`);
+    }
+    if (detection?.transcript?.text) lines.push(`  Transcript: "${String(detection.transcript.text).slice(0, 800)}"`);
+    lines.push('');
   }
-  if (detection?.transcript?.text) lines.push(`  Transcript: "${String(detection.transcript.text).slice(0, 800)}"`);
-  lines.push('');
   if (isBranding) {
     // Branding-mode review signal comes from brand-level Gemini search
     // not product-level SerpAPI. Surface those quotes so the LLM can
@@ -577,6 +586,16 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     if (typeof details.rating === 'number')      lines.push(`  Rating: ${details.rating}`);
     if (typeof details.reviewCount === 'number') lines.push(`  Review count: ${details.reviewCount}`);
     if (details.reviewSummary?.summary)          lines.push(`  Review summary: ${details.reviewSummary.summary}`);
+    // Real product-level review quotes (when available) — surfaced so
+    // the LLM can ground its tone in actual customer language. Cap at
+    // 5 to keep the prompt budget reasonable.
+    if (details.productReviews?.quotes?.length) {
+      lines.push('  Real product quotes (use these to inform tone, do NOT copy verbatim):');
+      for (const q of details.productReviews.quotes.slice(0, 5)) {
+        const author = q.author || q.source || 'Verified buyer';
+        lines.push(`    - "${q.text}" — ${author}${q.source && q.source !== author ? ` (${q.source})` : ''}`);
+      }
+    }
     lines.push('');
   }
   if (detection?.background) {
@@ -839,6 +858,18 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
   if (quotes.length === 0) {
     const syn = synthesizeQuoteFromReviewSummary(ctx);
     if (syn) quotes.push(syn);
+  }
+
+  // Real product-level review quotes (cached on the CatalogProduct via
+  // maybeFetchProductReviewsCached). Mostly relevant for product_image
+  // variants where there's no UGC caption to mine, but useful as a
+  // grounded backup for UGC variants too — append rather than replace
+  // so LLM-authored quotes still rank ahead.
+  const productQuotes = details.productReviews?.quotes;
+  if (Array.isArray(productQuotes) && productQuotes.length) {
+    for (const q of productQuotes) {
+      if (q?.text) quotes.push({ text: q.text, author_name: q.author || q.source || 'Verified buyer' });
+    }
   }
 
   // Branding-outcome quote injection. When the matching service couldn't
