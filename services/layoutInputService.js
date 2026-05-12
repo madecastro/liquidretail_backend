@@ -395,6 +395,7 @@ async function loadContext(mediaId, options = {}) {
   //     → override match.identification with seed-product details;
   //       keep categoryId / brandReviews / recommendedProducts as-is
   //       (those are scene-context, not product-identity)
+  let productHero = null;
   if (options.productId) {
     const cp = await CatalogProduct.findById(options.productId).lean();
     if (cp) {
@@ -408,6 +409,32 @@ async function loadContext(mediaId, options = {}) {
           identification:   seedIdent
         };
       }
+    }
+    // Also load the catalog product's hero Media + its CropArtifact so
+    // assembleInput can serve cropped catalog imagery for product.image
+    // (and any slot that wants a tight product thumbnail) instead of the
+    // raw uncropped Shopify URL. Per-ratio judge winners are picked the
+    // same way as the main hero — slot consumers get a c_crop transform
+    // URL keyed to the slot's ratio.
+    const heroMediaDoc = await Media.findOne({
+      source: 'catalog-product',
+      'metadata.catalogProductId': options.productId,
+      'metadata.imageRole': 'hero'
+    })
+      .select('_id fileUrl latestArtifacts')
+      .lean();
+    if (heroMediaDoc) {
+      const heroDetection = heroMediaDoc.latestArtifacts?.detection
+        ? await DetectionArtifact.findById(heroMediaDoc.latestArtifacts.detection).select('imageUrl').lean()
+        : null;
+      const heroCrops = heroMediaDoc.latestArtifacts?.crops
+        ? await CropArtifact.findById(heroMediaDoc.latestArtifacts.crops).lean()
+        : null;
+      productHero = {
+        mediaId:  heroMediaDoc._id,
+        imageUrl: heroDetection?.imageUrl || heroMediaDoc.fileUrl || null,
+        crops:    heroCrops || null
+      };
     }
   }
   const runId = detection?.runId || null;
@@ -437,7 +464,7 @@ async function loadContext(mediaId, options = {}) {
         .catch(err => { console.warn(`   ⚠️  categoryPool fetch failed: ${err.message}`); return []; })
     : [];
 
-  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool };
+  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool, productHero };
 }
 
 // Identification block built from a CatalogProduct. Mirrors the
@@ -985,14 +1012,12 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
       badges:         limitArray(derivedBadges, 4),
       hero_media:      mediaPair(heroMedia),
       secondary_media: mediaPair(secondaryMedia),
-      // Catalog-stock fallback. Direct CatalogProduct.imageUrl —
-      // distinct from hero_media which is always source-Media-derived
-      // (smart crops of the post being matched). Templates that want
-      // to gracefully degrade when no source Media exists (e.g. brands
-      // with only manual-upload catalog rows) put product.image at the
-      // end of their canvas/background source_priority chain. Empty
-      // when CatalogProduct isn't linked or has no imageUrl.
-      image:           details.imageUrl || undefined,
+      // Catalog product image. When the wizard threaded a productId
+      // (every ad-render does), prefer the JUDGE-CROPPED catalog hero
+      // for the heroSourceRatio over the raw CatalogProduct.imageUrl.
+      // Fall back to the raw URL when no catalog hero crops exist
+      // (early ingest, manual-upload-only catalog row, etc.).
+      image:           pickProductImage(ctx, heroSourceRatio, details) || undefined,
       // Sibling SKUs in the matched category — populated when the match
       // resolves to a Category (via CatalogProduct.categoryRef on a
       // product_match, or via ProductMatchArtifact.categoryId on a
@@ -1494,6 +1519,26 @@ function pickHeroMedia(ctx, aspectRatio) {
     }
   }
   return out;
+}
+
+// Pick a cropped catalog-product image keyed to the hero source
+// ratio. When ctx.productHero is set (wizard supplied a productId)
+// AND its CropArtifact has a winner for the requested ratio, return
+// the c_crop transform URL. Otherwise fall back to details.imageUrl
+// (the raw CatalogProduct.imageUrl, uncropped).
+function pickProductImage(ctx, aspectRatio, details) {
+  const ph = ctx?.productHero;
+  if (ph?.crops?.winners && ph?.imageUrl) {
+    const winnerId = ph.crops.winners[aspectRatio];
+    const list = ph.crops.smartCrops?.[aspectRatio] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0] || null;
+    if (winner) return buildCloudinaryCropUrl(ph.imageUrl, winner);
+    // No crop for this ratio but we have the catalog hero URL — return
+    // it uncropped (better than the raw Shopify URL since it's already
+    // mirrored to our Cloudinary, supports c_fill transforms downstream).
+    return ph.imageUrl;
+  }
+  return details?.imageUrl || null;
 }
 
 // Pick the best YOLO product detection to use as a tight product crop.
