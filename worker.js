@@ -52,6 +52,25 @@ mongoose.connect(process.env.MONGODB_URI, {
 }).then(async () => {
   console.log(`🔌 Connected to MongoDB (pool=${MONGO_POOL_SIZE}); starting ${CONCURRENCY} worker loop(s)`);
 
+  // Index sync. Mongoose's default autoIndex builds indexes lazily on
+  // first model use, which races against the worker loop's first
+  // DetectRun.create — partial unique indexes (the in-flight uniqueness
+  // guard on DetectRun(mediaId), the one on Ad(campaignId, identityDigest))
+  // would not exist yet, so duplicate-creation races slip through. After
+  // a DB drop this is the only way to ensure the partial uniques are in
+  // place before the worker starts inserting. Awaiting it blocks startup
+  // by a couple seconds at most on these small collections.
+  try {
+    await Promise.all([
+      DetectRun.syncIndexes(),
+      Ad.syncIndexes(),
+      CampaignRun.syncIndexes()
+    ]);
+    console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun)');
+  } catch (err) {
+    console.warn(`⚠️  syncIndexes failed (non-fatal): ${err.message}`);
+  }
+
   // Orphan reaper — catches DetectRun / Ad / CampaignRun docs left in
   // their "claimed" states (processing / rendering / running) when the
   // holder process died without releasing them. Runs once at boot

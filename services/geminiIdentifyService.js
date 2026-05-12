@@ -115,7 +115,16 @@ async function identifyChunkGemini(chunk, hints) {
           // ~6-8k chars. 2000 was getting truncated mid-array. 6000 leaves
           // comfortable headroom while still bounding cost.
           maxOutputTokens: 6000,
-          responseMimeType: 'application/json'
+          responseMimeType: 'application/json',
+          // gemini-2.5-flash defaults to a non-zero thinking budget that
+          // counts against maxOutputTokens but produces no visible output.
+          // For a structured-extraction task (image → JSON of detected
+          // products), chain-of-thought adds nothing — the schema is fixed
+          // and the model just transcribes what it sees. Without disabling
+          // thinking, large multi-crop batches hit MAX_TOKENS with the
+          // visible JSON truncated mid-array (out=2613 chars=9581 in
+          // observed logs).
+          thinkingConfig: { thinkingBudget: 0 }
         }
       },
       { timeout: 45000 }

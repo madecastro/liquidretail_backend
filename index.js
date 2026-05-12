@@ -229,6 +229,23 @@ mongoose.connect(process.env.MONGODB_URI, {
 })
   .then(async () => {
     console.log('✅ Connected to MongoDB');
+    // Sync the partial-unique indexes that protect concurrent inserts.
+    // After a DB drop, autoIndex builds these lazily on first model use —
+    // which races against postSyncService / catalogProductDetectService
+    // inserts. Explicit sync ensures the guards exist before any traffic.
+    try {
+      const DetectRun   = require('./models/DetectRun');
+      const Ad          = require('./models/Ad');
+      const CampaignRun = require('./models/CampaignRun');
+      await Promise.all([
+        DetectRun.syncIndexes(),
+        Ad.syncIndexes(),
+        CampaignRun.syncIndexes()
+      ]);
+      console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun)');
+    } catch (err) {
+      console.warn(`⚠️  syncIndexes failed (non-fatal): ${err.message}`);
+    }
     // One-shot legacy-index cleanup. The IntegrationCredential schema
     // moved from "one row per (brandId, type)" to per-account-id
     // partial indexes; the old global-unique indexes have to be

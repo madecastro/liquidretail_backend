@@ -263,6 +263,12 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
           temperature: 0.1,
           maxOutputTokens: 1200,
           responseMimeType: 'application/json',
+          // gemini-2.5-flash burns hidden thinking tokens against the
+          // visible budget; for a pure narrative → JSON shaping pass
+          // (no reasoning required, schema is fixed), thinking just
+          // truncates the output. Observed as "structuring produced no
+          // parsable JSON" in logs.
+          thinkingConfig: { thinkingBudget: 0 },
           // Same schema as product-reviews below — Gemini's freeform
           // JSON output is unreliable enough that the parser fallback
           // was firing often. Constrains the response shape.
@@ -396,6 +402,11 @@ async function lookupProductReviews({ productName, brandName, productUrl }) {
           temperature: 0.1,
           maxOutputTokens: 1200,
           responseMimeType: 'application/json',
+          // Same as brand-reviews above — disable thinking so the 1200
+          // token budget goes to the actual JSON instead of hidden
+          // reasoning. Eliminates the "structuring produced no parsable
+          // JSON" warnings caused by MAX_TOKENS-mid-JSON truncations.
+          thinkingConfig: { thinkingBudget: 0 },
           // Schema-enforced output to eliminate "structuring produced
           // no parsable JSON" warnings — Gemini was returning markdown-
           // wrapped JSON, prose with embedded JSON, or fields with

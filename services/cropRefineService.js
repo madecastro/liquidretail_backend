@@ -197,7 +197,12 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
         role: 'user',
         content: [{ type: 'text', text: prompt }, ...imageParts]
       }],
-      max_tokens: 1500,
+      // Bumped from 1500. With dense scenes the batch can produce 18-21
+      // boxes, each ~150-200 chars of JSON; 1500 tokens (~4500 chars)
+      // truncates around index 11-12 mid-array ("Expected ',' or ']'
+      // after array element in JSON at position 3189"). 4000 gives
+      // headroom for the dense path while still bounding cost.
+      max_tokens: 4000,
       temperature: 0.2
     });
     const raw = response.choices[0].message.content.trim();
