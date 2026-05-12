@@ -366,15 +366,31 @@ async function loadContext(mediaId, options = {}) {
   // fields when an FK target is missing (legacy pre-Phase-2 artifacts).
   let match = await hydrateMatch(rawMatch);
 
-  // Product-image variant path: when the wizard tagged this Ad with a
-  // productId AND the Media has no PMA (typical for catalog-product
-  // Media, which skips the match phase), synthesize a stub-match from
-  // the CatalogProduct so the existing slot-assembly code can read
-  // details.* the same way it does for matched UGC.
-  if (!match && options.productId) {
+  // options.productId is the operator's seed pick from the wizard.
+  // It's authoritative for the product slots — the latest PMA on
+  // this Media might point at a DIFFERENT product (when the media
+  // matched several), so we use the seed product instead. Two paths:
+  //
+  //   no match (catalog-product Media)
+  //     → synthesize a full stub-match from the CatalogProduct so
+  //       the existing slot-assembly code reads details.* normally
+  //   match exists (UGC Media with PMA)
+  //     → override match.identification with seed-product details;
+  //       keep categoryId / brandReviews / recommendedProducts as-is
+  //       (those are scene-context, not product-identity)
+  if (options.productId) {
     const cp = await CatalogProduct.findById(options.productId).lean();
     if (cp) {
-      match = synthesizeMatchFromCatalogProduct(cp);
+      if (!match) {
+        match = synthesizeMatchFromCatalogProduct(cp);
+      } else {
+        const seedIdent = buildIdentificationFromCatalogProduct(cp);
+        match = {
+          ...match,
+          catalogProductId: cp._id,
+          identification:   seedIdent
+        };
+      }
     }
   }
   const runId = detection?.runId || null;
@@ -407,11 +423,36 @@ async function loadContext(mediaId, options = {}) {
   return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool };
 }
 
+// Identification block built from a CatalogProduct. Mirrors the
+// shape hydrateMatch produces for a matched PMA so downstream slot
+// assembly reads details.* the same way for both paths.
+function buildIdentificationFromCatalogProduct(cp) {
+  return {
+    productName: cp.title || null,
+    brand:       cp.brand || null,
+    certainty:   1.0,
+    details: {
+      productId:   cp._id,
+      title:       cp.title       || null,
+      imageUrl:    cp.imageUrl    || null,
+      productUrl:  cp.productUrl  || null,
+      category:    cp.category    || null,
+      categoryRef: cp.categoryRef || null,
+      price: cp.price != null ? {
+        value:    cp.price,
+        currency: cp.currency,
+        display:  cp.priceDisplay || (typeof cp.price === 'number' ? `$${cp.price.toFixed(2)}` : String(cp.price))
+      } : null,
+      rating:      cp.rating      ?? null,
+      reviewCount: cp.reviewCount ?? null,
+      description: cp.description || null
+    }
+  };
+}
+
 // Build a stub ProductMatchArtifact-shaped object from a CatalogProduct.
 // Used in the product_image variant path where the source Media is a
-// catalog product image (no PMA) — the wizard knows the product, so
-// we project its details into the same shape the matched-UGC path
-// expects and let the existing slot-assembly code do its thing.
+// catalog product image (no PMA).
 function synthesizeMatchFromCatalogProduct(cp) {
   if (!cp) return null;
   return {
@@ -420,27 +461,7 @@ function synthesizeMatchFromCatalogProduct(cp) {
     catalogProductId: cp._id,
     categoryId:       cp.categoryRef || null,
     brandId:          cp.brandId || null,
-    identification: {
-      productName: cp.title || null,
-      brand:       cp.brand || null,
-      certainty:   1.0,
-      details: {
-        productId:   cp._id,
-        title:       cp.title       || null,
-        imageUrl:    cp.imageUrl    || null,
-        productUrl:  cp.productUrl  || null,
-        category:    cp.category    || null,
-        categoryRef: cp.categoryRef || null,
-        price: cp.price != null ? {
-          value:    cp.price,
-          currency: cp.currency,
-          display:  cp.priceDisplay || (typeof cp.price === 'number' ? `$${cp.price.toFixed(2)}` : String(cp.price))
-        } : null,
-        rating:      cp.rating      ?? null,
-        reviewCount: cp.reviewCount ?? null,
-        description: cp.description || null
-      }
-    }
+    identification:   buildIdentificationFromCatalogProduct(cp)
   };
 }
 
