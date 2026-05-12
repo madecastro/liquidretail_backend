@@ -72,12 +72,18 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
         }],
         generationConfig: {
           temperature: 0.1,
-          // Bumped from 400 — verbose reasoning was occasionally
-          // truncating the JSON mid-string and hitting the
-          // unparseable-response branch. Reasoning is one sentence
-          // by prompt, so 800 is comfortable headroom.
           maxOutputTokens: 800,
           responseMimeType: 'application/json',
+          // Disable thinking mode. Gemini 2.5 flash defaults to a non-
+          // zero thinking budget that counts against maxOutputTokens
+          // but produces no visible output — so an 800-token cap was
+          // being eaten by ~750 hidden thinking tokens, leaving ~50
+          // for the JSON and truncating mid-string ("unparseable
+          // response", finishReason=MAX_TOKENS). This task is a
+          // direct yes/no SKU comparison; reasoning quality doesn't
+          // benefit from chain-of-thought, and dropping it makes the
+          // call faster and cheaper too.
+          thinkingConfig: { thinkingBudget: 0 },
           // Schema-enforced output. Without this, Gemini sometimes
           // returns prose with embedded JSON, malformed JSON missing
           // a closing brace, or fields wrapped in markdown — all of
