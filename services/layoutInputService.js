@@ -237,8 +237,19 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   if (!supportedRatios.includes(aspectRatio))
     throw badRequest(`Template ${template} does not support aspect ratio ${aspectRatio}`);
 
+  // Cache key includes productId + variantKind so different seed
+  // products on the same media don't share a cached input. Both
+  // default to null for legacy callers (ads.html preview) — those
+  // cluster under (null, null) and don't conflict with ad-render
+  // entries that always have both set.
+  const cacheKeyProductId   = options.productId   || null;
+  const cacheKeyVariantKind = options.variantKind || null;
   if (!refresh) {
-    const cached = await LayoutInputArtifact.findOne({ mediaId, template, aspectRatio }).lean();
+    const cached = await LayoutInputArtifact.findOne({
+      mediaId, template, aspectRatio,
+      productId:   cacheKeyProductId,
+      variantKind: cacheKeyVariantKind
+    }).lean();
     // Cache hit only if the stored schema version matches what we emit today.
     // Without this check, v1 cached docs (with old paths like hero_image_url)
     // get served even though the renderer now reads hero_media.image —
@@ -276,12 +287,18 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   const input = assembleInput(ctx, template, aspectRatio, options, derivation, precomputedPlacement);
 
   await LayoutInputArtifact.findOneAndReplace(
-    { mediaId, template, aspectRatio },
+    {
+      mediaId, template, aspectRatio,
+      productId:   cacheKeyProductId,
+      variantKind: cacheKeyVariantKind
+    },
     {
       mediaId,
       runId: ctx.runId || null,
       template,
       aspectRatio,
+      productId:   cacheKeyProductId,
+      variantKind: cacheKeyVariantKind,
       schemaVersion: INPUT_SCHEMA_VERSION,
       input,
       derivation,

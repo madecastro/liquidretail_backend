@@ -225,10 +225,14 @@ async function deriveStage(req) {
   });
 
   // Look up the artifact id so the Ad doc can FK back to it without
-  // having to re-find it later. buildLayoutInput upserts the artifact
-  // by (mediaId, template, aspectRatio) so this find is a single hit.
+  // having to re-find it later. The cache key now includes
+  // productId + variantKind to partition the cache properly.
   const artifact = await LayoutInputArtifact
-    .findOne({ mediaId, template, aspectRatio })
+    .findOne({
+      mediaId, template, aspectRatio,
+      productId:   req.productId   || null,
+      variantKind: req.variantKind || 'ugc'
+    })
     .select('_id')
     .lean();
 
