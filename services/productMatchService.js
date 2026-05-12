@@ -1638,8 +1638,16 @@ async function findCatalogMatchByText({
   if (!signals.length) return [];
 
   // Candidate pool — try category-scoped first, fall back to full catalog
-  // when the filter is too restrictive.
-  const baseQuery = { brandId, draft: { $ne: true } };
+  // when the filter is too restrictive. isPrimaryVariant: { $ne: false }
+  // collapses Meta's per-SKU variant fanout (8 sizes of HCO Original →
+  // 1 candidate) so we don't score the same image 8 times. Legacy rows
+  // without the field set still pass; only explicit non-primaries are
+  // excluded.
+  const baseQuery = {
+    brandId,
+    draft:            { $ne: true },
+    isPrimaryVariant: { $ne: false }
+  };
   let rows = [];
   if (category) {
     const filtered = await CatalogProduct

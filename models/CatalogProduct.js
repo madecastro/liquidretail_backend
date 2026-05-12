@@ -29,6 +29,25 @@ const catalogProductSchema = new mongoose.Schema({
   externalId:   { type: String, required: true, index: true },
   retailerId:   String,    // merchant SKU when distinct from externalId
 
+  // Meta's variant-grouping signal. Shopify-via-Meta sets this to a
+  // shared id across size/color/scent variants of the same parent
+  // product (e.g. all 8 sizes of "HCO Original" share one
+  // item_group_id). We use it to collapse the detect fanout: only the
+  // primary variant of each group runs the full pipeline; siblings
+  // skip enqueue because they share imagery anyway.
+  //
+  // Sparse — merchants that don't set up product groups in Meta will
+  // have this null, in which case enqueueBrandProductDetects falls
+  // back to grouping by nameNormalized.
+  itemGroupId:  { type: String, index: true, sparse: true },
+
+  // Primary-of-group marker set by enqueueBrandProductDetects when it
+  // resolves which variant runs detect. True for one row per
+  // (brandId, itemGroupId || nameNormalized) group; false for the
+  // rest. The match service can filter to primaries to avoid scoring
+  // the same image 8 times across variants.
+  isPrimaryVariant: { type: Boolean, default: false, index: true },
+
   // Draft state — true when the row was auto-created from detect or
   // a partial manual upload and is missing commerce-required fields
   // (price, productUrl). The catalog browser filters drafts into a

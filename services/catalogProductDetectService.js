@@ -18,6 +18,7 @@ const Media = require('../models/Media');
 const DetectRun = require('../models/DetectRun');
 const CatalogProduct = require('../models/CatalogProduct');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
+const { normalizeBrandName } = require('../models/Brand');
 
 const MAX_ALT_IMAGES = 4;
 
@@ -94,20 +95,61 @@ async function enqueueProductDetect(product) {
   return { enqueued };
 }
 
-// Bulk wrapper — fire enqueueProductDetect for every product missing
-// an imageMediaId for this brand. Used by catalogSyncService at the
-// end of a sync pass.
+// Bulk wrapper — fire enqueueProductDetect for the primary variant of
+// each product group. Used by catalogSyncService at the end of a sync
+// pass.
+//
+// Variant collapse: Shopify-via-Meta returns each size/color variant
+// as a distinct catalog row (e.g. 8 sizes of "HCO Original" = 8 rows
+// sharing the same hero image). Without dedup we'd pay for detect on
+// every variant. We group by itemGroupId when Meta provides it, and
+// fall back to nameNormalized when it doesn't. Within each group we
+// pick a primary (most images, tiebreak lowest externalId) and only
+// the primary runs detect. The rest get isPrimaryVariant=false and
+// stay query-visible for commerce; downstream matchers should filter
+// to primaries to avoid scoring the same image across variants.
 async function enqueueBrandProductDetects(brandId) {
   const products = await CatalogProduct.find({
     brandId,
-    imageUrl:     { $ne: null },
-    imageMediaId: null
+    imageUrl: { $ne: null }
   }).lean();
 
+  // Group → primary selection.
+  const groups = groupProductsForDetect(products);
+  const primaries    = [];
+  const nonPrimaries = [];
+  for (const group of groups.values()) {
+    const primary = pickPrimary(group);
+    primaries.push(primary);
+    for (const p of group) {
+      if (String(p._id) !== String(primary._id)) nonPrimaries.push(p);
+    }
+  }
+
+  // Stamp the variant role so the match service + UI can join on it.
+  // Done before enqueue so a partial-failure run still leaves the
+  // flag set consistently.
+  if (primaries.length) {
+    await CatalogProduct.updateMany(
+      { _id: { $in: primaries.map(p => p._id) } },
+      { $set: { isPrimaryVariant: true } }
+    );
+  }
+  if (nonPrimaries.length) {
+    await CatalogProduct.updateMany(
+      { _id: { $in: nonPrimaries.map(p => p._id) } },
+      { $set: { isPrimaryVariant: false } }
+    );
+  }
+
+  // Only primaries that haven't been detected yet need an enqueue
+  // call. Already-detected primaries no-op via the imageMediaId check
+  // inside enqueueProductDetect.
   let heroEnqueued = 0;
   let altEnqueued  = 0;
   let skipped      = 0;
-  for (const p of products) {
+  for (const p of primaries) {
+    if (p.imageMediaId) { skipped++; continue; }
     const r = await enqueueProductDetect(p);
     if (r.skipped) { skipped++; continue; }
     if (r.enqueued?.hero) heroEnqueued++;
@@ -116,9 +158,44 @@ async function enqueueBrandProductDetects(brandId) {
 
   console.log(
     `📦 catalog-product detect — brand=${brandId} ` +
-    `heroes=${heroEnqueued} alts=${altEnqueued} skipped=${skipped} (of ${products.length})`
+    `groups=${groups.size} primaries=${primaries.length} variants=${nonPrimaries.length} ` +
+    `heroes=${heroEnqueued} alts=${altEnqueued} skipped=${skipped} (rows ${products.length})`
   );
-  return { heroEnqueued, altEnqueued, skipped, total: products.length };
+  return {
+    heroEnqueued, altEnqueued, skipped,
+    groups:    groups.size,
+    primaries: primaries.length,
+    variants:  nonPrimaries.length,
+    total:     products.length
+  };
+}
+
+// Group products by (itemGroupId || nameNormalized(title)). Returns a
+// Map<groupKey, products[]>. nameNormalized is the fallback when Meta
+// doesn't expose item_group_id (some merchants don't model variants
+// as groups in the catalog).
+function groupProductsForDetect(products) {
+  const groups = new Map();
+  for (const p of products) {
+    const key = p.itemGroupId
+      ? `group:${p.itemGroupId}`
+      : `title:${normalizeBrandName(p.title || '')}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  }
+  return groups;
+}
+
+// Primary = the variant most useful to run detect on. Most images
+// first (richer hero candidates, more alts), tiebreak by lowest
+// externalId for determinism across re-syncs.
+function pickPrimary(group) {
+  return [...group].sort((a, b) => {
+    const ai = (a.additionalImages || []).length;
+    const bi = (b.additionalImages || []).length;
+    if (bi !== ai) return bi - ai;
+    return String(a.externalId).localeCompare(String(b.externalId));
+  })[0];
 }
 
 // Create a DetectRun for this Media only if one isn't already in-flight.

@@ -28,7 +28,11 @@ const FIELDS = [
   // V3 #2 dedup signals — Meta only fills these when the merchant
   // submitted them. gtin is the canonical barcode (EAN/UPC); mpn is
   // the manufacturer part number used as fallback.
-  'gtin', 'mpn'
+  'gtin', 'mpn',
+  // Variant grouping — Shopify-via-Meta sets this id to the shared
+  // parent product across size/color/scent variants. Used by detect
+  // enqueue to collapse the per-variant fanout.
+  'item_group_id'
 ].join(',');
 
 // Meta returns price as a string like "29.99 USD". Strip the trailing
@@ -149,6 +153,7 @@ async function syncCatalogForCred(cred) {
         source:          'ig-catalog',
         externalId,
         retailerId:      item.retailer_id || null,
+        itemGroupId:     item.item_group_id ? String(item.item_group_id).trim() || null : null,
         // V3 #2 dedup keys — normalized so cross-tenant lookups
         // match regardless of formatting (Meta sometimes wraps gtin
         // in whitespace or pads with leading zeros).

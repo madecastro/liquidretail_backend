@@ -200,10 +200,11 @@ router.get('/:id/products', async (req, res) => {
     const categoryPoolProducts = categoryRefs.length === 0
       ? []
       : await CatalogProduct.find({
-          brandId:     c.brandId,
-          categoryRef: { $in: categoryRefs },
-          draft:       { $ne: true },
-          _id:         { $nin: products.map(p => p._id) }
+          brandId:          c.brandId,
+          categoryRef:      { $in: categoryRefs },
+          draft:            { $ne: true },
+          isPrimaryVariant: { $ne: false },
+          _id:              { $nin: products.map(p => p._id) }
         })
           .select('title description category categoryRef brand price currency imageUrl productUrl externalId source')
           .limit(24)

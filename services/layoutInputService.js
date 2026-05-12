@@ -453,9 +453,10 @@ async function loadContext(mediaId, options = {}) {
   const categoryRefForPool = match?.identification?.details?.categoryRef || match?.categoryId || null;
   const categoryPool = categoryRefForPool && match?.brandId
     ? await CatalogProduct.find({
-        brandId:     match.brandId,
-        categoryRef: categoryRefForPool,
-        draft:       { $ne: true },
+        brandId:          match.brandId,
+        categoryRef:      categoryRefForPool,
+        draft:            { $ne: true },
+        isPrimaryVariant: { $ne: false },
         ...(match.catalogProductId ? { _id: { $ne: match.catalogProductId } } : {})
       })
         .select('title imageUrl productUrl price currency category')
