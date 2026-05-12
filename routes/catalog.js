@@ -50,6 +50,13 @@ function projectListRow(p, matchCount) {
     matchCount:   matchCount || 0,
     gtin:         p.gtin || null,
     mpn:          p.mpn  || null,
+    // Variant-group surface — variantCount lets the UI show
+    // "+N variants" when this row is the primary of a Meta
+    // item_group_id. isPrimaryVariant is exposed so the operator
+    // can see the role explicitly when ?showVariants=1.
+    itemGroupId:      p.itemGroupId || null,
+    isPrimaryVariant: p.isPrimaryVariant !== false,
+    variantCount:     typeof p.variantCount === 'number' ? p.variantCount : 0,
     detectedFromMediaId: p.detectedFromMediaId ? String(p.detectedFromMediaId) : null,
     firstSeenAt:  p.firstSeenAt,
     lastSyncedAt: p.lastSyncedAt
@@ -110,8 +117,17 @@ router.get('/', async (req, res) => {
     const filter = tenantFilter(req, { brandId });
     // ?ids=a,b,c — batch hydration for the Generate Ads picker.
     // Bypasses sort/pagination but stays inside tenant + brand scope.
+    // Also bypasses the primary-variant filter so direct id lookups
+    // resolve every requested row regardless of role.
     const idsParam = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
     if (idsParam.length) filter._id = { $in: idsParam.slice(0, 100) };
+    // Variant collapse — default to primaries only so the operator
+    // sees one row per Shopify item_group_id instead of 8 SKU
+    // variants. ?showVariants=1 disables the filter for explicit
+    // drilldown.
+    if (!idsParam.length && req.query.showVariants !== '1') {
+      filter.isPrimaryVariant = { $ne: false };
+    }
     if (req.query.source === 'draft') {
       filter.draft = true;
     } else if (req.query.source) {
@@ -152,7 +168,28 @@ router.get('/', async (req, res) => {
             foreignField: 'catalogProductId',
             as:           'matches'
         }},
-        { $addFields: { matchCount: { $size: '$matches' } } },
+        // Sibling variant count — only meaningful when itemGroupId is
+        // set (Meta's variant grouping). Title-based groups would
+        // need a normalized-string $lookup which isn't worth the
+        // pipeline cost; siblings stay 0 in that case.
+        { $lookup: {
+            from: 'catalogproducts',
+            let:  { gid: '$itemGroupId', bid: '$brandId', myId: '$_id' },
+            pipeline: [
+              { $match: { $expr: { $and: [
+                  { $ne: ['$$gid', null] },
+                  { $eq: ['$itemGroupId', '$$gid'] },
+                  { $eq: ['$brandId', '$$bid'] },
+                  { $ne: ['$_id', '$$myId'] }
+              ] } } },
+              { $count: 'n' }
+            ],
+            as: 'siblings'
+        }},
+        { $addFields: {
+            matchCount:   { $size: '$matches' },
+            variantCount: { $ifNull: [{ $arrayElemAt: ['$siblings.n', 0] }, 0] }
+        }},
         { $sort: { matchCount: -1, lastSyncedAt: -1 } },
         { $skip:  offset },
         { $limit: limit },
@@ -160,6 +197,7 @@ router.get('/', async (req, res) => {
             externalId: 1, source: 1, draft: 1, title: 1, brand: 1, category: 1,
             price: 1, currency: 1, availability: 1, imageUrl: 1, productUrl: 1,
             rating: 1, reviews: 1, gtin: 1, mpn: 1,
+            itemGroupId: 1, isPrimaryVariant: 1, variantCount: 1,
             detectedFromMediaId: 1, firstSeenAt: 1, lastSyncedAt: 1,
             matchCount: 1
         }}
