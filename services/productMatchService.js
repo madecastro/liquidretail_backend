@@ -1824,25 +1824,40 @@ function slugify(s) {
 //   { combinedScore, textScore, visualScore, catalogMatch, visualResult }
 // where catalogMatch is the top-K-filtered single best per-refined match
 // (or null when no candidate cleared the floor).
-// Compare a UGC refined crop against EVERY visual representation of a
-// catalog product: the canonical product.imageUrl AND any per-image
-// refined crops persisted by the catalog-product detect pipeline (top-1
-// highest-confidence crop per catalog Media). Returns the best result
-// across all targets — { isMatch, score, reasoning, matchedAgainst }
-// where matchedAgainst is the URL of the winning catalog-side image.
-//
-// Falls back to imageUrl-only when the catalog product has no per-image
-// refined crops yet (early ingest, YOLO failure on the catalog image).
+// Per-product cap on how many catalog-side images we compare the UGC
+// refined crop against. 1 (default) = hero refined crop only or
+// product.imageUrl fallback — cheapest path, ~3× fewer Gemini calls
+// per match. Bump to 5+ for the multi-image coverage that catches
+// alt-angle matches (UGC shows back of product, hero shows front,
+// only an alt crop matches). Env-tunable so cost/precision can be
+// dialed without a deploy.
+const CATALOG_VISUAL_MATCH_MAX_IMAGES = Math.max(1, parseInt(process.env.CATALOG_VISUAL_MATCH_MAX_IMAGES, 10) || 1);
+
+// Compare a UGC refined crop against up to CATALOG_VISUAL_MATCH_MAX_IMAGES
+// visual representations of a catalog product. Targets are ordered
+// hero-refined-crops first, then alt-refined-crops, then the canonical
+// product.imageUrl as a last-resort fallback. The cap is applied
+// AFTER ordering so top-1 mode always picks the strongest signal
+// available. Returns the best { isMatch, score, reasoning,
+// matchedAgainst } across the chosen targets.
 async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product) {
   if (!ugcCropImageUrl || !product) return null;
 
+  // Refined crops first (tight YOLO bbox of the product, less
+  // background noise than the raw Shopify imageUrl). Hero-first
+  // ordering is applied inside loadCatalogRefinedCropUrls.
   const catalogCrops = await loadCatalogRefinedCropUrls(product._id);
-  const targets = new Set();
-  if (product.imageUrl) targets.add(product.imageUrl);
-  for (const url of catalogCrops) targets.add(url);
-  if (!targets.size) return null;
+  const ordered = [];
+  for (const url of catalogCrops) {
+    if (!ordered.includes(url)) ordered.push(url);
+  }
+  if (product.imageUrl && !ordered.includes(product.imageUrl)) {
+    ordered.push(product.imageUrl);
+  }
+  const targets = ordered.slice(0, CATALOG_VISUAL_MATCH_MAX_IMAGES);
+  if (!targets.length) return null;
 
-  const results = await Promise.all([...targets].map(async (url) => {
+  const results = await Promise.all(targets.map(async (url) => {
     const r = await visualCatalogMatch.compareCropToCandidate({
       cropImageUrl: ugcCropImageUrl,
       candidate:    { imageUrl: url, title: product.title }
@@ -1859,23 +1874,41 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product) {
 }
 
 // Pull the top-1 highest-confidence refined YOLO crop URL from EACH
-// catalog-product Media tied to the given CatalogProduct. Returns []
-// when no catalog Media exists yet or none have refined crops.
+// catalog-product Media tied to the given CatalogProduct, ordered
+// HERO FIRST then alts. Hero-first ordering matters for the top-1
+// visual-match path — picking the hero's canonical crop over an
+// arbitrary alt's gives the strongest single comparison signal.
+// Returns [] when no catalog Media exists yet or none have refined crops.
 async function loadCatalogRefinedCropUrls(catalogProductId) {
   if (!catalogProductId) return [];
   const medias = await Media.find(
     { source: 'catalog-product', 'metadata.catalogProductId': catalogProductId },
-    { latestArtifacts: 1 }
+    { latestArtifacts: 1, 'metadata.imageRole': 1 }
   ).lean();
   if (!medias.length) return [];
+  // Sort hero-first; preserve insertion order among alts.
+  medias.sort((a, b) => {
+    const aHero = a.metadata?.imageRole === 'hero' ? 0 : 1;
+    const bHero = b.metadata?.imageRole === 'hero' ? 0 : 1;
+    return aHero - bHero;
+  });
+
+  // Bulk-load all detections so the per-Media ordering is preserved
+  // when we map back. find() with $in doesn't guarantee order, so
+  // we index by id and walk the sorted media list.
   const detectionIds = medias.map(m => m.latestArtifacts?.detection).filter(Boolean);
   if (!detectionIds.length) return [];
   const detections = await DetectionArtifact.find(
     { _id: { $in: detectionIds } },
     { refinedProducts: 1 }
   ).lean();
+  const detById = new Map(detections.map(d => [String(d._id), d]));
+
   const urls = [];
-  for (const det of detections) {
+  for (const m of medias) {
+    const detId = m.latestArtifacts?.detection ? String(m.latestArtifacts.detection) : null;
+    const det = detId ? detById.get(detId) : null;
+    if (!det) continue;
     const top = (det.refinedProducts || [])
       .filter(rp => rp.croppedImageUrl)
       .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
