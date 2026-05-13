@@ -345,6 +345,12 @@ async function renderOne(run, job, adId, index, renderToken) {
       campaignRunId: run.runId,
       brandId:       job.brandId,
       campaignKind:  job.campaignKind,
+      // Promotional details ride alongside campaignKind so the
+      // derivation prompt can compose offer-aware headlines for
+      // kind='promotional' campaigns. Snapshot from the campaign at
+      // run-start time; in-flight edits won't take effect until the
+      // operator re-renders (cache key includes a hash of this).
+      promotionalDetails: job.promotionalDetails || null,
       // variantKind + productId thread through so buildLayoutInput
       // can swap the product source (UGC match vs catalog product
       // direct) and gate UGC-only slots (creator, ugc, engagement).

@@ -172,9 +172,35 @@ const campaignSchema = new mongoose.Schema({
   //                  collection imports).
   //   'brand'      — no SKU/collection resolution AND objective is
   //                  awareness / traffic / video views — operator
-  //                  picks products manually from the full catalog
+  //                  picks products manually from the full catalog.
+  //                  Composition: headline anchors on Brand.tagline;
+  //                  LLM produces tone-aware variants.
+  //   'promotional'— time-bound offer (sale / giveaway / launch). The
+  //                  operator supplies the offer details (see
+  //                  promotionalDetails below); the derivation prompt
+  //                  surfaces them in the headline.
   //   null         — unknown (legacy rows pre-derivation)
-  kind:          { type: String, enum: ['product', 'collection', 'brand', null], default: null },
+  kind:          { type: String, enum: ['product', 'collection', 'brand', 'promotional', null], default: null },
+
+  // Operator-supplied promotional context. Only consulted when
+  // kind='promotional'. Free-form so the wizard can grow it without a
+  // schema rev. The derivation prompt reads these to compose headlines
+  // like "20% off Hot Crispy Oil — Ends Friday" or "Free spoon with
+  // any order". A hash of this block feeds the LayoutInputArtifact
+  // cache key so edits invalidate cached derivations.
+  //
+  // Shape (all optional):
+  //   { startsAt:     Date,            window start (urgency cue)
+  //     endsAt:       Date,            window end   (urgency cue)
+  //     discountType: 'percent' | 'amount' | 'bogo' | 'bundle' | 'gift' | 'free_shipping',
+  //     discountValue: Number,         e.g. 20 for 20%, 5 for $5 off
+  //     discountCode: String,          promo code if any
+  //     giveaway:     String,          free-form ("Free spoon with $50+")
+  //     productIds:   [ObjectId],      subset of catalog on promo
+  //     headline:     String,          operator's preferred headline (LLM may vary)
+  //     notes:        String           free-form context for the LLM
+  //   }
+  promotionalDetails: mongoose.Schema.Types.Mixed,
 
   // Full raw payload from the platform — capped to ~16KB worth of
   // JSON. Useful for debugging and for fields we haven't mapped yet.

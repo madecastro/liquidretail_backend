@@ -216,11 +216,12 @@ async function deriveStage(req) {
     aspectRatio,
     refresh: !!req.options?.refresh,
     options: {
-      campaignKind: req.campaignKind || null,
-      ctaText:      req.cta?.text     || null,
-      ctaUrl:       req.cta?.url      || null,
-      variantKind:  req.variantKind   || 'ugc',
-      productId:    req.productId     || null
+      campaignKind:       req.campaignKind        || null,
+      promotionalDetails: req.promotionalDetails  || null,
+      ctaText:            req.cta?.text           || null,
+      ctaUrl:             req.cta?.url            || null,
+      variantKind:        req.variantKind         || 'ugc',
+      productId:          req.productId           || null
     }
   });
 

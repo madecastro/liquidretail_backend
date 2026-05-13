@@ -36,6 +36,15 @@ const layoutInputArtifactSchema = new mongoose.Schema({
   productId:   { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null, index: true },
   variantKind: { type: String, default: null },     // 'ugc' | 'product_image' | null
 
+  // Hash of campaign-intent inputs (Campaign.kind + promotionalDetails).
+  // Null for kind='product'/null callers (legacy + product-mode share a
+  // single cache entry per (mediaId, template, ratio, productId,
+  // variantKind)). Non-null for kind='brand'/'promotional' so different
+  // campaign intents — and different promotionalDetails edits — get
+  // their own derivations. Computed by layoutInputService.buildLayoutInput
+  // via crypto.createHash('sha256').
+  campaignContextHash: { type: String, default: null },
+
   // Semver of the input shape. Bump when the canonical path structure
   // changes (e.g. v1 → v2 moved hero_image_url → hero_media.image, split
   // creator out of ugc). buildLayoutInput refuses to serve a cached doc
@@ -50,12 +59,15 @@ const layoutInputArtifactSchema = new mongoose.Schema({
 });
 
 // One cached input per unique (mediaId, template, aspectRatio,
-// productId, variantKind) combination. productId + variantKind
-// partition the cache so different seed products on the same media
-// don't collide. Re-running deletes the prior matching entry via
-// findOneAndReplace in the service.
+// productId, variantKind, campaignContextHash) combination.
+// productId + variantKind partition the cache so different seed
+// products on the same media don't collide. campaignContextHash
+// partitions further so brand-mode vs promotional-mode vs product-mode
+// derivations don't share copy (a brand-tagline headline and a
+// "20% off" headline are not interchangeable). Re-running deletes the
+// prior matching entry via findOneAndReplace in the service.
 layoutInputArtifactSchema.index(
-  { mediaId: 1, template: 1, aspectRatio: 1, productId: 1, variantKind: 1 },
+  { mediaId: 1, template: 1, aspectRatio: 1, productId: 1, variantKind: 1, campaignContextHash: 1 },
   { unique: true }
 );
 

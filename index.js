@@ -234,15 +234,17 @@ mongoose.connect(process.env.MONGODB_URI, {
     // which races against postSyncService / catalogProductDetectService
     // inserts. Explicit sync ensures the guards exist before any traffic.
     try {
-      const DetectRun   = require('./models/DetectRun');
-      const Ad          = require('./models/Ad');
-      const CampaignRun = require('./models/CampaignRun');
+      const DetectRun           = require('./models/DetectRun');
+      const Ad                  = require('./models/Ad');
+      const CampaignRun         = require('./models/CampaignRun');
+      const LayoutInputArtifact = require('./models/LayoutInputArtifact');
       await Promise.all([
         DetectRun.syncIndexes(),
         Ad.syncIndexes(),
-        CampaignRun.syncIndexes()
+        CampaignRun.syncIndexes(),
+        LayoutInputArtifact.syncIndexes()
       ]);
-      console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun)');
+      console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun, LayoutInputArtifact)');
     } catch (err) {
       console.warn(`⚠️  syncIndexes failed (non-fatal): ${err.message}`);
     }

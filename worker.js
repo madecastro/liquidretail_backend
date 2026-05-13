@@ -61,12 +61,14 @@ mongoose.connect(process.env.MONGODB_URI, {
   // place before the worker starts inserting. Awaiting it blocks startup
   // by a couple seconds at most on these small collections.
   try {
+    const LayoutInputArtifact = require('./models/LayoutInputArtifact');
     await Promise.all([
       DetectRun.syncIndexes(),
       Ad.syncIndexes(),
-      CampaignRun.syncIndexes()
+      CampaignRun.syncIndexes(),
+      LayoutInputArtifact.syncIndexes()
     ]);
-    console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun)');
+    console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun, LayoutInputArtifact)');
   } catch (err) {
     console.warn(`⚠️  syncIndexes failed (non-fatal): ${err.message}`);
   }

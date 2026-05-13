@@ -158,7 +158,14 @@ async function expandWizardJob({
   if (!campaign) throw new Error(`Campaign not found: ${campaignId}`);
 
   const brandId      = String(campaign.brandId);
-  const campaignKind = campaign.kind || 'promotional';
+  // Default to 'product' for kind-less campaigns. The legacy default
+  // was 'promotional' but with our new derivation-prompt branching,
+  // 'promotional' implies operator-supplied offer details; defaulting
+  // to it for legacy rows would mis-route the derivation. 'product'
+  // matches existing composition behavior (the prompt's product-mode
+  // path) for any campaign whose kind wasn't explicitly set.
+  const campaignKind = campaign.kind || 'product';
+  const promotionalDetails = campaign.promotionalDetails || null;
   const allowedTemplates = templateIds.filter(t => SUPPORTED_TEMPLATES.has(t));
   if (!allowedTemplates.length) {
     throw new Error(`No supported templates in selection. V1 supports: ${Array.from(SUPPORTED_TEMPLATES).join(', ')}`);
@@ -288,6 +295,7 @@ async function expandWizardJob({
     campaignId: String(campaignId),
     brandId,
     campaignKind,
+    promotionalDetails,
     queuedCount,
     newlyQueued: newAdIds.length,
     alreadyQueued,

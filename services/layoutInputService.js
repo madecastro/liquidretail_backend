@@ -48,6 +48,7 @@
 // LayoutInputArtifact; `refresh: true` bypasses.
 
 const axios = require('axios');
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 
 const Media                  = require('../models/Media');
@@ -243,13 +244,20 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   // default to null for legacy callers (ads.html preview) — those
   // cluster under (null, null) and don't conflict with ad-render
   // entries that always have both set.
+  // campaignContextHash partitions further so a kind='brand' /
+  // kind='promotional' campaign gets a separate cache entry from a
+  // kind='product' campaign on the same (mediaId, template, ratio,
+  // productId, variantKind). Edits to promotionalDetails change the
+  // hash, forcing a re-derivation.
   const cacheKeyProductId   = options.productId   || null;
   const cacheKeyVariantKind = options.variantKind || null;
+  const campaignContextHash = computeCampaignContextHash(options);
   if (!refresh) {
     const cached = await LayoutInputArtifact.findOne({
       mediaId, template, aspectRatio,
       productId:   cacheKeyProductId,
-      variantKind: cacheKeyVariantKind
+      variantKind: cacheKeyVariantKind,
+      campaignContextHash
     }).lean();
     // Cache hit only if the stored schema version matches what we emit today.
     // Without this check, v1 cached docs (with old paths like hero_image_url)
@@ -291,7 +299,8 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
     {
       mediaId, template, aspectRatio,
       productId:   cacheKeyProductId,
-      variantKind: cacheKeyVariantKind
+      variantKind: cacheKeyVariantKind,
+      campaignContextHash
     },
     {
       mediaId,
@@ -300,6 +309,7 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
       aspectRatio,
       productId:   cacheKeyProductId,
       variantKind: cacheKeyVariantKind,
+      campaignContextHash,
       schemaVersion: INPUT_SCHEMA_VERSION,
       input,
       derivation,
@@ -309,6 +319,25 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   );
 
   return input;
+}
+
+// Hash of campaign-intent inputs that affect derivation. Returns null
+// when no campaign-intent overrides are active (kind='product'/null,
+// or no promotionalDetails on a brand campaign) so product-mode and
+// legacy entries cluster under a single cache slot. Non-null hash for
+// kind='brand'/'promotional' captures every input that changes the
+// derived headline copy — so an operator editing the offer's end date
+// or discount % invalidates the cached derivation cleanly.
+function computeCampaignContextHash(options) {
+  const kind = options?.campaignKind || null;
+  // 'product' is the no-special-handling default; treat as null for
+  // cache compatibility with legacy rows.
+  if (!kind || kind === 'product' || kind === 'collection') return null;
+  const payload = JSON.stringify({
+    kind,
+    promo: options.promotionalDetails || null
+  });
+  return crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -440,10 +469,10 @@ async function loadContext(mediaId, options = {}) {
       .select('_id fileUrl latestArtifacts classification metadata.imageRole')
       .lean() : [];
 
-    // Hero pick — prefer the Media that the seed already chose
-    // (options.mediaId); fall back to imageRole='hero' for legacy ads
+    // Hero pick — prefer the Media the seed pointed at (loadContext's
+    // first arg mediaId); fall back to imageRole='hero' for legacy ads
     // queued before shotType ranking landed.
-    const seedMediaId = options.mediaId ? String(options.mediaId) : null;
+    const seedMediaId = mediaId ? String(mediaId) : null;
     let heroMediaDoc = seedMediaId
       ? catalogMediaDocs.find(m => String(m._id) === seedMediaId)
       : null;
@@ -621,6 +650,8 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   const isBranding = match?.outcome === 'brand_match';
   const isProductImage = options.variantKind === 'product_image';
   const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
+  const campaignKind = options.campaignKind || null;
+  const promo = options.promotionalDetails || null;
   const lines = [];
 
   lines.push(`You are composing creative copy for a social-proof ad layout.`);
@@ -628,6 +659,68 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   lines.push(`Aspect ratio: ${aspectRatio}.`);
   if (options.tone_hint) lines.push(`Caller tone hint: ${options.tone_hint}.`);
   lines.push('');
+
+  // CAMPAIGN INTENT — overrides default headline rules when the
+  // operator chose 'brand' (tagline-anchored variants) or 'promotional'
+  // (offer-aware copy with urgency). 'product'/null/'collection' keep
+  // the existing match-outcome-driven framing below.
+  if (campaignKind === 'brand') {
+    const tagline = brand?.tagline || null;
+    const tone    = Array.isArray(brand?.tone) ? brand.tone.filter(Boolean) : [];
+    lines.push('CAMPAIGN INTENT — BRAND CAMPAIGN');
+    if (tagline) {
+      lines.push(`Anchor every headline variant on the brand's tagline: "${tagline}".`);
+      lines.push(`Do not invent a new brand position. Reword, tighten, or punch up the tagline to fit the slot's character budget. The headline should READ as a variant of the tagline, not unrelated copy.`);
+    } else {
+      lines.push(`No tagline is on file for the brand. Treat headlines as brand-positioning lines — short, evocative, focused on the brand itself rather than any specific product or offer.`);
+    }
+    if (tone.length) {
+      lines.push(`Match the brand's voice. Tone descriptors: ${tone.join(', ')}.`);
+    }
+    lines.push('Do NOT write product-specific feature claims or pitches in the headline.');
+    lines.push('');
+  } else if (campaignKind === 'promotional') {
+    lines.push('CAMPAIGN INTENT — PROMOTIONAL CAMPAIGN');
+    if (promo && Object.keys(promo).length) {
+      const promoLines = [];
+      if (promo.discountType && promo.discountValue != null) {
+        const v = promo.discountValue;
+        const offer = promo.discountType === 'percent' ? `${v}% off`
+                    : promo.discountType === 'amount'  ? `$${v} off`
+                    : promo.discountType === 'bogo'    ? 'Buy one, get one'
+                    : promo.discountType === 'bundle'  ? 'Bundle savings'
+                    : promo.discountType === 'gift'    ? `Free gift${promo.giveaway ? `: ${promo.giveaway}` : ''}`
+                    : promo.discountType === 'free_shipping' ? 'Free shipping'
+                    : `${promo.discountType}: ${v}`;
+        promoLines.push(`- Offer: ${offer}`);
+      } else if (promo.giveaway) {
+        promoLines.push(`- Giveaway: ${promo.giveaway}`);
+      }
+      if (promo.discountCode)             promoLines.push(`- Promo code: ${promo.discountCode}`);
+      if (promo.startsAt || promo.endsAt) {
+        const start = promo.startsAt ? new Date(promo.startsAt).toISOString().slice(0, 10) : '—';
+        const end   = promo.endsAt   ? new Date(promo.endsAt).toISOString().slice(0, 10)   : '—';
+        promoLines.push(`- Window: ${start} → ${end}`);
+      }
+      if (promo.headline) promoLines.push(`- Operator's preferred headline: "${promo.headline}" (use as anchor; vary tone + length to fit the slot).`);
+      if (promo.notes)    promoLines.push(`- Notes: ${promo.notes}`);
+      lines.push('Operator-supplied promotional details:');
+      promoLines.forEach(l => lines.push(l));
+      lines.push('');
+      lines.push('Headline MUST surface the offer or giveaway. Cite the discount, promo code, or freebie clearly — that is the reason this ad is running.');
+      if (promo.endsAt) {
+        const daysLeft = Math.ceil((new Date(promo.endsAt).getTime() - Date.now()) / 86400000);
+        if (Number.isFinite(daysLeft) && daysLeft > 0 && daysLeft <= 7) {
+          lines.push(`Add urgency — the offer ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. Use phrases like "Ends Friday", "${daysLeft} days left", "Don't miss it" where natural.`);
+        }
+      }
+    } else {
+      lines.push('Promotional campaign with no operator-supplied details. Lean toward urgency + "limited time" framing without inventing specific numbers or dates.');
+    }
+    lines.push('Do not undercut the offer with generic brand copy — every headline variant should reference the deal in some form.');
+    lines.push('');
+  }
+
 
   // Brand-mode banner — sets framing for the whole prompt up front so
   // every TASK rule the model considers below is filtered through
