@@ -322,6 +322,7 @@ async function seedFromBrandOnly(brandId, topN) {
   const mediaIds = Array.from(new Set(matches.map(m => String(m.mediaId))));
   const medias = await loadMediasForScoring(mediaIds);
   const ranked = medias
+    .filter(isMediaEligibleByContentNature)
     .sort((a, b) => (b.adSuitability?.score ?? -1) - (a.adSuitability?.score ?? -1))
     .slice(0, topN);
   return ranked.map(m => ({
@@ -342,9 +343,13 @@ async function seedFromBrandOnly(brandId, topN) {
 // explicit pick still produces an ad.
 async function seedsFromMedia(brandId, mediaId) {
   const media = await Media.findById(mediaId)
-    .select('matchedProducts adSuitability fileType')
+    .select('matchedProducts adSuitability fileType classification')
     .lean();
   if (!media) return [];
+  // Operator-driven path: when the wizard hands us a specific mediaId
+  // they ALREADY picked, trust the pick and bypass the content-nature
+  // gate. The gate is for inventory pulls (brand-only, brand-match
+  // fallback) where the operator hasn't seen the post.
   const fileType = media.fileType;
   const score    = media.adSuitability?.score ?? null;
 
@@ -386,7 +391,10 @@ async function seedsFromProduct(brandId, productId) {
 
   // Tiers 1 + 2 — product_match + product_category from the
   // denormalized mirror. Bulk-load the referenced Media docs so we
-  // can score by adSuitability + grab fileType.
+  // can score by adSuitability + grab fileType. Content-nature filter
+  // excludes promotional / announcement UGC (sale-of-the-week,
+  // "coming soon" teasers) — they read as stale ad inserts once the
+  // offer/date passes.
   if (product?.matchedMedia?.length) {
     const mediaIds = Array.from(new Set(product.matchedMedia.map(mm => String(mm.mediaId))));
     const medias = await loadMediasForScoring(mediaIds);
@@ -394,6 +402,7 @@ async function seedsFromProduct(brandId, productId) {
     for (const mm of product.matchedMedia) {
       const media = mediaById.get(String(mm.mediaId));
       if (!media) continue;
+      if (!isMediaEligibleByContentNature(media)) continue;
       seeds.push({
         productId:        String(productId),
         mediaId:          String(mm.mediaId),
@@ -417,6 +426,7 @@ async function seedsFromProduct(brandId, productId) {
   if (brandMatchMediaIds.length) {
     const medias = await loadMediasForScoring(brandMatchMediaIds);
     for (const m of medias) {
+      if (!isMediaEligibleByContentNature(m)) continue;
       seeds.push({
         productId:        String(productId),
         mediaId:          String(m._id),
@@ -456,8 +466,26 @@ async function seedsFromProduct(brandId, productId) {
 async function loadMediasForScoring(mediaIds) {
   if (!mediaIds.length) return [];
   return Media.find({ _id: { $in: mediaIds } })
-    .select('_id adSuitability fileType')
+    .select('_id adSuitability fileType classification')
     .lean();
+}
+
+// Time-bound posts (sale-of-the-week, "coming soon" teasers, holiday
+// promos) make terrible evergreen ad inserts — they reference dates
+// or offers that have passed by the time the ad runs. subjectTextService
+// classifies each Media into evergreen / promotional / announcement /
+// unknown; this gate excludes promotional + announcement when the
+// classifier is confident enough. unknown + low-confidence calls fall
+// through to inclusion so a flaky classifier doesn't starve the queue.
+const CONTENT_NATURE_BLOCK_THRESHOLD = 0.7;
+function isMediaEligibleByContentNature(media) {
+  const nature = media?.classification?.contentNature;
+  if (!nature || nature === 'evergreen' || nature === 'unknown') return true;
+  const conf = media?.classification?.contentNatureConfidence;
+  if (typeof conf === 'number' && conf >= CONTENT_NATURE_BLOCK_THRESHOLD) {
+    return false;
+  }
+  return true;
 }
 
 function dedupeSeeds(seeds) {

@@ -74,6 +74,16 @@ async function detectSubjectsAndText(imageUrl, hints = {}) {
 
 "secondaryElementsTags": array of 2–6 short noun tags describing the OTHER notable elements visible in the frame (not the primary subject). Drawn from secondary subjects + background contents. Single-word or two-word tags, capitalized. Examples: ["Mountain", "Trees", "Trail"], ["Coffee Mug", "Notebook"], ["Skyline", "Crosswalk"]. Omit if nothing notable.
 
+"contentNature": classify this post for ad-suitability using BOTH the caption (if provided) and visible text in the image:
+  - "evergreen":     lifestyle, product-in-use, behind-the-scenes, brand origin, customer testimonial without a time-bound offer. Reusable in ads year-round.
+  - "promotional":   contains a specific offer or sale ("20% off", "BOGO", "Black Friday deal", "Sale ends Friday", "Use code XYZ"). Time-bound; stale fast.
+  - "announcement":  teases or announces something new ("Coming soon", "New flavor dropping", "Just launched", "Drops tomorrow", collab reveals, event teasers). Time-bound; stale once the thing has launched.
+  - "unknown":       neither caption nor image text gives a clear signal.
+
+"contentNatureConfidence": 0.0-1.0 — how confident you are in the classification. ≥0.7 when caption or visible text directly signals (e.g. "% off" or "coming soon"); ≤0.5 when you're inferring from softer signals.
+
+"contentNatureReason": one short sentence citing the specific signal (e.g. "Caption says 'Black Friday 50% off'", "Visible text reads 'Coming soon'", "Lifestyle product-in-use shot with no time-bound language"). Max 120 chars.
+
 The PRIMARY subject's description should be detailed enough to search for it online — include material, color, cut/silhouette, notable features, and any product name/label you can read.${hintBlock}
 
 Return ONLY valid JSON, no markdown, no explanation.`
@@ -137,7 +147,26 @@ Return ONLY valid JSON, no markdown, no explanation.`
         .slice(0, 6)
     : [];
 
-  return { subjects, text, background, primarySubjectLabel, secondaryElementsTags };
+  // Content-nature classification — used downstream by the seed filter
+  // in campaignAdsGenerationService to exclude time-bound promotional /
+  // announcement UGC from default ad inventory. Default to 'unknown' so
+  // an LLM that doesn't return the field gets included rather than
+  // excluded by mistake.
+  const CONTENT_NATURE_VALUES = new Set(['evergreen', 'promotional', 'announcement', 'unknown']);
+  const rawNature = typeof parsed.contentNature === 'string' ? parsed.contentNature.trim().toLowerCase() : '';
+  const contentNature = CONTENT_NATURE_VALUES.has(rawNature) ? rawNature : 'unknown';
+  const contentNatureConfidence = typeof parsed.contentNatureConfidence === 'number'
+    ? Math.max(0, Math.min(1, parsed.contentNatureConfidence))
+    : 0.5;
+  const contentNatureReason = typeof parsed.contentNatureReason === 'string'
+    ? parsed.contentNatureReason.trim().slice(0, 120)
+    : null;
+
+  return {
+    subjects, text, background,
+    primarySubjectLabel, secondaryElementsTags,
+    contentNature, contentNatureConfidence, contentNatureReason
+  };
 }
 
 function clamp(v) {
