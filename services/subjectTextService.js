@@ -84,6 +84,19 @@ async function detectSubjectsAndText(imageUrl, hints = {}) {
 
 "contentNatureReason": one short sentence citing the specific signal (e.g. "Caption says 'Black Friday 50% off'", "Visible text reads 'Coming soon'", "Lifestyle product-in-use shot with no time-bound language"). Max 120 chars.
 
+"shotType": classify the photographic style. Look at framing, scene composition, and whether the product is isolated or in context:
+  - "lifestyle":     product shown in real-world context (in use, on a table, in a kitchen scene, held in hand, plated, etc.) — has scene, props, or ambient context
+  - "on_model":      person wearing, holding, or using the product (face may be cropped or full)
+  - "product_only":  isolated studio shot — single product on plain or solid background (white, gray, transparent, gradient). No human, no scene.
+  - "flat_lay":      top-down arrangement of one or more items on a flat surface
+  - "detail":        close-up / macro of a specific feature or texture (not the full product)
+  - "packaging":     box, label, or wrapper shot — emphasis on packaging, not the product itself
+  - "unknown":       ambiguous or doesn't fit any of the above
+
+"shotTypeConfidence": 0.0-1.0 — confidence in the shot type classification.
+
+"shotTypeReason": one short sentence citing the visual signal (e.g. "Bottle held over a steaming bowl of noodles on a wooden table", "Studio shot of bottle on white seamless"). Max 120 chars.
+
 The PRIMARY subject's description should be detailed enough to search for it online — include material, color, cut/silhouette, notable features, and any product name/label you can read.${hintBlock}
 
 Return ONLY valid JSON, no markdown, no explanation.`
@@ -162,10 +175,29 @@ Return ONLY valid JSON, no markdown, no explanation.`
     ? parsed.contentNatureReason.trim().slice(0, 120)
     : null;
 
+  // Shot-type classification — used by seedsFromProduct (Tier 0) to
+  // pick a lifestyle/on-model shot as the visual hero of a product_image
+  // ad, and by layoutInputService to pick a product_only shot for the
+  // product.image inset. Relevant primarily for catalog product Media;
+  // UGC posts almost always land on 'lifestyle' but downstream UGC
+  // consumers don't read the field.
+  const SHOT_TYPE_VALUES = new Set([
+    'lifestyle', 'on_model', 'product_only', 'flat_lay', 'detail', 'packaging', 'unknown'
+  ]);
+  const rawShot = typeof parsed.shotType === 'string' ? parsed.shotType.trim().toLowerCase() : '';
+  const shotType = SHOT_TYPE_VALUES.has(rawShot) ? rawShot : 'unknown';
+  const shotTypeConfidence = typeof parsed.shotTypeConfidence === 'number'
+    ? Math.max(0, Math.min(1, parsed.shotTypeConfidence))
+    : 0.5;
+  const shotTypeReason = typeof parsed.shotTypeReason === 'string'
+    ? parsed.shotTypeReason.trim().slice(0, 120)
+    : null;
+
   return {
     subjects, text, background,
     primarySubjectLabel, secondaryElementsTags,
-    contentNature, contentNatureConfidence, contentNatureReason
+    contentNature, contentNatureConfidence, contentNatureReason,
+    shotType, shotTypeConfidence, shotTypeReason
   };
 }
 

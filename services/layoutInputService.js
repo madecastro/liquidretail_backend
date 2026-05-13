@@ -417,18 +417,40 @@ async function loadContext(mediaId, options = {}) {
     // raw uncropped Shopify URL. Per-ratio judge winners are picked the
     // same way as the main hero — slot consumers get a c_crop transform
     // URL keyed to the slot's ratio.
+    //
+    // Two slot consumers, two preferences:
+    //   - productHero.crops      → product.hero_media / hero of the ad
+    //                              wants lifestyle / on_model / flat_lay
+    //                              (the wizard's product_image seed
+    //                              already pointed mediaId at this one)
+    //   - productInset.crops     → product.image inset / product_meta
+    //                              wants product_only / packaging — a
+    //                              clean isolated shot for the small
+    //                              callout. Resolved here by scanning
+    //                              alt Media for the product.
     // metadata.catalogProductId stored as ObjectId; cast string forms
     // so api → service hops don't lose the match.
     const productOid = mongoose.isValidObjectId(options.productId)
       ? new mongoose.Types.ObjectId(String(options.productId))
       : options.productId;
-    const heroMediaDoc = await Media.findOne({
+    const catalogMediaDocs = productOid ? await Media.find({
       source: 'catalog-product',
-      'metadata.catalogProductId': productOid,
-      'metadata.imageRole': 'hero'
+      'metadata.catalogProductId': productOid
     })
-      .select('_id fileUrl latestArtifacts')
-      .lean();
+      .select('_id fileUrl latestArtifacts classification metadata.imageRole')
+      .lean() : [];
+
+    // Hero pick — prefer the Media that the seed already chose
+    // (options.mediaId); fall back to imageRole='hero' for legacy ads
+    // queued before shotType ranking landed.
+    const seedMediaId = options.mediaId ? String(options.mediaId) : null;
+    let heroMediaDoc = seedMediaId
+      ? catalogMediaDocs.find(m => String(m._id) === seedMediaId)
+      : null;
+    if (!heroMediaDoc) {
+      heroMediaDoc = catalogMediaDocs.find(m => m.metadata?.imageRole === 'hero') || catalogMediaDocs[0] || null;
+    }
+
     if (heroMediaDoc) {
       const heroDetection = heroMediaDoc.latestArtifacts?.detection
         ? await DetectionArtifact.findById(heroMediaDoc.latestArtifacts.detection).select('imageUrl').lean()
@@ -441,6 +463,45 @@ async function loadContext(mediaId, options = {}) {
         imageUrl: heroDetection?.imageUrl || heroMediaDoc.fileUrl || null,
         crops:    heroCrops || null
       };
+    }
+
+    // Inset pick — best product_only shot OTHER than the hero. When
+    // the catalog only has one shot (no alts), inset falls back to
+    // hero's own crop in assembleInput. Ranking matches the inverse
+    // priority used in seedsFromProduct's hero ranking.
+    const INSET_RANK = {
+      product_only: 1,
+      packaging:    2,
+      detail:       3,
+      flat_lay:     4,
+      unknown:      5,
+      lifestyle:    6,
+      on_model:     7
+    };
+    const insetCandidates = catalogMediaDocs
+      .filter(m => !heroMediaDoc || String(m._id) !== String(heroMediaDoc._id))
+      .slice()
+      .sort((a, b) => {
+        const ra = INSET_RANK[a.classification?.shotType] ?? INSET_RANK.unknown;
+        const rb = INSET_RANK[b.classification?.shotType] ?? INSET_RANK.unknown;
+        return ra - rb;
+      });
+    const insetMediaDoc = insetCandidates[0] || null;
+    if (insetMediaDoc) {
+      const insetCrops = insetMediaDoc.latestArtifacts?.crops
+        ? await CropArtifact.findById(insetMediaDoc.latestArtifacts.crops).lean()
+        : null;
+      const insetDetection = insetMediaDoc.latestArtifacts?.detection
+        ? await DetectionArtifact.findById(insetMediaDoc.latestArtifacts.detection).select('imageUrl').lean()
+        : null;
+      // Stash on productHero so assembleInput / pickProductImage can
+      // serve product.image from the inset crop. When undefined, the
+      // existing fallback uses heroCrops (single-shot catalogs).
+      if (productHero) {
+        productHero.insetMediaId = insetMediaDoc._id;
+        productHero.insetImageUrl = insetDetection?.imageUrl || insetMediaDoc.fileUrl || null;
+        productHero.insetCrops    = insetCrops || null;
+      }
     }
   }
   const runId = detection?.runId || null;
@@ -1535,6 +1596,18 @@ function pickHeroMedia(ctx, aspectRatio) {
 // (the raw CatalogProduct.imageUrl, uncropped).
 function pickProductImage(ctx, aspectRatio, details) {
   const ph = ctx?.productHero;
+  // Prefer the INSET media (best product_only / clean catalog shot) for
+  // the small product callout slot. When loadContext found one, it
+  // stashed insetCrops/insetImageUrl on productHero alongside the main
+  // hero crops. For single-shot catalogs (no alt classified as
+  // product_only), fall through to the hero's own crop.
+  if (ph?.insetCrops?.winners && ph?.insetImageUrl) {
+    const winnerId = ph.insetCrops.winners[aspectRatio];
+    const list = ph.insetCrops.smartCrops?.[aspectRatio] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0] || null;
+    if (winner) return buildCloudinaryCropUrl(ph.insetImageUrl, winner);
+    return ph.insetImageUrl;
+  }
   if (ph?.crops?.winners && ph?.imageUrl) {
     const winnerId = ph.crops.winners[aspectRatio];
     const list = ph.crops.smartCrops?.[aspectRatio] || [];

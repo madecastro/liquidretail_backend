@@ -438,27 +438,65 @@ async function seedsFromProduct(brandId, productId) {
     }
   }
 
-  // Tier 0 — product_image: use the catalog product's hero Media as
-  // the visual slot. metadata.catalogProductId is stored as ObjectId;
-  // cast before the find so a string productId from the API matches.
+  // Tier 0 — product_image: pick the BEST catalog Media as the visual
+  // hero. Meta's image_url (imageRole='hero') is whatever the merchant
+  // listed first, often a clean studio shot. For ad creative we'd
+  // rather lead with a lifestyle / on-model shot when one exists, with
+  // the clean product shot serving the product.image inset slot
+  // (handled by layoutInputService.loadContext). Ranking falls back to
+  // imageRole when shotType is missing (legacy rows).
   const productOid = toObjectId(productId);
-  const heroMedia = productOid ? await Media.findOne({
+  const catalogMedias = productOid ? await Media.find({
     source: 'catalog-product',
-    'metadata.catalogProductId': productOid,
-    'metadata.imageRole': 'hero'
-  }).select('_id fileType adSuitability').lean() : null;
-  if (heroMedia) {
+    'metadata.catalogProductId': productOid
+  }).select('_id fileType adSuitability classification metadata.imageRole').lean() : [];
+  const chosen = pickProductImageHero(catalogMedias);
+  if (chosen) {
     seeds.push({
       productId:        String(productId),
-      mediaId:          String(heroMedia._id),
+      mediaId:          String(chosen._id),
       matchTier:        'product_match',     // the product IS the SKU here
       variantKind:      'product_image',
-      fileType:         heroMedia.fileType,
-      suitabilityScore: heroMedia.adSuitability?.score ?? null
+      fileType:         chosen.fileType,
+      suitabilityScore: chosen.adSuitability?.score ?? null
     });
   }
 
   return seeds;
+}
+
+// Pick the catalog Media most suited to be the visual hero of a
+// product_image ad. Preference order:
+//   1. lifestyle      product in real-world context (story-friendly)
+//   2. on_model       human element draws engagement
+//   3. flat_lay       contextual but flatter than lifestyle
+//   4. unknown / no classification — assume hero candidate
+//   5. product_only   clean studio shot — works but reads as catalog
+//   6. detail         close-up / partial product
+//   7. packaging      worst for hero
+// Within a rank, prefer imageRole='hero' (the merchant's primary
+// listing). Returns the chosen Media doc or null when the list is empty.
+function pickProductImageHero(medias) {
+  if (!Array.isArray(medias) || !medias.length) return null;
+  const RANK = {
+    lifestyle:    1,
+    on_model:     2,
+    flat_lay:     3,
+    unknown:      4,
+    product_only: 5,
+    detail:       6,
+    packaging:    7
+  };
+  const ranked = medias.slice().sort((a, b) => {
+    const ra = RANK[a.classification?.shotType] ?? RANK.unknown;
+    const rb = RANK[b.classification?.shotType] ?? RANK.unknown;
+    if (ra !== rb) return ra - rb;
+    // Tiebreak: merchant's primary listing wins
+    const ahero = (a.metadata?.imageRole === 'hero') ? 0 : 1;
+    const bhero = (b.metadata?.imageRole === 'hero') ? 0 : 1;
+    return ahero - bhero;
+  });
+  return ranked[0];
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

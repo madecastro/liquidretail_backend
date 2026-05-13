@@ -149,7 +149,8 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   const products = yoloChainOut.products;
   const refinedProducts = yoloChainOut.refinedProducts;
   const { subjects, text, background, primarySubjectLabel, secondaryElementsTags,
-          contentNature, contentNatureConfidence, contentNatureReason } = subjectsRes.status === 'fulfilled'
+          contentNature, contentNatureConfidence, contentNatureReason,
+          shotType, shotTypeConfidence, shotTypeReason } = subjectsRes.status === 'fulfilled'
     ? subjectsRes.value
     : emptySubjectsText();
 
@@ -219,14 +220,17 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
     refinedProducts:      (refinedProducts || []).map(rp => ({ ...rp })),
     lastDetectedAt:       new Date()
   };
-  // Content-nature classification — written via dot-notation so it
-  // doesn't clobber other classification keys (socialPostType,
-  // detectSummary). Consumed by campaignAdsGenerationService to filter
-  // time-bound posts out of the default seed pool.
+  // Content-nature + shot-type classification — written via dot-notation
+  // so other classification keys (socialPostType, detectSummary) survive.
+  // contentNature filters time-bound UGC out of the seed pool;
+  // shotType picks the visual hero for product_image ads.
   const classificationDenorm = {
     'classification.contentNature':           contentNature || 'unknown',
     'classification.contentNatureConfidence': typeof contentNatureConfidence === 'number' ? contentNatureConfidence : 0,
-    'classification.contentNatureReason':     contentNatureReason || null
+    'classification.contentNatureReason':     contentNatureReason || null,
+    'classification.shotType':                shotType || 'unknown',
+    'classification.shotTypeConfidence':      typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0,
+    'classification.shotTypeReason':          shotTypeReason || null
   };
   await Media.updateOne({ _id: media._id }, { $set: { ...denorm, ...classificationDenorm } });
   // Keep the in-memory media in sync — subsequent stages (productMatch,
@@ -236,6 +240,9 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   media.classification.contentNature           = contentNature || 'unknown';
   media.classification.contentNatureConfidence = typeof contentNatureConfidence === 'number' ? contentNatureConfidence : 0;
   media.classification.contentNatureReason     = contentNatureReason || null;
+  media.classification.shotType                = shotType || 'unknown';
+  media.classification.shotTypeConfidence      = typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0;
+  media.classification.shotTypeReason          = shotTypeReason || null;
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
@@ -509,7 +516,8 @@ async function runCatalogProductPipeline(run, media, buffer) {
   const products = yoloChainOut.products;
   const refinedProducts = yoloChainOut.refinedProducts;
   const { subjects, text, background, primarySubjectLabel, secondaryElementsTags,
-          contentNature, contentNatureConfidence, contentNatureReason } = subjectsRes.status === 'fulfilled'
+          contentNature, contentNatureConfidence, contentNatureReason,
+          shotType, shotTypeConfidence, shotTypeReason } = subjectsRes.status === 'fulfilled'
     ? subjectsRes.value
     : emptySubjectsText();
 
@@ -576,7 +584,10 @@ async function runCatalogProductPipeline(run, media, buffer) {
   const classificationDenormCp = {
     'classification.contentNature':           contentNature || 'unknown',
     'classification.contentNatureConfidence': typeof contentNatureConfidence === 'number' ? contentNatureConfidence : 0,
-    'classification.contentNatureReason':     contentNatureReason || null
+    'classification.contentNatureReason':     contentNatureReason || null,
+    'classification.shotType':                shotType || 'unknown',
+    'classification.shotTypeConfidence':      typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0,
+    'classification.shotTypeReason':          shotTypeReason || null
   };
   await Media.updateOne({ _id: media._id }, { $set: { ...denormCp, ...classificationDenormCp } });
   Object.assign(media, denormCp);
@@ -584,6 +595,9 @@ async function runCatalogProductPipeline(run, media, buffer) {
   media.classification.contentNature           = contentNature || 'unknown';
   media.classification.contentNatureConfidence = typeof contentNatureConfidence === 'number' ? contentNatureConfidence : 0;
   media.classification.contentNatureReason     = contentNatureReason || null;
+  media.classification.shotType                = shotType || 'unknown';
+  media.classification.shotTypeConfidence      = typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0;
+  media.classification.shotTypeReason          = shotTypeReason || null;
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
@@ -798,7 +812,10 @@ async function runSubjectsTextChain(run, imageUrl, media) {
         secondaryElementsTags: st.secondaryElementsTags || [],
         contentNature:           st.contentNature           || 'unknown',
         contentNatureConfidence: typeof st.contentNatureConfidence === 'number' ? st.contentNatureConfidence : 0.5,
-        contentNatureReason:     st.contentNatureReason     || null
+        contentNatureReason:     st.contentNatureReason     || null,
+        shotType:                st.shotType                || 'unknown',
+        shotTypeConfidence:      typeof st.shotTypeConfidence === 'number' ? st.shotTypeConfidence : 0.5,
+        shotTypeReason:          st.shotTypeReason          || null
       };
     } catch (err) {
       console.warn('⚠️  Subject/text:', err.message);
@@ -811,7 +828,8 @@ function emptySubjectsText() {
   return {
     subjects: [], text: [], background: null,
     primarySubjectLabel: null, secondaryElementsTags: [],
-    contentNature: 'unknown', contentNatureConfidence: 0, contentNatureReason: null
+    contentNature: 'unknown', contentNatureConfidence: 0, contentNatureReason: null,
+    shotType: 'unknown', shotTypeConfidence: 0, shotTypeReason: null
   };
 }
 
