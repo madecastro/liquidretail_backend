@@ -221,7 +221,8 @@ async function deriveStage(req) {
       ctaText:            req.cta?.text           || null,
       ctaUrl:             req.cta?.url            || null,
       variantKind:        req.variantKind         || 'ugc',
-      productId:          req.productId           || null
+      productId:          req.productId           || null,
+      paletteSource:      req.paletteSource       || 'media'
     }
   });
 

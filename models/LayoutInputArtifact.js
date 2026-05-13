@@ -45,6 +45,13 @@ const layoutInputArtifactSchema = new mongoose.Schema({
   // via crypto.createHash('sha256').
   campaignContextHash: { type: String, default: null },
 
+  // Which color source the resolved style bindings draw from. Defaults
+  // to 'media' (hero media's palette — historical behavior). 'brand'
+  // overrides media.palette_* with Brand.primaryColor / accentColor /
+  // secondaryColor at assembleInput time. Cache key dimension so the
+  // two colorways don't share a derivation slot.
+  paletteSource: { type: String, default: 'media' },
+
   // Semver of the input shape. Bump when the canonical path structure
   // changes (e.g. v1 → v2 moved hero_image_url → hero_media.image, split
   // creator out of ugc). buildLayoutInput refuses to serve a cached doc
@@ -67,7 +74,7 @@ const layoutInputArtifactSchema = new mongoose.Schema({
 // "20% off" headline are not interchangeable). Re-running deletes the
 // prior matching entry via findOneAndReplace in the service.
 layoutInputArtifactSchema.index(
-  { mediaId: 1, template: 1, aspectRatio: 1, productId: 1, variantKind: 1, campaignContextHash: 1 },
+  { mediaId: 1, template: 1, aspectRatio: 1, productId: 1, variantKind: 1, campaignContextHash: 1, paletteSource: 1 },
   { unique: true }
 );
 

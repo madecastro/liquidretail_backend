@@ -330,12 +330,13 @@ async function renderOne(run, job, adId, index, renderToken) {
     return;
   }
   const creative = {
-    mediaId:     String(ad.mediaId),
-    productId:   ad.productId ? String(ad.productId) : null,
-    template:    ad.template,
-    aspectRatio: ad.aspectRatio,
-    matchTier:   ad.matchTier,
-    variantKind: ad.variantKind
+    mediaId:       String(ad.mediaId),
+    productId:     ad.productId ? String(ad.productId) : null,
+    template:      ad.template,
+    aspectRatio:   ad.aspectRatio,
+    matchTier:     ad.matchTier,
+    variantKind:   ad.variantKind,
+    paletteSource: ad.paletteSource || 'media'
   };
   try {
     const result = await renderCreative({
@@ -356,6 +357,10 @@ async function renderOne(run, job, adId, index, renderToken) {
       // direct) and gate UGC-only slots (creator, ugc, engagement).
       variantKind:   ad.variantKind,
       productId:     ad.productId ? String(ad.productId) : null,
+      // paletteSource flips style bindings between hero-media palette
+      // and brand colors. assembleInput reads it and overrides the
+      // media.palette_* paths the templates bind to.
+      paletteSource: ad.paletteSource || 'media',
       creative,
       cta:           { text: ad.ctaText, url: ad.ctaUrl, params: ad.ctaUrlParams },
       authToken:     renderToken,

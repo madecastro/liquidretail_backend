@@ -99,6 +99,37 @@ const TIER_WEIGHTS = {
 // quality, scene density, etc.). Use a fixed quality assumption.
 const PRODUCT_IMAGE_QUALITY = 0.7;
 
+// Cap on cross-product expansion per single post seed. When the
+// operator picks a media that's product_category-matched (or only
+// brand_matched), the post pairs with the top-K products in the
+// category or catalog by popularityScore. Bounds the cartesian to
+// stay manageable on large catalogs.
+const EXPANSION_PRODUCTS_PER_POST = Math.max(1, parseInt(process.env.EXPANSION_PRODUCTS_PER_POST, 10) || 25);
+
+// After cartesian expansion, queue at most this many Ad payloads per
+// generation run. Sorted by readinessScore desc before trim so the
+// strongest combinations land. Re-running the wizard for the same
+// picks queues additional combinations (idempotent dedup at insert).
+const MAX_ADS_PER_GENERATION_RUN = Math.max(1, parseInt(process.env.MAX_ADS_PER_GENERATION_RUN, 10) || 200);
+
+// Composite product popularity. Primary signal: how many UGC posts
+// have matched this product (genuine popularity proxy on the brand's
+// own social inventory). Secondary signal: catalog review strength
+// (rating × log(reviewCount)). Capped at 1.0 so a product can't
+// outrun the readinessScore math via popularity alone.
+//
+// log10(matchedMedia.length + 1) / 2 — 0→0, 9→0.5, 99→1.0
+// (rating/5) × log10(reviewCount+1) / 3 — 5★/100 reviews → 0.67
+function productPopularityScore(catalogProduct) {
+  if (!catalogProduct) return 0;
+  const ugcCount    = Array.isArray(catalogProduct.matchedMedia) ? catalogProduct.matchedMedia.length : 0;
+  const rating      = typeof catalogProduct.rating === 'number' ? catalogProduct.rating : 0;
+  const reviewCount = Array.isArray(catalogProduct.reviews) ? catalogProduct.reviews.length : 0;
+  const ugcSig    = Math.log10(ugcCount + 1) / 2;
+  const reviewSig = (rating / 5) * (Math.log10(reviewCount + 1) / 3);
+  return Math.min(1, ugcSig + reviewSig);
+}
+
 // Engagement-weighted score from platformStats. Saves and shares are
 // higher-intent than likes; comments express deeper engagement than a
 // passive like. Weighted raw → log-normalized to 0-1 so a viral post
@@ -144,18 +175,21 @@ function readinessScoreForProductImage(matchTier) {
 
 // sha256 over the identity inputs that uniquely define an Ad in the
 // queue. Same digest on the same campaign = same Ad = unique index
-// rejects the duplicate insert.
-function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, ctaText, ctaUrl, ctaUrlParams }) {
+// rejects the duplicate insert. paletteSource doubles the identity
+// space so media-palette and brand-palette renders for the same
+// (media, product, template, ratio, variant) coexist as separate Ads.
+function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams }) {
   const payload = JSON.stringify({
-    campaignId:   String(campaignId),
-    productId:    productId ? String(productId) : null,
-    mediaId:      String(mediaId),
+    campaignId:    String(campaignId),
+    productId:     productId ? String(productId) : null,
+    mediaId:       String(mediaId),
     template,
     aspectRatio,
     variantKind,
-    ctaText:      String(ctaText || ''),
-    ctaUrl:       String(ctaUrl  || ''),
-    ctaUrlParams: String(ctaUrlParams || '')
+    paletteSource: paletteSource || 'media',
+    ctaText:       String(ctaText || ''),
+    ctaUrl:        String(ctaUrl  || ''),
+    ctaUrlParams:  String(ctaUrlParams || '')
   });
   return crypto.createHash('sha256').update(payload).digest('hex');
 }
@@ -238,7 +272,15 @@ async function expandWizardJob({
     }
   }
 
-  const payloads = [];
+  // Each seed × template × ratio expands across TWO paletteSource
+  // variants (media / brand). The 'media' variant draws style bindings
+  // from the hero media's palette (palette_dominant / palette_vibrant
+  // etc.); the 'brand' variant overrides those to brand.primaryColor /
+  // accentColor / secondaryColor. Identical visual composition, two
+  // colorways. Doubles the cartesian — the trim below caps total
+  // payloads at MAX_ADS_PER_GENERATION_RUN.
+  const PALETTE_SOURCES = ['media', 'brand'];
+  let payloads = [];
   for (const seed of seeds) {
     for (const cell of grid) {
       // Drop combos where the seed's variantKind isn't supported by the
@@ -246,37 +288,53 @@ async function expandWizardJob({
       // seeds for it would queue and then fail/look wrong at render.
       const supports = TEMPLATE_SUPPORTS_VARIANT[cell.templateId];
       if (supports && !supports.has(seed.variantKind)) continue;
-      const identityDigest = computeIdentityDigest({
-        campaignId,
-        productId:    seed.productId,
-        mediaId:      seed.mediaId,
-        template:     cell.templateId,
-        aspectRatio:  cell.aspectRatio,
-        variantKind:  seed.variantKind,
-        ctaText, ctaUrl, ctaUrlParams
-      });
-      const readinessScore = seed.variantKind === 'product_image'
-        ? readinessScoreForProductImage(seed.matchTier)
-        : readinessScoreFor(seed.matchTier, seed.fileType, seed.suitabilityScore, seed.platformStats);
-      payloads.push({
-        brandId,
-        campaignId,
-        campaignRunId:  null,
-        mediaId:        seed.mediaId,
-        productId:      seed.productId,
-        template:       cell.templateId,
-        aspectRatio:    cell.aspectRatio,
-        campaignKind,
-        matchTier:      seed.matchTier,
-        variantKind:    seed.variantKind,
-        readinessScore,
-        status:         'queued',
-        identityDigest,
-        ctaText, ctaUrl, ctaUrlParams,
-        queuedAt:       new Date(),
-        generatedAt:    new Date()
-      });
+      for (const paletteSource of PALETTE_SOURCES) {
+        const identityDigest = computeIdentityDigest({
+          campaignId,
+          productId:     seed.productId,
+          mediaId:       seed.mediaId,
+          template:      cell.templateId,
+          aspectRatio:   cell.aspectRatio,
+          variantKind:   seed.variantKind,
+          paletteSource,
+          ctaText, ctaUrl, ctaUrlParams
+        });
+        const readinessScore = seed.variantKind === 'product_image'
+          ? readinessScoreForProductImage(seed.matchTier)
+          : readinessScoreFor(seed.matchTier, seed.fileType, seed.suitabilityScore, seed.platformStats);
+        payloads.push({
+          brandId,
+          campaignId,
+          campaignRunId:  null,
+          mediaId:        seed.mediaId,
+          productId:      seed.productId,
+          template:       cell.templateId,
+          aspectRatio:    cell.aspectRatio,
+          campaignKind,
+          matchTier:      seed.matchTier,
+          variantKind:    seed.variantKind,
+          paletteSource,
+          readinessScore,
+          status:         'queued',
+          identityDigest,
+          ctaText, ctaUrl, ctaUrlParams,
+          queuedAt:       new Date(),
+          generatedAt:    new Date()
+        });
+      }
     }
+  }
+
+  // Cartesian limiter — bound per-run inventory growth. Sort by
+  // readinessScore desc (videos with null sort last automatically),
+  // trim to MAX_ADS_PER_GENERATION_RUN. Re-running the wizard with
+  // the same picks queues the next batch (identityDigest dedup catches
+  // any duplicates from the prior run).
+  if (payloads.length > MAX_ADS_PER_GENERATION_RUN) {
+    payloads.sort((a, b) => (b.readinessScore ?? -1) - (a.readinessScore ?? -1));
+    const before = payloads.length;
+    payloads = payloads.slice(0, MAX_ADS_PER_GENERATION_RUN);
+    console.log(`📦 expandWizardJob: cartesian trim ${before} → ${payloads.length} (cap=${MAX_ADS_PER_GENERATION_RUN})`);
   }
 
   if (!payloads.length) {
@@ -388,41 +446,108 @@ async function seedFromBrandOnly(brandId, topN) {
 // the media has no product matches at all (or none with a catalog
 // FK), fall back to a single brand_match seed so the operator's
 // explicit pick still produces an ad.
+// Operator picked a specific post (mediaId). Expand to (post, product)
+// seeds following the detect outcome:
+//
+//   product_match    → 1 seed per matched product, tier='product_match'
+//                      (post pairs with the SKU it actually featured)
+//   product_category → top-K products in the matched category,
+//                      tier='product_category' (synthetic pairing — the
+//                      post matched the class, not the specific item)
+//   brand_match      → top-K products in the brand's catalog,
+//                      tier='brand_match' (weakest pairing — the post
+//                      is brand-only content with no product signal)
+//
+// Post is ALWAYS the hero (variantKind='ugc'). Never emit
+// variantKind='product_image' from a post seed — the post drives the
+// ad's visual identity, the catalog product rides in the product panel
+// via product.image / product.lifestyle_image / product.product_image.
+//
+// Operator-driven path: the post passed the operator's eyeball, so the
+// content-nature gate (promotional / announcement filter) is bypassed.
+// Inventory-pull paths (brand_only, brand_match fallback in
+// seedsFromProduct) still apply the gate.
 async function seedsFromMedia(brandId, mediaId) {
   const media = await Media.findById(mediaId)
-    .select('matchedProducts adSuitability fileType classification platformStats')
+    .select('matchedProducts matchedCategories adSuitability fileType classification platformStats')
     .lean();
   if (!media) return [];
-  // Operator-driven path: when the wizard hands us a specific mediaId
-  // they ALREADY picked, trust the pick and bypass the content-nature
-  // gate. The gate is for inventory pulls (brand-only, brand-match
-  // fallback) where the operator hasn't seen the post.
-  const fileType = media.fileType;
-  const score    = media.adSuitability?.score ?? null;
-  const stats    = media.platformStats || null;
+  const baseSeed = {
+    mediaId:          String(mediaId),
+    variantKind:      'ugc',
+    fileType:         media.fileType,
+    suitabilityScore: media.adSuitability?.score ?? null,
+    platformStats:    media.platformStats || null
+  };
 
+  // Case 1 — at least one refined product is a product_match.
+  // matchedProducts captures BOTH product_match AND product_category
+  // outcomes; partition by outcome.
   const productMatches = (media.matchedProducts || []).filter(mp => mp.catalogProductId);
-  if (!productMatches.length) {
-    return [{
-      productId:        null,
-      mediaId:          String(mediaId),
-      matchTier:        'brand_match',
-      variantKind:      'ugc',
-      fileType,
-      suitabilityScore: score,
-      platformStats:    stats
-    }];
+  const trueProductMatches = productMatches.filter(mp => mp.outcome === 'product_match');
+  if (trueProductMatches.length) {
+    return trueProductMatches.map(mp => ({
+      ...baseSeed,
+      productId: String(mp.catalogProductId),
+      matchTier: 'product_match'
+    }));
   }
 
-  return productMatches.map(mp => ({
-    productId:        String(mp.catalogProductId),
-    mediaId:          String(mediaId),
-    matchTier:        mp.outcome === 'product_match' ? 'product_match' : 'product_category',
-    variantKind:      'ugc',
-    fileType,
-    suitabilityScore: score,
-    platformStats:    stats
+  // Case 2 — only product_category matches. Expand to top-K products
+  // in the matched categories (Media.matchedCategories carries the
+  // categoryId), ranked by popularity.
+  const categoryIds = Array.from(new Set(
+    (media.matchedCategories || []).map(mc => mc.categoryId).filter(Boolean).map(String)
+  ));
+  if (categoryIds.length) {
+    const products = await loadTopProductsByPopularity({
+      brandId,
+      categoryIds,
+      limit: EXPANSION_PRODUCTS_PER_POST
+    });
+    if (products.length) {
+      return products.map(p => ({
+        ...baseSeed,
+        productId: String(p._id),
+        matchTier: 'product_category'
+      }));
+    }
+  }
+
+  // Case 3 — brand_match (or no product signal). Expand to top-K
+  // products in the brand's catalog, ranked by popularity.
+  const products = await loadTopProductsByPopularity({
+    brandId,
+    categoryIds: null,
+    limit: EXPANSION_PRODUCTS_PER_POST
+  });
+  return products.map(p => ({
+    ...baseSeed,
+    productId: String(p._id),
+    matchTier: 'brand_match'
   }));
+}
+
+// Load CatalogProducts ranked by productPopularityScore, capped at
+// `limit`. When categoryIds is set, filter to products whose
+// categoryRef matches any (leaf-equality — broader subtree expansion
+// is a follow-up). Always excludes drafts and non-primary variants.
+async function loadTopProductsByPopularity({ brandId, categoryIds, limit }) {
+  const filter = {
+    brandId,
+    draft:            { $ne: true },
+    isPrimaryVariant: { $ne: false }
+  };
+  if (categoryIds && categoryIds.length) {
+    filter.categoryRef = { $in: categoryIds.map(id => new mongoose.Types.ObjectId(id)) };
+  }
+  const products = await CatalogProduct.find(filter)
+    .select('_id matchedMedia rating reviews categoryRef')
+    .lean();
+  if (!products.length) return [];
+  const scored = products.map(p => ({ p, score: productPopularityScore(p) }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(s => s.p);
 }
 
 // Product-driven (catalog entry / wizard Step 2). Operator picked a

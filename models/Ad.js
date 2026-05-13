@@ -65,6 +65,21 @@ const adSchema = new mongoose.Schema({
     index:    true
   },
 
+  // Where the ad's style bindings (panel_bg, headline_text_color,
+  // cta_button_bg) resolve their colors from:
+  //   media — palette extracted from the hero media (today's default)
+  //   brand — Brand.primaryColor / accentColor / secondaryColor
+  // Doubles the cartesian: every (media, product, template, ratio,
+  // variantKind) combo emits two Ads — one media-colored, one brand-
+  // colored. Operator picks the winner per render.
+  paletteSource: {
+    type:     String,
+    enum:     ['media', 'brand'],
+    default:  'media',
+    required: true,
+    index:    true
+  },
+
   // Denormalized at queue time so the selection query can sort
   // without joining Media. Combines Media.adSuitability.score and a
   // match-tier weight (product_match > product_category > brand_match
@@ -81,8 +96,8 @@ const adSchema = new mongoose.Schema({
   },
 
   // sha256 over identity inputs (campaignId, productId, mediaId,
-  // template, aspectRatio, variantKind, ctaText, ctaUrl, ctaUrlParams).
-  // Computed at queue time; unique per campaign.
+  // template, aspectRatio, variantKind, paletteSource, ctaText,
+  // ctaUrl, ctaUrlParams). Computed at queue time; unique per campaign.
   identityDigest: { type: String, required: true, index: true },
 
   // ── Render output (all null until render lands) ──────────────────

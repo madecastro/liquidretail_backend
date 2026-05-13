@@ -60,27 +60,48 @@ Seed expansion rules (per operator pick):
 
   1. No picks (brand-only):
      → top BRAND_ONLY_MEDIA_LIMIT (25) brand_match media for the
-       brand, ranked by adSuitability. Emit ugc seeds with
-       productId:null and matchTier='brand_only'.
+       brand, ranked by the blended engagement+adSuitability score
+       used in readinessScoreFor. Emit ugc seeds with productId:null
+       and matchTier='brand_only'.
 
-  2. mediaIds (library entry — operator picked a specific Media):
-     → Read Media.matchedProducts[] directly. Emit ONE ugc seed
-       per matched product (across all per-product tiers).
+  2. mediaIds (library entry — operator picked a specific post):
+     The post is ALWAYS the visual hero — seedsFromMedia never emits
+     variantKind='product_image'. Outcome decides which products the
+     post pairs with:
 
-         matched product (outcome=product_match)
-            → ugc seed, productId=catalogProductId,
-              matchTier='product_match'
-         matched product (outcome=product_category)
-            → ugc seed, productId=catalogProductId,
-              matchTier='product_category'
-         no matches OR all matches missing catalogProductId
-            → 1 brand_match seed, productId:null
+       Case A — at least one refined product is product_match
+         → emit one ugc seed per matched product
+           { productId, mediaId, matchTier='product_match',
+             variantKind='ugc', platformStats, fileType,
+             suitabilityScore }
 
-     Pre-2026-05-11 this consulted only the LATEST PMA for the
-     media. With multiple refined-product matches per Media common
-     (one IG post → shirt + hat + shoes), this dropped all but the
-     most recent. The denormalized Media.matchedProducts read
-     emits every match as its own seed.
+       Case B — only product_category outcomes (no product_match)
+         → expand to top-K products in the matched categories,
+           ranked by productPopularityScore. Each becomes a seed
+           with matchTier='product_category'. K = EXPANSION_PRODUCTS_
+           PER_POST (default 25).
+
+       Case C — brand_match (no product or category signal)
+         → expand to top-K products in the brand's full catalog,
+           ranked by productPopularityScore. Each becomes a seed
+           with matchTier='brand_match'.
+
+     Cross-product pairings in Cases B + C are SYNTHETIC — the post
+     never showed the paired product. Tier inheritance reflects
+     this: the seed inherits the post's outcome tier, not
+     product_match. A brand-only post expanded to 25 products
+     drains AFTER actual product_match UGC seeds.
+
+     productPopularityScore composite:
+       log10(matchedMedia.length + 1) / 2          (UGC popularity)
+     + (rating/5) × log10(reviewCount + 1) / 3     (review strength)
+       capped at 1.0
+     Primary signal is matchedMedia count (how often the product has
+     been featured in UGC); review strength is a tiebreaker for
+     products with no UGC matches yet.
+
+     Carousel posts (multi-asset): currently flattened to first child
+     by postSyncService — carousel-aware expansion is backlogged.
 
   3. productIds (catalog entry — operator picked a product):
      → Read CatalogProduct.matchedMedia[] for the per-product tiers
@@ -108,18 +129,32 @@ Cartesian expansion:
   for each seed:
     for each (template, aspectRatio) cell in
         allowedTemplates × intersect(template.ratios, SHIPPING_RATIOS):
-      payload = {
-        brandId, campaignId, mediaId, productId,
-        template, aspectRatio, campaignKind,
-        matchTier, variantKind,
-        readinessScore: computed (see below),
-        status: 'queued',
-        identityDigest: sha256(canonical-form identity),
-        cta*, queuedAt, generatedAt
-      }
-      payloads.push(payload)
+      for each paletteSource in ['media', 'brand']:
+        payload = {
+          brandId, campaignId, mediaId, productId,
+          template, aspectRatio, campaignKind,
+          matchTier, variantKind, paletteSource,
+          readinessScore: computed (see below),
+          status: 'queued',
+          identityDigest: sha256(canonical-form identity
+                                  — includes paletteSource),
+          cta*, queuedAt, generatedAt
+        }
+        payloads.push(payload)
 
   SHIPPING_RATIOS = { '1:1', '9:16', '16:9' }   — V1 only
+
+  paletteSource doubles the cartesian. 'media' draws style bindings
+  from the hero media's extracted palette (palette_dominant /
+  palette_vibrant etc.). 'brand' overrides those slots with
+  Brand.primaryColor / accentColor / secondaryColor at assembleInput
+  time. Templates' style_bindings read media.palette_* unchanged —
+  the value swap is invisible to the template JSON.
+
+After cartesian, payloads sorted by readinessScore desc and trimmed
+to MAX_ADS_PER_GENERATION_RUN (env, default 200). Bounds per-run
+growth on large catalogs. Re-running the wizard queues the next
+batch (identityDigest dedup catches duplicates at insert).
 
 Bulk insert:
   Ad.insertMany(payloads, { ordered: false })
@@ -605,7 +640,7 @@ Identity digest (queue-time dedup)
 ----------------------------------
 identityDigest = sha256(JSON.stringify({
   campaignId, productId, mediaId, template, aspectRatio,
-  variantKind, ctaText, ctaUrl, ctaUrlParams
+  variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams
 }))
 
 Computed in computeIdentityDigest (campaignAdsGenerationService.js).
@@ -651,14 +686,17 @@ POST   /api/ads/preview-video-composite   diagnostic: build a video
 
 Operational limits
 ------------------
-RENDER_CONCURRENCY        env, default 2    in-flight Puppeteer renders
-MAX_CREATIVES_PER_RUN     env, default 6    cap per CampaignRun
-SHIPPING_RATIOS           hardcoded         1:1, 9:16, 16:9
-SUPPORTED_TEMPLATES       hardcoded         testimonial_spotlight,
-                                            ugc_split_screen,
-                                            testimonial_overlay,
-                                            product_overlay
-BRAND_ONLY_MEDIA_LIMIT    25                brand-only seed pool
+RENDER_CONCURRENCY             env, default 2    in-flight Puppeteer renders
+MAX_CREATIVES_PER_RUN          env, default 6    cap per CampaignRun
+SHIPPING_RATIOS                hardcoded         1:1, 9:16, 16:9
+SUPPORTED_TEMPLATES            hardcoded         testimonial_spotlight,
+                                                 ugc_split_screen,
+                                                 testimonial_overlay,
+                                                 product_overlay
+BRAND_ONLY_MEDIA_LIMIT         25                brand-only seed pool
+EXPANSION_PRODUCTS_PER_POST    env, default 25   top-K products per post in
+                                                 category/brand expansion
+MAX_ADS_PER_GENERATION_RUN     env, default 200  cartesian cap per run
 
 Raising MAX_CREATIVES_PER_RUN: each run drains more queued ads but
 takes proportionally longer. Bottleneck is Chromium memory at 2-3

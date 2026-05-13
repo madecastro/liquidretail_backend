@@ -249,15 +249,17 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   // kind='product' campaign on the same (mediaId, template, ratio,
   // productId, variantKind). Edits to promotionalDetails change the
   // hash, forcing a re-derivation.
-  const cacheKeyProductId   = options.productId   || null;
-  const cacheKeyVariantKind = options.variantKind || null;
-  const campaignContextHash = computeCampaignContextHash(options);
+  const cacheKeyProductId     = options.productId   || null;
+  const cacheKeyVariantKind   = options.variantKind || null;
+  const cacheKeyPaletteSource = options.paletteSource || 'media';
+  const campaignContextHash   = computeCampaignContextHash(options);
   if (!refresh) {
     const cached = await LayoutInputArtifact.findOne({
       mediaId, template, aspectRatio,
-      productId:   cacheKeyProductId,
-      variantKind: cacheKeyVariantKind,
-      campaignContextHash
+      productId:     cacheKeyProductId,
+      variantKind:   cacheKeyVariantKind,
+      campaignContextHash,
+      paletteSource: cacheKeyPaletteSource
     }).lean();
     // Cache hit only if the stored schema version matches what we emit today.
     // Without this check, v1 cached docs (with old paths like hero_image_url)
@@ -298,18 +300,20 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   await LayoutInputArtifact.findOneAndReplace(
     {
       mediaId, template, aspectRatio,
-      productId:   cacheKeyProductId,
-      variantKind: cacheKeyVariantKind,
-      campaignContextHash
+      productId:     cacheKeyProductId,
+      variantKind:   cacheKeyVariantKind,
+      campaignContextHash,
+      paletteSource: cacheKeyPaletteSource
     },
     {
       mediaId,
       runId: ctx.runId || null,
       template,
       aspectRatio,
-      productId:   cacheKeyProductId,
-      variantKind: cacheKeyVariantKind,
+      productId:     cacheKeyProductId,
+      variantKind:   cacheKeyVariantKind,
       campaignContextHash,
+      paletteSource: cacheKeyPaletteSource,
       schemaVersion: INPUT_SCHEMA_VERSION,
       input,
       derivation,
@@ -1341,32 +1345,15 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
     // image's dominant tone wins for image-led layouts; structured
     // templates like results_proof keep brand.primary_color first).
     // Empty when no detection has run.
-    media: {
-      palette:           palette || [],
-      palette_dominant:  palette[0] || null,
-      palette_accent:    palette[1] || null,
-      palette_neutral:   palette[2] || null,
-      // Most-saturated color from the palette regardless of dominance
-      // rank. The detect pipeline returns palette[] in dominance order,
-      // which puts a deep-black backdrop at index 0 even when the
-      // eye-catching highlights (flame orange on black) are what the
-      // creative should LEAD with. palette_vibrant fixes that for
-      // image-led templates by walking the array and returning the
-      // entry with highest saturation — but ONLY when that pick is
-      // actually saturated enough to read as a real accent. For
-      // monochromatic palettes (all shades of one color, e.g. a
-      // black-and-grey studio shot), pickVibrantColor returns null
-      // and we DO NOT silently fall back to palette[1]/[0] — that
-      // would re-introduce the close-to-dominant tone the threshold
-      // was meant to filter out. A null here lets every binding
-      // chained to palette_vibrant cascade to its brand-fallback or
-      // auto-from-brightness default.
-      palette_vibrant:   pickVibrantColor(palette),
-      background_setting:     detection?.background?.setting     || null,
-      background_lighting:    detection?.background?.lighting    || null,
-      background_style:       detection?.background?.style       || null,
-      background_description: detection?.background?.description || null
-    },
+    //
+    // paletteSource='brand' override: when the operator generated a
+    // brand-colorway variant (cartesian doubles each seed across both
+    // sources), the palette_* fields surface the BRAND'S colors
+    // instead of the hero media's. Templates' style_bindings then
+    // resolve the same way (no per-template change) but draw from
+    // brand.primaryColor / accentColor / secondaryColor. Falls back
+    // to media-derived values per field when a brand color is missing.
+    media: buildMediaBlock({ palette, brand, detection, paletteSource: options.paletteSource || 'media' }),
 
     layout_options: options.layout_options || {
       show_logo:           !!brand?.logoUrl,
@@ -1738,6 +1725,50 @@ function pickHeroMedia(ctx, aspectRatio) {
 // AND its CropArtifact has a winner for the requested ratio, return
 // the c_crop transform URL. Otherwise fall back to details.imageUrl
 // (the raw CatalogProduct.imageUrl, uncropped).
+// Build the canonical input's `media` block. For paletteSource='media'
+// (default), populate from the hero media's extracted palette. For
+// paletteSource='brand', overlay brand-color overrides per slot,
+// falling back to the media palette when a brand color is missing.
+// Background context (setting/lighting/style/description) stays
+// scene-derived regardless of paletteSource — it informs the prompt
+// section, not style bindings.
+function buildMediaBlock({ palette, brand, detection, paletteSource }) {
+  const mediaPalette = palette || [];
+  const useBrand = paletteSource === 'brand';
+  // Resolve each style slot. When useBrand is true, brand colors win
+  // with media-palette as the fallback; otherwise it's the historical
+  // media-first behavior. palette_vibrant takes brand.accentColor in
+  // brand mode (the "pop" color the template uses for CTA + headlines).
+  const palette_dominant = useBrand
+    ? (brand?.primaryColor || mediaPalette[0] || null)
+    : (mediaPalette[0] || null);
+  const palette_accent = useBrand
+    ? (brand?.accentColor || mediaPalette[1] || null)
+    : (mediaPalette[1] || null);
+  const palette_neutral = useBrand
+    ? (brand?.secondaryColor || mediaPalette[2] || null)
+    : (mediaPalette[2] || null);
+  const palette_vibrant = useBrand
+    ? (brand?.accentColor || pickVibrantColor(mediaPalette))
+    : pickVibrantColor(mediaPalette);
+  // When brand mode is active, surface the brand palette as the array
+  // form too so consumers that iterate media.palette[] see brand colors.
+  const paletteArray = useBrand
+    ? [palette_dominant, palette_accent, palette_neutral].filter(Boolean)
+    : mediaPalette;
+  return {
+    palette:           paletteArray,
+    palette_dominant,
+    palette_accent,
+    palette_neutral,
+    palette_vibrant,
+    background_setting:     detection?.background?.setting     || null,
+    background_lighting:    detection?.background?.lighting    || null,
+    background_style:       detection?.background?.style       || null,
+    background_description: detection?.background?.description || null
+  };
+}
+
 // Given a hydrated flavor entry from loadContext.productHero (lifestyle
 // or productOnly), return the ratio-aware crop URL when crops exist,
 // else the raw imageUrl. Returns null when the entry is missing — the
