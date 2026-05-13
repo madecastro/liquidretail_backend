@@ -13,6 +13,17 @@ Architecture shift landed 2026-05-11. Previous model built an
 in-memory cartesian, sliced to a cap, dropped the rest. New model
 persists everything and renders the top N per run.
 
+Doc maintenance
+---------------
+Update this doc whenever any of the services below change:
+  - campaignAdsGenerationService.js  (seeding, scoring, cartesian, dedup)
+  - layoutInputService.js            (context load, derivation, assembleInput)
+  - templateRegistry.js              (slot/style bindings, contrast guard)
+  - renderService.js                 (Puppeteer, Cloudinary, persistence)
+  - routes/ads.js                    (endpoints, run orchestration)
+The deep-dive sections (Stage 6a, 6b, 7) are the most likely to drift —
+keep field lists and binding rules in sync with the code.
+
 
 High-level flow
 ---------------
@@ -274,6 +285,258 @@ Total per render: ~3-15s (derive 1-5s, render 2-8s, upload 1-3s,
                           persist <100ms)
 
 
+Stage 6a — Layout input assembly (services/layoutInputService.js)
+-----------------------------------------------------------------
+The derive substage above resolves to a single canonical input
+document. Lifecycle:
+
+  cache lookup → loadContext → derivation (Gemini) → assembleInput
+  → upsert LayoutInputArtifact
+
+Cache key:
+  (mediaId, template, aspectRatio, productId, variantKind)
+  + INPUT_SCHEMA_VERSION (currently 4.0)
+  A mismatch on schemaVersion invalidates the cached input even if the
+  inputs are identical. Bump the version after structural shape
+  changes; leave it alone for content-only changes.
+
+loadContext (lines 370-475)
+---------------------------
+Pulls every read source the prompt and slot adapter could need:
+
+  Media                       subjects, caption, creatorName,
+                              creatorHandle, fileType, fileUrl,
+                              adSuitability, platformStats, metadata,
+                              classification, latestArtifacts
+  DetectionArtifact           primarySubjectDesc, text[], background
+                              {palette, description, style, lighting,
+                              setting}, transcript
+  CropArtifact                smartCrops{5:4, 1:1, 4:5}, winners
+                              (per-ratio judge picks)
+  ExtendedCropArtifact        9:16 / 1.91:1 AI-extended candidates
+                              (skipped on catalog product Media)
+  OverlayZoneArtifact         brightness grid, restriction zones
+                              (overlay-mode templates only)
+  ProductMatchArtifact        outcome, identification.details
+                              (productName, brand, price, imageUrl,
+                              productUrl, productReviews, reviewSummary),
+                              brandReviews, recommendedProducts
+                              (hydrated via productMatchHydration)
+  CatalogProduct              full row + hero Media + its CropArtifact
+                              winners → ctx.productHero
+                              (only when options.productId is set)
+  Brand                       name, tagline, logoUrl, primaryColor,
+                              secondaryColor, accentColor, fontFamily,
+                              tone[], demographics[], brandReviews
+  Category siblings           via CatalogProduct.categoryRef, cap 12
+                              → ctx.categoryPool
+
+Product override path (when options.productId is set):
+  - No prior PMA   → synthesizeMatchFromCatalogProduct(cp) builds a
+                     stub match from the catalog row
+  - Prior PMA      → buildIdentificationFromCatalogProduct(cp)
+                     overrides match.identification with catalog
+                     details (keeps categoryId / brandReviews /
+                     recommendedProducts)
+  Catalog hero is loaded into ctx.productHero so the product.image
+  slot serves the judge-arbitrated crop, not the raw Shopify URL.
+
+For overlay-mode templates (testimonial_overlay / product_overlay):
+  computeOverlayPlacement() runs BEFORE derivation so the prompt can
+  include per-element box budgets. extractOverlayBoxes() returns
+  { headline: {w_px,h_px}, cta: {w_px,h_px}, quote: {w_px,h_px} }.
+
+Derivation prompt (buildDerivationPrompt, lines 556-799)
+--------------------------------------------------------
+Variant-aware sections:
+
+  BRAND section          when outcome=brand_match — tagline, tone[],
+                         scene, sentiment summary. Prompt explicitly
+                         forbids inventing product names.
+  PRODUCT section        otherwise — productName, brand, category,
+                         price, description, visible text from
+                         DetectionArtifact.text[]
+  SOCIAL CONTEXT         only when variantKind !== 'product_image'.
+                         Caption, creator handle, platformStats
+                         (likes/comments/shares/saves/views),
+                         transcript (video).
+                         Skipped for product_image so the prompt
+                         stays product-focused.
+  REVIEW SIGNAL          real productReviews.quotes (cap 5) →
+                         brandReviews.quotes (brand_match) →
+                         LLM fallback. Prompt enforces that real
+                         review quotes are preferred over invented
+                         ones.
+  SCENE CONTEXT          background palette / setting / lighting /
+                         style from DetectionArtifact.background
+  BRAND KEY PERSONAS     Brand.demographics[] surfaced as plausible
+                         quote authors
+  TASK rules             - per-template quote count + length caps
+                           (ugc_split_screen / review_collage:
+                           ≤90 chars / 10-14 words; others:
+                           ≤120 chars / 12-18 words)
+                         - slot-aware character budgets via
+                           computeSlotBudgets() — derived from the
+                           template's canvas variant
+                         - split-headline rules
+                           (headline_lead + headline_main)
+                         - overlay box budgets when precomputed
+                         - brand-mode vs. product-mode copy mode
+
+Gemini call:
+  Model:           GEMINI_MODEL (default gemini-2.5-pro)
+  Temperature:     0.3
+  maxOutputTokens: 3000
+  thinkingBudget:  1024
+  Schema-locked:   DERIVATION_SCHEMA (lines 175-230)
+                   { quotes[], short_benefits[], badges[],
+                     copy: { headline, headline_lead, headline_main,
+                             subheadline, eyebrow, highlight_text },
+                     cta:  { text, subtext, offer_text },
+                     trusted_by_text, tone[], theme_style,
+                     background_style, emphasis }
+
+On timeout / parse failure → fallbackDerivation() returns a generic
+copy skeleton so the ad still renders, just with weaker copy.
+
+assembleInput (lines 876-1214)
+------------------------------
+Merges derivation + context into the canonical RS Social Proof JSON.
+Key behaviors:
+
+  Hero / secondary / creator media picking
+    pickHeroMedia, pickSecondaryMedia, pickCreatorMedia choose the
+    smartCrop winner closest to the template's media slot ratio.
+    Fall through extended crops → fileUrl when nothing matches.
+
+  Quote priority (lines 910-941)
+    1. Real productReviews.quotes (or brandReviews when brand_match)
+    2. LLM-authored quotes from derivation.quotes
+    3. Synthesis from reviewSummary.summary first sentence
+    First survivor wins social_proof.primary_quote; rest fill
+    secondary_quotes[].
+
+  Variant suppression (variantKind === 'product_image')
+    creator block      → {}
+    ugc block          → {}
+    performance.engagement → {}
+    performance.metrics    → []
+    Catalog product images have no creator, no post, no engagement
+    data — the ad reads as a static product card rather than UGC
+    social proof.
+
+Canonical output (LayoutInputArtifact.input) shape:
+  {
+    template, aspect_ratio,
+    theme:        { style, background_style, emphasis },
+    brand:        { name, tagline, logo, primary_color,
+                    secondary_color, accent_color, font_family,
+                    tone },
+    product:      { id, name, category, price, currency, description,
+                    short_benefits[], badges[],
+                    hero_media: {image, video},
+                    secondary_media: {image, video},
+                    image,  // catalog hero crop for the slot ratio
+                    category_pool: [...] },
+    creator:      {...} | {},
+    ugc:          {...} | {},
+    social_proof: { rating_value, review_count, trusted_by_text,
+                    proof_badges[],
+                    primary_quote, secondary_quotes[] },
+    performance:  { engagement: {...} | {}, metrics: [...] | [] },
+    cta:          { text, url, subtext, offer_text },
+    copy:         { headline, headline_lead, headline_main,
+                    subheadline, eyebrow, highlight_text, disclaimer },
+    media:        { palette, palette_dominant, palette_accent,
+                    palette_neutral, palette_vibrant,
+                    background_setting, background_lighting,
+                    background_style, background_description },
+    layout_options: { show_logo, show_price, show_rating,
+                      show_review_count, show_creator_handle,
+                      show_engagement, show_badges, show_cta },
+    defaults:     { fallback_quote, fallback_headline, cta_text,
+                    product_name },
+    placement:    { elements[], analysis }  // overlay-mode only
+  }
+
+
+Stage 6b — Template binding resolution (services/templateRegistry.js)
+---------------------------------------------------------------------
+Each template (schemas/rsSocialProof.templates.normalized.json) declares:
+
+  zones[]            ordered list of render zones (text, media, badge,
+                     button, proof_bar, meta_block, text_card …)
+  slot_adapter       per-zone input-path priority chain
+  style_bindings     per-style-slot input-path priority chain + default
+  truncation_rules   line / char caps per slot (max_lines, max_chars)
+  validation         required_all_of, required_any_of, minCount per slot
+
+Slot resolution (resolveStyleBindings, lines 190-214):
+  For each binding entry:
+    1. Walk source_priority array in order
+    2. First non-null, non-empty value from input.* wins
+    3. If all sources are empty, fall back to `default`
+    4. If still empty, slot reads as null and the template's
+       fallback styling kicks in
+
+Contrast guard (applyContrastGuard, post-resolution):
+  For pairs declared in CONTRAST_PAIRS (text → paired bg surface):
+    - Compute WCAG luminance + contrast ratio
+    - If ratio < 8.0 (AAA threshold) → override the text binding to
+      white or brand fallback that DOES pass
+  Catches "white headline on a light vibrant palette" and similar
+  contrast failures that would otherwise ship.
+
+Active V1 templates (both support ugc + product_image variants):
+
+  testimonial_spotlight
+    layout:          quote_focus base + rating_bar overlay
+    zones:           hero_quote (social_proof.primary_quote.text |
+                     copy.headline), support_media (product.hero_media
+                     .video/image | creator.portrait_media |
+                     product.image), rating_bar (proof_bar),
+                     product_meta (name, price, currency, badges),
+                     cta (button)
+    style_bindings:  panel_bg ← media.palette_dominant
+                     headline_text_color ← media.palette_vibrant
+                       default #FFFFFF, contrast-guarded
+                     cta_button_bg ← media.palette_vibrant |
+                                       brand.accent_color | #FF6B35
+                     font_family_headline ← brand.font_family
+    truncation:      headline ≤3 lines, quote ≤4 lines, cta ≤24 chars
+    validation:      required_any_of=[primary_quote.text | headline]
+                     required_all_of=[product.name, cta.text]
+
+  ugc_split_screen
+    layout:          split_panel base (image + product side-by-side)
+                     + rating_bar overlay
+    zones:           section_header (copy.eyebrow | product.category |
+                     brand.tagline), product_meta (text from
+                     product.description | brand.summary |
+                     brand.tagline), support_media (same priority as
+                     spotlight), rating_bar, cta
+    slot_adapter:    split-headline support
+                     (copy.headline_lead + copy.headline_main)
+    truncation:      headline ≤3 lines, product_description ≤12 lines,
+                     cta ≤24 chars
+    validation:      required_all_of=[product.name, cta.text]
+
+  testimonial_overlay
+    UGC-only (gated by TEMPLATE_SUPPORTS_VARIANT). Creator quote sits
+    over a UGC scene, so it doesn't make sense on a catalog hero.
+
+  product_overlay
+    Both variants supported but not part of the V1 active pair in the
+    smoke test.
+
+Style bindings live in the per-template JSON spec, not in code.
+Adding a new style slot:
+  1. Add the binding to schemas/rsSocialProof.templates.normalized.json
+  2. Add the slot to the renderer's CSS (frontend/app/src/ads-renderer/)
+  3. If contrast-sensitive, add the (text, bg) pair to CONTRAST_PAIRS
+     in services/contrastGuard.js
+
+
 Ad lifecycle states
 -------------------
 queued     created by expandWizardJob; no render output; awaiting selection
@@ -354,10 +617,11 @@ size will OOM.
 
 Known gaps / things that will fail today
 ----------------------------------------
-1. variantKind='product_image' ads queue but render fails. Templates
-   currently expect UGC-shaped media slots; catalog hero media doesn't
-   produce the same content (no creator handle, no caption, etc.).
-   Template-side support for product_image is next on the roadmap.
+1. variantKind='product_image' ads render. assembleInput suppresses
+   creator/ugc/performance blocks for this variant, and the prompt
+   skips the SOCIAL CONTEXT section. testimonial_overlay is the only
+   V1 template that doesn't support product_image (creator quote over
+   a UGC photo only makes sense with real UGC).
 
 2. Videos rarely render because readinessScore=null sorts them last.
    Drain images first; if you want a video, manually pick one via
@@ -379,11 +643,27 @@ Key paths to read for deeper understanding
 ------------------------------------------
 server/models/Ad.js                            ← schema + indexes
 server/models/CampaignRun.js                   ← batch tracker
+server/models/LayoutInputArtifact.js           ← cached canonical input
 server/services/campaignAdsGenerationService.js
   expandWizardJob               ← queue builder
   selectAdsForRun               ← selection by readiness
   computeIdentityDigest         ← dedup key
   seedFromBrandOnly / seedsFromMedia / seedsFromProduct
+  TEMPLATE_SUPPORTS_VARIANT     ← per-template variant whitelist
+server/services/layoutInputService.js
+  buildLayoutInput              ← cache + assemble entry
+  loadContext                   ← Media / artifacts / Brand / Catalog
+  buildDerivationPrompt         ← Gemini prompt builder
+  assembleInput                 ← canonical RS Social Proof JSON
+  synthesizeMatchFromCatalogProduct
+  buildIdentificationFromCatalogProduct
+  computeSlotBudgets            ← per-slot char caps
+server/services/templateRegistry.js
+  resolveStyleBindings          ← input-path → style slot
+  applyContrastGuard            ← WCAG post-resolution override
+  validateInputAgainstTemplate  ← pre-render check
+server/services/contrastGuard.js               ← CONTRAST_PAIRS map
+server/services/overlayPlacementService.js     ← overlay-mode boxes
 server/services/renderService.js
   renderCreative                ← 5-stage pipeline
   persistStage                  ← Ad update-in-place
@@ -395,3 +675,8 @@ server/routes/ads.js
   POST /generate                ← orchestration
   runRenderLoop / renderOne     ← background loop
   projectAd                     ← API response shape
+server/schemas/rsSocialProof.templates.normalized.json
+                                ← per-template zones, slot_adapter,
+                                  style_bindings, truncation_rules
+server/schemas/rsSocialProof.canonicalData.v1.json
+                                ← schema for the canonical input JSON
