@@ -494,42 +494,66 @@ async function loadContext(mediaId, options = {}) {
       };
     }
 
-    // Inset pick — best product_only shot OTHER than the hero. When
-    // the catalog only has one shot (no alts), inset falls back to
-    // hero's own crop in assembleInput. Ranking matches the inverse
-    // priority used in seedsFromProduct's hero ranking.
-    const INSET_RANK = {
-      product_only: 1,
-      packaging:    2,
-      detail:       3,
-      flat_lay:     4,
-      unknown:      5,
-      lifestyle:    6,
-      on_model:     7
-    };
-    const insetCandidates = catalogMediaDocs
-      .filter(m => !heroMediaDoc || String(m._id) !== String(heroMediaDoc._id))
-      .slice()
-      .sort((a, b) => {
-        const ra = INSET_RANK[a.classification?.shotType] ?? INSET_RANK.unknown;
-        const rb = INSET_RANK[b.classification?.shotType] ?? INSET_RANK.unknown;
-        return ra - rb;
+    // Track both shot flavors independently so the canonical input can
+    // surface them at fixed paths (product.lifestyle_image,
+    // product.product_image). Templates that want a clean studio shot
+    // for the small product callout AND a lifestyle thumbnail
+    // elsewhere can bind both. The seed's mediaId already determined
+    // the AD hero (above); these two are reference paths that get
+    // populated independently.
+    const lifestyleCandidates = catalogMediaDocs
+      .filter(m => ['lifestyle', 'on_model', 'flat_lay'].includes(m.classification?.shotType));
+    const productOnlyCandidates = catalogMediaDocs
+      .filter(m => ['product_only', 'packaging', 'detail'].includes(m.classification?.shotType));
+
+    // Per-flavor pick: highest-confidence within the flavor, then
+    // prefer the merchant's primary (imageRole=hero) as a tiebreak.
+    function pickByConfidence(arr) {
+      if (!arr.length) return null;
+      const sorted = arr.slice().sort((a, b) => {
+        const ca = a.classification?.shotTypeConfidence ?? 0;
+        const cb = b.classification?.shotTypeConfidence ?? 0;
+        if (cb !== ca) return cb - ca;
+        const aHero = (a.metadata?.imageRole === 'hero') ? 0 : 1;
+        const bHero = (b.metadata?.imageRole === 'hero') ? 0 : 1;
+        return aHero - bHero;
       });
-    const insetMediaDoc = insetCandidates[0] || null;
-    if (insetMediaDoc) {
-      const insetCrops = insetMediaDoc.latestArtifacts?.crops
-        ? await CropArtifact.findById(insetMediaDoc.latestArtifacts.crops).lean()
-        : null;
-      const insetDetection = insetMediaDoc.latestArtifacts?.detection
-        ? await DetectionArtifact.findById(insetMediaDoc.latestArtifacts.detection).select('imageUrl').lean()
-        : null;
-      // Stash on productHero so assembleInput / pickProductImage can
-      // serve product.image from the inset crop. When undefined, the
-      // existing fallback uses heroCrops (single-shot catalogs).
-      if (productHero) {
-        productHero.insetMediaId = insetMediaDoc._id;
-        productHero.insetImageUrl = insetDetection?.imageUrl || insetMediaDoc.fileUrl || null;
-        productHero.insetCrops    = insetCrops || null;
+      return sorted[0];
+    }
+    const lifestyleMediaDoc = pickByConfidence(lifestyleCandidates);
+    const productOnlyMediaDoc = pickByConfidence(productOnlyCandidates);
+
+    // Hydrate crops + detection imageUrl for each flavor (cheap parallel).
+    async function hydrate(doc) {
+      if (!doc) return null;
+      const [det, crops] = await Promise.all([
+        doc.latestArtifacts?.detection
+          ? DetectionArtifact.findById(doc.latestArtifacts.detection).select('imageUrl').lean()
+          : Promise.resolve(null),
+        doc.latestArtifacts?.crops
+          ? CropArtifact.findById(doc.latestArtifacts.crops).lean()
+          : Promise.resolve(null)
+      ]);
+      return {
+        mediaId:  doc._id,
+        imageUrl: det?.imageUrl || doc.fileUrl || null,
+        crops:    crops || null
+      };
+    }
+    const lifestyleHydrated   = await hydrate(lifestyleMediaDoc);
+    const productOnlyHydrated = await hydrate(productOnlyMediaDoc);
+
+    if (productHero) {
+      productHero.lifestyle   = lifestyleHydrated;     // best lifestyle/on_model/flat_lay
+      productHero.productOnly = productOnlyHydrated;   // best product_only/packaging/detail
+      // Legacy alias (used by existing pickProductImage path) — point
+      // at productOnly when available so the inset slot already in use
+      // gets the clean shot; falls back to hero's own crop in
+      // pickProductImage when both are null.
+      if (productOnlyHydrated) {
+        productHero.insetMediaId  = productOnlyHydrated.mediaId;
+        productHero.insetImageUrl = productOnlyHydrated.imageUrl;
+        productHero.insetCrops    = productOnlyHydrated.crops;
       }
     }
   }
@@ -658,6 +682,23 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   lines.push(`Template: ${template} (${templateIntent(template)}).`);
   lines.push(`Aspect ratio: ${aspectRatio}.`);
   if (options.tone_hint) lines.push(`Caller tone hint: ${options.tone_hint}.`);
+
+  // Match-type signal — the LLM should know whether this is the exact
+  // SKU, just the SKU's category, or brand-only. Calibrates how
+  // specific the copy can be:
+  //   product_match    — exact SKU; write specific feature claims
+  //   product_category — same category, may not be the exact item;
+  //                      keep feature claims general
+  //   brand_match      — no product signal; brand-only mode (BRAND
+  //                      banner below also fires)
+  const outcome = match?.outcome || null;
+  if (outcome === 'product_match') {
+    lines.push(`Match type: product_match — this is the exact SKU. Specific feature claims (material, scent, size, etc.) are safe.`);
+  } else if (outcome === 'product_category') {
+    lines.push(`Match type: product_category — this is in the SKU's category but may not be the exact item. Keep feature claims GENERAL (talk about the product class, not specific cuts/colors/scents you can't verify).`);
+  } else if (outcome === 'brand_match') {
+    lines.push(`Match type: brand_match — no specific product was identified. See BRAND-ONLY MODE below.`);
+  }
   lines.push('');
 
   // CAMPAIGN INTENT — overrides default headline rules when the
@@ -1173,12 +1214,22 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
       badges:         limitArray(derivedBadges, 4),
       hero_media:      mediaPair(heroMedia),
       secondary_media: mediaPair(secondaryMedia),
-      // Catalog product image. When the wizard threaded a productId
-      // (every ad-render does), prefer the JUDGE-CROPPED catalog hero
-      // for the heroSourceRatio over the raw CatalogProduct.imageUrl.
-      // Fall back to the raw URL when no catalog hero crops exist
-      // (early ingest, manual-upload-only catalog row, etc.).
+      // Catalog product image (legacy single-shot path). When the
+      // wizard threaded a productId (every ad-render does), prefer the
+      // JUDGE-CROPPED catalog product_only shot for the heroSourceRatio
+      // over the raw CatalogProduct.imageUrl. Falls back through hero
+      // crop → raw URL. Kept for templates that bind to product.image
+      // directly; new templates should prefer the explicit
+      // lifestyle_image / product_image paths below.
       image:           pickProductImage(ctx, heroSourceRatio, details) || undefined,
+      // Explicit per-flavor catalog imagery. Always populated when the
+      // catalog has the shot classified, regardless of variantKind, so
+      // a UGC ad can also show a clean product callout AND a lifestyle
+      // thumbnail. Null when the catalog lacks the flavor (e.g.,
+      // product-only brand with no lifestyle photography). Both ride
+      // the same ratio-aware crop URL machinery as the hero.
+      lifestyle_image: pickFlavorImage(ctx?.productHero?.lifestyle,   heroSourceRatio) || null,
+      product_image:   pickFlavorImage(ctx?.productHero?.productOnly, heroSourceRatio) || null,
       // Sibling SKUs in the matched category — populated when the match
       // resolves to a Category (via CatalogProduct.categoryRef on a
       // product_match, or via ProductMatchArtifact.categoryId on a
@@ -1687,6 +1738,22 @@ function pickHeroMedia(ctx, aspectRatio) {
 // AND its CropArtifact has a winner for the requested ratio, return
 // the c_crop transform URL. Otherwise fall back to details.imageUrl
 // (the raw CatalogProduct.imageUrl, uncropped).
+// Given a hydrated flavor entry from loadContext.productHero (lifestyle
+// or productOnly), return the ratio-aware crop URL when crops exist,
+// else the raw imageUrl. Returns null when the entry is missing — the
+// caller emits null to the canonical input so templates know the
+// flavor isn't available for this product.
+function pickFlavorImage(flavor, aspectRatio) {
+  if (!flavor) return null;
+  if (flavor.crops?.winners && flavor.imageUrl) {
+    const winnerId = flavor.crops.winners[aspectRatio];
+    const list = flavor.crops.smartCrops?.[aspectRatio] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0] || null;
+    if (winner) return buildCloudinaryCropUrl(flavor.imageUrl, winner);
+  }
+  return flavor.imageUrl || null;
+}
+
 function pickProductImage(ctx, aspectRatio, details) {
   const ph = ctx?.productHero;
   // Prefer the INSET media (best product_only / clean catalog shot) for

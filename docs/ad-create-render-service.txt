@@ -139,14 +139,32 @@ Readiness score computation:
   variantKind='product_image':
     score = tierWeight × 0.7  (constant — catalog hero quality)
 
-  variantKind='ugc', fileType='image':
-    score = tierWeight × (Media.adSuitability.score ?? 0.5)
+  variantKind='ugc' (image OR video — equal participation):
+    quality   = 0.6 × engagementScore  +  0.4 × adSuitability.score
+    score     = tierWeight × quality
 
-  variantKind='ugc', fileType='video':
-    score = null
-    (videos are consistently subpar for static ad output; nulls sort
-     LAST in the selection query so videos are never picked unless
-     every image-tier ad has been rendered first)
+  engagementScore (per Media.platformStats):
+    raw     = likes + 2×comments + 2×saves + 3×shares
+              (saves and shares are higher-intent than likes;
+               comments express deeper engagement)
+    score   = min(1, log10(raw + 1) / 4)
+              (10 ≈ 0.26, 100 ≈ 0.50, 1000 ≈ 0.75, 10000 ≈ 1.0;
+               viral posts don't dwarf the rest of the queue)
+    null when raw <= 0 → caller blends a 0.5 default
+
+  Null-side fallback: if either engagement or adSuitability is null,
+  the missing side contributes a 0.5 default. Avoids penalizing
+  single-signal media (e.g. freshly-ingested posts with adSuitability
+  set but no insights yet).
+
+  Effect on drain order: within a tier, highest-engagement posts
+  surface first. Across tiers, tier weight dominates — a brand_match
+  post with viral engagement (0.6 × 1.0 = 0.60) still ranks below a
+  weak product_match (1.0 × 0.5 = 0.50)... wait, equal. Actually
+  brand_match-viral (0.60) edges out product_match-weak (0.50). The
+  blended math is intentionally permissive at the boundaries so a
+  truly outstanding lower-tier post can outrank a mediocre higher-tier
+  post.
 
 Returns:
   {
@@ -348,6 +366,20 @@ For overlay-mode templates (testimonial_overlay / product_overlay):
 
 Derivation prompt (buildDerivationPrompt, lines 556-799)
 --------------------------------------------------------
+Up-front signal block (always emitted):
+  - Template + aspect ratio + intent
+  - Match type line — product_match | product_category | brand_match
+    + guidance on how specific feature claims can be (exact SKU vs
+    category vs brand-only)
+  - Caller tone hint when present
+
+Campaign-intent section (kind='brand' or 'promotional' only):
+  - brand: anchor headlines on Brand.tagline; LLM produces
+    tone-aware variants matching Brand.tone[]
+  - promotional: operator-supplied offer details (discountType,
+    discountValue, code, window, giveaway, notes); auto-injects
+    urgency phrasing when endsAt is within 7 days
+
 Variant-aware sections:
 
   BRAND section          when outcome=brand_match — tagline, tone[],
@@ -436,7 +468,26 @@ Canonical output (LayoutInputArtifact.input) shape:
                     short_benefits[], badges[],
                     hero_media: {image, video},
                     secondary_media: {image, video},
-                    image,  // catalog hero crop for the slot ratio
+                    image,            // legacy: catalog product_only
+                                      // crop for the slot ratio,
+                                      // falls back to hero crop /
+                                      // raw URL. Kept for templates
+                                      // that bind product.image
+                                      // directly.
+                    lifestyle_image,  // NEW: best lifestyle/on_model/
+                                      // flat_lay catalog shot, ratio-
+                                      // aware crop URL. null when
+                                      // catalog has no lifestyle
+                                      // photo. Always populated when
+                                      // the catalog carries the
+                                      // flavor, regardless of variant.
+                    product_image,    // NEW: best product_only/
+                                      // packaging/detail catalog shot,
+                                      // ratio-aware crop URL. null
+                                      // when catalog has no clean
+                                      // studio shot. Always populated
+                                      // when the catalog carries the
+                                      // flavor.
                     category_pool: [...] },
     creator:      {...} | {},
     ugc:          {...} | {},

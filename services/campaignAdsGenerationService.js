@@ -99,13 +99,41 @@ const TIER_WEIGHTS = {
 // quality, scene density, etc.). Use a fixed quality assumption.
 const PRODUCT_IMAGE_QUALITY = 0.7;
 
-// Video media is consistently subpar for static ad output. Skip the
-// adSuitability lookup entirely and leave readinessScore null so the
-// selection query (sorted desc) ranks videos LAST.
-function readinessScoreFor(matchTier, fileType, adSuitabilityScore) {
-  if (fileType === 'video') return null;
+// Engagement-weighted score from platformStats. Saves and shares are
+// higher-intent than likes; comments express deeper engagement than a
+// passive like. Weighted raw → log-normalized to 0-1 so a viral post
+// doesn't dwarf the rest of the queue (an order-of-magnitude jump is
+// worth ~0.25 score). Returns null when no engagement signal is
+// available; callers blend a 0.5 default in.
+function engagementScore(platformStats) {
+  if (!platformStats || typeof platformStats !== 'object') return null;
+  const likes    = Number(platformStats.likes)    || 0;
+  const comments = Number(platformStats.comments) || 0;
+  const saves    = Number(platformStats.saves)    || 0;
+  const shares   = Number(platformStats.shares)   || 0;
+  const raw = likes + (2 * comments) + (2 * saves) + (3 * shares);
+  if (raw <= 0) return null;
+  // log10(raw+1) / 4 — 10 ≈ 0.26, 100 ≈ 0.50, 1000 ≈ 0.75, 10000 ≈ 1.0
+  return Math.min(1, Math.log10(raw + 1) / 4);
+}
+
+// UGC readiness = tier × quality, where quality blends engagement
+// (60%) with adSuitability (40%). Engagement captures audience pull;
+// adSuitability captures composition (focus / brightness / density).
+// Mixing both means a blurry viral post still ranks below a sharp
+// viral post, and a stunning low-engagement post still ranks below a
+// solid mid-engagement post. Null-side falls back to a 0.5 default
+// so single-signal media isn't penalized into oblivion.
+// Videos participate at parity with images — engagement on Reels is
+// often higher than feed photos for the same brand, and the static
+// renderer composites video poster frames cleanly.
+function readinessScoreFor(matchTier, fileType, adSuitabilityScore, platformStats) {
   const tier = TIER_WEIGHTS[matchTier] ?? 0.5;
-  const quality = adSuitabilityScore ?? 0.5;
+  const eng  = engagementScore(platformStats);
+  const ads  = (typeof adSuitabilityScore === 'number') ? adSuitabilityScore : null;
+  const engPart = eng ?? 0.5;
+  const adsPart = ads ?? 0.5;
+  const quality = (0.6 * engPart) + (0.4 * adsPart);
   return Number((tier * quality).toFixed(4));
 }
 
@@ -229,7 +257,7 @@ async function expandWizardJob({
       });
       const readinessScore = seed.variantKind === 'product_image'
         ? readinessScoreForProductImage(seed.matchTier)
-        : readinessScoreFor(seed.matchTier, seed.fileType, seed.suitabilityScore);
+        : readinessScoreFor(seed.matchTier, seed.fileType, seed.suitabilityScore, seed.platformStats);
       payloads.push({
         brandId,
         campaignId,
@@ -329,17 +357,28 @@ async function seedFromBrandOnly(brandId, topN) {
   if (!matches.length) return [];
   const mediaIds = Array.from(new Set(matches.map(m => String(m.mediaId))));
   const medias = await loadMediasForScoring(mediaIds);
+  // Rank the brand-only pool by the SAME blended quality that drives
+  // readinessScore so the cap (BRAND_ONLY_MEDIA_LIMIT) keeps the best
+  // posts. Pre-cap by composition-blended engagement so a slot-25
+  // post isn't a sharp-but-dead photo while a sharp-AND-popular post
+  // gets cut.
   const ranked = medias
     .filter(isMediaEligibleByContentNature)
-    .sort((a, b) => (b.adSuitability?.score ?? -1) - (a.adSuitability?.score ?? -1))
-    .slice(0, topN);
+    .map(m => ({
+      m,
+      score: readinessScoreFor('brand_only', m.fileType, m.adSuitability?.score, m.platformStats)
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topN)
+    .map(({ m }) => m);
   return ranked.map(m => ({
     productId:        null,
     mediaId:          String(m._id),
     matchTier:        'brand_only',
     variantKind:      'ugc',
     fileType:         m.fileType,
-    suitabilityScore: m.adSuitability?.score ?? null
+    suitabilityScore: m.adSuitability?.score ?? null,
+    platformStats:    m.platformStats || null
   }));
 }
 
@@ -351,7 +390,7 @@ async function seedFromBrandOnly(brandId, topN) {
 // explicit pick still produces an ad.
 async function seedsFromMedia(brandId, mediaId) {
   const media = await Media.findById(mediaId)
-    .select('matchedProducts adSuitability fileType classification')
+    .select('matchedProducts adSuitability fileType classification platformStats')
     .lean();
   if (!media) return [];
   // Operator-driven path: when the wizard hands us a specific mediaId
@@ -360,6 +399,7 @@ async function seedsFromMedia(brandId, mediaId) {
   // fallback) where the operator hasn't seen the post.
   const fileType = media.fileType;
   const score    = media.adSuitability?.score ?? null;
+  const stats    = media.platformStats || null;
 
   const productMatches = (media.matchedProducts || []).filter(mp => mp.catalogProductId);
   if (!productMatches.length) {
@@ -369,7 +409,8 @@ async function seedsFromMedia(brandId, mediaId) {
       matchTier:        'brand_match',
       variantKind:      'ugc',
       fileType,
-      suitabilityScore: score
+      suitabilityScore: score,
+      platformStats:    stats
     }];
   }
 
@@ -379,7 +420,8 @@ async function seedsFromMedia(brandId, mediaId) {
     matchTier:        mp.outcome === 'product_match' ? 'product_match' : 'product_category',
     variantKind:      'ugc',
     fileType,
-    suitabilityScore: score
+    suitabilityScore: score,
+    platformStats:    stats
   }));
 }
 
@@ -417,7 +459,8 @@ async function seedsFromProduct(brandId, productId) {
         matchTier:        mm.matchTier,
         variantKind:      'ugc',
         fileType:         media.fileType,
-        suitabilityScore: media.adSuitability?.score ?? null
+        suitabilityScore: media.adSuitability?.score ?? null,
+        platformStats:    media.platformStats || null
       });
     }
   }
@@ -441,7 +484,8 @@ async function seedsFromProduct(brandId, productId) {
         matchTier:        'brand_match',
         variantKind:      'ugc',
         fileType:         m.fileType,
-        suitabilityScore: m.adSuitability?.score ?? null
+        suitabilityScore: m.adSuitability?.score ?? null,
+        platformStats:    m.platformStats || null
       });
     }
   }
@@ -512,7 +556,7 @@ function pickProductImageHero(medias) {
 async function loadMediasForScoring(mediaIds) {
   if (!mediaIds.length) return [];
   return Media.find({ _id: { $in: mediaIds } })
-    .select('_id adSuitability fileType classification')
+    .select('_id adSuitability fileType classification platformStats')
     .lean();
 }
 
