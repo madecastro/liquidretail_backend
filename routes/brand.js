@@ -448,6 +448,24 @@ router.get('/:id/onboarding-status', async (req, res) => {
   }
 });
 
+// Ad-readiness gate — same signals as the onboarding panel, condensed
+// into a yes/no the wizard can disable buttons on. Strictest bar:
+// every connected source has ≥1 completed DetectRun AND zero in-flight
+// runs. Returns 200 with { ready, reason, blockers[] } even when not
+// ready — the frontend renders the blockers as a tooltip / banner.
+router.get('/:id/ad-readiness', async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).select('_id').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    const { getAdReadiness } = require('../services/adReadinessService');
+    const readiness = await getAdReadiness(brand._id);
+    res.json(readiness);
+  } catch (err) {
+    console.error('ad-readiness failed:', err);
+    res.status(500).json({ error: err.message || 'ad-readiness failed' });
+  }
+});
+
 // Friendly stage names for the ActivityBar. DetectRun.stage is the
 // pipeline phase (set via setRunPhase in pipelines/detect.js); we
 // flatten + humanize so the bar reads naturally rather than leaking

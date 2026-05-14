@@ -66,6 +66,24 @@ router.post('/generate', async (req, res) => {
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
 
+    // Account-setup gate — refuse generation while any connected source
+    // has detect in flight or hasn't completed. Mirrors the gate on
+    // POST /api/campaigns so a campaign created before the gate landed
+    // still can't generate ads on a half-ingested brand. brandId is
+    // resolved from the Campaign so the wizard caller doesn't have to
+    // re-pass it.
+    const gateCampaign = await Campaign.findById(campaignId).select('brandId').lean();
+    if (!gateCampaign) return res.status(404).json({ error: 'campaign not found' });
+    const { getAdReadiness } = require('../services/adReadinessService');
+    const readiness = await getAdReadiness(gateCampaign.brandId);
+    if (!readiness.ready) {
+      return res.status(409).json({
+        error: readiness.reason,
+        code: 'account-setup-incomplete',
+        blockers: readiness.blockers
+      });
+    }
+
     // 1. Expand the wizard payload — bulk-queues every viable combination as
     //    Ad docs with status='queued'. Re-running with the same picks is
     //    idempotent (unique index on campaignId+identityDigest swallows dups).

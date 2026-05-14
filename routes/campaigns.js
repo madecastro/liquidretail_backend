@@ -272,6 +272,20 @@ router.post('/', express.json(), async (req, res) => {
     if (!brandId)        return res.status(400).json({ error: 'brandId required' });
     if (!req.advertiserId) return res.status(400).json({ error: 'advertiser context missing' });
 
+    // Account-setup gate — block campaign creation until every connected
+    // source has ≥1 completed DetectRun and zero in-flight runs. Partial
+    // ingest state pairs seeds with stale/mismatched UGC; the strictest
+    // bar avoids that until detect terminates everywhere.
+    const { getAdReadiness } = require('../services/adReadinessService');
+    const readiness = await getAdReadiness(brandId);
+    if (!readiness.ready) {
+      return res.status(409).json({
+        error: readiness.reason,
+        code: 'account-setup-incomplete',
+        blockers: readiness.blockers
+      });
+    }
+
     const { name, kind, productIds = [], mediaIds = [], promotionalDetails = null } = req.body || {};
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: 'name required' });
