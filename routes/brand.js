@@ -493,10 +493,16 @@ router.get('/:id/brand-matches', async (req, res) => {
       .lean();
     const mediaById = new Map(medias.map(m => [String(m._id), m]));
 
+    // Mirror the seed expansion's content-nature gate so the picker
+    // doesn't surface promotional / announcement posts that the
+    // cartesian would silently drop.
+    const { isMediaEligibleByContentNature } = require('../services/campaignAdsGenerationService');
+
     const matches = ordered
       .map(a => {
         const m = mediaById.get(String(a.mediaId));
         if (!m) return null;
+        if (!isMediaEligibleByContentNature(m)) return null;
         return {
           mediaId:   String(a.mediaId),
           matchTier: 'brand_match',

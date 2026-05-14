@@ -290,9 +290,17 @@ router.get('/:id/matches', async (req, res) => {
       : [];
     const mediaById = new Map(mediaDocs.map(m => [String(m._id), m]));
 
+    // Apply the same content-nature gate the seed expansion uses
+    // (services/campaignAdsGenerationService.isMediaEligibleByContentNature).
+    // Without it the picker would surface promotional / announcement
+    // posts that the cartesian then silently drops, leaving the operator
+    // confused about why they don't appear in queued ads.
+    const { isMediaEligibleByContentNature } = require('../services/campaignAdsGenerationService');
+
     const matches = ordered.map(a => {
       const m = mediaById.get(String(a.mediaId));
       if (!m) return null;
+      if (!isMediaEligibleByContentNature(m)) return null;
       const cropProductRef = a.query?.productCrop || {};
       return {
         mediaId:    String(a.mediaId),

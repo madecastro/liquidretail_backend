@@ -788,5 +788,9 @@ module.exports = {
   expandWizardJob,
   selectAdsForRun,
   computeIdentityDigest,
-  SUPPORTED_TEMPLATES
+  SUPPORTED_TEMPLATES,
+  // Exposed so picker endpoints can apply the same content-nature
+  // gate the seed expansion uses — otherwise the picker shows posts
+  // that would be silently dropped at expansion time.
+  isMediaEligibleByContentNature
 };
