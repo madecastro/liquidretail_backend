@@ -272,15 +272,24 @@ router.post('/', express.json(), async (req, res) => {
     if (!brandId)        return res.status(400).json({ error: 'brandId required' });
     if (!req.advertiserId) return res.status(400).json({ error: 'advertiser context missing' });
 
-    const { name, kind, productIds = [], mediaIds = [] } = req.body || {};
+    const { name, kind, productIds = [], mediaIds = [], promotionalDetails = null } = req.body || {};
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: 'name required' });
     }
-    if (!['brand', 'product'].includes(kind)) {
-      return res.status(400).json({ error: "kind must be 'brand' or 'product'" });
+    if (!['brand', 'product', 'promotional'].includes(kind)) {
+      return res.status(400).json({ error: "kind must be 'brand', 'product', or 'promotional'" });
     }
     if (!Array.isArray(productIds) || !Array.isArray(mediaIds)) {
       return res.status(400).json({ error: 'productIds and mediaIds must be arrays' });
+    }
+    // Coerce promotionalDetails dates from ISO strings to Dates so the
+    // derivation prompt's days-until-end math works. Other fields are
+    // free-form Mixed; pass through as-is.
+    let normalizedPromo = null;
+    if (kind === 'promotional' && promotionalDetails && typeof promotionalDetails === 'object') {
+      normalizedPromo = { ...promotionalDetails };
+      if (normalizedPromo.startsAt) normalizedPromo.startsAt = new Date(normalizedPromo.startsAt);
+      if (normalizedPromo.endsAt)   normalizedPromo.endsAt   = new Date(normalizedPromo.endsAt);
     }
 
     // Tenant assertion on every passed product/media id — drop any
@@ -320,6 +329,7 @@ router.post('/', express.json(), async (req, res) => {
       // the same intent for media pre-selection.
       matchedProductIds: validProductIds,
       mediaIds:          validMediaIds,
+      promotionalDetails: normalizedPromo,
       adSets:      []
     });
 
