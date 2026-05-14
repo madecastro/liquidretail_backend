@@ -117,16 +117,6 @@ async function renderCreative(req) {
       expectedKind: req.creative.expectedKind,
       mediaId:      req.creative.mediaId,
       brandId:      req.brandId,
-      // Without these, the page-side fetch of /api/layout-input rebuilds
-      // the input with default options (no productId, paletteSource='media',
-      // variantKind='ugc') — producing a DIFFERENT artifact than deriveStage
-      // just made. That bug rendered "P / Product" placeholders on
-      // catalog-hero variants and made media/brand palette variants
-      // visually identical. Threading the options here keeps the page's
-      // rebuild keyed to the same cache slot.
-      productId:     req.productId     || null,
-      paletteSource: req.paletteSource || 'media',
-      variantKind:   req.variantKind   || 'ugc',
       authToken:    req.authToken || null,
       renderMode:   useVideoBranch ? 'video-overlay' : 'static'
     });
@@ -320,7 +310,7 @@ function decodeTokenPayload(token) {
   );
 })();
 
-async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, productId, paletteSource, variantKind, authToken: reqAuthToken, renderMode = 'static' }) {
+async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static' }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
   // renderMode = 'static' → opaque PNG of full canvas (image media or
@@ -331,14 +321,15 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
   url.searchParams.set('media', mediaId);
   url.searchParams.set('template', template);
   url.searchParams.set('ratio', aspectRatio);
-  // Render-time variant selectors. Without these, ads.html's POST to
-  // /api/layout-input would rebuild a DIFFERENT cache slot than the
-  // deriveStage artifact this render is meant to capture. The cache
-  // key already includes productId/paletteSource/variantKind, so when
-  // the page passes them through they hit the existing artifact.
-  if (productId)     url.searchParams.set('productId', String(productId));
-  if (paletteSource) url.searchParams.set('paletteSource', String(paletteSource));
-  if (variantKind)   url.searchParams.set('variantKind', String(variantKind));
+  // Pass the artifact ID directly so the page fetches by FK rather
+  // than rebuilding via the cache-keyed POST. Earlier attempt threaded
+  // productId/paletteSource/variantKind through URL params, but the
+  // 8-field cache key also includes campaignContextHash (derived from
+  // campaignKind + promotionalDetails + ctaText + ctaUrl) — those
+  // don't fit cleanly in URL params, and any drift forced a full
+  // re-derive that timed out at the 30s Netlify gateway. Fetching the
+  // artifact by id eliminates the entire cache-miss class.
+  if (layoutInputArtifactId) url.searchParams.set('layoutInputArtifactId', String(layoutInputArtifactId));
   const isVideoOverlay = renderMode === 'video-overlay';
 
   let browser;

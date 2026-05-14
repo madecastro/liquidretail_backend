@@ -3,7 +3,8 @@ const router = express.Router();
 
 const { buildLayoutInput, getCandidatesForMedia } = require('../services/layoutInputService');
 const registry = require('../services/templateRegistry');
-const { assertMediaInTenant } = require('../middleware/tenantHelpers');
+const { assertMediaInTenant, tenantFilter } = require('../middleware/tenantHelpers');
+const LayoutInputArtifact = require('../models/LayoutInputArtifact');
 
 // POST /api/layout-input
 // Body: { mediaId, template, aspect_ratio, options?, refresh? }
@@ -59,6 +60,34 @@ router.post('/', express.json(), async (req, res) => {
     // the request needing a repro.
     console.error(`❌ POST /api/layout-input failed (${status}): ${err.message}\n${err.stack || ''}`);
     res.status(status).json({ error: err.message || 'Layout input generation failed' });
+  }
+});
+
+// GET /api/layout-input/by-id/:id
+//
+// Direct fetch by stored artifact _id. The render path uses this
+// instead of POST /api/layout-input so the Puppeteer page never has
+// to reconstruct the cache key from URL params (campaignContextHash
+// would silently drift, miss the cache, force a full re-derive, and
+// time out the Netlify gateway at 30s — exactly what we just hit).
+//
+// Returns the same shape POST does: { input, canvas, style_bindings }.
+// The artifact was already validated when it was written; no need to
+// re-run validation here. Tenant filter scopes by brandId from the
+// token.
+router.get('/by-id/:id', async (req, res) => {
+  try {
+    const artifact = await LayoutInputArtifact.findOne(tenantFilter(req, { _id: req.params.id })).lean();
+    if (!artifact) return res.status(404).json({ error: 'layout input artifact not found' });
+    const response = {
+      input:          artifact.input,
+      canvas:         registry.getCanvas(artifact.template, artifact.aspectRatio),
+      style_bindings: registry.resolveStyleBindings(artifact.input, artifact.template)
+    };
+    res.json(response);
+  } catch (err) {
+    console.error(`❌ GET /api/layout-input/by-id/${req.params.id} failed: ${err.message}`);
+    res.status(500).json({ error: err.message || 'layout input fetch failed' });
   }
 });
 
