@@ -212,7 +212,13 @@ async function expandWizardJob({
   templateIds  = [],
   cta          = {},
   urlParams    = '',
-  requestedBy  = null
+  requestedBy  = null,
+  // [{ productId, mediaId }] — globally drop these (productId, mediaId)
+  // tuples from the cartesian. The wizard's Step 2 picker collects
+  // these as the operator clicks the X on individual related-tile
+  // pairings; passed through here so brand_match seeds (productId=null)
+  // can also be excluded when mediaId matches.
+  excludePairings = []
 }) {
   if (!campaignId) throw new Error('campaignId required');
 
@@ -251,6 +257,23 @@ async function expandWizardJob({
     for (const productId of productIds) {
       const productSeeds = await seedsFromProduct(brandId, productId);
       seeds.push(...productSeeds);
+    }
+  }
+
+  // Apply operator exclusions BEFORE dedup so the dedup keys aren't
+  // reused by an excluded pair (defensive — dedup compares whole tuple
+  // including productId, so this is belt+braces).
+  if (excludePairings.length) {
+    const excludeKeys = new Set(
+      excludePairings.map(p => `${p.productId ? String(p.productId) : 'NULL'}|${String(p.mediaId)}`)
+    );
+    const before = seeds.length;
+    seeds = seeds.filter(s => {
+      const key = `${s.productId ? String(s.productId) : 'NULL'}|${String(s.mediaId)}`;
+      return !excludeKeys.has(key);
+    });
+    if (before !== seeds.length) {
+      console.log(`📦 expandWizardJob: excludePairings dropped ${before - seeds.length} seed(s) (${excludePairings.length} exclusions configured)`);
     }
   }
 

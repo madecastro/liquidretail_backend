@@ -8,6 +8,7 @@ const Media = require('../models/Media');
 const CatalogProduct = require('../models/CatalogProduct');
 const Campaign = require('../models/Campaign');
 const IntegrationCredential = require('../models/IntegrationCredential');
+const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 
 // Fire-and-forget enrichment trigger. Imported lazily to avoid the
 // circular require that originally pushed enrichment scheduling into
@@ -445,6 +446,88 @@ router.get('/:id/onboarding-status', async (req, res) => {
   } catch (err) {
     console.error('onboarding-status failed:', err);
     res.status(500).json({ error: err.message || 'onboarding-status failed' });
+  }
+});
+
+// Brand-wide brand_match listings for the wizard's Step 2 picker.
+// brand_match PMAs are not tied to a specific catalog product — they
+// represent posts that registered as brand-fit without identifying a
+// SKU. The picker shows them as a separate "Brand-only posts" section
+// alongside the per-product/per-media match ribbons so operators can
+// individually exclude any of them from the cartesian.
+//
+// Returns one row per Media (latest brand_match PMA wins on dupes),
+// sorted by readiness signals — engagement first, then ad-suitability.
+// Capped to a generous default; the picker is meant for browsing not
+// pagination.
+router.get('/:id/brand-matches', async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).select('_id').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+
+    const artifacts = await ProductMatchArtifact.find({
+      brandId: brand._id,
+      outcome: 'brand_match'
+    })
+      .sort({ createdAt: -1 })
+      .select('mediaId outcome outcomeReasoning winner matchSource identification createdAt')
+      .limit(500)
+      .lean();
+
+    // Latest-per-media dedupe — a media that appears in multiple runs
+    // shows once with the most recent evidence.
+    const seen = new Set();
+    const ordered = [];
+    for (const a of artifacts) {
+      const key = String(a.mediaId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      ordered.push(a);
+    }
+    if (!ordered.length) return res.json({ matches: [] });
+
+    const mediaIds = ordered.map(a => a.mediaId);
+    const medias = await Media.find({ _id: { $in: mediaIds }, brandId: brand._id })
+      .select('externalId fileType fileUrl source metadata classification platformStats adSuitability createdAt')
+      .lean();
+    const mediaById = new Map(medias.map(m => [String(m._id), m]));
+
+    const matches = ordered
+      .map(a => {
+        const m = mediaById.get(String(a.mediaId));
+        if (!m) return null;
+        return {
+          mediaId:   String(a.mediaId),
+          matchTier: 'brand_match',
+          outcome:   a.outcome || null,
+          outcomeReasoning: a.outcomeReasoning || null,
+          winner:    a.winner       || null,
+          matchSource: a.matchSource || null,
+          confidence: a.identification?.certainty ?? null,
+          media: {
+            externalId:    m.externalId,
+            fileType:      m.fileType,
+            fileUrl:       m.fileUrl,
+            source:        m.source,
+            permalink:     m.metadata?.permalink     || null,
+            creatorHandle: m.metadata?.creatorHandle || null,
+            postedAt:      m.metadata?.postedAt      || null,
+            likes:         m.platformStats?.likes    ?? null,
+            comments:      m.platformStats?.comments ?? null,
+            saves:         m.platformStats?.saves    ?? null,
+            adSuitability: m.adSuitability?.score    ?? null,
+            createdAt:     m.createdAt
+          }
+        };
+      })
+      .filter(Boolean)
+      .slice(0, limit);
+
+    res.json({ matches });
+  } catch (err) {
+    console.error('brand-matches lookup failed:', err);
+    res.status(500).json({ error: err.message || 'brand-matches lookup failed' });
   }
 });
 

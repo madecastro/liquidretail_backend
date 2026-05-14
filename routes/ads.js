@@ -60,6 +60,10 @@ router.post('/generate', async (req, res) => {
       templateIds = [],
       cta         = {},
       urlParams   = '',
+      // [{ productId, mediaId }] — operator-deselected pairings from
+      // the Step 2 picker. Forwarded into expandWizardJob to drop the
+      // matching tuples from the cartesian.
+      excludePairings = [],
       refresh     = false   // wizard checkbox / smoke-test override; bypasses de-dupe + LayoutInputArtifact cache
     } = req.body || {};
 
@@ -94,6 +98,7 @@ router.post('/generate', async (req, res) => {
       templateIds,
       cta,
       urlParams,
+      excludePairings,
       requestedBy: req.user?.userId || null
     });
 

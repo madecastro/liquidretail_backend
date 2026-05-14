@@ -212,11 +212,24 @@ router.get('/:mediaId/related-products', async (req, res) => {
       .lean();
     const byId = new Map(products.map(p => [String(p._id), p]));
 
+    // Join the PMA evidence so the picker can show "why this match"
+    // alongside the product card. matchedProducts already carries the
+    // FK; one $in fetch hydrates them all in one round-trip.
+    const evidenceIds = entries.map(e => e.matchEvidenceArtifactId).filter(Boolean);
+    let pmaById = new Map();
+    if (evidenceIds.length) {
+      const pmas = await ProductMatchArtifact.find({ _id: { $in: evidenceIds } })
+        .select('outcomeReasoning winner matchSource catalogCombinedScore catalogVisualScore')
+        .lean();
+      pmaById = new Map(pmas.map(a => [String(a._id), a]));
+    }
+
     res.json({
       products: entries
         .map(e => {
           const p = byId.get(String(e.catalogProductId));
           if (!p) return null;
+          const pma = e.matchEvidenceArtifactId ? pmaById.get(String(e.matchEvidenceArtifactId)) : null;
           return {
             id:         String(p._id),
             title:      p.title,
@@ -229,7 +242,16 @@ router.get('/:mediaId/related-products', async (req, res) => {
             externalId: p.externalId || null,
             source:     p.source || null,
             outcome:    e.outcome || null,
-            confidence: e.confidence || null
+            // matchTier mirrors the seed-expansion field name. brand_match
+            // pairings don't surface here (no catalogProductId); the
+            // picker pulls those from /api/brand/:id/brand-matches.
+            matchTier:        e.outcome || null,
+            confidence:       e.confidence || null,
+            outcomeReasoning: pma?.outcomeReasoning || null,
+            winner:           pma?.winner          || null,
+            matchSource:      pma?.matchSource     || null,
+            catalogCombinedScore: pma?.catalogCombinedScore ?? null,
+            catalogVisualScore:   pma?.catalogVisualScore   ?? null
           };
         })
         .filter(Boolean)

@@ -268,7 +268,7 @@ router.get('/:id/matches', async (req, res) => {
     // most recent artifact's evidence).
     const artifacts = await ProductMatchArtifact.find({ catalogProductId: product._id })
       .sort({ createdAt: -1 })
-      .select('mediaId outcome winner identification query catalogCombinedScore catalogVisualScore createdAt productIndex')
+      .select('mediaId outcome outcomeReasoning winner identification query catalogCombinedScore catalogVisualScore createdAt productIndex matchSource')
       .limit(200)
       .lean();
 
@@ -299,6 +299,13 @@ router.get('/:id/matches', async (req, res) => {
         runArtifactId: String(a._id),
         productIndex: a.productIndex || null,
         outcome:    a.outcome || null,
+        // matchTier mirrors the seed expansion's matchTier values
+        // (product_match | product_category) — same shape the picker
+        // groups on. Brand-wide brand_match matches surface via the
+        // separate /api/brand/:id/brand-matches endpoint.
+        matchTier:        a.outcome || null,
+        outcomeReasoning: a.outcomeReasoning || null,
+        matchSource:      a.matchSource || null,
         winner:     a.winner  || null,
         confidence: a.catalogCombinedScore ?? a.identification?.certainty ?? null,
         catalogCombinedScore: a.catalogCombinedScore ?? null,
