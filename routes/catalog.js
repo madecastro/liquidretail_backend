@@ -133,6 +133,12 @@ router.get('/', async (req, res) => {
     } else if (req.query.source) {
       filter.source = String(req.query.source);
     }
+    // Independent draft filter — composes with `source` so callers can
+    // ask for "drafts of a specific source" (e.g. detect-identified
+    // review queue: ?source=detect-identified&draft=1). Without this,
+    // ?source=detect-identified returned both draft + saved rows mixed.
+    if (req.query.draft === '1') filter.draft = true;
+    if (req.query.draft === '0') filter.draft = { $ne: true };
     if (req.query.category) {
       filter.category = new RegExp(escapeRegex(String(req.query.category)), 'i');
     }
@@ -252,6 +258,56 @@ router.get('/:id', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'catalog detail failed' });
+  }
+});
+
+// ── Edit ────────────────────────────────────────────────────────────
+//
+// PATCH /api/catalog/:id
+// Body: subset of editable fields. Operator-curated edits — primarily
+// used by the /ads/detect review page to graduate a draft detect-
+// identified row into the main catalog.
+//
+// Editable fields:
+//   title, brand, category, price, currency, productUrl, imageUrl,
+//   description, draft  (passing `draft: false` saves/promotes a row)
+//
+// Source / catalog-sync fields (externalId, retailerId, gtin, mpn,
+// rawData, lastSyncedAt) are NOT editable — they're authoritative
+// from the upstream sync. Validators reject any unknown keys.
+const EDITABLE_FIELDS = new Set([
+  'title', 'brand', 'category', 'price', 'currency',
+  'productUrl', 'imageUrl', 'description', 'draft'
+]);
+router.patch('/:id', express.json(), async (req, res) => {
+  try {
+    const product = await CatalogProduct.findOne(tenantFilter(req, { _id: req.params.id }));
+    if (!product) return res.status(404).json({ error: 'product not found' });
+
+    const updates = {};
+    for (const [k, v] of Object.entries(req.body || {})) {
+      if (!EDITABLE_FIELDS.has(k)) continue;
+      // Coerce numerics; price comes off the wire as either number or
+      // string from <input type="number">.
+      if (k === 'price' && v !== null && v !== '') {
+        const n = Number(v);
+        if (Number.isFinite(n)) updates.price = n;
+        continue;
+      }
+      if (k === 'draft') { updates.draft = !!v; continue; }
+      updates[k] = v ?? null;
+    }
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ error: 'no editable fields provided' });
+    }
+
+    Object.assign(product, updates);
+    await product.save();
+
+    res.json({ product: projectListRow(product, (product.matchedMedia || []).length) });
+  } catch (err) {
+    console.error('catalog PATCH failed:', err);
+    res.status(500).json({ error: err.message || 'catalog update failed' });
   }
 });
 
