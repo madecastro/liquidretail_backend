@@ -546,6 +546,54 @@ Canonical output (LayoutInputArtifact.input) shape:
   }
 
 
+Where layout actually lives — two schemas, one renderer
+-------------------------------------------------------
+Template geometry lives in TWO schemas today:
+
+  canvas.v1.json (canvas-mode templates):
+    testimonial_spotlight, ugc_split_screen, review_collage,
+    results_proof, creator_endorsement
+    Declares fixed rect per ratio: zones[] with id, kind, slot,
+    rect{x,y,w,h}, style_variant, layer, padding, radius. Renderer
+    reads canvas.zones[] directly and absolute-positions each as a
+    <div class="tp-zone kind-{kind} style-{style_variant}">.
+
+  templates.normalized.json (overlay-mode templates):
+    testimonial_overlay, product_overlay
+    Declares placement_policy.element_priority_order — list of
+    elements (logo, headline, product_meta, cta, quote) with
+    region_hint and slot_binding. The renderer's placement service
+    computes per-element rects at render time using
+    OverlayZoneArtifact (brightness grid + restriction zones from
+    Gemini Vision) and a greedy algorithm respecting
+    subject_overlap_budget_pct. Text avoids the subject.
+
+Both pipelines converge at the renderer's DOM layer: every zone
+ends up as a tp-zone div with kind/style_variant classes that the
+CSS in ads.html styles. Style bindings (panel_bg, headline_text_
+color, cta_button_bg, etc.) always come from
+templates.normalized.json.style_bindings and resolve via
+templateRegistry.resolveStyleBindings → CSS variables on #tpStage.
+
+Rule going forward (until the unification refactor below lands):
+
+  New templates that AREN'T full-bleed overlays go canvas-first.
+  Declare in canvas.v1.json with per-ratio zones[].
+  Style bindings, validation, truncation rules go in
+  templates.normalized.json.
+
+  New full-bleed overlays (text-over-subject) keep
+  placement_policy.element_priority_order in
+  templates.normalized.json so subject-aware placement can adapt.
+
+Backlogged: unification refactor that migrates overlay zone
+declarations into canvas.v1.json with a placement_mode:"adaptive"
+flag, strips zones[] from templates.normalized.json, and unifies
+the two zone-loading paths in templatePreview.js. Triggered when
+adding a 5th overlay-mode template, a renderer change touching
+both paths, or a new contributor getting confused. See backlog.csv.
+
+
 Stage 6b — Template binding resolution (services/templateRegistry.js)
 ---------------------------------------------------------------------
 Each template (schemas/rsSocialProof.templates.normalized.json) declares:
