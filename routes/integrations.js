@@ -413,6 +413,44 @@ router.get('/instagram/:credentialId/options', async (req, res) => {
   }
 });
 
+// GET /instagram/:credentialId/options/debug
+//   Diagnostic for "I don't see my catalog in the picker" reports.
+//   Returns the same listAccountOptions output but flattened to the
+//   per-source counts + errors block so we can see WHICH enumeration
+//   leg failed for this user's token (owned/client/page/user). Safe
+//   to expose — never returns the token, and the caller must already
+//   own the credential (tenant filter on lookup).
+router.get('/instagram/:credentialId/options/debug', async (req, res) => {
+  try {
+    const brandId = req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'X-Brand-Id header required' });
+    const cred = await IntegrationCredential.findOne(tenantFilter(req, {
+      _id: req.params.credentialId, brandId, type: 'instagram',
+      status: { $in: ['pending', 'active'] }
+    }));
+    if (!cred) return res.status(404).json({ error: 'credential not found or revoked' });
+
+    const { decrypt } = require('../services/integrationCryptoService');
+    let token;
+    try { token = decrypt(cred.accessTokenEnc); }
+    catch (err) { return res.status(500).json({ error: `token decrypt failed: ${err.message}` }); }
+
+    const opts = await ig.listAccountOptions(token);
+    res.json({
+      pageCount:    opts.pages.length,
+      catalogCount: opts.catalogs.length,
+      catalogs:     opts.catalogs.map(c => ({
+        id: c.id, name: c.name, businessName: c.businessName,
+        productCount: c.productCount, sources: c.sources
+      })),
+      debug: opts.debug
+    });
+  } catch (err) {
+    console.error('options debug failed:', err);
+    res.status(500).json({ error: err.message || 'options debug failed' });
+  }
+});
+
 // PATCH /instagram/:credentialId/selection
 // Body: { pageId, igUserId?, catalogId? }
 //   Validates each picked id is in what the token can access, then
