@@ -1084,10 +1084,33 @@ function fallbackDerivation(ctx) {
 // ──────────────────────────────────────────────────────────────
 //  Canonical assembly
 // ──────────────────────────────────────────────────────────────
+// Trim text to a max-char budget at the last word boundary. Returns
+// the original text when it already fits. Used to enforce eyebrow_rules
+// max_chars on brand.tagline fallbacks — without this, a long tagline
+// (e.g. "Restored and Modified, Better than New") spills past the
+// hairline rules and looks broken in the rendered ad.
+function truncateToBudget(text, maxChars) {
+  if (!text || typeof text !== 'string') return text;
+  if (typeof maxChars !== 'number' || maxChars <= 0) return text;
+  if (text.length <= maxChars) return text;
+  // Cut at the last whitespace that fits, drop trailing punctuation.
+  const slice = text.slice(0, maxChars);
+  const lastSpace = slice.lastIndexOf(' ');
+  const cut = lastSpace > Math.floor(maxChars * 0.6) ? slice.slice(0, lastSpace) : slice;
+  return cut.replace(/[\s,.;:–—-]+$/, '');
+}
+
 function assembleInput(ctx, template, aspectRatio, options, derivation, precomputedPlacement) {
   const { media, detection, match, brand } = ctx;
   const ident   = match?.identification || {};
   const details = ident.details || {};
+  // Slot budgets — used to enforce per-zone caps on resolved copy
+  // fields. Today this only enforces eyebrow_rules max_chars on the
+  // subheadline fallback; headline path enforces caps inside the
+  // derivation prompt itself.
+  const canvasVariantForBudgets = registry.CANVAS.templates?.[template]?.variants?.[aspectRatio] || null;
+  const slotBudgets = canvasVariantForBudgets ? computeSlotBudgets(canvasVariantForBudgets) : {};
+  const eyebrowMaxChars = slotBudgets.eyebrow?.max_chars || null;
   // product_image variant uses the catalog product directly as the
   // visual + content source. Suppress UGC-only blocks (creator,
   // ugc, performance.engagement) so the renderer doesn't pull
@@ -1352,7 +1375,18 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
       // fall through to brand.tagline (subheadline) or brand.tone[0] +
       // an action verb / category (eyebrow). Keeps the panel populated
       // for brand_match outcomes the LLM under-emits on.
-      subheadline:    derivation.copy?.subheadline || brand?.tagline || undefined,
+      //
+      // Budget enforcement: when the resolved subheadline rides into
+      // the eyebrow_rules zone (the common case across the v1 templates),
+      // hard-cap to the slot's max_chars budget at the last word
+      // boundary. The LLM gets the cap in its prompt and respects it,
+      // but the brand.tagline fallback path doesn't — a long tagline
+      // like "Restored and Modified, Better than New" otherwise spills
+      // past the hairlines and looks broken.
+      subheadline:    truncateToBudget(
+        derivation.copy?.subheadline || brand?.tagline || undefined,
+        eyebrowMaxChars
+      ),
       eyebrow:        derivation.copy?.eyebrow
                        || (Array.isArray(brand?.tone) && brand.tone[0] ? `Built for ${String(brand.tone[0]).toLowerCase()}` : null)
                        || media.metadata?.category
