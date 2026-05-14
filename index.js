@@ -238,13 +238,18 @@ mongoose.connect(process.env.MONGODB_URI, {
       const Ad                  = require('./models/Ad');
       const CampaignRun         = require('./models/CampaignRun');
       const LayoutInputArtifact = require('./models/LayoutInputArtifact');
+      const Media               = require('./models/Media');
       await Promise.all([
         DetectRun.syncIndexes(),
         Ad.syncIndexes(),
         CampaignRun.syncIndexes(),
-        LayoutInputArtifact.syncIndexes()
+        LayoutInputArtifact.syncIndexes(),
+        // Drops the legacy global unique on (source, externalId) and
+        // builds the brand-scoped (brandId, source, externalId) one
+        // declared on the schema. Required for multi-tenant ingest.
+        Media.syncIndexes()
       ]);
-      console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun, LayoutInputArtifact)');
+      console.log('✅ critical indexes synced (DetectRun, Ad, CampaignRun, LayoutInputArtifact, Media)');
     } catch (err) {
       console.warn(`⚠️  syncIndexes failed (non-fatal): ${err.message}`);
     }

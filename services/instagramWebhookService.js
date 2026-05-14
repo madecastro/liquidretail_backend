@@ -113,8 +113,11 @@ async function handleMediaChange({ cred, value }) {
   const mediaId = String(value?.media_id || '').trim();
   if (!mediaId) return { skipped: 'no media_id in payload' };
 
-  // Idempotency short-circuit — already ingested?
-  const existing = await Media.findOne({ source: 'instagram', externalId: mediaId }).select('_id').lean();
+  // Idempotency short-circuit — already ingested for THIS brand?
+  // Brand-scoped (matches Media's tenant-scoped unique index) so the
+  // same IG post webhook delivered to two brands doesn't no-op the
+  // second one.
+  const existing = await Media.findOne({ brandId: cred.brandId, source: 'instagram', externalId: mediaId }).select('_id').lean();
   if (existing) return { skipped: 'already ingested', mediaId };
 
   let token;

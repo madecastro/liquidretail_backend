@@ -243,7 +243,20 @@ const mediaSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
-mediaSchema.index({ source: 1, externalId: 1 }, { unique: true });
+// Tenant-scoped uniqueness. Previously this was a GLOBAL unique on
+// (source, externalId) — but external IDs (Instagram media id, TikTok
+// post id, Meta catalog item id) only happen to be globally unique
+// from the platform's perspective; in our multi-tenant world the same
+// external asset can legitimately appear under more than one Brand
+// (test brands, agencies managing multiple clients with shared
+// accounts, etc.). With the old key, the first brand to ingest an
+// IG account "won" it and every subsequent brand silently 0-ingested
+// against the same post ids. Brand-scoping fixes that.
+//
+// Migration note: Media.syncIndexes() at boot drops the old global
+// index and builds this one. No data backfill needed — existing rows
+// already carry brandId.
+mediaSchema.index({ brandId: 1, source: 1, externalId: 1 }, { unique: true });
 mediaSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
   // Capture insert-vs-update so the post('save') hook below can

@@ -3,10 +3,14 @@
 // creates a Media doc per new post, and enqueues a DetectRun so the
 // existing detect pipeline runs on it unchanged.
 //
-// Idempotency: Media.findOne({ source: 'instagram', externalId: <ig-id> })
-// is the dedup key. Posts already ingested are skipped — we don't
-// re-enqueue DetectRuns for them. Re-running this sync after a few
-// hours will only ingest posts published since the last sync.
+// Idempotency: Media.findOne({ brandId, source: 'instagram', externalId })
+// is the dedup key. Brand-scoped because the same IG account can be
+// connected to more than one brand (test brands, agency-managed
+// portfolios) — a global key would let the first brand "win" the post
+// and silently 0-ingest every subsequent brand's sync. Posts already
+// ingested for THIS brand are skipped — we don't re-enqueue DetectRuns
+// for them. Re-running this sync after a few hours will only ingest
+// posts published since the last sync.
 //
 // Carousels: V1 takes only the first child item (image or video) as
 // the primary media. Multi-asset detect runs are a V2 concern.
@@ -225,8 +229,9 @@ async function syncPostsForCred(cred, options = {}) {
     const externalId = String(post.id || '').trim();
     if (!externalId) { summary.errors++; continue; }
 
-    // Idempotent skip: already ingested.
-    const existing = await Media.findOne({ source: 'instagram', externalId }).select('_id').lean();
+    // Idempotent skip: already ingested for THIS brand. Other brands'
+    // copies of the same IG post id are intentionally not deduped here.
+    const existing = await Media.findOne({ brandId, source: 'instagram', externalId }).select('_id').lean();
     if (existing) { summary.skipped++; continue; }
 
     // Cap check — when out of remaining runs, still ingest the Media
@@ -316,7 +321,7 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
   let media;
   try {
     media = await Media.findOneAndUpdate(
-      { source: 'instagram', externalId },
+      { brandId: cred.brandId, source: 'instagram', externalId },
       {
         $setOnInsert: {
           advertiserId: cred.advertiserId,

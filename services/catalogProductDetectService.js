@@ -235,15 +235,17 @@ async function createDetectRunIfAbsent(media, product) {
 // doesn't break the index later) and create a wrapper Media doc.
 // Idempotent: when a Media with the synthetic externalId already
 // exists (re-sync, concurrent enqueue, scheduler-overlap), return
-// the existing doc instead of E11000-ing on the (source, externalId)
-// unique index.
+// the existing doc instead of E11000-ing on the
+// (brandId, source, externalId) unique index. Brand-scoped so a
+// different brand's catalog with a coincidentally-matching synthetic
+// id can't collide.
 async function materializeImage({ sourceUrl, product, imageRole }) {
   const externalId = `cp_${product._id}_${imageRole}_${hashShort(sourceUrl)}`;
 
   // Fast path — if the Media doc already exists, skip the Cloudinary
   // mirror (expensive) and return it. The mirror is best-effort
   // anyway; a prior successful pass already paid for it.
-  const existing = await Media.findOne({ source: 'catalog-product', externalId });
+  const existing = await Media.findOne({ brandId: product.brandId, source: 'catalog-product', externalId });
   if (existing) return existing;
 
   let mirroredUrl;
@@ -280,7 +282,7 @@ async function materializeImage({ sourceUrl, product, imageRole }) {
     // Lost the race to a concurrent caller — the Media doc was
     // inserted between our findOne and create. Re-fetch and return.
     if (err.code === 11000) {
-      return await Media.findOne({ source: 'catalog-product', externalId });
+      return await Media.findOne({ brandId: product.brandId, source: 'catalog-product', externalId });
     }
     throw err;
   }
