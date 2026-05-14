@@ -67,11 +67,20 @@ detectRunSchema.index({ status: 1, priority: 1, createdAt: 1 });
 // and treats it as "already enqueued, no-op." Completed/failed runs
 // are NOT covered by the filter so re-detection can still create a
 // new run after a previous one terminates.
+//
+// Explicit name is REQUIRED — the field-level `index: true` on
+// mediaId above auto-names its index 'mediaId_1', and Mongoose would
+// auto-name this partial unique to the same string and fail
+// syncIndexes with "An existing index has the same name". The two
+// indexes serve different queries (single-field for general
+// mediaId lookups; partial unique for the in-flight uniqueness
+// guard) so both must coexist with distinct names.
 detectRunSchema.index(
   { mediaId: 1 },
   {
     unique: true,
-    partialFilterExpression: { status: { $in: ['queued', 'processing'] } }
+    partialFilterExpression: { status: { $in: ['queued', 'processing'] } },
+    name: 'mediaId_in_flight_unique'
   }
 );
 
