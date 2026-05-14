@@ -19,9 +19,11 @@ const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 // Hard cap so a runaway catalog doesn't spin forever inside an HTTP
 // request. Brands with > 500 SKUs need V2 background sync; typical
-// IG Commerce catalogs are well under this.
-const MAX_ITEMS = 500;
-const PAGE_SIZE = 100;
+// IG Commerce catalogs are well under this. Env-overridable
+// (CATALOG_SYNC_MAX_ITEMS) so smoke tests can cap to a smaller set
+// without a code change.
+const MAX_ITEMS = Math.max(1, parseInt(process.env.CATALOG_SYNC_MAX_ITEMS, 10) || 500);
+const PAGE_SIZE = Math.min(100, MAX_ITEMS);
 const FIELDS = [
   'id', 'retailer_id', 'name', 'description', 'brand', 'category',
   'price', 'currency', 'availability', 'image_url',
