@@ -485,16 +485,28 @@ async function loadContext(mediaId, options = {}) {
     }
 
     if (heroMediaDoc) {
+      // Pull the FULL detection (imageUrl + background) — palette /
+      // setting / lighting / style come from the catalog hero's own
+      // detection when this image becomes the ad's visual source
+      // (variantKind='product_image'). Without it, assembleInput
+      // would fall back to the UGC post's background — which is
+      // what produced the wrong-color (green jar) bug on catalog-
+      // hero variants.
       const heroDetection = heroMediaDoc.latestArtifacts?.detection
-        ? await DetectionArtifact.findById(heroMediaDoc.latestArtifacts.detection).select('imageUrl').lean()
+        ? await DetectionArtifact.findById(heroMediaDoc.latestArtifacts.detection).select('imageUrl background').lean()
         : null;
       const heroCrops = heroMediaDoc.latestArtifacts?.crops
         ? await CropArtifact.findById(heroMediaDoc.latestArtifacts.crops).lean()
         : null;
       productHero = {
-        mediaId:  heroMediaDoc._id,
-        imageUrl: heroDetection?.imageUrl || heroMediaDoc.fileUrl || null,
-        crops:    heroCrops || null
+        mediaId:    heroMediaDoc._id,
+        imageUrl:   heroDetection?.imageUrl || heroMediaDoc.fileUrl || null,
+        crops:      heroCrops || null,
+        // Catalog-hero scene context — palette + background descriptors.
+        // Consumed by assembleInput only when isProductImage; UGC
+        // variants continue to read from the post's own detection.
+        palette:    heroDetection?.background?.palette || null,
+        background: heroDetection?.background || null
       };
     }
 
@@ -1076,13 +1088,23 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
   const { media, detection, match, brand } = ctx;
   const ident   = match?.identification || {};
   const details = ident.details || {};
-  const palette = detection?.background?.palette || [];
   // product_image variant uses the catalog product directly as the
   // visual + content source. Suppress UGC-only blocks (creator,
   // ugc, performance.engagement) so the renderer doesn't pull
   // creator handles, post captions, or social signals that don't
   // exist for a catalog hero shot.
   const isProductImage = options.variantKind === 'product_image';
+  // Palette + scene context come from the SOURCE of the hero. For
+  // UGC variants that's the post's own detection; for product_image
+  // variants the hero is the catalog product, so we read its
+  // detection (hydrated onto ctx.productHero in loadContext). Before
+  // this branch, both variants read from `detection` (the UGC post
+  // detection) which produced wrong-color backgrounds on catalog-
+  // hero ads (green-jar variants showing UGC-scene colors).
+  const sceneBackground = isProductImage
+    ? (ctx.productHero?.background || detection?.background || null)
+    : (detection?.background || null);
+  const palette = sceneBackground?.palette || [];
 
   // Hero source crop matches the MEDIA SLOT'S ratio (not the canvas
   // ratio). For split-panel layouts the image slot is half-canvas
@@ -1353,7 +1375,11 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
     // resolve the same way (no per-template change) but draw from
     // brand.primaryColor / accentColor / secondaryColor. Falls back
     // to media-derived values per field when a brand color is missing.
-    media: buildMediaBlock({ palette, brand, detection, paletteSource: options.paletteSource || 'media' }),
+    // Pass sceneBackground rather than the raw detection so the
+    // catalog-hero variant routes through productHero.background.
+    // buildMediaBlock only reads background.* fields off whatever
+    // object is passed in detection-shape, so this is a safe swap.
+    media: buildMediaBlock({ palette, brand, sceneBackground, paletteSource: options.paletteSource || 'media' }),
 
     layout_options: options.layout_options || {
       show_logo:           !!brand?.logoUrl,
@@ -1732,7 +1758,10 @@ function pickHeroMedia(ctx, aspectRatio) {
 // Background context (setting/lighting/style/description) stays
 // scene-derived regardless of paletteSource — it informs the prompt
 // section, not style bindings.
-function buildMediaBlock({ palette, brand, detection, paletteSource }) {
+function buildMediaBlock({ palette, brand, sceneBackground, paletteSource }) {
+  // sceneBackground is the resolved background block from the active
+  // hero source (UGC post's detection.background OR catalog hero's
+  // productHero.background, picked by assembleInput per variantKind).
   const mediaPalette = palette || [];
   const useBrand = paletteSource === 'brand';
   // Resolve each style slot. When useBrand is true, brand colors win
@@ -1762,10 +1791,10 @@ function buildMediaBlock({ palette, brand, detection, paletteSource }) {
     palette_accent,
     palette_neutral,
     palette_vibrant,
-    background_setting:     detection?.background?.setting     || null,
-    background_lighting:    detection?.background?.lighting    || null,
-    background_style:       detection?.background?.style       || null,
-    background_description: detection?.background?.description || null
+    background_setting:     sceneBackground?.setting     || null,
+    background_lighting:    sceneBackground?.lighting    || null,
+    background_style:       sceneBackground?.style       || null,
+    background_description: sceneBackground?.description || null
   };
 }
 
