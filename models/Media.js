@@ -208,7 +208,35 @@ const mediaSchema = new mongoose.Schema({
       }],
       matchedCategories: [String],
       detectedAt: Date
-    }
+    },
+
+    // Content-nature classification from subjectTextService — used by
+    // campaignAdsGenerationService.isMediaEligibleByContentNature to
+    // exclude time-bound UGC (sales, "coming soon" teasers) from the
+    // seed pool. Written via dot-notation $set in
+    // pipelines/detect.js at the denorm save. Note: these MUST be
+    // declared here — Mongoose's strict mode silently drops $set to
+    // undeclared classification.* paths, which previously meant the
+    // classifier appeared to run (logs OK) but the field never
+    // persisted.
+    contentNature: {
+      type: String,
+      enum: ['evergreen', 'promotional', 'announcement', 'unknown'],
+      default: undefined
+    },
+    contentNatureConfidence: { type: Number, default: undefined },
+    contentNatureReason:     { type: String, default: undefined },
+
+    // Shot-type classification — picks the visual hero for product_image
+    // ads (lifestyle/on_model > flat_lay > product_only > etc.) and
+    // routes product_only to the small product callout slot.
+    shotType: {
+      type: String,
+      enum: ['lifestyle', 'on_model', 'product_only', 'flat_lay', 'detail', 'packaging', 'unknown'],
+      default: undefined
+    },
+    shotTypeConfidence: { type: Number, default: undefined },
+    shotTypeReason:     { type: String, default: undefined }
   },
 
   createdAt: { type: Date, default: Date.now },
