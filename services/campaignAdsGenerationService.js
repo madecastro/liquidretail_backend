@@ -420,8 +420,15 @@ async function seedFromBrandOnly(brandId, topN) {
   // posts. Pre-cap by composition-blended engagement so a slot-25
   // post isn't a sharp-but-dead photo while a sharp-AND-popular post
   // gets cut.
+  // brand_only gate — pairs a brand-context post with no seed product
+  // attribution. Visible products still risk a caption/text mismatch
+  // (the LLM will surface a generic brand line, but a viewer sees a
+  // specific jar). Apply the same filter as the Tier 3 brand_match
+  // path in seedsFromProduct so the brand-only inventory is curated
+  // to truly product-free brand moments.
   const ranked = medias
     .filter(isMediaEligibleByContentNature)
+    .filter(m => !hasIdentifiedSpecificProduct(m) && !hasVisibleUnmatchedProduct(m))
     .map(m => ({
       m,
       score: readinessScoreFor('brand_only', m.fileType, m.adSuitability?.score, m.platformStats)
@@ -578,6 +585,13 @@ async function seedsFromProduct(brandId, productId) {
       const media = mediaById.get(String(mm.mediaId));
       if (!media) continue;
       if (!isMediaEligibleByContentNature(media)) continue;
+      // Tier 2 gate — if this post arrived via product_category (the
+      // post matched the class, not the SKU) but ALSO has a concrete
+      // product_match to some OTHER specific SKU, the post would
+      // visually contradict the seed. Skip. Tier 1 (product_match)
+      // posts are unaffected — they wouldn't appear under a different
+      // product's matchedMedia at that tier.
+      if (mm.matchTier === 'product_category' && hasIdentifiedSpecificProduct(media)) continue;
       seeds.push({
         productId:        String(productId),
         mediaId:          String(mm.mediaId),
@@ -603,6 +617,12 @@ async function seedsFromProduct(brandId, productId) {
     const medias = await loadMediasForScoring(brandMatchMediaIds);
     for (const m of medias) {
       if (!isMediaEligibleByContentNature(m)) continue;
+      // Tier 3 gate — brand_match pairs an unmatched-by-product post
+      // with a seed SKU. If the post visibly contains ANY product
+      // (identified to another SKU, or unidentified but YOLO-visible),
+      // the pairing risks showing the wrong jar/label next to the
+      // seed's name. Exclude both cases.
+      if (hasIdentifiedSpecificProduct(m) || hasVisibleUnmatchedProduct(m)) continue;
       seeds.push({
         productId:        String(productId),
         mediaId:          String(m._id),
@@ -681,8 +701,34 @@ function pickProductImageHero(medias) {
 async function loadMediasForScoring(mediaIds) {
   if (!mediaIds.length) return [];
   return Media.find({ _id: { $in: mediaIds } })
-    .select('_id adSuitability fileType classification platformStats')
+    .select('_id adSuitability fileType classification platformStats matchedProducts refinedProducts')
     .lean();
+}
+
+// CPG cross-product mismatch guards. A post that visibly shows a
+// specific identified SKU should NOT be paired with a different seed
+// product just because both fall in the same category (Tier 2) or
+// because the brand matches (Tier 3 / brand_only). The catalog match
+// would override the visible jar/label in the photo, reading as a bait-
+// and-switch. Apparel tolerates this (a "tee" reads as a tee regardless
+// of which exact SKU is on the model); CPG doesn't.
+//
+//   hasIdentifiedSpecificProduct — Phase 1.6 + 2d landed a concrete
+//     catalog FK on this media via product_match. The visible product
+//     is known to be SKU X; never pair with seed SKU Y.
+//   hasVisibleUnmatchedProduct  — YOLO detected products on this media
+//     but identification didn't land a catalog FK. The jar is visible
+//     but the label/caption signal wasn't strong enough to claim a SKU.
+//     Still risky for brand-context pairings — the visible product might
+//     contradict the seed in the caption/text overlay.
+function hasIdentifiedSpecificProduct(media) {
+  return Array.isArray(media?.matchedProducts) && media.matchedProducts.some(
+    mp => mp && mp.outcome === 'product_match' && mp.catalogProductId
+  );
+}
+function hasVisibleUnmatchedProduct(media) {
+  if (!Array.isArray(media?.refinedProducts) || media.refinedProducts.length === 0) return false;
+  return !hasIdentifiedSpecificProduct(media);
 }
 
 // Time-bound posts (sale-of-the-week, "coming soon" teasers, holiday
