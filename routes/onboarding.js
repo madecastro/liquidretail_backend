@@ -214,6 +214,14 @@ router.post('/dispatch-syncs', requireAuth, express.json(), async (req, res) => 
           const r = await syncCatalog(String(brandId), {});
           console.log(`📦 dispatched catalog sync: ok=${r.ok} fetched=${r.fetched || 0}`);
         } catch (err) { console.warn(`⚠️  dispatched catalog sync failed: ${err.message}`); }
+        // Same race fix as integrations.js IG finalize: once catalog-
+        // product detects drain, re-run post detect for under-matched
+        // media so they pick up matches against products whose visual
+        // signatures weren't ready during the original race.
+        try {
+          const { rematchAfterCatalogDetect } = require('../services/postRematchAfterCatalogService');
+          await rematchAfterCatalogDetect({ brandId: String(brandId) });
+        } catch (err) { console.warn(`⚠️  rematch-after-catalog failed: ${err.message}`); }
       });
       setImmediate(async () => {
         try {

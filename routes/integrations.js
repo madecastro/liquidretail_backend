@@ -528,6 +528,16 @@ router.patch('/instagram/:credentialId/selection', express.json(), async (req, r
         } catch (err) {
           console.warn(`   ⚠️  auto-trigger catalog sync failed: ${err.message}`);
         }
+        // After catalog sync (and the catalog-product detects it
+        // queued) drain, re-run post detect for any post Media that
+        // missed matches because catalog visual signatures weren't
+        // ready yet. Polls up to 10min for catalog detects to drain.
+        try {
+          const { rematchAfterCatalogDetect } = require('../services/postRematchAfterCatalogService');
+          await rematchAfterCatalogDetect({ brandId: String(brandId) });
+        } catch (err) {
+          console.warn(`   ⚠️  rematch-after-catalog failed: ${err.message}`);
+        }
       });
     }
     if (cred.igUserId) {
