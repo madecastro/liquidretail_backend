@@ -114,6 +114,12 @@ async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, for
           source:              'detect-identified',
           externalId,
           draft:               true,
+          // Detect-identified drafts are by definition single SKUs, not
+          // variant siblings of an item-group. Without this, the schema
+          // default (false) makes them invisible to the catalog list's
+          // primary-variants-only filter — which the detect review page
+          // hits to surface the queue.
+          isPrimaryVariant:    true,
           detectedFromMediaId: media._id,
           firstSeenAt:         new Date()
         }
