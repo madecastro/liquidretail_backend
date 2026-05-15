@@ -1805,18 +1805,33 @@ function buildMediaBlock({ palette, brand, sceneBackground, paletteSource }) {
   // productHero.background, picked by assembleInput per variantKind).
   const mediaPalette = palette || [];
   const useBrand = paletteSource === 'brand';
-  // Resolve each style slot. When useBrand is true, brand colors win
-  // with media-palette as the fallback; otherwise it's the historical
-  // media-first behavior. palette_vibrant takes brand.accentColor in
-  // brand mode (the "pop" color the template uses for CTA + headlines).
+
+  // Brand-variant background picker. The accent color reads as the
+  // "pop" foreground (CTA fill, headline emphasis). Whichever of
+  // primary/secondary gives the accent the highest WCAG contrast wins
+  // the background slot; the other becomes palette_neutral. Without
+  // this, brand variants previously stamped primary as the background
+  // unconditionally — when accent was close in luminance to primary
+  // (e.g. red accent on red primary), the headline blended in.
+  const brandBg = useBrand
+    ? pickBrandBackground(brand?.primaryColor, brand?.secondaryColor, brand?.accentColor)
+    : null;
+  const brandOther = useBrand && brandBg
+    ? (sameHex(brandBg, brand?.primaryColor) ? brand?.secondaryColor : brand?.primaryColor)
+    : null;
+
+  // Resolve each style slot. Brand-mode picks primary/secondary by
+  // accent-contrast (above); media-mode uses the historical media-
+  // first ordering. palette_vibrant stays brand.accentColor in brand
+  // mode (the foreground pop color for CTA + headline emphasis).
   const palette_dominant = useBrand
-    ? (brand?.primaryColor || mediaPalette[0] || null)
+    ? (brandBg || brand?.primaryColor || mediaPalette[0] || null)
     : (mediaPalette[0] || null);
   const palette_accent = useBrand
     ? (brand?.accentColor || mediaPalette[1] || null)
     : (mediaPalette[1] || null);
   const palette_neutral = useBrand
-    ? (brand?.secondaryColor || mediaPalette[2] || null)
+    ? (brandOther || brand?.secondaryColor || mediaPalette[2] || null)
     : (mediaPalette[2] || null);
   const palette_vibrant = useBrand
     ? (brand?.accentColor || pickVibrantColor(mediaPalette))
@@ -1998,6 +2013,32 @@ const VIBRANT_MIN_SATURATION = 0.80;
 // a high-saturation pick that happens to share a hue family with the
 // panel will fail this gate and fall through to the white default.
 const VIBRANT_MIN_CONTRAST_VS_DOMINANT = 8.0;
+
+// Brand-variant background picker. Returns whichever of primary /
+// secondary gives the accent color the highest WCAG contrast — that's
+// where the accent reads as a "pop" foreground (CTA, headline emphasis)
+// instead of blending in. Falls back gracefully when one or more
+// inputs are missing: returns the first defined color.
+function pickBrandBackground(primary, secondary, accent) {
+  if (!accent)    return primary || secondary || null;
+  if (!primary)   return secondary || null;
+  if (!secondary) return primary || null;
+  const cP = contrastRatio(accent, primary);
+  const cS = contrastRatio(accent, secondary);
+  // Tie / null contrast → keep primary as default (matches the legacy
+  // behavior so brands without a meaningfully different secondary
+  // don't see their bindings flip arbitrarily).
+  if (cS == null || cP == null) return primary;
+  return cS > cP ? secondary : primary;
+}
+
+// Case-insensitive hex equality with optional leading-#. Used by the
+// brand-variant picker to identify the "other" color (whichever wasn't
+// chosen as background) for the neutral slot.
+function sameHex(a, b) {
+  if (!a || !b) return false;
+  return String(a).replace(/^#/, '').toLowerCase() === String(b).replace(/^#/, '').toLowerCase();
+}
 
 function pickVibrantColor(palette) {
   if (!Array.isArray(palette) || palette.length === 0) return null;
