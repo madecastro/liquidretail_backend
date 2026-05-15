@@ -137,6 +137,23 @@ const adSchema = new mongoose.Schema({
   ctaUrl:       { type: String, default: '' },
   ctaUrlParams: { type: String, default: '' },
 
+  // ── Meta Ads sync (push-back to Meta Marketing API) ─────────────
+  // Populated by services/metaAdsPushService when the operator pushes
+  // a rendered Ad to a connected Meta ad account. status='synced'
+  // means the Ad lives on Meta as a PAUSED ad; 'failed' preserves the
+  // last error message. Re-pushing to a different AdSet overwrites
+  // these fields (the prior Meta Ad is left in place — operator can
+  // delete from Ads Manager).
+  metaAdId:          { type: String, default: null, index: { sparse: true } },
+  metaAdCreativeId:  { type: String, default: null },
+  metaAdsetId:       { type: String, default: null, index: { sparse: true } },
+  metaCampaignId:    { type: String, default: null },
+  metaAdAccountId:   { type: String, default: null },
+  metaPageId:        { type: String, default: null },
+  metaSyncStatus:    { type: String, enum: ['synced', 'failed', null], default: null, index: { sparse: true } },
+  metaSyncError:     { type: String, default: null },
+  metaSyncedAt:      { type: Date,   default: null },
+
   // ── Timing ───────────────────────────────────────────────────────
   queuedAt:    { type: Date, default: Date.now },
   renderedAt:  { type: Date, default: null },

@@ -644,6 +644,63 @@ router.get('/', async (req, res) => {
   }
 });
 
+// ── Meta Ads push (Phase D) ──────────────────────────────────────────
+//
+// Both endpoints MUST live above the `/:id` routes — Express matches
+// in declaration order, and `/meta-adsets` would otherwise resolve
+// against `/:id` with id='meta-adsets' (404).
+//
+// GET /api/ads/meta-adsets?brandId=...
+//   Flat list of AdSets across the brand's synced Meta Ads campaigns.
+//   Drives the "Push to Meta" modal's single dropdown — UI groups by
+//   campaignName client-side.
+//
+// POST /api/ads/push-to-meta
+//   Body: { brandId, adsetId, adIds: [string] }
+//   Single-ad push is just adIds=[oneId]. Each Ad's image creative
+//   is uploaded → AdCreative + Ad created on Meta as PAUSED. Per-ad
+//   results returned in `perAd` so a partial failure surfaces
+//   row-level errors without losing the successful pushes.
+router.get('/meta-adsets', async (req, res) => {
+  try {
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    const { listAdsetsForBrand } = require('../services/metaAdsPushService');
+    const adsets = await listAdsetsForBrand(brandId);
+    res.json({ adsets });
+  } catch (err) {
+    console.error('meta-adsets list failed:', err);
+    res.status(500).json({ error: err.message || 'meta-adsets list failed' });
+  }
+});
+
+router.post('/push-to-meta', express.json(), async (req, res) => {
+  try {
+    const brandId = req.body?.brandId || req.query.brandId || req.headers['x-brand-id'];
+    const { adsetId, adIds } = req.body || {};
+    if (!brandId)         return res.status(400).json({ error: 'brandId required' });
+    if (!adsetId)         return res.status(400).json({ error: 'adsetId required' });
+    if (!Array.isArray(adIds) || !adIds.length) {
+      return res.status(400).json({ error: 'adIds (non-empty array) required' });
+    }
+    const { pushAdsBatch } = require('../services/metaAdsPushService');
+    const result = await pushAdsBatch({
+      adIds, adsetId, brandId,
+      requestedBy: req.user?.userId || null
+    });
+    // Always 200 — per-ad failures are in result.perAd. The whole
+    // call only 4xx/5xx's when the batch couldn't even start (no
+    // cred, no page, missing params).
+    res.json(result);
+  } catch (err) {
+    console.error('push-to-meta failed:', err);
+    // Surface the typed error code so the UI can render a specific
+    // remediation banner ("Connect Instagram first" vs generic).
+    res.status(err.code === 'no-page' || err.code === 'no-meta-ads-cred' ? 409 : 500)
+       .json({ error: err.message || 'push-to-meta failed', code: err.code || null });
+  }
+});
+
 // PATCH /api/ads/:id — flip status. Body: { status: 'draft' | 'live' | 'archived' }.
 // Caller passes ?brandId or X-Brand-Id so the lookup is tenant-scoped.
 router.patch('/:id', express.json(), async (req, res) => {
@@ -734,7 +791,19 @@ function projectAd(ad, full = false) {
     queuedAt:           ad.queuedAt,
     renderedAt:         ad.renderedAt,
     generatedAt:        ad.generatedAt,
-    createdAt:          ad.createdAt
+    createdAt:          ad.createdAt,
+    // Meta Ads sync — populated when the operator pushes a rendered
+    // ad to Meta Marketing API. The Ads page renders a "Synced to
+    // Meta" pill when status === 'synced' (link to Ads Manager via
+    // the metaAdId), or "Push failed" with the error in a tooltip.
+    metaAdId:           ad.metaAdId         || null,
+    metaAdCreativeId:   ad.metaAdCreativeId || null,
+    metaAdsetId:        ad.metaAdsetId      || null,
+    metaCampaignId:     ad.metaCampaignId   || null,
+    metaAdAccountId:    ad.metaAdAccountId  || null,
+    metaSyncStatus:     ad.metaSyncStatus   || null,
+    metaSyncError:      ad.metaSyncError    || null,
+    metaSyncedAt:       ad.metaSyncedAt     || null
   };
   if (full) {
     base.layoutInputArtifactId = ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null;
