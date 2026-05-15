@@ -31,6 +31,16 @@ const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 // slow once we have telemetry.
 const PUSH_CONCURRENCY = 3;
 
+// Video processing — Meta's /advideos is async. Upload returns
+// immediately with a video_id, but the video isn't usable in an
+// AdCreative until status.video_status === 'ready'. Real-world
+// processing takes 30s–3min; we cap at 5min so a stuck video doesn't
+// hold a worker indefinitely. The poll backs off from 4s to 10s so
+// we don't spam Graph for short videos while still being responsive.
+const VIDEO_POLL_INITIAL_MS  = 4000;
+const VIDEO_POLL_MAX_MS      = 10000;
+const VIDEO_PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
+
 // Operator's freeform CTA text → Meta's call_to_action enum. Falls
 // through to SHOP_NOW (the most common e-commerce CTA) when nothing
 // matches. Keyword bands are tested in order — "shop now" hits SHOP_NOW
@@ -116,6 +126,61 @@ async function uploadImageToMeta({ adAccountId, token, imageUrl }) {
   return hash;
 }
 
+// Upload a video to the ad account's video library. Meta processes
+// it asynchronously — this call returns a video_id immediately, but
+// the AdCreative can't reference the video until its status flips to
+// 'ready'. Caller follows up with waitForVideoReady().
+async function uploadVideoToMeta({ adAccountId, token, videoUrl }) {
+  const res = await axios.post(
+    `${META_GRAPH_ROOT}/${adAccountId}/advideos`,
+    null,
+    {
+      params: { file_url: videoUrl, access_token: token },
+      timeout: 60000   // generous — Meta sometimes holds the request
+                      // open while it does an initial fetch from our URL
+    }
+  );
+  if (!res.data?.id) throw new Error('Meta /advideos returned no id');
+  return res.data.id;
+}
+
+// Poll the video's status field until it reads 'ready'. Backs off
+// from 4s → 10s so quick videos aren't penalized by a slow first
+// poll while long videos don't hammer Graph. Errors out on Meta-
+// reported processing failures or the 5-minute wall clock.
+async function waitForVideoReady({ videoId, token }) {
+  const startedAt = Date.now();
+  let waitMs = VIDEO_POLL_INITIAL_MS;
+  while (Date.now() - startedAt < VIDEO_PROCESSING_TIMEOUT_MS) {
+    await new Promise(r => setTimeout(r, waitMs));
+    waitMs = Math.min(VIDEO_POLL_MAX_MS, Math.round(waitMs * 1.5));
+    let res;
+    try {
+      res = await axios.get(
+        `${META_GRAPH_ROOT}/${videoId}`,
+        {
+          params: { fields: 'status', access_token: token },
+          timeout: 15000
+        }
+      );
+    } catch (err) {
+      // Transient — keep polling. Meta occasionally 5xxs during
+      // processing windows; a few retries are cheaper than failing
+      // the whole push.
+      console.warn(`   ⚠️  video ${videoId} status poll glitched: ${err.message}`);
+      continue;
+    }
+    const phase = res.data?.status?.video_status;   // 'ready' | 'processing' | 'error'
+    if (phase === 'ready') return true;
+    if (phase === 'error') {
+      const detail = res.data?.status?.processing_phase || 'unknown processing error';
+      throw new Error(`Meta rejected video ${videoId}: ${detail}`);
+    }
+    // 'processing' — keep waiting.
+  }
+  throw new Error(`Meta video ${videoId} did not finish processing within ${VIDEO_PROCESSING_TIMEOUT_MS / 1000}s`);
+}
+
 // Create an AdCreative referencing the uploaded image. Headline and
 // body come from the Ad's render-time copy snapshot; landing URL is
 // the operator-supplied CTA URL with tracking params appended.
@@ -146,6 +211,41 @@ async function createAdCreative({ adAccountId, token, ad, imageHash, pageId }) {
     { params: { access_token: token }, timeout: 30000 }
   );
   if (!res.data?.id) throw new Error('Meta /adcreatives returned no id');
+  return res.data.id;
+}
+
+// Video AdCreative — uses video_data instead of link_data and
+// requires a poster (image_url) so Ads Manager has a still to show
+// in the gallery. ad.posterUrl comes from renderService when the
+// video composite was built.
+async function createAdCreativeForVideo({ adAccountId, token, ad, videoId, pageId }) {
+  const ctaText = ad.ctaText || 'Shop now';
+  const ctaUrl = composeCtaUrl(ad.ctaUrl, ad.ctaUrlParams);
+  const message  = ad.copy?.headline || ad.copy?.quote || ad.copy?.productName || '';
+  const headline = ad.copy?.productName || ad.copy?.headline || '';
+  if (!ad.posterUrl) throw new Error('video ad has no posterUrl — Meta requires a poster image');
+  const body = {
+    name: `${ad.template} ${ad.aspectRatio} ${String(ad._id).slice(-8)} (video)`,
+    object_story_spec: {
+      page_id: pageId,
+      video_data: {
+        video_id:  videoId,
+        image_url: ad.posterUrl,
+        title:     headline,
+        message,
+        call_to_action: {
+          type:  mapCtaTextToEnum(ctaText),
+          value: { link: ctaUrl || 'https://example.com' }
+        }
+      }
+    }
+  };
+  const res = await axios.post(
+    `${META_GRAPH_ROOT}/${adAccountId}/adcreatives`,
+    body,
+    { params: { access_token: token }, timeout: 30000 }
+  );
+  if (!res.data?.id) throw new Error('Meta /adcreatives (video) returned no id');
   return res.data.id;
 }
 
@@ -183,9 +283,22 @@ function composeCtaUrl(url, params) {
 // failed status without halting.
 async function pushOne({ ad, adsetId, adAccountId, token, pageId, metaCampaignId }) {
   if (!ad.renderUrl) throw new Error('ad has no renderUrl (not yet rendered)');
-  const imageHash  = await uploadImageToMeta({ adAccountId, token, imageUrl: ad.renderUrl });
-  const creativeId = await createAdCreative({ adAccountId, token, ad, imageHash, pageId });
-  const metaAdId   = await createAd({ adAccountId, token, ad, adsetId, creativeId });
+  // Video and image branches diverge on the upload + creative steps;
+  // the final Ad creation is identical. Video adds a poll-for-ready
+  // wait (Meta's /advideos is async, ~30s–3min) before the creative
+  // can reference the video_id.
+  let creativeId;
+  if (ad.kind === 'video') {
+    const videoId = await uploadVideoToMeta({ adAccountId, token, videoUrl: ad.renderUrl });
+    console.log(`   📹 video uploaded (id=${videoId}) — polling for ready…`);
+    await waitForVideoReady({ videoId, token });
+    console.log(`   📹 video ${videoId} ready — building creative`);
+    creativeId = await createAdCreativeForVideo({ adAccountId, token, ad, videoId, pageId });
+  } else {
+    const imageHash = await uploadImageToMeta({ adAccountId, token, imageUrl: ad.renderUrl });
+    creativeId = await createAdCreative({ adAccountId, token, ad, imageHash, pageId });
+  }
+  const metaAdId = await createAd({ adAccountId, token, ad, adsetId, creativeId });
   ad.metaAdId         = metaAdId;
   ad.metaAdCreativeId = creativeId;
   ad.metaAdsetId      = adsetId;
