@@ -160,12 +160,17 @@ router.post('/generate', async (req, res) => {
       });
     }
 
-    // 3. Mark the selected ads as picked for this run + stamp campaignRunId.
-    //    Done up-front so a server restart leaves the doc in a recognizable
-    //    rendering state rather than orphaned-but-queued.
+    // 3. Mark the selected ads as picked for this run + append the
+    //    runId to campaignRunIds[]. Done up-front so a server restart
+    //    leaves the doc in a recognizable rendering state rather than
+    //    orphaned-but-queued. $addToSet so re-render of the same Ad
+    //    in a new run cleanly accumulates without dup checks here.
     await Ad.updateMany(
       { _id: { $in: adIds } },
-      { $set: { campaignRunId: runId, status: 'rendering', updatedAt: new Date() } }
+      {
+        $addToSet: { campaignRunIds: runId },
+        $set:      { status: 'rendering', updatedAt: new Date() }
+      }
     );
 
     // 4. Create the run doc.
@@ -248,7 +253,10 @@ router.post('/runs', express.json(), async (req, res) => {
 
     await Ad.updateMany(
       { _id: { $in: adIds } },
-      { $set: { campaignRunId: runId, status: 'rendering', updatedAt: new Date() } }
+      {
+        $addToSet: { campaignRunIds: runId },
+        $set:      { status: 'rendering', updatedAt: new Date() }
+      }
     );
 
     const run = await CampaignRun.create({
@@ -767,7 +775,9 @@ function projectAd(ad, full = false) {
     id:                 String(ad._id),
     brandId:            String(ad.brandId),
     campaignId:         ad.campaignId ? String(ad.campaignId) : null,
-    campaignRunId:      ad.campaignRunId,
+    // Every run that has selected this Ad. Empty until first picked;
+    // grows on re-render dedupe hits ($addToSet at the run-pick step).
+    campaignRunIds:     Array.isArray(ad.campaignRunIds) ? ad.campaignRunIds : [],
     mediaId:            ad.mediaId   ? String(ad.mediaId)   : null,
     productId:          ad.productId ? String(ad.productId) : null,
     template:           ad.template,

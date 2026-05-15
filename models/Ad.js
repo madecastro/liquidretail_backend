@@ -29,10 +29,14 @@ const adSchema = new mongoose.Schema({
   brandId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',    required: true, index: true },
   campaignId: { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', default: null,  index: true },
 
-  // The run that selected this Ad for rendering. Null while queued;
-  // stamped when a render run picks the Ad; preserved on completion
-  // (or failure) so we can audit which run touched which Ad.
-  campaignRunId: { type: String, default: null, index: true },
+  // Every render run that has SELECTED this Ad. Started as a scalar
+  // (the first run's id) but flipped to an array (#111) so re-render
+  // calls that hit the (campaignId, identityDigest) dedupe — i.e. the
+  // cached Ad already exists — can $addToSet the new runId. Without
+  // this, /ads?campaignRunId=X filtered to the new run came back empty
+  // because the cached Ad still pointed at its ORIGINAL runId only.
+  // Empty until a CampaignRun first picks the Ad.
+  campaignRunIds: { type: [String], default: [], index: true },
 
   // ── Source linkage ───────────────────────────────────────────────
   mediaId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Media',          required: true, index: true },
@@ -176,8 +180,8 @@ adSchema.index({ campaignId: 1, identityDigest: 1 }, { unique: true });
 // readiness." Drives the render loop's pick.
 adSchema.index({ campaignId: 1, status: 1, readinessScore: -1 });
 
-// Run audit — "what did run X render?"
-adSchema.index({ campaignRunId: 1, status: 1 });
+// Run audit — "what did run X render?" Multi-key index over the array.
+adSchema.index({ campaignRunIds: 1, status: 1 });
 
 // Ads-page filtered listings (kept).
 adSchema.index({ brandId: 1, status: 1, generatedAt: -1 });

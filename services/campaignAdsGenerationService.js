@@ -328,7 +328,7 @@ async function expandWizardJob({
         payloads.push({
           brandId,
           campaignId,
-          campaignRunId:  null,
+          campaignRunIds: [],
           mediaId:        seed.mediaId,
           productId:      seed.productId,
           template:       cell.templateId,
