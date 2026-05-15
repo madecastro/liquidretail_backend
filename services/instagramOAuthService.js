@@ -174,15 +174,13 @@ async function fetchAccountSummary(longLivedToken) {
 // account picker to show the user every Page + IG Business account +
 // catalog so they can choose which to bind to a Brand.
 //
-// Catalog discovery walks FOUR sources because a real merchant's
-// catalog can be reached via any of them and the previous owned-only
-// path missed common cases (agency-shared, IG-Shopping auto-provisioned,
-// user-owned):
+// Catalog discovery walks TWO Business-owned sources. Page-leg and
+// user-leg were removed after the page-leg surfaced non-syncable
+// page-shop catalogs and the user-leg pointed at a non-existent
+// Graph endpoint (see comment near the deletion site below).
 //
 //   owned   — /{biz}/owned_product_catalogs        (merchant's own BM)
 //   client  — /{biz}/client_product_catalogs       (agency shared TO this biz)
-//   page    — /{page}/product_catalogs             (IG Shopping connects here)
-//   user    — /me/product_catalogs                 (rare; user-direct ownership)
 //
 // Results are deduped by catalog id and tagged with the source(s) they
 // were reachable from. The `debug` block exposes per-source counts and
@@ -193,8 +191,6 @@ async function listAccountOptions(accessToken) {
     businessesCount: 0,
     ownedCatalogsByBiz:  {},
     clientCatalogsByBiz: {},
-    pageCatalogsByPage:  {},
-    userCatalogsCount:   0,
     errors: []
   }};
   const debug = out.debug;
@@ -291,37 +287,28 @@ async function listAccountOptions(accessToken) {
     }
   }
 
-  // 3. Catalogs connected to each Page. IG Shopping's auto-provisioned
-  //    catalog typically lands here even when the user has no Business
-  //    Manager role granted to us — this is the leg that catches the
-  //    most common "I have a shop but can't see the catalog" report.
-  for (const p of pages) {
-    try {
-      const pageCats = await axios.get(`${META_GRAPH_ROOT}/${p.id}/product_catalogs`, {
-        params: { fields: 'id,name,product_count', access_token: accessToken, limit: 50 },
-        timeout: 15000
-      });
-      const rows = pageCats.data?.data || [];
-      debug.pageCatalogsByPage[p.id] = rows.length;
-      for (const c of rows) recordCatalog(c, 'page', { name: p.name });
-    } catch (err) {
-      pushErr(`/${p.id}/product_catalogs`, err);
-    }
-  }
-
-  // 4. User-owned catalog fallback. Rare in practice but cheap to check
-  //    and the only path for catalogs created outside any Business.
-  try {
-    const userCats = await axios.get(`${META_GRAPH_ROOT}/me/product_catalogs`, {
-      params: { fields: 'id,name,product_count', access_token: accessToken, limit: 50 },
-      timeout: 15000
-    });
-    const rows = userCats.data?.data || [];
-    debug.userCatalogsCount = rows.length;
-    for (const c of rows) recordCatalog(c, 'user', null);
-  } catch (err) {
-    pushErr('/me/product_catalogs', err);
-  }
+  // Page-leg + user-leg removed (was: legs 3 + 4). Background:
+  //
+  //   page-leg (/{page-id}/product_catalogs) surfaced catalogs the
+  //   merchant could SEE in the picker but the catalog sync couldn't
+  //   READ (GET /{catalog-id}/products → "Unknown method"). Page-
+  //   connected shop catalogs and Commerce Manager catalogs share the
+  //   same endpoint and ID format but only the latter respond to the
+  //   standard products call. With the page-leg active, operators
+  //   could pick a non-syncable catalog from the picker and end up
+  //   with `📦 catalog sync done: fetched=0 errors=1` on every sync.
+  //
+  //   user-leg (/me/product_catalogs) doesn't exist as a Graph
+  //   endpoint at all — Meta returns "(#100) Tried accessing
+  //   nonexisting field (product_catalogs)" on every call. Pure noise
+  //   in the logs.
+  //
+  // Backlog: re-add the page-leg with a smoke-test filter — fetch
+  // /{catalog-id}?fields=vertical,owner_business and only surface
+  // catalogs where owner_business is non-null. That filters out
+  // page-shop-only catalogs while still catching IG-Shopping
+  // catalogs that ARE Business-owned but invisible via /me/businesses
+  // (the original motivating case).
 
   return out;
 }
