@@ -306,6 +306,13 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
       paletteSource: cacheKeyPaletteSource
     },
     {
+      // Tenant scope — required for the /by-id/:id endpoint's
+      // tenantFilter to match. Without these, every artifact is
+      // written with advertiserId/brandId=null and the by-id lookup
+      // 404s (the Puppeteer page that fetches by FK ends up rendering
+      // the "artifact not found" stub instead of the canvas).
+      advertiserId:  ctx.media?.advertiserId || null,
+      brandId:       ctx.media?.brandId      || null,
       mediaId,
       runId: ctx.runId || null,
       template,
