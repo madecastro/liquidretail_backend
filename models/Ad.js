@@ -101,8 +101,17 @@ const adSchema = new mongoose.Schema({
 
   // sha256 over identity inputs (campaignId, productId, mediaId,
   // template, aspectRatio, variantKind, paletteSource, ctaText,
-  // ctaUrl, ctaUrlParams). Computed at queue time; unique per campaign.
+  // ctaUrl, ctaUrlParams, rafflePrizeMediaId). Computed at queue time;
+  // unique per campaign.
   identityDigest: { type: String, required: true, index: true },
+
+  // For raffle campaigns with multiple prize media (Option B per-media
+  // variants), this stamps WHICH prize Media this ad's render should
+  // use as its hero. Null on non-raffle ads. The first prize media
+  // selected by the operator is "canonical" (renders first in the
+  // detail strip + non-rendered contexts); the rest each get their
+  // own ad variant per (template × ratio × paletteSource).
+  rafflePrizeMediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media', default: null, index: true },
 
   // ── Render output (all null until render lands) ──────────────────
   kind:               { type: String, enum: ['image', 'video'], default: 'image' },

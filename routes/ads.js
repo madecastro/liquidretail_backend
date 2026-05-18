@@ -392,6 +392,11 @@ async function renderOne(run, job, adId, index, renderToken) {
       // and brand colors. assembleInput reads it and overrides the
       // media.palette_* paths the templates bind to.
       paletteSource: ad.paletteSource || 'media',
+      // Per-ad raffle prize media — set when the campaign has multiple
+      // prize media (Option B per-prize variants). Null on non-raffle
+      // ads + single-prize raffle ads (loadContext falls back to the
+      // campaign's first prize id in those cases).
+      rafflePrizeMediaId: ad.rafflePrizeMediaId ? String(ad.rafflePrizeMediaId) : null,
       creative,
       cta:           { text: ad.ctaText, url: ad.ctaUrl, params: ad.ctaUrlParams },
       authToken:     renderToken,

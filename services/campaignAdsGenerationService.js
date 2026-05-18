@@ -178,7 +178,7 @@ function readinessScoreForProductImage(matchTier) {
 // rejects the duplicate insert. paletteSource doubles the identity
 // space so media-palette and brand-palette renders for the same
 // (media, product, template, ratio, variant) coexist as separate Ads.
-function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams }) {
+function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams, rafflePrizeMediaId }) {
   const payload = JSON.stringify({
     campaignId:    String(campaignId),
     productId:     productId ? String(productId) : null,
@@ -189,7 +189,11 @@ function computeIdentityDigest({ campaignId, productId, mediaId, template, aspec
     paletteSource: paletteSource || 'media',
     ctaText:       String(ctaText || ''),
     ctaUrl:        String(ctaUrl  || ''),
-    ctaUrlParams:  String(ctaUrlParams || '')
+    ctaUrlParams:  String(ctaUrlParams || ''),
+    // Per-prize raffle variants — without this, multiple prize media
+    // would dedupe to a single ad and the cartesian wouldn't actually
+    // produce per-prize takes.
+    rafflePrizeMediaId: rafflePrizeMediaId ? String(rafflePrizeMediaId) : null
   });
   return crypto.createHash('sha256').update(payload).digest('hex');
 }
@@ -317,6 +321,20 @@ async function expandWizardJob({
   // colorways. Doubles the cartesian — the trim below caps total
   // payloads at MAX_ADS_PER_GENERATION_RUN.
   const PALETTE_SOURCES = ['media', 'brand'];
+
+  // Raffle prize media — when the campaign has multiple prize media,
+  // each one becomes its own ad variant per (template × ratio × palette
+  // source). Non-raffle campaigns use a single-element [null] so the
+  // outer loop is identical and the per-ad rafflePrizeMediaId stays
+  // null. The first selected id is the "canonical" prize (non-rendered
+  // contexts pick that one for thumbnails / banners).
+  const rafflePrizeIds = (campaign.kind === 'promotional'
+    && campaign.promotionalDetails?.discountType === 'raffle'
+    && Array.isArray(campaign.promotionalDetails?.rafflePrizeMediaIds)
+    && campaign.promotionalDetails.rafflePrizeMediaIds.length)
+    ? campaign.promotionalDetails.rafflePrizeMediaIds.map(String)
+    : [null];
+
   let payloads = [];
   for (const seed of seeds) {
     for (const cell of grid) {
@@ -326,38 +344,42 @@ async function expandWizardJob({
       const supports = TEMPLATE_SUPPORTS_VARIANT[cell.templateId];
       if (supports && !supports.has(seed.variantKind)) continue;
       for (const paletteSource of PALETTE_SOURCES) {
-        const identityDigest = computeIdentityDigest({
-          campaignId,
-          productId:     seed.productId,
-          mediaId:       seed.mediaId,
-          template:      cell.templateId,
-          aspectRatio:   cell.aspectRatio,
-          variantKind:   seed.variantKind,
-          paletteSource,
-          ctaText, ctaUrl, ctaUrlParams
-        });
-        const readinessScore = seed.variantKind === 'product_image'
-          ? readinessScoreForProductImage(seed.matchTier)
-          : readinessScoreFor(seed.matchTier, seed.fileType, seed.suitabilityScore, seed.platformStats);
-        payloads.push({
-          brandId,
-          campaignId,
-          campaignRunIds: [],
-          mediaId:        seed.mediaId,
-          productId:      seed.productId,
-          template:       cell.templateId,
-          aspectRatio:    cell.aspectRatio,
-          campaignKind,
-          matchTier:      seed.matchTier,
-          variantKind:    seed.variantKind,
-          paletteSource,
-          readinessScore,
-          status:         'queued',
-          identityDigest,
-          ctaText, ctaUrl, ctaUrlParams,
-          queuedAt:       new Date(),
-          generatedAt:    new Date()
-        });
+        for (const rafflePrizeMediaId of rafflePrizeIds) {
+          const identityDigest = computeIdentityDigest({
+            campaignId,
+            productId:     seed.productId,
+            mediaId:       seed.mediaId,
+            template:      cell.templateId,
+            aspectRatio:   cell.aspectRatio,
+            variantKind:   seed.variantKind,
+            paletteSource,
+            ctaText, ctaUrl, ctaUrlParams,
+            rafflePrizeMediaId
+          });
+          const readinessScore = seed.variantKind === 'product_image'
+            ? readinessScoreForProductImage(seed.matchTier)
+            : readinessScoreFor(seed.matchTier, seed.fileType, seed.suitabilityScore, seed.platformStats);
+          payloads.push({
+            brandId,
+            campaignId,
+            campaignRunIds: [],
+            mediaId:        seed.mediaId,
+            productId:      seed.productId,
+            template:       cell.templateId,
+            aspectRatio:    cell.aspectRatio,
+            campaignKind,
+            matchTier:      seed.matchTier,
+            variantKind:    seed.variantKind,
+            paletteSource,
+            rafflePrizeMediaId,
+            readinessScore,
+            status:         'queued',
+            identityDigest,
+            ctaText, ctaUrl, ctaUrlParams,
+            queuedAt:       new Date(),
+            generatedAt:    new Date()
+          });
+        }
       }
     }
   }

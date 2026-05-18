@@ -346,7 +346,12 @@ function computeCampaignContextHash(options) {
   if (!kind || kind === 'product' || kind === 'collection') return null;
   const payload = JSON.stringify({
     kind,
-    promo: options.promotionalDetails || null
+    promo: options.promotionalDetails || null,
+    // Per-ad prize media partitions the cache so each raffle ad
+    // variant gets its own LayoutInputArtifact. Without this, all
+    // N raffle variants would resolve to the same cached input and
+    // render identically (defeating Option B).
+    rafflePrizeMediaId: options.rafflePrizeMediaId || null
   });
   return crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
 }
@@ -613,10 +618,22 @@ async function loadContext(mediaId, options = {}) {
   // prize Media is the visual hero of every ad. Loaded here so
   // assembleInput can override the default pickHeroMedia path and
   // compute per-product entry counts based on the conversion rate.
+  //
+  // Per-ad prize: when the campaign has MULTIPLE prize media, each
+  // queued Ad carries its own rafflePrizeMediaId stamping which prize
+  // to render. expandWizardJob multiplies the cartesian by N prize
+  // media so the operator gets N visual takes per (template × ratio
+  // × paletteSource) cell. Falls back to the campaign's first prize
+  // media when options.rafflePrizeMediaId is absent (non-render paths
+  // like operator-driven preview that don't know about per-ad prize).
   let raffle = null;
   const promo = options.promotionalDetails || null;
-  if (options.campaignKind === 'promotional' && promo?.discountType === 'raffle' && promo.rafflePrizeMediaId) {
-    const prizeMedia = await Media.findById(promo.rafflePrizeMediaId).lean();
+  const prizeMediaIdForThisAd = options.rafflePrizeMediaId
+    || (Array.isArray(promo?.rafflePrizeMediaIds) && promo.rafflePrizeMediaIds[0])
+    || promo?.rafflePrizeMediaId   // legacy singular field — fallback for pre-migration docs
+    || null;
+  if (options.campaignKind === 'promotional' && promo?.discountType === 'raffle' && prizeMediaIdForThisAd) {
+    const prizeMedia = await Media.findById(prizeMediaIdForThisAd).lean();
     if (prizeMedia) {
       const [prizeCrops, prizeDetection] = await Promise.all([
         prizeMedia.latestArtifacts?.crops
@@ -635,7 +652,7 @@ async function loadContext(mediaId, options = {}) {
         drawDate:         promo.raffleDrawDate || promo.endsAt || null
       };
     } else {
-      console.warn(`   ⚠️  raffle prize Media ${promo.rafflePrizeMediaId} not found — falling back to default hero`);
+      console.warn(`   ⚠️  raffle prize Media ${prizeMediaIdForThisAd} not found — falling back to default hero`);
     }
   }
 

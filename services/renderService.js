@@ -222,7 +222,12 @@ async function deriveStage(req) {
       ctaUrl:             req.cta?.url            || null,
       variantKind:        req.variantKind         || 'ugc',
       productId:          req.productId           || null,
-      paletteSource:      req.paletteSource       || 'media'
+      paletteSource:      req.paletteSource       || 'media',
+      // Per-ad raffle prize — when the campaign has multiple prize
+      // media, this stamps which one this specific render should use
+      // as the hero. Threaded into the cache key via campaignContextHash
+      // so each prize variant gets its own LayoutInputArtifact.
+      rafflePrizeMediaId: req.rafflePrizeMediaId   || null
     }
   });
 
