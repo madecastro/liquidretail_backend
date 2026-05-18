@@ -1170,6 +1170,80 @@ function fallbackDerivation(ctx) {
 // ──────────────────────────────────────────────────────────────
 //  Canonical assembly
 // ──────────────────────────────────────────────────────────────
+// Compose a structured offer payload for the renderer's visual pill
+// overlay. label is the short text (max ~24 chars to fit a corner
+// badge); urgency is an optional second-line countdown that fires when
+// the relevant end/draw date is within 7 days. kind drives optional
+// renderer style hints. Returns null when the campaign isn't
+// promotional or no label can be derived — the renderer presence-
+// checks before painting the pill so this stays a clean opt-out.
+function deriveCampaignOffer(campaignKind, promo, raffleCtx) {
+  if (campaignKind !== 'promotional' || !promo) return null;
+
+  let label = null;
+  let kind  = null;
+  switch (promo.discountType) {
+    case 'percent':
+      if (promo.discountValue != null) { label = `${promo.discountValue}% OFF`; kind = 'discount'; }
+      break;
+    case 'amount':
+      if (promo.discountValue != null) { label = `$${promo.discountValue} OFF`; kind = 'discount'; }
+      break;
+    case 'bogo':         label = 'BOGO';                  kind = 'discount'; break;
+    case 'bundle':       label = 'BUNDLE SAVINGS';        kind = 'discount'; break;
+    case 'free_shipping': label = 'FREE SHIPPING';        kind = 'discount'; break;
+    case 'gift':
+      label = (promo.giveaway && String(promo.giveaway).trim())
+        ? truncateToBudget(`FREE: ${String(promo.giveaway).trim().toUpperCase()}`, 24)
+        : 'FREE GIFT';
+      kind = 'giveaway';
+      break;
+    case 'raffle': {
+      // Prize-first framing — operator's prize description if present,
+      // otherwise a generic "ENTER TO WIN". The numeric entries-per-$
+      // rides in the urgency line below since the pill stays a short
+      // hook rather than a stat readout.
+      const prize = (promo.rafflePrize || raffleCtx?.prizeDescription || '').trim();
+      label = prize ? truncateToBudget(`WIN: ${prize.toUpperCase()}`, 24) : 'ENTER TO WIN';
+      kind  = 'raffle';
+      break;
+    }
+    default: break;
+  }
+  if (!label) return null;
+
+  // Urgency — drawing date for raffle, end date otherwise. Fires when
+  // the date is within 7 days; below that threshold the label alone
+  // carries the offer.
+  const dateRaw = (promo.discountType === 'raffle')
+    ? (promo.raffleDrawDate || raffleCtx?.drawDate || promo.endsAt || null)
+    : (promo.endsAt || null);
+  let urgency = null;
+  if (dateRaw) {
+    const ms = new Date(dateRaw).getTime();
+    if (Number.isFinite(ms)) {
+      const days = Math.ceil((ms - Date.now()) / 86400000);
+      if (days > 0 && days <= 7) {
+        const word = promo.discountType === 'raffle' ? 'DRAWING' : 'ENDS';
+        urgency = days === 1 ? `${word} TOMORROW` : `${days} DAYS LEFT`;
+      } else if (days === 0) {
+        // Same-day urgency — fires until the actual end-of-day passes.
+        urgency = promo.discountType === 'raffle' ? 'DRAWING TODAY' : 'ENDS TODAY';
+      }
+    }
+  }
+
+  // Add the entry rate to raffle pills' urgency line when no countdown
+  // is active — it's a useful secondary stat the operator would
+  // otherwise lose to the visual.
+  if (kind === 'raffle' && !urgency) {
+    const epd = Number(promo.raffleEntriesPerDollar) || 0;
+    if (epd > 0) urgency = `${epd} ENTR${epd === 1 ? 'Y' : 'IES'} / $1`;
+  }
+
+  return { label, urgency, kind };
+}
+
 // Trim text to a max-char budget at the last word boundary. Returns
 // the original text when it already fits. Used to enforce eyebrow_rules
 // max_chars on brand.tagline fallbacks — without this, a long tagline
@@ -1418,6 +1492,18 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
         draw_date:          ctx.raffle.drawDate || null
       }
     } : {}),
+
+    // Top-level campaign context. Today it only carries the offer
+    // pill payload — a structured offer label + urgency line the
+    // renderer overlays on top of the canvas as a designed badge.
+    // Independent of the LLM-generated headline so the visual offer
+    // is consistent across every ad regardless of derivation drift.
+    // Absent when the campaign isn't promotional or no label can
+    // be derived (renderer presence-checks before painting).
+    ...(() => {
+      const offer = deriveCampaignOffer(options.campaignKind, options.promotionalDetails, ctx.raffle);
+      return offer ? { campaign: { offer } } : {};
+    })(),
 
     creator: isProductImage ? {} : {
       name:     media.metadata?.creatorName   || undefined,
