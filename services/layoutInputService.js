@@ -608,7 +608,38 @@ async function loadContext(mediaId, options = {}) {
         .catch(err => { console.warn(`   ⚠️  categoryPool fetch failed: ${err.message}`); return []; })
     : [];
 
-  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool, productHero };
+  // Raffle context — when the campaign is a raffle (campaignKind=
+  // 'promotional' + promotionalDetails.discountType='raffle'), the
+  // prize Media is the visual hero of every ad. Loaded here so
+  // assembleInput can override the default pickHeroMedia path and
+  // compute per-product entry counts based on the conversion rate.
+  let raffle = null;
+  const promo = options.promotionalDetails || null;
+  if (options.campaignKind === 'promotional' && promo?.discountType === 'raffle' && promo.rafflePrizeMediaId) {
+    const prizeMedia = await Media.findById(promo.rafflePrizeMediaId).lean();
+    if (prizeMedia) {
+      const [prizeCrops, prizeDetection] = await Promise.all([
+        prizeMedia.latestArtifacts?.crops
+          ? CropArtifact.findById(prizeMedia.latestArtifacts.crops).lean()
+          : null,
+        prizeMedia.latestArtifacts?.detection
+          ? DetectionArtifact.findById(prizeMedia.latestArtifacts.detection).select('imageUrl background').lean()
+          : null
+      ]);
+      raffle = {
+        prizeMedia,
+        prizeCrops,
+        prizeDetection,
+        entriesPerDollar: Number(promo.raffleEntriesPerDollar) || 0,
+        prizeDescription: promo.rafflePrize || null,
+        drawDate:         promo.raffleDrawDate || promo.endsAt || null
+      };
+    } else {
+      console.warn(`   ⚠️  raffle prize Media ${promo.rafflePrizeMediaId} not found — falling back to default hero`);
+    }
+  }
+
+  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool, productHero, raffle };
 }
 
 // Identification block built from a CatalogProduct. Mirrors the
@@ -745,7 +776,38 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     lines.push('');
   } else if (campaignKind === 'promotional') {
     lines.push('CAMPAIGN INTENT — PROMOTIONAL CAMPAIGN');
-    if (promo && Object.keys(promo).length) {
+    // Raffle is a structurally different promotional shape — the prize
+    // is the story; the product is the entry mechanic. Branched out
+    // before the standard discount-type rendering so the prompt frames
+    // the headline around the prize first.
+    if (promo?.discountType === 'raffle') {
+      const prize = promo.rafflePrize || 'the featured prize';
+      const epd   = Number(promo.raffleEntriesPerDollar) || 0;
+      const draw  = promo.raffleDrawDate || promo.endsAt || null;
+      lines.push(`This is a RAFFLE / sweepstakes campaign.`);
+      lines.push(`- Prize: ${prize}`);
+      if (epd > 0) lines.push(`- Entry rate: ${epd} entr${epd === 1 ? 'y' : 'ies'} per dollar spent (every purchase earns at least 1 entry).`);
+      if (promo.discountCode) lines.push(`- Promo code (optional): ${promo.discountCode}`);
+      if (draw) {
+        const drawIso = new Date(draw).toISOString().slice(0, 10);
+        const daysLeft = Math.ceil((new Date(draw).getTime() - Date.now()) / 86400000);
+        lines.push(`- Drawing date: ${drawIso}${Number.isFinite(daysLeft) && daysLeft > 0 ? ` (${daysLeft} day${daysLeft === 1 ? '' : 's'} from now)` : ''}.`);
+      }
+      if (promo.headline) lines.push(`- Operator's preferred headline anchor: "${promo.headline}".`);
+      if (promo.notes)    lines.push(`- Notes: ${promo.notes}`);
+      lines.push('');
+      lines.push('Headline MUST surface the prize and the entry mechanic. Examples: "Win [prize]! Every $1 earns 5 entries", "Buy a box, get 50 chances", "Enter to win — every purchase counts".');
+      lines.push('Do not describe the product as the prize — the prize is separate. The product is the path to entering.');
+      lines.push('Use phrases like "Enter to win", "Your chance to win", "Each purchase earns entries" — NOT "save X%" or "discount" (this is a raffle, not a sale).');
+      if (draw) {
+        const daysLeft = Math.ceil((new Date(draw).getTime() - Date.now()) / 86400000);
+        if (Number.isFinite(daysLeft) && daysLeft > 0 && daysLeft <= 7) {
+          lines.push(`Add urgency — the drawing is in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. Use phrases like "Drawing Friday", "${daysLeft} days to enter", "Last chance to enter".`);
+        }
+      }
+      lines.push('Reference sweepstakes-style framing; NEVER imply a guaranteed win.');
+      lines.push('');
+    } else if (promo && Object.keys(promo).length) {
       const promoLines = [];
       if (promo.discountType && promo.discountValue != null) {
         const v = promo.discountValue;
@@ -1124,6 +1186,12 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
   // creator handles, post captions, or social signals that don't
   // exist for a catalog hero shot.
   const isProductImage = options.variantKind === 'product_image';
+  // Raffle inversion — for raffle campaigns, the prize is the visual
+  // anchor of every ad. ctx.raffle is set by loadContext when the
+  // campaign is promotional + discountType=raffle + has a prize media
+  // selected. Overrides the normal hero source (UGC media or catalog
+  // product image) and the scene/palette context.
+  const isRaffle = !!ctx.raffle;
   // Palette + scene context come from the SOURCE of the hero. For
   // UGC variants that's the post's own detection; for product_image
   // variants the hero is the catalog product, so we read its
@@ -1131,9 +1199,12 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
   // this branch, both variants read from `detection` (the UGC post
   // detection) which produced wrong-color backgrounds on catalog-
   // hero ads (green-jar variants showing UGC-scene colors).
-  const sceneBackground = isProductImage
-    ? (ctx.productHero?.background || detection?.background || null)
-    : (detection?.background || null);
+  // For raffle, palette/scene come from the prize media.
+  const sceneBackground = isRaffle
+    ? (ctx.raffle.prizeDetection?.background || detection?.background || null)
+    : isProductImage
+      ? (ctx.productHero?.background || detection?.background || null)
+      : (detection?.background || null);
   const palette = sceneBackground?.palette || [];
 
   // Hero source crop matches the MEDIA SLOT'S ratio (not the canvas
@@ -1147,7 +1218,12 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
   // resolved.
   const canvasVariantForHero = registry.CANVAS.templates?.[template]?.variants?.[aspectRatio] || null;
   const heroSourceRatio = pickHeroSourceRatio(canvasVariantForHero) || aspectRatio;
-  const heroMedia      = pickHeroMedia(ctx, heroSourceRatio);
+  // Hero override for raffle — prize Media wins regardless of variant
+  // kind. Uses the prize's smart crops when detect ran on it; falls
+  // back to the raw fileUrl otherwise.
+  const heroMedia      = isRaffle
+    ? pickRafflePrizeMedia(ctx.raffle, heroSourceRatio)
+    : pickHeroMedia(ctx, heroSourceRatio);
   const secondaryMedia = pickSecondaryMedia(ctx, aspectRatio);
   const creatorMedia   = pickCreatorMedia(ctx);
   const ugcMedia       = creatorMedia;  // detect uploads == creator post asset
@@ -1300,8 +1376,31 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
         price:      p.price      ?? null,
         currency:   p.currency   || null,
         category:   p.category   || null
-      }))
+      })),
+      // Raffle entry count earned by purchasing this product. Computed
+      // as floor(price × entriesPerDollar) with a min-1 guard so a
+      // sub-$1 purchase still earns a single entry (operator intent —
+      // a purchase should always result in at least one ticket).
+      // Null when not a raffle campaign or no price on the product;
+      // templates bind to product.raffle_entries to render a counter
+      // alongside the price.
+      raffle_entries: isRaffle && Number.isFinite(details.price?.value)
+        ? Math.max(1, Math.floor(details.price.value * ctx.raffle.entriesPerDollar))
+        : null
     },
+
+    // Top-level raffle context block — templates and the derivation
+    // prompt read this when present. Null/absent on non-raffle ads
+    // so existing template bindings keep their conditional rendering
+    // shape (presence-check, not value-check).
+    ...(isRaffle ? {
+      raffle: {
+        prize_description:  ctx.raffle.prizeDescription || null,
+        entries_per_dollar: ctx.raffle.entriesPerDollar,
+        prize_media:        mediaPair(heroMedia),
+        draw_date:          ctx.raffle.drawDate || null
+      }
+    } : {}),
 
     creator: isProductImage ? {} : {
       name:     media.metadata?.creatorName   || undefined,
@@ -1734,6 +1833,37 @@ function pickHeroSourceRatio(canvasVariant) {
     if (d < bestDiff) { bestDiff = d; best = opt.name; }
   }
   return best;
+}
+
+// Raffle hero — uses the prize Media's smart-crop winner for the ratio
+// when CropArtifact exists, falls back to the raw mirror URL. Video
+// prize media surface video + an image poster derived from the first
+// frame transform (same trick the UGC tiles use).
+function pickRafflePrizeMedia(raffle, aspectRatio) {
+  const pm = raffle?.prizeMedia;
+  if (!pm) return { image: null };
+  const isVideo = pm.fileType === 'video';
+  // Smart crops if available.
+  if (raffle.prizeCrops?.winners && pm.fileUrl) {
+    const winnerId = raffle.prizeCrops.winners[aspectRatio];
+    const list = raffle.prizeCrops.smartCrops?.[aspectRatio] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0] || null;
+    if (winner) {
+      const baseUrl = raffle.prizeDetection?.imageUrl || pm.fileUrl;
+      return {
+        image: buildCloudinaryCropUrl(baseUrl, winner),
+        ...(isVideo && pm.fileUrl ? { video: pm.fileUrl } : {})
+      };
+    }
+  }
+  // No crops — raw URL. For video, also expose a poster frame.
+  if (isVideo) {
+    const poster = pm.fileUrl.includes('/video/upload/')
+      ? pm.fileUrl.replace('/video/upload/', '/video/upload/so_0/').replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
+      : pm.fileUrl;
+    return { image: poster, video: pm.fileUrl };
+  }
+  return { image: pm.fileUrl };
 }
 
 function pickHeroMedia(ctx, aspectRatio) {

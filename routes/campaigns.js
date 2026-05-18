@@ -379,20 +379,46 @@ router.patch('/:id', express.json(), async (req, res) => {
     if (c.platform !== 'reach-social') {
       return res.status(409).json({ error: 'only reach-social campaigns are editable' });
     }
-    const { name, kind } = req.body || {};
+    const { name, kind, promotionalDetails } = req.body || {};
     if (name != null) {
       const trimmed = String(name).trim();
       if (!trimmed) return res.status(400).json({ error: 'name cannot be empty' });
       c.name = trimmed;
     }
     if (kind != null) {
-      if (!['brand', 'product', 'collection', null].includes(kind)) {
+      // 'promotional' was previously missing here — operators couldn't
+      // switch an existing campaign to promotional, only create one new.
+      if (!['brand', 'product', 'promotional', 'collection', null].includes(kind)) {
         return res.status(400).json({ error: 'invalid kind' });
       }
       c.kind = kind;
     }
+    // promotionalDetails accepts a partial — merges over existing fields
+    // so editing entriesPerDollar alone doesn't blow away the prize
+    // description. Date coercion mirrors the POST path; null clears.
+    if (promotionalDetails !== undefined) {
+      if (promotionalDetails === null) {
+        c.promotionalDetails = null;
+      } else if (typeof promotionalDetails === 'object') {
+        const merged = { ...(c.promotionalDetails || {}), ...promotionalDetails };
+        if (merged.startsAt) merged.startsAt = new Date(merged.startsAt);
+        if (merged.endsAt)   merged.endsAt   = new Date(merged.endsAt);
+        if (merged.raffleDrawDate) merged.raffleDrawDate = new Date(merged.raffleDrawDate);
+        c.promotionalDetails = merged;
+        c.markModified('promotionalDetails');   // Mixed type — Mongoose needs the hint
+      } else {
+        return res.status(400).json({ error: 'promotionalDetails must be object or null' });
+      }
+    }
     await c.save();
-    res.json({ campaign: { id: String(c._id), name: c.name, kind: c.kind } });
+    res.json({
+      campaign: {
+        id: String(c._id),
+        name: c.name,
+        kind: c.kind,
+        promotionalDetails: c.promotionalDetails || null
+      }
+    });
   } catch (err) {
     console.error('campaign patch failed:', err);
     res.status(500).json({ error: err.message || 'campaign update failed' });
