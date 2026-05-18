@@ -241,7 +241,21 @@ async function expandWizardJob({
 
   const ctaText      = String(cta.text || '');
   const ctaUrl       = String(cta.url  || '');
-  const ctaUrlParams = String(urlParams || '').replace(/^[?&]/, '');
+  let   ctaUrlParams = String(urlParams || '').replace(/^[?&]/, '');
+
+  // Auto-stamp the discount code onto the landing URL for promotional
+  // campaigns. Without this, operators have to manually paste the code
+  // into urlParams on every ad-gen run, and it tends to drift out of
+  // sync with the campaign's promotionalDetails.discountCode value.
+  // Skipped when the operator already supplied `code=` in their params
+  // (per-channel overrides win) — we don't want to override a tracking-
+  // specific code with the campaign default.
+  const promoDiscountCode = (campaign.promotionalDetails?.discountCode || '').trim();
+  if (promoDiscountCode && !/[?&]?\bcode=/i.test(ctaUrlParams)) {
+    const encoded = encodeURIComponent(promoDiscountCode);
+    ctaUrlParams = ctaUrlParams ? `${ctaUrlParams}&code=${encoded}` : `code=${encoded}`;
+    console.log(`📦 expandWizardJob: stamped discount code "${promoDiscountCode}" onto ctaUrlParams`);
+  }
 
   // ── 1. Build seeds — flat list of {productId, mediaId, matchTier, variantKind, suitabilityScore, fileType} ──
   const useBrandOnly = productIds.length === 0 && mediaIds.length === 0;
