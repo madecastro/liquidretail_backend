@@ -24,6 +24,22 @@ const { tenantFilter } = require('../middleware/tenantHelpers');
 // Lightweight list for the Campaigns page. Returns a projection that
 // has everything the table renders without dragging the full embedded
 // adSets/rawData blobs over the wire.
+// Derived "is this campaign past its end date?" Used to badge expired
+// campaigns in the list + detail + wizard Step 1 picker. Two sources
+// of truth depending on platform:
+//   reach-social: promotionalDetails.endsAt (operator-supplied)
+//   synced       : schedule.end (pulled from Meta/Google)
+// We DON'T mutate Campaign.status here — Meta/Google manage their own
+// status enum, and the derived flag avoids race conditions between
+// the scheduler and operator edits. Returns false for non-promotional
+// reach-social campaigns (no end date by definition).
+function computeIsExpired(c) {
+  const candidate = c?.promotionalDetails?.endsAt || c?.schedule?.end || null;
+  if (!candidate) return false;
+  const t = new Date(candidate).getTime();
+  return Number.isFinite(t) && t < Date.now();
+}
+
 router.get('/', async (req, res) => {
   try {
     const brandId  = req.query.brandId  || req.headers['x-brand-id'];
@@ -34,7 +50,7 @@ router.get('/', async (req, res) => {
     if (req.query.status)   filter.status   = req.query.status;
 
     const rows = await Campaign.find(tenantFilter(req, filter))
-      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds mediaIds kind insights adSets lastSyncedAt firstSeenAt')
+      .select('platform externalId name status objective budget schedule productSetIds matchedProductIds mediaIds kind insights adSets lastSyncedAt firstSeenAt promotionalDetails')
       .sort({ lastSyncedAt: -1 })
       .lean();
 
@@ -68,7 +84,9 @@ router.get('/', async (req, res) => {
         renderedAdCount:   renderedAdCounts.get(String(c._id)) || 0,
         insights:      c.insights || null,
         lastSyncedAt:  c.lastSyncedAt || null,
-        firstSeenAt:   c.firstSeenAt || null
+        firstSeenAt:   c.firstSeenAt || null,
+        // Derived — see computeIsExpired note at top of file.
+        isExpired:     computeIsExpired(c)
       }))
     });
   } catch (err) {
@@ -122,7 +140,9 @@ router.get('/:id', async (req, res) => {
     ]);
 
     res.json({
-      campaign: c,
+      // Stamp the derived isExpired flag onto the campaign so the
+      // frontend doesn't need to re-implement the end-date logic.
+      campaign: { ...c, isExpired: computeIsExpired(c) },
       pinnedProducts: pinnedProducts.map(p => ({
         id:         String(p._id),
         title:      p.title,
