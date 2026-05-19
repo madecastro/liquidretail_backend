@@ -302,6 +302,16 @@ router.patch('/:id', express.json(), async (req, res) => {
     }
 
     Object.assign(product, updates);
+    // Belt & braces: detect-identified rows should always be primary
+    // variants (they're not Shopify variant siblings). Older drafts
+    // created before the draft service was fixed to stamp this on
+    // insert have isPrimaryVariant undefined → schema default false →
+    // catalog list filter excludes them. Auto-set on any PATCH so a
+    // "Save & add to catalog" from the Detect Review page rescues
+    // legacy drafts into the main catalog without a Mongo backfill.
+    if (product.source === 'detect-identified' && product.isPrimaryVariant === false) {
+      product.isPrimaryVariant = true;
+    }
     await product.save();
 
     res.json({ product: projectListRow(product, (product.matchedMedia || []).length) });
