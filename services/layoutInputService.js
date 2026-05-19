@@ -59,6 +59,7 @@ const ProductMatchArtifact   = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact    = require('../models/OverlayZoneArtifact');
 const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
 const CatalogProduct         = require('../models/CatalogProduct');
+const Comment                = require('../models/Comment');
 const { findBrandByName }    = require('./brandCatalogService');
 const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
@@ -656,7 +657,21 @@ async function loadContext(mediaId, options = {}) {
     }
   }
 
-  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool, productHero, raffle };
+  // Top social comments — surfaced on the canonical input as
+  // ugc.top_comments[] so the new comment_card zone kind can render
+  // IG-style / TikTok-style social proof distinct from review quotes.
+  // Empty array when no Comment docs exist (the Comment collection is
+  // populated by mediaInsightsService.fetchCommentsForMedia at sync
+  // time; pre-population brands just render with an empty list and the
+  // zone stays hidden). Top-3 by likeCount keeps the canonical input
+  // bounded and gives the renderer a small carousel to choose from.
+  const topComments = await Comment.find({ mediaId: media._id, parentExternalId: null })
+    .sort({ likeCount: -1, postedAt: -1 })
+    .limit(3)
+    .lean()
+    .catch(err => { console.warn(`   ⚠️  top comments fetch failed: ${err.message}`); return []; });
+
+  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool, productHero, raffle, topComments };
 }
 
 // Identification block built from a CatalogProduct. Mirrors the
@@ -1523,7 +1538,18 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
       comments:        media.platformStats?.comments ?? undefined,
       shares:          media.platformStats?.shares   ?? undefined,
       saves:           media.platformStats?.saves    ?? undefined,
-      rights_approved: rightsApproved
+      rights_approved: rightsApproved,
+      // Top 3 social comments by likeCount — populated by Comment
+      // collection at loadContext time. The new comment_card zone
+      // binds to ugc.top_comments[]; existing metrics_row continues
+      // to bind to ugc.{likes,comments,saves,shares} as counts.
+      top_comments: (ctx.topComments || []).map(c => ({
+        text:            c.text || '',
+        author_username: c.authorUsername || null,
+        like_count:      c.likeCount || 0,
+        reply_count:     c.replyCount || 0,
+        posted_at:       c.postedAt || null
+      }))
     },
 
     social_proof: {

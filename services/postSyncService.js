@@ -428,6 +428,19 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
     throw err;
   }
   console.log(`   · ingested IG post ${externalId} → Media ${media._id} + DetectRun ${run._id}`);
+
+  // Fire-and-forget top-level comment fetch so the new comment_card
+  // zone has data to render at ad-generation time. ~1 Graph call per
+  // ingested post; failures are non-fatal (the zone just stays empty).
+  // Caller (postSync loop) doesn't await — we don't want a flaky
+  // comments endpoint to slow down post ingest.
+  setImmediate(() => {
+    const { fetchCommentsForMedia } = require('./mediaInsightsService');
+    fetchCommentsForMedia(media._id).catch(err =>
+      console.warn(`   ⚠️  comment fetch failed for ${media._id}: ${err.message}`)
+    );
+  });
+
   return { runId: run._id, mediaId: media._id };
 }
 
