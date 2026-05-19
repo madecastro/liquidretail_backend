@@ -33,7 +33,11 @@
           "type": "logo",
           "kind": "logo",
           "required": true,
-          "slot_binding": { "source_priority": ["brand.logo"] }
+          "slot_binding": {
+            "source_priority": [
+              "brand.logo"
+            ]
+          }
         },
         "headline": {
           "id": "headline",
@@ -42,11 +46,17 @@
           "style_variant": "display_script",
           "required": true,
           "slot_binding": {
-            "source_priority": ["copy.headline"]
+            "source_priority": [
+              "copy.headline"
+            ]
           },
           "limits": {
             "max_chars": {
-              "1:1": 140, "4:5": 160, "9:16": 180, "16:9": 120, "1.91:1": 110
+              "1:1": 140,
+              "4:5": 160,
+              "9:16": 180,
+              "16:9": 120,
+              "1.91:1": 110
             }
           }
         },
@@ -57,7 +67,10 @@
           "comment": "Centered text framed by horizontal rules — e.g. 'HEAT & FLAVOR'. Sits BELOW the headline visually despite being eyebrow-style.",
           "required": false,
           "slot_binding": {
-            "source_priority": ["copy.subheadline", "brand.tagline"]
+            "source_priority": [
+              "copy.subheadline",
+              "brand.tagline"
+            ]
           }
         },
         "proof_bar": {
@@ -67,7 +80,10 @@
           "style_variant": "with_verified_buyers",
           "required": false,
           "slot_binding": {
-            "source_priority": ["social_proof.rating_value", "social_proof.review_count"]
+            "source_priority": [
+              "social_proof.rating_value",
+              "social_proof.review_count"
+            ]
           }
         },
         "quote_card": {
@@ -78,24 +94,12 @@
           "comment": "THE distinguishing zone vs ugc_split_screen — the right-panel hero card carries a customer quote + author chip with avatar + verified label. ugc_split_screen swaps this slot for a product_card (product.image + name + price).",
           "required": true,
           "slot_binding": {
-            "source_priority": ["social_proof.primary_quote"]
+            "source_priority": [
+              "social_proof.primary_quote"
+            ]
           },
           "limits": {
             "max_lines": 6
-          }
-        },
-        "badge_row": {
-          "id": "badge_row",
-          "type": "badge_row",
-          "kind": "badge_row",
-          "style_variant": "callouts",
-          "comment": "Stacked black-dot bullet list of product.badges (e.g. '● 4.7 STAR RATING' / '● SMALL BATCH'). NOT chip-styled — the renderer's CSS for callouts emits dots + uppercase labels.",
-          "required": false,
-          "slot_binding": {
-            "source_priority": ["product.badges"]
-          },
-          "limits": {
-            "max_items": 4
           }
         },
         "support_media": {
@@ -115,7 +119,10 @@
             "comment": "Source-Media-derived smart crop wins when a post is the entry point (post → product match → smart crop sized for this slot's ratio). product.lifestyle_image (catalog lifestyle shot) is a tail fallback when no UGC media or product hero crop exists; product.image is the final catalog stock. Crop is the renderer's responsibility (Cloudinary c_fill,g_auto when URL is Cloudinary, object-fit:cover otherwise)."
           },
           "media_rules": {
-            "accepted_kinds": ["image", "video"],
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
             "crop_mode": "subject_preserve",
             "poster_required_for_video": true
           }
@@ -126,8 +133,12 @@
           "kind": "cta",
           "required": true,
           "slot_binding": {
-            "text": ["cta.text"],
-            "url":  ["cta.url"]
+            "text": [
+              "cta.text"
+            ],
+            "url": [
+              "cta.url"
+            ]
           }
         }
       },
@@ -138,7 +149,6 @@
         "proof_bar",
         "quote_card",
         "support_media",
-        "badge_row",
         "cta"
       ],
       "slot_adapter": {
@@ -377,7 +387,11 @@
           "type": "logo",
           "kind": "logo",
           "required": true,
-          "slot_binding": { "source_priority": ["brand.logo"] }
+          "slot_binding": {
+            "source_priority": [
+              "brand.logo"
+            ]
+          }
         },
         "headline": {
           "id": "headline",
@@ -386,11 +400,17 @@
           "style_variant": "display_script",
           "required": true,
           "slot_binding": {
-            "source_priority": ["copy.headline"]
+            "source_priority": [
+              "copy.headline"
+            ]
           },
           "limits": {
             "max_chars": {
-              "1:1": 140, "4:5": 160, "9:16": 180, "16:9": 120, "1.91:1": 110
+              "1:1": 140,
+              "4:5": 160,
+              "9:16": 180,
+              "16:9": 120,
+              "1.91:1": 110
             }
           }
         },
@@ -400,7 +420,10 @@
           "kind": "eyebrow_rules",
           "required": false,
           "slot_binding": {
-            "source_priority": ["copy.subheadline", "brand.tagline"]
+            "source_priority": [
+              "copy.subheadline",
+              "brand.tagline"
+            ]
           }
         },
         "proof_bar": {
@@ -410,7 +433,10 @@
           "style_variant": "with_verified_buyers",
           "required": false,
           "slot_binding": {
-            "source_priority": ["social_proof.rating_value", "social_proof.review_count"]
+            "source_priority": [
+              "social_proof.rating_value",
+              "social_proof.review_count"
+            ]
           }
         },
         "product_meta": {
@@ -422,27 +448,19 @@
           "required": true,
           "slot_binding": {
             "fields": {
-              "image": ["product.image"],
-              "name":  ["product.name"],
-              "price": ["product.price"]
+              "image": [
+                "product.image"
+              ],
+              "name": [
+                "product.name"
+              ],
+              "price": [
+                "product.price"
+              ]
             }
           },
           "limits": {
             "max_lines": 6
-          }
-        },
-        "badge_row": {
-          "id": "badge_row",
-          "type": "badge_row",
-          "kind": "badge_row",
-          "style_variant": "callouts",
-          "comment": "Stacked black-dot bullet list of product.badges (e.g. '● 4.7 ★ RATING' / '● SMALL BATCH').",
-          "required": false,
-          "slot_binding": {
-            "source_priority": ["product.badges"]
-          },
-          "limits": {
-            "max_items": 4
           }
         },
         "support_media": {
@@ -462,7 +480,10 @@
             "comment": "4:5 source crop is the hero across all ratios — Cloudinary c_fill,g_auto smart-crops to whatever rect the canvas asks for. product.lifestyle_image is a catalog-side fallback when no post media exists for this combo."
           },
           "media_rules": {
-            "accepted_kinds": ["image", "video"],
+            "accepted_kinds": [
+              "image",
+              "video"
+            ],
             "crop_mode": "subject_preserve",
             "poster_required_for_video": true
           }
@@ -473,8 +494,12 @@
           "kind": "cta",
           "required": true,
           "slot_binding": {
-            "text": ["cta.text"],
-            "url":  ["cta.url"]
+            "text": [
+              "cta.text"
+            ],
+            "url": [
+              "cta.url"
+            ]
           }
         }
       },
@@ -485,7 +510,6 @@
         "proof_bar",
         "product_meta",
         "support_media",
-        "badge_row",
         "cta"
       ],
       "slot_adapter": {
