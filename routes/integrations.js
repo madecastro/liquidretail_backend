@@ -1591,4 +1591,121 @@ router.delete('/google-ads/:credentialId', async (req, res) => {
   }
 });
 
+// ── Token debug (operator-facing, fingerprint-only) ─────────────────
+//
+// GET /api/integrations/token-debug?brandId=X
+//   Returns metadata about every IntegrationCredential for the brand:
+//   fingerprint (first 4 + last 4 chars of the decrypted token),
+//   length, status, scopes, expiry, linked platform IDs, and last-used
+//   timestamps. NEVER returns the raw token — the fingerprint is
+//   enough to confirm "is this the same token I just regenerated"
+//   without leaking the bearer credential into any UI / log / screenshot.
+//
+// For Meta credentials (instagram + meta-ads), calls Graph's
+// /debug_token endpoint with the app access token so the response
+// reflects what Meta thinks the token can actually do — distinct
+// from what we requested at OAuth time. Cached in-memory for 30s to
+// avoid hammering Graph on UI re-render.
+const _tokenDebugCache = new Map();   // key = credId → { ts, payload }
+const TOKEN_DEBUG_CACHE_MS = 30000;
+
+router.get('/token-debug', async (req, res) => {
+  try {
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+
+    const creds = await IntegrationCredential.find(tenantFilter(req, { brandId })).lean();
+    const { decrypt } = require('../services/integrationCryptoService');
+    const axios = require('axios');
+
+    const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+    const META_APP_ID      = process.env.META_APP_ID;
+    const META_APP_SECRET  = process.env.META_APP_SECRET;
+    const metaAppToken = (META_APP_ID && META_APP_SECRET) ? `${META_APP_ID}|${META_APP_SECRET}` : null;
+
+    // refresh=1 query param busts the 30s cache. Used by the per-cred
+    // "Refresh from Meta" button so an operator can verify scopes
+    // immediately after a re-OAuth.
+    const refresh = req.query.refresh === '1';
+
+    async function probeMeta(credId, token, kind) {
+      if (!metaAppToken) return { error: 'META_APP_ID / META_APP_SECRET not configured' };
+      const cacheKey = `${credId}`;
+      if (!refresh) {
+        const cached = _tokenDebugCache.get(cacheKey);
+        if (cached && Date.now() - cached.ts < TOKEN_DEBUG_CACHE_MS) return cached.payload;
+      }
+      try {
+        const r = await axios.get(`https://graph.facebook.com/${META_API_VERSION}/debug_token`, {
+          params: { input_token: token, access_token: metaAppToken },
+          timeout: 10000
+        });
+        const d = r.data?.data || {};
+        const payload = {
+          source:      kind,
+          appId:       d.app_id || null,
+          userId:      d.user_id || null,
+          tokenType:   d.type || null,
+          isValid:     d.is_valid === true,
+          expiresAt:   d.expires_at ? new Date(d.expires_at * 1000).toISOString() : null,
+          dataAccessExpiresAt: d.data_access_expires_at ? new Date(d.data_access_expires_at * 1000).toISOString() : null,
+          scopes:      Array.isArray(d.scopes) ? d.scopes : [],
+          metaError:   null
+        };
+        _tokenDebugCache.set(cacheKey, { ts: Date.now(), payload });
+        return payload;
+      } catch (err) {
+        return {
+          source:    kind,
+          isValid:   false,
+          metaError: err.response?.data?.error?.message || err.message
+        };
+      }
+    }
+
+    function fingerprint(tok) {
+      if (!tok || tok.length < 12) return '∅';
+      return `${tok.slice(0, 4)}…${tok.slice(-4)}`;
+    }
+
+    const out = [];
+    for (const c of creds) {
+      let token = null;
+      let decryptError = null;
+      if (c.accessTokenEnc) {
+        try { token = decrypt(c.accessTokenEnc); }
+        catch (e) { decryptError = e.message; }
+      }
+      let metaProbe = null;
+      if (token && (c.type === 'instagram' || c.type === 'meta-ads')) {
+        metaProbe = await probeMeta(String(c._id), token, c.type);
+      }
+      out.push({
+        id:        String(c._id),
+        type:      c.type,
+        status:    c.status,
+        tokenFingerprint: token ? fingerprint(token) : '∅',
+        tokenLength:      token ? token.length : 0,
+        decryptError,
+        platformData:     c.platformData || null,
+        // Cred-side timestamps for quick "when did we last touch this?"
+        // reads. Falls back to model defaults when unset.
+        lastUsedAt:          c.lastUsedAt          || null,
+        lastCatalogSyncAt:   c.lastCatalogSyncAt   || null,
+        lastPostsSyncAt:     c.lastPostsSyncAt     || null,
+        lastCampaignSyncAt:  c.lastCampaignSyncAt  || null,
+        createdAt:           c.createdAt           || null,
+        // Meta probe (null on non-Meta or unconfigured app token).
+        // Carries Meta's live view of scopes + expiry — frequently
+        // diverges from what we requested at OAuth time.
+        meta: metaProbe
+      });
+    }
+    res.json({ credentials: out });
+  } catch (err) {
+    console.error('token-debug failed:', err);
+    res.status(500).json({ error: err.message || 'token-debug failed' });
+  }
+});
+
 module.exports = router;
