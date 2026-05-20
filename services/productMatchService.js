@@ -1817,12 +1817,18 @@ async function ensureCatalogProductForMatch(match, ctx) {
     }
   }
 
-  // 2b. Fuzzy title fallback — when the Gemini-returned name is a
-  // truncated / verbose variant of a synced row ("Hot Crispy Oil jar"
-  // vs "Hot Crispy Oil - Original"), require ≥3 shared content tokens
-  // AND ≥0.7 overlap to link. The 3-token floor specifically rejects
-  // single-brand-abbrev false positives like
-  // "HCO Shake" → "HCO T-shirt - Women's" (only "hco" overlaps).
+  // 2b. Subset title fallback — when the Gemini-returned name is a
+  // truncated or verbose variant of a synced row (e.g. "Hot Crispy
+  // Oil - Original Hot Chili Oil" vs synced "Hot Crispy Oil -
+  // Original"). Requires score = 1.0, which by the definition
+  //   score = shared / min(|tokens(a)|, |tokens(b)|)
+  // means every token of the shorter side appears in the longer side.
+  // This is strict subset semantics — neither side has unique
+  // distinguishing tokens — so we correctly:
+  //   accept: "Hot Crispy Oil Original" → twin (subset, same SKU)
+  //   reject: "Hot Crispy Oil SMOKEY"   → "...Original" (both have
+  //           unique variant tokens, competing SKUs)
+  // Plus a ≥3 shared-tokens floor so 2-token matches don't sneak by.
   if (normalizedQuery) {
     const candidates = await CatalogProduct.find({
       brandId: ctx.brandId,
@@ -1833,12 +1839,12 @@ async function ensureCatalogProductForMatch(match, ctx) {
     let best = null;
     for (const row of candidates) {
       const { score, shared } = titleSimilarity(row.normalizedTitle || row.title, ident.productName);
-      if (shared >= 3 && score >= 0.7 && (!best || score > best.score)) {
+      if (shared >= 3 && score >= 1.0 && (!best || shared > best.shared)) {
         best = { row, score, shared };
       }
     }
     if (best) {
-      console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: fuzzy title match score=${best.score.toFixed(2)} shared=${best.shared} (source=${best.row.source}) → ${best.row._id} "${best.row.title}"`);
+      console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: subset title match score=${best.score.toFixed(2)} shared=${best.shared} (source=${best.row.source}) → ${best.row._id} "${best.row.title}"`);
       return best.row._id;
     }
   }
