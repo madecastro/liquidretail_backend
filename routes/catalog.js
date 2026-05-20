@@ -25,6 +25,7 @@ const CatalogProduct        = require('../models/CatalogProduct');
 const Media                 = require('../models/Media');
 const ProductMatchArtifact  = require('../models/ProductMatchArtifact');
 const Category              = require('../models/Category');
+const catalogProductPromoteService = require('../services/catalogProductPromoteService');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 void assertMediaInTenant;     // kept for future :id verification helpers
 
@@ -301,6 +302,7 @@ router.patch('/:id', express.json(), async (req, res) => {
       return res.status(400).json({ error: 'no editable fields provided' });
     }
 
+    const wasDraft = product.draft === true;
     Object.assign(product, updates);
     // Belt & braces: detect-identified rows should always be primary
     // variants (they're not Shopify variant siblings). Older drafts
@@ -313,6 +315,20 @@ router.patch('/:id', express.json(), async (req, res) => {
       product.isPrimaryVariant = true;
     }
     await product.save();
+
+    // Draft promotion transition (true → false): retroactively link
+    // every existing unlinked ProductMatchArtifact across the brand's
+    // media whose identification subset-matches this product, and
+    // collapse any other detect-identified twins. Runs inline so the
+    // response carries the updated matchedMedia count.
+    const wasPromoted = wasDraft && product.draft === false;
+    if (wasPromoted) {
+      await catalogProductPromoteService.onPromote(product.toObject());
+      // Re-read so the response includes the freshly-rebuilt
+      // matchedMedia[] count from the retro-link pass.
+      const refreshed = await CatalogProduct.findById(product._id).lean();
+      return res.json({ product: projectListRow(refreshed, (refreshed.matchedMedia || []).length) });
+    }
 
     res.json({ product: projectListRow(product, (product.matchedMedia || []).length) });
   } catch (err) {
