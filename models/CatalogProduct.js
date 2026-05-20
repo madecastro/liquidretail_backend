@@ -8,6 +8,7 @@
 // upsert in place so reruns don't multiply rows.
 
 const mongoose = require('mongoose');
+const { normalizeTitle } = require('../utils/titleNormalize');
 
 const catalogProductSchema = new mongoose.Schema({
   advertiserId: { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', required: true, index: true },
@@ -69,6 +70,14 @@ const catalogProductSchema = new mongoose.Schema({
 
   // Display + commerce
   title:        { type: String, required: true },
+  // Lowercased, promo-stripped, separator-flattened form of `title`,
+  // computed in the pre-save hook below. Used as the match key by
+  // productMatchService.ensureCatalogProductForMatch so that promo
+  // suffixes ("Subscribe and Save 30% Off applied") and separator
+  // variants ("-", "—", ":") don't spawn phantom detect-identified
+  // rows for the same SKU. Indexed for fast (brandId, normalizedTitle)
+  // lookups.
+  normalizedTitle: { type: String, default: null, index: true },
   description:  String,
   brand:        String,    // Meta's "brand" field (often the brand name)
   category:     String,    // Meta's category string (taxonomy varies)
@@ -170,5 +179,28 @@ catalogProductSchema.index({ brandId: 1, draft: 1 });
 // Inverse-lookup for "what products did this media match" reads —
 // matchedMedia.mediaId is the natural key for the per-product seed pass.
 catalogProductSchema.index({ 'matchedMedia.mediaId': 1 });
+// Tenant-scoped normalized-title lookup for ensureCatalogProductForMatch
+// step 2 (find before create).
+catalogProductSchema.index({ brandId: 1, normalizedTitle: 1 });
+
+catalogProductSchema.pre('save', function(next) {
+  if (this.isModified('title') || this.normalizedTitle == null) {
+    this.normalizedTitle = normalizeTitle(this.title);
+  }
+  next();
+});
+
+// findOneAndUpdate / updateOne paths bypass the save hook; recompute
+// normalizedTitle when title is being set in an update operation so the
+// field stays consistent regardless of write style.
+catalogProductSchema.pre('findOneAndUpdate', function(next) {
+  const update = this.getUpdate() || {};
+  const set = update.$set || update;
+  if (set && typeof set.title === 'string') {
+    if (update.$set) update.$set.normalizedTitle = normalizeTitle(set.title);
+    else update.normalizedTitle = normalizeTitle(set.title);
+  }
+  next();
+});
 
 module.exports = mongoose.model('CatalogProduct', catalogProductSchema);
