@@ -372,17 +372,20 @@ router.get('/:id/matches', async (req, res) => {
       : [];
     const mediaById = new Map(mediaDocs.map(m => [String(m._id), m]));
 
-    // Apply the same content-nature gate the seed expansion uses
-    // (services/campaignAdsGenerationService.isMediaEligibleByContentNature).
-    // Without it the picker would surface promotional / announcement
-    // posts that the cartesian then silently drops, leaving the operator
-    // confused about why they don't appear in queued ads.
+    // Content-nature filter is gated on ?adEligible=1. The campaign
+    // wizard's Step 2 picker passes the flag so the picker only shows
+    // matches the cartesian will actually queue. The catalog browser
+    // does NOT pass it — operators looking at a product's match
+    // history should see every linked match, ad-eligible or not.
+    // Otherwise the matches tab silently disagrees with the sidebar's
+    // match count pill.
+    const filterAdEligible = req.query.adEligible === '1';
     const { isMediaEligibleByContentNature } = require('../services/campaignAdsGenerationService');
 
     const matches = ordered.map(a => {
       const m = mediaById.get(String(a.mediaId));
       if (!m) return null;
-      if (!isMediaEligibleByContentNature(m)) return null;
+      if (filterAdEligible && !isMediaEligibleByContentNature(m)) return null;
       const cropProductRef = a.query?.productCrop || {};
       return {
         mediaId:    String(a.mediaId),

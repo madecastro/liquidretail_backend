@@ -20,6 +20,7 @@
 const DetectRun            = require('../models/DetectRun');
 const Media                = require('../models/Media');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
+const catalogRetroLink     = require('./catalogRetroLinkService');
 
 const POLL_INTERVAL_MS     = 10000;
 const POLL_MAX_WAIT_MS     = 10 * 60 * 1000;   // 10 min — covers a 100-product catalog at 8-way concurrency
@@ -34,9 +35,20 @@ async function rematchAfterCatalogDetect({ brandId }) {
     if (!ok) {
       console.warn(`🔁 rematch-after-catalog: catalog-product detects didn't drain within ${POLL_MAX_WAIT_MS / 1000}s — proceeding anyway`);
     }
+
+    // Brand-wide retro-link pass — re-points unlinked artifacts and
+    // phantom-linked artifacts onto the now-current synced rows. Runs
+    // BEFORE the re-detect enqueue so the cheap subset-match path
+    // resolves anything it can without paying for a fresh DetectRun.
+    const retro = await catalogRetroLink.runBrandWide({ brandId });
+
     const result = await enqueueRematchForUnmatchedPosts({ brandId });
-    console.log(`🔁 rematch-after-catalog: brand=${brandId} drained=${ok} enqueued=${result.enqueued} (of ${result.candidates} candidates)`);
-    return { ok: true, ...result, drained: ok };
+    console.log(
+      `🔁 rematch-after-catalog: brand=${brandId} drained=${ok} ` +
+      `retroLinked=${retro.linked || 0} twinCollapses=${retro.twinCollapses || 0} ` +
+      `enqueued=${result.enqueued} (of ${result.candidates} candidates)`
+    );
+    return { ok: true, ...result, retro, drained: ok };
   } catch (err) {
     console.warn(`🔁 rematch-after-catalog failed for brand ${brandId}: ${err.message}`);
     return { ok: false, reason: err.message };
