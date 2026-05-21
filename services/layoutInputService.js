@@ -65,6 +65,7 @@ const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
 const { computeSlotBudgets } = require('./slotBudget');
+const { displayNormalizeTitle } = require('../utils/titleNormalize');
 
 const GEMINI_MODEL    = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -1432,11 +1433,22 @@ function assembleInput(ctx, template, aspectRatio, options, derivation, precompu
       //                                                     brand)
       // Templates with product_meta in required_all_of stay valid for
       // brand_match because a meaningful name is always present.
-      name:          (match?.catalogProductId
-                        ? (details.title || ident.productName)
-                        : (ident.productName || details.title))
-                     || brandName
-                     || 'Product',
+      // Strip promo cruft ("Subscribe and Save", "30% Off applied",
+      // empty parens, stranded separators) at render time so the
+      // catalog row's stored title can keep the promo phrasing for
+      // the brand's shop without bleeding into the ad's product_meta.
+      // Catalog rows often arrive as e.g. "Hot Crispy Oil - Original
+      // Subscribe and Save 30% Off applied at checkout" — 67 chars
+      // that overflow the product_card in narrow zones (9:16, 1:1
+      // stacked). Display-normalize trims that to "Hot Crispy Oil -
+      // Original".
+      name:          displayNormalizeTitle(
+                       (match?.catalogProductId
+                          ? (details.title || ident.productName)
+                          : (ident.productName || details.title))
+                       || brandName
+                       || 'Product'
+                     ) || brandName || 'Product',
       // Catalog-first: when a CatalogProduct is linked, its category
       // (Meta's catalog taxonomy via details.category) is authoritative.
       // For unlinked / brand_match outcomes, fall back to the source

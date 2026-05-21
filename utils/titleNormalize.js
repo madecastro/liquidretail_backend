@@ -83,4 +83,49 @@ function titleSimilarity(a, b) {
   return { score, shared };
 }
 
-module.exports = { normalizeTitle, titleSimilarity };
+// Display-friendly variant of normalizeTitle. Strips the same promo
+// cruft (Subscribe and Save, 30% Off applied, BOGO, etc.) but keeps
+// case, separators, and punctuation intact so the result is suitable
+// for rendering as a product name.
+//
+//   "Hot Crispy Oil - Original Subscribe and Save 30% Off applied
+//    at checkout"   →   "Hot Crispy Oil - Original"
+//
+// Used at render time inside layoutInputService when building the
+// ad's product.name field. The catalog row's stored title is not
+// modified — brands often want the promo phrasing on their actual
+// shop, just not on the ad.
+function displayNormalizeTitle(s) {
+  if (s == null) return '';
+  let out = String(s);
+
+  // Drop trademark marks but keep everything else.
+  out = out.replace(MARK_RE, '');
+
+  // Strip promo phrases. Same regex set as normalizeTitle.
+  for (const re of PROMO_PHRASES) {
+    out = out.replace(re, ' ');
+  }
+
+  // "applied at checkout" / "at checkout" leftovers from the promo
+  // phrase strip — they often sit alone after "30% Off" is removed.
+  out = out.replace(/\b(applied\s+)?at\s+checkout\b/gi, ' ');
+
+  // Collapse extra whitespace, strip stranded separators / empty
+  // bracket pairs / orphan trailing punctuation that promo removal
+  // left behind ("Hot Crispy Oil -  - Original", "( )", "!" alone).
+  out = out
+    .replace(/\s+/g, ' ')
+    .replace(/[(\[{]\s*[)\]}]/g, ' ')                // empty pairs
+    .replace(/(\s*[-–—|:]\s*)+/g, m => m.trim() ? ' - ' : ' ')
+    .replace(/\s+([!?.,;])/g, '$1')                  // tighten orphan punctuation
+    .replace(/[!?.,;]\s*$/g, '')                     // drop trailing orphan punctuation
+    .replace(/\s*-\s*$/g, '')
+    .replace(/^\s*-\s*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return out;
+}
+
+module.exports = { normalizeTitle, displayNormalizeTitle, titleSimilarity };
