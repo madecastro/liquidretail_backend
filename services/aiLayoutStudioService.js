@@ -18,6 +18,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const Media                = require('../models/Media');
 const DetectionArtifact    = require('../models/DetectionArtifact');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
+const AiLayoutSession      = require('../models/AiLayoutSession');
 const { findBrandByName }  = require('./brandCatalogService');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 
@@ -263,4 +264,95 @@ function clamp01(v) { return Math.max(0, Math.min(1, Number(v) || 0)); }
 function badRequest(msg) { const e = new Error(msg); e.status = 400; return e; }
 function notFound(msg)   { const e = new Error(msg); e.status = 404; return e; }
 
-module.exports = { generateAiLayouts, DEFAULT_VARIANTS, DEFAULT_ASPECT_RATIOS };
+// ──────────────────────────────────────────────────────────────
+//  Session-based runner (background-job pattern)
+// ──────────────────────────────────────────────────────────────
+// Called via setImmediate from the route handler. Never throws to
+// the caller; all errors are captured on the session doc so the
+// polling client can surface them. Writes each reference as it
+// settles so the client sees progress on every poll.
+async function runSession(sessionId) {
+  let session;
+  try {
+    session = await AiLayoutSession.findById(sessionId);
+  } catch (err) {
+    console.warn(`🎨 ai-layouts.runSession(${sessionId}): session load failed — ${err.message}`);
+    return;
+  }
+  if (!session) {
+    console.warn(`🎨 ai-layouts.runSession(${sessionId}): session not found`);
+    return;
+  }
+
+  try {
+    const ctx = await loadContext(session.mediaId);
+    if (!ctx) {
+      session.status = 'failed';
+      session.error = `Media ${session.mediaId} not found`;
+      session.completedAt = new Date();
+      await session.save();
+      return;
+    }
+
+    // Stamp display context + transition to running so the client's
+    // first poll sees brand/product name and progress info.
+    session.brandName   = ctx.brand?.name || ctx.media.metadata?.brand || null;
+    session.productName = ctx.match?.identification?.productName || null;
+    session.status      = 'running';
+    session.startedAt   = new Date();
+    await session.save();
+
+    const q = ['low', 'medium', 'high'].includes(session.quality) ? session.quality : DEFAULT_QUALITY;
+    const vSet = session.variants?.length     ? session.variants     : DEFAULT_VARIANTS;
+    const rSet = session.aspectRatios?.length ? session.aspectRatios : DEFAULT_ASPECT_RATIOS;
+    const combos = [];
+    for (const v of vSet) for (const r of rSet) combos.push({ variant: v, aspectRatio: r });
+
+    const t0 = Date.now();
+    console.log(`🎨 ai-layouts.runSession(${sessionId}): generating ${combos.length} refs (quality=${q})`);
+
+    // Per-combo: generate + extract + push to session.references[].
+    // Wrapped individually so one combo's failure can't reject the
+    // Promise.all and short-circuit the rest.
+    await Promise.all(combos.map(async (c) => {
+      let ref;
+      try {
+        const imageUrl = await generateReferenceImage(ctx, c.variant, c.aspectRatio, q);
+        let extractedCanvas = null;
+        try { extractedCanvas = await extractLayoutFromImage(imageUrl); }
+        catch (err) { console.warn(`   ⚠️  ai-layouts[${c.variant}/${c.aspectRatio}] extraction failed: ${err.message}`); }
+        ref = { ...c, imageUrl, extractedCanvas, status: 'ok' };
+      } catch (err) {
+        console.warn(`   ⚠️  ai-layouts[${c.variant}/${c.aspectRatio}] generation failed: ${err.message}`);
+        ref = { ...c, status: 'error', error: err.message };
+      }
+      // $push so each reference appears on the next client poll.
+      // Doesn't conflict with the final status update — that's a
+      // separate $set after Promise.all settles.
+      try {
+        await AiLayoutSession.updateOne(
+          { _id: sessionId },
+          { $push: { references: ref } }
+        );
+      } catch (err) {
+        console.warn(`   ⚠️  ai-layouts session push failed for ${c.variant}/${c.aspectRatio}: ${err.message}`);
+      }
+    }));
+
+    await AiLayoutSession.updateOne(
+      { _id: sessionId },
+      { $set: { status: 'completed', completedAt: new Date() } }
+    );
+    console.log(`🎨 ai-layouts.runSession(${sessionId}): completed in ${Date.now() - t0}ms`);
+  } catch (err) {
+    console.warn(`🎨 ai-layouts.runSession(${sessionId}): top-level failure — ${err.message}`);
+    try {
+      await AiLayoutSession.updateOne(
+        { _id: sessionId },
+        { $set: { status: 'failed', error: err.message || 'unknown error', completedAt: new Date() } }
+      );
+    } catch (_) { /* nothing else to do */ }
+  }
+}
+
+module.exports = { generateAiLayouts, runSession, DEFAULT_VARIANTS, DEFAULT_ASPECT_RATIOS };
