@@ -562,11 +562,39 @@ async function seedsFromMedia(brandId, mediaId) {
   const productMatches = (media.matchedProducts || []).filter(mp => mp.catalogProductId);
   const trueProductMatches = productMatches.filter(mp => mp.outcome === 'product_match');
   if (trueProductMatches.length) {
-    return trueProductMatches.map(mp => ({
+    const seeds = trueProductMatches.map(mp => ({
       ...baseSeed,
       productId: String(mp.catalogProductId),
       matchTier: 'product_match'
     }));
+
+    // Tier 0 alt expansion — for each matched product, emit one
+    // product_image seed per catalog Media (hero + ranked alts) so
+    // the catalog imagery fans out alongside the ugc seeds. Mirrors
+    // seedsFromProduct's product_image emission; reuses the same
+    // ranking helper. Note: this multiplies the cartesian — see
+    // backlog 'Cartesian enumeration cap for alt-expanded runs'.
+    for (const mp of trueProductMatches) {
+      const productOid = toObjectId(mp.catalogProductId);
+      if (!productOid) continue;
+      const catalogMedias = await Media.find({
+        source: 'catalog-product',
+        'metadata.catalogProductId': productOid
+      }).select('_id fileType adSuitability classification metadata.imageRole').lean();
+      const ranked = rankCatalogMediasForHero(catalogMedias);
+      for (const cm of ranked) {
+        seeds.push({
+          productId:        String(mp.catalogProductId),
+          mediaId:          String(cm._id),
+          matchTier:        'product_match',
+          variantKind:      'product_image',
+          fileType:         cm.fileType,
+          suitabilityScore: cm.adSuitability?.score ?? null
+        });
+      }
+    }
+
+    return seeds;
   }
 
   // Case 2 — only product_category matches. Expand to top-K products
