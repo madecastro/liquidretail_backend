@@ -45,6 +45,17 @@ function projectListRow(p, matchCount) {
     currency:     p.currency     || null,
     availability: p.availability || null,
     imageUrl:     p.imageUrl     || null,
+    // Hero + alts. URLs are the raw source-CDN strings; *MediaId fields
+    // point at the wrapped Cloudinary-mirrored catalog-product Media
+    // docs. Both surfaced so the Generate Ads wizard's brand-kind
+    // unified ribbon can render alt tiles AND wire per-alt exclusion
+    // pairings (productId, altMediaId) that drop specific alts from
+    // the product_image cartesian.
+    additionalImages:        Array.isArray(p.additionalImages) ? p.additionalImages : [],
+    imageMediaId:            p.imageMediaId ? String(p.imageMediaId) : null,
+    additionalImageMediaIds: Array.isArray(p.additionalImageMediaIds)
+                               ? p.additionalImageMediaIds.map(id => String(id))
+                               : [],
     productUrl:   p.productUrl   || null,
     rating:       typeof p.rating === 'number' ? p.rating : null,
     reviewCount:  Array.isArray(p.reviews) ? p.reviews.length : null,
@@ -84,7 +95,11 @@ function projectDetail(p, category) {
     currency:     p.currency     || null,
     availability: p.availability || null,
     imageUrl:     p.imageUrl     || null,
-    additionalImages: Array.isArray(p.additionalImages) ? p.additionalImages : [],
+    additionalImages:        Array.isArray(p.additionalImages) ? p.additionalImages : [],
+    imageMediaId:            p.imageMediaId ? String(p.imageMediaId) : null,
+    additionalImageMediaIds: Array.isArray(p.additionalImageMediaIds)
+                               ? p.additionalImageMediaIds.map(id => String(id))
+                               : [],
     productUrl:   p.productUrl   || null,
     gtin:         p.gtin || null,
     mpn:          p.mpn  || null,
@@ -203,6 +218,9 @@ router.get('/', async (req, res) => {
         { $project: {
             externalId: 1, source: 1, draft: 1, title: 1, brand: 1, category: 1,
             price: 1, currency: 1, availability: 1, imageUrl: 1, productUrl: 1,
+            // Hero + alts surfaced so the brand-kind unified ribbon can
+            // render alt tiles and key (productId, altMediaId) exclusions.
+            additionalImages: 1, imageMediaId: 1, additionalImageMediaIds: 1,
             rating: 1, reviews: 1, gtin: 1, mpn: 1,
             itemGroupId: 1, isPrimaryVariant: 1, variantCount: 1,
             detectedFromMediaId: 1, firstSeenAt: 1, lastSyncedAt: 1,
