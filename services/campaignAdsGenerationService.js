@@ -222,7 +222,14 @@ async function expandWizardJob({
   // these as the operator clicks the X on individual related-tile
   // pairings; passed through here so brand_match seeds (productId=null)
   // can also be excluded when mediaId matches.
-  excludePairings = []
+  excludePairings = [],
+  // Tier expansion toggles for product-kind picks. Default false so a
+  // product campaign only includes product_match (strict tier 1) UGC
+  // unless the operator opted in via the wizard's "Include category-
+  // matched" / "Include brand-matched" expand buttons in Step 2.
+  // Brand-only and media-driven seed paths ignore these flags.
+  includeCategoryMatched = false,
+  includeBrandMatched    = false
 }) {
   if (!campaignId) throw new Error('campaignId required');
 
@@ -273,7 +280,10 @@ async function expandWizardJob({
       seeds.push(...mediaSeeds);
     }
     for (const productId of productIds) {
-      const productSeeds = await seedsFromProduct(brandId, productId);
+      const productSeeds = await seedsFromProduct(brandId, productId, {
+        includeCategoryMatched,
+        includeBrandMatched
+      });
       seeds.push(...productSeeds);
     }
   }
@@ -617,23 +627,30 @@ async function loadTopProductsByPopularity({ brandId, categoryIds, limit }) {
 }
 
 // Product-driven (catalog entry / wizard Step 2). Operator picked a
-// productId. Pulls every matched media across product_match +
-// product_category tiers from CatalogProduct.matchedMedia[] (the
-// denormalized mirror written by detect), unions in brand_match
-// media for the brand (intentionally NOT denormalized — it isn't
-// per-product), and emits one product_image seed for the catalog
-// product's own hero.
-async function seedsFromProduct(brandId, productId) {
+// productId. Pulls matched media from CatalogProduct.matchedMedia[]
+// (the denormalized mirror written by detect), optionally unions in
+// brand_match media for the brand, and emits product_image seeds for
+// EVERY catalog media (hero + alts), ranked.
+//
+// Tier inclusion is opt-in for non-product_match tiers. The wizard's
+// Step 2 product-kind view exposes "Include category-matched" and
+// "Include brand-matched" expand buttons; the campaign-generate
+// endpoint forwards the toggles into opts here. Defaults are TRUE
+// for backwards-compat with callers that don't pass the flags.
+async function seedsFromProduct(brandId, productId, opts = {}) {
+  const includeCategoryMatched = opts.includeCategoryMatched !== false;
+  const includeBrandMatched    = opts.includeBrandMatched    !== false;
+
   const seeds = [];
 
   const product = await CatalogProduct.findById(productId)
     .select('matchedMedia')
     .lean();
 
-  // Tiers 1 + 2 — product_match + product_category from the
-  // denormalized mirror. Bulk-load the referenced Media docs so we
-  // can score by adSuitability + grab fileType. Content-nature filter
-  // excludes promotional / announcement UGC (sale-of-the-week,
+  // Tiers 1 + 2 — product_match (always) + product_category (opt-in)
+  // from the denormalized mirror. Bulk-load the referenced Media docs
+  // so we can score by adSuitability + grab fileType. Content-nature
+  // filter excludes promotional / announcement UGC (sale-of-the-week,
   // "coming soon" teasers) — they read as stale ad inserts once the
   // offer/date passes.
   if (product?.matchedMedia?.length) {
@@ -641,6 +658,7 @@ async function seedsFromProduct(brandId, productId) {
     const medias = await loadMediasForScoring(mediaIds);
     const mediaById = new Map(medias.map(m => [String(m._id), m]));
     for (const mm of product.matchedMedia) {
+      if (mm.matchTier === 'product_category' && !includeCategoryMatched) continue;
       const media = mediaById.get(String(mm.mediaId));
       if (!media) continue;
       if (!isMediaEligibleByContentNature(media)) continue;
@@ -663,66 +681,70 @@ async function seedsFromProduct(brandId, productId) {
     }
   }
 
-  // Tier 3 — brand_match fallback: tag the productId onto brand media
-  // so the ad is still attributed for CTA/tracking. Not denormalized
-  // on CatalogProduct (would require writing every brand_match media
-  // to every product in the brand), so this stays a PMA query.
-  const brandMatches = await ProductMatchArtifact.find({
-    brandId,
-    outcome: 'brand_match'
-  }).select('mediaId').lean();
-  const brandMatchMediaIds = Array.from(new Set(brandMatches.map(m => String(m.mediaId))));
-  if (brandMatchMediaIds.length) {
-    const medias = await loadMediasForScoring(brandMatchMediaIds);
-    for (const m of medias) {
-      if (!isMediaEligibleByContentNature(m)) continue;
-      // Tier 3 gate — brand_match pairs an unmatched-by-product post
-      // with a seed SKU. If the post visibly contains ANY product
-      // (identified to another SKU, or unidentified but YOLO-visible),
-      // the pairing risks showing the wrong jar/label next to the
-      // seed's name. Exclude both cases.
-      if (hasIdentifiedSpecificProduct(m) || hasVisibleUnmatchedProduct(m)) continue;
-      seeds.push({
-        productId:        String(productId),
-        mediaId:          String(m._id),
-        matchTier:        'brand_match',
-        variantKind:      'ugc',
-        fileType:         m.fileType,
-        suitabilityScore: m.adSuitability?.score ?? null,
-        platformStats:    m.platformStats || null
-      });
+  // Tier 3 — brand_match fallback (opt-in). Tags the productId onto
+  // brand media so the ad is still attributed for CTA/tracking. Not
+  // denormalized on CatalogProduct (would require writing every
+  // brand_match media to every product in the brand), so this stays
+  // a PMA query.
+  if (includeBrandMatched) {
+    const brandMatches = await ProductMatchArtifact.find({
+      brandId,
+      outcome: 'brand_match'
+    }).select('mediaId').lean();
+    const brandMatchMediaIds = Array.from(new Set(brandMatches.map(m => String(m.mediaId))));
+    if (brandMatchMediaIds.length) {
+      const medias = await loadMediasForScoring(brandMatchMediaIds);
+      for (const m of medias) {
+        if (!isMediaEligibleByContentNature(m)) continue;
+        // Tier 3 gate — brand_match pairs an unmatched-by-product post
+        // with a seed SKU. If the post visibly contains ANY product
+        // (identified to another SKU, or unidentified but YOLO-visible),
+        // the pairing risks showing the wrong jar/label next to the
+        // seed's name. Exclude both cases.
+        if (hasIdentifiedSpecificProduct(m) || hasVisibleUnmatchedProduct(m)) continue;
+        seeds.push({
+          productId:        String(productId),
+          mediaId:          String(m._id),
+          matchTier:        'brand_match',
+          variantKind:      'ugc',
+          fileType:         m.fileType,
+          suitabilityScore: m.adSuitability?.score ?? null,
+          platformStats:    m.platformStats || null
+        });
+      }
     }
   }
 
-  // Tier 0 — product_image: pick the BEST catalog Media as the visual
-  // hero. Meta's image_url (imageRole='hero') is whatever the merchant
-  // listed first, often a clean studio shot. For ad creative we'd
-  // rather lead with a lifestyle / on-model shot when one exists, with
-  // the clean product shot serving the product.image inset slot
-  // (handled by layoutInputService.loadContext). Ranking falls back to
-  // imageRole when shotType is missing (legacy rows).
+  // Tier 0 — product_image: emit ONE seed per catalog Media (hero +
+  // alts), ranked so the best hero candidate becomes the first /
+  // highest-priority seed. Previously this only emitted the single
+  // top-ranked Media; alts had artifacts but never made it into the
+  // cartesian. With the alt expansion, a product with 4 alts produces
+  // 5 product_image seeds (one per catalog media), each its own
+  // visual-hero variant. MAX_ADS_PER_GENERATION_RUN still clips the
+  // total run; smarter per-seed prioritization is a follow-up.
   const productOid = toObjectId(productId);
   const catalogMedias = productOid ? await Media.find({
     source: 'catalog-product',
     'metadata.catalogProductId': productOid
   }).select('_id fileType adSuitability classification metadata.imageRole').lean() : [];
-  const chosen = pickProductImageHero(catalogMedias);
-  if (chosen) {
+  const rankedCatalogMedias = rankCatalogMediasForHero(catalogMedias);
+  for (const m of rankedCatalogMedias) {
     seeds.push({
       productId:        String(productId),
-      mediaId:          String(chosen._id),
+      mediaId:          String(m._id),
       matchTier:        'product_match',     // the product IS the SKU here
       variantKind:      'product_image',
-      fileType:         chosen.fileType,
-      suitabilityScore: chosen.adSuitability?.score ?? null
+      fileType:         m.fileType,
+      suitabilityScore: m.adSuitability?.score ?? null
     });
   }
 
   return seeds;
 }
 
-// Pick the catalog Media most suited to be the visual hero of a
-// product_image ad. Preference order:
+// Rank catalog Media for use as a product_image ad's visual hero.
+// Preference order:
 //   1. lifestyle      product in real-world context (story-friendly)
 //   2. on_model       human element draws engagement
 //   3. flat_lay       contextual but flatter than lifestyle
@@ -731,9 +753,9 @@ async function seedsFromProduct(brandId, productId) {
 //   6. detail         close-up / partial product
 //   7. packaging      worst for hero
 // Within a rank, prefer imageRole='hero' (the merchant's primary
-// listing). Returns the chosen Media doc or null when the list is empty.
-function pickProductImageHero(medias) {
-  if (!Array.isArray(medias) || !medias.length) return null;
+// listing). Returns a sorted array (best first); empty when input is.
+function rankCatalogMediasForHero(medias) {
+  if (!Array.isArray(medias) || !medias.length) return [];
   const RANK = {
     lifestyle:    1,
     on_model:     2,
@@ -743,7 +765,7 @@ function pickProductImageHero(medias) {
     detail:       6,
     packaging:    7
   };
-  const ranked = medias.slice().sort((a, b) => {
+  return medias.slice().sort((a, b) => {
     const ra = RANK[a.classification?.shotType] ?? RANK.unknown;
     const rb = RANK[b.classification?.shotType] ?? RANK.unknown;
     if (ra !== rb) return ra - rb;
@@ -752,7 +774,14 @@ function pickProductImageHero(medias) {
     const bhero = (b.metadata?.imageRole === 'hero') ? 0 : 1;
     return ahero - bhero;
   });
-  return ranked[0];
+}
+
+// Back-compat shim — older callers (if any survive) still call
+// pickProductImageHero expecting a single Media. New flow ranks the
+// whole set; this returns the top of the rank.
+function pickProductImageHero(medias) {
+  const ranked = rankCatalogMediasForHero(medias);
+  return ranked[0] || null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

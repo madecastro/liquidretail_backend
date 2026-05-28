@@ -64,6 +64,13 @@ router.post('/generate', async (req, res) => {
       // the Step 2 picker. Forwarded into expandWizardJob to drop the
       // matching tuples from the cartesian.
       excludePairings = [],
+      // Tier-expansion toggles from the Step 2 picker (product-kind
+      // view). Default false — product campaigns only include
+      // product_match (strict tier 1) UGC unless the operator clicked
+      // the "Include category-matched" / "Include brand-matched"
+      // expand buttons.
+      includeCategoryMatched = false,
+      includeBrandMatched    = false,
       refresh     = false   // wizard checkbox / smoke-test override; bypasses de-dupe + LayoutInputArtifact cache
     } = req.body || {};
 
@@ -99,6 +106,8 @@ router.post('/generate', async (req, res) => {
       cta,
       urlParams,
       excludePairings,
+      includeCategoryMatched,
+      includeBrandMatched,
       requestedBy: req.user?.userId || null
     });
 
