@@ -537,6 +537,38 @@ router.get('/:id/brand-matches', async (req, res) => {
   }
 });
 
+// Lifestyle-eligible media IDs for the brand. Returns the Set of
+// Media IDs whose classification.shotType is in {lifestyle, on_model,
+// unknown} OR is unset/null — the wider "brand-campaign-appropriate
+// imagery" net the Generate Ads wizard applies under campaign
+// kind='brand' to keep product_only / packaging / detail studio
+// shots out of the picker. Hero / studio shots stay clear of
+// brand-led ads; lifestyle + on_model + unclassified slip through.
+//
+// Returns the IDs only (not Media docs) so the picker can build a
+// fast Set and apply membership-style filtering across the unified
+// ribbon + recommended tiles in a single pass.
+router.get('/:id/lifestyle-eligible-media-ids', async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).select('_id').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+    const Media = require('../models/Media');
+    const allowed = ['lifestyle', 'on_model', 'unknown'];
+    const rows = await Media.find({
+      brandId: brand._id,
+      $or: [
+        { 'classification.shotType': { $in: allowed } },
+        { 'classification.shotType': { $exists: false } },
+        { 'classification.shotType': null }
+      ]
+    }).select('_id').limit(10000).lean();
+    res.json({ mediaIds: rows.map(r => String(r._id)) });
+  } catch (err) {
+    console.error('lifestyle-eligible-media-ids failed:', err);
+    res.status(500).json({ error: err.message || 'lookup failed' });
+  }
+});
+
 // Ad-readiness gate — same signals as the onboarding panel, condensed
 // into a yes/no the wizard can disable buttons on. Strictest bar:
 // every connected source has ≥1 completed DetectRun AND zero in-flight
