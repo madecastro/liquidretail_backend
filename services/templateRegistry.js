@@ -149,6 +149,16 @@ function isAi(id) { return aiTemplates.isAi(id); }
 // Returns { ok, template_id, missing[], anyOfFailures[][], minCountFailures{} }.
 
 function validateInputAgainstTemplate(input, templateId) {
+  // AI templates skip the static required_all_of / required_any_of /
+  // min_counts validation — the LLM emits its own zone set per ad,
+  // and aiCanvasSpecService.validateSpec runs the spec-level checks
+  // (required zones logo+cta+copy, slot whitelist, rect bounds).
+  // Returning ok:true here lets the render pipeline proceed to the
+  // canvas-resolution branch in routes/layout.js, which dispatches
+  // to the AI spec service.
+  if (aiTemplates.isAi(templateId)) {
+    return { ok: true, template_id: templateId, ai: true };
+  }
   const spec = NORMALIZED_BY_ID[templateId];
   if (!spec) {
     return { ok: false, template_id: templateId, reason: `unknown template: ${templateId}` };
