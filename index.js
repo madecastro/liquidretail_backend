@@ -136,6 +136,7 @@ app.use('/api/integrations', (req, res, next) => {
   return requireAuth(req, res, next);
 }, integrationRoutes);
 app.use('/api/ai-layouts', requireAuth, aiLayoutRoutes);
+app.use('/api/ai-layouts/spec', requireAuth, require('./routes/aiCanvasSpec'));
 app.use('/api/catalog', requireAuth, catalogRoutes);
 app.use('/api/campaigns', requireAuth, campaignRoutes);
 app.use('/api/ads',       requireAuth, adsRoutes);
