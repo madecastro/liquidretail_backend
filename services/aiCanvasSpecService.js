@@ -37,7 +37,7 @@ const AiCanvasArtifact = require('../models/AiCanvasArtifact');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '1.0.0';
+const SPEC_SCHEMA_VERSION = '1.1.0';   // bumped when the response_format schema changed shape for strict mode
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -79,6 +79,32 @@ const ALLOWED_SLOTS = [
 // kinds + slot paths + rect bounds so the model can't invent
 // arbitrary zone types the renderer wouldn't know what to do with.
 function buildResponseSchema(aspectRatio) {
+  // OpenAI strict mode requires every property declared in `properties`
+  // to ALSO appear in `required`. Optional fields are modeled as
+  // nullable (type: [..., 'null']) and the model emits null when not
+  // applicable. additionalProperties must be false at every level.
+  // additionalProperties: { ... } syntax is NOT allowed in strict —
+  // safe_areas + style_bindings + zone_scalers therefore use fixed
+  // property maps with nullable rect/string values instead of an
+  // open additionalProperties shape.
+  const SAFE_AREA_NAMES = ['outer', 'text_primary', 'text_secondary', 'cta_safe', 'logo_safe', 'no_obstruction'];
+  const STYLE_BINDING_NAMES = [
+    'card_bg', 'card_text_color', 'panel_bg',
+    'headline_text_color', 'accent_border_color',
+    'cta_button_bg', 'cta_text_color',
+    'font_family_body', 'font_family_display'
+  ];
+  const ZONE_SCALER_NAMES = ['headline', 'eyebrow_rules', 'proof_bar', 'product_meta', 'quote_card'];
+
+  const safeAreaProps = Object.fromEntries(SAFE_AREA_NAMES.map(n => [n, { anyOf: [{ $ref: '#/$defs/rect' }, { type: 'null' }] }]));
+  const styleBindingProps = Object.fromEntries(STYLE_BINDING_NAMES.map(n => [n, { type: ['string', 'null'] }]));
+  const zoneScalerProps = Object.fromEntries(ZONE_SCALER_NAMES.map(n => [n, {
+    type: ['object', 'null'],
+    additionalProperties: false,
+    required: ['font'],
+    properties: { font: { type: ['number', 'null'] } }
+  }]));
+
   return {
     name: 'ai_canvas_spec',
     schema: {
@@ -86,7 +112,7 @@ function buildResponseSchema(aspectRatio) {
       additionalProperties: false,
       required: [
         'creative_style', 'rationale', 'elements_used', 'elements_skipped',
-        'aspect_ratio', 'canvas', 'zones', 'style_bindings'
+        'aspect_ratio', 'canvas', 'safe_areas', 'zones', 'zone_scalers', 'style_bindings'
       ],
       properties: {
         creative_style:   { type: 'string', enum: Object.keys(CREATIVE_STYLES) },
@@ -113,7 +139,9 @@ function buildResponseSchema(aspectRatio) {
         },
         safe_areas: {
           type: 'object',
-          additionalProperties: { $ref: '#/$defs/rect' }
+          additionalProperties: false,
+          required: SAFE_AREA_NAMES,
+          properties: safeAreaProps
         },
         zones: {
           type: 'array',
@@ -121,11 +149,11 @@ function buildResponseSchema(aspectRatio) {
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['id', 'kind', 'rect', 'layer'],
+            required: ['id', 'kind', 'slot', 'rect', 'layer', 'style_variant', 'max_lines', 'fit', 'radius'],
             properties: {
               id:        { type: 'string' },
               kind:      { type: 'string', enum: ALLOWED_ZONE_KINDS },
-              slot:      {
+              slot: {
                 anyOf: [
                   { type: 'string', enum: ALLOWED_SLOTS },
                   { type: 'array', items: { type: 'string', enum: ALLOWED_SLOTS } },
@@ -134,15 +162,28 @@ function buildResponseSchema(aspectRatio) {
               },
               rect:      { $ref: '#/$defs/rect' },
               layer:     { type: 'string', enum: ['media', 'background', 'copy', 'proof', 'cta', 'chrome'] },
-              style_variant: { type: 'string' },
-              max_lines: { type: 'integer', minimum: 1 },
-              fit:       { type: 'string', enum: ['subject_preserve', 'cover', 'contain'] },
-              radius:    { type: 'integer', minimum: 0 }
+              style_variant: { type: ['string', 'null'] },
+              max_lines: { type: ['integer', 'null'], minimum: 1 },
+              fit:       { anyOf: [
+                { type: 'string', enum: ['subject_preserve', 'cover', 'contain'] },
+                { type: 'null' }
+              ] },
+              radius:    { type: ['integer', 'null'], minimum: 0 }
             }
           }
         },
-        zone_scalers:  { type: 'object', additionalProperties: true },
-        style_bindings:{ type: 'object', additionalProperties: { type: 'string' } }
+        zone_scalers: {
+          type: 'object',
+          additionalProperties: false,
+          required: ZONE_SCALER_NAMES,
+          properties: zoneScalerProps
+        },
+        style_bindings: {
+          type: 'object',
+          additionalProperties: false,
+          required: STYLE_BINDING_NAMES,
+          properties: styleBindingProps
+        }
       },
       $defs: {
         rect: {
