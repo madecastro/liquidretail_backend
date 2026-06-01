@@ -241,6 +241,18 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   if (!supportedRatios.includes(aspectRatio))
     throw badRequest(`Template ${template} does not support aspect ratio ${aspectRatio}`);
 
+  // AI templates ride on top of a hand-authored base for derivation +
+  // assembly — the input shape is template-independent for our
+  // purposes (copy candidates, palette, slot data). Cache under the
+  // AI template id so re-renders stay isolated from the base, but
+  // derive + assemble against the base so we reuse all the existing
+  // slot-budget / overlay-placement / copy machinery.
+  let effectiveTemplate     = template;
+  const aiNormalized        = registry.isAi(template) ? registry.getNormalized(template) : null;
+  if (aiNormalized) {
+    effectiveTemplate = aiNormalized.derivationTemplate || 'ugc_split_screen';
+  }
+
   // Cache key includes productId + variantKind so different seed
   // products on the same media don't share a cached input. Both
   // default to null for legacy callers (ads.html preview) — those
@@ -287,17 +299,17 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   // (their slot budgets come from canvas.zones, not placement).
   let precomputedPlacement = null;
   let overlayBoxes = null;
-  if (OVERLAY_MODE_TEMPLATES.has(template)) {
+  if (OVERLAY_MODE_TEMPLATES.has(effectiveTemplate)) {
     try {
-      precomputedPlacement = computeOverlayPlacement(ctx, aspectRatio, options, /* content */ ctx, template);
+      precomputedPlacement = computeOverlayPlacement(ctx, aspectRatio, options, /* content */ ctx, effectiveTemplate);
       overlayBoxes = extractOverlayBoxes(precomputedPlacement, aspectRatio);
     } catch (err) {
-      console.warn(`   ⚠️  overlay placement (pre-derivation) failed for ${template} ${aspectRatio}: ${err.message}`);
+      console.warn(`   ⚠️  overlay placement (pre-derivation) failed for ${effectiveTemplate} ${aspectRatio}: ${err.message}`);
     }
   }
 
-  const derivation = await runDerivation(ctx, template, aspectRatio, { ...options, overlayBoxes });
-  const input = assembleInput(ctx, template, aspectRatio, options, derivation, precomputedPlacement);
+  const derivation = await runDerivation(ctx, effectiveTemplate, aspectRatio, { ...options, overlayBoxes });
+  const input = assembleInput(ctx, effectiveTemplate, aspectRatio, options, derivation, precomputedPlacement);
 
   await LayoutInputArtifact.findOneAndReplace(
     {

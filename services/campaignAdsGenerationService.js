@@ -62,7 +62,8 @@ const SUPPORTED_TEMPLATES = new Set([
   'testimonial_spotlight',
   'ugc_split_screen',
   'testimonial_overlay',
-  'product_overlay'
+  'product_overlay',
+  'ai_brand_led'                  // Phase 1c — LLM-emitted canvas spec at render time
 ]);
 
 // Per-template variant whitelist. Some templates are inherently UGC
@@ -74,7 +75,8 @@ const TEMPLATE_SUPPORTS_VARIANT = {
   testimonial_spotlight: new Set(['ugc', 'product_image']),
   ugc_split_screen:      new Set(['ugc', 'product_image']),
   testimonial_overlay:   new Set(['ugc']),                       // creator quote over UGC photo — needs UGC source
-  product_overlay:       new Set(['ugc', 'product_image'])
+  product_overlay:       new Set(['ugc', 'product_image']),
+  ai_brand_led:          new Set(['ugc', 'product_image'])
 };
 
 // Aspect ratios we're shipping ad output for in V1.

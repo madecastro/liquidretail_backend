@@ -23,6 +23,7 @@
 const fs = require('fs');
 const path = require('path');
 const { applyContrastGuard } = require('../utils/contrastGuard');
+const aiTemplates = require('./aiTemplateRegistry');
 
 const SCHEMAS_DIR = path.join(__dirname, '..', 'schemas');
 
@@ -55,19 +56,42 @@ function countCanvasVariants() {
 // ── Read-only accessors ──
 
 function listTemplates() {
-  return CATALOG.templates.map(t => ({
+  const hand = CATALOG.templates.map(t => ({
     id:        t.id,
     name:      t.name,
     ui_label:  t.ui_label,
     status:    t.status,
     emphasis:  t.emphasis,
-    supported_aspect_ratios: NORMALIZED_BY_ID[t.id]?.aspect_ratios?.supported || []
+    supported_aspect_ratios: NORMALIZED_BY_ID[t.id]?.aspect_ratios?.supported || [],
+    kind:      'hand_authored'
   }));
+  const ai = aiTemplates.listAiTemplates().map(t => ({
+    id:        t.template_id,
+    name:      t.name,
+    ui_label:  t.name,
+    status:    'active',
+    emphasis:  t.emphasis,
+    supported_aspect_ratios: t.aspect_ratios?.supported || [],
+    kind:      'ai',
+    creativeStyle: t.creativeStyle
+  }));
+  return [...hand, ...ai];
 }
 
 function getCatalog(id)            { return CATALOG_BY_ID[id] || null; }
-function getNormalized(id)         { return NORMALIZED_BY_ID[id] || null; }
+function getNormalized(id) {
+  // AI templates return a shim shaped like a normalized entry so
+  // existing callers (campaignAdsGenerationService's cartesian, the
+  // layout-input ratio gate) work without prefix-matching the id.
+  if (aiTemplates.isAi(id)) return aiTemplates.getNormalizedShim(id);
+  return NORMALIZED_BY_ID[id] || null;
+}
 function getCanvas(id, aspectRatio) {
+  // AI templates: canvas is generated at render-time by the AI
+  // canvas-spec service. Return null here so callers know to dispatch
+  // to that service instead of using a static spec. The route handler
+  // at routes/layout.js picks up the null and routes accordingly.
+  if (aiTemplates.isAi(id)) return null;
   const variant = CANVAS.templates?.[id]?.variants?.[aspectRatio];
   if (!variant) return null;
   // Merge per-template truncation_rules into per-zone max_lines /
@@ -110,8 +134,14 @@ function pickTruncationOverride(zone, tr) {
 function getCanvasMaster(id)       { return CANVAS.templates?.[id]?.master || null; }
 function getGlobalCanvasRules()    { return CANVAS.global_canvas_rules || {}; }
 function getSupportedAspectRatios(id) {
+  if (aiTemplates.isAi(id)) return aiTemplates.getAiTemplate(id)?.aspect_ratios?.supported || [];
   return NORMALIZED_BY_ID[id]?.aspect_ratios?.supported || [];
 }
+
+// Is this an AI template id? Used to branch render-time canvas
+// resolution (static schema vs LLM-generated spec) without
+// prefix-matching strings at every call site.
+function isAi(id) { return aiTemplates.isAi(id); }
 
 // ── Validation ──
 //
@@ -217,6 +247,7 @@ module.exports = {
   listTemplates,
   getCatalog, getNormalized, getCanvas, getCanvasMaster, getGlobalCanvasRules,
   getSupportedAspectRatios,
+  isAi,
   validateInputAgainstTemplate,
   resolveStyleBindings,
   getPath, isPresent,

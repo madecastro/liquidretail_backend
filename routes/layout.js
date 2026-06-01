@@ -34,16 +34,41 @@ router.post('/', express.json(), async (req, res) => {
     const input = await buildLayoutInput({
       mediaId, template, aspectRatio, options: options || {}, refresh: !!refresh
     });
-    const validation = registry.validateInputAgainstTemplate(input, template);
+
+    // AI templates skip the hand-authored validation block (the AI
+    // spec is validated by aiCanvasSpecService.validateSpec instead),
+    // and the canvas comes from the LLM, not the static schema.
+    const isAi = registry.isAi(template);
+    const validation = isAi ? { ok: true, template_id: template, ai: true } : registry.validateInputAgainstTemplate(input, template);
 
     const response = { input, validation };
     if (req.query.include === 'canvas') {
-      response.canvas = registry.getCanvas(template, aspectRatio);
-      // Resolved style_bindings — walked source_priority chain, defaults
-      // applied. Returned alongside canvas because the renderer reads
-      // both together; saves a second round-trip and keeps the contract
-      // co-located with the spatial spec.
-      response.style_bindings = registry.resolveStyleBindings(input, template);
+      if (isAi) {
+        const Media = require('../models/Media');
+        const m = await Media.findById(mediaId).select('advertiserId brandId').lean();
+        const aiSvc = require('../services/aiCanvasSpecService');
+        const aiNorm = registry.getNormalized(template);
+        const result = await aiSvc.getOrGenerate({
+          input,
+          template,
+          aspectRatio,
+          creativeStyle: aiNorm?.creativeStyle || 'brand_led',
+          mediaId,
+          productId:           (options && options.productId)   || null,
+          variantKind:         (options && options.variantKind) || null,
+          paletteSource:       (options && options.paletteSource) || 'media',
+          advertiserId:        m?.advertiserId || null,
+          brandId:             m?.brandId      || null,
+          refresh:             !!refresh
+        });
+        response.canvas = result.spec;
+        response.style_bindings = resolveAiBindings(result.spec.style_bindings || {}, input);
+        response.ai_artifact_id = result.artifactId;
+        response.ai_warnings    = result.warnings || [];
+      } else {
+        response.canvas = registry.getCanvas(template, aspectRatio);
+        response.style_bindings = registry.resolveStyleBindings(input, template);
+      }
     }
 
     if (!validation.ok && !(options && options.allow_invalid)) {
@@ -79,11 +104,36 @@ router.get('/by-id/:id', async (req, res) => {
   try {
     const artifact = await LayoutInputArtifact.findOne(tenantFilter(req, { _id: req.params.id })).lean();
     if (!artifact) return res.status(404).json({ error: 'layout input artifact not found' });
-    const response = {
-      input:          artifact.input,
-      canvas:         registry.getCanvas(artifact.template, artifact.aspectRatio),
-      style_bindings: registry.resolveStyleBindings(artifact.input, artifact.template)
-    };
+
+    let canvas, style_bindings, ai_artifact_id, ai_warnings;
+    if (registry.isAi(artifact.template)) {
+      const aiSvc = require('../services/aiCanvasSpecService');
+      const aiNorm = registry.getNormalized(artifact.template);
+      const result = await aiSvc.getOrGenerate({
+        input:           artifact.input,
+        template:        artifact.template,
+        aspectRatio:     artifact.aspectRatio,
+        creativeStyle:   aiNorm?.creativeStyle || 'brand_led',
+        mediaId:         artifact.mediaId,
+        productId:       artifact.productId,
+        variantKind:     artifact.variantKind,
+        campaignContextHash: artifact.campaignContextHash,
+        paletteSource:   artifact.paletteSource,
+        advertiserId:    artifact.advertiserId,
+        brandId:         artifact.brandId,
+        refresh:         false
+      });
+      canvas         = result.spec;
+      style_bindings = resolveAiBindings(result.spec.style_bindings || {}, artifact.input);
+      ai_artifact_id = result.artifactId;
+      ai_warnings    = result.warnings || [];
+    } else {
+      canvas         = registry.getCanvas(artifact.template, artifact.aspectRatio);
+      style_bindings = registry.resolveStyleBindings(artifact.input, artifact.template);
+    }
+
+    const response = { input: artifact.input, canvas, style_bindings };
+    if (ai_artifact_id) { response.ai_artifact_id = ai_artifact_id; response.ai_warnings = ai_warnings; }
     res.json(response);
   } catch (err) {
     console.error(`❌ GET /api/layout-input/by-id/${req.params.id} failed: ${err.message}`);
@@ -148,5 +198,21 @@ router.get('/meta', (req, res) => {
     global_canvas_rules: registry.getGlobalCanvasRules()
   });
 });
+
+// Resolve the AI spec's flat style_bindings shape
+// ({ name: 'brand.primary_color' | '#FFCC55' }) against the canonical
+// input — hex literals pass through, dotted paths read from input.
+// Mirrors the helper in routes/aiCanvasSpec.js; duplicated to keep
+// the dependency direction shallow.
+function resolveAiBindings(bindings, input) {
+  const out = {};
+  for (const [name, raw] of Object.entries(bindings || {})) {
+    if (typeof raw !== 'string') continue;
+    if (raw.startsWith('#')) { out[name] = raw; continue; }
+    const v = raw.split('.').reduce((acc, k) => (acc == null ? null : acc[k]), input);
+    if (v != null && v !== '') out[name] = v;
+  }
+  return out;
+}
 
 module.exports = router;
