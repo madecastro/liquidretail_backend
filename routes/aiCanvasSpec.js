@@ -21,11 +21,14 @@
 
 const express = require('express');
 const router  = express.Router();
+const mongoose = require('mongoose');
 
 const { buildLayoutInput } = require('../services/layoutInputService');
 const { getOrGenerate, CREATIVE_STYLES } = require('../services/aiCanvasSpecService');
 const { assertMediaInTenant } = require('../middleware/tenantHelpers');
-const Media = require('../models/Media');
+const Media             = require('../models/Media');
+const AiCanvasArtifact  = require('../models/AiCanvasArtifact');
+const LayoutInputArtifact = require('../models/LayoutInputArtifact');
 
 const DEFAULT_SOURCE_TEMPLATE = 'ugc_split_screen';
 
@@ -85,5 +88,96 @@ router.post('/test', express.json(), async (req, res) => {
     res.status(status).json({ error: err.message || 'spec generation failed' });
   }
 });
+
+// GET /api/ai-layouts/spec/by-artifact/:id
+// Returns the stored canvas spec + the canonical layout input ready
+// for the renderer. The preview page hits this on load to get
+// everything drawTpCanvas needs. Tenant-scoped via advertiserId on
+// the artifact.
+router.get('/by-artifact/:id', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'invalid artifact id' });
+    }
+    const filter = { _id: req.params.id };
+    if (req.advertiserId) filter.advertiserId = new mongoose.Types.ObjectId(req.advertiserId);
+    const art = await AiCanvasArtifact.findOne(filter).lean();
+    if (!art) return res.status(404).json({ error: 'artifact not found' });
+
+    // Re-fetch the canonical input artifact (or rebuild) using the
+    // same partition key. We borrow ugc_split_screen as the source
+    // template — same approach the test endpoint uses; the input
+    // shape is template-independent.
+    const inputArt = await LayoutInputArtifact.findOne({
+      mediaId:             art.mediaId,
+      template:            'ugc_split_screen',
+      aspectRatio:         art.aspectRatio,
+      productId:           art.productId,
+      variantKind:         art.variantKind,
+      campaignContextHash: art.campaignContextHash,
+      paletteSource:       art.paletteSource
+    }).lean();
+
+    let input = inputArt?.input || null;
+    if (!input) {
+      input = await buildLayoutInput({
+        mediaId:     art.mediaId,
+        template:    'ugc_split_screen',
+        aspectRatio: art.aspectRatio,
+        options: {
+          productId:     art.productId,
+          variantKind:   art.variantKind,
+          paletteSource: art.paletteSource
+        },
+        refresh: false
+      });
+    }
+
+    // Resolve the spec's style_bindings against the input. The AI
+    // spec uses the simpler flat shape "name": "path.to.value" — walk
+    // each entry; hex literals (starting with '#') pass through,
+    // dotted paths read from input. Anything unresolved is dropped
+    // so the renderer falls back to its CSS defaults.
+    const resolvedBindings = resolveAiSpecBindings(art.canvasSpec?.style_bindings || {}, input);
+
+    res.json({
+      artifactId:        String(art._id),
+      mediaId:           String(art.mediaId),
+      template:          art.template,
+      creativeStyle:     art.creativeStyle,
+      aspectRatio:       art.aspectRatio,
+      productId:         art.productId ? String(art.productId) : null,
+      variantKind:       art.variantKind,
+      paletteSource:     art.paletteSource,
+      spec:              art.canvasSpec,
+      input,
+      resolvedBindings,
+      rationale:         art.rationale,
+      elementsUsed:      art.elementsUsed,
+      elementsSkipped:   art.elementsSkipped,
+      validationWarnings: art.validationWarnings || [],
+      createdAt:         art.createdAt
+    });
+  } catch (err) {
+    console.error('ai-layouts/spec/by-artifact failed:', err);
+    res.status(500).json({ error: err.message || 'fetch failed' });
+  }
+});
+
+function resolveAiSpecBindings(bindings, input) {
+  const out = {};
+  for (const [name, raw] of Object.entries(bindings || {})) {
+    if (typeof raw !== 'string') continue;
+    if (raw.startsWith('#')) { out[name] = raw; continue; }
+    const v = getInputPath(input, raw);
+    if (v != null && v !== '') out[name] = v;
+  }
+  return out;
+}
+
+function getInputPath(obj, path) {
+  if (!obj || typeof path !== 'string') return null;
+  return path.split('.').reduce((acc, k) => (acc == null ? null : acc[k]), obj);
+}
 
 module.exports = router;
