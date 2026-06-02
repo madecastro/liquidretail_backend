@@ -39,7 +39,7 @@ const { loadContext } = require('./layoutInputService');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.1.0';   // 2.1: optional clipPolygon per zone (renderer applies CSS clip-path)
+const SPEC_SCHEMA_VERSION = '2.2.0';   // 2.2: composition archetypes, expanded slots (social_context/stats/comments), scaler clamp [0.5, 3.0]
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -63,18 +63,47 @@ const ALLOWED_ZONE_KINDS = [
 ];
 
 // Allowed slot paths the renderer's slot_adapter can resolve. Match
-// the canonical-input schema keys at layoutInputService output.
+// the canonical-input schema keys at layoutInputService output + the
+// grafted social_context / campaign nodes that getOrGenerate injects
+// from richContext before passing input to the renderer.
 const ALLOWED_SLOTS = [
+  // Brand
   'brand.logo', 'brand.name', 'brand.tagline',
+  // Copy (with picks already applied at this point)
   'copy.headline', 'copy.subheadline', 'copy.eyebrow', 'copy.cta_text',
+  'copy.headline_lead', 'copy.headline_main',
+  // CTA
   'cta.text', 'cta.url', 'cta',
-  'product.name', 'product.price', 'product.image',
+  // Product (canonical input.product)
+  'product.name', 'product.price', 'product.description', 'product.category',
+  'product.image',
   'product.hero_media', 'product.lifestyle_image', 'product.product_image',
-  'product.badges',
+  'product.badges', 'product.short_benefits',
+  'product.rating', 'product.review_count', 'product.review_summary',
+  'product.reviews.0.text', 'product.reviews.0.author', 'product.reviews.0.rating',
+  // Social proof (canonical)
   'social_proof.primary_quote', 'social_proof.primary_quote.text',
   'social_proof.primary_quote.author_name',
   'social_proof.rating_value', 'social_proof.review_count',
-  'trust.trusted_by_text'
+  'social_proof.secondary_quotes.0.text',
+  'social_proof.secondary_quotes.0.author_name',
+  // Social context (grafted from richContext at render time — likes,
+  // creator handle, top comments, caption: all real UGC signal the LLM
+  // sees in the prompt and can now place on the canvas)
+  'social_context.caption', 'social_context.permalink', 'social_context.posted_at',
+  'social_context.creator.handle', 'social_context.creator.platform',
+  'social_context.creator.follower_count',
+  'social_context.stats.likes', 'social_context.stats.comments',
+  'social_context.stats.shares', 'social_context.stats.saves',
+  'social_context.stats.reach', 'social_context.stats.engagement',
+  'social_context.top_comments.0.text', 'social_context.top_comments.0.author',
+  'social_context.top_comments.0.likes',
+  'social_context.top_comments.1.text', 'social_context.top_comments.1.author',
+  'social_context.top_comments.2.text', 'social_context.top_comments.2.author',
+  // Trust
+  'trust.trusted_by_text',
+  // Campaign
+  'campaign.offer', 'campaign.kind'
 ];
 
 // JSON Schema we hand OpenAI via response_format. Constrains zone
@@ -105,11 +134,15 @@ function buildResponseSchema(aspectRatio) {
 
   const safeAreaProps = Object.fromEntries(SAFE_AREA_NAMES.map(n => [n, { anyOf: [{ $ref: '#/$defs/rect' }, { type: 'null' }] }]));
   const styleBindingProps = Object.fromEntries(STYLE_BINDING_NAMES.map(n => [n, { type: ['string', 'null'] }]));
+  // font is a MULTIPLIER (1.0 = baseline, 1.5 = 150%). Clamp to [0.5, 3.0]
+  // at the schema layer so an out-of-range value can't silently torch a
+  // zone's text size at render time. Validator also warns + clamps as
+  // a belt-and-braces guard for cached specs from older models.
   const zoneScalerProps = Object.fromEntries(ZONE_SCALER_NAMES.map(n => [n, {
     type: ['object', 'null'],
     additionalProperties: false,
     required: ['font'],
-    properties: { font: { type: ['number', 'null'] } }
+    properties: { font: { type: ['number', 'null'], minimum: 0.5, maximum: 3.0 } }
   }]));
 
   return {
@@ -271,69 +304,79 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     `Every zone gets a rect, a kind, a layer, and (when it carries content) a slot path the renderer resolves against the input data.`,
     ``,
     `ZONE PALETTE (pick what serves the creative — none are mandatory): logo, cta, headline, support_media, panel, eyebrow_rules, proof_bar, quote_card, product_card, badge_row, text.`,
-    `Compose freely — an editorial frame can skip the logo, a pure hero-quote can skip the product_card, a typographic ad can skip support_media. Choose the zone set that makes the strongest creative for this brand + product + media.`,
+    `Compose freely — an editorial frame can skip the logo, a pure hero-quote can skip the product_card, a typographic ad can skip support_media.`,
     ``,
-    `Slot paths must come from the allowed set. If a slot expects an array (e.g. product_card), pass an array of paths in slot.`,
+    `COMPOSITION ARCHETYPES — pick (or mix) one that suits the brand voice, hero image, and the rest of the FULL CONTEXT below. Do NOT default to the same archetype every time; vary based on which strongest signal the data offers (great photo? lead with hero. great quote? lead with quote. high engagement? lead with the stat).`,
+    `  A) FULL-BLEED HERO + BOTTOM PANEL — support_media fills canvas; headline sits on a brand-color panel band along the bottom 25–35%. Safe default, works for any photo.`,
+    `  B) VERTICAL SPLIT — image and brand panel each take ~50%, side-by-side. Strong for product reveals.`,
+    `  C) DIAGONAL CARVE — use clipPolygon to split the canvas at an angle. Hero on one side, brand panel on the other. Energetic, magazine-like.`,
+    `  D) TYPOGRAPHIC DOMINANT — headline is the hero (covers 50%+ of canvas), support_media reduced to a small inset or omitted. For category-creation / brand-voice messaging.`,
+    `  E) HERO QUOTE OVERLAY — full-bleed hero image, a quote_card overlaid on a safe_overlay_zone. UGC + creator quote leads; product details minimal. Best when social_context.top_comments or social_proof.primary_quote is rich.`,
+    `  F) MAGAZINE / EDITORIAL — eyebrow_rules + headline + body text stacked vertically over a solid panel, image inset bottom-right. Reads like print.`,
+    `  G) STAT-LED SOCIAL PROOF — a numeric stat (rating, follower count, comment count, likes, engagement) rendered as the hero element via a text zone with a slot like social_context.stats.likes. Headline secondary. Use when the social signal is the strongest selling point.`,
+    `  H) PRODUCT-CARD GRID — multiple product_card / media zones in a 2×2 or 1×3 arrangement for catalog/collection ads.`,
+    `Within an archetype: vary panel position (top/bottom/left/right/diagonal), color emphasis (brand_fill vs gradient vs split), and which zones lead. Name the archetype + your variation in your rationale.`,
     ``,
-    `REQUIRED style_variant values (the renderer falls back to a placeholder if these are missing or wrong — DO NOT omit):`,
-    `  headline      → "display_script"        (script editorial display)`,
-    `  product_card  → "with_thumbnail"        (image + name + price)`,
-    `  quote_card    → "with_thumbnail"        (quote + author + photo)`,
-    `  proof_bar     → "with_verified_buyers"  (rating + verified buyers chip)`,
-    `  eyebrow_rules, badge_row, logo, cta, panel, support_media, text → leave style_variant null`,
+    `SLOT PATHS (single string or array). The renderer reads these from the resolved input. Pick freely; don't limit yourself to the brand+headline+cta minimum.`,
+    `  Brand    → brand.logo, brand.name, brand.tagline`,
+    `  Copy     → copy.headline, copy.subheadline, copy.eyebrow, copy.cta_text, copy.headline_lead, copy.headline_main`,
+    `  CTA      → "cta" (full object) or cta.text / cta.url`,
+    `  Product  → product.name, product.price, product.description, product.category,`,
+    `             product.image, product.hero_media, product.lifestyle_image, product.product_image,`,
+    `             product.badges, product.short_benefits, product.rating, product.review_count,`,
+    `             product.review_summary, product.reviews.0.text, product.reviews.0.author`,
+    `  Social   → social_proof.primary_quote(.text/.author_name), social_proof.rating_value,`,
+    `             social_proof.review_count, social_proof.secondary_quotes.0.text,`,
+    `             social_context.caption, social_context.permalink,`,
+    `             social_context.creator.handle, social_context.creator.follower_count,`,
+    `             social_context.stats.likes, social_context.stats.comments, social_context.stats.shares,`,
+    `             social_context.stats.engagement,`,
+    `             social_context.top_comments.0.text/.0.author (also .1 and .2)`,
+    `  Trust    → trust.trusted_by_text`,
+    `  Campaign → campaign.offer, campaign.kind`,
     ``,
-    `SLOT SHAPES — pass the exact path(s) the renderer expects:`,
-    `  logo          → "brand.logo"`,
-    `  headline      → "copy.headline"`,
-    `  eyebrow_rules → ["copy.subheadline", "brand.tagline"]   (array)`,
-    `  proof_bar     → ["social_proof.rating_value", "social_proof.review_count"]   (array)`,
+    `SLOT SHAPES — these are the only zones with a fixed array shape; everything else takes a single path:`,
     `  product_card  → ["product.image", "product.name", "product.price"]   (array, exactly this order)`,
-    `  quote_card    → "social_proof.primary_quote"`,
-    `  support_media → "product.hero_media"`,
-    `  cta           → "cta"`,
-    `  panel         → null`,
+    `  eyebrow_rules → ["copy.subheadline", "brand.tagline"]   (array — renderer picks the first that resolves)`,
+    `  proof_bar     → ["social_proof.rating_value", "social_proof.review_count"]   (array)`,
     ``,
-    `STYLE BINDINGS — surfaces use brand color PATHS; text colors on top of those surfaces must be EXPLICIT HEX values so the rendered text is readable. The renderer has NO contrast guard for AI templates, so null means "fall through to CSS default" which may not contrast with whatever surface the text sits on.`,
+    `STYLE_VARIANT (shape hint, per zone). These exist for the renderer's enriched modes — leave null when you want plain text/image rendering:`,
+    `  text / headline   → "display_script" (script editorial) | null (plain large type — picks the brand font)`,
+    `  product_card      → "with_thumbnail" (image left + name+price right)`,
+    `  quote_card        → "with_thumbnail" (quote + author + photo)`,
+    `  proof_bar         → "with_verified_buyers" (rating + verified buyers chip)`,
+    `  Everything else   → null`,
     ``,
-    `CRITICAL: text zones do NOT get their own background. The headline text sits directly on whatever surface its rect overlaps with — typically panel_bg, or the support_media image if it overlaps that zone. Do not create panel zones with kind='panel' behind a headline as a "scrim." If you want a darker reading surface for text, use kind='panel' explicitly in the spec with its own slot=null and rect, and pick the panel's background via the canvas.background.style + panel_bg. Then position the headline rect inside that panel.`,
+    `ZONE_SCALERS — multipliers, NOT pixel sizes. 1.0 = baseline (the canvas-spec default). 1.5 = 150%, 0.8 = 80%. Hard range [0.5, 3.0]. Use sparingly to amplify ONE zone for emphasis. Default to null when you don't need to scale.`,
     ``,
-    `For brand-led direction (panel_bg is brand.primary_color — typically a saturated brand color, usually dark or mid-tone):`,
-    `  panel_bg            → "brand.primary_color"     (dominant brand surface — the colored panel)`,
-    `  panel_text_color    → "#FFFFFF"                 (eyebrow + panel-level text on brand panel)`,
-    `  headline_text_color → "#FFFFFF"                 (display headline on brand panel)`,
-    `  card_bg             → "#FFFFFF"                 (product/quote cards as clean WHITE cards floating on the brand panel — best brand-led look)`,
-    `  card_text_color     → "#0A0A0A"                 (card text on white card)`,
-    `  cta_button_bg       → "brand.accent_color"      (CTA pops against the panel)`,
-    `  cta_text_color      → "#FFFFFF"                 (text on accent-colored CTA)`,
-    `  accent_border_color → "brand.primary_color"     (IMPORTANT: this binding is also the product-card price color — must contrast with card_bg=#FFFFFF; brand.accent_color is typically too light. Use brand.primary_color or a literal dark hex like "#0A0A0A".)`,
-    `  font_family_body    → null`,
-    `  font_family_display → null`,
+    `STYLE BINDINGS — surfaces should use brand color PATHS so the rendered ad inherits the actual brand identity. Text colors must be EXPLICIT HEX values picked for contrast (the AI-template path has no contrast guard, so null falls through to the CSS default).`,
+    `  Surface bindings (paths preferred):`,
+    `    panel_bg, card_bg     → "brand.primary_color" | "brand.secondary_color" | "#FFFFFF" | "#0A0A0A"`,
+    `    cta_button_bg         → "brand.accent_color" | "brand.primary_color"`,
+    `    accent_border_color   → "brand.primary_color" (used as product-card price color too — must contrast with card_bg)`,
+    `    font_family_body / font_family_display → "brand.font_family" when present, else null`,
+    `  Text bindings (explicit hex):`,
+    `    panel_text_color, headline_text_color, card_text_color, cta_text_color → "#FFFFFF" / "#0A0A0A" / etc.`,
     ``,
-    `If you choose a WHITE-panel direction instead (panel_bg: "#FFFFFF"):`,
-    `  panel_bg            → "#FFFFFF"`,
-    `  panel_text_color    → "#0A0A0A"  (eyebrow becomes dark on white)`,
-    `  headline_text_color → "#0A0A0A"  (display headline becomes dark on white)`,
-    `  card_bg             → "brand.primary_color"  (cards become the brand color now)`,
-    `  card_text_color     → "#FFFFFF"`,
-    `  cta_button_bg       → "brand.accent_color"`,
-    `  cta_text_color      → "#0A0A0A" if accent is light, else "#FFFFFF"`,
-    `  accent_border_color → "brand.primary_color"   (still must contrast with card_bg — brand.primary now provides it on the dark card)`,
-    `Don't leave text colors null — the AI-template path has no auto-contrast.`,
+    `DO NOT invent a "brand-feeling" hex for panel_bg. The brand has a primary_color in the FULL CONTEXT — use the PATH "brand.primary_color" so the rendered ad matches the real brand identity. Picking a literal hex from the photo (cream, yellow, etc.) is almost always wrong.`,
     ``,
-    `CANVAS BACKGROUND.STYLE — pick based on whether support_media spans the full frame:`,
-    `  full-bleed hero            → "solid" with panel_bg null (let media cover)`,
-    `  split panel (half-frame)   → "split_panel"`,
-    `  brand-color dominated      → "brand_fill"`,
-    `  gradient between two brand colors → "gradient"`,
+    `CANVAS BACKGROUND.STYLE — pick based on the chosen archetype:`,
+    `  full-bleed hero (A/E)              → "solid" with panel_bg null (let media cover)`,
+    `  split panel (B/F)                  → "split_panel"`,
+    `  brand-color dominated (D/G)        → "brand_fill"`,
+    `  diagonal carve (C)                 → "solid" (clipPolygon does the work)`,
+    `  gradient between two brand colors  → "gradient"`,
     ``,
-    `POLYGON CLIPPING (zone.clipPolygon) — every zone has an optional clipPolygon: an array of {x, y} points in canvas coords (0-1000) that clips the zone's visible region to a polygon AFTER rect placement. Use cases:`,
-    `  - Carve a full-bleed support_media around copy regions: set support_media rect to the full canvas, then clipPolygon defines an L-shape or angled cut that exposes a copy panel underneath.`,
-    `  - Diagonal panel splits instead of horizontal/vertical 50/50.`,
-    `  - Polygon-shaped product callouts (hexagons, parallelograms).`,
-    `  - Carve around source_media.subjects bboxes so faces / hero products read clean.`,
-    `Pass null when you want a plain rectangular zone (default). When you DO set clipPolygon: 3-16 points, all within the canvas, ordered clockwise OR counter-clockwise. Renderer converts to CSS clip-path; the rect still drives positioning + the zone's "click target" / collision area.`,
+    `POLYGON CLIPPING (zone.clipPolygon) — array of {x,y} points in canvas coords (0–1000) that clips the zone's visible region AFTER rect placement. 3–16 points, all in-canvas. Use cases:`,
+    `  - Carve a full-bleed support_media around copy regions (archetype C, sometimes A).`,
+    `  - Diagonal panel splits.`,
+    `  - Polygon-shaped product callouts.`,
+    `  - Avoid source_media.subjects bboxes when carving.`,
+    `Pass null for plain rectangular zones (most zones don't need a polygon).`,
     ``,
-    `Return creative_style + rationale + elements_used + elements_skipped so the validator can verify your picks are coherent.`
+    `CRITICAL: text zones (kind=text, headline, eyebrow_rules, etc.) do NOT get their own background. Text sits directly on whatever surface its rect overlaps. If you want a darker reading surface, add an explicit kind='panel' zone with its own rect + panel_bg, then position the text rect INSIDE that panel.`,
+    ``,
+    `Return creative_style + rationale + elements_used + elements_skipped. In rationale, name the chosen archetype (A–H) + why the FULL CONTEXT pointed to it.`
   ].join('\n');
 
   // Rich-context user payload. JSON-formatted so the LLM can read
@@ -469,6 +512,31 @@ function validateSpec(spec, aspectRatio) {
     if (!ids.has(id)) warnings.push(`elements_used names a zone not in spec.zones: ${id}`);
   }
 
+  // zone_scalers belt-and-braces: schema already restricts font to
+  // [0.5, 3.0] but cached older specs (2.1.0) may carry pixel-size
+  // values. Clamp + warn so the renderer never sees a runaway scaler.
+  for (const [name, entry] of Object.entries(spec.zone_scalers || {})) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (typeof entry.font === 'number' && (entry.font < 0.5 || entry.font > 3.0)) {
+      warnings.push(`zone_scaler ${name}.font ${entry.font} out of range — clamped to [0.5, 3.0]`);
+      entry.font = Math.max(0.5, Math.min(3.0, entry.font));
+    }
+  }
+
+  // Brand-identity sanity: panel_bg / card_bg as a literal hex when a
+  // brand color path is available almost always means the LLM cherry-
+  // picked a "brand-feeling" color from the photo instead of using
+  // the actual brand identity. Warn so the judge / operator can see it.
+  // The check is style-binding only — we don't know what brand.* is
+  // here, so we just flag literal hex picks on the dominant surfaces.
+  const sb = spec.style_bindings || {};
+  for (const k of ['panel_bg', 'card_bg']) {
+    const v = sb[k];
+    if (typeof v === 'string' && v.startsWith('#') && !['#FFFFFF', '#FFF', '#000', '#000000', '#0A0A0A', '#F5F5F5'].includes(v.toUpperCase())) {
+      warnings.push(`${k} is a non-neutral literal hex "${v}" — prefer a brand.* path so the surface inherits brand identity`);
+    }
+  }
+
   return warnings;
 }
 
@@ -547,11 +615,21 @@ async function getOrGenerate({
   } catch (err) {
     console.warn(`   ⚠️  aiCanvasSpec rich-context build failed (using minimal fallback): ${err.message}`);
   }
-  // Stamp candidates onto the working input so applyCopyPicks (and
-  // any downstream caller) can resolve picks against the same input.
-  const inputWithCandidates = richContext?.text?.copy_candidates
-    ? { ...input, copy_candidates: richContext.text.copy_candidates }
-    : input;
+  // Stamp candidates + social/campaign extras onto the working input
+  // so applyCopyPicks AND the renderer can resolve slot paths like
+  // social_context.stats.likes / campaign.offer / social_context.top_comments.0.text
+  // that the canonical layoutInput shape doesn't normally carry.
+  // Canonical input.product wins over richContext.text.product for any
+  // overlapping keys (canonical has hero_media / image / lifestyle_image
+  // objects the LLM expects; richContext flattens those to *_present flags).
+  const rcText = richContext?.text || {};
+  const inputWithCandidates = {
+    ...input,
+    copy_candidates: rcText.copy_candidates || input.copy_candidates,
+    social_context:  rcText.social_context  || input.social_context || null,
+    campaign:        { ...(rcText.campaign || {}), ...(input.campaign || {}) },
+    product:         { ...(rcText.product  || {}), ...(input.product  || {}) }
+  };
 
   if (!refresh) {
     const cached = await AiCanvasArtifact.findOne(filter).lean();
