@@ -39,7 +39,7 @@ const { loadContext } = require('./layoutInputService');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.0.0';   // 2.0: rich-context payload + vision attachments + pick-from-candidates
+const SPEC_SCHEMA_VERSION = '2.1.0';   // 2.1: optional clipPolygon per zone (renderer applies CSS clip-path)
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -171,7 +171,7 @@ function buildResponseSchema(aspectRatio) {
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['id', 'kind', 'slot', 'rect', 'layer', 'style_variant', 'max_lines', 'fit', 'radius'],
+            required: ['id', 'kind', 'slot', 'rect', 'layer', 'style_variant', 'max_lines', 'fit', 'radius', 'clipPolygon'],
             properties: {
               id:        { type: 'string' },
               kind:      { type: 'string', enum: ALLOWED_ZONE_KINDS },
@@ -190,7 +190,24 @@ function buildResponseSchema(aspectRatio) {
                 { type: 'string', enum: ['subject_preserve', 'cover', 'contain'] },
                 { type: 'null' }
               ] },
-              radius:    { type: ['integer', 'null'], minimum: 0 }
+              radius:    { type: ['integer', 'null'], minimum: 0 },
+              // Optional clip path applied AFTER the zone is positioned.
+              // Points are in canvas coords (0-1000); renderer converts
+              // to zone-relative percentages for CSS clip-path. Use for
+              // carving media zones around copy regions, creating
+              // angled panels, or non-rectangular shapes. null = no
+              // clip (renderer falls back to the rect's natural box).
+              clipPolygon: {
+                anyOf: [
+                  { type: 'null' },
+                  {
+                    type: 'array',
+                    minItems: 3,
+                    maxItems: 16,
+                    items: { $ref: '#/$defs/point' }
+                  }
+                ]
+              }
             }
           }
         },
@@ -217,6 +234,15 @@ function buildResponseSchema(aspectRatio) {
             y: { type: 'integer', minimum: 0, maximum: 1000 },
             w: { type: 'integer', minimum: 1, maximum: 1000 },
             h: { type: 'integer', minimum: 1, maximum: 1000 }
+          }
+        },
+        point: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['x', 'y'],
+          properties: {
+            x: { type: 'integer', minimum: 0, maximum: 1000 },
+            y: { type: 'integer', minimum: 0, maximum: 1000 }
           }
         }
       }
@@ -299,6 +325,13 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     `  split panel (half-frame)   → "split_panel"`,
     `  brand-color dominated      → "brand_fill"`,
     `  gradient between two brand colors → "gradient"`,
+    ``,
+    `POLYGON CLIPPING (zone.clipPolygon) — every zone has an optional clipPolygon: an array of {x, y} points in canvas coords (0-1000) that clips the zone's visible region to a polygon AFTER rect placement. Use cases:`,
+    `  - Carve a full-bleed support_media around copy regions: set support_media rect to the full canvas, then clipPolygon defines an L-shape or angled cut that exposes a copy panel underneath.`,
+    `  - Diagonal panel splits instead of horizontal/vertical 50/50.`,
+    `  - Polygon-shaped product callouts (hexagons, parallelograms).`,
+    `  - Carve around source_media.subjects bboxes so faces / hero products read clean.`,
+    `Pass null when you want a plain rectangular zone (default). When you DO set clipPolygon: 3-16 points, all within the canvas, ordered clockwise OR counter-clockwise. Renderer converts to CSS clip-path; the rect still drives positioning + the zone's "click target" / collision area.`,
     ``,
     `Return creative_style + rationale + elements_used + elements_skipped so the validator can verify your picks are coherent.`
   ].join('\n');
@@ -400,6 +433,20 @@ function validateSpec(spec, aspectRatio) {
     const { x, y, w, h } = z.rect;
     if (x < 0 || y < 0 || x + w > width || y + h > height) {
       warnings.push(`zone ${z.id}: rect ${x},${y},${w}x${h} extends beyond canvas ${width}x${height}`);
+    }
+
+    // Polygon — when present, every point must be inside the canvas
+    // (CSS clip-path tolerates out-of-rect points, but out-of-canvas
+    // is almost always a bug).
+    if (Array.isArray(z.clipPolygon) && z.clipPolygon.length) {
+      if (z.clipPolygon.length < 3) {
+        warnings.push(`zone ${z.id}: clipPolygon needs ≥3 points (got ${z.clipPolygon.length})`);
+      }
+      for (const [i, pt] of z.clipPolygon.entries()) {
+        if (pt.x < 0 || pt.x > width || pt.y < 0 || pt.y > height) {
+          warnings.push(`zone ${z.id}: clipPolygon[${i}] (${pt.x},${pt.y}) outside canvas`);
+        }
+      }
     }
 
     if (['headline', 'product_card', 'quote_card'].includes(z.kind) || z.id === 'headline') {
