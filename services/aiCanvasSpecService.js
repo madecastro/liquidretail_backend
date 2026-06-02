@@ -33,11 +33,13 @@ const crypto = require('crypto');
 const OpenAI = require('openai');
 
 const AiCanvasArtifact = require('../models/AiCanvasArtifact');
+const { buildAiCanvasContext } = require('./aiCanvasInputBuilder');
+const { loadContext } = require('./layoutInputService');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '1.4.0';   // 1.4: accent_border_color must contrast with card_bg (price uses it); explicit no-text-bg rule
+const SPEC_SCHEMA_VERSION = '2.0.0';   // 2.0: rich-context payload + vision attachments + pick-from-candidates
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -117,7 +119,8 @@ function buildResponseSchema(aspectRatio) {
       additionalProperties: false,
       required: [
         'creative_style', 'rationale', 'elements_used', 'elements_skipped',
-        'aspect_ratio', 'canvas', 'safe_areas', 'zones', 'zone_scalers', 'style_bindings'
+        'aspect_ratio', 'canvas', 'safe_areas', 'zones', 'zone_scalers', 'style_bindings',
+        'copy_picks'
       ],
       properties: {
         creative_style:   { type: 'string', enum: Object.keys(CREATIVE_STYLES) },
@@ -125,6 +128,20 @@ function buildResponseSchema(aspectRatio) {
         elements_used:    { type: 'array', items: { type: 'string' } },
         elements_skipped: { type: 'array', items: { type: 'string' } },
         aspect_ratio:     { type: 'string', enum: [aspectRatio] },
+        // Picks reference indices into the corresponding
+        // copy_candidates arrays from the input. null means "skip
+        // this copy zone." Backend resolves picks → strings before
+        // returning to the renderer so the slot path stays uniform.
+        copy_picks: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['headline_pick', 'subheadline_pick', 'eyebrow_pick'],
+          properties: {
+            headline_pick:    { type: ['integer', 'null'], minimum: 0 },
+            subheadline_pick: { type: ['integer', 'null'], minimum: 0 },
+            eyebrow_pick:     { type: ['integer', 'null'], minimum: 0 }
+          }
+        },
         canvas: {
           type: 'object',
           additionalProperties: false,
@@ -209,11 +226,17 @@ function buildResponseSchema(aspectRatio) {
 }
 
 // ── Prompt construction ─────────────────────────────────────────────
-function buildPrompt({ input, template, aspectRatio, creativeStyle }) {
+function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext }) {
   const styleSpec = CREATIVE_STYLES[creativeStyle];
   if (!styleSpec) throw new Error(`Unknown creativeStyle: ${creativeStyle}`);
 
   const { width, height } = parseRatio(aspectRatio);
+
+  // Rich context — the structured payload from aiCanvasInputBuilder.
+  // Fall back to a minimal text-only block when richContext isn't
+  // present so the unit tests (and any legacy callers) still work.
+  const ctx = richContext?.text || null;
+  const images = richContext?.images || [];
 
   const system = [
     `You are a senior ad designer. You output a JSON canvas spec the deterministic renderer draws. You do not write pixels.`,
@@ -280,52 +303,50 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle }) {
     `Return creative_style + rationale + elements_used + elements_skipped so the validator can verify your picks are coherent.`
   ].join('\n');
 
-  const user = [
+  // Rich-context user payload. JSON-formatted so the LLM can read
+  // arrays + nested fields cleanly. References image[N] for vision
+  // inputs supplied as separate message parts.
+  const userLines = [
     `CREATIVE STYLE: ${creativeStyle}`,
     `INTENT: ${styleSpec.intent}`,
     `Typical zones for this style: ${styleSpec.typical_zones.join(', ')}.`,
     `De-emphasized zones: ${styleSpec.de_emphasized.join(', ')}.`,
     ``,
-    `TARGET CANVAS:`,
-    `  aspect_ratio: ${aspectRatio}`,
-    `  width:  ${width}`,
-    `  height: ${height}`,
-    ``,
-    `BRAND:`,
-    `  name:      ${JSON.stringify(input.brand?.name || null)}`,
-    `  tagline:   ${JSON.stringify(input.brand?.tagline || null)}`,
-    `  logo:      ${input.brand?.logo ? 'present' : 'none'}`,
-    `  colors:    primary=${input.brand?.primary_color || '?'}, secondary=${input.brand?.secondary_color || '?'}, accent=${input.brand?.accent_color || '?'}`,
-    `  tone:      ${JSON.stringify(input.brand?.tone || null)}`,
-    ``,
-    `PRODUCT:`,
-    `  name:      ${JSON.stringify(input.product?.name || null)}`,
-    `  price:     ${input.product?.price ?? 'n/a'} ${input.product?.currency || ''}`,
-    `  hero image: ${input.product?.hero_media?.image ? 'present' : (input.product?.image ? 'present (catalog)' : 'none')}`,
-    `  badges:    ${JSON.stringify(input.product?.badges || [])}`,
-    `  category:  ${JSON.stringify(input.product?.category || null)}`,
-    ``,
-    `COPY (LLM-derived):`,
-    `  headline:    ${JSON.stringify(input.copy?.headline || null)}`,
-    `  subheadline: ${JSON.stringify(input.copy?.subheadline || null)}`,
-    `  eyebrow:     ${JSON.stringify(input.copy?.eyebrow || null)}`,
-    `  cta_text:    ${JSON.stringify(input.cta?.text || input.copy?.cta_text || 'Shop now')}`,
-    ``,
-    `SOCIAL PROOF:`,
-    `  primary_quote: ${JSON.stringify(input.social_proof?.primary_quote?.text || null)}`,
-    `  rating:        ${input.social_proof?.rating_value ?? 'n/a'}`,
-    `  reviews:       ${input.social_proof?.review_count ?? 'n/a'}`,
-    ``,
-    `SOURCE MEDIA (background scene context):`,
-    `  setting:    ${input.media?.background?.setting || 'n/a'}`,
-    `  scene_type: ${input.media?.background?.sceneType || 'n/a'}`,
-    `  palette:    ${JSON.stringify(input.media?.background?.palette || [])}`,
-    `  mood:       ${JSON.stringify(input.media?.background?.mood || [])}`,
-    `  primary_subject: ${JSON.stringify(input.primarySubjectLabel || null)}`,
-    ``,
-    `Emit the canvas spec now. Skip elements that don't serve the chosen creative_style — record those in elements_skipped with brief reasons in rationale.`
-  ].join('\n');
+    `TARGET CANVAS: aspect_ratio=${aspectRatio}, width=${width}, height=${height}.`,
+    ``
+  ];
 
+  if (images.length) {
+    userLines.push(`VISION INPUTS (attached as image parts in this message, in order):`);
+    images.forEach((img, i) => userLines.push(`  image[${i}] — ${img.role}: ${img.label || ''}`));
+    userLines.push(``);
+    userLines.push(`Use the actual images to inform composition: where the subject sits in the hero, which regions are visually safe for text overlays, whether the brand color reads correctly against the photo's tones. Reference image[N] by role in your rationale.`);
+    userLines.push(``);
+  }
+
+  if (ctx) {
+    userLines.push(`FULL CONTEXT (structured JSON):`);
+    userLines.push('```json');
+    userLines.push(JSON.stringify(ctx, null, 2));
+    userLines.push('```');
+    userLines.push('');
+    userLines.push(`PICK COPY FROM CANDIDATES. The "copy_candidates" object holds arrays — choose by index (headline_pick, subheadline_pick, eyebrow_pick). The backend resolves the index to the actual string before rendering, so the operator-approved copy is what ships. Use null when you don't want that element.`);
+    userLines.push(``);
+    userLines.push(`USE source_media.safe_overlay_zones to position text overlays — those rects are pre-computed regions where text won't collide with subjects in the photo. Match a headline / eyebrow / cta rect to one of these zones whenever a zone overlaps the source_hero image.`);
+    userLines.push(``);
+    userLines.push(`USE source_media.subjects bboxes when carving the support_media via clipPolygon — avoid clipping over a subject. Conversely, when you DO want product/face to read through, keep that subject's bbox inside the visible region.`);
+    userLines.push(``);
+  } else {
+    // Minimal fallback for legacy callers (no rich context).
+    userLines.push(`BRAND: ${JSON.stringify(input.brand || {})}`);
+    userLines.push(`PRODUCT: ${JSON.stringify(input.product || {})}`);
+    userLines.push(`COPY: ${JSON.stringify(input.copy || {})}`);
+    userLines.push(``);
+  }
+
+  userLines.push(`Emit the canvas spec now. Skip elements that don't serve the chosen creative_style — record those in elements_skipped with brief reasons in rationale.`);
+
+  const user = userLines.join('\n');
   return { system, user };
 }
 
@@ -401,6 +422,38 @@ function validateSpec(spec, aspectRatio) {
   return warnings;
 }
 
+// Resolve the spec's copy_picks against the input's copy_candidates.
+// Mutates a SHALLOW COPY of the input — original stays untouched so
+// callers that hold a reference don't get surprised. Returns the
+// mutated copy. The renderer reads input.copy.headline / .subheadline
+// / .eyebrow as it does today; no renderer change needed.
+function applyCopyPicks(input, spec) {
+  if (!spec || !spec.copy_picks) return input;
+  const picks = spec.copy_picks;
+  const next = { ...input, copy: { ...(input.copy || {}) } };
+  const candidates = input.copy_candidates || {};
+
+  const pickOne = (arr, idx) => (
+    Array.isArray(arr) && idx != null && idx >= 0 && idx < arr.length
+      ? arr[idx]
+      : null
+  );
+
+  if (picks.headline_pick != null) {
+    const v = pickOne(candidates.headlines || [input.copy?.headline], picks.headline_pick);
+    if (v != null) next.copy.headline = v;
+  }
+  if (picks.subheadline_pick != null) {
+    const v = pickOne(candidates.subheadlines || [input.copy?.subheadline], picks.subheadline_pick);
+    if (v != null) next.copy.subheadline = v;
+  }
+  if (picks.eyebrow_pick != null) {
+    const v = pickOne(candidates.eyebrows || [input.copy?.eyebrow], picks.eyebrow_pick);
+    if (v != null) next.copy.eyebrow = v;
+  }
+  return next;
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 async function getOrGenerate({
   input,
@@ -430,16 +483,53 @@ async function getOrGenerate({
     campaignContextHash, paletteSource, creativeStyle
   };
 
+  // Build the rich context FIRST (regardless of cache) so we have
+  // copy_candidates available for applyCopyPicks. Candidates come from
+  // the current input — they're not part of the cached spec, and stale
+  // candidates would mean picks resolve against text the operator no
+  // longer sees.
+  let richContext = null;
+  try {
+    const ctx = await loadContext(mediaId, {
+      productId, variantKind, paletteSource
+    });
+    if (ctx) richContext = await buildAiCanvasContext({ ctx, layoutInput: input, aspectRatio });
+  } catch (err) {
+    console.warn(`   ⚠️  aiCanvasSpec rich-context build failed (using minimal fallback): ${err.message}`);
+  }
+  // Stamp candidates onto the working input so applyCopyPicks (and
+  // any downstream caller) can resolve picks against the same input.
+  const inputWithCandidates = richContext?.text?.copy_candidates
+    ? { ...input, copy_candidates: richContext.text.copy_candidates }
+    : input;
+
   if (!refresh) {
     const cached = await AiCanvasArtifact.findOne(filter).lean();
     if (cached && cached.specSchemaVersion === SPEC_SCHEMA_VERSION) {
-      return { spec: cached.canvasSpec, cached: true, artifactId: String(cached._id), warnings: cached.validationWarnings || [] };
+      const resolvedInput = applyCopyPicks(inputWithCandidates, cached.canvasSpec);
+      return {
+        spec:          cached.canvasSpec,
+        cached:        true,
+        artifactId:    String(cached._id),
+        warnings:      cached.validationWarnings || [],
+        resolvedInput
+      };
     }
   }
 
-  const { system, user } = buildPrompt({ input, template, aspectRatio, creativeStyle });
+  const { system, user } = buildPrompt({ input, template, aspectRatio, creativeStyle, richContext });
   const responseSchema = buildResponseSchema(aspectRatio);
   const promptHash = crypto.createHash('sha256').update(system + '\n' + user).digest('hex');
+
+  // Multi-part user content when we have vision attachments — OpenAI
+  // takes images alongside text via { type: 'image_url' } parts.
+  const images = richContext?.images || [];
+  const userContent = images.length
+    ? [
+        { type: 'text', text: user },
+        ...images.map(img => ({ type: 'image_url', image_url: { url: img.url } }))
+      ]
+    : user;
 
   const t0 = Date.now();
   const completion = await openai.chat.completions.create({
@@ -447,7 +537,7 @@ async function getOrGenerate({
     response_format: { type: 'json_schema', json_schema: responseSchema },
     messages: [
       { role: 'system', content: system },
-      { role: 'user',   content: user }
+      { role: 'user',   content: userContent }
     ],
     temperature: 0.3,
     max_tokens: 4000
@@ -490,11 +580,13 @@ async function getOrGenerate({
     { upsert: true, new: true, includeResultMetadata: false }
   );
 
-  return { spec, cached: false, artifactId: String(artifact._id), warnings };
+  const resolvedInput = applyCopyPicks(inputWithCandidates, spec);
+  return { spec, cached: false, artifactId: String(artifact._id), warnings, resolvedInput };
 }
 
 module.exports = {
   getOrGenerate,
+  applyCopyPicks,
   CREATIVE_STYLES,
   ALLOWED_ZONE_KINDS,
   ALLOWED_SLOTS,

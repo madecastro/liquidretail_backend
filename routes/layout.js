@@ -61,8 +61,12 @@ router.post('/', express.json(), async (req, res) => {
           brandId:             m?.brandId      || null,
           refresh:             !!refresh
         });
+        // Use resolvedInput (input with copy_picks applied) so the
+        // renderer reads input.copy.headline / .subheadline / .eyebrow
+        // and gets the LLM-picked candidate text.
+        response.input = result.resolvedInput || input;
         response.canvas = result.spec;
-        response.style_bindings = resolveAiBindings(result.spec.style_bindings || {}, input);
+        response.style_bindings = resolveAiBindings(result.spec.style_bindings || {}, response.input);
         response.ai_artifact_id = result.artifactId;
         response.ai_warnings    = result.warnings || [];
       } else {
@@ -105,7 +109,7 @@ router.get('/by-id/:id', async (req, res) => {
     const artifact = await LayoutInputArtifact.findOne(tenantFilter(req, { _id: req.params.id })).lean();
     if (!artifact) return res.status(404).json({ error: 'layout input artifact not found' });
 
-    let canvas, style_bindings, ai_artifact_id, ai_warnings;
+    let input, canvas, style_bindings, ai_artifact_id, ai_warnings;
     if (registry.isAi(artifact.template)) {
       const aiSvc = require('../services/aiCanvasSpecService');
       const aiNorm = registry.getNormalized(artifact.template);
@@ -123,16 +127,18 @@ router.get('/by-id/:id', async (req, res) => {
         brandId:         artifact.brandId,
         refresh:         false
       });
+      input          = result.resolvedInput || artifact.input;
       canvas         = result.spec;
-      style_bindings = resolveAiBindings(result.spec.style_bindings || {}, artifact.input);
+      style_bindings = resolveAiBindings(result.spec.style_bindings || {}, input);
       ai_artifact_id = result.artifactId;
       ai_warnings    = result.warnings || [];
     } else {
+      input          = artifact.input;
       canvas         = registry.getCanvas(artifact.template, artifact.aspectRatio);
       style_bindings = registry.resolveStyleBindings(artifact.input, artifact.template);
     }
 
-    const response = { input: artifact.input, canvas, style_bindings };
+    const response = { input, canvas, style_bindings };
     if (ai_artifact_id) { response.ai_artifact_id = ai_artifact_id; response.ai_warnings = ai_warnings; }
     res.json(response);
   } catch (err) {
