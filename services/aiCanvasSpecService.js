@@ -52,8 +52,51 @@ const CREATIVE_STYLES = {
       "Hero media (lifestyle / on-model shot) covers most of the frame.",
     typical_zones:    ['logo', 'headline', 'eyebrow_rules', 'support_media', 'panel', 'product_card', 'cta'],
     de_emphasized:    ['quote_card', 'proof_bar', 'badge_row']
+  },
+
+  ugc_led: {
+    intent:
+      "The source UGC photo IS the ad — full bleed, the photo's atmosphere and authenticity are the entire creative. " +
+      "Brand presence is minimal: small logo chip, no large brand panel. " +
+      "Creator attribution is visible (handle, platform, maybe follower count). " +
+      "Copy is short and overlay-style on a safe zone — no panel scrims unless legibility demands it. " +
+      "CTA is secondary or minimal — the photo + creator do the selling.",
+    typical_zones:    ['support_media', 'logo', 'creator', 'headline', 'cta'],
+    de_emphasized:    ['panel', 'product_card', 'badge_row', 'proof_bar']
+  },
+
+  social_proof_led: {
+    intent:
+      "Real social signal is the hero element. The strongest piece of data the FULL CONTEXT carries (a glowing comment, a high rating, a big follower/engagement number, a featured testimonial) becomes the visual anchor — placed center, large, the first thing the eye reads. " +
+      "Product is supporting; brand panel is small or absent. " +
+      "If social_context.top_comments has rich entries, surface one as a quote_card or floating comment. " +
+      "If social_context.stats.likes / .engagement is high, surface it as a stat_hero. " +
+      "If social_proof.rating_value is strong, surface it as a star rating with the review count beside it.",
+    typical_zones:    ['quote_card', 'proof_bar', 'support_media', 'headline', 'cta', 'logo'],
+    de_emphasized:    ['eyebrow_rules', 'badge_row']
+  },
+
+  editorial: {
+    intent:
+      "Magazine-spread aesthetic. Typography is the hero — large display headline, optional eyebrow with rule, body-copy block (product.description or short_benefits). " +
+      "Image is inset or framed (not full-bleed). " +
+      "Generous negative space. " +
+      "Color palette restrained — one accent against neutrals. " +
+      "Reads like a feature article, not a sales ad.",
+    typical_zones:    ['eyebrow_rules', 'headline', 'text', 'support_media', 'logo', 'cta'],
+    de_emphasized:    ['proof_bar', 'badge_row', 'quote_card']
+  },
+
+  promotional: {
+    intent:
+      "Offer-first. The discount / sale / bundle is the visual hero — a sticker badge, ribbon, or large numeric callout dominates. " +
+      "Product image present and clearly tied to the offer. " +
+      "Urgency cues (limited time, save X%) read at a glance. " +
+      "Bright contrast, attention-grabbing CTA. " +
+      "Bind campaign.offer to a prominent zone.",
+    typical_zones:    ['offer', 'product_card', 'cta', 'support_media', 'badge_row', 'logo', 'headline'],
+    de_emphasized:    ['quote_card', 'text', 'eyebrow_rules']
   }
-  // Phase 1b adds: product_led, social_proof_led, editorial, ugc_led, promotional.
 };
 
 // Allowed zone kinds the renderer knows how to draw.
@@ -150,10 +193,17 @@ function buildResponseSchema(aspectRatio) {
     schema: {
       type: 'object',
       additionalProperties: false,
+      // ORDER MATTERS: LLMs emit properties left-to-right. hierarchy_spec
+      // comes FIRST so the model commits to strategy + layout_family
+      // BEFORE drawing zones — otherwise hierarchy becomes post-hoc
+      // commentary on whatever the model already drew, and every ad
+      // collapses to hero_product. (Confirmed empirically: 2.3.0 with
+      // hierarchy_spec last → 16/16 hero_product.)
       required: [
+        'hierarchy_spec',
         'creative_style', 'rationale', 'elements_used', 'elements_skipped',
         'aspect_ratio', 'canvas', 'safe_areas', 'zones', 'zone_scalers', 'style_bindings',
-        'copy_picks', 'hierarchy_spec'
+        'copy_picks'
       ],
       properties: {
         creative_style:   { type: 'string', enum: Object.keys(CREATIVE_STYLES) },
@@ -450,8 +500,10 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     ``,
     `Return creative_style + rationale + elements_used + elements_skipped. In rationale, name the chosen archetype (A–H) + why the FULL CONTEXT pointed to it.`,
     ``,
-    `── HIERARCHY SPEC (additional output, shadow today) ──`,
-    `Alongside the canvas spec, also emit a hierarchy_spec describing the SAME ad at a higher level of abstraction. Think of it as your design notes — what you'd hand a designer if they were doing the geometry themselves. No coordinates here; just strategy + visual intent + per-role hierarchy.`,
+    `── HIERARCHY SPEC (decide this FIRST) ──`,
+    `Before drawing any zones, decide the hierarchy_spec — strategy + layout_family + visual_direction + per-role hierarchy. Then draw zones[] to SATISFY that hierarchy. The schema's required order puts hierarchy_spec first for exactly this reason; commit to the strategy, then build the canvas to express it.`,
+    ``,
+    `IMPORTANT: do not default to "brand-led / hero_product / panel-at-bottom / pill CTA / no social proof" every time. Look at the FULL CONTEXT — if it has rich comments, lead with comments. If it has high engagement stats, lead with the stat. If the photo is the strongest signal, lead with the photo. If the brand voice is the strongest signal, lead with typography. The variety should come from MATCHING the strategy to the data, not from picking one safe default.`,
     ``,
     `OPEN VOCABULARY: pick the value that best describes your decision. The example values below are anchors, NOT enums — if you need a new term that fits better, use it. We're collecting the vocabulary you naturally pick.`,
     ``,
@@ -771,7 +823,10 @@ async function getOrGenerate({
       { role: 'system', content: system },
       { role: 'user',   content: userContent }
     ],
-    temperature: 0.3,
+    // 0.9 — creative work needs real variance. 0.3 collapses 16 ads
+    // into 16 hero_product compositions; 0.9 lets the LLM actually
+    // pick differently per (media, product, style) combination.
+    temperature: 0.9,
     max_tokens: 4000
   });
   const elapsedMs = Date.now() - t0;

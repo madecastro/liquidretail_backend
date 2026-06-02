@@ -10,17 +10,57 @@
 // enough that campaignAdsGenerationService's cartesian iteration
 // (registry.getNormalized + tpl.aspect_ratios?.supported) just works.
 
+// Each entry maps 1:1 to a creativeStyle in aiCanvasSpecService's
+// CREATIVE_STYLES map. The operator picks which to enable per campaign
+// in Step 3; the wizard fans out across enabled templates, so picking
+// 3 of them on a 4-media campaign emits 12 ads spanning 3 different
+// creative directions. Variety comes from the operator's pick set
+// (and the LLM's freedom within each style), not from a single
+// "do something different" knob.
 const AI_TEMPLATES = {
   ai_brand_led: {
     label:       'AI: Brand-led',
-    description: 'AI-generated layout. Brand colors + logo + hero media dominate; small product card + CTA.',
+    description: 'Brand colors + logo + hero media dominate; product is supporting.',
     creativeStyle: 'brand_led',
-    aspect_ratios: {
-      supported: ['1:1'],          // Phase 1c: 1:1 only.
-      preferred: ['1:1']
-    },
+    aspect_ratios: { supported: ['1:1'], preferred: ['1:1'] },
     variants: ['ugc', 'product_image'],
-    derivationTemplate: 'ugc_split_screen'   // base template used to derive copy + assemble the input; the AI spec rides on top
+    derivationTemplate: 'ugc_split_screen'
+  },
+
+  ai_ugc_led: {
+    label:       'AI: UGC-led',
+    description: 'Full-bleed creator photo carries the ad; minimal brand chrome, creator attribution visible.',
+    creativeStyle: 'ugc_led',
+    aspect_ratios: { supported: ['1:1'], preferred: ['1:1'] },
+    variants: ['ugc', 'product_image'],
+    derivationTemplate: 'ugc_split_screen'
+  },
+
+  ai_social_proof_led: {
+    label:       'AI: Social Proof',
+    description: 'Real comments / ratings / engagement stats are the visual anchor; product is supporting.',
+    creativeStyle: 'social_proof_led',
+    aspect_ratios: { supported: ['1:1'], preferred: ['1:1'] },
+    variants: ['ugc', 'product_image'],
+    derivationTemplate: 'ugc_split_screen'
+  },
+
+  ai_editorial: {
+    label:       'AI: Editorial',
+    description: 'Magazine-spread aesthetic — typography hero, image inset, restrained palette, generous whitespace.',
+    creativeStyle: 'editorial',
+    aspect_ratios: { supported: ['1:1'], preferred: ['1:1'] },
+    variants: ['ugc', 'product_image'],
+    derivationTemplate: 'ugc_split_screen'
+  },
+
+  ai_promotional: {
+    label:       'AI: Promotional',
+    description: 'Offer-first — discount badge or sale callout dominates, urgency cues, attention-grabbing CTA.',
+    creativeStyle: 'promotional',
+    aspect_ratios: { supported: ['1:1'], preferred: ['1:1'] },
+    variants: ['ugc', 'product_image'],
+    derivationTemplate: 'ugc_split_screen'
   }
 };
 

@@ -63,7 +63,14 @@ const SUPPORTED_TEMPLATES = new Set([
   'ugc_split_screen',
   'testimonial_overlay',
   'product_overlay',
-  'ai_brand_led'                  // Phase 1c — LLM-emitted canvas spec at render time
+  // AI templates — each maps 1:1 to a creativeStyle in aiCanvasSpecService.
+  // Operator enables one or more; cartesian fans across them so a 3-style
+  // pick on 4 media = 12 ads in 3 directions instead of one safe default.
+  'ai_brand_led',
+  'ai_ugc_led',
+  'ai_social_proof_led',
+  'ai_editorial',
+  'ai_promotional'
 ]);
 
 // Per-template variant whitelist. Some templates are inherently UGC
@@ -76,7 +83,13 @@ const TEMPLATE_SUPPORTS_VARIANT = {
   ugc_split_screen:      new Set(['ugc', 'product_image']),
   testimonial_overlay:   new Set(['ugc']),                       // creator quote over UGC photo — needs UGC source
   product_overlay:       new Set(['ugc', 'product_image']),
-  ai_brand_led:          new Set(['ugc', 'product_image'])
+  ai_brand_led:          new Set(['ugc', 'product_image']),
+  // ugc_led is by definition UGC-source only — the creator photo IS the ad.
+  ai_ugc_led:            new Set(['ugc']),
+  // social_proof leans on real comments/stats; both sources OK but UGC has more signal.
+  ai_social_proof_led:   new Set(['ugc', 'product_image']),
+  ai_editorial:          new Set(['ugc', 'product_image']),
+  ai_promotional:        new Set(['ugc', 'product_image'])
 };
 
 // Aspect ratios we're shipping ad output for in V1.
