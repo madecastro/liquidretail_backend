@@ -37,7 +37,7 @@ const AiCanvasArtifact = require('../models/AiCanvasArtifact');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '1.2.0';   // 1.2: prompt locks down required style_variants + brand-color binding paths
+const SPEC_SCHEMA_VERSION = '1.3.0';   // 1.3: panel_text_color binding for eyebrow + explicit white-on-brand text colors
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -88,8 +88,13 @@ function buildResponseSchema(aspectRatio) {
   // property maps with nullable rect/string values instead of an
   // open additionalProperties shape.
   const SAFE_AREA_NAMES = ['outer', 'text_primary', 'text_secondary', 'cta_safe', 'logo_safe', 'no_obstruction'];
+  // Binding names the renderer maps to CSS custom properties. Each
+  // binding becomes --tp-style-<kebab-name> at render time. Names
+  // here must match the CSS the renderer reads (see ads.html *.tp-zone
+  // rules + the var() fallbacks). Adding a new binding here lets the
+  // LLM set it; the rendering side already reads it.
   const STYLE_BINDING_NAMES = [
-    'card_bg', 'card_text_color', 'panel_bg',
+    'card_bg', 'card_text_color', 'panel_bg', 'panel_text_color',
     'headline_text_color', 'accent_border_color',
     'cta_button_bg', 'cta_text_color',
     'font_family_body', 'font_family_display'
@@ -239,17 +244,19 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle }) {
     `  cta           → "cta"`,
     `  panel         → null`,
     ``,
-    `STYLE BINDINGS — use BRAND COLOR PATHS, not hex literals. The renderer maps every binding to a CSS variable and falls back to its defaults when null. For brand-led direction:`,
-    `  panel_bg            → "brand.primary_color"     (dominant brand surface)`,
-    `  card_bg             → "brand.secondary_color"   (slightly different surface for cards)`,
+    `STYLE BINDINGS — surfaces use brand color PATHS; text colors on top of those surfaces must be EXPLICIT HEX values so the rendered text is readable. The renderer has NO contrast guard for AI templates, so null means "fall through to CSS default" which may not contrast with whatever surface the text sits on.`,
+    `For brand-led direction (panel_bg is brand.primary_color — typically a saturated brand color, usually dark or mid-tone):`,
+    `  panel_bg            → "brand.primary_color"     (dominant brand surface — the colored panel)`,
+    `  panel_text_color    → "#FFFFFF"                 (eyebrow + panel-level text on brand panel)`,
+    `  headline_text_color → "#FFFFFF"                 (display headline on brand panel)`,
+    `  card_bg             → "#FFFFFF"                 (product/quote cards as clean WHITE cards floating on the brand panel — best brand-led look)`,
+    `  card_text_color     → "#0A0A0A"                 (card text on white card)`,
     `  cta_button_bg       → "brand.accent_color"      (CTA pops against the panel)`,
+    `  cta_text_color      → "#FFFFFF"                 (text on accent-colored CTA)`,
     `  accent_border_color → "brand.accent_color"`,
-    `  headline_text_color → null   (let renderer auto-derive readable color)`,
-    `  card_text_color     → null   (let renderer auto-derive)`,
-    `  cta_text_color      → null   (let renderer auto-derive)`,
-    `  font_family_body    → null   (use brand font default)`,
+    `  font_family_body    → null`,
     `  font_family_display → null`,
-    `Use a literal hex (#RRGGBB) ONLY when no input path makes sense — e.g. you need a specific white card surface over a colored panel.`,
+    `If you choose a WHITE-panel direction instead (panel_bg: "#FFFFFF"), flip the text colors: panel_text_color and headline_text_color become "#0A0A0A", card_bg becomes brand.primary_color, card_text_color becomes "#FFFFFF". Don't leave text colors null — the AI-template path has no auto-contrast.`,
     ``,
     `CANVAS BACKGROUND.STYLE — pick based on whether support_media spans the full frame:`,
     `  full-bleed hero            → "solid" with panel_bg null (let media cover)`,
