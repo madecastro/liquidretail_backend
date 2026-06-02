@@ -37,7 +37,7 @@ const AiCanvasArtifact = require('../models/AiCanvasArtifact');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '1.1.0';   // bumped when the response_format schema changed shape for strict mode
+const SPEC_SCHEMA_VERSION = '1.2.0';   // 1.2: prompt locks down required style_variants + brand-color binding paths
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -216,12 +216,46 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle }) {
     `Coordinate system: normalized 0–1000 along BOTH axes. Width=${width}, Height=${height}. All rect.x + rect.w must stay <= width and rect.y + rect.h <= height.`,
     `Every zone gets a rect, a kind, a layer, and (when it carries content) a slot path the renderer resolves against the input data.`,
     ``,
-    `Required zones (must appear): logo, cta, and AT LEAST one copy zone (headline OR product_card OR quote_card).`,
+    `REQUIRED ZONES (must appear): logo, cta, and AT LEAST one copy zone (headline OR product_card OR quote_card).`,
     `Optional zones (pick if they serve the creative direction): support_media, panel, eyebrow_rules, proof_bar, quote_card, product_card, badge_row.`,
     ``,
     `Slot paths must come from the allowed set. If a slot expects an array (e.g. product_card), pass an array of paths in slot.`,
     ``,
-    `style_bindings names: card_bg, card_text_color, headline_text_color, accent_border_color, panel_bg, cta_button_bg, font_family_body, font_family_display. Map to data-driven values like "brand.primary_color", "brand.accent_color", "media.palette_dominant", or a literal hex "#RRGGBB". Leave unset to use renderer defaults.`,
+    `REQUIRED style_variant values (the renderer falls back to a placeholder if these are missing or wrong — DO NOT omit):`,
+    `  headline      → "display_script"        (script editorial display)`,
+    `  product_card  → "with_thumbnail"        (image + name + price)`,
+    `  quote_card    → "with_thumbnail"        (quote + author + photo)`,
+    `  proof_bar     → "with_verified_buyers"  (rating + verified buyers chip)`,
+    `  eyebrow_rules, badge_row, logo, cta, panel, support_media, text → leave style_variant null`,
+    ``,
+    `SLOT SHAPES — pass the exact path(s) the renderer expects:`,
+    `  logo          → "brand.logo"`,
+    `  headline      → "copy.headline"`,
+    `  eyebrow_rules → ["copy.subheadline", "brand.tagline"]   (array)`,
+    `  proof_bar     → ["social_proof.rating_value", "social_proof.review_count"]   (array)`,
+    `  product_card  → ["product.image", "product.name", "product.price"]   (array, exactly this order)`,
+    `  quote_card    → "social_proof.primary_quote"`,
+    `  support_media → "product.hero_media"`,
+    `  cta           → "cta"`,
+    `  panel         → null`,
+    ``,
+    `STYLE BINDINGS — use BRAND COLOR PATHS, not hex literals. The renderer maps every binding to a CSS variable and falls back to its defaults when null. For brand-led direction:`,
+    `  panel_bg            → "brand.primary_color"     (dominant brand surface)`,
+    `  card_bg             → "brand.secondary_color"   (slightly different surface for cards)`,
+    `  cta_button_bg       → "brand.accent_color"      (CTA pops against the panel)`,
+    `  accent_border_color → "brand.accent_color"`,
+    `  headline_text_color → null   (let renderer auto-derive readable color)`,
+    `  card_text_color     → null   (let renderer auto-derive)`,
+    `  cta_text_color      → null   (let renderer auto-derive)`,
+    `  font_family_body    → null   (use brand font default)`,
+    `  font_family_display → null`,
+    `Use a literal hex (#RRGGBB) ONLY when no input path makes sense — e.g. you need a specific white card surface over a colored panel.`,
+    ``,
+    `CANVAS BACKGROUND.STYLE — pick based on whether support_media spans the full frame:`,
+    `  full-bleed hero            → "solid" with panel_bg null (let media cover)`,
+    `  split panel (half-frame)   → "split_panel"`,
+    `  brand-color dominated      → "brand_fill"`,
+    `  gradient between two brand colors → "gradient"`,
     ``,
     `Return creative_style + rationale + elements_used + elements_skipped so the validator can verify your picks are coherent.`
   ].join('\n');
