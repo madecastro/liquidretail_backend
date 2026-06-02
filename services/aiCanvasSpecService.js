@@ -37,7 +37,7 @@ const AiCanvasArtifact = require('../models/AiCanvasArtifact');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '1.3.0';   // 1.3: panel_text_color binding for eyebrow + explicit white-on-brand text colors
+const SPEC_SCHEMA_VERSION = '1.4.0';   // 1.4: accent_border_color must contrast with card_bg (price uses it); explicit no-text-bg rule
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -245,6 +245,9 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle }) {
     `  panel         → null`,
     ``,
     `STYLE BINDINGS — surfaces use brand color PATHS; text colors on top of those surfaces must be EXPLICIT HEX values so the rendered text is readable. The renderer has NO contrast guard for AI templates, so null means "fall through to CSS default" which may not contrast with whatever surface the text sits on.`,
+    ``,
+    `CRITICAL: text zones do NOT get their own background. The headline text sits directly on whatever surface its rect overlaps with — typically panel_bg, or the support_media image if it overlaps that zone. Do not create panel zones with kind='panel' behind a headline as a "scrim." If you want a darker reading surface for text, use kind='panel' explicitly in the spec with its own slot=null and rect, and pick the panel's background via the canvas.background.style + panel_bg. Then position the headline rect inside that panel.`,
+    ``,
     `For brand-led direction (panel_bg is brand.primary_color — typically a saturated brand color, usually dark or mid-tone):`,
     `  panel_bg            → "brand.primary_color"     (dominant brand surface — the colored panel)`,
     `  panel_text_color    → "#FFFFFF"                 (eyebrow + panel-level text on brand panel)`,
@@ -253,10 +256,20 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle }) {
     `  card_text_color     → "#0A0A0A"                 (card text on white card)`,
     `  cta_button_bg       → "brand.accent_color"      (CTA pops against the panel)`,
     `  cta_text_color      → "#FFFFFF"                 (text on accent-colored CTA)`,
-    `  accent_border_color → "brand.accent_color"`,
+    `  accent_border_color → "brand.primary_color"     (IMPORTANT: this binding is also the product-card price color — must contrast with card_bg=#FFFFFF; brand.accent_color is typically too light. Use brand.primary_color or a literal dark hex like "#0A0A0A".)`,
     `  font_family_body    → null`,
     `  font_family_display → null`,
-    `If you choose a WHITE-panel direction instead (panel_bg: "#FFFFFF"), flip the text colors: panel_text_color and headline_text_color become "#0A0A0A", card_bg becomes brand.primary_color, card_text_color becomes "#FFFFFF". Don't leave text colors null — the AI-template path has no auto-contrast.`,
+    ``,
+    `If you choose a WHITE-panel direction instead (panel_bg: "#FFFFFF"):`,
+    `  panel_bg            → "#FFFFFF"`,
+    `  panel_text_color    → "#0A0A0A"  (eyebrow becomes dark on white)`,
+    `  headline_text_color → "#0A0A0A"  (display headline becomes dark on white)`,
+    `  card_bg             → "brand.primary_color"  (cards become the brand color now)`,
+    `  card_text_color     → "#FFFFFF"`,
+    `  cta_button_bg       → "brand.accent_color"`,
+    `  cta_text_color      → "#0A0A0A" if accent is light, else "#FFFFFF"`,
+    `  accent_border_color → "brand.primary_color"   (still must contrast with card_bg — brand.primary now provides it on the dark card)`,
+    `Don't leave text colors null — the AI-template path has no auto-contrast.`,
     ``,
     `CANVAS BACKGROUND.STYLE — pick based on whether support_media spans the full frame:`,
     `  full-bleed hero            → "solid" with panel_bg null (let media cover)`,
