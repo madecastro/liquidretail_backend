@@ -270,8 +270,8 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     `Coordinate system: normalized 0–1000 along BOTH axes. Width=${width}, Height=${height}. All rect.x + rect.w must stay <= width and rect.y + rect.h <= height.`,
     `Every zone gets a rect, a kind, a layer, and (when it carries content) a slot path the renderer resolves against the input data.`,
     ``,
-    `REQUIRED ZONES (must appear): logo, cta, and AT LEAST one copy zone (headline OR product_card OR quote_card).`,
-    `Optional zones (pick if they serve the creative direction): support_media, panel, eyebrow_rules, proof_bar, quote_card, product_card, badge_row.`,
+    `ZONE PALETTE (pick what serves the creative — none are mandatory): logo, cta, headline, support_media, panel, eyebrow_rules, proof_bar, quote_card, product_card, badge_row, text.`,
+    `Compose freely — an editorial frame can skip the logo, a pure hero-quote can skip the product_card, a typographic ad can skip support_media. Choose the zone set that makes the strongest creative for this brand + product + media.`,
     ``,
     `Slot paths must come from the allowed set. If a slot expects an array (e.g. product_card), pass an array of paths in slot.`,
     ``,
@@ -453,9 +453,12 @@ function validateSpec(spec, aspectRatio) {
       hasCopyZone = true;
     }
   }
-  if (!ids.has('logo')) throw new Error('required zone missing: logo');
-  if (!ids.has('cta'))  throw new Error('required zone missing: cta');
-  if (!hasCopyZone)     throw new Error('required: at least one of headline / product_card / quote_card');
+  // No hard-required zones — the LLM composes freely. Surface absences
+  // as warnings so downstream tooling / the judge can weigh "this ad has
+  // no CTA" against the creative intent without us throwing.
+  if (!ids.has('logo')) warnings.push('no logo zone — verify brand attribution is intentional');
+  if (!ids.has('cta'))  warnings.push('no cta zone — verify this is an awareness/editorial frame');
+  if (!hasCopyZone)     warnings.push('no copy-bearing zone (headline / product_card / quote_card) — verify the creative reads without copy');
 
   // elements_used should match the actual zone id set.
   const declared = new Set(spec.elements_used || []);
