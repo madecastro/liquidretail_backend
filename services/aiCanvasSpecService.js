@@ -39,7 +39,7 @@ const { loadContext } = require('./layoutInputService');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.2.0';   // 2.2: composition archetypes, expanded slots (social_context/stats/comments), scaler clamp [0.5, 3.0]
+const SPEC_SCHEMA_VERSION = '2.3.0';   // 2.3: shadow hierarchy_spec (strategy + layout intent, no rects) — persisted for vocabulary analysis, renderer ignores
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -153,7 +153,7 @@ function buildResponseSchema(aspectRatio) {
       required: [
         'creative_style', 'rationale', 'elements_used', 'elements_skipped',
         'aspect_ratio', 'canvas', 'safe_areas', 'zones', 'zone_scalers', 'style_bindings',
-        'copy_picks'
+        'copy_picks', 'hierarchy_spec'
       ],
       properties: {
         creative_style:   { type: 'string', enum: Object.keys(CREATIVE_STYLES) },
@@ -255,6 +255,78 @@ function buildResponseSchema(aspectRatio) {
           additionalProperties: false,
           required: STYLE_BINDING_NAMES,
           properties: styleBindingProps
+        },
+        // Higher-level "design intent" pass — strategy + layout family +
+        // visual direction + per-role hierarchy, no coordinates. Runs
+        // in SHADOW today: persisted on the artifact for vocabulary
+        // analysis but the renderer still reads zones[] (rects) above.
+        // Goal is to observe what layout_family / emotional_hook /
+        // comment_style / etc. strings the LLM converges on across
+        // 50–100 generations, then formalize enums + wire a constraint
+        // solver in a later slice that translates hierarchy → rects.
+        hierarchy_spec: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['strategy', 'layout'],
+          properties: {
+            strategy: {
+              type: 'object',
+              additionalProperties: false,
+              required: [
+                'emotional_hook', 'social_proof_type',
+                'product_priority', 'ugc_priority', 'comment_priority',
+                'stat_priority', 'cta_emphasis'
+              ],
+              properties: {
+                emotional_hook:     { type: 'string' },
+                social_proof_type:  { type: 'string' },
+                product_priority:   { type: 'string' },
+                ugc_priority:       { type: 'string' },
+                comment_priority:   { type: 'string' },
+                stat_priority:      { type: 'string' },
+                cta_emphasis:       { type: 'string' }
+              }
+            },
+            layout: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['layout_family', 'visual_direction', 'zones'],
+              properties: {
+                layout_family: { type: 'string' },
+                visual_direction: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: [
+                    'density', 'visual_energy', 'contrast',
+                    'corner_radius', 'shadow_depth', 'glass_level'
+                  ],
+                  properties: {
+                    density:        { type: 'string' },
+                    visual_energy:  { type: 'string' },
+                    contrast:       { type: 'string' },
+                    corner_radius:  { type: 'string' },
+                    shadow_depth:   { type: 'string' },
+                    glass_level:    { type: 'string' }
+                  }
+                },
+                zones: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['role', 'priority', 'anchor', 'weight', 'component_style'],
+                    properties: {
+                      role:            { type: 'string' },   // hero_media | product | comment | quote | stat | rating | cta | offer | eyebrow | headline | logo | creator
+                      priority:        { type: 'string' },   // high | medium | low
+                      anchor:          { type: 'string' },   // top_left | top_right | center | bottom_left | bottom_right | leading | trailing | full
+                      weight:          { type: 'number', minimum: 0, maximum: 1 },
+                      component_style: { type: 'string' }    // e.g. floating_glass / featured_testimonial / caption_strip / pill_button / sticker / stat_hero / etc.
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       },
       $defs: {
@@ -376,7 +448,39 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     ``,
     `CRITICAL: text zones (kind=text, headline, eyebrow_rules, etc.) do NOT get their own background. Text sits directly on whatever surface its rect overlaps. If you want a darker reading surface, add an explicit kind='panel' zone with its own rect + panel_bg, then position the text rect INSIDE that panel.`,
     ``,
-    `Return creative_style + rationale + elements_used + elements_skipped. In rationale, name the chosen archetype (A–H) + why the FULL CONTEXT pointed to it.`
+    `Return creative_style + rationale + elements_used + elements_skipped. In rationale, name the chosen archetype (A–H) + why the FULL CONTEXT pointed to it.`,
+    ``,
+    `── HIERARCHY SPEC (additional output, shadow today) ──`,
+    `Alongside the canvas spec, also emit a hierarchy_spec describing the SAME ad at a higher level of abstraction. Think of it as your design notes — what you'd hand a designer if they were doing the geometry themselves. No coordinates here; just strategy + visual intent + per-role hierarchy.`,
+    ``,
+    `OPEN VOCABULARY: pick the value that best describes your decision. The example values below are anchors, NOT enums — if you need a new term that fits better, use it. We're collecting the vocabulary you naturally pick.`,
+    ``,
+    `  strategy:`,
+    `    emotional_hook       — what this ad triggers. examples: trust / authenticity / performance / urgency / aspiration / value / discovery / curiosity / belonging / craftsmanship`,
+    `    social_proof_type    — which proof leads. examples: testimonial / stat / creator / review / rating / press / awards / none`,
+    `    product_priority     — how prominent the product is. examples: high / medium / low / absent`,
+    `    ugc_priority         — how prominent the source UGC photo is. examples: high / medium / low / absent`,
+    `    comment_priority     — how prominent a comment overlay is. examples: high / medium / low / absent`,
+    `    stat_priority        — how prominent a numeric stat (likes, rating count, etc.) is. examples: high / medium / low / absent`,
+    `    cta_emphasis         — how dominant the CTA is. examples: primary / secondary / minimal / absent`,
+    ``,
+    `  layout:`,
+    `    layout_family        — high-level composition family. examples: asymmetric_split / vertical_split / hero_product / hero_quote / stat_dominant / typographic / magazine / review_grid / mosaic / diagonal_carve`,
+    `    visual_direction:`,
+    `      density            — examples: airy / medium / dense / editorial`,
+    `      visual_energy      — examples: calm / balanced / high / electric`,
+    `      contrast           — examples: soft / strong / extreme`,
+    `      corner_radius      — examples: sharp / small / medium / large / pill`,
+    `      shadow_depth       — examples: none / minimal / soft / pronounced / dramatic`,
+    `      glass_level        — examples: none / light / medium / heavy   (frosted/blur surfaces over media)`,
+    `    zones[]              — one entry per visible role in the ad`,
+    `      role               — examples: hero_media / product / comment / quote / stat / rating / cta / offer / eyebrow / headline / logo / creator`,
+    `      priority           — high / medium / low`,
+    `      anchor             — examples: top_left / top_right / center / bottom_left / bottom_right / leading / trailing / full`,
+    `      weight             — 0.0–1.0, the visual share of canvas this role occupies (all weights together can sum to more than 1.0 when zones overlap, e.g. text on a hero)`,
+    `      component_style    — which visual treatment for this role. examples: floating_glass / featured_testimonial / caption_strip / pill_button / solid_primary / outlined / sticker / stat_hero / stat_row / star_burst / extended_card / compact_card / handle_chip / creator_card / discount_badge / offer_ribbon / display_script / sans_caps / slab_serif`,
+    ``,
+    `This output runs in shadow today — the renderer consumes zones[] (rects) above. The hierarchy_spec is collected so we can formalize the vocabulary you converge on, then wire a constraint solver later that translates hierarchy → rects. Pick what feels right; don't over-think alignment with the canvas spec.`
   ].join('\n');
 
   // Rich-context user payload. JSON-formatted so the LLM can read
@@ -702,6 +806,7 @@ async function getOrGenerate({
       rationale:         spec.rationale || null,
       elementsUsed:      spec.elements_used  || [],
       elementsSkipped:   spec.elements_skipped || [],
+      hierarchySpec:     spec.hierarchy_spec || null,
       specSchemaVersion: SPEC_SCHEMA_VERSION,
       createdAt:         new Date()
     },

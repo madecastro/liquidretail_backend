@@ -56,6 +56,13 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   elementsUsed:     { type: [String], default: [] },
   elementsSkipped:  { type: [String], default: [] },
 
+  // Shadow hierarchy spec (2.3+). Strategy + layout intent at a
+  // higher abstraction than zones[]. Renderer ignores; persisted
+  // for vocabulary analysis so we can formalize layout_family /
+  // component_style / emotional_hook enums based on what the LLM
+  // empirically converges on across many generations.
+  hierarchySpec:    { type: mongoose.Schema.Types.Mixed, default: null },
+
   // Semver of the AI-spec schema (the JSON Schema we feed to OpenAI).
   // Bump when the response schema changes — old cached docs become
   // unusable; service re-generates on miss.

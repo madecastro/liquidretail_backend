@@ -155,6 +155,7 @@ router.get('/by-artifact/:id', async (req, res) => {
       rationale:         art.rationale,
       elementsUsed:      art.elementsUsed,
       elementsSkipped:   art.elementsSkipped,
+      hierarchySpec:     art.hierarchySpec || art.canvasSpec?.hierarchy_spec || null,
       validationWarnings: art.validationWarnings || [],
       createdAt:         art.createdAt
     });
