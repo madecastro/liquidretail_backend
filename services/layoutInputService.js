@@ -2536,5 +2536,8 @@ module.exports = {
   // Exported for tests / future preview UI:
   assembleInput,
   stubDerivationFromCtx,
-  loadContext
+  loadContext,
+  // Exported for the AI-canvas pipeline so it can build per-ratio
+  // alt crop URLs from the same crop artifacts the renderer uses.
+  buildCloudinaryCropUrl
 };

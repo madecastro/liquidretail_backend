@@ -39,7 +39,7 @@ const { loadContext } = require('./layoutInputService');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.3.0';   // 2.3: shadow hierarchy_spec (strategy + layout intent, no rects) — persisted for vocabulary analysis, renderer ignores
+const SPEC_SCHEMA_VERSION = '2.4.0';   // 2.4: expose all-ratio hero crops (1:1/4:5/5:4/9:16/1.91:1) — LLM can slot a panoramic strip on a 1:1 canvas, etc.
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -121,6 +121,15 @@ const ALLOWED_SLOTS = [
   'product.name', 'product.price', 'product.description', 'product.category',
   'product.image',
   'product.hero_media', 'product.lifestyle_image', 'product.product_image',
+  // Per-ratio crop variants of the hero source — let the LLM pick a
+  // different aspect than the canvas (panoramic strip on 1:1, vertical
+  // inset, story-aspect band, etc.) instead of being forced into the
+  // canvas-ratio winner crop for every media slot.
+  'product.hero_media.crops.1_1',
+  'product.hero_media.crops.4_5',
+  'product.hero_media.crops.5_4',
+  'product.hero_media.crops.9_16',
+  'product.hero_media.crops.1_91_1',
   'product.badges', 'product.short_benefits',
   'product.rating', 'product.review_count', 'product.review_summary',
   'product.reviews.0.text', 'product.reviews.0.author', 'product.reviews.0.rating',
@@ -462,6 +471,12 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     `  eyebrow_rules → ["copy.subheadline", "brand.tagline"]   (array — renderer picks the first that resolves)`,
     `  proof_bar     → ["social_proof.rating_value", "social_proof.review_count"]   (array)`,
     ``,
+    `HERO CROP RATIOS — every source has crops at multiple aspect ratios available via product.hero_media.crops.* (1_1, 4_5, 5_4, 9_16, 1_91_1). The DEFAULT product.hero_media.image is the canvas-ratio winner. Use an alt crop when the composition calls for a different aspect than the canvas — e.g. on a 1:1 canvas:`,
+    `  - slot a 1.91:1 crop (product.hero_media.crops.1_91_1) as a panoramic strip across the middle`,
+    `  - slot a 9:16 crop (product.hero_media.crops.9_16) as a tall vertical inset`,
+    `  - slot a 4:5 crop (product.hero_media.crops.4_5) as a portrait product card`,
+    `Check source_media.alt_crops in the FULL CONTEXT to see which ratios actually exist for THIS media (some media only ship some crops). Vision attachments include the most aspect-different alt crops so you can see how the alts frame the subject.`,
+    ``,
     `STYLE_VARIANT (shape hint, per zone). These exist for the renderer's enriched modes — leave null when you want plain text/image rendering:`,
     `  text / headline   → "display_script" (script editorial) | null (plain large type — picks the brand font)`,
     `  product_card      → "with_thumbnail" (image left + name+price right)`,
@@ -779,12 +794,31 @@ async function getOrGenerate({
   // overlapping keys (canonical has hero_media / image / lifestyle_image
   // objects the LLM expects; richContext flattens those to *_present flags).
   const rcText = richContext?.text || {};
+  const cropMaps = richContext?.cropMaps || {};
   const inputWithCandidates = {
     ...input,
     copy_candidates: rcText.copy_candidates || input.copy_candidates,
     social_context:  rcText.social_context  || input.social_context || null,
     campaign:        { ...(rcText.campaign || {}), ...(input.campaign || {}) },
-    product:         { ...(rcText.product  || {}), ...(input.product  || {}) }
+    product: {
+      ...(rcText.product  || {}),
+      ...(input.product  || {}),
+      // Graft all-ratio crop maps so slot paths like
+      // product.hero_media.crops.1_91_1 resolve to the wide
+      // panoramic URL even when the canvas is 1:1.
+      hero_media: {
+        ...(input.product?.hero_media || {}),
+        crops: cropMaps.hero || (input.product?.hero_media?.crops || {})
+      },
+      lifestyle_image: {
+        ...(input.product?.lifestyle_image || {}),
+        crops: cropMaps.lifestyle || (input.product?.lifestyle_image?.crops || {})
+      },
+      product_image: {
+        ...(input.product?.product_image || {}),
+        crops: cropMaps.product_only || (input.product?.product_image?.crops || {})
+      }
+    }
   };
 
   if (!refresh) {

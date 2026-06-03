@@ -18,9 +18,19 @@
 // derivation step to emit multiple per field.
 
 const Comment = require('../models/Media').db?.models?.Comment || require('../models/Comment');
+const { buildCloudinaryCropUrl } = require('./layoutInputService');
 
 const SMART_CROP_RATIOS = ['1:1', '4:5', '5:4'];          // base smart crops
 const EXTENDED_CROP_RATIOS = ['9:16', '1.91:1'];          // ai-extended
+
+// Map a real aspect-ratio string ('1.91:1') to the underscored key
+// the LLM puts in slot paths ('1_91_1' — dots/colons can't appear in
+// dotted slot resolution). Used on the way IN to build the crops map
+// AND on the way OUT when the LLM emits a slot like
+// "product.hero_media.crops.1_91_1".
+function ratioKey(ratio) {
+  return String(ratio).replace(/[:.]/g, '_');
+}
 
 async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio }) {
   const { media, detection, crops, extended, match, overlayZones, productHero } = ctx;
@@ -145,16 +155,50 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio }) {
     }
   };
 
+  // ── All-ratio crop maps ─────────────────────────────────────────
+  // Build the full menu of crop URLs per source (hero / lifestyle /
+  // product_only). The canvas-ratio winner is what the renderer reads
+  // by default at `product.hero_media.image`, but the LLM can now
+  // slot a different ratio (e.g. product.hero_media.crops.1_91_1 for
+  // a panoramic strip on a 1:1 canvas, or .crops.4_5 for a vertical
+  // inset). aiCanvasSpecService grafts these onto resolvedInput so
+  // the slot paths resolve at render time.
+  const heroCrops = buildAllRatioCrops(ctx, 'hero');
+  const lifestyleCrops = buildAllRatioCrops(ctx, 'lifestyle');
+  const productOnlyCrops = buildAllRatioCrops(ctx, 'product_only');
+
+  // Surface the menu in the text payload so the LLM knows which slot
+  // paths are available. URLs themselves are tracked here too so the
+  // LLM can reference them in its rationale if it wants.
+  text.source_media.alt_crops = {
+    hero:          Object.keys(heroCrops),
+    lifestyle:     Object.keys(lifestyleCrops),
+    product_only:  Object.keys(productOnlyCrops),
+    canvas_ratio:  aspectRatio
+  };
+
   // ── Vision attachments ──────────────────────────────────────────
   // Order matters — the prompt references "image[N]" indices. Skip
   // entries with no URL so OpenAI doesn't 400 on null image_url.
+  // We pass the canvas-ratio crop as the primary visual, plus up to
+  // 2 alt ratios per source so the LLM can SEE what the alt framings
+  // look like (not just URLs in text). Token cost stays bounded.
   const images = [];
   if (brand.logo) {
     images.push({ role: 'brand_logo', url: brand.logo, label: 'Brand logo' });
   }
   const heroUrl = product.hero_media?.image || product.image || null;
   if (heroUrl) {
-    images.push({ role: 'source_hero', url: heroUrl, label: 'Hero media (source photo for the ad)' });
+    images.push({ role: 'source_hero', url: heroUrl, label: `Hero @ ${aspectRatio} (canvas crop, default)` });
+  }
+  // Pick up to 2 alt-ratio hero crops for vision. Prefer the most
+  // different aspects from the canvas (a 1.91:1 strip and a 9:16
+  // portrait give the LLM the widest creative range).
+  const altHeroPick = pickAltRatiosForVision(heroCrops, aspectRatio, 2);
+  for (const { ratio, url } of altHeroPick) {
+    if (!images.some(img => img.url === url)) {
+      images.push({ role: `hero_${ratioKey(ratio)}`, url, label: `Hero @ ${ratio} (alt crop — slot via product.hero_media.crops.${ratioKey(ratio)})` });
+    }
   }
   if (product.lifestyle_image?.image && product.lifestyle_image.image !== heroUrl) {
     images.push({ role: 'product_lifestyle', url: product.lifestyle_image.image, label: 'Catalog lifestyle shot' });
@@ -173,7 +217,68 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio }) {
     }
   }
 
-  return { text, images };
+  // Return crop maps alongside text + images so aiCanvasSpecService
+  // can graft them onto resolvedInput.product.{hero_media,
+  // lifestyle_image, product_image}.crops for slot resolution at
+  // render time.
+  return {
+    text,
+    images,
+    cropMaps: {
+      hero:         heroCrops,
+      lifestyle:    lifestyleCrops,
+      product_only: productOnlyCrops
+    }
+  };
+}
+
+// Walk ctx.crops + ctx.extended to extract the winning crop URL for
+// every available ratio (1:1, 4:5, 5:4, 9:16, 1.91:1) for a given
+// source — 'hero' reads from ctx.crops (the hero Media's smart crop
+// artifact) + ctx.extended (the AI-extended crops). 'lifestyle' /
+// 'product_only' return empty for now (catalog-product Media don't
+// run the smart-crop pipeline yet); future work can extend.
+function buildAllRatioCrops(ctx, source) {
+  const out = {};
+  if (source !== 'hero') return out;  // lifestyle / product_only still single-ratio
+
+  const { detection, crops, extended } = ctx;
+  if (!detection?.imageUrl) return out;
+
+  // Base smart crops (1:1, 4:5, 5:4) — judge winner per ratio.
+  for (const ratio of SMART_CROP_RATIOS) {
+    const winnerId = crops?.winners?.[ratio];
+    const list = crops?.smartCrops?.[ratio] || [];
+    const winner = list.find(c => c.id === winnerId) || list[0];
+    if (winner) {
+      out[ratioKey(ratio)] = buildCloudinaryCropUrl(detection.imageUrl, winner);
+    }
+  }
+
+  // AI-extended crops (9:16, 1.91:1) — already-baked URLs from the
+  // extended-crops pipeline, no Cloudinary transform needed.
+  for (const ratio of EXTENDED_CROP_RATIOS) {
+    const winnerRef = extended?.selectedWinners?.[ratio]?.candidateId;
+    const list = extended?.candidates?.[ratio] || [];
+    const winner = list.find(c => c.id === winnerRef)
+                || list.find(c => c.provider === 'gemini')
+                || list[0];
+    if (winner?.imageUrl) out[ratioKey(ratio)] = winner.imageUrl;
+  }
+
+  return out;
+}
+
+// Vision attachments cost real tokens. Pick at most N alt-ratio
+// hero crops, preferring the ones most aspect-different from the
+// canvas (a panorama + a portrait give the LLM the widest range).
+function pickAltRatiosForVision(cropsMap, canvasRatio, n) {
+  const canvasKey = ratioKey(canvasRatio);
+  const KEY_TO_RATIO = { '1_1': '1:1', '4_5': '4:5', '5_4': '5:4', '9_16': '9:16', '1_91_1': '1.91:1' };
+  const ranked = ['1_91_1', '9_16', '4_5', '5_4', '1_1']
+    .filter(k => k !== canvasKey)
+    .filter(k => cropsMap[k]);
+  return ranked.slice(0, n).map(k => ({ ratio: KEY_TO_RATIO[k], url: cropsMap[k] }));
 }
 
 function bboxPct(b) {
