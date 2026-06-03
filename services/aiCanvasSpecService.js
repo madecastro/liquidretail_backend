@@ -708,7 +708,120 @@ function validateSpec(spec, aspectRatio) {
     }
   }
 
+  // ── Hierarchy ↔ canvas consistency (1d-f) ─────────────────────
+  // The LLM emits hierarchy_spec FIRST (post-1d-e.1 reorder) but
+  // nothing forces the canvas zones to actually express what
+  // hierarchy declared. When they drift — strategy says "lead with
+  // a comment" but no comment zone exists — the rendered ad doesn't
+  // match its own intent. These warnings make that drift visible so
+  // the judge (or operator review) can de-rank inconsistent specs.
+  warnings.push(...checkHierarchyConsistency(spec));
+
   return warnings;
+}
+
+// Map a hierarchy role to a predicate that matches a canvas zone.
+// Fuzzy match: a "comment" role can be either a quote_card OR a
+// text zone whose slot points at social_context.top_comments.* —
+// we check kind + slot together. Returns true when the canvas
+// satisfies the role; the consistency walker uses this per
+// hierarchy_spec.layout.zones entry.
+function canvasZoneSatisfiesRole(role, zone) {
+  const slot = Array.isArray(zone.slot) ? zone.slot.join(' ') : (zone.slot || '');
+  const r = String(role || '').toLowerCase();
+  switch (r) {
+    case 'hero_media':
+    case 'support_media':
+    case 'media':
+      return zone.kind === 'media';
+    case 'product':
+      return zone.kind === 'product_card'
+          || (zone.kind === 'media' && /product\./.test(slot));
+    case 'comment':
+      return /social_context\.(top_comments|caption)/.test(slot);
+    case 'quote':
+    case 'testimonial':
+      return zone.kind === 'quote_card'
+          || /social_proof\.(primary_quote|secondary_quotes)/.test(slot);
+    case 'stat':
+      return /social_context\.stats|social_proof\.(rating_value|review_count)/.test(slot);
+    case 'rating':
+      return zone.kind === 'proof_bar'
+          || /social_proof\.(rating_value|review_count)/.test(slot);
+    case 'cta':
+      return zone.kind === 'cta';
+    case 'offer':
+    case 'discount':
+    case 'promo':
+      return /campaign\.offer/.test(slot);
+    case 'eyebrow':
+      return zone.kind === 'eyebrow_rules'
+          || (/copy\.(eyebrow|subheadline)/.test(slot));
+    case 'headline':
+      return (zone.kind === 'text' || zone.kind === 'headline')
+          && /copy\.headline/.test(slot);
+    case 'logo':
+    case 'brand':
+      return zone.kind === 'logo';
+    case 'creator':
+    case 'creator_attribution':
+      return /social_context\.creator/.test(slot);
+    default:
+      // Unknown role — don't warn; LLM may have invented a vocabulary
+      // term we haven't mapped yet. Vocabulary analysis will surface
+      // it through the aggregation queries.
+      return null;
+  }
+}
+
+function checkHierarchyConsistency(spec) {
+  const out = [];
+  const hs = spec.hierarchy_spec;
+  if (!hs || !hs.layout || !Array.isArray(hs.layout.zones)) return out;
+
+  const hsZones = hs.layout.zones;
+  const cvZones = spec.zones || [];
+
+  // Forward check: every high/medium-priority hierarchy role should
+  // have at least one matching canvas zone. Low-priority roles get a
+  // pass — the LLM may have declared them aspirationally without
+  // committing canvas to them.
+  for (const hz of hsZones) {
+    const priority = String(hz.priority || '').toLowerCase();
+    if (priority !== 'high' && priority !== 'medium') continue;
+    const matched = cvZones.some(z => canvasZoneSatisfiesRole(hz.role, z));
+    if (matched === false) {
+      out.push(`hierarchy declares role="${hz.role}" priority=${priority} but no canvas zone matches — canvas talks past hierarchy`);
+    }
+    // matched === null means unknown role; skip warning.
+  }
+
+  // Strategy-level proof check: if social_proof_type is non-empty
+  // (testimonial / stat / creator / review / rating / etc.) but no
+  // canvas zone surfaces ANY proof data, the strategy is empty.
+  const proofType = String(hs.strategy?.social_proof_type || '').toLowerCase();
+  if (proofType && !['none', 'absent', ''].includes(proofType)) {
+    const hasProofZone = cvZones.some(z => {
+      const slot = Array.isArray(z.slot) ? z.slot.join(' ') : (z.slot || '');
+      return /social_proof\.|social_context\.(top_comments|stats|caption|creator)/.test(slot)
+          || z.kind === 'proof_bar' || z.kind === 'quote_card';
+    });
+    if (!hasProofZone) {
+      out.push(`strategy.social_proof_type="${proofType}" but no canvas zone surfaces social proof — declared strategy unsupported`);
+    }
+  }
+
+  // Strategy-level CTA check: if cta_emphasis is primary/secondary but
+  // no canvas CTA zone exists, the CTA declaration is empty.
+  const ctaEmph = String(hs.strategy?.cta_emphasis || '').toLowerCase();
+  if (ctaEmph && !['none', 'absent', 'minimal', ''].includes(ctaEmph)) {
+    const hasCta = cvZones.some(z => z.kind === 'cta');
+    if (!hasCta) {
+      out.push(`strategy.cta_emphasis="${ctaEmph}" but no canvas cta zone — CTA emphasis declared with no CTA to emphasize`);
+    }
+  }
+
+  return out;
 }
 
 // Resolve the spec's copy_picks against the input's copy_candidates.
