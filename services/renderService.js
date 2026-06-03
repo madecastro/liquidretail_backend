@@ -33,7 +33,22 @@ const { buildVideoCompositeUrl } = require('./videoCompositeService');
 // slot:'product.hero_media'). Only these templates render as video in V1
 // — full-bleed templates (testimonial_overlay, product_overlay) would
 // need transparent pixels in the foreground and are deferred.
-const VIDEO_TEMPLATES = new Set(['ugc_split_screen', 'testimonial_spotlight']);
+//
+// AI templates (ai_*): composeVideoOutput resolves their canvas spec
+// dynamically from AiCanvasArtifact (the LLM emits geometry per ad,
+// not a static schema entry). If the LLM-emitted spec has a media
+// zone slotting product.hero_media we composite that rect; otherwise
+// composeVideoOutput returns null and the pipeline falls through to
+// the static PNG.
+const VIDEO_TEMPLATES = new Set([
+  'ugc_split_screen',
+  'testimonial_spotlight',
+  'ai_brand_led',
+  'ai_ugc_led',
+  'ai_social_proof_led',
+  'ai_editorial',
+  'ai_promotional'
+]);
 
 // ── Tunables ─────────────────────────────────────────────────────────
 
@@ -161,7 +176,16 @@ async function renderCreative(req) {
         template:         req.creative.template,
         aspectRatio:      req.creative.aspectRatio,
         overlayUrl:       upload.renderUrl,
-        overlayPublicId:  upload.cloudinaryPublicId
+        overlayPublicId:  upload.cloudinaryPublicId,
+        // Cartesian keys — needed for AI templates so we can find the
+        // exact AiCanvasArtifact whose spec drove this render. Without
+        // these we'd pick "most recent" and risk grabbing a stale spec
+        // from a different variant.
+        productId:           req.creative.productId           || null,
+        variantKind:         req.creative.variantKind         || null,
+        paletteSource:       req.creative.paletteSource       || 'media',
+        creativeStyle:       req.creative.creativeStyle       || null,
+        campaignContextHash: req.creative.campaignContextHash || null
       });
       if (videoComposite) {
         console.log(`   🎞️  ${tag} video composite ok (${videoComposite.compositeUrl.length} chars)`);
@@ -558,6 +582,59 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
 
 // ── Video composite helper ───────────────────────────────────────────
 
+// For AI templates the canvas spec is emitted per-ad by the LLM.
+// Read the matching AiCanvasArtifact (same cartesian key the render
+// pipeline used) and find the zone that should be punched through
+// for the source video. Picks the LARGEST media zone whose slot
+// resolves to product.hero_media (the only slot whose URL has a
+// video twin — alt-crop slots are image-only). Returns canvasDims
+// + slotZone, or null when no eligible zone is present (LLM emitted
+// no media zone, or only alt-crop media — composite path bails and
+// the static PNG ships).
+async function pickHeroMediaZoneFromAiArtifact({
+  mediaId, template, aspectRatio,
+  productId, variantKind, paletteSource, creativeStyle, campaignContextHash
+}) {
+  const AiCanvasArtifact = require('../models/AiCanvasArtifact');
+  // Build the cache key the way aiCanvasSpecService.getOrGenerate does.
+  // creativeStyle defaults: if the wizard didn't pass one, the registry
+  // shim derives it from the template id (ai_brand_led → brand_led, etc.).
+  let resolvedCreativeStyle = creativeStyle;
+  if (!resolvedCreativeStyle) {
+    const aiNorm = registry.getNormalized(template);
+    resolvedCreativeStyle = aiNorm?.creativeStyle || null;
+  }
+  const filter = {
+    mediaId, template, aspectRatio,
+    productId:           productId           || null,
+    variantKind:         variantKind         || null,
+    paletteSource:       paletteSource       || 'media',
+    creativeStyle:       resolvedCreativeStyle,
+    campaignContextHash: campaignContextHash || null
+  };
+  const artifact = await AiCanvasArtifact.findOne(filter).lean();
+  if (!artifact?.canvasSpec) return null;
+
+  const spec = artifact.canvasSpec;
+  const canvasDims = {
+    w: spec.canvas?.width  || CANVAS_DIMS[aspectRatio]?.w || 1000,
+    h: spec.canvas?.height || CANVAS_DIMS[aspectRatio]?.h || 1000
+  };
+  // Filter zones to those that slot the source media's hero (alt-crop
+  // slots like product.hero_media.crops.1_91_1 use a still image, no
+  // video twin, so they don't get the composite treatment).
+  const candidates = (spec.zones || []).filter(z =>
+    z.kind === 'media' && z.slot === 'product.hero_media' && z.rect
+  );
+  if (!candidates.length) return null;
+  // Pick the largest by area — when the LLM emits multiple media
+  // zones we want the dominant one for video.
+  const slotZone = candidates.sort((a, b) =>
+    (b.rect.w * b.rect.h) - (a.rect.w * a.rect.h)
+  )[0];
+  return { canvasDims, slotZone };
+}
+
 // Pick the base smart-crop ratio (5:4 / 1:1 / 4:5) closest to the
 // slot's shape. Mirrors layoutInputService.pickHeroSourceRatio so the
 // cropped clip matches the source crop the layout input was built
@@ -578,12 +655,35 @@ function _pickClosestBaseRatio(rect) {
   return best.name;
 }
 
-async function composeVideoOutput({ media, template, aspectRatio, overlayUrl, overlayPublicId }) {
-  const canvasVariant = registry.CANVAS?.templates?.[template]?.variants?.[aspectRatio];
-  if (!canvasVariant) return null;
-  const canvasDims = { w: canvasVariant.canvas?.width, h: canvasVariant.canvas?.height };
-  const slotZone = (canvasVariant.zones || []).find(z =>
-    z.kind === 'media' && z.slot === 'product.hero_media');
+async function composeVideoOutput({
+  media, template, aspectRatio, overlayUrl, overlayPublicId,
+  productId, variantKind, paletteSource, creativeStyle, campaignContextHash
+}) {
+  // Resolve canvas dims + the hero-media slot rect. Hand-authored
+  // templates have these in registry.CANVAS; AI templates emit them
+  // per-ad — we read back the AiCanvasArtifact this render used.
+  let canvasDims, slotZone;
+  if (registry.isAi(template)) {
+    const aiPick = await pickHeroMediaZoneFromAiArtifact({
+      mediaId:             media._id,
+      template,
+      aspectRatio,
+      productId,
+      variantKind,
+      paletteSource,
+      creativeStyle,
+      campaignContextHash
+    });
+    if (!aiPick) return null;
+    canvasDims = aiPick.canvasDims;
+    slotZone   = aiPick.slotZone;
+  } else {
+    const canvasVariant = registry.CANVAS?.templates?.[template]?.variants?.[aspectRatio];
+    if (!canvasVariant) return null;
+    canvasDims = { w: canvasVariant.canvas?.width, h: canvasVariant.canvas?.height };
+    slotZone = (canvasVariant.zones || []).find(z =>
+      z.kind === 'media' && z.slot === 'product.hero_media');
+  }
   if (!slotZone?.rect) return null;
 
   const cropDoc = media.latestArtifacts?.crops
