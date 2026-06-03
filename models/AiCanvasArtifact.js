@@ -48,6 +48,18 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   // LLM provenance.
   modelId:      { type: String },         // e.g. 'gpt-4.1'
   promptHash:   { type: String },         // sha256 of the prompt text for drift detection
+  // Full prompt text, persisted for diagnostic visibility. promptSystem
+  // is the system instructions block (zone palette, archetypes, schema
+  // guidance, etc.); promptUser is the per-request body including the
+  // FULL CONTEXT JSON, vision-input role list, and per-style intent.
+  // promptImages is the parallel list of {role, url, label} entries
+  // attached as image_url parts to OpenAI (the LLM sees these as
+  // separate vision inputs; we keep the URLs so the preview can show
+  // exactly which images flowed in). Stored as plain strings — no PII
+  // concerns since the brand/product context is operator-supplied.
+  promptSystem: { type: String, default: null },
+  promptUser:   { type: String, default: null },
+  promptImages: { type: [mongoose.Schema.Types.Mixed], default: [] },
   rawResponse:  { type: mongoose.Schema.Types.Mixed },
 
   // What the LLM declared about its own pick. elements_used /

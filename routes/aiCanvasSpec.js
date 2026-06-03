@@ -157,6 +157,13 @@ router.get('/by-artifact/:id', async (req, res) => {
       elementsSkipped:   art.elementsSkipped,
       hierarchySpec:     art.hierarchySpec || art.canvasSpec?.hierarchy_spec || null,
       validationWarnings: art.validationWarnings || [],
+      // Full prompt — system block, user block (FULL CONTEXT JSON +
+      // intent + vision-input list), and the image attachment URLs that
+      // were passed alongside as image_url parts. Older artifacts
+      // (pre-prompt-persistence) return null/[] here.
+      promptSystem:      art.promptSystem || null,
+      promptUser:        art.promptUser || null,
+      promptImages:      art.promptImages || [],
       createdAt:         art.createdAt
     });
   } catch (err) {
