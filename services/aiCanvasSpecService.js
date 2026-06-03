@@ -39,7 +39,7 @@ const { loadContext } = require('./layoutInputService');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.4.0';   // 2.4: expose all-ratio hero crops (1:1/4:5/5:4/9:16/1.91:1) — LLM can slot a panoramic strip on a 1:1 canvas, etc.
+const SPEC_SCHEMA_VERSION = '2.5.0';   // 2.5: per-zone visual_direction overrides — one panel can be glass-heavy while siblings stay solid
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -263,7 +263,7 @@ function buildResponseSchema(aspectRatio) {
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['id', 'kind', 'slot', 'rect', 'layer', 'style_variant', 'max_lines', 'fit', 'radius', 'clipPolygon'],
+            required: ['id', 'kind', 'slot', 'rect', 'layer', 'style_variant', 'max_lines', 'fit', 'radius', 'clipPolygon', 'visual_direction'],
             properties: {
               id:        { type: 'string' },
               kind:      { type: 'string', enum: ALLOWED_ZONE_KINDS },
@@ -297,6 +297,30 @@ function buildResponseSchema(aspectRatio) {
                     minItems: 3,
                     maxItems: 16,
                     items: { $ref: '#/$defs/point' }
+                  }
+                ]
+              },
+              // Per-zone visual_direction override (2.5+). Same shape
+              // as hierarchy_spec.layout.visual_direction but every
+              // field is independently nullable — null inherits the
+              // stage-level default, non-null overrides. Use for ONE
+              // focal element (a hero quote card with heavy glass and
+              // dramatic shadow while the rest of the ad stays solid).
+              visual_direction: {
+                anyOf: [
+                  { type: 'null' },
+                  {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['density', 'visual_energy', 'contrast', 'corner_radius', 'shadow_depth', 'glass_level'],
+                    properties: {
+                      density:        { type: ['string', 'null'] },
+                      visual_energy:  { type: ['string', 'null'] },
+                      contrast:       { type: ['string', 'null'] },
+                      corner_radius:  { type: ['string', 'null'] },
+                      shadow_depth:   { type: ['string', 'null'] },
+                      glass_level:    { type: ['string', 'null'] }
+                    }
                   }
                 ]
               }
@@ -503,6 +527,8 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     `  brand-color dominated (D/G)        → "brand_fill"`,
     `  diagonal carve (C)                 → "solid" (clipPolygon does the work)`,
     `  gradient between two brand colors  → "gradient"`,
+    ``,
+    `PER-ZONE VISUAL_DIRECTION OVERRIDES (zone.visual_direction) — every zone has an optional visual_direction with the same shape as hierarchy_spec.layout.visual_direction. Null inherits the stage default; non-null fields override on that zone only. Use when ONE focal element wants different treatment from the rest of the ad — a hero quote_card with glass_level: "heavy" + shadow_depth: "dramatic" while the rest stays solid, or a comment card with corner_radius: "pill" inside an otherwise sharp-cornered layout. Default to null when the zone matches the stage direction (most zones).`,
     ``,
     `POLYGON CLIPPING (zone.clipPolygon) — array of {x,y} points in canvas coords (0–1000) that clips the zone's visible region AFTER rect placement. 3–16 points, all in-canvas. Use cases:`,
     `  - Carve a full-bleed support_media around copy regions (archetype C, sometimes A).`,
