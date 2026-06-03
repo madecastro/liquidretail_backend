@@ -113,7 +113,17 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio }) {
         bbox_pct:  bboxPct(t),
         confidence: t.confidence
       })),
-      safe_overlay_zones: extractSafeZones(overlayZones, aspectRatio)
+      // Per-crop spatial analysis (1d-h/1d-i). For each available
+      // crop ratio (canvas + the alt ratios the LLM can slot via
+      // product.hero_media.crops.*), expose the OverlayZoneArtifact's
+      // density grid (visual busy-ness 0–1 per cell), brightness grid
+      // (0–1 per cell, drives text-color picking), keep-out zones
+      // (subject / face / text / product restrictions in 0..1000
+      // coords) and the primary subject rect. This is the real
+      // spatial intelligence the renderer has access to — previously
+      // the safe_overlay_zones field silently returned [] because
+      // extractSafeZones read the wrong artifact shape.
+      spatial_analysis: buildSpatialAnalysisMap(overlayZones, aspectRatio)
     },
 
     social_context: media.source === 'instagram' || media.source === 'tiktok' ? {
@@ -304,20 +314,79 @@ function nonEmptyArray(arr) {
   return (arr || []).filter(v => v != null && v !== '');
 }
 
-// overlayZones is the OverlayZoneArtifact — { zones: { '1:1': [...], '9:16': [...] } }.
-// Each zone entry has rect (0..1 normalized), contrastBg label, brightness.
-// Return the zones for the active aspectRatio in 0..1000 coords so the
-// LLM can place text inside them.
-function extractSafeZones(overlayZones, aspectRatio) {
-  if (!overlayZones?.zones) return [];
-  const list = overlayZones.zones[aspectRatio] || [];
-  return list.slice(0, 6).map((z, i) => ({
-    id:          z.id || `safe_${i + 1}`,
-    rect:        bboxPct({ x1: z.rect?.x1, y1: z.rect?.y1, x2: z.rect?.x2, y2: z.rect?.y2 }),
-    contrast_bg: z.contrastBg || z.contrast_bg || null,
-    brightness:  z.brightness ?? null,
-    notes:       z.notes || null
-  })).filter(z => z.rect);
+// Build a per-ratio spatial analysis map. OverlayZoneArtifact shape:
+//   zones[ratio] is either an array of variant entries (v3) OR a keyed
+//   object by variantKey (legacy). Each entry has .analysis containing
+//   { densityGrid, brightnessGrid, restrictions, primarySubjectRectPct,
+//     imageWidth, imageHeight }. We surface ALL ratios the artifact has
+//     data for so the LLM can read the right grid when it slots an alt
+//     crop via product.hero_media.crops.<ratio>.
+function buildSpatialAnalysisMap(overlayZones, canvasRatio) {
+  if (!overlayZones?.zones || typeof overlayZones.zones !== 'object') {
+    return { canvas_ratio: canvasRatio, by_ratio: {}, available_ratios: [] };
+  }
+  const by_ratio = {};
+  for (const ratio of Object.keys(overlayZones.zones)) {
+    const a = extractAnalysisForRatio(overlayZones.zones[ratio]);
+    if (a) by_ratio[ratioKey(ratio)] = a;
+  }
+  return {
+    canvas_ratio: canvasRatio,
+    by_ratio,
+    available_ratios: Object.keys(by_ratio)
+  };
+}
+
+// Pick the right variant entry inside zones[ratio] (array v3 or keyed
+// object) and project its .analysis into the LLM-friendly shape.
+function extractAnalysisForRatio(rawForRatio) {
+  if (!rawForRatio) return null;
+  let entry = null;
+  if (Array.isArray(rawForRatio)) {
+    entry = rawForRatio.find(e => e?.analysis && e.variant === 'base')
+         || rawForRatio.find(e => e?.analysis)
+         || rawForRatio[0];
+  } else if (typeof rawForRatio === 'object') {
+    entry = Object.values(rawForRatio).find(e => e?.analysis)
+         || Object.values(rawForRatio)[0];
+  }
+  const a = entry?.analysis;
+  if (!a) return null;
+  return {
+    image_size:           { w: a.imageWidth || null, h: a.imageHeight || null },
+    density_grid:         compactGrid(a.densityGrid),
+    brightness_grid:      compactGrid(a.brightnessGrid),
+    keep_out_zones:       (a.restrictions || []).slice(0, 8).map(r => ({
+      id:             r.id || null,
+      role:           r.role || null,
+      classification: r.classification || null,
+      strictness:     typeof r.strictness === 'number' ? +r.strictness.toFixed(2) : null,
+      rect:           rectPctToCanvas(r.rectPct),
+      reason:         typeof r.reason === 'string' ? r.reason.slice(0, 120) : null
+    })).filter(z => z.rect),
+    primary_subject_rect: rectPctToCanvas(a.primarySubjectRectPct)
+  };
+}
+
+// {cols, rows, cells: [[0..1]...]} → compact row strings. 1-decimal
+// floats keep the token cost low while preserving signal — 8 rows of
+// 8 numbers ≈ 250 chars. Each row reads left→right; rows go top→bottom.
+function compactGrid(grid) {
+  if (!grid || !Array.isArray(grid.cells) || !grid.cells.length) return null;
+  return {
+    cols: grid.cols || null,
+    rows: grid.rows || null,
+    rows_top_to_bottom: grid.cells.map(row =>
+      Array.isArray(row)
+        ? row.map(v => (Number(v) || 0).toFixed(1)).join(' ')
+        : ''
+    )
+  };
+}
+
+function rectPctToCanvas(r) {
+  if (!r || typeof r !== 'object') return null;
+  return bboxPct({ x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2 });
 }
 
 async function loadTopComments(mediaId, n) {

@@ -39,7 +39,7 @@ const { loadContext } = require('./layoutInputService');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.5.0';   // 2.5: per-zone visual_direction overrides — one panel can be glass-heavy while siblings stay solid
+const SPEC_SCHEMA_VERSION = '2.6.0';   // 2.6: real spatial analysis per crop ratio — density + brightness heatmaps + keep-out zones (was silently sending [] before)
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -605,7 +605,12 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     userLines.push('');
     userLines.push(`PICK COPY FROM CANDIDATES. The "copy_candidates" object holds arrays — choose by index (headline_pick, subheadline_pick, eyebrow_pick). The backend resolves the index to the actual string before rendering, so the operator-approved copy is what ships. Use null when you don't want that element.`);
     userLines.push(``);
-    userLines.push(`USE source_media.safe_overlay_zones to position text overlays — those rects are pre-computed regions where text won't collide with subjects in the photo. Match a headline / eyebrow / cta rect to one of these zones whenever a zone overlaps the source_hero image.`);
+    userLines.push(`SPATIAL ANALYSIS (source_media.spatial_analysis) — per-crop intelligence. For each available crop ratio (canvas + every alt ratio you can slot via product.hero_media.crops.*), you get four signals computed from the actual cropped image:`);
+    userLines.push(`  density_grid       — 0–1 per cell, top→bottom rows. 0 = empty/uniform (SAFE to place text). 1 = visually busy / subject / detailed texture (AVOID). Pick zone rects that overlap LOW-density cells.`);
+    userLines.push(`  brightness_grid    — 0–1 per cell. 0 = dark (use WHITE text). 1 = light (use DARK text). Read the cells your text-zone rect overlaps to pick the headline/cta text color that will read.`);
+    userLines.push(`  keep_out_zones     — explicit subject / face / text / product restrictions (already in canvas 0..1000 coords). Strictness ≥ 0.9 = hard rule (NEVER cover). Lower = softer guidance.`);
+    userLines.push(`  primary_subject_rect — the dominant subject. Keep visible; don't fully cover with panels or text.`);
+    userLines.push(`When you slot an alt-ratio crop (product.hero_media.crops.1_91_1 etc.) READ THE GRID FOR THAT RATIO via spatial_analysis.by_ratio.<ratio_key> — the canvas-ratio grid does NOT match what's in the alt crop frame.`);
     userLines.push(``);
     userLines.push(`USE source_media.subjects bboxes when carving the support_media via clipPolygon — avoid clipping over a subject. Conversely, when you DO want product/face to read through, keep that subject's bbox inside the visible region.`);
     userLines.push(``);
