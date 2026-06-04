@@ -84,6 +84,19 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   directionArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'CreativeDirectionArtifact', default: null, index: true },
   directionConceptId:  { type: String, default: null },
 
+  // Phase 3 — multi-candidate generation + Judge winner. When the V2
+  // Generator runs N>1 candidates, ALL N are stored here; canvasSpec
+  // mirrors candidates[winnerSpecIndex] for backward-compat reads.
+  // judgeResultId links the Judge's per-batch rationale + scores.
+  // V1 / single-candidate generations leave candidates empty and
+  // winnerSpecIndex at 0 — canvasSpec is the single output.
+  candidates:       { type: [mongoose.Schema.Types.Mixed], default: [] },
+  candidateCount:   { type: Number, default: 1 },
+  winnerSpecIndex:  { type: Number, default: 0 },
+  judgeResultId:    { type: mongoose.Schema.Types.ObjectId, ref: 'AiJudgeResultArtifact', default: null, index: true },
+  judgeRationale:   { type: String, default: null },
+  judgeConfidence:  { type: Number, default: null },
+
   // Semver of the AI-spec schema (the JSON Schema we feed to OpenAI).
   // Bump when the response schema changes — old cached docs become
   // unusable; service re-generates on miss.

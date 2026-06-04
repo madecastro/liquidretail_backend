@@ -160,6 +160,15 @@ router.get('/by-artifact/:id', async (req, res) => {
       // Looked up by recent-most match; not coupled to this specific
       // AiCanvasArtifact yet. Phase 2 will reference by concept_id.
       creativeDirection: await loadShadowCreativeDirection(art),
+      // Phase 3 — multi-candidate + Judge surface. Empty on V1/single-candidate.
+      multiCandidate: {
+        candidateCount:  art.candidateCount || 1,
+        winnerSpecIndex: art.winnerSpecIndex ?? 0,
+        candidates:      Array.isArray(art.candidates) ? art.candidates : [],
+        judgeResultId:   art.judgeResultId ? String(art.judgeResultId) : null,
+        judgeRationale:  art.judgeRationale || null,
+        judgeConfidence: art.judgeConfidence ?? null
+      },
       validationWarnings: art.validationWarnings || [],
       // Full prompt — system block, user block (FULL CONTEXT JSON +
       // intent + vision-input list), and the image attachment URLs that

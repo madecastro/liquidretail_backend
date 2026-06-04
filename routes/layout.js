@@ -145,6 +145,15 @@ router.get('/by-id/:id', async (req, res) => {
         }
       }
 
+      // Phase 3 — multi-candidate + Judge for V2 production renders.
+      // Preview path (?preview=1) skips the multi-gen for cheap operator
+      // iteration. V1 path stays N=1 regardless.
+      const previewMode  = req.query.preview === '1';
+      const v2Mode       = !!directionConcept;
+      const nCandidates  = v2Mode && !previewMode
+        ? Math.max(1, Math.min(5, parseInt(req.query.n || '3', 10) || 3))
+        : 1;
+
       const result = await aiSvc.getOrGenerate({
         input:           artifact.input,
         template:        artifact.template,
@@ -160,7 +169,10 @@ router.get('/by-id/:id', async (req, res) => {
         refresh:         false,
         // V2 inputs — null on V1 path; getOrGenerate branches internally.
         directionArtifactId,
-        directionConcept
+        directionConcept,
+        // Phase 3 multi-candidate inputs.
+        nCandidates,
+        previewMode
       });
       input          = result.resolvedInput || artifact.input;
       canvas         = result.spec;

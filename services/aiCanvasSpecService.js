@@ -939,7 +939,13 @@ async function getOrGenerate({
   // archetype menu / "decide first" instructions. Generator's job
   // becomes materialization, not strategy invention.
   directionArtifactId = null,
-  directionConcept    = null    // the concept object itself (not just its id)
+  directionConcept    = null,   // the concept object itself (not just its id)
+  // Phase 3 — multi-candidate generation. nCandidates > 1 only fires
+  // when directionConcept is supplied (V2 path); preview mode passes 1.
+  // Generator runs N concurrent OpenAI calls then dispatches to the
+  // Judge to pick the winner.
+  nCandidates         = 1,
+  previewMode         = false
 }) {
   if (!input)         throw new Error('input required');
   if (!template)      throw new Error('template required');
@@ -1073,49 +1079,107 @@ async function getOrGenerate({
       ]
     : user;
 
-  const t0 = Date.now();
-  // Wrapped in trackLlmCall so input/output tokens, vision-image count,
-  // duration, and best-effort cost land in CostLog. V2 (Director-driven)
-  // calls log under stage='layout_generator' so $/spec deltas between
-  // V1 and V2 are queryable for the Phase 2 validation gate.
-  const completion = await trackLlmCall(
-    {
-      stage:       isV2 ? 'layout_generator' : 'legacy_ai_canvas_spec',
-      provider:    'openai',
-      model:       MODEL_ID,
-      purposeTag:  isV2 ? `v2:${v2ConceptId || 'unknown'}` : template,
-      brandId, mediaId, productId,
-      visionImages: images.length,
-      cacheKey:    costCacheKey
-    },
-    () => openai.chat.completions.create({
-      model: MODEL_ID,
-      response_format: { type: 'json_schema', json_schema: responseSchema },
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user',   content: userContent }
-      ],
-      // 0.9 — creative work needs real variance. 0.3 collapses 16 ads
-      // into 16 hero_product compositions; 0.9 lets the LLM actually
-      // pick differently per (media, product, style) combination.
-      temperature: 0.9,
-      max_tokens: 4000
-    })
+  // Phase 3 — multi-candidate generation. N=3 in V2 production, N=1 in
+  // preview / V1. Run concurrently — wall-time is bounded by the slowest
+  // call, not the sum. Temperature 0.9 + concurrent sampling gives real
+  // variance across candidates.
+  const effectiveN = isV2 && !previewMode ? Math.max(1, nCandidates) : 1;
+
+  const oneGeneration = async (genIndex) => {
+    const t0 = Date.now();
+    const completion = await trackLlmCall(
+      {
+        stage:       isV2 ? 'layout_generator' : 'legacy_ai_canvas_spec',
+        provider:    'openai',
+        model:       MODEL_ID,
+        purposeTag:  isV2 ? `v2:${v2ConceptId || 'unknown'}:cand${genIndex}` : template,
+        brandId, mediaId, productId,
+        visionImages: images.length,
+        cacheKey:    costCacheKey
+      },
+      () => openai.chat.completions.create({
+        model: MODEL_ID,
+        response_format: { type: 'json_schema', json_schema: responseSchema },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user',   content: userContent }
+        ],
+        temperature: 0.9,
+        max_tokens:  4000
+      })
+    );
+    const elapsedMs = Date.now() - t0;
+    const raw = completion.choices?.[0]?.message?.content;
+    if (!raw) throw new Error(`OpenAI returned no content (cand ${genIndex})`);
+    let spec;
+    try { spec = JSON.parse(raw); }
+    catch (err) { throw new Error(`OpenAI response not JSON (cand ${genIndex}): ${err.message}`); }
+    const warnings = validateSpec(spec, aspectRatio);
+    return { spec, raw, warnings, elapsedMs };
+  };
+
+  // Run candidates concurrently. Partial failures are tolerated when
+  // effectiveN > 1 (the surviving candidates still get judged); single-
+  // candidate failures rethrow as today.
+  const results = await Promise.allSettled(
+    Array.from({ length: effectiveN }, (_, i) => oneGeneration(i))
   );
-  const elapsedMs = Date.now() - t0;
+  const successes = results.map((r, i) => ({ r, i })).filter(x => x.r.status === 'fulfilled');
+  if (!successes.length) {
+    // Every candidate failed — propagate the first error.
+    const firstReject = results.find(r => r.status === 'rejected');
+    throw firstReject?.reason || new Error('all candidate generations failed');
+  }
+  const candidates       = successes.map(s => s.r.value.spec);
+  const candidateWarnings = successes.map(s => s.r.value.warnings);
+  const candidateRaws    = successes.map(s => s.r.value.raw);
+  const totalElapsedMs   = successes.reduce((m, s) => Math.max(m, s.r.value.elapsedMs), 0);
 
-  const raw = completion.choices?.[0]?.message?.content;
-  if (!raw) throw new Error('OpenAI returned no content');
-  let spec;
-  try { spec = JSON.parse(raw); }
-  catch (err) { throw new Error(`OpenAI response not JSON: ${err.message}`); }
+  // Phase 3 — Judge picks the winner among candidates. Single-candidate
+  // mode auto-selects index 0 without an LLM call.
+  let judgeOutcome = { winnerIndex: 0, rationale: null, confidence: null, judgeResultArtifactId: null, criteriaScores: [] };
+  if (candidates.length > 1) {
+    try {
+      const judge = require('./aiJudgeService');
+      // Pass the Director's input_summary + concept along so the Judge
+      // can score strategy_fit + hierarchy_consistency against intent.
+      let conceptForJudge   = directionConcept || null;
+      let brandSignal       = null;
+      let inputSummary      = null;
+      if (directionArtifactId) {
+        try {
+          const dir = await CreativeDirectionArtifactSafe()?.findById(directionArtifactId).lean();
+          if (dir) {
+            inputSummary = dir.inputSummary || null;
+            brandSignal  = dir.inputSummary?.brand_signal || null;
+            if (!conceptForJudge && Array.isArray(dir.concepts)) {
+              conceptForJudge = dir.concepts.find(c => c.concept_id === directionConcept?.concept_id) || dir.concepts[0];
+            }
+          }
+        } catch (_) { /* judge can run without it */ }
+      }
+      judgeOutcome = await judge.judgeCandidates({
+        candidates,
+        concept:      conceptForJudge,
+        inputSummary,
+        brandSignal,
+        brandId, productId,
+        adId:         null  // Phase 3.1 will batch by adId
+      });
+    } catch (err) {
+      console.warn(`   ⚠️  judge failed (${err.message}) — defaulting to candidate 0`);
+    }
+  }
 
-  const warnings = validateSpec(spec, aspectRatio);
+  const winner          = candidates[judgeOutcome.winnerIndex] || candidates[0];
+  const winnerWarnings  = candidateWarnings[judgeOutcome.winnerIndex] || candidateWarnings[0] || [];
+  const winnerRaw       = candidateRaws[judgeOutcome.winnerIndex] || candidateRaws[0] || '';
 
   console.log(
     `🎨 aiCanvasSpec[${template}/${aspectRatio}/${creativeStyle}]: ` +
     `media=${mediaId} product=${productId || '-'} variant=${variantKind || '-'} ` +
-    `took=${elapsedMs}ms warnings=${warnings.length}`
+    `cands=${candidates.length} winner=${judgeOutcome.winnerIndex} ` +
+    `took=${totalElapsedMs}ms warnings=${winnerWarnings.length}`
   );
 
   // Persist. Replace any prior entry under the same key (refresh=true
@@ -1126,30 +1190,42 @@ async function getOrGenerate({
       ...filter,
       advertiserId,
       brandId,
-      canvasSpec:        spec,
-      validationWarnings: warnings,
+      canvasSpec:        winner,
+      validationWarnings: winnerWarnings,
       modelId:           MODEL_ID,
       promptHash,
       promptSystem:      system,
       promptUser:        user,
       promptImages:      images.map(img => ({ role: img.role, url: img.url, label: img.label || null })),
-      rawResponse:       raw,
-      rationale:         spec.rationale || null,
-      elementsUsed:      spec.elements_used  || [],
-      elementsSkipped:   spec.elements_skipped || [],
-      hierarchySpec:     spec.hierarchy_spec || null,
-      // Phase 2 — when this spec was V2-generated, link back to the
-      // concept that drove it. Null on V1/legacy generations.
+      rawResponse:       winnerRaw,
+      rationale:         winner.rationale || null,
+      elementsUsed:      winner.elements_used  || [],
+      elementsSkipped:   winner.elements_skipped || [],
+      hierarchySpec:     winner.hierarchy_spec || null,
       directionArtifactId: directionArtifactId || null,
       directionConceptId:  directionConcept?.concept_id || null,
+      // Phase 3 — store every candidate + winner pointer + judge link.
+      candidates:        candidates.length > 1 ? candidates : [],
+      candidateCount:    candidates.length,
+      winnerSpecIndex:   judgeOutcome.winnerIndex,
+      judgeResultId:    judgeOutcome.judgeResultArtifactId,
+      judgeRationale:   judgeOutcome.rationale,
+      judgeConfidence:  judgeOutcome.confidence,
       specSchemaVersion: SPEC_SCHEMA_VERSION,
       createdAt:         new Date()
     },
     { upsert: true, new: true, includeResultMetadata: false }
   );
 
-  const resolvedInput = applyCopyPicks(inputWithCandidates, spec);
-  return { spec, cached: false, artifactId: String(artifact._id), warnings, resolvedInput };
+  const resolvedInput = applyCopyPicks(inputWithCandidates, winner);
+  return { spec: winner, cached: false, artifactId: String(artifact._id), warnings: winnerWarnings, resolvedInput };
+}
+
+// Lazy require — avoids circular dependency between
+// aiCanvasSpecService and CreativeDirectionArtifact model load order.
+function CreativeDirectionArtifactSafe() {
+  try { return require('../models/CreativeDirectionArtifact'); }
+  catch (_) { return null; }
 }
 
 module.exports = {
