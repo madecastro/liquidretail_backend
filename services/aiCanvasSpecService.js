@@ -971,7 +971,13 @@ async function getOrGenerate({
     const ctx = await loadContext(mediaId, {
       productId, variantKind, paletteSource
     });
-    if (ctx) richContext = await buildAiCanvasContext({ ctx, layoutInput: input, aspectRatio });
+    if (ctx) richContext = await buildAiCanvasContext({
+      ctx, layoutInput: input, aspectRatio,
+      // Phase 4 — the input builder uses these to look up the
+      // style-aware copy candidates artifact (cache-keyed on
+      // brandId+productId+creativeStyle).
+      brandId, productId, creativeStyle
+    });
   } catch (err) {
     console.warn(`   ⚠️  aiCanvasSpec rich-context build failed (using minimal fallback): ${err.message}`);
   }

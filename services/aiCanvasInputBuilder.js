@@ -32,11 +32,28 @@ function ratioKey(ratio) {
   return String(ratio).replace(/[:.]/g, '_');
 }
 
-async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio }) {
+async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = null, productId = null, creativeStyle = null }) {
   const { media, detection, crops, extended, match, overlayZones, productHero } = ctx;
   const brand = layoutInput.brand || {};
   const product = layoutInput.product || {};
   const copy = layoutInput.copy || {};
+
+  // Phase 4 — load style-aware copy candidates from CopyCandidatesArtifact
+  // (cached per brand × product × creativeStyle). Replaces the legacy
+  // single-element wrap of input.copy.* when available; falls through
+  // to the legacy shape silently when not.
+  let derivedCopy = null;
+  if (brandId && creativeStyle) {
+    try {
+      const copyDerivation = require('./copyDerivationService');
+      const cached = await copyDerivation.loadCached({ brandId, productId, creativeStyle });
+      if (cached?.candidates) derivedCopy = cached.candidates;
+    } catch (err) {
+      // Lazy lookup failure is non-fatal — Generator falls back to
+      // length-1 copy_candidates arrays. Log for diagnosis.
+      console.warn(`   ⚠️  copy-candidates lazy load: ${err.message}`);
+    }
+  }
 
   // ── Text payload ────────────────────────────────────────────────
   const text = {
@@ -146,14 +163,20 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio }) {
       top_comments: await loadTopComments(media._id, 3)
     } : null,
 
-    // Copy CANDIDATES — arrays so the LLM picks by index. Phase 1d
-    // expands these to 3-5 each in derivation; today these are
-    // single-element arrays drawn from the existing input.copy.*.
+    // Copy CANDIDATES — arrays so the LLM picks by index. Phase 4 fills
+    // these from a CopyCandidatesArtifact (per brand × product × style)
+    // when present — 3-5 distinct candidates per slot, voiced for the
+    // style. Falls back to single-element arrays drawn from the existing
+    // input.copy.* when no derivation artifact exists for this cell.
     copy_candidates: {
-      headlines:    nonEmptyArray([copy.headline]),
-      subheadlines: nonEmptyArray([copy.subheadline]),
-      eyebrows:     nonEmptyArray([copy.eyebrow]),
-      cta_text:     layoutInput.cta?.text || copy.cta_text || 'Shop now',
+      headlines:    (derivedCopy?.headlines?.length    ? derivedCopy.headlines    : nonEmptyArray([copy.headline])),
+      subheadlines: (derivedCopy?.subheadlines?.length ? derivedCopy.subheadlines : nonEmptyArray([copy.subheadline])),
+      eyebrows:     (derivedCopy?.eyebrows?.length     ? derivedCopy.eyebrows     : nonEmptyArray([copy.eyebrow])),
+      // cta_text retained as a single string for legacy slot resolution
+      // (cta.text path). cta_micro_copy is an additional candidate array
+      // the V2 Generator can pick from for button copy variants.
+      cta_text:       layoutInput.cta?.text || copy.cta_text || 'Shop now',
+      cta_micro_copy: derivedCopy?.cta_micro_copy?.length ? derivedCopy.cta_micro_copy : nonEmptyArray([layoutInput.cta?.text || copy.cta_text || 'Shop now']),
       short_benefits: Array.isArray(product.short_benefits) ? product.short_benefits : [],
       quotes: (layoutInput.social_proof?.secondary_quotes || []).concat(
                  layoutInput.social_proof?.primary_quote ? [layoutInput.social_proof.primary_quote] : []
@@ -161,7 +184,11 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio }) {
                  text:   q.text || null,
                  author: q.author_name || null
                })),
-      badges_pool: Array.isArray(product.badges) ? product.badges : []
+      badges_pool: Array.isArray(product.badges) ? product.badges : [],
+      // Provenance: tell the LLM whether candidates are style-tailored
+      // (5+ variants) or single-string fallbacks. Affects copy_picks
+      // behavior — when length=1, the only valid pick is index 0.
+      derived_for_style: derivedCopy ? creativeStyle : null
     }
   };
 

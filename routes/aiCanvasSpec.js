@@ -160,6 +160,9 @@ router.get('/by-artifact/:id', async (req, res) => {
       // Looked up by recent-most match; not coupled to this specific
       // AiCanvasArtifact yet. Phase 2 will reference by concept_id.
       creativeDirection: await loadShadowCreativeDirection(art),
+      // Phase 4 — copy candidates artifact (style-aware). Looked up by
+      // the artifact's (brandId, productId, creativeStyle) tuple.
+      copyCandidates: await loadCopyCandidatesArtifact(art),
       // Phase 3 — multi-candidate + Judge surface. Empty on V1/single-candidate.
       multiCandidate: {
         candidateCount:  art.candidateCount || 1,
@@ -245,6 +248,32 @@ async function loadShadowCreativeDirection(art) {
     };
   } catch (err) {
     console.warn(`   ⚠️  loadShadowCreativeDirection: ${err.message}`);
+    return null;
+  }
+}
+
+// Phase 4 — load the style-aware copy candidates artifact for this
+// AiCanvasArtifact's (brandId, productId, creativeStyle) cell. Returns
+// null when the eager wizard derivation hasn't fired yet (V1 ads).
+async function loadCopyCandidatesArtifact(art) {
+  try {
+    if (!art?.brandId || !art?.creativeStyle) return null;
+    const CopyCandidatesArtifact = require('../models/CopyCandidatesArtifact');
+    const found = await CopyCandidatesArtifact.findOne({
+      brandId:       art.brandId,
+      productId:     art.productId || null,
+      creativeStyle: art.creativeStyle
+    }).lean();
+    if (!found) return null;
+    return {
+      artifactId:     String(found._id),
+      creativeStyle:  found.creativeStyle,
+      candidates:     found.candidates || {},
+      modelId:        found.modelId,
+      createdAt:      found.createdAt
+    };
+  } catch (err) {
+    console.warn(`   ⚠️  loadCopyCandidatesArtifact: ${err.message}`);
     return null;
   }
 }

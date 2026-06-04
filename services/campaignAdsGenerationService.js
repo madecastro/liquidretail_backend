@@ -475,6 +475,18 @@ async function expandWizardJob({
     console.warn(`   ⚠️  creative-director shadow failed: ${err.message}`);
   });
 
+  // Phase 4 EAGER — derive copy candidates per (brand × product ×
+  // creativeStyle) for every UNIQUE combination in the cartesian.
+  // Deduped to only the (product, style) pairs actually needed —
+  // e.g. only ai_brand_led picked → only brand_led style derived.
+  // Fire-and-forget; lazy cache fallback at render time covers misses.
+  runCopyDerivationEager({
+    brandId,
+    productStylePairs: derivePayloadProductStylePairs(payloads)
+  }).catch(err => {
+    console.warn(`   ⚠️  copy-derivation eager failed: ${err.message}`);
+  });
+
   return {
     campaignId: String(campaignId),
     brandId,
@@ -904,6 +916,47 @@ function dedupeSeeds(seeds) {
     out.push(s);
   }
   return out;
+}
+
+// Phase 4 helper — extract the set of (productId, creativeStyle)
+// pairs the cartesian touches. creativeStyle is resolved from the
+// template id via the registry (AI templates 1:1 map to a style;
+// non-AI templates map to null and are skipped for derivation).
+function derivePayloadProductStylePairs(payloads) {
+  const pairs = new Map();   // key → { productId, creativeStyle }
+  for (const p of payloads) {
+    const tpl = registry.getNormalized(p.template);
+    const style = tpl?.creativeStyle || null;
+    if (!style) continue;   // non-AI templates use the static schema, no derivation
+    const productKey = p.productId ? String(p.productId) : 'null';
+    const k = `${productKey}|${style}`;
+    if (!pairs.has(k)) pairs.set(k, { productId: p.productId || null, creativeStyle: style });
+  }
+  return Array.from(pairs.values());
+}
+
+// Phase 4 EAGER: derive style-aware copy candidates per (brand × product
+// × style). Each pair is cache-keyed; reruns are cheap. Errors are
+// swallowed — failures fall back to the legacy single-string copy at
+// render time via aiCanvasInputBuilder's lazy lookup.
+async function runCopyDerivationEager({ brandId, productStylePairs }) {
+  if (!brandId || !Array.isArray(productStylePairs) || !productStylePairs.length) return;
+  const copyDerivation = require('./copyDerivationService');
+  console.log(`✏️  copy-derivation eager: ${productStylePairs.length} (product × style) pairs for brand=${brandId}`);
+  await Promise.all(productStylePairs.map(async ({ productId, creativeStyle }) => {
+    try {
+      const { artifact, cached } = await copyDerivation.deriveCopy({ brandId, productId, creativeStyle });
+      const c = artifact?.candidates || {};
+      console.log(
+        `✏️  copy-derivation ${cached ? 'CACHE-HIT' : 'GENERATED'} ` +
+        `brand=${brandId} product=${productId || '-'} style=${creativeStyle} ` +
+        `hd=${(c.headlines || []).length} sh=${(c.subheadlines || []).length} ` +
+        `eb=${(c.eyebrows || []).length} cta=${(c.cta_micro_copy || []).length}`
+      );
+    } catch (err) {
+      console.warn(`   ⚠️  copy-derivation[product=${productId || '-'},style=${creativeStyle}]: ${err.message}`);
+    }
+  }));
 }
 
 // Phase 1 SHADOW: run the Creative Director once per unique product in
