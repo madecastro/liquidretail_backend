@@ -35,6 +35,7 @@ const OpenAI = require('openai');
 const AiCanvasArtifact = require('../models/AiCanvasArtifact');
 const { buildAiCanvasContext } = require('./aiCanvasInputBuilder');
 const { loadContext } = require('./layoutInputService');
+const { trackLlmCall, recordCacheHit } = require('./costTracker');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -965,9 +966,28 @@ async function getOrGenerate({
     }
   };
 
+  // Cache key serialized for cost-log grouping. Includes every cartesian
+  // dimension the AiCanvasArtifact unique index covers.
+  const costCacheKey = JSON.stringify({
+    mediaId: String(mediaId), template, aspectRatio,
+    productId: productId ? String(productId) : null,
+    variantKind, campaignContextHash, paletteSource, creativeStyle
+  });
+
   if (!refresh) {
     const cached = await AiCanvasArtifact.findOne(filter).lean();
     if (cached && cached.specSchemaVersion === SPEC_SCHEMA_VERSION) {
+      // Log the cache hit (0-cost) so per-(stage, cacheKey) hit-rate
+      // metrics are accurate. Fire-and-forget — don't await; telemetry
+      // can't block the render path.
+      recordCacheHit({
+        stage:       'legacy_ai_canvas_spec',
+        provider:    'openai',
+        model:       MODEL_ID,
+        purposeTag:  template,
+        brandId, mediaId, productId,
+        cacheKey:    costCacheKey
+      }).catch(() => {});
       const resolvedInput = applyCopyPicks(inputWithCandidates, cached.canvasSpec);
       return {
         spec:          cached.canvasSpec,
@@ -994,19 +1014,33 @@ async function getOrGenerate({
     : user;
 
   const t0 = Date.now();
-  const completion = await openai.chat.completions.create({
-    model: MODEL_ID,
-    response_format: { type: 'json_schema', json_schema: responseSchema },
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user',   content: userContent }
-    ],
-    // 0.9 — creative work needs real variance. 0.3 collapses 16 ads
-    // into 16 hero_product compositions; 0.9 lets the LLM actually
-    // pick differently per (media, product, style) combination.
-    temperature: 0.9,
-    max_tokens: 4000
-  });
+  // Wrapped in trackLlmCall so input/output tokens, vision-image count,
+  // duration, and best-effort cost land in CostLog. Stage 'legacy_ai_canvas_spec'
+  // until Phase 2 swaps this in for the new Generator service.
+  const completion = await trackLlmCall(
+    {
+      stage:       'legacy_ai_canvas_spec',
+      provider:    'openai',
+      model:       MODEL_ID,
+      purposeTag:  template,
+      brandId, mediaId, productId,
+      visionImages: images.length,
+      cacheKey:    costCacheKey
+    },
+    () => openai.chat.completions.create({
+      model: MODEL_ID,
+      response_format: { type: 'json_schema', json_schema: responseSchema },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user',   content: userContent }
+      ],
+      // 0.9 — creative work needs real variance. 0.3 collapses 16 ads
+      // into 16 hero_product compositions; 0.9 lets the LLM actually
+      // pick differently per (media, product, style) combination.
+      temperature: 0.9,
+      max_tokens: 4000
+    })
+  );
   const elapsedMs = Date.now() - t0;
 
   const raw = completion.choices?.[0]?.message?.content;
