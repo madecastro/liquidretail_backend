@@ -1224,6 +1224,29 @@ async function getOrGenerate({
   );
 
   const resolvedInput = applyCopyPicks(inputWithCandidates, winner);
+
+  // Phase 5a SHADOW — run the Resolver in the background. Persists a
+  // ResolvedLayoutArtifact for this AiCanvasArtifact; renderer doesn't
+  // consume it yet. Useful immediately as a diagnostic: spec preview
+  // surfaces slot resolution + fallback chain decisions.
+  // Fire-and-forget; failures don't affect the render path.
+  setImmediate(() => {
+    const resolver = require('./layoutResolverService');
+    resolver.resolveLayout({ aiCanvasArtifactId: artifact._id })
+      .then(({ artifact: rla, cached: rcCached }) => {
+        const fbCount = (rla.fallbacksUsed || []).length;
+        const wCount  = (rla.warnings      || []).length;
+        console.log(
+          `🧩 resolver shadow ${rcCached ? 'CACHE-HIT' : 'RESOLVED'}: ` +
+          `aiCanvasArtifact=${artifact._id} status=${rla.resolutionStatus} ` +
+          `fallbacks=${fbCount} warnings=${wCount}`
+        );
+      })
+      .catch(err => {
+        console.warn(`   ⚠️  resolver shadow failed: ${err.message}`);
+      });
+  });
+
   return { spec: winner, cached: false, artifactId: String(artifact._id), warnings: winnerWarnings, resolvedInput };
 }
 

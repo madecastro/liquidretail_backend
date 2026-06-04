@@ -163,6 +163,9 @@ router.get('/by-artifact/:id', async (req, res) => {
       // Phase 4 — copy candidates artifact (style-aware). Looked up by
       // the artifact's (brandId, productId, creativeStyle) tuple.
       copyCandidates: await loadCopyCandidatesArtifact(art),
+      // Phase 5a — the Resolver's shadow artifact for this canvas spec.
+      // Null until the eager pass fires (V1 ads will stay null).
+      resolvedLayout: await loadResolvedLayoutArtifact(art),
       // Phase 3 — multi-candidate + Judge surface. Empty on V1/single-candidate.
       multiCandidate: {
         candidateCount:  art.candidateCount || 1,
@@ -274,6 +277,36 @@ async function loadCopyCandidatesArtifact(art) {
     };
   } catch (err) {
     console.warn(`   ⚠️  loadCopyCandidatesArtifact: ${err.message}`);
+    return null;
+  }
+}
+
+// Phase 5a — load the ResolvedLayoutArtifact this canvas spec produced.
+// Null when shadow Resolver hasn't fired yet (older specs) or when the
+// resolution failed at the structure level.
+async function loadResolvedLayoutArtifact(art) {
+  try {
+    if (!art?._id) return null;
+    const ResolvedLayoutArtifact = require('../models/ResolvedLayoutArtifact');
+    const found = await ResolvedLayoutArtifact
+      .findOne({ aiCanvasArtifactId: art._id })
+      .sort({ createdAt: -1 })
+      .lean();
+    if (!found) return null;
+    return {
+      artifactId:       String(found._id),
+      resolutionStatus: found.resolutionStatus,
+      canvas:           found.canvas,
+      resolvedZones:    found.resolvedZones || [],
+      resolvedData:     found.resolvedData || { slots: {} },
+      validation:       found.validation || {},
+      fallbacksUsed:    found.fallbacksUsed || [],
+      warnings:         found.warnings || [],
+      durationMs:       found.durationMs,
+      createdAt:        found.createdAt
+    };
+  } catch (err) {
+    console.warn(`   ⚠️  loadResolvedLayoutArtifact: ${err.message}`);
     return null;
   }
 }
