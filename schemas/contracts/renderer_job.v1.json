@@ -1,0 +1,176 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://reach-social.app/contracts/renderer_job.v1.json",
+  "title": "Renderer Job (v1)",
+  "description": "Engine-neutral draw instructions. Built from a ResolvedLayout + export policy. The Puppeteer renderer consumes this; future Canvas / SVG / native renderers can consume the same shape.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type", "version", "job_id", "source_resolved_layout_id",
+    "canvas", "assets", "draw_order", "export", "qa"
+  ],
+  "properties": {
+    "contract_type": { "type": "string", "const": "renderer_job" },
+    "version":       { "type": "string", "const": "1.0" },
+    "job_id":        { "type": "string" },
+    "source_resolved_layout_id": { "type": "string" },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "background"],
+      "properties": {
+        "width":  { "type": "integer" },
+        "height": { "type": "integer" },
+        "background": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["style", "color"],
+          "properties": {
+            "style": { "type": "string", "enum": ["solid", "gradient", "split_panel", "brand_fill", "transparent"] },
+            "color": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "assets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["images", "videos"],
+      "properties": {
+        "images": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/imageAsset" }
+        },
+        "videos": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/videoAsset" }
+        }
+      }
+    },
+    "draw_order": {
+      "type": "array",
+      "description": "Ordered front-to-back rendering. Entries are typed; renderer dispatches by `type`.",
+      "items": { "$ref": "#/definitions/drawEntry" }
+    },
+    "export": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formats", "scale", "transparent", "filename"],
+      "properties": {
+        "formats":     { "type": "array", "items": { "type": "string", "enum": ["png", "jpg", "webp"] }, "minItems": 1 },
+        "scale":       { "type": "number", "minimum": 0.5, "maximum": 4 },
+        "transparent": { "type": "boolean" },
+        "filename":    { "type": "string" }
+      }
+    },
+    "qa": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["block_if_missing_required_assets", "block_if_rights_unapproved", "watermark_if_rights_unapproved"],
+      "properties": {
+        "block_if_missing_required_assets": { "type": "boolean" },
+        "block_if_rights_unapproved":       { "type": "boolean" },
+        "watermark_if_rights_unapproved":   { "type": "boolean" }
+      }
+    }
+  },
+  "definitions": {
+    "rect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": { "type": "integer" }, "y": { "type": "integer" },
+        "w": { "type": "integer" }, "h": { "type": "integer" }
+      }
+    },
+    "imageAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "url", "fit"],
+      "properties": {
+        "id":    { "type": "string" },
+        "url":   { "type": "string" },
+        "fit":   { "type": "string", "enum": ["cover", "contain", "fill"] },
+        "alt":   { "type": ["string", "null"] }
+      }
+    },
+    "videoAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "url", "poster_url"],
+      "properties": {
+        "id":         { "type": "string" },
+        "url":        { "type": "string" },
+        "poster_url": { "type": ["string", "null"] }
+      }
+    },
+    "drawEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zone_id", "type", "asset_id", "rect", "fit"],
+          "properties": {
+            "zone_id":  { "type": "string" },
+            "type":     { "type": "string", "const": "image" },
+            "asset_id": { "type": "string" },
+            "rect":     { "$ref": "#/definitions/rect" },
+            "fit":      { "type": "string", "enum": ["cover", "contain", "fill"] },
+            "effects":  { "type": "array", "items": { "type": "object" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zone_id", "type", "asset_id", "rect"],
+          "properties": {
+            "zone_id":  { "type": "string" },
+            "type":     { "type": "string", "const": "video" },
+            "asset_id": { "type": "string" },
+            "rect":     { "$ref": "#/definitions/rect" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zone_id", "type", "rect", "class_name"],
+          "properties": {
+            "zone_id":   { "type": "string" },
+            "type":      { "type": "string", "const": "surface" },
+            "rect":      { "$ref": "#/definitions/rect" },
+            "class_name":{ "type": "string" },
+            "style":     { "type": "object" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zone_id", "type", "text", "rect", "class_name"],
+          "properties": {
+            "zone_id":   { "type": "string" },
+            "type":      { "type": "string", "const": "text" },
+            "text":      { "type": "string" },
+            "rect":      { "$ref": "#/definitions/rect" },
+            "class_name":{ "type": "string" },
+            "style":     { "type": "object" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zone_id", "type", "component", "variant", "rect", "class_name", "props"],
+          "properties": {
+            "zone_id":   { "type": "string" },
+            "type":      { "type": "string", "const": "component" },
+            "component": { "type": "string", "description": "Role name from aiVocabulary.ROLES" },
+            "variant":   { "type": "string", "description": "component_style name" },
+            "rect":      { "$ref": "#/definitions/rect" },
+            "class_name":{ "type": "string", "description": "rs-<role>-<variant> + any modifiers" },
+            "props":     { "type": "object" }
+          }
+        }
+      ]
+    }
+  }
+}

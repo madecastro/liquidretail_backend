@@ -1,0 +1,151 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://reach-social.app/contracts/resolved_layout.v1.json",
+  "title": "Resolved Layout (v1)",
+  "description": "Output of the Resolver / Constraint Solver. Slots resolved to actual values, styles computed, fallbacks applied, validations recorded. Renderer consumes this directly.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type", "version", "cache_key",
+    "source_layout_id", "canvas", "resolution_status",
+    "resolved_data", "resolved_zones", "validation", "fallbacks_used", "warnings"
+  ],
+  "properties": {
+    "contract_type": { "type": "string", "const": "resolved_layout" },
+    "version":       { "type": "string", "const": "1.0" },
+    "cache_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layoutGenerationArtifactId", "layoutInputArtifactId"],
+      "properties": {
+        "layoutGenerationArtifactId": { "type": "string" },
+        "layoutInputArtifactId":      { "type": "string" }
+      }
+    },
+    "source_layout_id": { "type": "string" },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "aspect_ratio"],
+      "properties": {
+        "width":        { "type": "integer" },
+        "height":       { "type": "integer" },
+        "aspect_ratio": { "type": "string" }
+      }
+    },
+    "resolution_status": {
+      "type": "string",
+      "enum": ["resolved", "resolved_with_fallbacks", "partial", "failed"]
+    },
+    "resolved_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slots"],
+      "properties": {
+        "slots": {
+          "type": "object",
+          "description": "Map of zone_id → { resolved_value, asset_type }. resolved_value can be a string (text), object (quote/cta), or URL string for image/video assets.",
+          "additionalProperties": { "$ref": "#/definitions/resolvedSlot" }
+        }
+      }
+    },
+    "resolved_zones": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/resolvedZone" }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bounds_check", "overlap_check", "slot_resolution", "contrast_check", "safe_area_check", "missing_assets"],
+      "properties": {
+        "bounds_check":     { "type": "string", "enum": ["pass", "fail"] },
+        "overlap_check":    { "type": "string", "enum": ["pass", "fail", "warn"] },
+        "slot_resolution":  { "type": "string", "enum": ["pass", "fail", "partial"] },
+        "contrast_check":   { "type": "string", "enum": ["pass", "fail", "warn"] },
+        "safe_area_check":  { "type": "string", "enum": ["pass", "fail", "warn"] },
+        "missing_assets":   { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "fallbacks_used": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/fallbackRecord" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "message"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+          "message":  { "type": "string" },
+          "zone_id":  { "type": ["string", "null"] }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "rect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": { "type": "integer" }, "y": { "type": "integer" },
+        "w": { "type": "integer" }, "h": { "type": "integer" }
+      }
+    },
+    "resolvedSlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved_value", "asset_type"],
+      "properties": {
+        "resolved_value": { },
+        "asset_type":     { "type": "string", "enum": ["text", "image", "video", "quote", "cta", "stats", "rating", "badges", "creator", "offer"] },
+        "from_path":      { "type": ["string", "null"], "description": "Original slot path before resolution" },
+        "from_fallback":  { "type": ["string", "null"], "description": "If filled from defaults, which defaults.* path" }
+      }
+    },
+    "resolvedZone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "component_style", "rect", "css_class", "computed", "adjustments"],
+      "properties": {
+        "id":              { "type": "string" },
+        "role":            { "type": "string" },
+        "component_style": { "type": ["string", "null"] },
+        "rect":            { "$ref": "#/definitions/rect" },
+        "css_class":       { "type": "string", "description": "rs-<role>-<component_style>" },
+        "computed": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Per-zone computed styles: font_family, font_size, line_height, max_lines, text_color, etc. Free-form to allow component-specific extensions."
+        },
+        "adjustments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "reason"],
+            "properties": {
+              "type":     { "type": "string" },
+              "reason":   { "type": "string" },
+              "strategy": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "fallbackRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["zone_id", "role", "from_component_style", "to_component_style", "reason"],
+      "properties": {
+        "zone_id":              { "type": "string" },
+        "role":                 { "type": "string" },
+        "from_component_style": { "type": ["string", "null"] },
+        "to_component_style":   { "type": ["string", "null"], "description": "null = zone removed" },
+        "reason":               { "type": "string" }
+      }
+    }
+  }
+}
