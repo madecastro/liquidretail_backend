@@ -119,18 +119,30 @@ router.get('/by-artifact/:id', async (req, res) => {
     }).lean();
 
     let input = inputArt?.input || null;
+    let inputBuildWarning = null;
     if (!input) {
-      input = await buildLayoutInput({
-        mediaId:     art.mediaId,
-        template:    'ugc_split_screen',
-        aspectRatio: art.aspectRatio,
-        options: {
-          productId:     art.productId,
-          variantKind:   art.variantKind,
-          paletteSource: art.paletteSource
-        },
-        refresh: false
-      });
+      // buildLayoutInput throws when the source Media is missing (e.g.,
+      // orphaned AiCanvasArtifact whose Media got cleaned up). Catch
+      // and serve what we can — spec + concepts + resolved layout are
+      // still useful diagnostically; only the input-driven slot resolution
+      // suffers. Skip the rebuild rather than 500-ing the whole endpoint.
+      try {
+        input = await buildLayoutInput({
+          mediaId:     art.mediaId,
+          template:    'ugc_split_screen',
+          aspectRatio: art.aspectRatio,
+          options: {
+            productId:     art.productId,
+            variantKind:   art.variantKind,
+            paletteSource: art.paletteSource
+          },
+          refresh: false
+        });
+      } catch (err) {
+        console.warn(`   ⚠️  by-artifact: buildLayoutInput failed for media=${art.mediaId} (${err.message}) — serving spec without input`);
+        inputBuildWarning = err.message || 'layout input rebuild failed';
+        input = {};   // empty input; renderer will show placeholders for slots
+      }
     }
 
     // Resolve the spec's style_bindings against the input. The AI
@@ -175,7 +187,10 @@ router.get('/by-artifact/:id', async (req, res) => {
         judgeRationale:  art.judgeRationale || null,
         judgeConfidence: art.judgeConfidence ?? null
       },
-      validationWarnings: art.validationWarnings || [],
+      validationWarnings: [
+        ...(art.validationWarnings || []),
+        ...(inputBuildWarning ? [`[orphaned] ${inputBuildWarning}`] : [])
+      ],
       // Full prompt — system block, user block (FULL CONTEXT JSON +
       // intent + vision-input list), and the image attachment URLs that
       // were passed alongside as image_url parts. Older artifacts
