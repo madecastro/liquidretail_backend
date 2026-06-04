@@ -202,6 +202,18 @@ const campaignSchema = new mongoose.Schema({
   //   }
   promotionalDetails: mongoose.Schema.Types.Mixed,
 
+  // Phase 2 opt-in: route this campaign's AI ad generation through the
+  // new Creative-Director-driven Generator (V2 prompt + Director concept
+  // consumed at render time). When false, the legacy aiCanvasSpec path
+  // (Phase 1d-* prompt) runs unchanged. Default false so existing
+  // campaigns are unaffected; flipped to true per-campaign for
+  // A/B validation through Phase 7.
+  aiCreativeV2Enabled: { type: Boolean, default: false },
+  // Optional operator creative-intent hint, consumed by the Director
+  // (and forwarded to the Generator as the concept's emotional anchor).
+  // null = "AI decides everything." Phase 9 surfaces this in the wizard.
+  creativeIntent:      { type: String, default: null },
+
   // Full raw payload from the platform — capped to ~16KB worth of
   // JSON. Useful for debugging and for fields we haven't mapped yet.
   rawData:       mongoose.Schema.Types.Mixed,

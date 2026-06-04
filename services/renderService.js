@@ -121,6 +121,21 @@ async function renderCreative(req) {
   const supportsVideoTemplate = VIDEO_TEMPLATES.has(req.creative.template);
   const useVideoBranch = isVideoSource && supportsVideoTemplate && sourceMedia?.fileUrl?.includes('/video/upload/');
 
+  // Phase 2 V2 flag — look up the campaign to see whether to dispatch
+  // through the new Director-driven Generator. Cheap select; no LLM.
+  let aiCreativeV2 = false;
+  let creativeIntent = null;
+  let campaignKind = null;
+  if (req.campaignId) {
+    try {
+      const Campaign = require('../models/Campaign');
+      const camp = await Campaign.findById(req.campaignId).select('aiCreativeV2Enabled creativeIntent kind').lean();
+      aiCreativeV2   = !!camp?.aiCreativeV2Enabled;
+      creativeIntent = camp?.creativeIntent || null;
+      campaignKind   = camp?.kind || null;
+    } catch (_) { /* default to V1 path */ }
+  }
+
   // 4. render — Puppeteer screenshot
   let renderOutput;
   try {
@@ -133,7 +148,13 @@ async function renderCreative(req) {
       mediaId:      req.creative.mediaId,
       brandId:      req.brandId,
       authToken:    req.authToken || null,
-      renderMode:   useVideoBranch ? 'video-overlay' : 'static'
+      renderMode:   useVideoBranch ? 'video-overlay' : 'static',
+      // V2 routing — only set when the campaign opted in. The legacy
+      // pipeline is unaffected for unflagged campaigns.
+      aiCreativeV2,
+      creativeIntent,
+      campaignKind,
+      productId:    req.creative.productId || null
     });
     stages.render = Date.now() - t;
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB, mode=${useVideoBranch ? 'video-overlay' : 'static'})`);
@@ -339,7 +360,7 @@ function decodeTokenPayload(token) {
   );
 })();
 
-async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static' }) {
+async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static', aiCreativeV2 = false, campaignKind = null, creativeIntent = null, productId = null }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
   // renderMode = 'static' → opaque PNG of full canvas (image media or
@@ -359,6 +380,16 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
   // re-derive that timed out at the 30s Netlify gateway. Fetching the
   // artifact by id eliminates the entire cache-miss class.
   if (layoutInputArtifactId) url.searchParams.set('layoutInputArtifactId', String(layoutInputArtifactId));
+  // Phase 2 — when the campaign opts into V2, signal the by-id route to
+  // dispatch through aiCanvasSpecService's V2 path (Director-driven
+  // Generator). campaignKind + creativeIntent + productId let the route
+  // look up the matching CreativeDirectionArtifact.
+  if (aiCreativeV2) {
+    url.searchParams.set('v2', '1');
+    if (campaignKind)   url.searchParams.set('campaignKind',   campaignKind);
+    if (creativeIntent) url.searchParams.set('creativeIntent', creativeIntent);
+    if (productId)      url.searchParams.set('productId',      String(productId));
+  }
   const isVideoOverlay = renderMode === 'video-overlay';
 
   let browser;

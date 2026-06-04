@@ -192,22 +192,30 @@ function getInputPath(obj, path) {
   return path.split('.').reduce((acc, k) => (acc == null ? null : acc[k]), obj);
 }
 
-// Phase 1 SHADOW lookup. Given an AiCanvasArtifact, find any
-// CreativeDirectionArtifact that COULD have informed it (matches on
-// brandId + productId). Since the shadow Director runs after the
-// cartesian but the legacy render path doesn't reference back to a
-// concept_id yet, we surface the most recent matching artifact for
-// inspection. Phase 2 will use exact concept_id wiring.
+// Load the CreativeDirectionArtifact that informed this AiCanvasArtifact.
+//
+//   Phase 2: if art.directionArtifactId is set, fetch that one exactly +
+//   highlight which concept was used (matching art.directionConceptId).
+//   Phase 1 fallback: art has no Director reference → look up the most
+//   recent matching (brandId, productId) artifact as "what the Director
+//   would have picked." Useful for V1 ads before Phase 2 cutover.
 async function loadShadowCreativeDirection(art) {
   try {
     if (!art?.brandId) return null;
     const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
-    const filter = { brandId: art.brandId };
-    if (art.productId) filter.productId = art.productId;
-    const direction = await CreativeDirectionArtifact
-      .findOne(filter)
-      .sort({ createdAt: -1 })
-      .lean();
+    let direction = null;
+    let pickedConceptId = art.directionConceptId || null;
+    if (art.directionArtifactId) {
+      direction = await CreativeDirectionArtifact.findById(art.directionArtifactId).lean();
+    }
+    if (!direction) {
+      const filter = { brandId: art.brandId };
+      if (art.productId) filter.productId = art.productId;
+      direction = await CreativeDirectionArtifact
+        .findOne(filter)
+        .sort({ createdAt: -1 })
+        .lean();
+    }
     if (!direction) return null;
     return {
       artifactId:    String(direction._id),
@@ -217,6 +225,8 @@ async function loadShadowCreativeDirection(art) {
         campaignKind:   direction.campaignKind   || null,
         creativeIntent: direction.creativeIntent || null
       },
+      pickedConceptId,                // null on V1 ads
+      consumedByThisArtifact: !!art.directionArtifactId,
       inputSummary:        direction.inputSummary,
       availableArchetypes: direction.availableArchetypes,
       concepts:            direction.concepts,

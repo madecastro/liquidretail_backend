@@ -75,6 +75,15 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   // empirically converges on across many generations.
   hierarchySpec:    { type: mongoose.Schema.Types.Mixed, default: null },
 
+  // Phase 2 — when this spec was generated via the V2 path, these
+  // reference the CreativeDirectionArtifact + the specific concept
+  // (within that artifact's concepts[] array) the Generator materialized.
+  // Null on legacy / V1 specs. Used by the spec preview to surface the
+  // concept that drove this canvas and by Phase 3 consistency checks
+  // ("did the Generator stay true to the concept's strategy?").
+  directionArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'CreativeDirectionArtifact', default: null, index: true },
+  directionConceptId:  { type: String, default: null },
+
   // Semver of the AI-spec schema (the JSON Schema we feed to OpenAI).
   // Bump when the response schema changes — old cached docs become
   // unusable; service re-generates on miss.

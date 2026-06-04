@@ -441,7 +441,7 @@ function buildResponseSchema(aspectRatio) {
 }
 
 // ── Prompt construction ─────────────────────────────────────────────
-function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext }) {
+function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext, directionConcept = null }) {
   const styleSpec = CREATIVE_STYLES[creativeStyle];
   if (!styleSpec) throw new Error(`Unknown creativeStyle: ${creativeStyle}`);
 
@@ -589,6 +589,38 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext 
     `TARGET CANVAS: aspect_ratio=${aspectRatio}, width=${width}, height=${height}.`,
     ``
   ];
+
+  // Phase 2 V2 — when the Creative Director supplied a concept, inject
+  // it as a directive at the TOP of the user message. The system prompt
+  // still has the archetype menu (for legacy V1 callers) but the LLM is
+  // told to MATERIALIZE this concept rather than invent a strategy.
+  // Hierarchy_spec the LLM emits should match the concept's archetype
+  // and priorities — that's checked by the V2 consistency validator.
+  if (directionConcept) {
+    userLines.push(`── CREATIVE DIRECTION (from the Director — MATERIALIZE THIS CONCEPT) ──`);
+    userLines.push('```json');
+    userLines.push(JSON.stringify({
+      concept_id:             directionConcept.concept_id,
+      name:                   directionConcept.name,
+      archetype:              directionConcept.archetype,
+      layout_family:          directionConcept.layout_family,
+      emotional_hook:         directionConcept.emotional_hook,
+      social_proof_type:      directionConcept.social_proof_type,
+      product_priority:       directionConcept.product_priority,
+      ugc_priority:           directionConcept.ugc_priority,
+      comment_priority:       directionConcept.comment_priority,
+      stat_priority:          directionConcept.stat_priority,
+      cta_emphasis:           directionConcept.cta_emphasis,
+      recommended_components: directionConcept.recommended_components || {},
+      rationale:              directionConcept.rationale
+    }, null, 2));
+    userLines.push('```');
+    userLines.push(``);
+    userLines.push(`Your hierarchy_spec MUST match the concept's archetype, layout_family, emotional_hook, social_proof_type, *_priority, and cta_emphasis VERBATIM. Your zones[] MUST satisfy each high/medium priority role. Use the recommended_components map as the default per-zone style_variant pick — override only when a constraint demands it (missing prop, no space, etc.) and note the override in rationale.`);
+    userLines.push(``);
+    userLines.push(`Do not invent a different archetype or alternative strategy. The strategy is GIVEN.`);
+    userLines.push(``);
+  }
 
   if (images.length) {
     userLines.push(`VISION INPUTS (attached as image parts in this message, in order):`);
@@ -901,7 +933,13 @@ async function getOrGenerate({
   paletteSource    = 'media',
   advertiserId     = null,
   brandId          = null,
-  refresh          = false
+  refresh          = false,
+  // Phase 2 V2 — when supplied, the Director's concept fills in the
+  // strategy + recommended_components and the prompt drops the
+  // archetype menu / "decide first" instructions. Generator's job
+  // becomes materialization, not strategy invention.
+  directionArtifactId = null,
+  directionConcept    = null    // the concept object itself (not just its id)
 }) {
   if (!input)         throw new Error('input required');
   if (!template)      throw new Error('template required');
@@ -974,14 +1012,27 @@ async function getOrGenerate({
     variantKind, campaignContextHash, paletteSource, creativeStyle
   });
 
+  // V2 cache discipline: when a Director concept is supplied, only
+  // serve cached entries whose directionConceptId matches. A legacy
+  // V1 entry (directionConceptId: null) cached at the same cartesian
+  // key must NOT serve a V2 request — and vice versa. The unique
+  // index doesn't include directionConceptId yet (Phase 8 cleanup),
+  // so the cache CHECK enforces the separation here.
+  const isV2 = !!directionConcept;
+  const v2ConceptId = directionConcept?.concept_id || null;
+
   if (!refresh) {
     const cached = await AiCanvasArtifact.findOne(filter).lean();
-    if (cached && cached.specSchemaVersion === SPEC_SCHEMA_VERSION) {
+    const cachedMatchesMode = cached && (
+      (isV2  && cached.directionConceptId === v2ConceptId) ||
+      (!isV2 && (cached.directionConceptId == null))
+    );
+    if (cached && cachedMatchesMode && cached.specSchemaVersion === SPEC_SCHEMA_VERSION) {
       // Log the cache hit (0-cost) so per-(stage, cacheKey) hit-rate
       // metrics are accurate. Fire-and-forget — don't await; telemetry
       // can't block the render path.
       recordCacheHit({
-        stage:       'legacy_ai_canvas_spec',
+        stage:       isV2 ? 'layout_generator' : 'legacy_ai_canvas_spec',
         provider:    'openai',
         model:       MODEL_ID,
         purposeTag:  template,
@@ -999,7 +1050,16 @@ async function getOrGenerate({
     }
   }
 
-  const { system, user } = buildPrompt({ input, template, aspectRatio, creativeStyle, richContext });
+  // Phase 2 — when V2 (directionConcept provided), compress vision
+  // attachments to 512×512 max via Cloudinary q_auto:eco transforms.
+  // Cuts vision tokens ~70% (Lever 3) without measurable quality loss
+  // for composition decisions.
+  if (directionConcept && richContext?.images?.length) {
+    const { compressVisionAttachments } = require('./aiCreativeV2Helpers');
+    richContext = { ...richContext, images: compressVisionAttachments(richContext.images, 512) };
+  }
+
+  const { system, user } = buildPrompt({ input, template, aspectRatio, creativeStyle, richContext, directionConcept });
   const responseSchema = buildResponseSchema(aspectRatio);
   const promptHash = crypto.createHash('sha256').update(system + '\n' + user).digest('hex');
 
@@ -1015,14 +1075,15 @@ async function getOrGenerate({
 
   const t0 = Date.now();
   // Wrapped in trackLlmCall so input/output tokens, vision-image count,
-  // duration, and best-effort cost land in CostLog. Stage 'legacy_ai_canvas_spec'
-  // until Phase 2 swaps this in for the new Generator service.
+  // duration, and best-effort cost land in CostLog. V2 (Director-driven)
+  // calls log under stage='layout_generator' so $/spec deltas between
+  // V1 and V2 are queryable for the Phase 2 validation gate.
   const completion = await trackLlmCall(
     {
-      stage:       'legacy_ai_canvas_spec',
+      stage:       isV2 ? 'layout_generator' : 'legacy_ai_canvas_spec',
       provider:    'openai',
       model:       MODEL_ID,
-      purposeTag:  template,
+      purposeTag:  isV2 ? `v2:${v2ConceptId || 'unknown'}` : template,
       brandId, mediaId, productId,
       visionImages: images.length,
       cacheKey:    costCacheKey
@@ -1077,6 +1138,10 @@ async function getOrGenerate({
       elementsUsed:      spec.elements_used  || [],
       elementsSkipped:   spec.elements_skipped || [],
       hierarchySpec:     spec.hierarchy_spec || null,
+      // Phase 2 — when this spec was V2-generated, link back to the
+      // concept that drove it. Null on V1/legacy generations.
+      directionArtifactId: directionArtifactId || null,
+      directionConceptId:  directionConcept?.concept_id || null,
       specSchemaVersion: SPEC_SCHEMA_VERSION,
       createdAt:         new Date()
     },

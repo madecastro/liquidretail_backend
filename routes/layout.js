@@ -113,6 +113,38 @@ router.get('/by-id/:id', async (req, res) => {
     if (registry.isAi(artifact.template)) {
       const aiSvc = require('../services/aiCanvasSpecService');
       const aiNorm = registry.getNormalized(artifact.template);
+
+      // Phase 2 V2 dispatch — when ?v2=1 is on the URL (renderService
+      // appended it from Campaign.aiCreativeV2Enabled), look up the
+      // Director's concept for (brandId, productId, campaignKind,
+      // creativeIntent) and feed it to the Generator.
+      let directionArtifactId = null;
+      let directionConcept    = null;
+      if (req.query.v2 === '1' && artifact.brandId) {
+        try {
+          const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
+          const { pickConceptForCell } = require('../services/aiCreativeV2Helpers');
+          const directionFilter = {
+            brandId:        artifact.brandId,
+            productId:      artifact.productId || req.query.productId || null,
+            campaignKind:   req.query.campaignKind   || null,
+            creativeIntent: req.query.creativeIntent || null
+          };
+          const direction = await CreativeDirectionArtifact.findOne(directionFilter).lean();
+          if (direction?.concepts?.length) {
+            directionArtifactId = String(direction._id);
+            // Cell key combines media + paletteSource so cells of the
+            // same product spread across the Director's concepts.
+            const cellKey = `${artifact.mediaId}|${artifact.paletteSource || ''}|${artifact.variantKind || ''}`;
+            directionConcept = pickConceptForCell({ concepts: direction.concepts, cellKey });
+          } else {
+            console.warn(`   ⚠️  v2 requested but no Director concepts found for brand=${artifact.brandId} product=${directionFilter.productId || '-'} kind=${directionFilter.campaignKind || '-'} — falling back to V1`);
+          }
+        } catch (err) {
+          console.warn(`   ⚠️  v2 director lookup failed: ${err.message} — falling back to V1`);
+        }
+      }
+
       const result = await aiSvc.getOrGenerate({
         input:           artifact.input,
         template:        artifact.template,
@@ -125,7 +157,10 @@ router.get('/by-id/:id', async (req, res) => {
         paletteSource:   artifact.paletteSource,
         advertiserId:    artifact.advertiserId,
         brandId:         artifact.brandId,
-        refresh:         false
+        refresh:         false,
+        // V2 inputs — null on V1 path; getOrGenerate branches internally.
+        directionArtifactId,
+        directionConcept
       });
       input          = result.resolvedInput || artifact.input;
       canvas         = result.spec;
