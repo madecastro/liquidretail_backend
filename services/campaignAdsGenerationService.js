@@ -461,6 +461,20 @@ async function expandWizardJob({
     `newlyQueued=${newAdIds.length} alreadyQueued=${alreadyQueued} totalQueued=${queuedCount}`
   );
 
+  // Phase 1 SHADOW — run the Creative Director per unique (productId)
+  // for this campaign. One Director call per product regardless of how
+  // many ads the cartesian queued for it (Lever 1 caching).
+  // Fire-and-forget: the new artifacts are persisted but the legacy
+  // render path doesn't consume them yet. Phase 2 wires them in.
+  runCreativeDirectorShadow({
+    brandId,
+    productIds: Array.from(new Set(payloads.map(p => p.productId).filter(Boolean))),
+    campaignKind,
+    creativeIntent: null   // Phase 9 UX adds an operator hint here
+  }).catch(err => {
+    console.warn(`   ⚠️  creative-director shadow failed: ${err.message}`);
+  });
+
   return {
     campaignId: String(campaignId),
     brandId,
@@ -890,6 +904,39 @@ function dedupeSeeds(seeds) {
     out.push(s);
   }
   return out;
+}
+
+// Phase 1 SHADOW: run the Creative Director once per unique product in
+// the cartesian. Director is cache-keyed on (brandId, productId,
+// campaignKind, creativeIntent) so repeat calls are cheap. Errors are
+// swallowed — telemetry-only stage; legacy render path is unaffected.
+async function runCreativeDirectorShadow({ brandId, productIds, campaignKind, creativeIntent }) {
+  if (!brandId || !Array.isArray(productIds)) return;
+  const director = require('./aiCreativeDirectorService');
+  const uniq = Array.from(new Set(productIds.map(String)));
+  // Include the productId-null case for brand campaigns where the
+  // cartesian fans out with no specific product (rare today but the
+  // contract supports it).
+  if (!uniq.length) uniq.push(null);
+
+  // Run in parallel — small fanout (≤ ~5 unique products per campaign).
+  await Promise.all(uniq.map(async (pid) => {
+    try {
+      const { artifact, cached } = await director.directConcepts({
+        brandId,
+        productId:      pid,
+        campaignKind,
+        creativeIntent
+      });
+      console.log(
+        `🎭 creative-director shadow ${cached ? 'CACHE-HIT' : 'GENERATED'} ` +
+        `brand=${brandId} product=${pid || '-'} kind=${campaignKind || '-'} ` +
+        `concepts=${(artifact.concepts || []).length}`
+      );
+    } catch (err) {
+      console.warn(`   ⚠️  director[product=${pid || '-'}]: ${err.message}`);
+    }
+  }));
 }
 
 module.exports = {

@@ -156,6 +156,10 @@ router.get('/by-artifact/:id', async (req, res) => {
       elementsUsed:      art.elementsUsed,
       elementsSkipped:   art.elementsSkipped,
       hierarchySpec:     art.hierarchySpec || art.canvasSpec?.hierarchy_spec || null,
+      // Phase 1 shadow — Creative Director artifact for (brandId, productId).
+      // Looked up by recent-most match; not coupled to this specific
+      // AiCanvasArtifact yet. Phase 2 will reference by concept_id.
+      creativeDirection: await loadShadowCreativeDirection(art),
       validationWarnings: art.validationWarnings || [],
       // Full prompt — system block, user block (FULL CONTEXT JSON +
       // intent + vision-input list), and the image attachment URLs that
@@ -186,6 +190,44 @@ function resolveAiSpecBindings(bindings, input) {
 function getInputPath(obj, path) {
   if (!obj || typeof path !== 'string') return null;
   return path.split('.').reduce((acc, k) => (acc == null ? null : acc[k]), obj);
+}
+
+// Phase 1 SHADOW lookup. Given an AiCanvasArtifact, find any
+// CreativeDirectionArtifact that COULD have informed it (matches on
+// brandId + productId). Since the shadow Director runs after the
+// cartesian but the legacy render path doesn't reference back to a
+// concept_id yet, we surface the most recent matching artifact for
+// inspection. Phase 2 will use exact concept_id wiring.
+async function loadShadowCreativeDirection(art) {
+  try {
+    if (!art?.brandId) return null;
+    const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
+    const filter = { brandId: art.brandId };
+    if (art.productId) filter.productId = art.productId;
+    const direction = await CreativeDirectionArtifact
+      .findOne(filter)
+      .sort({ createdAt: -1 })
+      .lean();
+    if (!direction) return null;
+    return {
+      artifactId:    String(direction._id),
+      cacheKey: {
+        brandId:        direction.brandId    ? String(direction.brandId)    : null,
+        productId:      direction.productId  ? String(direction.productId)  : null,
+        campaignKind:   direction.campaignKind   || null,
+        creativeIntent: direction.creativeIntent || null
+      },
+      inputSummary:        direction.inputSummary,
+      availableArchetypes: direction.availableArchetypes,
+      concepts:            direction.concepts,
+      modelId:             direction.modelId,
+      validationWarnings:  direction.validationWarnings || [],
+      createdAt:           direction.createdAt
+    };
+  } catch (err) {
+    console.warn(`   ⚠️  loadShadowCreativeDirection: ${err.message}`);
+    return null;
+  }
 }
 
 module.exports = router;
