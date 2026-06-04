@@ -540,6 +540,15 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     ``,
     `CRITICAL: text zones (kind=text, headline, eyebrow_rules, etc.) do NOT get their own background. Text sits directly on whatever surface its rect overlaps. If you want a darker reading surface, add an explicit kind='panel' zone with its own rect + panel_bg, then position the text rect INSIDE that panel.`,
     ``,
+    `CRITICAL: panel zones sit ON TOP of media zones (z-index by layer: media=0, background=1, copy=3). Do NOT emit a panel whose rect covers (or substantially overlaps) the media zone — that BLANKS the photo. A panel is a TEXT-SURFACE element, sized to the text region. Patterns that work:`,
+    `  - Bottom band panel — rect.y ≥ 600, height 200-400, behind headline + cta. Photo shows in top 60-70%.`,
+    `  - Side strip panel — half-width vertical, behind a stack of text. Photo shows in the other half.`,
+    `  - Card panel — small rect behind a quote or stat. Photo shows around it.`,
+    `Patterns that BLANK the photo (forbidden):`,
+    `  - Panel with rect 0,0 1000x1000 + dark panel_bg → covers entire media.`,
+    `  - Panel covering >60% of the media zone's area with non-transparent bg → renderer applies an opacity guard but the layout still reads broken.`,
+    `If you want a tinted/scrim effect across the whole photo, use canvas.background.style: "gradient" or "brand_fill" (which the renderer applies as a background fill, NOT as an overlay zone). Or set visual_direction.glass_level on the panel for translucency.`,
+    ``,
     `Return creative_style + rationale + elements_used + elements_skipped. In rationale, name the chosen archetype (A–H) + why the FULL CONTEXT pointed to it.`,
     ``,
     `── HIERARCHY SPEC (decide this FIRST) ──`,
@@ -770,6 +779,35 @@ function validateSpec(spec, aspectRatio) {
     const v = sb[k];
     if (typeof v === 'string' && v.startsWith('#') && !['#FFFFFF', '#FFF', '#000', '#000000', '#0A0A0A', '#F5F5F5'].includes(v.toUpperCase())) {
       warnings.push(`${k} picked literal hex "${v}" (instead of brand.* path) — verify rationale explains why`);
+    }
+  }
+
+  // Panel-over-media safety check (post z-index fix). Any panel zone
+  // covering >60% of a media zone's area gets dampened to opacity 0.35
+  // at render time, but the spec is still broken — the LLM intended a
+  // backdrop and got an obscuring overlay. Warn so the operator (and
+  // future judge) can de-rank.
+  const mediaRects = spec.zones.filter(z =>
+    (z.kind === 'media' || z.role === 'hero_media' || z.role === 'support_media') && z.rect
+  );
+  for (const z of spec.zones) {
+    const isPanel = z.kind === 'panel' || z.role === 'panel' || z.role === 'scrim';
+    if (!isPanel || !z.rect) continue;
+    const pArea = (z.rect.w || 0) * (z.rect.h || 0);
+    if (!pArea) continue;
+    for (const m of mediaRects) {
+      const mArea = (m.rect.w || 0) * (m.rect.h || 0);
+      if (!mArea) continue;
+      const x1 = Math.max(z.rect.x, m.rect.x);
+      const y1 = Math.max(z.rect.y, m.rect.y);
+      const x2 = Math.min(z.rect.x + z.rect.w, m.rect.x + m.rect.w);
+      const y2 = Math.min(z.rect.y + z.rect.h, m.rect.y + m.rect.h);
+      const overlap = (x2 <= x1 || y2 <= y1) ? 0 : (x2 - x1) * (y2 - y1);
+      const pctOfMedia = overlap / mArea;
+      if (pctOfMedia > 0.6) {
+        warnings.push(`panel zone "${z.id}" covers ${Math.round(pctOfMedia * 100)}% of media zone "${m.id}" — renderer will auto-dampen opacity. Resize the panel to the text region (bottom band, side strip, or card sized to copy).`);
+        break;
+      }
     }
   }
 
