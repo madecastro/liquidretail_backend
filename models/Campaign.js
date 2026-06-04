@@ -202,13 +202,13 @@ const campaignSchema = new mongoose.Schema({
   //   }
   promotionalDetails: mongoose.Schema.Types.Mixed,
 
-  // Phase 2 opt-in: route this campaign's AI ad generation through the
-  // new Creative-Director-driven Generator (V2 prompt + Director concept
-  // consumed at render time). When false, the legacy aiCanvasSpec path
-  // (Phase 1d-* prompt) runs unchanged. Default false so existing
-  // campaigns are unaffected; flipped to true per-campaign for
-  // A/B validation through Phase 7.
-  aiCreativeV2Enabled: { type: Boolean, default: false },
+  // Phase 2 V2 routing — uses the Director-driven Generator + Judge
+  // pipeline. Default flipped to TRUE so newly-created campaigns
+  // automatically pick up the new flow; existing campaigns keep their
+  // stored value (which was `false` for anything created pre-cutover —
+  // they stay on V1 until explicitly updated). Set to false on a
+  // specific campaign to force the legacy aiCanvasSpec path.
+  aiCreativeV2Enabled: { type: Boolean, default: true },
   // Optional operator creative-intent hint, consumed by the Director
   // (and forwarded to the Generator as the concept's emotional anchor).
   // null = "AI decides everything." Phase 9 surfaces this in the wizard.
