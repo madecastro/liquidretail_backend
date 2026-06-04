@@ -520,7 +520,7 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     `  Text bindings (explicit hex):`,
     `    panel_text_color, headline_text_color, card_text_color, cta_text_color → "#FFFFFF" / "#0A0A0A" / etc.`,
     ``,
-    `DO NOT invent a "brand-feeling" hex for panel_bg. The brand has a primary_color in the FULL CONTEXT — use the PATH "brand.primary_color" so the rendered ad matches the real brand identity. Picking a literal hex from the photo (cream, yellow, etc.) is almost always wrong.`,
+    `BRAND COLORS — soft preference, not a hard rule. Default to brand.* PATHS (panel_bg: "brand.primary_color", card_bg: "brand.secondary_color", etc.) so the ad inherits the brand identity AND auto-updates when the brand changes its colors. BUT — when the brand's literal color creates a real composition problem (e.g., brand primary is too light to read white headline text against, OR a darker desaturated brand-tone reads better as panel_bg over a busy photo), you MAY pick a complementary hex that fits the brand's palette family. Avoid: random photo-sampled hexes unrelated to brand identity (cream / pastel pulled from the food). Prefer: brand-adjacent shades (slightly darker/lighter brand primary, complement of brand accent). When you DO pick a literal hex, the rationale should briefly justify why brand path didn't work.`,
     ``,
     `CANVAS BACKGROUND.STYLE — pick based on the chosen archetype:`,
     `  full-bleed hero (A/E)              → "solid" with panel_bg null (let media cover)`,
@@ -759,16 +759,17 @@ function validateSpec(spec, aspectRatio) {
   }
 
   // Brand-identity sanity: panel_bg / card_bg as a literal hex when a
-  // brand color path is available almost always means the LLM cherry-
-  // picked a "brand-feeling" color from the photo instead of using
-  // the actual brand identity. Warn so the judge / operator can see it.
-  // The check is style-binding only — we don't know what brand.* is
-  // here, so we just flag literal hex picks on the dominant surfaces.
+  // Brand-identity preference (soft): literal hex on the dominant
+  // surfaces is now ALLOWED when the LLM has a real compositional
+  // reason (per the loosened prompt). We still log it as a low-severity
+  // info note so the operator can spot batches where the LLM is
+  // routinely abandoning brand colors. Not a hard warning — the
+  // hierarchy_consistency and contrast checks are stricter.
   const sb = spec.style_bindings || {};
   for (const k of ['panel_bg', 'card_bg']) {
     const v = sb[k];
     if (typeof v === 'string' && v.startsWith('#') && !['#FFFFFF', '#FFF', '#000', '#000000', '#0A0A0A', '#F5F5F5'].includes(v.toUpperCase())) {
-      warnings.push(`${k} is a non-neutral literal hex "${v}" — prefer a brand.* path so the surface inherits brand identity`);
+      warnings.push(`${k} picked literal hex "${v}" (instead of brand.* path) — verify rationale explains why`);
     }
   }
 
