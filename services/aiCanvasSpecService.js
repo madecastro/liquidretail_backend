@@ -1051,6 +1051,25 @@ async function getOrGenerate({
         brandId, mediaId, productId,
         cacheKey:    costCacheKey
       }).catch(() => {});
+      // Phase 5a lazy backfill — when a render hits a cached AiCanvasArtifact
+      // that doesn't yet have a ResolvedLayoutArtifact (pre-Phase-5a specs,
+      // or shadows that failed on first generation), fire the Resolver
+      // fire-and-forget. The resolver itself is also cache-keyed on
+      // aiCanvasArtifactId so the second call hits cache instead of
+      // re-resolving. Setting `refresh: false` (the default) means already
+      // resolved specs are no-op.
+      setImmediate(() => {
+        const resolver = require('./layoutResolverService');
+        resolver.resolveLayout({ aiCanvasArtifactId: cached._id })
+          .then(({ cached: rCached }) => {
+            if (!rCached) {
+              console.log(`🧩 resolver backfill: aiCanvasArtifact=${cached._id}`);
+            }
+          })
+          .catch(err => {
+            console.warn(`   ⚠️  resolver backfill failed: ${err.message}`);
+          });
+      });
       const resolvedInput = applyCopyPicks(inputWithCandidates, cached.canvasSpec);
       return {
         spec:          cached.canvasSpec,
