@@ -108,6 +108,12 @@ function doResolve({ canvasSpec, layoutInput }) {
   const missingAssets = [];
   let   slotPartial   = false;
 
+  // Phase 5b.1 — stage base font, mirrors templatePreview.applyCanvasSize:
+  //   stage.style.fontSize = Math.max(12, canvasW / 22)px
+  // Every em-relative CSS rule cascades off this number.
+  const baseFontPx = Math.max(12, canvasW / 22);
+  const zoneScalers = canvasSpec?.zone_scalers || {};
+
   for (const zone of zones) {
     // Normalize kind → role using the legacy alias map (renderer-side
     // does the same for back-compat through Phase 8).
@@ -155,6 +161,19 @@ function doResolve({ canvasSpec, layoutInput }) {
 
     const cssClass = finalComponentStyle ? cssClassFor(role, finalComponentStyle) : '';
 
+    // Phase 5b.1 — port the CSS calc/clamp rules from tp-zones.css into
+    // concrete pixel values. The renderer can read these as inline
+    // styles in 5b.2; today they're diagnostic in the spec preview.
+    const computedStyles = computeStylesForZone({
+      role,
+      componentStyle: finalComponentStyle,
+      kind:           zone.kind || role,
+      rect:           zone.rect,
+      zoneScaler:     pickZoneScaler({ zoneScalers, id: zone.id, kind: zone.kind, role }),
+      baseFontPx,
+      styleVariant:   zone.style_variant
+    });
+
     resolvedZones.push({
       id:               zone.id,
       role,
@@ -165,14 +184,13 @@ function doResolve({ canvasSpec, layoutInput }) {
       layer:            zone.layer,
       slot:             zone.slot,
       css_class:        cssClass,
-      // Phase 5a — minimal computed block. Phase 5b ports the CSS
-      // clamp/calc math (font sizing, line clamping, contrast).
       computed: {
         font_family_body:    canvasSpec?.style_bindings?.font_family_body    || null,
         font_family_display: canvasSpec?.style_bindings?.font_family_display || null,
         text_color:          inferTextColor({ canvasSpec, role }),
-        max_lines:           zone.max_lines ?? null,
-        radius:              zone.radius    ?? null
+        radius_px:           zone.radius ?? null,
+        max_lines:           zone.max_lines ?? computedStyles.max_lines_default,
+        ...computedStyles
       },
       adjustments: removed ? [{ type: 'remove', reason: 'fallback chain exhausted' }] : []
     });
@@ -365,6 +383,171 @@ function augmentInput(rawInput, canvasSpec) {
   if (picks.subheadline_pick != null && at(cc.subheadlines, picks.subheadline_pick) != null) next.copy.subheadline = at(cc.subheadlines, picks.subheadline_pick);
   if (picks.eyebrow_pick     != null && at(cc.eyebrows,     picks.eyebrow_pick)     != null) next.copy.eyebrow     = at(cc.eyebrows,     picks.eyebrow_pick);
   return next;
+}
+
+// ── Phase 5b.1 — port of tp-zones.css per-zone font-size rules ──────
+//
+// Each entry maps a (role, component_style?) pair to:
+//   em            — base em multiplier on the stage font (overrides clamp)
+//   clamp         — {min_em, max_em, h_factor} → clamp(min, rect.h × h_factor × scale, max)
+//   line_height   — unitless line-height
+//   pad_v_em      — vertical padding in em
+//   pad_h_em      — horizontal padding in em
+//   pad_floor_px  — absolute pixel floor (mirrors CSS max(0.9em, 10px))
+//
+// Unknown (role, component_style) combos fall back to DEFAULT_RULE.
+const STYLE_RULES_BY_ROLE_VARIANT = Object.freeze({
+  // Headline
+  'headline':                          { em: 1.85, line_height: 0.95, pad_v_em: 0, pad_h_em: 0 },
+  'headline:display_script':           { em: 1.85, line_height: 0.95, pad_v_em: 0, pad_h_em: 0 },
+  'headline:section_header':           { em: 0.28, line_height: 1.15, pad_v_em: 0, pad_h_em: 0 },
+  'headline:stacked_impact':           { em: 1.7,  line_height: 0.95, pad_v_em: 0, pad_h_em: 0 },
+  'headline:editorial_serif':          { em: 1.5,  line_height: 1.15, pad_v_em: 0, pad_h_em: 0 },
+  'headline:social_caption_headline':  { em: 1.2,  line_height: 1.25, pad_v_em: 0, pad_h_em: 0 },
+
+  // Quote (uses rect-h clamp)
+  'quote':                             { clamp: { min_em: 0.35, max_em: 1.4, h_factor: 0.00187 }, line_height: 1.3, pad_v_em: 0.9, pad_h_em: 1.0, pad_floor_px: 10 },
+  'quote:base':                        { clamp: { min_em: 0.35, max_em: 1.4, h_factor: 0.00187 }, line_height: 1.3, pad_v_em: 0.9, pad_h_em: 1.0, pad_floor_px: 10 },
+  'quote:with_author_photo':           { clamp: { min_em: 0.35, max_em: 1.4, h_factor: 0.00187 }, line_height: 1.3, pad_v_em: 0.9, pad_h_em: 1.0, pad_floor_px: 10 },
+  'quote:featured_testimonial':        { clamp: { min_em: 0.35, max_em: 1.5, h_factor: 0.00200 }, line_height: 1.3, pad_v_em: 1.0, pad_h_em: 1.1, pad_floor_px: 12 },
+  'quote:review_stack':                { em: 0.8,  line_height: 1.25, pad_v_em: 0.4, pad_h_em: 0.55, pad_floor_px: 6 },
+
+  // Product card
+  'product_card':                      { clamp: { min_em: 0.35, max_em: 1.4, h_factor: 0.00187 }, line_height: 1.25, pad_v_em: 0.9, pad_h_em: 1.0, pad_floor_px: 10 },
+  'product_card:with_thumbnail_stacked':{ clamp: { min_em: 0.35, max_em: 1.4, h_factor: 0.00187 }, line_height: 1.25, pad_v_em: 0.9, pad_h_em: 1.0, pad_floor_px: 10 },
+  'product_card:catalog_tile':         { em: 0.9,  line_height: 1.25, pad_v_em: 0.55, pad_h_em: 0.7 },
+  'product_card:compact_inline_product':{ em: 0.85, line_height: 1.2,  pad_v_em: 0.4, pad_h_em: 0.6 },
+
+  // CTA
+  'cta':                               { em: 0.45, line_height: 1.0, pad_v_em: 0.7,  pad_h_em: 1.2 },
+  'cta:pill_button':                   { em: 0.45, line_height: 1.0, pad_v_em: 0.7,  pad_h_em: 1.2 },
+  'cta:editorial_link':                { em: 0.38, line_height: 1.0, pad_v_em: 0.3,  pad_h_em: 0.6 },
+  'cta:floating_shop_chip':            { em: 0.4,  line_height: 1.0, pad_v_em: 0.45, pad_h_em: 0.9 },
+  'cta:full_width_action_bar':         { em: 0.48, line_height: 1.0, pad_v_em: 0.9,  pad_h_em: 1.2 },
+  'cta:commerce_button_with_price':    { em: 0.45, line_height: 1.0, pad_v_em: 0.7,  pad_h_em: 1.2 },
+
+  // Eyebrow
+  'eyebrow':                           { em: 0.28, line_height: 1.1, pad_v_em: 0, pad_h_em: 0 },
+  'eyebrow:bookend_rules':             { em: 0.28, line_height: 1.1, pad_v_em: 0, pad_h_em: 0 },
+  'eyebrow:capsule_label':             { em: 0.26, line_height: 1.1, pad_v_em: 0.3, pad_h_em: 0.7 },
+  'eyebrow:overline':                  { em: 0.26, line_height: 1.1, pad_v_em: 0, pad_h_em: 0 },
+  'eyebrow:platform_kicker':           { em: 0.28, line_height: 1.1, pad_v_em: 0, pad_h_em: 0 },
+
+  // Rating
+  'rating':                            { em: 0.28, line_height: 1.15, pad_v_em: 0.4, pad_h_em: 0.8 },
+  'rating:with_verified_buyers':       { em: 0.28, line_height: 1.15, pad_v_em: 0.4, pad_h_em: 0.8 },
+  'rating:star_row':                   { em: 0.34, line_height: 1.15, pad_v_em: 0,   pad_h_em: 0 },
+  'rating:rating_pill':                { em: 0.34, line_height: 1.0,  pad_v_em: 0.3, pad_h_em: 0.7 },
+  'rating:review_score_card':          { em: 0.36, line_height: 1.2,  pad_v_em: 0.5, pad_h_em: 0.7 },
+
+  // Stat
+  'stat':                              { em: 0.85, line_height: 1.2, pad_v_em: 0.4,  pad_h_em: 0.4 },
+  'stat:metrics_row':                  { em: 0.85, line_height: 1.2, pad_v_em: 0.4,  pad_h_em: 0.4 },
+  'stat:metric_chips':                 { em: 0.45, line_height: 1.0, pad_v_em: 0.25, pad_h_em: 0.7 },
+  'stat:proof_counter':                { em: 1.6,  line_height: 1.0, pad_v_em: 0.5,  pad_h_em: 0.5 },
+  'stat:mini_stat_grid':               { em: 0.75, line_height: 1.2, pad_v_em: 0.4,  pad_h_em: 0.4 },
+
+  // Badges
+  'badges':                            { em: 0.85, line_height: 1.0, pad_v_em: 0.25, pad_h_em: 0.7 },
+  'badges:base':                       { em: 0.85, line_height: 1.0, pad_v_em: 0.25, pad_h_em: 0.7 },
+  'badges:callouts':                   { em: 0.28, line_height: 1.1, pad_v_em: 0,    pad_h_em: 0 },
+  'badges:trust_badges':               { em: 0.78, line_height: 1.1, pad_v_em: 0.3,  pad_h_em: 0.7 },
+  'badges:category_badges':            { em: 0.78, line_height: 1.1, pad_v_em: 0.3,  pad_h_em: 0.7 },
+
+  // Comment
+  'comment':                           { em: 0.95, line_height: 1.35, pad_v_em: 0.5,  pad_h_em: 0.7 },
+  'comment:ig':                        { em: 0.95, line_height: 1.35, pad_v_em: 0.5,  pad_h_em: 0.7 },
+  'comment:tiktok':                    { em: 0.92, line_height: 1.3,  pad_v_em: 0.5,  pad_h_em: 0.7 },
+  'comment:chat_bubble':               { em: 0.88, line_height: 1.3,  pad_v_em: 0.45, pad_h_em: 0.8 },
+  'comment:creator_reply':             { em: 0.9,  line_height: 1.3,  pad_v_em: 0.5,  pad_h_em: 0.7 },
+  'comment:comment_overlay_chip':      { em: 0.7,  line_height: 1.15, pad_v_em: 0.3,  pad_h_em: 0.7 },
+
+  // Creator
+  'creator':                           { em: 0.85, line_height: 1.2, pad_v_em: 0.35, pad_h_em: 0.7 },
+  'creator:identity_row':              { em: 0.85, line_height: 1.2, pad_v_em: 0.35, pad_h_em: 0.7 },
+  'creator:creator_chip':              { em: 0.62, line_height: 1.1, pad_v_em: 0.3,  pad_h_em: 0.7 },
+  'creator:creator_footer':            { em: 0.62, line_height: 1.2, pad_v_em: 0.3,  pad_h_em: 0.6 },
+  'creator:ugc_byline':                { em: 0.58, line_height: 1.2, pad_v_em: 0,    pad_h_em: 0 },
+
+  // Logo (image-only — no text rendering)
+  'logo':                              { em: 1, line_height: 1.0, pad_v_em: 0, pad_h_em: 0 },
+
+  // Panel / scrim (paint-only)
+  'panel':                             { em: 1, line_height: 1.0, pad_v_em: 0, pad_h_em: 0 },
+  'scrim':                             { em: 1, line_height: 1.0, pad_v_em: 0, pad_h_em: 0 },
+
+  // Hero media (image/video)
+  'hero_media':                        { em: 1, line_height: 1.0, pad_v_em: 0, pad_h_em: 0 },
+
+  // Offer
+  'offer':                             { em: 0.85, line_height: 1.1, pad_v_em: 0.4,  pad_h_em: 0.95 },
+  'offer:offer_pill':                  { em: 0.85, line_height: 1.1, pad_v_em: 0.4,  pad_h_em: 0.95 },
+  'offer:corner_tag':                  { em: 0.78, line_height: 1.1, pad_v_em: 0.35, pad_h_em: 0.7 },
+  'offer:discount_burst':              { em: 1.0,  line_height: 1.0, pad_v_em: 0.6,  pad_h_em: 0.6 },
+  'offer:ribbon_banner':               { em: 0.75, line_height: 1.1, pad_v_em: 0.4,  pad_h_em: 0.8 }
+});
+
+const DEFAULT_RULE = Object.freeze({
+  em: 1.1, line_height: 1.15, pad_v_em: 0.2, pad_h_em: 0, pad_floor_px: 0
+});
+
+// Per-role default max_lines when the canvas spec didn't set one.
+const DEFAULT_MAX_LINES_BY_ROLE = Object.freeze({
+  headline: 2, eyebrow: 1, quote: 4, comment: 3, cta: 1, rating: 1,
+  stat: 2, creator: 1, badges: 2, panel: null, scrim: null, logo: null,
+  hero_media: null, product_card: 2, offer: 2
+});
+
+// Compute per-zone font/line/padding values. Mirrors the cascade in
+// tp-zones.css off the stage's base font-size so the Resolver emits
+// the same pixel values the renderer would draw.
+function computeStylesForZone({ role, componentStyle, kind, rect, zoneScaler, baseFontPx, styleVariant }) {
+  let rule =
+    STYLE_RULES_BY_ROLE_VARIANT[`${role}:${componentStyle || ''}`] ||
+    STYLE_RULES_BY_ROLE_VARIANT[`${role}:${styleVariant || ''}`] ||
+    STYLE_RULES_BY_ROLE_VARIANT[role] ||
+    STYLE_RULES_BY_ROLE_VARIANT[kind] ||
+    DEFAULT_RULE;
+
+  const scale = typeof zoneScaler === 'number' ? zoneScaler : 1;
+  let zoneEm;
+  if (rule.clamp) {
+    const computedEm = (rect?.h || 300) * rule.clamp.h_factor * scale;
+    zoneEm = Math.max(rule.clamp.min_em, Math.min(computedEm, rule.clamp.max_em));
+  } else {
+    zoneEm = (rule.em || 1) * scale;
+  }
+
+  const zoneFontPx   = zoneEm * baseFontPx;
+  const lineHeightPx = (rule.line_height || 1.15) * zoneFontPx;
+  // Padding floor — CSS uses max(<em>, <px>); apply the same.
+  const padFloor = rule.pad_floor_px || 0;
+  const padVPx = Math.max((rule.pad_v_em || 0) * zoneFontPx, padFloor);
+  const padHPx = Math.max((rule.pad_h_em || 0) * zoneFontPx, Math.round(padFloor * 1.2));
+
+  return {
+    zone_em:         +zoneEm.toFixed(3),
+    font_size_px:    +zoneFontPx.toFixed(2),
+    line_height:     rule.line_height || 1.15,
+    line_height_px:  +lineHeightPx.toFixed(2),
+    padding_v_em:    rule.pad_v_em || 0,
+    padding_h_em:    rule.pad_h_em || 0,
+    padding_v_px:    +padVPx.toFixed(2),
+    padding_h_px:    +padHPx.toFixed(2),
+    max_lines_default: DEFAULT_MAX_LINES_BY_ROLE[role] ?? null,
+    rule_source:     rule === DEFAULT_RULE ? 'default' : 'matched'
+  };
+}
+
+// canvas.zone_scalers is keyed by zone.id OR zone.kind. Each entry is
+// either a number (legacy) or { font, slot }. We only need font here.
+function pickZoneScaler({ zoneScalers, id, kind, role }) {
+  if (!zoneScalers || typeof zoneScalers !== 'object') return 1;
+  const candidate = zoneScalers[id] ?? zoneScalers[kind] ?? zoneScalers[role];
+  if (candidate == null) return 1;
+  if (typeof candidate === 'number') return candidate;
+  if (typeof candidate === 'object' && candidate.font != null) return candidate.font;
+  return 1;
 }
 
 function inferTextColor({ canvasSpec, role }) {
