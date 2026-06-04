@@ -187,6 +187,32 @@ router.get('/by-id/:id', async (req, res) => {
 
     const response = { input, canvas, style_bindings };
     if (ai_artifact_id) { response.ai_artifact_id = ai_artifact_id; response.ai_warnings = ai_warnings; }
+
+    // Phase 5b.2 — when ?useResolved=1 is on the URL (renderer opt-in),
+    // attach the ResolvedLayoutArtifact for this canvas spec. Renderer
+    // uses it for: skip removed zones, use post-fallback component_style,
+    // apply Resolver's computed pixel-accurate font sizes inline. Falls
+    // back to standard rendering when the resolver hasn't fired yet.
+    if (req.query.useResolved === '1' && ai_artifact_id) {
+      try {
+        const ResolvedLayoutArtifact = require('../models/ResolvedLayoutArtifact');
+        const resolved = await ResolvedLayoutArtifact
+          .findOne({ aiCanvasArtifactId: ai_artifact_id })
+          .sort({ createdAt: -1 })
+          .lean();
+        if (resolved) {
+          response.resolved_layout = {
+            resolution_status: resolved.resolutionStatus,
+            resolved_zones:    resolved.resolvedZones || [],
+            resolved_data:     resolved.resolvedData  || { slots: {} },
+            warnings:          resolved.warnings      || [],
+            fallbacks_used:    resolved.fallbacksUsed || []
+          };
+        }
+      } catch (err) {
+        console.warn(`   ⚠️  resolved_layout lookup failed: ${err.message}`);
+      }
+    }
     res.json(response);
   } catch (err) {
     console.error(`❌ GET /api/layout-input/by-id/${req.params.id} failed: ${err.message}`);
