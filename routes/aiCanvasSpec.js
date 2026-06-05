@@ -178,6 +178,9 @@ router.get('/by-artifact/:id', async (req, res) => {
       // Phase 5a — the Resolver's shadow artifact for this canvas spec.
       // Null until the eager pass fires (V1 ads will stay null).
       resolvedLayout: await loadResolvedLayoutArtifact(art),
+      // Phase X.1 — gpt-image-1 reference render for this canvas. Null
+      // unless AI_IMAGE_REFERENCE_ENABLED was on when the spec generated.
+      imageReference: await loadImageReferenceArtifact(art),
       // Phase 3 — multi-candidate + Judge surface. Empty on V1/single-candidate.
       multiCandidate: {
         candidateCount:  art.candidateCount || 1,
@@ -322,6 +325,41 @@ async function loadResolvedLayoutArtifact(art) {
     };
   } catch (err) {
     console.warn(`   ⚠️  loadResolvedLayoutArtifact: ${err.message}`);
+    return null;
+  }
+}
+
+// Phase X.1 — load the gpt-image-1 reference render this canvas
+// produced. Null on artifacts generated before AI_IMAGE_REFERENCE_ENABLED
+// was on; shadow only — never consumed by the renderer.
+async function loadImageReferenceArtifact(art) {
+  try {
+    if (!art?._id) return null;
+    const AiFullRenderArtifact = require('../models/AiFullRenderArtifact');
+    const found = await AiFullRenderArtifact.findOne({
+      mediaId:             art.mediaId,
+      template:            art.template,
+      aspectRatio:         art.aspectRatio,
+      productId:           art.productId,
+      variantKind:         art.variantKind,
+      campaignContextHash: art.campaignContextHash,
+      paletteSource:       art.paletteSource,
+      creativeStyle:       art.creativeStyle
+    }).lean();
+    if (!found) return null;
+    return {
+      artifactId:      String(found._id),
+      imageUrl:        found.imageUrl,
+      modelId:         found.modelId,
+      width:           found.width,
+      height:          found.height,
+      costEstimateUsd: found.costEstimateUsd,
+      elapsedMs:       found.elapsedMs,
+      promptText:      found.promptText,
+      createdAt:       found.createdAt
+    };
+  } catch (err) {
+    console.warn(`   ⚠️  loadImageReferenceArtifact: ${err.message}`);
     return null;
   }
 }

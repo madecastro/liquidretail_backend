@@ -280,6 +280,7 @@ function buildPrompt({ inputSummary, creativeIntent }) {
     `- The ${N_CONCEPTS} concepts MUST be meaningfully different — different archetype OR different emotional_hook OR different social_proof_type. Avoid two concepts that read the same.`,
     `- Lead with the STRONGEST signal in the data. If social_proof_signal.strongest_signal is "testimonial" and performance is low, lean into the testimonial — don't pick a stat_led archetype.`,
     `- If a signal is "absent", do not build a concept around it.`,
+    `- HONESTY RULE: if social_proof_signal.strongest_signal is null AND has_primary_quote=false AND has_top_comments=false AND has_rating=false, you MUST set social_proof_type="none" on EVERY concept. Do not promise proof the data can't back. In that case, also avoid the stat_led_social_proof and hero_quote_overlay archetypes — there is nothing to surface. Lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself (full_bleed_hero_bottom_panel, vertical_split, diagonal_carve).`,
     ``,
     `AVAILABLE ARCHETYPES (pick one per concept):`,
     AVAILABLE_ARCHETYPES.map(a => `  ${a}`).join('\n'),

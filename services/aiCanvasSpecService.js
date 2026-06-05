@@ -549,6 +549,8 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     `  - Panel covering >60% of the media zone's area with non-transparent bg → renderer applies an opacity guard but the layout still reads broken.`,
     `If you want a tinted/scrim effect across the whole photo, use canvas.background.style: "gradient" or "brand_fill" (which the renderer applies as a background fill, NOT as an overlay zone). Or set visual_direction.glass_level on the panel for translucency.`,
     ``,
+    `CRITICAL: if hierarchy_spec.strategy.social_proof_type is anything OTHER than "none" / "absent" / empty, your zones[] MUST include at least one zone that actually surfaces that proof. Concrete: testimonial → kind='quote' or 'quote_card' with slot in social_proof.* (primary_quote / featured_review); creator → kind='comment' or 'creator_card' with slot in social_proof.top_comments.* or creator/handle; stat → kind='stat' with slot in performance.* or social_proof.rating.*; rating → kind='rating' with slot in social_proof.rating.*; review → kind='quote_card' with slot in social_proof.featured_review.*. A concept declaring social_proof_type: "testimonial" without a quote-bearing zone is broken — the renderer will surface a hierarchy_consistency warning and the LLM Judge will down-rank it. Conversely, if you have no proof data to bind to, set strategy.social_proof_type="none" and skip the proof zone entirely. Do NOT fake it with a generic CTA chip or eyebrow.`,
+    ``,
     `Return creative_style + rationale + elements_used + elements_skipped. In rationale, name the chosen archetype (A–H) + why the FULL CONTEXT pointed to it.`,
     ``,
     `── HIERARCHY SPEC (decide this FIRST) ──`,
@@ -1302,6 +1304,27 @@ async function getOrGenerate({
       })
       .catch(err => {
         console.warn(`   ⚠️  resolver shadow failed: ${err.message}`);
+      });
+  });
+
+  // Phase X.1 SHADOW — gpt-image-1 reference render. Opt-in via
+  // AI_IMAGE_REFERENCE_ENABLED=true. Fires per AiCanvasArtifact;
+  // dedup is handled inside the service (AiFullRenderArtifact's unique
+  // index matches AiCanvasArtifact's). Renderer never reads this.
+  setImmediate(() => {
+    const imgRef = require('./aiImageReferenceService');
+    if (!imgRef.enabled()) return;
+    imgRef.generateForArtifact({ aiCanvasArtifactId: artifact._id })
+      .then(out => {
+        if (out.skipped) return;
+        console.log(
+          `🖼  image-ref shadow ${out.cached ? 'CACHE-HIT' : 'GENERATED'}: ` +
+          `aiCanvasArtifact=${artifact._id}` +
+          (out.artifact?.imageUrl ? ` url=${out.artifact.imageUrl}` : '')
+        );
+      })
+      .catch(err => {
+        console.warn(`   ⚠️  image-ref shadow failed: ${err.message}`);
       });
   });
 

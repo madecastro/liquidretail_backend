@@ -319,6 +319,14 @@ const RENDER_AUTH_TOKEN  = process.env.RENDER_AUTH_TOKEN  || null;
 // or less (tight CI).
 const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '60000', 10);
 
+// Phase 5b.3 — when true, append useResolved=1 to the headless URL so
+// templatePreview.js draws via the ResolvedLayoutArtifact (post-Resolver
+// fallbacks, computed font sizes, role downgrades) instead of the
+// legacy CSS-driven canvas-spec render. Default off; flip per-deploy
+// once the spec preview A/B toggle confirms parity for the batch you
+// care about. Easy rollback by flipping the env back to false.
+const RENDER_USE_RESOLVED = String(process.env.RENDER_USE_RESOLVED || '').toLowerCase() === 'true';
+
 // Decode the token's payload (without verifying) so the boot log can
 // surface exp + user identity. Helps an operator confirm at a glance
 // whether the env-stamped JWT is still valid before kicking a render
@@ -356,7 +364,8 @@ function decodeTokenPayload(token) {
     `🎬 renderService config — ` +
     `FRONTEND_URL=${FRONTEND_URL} ` +
     `RENDER_AUTH_TOKEN=${tokenSummary} ` +
-    `RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS}`
+    `RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS} ` +
+    `RENDER_USE_RESOLVED=${RENDER_USE_RESOLVED}`
   );
 })();
 
@@ -390,6 +399,12 @@ async function renderStage({ layoutInputArtifactId, template, aspectRatio, expec
     if (creativeIntent) url.searchParams.set('creativeIntent', creativeIntent);
     if (productId)      url.searchParams.set('productId',      String(productId));
   }
+  // Phase 5b.3 — flip headless renders onto the Resolver path. The
+  // by-id route reads ?useResolved=1 and returns the ResolvedLayoutArtifact
+  // alongside the canvas spec; templatePreview.js then draws using the
+  // post-fallback bindings. Only meaningful for ai_* templates (legacy
+  // templates have no Resolver artifact).
+  if (RENDER_USE_RESOLVED) url.searchParams.set('useResolved', '1');
   const isVideoOverlay = renderMode === 'video-overlay';
 
   let browser;
