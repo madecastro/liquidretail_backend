@@ -137,11 +137,14 @@ router.get('/', async (req, res) => {
     // resolve every requested row regardless of role.
     const idsParam = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
     if (idsParam.length) filter._id = { $in: idsParam.slice(0, 100) };
-    // Variant collapse — default to primaries only so the operator
-    // sees one row per Shopify item_group_id instead of 8 SKU
-    // variants. ?showVariants=1 disables the filter for explicit
-    // drilldown.
-    if (!idsParam.length && req.query.showVariants !== '1') {
+    // Variant collapse — disabled by default so every SKU (size /
+    // color / pack-size) shows as its own pickable card for ads.
+    // Pack-size variants of the same product are commonly sold as
+    // separate listings, and operators want each to be ad-targetable.
+    // Opt INTO the old collapsed view with ?collapseVariants=1 (still
+    // supports legacy ?showVariants=1 callers — that param becomes
+    // a no-op since variants now show by default).
+    if (!idsParam.length && req.query.collapseVariants === '1') {
       filter.isPrimaryVariant = { $ne: false };
     }
     if (req.query.source === 'draft') {
