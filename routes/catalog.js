@@ -262,6 +262,25 @@ router.get('/:id', async (req, res) => {
     const product = await CatalogProduct.findOne(filter).lean();
     if (!product) return res.status(404).json({ error: 'product not found' });
 
+    // Lazy backfill — when the product has additionalImages URLs without
+    // matching additionalImageMediaIds entries (e.g. variants synced
+    // before the MAX_ALT_IMAGES bump, or alts the initial detect pass
+    // skipped), materialize the missing Media docs now so the Step 2
+    // picker can render every alt as an independently-selectable tile.
+    // Best-effort: failures don't block the detail response.
+    const urls = Array.isArray(product.additionalImages) ? product.additionalImages : [];
+    const ids  = Array.isArray(product.additionalImageMediaIds) ? product.additionalImageMediaIds : [];
+    const missingCount = urls.filter((u, i) => u && u !== product.imageUrl && !ids[i]).length;
+    if (missingCount > 0) {
+      try {
+        const { materializeMissingAlts } = require('../services/catalogProductDetectService');
+        const filled = await materializeMissingAlts(product);
+        product.additionalImageMediaIds = filled;
+      } catch (err) {
+        console.warn(`   ⚠️  catalog detail [${product._id}]: lazy alt backfill failed: ${err.message}`);
+      }
+    }
+
     // Variant family resolution. If this product is the family's
     // primary (primaryProductId is null), siblings have primaryProductId
     // pointing AT this row. If this row is a non-primary variant,

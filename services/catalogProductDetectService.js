@@ -20,7 +20,7 @@ const CatalogProduct = require('../models/CatalogProduct');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
 const { normalizeBrandName } = require('../models/Brand');
 
-const MAX_ALT_IMAGES = 4;
+const MAX_ALT_IMAGES = 12;
 
 // ── Public API ───────────────────────────────────────────────────────
 
@@ -302,6 +302,56 @@ async function materializeImage({ sourceUrl, product, imageRole }) {
   }
 }
 
+// Fill in the gaps in additionalImageMediaIds for an existing product.
+// Materializes a catalog-product Media doc for every additionalImages[i]
+// that doesn't yet have a corresponding entry, in parallel. Used by the
+// catalog detail endpoint as a lazy backfill so the picker tile is
+// always clickable (independent selection requires imageMediaId). Safe
+// to call repeatedly — materializeImage is idempotent via the
+// (brandId, source, externalId) unique index. No-op when nothing's
+// missing. Returns the final additionalImageMediaIds array.
+async function materializeMissingAlts(product) {
+  const urls = Array.isArray(product.additionalImages) ? product.additionalImages : [];
+  const ids  = Array.isArray(product.additionalImageMediaIds) ? product.additionalImageMediaIds : [];
+  if (!urls.length) return ids;
+  // Cap the lazy backfill at MAX_ALT_IMAGES so a catalog row with 50
+  // alts doesn't trigger 50 Cloudinary round-trips on one detail fetch.
+  const cappedUrls = urls.slice(0, MAX_ALT_IMAGES);
+  // Index-aligned: keep existing ids in place, only materialize where
+  // the slot is empty/missing.
+  const indicesNeedingFill = [];
+  for (let i = 0; i < cappedUrls.length; i++) {
+    if (!cappedUrls[i]) continue;
+    if (cappedUrls[i] === product.imageUrl) continue;       // dedupe against hero
+    if (ids[i]) continue;
+    indicesNeedingFill.push(i);
+  }
+  if (!indicesNeedingFill.length) return ids;
+
+  const results = await Promise.allSettled(
+    indicesNeedingFill.map(i =>
+      materializeImage({ sourceUrl: cappedUrls[i], product, imageRole: 'alt' })
+        .then(m => ({ i, mediaId: m?._id ? String(m._id) : null }))
+        .catch(err => {
+          console.warn(`   ⚠️  materializeMissingAlts[${product._id}][${i}]: ${err.message}`);
+          return { i, mediaId: null };
+        })
+    )
+  );
+  const newIds = [...ids];
+  for (const r of results) {
+    if (r.status !== 'fulfilled' || !r.value?.mediaId) continue;
+    newIds[r.value.i] = r.value.mediaId;
+  }
+  // Persist the filled-in array. updateOne so we don't fight Mongoose
+  // versioning on a lean doc.
+  await CatalogProduct.updateOne(
+    { _id: product._id },
+    { $set: { additionalImageMediaIds: newIds } }
+  );
+  return newIds;
+}
+
 function hashShort(s) {
   // Tiny non-crypto hash, just for distinguishing image URLs in the
   // synthetic externalId. Stable across calls so re-imports don't
@@ -311,4 +361,4 @@ function hashShort(s) {
   return Math.abs(h).toString(36).slice(0, 8);
 }
 
-module.exports = { enqueueProductDetect, enqueueBrandProductDetects, MAX_ALT_IMAGES };
+module.exports = { enqueueProductDetect, enqueueBrandProductDetects, materializeMissingAlts, MAX_ALT_IMAGES };
