@@ -25,11 +25,60 @@ const CatalogProduct        = require('../models/CatalogProduct');
 const Media                 = require('../models/Media');
 const ProductMatchArtifact  = require('../models/ProductMatchArtifact');
 const Category              = require('../models/Category');
+const CropArtifact          = require('../models/CropArtifact');
+const DetectionArtifact     = require('../models/DetectionArtifact');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 void assertMediaInTenant;     // kept for future :id verification helpers
 
 function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Apply a Cloudinary c_crop transform inline. Mirrors layoutInputService's
+// buildCloudinaryCropUrl — kept local so the catalog detail endpoint doesn't
+// have to require the entire layoutInputService graph.
+function buildCropUrl(sourceUrl, crop) {
+  if (!sourceUrl || !sourceUrl.includes('/upload/') || !crop) return sourceUrl;
+  const w = Math.max(1, (crop.x2 || 0) - (crop.x1 || 0));
+  const h = Math.max(1, (crop.y2 || 0) - (crop.y1 || 0));
+  if (!w || !h) return sourceUrl;
+  const transform = `c_crop,w_${w},h_${h},x_${crop.x1},y_${crop.y1}`;
+  if (/\/v\d+\//.test(sourceUrl)) return sourceUrl.replace(/\/(v\d+\/)/, `/${transform}/$1`);
+  return sourceUrl.replace('/upload/', `/upload/${transform}/`);
+}
+
+// Resolve the LLM-judged crop winners for a Media doc id into per-ratio
+// URLs. Used by the catalog detail endpoint so the gallery can show the
+// catalog hero's true ad-ready crops (5:4 / 1:1 / 4:5) instead of the
+// per-match YOLO-refined crops that have nothing to do with the hero.
+// Returns { '5:4': url|null, '1:1': url|null, '4:5': url|null } — empty
+// object when the Media has no CropArtifact or DetectionArtifact yet.
+async function loadHeroCrops(mediaId) {
+  if (!mediaId) return null;
+  const media = await Media.findById(mediaId)
+    .select('latestArtifacts fileUrl')
+    .lean();
+  if (!media) return null;
+  const cropArtifactId = media.latestArtifacts?.crops;
+  const detectionArtifactId = media.latestArtifacts?.detection;
+  if (!cropArtifactId) return null;
+  const [cropDoc, detectionDoc] = await Promise.all([
+    CropArtifact.findById(cropArtifactId).select('winners smartCrops').lean(),
+    detectionArtifactId
+      ? DetectionArtifact.findById(detectionArtifactId).select('imageUrl').lean()
+      : null
+  ]);
+  if (!cropDoc) return null;
+  const sourceUrl = detectionDoc?.imageUrl || media.fileUrl;
+  if (!sourceUrl) return null;
+  const out = {};
+  for (const ratio of ['5:4', '1:1', '4:5']) {
+    const winnerId = cropDoc.winners?.[ratio];
+    const list     = cropDoc.smartCrops?.[ratio] || [];
+    const winner   = list.find(c => c.id === winnerId) || list[0] || null;
+    out[ratio] = winner ? buildCropUrl(sourceUrl, winner) : null;
+  }
+  return out;
+}
 
 // Compact list row — enough for the sidebar thumbnail + chips.
 function projectListRow(p, matchCount) {
@@ -297,18 +346,30 @@ router.get('/:id', async (req, res) => {
       ]
     });
 
-    const [category, sourceMedia, variants] = await Promise.all([
+    const [category, sourceMedia, variants, heroCrops] = await Promise.all([
       product.categoryRef ? Category.findById(product.categoryRef).lean() : null,
       product.detectedFromMediaId
         ? Media.findById(product.detectedFromMediaId).select('externalId fileType fileUrl fileName source metadata platformStats createdAt').lean()
         : null,
       CatalogProduct.find(variantFilter)
         .select('_id title imageUrl imageMediaId source isPrimaryVariant primaryProductId price currency')
-        .lean()
+        .lean(),
+      loadHeroCrops(product.imageMediaId).catch(() => null)
     ]);
+
+    // Per-alt crop lookup. Each alt's Media doc has its own CropArtifact
+    // with LLM-judged winners; the gallery surfaces those when the
+    // operator promotes an alt to "active" (Phase 2 UX). Parallelized so
+    // a 12-alt product doesn't serialize the lookups.
+    const altMediaIds = (product.additionalImageMediaIds || []).map(id => id ? String(id) : null);
+    const altCropsResults = await Promise.all(
+      altMediaIds.map(id => id ? loadHeroCrops(id).catch(() => null) : Promise.resolve(null))
+    );
 
     res.json({
       product: projectDetail(product, category),
+      heroCrops,
+      altCrops: altCropsResults,
       variants: (variants || []).map(v => ({
         id:               String(v._id),
         title:            v.title || null,
