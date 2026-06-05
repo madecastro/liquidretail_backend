@@ -187,9 +187,14 @@ router.get('/', async (req, res) => {
     const [rows, total, distinctCategories, totalDrafts] = await Promise.all([
       CatalogProduct.aggregate([
         { $match: aggFilter },
+        // Variant inheritance — non-primary variants resolve matches via
+        // their primary (productMatchService only matches against primaries).
+        // effectiveProductId = primaryProductId || _id makes the matchCount
+        // on a 12-pack card mirror its 3-pack primary instead of zero.
+        { $addFields: { effectiveProductId: { $ifNull: ['$primaryProductId', '$_id'] } } },
         { $lookup: {
             from:         'productmatchartifacts',
-            localField:   '_id',
+            localField:   'effectiveProductId',
             foreignField: 'catalogProductId',
             as:           'matches'
         }},

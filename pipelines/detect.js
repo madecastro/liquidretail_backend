@@ -1032,20 +1032,42 @@ async function mirrorMatchesToCatalogProducts(mediaId, matchedProducts) {
   }
   if (!byCatalogProduct.size) return;
 
+  // Inheritance fan-out: matches always resolve to the variant family's
+  // PRIMARY (productMatchService filters to primaries only). To make
+  // operator picks of non-primary SKUs (e.g. the 12-pack of an oil)
+  // surface the same UGC, mirror the matchedMedia entries to every
+  // variant in the same family. variantsByPrimary[cpId] = ids of all
+  // non-primary CatalogProducts pointing at this primary.
+  const primaryIds = [...byCatalogProduct.keys()];
+  const variants = await CatalogProduct.find({
+    primaryProductId: { $in: primaryIds }
+  }).select('_id primaryProductId').lean();
+  const variantsByPrimary = new Map();
+  for (const v of variants) {
+    const key = String(v.primaryProductId);
+    if (!variantsByPrimary.has(key)) variantsByPrimary.set(key, []);
+    variantsByPrimary.get(key).push(v._id);
+  }
+
   const bulkOps = [];
   for (const [cpId, entries] of byCatalogProduct.entries()) {
-    bulkOps.push({
-      updateOne: {
-        filter: { _id: cpId },
-        update: { $pull: { matchedMedia: { mediaId } } }
-      }
-    });
-    bulkOps.push({
-      updateOne: {
-        filter: { _id: cpId },
-        update: { $push: { matchedMedia: { $each: entries } } }
-      }
-    });
+    // Targets = primary itself + its variants. Each gets the same
+    // pull+push so re-runs replace rather than duplicate the entry.
+    const targetIds = [cpId, ...(variantsByPrimary.get(String(cpId)) || []).map(String)];
+    for (const targetId of targetIds) {
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: targetId },
+          update: { $pull: { matchedMedia: { mediaId } } }
+        }
+      });
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: targetId },
+          update: { $push: { matchedMedia: { $each: entries } } }
+        }
+      });
+    }
   }
   try {
     await CatalogProduct.bulkWrite(bulkOps, { ordered: true });

@@ -114,32 +114,46 @@ async function enqueueBrandProductDetects(brandId) {
     imageUrl: { $ne: null }
   }).lean();
 
-  // Group → primary selection.
+  // Group → primary selection. We also track which primary each non-
+  // primary belongs to so we can stamp primaryProductId atomically
+  // (needed for matchedMedia inheritance + catalog browser matchCount
+  // $lookup on non-primary cards).
   const groups = groupProductsForDetect(products);
-  const primaries    = [];
-  const nonPrimaries = [];
+  const primaries        = [];
+  const variantsByPrimary = new Map();   // primary._id (string) → [variant._id, ...]
   for (const group of groups.values()) {
     const primary = pickPrimary(group);
     primaries.push(primary);
+    const variantIds = [];
     for (const p of group) {
-      if (String(p._id) !== String(primary._id)) nonPrimaries.push(p);
+      if (String(p._id) !== String(primary._id)) variantIds.push(p._id);
     }
+    if (variantIds.length) variantsByPrimary.set(String(primary._id), variantIds);
   }
 
   // Stamp the variant role so the match service + UI can join on it.
-  // Done before enqueue so a partial-failure run still leaves the
-  // flag set consistently.
+  // Done before enqueue so a partial-failure run still leaves the flag
+  // set consistently. Primaries also get primaryProductId cleared (in
+  // case a row previously belonged to a different family — e.g. after
+  // a title rename).
   if (primaries.length) {
     await CatalogProduct.updateMany(
       { _id: { $in: primaries.map(p => p._id) } },
-      { $set: { isPrimaryVariant: true } }
+      { $set: { isPrimaryVariant: true, primaryProductId: null } }
     );
   }
-  if (nonPrimaries.length) {
-    await CatalogProduct.updateMany(
-      { _id: { $in: nonPrimaries.map(p => p._id) } },
-      { $set: { isPrimaryVariant: false } }
-    );
+  // Per-family bulkWrite so each non-primary points at the right primary.
+  if (variantsByPrimary.size) {
+    const bulkOps = [];
+    for (const [primaryId, variantIds] of variantsByPrimary.entries()) {
+      bulkOps.push({
+        updateMany: {
+          filter: { _id: { $in: variantIds } },
+          update: { $set: { isPrimaryVariant: false, primaryProductId: primaryId } }
+        }
+      });
+    }
+    await CatalogProduct.bulkWrite(bulkOps, { ordered: false });
   }
 
   // Only primaries that haven't been detected yet need an enqueue

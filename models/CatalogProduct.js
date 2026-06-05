@@ -49,6 +49,19 @@ const catalogProductSchema = new mongoose.Schema({
   // the same image 8 times across variants.
   isPrimaryVariant: { type: Boolean, default: false, index: true },
 
+  // Pointer to the variant family's primary CatalogProduct. Null on
+  // primaries (and on rows that don't belong to any variant family).
+  // Non-primaries set this to their family's primary._id at variant-
+  // collapse time so downstream consumers (matchedMedia inheritance,
+  // catalog browser matchCount $lookup, etc.) can resolve to the
+  // primary's data without rebuilding the grouping logic at read time.
+  primaryProductId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'CatalogProduct',
+    default: null,
+    index: true
+  },
+
   // Draft state — true when the row was auto-created from detect or
   // a partial manual upload and is missing commerce-required fields
   // (price, productUrl). The catalog browser filters drafts into a
