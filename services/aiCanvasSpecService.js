@@ -879,6 +879,27 @@ function canvasZoneSatisfiesRole(role, zone) {
   }
 }
 
+// Hard-violation check used both by the soft validator (emits a warning)
+// and by the pre-Judge candidate filter (drops the candidate). Returns
+// true when hierarchy_spec.strategy.social_proof_type is non-none AND
+// no zone in zones[] surfaces actual proof data — i.e. the candidate
+// declared a proof strategy it didn't follow through on. The Generator
+// has been ignoring this rule even when the prompt spells it out, so we
+// pull non-compliant candidates out of the Judge's candidate pool to
+// force compliance via selection pressure.
+function specViolatesProofStrategy(spec) {
+  const hs = spec?.hierarchy_spec;
+  if (!hs) return false;
+  const proofType = String(hs.strategy?.social_proof_type || '').toLowerCase();
+  if (!proofType || ['none', 'absent', ''].includes(proofType)) return false;
+  const cvZones = spec.zones || [];
+  return !cvZones.some(z => {
+    const slot = Array.isArray(z.slot) ? z.slot.join(' ') : (z.slot || '');
+    return /social_proof\.|social_context\.(top_comments|stats|caption|creator)/.test(slot)
+        || z.kind === 'proof_bar' || z.kind === 'quote_card';
+  });
+}
+
 function checkHierarchyConsistency(spec) {
   const out = [];
   const hs = spec.hierarchy_spec;
@@ -904,16 +925,9 @@ function checkHierarchyConsistency(spec) {
   // Strategy-level proof check: if social_proof_type is non-empty
   // (testimonial / stat / creator / review / rating / etc.) but no
   // canvas zone surfaces ANY proof data, the strategy is empty.
-  const proofType = String(hs.strategy?.social_proof_type || '').toLowerCase();
-  if (proofType && !['none', 'absent', ''].includes(proofType)) {
-    const hasProofZone = cvZones.some(z => {
-      const slot = Array.isArray(z.slot) ? z.slot.join(' ') : (z.slot || '');
-      return /social_proof\.|social_context\.(top_comments|stats|caption|creator)/.test(slot)
-          || z.kind === 'proof_bar' || z.kind === 'quote_card';
-    });
-    if (!hasProofZone) {
-      out.push(`strategy.social_proof_type="${proofType}" but no canvas zone surfaces social proof — declared strategy unsupported`);
-    }
+  if (specViolatesProofStrategy(spec)) {
+    const proofType = String(hs.strategy?.social_proof_type || '').toLowerCase();
+    out.push(`strategy.social_proof_type="${proofType}" but no canvas zone surfaces social proof — declared strategy unsupported`);
   }
 
   // Strategy-level CTA check: if cta_emphasis is primary/secondary but
@@ -1196,10 +1210,38 @@ async function getOrGenerate({
     const firstReject = results.find(r => r.status === 'rejected');
     throw firstReject?.reason || new Error('all candidate generations failed');
   }
-  const candidates       = successes.map(s => s.r.value.spec);
-  const candidateWarnings = successes.map(s => s.r.value.warnings);
-  const candidateRaws    = successes.map(s => s.r.value.raw);
-  const totalElapsedMs   = successes.reduce((m, s) => Math.max(m, s.r.value.elapsedMs), 0);
+  let candidates        = successes.map(s => s.r.value.spec);
+  let candidateWarnings = successes.map(s => s.r.value.warnings);
+  let candidateRaws     = successes.map(s => s.r.value.raw);
+  const totalElapsedMs  = successes.reduce((m, s) => Math.max(m, s.r.value.elapsedMs), 0);
+
+  // Pre-Judge hard-violation filter — drop candidates that declared a
+  // social_proof_type strategy but emitted no proof-bearing zone. The
+  // Generator has been ignoring the prompt-level CRITICAL rule for this
+  // (Fix B), so we enforce it via selection pressure: the Judge never
+  // sees the violators. If ALL candidates violate, we keep the full
+  // pool (don't return empty) — better to render an imperfect ad than
+  // none at all — but log loudly so we can see how often the prompt
+  // alone fails to hold.
+  if (candidates.length > 1) {
+    const violationFlags = candidates.map(specViolatesProofStrategy);
+    const violatorCount  = violationFlags.filter(Boolean).length;
+    if (violatorCount > 0 && violatorCount < candidates.length) {
+      const keepIdx = violationFlags.map((v, i) => v ? null : i).filter(i => i != null);
+      console.log(
+        `   ⛔ pre-Judge filter dropped ${violatorCount}/${candidates.length} candidates ` +
+        `for proof-strategy violation (kept indices: ${keepIdx.join(',')})`
+      );
+      candidates        = keepIdx.map(i => candidates[i]);
+      candidateWarnings = keepIdx.map(i => candidateWarnings[i]);
+      candidateRaws     = keepIdx.map(i => candidateRaws[i]);
+    } else if (violatorCount === candidates.length) {
+      console.warn(
+        `   ⚠️  pre-Judge filter: ALL ${candidates.length} candidates violate proof-strategy rule — ` +
+        `keeping all (Judge will pick the least-bad). Generator prompt is failing this batch.`
+      );
+    }
+  }
 
   // Phase 3 — Judge picks the winner among candidates. Single-candidate
   // mode auto-selects index 0 without an LLM call.
