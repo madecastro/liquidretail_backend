@@ -463,7 +463,7 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     `Compose freely — an editorial frame can skip the logo, a pure hero-quote can skip the product_card, a typographic ad can skip support_media.`,
     ``,
     `COMPOSITION ARCHETYPES — pick (or mix) one that suits the brand voice, hero image, and the rest of the FULL CONTEXT below. Do NOT default to the same archetype every time; vary based on which strongest signal the data offers (great photo? lead with hero. great quote? lead with quote. high engagement? lead with the stat).`,
-    `  A) FULL-BLEED HERO + BOTTOM PANEL — support_media fills canvas; headline sits on a brand-color panel band along the bottom 25–35%. Safe default, works for any photo.`,
+    `  A) FULL-BLEED HERO + BOTTOM PANEL — support_media fills canvas; headline sits on a colored panel band along the bottom 25–35% (pick a hex that complements the photo). Safe default, works for any photo.`,
     `  B) VERTICAL SPLIT — image and brand panel each take ~50%, side-by-side. Strong for product reveals.`,
     `  C) DIAGONAL CARVE — use clipPolygon to split the canvas at an angle. Hero on one side, brand panel on the other. Energetic, magazine-like.`,
     `  D) TYPOGRAPHIC DOMINANT — headline is the hero (covers 50%+ of canvas), support_media reduced to a small inset or omitted. For category-creation / brand-voice messaging.`,
@@ -471,7 +471,7 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     `  F) MAGAZINE / EDITORIAL — eyebrow_rules + headline + body text stacked vertically over a solid panel, image inset bottom-right. Reads like print.`,
     `  G) STAT-LED SOCIAL PROOF — a numeric stat (rating, follower count, comment count, likes, engagement) rendered as the hero element via a text zone with a slot like social_context.stats.likes. Headline secondary. Use when the social signal is the strongest selling point.`,
     `  H) PRODUCT-CARD GRID — multiple product_card / media zones in a 2×2 or 1×3 arrangement for catalog/collection ads.`,
-    `Within an archetype: vary panel position (top/bottom/left/right/diagonal), color emphasis (brand_fill vs gradient vs split), and which zones lead. Name the archetype + your variation in your rationale.`,
+    `Within an archetype: vary panel position (top/bottom/left/right/diagonal), color emphasis (solid block vs gradient vs split), and which zones lead. Name the archetype + your variation in your rationale.`,
     ``,
     `SLOT PATHS (single string or array). The renderer reads these from the resolved input. Pick freely; don't limit yourself to the brand+headline+cta minimum.`,
     `  Brand    → brand.logo, brand.name, brand.tagline`,
@@ -511,23 +511,28 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     ``,
     `ZONE_SCALERS — multipliers, NOT pixel sizes. 1.0 = baseline (the canvas-spec default). 1.5 = 150%, 0.8 = 80%. Hard range [0.5, 3.0]. Use sparingly to amplify ONE zone for emphasis. Default to null when you don't need to scale.`,
     ``,
-    `STYLE BINDINGS — surfaces should use brand color PATHS so the rendered ad inherits the actual brand identity. Text colors must be EXPLICIT HEX values picked for contrast (the AI-template path has no contrast guard, so null falls through to the CSS default).`,
-    `  Surface bindings (paths preferred):`,
-    `    panel_bg, card_bg     → "brand.primary_color" | "brand.secondary_color" | "#FFFFFF" | "#0A0A0A"`,
-    `    cta_button_bg         → "brand.accent_color" | "brand.primary_color"`,
-    `    accent_border_color   → "brand.primary_color" (used as product-card price color too — must contrast with card_bg)`,
-    `    font_family_body / font_family_display → "brand.font_family" when present, else null`,
+    `STYLE BINDINGS — every color is an EXPLICIT HEX value YOU pick. No "brand.primary_color" / "brand.secondary_color" / "brand.accent_color" paths — the brand object no longer carries colors, so paths resolve to null. Choose a cohesive palette (2–3 working colors plus near-white / near-black for text) that complements the source photo's tones and matches the brand TONE (energetic, premium, playful, etc.). Aim for high contrast on text surfaces; the AI-template path has no contrast guard.`,
+    `  Surface bindings (explicit hex):`,
+    `    panel_bg, card_bg     → "#A52A2A" / "#FFF8E7" / "#0A0A0A" / etc. — pick to read against media, support the mood`,
+    `    cta_button_bg         → high-contrast accent hex (often complementary to panel_bg)`,
+    `    accent_border_color   → product-card price color too — must contrast with card_bg`,
+    `    font_family_body / font_family_display → null (use renderer defaults — do NOT invent font names)`,
     `  Text bindings (explicit hex):`,
-    `    panel_text_color, headline_text_color, card_text_color, cta_text_color → "#FFFFFF" / "#0A0A0A" / etc.`,
+    `    panel_text_color, headline_text_color, card_text_color, cta_text_color → "#FFFFFF" / "#0A0A0A" / etc., picked for contrast against the surface beneath`,
     ``,
-    `BRAND COLORS — soft preference, not a hard rule. Default to brand.* PATHS (panel_bg: "brand.primary_color", card_bg: "brand.secondary_color", etc.) so the ad inherits the brand identity AND auto-updates when the brand changes its colors. BUT — when the brand's literal color creates a real composition problem (e.g., brand primary is too light to read white headline text against, OR a darker desaturated brand-tone reads better as panel_bg over a busy photo), you MAY pick a complementary hex that fits the brand's palette family. Avoid: random photo-sampled hexes unrelated to brand identity (cream / pastel pulled from the food). Prefer: brand-adjacent shades (slightly darker/lighter brand primary, complement of brand accent). When you DO pick a literal hex, the rationale should briefly justify why brand path didn't work.`,
+    `PALETTE DERIVATION — How to pick:`,
+    `  1. Look at the source photo's dominant tones (food photography → warm browns/golds; outdoor lifestyle → earth + sky; product-only → background neutral).`,
+    `  2. Pick a panel/card color that sits cleanly against those tones (avoid clashing hue, avoid matching so closely the photo bleeds into the panel).`,
+    `  3. Pick a CTA color that's the visual hot-spot — usually high-chroma, often complementary to the panel.`,
+    `  4. Match the brand's TONE: a "premium / minimal" brand wants restrained near-monochrome; an "energetic / playful" brand wants saturated + bold.`,
+    `  5. Don't pull arbitrary photo-sampled pastels with no relationship to mood; aim for an intentional 2–3 color story.`,
     ``,
     `CANVAS BACKGROUND.STYLE — pick based on the chosen archetype:`,
     `  full-bleed hero (A/E)              → "solid" with panel_bg null (let media cover)`,
     `  split panel (B/F)                  → "split_panel"`,
-    `  brand-color dominated (D/G)        → "brand_fill"`,
+    `  bold typographic / color-block (D/G) → "solid" with a strong panel_bg hex you picked`,
     `  diagonal carve (C)                 → "solid" (clipPolygon does the work)`,
-    `  gradient between two brand colors  → "gradient"`,
+    `  gradient between two palette colors → "gradient" (the two colors come from your picked palette)`,
     ``,
     `PER-ZONE VISUAL_DIRECTION OVERRIDES (zone.visual_direction) — every zone has an optional visual_direction with the same shape as hierarchy_spec.layout.visual_direction. Null inherits the stage default; non-null fields override on that zone only. Use when ONE focal element wants different treatment from the rest of the ad — a hero quote_card with glass_level: "heavy" + shadow_depth: "dramatic" while the rest stays solid, or a comment card with corner_radius: "pill" inside an otherwise sharp-cornered layout. Default to null when the zone matches the stage direction (most zones).`,
     ``,
@@ -547,7 +552,7 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     `Patterns that BLANK the photo (forbidden):`,
     `  - Panel with rect 0,0 1000x1000 + dark panel_bg → covers entire media.`,
     `  - Panel covering >60% of the media zone's area with non-transparent bg → renderer applies an opacity guard but the layout still reads broken.`,
-    `If you want a tinted/scrim effect across the whole photo, use canvas.background.style: "gradient" or "brand_fill" (which the renderer applies as a background fill, NOT as an overlay zone). Or set visual_direction.glass_level on the panel for translucency.`,
+    `If you want a tinted/scrim effect across the whole photo, use canvas.background.style: "gradient" or "solid" with your picked panel_bg (which the renderer applies as a background fill, NOT as an overlay zone). Or set visual_direction.glass_level on the panel for translucency.`,
     ``,
     `CRITICAL: if hierarchy_spec.strategy.social_proof_type is anything OTHER than "none" / "absent" / empty, your zones[] MUST include at least one zone that actually surfaces that proof. Concrete: testimonial → kind='quote' or 'quote_card' with slot in social_proof.* (primary_quote / featured_review); creator → kind='comment' or 'creator_card' with slot in social_proof.top_comments.* or creator/handle; stat → kind='stat' with slot in performance.* or social_proof.rating.*; rating → kind='rating' with slot in social_proof.rating.*; review → kind='quote_card' with slot in social_proof.featured_review.*. A concept declaring social_proof_type: "testimonial" without a quote-bearing zone is broken — the renderer will surface a hierarchy_consistency warning and the LLM Judge will down-rank it. Conversely, if you have no proof data to bind to, set strategy.social_proof_type="none" and skip the proof zone entirely. Do NOT fake it with a generic CTA chip or eyebrow.`,
     ``,
@@ -637,7 +642,7 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     userLines.push(`VISION INPUTS (attached as image parts in this message, in order):`);
     images.forEach((img, i) => userLines.push(`  image[${i}] — ${img.role}: ${img.label || ''}`));
     userLines.push(``);
-    userLines.push(`Use the actual images to inform composition: where the subject sits in the hero, which regions are visually safe for text overlays, whether the brand color reads correctly against the photo's tones. Reference image[N] by role in your rationale.`);
+    userLines.push(`Use the actual images to inform composition: where the subject sits in the hero, which regions are visually safe for text overlays, what palette you'll pick to complement the photo's tones. Reference image[N] by role in your rationale.`);
     userLines.push(``);
   }
 
@@ -769,20 +774,9 @@ function validateSpec(spec, aspectRatio) {
     }
   }
 
-  // Brand-identity sanity: panel_bg / card_bg as a literal hex when a
-  // Brand-identity preference (soft): literal hex on the dominant
-  // surfaces is now ALLOWED when the LLM has a real compositional
-  // reason (per the loosened prompt). We still log it as a low-severity
-  // info note so the operator can spot batches where the LLM is
-  // routinely abandoning brand colors. Not a hard warning — the
-  // hierarchy_consistency and contrast checks are stricter.
-  const sb = spec.style_bindings || {};
-  for (const k of ['panel_bg', 'card_bg']) {
-    const v = sb[k];
-    if (typeof v === 'string' && v.startsWith('#') && !['#FFFFFF', '#FFF', '#000', '#000000', '#0A0A0A', '#F5F5F5'].includes(v.toUpperCase())) {
-      warnings.push(`${k} picked literal hex "${v}" (instead of brand.* path) — verify rationale explains why`);
-    }
-  }
+  // (Brand-identity hex-vs-path warning removed — the brand object no
+  // longer carries colors, so explicit hex IS the only valid path and
+  // doesn't need a "verify rationale" flag.)
 
   // Panel-over-media safety check (post z-index fix). Any panel zone
   // covering >60% of a media zone's area gets dampened to opacity 0.35

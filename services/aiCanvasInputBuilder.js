@@ -66,10 +66,13 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
       name:           brand.name      || null,
       tagline:        brand.tagline   || null,
       tone:           Array.isArray(brand.tone) ? brand.tone : [],
-      primary_color:  brand.primary_color   || null,
-      secondary_color:brand.secondary_color || null,
-      accent_color:   brand.accent_color    || null,
-      font_family:    brand.font_family     || null,
+      // Brand colors + font intentionally omitted. The Generator picks
+      // an HEX palette and font treatment that fits the photo + tone
+      // instead of being hard-bound to literal brand identity values
+      // (which produced dark-panel-over-media bugs and forced contrast
+      // problems). The renderer's brand.* style-binding paths simply
+      // resolve to null when the LLM emits them, falling through to
+      // explicit HEX or CSS defaults.
       logo_present:   !!brand.logo
     },
 

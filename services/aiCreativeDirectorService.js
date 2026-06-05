@@ -194,11 +194,14 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   }
 
   // ── Brand signal ──
+  // Brand colors + font intentionally OMITTED — letting the downstream
+  // Generator pick a palette from the photo + tone produces better
+  // composition than hard-binding the literal brand hex values, which
+  // routinely created dark panels covering media and forced unreadable
+  // contrast. Tone stays as a stylistic cue.
   const brandSignal = {
     name:            brand?.name || null,
-    tone:            Array.isArray(brand?.tone) ? brand.tone.slice(0, 6) : [],
-    primary_color:   brand?.primaryColor   || null,
-    secondary_color: brand?.secondaryColor || null
+    tone:            Array.isArray(brand?.tone) ? brand.tone.slice(0, 6) : []
   };
 
   // ── Product signal ──

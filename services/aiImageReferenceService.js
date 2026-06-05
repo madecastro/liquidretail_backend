@@ -342,8 +342,6 @@ async function fetchImageBuffer(url) {
 function buildPrompt({ brand, product, media, concept, proofData, aspectRatio, creativeStyle, canvasSpec }) {
   const brandName    = brand?.name || 'the brand';
   const brandTone    = Array.isArray(brand?.tone) && brand.tone.length ? brand.tone.slice(0, 4).join(', ') : null;
-  const primary      = brand?.primaryColor   || null;
-  const secondary    = brand?.secondaryColor || null;
 
   const productName  = product?.title    || null;
   const category     = product?.category || null;
@@ -358,9 +356,12 @@ function buildPrompt({ brand, product, media, concept, proofData, aspectRatio, c
   lines.push(``);
   lines.push(`Brand: ${brandName}${brandTone ? ` (tone: ${brandTone})` : ''}.`);
   if (productName) lines.push(`Featured product: ${productName}${category ? ` — ${category}` : ''}.`);
-  if (primary || secondary) {
-    lines.push(`Brand palette: ${[primary, secondary].filter(Boolean).join(' and ')}. Use these as accent colors.`);
-  }
+  // Brand colors + font intentionally NOT supplied. Pick a cohesive
+  // 2–3 color palette that complements the product photo and matches
+  // the brand tone; pick typography that fits the mood. The goal is
+  // "what would a great designer do given just the photo + tone?",
+  // not "force this literal hex into the layout."
+  lines.push(`Color & type: pick a cohesive palette (2–3 working colors plus near-white/near-black for text) and typography that complements the product photo and fits the brand tone. Do NOT default to neutral greys — make a confident, intentional color choice.`);
   lines.push(`Creative style: ${creativeStyle}.`);
 
   if (concept) {
