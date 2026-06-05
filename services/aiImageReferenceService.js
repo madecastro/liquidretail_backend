@@ -15,6 +15,7 @@
 
 const crypto       = require('crypto');
 const axios        = require('axios');
+const sharp        = require('sharp');
 const OpenAI       = require('openai');
 const { toFile }   = require('openai');
 
@@ -124,48 +125,90 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
   // generate when neither is available. images.edit gives the model a
   // visual anchor so it doesn't invent a fake-looking product from a
   // text description.
+  //
+  // Source URLs may be JPEG/WebP/anything Cloudinary serves; gpt-image-1
+  // accepts PNG most reliably, so normalize via sharp before sending.
   const seedImageUrl = product?.imageUrl || media?.fileUrl || null;
-  let seedBuffer = null;
+  let seedFile   = null;
   let seedSource = null;
   if (seedImageUrl) {
     try {
-      seedBuffer = await fetchImageBuffer(seedImageUrl);
+      const raw = await fetchImageBuffer(seedImageUrl);
+      const png = await sharp(raw).png().toBuffer();
+      seedFile   = await toFile(png, 'seed.png', { type: 'image/png' });
       seedSource = product?.imageUrl ? 'catalog-hero' : 'ugc-source';
     } catch (err) {
-      console.warn(`   ⚠️  image-ref: seed download failed (${err.message}) — falling back to text-only generate`);
+      console.warn(`   ⚠️  image-ref: seed prep failed (${err.message}) — falling back to text-only generate`);
     }
   }
 
+  const callOpenAi = () => seedFile
+    ? openai.images.edit({
+        model:   MODEL_ID,
+        image:   seedFile,
+        prompt,
+        size,
+        quality: QUALITY,
+        n:       1
+      })
+    : openai.images.generate({
+        model:   MODEL_ID,
+        prompt,
+        size,
+        quality: QUALITY,
+        n:       1
+      });
+
   const t0 = Date.now();
-  const res = await trackLlmCall(
-    {
-      stage:      'image_reference',
-      provider:   'openai',
-      model:      MODEL_ID,
-      purposeTag: canvas.template || 'untagged',
-      brandId:    canvas.brandId,
-      productId:  canvas.productId,
-      mediaId:    canvas.mediaId,
-      cacheKey:   JSON.stringify(filter),
-      visionImages: seedBuffer ? 1 : 0
-    },
-    () => seedBuffer
-      ? openai.images.edit({
+  let res;
+  try {
+    res = await trackLlmCall(
+      {
+        stage:      'image_reference',
+        provider:   'openai',
+        model:      MODEL_ID,
+        purposeTag: canvas.template || 'untagged',
+        brandId:    canvas.brandId,
+        productId:  canvas.productId,
+        mediaId:    canvas.mediaId,
+        cacheKey:   JSON.stringify(filter),
+        visionImages: seedFile ? 1 : 0
+      },
+      callOpenAi
+    );
+  } catch (err) {
+    // images.edit can reject for a variety of input-format reasons
+    // (resolution caps, content moderation tripped by seed, MIME
+    // sniffing mismatch). When that happens, retry as text-only
+    // images.generate so we still get a reference render rather than
+    // an empty panel.
+    if (seedFile) {
+      console.warn(`   ⚠️  image-ref: images.edit failed (${err.message}) — retrying as text-only generate`);
+      seedSource = null;
+      res = await trackLlmCall(
+        {
+          stage:      'image_reference',
+          provider:   'openai',
+          model:      MODEL_ID,
+          purposeTag: canvas.template || 'untagged',
+          brandId:    canvas.brandId,
+          productId:  canvas.productId,
+          mediaId:    canvas.mediaId,
+          cacheKey:   JSON.stringify(filter),
+          visionImages: 0
+        },
+        () => openai.images.generate({
           model:   MODEL_ID,
-          image:   toFile(seedBuffer, 'seed.png', { type: 'image/png' }),
           prompt,
           size,
           quality: QUALITY,
           n:       1
         })
-      : openai.images.generate({
-          model:   MODEL_ID,
-          prompt,
-          size,
-          quality: QUALITY,
-          n:       1
-        })
-  );
+      );
+    } else {
+      throw err;
+    }
+  }
   const elapsedMs = Date.now() - t0;
 
   const b64 = res?.data?.[0]?.b64_json;
