@@ -534,6 +534,32 @@ async function loadContext(mediaId, options = {}) {
         palette:    heroDetection?.background?.palette || null,
         background: heroDetection?.background || null
       };
+    } else if (productOid) {
+      // Detect-identified products often have a CatalogProduct row with
+      // imageUrl set but no wrapper Media doc (the Shopify-sync path
+      // materializes one via catalogProductDetectService.enqueueProductDetect,
+      // but productMatchService.ensureCatalogProduct doesn't enqueue
+      // detect for the new row). Without this fallback the canonical
+      // input emits null for product.hero_media / product_image /
+      // lifestyle_image and ad rendering loses its product imagery.
+      //
+      // Synthesize a minimal productHero from CatalogProduct.imageUrl
+      // so slot bindings resolve. No crops or detection background
+      // available here — the eager enqueueProductDetect call shipped
+      // alongside this band-aid backfills both on the next render.
+      const cpForFallback = await CatalogProduct
+        .findById(productOid)
+        .select('imageUrl')
+        .lean();
+      if (cpForFallback?.imageUrl) {
+        productHero = {
+          mediaId:    null,
+          imageUrl:   cpForFallback.imageUrl,
+          crops:      null,
+          palette:    null,
+          background: null
+        };
+      }
     }
 
     // Track both shot flavors independently so the canonical input can

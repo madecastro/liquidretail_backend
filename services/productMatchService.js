@@ -1881,6 +1881,29 @@ async function ensureCatalogProductForMatch(match, ctx) {
     lastSyncedAt:        new Date()
   });
   console.log(`📝 catalog row auto-created[${match.productIndex || 'primary'}]: "${ident.productName}" (draft=${isDraft}) → ${cp._id}`);
+
+  // Fire-and-forget: materialize a source: 'catalog-product' Media doc +
+  // crops + detection so the canonical input's productHero slot has
+  // real per-ratio crop URLs on the next render. Without this the
+  // layoutInputService.loadContext band-aid (synthesizes productHero
+  // from CatalogProduct.imageUrl directly) is the only thing the ad
+  // pipeline sees — works, but loses the cropping pass. Skipped when
+  // imageUrl is missing (enqueueProductDetect's own first check).
+  if (cp.imageUrl) {
+    setImmediate(() => {
+      const detectSvc = require('./catalogProductDetectService');
+      detectSvc.enqueueProductDetect(cp)
+        .then(out => {
+          if (out?.skipped) return;
+          const heroId = out?.enqueued?.hero?.mediaId || '-';
+          console.log(`   · ensureCatalogProduct[${cp._id}]: catalog-product detect enqueued (heroMedia=${heroId})`);
+        })
+        .catch(err => {
+          console.warn(`   ⚠️  ensureCatalogProduct[${cp._id}]: catalog-product detect enqueue failed: ${err.message}`);
+        });
+    });
+  }
+
   return cp._id;
 }
 
