@@ -793,10 +793,44 @@ async function seedsFromProduct(brandId, productId, opts = {}) {
   // visual-hero variant. MAX_ADS_PER_GENERATION_RUN still clips the
   // total run; smarter per-seed prioritization is a follow-up.
   const productOid = toObjectId(productId);
-  const catalogMedias = productOid ? await Media.find({
+  let catalogMedias = productOid ? await Media.find({
     source: 'catalog-product',
     'metadata.catalogProductId': productOid
   }).select('_id fileType adSuitability classification metadata.imageRole').lean() : [];
+
+  // Tier 0 fallback — detect-identified products (and any product that
+  // Shopify-sync didn't enqueue for some reason) have an imageUrl on
+  // the CatalogProduct row but NO catalog-product Media doc yet. The
+  // three tiers above return empty, so the campaign would queue zero
+  // Ads. Lazily materialize the hero Media now so the operator's pick
+  // still produces a renderable ad. The detect run kicked off here
+  // populates crops + scene background in the background for subsequent
+  // renders; the immediate render hits the band-aid in layoutInput-
+  // Service.loadContext that synthesizes productHero from raw imageUrl.
+  if (!catalogMedias.length && productOid && !seeds.length) {
+    try {
+      const fullProduct = await CatalogProduct.findById(productOid)
+        .select('_id brandId advertiserId imageUrl additionalImages imageMediaId')
+        .lean();
+      if (fullProduct?.imageUrl) {
+        const detectSvc = require('./catalogProductDetectService');
+        const out = await detectSvc.enqueueProductDetect(fullProduct);
+        const heroMediaId = out?.enqueued?.hero?.mediaId;
+        if (heroMediaId) {
+          catalogMedias = await Media.find({
+            _id: heroMediaId
+          }).select('_id fileType adSuitability classification metadata.imageRole').lean();
+          console.log(
+            `   · seedsFromProduct[${productId}]: lazy-materialized catalog-product Media ` +
+            `${heroMediaId} from product.imageUrl (detect-identified or unprocessed product)`
+          );
+        }
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  seedsFromProduct[${productId}]: lazy materialize failed: ${err.message}`);
+    }
+  }
+
   const rankedCatalogMedias = rankCatalogMediasForHero(catalogMedias);
   for (const m of rankedCatalogMedias) {
     seeds.push({
