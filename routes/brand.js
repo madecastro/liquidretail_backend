@@ -391,7 +391,19 @@ router.get('/:id/onboarding-status', async (req, res) => {
     const catalogCred = await IntegrationCredential.findOne({
       brandId: brand._id, type: 'instagram', status: 'active'
     }).select('catalogId lastCatalogSyncAt').lean();
-    const productCount = await CatalogProduct.countDocuments({ brandId: brand._id });
+    // Dedup count by (itemGroupId || normalizedTitle) so Shopify-via-Meta
+    // variants — where each size/color/pack shows up as a distinct catalog
+    // item with the same title and a null itemGroupId — collapse to one
+    // logical product in the dashboard. Matches the customer's mental
+    // model ("8 products") instead of the raw row count ("20 rows"). The
+    // same grouping logic is used by catalogProductDetectService.group-
+    // ProductsForDetect for variant collapse upstream.
+    const productCountGroups = await CatalogProduct.aggregate([
+      { $match: { brandId: brand._id } },
+      { $group: { _id: { $ifNull: ['$itemGroupId', '$normalizedTitle'] } } },
+      { $count: 'n' }
+    ]);
+    const productCount = productCountGroups[0]?.n || 0;
 
     // Detect-run rollups, split by source so the panel can show
     // catalog-product runs distinctly from media-path runs.

@@ -1830,16 +1830,29 @@ async function ensureCatalogProductForMatch(match, ctx) {
   //           unique variant tokens, competing SKUs)
   // Plus a ≥3 shared-tokens floor so 2-token matches don't sneak by.
   if (normalizedQuery) {
+    // Include detect-identified rows too — previously they were excluded
+    // because the intent was to "prefer synced rows", but the side-effect
+    // was that the same detect-identified product never got reused: each
+    // UGC matching "Hot Crispy Oil" failed to find the existing detect
+    // row and created another one. Inflated detect-identified counts
+    // dramatically (one brand had 16 detect rows for ~5 logical
+    // products). The PREFERENCE for synced rows is now expressed in the
+    // tiebreak below instead of by exclusion.
     const candidates = await CatalogProduct.find({
       brandId: ctx.brandId,
-      draft:   { $ne: true },
-      source:  { $ne: 'detect-identified' }   // prefer synced rows; phantoms get cleaned up by reparent script
+      draft:   { $ne: true }
     }).select('_id title source normalizedTitle').lean();
 
     let best = null;
     for (const row of candidates) {
       const { score, shared } = titleSimilarity(row.normalizedTitle || row.title, ident.productName);
-      if (shared >= 3 && score >= 1.0 && (!best || shared > best.shared)) {
+      if (shared < 3 || score < 1.0) continue;
+      if (!best) { best = { row, score, shared }; continue; }
+      // Tiebreak: (1) more shared tokens wins, (2) synced rows preferred
+      // over detect-identified at equal shared count.
+      const isSynced  = (r) => r.source !== 'detect-identified';
+      if (shared > best.shared) best = { row, score, shared };
+      else if (shared === best.shared && isSynced(row) && !isSynced(best.row)) {
         best = { row, score, shared };
       }
     }
