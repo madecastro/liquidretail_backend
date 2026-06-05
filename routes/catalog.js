@@ -422,7 +422,7 @@ router.get('/:id/matches', async (req, res) => {
     const mediaIds = ordered.map(a => a.mediaId);
     const mediaDocs = mediaIds.length
       ? await Media.find({ _id: { $in: mediaIds } })
-          .select('externalId fileType fileUrl fileName source metadata createdAt classification platformStats')
+          .select('externalId fileType fileUrl fileName source metadata createdAt classification platformStats adSuitability')
           .lean()
       : [];
     const mediaById = new Map(mediaDocs.map(m => [String(m._id), m]));
@@ -473,8 +473,25 @@ router.get('/:id/matches', async (req, res) => {
           permalink:    m.metadata?.permalink || null,
           creatorHandle: m.metadata?.creatorHandle || null,
           postedAt:     m.metadata?.postedAt || null,
-          likes:        m.platformStats?.likes    ?? null,
-          comments:     m.platformStats?.comments ?? null,
+          // Engagement stats — likes/comments are the basics; saves +
+          // engagement-rate let the tile show a real performance signal.
+          likes:        m.platformStats?.likes      ?? null,
+          comments:     m.platformStats?.comments   ?? null,
+          saves:        m.platformStats?.saves      ?? null,
+          engagement:   m.platformStats?.engagement ?? null,
+          // Post type — IG/TikTok type classification (image / video /
+          // reel / carousel). Lets the tile show a platform-aware chip.
+          postType:     m.metadata?.postType || null,
+          // Media classification — shotType (lifestyle / on_model /
+          // product_only / etc.) + contentNature (evergreen / promotional /
+          // announcement). Operators want to see at a glance whether a
+          // post is reusable evergreen lifestyle content vs an expired
+          // sale announcement.
+          shotType:       m.classification?.shotType       || null,
+          contentNature:  m.classification?.contentNature  || null,
+          // Ad readiness score (0–1, higher is better). Computed by the
+          // adSuitabilityService from photo quality + composition signals.
+          adReadiness:    typeof m.adSuitability?.score === 'number' ? m.adSuitability.score : null,
           detectOutcome: m.classification?.detectSummary?.outcome || null,
           createdAt:    m.createdAt
         },

@@ -523,10 +523,15 @@ router.get('/:id/brand-matches', async (req, res) => {
             permalink:     m.metadata?.permalink     || null,
             creatorHandle: m.metadata?.creatorHandle || null,
             postedAt:      m.metadata?.postedAt      || null,
-            likes:         m.platformStats?.likes    ?? null,
-            comments:      m.platformStats?.comments ?? null,
-            saves:         m.platformStats?.saves    ?? null,
-            adSuitability: m.adSuitability?.score    ?? null,
+            likes:         m.platformStats?.likes      ?? null,
+            comments:      m.platformStats?.comments   ?? null,
+            saves:         m.platformStats?.saves      ?? null,
+            engagement:    m.platformStats?.engagement ?? null,
+            postType:      m.metadata?.postType        || null,
+            shotType:      m.classification?.shotType      || null,
+            contentNature: m.classification?.contentNature || null,
+            adReadiness:   m.adSuitability?.score    ?? null,
+            adSuitability: m.adSuitability?.score    ?? null,   // legacy field name retained for callers
             createdAt:     m.createdAt
           }
         };
