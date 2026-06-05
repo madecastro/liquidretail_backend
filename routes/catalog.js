@@ -477,13 +477,39 @@ router.patch('/:id', express.json(), async (req, res) => {
 router.get('/:id/matches', async (req, res) => {
   try {
     const filter = tenantFilter(req, { _id: req.params.id });
-    const product = await CatalogProduct.findOne(filter).select('_id').lean();
+    const product = await CatalogProduct.findOne(filter)
+      .select('_id brandId primaryProductId')
+      .lean();
     if (!product) return res.status(404).json({ error: 'product not found' });
 
-    // Pull every artifact that references this catalog product, then
-    // group by mediaId so the UI shows one row per Media (with the
+    // Variant-family resolution. ProductMatchArtifact.catalogProductId
+    // points at whichever row was the match-resolution target at the time
+    // — sometimes the primary, sometimes a sibling variant, sometimes a
+    // detect-identified row that later became a non-primary of a synced
+    // family. To make every variant in a family surface the family's
+    // full match history, query across the whole family:
+    //   - If this row is the primary: include matches against this _id
+    //     AND any non-primary pointing at it.
+    //   - If this row is a non-primary: include matches against this _id,
+    //     its primary, AND its siblings (other non-primaries of the same
+    //     primary).
+    const familyPrimaryId = product.primaryProductId || product._id;
+    const familyMembers = await CatalogProduct.find({
+      brandId: product.brandId,
+      $or: [
+        { _id: familyPrimaryId },
+        { primaryProductId: familyPrimaryId }
+      ]
+    }).select('_id').lean();
+    const familyIds = familyMembers.map(m => m._id);
+    if (!familyIds.length) familyIds.push(product._id);   // belt & braces
+
+    // Pull every artifact that references any row in the variant family,
+    // then group by mediaId so the UI shows one row per Media (with the
     // most recent artifact's evidence).
-    const artifacts = await ProductMatchArtifact.find({ catalogProductId: product._id })
+    const artifacts = await ProductMatchArtifact.find({
+      catalogProductId: { $in: familyIds }
+    })
       .sort({ createdAt: -1 })
       .select('mediaId outcome outcomeReasoning winner identification query catalogCombinedScore catalogVisualScore createdAt productIndex matchSource')
       .limit(200)
@@ -517,10 +543,20 @@ router.get('/:id/matches', async (req, res) => {
     const filterAdEligible = req.query.adEligible === '1';
     const { isMediaEligibleByContentNature } = require('../services/campaignAdsGenerationService');
 
+    // Track how many matches were dropped by the adEligible gate so the
+    // caller can surface "N posts hidden because the classifier flagged
+    // them promotional/announcement" — important diagnostic when an
+    // operator sees zero related media despite the product having real
+    // match history.
+    let filteredOutByAdEligible = 0;
+
     const matches = ordered.map(a => {
       const m = mediaById.get(String(a.mediaId));
       if (!m) return null;
-      if (filterAdEligible && !isMediaEligibleByContentNature(m)) return null;
+      if (filterAdEligible && !isMediaEligibleByContentNature(m)) {
+        filteredOutByAdEligible++;
+        return null;
+      }
       const cropProductRef = a.query?.productCrop || {};
       return {
         mediaId:    String(a.mediaId),
@@ -582,6 +618,12 @@ router.get('/:id/matches', async (req, res) => {
     res.json({
       productId: String(product._id),
       total:    matches.length,
+      // Always present; non-zero when ?adEligible=1 dropped matches
+      // because the classifier flagged them promotional/announcement.
+      // Lets the picker show "N posts hidden — likely promotional".
+      filteredOutByAdEligible,
+      // Variant-family ids that contributed matches — diagnostic-only.
+      familyMemberIds: familyIds.map(id => String(id)),
       matches
     });
   } catch (err) {
