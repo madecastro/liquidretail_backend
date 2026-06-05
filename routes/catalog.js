@@ -262,15 +262,44 @@ router.get('/:id', async (req, res) => {
     const product = await CatalogProduct.findOne(filter).lean();
     if (!product) return res.status(404).json({ error: 'product not found' });
 
-    const [category, sourceMedia] = await Promise.all([
+    // Variant family resolution. If this product is the family's
+    // primary (primaryProductId is null), siblings have primaryProductId
+    // pointing AT this row. If this row is a non-primary variant,
+    // siblings share the same primaryProductId AND we include the
+    // primary itself. Either way, we end up with the full family minus
+    // this row.
+    const familyPrimaryId = product.primaryProductId || product._id;
+    const variantFilter = tenantFilter(req, {
+      brandId: product.brandId,
+      _id:     { $ne: product._id },
+      $or: [
+        { primaryProductId: familyPrimaryId },
+        { _id: familyPrimaryId }
+      ]
+    });
+
+    const [category, sourceMedia, variants] = await Promise.all([
       product.categoryRef ? Category.findById(product.categoryRef).lean() : null,
       product.detectedFromMediaId
         ? Media.findById(product.detectedFromMediaId).select('externalId fileType fileUrl fileName source metadata platformStats createdAt').lean()
-        : null
+        : null,
+      CatalogProduct.find(variantFilter)
+        .select('_id title imageUrl imageMediaId source isPrimaryVariant primaryProductId price currency')
+        .lean()
     ]);
 
     res.json({
       product: projectDetail(product, category),
+      variants: (variants || []).map(v => ({
+        id:               String(v._id),
+        title:            v.title || null,
+        imageUrl:         v.imageUrl || null,
+        imageMediaId:     v.imageMediaId ? String(v.imageMediaId) : null,
+        source:           v.source || null,
+        isPrimaryVariant: v.isPrimaryVariant === true,
+        price:            v.price ?? null,
+        currency:         v.currency || null
+      })),
       sourceMedia: sourceMedia ? {
         id:            String(sourceMedia._id),
         externalId:    sourceMedia.externalId,
