@@ -154,7 +154,10 @@ async function renderCreative(req) {
       aiCreativeV2,
       creativeIntent,
       campaignKind,
-      productId:    req.creative.productId || null
+      productId:    req.creative.productId || null,
+      // Phase 6.5 — campaign run id mixed into pickConceptForCell's
+      // hash downstream so concept rotates batch-over-batch.
+      campaignRunId: req.campaignRunId || null
     });
     stages.render = Date.now() - t;
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB, mode=${useVideoBranch ? 'video-overlay' : 'static'})`);
@@ -555,7 +558,7 @@ async function renderViaHtml({ outputHtml, dims, renderMode }) {
 // pre-Phase-6 behavior — extracted into a helper so renderStage can
 // branch cleanly. Still used for: non-AI templates always; AI templates
 // when RENDER_USE_HTML is off OR no HTML candidate is available.
-async function renderViaSpec({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static', aiCreativeV2 = false, campaignKind = null, creativeIntent = null, productId = null }) {
+async function renderViaSpec({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static', aiCreativeV2 = false, campaignKind = null, creativeIntent = null, productId = null, campaignRunId = null }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
   // renderMode = 'static' → opaque PNG of full canvas (image media or
@@ -584,6 +587,8 @@ async function renderViaSpec({ layoutInputArtifactId, template, aspectRatio, exp
     if (campaignKind)   url.searchParams.set('campaignKind',   campaignKind);
     if (creativeIntent) url.searchParams.set('creativeIntent', creativeIntent);
     if (productId)      url.searchParams.set('productId',      String(productId));
+    // Phase 6.5 — runId rotates concept picks batch-over-batch.
+    if (campaignRunId)  url.searchParams.set('runId',          String(campaignRunId));
   }
   // Phase 5b.3 — flip headless renders onto the Resolver path. The
   // by-id route reads ?useResolved=1 and returns the ResolvedLayoutArtifact

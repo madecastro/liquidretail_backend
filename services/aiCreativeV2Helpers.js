@@ -9,10 +9,20 @@ const crypto = require('crypto');
 // one concept by index using a stable hash. Different cells of the same
 // (brand × product) get different concepts, so the batch spreads across
 // the Director's emissions instead of every Ad getting concept[0].
-function pickConceptForCell({ concepts, cellKey }) {
+//
+// Phase 6.5 — optional runId is mixed into the hash so the SAME cell
+// shape rotates concepts batch-over-batch. Within a single CampaignRun
+// the cell stays cache-stable (same runId throughout → same concept
+// pick → same AiCanvasArtifact cache key). Across runs, the pick
+// rotates so an operator running the same campaign twice gets a
+// genuinely different look the second time, not just a re-render of
+// the first. Backward-compatible — when runId is omitted, behaves
+// exactly like the pre-6.5 deterministic-by-cellKey picker.
+function pickConceptForCell({ concepts, cellKey, runId = null }) {
   if (!Array.isArray(concepts) || !concepts.length) return null;
   if (concepts.length === 1) return concepts[0];
-  const hash = crypto.createHash('sha256').update(String(cellKey || '')).digest();
+  const seed = runId ? `${cellKey || ''}|${runId}` : String(cellKey || '');
+  const hash = crypto.createHash('sha256').update(seed).digest();
   // Use first 4 bytes as an unsigned int → modulo concept count.
   const idx = hash.readUInt32BE(0) % concepts.length;
   return concepts[idx];

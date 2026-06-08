@@ -136,7 +136,15 @@ router.get('/by-id/:id', async (req, res) => {
             // Cell key combines media + paletteSource so cells of the
             // same product spread across the Director's concepts.
             const cellKey = `${artifact.mediaId}|${artifact.paletteSource || ''}|${artifact.variantKind || ''}`;
-            directionConcept = pickConceptForCell({ concepts: direction.concepts, cellKey });
+            // Phase 6.5 — runId mixed in so the same cell rotates
+            // concept picks batch-over-batch. Within a single run the
+            // cellKey + runId pair is stable so AiCanvasArtifact cache
+            // hits work normally; across runs the pick varies.
+            directionConcept = pickConceptForCell({
+              concepts: direction.concepts,
+              cellKey,
+              runId:    req.query.runId || null
+            });
           } else {
             console.warn(`   ⚠️  v2 requested but no Director concepts found for brand=${artifact.brandId} product=${directionFilter.productId || '-'} kind=${directionFilter.campaignKind || '-'} — falling back to V1`);
           }
