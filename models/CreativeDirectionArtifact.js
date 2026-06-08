@@ -30,6 +30,12 @@ const creativeDirectionArtifactSchema = new mongoose.Schema({
   contractVersion:    { type: String, default: '1.0' },
   contractSchemaId:   { type: String, default: 'creative_direction.v1' },
 
+  // Bumped when assembleSignals' shape changes — the cache check in
+  // directConcepts only serves rows whose signalsVersion matches the
+  // current code so older summaries don't stay frozen. Mirrors the
+  // SPEC_SCHEMA_VERSION pattern in aiCanvasArtifact.
+  signalsVersion:     { type: String, default: '1.0.0' },
+
   // ── Input snapshot (the signals the Director saw) ──────────────
   // Persisted verbatim so we can audit what strategy was made against
   // what signal — useful when concept variety drifts.

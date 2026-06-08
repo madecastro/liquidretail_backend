@@ -38,6 +38,17 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
   const product = layoutInput.product || {};
   const copy = layoutInput.copy || {};
 
+  // DEFENSIVE: the LLM payload (`text` below) is hand-constructed from
+  // specific layoutInput fields — we explicitly DO NOT spread `layoutInput`
+  // and DO NOT touch `layoutInput.theme`, `layoutInput.layout_options`,
+  // or `layoutInput.derivation.{theme_style,emphasis,background_style}`.
+  // Those fields are template-only constraints (used by templatePreview.js
+  // for legacy hand-authored templates). Including them in the LLM
+  // payload would lock the Generator into a single archetype + Boolean
+  // shape per ad, collapsing compositional variety. If a future change
+  // adds new layoutInput fields, add them to the curated `text` object
+  // below intentionally — do not bulk-spread.
+
   // Phase 4 — load style-aware copy candidates from CopyCandidatesArtifact
   // (cached per brand × product × creativeStyle). Replaces the legacy
   // single-element wrap of input.copy.* when available; falls through

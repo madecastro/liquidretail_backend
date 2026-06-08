@@ -33,6 +33,11 @@ const TEMPERATURE = 0.7;          // creative direction wants nuance, not wild v
 const N_CONCEPTS  = 2;            // two distinct concepts per call (cheaper than running twice)
 const MAX_TOKENS  = 2000;
 
+// Bump when assembleSignals' output shape changes — invalidates existing
+// CreativeDirectionArtifact rows so the Director re-runs against the
+// richer inputSummary. Mirrors aiCanvasSpecService.SPEC_SCHEMA_VERSION.
+const DIRECTOR_SIGNALS_VERSION = '2.0.0';   // 2.0: full data projection (was: 1.0 5-bucket bool summary)
+
 // Canonical archetype enum (the 8 we've been using, with descriptive
 // names matching the contract). Director picks from these; Generator
 // must materialize.
@@ -82,7 +87,10 @@ async function directConcepts({
 
   if (!refresh) {
     const cached = await CreativeDirectionArtifact.findOne(filter).lean();
-    if (cached) {
+    // Cache hit requires the persisted artifact's signalsVersion to
+    // match the current code. Older artifacts (no field or older
+    // version) re-run against the enriched inputSummary on next call.
+    if (cached && cached.signalsVersion === DIRECTOR_SIGNALS_VERSION) {
       recordCacheHit({
         stage:    'creative_director',
         provider: 'openai',
@@ -150,6 +158,7 @@ async function directConcepts({
       ...filter,
       contractVersion:    '1.0',
       contractSchemaId:   'creative_direction.v1',
+      signalsVersion:     DIRECTOR_SIGNALS_VERSION,
       inputSummary,
       availableArchetypes:     [...AVAILABLE_ARCHETYPES],
       availableComponentRoles: [...ROLES],
@@ -185,38 +194,60 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     ? product.matchedMedia.map(mm => mm.mediaId).filter(Boolean).slice(0, 10)
     : [];
 
-  // Load representative media for stat aggregation.
+  // Pull fuller media — classification (shot type, content nature),
+  // primarySubjectLabel, adSuitability score, and creator metadata.
+  // The Director makes strategy calls; richer fields = richer concepts.
   let medias = [];
   if (matchedMediaIds.length) {
     medias = await Media.find({ _id: { $in: matchedMediaIds } })
-      .select('source platformStats metadata.caption fileType')
+      .select('source platformStats metadata classification primarySubjectLabel adSuitability fileType')
       .lean();
   }
 
+  // Top comments across matched media (sorted by likes). Best-effort —
+  // Comment model is optional for some ingestion paths.
+  let topCommentsAcrossMedia = [];
+  if (matchedMediaIds.length) {
+    try {
+      const Comment = require('../models/Comment');
+      topCommentsAcrossMedia = await Comment.find({ mediaId: { $in: matchedMediaIds } })
+        .sort({ likeCount: -1, postedAt: -1 })
+        .limit(5)
+        .select('author authorUsername text content likeCount mediaId')
+        .lean();
+    } catch (_) { /* Comment model unavailable in some envs */ }
+  }
+
   // ── Brand signal ──
-  // Brand colors + font intentionally OMITTED — letting the downstream
-  // Generator pick a palette from the photo + tone produces better
-  // composition than hard-binding the literal brand hex values, which
-  // routinely created dark panels covering media and forced unreadable
-  // contrast. Tone stays as a stylistic cue.
+  // Brand colors + font intentionally OMITTED (Generator picks palette).
+  // Adds description + tagline + brandReviews summary so the Director can
+  // ground strategy in actual voice, not just abstract tone words.
   const brandSignal = {
-    name:            brand?.name || null,
-    tone:            Array.isArray(brand?.tone) ? brand.tone.slice(0, 6) : []
+    name:        brand?.name        || null,
+    tagline:     brand?.tagline     || null,
+    description: snippetText(brand?.description, 280),
+    tone:        Array.isArray(brand?.tone) ? brand.tone.slice(0, 6) : [],
+    brand_reviews_summary: snippetText(brand?.brandReviews?.summary, 240),
+    has_logo:    !!brand?.logo
   };
 
   // ── Product signal ──
-  // Priority — explicit if campaignKind === 'product', medium for brand
-  // campaigns (product is supporting), absent for productId-null cases.
   const productSignal = {
-    name:     product?.title || null,
-    category: product?.category || null,
-    priority: !productId ? 'absent' :
-              campaignKind === 'product' ? 'high' :
-              campaignKind === 'brand'   ? 'medium' :
-              'medium'
+    name:           product?.title       || null,
+    category:       product?.category    || null,
+    description:    snippetText(product?.description, 280),
+    price:          product?.price ?? null,
+    currency:       product?.currency    || null,
+    availability:   product?.availability || null,
+    badges:         Array.isArray(product?.shortBenefits) ? product.shortBenefits.slice(0, 4) : [],
+    review_summary: snippetText(product?.reviewSummary?.summary || product?.productReviews?.summary, 240),
+    priority:       !productId ? 'absent' :
+                    campaignKind === 'product' ? 'high' :
+                    campaignKind === 'brand'   ? 'medium' :
+                    'medium'
   };
 
-  // ── UGC signal — aggregate across matched media ──
+  // ── UGC signal — aggregate + distributions across matched media ──
   const ugcMedias    = medias.filter(m => m.source === 'instagram' || m.source === 'tiktok');
   const ugcMediaCount= ugcMedias.length;
   const ugcPlatform  = ugcMedias.find(m => m.source)?.source || null;
@@ -225,40 +256,107 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
                         'absent';
   const rightsApproved = ugcMedias.some(m => m.platformStats?.rights_approved) || null;
 
+  // Shot-type + content-nature distributions: tells the Director whether
+  // the matched media is lifestyle vs product-only, evergreen vs
+  // promotional. Drives ugc_priority + emotional_hook + archetype.
+  const shotTypeDist     = distribution(ugcMedias.map(m => m.classification?.shotType).filter(Boolean));
+  const contentNatureDist = distribution(ugcMedias.map(m => m.classification?.contentNature).filter(Boolean));
+  const adReadinessScores = ugcMedias
+    .map(m => m.adSuitability?.score)
+    .filter(s => typeof s === 'number');
+  const avgAdReadiness = adReadinessScores.length
+    ? Number((adReadinessScores.reduce((s, n) => s + n, 0) / adReadinessScores.length).toFixed(2))
+    : null;
+  const subjectLabels = ugcMedias.map(m => m.primarySubjectLabel).filter(Boolean).slice(0, 5);
+  // Top creator (by follower count) across matched media. Lets the
+  // Director know if there's a meaningful creator anchor to lead with.
+  const creators = ugcMedias
+    .map(m => ({
+      handle:    m.metadata?.creatorHandle || null,
+      followers: m.metadata?.creatorFollowerCount ?? null,
+      platform:  m.source
+    }))
+    .filter(c => c.handle);
+  const topCreator = creators.sort((a, b) => (b.followers || 0) - (a.followers || 0))[0] || null;
+
   const ugcSignal = {
     platform:        ugcPlatform,
+    media_count:     ugcMediaCount,
     media_strength:  mediaStrength,
-    rights_approved: rightsApproved
+    rights_approved: rightsApproved,
+    shot_type_distribution:     shotTypeDist,        // { lifestyle: 4, product_only: 1, ... }
+    content_nature_distribution: contentNatureDist,  // { evergreen: 3, promotional: 1, ... }
+    avg_ad_readiness: avgAdReadiness,                 // 0–1 mean across matched
+    primary_subjects: subjectLabels,                  // ["jar of chili oil", "bowl of noodles", ...]
+    top_creator:     topCreator                      // { handle, followers, platform } | null
   };
 
-  // ── Social proof signal ──
-  const hasRating         = typeof product?.rating === 'number' && product.rating > 0;
-  const hasTopComments    = ugcMediaCount > 0;     // proxy — we don't have per-product top-comment count here
-  const hasPrimaryQuote   = Array.isArray(product?.reviews) && product.reviews.some(r => typeof r.text === 'string' && r.text.length > 30);
-  const strongestSignal   = hasPrimaryQuote ? 'testimonial' :
-                             hasRating ? 'rating' :
-                             hasTopComments ? 'creator' :
-                             null;
+  // ── Social proof signal — real values + actual quote/comment text ──
+  const ratingValue = typeof product?.rating === 'number' && product.rating > 0 ? product.rating : null;
+  // ratingCount preference order: productReviews snapshot → reviews[] array length
+  const ratingCount = product?.productReviews?.reviewCount
+                   ?? (Array.isArray(product?.reviews) ? product.reviews.length : null);
+
+  const productReviewQuotes = (Array.isArray(product?.reviews) ? product.reviews : [])
+    .map(r => ({ text: r.text || r.body || r.content, author: r.author || r.reviewer || r.user_name }))
+    .filter(r => typeof r.text === 'string' && r.text.trim().length > 30);
+  const primaryQuoteObj = productReviewQuotes[0] || null;
+  const topComments = topCommentsAcrossMedia.slice(0, 2).map(c => ({
+    text:   snippetText(c.text || c.content, 180),
+    author: c.author || c.authorUsername || null,
+    likes:  c.likeCount ?? null
+  })).filter(c => c.text);
+
+  const strongestSignal = primaryQuoteObj  ? 'testimonial' :
+                          ratingValue      ? 'rating' :
+                          topComments.length ? 'creator' :
+                          null;
 
   const socialProofSignal = {
-    has_primary_quote: !!hasPrimaryQuote,
-    has_top_comments:  !!hasTopComments,
-    has_rating:        !!hasRating,
-    strongest_signal:  strongestSignal
+    rating: ratingValue != null ? { value: Number(ratingValue.toFixed(1)), count: ratingCount } : null,
+    primary_quote: primaryQuoteObj
+      ? { text: snippetText(primaryQuoteObj.text, 200), author: primaryQuoteObj.author || null }
+      : null,
+    top_comments:     topComments,
+    strongest_signal: strongestSignal,
+    proof_density:    productReviewQuotes.length + topComments.length      // crude richness signal
   };
 
-  // ── Performance signal ──
+  // ── Performance signal — totals + rates + per-media percentiles ──
   const totalLikes    = ugcMedias.reduce((s, m) => s + (m.platformStats?.likes    || 0), 0);
   const totalComments = ugcMedias.reduce((s, m) => s + (m.platformStats?.comments || 0), 0);
+  const totalSaves    = ugcMedias.reduce((s, m) => s + (m.platformStats?.saves    || 0), 0);
+  const totalShares   = ugcMedias.reduce((s, m) => s + (m.platformStats?.shares   || 0), 0);
+  const engagementRates = ugcMedias
+    .map(m => m.platformStats?.engagement)
+    .filter(e => typeof e === 'number' && e > 0);
+  const avgEngagement = engagementRates.length
+    ? Number((engagementRates.reduce((s, n) => s + n, 0) / engagementRates.length).toFixed(4))
+    : null;
   const performanceStrength = totalLikes >= 5000 || totalComments >= 200 ? 'high' :
                               totalLikes >= 500  || totalComments >= 20  ? 'medium' :
                               totalLikes > 0     || totalComments > 0    ? 'low' :
                               'absent';
+  // Top single post by likes — lets the Director lean into stat_led when
+  // one post dominates ("this single post got 12K likes — make IT the ad").
+  const topPost = ugcMedias
+    .map(m => ({
+      likes:    m.platformStats?.likes    || 0,
+      comments: m.platformStats?.comments || 0,
+      saves:    m.platformStats?.saves    || 0,
+      caption:  snippetText(m.metadata?.caption, 140)
+    }))
+    .filter(p => p.likes > 0 || p.comments > 0)
+    .sort((a, b) => b.likes - a.likes)[0] || null;
 
   const performanceSignal = {
-    likes:    totalLikes    || null,
-    comments: totalComments || null,
-    strength: performanceStrength
+    likes:           totalLikes    || null,
+    comments:        totalComments || null,
+    saves:           totalSaves    || null,
+    shares:          totalShares   || null,
+    avg_engagement_rate: avgEngagement,        // 0–1, average across posts with engagement data
+    strength:        performanceStrength,
+    top_post:        topPost                    // { likes, comments, saves, caption } | null
   };
 
   return {
@@ -268,6 +366,26 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     social_proof_signal: socialProofSignal,
     performance_signal:  performanceSignal
   };
+}
+
+// Compact text → null/empty/length-capped clean snippet. Used to keep
+// the Director's inputSummary tight while still passing actual content.
+function snippetText(s, maxLen) {
+  if (!s || typeof s !== 'string') return null;
+  const trimmed = s.replace(/\s+/g, ' ').trim();
+  if (!trimmed) return null;
+  return trimmed.length > maxLen ? trimmed.slice(0, maxLen - 1) + '…' : trimmed;
+}
+
+// Count distinct values in an array. Used for shot-type + content-nature
+// distributions across matched media.
+function distribution(values) {
+  const out = {};
+  for (const v of values) {
+    if (!v) continue;
+    out[v] = (out[v] || 0) + 1;
+  }
+  return out;
 }
 
 // ── Prompt construction ──────────────────────────────────────────────
@@ -281,9 +399,24 @@ function buildPrompt({ inputSummary, creativeIntent }) {
     `RULES:`,
     `- DO NOT generate coordinates, rects, or pixel positions.`,
     `- The ${N_CONCEPTS} concepts MUST be meaningfully different — different archetype OR different emotional_hook OR different social_proof_type. Avoid two concepts that read the same.`,
-    `- Lead with the STRONGEST signal in the data. If social_proof_signal.strongest_signal is "testimonial" and performance is low, lean into the testimonial — don't pick a stat_led archetype.`,
-    `- If a signal is "absent", do not build a concept around it.`,
-    `- HONESTY RULE: if social_proof_signal.strongest_signal is null AND has_primary_quote=false AND has_top_comments=false AND has_rating=false, you MUST set social_proof_type="none" on EVERY concept. Do not promise proof the data can't back. In that case, also avoid the stat_led_social_proof and hero_quote_overlay archetypes — there is nothing to surface. Lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself (full_bleed_hero_bottom_panel, vertical_split, diagonal_carve).`,
+    `- Lead with the STRONGEST signal in the data. If social_proof_signal.primary_quote is present and performance is low, lean into the testimonial — don't pick a stat_led archetype.`,
+    `- If a signal is "absent" / null / empty, do not build a concept around it.`,
+    `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set social_proof_type="none" on EVERY concept. Do not promise proof the data can't back. In that case, also avoid the stat_led_social_proof and hero_quote_overlay archetypes — there is nothing to surface. Lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself (full_bleed_hero_bottom_panel, vertical_split, diagonal_carve).`,
+    ``,
+    `READING THE INPUT SUMMARY — use the FULL signal, not just strength labels:`,
+    `  brand_signal.description / tagline / brand_reviews_summary → voice + emotional_hook calibration`,
+    `  product_signal.description / review_summary / price → aspirational vs accessible vs functional positioning`,
+    `  ugc_signal.shot_type_distribution → if mostly lifestyle/on_model → ugc-led / hero_quote_overlay; if product_only → typographic_dominant / vertical_split`,
+    `  ugc_signal.content_nature_distribution → if mostly evergreen → safe to surface; if mostly promotional → archetype should sidestep the dated feel`,
+    `  ugc_signal.primary_subjects → what the photos ACTUALLY show — drives emotional_hook word choice`,
+    `  ugc_signal.top_creator → if a creator with significant followers anchors the matched set, pick a creator-led archetype (hero_quote_overlay) and set comment_priority=high`,
+    `  ugc_signal.avg_ad_readiness → high (>0.7) = photo-led works; low (<0.4) = lean typographic or brand-color-led to avoid weak imagery`,
+    `  social_proof_signal.primary_quote.text → if it makes a specific claim (e.g. "tastes like Italy") let the quote's CONTENT inform emotional_hook (e.g. "authenticity" not generic "trust")`,
+    `  social_proof_signal.top_comments[].text → same — if comments cluster on a topic ("flavor", "spice"), the concept's emotional_hook should pick up that theme`,
+    `  social_proof_signal.rating.value + count → if rating ≥ 4.5 AND count ≥ 50 → stat_led_social_proof is justified; smaller counts = lean on quote not number`,
+    `  performance_signal.top_post.likes → if a single post dramatically outperforms (>>median) the others, archetype should center THAT post's visual (hero_quote_overlay over that post's media)`,
+    `  performance_signal.avg_engagement_rate → high (>0.05) = social-proof-led safe; low = brand-voice-led safer`,
+    `Concepts that ignore the signal in favor of generic archetypes get rejected by the Judge downstream. SHOW that the signal drove the call in rationale.`,
     ``,
     `AVAILABLE ARCHETYPES (pick one per concept):`,
     AVAILABLE_ARCHETYPES.map(a => `  ${a}`).join('\n'),
