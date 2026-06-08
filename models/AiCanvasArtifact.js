@@ -70,6 +70,12 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   // artifact's own collection (indexed by aiCanvasArtifactId).
   htmlValidationId: { type: mongoose.Schema.Types.ObjectId, ref: 'AiHtmlValidationArtifact', default: null, index: true },
 
+  // Raw OpenAI response for the WINNING HTML candidate. Kept for
+  // diagnostic visibility (spec preview surfaces it under "HTML
+  // Generator Response"). Mirrors the rawResponse pattern for the
+  // JSON-spec path. Null when no HTML has been generated yet.
+  htmlRawResponse: { type: mongoose.Schema.Types.Mixed, default: null },
+
   // Validation outcomes recorded for diagnostics. Empty array on a
   // clean validation. Populated with soft-warnings when zones drift
   // outside safe areas, slots reference unknown paths, etc. Hard
