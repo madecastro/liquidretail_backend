@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://reach-social.app/contracts/ai_canvas_validation.v1.json",
+  "title": "AI Canvas HTML Validation Output (v1)",
+  "description": "Output of htmlValidationService when run against one candidate HTML output from the Generator. Drives Pre-Judge filter decisions (hard violators dropped) and surfaces warnings in the spec preview. One artifact per (aiCanvasArtifactId, candidateIndex).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type", "version",
+    "candidate_index", "parse_ok",
+    "warnings", "hard_violations"
+  ],
+  "properties": {
+    "contract_type": { "type": "string", "const": "ai_canvas_validation" },
+    "version":       { "type": "string", "const": "1.0" },
+
+    "candidate_index": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Index into AiCanvasArtifact.candidates[] this validation row covers."
+    },
+
+    "parse_ok": {
+      "type": "boolean",
+      "description": "false = cheerio failed to parse the HTML. Hard fail — Pre-Judge filter drops this candidate."
+    },
+
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "code", "message"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+          "code":     { "type": "string", "description": "stable identifier — e.g. 'contrast_below_aa', 'image_404', 'absolute_off_canvas', 'empty_headline'" },
+          "message":  { "type": "string" },
+          "locator":  { "type": "string", "description": "OPTIONAL CSS selector or DOM hint pointing at the offending element" }
+        }
+      }
+    },
+
+    "hard_violations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Subset of warnings.code values that trigger Pre-Judge drop. Stable enum: 'parse_failed', 'no_html', 'no_body', 'has_script', 'image_404_critical', 'proof_strategy_unsupported'."
+    },
+
+    "image_probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tested": { "type": "integer", "minimum": 0 },
+        "ok":     { "type": "integer", "minimum": 0 },
+        "failed": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "URLs that returned non-2xx on HEAD request"
+        }
+      }
+    },
+
+    "contrast_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["selector", "fg", "bg", "ratio", "pass_aa"],
+        "properties": {
+          "selector": { "type": "string" },
+          "fg":       { "type": "string", "pattern": "^#[A-Fa-f0-9]{6}$" },
+          "bg":       { "type": "string", "pattern": "^#[A-Fa-f0-9]{6}$" },
+          "ratio":    { "type": "number" },
+          "pass_aa":  { "type": "boolean", "description": "WCAG AA threshold — 4.5:1 normal text, 3:1 large text" }
+        }
+      }
+    },
+
+    "computed_dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "width":    { "type": "integer" },
+        "height":   { "type": "integer" },
+        "overflow": { "type": "boolean", "description": "true when post-render document height/width exceeds the expected viewport — text or element clipped" }
+      }
+    }
+  }
+}

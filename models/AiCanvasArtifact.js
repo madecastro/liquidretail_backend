@@ -29,14 +29,46 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   creativeStyle:{ type: String, required: true },   // e.g. 'brand_led' — the LLM's own picked style, also part of the cache key
   aspectRatio:  { type: String, required: true },
 
+  // Phase 6.0 — output discriminator. 'spec' = legacy JSON canvas spec
+  // path (canvasSpec field populated). 'html' = HTML rendering path
+  // (outputHtml field populated). Both paths use the same cache key;
+  // outputKind is part of the cache CHECK so a flag flip doesn't
+  // accidentally serve a stale spec when the operator wants HTML.
+  outputKind: { type: String, enum: ['spec', 'html'], default: 'spec', index: true },
+
   productId:   { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null, index: true },
   variantKind: { type: String, default: null },
 
   campaignContextHash: { type: String, default: null },
   paletteSource:       { type: String, default: 'media' },
 
-  // Validated canvas spec — the actual rendering payload.
-  canvasSpec:   { type: mongoose.Schema.Types.Mixed, required: true },
+  // Validated canvas spec — the actual rendering payload for the
+  // outputKind='spec' path. Nullable so HTML-only generations don't
+  // need to populate it. Required check moved into the service layer
+  // (must be present when outputKind='spec'; outputHtml must be
+  // present when outputKind='html').
+  canvasSpec:   { type: mongoose.Schema.Types.Mixed, default: null },
+
+  // Phase 6.0 — HTML rendering path output. outputHtml is a complete
+  // self-contained HTML document the renderer feeds directly to
+  // Puppeteer's page.setContent. outputCss is OPTIONAL — when the LLM
+  // separates style from markup (rarely; default is inline <style>).
+  // colorPalette is the 2-5 hex palette the LLM picked, surfaced for
+  // the spec preview's swatch row + the validator's contrast checks.
+  outputHtml:   { type: String, default: null },
+  outputCss:    { type: String, default: null },
+  colorPalette: { type: [String], default: [] },
+
+  // Bumped when ai_canvas_html.v1 schema or HTML Generator prompt
+  // changes — cache check pairs it with outputKind='html' so older
+  // HTML rows re-generate. Mirrors specSchemaVersion for the JSON path.
+  htmlSchemaVersion: { type: String, default: '1.0.0' },
+
+  // FK to the AiHtmlValidationArtifact for the WINNING candidate. Null
+  // for outputKind='spec' rows or HTML rows that haven't been validated
+  // yet. Per-candidate validation results live on the validation
+  // artifact's own collection (indexed by aiCanvasArtifactId).
+  htmlValidationId: { type: mongoose.Schema.Types.ObjectId, ref: 'AiHtmlValidationArtifact', default: null, index: true },
 
   // Validation outcomes recorded for diagnostics. Empty array on a
   // clean validation. Populated with soft-warnings when zones drift
