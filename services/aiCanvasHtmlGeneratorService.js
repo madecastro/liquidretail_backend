@@ -19,10 +19,12 @@
 const OpenAI = require('openai');
 
 const AiCanvasArtifact          = require('../models/AiCanvasArtifact');
+const AiHtmlValidationArtifact  = require('../models/AiHtmlValidationArtifact');
 const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
 const { buildAiCanvasContext }  = require('./aiCanvasInputBuilder');
 const { loadContext }           = require('./layoutInputService');
 const { trackLlmCall }          = require('./costTracker');
+const { validateCandidate }     = require('./htmlValidationService');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -169,13 +171,70 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
   const candidateRaws = successes.map(s => s.r.value.raw);
   const totalElapsed  = successes.reduce((m, s) => Math.max(m, s.r.value.elapsedMs), 0);
 
-  // Phase 6.1 winner picking is naive — first valid candidate. Phase
-  // 6.2 wires htmlValidationService + Pre-Judge filter; Phase 6.3
-  // upgrades to vision-Judge over rendered bitmaps. For shadow mode
-  // we just persist all candidates + designate index 0 as winner so
-  // Phase 6.2 has material to validate against.
-  const winnerIndex = 0;
-  const winner = candidates[winnerIndex];
+  // Phase 6.2 — validate every candidate. Persist an AiHtmlValidation-
+  // Artifact per candidate (replace-on-re-run via unique index on
+  // {aiCanvasArtifactId, candidateIndex}). Pre-Judge filter drops
+  // candidates with hard_violations.length > 0; if all candidates
+  // violate, keep them all (don't return empty) but log loudly.
+  const validations = await Promise.all(candidates.map((c, i) => validateCandidate(c.html, {
+    aspectRatio:   canvas.aspectRatio,
+    hierarchySpec: c.hierarchy_spec || null,
+    candidateIndex: i,
+    colorPalette:  Array.isArray(c.color_palette) ? c.color_palette : []
+  })));
+
+  // Replace-on-re-run via the unique (aiCanvasArtifactId, candidateIndex)
+  // index. Doing per-row upsert in parallel — small fanout.
+  await Promise.all(validations.map(v =>
+    AiHtmlValidationArtifact.findOneAndReplace(
+      { aiCanvasArtifactId: canvas._id, candidateIndex: v.candidateIndex },
+      {
+        aiCanvasArtifactId: canvas._id,
+        candidateIndex:     v.candidateIndex,
+        parseOk:            v.parseOk,
+        hardViolations:     v.hardViolations,
+        warnings:           v.warnings,
+        imageProbe:         v.imageProbe,
+        contrastChecks:     v.contrastChecks,
+        computedDimensions: v.computedDimensions,
+        createdAt:          new Date()
+      },
+      { upsert: true, new: true, includeResultMetadata: false }
+    )
+  ));
+
+  // Pre-Judge filter — preferred candidates have ZERO hard violations.
+  // When ALL candidates have hard violations, keep the full pool and
+  // log loudly so we can see Generator prompt failures.
+  const eligibleIndices = validations
+    .map((v, i) => v.hardViolations.length === 0 ? i : null)
+    .filter(i => i !== null);
+  let winnerIndex;
+  if (eligibleIndices.length === 0) {
+    console.warn(
+      `   ⚠️  html-gen Pre-Judge: ALL ${candidates.length} candidates have hard violations ` +
+      `(${validations.map(v => v.hardViolations.join('+')).join(' | ')}) — picking index 0 anyway`
+    );
+    winnerIndex = 0;
+  } else if (eligibleIndices.length < candidates.length) {
+    const dropped = candidates.length - eligibleIndices.length;
+    console.log(
+      `   ⛔ html-gen Pre-Judge: dropped ${dropped}/${candidates.length} candidates for hard violations ` +
+      `(kept indices: ${eligibleIndices.join(',')})`
+    );
+    winnerIndex = eligibleIndices[0];
+  } else {
+    winnerIndex = 0;
+  }
+  const winner          = candidates[winnerIndex];
+  const winnerValidation = validations[winnerIndex];
+
+  // Look up the persisted validation artifact for the winner so we can
+  // FK it on the canvas row.
+  const winnerValidationDoc = await AiHtmlValidationArtifact.findOne({
+    aiCanvasArtifactId: canvas._id,
+    candidateIndex:     winnerIndex
+  }).select('_id').lean();
 
   // Persist HTML + palette on the same AiCanvasArtifact. outputKind
   // stays 'spec' for now — Phase 6.3 flips renderer to read 'html'.
@@ -187,6 +246,7 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
         outputCss:         winner.css_extracted || null,
         colorPalette:      Array.isArray(winner.color_palette) ? winner.color_palette : [],
         htmlSchemaVersion: HTML_SCHEMA_VERSION,
+        htmlValidationId:  winnerValidationDoc?._id || null,
         // Stash the raw response for diagnostic visibility (mirrors the
         // JSON Generator's rawResponse pattern). One field, winner only;
         // multi-candidate raws are not persisted for cost / index size.
@@ -195,20 +255,24 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
     }
   );
 
+  const totalWarnings = validations.reduce((s, v) => s + v.warnings.length, 0);
   console.log(
     `🌐 htmlGen[${canvas.template}/${canvas.aspectRatio}/${canvas.creativeStyle}]: ` +
     `media=${canvas.mediaId} product=${canvas.productId || '-'} ` +
     `concept=${canvas.directionConceptId} cands=${candidates.length} ` +
-    `winner=${winnerIndex} took=${totalElapsed}ms html_len=${(winner.html || '').length}`
+    `winner=${winnerIndex} took=${totalElapsed}ms html_len=${(winner.html || '').length} ` +
+    `warnings=${totalWarnings} winner_hard_violations=${winnerValidation.hardViolations.length}`
   );
 
   return {
-    artifactId:   String(canvas._id),
+    artifactId:    String(canvas._id),
     candidateCount: candidates.length,
     winnerIndex,
-    htmlLength:   (winner.html || '').length,
-    palette:      winner.color_palette || [],
-    cached:       false
+    htmlLength:    (winner.html || '').length,
+    palette:       winner.color_palette || [],
+    totalWarnings,
+    winnerHardViolations: winnerValidation.hardViolations,
+    cached:        false
   };
 }
 
