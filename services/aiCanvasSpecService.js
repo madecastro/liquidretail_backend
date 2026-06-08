@@ -1377,31 +1377,14 @@ async function getOrGenerate({
       });
   });
 
-  // Phase 6.1 SHADOW — HTML Layout Generator. Opt-in via
-  // AI_HTML_LAYOUT_ENABLED=true. Persists outputHtml + colorPalette
-  // on the same AiCanvasArtifact via updateOne; outputKind stays 'spec'
-  // until Phase 6.3 flips the renderer. Fires after the JSON spec
-  // generation so html-gen can reuse the persisted concept + canvas
-  // metadata. Validation (Phase 6.2) wires in next.
-  setImmediate(() => {
-    const htmlGen = require('./aiCanvasHtmlGeneratorService');
-    if (!htmlGen.enabled()) return;
-    htmlGen.generateForArtifact({ aiCanvasArtifactId: artifact._id })
-      .then(out => {
-        if (out.skipped) {
-          console.log(`🌐 html-gen shadow SKIPPED: aiCanvasArtifact=${artifact._id} reason=${out.reason}`);
-          return;
-        }
-        console.log(
-          `🌐 html-gen shadow GENERATED: aiCanvasArtifact=${artifact._id} ` +
-          `cands=${out.candidateCount} winner=${out.winnerIndex} ` +
-          `html_len=${out.htmlLength} palette=${(out.palette || []).join(',')}`
-        );
-      })
-      .catch(err => {
-        console.warn(`   ⚠️  html-gen shadow failed: ${err.message}`);
-      });
-  });
+  // Phase 6.1 / 6.5.1 — HTML Layout Generator is now driven eagerly by
+  // renderService.ensureCanvasAndHtml before the renderer makes the
+  // spec-vs-html branch decision. Removing the setImmediate shadow here
+  // avoids a duplicate fire (eager call + setImmediate race) and the
+  // associated CACHE-HIT logspam on warm cells. Non-render callers that
+  // generate canvas specs without going through renderService (preview
+  // page, spec preview UI) won't get HTML output via this path — they
+  // already call generateForArtifact explicitly when they need it.
 
   return { spec: winner, cached: false, artifactId: String(artifact._id), warnings: winnerWarnings, resolvedInput };
 }

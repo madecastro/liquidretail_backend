@@ -386,13 +386,38 @@ async function renderStage(args) {
   const { layoutInputArtifactId, template, aspectRatio, mediaId, productId, renderMode = 'static' } = args;
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
 
+  // Phase 6.5.1 — eager prime so the first wave of a fresh batch
+  // actually uses the HTML path. Without this, the spec-path shadow
+  // populates outputHtml AFTER the renderer has already screenshot
+  // the legacy /ads.html, so the very first render of every cold cell
+  // ships as the spec render. Cache-keyed inside both services, so on
+  // warm cells this returns in milliseconds.
+  if (RENDER_USE_HTML && template && String(template).startsWith('ai_') && args.aiCreativeV2) {
+    try {
+      await ensureCanvasAndHtml({
+        layoutInputArtifactId,
+        template,
+        aspectRatio,
+        mediaId,
+        productId,
+        brandId:        args.brandId,
+        creativeIntent: args.creativeIntent,
+        campaignKind:   args.campaignKind,
+        campaignRunId:  args.campaignRunId
+      });
+    } catch (err) {
+      console.warn(`   ⚠️  [render eager] ensureCanvasAndHtml failed: ${err.message} — falling back to lazy path`);
+    }
+  }
+
   // Phase 6.3 — HTML render path. Eligible only for AI templates
   // (ai_*), only when the env flag is on, and only when an HTML
   // candidate is present on the AiCanvasArtifact for this cell with
-  // zero hard validation violations. Cold cells fall through to the
-  // legacy spec path; HTML accumulates in the background via the
-  // Phase 6.1 shadow on the way OUT, so re-renders of warmed cells
-  // pick it up automatically.
+  // zero hard validation violations. After Phase 6.5.1 the eager prime
+  // above means cold cells reach this check with outputHtml already
+  // populated; spec-path fallback only fires when (a) eager prime
+  // skipped (no Director / no v2 / disabled) or (b) html-gen returned
+  // hard violations.
   if (RENDER_USE_HTML && template && String(template).startsWith('ai_')) {
     try {
       const htmlCandidate = await lookupHtmlCandidate({
@@ -421,6 +446,105 @@ async function renderStage(args) {
   }
 
   return await renderViaSpec(args);
+}
+
+// Phase 6.5.1 — eager AiCanvasArtifact + outputHtml prime. Mirrors the
+// Director-concept resolution + getOrGenerate call that routes/layout.js
+// makes when the headless renderer hits /api/layout-input/by-id/:id,
+// then invokes html-gen synchronously so the subsequent lookupHtmlCandidate
+// returns the freshly generated HTML rather than null. No-ops on:
+//   - non-AI templates
+//   - V1 campaigns (no Director concept → html-gen would skip anyway)
+//   - missing layoutInputArtifactId
+//   - missing Director artifact (no concepts to pick from)
+//   - AI_HTML_LAYOUT_ENABLED=false
+// Failure is non-fatal — the caller catches and falls through to the
+// legacy spec render path so a flaky LLM never blocks a render.
+async function ensureCanvasAndHtml({
+  layoutInputArtifactId, template, aspectRatio, mediaId, productId,
+  brandId, creativeIntent, campaignKind, campaignRunId
+}) {
+  const htmlGen = require('./aiCanvasHtmlGeneratorService');
+  if (!htmlGen.enabled()) return;
+
+  const layoutInput = await LayoutInputArtifact.findById(layoutInputArtifactId).lean();
+  if (!layoutInput) return;
+
+  const aiNorm = registry.getNormalized(template);
+  const creativeStyle = aiNorm?.creativeStyle || 'brand_led';
+
+  // Director concept lookup — same filter shape as routes/layout.js by-id.
+  let directionArtifactId = null;
+  let directionConcept    = null;
+  try {
+    const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
+    const { pickConceptForCell }    = require('./aiCreativeV2Helpers');
+    const direction = await CreativeDirectionArtifact.findOne({
+      brandId:        brandId || layoutInput.brandId || null,
+      productId:      layoutInput.productId || productId || null,
+      campaignKind:   campaignKind   || null,
+      creativeIntent: creativeIntent || null
+    }).lean();
+    if (direction?.concepts?.length) {
+      directionArtifactId = String(direction._id);
+      const cellKey = `${layoutInput.mediaId}|${layoutInput.paletteSource || ''}|${layoutInput.variantKind || ''}`;
+      directionConcept = pickConceptForCell({
+        concepts: direction.concepts,
+        cellKey,
+        runId:    campaignRunId || null
+      });
+    }
+  } catch (err) {
+    console.warn(`   ⚠️  [render eager] director lookup failed: ${err.message}`);
+  }
+  if (!directionConcept) return;  // no V2 path → spec render takes over
+
+  // Prime the AiCanvasArtifact. Cache-hits when already generated for
+  // this cell (same 8-field key); cold-call triggers the JSON Generator.
+  const aiSvc = require('./aiCanvasSpecService');
+  let canvasResult;
+  try {
+    canvasResult = await aiSvc.getOrGenerate({
+      input:               layoutInput.input,
+      template,
+      aspectRatio,
+      creativeStyle,
+      mediaId,
+      productId:           layoutInput.productId,
+      variantKind:         layoutInput.variantKind,
+      campaignContextHash: layoutInput.campaignContextHash,
+      paletteSource:       layoutInput.paletteSource,
+      advertiserId:        layoutInput.advertiserId,
+      brandId:             layoutInput.brandId,
+      refresh:             false,
+      directionArtifactId,
+      directionConcept,
+      nCandidates:         3,
+      previewMode:         false
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  [render eager] canvas prime failed: ${err.message}`);
+    return;
+  }
+  if (!canvasResult?.artifactId) return;
+
+  // Prime the HTML output. Cache-hits when the AiCanvasArtifact already
+  // has outputHtml at the current schema version. Awaiting here is the
+  // whole point of Phase 6.5.1 — without it the renderer races the
+  // setImmediate shadow and almost always loses on the first wave.
+  try {
+    const out = await htmlGen.generateForArtifact({ aiCanvasArtifactId: canvasResult.artifactId });
+    if (out?.skipped) {
+      console.log(`   🌐 [render eager] html-gen SKIPPED: artifact=${canvasResult.artifactId} reason=${out.reason}`);
+    } else {
+      console.log(
+        `   🌐 [render eager] html-gen READY: artifact=${canvasResult.artifactId} ` +
+        `cands=${out.candidateCount} winner=${out.winnerIndex} html_len=${out.htmlLength}`
+      );
+    }
+  } catch (err) {
+    console.warn(`   ⚠️  [render eager] html-gen failed: ${err.message}`);
+  }
 }
 
 // Look up the HTML candidate for a given cell. Returns null when:
