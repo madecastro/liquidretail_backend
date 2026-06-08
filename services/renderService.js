@@ -327,6 +327,15 @@ const RENDER_TIMEOUT_MS  = parseInt(process.env.RENDER_TIMEOUT_MS  || '60000', 1
 // care about. Easy rollback by flipping the env back to false.
 const RENDER_USE_RESOLVED = String(process.env.RENDER_USE_RESOLVED || '').toLowerCase() === 'true';
 
+// Phase 6.3 — when true, the renderer prefers the HTML output path
+// (page.setContent → screenshot) over the legacy /ads.html bootstrap
+// for AI templates that have a validated outputHtml on the AiCanvas-
+// Artifact. Cold cells (no outputHtml yet) still fall back to the
+// spec path automatically; HTML accumulates in the background via
+// the Phase 6.1 shadow so subsequent renders of the same cell use it.
+// Easy rollback by flipping the env back to false.
+const RENDER_USE_HTML = String(process.env.RENDER_USE_HTML || '').toLowerCase() === 'true';
+
 // Decode the token's payload (without verifying) so the boot log can
 // surface exp + user identity. Helps an operator confirm at a glance
 // whether the env-stamped JWT is still valid before kicking a render
@@ -365,11 +374,188 @@ function decodeTokenPayload(token) {
     `FRONTEND_URL=${FRONTEND_URL} ` +
     `RENDER_AUTH_TOKEN=${tokenSummary} ` +
     `RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS} ` +
-    `RENDER_USE_RESOLVED=${RENDER_USE_RESOLVED}`
+    `RENDER_USE_RESOLVED=${RENDER_USE_RESOLVED} ` +
+    `RENDER_USE_HTML=${RENDER_USE_HTML}`
   );
 })();
 
-async function renderStage({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static', aiCreativeV2 = false, campaignKind = null, creativeIntent = null, productId = null }) {
+async function renderStage(args) {
+  const { layoutInputArtifactId, template, aspectRatio, mediaId, productId, renderMode = 'static' } = args;
+  const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
+
+  // Phase 6.3 — HTML render path. Eligible only for AI templates
+  // (ai_*), only when the env flag is on, and only when an HTML
+  // candidate is present on the AiCanvasArtifact for this cell with
+  // zero hard validation violations. Cold cells fall through to the
+  // legacy spec path; HTML accumulates in the background via the
+  // Phase 6.1 shadow on the way OUT, so re-renders of warmed cells
+  // pick it up automatically.
+  if (RENDER_USE_HTML && template && String(template).startsWith('ai_')) {
+    try {
+      const htmlCandidate = await lookupHtmlCandidate({
+        layoutInputArtifactId, template, aspectRatio, mediaId, productId
+      });
+      if (htmlCandidate?.outputHtml && !htmlCandidate.hasHardViolations) {
+        console.log(
+          `   🌐 [render] HTML path — artifact=${htmlCandidate.artifactId} ` +
+          `html_len=${htmlCandidate.outputHtml.length}`
+        );
+        return await renderViaHtml({
+          outputHtml: htmlCandidate.outputHtml,
+          dims,
+          renderMode
+        });
+      }
+      if (htmlCandidate?.outputHtml && htmlCandidate.hasHardViolations) {
+        console.warn(
+          `   ⚠️  [render] HTML available but has hard violations — ` +
+          `falling back to spec path (artifact=${htmlCandidate.artifactId})`
+        );
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  [render] HTML eligibility check failed: ${err.message} — falling back to spec path`);
+    }
+  }
+
+  return await renderViaSpec(args);
+}
+
+// Look up the HTML candidate for a given cell. Returns null when:
+//   - layoutInputArtifactId missing
+//   - LayoutInputArtifact not found
+//   - AiCanvasArtifact not found for the cell (cold cell — first render)
+//   - outputHtml not populated yet (HTML Gen shadow hasn't completed)
+// Returns { artifactId, outputHtml, hasHardViolations } when present.
+async function lookupHtmlCandidate({ layoutInputArtifactId, template, aspectRatio, mediaId, productId }) {
+  if (!layoutInputArtifactId) return null;
+  const LayoutInputArtifact      = require('../models/LayoutInputArtifact');
+  const AiCanvasArtifact         = require('../models/AiCanvasArtifact');
+  const AiHtmlValidationArtifact = require('../models/AiHtmlValidationArtifact');
+  const registry                 = require('./templateRegistry');
+
+  const layoutInput = await LayoutInputArtifact
+    .findById(layoutInputArtifactId)
+    .select('variantKind campaignContextHash paletteSource')
+    .lean();
+  if (!layoutInput) return null;
+
+  const aiNorm = registry.getNormalized(template);
+  const creativeStyle = aiNorm?.creativeStyle || 'brand_led';
+
+  const canvas = await AiCanvasArtifact.findOne({
+    mediaId,
+    template,
+    aspectRatio,
+    productId:           productId           || null,
+    variantKind:         layoutInput.variantKind         ?? null,
+    campaignContextHash: layoutInput.campaignContextHash ?? null,
+    paletteSource:       layoutInput.paletteSource       || 'media',
+    creativeStyle
+  }).select('_id outputHtml htmlValidationId').lean();
+  if (!canvas?.outputHtml) return null;
+
+  let hasHardViolations = false;
+  if (canvas.htmlValidationId) {
+    const v = await AiHtmlValidationArtifact
+      .findById(canvas.htmlValidationId)
+      .select('hardViolations')
+      .lean();
+    hasHardViolations = !!(v?.hardViolations?.length);
+  }
+
+  return {
+    artifactId:        String(canvas._id),
+    outputHtml:        canvas.outputHtml,
+    hasHardViolations
+  };
+}
+
+// HTML render path — page.setContent + screenshot. Self-contained:
+// no auth tokens, no localStorage seeding, no /ads.html bootstrap, no
+// waitForFunction __tpRenderReady. Renderer hits exactly the viewport
+// the HTML was authored for via setViewport.
+async function renderViaHtml({ outputHtml, dims, renderMode }) {
+  const isVideoOverlay = renderMode === 'video-overlay';
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage'
+      ]
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: dims.w, height: dims.h, deviceScaleFactor: 1 });
+
+    // Same diagnostic capture as the spec path — surfaces page console
+    // errors / failed requests if the HTML itself is broken.
+    const pageEvents = [];
+    const push = (s) => { if (pageEvents.length < 60) pageEvents.push(s); };
+    page.on('console',       (msg) => push(`[console.${msg.type()}] ${msg.text()}`));
+    page.on('pageerror',     (err) => push(`[pageerror] ${err.message}`));
+    page.on('requestfailed', (req) => push(`[requestfailed] ${req.url()} — ${req.failure()?.errorText || 'unknown'}`));
+    page.on('response',      (res) => { const s = res.status(); if (s >= 400) push(`[response ${s}] ${res.url()}`); });
+
+    await page.setContent(outputHtml, { waitUntil: 'networkidle0', timeout: RENDER_TIMEOUT_MS });
+
+    // Belt-and-braces wait for web fonts (system font stack is the
+    // norm in our HTML output but custom fonts may slip through).
+    await page.waitForFunction('document.fonts ? document.fonts.ready : true', { timeout: 5000 }).catch(() => {});
+
+    // Sanity: log body dimensions + image count so blank captures
+    // surface in the worker log with diagnostic context.
+    const bodyInfo = await page.evaluate(() => {
+      const b = document.body;
+      if (!b) return null;
+      const r = b.getBoundingClientRect();
+      return {
+        rect:     { x: r.x, y: r.y, w: r.width, h: r.height },
+        imgCount: b.querySelectorAll('img').length,
+        innerLen: b.innerHTML.length
+      };
+    });
+    if (!bodyInfo) {
+      const tail = pageEvents.length
+        ? `\n  page signals (last ${pageEvents.length}):\n    ${pageEvents.join('\n    ')}`
+        : '';
+      throw new Error(`HTML render: <body> not found in setContent output${tail}`);
+    }
+    if (!bodyInfo.rect.w || !bodyInfo.rect.h) {
+      throw new Error(`HTML render: <body> has zero size — diagnostic: ${JSON.stringify(bodyInfo)}`);
+    }
+    console.log(
+      `   🔬 [render html] body imgs=${bodyInfo.imgCount} ` +
+      `innerLen=${bodyInfo.innerLen} (${Math.round(bodyInfo.rect.w)}×${Math.round(bodyInfo.rect.h)})`
+    );
+
+    // Full-viewport screenshot. omitBackground only fires in video-
+    // overlay mode (HTML must opt-in by setting body { background:
+    // transparent } to leverage it).
+    const buffer = await page.screenshot({
+      type: 'png',
+      omitBackground: isVideoOverlay,
+      clip: { x: 0, y: 0, width: dims.w, height: dims.h }
+    });
+    return {
+      buffer,
+      contentType: 'image/png',
+      width:  dims.w,
+      height: dims.h,
+      bytes:  buffer.length,
+      kind:   'image'
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+// Legacy /ads.html + templatePreview.js rendering path. Unchanged from
+// pre-Phase-6 behavior — extracted into a helper so renderStage can
+// branch cleanly. Still used for: non-AI templates always; AI templates
+// when RENDER_USE_HTML is off OR no HTML candidate is available.
+async function renderViaSpec({ layoutInputArtifactId, template, aspectRatio, expectedKind, mediaId, brandId, authToken: reqAuthToken, renderMode = 'static', aiCreativeV2 = false, campaignKind = null, creativeIntent = null, productId = null }) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   const url = new URL(`${FRONTEND_URL}/ads.html`);
   // renderMode = 'static' → opaque PNG of full canvas (image media or
