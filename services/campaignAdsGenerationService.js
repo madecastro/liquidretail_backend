@@ -461,31 +461,41 @@ async function expandWizardJob({
     `newlyQueued=${newAdIds.length} alreadyQueued=${alreadyQueued} totalQueued=${queuedCount}`
   );
 
-  // Phase 1 SHADOW — run the Creative Director per unique (productId)
-  // for this campaign. One Director call per product regardless of how
-  // many ads the cartesian queued for it (Lever 1 caching).
-  // Fire-and-forget: the new artifacts are persisted but the legacy
-  // render path doesn't consume them yet. Phase 2 wires them in.
-  runCreativeDirectorShadow({
-    brandId,
-    productIds: Array.from(new Set(payloads.map(p => p.productId).filter(Boolean))),
-    campaignKind,
-    creativeIntent: null   // Phase 9 UX adds an operator hint here
-  }).catch(err => {
-    console.warn(`   ⚠️  creative-director shadow failed: ${err.message}`);
-  });
-
-  // Phase 4 EAGER — derive copy candidates per (brand × product ×
-  // creativeStyle) for every UNIQUE combination in the cartesian.
-  // Deduped to only the (product, style) pairs actually needed —
-  // e.g. only ai_brand_led picked → only brand_led style derived.
-  // Fire-and-forget; lazy cache fallback at render time covers misses.
-  runCopyDerivationEager({
-    brandId,
-    productStylePairs: derivePayloadProductStylePairs(payloads)
-  }).catch(err => {
-    console.warn(`   ⚠️  copy-derivation eager failed: ${err.message}`);
-  });
+  // Upstream LLM dependencies — Director concepts + Copy candidates are
+  // now part of the Generator's contract (V2 path requires a Director
+  // concept; HTML Generator can't materialize without one). Awaiting
+  // both before returning means the worker can NEVER pick an Ad whose
+  // upstream artifacts haven't landed yet — closes the race that used
+  // to silently degrade V2 → V1 when the fire-and-forget calls hadn't
+  // finished.
+  //
+  // Parallelized via Promise.allSettled so:
+  //   - Director and Copy run concurrently (typical batch 10-15s)
+  //   - A failure in one doesn't block the other
+  //   - A failure in EITHER doesn't block the campaign from queueing
+  //     (downstream Ads can still fall back to V1 — degraded but
+  //     non-empty output)
+  const upstreamT0 = Date.now();
+  const uniqueProductIds = Array.from(new Set(payloads.map(p => p.productId).filter(Boolean)));
+  const [directorRes, copyRes] = await Promise.allSettled([
+    runCreativeDirectorShadow({
+      brandId,
+      productIds:     uniqueProductIds,
+      campaignKind,
+      creativeIntent: null   // Phase 9 UX adds an operator hint here
+    }),
+    runCopyDerivationEager({
+      brandId,
+      productStylePairs: derivePayloadProductStylePairs(payloads)
+    })
+  ]);
+  if (directorRes.status === 'rejected') {
+    console.warn(`   ⚠️  creative-director eager failed (campaign continues with V1 fallback): ${directorRes.reason?.message || directorRes.reason}`);
+  }
+  if (copyRes.status === 'rejected') {
+    console.warn(`   ⚠️  copy-derivation eager failed (campaign continues with single-string fallback): ${copyRes.reason?.message || copyRes.reason}`);
+  }
+  console.log(`⏳ upstream LLM deps ready in ${Date.now() - upstreamT0}ms (${uniqueProductIds.length} products)`);
 
   return {
     campaignId: String(campaignId),
