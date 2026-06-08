@@ -181,6 +181,16 @@ router.get('/by-artifact/:id', async (req, res) => {
       // Phase X.1 — gpt-image-1 reference render for this canvas. Null
       // unless AI_IMAGE_REFERENCE_ENABLED was on when the spec generated.
       imageReference: await loadImageReferenceArtifact(art),
+      // Phase 6.1/6.2 — HTML Layout Generator output + validation.
+      // Null unless AI_HTML_LAYOUT_ENABLED was on when the spec generated.
+      htmlOutput: {
+        html:              art.outputHtml || null,
+        css:               art.outputCss  || null,
+        colorPalette:      Array.isArray(art.colorPalette) ? art.colorPalette : [],
+        htmlSchemaVersion: art.htmlSchemaVersion || null,
+        rawResponse:       art.htmlRawResponse || null
+      },
+      htmlValidation: await loadHtmlValidationArtifact(art),
       // Phase 3 — multi-candidate + Judge surface. Empty on V1/single-candidate.
       multiCandidate: {
         candidateCount:  art.candidateCount || 1,
@@ -329,6 +339,34 @@ async function loadResolvedLayoutArtifact(art) {
   }
 }
 
+// Phase 6.2 — load the HTML validation artifact for the WINNING
+// HTML candidate on this canvas. Null when no HTML has been generated
+// yet OR no validation has run. Includes warnings + contrast checks
+// + image probe + hard violations so the spec preview can surface
+// per-row pass/fail badges + a warning details panel.
+async function loadHtmlValidationArtifact(art) {
+  try {
+    if (!art?.htmlValidationId) return null;
+    const AiHtmlValidationArtifact = require('../models/AiHtmlValidationArtifact');
+    const v = await AiHtmlValidationArtifact.findById(art.htmlValidationId).lean();
+    if (!v) return null;
+    return {
+      artifactId:         String(v._id),
+      candidateIndex:     v.candidateIndex,
+      parseOk:            v.parseOk,
+      hardViolations:     v.hardViolations || [],
+      warnings:           v.warnings       || [],
+      imageProbe:         v.imageProbe     || { tested: 0, ok: 0, failed: [] },
+      contrastChecks:     v.contrastChecks || [],
+      computedDimensions: v.computedDimensions || null,
+      createdAt:          v.createdAt
+    };
+  } catch (err) {
+    console.warn(`   ⚠️  loadHtmlValidationArtifact: ${err.message}`);
+    return null;
+  }
+}
+
 // Phase X.1 — load the gpt-image-1 reference render this canvas
 // produced. Null on artifacts generated before AI_IMAGE_REFERENCE_ENABLED
 // was on; shadow only — never consumed by the renderer.
@@ -356,6 +394,7 @@ async function loadImageReferenceArtifact(art) {
       costEstimateUsd: found.costEstimateUsd,
       elapsedMs:       found.elapsedMs,
       promptText:      found.promptText,
+      seedSource:      found.seedSource || 'none',
       createdAt:       found.createdAt
     };
   } catch (err) {
