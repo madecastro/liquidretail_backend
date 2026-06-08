@@ -654,8 +654,18 @@ router.get('/', async (req, res) => {
       Ad.countDocuments(filter)
     ]);
 
+    // Phase B — attach photorealUrl (gpt-image-1.edit output from the
+    // image-ref shadow) joined by the Ad's cache key. Also resolve the
+    // Campaign-level useImageRefAsProduction flag so the frontend can
+    // decide which to display. Both lookups parallelized + batched.
+    const photorealMap         = await loadPhotorealUrlMap(rows);
+    const useImageRefByCampaign = await loadUseImageRefMap(rows);
+
     res.json({
-      ads: rows.map(projectAd),
+      ads: rows.map(r => projectAd(r, false, {
+        photorealUrl:           photorealMap.get(photorealCacheKey(r)) || null,
+        useImageRefAsProduction: useImageRefByCampaign.get(String(r.campaignId)) || false
+      })),
       total,
       limit,
       offset
@@ -784,7 +794,70 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-function projectAd(ad, full = false) {
+// Phase B — build a cache-key string for an Ad row that matches
+// AiFullRenderArtifact's unique index. Ad doesn't carry campaign-
+// ContextHash or creativeStyle directly; we use the 6 fields available
+// (mediaId, template, aspectRatio, productId, variantKind, palette-
+// Source) which is enough to disambiguate within typical batches.
+// When a brand happens to have multiple matching rows, we just pick
+// the most recent one (sort by createdAt desc downstream).
+function photorealCacheKey(ad) {
+  return [
+    String(ad.mediaId      || ''),
+    String(ad.template     || ''),
+    String(ad.aspectRatio  || ''),
+    String(ad.productId    || ''),
+    String(ad.variantKind  || ''),
+    String(ad.paletteSource|| 'media')
+  ].join('|');
+}
+
+async function loadPhotorealUrlMap(adRows) {
+  const map = new Map();
+  if (!adRows.length) return map;
+  const AiFullRenderArtifact = require('../models/AiFullRenderArtifact');
+  // Distinct cache-key tuples to query — same product+template+ratio+
+  // variant+palette across multiple Ads collapses to one query row.
+  const keys = new Set();
+  for (const ad of adRows) keys.add(photorealCacheKey(ad));
+  // Build an $or of the unique combinations.
+  const orClauses = [...keys].map(k => {
+    const [mediaId, template, aspectRatio, productId, variantKind, paletteSource] = k.split('|');
+    return {
+      mediaId,
+      template,
+      aspectRatio,
+      productId:     productId || null,
+      variantKind:   variantKind || null,
+      paletteSource: paletteSource || 'media'
+    };
+  });
+  const rows = await AiFullRenderArtifact
+    .find({ $or: orClauses })
+    .sort({ createdAt: -1 })
+    .select('mediaId template aspectRatio productId variantKind paletteSource imageUrl createdAt')
+    .lean();
+  // Most-recent wins per key.
+  for (const r of rows) {
+    const k = [r.mediaId, r.template, r.aspectRatio, r.productId, r.variantKind, r.paletteSource || 'media'].join('|');
+    if (!map.has(k)) map.set(k, r.imageUrl);
+  }
+  return map;
+}
+
+async function loadUseImageRefMap(adRows) {
+  const map = new Map();
+  const campaignIds = [...new Set(adRows.map(a => a.campaignId).filter(Boolean).map(String))];
+  if (!campaignIds.length) return map;
+  const Campaign = require('../models/Campaign');
+  const campaigns = await Campaign.find({ _id: { $in: campaignIds } })
+    .select('_id useImageRefAsProduction')
+    .lean();
+  for (const c of campaigns) map.set(String(c._id), !!c.useImageRefAsProduction);
+  return map;
+}
+
+function projectAd(ad, full = false, extras = {}) {
   const base = {
     id:                 String(ad._id),
     brandId:            String(ad.brandId),
@@ -802,6 +875,12 @@ function projectAd(ad, full = false) {
     campaignKind:       ad.campaignKind,
     kind:               ad.kind,
     renderUrl:          ad.renderUrl,
+    // Phase B — gpt-image-1 polished version (AiFullRenderArtifact.imageUrl)
+    // joined by the Ad's cache key. Frontend displays this instead of
+    // renderUrl when useImageRefAsProduction is true AND photorealUrl
+    // is populated. Null when no image-ref shadow has completed yet.
+    photorealUrl:           extras.photorealUrl || null,
+    useImageRefAsProduction: !!extras.useImageRefAsProduction,
     posterUrl:          ad.posterUrl,
     width:              ad.width,
     height:             ad.height,

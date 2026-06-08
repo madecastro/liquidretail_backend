@@ -214,6 +214,15 @@ const campaignSchema = new mongoose.Schema({
   // null = "AI decides everything." Phase 9 surfaces this in the wizard.
   creativeIntent:      { type: String, default: null },
 
+  // Phase B (post-6.4) — when true, the rsvite app displays the
+  // gpt-image-1 polished version (AiFullRenderArtifact.imageUrl)
+  // as the production ad image instead of the deterministic Puppeteer
+  // screenshot (Ad.renderUrl). Requires AI_IMAGE_REFERENCE_ENABLED on
+  // the backend so the polished version actually exists. Falls back to
+  // renderUrl gracefully when the polished version hasn't landed yet
+  // (image-ref runs as a shadow after the Puppeteer render).
+  useImageRefAsProduction: { type: Boolean, default: false },
+
   // Full raw payload from the platform — capped to ~16KB worth of
   // JSON. Useful for debugging and for fields we haven't mapped yet.
   rawData:       mongoose.Schema.Types.Mixed,

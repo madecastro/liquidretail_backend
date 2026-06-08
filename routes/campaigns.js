@@ -399,7 +399,14 @@ router.patch('/:id', express.json(), async (req, res) => {
     if (c.platform !== 'reach-social') {
       return res.status(409).json({ error: 'only reach-social campaigns are editable' });
     }
-    const { name, kind, promotionalDetails } = req.body || {};
+    const { name, kind, promotionalDetails, useImageRefAsProduction } = req.body || {};
+    // Phase B — operator-toggleable: when true, the rsvite Ads page
+    // displays the gpt-image-1 polished render instead of the
+    // deterministic Puppeteer screenshot. Falls back gracefully when
+    // the polish hasn't landed for an ad yet.
+    if (useImageRefAsProduction !== undefined) {
+      c.useImageRefAsProduction = !!useImageRefAsProduction;
+    }
     if (name != null) {
       const trimmed = String(name).trim();
       if (!trimmed) return res.status(400).json({ error: 'name cannot be empty' });
@@ -436,7 +443,8 @@ router.patch('/:id', express.json(), async (req, res) => {
         id: String(c._id),
         name: c.name,
         kind: c.kind,
-        promotionalDetails: c.promotionalDetails || null
+        promotionalDetails:      c.promotionalDetails || null,
+        useImageRefAsProduction: !!c.useImageRefAsProduction
       }
     });
   } catch (err) {
