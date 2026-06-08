@@ -125,9 +125,20 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
   // accepts PNG most reliably, so normalize via sharp before sending.
   let seedFile   = null;
   let seedSource = 'none';
-  if (canvas.outputHtml) {
+  // Race-fix: HTML Gen and image-ref both fire as setImmediate shadows
+  // off the JSON spec Generator. Image-ref typically reads the canvas
+  // doc BEFORE html-gen finishes its ~15s LLM call, so canvas.outputHtml
+  // is null and image-ref falls back to catalog-hero — exactly the
+  // wrong behavior. Poll for up to 25s waiting for outputHtml to appear
+  // (re-reads the canvas every 2s). When AI_HTML_LAYOUT_ENABLED is off
+  // the first re-read finds nothing and we fall through immediately.
+  let outputHtml = canvas.outputHtml;
+  if (!outputHtml) {
+    outputHtml = await waitForHtml(canvas._id, 25000, 2000);
+  }
+  if (outputHtml) {
     try {
-      const png = await renderHtmlToPng(canvas.outputHtml, { width, height });
+      const png = await renderHtmlToPng(outputHtml, { width, height });
       seedFile   = await toFile(png, 'seed.png', { type: 'image/png' });
       seedSource = 'html_render';
     } catch (err) {
@@ -482,6 +493,22 @@ function humanArchetype(slug) {
 
 function sha256(s) {
   return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+// Poll for HTML on the canvas artifact. HTML Gen runs as a setImmediate
+// shadow off the JSON spec Generator (~15s LLM call), and image-ref
+// fires off the same setImmediate batch — so image-ref typically reads
+// canvas.outputHtml=null on first try. Poll up to `maxWaitMs` re-fetching
+// every `intervalMs` ms. Returns the outputHtml string when it appears,
+// or null when the wait exhausts (HTML Gen disabled OR failed).
+async function waitForHtml(canvasId, maxWaitMs, intervalMs) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, intervalMs));
+    const c = await AiCanvasArtifact.findById(canvasId).select('outputHtml').lean();
+    if (c?.outputHtml) return c.outputHtml;
+  }
+  return null;
 }
 
 // Render an HTML document to a PNG buffer via Puppeteer at the

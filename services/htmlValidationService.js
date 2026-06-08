@@ -22,13 +22,19 @@ const AA_THRESHOLD_LARGE  = 3.0;
 const IMAGE_PROBE_TIMEOUT_MS = 5000;
 const IMAGE_PROBE_CONCURRENCY = 4;
 
-// Hard-violation codes the Pre-Judge filter drops on.
+// Hard-violation codes the Pre-Judge filter drops on. Kept narrow on
+// purpose — image probe + contrast are now SOFT signals; a broken
+// <img> is a visible quality defect the renderer can paint (we'll see
+// it in the rendered output and the spec preview), but it doesn't
+// make the HTML unrenderable. Hard violations = "this HTML cannot
+// be rendered at all" (parse failures, no <body>, <script> tags
+// that block headless render) PLUS the contract violation (proof
+// strategy declared but unsupported).
 const HARD_VIOLATION_CODES = new Set([
   'parse_failed',
   'no_html',
   'no_body',
   'has_script',
-  'image_404_critical',
   'proof_strategy_unsupported'
 ]);
 
@@ -77,20 +83,23 @@ async function validateCandidate(html, {
     warnings.push({ severity: 'high', code: 'unresolved_placeholder', message: 'Unresolved template placeholder ({{...}}) found — LLM should bake values directly' });
   }
 
-  // 3. Image probes — parallel HEAD requests. Hero image (first <img>) is
-  //    treated as critical; downstream images warn only.
+  // 3. Image probes — parallel HEAD requests with ranged-GET fallback.
+  //    SOFT warnings only (not hard violations) because:
+  //      - Many CDNs return 405/501 on HEAD even when GET works fine
+  //        (Brandfetch, some Cloudinary configs, Shopify CDN)
+  //      - A broken <img> is a visible quality defect the renderer
+  //        can still paint — operator sees it in the output and the
+  //        spec preview; not a "this HTML is unusable" failure
+  //      - Render-time the browser fetches via GET anyway; the probe
+  //        is for telemetry/QA, not gate-keeping
   const imageUrls = extractImageUrls(html);
   const imageProbe = await probeImages(imageUrls);
-  if (imageProbe.failed.length > 0) {
-    const heroFailed = imageProbe.failed.includes(imageUrls[0]);
-    if (heroFailed) {
-      hardViolations.add('image_404_critical');
-      warnings.push({ severity: 'high', code: 'image_404_critical', message: `Hero image returned non-2xx: ${imageUrls[0]}` });
-    }
-    for (const url of imageProbe.failed.slice(0, 5)) {
-      if (url === imageUrls[0]) continue;
-      warnings.push({ severity: 'medium', code: 'image_404', message: `Image returned non-2xx: ${url}` });
-    }
+  for (const url of imageProbe.failed.slice(0, 5)) {
+    warnings.push({
+      severity: url === imageUrls[0] ? 'high' : 'medium',
+      code:     url === imageUrls[0] ? 'hero_image_unreachable' : 'image_unreachable',
+      message:  `Image returned non-2xx on probe: ${url}`
+    });
   }
 
   // 4. Contrast checks — heuristic (parses inline + <style> color rules,
@@ -224,25 +233,49 @@ function extractImageUrls(html) {
 async function probeImages(urls) {
   const out = { tested: urls.length, ok: 0, failed: [] };
   if (!urls.length) return out;
-  // Simple parallel pool with concurrency cap.
+  // Simple parallel pool with concurrency cap. HEAD first (cheap);
+  // on 405 / 501 / network error, fall back to a 1-byte ranged GET
+  // — handles CDNs (Brandfetch, some Cloudinary, Shopify CDN) that
+  // either reject HEAD or rate-limit it. We don't download the body.
   const queue = urls.slice();
   async function worker() {
     while (queue.length) {
       const url = queue.shift();
-      try {
-        const res = await axios.head(url, { timeout: IMAGE_PROBE_TIMEOUT_MS, validateStatus: () => true, maxRedirects: 3 });
-        if (res.status >= 200 && res.status < 400) {
-          out.ok++;
-        } else {
-          out.failed.push(url);
-        }
-      } catch (_) {
-        out.failed.push(url);
-      }
+      const ok = await probeUrl(url);
+      if (ok) out.ok++; else out.failed.push(url);
     }
   }
   await Promise.all(Array.from({ length: Math.min(IMAGE_PROBE_CONCURRENCY, urls.length) }, worker));
   return out;
+}
+
+async function probeUrl(url) {
+  // Pass 1: HEAD
+  try {
+    const res = await axios.head(url, {
+      timeout: IMAGE_PROBE_TIMEOUT_MS,
+      validateStatus: () => true,
+      maxRedirects: 3
+    });
+    if (res.status >= 200 && res.status < 400) return true;
+    // HEAD-not-supported codes — fall through to ranged GET below
+    if (![405, 501, 403, 400].includes(res.status)) return false;
+  } catch (_) {
+    // Network error on HEAD — try GET
+  }
+  // Pass 2: ranged GET (1 byte)
+  try {
+    const res = await axios.get(url, {
+      timeout: IMAGE_PROBE_TIMEOUT_MS,
+      validateStatus: () => true,
+      maxRedirects: 3,
+      headers: { Range: 'bytes=0-0' },
+      responseType: 'arraybuffer'
+    });
+    return res.status >= 200 && res.status < 400;
+  } catch (_) {
+    return false;
+  }
 }
 
 // ── Contrast extraction ──────────────────────────────────────────────
