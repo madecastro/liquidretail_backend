@@ -110,37 +110,56 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
 
   const concept   = direction?.concepts?.find(c => c.concept_id === canvas.directionConceptId) || null;
   const proofData = await loadProofData({ product, media });
+  const { size, width, height } = sizeForRatio(canvas.aspectRatio);
 
+  // Seed image priority chain:
+  //   1. HTML render bitmap — when canvas.outputHtml exists. Best
+  //      visual anchor since it constrains the LLM to our exact
+  //      composition. Prompt becomes "refine into photoreal".
+  //   2. Catalog hero — clean product photo. Prompt is "compose ad
+  //      around this product".
+  //   3. UGC source photo — when no catalog imageUrl.
+  //   4. None — text-only generate.
+  //
+  // Source URLs may be JPEG/WebP/anything Cloudinary serves; gpt-image-1
+  // accepts PNG most reliably, so normalize via sharp before sending.
+  let seedFile   = null;
+  let seedSource = 'none';
+  if (canvas.outputHtml) {
+    try {
+      const png = await renderHtmlToPng(canvas.outputHtml, { width, height });
+      seedFile   = await toFile(png, 'seed.png', { type: 'image/png' });
+      seedSource = 'html_render';
+    } catch (err) {
+      console.warn(`   ⚠️  image-ref: HTML render seed failed (${err.message}) — falling back to product hero`);
+    }
+  }
+  if (!seedFile) {
+    const fallbackUrl = product?.imageUrl || media?.fileUrl || null;
+    if (fallbackUrl) {
+      try {
+        const raw = await fetchImageBuffer(fallbackUrl);
+        const png = await sharp(raw).png().toBuffer();
+        seedFile   = await toFile(png, 'seed.png', { type: 'image/png' });
+        seedSource = product?.imageUrl ? 'catalog-hero' : 'ugc-source';
+      } catch (err) {
+        console.warn(`   ⚠️  image-ref: seed prep failed (${err.message}) — falling back to text-only generate`);
+      }
+    }
+  }
+
+  // Build the prompt AFTER the seed source is decided — the language
+  // changes meaningfully ("refine this design" for html_render vs
+  // "compose ad around this product photo" for catalog-hero vs
+  // "compose ad from scratch" for none).
   const prompt = buildPrompt({
     brand, product, media, concept, proofData,
     aspectRatio:   canvas.aspectRatio,
     creativeStyle: canvas.creativeStyle,
-    canvasSpec:    canvas.canvasSpec
+    canvasSpec:    canvas.canvasSpec,
+    seedSource
   });
   const promptHash = sha256(prompt);
-  const { size, width, height } = sizeForRatio(canvas.aspectRatio);
-
-  // Seed image: prefer the clean catalog hero (keeps product identity
-  // accurate), fall back to the UGC source photo, fall back to text-only
-  // generate when neither is available. images.edit gives the model a
-  // visual anchor so it doesn't invent a fake-looking product from a
-  // text description.
-  //
-  // Source URLs may be JPEG/WebP/anything Cloudinary serves; gpt-image-1
-  // accepts PNG most reliably, so normalize via sharp before sending.
-  const seedImageUrl = product?.imageUrl || media?.fileUrl || null;
-  let seedFile   = null;
-  let seedSource = null;
-  if (seedImageUrl) {
-    try {
-      const raw = await fetchImageBuffer(seedImageUrl);
-      const png = await sharp(raw).png().toBuffer();
-      seedFile   = await toFile(png, 'seed.png', { type: 'image/png' });
-      seedSource = product?.imageUrl ? 'catalog-hero' : 'ugc-source';
-    } catch (err) {
-      console.warn(`   ⚠️  image-ref: seed prep failed (${err.message}) — falling back to text-only generate`);
-    }
-  }
 
   const callOpenAi = () => seedFile
     ? openai.images.edit({
@@ -233,6 +252,7 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
       width, height,
       costEstimateUsd:    estimateCostUsd(size),
       elapsedMs,
+      seedSource,
       createdAt:          new Date()
     },
     { upsert: true, new: true, includeResultMetadata: false }
@@ -242,7 +262,7 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
     `🖼  imageReference[${canvas.template}/${canvas.aspectRatio}/${canvas.creativeStyle}]: ` +
     `media=${canvas.mediaId} product=${canvas.productId || '-'} ` +
     `concept=${canvas.directionConceptId || '-'} size=${size} ` +
-    `seed=${seedSource || 'none'} took=${elapsedMs}ms`
+    `seed=${seedSource} took=${elapsedMs}ms`
   );
 
   return { artifact: artifact.toObject ? artifact.toObject() : artifact, cached: false };
@@ -339,7 +359,7 @@ async function fetchImageBuffer(url) {
 // canvas picked, AND the actual proof data so it doesn't fabricate fake
 // testimonials/star ratings.
 
-function buildPrompt({ brand, product, media, concept, proofData, aspectRatio, creativeStyle, canvasSpec }) {
+function buildPrompt({ brand, product, media, concept, proofData, aspectRatio, creativeStyle, canvasSpec, seedSource = 'none' }) {
   const brandName    = brand?.name || 'the brand';
   const brandTone    = Array.isArray(brand?.tone) && brand.tone.length ? brand.tone.slice(0, 4).join(', ') : null;
 
@@ -352,7 +372,16 @@ function buildPrompt({ brand, product, media, concept, proofData, aspectRatio, c
 
   const lines = [];
   lines.push(`A polished social-media advertisement at ${aspectRatio} aspect ratio.`);
-  lines.push(`The provided reference image shows the actual product. Preserve the product's identity, shape, color, label, and packaging exactly — do NOT redesign the product. You may reframe it, recolor the background, change the composition, add overlays, etc.`);
+  // Phase 6.4 — opening line adapts to seed source. HTML render seed
+  // gets a "refine this design" ask; product/UGC photo seed gets the
+  // existing "compose ad around this photo" ask.
+  if (seedSource === 'html_render') {
+    lines.push(`The provided reference image is a draft of the ad's composition (rendered from HTML). REFINE it into a polished photoreal version while keeping the LAYOUT, hierarchy, text content, and image positions intact. Replace any rendered product photography in the draft with photoreal product imagery; replace placeholder background colors with cohesive photoreal backgrounds; smooth typography rendering; preserve all text exactly as it appears. The composition is given — your job is to make it look like a finished ad.`);
+  } else if (seedSource === 'catalog-hero' || seedSource === 'ugc-source') {
+    lines.push(`The provided reference image shows the actual product. Preserve the product's identity, shape, color, label, and packaging exactly — do NOT redesign the product. You may reframe it, recolor the background, change the composition, add overlays, etc.`);
+  } else {
+    lines.push(`Compose the ad from scratch — no seed image provided. Make it look photoreal and complete.`);
+  }
   lines.push(``);
   lines.push(`Brand: ${brandName}${brandTone ? ` (tone: ${brandTone})` : ''}.`);
   if (productName) lines.push(`Featured product: ${productName}${category ? ` — ${category}` : ''}.`);
@@ -453,6 +482,33 @@ function humanArchetype(slug) {
 
 function sha256(s) {
   return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+// Render an HTML document to a PNG buffer via Puppeteer at the
+// specified viewport. Lightweight — single page, no fonts wait
+// beyond document.fonts.ready, full-viewport screenshot. Used as the
+// seed image for gpt-image-1.edit so the LLM gets our exact
+// composition as its visual anchor.
+async function renderHtmlToPng(html, { width, height }) {
+  const puppeteer = require('puppeteer');
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+    await page.waitForFunction('document.fonts ? document.fonts.ready : true', { timeout: 5000 }).catch(() => {});
+    const buf = await page.screenshot({
+      type: 'png',
+      clip: { x: 0, y: 0, width, height }
+    });
+    return buf;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 module.exports = {

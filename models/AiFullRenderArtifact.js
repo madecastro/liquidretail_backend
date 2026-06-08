@@ -38,6 +38,16 @@ const aiFullRenderArtifactSchema = new mongoose.Schema({
   costEstimateUsd: { type: Number, default: null },   // best-effort, based on size + quality tier
   elapsedMs:       { type: Number, default: null },
 
+  // Phase 6.4 — what visual seed was passed to images.edit. Drives the
+  // prompt shape (refine-this-design when seeded from HTML render vs
+  // refine-this-photo when seeded from catalog hero). Diagnostic
+  // surface in the spec preview's Image Reference panel.
+  seedSource: {
+    type: String,
+    enum: ['catalog-hero', 'ugc-source', 'html_render', 'none'],
+    default: 'none'
+  },
+
   createdAt:    { type: Date, default: Date.now }
 });
 
