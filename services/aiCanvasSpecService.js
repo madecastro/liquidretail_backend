@@ -40,7 +40,7 @@ const { trackLlmCall, recordCacheHit } = require('./costTracker');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.6.0';   // 2.6: real spatial analysis per crop ratio — density + brightness heatmaps + keep-out zones (was silently sending [] before)
+const SPEC_SCHEMA_VERSION = '2.7.0';   // 2.7: Phase 5c.2 — enriched Generator signal payload (brand description, commerce sellers/specs/availability, rating distribution, cross-media distributions). 2.6: real spatial analysis per crop ratio.
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -662,6 +662,19 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     userLines.push(`When you slot an alt-ratio crop (product.hero_media.crops.1_91_1 etc.) READ THE GRID FOR THAT RATIO via spatial_analysis.by_ratio.<ratio_key> — the canvas-ratio grid does NOT match what's in the alt crop frame.`);
     userLines.push(``);
     userLines.push(`USE source_media.subjects bboxes when carving the support_media via clipPolygon — avoid clipping over a subject. Conversely, when you DO want product/face to read through, keep that subject's bbox inside the visible region.`);
+    userLines.push(``);
+    userLines.push(`ENRICHED SIGNALS — use these to make non-obvious composition / copy decisions:`);
+    userLines.push(`  brand.description / brand.brand_reviews_summary — actual brand voice. Drives color/typography mood beyond the tone words. A "small-batch artisan oil" brand wants warmer tones + serif-leaning type vs a "high-performance training gear" brand wanting cool tones + condensed sans.`);
+    userLines.push(`  product.commerce.sellers — if Walmart + Amazon both stock it at similar prices, the product is mass-distributed (lean accessible/value); if listed by 1-2 specialty sellers at higher prices, lean premium/aspirational. Sellers list can also justify a "Sold at: [logos]" badge row.`);
+    userLines.push(`  product.commerce.specs — surface 1-2 standout specs in a tight callout when typographic-dominant (e.g. "100% Cotton · Pre-shrunk" under a t-shirt headline).`);
+    userLines.push(`  product.commerce.availability — if "out of stock" / "preorder", DROP the CTA or downgrade to "Notify me" rather than "Shop Now" (don't promise what can't be bought).`);
+    userLines.push(`  product.rating_distribution — when 80%+ of reviews are 5-star, you can lean stat_led with "92% love it" instead of the bare rating. Skewed distributions = more compelling than averages.`);
+    userLines.push(`  signals.cross_media — this product has matched UGC beyond just the source photo. Distributions tell you what the rest LOOKS like:`);
+    userLines.push(`    shot_type_distribution mostly lifestyle/on_model → ugc_led + photo-led composition; mostly product_only → typographic_dominant / strong color blocks`);
+    userLines.push(`    content_nature_distribution mostly evergreen → quote/stat composition is safe; mostly promotional → archetype should sidestep the dated feel`);
+    userLines.push(`    avg_ad_readiness high (>0.7) = photo-led works; low (<0.4) = lean typographic or brand-color-led to avoid weak imagery`);
+    userLines.push(`    avg_engagement_rate high (>0.05) = social-proof-led is justified; low = brand-voice-led safer`);
+    userLines.push(`  These signals are SUPPORTING, not authoritative — the Director concept's archetype + emotional_hook + social_proof_type are the contract. Use the signals to choose colors, copy, layout details that REINFORCE the concept, not to invent a different one.`);
     userLines.push(``);
   } else {
     // Minimal fallback for legacy callers (no rich context).

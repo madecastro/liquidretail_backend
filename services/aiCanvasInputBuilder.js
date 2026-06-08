@@ -38,6 +38,45 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
   const product = layoutInput.product || {};
   const copy = layoutInput.copy || {};
 
+  // Phase 5c.2 — fresh loads for signals layoutInput doesn't carry.
+  // The Director already enriched its inputSummary against these same
+  // sources; we mirror them here so the Generator has the SAME picture
+  // and can materialize concepts that lean into specific signal points
+  // (brand description's voice, commerce sellers' price stratification,
+  // cross-media distributions for color/composition decisions).
+  let brandDoc = null;
+  let productDoc = null;
+  let crossMediaDocs = [];
+  if (brandId || productId) {
+    try {
+      const BrandModel    = require('../models/Brand');
+      const CatalogModel  = require('../models/CatalogProduct');
+      const MediaModel    = require('../models/Media');
+      const [bd, pd] = await Promise.all([
+        brandId   ? BrandModel.findById(brandId).select('description tagline brandReviews tone').lean()   : null,
+        productId ? CatalogModel.findById(productId).select('matchedMedia sellers specs availability productReviews rating ratingDistribution').lean() : null
+      ]);
+      brandDoc = bd;
+      productDoc = pd;
+      // Cross-media: other matched UGC for this product (excluding the
+      // current source media) so we can compute distribution signals
+      // (shot type, content nature, ad readiness mean). Capped at 10
+      // for cost.
+      const otherMediaIds = (pd?.matchedMedia || [])
+        .map(mm => mm.mediaId)
+        .filter(Boolean)
+        .filter(id => String(id) !== String(media?._id))
+        .slice(0, 10);
+      if (otherMediaIds.length) {
+        crossMediaDocs = await MediaModel.find({ _id: { $in: otherMediaIds } })
+          .select('classification adSuitability platformStats')
+          .lean();
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  signals fresh-load failed (Generator falls back to layoutInput-only): ${err.message}`);
+    }
+  }
+
   // DEFENSIVE: the LLM payload (`text` below) is hand-constructed from
   // specific layoutInput fields — we explicitly DO NOT spread `layoutInput`
   // and DO NOT touch `layoutInput.theme`, `layoutInput.layout_options`,
@@ -76,6 +115,13 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
     brand: {
       name:           brand.name      || null,
       tagline:        brand.tagline   || null,
+      // Phase 5c.2 — brand voice depth. Description (capped) gives the
+      // Generator real voice to lean on for copy + composition mood;
+      // brand_reviews_summary captures the Gemini narrative for what
+      // people actually say about the brand (different from product
+      // reviews — brand-level positioning).
+      description:    snippetText(brandDoc?.description, 280),
+      brand_reviews_summary: snippetText(brandDoc?.brandReviews?.summary, 240),
       tone:           Array.isArray(brand.tone) ? brand.tone : [],
       // Brand colors + font intentionally omitted. The Generator picks
       // an HEX palette and font treatment that fits the photo + tone
@@ -111,7 +157,27 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
         author: r.author || null,
         text:   typeof r.text === 'string' ? r.text.slice(0, 200) : null,
         rating: r.rating ?? null
-      }))
+      })),
+      // Phase 5c.2 — commerce signals. Sellers (top 3 with price for
+      // price-anchor and parity messaging), key specs (Generator can
+      // surface specs in a callout when typographic-dominant), and live
+      // availability (Generator can suppress CTA when sold out OR add an
+      // "in-stock now" badge when relevant).
+      commerce: {
+        sellers: (productDoc?.sellers || []).slice(0, 3).map(s => ({
+          name:     s.name      || null,
+          price:    s.price     || null,
+          shipping: s.shipping  || null
+        })),
+        specs:        productDoc?.specs        || null,
+        availability: productDoc?.availability || null
+      },
+      // Phase 5c.2 — rating distribution histogram. Lets the Generator
+      // make a more nuanced call than "show the star" — e.g. if 92% of
+      // reviews are 5-star, lean stat_led with "92% 5★" instead of "4.8/5".
+      rating_distribution: Array.isArray(productDoc?.ratingDistribution)
+        ? productDoc.ratingDistribution
+        : []
     },
 
     source_media: {
@@ -203,6 +269,27 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
       // (5+ variants) or single-string fallbacks. Affects copy_picks
       // behavior — when length=1, the only valid pick is index 0.
       derived_for_style: derivedCopy ? creativeStyle : null
+    },
+
+    // Phase 5c.2 — cross-media signals. The Generator works against ONE
+    // source media but the product has a wider matched-media set the
+    // Director used to pick concept. Surfacing distributions + means
+    // here lets the Generator know: "this product's matched UGC is
+    // mostly lifestyle + evergreen with strong engagement" → palette
+    // and composition choices can lean photo-led; vs "matched UGC is
+    // mostly product_only studio shots + sparse engagement" → lean
+    // brand-voice / typographic / strong color blocks. Empty {} when
+    // there are no other matched media beyond the source.
+    signals: {
+      cross_media: crossMediaDocs.length ? {
+        media_count_excluding_source: crossMediaDocs.length,
+        shot_type_distribution:       distribution(crossMediaDocs.map(m => m.classification?.shotType).filter(Boolean)),
+        content_nature_distribution:  distribution(crossMediaDocs.map(m => m.classification?.contentNature).filter(Boolean)),
+        avg_ad_readiness:             avgOf(crossMediaDocs.map(m => m.adSuitability?.score)),
+        avg_engagement_rate:          avgOf(crossMediaDocs.map(m => m.platformStats?.engagement)),
+        total_likes:                  sumOf(crossMediaDocs.map(m => m.platformStats?.likes)),
+        total_comments:               sumOf(crossMediaDocs.map(m => m.platformStats?.comments))
+      } : null
     }
   };
 
@@ -447,6 +534,34 @@ async function loadTopComments(mediaId, n) {
   } catch (_) {
     return [];   // Comment model optional — UGC ingestion may not have populated it yet
   }
+}
+
+// ── Helpers used by the new signals block ────────────────────────────
+
+function snippetText(s, maxLen) {
+  if (!s || typeof s !== 'string') return null;
+  const trimmed = s.replace(/\s+/g, ' ').trim();
+  if (!trimmed) return null;
+  return trimmed.length > maxLen ? trimmed.slice(0, maxLen - 1) + '…' : trimmed;
+}
+
+function distribution(values) {
+  const out = {};
+  for (const v of values) {
+    if (!v) continue;
+    out[v] = (out[v] || 0) + 1;
+  }
+  return out;
+}
+
+function avgOf(arr) {
+  const nums = (arr || []).filter(n => typeof n === 'number' && Number.isFinite(n));
+  if (!nums.length) return null;
+  return Number((nums.reduce((s, n) => s + n, 0) / nums.length).toFixed(3));
+}
+
+function sumOf(arr) {
+  return (arr || []).reduce((s, n) => s + (typeof n === 'number' ? n : 0), 0) || null;
 }
 
 module.exports = { buildAiCanvasContext };
