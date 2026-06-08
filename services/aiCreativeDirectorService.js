@@ -30,13 +30,14 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID    = 'gpt-4.1';
 const TEMPERATURE = 0.7;          // creative direction wants nuance, not wild variance
-const N_CONCEPTS  = 2;            // two distinct concepts per call (cheaper than running twice)
-const MAX_TOKENS  = 2000;
+const N_CONCEPTS  = 4;            // four distinct concepts per call — gives pickConceptForCell a wider menu to spread across the cartesian (was 2; producing too-tight band)
+const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 tokens with rich rationale
 
-// Bump when assembleSignals' output shape changes — invalidates existing
-// CreativeDirectionArtifact rows so the Director re-runs against the
-// richer inputSummary. Mirrors aiCanvasSpecService.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '2.0.0';   // 2.0: full data projection (was: 1.0 5-bucket bool summary)
+// Bump when assembleSignals' output shape OR N_CONCEPTS changes —
+// invalidates existing CreativeDirectionArtifact rows so the Director
+// re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
+// Service.SPEC_SCHEMA_VERSION.
+const DIRECTOR_SIGNALS_VERSION = '2.1.0';   // 2.1: N_CONCEPTS bump 2 → 4 (2.0: full data projection)
 
 // Canonical archetype enum (the 8 we've been using, with descriptive
 // names matching the contract). Director picks from these; Generator
