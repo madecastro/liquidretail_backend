@@ -32,7 +32,7 @@ const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
 const N_CANDIDATES_DEFAULT = 2;        // HTML output is ~3-5× longer than JSON spec — start conservative
 const MAX_TOKENS          = 6000;
-const HTML_SCHEMA_VERSION = '1.2.0';   // 1.2: image-URL host allowlist hard violation + prompt-side allowed-hosts directive (catches LLM URL hallucination like cdn.openai.com/herosquare.jpg). 1.1: archetype I added.
+const HTML_SCHEMA_VERSION = '1.3.0';   // 1.3: prompt hands the LLM a flat AVAILABLE IMAGE URLS allowlist (the exact URLs to copy) so there's nothing to hallucinate. 1.2: validator-side host allowlist hard violation. 1.1: archetype I added.
 
 function enabled() {
   return String(process.env.AI_HTML_LAYOUT_ENABLED || '').toLowerCase() === 'true';
@@ -378,13 +378,23 @@ function buildPrompt({ canvas, concept, input, richContext, dims }) {
     userLines.push(``);
     userLines.push(`PICK COPY FROM copy_candidates arrays — use the index 0 entry unless a different pick clearly serves the concept better. The chosen string is what ships in the final ad.`);
     userLines.push(``);
-    userLines.push(`IMAGE URLS — embed verbatim from these paths:`);
-    userLines.push(`  product.hero_media.image — canvas-ratio hero crop`);
-    userLines.push(`  product.image — catalog product-only shot`);
-    userLines.push(`  product.lifestyle_image.image — catalog lifestyle shot (when present)`);
-    userLines.push(`  product.product_image.image — catalog product-only (when present)`);
-    userLines.push(`  product.hero_media.crops.<ratio_key> — alt-ratio hero crops (1_1, 4_5, 5_4, 9_16, 1_91_1) for inset/secondary use`);
-    userLines.push(`  brand.logo — only when logo_present is true`);
+    const urlAllowlist = collectImageUrls(input);
+    if (urlAllowlist.length) {
+      userLines.push(`AVAILABLE IMAGE URLS — these are the ONLY strings you may put in any <img src>. Copy them EXACTLY as written. Do NOT modify, shorten, transform, or invent URLs. If none of these fit a zone you wanted to fill, OMIT the <img> tag entirely and use a styled <div> instead (decorative panels beat broken images).`);
+      urlAllowlist.forEach(entry => {
+        userLines.push(`  [${entry.role}] ${entry.url}`);
+      });
+      userLines.push(``);
+      userLines.push(`Any <img src> that does NOT exactly match one of the URLs above will fail validation and your candidate will be discarded. Hosts other than res.cloudinary.com, cdn.brandfetch.io, cdn.shopify.com, scontent.cdninstagram.com, *.fbcdn.net are auto-rejected.`);
+    } else {
+      userLines.push(`IMAGE URLS — embed verbatim from these paths:`);
+      userLines.push(`  product.hero_media.image — canvas-ratio hero crop`);
+      userLines.push(`  product.image — catalog product-only shot`);
+      userLines.push(`  product.lifestyle_image.image — catalog lifestyle shot (when present)`);
+      userLines.push(`  product.product_image.image — catalog product-only (when present)`);
+      userLines.push(`  product.hero_media.crops.<ratio_key> — alt-ratio hero crops (1_1, 4_5, 5_4, 9_16, 1_91_1) for inset/secondary use`);
+      userLines.push(`  brand.logo — only when logo_present is true`);
+    }
     userLines.push(``);
   } else {
     userLines.push(`MINIMAL CONTEXT (no rich context available):`);
@@ -396,6 +406,43 @@ function buildPrompt({ canvas, concept, input, richContext, dims }) {
   userLines.push(`Emit the complete HTML document now.`);
   const user = userLines.join('\n');
   return { system, user, images };
+}
+
+// Pull every embeddable image URL out of the layout input into a flat
+// allowlist. The LLM gets this as an explicit "USE EXACTLY ONE OF
+// THESE" list so it can't hallucinate cdn.openai.com paths from its
+// training set — there's no ambiguity about what strings are valid.
+// Only emits hosts on the validator's allowlist (res.cloudinary.com,
+// cdn.brandfetch.io, etc.) so the prompt and validator agree.
+const ALLOWED_PROMPT_HOSTS = [
+  'res.cloudinary.com', 'cdn.brandfetch.io', 'cdn.shopify.com',
+  'scontent.cdninstagram.com', 'fbcdn.net', 'instagram.com'
+];
+function isAllowedPromptHost(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return ALLOWED_PROMPT_HOSTS.some(h => host === h || host.endsWith('.' + h) || host.endsWith(h));
+  } catch (_) { return false; }
+}
+function collectImageUrls(input) {
+  const out = [];
+  const seen = new Set();
+  const push = (role, url) => {
+    if (typeof url !== 'string' || !url) return;
+    if (seen.has(url)) return;
+    if (!isAllowedPromptHost(url)) return;   // skip bad hosts so prompt and validator stay in sync
+    seen.add(url);
+    out.push({ role, url });
+  };
+  const p = input?.product || {};
+  push('hero',              p.hero_media?.image);
+  push('product_only',      p.product_image?.image || p.image);
+  push('lifestyle',         p.lifestyle_image?.image);
+  // Alt-ratio hero crops — flatten the crops map.
+  const crops = p.hero_media?.crops || {};
+  Object.keys(crops).forEach(k => push(`hero_crop_${k}`, crops[k]?.url || crops[k]));
+  push('logo',              input?.brand?.logo);
+  return out;
 }
 
 // Compose OpenAI's multimodal user message: text + image_url parts
