@@ -40,7 +40,7 @@ const { trackLlmCall, recordCacheHit } = require('./costTracker');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.7.0';   // 2.7: Phase 5c.2 — enriched Generator signal payload (brand description, commerce sellers/specs/availability, rating distribution, cross-media distributions). 2.6: real spatial analysis per crop ratio.
+const SPEC_SCHEMA_VERSION = '2.8.0';   // 2.8: archetype I (UGC × PRODUCT SPLIT) added — opens multi-media-zone composition for ads where both lifestyle_image and product_image exist. 2.7: enriched Generator signal payload. 2.6: real spatial analysis per crop ratio.
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -471,6 +471,7 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     `  F) MAGAZINE / EDITORIAL — eyebrow_rules + headline + body text stacked vertically over a solid panel, image inset bottom-right. Reads like print.`,
     `  G) STAT-LED SOCIAL PROOF — a numeric stat (rating, follower count, comment count, likes, engagement) rendered as the hero element via a text zone with a slot like social_context.stats.likes. Headline secondary. Use when the social signal is the strongest selling point.`,
     `  H) PRODUCT-CARD GRID — multiple product_card / media zones in a 2×2 or 1×3 arrangement for catalog/collection ads.`,
+    `  I) UGC × PRODUCT SPLIT — two media zones side-by-side (50/50 vertical) or stacked diagonal. One slots product.hero_media (UGC in real-world context); the other slots product.product_image (clean studio shot) or product.lifestyle_image (catalog lifestyle). Most effective for "real people use it / here's what you'd buy" framing. Pair with a thin headline strip across the join; skip the brand panel since the two hero zones ARE the composition. ONLY use when both lifestyle_image_present AND product_image_present (check FULL CONTEXT) — when only the UGC hero exists, fall back to archetypes A/C/E.`,
     `Within an archetype: vary panel position (top/bottom/left/right/diagonal), color emphasis (solid block vs gradient vs split), and which zones lead. Name the archetype + your variation in your rationale.`,
     ``,
     `SLOT PATHS (single string or array). The renderer reads these from the resolved input. Pick freely; don't limit yourself to the brand+headline+cta minimum.`,

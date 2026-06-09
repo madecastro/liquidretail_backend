@@ -32,7 +32,7 @@ const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
 const N_CANDIDATES_DEFAULT = 2;        // HTML output is ~3-5× longer than JSON spec — start conservative
 const MAX_TOKENS          = 6000;
-const HTML_SCHEMA_VERSION = '1.0.0';
+const HTML_SCHEMA_VERSION = '1.1.0';   // 1.1: archetype I (UGC × PRODUCT SPLIT) added — multi-media composition unlocked when both product_image and lifestyle_image exist.
 
 function enabled() {
   return String(process.env.AI_HTML_LAYOUT_ENABLED || '').toLowerCase() === 'true';
@@ -314,6 +314,7 @@ function buildPrompt({ canvas, concept, input, richContext, dims }) {
     `  F) MAGAZINE / EDITORIAL — eyebrow rules + headline + body text stacked vertically over a solid panel, image inset bottom-right.`,
     `  G) STAT-LED SOCIAL PROOF — numeric stat (rating, follower count, engagement) rendered as the hero element. Headline secondary.`,
     `  H) PRODUCT-CARD GRID — multiple product images in a 2×2 or 1×3 arrangement.`,
+    `  I) UGC × PRODUCT SPLIT — two media zones: 50/50 vertical split or stacked diagonal. One <img> sources product.hero_media (UGC in real-world context); the other sources product.product_image (clean studio shot) or product.lifestyle_image (catalog lifestyle). "Real people use it / here's what you'd buy" framing. Thin headline strip across the join; no brand panel. ONLY when both product_image_present AND lifestyle_image_present are true in FULL CONTEXT — fall back to A/C/E when only the UGC hero exists.`,
     ``,
     `PALETTE DERIVATION — pick a cohesive 2-5 color palette:`,
     `  1. Read the source photo's dominant tones (food → warm browns/golds; outdoor → earth + sky; product-only → background neutral).`,
