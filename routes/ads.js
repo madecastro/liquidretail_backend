@@ -663,7 +663,7 @@ router.get('/', async (req, res) => {
 
     res.json({
       ads: rows.map(r => projectAd(r, false, {
-        photorealUrl:           photorealMap.get(photorealCacheKey(r)) || null,
+        photorealUrl:           photorealMap.get(String(r._id)) || null,
         useImageRefAsProduction: useImageRefByCampaign.get(String(r.campaignId)) || false
       })),
       total,
@@ -812,15 +812,49 @@ function photorealCacheKey(ad) {
   ].join('|');
 }
 
+// Returns a map { [adId]: photorealUrl }. Two-pass lookup:
+//   1) Fast FK join via Ad.aiCanvasArtifactId — populated for every
+//      render that went through the Phase 6.5.1 eager prime (V2 ai_*
+//      with RENDER_USE_HTML on). One indexed query, deterministic.
+//   2) Legacy cartesian-heuristic fallback for Ads without the FK
+//      (older renders, V1, non-AI templates). Same 6-field $or as
+//      before, kept narrowly scoped to the leftover ad ids.
 async function loadPhotorealUrlMap(adRows) {
   const map = new Map();
   if (!adRows.length) return map;
   const AiFullRenderArtifact = require('../models/AiFullRenderArtifact');
-  // Distinct cache-key tuples to query — same product+template+ratio+
-  // variant+palette across multiple Ads collapses to one query row.
+
+  // Pass 1 — direct FK join. Group Ads by their canvas artifact id.
+  const adsByCanvas = new Map();
+  for (const ad of adRows) {
+    if (!ad.aiCanvasArtifactId) continue;
+    const k = String(ad.aiCanvasArtifactId);
+    if (!adsByCanvas.has(k)) adsByCanvas.set(k, []);
+    adsByCanvas.get(k).push(ad);
+  }
+  if (adsByCanvas.size) {
+    const fkRows = await AiFullRenderArtifact
+      .find({ aiCanvasArtifactId: { $in: [...adsByCanvas.keys()] } })
+      .sort({ createdAt: -1 })
+      .select('aiCanvasArtifactId imageUrl createdAt')
+      .lean();
+    const fkMap = new Map();   // canvasId → most-recent imageUrl
+    for (const r of fkRows) {
+      const k = String(r.aiCanvasArtifactId);
+      if (!fkMap.has(k)) fkMap.set(k, r.imageUrl);
+    }
+    for (const [canvasKey, ads] of adsByCanvas.entries()) {
+      const url = fkMap.get(canvasKey);
+      if (url) for (const ad of ads) map.set(String(ad._id), url);
+    }
+  }
+
+  // Pass 2 — cartesian fallback for Ads without an FK or where the FK
+  // didn't resolve (race-condition cold cells).
+  const leftover = adRows.filter(ad => !map.has(String(ad._id)));
+  if (!leftover.length) return map;
   const keys = new Set();
-  for (const ad of adRows) keys.add(photorealCacheKey(ad));
-  // Build an $or of the unique combinations.
+  for (const ad of leftover) keys.add(photorealCacheKey(ad));
   const orClauses = [...keys].map(k => {
     const [mediaId, template, aspectRatio, productId, variantKind, paletteSource] = k.split('|');
     return {
@@ -837,10 +871,14 @@ async function loadPhotorealUrlMap(adRows) {
     .sort({ createdAt: -1 })
     .select('mediaId template aspectRatio productId variantKind paletteSource imageUrl createdAt')
     .lean();
-  // Most-recent wins per key.
+  const heuristicMap = new Map();
   for (const r of rows) {
     const k = [r.mediaId, r.template, r.aspectRatio, r.productId, r.variantKind, r.paletteSource || 'media'].join('|');
-    if (!map.has(k)) map.set(k, r.imageUrl);
+    if (!heuristicMap.has(k)) heuristicMap.set(k, r.imageUrl);
+  }
+  for (const ad of leftover) {
+    const url = heuristicMap.get(photorealCacheKey(ad));
+    if (url) map.set(String(ad._id), url);
   }
   return map;
 }

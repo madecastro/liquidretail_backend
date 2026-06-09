@@ -45,6 +45,13 @@ const adSchema = new mongoose.Schema({
   // Resolved at render time when buildLayoutInput runs. Null while queued.
   layoutInputArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'LayoutInputArtifact', default: null },
 
+  // Stamped at render time alongside layoutInputArtifactId. Gives the
+  // Ads list a clean FK to join AiFullRenderArtifact (photoreal polish)
+  // instead of reconstructing the 8-field cartesian cache key from
+  // fields the Ad doesn't carry (campaignContextHash, creativeStyle).
+  // Null for V1/legacy ads — Ads list falls back to a cartesian heuristic.
+  aiCanvasArtifactId:    { type: mongoose.Schema.Types.ObjectId, ref: 'AiCanvasArtifact',   default: null },
+
   // ── Generation context ───────────────────────────────────────────
   template:     { type: String, required: true, index: true },
   aspectRatio:  { type: String, required: true },

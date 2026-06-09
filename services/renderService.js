@@ -385,6 +385,7 @@ function decodeTokenPayload(token) {
 async function renderStage(args) {
   const { layoutInputArtifactId, template, aspectRatio, mediaId, productId, renderMode = 'static' } = args;
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
+  let primedCanvasArtifactId = null;
 
   // Phase 6.5.1 — eager prime so the first wave of a fresh batch
   // actually uses the HTML path. Without this, the spec-path shadow
@@ -392,9 +393,11 @@ async function renderStage(args) {
   // the legacy /ads.html, so the very first render of every cold cell
   // ships as the spec render. Cache-keyed inside both services, so on
   // warm cells this returns in milliseconds.
+  // Also captures the canvas artifact id so the caller can stamp it
+  // on the Ad doc for a clean photoreal FK join downstream.
   if (RENDER_USE_HTML && template && String(template).startsWith('ai_') && args.aiCreativeV2) {
     try {
-      await ensureCanvasAndHtml({
+      const primed = await ensureCanvasAndHtml({
         layoutInputArtifactId,
         template,
         aspectRatio,
@@ -405,6 +408,7 @@ async function renderStage(args) {
         campaignKind:   args.campaignKind,
         campaignRunId:  args.campaignRunId
       });
+      primedCanvasArtifactId = primed?.aiCanvasArtifactId || null;
     } catch (err) {
       console.warn(`   ⚠️  [render eager] ensureCanvasAndHtml failed: ${err.message} — falling back to lazy path`);
     }
@@ -428,11 +432,13 @@ async function renderStage(args) {
           `   🌐 [render] HTML path — artifact=${htmlCandidate.artifactId} ` +
           `html_len=${htmlCandidate.outputHtml.length}`
         );
-        return await renderViaHtml({
+        const output = await renderViaHtml({
           outputHtml: htmlCandidate.outputHtml,
           dims,
           renderMode
         });
+        output.aiCanvasArtifactId = htmlCandidate.artifactId || primedCanvasArtifactId || null;
+        return output;
       }
       if (htmlCandidate?.outputHtml && htmlCandidate.hasHardViolations) {
         console.warn(
@@ -445,7 +451,9 @@ async function renderStage(args) {
     }
   }
 
-  return await renderViaSpec(args);
+  const specOutput = await renderViaSpec(args);
+  specOutput.aiCanvasArtifactId = primedCanvasArtifactId || null;
+  return specOutput;
 }
 
 // Phase 6.5.1 — eager AiCanvasArtifact + outputHtml prime. Mirrors the
@@ -524,9 +532,9 @@ async function ensureCanvasAndHtml({
     });
   } catch (err) {
     console.warn(`   ⚠️  [render eager] canvas prime failed: ${err.message}`);
-    return;
+    return null;
   }
-  if (!canvasResult?.artifactId) return;
+  if (!canvasResult?.artifactId) return null;
 
   // Prime the HTML output. Cache-hits when the AiCanvasArtifact already
   // has outputHtml at the current schema version. Awaiting here is the
@@ -545,6 +553,7 @@ async function ensureCanvasAndHtml({
   } catch (err) {
     console.warn(`   ⚠️  [render eager] html-gen failed: ${err.message}`);
   }
+  return { aiCanvasArtifactId: canvasResult.artifactId };
 }
 
 // Look up the HTML candidate for a given cell. Returns null when:
@@ -921,6 +930,11 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
   const update = {
     $set: {
       layoutInputArtifactId,
+      // Stamped only when the eager prime ran (V2 ai_* templates with
+      // RENDER_USE_HTML on). Enables a direct FK join to AiFullRenderArtifact
+      // in the Ads list endpoint instead of reconstructing the cartesian
+      // cache key from fields the Ad doesn't carry.
+      aiCanvasArtifactId: renderOutput.aiCanvasArtifactId || null,
       kind:               isVideo ? 'video' : (renderOutput.kind || 'image'),
       renderUrl:          isVideo ? videoComposite.compositeUrl : upload.renderUrl,
       posterUrl:          isVideo ? upload.renderUrl : upload.posterUrl,
