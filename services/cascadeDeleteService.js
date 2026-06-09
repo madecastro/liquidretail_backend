@@ -23,6 +23,8 @@ const LayoutInputArtifact   = require('../models/LayoutInputArtifact');
 const CatalogProduct        = require('../models/CatalogProduct');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const Campaign              = require('../models/Campaign');
+const Ad                    = require('../models/Ad');
+const CampaignRun           = require('../models/CampaignRun');
 const { deleteManyFromCloudinary } = require('./cloudinaryService');
 
 // ── Brand cascade ─────────────────────────────────────────────────────
@@ -225,4 +227,79 @@ function collectMediaCloudUrls(media) {
   return urls;
 }
 
-module.exports = { cascadeDeleteBrand, cascadeDeleteMedia };
+// ── Campaign cascade ──────────────────────────────────────────────────
+//
+// Narrow cascade — campaigns own Ads + CampaignRun rows, nothing else.
+// LayoutInputArtifact / AiCanvasArtifact / ResolvedLayoutArtifact /
+// AiFullRenderArtifact / AiHtmlValidationArtifact / CreativeDirection-
+// Artifact / CopyCandidatesArtifact are all media-or-brand keyed and
+// reusable across campaigns; deleting them here would invalidate other
+// campaigns' caches. Same for Media + CatalogProduct (brand-level).
+//
+// Order:
+//   1. Load Campaign for tenant verification (route is expected to have
+//      already authorized; this is just an existence check + name for the
+//      log line).
+//   2. Collect Cloudinary URLs from Ad.renderUrl + Ad.posterUrl. Only
+//      the rendered PNG/posters belong to the campaign — the source media
+//      (Cloudinary-hosted UGC photos, catalog product images) belongs to
+//      the brand and survives.
+//   3. Delete Ads + CampaignRuns in parallel.
+//   4. Delete the Campaign itself.
+//   5. Fire-and-forget Cloudinary cleanup.
+
+async function cascadeDeleteCampaign(campaignId) {
+  const t0 = Date.now();
+
+  const campaign = await Campaign.findById(campaignId).lean();
+  if (!campaign) return { ok: false, reason: 'campaign not found' };
+
+  // Step 2 — collect Cloudinary URLs. Only the Cloudinary-hosted ones
+  // (filter on host) so video composites built from external CDNs don't
+  // get fed to the cleanup queue.
+  const ads = await Ad.find({ campaignId }, { renderUrl: 1, posterUrl: 1, cloudinaryPublicId: 1 }).lean();
+  const cloudUrls = new Set();
+  for (const ad of ads) {
+    if (ad.renderUrl && /res\.cloudinary\.com/.test(ad.renderUrl)) cloudUrls.add(ad.renderUrl);
+    if (ad.posterUrl && /res\.cloudinary\.com/.test(ad.posterUrl)) cloudUrls.add(ad.posterUrl);
+  }
+  const cloudUrlList = [...cloudUrls];
+
+  // Step 3 — delete in parallel.
+  const [adRes, runRes] = await Promise.all([
+    Ad.deleteMany({ campaignId }),
+    CampaignRun.deleteMany({ campaignId })
+  ]);
+
+  // Step 4 — campaign itself.
+  const campaignRes = await Campaign.deleteOne({ _id: campaignId });
+
+  // Step 5 — fire-and-forget Cloudinary cleanup.
+  if (cloudUrlList.length > 0) {
+    deleteManyFromCloudinary(cloudUrlList)
+      .then(results => {
+        const ok = results.filter(r => r.result === 'ok').length;
+        console.log(`   · campaign-cascade cloudinary cleanup: ok=${ok}/${cloudUrlList.length}`);
+      })
+      .catch(err => console.warn(`   ⚠️  campaign-cascade cloudinary cleanup failed: ${err.message}`));
+  }
+
+  console.log(
+    `🗑️  campaign-cascade done: campaign=${campaignId} (${campaign.name || '-'}) ` +
+    `ads=${adRes.deletedCount || 0} runs=${runRes.deletedCount || 0} ` +
+    `cloudUrls=${cloudUrlList.length} in ${Date.now() - t0}ms`
+  );
+
+  return {
+    ok: true,
+    campaignId,
+    campaignName: campaign.name || null,
+    adsDeleted:        adRes.deletedCount || 0,
+    runsDeleted:       runRes.deletedCount || 0,
+    campaignDeleted:   campaignRes.deletedCount === 1,
+    cloudinaryQueued:  cloudUrlList.length,
+    durationMs:        Date.now() - t0
+  };
+}
+
+module.exports = { cascadeDeleteBrand, cascadeDeleteMedia, cascadeDeleteCampaign };

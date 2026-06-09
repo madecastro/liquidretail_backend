@@ -615,4 +615,32 @@ function collectSampleCreatives(campaign, limit) {
   return out;
 }
 
+// DELETE /api/campaigns/:id
+// Hard-delete a campaign and its directly-owned children (Ads,
+// CampaignRun rows, rendered Cloudinary PNGs). Shared artifacts —
+// LayoutInputArtifact, AiCanvasArtifact, ResolvedLayoutArtifact,
+// AiFullRenderArtifact, AiHtmlValidationArtifact, CreativeDirection-
+// Artifact, CopyCandidatesArtifact — are deliberately preserved
+// because they're keyed on media/brand, not campaign, and other
+// campaigns may legitimately reuse them. Source media and catalog
+// products belong to the brand and survive.
+router.delete('/:id', async (req, res) => {
+  try {
+    const c = await Campaign.findOne(tenantFilter(req, { _id: req.params.id }))
+      .select('_id name brandId platform')
+      .lean();
+    if (!c) return res.status(404).json({ error: 'campaign not found' });
+    if (c.platform !== 'reach-social') {
+      return res.status(409).json({ error: 'only reach-social campaigns can be deleted via this endpoint' });
+    }
+    const { cascadeDeleteCampaign } = require('../services/cascadeDeleteService');
+    const result = await cascadeDeleteCampaign(c._id);
+    if (!result.ok) return res.status(500).json({ error: result.reason || 'cascade delete failed' });
+    res.json(result);
+  } catch (err) {
+    console.error(`❌ DELETE /api/campaigns/${req.params.id} failed: ${err.message}\n${err.stack || ''}`);
+    res.status(500).json({ error: err.message || 'campaign delete failed' });
+  }
+});
+
 module.exports = router;
