@@ -35,8 +35,34 @@ const HARD_VIOLATION_CODES = new Set([
   'no_html',
   'no_body',
   'has_script',
-  'proof_strategy_unsupported'
+  'proof_strategy_unsupported',
+  'image_url_disallowed_host'
 ]);
+
+// Allowlist of hosts the renderer's image fetches actually reach. Any
+// <img src> with a host outside this set is a hallucinated URL — the
+// LLM dreaming up `cdn.openai.com/CHILLI-OIL/hero.jpg` instead of
+// using the verbatim Cloudinary URL we handed it. Verbatim-URL
+// instructions in the prompt slip occasionally; this is the catch-net.
+// Hosts match by suffix so subdomain variants pass (a.res.cloudinary.com,
+// etc.) but the base domain still has to be in the list.
+const ALLOWED_IMG_HOSTS = [
+  'res.cloudinary.com',         // primary catalog + UGC CDN
+  'cdn.brandfetch.io',           // brand logos
+  'cdn.shopify.com',             // Shopify product images
+  'scontent.cdninstagram.com',   // Instagram media
+  'fbcdn.net',                   // Instagram fallback
+  'instagram.com'                // IG public assets
+];
+
+function isAllowedImgHost(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return ALLOWED_IMG_HOSTS.some(h => host === h || host.endsWith('.' + h) || host.endsWith(h));
+  } catch (_) {
+    return false;
+  }
+}
 
 // Roles the proof-strategy compliance check accepts as "surfacing proof".
 const PROOF_ZONE_ROLES = new Set([
@@ -93,6 +119,21 @@ async function validateCandidate(html, {
   //      - Render-time the browser fetches via GET anyway; the probe
   //        is for telemetry/QA, not gate-keeping
   const imageUrls = extractImageUrls(html);
+
+  // Host-allowlist check FIRST — if the LLM hallucinated URLs (e.g.,
+  // cdn.openai.com from its training set), probeImages would just emit
+  // soft warnings and the candidate would still ship to render with
+  // broken <img>s. Hard violation drops these candidates pre-Judge.
+  const disallowedHostUrls = imageUrls.filter(u => !isAllowedImgHost(u));
+  if (disallowedHostUrls.length) {
+    hardViolations.add('image_url_disallowed_host');
+    warnings.push({
+      severity: 'high',
+      code: 'image_url_disallowed_host',
+      message: `${disallowedHostUrls.length} <img src> with host outside allowlist (likely LLM-hallucinated URLs): ${disallowedHostUrls.slice(0, 3).join(', ')}`
+    });
+  }
+
   const imageProbe = await probeImages(imageUrls);
   for (const url of imageProbe.failed.slice(0, 5)) {
     warnings.push({

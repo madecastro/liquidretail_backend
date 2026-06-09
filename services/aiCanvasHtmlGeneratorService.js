@@ -32,7 +32,7 @@ const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
 const N_CANDIDATES_DEFAULT = 2;        // HTML output is ~3-5× longer than JSON spec — start conservative
 const MAX_TOKENS          = 6000;
-const HTML_SCHEMA_VERSION = '1.1.0';   // 1.1: archetype I (UGC × PRODUCT SPLIT) added — multi-media composition unlocked when both product_image and lifestyle_image exist.
+const HTML_SCHEMA_VERSION = '1.2.0';   // 1.2: image-URL host allowlist hard violation + prompt-side allowed-hosts directive (catches LLM URL hallucination like cdn.openai.com/herosquare.jpg). 1.1: archetype I added.
 
 function enabled() {
   return String(process.env.AI_HTML_LAYOUT_ENABLED || '').toLowerCase() === 'true';
@@ -295,6 +295,7 @@ function buildPrompt({ canvas, concept, input, richContext, dims }) {
     `- NO <script>. NO external <link rel="stylesheet"> or @import (renderer runs offline; external requests time out).`,
     `- NO external fonts. Use system stack: \`font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif\` OR \`font-family: Georgia, "Times New Roman", serif\` for editorial vibe.`,
     `- All image src URLs MUST come from the supplied crop maps or richContext VERBATIM — use the actual URL strings from product.hero_media.image, product.image, product.product_image.image, product.lifestyle_image.image, product.hero_media.crops.<ratio_key>, brand.logo (if logo_present). Do NOT invent or modify URLs.`,
+    `- ALLOWED IMAGE HOSTS: res.cloudinary.com, cdn.brandfetch.io, cdn.shopify.com, scontent.cdninstagram.com, *.fbcdn.net. ANY <img src> whose host is outside this list (especially cdn.openai.com, example.com, placeholder.com, picsum.photos, unsplash.com) is a hard validation failure — the candidate is dropped pre-Judge. If you can't find a URL in FULL CONTEXT to use, OMIT the <img> tag entirely (decorative <div> + brand colors is better than a broken or hallucinated image).`,
     `- NO placeholder text. NO Lorem Ipsum. Pull copy from copy_candidates arrays (pick by index — use index 0 if you can't justify another).`,
     `- Render copy LEGIBLY: white-space, kerning, no text-clipping. Use overflow-wrap, word-break sensibly.`,
     `- Color text + background pairs must achieve WCAG AA contrast (≥ 4.5:1 normal, ≥ 3:1 for ≥ 24px or bold ≥ 19px). Validator will check.`,
