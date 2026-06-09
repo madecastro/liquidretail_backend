@@ -31,8 +31,13 @@ const { trackLlmCall, recordCacheHit } = require('./costTracker');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const MODEL_ID = 'gpt-image-1';
-const QUALITY  = 'medium';     // low=$0.011 / medium=$0.042 / high=$0.167 (1024²)
+// Env-driven so model swaps don't require a code deploy. Default
+// stays gpt-image-1; flip AI_IMAGE_REF_MODEL_ID on Render to evaluate
+// a successor model. If the new model has different size constraints,
+// sizeForRatio() below may also need adjustment — pay attention to the
+// first few worker logs after the swap.
+const MODEL_ID = process.env.AI_IMAGE_REF_MODEL_ID || 'gpt-image-1';
+const QUALITY  = process.env.AI_IMAGE_REF_QUALITY  || 'medium';     // low=$0.011 / medium=$0.042 / high=$0.167 (1024² on gpt-image-1)
 
 // gpt-image-1 only supports these three sizes.
 function sizeForRatio(aspectRatio) {
@@ -56,6 +61,18 @@ function estimateCostUsd(size) {
 function enabled() {
   return String(process.env.AI_IMAGE_REFERENCE_ENABLED || '').toLowerCase() === 'true';
 }
+
+// Boot-log the active config so a Render log scan tells you at a
+// glance which image model is in use. Helps catch "I flipped the env
+// but Render is on an old deploy" silently.
+(function logImageRefConfig() {
+  console.log(
+    `🖼  aiImageReferenceService config — ` +
+    `enabled=${enabled()} ` +
+    `model=${MODEL_ID} ` +
+    `quality=${QUALITY}`
+  );
+})();
 
 // ── Public API ───────────────────────────────────────────────────────
 
