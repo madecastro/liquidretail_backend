@@ -48,6 +48,50 @@ const RENDER_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || '2', 10);
 // for a single seed.
 const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '6', 10);
 
+// POST /api/ads/preview
+// Same body as /generate. Runs the entire seed assembly + cartesian +
+// caps WITHOUT inserting Ad docs. Returns the would-be payload counts
+// grouped by productId + variantKind so the wizard can show the
+// operator the expansion math before they hit Generate. Cheap relative
+// to /generate (no LLM, no DB writes) but still issues the matchedMedia
+// + ProductMatchArtifact reads — call once on Step 2/3 entry, not on
+// every keystroke.
+router.post('/preview', async (req, res) => {
+  try {
+    const {
+      campaignId,
+      productIds  = [],
+      mediaIds    = [],
+      templateIds = [],
+      cta         = {},
+      urlParams   = '',
+      excludePairings = [],
+      includeCategoryMatched = false,
+      includeBrandMatched    = false
+    } = req.body || {};
+    if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
+    if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
+
+    const job = await expandWizardJob({
+      campaignId,
+      productIds,
+      mediaIds,
+      templateIds,
+      cta,
+      urlParams,
+      excludePairings,
+      includeCategoryMatched,
+      includeBrandMatched,
+      requestedBy: req.user?.userId || null,
+      dryRun: true
+    });
+    res.json(job);
+  } catch (err) {
+    console.error(`❌ POST /api/ads/preview failed: ${err.message}\n${err.stack || ''}`);
+    res.status(500).json({ error: err.message || 'preview failed' });
+  }
+});
+
 // POST /api/ads/generate
 // Body: { campaignId, productIds, mediaIds, templateIds, cta:{text,url}, urlParams }
 // Response: 202 Accepted { campaignRunId, total, status: 'running' }

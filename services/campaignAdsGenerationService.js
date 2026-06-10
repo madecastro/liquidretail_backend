@@ -127,6 +127,12 @@ const EXPANSION_PRODUCTS_PER_POST = Math.max(1, parseInt(process.env.EXPANSION_P
 // picks queues additional combinations (idempotent dedup at insert).
 const MAX_ADS_PER_GENERATION_RUN = Math.max(1, parseInt(process.env.MAX_ADS_PER_GENERATION_RUN, 10) || 200);
 
+// Per-product hard cap — independent of the global run cap. Keeps a
+// 1-product wizard run tight (3 ads) while a 10-product brand campaign
+// still produces 30 ads. Top picks by readinessScore within each
+// productId group; brand-only seeds (productId=null) form one group.
+const ADS_PER_PRODUCT_CAP = Math.max(1, parseInt(process.env.ADS_PER_PRODUCT_CAP, 10) || 3);
+
 // Composite product popularity. Primary signal: how many UGC posts
 // have matched this product (genuine popularity proxy on the brand's
 // own social inventory). Secondary signal: catalog review strength
@@ -244,7 +250,13 @@ async function expandWizardJob({
   // matched" / "Include brand-matched" expand buttons in Step 2.
   // Brand-only and media-driven seed paths ignore these flags.
   includeCategoryMatched = false,
-  includeBrandMatched    = false
+  includeBrandMatched    = false,
+  // Dry-run mode — runs the entire seed assembly + cartesian + caps
+  // but skips the Ad.insertMany. Returns the would-be payload counts
+  // grouped by productId so the wizard can show "this will produce N
+  // ads" before the operator hits Generate. Use sparingly — still
+  // costs LLM-free DB reads (matchedMedia, ProductMatchArtifact, etc.).
+  dryRun = false
 }) {
   if (!campaignId) throw new Error('campaignId required');
 
@@ -338,14 +350,13 @@ async function expandWizardJob({
     }
   }
 
-  // Each seed × template × ratio expands across TWO paletteSource
-  // variants (media / brand). The 'media' variant draws style bindings
-  // from the hero media's palette (palette_dominant / palette_vibrant
-  // etc.); the 'brand' variant overrides those to brand.primaryColor /
-  // accentColor / secondaryColor. Identical visual composition, two
-  // colorways. Doubles the cartesian — the trim below caps total
-  // payloads at MAX_ADS_PER_GENERATION_RUN.
-  const PALETTE_SOURCES = ['media', 'brand'];
+  // paletteSource doubling removed — that was the legacy CSS-render
+  // path where style_bindings interpolated different hex values per
+  // (media|brand) source. The HTML Layout Generator now picks its own
+  // palette per the prompt's PALETTE DERIVATION section, so the
+  // second colorway just duplicated identical ads. Field stays in the
+  // cache key for backward compat; we just emit a single value.
+  const PALETTE_SOURCES = ['media'];
 
   // Raffle prize media — when the campaign has multiple prize media,
   // each one becomes its own ad variant per (template × ratio × palette
@@ -409,23 +420,69 @@ async function expandWizardJob({
     }
   }
 
-  // Cartesian limiter — bound per-run inventory growth. Sort by
-  // readinessScore desc (videos with null sort last automatically),
-  // trim to MAX_ADS_PER_GENERATION_RUN. Re-running the wizard with
-  // the same picks queues the next batch (identityDigest dedup catches
-  // any duplicates from the prior run).
+  // Per-product cap — keep at most ADS_PER_PRODUCT_CAP payloads per
+  // productId, picking the highest-readinessScore winners within each
+  // group. Brand-only seeds (productId null) form one group and get
+  // the same cap. Applied BEFORE the global MAX_ADS cap so that a
+  // wizard run on N products doesn't have one popular product hog
+  // the budget while others render zero ads.
+  if (payloads.length) {
+    const groupKey = (p) => p.productId ? String(p.productId) : 'NULL';
+    const byProduct = new Map();
+    for (const p of payloads) {
+      const k = groupKey(p);
+      if (!byProduct.has(k)) byProduct.set(k, []);
+      byProduct.get(k).push(p);
+    }
+    const trimmed = [];
+    let perProductDropped = 0;
+    for (const group of byProduct.values()) {
+      group.sort((a, b) => (b.readinessScore ?? -1) - (a.readinessScore ?? -1));
+      if (group.length > ADS_PER_PRODUCT_CAP) perProductDropped += group.length - ADS_PER_PRODUCT_CAP;
+      trimmed.push(...group.slice(0, ADS_PER_PRODUCT_CAP));
+    }
+    if (perProductDropped > 0) {
+      console.log(`📦 expandWizardJob: per-product trim dropped ${perProductDropped} payload(s) (cap=${ADS_PER_PRODUCT_CAP}/product across ${byProduct.size} group(s))`);
+    }
+    payloads = trimmed;
+  }
+
+  // Global cap — last-resort backstop. With ADS_PER_PRODUCT_CAP=3 and
+  // typical product counts, this almost never fires. Kept so a brand
+  // campaign with 100+ products doesn't accidentally queue 300 ads.
   if (payloads.length > MAX_ADS_PER_GENERATION_RUN) {
     payloads.sort((a, b) => (b.readinessScore ?? -1) - (a.readinessScore ?? -1));
     const before = payloads.length;
     payloads = payloads.slice(0, MAX_ADS_PER_GENERATION_RUN);
-    console.log(`📦 expandWizardJob: cartesian trim ${before} → ${payloads.length} (cap=${MAX_ADS_PER_GENERATION_RUN})`);
+    console.log(`📦 expandWizardJob: global cap trim ${before} → ${payloads.length} (cap=${MAX_ADS_PER_GENERATION_RUN})`);
   }
 
   if (!payloads.length) {
     return {
       campaignId: String(campaignId), brandId, campaignKind,
-      queuedCount: await Ad.countDocuments({ campaignId, status: 'queued' }),
-      newlyQueued: 0, alreadyQueued: 0, newAdIds: []
+      queuedCount: dryRun ? 0 : await Ad.countDocuments({ campaignId, status: 'queued' }),
+      newlyQueued: 0, alreadyQueued: 0, newAdIds: [], total: 0, byProduct: {}
+    };
+  }
+
+  // Dry-run — skip DB writes, summarize counts so the wizard can
+  // show the operator the expansion math before commit.
+  if (dryRun) {
+    const byProduct = {};
+    const byVariantKind = { ugc: 0, product_image: 0 };
+    for (const p of payloads) {
+      const k = p.productId ? String(p.productId) : 'NULL';
+      byProduct[k] = (byProduct[k] || 0) + 1;
+      if (p.variantKind in byVariantKind) byVariantKind[p.variantKind]++;
+    }
+    return {
+      campaignId: String(campaignId), brandId, campaignKind,
+      dryRun: true,
+      total:        payloads.length,
+      byProduct,
+      byVariantKind,
+      seedCount:    seeds.length,
+      productCount: Object.keys(byProduct).length
     };
   }
 
