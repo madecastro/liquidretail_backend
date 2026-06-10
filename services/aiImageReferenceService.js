@@ -87,6 +87,16 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
   const canvas = await AiCanvasArtifact.findById(aiCanvasArtifactId).lean();
   if (!canvas) throw new Error(`AiCanvasArtifact ${aiCanvasArtifactId} not found`);
 
+  // Video sources skip the polish entirely. gpt-image-1 produces still
+  // images — running it on a video ad's canvas would yield a still PNG
+  // that the UI would then try to play as <video>, breaking playback.
+  // Video ads live on the Cloudinary composite (renderUrl) by design;
+  // photorealUrl stays null for them forever.
+  const sourceMedia = await Media.findById(canvas.mediaId).select('fileType').lean();
+  if (sourceMedia?.fileType === 'video') {
+    return { skipped: true, reason: 'source media is video — image-ref disabled for video ads' };
+  }
+
   const filter = {
     mediaId:             canvas.mediaId,
     template:            canvas.template,

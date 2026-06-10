@@ -32,7 +32,7 @@ const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
 const N_CANDIDATES_DEFAULT = 2;        // HTML output is ~3-5× longer than JSON spec — start conservative
 const MAX_TOKENS          = 6000;
-const HTML_SCHEMA_VERSION = '1.3.0';   // 1.3: prompt hands the LLM a flat AVAILABLE IMAGE URLS allowlist (the exact URLs to copy) so there's nothing to hallucinate. 1.2: validator-side host allowlist hard violation. 1.1: archetype I added.
+const HTML_SCHEMA_VERSION = '1.4.0';   // 1.4: video-overlay mode — when source media is video AND canvas has a media zone, LLM emits transparent body + transparent media slot at the JSON Generator's rect so Cloudinary can composite over the source video. 1.3: AVAILABLE IMAGE URLS allowlist. 1.2: validator host allowlist. 1.1: archetype I.
 
 function enabled() {
   return String(process.env.AI_HTML_LAYOUT_ENABLED || '').toLowerCase() === 'true';
@@ -113,9 +113,27 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
     console.warn(`   ⚠️  html-gen rich-context build failed: ${err.message}`);
   }
 
+  // Video-overlay mode — when source Media is video AND the canvas
+  // spec has a media zone slotting product.hero_media, the LLM should
+  // emit body{background:transparent} + leave the media rect
+  // transparent so the Puppeteer omitBackground screenshot yields a
+  // transparent PNG that Cloudinary composites over the source video.
+  // Fallback when no media zone exists (e.g. typographic-dominant
+  // archetype that skipped support_media): videoMode=false, render
+  // as a static image — composeVideoOutput will return null and the
+  // pipeline ships the static PNG as the ad.
+  const Media = require('../models/Media');
+  const sourceMedia = await Media.findById(canvas.mediaId).select('fileType').lean();
+  const isVideoSource = sourceMedia?.fileType === 'video';
+  const mediaZone = (canvas.canvasSpec?.zones || []).find(z =>
+    z.kind === 'media' && z.slot === 'product.hero_media' && z.rect
+  );
+  const videoMode = isVideoSource && !!mediaZone;
+  const mediaRect = videoMode ? mediaZone.rect : null;
+
   const dims = canvasDims(canvas.aspectRatio);
   const { system, user, images } = buildPrompt({
-    canvas, concept, input, richContext, dims
+    canvas, concept, input, richContext, dims, videoMode, mediaRect
   });
 
   const nCandidates = N_CANDIDATES_DEFAULT;
@@ -278,7 +296,7 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
 
 // ── Prompt construction ──────────────────────────────────────────────
 
-function buildPrompt({ canvas, concept, input, richContext, dims }) {
+function buildPrompt({ canvas, concept, input, richContext, dims, videoMode = false, mediaRect = null }) {
   const ctx    = richContext?.text || null;
   const images = richContext?.images || [];
   const creativeStyle = canvas.creativeStyle;
@@ -361,6 +379,25 @@ function buildPrompt({ canvas, concept, input, richContext, dims }) {
   userLines.push(``);
   userLines.push(`Your hierarchy_spec MUST mirror this concept's archetype, layout_family, emotional_hook, social_proof_type, *_priority, and cta_emphasis VERBATIM. Use recommended_components as defaults; override only when a constraint demands it (note in rationale).`);
   userLines.push(``);
+
+  // VIDEO-OVERLAY mode — source media is a video. The renderer screenshots
+  // with omitBackground:true and Cloudinary composites the resulting
+  // transparent PNG over the source video. Three strict requirements
+  // for the LLM:
+  //   1. body MUST have background:transparent
+  //   2. The media zone at the JSON Generator's exact rect MUST be
+  //      transparent — no <img>, no background fill, just an empty
+  //      positioned <div data-media-slot="true"> for clarity
+  //   3. Every OTHER zone (panel, headline, CTA, logo) renders
+  //      normally as it would in static mode
+  if (videoMode && mediaRect) {
+    userLines.push(`VIDEO-OVERLAY MODE — source media is a video. Your HTML will be screenshot with omitBackground:true and Cloudinary will composite the resulting transparent PNG over the source video. HARD REQUIREMENTS:`);
+    userLines.push(`  1. body MUST set background:transparent (NOT a hex color, NOT white). Inline style="background:transparent" on the body tag is required.`);
+    userLines.push(`  2. The media zone MUST be a transparent rectangle at EXACTLY x:${mediaRect.x}, y:${mediaRect.y}, width:${mediaRect.w}, height:${mediaRect.h}. Emit it as <div data-media-slot="true" style="position:absolute;left:${mediaRect.x}px;top:${mediaRect.y}px;width:${mediaRect.w}px;height:${mediaRect.h}px;background:transparent"></div>. NO <img> inside this rect. NO background-color, NO background-image. The Cloudinary composite layers the video underneath, so this rect MUST stay see-through.`);
+    userLines.push(`  3. Every OTHER zone (panel, headline, CTA, logo, badges, eyebrows) renders normally with opaque backgrounds and visible content as you'd author for a static ad. Those zones land ON TOP of the video.`);
+    userLines.push(`  4. Position the OTHER zones so they don't accidentally overlap the transparent slot's rect — the operator wants the video clearly visible in that area.`);
+    userLines.push(``);
+  }
 
   if (images.length) {
     userLines.push(`VISION INPUTS (attached as image parts in this message, in order):`);
