@@ -28,13 +28,25 @@ const IntegrationCredential = require('../models/IntegrationCredential');
 // no gate needed" — a brand that hasn't linked IG simply skips the
 // social source rather than being blocked forever on a step they
 // never started.
+//
+// Social presence is defined by ACTUAL ingested posts, not by the
+// presence of an IG credential. A brand that connected IG for Meta
+// catalog access only (catalogId set, posts ingestion never opted
+// into) shouldn't be blocked by "No Instagram posts ingested yet" —
+// catalog-only ad generation is a first-class supported workflow.
+// Catalog presence stays credential-driven (catalogId set) so that
+// a freshly connected brand mid-first-sync is still gated until at
+// least one catalog product lands.
 async function probeConnections(brandId) {
   const cred = await IntegrationCredential.findOne({
     brandId, type: 'instagram', status: 'active'
   }).select('catalogId').lean();
+  const socialMediaCount = await Media.countDocuments({
+    brandId, source: 'instagram'
+  });
   return {
     catalog: !!cred?.catalogId,
-    social:  !!cred
+    social:  socialMediaCount > 0
   };
 }
 
