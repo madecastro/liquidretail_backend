@@ -48,6 +48,13 @@ const aiFullRenderArtifactSchema = new mongoose.Schema({
     default: 'none'
   },
 
+  // Diagnostic — when IMAGE_REF_DUMP_SEEDS=true, the seed PNG sent to
+  // openai.images.edit is uploaded to Cloudinary and the URL stamped
+  // here. Lets us A/B the seed input vs the polished output and
+  // quantify whether drift comes from the seed or from model
+  // interpretation. Null when the dump flag isn't on.
+  seedUrl:      { type: String, default: null },
+
   createdAt:    { type: Date, default: Date.now }
 });
 
