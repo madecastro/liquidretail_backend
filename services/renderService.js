@@ -201,10 +201,14 @@ async function renderCreative(req) {
         aspectRatio:      req.creative.aspectRatio,
         overlayUrl:       upload.renderUrl,
         overlayPublicId:  upload.cloudinaryPublicId,
-        // Cartesian keys — needed for AI templates so we can find the
-        // exact AiCanvasArtifact whose spec drove this render. Without
-        // these we'd pick "most recent" and risk grabbing a stale spec
-        // from a different variant.
+        // Prefer the direct FK stamped by renderStage when the eager
+        // prime ran. The 8-field cartesian lookup below (productId,
+        // variantKind, paletteSource, creativeStyle, campaignContext-
+        // Hash) was under-matching for video ads because creativeStyle
+        // and campaignContextHash aren't reliably populated on
+        // req.creative — they're computed at queue time and never
+        // persisted on the Ad doc. Same fix as the photoreal join.
+        aiCanvasArtifactId:  renderOutput.aiCanvasArtifactId   || null,
         productId:           req.creative.productId           || null,
         variantKind:         req.creative.variantKind         || null,
         paletteSource:       req.creative.paletteSource       || 'media',
@@ -967,27 +971,38 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
 // no media zone, or only alt-crop media — composite path bails and
 // the static PNG ships).
 async function pickHeroMediaZoneFromAiArtifact({
+  aiCanvasArtifactId,
   mediaId, template, aspectRatio,
   productId, variantKind, paletteSource, creativeStyle, campaignContextHash
 }) {
   const AiCanvasArtifact = require('../models/AiCanvasArtifact');
-  // Build the cache key the way aiCanvasSpecService.getOrGenerate does.
-  // creativeStyle defaults: if the wizard didn't pass one, the registry
-  // shim derives it from the template id (ai_brand_led → brand_led, etc.).
-  let resolvedCreativeStyle = creativeStyle;
-  if (!resolvedCreativeStyle) {
-    const aiNorm = registry.getNormalized(template);
-    resolvedCreativeStyle = aiNorm?.creativeStyle || null;
+  // Two-pass lookup. Pass 1 — direct FK when renderStage captured the
+  // canvas id during the eager prime. Pass 2 — legacy 8-field cartesian
+  // reconstruction for paths that don't carry the FK (V1 ads, non-
+  // eager-prime renders). Pass 1 fixes the silent under-match where
+  // creativeStyle and campaignContextHash aren't reliably populated
+  // on the render request (computed at queue time, not stored on the
+  // Ad doc).
+  let artifact = null;
+  if (aiCanvasArtifactId) {
+    artifact = await AiCanvasArtifact.findById(aiCanvasArtifactId).lean();
   }
-  const filter = {
-    mediaId, template, aspectRatio,
-    productId:           productId           || null,
-    variantKind:         variantKind         || null,
-    paletteSource:       paletteSource       || 'media',
-    creativeStyle:       resolvedCreativeStyle,
-    campaignContextHash: campaignContextHash || null
-  };
-  const artifact = await AiCanvasArtifact.findOne(filter).lean();
+  if (!artifact) {
+    let resolvedCreativeStyle = creativeStyle;
+    if (!resolvedCreativeStyle) {
+      const aiNorm = registry.getNormalized(template);
+      resolvedCreativeStyle = aiNorm?.creativeStyle || null;
+    }
+    const filter = {
+      mediaId, template, aspectRatio,
+      productId:           productId           || null,
+      variantKind:         variantKind         || null,
+      paletteSource:       paletteSource       || 'media',
+      creativeStyle:       resolvedCreativeStyle,
+      campaignContextHash: campaignContextHash || null
+    };
+    artifact = await AiCanvasArtifact.findOne(filter).lean();
+  }
   if (!artifact?.canvasSpec) return null;
 
   const spec = artifact.canvasSpec;
@@ -1032,6 +1047,7 @@ function _pickClosestBaseRatio(rect) {
 
 async function composeVideoOutput({
   media, template, aspectRatio, overlayUrl, overlayPublicId,
+  aiCanvasArtifactId,
   productId, variantKind, paletteSource, creativeStyle, campaignContextHash
 }) {
   // Resolve canvas dims + the hero-media slot rect. Hand-authored
@@ -1040,6 +1056,7 @@ async function composeVideoOutput({
   let canvasDims, slotZone;
   if (registry.isAi(template)) {
     const aiPick = await pickHeroMediaZoneFromAiArtifact({
+      aiCanvasArtifactId,
       mediaId:             media._id,
       template,
       aspectRatio,
