@@ -199,4 +199,14 @@ async function fetchBuffer(url) {
 // Probe once at module load so the Render log tells us what's available.
 if (genAI) discoverModels();
 
-module.exports = { extendImage, generateFresh, isEnabled, discoverModels };
+// Generic image-to-image polish. Caller supplies the prompt + a source
+// URL the model sees as the base; Gemini returns a refined image. Used
+// by the video-poster + overlay-polish paths where the seed isn't a
+// catalog product extension but a composed scene we want to lift to
+// photoreal. Returns a PNG Buffer.
+async function polishImage(prompt, sourceUrl) {
+  if (!genAI) throw new Error('GEMINI_API_KEY not set');
+  return Buffer.from(await runImageGen(prompt, sourceUrl), 'base64');
+}
+
+module.exports = { extendImage, generateFresh, polishImage, isEnabled, discoverModels };

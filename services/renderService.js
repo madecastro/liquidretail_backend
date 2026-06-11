@@ -245,6 +245,30 @@ async function renderCreative(req) {
     return failed(jobId, 'persist', err);
   }
 
+  // Phase (a) — video-poster polish shadow. Fires only when the Ad
+  // shipped as video AND the env flag is on. gpt-image-1/2 don't do
+  // video so the existing image-ref shadow doesn't help here; this
+  // path uses Gemini 2.5 Flash Image (Nano Banana) to refine the
+  // composite's first frame into a photoreal poster. Fire-and-forget
+  // — the playable composite is already correct; this only upgrades
+  // Ad.posterUrl.
+  if (ad?.kind === 'video') {
+    setImmediate(() => {
+      const videoPoster = require('./aiVideoPosterService');
+      if (!videoPoster.enabled()) return;
+      videoPoster.generatePosterForAd({ adId: ad._id })
+        .then(out => {
+          if (out?.skipped) return;
+          if (out?.ok) {
+            console.log(`🎞️  video-poster shadow READY: ad=${ad._id} took=${out.elapsedMs}ms`);
+          }
+        })
+        .catch(err => {
+          console.warn(`   ⚠️  video-poster shadow failed: ${err.message}`);
+        });
+    });
+  }
+
   const totalMs = Date.now() - t0;
   console.log(`🎉 ${tag} done in ${totalMs}ms (derive=${stages.derive||0} render=${stages.render||0} upload=${stages.upload||0} persist=${stages.persist||0})`);
   return success(jobId, ad.toObject ? ad.toObject() : ad);
