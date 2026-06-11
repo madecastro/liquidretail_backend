@@ -245,13 +245,14 @@ async function renderCreative(req) {
     return failed(jobId, 'persist', err);
   }
 
-  // Phase (a) — video-poster polish shadow. Fires only when the Ad
-  // shipped as video AND the env flag is on. gpt-image-1/2 don't do
-  // video so the existing image-ref shadow doesn't help here; this
-  // path uses Gemini 2.5 Flash Image (Nano Banana) to refine the
-  // composite's first frame into a photoreal poster. Fire-and-forget
-  // — the playable composite is already correct; this only upgrades
-  // Ad.posterUrl.
+  // Phase (a) — video-poster polish shadow. Nano Banana refines the
+  // composite's first frame into a photoreal still on Ad.posterUrl.
+  // Phase (b) — overlay-polish shadow. Nano Banana polishes the
+  // Puppeteer overlay PNG, sharp enforces the transparent slot,
+  // composeVideoOutput rebuilds the composite with the polished
+  // overlay, Ad.renderUrl swaps to the polished composite.
+  // Both fire-and-forget; both env-gated independently so one can
+  // be evaluated without the other. Cost: ~$0.04 + ~30s each.
   if (ad?.kind === 'video') {
     setImmediate(() => {
       const videoPoster = require('./aiVideoPosterService');
@@ -265,6 +266,20 @@ async function renderCreative(req) {
         })
         .catch(err => {
           console.warn(`   ⚠️  video-poster shadow failed: ${err.message}`);
+        });
+    });
+    setImmediate(() => {
+      const overlayPolish = require('./aiOverlayPolishService');
+      if (!overlayPolish.enabled()) return;
+      overlayPolish.polishOverlayForAd({ adId: ad._id })
+        .then(out => {
+          if (out?.skipped) return;
+          if (out?.ok) {
+            console.log(`🎨 overlay-polish shadow READY: ad=${ad._id} took=${out.elapsedMs}ms`);
+          }
+        })
+        .catch(err => {
+          console.warn(`   ⚠️  overlay-polish shadow failed: ${err.message}`);
         });
     });
   }
@@ -1188,4 +1203,4 @@ function success(jobId, ad) {
   };
 }
 
-module.exports = { renderCreative };
+module.exports = { renderCreative, composeVideoOutput };
