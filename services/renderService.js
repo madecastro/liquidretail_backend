@@ -1013,13 +1013,27 @@ async function pickHeroMediaZoneFromAiArtifact({
   // Filter zones to those that slot the source media's hero (alt-crop
   // slots like product.hero_media.crops.1_91_1 use a still image, no
   // video twin, so they don't get the composite treatment).
-  const candidates = (spec.zones || []).filter(z =>
-    z.kind === 'media' && z.slot === 'product.hero_media' && z.rect
-  );
+  //
+  // Slot filter is intentionally loose. Brand campaigns (no productId)
+  // produce specs where the LLM picks slot 'source_media.fileUrl' or
+  // leaves slot null while still emitting a kind:'media' zone with a
+  // rect — the composite just needs a rectangular media region to
+  // position the source video, the slot path itself doesn't matter
+  // for layered composition. Excludes only alt-crop slots
+  // (product.hero_media.crops.*) which point at still-image variants
+  // that have no video twin.
+  const candidates = (spec.zones || []).filter(z => {
+    if (z.kind !== 'media' || !z.rect) return false;
+    const slot = z.slot || '';
+    if (typeof slot === 'string' && slot.startsWith('product.hero_media.crops.')) return false;
+    return true;
+  });
   if (!candidates.length) return null;
-  // Pick the largest by area — when the LLM emits multiple media
-  // zones we want the dominant one for video.
-  const slotZone = candidates.sort((a, b) =>
+  // Prefer a hero-slotted zone when present; otherwise the largest by
+  // area. Brand campaigns typically have a single media zone so this
+  // picks it; product campaigns with hero + alts get the hero.
+  const heroSlotted = candidates.find(z => z.slot === 'product.hero_media');
+  const slotZone = heroSlotted || candidates.sort((a, b) =>
     (b.rect.w * b.rect.h) - (a.rect.w * a.rect.h)
   )[0];
   return { canvasDims, slotZone };
