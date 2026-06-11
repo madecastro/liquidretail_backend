@@ -303,7 +303,7 @@ async function expandWizardJob({
     seeds = await seedFromBrandOnly(brandId, BRAND_ONLY_MEDIA_LIMIT);
   } else {
     for (const mediaId of mediaIds) {
-      const mediaSeeds = await seedsFromMedia(brandId, mediaId);
+      const mediaSeeds = await seedsFromMedia(brandId, mediaId, { campaignKind });
       seeds.push(...mediaSeeds);
     }
     for (const productId of productIds) {
@@ -651,7 +651,7 @@ async function seedFromBrandOnly(brandId, topN) {
 // content-nature gate (promotional / announcement filter) is bypassed.
 // Inventory-pull paths (brand_only, brand_match fallback in
 // seedsFromProduct) still apply the gate.
-async function seedsFromMedia(brandId, mediaId) {
+async function seedsFromMedia(brandId, mediaId, opts = {}) {
   const media = await Media.findById(mediaId)
     .select('matchedProducts matchedCategories adSuitability fileType classification platformStats')
     .lean();
@@ -663,6 +663,32 @@ async function seedsFromMedia(brandId, mediaId) {
     suitabilityScore: media.adSuitability?.score ?? null,
     platformStats:    media.platformStats || null
   };
+
+  // Brand-campaign short-circuit. For campaignKind='brand' the
+  // operator picked the media because they want THAT visual to be
+  // the ad — not a fanout pairing that visual with every plausible
+  // product. Emit exactly one seed:
+  //   - if the media has a top product_match → attach that productId
+  //   - otherwise → productId:null, matchTier:'brand_only' (the
+  //     brand-only path that brand-led copy uses already)
+  if (opts.campaignKind === 'brand') {
+    const productMatches = (media.matchedProducts || []).filter(mp => mp.catalogProductId);
+    const top = productMatches.find(mp => mp.outcome === 'product_match')
+              || productMatches.find(mp => mp.outcome === 'product_category')
+              || null;
+    if (top) {
+      return [{
+        ...baseSeed,
+        productId: String(top.catalogProductId),
+        matchTier: top.outcome === 'product_match' ? 'product_match' : 'product_category'
+      }];
+    }
+    return [{
+      ...baseSeed,
+      productId: null,
+      matchTier: 'brand_only'
+    }];
+  }
 
   // Case 1 — at least one refined product is a product_match.
   // matchedProducts captures BOTH product_match AND product_category
