@@ -26,6 +26,7 @@ const aiLayoutRoutes = require('./routes/aiLayouts');
 const catalogRoutes = require('./routes/catalog');
 const campaignRoutes = require('./routes/campaigns');
 const adsRoutes = require('./routes/ads');
+const seedsRoutes = require('./routes/seeds');
 const requireAuth = require('./middleware/requireAuth');
 
 const app = express();
@@ -140,6 +141,7 @@ app.use('/api/ai-layouts/spec', requireAuth, require('./routes/aiCanvasSpec'));
 app.use('/api/catalog', requireAuth, catalogRoutes);
 app.use('/api/campaigns', requireAuth, campaignRoutes);
 app.use('/api/ads',       requireAuth, adsRoutes);
+app.use('/api/seeds',     requireAuth, seedsRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
   try {
