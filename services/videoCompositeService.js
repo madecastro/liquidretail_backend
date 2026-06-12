@@ -112,31 +112,23 @@ function buildVideoCompositeUrl({
     effH = sH;
   }
 
-  // 2. For full-canvas slots (the typical video-overlay case), the
-  //    composite stays at effW × effH — no padding, no upscale
-  //    attempts. For partial slots, c_lpad pads to canvas dims and
-  //    positions the video at the slot's coordinates; the slot's
-  //    rect must be expressed in the working coord space (scale slot
-  //    to match the working size since the video can't upscale to
-  //    canvas dims).
-  const slotIsCanvas = slotX === 0 && slotY === 0 && slotW === cw && slotH === ch;
-  let workW = effW;
-  let workH = effH;
-  if (!slotIsCanvas) {
-    // Scale slot coords from canvas dims into the working dim space
-    // proportionally — preserves the same slot positioning ratio.
-    const sx = Math.round(slotX * (effW / cw));
-    const sy = Math.round(slotY * (effH / ch));
-    const sw = Math.max(1, Math.round(slotW * (effW / cw)));
-    const sh = Math.max(1, Math.round(slotH * (effH / ch)));
-    // c_lpad pads the cropped video into a canvas-sized rectangle (in
-    // the working dim space) with the video positioned at the scaled
-    // slot coordinates.
-    transforms.push(`c_lpad,w_${effW},h_${effH},g_north_west,x_${sx},y_${sy},b_black`);
-    workW = effW;
-    workH = effH;
-    void sw; void sh;  // slot dims used implicitly via the input crop size
-  }
+  // 2. Pad/position the cropped video into the working canvas. ALWAYS
+  //    emit c_lpad — even when the slot covers the entire canvas and
+  //    the pad would be dimensionally a no-op — because Cloudinary's
+  //    video pipeline requires a sizing/padding transform between
+  //    c_crop and fl_layer_apply for the overlay to actually apply.
+  //    Without it, the chain (c_crop → l_<overlay> → fl_layer_apply)
+  //    silently no-ops the overlay during video playback while the
+  //    image pipeline (so_0 → JPEG) still handles it correctly. Net
+  //    user-visible bug: poster shows overlay, video playback doesn't.
+  //    Slot coords are scaled from canvas-dim space into the working
+  //    dim space so the same positioning ratio applies regardless of
+  //    the working resolution.
+  const sx = Math.round(slotX * (effW / cw));
+  const sy = Math.round(slotY * (effH / ch));
+  transforms.push(`c_lpad,w_${effW},h_${effH},g_north_west,x_${sx},y_${sy},b_black`);
+  const workW = effW;
+  const workH = effH;
 
   // 3. Apply the overlay PNG, scaled to match the working composite
   //    dimensions. Cloudinary syntax for overlays is two slash-
