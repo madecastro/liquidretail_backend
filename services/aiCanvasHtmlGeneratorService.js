@@ -32,7 +32,7 @@ const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
 const N_CANDIDATES_DEFAULT = 2;        // HTML output is ~3-5× longer than JSON spec — start conservative
 const MAX_TOKENS          = 6000;
-const HTML_SCHEMA_VERSION = '1.4.0';   // 1.4: video-overlay mode — when source media is video AND canvas has a media zone, LLM emits transparent body + transparent media slot at the JSON Generator's rect so Cloudinary can composite over the source video. 1.3: AVAILABLE IMAGE URLS allowlist. 1.2: validator host allowlist. 1.1: archetype I.
+const HTML_SCHEMA_VERSION = '1.5.0';   // 1.5: video-overlay slot detection broadened — find ANY kind:'media' zone with a rect (preferring slot:'product.hero_media', falling back to largest media-kind rect) instead of strict slot match. Adds explicit "no <img src=hero_media.*> anywhere" prompt rule — editorial/magazine archetypes were baking the first frame into the chrome and covering the playing video. 1.4: video-overlay mode initial. 1.3: AVAILABLE IMAGE URLS allowlist. 1.2: validator host allowlist. 1.1: archetype I.
 
 function enabled() {
   return String(process.env.AI_HTML_LAYOUT_ENABLED || '').toLowerCase() === 'true';
@@ -113,21 +113,35 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
     console.warn(`   ⚠️  html-gen rich-context build failed: ${err.message}`);
   }
 
-  // Video-overlay mode — when source Media is video AND the canvas
-  // spec has a media zone slotting product.hero_media, the LLM should
-  // emit body{background:transparent} + leave the media rect
+  // Video-overlay mode — when source Media is video AND the canvas spec
+  // has ANY kind:'media' zone with a rect, the LLM emits
+  // body{background:transparent} + leaves the chosen media rect
   // transparent so the Puppeteer omitBackground screenshot yields a
-  // transparent PNG that Cloudinary composites over the source video.
-  // Fallback when no media zone exists (e.g. typographic-dominant
-  // archetype that skipped support_media): videoMode=false, render
-  // as a static image — composeVideoOutput will return null and the
-  // pipeline ships the static PNG as the ad.
+  // transparent PNG Cloudinary composites over the source video.
+  //
+  // Slot picking: prefer slot:'product.hero_media' (the canonical
+  // single-video-slot contract JSON Gen targets). Fall back to the
+  // largest media-kind rect when the spec used a non-canonical slot —
+  // alt-crop (product.hero_media.crops.*), product.lifestyle_image,
+  // etc., which editorial / magazine archetypes historically picked.
+  // Without this fallback the strict slot filter missed those specs,
+  // videoMode came back false, the LLM got no transparency instructions,
+  // and the source frame got baked into the chrome as <img>, covering
+  // the playing video behind a frozen first frame.
+  //
+  // No media zone at all → videoMode=false, render as static PNG —
+  // composeVideoOutput will return null and the pipeline ships the
+  // static PNG as the ad.
   const Media = require('../models/Media');
   const sourceMedia = await Media.findById(canvas.mediaId).select('fileType').lean();
   const isVideoSource = sourceMedia?.fileType === 'video';
-  const mediaZone = (canvas.canvasSpec?.zones || []).find(z =>
-    z.kind === 'media' && z.slot === 'product.hero_media' && z.rect
+  const mediaZones = (canvas.canvasSpec?.zones || []).filter(z =>
+    z.kind === 'media' && z.rect
   );
+  const heroSlotted = mediaZones.find(z => z.slot === 'product.hero_media');
+  const largestMedia = mediaZones.slice()
+    .sort((a, b) => (b.rect.w * b.rect.h) - (a.rect.w * a.rect.h))[0] || null;
+  const mediaZone = heroSlotted || largestMedia;
   const videoMode = isVideoSource && !!mediaZone;
   const mediaRect = videoMode ? mediaZone.rect : null;
 
@@ -396,6 +410,7 @@ function buildPrompt({ canvas, concept, input, richContext, dims, videoMode = fa
     userLines.push(`  2. The media zone MUST be a transparent rectangle at EXACTLY x:${mediaRect.x}, y:${mediaRect.y}, width:${mediaRect.w}, height:${mediaRect.h}. Emit it as <div data-media-slot="true" style="position:absolute;left:${mediaRect.x}px;top:${mediaRect.y}px;width:${mediaRect.w}px;height:${mediaRect.h}px;background:transparent"></div>. NO <img> inside this rect. NO background-color, NO background-image. The Cloudinary composite layers the video underneath, so this rect MUST stay see-through.`);
     userLines.push(`  3. Every OTHER zone (panel, headline, CTA, logo, badges, eyebrows) renders normally with opaque backgrounds and visible content as you'd author for a static ad. Those zones land ON TOP of the video.`);
     userLines.push(`  4. Position the OTHER zones so they don't accidentally overlap the transparent slot's rect — the operator wants the video clearly visible in that area.`);
+    userLines.push(`  5. CRITICAL — DO NOT emit any <img> tag whose src is product.hero_media.image, any product.hero_media.crops.<ratio> URL, or otherwise points at the source video's frames. ANYWHERE on the canvas. The video plays UNDERNEATH the transparent slot during playback — embedding the source frame as <img> anywhere freezes that frame and covers the live playback. If your archetype calls for a "hero photo panel" / "full-bleed hero" composition, the TRANSPARENT SLOT itself IS that hero panel (the video fills it during playback, the first frame fills it on the poster). Build chrome (panels, text, CTA, logo) AROUND the slot rect — never reference product.hero_media URLs inside an <img src>. Other product imagery (product.product_image, product.lifestyle_image, brand.logo) IS allowed as <img> in non-slot zones.`);
     userLines.push(``);
   }
 
