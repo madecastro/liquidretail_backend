@@ -65,16 +65,39 @@ function buildPolishPrompt(rect) {
 // in post guarantees the composite has somewhere for the video to
 // show through. SVG mask: opaque everywhere except the rect, then
 // dest-in keeps polished pixels only where the mask is opaque.
+// Defense-in-depth — enforce transparency at the slot rect via sharp.
+// dest-out keeps the destination where the source is TRANSPARENT and
+// clears it where the source is OPAQUE. So compositing an opaque slot-
+// shaped buffer at the slot's coordinates punches a transparent hole
+// in the polished overlay at exactly those pixels — independent of
+// what Nano Banana actually painted there.
+//
+// The previous implementation tried to use an SVG mask with dest-in
+// (white = keep, black = clear) but in SVG both fill colors have
+// alpha=1, so the mask was fully opaque and dest-in was effectively a
+// no-op — the polish "punch" never punched. With dest-out + an opaque
+// rect at slot coords the semantics are explicit and correct.
 async function punchTransparentSlot(pngBuffer, rect, width, height) {
-  const mask = Buffer.from(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">` +
-    `<rect width="${width}" height="${height}" fill="white"/>` +
-    `<rect x="${rect.x}" y="${rect.y}" width="${rect.w}" height="${rect.h}" fill="black"/>` +
-    `</svg>`
-  );
+  // Clamp the slot to the canvas bounds — Nano Banana sometimes returns
+  // an image slightly different from the input dims, in which case an
+  // out-of-bounds composite would throw.
+  const x = Math.max(0, Math.min(width  - 1, Math.round(rect.x || 0)));
+  const y = Math.max(0, Math.min(height - 1, Math.round(rect.y || 0)));
+  const w = Math.max(1, Math.min(width  - x, Math.round(rect.w)));
+  const h = Math.max(1, Math.min(height - y, Math.round(rect.h)));
+
+  const slotMask = await sharp({
+    create: {
+      width:  w,
+      height: h,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 1 }
+    }
+  }).png().toBuffer();
+
   return await sharp(pngBuffer)
     .ensureAlpha()
-    .composite([{ input: mask, blend: 'dest-in' }])
+    .composite([{ input: slotMask, left: x, top: y, blend: 'dest-out' }])
     .png()
     .toBuffer();
 }
