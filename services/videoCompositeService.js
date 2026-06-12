@@ -86,6 +86,18 @@ function buildVideoCompositeUrl({
 
   const transforms = [];
 
+  // Cloudinary's video pipeline empirically refuses to upscale video
+  // beyond its source resolution — c_fill, c_scale, c_lpad all silently
+  // cap at the input's native dimensions. Working around this by
+  // anchoring the composite to the smart-cropped video's working size
+  // (effW × effH) instead of the canvas's design dimensions, and
+  // scaling the overlay DOWN to match. The browser handles display
+  // scaling — some pixel sharpness lost vs a true canvas-sized
+  // composite, but the composition itself renders correctly with the
+  // video filling the working area.
+  let effW = cw;
+  let effH = ch;
+
   // 1. Crop source video to smart-crop bbox if provided. Skipped when
   //    no bbox — the video plays from its native frame.
   if (smartCropBbox && smartCropBbox.x2 > smartCropBbox.x1 && smartCropBbox.y2 > smartCropBbox.y1) {
@@ -94,36 +106,41 @@ function buildVideoCompositeUrl({
     const sX = Math.max(0, Math.round(smartCropBbox.x1));
     const sY = Math.max(0, Math.round(smartCropBbox.y1));
     transforms.push(`c_crop,w_${sW},h_${sH},x_${sX},y_${sY}`);
+    // After c_crop the video is sW × sH; this is the upper bound for
+    // composite resolution since Cloudinary won't upscale from here.
+    effW = sW;
+    effH = sH;
   }
 
-  // 2. Get to slot dimensions. We do this in TWO transforms:
-  //    a) c_fill,g_auto resolves any aspect-ratio mismatch between the
-  //       smart-cropped clip and the slot (handles the case where the
-  //       chosen crop ratio isn't a perfect match for the slot ratio).
-  //    b) c_scale forces an explicit resize to the slot's exact pixel
-  //       dimensions. Cloudinary's video pipeline empirically refuses
-  //       to upscale via c_fill alone — a 640×640 source clip with
-  //       c_fill,w_1000,h_1000 stays at 640×640, which when followed
-  //       by c_lpad pin-corners the video in the upper-left of the
-  //       canvas. c_scale has no such restriction and always upscales
-  //       to the target dims.
-  transforms.push(`c_fill,w_${slotW},h_${slotH},g_auto`);
-  transforms.push(`c_scale,w_${slotW},h_${slotH}`);
-
-  // 3. Letterbox-pad to full canvas dims, positioning the slotted clip
-  //    at the slot's top-left corner. b_black is hidden by the overlay,
-  //    so it's only visible in transparent areas (which shouldn't happen
-  //    once the overlay lands). SKIPPED when slot covers the entire
-  //    canvas — c_lpad is a no-op in that case but adds latency and
-  //    re-introduces the upscale issue if Cloudinary ever re-evaluates
-  //    its handling of zero-padding transforms.
+  // 2. For full-canvas slots (the typical video-overlay case), the
+  //    composite stays at effW × effH — no padding, no upscale
+  //    attempts. For partial slots, c_lpad pads to canvas dims and
+  //    positions the video at the slot's coordinates; the slot's
+  //    rect must be expressed in the working coord space (scale slot
+  //    to match the working size since the video can't upscale to
+  //    canvas dims).
   const slotIsCanvas = slotX === 0 && slotY === 0 && slotW === cw && slotH === ch;
+  let workW = effW;
+  let workH = effH;
   if (!slotIsCanvas) {
-    transforms.push(`c_lpad,w_${cw},h_${ch},g_north_west,x_${slotX},y_${slotY},b_black`);
+    // Scale slot coords from canvas dims into the working dim space
+    // proportionally — preserves the same slot positioning ratio.
+    const sx = Math.round(slotX * (effW / cw));
+    const sy = Math.round(slotY * (effH / ch));
+    const sw = Math.max(1, Math.round(slotW * (effW / cw)));
+    const sh = Math.max(1, Math.round(slotH * (effH / ch)));
+    // c_lpad pads the cropped video into a canvas-sized rectangle (in
+    // the working dim space) with the video positioned at the scaled
+    // slot coordinates.
+    transforms.push(`c_lpad,w_${effW},h_${effH},g_north_west,x_${sx},y_${sy},b_black`);
+    workW = effW;
+    workH = effH;
+    void sw; void sh;  // slot dims used implicitly via the input crop size
   }
 
-  // 4. Apply the canvas-sized overlay PNG. Cloudinary syntax for
-  //    overlays is two slash-separated groups:
+  // 3. Apply the overlay PNG, scaled to match the working composite
+  //    dimensions. Cloudinary syntax for overlays is two slash-
+  //    separated groups:
   //      Group A: l_<id>,<overlay's own transforms>   → sizes the overlay
   //      Group B: fl_layer_apply,<positioning>         → composites it
   //    Putting fl_layer_apply in the SAME comma-group as the overlay's
@@ -136,7 +153,7 @@ function buildVideoCompositeUrl({
   const overlayLayerArg = overlayPublicId
     ? buildLayerArg(overlayPublicId)
     : `l_fetch:${base64UrlEncode(overlayImageUrl)}`;
-  transforms.push(`${overlayLayerArg},w_${cw},h_${ch}`);
+  transforms.push(`${overlayLayerArg},w_${workW},h_${workH}`);
   transforms.push(`fl_layer_apply,g_north_west,x_0,y_0`);
 
   // Splice the transform chain into the source URL right after /video/upload/.
