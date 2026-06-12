@@ -980,7 +980,14 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
       aiCanvasArtifactId: renderOutput.aiCanvasArtifactId || null,
       kind:               isVideo ? 'video' : (renderOutput.kind || 'image'),
       renderUrl:          isVideo ? videoComposite.compositeUrl : upload.renderUrl,
-      posterUrl:          isVideo ? upload.renderUrl : upload.posterUrl,
+      // For video ads the static poster is the COMPOSITE at frame 0
+      // (so_0 transform on the video URL → JPEG of the first frame).
+      // That shows the operator the video-with-overlay state they'll
+      // see when paused, instead of the static overlay PNG which has
+      // a black rectangle where the transparent slot is. Falls back
+      // to the raw overlay if the composite URL doesn't match the
+      // /video/upload/ pattern (would be unexpected for an AI ad).
+      posterUrl:          isVideo ? buildPosterFromComposite(videoComposite.compositeUrl) : upload.posterUrl,
       cloudinaryPublicId: upload.cloudinaryPublicId,
       width:              upload.width,
       height:             upload.height,
@@ -1201,6 +1208,19 @@ function success(jobId, ad) {
       identityDigest:        ad.identityDigest
     }
   };
+}
+
+// Turn a Cloudinary video composite URL into a JPEG of frame 0 — the
+// static poster the <video poster=...> attribute renders before play.
+// Inserts so_0 into the transform chain and swaps the extension. If
+// the URL isn't a video composite (no /video/upload/), returns it
+// unchanged — caller falls back via `|| upload.posterUrl` etc.
+function buildPosterFromComposite(compositeUrl) {
+  if (!compositeUrl || typeof compositeUrl !== 'string') return null;
+  if (!compositeUrl.includes('/video/upload/')) return compositeUrl;
+  return compositeUrl
+    .replace('/video/upload/', '/video/upload/so_0/')
+    .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2');
 }
 
 module.exports = { renderCreative, composeVideoOutput };
