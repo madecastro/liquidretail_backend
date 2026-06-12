@@ -956,6 +956,7 @@ function projectAd(ad, full = false, extras = {}) {
     readinessScore:     ad.readinessScore,
     campaignKind:       ad.campaignKind,
     kind:               ad.kind,
+    sourceFileType:     ad.sourceFileType || null,
     renderUrl:          ad.renderUrl,
     // Phase B — gpt-image-1 polished version (AiFullRenderArtifact.imageUrl)
     // joined by the Ad's cache key. Frontend displays this instead of

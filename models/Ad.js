@@ -122,6 +122,14 @@ const adSchema = new mongoose.Schema({
 
   // ── Render output (all null until render lands) ──────────────────
   kind:               { type: String, enum: ['image', 'video'], default: 'image' },
+  // Stamped at render time from sourceMedia.fileType. Distinct from
+  // kind: kind reflects what SHIPPED ('image' even on a static-on-video
+  // fallback), sourceFileType reflects what the seed Media WAS. Used
+  // by the UI to suppress POLISHING badges for video-source ads that
+  // fell back to static — image-ref correctly skips video sources, so
+  // photorealUrl never lands and the badge would otherwise stay on
+  // forever.
+  sourceFileType:     { type: String, enum: ['image', 'video', null], default: null },
   renderUrl:          { type: String, default: null },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.

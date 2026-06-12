@@ -236,7 +236,8 @@ async function renderCreative(req) {
       layoutInputArtifactId,
       renderOutput,
       upload,
-      videoComposite
+      videoComposite,
+      sourceFileType: sourceMedia?.fileType || null
     });
     stages.persist = Date.now() - t;
     console.log(`   💾 ${tag} persist ok in ${stages.persist}ms (Ad ${ad._id})`);
@@ -959,7 +960,7 @@ async function uploadStage(renderOutput, ctx) {
   };
 }
 
-async function persistStage({ req, input, layoutInputArtifactId, renderOutput, upload, videoComposite }) {
+async function persistStage({ req, input, layoutInputArtifactId, renderOutput, upload, videoComposite, sourceFileType = null }) {
   const copy = extractCopySnapshot(input);
   const isVideo = !!videoComposite;
   // Update the existing queued Ad doc (status='rendering' was stamped
@@ -978,6 +979,7 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
       // in the Ads list endpoint instead of reconstructing the cartesian
       // cache key from fields the Ad doesn't carry.
       aiCanvasArtifactId: renderOutput.aiCanvasArtifactId || null,
+      sourceFileType:     sourceFileType,
       kind:               isVideo ? 'video' : (renderOutput.kind || 'image'),
       renderUrl:          isVideo ? videoComposite.compositeUrl : upload.renderUrl,
       // For video ads the static poster is the COMPOSITE at frame 0

@@ -40,7 +40,7 @@ const { trackLlmCall, recordCacheHit } = require('./costTracker');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const MODEL_ID = 'gpt-4.1';
-const SPEC_SCHEMA_VERSION = '2.8.0';   // 2.8: archetype I (UGC × PRODUCT SPLIT) added — opens multi-media-zone composition for ads where both lifestyle_image and product_image exist. 2.7: enriched Generator signal payload. 2.6: real spatial analysis per crop ratio.
+const SPEC_SCHEMA_VERSION = '2.9.0';   // 2.9: video-source media zone REQUIRED rule — typographic-dominant archetypes can no longer skip the media zone when source_media.file_type is video, preventing static-on-video fallback for brand campaigns that picked video sources. 2.8: archetype I added. 2.7: enriched signal payload.
 
 // Creative style menu. Each entry is a short guidance block injected
 // into the prompt. Add styles here as they come online.
@@ -556,6 +556,7 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
     `If you want a tinted/scrim effect across the whole photo, use canvas.background.style: "gradient" or "solid" with your picked panel_bg (which the renderer applies as a background fill, NOT as an overlay zone). Or set visual_direction.glass_level on the panel for translucency.`,
     ``,
     `CRITICAL: if hierarchy_spec.strategy.social_proof_type is anything OTHER than "none" / "absent" / empty, your zones[] MUST include at least one zone that actually surfaces that proof. Concrete: testimonial → kind='quote' or 'quote_card' with slot in social_proof.* (primary_quote / featured_review); creator → kind='comment' or 'creator_card' with slot in social_proof.top_comments.* or creator/handle; stat → kind='stat' with slot in performance.* or social_proof.rating.*; rating → kind='rating' with slot in social_proof.rating.*; review → kind='quote_card' with slot in social_proof.featured_review.*. A concept declaring social_proof_type: "testimonial" without a quote-bearing zone is broken — the renderer will surface a hierarchy_consistency warning and the LLM Judge will down-rank it. Conversely, if you have no proof data to bind to, set strategy.social_proof_type="none" and skip the proof zone entirely. Do NOT fake it with a generic CTA chip or eyebrow.`,
+    `CRITICAL — VIDEO SOURCE MEDIA: when source_media.file_type === "video" (check the FULL CONTEXT), you MUST include at least one kind:'media' zone with slot:'product.hero_media' (or another media slot) and a non-trivial rect — minimum 30% of canvas area. The renderer composites the source video through this zone's rect; without a media zone the video is INVISIBLE and the ad ships as a static image, which is the wrong outcome for an operator who deliberately selected a video source. Even for typographic-dominant, magazine/editorial, or stat-led archetypes that would normally skip support_media, when the source is video you MUST allocate at least an inset / band / corner panel for the media zone. Adjust the typographic emphasis around it; do NOT omit the media zone. Static-source media (image) is unconstrained by this rule.`,
     ``,
     `Return creative_style + rationale + elements_used + elements_skipped. In rationale, name the chosen archetype (A–H) + why the FULL CONTEXT pointed to it.`,
     ``,
