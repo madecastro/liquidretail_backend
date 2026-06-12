@@ -1143,7 +1143,17 @@ async function composeVideoOutput({
   const cropDoc = media.latestArtifacts?.crops
     ? await CropArtifact.findById(media.latestArtifacts.crops).lean()
     : null;
-  const slotRatio = _pickClosestBaseRatio(slotZone.rect);
+  // Pick the smart-crop ratio that matches the CANVAS aspect, not the
+  // slot rect's aspect. Cloudinary's video composite output dimensions
+  // equal the smart-crop bbox dims (it won't upscale), and the
+  // <video> element displays the resulting MP4 in a canvas-aspect
+  // container. Slot-aspect smart crops produce off-aspect MP4s that
+  // get pillarboxed / letterboxed in the player. Canvas-aspect crops
+  // produce MP4s that fill the player without bars; the slot rect's
+  // role becomes purely positioning the chrome in the overlay PNG
+  // (the chrome's transparent region matches where the slot lands on
+  // canvas, so the visible video portion still aligns with the slot).
+  const slotRatio = _pickClosestBaseRatio({ w: canvasDims.w, h: canvasDims.h });
   const winnerId = cropDoc?.winners?.[slotRatio] || null;
   const list = cropDoc?.smartCrops?.[slotRatio] || [];
   const winner = list.find(c => c.id === winnerId) || list[0] || null;
