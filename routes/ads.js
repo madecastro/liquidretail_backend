@@ -42,11 +42,15 @@ const AD_STATUSES = ['draft', 'live', 'archived'];
 const RENDER_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || '2', 10);
 
 // Hard cap on creatives per generation. Cartesian expansion
-// (products × templates × supported ratios) blows up fast. 6 fits
-// comfortably inside Chromium's warm-render window AND aligns with
-// the wizard's 2 templates × 3 shipping ratios = 6 baseline output
-// for a single seed.
-const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '6', 10);
+// (products × templates × supported ratios) blows up fast. Bumped
+// from 6 to 20 after the wizard simplification — the operator no
+// longer picks 1-2 templates, so the default fanout grew (all 5
+// ai_* templates × 4 concepts), and a 6-cap meant only a slice of
+// the seed × template × concept matrix ever rendered per run.
+// 20 still fits inside Chromium's warm-render window at concurrency
+// 2 in roughly 10-15 minutes — adjust POLL_TIMEOUT_MS in the Ads
+// page if you push this further.
+const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '20', 10);
 
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +
