@@ -37,7 +37,7 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '2.1.0';   // 2.1: N_CONCEPTS bump 2 → 4 (2.0: full data projection)
+const DIRECTOR_SIGNALS_VERSION = '2.2.0';   // 2.2: ugc_signal.file_type_distribution added — when matched media includes video, Director steers away from archetype I (ugc_x_product_split — requires two media zones, but the video composite flow only fits one). 2.1: N_CONCEPTS bump 2 → 4. 2.0: full data projection.
 
 // Canonical archetype enum (the 8 we've been using, with descriptive
 // names matching the contract). Director picks from these; Generator
@@ -262,6 +262,14 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   // promotional. Drives ugc_priority + emotional_hook + archetype.
   const shotTypeDist     = distribution(ugcMedias.map(m => m.classification?.shotType).filter(Boolean));
   const contentNatureDist = distribution(ugcMedias.map(m => m.classification?.contentNature).filter(Boolean));
+  // Distribution of source file types across matched media. When any
+  // entry is 'video', the render pipeline composites the source as a
+  // full-bleed transparent slot with chrome as overlay-only (see the
+  // CRITICAL VIDEO SOURCE MEDIA rule in aiCanvasSpecService.js). The
+  // Director uses this signal to avoid archetype I (ugc_x_product_split)
+  // for video-bearing contexts — that archetype needs two media zones
+  // and the video flow only fits one.
+  const fileTypeDist = distribution(ugcMedias.map(m => m.fileType).filter(Boolean));
   const adReadinessScores = ugcMedias
     .map(m => m.adSuitability?.score)
     .filter(s => typeof s === 'number');
@@ -287,6 +295,7 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     rights_approved: rightsApproved,
     shot_type_distribution:     shotTypeDist,        // { lifestyle: 4, product_only: 1, ... }
     content_nature_distribution: contentNatureDist,  // { evergreen: 3, promotional: 1, ... }
+    file_type_distribution:      fileTypeDist,       // { video: 3, image: 1 } — drives video-aware archetype constraint
     avg_ad_readiness: avgAdReadiness,                 // 0–1 mean across matched
     primary_subjects: subjectLabels,                  // ["jar of chili oil", "bowl of noodles", ...]
     top_creator:     topCreator                      // { handle, followers, platform } | null
@@ -409,6 +418,7 @@ function buildPrompt({ inputSummary, creativeIntent }) {
     `  product_signal.description / review_summary / price → aspirational vs accessible vs functional positioning`,
     `  ugc_signal.shot_type_distribution → if mostly lifestyle/on_model → ugc-led / hero_quote_overlay; if product_only → typographic_dominant / vertical_split`,
     `  ugc_signal.content_nature_distribution → if mostly evergreen → safe to surface; if mostly promotional → archetype should sidestep the dated feel`,
+    `  ugc_signal.file_type_distribution → when video > 0, the matched media includes a video clip. The render pipeline composites video as a FULL-BLEED transparent slot with chrome as OVERLAY-ONLY (panels, text, CTAs, badges, social proof live on top of the playing video — they NEVER cover the full canvas). AVOID archetype ugc_x_product_split when video is present (it requires two media zones, but the video flow only fits one). All other archetypes work; pick the chrome composition that reads cleanly over a playing video — full_bleed_hero_bottom_panel for a clean bottom band, hero_quote_overlay for a floating quote card, stat_led_social_proof for a centered stat callout, magazine_editorial for a stacked corner inset, diagonal_carve for an angled chrome shape, etc.`,
     `  ugc_signal.primary_subjects → what the photos ACTUALLY show — drives emotional_hook word choice`,
     `  ugc_signal.top_creator → if a creator with significant followers anchors the matched set, pick a creator-led archetype (hero_quote_overlay) and set comment_priority=high`,
     `  ugc_signal.avg_ad_readiness → high (>0.7) = photo-led works; low (<0.4) = lean typographic or brand-color-led to avoid weak imagery`,

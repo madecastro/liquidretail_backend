@@ -32,7 +32,7 @@ const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
 const N_CANDIDATES_DEFAULT = 2;        // HTML output is ~3-5× longer than JSON spec — start conservative
 const MAX_TOKENS          = 6000;
-const HTML_SCHEMA_VERSION = '1.7.0';   // 1.7: video-overlay archetype-variety nudge — rule #6 (no clip-path on text-children) was pushing the LLM into archetype A (full-bleed + bottom panel) on every video render across templates. Adds rule #7 with concrete B/C/D/E/F/G recipes that work with the transparent slot constraint, scoped to videoMode only. 1.6: clip-path safety rule. 1.5: slot detection broadened + no-hero_media-<img> rule. 1.4: video-overlay mode initial.
+const HTML_SCHEMA_VERSION = '1.8.0';   // 1.8: video-overlay full-canvas safety net — when videoMode is on, mediaRect is FORCED to the full canvas (0, 0, canvasW, canvasH) regardless of what the JSON spec returned. Catches LLM disobedience to the SPEC v2.11.0 full-bleed mandate so the transparent slot always stretches edge-to-edge and the video never gets pillarboxed, letterboxed, or partially covered. 1.7: archetype-variety nudge (rule #7). 1.6: clip-path safety rule (#6). 1.5: slot detection broadened. 1.4: video-overlay initial.
 
 function enabled() {
   return String(process.env.AI_HTML_LAYOUT_ENABLED || '').toLowerCase() === 'true';
@@ -115,23 +115,26 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
 
   // Video-overlay mode — when source Media is video AND the canvas spec
   // has ANY kind:'media' zone with a rect, the LLM emits
-  // body{background:transparent} + leaves the chosen media rect
-  // transparent so the Puppeteer omitBackground screenshot yields a
-  // transparent PNG Cloudinary composites over the source video.
+  // body{background:transparent} + leaves the media rect transparent so
+  // the Puppeteer omitBackground screenshot yields a transparent PNG
+  // Cloudinary composites over the source video.
   //
-  // Slot picking: prefer slot:'product.hero_media' (the canonical
-  // single-video-slot contract JSON Gen targets). Fall back to the
-  // largest media-kind rect when the spec used a non-canonical slot —
-  // alt-crop (product.hero_media.crops.*), product.lifestyle_image,
-  // etc., which editorial / magazine archetypes historically picked.
-  // Without this fallback the strict slot filter missed those specs,
-  // videoMode came back false, the LLM got no transparency instructions,
-  // and the source frame got baked into the chrome as <img>, covering
-  // the playing video behind a frozen first frame.
+  // SPEC v2.11.0 mandates media zone rect = full canvas + no clipPolygon
+  // for video sources (the full-bleed + overlay-only topology). The
+  // detector below still tolerates a non-canonical media zone (slot mis-
+  // match or smaller rect) for backwards-compat with caches generated
+  // pre-2.11.0, but the mediaRect handed to the prompt is FORCED to the
+  // full canvas whenever videoMode is on — this is the safety net that
+  // guarantees the transparent slot stretches edge-to-edge and the video
+  // never gets pillarboxed, letterboxed, or covered, regardless of what
+  // the JSON spec actually returned.
   //
-  // No media zone at all → videoMode=false, render as static PNG —
-  // composeVideoOutput will return null and the pipeline ships the
-  // static PNG as the ad.
+  // No media zone at all on a video source → videoMode=false, render
+  // as static PNG. composeVideoOutput returns null and the pipeline
+  // ships the static PNG as the ad. (Shouldn't happen post-2.11.0 since
+  // the JSON Gen mandates exactly one media zone — but the fallback
+  // keeps the pipeline robust to any miss.)
+  const dims = canvasDims(canvas.aspectRatio);
   const Media = require('../models/Media');
   const sourceMedia = await Media.findById(canvas.mediaId).select('fileType').lean();
   const isVideoSource = sourceMedia?.fileType === 'video';
@@ -143,9 +146,15 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false }) {
     .sort((a, b) => (b.rect.w * b.rect.h) - (a.rect.w * a.rect.h))[0] || null;
   const mediaZone = heroSlotted || largestMedia;
   const videoMode = isVideoSource && !!mediaZone;
-  const mediaRect = videoMode ? mediaZone.rect : null;
+  // Safety net — force the mediaRect to the full canvas for video sources.
+  // The SPEC v2.11.0 prompt mandates this, but if the LLM emits a smaller
+  // / clipPathed / inset media zone anyway, this guarantees the rendered
+  // overlay PNG has its transparent region at exactly (0, 0, canvasW,
+  // canvasH) so the composite chain stretches the video edge-to-edge.
+  const mediaRect = videoMode
+    ? { x: 0, y: 0, w: dims.width, h: dims.height }
+    : null;
 
-  const dims = canvasDims(canvas.aspectRatio);
   const { system, user, images } = buildPrompt({
     canvas, concept, input, richContext, dims, videoMode, mediaRect
   });
