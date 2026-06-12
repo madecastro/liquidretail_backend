@@ -96,17 +96,31 @@ function buildVideoCompositeUrl({
     transforms.push(`c_crop,w_${sW},h_${sH},x_${sX},y_${sY}`);
   }
 
-  // 2. Scale to slot dimensions so the next pad-to-canvas step places
-  //    the clip at exactly the slot's size. c_fill keeps subject-aware
-  //    fit when slot ratio ≠ source ratio (still-sane fallback when
-  //    smart-crop bbox is missing).
+  // 2. Get to slot dimensions. We do this in TWO transforms:
+  //    a) c_fill,g_auto resolves any aspect-ratio mismatch between the
+  //       smart-cropped clip and the slot (handles the case where the
+  //       chosen crop ratio isn't a perfect match for the slot ratio).
+  //    b) c_scale forces an explicit resize to the slot's exact pixel
+  //       dimensions. Cloudinary's video pipeline empirically refuses
+  //       to upscale via c_fill alone — a 640×640 source clip with
+  //       c_fill,w_1000,h_1000 stays at 640×640, which when followed
+  //       by c_lpad pin-corners the video in the upper-left of the
+  //       canvas. c_scale has no such restriction and always upscales
+  //       to the target dims.
   transforms.push(`c_fill,w_${slotW},h_${slotH},g_auto`);
+  transforms.push(`c_scale,w_${slotW},h_${slotH}`);
 
   // 3. Letterbox-pad to full canvas dims, positioning the slotted clip
   //    at the slot's top-left corner. b_black is hidden by the overlay,
   //    so it's only visible in transparent areas (which shouldn't happen
-  //    once the overlay lands).
-  transforms.push(`c_lpad,w_${cw},h_${ch},g_north_west,x_${slotX},y_${slotY},b_black`);
+  //    once the overlay lands). SKIPPED when slot covers the entire
+  //    canvas — c_lpad is a no-op in that case but adds latency and
+  //    re-introduces the upscale issue if Cloudinary ever re-evaluates
+  //    its handling of zero-padding transforms.
+  const slotIsCanvas = slotX === 0 && slotY === 0 && slotW === cw && slotH === ch;
+  if (!slotIsCanvas) {
+    transforms.push(`c_lpad,w_${cw},h_${ch},g_north_west,x_${slotX},y_${slotY},b_black`);
+  }
 
   // 4. Apply the canvas-sized overlay PNG. Cloudinary syntax for
   //    overlays is two slash-separated groups:
