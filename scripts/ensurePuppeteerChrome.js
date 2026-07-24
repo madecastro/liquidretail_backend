@@ -47,34 +47,45 @@ try {
   console.warn(`[ensurePuppeteerChrome] mkdir failed: ${err.message} — proceeding anyway`);
 }
 
-// Pre-clean any HALF-INSTALLED chrome/<build>/ directories. Puppeteer's
-// install treats a pre-existing build directory as "already installed"
-// and skips the download — but if the previous install died mid-extract,
-// the folder is there but the actual chrome executable inside is not,
-// producing:
+// Pre-clean any HALF-INSTALLED chrome/<build>/ directories AND any
+// cached .zip archives. Puppeteer's install treats a pre-existing
+// build directory (or cached .zip) as "already fetched" and skips the
+// re-download — but if the previous run died mid-extract or the .zip
+// is corrupt, the folder is there but the actual chrome executable
+// inside is not, producing:
 //   Error: All providers failed for chrome X.Y.Z:
 //     The browser folder (.../chrome/linux-X.Y.Z) exists but the
 //     executable (.../chrome/linux-X.Y.Z/chrome-linux64/chrome) is missing
-// Deleting the skeleton up-front forces a clean re-download.
+// Nuking both the skeleton dir + the cached .zip forces a full fresh
+// re-download every deploy. Cost: one extra ~150MB download per deploy.
+// Worth it — the alternative is silently broken image ads.
 const chromeDirEarly = path.join(CACHE_DIR, 'chrome');
 if (fs.existsSync(chromeDirEarly)) {
   try {
-    const stale = fs.readdirSync(chromeDirEarly, { withFileTypes: true })
+    const entries = fs.readdirSync(chromeDirEarly, { withFileTypes: true });
+    // Skeleton dirs (chrome executable missing) → delete
+    const skeletons = entries
       .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
       .filter((e) => {
-        // A build is "complete" if the chrome-linux64/chrome executable
-        // (Linux) or chrome-mac/Google Chrome for Testing.app (mac) or
-        // chrome-win64/chrome.exe (win) exists. Missing → skeleton.
         const buildPath = path.join(chromeDirEarly, e.name);
         return !fs.existsSync(path.join(buildPath, 'chrome-linux64', 'chrome'))
             && !fs.existsSync(path.join(buildPath, 'chrome-win64', 'chrome.exe'))
             && !fs.existsSync(path.join(buildPath, 'chrome-mac-x64', 'Google Chrome for Testing.app'))
             && !fs.existsSync(path.join(buildPath, 'chrome-mac-arm64', 'Google Chrome for Testing.app'));
       });
-    for (const s of stale) {
+    // Cached .zip archives (any potentially-corrupt archive) → delete.
+    // Puppeteer would otherwise re-extract the same broken archive on
+    // every deploy and keep producing skeletons.
+    const zips = entries.filter((e) => !e.isDirectory() && e.name.endsWith('.zip'));
+    for (const s of skeletons) {
       const p = path.join(chromeDirEarly, s.name);
       console.log(`[ensurePuppeteerChrome] removing stale skeleton: ${p}`);
       fs.rmSync(p, { recursive: true, force: true });
+    }
+    for (const z of zips) {
+      const p = path.join(chromeDirEarly, z.name);
+      console.log(`[ensurePuppeteerChrome] removing cached archive (forces fresh download): ${p}`);
+      fs.rmSync(p, { force: true });
     }
   } catch (err) {
     console.warn(`[ensurePuppeteerChrome] pre-clean failed: ${err.message} — proceeding anyway`);
