@@ -291,6 +291,7 @@ async function expandWizardJob({
   // primary seed). Grouped by metadata.catalogProductId inside
   // expandDeterministicVideo; order is preserved end-to-end.
   seedMediaIds = [],
+  seedPicks = null,
   // Run-level video prompt overrides (stamped on every video Ad).
   // Guidance merges via resolvePromptGuidance → operatorPrompt prepend;
   // raw fully replaces the canonical prompt at render time.
@@ -439,6 +440,7 @@ async function expandWizardJob({
       detResult = await expandDeterministicVideo({
         campaignId, brandId, campaignKind, productIds,
         seedMediaIds,
+        seedPicks,
         ctaText, ctaUrl, ctaUrlParams,
         platformFormat: effectivePlatformFormat,
         videoDurationSec,
@@ -1545,6 +1547,7 @@ function mergeExpansionResults(a, b) {
 async function expandDeterministicVideo({
   campaignId, brandId, campaignKind, productIds,
   seedMediaIds = [],
+  seedPicks = null,
   ctaText, ctaUrl, ctaUrlParams,
   platformFormat,
   videoDurationSec,
@@ -1620,7 +1623,13 @@ async function expandDeterministicVideo({
   // metadata.catalogProductId, and posts matched during detect carry
   // matchedProducts[].catalogProductId. resolveSeedProductId below uses both.
   const productIdSet = new Set(productIds.map(String));
-  const seedOids = (seedMediaIds || []).map(toObjectId).filter(Boolean);
+  // Load whichever source is authoritative. A client sending ONLY seedPicks
+  // would otherwise load nothing here and have every pick dropped as "not
+  // found" — the same silent-drop failure this whole change exists to remove.
+  const seedIdSource = Array.isArray(seedPicks) && seedPicks.length
+    ? seedPicks.map(p => p?.mediaId)
+    : (seedMediaIds || []);
+  const seedOids = [...new Set(seedIdSource.map(String))].map(toObjectId).filter(Boolean);
   // brandId scoping is explicit now. The dropped source:'catalog-product' filter
   // was never a security control, but it did incidentally narrow what an
   // arbitrary seedMediaId could load. Since these ids come straight off the
@@ -1638,22 +1647,41 @@ async function expandDeterministicVideo({
     : [];
   const seedById = new Map(seedDocs.map(d => [String(d._id), d]));
 
+  // EXPLICIT (productId, mediaId) pairs are authoritative when present. They
+  // remove the guesswork entirely: no matchedProducts ranking, so the product a
+  // seed belongs to cannot flip when detect rewrites its scores, and the same
+  // media can legitimately seed TWO products' videos — neither of which a flat
+  // mediaId list can express. `seedMediaIds` remains the fallback for links and
+  // clients minted before seedPicks existed.
   /** @type {Map<string, mongoose.Types.ObjectId[]>} */
   const picksByProduct = new Map();
-  for (const rawId of (seedMediaIds || [])) {
-    const idStr = String(rawId);
+  const explicitPairs = Array.isArray(seedPicks) && seedPicks.length
+    ? seedPicks
+    : null;
+  const walk = explicitPairs
+    ? explicitPairs.map(p => ({ idStr: String(p.mediaId), assigned: String(p.productId) }))
+    : (seedMediaIds || []).map(id => ({ idStr: String(id), assigned: null }));
+
+  for (const { idStr, assigned } of walk) {
     const doc = seedById.get(idStr);
     if (!doc) {
       console.warn(
-        `📦 expandDeterministicVideo: seedMediaId=${idStr} not found or not catalog-product — dropped`
+        `📦 expandDeterministicVideo: seedMediaId=${idStr} not found for this brand — dropped`
       );
       continue;
     }
-    const cpid = resolveSeedProductId(doc, productIdSet);
+    // Explicit assignment still has to name a product IN THIS RUN — the pair
+    // comes off the request body, so it is operator intent, not authorisation.
+    const cpid = assigned
+      ? (productIdSet.has(assigned) ? assigned : null)
+      : resolveSeedProductId(doc, productIdSet);
     if (!cpid) {
       console.warn(
-        `📦 expandDeterministicVideo: seedMediaId=${idStr} (source=${doc.source}) has no ` +
-        `product association inside this run's productIds — dropped`
+        assigned
+          ? `📦 expandDeterministicVideo: seedPick mediaId=${idStr} names productId=${assigned} ` +
+            `which is not in this run's productIds — dropped`
+          : `📦 expandDeterministicVideo: seedMediaId=${idStr} (source=${doc.source}) has no ` +
+            `product association inside this run's productIds — dropped`
       );
       continue;
     }

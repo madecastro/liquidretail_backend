@@ -45,6 +45,14 @@ function parsePhase3WizardFields(body = {}) {
   const {
     directorVariants = false,
     seedMediaIds = [],
+    // Ordered (productId, mediaId) pairs. Supersedes seedMediaIds when present.
+    // Exists because a flat mediaId list cannot express which product a related/
+    // social post is seeding, nor the same post seeding TWO products — the
+    // backend had to guess from matchedProducts, and that guess could flip if
+    // detect rewrote its scores, changing the ad's identityDigest.
+    // seedMediaIds is retained so links and clients minted before this keep
+    // working (expandDeterministicVideo still resolves those by association).
+    seedPicks = null,
     videoPromptGuidance = null,
     videoPromptRaw = null
   } = body;
@@ -70,10 +78,39 @@ function parsePhase3WizardFields(body = {}) {
     }
   }
 
+  let parsedSeedPicks = null;
+  if (seedPicks != null) {
+    if (!Array.isArray(seedPicks)) {
+      return { ok: false, status: 400, error: 'seedPicks must be an array of { productId, mediaId }' };
+    }
+    parsedSeedPicks = [];
+    const seenPairs = new Set();
+    for (const p of seedPicks) {
+      if (!p || typeof p !== 'object') {
+        return { ok: false, status: 400, error: 'seedPicks entry must be an object with productId and mediaId' };
+      }
+      if (!mongoose.isValidObjectId(p.productId)) {
+        return { ok: false, status: 400, error: `seedPicks productId is not a valid ObjectId: ${p.productId}` };
+      }
+      if (!mongoose.isValidObjectId(p.mediaId)) {
+        return { ok: false, status: 400, error: `seedPicks mediaId is not a valid ObjectId: ${p.mediaId}` };
+      }
+      // Same media may legitimately appear under DIFFERENT products (one
+      // flat-lay seeding two SKUs' videos), so dedupe on the PAIR, not on
+      // mediaId. A repeated identical pair is an operator double-click, not
+      // an instruction to send the image twice.
+      const key = `${String(p.productId)}|${String(p.mediaId)}`;
+      if (seenPairs.has(key)) continue;
+      seenPairs.add(key);
+      parsedSeedPicks.push({ productId: String(p.productId), mediaId: String(p.mediaId) });
+    }
+  }
+
   return {
     ok: true,
     fields: {
       directorVariants: !!directorVariants,
+      seedPicks: parsedSeedPicks,
       seedMediaIds: Array.isArray(seedMediaIds) ? seedMediaIds : [],
       videoPromptGuidance: (typeof videoPromptGuidance === 'string' && videoPromptGuidance.trim())
         ? videoPromptGuidance
@@ -159,6 +196,7 @@ router.post('/preview', async (req, res) => {
       videoDurationSec,
       directorVariants: phase3.fields.directorVariants,
       seedMediaIds: phase3.fields.seedMediaIds,
+      seedPicks: phase3.fields.seedPicks,
       videoPromptGuidance: phase3.fields.videoPromptGuidance,
       videoPromptRaw: phase3.fields.videoPromptRaw,
       requestedBy: req.user?.userId || null,
@@ -308,6 +346,7 @@ router.post('/generate', async (req, res) => {
           videoDurationSec: parsedVideoDurationSec,
           directorVariants: phase3.fields.directorVariants,
           seedMediaIds: phase3.fields.seedMediaIds,
+          seedPicks: phase3.fields.seedPicks,
           videoPromptGuidance: phase3.fields.videoPromptGuidance,
           videoPromptRaw: phase3.fields.videoPromptRaw,
           requestedBy: req.user?.userId || null
