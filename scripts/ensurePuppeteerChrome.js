@@ -29,8 +29,9 @@ const path       = require('path');
 const fs         = require('fs');
 const { execSync, spawnSync } = require('child_process');
 
-// Same resolution .puppeteerrc.cjs performs.
-const CACHE_DIR = path.join(__dirname, '..', '.cache', 'puppeteer');
+// Same resolution .puppeteerrc.cjs performs. Kept in sync manually —
+// if the .puppeteerrc moves, update this too.
+const CACHE_DIR = path.join(__dirname, '..', 'node_modules', '.puppeteer-cache');
 
 console.log(`[ensurePuppeteerChrome] target cache dir: ${CACHE_DIR}`);
 

@@ -1,17 +1,26 @@
-// Pin Puppeteer's browser cache to a project-relative path.
+// Pin Puppeteer's browser cache inside node_modules/ so Chrome ships
+// with the build artifact.
 //
-// Render's free tier wipes ~/.cache between build and runtime
-// (which is where puppeteer defaults — /opt/render/.cache/puppeteer),
-// but anything inside the project tree persists. Pointing
-// cacheDirectory at server/.cache/puppeteer means the Chromium that
-// `puppeteer browsers install chrome` downloads during the
-// postinstall hook is still there when puppeteer.launch() looks for
-// it at runtime.
+// Prior version pointed at `<project>/.cache/puppeteer`. That works
+// on machines where the entire project tree is transported build →
+// runtime intact, but Render (native runtime, not Docker) has been
+// observed to lose `.cache/` between the build container and the
+// serve container — puppeteer.launch() then errors:
 //
-// Both the install CLI and the runtime launcher honour this file.
+//   Could not find Chrome (ver. X.Y.Z). This can occur if either
+//   1. you did not perform an installation before running the script …
+//   2. your cache path is incorrectly configured (which is: /opt/render/
+//      project/src/.cache/puppeteer).
+//
+// node_modules/ ALWAYS ships with the deploy artifact — it's what
+// makes the Node app runnable on the serve container. Pointing the
+// puppeteer cache into that tree guarantees Chrome travels with it.
+//
+// Both the install CLI (scripts/ensurePuppeteerChrome.js) and the
+// runtime launcher honour this file.
 
 const { join } = require('path');
 
 module.exports = {
-  cacheDirectory: join(__dirname, '.cache', 'puppeteer')
+  cacheDirectory: join(__dirname, 'node_modules', '.puppeteer-cache')
 };

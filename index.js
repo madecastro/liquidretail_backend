@@ -344,5 +344,31 @@ require('./services/progressService')
   .sweepStaleRuns()
   .catch(err => console.warn(`🧹 progress sweep failed at boot: ${err.message}`));
 
+// Puppeteer Chrome availability probe — logs the resolved cache dir
+// and whether a Chrome build survived from build → runtime. Turns a
+// silent "image ads all fail at render" regression into a visible
+// startup warning. See scripts/ensurePuppeteerChrome.js + .puppeteerrc.cjs.
+(() => {
+  try {
+    const fs   = require('fs');
+    const path = require('path');
+    const cfg  = require('./.puppeteerrc.cjs');
+    const cacheDir  = cfg.cacheDirectory;
+    const chromeDir = path.join(cacheDir, 'chrome');
+    if (!fs.existsSync(chromeDir)) {
+      console.warn(`🕵️  puppeteer: no Chrome dir at ${chromeDir} — image ads will fail at render. Check the postinstall log.`);
+      return;
+    }
+    const builds = fs.readdirSync(chromeDir).filter((n) => !n.startsWith('.'));
+    if (builds.length === 0) {
+      console.warn(`🕵️  puppeteer: ${chromeDir} exists but is empty — image ads will fail.`);
+      return;
+    }
+    console.log(`🕵️  puppeteer: Chrome found at ${chromeDir} — builds: ${builds.join(', ')}`);
+  } catch (err) {
+    console.warn(`🕵️  puppeteer probe failed: ${err.message}`);
+  }
+})();
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
