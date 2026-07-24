@@ -1856,7 +1856,7 @@ const REGISTERED_FONTS_LIST =
   'Montserrat, Great Vibes, DM Sans, Bebas Neue, Anton, Oswald, IBM Plex Sans, ' +
   'Poppins, Nunito, Quicksand';
 
-async function runGenerateFullScript(jobId, brand, direction, format, baseScript) {
+async function runGenerateFullScript(jobId, brand, direction, format, baseScript, history = []) {
   try {
     const fs   = require('fs');
     const path = require('path');
@@ -1934,8 +1934,27 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
       '',
       'OUTPUT LENGTH BUDGET: Target 200-350 lines total. Skip verbose comment blocks — one short line max per function is enough. Do NOT restate the interface spec in comments. Skip defensive fallbacks for meta fields that already have safe defaults in the sample. Prefer inline expressions over separate helper functions where a helper is only called once. The reference below is intentionally long for coverage; your output should be TIGHTER.',
       '',
-      'OUTPUT: return ONLY the raw JavaScript module. No markdown fences, no commentary, no leading prose. The first characters should be `//` (a comment) or `module.exports` or `const`.'
+      'SUMMARY HEADER: begin your response with exactly one comment line in this shape (≤160 chars, one plain English sentence describing what you changed vs the current script):',
+      '  // SUMMARY: <one sentence>',
+      'That line is parsed off the response and shown to the operator as your chat reply. The rest of the file is the module.',
+      '',
+      'OUTPUT: return ONLY the raw JavaScript module beginning with the SUMMARY comment. No markdown fences, no commentary outside the file. The second character onwards should form a valid JavaScript module.'
     ].join('\n');
+
+    // Compact prior chat turns into a CONVERSATION HISTORY block prefixed
+    // to the user message. Same shape as the title-spec chat: role +
+    // content, capped at the last 10 turns for token budget. Empty when
+    // history is [] — the block is filtered out by filter(Boolean) below.
+    const historyBlock = (Array.isArray(history) && history.length > 0)
+      ? [
+          'CONVERSATION HISTORY (oldest first, most recent last):',
+          ...history.slice(-10).map((t) => {
+            const role = t?.role === 'user' ? 'Operator' : 'You';
+            const content = String(t?.content || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+            return content ? `- ${role}: ${content}` : null;
+          }).filter(Boolean),
+        ].join('\n')
+      : '';
 
     const brandContextLines = [
       `Brand name: ${brand.name}`,
@@ -1997,7 +2016,8 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
 
     // Two user-prompt shapes: fresh generate (start from shipped
     // canonical as reference) vs tweak (start from operator's current
-    // script and apply the directive).
+    // script and apply the directive). Both interleave chat history
+    // (optional) so multi-turn requests build on each other.
     let user;
     if (baseScript && String(baseScript).trim()) {
       user = [
@@ -2006,9 +2026,10 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
         '',
         brandContextLines,
         '',
+        historyBlock,
         direction
-          ? `OPERATOR DIRECTION: ${direction}`
-          : 'OPERATOR DIRECTION: (none — polish typography and composition without shifting the overall design)',
+          ? `OPERATOR REQUEST: ${direction}`
+          : 'OPERATOR REQUEST: (none — polish typography and composition without shifting the overall design)',
         '',
         '── Sample meta blob that will be passed to renderFrame at runtime:',
         '```json',
@@ -2020,17 +2041,18 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
         String(baseScript),
         '```',
         '',
-        'Output the FULL revised JS module. Raw JS only — no fences, no commentary.'
-      ].join('\n');
+        'Output: begin with the SUMMARY comment header, then the FULL revised JS module. Raw JS only — no fences.'
+      ].filter(Boolean).join('\n');
     } else {
       user = [
         `Write a ${format} (${dims.aspect}) canvas overlay script tailored to this brand:`,
         '',
         brandContextLines,
         '',
+        historyBlock,
         direction
-          ? `OPERATOR DIRECTION: ${direction}`
-          : 'OPERATOR DIRECTION: (none — pick a strong editorial composition that fits the brand)',
+          ? `OPERATOR REQUEST: ${direction}`
+          : 'OPERATOR REQUEST: (none — pick a strong editorial composition that fits the brand)',
         '',
         '── Sample meta blob that will be passed to renderFrame at runtime:',
         '```json',
@@ -2043,8 +2065,8 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
         canonicalSource,
         '```',
         '',
-        `Now write the ${brand.name} ${format} script. Raw JS only.`
-      ].join('\n');
+        `Now write the ${brand.name} ${format} script. Begin with the SUMMARY comment header, then raw JS.`
+      ].filter(Boolean).join('\n');
     }
 
     // Output budget — sized for compact scripts (200-350 lines, per
@@ -2076,6 +2098,15 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
       .replace(/\n?```\s*$/i, '')
       .trim();
 
+    // Extract the SUMMARY header (first line, `// SUMMARY: <text>`)
+    // as the chat-panel reply. The comment stays in the script — it's
+    // harmless and documents the change for future readers. Falls back
+    // to null when the LLM skipped the header; the chat UI shows a
+    // generic "Applied your requested changes" in that case.
+    let summary = null;
+    const summaryMatch = cleaned.match(/^\/\/\s*SUMMARY:\s*(.+?)\s*$/im);
+    if (summaryMatch) summary = summaryMatch[1].slice(0, 400);
+
     // Structural validation. Cheap — catches most malformed responses
     // before the operator hits Preview.
     if (!/module\.exports\s*=/.test(cleaned)) {
@@ -2102,6 +2133,7 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
       ...job,
       status:       'done',
       script:       cleaned,
+      summary,                    // one-sentence chat-panel reply (null if the LLM skipped the header)
       format,
       model:        result.model,
       usage:        result.usage,
@@ -2109,7 +2141,7 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
       completedAt:  Date.now()
     });
     reapJob(jobId);
-    console.log(`🧠 generate-script[full]: job=${jobId} DONE in ${Date.now() - (job.startedAt || Date.now())}ms format=${format} chars=${cleaned.length}`);
+    console.log(`🧠 generate-script[full]: job=${jobId} DONE in ${Date.now() - (job.startedAt || Date.now())}ms format=${format} chars=${cleaned.length} summary="${(summary || '').slice(0, 60)}"`);
   } catch (err) {
     console.error(`🧠 generate-script[full]: job=${jobId} FAILED — ${err.message}`);
     const job = scriptJobs.get(jobId) || {};
@@ -2144,10 +2176,19 @@ router.post('/:id/generate-script', express.json(), async (req, res) => {
     const rawFormat   = String(req.body?.format || '').toLowerCase();
     const format      = ['feed', 'vertical', 'landscape'].includes(rawFormat) ? rawFormat : 'feed';
     const baseScript  = req.body?.baseScript ? String(req.body.baseScript) : null;
+    // Optional chat history for multi-turn script authoring. Same shape
+    // as the title-spec chat path: sanitized to { role: 'user'|'assistant',
+    // content: string }[], capped and role-filtered before the runner
+    // sees it.
+    const rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
+    const history = rawHistory
+      .filter((t) => t && typeof t === 'object' && (t.role === 'user' || t.role === 'assistant'))
+      .map((t) => ({ role: t.role, content: String(t.content || '').slice(0, 1000) }))
+      .filter((t) => t.content);
 
     const crypto = require('crypto');
     const jobId = crypto.randomBytes(6).toString('hex');
-    console.log(`🧠 generate-script: brand="${brand.name}" mode=${mode}${mode === 'script' ? ` format=${format}${baseScript ? ' (tweak)' : ' (fresh)'}` : ''} directionChars=${direction.length} job=${jobId}`);
+    console.log(`🧠 generate-script: brand="${brand.name}" mode=${mode}${mode === 'script' ? ` format=${format}${baseScript ? ' (tweak)' : ' (fresh)'} history=${history.length}` : ''} directionChars=${direction.length} job=${jobId}`);
 
     scriptJobs.set(jobId, {
       status:      'pending',
@@ -2158,7 +2199,7 @@ router.post('/:id/generate-script', express.json(), async (req, res) => {
     // Fire-and-forget. The runner flips the job to done/failed when
     // Atlas returns; errors are logged and never crash the process.
     if (mode === 'script') {
-      runGenerateFullScript(jobId, brand, direction, format, baseScript);
+      runGenerateFullScript(jobId, brand, direction, format, baseScript, history);
     } else {
       runGenerateScript(jobId, brand, direction);
     }
@@ -2195,6 +2236,7 @@ router.get('/:id/generate-script/:jobId', async (req, res) => {
       format:       job.format,      // set for mode='script' only
       theme:        job.theme,       // set for mode='theme'
       script:       job.script,      // set for mode='script'
+      summary:      job.summary,     // chat-panel reply for mode='script' (parsed from // SUMMARY: header)
       error:        job.error,
       model:        job.model,
       usage:        job.usage,
