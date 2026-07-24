@@ -115,9 +115,32 @@ const REFRAME_BORDER_STD_MAX = () => {
   const n = Number(process.env.REFRAME_BORDER_STD_MAX);
   return Number.isFinite(n) && n > 0 ? n : 8;
 };
-// Ladder id persisted on Media.metadata.reframes[*] so we can distinguish
-// assets produced by this uncrop process from older outpaint-only entries.
-const REFRAME_LADDER_VERSION = 'uncrop-v1';
+// Ladder id persisted on Media.metadata.reframes[*]. BUMP THIS whenever the
+// ladder changes in a way that should invalidate previously-derived assets.
+//   uncrop-v1 → the first port (1k + uncrop prompt, no product-only routing)
+//   reframe-v2 → current: 4k + conservative 'reframe' prompt, product-only $0
+//                pad routing, output ratio validation, solid-preferred pad
+const REFRAME_LADDER_VERSION = 'reframe-v2';
+// Re-derive cached assets produced by an OLDER ladder on the next video
+// generation, rather than serving them forever. A product whose videos were
+// made under the old resize regime picks up the new one without any manual
+// invalidation. Cost is bounded and mostly zero: stale 'exact' and 'pad-*'
+// entries re-derive for $0, and product-only shots that used to outpaint now
+// route to the free pad — only genuinely busy imagery re-spends. Set false to
+// freeze existing assets in place.
+const REFRAME_REDERIVE_STALE = () =>
+  String(process.env.REFRAME_REDERIVE_STALE ?? 'true').toLowerCase() !== 'false';
+
+// A cache entry is servable only when its url is usable AND it came from the
+// CURRENT ladder. Returns { url, stale } so callers can both re-derive a stale
+// asset and keep it as a last resort — a previously-good reframe beats a
+// destructive crop if the re-derive fails.
+function readReframeEntry(entry) {
+  const url = entry?.url;
+  if (typeof url !== 'string' || !url.trim()) return { url: null, stale: false };
+  const stale = REFRAME_REDERIVE_STALE() && entry?.ladderVersion !== REFRAME_LADDER_VERSION;
+  return { url: url.trim(), stale };
+}
 // Cross-process reframe claim lease. Web service and worker are separate Node
 // processes, so the in-process Map + fresh DB re-read alone cannot stop both
 // from POSTing generateImage for the same (media, aspect). Lease must outlive a
@@ -1060,7 +1083,11 @@ async function tryClaimReframe(mediaId, aspectKey, claimBy) {
     const doc = await Media.findOneAndUpdate(
       {
         _id: mediaId,
-        // No finished result yet (url-only is the cache signal).
+        // Claimable when there is no finished result YET, or when the result
+        // that exists came from an older ladder and is due for re-derivation.
+        // Without the ladderVersion clause a stale asset could never be
+        // reclaimed — its url is present, so the emptiness test alone would
+        // reject every claim and the re-derive would silently never happen.
         $and: [
           {
             $or: [
@@ -1070,7 +1097,10 @@ async function tryClaimReframe(mediaId, aspectKey, claimBy) {
               // Whitespace-only must count as empty too: the cache reads .trim(),
               // so without this a corrupt "   " url is neither a cache hit nor
               // claimable and the aspect is stuck on crops forever.
-              { [`${path}.url`]: { $not: /\S/ } }
+              { [`${path}.url`]: { $not: /\S/ } },
+              ...(REFRAME_REDERIVE_STALE()
+                ? [{ [`${path}.ladderVersion`]: { $ne: REFRAME_LADDER_VERSION } }]
+                : [])
             ]
           },
           // No live claim, or the prior holder is past the lease TTL.
@@ -1101,23 +1131,34 @@ async function tryClaimReframe(mediaId, aspectKey, claimBy) {
   }
 }
 
-// Drop OUR claim-only entry so a later render can retry. No-op when a url has
-// already been written (persist supersedes) or when another holder reclaimed.
+// Release OUR claim so a later render can retry. Two shapes, and picking the
+// wrong one destroys data:
+//   • claim-only entry (no url) → unset the whole path, restoring "never derived"
+//   • stale entry we were re-deriving (url present) → unset ONLY `.claim`, or we
+//     would delete a perfectly good older asset and leave the aspect with nothing
+// Both are scoped to claim.by === ours so we never disturb another holder, and
+// neither can clobber a freshly persisted result (persist replaces the whole
+// entry, which drops `.claim` and makes claim.by stop matching).
 async function releaseReframeClaim(mediaId, aspectKey, claimBy) {
   const path = reframeClaimPath(aspectKey);
+  const emptyUrl = [
+    { [`${path}.url`]: { $exists: false } },
+    { [`${path}.url`]: null },
+    { [`${path}.url`]: '' },
+    { [`${path}.url`]: { $not: /\S/ } }
+  ];
   try {
-    await Media.updateOne(
-      {
-        _id: mediaId,
-        [`${path}.claim.by`]: claimBy,
-        $or: [
-          { [`${path}.url`]: { $exists: false } },
-          { [`${path}.url`]: null },
-          { [`${path}.url`]: '' },
-          { [`${path}.url`]: { $not: /\S/ } }
-        ]
-      },
+    // Claim-only → drop the entry entirely.
+    const res = await Media.updateOne(
+      { _id: mediaId, [`${path}.claim.by`]: claimBy, $or: emptyUrl },
       { $unset: { [path]: 1 } }
+    );
+    if (res?.modifiedCount) return;
+    // Otherwise a url is present (the stale asset we tried to replace) — keep
+    // the asset, drop just our lock.
+    await Media.updateOne(
+      { _id: mediaId, [`${path}.claim.by`]: claimBy },
+      { $unset: { [`${path}.claim`]: 1 } }
     );
   } catch (err) {
     console.warn(`⚠️  reframe claim release failed — ${err.message}`);
@@ -1127,6 +1168,9 @@ async function releaseReframeClaim(mediaId, aspectKey, claimBy) {
 // Loser wait: a couple of short re-reads for the winner's url. Generation can
 // take minutes, so this usually returns null and the caller crops — never
 // spends. Next render hits the persistent cache once the winner persists.
+// Deliberately accepts a STALE url too: during a re-derive the older asset is
+// still a real, correctly-shaped image, so serving it to a concurrent render
+// beats a destructive crop and costs nothing.
 async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
   for (let i = 0; i < attempts; i++) {
     await new Promise(r => setTimeout(r, 1000 * (i + 1)));
@@ -1144,7 +1188,13 @@ async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
 // crop so the ad pipeline keeps moving. Successful reframes (incl. exact / pad)
 // are persisted on Media.metadata.reframes[aspectKey] for reuse.
 async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand }) {
-  const fallback = () => cropImageUrlForAspect(sourceUrl, aspectRatio, brand);
+  const cropUrl = () => cropImageUrlForAspect(sourceUrl, aspectRatio, brand);
+  // Set when we find a cached asset from an OLDER ladder. We re-derive it, but
+  // it stays the last resort: an old reframe is a real, correctly-shaped image,
+  // so serving it beats falling back to a destructive c_fill crop if the
+  // re-derive fails.
+  let staleUrl = null;
+  const fallback = () => staleUrl || cropUrl();
   try {
     // 1. Kill-switch / Atlas unconfigured / missing source → crop only.
     if (!REFRAME_ENABLED() || !enabled() || !sourceUrl) return fallback();
@@ -1157,8 +1207,19 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
     // 3. PERSISTENT CACHE HIT — no spend, no submit (survives restarts).
     //    Only `.url` counts: a claim-only entry ({ claim: { at, by } }) is NOT
     //    a hit and must fall through so the loser can wait / crop.
-    const cached = media?.metadata?.reframes?.[aspectKey]?.url;
-    if (typeof cached === 'string' && cached.trim()) return cached;
+    //    A CURRENT-ladder entry is served as-is. An entry from an older ladder
+    //    is deliberately NOT served: the next video generation re-derives it
+    //    under the new resize regime (see REFRAME_REDERIVE_STALE).
+    const cachedEntry = readReframeEntry(media?.metadata?.reframes?.[aspectKey]);
+    if (cachedEntry.url && !cachedEntry.stale) return cachedEntry.url;
+    if (cachedEntry.stale) {
+      staleUrl = cachedEntry.url;
+      console.log(
+        `   ♻️  reframe[${aspectKey}]: cached asset is from ladder ` +
+        `'${media?.metadata?.reframes?.[aspectKey]?.ladderVersion || 'pre-versioning'}' ` +
+        `— re-deriving under '${REFRAME_LADDER_VERSION}'`
+      );
+    }
 
     // 4. IN-PROCESS SINGLE-FLIGHT — collapse concurrent reframes of the same
     //    media+aspect within this worker so the billable outpaint runs once.
@@ -1187,8 +1248,11 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
       //     Again: `.url` only — never treat a bare claim as a finished reframe.
       try {
         const fresh = await Media.findById(media._id).select(`metadata.reframes.${aspectKey}`).lean();
-        const freshUrl = fresh?.metadata?.reframes?.[aspectKey]?.url;
-        if (typeof freshUrl === 'string' && freshUrl.trim()) return freshUrl;
+        const freshEntry = readReframeEntry(fresh?.metadata?.reframes?.[aspectKey]);
+        // Only a CURRENT-ladder entry short-circuits. A stale one is kept as the
+        // last resort and we continue on to re-derive it.
+        if (freshEntry.url && !freshEntry.stale) return freshEntry.url;
+        if (freshEntry.stale) staleUrl = freshEntry.url;
       } catch { /* fall through and compute */ }
 
       // 5. ALREADY-CORRECT guard — source aspect within threshold of target.
@@ -1197,7 +1261,14 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         const tr = wr / hr;
         const retained = Math.min(sr, tr) / Math.max(sr, tr);
         if (retained >= REFRAME_SKIP_THRESHOLD()) {
-          const exactUrl = fallback();
+          // cropUrl(), NOT fallback(). fallback() may return a STALE asset, and
+          // persisting that here would launder an old generative reframe into a
+          // current-ladder 'exact' entry — stamping it with the new
+          // ladderVersion so it is never re-derived again. On a product-only
+          // shot that would freeze a fabricated garment in place permanently.
+          // At this threshold the source is already ~the target aspect, so the
+          // deterministic crop IS the honest 'exact' result and costs nothing.
+          const exactUrl = cropUrl();
           // Persist exact-fit too so every aspect is on file for reuse.
           await persistReframe(media, aspectKey, aspectRatio, exactUrl, 'exact');
           return exactUrl;
@@ -1292,11 +1363,15 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         try {
           const settled = await Media.findById(media._id)
             .select(`metadata.reframes.${aspectKey}`).lean();
-          const settledUrl = settled?.metadata?.reframes?.[aspectKey]?.url;
-          if (typeof settledUrl === 'string' && settledUrl.trim()) {
+          const settledEntry = readReframeEntry(settled?.metadata?.reframes?.[aspectKey]);
+          // Only a CURRENT-ladder result means "someone else already did the
+          // work". A stale url here is the very asset we hold the claim to
+          // replace — bailing on it would make the re-derive impossible.
+          if (settledEntry.url && !settledEntry.stale) {
             console.log(`   ✅ reframe[${aspectKey}]: another process landed a result — no spend`);
-            return settledUrl;
+            return settledEntry.url;
           }
+          if (settledEntry.stale) staleUrl = settledEntry.url;
         } catch { /* unreadable → proceed; the claim is still ours */ }
 
         // The bytes + URL the model will see. Re-encoded ONLY when the source
@@ -1416,15 +1491,25 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
           return resultUrl;
         }
 
-        // Billed, but nothing usable came out of it (pad build AND upload failed).
-        // Persist the deterministic crop so the next render can't charge us a
-        // second time for this media+aspect. Labelled honestly so a targeted
-        // invalidation can find these later via method + ladderVersion.
-        const cropUrl = fallback();
-        if (billed && cropUrl) {
-          await persistReframe(media, aspectKey, aspectRatio, cropUrl, 'crop-after-bill');
+        // Billed, but nothing usable came out of it (pad build AND upload both
+        // failed). Persist SOMETHING so the next render can't charge us a second
+        // time — but label it for what it actually is, because these two cases
+        // are different assets and a future targeted invalidation needs to tell
+        // them apart via method + ladderVersion.
+        //
+        // Note we must NOT persist fallback() blindly: when re-deriving, it
+        // returns the stale asset, and writing that under the current
+        // ladderVersion would silently abandon the upgrade after a single paid
+        // miss. Keeping the old asset is right (it beats a crop); pretending it
+        // is a fresh derivation is not.
+        const settleUrl = staleUrl || cropUrl();
+        if (billed && settleUrl) {
+          await persistReframe(
+            media, aspectKey, aspectRatio, settleUrl,
+            staleUrl ? 'stale-kept-after-bill' : 'crop-after-bill'
+          );
         }
-        return cropUrl;
+        return settleUrl;
       } finally {
         // CLAIM RELEASE: only when we hold a claim-only entry AND never billed.
         // Unbilled → free the slot so a later render can retry the real outpaint.
