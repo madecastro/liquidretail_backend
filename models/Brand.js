@@ -262,7 +262,13 @@ const brandSchema = new mongoose.Schema({
     // subdoc — a value missing from this schema is silently dropped by
     // strict mode, so keep this field list in sync with
     // salesDemosService.normalizeMethod.
-    method:        { type: String, enum: ['shopify-direct', 'apify', 'generic-sitemap'], default: null },
+    // `null` is explicitly in the enum so brand docs with an unset
+    // method (all non-demo brands + demo brands that haven't picked
+    // yet) pass full-doc validation on save. Without null here, any
+    // PATCH that triggers brand.save() (Title Studio, Content Sources,
+    // Video Model, etc.) errors: "null is not a valid enum value for
+    // path `apifyDemo.method`". The default:null intent stays intact.
+    method:        { type: String, enum: ['shopify-direct', 'apify', 'generic-sitemap', null], default: null },
     // Cooperative cancellation flag. /abort sets true; the ingest
     // service resets it to false at the start of every sync and
     // checks it between records, bailing early when flipped mid-run.
