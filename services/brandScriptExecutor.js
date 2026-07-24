@@ -787,16 +787,27 @@ async function resolveBrandRenderer(brand, ad) {
   return { path: 'canonical', script, canonicalSource: source, format };
 }
 
-// Which title compositor renders this ad. Chain (most specific wins):
-//   custom styleScript for the ad's format → 'canvas' (forced — bespoke
-//   scripts only exist in the canvas sandbox, logged)
-//   → Brand.videoSettings.titlingEngine → TITLING_ENGINE env → 'remotion'
-// Unknown values warn and fall through (same defensive idiom as
-// atlasVideoService.resolveVideoModel).
+// Which title compositor renders this ad. Force-locked to Remotion —
+// the canvas engine is disabled while the Video Script card is hidden
+// on the operator UI. Existing Brand.styleScript* documents remain in
+// the DB (data preserved), just ignored at render time. Same for
+// Brand.videoSettings.titlingEngine='canvas' and TITLING_ENGINE=canvas.
+// To re-enable canvas: remove the short-circuit below, revert the
+// commented block, and unhide the StyleOverridesCard in Brand/index.tsx.
 function resolveTitlingEngine(brand, ad) {
   const format = classifyFormat(ad);
+  // Kill-switch: always Remotion. Log once per render so the choice is
+  // visible in the ad's render log, and callers can see WHY when they
+  // wonder why a custom styleScript isn't taking effect.
   const custom = brand?.[BRAND_SCRIPT_FIELD[format]];
   if (custom && String(custom).trim()) {
+    console.log(`🎨 resolveTitlingEngine[ad=${ad?._id || '?'}]: brand has a custom ${BRAND_SCRIPT_FIELD[format]} but canvas engine is disabled — falling through to remotion`);
+  }
+  return { engine: 'remotion', source: 'canvas-disabled', format };
+
+  /* Original cascade — restore when re-enabling the canvas path:
+  const customScript = brand?.[BRAND_SCRIPT_FIELD[format]];
+  if (customScript && String(customScript).trim()) {
     return { engine: 'canvas', source: 'custom-script', format };
   }
   const links = [
@@ -809,6 +820,7 @@ function resolveTitlingEngine(brand, ad) {
     console.warn(`⚠️  resolveTitlingEngine: unknown engine '${val}' from ${source} — falling through`);
   }
   return { engine: 'remotion', source: 'default', format };
+  */
 }
 
 // Shared tail of both engines: upload the rendered mp4, stamp
