@@ -1568,14 +1568,54 @@ async function expandDeterministicVideo({
     )
   );
 
-  // Load picked Media once; group by catalogProductId PRESERVING pick order.
+  // Which product does this seed pick belong to? Returns a productId string
+  // that is present in `productIdSet`, or null when the media has no usable
+  // association with anything in this run.
+  //
+  // Two sources, in priority order:
+  //   1. metadata.catalogProductId — set on catalog mirrors (hero + alts). This
+  //      is authoritative: the Media exists BECAUSE it is that product's image.
+  //   2. matchedProducts[] — written by detect when a post is matched to a SKU.
+  //      This is what makes a lifestyle/social shot usable as a seed.
+  //
+  // A post can legitimately match several products (a flat-lay with three SKUs),
+  // so when more than one candidate falls inside this run we rank rather than
+  // taking the first: a direct 'product_match' beats a looser
+  // 'product_category', then higher confidence wins. Picking arbitrarily would
+  // attach the seed to a different product on different runs for the same
+  // input, which would also change the ad's identity digest.
+  function resolveSeedProductId(doc, allowed) {
+    const direct = doc?.metadata?.catalogProductId != null
+      ? String(doc.metadata.catalogProductId)
+      : null;
+    if (direct && allowed.has(direct)) return direct;
+
+    const candidates = (Array.isArray(doc?.matchedProducts) ? doc.matchedProducts : [])
+      .filter(m => m?.catalogProductId != null && allowed.has(String(m.catalogProductId)))
+      .map(m => ({
+        id:    String(m.catalogProductId),
+        exact: m.outcome === 'product_match' ? 1 : 0,
+        conf:  Number.isFinite(m.confidence) ? m.confidence : 0
+      }));
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => (b.exact - a.exact) || (b.conf - a.conf) || a.id.localeCompare(b.id));
+    return candidates[0].id;
+  }
+
+  // Load picked Media once; group by product PRESERVING pick order.
+  //
+  // Deliberately NOT restricted to source:'catalog-product' any more. That
+  // filter silently discarded every related-media pick — an operator who chose
+  // a lifestyle/social shot as the seed got no video from it and no explanation.
+  // Related media IS product-associated: catalog mirrors carry
+  // metadata.catalogProductId, and posts matched during detect carry
+  // matchedProducts[].catalogProductId. resolveSeedProductId below uses both.
   const productIdSet = new Set(productIds.map(String));
   const seedOids = (seedMediaIds || []).map(toObjectId).filter(Boolean);
   const seedDocs = seedOids.length
-    ? await Media.find({
-        _id: { $in: seedOids },
-        source: 'catalog-product'
-      }).select('_id metadata fileType').lean()
+    ? await Media.find({ _id: { $in: seedOids } })
+        .select('_id metadata fileType source matchedProducts')
+        .lean()
     : [];
   const seedById = new Map(seedDocs.map(d => [String(d._id), d]));
 
@@ -1590,13 +1630,11 @@ async function expandDeterministicVideo({
       );
       continue;
     }
-    const cpid = doc.metadata?.catalogProductId != null
-      ? String(doc.metadata.catalogProductId)
-      : null;
-    if (!cpid || !productIdSet.has(cpid)) {
+    const cpid = resolveSeedProductId(doc, productIdSet);
+    if (!cpid) {
       console.warn(
-        `📦 expandDeterministicVideo: seedMediaId=${idStr} catalogProductId=${cpid} ` +
-        `not in productIds — dropped`
+        `📦 expandDeterministicVideo: seedMediaId=${idStr} (source=${doc.source}) has no ` +
+        `product association inside this run's productIds — dropped`
       );
       continue;
     }
