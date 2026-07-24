@@ -369,7 +369,23 @@ Category settings sit **between product and brand**, ordered **leaf → root**, 
 
 - When **`Ad.referenceMediaIds` is non-empty:** load Media in **exact pick order** as `orderedReferenceMedia` (position **0 = seed**); skip default seed+catalog assembly.
 - When empty: seed (`ad.mediaId`) first, then catalog-product medias (createdAt asc ≈ hero-first), then product URL fallbacks; count from `resolveReferenceImageCount` (product → brand → env → default **3**), capped by model `maxReferenceImages`.
-- Every ref is still **generatively reframed / outpainted** to the target aspect (`reframeReferenceForAspect` — frontend/backend PR #10 path): cached on `Media.metadata.reframes`, single-flight, kill-switch `REFRAME_ENABLED`; failure degrades to Cloudinary crop.
+- Every ref is still **generatively reframed / outpainted** to the target aspect via `reframeReferenceForAspect` — **video reference images only**, the static-ad image path is untouched: cached on `Media.metadata.reframes`, single-flight + fresh-DB re-read, kill-switch `REFRAME_ENABLED`; failure degrades to Cloudinary crop.
+
+**Reframe ladder** (`reframeReferenceForAspect`, ported from ReachSocialLLMExpander `runSafeZoneReframe`; replaces a prior unmasked-whole-image edit that had no subject-preservation clause and produced visible artifacts — warped logos, mangled label text, drifted product shape). Persisted entries carry `ladderVersion: 'uncrop-v1'`:
+
+1. **Guards** — kill-switch / Atlas unconfigured / no source → crop, no spend. Persistent cache hit on `Media.metadata.reframes[aspectKey]` → return, no spend. In-process single-flight collapses concurrent callers for the same media+aspect (product fan-out shares reference medias across ads). Fresh DB re-read closes the post-settle window where a sibling worker persisted this aspect after the lean doc was loaded.
+2. **Exact-fit skip** — source aspect already within `REFRAME_SKIP_THRESHOLD` of target → Cloudinary crop, persisted as `method: 'exact'`, no spend.
+3. **Normalize source** — download (timeout + byte cap + content-type check) → sharp `.rotate()` (EXIF auto-orient) → `.flatten({ background: '#ffffff' })` (white-flatten so transparent PNGs aren't matted black by the model) → resize to max 2048px wide → JPEG q88 → re-host on Cloudinary. Normalize failure → crop, **no spend** — an un-normalized source is the artifact-prone path this ladder replaces.
+4. **Outpaint** — single billable POST to `REFRAME_OUTPAINT_MODEL` at `REFRAME_RESOLUTION`. Prompt is the verbatim "Expand and uncrop…" spec with an explicit do-not-alter-the-subject clause (the old prompt's missing subject-preservation guard was the artifact root cause).
+5. **Validate output** — byte floor (512B) + aspect ratio within `REFRAME_RATIO_TOLERANCE` of target (ratio only — pixel size is never compared). Rejected → falls through to the pad.
+6. **Pad fallback** — $0 deterministic letterbox (sharp: normalized source scaled to cover + `.blur(24)` as background, same source scaled to fit composited centered on top); nothing cropped or lost. Persisted as `method: 'pad-fallback'`.
+7. **Cleanup** — the normalized-source Cloudinary mirror is deleted once the prediction reaches a terminal state (best-effort, never throws), so a reframe no longer leaks a permanent Cloudinary asset.
+
+A persisted entry's `method` is one of `'exact' | 'outpaint' | 'pad-fallback'`.
+
+**`billed` invariant (money-critical):** flips true the instant `pollPrediction` resolves — Atlas bills on terminal-ok — and is never cleared afterward, so `recordFlatCost` fires on **every** subsequent path, including a rejected output that falls through to the pad. This closes a pre-existing ledger gap where a Cloudinary upload failure after a successful generation skipped the cost record entirely.
+
+**Known tradeoff:** a persisted `pad-fallback` entry is a permanent cache hit — a single transient Atlas failure locks that image+aspect to a letterbox until the entry is invalidated (`ladderVersion` makes targeted invalidation possible).
 
 ### Titling composite
 
@@ -404,7 +420,7 @@ Category settings sit **between product and brand**, ordered **leaf → root**, 
 ### Models & cost
 
 - Atlas image-to-video (default Gemini Omni; Grok / Veo slugs in `MODEL_CAPS`) — rate-limited; **429s if concurrency > 1**.
-- Per-ref generative reframe (nano-banana-2 class edit when enabled) — cached per media+aspect.
+- Per-ref generative reframe (nano-banana-2 class edit when enabled) — 3-tier ladder (exact-fit skip → outpaint → $0 pad fallback); outpaint billed at `REFRAME_COST_USD` per image, cached per media+aspect on first success.
 - LayoutInput derivation (Gemini / existing builder) when artifact missing — non-fatal.
 - GPT storyboard only on non-Atlas paths that still call it.
 
@@ -421,8 +437,13 @@ Category settings sit **between product and brand**, ordered **leaf → root**, 
 | `ATLAS_VIDEO_FORCE_CHROME` | `true` | Force chrome handling on Atlas path |
 | `ATLAS_POLL_INTERVAL_MS` | `15000` (`defaults.env`; code fallback `5000`) | Prediction poll interval |
 | `ATLAS_VIDEO_MODEL` | (empty) | Optional model override in resolve chain |
-| `REFRAME_ENABLED` | `true` | Generative reframe of video reference images |
-| `REFRAME_OUTPAINT_MODEL` / `REFRAME_RESOLUTION` / `REFRAME_SKIP_THRESHOLD` | see `atlasVideoService.js` | Reframe tuning |
+| `REFRAME_ENABLED` | `true` | Master switch for generative reframe of video reference images; `false` → Cloudinary crop only |
+| `REFRAME_OUTPAINT_MODEL` | `google/nano-banana-2/edit` | Atlas image-edit model for outpaint (billable per image, single submit) |
+| `REFRAME_RESOLUTION` | `1k` | Outpaint output resolution (`1k`\|`2k`\|`4k`) |
+| `REFRAME_SKIP_THRESHOLD` | `0.985` | Skip outpaint when source aspect is within this ratio of target (0–1) |
+| `REFRAME_COST_USD` | `0.08` | Per-image outpaint price recorded in the cost ledger (observability only, not a spend gate) |
+| `REFRAME_RATIO_TOLERANCE` | `0.05` | Relative ratio tolerance when validating outpaint output (ratio only, never pixel size) |
+| `REFRAME_MAX_SOURCE_BYTES` | `52428800` (50 MiB) | Max bytes for source / outpaint downloads |
 
 Secret: `ATLAS_API_KEY`.
 

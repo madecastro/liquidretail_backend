@@ -23,13 +23,14 @@
 //   3. result.data.outputs[0] is a remote video URL — mirror to Cloudinary
 
 const axios = require('axios');
+const sharp = require('sharp');
 
 const Media                     = require('../models/Media');
 const Brand                     = require('../models/Brand');
 const Campaign                  = require('../models/Campaign');
 const CatalogProduct            = require('../models/CatalogProduct');
 const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
-const { uploadBufferToCloudinary, uploadUrlToCloudinary } = require('./cloudinaryService');
+const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
 const { recordFlatCost } = require('./costTracker');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
@@ -40,20 +41,52 @@ const { buildLayoutInput }   = require('./layoutInputService');
 // the target aspect so the product stays fully visible; store labeled
 // results on Media.metadata.reframes for reuse (no re-spend). Master
 // switch + model/resolution/skip-threshold are all env-tunable.
+// Ported from ReachSocialLLMExpander runSafeZoneReframe (uncrop-v1 ladder).
 const REFRAME_ENABLED = () => String(process.env.REFRAME_ENABLED ?? 'true').toLowerCase() !== 'false';
+// Model tier: '-developer' is a BILLING variant, not a quality tier. Verified
+// against the live Atlas catalogue (2026-07-24): it carries the same
+// price.origin.base_price ($0.08) as plain /edit and differs only by a 50%
+// discount factor; `profile` text is verbatim identical and the readmes are
+// byte-identical. The same pattern holds across all 12 '-developer' variants,
+// while a genuine quality up-tier (nano-banana-pro/edit-ultra) gets its own
+// higher list price. Distillation is the separate '-lite' axis, which composes
+// independently. So: half price, no evidenced fidelity cost.
 const REFRAME_OUTPAINT_MODEL = () => process.env.REFRAME_OUTPAINT_MODEL || 'google/nano-banana-2/edit-developer';
-const REFRAME_RESOLUTION = () => process.env.REFRAME_RESOLUTION || '4k';
+// 1k is the schema default for both variants (enum 1k|2k|4k). Deliberately NOT
+// 4k: no Atlas model exposes a mask or pixel-passthrough, so the whole canvas
+// is re-synthesised every call — at 4k the decoder must commit to letterforms
+// and logo strokes it can only guess, which is the artifact we were seeing.
+// And the reframed reference is never consumed at 4k anyway: it feeds a 720p
+// video render (~9x area downsample). Raise ATLAS_VIDEO_RESOLUTION, not this,
+// if you want more resolution where viewers actually see it.
+const REFRAME_RESOLUTION = () => process.env.REFRAME_RESOLUTION || '1k';
 const REFRAME_SKIP_THRESHOLD = () => {
   const n = Number(process.env.REFRAME_SKIP_THRESHOLD);
   return Number.isFinite(n) && n > 0 && n <= 1 ? n : 0.985;
 };
-// Per-image outpaint price for the cost ledger (nano-banana-2/edit-developer
-// is $0.04 flat across 1k|2k|4k). Tunable so the ledger stays honest if the
-// model/tier changes — this is observability only, not a spend gate.
+// Per-image outpaint price for the cost ledger. $0.04 = the -developer tier at
+// 1k. NOTE the model readme prices 1k $0.08 / 2k $0.12 / 4k $0.16 and notes
+// "4K resolution costs 2x the standard rate" — whether that multiplier stacks
+// on the discounted base is undocumented, so if you raise REFRAME_RESOLUTION
+// raise this too or the ledger silently under-reports. Observability only.
 const REFRAME_COST_USD = () => {
   const n = Number(process.env.REFRAME_COST_USD);
   return Number.isFinite(n) && n >= 0 ? n : 0.04;
 };
+// Accept outpaint output if its pixel ratio is within this relative
+// tolerance of the target (ratio-only; pixel size is never compared).
+const REFRAME_RATIO_TOLERANCE = () => {
+  const n = Number(process.env.REFRAME_RATIO_TOLERANCE);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : 0.05;
+};
+// Cap source / outpaint downloads so a runaway response can't OOM the worker.
+const REFRAME_MAX_SOURCE_BYTES = () => {
+  const n = Number(process.env.REFRAME_MAX_SOURCE_BYTES);
+  return Number.isFinite(n) && n > 0 ? n : 50 * 1024 * 1024;
+};
+// Ladder id persisted on Media.metadata.reframes[*] so we can distinguish
+// assets produced by this uncrop process from older outpaint-only entries.
+const REFRAME_LADDER_VERSION = 'uncrop-v1';
 
 // Titling is CANONICAL by default. The layoutInput derivation template is
 // fixed to the canonical template ('ai_brand_led') UNLESS a brand or product
@@ -582,26 +615,215 @@ async function submitImageGeneration({ model, images, prompt, aspectRatio, resol
     }
   );
   const id = res.data?.data?.id;
-  if (!id) throw new Error('atlasImage: submit response missing prediction id');
+  if (!id) {
+    // The POST resolved, so Atlas accepted (and may well have charged) this
+    // request — we just can't track it. Mark the error so the caller still
+    // ledgers the spend instead of silently losing it.
+    const err = new Error('atlasImage: submit response missing prediction id');
+    err.charged = true;
+    throw err;
+  }
   return id;
 }
 
-function outpaintPromptForAspect(aspectRatio) {
+// Re-fetch a completed prediction's output. Retrying THIS is safe and free —
+// the generation is already paid for and the URL is idempotent. Only the POST
+// is uncharged-once. Without a retry, one transient network blip after a good
+// paid generation would discard it and cache the $0 pad permanently.
+async function fetchOutpaintOutput(outUrl, attempts = 3) {
+  if (isBlockedFetchHost(outUrl)) throw new Error('outpaint output URL host blocked');
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const dl = await axios.get(outUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+        maxRedirects: 3,
+        maxContentLength: REFRAME_MAX_SOURCE_BYTES(),
+        maxBodyLength: REFRAME_MAX_SOURCE_BYTES()
+      });
+      return Buffer.from(dl.data);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        console.warn(`   ↻ reframe output fetch retry ${i + 1}/${attempts - 1} — ${err.message}`);
+        await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// Verbatim uncrop prompt from ReachSocialLLMExpander media.ts:uncropPrompt.
+// Character-for-character; do not "improve" — that prompt is the artifact-free path.
+function uncropPromptForAspect(aspectRatio) {
   const [wr, hr] = String(aspectRatio).split(':').map(Number);
   const orient = wr > hr ? 'horizontal (landscape)' : wr < hr ? 'vertical (portrait)' : 'square';
-  return `Reframe this image into a ${orient} ${wr}:${hr} composition. Keep the ENTIRE subject and all text fully visible and uncropped. Naturally extend the existing background, colors and scene to fill the new areas — do not add new objects, people or text. Seamless, photorealistic, matching the original style, lighting and palette.`;
+  return (
+    `Expand and uncrop this image into a ${orient} ${wr}:${hr} composition. Naturally EXTEND the scene to ` +
+    `fill the frame — continue the subject (reveal more of the body/product/clothing) and add clean ` +
+    `headroom above plus more of the same plain background and floor. Keep the existing subject unchanged, ` +
+    `sharp, uncropped and centered — do NOT distort, shrink, recolor or alter it, and do NOT change its ` +
+    `pose or orientation. Seamless and photorealistic, matching the original lighting, color and plain ` +
+    `background. Add no text, logos or new objects.`
+  );
+}
+
+// Block server-side fetches of loopback / link-local / RFC1918 hosts. The
+// reference implementation guards this (media.ts isBlockedIngestHost) and we
+// now fetch sourceUrl ourselves, so the same guard applies here. sourceUrl is
+// normally our own Cloudinary mirror, but CatalogProduct image URLs come from
+// tenant feeds/scrapes, so treat them as untrusted. Not airtight against a
+// hostile redirect chain (axios can't validate per-hop) — maxRedirects is
+// clamped below to bound that. A shared, redirect-aware fetch helper for every
+// ingest path in the repo is the proper fix; see docs/PIPELINES.md.
+function isBlockedFetchHost(rawUrl) {
+  let host;
+  try {
+    const u = new URL(rawUrl);
+    if (!/^https?:$/.test(u.protocol)) return true;
+    host = u.hostname.toLowerCase();
+  } catch { return true; }
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.internal')) return true;
+  // IPv6 literals arrive from URL bracket-stripped and lowercased.
+  const v6 = host.replace(/^\[|\]$/g, '');
+  if (v6 === '::1' || v6 === '::') return true;
+  if (/^f[cd][0-9a-f]{2}:/.test(v6)) return true;             // fc00::/7 unique-local
+  if (/^fe[89ab][0-9a-f]:/.test(v6)) return true;             // fe80::/10 link-local
+  // IPv4-mapped IPv6 (::ffff:7f00:1 or ::ffff:127.0.0.1) — recurse on the tail.
+  const mapped = v6.match(/^::ffff:(.+)$/);
+  if (mapped) {
+    const t = mapped[1];
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(t)) return isBlockedFetchHost(`http://${t}`);
+    const hx = t.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hx) {
+      const n = (parseInt(hx[1], 16) << 16) | parseInt(hx[2], 16);
+      const dotted = [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
+      return isBlockedFetchHost(`http://${dotted}`);
+    }
+    return true;
+  }
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  if (a === 127 || a === 0 || a === 10) return true;
+  if (a === 169 && b === 254) return true;              // link-local incl. cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  return false;
+}
+
+// Prepare the source the Atlas edit model will fetch. Never throws; returns
+// { buffer, url, mirrored } or null.
+//
+// Re-encode is CONDITIONAL, and that's deliberate. The only thing we actually
+// need to fix is (a) alpha — a transparent product PNG gets matted by the model
+// (often onto black) and then "extended", a direct artifact source — and (b)
+// EXIF orientation. Everything else is better left alone: a JPEG round-trip
+// costs a lossy generation and, at default settings, 4:2:0 chroma subsampling,
+// which halves colour resolution exactly where coloured logo and label edges
+// live. The reference implementation re-encodes unconditionally and pays that
+// cost on every opaque photo; we skip it and forward the pristine original.
+//
+// When no re-encode is needed we also skip the Cloudinary mirror entirely and
+// hand Atlas the original URL — no upload, no orphan to clean up.
+async function normalizeReframeSource(sourceUrl) {
+  try {
+    if (isBlockedFetchHost(sourceUrl)) {
+      console.warn('⚠️  normalizeReframeSource: blocked host — refusing to fetch');
+      return null;
+    }
+    const res = await axios.get(sourceUrl, {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+      maxRedirects: 3,
+      maxContentLength: REFRAME_MAX_SOURCE_BYTES(),
+      maxBodyLength: REFRAME_MAX_SOURCE_BYTES()
+    });
+    const raw = Buffer.from(res.data);
+    // Content-type is ADVISORY only: some CDNs serve images as
+    // application/octet-stream, and rejecting those would silently downgrade a
+    // good image to a crop. sharp is the real gate — it throws on non-images
+    // (including HTML error pages), which the catch below turns into null.
+    const ct = String(res.headers['content-type'] || '').toLowerCase();
+    if (ct && !ct.startsWith('image/')) {
+      console.warn(`⚠️  normalizeReframeSource: non-image content-type "${ct}" — letting sharp decide`);
+    }
+
+    const md = await sharp(raw).metadata();
+    const hasAlpha  = !!md.hasAlpha;
+    // orientation > 1 means EXIF asks for a rotation/flip. sharp does NOT apply
+    // it by default AND strips the tag on output, so leaving it would hand the
+    // model — and bake into the ad — a sideways image. ffmpeg applied the
+    // display matrix automatically, so the reference never needed this.
+    const needsOrient = Number(md.orientation || 1) > 1;
+
+    if (!hasAlpha && !needsOrient) {
+      return { buffer: raw, url: sourceUrl, mirrored: false };
+    }
+
+    // chromaSubsampling 4:4:4 keeps full colour resolution — without it sharp
+    // defaults to 4:2:0 and smears exactly the coloured label/logo edges the
+    // model is being asked to preserve.
+    const buffer = await sharp(raw)
+      .rotate()
+      .flatten({ background: '#ffffff' })
+      .jpeg({ quality: 95, chromaSubsampling: '4:4:4' })
+      .toBuffer();
+    const up = await uploadBufferToCloudinary(buffer, { folder: 'liquidretail/reframes/src' });
+    const url = up.secure_url || up.url;
+    if (!url) return null;
+    console.log(`   🖼  reframe source re-encoded (alpha=${hasAlpha} orient=${md.orientation || 1})`);
+    return { buffer, url, mirrored: true };
+  } catch (err) {
+    console.warn(`⚠️  normalizeReframeSource: ${err.message}`);
+    return null;
+  }
+}
+
+// $0 deterministic pad: fit the WHOLE source inside a W×H frame (letterbox,
+// nothing cropped/lost) over a blurred cover of itself. Port of media.ts:padToRatio
+// (gblur=sigma=24). Never throws; returns JPEG Buffer or null.
+async function padToRatioBuffer(srcBuffer, W, H) {
+  try {
+    const bg = await sharp(srcBuffer).resize(W, H, { fit: 'cover' }).blur(24).toBuffer();
+    const fg = await sharp(srcBuffer).resize(W, H, { fit: 'inside' }).toBuffer();
+    return await sharp(bg).composite([{ input: fg, gravity: 'center' }]).jpeg({ quality: 88 }).toBuffer();
+  } catch (err) {
+    console.warn(`⚠️  padToRatioBuffer: ${err.message}`);
+    return null;
+  }
+}
+
+// Confirm buffer decodes and its aspect ratio ≈ target (ratio only, not pixel size).
+// Port of media.ts:decodeAndRatioOk. Never throws; returns false on any error.
+async function outputRatioOk(buffer, wr, hr) {
+  try {
+    const md = await sharp(buffer).metadata();
+    if (!(md.width >= 2 && md.height >= 2)) return false;
+    // metadata() reports STORED dims. EXIF orientation 5-8 means the image is
+    // displayed transposed, so compare against the DISPLAY ratio or we would
+    // reject good portrait output that happens to be stored landscape.
+    const transposed = Number(md.orientation || 1) >= 5;
+    const dw = transposed ? md.height : md.width;
+    const dh = transposed ? md.width  : md.height;
+    const tr = wr / hr;
+    return Math.abs(dw / dh - tr) / tr <= REFRAME_RATIO_TOLERANCE();
+  } catch {
+    return false;
+  }
 }
 
 // In-process single-flight for reframes. The product fan-out emits several
 // ads that SHARE reference medias, and workers run those ads in parallel —
 // without this, the same media+aspect would outpaint 2–3× concurrently
-// before any persist lands, paying $0.04 each for one asset. Keyed by media
+// before any persist lands, paying REFRAME_COST_USD each for one asset. Keyed by media
 // _id (or source URL when there's no Media doc) + aspect; cleared on settle.
 const _inflightReframes = new Map();
 
-// Reframe sourceUrl to aspectRatio via generative outpaint (or exact-fit
-// skip). NEVER throws — any failure degrades to deterministic Cloudinary
-// crop so the ad pipeline keeps moving. Successful reframes (incl. exact)
+// Reframe sourceUrl to aspectRatio via generative uncrop outpaint (or exact-fit
+// skip / $0 pad). NEVER throws — any failure degrades to deterministic Cloudinary
+// crop so the ad pipeline keeps moving. Successful reframes (incl. exact / pad)
 // are persisted on Media.metadata.reframes[aspectKey] for reuse.
 async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand }) {
   const fallback = () => cropImageUrlForAspect(sourceUrl, aspectRatio, brand);
@@ -632,7 +854,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
       if (!(wr > 0 && hr > 0)) return fallback();
 
       // 4b. Only MEDIA-BACKED refs are cacheable. An uncacheable ref (product
-      //     URL / legacy fallback, no Media doc) would re-outpaint $0.04 EVERY
+      //     URL / legacy fallback, no Media doc) would re-outpaint every
       //     render, so crop it instead of spending. The seed + catalog mirrors
       //     always have _id, so the common path still outpaints.
       if (!media?._id) return fallback();
@@ -641,7 +863,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
       //     loaded BEFORE a sibling ad/worker persisted this aspect (fan-out
       //     ads share reference medias) — the in-process single-flight only
       //     covers overlapping calls, so re-check the DB to close the
-      //     post-settle sequential dual-bill window (one cheap read ≪ $0.04).
+      //     post-settle sequential dual-bill window (one cheap read ≪ cost).
       try {
         const fresh = await Media.findById(media._id).select(`metadata.reframes.${aspectKey}`).lean();
         const freshUrl = fresh?.metadata?.reframes?.[aspectKey]?.url;
@@ -661,43 +883,131 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         }
       }
 
-      // 6. OUTPAINT (single billable POST) + Cloudinary mirror. Errors here
-      //    must NOT persist a fallback as the good reframe (allow retry next
-      //    render). Single submit only — never retry the charged POST.
-      let finalUrl;
-      try {
-        const id = await submitImageGeneration({
-          model: REFRAME_OUTPAINT_MODEL(),
-          images: [sourceUrl],
-          prompt: outpaintPromptForAspect(aspectRatio),
-          aspectRatio,
-          resolution: REFRAME_RESOLUTION()
-        });
-        const outUrl = await pollPrediction(id);
-        const up = await uploadUrlToCloudinary(outUrl, { folder: 'liquidretail/reframes' });
-        finalUrl = up.secure_url || up.url || outUrl;
-      } catch (err) {
-        console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: outpaint failed — ${err.message}`);
+      // 6. NORMALIZE → OUTPAINT → VALIDATE → PAD. Ported from the LLM
+      //    Expander's runSafeZoneReframe (media.ts:1117-1227). `billed` flips
+      //    true as soon as the billable POST is away and is NEVER cleared, so
+      //    the ledger records the charge on EVERY subsequent path — a rejected
+      //    output, a failed download, a poll timeout, or a fall-through to the
+      //    $0 pad. An unledgered charge is invisible; that's the failure mode
+      //    this ordering exists to prevent.
+      const { w: W, h: H } = imageDimsForAspect(aspectRatio);
+      let billed    = false;
+      let resultUrl = null;
+      let method    = null;
+
+      // The bytes + URL the model will see. Re-encoded ONLY when the source
+      // carries alpha or an EXIF rotation; otherwise the original is forwarded
+      // untouched (see normalizeReframeSource). Feeds BOTH the outpaint and the
+      // pad fallback. If we can't even read it, do NOT spend — crop instead.
+      const srcNorm = await normalizeReframeSource(sourceUrl);
+      if (!srcNorm) {
+        console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: source normalize failed — cropping, no spend`);
         return fallback();
       }
 
-      // 7. Ledger the spend (best-effort telemetry — never blocks the URL).
       try {
-        await recordFlatCost({
-          stage: 'reframe-outpaint',
-          provider: 'atlas',
+        const id = await submitImageGeneration({
           model: REFRAME_OUTPAINT_MODEL(),
-          brandId: brand?._id || media?.brandId || null,
-          mediaId: media?._id || null,
-          productId: media?.metadata?.catalogProductId || null,
-          purposeTag: `reframe:${aspectRatio}`,
-          costUsd: REFRAME_COST_USD()
+          images: [srcNorm.url],
+          prompt: uncropPromptForAspect(aspectRatio),
+          aspectRatio,
+          resolution: REFRAME_RESOLUTION()
         });
-      } catch { /* telemetry only */ }
+        // Charge point. submitImageGeneration's own contract is "NO retry (POST
+        // is charged)", so the money is committed HERE — before the poll, not
+        // after it. Setting `billed` at terminal-ok instead would lose the
+        // charge whenever polling times out on a prediction Atlas later
+        // completes and bills. Worst case this over-attributes a genuinely
+        // failed prediction, which is the safe direction: an overstated ledger
+        // is visible and correctable, an understated one is neither.
+        billed = true;
 
-      // 8. PERSIST asset-library entry (DB write failure must not lose URL).
-      await persistReframe(media, aspectKey, aspectRatio, finalUrl, 'outpaint');
-      return finalUrl;
+        const outUrl = await pollPrediction(id);
+
+        // Retried (free, idempotent) — see fetchOutpaintOutput. A single blip
+        // here used to discard a generation we had already paid for.
+        const outBuf = await fetchOutpaintOutput(outUrl);
+        if (outBuf.length >= 512 && await outputRatioOk(outBuf, wr, hr)) {
+          const up = await uploadBufferToCloudinary(outBuf, { folder: 'liquidretail/reframes' });
+          const url = up.secure_url || up.url;
+          if (url) { resultUrl = url; method = 'outpaint'; }
+        } else {
+          console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: output rejected (bytes=${outBuf.length}) — pad fallback`);
+        }
+      } catch (err) {
+        // err.charged: the POST resolved (Atlas accepted, and may have billed)
+        // but the response carried no prediction id, so we can't poll for it.
+        // Still record the spend rather than lose it.
+        if (err?.charged) billed = true;
+        console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: outpaint failed — ${err.message}`);
+      }
+
+      // 6a. Drop the normalized-source mirror IF we made one (opaque, correctly
+      //     oriented sources are handed to Atlas by their original URL and have
+      //     nothing to clean up). The mirror exists only so the model could
+      //     fetch flattened/oriented bytes; the prediction has reached a
+      //     terminal state by here, so Atlas will never re-fetch it, and the pad
+      //     below uses srcNorm.buffer (in-memory), not this URL. Without this,
+      //     every re-encoded reframe would leak a permanent Cloudinary asset.
+      //     Best-effort — deleteFromCloudinary catches internally, never throws.
+      if (srcNorm.mirrored) await deleteFromCloudinary(srcNorm.url);
+
+      // 6b. Rejected or failed → $0 deterministic pad from the normalized
+      //     source. Nothing is cropped or lost; the whole subject stays visible.
+      if (!resultUrl) {
+        try {
+          const padBuf = await padToRatioBuffer(srcNorm.buffer, W, H);
+          if (padBuf) {
+            const up = await uploadBufferToCloudinary(padBuf, { folder: 'liquidretail/reframes' });
+            const url = up.secure_url || up.url;
+            if (url) { resultUrl = url; method = 'pad-fallback'; }
+          }
+        } catch (err) {
+          console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: pad fallback failed — ${err.message}`);
+        }
+      }
+
+      // 7. Ledger the spend EXACTLY ONCE if Atlas billed us — on every path,
+      //    success or rejected-then-padded. Best-effort; never blocks the URL.
+      if (billed) {
+        try {
+          await recordFlatCost({
+            stage: 'reframe-outpaint',
+            provider: 'atlas',
+            model: REFRAME_OUTPAINT_MODEL(),
+            brandId: brand?._id || media?.brandId || null,
+            mediaId: media?._id || null,
+            productId: media?.metadata?.catalogProductId || null,
+            purposeTag: `reframe:${aspectRatio}`,
+            costUsd: REFRAME_COST_USD()
+          });
+        } catch { /* telemetry only */ }
+      }
+
+      // 8. Persist the asset-library entry — but ONLY when Atlas actually billed
+      //    us. A persisted entry is a permanent cache hit, so its real job is to
+      //    stop a second POST for an asset we already paid for.
+      //
+      //    When we were NEVER billed (Atlas 5xx, bad key, blocked host, submit
+      //    threw) the pad is the right answer for THIS render, but persisting it
+      //    would lock this media+aspect to a blurred letterbox forever on the
+      //    strength of one transient outage. Leave the cache empty so a later
+      //    render retries the real uncrop — there is no spend to protect.
+      //    (method 'outpaint' implies billed, so this gates on `billed` alone.)
+      if (resultUrl && method) {
+        if (billed) await persistReframe(media, aspectKey, aspectRatio, resultUrl, method);
+        return resultUrl;
+      }
+
+      // Billed, but nothing usable came out of it (pad build AND upload failed).
+      // Persist the deterministic crop so the next render can't charge us a
+      // second time for this media+aspect. Labelled honestly so a targeted
+      // invalidation can find these later via method + ladderVersion.
+      const cropUrl = fallback();
+      if (billed && cropUrl) {
+        await persistReframe(media, aspectKey, aspectRatio, cropUrl, 'crop-after-bill');
+      }
+      return cropUrl;
     })();
 
     _inflightReframes.set(memoKey, work);
@@ -712,6 +1022,9 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
   }
 }
 
+// method: 'exact' | 'outpaint' | 'pad-fallback' | 'crop-after-bill'
+// ladderVersion lets a future change invalidate $0 tiers selectively without
+// re-spending on entries that cost real money.
 async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method) {
   if (!finalUrl) return;
   const entry = {
@@ -719,6 +1032,7 @@ async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method) {
     aspect: aspectRatio,
     method,
     model: REFRAME_OUTPAINT_MODEL(),
+    ladderVersion: REFRAME_LADDER_VERSION,
     at: new Date().toISOString()
   };
   // Mutate in-memory lean doc so the same run reuses the cache.
