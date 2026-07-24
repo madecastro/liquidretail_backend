@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node index.js",
     "worker": "node worker.js",
-    "postinstall": "puppeteer browsers install chrome && (npx remotion browser ensure || true)",
+    "postinstall": "node scripts/ensurePuppeteerChrome.js && (npx remotion browser ensure || true)",
     "video:dryrun": "node scripts/dryRunVideoSubmit.js",
     "titles:test": "node scripts/testRemotionTitles.js"
   },
