@@ -59,7 +59,19 @@ const REFRAME_OUTPAINT_MODEL = () => process.env.REFRAME_OUTPAINT_MODEL || 'goog
 // And the reframed reference is never consumed at 4k anyway: it feeds a 720p
 // video render (~9x area downsample). Raise ATLAS_VIDEO_RESOLUTION, not this,
 // if you want more resolution where viewers actually see it.
-const REFRAME_RESOLUTION = () => process.env.REFRAME_RESOLUTION || '1k';
+// 4k per operator decision (2026-07-24) after reviewing 20 live generations
+// side by side: at 4k the conservative 'reframe' prompt held product geometry
+// better than 1k did, and the reframed reference is surfaced at full size in
+// the generation inspector. Note the video render itself is 720p by default
+// (ATLAS_VIDEO_RESOLUTION), so 4k benefits inspection rather than the finished
+// ad — and the readme prices 4k at 2x, hence REFRAME_COST_USD below. Schema
+// enum is 1k|2k|4k; 4k is the maximum offered.
+const REFRAME_RESOLUTION = () => process.env.REFRAME_RESOLUTION || '4k';
+// 'reframe' (conservative, default) | 'uncrop' (scene-revealing, riskier on
+// product imagery). See reframeOutpaintPrompt for the measured tradeoff.
+const REFRAME_PROMPT_STYLE = () =>
+  String(process.env.REFRAME_PROMPT_STYLE || 'reframe').trim().toLowerCase() === 'uncrop'
+    ? 'uncrop' : 'reframe';
 const REFRAME_SKIP_THRESHOLD = () => {
   const n = Number(process.env.REFRAME_SKIP_THRESHOLD);
   return Number.isFinite(n) && n > 0 && n <= 1 ? n : 0.985;
@@ -71,7 +83,7 @@ const REFRAME_SKIP_THRESHOLD = () => {
 // raise this too or the ledger silently under-reports. Observability only.
 const REFRAME_COST_USD = () => {
   const n = Number(process.env.REFRAME_COST_USD);
-  return Number.isFinite(n) && n >= 0 ? n : 0.04;
+  return Number.isFinite(n) && n >= 0 ? n : 0.08;
 };
 // Accept outpaint output if its pixel ratio is within this relative
 // tolerance of the target (ratio-only; pixel size is never compared).
@@ -83,6 +95,25 @@ const REFRAME_RATIO_TOLERANCE = () => {
 const REFRAME_MAX_SOURCE_BYTES = () => {
   const n = Number(process.env.REFRAME_MAX_SOURCE_BYTES);
   return Number.isFinite(n) && n > 0 ? n : 50 * 1024 * 1024;
+};
+// Product-only shots NEVER go generative. Measured on real catalogue imagery
+// (2026-07-24, 20 live generations): because no Atlas model exposes a mask, the
+// whole canvas is re-synthesised, and on flat-lay/studio product shots that
+// FABRICATES MERCHANDISE — a pair of shorts came back as full-length trousers,
+// a waistband crop came back as an invented whole garment with the PELAGIC
+// lockup reduced to illegible marks, and an embroidered espadrille came back
+// with a different arrangement of fruits. That is product misrepresentation,
+// not an aesthetic artifact. A deterministic c_pad scales-to-fit and never
+// redraws a pixel, so it is both exact and free. Generative uncrop stays for
+// on-model / lifestyle imagery, where it genuinely adds scene.
+const REFRAME_PRODUCT_ONLY_PAD = () =>
+  String(process.env.REFRAME_PRODUCT_ONLY_PAD ?? 'true').toLowerCase() !== 'false';
+// Max per-channel stddev on an extended edge for it to count as a flat,
+// uniform background we can match with a solid fill. Studio white measures
+// 0.0; a lifestyle frame measured 27-39.
+const REFRAME_BORDER_STD_MAX = () => {
+  const n = Number(process.env.REFRAME_BORDER_STD_MAX);
+  return Number.isFinite(n) && n > 0 ? n : 8;
 };
 // Ladder id persisted on Media.metadata.reframes[*] so we can distinguish
 // assets produced by this uncrop process from older outpaint-only entries.
@@ -654,6 +685,34 @@ async function fetchOutpaintOutput(outUrl, attempts = 3) {
   throw lastErr;
 }
 
+// Two prompt styles, both measured on real catalogue imagery (2026-07-24, 20
+// live generations). Selected by REFRAME_PROMPT_STYLE.
+//
+//   'reframe' (DEFAULT) — the conservative extension instruction. Constrains
+//     visibility/framing. On flat-lay product shots it leaves the garment as
+//     the garment.
+//
+//   'uncrop' — verbatim from ReachSocialLLMExpander media.ts:uncropPrompt.
+//     Constrains geometry/identity/pose and is far better at revealing SCENE on
+//     cropped lifestyle photos (it recovered a full model + garden from a
+//     thigh-level crop). But its "continue the subject (reveal more of the
+//     body/product/clothing)" clause is DANGEROUS on product-only imagery: it
+//     turned a pair of shorts into full-length trousers and expanded a
+//     waistband crop into an invented whole garment. Product-only shots are
+//     routed to the $0 pad before this is reached, so the clause only applies
+//     to on-model/lifestyle frames — but the risk is why it isn't the default.
+function reframePromptForAspect(aspectRatio) {
+  const [wr, hr] = String(aspectRatio).split(':').map(Number);
+  const orient = wr > hr ? 'horizontal (landscape)' : wr < hr ? 'vertical (portrait)' : 'square';
+  return `Reframe this image into a ${orient} ${wr}:${hr} composition. Keep the ENTIRE subject and all text fully visible and uncropped. Naturally extend the existing background, colors and scene to fill the new areas — do not add new objects, people or text. Seamless, photorealistic, matching the original style, lighting and palette.`;
+}
+
+function reframeOutpaintPrompt(aspectRatio) {
+  return REFRAME_PROMPT_STYLE() === 'uncrop'
+    ? uncropPromptForAspect(aspectRatio)
+    : reframePromptForAspect(aspectRatio);
+}
+
 // Verbatim uncrop prompt from ReachSocialLLMExpander media.ts:uncropPrompt.
 // Character-for-character; do not "improve" — that prompt is the artifact-free path.
 function uncropPromptForAspect(aspectRatio) {
@@ -795,6 +854,134 @@ async function padToRatioBuffer(srcBuffer, W, H) {
   }
 }
 
+// Is this Media a flat-lay / studio product shot? LLM-judged by
+// subjectTextService, so a HINT — but the cost of a false positive is only a
+// letterboxed pad (product preserved exactly), while a false negative risks
+// the model inventing merchandise. Asymmetric, so we lean on it.
+function isProductOnlyShot(media) {
+  return media?.classification?.shotType === 'product_only';
+}
+
+// Which edges does padding to `target` actually add? Only those need to be a
+// uniform background for a solid fill to be invisible. A 1:1 source going to
+// 9:16 gains height, so only top+bottom matter — checking left/right too would
+// needlessly reject images whose sides are busy but whose top/bottom are clean.
+function extendedEdgesFor(srcRatio, targetRatio) {
+  return srcRatio > targetRatio ? ['top', 'bottom'] : ['left', 'right'];
+}
+
+// Sample the edges we're about to extend and report whether they're a single
+// flat colour we can match exactly. Works on a tiny derivative (a few KB), so
+// this is cheap enough to run before every product-only pad.
+// Never throws; returns { uniform, hex } with hex always usable as a fallback.
+async function detectBorderFill(buffer, srcRatio, targetRatio) {
+  const FALLBACK = { uniform: false, hex: null };
+  try {
+    const N = 64;
+    const { data, info } = await sharp(buffer)
+      .rotate()
+      .flatten({ background: '#ffffff' })
+      .resize(N, N, { fit: 'fill' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const ch = info.channels;
+    if (ch < 3) return FALLBACK;
+    const band = Math.max(2, Math.round(N * 0.06));
+    const px = (x, y) => {
+      const i = (y * N + x) * ch;
+      return [data[i], data[i + 1], data[i + 2]];
+    };
+    const region = (x0, y0, x1, y1) => {
+      const out = [];
+      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) out.push(px(x, y));
+      return out;
+    };
+    const REGIONS = {
+      top:    () => region(0, 0, N, band),
+      bottom: () => region(0, N - band, N, N),
+      left:   () => region(0, 0, band, N),
+      right:  () => region(N - band, 0, N, N)
+    };
+    const stats = [];
+    for (const edge of extendedEdgesFor(srcRatio, targetRatio)) {
+      const pxs = REGIONS[edge]();
+      if (!pxs.length) return FALLBACK;
+      const mean = [0, 1, 2].map(c => pxs.reduce((s, p) => s + p[c], 0) / pxs.length);
+      const std = Math.max(...[0, 1, 2].map(c =>
+        Math.sqrt(pxs.reduce((s, p) => s + (p[c] - mean[c]) ** 2, 0) / pxs.length)));
+      stats.push({ mean, std });
+    }
+    const maxStd = Math.max(...stats.map(s => s.std));
+    const mean = [0, 1, 2].map(c =>
+      Math.round(stats.reduce((s, st) => s + st.mean[c], 0) / stats.length));
+    // Edges must each be flat AND agree with each other, or a gradient reads as
+    // "uniform" per-edge and the solid fill shows a seam.
+    const spread = Math.max(...[0, 1, 2].map(c =>
+      Math.max(...stats.map(s => s.mean[c])) - Math.min(...stats.map(s => s.mean[c]))));
+    const hex = mean.map(v => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0')).join('');
+    return { uniform: maxStd <= REFRAME_BORDER_STD_MAX() && spread <= 12, hex };
+  } catch (err) {
+    console.warn(`⚠️  detectBorderFill: ${err.message}`);
+    return FALLBACK;
+  }
+}
+
+// Pure Cloudinary pad — no upload, no bytes, no spend. c_pad scales-to-fit and
+// pads, so the product is delivered untouched. b_rgb when we sampled a flat
+// background; otherwise b_auto:predominant_gradient, which Cloudinary derives
+// from the border server-side and is the ALWAYS-AVAILABLE soft option on this
+// plan (b_blurred needs an add-on we don't have — see
+// services/extendedCropsService.js:127-129). Returns null for non-Cloudinary
+// sources, which the caller handles by padding the bytes locally instead.
+function cloudinaryPadUrl(sourceUrl, aspectRatio, hex) {
+  if (!sourceUrl || !sourceUrl.includes('/image/upload/')) return null;
+  const { w, h } = imageDimsForAspect(aspectRatio);
+  const bg = hex ? `b_rgb:${hex}` : 'b_auto:predominant_gradient';
+  return sourceUrl.replace(
+    '/image/upload/',
+    `/image/upload/${bg},c_pad,w_${w},h_${h},f_jpg,q_auto:good/`
+  );
+}
+
+// Local solid-colour letterbox, for product-only sources that aren't on
+// Cloudinary and so can't be transformed by URL. Same geometry as
+// padToRatioBuffer but a flat fill instead of a blurred cover — on a uniform
+// studio background the blurred version smears product colour into the bands.
+async function padSolidBuffer(srcBuffer, W, H, hex) {
+  try {
+    const fg = await sharp(srcBuffer).rotate().resize(W, H, { fit: 'inside' }).toBuffer();
+    const r = parseInt(hex.slice(0, 2), 16);
+    const g = parseInt(hex.slice(2, 4), 16);
+    const b = parseInt(hex.slice(4, 6), 16);
+    return await sharp({ create: { width: W, height: H, channels: 3, background: { r, g, b } } })
+      .composite([{ input: fg, gravity: 'center' }])
+      .jpeg({ quality: 92 })
+      .toBuffer();
+  } catch (err) {
+    console.warn(`⚠️  padSolidBuffer: ${err.message}`);
+    return null;
+  }
+}
+
+// Fetch a small derivative purely to sample the border. A few KB against a
+// $0.04 decision. Falls back to the full source for non-Cloudinary URLs.
+async function fetchBorderSample(sourceUrl) {
+  const small = sourceUrl.includes('/image/upload/')
+    ? sourceUrl.replace('/image/upload/', '/image/upload/w_120,c_limit,f_jpg,q_auto:eco/')
+    : sourceUrl;
+  if (isBlockedFetchHost(small)) return null;
+  try {
+    const res = await axios.get(small, {
+      responseType: 'arraybuffer', timeout: 15000, maxRedirects: 3,
+      maxContentLength: REFRAME_MAX_SOURCE_BYTES(), maxBodyLength: REFRAME_MAX_SOURCE_BYTES()
+    });
+    return Buffer.from(res.data);
+  } catch (err) {
+    console.warn(`⚠️  fetchBorderSample: ${err.message}`);
+    return null;
+  }
+}
+
 // Confirm buffer decodes and its aspect ratio ≈ target (ratio only, not pixel size).
 // Port of media.ts:decodeAndRatioOk. Never throws; returns false on any error.
 async function outputRatioOk(buffer, wr, hr) {
@@ -883,6 +1070,49 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         }
       }
 
+      // 5b. PRODUCT-ONLY → deterministic pad, NEVER generative, NEVER billed.
+      //     See REFRAME_PRODUCT_ONLY_PAD for the measured reasoning: generative
+      //     outpaint fabricates merchandise on flat-lay/studio shots. c_pad
+      //     scales-to-fit and pads, so the product ships untouched.
+      //
+      //     Returns before any POST. On ANY failure we fall through to the
+      //     generative ladder below rather than returning a crop, so a product
+      //     still gets a usable reference — but the pad is tried first.
+      if (REFRAME_PRODUCT_ONLY_PAD() && isProductOnlyShot(media)) {
+        const srcRatio = media.width > 0 && media.height > 0 ? media.width / media.height : null;
+        const sample   = await fetchBorderSample(sourceUrl);
+        const fill     = sample && srcRatio
+          ? await detectBorderFill(sample, srcRatio, wr / hr)
+          : { uniform: false, hex: null };
+        // Only claim an exact colour match when the edges really are flat;
+        // otherwise let Cloudinary derive a gradient from the border itself.
+        const hex = fill.uniform ? fill.hex : null;
+
+        let padUrl = cloudinaryPadUrl(sourceUrl, aspectRatio, hex);
+        if (!padUrl && sample) {
+          // Non-Cloudinary source: can't transform by URL, so pad the bytes.
+          const { w: pw, h: ph } = imageDimsForAspect(aspectRatio);
+          const buf = await padSolidBuffer(sample, pw, ph, hex || 'ffffff');
+          if (buf) {
+            try {
+              const up = await uploadBufferToCloudinary(buf, { folder: 'liquidretail/reframes' });
+              padUrl = up.secure_url || up.url || null;
+            } catch (err) {
+              console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: product-only pad upload failed — ${err.message}`);
+            }
+          }
+        }
+        if (padUrl) {
+          console.log(
+            `   🧺 reframe[${aspectKey}]: product_only → $0 pad ` +
+            `(${hex ? `solid #${hex}, border std ok` : 'predominant gradient'})`
+          );
+          await persistReframe(media, aspectKey, aspectRatio, padUrl, 'pad-product-only');
+          return padUrl;
+        }
+        console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: product-only pad unavailable — falling through to generative`);
+      }
+
       // 6. NORMALIZE → OUTPAINT → VALIDATE → PAD. Ported from the LLM
       //    Expander's runSafeZoneReframe (media.ts:1117-1227). `billed` flips
       //    true as soon as the billable POST is away and is NEVER cleared, so
@@ -909,7 +1139,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         const id = await submitImageGeneration({
           model: REFRAME_OUTPAINT_MODEL(),
           images: [srcNorm.url],
-          prompt: uncropPromptForAspect(aspectRatio),
+          prompt: reframeOutpaintPrompt(aspectRatio),
           aspectRatio,
           resolution: REFRAME_RESOLUTION()
         });
@@ -956,7 +1186,18 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
       //     source. Nothing is cropped or lost; the whole subject stays visible.
       if (!resultUrl) {
         try {
-          const padBuf = await padToRatioBuffer(srcNorm.buffer, W, H);
+          // Prefer a sampled SOLID fill when the extended edges are flat. The
+          // blurred cover is a scaled-up copy of the frame, so on a uniform
+          // studio background it smears product colour (and hair) into the
+          // bands — visibly worse than matching the backdrop exactly. Blur is
+          // the right call only when the background genuinely has content.
+          const srcRatio = media.width > 0 && media.height > 0 ? media.width / media.height : null;
+          const fill = srcRatio
+            ? await detectBorderFill(srcNorm.buffer, srcRatio, wr / hr)
+            : { uniform: false, hex: null };
+          const padBuf = fill.uniform
+            ? (await padSolidBuffer(srcNorm.buffer, W, H, fill.hex)) || (await padToRatioBuffer(srcNorm.buffer, W, H))
+            : await padToRatioBuffer(srcNorm.buffer, W, H);
           if (padBuf) {
             const up = await uploadBufferToCloudinary(padBuf, { folder: 'liquidretail/reframes' });
             const url = up.secure_url || up.url;
