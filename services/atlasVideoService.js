@@ -1641,7 +1641,23 @@ async function buildReferenceImages({
   }
 
   // Cap BEFORE reframing — never pay for images we won't send.
-  const capped = ids.slice(0, maxImages);
+  //
+  // An EXPLICIT operator pick list defines its own count: picking 5 images means
+  // 5, not "5 truncated to referenceImageCount". referenceImageCount is the
+  // default for AUTO assembly (how many to grab when nobody chose), not a
+  // ceiling on a deliberate choice — silently dropping picks 4+ was the "why did
+  // it ignore the images I selected?" surprise. Still bounded by the model's own
+  // maxReferenceImages, which is a hard API limit we cannot exceed.
+  const effectiveMax = usedOrdered
+    ? Math.min(ids.length, caps?.maxReferenceImages || MAX_REFERENCE_IMAGE_COUNT)
+    : maxImages;
+  const capped = ids.slice(0, effectiveMax);
+  if (usedOrdered && ids.length > effectiveMax) {
+    console.warn(
+      `⚠️  buildReferenceImages: ${ids.length} operator picks exceed the model's ` +
+      `maxReferenceImages (${effectiveMax}) — using the first ${effectiveMax} in pick order`
+    );
+  }
 
   // Reframe all in parallel; preserve order.
   const reframed = await Promise.all(
@@ -2350,7 +2366,15 @@ async function buildPromptScaffold({
     model,
     aspectRatio,
     durationSec: resolvedDuration,
-    byteCap: caps?.promptByteCap || 4096
+    byteCap: caps?.promptByteCap || 4096,
+    // Reference-stack limits for the seed picker. maxReferenceImages is a HARD
+    // per-model API limit and varies wildly (gemini-omni i2v: 7, omni r2v: 5,
+    // grok-imagine i2v and veo3.1: 1), so the UI must read it from the resolved
+    // model rather than assume 7 — otherwise it offers slots the model will
+    // silently drop. defaultReferenceCount is how many get used when the
+    // operator picks nothing.
+    maxReferenceImages:    caps?.maxReferenceImages || MAX_REFERENCE_IMAGE_COUNT,
+    defaultReferenceCount: resolveReferenceImageCount({ brand, product })
   };
 }
 
