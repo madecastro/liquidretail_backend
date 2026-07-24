@@ -118,6 +118,28 @@ const REFRAME_BORDER_STD_MAX = () => {
 // Ladder id persisted on Media.metadata.reframes[*] so we can distinguish
 // assets produced by this uncrop process from older outpaint-only entries.
 const REFRAME_LADDER_VERSION = 'uncrop-v1';
+// Cross-process reframe claim lease. Web service and worker are separate Node
+// processes, so the in-process Map + fresh DB re-read alone cannot stop both
+// from POSTing generateImage for the same (media, aspect). Lease must outlive a
+// realistic generation (ATLAS_TIMEOUT_MS defaults to 10 min) so a live flight
+// is not stolen mid-poll; a crashed holder self-heals when the lease ages out.
+// Floored at MAX_POLL_MS + 10 min rather than trusting the configured value
+// alone. If the lease could expire while the holder is still legitimately
+// polling, a second process would steal the claim and BOTH would bill — so the
+// safe TTL is coupled to how long a generation is allowed to run. Raising
+// ATLAS_TIMEOUT_MS therefore cannot silently reintroduce the double-charge this
+// lease exists to prevent.
+const REFRAME_CLAIM_TTL_MS = () => {
+  const n = Number(process.env.REFRAME_CLAIM_TTL_MS);
+  const configured = Number.isFinite(n) && n > 0 ? n : 15 * 60 * 1000;
+  // Slack covers the work AFTER polling that still precedes persist: output
+  // download with retries (~90s), Cloudinary uploads, pad build. Erring long is
+  // the cheap direction — an over-long lease only makes peers crop for a while,
+  // whereas an under-long one lets a second process bill for the same asset. It
+  // also absorbs modest clock skew between processes, since `claim.at` is
+  // written from each process's own wall clock rather than server time.
+  return Math.max(configured, MAX_POLL_MS + 10 * 60 * 1000);
+};
 
 // Titling is CANONICAL by default. The layoutInput derivation template is
 // fixed to the canonical template ('ai_brand_led') UNLESS a brand or product
@@ -1008,6 +1030,115 @@ async function outputRatioOk(buffer, wr, hr) {
 // _id (or source URL when there's no Media doc) + aspect; cleared on settle.
 const _inflightReframes = new Map();
 
+// ── Cross-process reframe claim (Option A) ─────────────────────────────
+// Mutex lives on Media.metadata.reframes.<aspectKey>.claim = { at, by }.
+// Chosen over Option B (dedicated claim collection + unique index) because:
+//   • Mongo is already the shared store for the result cache on the same path
+//   • one atomic findOneAndUpdate both locks and co-locates with the eventual
+//     url entry (persist supersedes claim via full $set of the aspect key)
+//   • no new collection/index to operate; the only wrinkle is that cache reads
+//     MUST key on `.url` only — a claim-only entry is never a cache hit
+//     (see steps 3 / 4c / waitForReframeUrl below).
+//
+// Winner → billable POST. Loser → bounded re-read wait, then $0 crop; NEVER
+// spends. Stale claims (older than REFRAME_CLAIM_TTL_MS) are stealable so a
+// crashed holder cannot block (media, aspect) forever. Unbilled exits release
+// the claim; billed exits leave it for persist to supersede (or TTL if persist
+// fails — better a soft lock than an immediate re-POST of a paid asset).
+
+function reframeClaimPath(aspectKey) {
+  return `metadata.reframes.${aspectKey}`;
+}
+
+// Atomic try-claim. Returns true only when THIS process holds the lease.
+// Fail-CLOSED on Mongo errors: crop instead of risking a double POST.
+async function tryClaimReframe(mediaId, aspectKey, claimBy) {
+  const path = reframeClaimPath(aspectKey);
+  const now = Date.now();
+  const staleBefore = new Date(now - REFRAME_CLAIM_TTL_MS()).toISOString();
+  try {
+    const doc = await Media.findOneAndUpdate(
+      {
+        _id: mediaId,
+        // No finished result yet (url-only is the cache signal).
+        $and: [
+          {
+            $or: [
+              { [`${path}.url`]: { $exists: false } },
+              { [`${path}.url`]: null },
+              { [`${path}.url`]: '' },
+              // Whitespace-only must count as empty too: the cache reads .trim(),
+              // so without this a corrupt "   " url is neither a cache hit nor
+              // claimable and the aspect is stuck on crops forever.
+              { [`${path}.url`]: { $not: /\S/ } }
+            ]
+          },
+          // No live claim, or the prior holder is past the lease TTL.
+          {
+            $or: [
+              { [`${path}.claim.at`]: { $exists: false } },
+              { [`${path}.claim.at`]: { $lt: staleBefore } }
+            ]
+          }
+        ]
+      },
+      {
+        $set: {
+          [`${path}.claim`]: {
+            at: new Date(now).toISOString(),
+            by: claimBy
+          }
+        }
+      },
+      { new: true }
+    );
+    return !!doc;
+  } catch (err) {
+    console.error(
+      `❌ reframe claim acquire failed (fail-closed, no spend) — ${err.message}`
+    );
+    return false;
+  }
+}
+
+// Drop OUR claim-only entry so a later render can retry. No-op when a url has
+// already been written (persist supersedes) or when another holder reclaimed.
+async function releaseReframeClaim(mediaId, aspectKey, claimBy) {
+  const path = reframeClaimPath(aspectKey);
+  try {
+    await Media.updateOne(
+      {
+        _id: mediaId,
+        [`${path}.claim.by`]: claimBy,
+        $or: [
+          { [`${path}.url`]: { $exists: false } },
+          { [`${path}.url`]: null },
+          { [`${path}.url`]: '' },
+          { [`${path}.url`]: { $not: /\S/ } }
+        ]
+      },
+      { $unset: { [path]: 1 } }
+    );
+  } catch (err) {
+    console.warn(`⚠️  reframe claim release failed — ${err.message}`);
+  }
+}
+
+// Loser wait: a couple of short re-reads for the winner's url. Generation can
+// take minutes, so this usually returns null and the caller crops — never
+// spends. Next render hits the persistent cache once the winner persists.
+async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    try {
+      const fresh = await Media.findById(mediaId).select(`metadata.reframes.${aspectKey}`).lean();
+      const url = fresh?.metadata?.reframes?.[aspectKey]?.url;
+      if (typeof url === 'string' && url.trim()) return url;
+    } catch { /* retry / fall through */ }
+  }
+  return null;
+}
+
 // Reframe sourceUrl to aspectRatio via generative uncrop outpaint (or exact-fit
 // skip / $0 pad). NEVER throws — any failure degrades to deterministic Cloudinary
 // crop so the ad pipeline keeps moving. Successful reframes (incl. exact / pad)
@@ -1024,6 +1155,8 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
     const aspectKey = String(aspectRatio).replace(/[^a-z0-9]+/gi, '_');
 
     // 3. PERSISTENT CACHE HIT — no spend, no submit (survives restarts).
+    //    Only `.url` counts: a claim-only entry ({ claim: { at, by } }) is NOT
+    //    a hit and must fall through so the loser can wait / crop.
     const cached = media?.metadata?.reframes?.[aspectKey]?.url;
     if (typeof cached === 'string' && cached.trim()) return cached;
 
@@ -1051,6 +1184,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
       //     ads share reference medias) — the in-process single-flight only
       //     covers overlapping calls, so re-check the DB to close the
       //     post-settle sequential dual-bill window (one cheap read ≪ cost).
+      //     Again: `.url` only — never treat a bare claim as a finished reframe.
       try {
         const fresh = await Media.findById(media._id).select(`metadata.reframes.${aspectKey}`).lean();
         const freshUrl = fresh?.metadata?.reframes?.[aspectKey]?.url;
@@ -1120,135 +1254,187 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
       //    output, a failed download, a poll timeout, or a fall-through to the
       //    $0 pad. An unledgered charge is invisible; that's the failure mode
       //    this ordering exists to prevent.
+      //
+      //    Cross-process claim wraps this billable section only (free tiers
+      //    above never spend and need no mutex). See tryClaimReframe.
       const { w: W, h: H } = imageDimsForAspect(aspectRatio);
       let billed    = false;
       let resultUrl = null;
       let method    = null;
-
-      // The bytes + URL the model will see. Re-encoded ONLY when the source
-      // carries alpha or an EXIF rotation; otherwise the original is forwarded
-      // untouched (see normalizeReframeSource). Feeds BOTH the outpaint and the
-      // pad fallback. If we can't even read it, do NOT spend — crop instead.
-      const srcNorm = await normalizeReframeSource(sourceUrl);
-      if (!srcNorm) {
-        console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: source normalize failed — cropping, no spend`);
-        return fallback();
-      }
+      // BILLING/CLAIM: identity of this process's lease; only release when we
+      // still hold a claim-only entry and did NOT bill (see finally below).
+      const claimBy = `${process.pid}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
+      let holdClaim = false;
 
       try {
-        const id = await submitImageGeneration({
-          model: REFRAME_OUTPAINT_MODEL(),
-          images: [srcNorm.url],
-          prompt: reframeOutpaintPrompt(aspectRatio),
-          aspectRatio,
-          resolution: REFRAME_RESOLUTION()
-        });
-        // Charge point. submitImageGeneration's own contract is "NO retry (POST
-        // is charged)", so the money is committed HERE — before the poll, not
-        // after it. Setting `billed` at terminal-ok instead would lose the
-        // charge whenever polling times out on a prediction Atlas later
-        // completes and bills. Worst case this over-attributes a genuinely
-        // failed prediction, which is the safe direction: an overstated ledger
-        // is visible and correctable, an understated one is neither.
-        billed = true;
-
-        const outUrl = await pollPrediction(id);
-
-        // Retried (free, idempotent) — see fetchOutpaintOutput. A single blip
-        // here used to discard a generation we had already paid for.
-        const outBuf = await fetchOutpaintOutput(outUrl);
-        if (outBuf.length >= 512 && await outputRatioOk(outBuf, wr, hr)) {
-          const up = await uploadBufferToCloudinary(outBuf, { folder: 'liquidretail/reframes' });
-          const url = up.secure_url || up.url;
-          if (url) { resultUrl = url; method = 'outpaint'; }
-        } else {
-          console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: output rejected (bytes=${outBuf.length}) — pad fallback`);
+        // CLAIM: atomic cross-process mutex. Loser never reaches submitImageGeneration.
+        const won = await tryClaimReframe(media._id, aspectKey, claimBy);
+        if (!won) {
+          console.log(
+            `   ⏳ reframe[${aspectKey}]: claim held by another process — waiting briefly, no spend`
+          );
+          const winnerUrl = await waitForReframeUrl(media._id, aspectKey);
+          if (winnerUrl) return winnerUrl;
+          console.warn(
+            `⚠️  reframeReferenceForAspect[${aspectKey}]: claim loser — winner result not ready, cropping (no spend)`
+          );
+          return fallback();
         }
-      } catch (err) {
-        // err.charged: the POST resolved (Atlas accepted, and may have billed)
-        // but the response carried no prediction id, so we can't poll for it.
-        // Still record the spend rather than lose it.
-        if (err?.charged) billed = true;
-        console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: outpaint failed — ${err.message}`);
-      }
+        holdClaim = true;
 
-      // 6a. Drop the normalized-source mirror IF we made one (opaque, correctly
-      //     oriented sources are handed to Atlas by their original URL and have
-      //     nothing to clean up). The mirror exists only so the model could
-      //     fetch flattened/oriented bytes; the prediction has reached a
-      //     terminal state by here, so Atlas will never re-fetch it, and the pad
-      //     below uses srcNorm.buffer (in-memory), not this URL. Without this,
-      //     every re-encoded reframe would leak a permanent Cloudinary asset.
-      //     Best-effort — deleteFromCloudinary catches internally, never throws.
-      if (srcNorm.mirrored) await deleteFromCloudinary(srcNorm.url);
-
-      // 6b. Rejected or failed → $0 deterministic pad from the normalized
-      //     source. Nothing is cropped or lost; the whole subject stays visible.
-      if (!resultUrl) {
+        // CLAIM: last look before spending. Winning the claim does NOT prove no
+        // result exists — the FREE tiers (exact-fit skip, product-only pad) call
+        // persistReframe with a full $set and no claim check, so another process
+        // can land a $0 result and wipe our claim at any moment. Without this
+        // re-read we would pay for a generative reframe that already has a free
+        // answer, and then OVERWRITE that answer — which on a product-only shot
+        // means replacing a pixel-exact pad with a fabricated garment.
         try {
-          // Prefer a sampled SOLID fill when the extended edges are flat. The
-          // blurred cover is a scaled-up copy of the frame, so on a uniform
-          // studio background it smears product colour (and hair) into the
-          // bands — visibly worse than matching the backdrop exactly. Blur is
-          // the right call only when the background genuinely has content.
-          const srcRatio = media.width > 0 && media.height > 0 ? media.width / media.height : null;
-          const fill = srcRatio
-            ? await detectBorderFill(srcNorm.buffer, srcRatio, wr / hr)
-            : { uniform: false, hex: null };
-          const padBuf = fill.uniform
-            ? (await padSolidBuffer(srcNorm.buffer, W, H, fill.hex)) || (await padToRatioBuffer(srcNorm.buffer, W, H))
-            : await padToRatioBuffer(srcNorm.buffer, W, H);
-          if (padBuf) {
-            const up = await uploadBufferToCloudinary(padBuf, { folder: 'liquidretail/reframes' });
+          const settled = await Media.findById(media._id)
+            .select(`metadata.reframes.${aspectKey}`).lean();
+          const settledUrl = settled?.metadata?.reframes?.[aspectKey]?.url;
+          if (typeof settledUrl === 'string' && settledUrl.trim()) {
+            console.log(`   ✅ reframe[${aspectKey}]: another process landed a result — no spend`);
+            return settledUrl;
+          }
+        } catch { /* unreadable → proceed; the claim is still ours */ }
+
+        // The bytes + URL the model will see. Re-encoded ONLY when the source
+        // carries alpha or an EXIF rotation; otherwise the original is forwarded
+        // untouched (see normalizeReframeSource). Feeds BOTH the outpaint and the
+        // pad fallback. If we can't even read it, do NOT spend — crop instead.
+        const srcNorm = await normalizeReframeSource(sourceUrl);
+        if (!srcNorm) {
+          console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: source normalize failed — cropping, no spend`);
+          return fallback();
+        }
+
+        try {
+          const id = await submitImageGeneration({
+            model: REFRAME_OUTPAINT_MODEL(),
+            images: [srcNorm.url],
+            prompt: reframeOutpaintPrompt(aspectRatio),
+            aspectRatio,
+            resolution: REFRAME_RESOLUTION()
+          });
+          // BILLING: Charge point. submitImageGeneration's own contract is "NO
+          // retry (POST is charged)", so the money is committed HERE — before
+          // the poll, not after it. Setting `billed` at terminal-ok instead
+          // would lose the charge whenever polling times out on a prediction
+          // Atlas later completes and bills. Worst case this over-attributes a
+          // genuinely failed prediction, which is the safe direction: an
+          // overstated ledger is visible and correctable, an understated one is
+          // neither. NEVER cleared once true.
+          billed = true;
+
+          const outUrl = await pollPrediction(id);
+
+          // Retried (free, idempotent) — see fetchOutpaintOutput. A single blip
+          // here used to discard a generation we had already paid for.
+          const outBuf = await fetchOutpaintOutput(outUrl);
+          if (outBuf.length >= 512 && await outputRatioOk(outBuf, wr, hr)) {
+            const up = await uploadBufferToCloudinary(outBuf, { folder: 'liquidretail/reframes' });
             const url = up.secure_url || up.url;
-            if (url) { resultUrl = url; method = 'pad-fallback'; }
+            if (url) { resultUrl = url; method = 'outpaint'; }
+          } else {
+            console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: output rejected (bytes=${outBuf.length}) — pad fallback`);
           }
         } catch (err) {
-          console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: pad fallback failed — ${err.message}`);
+          // BILLING: err.charged — POST resolved (Atlas accepted, may have billed)
+          // but response carried no prediction id, so we can't poll. Still set
+          // billed and ledger rather than lose the spend.
+          if (err?.charged) billed = true;
+          console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: outpaint failed — ${err.message}`);
+        }
+
+        // 6a. Drop the normalized-source mirror IF we made one (opaque, correctly
+        //     oriented sources are handed to Atlas by their original URL and have
+        //     nothing to clean up). The mirror exists only so the model could
+        //     fetch flattened/oriented bytes; the prediction has reached a
+        //     terminal state by here, so Atlas will never re-fetch it, and the pad
+        //     below uses srcNorm.buffer (in-memory), not this URL. Without this,
+        //     every re-encoded reframe would leak a permanent Cloudinary asset.
+        //     Best-effort — deleteFromCloudinary catches internally, never throws.
+        if (srcNorm.mirrored) await deleteFromCloudinary(srcNorm.url);
+
+        // 6b. Rejected or failed → $0 deterministic pad from the normalized
+        //     source. Nothing is cropped or lost; the whole subject stays visible.
+        if (!resultUrl) {
+          try {
+            // Prefer a sampled SOLID fill when the extended edges are flat. The
+            // blurred cover is a scaled-up copy of the frame, so on a uniform
+            // studio background it smears product colour (and hair) into the
+            // bands — visibly worse than matching the backdrop exactly. Blur is
+            // the right call only when the background genuinely has content.
+            const srcRatio = media.width > 0 && media.height > 0 ? media.width / media.height : null;
+            const fill = srcRatio
+              ? await detectBorderFill(srcNorm.buffer, srcRatio, wr / hr)
+              : { uniform: false, hex: null };
+            const padBuf = fill.uniform
+              ? (await padSolidBuffer(srcNorm.buffer, W, H, fill.hex)) || (await padToRatioBuffer(srcNorm.buffer, W, H))
+              : await padToRatioBuffer(srcNorm.buffer, W, H);
+            if (padBuf) {
+              const up = await uploadBufferToCloudinary(padBuf, { folder: 'liquidretail/reframes' });
+              const url = up.secure_url || up.url;
+              if (url) { resultUrl = url; method = 'pad-fallback'; }
+            }
+          } catch (err) {
+            console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: pad fallback failed — ${err.message}`);
+          }
+        }
+
+        // 7. LEDGER: spend EXACTLY ONCE if Atlas billed us — on every path,
+        //    success or rejected-then-padded. Best-effort; never blocks the URL.
+        if (billed) {
+          try {
+            await recordFlatCost({
+              stage: 'reframe-outpaint',
+              provider: 'atlas',
+              model: REFRAME_OUTPAINT_MODEL(),
+              brandId: brand?._id || media?.brandId || null,
+              mediaId: media?._id || null,
+              productId: media?.metadata?.catalogProductId || null,
+              purposeTag: `reframe:${aspectRatio}`,
+              costUsd: REFRAME_COST_USD()
+            });
+          } catch { /* telemetry only */ }
+        }
+
+        // 8. Persist the asset-library entry — but ONLY when Atlas actually billed
+        //    us. A persisted entry is a permanent cache hit, so its real job is to
+        //    stop a second POST for an asset we already paid for. Full $set of the
+        //    aspect key SUPERSEDES the claim (claim field is not copied into entry).
+        //
+        //    When we were NEVER billed (Atlas 5xx, bad key, blocked host, submit
+        //    threw) the pad is the right answer for THIS render, but persisting it
+        //    would lock this media+aspect to a blurred letterbox forever on the
+        //    strength of one transient outage. Leave the cache empty so a later
+        //    render retries the real uncrop — there is no spend to protect.
+        //    (method 'outpaint' implies billed, so this gates on `billed` alone.)
+        if (resultUrl && method) {
+          if (billed) await persistReframe(media, aspectKey, aspectRatio, resultUrl, method);
+          return resultUrl;
+        }
+
+        // Billed, but nothing usable came out of it (pad build AND upload failed).
+        // Persist the deterministic crop so the next render can't charge us a
+        // second time for this media+aspect. Labelled honestly so a targeted
+        // invalidation can find these later via method + ladderVersion.
+        const cropUrl = fallback();
+        if (billed && cropUrl) {
+          await persistReframe(media, aspectKey, aspectRatio, cropUrl, 'crop-after-bill');
+        }
+        return cropUrl;
+      } finally {
+        // CLAIM RELEASE: only when we hold a claim-only entry AND never billed.
+        // Unbilled → free the slot so a later render can retry the real outpaint.
+        // Billed → do NOT release: persist supersedes claim with the paid url, or
+        // if persist failed the lease soft-locks until TTL (avoids an immediate
+        // re-POST for an asset we already paid for but failed to share off-box).
+        if (holdClaim && !billed) {
+          await releaseReframeClaim(media._id, aspectKey, claimBy);
         }
       }
-
-      // 7. Ledger the spend EXACTLY ONCE if Atlas billed us — on every path,
-      //    success or rejected-then-padded. Best-effort; never blocks the URL.
-      if (billed) {
-        try {
-          await recordFlatCost({
-            stage: 'reframe-outpaint',
-            provider: 'atlas',
-            model: REFRAME_OUTPAINT_MODEL(),
-            brandId: brand?._id || media?.brandId || null,
-            mediaId: media?._id || null,
-            productId: media?.metadata?.catalogProductId || null,
-            purposeTag: `reframe:${aspectRatio}`,
-            costUsd: REFRAME_COST_USD()
-          });
-        } catch { /* telemetry only */ }
-      }
-
-      // 8. Persist the asset-library entry — but ONLY when Atlas actually billed
-      //    us. A persisted entry is a permanent cache hit, so its real job is to
-      //    stop a second POST for an asset we already paid for.
-      //
-      //    When we were NEVER billed (Atlas 5xx, bad key, blocked host, submit
-      //    threw) the pad is the right answer for THIS render, but persisting it
-      //    would lock this media+aspect to a blurred letterbox forever on the
-      //    strength of one transient outage. Leave the cache empty so a later
-      //    render retries the real uncrop — there is no spend to protect.
-      //    (method 'outpaint' implies billed, so this gates on `billed` alone.)
-      if (resultUrl && method) {
-        if (billed) await persistReframe(media, aspectKey, aspectRatio, resultUrl, method);
-        return resultUrl;
-      }
-
-      // Billed, but nothing usable came out of it (pad build AND upload failed).
-      // Persist the deterministic crop so the next render can't charge us a
-      // second time for this media+aspect. Labelled honestly so a targeted
-      // invalidation can find these later via method + ladderVersion.
-      const cropUrl = fallback();
-      if (billed && cropUrl) {
-        await persistReframe(media, aspectKey, aspectRatio, cropUrl, 'crop-after-bill');
-      }
-      return cropUrl;
     })();
 
     _inflightReframes.set(memoKey, work);
@@ -1263,11 +1449,16 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
   }
 }
 
-// method: 'exact' | 'outpaint' | 'pad-fallback' | 'crop-after-bill'
+// method: 'exact' | 'pad-product-only' | 'outpaint' | 'pad-fallback' | 'crop-after-bill'
 // ladderVersion lets a future change invalidate $0 tiers selectively without
 // re-spending on entries that cost real money.
+// Returns true when the DB write succeeded (or was skipped because there is no
+// media._id — in-memory only). Returns false when Media.updateOne failed: the
+// calling process still has the paid URL in its lean doc, but other processes
+// cannot see it and may re-POST after the claim TTL — spend is unprotected
+// off-box. Never throws.
 async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method) {
-  if (!finalUrl) return;
+  if (!finalUrl) return false;
   const entry = {
     url: finalUrl,
     aspect: aspectRatio,
@@ -1282,14 +1473,25 @@ async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method) {
     media.metadata.reframes = media.metadata.reframes || {};
     media.metadata.reframes[aspectKey] = entry;
   }
-  if (!media?._id) return;
+  if (!media?._id) return true;
   try {
+    // Full $set supersedes any in-flight claim on this aspect key.
     await Media.updateOne(
       { _id: media._id },
       { $set: { [`metadata.reframes.${aspectKey}`]: entry } }
     );
+    return true;
   } catch (err) {
-    console.warn(`⚠️  reframeReferenceForAspect: persist failed (url kept) — ${err.message}`);
+    // PERSIST/BILLING visibility: was console.warn (easy to miss). A failed
+    // write after a billed generation leaves other processes without the paid
+    // URL — they will soft-wait on the claim then crop, and after TTL may
+    // re-POST. Operators must notice this.
+    console.error(
+      `❌ reframeReferenceForAspect: PERSIST FAILED — paid reframe URL not shared ` +
+      `across processes; spend unprotected off-box (media=${media._id} aspect=${aspectKey} ` +
+      `method=${method}) — ${err.message}`
+    );
+    return false;
   }
 }
 

@@ -375,17 +375,26 @@ Category settings sit **between product and brand**, ordered **leaf → root**, 
 
 1. **Guards** — kill-switch / Atlas unconfigured / no source → crop, no spend. Persistent cache hit on `Media.metadata.reframes[aspectKey]` → return, no spend. In-process single-flight collapses concurrent callers for the same media+aspect (product fan-out shares reference medias across ads). Fresh DB re-read closes the post-settle window where a sibling worker persisted this aspect after the lean doc was loaded.
 2. **Exact-fit skip** — source aspect already within `REFRAME_SKIP_THRESHOLD` of target → Cloudinary crop, persisted as `method: 'exact'`, no spend.
-3. **Normalize source** — download (timeout + byte cap + content-type check) → sharp `.rotate()` (EXIF auto-orient) → `.flatten({ background: '#ffffff' })` (white-flatten so transparent PNGs aren't matted black by the model) → resize to max 2048px wide → JPEG q88 → re-host on Cloudinary. Normalize failure → crop, **no spend** — an un-normalized source is the artifact-prone path this ladder replaces.
-4. **Outpaint** — single billable POST to `REFRAME_OUTPAINT_MODEL` at `REFRAME_RESOLUTION`. Prompt is the verbatim "Expand and uncrop…" spec with an explicit do-not-alter-the-subject clause (the old prompt's missing subject-preservation guard was the artifact root cause).
-5. **Validate output** — byte floor (512B) + aspect ratio within `REFRAME_RATIO_TOLERANCE` of target (ratio only — pixel size is never compared). Rejected → falls through to the pad.
-6. **Pad fallback** — $0 deterministic letterbox (sharp: normalized source scaled to cover + `.blur(24)` as background, same source scaled to fit composited centered on top); nothing cropped or lost. Persisted as `method: 'pad-fallback'`.
-7. **Cleanup** — the normalized-source Cloudinary mirror is deleted once the prediction reaches a terminal state (best-effort, never throws), so a reframe no longer leaks a permanent Cloudinary asset.
+3. **Product-only $0 pad (new, tier 5b)** — `Media.classification.shotType === 'product_only'` → deterministic pad, **before any billable POST**. See "Product-only routing" below for the full rationale. Persisted as `method: 'pad-product-only'`. Any failure here falls through to step 4 rather than returning a crop.
+4. **Normalize source** (conditional) — download (timeout + byte cap + content-type check) → sharp `.rotate()` (EXIF auto-orient) → `.flatten({ background: '#ffffff' })` (white-flatten so transparent PNGs aren't matted black by the model) → resize to max 2048px wide → JPEG q88 → re-host on Cloudinary, but **only when the source carries alpha or an EXIF rotation** — otherwise the original bytes are forwarded untouched. Normalize failure → crop, **no spend** — an un-normalized source is the artifact-prone path this ladder replaces.
+5. **Outpaint** — single billable POST to `REFRAME_OUTPAINT_MODEL` at `REFRAME_RESOLUTION` (default `4k`). Prompt selected by `REFRAME_PROMPT_STYLE` (default `reframe`; anything unrecognised falls back to it): `reframe` is the conservative extension instruction; `uncrop` is the verbatim "Expand and uncrop…" spec — better at revealing scene on cropped lifestyle frames, but its "continue the subject (reveal more of the body/product/clothing)" clause is the exact mechanism behind the fabrication findings below, so it isn't the default.
+6. **Validate output** — byte floor (512B) + aspect ratio within `REFRAME_RATIO_TOLERANCE` of target (ratio only — pixel size is never compared). Rejected → falls through to the pad.
+7. **Pad fallback** — $0 deterministic letterbox from the normalized source. Prefers a sampled **solid** fill (`detectBorderFill`, same check as step 3) when the extended edges are flat and agree with each other; falls back to the blurred cover (scaled-to-cover + `.blur(24)`) only when the background genuinely has content — on a uniform studio background the blur smears product colour and hair into the bands. Persisted as `method: 'pad-fallback'`.
+8. **Cleanup** — the normalized-source Cloudinary mirror (if one was made) is deleted once the prediction reaches a terminal state (best-effort, never throws), so a reframe no longer leaks a permanent Cloudinary asset.
 
-A persisted entry's `method` is one of `'exact' | 'outpaint' | 'pad-fallback'`.
+A persisted entry's `method` is one of `'exact' | 'pad-product-only' | 'outpaint' | 'pad-fallback' | 'crop-after-bill'`.
 
-**`billed` invariant (money-critical):** flips true the instant `pollPrediction` resolves — Atlas bills on terminal-ok — and is never cleared afterward, so `recordFlatCost` fires on **every** subsequent path, including a rejected output that falls through to the pad. This closes a pre-existing ledger gap where a Cloudinary upload failure after a successful generation skipped the cost record entirely.
+**Product-only routing — why generative outpaint is banned on these shots:** Measured on 20 live generations across 8 real catalogue images (2026-07-24): no Atlas model exposes a mask or pixel-passthrough (0 of 437 catalog models), so the whole canvas is re-synthesised on every outpaint call. On flat-lay/studio product shots that doesn't just add artifacts — it **fabricates merchandise**: a pair of PELAGIC shorts came back as full-length trousers, a waistband crop came back as an invented whole garment with the "PELAGIC HIGH PERFORMANCE" lockup reduced to illegible marks, and an embroidered Soludos espadrille came back with a different arrangement of fruits than the shoe actually being sold. That is product misrepresentation, not an aesthetic artifact — **do not simplify this routing away** on the assumption it's just extra caution. A deterministic `c_pad` scales-to-fit and never redraws a pixel, so the product ships exactly as photographed, for $0.
 
-**Known tradeoff:** a persisted `pad-fallback` entry is a permanent cache hit — a single transient Atlas failure locks that image+aspect to a letterbox until the entry is invalidated (`ladderVersion` makes targeted invalidation possible).
+Routing is on `isProductOnlyShot` (`Media.classification.shotType === 'product_only'`) — LLM-judged, so a hint, not a guarantee. The asymmetry favours trusting it anyway: a false positive costs only a letterbox with the product intact, while a false negative risks invented product. Gated by `REFRAME_PRODUCT_ONLY_PAD` (default on).
+
+`detectBorderFill` samples only the edges the padding will actually add (a 1:1 source going to 9:16 gains height, so left/right never matter) on a ~5KB Cloudinary derivative (`fetchBorderSample`). Edges that are each flat AND agree with each other → exact `b_rgb:<hex>` match; otherwise `b_auto:predominant_gradient`, which Cloudinary derives from the border server-side and is the always-available soft option on this plan (`b_blurred` needs an add-on this account doesn't have — see `services/extendedCropsService.js`). Measured against real imagery: studio white = stddev 0.0, a lifestyle frame = 27–39; threshold is `REFRAME_BORDER_STD_MAX` (default `8`). Both transforms were confirmed returning HTTP 200 at exactly 720×1280; `b_blurred` still 400s on this plan — the control that proves the check detects add-on gating, not a false negative.
+
+Non-Cloudinary sources can't be transformed by URL, so they pad locally via `padSolidBuffer` + upload instead — still zero model spend.
+
+**`billed` invariant (money-critical):** flips true the instant `pollPrediction` resolves — Atlas bills on terminal-ok — and is never cleared afterward, so `recordFlatCost` fires on **every** subsequent path, including a rejected output that falls through to the pad. This closes a pre-existing ledger gap where a Cloudinary upload failure after a successful generation skipped the cost record entirely. The product-only pad (step 3) returns before any POST, so it never touches `billed` or the ledger.
+
+**Known tradeoff:** a persisted `pad-fallback` or `pad-product-only` entry is a permanent cache hit — a single transient Atlas failure, or a wrong `shotType` classification, locks that image+aspect to a letterbox until the entry is invalidated (`ladderVersion` makes targeted invalidation possible).
 
 ### Titling composite
 
@@ -420,7 +429,7 @@ A persisted entry's `method` is one of `'exact' | 'outpaint' | 'pad-fallback'`.
 ### Models & cost
 
 - Atlas image-to-video (default Gemini Omni; Grok / Veo slugs in `MODEL_CAPS`) — rate-limited; **429s if concurrency > 1**.
-- Per-ref generative reframe (nano-banana-2 class edit when enabled) — 3-tier ladder (exact-fit skip → outpaint → $0 pad fallback); outpaint billed at `REFRAME_COST_USD` per image, cached per media+aspect on first success.
+- Per-ref generative reframe (nano-banana-2 class edit when enabled) — ladder is exact-fit skip → product-only $0 pad → outpaint → $0 pad fallback; outpaint billed at `REFRAME_COST_USD` per image (default `$0.08` @ `4k`), cached per media+aspect on first success. Product-only shots (`Media.classification.shotType`) never reach the billable POST.
 - LayoutInput derivation (Gemini / existing builder) when artifact missing — non-fatal.
 - GPT storyboard only on non-Atlas paths that still call it.
 
@@ -438,12 +447,15 @@ A persisted entry's `method` is one of `'exact' | 'outpaint' | 'pad-fallback'`.
 | `ATLAS_POLL_INTERVAL_MS` | `15000` (`defaults.env`; code fallback `5000`) | Prediction poll interval |
 | `ATLAS_VIDEO_MODEL` | (empty) | Optional model override in resolve chain |
 | `REFRAME_ENABLED` | `true` | Master switch for generative reframe of video reference images; `false` → Cloudinary crop only |
-| `REFRAME_OUTPAINT_MODEL` | `google/nano-banana-2/edit` | Atlas image-edit model for outpaint (billable per image, single submit) |
-| `REFRAME_RESOLUTION` | `1k` | Outpaint output resolution (`1k`\|`2k`\|`4k`) |
+| `REFRAME_OUTPAINT_MODEL` | `google/nano-banana-2/edit-developer` | Atlas image-edit model for outpaint (billable per image, single submit; `-developer` is a half-price billing variant, not a lower-fidelity tier) |
+| `REFRAME_RESOLUTION` | `4k` | Outpaint output resolution (`1k`\|`2k`\|`4k`). `4k` per operator decision (2026-07-24) after reviewing 20 live generations side by side — held product geometry better than `1k`; the reframed reference is also surfaced at full size in the generation inspector. The render itself stays 720p (`ATLAS_VIDEO_RESOLUTION`) |
+| `REFRAME_PROMPT_STYLE` | `reframe` | `reframe` (conservative, default) \| `uncrop` (scene-revealing, riskier on product-only imagery — see reframe ladder step 5); unrecognised values fall back to `reframe` |
 | `REFRAME_SKIP_THRESHOLD` | `0.985` | Skip outpaint when source aspect is within this ratio of target (0–1) |
-| `REFRAME_COST_USD` | `0.08` | Per-image outpaint price recorded in the cost ledger (observability only, not a spend gate) |
+| `REFRAME_COST_USD` | `0.08` | Per-image outpaint price recorded in the cost ledger (observability only, not a spend gate). `0.08` reflects `-developer` @ `4k`; readme documents "4K costs 2x" but not whether that stacks on the discounted `-developer` base, so this deliberately errs high |
 | `REFRAME_RATIO_TOLERANCE` | `0.05` | Relative ratio tolerance when validating outpaint output (ratio only, never pixel size) |
 | `REFRAME_MAX_SOURCE_BYTES` | `52428800` (50 MiB) | Max bytes for source / outpaint downloads |
+| `REFRAME_PRODUCT_ONLY_PAD` | `true` | Route `product_only`-classified shots to the deterministic $0 pad instead of the billable outpaint (see "Product-only routing" above); `false` accepts the merchandise-fabrication risk |
+| `REFRAME_BORDER_STD_MAX` | `8` | Max per-channel stddev on an extended edge to treat the background as flat/uniform and match it with a solid fill (studio white measures `0.0`; lifestyle frames measured `27`–`39`) |
 
 Secret: `ATLAS_API_KEY`.
 
