@@ -47,6 +47,40 @@ try {
   console.warn(`[ensurePuppeteerChrome] mkdir failed: ${err.message} — proceeding anyway`);
 }
 
+// Pre-clean any HALF-INSTALLED chrome/<build>/ directories. Puppeteer's
+// install treats a pre-existing build directory as "already installed"
+// and skips the download — but if the previous install died mid-extract,
+// the folder is there but the actual chrome executable inside is not,
+// producing:
+//   Error: All providers failed for chrome X.Y.Z:
+//     The browser folder (.../chrome/linux-X.Y.Z) exists but the
+//     executable (.../chrome/linux-X.Y.Z/chrome-linux64/chrome) is missing
+// Deleting the skeleton up-front forces a clean re-download.
+const chromeDirEarly = path.join(CACHE_DIR, 'chrome');
+if (fs.existsSync(chromeDirEarly)) {
+  try {
+    const stale = fs.readdirSync(chromeDirEarly, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .filter((e) => {
+        // A build is "complete" if the chrome-linux64/chrome executable
+        // (Linux) or chrome-mac/Google Chrome for Testing.app (mac) or
+        // chrome-win64/chrome.exe (win) exists. Missing → skeleton.
+        const buildPath = path.join(chromeDirEarly, e.name);
+        return !fs.existsSync(path.join(buildPath, 'chrome-linux64', 'chrome'))
+            && !fs.existsSync(path.join(buildPath, 'chrome-win64', 'chrome.exe'))
+            && !fs.existsSync(path.join(buildPath, 'chrome-mac-x64', 'Google Chrome for Testing.app'))
+            && !fs.existsSync(path.join(buildPath, 'chrome-mac-arm64', 'Google Chrome for Testing.app'));
+      });
+    for (const s of stale) {
+      const p = path.join(chromeDirEarly, s.name);
+      console.log(`[ensurePuppeteerChrome] removing stale skeleton: ${p}`);
+      fs.rmSync(p, { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.warn(`[ensurePuppeteerChrome] pre-clean failed: ${err.message} — proceeding anyway`);
+  }
+}
+
 // Runtime env for the install subprocess. PUPPETEER_CACHE_DIR is
 // puppeteer's highest-priority resolver, higher than the .puppeteerrc
 // file. Belt-and-suspenders.

@@ -345,9 +345,11 @@ require('./services/progressService')
   .catch(err => console.warn(`🧹 progress sweep failed at boot: ${err.message}`));
 
 // Puppeteer Chrome availability probe — logs the resolved cache dir
-// and whether a Chrome build survived from build → runtime. Turns a
-// silent "image ads all fail at render" regression into a visible
-// startup warning. See scripts/ensurePuppeteerChrome.js + .puppeteerrc.cjs.
+// and whether an ACTUAL chrome executable survived the build → runtime
+// transition. A directory-only check was the wrong signal: puppeteer's
+// install leaves an empty skeleton dir on partial extracts, and the
+// probe would report "Chrome found" while runtime launches still fail.
+// Now verifies the platform-specific executable path inside the build.
 (() => {
   try {
     const fs   = require('fs');
@@ -359,12 +361,27 @@ require('./services/progressService')
       console.warn(`🕵️  puppeteer: no Chrome dir at ${chromeDir} — image ads will fail at render. Check the postinstall log.`);
       return;
     }
-    const builds = fs.readdirSync(chromeDir).filter((n) => !n.startsWith('.'));
+    const builds = fs.readdirSync(chromeDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name);
     if (builds.length === 0) {
-      console.warn(`🕵️  puppeteer: ${chromeDir} exists but is empty — image ads will fail.`);
+      console.warn(`🕵️  puppeteer: ${chromeDir} has no build directories — image ads will fail.`);
       return;
     }
-    console.log(`🕵️  puppeteer: Chrome found at ${chromeDir} — builds: ${builds.join(', ')}`);
+    // Check for the actual chrome binary — Linux is the Render deploy
+    // target; the mac/win checks stay for local dev-machine parity.
+    const candidateExes = (buildName) => [
+      path.join(chromeDir, buildName, 'chrome-linux64', 'chrome'),
+      path.join(chromeDir, buildName, 'chrome-win64',   'chrome.exe'),
+      path.join(chromeDir, buildName, 'chrome-mac-x64',   'Google Chrome for Testing.app'),
+      path.join(chromeDir, buildName, 'chrome-mac-arm64', 'Google Chrome for Testing.app'),
+    ];
+    const complete = builds.filter((b) => candidateExes(b).some((p) => fs.existsSync(p)));
+    if (complete.length === 0) {
+      console.warn(`🕵️  puppeteer: ${builds.length} build dir(s) exist but no chrome executable — image ads will fail at render. Skeleton dirs: ${builds.join(', ')}`);
+      return;
+    }
+    console.log(`🕵️  puppeteer: Chrome executable verified at ${chromeDir} — builds: ${complete.join(', ')}`);
   } catch (err) {
     console.warn(`🕵️  puppeteer probe failed: ${err.message}`);
   }
