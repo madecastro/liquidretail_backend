@@ -1590,15 +1590,24 @@ async function expandDeterministicVideo({
       : null;
     if (direct && allowed.has(direct)) return direct;
 
+    // Only outcome:'product_match' counts. 'product_category' means detect
+    // placed the media in the same CATEGORY as the SKU, which is not evidence
+    // that this image depicts THIS product — seeding a product video from it
+    // would ship ~$1 of creative showing something else. Category-only picks
+    // are dropped (and logged by the caller) rather than quietly promoted.
     const candidates = (Array.isArray(doc?.matchedProducts) ? doc.matchedProducts : [])
-      .filter(m => m?.catalogProductId != null && allowed.has(String(m.catalogProductId)))
+      .filter(m =>
+        m?.catalogProductId != null &&
+        allowed.has(String(m.catalogProductId)) &&
+        m.outcome === 'product_match')
       .map(m => ({
-        id:    String(m.catalogProductId),
-        exact: m.outcome === 'product_match' ? 1 : 0,
-        conf:  Number.isFinite(m.confidence) ? m.confidence : 0
+        id:   String(m.catalogProductId),
+        // Missing/NaN confidence sorts LAST rather than tying at 0, so a scored
+        // match always beats an unscored one instead of winning on id order.
+        conf: Number.isFinite(m.confidence) ? m.confidence : -1
       }));
     if (!candidates.length) return null;
-    candidates.sort((a, b) => (b.exact - a.exact) || (b.conf - a.conf) || a.id.localeCompare(b.id));
+    candidates.sort((a, b) => (b.conf - a.conf) || a.id.localeCompare(b.id));
     return candidates[0].id;
   }
 
@@ -1612,8 +1621,18 @@ async function expandDeterministicVideo({
   // matchedProducts[].catalogProductId. resolveSeedProductId below uses both.
   const productIdSet = new Set(productIds.map(String));
   const seedOids = (seedMediaIds || []).map(toObjectId).filter(Boolean);
+  // brandId scoping is explicit now. The dropped source:'catalog-product' filter
+  // was never a security control, but it did incidentally narrow what an
+  // arbitrary seedMediaId could load. Since these ids come straight off the
+  // request body (parsePhase3WizardFields only validates ObjectId shape), scope
+  // the query to this brand rather than relying on the downstream productIdSet
+  // check to be the only thing standing between a foreign id and a load.
+  const seedBrandOid = toObjectId(brandId);
   const seedDocs = seedOids.length
-    ? await Media.find({ _id: { $in: seedOids } })
+    ? await Media.find({
+        _id: { $in: seedOids },
+        ...(seedBrandOid ? { brandId: seedBrandOid } : {})
+      })
         .select('_id metadata fileType source matchedProducts')
         .lean()
     : [];
@@ -1666,6 +1685,47 @@ async function expandDeterministicVideo({
       // ONE ad with the ordered reference stack; position 0 = primary seed.
       referenceMediaIds = picks.slice();
       mediaId = picks[0];
+
+      // PRODUCT ANCHOR. A non-empty referenceMediaIds makes buildReferenceImages
+      // take the ordered-only path, which SKIPS seed+catalog assembly entirely.
+      // That is correct when the picks are catalog imagery, but when every pick
+      // is related/social media it would hand the model a lifestyle frame and
+      // nothing else — worse product fidelity than the old behaviour, where the
+      // pick was silently dropped and the ad fell back to hero+alts. Paying ~$1
+      // for a weaker stack than we had before is not a fix.
+      //
+      // So: an operator picking a lifestyle shot means "make this the PRIMARY
+      // seed", not "discard the product imagery". If none of the picks is a
+      // catalog mirror for this product, append the catalog hero after them —
+      // position 0 stays theirs, and the model still gets a product anchor.
+      const hasCatalogAnchor = picks.some(id => {
+        const doc = seedById.get(String(id));
+        const direct = doc?.metadata?.catalogProductId;
+        return direct != null && String(direct) === pidStr;
+      });
+      if (!hasCatalogAnchor) {
+        const anchor = await Media.findOne({
+          source: 'catalog-product',
+          'metadata.catalogProductId': productOid,
+          'metadata.imageRole': 'hero'
+        }).select('_id').lean()
+          || await Media.findOne({
+            source: 'catalog-product',
+            'metadata.catalogProductId': productOid
+          }).sort({ createdAt: 1 }).select('_id').lean();
+        if (anchor?._id && !referenceMediaIds.some(x => String(x) === String(anchor._id))) {
+          referenceMediaIds.push(anchor._id);
+          console.log(
+            `📦 expandDeterministicVideo[${pidStr}]: picks are all non-catalog — appended ` +
+            `catalog anchor ${anchor._id} after ${picks.length} operator pick(s)`
+          );
+        } else if (!anchor?._id) {
+          console.warn(
+            `📦 expandDeterministicVideo[${pidStr}]: picks are all non-catalog and no catalog ` +
+            `Media exists to anchor them — shipping seed-only stack`
+          );
+        }
+      }
     } else {
       // Feed-order hero: imageRole hero → earliest createdAt → lazy materialize.
       let hero = await Media.findOne({
