@@ -57,6 +57,17 @@ function plateIsLightGlobal(plateHints, groups, timeScale, meta) {
   return lightWeight > darkWeight;
 }
 
+// Extract the value a bind-chain entry contributes at this render.
+// Entries are either meta field names (strings) OR literal fallback
+// objects ({ literal: <value> }). Literals always "win" if reached —
+// they're the operator's "if nothing else, show this" floor.
+function extractBindEntry(entry, meta) {
+  if (entry && typeof entry === 'object' && Object.prototype.hasOwnProperty.call(entry, 'literal')) {
+    return entry.literal;
+  }
+  return meta?.[entry];
+}
+
 function resolveSlotContent(slot, meta) {
   const brandMode = meta?.endcardMode === 'brand';
   if (!slot.visible) return null;
@@ -74,10 +85,11 @@ function resolveSlotContent(slot, meta) {
   const chain = brandMode && slot.brandModeBind ? slot.brandModeBind : slot.bind;
 
   // Multi-value slots return the source array (capped at maxItems, empty
-  // slots skipped). Bind chain picks the first non-empty array.
+  // slots skipped). Bind chain picks the first non-empty array; a
+  // literal entry always short-circuits with its embedded array.
   if (slot.slotType === 'multi') {
-    for (const field of chain) {
-      const arr = meta?.[field];
+    for (const entry of chain) {
+      const arr = extractBindEntry(entry, meta);
       if (Array.isArray(arr) && arr.length > 0) {
         const cap = slot.treatment?.maxItems ?? 4;
         const items = arr
@@ -93,16 +105,18 @@ function resolveSlotContent(slot, meta) {
   // Image slots return the URL string. Same first-non-empty semantics as
   // text, but the value stays as-is (no .trim() on URLs beyond whitespace).
   if (slot.slotType === 'image') {
-    for (const field of chain) {
-      const v = meta?.[field];
+    for (const entry of chain) {
+      const v = extractBindEntry(entry, meta);
       if (typeof v === 'string' && v.trim() !== '') return v.trim();
     }
     return null;
   }
 
-  // Text: first non-empty stringified value in the bind chain.
-  for (const field of chain) {
-    const v = meta?.[field];
+  // Text: first non-empty stringified value in the bind chain. Literal
+  // entries always contribute (they can't be "empty" by construction —
+  // the validator rejects null literals).
+  for (const entry of chain) {
+    const v = extractBindEntry(entry, meta);
     if (v != null && String(v).trim() !== '') return String(v).trim();
   }
   return null;

@@ -314,9 +314,13 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
       const slotType = slotTypeForKey(s.key);
       out.slotType = slotType;
 
-      // bind — chain shape depends on slot type. Rating is composite so
-      // an empty chain is legal; every other type needs at least one field
-      // from the type-appropriate whitelist.
+      // bind — chain shape depends on slot type. Each entry may be
+      // either a meta-field NAME (string from the type-appropriate
+      // whitelist) OR a LITERAL fallback ({ literal: <value> } object)
+      // that renders directly when reached. Literals act as a floor
+      // value — always non-empty by construction. Rating is composite
+      // so an empty chain is legal; every other type needs at least
+      // one entry.
       const bind = s.bind == null ? DEFAULT_BIND[s.key] : s.bind;
       const validFields = slotType === 'multi'  ? BINDABLE_MULTI_META_FIELDS
                         : slotType === 'image'  ? BINDABLE_IMAGE_META_FIELDS
@@ -325,19 +329,74 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
       if (!Array.isArray(bind)) {
         err(`${where}.bind must be an array`); continue;
       }
-      if (slotType !== 'rating' && bind.some((b) => !validFields.includes(b))) {
-        err(`${where}.bind (slot type '${slotType}') must be an array of ${validFields.join(', ')}`);
-        continue;
+      // Validate + normalize each entry. Strings pass through as-is;
+      // literal entries are shape-checked against the slot's type
+      // (string for text, array for multi, string URL for image).
+      const cleanBind = [];
+      let bindError = null;
+      for (let bi = 0; bi < bind.length; bi++) {
+        const b = bind[bi];
+        if (typeof b === 'string') {
+          if (slotType !== 'rating' && !validFields.includes(b)) {
+            bindError = `${where}.bind[${bi}] '${b}' unknown for slot type '${slotType}' (valid: ${validFields.join(', ')})`;
+            break;
+          }
+          cleanBind.push(b);
+        } else if (isPlainObject(b) && Object.prototype.hasOwnProperty.call(b, 'literal')) {
+          const v = b.literal;
+          // Shape check per slot type. Undefined → skip validation
+          // (defer to render time — same tolerance the existing
+          // multi/image treatment fields use).
+          if (v == null) {
+            bindError = `${where}.bind[${bi}]: literal cannot be null (omit the entry to have no fallback)`;
+            break;
+          }
+          if (slotType === 'multi' && !Array.isArray(v)) {
+            bindError = `${where}.bind[${bi}]: multi-slot literal must be an array`; break;
+          }
+          if (slotType !== 'multi' && Array.isArray(v)) {
+            bindError = `${where}.bind[${bi}]: literal for a ${slotType} slot must be a scalar, not an array`; break;
+          }
+          if (slotType === 'image' && typeof v !== 'string') {
+            bindError = `${where}.bind[${bi}]: image-slot literal must be a URL string`; break;
+          }
+          cleanBind.push({ literal: v });
+        } else {
+          bindError = `${where}.bind[${bi}]: expected a meta-field name string or { literal: <value> } object`;
+          break;
+        }
       }
-      out.bind = bind;
+      if (bindError) { err(bindError); continue; }
+      out.bind = cleanBind;
 
-      // brand mode
+      // brand mode — mirrors the same mixed-entry acceptance as bind.
       const brandMode = s.brandMode == null ? (DEFAULT_BRAND_MODE[s.key] || 'keep') : s.brandMode;
       if (!BRAND_MODES.includes(brandMode)) { err(`${where}.brandMode must be one of ${BRAND_MODES.join('|')}`); continue; }
       out.brandMode = brandMode;
-      const bmBind = s.brandModeBind == null ? (DEFAULT_BRAND_MODE_BIND[s.key] || null) : s.brandModeBind;
-      if (bmBind != null && (!Array.isArray(bmBind) || bmBind.some((b) => !BINDABLE_META_FIELDS.includes(b)))) {
-        err(`${where}.brandModeBind must be an array of meta fields`); continue;
+      const bmBindRaw = s.brandModeBind == null ? (DEFAULT_BRAND_MODE_BIND[s.key] || null) : s.brandModeBind;
+      let bmBind = null;
+      if (bmBindRaw != null) {
+        if (!Array.isArray(bmBindRaw)) {
+          err(`${where}.brandModeBind must be an array`); continue;
+        }
+        const cleanBmBind = [];
+        let bmErr = null;
+        for (let bi = 0; bi < bmBindRaw.length; bi++) {
+          const b = bmBindRaw[bi];
+          if (typeof b === 'string') {
+            if (!BINDABLE_META_FIELDS.includes(b)) {
+              bmErr = `${where}.brandModeBind[${bi}] '${b}' unknown`; break;
+            }
+            cleanBmBind.push(b);
+          } else if (isPlainObject(b) && Object.prototype.hasOwnProperty.call(b, 'literal')) {
+            if (b.literal == null) { bmErr = `${where}.brandModeBind[${bi}]: literal cannot be null`; break; }
+            cleanBmBind.push({ literal: b.literal });
+          } else {
+            bmErr = `${where}.brandModeBind[${bi}]: expected string or { literal: <value> }`; break;
+          }
+        }
+        if (bmErr) { err(bmErr); continue; }
+        bmBind = cleanBmBind;
       }
       out.brandModeBind = bmBind;
 
