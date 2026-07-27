@@ -1,20 +1,35 @@
 // services/productReviewsScrapeService.js
 //
-// On-page product review + rating engine. ONE extractor, shared by every
-// catalog ingest path, so a Shopify-integration brand, a sitemap/JSON-LD
-// brand and a Meta-catalog brand all capture reviews the same way.
+// Product review + rating engine. ONE entry point, shared by every catalog
+// ingest path, so a Shopify-integration brand, a sitemap/JSON-LD brand and
+// a Meta-catalog brand all capture reviews the same way.
 //
-// PLATFORM-AGNOSTIC BY DESIGN. It does not talk to Judge.me / Yotpo /
-// Bazaarvoice / Okendo / Loox / Stamped APIs. It reads the schema.org
-// review data those apps publish into the product page for Google rich
-// snippets — the one output format they all share. Platform detection
-// exists only to label quote provenance and to explain an empty result.
+// THREE TIERS, cheapest first, each additive (fetchProductReviews):
+//
+//   1. ON-PAGE STRUCTURED DATA (here) — the schema.org review data every
+//      review app publishes for Google rich snippets, the one output format
+//      they all share. One HTTP GET, no per-app knowledge. Free.
+//   2. VENDOR PUBLIC API (services/reviewAdapters) — PAGINATED. Rich
+//      snippets are a teaser: Judge.me publishes ~2 of 81 reviews,
+//      Bazaarvoice ~6 of 156, and a client-rendered widget publishes none.
+//      Tier 2 reads the same public endpoint the store's own widget reads,
+//      keyed by an identifier sitting in the page HTML. No credentials.
+//   3. HEADLESS CAPTURE (services/reviewHeadlessCapture) — PAGINATED. A
+//      real browser drives the widget for stores with neither snippets nor
+//      a readable API. Expensive, so opt-in (REVIEW_HEADLESS_ENABLED).
+//
+// Tier 1 always runs; 2 runs when 1 came up short; 3 only when 1+2 found
+// nothing. Results merge (aggregates fill gaps, quotes union + dedupe),
+// then rank positive-first and truncate to the storage cap.
 //
 // Captured per product:
-//   rating       — aggregateRating.ratingValue, normalized to a 0–5 scale
-//   reviewCount  — aggregateRating.reviewCount ?? ratingCount
-//   quotes[]     — { text, title, author, rating, datePublished, source }
-//   platform     — 'bazaarvoice' | 'judge.me' | … | null
+//   rating              — aggregate, normalized to a 0–5 scale
+//   reviewCount         — the store's own total
+//   quotes[]            — { text, title, author, rating, datePublished, source }
+//   ratingDistribution  — star histogram of the reviews WE fetched
+//   reviewsFetched      — denominator for that histogram (NOT reviewCount)
+//   tiers[]             — provenance: ['json-ld','api:judge.me'] …
+//   platform            — 'bazaarvoice' | 'judge.me' | … | null
 //
 // PER-REVIEW STARS ARE THE POINT. The previous extractors kept only
 // { text, author } and dropped review.reviewRating.ratingValue, so
@@ -53,6 +68,11 @@ const MIN_POSITIVE_STARS = 4;
 const MAX_QUOTE_CHARS  = 400;
 const MAX_TITLE_CHARS  = 140;
 const MAX_AUTHOR_CHARS = 120;
+
+// Headless capture (tier 3) is off by default: a real browser per product
+// is orders of magnitude more expensive than an HTTP GET. Turn it on for a
+// brand whose review app renders client-side, or pass useHeadless per call.
+const HEADLESS_DEFAULT = process.env.REVIEW_HEADLESS_ENABLED === 'true';
 
 // Refresh cadence for a brand-wide re-scrape. Matches the 30-day TTL the
 // Gemini/SerpAPI enrichment caches use so the two can't fight.
@@ -409,14 +429,100 @@ function extractOnPageReviews(html, { platform = undefined, maxQuotes = MAX_QUOT
 }
 
 /**
- * fetchProductReviews(productUrl, opts?) → extract result + { ok, reason }
- * Robots-aware, throttled fetch (httpScrapeClient) then extract. Never
- * throws — a review miss must not fail a catalog sync.
+ * ratingDistributionOf(quotes) → [{ stars, count }] | null
+ * Star histogram over the reviews we actually collected. Descending by
+ * stars, only the buckets present. Null when nothing carried a rating.
+ *
+ * NOTE this is the distribution of the FETCHED SAMPLE, not of the store's
+ * whole review set — `reviewsFetched` next to it says how big that sample
+ * was, and `reviewCount` says how many the store claims in total. Callers
+ * that render percentages must divide by reviewsFetched, not reviewCount.
  */
-async function fetchProductReviews(productUrl, { timeoutMs = 15000, maxBytes = 4_000_000, maxQuotes = MAX_QUOTES } = {}) {
+function ratingDistributionOf(quotes) {
+  const buckets = new Map();
+  for (const q of quotes || []) {
+    if (!q || !Number.isFinite(q.rating)) continue;
+    const star = Math.max(1, Math.min(5, Math.round(q.rating)));
+    buckets.set(star, (buckets.get(star) || 0) + 1);
+  }
+  if (!buckets.size) return null;
+  return [...buckets.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([stars, count]) => ({ stars, count }));
+}
+
+/**
+ * mergeTier(base, tier) → base
+ * Fold a tier-2/3 result into the tier-1 snapshot. Aggregates fill gaps
+ * only — a vendor API's own count/average is authoritative when the page
+ * had none, but we never overwrite a figure the page stated. Quotes are
+ * unioned and deduped on normalized text, so the handful of rich-snippet
+ * reviews and the paginated set collapse into one list.
+ */
+function mergeTier(base, tier, label) {
+  if (!tier) return base;
+  if (base.rating == null && tier.average != null) {
+    base.rating = normalizeStars(tier.average);
+  }
+  if (base.reviewCount == null && tier.total != null) {
+    base.reviewCount = tier.total;
+  }
+  if (!base.vendorDistribution && tier.distribution) {
+    base.vendorDistribution = tier.distribution;
+  }
+
+  const seen = new Set(base.quotes.map(q => reviewKey(q.text)));
+  for (const q of tier.reviews || []) {
+    const key = reviewKey(q.text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    base.quotes.push(Object.assign({ source: tier.platform || base.platform || 'store' }, q));
+  }
+
+  base.quotesFound += (tier.reviews || []).length;
+  base.pagesFetched = (base.pagesFetched || 0) + (tier.pagesFetched || 0);
+  base.truncated = base.truncated || !!tier.truncated;
+  base.tiers.push(tier.platform ? `${label}:${tier.platform}` : label);
+  if (!base.platform && tier.platform) base.platform = tier.platform;
+  return base;
+}
+
+function reviewKey(text) {
+  return String(text || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+
+/**
+ * fetchProductReviews(productUrl, opts?) → merged result + { ok, reason }
+ *
+ * Three tiers, cheapest first, each additive:
+ *
+ *   1. ON-PAGE STRUCTURED DATA — one GET, the review app's rich-snippet
+ *      output. Free and always tried.
+ *   2. VENDOR PUBLIC API (services/reviewAdapters) — paginated. Runs when
+ *      tier 1 came up short: apps publish only a couple of reviews in
+ *      snippets (Judge.me ~2 of 81, Bazaarvoice ~6 of 156) and
+ *      client-rendered widgets publish none. Same public endpoint the
+ *      widget itself reads, no credentials.
+ *   3. HEADLESS CAPTURE (services/reviewHeadlessCapture) — a real browser,
+ *      paginated by driving the widget. Expensive, so it only runs when
+ *      tiers 1-2 found NOTHING and the caller opts in.
+ *
+ * Robots-aware and throttled throughout (httpScrapeClient). Never throws.
+ */
+async function fetchProductReviews(productUrl, {
+  timeoutMs = 15000,
+  maxBytes = 4_000_000,
+  maxQuotes = MAX_QUOTES,
+  useAdapters = true,
+  useHeadless = false,
+  adapterMaxPages = undefined,
+  adapterMaxReviews = undefined
+} = {}) {
   const fail = (reason) => ({
     ok: false, reason, rating: null, reviewCount: null,
-    quotes: [], platform: null, quotesFound: 0, source: null
+    quotes: [], platform: null, quotesFound: 0, source: null,
+    tiers: [], pagesFetched: 0, truncated: false,
+    ratingDistribution: null, reviewsFetched: 0
   });
   if (!productUrl) return fail('no productUrl');
 
@@ -434,8 +540,50 @@ async function fetchProductReviews(productUrl, { timeoutMs = 15000, maxBytes = 4
   if (res.rateLimited)  return fail('rate limited');
   if (!res.ok || !res.text) return fail(`http ${res.status || 'error'}`);
 
-  const extracted = extractOnPageReviews(res.text, { maxQuotes });
-  return Object.assign({ ok: true, reason: null }, extracted);
+  const html = res.text;
+  // Tier 1 keeps every review it can see — the storage cap is applied once
+  // at the end, after all tiers have contributed to the ranking pool.
+  const merged = Object.assign(
+    { ok: true, reason: null, tiers: [], pagesFetched: 0, truncated: false, vendorDistribution: null },
+    extractOnPageReviews(html, { maxQuotes: Infinity })
+  );
+  if (merged.source) merged.tiers.push('json-ld');
+
+  // ── tier 2: vendor public API, paginated ─────────────────────────
+  if (useAdapters && merged.quotes.length < maxQuotes) {
+    try {
+      const adapters = require('./reviewAdapters');
+      const viaApi = await adapters.fetchViaAdapters(html, productUrl, {
+        platform: merged.platform,
+        ...(adapterMaxPages   != null ? { maxPages:   adapterMaxPages }   : {}),
+        ...(adapterMaxReviews != null ? { maxReviews: adapterMaxReviews } : {})
+      });
+      if (viaApi) mergeTier(merged, viaApi, 'api');
+    } catch (err) {
+      console.warn(`   ⚠️  ${LOG}  adapter tier failed for ${productUrl}: ${err.message}`);
+    }
+  }
+
+  // ── tier 3: headless, only when the cheap tiers found nothing ────
+  if (useHeadless && !merged.quotes.length) {
+    try {
+      const headless = require('./reviewHeadlessCapture');
+      const viaBrowser = await headless.captureReviews(productUrl, {
+        platform: merged.platform,
+        maxReviews: adapterMaxReviews
+      });
+      if (viaBrowser) mergeTier(merged, viaBrowser, 'headless');
+    } catch (err) {
+      console.warn(`   ⚠️  ${LOG}  headless tier failed for ${productUrl}: ${err.message}`);
+    }
+  }
+
+  // Rank across everything collected, then cap for storage.
+  merged.reviewsFetched = merged.quotes.length;
+  merged.ratingDistribution = ratingDistributionOf(merged.quotes);
+  merged.quotes = rankQuotes(merged.quotes).slice(0, maxQuotes);
+  if (!merged.source && merged.tiers.length) merged.source = merged.tiers[0];
+  return merged;
 }
 
 // ── persistence ────────────────────────────────────────────────────
@@ -463,6 +611,20 @@ function buildProductReviews(extracted, existing = null) {
     platform:    extracted.platform || null,
     source:      extracted.source || null,
     quotesFound: extracted.quotesFound || 0,
+    // Star histogram of the reviews we collected. `reviewsFetched` is its
+    // denominator — NOT reviewCount, which is the store's total.
+    ratingDistribution: extracted.ratingDistribution
+      || ratingDistributionOf(extracted.quotes)
+      || null,
+    // Distribution as the vendor reported it, when their API gave one.
+    vendorDistribution: extracted.vendorDistribution || null,
+    reviewsFetched: extracted.reviewsFetched != null
+      ? extracted.reviewsFetched
+      : (extracted.quotes || []).length,
+    // Provenance: ['json-ld'], ['json-ld','api:judge.me'], ['headless:okendo'] …
+    tiers:        Array.isArray(extracted.tiers) ? extracted.tiers : [],
+    pagesFetched: extracted.pagesFetched || 0,
+    truncated:    !!extracted.truncated,
     fetchedAt:   new Date()
   };
 }
@@ -489,14 +651,23 @@ function isFresh(productReviews) {
  * the snapshot so existing consumers that read the top-level field pick
  * the on-page value up.
  */
-async function captureForProduct(row, { force = false, maxQuotes = MAX_QUOTES } = {}) {
+async function captureForProduct(row, {
+  force = false,
+  maxQuotes = MAX_QUOTES,
+  useAdapters = true,
+  useHeadless = HEADLESS_DEFAULT,
+  adapterMaxPages = undefined,
+  adapterMaxReviews = undefined
+} = {}) {
   const CatalogProduct = require('../models/CatalogProduct');
   if (!row || !row.productUrl) return { captured: false, reason: 'no productUrl' };
   if (!force && isFresh(row.productReviews)) {
     return { captured: false, reason: 'fresh' };
   }
 
-  const extracted = await fetchProductReviews(row.productUrl, { maxQuotes });
+  const extracted = await fetchProductReviews(row.productUrl, {
+    maxQuotes, useAdapters, useHeadless, adapterMaxPages, adapterMaxReviews
+  });
   if (!extracted.ok) return { captured: false, reason: extracted.reason };
 
   const productReviews = buildProductReviews(extracted, row.productReviews);
@@ -504,7 +675,7 @@ async function captureForProduct(row, { force = false, maxQuotes = MAX_QUOTES } 
     return {
       captured: false,
       reason: extracted.platform
-        ? `no structured reviews (${extracted.platform} widget renders client-side)`
+        ? `no reviews reachable (${extracted.platform}: no rich snippets, no public API hit${useHeadless ? ', headless found none' : ''})`
         : 'no structured reviews on page'
     };
   }
@@ -543,7 +714,14 @@ async function syncBrandProductReviews(brandId, {
   limit = SYNC_MAX_PER_RUN,
   concurrency = SYNC_CONCURRENCY,
   advertiserId = null,
-  run = null
+  run = null,
+  // Tier controls. Adapters (tier 2) are on — they are plain HTTP GETs to
+  // the same public endpoint the store's own widget reads. Headless
+  // (tier 3) is opt-in per run because it costs a browser per product.
+  useAdapters = true,
+  useHeadless = HEADLESS_DEFAULT,
+  adapterMaxPages = undefined,
+  adapterMaxReviews = undefined
 } = {}) {
   const CatalogProduct = require('../models/CatalogProduct');
   const Brand = require('../models/Brand');
@@ -583,6 +761,9 @@ async function syncBrandProductReviews(brandId, {
     skipped: 0,
     cancelled: false,
     platforms: {},
+    tiers: {},
+    reviewsCollected: 0,
+    pagesFetched: 0,
     durationMs: 0
   };
   if (!rows.length) {
@@ -614,7 +795,9 @@ async function syncBrandProductReviews(brandId, {
       }
 
       try {
-        const res = await captureForProduct(row, { force });
+        const res = await captureForProduct(row, {
+          force, useAdapters, useHeadless, adapterMaxPages, adapterMaxReviews
+        });
         if (res.captured) {
           summary.captured += 1;
           const pr = res.productReviews;
@@ -622,6 +805,11 @@ async function syncBrandProductReviews(brandId, {
           if (pr.rating != null) summary.withRating += 1;
           const key = pr.platform || 'unlabeled';
           summary.platforms[key] = (summary.platforms[key] || 0) + 1;
+          summary.reviewsCollected += pr.reviewsFetched || 0;
+          summary.pagesFetched += pr.pagesFetched || 0;
+          for (const t of pr.tiers || []) {
+            summary.tiers[t] = (summary.tiers[t] || 0) + 1;
+          }
         } else {
           summary.skipped += 1;
         }
@@ -648,7 +836,8 @@ async function syncBrandProductReviews(brandId, {
   summary.durationMs = Date.now() - t0;
 
   const note = `${summary.captured} captured · ${summary.withQuotes} with quotes · ` +
-    `${summary.withRating} with ratings · ${summary.skipped} skipped`;
+    `${summary.withRating} with ratings · ${summary.reviewsCollected} reviews read · ` +
+    `${summary.skipped} skipped`;
   if (!run) {
     if (cancelled) await handle.markCancelled?.();
     else await handle.succeed?.(note);
@@ -656,7 +845,8 @@ async function syncBrandProductReviews(brandId, {
 
   console.log(
     `${LOG}  reviews sync brand=${brand._id} ${note} ` +
-    `platforms=${JSON.stringify(summary.platforms)} in ${Math.round(summary.durationMs / 1000)}s`
+    `platforms=${JSON.stringify(summary.platforms)} tiers=${JSON.stringify(summary.tiers)} ` +
+    `in ${Math.round(summary.durationMs / 1000)}s`
   );
   return summary;
 }
