@@ -156,6 +156,61 @@ function tidyText(s, maxLen = null) {
 }
 
 /**
+ * truncateSentences(s, maxLen) → string
+ *
+ * Shorten a REVIEW BODY by dropping whole sentences from the end — never by
+ * cutting inside one. A review must always read as something the customer
+ * actually wrote, so:
+ *   · keep as many complete sentences as fit
+ *   · never append an ellipsis (an excerpt of whole sentences needs no mark,
+ *     and a "…" reads as the reviewer trailing off, which they did not)
+ *   · if even the FIRST sentence exceeds maxLen, keep the whole review rather
+ *     than mangle it — storing 40 extra characters is strictly better than
+ *     inventing a cut-off, and maxLen is a storage bound, not a display one
+ *
+ * Abbreviations are handled by requiring a terminator to be followed by
+ * whitespace AND a capital/quote/digit — so "5.5 in. wide" is one sentence, not
+ * three, while "perfectly. Second" splits.
+ *
+ * splitSentences is a SCAN, not a match: an earlier regex-match version
+ * silently dropped any prefix it could not match ("Measures 5.5 in. wide and
+ * fits perfectly." came back as "5 in. wide and fits perfectly."), which is
+ * exactly the kind of invisible data loss this function exists to prevent. The
+ * parts always concatenate back to the input.
+ */
+function splitSentences(str) {
+  const parts = [];
+  const re = /[.!?…]+(?=\s+["'“(\[]?[A-Z0-9]|\s*$)/g;
+  let start = 0;
+  let m;
+  while ((m = re.exec(str)) !== null) {
+    const end = m.index + m[0].length;
+    parts.push(str.slice(start, end));
+    start = end;
+  }
+  if (start < str.length) parts.push(str.slice(start));
+  return parts;
+}
+
+function truncateSentences(s, maxLen) {
+  const str = String(s == null ? '' : s).trim();
+  if (!str || str.length <= maxLen) return str;
+
+  const parts = splitSentences(str);
+  if (parts.length <= 1) return str;               // one sentence → keep it whole
+
+  let out = '';
+  for (const part of parts) {
+    const next = out + part;
+    if (next.trim().length > maxLen) break;
+    out = next;
+  }
+  out = out.trim();
+  // Nothing fit → the first sentence is longer than the cap; keep it entire.
+  return out || str;
+}
+
+/**
  * truncateWords(s, maxLen) → string
  * Cut at a WORD boundary and mark it. A hard slice produced stored reviews
  * ending "…would buy again but the new one is horrible. Pl" — 10 of 50 Ulta
@@ -192,6 +247,8 @@ module.exports = {
   cleanScrapedText,
   tidyText,
   truncateWords,
+  truncateSentences,
+  splitSentences,
   hasHtmlEntity,
   NAMED
 };

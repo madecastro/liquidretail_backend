@@ -32,7 +32,8 @@ const {
   toDate,
   text,
   distributionFromCounts,
-  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+  reviewText,
+  REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 25;                    // hard server ceiling: 26+ → HTTP 400
@@ -292,7 +293,7 @@ function parse(payload, ctx, page) {
 
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  const body = text(pick(raw, 'details.comments'), REVIEW_TEXT_MAX);
+  const body = reviewText(pick(raw, 'details.comments'));
   if (!body) return null;
   return {
     text: body,

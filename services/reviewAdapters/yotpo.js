@@ -24,7 +24,8 @@
 
 const {
   firstMatch, pick, pickAny, toInt, toFloat, toDate, text, distributionFromCounts, shopifyProductId,
-  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+  reviewText,
+  REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                  // under the 150 clamp, fewer huge payloads
@@ -78,7 +79,7 @@ function parse(payload) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.content, REVIEW_TEXT_MAX);
+  const body = reviewText(raw && raw.content);
   if (!body) return null;
   return {
     text: body,

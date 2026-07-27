@@ -1358,18 +1358,39 @@ function pickStrongestQuote(candidates) {
 
 // Normalize a raw quote object from any tier into the shape the
 // layout-input artifact expects: { text, author_name, source }.
+// A quote an LLM wrote or rewrote is not a first-party review, so it must not
+// inherit the first-party defaults below. `origin` is stamped at capture time
+// (see docs/REVIEW_VENDORS.md §7): 'scraped' by the review engine, 'llm-web' by
+// geminiSearchProvider/categoryReviewsService, 'synthesized' by
+// synthesizeQuoteFromReviewSummary. Legacy rows predating the stamp have no
+// origin and keep the previous behaviour.
+function isFirstPartyQuote(q) {
+  return q.origin !== 'llm-web' && q.origin !== 'synthesized';
+}
+
 function normalizeQuote(q) {
   if (!q?.text) return null;
   const rating = Number(q.rating);
+  const firstParty = isFirstPartyQuote(q);
   return {
     text:        String(q.text).trim(),
-    author_name: q.author_name || q.author || q.source || 'Verified buyer',
+    // "Verified buyer" is a CLAIM. Defaulting to it for an LLM-derived line
+    // asserts a verified purchase that nothing established — the exact
+    // laundering the provenance stamps exist to prevent. Non-first-party
+    // quotes fall back to a neutral label instead.
+    author_name: q.author_name || q.author || q.source ||
+                 (firstParty ? 'Verified buyer' : 'Customer'),
     source:      q.source || undefined,
-    verified:    q.verified !== undefined ? q.verified : true,
+    verified:    q.verified !== undefined ? q.verified : firstParty,
     // Carried through from the scrape so pickStrongestQuote can gate on
     // the reviewer's own star rating. undefined for tiers that have none.
     rating:      Number.isFinite(rating) ? rating : undefined,
-    title:       q.title || undefined
+    title:       q.title || undefined,
+    // Provenance survives normalisation — otherwise this funnel is exactly
+    // where a rewritten line becomes indistinguishable from a real review.
+    origin:      q.origin || undefined,
+    verbatim:    q.verbatim !== undefined ? q.verbatim : undefined,
+    scope:       q.scope || undefined
   };
 }
 
@@ -1441,7 +1462,13 @@ function synthesizeQuoteFromReviewSummary(ctx) {
   return {
     text:     first,
     source:   'review',
-    verified: false
+    verified: false,
+    // PROVENANCE: reviewSummary is LLM-written prose ABOUT the reviews, so its
+    // first sentence is not a review and must never be stored or rendered as
+    // one — even though it reads like a quote. See docs/REVIEW_VENDORS.md §7.
+    origin:   'synthesized',
+    verbatim: false,
+    scope:    'product'
   };
 }
 

@@ -20,7 +20,8 @@
 
 const {
   firstMatch, pick, pickAny, toInt, toFloat, toDate, text, distributionFromCounts, shopifyProductId,
-  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+  reviewText,
+  REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                  // real ceiling, not the documented 25
@@ -111,7 +112,7 @@ async function aggregate(ctx) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.body, REVIEW_TEXT_MAX);
+  const body = reviewText(raw && raw.body);
   if (!body) return null;
   return {
     text: body,

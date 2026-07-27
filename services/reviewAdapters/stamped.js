@@ -22,7 +22,8 @@
 
 const {
   firstMatch, pick, toInt, toFloat, toDate, text, shopifyProductId, shopDomain,
-  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+  reviewText,
+  REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                   // server cap
@@ -85,7 +86,7 @@ function parse(payload) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.reviewMessage, REVIEW_TEXT_MAX);
+  const body = reviewText(raw && raw.reviewMessage);
   if (!body) return null;
   return {
     text: body,

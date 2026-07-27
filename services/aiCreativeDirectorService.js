@@ -465,11 +465,18 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
 
 // Compact text → null/empty/length-capped clean snippet. Used to keep
 // the Director's inputSummary tight while still passing actual content.
+// Word-boundary truncation. The old slice(maxLen - 1) cut mid-word, which
+// matters most for social_proof_signal.primary_quote: the Director reads that
+// text and is asked to ground copy in it, so a quote ending "the new one is
+// horrible. Pl" invites the model to complete a sentence the reviewer never
+// wrote. utils/htmlEntities.truncateWords backs off to the last space and marks
+// the cut.
 function snippetText(s, maxLen) {
   if (!s || typeof s !== 'string') return null;
   const trimmed = s.replace(/\s+/g, ' ').trim();
   if (!trimmed) return null;
-  return trimmed.length > maxLen ? trimmed.slice(0, maxLen - 1) + '…' : trimmed;
+  if (trimmed.length <= maxLen) return trimmed;
+  return require('../utils/htmlEntities').truncateWords(trimmed, maxLen);
 }
 
 // Count distinct values in an array. Used for shot-type + content-nature
@@ -515,6 +522,31 @@ const ARCHETYPE_WEIGHTING = {
     `    AVOID        product_card_grid (multi-card layouts get clipped on small Display banner placements)`
   ].join('\n')
 };
+
+// ── the objective ────────────────────────────────────────────────────
+//
+// Shared verbatim by buildPrompt (V1) and buildPromptRound (V2) so the two
+// paths cannot drift on what the ad is FOR. Without this, both prompts read as
+// "match the signals" — signal-fitting, which optimises for a coherent-looking
+// concept rather than for a sale. The Judge downstream scores against the same
+// objective, so stating it here is what makes the two agree.
+const OBJECTIVE_BLOCK = [
+  `THE OBJECTIVE — every concept is judged on this:`,
+  `This is direct-response advertising. The ad's job is to move someone who is BROWSING into BUYING. It is not to win a design award, not to be clever, and not to "build awareness". If a choice looks better but sells less, it is the wrong choice.`,
+  ``,
+  `What actually converts, strongest first:`,
+  `  1. REMOVING A PURCHASE OBJECTION. Most people who don't buy have one specific unresolved worry — will it fit, is the colour real, is it durable, is it worth the price. Proof that answers that worry outsells proof that is merely flattering. A review saying "fits true to size" beats a review saying "I love it!!" every time, even though the second sounds more enthusiastic.`,
+  `  2. A SPECIFIC, CHECKABLE CLAIM. "Holds a charge six days" converts; "long battery life" does not. Specificity reads as true; superlatives read as marketing.`,
+  `  3. PROOF AT SCALE. A high rating with a large count (≥4.5 from ≥50) is credible on its own. A high rating from 3 reviews is not — lean on the quote instead of the number.`,
+  `  4. ONE CLEAR NEXT ACTION. Competing CTAs convert worse than one.`,
+  ``,
+  `Applying it:`,
+  `  - emotional_hook should name the objection the concept dissolves ("fit certainty", "worth the price", "will last") rather than a generic mood ("trust", "quality") whenever the data supports it.`,
+  `  - When picking which proof to surface, prefer the quote that resolves a doubt over the quote that praises hardest.`,
+  `  - NEVER build a concept around shipping, delivery, packaging or customer service. Those describe the retailer, not the product, and they do not move a purchase decision.`,
+  `  - rationale must say WHICH objection the concept removes and WHICH signal supports it. "Looks premium" is not a rationale.`,
+  `  - The honesty rule below is not in tension with this: an unsupported claim converts once and costs the client afterwards. Never promise proof the data can't back.`
+].join('\n');
 
 function buildFormatConstraints(platformFormat) {
   const { getFormatCaps, creativeBriefForPlatformFormat } = require('./platformFormats');
@@ -563,6 +595,8 @@ function buildPrompt({ inputSummary, creativeIntent, platformFormat = 'meta_feed
     `You are a creative director planning social-media ad creative for a brand.`,
     ``,
     `Your job: pick ${N_CONCEPTS} distinct creative concepts that match the signals below. You make STRATEGY decisions — archetype, hierarchy, recommended components — NOT coordinates. A downstream Layout Generator materializes each concept into pixels.`,
+    ``,
+    OBJECTIVE_BLOCK,
     ``,
     `RULES:`,
     `- DO NOT generate coordinates, rects, or pixel positions.`,
@@ -1112,6 +1146,8 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `Your job: emit ${N_CONCEPTS_ROUND} distinct creative concepts. Each concept declares: archetype + composition strategy (the V1 fields), WHICH media from the seeded universe it uses (media_picks), what output shape it materializes (output_shape), and the final copy strings it ships (copy_picks).`,
     ``,
     `ROUND CONTEXT: this is round ${roundIndex} for this product on ${platformFormat}. Earlier rounds (if any) are summarized in the AVOID block below. Each Generate press from the operator triggers a new round; concept diversity across rounds matters as much as within-round diversity.`,
+    ``,
+    OBJECTIVE_BLOCK,
     ``,
     `RULES:`,
     `- DO NOT generate coordinates, rects, or pixel positions. The Layout stage materializes pixels from your strategy + media_picks + output_shape declaration.`,

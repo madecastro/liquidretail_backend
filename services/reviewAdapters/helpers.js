@@ -10,7 +10,9 @@
 
 'use strict';
 
-const { cleanScrapedText, decodeHtmlEntities } = require('../../utils/htmlEntities');
+const {
+  cleanScrapedText, decodeHtmlEntities, truncateSentences
+} = require('../../utils/htmlEntities');
 
 // Stored length of one review body. 400 was too tight — measured live, 10 of 50
 // Ulta reviews and 1 of 50 Living Spaces reviews hit it and were cut mid-word.
@@ -148,13 +150,16 @@ function pageHost(pageUrl) {
  * Widget responses that ship HTML (Judge.me) → plain review text. Block
  * boundaries become spaces so "<p>a</p><p>b</p>" doesn't fuse into "ab".
  */
-function htmlToText(fragment, maxLen = 400) {
-  if (!fragment) return null;
-  const spaced = String(fragment)
+function stripReviewMarkup(fragment) {
+  return String(fragment)
     .replace(/<br\s*\/?>/gi, ' ')
     .replace(/<\/(p|div|li|h[1-6])>/gi, ' ')
     .replace(/<[^>]*>/g, '');
-  return cleanScrapedText(decodeHtmlEntities(spaced), maxLen);
+}
+
+function htmlToText(fragment, maxLen = 400) {
+  if (!fragment) return null;
+  return cleanScrapedText(decodeHtmlEntities(stripReviewMarkup(fragment)), maxLen);
 }
 
 /**
@@ -203,7 +208,34 @@ function text(v, maxLen) {
   return cleanScrapedText(v, maxLen);
 }
 
+/**
+ * reviewText(v) → string | null
+ * A review BODY: decoded, whitespace-normalised, and — only when it exceeds
+ * REVIEW_TEXT_MAX — shortened by keeping the MOST USEFUL whole sentences in
+ * their original order (utils/reviewText.shortenReview). Never mid-sentence,
+ * never an ellipsis, never rewritten. `text()` stays for titles/authors, where
+ * a word-boundary cut is appropriate.
+ */
+function reviewText(v) {
+  const clean = cleanScrapedText(v);            // no cap — decode + normalise only
+  if (!clean) return null;
+  return require('../../utils/reviewText').shortenReview(clean, REVIEW_TEXT_MAX);
+}
+
+/**
+ * reviewHtmlText(fragment) → string | null
+ * reviewText() for vendors that ship the body as an HTML fragment (Judge.me).
+ * Tags are stripped and entities decoded BEFORE any length decision, so the
+ * bound applies to the text a reader sees rather than to the markup.
+ */
+function reviewHtmlText(fragment) {
+  if (!fragment) return null;
+  return reviewText(decodeHtmlEntities(stripReviewMarkup(fragment)));
+}
+
 module.exports = {
+  reviewText,
+  reviewHtmlText,
   REVIEW_TEXT_MAX,
   REVIEW_TITLE_MAX,
   REVIEW_AUTHOR_MAX,

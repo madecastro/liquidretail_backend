@@ -32,7 +32,8 @@
 
 const {
   firstMatch, pick, toInt, toFloat, toDate, text,
-  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+  reviewText,
+  REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                   // hard server cap on Limit
@@ -138,6 +139,20 @@ function request(ctx, page) {
     Stats: 'Reviews',
     Sort: 'SubmissionTime:desc'          // deterministic page-to-page ordering
   });
+
+  // SERVER-SIDE RATING FILTER. Repeated Filter params are AND'ed, and Rating
+  // accepts eq/gt/gte/lt/lte, so one request returns only 4-and-5-star
+  // reviews. Bazaarvoice is the ONLY vendor of the nine that can do this in a
+  // single request (see docs/REVIEW_VENDORS.md §10) — it is how we stop
+  // spending a throttled request budget on reviews we would discard anyway.
+  //
+  // The driver only ever sets ctx.minRating for pages AFTER it has taken the
+  // aggregate from an unfiltered page: BV has a separate FilteredStats
+  // mechanism, and whether plain Stats=Reviews stays whole-product under a
+  // Rating filter is documented ambiguously. Rather than depend on reading it
+  // right, the aggregate simply never comes from a filtered response.
+  if (ctx.minRating) qs.append('Filter', `Rating:gte:${ctx.minRating}`);
+
   return { url: `${API_ROOT}?${qs}`, as: 'json' };
 }
 
@@ -199,7 +214,7 @@ function parse(payload, ctx, page) {
 
 function normalize(raw, ctx) {
   if (!raw || typeof raw !== 'object') return null;
-  const body = text(raw.ReviewText, REVIEW_TEXT_MAX);
+  const body = reviewText(raw.ReviewText);
   if (!body) return null;                // ratings-only reviews are common on BV
   const quote = {
     text: body,
@@ -216,6 +231,11 @@ function normalize(raw, ctx) {
 module.exports = {
   platform: 'bazaarvoice',
   pageSize: PAGE_SIZE,
+  // Declares to the driver that request() honours ctx.minRating server-side in
+  // ONE request. Vendors that can only filter by exact star (Yotpo: star=4 then
+  // star=5) or not at all deliberately do NOT set this — see the table in
+  // docs/REVIEW_VENDORS.md §10.
+  supportsMinRating: true,
   discover,
   request,
   parse,

@@ -29,7 +29,8 @@ const {
   text,
   shopifyProductId,
   distributionFromCounts,
-  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+  reviewText,
+  REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                   // server ceiling; above it clamps silently
@@ -111,7 +112,7 @@ function parse(payload, ctx, page) {
 
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  const body = text(raw.body, REVIEW_TEXT_MAX);
+  const body = reviewText(raw.body);
   if (!body) return null;
   return {
     text: body,

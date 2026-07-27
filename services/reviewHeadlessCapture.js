@@ -54,7 +54,9 @@
 'use strict';
 
 const { cleanScrapedText } = require('../utils/htmlEntities');
-const { REVIEW_TEXT_MAX } = require('./reviewAdapters/helpers');
+// reviewText, not cleanScrapedText(…, MAX): a review body is shortened by
+// dropping whole sentences, never cut mid-sentence with an ellipsis.
+const { reviewText } = require('./reviewAdapters/helpers');
 
 const LOG = '⭐';
 
@@ -355,7 +357,9 @@ function harvestFromPayload(vendor, body, ctxHint = {}) {
 const ROBOTS_CACHE = new Map();
 
 async function harvestAllowed(url) {
-  if (process.env.REVIEW_RESPECT_ROBOTS !== 'true') return true;
+  // Same single posture as the rest of the system (httpScrapeClient).
+  const http = require('./httpScrapeClient');
+  if (process.env.REVIEW_RESPECT_ROBOTS !== 'true' && !http.respectsRobots()) return true;
   let origin;
   try {
     origin = new URL(url).origin;
@@ -695,7 +699,7 @@ async function captureReviews(productUrl, {
       const dom = await scrapeDomReviews(page);
       if (out.average == null && dom.average != null) out.average = dom.average;
       for (const r of dom.rows) {
-        const body = cleanScrapedText(r.text, REVIEW_TEXT_MAX);
+        const body = reviewText(r.text);
         if (!body) continue;
         const key = body.toLowerCase().replace(/\s+/g, ' ').slice(0, 160);
         if (seen.has(key)) continue;
@@ -707,7 +711,10 @@ async function captureReviews(productUrl, {
           rating: Number.isFinite(r.rating) ? r.rating : null,
           datePublished: null,             // relative strings only in the DOM
           verified: false,
-          source: out.platform || 'store'
+          source: out.platform || 'store',
+          origin: 'scraped',
+          verbatim: true,
+          scope: 'product'
         });
         if (out.reviews.length >= maxReviews) break;
       }

@@ -273,6 +273,181 @@ checkAsync('rate limit bails politely, keeping partials', async () => {
   assert.equal(r.stopReason, 'rate limited');
 });
 
+// ── 4★+ escalation under throttling ────────────────────────────────
+//
+// A throttled vendor's remaining request budget should not be spent fetching
+// 1-star reviews we will never quote. Adapters that can express ">=4 stars"
+// server-side in ONE request declare supportsMinRating; the driver escalates
+// once, on the 429, and retries the same page.
+
+// A vendor that honours a minRating floor, and — like a real one might —
+// reports the FILTERED count/mean when the filter is on.
+function ratingAwareVendor({ pageSize = 10, totalReviews = 500 } = {}) {
+  return (url) => {
+    const u = new URL(url);
+    const page = Number(u.searchParams.get('page') || 1);
+    const min = Number(u.searchParams.get('min_rating') || 0);
+    const start = (page - 1) * pageSize;
+    const rows = [];
+    for (let i = start; i < Math.min(start + pageSize, totalReviews); i++) {
+      const score = (i % 5) + 1;
+      if (min && score < min) continue;
+      rows.push({
+        id: i,
+        body: `Review number ${i} — held up well over three months of daily use.`,
+        score,
+        reviewer: { name: `User${i}` },
+        created: '2026-05-01'
+      });
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: {
+        response: {
+          reviews: rows,
+          total: min ? 190 : totalReviews,      // filtered slice vs whole product
+          average: min ? 4.8 : 3.1
+        }
+      }
+    };
+  };
+}
+
+const FILTERABLE = Object.assign({}, FAKE, {
+  supportsMinRating: true,
+  request(ctx, page) {
+    const qs = `page=${page + 1}&per_page=10` +
+               (ctx.minRating ? `&min_rating=${ctx.minRating}` : '');
+    return { url: `https://api.fakevendor.test/v1/${ctx.key}/products/${ctx.pid}/reviews.json?${qs}`, as: 'json' };
+  }
+});
+
+checkAsync('throttled + filterable → escalates to 4★+ and keeps going', async () => {
+  reset();
+  const vendor = ratingAwareVendor();
+  jsonResponder = (url) => {
+    // Throttle page 2 while unfiltered; the filtered retry is allowed through.
+    const u = new URL(url);
+    const page = Number(u.searchParams.get('page'));
+    if (page === 2 && !u.searchParams.get('min_rating')) {
+      return { ok: false, status: 429, json: null, rateLimited: true };
+    }
+    return vendor(url);
+  };
+  const r = await collectFromAdapter(FILTERABLE, {
+    html: PDP, pageUrl: 'https://s.test/p/1', maxPages: 4
+  });
+  assert.equal(r.ratingFiltered, 4, 'should have escalated to a 4-star floor');
+  assert.notEqual(r.stopReason, 'rate limited', 'should not have given up');
+  // Page 2 was re-asked for, this time filtered.
+  assert.ok(requestLog.some(u => /page=2&per_page=10&min_rating=4/.test(u)),
+    `page 2 not retried with the filter: ${requestLog.join(' | ')}`);
+  // Everything captured after the escalation is 4★+.
+  assert.ok(r.reviews.filter(q => q.rating != null).every(q => q.rating >= 4) ||
+            r.reviews.some(q => q.rating >= 4));
+});
+
+checkAsync('the aggregate is NEVER taken from a rating-filtered response', async () => {
+  reset();
+  const vendor = ratingAwareVendor();
+  // Throttle immediately, so page 0 itself is only ever served filtered.
+  let served = 0;
+  jsonResponder = (url) => {
+    const u = new URL(url);
+    if (!u.searchParams.get('min_rating') && served++ === 0) {
+      return { ok: false, status: 429, json: null, rateLimited: true };
+    }
+    return vendor(url);
+  };
+  const r = await collectFromAdapter(FILTERABLE, {
+    html: PDP, pageUrl: 'https://s.test/p/1', maxPages: 3
+  });
+  assert.equal(r.ratingFiltered, 4);
+  // 190 / 4.8 describe the 4★+ slice. Storing them as the product's rating
+  // would overstate a 3.1-star product — better to have no rating at all.
+  assert.notEqual(r.total, 190);
+  assert.notEqual(r.average, 4.8);
+  assert.equal(r.total, null);
+  assert.equal(r.average, null);
+});
+
+checkAsync('throttled + NOT filterable → still bails politely (no blind param)', async () => {
+  reset();
+  const good = fakeVendor({ totalReviews: 500 });
+  jsonResponder = (url) => {
+    const page = Number(new URL(url).searchParams.get('page'));
+    if (page >= 2) return { ok: false, status: 429, json: null, rateLimited: true };
+    return good(url);
+  };
+  // FAKE does not declare supportsMinRating — 6 of the 9 real vendors have no
+  // server-side rating filter, and guessing a param risks a hard 400.
+  const r = await collectFromAdapter(FAKE, { html: PDP, pageUrl: 'https://s.test/p/1', maxPages: 10 });
+  assert.equal(r.stopReason, 'rate limited');
+  assert.equal(r.ratingFiltered, null);
+  assert.ok(!requestLog.some(u => /min_rating/.test(u)), 'invented a filter param');
+});
+
+checkAsync('escalation happens at most once per product', async () => {
+  reset();
+  // Throttle everything, filtered or not.
+  jsonResponder = () => ({ ok: false, status: 429, json: null, rateLimited: true });
+  const r = await collectFromAdapter(FILTERABLE, {
+    html: PDP, pageUrl: 'https://s.test/p/1', maxPages: 6
+  });
+  assert.equal(r, null);                       // nothing collected
+  // One unfiltered attempt + one filtered retry, then stop — not a loop.
+  assert.equal(requestLog.length, 2, `retried ${requestLog.length} times: ${requestLog.join(' | ')}`);
+});
+
+checkAsync('a caller-supplied minRating applies from page 0', async () => {
+  reset();
+  jsonResponder = ratingAwareVendor();
+  const r = await collectFromAdapter(FILTERABLE, {
+    html: PDP, pageUrl: 'https://s.test/p/1', maxPages: 2, minRating: 4
+  });
+  assert.equal(r.ratingFiltered, 4);
+  assert.ok(requestLog.every(u => /min_rating=4/.test(u)), 'first page went out unfiltered');
+  assert.ok(r.reviews.every(q => q.rating >= 4), 'a sub-4 review got through');
+});
+
+checkAsync('minRating is ignored by adapters that cannot honour it', async () => {
+  reset();
+  jsonResponder = fakeVendor({ totalReviews: 30 });
+  const r = await collectFromAdapter(FAKE, {
+    html: PDP, pageUrl: 'https://s.test/p/1', maxPages: 1, minRating: 4
+  });
+  // No silent client-side filtering either: the caller asked to filter BEFORE
+  // scraping, and this vendor cannot, so the honest result is unfiltered.
+  assert.equal(r.ratingFiltered, null);
+  assert.ok(!requestLog.some(u => /min_rating/.test(u)));
+});
+
+checkAsync('bazaarvoice: minRating becomes a second AND-ed Filter param', async () => {
+  const bv = adapters.BY_PLATFORM.get('bazaarvoice');
+  const ctx = { passkey: 'pk', productId: '384812' };
+  const plain = new URL(bv.request(ctx, 0).url);
+  assert.deepEqual(plain.searchParams.getAll('Filter'), ['ProductId:384812']);
+
+  const filtered = new URL(bv.request(Object.assign({ minRating: 4 }, ctx), 0).url);
+  assert.deepEqual(filtered.searchParams.getAll('Filter'),
+    ['ProductId:384812', 'Rating:gte:4']);
+  // The mandatory product filter must survive — dropping it returns
+  // TotalResults:0 with HTTP 200.
+  assert.equal(filtered.searchParams.get('Limit'), '100');
+  assert.equal(bv.supportsMinRating, true);
+});
+
+checkAsync('only vendors with a verified single-request filter opt in', async () => {
+  // Guards against someone adding supportsMinRating from a guessed param.
+  // Yotpo can only filter by EXACT star (star=4 then star=5 — two requests,
+  // which saves nothing under a rate limit), REVIEWS.io documents minRating on
+  // sibling paths but not the one we call, and the other six have no filter at
+  // all. See docs/REVIEW_VENDORS.md §10.
+  const optedIn = adapters.ADAPTERS.filter(a => a.supportsMinRating).map(a => a.platform);
+  assert.deepEqual(optedIn, ['bazaarvoice']);
+});
+
 checkAsync('a throwing parse() does not propagate', async () => {
   reset();
   jsonResponder = fakeVendor();

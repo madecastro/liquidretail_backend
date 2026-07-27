@@ -113,15 +113,32 @@ const MAX_BYTES = 4_000_000;
 // should be one env var away from off.
 const ENABLED = process.env.REVIEW_ADAPTERS_ENABLED !== 'false';
 
-// Whether to honour robots.txt on VENDOR API hosts. Off by default: this
-// deployment scrapes with client authorisation, and the vendor endpoints in
-// question are the same public ones the merchant's own storefront calls on
-// every page view. Flip to 'true' for a robots-respecting posture (that setting
-// disables the Loox path entirely — loox.io disallows /widget).
-// Read at CALL time, not load time, so the posture can be flipped without a
-// restart (and so tests can exercise both paths).
+// ── rating filter under throttling ─────────────────────────────────
+//
+// When a vendor host starts rate-limiting us mid-product, the remaining
+// request budget is better spent on reviews we can actually use. We surface
+// positive quotes, so 1-3 star reviews are fetched, stored, and then never
+// chosen — pure waste at exactly the moment requests became scarce.
+//
+// So on a 429 the driver escalates ONCE to "4 stars and up, server-side" and
+// re-asks for the same page, instead of stopping. Only adapters that declare
+// supportsMinRating participate, and only Bazaarvoice can do it in a single
+// request; asking the others would mean two requests per page (Yotpo's
+// star=4 then star=5) or an undocumented param that might 400 — both worse
+// than not filtering. Full table + sources: docs/REVIEW_VENDORS.md §10.
+//
+// This never becomes the default: an unfiltered sweep is what gives an honest
+// rating distribution, and the escalation is recorded on the result
+// (ratingFiltered) so a consumer knows the tail was not sampled.
+const MIN_RATING_ON_THROTTLE = Math.min(5, Math.max(1,
+  parseInt(process.env.REVIEW_MIN_RATING_ON_THROTTLE, 10) || 4
+));
+
+// Robots posture is system-wide — see httpScrapeClient.respectsRobots(). It is
+// off by default because this platform scrapes with client authorisation.
+// REVIEW_RESPECT_ROBOTS remains accepted as a reviews-only override.
 function respectRobots() {
-  return process.env.REVIEW_RESPECT_ROBOTS === 'true';
+  return process.env.REVIEW_RESPECT_ROBOTS === 'true' || http.respectsRobots();
 }
 
 // ── shared helpers ─────────────────────────────────────────────────
@@ -202,7 +219,8 @@ async function collectFromAdapter(adapter, {
   html,
   pageUrl,
   maxPages = MAX_PAGES,
-  maxReviews = MAX_REVIEWS
+  maxReviews = MAX_REVIEWS,
+  minRating = null
 } = {}) {
   let ctx;
   try {
@@ -220,9 +238,36 @@ async function collectFromAdapter(adapter, {
     distribution: null,
     pagesFetched: 0,
     truncated: false,
-    stopReason: null
+    stopReason: null,
+    // Non-null → the captured set is 4★+ only and is NOT a representative
+    // sample. total/average/distribution are still whole-product (they are
+    // only ever read from an unfiltered response).
+    ratingFiltered: null
   };
   const seen = new Set();
+
+  // A caller-supplied floor (a host already known to throttle) applies from
+  // page 0. The reactive escalation below applies from wherever the 429 hit.
+  if (minRating && adapter.supportsMinRating) {
+    ctx.minRating = minRating;
+    out.ratingFiltered = minRating;
+  }
+  let escalated = false;
+
+  /**
+   * Rate-limited. If this adapter can filter server-side and we are not
+   * already filtering, switch on the 4★ floor and let the caller retry the
+   * same page — the remaining budget then returns only usable reviews.
+   * Returns true when the caller should retry rather than stop.
+   */
+  function escalateOnThrottle(page) {
+    if (escalated || ctx.minRating || !adapter.supportsMinRating) return false;
+    escalated = true;
+    ctx.minRating = MIN_RATING_ON_THROTTLE;
+    out.ratingFiltered = MIN_RATING_ON_THROTTLE;
+    console.log(`   · ${LOG}  ${adapter.platform}: rate limited at page ${page + 1} — retrying with ${MIN_RATING_ON_THROTTLE}★+ server-side filter`);
+    return true;
+  }
 
   for (let page = 0; page < maxPages; page++) {
     let req;
@@ -257,20 +302,28 @@ async function collectFromAdapter(adapter, {
     };
 
     let payload;
+    let throttled = false;
     try {
       if (req.as === 'text') {
         const res = await http.fetchText(req.url, opts);
-        if (res.rateLimited) { out.stopReason = 'rate limited'; break; }
-        if (!res.ok || !res.text) { out.stopReason = `http ${res.status || 'error'}`; break; }
-        payload = res.text;
+        if (res.rateLimited) throttled = true;
+        else if (!res.ok || !res.text) { out.stopReason = `http ${res.status || 'error'}`; break; }
+        else payload = res.text;
       } else {
         const res = await http.fetchJson(req.url, opts);
-        if (res.rateLimited) { out.stopReason = 'rate limited'; break; }
-        if (!res.ok || res.json == null) { out.stopReason = `http ${res.status || 'error'}`; break; }
-        payload = res.json;
+        if (res.rateLimited) throttled = true;
+        else if (!res.ok || res.json == null) { out.stopReason = `http ${res.status || 'error'}`; break; }
+        else payload = res.json;
       }
     } catch (err) {
       out.stopReason = `fetch failed: ${err.message}`;
+      break;
+    }
+    if (throttled) {
+      // page -= 1 then the loop's page++ re-asks for THIS page, now filtered.
+      // Guarded by `escalated` so it can happen at most once per product.
+      if (escalateOnThrottle(page)) { page -= 1; continue; }
+      out.stopReason = 'rate limited';
       break;
     }
 
@@ -290,9 +343,17 @@ async function collectFromAdapter(adapter, {
     }
 
     out.pagesFetched = page + 1;
-    if (parsed.total != null && out.total == null) out.total = toInt(parsed.total);
-    if (parsed.average != null && out.average == null) out.average = toFloat(parsed.average);
-    if (parsed.distribution && !out.distribution) out.distribution = parsed.distribution;
+    // AGGREGATE ONLY FROM AN UNFILTERED RESPONSE. A 4★+ filtered page may
+    // report the count and mean of the filtered slice — Bazaarvoice has a
+    // separate FilteredStats concept and the interaction is documented
+    // ambiguously. Storing "4.9 from 83 reviews" for a product that really
+    // holds 3.8 from 156 would be a worse error than having no rating, so the
+    // aggregate is simply never read from a filtered page.
+    if (!ctx.minRating) {
+      if (parsed.total != null && out.total == null) out.total = toInt(parsed.total);
+      if (parsed.average != null && out.average == null) out.average = toFloat(parsed.average);
+      if (parsed.distribution && !out.distribution) out.distribution = parsed.distribution;
+    }
     if (parsed.cursor !== undefined) ctx.cursor = parsed.cursor;
 
     const rows = Array.isArray(parsed.reviews) ? parsed.reviews : [];
@@ -360,11 +421,14 @@ async function collectFromAdapter(adapter, {
 async function fetchViaAdapters(html, pageUrl, {
   platform = null,
   maxPages = MAX_PAGES,
-  maxReviews = MAX_REVIEWS
+  maxReviews = MAX_REVIEWS,
+  minRating = null
 } = {}) {
   if (!ENABLED) return null;
   for (const adapter of adaptersFor(platform)) {
-    const res = await collectFromAdapter(adapter, { html, pageUrl, maxPages, maxReviews });
+    const res = await collectFromAdapter(adapter, {
+      html, pageUrl, maxPages, maxReviews, minRating
+    });
     if (res) return res;
   }
   return null;
@@ -378,6 +442,7 @@ module.exports = Object.assign({
   BY_PLATFORM,
   MAX_PAGES,
   MAX_REVIEWS,
+  MIN_RATING_ON_THROTTLE,
   ENABLED,
   respectRobots
 }, helpers);

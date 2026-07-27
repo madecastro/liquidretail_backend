@@ -22,7 +22,8 @@
 
 const {
  firstMatch, pick, toInt, toFloat, toDate, text,
-  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+  reviewText,
+  REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 50;
@@ -75,7 +76,7 @@ function parse(payload, ctx, page) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.review, REVIEW_TEXT_MAX);
+  const body = reviewText(raw && raw.review);
   if (!body) return null;
   const first = raw.reviewer && raw.reviewer.first_name;
   const last = raw.reviewer && raw.reviewer.last_name;

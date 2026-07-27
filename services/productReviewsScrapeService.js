@@ -68,9 +68,13 @@ const MIN_POSITIVE_STARS = 4;
 // Shared with the adapters (services/reviewAdapters/helpers) so one env var
 // governs stored review length everywhere. 400 was measured to be too tight:
 // 10 of 50 Ulta reviews and 1 of 50 Living Spaces reviews hit it and were cut
-// mid-word. Over-long bodies now truncate at a word boundary with an ellipsis.
+// mid-word.
+//
+// Bodies are never cut mid-sentence and never gain an ellipsis: reviewText()
+// keeps the most useful WHOLE sentences (utils/reviewText). titles/authors
+// still use the word-boundary text() cut, where a clipped label is harmless.
 const {
-  REVIEW_TEXT_MAX: MAX_QUOTE_CHARS,
+  reviewText,
   REVIEW_TITLE_MAX: MAX_TITLE_CHARS,
   REVIEW_AUTHOR_MAX: MAX_AUTHOR_CHARS
 } = require('./reviewAdapters/helpers');
@@ -182,7 +186,12 @@ function parseLdBlocks(html) {
 
 // Unescape one level of JS/JSON string escaping.
 function unescapeOnce(s) {
-  return s.replace(/\\\\/g, ' ').replace(/\\"/g, '"').replace(/ /g, '\\');
+  // '\u0000' is a sentinel, not data: a JSON string cannot contain a raw NUL,
+  // so it safely parks escaped backslashes while the \" pass runs. Written as an
+  // escape rather than a literal byte — a literal NUL makes this whole file read
+  // as binary to grep and every other text tool.
+  const NUL = '\u0000';
+  return s.replace(/\\\\/g, NUL).replace(/\\"/g, '"').split(NUL).join('\\');
 }
 
 /**
@@ -321,9 +330,8 @@ function publishedAt(raw) {
 function mapReviewNode(node, source = null) {
   if (!node || typeof node !== 'object') return null;
 
-  const text = cleanScrapedText(
-    node.reviewBody != null ? node.reviewBody : node.description,
-    MAX_QUOTE_CHARS
+  const text = reviewText(
+    node.reviewBody != null ? node.reviewBody : node.description
   );
   if (!text) return null;
 
@@ -342,7 +350,15 @@ function mapReviewNode(node, source = null) {
     author:        authorName(node.author),
     rating,
     datePublished: publishedAt(node.datePublished || node.dateCreated),
-    source:        source || 'store'
+    source:        source || 'store',
+    // Provenance — a real customer's own words, about THIS product, stored
+    // exactly as published (shortened by whole sentences at most). Anything
+    // an LLM wrote or rewrote carries origin:'llm-web'/'synthesized' and
+    // verbatim:false instead, so a consumer can tell a quotable review from
+    // generated copy without guessing. See docs/PIPELINES.md.
+    origin:        'scraped',
+    verbatim:      true,
+    scope:         'product'
   };
 }
 
@@ -699,6 +715,8 @@ function buildProductReviews(extracted, existing = null) {
 
   return {
     quotes:      extracted.quotes || [],
+    // Every quote in this snapshot came from the merchant's own review data.
+    quotesOrigin: 'scraped',
     rating:      extracted.rating,
     reviewCount: extracted.reviewCount,
     summary:     existing && existing.summary != null ? existing.summary : null,

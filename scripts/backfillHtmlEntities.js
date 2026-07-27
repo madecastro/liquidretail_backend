@@ -39,6 +39,9 @@ const Category = require('../models/Category');
 const { breadcrumbToKey } = Category;
 const { normalizeTitle } = require('../utils/titleNormalize');
 const { cleanScrapedText, hasHtmlEntity } = require('../utils/htmlEntities');
+// Same caps the ingest paths use — this script REWRITES stored reviews, so a
+// smaller cap here would silently clip bodies that were captured in full.
+const { REVIEW_TEXT_MAX, REVIEW_AUTHOR_MAX } = require('../services/reviewAdapters/helpers');
 // Same description cleaner the scrapers use — decode once, strip tags on
 // both sides of it (escaped markup only becomes strippable after decoding).
 const { stripHtml } = require('../services/shopifyPublicIngestService');
@@ -109,7 +112,7 @@ function repairQuotes(quotes) {
     const next = { ...(q.toObject ? q.toObject() : q) };
     for (const f of ['text', 'author']) {
       if (hasHtmlEntity(next[f])) {
-        next[f] = cleanScrapedText(next[f], f === 'text' ? 400 : 120);
+        next[f] = cleanScrapedText(next[f], f === 'text' ? REVIEW_TEXT_MAX : REVIEW_AUTHOR_MAX);
         changed = true;
       }
     }

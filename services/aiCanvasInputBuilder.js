@@ -538,11 +538,18 @@ async function loadTopComments(mediaId, n) {
 
 // ── Helpers used by the new signals block ────────────────────────────
 
+// Word-boundary truncation. The old slice(maxLen - 1) cut mid-word, which
+// matters most for social_proof_signal.primary_quote: the Director reads that
+// text and is asked to ground copy in it, so a quote ending "the new one is
+// horrible. Pl" invites the model to complete a sentence the reviewer never
+// wrote. utils/htmlEntities.truncateWords backs off to the last space and marks
+// the cut.
 function snippetText(s, maxLen) {
   if (!s || typeof s !== 'string') return null;
   const trimmed = s.replace(/\s+/g, ' ').trim();
   if (!trimmed) return null;
-  return trimmed.length > maxLen ? trimmed.slice(0, maxLen - 1) + '…' : trimmed;
+  if (trimmed.length <= maxLen) return trimmed;
+  return require('../utils/htmlEntities').truncateWords(trimmed, maxLen);
 }
 
 function distribution(values) {
