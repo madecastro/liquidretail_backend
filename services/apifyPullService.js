@@ -14,6 +14,7 @@
 // for Shopify) are responsible for mapping into the domain shape.
 
 const axios = require('axios');
+const { cleanScrapedText } = require('../utils/htmlEntities');
 
 const APIFY_API_ROOT = 'https://api.apify.com/v2';
 
@@ -164,7 +165,9 @@ function normalizeShopifyProduct(raw) {
 
   return {
     externalId:    String(externalId),
-    title:         raw.title || raw.name || null,
+    // Actors that scrape HTML hand back entity-encoded text ("33&quot;"),
+    // so decode before this becomes CatalogProduct.title.
+    title:         cleanScrapedText(raw.title || raw.name),
     description:   raw.description || raw.bodyHtml || null,
     productUrl:    raw.url || raw.productUrl || null,
     imageUrl:      images[0] || raw.image || raw.featuredImage || null,
@@ -172,7 +175,7 @@ function normalizeShopifyProduct(raw) {
     price:         Number.isFinite(price) ? price : null,
     currency:      raw.currency || raw.priceRange?.currency || null,
     availability:  raw.available === false ? 'out of stock' : 'in stock',
-    brand:         raw.vendor || raw.brand || null,
+    brand:         cleanScrapedText(raw.vendor || raw.brand),
     handle:        raw.handle || null
   };
 }

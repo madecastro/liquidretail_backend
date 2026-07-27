@@ -33,6 +33,7 @@
 
 const CatalogProduct = require('../models/CatalogProduct');
 const Media          = require('../models/Media');
+const { cleanScrapedText, decodeHtmlEntities, tidyText } = require('../utils/htmlEntities');
 
 // ── constants ──────────────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -57,20 +58,20 @@ function normalizeGtin(raw) {
 }
 
 // Strip HTML tags → plain text, collapse whitespace, truncate.
+//
+// Entity decoding is delegated to utils/htmlEntities so NUMERIC references
+// are handled too — the hand-rolled list here only covered five named ones,
+// which left `&#x2B;` / `&#34;` / `&#8221;` (all common in furniture
+// catalogs) sitting raw in descriptions.
+//
+// Two tag-strip passes around ONE decode pass: sites that escape their
+// JSON-LD ship the description as encoded markup ("&lt;div&gt;Introducing
+// the Austen Black 74&quot; …"), which is only strippable after decoding.
+// Decoding twice is what we must avoid, not stripping twice.
 function stripHtml(html, maxLen = 2000) {
   if (!html) return null;
-  const text = String(html)
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text) return null;
-  return text.length > maxLen ? text.slice(0, maxLen) : text;
+  const decoded = decodeHtmlEntities(String(html).replace(/<[^>]*>/g, ' '));
+  return tidyText(decoded.replace(/<[^>]*>/g, ' '), maxLen);
 }
 
 function sleep(ms) {
@@ -330,9 +331,12 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
             source:           'shopify-direct',
             externalId,
             itemGroupId:      externalId,
-            title:            p.title || '(untitled)',
+            // Decoded for the same reason as the generic path: the headless
+            // fallback feeds this shape from JSON-LD, and merchants
+            // sometimes type entities straight into a Shopify title.
+            title:            cleanScrapedText(p.title) || '(untitled)',
             description,
-            brand:            p.vendor || brand.name || null,
+            brand:            cleanScrapedText(p.vendor) || brand.name || null,
             price:            Number.isFinite(price) ? price : null,
             currency:         null,
             availability,
@@ -341,7 +345,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
             productUrl,
             gtin:             normalizeGtin(v0.barcode),
             mpn:              v0.sku || null,
-            category:         p.product_type || null,
+            category:         cleanScrapedText(p.product_type),
             rawData:          p,
             lastSyncedAt:     new Date()
           },
@@ -755,7 +759,9 @@ function extractReviewsFromHtml(html, reviewAppName) {
     const revArr = Array.isArray(rev) ? rev : rev ? [rev] : [];
     for (const r of revArr) {
       if (!r || typeof r !== 'object') continue;
-      const text = (r.reviewBody != null ? String(r.reviewBody) : '').trim().slice(0, 400);
+      // Entity-decoded: review bodies scraped from JSON-LD inside a
+      // <script> arrive with `&quot;` / `&#39;` intact.
+      const text = cleanScrapedText(r.reviewBody, 400);
       if (!text) continue;
       let author = null;
       if (r.author != null) {
@@ -764,7 +770,7 @@ function extractReviewsFromHtml(html, reviewAppName) {
       }
       quotes.push({
         text,
-        author: author ? String(author).slice(0, 120) : null,
+        author: cleanScrapedText(author, 120),
         source: reviewAppName || 'store'
       });
       if (quotes.length >= 10) break;
