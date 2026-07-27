@@ -471,6 +471,14 @@ Secret: `ATLAS_API_KEY`.
 
 ## 7. Progress + activity system
 
+> **Out-of-band alerting:** progress rows are in-app only — nobody sees them
+> unless a browser is open. Push alerts for crashes, dropped work, stalled
+> runs, and spend spikes go to Telegram; see **[docs/ALERTING.md](ALERTING.md)**.
+> That doc also records *why* video batches stall: `runRenderLoop` executes
+> in the **web** process, which Render replaces on deploy **and** on
+> autoscale (`min 1 / max 3`, CPU+memory at 60%), and reaped ads land in
+> `queued` where nothing drains them automatically.
+
 ### Core
 
 - **Model:** `models/OperationRun.js` — tenant-scoped runs (kind, status, stage, note, pct/items, heartbeat, cancel).
