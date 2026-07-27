@@ -759,6 +759,142 @@ check('fera: 1-indexed pages, meta.page_count terminates', () => {
   assert.equal(q.author, 'Mia');
 });
 
+// ── tier 3: headless capture internals ─────────────────────────────
+//
+// The browser half can't run here (puppeteer is absent from this container's
+// partial install), but everything that decides WHAT gets harvested is pure:
+// URL matching, JSONP unwrapping, and the reuse of tier-2 adapters to map an
+// intercepted payload. Those are the parts that break silently, so they are
+// the parts under test.
+
+const headless = require('../services/reviewHeadlessCapture');
+
+check('headless: JSONP wrapper is unwrapped (Bazaarvoice batch.json)', () => {
+  const jsonp = 'BV._internal.dataHandler0({"BatchedResults":{"q0":{"Results":[],"TotalResults":149}}})';
+  const j = headless.unwrapJsonp(jsonp);
+  assert.equal(j.BatchedResults.q0.TotalResults, 149);
+  // bv_<n>_<n> callback naming also occurs
+  assert.ok(headless.unwrapJsonp('bv_123_456({"Results":[]})'));
+  // plain JSON passes straight through
+  assert.deepEqual(headless.unwrapJsonp('{"a":1}'), { a: 1 });
+  assert.equal(headless.unwrapJsonp('not json at all'), null);
+  assert.equal(headless.unwrapJsonp(''), null);
+  assert.equal(headless.unwrapJsonp(null), null);
+});
+
+check('headless: only review-carrying URLs match; loader/telemetry do not', () => {
+  const m = (u) => { const v = headless.matchVendorResponse(u); return v && v.platform; };
+  assert.equal(m('https://api.bazaarvoice.com/data/batch.json?passkey=x'), 'bazaarvoice');
+  assert.equal(m('https://api.bazaarvoice.com/data/reviews.json?passkey=x'), 'bazaarvoice');
+  assert.equal(m('https://apid.juniphq.com/v2/products/remote/123/reviews?page_size=5'), 'junip');
+  assert.equal(m('https://api-cdn.yotpo.com/v1/widget/KEY/products/9/reviews.json'), 'yotpo');
+  assert.equal(m('https://api.okendo.io/v1/stores/sub/products/shopify-1/reviews'), 'okendo');
+  assert.equal(m('https://stamped.io/api/widget/reviews?productId=1'), 'stamped');
+  assert.equal(m('https://judge.me/reviews/reviews_for_widget?url=x'), 'judge.me');
+  assert.equal(m('https://display.powerreviews.com/m/6406/l/en_US/product/p1/reviews'), 'powerreviews');
+  assert.equal(m('https://cdn.fera.ai/api/v3/public/products/7/reviews.json'), 'fera');
+
+  // Presence-only / noise hosts must never be harvested.
+  assert.equal(m('https://network-a.bazaarvoice.com/beacon.gif'), null);
+  assert.equal(m('https://apps.bazaarvoice.com/deployments/client/main_site/bv.js'), null);
+  assert.equal(m('https://display.ugc.bazaarvoice.com/static/Client/bvapi.js'), null);
+  assert.equal(m('https://scripts.juniphq.com/v1/junip.js'), null);
+  assert.equal(m('https://www.googletagmanager.com/gtm.js'), null);
+  assert.equal(m(''), null);
+  assert.equal(m(null), null);
+});
+
+check('headless: intercepted BV batch payload maps via the tier-2 adapter', () => {
+  const vendor = headless.matchVendorResponse('https://api.bazaarvoice.com/data/batch.json');
+  const jsonp = 'BV._internal.dataHandler0(' + JSON.stringify({
+    BatchedResults: {
+      q0: { Limit: 30, Offset: 10, TotalResults: 149, Results: [{
+        ProductId: '7330615623735',
+        ReviewText: 'Bold roast with real caffeine kick, my morning staple now.',
+        Title: 'Strong', Rating: 5, UserNickname: 'Chuey72',
+        SubmissionTime: '2026-07-27T01:51:05.000+00:00',
+        Badges: { verifiedPurchaser: true }
+      }] }
+    }
+  }) + ')';
+  const got = headless.harvestFromPayload(vendor, jsonp, { productId: null });
+  assert.equal(got.quotes.length, 1);
+  assert.equal(got.total, 149);
+  assert.equal(got.quotes[0].rating, 5);
+  assert.equal(got.quotes[0].author, 'Chuey72');
+  assert.equal(got.quotes[0].source, 'bazaarvoice');
+  assert.ok(got.quotes[0].datePublished instanceof Date);
+});
+
+check('headless: BV batch picks the sub-result holding reviews, whatever its q index', () => {
+  const vendor = headless.matchVendorResponse('https://api.bazaarvoice.com/data/batch.json');
+  // Real batches interleave products + reviews and the index shifts per call.
+  const body = JSON.stringify({ BatchedResults: {
+    q0: { Results: undefined, Products: [] },
+    q7: { TotalResults: 4, Results: [{ ReviewText: 'Grinds evenly and stays fresh for weeks.', Rating: 4 }] }
+  } });
+  const got = headless.harvestFromPayload(vendor, body, {});
+  assert.equal(got.quotes.length, 1);
+  assert.equal(got.total, 4);
+});
+
+check('headless: intercepted Junip payload maps via its adapter', () => {
+  const vendor = headless.matchVendorResponse('https://apid.juniphq.com/v2/products/remote/1/reviews');
+  const got = headless.harvestFromPayload(vendor, {
+    data: [{ body: 'Pans heat evenly and wash clean in seconds.', title: 'Even heat',
+             rating: 5, created_at: '2026-06-01T00:00:00Z', verified_buyer: true,
+             customer: { first_name: 'Ada', last_name: 'L' },
+             product: { remote_id: 999 } }],
+    meta: { after: 'cursor' }
+  }, {});
+  assert.equal(got.quotes.length, 1);
+  assert.equal(got.quotes[0].author, 'Ada L');
+  assert.equal(got.quotes[0].source, 'junip');
+});
+
+check('headless: unusable / mismatched payloads harvest nothing, never throw', () => {
+  const bv = headless.matchVendorResponse('https://api.bazaarvoice.com/data/batch.json');
+  for (const body of [null, undefined, '', 'garbage', '{}', '{"BatchedResults":{}}']) {
+    const got = headless.harvestFromPayload(bv, body, {});
+    assert.deepEqual(got.quotes, []);
+  }
+  assert.deepEqual(headless.harvestFromPayload(null, '{}', {}).quotes, []);
+});
+
+check('headless: load-more text sweep never clicks "Write a review"', () => {
+  const rx = headless.LOAD_MORE_TEXT_RE;
+  const deny = headless.LOAD_MORE_TEXT_DENY_RE;
+  const wouldClick = (label) => rx.test(label) && !deny.test(label);
+  assert.equal(wouldClick('See more reviews'), true);
+  assert.equal(wouldClick('Load more'), true);
+  assert.equal(wouldClick('Next Reviews'), true);
+  assert.equal(wouldClick('Show more'), true);
+  // These would navigate away mid-capture or open an unrelated flow.
+  assert.equal(wouldClick('Write a review'), false);
+  assert.equal(wouldClick('Write A Review'), false);
+  assert.equal(wouldClick('Ask a question'), false);
+  assert.equal(wouldClick('See more products'), false);
+  assert.equal(wouldClick('Add to cart'), false);
+});
+
+check('headless: every vendor entry points at a registered tier-2 adapter', () => {
+  for (const v of headless.VENDOR_RESPONSES) {
+    assert.ok(adapters.BY_PLATFORM.get(v.adapter),
+      `${v.platform} references unknown adapter "${v.adapter}"`);
+    assert.equal(typeof v.test, 'function');
+    assert.equal(typeof v.unwrap, 'function');
+  }
+});
+
+checkAsync('headless: disabled by default — captureReviews is a no-op without opt-in', async () => {
+  // ENABLED reads REVIEW_HEADLESS_ENABLED at load; unset here, so a call must
+  // return null WITHOUT trying to launch a browser (puppeteer is absent from
+  // this container, so a launch attempt would surface as an error, not null).
+  assert.equal(headless.ENABLED, false);
+  assert.equal(await headless.captureReviews('https://example.com/p/1'), null);
+  assert.equal(await headless.captureReviews(''), null);
+});
+
 // ── registry ───────────────────────────────────────────────────────
 
 check('registry: every loaded adapter satisfies the contract', () => {

@@ -353,11 +353,20 @@ router.post('/brands/:id/enrich', async (req, res) => {
 
 // POST /api/sales-demos/brands/:id/sync-reviews — re-scrape product
 // reviews + ratings from the brand's own product pages. FREE (no LLM, no
-// SerpAPI): reads the schema.org review data the store's review app
-// publishes for rich snippets, whichever app that is. Use it to add
-// reviews to a brand that was already synced, or to refresh a stale
-// snapshot. TTL-gated (30d) unless ?force=1. Fire-and-forget (202);
-// progress is a cancellable OperationRun (kind 'enrichment').
+// SerpAPI). Runs the shared three-tier engine: schema.org rich snippets →
+// the store's own review-app public API (paginated) → optionally a real
+// browser. Use it to add reviews to a brand that was already synced, or to
+// refresh a stale snapshot.
+//
+// Query flags:
+//   ?force=1      ignore the 30-day TTL and re-read every product
+//   ?headless=1   also allow tier 3 (a browser per product, ~10-25s each) —
+//                 off by default because it is orders of magnitude more
+//                 expensive than the HTTP tiers. Worth it for a brand whose
+//                 review widget renders client-side and publishes nothing.
+//   ?pages=N      per-product page cap for the vendor-API tier
+//
+// Fire-and-forget (202); progress is a cancellable OperationRun.
 router.post('/brands/:id/sync-reviews', async (req, res) => {
   try {
     const brand = await Brand.findOne({
@@ -367,16 +376,23 @@ router.post('/brands/:id/sync-reviews', async (req, res) => {
     }).select('_id advertiserId').lean();
     if (!brand) return res.status(404).json({ error: 'demo brand not found' });
 
-    const force = req.query.force === '1' || req.query.force === 'true';
+    const truthy = (v) => v === '1' || v === 'true';
+    const force = truthy(req.query.force);
+    const useHeadless = truthy(req.query.headless);
+    const pages = parseInt(req.query.pages, 10);
 
-    // Not gated on enrichInFlight — this path spends nothing, so it can
+    // Not gated on enrichInFlight — the HTTP tiers spend nothing, so this can
     // run alongside a paid enrichment without a cost-control lock.
     syncBrandProductReviews(String(brand._id), {
       force,
+      useHeadless,
+      ...(Number.isFinite(pages) && pages > 0 ? { adapterMaxPages: pages } : {}),
       advertiserId: brand.advertiserId || req.salesDemosAdvertiserId
     }).catch(err => console.error(`⚠️  product-reviews sync failed for brand=${brand._id}: ${err.message}`));
 
-    res.status(202).json({ ok: true, brandId: String(brand._id), status: 'started', force });
+    res.status(202).json({
+      ok: true, brandId: String(brand._id), status: 'started', force, headless: useHeadless
+    });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || 'reviews sync failed' });
   }
