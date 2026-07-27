@@ -18,6 +18,11 @@
 require('dotenv').config();
 // Repo-versioned non-secret defaults — see index.js. Env always wins.
 require('dotenv').config({ path: require('path').join(__dirname, 'config', 'defaults.env') });
+
+// Crash / restart / shutdown alerting. Idempotent, so the RUN_WORKER=true
+// single-process mode (where index.js requires this file) installs once.
+require('./services/processAlerts').installProcessAlerts({ role: 'worker' });
+
 const mongoose = require('mongoose');
 
 const Job          = require('./models/Job');
@@ -44,6 +49,12 @@ const CONCURRENCY = Math.max(1, Math.min(parseInt(process.env.WORKER_CONCURRENCY
 // REAP_INTERVAL_MIN drives the periodic sweep alongside the startup pass.
 const REAP_STALE_MIN     = Math.max(1, parseInt(process.env.REAP_STALE_MIN, 10)     || 15);
 const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 10)  || 5);
+
+// Health sweep → Telegram (services/backlogWatchdog.js). Separate cadence
+// from the reaper so the thresholds can be tuned independently.
+const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_INTERVAL_MIN, 10) || 5);
+
+const alerts = require('./services/alertService');
 
 // Mongoose default pool is 100 max. With 50+ concurrent workers each
 // firing several queries per pipeline stage, we want a roomy pool to
@@ -93,6 +104,17 @@ mongoose.connect(process.env.MONGODB_URI, {
     reapOrphans().catch(err => console.warn(`⚠️  periodic reap failed: ${err.message}`));
   }, REAP_INTERVAL_MIN * 60 * 1000);
 
+  // Health sweep — wedged renders, stalled runs, detect backlog, spend.
+  // Never awaited at boot: a slow first sweep must not delay the queues.
+  // First sweep after 90s (post-boot-reap, post-Mongo-connect) so a
+  // crash-looping deploy surfaces wedged state quickly instead of waiting
+  // out the first full interval.
+  const { runWatchdog } = require('./services/backlogWatchdog');
+  const watchdogTick = () => runWatchdog().catch(err => console.warn(`⚠️  watchdog failed: ${err.message}`));
+  setTimeout(watchdogTick, 90 * 1000);
+  setInterval(watchdogTick, WATCHDOG_INTERVAL_MIN * 60 * 1000);
+  console.log(`🔔 alerts: ${alerts.isConfigured() ? 'Telegram configured' : 'Telegram NOT configured (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)'}; watchdog every ${WATCHDOG_INTERVAL_MIN}m`);
+
   for (let i = 1; i <= CONCURRENCY; i++) {
     workerLoop(i).catch(err => console.error(`❌ worker[${i}] crashed:`, err));
   }
@@ -116,29 +138,70 @@ async function reapOrphans() {
     { $set: { status: 'queued', errorStage: 'orphan-reset' } }
   );
 
-  // Ad: stuck in 'rendering' → back to 'queued' and clear campaignRunId
-  // so the next selectAdsForRun pass re-picks it on a fresh run. The
-  // failed run's CampaignRun stays as audit; the Ad just re-enters the queue.
+  // Ad: stuck in 'rendering' → back to 'queued'. The failed run's
+  // CampaignRun stays as audit; the Ad just re-enters the queue.
+  //
+  // `campaignRunIds` is deliberately left intact — it is the audit trail of
+  // which runs attempted this ad, and selectAdsForRun filters only on
+  // (campaignId, status) so a stale entry never blocks re-selection. This
+  // used to also `$set: { campaignRunId: null }`, a singular field that does
+  // not exist on the schema; with the default `strict: true` mongoose
+  // silently stripped it, so the write was always a no-op. Removed rather
+  // than "fixed" — there is nothing that needs clearing.
   const ads = await Ad.updateMany(
     { status: 'rendering', updatedAt: { $lt: cutoff } },
-    { $set: { status: 'queued', campaignRunId: null, updatedAt: new Date() } }
+    { $set: { status: 'queued', updatedAt: new Date() } }
   );
 
   // CampaignRun: stuck 'running' → mark 'failed' with completedAt so
   // the frontend poller resolves. The individual Ads inside the run
   // were handled by the Ad sweep above.
+  //
+  // Staleness is judged on updatedAt, NOT startedAt: the schema has
+  // timestamps:true, so every per-ad `$inc { succeeded/failed }` refreshes
+  // updatedAt — a live run heartbeats roughly once a minute. Filtering on
+  // startedAt would fail ANY run older than 15 minutes, and a serialized
+  // 20-ad video batch legitimately runs 25-35 — the healthy long batch
+  // would be marked failed while still rendering. A run whose counters
+  // haven't moved in 15 minutes is genuinely dead.
   const runs = await CampaignRun.updateMany(
-    { status: 'running', startedAt: { $lt: cutoff } },
+    { status: 'running', updatedAt: { $lt: cutoff } },
     { $set: { status: 'failed', completedAt: new Date() } }
   );
 
-  const total = (detects.modifiedCount || 0) + (ads.modifiedCount || 0) + (runs.modifiedCount || 0);
+  const nDetects = detects.modifiedCount || 0;
+  const nAds     = ads.modifiedCount     || 0;
+  const nRuns    = runs.modifiedCount    || 0;
+  const total = nDetects + nAds + nRuns;
   if (total > 0) {
     console.log(
-      `🧹 reaped: ${detects.modifiedCount || 0} DetectRun · ` +
-      `${ads.modifiedCount || 0} Ad · ${runs.modifiedCount || 0} CampaignRun ` +
+      `🧹 reaped: ${nDetects} DetectRun · ${nAds} Ad · ${nRuns} CampaignRun ` +
       `(stale > ${REAP_STALE_MIN}m)`
     );
+
+    // THE "work got dropped" alert. Reaping an Ad or a CampaignRun means a
+    // process died holding claimed work — a deploy, an autoscale scale-in,
+    // or a crash. The reset ads go back to 'queued', and nothing drains
+    // 'queued' automatically (selectAdsForRun is only reachable from
+    // POST /api/ads/generate and POST /api/ads/runs), so somebody has to
+    // press "Generate more" or that work never resumes. Reaping only
+    // DetectRuns is benign — the worker re-claims those itself — so that
+    // case stays at warn.
+    const dropped = nAds + nRuns;
+    alerts.notifyAsync({
+      level: dropped > 0 ? 'error' : 'warn',
+      title: dropped > 0
+        ? `Dropped work reclaimed — ${nAds} ad(s), ${nRuns} run(s)`
+        : `Reclaimed ${nDetects} stale detect run(s)`,
+      key: 'reaper:reaped',
+      fields: {
+        'ads reset to queued': nAds || undefined,
+        'runs marked failed':  nRuns || undefined,
+        'detect runs requeued': nDetects || undefined,
+        'stale threshold':     `${REAP_STALE_MIN}m`,
+        ...(nAds > 0 ? { 'action needed': 'ads sit in queued until someone re-runs the campaign' } : {})
+      }
+    });
   }
 
   // OperationRun (unified progress rows): stale-heartbeat runs from

@@ -37,6 +37,8 @@ const { deleteFromCloudinary } = require('../services/cloudinaryService');
 const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
 const { buildPreviewHtmlForAd }  = require('../services/adPreviewPageService');
 const registry = require('../services/templateRegistry');
+const alerts   = require('../services/alertService');
+const inFlight = require('../services/inFlight');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
@@ -395,6 +397,14 @@ router.post('/generate', async (req, res) => {
         await runRenderLoop(run, { ...job, platformFormat }, adIds, renderToken);
       } catch (err) {
         console.error(`❌ campaign run ${runId} prep/render crashed:`, err);
+        inFlight.untrack(runId);
+        alerts.notifyAsync({
+          level: 'error',
+          title: 'Campaign run crashed during prep/render',
+          key:   'run-crash:generate',
+          fields: { run: runId, campaign: campaignId, ads: (adIds || []).length, error: err.message || String(err) },
+          detail: err.stack || null
+        });
         if (adIds && adIds.length) {
           await Ad.updateMany(
             { _id: { $in: adIds }, status: 'rendering' },
@@ -498,6 +508,14 @@ router.post('/runs', express.json(), async (req, res) => {
     setImmediate(() => {
       runRenderLoop(run, job, adIds, renderToken).catch(err => {
         console.error(`❌ campaign run ${runId} crashed:`, err);
+        inFlight.untrack(runId);
+        alerts.notifyAsync({
+          level: 'error',
+          title: 'Campaign run crashed (queued drain)',
+          key:   'run-crash:runs',
+          fields: { run: runId, campaign: String(campaign._id), ads: adIds.length, error: err.message || String(err) },
+          detail: err.stack || null
+        });
         Ad.updateMany(
           { _id: { $in: adIds }, status: 'rendering' },
           { $set: { status: 'queued', updatedAt: new Date() } }
@@ -530,6 +548,11 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     `🚀 [campaignRun ${run.runId}] start — ${adIds.length} ad(s) ` +
     `concurrency=${concurrency}${isVeoRun ? ' (veo)' : ''} brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
   );
+
+  // Register with the in-flight registry so the SIGTERM handler can report
+  // exactly how much work an instance replacement is about to orphan. This
+  // loop lives in the web process and dies with it — see services/inFlight.js.
+  inFlight.track(run.runId, { total: adIds.length, brandId: job.brandId, veo: isVeoRun });
 
   // Unified progress row (ActivityDock) — mirrors the CampaignRun
   // counters and adds cooperative cancel: the pool stops claiming new
@@ -565,6 +588,23 @@ async function runRenderLoop(run, job, adIds, renderToken) {
           .finally(() => {
             inflight--;
             progressRun.tick(++done, adIds.length);
+            inFlight.progress(run.runId, done);
+            // Liveness heartbeat for the reaper. Ads are bulk-claimed with a
+            // single updatedAt stamp before the loop, but a serialized video
+            // batch runs ~1 min/ad — so ads late in a 20-ad queue would sit
+            // 'rendering' with a 15-min-old timestamp while perfectly
+            // healthy, and worker.js's reaper would flip them back to
+            // 'queued' MID-RUN. renderOne renders by id with no status
+            // check, so a concurrent "Generate more" could then select the
+            // same ad into a second run: two billable video submits for one
+            // ad. Refreshing on every completion (~1/min here) means the
+            // reaper only ever sees ads whose loop has genuinely stopped.
+            // Scoped to status:'rendering' so it never resurrects ads the
+            // cancel path already re-queued.
+            Ad.updateMany(
+              { _id: { $in: adIds }, status: 'rendering' },
+              { $set: { updatedAt: new Date() } }
+            ).catch(() => {});
             if ((next >= queue.length || cancelled) && inflight === 0) resolve();
             else dispatch();
           });
@@ -594,13 +634,43 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     { status: 'done', completedAt: new Date() }
   );
   const totalMs = Date.now() - t0;
-  const final = await CampaignRun.findById(run._id).select('succeeded skipped failed').lean();
+  inFlight.untrack(run.runId);
+  const final = await CampaignRun.findById(run._id).select('succeeded skipped failed errors').lean();
   if (cancelled) await progressRun.markCancelled(`Stopped — ${final?.succeeded || 0} finished, rest skipped`);
   else await progressRun.succeed({ succeeded: final?.succeeded || 0, skipped: final?.skipped || 0, failed: final?.failed || 0 });
   console.log(
     `🎉 [campaignRun ${run.runId}] done in ${totalMs}ms — ` +
     `${final?.succeeded || 0} succeeded · ${final?.skipped || 0} skipped · ${final?.failed || 0} failed${cancelled ? ' (cancelled by operator)' : ''}`
   );
+
+  // Report batches that finished with losses. An operator-cancelled run is
+  // expected, so it stays quiet; a run that failed every ad is escalated.
+  const nFailed = final?.failed || 0;
+  if (!cancelled && nFailed > 0) {
+    const nOk = final?.succeeded || 0;
+    alerts.notifyAsync({
+      level: nOk === 0 ? 'error' : 'warn',
+      title: nOk === 0
+        ? `Campaign run failed entirely — ${nFailed} ad(s)`
+        : `Campaign run finished with ${nFailed} failed ad(s)`,
+      key:   `run-failed:${nOk === 0 ? 'total' : 'partial'}`,
+      fields: {
+        run:      run.runId,
+        brand:    job.brandId,
+        outcome:  `${nOk}✓ / ${nFailed}✗ / ${final?.skipped || 0}⊘ of ${adIds.length}`,
+        route:    isVeoRun ? 'video' : 'static',
+        took:     `${Math.round(totalMs / 1000)}s`
+      },
+      // The per-ad errors array is the actual diagnosis; the run counters
+      // alone never say WHY. Defensive per-entry: this runs AFTER the run
+      // was persisted as 'done', still inside runRenderLoop — a throw here
+      // would surface in the caller's catch and falsely re-mark the run
+      // 'failed'.
+      detail: (Array.isArray(final?.errors) ? final.errors : []).slice(-6)
+        .map((e) => `#${e?.index ?? '?'} [${e?.stage ?? '?'}] ${String(e?.message ?? '').slice(0, 200)}`)
+        .join('\n') || null
+    });
+  }
 }
 
 async function renderOne(run, job, adId, index, renderToken) {
@@ -754,6 +824,20 @@ async function renderOne(run, job, adId, index, renderToken) {
       await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
     } catch (err) {
       console.error(`❌ veoReference[ad=${adId}]:`, err.message || err);
+      // Video is the expensive, slow, vendor-dependent stage — the one
+      // worth a push. Deduped on the message shape, not the ad id, so a
+      // vendor outage that fails 20 ads sends one alert with a count
+      // rather than 20 separate ones. String() the message defensively:
+      // a vendor error like {message: 429} has a truthy non-string
+      // .message, and a synchronous throw HERE would skip the CampaignRun/
+      // Ad failure bookkeeping below, wedging the ad in 'rendering'.
+      const vmsg = String((err && err.message) || err);
+      alerts.notifyAsync({
+        level:  'error',
+        title:  'Video generation failed',
+        key:    `video-failed:${vmsg.slice(0, 60)}`,
+        fields: { ad: String(adId), run: run.runId, brand: job.brandId, error: vmsg.slice(0, 300) }
+      });
       await CampaignRun.updateOne(
         { _id: run._id },
         {
