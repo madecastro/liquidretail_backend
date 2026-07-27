@@ -83,6 +83,14 @@ function parsePhase3WizardFields(body = {}) {
     if (!Array.isArray(seedPicks)) {
       return { ok: false, status: 400, error: 'seedPicks must be an array of { productId, mediaId }' };
     }
+    // Bound the array. Spend is already capped downstream (one ad per product,
+    // references clamped to the model's maxReferenceImages), so a huge array
+    // cannot run up a bill — but it can bloat the request, the Ad rows and this
+    // validation loop. 200 pairs is ~28 products at a full 7-reference stack,
+    // far past any real run.
+    if (seedPicks.length > 200) {
+      return { ok: false, status: 400, error: 'seedPicks may not exceed 200 entries' };
+    }
     parsedSeedPicks = [];
     const seenPairs = new Set();
     for (const p of seedPicks) {

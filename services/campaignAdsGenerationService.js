@@ -1587,6 +1587,19 @@ async function expandDeterministicVideo({
   // 'product_category', then higher confidence wins. Picking arbitrarily would
   // attach the seed to a different product on different runs for the same
   // input, which would also change the ad's identity digest.
+  // Does this Media genuinely belong to `productId`? Same evidence
+  // resolveSeedProductId accepts, asked about ONE product instead of ranking a
+  // set. Used to validate explicit seedPicks pairs.
+  function mediaAssociatesWithProduct(doc, productId) {
+    const pid = String(productId);
+    const direct = doc?.metadata?.catalogProductId;
+    if (direct != null && String(direct) === pid) return true;
+    return (Array.isArray(doc?.matchedProducts) ? doc.matchedProducts : []).some(m =>
+      m?.catalogProductId != null &&
+      String(m.catalogProductId) === pid &&
+      m.outcome === 'product_match');
+  }
+
   function resolveSeedProductId(doc, allowed) {
     const direct = doc?.metadata?.catalogProductId != null
       ? String(doc.metadata.catalogProductId)
@@ -1623,12 +1636,15 @@ async function expandDeterministicVideo({
   // metadata.catalogProductId, and posts matched during detect carry
   // matchedProducts[].catalogProductId. resolveSeedProductId below uses both.
   const productIdSet = new Set(productIds.map(String));
-  // Load whichever source is authoritative. A client sending ONLY seedPicks
-  // would otherwise load nothing here and have every pick dropped as "not
-  // found" — the same silent-drop failure this whole change exists to remove.
-  const seedIdSource = Array.isArray(seedPicks) && seedPicks.length
-    ? seedPicks.map(p => p?.mediaId)
-    : (seedMediaIds || []);
+  // Load the UNION of both sources. Loading only the authoritative one breaks
+  // two things: a client sending only seedPicks would load nothing under the old
+  // code and have every pick dropped as "not found", and the merge below — which
+  // fills products seedPicks never mentioned from the legacy list — needs those
+  // legacy docs present to resolve them.
+  const seedIdSource = [
+    ...(Array.isArray(seedPicks) ? seedPicks.map(p => p?.mediaId) : []),
+    ...(seedMediaIds || [])
+  ].filter(Boolean);
   const seedOids = [...new Set(seedIdSource.map(String))].map(toObjectId).filter(Boolean);
   // brandId scoping is explicit now. The dropped source:'catalog-product' filter
   // was never a security control, but it did incidentally narrow what an
@@ -1670,10 +1686,15 @@ async function expandDeterministicVideo({
       );
       continue;
     }
-    // Explicit assignment still has to name a product IN THIS RUN — the pair
-    // comes off the request body, so it is operator intent, not authorisation.
+    // An explicit pair DISAMBIGUATES among associations the media genuinely
+    // has; it does not get to invent one. Membership in productIds is not
+    // sufficient: without the association check, a body could assign product
+    // A's catalog hero to product B and B's video would be seeded — and billed
+    // ~$1 — showing the wrong SKU. This also means a productId belonging to
+    // another brand cannot be used, since the media load is brand-scoped and a
+    // foreign product will have no association with an in-brand Media.
     const cpid = assigned
-      ? (productIdSet.has(assigned) ? assigned : null)
+      ? (productIdSet.has(assigned) && mediaAssociatesWithProduct(doc, assigned) ? assigned : null)
       : resolveSeedProductId(doc, productIdSet);
     if (!cpid) {
       console.warn(
@@ -1690,6 +1711,32 @@ async function expandDeterministicVideo({
     // Preserve first occurrence only (re-picks of the same id ignored).
     if (!list.some(x => String(x) === idStr)) {
       list.push(doc._id);
+    }
+  }
+
+  // MERGE, don't silence. seedPicks is authoritative only for the products it
+  // actually mentions. A payload carrying both — a partial pick list plus a
+  // fuller legacy seedMediaIds, or a pick list whose every pair got dropped —
+  // would otherwise send the unmentioned products down the hero path, produce a
+  // different identityDigest than the seed-based ad already queued for them, and
+  // insert a SECOND ad: double video spend for one operator intent.
+  if (explicitPairs && (seedMediaIds || []).length) {
+    for (const rawId of seedMediaIds) {
+      const idStr = String(rawId);
+      const doc = seedById.get(idStr);
+      if (!doc) continue;
+      const cpid = resolveSeedProductId(doc, productIdSet);
+      // Only fill products the explicit list said nothing about.
+      if (!cpid || picksByProduct.has(cpid)) continue;
+      if (!picksByProduct.has(cpid)) picksByProduct.set(cpid, []);
+      const list = picksByProduct.get(cpid);
+      if (!list.some(x => String(x) === idStr)) {
+        list.push(doc._id);
+        console.log(
+          `📦 expandDeterministicVideo: product ${cpid} not covered by seedPicks — ` +
+          `filled from legacy seedMediaIds (${idStr})`
+        );
+      }
     }
   }
 
