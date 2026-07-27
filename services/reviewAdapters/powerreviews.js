@@ -31,7 +31,8 @@ const {
   toFloat,
   toDate,
   text,
-  distributionFromCounts
+  distributionFromCounts,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 25;                    // hard server ceiling: 26+ → HTTP 400
@@ -291,12 +292,12 @@ function parse(payload, ctx, page) {
 
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  const body = text(pick(raw, 'details.comments'), 400);
+  const body = text(pick(raw, 'details.comments'), REVIEW_TEXT_MAX);
   if (!body) return null;
   return {
     text: body,
-    title: text(pick(raw, 'details.headline'), 140),
-    author: text(pick(raw, 'details.nickname'), 120),
+    title: text(pick(raw, 'details.headline'), REVIEW_TITLE_MAX),
+    author: text(pick(raw, 'details.nickname'), REVIEW_AUTHOR_MAX),
     rating: toFloat(pick(raw, 'metrics.rating')),
     // Epoch MILLISECONDS — toDate handles both, but this is why it must.
     datePublished: toDate(pick(raw, 'details.created_date')),

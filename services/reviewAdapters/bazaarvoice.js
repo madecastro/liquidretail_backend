@@ -31,7 +31,8 @@
 'use strict';
 
 const {
-  firstMatch, pick, toInt, toFloat, toDate, text
+  firstMatch, pick, toInt, toFloat, toDate, text,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                   // hard server cap on Limit
@@ -198,12 +199,12 @@ function parse(payload, ctx, page) {
 
 function normalize(raw, ctx) {
   if (!raw || typeof raw !== 'object') return null;
-  const body = text(raw.ReviewText, 400);
+  const body = text(raw.ReviewText, REVIEW_TEXT_MAX);
   if (!body) return null;                // ratings-only reviews are common on BV
   const quote = {
     text: body,
-    title: text(raw.Title, 140),
-    author: text(raw.UserNickname, 120),
+    title: text(raw.Title, REVIEW_TITLE_MAX),
+    author: text(raw.UserNickname, REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.Rating),
     datePublished: toDate(raw.SubmissionTime),
     verified: !!pick(raw, 'Badges.verifiedPurchaser')

@@ -20,7 +20,8 @@
 'use strict';
 
 const {
-  firstMatch, pick, toInt, toFloat, toDate, text, htmlToText, shopifyProductId, shopDomain
+  firstMatch, pick, toInt, toFloat, toDate, text, htmlToText, shopifyProductId, shopDomain,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 30;                    // server cap; asking for more is silently clamped
@@ -107,12 +108,12 @@ function parse(payload, ctx) {
 }
 
 function normalize(raw) {
-  const body = htmlToText(raw.body, 400);
+  const body = htmlToText(raw.body, REVIEW_TEXT_MAX);
   if (!body) return null;
   return {
     text: body,
-    title: htmlToText(raw.title, 140),
-    author: text(htmlToText(raw.author, 120), 120),
+    title: htmlToText(raw.title, REVIEW_TITLE_MAX),
+    author: text(htmlToText(raw.author, REVIEW_AUTHOR_MAX), REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.score),
     datePublished: toDate(raw.timestamp),
     verified: raw.verified === 'true' || raw.verified === '1'

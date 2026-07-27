@@ -342,6 +342,9 @@ checkAsync('text-mode adapters (HTML widget responses) are supported', async () 
 
 checkAsync('robots.txt disallow on the vendor host → adapter declines, nothing fetched', async () => {
   reset();
+  // The gate is opt-in (REVIEW_RESPECT_ROBOTS) because this deployment scrapes
+  // with client authorisation; this test covers the respecting posture.
+  process.env.REVIEW_RESPECT_ROBOTS = 'true';
   robotsAllow = false;
   jsonResponder = fakeVendor();
   const r = await collectFromAdapter(FAKE, { html: PDP, pageUrl: 'https://s.test/p/1' });
@@ -349,23 +352,39 @@ checkAsync('robots.txt disallow on the vendor host → adapter declines, nothing
   assert.equal(requestLog.length, 0, 'must not fetch a disallowed endpoint');
   assert.equal(robotsLog.length, 1);
   assert.match(robotsLog[0], /api\.fakevendor\.test/);
+  delete process.env.REVIEW_RESPECT_ROBOTS;
 });
 
-checkAsync('robots is checked once, not per page', async () => {
+checkAsync('robots gate OFF by default → a disallowed vendor is still read', async () => {
   reset();
+  delete process.env.REVIEW_RESPECT_ROBOTS;
+  robotsAllow = false;                    // vendor says no…
+  jsonResponder = fakeVendor({ totalReviews: 5 });
+  const r = await collectFromAdapter(FAKE, { html: PDP, pageUrl: 'https://s.test/p/1' });
+  assert.ok(r, 'default posture is authorised scraping, so the fetch proceeds');
+  assert.equal(r.reviews.length, 5);
+  assert.equal(robotsLog.length, 0, 'no robots lookup at all when the gate is off');
+});
+
+checkAsync('robots is checked once, not per page (respecting posture)', async () => {
+  reset();
+  process.env.REVIEW_RESPECT_ROBOTS = 'true';
   jsonResponder = fakeVendor({ totalReviews: 47 });
   await collectFromAdapter(FAKE, { html: PDP, pageUrl: 'https://s.test/p/1', maxPages: 5, maxReviews: 200 });
   assert.equal(robotsLog.length, 1);
   assert.equal(requestLog.length, 5);
+  delete process.env.REVIEW_RESPECT_ROBOTS;
 });
 
 checkAsync('unreachable robots.txt (throw) is treated as "nothing stated" → proceed', async () => {
   reset();
+  process.env.REVIEW_RESPECT_ROBOTS = 'true';
   robotsAllow = () => { throw new Error('403'); };
   jsonResponder = fakeVendor({ totalReviews: 5 });
   const r = await collectFromAdapter(FAKE, { html: PDP, pageUrl: 'https://s.test/p/1' });
   assert.ok(r);
   assert.equal(r.reviews.length, 5);
+  delete process.env.REVIEW_RESPECT_ROBOTS;
 });
 
 // ── per-vendor adapters, against real payload shapes ───────────────
@@ -971,13 +990,34 @@ check('headless: load-more text sweep never clicks "Write a review"', () => {
   assert.equal(wouldClick('Add to cart'), false);
 });
 
-check('headless: every vendor entry points at a registered tier-2 adapter', () => {
+check('headless: every vendor entry is either adapter-backed or learn-only', () => {
   for (const v of headless.VENDOR_RESPONSES) {
-    assert.ok(adapters.BY_PLATFORM.get(v.adapter),
-      `${v.platform} references unknown adapter "${v.adapter}"`);
     assert.equal(typeof v.test, 'function');
     assert.equal(typeof v.unwrap, 'function');
+    if (v.adapter) {
+      assert.ok(adapters.BY_PLATFORM.get(v.adapter),
+        `${v.platform} references unknown adapter "${v.adapter}"`);
+    } else {
+      // Identification-only (Loox): no tier-2 adapter can exist because the
+      // store key is absent from the PDP, so it must at least teach us one.
+      assert.equal(typeof v.learn, 'function',
+        `${v.platform} has no adapter and no learn() — it would be inert`);
+    }
   }
+});
+
+check('headless: the Loox entry learns the store key from its request URL', () => {
+  const loox = headless.VENDOR_RESPONSES.find(v => v.platform === 'loox');
+  assert.ok(loox, 'expected a loox entry');
+  const url = 'https://loox.io/widget/4J-pXOns-B/reviews/4695416602690?h=1785189600000';
+  assert.equal(loox.test(url), true);
+  assert.deepEqual(loox.learn(url), {
+    looxPublicStoreId: '4J-pXOns-B', looxProductId: '4695416602690'
+  });
+  // The key is NOT in the PDP HTML, which is exactly why this exists.
+  assert.equal(loox.learn('https://loox.io/widget/loox.js?shop=x.myshopify.com'), null);
+  // Harvesting is a no-op: there is no tier-2 loox adapter to map through.
+  assert.deepEqual(headless.harvestFromPayload(loox, '<div>html</div>', {}).quotes, []);
 });
 
 checkAsync('headless: disabled by default — captureReviews is a no-op without opt-in', async () => {

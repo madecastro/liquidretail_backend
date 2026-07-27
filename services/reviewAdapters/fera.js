@@ -28,7 +28,8 @@ const {
   toDate,
   text,
   shopifyProductId,
-  distributionFromCounts
+  distributionFromCounts,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                   // server ceiling; above it clamps silently
@@ -110,13 +111,13 @@ function parse(payload, ctx, page) {
 
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  const body = text(raw.body, 400);
+  const body = text(raw.body, REVIEW_TEXT_MAX);
   if (!body) return null;
   return {
     text: body,
-    title: text(raw.heading, 140),
+    title: text(raw.heading, REVIEW_TITLE_MAX),
     // display_name is literally 'Anonymous' when the reviewer opted out.
-    author: text(pick(raw, 'customer.display_name'), 120),
+    author: text(pick(raw, 'customer.display_name'), REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.rating),
     datePublished: toDate(raw.created_at),
     verified: raw.is_verified === true

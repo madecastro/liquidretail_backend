@@ -23,7 +23,8 @@
 'use strict';
 
 const {
-  firstMatch, pick, pickAny, toInt, toFloat, toDate, text, distributionFromCounts, shopifyProductId
+  firstMatch, pick, pickAny, toInt, toFloat, toDate, text, distributionFromCounts, shopifyProductId,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                  // under the 150 clamp, fewer huge payloads
@@ -77,12 +78,12 @@ function parse(payload) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.content, 400);
+  const body = text(raw && raw.content, REVIEW_TEXT_MAX);
   if (!body) return null;
   return {
     text: body,
-    title: text(raw.title, 140),
-    author: text(pickAny(raw, ['user.display_name', 'user.name', 'name']), 120),
+    title: text(raw.title, REVIEW_TITLE_MAX),
+    author: text(pickAny(raw, ['user.display_name', 'user.name', 'name']), REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.score),
     datePublished: toDate(raw.created_at),
     verified: !!raw.verified_buyer

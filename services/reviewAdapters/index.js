@@ -53,7 +53,15 @@
 // per-host throttle, UA rotation, 429/Retry-After handling and byte caps as
 // the rest of our crawling. Adapters never call fetch() directly.
 //
-// ROBOTS IS ENFORCED ON VENDOR HOSTS TOO (checked live 2026-07-27):
+// ROBOTS POSTURE IS A DEPLOYMENT CHOICE — see REVIEW_RESPECT_ROBOTS below.
+// This deployment runs with client authorisation for the storefronts it
+// scrapes, so the gate defaults OFF. Set REVIEW_RESPECT_ROBOTS=true to restore
+// it. NOTE the asymmetry the flag cannot fix: a client can authorise access to
+// THEIR storefront, but api.bazaarvoice.com / loox.io / judge.me are
+// third-party infrastructure the client cannot consent on behalf of, so the
+// policies below remain the vendors' own position on automated access.
+//
+// VENDOR ROBOTS POLICIES (checked live 2026-07-27, recorded for the record):
 //   api-cdn.yotpo.com   Disallow: / BUT explicit Allow: /v1/widget/*,
 //                       /products/*/*/reviews, /v1/star_distribution/* —
 //                       i.e. the widget read endpoints are opened on purpose.
@@ -104,6 +112,17 @@ const MAX_BYTES = 4_000_000;
 // Master switch — adapters are pure additive value, so a bad vendor day
 // should be one env var away from off.
 const ENABLED = process.env.REVIEW_ADAPTERS_ENABLED !== 'false';
+
+// Whether to honour robots.txt on VENDOR API hosts. Off by default: this
+// deployment scrapes with client authorisation, and the vendor endpoints in
+// question are the same public ones the merchant's own storefront calls on
+// every page view. Flip to 'true' for a robots-respecting posture (that setting
+// disables the Loox path entirely — loox.io disallows /widget).
+// Read at CALL time, not load time, so the posture can be flipped without a
+// restart (and so tests can exercise both paths).
+function respectRobots() {
+  return process.env.REVIEW_RESPECT_ROBOTS === 'true';
+}
 
 // ── shared helpers ─────────────────────────────────────────────────
 //
@@ -215,11 +234,10 @@ async function collectFromAdapter(adapter, {
     }
     if (!req || !req.url) { out.stopReason = 'no further request'; break; }
 
-    // Robots gate on the VENDOR host. Checked on the first page only —
-    // subsequent pages are the same path with a different query, and
-    // isAllowedByRobots caches per origin anyway. A vendor that disallows
-    // its widget endpoints (Loox does) stops here with nothing fetched.
-    if (page === 0) {
+    // Robots gate on the VENDOR host, when the deployment opts into it.
+    // Checked on the first page only — later pages are the same path with a
+    // different query, and isAllowedByRobots caches per origin anyway.
+    if (respectRobots() && page === 0) {
       let allowed = true;
       try {
         allowed = await http.isAllowedByRobots(req.url);
@@ -360,5 +378,6 @@ module.exports = Object.assign({
   BY_PLATFORM,
   MAX_PAGES,
   MAX_REVIEWS,
-  ENABLED
+  ENABLED,
+  respectRobots
 }, helpers);

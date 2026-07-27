@@ -39,12 +39,11 @@
 // widget pages 5 at a time. Hence the click cap: this is for harvesting a
 // pool of positive quotes, not for archiving every review.
 //
-// ROBOTS: we always fetch the MERCHANT's page (allowed — same check tier 1
-// makes) and reading what it renders is fair game. Harvesting the JSON of a
-// vendor host that disallows robots is NOT, so intercepted payloads are gated
-// per host and a disallowed vendor falls through to the DOM read. loox.io is
-// the live example: it disallows /widget, so its JSON is never harvested even
-// though the merchant's page fetches it.
+// ROBOTS: gated on REVIEW_RESPECT_ROBOTS (default off — this deployment runs
+// with client authorisation). When enabled, intercepted payloads from a vendor
+// host that disallows robots are dropped and the DOM read takes over instead;
+// loox.io is the live example, since it disallows /widget. Reading the rendered
+// merchant page is unaffected either way — that is the client's own page.
 //
 // SANDBOX GOTCHA worth knowing beyond this feature: bundled Chromium could not
 // complete ANY outbound TLS in a container behind a TLS-terminating proxy
@@ -55,6 +54,7 @@
 'use strict';
 
 const { cleanScrapedText } = require('../utils/htmlEntities');
+const { REVIEW_TEXT_MAX } = require('./reviewAdapters/helpers');
 
 const LOG = '⭐';
 
@@ -79,10 +79,13 @@ const NAV_TIMEOUT_MS = Math.max(
   parseInt(process.env.REVIEW_HEADLESS_NAV_TIMEOUT_MS, 10) || 30000
 );
 // Widgets need a beat after their container mounts before their first XHR
-// resolves; both verified vendors did.
+// resolves. Measured mount times: Bazaarvoice ~10-11s, Junip ~9s, Loox ~6.5s
+// AND ONLY AFTER SCROLLING (blendjet.com never fetches its reviews until the
+// widget enters the viewport). This is an upper bound on a poll, not a fixed
+// sleep — see waitForReviewSignal.
 const HYDRATE_MS = Math.max(
-  0,
-  parseInt(process.env.REVIEW_HEADLESS_HYDRATE_MS, 10) || 3500
+  1000,
+  parseInt(process.env.REVIEW_HEADLESS_HYDRATE_MS, 10) || 16000
 );
 const CLICK_WAIT_MS = Math.max(
   1000,
@@ -169,6 +172,23 @@ const VENDOR_RESPONSES = [
     unwrap: (body) => (body && Array.isArray(body.data) ? body : null)
   },
   {
+    // Loox has NO tier-2 adapter — its publicStoreId is not in the PDP HTML at
+    // all (verified: blendjet.com's key 4J-pXOns-B appears nowhere in the
+    // served markup; loox.js fetches it at runtime). So the browser is the only
+    // thing that can learn it, and the widget answers with an HTML fragment
+    // rather than JSON. Its reviews are read from the rendered iframe by the
+    // DOM path; this entry exists to LEARN the store key from the request URL
+    // so the profile store can record it.
+    platform: 'loox',
+    adapter: null,
+    test: (url) => /loox\.io\/widget\/[^/]+\/reviews\//i.test(url),
+    unwrap: () => null,
+    learn: (url) => {
+      const m = String(url).match(/loox\.io\/widget\/([^/]+)\/reviews\/(\d+)/i);
+      return m ? { looxPublicStoreId: m[1], looxProductId: m[2] } : null;
+    }
+  },
+  {
     platform: 'reviews.io',
     adapter: 'reviews.io',
     test: (url) => /api\.reviews\.io\/(product\/reviews|timeline\/data)/i.test(url),
@@ -232,19 +252,41 @@ const LOAD_MORE_SELECTORS = [
 const LOAD_MORE_TEXT_RE = /(load|show|see)\s+more|more\s+reviews|next\s+reviews|next\s+page/i;
 const LOAD_MORE_TEXT_DENY_RE = /write\s+a?\s*review|ask\s+a\s+question|see\s+more\s+products/i;
 
-// ── DOM fallback selectors ─────────────────────────────────────────
-const DOM_REVIEW_SELECTORS = [
-  { platform: 'bazaarvoice', item: 'li.bv-content-item.bv-content-review',
-    text: '.bv-content-summary-body-text', author: '.bv-content-author-name',
-    rating: 'abbr.bv-rating-stars-off[title], abbr[title*="out of 5"]' },
-  { platform: 'junip', item: '.junip-review',
-    text: '.junip-review-body, .junip-review__body', author: '.junip-review-author',
-    rating: '[aria-label*="star"]' },
-  { platform: 'generic', item: '[class*="review-item"], [class*="review__item"], [data-review-id]',
-    text: '[class*="review-body"], [class*="review__body"], [class*="review-content"]',
-    author: '[class*="review-author"], [class*="reviewer-name"]',
-    rating: '[aria-label*="star"], [title*="out of 5"]' }
-];
+// ── DOM fallback ───────────────────────────────────────────────────
+//
+// FRAME WALKING IS MANDATORY, NOT OPTIONAL. Loox renders its reviews inside an
+// IFRAME (loox.io/widget/<key>/reviews/<productId>) — verified on
+// blendjet.com/products/blendjet-2, where the main document holds an empty
+// .loox-reviews shell and the 20 review cards live in a child frame with 788
+// nodes. And Loox is exactly the vendor whose JSON we may NOT harvest (their
+// robots disallows /widget), so the DOM read is the only permitted route.
+// A main-document-only read returns nothing here.
+//
+// CARD DISCOVERY IS VENDOR-AGNOSTIC. Rather than a selector table per widget,
+// we climb from every star-rating element to the nearest ancestor that also
+// contains a paragraph of text: that ancestor IS the review card, in any
+// widget. The rating comes off the star element's own aria-label/title
+// ("Rating icons: 5 / 5 star review" on Loox), which is the only place the
+// value exists as text — the visual state is CSS.
+const DOM_STAR_SELECTORS = [
+  '[aria-label*="star" i]',
+  '[title*="out of 5" i]',
+  '[class*="stars"]',
+  '[class*="rating"]'
+].join(',');
+
+// Tried first — a known item selector is cheaper and less noisy than climbing.
+const DOM_ITEM_SELECTORS = [
+  'li.bv-content-item.bv-content-review',        // bazaarvoice
+  '.junip-review',                               // junip
+  '.jdgm-rev',                                   // judge.me
+  '.yotpo-review',                               // yotpo
+  '.oke-review',                                 // okendo
+  '.stamped-review',                             // stamped
+  '[data-review-id]',
+  '[class*="review-item"]',
+  '[class*="review__item"]'
+].join(',');
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -268,6 +310,9 @@ function harvestFromPayload(vendor, body, ctxHint = {}) {
   }
   if (!payload) return out;
 
+  // Some vendors are present for identification only (Loox — no tier-2
+  // adapter exists because its store key is not in the page).
+  if (!vendor.adapter) return out;
   let adapter;
   try {
     adapter = require('./reviewAdapters').BY_PLATFORM.get(vendor.adapter);
@@ -310,6 +355,7 @@ function harvestFromPayload(vendor, body, ctxHint = {}) {
 const ROBOTS_CACHE = new Map();
 
 async function harvestAllowed(url) {
+  if (process.env.REVIEW_RESPECT_ROBOTS !== 'true') return true;
   let origin;
   try {
     origin = new URL(url).origin;
@@ -331,40 +377,135 @@ async function harvestAllowed(url) {
 }
 
 /**
- * scrapeDomReviews(page) → quotes[]
- * Fallback when nothing crossed the network boundary. Reads visible review
- * nodes; ratings come from aria-label / title text because the visual star
- * state is CSS. Dates are deliberately NOT read — both verified vendors
- * render them as relative strings ("9 months ago"), which is worse than null.
+ * scrapeDomReviews(page) → rows[]
+ *
+ * Reads review cards out of the RENDERED page, walking every frame and keeping
+ * whichever frame yields the most cards (the widget iframe, usually). Dates are
+ * deliberately not read: widgets render them as relative strings ("9 months
+ * ago"), which is worse than null.
  */
-async function scrapeDomReviews(page, selectors) {
-  try {
-    return await page.evaluate((groups) => {
-      const readRating = (el) => {
-        if (!el) return null;
-        const src = el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '';
-        const m = String(src).match(/(\d(?:\.\d)?)\s*(?:out of|\/)\s*5|(\d(?:\.\d)?)\s*star/i);
-        const v = m ? Number(m[1] || m[2]) : NaN;
-        return Number.isFinite(v) ? v : null;
-      };
-      for (const g of groups) {
-        const items = Array.from(document.querySelectorAll(g.item));
-        if (!items.length) continue;
-        const rows = items.map((el) => {
-          const t = el.querySelector(g.text);
-          return {
-            text: (t ? t.textContent : el.textContent || '').trim().slice(0, 600),
-            author: (() => { const a = el.querySelector(g.author); return a ? a.textContent.trim() : null; })(),
-            rating: readRating(el.querySelector(g.rating)),
-            platform: g.platform
-          };
-        }).filter(r => r.text && r.text.length >= 20);
-        if (rows.length) return rows;
+async function scrapeDomReviews(page) {
+  const extract = (itemSel, starSel) => {
+    const textOf = (el) => (el ? String(el.textContent || '').replace(/\s+/g, ' ').trim() : '');
+
+    const readRating = (el) => {
+      if (!el) return null;
+      const src = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+      // "Rating icons: 5 / 5 star review", "4 out of 5 stars", "4.5 stars"
+      const m = String(src).match(/(\d(?:\.\d)?)\s*(?:\/|out of)\s*5|(\d(?:\.\d)?)\s*star/i);
+      const v = m ? Number(m[1] || m[2]) : NaN;
+      return Number.isFinite(v) && v >= 0 && v <= 5 ? v : null;
+    };
+
+    // Longest childless descendant — the review body, not the whole card.
+    const bodyOf = (card) => {
+      let best = '';
+      for (const el of card.querySelectorAll('div,p,span,li')) {
+        if (el.children.length) continue;
+        const t = textOf(el);
+        if (t.length > best.length) best = t;
       }
-      return [];
-    }, selectors);
-  } catch {
-    return [];
+      return best || textOf(card);
+    };
+
+    const cards = new Set();
+    for (const el of document.querySelectorAll(itemSel)) cards.add(el);
+
+    // No known item selector matched → climb from each star element to the
+    // nearest ancestor that also carries a paragraph of text. That ancestor is
+    // the review card in any widget.
+    if (!cards.size) {
+      for (const star of document.querySelectorAll(starSel)) {
+        let node = star;
+        for (let up = 0; up < 6 && node && node.parentElement; up++) {
+          node = node.parentElement;
+          const t = textOf(node);
+          if (t.length >= 60 && t.length <= 2000) { cards.add(node); break; }
+        }
+      }
+    }
+
+    // The widget states its own average in an aria-label ("Average rating:
+    // 4.9 / 5 star review") — the only place that number exists as text.
+    let average = null;
+    for (const el of document.querySelectorAll('[aria-label*="average" i], [aria-label*="Average" i]')) {
+      const m = String(el.getAttribute('aria-label') || '').match(/([\d.]+)\s*\/\s*5/);
+      if (m) { const v = Number(m[1]); if (Number.isFinite(v)) { average = v; break; } }
+    }
+
+    const rows = [];
+    for (const card of cards) {
+      // Skip a card that merely contains other cards (a list wrapper).
+      let containsAnother = false;
+      for (const other of cards) {
+        if (other !== card && card.contains(other)) { containsAnother = true; break; }
+      }
+      if (containsAnother) continue;
+
+      const body = bodyOf(card);
+      if (!body || body.length < 20) continue;
+      // The first star-ish match is frequently a wrapper carrying no label, so
+      // try them all and keep the first that yields a value.
+      let rating = null;
+      for (const cand of card.querySelectorAll(starSel)) {
+        rating = readRating(cand);
+        if (rating != null) break;
+      }
+      // Author heuristic: a short line that is not the body.
+      // AUTHOR IS DELIBERATELY NOT GUESSED FROM THE DOM. There is no reliable
+      // marker for it, and the plausible-looking short string next to a review
+      // is usually something else: on blendjet.com's Loox cards the candidates
+      // were "Match Point", "Lavender", "Urban Camo" — the purchased VARIANT,
+      // not the reviewer. A wrong name printed on an ad is worse than none, and
+      // the engine renders a missing author as "Verified buyer". Real authors
+      // come from the typed fields of the intercepted-JSON path.
+      const author = null;
+      rows.push({ text: body.slice(0, 4000), author, rating });   // engine applies the real cap
+    }
+    return { rows, average };
+  };
+
+  let best = { rows: [], average: null };
+  // Main document first, then children. page.frames() includes the main frame.
+  for (const frame of page.frames()) {
+    let got = null;
+    try {
+      got = await frame.evaluate(extract, DOM_ITEM_SELECTORS, DOM_STAR_SELECTORS);
+    } catch {
+      got = null;                           // cross-origin or detached frame
+    }
+    if (got && Array.isArray(got.rows) && got.rows.length > best.rows.length) best = got;
+  }
+  return best;
+}
+
+/**
+ * waitForReviewSignal(page, out, pending, until) → void
+ * Scrolls in steps and resolves as soon as either an intercepted payload has
+ * produced reviews or review-ish DOM exists — whichever comes first — so a
+ * fast store isn't charged the slowest store's mount time.
+ */
+async function waitForReviewSignal(page, out, pending, until) {
+  let step = 0;
+  while (Date.now() < until) {
+    if (out.reviews.length) return;
+    try {
+      // A fifth of the page per tick: enough to trip lazy mounts without
+      // skipping past the widget entirely.
+      await page.evaluate((n) => window.scrollTo(0, document.body.scrollHeight * n),
+        Math.min(0.15 + step * 0.2, 0.95));
+    } catch { /* page may be navigating */ }
+    step += 1;
+    await sleep(1200);
+    await Promise.allSettled(pending.slice());
+    if (out.reviews.length) return;
+    // Cheap DOM probe: if review cards exist we can stop waiting and let the
+    // pagination loop (or the DOM fallback) take over.
+    try {
+      const seenCards = await page.evaluate((sel) => document.querySelectorAll(sel).length > 0,
+        DOM_STAR_SELECTORS);
+      if (seenCards && step >= 3) return;
+    } catch { /* ignore */ }
   }
 }
 
@@ -442,7 +583,10 @@ async function captureReviews(productUrl, {
     distribution: null,
     pagesFetched: 0,
     truncated: false,
-    stopReason: null
+    stopReason: null,
+    // Anything the browser learned that a cheaper tier could reuse later
+    // (e.g. Loox's publicStoreId, which is unavailable from static HTML).
+    hints: null
   };
 
   let browser;
@@ -472,6 +616,17 @@ async function captureReviews(productUrl, {
       pending.push((async () => {
         try {
           if (!(await harvestAllowed(url))) return;
+          // Identification-only vendors teach us their store key FIRST: Loox
+          // answers text/html, so anything gated behind a JSON parse would
+          // never see it.
+          if (typeof vendor.learn === 'function') {
+            const hints = vendor.learn(url);
+            if (hints) {
+              out.platform = out.platform || vendor.platform;
+              out.hints = Object.assign({}, out.hints, hints);
+            }
+          }
+          if (!vendor.adapter) return;          // nothing more to harvest here
           const text = await res.text();
           // Bazaarvoice's unwrap handles its own JSONP wrapper, so it takes the
           // raw text; every other vendor answers plain JSON.
@@ -505,8 +660,11 @@ async function captureReviews(productUrl, {
       out.stopReason = `navigation failed: ${err.message}`;
       return finish(out, page, pending);
     }
-    await sleep(Math.min(HYDRATE_MS, Math.max(0, deadline - Date.now())));
-    await Promise.allSettled(pending.slice());
+    // Lazy widgets only mount when scrolled into view, so drive the page down
+    // the way a reader would, then poll for evidence that reviews arrived
+    // instead of sleeping a fixed window (which either wastes time or misses
+    // the mount, depending on the store).
+    await waitForReviewSignal(page, out, pending, Math.min(deadline, Date.now() + HYDRATE_MS));
 
     // Pagination: click, wait for the follow-up XHR, repeat.
     let clicks = 0;
@@ -534,9 +692,10 @@ async function captureReviews(productUrl, {
 
     // Nothing crossed the network boundary → read what is on screen.
     if (!out.reviews.length) {
-      const rows = await scrapeDomReviews(page, DOM_REVIEW_SELECTORS);
-      for (const r of rows) {
-        const body = cleanScrapedText(r.text, 400);
+      const dom = await scrapeDomReviews(page);
+      if (out.average == null && dom.average != null) out.average = dom.average;
+      for (const r of dom.rows) {
+        const body = cleanScrapedText(r.text, REVIEW_TEXT_MAX);
         if (!body) continue;
         const key = body.toLowerCase().replace(/\s+/g, ' ').slice(0, 160);
         if (seen.has(key)) continue;
@@ -548,7 +707,7 @@ async function captureReviews(productUrl, {
           rating: Number.isFinite(r.rating) ? r.rating : null,
           datePublished: null,             // relative strings only in the DOM
           verified: false,
-          source: r.platform === 'generic' ? (out.platform || 'store') : r.platform
+          source: out.platform || 'store'
         });
         if (out.reviews.length >= maxReviews) break;
       }
@@ -587,7 +746,9 @@ module.exports = {
   LOAD_MORE_SELECTORS,
   LOAD_MORE_TEXT_RE,
   LOAD_MORE_TEXT_DENY_RE,
-  DOM_REVIEW_SELECTORS,
+  DOM_ITEM_SELECTORS,
+  DOM_STAR_SELECTORS,
+  scrapeDomReviews,
   ENABLED,
   MAX_CLICKS,
   BUDGET_MS

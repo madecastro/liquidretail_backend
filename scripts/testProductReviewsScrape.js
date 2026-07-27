@@ -185,6 +185,55 @@ check('embedded scan survives malformed escaping without throwing', () => {
   }
 });
 
+// ── stored review length ───────────────────────────────────────────
+//
+// The old 400-char cap was measured against live vendors: 10 of 50 Ulta
+// reviews and 1 of 50 Living Spaces reviews hit it exactly and were sliced
+// mid-word ("…would buy again but the new one is horrible. Pl"), which reads as
+// corrupted text rather than an excerpt when it lands on an ad.
+
+check('a long review is kept whole, not clipped at 400', () => {
+  const body = 'I ordered this in early spring and have used it almost daily since. ' +
+    'The finish has held up to two cats, a toddler and one spilled glass of red wine. ' +
+    'Assembly took about forty minutes with two people and the instructions were clear. ' +
+    'My only note is that the drawer glides feel lighter than the rest of the piece, ' +
+    'though after five months nothing has loosened or started to squeak at all. ' +
+    'For the price I would absolutely buy it again and I have already recommended ' +
+    'it to two friends who were shopping for something similar this season.';
+  assert.ok(body.length > 400, 'fixture must exceed the old cap');
+  const r = extractOnPageReviews(ld({
+    '@type': 'Product', name: 'X',
+    review: [{ type: 'Review', reviewBody: body, reviewRating: { ratingValue: 5 } }]
+  }));
+  assert.equal(r.quotes[0].text, body, 'nothing should be removed at this length');
+});
+
+check('over-cap text truncates at a WORD boundary with an ellipsis', () => {
+  const { truncateWords } = require('../utils/htmlEntities');
+  const s = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet';
+  const out = truncateWords(s, 30);
+  assert.ok(out.length <= 31, `expected <=31 chars, got ${out.length}`);
+  assert.ok(out.endsWith('…'), 'must mark that text was removed');
+  // The cut must land between words, never inside one.
+  const body = out.slice(0, -1);
+  assert.ok(s.startsWith(body), 'the kept text must be a true prefix of the source');
+  assert.ok(!/\S$/.test(body) || s[body.length] === ' ',
+    `cut inside a word: ${JSON.stringify(body)}`);
+});
+
+check('truncateWords: a single huge token still gets cut (no runaway)', () => {
+  const { truncateWords } = require('../utils/htmlEntities');
+  const out = truncateWords('x'.repeat(500), 100);
+  assert.ok(out.length <= 101);
+  assert.ok(out.endsWith('…'));
+});
+
+check('truncateWords: at or under the limit is returned untouched', () => {
+  const { truncateWords } = require('../utils/htmlEntities');
+  assert.equal(truncateWords('short enough', 50), 'short enough');
+  assert.equal(truncateWords('', 50), '');
+});
+
 // ── platform-agnostic coverage ─────────────────────────────────────
 
 check('detectReviewPlatform: the apps clients actually run', () => {

@@ -20,7 +20,10 @@
 
 'use strict';
 
-const { firstMatch, pick, toInt, toFloat, toDate, text } = require('./helpers');
+const {
+ firstMatch, pick, toInt, toFloat, toDate, text,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
+} = require('./helpers');
 
 const PAGE_SIZE = 50;
 
@@ -72,15 +75,15 @@ function parse(payload, ctx, page) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.review, 400);
+  const body = text(raw && raw.review, REVIEW_TEXT_MAX);
   if (!body) return null;
   const first = raw.reviewer && raw.reviewer.first_name;
   const last = raw.reviewer && raw.reviewer.last_name;
   const author = [first, last].filter(Boolean).join(' ').trim();
   return {
     text: body,
-    title: text(raw.title, 140),
-    author: text(author, 120),
+    title: text(raw.title, REVIEW_TITLE_MAX),
+    author: text(author, REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.rating),
     datePublished: toDate(raw.date_created),
     verified: !!(raw.reviewer && raw.reviewer.verified_buyer)

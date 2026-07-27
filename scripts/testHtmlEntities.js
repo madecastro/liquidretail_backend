@@ -122,10 +122,15 @@ check('cleanScrapedText: objects → null, never "[object Object]"', () => {
   assert.equal(cleanScrapedText(['a']), null);
 });
 
-check('cleanScrapedText: maxLen truncates AFTER decoding', () => {
+check('cleanScrapedText: maxLen truncates AFTER decoding, on a word boundary', () => {
   // "&quot;" is 6 chars encoded, 1 decoded — truncating first would cut
-  // mid-entity and leave "&quo" in the field.
-  assert.equal(cleanScrapedText('33&quot; Wide Table', 8), '33" Wide');
+  // mid-entity and leave "&quo" in the field. The cut also lands between
+  // words and is marked, so a clipped review reads as an excerpt rather than
+  // as corrupted text.
+  const out = cleanScrapedText('33&quot; Wide Table', 8);
+  assert.equal(out, '33" Wide…');
+  // Nothing is removed when it already fits.
+  assert.equal(cleanScrapedText('33&quot; Wide', 20), '33" Wide');
 });
 
 // ── hasHtmlEntity (backfill row selection) ─────────────────────────

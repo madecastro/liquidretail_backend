@@ -21,7 +21,8 @@
 'use strict';
 
 const {
-  firstMatch, pick, toInt, toFloat, toDate, text, shopifyProductId, shopDomain
+  firstMatch, pick, toInt, toFloat, toDate, text, shopifyProductId, shopDomain,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                   // server cap
@@ -84,12 +85,12 @@ function parse(payload) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.reviewMessage, 400);
+  const body = text(raw && raw.reviewMessage, REVIEW_TEXT_MAX);
   if (!body) return null;
   return {
     text: body,
-    title: text(raw.reviewTitle, 140),
-    author: text(raw.author, 120),
+    title: text(raw.reviewTitle, REVIEW_TITLE_MAX),
+    author: text(raw.author, REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.reviewRating),
     datePublished: toDate(raw.dateCreated),
     // reviewVerifiedType is a numeric enum; anything non-zero is a verified

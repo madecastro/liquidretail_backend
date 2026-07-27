@@ -19,7 +19,8 @@
 'use strict';
 
 const {
-  firstMatch, pick, pickAny, toInt, toFloat, toDate, text, distributionFromCounts, shopifyProductId
+  firstMatch, pick, pickAny, toInt, toFloat, toDate, text, distributionFromCounts, shopifyProductId,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 100;                  // real ceiling, not the documented 25
@@ -110,12 +111,12 @@ async function aggregate(ctx) {
 }
 
 function normalize(raw) {
-  const body = text(raw && raw.body, 400);
+  const body = text(raw && raw.body, REVIEW_TEXT_MAX);
   if (!body) return null;
   return {
     text: body,
-    title: text(raw.title, 140),
-    author: text(pickAny(raw, ['reviewer.displayName', 'reviewer.name']), 120),
+    title: text(raw.title, REVIEW_TITLE_MAX),
+    author: text(pickAny(raw, ['reviewer.displayName', 'reviewer.name']), REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.rating),
     datePublished: toDate(raw.dateCreated),
     verified: !!pick(raw, 'reviewer.isVerified')

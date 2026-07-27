@@ -12,6 +12,17 @@
 
 const { cleanScrapedText, decodeHtmlEntities } = require('../../utils/htmlEntities');
 
+// Stored length of one review body. 400 was too tight — measured live, 10 of 50
+// Ulta reviews and 1 of 50 Living Spaces reviews hit it and were cut mid-word.
+// 1200 clears essentially every real review while keeping documents bounded;
+// anything longer is truncated at a word boundary with an ellipsis.
+const REVIEW_TEXT_MAX = Math.max(
+  120,
+  parseInt(process.env.REVIEW_TEXT_MAX_CHARS, 10) || 1200
+);
+const REVIEW_TITLE_MAX = 200;
+const REVIEW_AUTHOR_MAX = 120;
+
 /**
  * firstMatch(html, regexes, groupIndex?) → string | null
  * First capturing-group hit across an ordered regex list. Vendors put the
@@ -193,6 +204,9 @@ function text(v, maxLen) {
 }
 
 module.exports = {
+  REVIEW_TEXT_MAX,
+  REVIEW_TITLE_MAX,
+  REVIEW_AUTHOR_MAX,
   firstMatch,
   pick,
   pickAny,

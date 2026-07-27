@@ -151,8 +151,28 @@ function tidyText(s, maxLen = null) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!out) return null;
-  if (maxLen != null && out.length > maxLen) out = out.slice(0, maxLen).trim();
+  if (maxLen != null && out.length > maxLen) out = truncateWords(out, maxLen);
   return out || null;
+}
+
+/**
+ * truncateWords(s, maxLen) → string
+ * Cut at a WORD boundary and mark it. A hard slice produced stored reviews
+ * ending "…would buy again but the new one is horrible. Pl" — 10 of 50 Ulta
+ * reviews hit the old 400-char cap mid-word — which reads as corrupted text
+ * rather than an excerpt when it lands on an ad.
+ *
+ * The ellipsis is only added when something was actually removed, and the
+ * back-off to the last space is abandoned if it would discard more than a
+ * quarter of the allowance (a single very long token).
+ */
+function truncateWords(s, maxLen) {
+  const str = String(s);
+  if (str.length <= maxLen) return str;
+  const hard = str.slice(0, maxLen);
+  const lastSpace = hard.lastIndexOf(' ');
+  const cut = lastSpace > maxLen * 0.75 ? hard.slice(0, lastSpace) : hard;
+  return cut.replace(/[\s,;:.!?—–-]+$/, '') + '…';
 }
 
 /**
@@ -171,6 +191,7 @@ module.exports = {
   decodeHtmlEntities,
   cleanScrapedText,
   tidyText,
+  truncateWords,
   hasHtmlEntity,
   NAMED
 };

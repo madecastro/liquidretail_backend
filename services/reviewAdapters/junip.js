@@ -29,7 +29,8 @@ const {
   toDate,
   text,
   shopifyProductId,
-  distributionFromCounts
+  distributionFromCounts,
+  REVIEW_TEXT_MAX, REVIEW_TITLE_MAX, REVIEW_AUTHOR_MAX
 } = require('./helpers');
 
 const PAGE_SIZE = 50;                    // hard server ceiling: 51+ → HTTP 400
@@ -141,7 +142,7 @@ function parse(payload, ctx) {
 function normalize(raw, ctx) {
   if (!raw || typeof raw !== 'object') return null;
 
-  const body = text(raw.body, 400);
+  const body = text(raw.body, REVIEW_TEXT_MAX);
   if (!body) return null;
 
   // NOTE: raw.target_title is the PRODUCT name, not a review headline — it
@@ -151,8 +152,8 @@ function normalize(raw, ctx) {
 
   const quote = {
     text: body,
-    title: text(raw.title, 140),
-    author: text(`${first} ${last}`.trim(), 120),
+    title: text(raw.title, REVIEW_TITLE_MAX),
+    author: text(`${first} ${last}`.trim(), REVIEW_AUTHOR_MAX),
     rating: toFloat(raw.rating),
     datePublished: toDate(raw.created_at),
     verified: !!pickAny(raw, ['verified_buyer', 'identity_confirmed'])
