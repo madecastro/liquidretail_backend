@@ -291,6 +291,7 @@ async function expandWizardJob({
   // primary seed). Grouped by metadata.catalogProductId inside
   // expandDeterministicVideo; order is preserved end-to-end.
   seedMediaIds = [],
+  seedPicks = null,
   // Run-level video prompt overrides (stamped on every video Ad).
   // Guidance merges via resolvePromptGuidance → operatorPrompt prepend;
   // raw fully replaces the canonical prompt at render time.
@@ -439,6 +440,7 @@ async function expandWizardJob({
       detResult = await expandDeterministicVideo({
         campaignId, brandId, campaignKind, productIds,
         seedMediaIds,
+        seedPicks,
         ctaText, ctaUrl, ctaUrlParams,
         platformFormat: effectivePlatformFormat,
         videoDurationSec,
@@ -1545,6 +1547,7 @@ function mergeExpansionResults(a, b) {
 async function expandDeterministicVideo({
   campaignId, brandId, campaignKind, productIds,
   seedMediaIds = [],
+  seedPicks = null,
   ctaText, ctaUrl, ctaUrlParams,
   platformFormat,
   videoDurationSec,
@@ -1568,35 +1571,138 @@ async function expandDeterministicVideo({
     )
   );
 
-  // Load picked Media once; group by catalogProductId PRESERVING pick order.
+  // Which product does this seed pick belong to? Returns a productId string
+  // that is present in `productIdSet`, or null when the media has no usable
+  // association with anything in this run.
+  //
+  // Two sources, in priority order:
+  //   1. metadata.catalogProductId — set on catalog mirrors (hero + alts). This
+  //      is authoritative: the Media exists BECAUSE it is that product's image.
+  //   2. matchedProducts[] — written by detect when a post is matched to a SKU.
+  //      This is what makes a lifestyle/social shot usable as a seed.
+  //
+  // A post can legitimately match several products (a flat-lay with three SKUs),
+  // so when more than one candidate falls inside this run we rank rather than
+  // taking the first: a direct 'product_match' beats a looser
+  // 'product_category', then higher confidence wins. Picking arbitrarily would
+  // attach the seed to a different product on different runs for the same
+  // input, which would also change the ad's identity digest.
+  // Does this Media genuinely belong to `productId`? Same evidence
+  // resolveSeedProductId accepts, asked about ONE product instead of ranking a
+  // set. Used to validate explicit seedPicks pairs.
+  function mediaAssociatesWithProduct(doc, productId) {
+    const pid = String(productId);
+    const direct = doc?.metadata?.catalogProductId;
+    if (direct != null && String(direct) === pid) return true;
+    return (Array.isArray(doc?.matchedProducts) ? doc.matchedProducts : []).some(m =>
+      m?.catalogProductId != null &&
+      String(m.catalogProductId) === pid &&
+      m.outcome === 'product_match');
+  }
+
+  function resolveSeedProductId(doc, allowed) {
+    const direct = doc?.metadata?.catalogProductId != null
+      ? String(doc.metadata.catalogProductId)
+      : null;
+    if (direct && allowed.has(direct)) return direct;
+
+    // Only outcome:'product_match' counts. 'product_category' means detect
+    // placed the media in the same CATEGORY as the SKU, which is not evidence
+    // that this image depicts THIS product — seeding a product video from it
+    // would ship ~$1 of creative showing something else. Category-only picks
+    // are dropped (and logged by the caller) rather than quietly promoted.
+    const candidates = (Array.isArray(doc?.matchedProducts) ? doc.matchedProducts : [])
+      .filter(m =>
+        m?.catalogProductId != null &&
+        allowed.has(String(m.catalogProductId)) &&
+        m.outcome === 'product_match')
+      .map(m => ({
+        id:   String(m.catalogProductId),
+        // Missing/NaN confidence sorts LAST rather than tying at 0, so a scored
+        // match always beats an unscored one instead of winning on id order.
+        conf: Number.isFinite(m.confidence) ? m.confidence : -1
+      }));
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => (b.conf - a.conf) || a.id.localeCompare(b.id));
+    return candidates[0].id;
+  }
+
+  // Load picked Media once; group by product PRESERVING pick order.
+  //
+  // Deliberately NOT restricted to source:'catalog-product' any more. That
+  // filter silently discarded every related-media pick — an operator who chose
+  // a lifestyle/social shot as the seed got no video from it and no explanation.
+  // Related media IS product-associated: catalog mirrors carry
+  // metadata.catalogProductId, and posts matched during detect carry
+  // matchedProducts[].catalogProductId. resolveSeedProductId below uses both.
   const productIdSet = new Set(productIds.map(String));
-  const seedOids = (seedMediaIds || []).map(toObjectId).filter(Boolean);
+  // Load the UNION of both sources. Loading only the authoritative one breaks
+  // two things: a client sending only seedPicks would load nothing under the old
+  // code and have every pick dropped as "not found", and the merge below — which
+  // fills products seedPicks never mentioned from the legacy list — needs those
+  // legacy docs present to resolve them.
+  const seedIdSource = [
+    ...(Array.isArray(seedPicks) ? seedPicks.map(p => p?.mediaId) : []),
+    ...(seedMediaIds || [])
+  ].filter(Boolean);
+  const seedOids = [...new Set(seedIdSource.map(String))].map(toObjectId).filter(Boolean);
+  // brandId scoping is explicit now. The dropped source:'catalog-product' filter
+  // was never a security control, but it did incidentally narrow what an
+  // arbitrary seedMediaId could load. Since these ids come straight off the
+  // request body (parsePhase3WizardFields only validates ObjectId shape), scope
+  // the query to this brand rather than relying on the downstream productIdSet
+  // check to be the only thing standing between a foreign id and a load.
+  const seedBrandOid = toObjectId(brandId);
   const seedDocs = seedOids.length
     ? await Media.find({
         _id: { $in: seedOids },
-        source: 'catalog-product'
-      }).select('_id metadata fileType').lean()
+        ...(seedBrandOid ? { brandId: seedBrandOid } : {})
+      })
+        .select('_id metadata fileType source matchedProducts')
+        .lean()
     : [];
   const seedById = new Map(seedDocs.map(d => [String(d._id), d]));
 
+  // EXPLICIT (productId, mediaId) pairs are authoritative when present. They
+  // remove the guesswork entirely: no matchedProducts ranking, so the product a
+  // seed belongs to cannot flip when detect rewrites its scores, and the same
+  // media can legitimately seed TWO products' videos — neither of which a flat
+  // mediaId list can express. `seedMediaIds` remains the fallback for links and
+  // clients minted before seedPicks existed.
   /** @type {Map<string, mongoose.Types.ObjectId[]>} */
   const picksByProduct = new Map();
-  for (const rawId of (seedMediaIds || [])) {
-    const idStr = String(rawId);
+  const explicitPairs = Array.isArray(seedPicks) && seedPicks.length
+    ? seedPicks
+    : null;
+  const walk = explicitPairs
+    ? explicitPairs.map(p => ({ idStr: String(p.mediaId), assigned: String(p.productId) }))
+    : (seedMediaIds || []).map(id => ({ idStr: String(id), assigned: null }));
+
+  for (const { idStr, assigned } of walk) {
     const doc = seedById.get(idStr);
     if (!doc) {
       console.warn(
-        `📦 expandDeterministicVideo: seedMediaId=${idStr} not found or not catalog-product — dropped`
+        `📦 expandDeterministicVideo: seedMediaId=${idStr} not found for this brand — dropped`
       );
       continue;
     }
-    const cpid = doc.metadata?.catalogProductId != null
-      ? String(doc.metadata.catalogProductId)
-      : null;
-    if (!cpid || !productIdSet.has(cpid)) {
+    // An explicit pair DISAMBIGUATES among associations the media genuinely
+    // has; it does not get to invent one. Membership in productIds is not
+    // sufficient: without the association check, a body could assign product
+    // A's catalog hero to product B and B's video would be seeded — and billed
+    // ~$1 — showing the wrong SKU. This also means a productId belonging to
+    // another brand cannot be used, since the media load is brand-scoped and a
+    // foreign product will have no association with an in-brand Media.
+    const cpid = assigned
+      ? (productIdSet.has(assigned) && mediaAssociatesWithProduct(doc, assigned) ? assigned : null)
+      : resolveSeedProductId(doc, productIdSet);
+    if (!cpid) {
       console.warn(
-        `📦 expandDeterministicVideo: seedMediaId=${idStr} catalogProductId=${cpid} ` +
-        `not in productIds — dropped`
+        assigned
+          ? `📦 expandDeterministicVideo: seedPick mediaId=${idStr} names productId=${assigned} ` +
+            `which is not in this run's productIds — dropped`
+          : `📦 expandDeterministicVideo: seedMediaId=${idStr} (source=${doc.source}) has no ` +
+            `product association inside this run's productIds — dropped`
       );
       continue;
     }
@@ -1605,6 +1711,32 @@ async function expandDeterministicVideo({
     // Preserve first occurrence only (re-picks of the same id ignored).
     if (!list.some(x => String(x) === idStr)) {
       list.push(doc._id);
+    }
+  }
+
+  // MERGE, don't silence. seedPicks is authoritative only for the products it
+  // actually mentions. A payload carrying both — a partial pick list plus a
+  // fuller legacy seedMediaIds, or a pick list whose every pair got dropped —
+  // would otherwise send the unmentioned products down the hero path, produce a
+  // different identityDigest than the seed-based ad already queued for them, and
+  // insert a SECOND ad: double video spend for one operator intent.
+  if (explicitPairs && (seedMediaIds || []).length) {
+    for (const rawId of seedMediaIds) {
+      const idStr = String(rawId);
+      const doc = seedById.get(idStr);
+      if (!doc) continue;
+      const cpid = resolveSeedProductId(doc, productIdSet);
+      // Only fill products the explicit list said nothing about.
+      if (!cpid || picksByProduct.has(cpid)) continue;
+      if (!picksByProduct.has(cpid)) picksByProduct.set(cpid, []);
+      const list = picksByProduct.get(cpid);
+      if (!list.some(x => String(x) === idStr)) {
+        list.push(doc._id);
+        console.log(
+          `📦 expandDeterministicVideo: product ${cpid} not covered by seedPicks — ` +
+          `filled from legacy seedMediaIds (${idStr})`
+        );
+      }
     }
   }
 
@@ -1628,6 +1760,47 @@ async function expandDeterministicVideo({
       // ONE ad with the ordered reference stack; position 0 = primary seed.
       referenceMediaIds = picks.slice();
       mediaId = picks[0];
+
+      // PRODUCT ANCHOR. A non-empty referenceMediaIds makes buildReferenceImages
+      // take the ordered-only path, which SKIPS seed+catalog assembly entirely.
+      // That is correct when the picks are catalog imagery, but when every pick
+      // is related/social media it would hand the model a lifestyle frame and
+      // nothing else — worse product fidelity than the old behaviour, where the
+      // pick was silently dropped and the ad fell back to hero+alts. Paying ~$1
+      // for a weaker stack than we had before is not a fix.
+      //
+      // So: an operator picking a lifestyle shot means "make this the PRIMARY
+      // seed", not "discard the product imagery". If none of the picks is a
+      // catalog mirror for this product, append the catalog hero after them —
+      // position 0 stays theirs, and the model still gets a product anchor.
+      const hasCatalogAnchor = picks.some(id => {
+        const doc = seedById.get(String(id));
+        const direct = doc?.metadata?.catalogProductId;
+        return direct != null && String(direct) === pidStr;
+      });
+      if (!hasCatalogAnchor) {
+        const anchor = await Media.findOne({
+          source: 'catalog-product',
+          'metadata.catalogProductId': productOid,
+          'metadata.imageRole': 'hero'
+        }).select('_id').lean()
+          || await Media.findOne({
+            source: 'catalog-product',
+            'metadata.catalogProductId': productOid
+          }).sort({ createdAt: 1 }).select('_id').lean();
+        if (anchor?._id && !referenceMediaIds.some(x => String(x) === String(anchor._id))) {
+          referenceMediaIds.push(anchor._id);
+          console.log(
+            `📦 expandDeterministicVideo[${pidStr}]: picks are all non-catalog — appended ` +
+            `catalog anchor ${anchor._id} after ${picks.length} operator pick(s)`
+          );
+        } else if (!anchor?._id) {
+          console.warn(
+            `📦 expandDeterministicVideo[${pidStr}]: picks are all non-catalog and no catalog ` +
+            `Media exists to anchor them — shipping seed-only stack`
+          );
+        }
+      }
     } else {
       // Feed-order hero: imageRole hero → earliest createdAt → lazy materialize.
       let hero = await Media.findOne({
