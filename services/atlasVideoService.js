@@ -1930,6 +1930,30 @@ async function pollPrediction(predictionId, { shouldCancel = null } = {}) {
 // paramShape still applies model-specific bounds (enum snap, ends≤10,
 // maxDuration) as a defensive floor, but callers should not rely on
 // that path for operator-facing validation.
+// Which of the assembled reference images this model shape ACTUALLY receives.
+//
+// Single source of truth for two consumers that must never disagree: the request
+// body below, and the audit record persisted as Ad.veoReferenceImages and shown
+// in the generation inspector. Previously the inspector was handed the full
+// assembled stack while several shapes submit less than that — so on a
+// 1-reference model (grok-imagine i2v, veo3.1) the inspector displayed three
+// images when exactly one was sent, with nothing indicating the difference. An
+// audit surface that overstates what a paid call received is worse than no audit
+// surface, because it is trusted.
+//
+// Keep this switch EXHAUSTIVE against buildSubmissionBody's cases.
+function submittedImageUrls(imageUrls, caps) {
+  const urls = Array.isArray(imageUrls) ? imageUrls : [];
+  switch (caps?.paramShape) {
+    case 'gemini-omni':     return urls;                                        // images: full stack
+    case 'gemini-omni-r2v': return urls.slice(0, caps.maxReferenceImages || 5);  // images: clamped
+    case 'grok':            return urls;                                        // image_urls: full stack
+    case 'grok-i2v':                                                            // image_url: single frame
+    case 'veo':                                                                 // image_url: single frame
+    default:                return urls.slice(0, 1);                            // generic: single frame
+  }
+}
+
 function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null }) {
   switch (caps.paramShape) {
     case 'gemini-omni':
@@ -1938,7 +1962,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        images: imageUrls,
+        images: submittedImageUrls(imageUrls, caps),
         duration: durationSec || caps.defaultDuration || 8,
         aspect_ratio: aspectRatio,
         resolution: process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p'
@@ -1954,7 +1978,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
         model,
         prompt,
         video_clips: [{ url: videoClipUrl, start: 0, ends: Math.min(10, duration) }],
-        images: imageUrls.slice(0, caps.maxReferenceImages || 5),
+        images: submittedImageUrls(imageUrls, caps),
         duration,
         aspect_ratio: aspectRatio,
         resolution: process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p'
@@ -1964,7 +1988,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        image_urls: imageUrls,
+        image_urls: submittedImageUrls(imageUrls, caps),
         duration: Math.min(caps.maxDuration, durationSec || 8),
         resolution: '720p',
         aspect_ratio: aspectRatio
@@ -1977,7 +2001,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        image_url: imageUrls[0],
+        image_url: submittedImageUrls(imageUrls, caps)[0],
         duration: durationSec || caps.defaultDuration || 8,
         resolution: caps.defaultResolution || '720p',
         aspect_ratio: aspectRatio
@@ -1986,14 +2010,14 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        image_url: imageUrls[0],
+        image_url: submittedImageUrls(imageUrls, caps)[0],
         aspect_ratio: aspectRatio
       };
     default:
       return {
         model,
         prompt,
-        image_url: imageUrls[0]
+        image_url: submittedImageUrls(imageUrls, caps)[0]
       };
   }
 }
@@ -2001,8 +2025,16 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
 async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null }) {
   const body = buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
 
+  // refs= reports what the model RECEIVES, and names the assembled count too
+  // when the shape takes fewer. Reading "refs=3" for a 1-reference model was
+  // misleading in exactly the place you would check it — and it hid the fact
+  // that two of those reframes had been paid for and then discarded.
+  const sentRefs = submittedImageUrls(imageUrls, caps);
+  const refsLabel = sentRefs.length === imageUrls.length
+    ? `refs=${sentRefs.length}`
+    : `refs=${sentRefs.length} (of ${imageUrls.length} assembled — ${caps.paramShape} accepts fewer)`;
   console.log(
-    `🎬 atlasVideo.submit: model=${model} aspect=${aspectRatio} refs=${imageUrls.length} ` +
+    `🎬 atlasVideo.submit: model=${model} aspect=${aspectRatio} ${refsLabel} ` +
     `paramShape=${caps.paramShape} promptChars=${prompt.length} promptBytes=${Buffer.byteLength(prompt, 'utf8')} promptProfile=${promptProfileFor(caps)}`
   );
 
@@ -2396,7 +2428,13 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     track:              media.fileType === 'video' ? 1 : 2,
     prompt,
     storyboard,
-    referenceImages:    imageUrls,   // the exact stack sent to the model (pos 0 = seed, then product hero + alts) — for the generation inspector
+    // The images the model ACTUALLY received, per its param shape — not the
+    // full assembled stack. Several shapes submit fewer (r2v clamps to
+    // maxReferenceImages; grok-i2v/veo/generic take a single frame), so
+    // reporting imageUrls here overstated what a paid call was given. Position 0
+    // is the seed, then product hero + alts. Feeds Ad.veoReferenceImages and the
+    // generation inspector.
+    referenceImages:    submittedImageUrls(imageUrls, caps),
     elapsedMs,
     model,
     modelFallback:      fallback,
