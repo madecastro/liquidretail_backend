@@ -361,6 +361,10 @@ async function syncBrandShopify(brand, run = null) {
     // (rating, sellers, specs) via Gemini + SerpAPI. Idempotent: the
     // enrichment service skips products already fresh in its 30-day
     // cache, so re-syncs are effectively free.
+    // Enrichment leads with the free on-site review scrape
+    // (productReviewsScrapeService) before any paid lookup — the Apify
+    // actor returns no review data at all, so that scrape is where this
+    // path's first-party reviews and ratings come from.
     setImmediate(() => {
       require('./catalogProductEnrichmentService')
         .enqueueBrandProductEnrichment(brand._id)

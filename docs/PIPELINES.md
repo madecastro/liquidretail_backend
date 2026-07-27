@@ -86,7 +86,7 @@ Historically three jobs fired at the end of a catalog sync (`services/genericCat
 | # | Job | Behavior now |
 |---|---|---|
 | **(a)** | Product-detect enqueue | **DEFERRED** — variant roles stamped; image detect skipped unless precompute. [§3](#3-per-product-detect--overlay-zones--ad-readiness-deferred-to-ad-time) |
-| **(b)** | Catalog enrichment | **Gap-fill only** (reviews) on auto path. [§4](#4-catalog-enrichment-reviews--cross-seller-details) |
+| **(b)** | Catalog enrichment | **Free on-site review scrape (all paths)**, then paid gap-fill for what's left. [§4](#4-catalog-enrichment-reviews--cross-seller-details) |
 | **(c)** | Category inference | **Mostly skipped** — breadcrumbs captured in-scan; backfills only gaps |
 
 ### (c) Category inference (gap backfill)
@@ -160,14 +160,36 @@ Worker pool concurrency: `WORKER_CONCURRENCY` (`worker.js`, default 4, prod **5*
 
 **File:** `services/catalogProductEnrichmentService.js`.
 
-Two paths, split for cost control:
+Phase 0 (free, both paths) then two paths split for cost control:
+
+### Phase 0 — on-site reviews + ratings (ALL FOUR INGEST PATHS)
+
+**File:** `services/productReviewsScrapeService.js` — the single review engine.
+
+Runs at the top of `runEnrichment`, so every catalog source gets identical review coverage: all four converge here when their sync completes.
+
+| Ingest path | Entry | On-site reviews |
+|---|---|---|
+| Shopify auth (Meta/IG catalog) | `catalogSyncService.syncCatalog` | phase 0 only (path never crawls PDPs) |
+| Shopify direct | `shopifyPublicIngestService.syncBrandShopifyDirect` | inline “reviews & ratings” stage + phase 0 gap-fill |
+| Apify actor | `apifyIngestService.syncBrandShopify` | phase 0 only (actor returns no review data) |
+| Generic sitemap | `genericCatalogResolver` → `genericCatalogIngestService` | in-scan (same HTML) + phase 0 gap-fill |
+
+- **Source:** the schema.org review data the store’s review app publishes for Google rich snippets — `Product.aggregateRating` + `review[]`, standalone `Review` nodes, or `itemprop` microdata for the aggregate. **Review-app agnostic**: Bazaarvoice, Judge.me, Yotpo, Okendo, Loox, Stamped, PowerReviews, TurnTo, Reviews.io, Junip, Fera, legacy Shopify Product Reviews. No vendor API keys, no per-app adapters.
+- **Captured:** `rating` (rescaled to 0–5 from 5/10/100-point scales), `reviewCount`, and per review: `text`, `title` (reviewer’s headline), `author`, **`rating` (stars)**, `datePublished`, `source` (platform label).
+- **Stored:** `CatalogProduct.productReviews` = `{ quotes[], rating, reviewCount, summary, platform, source, quotesFound, fetchedAt }` + top-level `rating`. A `summary` written earlier by the Gemini path is **preserved** across re-scrapes.
+- **Ranking:** quotes are ordered positive-first (star verdict → substance → recency) **before** the `PRODUCT_REVIEWS_MAX_QUOTES` cap, so the stored sample is the best of the page, not the first N in document order.
+- **Cost:** free — no LLM, no SerpAPI. One `GET` per product page, robots-aware, per-host throttled by `httpScrapeClient`, TTL-gated at `PRODUCT_REVIEWS_TTL_DAYS` (30). A snapshot with no rating **and** no quotes counts as stale so pages are retried later (stores turn rich snippets on).
+- **`type` vs `@type`:** nested review nodes in the wild often use a bare `type` key (Bazaarvoice-rendered PDPs do). Every type read goes through `nodeTypes()`, which accepts both — gating on `@type` alone captures **zero** quotes on those pages.
+- **Known limit:** a store whose review widget renders **client-side only** publishes no structured data; the engine logs `<platform> widget detected, no structured reviews on page` and the paid gap-fill (below) takes over. Recovering those needs a headless render or a per-vendor API adapter — neither is implemented.
+- **Manual re-scrape:** `POST /api/sales-demos/brands/:id/sync-reviews` (`?force=1` ignores the TTL). Free, so it isn’t behind the Enrich lock.
 
 ### A. AUTO — reviews-only gap-fill (after sync)
 
-- **Entry:** `enqueueBrandProductEnrichment(brandId)` (post-sync `setImmediate`).
-- **Gate:** `needsEnrichment(row)` = true only when **no** on-page review signal: no review quotes **and** `rating == null`.
+- **Entry:** `enqueueBrandProductEnrichment(brandId)` (post-sync `setImmediate`) → phase 0, then the gap-fill.
+- **Gate:** `needsEnrichment(row)` = true only when **no** review signal remains **after phase 0**: no review quotes **and** `rating == null`. Rows are loaded after the scrape so the gate sees fresh state — anything scraped is never billed.
 - **Does not** run SerpAPI product-details.
-- **OperationRun:** kind `enrichment`, label **`Review gap-fill`**, per-item progress + cancel.
+- **OperationRun:** kind `enrichment`, label **`Review gap-fill`**, per-item progress + cancel. Phase 0 opens its own `enrichment` run labelled **`Reviews · <brand>`**.
 
 ### B. USER-ACTUATED — full cross-seller + reviews (Enrich button)
 
@@ -192,6 +214,10 @@ Two paths, split for cost control:
 |---|---|---|
 | `CATALOG_ENRICHMENT_CONCURRENCY` | `6` | Parallel enrich workers |
 | `CATALOG_ENRICHMENT_MAX_PER_RUN` | `500` | Hard cap per brand run |
+| `PRODUCT_REVIEWS_MAX_QUOTES` | `10` | Quotes stored per product (phase 0) |
+| `PRODUCT_REVIEWS_TTL_DAYS` | `30` | Re-scrape cadence for on-site reviews |
+| `PRODUCT_REVIEWS_CONCURRENCY` | `4` | Parallel PDP fetches in the review sweep |
+| `PRODUCT_REVIEWS_MAX_PER_RUN` | `2000` | Products per review sweep |
 
 Requires secrets: `SERPAPI_API_KEY`, `GEMINI_API_KEY` (details path no-ops if SerpAPI disabled).
 
@@ -204,6 +230,15 @@ Both paths: kind `enrichment`, cancellable; partials kept. Idempotent via 30-day
 - Catalog UI (sellers table, specs, review summary, rating distribution).
 - Ad copy / social-proof templates that pull review quotes and ratings.
 - Matching still works without enrichment; enrichment improves merchandising + social-proof creatives.
+
+### Surfacing a POSITIVE review on an ad
+
+`services/layoutInputService.js` `pickStrongestQuote` runs over the 6-tier quote pool (product → category → brand → social comment → LLM → synth):
+
+- When **any** candidate in a tier carries a scraped star rating, candidates the reviewer scored below **`MIN_STARS_FOR_AD` (4)** are dropped, and a small bonus breaks ties in favour of 5-star over 4-star. Tiers with no ratings (comments, LLM-authored) are unaffected and fall through to the lexical scorer as before.
+- The lexical `scoreQuote` sentiment gate still applies on top; stars decide *eligibility*, prose decides *which* eligible quote wins.
+- `normalizeQuote` carries `rating` + `title` through onto the artifact, so the renderer can draw stars next to the quote and use the reviewer’s own headline.
+- Star ratings do **not** exist on Gemini web-wide quotes; those still rely on the lexical gate alone.
 
 ---
 

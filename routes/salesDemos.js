@@ -13,6 +13,7 @@ const Media                = require('../models/Media');
 const OperationRun         = require('../models/OperationRun');
 const AdvertiserMembership = require('../models/AdvertiserMembership');
 const { enrichBrandDetails } = require('../services/catalogProductEnrichmentService');
+const { syncBrandProductReviews } = require('../services/productReviewsScrapeService');
 const {
   ensureSalesDemosAdvertiser,
   createDemoBrand,
@@ -347,6 +348,37 @@ router.post('/brands/:id/enrich', async (req, res) => {
     res.status(202).json({ ok: true, brandId: String(brand._id), status: 'started' });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || 'enrich failed' });
+  }
+});
+
+// POST /api/sales-demos/brands/:id/sync-reviews — re-scrape product
+// reviews + ratings from the brand's own product pages. FREE (no LLM, no
+// SerpAPI): reads the schema.org review data the store's review app
+// publishes for rich snippets, whichever app that is. Use it to add
+// reviews to a brand that was already synced, or to refresh a stale
+// snapshot. TTL-gated (30d) unless ?force=1. Fire-and-forget (202);
+// progress is a cancellable OperationRun (kind 'enrichment').
+router.post('/brands/:id/sync-reviews', async (req, res) => {
+  try {
+    const brand = await Brand.findOne({
+      _id: req.params.id,
+      advertiserId: req.salesDemosAdvertiserId,
+      isDemo: true
+    }).select('_id advertiserId').lean();
+    if (!brand) return res.status(404).json({ error: 'demo brand not found' });
+
+    const force = req.query.force === '1' || req.query.force === 'true';
+
+    // Not gated on enrichInFlight — this path spends nothing, so it can
+    // run alongside a paid enrichment without a cost-control lock.
+    syncBrandProductReviews(String(brand._id), {
+      force,
+      advertiserId: brand.advertiserId || req.salesDemosAdvertiserId
+    }).catch(err => console.error(`⚠️  product-reviews sync failed for brand=${brand._id}: ${err.message}`));
+
+    res.status(202).json({ ok: true, brandId: String(brand._id), status: 'started', force });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'reviews sync failed' });
   }
 });
 

@@ -34,6 +34,9 @@ const ingestHelpers = require('./shopifyPublicIngestService');
 // JSON-LD string values hand us `74&quot; Wide TV Stand` verbatim — every
 // human-readable field below goes through cleanScrapedText.
 const { cleanScrapedText } = require('../utils/htmlEntities');
+// Shared on-page review/rating engine — same extractor every ingest path
+// uses, so review coverage doesn't depend on which sync method ran.
+const reviewsEngine = require('./productReviewsScrapeService');
 // Reuse the pure (axios-free) breadcrumb parser so we can capture the
 // PDP's BreadcrumbList from the SAME HTML the scan already fetched —
 // avoids a second full per-product crawl by the post-sync inference pass.
@@ -557,52 +560,15 @@ function imagesFromNode(node, pageUrl) {
   };
 }
 
+// Reviews come from the shared engine (services/productReviewsScrapeService)
+// so this path, the Shopify path and the Meta-catalog path all capture the
+// same fields: per-review STARS + headline + date, positive-ranked, scale-
+// normalized aggregate. Previously this kept { text, author } for the first
+// ten reviews in document order and dropped reviewRating entirely.
 function reviewsFromNode(node) {
-  let rating = null;
-  let reviewCount = null;
-  const quotes = [];
-
-  const ar = node.aggregateRating;
-  if (ar && typeof ar === 'object') {
-    const rv = Number(ar.ratingValue);
-    if (Number.isFinite(rv)) rating = Math.max(0, Math.min(5, rv));
-    const rc = Number(ar.reviewCount ?? ar.ratingCount);
-    if (Number.isFinite(rc)) reviewCount = rc;
-  }
-
-  const rev = node.review;
-  const revArr = Array.isArray(rev) ? rev : rev ? [rev] : [];
-  for (const r of revArr) {
-    if (!r || typeof r !== 'object') continue;
-    const text = cleanScrapedText(r.reviewBody, 400);
-    if (!text) continue;
-    let author = null;
-    if (r.author != null) {
-      if (typeof r.author === 'string') author = r.author;
-      else if (typeof r.author === 'object') author = r.author.name || null;
-    }
-    quotes.push({
-      text,
-      author: cleanScrapedText(author, 120),
-      source: 'store'
-    });
-    if (quotes.length >= 10) break;
-  }
-
-  if (rating == null && !quotes.length && reviewCount == null) {
-    return { rating: null, productReviews: null };
-  }
-
-  return {
-    rating,
-    productReviews: {
-      quotes,
-      rating,
-      reviewCount,
-      summary: null,
-      fetchedAt: new Date()
-    }
-  };
+  const extracted = reviewsEngine.reviewsFromProductNode(node, { source: 'store' });
+  const productReviews = reviewsEngine.buildProductReviews(extracted);
+  return { rating: extracted.rating, productReviews };
 }
 
 // The offer-level sku, if present (some sites carry the feed id there).
@@ -1133,22 +1099,18 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       }
     } catch { /* best-effort — inference pass will backfill on a miss */ }
 
-    // Optional: enrich reviews via the shared HTML helper (also flattens
-    // JSON-LD aggregateRating) when mapper left rating empty.
+    // Whole-page review sweep when the Product node alone came up short:
+    // catches standalone Review nodes, a Product node the mapper skipped,
+    // and itemprop-only aggregates. Also labels the review platform
+    // (bazaarvoice / judge.me / yotpo / …) for provenance.
     if (mapped.rating == null || !mapped.productReviews) {
       try {
-        const rev = ingestHelpers.extractReviewsFromHtml(html, null);
+        const rev = reviewsEngine.extractOnPageReviews(html);
         if (rev.rating != null && mapped.rating == null) mapped.rating = rev.rating;
-        if ((rev.quotes && rev.quotes.length) || rev.rating != null) {
-          if (!mapped.productReviews) {
-            mapped.productReviews = {
-              quotes: rev.quotes || [],
-              rating: rev.rating,
-              reviewCount: rev.reviewCount,
-              summary: null,
-              fetchedAt: new Date()
-            };
-          }
+        if (!mapped.productReviews) {
+          mapped.productReviews = reviewsEngine.buildProductReviews(rev);
+        } else if (rev.platform && !mapped.productReviews.platform) {
+          mapped.productReviews.platform = rev.platform;
         }
       } catch { /* best-effort */ }
     }

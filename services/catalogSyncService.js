@@ -308,6 +308,10 @@ async function syncCatalogForCred(cred, run = null) {
   // a fully-cached brand is a no-op. Fire-and-forget — the sync HTTP
   // response shouldn't block on review/SerpAPI calls (cold-cache enrich
   // of 100 products at concurrency=3 takes ~5–8 minutes).
+  // enqueueBrandProductEnrichment leads with the free on-site review
+  // scrape (productReviewsScrapeService) and only then pays for the
+  // web-wide gap-fill — the Meta/Shopify-auth path has no PDP crawl of
+  // its own, so that scrape is where its first-party reviews come from.
   setImmediate(() => {
     require('./catalogProductEnrichmentService')
       .enqueueBrandProductEnrichment(brandId)

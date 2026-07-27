@@ -1304,13 +1304,35 @@ function scoreQuote(text) {
 // promote neutral-lived-experience quotes with no endorsement value.
 const SCORE_FLOOR = 1;
 
+// Minimum star rating for a scraped review to be eligible for an ad.
+// 4+ on a 5-point scale — the reviewer's own verdict. Only applied to
+// quotes that actually carry a rating.
+const MIN_STARS_FOR_AD = 4;
+
 function pickStrongestQuote(candidates) {
   if (!Array.isArray(candidates) || candidates.length === 0) return null;
+
+  // STAR VERDICT BEATS TEXT SENTIMENT. Scraped reviews now carry the
+  // reviewer's own rating (productReviewsScrapeService), which is a far
+  // better positivity signal than lexical scoring — a calmly-worded
+  // 2-star ("the fabric is nice but the frame cracked") can clear a
+  // lexical gate, while a 5-star one-liner gets penalized for brevity.
+  // When ANY candidate in this tier is star-rated, drop the ones the
+  // reviewer themself scored below MIN_STARS_FOR_AD and let the text
+  // scorer choose among what's left. Tiers with no ratings at all
+  // (comments, LLM-authored) are unaffected.
+  const rated = candidates.filter(q => q && Number.isFinite(q.rating));
+  const pool = rated.length
+    ? candidates.filter(q => !Number.isFinite(q?.rating) || q.rating >= MIN_STARS_FOR_AD)
+    : candidates;
+
   let best = null;
   let bestScore = -Infinity;
-  for (const q of candidates) {
+  for (const q of pool) {
     if (!q?.text) continue;
-    const score = scoreQuote(q.text);
+    // Small nudge so a 5-star beats a 4-star when the prose scores level.
+    const starBonus = Number.isFinite(q.rating) ? (q.rating - MIN_STARS_FOR_AD) : 0;
+    const score = scoreQuote(q.text) + starBonus;
     if (score > bestScore) {
       bestScore = score;
       best = q;
@@ -1338,11 +1360,16 @@ function pickStrongestQuote(candidates) {
 // layout-input artifact expects: { text, author_name, source }.
 function normalizeQuote(q) {
   if (!q?.text) return null;
+  const rating = Number(q.rating);
   return {
     text:        String(q.text).trim(),
     author_name: q.author_name || q.author || q.source || 'Verified buyer',
     source:      q.source || undefined,
-    verified:    q.verified !== undefined ? q.verified : true
+    verified:    q.verified !== undefined ? q.verified : true,
+    // Carried through from the scrape so pickStrongestQuote can gate on
+    // the reviewer's own star rating. undefined for tiers that have none.
+    rating:      Number.isFinite(rating) ? rating : undefined,
+    title:       q.title || undefined
   };
 }
 
