@@ -15,10 +15,13 @@
 //   platform   'judge.me' | 'yotpo' | …  matches detectReviewPlatform()
 //   pageSize   number — reviews requested per page
 //
-//   discover(html, pageUrl) → ctx | null
+//   discover(html, pageUrl) → ctx | null            (may be async)
 //       Pull the public identifiers (app key / store id / product id) out
 //       of the PDP HTML. null = this adapter cannot serve this page, which
-//       is the normal answer for 12 of the 13 adapters on any given page.
+//       is the normal answer for 8 of the 9 adapters on any given page.
+//       Async is allowed because some vendors bury the key behind their
+//       loader JS — Bazaarvoice's display passkey takes three hops
+//       (PDP → deployments/<client>/bv.js → legacyScoutUrl bvapi.js).
 //
 //   request(ctx, page) → { url, as: 'json' | 'text', headers? }
 //       page is ZERO-BASED here; adapters convert to whatever the vendor
@@ -28,10 +31,20 @@
 //       reviews: rawReview[],      // vendor-shaped, passed to normalize()
 //       total?: number,            // total review count for the product
 //       average?: number,          // aggregate rating
-//       distribution?: {stars:count},
+//       distribution?: [{stars,count}],
 //       hasMore?: boolean,         // omit → driver infers from page fill
-//       cursor?: any               // stashed on ctx for the next request()
+//       cursor?: any,              // stashed on ctx for the next request()
+//       error?: string             // vendor said no (see BV below) → stop
 //   }
+//       `error` exists because vendors report failure INSIDE a 200 body:
+//       Bazaarvoice answers an over-cap Limit with HTTP 200 and
+//       {"Errors":[{"Code":"ERROR_PARAM_INVALID_LIMIT"}],"Results":[]}.
+//       Status-code checks alone would read that as an empty last page.
+//
+//   aggregate(ctx) → { total?, average?, distribution? } | null   (optional,
+//       async) — for vendors whose review list carries no aggregate and
+//       needs a second call (Junip, Okendo, Fera). Called once, after the
+//       first page succeeds, and only when the list didn't supply one.
 //
 //   normalize(raw, ctx) → { text, title, author, rating, datePublished, verified }
 //       Vendor row → engine quote shape. Return null to skip a row.
@@ -92,88 +105,34 @@ const MAX_BYTES = 4_000_000;
 // should be one env var away from off.
 const ENABLED = process.env.REVIEW_ADAPTERS_ENABLED !== 'false';
 
-// ── shared helpers for adapter modules ─────────────────────────────
-
-/**
- * firstMatch(html, regexes, groupIndex?) → string | null
- * First capturing-group hit across an ordered regex list. Adapters use
- * this for identifier discovery, where sites put the same key in several
- * shapes (inline JSON, data-attribute, script src query).
- */
-function firstMatch(html, regexes, groupIndex = 1) {
-  if (!html) return null;
-  for (const re of regexes) {
-    // Fresh regex per use: adapter modules define these at module scope and
-    // a /g one would carry lastIndex between products.
-    const rx = re.global ? new RegExp(re.source, re.flags.replace('g', '')) : re;
-    const m = html.match(rx);
-    if (m && m[groupIndex] != null && String(m[groupIndex]).trim()) {
-      return String(m[groupIndex]).trim();
-    }
-  }
-  return null;
-}
-
-/**
- * pick(obj, path) → value | undefined
- * Dot/bracket path reader ('response.reviews.0.content'). Adapters keep
- * their field mapping declarative and readable.
- */
-function pick(obj, path) {
-  if (obj == null || !path) return undefined;
-  let cur = obj;
-  for (const seg of String(path).split('.')) {
-    if (cur == null) return undefined;
-    cur = cur[seg];
-  }
-  return cur;
-}
-
-/** First defined value among several paths. */
-function pickAny(obj, paths) {
-  for (const p of paths) {
-    const v = pick(obj, p);
-    if (v != null && v !== '') return v;
-  }
-  return undefined;
-}
-
-// First number in the string, not "every digit concatenated" — vendors send
-// "4.6 out of 5" and "1,234 reviews", where stripping non-digits would yield
-// 4.65 and (correctly) 1234. Thousands separators are dropped first so the
-// grouped form still parses.
-function firstNumber(v) {
-  if (v == null) return null;
-  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-  const s = String(v).replace(/(\d),(\d{3})\b/g, '$1$2');
-  const m = s.match(/-?\d+(?:\.\d+)?/);
-  if (!m) return null;
-  const n = Number(m[0]);
-  return Number.isFinite(n) ? n : null;
-}
-
-function toInt(v) {
-  const n = firstNumber(v);
-  return n == null ? null : Math.round(n);
-}
-
-function toFloat(v) {
-  return firstNumber(v);
-}
+// ── shared helpers ─────────────────────────────────────────────────
+//
+// In ./helpers so adapter modules can require them without a cycle back
+// through this file (see the note at the top of helpers.js). Re-exported
+// below for tests and for callers that already import from here.
+const helpers = require('./helpers');
+const { firstMatch, pick, pickAny, toInt, toFloat, reviewKey } = helpers;
 
 // ── registry ───────────────────────────────────────────────────────
 //
 // Order matters only for logging; lookup is by platform slug. Each module
 // self-reports the slug so the registry can't drift from the detector.
+// No loox adapter: loox.io/robots.txt disallows /widget and /widgets (see
+// header). No shopify-legacy adapter: Shopify's own Product Reviews app was
+// removed 2023-09-05 and its backend shut down 2024-05-06 —
+// productreviews.shopifyapps.com no longer answers TLS at all, and it was
+// never a paginated JSON API in the first place (Liquid-rendered metafield
+// HTML plus Shopify's generic ?page= param).
 const ADAPTER_MODULES = [
+  './bazaarvoice',
   './judgeme',
   './yotpo',
   './okendo',
   './stamped',
-  './bazaarvoice',
-  './powerreviews',
   './reviewsio',
-  './shopifyLegacy'
+  './powerreviews',
+  './junip',
+  './fera'
 ];
 
 const ADAPTERS = [];
@@ -206,14 +165,6 @@ function adaptersFor(platform) {
 
 // ── pagination driver ──────────────────────────────────────────────
 
-function reviewKey(q) {
-  return String(q && q.text ? q.text : '')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 160);
-}
-
 /**
  * collectFromAdapter(adapter, { html, pageUrl, … }) → result | null
  *
@@ -236,7 +187,7 @@ async function collectFromAdapter(adapter, {
 } = {}) {
   let ctx;
   try {
-    ctx = adapter.discover(html, pageUrl);
+    ctx = await adapter.discover(html, pageUrl);
   } catch (err) {
     return null;
   }
@@ -313,6 +264,12 @@ async function collectFromAdapter(adapter, {
       break;
     }
     if (!parsed) { out.stopReason = 'unparseable page'; break; }
+    if (parsed.error) {
+      // Vendor rejected the request inside a 200 body (over-cap page size,
+      // bad filter). Keep what earlier pages gave us and stop.
+      out.stopReason = `vendor error: ${parsed.error}`;
+      break;
+    }
 
     out.pagesFetched = page + 1;
     if (parsed.total != null && out.total == null) out.total = toInt(parsed.total);
@@ -330,7 +287,7 @@ async function collectFromAdapter(adapter, {
         q = null;
       }
       if (!q || !q.text) continue;
-      const key = reviewKey(q);
+      const key = reviewKey(q.text);
       if (!key || seen.has(key)) continue;
       seen.add(key);
       out.reviews.push(q);
@@ -358,6 +315,19 @@ async function collectFromAdapter(adapter, {
     }
   }
 
+  // Second call for vendors that keep the aggregate on a different endpoint.
+  if (out.pagesFetched > 0 && typeof adapter.aggregate === 'function' &&
+      (out.total == null || out.average == null)) {
+    try {
+      const agg = await adapter.aggregate(ctx);
+      if (agg) {
+        if (out.total == null && agg.total != null) out.total = toInt(agg.total);
+        if (out.average == null && agg.average != null) out.average = toFloat(agg.average);
+        if (!out.distribution && agg.distribution) out.distribution = agg.distribution;
+      }
+    } catch { /* best-effort — the review rows are what matter */ }
+  }
+
   if (!out.reviews.length && out.total == null && out.average == null) return null;
   return out;
 }
@@ -382,20 +352,13 @@ async function fetchViaAdapters(html, pageUrl, {
   return null;
 }
 
-module.exports = {
+module.exports = Object.assign({
   fetchViaAdapters,
   collectFromAdapter,
   adaptersFor,
   ADAPTERS,
   BY_PLATFORM,
-  // shared helpers for adapter modules + their tests
-  firstMatch,
-  pick,
-  pickAny,
-  toInt,
-  toFloat,
-  reviewKey,
   MAX_PAGES,
   MAX_REVIEWS,
   ENABLED
-};
+}, helpers);

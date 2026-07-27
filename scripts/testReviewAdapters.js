@@ -368,6 +368,397 @@ checkAsync('unreachable robots.txt (throw) is treated as "nothing stated" → pr
   assert.equal(r.reviews.length, 5);
 });
 
+// ── per-vendor adapters, against real payload shapes ───────────────
+//
+// Fixtures mirror the exact structures a research pass captured live from
+// each vendor on 2026-07-27 (field names, nesting, indexing, clamps). They
+// are deliberately shaped like the real thing rather than minimal — the
+// traps these adapters exist to handle only show up in the real shapes.
+
+const byPlatform = (slug) => adapters.BY_PLATFORM.get(slug);
+
+check('every registered adapter declares a slug the detector also knows', () => {
+  const { NAMED } = require('../utils/htmlEntities');   // sanity: helpers load
+  assert.ok(NAMED);
+  const eng = require('../services/productReviewsScrapeService');
+  for (const a of adapters.ADAPTERS) {
+    // detectReviewPlatform must be able to produce this slug, otherwise the
+    // "detected platform first" ordering silently never fires for it.
+    const probe = {
+      'bazaarvoice': '<div data-bv-show="reviews"></div>',
+      'judge.me': '<div class="jdgm-widget"></div>',
+      'yotpo': '<script src="//cdn.yotpo.com/w.js">',
+      'okendo': '<div data-oke-widget></div>',
+      'stamped': '<script src="https://cdn1.stamped.io/files/widget.min.js">',
+      'reviews.io': '<div class="ruk_rating_snippet"></div>',
+      'powerreviews': '<div class="pr-snippet"></div>',
+      'junip': '<span class="junip-store-key"></span>',
+      'fera': '<script src="https://cdn.fera.ai/js/v3/fera.js">'
+    }[a.platform];
+    assert.ok(probe, `no detector probe for ${a.platform}`);
+    assert.equal(eng.detectReviewPlatform(probe), a.platform, `detector missed ${a.platform}`);
+  }
+});
+
+// ── Yotpo ──────────────────────────────────────────────────────────
+
+check('yotpo: discovery takes the REVIEWS key, never the loyalty key', () => {
+  const a = byPlatform('yotpo');
+  const html = `
+    <script src="https://cdn-loyalty.yotpo.com/loader/dVWhcBSvyqNFQpeF1QrmIg.js?shop=x"></script>
+    <script src="https://cdn-widgetsrepository.yotpo.com/v1/loader/3rDpN9Pt4bd0nDlU4w5UAHDVg66o2ao2LlD94EWF?languageCode=en"></script>
+    <div class="yotpo-widget-instance" data-yotpo-product-id="538465337388"></div>`;
+  const ctx = a.discover(html, 'https://s.com/p/1');
+  assert.equal(ctx.appKey, '3rDpN9Pt4bd0nDlU4w5UAHDVg66o2ao2LlD94EWF');
+  assert.notEqual(ctx.appKey, 'dVWhcBSvyqNFQpeF1QrmIg');
+  assert.equal(ctx.productId, '538465337388');
+  assert.match(a.request(ctx, 0).url, /\/v1\/widget\/3rDpN9[^/]*\/products\/538465337388\/reviews\.json/);
+  assert.match(a.request(ctx, 0).url, /page=1/);       // driver 0 → vendor 1
+  assert.match(a.request(ctx, 3).url, /page=4/);
+});
+
+check('yotpo: parse maps rows, bottomline and star_distribution', () => {
+  const a = byPlatform('yotpo');
+  const payload = {
+    response: {
+      pagination: { page: 1, per_page: 150, total: 82 },
+      bottomline: { average_score: 4.7, total_review: 82, star_distribution: [2, 1, 4, 15, 60] },
+      reviews: [{
+        content: 'Softest tee I own and it survived a year of weekly washes.',
+        title: 'Holds up', score: 5, created_at: '2026-05-02T10:00:00Z',
+        verified_buyer: true, user: { display_name: 'Sam' }
+      }]
+    }
+  };
+  const p = a.parse(payload, {}, 0);
+  assert.equal(p.total, 82);
+  assert.equal(p.average, 4.7);
+  // ASCENDING array → 5-star bucket must be 60, not 2
+  assert.deepEqual(p.distribution[0], { stars: 5, count: 60 });
+  const q = a.normalize(p.reviews[0]);
+  assert.equal(q.rating, 5);
+  assert.equal(q.author, 'Sam');
+  assert.equal(q.verified, true);
+  assert.ok(q.datePublished instanceof Date);
+});
+
+// ── REVIEWS.io — the 0-indexing trap ───────────────────────────────
+
+check('reviews.io: page 0 is the FIRST page (0-indexed endpoint)', () => {
+  const a = byPlatform('reviews.io');
+  const html = `<script>var reviewsIoStore = 'boxraw';</script>
+    <div class="ruk_rating_snippet" data-sku="BXRW-GSB-B-OS;40047970385978;7104899907642;handle"></div>`;
+  const ctx = a.discover(html, 'https://boxraw.com/p/1');
+  assert.equal(ctx.store, 'boxraw');
+  assert.equal(ctx.sku, 'BXRW-GSB-B-OS');            // first segment only
+  assert.match(a.request(ctx, 0).url, /page=0&/);    // NOT page=1
+  assert.match(a.request(ctx, 1).url, /page=1&/);
+});
+
+check('reviews.io: total_pages drives termination, current_page is ignored', () => {
+  const a = byPlatform('reviews.io');
+  // current_page echoes the request and lies — 2 pages of data, we are on the last
+  const payload = {
+    count: 68, rating: 4.8, total_pages: 2, current_page: 99,
+    reviews: [{
+      review: 'Gloves held up through eight months of heavy bag work.',
+      title: 'Tough', rating: 5, date_created: '2026-04-01',
+      reviewer: { first_name: 'Jo', last_name: 'B', verified_buyer: true }
+    }]
+  };
+  assert.equal(a.parse(payload, {}, 0).hasMore, true);   // page 0 of 2 → more
+  assert.equal(a.parse(payload, {}, 1).hasMore, false);  // page 1 of 2 → done
+  const q = a.normalize(payload.reviews[0]);
+  assert.equal(q.author, 'Jo B');
+  assert.equal(q.rating, 5);
+});
+
+// ── Bazaarvoice — error-in-200, family rollup, offsets ──────────────
+
+check('bazaarvoice: Errors[] inside a 200 body becomes a stop, not an empty page', () => {
+  const a = byPlatform('bazaarvoice');
+  const payload = {
+    Limit: 0, Offset: 0, TotalResults: 0, Results: [],
+    Errors: [{ Message: 'Invalid limit value: 200, limit cannot be greater than 100',
+               Code: 'ERROR_PARAM_INVALID_LIMIT' }]
+  };
+  const p = a.parse(payload, { productId: '1' }, 0);
+  assert.match(p.error, /limit cannot be greater than 100/);
+  assert.deepEqual(p.reviews, []);
+});
+
+check('bazaarvoice: Offset is a RECORD offset and Filter is mandatory', () => {
+  const a = byPlatform('bazaarvoice');
+  const ctx = { passkey: 'pk', productId: '384812' };
+  assert.match(a.request(ctx, 0).url, /Offset=0/);
+  assert.match(a.request(ctx, 2).url, /Offset=200/);    // page 2 × Limit 100
+  assert.match(a.request(ctx, 0).url, /Filter=ProductId%3A384812/);
+  assert.match(a.request(ctx, 0).url, /Limit=100/);
+});
+
+check('bazaarvoice: family rollup — exact-product rows win when present', () => {
+  const a = byPlatform('bazaarvoice');
+  const ctx = { productId: '384812', familyRollup: false };
+  const payload = {
+    TotalResults: 1511,
+    Results: [
+      { ProductId: '384808', ReviewText: 'The ottoman is lovely and firm.', Rating: 5 },
+      { ProductId: '384812', ReviewText: 'This sofa seats five comfortably.', Rating: 5 }
+    ],
+    Includes: { Products: { 384812: { ReviewStatistics: {
+      AverageOverallRating: 4.6, TotalReviewCount: 1511,
+      RatingDistribution: [{ RatingValue: 5, Count: 1200 }, { RatingValue: 1, Count: 40 }]
+    } } } }
+  };
+  const p = a.parse(payload, ctx, 0);
+  assert.equal(p.reviews.length, 1);
+  assert.match(p.reviews[0].ReviewText, /sofa seats five/);
+  assert.equal(ctx.familyRollup, false);
+  assert.equal(p.average, 4.6);
+  assert.deepEqual(p.distribution, [{ stars: 5, count: 1200 }, { stars: 1, count: 40 }]);
+});
+
+check('bazaarvoice: family rollup — falls back to siblings and FLAGS them', () => {
+  const a = byPlatform('bazaarvoice');
+  const ctx = { productId: '384812', familyRollup: false };
+  const payload = {
+    TotalResults: 1511,
+    Results: [{ ProductId: '384810', ReviewText: 'Great ottoman, matches the set.', Rating: 5 }]
+  };
+  const p = a.parse(payload, ctx, 0);
+  assert.equal(p.reviews.length, 1);
+  assert.equal(ctx.familyRollup, true);
+  const q = a.normalize(p.reviews[0], ctx);
+  assert.equal(q.familyRollup, true, 'sibling quotes must carry provenance');
+});
+
+check('bazaarvoice: ratings-only reviews (no body) are skipped', () => {
+  const a = byPlatform('bazaarvoice');
+  assert.equal(a.normalize({ Rating: 5, ReviewText: '' }, {}), null);
+  assert.equal(a.normalize({ Rating: 5 }, {}), null);
+});
+
+// ── PowerReviews — epoch ms, ascending histogram, pages_total ───────
+
+check('powerreviews: paging.from is a record offset capped at size 25', () => {
+  const a = byPlatform('powerreviews');
+  const ctx = { apiKey: 'k', merchantId: '6406', locale: 'en_US', pageId: 'pimprod2054180' };
+  assert.equal(a.pageSize, 25);
+  assert.match(a.request(ctx, 0).url, /paging\.from=0/);
+  assert.match(a.request(ctx, 3).url, /paging\.from=75/);
+  assert.match(a.request(ctx, 0).url, /paging\.size=25/);
+  assert.match(a.request(ctx, 0).url, /\/m\/6406\/l\/en_US\/product\/pimprod2054180\/reviews/);
+  // merchant_group_id must never appear
+  assert.ok(!/merchant_group/i.test(a.request(ctx, 0).url));
+});
+
+check('powerreviews: epoch-ms dates and ASCENDING histogram', () => {
+  const a = byPlatform('powerreviews');
+  const payload = {
+    paging: { total_results: 714, pages_total: 29, current_page_number: 1 },
+    results: [{
+      rollup: { average_rating: 4.48, review_count: 714, rating_histogram: [26, 20, 44, 122, 502] },
+      reviews: [{
+        details: { comments: 'Full coverage that lasted a 12-hour shift.',
+                   headline: 'All day wear', nickname: 'Dana', created_date: 1751000000000 },
+        metrics: { rating: 5 }, badges: { is_verified_buyer: true }
+      }]
+    }]
+  };
+  const p = a.parse(payload, {}, 0);
+  assert.equal(p.total, 714);
+  assert.equal(p.average, 4.48);
+  assert.deepEqual(p.distribution[0], { stars: 5, count: 502 });   // ascending → 502 is 5-star
+  assert.equal(p.hasMore, true);
+  assert.equal(a.parse(payload, {}, 28).hasMore, false);           // page 28 of 29
+  const q = a.normalize(payload.results[0].reviews[0]);
+  assert.equal(q.author, 'Dana');
+  assert.equal(q.datePublished.getUTCFullYear(), 2025);            // ms, not seconds
+});
+
+check('powerreviews: status_code>=400 inside the body is an error stop', () => {
+  const a = byPlatform('powerreviews');
+  const p = a.parse({ message: 'paging.size maximum value is 25', status_code: 400 }, {}, 0);
+  assert.match(p.error, /maximum value is 25/);
+});
+
+// ── Junip / Okendo — cursor paging ─────────────────────────────────
+
+check('junip: cursor paging, no totals in the list, summary span harvested', () => {
+  const a = byPlatform('junip');
+  const html = `<script src="https://widgets.juniphq.com/v1/junip_shopify.js?shop=hexclad-cookware.myshopify.com"></script>
+    <span class="junip-store-key" data-store-key="jg6Ctmk2KGaaKe7sXgWBYgxi"></span>
+    <span class="junip-product-summary" data-product-id="6888697921670"
+      data-product-rating-count="8278" data-product-rating-average="4.845"></span>`;
+  const ctx = a.discover(html, 'https://hexclad.com/p/1');
+  assert.equal(ctx.storeKey, 'jg6Ctmk2KGaaKe7sXgWBYgxi');
+  assert.equal(ctx.productId, '6888697921670');
+  assert.equal(ctx.summaryTotal, 8278);       // free aggregate, no extra request
+  const r0 = a.request(ctx, 0);
+  assert.equal(r0.headers['Junip-Store-Key'], 'jg6Ctmk2KGaaKe7sXgWBYgxi');
+  assert.ok(!/page_after/.test(r0.url), 'first page must omit the cursor');
+  assert.match(r0.url, /page_size=50/);
+  // page > 0 without a cursor must stop rather than refetch page 1
+  assert.equal(a.request({ ...ctx, cursor: null }, 1), null);
+  ctx.cursor = 'eyJyZXZpZXdfY3JlYXRlZF9hdCI6';
+  assert.match(a.request(ctx, 1).url, /page_after=eyJyZXZpZXdfY3JlYXRlZF9hdCI6/);
+});
+
+check('junip: product-group rollup prefers exact remote_id, else flags', () => {
+  const a = byPlatform('junip');
+  const ctx = { productId: '6888697921670', storeKey: 'k' };
+  const exact = {
+    data: [
+      { body: 'The 6-pc set is great but I bought the 12-pc.', rating: 5,
+        product: { remote_id: 4352900202630 } },
+      { body: 'Pans heat evenly and clean up in seconds.', rating: 5,
+        product: { remote_id: 6888697921670 }, title: 'Even heat',
+        customer: { first_name: 'Ada', last_name: 'L' }, verified_buyer: true }
+    ],
+    meta: { after: null }
+  };
+  const p = a.parse(exact, ctx, 0);
+  assert.equal(p.reviews.length, 1);
+  assert.equal(ctx.familyRollup, false);
+  const q = a.normalize(p.reviews[0], ctx);
+  assert.equal(q.author, 'Ada L');
+  assert.equal(q.title, 'Even heat');
+  assert.equal(q.familyRollup, undefined);
+
+  const groupOnly = { data: [{ body: 'Love the 6-pc pot set lids.', rating: 5,
+    product: { remote_id: 4352900202630 } }], meta: { after: null } };
+  const ctx2 = { productId: '6888697921670', storeKey: 'k' };
+  const p2 = a.parse(groupOnly, ctx2, 0);
+  assert.equal(ctx2.familyRollup, true);
+  assert.equal(a.normalize(p2.reviews[0], ctx2).familyRollup, true);
+});
+
+check('junip: title never falls back to target_title (a PRODUCT name)', () => {
+  const a = byPlatform('junip');
+  const q = a.normalize({ body: 'Solid pan, even heat after months.',
+    target_title: 'Hybrid Pot Set with Lids, 6-pc' }, {});
+  assert.equal(q.title, null, 'a product name must not be used as a review headline');
+});
+
+check('okendo: productId must be shopify-prefixed; cursor replayed verbatim', () => {
+  const a = byPlatform('okendo');
+  const html = `<script id="okeReferralSettings" type="application/json">
+      {"subscriberId":"6a5493fe-bb43-48c7-9860-714f216f13cf"}</script>
+    <div data-oke-widget data-oke-reviews-product-id="shopify-8859021475989"></div>`;
+  const ctx = a.discover(html, 'https://s.com/p/1');
+  assert.equal(ctx.subscriberId, '6a5493fe-bb43-48c7-9860-714f216f13cf');
+  assert.equal(ctx.productId, 'shopify-8859021475989');
+  assert.match(a.request(ctx, 0).url, /\/products\/shopify-8859021475989\/reviews/);
+
+  const payload = { reviews: [{ body: 'Held colour after 20 washes.', rating: 5,
+      dateCreated: '2026-03-01', reviewer: { displayName: 'Kim', isVerified: true } }],
+    nextUrl: '/stores/6a5493fe/products/shopify-1/reviews?limit=5&lastEvaluated=%7Bx%7D',
+    reviewAggregate: { reviewCount: 40, reviewCountByLevel: { level5Count: 30, level1Count: 2 } } };
+  const p = a.parse(payload, ctx, 0);
+  assert.equal(p.hasMore, true);
+  assert.equal(p.total, 40);
+  assert.deepEqual(p.distribution[0], { stars: 5, count: 30 });
+  ctx.cursor = p.cursor;
+  assert.match(a.request(ctx, 1).url, /lastEvaluated=%7Bx%7D/);   // verbatim replay
+  // Absent nextUrl = authoritative last page
+  assert.equal(a.parse({ reviews: [] }, ctx, 1).hasMore, false);
+});
+
+check('okendo: synthesises the shopify- prefix when only a bare id exists', () => {
+  const a = byPlatform('okendo');
+  const html = `<meta name="oke:subscriber_id" content="6a5493fe-bb43-48c7-9860-714f216f13cf">
+    <div data-oke-widget></div>
+    <script>var meta = {"product":{"id":8859021475989,"gid":"x"}};</script>`;
+  const ctx = a.discover(html, 'https://s.com/p/1');
+  assert.equal(ctx.productId, 'shopify-8859021475989');
+});
+
+// ── Judge.me — HTML fragment parsing ───────────────────────────────
+
+check('judge.me: parses the HTML fragment into rows with stars', () => {
+  const a = byPlatform('judge.me');
+  const html = `<script>window.jdgmSettings={"pagination":5};</script>
+    <div class="jdgm-widget jdgm-preview-badge" data-id='7432276279379'
+      data-average-rating="4.74" data-number-of-reviews="81"></div>`;
+  const ctx = a.discover(html, 'https://beardbrand.com/products/x');
+  assert.equal(ctx.productId, '7432276279379');
+  assert.equal(ctx.pageAverage, 4.74);
+  assert.equal(ctx.pageCount, 81);
+  const req = a.request(ctx, 0);
+  assert.match(req.url, /per_page=30/);      // the silent clamp ceiling
+  assert.match(req.url, /page=1/);
+
+  const fragment = `<div class="jdgm-rev-widg__reviews">
+    <div class="jdgm-rev jdgm-divider-top" data-score="5" data-verified-buyer="true"
+         data-timestamp="2026-05-01T00:00:00Z">
+      <b class="jdgm-rev__title">Best trimmer</b>
+      <div class="jdgm-rev__body"><p>Cuts cleanly and the battery lasts weeks.</p></div>
+      <span class="jdgm-rev__author">Alex</span>
+    </div>
+    <div class="jdgm-rev" data-score="2" data-verified-buyer="false">
+      <div class="jdgm-rev__body"><p>Stopped charging after a month.</p></div>
+      <span class="jdgm-rev__author">Sam</span>
+    </div></div>`;
+  const p = a.parse({ html: fragment }, ctx, 0);
+  assert.equal(p.reviews.length, 2);
+  assert.equal(p.average, 4.74);
+  const q = a.normalize(p.reviews[0]);
+  assert.equal(q.text, 'Cuts cleanly and the battery lasts weeks.');
+  assert.equal(q.title, 'Best trimmer');
+  assert.equal(q.author, 'Alex');
+  assert.equal(q.rating, 5);
+  assert.equal(q.verified, true);
+  assert.equal(a.normalize(p.reviews[1]).rating, 2);
+});
+
+// ── Stamped / Fera ─────────────────────────────────────────────────
+
+check('stamped: pubkey + sId from one init call, Shopify id from analytics', () => {
+  const a = byPlatform('stamped');
+  const html = `<script>function myInit(){ StampedFn.init({ apiKey: 'pubkey-3k2cnGWYWs2hfG2efGP1cwlH6XrYvo', sId: '114374' }); }</script>
+    <script src="https://cdn1.stamped.io/files/widget.min.js"></script>
+    <script>var meta = {"product":{"id":8483130540168,"gid":"gid://shopify/Product/8483130540168"}};</script>`;
+  const ctx = a.discover(html, 'https://innosupps.com/p/1');
+  assert.equal(ctx.apiKey, 'pubkey-3k2cnGWYWs2hfG2efGP1cwlH6XrYvo');
+  assert.equal(ctx.storeUrl, '114374');
+  assert.equal(ctx.productId, '8483130540168');
+  assert.match(a.request(ctx, 0).url, /page=1&/);
+  assert.match(a.request(ctx, 0).url, /take=100/);
+
+  const payload = { total: 398, rating: 4.7, data: [{
+    reviewMessage: 'Mixes clean with no clumps at all.', reviewTitle: 'Smooth',
+    reviewRating: 5, author: 'Ray', dateCreated: '2026-06-01', reviewVerifiedType: 2 }] };
+  const p = a.parse(payload, ctx, 0);
+  assert.equal(p.total, 398);
+  assert.equal(p.average, 4.7);
+  const q = a.normalize(p.data ? p.data[0] : p.reviews[0]);
+  assert.equal(q.verified, true);        // non-zero enum = verified
+});
+
+check('fera: 1-indexed pages, meta.page_count terminates', () => {
+  const a = byPlatform('fera');
+  const html = `<script>const fkey = "pk_e70aebf09910b4ffa8a096daf07aaeb5da64c102e28fe16ba1dddadd61d5f43f";
+    const fdomain = "the-vintage-secret.myshopify.com";</script>
+    <script>window.fera.push({ action: "setProductId", product_id: "7961280610487" });</script>`;
+  const ctx = a.discover(html, 'https://thevintagesecret.com.au/products/x');
+  assert.match(ctx.apiKey, /^pk_e70aebf0/);
+  assert.equal(ctx.productId, '7961280610487');
+  assert.match(a.request(ctx, 0).url, /page=1&/);
+  assert.match(a.request(ctx, 0).url, /cdn\.fera\.ai/);   // edge cache, politer
+
+  const payload = { product: null, meta: { page: 1, page_count: 3, total_count: 26 },
+    data: [{ body: 'Adjustable length is perfect, choker to long.', heading: 'Excellent!',
+      rating: 5, created_at: '2025-08-25T21:58:48Z', is_verified: true,
+      customer: { display_name: 'Mia' } }] };
+  const p = a.parse(payload, ctx, 0);
+  assert.equal(p.total, 26);
+  assert.equal(p.hasMore, true);
+  assert.equal(a.parse({ meta: { page: 3, page_count: 3, total_count: 26 }, data: [] }, ctx, 2).hasMore, false);
+  const q = a.normalize(p.reviews[0]);
+  assert.equal(q.title, 'Excellent!');
+  assert.equal(q.author, 'Mia');
+});
+
 // ── registry ───────────────────────────────────────────────────────
 
 check('registry: every loaded adapter satisfies the contract', () => {

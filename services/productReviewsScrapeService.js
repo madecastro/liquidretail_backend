@@ -93,8 +93,13 @@ const PLATFORM_SIGNATURES = [
   ['turnto',           /turnto\.com|turntocdn/i],
   ['judge.me',         /judge\.me|judgeme|jdgm-/i],
   ['yotpo',            /yotpo/i],
-  ['okendo',           /okendo|oke-star|api\.okendo\.io/i],
-  ['reviews.io',       /reviews\.io|reviewsio|widget\.reviews\.co\.uk/i],
+  // data-oke-* is what Okendo stores actually emit on the widget host div
+  // (data-oke-widget, data-oke-reviews-product-id) — matching only the
+  // literal "okendo" missed every store whose theme uses just the attributes.
+  ['okendo',           /okendo|data-oke-|oke-star|api\.okendo\.io/i],
+  // ruk_* is REVIEWS.io's own widget prefix (from its reviews.co.uk days) and
+  // is often the only marker in a theme's markup.
+  ['reviews.io',       /reviews\.io|reviewsio|ruk_rating_snippet|ruk-widget|widget\.reviews\.co\.uk/i],
   ['trustpilot',       /trustpilot/i],
   ['junip',            /junip\.co|junip-/i],
   ['fera',             /fera\.ai|fera-/i],
