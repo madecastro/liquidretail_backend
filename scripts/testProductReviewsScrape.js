@@ -122,6 +122,69 @@ check('cap keeps the BEST quotes, not the first N in document order', () => {
   assert.equal(r.quotes[0].rating, 5);
 });
 
+// ── JSON-LD that never appears in a <script> tag (RSC stores) ──────
+//
+// gap.com forced this: Next.js App Router serialises the whole ld+json tag
+// into the React flight payload, so the Product node arrives as a DOUBLY
+// ESCAPED string inside a JS array. A script-tag scan finds nothing, and Gap
+// reported no reviews at all for a product with 2741 ratings.
+
+check('embedded/escaped JSON-LD in an RSC flight payload is recovered', () => {
+  const node = {
+    '@context': 'https://schema.org',
+    '@type': 'Product',
+    name: 'Modern Khakis',
+    sku: '1300460420010',
+    aggregateRating: { '@type': 'AggregateRating', ratingCount: 2741, ratingValue: 4.48 }
+  };
+  // Two levels of escaping, exactly like Gap's payload:
+  //   \"children\":\"{\\\"@context\\\":...}\"
+  const inner = JSON.stringify(node);                 // level 0
+  const once = JSON.stringify(inner);                 // wrapped as a JS string
+  const html = '<script>self.__next_f.push([1,"[\\"$\\",\\"$L48\\",null,' +
+    '{\\"id\\":\\"seo-page-schema\\",\\"type\\":\\"application/ld+json\\",' +
+    '\\"children\\":' + once.replace(/"/g, '\\"') + '}]"])</script>';
+
+  const r = extractOnPageReviews(html);
+  assert.equal(r.rating, 4.48, 'rating must survive the escaping');
+  assert.equal(r.reviewCount, 2741);
+  assert.equal(r.source, 'json-ld');
+});
+
+check('embedded scan finds review[] too, not just the aggregate', () => {
+  const node = {
+    '@context': 'https://schema.org', '@type': 'Product', name: 'X',
+    review: [{ '@type': 'Review', reviewBody: 'Held its shape after a year of weekly wear.',
+               reviewRating: { ratingValue: 5 }, author: { name: 'Sam' } }]
+  };
+  const escaped = JSON.stringify(JSON.stringify(node)).replace(/"/g, '\\"');
+  const r = extractOnPageReviews(`<script>window.__DATA__={"payload":${escaped}}</script>`);
+  assert.equal(r.quotes.length, 1);
+  assert.equal(r.quotes[0].rating, 5);
+});
+
+check('embedded scan is a no-op on ordinary pages (no false positives)', () => {
+  // A page with a real script-tag block must not be double-counted, and a page
+  // with neither must stay empty.
+  const plain = ld(LIVING_SPACES);
+  const r = extractOnPageReviews(plain);
+  assert.equal(r.quotesFound, 3, 'script-tag block must not be counted twice');
+  const none = extractOnPageReviews('<html><body>no schema, just \\"quotes\\"</body></html>');
+  assert.equal(none.rating, null);
+  assert.deepEqual(none.quotes, []);
+});
+
+check('embedded scan survives malformed escaping without throwing', () => {
+  for (const html of [
+    '<script>x={\\"@context\\":\\"https://schema.org\\",\\"@type\\":\\"Product\\"',  // truncated
+    '<script>x=\\"@context\\":\\"https://schema.org\\"</script>',                            // no object
+    '<script>' + '\\"@type\\":\\"Product\\",'.repeat(50) + '</script>'                       // junk repetition
+  ]) {
+    const r = extractOnPageReviews(html);
+    assert.equal(r.rating, null);
+  }
+});
+
 // ── platform-agnostic coverage ─────────────────────────────────────
 
 check('detectReviewPlatform: the apps clients actually run', () => {

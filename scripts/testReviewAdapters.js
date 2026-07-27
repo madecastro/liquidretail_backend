@@ -759,6 +759,100 @@ check('fera: 1-indexed pages, meta.page_count terminates', () => {
   assert.equal(q.author, 'Mia');
 });
 
+// ── page_id inference + the persistent site-profile store ──────────
+//
+// gap.com is the case that forced this: its PDP shows pid=130046042 and
+// sku=1300460420010, but PowerReviews files all 2741 reviews under `130046`.
+// Every id literally on the page returns 200 with total_results:0, so without
+// derived candidates the product looks review-less.
+
+const profiles = require('../services/reviewSiteProfileService');
+
+check('powerreviews: derives trimmed candidates (variant id → style id)', () => {
+  const a = byPlatform('powerreviews');
+  const gapHtml = '<script src="//ui.powerreviews.com/stable/4.0/ui.js"></script>' +
+    '<script>{\\"powerReviewsConfig\\":{\\"groupId\\":524780421,' +
+    '\\"merchantId\\":1443032450,\\"apiKey\\":\\"96e4b93c-348e-4f21-847b-028497ff9f1c\\"}}</script>' +
+    '<script>x={\\"productID\\":\\"130046042\\",\\"sku\\":\\"1300460420010\\"}</script>';
+  profiles.clearCache('www.gap.com');
+  const list = a.candidateList(gapHtml, 'https://www.gap.com/browse/product.do?pid=130046042');
+  const ids = list.map(c => c.id);
+  assert.ok(ids.includes('130046042'), 'the literal id must still be tried first');
+  assert.ok(ids.includes('130046'), 'the style id (pid minus colour) must be derived');
+  // Bounded: never trims below 5 chars and never more than 4 chars
+  assert.ok(list.every(c => c.id.length >= 5));
+  assert.ok(list.every(c => c.trim <= 4));
+});
+
+check('powerreviews: file-like canonical values are not probed', () => {
+  const a = byPlatform('powerreviews');
+  // Gap's canonical path ends in "product.do" — a page name, never a page_id.
+  const html = '<script src="//ui.powerreviews.com/x/ui.js"></script>' +
+    '<link rel="canonical" href="https://www.gap.com/browse/product.do?pid=1"/>' +
+    '<script>{"prApiKey":"k","prMerchantId":"1"}</script>';
+  const ids = a.candidateList(html, 'https://www.gap.com/browse/product.do?pid=130046042').map(c => c.id);
+  assert.ok(!ids.includes('product.do'), 'must not waste a probe on a page name');
+});
+
+check('powerreviews: Gap-style keys are read, and only from powerReviewsConfig', () => {
+  const { firstMatch } = adapters;
+  // A bare /"apiKey"/ would grab this unrelated token instead of the PR one.
+  const html = '<script>{\\"someOtherService\\":{\\"apiKey\\":\\"9aQq9iKmc0McDfGbVTGa\\"},' +
+    '\\"powerReviewsConfig\\":{\\"groupId\\":524780421,\\"merchantId\\":1443032450,' +
+    '\\"apiKey\\":\\"96e4b93c-348e-4f21-847b-028497ff9f1c\\"}}</script>';
+  const key = firstMatch(html, [
+    /powerReviewsConfig\\?"?\s*:\s*\{[^{}]{0,300}?\\?"apiKey\\?"\s*:\s*\\?"([0-9a-fA-F-]{20,})/i
+  ]);
+  assert.equal(key, '96e4b93c-348e-4f21-847b-028497ff9f1c');
+  assert.notEqual(key, '9aQq9iKmc0McDfGbVTGa');
+});
+
+check('profiles: the checked-in seed answers with no database', () => {
+  const gap = profiles.getProfileSync('https://www.gap.com/browse/product.do?pid=1');
+  assert.equal(gap.platform, 'powerreviews');
+  assert.equal(gap.idSource, 'productID');
+  assert.equal(gap.idTrim, 3);
+  assert.equal(gap.ldSource, 'embedded');
+  assert.equal(gap.origin, 'seed');
+  // Hosts we have not profiled return null rather than a guess.
+  assert.equal(profiles.getProfileSync('https://unknown-store.example/p/1'), null);
+  assert.equal(profiles.getProfileSync('not a url'), null);
+});
+
+check('profiles: a seeded transform is probed FIRST (cold start, one request)', () => {
+  const a = byPlatform('powerreviews');
+  const html = '<script src="//ui.powerreviews.com/x/ui.js"></script>' +
+    '<script>{"prApiKey":"k","prMerchantId":"1"}</script>' +
+    '<script>x={\\"productID\\":\\"373509062\\"}</script>';
+  profiles.clearCache();
+  const first = a.candidateList(html, 'https://www.gap.com/browse/product.do?pid=373509062')[0];
+  assert.equal(first.id, '373509', 'the seed says productID minus 3 — try that first');
+  assert.equal(first.trim, 3);
+});
+
+checkAsync('profiles: learn() updates memory even with no DB connection', async () => {
+  profiles.clearCache('shop.example');
+  assert.equal(profiles.getProfileSync('https://shop.example/p/1'), null);
+  await profiles.learn('https://shop.example/p/1', {
+    platform: 'yotpo', idSource: 'sku', idTrim: 2, reviewsSeen: 42
+  });
+  const p = profiles.getProfileSync('https://shop.example/p/9');
+  assert.equal(p.platform, 'yotpo');
+  assert.equal(p.idTrim, 2);
+  assert.equal(p.origin, 'learned');
+  assert.equal(p.reviewsSeen, 42);
+});
+
+checkAsync('profiles: learn() merges, it does not blank prior knowledge', async () => {
+  profiles.clearCache('merge.example');
+  await profiles.learn('https://merge.example/p/1', { platform: 'okendo', idSource: 'sku', idTrim: 0 });
+  await profiles.learn('https://merge.example/p/2', { ldSource: 'embedded' });
+  const p = profiles.getProfileSync('merge.example');
+  assert.equal(p.platform, 'okendo', 'a later partial learn must not erase the platform');
+  assert.equal(p.idSource, 'sku');
+  assert.equal(p.ldSource, 'embedded');
+});
+
 // ── tier 3: headless capture internals ─────────────────────────────
 //
 // The browser half can't run here (puppeteer is absent from this container's
