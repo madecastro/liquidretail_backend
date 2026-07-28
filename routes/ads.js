@@ -1681,13 +1681,14 @@ router.get('/:id/generation-inspector', async (req, res) => {
       if (ad.aiCanvasArtifactId) {
         const AiCanvasArtifact = require('../models/AiCanvasArtifact');
         const c = await AiCanvasArtifact.findById(ad.aiCanvasArtifactId)
-          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks').lean();
+          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks modelId').lean();
         if (c) {
           image.layoutPrompt = { system: c.promptSystem || null, user: c.promptUser || null, images: c.promptImages || [] };
           image.canvasSpec   = c.canvasSpec || null;
           image.outputHtml   = c.outputHtml || null;
           image.colorPalette = c.colorPalette || null;
           image.copyPicks    = c.copyPicks || null;
+          image.model        = c.modelId || null;   // e.g. 'gpt-4.1' — the layout-generation model
         }
       }
       // NOTE: the gpt-image-2 image-ref prompt (AiFullRenderArtifact) is
