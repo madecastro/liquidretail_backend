@@ -1376,13 +1376,20 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 });
 
 // POST /api/ads/:id/regenerate — re-run the render pipeline for this
-// ad with an operator refinement prompt. Body: { prompt, mode? }.
-//   prompt: required, up to ~1000 chars
-//   mode:   'light' (default, video only — re-runs chrome + composite,
-//                    Veo unchanged) | 'full' (re-runs Veo too).
-//           Image ads always do full HTML Gen re-render; mode ignored.
+// ad with an operator refinement prompt, OR a verbatim prompt override.
+// Body: { prompt?, mode?, promptOverride? }.
+//   prompt:  a refinement note appended to the auto-composed prompt.
+//            Required UNLESS promptOverride is given. Up to ~1000 chars.
+//   mode:    'light' (default, video only — re-runs chrome + composite,
+//                     Veo unchanged) | 'full' (re-runs Veo too).
+//            Image ads always do full HTML Gen re-render; mode ignored.
+//   promptOverride: { system, user } — image ads only. The operator
+//            edited the EXACT prompt shown in the Generation Details
+//            modal; this text replaces the auto-composed prompt
+//            verbatim instead of being appended as a refinement note.
 // Returns 202 with a poll target. Frontend polls
-// /api/catalog/:productId/ads-detail watching ad.regenerating.
+// /api/catalog/:productId/ads-detail (or this ad's generation-inspector)
+// watching ad.regenerating.
 router.post('/:id/regenerate', express.json(), async (req, res) => {
   try {
     const brandId = req.query.brandId || req.headers['x-brand-id'];
@@ -1393,8 +1400,21 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       if (e.status === 404) return res.status(404).json({ error: e.message });
       throw e;
     }
+
+    const MAX_OVERRIDE_LEN = 40000;
+    let promptOverride = null;
+    if (req.body?.promptOverride && typeof req.body.promptOverride === 'object') {
+      const sys = String(req.body.promptOverride.system || '').trim();
+      const usr = String(req.body.promptOverride.user   || '').trim();
+      if (!sys || !usr) return res.status(400).json({ error: 'promptOverride requires both system and user text' });
+      if (sys.length > MAX_OVERRIDE_LEN || usr.length > MAX_OVERRIDE_LEN) {
+        return res.status(400).json({ error: `promptOverride text is too long (max ${MAX_OVERRIDE_LEN} chars each)` });
+      }
+      promptOverride = { system: sys, user: usr };
+    }
+
     const prompt = String(req.body?.prompt || '').trim();
-    if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+    if (!prompt && !promptOverride) return res.status(400).json({ error: 'prompt or promptOverride is required' });
     if (prompt.length > 1000) return res.status(400).json({ error: 'prompt is too long (max 1000 chars)' });
     const mode = req.body?.mode === 'full' ? 'full' : 'light';
 
@@ -1418,6 +1438,9 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     } catch (err) {
       return res.status(err.status || 400).json({ error: err.message });
     }
+    if (promptOverride && ad.kind !== 'image') {
+      return res.status(400).json({ error: 'promptOverride is only supported for image ads' });
+    }
     const requestedBy = req.user?.userId || req.user?.email || null;
 
     // 202 — operator polls /api/catalog/:productId/ads-detail for stage.
@@ -1429,7 +1452,7 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     });
 
     setImmediate(() => {
-      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel })
+      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel, promptOverride })
         .catch(err => console.error(`❌ regenerate setImmediate crash: ${err.message}`));
     });
   } catch (err) {
@@ -1587,13 +1610,27 @@ router.get('/:id/generation-inspector', async (req, res) => {
     const brand = await Brand.findById(brandId).lean();
 
     const out = {
-      adId:        String(ad._id),
-      kind:        ad.kind,
-      template:    ad.template,
-      aspectRatio: ad.aspectRatio,
-      status:      ad.status,
-      productId:   ad.productId ? String(ad.productId) : null,
-      warnings:    []
+      adId:               String(ad._id),
+      kind:               ad.kind,
+      template:           ad.template,
+      aspectRatio:        ad.aspectRatio,
+      status:             ad.status,
+      productId:          ad.productId ? String(ad.productId) : null,
+      // Regenerate-with-prompt state — surfaced here so the Generation
+      // Details modal can poll this same endpoint while a regen runs,
+      // and so it can gate edit/regenerate on exported ads (read-only).
+      metaSyncStatus:     ad.metaSyncStatus || null,
+      regenerating:       !!ad.regenerating,
+      regenerationStage:  ad.regenerationStage || null,
+      // Last regen outcome (done/failed/pending) — lets a poller distinguish
+      // "finished successfully" from "finished but failed" once regenerating
+      // flips back to false (both look identical from that flag alone).
+      lastRegeneration: (() => {
+        const h = Array.isArray(ad.regenerationHistory) ? ad.regenerationHistory : [];
+        const last = h.length ? h[h.length - 1] : null;
+        return last ? { status: last.status, error: last.error || null, at: last.at || null } : null;
+      })(),
+      warnings:           []
     };
 
     // ── Seed media (the source the generation animated/composed) ──
@@ -1681,13 +1718,34 @@ router.get('/:id/generation-inspector', async (req, res) => {
       if (ad.aiCanvasArtifactId) {
         const AiCanvasArtifact = require('../models/AiCanvasArtifact');
         const c = await AiCanvasArtifact.findById(ad.aiCanvasArtifactId)
-          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks').lean();
+          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks modelId htmlPromptSystem htmlPromptUser')
+          .lean();
         if (c) {
-          image.layoutPrompt = { system: c.promptSystem || null, user: c.promptUser || null, images: c.promptImages || [] };
+          // htmlPromptSystem/User is the EXACT prompt the HTML Generator
+          // sent for the current outputHtml. promptSystem/User is the
+          // older JSON Generator's own (different) prompt — kept as a
+          // fallback for ads rendered before htmlPrompt* was captured,
+          // but it does NOT necessarily match outputHtml, so flag it.
+          const exact = !!(c.htmlPromptSystem && c.htmlPromptUser);
+          image.layoutPrompt = {
+            system: c.htmlPromptSystem || c.promptSystem || null,
+            user:   c.htmlPromptUser   || c.promptUser   || null,
+            images: c.promptImages || []
+          };
+          image.promptIsExact = exact;
           image.canvasSpec   = c.canvasSpec || null;
           image.outputHtml   = c.outputHtml || null;
           image.colorPalette = c.colorPalette || null;
           image.copyPicks    = c.copyPicks || null;
+          image.model        = c.modelId || null;   // e.g. 'gpt-4.1' — the layout-generation model
+          if (!exact && (image.layoutPrompt.system || image.layoutPrompt.user)) {
+            out.warnings.push({
+              code: 'layout-prompt-legacy',
+              message: 'Shown prompt is from the legacy JSON layout generator, not the HTML generator that actually produced this render — it may not exactly match the image. Editing and regenerating will still work off your edited text going forward.'
+            });
+          } else if (!image.layoutPrompt.system && !image.layoutPrompt.user) {
+            out.warnings.push({ code: 'layout-prompt-missing', message: 'No layout prompt captured for this ad.' });
+          }
         }
       }
       // NOTE: the gpt-image-2 image-ref prompt (AiFullRenderArtifact) is

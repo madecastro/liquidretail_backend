@@ -84,7 +84,7 @@ async function preflight(adId, brandId) {
 // route responds 202 with { regenerating: true } and the worker runs
 // in the background. The frontend polls /api/catalog/:id/ads-detail
 // every 5s watching Ad.regenerating.
-async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null }) {
+async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, promptOverride = null }) {
   const adId      = String(ad._id);
   const kind      = ad.kind || 'image';
   // Video always regens fully (new Grok video + brand-script chrome).
@@ -93,18 +93,23 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null }
   const effMode   = 'full';
   const startedAt = Date.now();
   const historyEntry = {
-    prompt:      String(prompt || '').slice(0, 1000),
-    mode:        effMode,
-    requestedBy: requestedBy || null,
-    videoModel:  videoModel || null,
-    at:          new Date(startedAt),
-    status:      'pending'
+    prompt:        String(prompt || '').slice(0, 1000),
+    mode:          effMode,
+    requestedBy:   requestedBy || null,
+    videoModel:    videoModel || null,
+    // The full override text lives on the AiCanvasArtifact
+    // (htmlPromptSystem/htmlPromptUser), overwritten each run — the
+    // history entry just flags that THIS run was a verbatim prompt
+    // edit rather than a refinement note appended to the auto-prompt.
+    rawPromptEdit: !!promptOverride,
+    at:            new Date(startedAt),
+    status:        'pending'
   };
 
   console.log(
     `🔁 regenerate[ad=${adId}]: kind=${kind} mode=${effMode}` +
     (videoModel ? ` videoModel=${videoModel}` : '') +
-    ` prompt="${historyEntry.prompt.slice(0, 60)}${historyEntry.prompt.length > 60 ? '…' : ''}"`
+    (promptOverride ? ' rawPromptEdit=true' : ` prompt="${historyEntry.prompt.slice(0, 60)}${historyEntry.prompt.length > 60 ? '…' : ''}"`)
   );
 
   // Atomic lock + append in-flight history entry. Filter requires
@@ -144,7 +149,7 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null }
     if (kind === 'video') {
       await runVideoFull(adId, prompt, progressRun, videoModel);
     } else {
-      await runImage(adId, prompt, progressRun);
+      await runImage(adId, prompt, progressRun, promptOverride);
     }
 
     const durationMs = Date.now() - startedAt;
@@ -241,7 +246,7 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null)
 // operatorPrompt) then screenshots the new outputHtml with Puppeteer
 // at the canvas's normalized dims, uploads to Cloudinary, and updates
 // the Ad's renderUrl.
-async function runImage(adId, prompt, progressRun = null) {
+async function runImage(adId, prompt, progressRun = null, promptOverride = null) {
   if (progressRun) { await progressRun.checkpoint(); progressRun.stage('generating image'); }
   await setStage(adId, 'image-gen');
   const ad = await Ad.findById(adId).lean();
@@ -251,11 +256,17 @@ async function runImage(adId, prompt, progressRun = null) {
 
   // Re-run HTML Gen on the existing artifact with the operator prompt.
   // refresh:true ignores the htmlSchemaVersion cache so the prompt is
-  // honored even if the artifact was generated this version.
+  // honored even if the artifact was generated this version. When
+  // promptOverride is set (operator edited the exact prompt text in the
+  // Generation Details modal), it replaces the auto-composed prompt
+  // verbatim — operatorPrompt (the refinement-note path) is moot in
+  // that case since the override already contains whatever the
+  // operator wanted said.
   const out = await htmlGen.generateForArtifact({
     aiCanvasArtifactId: ad.aiCanvasArtifactId,
     refresh:            true,
-    operatorPrompt:     prompt
+    operatorPrompt:     prompt,
+    rawPromptOverride:  promptOverride
   });
   if (out?.skipped) throw new Error(`HTML Gen skipped: ${out.reason || 'unknown'}`);
 

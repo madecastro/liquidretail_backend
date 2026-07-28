@@ -1016,6 +1016,34 @@ function applyCopyPicks(input, spec) {
   return next;
 }
 
+// Both persist points below replace the whole AiCanvasArtifact document
+// (findOneAndReplace) — any field not listed reverts to its schema default.
+// The HTML Generator (aiCanvasHtmlGeneratorService.js) owns outputHtml/
+// htmlPrompt*/colorPalette/copyPicks/htmlSchemaVersion/htmlValidationId/
+// htmlRawResponse on this SAME collection, written via a separate $set call
+// (e.g. an operator's regenerate-with-prompt). If THIS generator re-runs
+// afterward for the same cache key (refresh:true, or a SPEC_SCHEMA_VERSION
+// bump), the replace would silently wipe that data back to null even
+// though the Ad's renderUrl still shows the HTML-rendered image — carry it
+// forward so a re-run here never regresses an ad already regenerated via
+// HTML Gen.
+async function preserveHtmlGenFields(filter) {
+  const existing = await AiCanvasArtifact.findOne(filter)
+    .select('outputHtml outputCss colorPalette copyPicks htmlSchemaVersion htmlValidationId htmlRawResponse htmlPromptSystem htmlPromptUser')
+    .lean();
+  return {
+    outputHtml:        existing?.outputHtml ?? null,
+    outputCss:         existing?.outputCss ?? null,
+    colorPalette:      existing?.colorPalette ?? [],
+    copyPicks:         existing?.copyPicks ?? { headline: null, subheadline: null, eyebrow: null, cta: null },
+    htmlSchemaVersion: existing?.htmlSchemaVersion ?? '1.0.0',
+    htmlValidationId:  existing?.htmlValidationId ?? null,
+    htmlRawResponse:   existing?.htmlRawResponse ?? null,
+    htmlPromptSystem:  existing?.htmlPromptSystem ?? null,
+    htmlPromptUser:    existing?.htmlPromptUser ?? null
+  };
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 async function getOrGenerate({
   input,
@@ -1204,6 +1232,7 @@ async function getOrGenerate({
   // a concept and would skip anyway, so the JSON spec is the only path.
   const directHtml = String(process.env.AI_LAYOUT_DIRECT_HTML || '').toLowerCase() === 'true';
   if (directHtml && isV2) {
+    const preserved = await preserveHtmlGenFields(filter);
     const artifact = await AiCanvasArtifact.findOneAndReplace(
       filter,
       {
@@ -1232,7 +1261,8 @@ async function getOrGenerate({
         judgeRationale:    null,
         judgeConfidence:   null,
         specSchemaVersion: SPEC_SCHEMA_VERSION,
-        createdAt:         new Date()
+        createdAt:         new Date(),
+        ...preserved
       },
       { upsert: true, new: true, includeResultMetadata: false }
     );
@@ -1441,6 +1471,7 @@ async function getOrGenerate({
 
   // Persist. Replace any prior entry under the same key (refresh=true
   // path or schema-version mismatch from the cache check above).
+  const preserved = await preserveHtmlGenFields(filter);
   const artifact = await AiCanvasArtifact.findOneAndReplace(
     filter,
     {
@@ -1473,7 +1504,8 @@ async function getOrGenerate({
       judgeRationale:   judgeOutcome.rationale,
       judgeConfidence:  judgeOutcome.confidence,
       specSchemaVersion: SPEC_SCHEMA_VERSION,
-      createdAt:         new Date()
+      createdAt:         new Date(),
+      ...preserved
     },
     { upsert: true, new: true, includeResultMetadata: false }
   );
