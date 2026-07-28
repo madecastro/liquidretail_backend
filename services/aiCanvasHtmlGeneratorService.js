@@ -54,7 +54,7 @@ function enabled() {
 // the JSON spec generation completes. Idempotent on (aiCanvasArtifactId,
 // htmlSchemaVersion) — if the artifact already has outputHtml at the
 // current schema version, skip.
-async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operatorPrompt = null }) {
+async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operatorPrompt = null, rawPromptOverride = null }) {
   if (!enabled() && !refresh) {
     return { skipped: true, reason: 'AI_HTML_LAYOUT_ENABLED=false' };
   }
@@ -210,7 +210,7 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
     mediaUrlMap = new Map(docs.map(d => [String(d._id), toStillIfVideo(d.fileUrl)]));
   }
 
-  const { system, user, images } = isV2Concept
+  const built = isV2Concept
     ? buildPromptV2({
         canvas, concept, input, richContext, dims, videoMode, mediaRect, platformFormat,
         mediaUrlMap, sourceText, sourceSubjects, sourcePrimarySubjectDesc, operatorPrompt
@@ -219,6 +219,16 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
         canvas, concept, input, richContext, dims, videoMode, mediaRect, platformFormat,
         sourceText, sourceSubjects, sourcePrimarySubjectDesc, operatorPrompt
       });
+
+  // Raw prompt override — the operator edited the exact prompt text
+  // shown in the Generation Details modal and hit Regenerate. Their
+  // text replaces the auto-composed system/user verbatim; the vision
+  // images stay whatever the normal build resolved (mediaUrlMap /
+  // concept media picks) since an override only edits wording, not
+  // which images ground the generation.
+  const system = (rawPromptOverride?.system) || built.system;
+  const user   = (rawPromptOverride?.user)   || built.user;
+  const images = built.images;
 
   const nCandidates = N_CANDIDATES_DEFAULT;
   const responseSchema = buildResponseSchema();
@@ -368,7 +378,12 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
         // Stash the raw response for diagnostic visibility (mirrors the
         // JSON Generator's rawResponse pattern). One field, winner only;
         // multi-candidate raws are not persisted for cost / index size.
-        htmlRawResponse:   candidateRaws[winnerIndex] || null
+        htmlRawResponse:   candidateRaws[winnerIndex] || null,
+        // The exact prompt just sent to the model (post raw-override, if
+        // any) — see field comment on the schema for why this is distinct
+        // from promptSystem/promptUser.
+        htmlPromptSystem:  system,
+        htmlPromptUser:    user
       }
     }
   );

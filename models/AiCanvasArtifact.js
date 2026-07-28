@@ -125,6 +125,18 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   promptSystem: { type: String, default: null },
   promptUser:   { type: String, default: null },
   promptImages: { type: [mongoose.Schema.Types.Mixed], default: [] },
+
+  // The ACTUAL system/user prompt sent to the HTML Generator
+  // (aiCanvasHtmlGeneratorService's buildPrompt/buildPromptV2) — distinct
+  // from promptSystem/promptUser above, which belong to the JSON
+  // Generator's own (different, sometimes skipped) LLM call. Under
+  // AI_LAYOUT_DIRECT_HTML those legacy fields are null; even when
+  // populated they don't reflect what actually produced outputHtml.
+  // Overwritten on every HTML Gen run (including operator regenerate
+  // with a raw prompt override), so this always matches the CURRENT
+  // outputHtml.
+  htmlPromptSystem: { type: String, default: null },
+  htmlPromptUser:   { type: String, default: null },
   rawResponse:  { type: mongoose.Schema.Types.Mixed },
 
   // What the LLM declared about its own pick. elements_used /

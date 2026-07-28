@@ -127,7 +127,12 @@ app.use(passport.session());
 app.use('/auth', authRoutes);
 
 // ── Protected API routes ─────────────────────────────────────────────────────
-app.use(express.json());
+// Raised from Express's 100kb default — the ad regenerate-with-prompt-
+// override flow (routes/ads.js POST /:id/regenerate) accepts up to a
+// 40,000-char system + 40,000-char user prompt, which in JSON-escaped form
+// can exceed 100kb before that route's own friendlier length check ever
+// runs, surfacing an opaque body-parser 413 instead.
+app.use(express.json({ limit: '2mb' }));
 app.use('/api/upload', requireAuth, uploadRoutes);
 app.use('/api/jobs', requireAuth, jobRoutes);
 app.use('/api/detect', requireAuth, detectRoutes);
