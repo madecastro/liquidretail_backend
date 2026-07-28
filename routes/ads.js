@@ -322,7 +322,17 @@ router.post('/generate', async (req, res) => {
           return;
         }
 
-        adIds = await selectAdsForRun({ campaignId, limit: MAX_CREATIVES_PER_RUN });
+        // Scoped to the products the operator actually picked. Unscoped, this
+        // renders the campaign's OLDEST queued ads (see selectAdsForRun), so a
+        // Generate for one Pelagic product spent most of a 20-slot run on
+        // leftovers from earlier sessions for other products.
+        // POST /api/ads/runs below stays unscoped on purpose — draining
+        // whole-campaign inventory is that endpoint's entire job.
+        adIds = await selectAdsForRun({
+          campaignId,
+          limit: MAX_CREATIVES_PER_RUN,
+          productIds
+        });
         if (!adIds.length) {
           await CampaignRun.updateOne(
             { _id: run._id },
@@ -505,9 +515,21 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   let cancelled = false;
 
   await new Promise((resolve) => {
-    const dispatch = () => {
-      // Refresh the cancel flag (non-throwing) before claiming more work.
-      progressRun.checkpoint().catch(() => { cancelled = true; });
+    // AWAITED, not fire-and-forget. checkpoint() is async (it reads
+    // cancelRequested from Mongo) and signals cancellation by THROWING, so
+    // `.catch(() => cancelled = true)` could only ever run on a later
+    // microtask. The synchronous while-loop below therefore ran first with a
+    // stale `cancelled === false` and claimed a whole extra wave of renders
+    // AFTER the operator pressed Stop — every one of them billable. Awaiting
+    // it costs one already-throttled read (1/s cache in progressService) per
+    // dispatch cycle and makes Stop mean stop.
+    const dispatch = async () => {
+      try {
+        await progressRun.checkpoint();
+      } catch {
+        cancelled = true;
+      }
+      if (cancelled && inflight === 0) return resolve();
       while (!cancelled && inflight < concurrency && next < queue.length) {
         const { adId, index } = queue[next++];
         inflight++;
@@ -519,27 +541,78 @@ async function runRenderLoop(run, job, adIds, renderToken) {
             inflight--;
             progressRun.tick(++done, adIds.length);
             if ((next >= queue.length || cancelled) && inflight === 0) resolve();
-            else dispatch();
+            else dispatch().catch(() => resolve());
           });
       }
       if (cancelled && inflight === 0) resolve();
     };
-    dispatch();
+    // dispatch() is async now, so an unhandled rejection here would take the
+    // process down instead of ending the batch.
+    dispatch().catch(() => resolve());
   });
 
-  // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at
-  // claim time, before the loop) go BACK to the queue — they count as
-  // skipped for this run and the next run's selectAdsForRun re-drains
-  // them. Matching on status:'rendering' is load-bearing: the old
-  // status:'queued' filter matched nothing post-claim, stranding
-  // unclaimed ads in 'rendering' forever (adversarial-review find).
-  if (cancelled && next < queue.length) {
-    const remaining = queue.slice(next).map((q) => q.adId);
-    await Ad.updateMany(
-      { _id: { $in: remaining }, status: 'rendering' },
-      { $set: { status: 'queued', updatedAt: new Date() } }
+  // STOP MEANS STOP — nothing survives to be generated later.
+  //
+  // This block used to put the unrendered ads BACK to status:'queued', which
+  // is the opposite of what pressing Stop means: selectAdsForRun re-drained
+  // them on the operator's next Generate, so cancelled work reappeared —
+  // often against a different product, because that selector filters on
+  // campaignId only and sorts oldest-first. Stopping a batch then cost money
+  // later, on ads nobody asked for twice.
+  //
+  // Now cancellation ARCHIVES instead. 'archived' is in the Ad status enum and
+  // selectAdsForRun only ever matches 'queued', so archived ads are invisible
+  // to every future run while remaining inspectable — and reversible in bulk
+  // via `node scripts/purgeQueuedAds.js --apply --restore`.
+  //
+  // Two scopes are archived, because "no more generation happens" means both:
+  //   1. this run's claimed-but-unrendered ads (status 'rendering'), and
+  //   2. the rest of the campaign's queued inventory sitting behind this run.
+  // Without (2), Stop only pauses: the backlog is still there and the next
+  // Generate press drains it.
+  //
+  // TRADE-OFF, deliberate: this empties the pool that "Generate more from this
+  // campaign" (POST /api/ads/runs) draws on, so after a Stop that button has
+  // nothing to render until the operator generates again. That is the correct
+  // reading of Stop — the alternative silently bills for cancelled work.
+  //
+  // What this CANNOT do is abort renders already in flight. A dispatched Veo
+  // call is already paid for; those finish and are kept.
+  if (cancelled) {
+    let archivedThisRun = 0;
+    if (next < queue.length) {
+      const remaining = queue.slice(next).map((q) => q.adId);
+      const r = await Ad.updateMany(
+        { _id: { $in: remaining }, status: 'rendering' },
+        { $set: { status: 'archived', updatedAt: new Date() } }
+      ).catch(() => null);
+      archivedThisRun = r?.modifiedCount || 0;
+      await CampaignRun.updateOne(
+        { _id: run._id },
+        { $inc: { skipped: remaining.length } }
+      ).catch(() => {});
+    }
+
+    // The backlog behind this run.
+    const backlog = await Ad.updateMany(
+      { campaignId: job.campaignId, status: 'queued' },
+      { $set: { status: 'archived', updatedAt: new Date() } }
+    ).catch(() => null);
+    const archivedBacklog = backlog?.modifiedCount || 0;
+
+    console.log(
+      `🛑 [campaignRun ${run.runId}] stopped by operator — archived ` +
+      `${archivedThisRun} unrendered from this batch + ${archivedBacklog} queued in the campaign; ` +
+      `${inflight} render(s) were already in flight and were allowed to finish`
+    );
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      { $push: { errors: {
+          index: -1,
+          stage: 'cancel',
+          message: `Stopped by operator — ${archivedThisRun + archivedBacklog} pending ad(s) archived, not re-queued`
+      } } }
     ).catch(() => {});
-    await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
   }
 
   await CampaignRun.updateOne(
