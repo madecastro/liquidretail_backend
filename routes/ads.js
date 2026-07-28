@@ -538,15 +538,21 @@ router.post('/runs', express.json(), async (req, res) => {
 // poller can show real-time progress.
 async function runRenderLoop(run, job, adIds, renderToken) {
   const t0 = Date.now();
-  // Veo calls are expensive and quota-limited — serialize them by default.
-  // Derive from the actual ads (not job.platformFormat) so mixed / non-reels
-  // veo batches still get VEO_CONCURRENCY.
-  const veoCount    = await Ad.countDocuments({ _id: { $in: adIds }, renderRoute: 'veo' });
-  const isVeoRun    = veoCount > 0;
-  const concurrency = isVeoRun ? VEO_CONCURRENCY : RENDER_CONCURRENCY;
+  // Partition the batch by renderRoute so veo (quota-limited) and image
+  // (cheap, parallelizable) render in independent pools. A single mixed
+  // batch used to fall back to VEO_CONCURRENCY for ALL ads because "any
+  // veo ad ⇒ serialize everything" — which meant a 20-min Grok poll
+  // starved 3 image ads that could have finished in <1 min. Two pools
+  // dispatched via Promise.all restores parallelism.
+  const routes = await Ad.find({ _id: { $in: adIds } }).select('_id renderRoute').lean();
+  const routeById = new Map(routes.map((r) => [String(r._id), r.renderRoute || null]));
+  const veoIds   = adIds.filter((id) => routeById.get(String(id)) === 'veo');
+  const otherIds = adIds.filter((id) => routeById.get(String(id)) !== 'veo');
+  const isVeoRun = veoIds.length > 0;
   console.log(
     `🚀 [campaignRun ${run.runId}] start — ${adIds.length} ad(s) ` +
-    `concurrency=${concurrency}${isVeoRun ? ' (veo)' : ''} brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
+    `concurrency=veo:${VEO_CONCURRENCY}(${veoIds.length}) image:${RENDER_CONCURRENCY}(${otherIds.length}) ` +
+    `brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
   );
 
   // Register with the in-flight registry so the SIGTERM handler can report
@@ -564,55 +570,58 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     advertiserId: brandDoc?.advertiserId,
     brandId: job.brandId,
     total: adIds.length,
-    label: isVeoRun ? 'Video ad generation' : 'Ad generation',
+    // Label reflects the mix — mostly for the ActivityDock header.
+    label: isVeoRun && otherIds.length ? 'Ad generation (mixed)'
+         : isVeoRun ? 'Video ad generation'
+         : 'Ad generation',
   });
   progressRun.stage('rendering');
 
-  const queue = adIds.map((adId, i) => ({ adId, index: i }));
-  let inflight = 0;
-  let next     = 0;
-  let done     = 0;
+  // Preserve stable "position in batch" via the shared adIds order — the
+  // index gets stamped into CampaignRun.errors[] rows and log lines. Each
+  // pool consumes its own slice but keeps the original index.
+  const indexOf = new Map(adIds.map((id, i) => [String(id), i]));
+  let done      = 0;
   let cancelled = false;
+  // Each pool tracks its own remaining-work cursor so the cancel path
+  // can requeue precisely what it didn't reach.
+  const pools = [
+    { name: 'veo',   concurrency: VEO_CONCURRENCY,    queue: veoIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })),   next: 0, inflight: 0 },
+    { name: 'image', concurrency: RENDER_CONCURRENCY, queue: otherIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })), next: 0, inflight: 0 }
+  ].filter((p) => p.queue.length > 0);
 
-  await new Promise((resolve) => {
+  await Promise.all(pools.map((pool) => new Promise((resolve) => {
     const dispatch = () => {
       // Refresh the cancel flag (non-throwing) before claiming more work.
       progressRun.checkpoint().catch(() => { cancelled = true; });
-      while (!cancelled && inflight < concurrency && next < queue.length) {
-        const { adId, index } = queue[next++];
-        inflight++;
+      while (!cancelled && pool.inflight < pool.concurrency && pool.next < pool.queue.length) {
+        const { adId, index } = pool.queue[pool.next++];
+        pool.inflight++;
         renderOne(run, job, adId, index, renderToken)
           .catch(err => {
-            console.error(`❌ [campaignRun ${run.runId}] #${index} dispatch crash:`, err.message || err);
+            console.error(`❌ [campaignRun ${run.runId}] #${index} (${pool.name}) dispatch crash:`, err.message || err);
           })
           .finally(() => {
-            inflight--;
+            pool.inflight--;
             progressRun.tick(++done, adIds.length);
             inFlight.progress(run.runId, done);
-            // Liveness heartbeat for the reaper. Ads are bulk-claimed with a
-            // single updatedAt stamp before the loop, but a serialized video
-            // batch runs ~1 min/ad — so ads late in a 20-ad queue would sit
-            // 'rendering' with a 15-min-old timestamp while perfectly
-            // healthy, and worker.js's reaper would flip them back to
-            // 'queued' MID-RUN. renderOne renders by id with no status
-            // check, so a concurrent "Generate more" could then select the
-            // same ad into a second run: two billable video submits for one
-            // ad. Refreshing on every completion (~1/min here) means the
-            // reaper only ever sees ads whose loop has genuinely stopped.
-            // Scoped to status:'rendering' so it never resurrects ads the
-            // cancel path already re-queued.
+            // Liveness heartbeat for the reaper — see the comment on the
+            // pre-partition version for why we refresh updatedAt on every
+            // completion instead of just at claim time. Scoped to
+            // status:'rendering' so it never resurrects ads the cancel
+            // path already re-queued.
             Ad.updateMany(
               { _id: { $in: adIds }, status: 'rendering' },
               { $set: { updatedAt: new Date() } }
             ).catch(() => {});
-            if ((next >= queue.length || cancelled) && inflight === 0) resolve();
+            if ((pool.next >= pool.queue.length || cancelled) && pool.inflight === 0) resolve();
             else dispatch();
           });
       }
-      if (cancelled && inflight === 0) resolve();
+      if (cancelled && pool.inflight === 0) resolve();
     };
     dispatch();
-  });
+  })));
 
   // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at
   // claim time, before the loop) go BACK to the queue — they count as
@@ -620,13 +629,16 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // them. Matching on status:'rendering' is load-bearing: the old
   // status:'queued' filter matched nothing post-claim, stranding
   // unclaimed ads in 'rendering' forever (adversarial-review find).
-  if (cancelled && next < queue.length) {
-    const remaining = queue.slice(next).map((q) => q.adId);
-    await Ad.updateMany(
-      { _id: { $in: remaining }, status: 'rendering' },
-      { $set: { status: 'queued', updatedAt: new Date() } }
-    ).catch(() => {});
-    await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
+  // With two pools we requeue the untouched tail of each.
+  if (cancelled) {
+    const remaining = pools.flatMap((p) => p.queue.slice(p.next).map((q) => q.adId));
+    if (remaining.length) {
+      await Ad.updateMany(
+        { _id: { $in: remaining }, status: 'rendering' },
+        { $set: { status: 'queued', updatedAt: new Date() } }
+      ).catch(() => {});
+      await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
+    }
   }
 
   await CampaignRun.updateOne(
