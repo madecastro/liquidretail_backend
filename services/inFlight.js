@@ -46,14 +46,19 @@ function snapshot() {
   let veoRuns = 0;
   let oldest = 0;
   const lines = [];
+  const runIds = [];
   for (const [runId, r] of runs) {
     const left = Math.max(0, r.total - r.done);
     adsRemaining += left;
     if (r.veo) veoRuns++;
     oldest = Math.max(oldest, now - r.startedAt);
     lines.push(`${runId} ${r.done}/${r.total}${r.veo ? ' veo' : ''} brand=${r.brandId || '-'} age=${Math.round((now - r.startedAt) / 1000)}s`);
+    // Included so the shutdown/crash handler can scope the requeue +
+    // errors[] stamp to exactly the runs THIS process was working on,
+    // instead of a global "any rendering ad" sweep.
+    runIds.push(runId);
   }
-  return { runCount: runs.size, adsRemaining, veoRuns, oldestAgeMs: oldest, lines };
+  return { runCount: runs.size, adsRemaining, veoRuns, oldestAgeMs: oldest, lines, runIds };
 }
 
 module.exports = { track, progress, untrack, snapshot };
