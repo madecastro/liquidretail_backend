@@ -26,6 +26,11 @@ const axios = require('axios');
 const sharp = require('sharp');
 
 const Media                     = require('../models/Media');
+// Required for the charge-point veoPredictionId write in generateForAd. NOTE this file
+// previously had no Ad import at all — `node --check` passes on an undefined identifier,
+// so the missing require would only have surfaced as a runtime ReferenceError on the
+// first real video generation, inside the very guard meant to protect spend.
+const Ad                        = require('../models/Ad');
 const Brand                     = require('../models/Brand');
 const Campaign                  = require('../models/Campaign');
 const CatalogProduct            = require('../models/CatalogProduct');
@@ -43,29 +48,42 @@ const { buildLayoutInput }   = require('./layoutInputService');
 // switch + model/resolution/skip-threshold are all env-tunable.
 // Ported from ReachSocialLLMExpander runSafeZoneReframe (uncrop-v1 ladder).
 const REFRAME_ENABLED = () => String(process.env.REFRAME_ENABLED ?? 'true').toLowerCase() !== 'false';
-// Model tier: '-developer' is a BILLING variant, not a quality tier. Verified
-// against the live Atlas catalogue (2026-07-24): it carries the same
-// price.origin.base_price ($0.08) as plain /edit and differs only by a 50%
-// discount factor; `profile` text is verbatim identical and the readmes are
-// byte-identical. The same pattern holds across all 12 '-developer' variants,
-// while a genuine quality up-tier (nano-banana-pro/edit-ultra) gets its own
-// higher list price. Distillation is the separate '-lite' axis, which composes
-// independently. So: half price, no evidenced fidelity cost.
+// Model tier: for THIS model ('google/nano-banana-2/edit') '-developer' is a BILLING
+// variant, not a quality tier. Verified against the live Atlas catalogue
+// (2026-07-24): it carries the same price.origin.base_price ($0.08) as plain /edit
+// and differs only by a 50% discount factor; `profile` text is verbatim identical
+// and the readmes are byte-identical. A genuine quality up-tier
+// (nano-banana-pro/edit-ultra) gets its own higher list price. Distillation is the
+// separate '-lite' axis, which composes independently. So here: half price, no
+// evidenced fidelity cost.
+//
+// CORRECTION 2026-07-29 — this comment used to claim "the same pattern holds across
+// all 12 '-developer' variants". That generalisation is FALSE. Diffed live for
+// gemini-omni-flash/image-to-video: plain vs '-developer' differ in input shape
+// (`image` single string vs `images[]` 1-7), duration (range 3-10 vs enum 4/6/8/10),
+// resolution (720p ONLY vs 720p/1080p/4k), `thinking_level` (present vs ABSENT), and
+// the pricing formula itself. Never assume the suffix is cosmetic — diff the two
+// schemas for the specific slug. See docs/ATLAS.md §8.
 const REFRAME_OUTPAINT_MODEL = () => process.env.REFRAME_OUTPAINT_MODEL || 'google/nano-banana-2/edit-developer';
 // 1k is the schema default for both variants (enum 1k|2k|4k). Deliberately NOT
 // 4k: no Atlas model exposes a mask or pixel-passthrough, so the whole canvas
 // is re-synthesised every call — at 4k the decoder must commit to letterforms
 // and logo strokes it can only guess, which is the artifact we were seeing.
-// And the reframed reference is never consumed at 4k anyway: it feeds a 720p
-// video render (~9x area downsample). Raise ATLAS_VIDEO_RESOLUTION, not this,
-// if you want more resolution where viewers actually see it.
+// And the reframed reference is heavily downsampled by the video render anyway.
+// Raise ATLAS_VIDEO_RESOLUTION, not this, for resolution viewers actually see.
 // 4k per operator decision (2026-07-24) after reviewing 20 live generations
 // side by side: at 4k the conservative 'reframe' prompt held product geometry
 // better than 1k did, and the reframed reference is surfaced at full size in
-// the generation inspector. Note the video render itself is 720p by default
-// (ATLAS_VIDEO_RESOLUTION), so 4k benefits inspection rather than the finished
-// ad — and the readme prices 4k at 2x, hence REFRAME_COST_USD below. Schema
-// enum is 1k|2k|4k; 4k is the maximum offered.
+// the generation inspector. The readme prices 4k at 2x, hence REFRAME_COST_USD
+// below. Schema enum is 1k|2k|4k; 4k is the MAXIMUM offered — there is no higher
+// tier to raise this to.
+// UPDATED 2026-07-29: ATLAS_VIDEO_RESOLUTION is now 1080p (it is the same price as
+// 720p — see config/defaults.env), so the downsample from a 4k reference is ~4x
+// area rather than ~9x. That makes the operator's 4k choice MORE justified than
+// when it was made, not less: more of the fidelity now survives into the finished
+// ad instead of only into the inspector.
+// Worth knowing if 4k is ever revisited: the readme prices 1k and 2k IDENTICALLY
+// ($0.08), so 2k is a free upgrade over 1k, while 4k alone costs 2x ($0.16).
 const REFRAME_RESOLUTION = () => process.env.REFRAME_RESOLUTION || '4k';
 // 'reframe' (conservative, default) | 'uncrop' (scene-revealing, riskier on
 // product imagery). See reframeOutpaintPrompt for the measured tradeoff.
@@ -489,7 +507,17 @@ function resolveAspectRatioForModel(requested, caps) {
 function omniFamilyNativeFor(requestedAspect) {
   const r = aspectToNumeric(requestedAspect);
   if (r == null) return null;
-  if (Math.abs(r - 1) < 0.01) return null;   // square — no clean Omni family
+  if (Math.abs(r - 1) < 0.01) {
+    // Square via Omni (owner decision 2026-07-29, flipped after side-testing). The "44% crop
+    // drops too much subject" objection above predates the face-safe base-plate crop
+    // (services/basePlateCropService.js): 1:1 now renders at Omni 9:16 and titling crops it
+    // face-anchored — crown may be sacrificed up to FACE_TOP_CROP_ALLOWANCE_FRAC, forehead never
+    // (faceSafeCrop.js). When detection finds no head, BasePlate's centre crop is the accepted
+    // fallback. Env off-switch restores the Grok fallback for square only.
+    return String(process.env.SQUARE_VIA_OMNI_CROP ?? 'true').toLowerCase() !== 'false'
+      ? '9:16'
+      : null;
+  }
   return r < 1 ? '9:16' : '16:9';
 }
 
@@ -753,7 +781,11 @@ async function submitImageGeneration({ model, images, prompt, aspectRatio, resol
     { model, images, prompt, aspect_ratio: aspectRatio, resolution },
     {
       headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json' },
-      timeout: 60000
+      timeout: 60000,
+      // See the same guard on the video submit: axios's default maxRedirects of 5
+      // re-sends the body on a 307/308, double-charging inside one call. This path
+      // already refuses to retry; that promise is void unless redirects are off too.
+      maxRedirects: 0
     }
   );
   const id = res.data?.data?.id;
@@ -1887,7 +1919,124 @@ function isRateLimit(summary) {
   if (!summary) return false;
   if (summary.status === 429) return true;
   const body = String(summary.body || summary.message || '').toLowerCase();
-  return /(\bcode\b\s*[:=]\s*429|\bstatus\b\s*[:=]\s*429|http status code:\s*429|rate[- ]?limit|too many requests)/i.test(body);
+  // Same `(?!\d)` digit-boundary guard as isDefinite429 below — `code: 42901` is
+  // not a 429. Harmless here (a mis-read only lengthens a poll backoff, and polls
+  // are free to retry) but wrong is wrong, and the two predicates should not
+  // disagree about what the word "429" means.
+  return /(\bcode\b"?\s*[:=]\s*429(?!\d)|\bstatus\b"?\s*[:=]\s*429(?!\d)|http status code:\s*429(?!\d)|rate[- ]?limit|too many requests)/i.test(body);
+}
+
+// STRICTER sibling of isRateLimit, for the BILLABLE submit path only.
+//
+// isRateLimit is correct for polling, where a retry is free — so it casts wide,
+// including the bare phrases "rate limit" / "too many requests" matched against
+// JSON.stringify(<arbitrary envelope>).slice(0, 400). On a submit a retry is a
+// second POST, so inference from a loose substring is the wrong evidence bar:
+// we retry only on a STRUCTURED 429 signal, which is positive proof the request
+// was rejected upstream before any generation began (and therefore unbilled).
+//
+// Deliberately NOT matched here: bare "rate limit"/"too many requests" prose. A
+// 5xx from an unrelated cause whose envelope merely contains those words would
+// otherwise be replayed. Cost of being wrong is asymmetric — a declined submit
+// is a retryable ad, a duplicated submit is money already spent.
+//
+// Client-side failures (ECONNRESET, "timeout of 60000ms exceeded") match neither
+// this nor isRateLimit, so they still throw on the first attempt. That is the
+// correct call: a timed-out POST may well have landed server-side, and there is
+// no prediction id to reconcile against.
+// Two details here are load-bearing, NOT decoration. Both were caught by tests
+// after adversarial review; keep them if this regex is ever edited.
+//
+// 1. `(?!\d)` after each 429. Without it `code: 42901`, `status: 42917` and
+//    `http status code: 42999` all match — any longer integer merely PREFIXED by
+//    429. A validation error carrying such a field id would read as a definite
+//    rate-limit and get replayed: a second billable POST for an error that had
+//    nothing to do with rate limiting.
+// 2. `"?` before the separator. The documented Atlas envelope embeds JSON —
+//    `{"error":"unexpected http status code: 429, body: {\"code\":429,...}"}` —
+//    and `\bcode\b\s*[:=]` cannot match `"code":429`, because the quote sits
+//    between the key and the colon. That envelope only matched at all via the
+//    `http status code: 429` alternative; a body carrying ONLY the JSON marker
+//    would have been misread as "not a rate limit". Safe direction (fail rather
+//    than double-bill) but wrong, so it is fixed rather than tolerated.
+function isDefinite429(summary) {
+  if (!summary) return false;
+  if (summary.status === 429) return true;
+  const body = String(summary.body || summary.message || '');
+  return /(\bcode\b"?\s*[:=]\s*429(?!\d)|\bstatus\b"?\s*[:=]\s*429(?!\d)|http status code:\s*429(?!\d))/i.test(body);
+}
+
+/**
+ * The whole replay decision for a failed billable submit, as ONE pure function.
+ *
+ * Extracted from the catch block so the money-critical choice is unit-testable
+ * without mocking axios — scripts/verifySubmitGuard.js drives this directly. The
+ * catch block must contain no replay logic of its own; if a case is missing, add
+ * it HERE so the harness covers it.
+ *
+ * Returns one of:
+ *   'retry'            — proven 429 and attempts remain: safe to POST again
+ *   'throw-429'        — proven 429 but attempts exhausted
+ *   'throw-maybe-429'  — looks rate-limited but unproven: deliberately NOT replayed
+ *   'throw-other'      — anything else, including timeouts and resets
+ */
+function submitRetryDecision(summary, attempt, maxAttempts) {
+  if (isDefinite429(summary)) {
+    return attempt < maxAttempts ? 'retry' : 'throw-429';
+  }
+  if (isRateLimit(summary)) return 'throw-maybe-429';
+  return 'throw-other';
+}
+
+// ── Per-model submit pacing ───────────────────────────────────────────
+//
+// Atlas rate limits are per (team, model) RPS and some models are 1 RPS. Firing
+// N same-model submits at once bursts past that and all-but-one fail server-side
+// — which is exactly the condition the submit retry below was added to absorb.
+// Pacing PREVENTS the collision instead of reacting to it: same-model submits are
+// serialized and spaced >= SUBMIT_SPACING_MS apart (start-to-start), while
+// different models run in parallel as independent buckets.
+//
+// This only ever DELAYS the single POST a task makes — it never retries one.
+// Ported from reach-social-llm-expander src/lib/atlas.ts:69-99; keep the two in
+// step, the reasoning is identical.
+//
+// SINGLE-PROCESS ASSUMPTION, and it matters: this gate is in-memory, so two web
+// instances keep two independent gates and the effective rate doubles. It is a
+// real improvement within one process and NOT a global limiter. It becomes
+// globally true once rendering moves to the single-instance worker (see
+// ARCHITECTURE_REVIEW.md "The render-queue architecture problem"); until then
+// VEO_CONCURRENCY per-process remains the weak link (routes/ads.js:144).
+const SUBMIT_SPACING_MS = (() => {
+  const n = Number(process.env.ATLAS_SUBMIT_SPACING_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 1200;
+})();
+
+const _modelSubmitGate = new Map();
+const _modelLastSubmitAt = new Map();
+
+/** Run `fn` serialized + rate-spaced against other submits for the SAME model, process-wide. */
+function pacedModelSubmit(model, fn) {
+  const run = async () => {
+    if (SUBMIT_SPACING_MS > 0) {
+      const last = _modelLastSubmitAt.get(model);
+      const wait = last == null ? 0 : last + SUBMIT_SPACING_MS - Date.now();
+      if (wait > 0) {
+        console.log(`   ⏱️  atlasVideo: pacing submit for ${model} — waiting ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
+    // Stamp BEFORE the call so spacing is start-to-start: a slow submit must not
+    // let the next one fire the instant it returns.
+    _modelLastSubmitAt.set(model, Date.now());
+    return fn();
+  };
+  // Chain after the previous submit for this model to serialize the bucket. The
+  // stored tail swallows the outcome so one failure never wedges the chain, while
+  // the caller still sees `next` reject.
+  const next = (_modelSubmitGate.get(model) || Promise.resolve()).then(run);
+  _modelSubmitGate.set(model, next.then(() => undefined, () => undefined));
+  return next;
 }
 
 async function pollPrediction(predictionId, { shouldCancel = null } = {}) {
@@ -2106,46 +2255,74 @@ async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, v
 
 
 
-  // Bounded rate-limit retry — same isRateLimit detection + RATE_LIMIT_BACKOFF_MS
-  // schedule as pollPrediction. Under VEO_CONCURRENCY > 1 the provider 429s
-  // (sometimes wrapped in an Atlas 500) on submit; without this the ad fails
-  // before any prediction id exists. Non-rate-limit errors still throw
-  // immediately. Cap of 4 attempts (1 initial + 3 backoffs).
+  // Bounded retry on a STRUCTURED 429 only — see isDefinite429. Pacing above
+  // (pacedModelSubmit) is the primary defence: it spaces same-model submits so the
+  // per-(team,model) RPS ceiling is not breached in the first place. This retry is
+  // the residual safety net for a 429 we did not manage to avoid, and it fires only
+  // when the response proves the request was rejected before any generation began.
+  //
+  // Everything else — client timeouts, connection resets, 5xx with no explicit 429
+  // marker, loose "rate limit" prose — throws on the first attempt. A POST that may
+  // have landed is NEVER replayed: there is no prediction id to reconcile against,
+  // so a replay risks paying twice for one ad.
+  // Cap of 4 attempts (1 initial + 3 backoffs).
   const maxAttempts = 4;
   let consecutiveRateLimits = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await axios.post(
+      const res = await pacedModelSubmit(model, () => axios.post(
         `${BASE_URL}/model/generateVideo`,
         body,
         {
           headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json' },
-          timeout: 60000
+          timeout: 60000,
+          // maxRedirects: 0 — axios defaults to 5 and RE-SENDS the request body on a
+          // 307/308, which on a billable endpoint is a silent double submit inside a
+          // single call (invisible to the retry logic below, which never sees it). A
+          // generation endpoint has no legitimate reason to redirect, so treat any 3xx
+          // as an error: axios then rejects, the catch runs, no 429 marker matches, and
+          // we surface it instead of paying twice.
+          maxRedirects: 0
         }
-      );
+      ));
       const predictionId = res.data?.data?.id;
       if (!predictionId) throw new Error(`atlasVideo: no prediction id in response: ${JSON.stringify(res.data).slice(0, 300)}`);
       return predictionId;
     } catch (err) {
       // "no prediction id" is a successful HTTP response with a bad body —
-      // not a rate-limit; rethrow immediately.
+      // not a rate-limit; rethrow immediately. NB this is also the one case where
+      // a billable generation may exist without us holding its id.
       if (err.message && err.message.startsWith('atlasVideo: no prediction id')) throw err;
 
       const summary = summarizeAxiosError(err);
-      if (isRateLimit(summary) && attempt < maxAttempts) {
+      const decision = submitRetryDecision(summary, attempt, maxAttempts);
+      if (decision === 'retry') {
         consecutiveRateLimits++;
         const backoffMs = RATE_LIMIT_BACKOFF_MS[Math.min(consecutiveRateLimits - 1, RATE_LIMIT_BACKOFF_MS.length - 1)];
         console.warn(
           `   ⏳ atlasVideo: submit rate-limited ` +
           `(hit #${consecutiveRateLimits}, attempt ${attempt}/${maxAttempts}, backing off ${backoffMs / 1000}s): ${summary.body || summary.message}`
         );
+        // NOTE: after this sleep the retry re-enters pacedModelSubmit and therefore
+        // joins the BACK of the model's queue — pacing wait stacks on top of the
+        // backoff. Bounded by maxAttempts, but a deep same-model backlog makes the
+        // submit phase noticeably slower than backoff alone suggests. Accepted:
+        // arriving late beats arriving twice.
         await new Promise(r => setTimeout(r, backoffMs));
         continue;
       }
-      // Exhausted retries, or a non-rate-limit error — surface immediately.
-      if (isRateLimit(summary)) {
+      // Exhausted retries on a proven 429 — distinct message so the two cases stay
+      // legible in the logs.
+      if (decision === 'throw-429') {
         throw new Error(
           `atlasVideo: submit rate-limited after ${maxAttempts} attempts: ${summary.body || summary.message}`
+        );
+      }
+      // Rate-limit-ISH but without structured proof: not replayed by design.
+      if (decision === 'throw-maybe-429') {
+        throw new Error(
+          `atlasVideo: submit failed with a possible rate-limit but no explicit 429 marker — ` +
+          `not retried (a replay could double-bill): ${summary.body || summary.message}`
         );
       }
       const status = summary.status;
@@ -2406,9 +2583,61 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     ? (buildVideoSegmentUrl(media.fileUrl, aspectRatio, durationSec) || media.fileUrl)
     : null;
 
+  // Resolution the submission body will actually request — computed BEFORE the submit
+  // because the cost estimate is now ledgered at the charge point, not on success.
+  const renderResolution = String(caps.paramShape || '').startsWith('gemini-omni')
+    ? (process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p')
+    : (caps.defaultResolution || '720p');
+  const costUsd = estimateRenderCostUsd({ model, durationSec, resolution: renderResolution });
+
   const t0 = Date.now();
   const predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
+  const submitMs = Date.now() - t0;
   console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
+
+  // ── CHARGE POINT ──────────────────────────────────────────────────────────
+  // The submit returned an id, so the provider has accepted a billable job. Money is
+  // committed HERE, whatever happens to the poll, the download, or the Cloudinary
+  // mirror. Both writes below therefore happen now rather than at the end:
+  //
+  //   1. veoPredictionId — the spend receipt. Without it a crash mid-poll loses the
+  //      only handle to work we have paid for, and the reaper re-queues the ad into a
+  //      second submit. See models/Ad.js for the full reasoning.
+  //   2. the CostLog row — previously written only after poll + download + upload
+  //      succeeded, so a timeout or a failed upload spent ~$1.00 and recorded $0.
+  //
+  // ONE row per billable submit, deliberately. Outcome lives on the Ad (status,
+  // renderUrl); CostLog records SPEND, and spend happened. The trade-off is that
+  // durationMs here is submit latency rather than end-to-end render time — the full
+  // elapsed time is logged on completion below instead of creating a second row that
+  // would double-count the charge.
+  //
+  // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
+  // generation post-payment, because the caller would then never store videoUrl and a
+  // retry would double-bill.
+  try {
+    await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
+  } catch (err) {
+    console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
+  }
+  try {
+    await recordFlatCost({
+      stage:      'atlas_video_render',
+      provider:   'atlas',
+      model,
+      purposeTag: caps.paramShape,
+      brandId:    media.brandId || null,
+      campaignId: ad.campaignId || null,
+      adId:       ad._id || null,
+      mediaId:    media._id || null,
+      productId:  ad.productId || null,
+      costUsd:    costUsd || 0,
+      durationMs: submitMs,
+      status:     'submitted'
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
+  }
 
   const remoteVideoUrl = await pollPrediction(predictionId);
   const videoBuffer = await downloadToBuffer(remoteVideoUrl);
@@ -2441,39 +2670,15 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
 
   const elapsedMs = Date.now() - t0;
 
-  // Cost telemetry — flat per-render estimate from the registry's
-  // pricing entry, mirroring the duration/resolution the submission
-  // body requested. Lands in CostLog alongside the pipeline's LLM
-  // entries so per-brand/per-campaign rollups include video spend.
-  const renderResolution = String(caps.paramShape || '').startsWith('gemini-omni')
-    ? (process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p')
-    : (caps.defaultResolution || '720p');
-  const costUsd = estimateRenderCostUsd({
-    model,
-    durationSec,
-    resolution:  renderResolution
-  });
-  // Non-fatal: render + Cloudinary mirror already succeeded. A telemetry
-  // rejection here must not fail generateForAd post-payment — the caller
-  // would never store videoUrl, and a retry would double-bill the provider.
-  try {
-    await recordFlatCost({
-      stage:      'atlas_video_render',
-      provider:   'atlas',
-      model,
-      purposeTag: caps.paramShape,
-      brandId:    media.brandId || null,
-      campaignId: ad.campaignId || null,
-      adId:       ad._id || null,
-      mediaId:    media._id || null,
-      productId:  ad.productId || null,
-      costUsd:    costUsd || 0,
-      durationMs: elapsedMs
-    });
-  } catch (err) {
-    console.warn('⚠️ atlasVideo cost telemetry failed (non-fatal): ' + err.message);
-  }
-
+  // NO cost record here. The charge was ledgered at the CHARGE POINT above, right after
+  // the submit returned a prediction id. Writing a second row on success would
+  // double-count every completed render, and — worse — would restore the original bug
+  // by implication: that spend is only real once the whole chain succeeds. It isn't.
+  // The provider bills the submit. Everything after it is delivery.
+  //
+  // End-to-end timing therefore lives in this log line rather than CostLog.durationMs
+  // (which holds submit latency). If per-render duration is ever needed in reports,
+  // update the existing row by adId + predictionId — do not create a new one.
   console.log(
     `🎬 atlasVideo[ad=${ad._id}]: done — model=${model} aspect=${aspectRatio} ` +
     `took=${Math.round(elapsedMs / 1000)}s cost≈$${(costUsd ?? 0).toFixed(2)}`
@@ -2582,5 +2787,12 @@ module.exports = {
   buildVideoSegmentUrl,
   buildReferenceImages,
   pickProductOnlyUrl,
-  buildPromptScaffold
+  buildPromptScaffold,
+  // Billable-submit replay guard. Exported for scripts/verifySubmitGuard.js —
+  // these decide whether a charged POST is repeated, so they are tested directly
+  // rather than through a mocked axios.
+  isRateLimit,
+  isDefinite429,
+  submitRetryDecision,
+  summarizeAxiosError
 };

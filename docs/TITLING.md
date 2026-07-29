@@ -1,12 +1,48 @@
 # Titling Engine
 
-## 1) Architecture overview
+## 0) READ FIRST — the canvas engine is DISABLED (verified 2026-07-29)
+
+**Remotion is the only titling engine that runs.** `resolveTitlingEngine`
+(`services/brandScriptExecutor.js:797-806`) returns `{ engine: 'remotion', source:
+'canvas-disabled' }` **unconditionally**. The cascade described in §1 below is the
+code at `:808-823`, which sits inside a `/* … */` block.
+
+Consequences that have already cost real time:
+
+- `TITLING_ENGINE` and `Brand.videoSettings.titlingEngine` are **not read by the
+  render path** — `resolveTitlingEngine` returns before reaching them. Every other
+  reader was grepped; the full picture is worse than "inert":
+  - `validateVideoSettings` (`atlasVideoService.js:1644`) still **accepts** `'canvas'`,
+    so it persists.
+  - `routes/brand.js:1362` and `:2308` compute
+    `videoSettings?.titlingEngine || process.env.TITLING_ENGINE || 'remotion'` and
+    return it to the SPA, which renders it as a badge
+    (`frontend/app/src/titling/TitleStudioCard.tsx:483-484`, "engine: …").
+  - So a brand with `titlingEngine: 'canvas'` shows **"engine: canvas"** in the UI
+    while every render uses remotion. The setting is not just ineffective, it is
+    **actively misreported**. Fix the badge or the resolver together — not one alone.
+- A brand's custom `styleScript*` fields do **not** take effect. `:804` logs a line
+  saying so per render.
+- Everything under `services/brandScripts/*.script.js`, `brandScriptRunner.child.js`,
+  and the `sharp.resize(fit:'cover')` calls at `brandScriptExecutor.js:387-388` and
+  `:488-489` is on the dead path. Do not plan framing/crop work against them —
+  video framing lives in `remotion/components/BasePlate.jsx:18,28` (`objectFit:
+  'cover'`).
+- **Security:** `POST /api/brand/:id/preview-script` forces `engine='canvas'` and so
+  bypasses this kill-switch — that is the only route reaching the
+  `vm.compileFunction` sandbox-escape in `brandScriptRunner.child.js:139`. See
+  `ARCHITECTURE_REVIEW.md` GEN-1.
+
+§1 is retained as a description of the cascade to restore *if* canvas is re-enabled.
+Treat it as design intent, not current behaviour.
+
+## 1) Architecture overview (the cascade AS COMMENTED OUT — not live)
 
 Dual-engine dispatch in `services/brandScriptExecutor.js`:
 
-- `resolveTitlingEngine(brand, ad)`: custom per-format script (styleScript*/styleScriptVertical etc.) forces 'canvas'; else Brand.videoSettings.titlingEngine > TITLING_ENGINE env > default **'remotion'**.
-- 'canvas' path: `renderBrandScriptAndSave` → `resolveBrandRenderer` → `renderBrandScript` (child process) → upload + Ad.renderUrl.
-- 'remotion' path: `renderWithRemotionAndSave` → `resolveSpecForBrand` + `buildBrandTokens` → `renderTitles` (services/remotionRenderService.js) → upload + Ad.renderUrl.
+- `resolveTitlingEngine(brand, ad)`: custom per-format script (styleScript*/styleScriptVertical etc.) forces 'canvas'; else Brand.videoSettings.titlingEngine > TITLING_ENGINE env > default **'remotion'**. **← NOT LIVE, see §0.**
+- 'canvas' path: `renderBrandScriptAndSave` → `resolveBrandRenderer` → `renderBrandScript` (child process) → upload + Ad.renderUrl. **← unreachable except via preview-script.**
+- 'remotion' path: `renderWithRemotionAndSave` → `resolveSpecForBrand` + `buildBrandTokens` → `renderTitles` (services/remotionRenderService.js) → upload + Ad.renderUrl. **← the only live path.**
 
 Remotion render pipeline (ad.veoVideoUrl → Ad.renderUrl):
 
@@ -96,6 +132,60 @@ Duration time-scaling: specs are authored against their own extent (max `phases[
 
 Constants exported: SLOT_KEYS, BINDABLE_META_FIELDS, TOKEN_COLOR_KEYS, FONT_ROLES, ANCHORS, ALIGNS, TRANSITIONS, SCRIMS, SHADOWS, CASINGS, FORMATS, DEFAULT_BIND, clamp.
 
+## 2b) Formats — one canonical template per format and size
+
+Four titling formats. `services/titleSpecValidator.js` `FORMATS` is the **single source
+of truth**; import it rather than re-listing (it was duplicated as a literal in five
+places in `routes/brand.js`, which is exactly how the square bug nearly shipped twice).
+
+| format | composition | canvas | platformFormats served |
+|---|---|---|---|
+| `vertical` | `CanonicalVertical` | 1080x1920 | `meta_reels_9_16`, `meta_stories_9_16` |
+| `feed` | `CanonicalFeed` | 1080x1350 | `meta_feed_4_5` |
+| `square` | `CanonicalSquare` | 1080x1080 | `meta_feed_1_1` |
+| `landscape` | `CanonicalLandscape` | 1920x1080 | `pmax_16_9` |
+
+**`square` was added 2026-07-29, and it fixed a live bug.** `classifyFormat` was a
+three-way branch ending in `return 'feed'`, so a 1:1 ad matched neither vertical nor
+landscape and fell through to `feed` — titled in `CanonicalFeed` at 1080x1350. Because
+`BasePlate` uses `objectFit:'cover'`, the square ad was centre-cropped into a 4:5 frame
+and delivered at 4:5 while its Ad row still said `aspectRatio: '1:1'`. Nothing threw.
+`meta_feed_1_1` declares `kinds: ['image','video']` and `AI_VEO_FEED=true`, so this was
+reachable, not theoretical.
+
+Square's canonical is feed's stack with **every `maxLines` clamped to 1**, which is the
+house response to a height-constrained canvas (`landscape` does the same). Budget:
+square has `1080 - 0.54*1080 - 0.06*1080` = **432px** of `lowerThird` stack room versus
+feed's **540px**. Slot coverage is otherwise identical to feed — nothing is dropped.
+Square deliberately shares feed's `styleScript` field and safe-zone padding: same 1080
+width, same surface, only the height differs.
+
+### Adding a format is EIGHT registries, not one
+
+`scripts/verifyTitlingFormats.js` (49 offline checks, no DB/network) asserts every one
+of them and fails loudly if a format is half-added. Run it after any format change.
+
+1. `services/titleSpecValidator.js` `FORMATS`
+2. `remotion/presets/canonical.json` `byFormat.<format>` — **omitting this makes
+   `titleSpecService.resolveSpec` THROW** at its guaranteed-floor step
+3. `remotion/Root.jsx` — a `<Composition>` with matching `defaultProps.format`
+4. `services/remotionRenderService.js` `COMPOSITION_BY_FORMAT`
+5. `remotion/lib/safeZones.js` `SAFE_ZONES`
+6. `remotion/components/slotRenderers.jsx` `BASE_SIZE` column **or** a
+   `SIZE_FORMAT_ALIAS` entry — miss both and `baseSize()` returns its `?? 24` default
+   for every slot, i.e. wrong output rather than a failure
+7. `services/brandScriptExecutor.js` `BRAND_SCRIPT_FIELD` + a `classifyFormat` branch
+8. `routes/brand.js` `ASPECT_BY_TITLING_FORMAT` and `DIMS_BY_FORMAT`
+
+The harness's most valuable check is **B3**: for every `PLATFORM_FORMATS` entry it
+asserts `deliveryDims`' aspect matches the composition the ad will actually render in.
+That is the assertion the original bug could not survive.
+
+Brand presets under `remotion/presets/` other than `canonical.json` are **not** required
+to carry every format — `resolveSpec` warns and falls back to canonical for a missing
+one. The six brand presets currently have no `square`, so square ads render the
+canonical square spec until authored.
+
 ## 3) Brand token pipeline
 
 `services/titleSpecService.js` `buildBrandTokens(brand, {layoutInputBrand, specFontOverrides})` → {colors, fonts}.
@@ -162,7 +252,7 @@ Threaded through `renderWithRemotionAndSave` → `renderTitles` / `renderPreview
 ## 6) Ops runbook
 
 Env vars:
-- TITLING_ENGINE=canvas|remotion (brandScriptExecutor.js) — default engine is **remotion** when unset.
+- TITLING_ENGINE=canvas|remotion (brandScriptExecutor.js) — **INERT as of 2026-07-29.** `resolveTitlingEngine` returns remotion unconditionally (`:806`) and never reads this. Kept documented because the value still persists and reads as effective. See §0.
 - REMOTION_TIMEOUT_MS (default 180000), REMOTION_BROWSER_EXECUTABLE, REMOTION_CONCURRENCY.
 - TITLE_PLATE_SCAN=basic|gemini|off (plateIntelService.js) — scan depth in **content** placement mode; `off` is a global kill switch forcing canonical placement.
 - GEMINI_API_KEY (for gemini mode).

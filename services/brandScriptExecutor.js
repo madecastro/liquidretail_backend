@@ -61,9 +61,30 @@ function isLandscapeFormat(ad) {
   return false;
 }
 
+// 1:1 (Meta Feed square). Anchored to the `_1_1` SUFFIX rather than a loose /1_1/
+// so it cannot collide with another format id that merely contains those digits.
+// Checked against the real ids: meta_feed_1_1 matches; meta_feed_4_5,
+// meta_reels_9_16, meta_stories_9_16 and pmax_16_9 do not.
+function isSquareFormat(ad) {
+  const pf = String(ad?.platformFormat || '').toLowerCase();
+  if (/_1_1$/.test(pf)) return true;
+  if (String(ad?.aspectRatio || '') === '1:1') return true;
+  return false;
+}
+
+// BUG FIXED 2026-07-29: this was a three-way branch ending in `return 'feed'`, so a
+// 1:1 ad matched neither vertical nor landscape and fell through to 'feed' — titled
+// in CanonicalFeed at 1080x1350. Since BasePlate uses objectFit:'cover', a 1:1 ad was
+// centre-cropped into a 4:5 frame and delivered at 4:5 while its Ad row said
+// aspectRatio '1:1'. meta_feed_1_1 declares kinds ['image','video'] and AI_VEO_FEED
+// is true, so this was reachable, not theoretical.
+//
+// Order matters: vertical and landscape are matched first because their patterns are
+// the more specific ones; square must precede the 'feed' fallthrough.
 function classifyFormat(ad) {
   if (isVerticalFormat(ad))  return 'vertical';
   if (isLandscapeFormat(ad)) return 'landscape';
+  if (isSquareFormat(ad))    return 'square';
   return 'feed';
 }
 
@@ -72,6 +93,10 @@ function classifyFormat(ad) {
 const BRAND_SCRIPT_FIELD = {
   vertical:  'styleScriptVertical',
   landscape: 'styleScriptLandscape',
+  // square shares feed's custom-script field and feed's canonical script: same 1080
+  // width, same surface, only the height differs. A dedicated styleScriptSquare would
+  // be one row here plus one in routes/brand.js's preview-script map.
+  square:    'styleScript',
   feed:      'styleScript'
 };
 
@@ -838,6 +863,17 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
       overwrite:    true
     });
     const set = { renderUrl: uploaded.secure_url, updatedAt: new Date() };
+    // Rebuild the poster from the TITLED upload. posterUrl was stamped pre-chrome from the raw
+    // base video (routes/ads.js), so without this a video ad's poster stays an UNCROPPED,
+    // UNTITLED 9:16 still — the wrong aspect and missing the titles — and that poster is the
+    // image Meta shows before playback. so_2 lands after the title entrances (~0.3-2s), so the
+    // still shows the ad as it actually plays. Same URL-shape trick as
+    // renderService.buildPosterFromComposite.
+    if (uploaded.secure_url.includes('/video/upload/')) {
+      set.posterUrl = uploaded.secure_url
+        .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good/')
+        .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2');
+    }
     // Persist the exact titling used for this render (generation-inspector).
     if (titlingSnapshot) set.titlingSnapshot = titlingSnapshot;
     await Ad.updateOne(
@@ -900,17 +936,45 @@ async function renderWithRemotionAndSave({ ad, brand, format }) {
   const placement = resolveTitlePlacementMode({ brand });
   console.log(`🎨 brandScript[ad=${ad._id}]: engine=remotion format=${format} spec=${source} placement=${placement} fonts=${['heading', 'body', 'quote'].map(r => `${r}:${tokens.fonts[r].family}(${tokens.fonts[r].source})`).join(' ')}`);
 
-  const result = await renderTitles({
-    videoUrl:  ad.veoVideoUrl,
-    meta,
-    spec,
-    tokens,
-    format,
-    brandName: brand?.name,
-    adId:      String(ad._id),
-    brand,
-    placementMode: placement,
-  });
+  // Face-safe base-plate crop (services/basePlateCropService.js): for a 4:5 ad the base renders
+  // at Omni's 9:16 native and BasePlate.jsx objectFit:'cover' centre-crops it blind — measured
+  // 131px of head lost on a high head. The resolver returns a liveness-probed Cloudinary c_crop
+  // derivative, or ad.veoVideoUrl unchanged on ANY gate/failure. Never throws.
+  const basePlate = await require('./basePlateCropService').resolveBasePlateVideoUrl({ ad, format });
+  const plateUrl = basePlate.videoUrl || ad.veoVideoUrl;
+
+  let result;
+  try {
+    result = await renderTitles({
+      videoUrl:  plateUrl,
+      meta,
+      spec,
+      tokens,
+      format,
+      brandName: brand?.name,
+      adId:      String(ad._id),
+      brand,
+      placementMode: placement,
+    });
+  } catch (err) {
+    // A cropped-plate failure must NEVER cost the titles: renderBrandScriptAndSave's callers
+    // treat chrome as best-effort, so an unhandled throw here ships the raw UNTITLED 9:16
+    // master as the deliverable — strictly worse than a titled-but-centre-cropped ad. Retry
+    // once with the raw plate; only a raw-plate failure propagates.
+    if (basePlate.cropped && plateUrl !== ad.veoVideoUrl) {
+      console.warn(`   ⚠️  brandScript[ad=${ad._id}]: titling failed on the cropped plate (${err.message}) — retrying once with the raw plate`);
+      result = await renderTitles({
+        videoUrl:  ad.veoVideoUrl,
+        meta, spec, tokens, format,
+        brandName: brand?.name,
+        adId:      String(ad._id),
+        brand,
+        placementMode: placement,
+      });
+    } else {
+      throw err;
+    }
+  }
   return uploadRenderAndStamp({
     ad, finalPath: result.finalPath, tempDir: result.tempDir, timings: result.timings,
     titlingSnapshot: {
@@ -919,6 +983,9 @@ async function renderWithRemotionAndSave({ ad, brand, format }) {
       spec: { source, id: spec?.id || null, version: spec?.version || null },
       placement,
       meta,
+      basePlate: basePlate.cropped
+        ? { cropped: true, rect: basePlate.rect }
+        : { cropped: false, reason: basePlate.reason || null },
       capturedAt: new Date()
     }
   });
@@ -983,4 +1050,4 @@ async function renderBrandScriptAndSave({ ad, brand }) {
   });
 }
 
-module.exports = { renderBrandScript, renderBrandScriptAndSave, buildMetaForAd, previewBrandScript, previewBrandScriptAsVideo, resolveBrandRenderer, resolveTitlingEngine, isVerticalFormat, isLandscapeFormat, classifyFormat };
+module.exports = { renderBrandScript, renderBrandScriptAndSave, buildMetaForAd, previewBrandScript, previewBrandScriptAsVideo, resolveBrandRenderer, resolveTitlingEngine, isVerticalFormat, isLandscapeFormat, isSquareFormat, classifyFormat, BRAND_SCRIPT_FIELD };
