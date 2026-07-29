@@ -101,9 +101,15 @@ scraping. Video never launches a browser.
 - **Never trust a model id or a price from memory.** `GET
   https://api.atlascloud.ai/api/v1/models` (no auth) is the catalog; each entry
   carries `schema` and `readme` **URLs** — fetch those, they are the operative
-  contract. The price field is **`price.actual.base_price`** (a string). There is no
-  `pricing` key; reading `m.pricing?.actual?.price` silently ledgers $0 —
-  `ARCHITECTURE_REVIEW.md` XREPO-1.
+  contract. The price field is **`price.actual.base_price`** (a string), and `actual`
+  is what we pay (`origin` is list). Verified live: **0 of 444** entries have a
+  `pricing` key, **444 of 444** have `price`. 123 have no `base_price` at all — those
+  are per-token LLM entries, which must be treated as "not applicable", never as free.
+  Covered by `scripts/verifyImagePricing.js` (9 offline checks, revert-proven).
+- **Ledger spend at the charge point, not the success point.** A billable submit that
+  then fails still costs money. `atlasImageService.chargedError` records it and sets
+  `err.charged`, which is the flag telling a caller that a direct-provider fallback
+  means paying twice for one asset.
 - **Never print or commit `ATLAS_API_KEY`.**
 - Same-model submits are paced by `pacedModelSubmit` (`ATLAS_SUBMIT_SPACING_MS`,
   default 1200ms). It is **in-memory**, so it is not a global limiter across web
