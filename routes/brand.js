@@ -147,6 +147,25 @@ router.get('/', async (req, res) => {
       .select('name nameNormalized logoUrl websiteUrl primaryColor fontFamily fontSource source enrichmentSources curatedFields createdAt')
       .sort({ name: 1 })
       .lean();
+
+    // Connected IG handle per brand — identity for the ad-preview
+    // placement chrome (Instagram Reels/Stories/Feed mockups) on the
+    // frontend. One batched query for the whole list rather than a
+    // lookup per brand. Best-effort: a brand with no active Instagram
+    // credential just has no handle and the UI slugs its name.
+    const igHandleByBrand = new Map();
+    try {
+      const creds = await IntegrationCredential
+        .find({ brandId: { $in: brands.map(b => b._id) }, type: 'instagram', status: 'active' })
+        .select('brandId igUsername')
+        .lean();
+      for (const c of creds) {
+        if (c.igUsername && !igHandleByBrand.has(String(c.brandId))) {
+          igHandleByBrand.set(String(c.brandId), c.igUsername);
+        }
+      }
+    } catch { /* optional enrichment — never fail the brand list over it */ }
+
     res.json({
       brands: brands.map(b => ({
         id:           String(b._id),
@@ -154,6 +173,7 @@ router.get('/', async (req, res) => {
         slug:         b.nameNormalized,
         logoUrl:      b.logoUrl || null,
         websiteUrl:   b.websiteUrl || null,
+        igHandle:     igHandleByBrand.get(String(b._id)) || null,
         primaryColor: b.primaryColor || null,
         source:       b.source,
         enrichmentSources: b.enrichmentSources || [],
