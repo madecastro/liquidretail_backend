@@ -10,6 +10,20 @@ const Campaign = require('../models/Campaign');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const { validateVideoSettings } = require('../services/atlasVideoService');
+// Single source of truth for titling format ids — was duplicated as a literal
+// ['vertical','feed','landscape'] in five places in this file, which is how adding
+// 'square' nearly shipped as a silent fall-through to 'feed'. Import it; do not
+// re-list it. Order and membership live in services/titleSpecValidator.js.
+const { FORMATS: TITLING_FORMATS } = require('../services/titleSpecValidator');
+// format id -> the aspectRatio a synthetic ad must carry for
+// brandScriptExecutor.classifyFormat to classify it back to that same format.
+// Every entry here MUST round-trip; scripts/verifyTitlingFormats.js asserts it.
+const ASPECT_BY_TITLING_FORMAT = {
+  vertical:  '9:16',
+  feed:      '4:5',
+  square:    '1:1',
+  landscape: '16:9'
+};
 
 // ── Preview plate resolver ─────────────────────────────────────────
 //
@@ -961,7 +975,7 @@ router.post('/:id/title-still', express.json({ limit: '1mb' }), async (req, res)
     if (!brand) return res.status(404).json({ error: 'brand not found' });
 
     const rawFormat = String(req.body?.format || 'vertical').toLowerCase();
-    if (!['vertical', 'feed', 'landscape'].includes(rawFormat)) {
+    if (!TITLING_FORMATS.includes(rawFormat)) {
       return res.status(400).json({ error: `unknown format '${rawFormat}'` });
     }
 
@@ -1100,10 +1114,14 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
     const bodyScript = req.body?.script ? String(req.body.script).trim() : null;
     const bodyTheme  = req.body?.theme && typeof req.body.theme === 'object' ? req.body.theme : null;
     const rawFormat  = String(req.body?.format || '').toLowerCase();
-    const format     = ['vertical', 'landscape', 'feed'].includes(rawFormat) ? rawFormat : 'feed';
+    const format     = TITLING_FORMATS.includes(rawFormat) ? rawFormat : 'feed';
     const brandScriptField = ({
       vertical:  'styleScriptVertical',
       landscape: 'styleScriptLandscape',
+      // square has no dedicated brand field — it shares feed's custom script, the
+      // same way it shares feed's canonical. Adding styleScriptSquare later means a
+      // row here plus one in brandScriptExecutor.BRAND_SCRIPT_FIELD.
+      square:    'styleScript',
       feed:      'styleScript'
     })[format];
 
@@ -1114,7 +1132,7 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
     const bodyEngine = ['canvas', 'remotion'].includes(req.body?.engine) ? req.body.engine : null;
     // classifyFormat keys off platformFormat regexes / aspectRatio — the
     // synthetic ad must use an aspectRatio it actually recognizes.
-    const fakeAd = { aspectRatio: { vertical: '9:16', landscape: '16:9', feed: '4:5' }[format] };
+    const fakeAd = { aspectRatio: ASPECT_BY_TITLING_FORMAT[format] };
     let engine = bodyScript
       ? 'canvas'
       : bodyEngine || resolveTitlingEngine(brand, fakeAd).engine;
@@ -1314,7 +1332,7 @@ router.get('/:id/title-spec', async (req, res) => {
 
     const { resolveSpecForBrand, buildBrandTokens, hydrateAllSlotKeys, PRESET_DIR } = require('../services/titleSpecService');
     const resolved = {};
-    for (const format of ['vertical', 'feed', 'landscape']) {
+    for (const format of TITLING_FORMATS) {
       try {
         const { spec, source } = resolveSpecForBrand(brand, format);
         // Hydrate stub entries for every SLOT_KEYS not present so the
@@ -1586,7 +1604,7 @@ router.post('/:id/title-spec/modify', express.json(), async (req, res) => {
     if (!request) return res.status(400).json({ error: 'request text required' });
     if (request.length > 2000) return res.status(400).json({ error: 'request too long (2000 chars max)' });
     const rawFormat = String(req.body?.format || 'vertical').toLowerCase();
-    if (!['vertical', 'feed', 'landscape'].includes(rawFormat)) {
+    if (!TITLING_FORMATS.includes(rawFormat)) {
       return res.status(400).json({ error: `unknown format '${rawFormat}'` });
     }
     // Optional chat history for multi-turn context. Client-side chats
@@ -1842,8 +1860,12 @@ const CANONICAL_FILE_BY_FORMAT = {
   landscape: 'local_scrim_landscape.script.js'
 };
 
+// Fed to the script-generation LLM prompt, so these strings are load-bearing:
+// feed's aspect used to read '4:5 (also serves 1:1)', which was true only because
+// 1:1 was mis-bucketed into feed. Square now has its own composition and canonical.
 const DIMS_BY_FORMAT = {
-  feed:      { width: 1080, height: 1350, aspect: '4:5 (also serves 1:1)' },
+  feed:      { width: 1080, height: 1350, aspect: '4:5' },
+  square:    { width: 1080, height: 1080, aspect: '1:1' },
   vertical:  { width: 1080, height: 1920, aspect: '9:16' },
   landscape: { width: 1920, height: 1080, aspect: '16:9' }
 };

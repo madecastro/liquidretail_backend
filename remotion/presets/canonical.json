@@ -1,6 +1,6 @@
 {
   "name": "canonical",
-  "description": "Default canonical titling — direct port of the canvas canonicals: DR-v1 vertical (HOOK/PROOF upper-third editorial), feed bottom-anchored conversion stack, landscape left-column testimonial. Times authored for the nominal 8s clip.",
+  "description": "Default canonical titling — direct port of the canvas canonicals: DR-v1 vertical (HOOK/PROOF upper-third editorial), feed bottom-anchored conversion stack, square = feed's stack single-lined for the shorter 1:1 canvas, landscape left-column testimonial. Times authored for the nominal 8s clip.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -229,6 +229,225 @@
             "fontRole": "quote",
             "weight": 400,
             "maxLines": 2
+          }
+        },
+        {
+          "key": "reviewer",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 1.58,
+            "exitAtSec": null,
+            "enterDurationSec": 0.83
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary"
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.83
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary"
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "right",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.4
+          },
+          "transition": {
+            "type": "pop",
+            "spring": {
+              "damping": 12,
+              "stiffness": 180,
+              "mass": 1
+            }
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2
+          },
+          "visible": false
+        }
+      ]
+    },
+    "square": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
+      ],
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "main",
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
+          "timing": {
+            "enterAtSec": 0.33,
+            "exitAtSec": null,
+            "enterDurationSec": 0.67
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "down"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          }
+        },
+        {
+          "key": "badge",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 0.67,
+            "exitAtSec": null,
+            "enterDurationSec": 0.67
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "trackingPx": 0.8
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 0.92,
+            "exitAtSec": null,
+            "enterDurationSec": 0.83
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 1.25,
+            "exitAtSec": null,
+            "enterDurationSec": 0.75
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 1.58,
+            "exitAtSec": null,
+            "enterDurationSec": 0.83
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "fontRole": "quote",
+            "weight": 400,
+            "maxLines": 1
           }
         },
         {

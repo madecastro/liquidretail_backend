@@ -1,6 +1,17 @@
-// Composition registry. All three canonical formats render the same spec
+// Composition registry. All four canonical formats render the same spec
 // interpreter; fps/duration come from inputProps at render time (probed
 // from the actual plate video by remotionRenderService — never assumed).
+//
+// 'square' (1080x1080, Meta Feed 1:1) was added 2026-07-29. Before that a 1:1 ad
+// fell through classifyFormat's three-way branch to 'feed' and was titled in
+// CanonicalFeed at 1080x1350 — i.e. a 1:1 ad was delivered at 4:5 while its Ad row
+// said aspectRatio '1:1'. Adding a composition here is only half the fix; see
+// brandScriptExecutor.classifyFormat for the other half.
+//
+// Square deliberately reuses feed's STYLE (safe zones, base text sizes, title
+// specs) because both are 1080 wide, so the horizontal text budget is identical
+// and only the height differs. Only the geometry is new. See SPEC_FORMAT_ALIAS in
+// brandScriptExecutor.js.
 
 import React from 'react';
 import { Composition } from 'remotion';
@@ -44,6 +55,16 @@ export const RemotionRoot = () => (
       fps={FALLBACK.fps}
       durationInFrames={FALLBACK.durationInFrames}
       defaultProps={{ ...DEFAULTS, format: 'feed' }}
+      calculateMetadata={calculateMetadata}
+    />
+    <Composition
+      id="CanonicalSquare"
+      component={Canonical}
+      width={1080}
+      height={1080}
+      fps={FALLBACK.fps}
+      durationInFrames={FALLBACK.durationInFrames}
+      defaultProps={{ ...DEFAULTS, format: 'square' }}
       calculateMetadata={calculateMetadata}
     />
     <Composition

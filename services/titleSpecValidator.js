@@ -143,7 +143,13 @@ const SCRIMS = ['frosted', 'solid', 'card', 'none'];
 const SHADOWS = ['layered', 'soft', 'none'];
 const CASINGS = ['upper', 'title', 'none'];
 const BRAND_MODES = ['keep', 'hide'];
-const FORMATS = ['vertical', 'feed', 'landscape'];
+// 'square' (1:1, 1080x1080) added 2026-07-29 alongside the CanonicalSquare
+// composition. Order matches remotion/Root.jsx and canonical.json's byFormat.
+// Adding a format here is not sufficient on its own — a format with no
+// `byFormat.<format>` entry in remotion/presets/canonical.json makes
+// titleSpecService.resolveSpec THROW at its guaranteed-floor step, so the preset
+// and this list must move together.
+const FORMATS = ['vertical', 'feed', 'square', 'landscape'];
 
 // Multi-value + image treatment vocabularies.
 const ITEM_LAYOUTS = ['stack', 'row', 'grid'];

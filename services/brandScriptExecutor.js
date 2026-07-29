@@ -61,9 +61,30 @@ function isLandscapeFormat(ad) {
   return false;
 }
 
+// 1:1 (Meta Feed square). Anchored to the `_1_1` SUFFIX rather than a loose /1_1/
+// so it cannot collide with another format id that merely contains those digits.
+// Checked against the real ids: meta_feed_1_1 matches; meta_feed_4_5,
+// meta_reels_9_16, meta_stories_9_16 and pmax_16_9 do not.
+function isSquareFormat(ad) {
+  const pf = String(ad?.platformFormat || '').toLowerCase();
+  if (/_1_1$/.test(pf)) return true;
+  if (String(ad?.aspectRatio || '') === '1:1') return true;
+  return false;
+}
+
+// BUG FIXED 2026-07-29: this was a three-way branch ending in `return 'feed'`, so a
+// 1:1 ad matched neither vertical nor landscape and fell through to 'feed' — titled
+// in CanonicalFeed at 1080x1350. Since BasePlate uses objectFit:'cover', a 1:1 ad was
+// centre-cropped into a 4:5 frame and delivered at 4:5 while its Ad row said
+// aspectRatio '1:1'. meta_feed_1_1 declares kinds ['image','video'] and AI_VEO_FEED
+// is true, so this was reachable, not theoretical.
+//
+// Order matters: vertical and landscape are matched first because their patterns are
+// the more specific ones; square must precede the 'feed' fallthrough.
 function classifyFormat(ad) {
   if (isVerticalFormat(ad))  return 'vertical';
   if (isLandscapeFormat(ad)) return 'landscape';
+  if (isSquareFormat(ad))    return 'square';
   return 'feed';
 }
 
@@ -72,6 +93,10 @@ function classifyFormat(ad) {
 const BRAND_SCRIPT_FIELD = {
   vertical:  'styleScriptVertical',
   landscape: 'styleScriptLandscape',
+  // square shares feed's custom-script field and feed's canonical script: same 1080
+  // width, same surface, only the height differs. A dedicated styleScriptSquare would
+  // be one row here plus one in routes/brand.js's preview-script map.
+  square:    'styleScript',
   feed:      'styleScript'
 };
 
@@ -983,4 +1008,4 @@ async function renderBrandScriptAndSave({ ad, brand }) {
   });
 }
 
-module.exports = { renderBrandScript, renderBrandScriptAndSave, buildMetaForAd, previewBrandScript, previewBrandScriptAsVideo, resolveBrandRenderer, resolveTitlingEngine, isVerticalFormat, isLandscapeFormat, classifyFormat };
+module.exports = { renderBrandScript, renderBrandScriptAndSave, buildMetaForAd, previewBrandScript, previewBrandScriptAsVideo, resolveBrandRenderer, resolveTitlingEngine, isVerticalFormat, isLandscapeFormat, isSquareFormat, classifyFormat, BRAND_SCRIPT_FIELD };
