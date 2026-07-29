@@ -398,7 +398,7 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 
 ### Titling composite
 
-- Downstream of base video: `brandScriptExecutor` + Remotion (default) or canvas override.
+- Downstream of base video: `brandScriptExecutor` → **Remotion only**. There is no working canvas override — `resolveTitlingEngine` is hard-wired to remotion (`brandScriptExecutor.js:806`); `TITLING_ENGINE` and `videoSettings.titlingEngine` are inert. See `docs/TITLING.md` §0.
 - Title template for layoutInput derivation is **canonical `ai_brand_led`** unless cascaded `titleTemplate` override.
 - Placement mode / engine: see `docs/TITLING.md` (`titlePlacementMode`, `titleStyleSpec` cascade including category).
 - **Does not use overlay zones** — text is scripted, not zone-driven product overlay.

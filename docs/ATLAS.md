@@ -114,3 +114,72 @@ Never trust a model id from memory: `GET https://api.atlascloud.ai/api/v1/models
 (no auth) lists the catalog; probe with a real chat call before adding to
 `atlasModelMap` (listing ≠ routing). Fetch the per-model schema URL from
 the catalog entry before using media-model params.
+
+## 7) Prompt caps, resolutions, pricing — live-verified 2026-07-29
+
+Method, in priority order (owner direction: **the Atlas per-model docs outrank the
+OpenAPI schema**). Every catalog entry from `GET /api/v1/models` carries three URLs:
+
+1. `readme` → `https://static.atlascloud.ai/model/readme/<slug>.md` — human param
+   tables and pricing. **Primary.**
+2. `schema` → `https://static.atlascloud.ai/model/schema/<slug>.json` — machine enums.
+3. `price` → on the catalog entry itself. Field is **`price.actual.base_price`**, a
+   string. There is **no `pricing` key**.
+
+README and schema agreed on all eight models checked. Re-run before trusting these.
+
+### Selectable video models (`selectable: true` in `MODEL_CAPS`)
+
+| slug | prompt cap | source | resolutions | aspects |
+|---|---|---|---|---|
+| `google/gemini-omni-flash/image-to-video-developer` | **20,000 chars** | README param table + schema description | 720p/1080p/**4k** | 16:9, 9:16 only |
+| `google/gemini-omni-flash/reference-to-video-developer` | **20,000 chars** | same | 720p/1080p/4k | 16:9, 9:16 only |
+| `xai/grok-imagine-video-v1.5/image-to-video` | **none published** | Atlas README, Atlas schema and xAI docs are all silent | 480p/720p/1080p | 1:1,16:9,9:16,4:3,3:4,3:2,2:3 |
+
+Registered but **NOT selectable** (still reachable via persisted `videoSettings` or
+env, because `validateVideoSettings` accepts any `MODEL_CAPS` key):
+`xai/grok-imagine-video/reference-to-video`, `google/veo3.1/image-to-video`.
+
+Our `promptByteCap` of 4096 for Grok is **product policy, not a provider limit** — do
+not comment it as a spec. Veo's real constraint is Google's **1,024 tokens**, so a
+4096-*byte* cap is unit-mismatched; moot while Veo is unselectable.
+
+### Omni pricing — 720p and 1080p cost the SAME
+
+README, verbatim: *"720p and 1080p are identically priced."*
+
+```
+(resolution == "4k" ? $1 : $0.2) + duration × $0.1
+```
+
+8s → **$1.00 at 720p, $1.00 at 1080p, $1.80 at 4k.** Hence
+`ATLAS_VIDEO_RESOLUTION=1080p` in `config/defaults.env`: free, and it matches every
+`deliveryDims` in `platformFormats.js` (all 1080-wide), so a 9:16 render is
+1080×1920 and a 1:1 crop lands at exactly 1080×1080 with no upscale.
+
+### Outpaint / reframe (`google/nano-banana-2/edit-developer`)
+
+Resolution enum `1k|2k|4k`; **`REFRAME_RESOLUTION=4k` is already the maximum** — there
+is no higher tier. README prices 1k **$0.08**, 2k **$0.08**, 4k **$0.16** ("4K costs
+2× the standard rate"). So **2k is a free upgrade over 1k**; only 4k costs more. The
+`-developer` suffix is a **billing** variant (50% off, live-verified: `actual` 0.04 vs
+`origin` 0.08), not a quality tier.
+
+### No system prompt on any media endpoint
+
+All seven fetched schemas expose a single flat `prompt` string; only Veo adds
+`negative_prompt`. **There are no chat roles on image or video generation.**
+System/user prompt pairs exist only on the LLM/chat transports. The frontend
+inspector's "Layout prompt (system/user)" is the **AI Canvas spec generator's** LLM
+call, not the image model's — label any new prompt UI accordingly.
+
+### Prompt-length enforcement today
+
+- Video: per-model `caps.promptByteCap` via `veoPromptBuilder.enforceByteCap`, which
+  drops whole lines in `DROP_PRIORITY` order when over budget. **Measured:** on Grok
+  (4096) with ~400 chars of guidance it silently drops `Product` and `PHYSICAL
+  ACCURACY`; at 1000 chars (the route's own legal max) the prompt is 4,250 bytes —
+  over cap after dropping everything — and is submitted anyway with a warning.
+- `routes/ads.js:69` rejects `videoPromptRaw > 4000` **chars regardless of model**, so
+  an Omni prompt legal at 20,000 chars is refused at ~4,300.
+- Image path: **no cap and no instrumentation** anywhere.

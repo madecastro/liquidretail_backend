@@ -3,7 +3,81 @@
 ## Next-session prompt
 _(empty — no pending owner prompt)_
 
-## Current state (2026-07-27)
+## Current state (2026-07-29)
+
+Branch **`claude/architecture-review-grok-elfqxc`** at `c79e606`, pushed. Trunk is
+`main`.
+
+**Start by reading the new root `CLAUDE.md`.** It was written this session precisely
+so the discoveries below are not re-made. Its §0 and §1 (how to tell what is live,
+and the dead-path register) are the load-bearing parts.
+
+### Shipped today (`c79e606`)
+
+Billable-submit hardening in `services/atlasVideoService.js`:
+- `pacedModelSubmit` — per-model submit spacing (`ATLAS_SUBMIT_SPACING_MS`, 1200ms),
+  ported from the expander. In-memory, so NOT global across web instances.
+- `isDefinite429` — replay requires a *structured* 429; loose "rate limit" prose no
+  longer buys a second billable POST. `isRateLimit` stays as-is for polling.
+- `submitRetryDecision()` extracted so the replay choice is one pure function.
+- `maxRedirects: 0` on **both** billable POSTs — axios defaults to 21 and re-sends the
+  body on 307/308, a silent double charge inside one call.
+- Two regex bugs, both found by adversarial review + the new tests, both revert-proven:
+  missing digit boundary (`code: 42901` matched → replay) and JSON-quoted keys never
+  matching (`"code":429`).
+- `scripts/verifySubmitGuard.js` — 31 offline checks, no DB/network/key.
+
+`config/defaults.env`: **`ATLAS_VIDEO_RESOLUTION=1080p`** — free (Atlas prices 720p and
+1080p identically) and matches every `deliveryDims` in `platformFormats.js`.
+
+Docs: new root `CLAUDE.md`, new `docs/CLOUDINARY-VIDEO.md`, new `docs/ATLAS.md` §7,
+plus **corrections to `docs/TITLING.md` and `docs/PIPELINES.md`, which documented the
+commented-out canvas cascade as if it were live** — that stale doc is what caused the
+wrong turns this session.
+
+### Discovered this session — the expensive ones
+
+1. **Canvas titling is kill-switched.** `resolveTitlingEngine` returns remotion
+   unconditionally (`brandScriptExecutor.js:806`). Remotion is the only engine.
+   Video framing therefore lives in `remotion/components/BasePlate.jsx:18,28`, not in
+   `brandScriptExecutor`'s sharp resizes or the `brandScripts/*.script.js` files.
+2. **`/ads.html` is not published.** On `staging.reach-social.io` it returns the
+   655-byte Vite shell, byte-identical to `/`. So `renderViaSpec` cannot work, and the
+   7 `status: active` legacy templates in the catalog cannot render at all.
+   **Owner decision: retire it** (task #10) — the DB is expected to be wiped before
+   production, so re-rendering old ads the old way is not wanted.
+3. **Cloudinary video has no face gravity** (`g_face`, `g_xy_center` both 400) and
+   `fl_relative` does not apply to base assets. `g_auto` works but is async per asset
+   (423 → 200). Explicit `c_crop` with a `c_scale` prefix is the viable approach.
+4. **Each aspect ratio is a separate billable generation** — 1:1 + 4:5 + 9:16 = three
+   submits, and 1:1/4:5 force-route to Grok because Omni is 16:9/9:16 only. Generate
+   once at 9:16 and crop down is the obvious saving, and is what the face-safe crop
+   port would make safe.
+5. **No media endpoint supports a system prompt.** The inspector's
+   "Layout prompt (system/user)" is the LLM spec-generator's call, not the image
+   model's.
+6. **`node_modules` is gitignored but 4930 files are tracked, and the tree is
+   incomplete** — `https-proxy-agent` is missing, so `require('axios')` throws. See
+   `CLAUDE.md` §4 for the restore recipe that does not dirty the commit.
+
+### Open, in priority order
+
+Full plan lives outside the repo (this session's plan file). Short form:
+1. Retire the legacy render path — task #10, owner-approved.
+2. Per-model prompt caps: `routes/ads.js:69` rejects `videoPromptRaw > 4000` chars
+   regardless of model, so an Omni prompt legal at 20,000 is refused at ~4,300.
+   Measured: on Grok, ~400 chars of guidance silently drops `PHYSICAL ACCURACY`.
+3. Port the expander's face-safe crop geometry. Live insertion point is
+   `buildCloudinaryCropUrl` + its winner sites — **not** `pickHeroSourceRatio`, which
+   is legacy-only and returns null for every `ai_*` template.
+4. Raw system+user prompt view/edit for static ads (read path already exists,
+   read-only, in `GenerationInspectorModal.tsx:217-219`).
+5. Not started, and gates multi-user: rendering runs in the web process via
+   `setImmediate`, one Chromium per static render with no cap, per-process
+   concurrency gates, nothing drains `Ad{status:'queued'}`. See
+   `ARCHITECTURE_REVIEW.md` "The render-queue architecture problem".
+
+## Prior state (2026-07-27)
 
 ### Shipped today
 `main` is at **`074babb`** with four merged PRs — #15 reframe port +

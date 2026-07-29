@@ -1,12 +1,48 @@
 # Titling Engine
 
-## 1) Architecture overview
+## 0) READ FIRST — the canvas engine is DISABLED (verified 2026-07-29)
+
+**Remotion is the only titling engine that runs.** `resolveTitlingEngine`
+(`services/brandScriptExecutor.js:797-806`) returns `{ engine: 'remotion', source:
+'canvas-disabled' }` **unconditionally**. The cascade described in §1 below is the
+code at `:808-823`, which sits inside a `/* … */` block.
+
+Consequences that have already cost real time:
+
+- `TITLING_ENGINE` and `Brand.videoSettings.titlingEngine` are **not read by the
+  render path** — `resolveTitlingEngine` returns before reaching them. Every other
+  reader was grepped; the full picture is worse than "inert":
+  - `validateVideoSettings` (`atlasVideoService.js:1644`) still **accepts** `'canvas'`,
+    so it persists.
+  - `routes/brand.js:1362` and `:2308` compute
+    `videoSettings?.titlingEngine || process.env.TITLING_ENGINE || 'remotion'` and
+    return it to the SPA, which renders it as a badge
+    (`frontend/app/src/titling/TitleStudioCard.tsx:483-484`, "engine: …").
+  - So a brand with `titlingEngine: 'canvas'` shows **"engine: canvas"** in the UI
+    while every render uses remotion. The setting is not just ineffective, it is
+    **actively misreported**. Fix the badge or the resolver together — not one alone.
+- A brand's custom `styleScript*` fields do **not** take effect. `:804` logs a line
+  saying so per render.
+- Everything under `services/brandScripts/*.script.js`, `brandScriptRunner.child.js`,
+  and the `sharp.resize(fit:'cover')` calls at `brandScriptExecutor.js:387-388` and
+  `:488-489` is on the dead path. Do not plan framing/crop work against them —
+  video framing lives in `remotion/components/BasePlate.jsx:18,28` (`objectFit:
+  'cover'`).
+- **Security:** `POST /api/brand/:id/preview-script` forces `engine='canvas'` and so
+  bypasses this kill-switch — that is the only route reaching the
+  `vm.compileFunction` sandbox-escape in `brandScriptRunner.child.js:139`. See
+  `ARCHITECTURE_REVIEW.md` GEN-1.
+
+§1 is retained as a description of the cascade to restore *if* canvas is re-enabled.
+Treat it as design intent, not current behaviour.
+
+## 1) Architecture overview (the cascade AS COMMENTED OUT — not live)
 
 Dual-engine dispatch in `services/brandScriptExecutor.js`:
 
-- `resolveTitlingEngine(brand, ad)`: custom per-format script (styleScript*/styleScriptVertical etc.) forces 'canvas'; else Brand.videoSettings.titlingEngine > TITLING_ENGINE env > default **'remotion'**.
-- 'canvas' path: `renderBrandScriptAndSave` → `resolveBrandRenderer` → `renderBrandScript` (child process) → upload + Ad.renderUrl.
-- 'remotion' path: `renderWithRemotionAndSave` → `resolveSpecForBrand` + `buildBrandTokens` → `renderTitles` (services/remotionRenderService.js) → upload + Ad.renderUrl.
+- `resolveTitlingEngine(brand, ad)`: custom per-format script (styleScript*/styleScriptVertical etc.) forces 'canvas'; else Brand.videoSettings.titlingEngine > TITLING_ENGINE env > default **'remotion'**. **← NOT LIVE, see §0.**
+- 'canvas' path: `renderBrandScriptAndSave` → `resolveBrandRenderer` → `renderBrandScript` (child process) → upload + Ad.renderUrl. **← unreachable except via preview-script.**
+- 'remotion' path: `renderWithRemotionAndSave` → `resolveSpecForBrand` + `buildBrandTokens` → `renderTitles` (services/remotionRenderService.js) → upload + Ad.renderUrl. **← the only live path.**
 
 Remotion render pipeline (ad.veoVideoUrl → Ad.renderUrl):
 
@@ -162,7 +198,7 @@ Threaded through `renderWithRemotionAndSave` → `renderTitles` / `renderPreview
 ## 6) Ops runbook
 
 Env vars:
-- TITLING_ENGINE=canvas|remotion (brandScriptExecutor.js) — default engine is **remotion** when unset.
+- TITLING_ENGINE=canvas|remotion (brandScriptExecutor.js) — **INERT as of 2026-07-29.** `resolveTitlingEngine` returns remotion unconditionally (`:806`) and never reads this. Kept documented because the value still persists and reads as effective. See §0.
 - REMOTION_TIMEOUT_MS (default 180000), REMOTION_BROWSER_EXECUTABLE, REMOTION_CONCURRENCY.
 - TITLE_PLATE_SCAN=basic|gemini|off (plateIntelService.js) — scan depth in **content** placement mode; `off` is a global kill switch forcing canonical placement.
 - GEMINI_API_KEY (for gemini mode).
