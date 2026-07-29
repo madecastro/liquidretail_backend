@@ -197,6 +197,11 @@ const adSchema = new mongoose.Schema({
       mode:        { type: String, enum: ['light', 'full'] },  // light = chrome-only re-comp; full = re-run pipeline
       requestedBy: String,
       videoModel:  String,   // per-run model override from the regenerate dropdown (null = brand/product default)
+      // true when this run used a verbatim prompt-text override (operator
+      // edited the exact prompt in the Generation Details modal) rather
+      // than the refinement-note path. The full text lives on the
+      // AiCanvasArtifact (htmlPromptSystem/htmlPromptUser), not here.
+      rawPromptEdit: { type: Boolean, default: false },
       at:          Date,
       status:      { type: String, enum: ['pending', 'done', 'failed'] },
       error:       String,

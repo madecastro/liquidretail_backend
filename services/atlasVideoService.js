@@ -492,6 +492,25 @@ function resolveAspectRatioForModel(requested, caps) {
   return best;
 }
 
+// Omni renders 16:9 or 9:16 only. Rather than fall back to Grok for
+// every other aspect (4:5, 3:4, 2:3, 3:2, 4:3, 1.91:1 — which Grok either
+// doesn't support natively either, or produces at higher cost), pick the
+// FAMILY native: 9:16 for anything portrait, 16:9 for anything landscape.
+// The downstream compositor's c_fill,g_auto (see videoCompositeService)
+// crops the render aspect to the canvas aspect at composite time using
+// saliency-aware gravity, so a 9:16 source in a 4:5 canvas gets a clean
+// content-centered vertical crop with no letterboxing.
+//
+// Square (1:1) has no clean family native — a 44%-of-frame crop from
+// portrait or landscape drops too much subject; keep the Grok fallback
+// for it. Non-numeric aspects (unrecognized string) also fall through.
+function omniFamilyNativeFor(requestedAspect) {
+  const r = aspectToNumeric(requestedAspect);
+  if (r == null) return null;
+  if (Math.abs(r - 1) < 0.01) return null;   // square — no clean Omni family
+  return r < 1 ? '9:16' : '16:9';
+}
+
 // ── Model + aspect resolution (shared) ────────────────────────────────
 //
 // The single decision point both prepareStoryboard and generateForAd go
@@ -501,16 +520,25 @@ function resolveAspectRatioForModel(requested, caps) {
 //   2. requiresVideoSeed degrade: Omni reference-to-video transforms an
 //      existing clip — an image-seeded ad can't feed it, so it degrades
 //      to the built-in i2v default rather than failing the render.
-//   3. Aspect fallback: Omni models only render 16:9/9:16. Any other
-//      canvas routes to ASPECT_FALLBACK_MODEL (Grok 1.5), whose refs are
-//      already pre-cropped to the canvas by the existing resize system.
-//      Explicitly-selected Grok/Veo models never "fall back".
-//   4. resolveAspectRatioForModel runs against the FINAL model's caps
-//      (formats even Grok lacks — 4:5, 5:4, 1.91:1 — keep the
-//      closest-aspect render + Cloudinary eager re-crop path).
+//   3. Omni family route: Omni models only render 16:9 / 9:16. For any
+//      other portrait / landscape target we render at the FAMILY native
+//      (9:16 or 16:9) and let the compositor's c_fill,g_auto crop to
+//      the platform aspect. Cheaper + higher quality than Grok fallback,
+//      and avoids the "no native 4:5" trap that used to two-hop through
+//      Grok@3:4. Square (1:1) still falls back to Grok since neither
+//      Omni family is a clean crop source.
+//   4. Grok fallback: square-only remainder (or explicitly-selected
+//      non-Omni models whose caps.paramShape !== 'gemini-omni-*').
+//   5. resolveAspectRatioForModel runs against the FINAL model's caps
+//      (formats even Grok lacks — 5:4, 1.91:1 — keep the closest-aspect
+//      render + Cloudinary eager re-crop path).
 //
-// Returns { model, caps, aspectRatio, fallback } where fallback is
-// null or { from, reason } for logging / the Ad doc.
+// Returns { model, caps, renderAspect, targetAspect, aspectRatio, fallback }.
+//   renderAspect  — what the video model will emit (submit body, ref pre-crop)
+//   targetAspect  — the platform aspect the ad ends up as (chrome + compositor)
+//   aspectRatio   — backwards-compat alias for renderAspect
+//   fallback      — null, or { from, to?, kind, reason } for logging / Ad doc.
+//                   kind ∈ 'video-seed-degrade' | 'omni-family-crop' | 'grok-fallback'
 function resolveModelAndAspect({
   brand = null, product = null, categories = [], canvasKeys = [],
   platformAspect, modelOverride = null, hasVideoSeed = false
@@ -529,20 +557,58 @@ function resolveModelAndAspect({
   let caps = capsFor(model);
 
   if (caps.requiresVideoSeed && !hasVideoSeed) {
-    fallback = { from: model, reason: 'model requires a video seed; ad is image-seeded' };
+    fallback = { from: model, kind: 'video-seed-degrade', reason: 'model requires a video seed; ad is image-seeded' };
     model = BUILT_IN_DEFAULT_MODEL;
     caps = capsFor(model);
   }
 
   const isOmni = String(caps.paramShape || '').startsWith('gemini-omni');
   if (isOmni && platformAspect && !(caps.supportedAspectRatios || []).includes(platformAspect)) {
-    fallback = { from: model, reason: `aspect ${platformAspect} unsupported (${(caps.supportedAspectRatios || []).join('/')})` };
+    const familyNative = omniFamilyNativeFor(platformAspect);
+    if (familyNative) {
+      // Family route — keep Omni, render at its native, compositor crops.
+      fallback = {
+        from:   platformAspect,
+        to:     familyNative,
+        kind:   'omni-family-crop',
+        reason: `render at Omni family native ${familyNative}; compositor c_fill,g_auto crops to ${platformAspect}`
+      };
+      return {
+        model, caps,
+        renderAspect: familyNative,
+        targetAspect: platformAspect,
+        aspectRatio:  familyNative,
+        fallback
+      };
+    }
+    // Square (or unrecognized) — no clean Omni family, fall back to Grok.
+    fallback = { from: model, kind: 'grok-fallback', reason: `aspect ${platformAspect} unsupported (${(caps.supportedAspectRatios || []).join('/')})` };
     model = ASPECT_FALLBACK_MODEL;
     caps = capsFor(model);
   }
 
-  const aspectRatio = resolveAspectRatioForModel(platformAspect, caps);
-  return { model, caps, aspectRatio, fallback };
+  const renderAspect = resolveAspectRatioForModel(platformAspect, caps);
+  return {
+    model, caps,
+    renderAspect,
+    targetAspect: platformAspect,
+    aspectRatio:  renderAspect,
+    fallback
+  };
+}
+
+// Emit the resolver's outcome as ONE log line per ad instead of the old
+// two-line "model fallback ... / remapped aspect ..." split. Keeps the
+// resolver's dispatch decision in a single grep-able place.
+function logResolution(adId, model, renderAspect, targetAspect, fallback) {
+  if (!fallback && renderAspect === targetAspect) {
+    console.log(`🎬 atlasVideo[ad=${adId}]: model=${model} aspect=${renderAspect}`);
+    return;
+  }
+  const cropNote = renderAspect !== targetAspect ? ` → crop to ${targetAspect}` : '';
+  const kind = fallback?.kind ? ` [${fallback.kind}]` : '';
+  const reason = fallback?.reason ? ` — ${fallback.reason}` : '';
+  console.log(`🎬 atlasVideo[ad=${adId}]: model=${model} render=${renderAspect}${cropNote}${kind}${reason}`);
 }
 
 // ── Cloudinary aspect cropping ────────────────────────────────────────
@@ -2284,29 +2350,30 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
   // must come after the loads. Shared with generateForAd so both stages
   // of one ad agree on model + aspect (incl. the Grok aspect fallback).
   const platformAspect = aspectRatioForPlatformFormat(ad.platformFormat) || ad.aspectRatio || '9:16';
-  const { model, aspectRatio, fallback } = resolveModelAndAspect({
+  const { model, renderAspect, targetAspect, aspectRatio, fallback } = resolveModelAndAspect({
     brand, product, categories, canvasKeys: [ad.platformFormat, platformAspect],
     platformAspect, modelOverride, hasVideoSeed: media.fileType === 'video'
   });
-  if (fallback) {
-    console.log(`🎬 atlasVideo[ad=${ad._id}]: model fallback ${fallback.from} → ${model} (${fallback.reason})`);
-  }
+  logResolution(ad._id, model, renderAspect, targetAspect, fallback);
 
   // Derive layoutInput if missing — the brand-script overlay downstream
-  // reads its copy/proof/product/theme fields directly. Cached per
-  // (mediaId, template, aspectRatio, productId, variantKind,
-  // campaignContextHash). Non-fatal on failure.
+  // reads its copy/proof/product/theme fields directly. The overlay is
+  // sized to the FINAL canvas (targetAspect), so derivation runs at the
+  // platform aspect, NOT the render aspect. Passing renderAspect here
+  // was the source of the "template ai_brand_led does not support
+  // aspect ratio 3:4" warnings on 4:5 ads — the template supports 4:5
+  // fine; it was being asked about the Grok fallback aspect.
   let layoutInput = layoutInputInitial;
   const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
   if (lpEmpty && ad.productId) {
     const tmpl = resolveTitleTemplate({ brand, product, categories });
     try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${aspectRatio}, product=${ad.productId})...`);
+      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
       const t0 = Date.now();
       await buildLayoutInput({
         mediaId:     media._id,
         template:    tmpl,
-        aspectRatio,
+        aspectRatio: targetAspect,
         options: {
           campaignKind:  campaign?.kind || 'product',
           variantKind:   'product_image',
@@ -2365,19 +2432,11 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // per-run override, the r2v video-seed degrade, and the Omni → Grok
   // aspect fallback (shared with prepareStoryboard).
   const platformAspect = aspectRatioForPlatformFormat(ad.platformFormat) || ad.aspectRatio || '9:16';
-  const { model, caps, aspectRatio, fallback } = resolveModelAndAspect({
+  const { model, caps, renderAspect, targetAspect, aspectRatio, fallback } = resolveModelAndAspect({
     brand, product, categories, canvasKeys: [ad.platformFormat, platformAspect],
     platformAspect, modelOverride, hasVideoSeed: media.fileType === 'video'
   });
-  if (fallback) {
-    console.log(`🎬 atlasVideo[ad=${ad._id}]: model fallback ${fallback.from} → ${model} (${fallback.reason})`);
-  }
-  if (aspectRatio !== platformAspect) {
-    console.log(
-      `🎬 atlasVideo[ad=${ad._id}]: remapped aspect ${platformAspect} → ${aspectRatio} ` +
-      `(unsupported by ${model}; closest of ${caps.supportedAspectRatios.join(', ')})`
-    );
-  }
+  logResolution(ad._id, model, renderAspect, targetAspect, fallback);
   // Per-ad render length — wizard-stamped Ad.videoDurationSec (or the
   // standard 8s), clamped/enum-snapped to the resolved model's caps.
   const durationSec = resolveDurationSec(ad.videoDurationSec, caps);
@@ -2390,20 +2449,20 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // creative director no longer influences it. The builder caches per
   // (mediaId, template, aspectRatio, productId, variantKind,
   // campaignContextHash) — so subsequent runs hit the cache instead of
-  // re-deriving. Non-fatal: if derivation fails (e.g. Gemini credits
-  // exhausted), we fall back to whatever data was already on the artifact
-  // / CatalogProduct.
+  // re-deriving. Derivation runs at the TARGET (platform) aspect since
+  // the derived layout describes chrome sized to the final canvas, not
+  // the raw video render aspect. Non-fatal on failure.
   let layoutInput = layoutInputInitial;
   const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
   if (lpEmpty && ad.productId) {
     const tmpl = resolveTitleTemplate({ brand, product, categories });
     try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${aspectRatio}, product=${ad.productId})...`);
+      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
       const t0 = Date.now();
       await buildLayoutInput({
         mediaId:     media._id,
         template:    tmpl,
-        aspectRatio,
+        aspectRatio: targetAspect,
         options: {
           campaignKind:  campaign?.kind || 'product',
           variantKind:   'product_image',

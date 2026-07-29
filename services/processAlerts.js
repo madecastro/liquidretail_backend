@@ -14,9 +14,15 @@
 // even if the handler throws), and signals re-raise so co-resident cleanup
 // handlers (puppeteer closes Chrome on SIGTERM) still run — backed by a
 // hard 1s exit timer, because those handlers do NOT exit and re-raise alone
-// would leave the process alive until Render SIGKILLs it. The only additive
-// change is a bounded (default 2.5s) window to flush one Telegram message
-// first.
+// would leave the process alive until Render SIGKILLs it.
+//
+// Inside the ~FLUSH_MS shutdown window (default 2.5s) we do two things in
+// parallel: send the Telegram alert AND persist a diagnostic for any ads
+// this process had in flight (requeue rendering→queued, stamp a shutdown
+// row on CampaignRun.errors[], flip the run failed). Without the persist
+// step the reaper would eventually notice ~15 min later, but with an
+// empty errors[] and 0/0/0 counters — the "silent stall" pattern we hit
+// on the Allbirds 2026-07-28 20:07 UTC run.
 
 const alerts   = require('./alertService');
 const inFlight = require('./inFlight');
@@ -46,6 +52,58 @@ function inFlightFields() {
     },
     detail: s.lines.join('\n')
   };
+}
+
+// Persist a diagnostic for ads left in-flight when the process is going
+// down. Two writes, both scoped to THIS process's runIds:
+//   1. Requeue rendering ads back to queued so a subsequent worker cycle
+//      (or the queued-drain endpoint) picks them up without waiting on
+//      the 15-min reaper.
+//   2. Push a synthetic shutdown row onto CampaignRun.errors[] and mark
+//      the run failed — the run itself is over, and the empty errors[]
+//      + 0/0/0 counts pattern we saw on the Allbirds 20:07 UTC failure
+//      leaves operators with no signal to debug from.
+//
+// This runs inside the shutdown flush window (~FLUSH_MS, default 2.5s),
+// in parallel with the Telegram alert. Skipped entirely if Mongoose
+// isn't connected — e.g. a crash during boot before the DB came up —
+// so the shutdown path never blocks on a dead connection.
+async function persistOrphans({ signal, role }) {
+  const s = inFlight.snapshot();
+  if (s.adsRemaining === 0) return;
+
+  const mongoose = require('mongoose');
+  if (mongoose.connection.readyState !== 1) {
+    console.warn(`⚠️  ${signal} orphan persist skipped — mongoose not connected (readyState=${mongoose.connection.readyState})`);
+    return;
+  }
+
+  const Ad = require('../models/Ad');
+  const CampaignRun = require('../models/CampaignRun');
+  const now = new Date();
+  const stage = 'shutdown';
+  const message = `${role} process ${signal} at ${now.toISOString()} — ${s.adsRemaining} ad(s) requeued`;
+
+  try {
+    const [adRes, runRes] = await Promise.all([
+      Ad.updateMany(
+        { campaignRunIds: { $in: s.runIds }, status: 'rendering' },
+        { $set: { status: 'queued', updatedAt: now } }
+      ),
+      CampaignRun.updateMany(
+        { runId: { $in: s.runIds }, status: { $nin: ['done', 'failed'] } },
+        {
+          $set: { status: 'failed', completedAt: now },
+          $push: { errors: { stage, message } }
+        }
+      )
+    ]);
+    console.log(`🛑 orphan persist: requeued ${adRes.modifiedCount} ad(s), marked ${runRes.modifiedCount} run(s) failed`);
+  } catch (err) {
+    // Best-effort — the alert is still going out with the orphan count,
+    // and the reaper will eventually catch what we couldn't.
+    console.error(`🛑 orphan persist failed: ${err && err.message}`);
+  }
 }
 
 /**
@@ -88,13 +146,19 @@ function installProcessAlerts({ role = 'web' } = {}) {
       terminating = true;
       const { fields, detail } = inFlightFields();
       const msg = (thrown && thrown.message) ? String(thrown.message) : String(thrown);
-      await flush(alerts.notify({
-        level:  'fatal',
-        title:  `${role} crashed — ${kind}`,
-        key:    `${kind}:${role}:${msg.slice(0, 80)}`,
-        fields: { error: msg, ...fields },
-        detail: [(thrown && thrown.stack) ? thrown.stack : msg, detail].filter(Boolean).join('\n\n')
-      }));
+      // Persist orphans and send the alert in parallel — both share the
+      // one flush window before we exit. persistOrphans is best-effort
+      // and swallows its own errors, so it can't reject the race.
+      await flush(Promise.all([
+        alerts.notify({
+          level:  'fatal',
+          title:  `${role} crashed — ${kind}`,
+          key:    `${kind}:${role}:${msg.slice(0, 80)}`,
+          fields: { error: msg, ...fields },
+          detail: [(thrown && thrown.stack) ? thrown.stack : msg, detail].filter(Boolean).join('\n\n')
+        }),
+        persistOrphans({ signal: kind, role })
+      ]));
     } catch (e) {
       try { console.error(`💥 ${kind} handler itself failed: ${e && e.message}`); } catch { /* ignore */ }
     } finally {
@@ -119,16 +183,23 @@ function installProcessAlerts({ role = 'web' } = {}) {
         const { fields, detail } = inFlightFields();
         const orphaned = inFlight.snapshot().adsRemaining;
         console.log(`🛑 ${sig} received — ${orphaned} ad(s) in flight will be orphaned`);
-        await flush(alerts.notify({
-          // Losing queued work is worth waking up for; a clean shutdown isn't.
-          level:  orphaned > 0 ? 'error' : 'info',
-          title:  orphaned > 0
-            ? `${role} shutting down with ${orphaned} ad(s) in flight`
-            : `${role} shutting down cleanly`,
-          key:    `${sig}:${role}`,
-          fields: { signal: sig, ...fields },
-          detail
-        }));
+        // Persist orphans and send the alert in parallel — both share
+        // the one flush window before the exit timer fires. When
+        // orphaned=0 persistOrphans no-ops immediately, so a clean
+        // shutdown pays nothing.
+        await flush(Promise.all([
+          alerts.notify({
+            // Losing queued work is worth waking up for; a clean shutdown isn't.
+            level:  orphaned > 0 ? 'error' : 'info',
+            title:  orphaned > 0
+              ? `${role} shutting down with ${orphaned} ad(s) in flight`
+              : `${role} shutting down cleanly`,
+            key:    `${sig}:${role}`,
+            fields: { signal: sig, ...fields },
+            detail
+          }),
+          persistOrphans({ signal: sig, role })
+        ]));
       } catch (e) {
         try { console.error(`🛑 ${sig} handler failed: ${e && e.message}`); } catch { /* ignore */ }
       } finally {

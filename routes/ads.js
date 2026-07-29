@@ -538,15 +538,21 @@ router.post('/runs', express.json(), async (req, res) => {
 // poller can show real-time progress.
 async function runRenderLoop(run, job, adIds, renderToken) {
   const t0 = Date.now();
-  // Veo calls are expensive and quota-limited — serialize them by default.
-  // Derive from the actual ads (not job.platformFormat) so mixed / non-reels
-  // veo batches still get VEO_CONCURRENCY.
-  const veoCount    = await Ad.countDocuments({ _id: { $in: adIds }, renderRoute: 'veo' });
-  const isVeoRun    = veoCount > 0;
-  const concurrency = isVeoRun ? VEO_CONCURRENCY : RENDER_CONCURRENCY;
+  // Partition the batch by renderRoute so veo (quota-limited) and image
+  // (cheap, parallelizable) render in independent pools. A single mixed
+  // batch used to fall back to VEO_CONCURRENCY for ALL ads because "any
+  // veo ad ⇒ serialize everything" — which meant a 20-min Grok poll
+  // starved 3 image ads that could have finished in <1 min. Two pools
+  // dispatched via Promise.all restores parallelism.
+  const routes = await Ad.find({ _id: { $in: adIds } }).select('_id renderRoute').lean();
+  const routeById = new Map(routes.map((r) => [String(r._id), r.renderRoute || null]));
+  const veoIds   = adIds.filter((id) => routeById.get(String(id)) === 'veo');
+  const otherIds = adIds.filter((id) => routeById.get(String(id)) !== 'veo');
+  const isVeoRun = veoIds.length > 0;
   console.log(
     `🚀 [campaignRun ${run.runId}] start — ${adIds.length} ad(s) ` +
-    `concurrency=${concurrency}${isVeoRun ? ' (veo)' : ''} brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
+    `concurrency=veo:${VEO_CONCURRENCY}(${veoIds.length}) image:${RENDER_CONCURRENCY}(${otherIds.length}) ` +
+    `brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
   );
 
   // Register with the in-flight registry so the SIGTERM handler can report
@@ -564,55 +570,58 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     advertiserId: brandDoc?.advertiserId,
     brandId: job.brandId,
     total: adIds.length,
-    label: isVeoRun ? 'Video ad generation' : 'Ad generation',
+    // Label reflects the mix — mostly for the ActivityDock header.
+    label: isVeoRun && otherIds.length ? 'Ad generation (mixed)'
+         : isVeoRun ? 'Video ad generation'
+         : 'Ad generation',
   });
   progressRun.stage('rendering');
 
-  const queue = adIds.map((adId, i) => ({ adId, index: i }));
-  let inflight = 0;
-  let next     = 0;
-  let done     = 0;
+  // Preserve stable "position in batch" via the shared adIds order — the
+  // index gets stamped into CampaignRun.errors[] rows and log lines. Each
+  // pool consumes its own slice but keeps the original index.
+  const indexOf = new Map(adIds.map((id, i) => [String(id), i]));
+  let done      = 0;
   let cancelled = false;
+  // Each pool tracks its own remaining-work cursor so the cancel path
+  // can requeue precisely what it didn't reach.
+  const pools = [
+    { name: 'veo',   concurrency: VEO_CONCURRENCY,    queue: veoIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })),   next: 0, inflight: 0 },
+    { name: 'image', concurrency: RENDER_CONCURRENCY, queue: otherIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })), next: 0, inflight: 0 }
+  ].filter((p) => p.queue.length > 0);
 
-  await new Promise((resolve) => {
+  await Promise.all(pools.map((pool) => new Promise((resolve) => {
     const dispatch = () => {
       // Refresh the cancel flag (non-throwing) before claiming more work.
       progressRun.checkpoint().catch(() => { cancelled = true; });
-      while (!cancelled && inflight < concurrency && next < queue.length) {
-        const { adId, index } = queue[next++];
-        inflight++;
+      while (!cancelled && pool.inflight < pool.concurrency && pool.next < pool.queue.length) {
+        const { adId, index } = pool.queue[pool.next++];
+        pool.inflight++;
         renderOne(run, job, adId, index, renderToken)
           .catch(err => {
-            console.error(`❌ [campaignRun ${run.runId}] #${index} dispatch crash:`, err.message || err);
+            console.error(`❌ [campaignRun ${run.runId}] #${index} (${pool.name}) dispatch crash:`, err.message || err);
           })
           .finally(() => {
-            inflight--;
+            pool.inflight--;
             progressRun.tick(++done, adIds.length);
             inFlight.progress(run.runId, done);
-            // Liveness heartbeat for the reaper. Ads are bulk-claimed with a
-            // single updatedAt stamp before the loop, but a serialized video
-            // batch runs ~1 min/ad — so ads late in a 20-ad queue would sit
-            // 'rendering' with a 15-min-old timestamp while perfectly
-            // healthy, and worker.js's reaper would flip them back to
-            // 'queued' MID-RUN. renderOne renders by id with no status
-            // check, so a concurrent "Generate more" could then select the
-            // same ad into a second run: two billable video submits for one
-            // ad. Refreshing on every completion (~1/min here) means the
-            // reaper only ever sees ads whose loop has genuinely stopped.
-            // Scoped to status:'rendering' so it never resurrects ads the
-            // cancel path already re-queued.
+            // Liveness heartbeat for the reaper — see the comment on the
+            // pre-partition version for why we refresh updatedAt on every
+            // completion instead of just at claim time. Scoped to
+            // status:'rendering' so it never resurrects ads the cancel
+            // path already re-queued.
             Ad.updateMany(
               { _id: { $in: adIds }, status: 'rendering' },
               { $set: { updatedAt: new Date() } }
             ).catch(() => {});
-            if ((next >= queue.length || cancelled) && inflight === 0) resolve();
+            if ((pool.next >= pool.queue.length || cancelled) && pool.inflight === 0) resolve();
             else dispatch();
           });
       }
-      if (cancelled && inflight === 0) resolve();
+      if (cancelled && pool.inflight === 0) resolve();
     };
     dispatch();
-  });
+  })));
 
   // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at
   // claim time, before the loop) go BACK to the queue — they count as
@@ -620,13 +629,16 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // them. Matching on status:'rendering' is load-bearing: the old
   // status:'queued' filter matched nothing post-claim, stranding
   // unclaimed ads in 'rendering' forever (adversarial-review find).
-  if (cancelled && next < queue.length) {
-    const remaining = queue.slice(next).map((q) => q.adId);
-    await Ad.updateMany(
-      { _id: { $in: remaining }, status: 'rendering' },
-      { $set: { status: 'queued', updatedAt: new Date() } }
-    ).catch(() => {});
-    await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
+  // With two pools we requeue the untouched tail of each.
+  if (cancelled) {
+    const remaining = pools.flatMap((p) => p.queue.slice(p.next).map((q) => q.adId));
+    if (remaining.length) {
+      await Ad.updateMany(
+        { _id: { $in: remaining }, status: 'rendering' },
+        { $set: { status: 'queued', updatedAt: new Date() } }
+      ).catch(() => {});
+      await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
+    }
   }
 
   await CampaignRun.updateOne(
@@ -1376,13 +1388,20 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 });
 
 // POST /api/ads/:id/regenerate — re-run the render pipeline for this
-// ad with an operator refinement prompt. Body: { prompt, mode? }.
-//   prompt: required, up to ~1000 chars
-//   mode:   'light' (default, video only — re-runs chrome + composite,
-//                    Veo unchanged) | 'full' (re-runs Veo too).
-//           Image ads always do full HTML Gen re-render; mode ignored.
+// ad with an operator refinement prompt, OR a verbatim prompt override.
+// Body: { prompt?, mode?, promptOverride? }.
+//   prompt:  a refinement note appended to the auto-composed prompt.
+//            Required UNLESS promptOverride is given. Up to ~1000 chars.
+//   mode:    'light' (default, video only — re-runs chrome + composite,
+//                     Veo unchanged) | 'full' (re-runs Veo too).
+//            Image ads always do full HTML Gen re-render; mode ignored.
+//   promptOverride: { system, user } — image ads only. The operator
+//            edited the EXACT prompt shown in the Generation Details
+//            modal; this text replaces the auto-composed prompt
+//            verbatim instead of being appended as a refinement note.
 // Returns 202 with a poll target. Frontend polls
-// /api/catalog/:productId/ads-detail watching ad.regenerating.
+// /api/catalog/:productId/ads-detail (or this ad's generation-inspector)
+// watching ad.regenerating.
 router.post('/:id/regenerate', express.json(), async (req, res) => {
   try {
     const brandId = req.query.brandId || req.headers['x-brand-id'];
@@ -1393,8 +1412,21 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       if (e.status === 404) return res.status(404).json({ error: e.message });
       throw e;
     }
+
+    const MAX_OVERRIDE_LEN = 40000;
+    let promptOverride = null;
+    if (req.body?.promptOverride && typeof req.body.promptOverride === 'object') {
+      const sys = String(req.body.promptOverride.system || '').trim();
+      const usr = String(req.body.promptOverride.user   || '').trim();
+      if (!sys || !usr) return res.status(400).json({ error: 'promptOverride requires both system and user text' });
+      if (sys.length > MAX_OVERRIDE_LEN || usr.length > MAX_OVERRIDE_LEN) {
+        return res.status(400).json({ error: `promptOverride text is too long (max ${MAX_OVERRIDE_LEN} chars each)` });
+      }
+      promptOverride = { system: sys, user: usr };
+    }
+
     const prompt = String(req.body?.prompt || '').trim();
-    if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+    if (!prompt && !promptOverride) return res.status(400).json({ error: 'prompt or promptOverride is required' });
     if (prompt.length > 1000) return res.status(400).json({ error: 'prompt is too long (max 1000 chars)' });
     const mode = req.body?.mode === 'full' ? 'full' : 'light';
 
@@ -1418,6 +1450,9 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     } catch (err) {
       return res.status(err.status || 400).json({ error: err.message });
     }
+    if (promptOverride && ad.kind !== 'image') {
+      return res.status(400).json({ error: 'promptOverride is only supported for image ads' });
+    }
     const requestedBy = req.user?.userId || req.user?.email || null;
 
     // 202 — operator polls /api/catalog/:productId/ads-detail for stage.
@@ -1429,7 +1464,7 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     });
 
     setImmediate(() => {
-      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel })
+      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel, promptOverride })
         .catch(err => console.error(`❌ regenerate setImmediate crash: ${err.message}`));
     });
   } catch (err) {
@@ -1587,13 +1622,27 @@ router.get('/:id/generation-inspector', async (req, res) => {
     const brand = await Brand.findById(brandId).lean();
 
     const out = {
-      adId:        String(ad._id),
-      kind:        ad.kind,
-      template:    ad.template,
-      aspectRatio: ad.aspectRatio,
-      status:      ad.status,
-      productId:   ad.productId ? String(ad.productId) : null,
-      warnings:    []
+      adId:               String(ad._id),
+      kind:               ad.kind,
+      template:           ad.template,
+      aspectRatio:        ad.aspectRatio,
+      status:             ad.status,
+      productId:          ad.productId ? String(ad.productId) : null,
+      // Regenerate-with-prompt state — surfaced here so the Generation
+      // Details modal can poll this same endpoint while a regen runs,
+      // and so it can gate edit/regenerate on exported ads (read-only).
+      metaSyncStatus:     ad.metaSyncStatus || null,
+      regenerating:       !!ad.regenerating,
+      regenerationStage:  ad.regenerationStage || null,
+      // Last regen outcome (done/failed/pending) — lets a poller distinguish
+      // "finished successfully" from "finished but failed" once regenerating
+      // flips back to false (both look identical from that flag alone).
+      lastRegeneration: (() => {
+        const h = Array.isArray(ad.regenerationHistory) ? ad.regenerationHistory : [];
+        const last = h.length ? h[h.length - 1] : null;
+        return last ? { status: last.status, error: last.error || null, at: last.at || null } : null;
+      })(),
+      warnings:           []
     };
 
     // ── Seed media (the source the generation animated/composed) ──
@@ -1681,13 +1730,34 @@ router.get('/:id/generation-inspector', async (req, res) => {
       if (ad.aiCanvasArtifactId) {
         const AiCanvasArtifact = require('../models/AiCanvasArtifact');
         const c = await AiCanvasArtifact.findById(ad.aiCanvasArtifactId)
-          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks').lean();
+          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks modelId htmlPromptSystem htmlPromptUser')
+          .lean();
         if (c) {
-          image.layoutPrompt = { system: c.promptSystem || null, user: c.promptUser || null, images: c.promptImages || [] };
+          // htmlPromptSystem/User is the EXACT prompt the HTML Generator
+          // sent for the current outputHtml. promptSystem/User is the
+          // older JSON Generator's own (different) prompt — kept as a
+          // fallback for ads rendered before htmlPrompt* was captured,
+          // but it does NOT necessarily match outputHtml, so flag it.
+          const exact = !!(c.htmlPromptSystem && c.htmlPromptUser);
+          image.layoutPrompt = {
+            system: c.htmlPromptSystem || c.promptSystem || null,
+            user:   c.htmlPromptUser   || c.promptUser   || null,
+            images: c.promptImages || []
+          };
+          image.promptIsExact = exact;
           image.canvasSpec   = c.canvasSpec || null;
           image.outputHtml   = c.outputHtml || null;
           image.colorPalette = c.colorPalette || null;
           image.copyPicks    = c.copyPicks || null;
+          image.model        = c.modelId || null;   // e.g. 'gpt-4.1' — the layout-generation model
+          if (!exact && (image.layoutPrompt.system || image.layoutPrompt.user)) {
+            out.warnings.push({
+              code: 'layout-prompt-legacy',
+              message: 'Shown prompt is from the legacy JSON layout generator, not the HTML generator that actually produced this render — it may not exactly match the image. Editing and regenerating will still work off your edited text going forward.'
+            });
+          } else if (!image.layoutPrompt.system && !image.layoutPrompt.user) {
+            out.warnings.push({ code: 'layout-prompt-missing', message: 'No layout prompt captured for this ad.' });
+          }
         }
       }
       // NOTE: the gpt-image-2 image-ref prompt (AiFullRenderArtifact) is
