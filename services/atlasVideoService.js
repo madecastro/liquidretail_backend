@@ -43,14 +43,22 @@ const { buildLayoutInput }   = require('./layoutInputService');
 // switch + model/resolution/skip-threshold are all env-tunable.
 // Ported from ReachSocialLLMExpander runSafeZoneReframe (uncrop-v1 ladder).
 const REFRAME_ENABLED = () => String(process.env.REFRAME_ENABLED ?? 'true').toLowerCase() !== 'false';
-// Model tier: '-developer' is a BILLING variant, not a quality tier. Verified
-// against the live Atlas catalogue (2026-07-24): it carries the same
-// price.origin.base_price ($0.08) as plain /edit and differs only by a 50%
-// discount factor; `profile` text is verbatim identical and the readmes are
-// byte-identical. The same pattern holds across all 12 '-developer' variants,
-// while a genuine quality up-tier (nano-banana-pro/edit-ultra) gets its own
-// higher list price. Distillation is the separate '-lite' axis, which composes
-// independently. So: half price, no evidenced fidelity cost.
+// Model tier: for THIS model ('google/nano-banana-2/edit') '-developer' is a BILLING
+// variant, not a quality tier. Verified against the live Atlas catalogue
+// (2026-07-24): it carries the same price.origin.base_price ($0.08) as plain /edit
+// and differs only by a 50% discount factor; `profile` text is verbatim identical
+// and the readmes are byte-identical. A genuine quality up-tier
+// (nano-banana-pro/edit-ultra) gets its own higher list price. Distillation is the
+// separate '-lite' axis, which composes independently. So here: half price, no
+// evidenced fidelity cost.
+//
+// CORRECTION 2026-07-29 — this comment used to claim "the same pattern holds across
+// all 12 '-developer' variants". That generalisation is FALSE. Diffed live for
+// gemini-omni-flash/image-to-video: plain vs '-developer' differ in input shape
+// (`image` single string vs `images[]` 1-7), duration (range 3-10 vs enum 4/6/8/10),
+// resolution (720p ONLY vs 720p/1080p/4k), `thinking_level` (present vs ABSENT), and
+// the pricing formula itself. Never assume the suffix is cosmetic — diff the two
+// schemas for the specific slug. See docs/ATLAS.md §8.
 const REFRAME_OUTPAINT_MODEL = () => process.env.REFRAME_OUTPAINT_MODEL || 'google/nano-banana-2/edit-developer';
 // 1k is the schema default for both variants (enum 1k|2k|4k). Deliberately NOT
 // 4k: no Atlas model exposes a mask or pixel-passthrough, so the whole canvas

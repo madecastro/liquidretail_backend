@@ -183,3 +183,84 @@ call, not the image model's — label any new prompt UI accordingly.
 - `routes/ads.js:69` rejects `videoPromptRaw > 4000` **chars regardless of model**, so
   an Omni prompt legal at 20,000 chars is refused at ~4,300.
 - Image path: **no cap and no instrumentation** anywhere.
+
+## 8) The '-developer' suffix is NOT uniformly cosmetic (verified 2026-07-29)
+
+An older comment in `atlasVideoService.js` claimed `-developer` is a billing variant
+only, and that "the same pattern holds across all 12 '-developer' variants". **That
+generalisation is false.** It was verified for `google/nano-banana-2/edit` — where it
+does hold — and then over-generalised.
+
+Diffed live for `google/gemini-omni-flash/image-to-video`:
+
+| | plain | `-developer` |
+|---|---|---|
+| image input | **`image`** — single string | **`images`** — array, 1–7 |
+| duration | range **3–10**, default 10 | enum **4/6/8/10**, default 8 |
+| resolution | **`720p` only** | **`720p` / `1080p` / `4k`** |
+| `thinking_level` | **present** (default/high/low) | **absent** |
+| price (8s) | `max(3, dur) × $0.13` = **$1.04** | `$0.2 + dur × $0.1` = **$1.00** |
+
+So for this family the suffix changes the request shape, the resolution ceiling and
+the pricing formula. **`-developer` is the only variant that can do 1080p**, which is
+what `ATLAS_VIDEO_RESOLUTION=1080p` depends on.
+
+**Rule: diff the two schemas for the specific slug before assuming anything.**
+`https://static.atlascloud.ai/model/schema/<slug>.json` for each, then `diff`.
+
+### All four Omni endpoints are one model
+
+The plain README states it directly: *"AtlasCloud exposes Gemini Omni Flash through
+four endpoints — text-to-video, image-to-video, reference-to-video, and video-edit.
+All four route to the **same** `gemini-omni-flash-preview` model and differ only by the
+input modality they accept."*
+
+Registered in `MODEL_CAPS`: image-to-video-developer, reference-to-video-developer.
+**Not registered:** `google/gemini-omni-flash/video-edit` (source video + edit prompt,
+1–5 optional refs, `thinking_level`, **`resolution` enum is `['720p']` only**, priced
+`clamp(duration, 3, 30) × $0.14` — so $1.12 for 8s, *more* than a fresh generation).
+Also unregistered: the `text-to-video` pair and the plain non-developer variants.
+
+### Conversational / multi-turn editing is NOT available through Atlas
+
+Checked every field of both Omni video schemas plus both READMEs: **zero** occurrences
+of `interaction`, `session`, `conversation`, `multi-turn`, `persistent`, `state`,
+`follow-up` or `previous_*`. The input surface is stateless —
+`{model, prompt, images|video_clips, duration, aspect_ratio, resolution, seed}`. Every
+Atlas call is independent.
+
+What this means for the **regeneration loop today**: `adRegenerateService.js:205` calls
+`generateForAd({ ad, operatorPrompt })`, which regenerates from the **original seed
+images** with the refinement prepended, then overwrites `veoVideoUrl` at `:211-217`. So
+an operator's "make the quote larger" is interpreted against the seed stills, not
+against the clip they just watched. It is a re-roll with a hint, not an edit, and
+nothing is pixel-stable.
+
+### Google's Interactions API — reachable, but not through Atlas
+
+Google's stateful video editing is the **Interactions API** on the Gemini **Developer**
+surface (API-key auth, not Vertex):
+
+- `POST https://generativelanguage.googleapis.com/v1beta/interactions`
+- State carried by **`previous_interaction_id`**; each response returns an `id` to chain.
+- Image-to-video multi-turn IS supported: `"task": "image_to_video"` in `video_config`,
+  initial image as `{"type":"image","data":<base64>,"mime_type":...}`.
+- Aspect ratios **`9:16` / `16:9` only** — same restriction as Atlas, so deriving 1:1
+  and 4:5 by crop is required either way.
+- We already call that host (`aiVideoReferenceService.js:30`) and `.env.example:158`
+  confirms our "vertex" provider actually authenticates with `GEMINI_API_KEY`.
+
+**UNVERIFIED and load-bearing before adopting it** — no key was available to test:
+1. **Resolution ceiling.** The doc lists aspect ratios but *not* resolutions (only
+   ">720p when available" re: URI delivery). If Interactions is 720p-only it is
+   mutually exclusive with 1080p multi-format delivery — a product decision, not a
+   technical one.
+2. **Pricing.** Atlas `-developer` is 50% off list. Direct Google is presumably list;
+   the doc page carries no pricing.
+3. Video references are documented as capped at 3s and "currently unsupported".
+
+Adopting it also means re-implementing on a new transport everything Atlas currently
+gives us: `submitRetryDecision` (submit-once), `pacedModelSubmit`, `maxRedirects: 0`,
+the prediction-poll machinery, and the cost ledger. `aiVideoReferenceService` is the
+existing direct-Google path and `ARCHITECTURE_REVIEW.md`'s divergence table rates it
+weaker on every axis — harden it before putting money through it.
