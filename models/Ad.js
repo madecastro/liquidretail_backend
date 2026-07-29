@@ -243,6 +243,24 @@ const adSchema = new mongoose.Schema({
   // transcode, no 423 race.
   veoAspectRatio:     { type: String, default: null },
   veoPrompt:          { type: String, default: null },  // storyboard prompt sent to Veo — preserved for debugging + reproduction
+  // The provider's prediction id, persisted IMMEDIATELY after the billable submit
+  // succeeds — before polling starts.
+  //
+  // This is a SPEND RECEIPT, not telemetry. Previously the id lived only as a local
+  // variable inside generateForAd, so a web-process death between submit and
+  // completion (deploy, autoscale replacement, OOM) lost it: Atlas was generating a
+  // video we had paid for, with no handle to reclaim it, and the orphan reaper would
+  // flip the ad back to 'queued' so the next run submitted AGAIN. That is a guaranteed
+  // double charge, ~$1.00 a time. Not hypothetical here — Render's SIGKILL lands after
+  // a 300s drain window while MAX_POLL_MS is 10 minutes, so an in-flight poll cannot
+  // be drained cleanly.
+  //
+  // Persisting it makes the orphan reconcilable: a restart can poll this id and finish
+  // the ad instead of re-submitting. Nothing consumes it that way YET — that resume
+  // path belongs with the render-queue move (ARCHITECTURE_REVIEW.md "The render-queue
+  // architecture problem"). Until then it is the audit trail that turns a silent
+  // double-bill into a visible orphan.
+  veoPredictionId:    { type: String, default: null },
   veoReferenceImages: { type: [String], default: [] },  // exact reference-image stack sent to the model (pos 0 = seed, then product hero + alts) — for the generation inspector
   // GPT-composed structured storyboard. Null when VEO_USE_GPT_STORYBOARD
   // is off or the GPT call failed (Veo prompt then carries the legacy

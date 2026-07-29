@@ -26,6 +26,11 @@ const axios = require('axios');
 const sharp = require('sharp');
 
 const Media                     = require('../models/Media');
+// Required for the charge-point veoPredictionId write in generateForAd. NOTE this file
+// previously had no Ad import at all — `node --check` passes on an undefined identifier,
+// so the missing require would only have surfaced as a runtime ReferenceError on the
+// first real video generation, inside the very guard meant to protect spend.
+const Ad                        = require('../models/Ad');
 const Brand                     = require('../models/Brand');
 const Campaign                  = require('../models/Campaign');
 const CatalogProduct            = require('../models/CatalogProduct');
@@ -2509,9 +2514,61 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     ? (buildVideoSegmentUrl(media.fileUrl, aspectRatio, durationSec) || media.fileUrl)
     : null;
 
+  // Resolution the submission body will actually request — computed BEFORE the submit
+  // because the cost estimate is now ledgered at the charge point, not on success.
+  const renderResolution = String(caps.paramShape || '').startsWith('gemini-omni')
+    ? (process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p')
+    : (caps.defaultResolution || '720p');
+  const costUsd = estimateRenderCostUsd({ model, durationSec, resolution: renderResolution });
+
   const t0 = Date.now();
   const predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
+  const submitMs = Date.now() - t0;
   console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
+
+  // ── CHARGE POINT ──────────────────────────────────────────────────────────
+  // The submit returned an id, so the provider has accepted a billable job. Money is
+  // committed HERE, whatever happens to the poll, the download, or the Cloudinary
+  // mirror. Both writes below therefore happen now rather than at the end:
+  //
+  //   1. veoPredictionId — the spend receipt. Without it a crash mid-poll loses the
+  //      only handle to work we have paid for, and the reaper re-queues the ad into a
+  //      second submit. See models/Ad.js for the full reasoning.
+  //   2. the CostLog row — previously written only after poll + download + upload
+  //      succeeded, so a timeout or a failed upload spent ~$1.00 and recorded $0.
+  //
+  // ONE row per billable submit, deliberately. Outcome lives on the Ad (status,
+  // renderUrl); CostLog records SPEND, and spend happened. The trade-off is that
+  // durationMs here is submit latency rather than end-to-end render time — the full
+  // elapsed time is logged on completion below instead of creating a second row that
+  // would double-count the charge.
+  //
+  // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
+  // generation post-payment, because the caller would then never store videoUrl and a
+  // retry would double-bill.
+  try {
+    await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
+  } catch (err) {
+    console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
+  }
+  try {
+    await recordFlatCost({
+      stage:      'atlas_video_render',
+      provider:   'atlas',
+      model,
+      purposeTag: caps.paramShape,
+      brandId:    media.brandId || null,
+      campaignId: ad.campaignId || null,
+      adId:       ad._id || null,
+      mediaId:    media._id || null,
+      productId:  ad.productId || null,
+      costUsd:    costUsd || 0,
+      durationMs: submitMs,
+      status:     'submitted'
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
+  }
 
   const remoteVideoUrl = await pollPrediction(predictionId);
   const videoBuffer = await downloadToBuffer(remoteVideoUrl);
@@ -2544,39 +2601,15 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
 
   const elapsedMs = Date.now() - t0;
 
-  // Cost telemetry — flat per-render estimate from the registry's
-  // pricing entry, mirroring the duration/resolution the submission
-  // body requested. Lands in CostLog alongside the pipeline's LLM
-  // entries so per-brand/per-campaign rollups include video spend.
-  const renderResolution = String(caps.paramShape || '').startsWith('gemini-omni')
-    ? (process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p')
-    : (caps.defaultResolution || '720p');
-  const costUsd = estimateRenderCostUsd({
-    model,
-    durationSec,
-    resolution:  renderResolution
-  });
-  // Non-fatal: render + Cloudinary mirror already succeeded. A telemetry
-  // rejection here must not fail generateForAd post-payment — the caller
-  // would never store videoUrl, and a retry would double-bill the provider.
-  try {
-    await recordFlatCost({
-      stage:      'atlas_video_render',
-      provider:   'atlas',
-      model,
-      purposeTag: caps.paramShape,
-      brandId:    media.brandId || null,
-      campaignId: ad.campaignId || null,
-      adId:       ad._id || null,
-      mediaId:    media._id || null,
-      productId:  ad.productId || null,
-      costUsd:    costUsd || 0,
-      durationMs: elapsedMs
-    });
-  } catch (err) {
-    console.warn('⚠️ atlasVideo cost telemetry failed (non-fatal): ' + err.message);
-  }
-
+  // NO cost record here. The charge was ledgered at the CHARGE POINT above, right after
+  // the submit returned a prediction id. Writing a second row on success would
+  // double-count every completed render, and — worse — would restore the original bug
+  // by implication: that spend is only real once the whole chain succeeds. It isn't.
+  // The provider bills the submit. Everything after it is delivery.
+  //
+  // End-to-end timing therefore lives in this log line rather than CostLog.durationMs
+  // (which holds submit latency). If per-render duration is ever needed in reports,
+  // update the existing row by adId + predictionId — do not create a new one.
   console.log(
     `🎬 atlasVideo[ad=${ad._id}]: done — model=${model} aspect=${aspectRatio} ` +
     `took=${Math.round(elapsedMs / 1000)}s cost≈$${(costUsd ?? 0).toFixed(2)}`
