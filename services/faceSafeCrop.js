@@ -21,7 +21,7 @@
  *
  * @typedef {{ left: number, top: number, right: number, bottom: number }} SubjectBox
  *   Normalized fractions 0..1 of frame width/height. left/right horizontal, top/bottom vertical.
- * @typedef {'center'|'subject-fit'|'face-safe'|'face-center'} CropAnchorY
+ * @typedef {'center'|'subject-fit'|'face-safe'|'face-crop'|'face-center'} CropAnchorY
  * @typedef {{ cx: number, cy: number, cw: number, ch: number, anchorY: CropAnchorY }} CropRect
  *   Pixel rect in the SOURCE frame's coordinate space. cx/cy are the top-left corner.
  */
@@ -63,6 +63,29 @@ const FACE_MARGIN_FRAC = 0.06;
 const FACE_TOP_MARGIN_FRAC = (() => {
   const n = Number(process.env.FACE_TOP_MARGIN_FRAC);
   return Number.isFinite(n) && n > 0 && n <= FACE_MARGIN_FRAC ? n : 0.035;
+})();
+
+/**
+ * DIVERGENCE from the expander — product-first crown sacrifice (owner decision 2026-07-29):
+ * "we are open to allowing the top of someone's head (forehead still visible) to be cropped, if
+ * needed in order to best fit products."
+ *
+ * How much of the HEAD BOX's height may be cropped off its top, as a fraction of the box. The box
+ * includes hair and headwear, so 0.3 sacrifices crown/hat territory while the brow line — roughly
+ * the top third boundary of a real head box — stays in frame. 0 disables the behaviour entirely;
+ * capped at 0.5 because past the box's midline the EYES go, and "forehead still visible" stops
+ * being true.
+ *
+ * ONLY consulted when placeWithMargin's normal placement (marginTopY headroom + full marginY chin
+ * clearance) FAILS — i.e. rule 4, head-plus-both-margins taller than the window. The normal
+ * success path already places the window as low as the small top margin allows (maximum product
+ * visible within a safe headroom); there is nothing for this allowance to improve there. It exists
+ * only to give rule 4's fallback a better option than centring, which crops crown AND chin —
+ * sacrificing crown only, up to this fraction, keeps the chin/torso (where the product is) intact.
+ */
+const FACE_TOP_CROP_ALLOWANCE_FRAC = (() => {
+  const n = Number(process.env.FACE_TOP_CROP_ALLOWANCE_FRAC);
+  return Number.isFinite(n) && n >= 0 && n <= 0.5 ? n : 0.3;
 })();
 
 /**
@@ -253,12 +276,31 @@ function computeGravityCropRect(sw, sh, wr, hr, subjectIn, faceIn) {
     anchorY = 'face-safe';
   }
 
-  // Vertical: small clearance above the head, full clearance below it.
+  // Vertical: small clearance above the head, full clearance below it. This already places the
+  // window as far down (as much product visible) as the small top margin allows — there is
+  // nothing to "improve" on the success path; the allowance below exists ONLY for when this fails.
   let cy = placeWithMargin(Math.round(desiredY), ch, sh, faceT, faceB, marginTopY, marginY);
+
   if (cy === null) {
-    // Rule 4 — head (plus margins) is taller than the window: centre on the head, accept the fit.
-    cy = clampTo(Math.round((faceT + faceB) / 2 - ch / 2), 0, sh - ch);
-    anchorY = 'face-center';
+    // Rule 4 — head + BOTH margins is taller than the window. The plain fallback centres on the
+    // head, which crops crown AND chin. Owner decision 2026-07-29: sacrifice the CROWN ONLY, and
+    // only by the MINIMUM pixels needed to fit the full chin margin (never the full allowance just
+    // because rule 4 fired) — up to FACE_TOP_CROP_ALLOWANCE_FRAC of the head's height ("forehead
+    // still visible"). Chin/torso carries the product context, so it keeps its full margin as long
+    // as the deficit fits within the allowance; only a deficit bigger than the allowance falls back
+    // to centring.
+    const headHeight = faceB - faceT;
+    const required = Math.max(0, headHeight + marginY - ch);
+    const allowPx = FACE_TOP_CROP_ALLOWANCE_FRAC * headHeight;
+    if (required <= allowPx) {
+      const lo = faceT + required;
+      cy = placeWithMargin(Math.round(lo), ch, sh, lo, faceB, 0, marginY);
+      if (cy !== null) anchorY = required > 0 ? 'face-crop' : 'face-safe';
+    }
+    if (cy === null) {
+      cy = clampTo(Math.round((faceT + faceB) / 2 - ch / 2), 0, sh - ch);
+      anchorY = 'face-center';
+    }
   }
 
   // Horizontal: prefer the subject's centre (keeps the composition), but never at the cost of the
@@ -356,6 +398,7 @@ module.exports = {
   // constants
   FACE_MARGIN_FRAC,
   FACE_TOP_MARGIN_FRAC,
+  FACE_TOP_CROP_ALLOWANCE_FRAC,
   FACE_MAX_SUBJECT_AREA_FRAC,
   FACE_MIN_FRAMES,
 };

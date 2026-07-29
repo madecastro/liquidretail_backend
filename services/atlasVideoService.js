@@ -507,7 +507,17 @@ function resolveAspectRatioForModel(requested, caps) {
 function omniFamilyNativeFor(requestedAspect) {
   const r = aspectToNumeric(requestedAspect);
   if (r == null) return null;
-  if (Math.abs(r - 1) < 0.01) return null;   // square — no clean Omni family
+  if (Math.abs(r - 1) < 0.01) {
+    // Square via Omni (owner decision 2026-07-29, flipped after side-testing). The "44% crop
+    // drops too much subject" objection above predates the face-safe base-plate crop
+    // (services/basePlateCropService.js): 1:1 now renders at Omni 9:16 and titling crops it
+    // face-anchored — crown may be sacrificed up to FACE_TOP_CROP_ALLOWANCE_FRAC, forehead never
+    // (faceSafeCrop.js). When detection finds no head, BasePlate's centre crop is the accepted
+    // fallback. Env off-switch restores the Grok fallback for square only.
+    return String(process.env.SQUARE_VIA_OMNI_CROP ?? 'true').toLowerCase() !== 'false'
+      ? '9:16'
+      : null;
+  }
   return r < 1 ? '9:16' : '16:9';
 }
 

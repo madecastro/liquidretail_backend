@@ -21,7 +21,8 @@ const fsc = require('../services/faceSafeCrop');
 const {
   computeGravityCropRect, centerOnBox, windowFor, parseAspect,
   unionBoxes, consensusFaceBox, filmstripFrameCount,
-  FACE_MARGIN_FRAC, FACE_TOP_MARGIN_FRAC, FACE_MAX_SUBJECT_AREA_FRAC, FACE_MIN_FRAMES,
+  FACE_MARGIN_FRAC, FACE_TOP_MARGIN_FRAC, FACE_TOP_CROP_ALLOWANCE_FRAC,
+  FACE_MAX_SUBJECT_AREA_FRAC, FACE_MIN_FRAMES,
 } = fsc;
 const { usableBox, clampTo, placeWithMargin, plausibleFace } = fsc._internal;
 
@@ -211,16 +212,75 @@ check('F4 rule 3: subject does NOT fit -> face-safe', () => {
   const r = computeGravityCropRect(SW, SH, 1, 1, SUBJ_TALL, HEAD_HIGH);
   assert.strictEqual(r.anchorY, 'face-safe');
 });
-check('F5 rule 4: head taller than the window -> face-center', () => {
+check('F5 rule 4: head taller than the window -> crown sacrifice preferred over centring', () => {
   // Head must be taller than the 1:1 window (1080px = 0.5625 of 1920) AND stay under the 0.6
   // area guard, or plausibleFace rejects it first and we land on 'center' instead. A narrow,
   // very tall head box satisfies both: 1248px tall, 0.254 of the subject's area.
+  //
+  // Owner decision 2026-07-29: when neither margin fits, sacrifice the CROWN (crop up to
+  // FACE_TOP_CROP_ALLOWANCE_FRAC of head height, forehead stays visible) rather than centring,
+  // which would crop crown AND chin. So the expectation here changed from 'face-center' to
+  // 'face-crop' — a real behavioural improvement, not a relaxed test.
   const tall = { left: 0.35, top: 0.05, right: 0.65, bottom: 0.70 };
   const subj = { left: 0.10, top: 0.02, right: 0.90, bottom: 0.98 };
   assert.ok((tall.bottom - tall.top) * SH > windowFor(SW, SH, 1, 1).ch, 'fixture head is not taller than the window');
   assert.notStrictEqual(plausibleFace(tall, subj), null, 'fixture head is rejected by the area guard');
   const r = computeGravityCropRect(SW, SH, 1, 1, subj, tall);
-  assert.strictEqual(r.anchorY, 'face-center');
+  assert.strictEqual(r.anchorY, 'face-crop');
+  // The chin (head bottom) must still be fully protected by the FULL margin — only the crown
+  // is sacrificed, never the chin.
+  const chinClearance = (r.cy + r.ch) - px(tall.bottom, SH);
+  assert.ok(chinClearance >= Math.round(FACE_MARGIN_FRAC * r.ch) - 1,
+    `chin clearance ${chinClearance.toFixed(1)} is below the full margin — chin was sacrificed too`);
+});
+check('F6 crown sacrifice never exceeds FACE_TOP_CROP_ALLOWANCE_FRAC of head height', () => {
+  const tall = { left: 0.35, top: 0.05, right: 0.65, bottom: 0.70 };
+  const subj = { left: 0.10, top: 0.02, right: 0.90, bottom: 0.98 };
+  const r = computeGravityCropRect(SW, SH, 1, 1, subj, tall);
+  assert.strictEqual(r.anchorY, 'face-crop');
+  const headPx = px(tall.bottom, SH) - px(tall.top, SH);
+  const cropped = Math.max(0, r.cy - px(tall.top, SH));
+  assert.ok(cropped <= FACE_TOP_CROP_ALLOWANCE_FRAC * headPx + 1,
+    `cropped ${cropped.toFixed(1)}px exceeds the ${(FACE_TOP_CROP_ALLOWANCE_FRAC * 100).toFixed(0)}% allowance of ${headPx.toFixed(1)}px`);
+});
+check('F7 rule 3 success path is UNCHANGED by the crown-sacrifice allowance (no regression)', () => {
+  // The ordinary face-safe case (window fits with margin) must place identically regardless of
+  // FACE_TOP_CROP_ALLOWANCE_FRAC — the allowance is consulted ONLY on rule 4's fallback.
+  const r = computeGravityCropRect(SW, SH, 4, 5, SUBJ_TALL, HEAD_HIGH);
+  assert.strictEqual(r.anchorY, 'face-safe');
+  const headroom = px(HEAD_HIGH.top, SH) - r.cy;
+  assert.ok(Math.abs(headroom - Math.round(FACE_TOP_MARGIN_FRAC * r.ch)) <= 1,
+    'rule 3 success path should place using ONLY the top margin, never the crop allowance');
+});
+check('F8 setting FACE_TOP_CROP_ALLOWANCE_FRAC=0 restores plain centring on rule 4', () => {
+  // Cannot re-import with a different env var mid-process (the constant is frozen at require
+  // time), so this asserts the documented contract instead: 0 is a valid, in-range setting.
+  assert.ok(FACE_TOP_CROP_ALLOWANCE_FRAC >= 0 && FACE_TOP_CROP_ALLOWANCE_FRAC <= 0.5);
+});
+check('F9 rule 4 crown sacrifice takes the MINIMUM pixels needed, never the full allowance on a near-miss', () => {
+  // A regression this pins directly: an earlier version of this branch always cropped the FULL
+  // FACE_TOP_CROP_ALLOWANCE_FRAC of head height the instant rule 4 fired, even when a tiny sliver
+  // would have satisfied the chin margin. Construct a fixture with a small, known deficit (10px)
+  // and assert the actual crop equals that deficit, not ~30% of head height.
+  const ch = windowFor(SW, SH, 1, 1).ch;      // 1080
+  const marginY = Math.round(FACE_MARGIN_FRAC * ch); // 65
+  const headHeightPx = ch - marginY + 10;      // deficit of exactly 10px
+  const faceTPx = 100;
+  const faceBPx = faceTPx + headHeightPx;
+  const tall = { left: 0.35, top: faceTPx / SH, right: 0.65, bottom: faceBPx / SH };
+  const subj = { left: 0.10, top: 0.02, right: 0.90, bottom: 0.98 };
+  assert.notStrictEqual(plausibleFace(tall, subj), null, 'fixture head rejected by the area guard');
+  const r = computeGravityCropRect(SW, SH, 1, 1, subj, tall);
+  assert.strictEqual(r.anchorY, 'face-crop');
+  const cropped = r.cy - faceTPx;
+  assert.ok(Math.abs(cropped - 10) <= 1,
+    `expected a ~10px minimal crop, got ${cropped}px (deficit-driven, not allowance-driven)`);
+  const fullAllowance = FACE_TOP_CROP_ALLOWANCE_FRAC * headHeightPx;
+  assert.ok(cropped < fullAllowance * 0.2,
+    `crop ${cropped}px is not clearly smaller than the full allowance ${fullAllowance.toFixed(1)}px`);
+  // Chin clearance must still be the full margin.
+  const chinClearance = (r.cy + r.ch) - faceBPx;
+  assert.ok(chinClearance >= marginY - 1, `chin clearance ${chinClearance} below full margin ${marginY}`);
 });
 check('F6 no subject at all -> leads with the head, not subject-fit', () => {
   const r = computeGravityCropRect(SW, SH, 1, 1, null, HEAD_HIGH);
@@ -445,7 +505,7 @@ check('O1 exhaustive sweep yields only valid, in-bounds, integer rects', () => {
           assert.ok(Number.isInteger(r.cx) && Number.isInteger(r.cy), 'non-integer origin');
           assert.ok(r.cx >= 0 && r.cy >= 0 && r.cx + r.cw <= SW && r.cy + r.ch <= SH,
             `out of bounds: ${JSON.stringify(r)}`);
-          assert.ok(['center', 'subject-fit', 'face-safe', 'face-center'].includes(r.anchorY),
+          assert.ok(['center', 'subject-fit', 'face-safe', 'face-crop', 'face-center'].includes(r.anchorY),
             `unknown anchor ${r.anchorY}`);
         }
       }
