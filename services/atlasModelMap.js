@@ -26,6 +26,14 @@ const MAP = Object.freeze({
   'gpt-4o':           { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4o' } },
   'gemini-2.5-flash': { atlas: 'google/gemini-2.5-flash', direct: { provider: 'google', model: 'gemini-2.5-flash' } },
   'gemini-2.5-pro':   { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
+  // Extract one short phrase from one short review. Tiny in, ~60 tokens out,
+  // strict json_schema, no reasoning. It was riding the 'gpt-4o-mini' role,
+  // which maps to gpt-5.6-luna at $1.00/$6.00 per 1M — 20x the input and 15x
+  // the output of the nano tier for a task that is a substring search with
+  // taste. Prices verified against the live Atlas catalog 2026-07-30.
+  // Direct fallback stays on gpt-4o-mini: a known-good OpenAI model name, and
+  // this role only reaches it if Atlas is unavailable.
+  'quote-snippet':    { atlas: 'openai/gpt-5-nano',       direct: { provider: 'openai', model: 'gpt-4o-mini' } },
 });
 
 function envKeyFor(role) {

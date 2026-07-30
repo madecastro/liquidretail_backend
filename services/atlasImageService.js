@@ -168,9 +168,9 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
       // normalize to a b64 payload so callers get buffers without egress.
       if (/^https?:\/\//.test(out)) {
         const img = await axios.get(out, { responseType: 'arraybuffer', timeout: 20_000 });
-        return { b64: Buffer.from(img.data).toString('base64'), url: out };
+        return { b64: Buffer.from(img.data).toString('base64'), url: out, predictionId: id };
       }
-      return { b64: out, url: null };
+      return { b64: out, url: null, predictionId: id };
     }
     if (['failed', 'error', 'cancelled', 'canceled', 'rejected'].includes(st)) {
       // Atlas explicitly reported failure. Providers generally do not bill a failed
@@ -230,6 +230,43 @@ function buildParams(model, { prompt, size, quality, images, inputFidelity, aspe
   return p;
 }
 
+/**
+ * An audit record of what was ACTUALLY sent to the image model, built from the
+ * same `params` object that becomes the POST body — never from what a caller
+ * intended to send. The generation inspector renders this verbatim.
+ *
+ * `submittedUrl` + `imageCount` are ground truth (they are the body). `sourceUrl`
+ * and `role` are caller-supplied labels for the same positions: they name where a
+ * buffer came from, because uploaded reference URLs are ephemeral Atlas handles
+ * that expire and would be useless in a diagnostic later. Labels never replace or
+ * reorder the submitted list — a missing label leaves null rather than guessing.
+ */
+function buildSubmissionRecord({ provider, model, params = {}, predictionId = null, imageMeta = [] }) {
+  const images = Array.isArray(params.images) ? params.images : [];
+  // An explicit null from a caller would defeat the default and throw on
+  // indexing — after a billable submit has already succeeded, which would
+  // discard a paid-for image over a labelling detail.
+  const labels = Array.isArray(imageMeta) ? imageMeta : [];
+  return {
+    provider,
+    model,
+    predictionId,
+    submittedAt: new Date().toISOString(),
+    prompt:        params.prompt ?? null,
+    size:          params.size ?? null,
+    quality:       params.quality ?? null,
+    aspectRatio:   params.aspect_ratio ?? null,
+    inputFidelity: params.input_fidelity ?? null,
+    imageCount:    images.length,
+    images: images.map((url, i) => ({
+      position:     i,
+      submittedUrl: typeof url === 'string' ? url : null,
+      sourceUrl:    labels[i]?.sourceUrl ?? null,
+      role:         labels[i]?.role ?? null
+    }))
+  };
+}
+
 // ── direct-OpenAI fallback (original models, original API) ─────────────────
 async function directOpenAiImages({ kind, prompt, size, quality, buffers, fallbackModel }) {
   const key = process.env.OPENAI_API_KEY;
@@ -261,19 +298,31 @@ async function generateImage({
   const m = model || DEFAULT_T2I_MODEL;
   try {
     if (!isConfigured()) throw new Error('ATLAS_API_KEY not configured');
-    const out = await submitAndPoll(
-      m,
-      buildParams(m, { prompt, size, quality, aspectRatio }),
-      meta,
-      { timeoutMs }
-    );
-    return { data: [{ b64_json: out.b64 }], url: out.url };
+    // Built inside the try so a throw here still reaches the provider
+    // fallback, matching editImage.
+    const params = buildParams(m, { prompt, size, quality, aspectRatio });
+    const out = await submitAndPoll(m, params, meta, { timeoutMs });
+    return {
+      data: [{ b64_json: out.b64 }],
+      url: out.url,
+      submission: buildSubmissionRecord({ provider: 'atlas', model: m, params, predictionId: out.predictionId })
+    };
   } catch (err) {
     if (!allowFallback) throw err;
     warnIfDoublePaying(err, 'generate');
     const fb = await directOpenAiImages({ kind: 'generate', prompt, size, quality, fallbackModel }).catch((e) => { throw new Error(`${err.message}; fallback: ${e.message}`); });
     if (!fb) throw err;
-    return { data: [{ b64_json: fb.b64 }], url: fb.url };
+    // The fallback is a DIFFERENT provider and model. Reporting the Atlas
+    // attempt here would describe a request that produced nothing.
+    return {
+      data: [{ b64_json: fb.b64 }],
+      url: fb.url,
+      submission: buildSubmissionRecord({
+        provider: 'openai-direct',
+        model: fallbackModel || 'gpt-image-1',
+        params: { prompt, size, quality }
+      })
+    };
   }
 }
 
@@ -302,7 +351,8 @@ function warnIfDoublePaying(err, kind) {
  */
 async function editImage({
   prompt, images = [], size, quality, inputFidelity, model, fallbackModel,
-  aspectRatio, meta = {}, timeoutMs, uploadTimeoutMs, allowFallback = true
+  aspectRatio, meta = {}, timeoutMs, uploadTimeoutMs, allowFallback = true,
+  imageMeta = []
 }) {
   const m = model || DEFAULT_EDIT_MODEL;
   const buffers = images.filter((i) => Buffer.isBuffer(i));
@@ -315,13 +365,13 @@ async function editImage({
         ? uploadBuffer(img, `reference-${index + 1}.png`, 'image/png', uploadTimeoutMs)
         : img
     )));
-    const out = await submitAndPoll(
-      m,
-      buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio }),
-      meta,
-      { timeoutMs }
-    );
-    return { data: [{ b64_json: out.b64 }], url: out.url };
+    const params = buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio });
+    const out = await submitAndPoll(m, params, meta, { timeoutMs });
+    return {
+      data: [{ b64_json: out.b64 }],
+      url: out.url,
+      submission: buildSubmissionRecord({ provider: 'atlas', model: m, params, predictionId: out.predictionId, imageMeta })
+    };
   } catch (err) {
     if (!allowFallback) throw err;
     warnIfDoublePaying(err, 'edit');
@@ -332,8 +382,19 @@ async function editImage({
     }
     const fb = await directOpenAiImages({ kind: 'edit', prompt, size, quality, buffers: fbBuffers, fallbackModel }).catch((e) => { throw new Error(`${err.message}; fallback: ${e.message}`); });
     if (!fb) throw err;
-    return { data: [{ b64_json: fb.b64 }], url: fb.url };
+    // Buffers go to OpenAI as multipart files, so there is no submitted URL to
+    // record — only the true count and the caller's position labels.
+    return {
+      data: [{ b64_json: fb.b64 }],
+      url: fb.url,
+      submission: buildSubmissionRecord({
+        provider: 'openai-direct',
+        model: fallbackModel || 'gpt-image-1',
+        params: { prompt, size, quality, images: fbBuffers },
+        imageMeta
+      })
+    };
   }
 }
 
-module.exports = { generateImage, editImage, uploadBuffer, isConfigured, buildPriceMap };
+module.exports = { generateImage, editImage, uploadBuffer, isConfigured, buildPriceMap, buildSubmissionRecord };

@@ -67,7 +67,7 @@ const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
 const { computeSlotBudgets } = require('./slotBudget');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
-const { extractSnippet }        = require('./quoteSnippetService');
+const { extractSnippet, PROOF_LINE_MAX_CHARS } = require('./quoteSnippetService');
 
 // Atlas gateway (Gemini served OpenAI-compatible; Google's OpenAI-compat
 // endpoint as the direct fallback inside the transport).
@@ -1304,6 +1304,47 @@ function scoreQuote(text) {
 // promote neutral-lived-experience quotes with no endorsement value.
 const SCORE_FLOOR = 1;
 
+// Star gate for review-backed quote tiers. A testimonial on a paid ad should
+// come from someone who actually rated the product highly — text scoring alone
+// cannot tell "the fabric feels amazing" in a 5-star review from the same
+// clause inside a 2-star complaint.
+//
+// Applies to reviews only. Instagram comments and LLM-authored lines carry no
+// star rating and are gated by sentiment elsewhere.
+const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.5);
+// Whether a quote with NO recorded rating may still be used. Per-review stars
+// were not captured until recently, so every already-synced product has
+// unrated quotes: requiring a rating outright would strip testimonials from
+// the entire existing catalog until each product is re-synced. Default keeps
+// them and reports the gap; set true once coverage is good.
+const QUOTE_REQUIRE_RATING = String(process.env.QUOTE_REQUIRE_RATING || 'false').toLowerCase() === 'true';
+
+function gateQuotesByRating(candidates, tierName) {
+  if (!Array.isArray(candidates) || !candidates.length) return [];
+  let rated = 0, dropped = 0, unrated = 0;
+  const kept = candidates.filter((q) => {
+    if (typeof q?.rating !== 'number' || !Number.isFinite(q.rating)) {
+      unrated += 1;
+      return !QUOTE_REQUIRE_RATING;
+    }
+    rated += 1;
+    // Ratings arrive on both 5-point and 100-point scales depending on the
+    // review app; normalize before comparing so a 90/100 is not read as a 90.
+    const normalized = q.rating > 5 ? (q.rating / 20) : q.rating;
+    if (normalized >= QUOTE_MIN_RATING) return true;
+    dropped += 1;
+    return false;
+  });
+  if (dropped || unrated) {
+    console.log(
+      `⭐ quote gate[${tierName}] — kept=${kept.length}/${candidates.length} ` +
+      `rated=${rated} belowMin=${dropped} unrated=${unrated} ` +
+      `(min=${QUOTE_MIN_RATING}, requireRating=${QUOTE_REQUIRE_RATING})`
+    );
+  }
+  return kept;
+}
+
 function pickStrongestQuote(candidates) {
   if (!Array.isArray(candidates) || candidates.length === 0) return null;
   let best = null;
@@ -1317,31 +1358,74 @@ function pickStrongestQuote(candidates) {
     }
   }
   if (!best || bestScore < SCORE_FLOOR) return null;
-  // Require at least one positive lexeme — prevents pure lived-experience
-  // narration ("Bought this three weeks ago") from winning the primary
-  // slot with no endorsement signal.
-  const s = String(best.text || '');
+  return hasPositiveSignal(best.text) ? best : null;
+}
+
+// Require at least one positive lexeme — prevents pure lived-experience
+// narration ("Bought this three weeks ago") from being used as an
+// endorsement. Shared by the quote tiers and by social comments so both are
+// held to the same standard of what counts as praise.
+function hasPositiveSignal(text) {
+  const s = String(text || '');
   const hasPositive =
        STRONG_POSITIVE.test(s)
     || MODERATE_POSITIVE.test(s)
     || PHRASE_STRONG.test(s);
   // Reset the regex `lastIndex` state since STRONG_POSITIVE/MODERATE_POSITIVE
   // use the global flag; leaving lastIndex non-zero would break subsequent
-  // matches on the next pick.
+  // matches on the next call.
   STRONG_POSITIVE.lastIndex = 0;
   MODERATE_POSITIVE.lastIndex = 0;
   PHRASE_STRONG.lastIndex = 0;
-  return hasPositive ? best : null;
+  return hasPositive;
+}
+
+// Social comments rendered as proof go through the SAME pipeline as review
+// quotes: positive-sentiment gate, then extractSnippet — the one place a
+// quote is shortened, which enforces a self-contained thought on a whole
+// word. Comments that carry no praise, or that yield nothing usable, are
+// dropped rather than shown half-finished. Nothing downstream shortens
+// these again.
+async function buildProofComments(topComments, ctx, limit = 3) {
+  const rows = Array.isArray(topComments) ? topComments : [];
+  const positive = rows.filter((c) => c?.text && hasPositiveSignal(c.text));
+  const out = [];
+  for (const c of positive) {
+    if (out.length >= limit) break;
+    const snippet = await extractSnippet(c.text, {
+      brandId:   ctx.media?.brandId || null,
+      productId: ctx.match?.identification?.details?.catalogProductId || null
+    });
+    if (!snippet || snippet.length > PROOF_LINE_MAX_CHARS) continue;
+    out.push({
+      text:            snippet,
+      author_username: c.authorUsername || c.author || null,
+      like_count:      c.likeCount || 0,
+      reply_count:     c.replyCount || 0,
+      posted_at:       c.postedAt || null
+    });
+  }
+  if (rows.length !== out.length) {
+    console.log(`💬 proof comments — kept=${out.length}/${rows.length} (positive=${positive.length}, max=${PROOF_LINE_MAX_CHARS}c)`);
+  }
+  return out;
 }
 
 // Normalize a raw quote object from any tier into the shape the
 // layout-input artifact expects: { text, author_name, source }.
 function normalizeQuote(q) {
   if (!q?.text) return null;
+  // rating is carried so selection can gate on the reviewer's stars. It was
+  // dropped here, which left scoring to judge the wording alone — a low-rated
+  // review that reads positively could win the primary slot.
+  // null means genuinely unknown (older rows, comments, LLM-authored), never
+  // "unrated so assume good".
+  const rating = Number(q.rating ?? q.reviewRating?.ratingValue);
   return {
     text:        String(q.text).trim(),
     author_name: q.author_name || q.author || q.source || 'Verified buyer',
     source:      q.source || undefined,
+    rating:      Number.isFinite(rating) ? rating : null,
     verified:    q.verified !== undefined ? q.verified : true
   };
 }
@@ -1619,10 +1703,31 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // First non-empty tier's best-scoring quote wins the primary slot.
   // Everything else across all tiers goes to secondary_quotes so the
   // renderer can rotate through them.
-  const tierProduct = (details.productReviews?.quotes || []).map(normalizeQuote).filter(Boolean);
+  const tierProduct = gateQuotesByRating((details.productReviews?.quotes || []).map(normalizeQuote).filter(Boolean), 'product');
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
-  const tierCategory = (catReviewsForMatch?.quotes || []).map(normalizeQuote).filter(Boolean);
-  const tierBrand    = (ctx.match?.brandReviews?.quotes || ctx.brand?.brandReviews?.quotes || []).map(normalizeQuote).filter(Boolean);
+  const tierCategory = gateQuotesByRating((catReviewsForMatch?.quotes || []).map(normalizeQuote).filter(Boolean), 'category');
+  // Brand-tier reviews are catalog-wide: they are about whatever the reviewer
+  // bought, which on a multi-SKU brand is usually NOT this product. Rendering
+  // one under this product's photo presents another item's praise as if it
+  // were about this one — a leggings review as the testimonial on a tee ad.
+  // Brand reviews therefore only back a BRAND ad, where no single product is
+  // being claimed. A product ad with no product- or category-level review
+  // shows no testimonial, which is the honest result.
+  // catalogProductId is the FK on ProductMatchArtifact (:78) and is what the
+  // rest of this file tests product scope with (:653, :1850). The nested
+  // identification.details.catalogProductId is NOT hydrated —
+  // productMatchHydration rebuilds that object from the CatalogProduct's
+  // commerce fields and never writes an id onto it — so reading it here would
+  // have left isProductScoped false on real product ads and leaked the brand
+  // quotes this guard exists to withhold.
+  const isProductScoped = !!(ctx.match?.catalogProductId || ctx.match?.identification?.details?.catalogProductId);
+  const brandQuotesRaw = (ctx.match?.brandReviews?.quotes || ctx.brand?.brandReviews?.quotes || []);
+  const tierBrand = isProductScoped
+    ? []
+    : gateQuotesByRating(brandQuotesRaw.map(normalizeQuote).filter(Boolean), 'brand');
+  if (isProductScoped && brandQuotesRaw.length) {
+    console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk)`);
+  }
   const tierComment  = await loadBrandCommentsForQuotePool(ctx);
   const tierLlm      = (Array.isArray(derivation.quotes) ? derivation.quotes : []).map(normalizeQuote).filter(Boolean);
 
@@ -1653,8 +1758,17 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       brandId:   ctx.media?.brandId || null,
       productId: ctx.match?.identification?.details?.catalogProductId || null
     });
-    if (snippet && snippet !== primaryQuote.text) primaryQuote.snippet = snippet;
+    // Always populate, even when it equals the source. `snippet` means "the
+    // <=50-char, word-safe form of this quote", which for an already-short
+    // quote IS the quote. Setting it only when it DIFFERED left the field
+    // absent for every short quote, so a layout binding
+    // social_proof.primary_quote.snippet rendered an empty proof element
+    // precisely when the quote needed no shortening.
+    if (snippet) primaryQuote.snippet = snippet;
   }
+
+  // Social comments used as proof go through the same gate + snippet path.
+  const proofComments = await buildProofComments(ctx.topComments, ctx);
 
   // Observability — show tier counts + which tier won so a bad
   // primary_quote is diagnosable from Render logs without a DB query.
@@ -1852,13 +1966,10 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       // collection at loadContext time. The new comment_card zone
       // binds to ugc.top_comments[]; existing metrics_row continues
       // to bind to ugc.{likes,comments,saves,shares} as counts.
-      top_comments: (ctx.topComments || []).map(c => ({
-        text:            c.text || '',
-        author_username: c.authorUsername || null,
-        like_count:      c.likeCount || 0,
-        reply_count:     c.replyCount || 0,
-        posted_at:       c.postedAt || null
-      }))
+      // Positive-gated and snippetized through the same path as review
+      // quotes (see buildProofComments) — previously the raw comment was
+      // passed through and the renderer clipped whatever overflowed.
+      top_comments: proofComments
     },
 
     social_proof: {
@@ -2827,5 +2938,8 @@ module.exports = {
   loadContext,
   // Exported for the AI-canvas pipeline so it can build per-ratio
   // alt crop URLs from the same crop artifacts the renderer uses.
-  buildCloudinaryCropUrl
+  buildCloudinaryCropUrl,
+  // Shared so every surface that renders a social comment as proof applies
+  // the same definition of praise, rather than each growing its own lexicon.
+  hasPositiveSignal
 };

@@ -525,12 +525,27 @@ async function loadTopComments(mediaId, n) {
       .limit(n)
       .select('author authorUsername text content likeCount postedAt')
       .lean();
-    return rows.map(c => ({
-      author:  c.author || c.authorUsername || null,
-      text:    (c.text || c.content || '').slice(0, 200),
-      likes:   c.likeCount ?? null,
-      posted_at: c.postedAt || null
-    }));
+    // Same treatment as review quotes and the layoutInput comment path: only
+    // praise, and shortened once by extractSnippet into a self-contained
+    // thought on a whole word. This used to be a raw 200-char slice, which is
+    // both over the 60-char proof ceiling and a cut mid-word — and it applied
+    // no sentiment gate at all, so a complaint could be rendered as proof.
+    const { extractSnippet, PROOF_LINE_MAX_CHARS } = require('./quoteSnippetService');
+    const { hasPositiveSignal } = require('./layoutInputService');
+    const out = [];
+    for (const c of rows) {
+      const raw = (c.text || c.content || '').trim();
+      if (!raw || !hasPositiveSignal(raw)) continue;
+      const snippet = await extractSnippet(raw);
+      if (!snippet || snippet.length > PROOF_LINE_MAX_CHARS) continue;
+      out.push({
+        author:  c.author || c.authorUsername || null,
+        text:    snippet,
+        likes:   c.likeCount ?? null,
+        posted_at: c.postedAt || null
+      });
+    }
+    return out;
   } catch (_) {
     return [];   // Comment model optional — UGC ingestion may not have populated it yet
   }

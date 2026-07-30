@@ -72,7 +72,7 @@ async function renderCreative(req) {
   // Load the queued Ad doc up front. identityDigest is needed for the
   // upload filename so re-renders of the same (campaign, identity)
   // overwrite the existing Cloudinary asset rather than orphaning.
-  const adDoc = req.adId ? await Ad.findById(req.adId).select('identityDigest').lean() : null;
+  const adDoc = req.adId ? await Ad.findById(req.adId).select('identityDigest referenceMediaIds').lean() : null;
   const identityDigest = adDoc?.identityDigest || null;
   const stages = {};
   const t0 = Date.now();
@@ -170,7 +170,11 @@ async function renderCreative(req) {
       // CanvasAndHtml uses them directly instead of pickConceptForCell.
       // Null on legacy Ads → existing behavior.
       adConceptArtifactId: req.adConceptArtifactId || null,
-      adConceptId:         req.adConceptId         || null
+      adConceptId:         req.adConceptId         || null,
+      // The operator's explicit ordered image picks. Empty for most ads,
+      // where the static path deliberately sends ONE reference — see
+      // directImageRenderService. The video path already reads this.
+      referenceMediaIds:   Array.isArray(adDoc?.referenceMediaIds) ? adDoc.referenceMediaIds : []
     });
     stages.render = Date.now() - t;
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB, mode=static)`);
@@ -1063,6 +1067,7 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
       bytes:              upload.bytes,
       durationMs:         upload.durationMs,
       fontResolution:     renderOutput.fontResolution || null,
+      imageGeneration:    renderOutput.imageGeneration || null,
       copy,
       status:             'draft',
       renderedAt:         new Date(),

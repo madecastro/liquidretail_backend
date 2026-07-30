@@ -654,10 +654,23 @@ async function buildMetaForAd(ad, brand) {
   // endcardMode routes the canonical scripts' brand vs product endcard
   // branch. reviewsText is a formatted string built from reviewCount.
   const endcardMode = ad.productId ? 'product' : 'brand';
+  // Null when we have no count, so the slot is skipped. The old fallback was
+  // the literal '53 reviews' — a number invented for a product we hold no
+  // review data for, printed as social proof. Removing the brand-level
+  // rating/reviewCount fallback from the cascade makes an unknown count more
+  // common, which makes inventing one worse, not more excusable.
   const rc = cascaded.reviewCount;
-  const reviewsText = rc != null
-    ? `${rc} review${rc === 1 ? '' : 's'}`
-    : '53 reviews';
+  const reviewsText = rc != null ? `${rc} review${rc === 1 ? '' : 's'}` : null;
+
+  // deliveryLine and promoText share their two highest-priority sources
+  // (ad.copy.offer_text, then layoutInput.input.cta.offer_text), so any ad
+  // with an offer set resolves both to the SAME string and paints it twice —
+  // e.g. "Only $28" as both the delivery line and the promo pill. promoText
+  // is the one designed to be skippable (its cascade deliberately has no
+  // literal fallback), so it yields when it would only repeat the line above.
+  const promoText = cascaded.promoText && cascaded.promoText === cascaded.deliveryLine
+    ? null
+    : (cascaded.promoText ?? null);
 
   return {
     // Cascaded fields — every one of these can be re-pointed via
@@ -681,7 +694,7 @@ async function buildMetaForAd(ad, brand) {
     reviewCount:        cascaded.reviewCount        ?? null,
     likes:              cascaded.likes              ?? null,
     quoteSnippet:       cascaded.quoteSnippet       ?? null,
-    promoText:          cascaded.promoText          ?? null,   // null lets the renderer skip the promo pill
+    promoText,   // null lets the renderer skip the promo pill (see dedupe above)
     productOnlyImageUrl: cascaded.productOnlyImageUrl ?? null,
 
     // Alias for the Remotion titling engine's `productImage` slot bind
