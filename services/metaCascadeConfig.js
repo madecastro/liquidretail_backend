@@ -72,10 +72,15 @@ const DEFAULT_META_CASCADES = {
   // truck as though $28 were the shipping terms, and painted a second time
   // as the promo pill, since promoText draws from the same two sources.
   // The offer now renders once, through promoText alone.
+  // No literal fallback, and no brand tagline: this slot is drawn with a
+  // delivery truck, so whatever lands in it reads as a shipping promise.
+  // 'Ships free' was a hardcoded default asserting free shipping for every
+  // brand on the platform, true or not — it was simply invisible before,
+  // because offer_text outranked it on any ad with an offer. A tagline next
+  // to a truck is nonsense for the same reason. Null now means the slot is
+  // skipped, which is the honest outcome when we hold no delivery terms.
   deliveryLine: [
     { type: 'doc', doc: 'layoutInput', path: 'input.product.badges[1]' },
-    { type: 'doc', doc: 'brand',       path: 'tagline' },
-    { type: 'literal', value: 'Ships free' },
   ],
   promoText: [
     { type: 'doc', doc: 'ad',          path: 'copy.offer_text' },
