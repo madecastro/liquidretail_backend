@@ -113,8 +113,9 @@ async function runEnrichment(brand, brandId, run = null) {
   const wantScraped      = !sourcesAttempted.has('scraped');
   const wantGpt          = !!process.env.OPENAI_API_KEY && !sourcesAttempted.has('gpt');
   const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
+  const wantFontIngest   = !brand.fontIngestedAt;
 
-  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews) {
+  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
 
@@ -125,6 +126,7 @@ async function runEnrichment(brand, brandId, run = null) {
   if (wantScraped)      planParts.push('scrape');
   if (wantGpt)          planParts.push('gpt');
   if (wantBrandReviews) planParts.push('brand-reviews');
+  if (wantFontIngest)   planParts.push('website-fonts');
   console.log(`🌐 brand enrichment: ${brand.websiteUrl} for "${brand.name}" — running ${planParts.join('+')}${sourcesAttempted.size ? ` (already have: ${[...sourcesAttempted].join(', ')})` : ''}`);
 
   // ── Tier 1: Brandfetch ──
@@ -208,7 +210,10 @@ async function runEnrichment(brand, brandId, run = null) {
   const skipLLM = textContent.length < 200;
   if (skipLLM && !bf) {
     console.warn(`   ⚠️  brand enrichment: ${brand.websiteUrl} returned too little text (${rawTextContent.length} chars) — likely bot-blocked, no Brandfetch fallback`);
-    return { ok: false, reason: 'too little text and no Brandfetch data' };
+    // Font stylesheets may still be public even when readable page text is
+    // sparse (Shopify/Next storefronts), so continue when the automatic
+    // website-font scan has not run yet.
+    if (!wantFontIngest) return { ok: false, reason: 'too little text and no Brandfetch data' };
   }
 
   // ── Tier 3: GPT-4.1 text extraction ──
@@ -458,6 +463,30 @@ async function runEnrichment(brand, brandId, run = null) {
   brand.enrichedAt = new Date();
   await brand.save();
 
+  // Initial brand ingest now includes the customer's real website font
+  // files. This remains best-effort: a blocked stylesheet or commercial
+  // foundry must not fail the rest of brand enrichment.
+  if (wantFontIngest && brand.websiteUrl) {
+    if (run) { await run.checkpoint(); run.stage('website fonts'); }
+    try {
+      const { ingestBrandFonts } = require('./brandFontIngestService');
+      const { applyFontIngestResult } = require('./brandFontPersistenceService');
+      const fontResult = await ingestBrandFonts(brand, { trackProgress: false });
+      applyFontIngestResult(brand, fontResult);
+      await brand.save();
+      console.log(
+        `   · website fonts: ${fontResult.ingested.length} usable, ` +
+        `${fontResult.flagged.length} flagged, heading=${fontResult.usage?.heading || 'unknown'}, ` +
+        `body=${fontResult.usage?.body || 'unknown'}`
+      );
+    } catch (err) {
+      brand.fontIngestedAt = new Date();
+      brand.fontIngestError = String(err.message || err).slice(0, 2000);
+      await brand.save().catch(() => {});
+      console.warn(`   ⚠️  website font ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
+
   // Per-field override log — fire-and-forget calls go to the same
   // server log stream, so this is the only visibility into what the
   // background enrichment actually changed.
@@ -476,7 +505,8 @@ async function runEnrichment(brand, brandId, run = null) {
     wantTailwind ? 'tailwind' : null,
     wantScraped    ? 'scraped'    : null,
     (wantGpt && !skipLLM) ? 'gpt'  : null,
-    wantBrandReviews ? 'brand-reviews' : null
+    wantBrandReviews ? 'brand-reviews' : null,
+    wantFontIngest ? 'website-fonts' : null
   ].filter(Boolean).join('+');
   console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), ${brand.brandReviews?.quotes?.length || 0} brand review(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
   return { ok: true, brand, overrides };

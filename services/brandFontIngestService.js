@@ -129,6 +129,12 @@ function parseWeight(raw) {
   return m ? parseInt(m[0], 10) : 400;
 }
 
+function parseWeightRange(raw) {
+  const range = String(raw || '').trim().match(/(\d{2,4})\s+(\d{2,4})/);
+  if (!range) return { weightMin: null, weightMax: null };
+  return { weightMin: parseInt(range[1], 10), weightMax: parseInt(range[2], 10) };
+}
+
 function cleanFamily(raw) {
   if (!raw) return null;
   const fam = String(raw).split(',')[0].trim().replace(/^['"]+|['"]+$/g, '').trim();
@@ -185,9 +191,11 @@ function buildFace({ family, weight, style, src, unicodeRange }, baseUrl) {
   if (!candidates.length) return null;
   candidates.sort((a, b) => FORMAT_RANK[b.format] - FORMAT_RANK[a.format]);
 
+  const range = parseWeightRange(weight);
   return {
     family: fam,
     weight: parseWeight(weight),
+    ...range,
     style: /italic|oblique/i.test(String(style || '')) ? 'italic' : 'normal',
     format: candidates[0].format,
     url: candidates[0].url,
@@ -288,6 +296,79 @@ function parseFontFacesFromCss(cssText, baseUrl) {
   return faces.length ? faces : regexExtractFontFaces(css, baseUrl);
 }
 
+// ── Website role usage ─────────────────────────────────────────────────
+
+const GENERIC_FAMILIES = new Set([
+  'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui',
+  'ui-serif', 'ui-sans-serif', 'ui-monospace', 'inherit', 'initial', 'unset'
+]);
+
+function firstConcreteFamily(raw, variables = {}) {
+  if (!raw) return null;
+  let value = String(raw).trim();
+  const varRef = value.match(/^var\(\s*(--[a-z0-9_-]+)(?:\s*,\s*([^)]+))?\)/i);
+  if (varRef) value = variables[varRef[1]] || varRef[2] || '';
+  for (const part of value.split(',')) {
+    const family = part.trim().replace(/^['"]+|['"]+$/g, '').trim();
+    if (family && !GENERIC_FAMILIES.has(family.toLowerCase())) return family;
+  }
+  return null;
+}
+
+/**
+ * Best-effort extraction of the font families the storefront actually
+ * assigns to headings, body copy and buttons. This is intentionally
+ * evidence, not computed-style truth: the resolver still validates the
+ * family against an ingested website face or Google Fonts before use.
+ */
+function extractFontUsageFromCss(cssText) {
+  const css = String(cssText || '').replace(/\/\*[\s\S]*?\*\//g, ' ');
+  const variables = {};
+  for (const m of css.matchAll(/(--[a-z0-9_-]+)\s*:\s*([^;}{]+)/gi)) {
+    variables[m[1]] = m[2].trim();
+  }
+
+  const evidence = [];
+  const ruleRe = /([^{}]+)\{([^{}]*)\}/g;
+  let match;
+  while ((match = ruleRe.exec(css)) !== null) {
+    const selector = match[1].trim();
+    if (!selector || selector.startsWith('@')) continue;
+    const declaration = match[2];
+    const familyMatch = declaration.match(/font-family\s*:\s*([^;}]+)/i);
+    if (!familyMatch) continue;
+    const family = firstConcreteFamily(familyMatch[1], variables);
+    if (!family) continue;
+
+    let role = null;
+    let score = 1;
+    const selectorKey = selector.toLowerCase();
+    if (/(^|[^a-z0-9])(h[1-6]|heading|headline|hero-title|display-title)([^a-z0-9]|$)/.test(selectorKey)) {
+      role = 'heading'; score = 4;
+    } else if (/(^|[^a-z0-9])(button|btn|cta|call-to-action)([^a-z0-9]|$)/.test(selectorKey)) {
+      role = 'button'; score = 3;
+    } else if (/(^|[^a-z0-9])(body|html|p|paragraph|copy|rich-text|rte)([^a-z0-9]|$)/.test(selectorKey)) {
+      role = 'body'; score = 3;
+    }
+    if (!role) continue;
+    evidence.push({ family, role, selector: selector.slice(0, 180), score });
+  }
+
+  const pick = (role) => {
+    const scores = new Map();
+    for (const item of evidence.filter((e) => e.role === role)) {
+      scores.set(item.family, (scores.get(item.family) || 0) + item.score);
+    }
+    return [...scores.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+  };
+  return {
+    heading: pick('heading'),
+    body: pick('body'),
+    button: pick('button'),
+    evidence: evidence.slice(0, 30)
+  };
+}
+
 // ── HTML → stylesheet discovery ────────────────────────────────────────
 
 function extractInlineStyles(html) {
@@ -295,7 +376,7 @@ function extractInlineStyles(html) {
   const re = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    if (m[1] && m[1].includes('@font-face')) out.push(m[1]);
+    if (m[1] && m[1].trim()) out.push(m[1]);
   }
   return out;
 }
@@ -383,10 +464,19 @@ function familySlug(family) {
  *     flagged), sourceUrl, source:'website', license, needsLicense, ingestedAt }
  * @throws when brand.websiteUrl is missing or the homepage is unreachable
  */
-async function ingestBrandFonts(brand) {
+async function ingestBrandFonts(brand, { trackProgress = true } = {}) {
   const t0 = Date.now();
   const { startRun, CancelledError } = require('./progressService');
-  const run = await startRun({ kind: 'font-ingest', advertiserId: brand.advertiserId, brandId: brand._id, label: 'Website font ingest' });
+  const run = trackProgress
+    ? await startRun({ kind: 'font-ingest', advertiserId: brand.advertiserId, brandId: brand._id, label: 'Website font ingest' })
+    : {
+        stage() {},
+        tick() {},
+        async checkpoint() {},
+        async succeed() {},
+        async fail() {},
+        async markCancelled() {}
+      };
   try {
     const result = await ingestBrandFontsInner(brand, run);
     if (result.cancelled) {
@@ -438,6 +528,7 @@ async function ingestBrandFontsInner(brand, run) {
   // sheets. One dead sheet is an errors[] line, never a hard failure.
   const sheets = extractInlineStyles(html).map((css) => ({ css, baseUrl: pageUrl, from: 'inline <style>' }));
   const sheetUrls = extractStylesheetUrls(html, pageUrl);
+  const seenSheetUrls = new Set(sheetUrls);
   for (const href of sheetUrls) {
     try {
       const res = await axios.get(href, {
@@ -449,7 +540,20 @@ async function ingestBrandFontsInner(brand, run) {
         transformResponse: [(d) => d],
         headers: { 'User-Agent': UA, Accept: 'text/css,*/*;q=0.1' }
       });
-      sheets.push({ css: String(res.data || ''), baseUrl: href, from: href });
+      const css = String(res.data || '');
+      sheets.push({ css, baseUrl: href, from: href });
+      // Follow bounded CSS @imports. Themes often put @font-face rules in
+      // a typography partial rather than the homepage's first-level sheet.
+      for (const m of css.matchAll(/@import\s+(?:url\(\s*)?['"]?([^'")\s;]+)['"]?\s*\)?[^;]*;/gi)) {
+        if (sheetUrls.length >= MAX_STYLESHEETS) break;
+        try {
+          const imported = new URL(m[1], href).toString();
+          if (/^https?:/i.test(imported) && !seenSheetUrls.has(imported)) {
+            seenSheetUrls.add(imported);
+            sheetUrls.push(imported);
+          }
+        } catch { /* malformed import — skip */ }
+      }
     } catch (err) {
       errors.push(`stylesheet fetch failed: ${href}: ${err.message}`);
     }
@@ -465,6 +569,12 @@ async function ingestBrandFontsInner(brand, run) {
     }
   }
   faces = dedupeFaces(faces);
+  const usageParts = sheets.map((sheet) => extractFontUsageFromCss(sheet.css));
+  const usageEvidence = usageParts.flatMap((u) => u.evidence || []);
+  const usage = extractFontUsageFromCss(
+    usageEvidence.map((e) => `${e.selector}{font-family:"${e.family}"}`).join('\n')
+  );
+  usage.evidence = usageEvidence.slice(0, 30);
 
   // 4–6. Classify, then mirror ingestable faces to Cloudinary.
   const ingested = [];
@@ -486,6 +596,8 @@ async function ingestBrandFontsInner(brand, run) {
     const entryBase = {
       family: face.family,
       weight: face.weight,
+      weightMin: face.weightMin,
+      weightMax: face.weightMax,
       style: face.style,
       format: face.format,
       sourceUrl: face.url,
@@ -525,11 +637,12 @@ async function ingestBrandFontsInner(brand, run) {
     `🔤 brand font ingest for "${brand.name || brandId}": ${ingested.length} ingested, ${flagged.length} flagged commercial, ${errors.length} error(s) from ${sheets.length} sheet(s) (${faces.length} unique face(s)) in ${Date.now() - t0}ms${cancelled ? ' [cancelled]' : ''}`
   );
 
-  return { ingested, flagged, errors, cancelled };
+  return { ingested, flagged, errors, cancelled, usage };
 }
 
 module.exports = {
   ingestBrandFonts,
   classifyFontSource,
-  parseFontFacesFromCss
+  parseFontFacesFromCss,
+  extractFontUsageFromCss
 };

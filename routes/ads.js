@@ -715,7 +715,7 @@ async function renderOne(run, job, adId, index, renderToken) {
         .select('fileType fileUrl brandId').lean();
       const brandDoc = sourceMedia?.brandId
         ? await Brand.findById(sourceMedia.brandId)
-            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily derivedVoice videoSettings titleStyleSpec titleStylePreset customFonts').lean()
+            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset').lean()
         : null;
 
       // Grok-skip branch — when the seed is already a video, we keep
@@ -1746,7 +1746,8 @@ router.get('/:id/generation-inspector', async (req, res) => {
     if (ad.kind === 'image' || ad.aiCanvasArtifactId) {
       const image = {
         aiCanvasArtifactId:    ad.aiCanvasArtifactId ? String(ad.aiCanvasArtifactId) : null,
-        layoutInputArtifactId: ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null
+        layoutInputArtifactId: ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null,
+        fontResolution:        ad.fontResolution || null
       };
       if (ad.aiCanvasArtifactId) {
         const AiCanvasArtifact = require('../models/AiCanvasArtifact');

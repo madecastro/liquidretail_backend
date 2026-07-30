@@ -312,6 +312,9 @@ const adSchema = new mongoose.Schema({
   // Brand (which drift), so this gives the generation-inspector byte-exact
   // historical titling. Written by brandScriptExecutor at render time.
   titlingSnapshot:    { type: mongoose.Schema.Types.Mixed, default: null },
+  // Exact font resolution audit for the direct static-image path.
+  // { heading/body: { requestedFamily, resolvedFamily, source, exact } }
+  fontResolution:     { type: mongoose.Schema.Types.Mixed, default: null },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },
