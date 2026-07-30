@@ -18,9 +18,15 @@ const Media = require('../models/Media');
 const { resolveBrandFonts, normalizeFontFamily } = require('./fontResolverService');
 
 const DIRECT_OVERLAY_PIPELINE = 'direct_overlay';
-const PLATE_EDIT_MODEL = 'openai/gpt-image-2/edit';
-const PLATE_T2I_MODEL = 'openai/gpt-image-2/text-to-image';
-const PLATE_QUALITY = process.env.AI_DIRECT_IMAGE_QUALITY || 'high';
+const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
+const PLATE_T2I_MODEL = process.env.AI_DIRECT_IMAGE_MODEL || 'openai/gpt-image-2/text-to-image';
+// Atlas's live GPT Image 2 schema defaults to medium. High materially extends
+// latency and is unnecessary for the plate because Sharp performs the final
+// crop, typography, logo, and export.
+const PLATE_QUALITY = process.env.AI_DIRECT_IMAGE_QUALITY || 'medium';
+const PLATE_TIMEOUT_MS = Number(process.env.AI_DIRECT_IMAGE_TIMEOUT_MS || 60_000);
+const REFERENCE_TIMEOUT_MS = Number(process.env.AI_DIRECT_REFERENCE_TIMEOUT_MS || 15_000);
+const UPLOAD_TIMEOUT_MS = Number(process.env.AI_DIRECT_UPLOAD_TIMEOUT_MS || 20_000);
 
 function isDirectOverlayPipeline(value) {
   return String(value || DIRECT_OVERLAY_PIPELINE).toLowerCase() === DIRECT_OVERLAY_PIPELINE;
@@ -216,7 +222,7 @@ function buildTextLayers({ copy, brand, layoutBrand, dims, fonts }) {
 }
 
 async function fetchBuffer(url) {
-  const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 30_000 });
+  const response = await axios.get(url, { responseType: 'arraybuffer', timeout: REFERENCE_TIMEOUT_MS });
   return Buffer.from(response.data);
 }
 
@@ -268,9 +274,21 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   const refs = (await Promise.all([optionalImage(resolvedProduct?.imageUrl), optionalImage(media?.fileUrl)])).filter(Boolean).slice(0, 2);
   const prompt = buildPlatePrompt({ concept, brand: resolvedBrand, product: resolvedProduct, aspectRatio });
   const meta = { stage: 'direct_image_overlay', service: 'directImageRenderService', purposeTag: template || 'untagged', brandId: resolvedBrand?._id || brandId || null, productId: resolvedProduct?._id || productId || null, mediaId: mediaId || null };
+  // When Atlas is configured, the established renderer is the recovery path.
+  // Starting a second provider request after a submitted Atlas prediction both
+  // extends the user's wait and can double-charge the same ad.
+  const allowProviderFallback = !atlasImage.isConfigured();
   const result = refs.length
-    ? await atlasImage.editImage({ model: PLATE_EDIT_MODEL, images: refs, prompt, size: dims.atlasSize, quality: PLATE_QUALITY, meta })
-    : await atlasImage.generateImage({ model: PLATE_T2I_MODEL, prompt, size: dims.atlasSize, quality: PLATE_QUALITY, meta });
+    ? await atlasImage.editImage({
+      model: PLATE_EDIT_MODEL, images: refs, prompt, size: dims.atlasSize,
+      quality: PLATE_QUALITY, meta, timeoutMs: PLATE_TIMEOUT_MS,
+      uploadTimeoutMs: UPLOAD_TIMEOUT_MS, allowFallback: allowProviderFallback
+    })
+    : await atlasImage.generateImage({
+      model: PLATE_T2I_MODEL, prompt, size: dims.atlasSize,
+      quality: PLATE_QUALITY, meta, timeoutMs: PLATE_TIMEOUT_MS,
+      allowFallback: allowProviderFallback
+    });
   const b64 = result?.data?.[0]?.b64_json;
   if (!b64) throw new Error('direct-image generation returned no image data');
 

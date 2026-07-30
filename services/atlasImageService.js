@@ -35,6 +35,11 @@ const TIMEOUT_MS = Number(process.env.ATLAS_IMAGE_TIMEOUT_MS || 180_000);
 
 function isConfigured() { return !!KEY(); }
 
+function positiveTimeout(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 // ── live pricing cache (per-image flat costs) ──────────────────────────────
 //
 // FIXED 2026-07-29 (ARCHITECTURE_REVIEW.md XREPO-1). This read
@@ -102,12 +107,12 @@ async function priceFor(model) {
 }
 
 // ── upload helper (buffers → temporary public URLs for edit inputs) ────────
-async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png') {
+async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png', timeoutMs = 60_000) {
   const fd = new FormData();
   fd.append('file', new Blob([buf], { type: mime }), filename);
   const res = await axios.post(`${BASE}/model/uploadMedia`, fd, {
     headers: { Authorization: `Bearer ${KEY()}` },
-    timeout: 60_000,
+    timeout: positiveTimeout(timeoutMs, 60_000),
   });
   const url = res.data?.data?.download_url;
   if (!url) throw new Error(`uploadMedia returned no URL: ${JSON.stringify(res.data).slice(0, 200)}`);
@@ -115,11 +120,12 @@ async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png') {
 }
 
 // ── submit + poll ──────────────────────────────────────────────────────────
-async function submitAndPoll(model, params, meta = {}) {
+async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS } = {}) {
+  const generationTimeoutMs = positiveTimeout(timeoutMs, TIMEOUT_MS);
   const t0 = Date.now();
   const submit = await axios.post(`${BASE}/model/generateImage`, { model, ...params }, {
     headers: { Authorization: `Bearer ${KEY()}`, 'Content-Type': 'application/json' },
-    timeout: 60_000,
+    timeout: Math.min(60_000, generationTimeoutMs),
     validateStatus: () => true,
     // BILLABLE POST — axios defaults to maxRedirects 21 and re-sends the body on a
     // 307/308, which is a double charge inside a single call and invisible to any
@@ -133,15 +139,24 @@ async function submitAndPoll(model, params, meta = {}) {
     throw new Error(`Atlas image submit ${submit.status}: ${JSON.stringify(submit.data).slice(0, 200)}`);
   }
   const id = submit.data.data.id;
+  let lastStatus = null;
+  console.log(`   ⏳ atlasImage: submitted ${id} (${model}); deadline=${generationTimeoutMs}ms`);
 
-  while (Date.now() - t0 < TIMEOUT_MS) {
-    await new Promise((r) => setTimeout(r, POLL_MS));
+  while (Date.now() - t0 < generationTimeoutMs) {
+    const remainingBeforePoll = generationTimeoutMs - (Date.now() - t0);
+    await new Promise((r) => setTimeout(r, Math.min(POLL_MS, Math.max(0, remainingBeforePoll))));
+    const remaining = generationTimeoutMs - (Date.now() - t0);
+    if (remaining <= 0) break;
     const poll = await axios.get(`${BASE}/model/prediction/${id}`, {
       headers: { Authorization: `Bearer ${KEY()}` },
-      timeout: 30_000,
+      timeout: Math.min(30_000, Math.max(1000, remaining)),
       validateStatus: () => true,
     });
-    const st = poll.data?.data?.status;
+    const st = String(poll.data?.data?.status || 'unknown').toLowerCase();
+    if (st !== lastStatus) {
+      console.log(`   ⏳ atlasImage: ${id} status=${st} elapsed=${Date.now() - t0}ms`);
+      lastStatus = st;
+    }
     if (st === 'completed' || st === 'succeeded') {
       const out = poll.data.data.outputs?.[0];
       if (!out) throw await chargedError('Atlas image completed with no outputs', id, model, meta, t0);
@@ -152,12 +167,12 @@ async function submitAndPoll(model, params, meta = {}) {
       // Output is a URL (or base64 when enable_base64_output was set) —
       // normalize to a b64 payload so callers get buffers without egress.
       if (/^https?:\/\//.test(out)) {
-        const img = await axios.get(out, { responseType: 'arraybuffer', timeout: 60_000 });
+        const img = await axios.get(out, { responseType: 'arraybuffer', timeout: 20_000 });
         return { b64: Buffer.from(img.data).toString('base64'), url: out };
       }
       return { b64: out, url: null };
     }
-    if (st === 'failed') {
+    if (['failed', 'error', 'cancelled', 'canceled', 'rejected'].includes(st)) {
       // Atlas explicitly reported failure. Providers generally do not bill a failed
       // generation, so this is NOT marked charged — but the attempt is ledgered at $0
       // so it is still visible in spend reports rather than vanishing.
@@ -170,7 +185,7 @@ async function submitAndPoll(model, params, meta = {}) {
   }
   // Timed out waiting. The submit succeeded, so Atlas is doing (or has done) the work
   // and will bill for it — and it may well complete after we stop polling. Charged.
-  throw await chargedError(`Atlas image timed out after ${TIMEOUT_MS}ms`, id, model, meta, t0);
+  throw await chargedError(`Atlas image timed out after ${generationTimeoutMs}ms`, id, model, meta, t0);
 }
 
 /**
@@ -239,13 +254,22 @@ async function directOpenAiImages({ kind, prompt, size, quality, buffers, fallba
  * generateImage({ prompt, size?, quality?, model?, fallbackModel?, meta? })
  * → { data: [{ b64_json }], url } (OpenAI-images shape).
  */
-async function generateImage({ prompt, size, quality, model, fallbackModel, aspectRatio, meta = {} }) {
+async function generateImage({
+  prompt, size, quality, model, fallbackModel, aspectRatio, meta = {},
+  timeoutMs, allowFallback = true
+}) {
   const m = model || DEFAULT_T2I_MODEL;
   try {
     if (!isConfigured()) throw new Error('ATLAS_API_KEY not configured');
-    const out = await submitAndPoll(m, buildParams(m, { prompt, size, quality, aspectRatio }), meta);
+    const out = await submitAndPoll(
+      m,
+      buildParams(m, { prompt, size, quality, aspectRatio }),
+      meta,
+      { timeoutMs }
+    );
     return { data: [{ b64_json: out.b64 }], url: out.url };
   } catch (err) {
+    if (!allowFallback) throw err;
     warnIfDoublePaying(err, 'generate');
     const fb = await directOpenAiImages({ kind: 'generate', prompt, size, quality, fallbackModel }).catch((e) => { throw new Error(`${err.message}; fallback: ${e.message}`); });
     if (!fb) throw err;
@@ -276,18 +300,30 @@ function warnIfDoublePaying(err, kind) {
  * → { data: [{ b64_json }], url }. NO mask support — mask inpainting
  * stays on direct OpenAI (openaiImageService) by design.
  */
-async function editImage({ prompt, images = [], size, quality, inputFidelity, model, fallbackModel, aspectRatio, meta = {} }) {
+async function editImage({
+  prompt, images = [], size, quality, inputFidelity, model, fallbackModel,
+  aspectRatio, meta = {}, timeoutMs, uploadTimeoutMs, allowFallback = true
+}) {
   const m = model || DEFAULT_EDIT_MODEL;
   const buffers = images.filter((i) => Buffer.isBuffer(i));
   try {
     if (!isConfigured()) throw new Error('ATLAS_API_KEY not configured');
-    const urls = [];
-    for (const img of images) {
-      urls.push(Buffer.isBuffer(img) ? await uploadBuffer(img) : img);
-    }
-    const out = await submitAndPoll(m, buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio }), meta);
+    // Independent reference uploads should not multiply startup latency. A
+    // two-reference static ad now waits for the slower upload, not both.
+    const urls = await Promise.all(images.map((img, index) => (
+      Buffer.isBuffer(img)
+        ? uploadBuffer(img, `reference-${index + 1}.png`, 'image/png', uploadTimeoutMs)
+        : img
+    )));
+    const out = await submitAndPoll(
+      m,
+      buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio }),
+      meta,
+      { timeoutMs }
+    );
     return { data: [{ b64_json: out.b64 }], url: out.url };
   } catch (err) {
+    if (!allowFallback) throw err;
     warnIfDoublePaying(err, 'edit');
     // Direct fallback needs buffers; URL inputs get downloaded first.
     let fbBuffers = buffers;
