@@ -344,6 +344,8 @@ router.patch('/:id', express.json(), async (req, res) => {
     }
     const fontTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'fontFamily');
     const fontCleared = fontTouched && (req.body.fontFamily == null || req.body.fontFamily === '');
+    const logoTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'logoUrl');
+    const logoCleared = logoTouched && (req.body.logoUrl == null || req.body.logoUrl === '');
     const before = { websiteUrl: brand.websiteUrl };
     const curatedSet = new Set(brand.curatedFields || []);
 
@@ -392,6 +394,12 @@ router.patch('/:id', express.json(), async (req, res) => {
     // Font provenance: setting a value = 'curated'; clearing = null so
     // the next enrichment can re-attribute it to whichever tier wins.
     if (fontTouched) brand.fontSource = fontCleared ? null : 'curated';
+    if (logoTouched) {
+      brand.logoSource = logoCleared ? null : 'curated';
+      brand.logoOriginalUrl = logoCleared ? null : brand.logoUrl;
+      brand.logoIngestedAt = logoCleared ? null : new Date();
+      brand.logoIngestError = null;
+    }
     await brand.save();
 
     // Re-enrich when the websiteUrl actually changed (new domain →
@@ -405,6 +413,13 @@ router.patch('/:id', express.json(), async (req, res) => {
       brand.websiteFontUsage = null;
       brand.fontIngestedAt = null;
       brand.fontIngestError = null;
+      brand.logoIngestedAt = null;
+      brand.logoIngestError = null;
+      brand.logoOriginalUrl = null;
+      if (!brand.curatedFields?.includes('logoUrl')) {
+        brand.logoUrl = null;
+        brand.logoSource = null;
+      }
       brand.markModified('customFonts');
       brand.markModified('websiteFontUsage');
       await brand.save();
@@ -2364,6 +2379,10 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
       return res.status(400).json({ error: 'brand has no websiteUrl — set one via PATCH first' });
     }
     brand.enrichmentSources = [];
+    if (!(brand.curatedFields || []).includes('logoUrl')) {
+      brand.logoIngestedAt = null;
+      brand.logoIngestError = null;
+    }
     // Auto-unlock any field that's currently empty. A curated lock on an
     // empty value defeats the user's intent — they cleared it because
     // they want enrichment to fill it. Non-empty curated fields stay
@@ -2375,6 +2394,12 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
       return true;
     });
     if (unlocked.includes('fontFamily')) brand.fontSource = null;
+    if (unlocked.includes('logoUrl')) {
+      brand.logoSource = null;
+      brand.logoOriginalUrl = null;
+      brand.logoIngestedAt = null;
+      brand.logoIngestError = null;
+    }
     if (unlocked.length) {
       console.log(`   · refresh: unlocked empty curated fields for "${brand.name}": ${unlocked.join(', ')}`);
     }
@@ -2551,6 +2576,10 @@ function serializeBrand(b) {
     tagline:      b.tagline || null,
     summary:      b.summary || null,
     logoUrl:      b.logoUrl || null,
+    logoSource:   b.logoSource || null,
+    logoOriginalUrl: b.logoOriginalUrl || null,
+    logoIngestedAt: b.logoIngestedAt || null,
+    logoIngestError: b.logoIngestError || null,
     websiteUrl:   b.websiteUrl || null,
     primaryColor: b.primaryColor || null,
     secondaryColor: b.secondaryColor || null,

@@ -24,6 +24,7 @@ async function upsertBrandStub({ name, paletteSeed, firstSeenMediaId, websiteUrl
     nameNormalized:   normalized,
     tagline:          null,
     logoUrl:          null,
+    logoSource:       null,
     primaryColor:     palette[0] || null,
     secondaryColor:   palette[1] || null,
     accentColor:      palette[2] || null,
@@ -69,12 +70,18 @@ async function upsertBrandStub({ name, paletteSeed, firstSeenMediaId, websiteUrl
   const sourcesAttempted = new Set(doc.enrichmentSources || []);
   const needsBrandfetch  = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
   const needsFontIngest  = !doc.fontIngestedAt;
-  const shouldEnrich     = !!doc.websiteUrl && (doc.source === 'stub' || needsBrandfetch || needsFontIngest);
+  const logoIsCurated    = Array.isArray(doc.curatedFields) && doc.curatedFields.includes('logoUrl');
+  const needsLogoIngest  = !logoIsCurated && !doc.logoIngestedAt;
+  const shouldEnrich     = !!doc.websiteUrl && (doc.source === 'stub' || needsBrandfetch || needsFontIngest || needsLogoIngest);
   if (shouldEnrich) {
     // Fire-and-forget. Require here to avoid a circular-require at module
     // load time (enrichment service does NOT import brandCatalogService).
     const { enrichBrandFromUrl } = require('./brandEnrichmentService');
-    const reason = doc.source === 'stub' ? 'stub' : needsFontIngest ? 'backfill website fonts' : 'backfill brandfetch';
+    const reason = doc.source === 'stub'
+      ? 'stub'
+      : needsLogoIngest
+        ? 'backfill website logo'
+        : needsFontIngest ? 'backfill website fonts' : 'backfill brandfetch';
     console.log(`🌐 brand enrichment queued for "${name}" (${reason})`);
     enrichBrandFromUrl(doc._id).catch(err =>
       console.warn(`   ⚠️  brand enrichment fire-and-forget failed for "${name}": ${err.message}`)
@@ -111,6 +118,12 @@ async function setCuratedAsset({ name, fieldName, value, websiteUrl, firstSeenMe
   }
 
   brand[fieldName] = value;
+  if (fieldName === 'logoUrl') {
+    brand.logoSource = 'curated';
+    brand.logoOriginalUrl = value;
+    brand.logoIngestedAt = new Date();
+    brand.logoIngestError = null;
+  }
   if (!Array.isArray(brand.curatedFields)) brand.curatedFields = [];
   if (!brand.curatedFields.includes(fieldName)) brand.curatedFields.push(fieldName);
   brand.updatedAt = new Date();

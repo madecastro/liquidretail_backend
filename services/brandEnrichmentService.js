@@ -8,8 +8,9 @@
 //                       layout generator to author notional persona quotes)
 //   - color guesses    (best-effort from meta theme-color, else vibe-based)
 //
-// Logo URL is set deterministically from Google's favicon service (always
-// resolvable, no scraping heuristics).
+// Logo discovery is deterministic and source-ranked: current storefront
+// structured data/header assets/rendered DOM → Brandfetch → favicon fallback.
+// The selected website asset is mirrored to Cloudinary during ingest.
 //
 // Fire-and-forget from brandCatalogService — the detect pipeline never
 // awaits this. On failure the Brand stays a stub and gets another chance
@@ -114,8 +115,10 @@ async function runEnrichment(brand, brandId, run = null) {
   const wantGpt          = !!process.env.OPENAI_API_KEY && !sourcesAttempted.has('gpt');
   const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
   const wantFontIngest   = !brand.fontIngestedAt;
+  const logoIsCurated    = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('logoUrl');
+  const wantLogoIngest   = !logoIsCurated && !brand.logoIngestedAt;
 
-  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest) {
+  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest && !wantLogoIngest) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
 
@@ -127,6 +130,7 @@ async function runEnrichment(brand, brandId, run = null) {
   if (wantGpt)          planParts.push('gpt');
   if (wantBrandReviews) planParts.push('brand-reviews');
   if (wantFontIngest)   planParts.push('website-fonts');
+  if (wantLogoIngest)   planParts.push('website-logo');
   console.log(`🌐 brand enrichment: ${brand.websiteUrl} for "${brand.name}" — running ${planParts.join('+')}${sourcesAttempted.size ? ` (already have: ${[...sourcesAttempted].join(', ')})` : ''}`);
 
   // ── Tier 1: Brandfetch ──
@@ -148,6 +152,7 @@ async function runEnrichment(brand, brandId, run = null) {
   if (run && wantScraped) { await run.checkpoint(); run.stage('website scrape'); }
   if (wantScraped) await setStage(brandId, 'scraped');
   let html = '';
+  let pageUrl = brand.websiteUrl;
   let metaThemeColor = null;
   try {
     const res = await axios.get(brand.websiteUrl, {
@@ -160,6 +165,7 @@ async function runEnrichment(brand, brandId, run = null) {
       validateStatus: () => true
     });
     html = typeof res.data === 'string' ? res.data : String(res.data || '');
+    pageUrl = res.request?.res?.responseUrl || brand.websiteUrl;
     const themeMatch = html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i);
     if (themeMatch) metaThemeColor = themeMatch[1];
   } catch (err) {
@@ -167,12 +173,35 @@ async function runEnrichment(brand, brandId, run = null) {
     // If Brandfetch already gave us the visual identity, the GPT step still
     // adds value (tagline/tone/personas need text). Without HTML we can't
     // do GPT so we have to bail unless Brandfetch gave us enough.
-    if (!bf) return { ok: false, reason: `fetch failed: ${err.message}` };
+    if (!bf && !wantLogoIngest) return { ok: false, reason: `fetch failed: ${err.message}` };
   }
 
   // Tier 2 helpers — run on whatever HTML we got (may be empty).
-  const scrapedLogoUrl     = extractAppleTouchIcon(html, brand.websiteUrl);
   const scrapedFontFamily  = extractGoogleFontsFamily(html);
+  let websiteLogo = null;
+  if (wantLogoIngest) {
+    if (run) { await run.checkpoint(); run.stage('website logo'); }
+    await setStage(brandId, 'website-logo');
+    try {
+      const { discoverAndIngestBrandLogo } = require('./brandLogoIngestService');
+      websiteLogo = await discoverAndIngestBrandLogo(brand, { html: html || null, pageUrl });
+      brand.logoIngestedAt = new Date();
+      brand.logoIngestError = null;
+      if (websiteLogo.logoUrl) {
+        brand.logoOriginalUrl = websiteLogo.originalUrl;
+        console.log(
+          `   · website logo: ${websiteLogo.source}, ${websiteLogo.width || '?'}×${websiteLogo.height || '?'}, ` +
+          `${websiteLogo.candidatesChecked} candidate(s)`
+        );
+      } else {
+        console.log(`   · website logo: no validated mark from ${websiteLogo.candidatesChecked} candidate(s)`);
+      }
+    } catch (err) {
+      brand.logoIngestedAt = new Date();
+      brand.logoIngestError = String(err.message || err).slice(0, 2000);
+      console.warn(`   ⚠️  website logo ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
   // FLAG: static-HTML/CSS heuristic for page surface color (NOT theme-color).
   // headlessScrapeService is product-ingest + SHOPIFY_HEADLESS_RENDER-gated —
   // too heavy to couple into every brand enrichment just for body bg.
@@ -213,7 +242,7 @@ async function runEnrichment(brand, brandId, run = null) {
     // Font stylesheets may still be public even when readable page text is
     // sparse (Shopify/Next storefronts), so continue when the automatic
     // website-font scan has not run yet.
-    if (!wantFontIngest) return { ok: false, reason: 'too little text and no Brandfetch data' };
+    if (!wantFontIngest && !wantLogoIngest) return { ok: false, reason: 'too little text and no Brandfetch data' };
   }
 
   // ── Tier 3: GPT-4.1 text extraction ──
@@ -262,7 +291,9 @@ async function runEnrichment(brand, brandId, run = null) {
     } catch (err) {
       console.warn(`   ⚠️  brand enrichment LLM failed for "${brand.name}": ${err.message}`);
       // If LLM fails but Brandfetch worked, still ship the visual identity.
-      if (!bf) return { ok: false, reason: `LLM failed: ${err.message}` };
+      if (!bf && !websiteLogo?.logoUrl && !wantFontIngest && !wantLogoIngest) {
+        return { ok: false, reason: `LLM failed: ${err.message}` };
+      }
     }
   }
 
@@ -288,12 +319,16 @@ async function runEnrichment(brand, brandId, run = null) {
   };
 
   let [logoVal, logoSrc] = pick(
+    [websiteLogo?.logoUrl, websiteLogo?.source ? `website:${websiteLogo.source}` : 'website'],
     [bf?.logoUrl, 'brandfetch'],
-    [scrapedLogoUrl, 'scraped'],
     [brand.logoUrl, 'existing'],
     [googleFaviconFallback(hostname), 'google-favicon']
   );
   setIf('logoUrl', logoVal, logoSrc);
+  if (!isCurated('logoUrl') && logoSrc && logoSrc !== 'existing') {
+    brand.logoSource = logoSrc;
+    if (!logoSrc.startsWith('website:')) brand.logoOriginalUrl = logoVal;
+  }
 
   // Font resolution chain. High-confidence sources first
   // (Brandfetch / scraped Google Fonts), then GPT-suggested based on
@@ -506,7 +541,8 @@ async function runEnrichment(brand, brandId, run = null) {
     wantScraped    ? 'scraped'    : null,
     (wantGpt && !skipLLM) ? 'gpt'  : null,
     wantBrandReviews ? 'brand-reviews' : null,
-    wantFontIngest ? 'website-fonts' : null
+    wantFontIngest ? 'website-fonts' : null,
+    wantLogoIngest ? 'website-logo' : null
   ].filter(Boolean).join('+');
   console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), ${brand.brandReviews?.quotes?.length || 0} brand review(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
   return { ok: true, brand, overrides };
@@ -528,38 +564,6 @@ function extractTextFromHtml(html) {
 function hostnameFromUrl(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); }
   catch { return null; }
-}
-
-// Find the largest apple-touch-icon link in the HTML and resolve it to
-// an absolute URL. Apple-touch-icons are typically 180-512px PNGs of the
-// brand mark — much higher quality than the 128px Google favicon and
-// usually clean (sites care about how their iOS bookmark looks).
-// Returns null if no link found.
-function extractAppleTouchIcon(html, baseUrl) {
-  if (!html) return null;
-  const linkRegex = /<link\b[^>]*rel=["']apple-touch-icon(?:-precomposed)?["'][^>]*>/gi;
-  const candidates = [];
-  let m;
-  while ((m = linkRegex.exec(html)) !== null) {
-    const tag = m[0];
-    const hrefMatch = tag.match(/href=["']([^"']+)["']/i);
-    if (!hrefMatch) continue;
-    const sizesMatch = tag.match(/sizes=["']([^"']+)["']/i);
-    let size = 0;
-    if (sizesMatch) {
-      const dim = sizesMatch[1].match(/(\d+)x(\d+)/i);
-      if (dim) size = Math.max(parseInt(dim[1], 10), parseInt(dim[2], 10));
-    }
-    candidates.push({ href: hrefMatch[1], size });
-  }
-  if (!candidates.length) return null;
-  // Largest icon wins (sites with sizes="180x180" beat sizes="").
-  candidates.sort((a, b) => b.size - a.size);
-  try {
-    return new URL(candidates[0].href, baseUrl).toString();
-  } catch {
-    return null;
-  }
 }
 
 // Find the primary Google Fonts family loaded by the page. Looks for
