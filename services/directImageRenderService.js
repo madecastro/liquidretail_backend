@@ -65,14 +65,18 @@ function linesSvg(lines, { x, y, size, lineHeight, weight, color, family }) {
 }
 
 function themeFor(brand, layoutBrand) {
-  const theme = brand?.styleTheme || {};
+  const styleThemeIsCurated = Array.isArray(brand?.curatedFields) && brand.curatedFields.includes('styleTheme');
+  const tailwind = brand?.tailwindTheme || {};
+  // A human-curated style theme remains authoritative. Otherwise the
+  // confidence-gated Tailwind kit wins over older automatic style data.
+  const theme = styleThemeIsCurated ? (brand?.styleTheme || {}) : {};
   const colors = theme?.colors || theme || {};
   return {
-    accent: safeColor(colors.ctaBgColor || colors.accentColor || brand?.accentColor || layoutBrand?.accent_color, '#D8FF64'),
-    text: safeColor(colors.textPrimary || brand?.fontColor, '#FFFFFF'),
+    accent: safeColor(colors.ctaBgColor || colors.accentColor || tailwind?.colors?.accent || brand?.accentColor || layoutBrand?.accent_color, '#D8FF64'),
+    text: safeColor(colors.textPrimary || tailwind?.colors?.font || brand?.fontColor, '#FFFFFF'),
     secondaryText: safeColor(colors.textSecondary, '#E6EEF7'),
     ctaText: safeColor(colors.ctaTextColor, '#07111D'),
-    font: String(theme?.fonts?.heading?.family || theme?.headingFont || brand?.fontFamily || 'Arial, Helvetica, sans-serif').slice(0, 120)
+    font: String(theme?.fonts?.heading?.family || theme?.headingFont || tailwind?.fonts?.heading || tailwind?.fonts?.body || brand?.fontFamily || 'Arial, Helvetica, sans-serif').slice(0, 120)
   };
 }
 
@@ -178,4 +182,4 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   return { buffer, contentType: 'image/png', width: dims.width, height: dims.height, bytes: buffer.length, kind: 'image', directImage: true };
 }
 
-module.exports = { DIRECT_OVERLAY_PIPELINE, enabled, dimsFor, buildOverlay, buildPlatePrompt, renderDirectImage };
+module.exports = { DIRECT_OVERLAY_PIPELINE, enabled, dimsFor, themeFor, buildOverlay, buildPlatePrompt, renderDirectImage };
