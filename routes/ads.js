@@ -811,6 +811,7 @@ async function renderOne(run, job, adId, index, renderToken) {
             posterUrl:          fallbackPosterUrl || veoVideoUrl,
             cloudinaryPublicId: veoCloudinaryPublicId,
             sourceFileType:     'video',
+            renderedAt:         new Date(),
             updatedAt:          new Date()
           },
           $inc: { renderAttempts: 1 }
@@ -1627,6 +1628,10 @@ router.get('/:id/generation-inspector', async (req, res) => {
       template:           ad.template,
       aspectRatio:        ad.aspectRatio,
       status:             ad.status,
+      // Prefer the moment the render actually completed. Older video
+      // rows predate renderedAt persistence, so fall back to the time
+      // the generation row was created rather than leaving the UI blank.
+      generatedAt:        ad.renderedAt || ad.generatedAt || ad.createdAt || null,
       productId:          ad.productId ? String(ad.productId) : null,
       // Regenerate-with-prompt state — surfaced here so the Generation
       // Details modal can poll this same endpoint while a regen runs,
@@ -1698,6 +1703,22 @@ router.get('/:id/generation-inspector', async (req, res) => {
         storyboard:  ad.veoStoryboard || null,
         rawVideoUrl: ad.veoVideoUrl || null,    // BEFORE titling — compare vs finalUrl to locate garble
         finalUrl:    ad.renderUrl || null,       // AFTER titling overlay
+        // Omni-family models render portrait masters at 9:16. Feed and
+        // square deliverables are cropped from that Cloudinary master.
+        // Expose the provenance explicitly so the inspector can show a
+        // linked source thumbnail without guessing from URL strings.
+        derivedFrom: (
+          ['1:1', '4:5'].includes(ad.aspectRatio) &&
+          ad.veoAspectRatio === '9:16' &&
+          typeof ad.veoVideoUrl === 'string' &&
+          ad.veoVideoUrl.includes('/video/upload/')
+        ) ? {
+          aspectRatio:  '9:16',
+          videoUrl:     ad.veoVideoUrl,
+          thumbnailUrl: ad.veoVideoUrl
+            .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good,w_360/')
+            .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
+        } : null,
         referenceImages,                         // the images the director chose (pos 0 = seed)
         referenceImagesReconstructed
       };
