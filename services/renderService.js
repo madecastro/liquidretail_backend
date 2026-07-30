@@ -419,11 +419,9 @@ async function renderStage(args) {
   if (renderMode === 'static' && template && String(template).startsWith('ai_') && args.adConceptArtifactId) {
     try {
       const directImage = require('./directImageRenderService');
-      if (directImage.enabled()) {
-        const output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
-        if (!output?.skipped) return output;
-        console.log(`   🖼️  [render direct-image] skipped — ${output.reason}`);
-      }
+      const output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
+      if (!output?.skipped) return output;
+      console.log(`   🖼️  [render direct-image] skipped — ${output.reason}`);
     } catch (err) {
       console.warn(`   ⚠️  [render direct-image] failed (${err.message}) — falling back to existing renderer`);
     }

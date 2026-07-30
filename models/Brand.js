@@ -240,6 +240,15 @@ const brandSchema = new mongoose.Schema({
   // field — route handlers must markModified('videoSettings') on writes.
   videoSettings: { type: mongoose.Schema.Types.Mixed, default: null },
 
+  // Runtime-selectable static-ad renderer. This is intentionally stored on
+  // the Brand, not in a deploy-time environment variable: operators can
+  // switch the next concept-driven static render from the application.
+  staticImagePipeline: {
+    type: String,
+    enum: ['direct_overlay', 'html'],
+    default: 'direct_overlay'
+  },
+
   // Per-brand overrides of the meta-field cascades (services/metaCascadeConfig.js).
   // Sparse map of `field → source[]`. A field present here REPLACES the
   // default cascade for that field entirely (simpler mental model than

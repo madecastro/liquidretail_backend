@@ -21,8 +21,8 @@ const PLATE_EDIT_MODEL = 'openai/gpt-image-2/edit';
 const PLATE_T2I_MODEL = 'openai/gpt-image-2/text-to-image';
 const PLATE_QUALITY = process.env.AI_DIRECT_IMAGE_QUALITY || 'high';
 
-function enabled() {
-  return String(process.env.AI_STATIC_PIPELINE || 'html').toLowerCase() === DIRECT_OVERLAY_PIPELINE;
+function isDirectOverlayPipeline(value) {
+  return String(value || DIRECT_OVERLAY_PIPELINE).toLowerCase() === DIRECT_OVERLAY_PIPELINE;
 }
 
 function dimsFor(aspectRatio) {
@@ -142,7 +142,6 @@ async function resolveConcept({ adConceptArtifactId, adConceptId }) {
 }
 
 async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, productId, brandId, adConceptArtifactId, adConceptId, template }) {
-  if (!enabled()) return { skipped: true, reason: 'AI_STATIC_PIPELINE is not direct_overlay' };
   if (!atlasImage.isConfigured() && !process.env.OPENAI_API_KEY) return { skipped: true, reason: 'no Atlas or OpenAI image credentials configured' };
 
   const [layout, concept, brand, product, media] = await Promise.all([
@@ -156,6 +155,9 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   if (!concept) return { skipped: true, reason: 'direct overlay requires a named Director concept' };
 
   const resolvedBrand = brand || (layout.brandId ? await Brand.findById(layout.brandId).lean() : null);
+  if (!isDirectOverlayPipeline(resolvedBrand?.staticImagePipeline)) {
+    return { skipped: true, reason: `brand staticImagePipeline is ${resolvedBrand?.staticImagePipeline || 'html'}` };
+  }
   const resolvedProduct = product || (layout.productId ? await CatalogProduct.findById(layout.productId).select('title imageUrl').lean() : null);
   const dims = dimsFor(aspectRatio);
   const refs = (await Promise.all([optionalImage(resolvedProduct?.imageUrl), optionalImage(media?.fileUrl)])).filter(Boolean).slice(0, 2);
@@ -182,4 +184,4 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   return { buffer, contentType: 'image/png', width: dims.width, height: dims.height, bytes: buffer.length, kind: 'image', directImage: true };
 }
 
-module.exports = { DIRECT_OVERLAY_PIPELINE, enabled, dimsFor, themeFor, buildOverlay, buildPlatePrompt, renderDirectImage };
+module.exports = { DIRECT_OVERLAY_PIPELINE, isDirectOverlayPipeline, dimsFor, themeFor, buildOverlay, buildPlatePrompt, renderDirectImage };
