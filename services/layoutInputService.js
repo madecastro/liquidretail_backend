@@ -1706,7 +1706,28 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   const tierProduct = gateQuotesByRating((details.productReviews?.quotes || []).map(normalizeQuote).filter(Boolean), 'product');
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
   const tierCategory = gateQuotesByRating((catReviewsForMatch?.quotes || []).map(normalizeQuote).filter(Boolean), 'category');
-  const tierBrand    = gateQuotesByRating((ctx.match?.brandReviews?.quotes || ctx.brand?.brandReviews?.quotes || []).map(normalizeQuote).filter(Boolean), 'brand');
+  // Brand-tier reviews are catalog-wide: they are about whatever the reviewer
+  // bought, which on a multi-SKU brand is usually NOT this product. Rendering
+  // one under this product's photo presents another item's praise as if it
+  // were about this one — a leggings review as the testimonial on a tee ad.
+  // Brand reviews therefore only back a BRAND ad, where no single product is
+  // being claimed. A product ad with no product- or category-level review
+  // shows no testimonial, which is the honest result.
+  // catalogProductId is the FK on ProductMatchArtifact (:78) and is what the
+  // rest of this file tests product scope with (:653, :1850). The nested
+  // identification.details.catalogProductId is NOT hydrated —
+  // productMatchHydration rebuilds that object from the CatalogProduct's
+  // commerce fields and never writes an id onto it — so reading it here would
+  // have left isProductScoped false on real product ads and leaked the brand
+  // quotes this guard exists to withhold.
+  const isProductScoped = !!(ctx.match?.catalogProductId || ctx.match?.identification?.details?.catalogProductId);
+  const brandQuotesRaw = (ctx.match?.brandReviews?.quotes || ctx.brand?.brandReviews?.quotes || []);
+  const tierBrand = isProductScoped
+    ? []
+    : gateQuotesByRating(brandQuotesRaw.map(normalizeQuote).filter(Boolean), 'brand');
+  if (isProductScoped && brandQuotesRaw.length) {
+    console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk)`);
+  }
   const tierComment  = await loadBrandCommentsForQuotePool(ctx);
   const tierLlm      = (Array.isArray(derivation.quotes) ? derivation.quotes : []).map(normalizeQuote).filter(Boolean);
 
