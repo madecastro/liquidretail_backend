@@ -72,7 +72,7 @@ const brandSchema = new mongoose.Schema({
   // validation. Mongoose's enum check rejects null even on non-
   // required fields when a default isn't matched, so we explicitly
   // allow it here.
-  fontSource:     { type: String, enum: ['brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
+  fontSource:     { type: String, enum: ['tailwind', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
   tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
   hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
   tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')
@@ -94,16 +94,24 @@ const brandSchema = new mongoose.Schema({
   // Which auto-enrichment sources have been ATTEMPTED on this brand
   // (regardless of whether each returned data). Drives re-enrichment
   // logic — if a tier is missing, we re-run enrichment so it can
-  // backfill. Values: 'brandfetch' | 'scraped' | 'gpt' | 'brand-reviews'.
+  // backfill. Values: 'tailwind' | 'brandfetch' | 'scraped' | 'gpt' |
+  // 'brand-reviews'.
   // Resets when curation explicitly removes a field, when the
   // websiteUrl changes, or via /refresh-enrichment.
   enrichmentSources: [String],
 
+  // Public Tailwind theme signals recovered from a brand's published site.
+  // A real tailwind.config file is rarely exposed, so this stores only
+  // confidence-gated inline config or generated-CSS variables; never a
+  // guessed reconstruction. Automatic precedence is Tailwind > Brandfetch
+  // > scrape/GPT, while curated fields always win.
+  tailwindTheme: { type: mongoose.Schema.Types.Mixed, default: null },
+
   // Currently-running enrichment tier name, or null when nothing is
   // running. Updated incrementally by enrichBrandFromUrl so the brand
   // page can poll and show "Detecting brand kit (Brandfetch)…" etc.
-  // Values mirror enrichmentSources entries: 'brandfetch' | 'scraped'
-  // | 'gpt' | 'brand-reviews' | null.
+  // Values mirror enrichmentSources entries: 'tailwind' | 'brandfetch' |
+  // 'scraped' | 'gpt' | 'brand-reviews' | null.
   enrichmentStage:    { type: String, default: null },
 
   // Brand-level review snapshot. Populated by enrichBrandFromUrl

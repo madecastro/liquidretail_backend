@@ -411,6 +411,24 @@ async function renderStage(args) {
   const dims = CANVAS_DIMS[aspectRatio] || { w: 1000, h: 1000 };
   let primedCanvasArtifactId = null;
 
+  // Direct image pipeline: use the Director's approved concept and source
+  // imagery to make a text-free plate, then render all copy/CTA/logo locally.
+  // It is deliberately synchronous: an ad never becomes draft until the
+  // production asset exists. Any failure falls through to the established
+  // HTML/spec pipeline so a provider outage cannot stop campaign generation.
+  if (renderMode === 'static' && template && String(template).startsWith('ai_') && args.adConceptArtifactId) {
+    try {
+      const directImage = require('./directImageRenderService');
+      if (directImage.enabled()) {
+        const output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
+        if (!output?.skipped) return output;
+        console.log(`   🖼️  [render direct-image] skipped — ${output.reason}`);
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  [render direct-image] failed (${err.message}) — falling back to existing renderer`);
+    }
+  }
+
   // Phase 6.5.1 — eager prime so the first wave of a fresh batch
   // actually uses the HTML path. Without this, the spec-path shadow
   // populates outputHtml AFTER the renderer has already screenshot

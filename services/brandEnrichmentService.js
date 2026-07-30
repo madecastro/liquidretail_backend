@@ -26,6 +26,7 @@ const {
 } = require('../utils/websiteBackground');
 
 const { chatCompletion } = require('./atlasLlmService');
+const { inspectTailwindTheme } = require('./tailwindTokenExtractor');
 const MAX_HTML_CHARS = 25000;
 
 const ENRICHMENT_SCHEMA = {
@@ -108,17 +109,19 @@ async function runEnrichment(brand, brandId, run = null) {
   // backfill it whenever we can.
   const sourcesAttempted = new Set(brand.enrichmentSources || []);
   const wantBrandfetch   = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
+  const wantTailwind     = !sourcesAttempted.has('tailwind');
   const wantScraped      = !sourcesAttempted.has('scraped');
   const wantGpt          = !!process.env.OPENAI_API_KEY && !sourcesAttempted.has('gpt');
   const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
 
-  if (!wantBrandfetch && !wantScraped && !wantGpt && !wantBrandReviews) {
+  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
 
   const t0 = Date.now();
   const planParts = [];
   if (wantBrandfetch)   planParts.push('brandfetch');
+  if (wantTailwind)     planParts.push('tailwind');
   if (wantScraped)      planParts.push('scrape');
   if (wantGpt)          planParts.push('gpt');
   if (wantBrandReviews) planParts.push('brand-reviews');
@@ -175,6 +178,16 @@ async function runEnrichment(brand, brandId, run = null) {
   // Linked stylesheets are NOT fetched here (not "already fetched"); returns null
   // rather than guessing a dark color from meta theme-color.
   const scrapedWebsiteBackground = extractWebsiteBackground(html);
+  // Tailwind is extracted from published CSS/config only; no third-party JS
+  // is evaluated. A high-confidence result takes precedence over every other
+  // automatic enrichment source, never over a human-curated field.
+  let tailwind = null;
+  if (wantTailwind && html) {
+    if (run) { await run.checkpoint(); run.stage('tailwind tokens'); }
+    await setStage(brandId, 'tailwind');
+    tailwind = await inspectTailwindTheme({ html, pageUrl: brand.websiteUrl });
+    if (tailwind) console.log(`   · tailwind tokens: ${Object.keys(tailwind.colors || {}).length} color(s), ${Object.keys(tailwind.fonts || {}).length} font role(s), source=${tailwind.source}`);
+  }
 
   const rawTextContent = extractTextFromHtml(html).slice(0, MAX_HTML_CHARS);
   // JS-rendered SPAs (Next.js, Shopify Hydrogen, etc.) leave almost
@@ -291,6 +304,7 @@ async function runEnrichment(brand, brandId, run = null) {
     console.log(`   · brandfetch font rejected (not a real family name): ${bf.fontFamily}`);
   }
   let [fontVal, fontSrc] = pick(
+    [tailwind?.fonts?.heading || tailwind?.fonts?.body, 'tailwind'],
     [bfFont, 'brandfetch'],
     [isValidFontName(scrapedFontFamily) ? scrapedFontFamily : null, 'scraped'],
     [isValidFontName(enrichment.fontSuggestion) ? enrichment.fontSuggestion : null, 'suggested'],
@@ -306,6 +320,7 @@ async function runEnrichment(brand, brandId, run = null) {
   }
 
   let [primaryVal, primarySrc] = pick(
+    [tailwind?.colors?.primary, 'tailwind'],
     [bf?.primaryColor, 'brandfetch'],
     [metaThemeColor, 'meta-theme-color'],
     [enrichment.primaryColor, 'gpt'],
@@ -314,6 +329,7 @@ async function runEnrichment(brand, brandId, run = null) {
   setIf('primaryColor', primaryVal, primarySrc);
 
   let [secondaryVal, secondarySrc] = pick(
+    [tailwind?.colors?.secondary, 'tailwind'],
     [bf?.secondaryColor, 'brandfetch'],
     [enrichment.secondaryColor, 'gpt'],
     [brand.secondaryColor, 'existing']
@@ -321,6 +337,7 @@ async function runEnrichment(brand, brandId, run = null) {
   setIf('secondaryColor', secondaryVal, secondarySrc);
 
   let [accentVal, accentSrc] = pick(
+    [tailwind?.colors?.accent, 'tailwind'],
     [bf?.accentColor, 'brandfetch'],
     [enrichment.accentColor, 'gpt'],
     [brand.accentColor, 'existing']
@@ -328,6 +345,7 @@ async function runEnrichment(brand, brandId, run = null) {
   setIf('accentColor', accentVal, accentSrc);
 
   let [fontColorVal, fontColorSrc] = pick(
+    [tailwind?.colors?.font, 'tailwind'],
     [bf?.fontColor, 'brandfetch'],
     [enrichment.fontColor, 'gpt'],
     [brand.fontColor, 'existing']
@@ -338,10 +356,17 @@ async function runEnrichment(brand, brandId, run = null) {
   // Scraped only — never theme-color, never GPT guess (dark accents would
   // reintroduce product-on-black). Respects curatedFields via setIf.
   let [websiteBgVal, websiteBgSrc] = pick(
+    [tailwind?.colors?.background, 'tailwind'],
     [scrapedWebsiteBackground, 'scraped'],
     [normalizeWebsiteBackgroundHex(brand.websiteBackground), 'existing']
   );
   setIf('websiteBackground', websiteBgVal, websiteBgSrc);
+
+  if (tailwind && !isCurated('tailwindTheme')) {
+    const previousTailwind = brand.tailwindTheme;
+    brand.tailwindTheme = tailwind;
+    overrides.push({ field: 'tailwindTheme', oldVal: previousTailwind ? '(previous)' : null, newVal: `${tailwind.source}/${tailwind.confidence}`, source: 'tailwind' });
+  }
 
   let [taglineVal, taglineSrc] = pick(
     [enrichment.tagline, 'gpt'],
@@ -423,6 +448,7 @@ async function runEnrichment(brand, brandId, run = null) {
   // know whether to backfill (e.g. Brandfetch came online later).
   const newSourcesAttempted = new Set(brand.enrichmentSources || []);
   if (wantBrandfetch)   newSourcesAttempted.add('brandfetch');
+  if (wantTailwind)     newSourcesAttempted.add('tailwind');
   if (wantScraped)      newSourcesAttempted.add('scraped');
   if (wantGpt && !skipLLM) newSourcesAttempted.add('gpt');
   if (wantBrandReviews) newSourcesAttempted.add('brand-reviews');
@@ -447,6 +473,7 @@ async function runEnrichment(brand, brandId, run = null) {
 
   const ranThisTime = [
     wantBrandfetch ? 'brandfetch' : null,
+    wantTailwind ? 'tailwind' : null,
     wantScraped    ? 'scraped'    : null,
     (wantGpt && !skipLLM) ? 'gpt'  : null,
     wantBrandReviews ? 'brand-reviews' : null
