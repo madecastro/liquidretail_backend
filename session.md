@@ -3,7 +3,102 @@
 ## Next-session prompt
 _(empty — no pending owner prompt)_
 
-## Current state (2026-07-29)
+## Current state (2026-07-30) — static-ad diagnostics, PR #28 OPEN
+
+Branch **`fix/truthful-image-gen-details`** → [PR #28](https://github.com/Emami-RS-Project/liquidretail_backend/pull/28)
+(base `main`), frontend counterpart [liquidretail#18](https://github.com/Emami-RS-Project/liquidretail/pull/18)
+(branch of the same name, base `master`). **Both open, NOT merged.** No live
+render has exercised any of this yet — everything below is verified by code
+reading, unit assertions, and three Grok adversarial passes, not by a
+production ad.
+
+Driven by an operator diagnostic session on two GymShark static ads. Five
+separate defects, all confirmed in code:
+
+1. **The inspector described a different request than the one that ran.** Its
+   static branch showed `AiCanvasArtifact.promptImages` — the *layout LLM's*
+   vision list — under a heading operators read as the image model's inputs.
+   Meanwhile `directImageRenderService` submitted **two** images to gpt-image-2
+   (`product.imageUrl` AND `media.fileUrl`) and persisted nothing about it. The
+   reported "hallucinated back view" was neither hallucinated nor a model
+   fault: it was a second reference we added and never displayed. Fixed by
+   capturing the request where it becomes the POST body
+   (`atlasImageService.buildSubmissionRecord`) onto `Ad.imageGeneration`, and
+   by deleting the video path's *reconstructed* reference stack, which rebuilt
+   a guess from the product's CURRENT catalog images. **Not backfilled** — old
+   ads say so, and the warnings deliberately do not name a cause (an HTML
+   render makes no image-model call at all).
+2. **Two reference images by default → now one** (the selected media; product
+   hero only when there is no media). Extra refs are opt-in via
+   `referenceMediaIds`. Also closes a duplicate spend: merchant original vs
+   Cloudinary mirror of the same photo defeats URL dedup and is billed twice.
+3. **The offer painted twice.** `deliveryLine` and `promoText` shared their two
+   top cascade sources, so "Only $28" rendered as both — and `deliveryLine`
+   draws with a **truck icon**, so the offer read as shipping terms. Removing
+   offer_text from it exposed a hardcoded literal `'Ships free'` underneath,
+   asserting free shipping for every brand on the platform. Both gone.
+4. **Testimonials.** `quoteSnippetService` already produced a ≤50-char
+   word-safe extract and stored it as `primary_quote.snippet` — it was simply
+   not in the static bind allow-list, so every layout took the full review and
+   clipped it mid-word. Snippet is now bindable, always populated (it was only
+   written when it *differed* from the text, i.e. absent for short quotes), and
+   rendered **verbatim** — the first attempt told the HTML generator to re-cap
+   at 60 chars, which is a second shortener on top of the first and exactly
+   what strands a quote mid-thought. Per owner: shorten once, correctly.
+   Added: ≥4.5★ gate (`QUOTE_MIN_RATING`) — the per-review star rating was
+   being **discarded at ingest**, so selection judged wording alone; positive
+   sentiment + complete-thought rules; at most ONE testimonial per ad
+   (`secondary_quotes` was reachable). Comments now run the *identical*
+   pipeline in both emitters — one had a raw `.slice(0, 200)` (mid-word, no
+   sentiment gate at all).
+5. **Cross-product contamination** — a Campus Crest T-Shirt ad rendered
+   "straight leg leggings" copy. Right `productId`, right images, wrong
+   language. Two brand-scoped paths reached a product-scoped ad: the layout
+   quote cascade fell product → category → **brand** (brand reviews are
+   catalog-wide), and — the real one — `aiCreativeDirectorService.assembleSignals`
+   fell `productReviewQuotes[0] || brandReviewQuotes[0]`, handing the Director a
+   brand review as `primary_quote` while COPY PICKS instructs it to ground copy
+   on that field. Both gated on product scope. The numeric twin is fixed too:
+   the meta cascade reached around `layoutInput.social_proof`'s existing
+   `brand_match` gate straight to `Brand.brandReviews`, which is how a $28 tee
+   advertised **41,000 reviews** and the brand's 3.3 rating; and `reviewsText`
+   fell back to a literal `'53 reviews'`.
+
+**Model cost:** the snippet role rode `gpt-4o-mini`, which the Atlas map points
+at `gpt-5.6-luna` — **$1.00/$6.00 per 1M** for a substring search over a
+≤400-char review. New `quote-snippet` role → `openai/gpt-5-nano` at
+$0.05/$0.40 (verified against the live catalog 2026-07-30). Extraction was
+also gated on `OPENAI_API_KEY` alone while Atlas is the primary route, so an
+Atlas-only deployment silently fell back to mechanical truncation for every
+quote.
+
+**Grok adversarial review earned its keep three times** and each pass caught a
+real defect *I had introduced*: an inspector warning that asserted "this ad
+predates capture" (false for HTML-pipeline ads — the same untruthfulness the
+commit existed to remove); allow-listing `.snippet` while it was only
+sometimes written; and `isProductScoped` reading
+`identification.details.catalogProductId`, which `productMatchHydration` never
+writes — the guard would have been false on real product ads and leaked the
+quotes it exists to withhold.
+
+### Open follow-ups from this session
+- **Not verified against a live render.** Generate one static ad per pipeline
+  and confirm via Generation Details that `imageGeneration` shows one image
+  with its role, and that no testimonial exceeds 60 chars or repeats.
+- **`QUOTE_REQUIRE_RATING` is `false`.** Per-review stars were never stored
+  before this change, so every already-synced product has unrated quotes and
+  requiring a star outright would strip testimonials catalog-wide. Flip to
+  `true` once products have been re-synced.
+- **Category-tier quotes and brand comments are still cross-product** sources
+  on a product ad (Grok finding #3 on the last pass) — same class as the brand
+  tier, not yet gated.
+- **Legacy `buildPrompt` (V1 Director, `:560`) lacks the ONE PRODUCT ONLY
+  line.** It emits strategy only, not `copy_picks`, so it is low risk — add it
+  if V1 can still run.
+- `aiImageReferenceService` (photoreal / image-ref shadow path) still does not
+  record its image-model request; only `directImageRenderService` does.
+
+## Prior state (2026-07-29)
 
 Branch **`claude/architecture-review-grok-elfqxc`** at `c79e606`, pushed. Trunk is
 `main`.
