@@ -1688,9 +1688,12 @@ router.get('/:id/generation-inspector', async (req, res) => {
       // Ads rendered before this was persisted report an empty list and say so.
       const referenceImages = Array.isArray(ad.veoReferenceImages) ? ad.veoReferenceImages.filter(Boolean) : [];
       if (!referenceImages.length) {
+        // Empty is ambiguous — an unrecorded render and a genuinely
+        // reference-free one look identical here. State that rather than
+        // picking the more flattering explanation.
         out.warnings.push({
           code: 'reference-images-not-recorded',
-          message: 'No reference-image stack was recorded for this render, so none is shown. This ad predates submit-time capture — the images it actually received cannot be recovered after the fact.'
+          message: 'No reference images are stored for this ad — either none were sent or the render predates submit-time capture. Nothing is shown, because what a past render received cannot be recovered after the fact.'
         });
       }
       out.video = {
@@ -1752,9 +1755,12 @@ router.get('/:id/generation-inspector', async (req, res) => {
         imageGeneration:       ad.imageGeneration || null
       };
       if (!ad.imageGeneration) {
+        // Deliberately does NOT assert a cause. An HTML/Puppeteer render makes
+        // no image-model call at all, so "predates capture" would be a fresh
+        // untruth in the very field that exists to stop guessing.
         out.warnings.push({
           code: 'image-generation-not-recorded',
-          message: 'No image-model request was recorded for this render, so none is shown. Any prompt or image shown below belongs to the layout LLM, NOT the image model. This ad predates submit-time capture.'
+          message: 'No image-model request is stored for this ad — either none was made (HTML layout pipeline) or the render predates submit-time capture. Any prompt or image below belongs to the layout LLM, NOT the image model.'
         });
       }
       if (ad.aiCanvasArtifactId) {

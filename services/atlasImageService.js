@@ -243,6 +243,10 @@ function buildParams(model, { prompt, size, quality, images, inputFidelity, aspe
  */
 function buildSubmissionRecord({ provider, model, params = {}, predictionId = null, imageMeta = [] }) {
   const images = Array.isArray(params.images) ? params.images : [];
+  // An explicit null from a caller would defeat the default and throw on
+  // indexing — after a billable submit has already succeeded, which would
+  // discard a paid-for image over a labelling detail.
+  const labels = Array.isArray(imageMeta) ? imageMeta : [];
   return {
     provider,
     model,
@@ -257,8 +261,8 @@ function buildSubmissionRecord({ provider, model, params = {}, predictionId = nu
     images: images.map((url, i) => ({
       position:     i,
       submittedUrl: typeof url === 'string' ? url : null,
-      sourceUrl:    imageMeta[i]?.sourceUrl ?? null,
-      role:         imageMeta[i]?.role ?? null
+      sourceUrl:    labels[i]?.sourceUrl ?? null,
+      role:         labels[i]?.role ?? null
     }))
   };
 }
@@ -292,9 +296,11 @@ async function generateImage({
   timeoutMs, allowFallback = true
 }) {
   const m = model || DEFAULT_T2I_MODEL;
-  const params = buildParams(m, { prompt, size, quality, aspectRatio });
   try {
     if (!isConfigured()) throw new Error('ATLAS_API_KEY not configured');
+    // Built inside the try so a throw here still reaches the provider
+    // fallback, matching editImage.
+    const params = buildParams(m, { prompt, size, quality, aspectRatio });
     const out = await submitAndPoll(m, params, meta, { timeoutMs });
     return {
       data: [{ b64_json: out.b64 }],
