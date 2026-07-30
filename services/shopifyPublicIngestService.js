@@ -762,10 +762,18 @@ function extractReviewsFromHtml(html, reviewAppName) {
         if (typeof r.author === 'string') author = r.author;
         else if (typeof r.author === 'object') author = r.author.name || null;
       }
+      // Per-review star rating, kept so quote selection can require a
+      // high-rated review. Without it every stored quote is unrated and
+      // downstream can only judge the wording, which lets a 2-star review
+      // that happens to open warmly ("the fabric feels amazing, but…")
+      // become the testimonial on the ad.
+      const rr = r.reviewRating && typeof r.reviewRating === 'object' ? r.reviewRating : null;
+      const ratingValue = Number(rr?.ratingValue ?? r.ratingValue);
       quotes.push({
         text,
         author: author ? String(author).slice(0, 120) : null,
-        source: reviewAppName || 'store'
+        source: reviewAppName || 'store',
+        rating: Number.isFinite(ratingValue) ? ratingValue : null
       });
       if (quotes.length >= 10) break;
     }

@@ -1304,6 +1304,47 @@ function scoreQuote(text) {
 // promote neutral-lived-experience quotes with no endorsement value.
 const SCORE_FLOOR = 1;
 
+// Star gate for review-backed quote tiers. A testimonial on a paid ad should
+// come from someone who actually rated the product highly — text scoring alone
+// cannot tell "the fabric feels amazing" in a 5-star review from the same
+// clause inside a 2-star complaint.
+//
+// Applies to reviews only. Instagram comments and LLM-authored lines carry no
+// star rating and are gated by sentiment elsewhere.
+const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.5);
+// Whether a quote with NO recorded rating may still be used. Per-review stars
+// were not captured until recently, so every already-synced product has
+// unrated quotes: requiring a rating outright would strip testimonials from
+// the entire existing catalog until each product is re-synced. Default keeps
+// them and reports the gap; set true once coverage is good.
+const QUOTE_REQUIRE_RATING = String(process.env.QUOTE_REQUIRE_RATING || 'false').toLowerCase() === 'true';
+
+function gateQuotesByRating(candidates, tierName) {
+  if (!Array.isArray(candidates) || !candidates.length) return [];
+  let rated = 0, dropped = 0, unrated = 0;
+  const kept = candidates.filter((q) => {
+    if (typeof q?.rating !== 'number' || !Number.isFinite(q.rating)) {
+      unrated += 1;
+      return !QUOTE_REQUIRE_RATING;
+    }
+    rated += 1;
+    // Ratings arrive on both 5-point and 100-point scales depending on the
+    // review app; normalize before comparing so a 90/100 is not read as a 90.
+    const normalized = q.rating > 5 ? (q.rating / 20) : q.rating;
+    if (normalized >= QUOTE_MIN_RATING) return true;
+    dropped += 1;
+    return false;
+  });
+  if (dropped || unrated) {
+    console.log(
+      `⭐ quote gate[${tierName}] — kept=${kept.length}/${candidates.length} ` +
+      `rated=${rated} belowMin=${dropped} unrated=${unrated} ` +
+      `(min=${QUOTE_MIN_RATING}, requireRating=${QUOTE_REQUIRE_RATING})`
+    );
+  }
+  return kept;
+}
+
 function pickStrongestQuote(candidates) {
   if (!Array.isArray(candidates) || candidates.length === 0) return null;
   let best = null;
@@ -1338,10 +1379,17 @@ function pickStrongestQuote(candidates) {
 // layout-input artifact expects: { text, author_name, source }.
 function normalizeQuote(q) {
   if (!q?.text) return null;
+  // rating is carried so selection can gate on the reviewer's stars. It was
+  // dropped here, which left scoring to judge the wording alone — a low-rated
+  // review that reads positively could win the primary slot.
+  // null means genuinely unknown (older rows, comments, LLM-authored), never
+  // "unrated so assume good".
+  const rating = Number(q.rating ?? q.reviewRating?.ratingValue);
   return {
     text:        String(q.text).trim(),
     author_name: q.author_name || q.author || q.source || 'Verified buyer',
     source:      q.source || undefined,
+    rating:      Number.isFinite(rating) ? rating : null,
     verified:    q.verified !== undefined ? q.verified : true
   };
 }
@@ -1619,10 +1667,10 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // First non-empty tier's best-scoring quote wins the primary slot.
   // Everything else across all tiers goes to secondary_quotes so the
   // renderer can rotate through them.
-  const tierProduct = (details.productReviews?.quotes || []).map(normalizeQuote).filter(Boolean);
+  const tierProduct = gateQuotesByRating((details.productReviews?.quotes || []).map(normalizeQuote).filter(Boolean), 'product');
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
-  const tierCategory = (catReviewsForMatch?.quotes || []).map(normalizeQuote).filter(Boolean);
-  const tierBrand    = (ctx.match?.brandReviews?.quotes || ctx.brand?.brandReviews?.quotes || []).map(normalizeQuote).filter(Boolean);
+  const tierCategory = gateQuotesByRating((catReviewsForMatch?.quotes || []).map(normalizeQuote).filter(Boolean), 'category');
+  const tierBrand    = gateQuotesByRating((ctx.match?.brandReviews?.quotes || ctx.brand?.brandReviews?.quotes || []).map(normalizeQuote).filter(Boolean), 'brand');
   const tierComment  = await loadBrandCommentsForQuotePool(ctx);
   const tierLlm      = (Array.isArray(derivation.quotes) ? derivation.quotes : []).map(normalizeQuote).filter(Boolean);
 
