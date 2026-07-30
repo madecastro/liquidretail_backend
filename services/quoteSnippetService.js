@@ -14,7 +14,9 @@ const { trackLlmCall } = require('./costTracker');
 
 const { chatCompletion } = require('./atlasLlmService');
 
-const MODEL_ID  = process.env.QUOTE_SNIPPET_MODEL_ID || 'gpt-4o-mini';
+// 'quote-snippet' role → Atlas openai/gpt-5-nano (see atlasModelMap). Sized to
+// the job: one short review in, ~8 words out, strict schema, no reasoning.
+const MODEL_ID  = process.env.QUOTE_SNIPPET_MODEL_ID || 'quote-snippet';
 const MAX_CHARS = 50;
 
 const RESPONSE_SCHEMA = {
@@ -104,8 +106,11 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   if (!clean) return null;
   if (clean.length <= MAX_CHARS) return clean;
 
-  if (!process.env.OPENAI_API_KEY) {
-    console.warn('quoteSnippet: OPENAI_API_KEY missing — mechanical truncate');
+  // Atlas is the primary route and OpenAI only the direct fallback, so gating
+  // on OPENAI_API_KEY alone silently disabled extraction on an Atlas-only
+  // deployment — every quote fell back to mechanical truncation.
+  if (!process.env.ATLAS_API_KEY && !process.env.OPENAI_API_KEY) {
+    console.warn('quoteSnippet: no ATLAS_API_KEY or OPENAI_API_KEY — mechanical truncate');
     return truncateAtWordBoundary(clean);
   }
 
@@ -158,8 +163,24 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   }
 }
 
+// Ceiling for ANY proof line rendered on an ad — review quote or social
+// comment. Comments never pass through extractSnippet (they are bound
+// directly from social_context.top_comments[]), so they are shortened with
+// truncateAtWordBoundary at this width instead of being raw-sliced.
+const PROOF_LINE_MAX_CHARS = 60;
+
+// One-line helper so every comment emitter shortens identically. Deliberately
+// the same routine the quote fallback uses: a complete sentence or clause when
+// one fits, otherwise a space-boundary cut — never mid-word.
+function shortenProofLine(text, maxChars = PROOF_LINE_MAX_CHARS) {
+  const clean = String(text || '').trim();
+  return clean ? truncateAtWordBoundary(clean, maxChars) : '';
+}
+
 module.exports = {
   extractSnippet,
   truncateAtWordBoundary,   // exported for testing / direct fallback callers
+  shortenProofLine,
+  PROOF_LINE_MAX_CHARS,
   MAX_CHARS
 };

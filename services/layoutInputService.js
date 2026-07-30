@@ -67,7 +67,7 @@ const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
 const { computeSlotBudgets } = require('./slotBudget');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
-const { extractSnippet }        = require('./quoteSnippetService');
+const { extractSnippet, PROOF_LINE_MAX_CHARS } = require('./quoteSnippetService');
 
 // Atlas gateway (Gemini served OpenAI-compatible; Google's OpenAI-compat
 // endpoint as the direct fallback inside the transport).
@@ -1358,21 +1358,57 @@ function pickStrongestQuote(candidates) {
     }
   }
   if (!best || bestScore < SCORE_FLOOR) return null;
-  // Require at least one positive lexeme — prevents pure lived-experience
-  // narration ("Bought this three weeks ago") from winning the primary
-  // slot with no endorsement signal.
-  const s = String(best.text || '');
+  return hasPositiveSignal(best.text) ? best : null;
+}
+
+// Require at least one positive lexeme — prevents pure lived-experience
+// narration ("Bought this three weeks ago") from being used as an
+// endorsement. Shared by the quote tiers and by social comments so both are
+// held to the same standard of what counts as praise.
+function hasPositiveSignal(text) {
+  const s = String(text || '');
   const hasPositive =
        STRONG_POSITIVE.test(s)
     || MODERATE_POSITIVE.test(s)
     || PHRASE_STRONG.test(s);
   // Reset the regex `lastIndex` state since STRONG_POSITIVE/MODERATE_POSITIVE
   // use the global flag; leaving lastIndex non-zero would break subsequent
-  // matches on the next pick.
+  // matches on the next call.
   STRONG_POSITIVE.lastIndex = 0;
   MODERATE_POSITIVE.lastIndex = 0;
   PHRASE_STRONG.lastIndex = 0;
-  return hasPositive ? best : null;
+  return hasPositive;
+}
+
+// Social comments rendered as proof go through the SAME pipeline as review
+// quotes: positive-sentiment gate, then extractSnippet — the one place a
+// quote is shortened, which enforces a self-contained thought on a whole
+// word. Comments that carry no praise, or that yield nothing usable, are
+// dropped rather than shown half-finished. Nothing downstream shortens
+// these again.
+async function buildProofComments(topComments, ctx, limit = 3) {
+  const rows = Array.isArray(topComments) ? topComments : [];
+  const positive = rows.filter((c) => c?.text && hasPositiveSignal(c.text));
+  const out = [];
+  for (const c of positive) {
+    if (out.length >= limit) break;
+    const snippet = await extractSnippet(c.text, {
+      brandId:   ctx.media?.brandId || null,
+      productId: ctx.match?.identification?.details?.catalogProductId || null
+    });
+    if (!snippet || snippet.length > PROOF_LINE_MAX_CHARS) continue;
+    out.push({
+      text:            snippet,
+      author_username: c.authorUsername || c.author || null,
+      like_count:      c.likeCount || 0,
+      reply_count:     c.replyCount || 0,
+      posted_at:       c.postedAt || null
+    });
+  }
+  if (rows.length !== out.length) {
+    console.log(`💬 proof comments — kept=${out.length}/${rows.length} (positive=${positive.length}, max=${PROOF_LINE_MAX_CHARS}c)`);
+  }
+  return out;
 }
 
 // Normalize a raw quote object from any tier into the shape the
@@ -1710,6 +1746,9 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
     if (snippet) primaryQuote.snippet = snippet;
   }
 
+  // Social comments used as proof go through the same gate + snippet path.
+  const proofComments = await buildProofComments(ctx.topComments, ctx);
+
   // Observability — show tier counts + which tier won so a bad
   // primary_quote is diagnosable from Render logs without a DB query.
   console.log(
@@ -1906,13 +1945,10 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       // collection at loadContext time. The new comment_card zone
       // binds to ugc.top_comments[]; existing metrics_row continues
       // to bind to ugc.{likes,comments,saves,shares} as counts.
-      top_comments: (ctx.topComments || []).map(c => ({
-        text:            c.text || '',
-        author_username: c.authorUsername || null,
-        like_count:      c.likeCount || 0,
-        reply_count:     c.replyCount || 0,
-        posted_at:       c.postedAt || null
-      }))
+      // Positive-gated and snippetized through the same path as review
+      // quotes (see buildProofComments) — previously the raw comment was
+      // passed through and the renderer clipped whatever overflowed.
+      top_comments: proofComments
     },
 
     social_proof: {
@@ -2881,5 +2917,8 @@ module.exports = {
   loadContext,
   // Exported for the AI-canvas pipeline so it can build per-ratio
   // alt crop URLs from the same crop artifacts the renderer uses.
-  buildCloudinaryCropUrl
+  buildCloudinaryCropUrl,
+  // Shared so every surface that renders a social comment as proof applies
+  // the same definition of praise, rather than each growing its own lexicon.
+  hasPositiveSignal
 };
