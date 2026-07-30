@@ -430,13 +430,30 @@ async function renderStage(args) {
   //
   // The one exception is a brand deliberately routed to the HTML path
   // (`routedToHtml`) — a choice, not a fault.
-  if (renderMode === 'static' && template && String(template).startsWith('ai_') && args.adConceptArtifactId) {
+  // NOTE the guard deliberately does NOT test adConceptArtifactId. It used to,
+  // which meant an ai_* static Ad queued without a concept skipped this block
+  // entirely and rendered through HTML gen — an ad shipping with no creative
+  // direction at all, silently. Every static ai_* render now enters here, and
+  // an absent concept fails inside renderDirectImage rather than routing
+  // around the check.
+  if (renderMode === 'static' && template && String(template).startsWith('ai_')) {
     const directImage = require('./directImageRenderService');
+    const alerts = require('./alertService');
     let output;
     try {
       output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
     } catch (err) {
       console.error(`   ❌ [render direct-image] failed — ${err.message}`);
+      // One alert per failed render, at the severity the thrower chose:
+      // missing credentials is an outage (fatal), a missing concept is a
+      // pipeline fault (error). Unclassified throws default to error.
+      alerts.notifyAsync({
+        level:  err.alertLevel || 'error',
+        title:  'Static ad render failed (direct overlay)',
+        key:    err.alertKey || 'direct-image:render-failed',
+        fields: { template, aspectRatio, product: String(productId || '-'), media: String(mediaId || '-'), error: err.message },
+        detail: err.stack || null
+      });
       throw new Error(`direct-image render failed: ${err.message}`, { cause: err });
     }
     if (!output?.skipped) return output;
