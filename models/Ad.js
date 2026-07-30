@@ -315,6 +315,16 @@ const adSchema = new mongoose.Schema({
   // Exact font resolution audit for the direct static-image path.
   // { heading/body: { requestedFamily, resolvedFamily, source, exact } }
   fontResolution:     { type: mongoose.Schema.Types.Mixed, default: null },
+  // Verbatim audit of the image-model request, captured at submit time from
+  // the POST body itself (atlasImageService.buildSubmissionRecord):
+  // { provider, model, predictionId, submittedAt, prompt, size, quality,
+  //   imageCount, images: [{ position, submittedUrl, sourceUrl, role }] }.
+  // The generation inspector renders ONLY this — it must never reconstruct a
+  // plausible-looking stack, because a diagnostic that shows what should have
+  // been sent instead of what was sent silently misdirects every diagnosis
+  // built on it. Null on renders that predate this capture; the inspector
+  // says so rather than guessing.
+  imageGeneration:    { type: mongoose.Schema.Types.Mixed, default: null },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },

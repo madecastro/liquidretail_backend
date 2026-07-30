@@ -271,7 +271,19 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   }
   const resolvedProduct = product || (layout.productId ? await CatalogProduct.findById(layout.productId).select('title imageUrl').lean() : null);
   const dims = dimsFor(aspectRatio);
-  const refs = (await Promise.all([optionalImage(resolvedProduct?.imageUrl), optionalImage(media?.fileUrl)])).filter(Boolean).slice(0, 2);
+  // Two references go to the image model, not one. Carry each buffer's origin
+  // alongside it so the generation inspector can name what was submitted —
+  // the uploaded Atlas handles are ephemeral and meaningless after the fact.
+  const refCandidates = [
+    { sourceUrl: resolvedProduct?.imageUrl || null, role: 'product-hero' },
+    { sourceUrl: media?.fileUrl || null,            role: 'seed-media'   }
+  ];
+  const fetchedRefs = await Promise.all(refCandidates.map((c) => optionalImage(c.sourceUrl)));
+  const refs = [];
+  const imageMeta = [];
+  refCandidates.forEach((candidate, i) => {
+    if (fetchedRefs[i] && refs.length < 2) { refs.push(fetchedRefs[i]); imageMeta.push(candidate); }
+  });
   const prompt = buildPlatePrompt({ concept, brand: resolvedBrand, product: resolvedProduct, aspectRatio });
   const meta = { stage: 'direct_image_overlay', service: 'directImageRenderService', purposeTag: template || 'untagged', brandId: resolvedBrand?._id || brandId || null, productId: resolvedProduct?._id || productId || null, mediaId: mediaId || null };
   // When Atlas is configured, the established renderer is the recovery path.
@@ -280,7 +292,7 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   const allowProviderFallback = !atlasImage.isConfigured();
   const result = refs.length
     ? await atlasImage.editImage({
-      model: PLATE_EDIT_MODEL, images: refs, prompt, size: dims.atlasSize,
+      model: PLATE_EDIT_MODEL, images: refs, imageMeta, prompt, size: dims.atlasSize,
       quality: PLATE_QUALITY, meta, timeoutMs: PLATE_TIMEOUT_MS,
       uploadTimeoutMs: UPLOAD_TIMEOUT_MS, allowFallback: allowProviderFallback
     })
@@ -316,6 +328,12 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   return {
     buffer, contentType: 'image/png', width: dims.width, height: dims.height,
     bytes: buffer.length, kind: 'image', directImage: true,
+    // Verbatim audit of the image-model request, built at submit time inside
+    // atlasImageService. Persisted onto the Ad so the inspector never has to
+    // re-derive what "should" have been sent.
+    imageGeneration: result?.submission
+      ? { ...result.submission, pipeline: DIRECT_OVERLAY_PIPELINE, stage: 'plate' }
+      : null,
     fontResolution: {
       heading: {
         requestedFamily: fonts.heading.requestedFamily,

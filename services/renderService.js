@@ -1063,6 +1063,7 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
       bytes:              upload.bytes,
       durationMs:         upload.durationMs,
       fontResolution:     renderOutput.fontResolution || null,
+      imageGeneration:    renderOutput.imageGeneration || null,
       copy,
       status:             'draft',
       renderedAt:         new Date(),

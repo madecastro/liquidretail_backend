@@ -1679,22 +1679,19 @@ router.get('/:id/generation-inspector', async (req, res) => {
 
     // ── Video generation inputs ──
     if (ad.kind === 'video' || ad.veoPrompt || ad.veoVideoUrl) {
-      // Reference-image stack the director actually fed the model
-      // (pos 0 = seed, then product hero + alts). Persisted on newer ads;
-      // reconstructed from seed + catalog product images for older ones.
-      let referenceImages = Array.isArray(ad.veoReferenceImages) ? ad.veoReferenceImages.filter(Boolean) : [];
-      let referenceImagesReconstructed = false;
+      // The reference-image stack the model ACTUALLY received (pos 0 = seed),
+      // exactly as persisted at submit time. This used to fall back to a guess
+      // rebuilt from the seed + the product's current catalog images, which is
+      // both unfaithful (catalog images drift after the render) and actively
+      // misleading in a diagnostic — an operator comparing output against a
+      // reconstructed input stack is debugging a request that never happened.
+      // Ads rendered before this was persisted report an empty list and say so.
+      const referenceImages = Array.isArray(ad.veoReferenceImages) ? ad.veoReferenceImages.filter(Boolean) : [];
       if (!referenceImages.length) {
-        const recon = [];
-        if (seed?.url) recon.push(seed.url);
-        if (ad.productId) {
-          const CatalogProduct = require('../models/CatalogProduct');
-          const cp = await CatalogProduct.findById(ad.productId).select('imageUrl additionalImages').lean();
-          if (cp?.imageUrl) recon.push(cp.imageUrl);
-          for (const u of (Array.isArray(cp?.additionalImages) ? cp.additionalImages : [])) if (u) recon.push(u);
-        }
-        referenceImages = [...new Set(recon)];
-        referenceImagesReconstructed = referenceImages.length > 0;
+        out.warnings.push({
+          code: 'reference-images-not-recorded',
+          message: 'No reference-image stack was recorded for this render, so none is shown. This ad predates submit-time capture — the images it actually received cannot be recovered after the fact.'
+        });
       }
       out.video = {
         model:       ad.veoModel || null,
@@ -1719,8 +1716,7 @@ router.get('/:id/generation-inspector', async (req, res) => {
             .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good,w_360/')
             .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
         } : null,
-        referenceImages,                         // the images the director chose (pos 0 = seed)
-        referenceImagesReconstructed
+        referenceImages                           // exactly what was submitted (pos 0 = seed); never reconstructed
       };
       if (!ad.veoPrompt) {
         out.warnings.push({ code: 'no-video-prompt', message: 'No stored video prompt — ad predates prompt persistence or was not a Veo render.' });
@@ -1743,12 +1739,24 @@ router.get('/:id/generation-inspector', async (req, res) => {
     }
 
     // ── Static image generation inputs ──
-    if (ad.kind === 'image' || ad.aiCanvasArtifactId) {
+    if (ad.kind === 'image' || ad.aiCanvasArtifactId || ad.imageGeneration) {
       const image = {
         aiCanvasArtifactId:    ad.aiCanvasArtifactId ? String(ad.aiCanvasArtifactId) : null,
         layoutInputArtifactId: ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null,
-        fontResolution:        ad.fontResolution || null
+        fontResolution:        ad.fontResolution || null,
+        // THE image-model request, verbatim from the POST body at submit time.
+        // Distinct from layoutPrompt below, which belongs to the *layout* LLM
+        // that writes HTML — conflating the two is what made an operator read
+        // "one front image" while gpt-image-2 had in fact been handed two
+        // references. Never reconstructed: null means not recorded.
+        imageGeneration:       ad.imageGeneration || null
       };
+      if (!ad.imageGeneration) {
+        out.warnings.push({
+          code: 'image-generation-not-recorded',
+          message: 'No image-model request was recorded for this render, so none is shown. Any prompt or image shown below belongs to the layout LLM, NOT the image model. This ad predates submit-time capture.'
+        });
+      }
       if (ad.aiCanvasArtifactId) {
         const AiCanvasArtifact = require('../models/AiCanvasArtifact');
         const c = await AiCanvasArtifact.findById(ad.aiCanvasArtifactId)
@@ -1782,7 +1790,7 @@ router.get('/:id/generation-inspector', async (req, res) => {
           }
         }
       }
-      // NOTE: the gpt-image-2 image-ref prompt (AiFullRenderArtifact) is
+      // NOTE: the shadow image-ref artifact (AiFullRenderArtifact) is still
       // intentionally NOT joined here — it has no FK on the Ad and its
       // uniqueness is an 8-field cache key (mediaId+template+aspectRatio+
       // productId+variantKind+campaignContextHash+paletteSource+creativeStyle),
@@ -1791,6 +1799,9 @@ router.get('/:id/generation-inspector', async (req, res) => {
       // correctly-joined image-ref + creative-direction detail is available
       // via GET /api/ai-layouts/spec/by-artifact/:aiCanvasArtifactId (exposed
       // above) — the frontend can deep-link to it.
+      // This is why `imageGeneration` above is captured at submit time on the
+      // Ad itself: an FK-less join is guesswork, and the one thing this
+      // endpoint must never do is guess about what the model was sent.
       out.image = image;
     }
 
