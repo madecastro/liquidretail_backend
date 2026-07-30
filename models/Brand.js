@@ -46,6 +46,13 @@ const brandSchema = new mongoose.Schema({
   tagline:        String,                            // one-liner positioning (≤ 12 words)
   summary:        String,                            // 2-4 sentence verbose brand description
   logoUrl:        String,
+  // Logo provenance and ingest audit. Website logos are discovered from
+  // structured data, header/nav markup, manifests and rendered storefronts,
+  // then mirrored to Cloudinary before this URL is stored.
+  logoSource:      { type: String, default: null },
+  logoOriginalUrl: { type: String, default: null },
+  logoIngestedAt:  { type: Date, default: null },
+  logoIngestError: { type: String, default: null },
   primaryColor:   String,
   secondaryColor: String,
   accentColor:    String,
