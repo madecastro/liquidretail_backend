@@ -126,15 +126,21 @@ const DEFAULT_META_CASCADES = {
   ],
 
   // ── Social proof (numeric) ───────────────────────────────────────
+  // No brand-level fallback. layoutInput.social_proof already decides when
+  // brand rating/review_count may stand in — only when the match outcome is
+  // brand_match, i.e. a brand ad claiming no single SKU — and tier 1 below
+  // carries that decision. A third tier reading Brand.brandReviews directly
+  // reached around that gate, so a product ad with no reviews of its own
+  // displayed the brand's aggregate beside one item: a $28 t-shirt credited
+  // with 41,000 reviews and the brand's 3.3 rating. Product ads now show the
+  // product's own numbers or none.
   rating: [
     { type: 'doc', doc: 'layoutInput',    path: 'input.social_proof.rating_value' },
     { type: 'doc', doc: 'catalogProduct', path: 'rating' },
-    { type: 'doc', doc: 'brand',          path: 'brandReviews.rating' },
   ],
   reviewCount: [
     { type: 'doc', doc: 'layoutInput',    path: 'input.social_proof.review_count' },
     { type: 'doc', doc: 'catalogProduct', path: 'reviewCount' },
-    { type: 'doc', doc: 'brand',          path: 'brandReviews.reviewCount' },
   ],
   likes: [
     { type: 'doc', doc: 'layoutInput', path: 'input.performance.engagement.likes' },

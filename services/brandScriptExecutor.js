@@ -654,10 +654,13 @@ async function buildMetaForAd(ad, brand) {
   // endcardMode routes the canonical scripts' brand vs product endcard
   // branch. reviewsText is a formatted string built from reviewCount.
   const endcardMode = ad.productId ? 'product' : 'brand';
+  // Null when we have no count, so the slot is skipped. The old fallback was
+  // the literal '53 reviews' — a number invented for a product we hold no
+  // review data for, printed as social proof. Removing the brand-level
+  // rating/reviewCount fallback from the cascade makes an unknown count more
+  // common, which makes inventing one worse, not more excusable.
   const rc = cascaded.reviewCount;
-  const reviewsText = rc != null
-    ? `${rc} review${rc === 1 ? '' : 's'}`
-    : '53 reviews';
+  const reviewsText = rc != null ? `${rc} review${rc === 1 ? '' : 's'}` : null;
 
   // deliveryLine and promoText share their two highest-priority sources
   // (ad.copy.offer_text, then layoutInput.input.cta.offer_text), so any ad
