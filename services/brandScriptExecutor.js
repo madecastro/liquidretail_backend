@@ -862,7 +862,11 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
       resourceType: 'video',
       overwrite:    true
     });
-    const set = { renderUrl: uploaded.secure_url, updatedAt: new Date() };
+    const set = {
+      renderUrl:  uploaded.secure_url,
+      renderedAt: new Date(),
+      updatedAt:  new Date()
+    };
     // Rebuild the poster from the TITLED upload. posterUrl was stamped pre-chrome from the raw
     // base video (routes/ads.js), so without this a video ad's poster stays an UNCROPPED,
     // UNTITLED 9:16 still — the wrong aspect and missing the titles — and that poster is the

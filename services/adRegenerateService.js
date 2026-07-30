@@ -221,6 +221,7 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null)
       veoModel:       veoResult.model || null,
       veoReferenceImages: veoResult.referenceImages || [],
       renderUrl:      veoResult.videoUrl,
+      renderedAt:     new Date(),
       updatedAt:      new Date()
     }
   });
@@ -294,6 +295,7 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
       $set: {
         renderUrl:          uploaded.secure_url,
         cloudinaryPublicId: uploaded.public_id,
+        renderedAt:         new Date(),
         updatedAt:          new Date()
       }
     }
