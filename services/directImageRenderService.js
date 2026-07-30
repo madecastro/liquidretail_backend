@@ -263,15 +263,10 @@ function taggedError(message, { alertLevel = 'error', alertKey }) {
 }
 
 async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, productId, brandId, adConceptArtifactId, adConceptId, template, referenceMediaIds = [] }) {
-  // No image provider at all. Nothing downstream can succeed and every ad in
-  // every run will fail the same way, so this is the loudest level we have —
-  // it is an outage, not a bad ad.
-  if (!atlasImage.isConfigured() && !process.env.OPENAI_API_KEY) {
-    throw taggedError(
-      'no image credentials: neither ATLAS_API_KEY nor OPENAI_API_KEY is configured — no static ad can render until one is set',
-      { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
-    );
-  }
+  // Credentials are checked further down, AFTER brand routing: a brand
+  // deliberately on the HTML pipeline renders through gpt-4.1 + Puppeteer and
+  // needs no image-model key, so failing it here for a missing Atlas key would
+  // break a path that does not use Atlas.
 
   const [layout, concept, brand, product, media] = await Promise.all([
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
@@ -308,6 +303,18 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
     // above is breakage and must not be quietly rerouted into a different
     // renderer.
     return { skipped: true, routedToHtml: true, reason: `brand staticImagePipeline is ${resolvedBrand?.staticImagePipeline || 'html'}` };
+  }
+
+  // Only reached for brands actually on this pipeline. No image provider at
+  // all means nothing here can succeed and every ad in every run fails the
+  // same way, so it gets the loudest level we have — it is an outage, not a
+  // bad ad. Deliberately after the concept check, which is universal, and
+  // after brand routing, which does not need an image key.
+  if (!atlasImage.isConfigured() && !process.env.OPENAI_API_KEY) {
+    throw taggedError(
+      'no image credentials: neither ATLAS_API_KEY nor OPENAI_API_KEY is configured — no static ad can render until one is set',
+      { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
+    );
   }
   const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl').lean() : null);
   const dims = dimsFor(aspectRatio);
