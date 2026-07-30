@@ -267,7 +267,12 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
 
   const resolvedBrand = brand || (layout.brandId ? await Brand.findById(layout.brandId).lean() : null);
   if (!isDirectOverlayPipeline(resolvedBrand?.staticImagePipeline)) {
-    return { skipped: true, reason: `brand staticImagePipeline is ${resolvedBrand?.staticImagePipeline || 'html'}` };
+    // The ONLY legitimate reason to leave this pipeline: an operator put this
+    // brand on the HTML path deliberately. `routedToHtml` marks it as a
+    // routing decision so the caller can honour it, while every other exit
+    // above is breakage and must not be quietly rerouted into a different
+    // renderer.
+    return { skipped: true, routedToHtml: true, reason: `brand staticImagePipeline is ${resolvedBrand?.staticImagePipeline || 'html'}` };
   }
   const resolvedProduct = product || (layout.productId ? await CatalogProduct.findById(layout.productId).select('title imageUrl').lean() : null);
   const dims = dimsFor(aspectRatio);

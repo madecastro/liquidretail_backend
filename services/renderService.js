@@ -418,17 +418,33 @@ async function renderStage(args) {
   // Direct image pipeline: use the Director's approved concept and source
   // imagery to make a text-free plate, then render all copy/CTA/logo locally.
   // It is deliberately synchronous: an ad never becomes draft until the
-  // production asset exists. Any failure falls through to the established
-  // HTML/spec pipeline so a provider outage cannot stop campaign generation.
+  // production asset exists.
+  //
+  // This used to swallow every failure and fall through to the HTML/spec
+  // renderer. That produced an ad through a pipeline the operator had already
+  // rejected, and — worse — hid the reason: a missing concept, an expired
+  // Atlas key and a provider timeout all looked identical from the outside,
+  // which is to say invisible. A render that cannot run the pipeline it was
+  // asked for now fails loudly, with the reason attached, so the cause gets
+  // fixed instead of papered over.
+  //
+  // The one exception is a brand deliberately routed to the HTML path
+  // (`routedToHtml`) — a choice, not a fault.
   if (renderMode === 'static' && template && String(template).startsWith('ai_') && args.adConceptArtifactId) {
+    const directImage = require('./directImageRenderService');
+    let output;
     try {
-      const directImage = require('./directImageRenderService');
-      const output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
-      if (!output?.skipped) return output;
-      console.log(`   🖼️  [render direct-image] skipped — ${output.reason}`);
+      output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
     } catch (err) {
-      console.warn(`   ⚠️  [render direct-image] failed (${err.message}) — falling back to existing renderer`);
+      console.error(`   ❌ [render direct-image] failed — ${err.message}`);
+      throw new Error(`direct-image render failed: ${err.message}`, { cause: err });
     }
+    if (!output?.skipped) return output;
+    if (!output.routedToHtml) {
+      console.error(`   ❌ [render direct-image] unavailable — ${output.reason}`);
+      throw new Error(`direct-image render unavailable: ${output.reason}`);
+    }
+    console.log(`   🖼️  [render direct-image] brand routed to HTML — ${output.reason}`);
   }
 
   // Phase 6.5.1 — eager prime so the first wave of a fresh batch
