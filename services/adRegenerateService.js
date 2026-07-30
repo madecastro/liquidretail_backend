@@ -184,7 +184,7 @@ async function loadBrand(adId) {
   const media = ad?.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
   return media?.brandId
     ? await Brand.findById(media.brandId)
-        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily videoSettings titleStyleSpec titleStylePreset customFonts').lean()
+        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts videoSettings titleStyleSpec titleStylePreset').lean()
     : null;
 }
 

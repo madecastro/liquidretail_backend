@@ -5,3 +5,4 @@ uploads/
 .cache/
 scripts/out/
 services/brandScripts/assets/webfonts/
+services/brandScripts/assets/fonts/*.ttf

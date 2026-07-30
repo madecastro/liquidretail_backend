@@ -15,6 +15,7 @@ const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact')
 const Brand = require('../models/Brand');
 const CatalogProduct = require('../models/CatalogProduct');
 const Media = require('../models/Media');
+const { resolveBrandFonts, normalizeFontFamily } = require('./fontResolverService');
 
 const DIRECT_OVERLAY_PIPELINE = 'direct_overlay';
 const PLATE_EDIT_MODEL = 'openai/gpt-image-2/edit';
@@ -66,17 +67,33 @@ function linesSvg(lines, { x, y, size, lineHeight, weight, color, family }) {
 
 function themeFor(brand, layoutBrand) {
   const styleThemeIsCurated = Array.isArray(brand?.curatedFields) && brand.curatedFields.includes('styleTheme');
+  const fontFamilyIsCurated = Array.isArray(brand?.curatedFields) && brand.curatedFields.includes('fontFamily');
   const tailwind = brand?.tailwindTheme || {};
   // A human-curated style theme remains authoritative. Otherwise the
   // confidence-gated Tailwind kit wins over older automatic style data.
   const theme = styleThemeIsCurated ? (brand?.styleTheme || {}) : {};
   const colors = theme?.colors || theme || {};
+  const headingFont = normalizeFontFamily(
+    theme?.fonts?.heading?.family || theme?.headingFont ||
+    (fontFamilyIsCurated ? brand?.fontFamily : null) ||
+    tailwind?.fonts?.heading || brand?.websiteFontUsage?.heading ||
+    brand?.fontFamily || layoutBrand?.font_family
+  ) || 'Arial';
+  const bodyFont = normalizeFontFamily(
+    theme?.fonts?.body?.family || theme?.bodyFont ||
+    (fontFamilyIsCurated ? brand?.fontFamily : null) ||
+    tailwind?.fonts?.body || brand?.websiteFontUsage?.body ||
+    brand?.fontFamily || layoutBrand?.font_family || headingFont
+  ) || headingFont;
   return {
     accent: safeColor(colors.ctaBgColor || colors.accentColor || tailwind?.colors?.accent || brand?.accentColor || layoutBrand?.accent_color, '#D8FF64'),
     text: safeColor(colors.textPrimary || tailwind?.colors?.font || brand?.fontColor, '#FFFFFF'),
     secondaryText: safeColor(colors.textSecondary, '#E6EEF7'),
     ctaText: safeColor(colors.ctaTextColor, '#07111D'),
-    font: String(theme?.fonts?.heading?.family || theme?.headingFont || tailwind?.fonts?.heading || tailwind?.fonts?.body || brand?.fontFamily || 'Arial, Helvetica, sans-serif').slice(0, 120)
+    headingFont,
+    bodyFont,
+    // Backward-compatible alias for callers/tests that inspect theme.font.
+    font: headingFont
   };
 }
 
@@ -108,6 +125,94 @@ function buildOverlay({ copy, brand, layoutBrand, dims }) {
     <text x="${margin + 167}" y="${ctaY + 59}" text-anchor="middle" font-family="${escapeXml(theme.font)}" font-size="28" font-weight="700" letter-spacing="1" fill="${theme.ctaText}">${escapeXml(cta)}</text>
     ${wordmark ? `<text x="${dims.width - margin}" y="${dims.height - 76}" text-anchor="end" font-family="${escapeXml(theme.font)}" font-size="22" font-weight="700" letter-spacing="2" fill="${theme.text}">${escapeXml(wordmark)}</text>` : ''}
   </svg>`;
+}
+
+function buildGraphicOverlay({ brand, layoutBrand, dims }) {
+  const theme = themeFor(brand, layoutBrand);
+  const margin = 64;
+  const ruleY = Math.round(dims.height * dims.overlayStart);
+  const ctaY = dims.height - 166;
+  return `
+  <svg width="${dims.width}" height="${dims.height}" xmlns="http://www.w3.org/2000/svg">
+    <defs><linearGradient id="direct-scrim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#07111D" stop-opacity="0"/><stop offset="38%" stop-color="#07111D" stop-opacity="0.12"/><stop offset="100%" stop-color="#07111D" stop-opacity="0.94"/>
+    </linearGradient></defs>
+    <rect width="100%" height="100%" fill="url(#direct-scrim)"/>
+    <rect x="${margin}" y="${ruleY}" width="${dims.width - margin * 2}" height="12" rx="6" fill="${theme.accent}"/>
+    <rect x="${margin}" y="${ctaY}" width="334" height="94" rx="47" fill="${theme.accent}"/>
+  </svg>`;
+}
+
+function pangoMarkup(text, { color, size, weight, letterSpacing = 0 }) {
+  const spacing = Math.round(letterSpacing * 1024);
+  return `<span foreground="${escapeXml(color)}" size="${size}pt" weight="${weight}"${spacing ? ` letter_spacing="${spacing}"` : ''}>${escapeXml(text)}</span>`;
+}
+
+function textComposite({ text, font, left, top, width, color, size, weight, align = 'left', spacing = 0, letterSpacing = 0 }) {
+  if (!text) return null;
+  const descriptor = {
+    text: pangoMarkup(text, { color, size, weight, letterSpacing }),
+    font: `${font.family} ${weight}`,
+    width,
+    align,
+    spacing,
+    rgba: true
+  };
+  // This is the load-bearing difference from the old SVG text: Sharp
+  // receives the exact resolved website/Google/library font file.
+  if (font.url) descriptor.fontfile = font.url;
+  return { input: { text: descriptor }, left: Math.round(left), top: Math.max(0, Math.round(top)) };
+}
+
+async function resolveDirectFonts(brand, layoutBrand) {
+  const theme = themeFor(brand, layoutBrand);
+  return resolveBrandFonts(brand, {
+    overrides: {
+      heading: { family: theme.headingFont, weight: 700 },
+      body:    { family: theme.bodyFont,    weight: 400 },
+      quote:   { family: theme.bodyFont,    weight: 400 }
+    },
+    layoutInputBrand: layoutBrand
+  });
+}
+
+function buildTextLayers({ copy, brand, layoutBrand, dims, fonts }) {
+  const theme = themeFor(brand, layoutBrand);
+  const margin = 64;
+  const ruleY = Math.round(dims.height * dims.overlayStart);
+  const eyebrowY = ruleY + 72;
+  const headline = wrap(copy.headline || brand?.tagline || brand?.name || 'Discover more', dims.width < 1000 ? 20 : 23);
+  const headlineY = eyebrowY + 66;
+  const subheadline = wrap(copy.subheadline || '', 42);
+  const subheadlineY = headlineY + (headline.length * 70) + 42;
+  const ctaY = dims.height - 166;
+  const eyebrow = copy.eyebrow || (brand?.name ? String(brand.name).toUpperCase() : '');
+  const cta = copy.cta || 'SHOP NOW';
+  const wordmark = !brand?.logoUrl ? (brand?.name || layoutBrand?.name || '') : '';
+  const textWidth = dims.width - (margin * 2);
+
+  return [
+    textComposite({
+      text: eyebrow, font: fonts.heading, left: margin, top: eyebrowY - 31,
+      width: textWidth, color: theme.accent, size: 26, weight: 700, letterSpacing: 3
+    }),
+    textComposite({
+      text: headline.join('\n'), font: fonts.heading, left: margin, top: headlineY - 63,
+      width: textWidth, color: theme.text, size: 68, weight: 700, spacing: 72
+    }),
+    textComposite({
+      text: subheadline.join('\n'), font: fonts.body, left: margin, top: subheadlineY - 31,
+      width: textWidth, color: theme.secondaryText, size: 31, weight: 400, spacing: 40
+    }),
+    textComposite({
+      text: cta, font: fonts.heading, left: margin, top: ctaY + 25,
+      width: 334, color: theme.ctaText, size: 28, weight: 700, align: 'center', letterSpacing: 1
+    }),
+    textComposite({
+      text: wordmark, font: fonts.heading, left: dims.width - margin - 420, top: dims.height - 101,
+      width: 420, color: theme.text, size: 22, weight: 700, align: 'right', letterSpacing: 2
+    })
+  ].filter(Boolean);
 }
 
 async function fetchBuffer(url) {
@@ -171,7 +276,12 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
 
   const plate = await sharp(Buffer.from(b64, 'base64')).resize(dims.width, dims.height, { fit: 'cover', position: 'attention' }).png().toBuffer();
   const copy = concept.copy_picks || {};
-  const layers = [{ input: Buffer.from(buildOverlay({ copy, brand: resolvedBrand, layoutBrand: layout.input?.brand || {}, dims })), top: 0, left: 0 }];
+  const layoutBrand = layout.input?.brand || {};
+  const fonts = await resolveDirectFonts(resolvedBrand, layoutBrand);
+  const layers = [
+    { input: Buffer.from(buildGraphicOverlay({ brand: resolvedBrand, layoutBrand, dims })), top: 0, left: 0 },
+    ...buildTextLayers({ copy, brand: resolvedBrand, layoutBrand, dims, fonts })
+  ];
   const logo = await optionalImage(resolvedBrand?.logoUrl || layout.input?.brand?.logo);
   if (logo) {
     try {
@@ -180,8 +290,33 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
     } catch (err) { console.warn(`   ⚠️  direct-image: logo compose failed (${err.message})`); }
   }
   const buffer = await sharp(plate).composite(layers).png().toBuffer();
-  console.log(`   🖼️  direct-image ready — ${template}/${aspectRatio} concept=${adConceptId} refs=${refs.length} model=${refs.length ? PLATE_EDIT_MODEL : PLATE_T2I_MODEL}`);
-  return { buffer, contentType: 'image/png', width: dims.width, height: dims.height, bytes: buffer.length, kind: 'image', directImage: true };
+  console.log(
+    `   🖼️  direct-image ready — ${template}/${aspectRatio} concept=${adConceptId} refs=${refs.length} ` +
+    `model=${refs.length ? PLATE_EDIT_MODEL : PLATE_T2I_MODEL} ` +
+    `font=${fonts.heading.requestedFamily}→${fonts.heading.resolvedFamily}[${fonts.heading.source}]`
+  );
+  return {
+    buffer, contentType: 'image/png', width: dims.width, height: dims.height,
+    bytes: buffer.length, kind: 'image', directImage: true,
+    fontResolution: {
+      heading: {
+        requestedFamily: fonts.heading.requestedFamily,
+        resolvedFamily: fonts.heading.resolvedFamily,
+        source: fonts.heading.source,
+        exact: fonts.heading.exact
+      },
+      body: {
+        requestedFamily: fonts.body.requestedFamily,
+        resolvedFamily: fonts.body.resolvedFamily,
+        source: fonts.body.source,
+        exact: fonts.body.exact
+      }
+    }
+  };
 }
 
-module.exports = { DIRECT_OVERLAY_PIPELINE, isDirectOverlayPipeline, dimsFor, themeFor, buildOverlay, buildPlatePrompt, renderDirectImage };
+module.exports = {
+  DIRECT_OVERLAY_PIPELINE, isDirectOverlayPipeline, dimsFor, themeFor,
+  buildOverlay, buildGraphicOverlay, buildTextLayers, resolveDirectFonts,
+  buildPlatePrompt, renderDirectImage
+};

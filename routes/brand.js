@@ -399,6 +399,14 @@ router.patch('/:id', express.json(), async (req, res) => {
     if (before.websiteUrl !== brand.websiteUrl) {
       // Reset enrichmentSources so all tiers re-attempt against the new URL.
       brand.enrichmentSources = [];
+      // Website fonts belong to the old domain and must never leak into
+      // renders for the replacement storefront.
+      brand.customFonts = [];
+      brand.websiteFontUsage = null;
+      brand.fontIngestedAt = null;
+      brand.fontIngestError = null;
+      brand.markModified('customFonts');
+      brand.markModified('websiteFontUsage');
       await brand.save();
       triggerEnrichment(brand, 'website-url changed');
     }
@@ -1269,18 +1277,14 @@ router.post('/:id/ingest-fonts', express.json(), async (req, res) => {
     if (!brand.websiteUrl) return res.status(400).json({ error: 'brand has no websiteUrl to scan' });
 
     const { ingestBrandFonts } = require('../services/brandFontIngestService');
-    const { ingested, flagged, errors } = await ingestBrandFonts(brand);
-
-    // Merge by family+weight+style — re-ingests refresh, never duplicate.
-    const keyOf = (f) => `${String(f.family).toLowerCase()}|${f.weight || 400}|${f.style || 'normal'}`;
-    const merged = new Map((brand.customFonts || []).map((f) => [keyOf(f), f]));
-    for (const entry of [...ingested, ...flagged]) merged.set(keyOf(entry), entry);
-    brand.customFonts = [...merged.values()];
-    brand.markModified('customFonts');
+    const result = await ingestBrandFonts(brand);
+    const { ingested, flagged, errors } = result;
+    const { applyFontIngestResult } = require('../services/brandFontPersistenceService');
+    applyFontIngestResult(brand, result);
     await brand.save();
 
     console.log(`🔤 ingest-fonts[${brand.name}]: ${ingested.length} ingested, ${flagged.length} flagged, ${errors.length} errors`);
-    res.json({ ok: true, ingested, flagged, errors, customFonts: brand.customFonts });
+    res.json({ ok: true, ingested, flagged, errors, usage: result.usage, customFonts: brand.customFonts });
   } catch (err) {
     console.error('ingest-fonts failed:', err.message);
     res.status(err.status || 500).json({ error: err.message || 'font ingest failed' });
@@ -2563,6 +2567,9 @@ function serializeBrand(b) {
     enrichmentSources: b.enrichmentSources || [],
     curatedFields:     b.curatedFields || [],
     tailwindTheme:     b.tailwindTheme || null,
+    websiteFontUsage:  b.websiteFontUsage || null,
+    fontIngestedAt:    b.fontIngestedAt || null,
+    fontIngestError:   b.fontIngestError || null,
     // Per-brand video-generation overrides — included so the PATCH
     // response confirms a videoSettings save (GET already returns the
     // raw lean doc, which carries it).

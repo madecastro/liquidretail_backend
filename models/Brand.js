@@ -72,7 +72,7 @@ const brandSchema = new mongoose.Schema({
   // validation. Mongoose's enum check rejects null even on non-
   // required fields when a default isn't matched, so we explicitly
   // allow it here.
-  fontSource:     { type: String, enum: ['tailwind', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
+  fontSource:     { type: String, enum: ['tailwind', 'website', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
   tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
   hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
   tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')
@@ -371,6 +371,16 @@ const brandSchema = new mongoose.Schema({
   // client must supply licensed files. fontResolverService prefers
   // these over Google Fonts when families match.
   customFonts: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  // Font roles observed in the customer's own CSS during font ingest.
+  // Shape: { heading?, body?, button?, evidence: [{ family, role, selector }] }.
+  // This lets the resolver choose the website's actual heading/body face
+  // when the site declares several @font-face families.
+  websiteFontUsage: { type: mongoose.Schema.Types.Mixed, default: null },
+  // Successful or attempted automatic website-font scan. A timestamp is
+  // recorded even when the site exposes no reusable faces so render-time
+  // resolution does not repeatedly crawl the storefront.
+  fontIngestedAt: { type: Date, default: null },
+  fontIngestError: { type: String, default: null },
 
   // Derived voice — structured profile extracted by
   // brandVoiceDerivationService from the brand's existing Meta/Google
