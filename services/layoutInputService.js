@@ -1653,7 +1653,13 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       brandId:   ctx.media?.brandId || null,
       productId: ctx.match?.identification?.details?.catalogProductId || null
     });
-    if (snippet && snippet !== primaryQuote.text) primaryQuote.snippet = snippet;
+    // Always populate, even when it equals the source. `snippet` means "the
+    // <=50-char, word-safe form of this quote", which for an already-short
+    // quote IS the quote. Setting it only when it DIFFERED left the field
+    // absent for every short quote, so a layout binding
+    // social_proof.primary_quote.snippet rendered an empty proof element
+    // precisely when the quote needed no shortening.
+    if (snippet) primaryQuote.snippet = snippet;
   }
 
   // Observability — show tier counts + which tier won so a bad
