@@ -265,7 +265,15 @@ router.patch('/:id', express.json(), async (req, res) => {
                       'brandSafety', 'styleOverrides', 'styleScript',
                       'styleScriptVertical', 'styleScriptLandscape', 'styleTheme',
                       'videoSettings', 'titleStyleSpec', 'titleStylePreset',
-                      'metaCascades'];
+                      'metaCascades', 'staticImagePipeline'];
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'staticImagePipeline')) {
+      const pipeline = String(req.body.staticImagePipeline || '').trim();
+      if (!['direct_overlay', 'html'].includes(pipeline)) {
+        return res.status(400).json({ error: "staticImagePipeline must be 'direct_overlay' or 'html'" });
+      }
+      req.body.staticImagePipeline = pipeline;
+    }
 
     // videoSettings carries model slugs consumed at render time — reject
     // unknown slugs here (nicer UX than the render-time warn-and-fall-
@@ -344,6 +352,7 @@ router.patch('/:id', express.json(), async (req, res) => {
     // ESPECIALLY when clearing to null. Applies to any field the
     // Brand schema declares as mongoose.Schema.Types.Mixed.
     const MIXED_FIELDS = new Set(['styleOverrides', 'styleTheme', 'brandSafety', 'videoSettings', 'titleStyleSpec', 'metaCascades']);
+    const RUNTIME_SETTINGS = new Set(['staticImagePipeline']);
 
     for (const k of editable) {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
@@ -369,8 +378,10 @@ router.patch('/:id', express.json(), async (req, res) => {
         if (MIXED_FIELDS.has(k)) brand.markModified(k);
         // Clearing a field is a request to RE-enrich it, not lock the
         // empty value as curated. Setting a value is curation.
-        if (isEmpty) curatedSet.delete(k);
-        else         curatedSet.add(k);
+        if (!RUNTIME_SETTINGS.has(k)) {
+          if (isEmpty) curatedSet.delete(k);
+          else         curatedSet.add(k);
+        }
       }
     }
     // Renormalize the slug if name changed.
@@ -2544,6 +2555,7 @@ function serializeBrand(b) {
     websiteBackground: b.websiteBackground || null,
     fontFamily:   b.fontFamily || null,
     fontSource:   b.fontSource || null,
+    staticImagePipeline: b.staticImagePipeline || 'direct_overlay',
     tone:         b.tone || [],
     hashtags:     b.hashtags || [],
     tags:         b.tags || [],
