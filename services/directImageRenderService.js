@@ -252,7 +252,7 @@ async function resolveConcept({ adConceptArtifactId, adConceptId }) {
   return artifact?.concepts?.find((c) => c.concept_id === adConceptId) || null;
 }
 
-async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, productId, brandId, adConceptArtifactId, adConceptId, template }) {
+async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, productId, brandId, adConceptArtifactId, adConceptId, template, referenceMediaIds = [] }) {
   if (!atlasImage.isConfigured() && !process.env.OPENAI_API_KEY) return { skipped: true, reason: 'no Atlas or OpenAI image credentials configured' };
 
   const [layout, concept, brand, product, media] = await Promise.all([
@@ -271,18 +271,42 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
   }
   const resolvedProduct = product || (layout.productId ? await CatalogProduct.findById(layout.productId).select('title imageUrl').lean() : null);
   const dims = dimsFor(aspectRatio);
-  // Two references go to the image model, not one. Carry each buffer's origin
-  // alongside it so the generation inspector can name what was submitted —
-  // the uploaded Atlas handles are ephemeral and meaningless after the fact.
-  const refCandidates = [
-    { sourceUrl: resolvedProduct?.imageUrl || null, role: 'product-hero' },
-    { sourceUrl: media?.fileUrl || null,            role: 'seed-media'   }
-  ];
+  // ONE reference by default: the media this ad was actually built from.
+  //
+  // This used to send the selected media AND the product's hero image on every
+  // render. The model faithfully composed both, so an operator who picked a
+  // single shot got a second view of the product they never asked for — and
+  // when the two happen to be the same photo (merchant original vs Cloudinary
+  // mirror), URL dedup can't see it and the same image is paid for twice.
+  //
+  // Extra references are opt-in: `referenceMediaIds` carries the operator's
+  // explicit ordered picks, the same field the video path reads.
+  const refCandidates = [];
+  const orderedIds = (Array.isArray(referenceMediaIds) ? referenceMediaIds : []).map(String);
+  if (orderedIds.length) {
+    const picked = await Media.find({ _id: { $in: orderedIds } }).select('fileUrl').lean();
+    const byId = new Map(picked.map((m) => [String(m._id), m]));
+    orderedIds.forEach((id, i) => {
+      const doc = byId.get(id);
+      if (doc?.fileUrl) refCandidates.push({ sourceUrl: doc.fileUrl, role: i === 0 ? 'operator-pick' : `operator-pick-${i}` });
+    });
+    if (refCandidates.length < orderedIds.length) {
+      console.warn(`   ⚠️  direct-image: ${orderedIds.length - refCandidates.length} operator-picked media missing — sending the ${refCandidates.length} that resolved`);
+    }
+  }
+  if (!refCandidates.length) {
+    const fallback = media?.fileUrl
+      ? { sourceUrl: media.fileUrl, role: 'seed-media' }
+      : (resolvedProduct?.imageUrl ? { sourceUrl: resolvedProduct.imageUrl, role: 'product-hero' } : null);
+    if (fallback) refCandidates.push(fallback);
+  }
+  // Carry each buffer's origin alongside it: the uploaded Atlas handles are
+  // ephemeral, so only this makes the submission legible in the inspector.
   const fetchedRefs = await Promise.all(refCandidates.map((c) => optionalImage(c.sourceUrl)));
   const refs = [];
   const imageMeta = [];
   refCandidates.forEach((candidate, i) => {
-    if (fetchedRefs[i] && refs.length < 2) { refs.push(fetchedRefs[i]); imageMeta.push(candidate); }
+    if (fetchedRefs[i]) { refs.push(fetchedRefs[i]); imageMeta.push(candidate); }
   });
   const prompt = buildPlatePrompt({ concept, brand: resolvedBrand, product: resolvedProduct, aspectRatio });
   const meta = { stage: 'direct_image_overlay', service: 'directImageRenderService', purposeTag: template || 'untagged', brandId: resolvedBrand?._id || brandId || null, productId: resolvedProduct?._id || productId || null, mediaId: mediaId || null };
