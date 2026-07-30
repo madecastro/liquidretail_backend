@@ -135,6 +135,11 @@ const ALLOWED_SLOTS = [
   'product.reviews.0.text', 'product.reviews.0.author', 'product.reviews.0.rating',
   // Social proof (canonical)
   'social_proof.primary_quote', 'social_proof.primary_quote.text',
+  // The ≤50-char, word-boundary-safe extract of primary_quote.text, produced
+  // by quoteSnippetService at derive time. It existed but was unbindable, so
+  // every static layout took the full review — which overflows its container
+  // and gets clipped mid-word at paint time.
+  'social_proof.primary_quote.snippet',
   'social_proof.primary_quote.author_name',
   'social_proof.rating_value', 'social_proof.review_count',
   'social_proof.secondary_quotes.0.text',

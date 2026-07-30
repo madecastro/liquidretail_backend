@@ -65,9 +65,14 @@ const DEFAULT_META_CASCADES = {
     { type: 'doc', doc: 'layoutInput', path: 'input.copy.cta_text' },
     { type: 'literal', value: 'SHOP NOW' },
   ],
+  // Renders in the lower third beside the CTA, with a truck icon
+  // (slotRenderers.DeliverySlot) — it is a shipping reassurance, not a
+  // general copy slot. It used to read copy.offer_text / cta.offer_text
+  // first, which put the OFFER here: "Only $28" rendered next to a delivery
+  // truck as though $28 were the shipping terms, and painted a second time
+  // as the promo pill, since promoText draws from the same two sources.
+  // The offer now renders once, through promoText alone.
   deliveryLine: [
-    { type: 'doc', doc: 'ad',          path: 'copy.offer_text' },
-    { type: 'doc', doc: 'layoutInput', path: 'input.cta.offer_text' },
     { type: 'doc', doc: 'layoutInput', path: 'input.product.badges[1]' },
     { type: 'doc', doc: 'brand',       path: 'tagline' },
     { type: 'literal', value: 'Ships free' },

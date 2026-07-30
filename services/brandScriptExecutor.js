@@ -659,6 +659,16 @@ async function buildMetaForAd(ad, brand) {
     ? `${rc} review${rc === 1 ? '' : 's'}`
     : '53 reviews';
 
+  // deliveryLine and promoText share their two highest-priority sources
+  // (ad.copy.offer_text, then layoutInput.input.cta.offer_text), so any ad
+  // with an offer set resolves both to the SAME string and paints it twice —
+  // e.g. "Only $28" as both the delivery line and the promo pill. promoText
+  // is the one designed to be skippable (its cascade deliberately has no
+  // literal fallback), so it yields when it would only repeat the line above.
+  const promoText = cascaded.promoText && cascaded.promoText === cascaded.deliveryLine
+    ? null
+    : (cascaded.promoText ?? null);
+
   return {
     // Cascaded fields — every one of these can be re-pointed via
     // Brand.metaCascades[<field>] without a code change. Undefined
@@ -681,7 +691,7 @@ async function buildMetaForAd(ad, brand) {
     reviewCount:        cascaded.reviewCount        ?? null,
     likes:              cascaded.likes              ?? null,
     quoteSnippet:       cascaded.quoteSnippet       ?? null,
-    promoText:          cascaded.promoText          ?? null,   // null lets the renderer skip the promo pill
+    promoText,   // null lets the renderer skip the promo pill (see dedupe above)
     productOnlyImageUrl: cascaded.productOnlyImageUrl ?? null,
 
     // Alias for the Remotion titling engine's `productImage` slot bind
