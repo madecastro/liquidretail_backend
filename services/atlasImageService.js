@@ -152,6 +152,39 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
       timeout: Math.min(30_000, Math.max(1000, remaining)),
       validateStatus: () => true,
     });
+    // Atlas reports errors as a TOP-LEVEL {code, msg} with no data.status —
+    // e.g. {"code":402,"msg":"insufficient balance"}. Reading only
+    // data.status turned every one of those into st='unknown', which matches
+    // neither the success nor the failure list, so the loop span the full
+    // deadline and reported "timed out". An out-of-credit account therefore
+    // looked like a slow model, for 60s per ad, and was then ledgered as
+    // CHARGED spend for work Atlas never performed.
+    //
+    // Check the envelope before the status. A non-200, or a body carrying an
+    // error code, is terminal now — there is nothing to wait for.
+    const apiCode = poll.data?.code;
+    const apiMsg  = poll.data?.msg || poll.data?.message || null;
+    const isErrorEnvelope = (typeof apiCode === 'number' && apiCode !== 200) || (poll.status !== 200 && !poll.data?.data);
+    if (isErrorEnvelope) {
+      // Billing is an outage, not a bad ad: every render in every run fails
+      // identically until someone tops the account up. Flagged fatal so it
+      // pages instead of hiding behind per-ad render failures.
+      const isBilling = apiCode === 402 || /insufficient balance|quota|credit/i.test(String(apiMsg || ''));
+      recordFlatCost({
+        ...meta, provider: 'atlas', model,
+        costUsd: 0, durationMs: Date.now() - t0, status: isBilling ? 'rejected-billing' : 'rejected',
+      }).catch?.(() => {});
+      const err = new Error(
+        `Atlas image ${isBilling ? 'REJECTED — insufficient balance' : 'error'} ` +
+        `(HTTP ${poll.status}, code ${apiCode ?? 'n/a'}): ${apiMsg || JSON.stringify(poll.data).slice(0, 160)} [prediction ${id}]`
+      );
+      // NOT charged: Atlas explicitly declined to run it, so recording spend
+      // would inflate the ledger with work that never happened.
+      err.charged = false;
+      err.atlasCode = apiCode ?? null;
+      if (isBilling) { err.alertLevel = 'fatal'; err.alertKey = 'atlas:insufficient-balance'; }
+      throw err;
+    }
     const st = String(poll.data?.data?.status || 'unknown').toLowerCase();
     if (st !== lastStatus) {
       console.log(`   ⏳ atlasImage: ${id} status=${st} elapsed=${Date.now() - t0}ms`);
