@@ -221,7 +221,11 @@ async function renderCreative(req) {
       renderOutput,
       upload,
       videoComposite,
-      sourceFileType: sourceMedia?.fileType || null
+      sourceFileType: sourceMedia?.fileType || null,
+      // Timings known BEFORE this call (derive/render/upload). `persist` isn't
+      // included — it can't be, its own duration isn't known until this call
+      // returns — but the caller logs the full set to console regardless.
+      stagesMs: { deriveMs: stages.derive ?? null, renderMs: stages.render ?? null, uploadMs: stages.upload ?? null }
     });
     stages.persist = Date.now() - t;
     console.log(`   💾 ${tag} persist ok in ${stages.persist}ms (Ad ${ad._id})`);
@@ -1074,7 +1078,7 @@ async function uploadStage(renderOutput, ctx) {
   };
 }
 
-async function persistStage({ req, input, layoutInputArtifactId, renderOutput, upload, videoComposite, sourceFileType = null }) {
+async function persistStage({ req, input, layoutInputArtifactId, renderOutput, upload, videoComposite, sourceFileType = null, stagesMs = null }) {
   const copy = extractCopySnapshot(input);
   const isVideo = !!videoComposite;
   // Update the existing queued Ad doc (status='rendering' was stamped
@@ -1111,6 +1115,8 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
       durationMs:         upload.durationMs,
       fontResolution:     renderOutput.fontResolution || null,
       imageGeneration:    renderOutput.imageGeneration || null,
+      intentResolution:   renderOutput.intentResolution || null,
+      renderStages:       stagesMs || null,
       copy,
       status:             'draft',
       renderedAt:         new Date(),

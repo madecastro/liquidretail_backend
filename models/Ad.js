@@ -312,19 +312,46 @@ const adSchema = new mongoose.Schema({
   // Brand (which drift), so this gives the generation-inspector byte-exact
   // historical titling. Written by brandScriptExecutor at render time.
   titlingSnapshot:    { type: mongoose.Schema.Types.Mixed, default: null },
-  // Exact font resolution audit for the direct static-image path.
+  // Font resolution audit. DEAD as of 2026-07-31 for new ads — it was produced
+  // only by the retired direct-image-with-overlay renderer, which composited
+  // headline/subheadline text locally and so had a font to resolve. The
+  // current direct_image path lets the model typeset its own copy and never
+  // calls fontResolverService. Kept, not removed: still populated on ads
+  // rendered before the rewrite, and the inspector still reads it (routes/ads.js)
+  // so those historical ads keep their real diagnostic. Null on every ad
+  // rendered after 2026-07-31 is expected, not a regression.
   // { heading/body: { requestedFamily, resolvedFamily, source, exact } }
   fontResolution:     { type: mongoose.Schema.Types.Mixed, default: null },
   // Verbatim audit of the image-model request, captured at submit time from
   // the POST body itself (atlasImageService.buildSubmissionRecord):
   // { provider, model, predictionId, submittedAt, prompt, size, quality,
-  //   imageCount, images: [{ position, submittedUrl, sourceUrl, role }] }.
+  //   imageCount, images: [{ position, submittedUrl, sourceUrl, role }],
+  //   pipeline, stage }. `pipeline` is the delivering render path
+  //   ('direct_image' | the retired 'direct_overlay' on historical ads) —
+  //   read this, not a guess, when asking "which path made this ad".
   // The generation inspector renders ONLY this — it must never reconstruct a
   // plausible-looking stack, because a diagnostic that shows what should have
   // been sent instead of what was sent silently misdirects every diagnosis
   // built on it. Null on renders that predate this capture; the inspector
   // says so rather than guessing.
   imageGeneration:    { type: mongoose.Schema.Types.Mixed, default: null },
+  // Which intent ran and what it did with the data it was given — the
+  // provenance a debugging session actually needs, added 2026-07-31 alongside
+  // the direct_image rewrite: { surface, requested, delivered, fellBackFrom,
+  // renderedRoles[], droppedRoles[], generateSize, logoComposited }.
+  // `delivered !== requested` means the data couldn't support the requested
+  // intent (e.g. no rating) and the resolver walked down the hierarchy — that
+  // is working as designed, not a fault. Null on every ad that predates this
+  // field (including the legacy HTML/overlay paths, which never resolved an
+  // intent) and on any ad that failed before the intent was built.
+  intentResolution:   { type: mongoose.Schema.Types.Mixed, default: null },
+  // Per-stage wall time in ms for THIS render, whichever pipeline ran:
+  // { deriveMs, renderMs, uploadMs }. Answers "why is this ad slow" without a
+  // log-diving session — direct_image's renderMs is the Atlas submit+poll
+  // round trip and is normally 60-150s; a value far outside that on a specific
+  // ad, not the whole pipeline, points at that one Atlas call rather than at
+  // the code. Null on ads that predate this field.
+  renderStages:       { type: mongoose.Schema.Types.Mixed, default: null },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },
