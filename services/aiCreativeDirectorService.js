@@ -21,6 +21,7 @@ const ProductMatchArtifact  = require('../models/ProductMatchArtifact');
 const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
 
 const { ROLES, COMPONENT_STYLE_BY_ROLE } = require('./aiVocabulary');
+const alerts = require('./alertService');
 const { trackLlmCall, recordCacheHit } = require('./costTracker');
 
 const { chatCompletion } = require('./atlasLlmService');
@@ -870,7 +871,25 @@ function schemaErrors(value, schema, at = '') {
   }
   if (actual === 'object') {
     for (const key of schema.required || []) {
-      if (!(key in value)) out.push(`${at ? at + '.' : ''}${key} is missing`);
+      if (key in value) continue;
+      /**
+       * A missing key whose schema permits null is NOT an error.
+       *
+       * recommended_components requires all 8 role keys, but every value is
+       * type:['string','null'] — so the contract only ever wanted the SHAPE, and a
+       * concept with no badge is meant to write `badge: null`. Writing nothing at
+       * all means exactly the same thing.
+       *
+       * Under strict json_schema OpenAI emitted the explicit nulls, so the
+       * distinction never surfaced. Treating absence as a hard failure once that
+       * guarantee was gone would reject a payload that is semantically correct, and
+       * would fail EVERY round over a formatting nicety. Absence is normalised to
+       * null instead.
+       */
+      const sub = (schema.properties || {})[key];
+      const subTypes = sub && (Array.isArray(sub.type) ? sub.type : [sub.type]);
+      if (subTypes && subTypes.includes('null')) { value[key] = null; continue; }
+      out.push(`${at ? at + '.' : ''}${key} is missing`);
     }
     for (const [key, sub] of Object.entries(schema.properties || {})) {
       if (key in value) out.push(...schemaErrors(value[key], sub, `${at ? at + '.' : ''}${key}`));
@@ -1217,10 +1236,33 @@ async function directConceptsRound({
     attempt++;
   }
 
+  /**
+   * A validator must not be able to take generation down.
+   *
+   * The first version threw here, and that turned a formatting quibble into a
+   * production outage: static ads stopped generating entirely because the payload
+   * omitted nullable keys the previous transport used to fill in. Rejecting a round
+   * the renderers could have used is strictly worse than rendering it.
+   *
+   * So the only throw left is for a payload that genuinely cannot be used — no
+   * concepts at all. Anything else proceeds with an alert, so the problem is
+   * visible without being fatal.
+   */
+  const usable = Array.isArray(parsed?.concepts) && parsed.concepts.length > 0;
   if (reasons.length) {
-    // Surviving a re-ask means the model cannot satisfy the contract for this
-    // input. Failing loudly beats persisting a round the renderers will misread.
-    throw new Error(`Director (round) payload invalid after re-ask: ${reasons.join('; ')}`);
+    if (!usable) {
+      throw new Error(`Director (round) returned no usable concepts: ${reasons.join('; ')}`);
+    }
+    console.warn(
+      `🎭 directorRound[r${roundIndex}]: proceeding with ${parsed.concepts.length} concept(s) ` +
+      `despite ${reasons.length} contract warning(s) — ${reasons.slice(0, 4).join('; ')}`
+    );
+    alerts.warn({
+      title: 'Director payload did not satisfy the round contract',
+      detail: reasons.slice(0, 6).join('\n'),
+      fields: { model: DIRECTOR_ROUND_MODEL, round: roundIndex, concepts: parsed.concepts.length },
+      key: 'director:contract-warn'
+    }).catch(() => {});
   }
 
   const elapsedMs = Date.now() - t0;

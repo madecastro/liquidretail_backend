@@ -60,6 +60,11 @@ const PLATFORM_FORMATS = {
     canvas:       { width: 1000, height: 1778 },
     deliveryDims: { width: 1080, height: 1920 },
     safeArea:     { top: 204, bottom: 204 },  // IG/FB caption + like/share bands
+    // Selecting 9:16 also delivers these, cropped from the SAME master render and
+    // re-titled for the new frame — no second generation, so no second charge.
+    // 1080x1920 centre-crops to 1080x1350 (4:5) and 1080x1080 (1:1), both of which
+    // sit inside the 204px safe bands, so nothing meaningful is lost.
+    companions:  ['meta_feed_4_5', 'meta_feed_1_1'],
     chromeStyleHints: ['ig_reels', 'tiktok', 'yt_shorts', 'editorial'],
     creativeBrief:
       'Vertical Reels on Instagram + Facebook. Full-screen, fast-paced, sound-on by default. ' +
@@ -76,6 +81,9 @@ const PLATFORM_FORMATS = {
     canvas:       { width: 1000, height: 1778 },
     deliveryDims: { width: 1080, height: 1920 },
     safeArea:     { top: 250, bottom: 250 },  // IG Stories: top creator chip + bottom reply input
+    // Same 9:16 master, same cheap-crop companions. Stories reserves MORE than
+    // Reels (250 vs 204), so a crop that is safe here is safe for Reels too.
+    companions:  ['meta_feed_4_5', 'meta_feed_1_1'],
     chromeStyleHints: ['ig_reels', 'editorial'],
     creativeBrief:
       'Vertical IG Stories. Full-screen, 5–15s per slide, viewers tap-through or swipe-away ' +
