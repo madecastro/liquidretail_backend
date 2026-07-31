@@ -418,17 +418,50 @@ async function renderStage(args) {
   // Direct image pipeline: use the Director's approved concept and source
   // imagery to make a text-free plate, then render all copy/CTA/logo locally.
   // It is deliberately synchronous: an ad never becomes draft until the
-  // production asset exists. Any failure falls through to the established
-  // HTML/spec pipeline so a provider outage cannot stop campaign generation.
-  if (renderMode === 'static' && template && String(template).startsWith('ai_') && args.adConceptArtifactId) {
+  // production asset exists.
+  //
+  // This used to swallow every failure and fall through to the HTML/spec
+  // renderer. That produced an ad through a pipeline the operator had already
+  // rejected, and — worse — hid the reason: a missing concept, an expired
+  // Atlas key and a provider timeout all looked identical from the outside,
+  // which is to say invisible. A render that cannot run the pipeline it was
+  // asked for now fails loudly, with the reason attached, so the cause gets
+  // fixed instead of papered over.
+  //
+  // The one exception is a brand deliberately routed to the HTML path
+  // (`routedToHtml`) — a choice, not a fault.
+  // NOTE the guard deliberately does NOT test adConceptArtifactId. It used to,
+  // which meant an ai_* static Ad queued without a concept skipped this block
+  // entirely and rendered through HTML gen — an ad shipping with no creative
+  // direction at all, silently. Every static ai_* render now enters here, and
+  // an absent concept fails inside renderDirectImage rather than routing
+  // around the check.
+  if (renderMode === 'static' && template && String(template).startsWith('ai_')) {
+    const directImage = require('./directImageRenderService');
+    const alerts = require('./alertService');
+    let output;
     try {
-      const directImage = require('./directImageRenderService');
-      const output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
-      if (!output?.skipped) return output;
-      console.log(`   🖼️  [render direct-image] skipped — ${output.reason}`);
+      output = await directImage.renderDirectImage({ ...args, layoutInputArtifactId, aspectRatio, mediaId, productId, template });
     } catch (err) {
-      console.warn(`   ⚠️  [render direct-image] failed (${err.message}) — falling back to existing renderer`);
+      console.error(`   ❌ [render direct-image] failed — ${err.message}`);
+      // One alert per failed render, at the severity the thrower chose:
+      // missing credentials is an outage (fatal), a missing concept is a
+      // pipeline fault (error). Unclassified throws default to error.
+      alerts.notifyAsync({
+        level:  err.alertLevel || 'error',
+        title:  'Static ad render failed (direct overlay)',
+        key:    err.alertKey || 'direct-image:render-failed',
+        fields: { template, aspectRatio, product: String(productId || '-'), media: String(mediaId || '-'), error: err.message },
+        detail: err.stack || null
+      });
+      throw new Error(`direct-image render failed: ${err.message}`, { cause: err });
     }
+    if (!output?.skipped) return output;
+    if (!output.routedToHtml) {
+      console.error(`   ❌ [render direct-image] unavailable — ${output.reason}`);
+      throw new Error(`direct-image render unavailable: ${output.reason}`);
+    }
+    console.log(`   🖼️  [render direct-image] brand routed to HTML — ${output.reason}`);
   }
 
   // Phase 6.5.1 — eager prime so the first wave of a fresh batch

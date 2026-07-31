@@ -252,8 +252,21 @@ async function resolveConcept({ adConceptArtifactId, adConceptId }) {
   return artifact?.concepts?.find((c) => c.concept_id === adConceptId) || null;
 }
 
+// Tag an error with how loudly it should be reported. renderService raises
+// exactly one alert per failed render using these, so the classification lives
+// with the code that knows what went wrong, not with the caller.
+function taggedError(message, { alertLevel = 'error', alertKey }) {
+  const err = new Error(message);
+  err.alertLevel = alertLevel;
+  err.alertKey = alertKey;
+  return err;
+}
+
 async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, productId, brandId, adConceptArtifactId, adConceptId, template, referenceMediaIds = [] }) {
-  if (!atlasImage.isConfigured() && !process.env.OPENAI_API_KEY) return { skipped: true, reason: 'no Atlas or OpenAI image credentials configured' };
+  // Credentials are checked further down, AFTER brand routing: a brand
+  // deliberately on the HTML pipeline renders through gpt-4.1 + Puppeteer and
+  // needs no image-model key, so failing it here for a missing Atlas key would
+  // break a path that does not use Atlas.
 
   const [layout, concept, brand, product, media] = await Promise.all([
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
@@ -262,14 +275,48 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
     productId ? CatalogProduct.findById(productId).select('title imageUrl').lean() : null,
     mediaId ? Media.findById(mediaId).select('fileUrl').lean() : null
   ]);
-  if (!layout) return { skipped: true, reason: 'layout input missing' };
-  if (!concept) return { skipped: true, reason: 'direct overlay requires a named Director concept' };
-
-  const resolvedBrand = brand || (layout.brandId ? await Brand.findById(layout.brandId).lean() : null);
-  if (!isDirectOverlayPipeline(resolvedBrand?.staticImagePipeline)) {
-    return { skipped: true, reason: `brand staticImagePipeline is ${resolvedBrand?.staticImagePipeline || 'html'}` };
+  // A missing layout artifact is recoverable: everything it supplies has a
+  // source of its own. brand/product come from the explicit args, and themeFor
+  // already falls back to the Brand document when there is no layoutInput
+  // brand block. Render a generic layout rather than losing the ad.
+  if (!layout) {
+    console.warn(`   ⚠️  direct-image: layout input ${layoutInputArtifactId} missing — rendering with a generic layout`);
   }
-  const resolvedProduct = product || (layout.productId ? await CatalogProduct.findById(layout.productId).select('title imageUrl').lean() : null);
+  const effectiveLayout = layout || { input: {}, brandId: brandId || null, productId: productId || null };
+
+  // A concept is not recoverable — it carries the copy the ad is built from.
+  // Its absence means the Director round did not produce (or did not attach)
+  // the concept this Ad row points at, which is a pipeline fault worth
+  // surfacing, not a creative to improvise.
+  if (!concept) {
+    throw taggedError(
+      `no Director concept resolved for ad (conceptArtifact=${adConceptArtifactId || 'none'} conceptId=${adConceptId || 'none'}) — the concept is missing from the artifact or the artifact is gone`,
+      { alertLevel: 'error', alertKey: 'direct-image:no-concept' }
+    );
+  }
+
+  const resolvedBrand = brand || (effectiveLayout.brandId ? await Brand.findById(effectiveLayout.brandId).lean() : null);
+  if (!isDirectOverlayPipeline(resolvedBrand?.staticImagePipeline)) {
+    // The ONLY legitimate reason to leave this pipeline: an operator put this
+    // brand on the HTML path deliberately. `routedToHtml` marks it as a
+    // routing decision so the caller can honour it, while every other exit
+    // above is breakage and must not be quietly rerouted into a different
+    // renderer.
+    return { skipped: true, routedToHtml: true, reason: `brand staticImagePipeline is ${resolvedBrand?.staticImagePipeline || 'html'}` };
+  }
+
+  // Only reached for brands actually on this pipeline. No image provider at
+  // all means nothing here can succeed and every ad in every run fails the
+  // same way, so it gets the loudest level we have — it is an outage, not a
+  // bad ad. Deliberately after the concept check, which is universal, and
+  // after brand routing, which does not need an image key.
+  if (!atlasImage.isConfigured() && !process.env.OPENAI_API_KEY) {
+    throw taggedError(
+      'no image credentials: neither ATLAS_API_KEY nor OPENAI_API_KEY is configured — no static ad can render until one is set',
+      { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
+    );
+  }
+  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl').lean() : null);
   const dims = dimsFor(aspectRatio);
   // ONE reference by default: the media this ad was actually built from.
   //
@@ -330,13 +377,13 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
 
   const plate = await sharp(Buffer.from(b64, 'base64')).resize(dims.width, dims.height, { fit: 'cover', position: 'attention' }).png().toBuffer();
   const copy = concept.copy_picks || {};
-  const layoutBrand = layout.input?.brand || {};
+  const layoutBrand = effectiveLayout.input?.brand || {};
   const fonts = await resolveDirectFonts(resolvedBrand, layoutBrand);
   const layers = [
     { input: Buffer.from(buildGraphicOverlay({ brand: resolvedBrand, layoutBrand, dims })), top: 0, left: 0 },
     ...buildTextLayers({ copy, brand: resolvedBrand, layoutBrand, dims, fonts })
   ];
-  const logo = await optionalImage(resolvedBrand?.logoUrl || layout.input?.brand?.logo);
+  const logo = await optionalImage(resolvedBrand?.logoUrl || effectiveLayout.input?.brand?.logo);
   if (logo) {
     try {
       const logoPng = await sharp(logo).resize({ width: 160, height: 56, fit: 'inside', withoutEnlargement: true }).png().toBuffer();
