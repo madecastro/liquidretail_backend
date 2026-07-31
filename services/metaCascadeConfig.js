@@ -142,9 +142,12 @@ const DEFAULT_META_CASCADES = {
     { type: 'doc', doc: 'layoutInput',    path: 'input.social_proof.review_count' },
     { type: 'doc', doc: 'catalogProduct', path: 'reviewCount' },
   ],
+  // No literal fallback. `572` was a hardcoded number rendered as this post's
+  // like count on any ad without real engagement data — invented social proof,
+  // the same class as the '53 reviews' and 'Ships free' defaults. Null means
+  // the slot is skipped.
   likes: [
     { type: 'doc', doc: 'layoutInput', path: 'input.performance.engagement.likes' },
-    { type: 'literal', value: 572 },
   ],
 };
 
