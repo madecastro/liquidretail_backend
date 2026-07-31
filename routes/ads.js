@@ -176,7 +176,11 @@ router.post('/preview', async (req, res) => {
       excludePairings = [],
       includeCategoryMatched = false,
       includeBrandMatched    = false,
-      videoDurationSec = null
+      videoDurationSec = null,
+      // "All static formats" wizard button. See expandWizardJob for what
+      // this actually does — each additional format is a separate billable
+      // image generation, not a crop.
+      expandStaticFormats = false
     } = req.body || {};
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
@@ -204,6 +208,7 @@ router.post('/preview', async (req, res) => {
       includeCategoryMatched,
       includeBrandMatched,
       videoDurationSec,
+      expandStaticFormats,
       directorVariants: phase3.fields.directorVariants,
       seedMediaIds: phase3.fields.seedMediaIds,
       seedPicks: phase3.fields.seedPicks,
@@ -245,7 +250,12 @@ router.post('/generate', async (req, res) => {
       includeCategoryMatched = false,
       includeBrandMatched    = false,
       refresh     = false,  // wizard checkbox / smoke-test override; bypasses de-dupe + LayoutInputArtifact cache
-      videoDurationSec = null  // wizard format-selection stage; integer 1–15, null = standard 8s
+      videoDurationSec = null,  // wizard format-selection stage; integer 1–15, null = standard 8s
+      // "All static formats" wizard button — fans each image concept out to
+      // every Meta static surface (staticFanoutForPlatformFormat) instead of
+      // just platformFormat. EACH SIZE IS A SEPARATE BILLABLE GENERATION.
+      // Default false: existing callers get exactly prior behavior.
+      expandStaticFormats = false
     } = req.body || {};
 
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
@@ -354,6 +364,7 @@ router.post('/generate', async (req, res) => {
           includeCategoryMatched,
           includeBrandMatched,
           videoDurationSec: parsedVideoDurationSec,
+          expandStaticFormats,
           directorVariants: phase3.fields.directorVariants,
           seedMediaIds: phase3.fields.seedMediaIds,
           seedPicks: phase3.fields.seedPicks,

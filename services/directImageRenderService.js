@@ -291,6 +291,11 @@ function taggedError(message, { alertLevel = 'error', alertKey }) {
 async function renderDirectImage({
   layoutInputArtifactId, aspectRatio, mediaId, productId, brandId,
   adConceptArtifactId, adConceptId, template, referenceMediaIds = [],
+  // Where referenceMediaIds came from, purely so the per-reference role labels
+  // and the inspector tell the truth. 'operator' = an explicit wizard stack;
+  // 'director' = the concept's own media_picks. Defaults to 'operator' because
+  // that was the only source when this argument was introduced.
+  referenceSource = 'operator',
   // The surface drives the safe box and the generation size. renderStage already
   // threads platformFormat through ...args and defaults it to meta_feed_1_1, so
   // this is a rename at the boundary, not a new requirement on callers.
@@ -374,10 +379,15 @@ async function renderDirectImage({
     const byId = new Map(picked.map((m) => [String(m._id), m]));
     orderedIds.forEach((id, i) => {
       const doc = byId.get(id);
-      if (doc?.fileUrl) refCandidates.push({ sourceUrl: doc.fileUrl, role: i === 0 ? 'operator-pick' : `operator-pick-${i}` });
+      // Label by ACTUAL source. These strings land in Ad.imageGeneration.images
+      // and are what an operator reads in the inspector when asking "why is this
+      // photo in my ad" — calling a Director pick an "operator-pick" sends that
+      // question to the wrong place entirely.
+      const prefix = referenceSource === 'director' ? 'director-pick' : 'operator-pick';
+      if (doc?.fileUrl) refCandidates.push({ sourceUrl: doc.fileUrl, role: i === 0 ? prefix : `${prefix}-${i}` });
     });
     if (refCandidates.length < orderedIds.length) {
-      console.warn(`   ⚠️  direct-image: ${orderedIds.length - refCandidates.length} operator-picked media missing — sending the ${refCandidates.length} that resolved`);
+      console.warn(`   ⚠️  direct-image: ${orderedIds.length - refCandidates.length} ${referenceSource}-selected media missing — sending the ${refCandidates.length} that resolved`);
     }
   }
   if (!refCandidates.length) {

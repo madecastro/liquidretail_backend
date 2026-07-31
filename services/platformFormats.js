@@ -156,6 +156,39 @@ function renderRouteForKind(kind) {
   return kind === 'video' ? 'veo' : 'html_gen';
 }
 
+// The Meta static surfaces that ONE "static ads" selection fans out to, so an
+// operator picking static gets every size they actually run, not just the one
+// they happened to click. Owner-set 2026-07-31.
+//
+// Excludes, deliberately:
+//   - meta_reels_9_16 — declared kinds:['video']; it ships no static image.
+//   - pmax_16_9 — Google Performance Max, a different ad platform. Available
+//     when explicitly selected, never fanned out from a Meta choice.
+//
+// EACH ENTRY IS A SEPARATE BILLABLE GENERATION, and that is not an oversight.
+// The `companions: [...]` fields still declared on the 9:16 formats describe an
+// abandoned cheaper plan: render one 9:16 master and centre-crop it to 4:5 and
+// 1:1 ("a cheap crop and titling"), no second charge. That worked only while
+// copy was composited by us AFTER the crop. The direct_image pipeline has the
+// image model typeset the copy INTO the pixels, so cropping a 9:16 master would
+// slice through the headline and CTA. Each surface therefore needs its own
+// generation, typeset for its own safe box — verified against the per-surface
+// geometry in services/staticAdIntents.js. Do not "optimise" this back into a
+// crop without first moving text compositing back out of the model.
+const META_STATIC_FANOUT = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16'];
+
+// Every static surface an operator's chosen format should produce.
+//
+// A Meta static pick fans out to all three Meta static surfaces. Any other
+// format (today: pmax_16_9) stays exactly as chosen — one format in, one out —
+// because fanning a Google placement out to Meta sizes would spend money on
+// surfaces the operator never asked for. A format that supports no static image
+// at all (Reels) returns [] so the caller queues no image work for it.
+function staticFanoutForPlatformFormat(platformFormat) {
+  if (META_STATIC_FANOUT.includes(platformFormat)) return [...META_STATIC_FANOUT];
+  return kindsForPlatformFormat(platformFormat).includes('image') ? [platformFormat] : [];
+}
+
 module.exports = {
   PLATFORM_FORMATS,
   PLATFORM_FORMAT_KEYS,
@@ -167,5 +200,7 @@ module.exports = {
   creativeBriefForPlatformFormat,
   kindsForPlatformFormat,
   resolveKinds,
-  renderRouteForKind
+  renderRouteForKind,
+  META_STATIC_FANOUT,
+  staticFanoutForPlatformFormat
 };

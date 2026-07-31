@@ -100,7 +100,7 @@ const TEMPLATE_SUPPORTS_VARIANT = {
 // route through the legacy cartesian and hit this filter; keeping it
 // dynamic means any new platformFormat addition auto-unlocks the same
 // aspect for brand campaigns.
-const { PLATFORM_FORMATS } = require('./platformFormats');
+const { PLATFORM_FORMATS, staticFanoutForPlatformFormat } = require('./platformFormats');
 const SHIPPING_RATIOS = new Set(
   Object.values(PLATFORM_FORMATS).map(f => f.aspectRatio).filter(Boolean)
 );
@@ -142,6 +142,17 @@ const MAX_ADS_PER_GENERATION_RUN = Math.max(1, parseInt(process.env.MAX_ADS_PER_
 // still produces 30 ads. Top picks by readinessScore within each
 // productId group; brand-only seeds (productId=null) form one group.
 const ADS_PER_PRODUCT_CAP     = Math.max(1, parseInt(process.env.ADS_PER_PRODUCT_CAP,     10) || 3);
+// How many candidate images the Director sees when the operator picked none.
+//
+// The renderer now honours the Director's full pick list (renderService threads
+// Ad.mediaIds through when there is no explicit operator stack), so a wider
+// universe genuinely produces multi-reference ads instead of silently
+// discarding every pick past the first.
+//
+// Set DIRECTOR_UNIVERSE_TOP_N=1 to get the single-hero behaviour: the Director
+// sees one image, picks it, and the composition matches the reference exactly.
+// That is a one-value flip and needs no code change.
+const DIRECTOR_UNIVERSE_TOP_N = Math.max(1, parseInt(process.env.DIRECTOR_UNIVERSE_TOP_N, 10) || 10);
 const VEO_ADS_PER_PRODUCT_CAP = Math.max(1, parseInt(process.env.VEO_ADS_PER_PRODUCT_CAP, 10) || 1);
 
 // Composite product popularity. Primary signal: how many UGC posts
@@ -259,6 +270,13 @@ async function expandWizardJob({
   // tagged for Feed can still run a one-off Reels batch without
   // mutating Campaign.platformFormat.
   platformFormat = null,
+  // Operator opted into "All static formats" in the wizard. When true, every
+  // image concept is emitted once per Meta static surface
+  // (staticFanoutForPlatformFormat) instead of once for platformFormat alone.
+  // Default false: a caller that doesn't pass this gets EXACTLY prior
+  // behavior — one format, one generation per concept. Video is untouched by
+  // this flag; it has its own (not yet built) companion-crop story.
+  expandStaticFormats = false,
   requestedBy  = null,
   // [{ productId, mediaId }] — globally drop these (productId, mediaId)
   // tuples from the cartesian. The wizard's Step 2 picker collects
@@ -453,12 +471,20 @@ async function expandWizardJob({
       ...(conceptImage ? ['image'] : []),
       ...(conceptVideo ? ['video'] : [])
     ];
+    // Computed here, not earlier: only meaningful once we know an image
+    // concept is actually in this run. staticFanoutForPlatformFormat is a
+    // no-op passthrough for pmax_16_9 (one format in, one out) and for any
+    // format outside the Meta static three, so this is always safe to pass.
+    const staticFanout = (expandStaticFormats && conceptImage)
+      ? staticFanoutForPlatformFormat(effectivePlatformFormat)
+      : [];
     if (conceptKinds.length) {
       conceptResult = await runConceptDrivenExpansion({
         campaignId, brandId, campaignKind, productIds,
         mediaIds,   // operator-picked UGC seeds — restricts the Director's universe when non-empty
         ctaText, ctaUrl, ctaUrlParams,
         platformFormat: effectivePlatformFormat,
+        staticFormats: staticFanout,
         kinds: conceptKinds,
         includeCategoryMatched, includeBrandMatched,
         excludePairings, creativeIntent: null,
@@ -482,6 +508,12 @@ async function expandWizardJob({
     // Group seedMediaIds by product for labeling (cheap; Media load once).
     // Estimate itself is always 1 det ad/product regardless of pick count.
     const estimateProducts = productIds.length > 0 ? productIds : [null];
+    // How many static surfaces each image concept will be emitted for. Mirrors
+    // the live path's `staticFanout` exactly; 1 when the operator has not opted
+    // into the fan-out, so the estimate is unchanged for every existing caller.
+    const staticFanoutCount = (expandStaticFormats && conceptImage)
+      ? Math.max(1, staticFanoutForPlatformFormat(effectivePlatformFormat).length)
+      : 1;
     const byProduct = {};
     let detTotal = 0;
     let dirTotal = 0;
@@ -499,7 +531,16 @@ async function expandWizardJob({
         dirTotal += VEO_ADS_PER_PRODUCT_CAP;
       }
       if (conceptImage) {
-        const imgN = Math.min(3, ADS_PER_PRODUCT_CAP);
+        // Multiply by the static fan-out. The cap is applied per
+        // (product, kind, platformFormat), so N concepts survive PER SIZE and
+        // the real billable count is concepts x sizes.
+        //
+        // This estimate is the number the wizard shows before the operator
+        // commits, and every image in it is a separate billable Atlas submit —
+        // if it ignored the fan-out it would quietly under-quote by 3x on an
+        // "All static formats" run, which is the one case where the operator
+        // most needs an honest number.
+        const imgN = Math.min(3, ADS_PER_PRODUCT_CAP) * Math.max(1, staticFanoutCount);
         n += imgN;
         imgTotal += imgN;
       }
@@ -2024,6 +2065,12 @@ async function runConceptDrivenExpansion({
   mediaIds = [],                                    // operator-picked seed media — when non-empty, restricts the Director's universe to just those IDs
   ctaText, ctaUrl, ctaUrlParams,
   platformFormat,
+  // Static surfaces each image concept is emitted for. Defaults to just the
+  // requested platformFormat so any caller that doesn't opt in behaves exactly
+  // as before. Every entry is a separate billable generation — see
+  // staticFanoutForPlatformFormat in services/platformFormats.js for why these
+  // cannot be cheap crops of one master any more.
+  staticFormats = [],
   kinds,                                            // [] of 'image'|'video' — what pipelines to emit per concept
   includeCategoryMatched, includeBrandMatched,
   excludePairings, creativeIntent,
@@ -2068,11 +2115,24 @@ async function runConceptDrivenExpansion({
       // because Veo's image-to-video mode bakes overlay text into the
       // generated video (which we can't remove later). Text-free seeds
       // ranked first; text-burned only used if nothing else exists.
+      // Universe size. Operator picks, when present, ARE the universe —
+      // restrictToMediaIds constrains the pool to exactly what they chose and
+      // topN widens to fit, so a 5-image selection is never truncated to 1.
+      //
+      // Absent picks, the Director sees DIRECTOR_UNIVERSE_TOP_N candidates and
+      // its chosen subset now actually reaches the renderer (see the
+      // referenceMediaIds fallback in renderService). Set that env to 1 for
+      // single-hero behaviour.
+      const operatorPickedMedia = Array.isArray(mediaIds) && mediaIds.length > 0;
+      const universeTopN = operatorPickedMedia
+        ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
+        : DIRECTOR_UNIVERSE_TOP_N;
       const { universe, seedUniverseHash, counts } =
         await seededUniverseSvc.buildSeededUniverse(brandId, productId, {
-          includeCategoryMatched, includeBrandMatched, topN: 10,
+          includeCategoryMatched, includeBrandMatched,
+          topN: universeTopN,
           wantsVideo: resolvedKinds.includes('video'),
-          restrictToMediaIds: Array.isArray(mediaIds) && mediaIds.length ? mediaIds : null
+          restrictToMediaIds: operatorPickedMedia ? mediaIds : null
         });
       const filtered = filterUniverseForProduct(productId, universe);
       if (!filtered.length) {
@@ -2146,51 +2206,76 @@ async function runConceptDrivenExpansion({
         const template = CREATIVE_STYLE_TO_TEMPLATE[concept.creative_style] || 'ai_brand_led';
         const role = primaryUniverseEntry.role;
 
-        // One payload per requested kind. Image → html_gen, video → veo.
-        // identityDigest includes kind so image+video variants of the same
-        // concept don't collide on the (campaignId, identityDigest) unique
-        // index.
+        // One payload per requested kind — and, for image, per STATIC SURFACE.
+        //
+        // identityDigest includes both kind and platformFormat, so
+        // image+video variants and the three static sizes of one concept all
+        // land as distinct rows on the (campaignId, identityDigest) unique
+        // index rather than colliding.
+        //
+        // The Director ran ONCE per product, and the same concepts feed every
+        // size. That is deliberate: an advertiser wants one campaign idea
+        // delivered in three sizes, not three unrelated ideas. Format
+        // correctness lives where it actually matters — the per-surface safe
+        // box and geometry block in the image prompt (services/staticAdIntents.js)
+        // — so re-running the Director per format would triple its cost
+        // (~$0.11/product/round) and buy nothing but drift between sizes.
         for (const kind of resolvedKinds) {
-          payloads.push({
-            brandId,
-            campaignId,
-            campaignRunIds: [],
-            mediaId:        new mongoose.Types.ObjectId(primaryId),
-            productId:      toObjectId(productId),
-            // Concept-driven fields (A1 schema)
-            conceptId:         concept.concept_id,
-            conceptArtifactId: artifact._id,
-            mediaIds:          mediaIdObjs,
-            judgeRank:         score.judgeRank ?? null,
-            judgeScore:        score.judgeScore ?? null,
-            generationOrder:   null,
-            renderRoute:       renderRouteForKind(kind),
-            kind,
-            // Legacy required fields kept populated for back-compat
-            template,
-            aspectRatio:       aspectRatioForPlatformFormat(platformFormat) || '1:1',
-            campaignKind,
-            platformFormat,
-            videoDurationSec:  kind === 'video' ? (videoDurationSec || null) : null,
-            videoPromptGuidance: kind === 'video' ? (videoPromptGuidance || null) : null,
-            videoPromptRaw:      kind === 'video' ? (videoPromptRaw || null) : null,
-            matchTier:         matchTierForUniverseRole(role),
-            variantKind:       variantKindForUniverseRole(role),
-            paletteSource:     'media',
-            rafflePrizeMediaId: null,
-            readinessScore:    score.judgeScore ?? null,
-            status:            'queued',
-            identityDigest:    computeV2IdentityDigest({
-              campaignId, productId,
-              conceptId: concept.concept_id,
-              platformFormat,
+          // Video ships only the operator's chosen format; there is no
+          // cheap-crop story for video and no owner request to fan it out.
+          const formatsForKind = kind === 'image'
+            ? (staticFormats.length ? staticFormats : [platformFormat])
+            : [platformFormat];
+          for (const fmt of formatsForKind) {
+            payloads.push({
+              brandId,
+              campaignId,
+              campaignRunIds: [],
+              mediaId:        new mongoose.Types.ObjectId(primaryId),
+              productId:      toObjectId(productId),
+              // Concept-driven fields (A1 schema)
+              conceptId:         concept.concept_id,
+              conceptArtifactId: artifact._id,
+              mediaIds:          mediaIdObjs,
+              judgeRank:         score.judgeRank ?? null,
+              judgeScore:        score.judgeScore ?? null,
+              generationOrder:   null,
+              renderRoute:       renderRouteForKind(kind),
               kind,
-              ctaText, ctaUrl, ctaUrlParams
-            }),
-            ctaText, ctaUrl, ctaUrlParams,
-            queuedAt:          new Date(),
-            generatedAt:       new Date()
-          });
+              // Legacy required fields kept populated for back-compat
+              template,
+              // Per-FORMAT, not per-run: these three lines are the whole point
+              // of the fan-out. aspectRatio drives the delivery crop and
+              // platformFormat drives the safe box the model typesets inside,
+              // so both must describe `fmt` and not the format the operator
+              // happened to click.
+              aspectRatio:       aspectRatioForPlatformFormat(fmt) || '1:1',
+              campaignKind,
+              platformFormat:    fmt,
+              videoDurationSec:  kind === 'video' ? (videoDurationSec || null) : null,
+              videoPromptGuidance: kind === 'video' ? (videoPromptGuidance || null) : null,
+              videoPromptRaw:      kind === 'video' ? (videoPromptRaw || null) : null,
+              matchTier:         matchTierForUniverseRole(role),
+              variantKind:       variantKindForUniverseRole(role),
+              paletteSource:     'media',
+              rafflePrizeMediaId: null,
+              readinessScore:    score.judgeScore ?? null,
+              status:            'queued',
+              // fmt (not platformFormat) is what keeps the three sizes of one
+              // concept from colliding on the unique index — passing the run's
+              // format here would silently collapse the fan-out to one ad.
+              identityDigest:    computeV2IdentityDigest({
+                campaignId, productId,
+                conceptId: concept.concept_id,
+                platformFormat: fmt,
+                kind,
+                ctaText, ctaUrl, ctaUrlParams
+              }),
+              ctaText, ctaUrl, ctaUrlParams,
+              queuedAt:          new Date(),
+              generatedAt:       new Date()
+            });
+          }
         }
       }
 
@@ -2215,27 +2300,44 @@ async function runConceptDrivenExpansion({
     }
   }));
 
-  // Per-(product, kind) caps. Video is expensive (~$1.75/Veo call) so it
-  // caps at VEO_ADS_PER_PRODUCT_CAP (1); image uses ADS_PER_PRODUCT_CAP (3).
-  // Judge already ranked concepts (judgeRank=1=best); sort ascending and
-  // take the top N within each kind bucket.
+  // Per-(product, kind, PLATFORM FORMAT) caps. Video is expensive
+  // (~$1.75/Veo call) so it caps at VEO_ADS_PER_PRODUCT_CAP (1); image uses
+  // ADS_PER_PRODUCT_CAP (3). Judge already ranked concepts (judgeRank=1=best);
+  // sort ascending and take the top N within each bucket.
+  //
+  // FORMAT IS PART OF THE BUCKET KEY, and that is load-bearing. It used to
+  // bucket by kind alone, which was correct only while one run produced one
+  // format. With the static fan-out on, one concept emits three image payloads
+  // (1:1, 4:5, Stories) — so a kind-only bucket made the three SIZES of one
+  // concept compete for the same 3 slots as the other concepts. 3 concepts x 3
+  // formats = 9 payloads sliced to 3, and because the loop is concept-major the
+  // survivors were all one concept: the operator paid the Director for three
+  // concepts and got the sizes of the top-ranked one, with concepts 2 and 3
+  // silently discarded. Caught by adversarial review, confirmed by simulation
+  // before this fix.
+  //
+  // Keyed by format, the cap means what it reads like: up to N concepts PER
+  // SIZE. Behaviour with fan-out off is unchanged — every payload of a kind
+  // shares one format, so there is exactly one bucket, exactly as before.
   const CAP_BY_KIND = { video: VEO_ADS_PER_PRODUCT_CAP, image: ADS_PER_PRODUCT_CAP };
   const payloads = perProductResults.flatMap(r => {
     if (!r.payloads.length) return [];
-    const byKind = new Map();
+    const byBucket = new Map();
     for (const p of r.payloads) {
       const k = p.kind || 'image';
-      if (!byKind.has(k)) byKind.set(k, []);
-      byKind.get(k).push(p);
+      const bucket = `${k}|${p.platformFormat || ''}`;
+      if (!byBucket.has(bucket)) byBucket.set(bucket, []);
+      byBucket.get(bucket).push(p);
     }
     const kept = [];
-    for (const [kind, list] of byKind.entries()) {
+    for (const [bucket, list] of byBucket.entries()) {
+      const [kind, fmt] = bucket.split('|');
       const cap = CAP_BY_KIND[kind] ?? Infinity;
       const sorted = list.slice().sort((a, b) => (a.judgeRank ?? 999) - (b.judgeRank ?? 999));
       const slice  = isFinite(cap) ? sorted.slice(0, cap) : sorted;
       if (slice.length < list.length) {
         const tag = r.productId ? `product=${r.productId}` : 'brand-only';
-        console.log(`📦 conceptDriven[${tag}]: capped ${list.length} → ${slice.length} ${kind} payload(s) (cap=${cap})`);
+        console.log(`📦 conceptDriven[${tag}]: capped ${list.length} → ${slice.length} ${kind} payload(s) for ${fmt} (cap=${cap})`);
       }
       kept.push(...slice);
     }
