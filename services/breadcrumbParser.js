@@ -7,6 +7,12 @@
 
 'use strict';
 
+// Breadcrumb names come out of a <script> block, so character references
+// are still encoded — "Table &#x2B; Buffet Lamps", and separators
+// themselves ("&#x203A;" for ›) which the Product.category split below
+// depends on seeing as real characters.
+const { cleanScrapedText } = require('../utils/htmlEntities');
+
 // Top-level breadcrumb segments that are navigation chrome, not real
 // categories. Filtered out so "Home > Mens > Tops" becomes "Mens > Tops".
 const BREADCRUMB_SKIP = new Set([
@@ -53,10 +59,10 @@ function normalizeBreadcrumb(items) {
   if (!Array.isArray(items)) return null;
   const names = items
     .map(it => {
-      if (typeof it === 'string') return it;
+      if (typeof it === 'string') return cleanScrapedText(it);
       // BreadcrumbList items can be: { name } or { item: { name } } or { item: "...", name: "..." }
       const n = it?.name || it?.item?.name || null;
-      return n ? String(n).trim() : null;
+      return cleanScrapedText(n);
     })
     .filter(Boolean)
     .filter(n => !BREADCRUMB_SKIP.has(n.toLowerCase()));
@@ -84,7 +90,7 @@ function extractBreadcrumb(html) {
     const products = findByType(block, 'Product');
     for (const p of products) {
       if (!p.category) continue;
-      const raw = String(p.category).trim();
+      const raw = cleanScrapedText(p.category) || '';
       // Common separators: > / › → →
       const names = raw.split(/[>/›→]+/).map(s => s.trim()).filter(Boolean)
         .filter(n => !BREADCRUMB_SKIP.has(n.toLowerCase()));

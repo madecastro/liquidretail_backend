@@ -9,6 +9,44 @@
 
 const axios = require('axios');
 
+// Narrative summaries were cut with slice(0, 200), which ends mid-word. Prefer
+// whole sentences and fall back to a word-boundary cut.
+const { truncateWords } = require('../../utils/htmlEntities');
+
+/**
+ * stampLlmQuotes(rows, scope) → quote[]
+ * Marks every quote this provider emits as LLM-derived. The scrape path writes
+ * `origin: 'scraped', verbatim: true`; anything from here is
+ * `origin: 'llm-web', verbatim: false` so a consumer that needs a genuine
+ * customer review can filter, and so a rewritten line can never be stored or
+ * rendered as an original review.
+ *
+ * `scope` matters as much as `origin`: brand-level quotes DO get used on ads,
+ * and a quote about the brand is not evidence about the product it is placed
+ * next to. Carrying 'brand' vs 'product' lets a consumer prefer the tighter
+ * one instead of treating the pool as interchangeable.
+ */
+function stampLlmQuotes(rows, scope) {
+  if (!Array.isArray(rows)) return [];
+  return rows.slice(0, 6).filter(q => q && q.text).map(q => Object.assign({}, q, {
+    origin: 'llm-web',
+    verbatim: false,
+    scope: scope || 'product'
+  }));
+}
+function summarySnippet(s, maxLen = 200) {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+  if (t.length <= maxLen) return t;
+  const sentences = t.match(/[^.!?]+[.!?]+(\s|$)/g) || [];
+  let out = '';
+  for (const sent of sentences) {
+    if ((out + sent).trim().length > maxLen) break;
+    out += sent;
+  }
+  return out.trim() || truncateWords(t, maxLen);
+}
+
 const MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 const PROVIDER_NAME = 'gemini-search';
@@ -299,7 +337,7 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
     );
   } catch (err) {
     console.warn(`   ⚠️  brand-reviews structuring failed: ${err.message}`);
-    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
+    return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
   const structCand = structRes.data?.candidates?.[0];
@@ -312,11 +350,15 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
   }
   if (!parsed) {
     console.warn(`   · brand-reviews: structuring produced no parsable JSON for ${brandName}`);
-    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
+    return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
   const result = {
-    quotes:      Array.isArray(parsed.quotes) ? parsed.quotes.slice(0, 6).filter(q => q && q.text) : [],
+    // PROVENANCE: these quotes are produced by a grounded LLM search over the
+    // open web, not scraped verbatim from the merchant's review app. They are
+    // stamped so nothing downstream can present them as first-party customer
+    // reviews — see stampLlmQuotes().
+    quotes:      stampLlmQuotes(parsed.quotes, 'brand'),
     rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
     reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
     summary:     parsed.summary || null,
@@ -439,7 +481,7 @@ async function lookupProductReviews({ productName, brandName, productUrl }) {
     );
   } catch (err) {
     console.warn(`   ⚠️  product-reviews structuring failed: ${err.message}`);
-    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
+    return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
   const structCand = structRes.data?.candidates?.[0];
@@ -452,11 +494,15 @@ async function lookupProductReviews({ productName, brandName, productUrl }) {
   }
   if (!parsed) {
     console.warn(`   · product-reviews: structuring produced no parsable JSON for ${productLabel}`);
-    return { quotes: [], rating: null, reviewCount: null, summary: narrative.slice(0, 200), source: PROVIDER_NAME };
+    return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
   const result = {
-    quotes:      Array.isArray(parsed.quotes) ? parsed.quotes.slice(0, 6).filter(q => q && q.text) : [],
+    // PROVENANCE: these quotes are produced by a grounded LLM search over the
+    // open web, not scraped verbatim from the merchant's review app. They are
+    // stamped so nothing downstream can present them as first-party customer
+    // reviews — see stampLlmQuotes().
+    quotes:      stampLlmQuotes(parsed.quotes, 'product'),
     rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
     reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
     summary:     parsed.summary || null,

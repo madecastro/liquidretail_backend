@@ -33,6 +33,11 @@
 
 const CatalogProduct = require('../models/CatalogProduct');
 const Media          = require('../models/Media');
+const { cleanScrapedText, decodeHtmlEntities, tidyText } = require('../utils/htmlEntities');
+// Shared on-page review/rating engine. Owns platform detection + review
+// extraction for every ingest path; this service keeps its own polite
+// fetch loop and hands the HTML over.
+const reviewsEngine = require('./productReviewsScrapeService');
 
 // ── constants ──────────────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -57,20 +62,20 @@ function normalizeGtin(raw) {
 }
 
 // Strip HTML tags → plain text, collapse whitespace, truncate.
+//
+// Entity decoding is delegated to utils/htmlEntities so NUMERIC references
+// are handled too — the hand-rolled list here only covered five named ones,
+// which left `&#x2B;` / `&#34;` / `&#8221;` (all common in furniture
+// catalogs) sitting raw in descriptions.
+//
+// Two tag-strip passes around ONE decode pass: sites that escape their
+// JSON-LD ship the description as encoded markup ("&lt;div&gt;Introducing
+// the Austen Black 74&quot; …"), which is only strippable after decoding.
+// Decoding twice is what we must avoid, not stripping twice.
 function stripHtml(html, maxLen = 2000) {
   if (!html) return null;
-  const text = String(html)
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text) return null;
-  return text.length > maxLen ? text.slice(0, maxLen) : text;
+  const decoded = decodeHtmlEntities(String(html).replace(/<[^>]*>/g, ' '));
+  return tidyText(decoded.replace(/<[^>]*>/g, ' '), maxLen);
 }
 
 function sleep(ms) {
@@ -330,9 +335,12 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
             source:           'shopify-direct',
             externalId,
             itemGroupId:      externalId,
-            title:            p.title || '(untitled)',
+            // Decoded for the same reason as the generic path: the headless
+            // fallback feeds this shape from JSON-LD, and merchants
+            // sometimes type entities straight into a Shopify title.
+            title:            cleanScrapedText(p.title) || '(untitled)',
             description,
-            brand:            p.vendor || brand.name || null,
+            brand:            cleanScrapedText(p.vendor) || brand.name || null,
             price:            Number.isFinite(price) ? price : null,
             currency:         null,
             availability,
@@ -341,7 +349,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
             productUrl,
             gtin:             normalizeGtin(v0.barcode),
             mpn:              v0.sku || null,
-            category:         p.product_type || null,
+            category:         cleanScrapedText(p.product_type),
             rawData:          p,
             lastSyncedAt:     new Date()
           },
@@ -597,25 +605,27 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
     }
 
     try {
-      const reviewApp = detectReviewApp(html);
-      const { rating, reviewCount, quotes } = extractReviewsFromHtml(html, reviewApp);
+      // Shared engine (services/productReviewsScrapeService) — captures
+      // per-review stars/headline/date and ranks positives first, and is
+      // the same extractor the sitemap + Meta-catalog paths run.
+      const rev = reviewsEngine.extractOnPageReviews(html);
+      const productReviews = reviewsEngine.buildProductReviews(rev);
 
-      if (rating != null || (quotes && quotes.length)) {
-        const productReviews = {
-          quotes:      quotes || [],
-          rating:      rating,
-          reviewCount: reviewCount,
-          summary:     null,
-          fetchedAt:   new Date()
-        };
+      if (productReviews) {
         const $set = { productReviews };
-        if (rating != null) $set.rating = rating;
+        if (productReviews.rating != null) $set.rating = productReviews.rating;
 
         await CatalogProduct.updateOne(
           { brandId: brand._id, externalId: String(p.id) },
           { $set }
         );
         reviewsCaptured += 1;
+      } else if (rev.platform) {
+        // Widget present but nothing structured to read — the store has
+        // its review app's rich snippets turned off. Worth a log line:
+        // it's the difference between "no reviews" and "reviews we can't
+        // see", and it's the case a headless render would recover.
+        console.log(`   · 🛍  ${p.handle}: ${rev.platform} widget detected, no structured reviews on page`);
       }
     } catch (err) {
       console.warn(`   ⚠️  🛍  review parse failed for ${p.handle}: ${err.message}`);
@@ -697,108 +707,19 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
 
 // ── review helpers ─────────────────────────────────────────────────
 
+// Review extraction + platform detection now live in
+// services/productReviewsScrapeService (the shared engine). These two
+// names stay as thin delegates because probe scripts import them from
+// here; new callers should use the engine directly.
 function detectReviewApp(html) {
-  if (!html) return null;
-  if (/judge\.me|judgeme/i.test(html)) return 'judge.me';
-  if (/yotpo/i.test(html)) return 'yotpo';
-  if (/loox\.io|loox/i.test(html)) return 'loox';
-  if (/stamped\.io|stamped/i.test(html)) return 'stamped';
-  if (/okendo/i.test(html)) return 'okendo';
-  return null;
+  return reviewsEngine.detectReviewPlatform(html);
 }
 
 function extractReviewsFromHtml(html, reviewAppName) {
-  let rating = null;
-  let reviewCount = null;
-  const quotes = [];
-
-  // Pull every <script type="application/ld+json">…</script> block.
-  const re = /<script[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  const blocks = [];
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const raw = (m[1] || '').trim();
-    if (!raw) continue;
-    try {
-      blocks.push(JSON.parse(raw));
-    } catch {
-      // lenient — try to salvage trailing-comma / junk
-      try {
-        const cleaned = raw.replace(/,\s*([}\]])/g, '$1');
-        blocks.push(JSON.parse(cleaned));
-      } catch {
-        // skip bad block
-      }
-    }
-  }
-
-  const nodes = flattenLdNodes(blocks);
-  for (const node of nodes) {
-    if (!node || typeof node !== 'object') continue;
-    const type = node['@type'];
-    const types = Array.isArray(type) ? type : [type];
-    if (!types.some(t => t && String(t).toLowerCase() === 'product')) continue;
-
-    // aggregateRating
-    const ar = node.aggregateRating;
-    if (ar && typeof ar === 'object') {
-      const rv = Number(ar.ratingValue);
-      if (Number.isFinite(rv)) {
-        rating = Math.max(0, Math.min(5, rv));
-      }
-      const rc = Number(ar.reviewCount ?? ar.ratingCount);
-      if (Number.isFinite(rc)) reviewCount = rc;
-    }
-
-    // review[] 
-    const rev = node.review;
-    const revArr = Array.isArray(rev) ? rev : rev ? [rev] : [];
-    for (const r of revArr) {
-      if (!r || typeof r !== 'object') continue;
-      const text = (r.reviewBody != null ? String(r.reviewBody) : '').trim().slice(0, 400);
-      if (!text) continue;
-      let author = null;
-      if (r.author != null) {
-        if (typeof r.author === 'string') author = r.author;
-        else if (typeof r.author === 'object') author = r.author.name || null;
-      }
-      // Per-review star rating, kept so quote selection can require a
-      // high-rated review. Without it every stored quote is unrated and
-      // downstream can only judge the wording, which lets a 2-star review
-      // that happens to open warmly ("the fabric feels amazing, but…")
-      // become the testimonial on the ad.
-      const rr = r.reviewRating && typeof r.reviewRating === 'object' ? r.reviewRating : null;
-      const ratingValue = Number(rr?.ratingValue ?? r.ratingValue);
-      quotes.push({
-        text,
-        author: author ? String(author).slice(0, 120) : null,
-        source: reviewAppName || 'store',
-        rating: Number.isFinite(ratingValue) ? ratingValue : null
-      });
-      if (quotes.length >= 10) break;
-    }
-    if (quotes.length >= 10 && rating != null) break;
-  }
-
-  return { rating, reviewCount, quotes: quotes.slice(0, 10) };
-}
-
-function flattenLdNodes(blocks) {
-  const out = [];
-  const walk = (node) => {
-    if (node == null) return;
-    if (Array.isArray(node)) {
-      for (const n of node) walk(n);
-      return;
-    }
-    if (typeof node !== 'object') return;
-    out.push(node);
-    if (Array.isArray(node['@graph'])) {
-      for (const n of node['@graph']) walk(n);
-    }
-  };
-  for (const b of blocks) walk(b);
-  return out;
+  const r = reviewsEngine.extractOnPageReviews(html, {
+    platform: reviewAppName !== undefined ? reviewAppName : undefined
+  });
+  return { rating: r.rating, reviewCount: r.reviewCount, quotes: r.quotes };
 }
 
 module.exports = {

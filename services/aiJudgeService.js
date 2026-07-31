@@ -313,9 +313,21 @@ function sha256(s) {
 //       proof_coherence    — if social_proof_type != 'none', the
 //                            inputSummary HAS the data to back it
 //       distinctness       — concept differs meaningfully from peers
+//       conversion_strength — would this actually make a browser buy
 //   • hardViolations[] flags diagnostic issues without culling.
+//
+// conversion_strength exists because the other five axes all measure
+// COHERENCE — does the concept fit the signal, the brand, the media, the
+// proof, its peers. A concept can score 10 across all of them and still be
+// an ad nobody buys from. The Director prompt is explicitly direct-response
+// (see OBJECTIVE_BLOCK in aiCreativeDirectorService); without a matching axis
+// here the Judge would rank that work away in favour of the most coherent
+// concept rather than the most persuasive one.
+//
+// Adding an axis is a one-line change on purpose: the response schema, the
+// per-axis average and the 0-1 normalisation are all derived from this array.
 
-const CONCEPT_AXES = ['strategy_fit', 'brand_match', 'media_utilization', 'proof_coherence', 'distinctness'];
+const CONCEPT_AXES = ['strategy_fit', 'brand_match', 'media_utilization', 'proof_coherence', 'distinctness', 'conversion_strength'];
 
 // Compress one concept into the Judge's reading payload. Strip prompt-
 // builder fields (long rationales, recommended_components verbosity) so
@@ -525,6 +537,7 @@ function buildConceptRoundPrompt({ summaries, inputSummary, brandSignal, univers
     `  media_utilization  — does media_picks use the seeded universe SMARTLY? Penalize: always-just-hero (single static_single when collage/grid would showcase alts), random picks unrelated to the archetype, output_shape tile_count mismatching media_picks length.`,
     `  proof_coherence    — when social_proof_type != "none", inputSummary MUST have actual proof data to back it (primary_quote, top_comments, or rating). When proof_coherence fails, ALSO emit a "claimed_proof_no_data" hard_violation.`,
     `  distinctness       — how meaningfully does this concept differ from its peers in this round (different archetype OR different media-pick combo OR different copy angle)?`,
+    `  conversion_strength — this is DIRECT-RESPONSE advertising: would this concept move someone who is BROWSING into BUYING? Score high when the concept REMOVES A SPECIFIC PURCHASE OBJECTION (fit, colour accuracy, durability, worth-the-price) and backs it with a specific checkable claim. Score low for: generic praise as the proof ("I love it!"), a mood-only emotional_hook ("trust", "quality") where the data supported something concrete, superlatives in place of specifics, competing CTAs, or any concept leaning on shipping/delivery/packaging/customer-service — those describe the retailer, not the product, and do not move a purchase decision. A concept can be perfectly coherent on the other five axes and still score low here; that is the point of this axis.`,
     ``,
     `HARD VIOLATIONS — flag these as short string codes in the concept's hard_violations array. Do NOT cull; the renderer still ships violating concepts in rank order but operators surface the violation in diagnostics.`,
     `  • claimed_proof_no_data    — social_proof_type != "none" AND inputSummary has no proof signal`,
@@ -534,7 +547,7 @@ function buildConceptRoundPrompt({ summaries, inputSummary, brandSignal, univers
     `  • duplicate_archetype        — concept's archetype matches another concept in the batch AND their media-pick sets are identical`,
     ``,
     `OUTPUT JSON:`,
-    `  concept_scores  — array in CONCEPT INPUT ORDER (one per concept). Each: { concept_id, criteria_scores: { strategy_fit, brand_match, media_utilization, proof_coherence, distinctness } (each 0-10), hard_violations: [string] }`,
+    `  concept_scores  — array in CONCEPT INPUT ORDER (one per concept). Each: { concept_id, criteria_scores: { ${CONCEPT_AXES.join(', ')} } (each 0-10), hard_violations: [string] }`,
     `  batch_rationale — 1-2 sentences explaining what differentiated the top concept`,
     ``,
     `Be decisive on scoring. If all concepts are similar, surface the differences via the distinctness axis.`,

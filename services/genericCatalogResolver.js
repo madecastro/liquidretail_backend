@@ -29,6 +29,14 @@
 const zlib = require('zlib');
 const http = require('./httpScrapeClient');
 const ingestHelpers = require('./shopifyPublicIngestService');
+// TEXT: JSON-LD lives inside a <script> (a raw-text element), so the HTML
+// parser never decodes character references in it. Sites that escape their
+// JSON-LD string values hand us `74&quot; Wide TV Stand` verbatim — every
+// human-readable field below goes through cleanScrapedText.
+const { cleanScrapedText } = require('../utils/htmlEntities');
+// Shared on-page review/rating engine — same extractor every ingest path
+// uses, so review coverage doesn't depend on which sync method ran.
+const reviewsEngine = require('./productReviewsScrapeService');
 // Reuse the pure (axios-free) breadcrumb parser so we can capture the
 // PDP's BreadcrumbList from the SAME HTML the scan already fetched —
 // avoids a second full per-product crawl by the post-sync inference pass.
@@ -327,17 +335,49 @@ function looksLikeSlug(id) {
  * product, corrupting the dedup + feed key. Returns the id or null.
  */
 function extractProductIdFromHtml(html) {
+  return metaContent(html, ['itemprop'], 'productid');
+}
+
+// ── <meta> reader ──────────────────────────────────────────────────
+//
+// Read a <meta> tag's `content` by matching one of its identifying
+// attributes (property / name / itemprop). Whole tags are scanned first,
+// then each attribute is read with ITS OWN delimiter.
+//
+// The previous one-shot patterns (`["']([^"']+)["']`) truncated any
+// double-quoted value containing an apostrophe — `content="Nate's 33&quot;
+// Table"` came back as `Nate` — and only matched the two attribute
+// orderings that were spelled out. Values are entity-decoded on the way
+// out: attribute values are ALWAYS character-reference-encoded in HTML, so
+// `33&quot;` here is the encoding of a plain `33"`.
+// Source string, not a shared /g regex — a stateful lastIndex across calls
+// would make results depend on call order.
+const META_TAG_SRC = '<meta\\b[^>]*>';
+
+function readTagAttr(tag, name) {
+  const re = new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'\`=<>]+))`, 'i');
+  const m = tag.match(re);
+  if (!m) return null;
+  const raw = m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3]);
+  return raw == null ? null : raw;
+}
+
+function metaContent(html, idAttrs, wantedValue) {
   if (!html || typeof html !== 'string') return null;
-  const patterns = [
-    /<meta[^>]+itemprop\s*=\s*["']productID["'][^>]+content\s*=\s*["']([^"']+)["']/i,
-    /<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]+itemprop\s*=\s*["']productID["']/i
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m && m[1]) {
-      const cand = m[1].trim();
-      if (cand) return cand;
+  const want = String(wantedValue).toLowerCase();
+  const re = new RegExp(META_TAG_SRC, 'gi');
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const tag = m[0];
+    let hit = false;
+    for (const attr of idAttrs) {
+      const v = readTagAttr(tag, attr);
+      if (v != null && v.trim().toLowerCase() === want) { hit = true; break; }
     }
+    if (!hit) continue;
+    const content = readTagAttr(tag, 'content');
+    const cleaned = cleanScrapedText(content);
+    if (cleaned) return cleaned;
   }
   return null;
 }
@@ -393,14 +433,13 @@ function mapAvailability(raw) {
 // specific segment for arrays) or null.
 function categoryOf(cat) {
   if (cat == null) return null;
-  if (typeof cat === 'string') return cat.trim() || null;
+  if (typeof cat === 'string') return cleanScrapedText(cat);
   if (Array.isArray(cat)) {
     const parts = cat.map(categoryOf).filter(Boolean);
     return parts.length ? parts[parts.length - 1] : null;
   }
   if (typeof cat === 'object') {
-    const n = cat.name != null ? String(cat.name).trim() : '';
-    return n || null;
+    return cat.name != null ? cleanScrapedText(cat.name) : null;
   }
   return null;
 }
@@ -409,10 +448,9 @@ function brandNameOf(node) {
   if (!node) return null;
   const b = node.brand;
   if (b == null) return null;
-  if (typeof b === 'string') return b.trim() || null;
+  if (typeof b === 'string') return cleanScrapedText(b);
   if (typeof b === 'object') {
-    const n = b.name != null ? String(b.name).trim() : '';
-    return n || null;
+    return b.name != null ? cleanScrapedText(b.name) : null;
   }
   return null;
 }
@@ -522,52 +560,15 @@ function imagesFromNode(node, pageUrl) {
   };
 }
 
+// Reviews come from the shared engine (services/productReviewsScrapeService)
+// so this path, the Shopify path and the Meta-catalog path all capture the
+// same fields: per-review STARS + headline + date, positive-ranked, scale-
+// normalized aggregate. Previously this kept { text, author } for the first
+// ten reviews in document order and dropped reviewRating entirely.
 function reviewsFromNode(node) {
-  let rating = null;
-  let reviewCount = null;
-  const quotes = [];
-
-  const ar = node.aggregateRating;
-  if (ar && typeof ar === 'object') {
-    const rv = Number(ar.ratingValue);
-    if (Number.isFinite(rv)) rating = Math.max(0, Math.min(5, rv));
-    const rc = Number(ar.reviewCount ?? ar.ratingCount);
-    if (Number.isFinite(rc)) reviewCount = rc;
-  }
-
-  const rev = node.review;
-  const revArr = Array.isArray(rev) ? rev : rev ? [rev] : [];
-  for (const r of revArr) {
-    if (!r || typeof r !== 'object') continue;
-    const text = (r.reviewBody != null ? String(r.reviewBody) : '').trim().slice(0, 400);
-    if (!text) continue;
-    let author = null;
-    if (r.author != null) {
-      if (typeof r.author === 'string') author = r.author;
-      else if (typeof r.author === 'object') author = r.author.name || null;
-    }
-    quotes.push({
-      text,
-      author: author ? String(author).slice(0, 120) : null,
-      source: 'store'
-    });
-    if (quotes.length >= 10) break;
-  }
-
-  if (rating == null && !quotes.length && reviewCount == null) {
-    return { rating: null, productReviews: null };
-  }
-
-  return {
-    rating,
-    productReviews: {
-      quotes,
-      rating,
-      reviewCount,
-      summary: null,
-      fetchedAt: new Date()
-    }
-  };
+  const extracted = reviewsEngine.reviewsFromProductNode(node, { source: 'store' });
+  const productReviews = reviewsEngine.buildProductReviews(extracted);
+  return { rating: extracted.rating, productReviews };
 }
 
 // The offer-level sku, if present (some sites carry the feed id there).
@@ -609,9 +610,10 @@ function mapJsonLdProduct(node, pageUrl, explicitId = null) {
     : resolveFeedId(node, pageUrl);
   if (!externalId) return null;
 
+  // Entity-decoded: a `33&quot;` in the JSON-LD name must land as `33"`.
   const title = node.name != null
-    ? String(node.name).trim()
-    : (node.title != null ? String(node.title).trim() : '');
+    ? cleanScrapedText(node.name)
+    : (node.title != null ? cleanScrapedText(node.title) : null);
   const descriptionRaw = node.description != null ? node.description : null;
   const description = descriptionRaw != null
     ? ingestHelpers.stripHtml(String(descriptionRaw), 2000)
@@ -652,18 +654,10 @@ function mapJsonLdProduct(node, pageUrl, explicitId = null) {
 function mapOgProduct(html, pageUrl) {
   if (!html || typeof html !== 'string') return null;
 
-  const meta = (prop) => {
-    const re = new RegExp(
-      `<meta[^>]+(?:property|name)\\s*=\\s*["']${prop}["'][^>]+content\\s*=\\s*["']([^"']+)["']`,
-      'i'
-    );
-    const re2 = new RegExp(
-      `<meta[^>]+content\\s*=\\s*["']([^"']+)["'][^>]+(?:property|name)\\s*=\\s*["']${prop}["']`,
-      'i'
-    );
-    const m = html.match(re) || html.match(re2);
-    return m ? m[1].trim() : null;
-  };
+  // Attribute-order agnostic, delimiter-aware, entity-decoded — see
+  // metaContent(). og:title carries the same `&quot;` inch marks as the
+  // JSON-LD name on sites that escape their markup.
+  const meta = (prop) => metaContent(html, ['property', 'name'], prop);
 
   const title = meta('og:title');
   if (!title) return null;
@@ -1105,22 +1099,18 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       }
     } catch { /* best-effort — inference pass will backfill on a miss */ }
 
-    // Optional: enrich reviews via the shared HTML helper (also flattens
-    // JSON-LD aggregateRating) when mapper left rating empty.
+    // Whole-page review sweep when the Product node alone came up short:
+    // catches standalone Review nodes, a Product node the mapper skipped,
+    // and itemprop-only aggregates. Also labels the review platform
+    // (bazaarvoice / judge.me / yotpo / …) for provenance.
     if (mapped.rating == null || !mapped.productReviews) {
       try {
-        const rev = ingestHelpers.extractReviewsFromHtml(html, null);
+        const rev = reviewsEngine.extractOnPageReviews(html);
         if (rev.rating != null && mapped.rating == null) mapped.rating = rev.rating;
-        if ((rev.quotes && rev.quotes.length) || rev.rating != null) {
-          if (!mapped.productReviews) {
-            mapped.productReviews = {
-              quotes: rev.quotes || [],
-              rating: rev.rating,
-              reviewCount: rev.reviewCount,
-              summary: null,
-              fetchedAt: new Date()
-            };
-          }
+        if (!mapped.productReviews) {
+          mapped.productReviews = reviewsEngine.buildProductReviews(rev);
+        } else if (rev.platform && !mapped.productReviews.platform) {
+          mapped.productReviews.platform = rev.platform;
         }
       } catch { /* best-effort */ }
     }

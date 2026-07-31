@@ -1304,10 +1304,17 @@ function scoreQuote(text) {
 // promote neutral-lived-experience quotes with no endorsement value.
 const SCORE_FLOOR = 1;
 
-// Star gate for review-backed quote tiers. A testimonial on a paid ad should
-// come from someone who actually rated the product highly — text scoring alone
-// cannot tell "the fabric feels amazing" in a 5-star review from the same
-// clause inside a 2-star complaint.
+// Minimum star rating for a scraped review to be eligible for an ad.
+// 4+ on a 5-point scale — the reviewer's own verdict. Only applied to
+// quotes that actually carry a rating. Used by pickStrongestQuote below as
+// a soft, per-candidate filter/scoring nudge.
+const MIN_STARS_FOR_AD = 4;
+
+// Star gate for review-backed quote tiers, applied to a whole candidate list
+// BEFORE it reaches pickStrongestQuote. A testimonial on a paid ad should
+// come from someone who actually rated the product highly — text scoring
+// alone cannot tell "the fabric feels amazing" in a 5-star review from the
+// same clause inside a 2-star complaint.
 //
 // Applies to reviews only. Instagram comments and LLM-authored lines carry no
 // star rating and are gated by sentiment elsewhere.
@@ -1347,11 +1354,28 @@ function gateQuotesByRating(candidates, tierName) {
 
 function pickStrongestQuote(candidates) {
   if (!Array.isArray(candidates) || candidates.length === 0) return null;
+
+  // STAR VERDICT BEATS TEXT SENTIMENT. Scraped reviews now carry the
+  // reviewer's own rating (productReviewsScrapeService), which is a far
+  // better positivity signal than lexical scoring — a calmly-worded
+  // 2-star ("the fabric is nice but the frame cracked") can clear a
+  // lexical gate, while a 5-star one-liner gets penalized for brevity.
+  // When ANY candidate in this tier is star-rated, drop the ones the
+  // reviewer themself scored below MIN_STARS_FOR_AD and let the text
+  // scorer choose among what's left. Tiers with no ratings at all
+  // (comments, LLM-authored) are unaffected.
+  const rated = candidates.filter(q => q && Number.isFinite(q.rating));
+  const pool = rated.length
+    ? candidates.filter(q => !Number.isFinite(q?.rating) || q.rating >= MIN_STARS_FOR_AD)
+    : candidates;
+
   let best = null;
   let bestScore = -Infinity;
-  for (const q of candidates) {
+  for (const q of pool) {
     if (!q?.text) continue;
-    const score = scoreQuote(q.text);
+    // Small nudge so a 5-star beats a 4-star when the prose scores level.
+    const starBonus = Number.isFinite(q.rating) ? (q.rating - MIN_STARS_FOR_AD) : 0;
+    const score = scoreQuote(q.text) + starBonus;
     if (score > bestScore) {
       bestScore = score;
       best = q;
@@ -1413,20 +1437,46 @@ async function buildProofComments(topComments, ctx, limit = 3) {
 
 // Normalize a raw quote object from any tier into the shape the
 // layout-input artifact expects: { text, author_name, source }.
+// A quote an LLM wrote or rewrote is not a first-party review, so it must not
+// inherit the first-party defaults below. `origin` is stamped at capture time
+// (see docs/REVIEW_VENDORS.md §7): 'scraped' by the review engine, 'llm-web' by
+// geminiSearchProvider/categoryReviewsService, 'synthesized' by
+// synthesizeQuoteFromReviewSummary. Legacy rows predating the stamp have no
+// origin and keep the previous behaviour.
+function isFirstPartyQuote(q) {
+  return q.origin !== 'llm-web' && q.origin !== 'synthesized';
+}
+
 function normalizeQuote(q) {
   if (!q?.text) return null;
   // rating is carried so selection can gate on the reviewer's stars. It was
   // dropped here, which left scoring to judge the wording alone — a low-rated
   // review that reads positively could win the primary slot.
   // null means genuinely unknown (older rows, comments, LLM-authored), never
-  // "unrated so assume good".
+  // "unrated so assume good". Falls back to the raw schema.org shape for
+  // callers that haven't gone through productReviewsScrapeService's own
+  // normalization.
   const rating = Number(q.rating ?? q.reviewRating?.ratingValue);
+  const firstParty = isFirstPartyQuote(q);
   return {
     text:        String(q.text).trim(),
-    author_name: q.author_name || q.author || q.source || 'Verified buyer',
+    // "Verified buyer" is a CLAIM. Defaulting to it for an LLM-derived line
+    // asserts a verified purchase that nothing established — the exact
+    // laundering the provenance stamps exist to prevent. Non-first-party
+    // quotes fall back to a neutral label instead.
+    author_name: q.author_name || q.author || q.source ||
+                 (firstParty ? 'Verified buyer' : 'Customer'),
     source:      q.source || undefined,
-    rating:      Number.isFinite(rating) ? rating : null,
-    verified:    q.verified !== undefined ? q.verified : true
+    verified:    q.verified !== undefined ? q.verified : firstParty,
+    // Carried through from the scrape so pickStrongestQuote can gate on
+    // the reviewer's own star rating. undefined for tiers that have none.
+    rating:      Number.isFinite(rating) ? rating : undefined,
+    title:       q.title || undefined,
+    // Provenance survives normalisation — otherwise this funnel is exactly
+    // where a rewritten line becomes indistinguishable from a real review.
+    origin:      q.origin || undefined,
+    verbatim:    q.verbatim !== undefined ? q.verbatim : undefined,
+    scope:       q.scope || undefined
   };
 }
 
@@ -1498,7 +1548,13 @@ function synthesizeQuoteFromReviewSummary(ctx) {
   return {
     text:     first,
     source:   'review',
-    verified: false
+    verified: false,
+    // PROVENANCE: reviewSummary is LLM-written prose ABOUT the reviews, so its
+    // first sentence is not a review and must never be stored or rendered as
+    // one — even though it reads like a quote. See docs/REVIEW_VENDORS.md §7.
+    origin:   'synthesized',
+    verbatim: false,
+    scope:    'product'
   };
 }
 

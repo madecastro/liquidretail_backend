@@ -205,7 +205,34 @@ function _pathDisallowed(rules, userAgent, pathname) {
   return true;
 }
 
+// ── robots posture, system-wide ─────────────────────────────────────
+//
+// EVERY scrape this platform performs — catalog ingest, reviews, lifestyle
+// imagery, enrichment — runs against storefronts the client has authorised
+// under the engagement agreement, which also makes the client responsible for
+// the legality of what ends up in a finished ad. So robots.txt is NOT treated
+// as an access gate by default: it is a crawler-etiquette file, and we are
+// operating with the site owner's permission rather than as an anonymous
+// crawler.
+//
+// Set RESPECT_ROBOTS=true to restore gating for a deployment that needs it
+// (e.g. prospecting a site before a contract is signed). Read at CALL time so
+// the posture can change without a restart.
+//
+// WHAT IS DELIBERATELY NOT DISABLED: per-host throttling, the concurrency cap
+// and Crawl-delay parsing (see parseRobotsForSitemaps / the pacing in
+// _doFetch). Those exist to avoid degrading the client's own storefront and are
+// a matter of not harming the site, not of permission. Removing them would put
+// a client's site at risk, so they stay regardless of this flag.
+function respectsRobots() {
+  return process.env.RESPECT_ROBOTS === 'true';
+}
+
 async function isAllowedByRobots(url, { userAgent = '*' } = {}) {
+  // Authorised-scraping posture: allow without fetching robots.txt at all,
+  // which also saves a request per new host.
+  if (!respectsRobots()) return true;
+
   let parsed;
   try {
     parsed = new URL(url);
@@ -662,5 +689,6 @@ module.exports = {
   fetchText,
   fetchJson,
   fetchBuffer,
-  isAllowedByRobots
+  isAllowedByRobots,
+  respectsRobots
 };

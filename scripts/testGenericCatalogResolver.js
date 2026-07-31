@@ -355,6 +355,150 @@ check('extractJsonLdProducts: trailing comma still parsed', () => {
 
 // ── mapOgProduct smoke ─────────────────────────────────────────────
 
+// ── HTML entities in scraped text (the `33"` mangling) ─────────────
+//
+// JSON-LD sits inside a <script>, a raw-text element — the HTML parser
+// never decodes character references there, so an escaping site hands us
+// `74&quot;` and JSON.parse keeps it verbatim. Every human-readable field
+// must come out decoded. Real Living Spaces markup below.
+
+check('mapJsonLdProduct: &quot; in name → real inch mark in title', () => {
+  const p = mapJsonLdProduct({
+    '@type': 'Product',
+    name: 'Austen Black 74&quot; Wide Wood TV Stand | Doors | Shelves',
+    sku: '318153',
+    offers: { price: '899.00', priceCurrency: 'USD' }
+  }, 'https://www.livingspaces.com/pdp-austen-74-inch-media-console-318153');
+  assert.equal(p.title, 'Austen Black 74" Wide Wood TV Stand | Doors | Shelves');
+});
+
+check('mapJsonLdProduct: &amp; / &#x2B; / &#x201D; in name decoded', () => {
+  const p = mapJsonLdProduct({
+    '@type': 'Product',
+    name: 'Paulina Black &amp; Grey 71&quot; Stand By Berkus &#x2B; Brent 100&#x201D;',
+    sku: '341970',
+    offers: { price: '499.00' }
+  }, 'https://www.livingspaces.com/pdp-x-341970');
+  assert.equal(p.title, 'Paulina Black & Grey 71" Stand By Berkus + Brent 100”');
+});
+
+check('mapJsonLdProduct: brand + category + review text decoded', () => {
+  const p = mapJsonLdProduct({
+    '@type': 'Product',
+    name: 'Chair',
+    sku: 'C-1',
+    brand: { '@type': 'Brand', name: 'Nate Berkus &#x2B; Jeremiah Brent' },
+    category: 'Tables &#x2B; Consoles',
+    offers: { price: '10' },
+    review: [{
+      '@type': 'Review',
+      reviewBody: 'Fits my 55&quot; TV perfectly &amp; looks great',
+      author: { name: 'Dana &#x2B; Sam' }
+    }]
+  }, 'https://ex.com/p1');
+  assert.equal(p.brand, 'Nate Berkus + Jeremiah Brent');
+  assert.equal(p.category, 'Tables + Consoles');
+  assert.equal(p.productReviews.quotes[0].text, 'Fits my 55" TV perfectly & looks great');
+  assert.equal(p.productReviews.quotes[0].author, 'Dana + Sam');
+});
+
+check('mapJsonLdProduct: description shipped as ESCAPED markup → plain text', () => {
+  // Living Spaces puts "&lt;div&gt;Introducing the Austen Black 74&quot; …"
+  // in Product.description. Tags only become strippable after decoding.
+  const p = mapJsonLdProduct({
+    '@type': 'Product', name: 'Austen', sku: 'A-1', offers: { price: '750' },
+    description: '&lt;div&gt;Austen Black 74&quot; TV Stand.&lt;/div&gt;&#xA;&lt;ul&gt;&lt;li&gt;74&quot; wide&lt;/li&gt;&lt;/ul&gt;'
+  }, 'https://ex.com/a1');
+  assert.equal(p.description, 'Austen Black 74" TV Stand. 74" wide');
+});
+
+check('mapJsonLdProduct: unescaped JSON name is untouched (no double-decode)', () => {
+  const p = mapJsonLdProduct({
+    '@type': 'Product', name: 'Cover for 33" Grill &amp; Cart', sku: 'G-1',
+    offers: { price: '10' }
+  }, 'https://ex.com/g1');
+  // The `&amp;` here IS the site's literal text — one decode pass, so it
+  // becomes '&'. A second pass would be the only way to corrupt the '33"'.
+  assert.equal(p.title, 'Cover for 33" Grill & Cart');
+});
+
+check('mapOgProduct: og:title entities decoded', () => {
+  const html = `
+    <meta property="og:title" content="Kabria Cocoa 96&quot; Fireplace TV Stand &amp; Piers" />
+    <meta property="og:url" content="https://shop.example.com/pdp/p4242" />
+    <meta property="og:image" content="https://cdn.example.com/og.jpg" />
+  `;
+  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p4242');
+  assert.equal(p.title, 'Kabria Cocoa 96" Fireplace TV Stand & Piers');
+});
+
+check('mapOgProduct: apostrophe inside a double-quoted content is NOT truncated', () => {
+  // The old `["']([^"']+)["']` pattern stopped at the inner apostrophe and
+  // returned "Nate" — the whole title after it was silently dropped.
+  const html = `
+    <meta property="og:title" content="Nate's 33&quot; Round Drink Table" />
+    <meta property="og:url" content="https://shop.example.com/pdp/p777" />
+    <meta property="og:image" content="https://cdn.example.com/a.jpg" />
+  `;
+  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p777');
+  assert.equal(p.title, 'Nate\'s 33" Round Drink Table');
+});
+
+check('mapOgProduct: single-quoted content attribute holding a double quote', () => {
+  const html = `
+    <meta property='og:title' content='36" Bar Stool' />
+    <meta property='og:url' content='https://shop.example.com/pdp/p888' />
+    <meta property='og:image' content='https://cdn.example.com/b.jpg' />
+  `;
+  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p888');
+  assert.equal(p.title, '36" Bar Stool');
+});
+
+check('mapOgProduct: content-before-property attribute order still matches', () => {
+  const html = `
+    <meta content="Reversed Order Sofa" property="og:title">
+    <meta content="https://shop.example.com/pdp/p555" property="og:url">
+    <meta content="https://cdn.example.com/c.jpg" property="og:image">
+  `;
+  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p555');
+  assert.equal(p.title, 'Reversed Order Sofa');
+  assert.equal(p.externalId, '555');
+});
+
+check('mapOgProduct: name= (not property=) meta is accepted', () => {
+  const html = `
+    <meta name="og:title" content="Name Attr Sofa">
+    <meta name="og:url" content="https://shop.example.com/pdp/p556">
+    <meta name="og:image" content="https://cdn.example.com/d.jpg">
+  `;
+  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p556');
+  assert.equal(p.title, 'Name Attr Sofa');
+});
+
+check('breadcrumb: entity-encoded names and separators decoded', () => {
+  const list = `<script type="application/ld+json">${JSON.stringify({
+    '@type': 'BreadcrumbList',
+    itemListElement: [
+      { '@type': 'ListItem', position: 1, name: 'Home' },
+      { '@type': 'ListItem', position: 2, name: 'Lighting' },
+      { '@type': 'ListItem', position: 3, name: 'Table &#x2B; Buffet Lamps' }
+    ]
+  })}</script>`;
+  assert.deepEqual(extractBreadcrumb(list).breadcrumb, ['Lighting', 'Table + Buffet Lamps']);
+
+  // Product.category fallback: the `›` separator itself arrives encoded, so
+  // the split can only work after decoding.
+  const cat = `<script type="application/ld+json">${JSON.stringify({
+    '@type': 'Product', name: 'X', category: 'Furniture &#x203A; Living Room &#x203A; Sofas'
+  })}</script>`;
+  assert.deepEqual(extractBreadcrumb(cat).breadcrumb, ['Furniture', 'Living Room', 'Sofas']);
+});
+
+check('extractProductIdFromHtml: value with an apostrophe-bearing sibling attr', () => {
+  const html = '<meta itemprop="productID" content="108724" data-note="Nate\'s pick" />';
+  assert.equal(extractProductIdFromHtml(html), '108724');
+});
+
 check('mapOgProduct: og tags → partial product', () => {
   const html = `
     <meta property="og:title" content="OG Sofa" />

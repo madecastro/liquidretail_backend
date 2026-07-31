@@ -2179,9 +2179,23 @@ async function maybeFetchProductReviewsCached({ catalogProductId, productName, b
     .then(async (fresh) => {
       if (!fresh || !Array.isArray(fresh.quotes) || fresh.quotes.length === 0) return;
       try {
+        // GUARD: this is LLM-derived, web-wide sentiment. It must never
+        // replace a snapshot scraped verbatim from the merchant's own review
+        // app — the filter makes the write a no-op once real reviews exist,
+        // even if this background fetch lands after a later scrape.
         await CatalogProduct.updateOne(
-          { _id: catalogProductId },
-          { $set: { productReviews: Object.assign({}, fresh, { fetchedAt: new Date() }) } }
+          {
+            _id: catalogProductId,
+            $or: [
+              { 'productReviews.quotesOrigin': { $ne: 'scraped' } },
+              { 'productReviews.quotes': { $size: 0 } },
+              { 'productReviews.quotes': { $exists: false } }
+            ]
+          },
+          { $set: { productReviews: Object.assign({}, fresh, {
+            fetchedAt: new Date(),
+            quotesOrigin: 'llm-web'
+          }) } }
         );
         console.log(`   · product-reviews: cached on CatalogProduct "${row.title}"`);
       } catch (err) {

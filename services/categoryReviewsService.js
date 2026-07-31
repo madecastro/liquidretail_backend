@@ -272,7 +272,19 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
       // clause-fragments ("comfort", "sun protection") get filtered out.
       return qNorm.length >= 15 && narrNorm.includes(qNorm);
     })
-    .slice(0, 6);
+    .slice(0, 6)
+    // PROVENANCE. These clear the substring check above, so the text is a
+    // verbatim slice of the narrative — but the NARRATIVE is LLM-written from
+    // grounded web search, so the quote is not a customer's own words reaching
+    // us first-hand: origin stays 'llm-web', verbatim stays false. scope
+    // 'category' is the loosest of the three (a quote about the category, not
+    // this product), so a consumer should prefer product- then brand-scoped
+    // quotes over these. See docs/REVIEW_VENDORS.md §7.
+    .map(q => Object.assign({}, q, {
+      origin: 'llm-web',
+      verbatim: false,
+      scope: 'category'
+    }));
   const droppedCount = (Array.isArray(parsed.quotes) ? parsed.quotes.length : 0) - validatedQuotes.length;
   if (droppedCount > 0) {
     console.log(`   · categoryReviews: dropped ${droppedCount} non-verbatim quote(s) for "${breadcrumb}"`);

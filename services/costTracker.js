@@ -38,7 +38,18 @@ const MODEL_RATES = Object.freeze({
   'openai/gpt-5.4':              { input: 2.50,  output: 15.00, cachedInput: 0.25 },
   'google/gemini-2.5-flash':     { input: 0.30,  output: 2.50,  cachedInput: 0.075 },
   'google/gemini-2.5-pro':       { input: 1.25,  output: 10.00, cachedInput: 0.31 },
-  'anthropic/claude-sonnet-4.6': { input: 3.00,  output: 15.00, cachedInput: 0.30 }
+  'anthropic/claude-sonnet-4.6': { input: 3.00,  output: 15.00, cachedInput: 0.30 },
+  // Flash-tier models used/benchmarked for the 'review-text' role
+  // (atlasModelMap). Rates from the live Atlas catalog 2026-07-27. The
+  // also-rans are listed too so switching via ATLAS_MODEL_REVIEW_TEXT shows up
+  // in the ledger instead of silently logging $0.
+  'google/gemini-2.5-flash-lite':           { input: 0.10,  output: 0.40, cachedInput: 0.01 },
+  'google/gemini-2.0-flash-lite':           { input: 0.075, output: 0.30, cachedInput: 0.075 },
+  'bytedance/doubao-seed-1.6-flash-250828': { input: 0.075, output: 0.30, cachedInput: 0.075 },
+  'bytedance/doubao-seed-2.0-mini-260428':  { input: 0.10,  output: 0.40, cachedInput: 0.10 },
+  'deepseek-ai/deepseek-v4-flash':          { input: 0.14,  output: 0.28, cachedInput: 0.14 },
+  'qwen/qwen3.5-flash':                     { input: 0.10,  output: 0.40, cachedInput: 0.10 },
+  'anthropic/claude-haiku-4.5-20251001':    { input: 1.00,  output: 5.00, cachedInput: 0.10 }
 });
 
 // Unknown models silently log $0 — warn once per model id so a new/renamed

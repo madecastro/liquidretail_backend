@@ -1,0 +1,80 @@
+{
+  "_readme": [
+    "Seed knowledge about how specific retailers expose reviews. Read by",
+    "services/reviewSiteProfileService as the fallback layer under the DB, so a",
+    "fresh deploy starts knowing what we already learned instead of re-probing.",
+    "",
+    "EVERY ENTRY HERE WAS VERIFIED AGAINST THE LIVE SITE — do not add guesses.",
+    "The runtime writes what it learns to the ReviewSiteProfile collection; when",
+    "a learned profile proves stable, promote it into this file so it survives a",
+    "database reset and is reviewable in a PR.",
+    "",
+    "idSource/idTrim answer 'which id are this store's reviews filed under':",
+    "take the value from idSource and drop idTrim trailing characters.",
+    "",
+    "Fields: platform, idSource, idTrim, ldSource, hints, reviewsSeen, learnedFrom."
+  ],
+
+  "www.gap.com": {
+    "platform": "powerreviews",
+    "idSource": "productID",
+    "idTrim": 3,
+    "ldSource": "embedded",
+    "reviewsSeen": 2741,
+    "learnedFrom": "https://www.gap.com/browse/product.do?pid=130046042",
+    "hints": {
+      "note": "PDP is Next.js App Router: the ld+json tag is serialised into the RSC flight payload, doubly escaped, so a script-tag scan finds nothing. PowerReviews keys are under powerReviewsConfig:{groupId,merchantId,apiKey} — NOT prApiKey/prMerchantId. Reviews are filed against the 6-digit style (130046), not the 9-digit colour pid (130046042) nor the 13-digit sku.",
+      "merchantIdIsNotGroupId": "groupId 524780421 returns 401 'api key is invalid for this merchant'; merchantId 1443032450 is the one the read URL wants."
+    }
+  },
+
+  "www.ulta.com": {
+    "platform": "powerreviews",
+    "idSource": "productID",
+    "idTrim": 0,
+    "ldSource": "json-ld",
+    "reviewsSeen": 714,
+    "learnedFrom": "https://www.ulta.com/p/airbrush-flawless-foundation-pimprod2054180",
+    "hints": {
+      "note": "Reviews are filed under the PDP slug id (pimprod2054180) from JSON-LD productID / the canonical URL. The SKU (2644401) returns a valid but EMPTY response, so the SKU must not be trusted as the page_id.",
+      "keys": "prApiKey / prMerchantId / prMerchantGroupId in an inline React page-state blob."
+    }
+  },
+
+  "www.livingspaces.com": {
+    "platform": "bazaarvoice",
+    "idSource": "productID",
+    "idTrim": 0,
+    "ldSource": "json-ld",
+    "reviewsSeen": 1511,
+    "learnedFrom": "https://www.livingspaces.com/pdp-austen-74-inch-media-console-318153",
+    "hints": {
+      "note": "Publishes rich snippets, so tier 1 alone yields the aggregate plus ~6 reviews. Nested review nodes use a BARE `type` key instead of `@type`.",
+      "familyRollup": "BV is configured with BV_FE_FAMILY, so a query for one product returns reviews for every sibling in the furniture family with an identical TotalResults. Exact-ProductId rows are preferred; family rows are flagged."
+    }
+  },
+
+  "www.deathwishcoffee.com": {
+    "platform": "bazaarvoice",
+    "idSource": "urlPid",
+    "idTrim": 0,
+    "ldSource": null,
+    "reviewsSeen": 4726,
+    "learnedFrom": "https://www.deathwishcoffee.com/products/maple-cinnamon-coffee",
+    "hints": {
+      "note": "Renders reviews entirely client-side — ZERO aggregateRating in the server HTML, so tier 1 gets nothing and tier 2/3 are the only routes. The BV product id is still server-rendered on the container div (data-bv-product-id).",
+      "rateLimit": "Shopify's edge 429s datacenter egress on this store; PDP fetches from cloud IPs may fail regardless of tier."
+    }
+  },
+
+  "drsquatch.com": {
+    "platform": "judge.me",
+    "idSource": "productID",
+    "idTrim": 0,
+    "ldSource": "json-ld",
+    "learnedFrom": "https://drsquatch.com/products/squishee-supreme",
+    "hints": {
+      "note": "Rich snippets carry the aggregate plus a couple of reviews (2 of 81) — the rest need tier 2. Was Judge.me at time of verification; apps churn, so installation is always re-checked from the page rather than trusted from this file."
+    }
+  }
+}

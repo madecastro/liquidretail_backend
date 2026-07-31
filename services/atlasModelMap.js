@@ -20,6 +20,46 @@
 'use strict';
 
 const MAP = Object.freeze({
+  // ── review-text role ─────────────────────────────────────────────
+  //
+  // Short-context, high-volume, latency-tolerant work over customer review
+  // sentences: pulling the sharpest phrase out of a review, judging which
+  // review is worth quoting. Under ~2k tokens in, under ~300 out, and called
+  // once per ad rather than once per catalog row — see docs/REVIEW_VENDORS.md
+  // §11 for why the per-review storage path uses no model at all.
+  //
+  // A ROLE, not a model, so the choice lives in exactly one place and moves
+  // with one env var (ATLAS_MODEL_REVIEW_TEXT).
+  //
+  // CHOSEN BY MEASUREMENT, 2026-07-27 — 6 real reviews per model through the
+  // actual quoteSnippetService schema and prompt, scored on hard failures,
+  // off-product snippets, non-verbatim output, cost and latency:
+  //
+  //   google/gemini-2.5-flash-lite  0 fail  0 off  0 non-verbatim  $0.000012   851ms  ← chosen
+  //   openai/gpt-5.6-luna           0 fail  0 off  0 non-verbatim  $0.000195  1245ms
+  //   bytedance/doubao-1.6-flash    0 fail  0 off  0 non-verbatim  $0.000406 15526ms
+  //   anthropic/claude-haiku-4.5    1 fail  0 off  5/6 NON-VERBATIM $0.000124 1223ms
+  //   openai/gpt-5-nano             HTTP 400 "router not found" — listed, not routable
+  //   qwen/qwen3.5-flash            HTTP 400 on strict json_schema
+  //
+  // 16x cheaper and 1.5x faster than the luna it replaces, with identical
+  // correctness on the sample.
+  //
+  // WHY THE HEADLINE PRICES MISLEAD: the cheapest-looking slugs are REASONING
+  // models, and hidden reasoning tokens are billed as output. doubao-1.6-flash
+  // is nominally 20x cheaper per output token than luna but spent up to 5,735
+  // reasoning tokens on a one-sentence extraction — so it is 2x more expensive
+  // in practice, 12x slower, and blows the max_tokens+RESERVE budget (828),
+  // which returns an empty message and silently degrades to mechanical
+  // truncation. gemini-2.5-flash-lite spends ZERO reasoning tokens and emits
+  // ~20. For short extractive work, "does it think" dominates the sticker price.
+  //
+  // claude-haiku-4.5 is disqualified on correctness, not cost: it returned
+  // non-verbatim text for 5 of 6 reviews, which for a quote is a fabrication.
+  //
+  // Overridable per deployment: ATLAS_MODEL_REVIEW_TEXT=<slug>.
+  'review-text':      { atlas: 'google/gemini-2.5-flash-lite', direct: { provider: 'google', model: 'gemini-2.5-flash-lite' } },
+
   'gpt-4.1':          { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4.1' } },
   'gpt-4.1-mini':     { atlas: 'openai/gpt-5.6-luna',  direct: { provider: 'openai', model: 'gpt-4.1-mini' } },
   'gpt-4o-mini':      { atlas: 'openai/gpt-5.6-luna',  direct: { provider: 'openai', model: 'gpt-4o-mini' } },

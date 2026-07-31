@@ -37,6 +37,7 @@ Deterministic, cheap product ingest: discover product URLs from sitemaps, fetch 
 5. **Extraction**
    - Primary: JSON-LD Product → `mapJsonLdProduct` (`genericCatalogResolver.js`)
    - Fallback: Open Graph → `mapOgProduct`
+   - **Entity decode** — every human-readable field goes through `utils/htmlEntities.js` `cleanScrapedText`. A `<script type="application/ld+json">` is a raw-text element, so the HTML parser never decodes character references inside it: sites that escape their JSON-LD ship `Austen Black 74&quot; TV Stand` and `Table &#x2B; Buffet Lamps` straight through `JSON.parse`. Same for `<meta content="…">` values, which are entity-encoded by definition. Decoding is a **single pass**, so a double-escaped `&amp;quot;` becomes the literal `&quot;` rather than a bare quote. Descriptions additionally get tag-stripped on both sides of the decode (`stripHtml`) because escaped markup (`&lt;div&gt;…`) is only strippable once decoded. Rows synced before this landed are repaired by `scripts/backfillHtmlEntities.js`.
 6. **Validate** → **sku-dedup** → **CatalogProduct upsert**.
 7. **In-scan breadcrumb (NEW)** — reuses `services/breadcrumbParser.js` `extractBreadcrumb` → persisted as `inferredBreadcrumb` + `inferredCategoryAt` + Category tree via `Category.findOrCreateCategoryTree`, so post-sync category inference **skips** these products (no second crawl). See [§2](#2-post-sync-trio).
 
@@ -85,7 +86,7 @@ Historically three jobs fired at the end of a catalog sync (`services/genericCat
 | # | Job | Behavior now |
 |---|---|---|
 | **(a)** | Product-detect enqueue | **DEFERRED** — variant roles stamped; image detect skipped unless precompute. [§3](#3-per-product-detect--overlay-zones--ad-readiness-deferred-to-ad-time) |
-| **(b)** | Catalog enrichment | **Gap-fill only** (reviews) on auto path. [§4](#4-catalog-enrichment-reviews--cross-seller-details) |
+| **(b)** | Catalog enrichment | **Free on-site review scrape (all paths)**, then paid gap-fill for what's left. [§4](#4-catalog-enrichment-reviews--cross-seller-details) |
 | **(c)** | Category inference | **Mostly skipped** — breadcrumbs captured in-scan; backfills only gaps |
 
 ### (c) Category inference (gap backfill)
@@ -159,14 +160,73 @@ Worker pool concurrency: `WORKER_CONCURRENCY` (`worker.js`, default 4, prod **5*
 
 **File:** `services/catalogProductEnrichmentService.js`.
 
-Two paths, split for cost control:
+Phase 0 (free, both paths) then two paths split for cost control:
+
+### Phase 0 — on-site reviews + ratings (ALL FOUR INGEST PATHS)
+
+**File:** `services/productReviewsScrapeService.js` — the single review engine.
+
+Runs at the top of `runEnrichment`, so every catalog source gets identical review coverage: all four converge here when their sync completes.
+
+| Ingest path | Entry | On-site reviews |
+|---|---|---|
+| Shopify auth (Meta/IG catalog) | `catalogSyncService.syncCatalog` | phase 0 only (path never crawls PDPs) |
+| Shopify direct | `shopifyPublicIngestService.syncBrandShopifyDirect` | inline “reviews & ratings” stage + phase 0 gap-fill |
+| Apify actor | `apifyIngestService.syncBrandShopify` | phase 0 only (actor returns no review data) |
+| Generic sitemap | `genericCatalogResolver` → `genericCatalogIngestService` | in-scan (same HTML) + phase 0 gap-fill |
+
+- **Source:** the schema.org review data the store’s review app publishes for Google rich snippets — `Product.aggregateRating` + `review[]`, standalone `Review` nodes, or `itemprop` microdata for the aggregate. **Review-app agnostic**: Bazaarvoice, Judge.me, Yotpo, Okendo, Loox, Stamped, PowerReviews, TurnTo, Reviews.io, Junip, Fera, legacy Shopify Product Reviews. No vendor API keys, no per-app adapters.
+- **Captured:** `rating` (rescaled to 0–5 from 5/10/100-point scales), `reviewCount`, and per review: `text`, `title` (reviewer’s headline), `author`, **`rating` (stars)**, `datePublished`, `source` (platform label).
+- **Stored:** `CatalogProduct.productReviews` = `{ quotes[], rating, reviewCount, summary, platform, source, quotesFound, fetchedAt }` + top-level `rating`. A `summary` written earlier by the Gemini path is **preserved** across re-scrapes.
+- **Ranking:** quotes are ordered positive-first (star verdict → substance → recency) **before** the `PRODUCT_REVIEWS_MAX_QUOTES` cap, so the stored sample is the best of the page, not the first N in document order.
+- **Cost:** free — no LLM, no SerpAPI. One `GET` per product page, robots-aware, per-host throttled by `httpScrapeClient`, TTL-gated at `PRODUCT_REVIEWS_TTL_DAYS` (30). A snapshot with no rating **and** no quotes counts as stale so pages are retried later (stores turn rich snippets on).
+- **`type` vs `@type`:** nested review nodes in the wild often use a bare `type` key (Bazaarvoice-rendered PDPs do). Every type read goes through `nodeTypes()`, which accepts both — gating on `@type` alone captures **zero** quotes on those pages.
+- **Manual re-scrape:** `POST /api/sales-demos/brands/:id/sync-reviews` — `?force=1` ignores the TTL, `?headless=1` enables tier 3, `?pages=N` caps tier-2 pages. Free, so it isn’t behind the Enrich lock.
+
+#### Tier 2 — vendor public APIs, paginated (`services/reviewAdapters/`)
+
+Rich snippets are a *teaser*: Judge.me publishes ~2 of 81 reviews, Bazaarvoice ~6 of 156, and a client-rendered widget publishes none. Tier 2 reads the same public endpoint the store’s own widget reads, keyed by an identifier sitting in the page HTML. No credentials, no vendor accounts. Runs when tier 1 came up short.
+
+| Adapter | Verified live against | Paging | Page cap |
+|---|---|---|---|
+| `bazaarvoice` | livingspaces.com, deathwishcoffee.com | `Offset`/`Limit` — 0-indexed **record offset** | 100 |
+| `judge.me` | beardbrand.com | `page` 1-indexed (returns an **HTML fragment**) | 30, silent clamp |
+| `yotpo` | soldejaneiro.com | `page`/`per_page` 1-indexed | 150, silent clamp |
+| `okendo` | — | opaque `nextUrl` **cursor** | 100 |
+| `stamped` | innosupps.com | `page`/`take` 1-indexed | 100, silent clamp |
+| `reviews.io` | boxraw.com | `page` — **0-INDEXED** | — |
+| `powerreviews` | ulta.com | `paging.from` record offset | 25 (hard 400) |
+| `junip` | hexclad.com | opaque `meta.after` **cursor** | 50 (hard 400) |
+| `fera` | thevintagesecret.com.au | `page`/`page_size` 1-indexed | 100, silent clamp |
+
+> **Full vendor reference — endpoints, credentials, paging models, robots policies, rating filters, rate limits, and how to add an adapter: [`docs/REVIEW_VENDORS.md`](./REVIEW_VENDORS.md).**
+
+- **Driver** (`reviewAdapters/index.js`): every request goes through `httpScrapeClient` (per-host throttle, UA rotation, 429/Retry-After), and paging stops on any of: vendor `hasMore:false`, a short page, a page yielding no *new* reviews (protects against a vendor ignoring the page param), page/review caps, HTTP error or rate-limit (partials kept).
+- **Robots is OFF by default, system-wide** (`httpScrapeClient.respectsRobots()`): all scraping — catalog, reviews, lifestyle imagery, enrichment — runs under client authorisation, and the client warrants rights to the content used in their ads. `RESPECT_ROBOTS=true` restores it globally, `REVIEW_RESPECT_ROBOTS=true` for reviews only. **Throttling and `Crawl-delay` are kept regardless.** Note the asymmetry a flag can't fix: a client can authorise *their* storefront, but `loox.io`/`api.bazaarvoice.com`/`judge.me` are third-party infrastructure they cannot consent for — hence Loox stays tier-1/3 only.
+- **4★+ escalation under throttling.** On a 429, an adapter that can express `>=4 stars` **server-side in one request** switches the floor on and **retries the same page** rather than stopping — a throttled budget shouldn't be spent on reviews we'd never quote. **Only `bazaarvoice` qualifies** (`Filter=Rating:gte:4`); Yotpo can only filter by exact star (two requests, no saving), REVIEWS.io's `minRating` is undocumented on the path we call, and six vendors have no filter at all. `result.ratingFiltered` records the floor. **The aggregate is never read from a filtered response** — storing "4.9 from 83" for a 3.8-from-156 product is worse than storing no rating.
+- **`discover()` may be async.** Bazaarvoice’s display passkey takes **three hops** (PDP → `deployments/<client>/bv.js` → `legacyScoutUrl` `bvapi.js` → `apiconfig:{passkey}`); resolved keys are cached per client for the process, so a 5000-product sync costs 2 extra requests, not 10 000. PowerReviews probes up to 4 `page_id` candidates because a wrong one returns **200 with `total_results:0`**, not an error.
+- **Vendors report failure inside a 200 body** — BV with `Errors[]`, PowerReviews with `status_code:400`. Both map to a driver stop that keeps earlier pages.
+- **FAMILY/GROUP ROLLUP** (Bazaarvoice + Junip): both pool reviews across a variant family, so a query for one product returns quotes about siblings (livingspaces.com returned ottoman reviews under a sofa id with identical `TotalResults` for every family member). Exact-product rows win; family rows are used only when nothing matches and are stamped `familyRollup: true`.
+- **Not built, deliberately:** **Loox** — `loox.io/robots.txt` disallows `/widget` and `/widgets`, and `publicStoreId` isn’t derivable from PDP HTML. **Shopify legacy Product Reviews** — removed 2023-09-05, backend shut down 2024-05-06; `productreviews.shopifyapps.com` no longer answers TLS.
+
+#### Tier 3 — headless capture, paginated (`services/reviewHeadlessCapture.js`)
+
+For stores with neither snippets nor a readable API. **Opt-in** (`REVIEW_HEADLESS_ENABLED=true` or `?headless=1`) because it costs a browser per product.
+
+- **Response interception, not DOM scraping.** The PDP loads, the widget hydrates, and we read the JSON its own XHRs return — typed ratings, ISO dates, plaintext bodies. The DOM alternative is presentation-only: Bazaarvoice encodes a rating in `<abbr title="4 out of 5 stars">` plus a CSS bucket class, Junip draws five inline SVG stars, and **both render dates as relative strings** (“9 months ago”). Interception is also frame-agnostic for free (`page.on('response')` fires for child frames), so iframe-hosted widgets need no `frames()` walk. DOM scraping remains the fallback when nothing crosses the network boundary.
+- **Intercepted payloads are the shapes tier 2 already parses**, so tier 3 calls the matching adapter’s `parse()`/`normalize()` rather than duplicating field maps. Bazaarvoice’s `batch.json` is JSONP-wrapped and nests under `BatchedResults.qN` where **N shifts between requests** — the harvester picks whichever sub-result holds `Results`.
+- **Pagination** clicks the widget’s own control and waits for the follow-up XHR. BV advances by the *previous* page’s limit (observed 0 → 10 → 40 → 70 — never `page*size`); Junip walks a cursor 5 at a time. The text-matched control sweep has a **denylist** so it can never click “Write a review” and navigate away mid-capture.
+- **Reuses `headlessScrapeService.getBrowser()`** (one pooled Chrome, lazily required so a container without puppeteer degrades to “tier 3 unavailable”).
+- **Cost, measured:** ~9–11 s to the first review XHR (storefront + widget bootstrap pulls 200–600 subresources across 40–75 hosts — not tunable by us), then ~1.0–2.5 s per click. ~20–25 s for a 149-review BV product; ~38 s for a 131-review Junip product (5/click). Hence the click cap.
+- **Robots:** the merchant’s page is always fetched (same check tier 1 makes) and reading what it renders is fair game; harvesting a *vendor* host’s JSON is gated per host, so a disallowed vendor (Loox) falls through to the DOM read.
+- **Sandbox gotcha beyond this feature:** bundled Chromium could not complete **any** outbound TLS behind a TLS-terminating proxy (`ERR_CONNECTION_RESET` even for `https://example.com`) until GREASE Encrypted ClientHello was disabled by policy. If tier 3 fails everywhere in a new image, suspect that before the selectors.
 
 ### A. AUTO — reviews-only gap-fill (after sync)
 
-- **Entry:** `enqueueBrandProductEnrichment(brandId)` (post-sync `setImmediate`).
-- **Gate:** `needsEnrichment(row)` = true only when **no** on-page review signal: no review quotes **and** `rating == null`.
+- **Entry:** `enqueueBrandProductEnrichment(brandId)` (post-sync `setImmediate`) → phase 0, then the gap-fill.
+- **Gate:** `needsEnrichment(row)` = true only when **no** review signal remains **after phase 0**: no review quotes **and** `rating == null`. Rows are loaded after the scrape so the gate sees fresh state — anything scraped is never billed.
 - **Does not** run SerpAPI product-details.
-- **OperationRun:** kind `enrichment`, label **`Review gap-fill`**, per-item progress + cancel.
+- **OperationRun:** kind `enrichment`, label **`Review gap-fill`**, per-item progress + cancel. Phase 0 opens its own `enrichment` run labelled **`Reviews · <brand>`**.
 
 ### B. USER-ACTUATED — full cross-seller + reviews (Enrich button)
 
@@ -191,6 +251,22 @@ Two paths, split for cost control:
 |---|---|---|
 | `CATALOG_ENRICHMENT_CONCURRENCY` | `6` | Parallel enrich workers |
 | `CATALOG_ENRICHMENT_MAX_PER_RUN` | `500` | Hard cap per brand run |
+| `PRODUCT_REVIEWS_MAX_QUOTES` | `10` | Quotes **stored** per product (ranked positive-first before truncation) |
+| `PRODUCT_REVIEWS_TTL_DAYS` | `30` | Re-scrape cadence for on-site reviews |
+| `PRODUCT_REVIEWS_CONCURRENCY` | `4` | Parallel PDP fetches in the review sweep |
+| `PRODUCT_REVIEWS_MAX_PER_RUN` | `2000` | Products per review sweep |
+| `REVIEW_ADAPTERS_ENABLED` | `true` | Kill-switch for tier 2 (set `false` to disable all vendor APIs) |
+| `REVIEW_ADAPTER_MAX_PAGES` | `5` | Vendor-API pages per product |
+| `REVIEW_ADAPTER_MAX_REVIEWS` | `100` | Reviews read per product across all tiers |
+| `REVIEW_ADAPTER_TIMEOUT_MS` | `12000` | Per-request timeout for vendor APIs |
+| `REVIEW_HEADLESS_ENABLED` | `false` | Tier 3 master switch (a browser per product) |
+| `REVIEW_HEADLESS_MAX_CLICKS` | `6` | Pagination clicks per product |
+| `REVIEW_HEADLESS_BUDGET_MS` | `60000` | Hard per-product wall clock for tier 3 |
+| `REVIEW_HEADLESS_NAV_TIMEOUT_MS` | `30000` | PDP navigation timeout |
+| `REVIEW_HEADLESS_HYDRATE_MS` | `3500` | Settle window after `domcontentloaded` before reading |
+| `REVIEW_HEADLESS_CLICK_WAIT_MS` | `12000` | Wait for the XHR a pagination click triggers |
+
+**Blast radius.** A 10 k-product catalog at the defaults is bounded by `PRODUCT_REVIEWS_MAX_PER_RUN` (2000 products/sweep) × `REVIEW_ADAPTER_MAX_PAGES` (5) — and every row is TTL-gated, so a re-sync of an already-scraped brand costs ~0 requests. Tier 3 stays off unless asked for, per brand or per env.
 
 Requires secrets: `SERPAPI_API_KEY`, `GEMINI_API_KEY` (details path no-ops if SerpAPI disabled).
 
@@ -203,6 +279,15 @@ Both paths: kind `enrichment`, cancellable; partials kept. Idempotent via 30-day
 - Catalog UI (sellers table, specs, review summary, rating distribution).
 - Ad copy / social-proof templates that pull review quotes and ratings.
 - Matching still works without enrichment; enrichment improves merchandising + social-proof creatives.
+
+### Surfacing a POSITIVE review on an ad
+
+`services/layoutInputService.js` `pickStrongestQuote` runs over the 6-tier quote pool (product → category → brand → social comment → LLM → synth):
+
+- When **any** candidate in a tier carries a scraped star rating, candidates the reviewer scored below **`MIN_STARS_FOR_AD` (4)** are dropped, and a small bonus breaks ties in favour of 5-star over 4-star. Tiers with no ratings (comments, LLM-authored) are unaffected and fall through to the lexical scorer as before.
+- The lexical `scoreQuote` sentiment gate still applies on top; stars decide *eligibility*, prose decides *which* eligible quote wins.
+- `normalizeQuote` carries `rating` + `title` through onto the artifact, so the renderer can draw stars next to the quote and use the reviewer’s own headline.
+- Star ratings do **not** exist on Gemini web-wide quotes; those still rely on the lexical gate alone.
 
 ---
 

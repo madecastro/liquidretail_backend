@@ -17,6 +17,10 @@
 // NODE 18+, puppeteer ^24 already installed. No new deps.
 
 const puppeteer = require('puppeteer');
+// JSON-LD read via script.textContent keeps its character references
+// encoded (a <script> is a raw-text element) — decode human-readable
+// fields so `74&quot;` lands as `74"`.
+const { cleanScrapedText } = require('../utils/htmlEntities');
 
 // ── constants ──────────────────────────────────────────────────────
 const DEFAULT_CAP     = 200;
@@ -127,7 +131,7 @@ function mapLdProduct(node) {
     (node.handle && (node.title || node.name));
   if (!isProduct && !node.name && !node.title) return null;
 
-  const title = node.name || node.title || null;
+  const title = cleanScrapedText(node.name || node.title);
   const handle = node.handle ||
     (typeof node.url === 'string'
       ? (node.url.match(/\/products\/([^/?#]+)/i) || [])[1] || null
@@ -200,6 +204,7 @@ function mapLdProduct(node) {
     vendor = node.brand.name || node.brand['@id'] || null;
   }
   if (!vendor && node.vendor) vendor = String(node.vendor);
+  vendor = cleanScrapedText(vendor);
 
   if (!title && !handle) return null;
 
@@ -210,7 +215,7 @@ function mapLdProduct(node) {
     body_html: node.description || null,
     vendor,
     product_type: node.category
-      ? (typeof node.category === 'string' ? node.category : node.category.name || null)
+      ? cleanScrapedText(typeof node.category === 'string' ? node.category : node.category.name)
       : null,
     tags: [],
     variants: variants.length ? variants : [{
@@ -253,7 +258,7 @@ function mapHydrationProduct(node) {
   if (!node || typeof node !== 'object') return null;
 
   const handle = node.handle || node.productHandle || node.product_handle || null;
-  const title = node.title || node.name || null;
+  const title = cleanScrapedText(node.title || node.name);
   if (!handle && !title) return null;
 
   let tags = node.tags;
@@ -373,8 +378,9 @@ function mapHydrationProduct(node) {
     handle: handle || null,
     title,
     body_html: node.body_html || node.descriptionHtml || node.description || null,
-    vendor: node.vendor || node.brand || null,
-    product_type: node.product_type || node.productType || node.type || null,
+    vendor: cleanScrapedText(node.vendor || node.brand)
+      || (node.brand && typeof node.brand === 'object' ? cleanScrapedText(node.brand.name) : null),
+    product_type: cleanScrapedText(node.product_type || node.productType || node.type),
     tags,
     variants: variants.length ? variants : [{
       price: '0.00',
