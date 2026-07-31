@@ -13,6 +13,7 @@
 // the artifact came from cache instead of an LLM call.
 
 const CostLog = require('../models/CostLog');
+const alerts  = require('./alertService');
 
 // Best-effort per-model rates (USD per 1M tokens). Sourced from provider
 // pricing pages 2026 mid-year; refresh as pricing changes. Used only for
@@ -38,6 +39,12 @@ const MODEL_RATES = Object.freeze({
   'openai/gpt-5.4':              { input: 2.50,  output: 15.00, cachedInput: 0.25 },
   'google/gemini-2.5-flash':     { input: 0.30,  output: 2.50,  cachedInput: 0.075 },
   'google/gemini-2.5-pro':       { input: 1.25,  output: 10.00, cachedInput: 0.31 },
+  // Director role as of 2026-07-31. Rates read from the live Atlas catalog
+  // (price.actual input_price/output_price), not the vendor list price. Without an
+  // entry here every director call ledgers $0 — the role would be invisible in
+  // spend reports precisely when we have just started paying for it.
+  'anthropic/claude-sonnet-5-ccmax': { input: 2.00,  output: 10.00, cachedInput: 0.20 },
+  'anthropic/claude-opus-5-ccmax':   { input: 5.00,  output: 25.00, cachedInput: 0.50 },
   'anthropic/claude-sonnet-4.6': { input: 3.00,  output: 15.00, cachedInput: 0.30 },
   // Flash-tier models used/benchmarked for the 'review-text' role
   // (atlasModelMap). Rates from the live Atlas catalog 2026-07-27. The
@@ -109,7 +116,49 @@ async function recordFlatCost(meta) {
   await persistCost({ status: 'ok', ...meta, costUsd: meta.costUsd || 0 });
 }
 
+/**
+ * Replace an estimated cost with the provider's authoritative figure.
+ *
+ * Atlas publishes `price` on the prediction, but the render path returns as soon
+ * as status flips to completed, so the row can be written before that value is
+ * readable. This updates in place, keyed on the prediction id.
+ *
+ * Deliberately narrow: only ever upgrades 'estimated' -> 'actual'. It will not
+ * touch a row already marked actual, so a late duplicate call cannot corrupt a
+ * good figure, and it never creates a row (a missing row means the write failed
+ * and inventing one here would hide that).
+ */
+async function reconcileCost({ providerRequestId, costUsd }) {
+  if (!providerRequestId || !Number.isFinite(Number(costUsd))) return false;
+  try {
+    const res = await CostLog.updateOne(
+      { providerRequestId, costSource: 'estimated' },
+      { $set: { costUsd: Number(costUsd), costSource: 'actual' } }
+    );
+    const n = res.modifiedCount ?? res.nModified ?? 0;
+    if (n) console.log(`   💲 cost reconciled ${providerRequestId} -> $${Number(costUsd).toFixed(6)} (actual)`);
+    return !!n;
+  } catch (err) {
+    console.warn(`   ⚠️  cost reconcile failed for ${providerRequestId}: ${err.message}`);
+    return false;
+  }
+}
+
 async function persistCost(record) {
+  // Normalise the outcome BEFORE validation. An unrecognised status used to fail
+  // mongoose validation, and the catch below swallowed it, so the entire cost row
+  // vanished — the dollars, the model, the duration, everything. Coerce instead,
+  // preserving the original value in errorMessage so nothing is lost.
+  const raw = record.status || 'ok';
+  const known = CostLog.COST_STATUSES.includes(raw);
+  const status = known ? raw : 'error';
+  const errorMessage = known
+    ? (record.errorMessage || null)
+    : [`unmapped status "${raw}"`, record.errorMessage].filter(Boolean).join(' — ');
+  if (!known) {
+    console.error(`   ❌ costTracker: unmapped status "${raw}" coerced to 'error' — add it to CostLog.COST_STATUSES`);
+  }
+
   try {
     await CostLog.create({
       stage:       record.stage,
@@ -134,12 +183,25 @@ async function persistCost(record) {
       visionImages:record.visionImages || 0,
       costUsd:     record.costUsd || 0,
       durationMs:  record.durationMs || 0,
-      status:      record.status || 'ok',
-      errorMessage:record.errorMessage || null
+      status:      status,
+      errorMessage:errorMessage,
+      providerRequestId: record.providerRequestId || null,
+      costSource:  record.costSource || (record.costUsd ? 'estimated' : 'none')
     });
   } catch (err) {
     // Never let telemetry break the pipeline. Log + continue.
-    console.warn(`   ⚠️  costTracker.persist failed: ${err.message}`);
+    // A ValidationError here means a producer and the schema have drifted, which
+    // costs us the whole row — loud, because it is a code bug, not a blip.
+    if (err?.name === 'ValidationError') {
+      console.error(`   ❌ costTracker.persist DROPPED a cost row (schema drift): ${err.message}`);
+      alerts.error({
+        title: 'Cost row dropped — CostLog schema drift',
+        detail: err.message,
+        key: 'costlog-validation'
+      }).catch(() => {});
+    } else {
+      console.warn(`   ⚠️  costTracker.persist failed: ${err.message}`);
+    }
   }
 }
 
@@ -211,6 +273,7 @@ module.exports = {
   trackLlmCall,
   recordCacheHit,
   recordFlatCost,
+  reconcileCost,
   MODEL_RATES,
   VISION_IMAGE_COST_PER_IMAGE_USD
 };

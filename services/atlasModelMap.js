@@ -65,6 +65,35 @@ const MAP = Object.freeze({
   // Overridable per deployment: ATLAS_MODEL_REVIEW_TEXT=<slug>.
   'review-text':      { atlas: 'google/gemini-2.5-flash-lite', direct: { provider: 'google', model: 'gemini-2.5-flash-lite' } },
 
+  // CREATIVE DIRECTOR role — its own logical name, deliberately NOT a repointed
+  // 'gpt-4.1'. Eleven other services share that name (NER, brand enrichment,
+  // crop refine, layout studio, canvas spec, the HTML generator, veo storyboard,
+  // subject text), and several send strict json_schema, which Atlas rejects with
+  // 400 for Anthropic models. Repointing the shared name would have switched all
+  // of them at once and broken every schema user silently.
+  //
+  // Selected by owner review of a blind bake-off (2026-07-31): three candidates
+  // each produced three concepts from one brief and seven real catalog photos,
+  // and every concept was rendered to a finished ad before judging — the JSON on
+  // its own was not a fair test. Ranking: sonnet-5 > opus-5 > gpt-5.6-terra, with
+  // terra (the incumbent) eliminated for setting the product name in all three
+  // concepts against an explicit directive and never once requesting a second
+  // reference image. Sonnet is also the cheapest Claude of the three at $2/$10
+  // per M — $0.105 per director run against $0.223 for opus.
+  //
+  // TWO CONSTRAINTS, probed live rather than assumed:
+  //  - response_format json_schema  -> HTTP 400, on text AND vision alike.
+  //    Callers MUST use json_object and validate in code.
+  //  - vision (image_url parts)     -> works; confirmed sees_image=true and a
+  //    correct colour reading. Earlier notes claiming Claude could not do vision
+  //    with structured output were wrong: strict schema is the only blocker.
+  //
+  // reasoning_effort is NOT set: the flat form 400s, and the nested
+  // reasoning:{effort} form showed no reproducible benefit on this task (the
+  // run-to-run spread at temperature 0.7 was larger than the effect). Consistency
+  // comes from the lower temperature and the validator below instead.
+  'director':         { atlas: 'anthropic/claude-sonnet-5-ccmax', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
+
   'gpt-4.1':          { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4.1' } },
   'gpt-4.1-mini':     { atlas: 'openai/gpt-5.6-luna',  direct: { provider: 'openai', model: 'gpt-4.1-mini' } },
   'gpt-4o-mini':      { atlas: 'openai/gpt-5.6-luna',  direct: { provider: 'openai', model: 'gpt-4o-mini' } },
