@@ -1887,13 +1887,26 @@ router.get('/:id/generation-inspector', async (req, res) => {
       const image = {
         aiCanvasArtifactId:    ad.aiCanvasArtifactId ? String(ad.aiCanvasArtifactId) : null,
         layoutInputArtifactId: ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null,
+        // WHICH PIPELINE actually delivered this ad, read from the same
+        // capture as imageGeneration below rather than inferred — an operator
+        // question that used to take a code-reading session ("is this the
+        // direct-image path or the old HTML fallback?") now answers itself.
+        // null means neither recorded a submission (pre-capture render, or a
+        // pipeline that makes no image-model call at all).
+        pipeline:              ad.imageGeneration?.pipeline || null,
         fontResolution:        ad.fontResolution || null,
         // THE image-model request, verbatim from the POST body at submit time.
         // Distinct from layoutPrompt below, which belongs to the *layout* LLM
         // that writes HTML — conflating the two is what made an operator read
         // "one front image" while gpt-image-2 had in fact been handed two
         // references. Never reconstructed: null means not recorded.
-        imageGeneration:       ad.imageGeneration || null
+        imageGeneration:       ad.imageGeneration || null,
+        // Which intent ran, whether it fell back, what got sacrificed to the
+        // density budget. See models/Ad.js for the full field description.
+        intentResolution:      ad.intentResolution || null,
+        // Per-stage wall time for THIS render (derive/render/upload ms) — the
+        // direct answer to "why is this one slow" without a log search.
+        renderStages:          ad.renderStages || null
       };
       if (!ad.imageGeneration) {
         // Deliberately does NOT assert a cause. An HTML/Puppeteer render makes
