@@ -3,6 +3,75 @@
 ## Next-session prompt
 _(empty — no pending owner prompt)_
 
+## Current state (2026-07-31) — static-ad correctness pass, VERIFIED LIVE
+
+Backend `main` @ PR #34. Frontend `master` @ PR #19. Everything below is
+merged, deployed, and **confirmed in a real generated ad** (not just code
+review). Five PRs this session: #28 #29 #30 #31 #35, plus frontend #18.
+
+### What was wrong, and what proved it
+An operator reported a Campus Crest T-Shirt ad carrying "Strength, in pink." /
+"Training Straight Leg Leggings". Reading the LIVE generation inspector — not
+the code — settled it: the campaign's creative brief said *"Goal: Introduce the
+Gymshark Training Straight Leg Leggings in Strength Pink"*, and the Director
+copied that product name verbatim into a t-shirt ad. It is visible in the
+rendered pixels.
+
+THREE independent cross-product vectors were found and fixed. Only the third
+explains the reported copy:
+1. `buildSeededUniverse` restrictToMediaIds mode filtered by brandId only, so
+   every product's Director round got the SAME operator-picked media (#30).
+2. `selectAdsForRun` had no product filter, so a run backfilled from the
+   campaign's oldest queued ads for OTHER products (#31, recovered from
+   `30125a1` which had sat unmerged on a branch since 28 Jul).
+3. **The campaign brief names one product and was fed to every product's
+   Director round under "concepts must serve it" (#35).** A prompt rule cannot
+   win against contradictory context — the context had to change.
+
+### Also fixed and verified
+- Inspector reported the LAYOUT LLM's inputs where operators read the image
+  model's. Now captures the real request at submit time (`Ad.imageGeneration`)
+  and renders it. Reconstruction deleted, not relabelled.
+- Direct path submitted TWO reference images; now ONE (the selected media),
+  extras opt-in via `referenceMediaIds`.
+- `deliveryLine`/`promoText` shared cascade sources → the offer painted twice,
+  and `deliveryLine` draws with a TRUCK icon so "$28" read as shipping terms.
+- Removed three fabrications: `'Ships free'`, `'53 reviews'`, `likes: 572`, and
+  the brand-level rating/reviewCount fallback that credited one $28 tee with
+  the brand's 41,000 reviews.
+- Quote is shortened ONCE (`quoteSnippetService`), rendered verbatim; ≥4.5★
+  gate; positive-sentiment + complete-thought; comments run the same path.
+- Direct-overlay failures now fail LOUD per condition (credentials=fatal,
+  missing layout=generic layout, no concept=error) instead of silently
+  switching to the HTML pipeline. No ad can ship without a concept.
+
+### Verified output (post-fix generation, same leggings-naming brief)
+`SENT TO THE IMAGE MODEL: 1 image · openai/gpt-image-2/edit · seed-media`;
+headline "MEET THE NEW ESSENTIAL"; quote 43 chars complete; deliveryLine
+"Top Rated" != promoText "Just $22"; likes/reviewsText/rating all absent.
+
+### MISTAKE TO NOT REPEAT
+I pointed a new `quote-snippet` role at `openai/gpt-5-nano` after confirming it
+was LISTED in the Atlas catalog. It is **listed but NOT routable** — HTTP 400
+"router not found" — so every snippet call would have silently degraded to
+mechanical truncation. PR #34's benchmark caught it and moved the role to
+`google/gemini-2.5-flash-lite`. Verify a model ROUTES, not just that it exists.
+
+## Open queue (owner-directed 2026-07-31, in his priority order)
+1. **Generate Ads wizard does not scope to the clicked product** — clicking
+   Generate Ads on a product row opens the wizard with a STALE selection (the
+   URL carries only campaignId). One click from billing the wrong product.
+   FIX FIRST.
+2. **Status messages must be accurate and data-rich.** A run that queues
+   nothing shows "Preparing creatives…" forever with no error or timeout.
+   Owner wants the whole run watched end-to-end and every status audited.
+3. **Stories and Feed must be separate templates.** `isReels` matches only
+   `meta_reels_9_16`, so `meta_stories_9_16` falls into the Feed output-shape
+   branch and gets NO archetype weighting. Owner: every surface deserving
+   unique template treatment gets its own template.
+4. Category-tier quotes + brand comments are acceptable to the owner ONLY when
+   accurate and when no product-specific positive quote exists.
+
 ## Current state (2026-07-30) — static-ad diagnostics, PR #28 OPEN
 
 Branch **`fix/truthful-image-gen-details`** → [PR #28](https://github.com/Emami-RS-Project/liquidretail_backend/pull/28)
