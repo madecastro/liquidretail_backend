@@ -389,13 +389,49 @@ router.post('/generate', async (req, res) => {
           return;
         }
 
+        // ATOMIC CLAIM. `status: 'queued'` in the filter is load-bearing and
+        // is what makes this a claim rather than an announcement.
+        //
+        // selectAdsForRun reads queued ads, and this write marked them
+        // rendering — with no status condition. Between the read and the write
+        // another Generate could select the SAME ad and claim it too, and both
+        // runs would then render it. Atlas bills image generation ON SUBMIT, so
+        // that is a straight double charge for one ad, with the second result
+        // overwriting the first. Two operators pressing Generate at once, or a
+        // double-clicked button, is all it took.
+        //
+        // Conditioning on 'queued' means the loser's update matches nothing for
+        // that ad, so exactly one run can own it.
         await Ad.updateMany(
-          { _id: { $in: adIds } },
+          { _id: { $in: adIds }, status: 'queued' },
           {
             $addToSet: { campaignRunIds: runId },
             $set:      { status: 'rendering', updatedAt: new Date() }
           }
         );
+
+        // Re-read what we ACTUALLY won. updateMany's modifiedCount cannot tell
+        // us WHICH ids were claimed, and rendering an ad this run does not own
+        // is the double-charge we just closed.
+        const claimed = await Ad.find({ _id: { $in: adIds }, status: 'rendering', campaignRunIds: runId })
+          .select('_id')
+          .lean();
+        const claimedIds = claimed.map(a => a._id);
+        if (claimedIds.length !== adIds.length) {
+          console.warn(
+            `⚠️  [campaignRun ${runId}] claimed ${claimedIds.length}/${adIds.length} ad(s) — ` +
+            `the rest were taken by a concurrent run`
+          );
+        }
+        adIds = claimedIds;
+        if (!adIds.length) {
+          await CampaignRun.updateOne(
+            { _id: run._id },
+            { status: 'done', completedAt: new Date(),
+              $push: { errors: { index: 0, stage: 'select', message: 'All selected ads were claimed by a concurrent run' } } }
+          );
+          return;
+        }
 
         await CampaignRun.updateOne(
           { _id: run._id },
@@ -740,6 +776,35 @@ async function runRenderLoop(run, job, adIds, renderToken) {
 }
 
 async function renderOne(run, job, adId, index, renderToken) {
+  // HEARTBEAT — this is a money guard, not telemetry.
+  //
+  // worker.js's reaper flips any Ad sitting in 'rendering' with
+  // updatedAt older than REAP_STALE_MIN (15m) back to 'queued', on the
+  // reasoning that a process died holding it. But nothing was refreshing
+  // updatedAt during a render: it was stamped once at claim time, so the
+  // clock ran against the ad's TOTAL render duration rather than against
+  // its silence. A legitimately slow render — the image plate alone is
+  // allowed 600s, and the Director, canvas spec and proof judge all run
+  // before it — could cross 15 minutes, get reaped while its Atlas call
+  // was still in flight, and be re-submitted by the next Generate.
+  // Atlas bills on submit, so that is a second charge for an image we had
+  // already paid for and then discarded.
+  //
+  // Touching updatedAt every 60s makes the reaper's "hasn't moved in 15
+  // minutes" mean what it says: still claimed, still alive.
+  const heartbeat = setInterval(() => {
+    Ad.updateOne({ _id: adId, status: 'rendering' }, { $set: { updatedAt: new Date() } })
+      .catch(() => {});   // a missed beat is survivable; the next one lands
+  }, 60_000);
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
+  try {
+    return await renderOneInner(run, job, adId, index, renderToken);
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
+async function renderOneInner(run, job, adId, index, renderToken) {
   // Fetch the queued Ad doc and shape it into the request the
   // render service expects. The doc carries everything the old
   // in-memory creative descriptor used to provide.
@@ -1023,7 +1088,19 @@ async function renderOne(run, job, adId, index, renderToken) {
       {
         $set: {
           status:      'failed',
-          renderError: { message: err.message || String(err), stage: 'crash', at: new Date() },
+          // Carry the billing tags. An unexpected throw AFTER a charged Atlas
+          // submit is exactly the case where the recovery handle matters most,
+          // and this path recorded only the message — so the one crash that
+          // cost money looked identical to one that cost nothing.
+          // `err.cause` is read too: wrappers put the tags there.
+          renderError: {
+            message:      err.message || String(err),
+            stage:        'crash',
+            at:           new Date(),
+            predictionId: err.predictionId || err.cause?.predictionId || null,
+            charged:      err.charged === true || err.cause?.charged === true,
+            atlasCode:    err.atlasCode ?? err.cause?.atlasCode ?? null
+          },
           updatedAt:   new Date()
         },
         $inc: { renderAttempts: 1 }
