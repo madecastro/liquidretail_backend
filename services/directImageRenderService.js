@@ -24,7 +24,22 @@ const PLATE_T2I_MODEL = process.env.AI_DIRECT_IMAGE_MODEL || 'openai/gpt-image-2
 // latency and is unnecessary for the plate because Sharp performs the final
 // crop, typography, logo, and export.
 const PLATE_QUALITY = process.env.AI_DIRECT_IMAGE_QUALITY || 'medium';
-const PLATE_TIMEOUT_MS = Number(process.env.AI_DIRECT_IMAGE_TIMEOUT_MS || 60_000);
+// MEASURED, 2026-07-31: a real openai/gpt-image-2/edit call with exactly the
+// payload this service sends (1 reference, 1024x1024, quality medium) took
+// **69.7s** end to end — status 'processing' at every poll through t=62.7s,
+// 'completed' at t=69.7s.
+//
+// The previous 60s bound therefore sat BELOW the model's typical latency. It
+// did not merely fail slow renders; it failed most of them, and intermittently
+// — an identical batch rendered fine earlier the same day, because latency
+// straddles the boundary. Worse, Atlas bills on submit and a poll timeout is
+// marked `charged`, so every one of those paid for an image that finished a
+// few seconds after we stopped listening, then threw it away.
+//
+// 180s keeps the call bounded (the point of the original limit) while sitting
+// clear of the measured floor plus load variance. Tune with
+// AI_DIRECT_IMAGE_TIMEOUT_MS; re-measure before lowering it.
+const PLATE_TIMEOUT_MS = Number(process.env.AI_DIRECT_IMAGE_TIMEOUT_MS || 180_000);
 const REFERENCE_TIMEOUT_MS = Number(process.env.AI_DIRECT_REFERENCE_TIMEOUT_MS || 15_000);
 const UPLOAD_TIMEOUT_MS = Number(process.env.AI_DIRECT_UPLOAD_TIMEOUT_MS || 20_000);
 
