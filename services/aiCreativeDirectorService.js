@@ -24,6 +24,7 @@ const { ROLES, COMPONENT_STYLE_BY_ROLE } = require('./aiVocabulary');
 const { trackLlmCall, recordCacheHit } = require('./costTracker');
 
 const { chatCompletion } = require('./atlasLlmService');
+const { usableProofCommentsOrNone } = require('./quoteSnippetService');
 
 // ── Tunables ─────────────────────────────────────────────────────────
 
@@ -255,10 +256,13 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   if (matchedMediaIds.length) {
     try {
       const Comment = require('../models/Comment');
+      // Over-fetched because the judge below narrows this; see the note at the
+      // topComments mapping. Selecting proofJudgment lets already-judged rows
+      // cost nothing.
       topCommentsAcrossMedia = await Comment.find({ mediaId: { $in: matchedMediaIds } })
         .sort({ likeCount: -1, postedAt: -1 })
-        .limit(5)
-        .select('author authorUsername text content likeCount mediaId')
+        .limit(30)
+        .select('author authorUsername text content likeCount mediaId proofJudgment')
         .lean();
     } catch (_) { /* Comment model unavailable in some envs */ }
   }
@@ -413,8 +417,15 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     ? brandReviewSource
     : null;
 
-  const topComments = topCommentsAcrossMedia.slice(0, 2).map(c => ({
-    text:   snippetText(c.text || c.content, 180),
+  // JUDGED, not raw. The Director was handed the most-liked comments verbatim,
+  // truncated to 180 chars, with no sentiment screen of any kind — so a
+  // complaint could seed the concept that the whole ad is then built around,
+  // and `social_proof_type: "creator"` could be chosen on the strength of it.
+  // Every other comment surface screens; this one, the most upstream and
+  // therefore the most consequential, did not.
+  const judgedComments = await usableProofCommentsOrNone(topCommentsAcrossMedia, { brandId, productId }, 'director');
+  const topComments = judgedComments.slice(0, 2).map(c => ({
+    text:   c.proofLine,
     author: c.author || c.authorUsername || null,
     likes:  c.likeCount ?? null
   })).filter(c => c.text);

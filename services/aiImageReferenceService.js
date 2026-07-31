@@ -377,13 +377,19 @@ async function loadProofData({ product, media }) {
     // the Layout Generator. Best-effort: Comment model might not be
     // populated yet for a given UGC post.
     try {
+      // Over-fetch, then take the judged ones. A raw 180-char slice of the
+      // three most-liked comments went straight into the image-model reference
+      // context — no sentiment screen, and cut mid-word. Same ingest verdict
+      // every other comment surface reads.
       const rows = await Comment.find({ mediaId: media._id })
         .sort({ likeCount: -1, postedAt: -1 })
-        .limit(3)
-        .select('author authorUsername text content likeCount')
+        .limit(25)
+        .select('author authorUsername text content likeCount proofJudgment')
         .lean();
-      out.topComments = rows.map(c => ({
-        text:   String(c.text || c.content || '').slice(0, 180),
+      const { usableProofCommentsOrNone } = require('./quoteSnippetService');
+      const usable = await usableProofCommentsOrNone(rows, { brandId: media.brandId || null }, 'imageReference');
+      out.topComments = usable.slice(0, 3).map(c => ({
+        text:   c.proofLine,
         author: c.author || c.authorUsername || null,
         likes:  c.likeCount ?? null
       })).filter(c => c.text);

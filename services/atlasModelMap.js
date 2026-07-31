@@ -35,12 +35,17 @@ const MAP = Object.freeze({
   // actual quoteSnippetService schema and prompt, scored on hard failures,
   // off-product snippets, non-verbatim output, cost and latency:
   //
-  //   google/gemini-2.5-flash-lite  0 fail  0 off  0 non-verbatim  $0.000012   851ms  ← chosen
-  //   openai/gpt-5.6-luna           0 fail  0 off  0 non-verbatim  $0.000195  1245ms
-  //   bytedance/doubao-1.6-flash    0 fail  0 off  0 non-verbatim  $0.000406 15526ms
-  //   anthropic/claude-haiku-4.5    1 fail  0 off  5/6 NON-VERBATIM $0.000124 1223ms
-  //   openai/gpt-5-nano             HTTP 400 "router not found" — listed, not routable
-  //   qwen/qwen3.5-flash            HTTP 400 on strict json_schema
+  // Slugs below are the exact routable catalog ids, so an operator can paste
+  // one straight into ATLAS_MODEL_REVIEW_TEXT and still match a MODEL_RATES
+  // entry in costTracker — an abbreviated slug resolves to no price and logs
+  // the call at $0.
+  //
+  //   google/gemini-2.5-flash-lite         0 fail 0 off 0 non-verbatim  $0.000012   851ms  ← chosen
+  //   openai/gpt-5.6-luna                  0 fail 0 off 0 non-verbatim  $0.000195  1245ms
+  //   bytedance/doubao-seed-1.6-flash-250828  0 fail 0 off 0 non-verbatim  $0.000406 15526ms
+  //   anthropic/claude-haiku-4.5-20251001  1 fail 0 off 5/6 NON-VERBATIM $0.000124 1223ms
+  //   openai/gpt-5-nano                    HTTP 400 "router not found" — listed, not routable
+  //   qwen/qwen3.5-flash                   HTTP 400 on strict json_schema
   //
   // 16x cheaper and 1.5x faster than the luna it replaces, with identical
   // correctness on the sample.
@@ -66,14 +71,16 @@ const MAP = Object.freeze({
   'gpt-4o':           { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4o' } },
   'gemini-2.5-flash': { atlas: 'google/gemini-2.5-flash', direct: { provider: 'google', model: 'gemini-2.5-flash' } },
   'gemini-2.5-pro':   { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
-  // Extract one short phrase from one short review. Tiny in, ~60 tokens out,
-  // strict json_schema, no reasoning. It was riding the 'gpt-4o-mini' role,
-  // which maps to gpt-5.6-luna at $1.00/$6.00 per 1M — 20x the input and 15x
-  // the output of the nano tier for a task that is a substring search with
-  // taste. Prices verified against the live Atlas catalog 2026-07-30.
-  // Direct fallback stays on gpt-4o-mini: a known-good OpenAI model name, and
-  // this role only reaches it if Atlas is unavailable.
-  'quote-snippet':    { atlas: 'openai/gpt-5-nano',       direct: { provider: 'openai', model: 'gpt-4o-mini' } },
+  // NO 'quote-snippet' ROLE — deliberately removed, do not re-add it.
+  // It mapped to openai/gpt-5-nano, which the benchmark above records as
+  // HTTP 400 "router not found": listed in the catalog, not routable. A role
+  // is only reachable by name, so the entry sat here inert while the one
+  // caller that would have used it (quoteSnippetService) had already been
+  // pointed at 'review-text'. Leaving a role wired to a model that 400s is a
+  // trap — the next caller to reach for the obvious name gets a silent
+  // degrade to mechanical truncation, and gpt-5-nano has no MODEL_RATES entry
+  // either, so the failure would not even show up as cost.
+  // Review-text work goes through 'review-text'.
 });
 
 function envKeyFor(role) {

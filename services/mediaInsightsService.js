@@ -22,6 +22,7 @@ const Media = require('../models/Media');
 const Comment = require('../models/Comment');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const { decrypt } = require('./integrationCryptoService');
+const { ensureCommentsJudged } = require('./quoteSnippetService');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -131,6 +132,27 @@ async function fetchCommentsForMedia(mediaId) {
     url = nextUrl;
     params = undefined; // next URL already carries access_token
     pages++;
+  }
+
+  // Judge the newly-ingested comments for ad usability now, while we are
+  // already in a background job, rather than making the first ad that wants
+  // one pay the latency. One batched inference call for the whole page — see
+  // services/quoteSnippetService.judgeProofLines and docs/PROOF_JUDGE.md.
+  //
+  // A failure here does NOT fail the fetch: the comments are stored and
+  // correct, they simply have no verdict yet, and the read path judges
+  // un-judged rows lazily. The judge itself has already alerted.
+  if (upserted) {
+    try {
+      const fresh = await Comment.find({ mediaId: media._id, 'proofJudgment.usable': { $exists: false } })
+        .select('text proofJudgment')
+        .lean(false);
+      if (fresh.length) {
+        await ensureCommentsJudged(fresh, { brandId: media.brandId });
+      }
+    } catch (err) {
+      console.warn(`⚠️  comment proof-judge at ingest failed (${err.message}) — verdicts deferred to read path`);
+    }
   }
 
   // Sync the comment count on Media so it stays consistent with the

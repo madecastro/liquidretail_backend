@@ -520,32 +520,28 @@ function rectPctToCanvas(r) {
 async function loadTopComments(mediaId, n) {
   try {
     const C = require('../models/Comment');
+    // Over-fetch, THEN narrow by the judge, then take n. Limiting to n first
+    // and screening after returned nothing whenever a post's n most-liked
+    // comments were noise or complaints, even with clean praise just below the
+    // cut — the screen could only ever shrink an already-truncated list.
     const rows = await C.find({ mediaId })
       .sort({ likeCount: -1, postedAt: -1 })
-      .limit(n)
-      .select('author authorUsername text content likeCount postedAt')
+      .limit(Math.max(n * 8, 25))
+      .select('author authorUsername text content likeCount postedAt proofJudgment')
       .lean();
-    // Same treatment as review quotes and the layoutInput comment path: only
-    // praise, and shortened once by extractSnippet into a self-contained
-    // thought on a whole word. This used to be a raw 200-char slice, which is
-    // both over the 60-char proof ceiling and a cut mid-word — and it applied
-    // no sentiment gate at all, so a complaint could be rendered as proof.
-    const { extractSnippet, PROOF_LINE_MAX_CHARS } = require('./quoteSnippetService');
-    const { hasPositiveSignal } = require('./layoutInputService');
-    const out = [];
-    for (const c of rows) {
-      const raw = (c.text || c.content || '').trim();
-      if (!raw || !hasPositiveSignal(raw)) continue;
-      const snippet = await extractSnippet(raw);
-      if (!snippet || snippet.length > PROOF_LINE_MAX_CHARS) continue;
-      out.push({
-        author:  c.author || c.authorUsername || null,
-        text:    snippet,
-        likes:   c.likeCount ?? null,
-        posted_at: c.postedAt || null
-      });
-    }
-    return out;
+    // The ingest judgment — inference over the whole sentence — is the single
+    // source of truth for whether a comment may be printed, shared with
+    // layoutInputService and the Director. It replaces a lexical gate here that
+    // accepted any comment containing a positive word, and a second
+    // extractSnippet call that re-shortened text the judge had already sized.
+    const { usableProofCommentsOrNone } = require('./quoteSnippetService');
+    const usable = await usableProofCommentsOrNone(rows, {}, 'canvasInputBuilder');
+    return usable.slice(0, n).map(c => ({
+      author:    c.author || c.authorUsername || null,
+      text:      c.proofLine,
+      likes:     c.likeCount ?? null,
+      posted_at: c.postedAt || null
+    }));
   } catch (_) {
     return [];   // Comment model optional — UGC ingestion may not have populated it yet
   }
