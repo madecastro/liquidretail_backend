@@ -1433,16 +1433,30 @@ router.get('/meta-adsets', async (req, res) => {
 router.get('/render-activity', async (req, res) => {
   try {
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
-    const filter = {};
-    // mongoose.isValidObjectId rather than a local helper: routes/ads.js has no
-    // toObjectId, and casting an invalid id would throw inside find() instead of
-    // returning an empty board.
-    if (req.query.brandId && mongoose.isValidObjectId(String(req.query.brandId))) {
-      filter.brandId = new mongoose.Types.ObjectId(String(req.query.brandId));
+
+    // TENANT SCOPING — brandId is REQUIRED and verified, matching GET /api/ads.
+    //
+    // This board originally queried Ad with no tenant filter at all, which would
+    // have let any authenticated user read EVERY advertiser's assets: prompts,
+    // prediction ids, Cloudinary URLs, product and campaign ids. A cross-tenant
+    // data leak, on a diagnostic endpoint, is not an acceptable trade for
+    // convenience.
+    //
+    // Ad carries brandId and not advertiserId, so the generic tenantFilter()
+    // does not apply; a brand belongs to exactly one advertiser, so an
+    // assertBrandInTenant'd brandId IS the scope. Same reasoning and same
+    // helper as the ads list route.
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    try {
+      await assertBrandInTenant(brandId, req);
+    } catch (e) {
+      if (e.status === 404) return res.status(404).json({ error: e.message });
+      throw e;
     }
+
+    const filter = { brandId };
     if (req.query.runId)    filter.campaignRunIds = String(req.query.runId);
-    // Default view is "things that are live or recently finished", which is what
-    // an operator watching a generation actually wants.
     if (req.query.status)   filter.status = String(req.query.status);
 
     const ads = await Ad.find(filter)
