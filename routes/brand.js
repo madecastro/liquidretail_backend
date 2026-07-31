@@ -10,6 +10,7 @@ const Campaign = require('../models/Campaign');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const { validateVideoSettings } = require('../services/atlasVideoService');
+const { normalizeStaticPipelineInput, resolveStaticPipeline, STATIC_PIPELINES } = require('../services/staticPipeline');
 // Single source of truth for titling format ids — was duplicated as a literal
 // ['vertical','feed','landscape'] in five places in this file, which is how adding
 // 'square' nearly shipped as a silent fall-through to 'feed'. Import it; do not
@@ -288,9 +289,15 @@ router.patch('/:id', express.json(), async (req, res) => {
                       'metaCascades', 'staticImagePipeline'];
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'staticImagePipeline')) {
-      const pipeline = String(req.body.staticImagePipeline || '').trim();
-      if (!['direct_overlay', 'html'].includes(pipeline)) {
-        return res.status(400).json({ error: "staticImagePipeline must be 'direct_overlay' or 'html'" });
+      // Normalised through the one canonical resolver rather than a local list, so
+      // this route, the Brand enum and the renderer cannot drift. It also absorbs
+      // the retired 'direct_overlay' from a frontend build that predates the
+      // rename, storing it as 'direct_image' instead of 400-ing a working client.
+      const pipeline = normalizeStaticPipelineInput(req.body.staticImagePipeline);
+      if (!pipeline) {
+        return res.status(400).json({
+          error: `staticImagePipeline must be one of: ${STATIC_PIPELINES.join(', ')}`
+        });
       }
       req.body.staticImagePipeline = pipeline;
     }
@@ -2608,7 +2615,7 @@ function serializeBrand(b) {
     websiteBackground: b.websiteBackground || null,
     fontFamily:   b.fontFamily || null,
     fontSource:   b.fontSource || null,
-    staticImagePipeline: b.staticImagePipeline || 'direct_overlay',
+    staticImagePipeline: resolveStaticPipeline(b.staticImagePipeline),
     tone:         b.tone || [],
     hashtags:     b.hashtags || [],
     tags:         b.tags || [],
