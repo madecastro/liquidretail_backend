@@ -50,7 +50,14 @@ const costLogSchema = new mongoose.Schema({
   durationMs:   { type: Number, default: 0 },
 
   // Outcome
-  status:       { type: String, enum: ['ok', 'error', 'timeout'], default: 'ok' },
+  // 'rejected'         — the provider refused the request outright (4xx envelope)
+  // 'rejected-billing' — refused for balance/quota specifically
+  //
+  // atlasImageService records both, but they were missing from this enum, so
+  // mongoose validation failed and the cost row was silently DROPPED. Every
+  // provider rejection — including a 402 insufficient-balance, the one you most
+  // want to see in the ledger — was invisible.
+  status:       { type: String, enum: ['ok', 'error', 'timeout', 'rejected', 'rejected-billing'], default: 'ok' },
   errorMessage: { type: String, default: null },
 
   createdAt:    { type: Date, default: Date.now, index: true }
