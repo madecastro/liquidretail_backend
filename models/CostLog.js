@@ -19,7 +19,19 @@ const mongoose = require('mongoose');
 
 // Single source of truth for outcome values, exported so producers and the
 // persist layer cannot drift from the schema.
-const COST_STATUSES = ['ok', 'error', 'timeout', 'rejected', 'rejected-billing', 'failed', 'charged-no-output'];
+// 'submitted' — the CHARGE-POINT record. Atlas bills video on submit, so
+// atlasVideoService writes this row the moment money is spent, deliberately
+// before the poll resolves (see the comment at atlasVideoService.js:2612 — a
+// bookkeeping failure must never fail a generation post-payment). It means
+// "billed, outcome not yet known", NOT a failure.
+//
+// It was missing from this list, so costTracker's unmapped-status guard coerced
+// every one of them to 'error' and logged a loud ❌. Measured on prod
+// 2026-07-31: 6 rows/hour, every successful $1.00 video render recorded as an
+// error. Nothing was lost (the guard records rather than drops — that was the
+// PR #43 fix), but spend-by-status was reading as though video was failing
+// constantly while it was in fact succeeding.
+const COST_STATUSES = ['ok', 'error', 'timeout', 'rejected', 'rejected-billing', 'failed', 'charged-no-output', 'submitted'];
 
 const costLogSchema = new mongoose.Schema({
   // Provenance — what was being generated

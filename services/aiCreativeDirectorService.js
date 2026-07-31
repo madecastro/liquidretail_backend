@@ -1447,7 +1447,21 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `- The ${N_CONCEPTS_ROUND} concepts MUST be meaningfully different — different archetype OR different media-pick combination OR different output_shape OR different copy angle.`,
     `- Lead with the STRONGEST signal in the data.`,
     `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself.`,
-    `- MEDIA PICKS: every media_id you reference in media_picks MUST appear in the SEEDED UNIVERSE block below. Pick by media_id verbatim. role is a short label describing how the media sits in your composition. Pick 1-4 media per concept; Reels picks 1 video (preferred) or 1-4 image references for Veo synthesis.`,
+    // The pick ceiling is derived from the universe actually supplied, not
+    // hardcoded. It used to always say "1-4" even when the universe held a
+    // single hero, which asks for a multi-image composition that cannot be
+    // built — and, worse, the static renderer honours only ONE reference today,
+    // so any extra pick was silently discarded and the concept described an ad
+    // that was never produced. Saying "exactly 1" when there is 1 keeps the
+    // brief and the render truthful about each other.
+    (() => {
+      const n = Array.isArray(seededUniverse) ? seededUniverse.length : 0;
+      const ceiling = Math.min(4, Math.max(1, n));
+      const pickPhrase = ceiling === 1
+        ? `Pick EXACTLY 1 media per concept — the universe below holds a single hero image and the static renderer composes from one reference.`
+        : `Pick 1-${ceiling} media per concept.`;
+      return `- MEDIA PICKS: every media_id you reference in media_picks MUST appear in the SEEDED UNIVERSE block below. Pick by media_id verbatim. role is a short label describing how the media sits in your composition. ${pickPhrase} Reels picks 1 video (preferred) or 1-4 image references for Veo synthesis.`;
+    })(),
     `- [CRITICAL] The SEEDED UNIVERSE is PRE-RANKED by shot-type quality: lifestyle > on_model > flat_lay > product_only > detail > packaging. Earlier entries are BETTER seeds for animation and stronger composition anchors — STRONGLY prefer them for media_picks[0]. Only reach for lower-ranked entries when a specific concept archetype requires that shot type (e.g. product_card_grid can use flat_lay/product_only intentionally, hero_quote_overlay wants lifestyle/on_model).`,
     platformFormat === 'meta_reels_9_16'
       ? `- OUTPUT SHAPE (Reels): format MUST be "reels_storyboard". duration_sec ∈ [${REELS_DURATION_MIN_SEC}, ${REELS_DURATION_MAX_SEC}] (Veo native clip range). storyboard_beats is an array of overlay timing events Puppeteer renders as transparent PNGs and Cloudinary composites onto Veo's base video. Each beat: { t_start (seconds), t_end, role ∈ ${STORYBOARD_BEAT_ROLES.join('|')}, position ∈ ${STORYBOARD_POSITIONS.join('|')}, emphasis ∈ ${STORYBOARD_EMPHASIS.join('|')} }. Beats may overlap. Honor the Reels safe zones in your position picks (top reserved 0-220px, bottom reserved 1558-1778px — use middle positions for chrome that needs to be visible past IG/FB UI).`

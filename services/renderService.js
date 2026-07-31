@@ -72,7 +72,7 @@ async function renderCreative(req) {
   // Load the queued Ad doc up front. identityDigest is needed for the
   // upload filename so re-renders of the same (campaign, identity)
   // overwrite the existing Cloudinary asset rather than orphaning.
-  const adDoc = req.adId ? await Ad.findById(req.adId).select('identityDigest referenceMediaIds').lean() : null;
+  const adDoc = req.adId ? await Ad.findById(req.adId).select('identityDigest referenceMediaIds mediaIds').lean() : null;
   const identityDigest = adDoc?.identityDigest || null;
   const stages = {};
   const t0 = Date.now();
@@ -171,10 +171,37 @@ async function renderCreative(req) {
       // Null on legacy Ads → existing behavior.
       adConceptArtifactId: req.adConceptArtifactId || null,
       adConceptId:         req.adConceptId         || null,
-      // The operator's explicit ordered image picks. Empty for most ads,
-      // where the static path deliberately sends ONE reference — see
-      // directImageRenderService. The video path already reads this.
-      referenceMediaIds:   Array.isArray(adDoc?.referenceMediaIds) ? adDoc.referenceMediaIds : []
+      // The ordered reference stack, position 0 = primary.
+      //
+      // TWO sources, in precedence order, and the fallback is the fix for a real
+      // gap: the operator's explicit picks (Ad.referenceMediaIds, written by
+      // expandDeterministicVideo) win when present; otherwise the DIRECTOR's
+      // concept picks (Ad.mediaIds) are used.
+      //
+      // Without that fallback the concept-driven static path sent exactly one
+      // reference no matter what the Director chose. concept.media_picks is
+      // persisted to Ad.mediaIds by runConceptDrivenExpansion, but this call
+      // only ever read Ad.referenceMediaIds — which that path never writes — so
+      // renderDirectImage received [] and fell back to the single seed media.
+      // Every pick past the first was silently discarded: the Director composed
+      // for a multi-image ad and the renderer built a different, single-image
+      // one. Verified on prod, where 8 consecutive static renders logged
+      // `refs=1` regardless of concept.
+      //
+      // Kept as a FALLBACK rather than a merge on purpose. An operator who
+      // explicitly ordered a stack means that stack, and quietly appending the
+      // Director's picks to it would spend money on references they deselected.
+      referenceMediaIds:
+        (Array.isArray(adDoc?.referenceMediaIds) && adDoc.referenceMediaIds.length)
+          ? adDoc.referenceMediaIds
+          : (Array.isArray(adDoc?.mediaIds) ? adDoc.mediaIds : []),
+      // Carried so the per-reference role labels (and therefore the inspector)
+      // name the real chooser instead of crediting the Director's picks to the
+      // operator.
+      referenceSource:
+        (Array.isArray(adDoc?.referenceMediaIds) && adDoc.referenceMediaIds.length)
+          ? 'operator'
+          : 'director'
     });
     stages.render = Date.now() - t;
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB, mode=static)`);

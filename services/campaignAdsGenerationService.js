@@ -142,6 +142,17 @@ const MAX_ADS_PER_GENERATION_RUN = Math.max(1, parseInt(process.env.MAX_ADS_PER_
 // still produces 30 ads. Top picks by readinessScore within each
 // productId group; brand-only seeds (productId=null) form one group.
 const ADS_PER_PRODUCT_CAP     = Math.max(1, parseInt(process.env.ADS_PER_PRODUCT_CAP,     10) || 3);
+// How many candidate images the Director sees when the operator picked none.
+//
+// The renderer now honours the Director's full pick list (renderService threads
+// Ad.mediaIds through when there is no explicit operator stack), so a wider
+// universe genuinely produces multi-reference ads instead of silently
+// discarding every pick past the first.
+//
+// Set DIRECTOR_UNIVERSE_TOP_N=1 to get the single-hero behaviour: the Director
+// sees one image, picks it, and the composition matches the reference exactly.
+// That is a one-value flip and needs no code change.
+const DIRECTOR_UNIVERSE_TOP_N = Math.max(1, parseInt(process.env.DIRECTOR_UNIVERSE_TOP_N, 10) || 10);
 const VEO_ADS_PER_PRODUCT_CAP = Math.max(1, parseInt(process.env.VEO_ADS_PER_PRODUCT_CAP, 10) || 1);
 
 // Composite product popularity. Primary signal: how many UGC posts
@@ -2104,11 +2115,24 @@ async function runConceptDrivenExpansion({
       // because Veo's image-to-video mode bakes overlay text into the
       // generated video (which we can't remove later). Text-free seeds
       // ranked first; text-burned only used if nothing else exists.
+      // Universe size. Operator picks, when present, ARE the universe —
+      // restrictToMediaIds constrains the pool to exactly what they chose and
+      // topN widens to fit, so a 5-image selection is never truncated to 1.
+      //
+      // Absent picks, the Director sees DIRECTOR_UNIVERSE_TOP_N candidates and
+      // its chosen subset now actually reaches the renderer (see the
+      // referenceMediaIds fallback in renderService). Set that env to 1 for
+      // single-hero behaviour.
+      const operatorPickedMedia = Array.isArray(mediaIds) && mediaIds.length > 0;
+      const universeTopN = operatorPickedMedia
+        ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
+        : DIRECTOR_UNIVERSE_TOP_N;
       const { universe, seedUniverseHash, counts } =
         await seededUniverseSvc.buildSeededUniverse(brandId, productId, {
-          includeCategoryMatched, includeBrandMatched, topN: 10,
+          includeCategoryMatched, includeBrandMatched,
+          topN: universeTopN,
           wantsVideo: resolvedKinds.includes('video'),
-          restrictToMediaIds: Array.isArray(mediaIds) && mediaIds.length ? mediaIds : null
+          restrictToMediaIds: operatorPickedMedia ? mediaIds : null
         });
       const filtered = filterUniverseForProduct(productId, universe);
       if (!filtered.length) {
