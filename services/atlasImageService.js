@@ -23,7 +23,8 @@
 'use strict';
 
 const axios = require('axios');
-const { recordFlatCost } = require('./costTracker');
+const { recordFlatCost, reconcileCost } = require('./costTracker');
+const { classify, mayResubmit, retryAfterFrom } = require('./atlasErrorPolicy');
 
 const BASE = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
 const KEY = () => process.env.ATLAS_API_KEY;
@@ -119,6 +120,41 @@ async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png', tim
   return url;
 }
 
+/**
+ * Read a prediction back later and upgrade its ledgered cost to Atlas's own
+ * figure. Fire-and-forget: a finished image must never wait on telemetry.
+ *
+ * Atlas fills in `price` when the task settles, and the render path returns the
+ * instant status flips to completed, so the value can genuinely be absent at
+ * that moment. Retries a few times with a widening gap, then gives up quietly —
+ * the row keeps its estimate and stays marked costSource:'estimated', so an
+ * unreconciled row is queryable rather than invisible.
+ */
+function scheduleCostReconcile(predictionId, attempt = 0) {
+  const delays = [3000, 10_000, 30_000];
+  if (attempt >= delays.length) {
+    console.warn(`   ⚠️  atlasImage: cost for ${predictionId} never published — row stays estimated`);
+    return;
+  }
+  setTimeout(async () => {
+    try {
+      const res = await axios.get(`${BASE}/model/prediction/${predictionId}`, {
+        headers: { Authorization: `Bearer ${KEY()}` },
+        timeout: 15_000, validateStatus: () => true
+      });
+      const price = Number(res.data?.data?.price);
+      if (Number.isFinite(price) && price > 0) {
+        await reconcileCost({ providerRequestId: predictionId, costUsd: price });
+        return;
+      }
+      scheduleCostReconcile(predictionId, attempt + 1);
+    } catch (err) {
+      console.warn(`   ⚠️  atlasImage: cost reconcile read failed for ${predictionId}: ${err.message}`);
+      scheduleCostReconcile(predictionId, attempt + 1);
+    }
+  }, delays[attempt]).unref?.();
+}
+
 // ── submit + poll ──────────────────────────────────────────────────────────
 async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS } = {}) {
   const generationTimeoutMs = positiveTimeout(timeoutMs, TIMEOUT_MS);
@@ -136,10 +172,36 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     maxRedirects: 0,
   });
   if (submit.status !== 200 || !submit.data?.data?.id) {
-    throw new Error(`Atlas image submit ${submit.status}: ${JSON.stringify(submit.data).slice(0, 200)}`);
+    // A refused SUBMIT was previously a bare Error: no ledger row, no
+    // classification, no alert. A 402 at submit — the single most important state
+    // to see — was therefore invisible, and a 429 at submit was never retried
+    // even though nothing had been created yet and resubmitting is free.
+    const policy = classify({
+      http: submit.status,
+      code: submit.data?.code,
+      msg: submit.data?.msg || submit.data?.message || null,
+      retryAfterSec: retryAfterFrom(submit)
+    });
+    recordFlatCost({
+      ...meta, provider: 'atlas', model,
+      costUsd: 0, costSource: 'none',
+      durationMs: Date.now() - t0, status: policy.costStatus(),
+      errorMessage: `submit refused: ${JSON.stringify(submit.data).slice(0, 200)}`
+    }).catch?.(() => {});
+    const err = new Error(
+      `Atlas image submit refused (${policy.name}, HTTP ${submit.status}): ` +
+      `${JSON.stringify(submit.data).slice(0, 200)} — ${policy.why}`
+    );
+    err.charged    = false;          // nothing was created, so nothing is billed
+    err.atlasCode  = submit.data?.code ?? null;
+    err.policy     = policy;
+    err.alertLevel = policy.alertLevel;
+    err.alertKey   = policy.alertKey;
+    throw err;                       // no predictionId => wrapper may resubmit
   }
   const id = submit.data.data.id;
   let lastStatus = null;
+  let transientPolls = 0;   // backoff counter for throttles seen while polling
   console.log(`   ⏳ atlasImage: submitted ${id} (${model}); deadline=${generationTimeoutMs}ms`);
 
   while (Date.now() - t0 < generationTimeoutMs) {
@@ -164,28 +226,76 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     // error code, is terminal now — there is nothing to wait for.
     const apiCode = poll.data?.code;
     const apiMsg  = poll.data?.msg || poll.data?.message || null;
+    const st = String(poll.data?.data?.status || 'unknown').toLowerCase();
+
+    // Classification is centralised in atlasErrorPolicy so precedence is
+    // deliberate. It matters here: a FAILED prediction arrives as envelope
+    // code:500 with data.status:"failed", and the old check saw only the code —
+    // so a refunded failure was ledgered as a generic rejection and never
+    // reattempted. A 429 was likewise folded in as terminal, which is wrong;
+    // Atlas expects backoff and retry, and 429s are exactly what our 5-6
+    // concurrent submits provoke.
     const isErrorEnvelope = (typeof apiCode === 'number' && apiCode !== 200) || (poll.status !== 200 && !poll.data?.data);
-    if (isErrorEnvelope) {
-      // Billing is an outage, not a bad ad: every render in every run fails
-      // identically until someone tops the account up. Flagged fatal so it
-      // pages instead of hiding behind per-ad render failures.
-      const isBilling = apiCode === 402 || /insufficient balance|quota|credit/i.test(String(apiMsg || ''));
+    const isFailureStatus = ['failed', 'error', 'cancelled', 'canceled', 'rejected'].includes(st);
+    if (isErrorEnvelope || isFailureStatus) {
+      const outs = poll.data?.data?.outputs;
+      const policy = classify({
+        http: poll.status, code: apiCode, msg: apiMsg,
+        predictionStatus: isFailureStatus ? st : null,
+        // An empty array is truthy — length, not existence, or a
+        // completed-with-no-outputs never matches.
+        hasOutputs: Array.isArray(outs) ? outs.length > 0 : !!outs,
+        nsfw: poll.data?.data?.has_nsfw_contents === true
+          || (Array.isArray(poll.data?.data?.has_nsfw_contents)
+              && poll.data.data.has_nsfw_contents.some(Boolean)),
+        retryAfterSec: retryAfterFrom(poll)
+      });
+
+      /**
+       * CRITICAL: we are PAST a successful submit, so a task exists and image
+       * models are billed at submission. Throttling or an outage seen while
+       * POLLING says nothing about that task — it is still cooking. Resubmitting
+       * here would be a second charge for one image.
+       *
+       * So transient conditions do not fail the render and do not escape to the
+       * retry wrapper: back off and keep polling the SAME prediction until our
+       * own deadline. Only a verdict about the task itself (failed, refunded) or
+       * a terminal account state leaves this loop.
+       */
+      if (policy.retryable && !isFailureStatus) {
+        const waitMs = policy.backoffFor(transientPolls++);
+        console.warn(
+          `   ⏸  atlasImage: ${policy.name} while polling ${id} — waiting ${waitMs}ms and continuing ` +
+          `to poll (NOT resubmitting; the task is already billable)`
+        );
+        await new Promise((r) => setTimeout(r, Math.min(waitMs, Math.max(0, generationTimeoutMs - (Date.now() - t0)))));
+        continue;
+      }
+
+      // Cost: only ledger real money. Atlas refunds the reservation on a failed
+      // task and never bills a rejection, and we confirmed data.price is null on
+      // a failed prediction — so these rows sit at $0 but stay VISIBLE.
+      const charged = policy.charged === true;
       recordFlatCost({
-        ...meta, provider: 'atlas', model,
-        costUsd: 0, durationMs: Date.now() - t0, status: isBilling ? 'rejected-billing' : 'rejected',
+        ...meta, provider: 'atlas', model, providerRequestId: id,
+        costUsd: charged ? await priceFor(model) : 0,
+        costSource: charged ? 'estimated' : 'none',
+        durationMs: Date.now() - t0, status: policy.costStatus(),
+        errorMessage: apiMsg || null
       }).catch?.(() => {});
+
       const err = new Error(
-        `Atlas image ${isBilling ? 'REJECTED — insufficient balance' : 'error'} ` +
-        `(HTTP ${poll.status}, code ${apiCode ?? 'n/a'}): ${apiMsg || JSON.stringify(poll.data).slice(0, 160)} [prediction ${id}]`
+        `Atlas image ${policy.name} (HTTP ${poll.status}, code ${apiCode ?? 'n/a'}, status ${st}): ` +
+        `${apiMsg || JSON.stringify(poll.data?.data || poll.data).slice(0, 200)} [prediction ${id}] — ${policy.why}`
       );
-      // NOT charged: Atlas explicitly declined to run it, so recording spend
-      // would inflate the ledger with work that never happened.
-      err.charged = false;
-      err.atlasCode = apiCode ?? null;
-      if (isBilling) { err.alertLevel = 'fatal'; err.alertKey = 'atlas:insufficient-balance'; }
+      err.charged     = policy.charged;
+      err.atlasCode   = apiCode ?? null;
+      err.predictionId = id;
+      err.policy      = policy;          // read by the retry wrapper below
+      err.alertLevel  = policy.alertLevel;
+      err.alertKey    = policy.alertKey;
       throw err;
     }
-    const st = String(poll.data?.data?.status || 'unknown').toLowerCase();
     if (st !== lastStatus) {
       console.log(`   ⏳ atlasImage: ${id} status=${st} elapsed=${Date.now() - t0}ms`);
       lastStatus = st;
@@ -193,10 +303,24 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     if (st === 'completed' || st === 'succeeded') {
       const out = poll.data.data.outputs?.[0];
       if (!out) throw await chargedError('Atlas image completed with no outputs', id, model, meta, t0);
+
+      // ACTUAL cost, not a guess. Atlas publishes the authoritative figure as
+      // data.price on the completed prediction. The catalog base_price we used
+      // before was badly wrong for this model: 0.01 estimated against 0.057224
+      // (square) / 0.068744 (portrait, landscape) actually billed — roughly 6x
+      // understated, in the direction that hides spend.
+      //
+      // If price has not landed yet we ledger the estimate and reconcile from a
+      // follow-up read, rather than block returning a finished image on telemetry.
+      const actual = Number(poll.data.data.price);
+      const haveActual = Number.isFinite(actual) && actual > 0;
       recordFlatCost({
-        ...meta, provider: 'atlas', model,
-        costUsd: await priceFor(model), durationMs: Date.now() - t0, status: 'ok',
+        ...meta, provider: 'atlas', model, providerRequestId: id,
+        costUsd: haveActual ? actual : await priceFor(model),
+        costSource: haveActual ? 'actual' : 'estimated',
+        durationMs: Date.now() - t0, status: 'ok',
       }).catch?.(() => {});
+      if (!haveActual) scheduleCostReconcile(id);
       // Output is a URL (or base64 when enable_base64_output was set) —
       // normalize to a b64 payload so callers get buffers without egress.
       if (/^https?:\/\//.test(out)) {
@@ -205,20 +329,61 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
       }
       return { b64: out, url: null, predictionId: id };
     }
-    if (['failed', 'error', 'cancelled', 'canceled', 'rejected'].includes(st)) {
-      // Atlas explicitly reported failure. Providers generally do not bill a failed
-      // generation, so this is NOT marked charged — but the attempt is ledgered at $0
-      // so it is still visible in spend reports rather than vanishing.
-      recordFlatCost({
-        ...meta, provider: 'atlas', model,
-        costUsd: 0, durationMs: Date.now() - t0, status: 'failed',
-      }).catch?.(() => {});
-      throw new Error(`Atlas image failed: ${JSON.stringify(poll.data?.data).slice(0, 200)}`);
-    }
+    // Failure statuses are handled by the classification branch above, which
+    // ledgers and throws with a policy attached. Nothing to do here.
   }
   // Timed out waiting. The submit succeeded, so Atlas is doing (or has done) the work
   // and will bill for it — and it may well complete after we stop polling. Charged.
   throw await chargedError(`Atlas image timed out after ${generationTimeoutMs}ms`, id, model, meta, t0);
+}
+
+/**
+ * Reattempt wrapper around submitAndPoll.
+ *
+ * Only ever resubmits when the classification says the previous attempt cost us
+ * nothing — a refunded `failed` prediction, a 429 throttle, a 503 outage. That is
+ * what makes reattempting safe rather than reckless: the standing rule against
+ * auto-retrying a billable POST exists to prevent paying twice, and a refunded
+ * failure cannot double-charge.
+ *
+ * Never resubmits on a 'probe' verdict (500 / 504 / network / our own timeout),
+ * because the outcome is unknown there — the task may be running and already
+ * billable, so a second submit is a second charge. Those surface to the caller
+ * with err.policy.probeFirst set, carrying the prediction id to look up.
+ */
+async function submitAndPollWithRetry(model, params, meta = {}, opts = {}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await submitAndPoll(model, params, meta, opts);
+    } catch (err) {
+      const policy = err.policy;
+
+      /**
+       * The gate is NOT "was this uncharged" — it is "did the previous attempt
+       * fail to create a billable task". Those are different, and conflating them
+       * was a genuine double-charge hole: a 429 classifies as uncharged, but a 429
+       * seen after a successful submit sits alongside a task that IS billed, so
+       * resubmitting bought the same image twice. (Transient conditions mid-poll
+       * no longer reach here at all — submitAndPoll keeps polling instead.)
+       *
+       * Resubmit only when either:
+       *   - no prediction was ever created (the submit itself was refused), or
+       *   - the task ran and Atlas reported it failed, which is refunded.
+       */
+      const safeToResubmit = mayResubmit(policy, err.predictionId);
+      const attemptsLeft = policy ? attempt + 1 < policy.maxAttempts : false;
+      if (!safeToResubmit || !attemptsLeft) throw err;
+
+      const waitMs = policy.backoffFor(attempt);
+      console.warn(
+        `   ↻ atlasImage: ${policy.name} on ${model} — reattempt ${attempt + 2}/${policy.maxAttempts} ` +
+        `in ${waitMs}ms (uncharged, safe to resubmit)`
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+      attempt++;
+    }
+  }
 }
 
 /**
@@ -235,10 +400,16 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
  */
 async function chargedError(message, predictionId, model, meta, t0) {
   const costUsd = await priceFor(model);
+  // This is the genuinely-charged path, and the catalog estimate understates the
+  // real figure by ~6x on this model — so tag it and reconcile, or "paid but got
+  // nothing" ends up the most under-reported spend in the ledger.
   recordFlatCost({
-    ...meta, provider: 'atlas', model,
-    costUsd, durationMs: Date.now() - t0, status: 'charged-no-output',
+    ...meta, provider: 'atlas', model, providerRequestId: predictionId,
+    costUsd, costSource: 'estimated',
+    durationMs: Date.now() - t0, status: 'charged-no-output',
+    errorMessage: message
   }).catch?.(() => {});
+  if (predictionId) scheduleCostReconcile(predictionId);
   const err = new Error(`${message} (prediction ${predictionId})`);
   err.charged = true;
   err.predictionId = predictionId;
@@ -334,7 +505,7 @@ async function generateImage({
     // Built inside the try so a throw here still reaches the provider
     // fallback, matching editImage.
     const params = buildParams(m, { prompt, size, quality, aspectRatio });
-    const out = await submitAndPoll(m, params, meta, { timeoutMs });
+    const out = await submitAndPollWithRetry(m, params, meta, { timeoutMs });
     return {
       data: [{ b64_json: out.b64 }],
       url: out.url,
@@ -416,7 +587,7 @@ async function editImage({
         : img
     )));
     const params = buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio });
-    const out = await submitAndPoll(m, params, meta, { timeoutMs });
+    const out = await submitAndPollWithRetry(m, params, meta, { timeoutMs });
     return {
       data: [{ b64_json: out.b64 }],
       url: out.url,

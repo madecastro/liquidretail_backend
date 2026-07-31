@@ -17,6 +17,10 @@
 
 const mongoose = require('mongoose');
 
+// Single source of truth for outcome values, exported so producers and the
+// persist layer cannot drift from the schema.
+const COST_STATUSES = ['ok', 'error', 'timeout', 'rejected', 'rejected-billing', 'failed', 'charged-no-output'];
+
 const costLogSchema = new mongoose.Schema({
   // Provenance — what was being generated
   stage:        { type: String, required: true, index: true },
@@ -35,6 +39,21 @@ const costLogSchema = new mongoose.Schema({
   layoutGenerationArtifactId:    { type: mongoose.Schema.Types.ObjectId, default: null },
   resolvedLayoutArtifactId:      { type: mongoose.Schema.Types.ObjectId, default: null },
   judgeResultArtifactId:         { type: mongoose.Schema.Types.ObjectId, default: null },
+
+  // Provider-side identifier for this call — the Atlas prediction id for image
+  // and video work. Indexed because cost reconciliation looks the row up by it:
+  // Atlas populates the authoritative `price` on the prediction, and we may have
+  // written the row before that value was available.
+  providerRequestId: { type: String, default: null, index: true },
+
+  // Where costUsd came from.
+  //   'actual'    — the provider's own figure (Atlas prediction.price)
+  //   'estimated' — our catalog base_price guess, pending reconciliation
+  //   'none'      — nothing was charged (rejection, or a refunded failure)
+  // Worth recording because the two disagreed by ~6x on the image path: the
+  // catalog said 0.01 while Atlas actually billed 0.057-0.069 per edit, so a
+  // ledger built from estimates understated image spend badly.
+  costSource: { type: String, enum: ['actual', 'estimated', 'none'], default: 'estimated', index: true },
 
   // Cache discipline — 0-cost cache hits still log so we can measure
   // hit rate per (stage, cacheKey).
@@ -57,7 +76,16 @@ const costLogSchema = new mongoose.Schema({
   // mongoose validation failed and the cost row was silently DROPPED. Every
   // provider rejection — including a 402 insufficient-balance, the one you most
   // want to see in the ledger — was invisible.
-  status:       { type: String, enum: ['ok', 'error', 'timeout', 'rejected', 'rejected-billing'], default: 'ok' },
+  // 'failed'            — provider accepted, then reported a failed prediction
+  // 'charged-no-output' — billed but produced nothing (rare)
+  //
+  // Every value a producer can write MUST appear here. A status outside the enum
+  // fails validation, and persistCost swallows that error, so the ENTIRE row
+  // disappears — not just the status field. 'rejected'/'rejected-billing' were
+  // missing once; 'failed'/'charged-no-output' were missing again after that.
+  // persistCost now normalises unknown values rather than trusting this list to
+  // stay exhaustive.
+  status:       { type: String, enum: COST_STATUSES, default: 'ok' },
   errorMessage: { type: String, default: null },
 
   createdAt:    { type: Date, default: Date.now, index: true }
@@ -67,4 +95,7 @@ const costLogSchema = new mongoose.Schema({
 costLogSchema.index({ brandId: 1, createdAt: -1 });
 costLogSchema.index({ stage: 1, createdAt: -1 });
 
-module.exports = mongoose.model('CostLog', costLogSchema);
+const CostLog = mongoose.model('CostLog', costLogSchema);
+CostLog.COST_STATUSES = COST_STATUSES;
+
+module.exports = CostLog;

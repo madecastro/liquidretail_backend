@@ -841,11 +841,135 @@ function badRequest(msg) { const e = new Error(msg); e.status = 400; return e; }
 // gated with a clear error so a misconfigured flag doesn't silently
 // produce bad output. Phase B will add the Reels schema + Veo route.
 
+/**
+ * Minimal JSON-Schema-subset checker: type, required, enum, minItems/maxItems,
+ * nested objects and arrays. Enough to re-assert exactly what the round contract
+ * declares, and no more.
+ *
+ * Deliberately validates AGAINST the schema object rather than a hand-copied field
+ * list. Atlas rejects strict json_schema for Anthropic models, so the schema can no
+ * longer be enforced at the transport layer — but it is still the contract, and a
+ * hand-maintained duplicate would drift from it the first time someone edits the
+ * schema. This way editing the schema updates the validation for free.
+ */
+function schemaErrors(value, schema, at = '') {
+  const out = [];
+  if (!schema || typeof schema !== 'object') return out;
+  const types = Array.isArray(schema.type) ? schema.type : (schema.type ? [schema.type] : []);
+  const actual = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+
+  if (types.length && !types.includes(actual)) {
+    // integers arrive as 'number'
+    if (!(types.includes('integer') && Number.isInteger(value))) {
+      out.push(`${at || 'value'} must be ${types.join(' or ')}, got ${actual}`);
+      return out;   // wrong type — deeper checks would be noise
+    }
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    out.push(`${at || 'value'} must be one of [${schema.enum.join(', ')}], got ${JSON.stringify(value)}`);
+  }
+  if (actual === 'object') {
+    for (const key of schema.required || []) {
+      if (!(key in value)) out.push(`${at ? at + '.' : ''}${key} is missing`);
+    }
+    for (const [key, sub] of Object.entries(schema.properties || {})) {
+      if (key in value) out.push(...schemaErrors(value[key], sub, `${at ? at + '.' : ''}${key}`));
+    }
+  }
+  if (actual === 'array') {
+    if (Number.isInteger(schema.minItems) && value.length < schema.minItems) {
+      out.push(`${at} must have at least ${schema.minItems} item(s), got ${value.length}`);
+    }
+    if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) {
+      out.push(`${at} must have at most ${schema.maxItems} item(s), got ${value.length}`);
+    }
+    if (schema.items) value.forEach((v, i) => out.push(...schemaErrors(v, schema.items, `${at}[${i}]`)));
+  }
+  return out;
+}
+
+/**
+ * Everything the transport used to guarantee, plus the semantic rules a schema
+ * cannot express. Returns [] when usable, else reasons that are handed back to the
+ * model verbatim on a single re-ask.
+ *
+ * SEMANTIC RULES, and why each exists:
+ *  - duplicate primary line: the chosen model reused one headline across two of
+ *    three concepts in the bake-off. Different intents, identical primary line, so
+ *    two of three were not distinct ads to a viewer.
+ *  - forbidden strings / pricing: checked ONLY against copy_picks values, i.e. text
+ *    that actually reaches the image. Scanning the whole concept blob would reject
+ *    a rationale that merely discusses the product name or mentions a discount
+ *    strategy, and a false reject costs a full re-ask on ~30k vision tokens.
+ */
+function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbiddenStrings = [] } = {}) {
+  const reasons = [];
+
+  if (schema) reasons.push(...schemaErrors(parsed, schema.schema || schema, ''));
+
+  const concepts = parsed?.concepts;
+  if (!Array.isArray(concepts)) {
+    if (!reasons.length) reasons.push('"concepts" must be an array');
+    return reasons;
+  }
+  if (concepts.length !== nConcepts) {
+    reasons.push(`"concepts" must contain exactly ${nConcepts} items, got ${concepts.length}`);
+  }
+
+  // Only strings that end up rendered count as ad copy.
+  const copyOf = (c) => Object.values(c?.copy_picks || {}).filter(v => typeof v === 'string');
+  // A one- or two-character product name would match almost any copy; substring
+  // matching is only meaningful for a reasonably distinctive name.
+  const checkable = forbiddenStrings.filter(s => String(s).trim().length >= 4);
+
+  const primaries = [];
+  concepts.forEach((c, i) => {
+    if (!c || typeof c !== 'object') { reasons.push(`concepts[${i}] is not an object`); return; }
+
+    // copy_picks.headline is the contract field; the others are older shapes kept
+    // so a contract change does not silently disable the duplicate check.
+    const primary = c.copy_picks?.headline ?? c.headline ?? c.primary_line ?? null;
+    if (primary && String(primary).trim()) primaries.push(String(primary).trim().toLowerCase());
+
+    const copy = copyOf(c).join('  ');
+    for (const bad of checkable) {
+      if (copy.toLowerCase().includes(String(bad).toLowerCase())) {
+        reasons.push(`concepts[${i}].copy_picks contains the product name "${bad}", which must not appear in ad copy`);
+      }
+    }
+    if (/(\$\s?\d|[£€]\s?\d|\b\d+% ?off\b|\bdiscount\b|\bsavings?\b|\bsale\b)/i.test(copy)) {
+      reasons.push(`concepts[${i}].copy_picks contains pricing or discount language, which is switched off system-wide`);
+    }
+  });
+
+  const dupes = primaries.filter((p, i) => primaries.indexOf(p) !== i);
+  if (dupes.length) {
+    reasons.push(
+      `two concepts share the same primary line (${JSON.stringify(dupes[0])}). ` +
+      `Each concept must lead with a DIFFERENT headline — reusing one makes the concepts identical to a viewer.`
+    );
+  }
+  return reasons;
+}
+
 const N_CONCEPTS_ROUND       = 3;
 const ROUND_VERSION          = '1.0.0';   // bump when the round schema/prompt shape changes
-const DIRECTOR_ROUND_MODEL   = 'gpt-4.1';
-const DIRECTOR_ROUND_TEMP    = 0.8;       // a hair higher than V1 — round diversity matters
-const DIRECTOR_ROUND_TOKENS  = 4000;      // 3 concepts × richer shape (media_picks + output_shape + copy_picks)
+const DIRECTOR_ROUND_MODEL   = 'director'; // claude-sonnet-5 — see atlasModelMap
+// Lowered from 0.8. The bake-off's one real defect was a REPEATED primary line
+// across two concepts, and the same prompt produced it on one run and not the
+// next — a consistency problem, not a creativity one.
+//
+// Caveat worth keeping visible: the round contract has no 'intent' field, so
+// within-round distinctness is NOT structurally guaranteed — it rests on the
+// archetype/output_shape/copy variation the prompt asks for, plus the duplicate
+// headline check in validateDirectorPayload. And the cross-round avoid-list is
+// prompt text only, so a lower temperature could in principle make later rounds
+// stickier. Watch round-over-round variety after this lands.
+const DIRECTOR_ROUND_TEMP    = 0.45;
+// Raised from 4000. Sonnet spent 2,683 output tokens on three concepts in the
+// bake-off, so 4000 left almost no headroom and a truncated response is an
+// unparseable one. At $10/M output the extra ceiling costs nothing unless used.
+const DIRECTOR_ROUND_TOKENS  = 8000;
 const AVOID_LIST_MAX_ROUNDS  = parseInt(process.env.DIRECTOR_AVOID_LIST_ROUNDS || '6', 10);
 const VISION_ATTACHMENT_CAP  = 6;         // first N universe entries get attached as image_url parts
 
@@ -901,8 +1025,14 @@ async function directConceptsRound({
   if (!Array.isArray(seededUniverse) || !seededUniverse.length) {
     throw badRequest('seededUniverse required and must be non-empty');
   }
-  if (!process.env.OPENAI_API_KEY) {
-    const e = new Error('OPENAI_API_KEY not set'); e.status = 500; throw e;
+  // The round director routes to Anthropic via Atlas, so ATLAS_API_KEY is what it
+  // actually needs. Gating on OPENAI_API_KEY here would refuse to run on a
+  // correctly-configured Atlas-only deployment, and would refuse BEFORE any call —
+  // a hard 500 with a misleading message. OPENAI_API_KEY is still accepted because
+  // atlasLlmService can fall back to direct OpenAI for other roles.
+  if (!process.env.ATLAS_API_KEY && !process.env.OPENAI_API_KEY) {
+    const e = new Error('no LLM credentials: set ATLAS_API_KEY (the director role routes via Atlas)');
+    e.status = 500; throw e;
   }
   const { PLATFORM_FORMAT_KEYS } = require('./platformFormats');
   if (!PLATFORM_FORMAT_KEYS.includes(platformFormat)) {
@@ -1011,36 +1141,89 @@ async function directConceptsRound({
     : user;
 
   const t0 = Date.now();
-  const completion = await chatCompletion(
-    {
-      stage:      'creative_director_round',
-      provider:   'openai',
-      model:      DIRECTOR_ROUND_MODEL,
-      purposeTag: `round:${roundIndex}:${campaignKind || 'untagged'}`,
-      brandId, productId,
-      visionImages: visionImages.length,
-      cacheKey:   `directorRound:${brandId}:${productId}:${platformFormat}:${roundIndex}`
-    },
-    {
-      model: DIRECTOR_ROUND_MODEL,
-      response_format: { type: 'json_schema', json_schema: responseSchema },
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user',   content: userContent }
-      ],
-      temperature: DIRECTOR_ROUND_TEMP,
-      max_tokens:  DIRECTOR_ROUND_TOKENS
+
+  /**
+   * json_object, NOT json_schema. Atlas returns 400 "invalid request params" for
+   * strict json_schema on Anthropic models — probed on both text-only and vision
+   * requests, so it is the schema and not the images.
+   *
+   * responseSchema is therefore no longer sent to the transport, but it is still the
+   * contract: it is handed to validateDirectorPayload, which re-asserts type,
+   * required, enum and array-bound rules against the SAME object the transport used
+   * to enforce. That keeps enforcement and contract in one place — a hand-copied
+   * field list would drift the first time the schema changed.
+   *
+   * The model is steered by the field list already written into the prompt text (see
+   * buildPromptRound); losing transport enforcement does not lose that.
+   */
+  // Owner directive: the product NAME does not belong in ad copy. The eliminated
+  // incumbent set it in all three concepts, so this is checked, not trusted.
+  // Path matches the one renderCampaignBriefBlock already reads, and optional
+  // chaining keeps a missing signal from throwing.
+  const forbiddenStrings = [inputSummary?.product_signal?.name].filter(Boolean);
+  let completion, raw, parsed, reasons = [];
+  let attempt = 0;
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user',   content: userContent }
+  ];
+
+  for (;;) {
+    completion = await chatCompletion(
+      {
+        stage:      'creative_director_round',
+        provider:   'atlas',
+        model:      DIRECTOR_ROUND_MODEL,
+        purposeTag: `round:${roundIndex}:${campaignKind || 'untagged'}${attempt ? `:retry${attempt}` : ''}`,
+        brandId, productId,
+        visionImages: visionImages.length,
+        // attempt distinguishes the retry in the ledger. There is no response cache
+        // on this path, so this is telemetry, not retry isolation.
+        cacheKey:   `directorRound:${brandId}:${productId}:${platformFormat}:${roundIndex}:${attempt}`
+      },
+      {
+        model: DIRECTOR_ROUND_MODEL,
+        response_format: { type: 'json_object' },
+        messages,
+        temperature: DIRECTOR_ROUND_TEMP,
+        max_tokens:  DIRECTOR_ROUND_TOKENS
+      }
+    );
+
+    raw = completion.choices?.[0]?.message?.content;
+    if (!raw) throw new Error('Director (round) returned no content');
+    // Some gateways wrap json_object output in a fence despite the setting.
+    const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+    try { parsed = JSON.parse(cleaned); }
+    catch (err) {
+      if (completion.choices?.[0]?.finish_reason === 'length') {
+        throw new Error(`Director (round) response truncated at ${DIRECTOR_ROUND_TOKENS} tokens — raise DIRECTOR_ROUND_TOKENS`);
+      }
+      throw new Error(`Director (round) response not JSON: ${err.message}`);
     }
-  );
+
+    reasons = validateDirectorPayload(parsed, { schema: responseSchema, nConcepts: N_CONCEPTS_ROUND, forbiddenStrings });
+    if (!reasons.length || attempt >= 1) break;
+
+    console.warn(
+      `🎭 directorRound[r${roundIndex}]: payload rejected, re-asking once — ${reasons.join('; ')}`
+    );
+    messages.push({ role: 'assistant', content: raw });
+    messages.push({
+      role: 'user',
+      content: `That response is not usable. Fix exactly these problems and return the corrected JSON only:\n` +
+               reasons.map(r => `- ${r}`).join('\n')
+    });
+    attempt++;
+  }
+
+  if (reasons.length) {
+    // Surviving a re-ask means the model cannot satisfy the contract for this
+    // input. Failing loudly beats persisting a round the renderers will misread.
+    throw new Error(`Director (round) payload invalid after re-ask: ${reasons.join('; ')}`);
+  }
+
   const elapsedMs = Date.now() - t0;
-
-  const raw = completion.choices?.[0]?.message?.content;
-  if (!raw) throw new Error('Director (round) returned no content');
-
-  let parsed;
-  try { parsed = JSON.parse(raw); }
-  catch (err) { throw new Error(`Director (round) response not JSON: ${err.message}`); }
-
   const warnings = validateConceptsRound(parsed.concepts || [], seededUniverse);
 
   console.log(
@@ -1065,7 +1248,7 @@ async function directConceptsRound({
     availableComponentRoles: [...ROLES],
     creativeRules:           { ...CREATIVE_RULES },
     concepts:                parsed.concepts || [],
-    provider:    'openai',
+    provider:    'atlas',   // the director role routes to Anthropic via Atlas now
     modelId:     DIRECTOR_ROUND_MODEL,
     promptHash,
     promptSystem: system,
