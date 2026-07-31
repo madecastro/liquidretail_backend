@@ -1449,17 +1449,22 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself.`,
     // The pick ceiling is derived from the universe actually supplied, not
     // hardcoded. It used to always say "1-4" even when the universe held a
-    // single hero, which asks for a multi-image composition that cannot be
-    // built — and, worse, the static renderer honours only ONE reference today,
-    // so any extra pick was silently discarded and the concept described an ad
-    // that was never produced. Saying "exactly 1" when there is 1 keeps the
-    // brief and the render truthful about each other.
+    // single hero — asking for a multi-image composition that cannot be built
+    // from one asset.
+    //
+    // The renderer DOES honour the full pick list: renderService falls back to
+    // Ad.mediaIds (the Director's picks) when there is no explicit operator
+    // stack, and directImageRenderService sends every resolved reference on one
+    // edit call. An earlier revision of this comment claimed the renderer
+    // honoured only one reference; that was true before that fallback landed and
+    // is false now. Corrected rather than left in place — a comment describing
+    // retired behaviour is precisely what makes this codebase expensive to read.
     (() => {
       const n = Array.isArray(seededUniverse) ? seededUniverse.length : 0;
       const ceiling = Math.min(4, Math.max(1, n));
       const pickPhrase = ceiling === 1
-        ? `Pick EXACTLY 1 media per concept — the universe below holds a single hero image and the static renderer composes from one reference.`
-        : `Pick 1-${ceiling} media per concept.`;
+        ? `Pick EXACTLY 1 media per concept — the universe below holds a single image.`
+        : `Pick 1-${ceiling} media per concept; every one you pick is sent to the image model as a reference, so pick only what the composition genuinely uses.`;
       return `- MEDIA PICKS: every media_id you reference in media_picks MUST appear in the SEEDED UNIVERSE block below. Pick by media_id verbatim. role is a short label describing how the media sits in your composition. ${pickPhrase} Reels picks 1 video (preferred) or 1-4 image references for Veo synthesis.`;
     })(),
     `- [CRITICAL] The SEEDED UNIVERSE is PRE-RANKED by shot-type quality: lifestyle > on_model > flat_lay > product_only > detail > packaging. Earlier entries are BETTER seeds for animation and stronger composition anchors — STRONGLY prefer them for media_picks[0]. Only reach for lower-ranked entries when a specific concept archetype requires that shot type (e.g. product_card_grid can use flat_lay/product_only intentionally, hero_quote_overlay wants lifestyle/on_model).`,
