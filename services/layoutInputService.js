@@ -471,7 +471,12 @@ async function loadContext(mediaId, options = {}) {
         match = {
           ...match,
           catalogProductId: cp._id,
-          identification:   seedIdent
+          identification:   seedIdent,
+          // The spread carries the PMA's own top-level productReviews, which
+          // belong to whatever product the media originally matched — NOT the
+          // seed pick. Overwrite it, or productReviewsOf() below can fall back
+          // to another product's reviews the moment this one has none.
+          productReviews:   cp.productReviews || null
         };
       }
     }
@@ -709,9 +714,13 @@ async function loadContext(mediaId, options = {}) {
   // time; pre-population brands just render with an empty list and the
   // zone stays hidden). Top-3 by likeCount keeps the canonical input
   // bounded and gives the renderer a small carousel to choose from.
+  // Over-fetched, then narrowed by the judge downstream. Taking the top 3 by
+  // likes FIRST and screening after would return nothing whenever a post's
+  // three most-liked comments are noise — which on a popular post they usually
+  // are ("🔥🔥", "need this") — while genuinely usable praise sat at #4.
   const topComments = await Comment.find({ mediaId: media._id, parentExternalId: null })
     .sort({ likeCount: -1, postedAt: -1 })
-    .limit(3)
+    .limit(25)
     .lean()
     .catch(err => { console.warn(`   ⚠️  top comments fetch failed: ${err.message}`); return []; });
 
@@ -760,6 +769,33 @@ function synthesizeMatchFromCatalogProduct(cp) {
     brandId:          cp.brandId || null,
     identification:   buildIdentificationFromCatalogProduct(cp)
   };
+}
+
+// The matched product's review snapshot, wherever it actually lives.
+//
+// hydrateMatch writes CatalogProduct.productReviews to the TOP LEVEL of the
+// artifact (productMatchHydration.js:66) and never into identification.details
+// — the same shape gap that hides catalogProductId (see :1779). Reading only
+// details.productReviews therefore left the product quote tier structurally
+// EMPTY on every hydrated match: the 3-tier review engine's SKU-specific,
+// star-rated quotes never reached an ad, and every testimonial fell through to
+// the category / brand / comment tiers instead.
+//
+// details wins when present because it is the operator's seed pick (:470),
+// which is authoritative for the product being advertised.
+// A truthy-but-quoteless snapshot must not mask a populated one, so the
+// fallthrough tests for quotes rather than existence. That cannot cross
+// products: details.productReviews is only ever written by
+// buildIdentificationFromCatalogProduct, and both of its callers
+// (the seed branch at :471 and synthesizeMatchFromCatalogProduct) set the
+// top-level field from the SAME CatalogProduct — so where both exist they
+// describe the same product.
+function productReviewsOf(match) {
+  const seeded   = match?.identification?.details?.productReviews || null;
+  const hydrated = match?.productReviews || null;
+  if (seeded?.quotes?.length)   return seeded;
+  if (hydrated?.quotes?.length) return hydrated;
+  return seeded || hydrated || null;
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -996,9 +1032,10 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     // Real product-level review quotes (when available) — surfaced so
     // the LLM can ground its tone in actual customer language. Cap at
     // 5 to keep the prompt budget reasonable.
-    if (details.productReviews?.quotes?.length) {
+    const productReviews = productReviewsOf(match);
+    if (productReviews?.quotes?.length) {
       lines.push('  Real product quotes (use these to inform tone, do NOT copy verbatim):');
-      for (const q of details.productReviews.quotes.slice(0, 5)) {
+      for (const q of productReviews.quotes.slice(0, 5)) {
         const author = q.author || q.source || 'Verified buyer';
         lines.push(`    - "${q.text}" — ${author}${q.source && q.source !== author ? ` (${q.source})` : ''}`);
       }
@@ -1304,11 +1341,26 @@ function scoreQuote(text) {
 // promote neutral-lived-experience quotes with no endorsement value.
 const SCORE_FLOOR = 1;
 
-// Minimum star rating for a scraped review to be eligible for an ad.
-// 4+ on a 5-point scale — the reviewer's own verdict. Only applied to
-// quotes that actually carry a rating. Used by pickStrongestQuote below as
-// a soft, per-candidate filter/scoring nudge.
-const MIN_STARS_FOR_AD = 4;
+// Ratings arrive on 5-, 10- and 100-point scales depending on the review app,
+// and the vendor adapters store each review's stars verbatim (only the
+// AGGREGATE goes through normalizeStars). Normalize before ANY comparison:
+// read literally, a 90/100 clears every threshold, and as a scoring bonus it
+// would add +85 to a text score that runs in single digits — the
+// highest-NUMBERED rating would take the primary slot regardless of what the
+// review actually says.
+function toFiveScale(rating) {
+  // Reject non-ratings BEFORE Number(): Number(null), Number('') and
+  // Number(false) are all 0, which would reclassify an UNRATED quote as one
+  // the reviewer scored zero stars — inverting the gate, since unrated
+  // quotes are allowed through and 0-star quotes must not be.
+  // A real 0 stays a real 0 and fails the threshold, which is correct.
+  if (rating === null || rating === undefined || rating === '' || typeof rating === 'boolean') return null;
+  const n = Number(rating);
+  if (!Number.isFinite(n)) return null;
+  if (n > 10) return n / 20;   // 100-point
+  if (n > 5)  return n / 2;    // 10-point
+  return n;
+}
 
 // Star gate for review-backed quote tiers, applied to a whole candidate list
 // BEFORE it reaches pickStrongestQuote. A testimonial on a paid ad should
@@ -1335,10 +1387,7 @@ function gateQuotesByRating(candidates, tierName) {
       return !QUOTE_REQUIRE_RATING;
     }
     rated += 1;
-    // Ratings arrive on both 5-point and 100-point scales depending on the
-    // review app; normalize before comparing so a 90/100 is not read as a 90.
-    const normalized = q.rating > 5 ? (q.rating / 20) : q.rating;
-    if (normalized >= QUOTE_MIN_RATING) return true;
+    if (toFiveScale(q.rating) >= QUOTE_MIN_RATING) return true;
     dropped += 1;
     return false;
   });
@@ -1361,20 +1410,32 @@ function pickStrongestQuote(candidates) {
   // 2-star ("the fabric is nice but the frame cracked") can clear a
   // lexical gate, while a 5-star one-liner gets penalized for brevity.
   // When ANY candidate in this tier is star-rated, drop the ones the
-  // reviewer themself scored below MIN_STARS_FOR_AD and let the text
-  // scorer choose among what's left. Tiers with no ratings at all
-  // (comments, LLM-authored) are unaffected.
-  const rated = candidates.filter(q => q && Number.isFinite(q.rating));
+  // reviewer themself scored below the bar and let the text scorer choose
+  // among what's left. Tiers with no ratings at all (comments, LLM-authored)
+  // are unaffected.
+  //
+  // ONE THRESHOLD, QUOTE_MIN_RATING. This filter arrived with a second,
+  // LOWER floor of its own (4 vs the tier gate's 4.5), which was a no-op only
+  // for as long as every rated tier happened to pass through
+  // gateQuotesByRating first. Any tier that skipped that gate would have
+  // silently quoted 4-star reviews on a paid ad.
+  const rated = candidates.filter(q => toFiveScale(q?.rating) !== null);
   const pool = rated.length
-    ? candidates.filter(q => !Number.isFinite(q?.rating) || q.rating >= MIN_STARS_FOR_AD)
+    ? candidates.filter((q) => {
+        const r = toFiveScale(q?.rating);
+        return r === null || r >= QUOTE_MIN_RATING;
+      })
     : candidates;
 
   let best = null;
   let bestScore = -Infinity;
   for (const q of pool) {
     if (!q?.text) continue;
-    // Small nudge so a 5-star beats a 4-star when the prose scores level.
-    const starBonus = Number.isFinite(q.rating) ? (q.rating - MIN_STARS_FOR_AD) : 0;
+    // Small nudge so a 5-star beats a 4.5-star when the prose scores level.
+    // Bounded to 0–0.5 by the normalization above; it breaks ties, it does
+    // not outrank the text.
+    const normalized = toFiveScale(q.rating);
+    const starBonus = normalized === null ? 0 : (normalized - QUOTE_MIN_RATING);
     const score = scoreQuote(q.text) + starBonus;
     if (score > bestScore) {
       bestScore = score;
@@ -1385,10 +1446,21 @@ function pickStrongestQuote(candidates) {
   return hasPositiveSignal(best.text) ? best : null;
 }
 
-// Require at least one positive lexeme — prevents pure lived-experience
-// narration ("Bought this three weeks ago") from being used as an
-// endorsement. Shared by the quote tiers and by social comments so both are
-// held to the same standard of what counts as praise.
+// "Does this text express praise" — NOT "does it contain a positive word".
+//
+// Two conditions, both required:
+//   1. At least one positive lexeme, so pure lived-experience narration
+//      ("Bought this three weeks ago") is not read as an endorsement.
+//   2. No negation of that praise and no complaint, so "Not great, would not
+//      buy again" is not read as one either. Testing (1) alone passed that
+//      line — "great" is right there in it.
+//
+// Condition 2 matters most where this is the ONLY gate. scoreQuote applies
+// the same two patterns before scoring, so the primary quote slot was already
+// safe; the callers that were not are buildProofComments, the comment quote
+// pool, and aiCanvasInputBuilder's loadTopComments — every one of them a path
+// that renders a social comment on an ad for a client whose only proof IS
+// comments.
 function hasPositiveSignal(text) {
   const s = String(text || '');
   const hasPositive =
@@ -1401,7 +1473,8 @@ function hasPositiveSignal(text) {
   STRONG_POSITIVE.lastIndex = 0;
   MODERATE_POSITIVE.lastIndex = 0;
   PHRASE_STRONG.lastIndex = 0;
-  return hasPositive;
+  if (!hasPositive) return false;
+  return !NEGATED_POSITIVE.test(s) && !NEGATIVE_SENTIMENT.test(s);
 }
 
 // Social comments rendered as proof go through the SAME pipeline as review
@@ -1412,27 +1485,25 @@ function hasPositiveSignal(text) {
 // these again.
 async function buildProofComments(topComments, ctx, limit = 3) {
   const rows = Array.isArray(topComments) ? topComments : [];
-  const positive = rows.filter((c) => c?.text && hasPositiveSignal(c.text));
-  const out = [];
-  for (const c of positive) {
-    if (out.length >= limit) break;
-    const snippet = await extractSnippet(c.text, {
-      brandId:   ctx.media?.brandId || null,
-      productId: ctx.match?.identification?.details?.catalogProductId || null
-    });
-    if (!snippet || snippet.length > PROOF_LINE_MAX_CHARS) continue;
-    out.push({
-      text:            snippet,
-      author_username: c.authorUsername || c.author || null,
-      like_count:      c.likeCount || 0,
-      reply_count:     c.replyCount || 0,
-      posted_at:       c.postedAt || null
-    });
-  }
-  if (rows.length !== out.length) {
-    console.log(`💬 proof comments — kept=${out.length}/${rows.length} (positive=${positive.length}, max=${PROOF_LINE_MAX_CHARS}c)`);
-  }
-  return out;
+  if (!rows.length) return [];
+  // ONE judgment, made at ingest and shared with every other comment surface.
+  // This used to run its own lexical gate and then its own extractSnippet call,
+  // which meant this path and the quote-pool path could disagree about whether
+  // the same comment counted as praise — and both were deciding on keywords.
+  const usable = await usableProofCommentsOrNone(rows, {
+    brandId:   ctx.media?.brandId || null,
+    // catalogProductId is the hydrated FK; the nested details copy is never
+    // written (see :1779), so reading only that attributed every judge call to
+    // a null product in the cost ledger.
+    productId: ctx.match?.catalogProductId || null
+  }, 'proofComments');
+  return usable.slice(0, limit).map(c => ({
+    text:            c.proofLine,
+    author_username: c.authorUsername || c.author || null,
+    like_count:      c.likeCount || 0,
+    reply_count:     c.replyCount || 0,
+    posted_at:       c.postedAt || null
+  }));
 }
 
 // Normalize a raw quote object from any tier into the shape the
@@ -1489,12 +1560,32 @@ async function loadBrandCommentsForQuotePool(ctx) {
   try {
     const brandId = ctx.media?.brandId || null;
     if (!brandId) return [];
+    // BOUNDED. This was an unlimited find over every comment the brand has
+    // ever received. Feeding that to the judge in one batch would overrun the
+    // token budget on a chatty brand, truncate the response, and fail the ad.
+    // Like-sorted first so the cap keeps the best candidates.
     const comments = await Comment.find({ brandId })
-      .select('text authorUsername likeCount postedAt createdAt')
+      .sort({ likeCount: -1, postedAt: -1 })
+      .limit(60)
+      .select('text authorUsername likeCount postedAt createdAt proofJudgment')
       .lean();
 
-    const filtered = comments.filter(c => {
-      const t = String(c.text || '').trim();
+    // JUDGED BEFORE THE LIKE SORT, not after. Comments are the fallback proof
+    // tier for a client with no star-rated reviews at all, so this is the only
+    // gate between a brand's comment section and its ads — and ranking by
+    // likes first would let ten popular neutral comments crowd out the
+    // genuinely good one sitting at #11, emptying a tier that had usable
+    // praise in it.
+    //
+    // The verdict comes from the ingest judge (inference over the whole
+    // sentence), not from a keyword test, and it is shared with every other
+    // surface that renders a comment. It also matters that this runs on the
+    // whole pool rather than just the winner: pickStrongestQuote only protects
+    // the PRIMARY slot, and everything else here flows into secondary_quotes
+    // for the renderer to rotate through.
+    const usable = await usableProofCommentsOrNone(comments, { brandId }, 'quotePool');
+    const filtered = usable.filter(c => {
+      const t = String(c.proofLine || '').trim();
       return t.length >= 20 && t.length <= 300;
     });
 
@@ -1507,8 +1598,12 @@ async function loadBrandCommentsForQuotePool(ctx) {
       return new Date(tb).getTime() - new Date(ta).getTime();
     });
 
+    // proofLine, never c.text: the judged, ad-ready form is the processed
+    // artifact. Passing the raw comment on would re-open the door to a
+    // downstream surface shortening it a second time, or rendering the part
+    // the judge did not approve.
     return filtered.slice(0, 10).map(c => normalizeQuote({
-      text:        c.text,
+      text:        c.proofLine,
       author_name: c.authorUsername || 'Instagram commenter',
       source:      'social_comment',
       verified:    false
@@ -1759,7 +1854,7 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // First non-empty tier's best-scoring quote wins the primary slot.
   // Everything else across all tiers goes to secondary_quotes so the
   // renderer can rotate through them.
-  const tierProduct = gateQuotesByRating((details.productReviews?.quotes || []).map(normalizeQuote).filter(Boolean), 'product');
+  const tierProduct = gateQuotesByRating((productReviewsOf(ctx.match)?.quotes || []).map(normalizeQuote).filter(Boolean), 'product');
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
   const tierCategory = gateQuotesByRating((catReviewsForMatch?.quotes || []).map(normalizeQuote).filter(Boolean), 'category');
   // Brand-tier reviews are catalog-wide: they are about whatever the reviewer
@@ -1785,7 +1880,10 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
     console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk)`);
   }
   const tierComment  = await loadBrandCommentsForQuotePool(ctx);
-  const tierLlm      = (Array.isArray(derivation.quotes) ? derivation.quotes : []).map(normalizeQuote).filter(Boolean);
+  // Unrated tier, so sentiment is the only gate — same rule as comments.
+  const tierLlm      = (Array.isArray(derivation.quotes) ? derivation.quotes : [])
+    .map(normalizeQuote)
+    .filter(q => q && hasPositiveSignal(q.text));
 
   const pickedProduct  = pickStrongestQuote(tierProduct);
   const pickedCategory = pickedProduct  ? null : pickStrongestQuote(tierCategory);
@@ -1812,7 +1910,7 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   if (primaryQuote) {
     const snippet = await extractSnippet(primaryQuote.text, {
       brandId:   ctx.media?.brandId || null,
-      productId: ctx.match?.identification?.details?.catalogProductId || null
+      productId: ctx.match?.catalogProductId || null
     });
     // Always populate, even when it equals the source. `snippet` means "the
     // <=50-char, word-safe form of this quote", which for an already-short
@@ -1836,6 +1934,11 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   );
 
   // Secondaries: every other quote from every tier, minus the primary.
+  // Every tier feeding this is gated before it gets here — the review-backed
+  // ones on the reviewer's own stars (gateQuotesByRating), the unrated ones
+  // (comments, LLM-authored) on sentiment. That matters because
+  // secondary_quotes is rendered by rotation, so anything in this array can
+  // reach an ad without pickStrongestQuote ever having judged it.
   const allQuotes = [...tierProduct, ...tierCategory, ...tierBrand, ...tierComment, ...tierLlm];
   const secondaryQuotes = primaryQuote
     ? allQuotes.filter(q => q.text !== primaryQuote.text).map(q => ({ ...q }))
@@ -2997,5 +3100,13 @@ module.exports = {
   buildCloudinaryCropUrl,
   // Shared so every surface that renders a social comment as proof applies
   // the same definition of praise, rather than each growing its own lexicon.
-  hasPositiveSignal
+  hasPositiveSignal,
+  // Quote-selection internals, exported so scripts/verifyQuoteGate.js can pin
+  // the 4.5-star floor and the product-review lookup. Both have already been
+  // broken once by a merge with nothing to catch it.
+  gateQuotesByRating,
+  pickStrongestQuote,
+  productReviewsOf,
+  toFiveScale,
+  QUOTE_MIN_RATING
 };

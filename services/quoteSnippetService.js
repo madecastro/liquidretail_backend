@@ -13,6 +13,8 @@
 const { trackLlmCall } = require('./costTracker');
 
 const { chatCompletion, isConfigured: atlasConfigured } = require('./atlasLlmService');
+const alerts = require('./alertService');
+const Comment = require('../models/Comment');
 // Conversion-weighted sentence ranking, shared with the review-storage path.
 const { scoreSentence } = require('../utils/reviewText');
 const { splitSentences } = require('../utils/htmlEntities');
@@ -22,10 +24,12 @@ const { splitSentences } = require('../utils/htmlEntities');
 // made in one place. Currently google/gemini-2.5-flash-lite — chosen by
 // measurement over 6 candidates through this exact prompt/schema (16x cheaper
 // and slightly faster than the gpt-4o-mini/luna it replaces, identical
-// correctness). NOT 'quote-snippet' (openai/gpt-5-nano): that candidate 400'd
-// with "router not found" in the same benchmark, so pointing here at it would
-// silently fail every call and fall through to the mechanical truncation
-// fallback below. QUOTE_SNIPPET_MODEL_ID still overrides this one call site.
+// correctness). There was briefly a 'quote-snippet' role pointing at
+// openai/gpt-5-nano; that candidate 400'd with "router not found" in the same
+// benchmark, so it would have silently failed every call and fallen through to
+// the mechanical truncation below. The role has since been deleted from
+// atlasModelMap — do not resurrect it.
+// QUOTE_SNIPPET_MODEL_ID still overrides this one call site.
 const MODEL_ID  = process.env.QUOTE_SNIPPET_MODEL_ID || 'review-text';
 const MAX_CHARS = 50;
 
@@ -252,6 +256,178 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
 // truncateAtWordBoundary at this width instead of being raw-sliced.
 const PROOF_LINE_MAX_CHARS = 60;
 
+const JUDGE_SCHEMA = {
+  name:   'proof_line_selection',
+  strict: true,
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['lines'],
+    properties: {
+      lines: {
+        type:  'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['index', 'usable', 'reason', 'line'],
+          properties: {
+            index:  { type: 'integer', description: 'The candidate number you are judging.' },
+            usable: { type: 'boolean', description: 'True only if this is genuine praise that is safe to print on a paid ad.' },
+            reason: { type: 'string',  description: 'At most 8 words on why. Required for both verdicts.' },
+            line:   { type: 'string',  description: `The ad-ready extractive line, <=${PROOF_LINE_MAX_CHARS} characters, a complete thought. Empty string when usable is false.` }
+          }
+        }
+      }
+    }
+  }
+};
+
+function buildJudgeSystemPrompt() {
+  return [
+    `You are choosing which customer comments may be printed as the testimonial on a paid direct-response ad, and shortening each chosen one to <=${PROOF_LINE_MAX_CHARS} characters.`,
+    '',
+    'JUDGE THE MEANING OF THE WHOLE SENTENCE. Do not decide on the presence or absence of any single word. A keyword test gets both of these backwards, so read them and understand why:',
+    '  "Not great, would not buy again."           → NOT usable. It contains the word "great" and is still a complaint.',
+    '  "Hasn\'t faded at all after a year, love it" → USABLE. It contains "faded" and is outstanding praise.',
+    '',
+    'USABLE means ALL of the following:',
+    '- It is positive ON BALANCE about the product. Wholehearted, not hedged. "Nice but runs small" is not usable.',
+    '- It is about the PRODUCT, not shipping, delivery, packaging, returns, or customer service.',
+    '- It reads as a finished thought, not a fragment.',
+    '- It is specific enough to mean something. Pure noise ("🔥🔥", "want", "need this") is not usable.',
+    '- It says nothing that would embarrass the brand or make a claim the brand cannot stand behind (medical results, income, competitor comparisons).',
+    '',
+    'A NEGATED COMPLAINT IS PRAISE, and the strongest kind. "no cracks after a year", "doesn\'t smell", "never slips", "hasn\'t stretched out" are the reviewer naming the exact worry that stops a purchase and resolving it. Mark these usable and prefer them.',
+    '',
+    'FOR EACH USABLE CANDIDATE, return `line`: the sharpest self-contained phrase from it, verbatim.',
+    `- <=${PROOF_LINE_MAX_CHARS} characters. This is the ONLY point at which it is shortened; nothing downstream trims it again, so it must be ad-ready exactly as written.`,
+    '- Extractive: it MUST appear near-verbatim in the candidate. No paraphrasing, no new words.',
+    '- Never cut mid-word or mid-clause, and never use an ellipsis. If nothing self-contained fits, return the strongest SHORT complete phrase instead of the opening fragment of a long one.',
+    '- Keep the writer\'s voice; colloquial phrasing and imperfect grammar are fine. Strip @handles and hashtags.',
+    '',
+    'When usable is false, set line to an empty string.',
+    'Return exactly one entry per candidate, with its index. Judge each one independently.'
+  ].join('\n');
+}
+
+/**
+ * judgeProofLines(texts, ctx) → [{ index, usable, reason, line }]
+ *
+ * The positive/negative decision for UNRATED proof — social comments — made by
+ * inference over the whole sentence, in ONE batched call for all candidates.
+ *
+ * WHY THIS IS NOT A LEXICON. The regex gate this replaces asked "does a
+ * positive word appear in the string", which accepted "Not great, would not
+ * buy again" because the word `great` is in it. Adding a complaint blocklist
+ * on top then rejected "Hasn't faded at all after a year, love it" — risk
+ * reversal, the single most persuasive thing a reviewer can write, and the
+ * exact form the snippet prompt above is told to PREFER. An allowlist and a
+ * blocklist cannot both be right about a negation; sentiment is a property of
+ * the sentence, not of its words.
+ *
+ * One call per candidate set, ~$0.00002 through the review-text role. The
+ * model also returns the shortened line, so a comment is still judged and
+ * shortened exactly ONCE.
+ *
+ * Callers must handle `usable: false` by DROPPING the candidate.
+ *
+ * NO LEXICAL FALLBACK — IT FAILS LOUD. See docs/PROOF_JUDGE.md. chatCompletion
+ * already tries Atlas and then the direct provider for the same model; if BOTH
+ * are unreachable there is no third path that can judge sentiment, and the
+ * only alternatives would be to print unjudged comments or to silently degrade
+ * to the keyword screen this function exists to replace. Both put a complaint
+ * on a paid ad. So it alerts and throws, and the ad fails visibly.
+ */
+async function judgeProofLines(texts, { brandId = null, productId = null } = {}) {
+  const candidates = (Array.isArray(texts) ? texts : [])
+    .map((t, i) => ({ index: i, text: String(t || '').trim() }))
+    .filter(c => c.text);
+  if (!candidates.length) return [];
+
+  const fail = (message, level) => {
+    const err = new Error(`proofJudge: ${message}`);
+    err.stage = 'proof_line_judge';
+    err.alertKey = 'proof-judge:unavailable';
+    err.alertLevel = level;
+    alerts.notifyAsync({
+      level,
+      title: 'Social-proof judge unavailable',
+      body: `${message}. Comments cannot be screened for sentiment, so no ad may render social proof until this clears.`,
+      key:  err.alertKey
+    });
+    return err;
+  };
+
+  // No credential for Atlas AND none for the direct provider: this is a
+  // configuration fault, not a transient one. Five-alarm.
+  if (!atlasConfigured() && !process.env.OPENAI_API_KEY && !process.env.GEMINI_API_KEY) {
+    throw fail('no ATLAS_API_KEY, OPENAI_API_KEY or GEMINI_API_KEY configured', 'fatal');
+  }
+
+  const t0 = Date.now();
+  try {
+    const completion = await chatCompletion(
+      {
+        stage:      'proof_line_judge',
+        provider:   'openai',
+        model:      MODEL_ID,
+        purposeTag: 'judge',
+        brandId, productId,
+        visionImages: 0,
+        cacheKey:   null
+      },
+      {
+        model:           MODEL_ID,
+        response_format: { type: 'json_schema', json_schema: JUDGE_SCHEMA },
+        messages: [
+          { role: 'system', content: buildJudgeSystemPrompt() },
+          { role: 'user',   content: candidates.map(c => `${c.index}. ${c.text}`).join('\n') }
+        ],
+        temperature: 0,
+        max_tokens:  60 * candidates.length + 200
+      }
+    );
+
+    const raw = completion.choices?.[0]?.message?.content;
+    if (!raw) throw new Error('empty response');
+    const parsed = JSON.parse(raw);
+    const byIndex = new Map();
+    for (const row of (Array.isArray(parsed.lines) ? parsed.lines : [])) {
+      if (Number.isInteger(row?.index)) byIndex.set(row.index, row);
+    }
+
+    const out = [];
+    for (const c of candidates) {
+      const row = byIndex.get(c.index);
+      // A candidate the model did not return a verdict for is DROPPED, not
+      // assumed good. Silence is not approval for text going onto an ad.
+      if (!row) { out.push({ index: c.index, usable: false, reason: 'no verdict returned', line: '' }); continue; }
+      let line = String(row.line || '').trim();
+      const usable = row.usable === true && !!line;
+      // The model is told to stay extractive and inside the budget; verify
+      // rather than trust, and fall back to a mechanical cut of the ORIGINAL
+      // rather than printing a paraphrase.
+      if (usable && !isExtractive(line, c.text)) {
+        console.warn(`proofJudge: non-extractive "${line}" — mechanical shorten`);
+        line = shortenProofLine(c.text);
+      }
+      if (usable && line.length > PROOF_LINE_MAX_CHARS) {
+        line = shortenProofLine(line);
+      }
+      out.push({ index: c.index, usable, reason: String(row.reason || '').slice(0, 60), line: usable ? line : '' });
+    }
+
+    const kept = out.filter(r => r.usable).length;
+    console.log(`⚖️  proofJudge: ${kept}/${candidates.length} usable in ${Date.now() - t0}ms`);
+    return out;
+  } catch (err) {
+    // chatCompletion has already tried Atlas and then the direct provider for
+    // this model. Reaching here means neither answered, so there is nothing
+    // left that can judge sentiment. Stop; do not guess.
+    throw fail(`judge call failed after ${Date.now() - t0}ms (${err.message})`, 'error');
+  }
+}
+
 // One-line helper so every comment emitter shortens identically. Deliberately
 // the same routine the quote fallback uses: a complete sentence or clause when
 // one fits, otherwise a space-boundary cut — never mid-word.
@@ -260,12 +436,118 @@ function shortenProofLine(text, maxChars = PROOF_LINE_MAX_CHARS) {
   return clean ? truncateAtWordBoundary(clean, maxChars) : '';
 }
 
+/**
+ * ensureCommentsJudged(comments, ctx) → the same rows, each with proofJudgment
+ *
+ * The read-side half of the ingest judgment. Rows already carrying a verdict
+ * cost nothing; rows without one are judged in a single batched call and the
+ * verdict is PERSISTED, so the next ad that touches the same comment reads it
+ * from the row.
+ *
+ * That lazy fill is what lets the judgment be an ingest concern without a
+ * backfill: a comment ingested before the judge existed, or ingested while the
+ * judge was down, gets its verdict the first time something wants to render
+ * it. Forward-only, self-healing.
+ *
+ * Throws if the judge is unavailable — see judgeProofLines. Callers must NOT
+ * catch that and render the comments anyway.
+ */
+async function ensureCommentsJudged(comments, { brandId = null, productId = null } = {}) {
+  const rows = (Array.isArray(comments) ? comments : []).filter(c => c && String(c.text || '').trim());
+  if (!rows.length) return [];
+
+  const unjudged = rows.filter(c => typeof c.proofJudgment?.usable !== 'boolean');
+  if (!unjudged.length) return rows;
+
+  const verdicts = await judgeProofLines(unjudged.map(c => c.text), { brandId, productId });
+  const judgedAt = new Date();
+  const ops = [];
+  for (const v of verdicts) {
+    const doc = unjudged[v.index];
+    if (!doc) continue;
+    const judgment = { usable: v.usable, reason: v.reason || null, line: v.line || null, model: MODEL_ID, judgedAt };
+    doc.proofJudgment = judgment;
+    if (doc._id) ops.push({ updateOne: { filter: { _id: doc._id }, update: { $set: { proofJudgment: judgment } } } });
+  }
+  if (ops.length) {
+    // A cache-write failure is not a correctness failure: the verdicts above
+    // are already applied in memory, so this ad renders correctly and the next
+    // one simply re-judges.
+    try { await Comment.bulkWrite(ops, { ordered: false }); }
+    catch (err) { console.warn(`proofJudge: verdict persist failed (${err.message}) — judged for this run only`); }
+  }
+  console.log(`⚖️  proofJudge: ${unjudged.length} newly judged, ${rows.length - unjudged.length} cached`);
+  return rows;
+}
+
+/**
+ * usableProofComments(comments, ctx) → rows the judge approved, each with
+ * `.proofLine` set to the ad-ready ≤PROOF_LINE_MAX_CHARS text.
+ *
+ * The single entry point every surface that renders a comment should use, so
+ * they cannot disagree about what counts as praise.
+ */
+// Hard ceiling on how many candidates go into one judge call. The response
+// carries a line per candidate, so an unbounded batch can overrun the token
+// budget, come back truncated, and fail JSON.parse — turning a chatty brand's
+// comment section into a failed ad. Candidates arrive like-sorted, so the cap
+// keeps the best ones.
+const JUDGE_BATCH_MAX = Number(process.env.PROOF_JUDGE_BATCH_MAX || 60);
+
+async function usableProofComments(comments, ctx = {}) {
+  const capped = (Array.isArray(comments) ? comments : []).slice(0, JUDGE_BATCH_MAX);
+  if (Array.isArray(comments) && comments.length > JUDGE_BATCH_MAX) {
+    console.log(`⚖️  proofJudge: ${comments.length} candidates capped to ${JUDGE_BATCH_MAX} for judging`);
+  }
+  const judged = await ensureCommentsJudged(capped, ctx);
+  const kept = judged
+    .filter(c => c.proofJudgment?.usable === true && c.proofJudgment?.line)
+    .map(c => Object.assign(c, { proofLine: c.proofJudgment.line }));
+  if (judged.length !== kept.length) {
+    console.log(`💬 proof comments — kept=${kept.length}/${judged.length} (judged usable)`);
+  }
+  return kept;
+}
+
+/**
+ * usableProofCommentsOrNone(comments, ctx, where) → approved rows, or []
+ *
+ * ONE failure policy for every comment surface, in one place.
+ *
+ * judgeProofLines alerts and throws when the judge is unreachable, which is
+ * right — nothing unjudged may be printed. But the consumers disagreed about
+ * what to do with that throw: two swallowed it into an empty list, two let it
+ * abort the whole ad. The same outage therefore killed some ads and quietly
+ * degraded others, which is the worst of both.
+ *
+ * The policy: comments are ENRICHMENT. The judge being down means this ad gets
+ * NO comments — never a raw one — and the alert has already fired. It does not
+ * mean an ad holding 4.5-star review quotes should fail; that is the wrong
+ * severity for the wrong reason. An ad whose only proof was comments now
+ * legitimately has no proof, which the Director's HONESTY RULE already handles
+ * by setting social_proof_type="none" rather than inventing something.
+ */
+async function usableProofCommentsOrNone(comments, ctx = {}, where = 'unknown') {
+  try {
+    return await usableProofComments(comments, ctx);
+  } catch (err) {
+    // judgeProofLines already alerted; this line is for the render log, so the
+    // absence of comments on this ad is explained rather than mysterious.
+    console.warn(`⚠️  proofJudge unavailable at ${where} — rendering with NO comments (${err.message})`);
+    return [];
+  }
+}
+
 module.exports = {
   extractSnippet,
   truncateAtWordBoundary,   // exported for testing / direct fallback callers
   strongestSentence,
   bestClause,
   shortenProofLine,
+  judgeProofLines,
+  ensureCommentsJudged,
+  usableProofComments,
+  usableProofCommentsOrNone,
   PROOF_LINE_MAX_CHARS,
   MAX_CHARS
 };

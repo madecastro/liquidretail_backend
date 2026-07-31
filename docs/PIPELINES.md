@@ -284,10 +284,22 @@ Both paths: kind `enrichment`, cancellable; partials kept. Idempotent via 30-day
 
 `services/layoutInputService.js` `pickStrongestQuote` runs over the 6-tier quote pool (product → category → brand → social comment → LLM → synth):
 
-- When **any** candidate in a tier carries a scraped star rating, candidates the reviewer scored below **`MIN_STARS_FOR_AD` (4)** are dropped, and a small bonus breaks ties in favour of 5-star over 4-star. Tiers with no ratings (comments, LLM-authored) are unaffected and fall through to the lexical scorer as before.
+- There is **one** star threshold, **`QUOTE_MIN_RATING` (4.5)**, enforced in two places against the same constant: `gateQuotesByRating` filters a whole review-backed tier, and `pickStrongestQuote` re-applies it per candidate for any tier that reaches it ungated. A small bonus (0–0.5) breaks ties in favour of 5-star over 4.5-star. Tiers with no ratings (comments, LLM-authored) are unaffected and fall through to the lexical scorer as before.
+- Ratings are normalized to a 5-point scale (`toFiveScale`) before **every** comparison — vendor adapters store each review's stars verbatim, so a 90/100 read literally would clear any threshold and, as a tie-break bonus, would outrank the prose score outright.
+- The product tier reads `productReviewsOf(match)`, which checks `identification.details.productReviews` (the operator's seed pick) then the hydrated top-level `match.productReviews`. Reading only the former left the tier structurally empty on every hydrated match, so scraped SKU-specific quotes never reached an ad.
 - The lexical `scoreQuote` sentiment gate still applies on top; stars decide *eligibility*, prose decides *which* eligible quote wins.
 - `normalizeQuote` carries `rating` + `title` through onto the artifact, so the renderer can draw stars next to the quote and use the reviewer’s own headline.
 - Star ratings do **not** exist on Gemini web-wide quotes; those still rely on the lexical gate alone.
+
+### Surfacing a COMMENT on an ad
+
+Comments carry no star rating, so sentiment is the only gate — and it is made by
+**inference at ingest**, not by a keyword lexicon. The verdict is persisted to
+`Comment.proofJudgment` and read by every surface that renders a comment
+(quote tier, `top_comments`, the AI-canvas builder, the Director, the
+image-reference builder). If the judge is unreachable it **alerts and throws**;
+there is no lexical fallback. Full rationale, failure policy and consumer list:
+**[docs/PROOF_JUDGE.md](PROOF_JUDGE.md)**.
 
 ---
 
