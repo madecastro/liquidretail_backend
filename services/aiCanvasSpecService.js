@@ -37,6 +37,7 @@ const { loadContext } = require('./layoutInputService');
 const { trackLlmCall, recordCacheHit } = require('./costTracker');
 
 const { chatCompletion } = require('./atlasLlmService');
+const { getFormatCaps } = require('./platformFormats');
 
 const MODEL_ID = 'gpt-4.1';
 const SPEC_SCHEMA_VERSION = '4.0.0';   // 4.0: retired V1 panel-zone layering constraints. The "panels sit ON TOP of media zones (z-index by layer: media=0, background=1, copy=3)" + "panel cannot cover or substantially overlap media" + ">60% media area forbidden" + three-prescriptive-patterns rules were V1 deterministic-renderer protections. V2 (HTML Gen) renders zones as CSS divs with full expressiveness (translucent panels, blend modes, gradients, photo backdrops) — none of the V1 layering concerns apply. Replaced with a "zones are semantic, not pixel-level layers" framing that explicitly enables panel-covers-media compositions, text-on-media without backing panels, and arbitrary visual_direction interpretation by HTML Gen. Unlocks magazine-editorial dominance, full-bleed scrims, editorial spreads, and other layouts the V1 rules forbade. 3.1: Phase 4 platform-format safe-area boxes (kept). 3.0: video topology mandate rolled back.
@@ -452,29 +453,61 @@ function buildResponseSchema(aspectRatio) {
 // rejects any spec whose chrome zones intrude. Mirrors the HTML Gen
 // FORMAT CONSTRAINTS pixel boxes from Phase 3 — same coords so both
 // LLMs reason in the same space.
+// Driven entirely off the platformFormats table, per surface.
+//
+// This used to be `if (reels) {...} else {feed 1:1}`, which meant every
+// non-Reels surface was handed the Feed block verbatim: Stories was told it was
+// SQUARE 1:1 and that it had NO reserved bands, when it actually reserves 250px
+// top and bottom for the creator chip and the reply input. The generator was
+// therefore instructed to fill a canvas it did not have, and to place chrome
+// exactly where IG's own UI covers it. Feed 4:5 and PMax 16:9 got the same
+// wrong dimensions.
+//
+// Anything in PLATFORM_FORMATS is now described correctly without touching this
+// function — which is what makes per-surface templates addable as data.
 function buildFormatConstraintsBlock(platformFormat, width, height) {
-  if (platformFormat === 'meta_reels_9_16') {
-    // Safe areas scaled from Meta's published Reels safe zones
-    // (220px top + bottom on 1920-tall) to our 1778-tall normalized
-    // canvas: top 0-204, bottom 1574-1778 reserved.
-    const safeTop = Math.round(204 * (height / 1778));
-    const safeBottom = height - safeTop;
+  const caps = getFormatCaps(platformFormat);
+  if (!caps) {
+    // An unknown surface must not silently inherit Feed's geometry.
     return [
-      `FORMAT CONSTRAINTS — meta_reels_9_16 (Reels, vertical 9:16):`,
-      `  Canvas:             ${width}×${height} (Meta delivers as 1080×1920; our normalized space is 1000×1778)`,
-      `  Reserved top band:  rect {x:0, y:0, w:${width}, h:${safeTop}} — IG/FB caption + creator overlay live here`,
-      `  Reserved bottom band: rect {x:0, y:${safeBottom}, w:${width}, h:${safeTop}} — IG/FB like / comment / share / save controls live here`,
-      `  Content safe rect:  {x:0, y:${safeTop}, w:${width}, h:${safeBottom - safeTop}} (the middle ~${Math.round(((safeBottom - safeTop) / height) * 100)}% of canvas height)`,
-      `  HARD: every chrome zone you emit (kind != "media") MUST fit entirely inside the content safe rect — rect.y >= ${safeTop} AND rect.y + rect.h <= ${safeBottom}. The validator will REJECT specs whose chrome zones intrude either reserved band as a safe_area_violation HARD failure; your candidate gets dropped pre-Judge.`,
-      `  Media zones (kind === "media") CAN cross the reserved bands — the video plays edge-to-edge underneath IG's UI overlays.`,
-      `  Composition guidance: think of the canvas as having ONLY the middle ${safeBottom - safeTop}px of vertical space for chrome. Bottom panel bands should end at y=${safeBottom} (NOT y=${height}). Top eyebrow rules should start at y=${safeTop} (NOT y=0). Floating cards / CTAs in the middle band are ideal.`
+      `FORMAT CONSTRAINTS — ${platformFormat} (UNKNOWN SURFACE):`,
+      `  Canvas: ${width}×${height}. No safe-area data available for this format — keep all chrome well inside the canvas edges.`
     ].join('\n');
   }
-  return [
-    `FORMAT CONSTRAINTS — meta_feed_1_1 (Feed, square 1:1):`,
-    `  Canvas:             ${width}×${height} (Meta delivers as 1080×1080; our normalized space is 1000×1000)`,
-    `  Safe zones:         none — feed surface has no reserved bands. Chrome can use the full canvas.`
-  ].join('\n');
+
+  const lines = [
+    `FORMAT CONSTRAINTS — ${platformFormat} (${caps.label}, ${caps.aspectRatio}):`,
+    `  Canvas:             ${width}×${height} (delivered at ${caps.deliveryDims.width}×${caps.deliveryDims.height}; our normalized space is ${caps.canvas.width}×${caps.canvas.height})`,
+    `  Accepts:            ${(caps.kinds || []).join(' + ') || 'image'}`
+  ];
+
+  // Reserved bands are declared in the table at the canonical canvas height, so
+  // scale to whatever height this call is composing at.
+  const scale      = height / caps.canvas.height;
+  const safeTop    = Math.round((caps.safeArea?.top || 0) * scale);
+  const safeBottomH = Math.round((caps.safeArea?.bottom || 0) * scale);
+  const safeBottom = height - safeBottomH;
+
+  if (safeTop > 0 || safeBottomH > 0) {
+    const contentH = safeBottom - safeTop;
+    if (safeTop > 0) {
+      lines.push(`  Reserved top band:  rect {x:0, y:0, w:${width}, h:${safeTop}} — the platform's own UI sits here`);
+    }
+    if (safeBottomH > 0) {
+      lines.push(`  Reserved bottom band: rect {x:0, y:${safeBottom}, w:${width}, h:${safeBottomH}} — the platform's own UI sits here`);
+    }
+    lines.push(
+      `  Content safe rect:  {x:0, y:${safeTop}, w:${width}, h:${contentH}} (the middle ~${Math.round((contentH / height) * 100)}% of canvas height)`,
+      `  HARD: every chrome zone you emit (kind != "media") MUST fit entirely inside the content safe rect — rect.y >= ${safeTop} AND rect.y + rect.h <= ${safeBottom}. The validator REJECTS specs whose chrome zones intrude a reserved band as a safe_area_violation HARD failure; your candidate is dropped pre-Judge.`,
+      `  Media zones (kind === "media") CAN cross the reserved bands — the creative runs edge-to-edge underneath the platform's overlays.`,
+      `  Composition guidance: treat ONLY the middle ${contentH}px of vertical space as available for chrome. Bottom panel bands should end at y=${safeBottom} (NOT y=${height}). Top eyebrow rules should start at y=${safeTop} (NOT y=0). Floating cards / CTAs in the middle band are ideal.`
+    );
+  } else {
+    lines.push(`  Safe zones:         none — this surface has no reserved bands. Chrome can use the full canvas.`);
+  }
+
+  if (caps.creativeBrief) lines.push(`  Surface brief:      ${caps.creativeBrief}`);
+  return lines.join('\n');
 }
 
 function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext, directionConcept = null, platformFormat = 'meta_feed_1_1' }) {
@@ -1588,5 +1621,6 @@ module.exports = {
   SPEC_SCHEMA_VERSION,
   // exposed for testing
   buildPrompt,
-  validateSpec
+  validateSpec,
+  buildFormatConstraintsBlock
 };

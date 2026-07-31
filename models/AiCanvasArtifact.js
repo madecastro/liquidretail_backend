@@ -19,6 +19,7 @@
 // validator gets stricter.
 
 const mongoose = require('mongoose');
+const { PLATFORM_FORMAT_KEYS } = require('../services/platformFormats');
 
 const aiCanvasArtifactSchema = new mongoose.Schema({
   advertiserId: { type: mongoose.Schema.Types.ObjectId, ref: 'Advertiser', index: true, default: null },
@@ -63,8 +64,14 @@ const aiCanvasArtifactSchema = new mongoose.Schema({
   // — Phase 5 wires that. For now the schema-version bump invalidates
   // cached artifacts so the next call regenerates with format-awareness.
   platformFormat: {
-    type:    String,
-    enum:    ['meta_feed_1_1', 'meta_reels_9_16'],
+    type: String,
+    // Driven off platformFormats.js rather than a hand-listed pair. The literal
+    // list here was ['meta_feed_1_1', 'meta_reels_9_16'] while the format table
+    // defined five surfaces, so saving a canvas artifact for Stories, Feed 4:5
+    // or PMax threw a Mongoose ValidationError — three of five surfaces could
+    // not persist a spec at all. A new surface added to the table is now
+    // accepted here automatically.
+    enum:    PLATFORM_FORMAT_KEYS,
     default: 'meta_feed_1_1',
     index:   true
   },

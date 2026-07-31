@@ -550,6 +550,21 @@ const ARCHETYPE_WEIGHTING = {
     `    DEPRIORITIZE product_card_grid (multi-card layouts feel cramped on tall vertical)`,
     `    AVOID        stat_led_social_proof (numeric stat as hero competes with creator-handle overlays in top safe zone)`
   ].join('\n'),
+  // Stories is NOT Reels, even though both are 9:16. Reels is a scroll surface
+  // where the ad competes with entertainment; Stories is tap-through, ephemeral,
+  // and natively overlay-heavy (text, stickers, polls), with a much deeper
+  // reserved band top and bottom (250 vs 204). Without its own entry Stories got
+  // no weighting at all, so the Director picked archetypes tuned for square Feed.
+  meta_stories_9_16: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  full_bleed_hero_bottom_panel (full-screen imagery with the panel inside the middle band is exactly how native Stories reads)`,
+    `    PREFER  typographic_dominant (Stories creative is natively text-and-sticker heavy — bold type reads as native here, unlike on Reels)`,
+    `    PREFER  hero_quote_overlay (a floating quote card in the middle band mirrors the sticker convention)`,
+    `    DEPRIORITIZE magazine_editorial (an editorial spread reads as a printed page on a surface people tap through in 3 seconds)`,
+    `    DEPRIORITIZE product_card_grid (multi-card layouts get cramped between a 250px chip band and a 250px reply band)`,
+    `    AVOID        stat_led_social_proof (a numeric hero competes with the creator chip in the top reserved band)`,
+    `    Drive curiosity or urgency over direct sell — the tap-forward is the enemy, not the scroll.`
+  ].join('\n'),
   pmax_16_9: [
     `  ARCHETYPE WEIGHTING:`,
     `    PREFER  magazine_editorial (clean editorial spread reads as commercial/professional on landscape)`,
