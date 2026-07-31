@@ -1320,25 +1320,29 @@ async function getOrGenerate({
         .catch(() => {});
     });
 
-    // Image-Ref shadow — kept firing so the photoreal polish runs on
-    // the HTML-rendered seed. The service polls for canvas.outputHtml
-    // until HTML Gen finishes, then proceeds with html_render mode.
-    setImmediate(() => {
-      const imgRef = require('./aiImageReferenceService');
-      if (!imgRef.enabled()) return;
-      imgRef.generateForArtifact({ aiCanvasArtifactId: artifact._id })
-        .then(out => {
-          if (out.skipped) return;
-          console.log(
-            `🖼  image-ref shadow ${out.cached ? 'CACHE-HIT' : 'GENERATED'}: ` +
-            `aiCanvasArtifact=${artifact._id}` +
-            (out.artifact?.imageUrl ? ` url=${out.artifact.imageUrl}` : '')
-          );
-        })
-        .catch(err => {
-          console.warn(`   ⚠️  image-ref shadow failed: ${err.message}`);
-        });
-    });
+    // Image-Ref shadow — REMOVED 2026-07-31 by owner instruction ("the shadow
+    // fire driving expense that is unconsumed needs to stop immediately").
+    //
+    // It fired a full billable gpt-image-2 call per canvas artifact, at
+    // quality=high, to produce an AiFullRenderArtifact that **no renderer ever
+    // read** — the service's own header said "Shadow only — no caller relies on
+    // the result for the render path", and docs/backlog.csv:147 already recorded
+    // that nothing user-facing consumes it. Worse, it seeded itself by polling up
+    // to 25s for canvas.outputHtml and then Puppeteer-rasterising that HTML, so
+    // it also kept the retired HTML path warm: measured 38–50s of added latency
+    // per ad (took=50487ms / 44021ms / 38604ms / 41344ms on 2026-07-30) on top of
+    // a second image charge.
+    //
+    // Deleted rather than env-gated on purpose. It had a kill switch
+    // (AI_IMAGE_REFERENCE_ENABLED) and that switch was ON in the Render dashboard
+    // for both services — a flag that defaults to spending money is not a
+    // safeguard. The artifacts already written stay readable via
+    // routes/aiCanvasSpec.js; nothing new is produced.
+    //
+    // aiImageReferenceService.js is intentionally left in the tree: it is the only
+    // record of the photoreal-polish prompt work. If a polish step is ever wanted
+    // again it must be an explicit, consumed render stage with its cost attributed
+    // — not a fire-and-forget shadow.
 
     // No spec to apply copy picks against — return the unmodified input.
     // Image Ref will read copyPicks off the artifact once HTML Gen writes
@@ -1572,26 +1576,9 @@ async function getOrGenerate({
       });
   });
 
-  // Phase X.1 SHADOW — gpt-image-1 reference render. Opt-in via
-  // AI_IMAGE_REFERENCE_ENABLED=true. Fires per AiCanvasArtifact;
-  // dedup is handled inside the service (AiFullRenderArtifact's unique
-  // index matches AiCanvasArtifact's). Renderer never reads this.
-  setImmediate(() => {
-    const imgRef = require('./aiImageReferenceService');
-    if (!imgRef.enabled()) return;
-    imgRef.generateForArtifact({ aiCanvasArtifactId: artifact._id })
-      .then(out => {
-        if (out.skipped) return;
-        console.log(
-          `🖼  image-ref shadow ${out.cached ? 'CACHE-HIT' : 'GENERATED'}: ` +
-          `aiCanvasArtifact=${artifact._id}` +
-          (out.artifact?.imageUrl ? ` url=${out.artifact.imageUrl}` : '')
-        );
-      })
-      .catch(err => {
-        console.warn(`   ⚠️  image-ref shadow failed: ${err.message}`);
-      });
-  });
+  // Phase X.1 SHADOW — REMOVED 2026-07-31. Second of the two fire sites; see the
+  // full rationale at the sibling removal in the AI_LAYOUT_DIRECT_HTML branch
+  // above. Billable gpt-image-2 call per artifact, output read by nothing.
 
   // Phase 6.1 / 6.5.1 — HTML Layout Generator is now driven eagerly by
   // renderService.ensureCanvasAndHtml before the renderer makes the

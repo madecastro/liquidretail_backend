@@ -250,10 +250,25 @@ const brandSchema = new mongoose.Schema({
   // Runtime-selectable static-ad renderer. This is intentionally stored on
   // the Brand, not in a deploy-time environment variable: operators can
   // switch the next concept-driven static render from the application.
+  //
+  // 2026-07-31 — 'direct_overlay' RETIRED at owner instruction ("kill the direct
+  // image with overlay path, it was never used and nobody liked it"). That mode
+  // asked the image model for a deliberately text-free plate and then composited
+  // every headline, rating, quote and CTA locally as SVG. It is replaced by
+  // 'direct_image', where the model typesets the copy itself from the proven
+  // intent prompts (services/staticAdIntents.js). The brand LOGO is still
+  // composited locally and is never sent to the model — owner-specified, and the
+  // one deliberate exception to "the model renders everything".
+  //
+  // NO BACKFILL (house rule: forward-only). Brands still holding the retired
+  // 'direct_overlay' string are not migrated; resolveStaticPipeline() below
+  // treats anything that is not exactly 'html' as the direct path, so those rows
+  // land on 'direct_image' by themselves and nothing throws on read. The enum is
+  // only consulted on write, so an old value can never break a render.
   staticImagePipeline: {
     type: String,
-    enum: ['direct_overlay', 'html'],
-    default: 'direct_overlay'
+    enum: ['direct_image', 'html'],
+    default: 'direct_image'
   },
 
   // Per-brand overrides of the meta-field cascades (services/metaCascadeConfig.js).
