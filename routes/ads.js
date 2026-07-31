@@ -993,7 +993,17 @@ async function renderOne(run, job, adId, index, renderToken) {
         {
           $set: {
             status:      'failed',
-            renderError: { message: errMsg, stage: result.stage || 'unknown', at: new Date() },
+            // predictionId makes an abandoned-but-paid-for render recoverable:
+            // Atlas retains the asset for days, so a reclaim pass can fetch it
+            // instead of re-submitting and paying twice.
+            renderError: {
+              message:      errMsg,
+              stage:        result.stage || result.error?.stage || 'unknown',
+              predictionId: result.error?.predictionId || null,
+              atlasCode:    result.error?.atlasCode ?? null,
+              charged:      result.error?.charged === true,
+              at:           new Date()
+            },
             updatedAt:   new Date()
           },
           $inc: { renderAttempts: 1 }
