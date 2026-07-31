@@ -454,7 +454,17 @@ async function renderStage(args) {
         fields: { template, aspectRatio, product: String(productId || '-'), media: String(mediaId || '-'), error: err.message },
         detail: err.stack || null
       });
-      throw new Error(`direct-image render failed: ${err.message}`, { cause: err });
+      // Re-wrapping put the provider's tags on `err.cause`, but failed() reads
+      // them at the TOP level — so predictionId/charged/atlasCode were lost at
+      // exactly the moment they mattered, and a paid-for image became
+      // unrecoverable. Carry them forward explicitly.
+      const wrapped = new Error(`direct-image render failed: ${err.message}`, { cause: err });
+      wrapped.predictionId = err.predictionId || null;
+      wrapped.charged      = err.charged === true;
+      wrapped.atlasCode    = err.atlasCode ?? null;
+      wrapped.alertLevel   = err.alertLevel;
+      wrapped.alertKey     = err.alertKey;
+      throw wrapped;
     }
     if (!output?.skipped) return output;
     if (!output.routedToHtml) {

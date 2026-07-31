@@ -343,7 +343,7 @@ async function generateImage({
   } catch (err) {
     if (!allowFallback) throw err;
     warnIfDoublePaying(err, 'generate');
-    const fb = await directOpenAiImages({ kind: 'generate', prompt, size, quality, fallbackModel }).catch((e) => { throw new Error(`${err.message}; fallback: ${e.message}`); });
+    const fb = await directOpenAiImages({ kind: 'generate', prompt, size, quality, fallbackModel }).catch((e) => { throw carryProviderTags(new Error(`${err.message}; fallback: ${e.message}`), err); });
     if (!fb) throw err;
     // The fallback is a DIFFERENT provider and model. Reporting the Atlas
     // attempt here would describe a request that produced nothing.
@@ -367,6 +367,23 @@ async function generateImage({
  * hide. Both charges are in the ledger: Atlas via chargedError, OpenAI via its own
  * recordFlatCost path.
  */
+// Carry a provider error's billing tags onto a wrapper error.
+//
+// `charged` and `predictionId` are the only record that Atlas already billed
+// for an image and is still holding it. Re-wrapping an error with
+// `new Error(...)` silently resets both to undefined, so the double-spend
+// warning went quiet and the paid-for prediction became unreclaimable — at
+// precisely the moment two providers had been paid.
+function carryProviderTags(wrapper, source) {
+  wrapper.predictionId = source?.predictionId || null;
+  wrapper.charged      = source?.charged === true;
+  wrapper.atlasCode    = source?.atlasCode ?? null;
+  wrapper.costUsd      = source?.costUsd ?? undefined;
+  if (source?.alertLevel) wrapper.alertLevel = source.alertLevel;
+  if (source?.alertKey)   wrapper.alertKey   = source.alertKey;
+  return wrapper;
+}
+
 function warnIfDoublePaying(err, kind) {
   if (!err?.charged) return;
   console.warn(
@@ -413,7 +430,7 @@ async function editImage({
     if (!fbBuffers.length && images.length) {
       fbBuffers = await Promise.all(images.filter((i) => typeof i === 'string').map(async (u) => Buffer.from((await axios.get(u, { responseType: 'arraybuffer', timeout: 30_000 })).data)));
     }
-    const fb = await directOpenAiImages({ kind: 'edit', prompt, size, quality, buffers: fbBuffers, fallbackModel }).catch((e) => { throw new Error(`${err.message}; fallback: ${e.message}`); });
+    const fb = await directOpenAiImages({ kind: 'edit', prompt, size, quality, buffers: fbBuffers, fallbackModel }).catch((e) => { throw carryProviderTags(new Error(`${err.message}; fallback: ${e.message}`), err); });
     if (!fb) throw err;
     // Buffers go to OpenAI as multipart files, so there is no submitted URL to
     // record — only the true count and the caller's position labels.

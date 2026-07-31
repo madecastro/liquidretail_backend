@@ -338,7 +338,23 @@ const adSchema = new mongoose.Schema({
   renderError: {
     message: { type: String },
     stage:   { type: String },
-    at:      { type: Date }
+    at:      { type: Date },
+    // RECOVERY HANDLE. Atlas bills image generation on submit and retains the
+    // prediction for days, so a render that failed AFTER a successful submit is
+    // an image we have already paid for and can still fetch.
+    //
+    // These three were being written by routes/ads.js and renderService.failed()
+    // but were NOT declared here, so mongoose's default strict mode silently
+    // dropped them on every save — the write looked fine and stored nothing.
+    // Every failed-but-charged render was unrecoverable, and "did this cost us
+    // money?" was unanswerable from the Ad doc.
+    predictionId: { type: String, default: null },
+    // Whether the provider had already billed when this failed. Drives the
+    // double-spend warning and the reclaim sweep.
+    charged:      { type: Boolean, default: false },
+    // Provider's own error code (Atlas envelope `code`), e.g. 402 insufficient
+    // balance — kept so a billing rejection is distinguishable from a timeout.
+    atlasCode:    { type: Number, default: null }
   },
   renderAttempts: { type: Number, default: 0 },
 

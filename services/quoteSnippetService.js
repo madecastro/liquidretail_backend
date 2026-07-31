@@ -301,7 +301,8 @@ function buildJudgeSystemPrompt() {
     '',
     'FOR EACH USABLE CANDIDATE, return `line`: the sharpest self-contained phrase from it, verbatim.',
     `- <=${PROOF_LINE_MAX_CHARS} characters. This is the ONLY point at which it is shortened; nothing downstream trims it again, so it must be ad-ready exactly as written.`,
-    '- Extractive: it MUST appear near-verbatim in the candidate. No paraphrasing, no new words.',
+    '- Extractive, and CONTIGUOUS. Copy an unbroken run of words out of the candidate. You may cut from the START or the END, but you must NEVER remove words from the MIDDLE and close the gap. "no pilling after 6 months which is unheard of" → "no pilling after 6 months" is correct. Stitching "after a year" onto "love it" and dropping what sat between them is not, even though every word is the writer\'s. Removing interior words can reverse a meaning — "not great, would not buy" becomes "great ... buy" — so a non-contiguous line is rejected and your work on it is thrown away.',
+    '- No paraphrasing, no new words, no reordering.',
     '- Never cut mid-word or mid-clause, and never use an ellipsis. If nothing self-contained fits, return the strongest SHORT complete phrase instead of the opening fragment of a long one.',
     '- Keep the writer\'s voice; colloquial phrasing and imperfect grammar are fine. Strip @handles and hashtags.',
     '',
@@ -401,7 +402,13 @@ async function judgeProofLines(texts, { brandId = null, productId = null } = {})
       const row = byIndex.get(c.index);
       // A candidate the model did not return a verdict for is DROPPED, not
       // assumed good. Silence is not approval for text going onto an ad.
-      if (!row) { out.push({ index: c.index, usable: false, reason: 'no verdict returned', line: '' }); continue; }
+      // A candidate the model did not return a verdict for is DROPPED from
+      // THIS ad — silence is not approval — but `transient` marks it as never
+      // actually judged, so the verdict is not persisted. Storing it as a
+      // usable:false would permanently blacklist a perfectly good comment on
+      // the strength of one truncated or malformed response, and nothing would
+      // ever revisit it.
+      if (!row) { out.push({ index: c.index, usable: false, reason: 'no verdict returned', line: '', transient: true }); continue; }
       let line = String(row.line || '').trim();
       const usable = row.usable === true && !!line;
       // The model is told to stay extractive and inside the budget; verify
@@ -467,7 +474,13 @@ async function ensureCommentsJudged(comments, { brandId = null, productId = null
     if (!doc) continue;
     const judgment = { usable: v.usable, reason: v.reason || null, line: v.line || null, model: MODEL_ID, judgedAt };
     doc.proofJudgment = judgment;
-    if (doc._id) ops.push({ updateOne: { filter: { _id: doc._id }, update: { $set: { proofJudgment: judgment } } } });
+    // `transient` means the model returned no verdict for this candidate, so
+    // it was never really judged. Drop it from this ad, but do NOT write the
+    // rejection — it would be indistinguishable from a considered one and
+    // would outlive the glitch that caused it.
+    if (doc._id && !v.transient) {
+      ops.push({ updateOne: { filter: { _id: doc._id }, update: { $set: { proofJudgment: judgment } } } });
+    }
   }
   if (ops.length) {
     // A cache-write failure is not a correctness failure: the verdicts above

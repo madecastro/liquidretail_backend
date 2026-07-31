@@ -1036,7 +1036,10 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     if (productReviews?.quotes?.length) {
       lines.push('  Real product quotes (use these to inform tone, do NOT copy verbatim):');
       for (const q of productReviews.quotes.slice(0, 5)) {
-        const author = q.author || q.source || 'Verified buyer';
+        // Neutral default, not "Verified buyer": this text is handed to the
+        // copy LLM, and seeding it with an unearned verified-purchase claim is
+        // how that claim ends up written into the ad.
+        const author = q.author || q.source || (q.verified ? 'Verified buyer' : 'Anonymous Customer');
         lines.push(`    - "${q.text}" — ${author}${q.source && q.source !== author ? ` (${q.source})` : ''}`);
       }
     }
@@ -1529,16 +1532,23 @@ function normalizeQuote(q) {
   // normalization.
   const rating = Number(q.rating ?? q.reviewRating?.ratingValue);
   const firstParty = isFirstPartyQuote(q);
+  // Resolved BEFORE the byline, because the byline asserts it.
+  const verified = q.verified !== undefined ? q.verified : firstParty;
   return {
     text:        String(q.text).trim(),
-    // "Verified buyer" is a CLAIM. Defaulting to it for an LLM-derived line
-    // asserts a verified purchase that nothing established — the exact
-    // laundering the provenance stamps exist to prevent. Non-first-party
-    // quotes fall back to a neutral label instead.
+    // "Verified buyer" is a CLAIM, and it must track the `verified` flag rather
+    // than merely first-party-ness. The vendor adapters capture a per-review
+    // verified boolean, so a review a platform explicitly marked UNVERIFIED
+    // was still being given the byline "Verified buyer" — this field was
+    // deciding on `firstParty` while the field right below it honoured the
+    // vendor's actual answer. Same laundering the provenance stamps exist to
+    // prevent, one line further along.
+    // "Anonymous Customer" when we have no name and no verified purchase: it
+    // claims only that someone reviewed the product, which is all we know.
     author_name: q.author_name || q.author || q.source ||
-                 (firstParty ? 'Verified buyer' : 'Customer'),
+                 (verified ? 'Verified buyer' : 'Anonymous Customer'),
     source:      q.source || undefined,
-    verified:    q.verified !== undefined ? q.verified : firstParty,
+    verified,
     // Carried through from the scrape so pickStrongestQuote can gate on
     // the reviewer's own star rating. undefined for tiers that have none.
     rating:      Number.isFinite(rating) ? rating : undefined,
@@ -1560,11 +1570,39 @@ async function loadBrandCommentsForQuotePool(ctx) {
   try {
     const brandId = ctx.media?.brandId || null;
     if (!brandId) return [];
+
+    // PRODUCT-SCOPED on a product ad. The review tiers already withhold
+    // brand-level quotes here (see tierBrand) because a brand-wide review is
+    // about whatever the reviewer bought, which on a multi-SKU brand is usually
+    // NOT this product — a leggings review under a tee photo. Comments had no
+    // such guard: this queried by brandId alone, so the most-liked comment on
+    // ANY of the brand's posts could become this product's testimonial.
+    //
+    // Rather than withhold the tier outright — comments are the only proof some
+    // clients have — narrow it to comments left on media that actually matched
+    // THIS product. Those are comments about this item. A brand ad claims no
+    // single product, so brand-wide is correct there.
+    const scopeProductId = ctx.match?.catalogProductId || null;
+    const scope = { brandId };
+    if (scopeProductId) {
+      const pmas = await ProductMatchArtifact
+        .find({ catalogProductId: scopeProductId, outcome: 'product_match' })
+        .select('mediaId')
+        .limit(200)
+        .lean();
+      const mediaIds = pmas.map(p => p.mediaId).filter(Boolean);
+      if (!mediaIds.length) {
+        console.log(`🔒 comment quote pool — no product-matched media for ${scopeProductId}, comment tier empty on this product ad`);
+        return [];
+      }
+      scope.mediaId = { $in: mediaIds };
+    }
+
     // BOUNDED. This was an unlimited find over every comment the brand has
     // ever received. Feeding that to the judge in one batch would overrun the
     // token budget on a chatty brand, truncate the response, and fail the ad.
     // Like-sorted first so the cap keeps the best candidates.
-    const comments = await Comment.find({ brandId })
+    const comments = await Comment.find(scope)
       .sort({ likeCount: -1, postedAt: -1 })
       .limit(60)
       .select('text authorUsername likeCount postedAt createdAt proofJudgment')
@@ -2234,7 +2272,12 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       show_price:          !!(details.price?.display || details.price?.value),
       show_rating:         typeof details.rating === 'number',
       show_review_count:   typeof details.reviewCount === 'number',
-      show_creator_handle: !!media.metadata?.creatorHandle,
+      // BOTH gated on rights. Engagement was gated and the handle was not,
+      // which is backwards: the like count is a number about a post, the handle
+      // is a real person's identity, and printing it on a paid ad implies they
+      // endorsed it. If we will not show someone's like count without approved
+      // rights we certainly cannot show their name.
+      show_creator_handle: !!media.metadata?.creatorHandle && rightsApproved,
       show_engagement:     !!media.platformStats && rightsApproved,
       show_badges:         (derivation.badges?.length || 0) > 0,
       show_cta:            true
