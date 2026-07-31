@@ -216,7 +216,43 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
       brandId  // safety — never leak media from other brands
     }).select('_id fileType fileUrl source createdAt classification metadata platformStats matchedProducts refinedProducts text').lean() : [];
 
-    const pool = pickedMedias.map(m => {
+    // Scope the operator's picks to the product being iterated.
+    //
+    // Without this, a multi-product run hands EVERY product's Director round
+    // the SAME picked media — so a t-shirt's round sees another SKU's photos
+    // and writes copy about it. That is exactly how a Campus Crest T-Shirt ad
+    // shipped the headline "Strength, in pink." over "Training Straight Leg
+    // Leggings": the artifact was correctly the tee's, its contents were not,
+    // and no downstream FK check can catch that because nothing is
+    // mismatched — the Director was simply shown the wrong product.
+    //
+    // The tier-based path below has always scoped catalog media by
+    // metadata.catalogProductId; this branch bypasses tier assembly and only
+    // filtered by brandId ("never leak media from other brands"), which is the
+    // same guarantee one level too coarse.
+    //
+    // Same standard as the deterministic-video seed path: a direct
+    // catalogProductId, or an explicit outcome:'product_match'. A
+    // 'product_category' match means detect placed the media in the same
+    // CATEGORY as the SKU, which is not evidence it depicts THIS product.
+    // Brand-only runs (productId null) keep every pick — no SKU to scope to.
+    const associatesWithProduct = (m) => {
+      if (isBrandOnly) return true;
+      const pid = String(productId);
+      if (m?.metadata?.catalogProductId != null && String(m.metadata.catalogProductId) === pid) return true;
+      return (Array.isArray(m?.matchedProducts) ? m.matchedProducts : []).some(
+        (x) => x?.catalogProductId != null && String(x.catalogProductId) === pid && x.outcome === 'product_match'
+      );
+    };
+    const scopedMedias = pickedMedias.filter(associatesWithProduct);
+    if (scopedMedias.length !== pickedMedias.length) {
+      console.log(
+        `🔒 seeded universe — ${pickedMedias.length - scopedMedias.length}/${pickedMedias.length} operator-picked media dropped for ` +
+        `product ${productId}: they depict a different SKU`
+      );
+    }
+
+    const pool = scopedMedias.map(m => {
       const isCatalog = m.source === 'catalog-product';
       const role = isCatalog ? 'catalog' : 'ugc_brand_match';
       if (isCatalog) counts.catalog++;

@@ -246,10 +246,25 @@ function buildPlatePrompt({ concept, brand, product, aspectRatio }) {
   return refs.join('\n');
 }
 
-async function resolveConcept({ adConceptArtifactId, adConceptId }) {
+async function resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId }) {
   if (!adConceptArtifactId || !adConceptId) return null;
-  const artifact = await CreativeDirectionArtifact.findById(adConceptArtifactId).select('concepts').lean();
-  return artifact?.concepts?.find((c) => c.concept_id === adConceptId) || null;
+  const artifact = await CreativeDirectionArtifact.findById(adConceptArtifactId).select('concepts productId').lean();
+  if (!artifact) return null;
+
+  // A CreativeDirectionArtifact is scoped to ONE product. An Ad pointing at a
+  // different product's round renders that product's copy under this
+  // product's photo, and nothing downstream can catch it: the Ad has the
+  // right productId, the right images, and copy that reads perfectly — for
+  // the wrong item. That is how a Campus Crest T-Shirt ad shipped the
+  // headline "Strength, in pink." over the subheadline "Training Straight Leg
+  // Leggings". Refuse to render rather than misdescribe the product.
+  if (expectedProductId && artifact.productId && String(artifact.productId) !== String(expectedProductId)) {
+    throw taggedError(
+      `concept artifact ${adConceptArtifactId} belongs to product ${artifact.productId}, not ${expectedProductId} — refusing to render another product's creative direction`,
+      { alertLevel: 'error', alertKey: 'direct-image:concept-product-mismatch' }
+    );
+  }
+  return artifact.concepts?.find((c) => c.concept_id === adConceptId) || null;
 }
 
 // Tag an error with how loudly it should be reported. renderService raises
@@ -270,7 +285,7 @@ async function renderDirectImage({ layoutInputArtifactId, aspectRatio, mediaId, 
 
   const [layout, concept, brand, product, media] = await Promise.all([
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
-    resolveConcept({ adConceptArtifactId, adConceptId }),
+    resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
     brandId ? Brand.findById(brandId).lean() : null,
     productId ? CatalogProduct.findById(productId).select('title imageUrl').lean() : null,
     mediaId ? Media.findById(mediaId).select('fileUrl').lean() : null
