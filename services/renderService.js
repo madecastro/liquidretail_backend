@@ -1370,7 +1370,15 @@ function failed(jobId, stage, err) {
     error: {
       stage,
       message:   err.message || String(err),
-      retryable: stage !== 'validate'   // validate failures are surfaced as 'skipped' separately
+      retryable: stage !== 'validate',  // validate failures are surfaced as 'skipped' separately
+      // Carry the provider handle through. Atlas bills on submit and keeps the
+      // asset for days, so a render we abandoned — a poll timeout, or a deploy
+      // or autoscale killing the loop mid-batch — is an image we ALREADY PAID
+      // FOR that is still sitting on Atlas. Without the id here it is
+      // unreachable and the retry pays a second time for the same picture.
+      predictionId: err.predictionId || null,
+      atlasCode:    err.atlasCode ?? null,
+      charged:      err.charged === true
     }
   };
 }
