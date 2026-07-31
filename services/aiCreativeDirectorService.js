@@ -1074,10 +1074,23 @@ function renderBrandVoiceBlock(voice) {
   return lines.join('\n');
 }
 
-function renderCampaignBriefBlock(brief) {
+function renderCampaignBriefBlock(brief, productName = null) {
   if (!brief) return '';
   const lines = [];
   lines.push(`CAMPAIGN BRIEF (the intent of THIS specific campaign — concepts must serve it):`);
+  // A campaign brief is written once for the CAMPAIGN, and its goal routinely
+  // names one specific product ("Introduce the Training Straight Leg Leggings
+  // in Strength Pink..."). Every product generated under that campaign then
+  // received it verbatim, under the instruction that concepts MUST serve it —
+  // so the Director dutifully wrote leggings copy for a t-shirt, and the
+  // one-product rule below lost the argument to a more specific instruction
+  // sitting in the same prompt.
+  //
+  // The brief's STRATEGY still applies to every product in the campaign; only
+  // the product its goal happens to name does not.
+  if (productName) {
+    lines.push(`  SCOPE: this concept is for "${productName}". Where the goal or pitch below names a DIFFERENT product, that naming does NOT apply here — it is campaign-level context. Serve the campaign's strategy (funnel stage, tone, audience, CTA emphasis) for THIS product, and never carry another product's name, category, or attributes into your copy.`);
+  }
   if (brief.goal)         lines.push(`  Goal: ${brief.goal}`);
   if (brief.pitch)        lines.push(`  Pitch: ${brief.pitch}`);
   if (brief.focus)        lines.push(`  Dominant lever: ${brief.focus}`);
@@ -1093,14 +1106,18 @@ function renderCampaignBriefBlock(brief) {
     if (Array.isArray(a.segments) && a.segments.length) fragments.push(`segments ${a.segments.slice(0, 4).join(', ')}`);
     if (fragments.length) lines.push(`    (${fragments.join('; ')})`);
   }
-  lines.push(`  Every concept you emit MUST serve the campaign goal + pitch. If a concept doesn't advance this brief, drop it for one that does.`);
+  lines.push(
+    productName
+      ? `  Every concept you emit MUST serve this campaign's STRATEGY — its funnel stage, tone, audience and CTA emphasis — as applied to "${productName}". If a concept doesn't advance that, drop it for one that does. Serving the brief never means advertising a product other than "${productName}".`
+      : `  Every concept you emit MUST serve the campaign goal + pitch. If a concept doesn't advance this brief, drop it for one that does.`
+  );
   return lines.join('\n');
 }
 
 function buildPromptRound({ inputSummary, creativeIntent, platformFormat, universe, roundIndex, avoidList, derivedVoice = null, creativeBrief = null }) {
   const formatConstraints = buildFormatConstraints(platformFormat);
   const brandVoiceBlock   = renderBrandVoiceBlock(derivedVoice);
-  const campaignBriefBlock = renderCampaignBriefBlock(creativeBrief);
+  const campaignBriefBlock = renderCampaignBriefBlock(creativeBrief, inputSummary?.product_signal?.name || null);
 
   // Build the universe block — the LLM uses these media_id values
   // verbatim in concept.media_picks. Roles surface so the LLM knows
