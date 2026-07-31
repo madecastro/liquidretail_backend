@@ -815,6 +815,23 @@ async function renderOne(run, job, adId, index, renderToken) {
   }
 }
 
+/**
+ * Record which stage a specific ad is in, so an operator can read one assetId's
+ * state instead of grepping logs for it.
+ *
+ * FIRE-AND-FORGET BY CONTRACT. Not awaited, and a failed write is swallowed.
+ * This is telemetry on a path where Atlas has already been billed; a Mongo blip
+ * must never be able to fail a paid render. The trade is that a stage can be
+ * missed under load — acceptable, because the next transition overwrites it and
+ * the terminal status is written by the real persist path, not by this.
+ */
+function adStage(adId, stage) {
+  Ad.updateOne(
+    { _id: adId },
+    { $set: { renderStage: stage, renderStageAt: new Date(), updatedAt: new Date() } }
+  ).catch(() => {});
+}
+
 async function renderOneInner(run, job, adId, index, renderToken) {
   // Fetch the queued Ad doc and shape it into the request the
   // render service expects. The doc carries everything the old
@@ -871,6 +888,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         } else {
           veoVideoUrl    = segmentUrl;
           veoAspectRatio = ad.aspectRatio || '9:16';
+          adStage(adId, 'reusing video seed segment (no generation)');
           console.log(
             `🎬 [veo] ad=${adId} seed=video → skip Grok, 8s Cloudinary segment ` +
             `(aspect=${veoAspectRatio}) → ${segmentUrl.slice(0, 120)}…`
@@ -887,6 +905,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // storyboard is always null on the Atlas path now (the Ken Burns
         // prompt directs motion; the GPT storyboard stage is retired) —
         // the stamp below only fires for legacy/vertex storyboards.
+        adStage(adId, 'preparing video context');
         const { storyboard } = await veoPrepareStoryboard({ ad });
         veoStoryboard = storyboard || null;
 
@@ -898,6 +917,10 @@ async function renderOneInner(run, job, adId, index, renderToken) {
 
         // Stage 2 — generate the base video via Grok. Chrome (if any)
         // runs after Grok completes in Stage 3.
+        // The billable one. Named so the status screen says exactly what is
+        // being paid for, and so a stall here is distinguishable from a stall in
+        // titling or upload.
+        adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
         const veoResult = await veoGenerateForAd({ ad, storyboard });
         if (veoResult.skipped) {
           await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
@@ -958,6 +981,11 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       if (brandDoc) {
         try {
           const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
+          // Titling names its target aspect: this is the stage that face-crops
+          // the 9:16 master down (basePlateCropService) and composites the
+          // overlay, so "titling 1:1" and "master video generation" being
+          // distinct is what makes a stall attributable.
+          adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '9:16'}`);
           await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
         } catch (scriptErr) {
           console.warn(`⚠️ brandScript[ad=${adId}]: failed (non-fatal) — ${scriptErr.message}`);
@@ -1005,6 +1033,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
 
   // ── HTML Gen render path (Feed) ─────────────────────────────────────
   try {
+    adStage(adId, `static image generation (${ad.platformFormat || 'meta_feed_1_1'})`);
     const result = await renderCreative({
       jobId:         crypto.randomBytes(8).toString('hex'),
       adId:          String(ad._id),
@@ -1384,6 +1413,152 @@ router.get('/meta-adsets', async (req, res) => {
   } catch (err) {
     console.error('meta-adsets list failed:', err);
     res.status(500).json({ error: err.message || 'meta-adsets list failed' });
+  }
+});
+
+// GET /api/ads/render-activity — technical status board.
+//
+// Exists because the only way to answer "what is this asset doing / why did it
+// stall" used to be an SSH session and a log grep, which meant asking whoever
+// had shell access. Everything here is READ from the Ad document; nothing is
+// reconstructed or inferred, so a field being absent means it was never
+// recorded rather than that this endpoint could not work it out.
+//
+// `diagnostic` is a pre-formatted one-paste block. It is built server-side on
+// purpose: a copy button that assembles its own text drifts from what is
+// actually useful to hand to someone debugging, and then the paste is missing
+// the one id that mattered.
+//
+// NOTE: must stay registered above the '/:id' routes.
+router.get('/render-activity', async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const filter = {};
+    // mongoose.isValidObjectId rather than a local helper: routes/ads.js has no
+    // toObjectId, and casting an invalid id would throw inside find() instead of
+    // returning an empty board.
+    if (req.query.brandId && mongoose.isValidObjectId(String(req.query.brandId))) {
+      filter.brandId = new mongoose.Types.ObjectId(String(req.query.brandId));
+    }
+    if (req.query.runId)    filter.campaignRunIds = String(req.query.runId);
+    // Default view is "things that are live or recently finished", which is what
+    // an operator watching a generation actually wants.
+    if (req.query.status)   filter.status = String(req.query.status);
+
+    const ads = await Ad.find(filter)
+      .select('status renderStage renderStageAt kind template platformFormat aspectRatio ' +
+              'renderUrl renderError renderAttempts renderStages imageGeneration ' +
+              'intentResolution veoPredictionId veoAspectRatio veoVideoUrl ' +
+              'campaignId campaignRunIds productId mediaId brandId conceptId ' +
+              'queuedAt renderedAt updatedAt')
+      .sort({ updatedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    // Who asked. Resolved per run, not per ad, so a 20-ad run is one lookup.
+    const runIds = [...new Set(ads.flatMap(a => a.campaignRunIds || []).map(String))];
+    const runs = runIds.length
+      ? await CampaignRun.find({ runId: { $in: runIds } })
+          .select('runId requestedBy status startedAt completedAt total succeeded failed skipped')
+          .lean()
+      : [];
+    const runById = new Map(runs.map(r => [String(r.runId), r]));
+
+    // Resolve requester emails WITHOUT populate. `.populate('requestedBy')`
+    // throws "Schema hasn't been registered for model User" here — routes/ads.js
+    // never requires the User model, and mongoose resolves refs lazily against
+    // whatever is registered in the process. That would have 500'd the entire
+    // board over a cosmetic field. Verified against prod before shipping.
+    //
+    // The require is guarded and the lookup is best-effort for the same reason:
+    // a status board must degrade to showing ids, never fail.
+    const userById = new Map();
+    const requesterIds = [...new Set(runs.map(r => r.requestedBy).filter(Boolean).map(String))];
+    if (requesterIds.length) {
+      try {
+        const User = require('../models/User');
+        const users = await User.find({ _id: { $in: requesterIds } }).select('email name').lean();
+        users.forEach(u => userById.set(String(u._id), u));
+      } catch (err) {
+        console.warn(`   ⚠️  render-activity: requester lookup skipped (${err.message}) — showing ids`);
+      }
+    }
+
+    const now = Date.now();
+    const rows = ads.map(a => {
+      const run = (a.campaignRunIds || []).map(String).map(id => runById.get(id)).find(Boolean) || null;
+      const predictionId = a.imageGeneration?.predictionId || a.veoPredictionId || null;
+      const stageAgeSec = a.renderStageAt ? Math.round((now - new Date(a.renderStageAt).getTime()) / 1000) : null;
+      const t = a.renderStages || {};
+      const row = {
+        assetId:       String(a._id),
+        status:        a.status,
+        stage:         a.renderStage || null,
+        stageAgeSec,
+        // A render sitting in one stage far longer than that stage's normal cost
+        // is the signal worth surfacing; 600s is the Atlas image deadline and the
+        // video poll ceiling, so past that something is genuinely wrong.
+        stalled:       a.status === 'rendering' && stageAgeSec != null && stageAgeSec > 600,
+        kind:          a.kind,
+        template:      a.template,
+        platformFormat: a.platformFormat,
+        aspectRatio:   a.aspectRatio,
+        pipeline:      a.imageGeneration?.pipeline || (a.kind === 'video' ? 'veo' : null),
+        model:         a.imageGeneration?.model || null,
+        predictionId,
+        // Provenance for the multi-size video story: a 1:1 or 4:5 video whose
+        // veoAspectRatio is 9:16 was CROPPED from a master, not generated.
+        derivedFromMaster: a.kind === 'video' && a.veoAspectRatio === '9:16' && a.aspectRatio !== '9:16',
+        timingsMs:     { derive: t.deriveMs ?? null, render: t.renderMs ?? null, upload: t.uploadMs ?? null },
+        intent:        a.intentResolution
+          ? { requested: a.intentResolution.requested, delivered: a.intentResolution.delivered,
+              fellBackFrom: a.intentResolution.fellBackFrom || null,
+              dropped: a.intentResolution.droppedRoles || [] }
+          : null,
+        assetUrl:      a.renderUrl || null,
+        error:         a.renderError?.message || (typeof a.renderError === 'string' ? a.renderError : null),
+        attempts:      a.renderAttempts ?? null,
+        ids:           {
+          campaignId: a.campaignId ? String(a.campaignId) : null,
+          runId:      run?.runId || (a.campaignRunIds || [])[0] || null,
+          productId:  a.productId ? String(a.productId) : null,
+          mediaId:    a.mediaId ? String(a.mediaId) : null,
+          brandId:    a.brandId ? String(a.brandId) : null,
+          conceptId:  a.conceptId || null
+        },
+        requestedBy:   (() => {
+          const uid = run?.requestedBy ? String(run.requestedBy) : null;
+          if (!uid) return null;
+          const u = userById.get(uid);
+          return u?.email || u?.name || uid;   // id is still useful; never blank
+        })(),
+        run:           run ? { status: run.status, total: run.total, succeeded: run.succeeded, failed: run.failed, skipped: run.skipped } : null,
+        queuedAt:      a.queuedAt || null,
+        renderedAt:    a.renderedAt || null,
+        updatedAt:     a.updatedAt || null
+      };
+      row.diagnostic = [
+        `asset=${row.assetId}`,
+        `status=${row.status}${row.stalled ? ' STALLED' : ''}`,
+        `stage=${row.stage || '-'}${row.stageAgeSec != null ? ` (${row.stageAgeSec}s)` : ''}`,
+        `kind=${row.kind} fmt=${row.platformFormat} aspect=${row.aspectRatio}`,
+        `pipeline=${row.pipeline || '-'} model=${row.model || '-'}`,
+        `prediction=${row.predictionId || '-'}`,
+        row.derivedFromMaster ? 'derivedFromMaster=true (cropped, not generated)' : null,
+        `timings(ms) derive=${row.timingsMs.derive ?? '-'} render=${row.timingsMs.render ?? '-'} upload=${row.timingsMs.upload ?? '-'}`,
+        row.intent ? `intent=${row.intent.delivered}${row.intent.fellBackFrom ? ` (fellBackFrom ${row.intent.fellBackFrom})` : ''}${row.intent.dropped.length ? ` dropped=${row.intent.dropped.join('+')}` : ''}` : null,
+        `run=${row.ids.runId || '-'} by=${row.requestedBy || '-'}`,
+        `product=${row.ids.productId || '-'} media=${row.ids.mediaId || '-'} concept=${row.ids.conceptId || '-'}`,
+        row.error ? `error=${row.error}` : null,
+        row.assetUrl ? `asset=${row.assetUrl}` : null
+      ].filter(Boolean).join('\n');
+      return row;
+    });
+
+    res.json({ rows, count: rows.length, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error(`❌ GET /api/ads/render-activity failed: ${err.message}`);
+    res.status(500).json({ error: err.message || 'render-activity failed' });
   }
 });
 
