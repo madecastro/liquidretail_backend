@@ -65,12 +65,22 @@ const DEFAULT_META_CASCADES = {
     { type: 'doc', doc: 'layoutInput', path: 'input.copy.cta_text' },
     { type: 'literal', value: 'SHOP NOW' },
   ],
+  // Renders in the lower third beside the CTA, with a truck icon
+  // (slotRenderers.DeliverySlot) — it is a shipping reassurance, not a
+  // general copy slot. It used to read copy.offer_text / cta.offer_text
+  // first, which put the OFFER here: "Only $28" rendered next to a delivery
+  // truck as though $28 were the shipping terms, and painted a second time
+  // as the promo pill, since promoText draws from the same two sources.
+  // The offer now renders once, through promoText alone.
+  // No literal fallback, and no brand tagline: this slot is drawn with a
+  // delivery truck, so whatever lands in it reads as a shipping promise.
+  // 'Ships free' was a hardcoded default asserting free shipping for every
+  // brand on the platform, true or not — it was simply invisible before,
+  // because offer_text outranked it on any ad with an offer. A tagline next
+  // to a truck is nonsense for the same reason. Null now means the slot is
+  // skipped, which is the honest outcome when we hold no delivery terms.
   deliveryLine: [
-    { type: 'doc', doc: 'ad',          path: 'copy.offer_text' },
-    { type: 'doc', doc: 'layoutInput', path: 'input.cta.offer_text' },
     { type: 'doc', doc: 'layoutInput', path: 'input.product.badges[1]' },
-    { type: 'doc', doc: 'brand',       path: 'tagline' },
-    { type: 'literal', value: 'Ships free' },
   ],
   promoText: [
     { type: 'doc', doc: 'ad',          path: 'copy.offer_text' },
@@ -116,19 +126,28 @@ const DEFAULT_META_CASCADES = {
   ],
 
   // ── Social proof (numeric) ───────────────────────────────────────
+  // No brand-level fallback. layoutInput.social_proof already decides when
+  // brand rating/review_count may stand in — only when the match outcome is
+  // brand_match, i.e. a brand ad claiming no single SKU — and tier 1 below
+  // carries that decision. A third tier reading Brand.brandReviews directly
+  // reached around that gate, so a product ad with no reviews of its own
+  // displayed the brand's aggregate beside one item: a $28 t-shirt credited
+  // with 41,000 reviews and the brand's 3.3 rating. Product ads now show the
+  // product's own numbers or none.
   rating: [
     { type: 'doc', doc: 'layoutInput',    path: 'input.social_proof.rating_value' },
     { type: 'doc', doc: 'catalogProduct', path: 'rating' },
-    { type: 'doc', doc: 'brand',          path: 'brandReviews.rating' },
   ],
   reviewCount: [
     { type: 'doc', doc: 'layoutInput',    path: 'input.social_proof.review_count' },
     { type: 'doc', doc: 'catalogProduct', path: 'reviewCount' },
-    { type: 'doc', doc: 'brand',          path: 'brandReviews.reviewCount' },
   ],
+  // No literal fallback. `572` was a hardcoded number rendered as this post's
+  // like count on any ad without real engagement data — invented social proof,
+  // the same class as the '53 reviews' and 'Ships free' defaults. Null means
+  // the slot is skipped.
   likes: [
     { type: 'doc', doc: 'layoutInput', path: 'input.performance.engagement.likes' },
-    { type: 'literal', value: 572 },
   ],
 };
 

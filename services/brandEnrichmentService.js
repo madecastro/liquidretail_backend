@@ -8,8 +8,9 @@
 //                       layout generator to author notional persona quotes)
 //   - color guesses    (best-effort from meta theme-color, else vibe-based)
 //
-// Logo URL is set deterministically from Google's favicon service (always
-// resolvable, no scraping heuristics).
+// Logo discovery is deterministic and source-ranked: current storefront
+// structured data/header assets/rendered DOM → Brandfetch → favicon fallback.
+// The selected website asset is mirrored to Cloudinary during ingest.
 //
 // Fire-and-forget from brandCatalogService — the detect pipeline never
 // awaits this. On failure the Brand stays a stub and gets another chance
@@ -26,6 +27,7 @@ const {
 } = require('../utils/websiteBackground');
 
 const { chatCompletion } = require('./atlasLlmService');
+const { inspectTailwindTheme } = require('./tailwindTokenExtractor');
 const MAX_HTML_CHARS = 25000;
 
 const ENRICHMENT_SCHEMA = {
@@ -108,20 +110,27 @@ async function runEnrichment(brand, brandId, run = null) {
   // backfill it whenever we can.
   const sourcesAttempted = new Set(brand.enrichmentSources || []);
   const wantBrandfetch   = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
+  const wantTailwind     = !sourcesAttempted.has('tailwind');
   const wantScraped      = !sourcesAttempted.has('scraped');
   const wantGpt          = !!process.env.OPENAI_API_KEY && !sourcesAttempted.has('gpt');
   const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
+  const wantFontIngest   = !brand.fontIngestedAt;
+  const logoIsCurated    = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('logoUrl');
+  const wantLogoIngest   = !logoIsCurated && !brand.logoIngestedAt;
 
-  if (!wantBrandfetch && !wantScraped && !wantGpt && !wantBrandReviews) {
+  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest && !wantLogoIngest) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
 
   const t0 = Date.now();
   const planParts = [];
   if (wantBrandfetch)   planParts.push('brandfetch');
+  if (wantTailwind)     planParts.push('tailwind');
   if (wantScraped)      planParts.push('scrape');
   if (wantGpt)          planParts.push('gpt');
   if (wantBrandReviews) planParts.push('brand-reviews');
+  if (wantFontIngest)   planParts.push('website-fonts');
+  if (wantLogoIngest)   planParts.push('website-logo');
   console.log(`🌐 brand enrichment: ${brand.websiteUrl} for "${brand.name}" — running ${planParts.join('+')}${sourcesAttempted.size ? ` (already have: ${[...sourcesAttempted].join(', ')})` : ''}`);
 
   // ── Tier 1: Brandfetch ──
@@ -143,6 +152,7 @@ async function runEnrichment(brand, brandId, run = null) {
   if (run && wantScraped) { await run.checkpoint(); run.stage('website scrape'); }
   if (wantScraped) await setStage(brandId, 'scraped');
   let html = '';
+  let pageUrl = brand.websiteUrl;
   let metaThemeColor = null;
   try {
     const res = await axios.get(brand.websiteUrl, {
@@ -155,6 +165,7 @@ async function runEnrichment(brand, brandId, run = null) {
       validateStatus: () => true
     });
     html = typeof res.data === 'string' ? res.data : String(res.data || '');
+    pageUrl = res.request?.res?.responseUrl || brand.websiteUrl;
     const themeMatch = html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i);
     if (themeMatch) metaThemeColor = themeMatch[1];
   } catch (err) {
@@ -162,12 +173,35 @@ async function runEnrichment(brand, brandId, run = null) {
     // If Brandfetch already gave us the visual identity, the GPT step still
     // adds value (tagline/tone/personas need text). Without HTML we can't
     // do GPT so we have to bail unless Brandfetch gave us enough.
-    if (!bf) return { ok: false, reason: `fetch failed: ${err.message}` };
+    if (!bf && !wantLogoIngest) return { ok: false, reason: `fetch failed: ${err.message}` };
   }
 
   // Tier 2 helpers — run on whatever HTML we got (may be empty).
-  const scrapedLogoUrl     = extractAppleTouchIcon(html, brand.websiteUrl);
   const scrapedFontFamily  = extractGoogleFontsFamily(html);
+  let websiteLogo = null;
+  if (wantLogoIngest) {
+    if (run) { await run.checkpoint(); run.stage('website logo'); }
+    await setStage(brandId, 'website-logo');
+    try {
+      const { discoverAndIngestBrandLogo } = require('./brandLogoIngestService');
+      websiteLogo = await discoverAndIngestBrandLogo(brand, { html: html || null, pageUrl });
+      brand.logoIngestedAt = new Date();
+      brand.logoIngestError = null;
+      if (websiteLogo.logoUrl) {
+        brand.logoOriginalUrl = websiteLogo.originalUrl;
+        console.log(
+          `   · website logo: ${websiteLogo.source}, ${websiteLogo.width || '?'}×${websiteLogo.height || '?'}, ` +
+          `${websiteLogo.candidatesChecked} candidate(s)`
+        );
+      } else {
+        console.log(`   · website logo: no validated mark from ${websiteLogo.candidatesChecked} candidate(s)`);
+      }
+    } catch (err) {
+      brand.logoIngestedAt = new Date();
+      brand.logoIngestError = String(err.message || err).slice(0, 2000);
+      console.warn(`   ⚠️  website logo ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
   // FLAG: static-HTML/CSS heuristic for page surface color (NOT theme-color).
   // headlessScrapeService is product-ingest + SHOPIFY_HEADLESS_RENDER-gated —
   // too heavy to couple into every brand enrichment just for body bg.
@@ -175,6 +209,16 @@ async function runEnrichment(brand, brandId, run = null) {
   // Linked stylesheets are NOT fetched here (not "already fetched"); returns null
   // rather than guessing a dark color from meta theme-color.
   const scrapedWebsiteBackground = extractWebsiteBackground(html);
+  // Tailwind is extracted from published CSS/config only; no third-party JS
+  // is evaluated. A high-confidence result takes precedence over every other
+  // automatic enrichment source, never over a human-curated field.
+  let tailwind = null;
+  if (wantTailwind && html) {
+    if (run) { await run.checkpoint(); run.stage('tailwind tokens'); }
+    await setStage(brandId, 'tailwind');
+    tailwind = await inspectTailwindTheme({ html, pageUrl: brand.websiteUrl });
+    if (tailwind) console.log(`   · tailwind tokens: ${Object.keys(tailwind.colors || {}).length} color(s), ${Object.keys(tailwind.fonts || {}).length} font role(s), source=${tailwind.source}`);
+  }
 
   const rawTextContent = extractTextFromHtml(html).slice(0, MAX_HTML_CHARS);
   // JS-rendered SPAs (Next.js, Shopify Hydrogen, etc.) leave almost
@@ -195,7 +239,10 @@ async function runEnrichment(brand, brandId, run = null) {
   const skipLLM = textContent.length < 200;
   if (skipLLM && !bf) {
     console.warn(`   ⚠️  brand enrichment: ${brand.websiteUrl} returned too little text (${rawTextContent.length} chars) — likely bot-blocked, no Brandfetch fallback`);
-    return { ok: false, reason: 'too little text and no Brandfetch data' };
+    // Font stylesheets may still be public even when readable page text is
+    // sparse (Shopify/Next storefronts), so continue when the automatic
+    // website-font scan has not run yet.
+    if (!wantFontIngest && !wantLogoIngest) return { ok: false, reason: 'too little text and no Brandfetch data' };
   }
 
   // ── Tier 3: GPT-4.1 text extraction ──
@@ -244,7 +291,9 @@ async function runEnrichment(brand, brandId, run = null) {
     } catch (err) {
       console.warn(`   ⚠️  brand enrichment LLM failed for "${brand.name}": ${err.message}`);
       // If LLM fails but Brandfetch worked, still ship the visual identity.
-      if (!bf) return { ok: false, reason: `LLM failed: ${err.message}` };
+      if (!bf && !websiteLogo?.logoUrl && !wantFontIngest && !wantLogoIngest) {
+        return { ok: false, reason: `LLM failed: ${err.message}` };
+      }
     }
   }
 
@@ -270,12 +319,16 @@ async function runEnrichment(brand, brandId, run = null) {
   };
 
   let [logoVal, logoSrc] = pick(
+    [websiteLogo?.logoUrl, websiteLogo?.source ? `website:${websiteLogo.source}` : 'website'],
     [bf?.logoUrl, 'brandfetch'],
-    [scrapedLogoUrl, 'scraped'],
     [brand.logoUrl, 'existing'],
     [googleFaviconFallback(hostname), 'google-favicon']
   );
   setIf('logoUrl', logoVal, logoSrc);
+  if (!isCurated('logoUrl') && logoSrc && logoSrc !== 'existing') {
+    brand.logoSource = logoSrc;
+    if (!logoSrc.startsWith('website:')) brand.logoOriginalUrl = logoVal;
+  }
 
   // Font resolution chain. High-confidence sources first
   // (Brandfetch / scraped Google Fonts), then GPT-suggested based on
@@ -291,6 +344,7 @@ async function runEnrichment(brand, brandId, run = null) {
     console.log(`   · brandfetch font rejected (not a real family name): ${bf.fontFamily}`);
   }
   let [fontVal, fontSrc] = pick(
+    [tailwind?.fonts?.heading || tailwind?.fonts?.body, 'tailwind'],
     [bfFont, 'brandfetch'],
     [isValidFontName(scrapedFontFamily) ? scrapedFontFamily : null, 'scraped'],
     [isValidFontName(enrichment.fontSuggestion) ? enrichment.fontSuggestion : null, 'suggested'],
@@ -306,6 +360,7 @@ async function runEnrichment(brand, brandId, run = null) {
   }
 
   let [primaryVal, primarySrc] = pick(
+    [tailwind?.colors?.primary, 'tailwind'],
     [bf?.primaryColor, 'brandfetch'],
     [metaThemeColor, 'meta-theme-color'],
     [enrichment.primaryColor, 'gpt'],
@@ -314,6 +369,7 @@ async function runEnrichment(brand, brandId, run = null) {
   setIf('primaryColor', primaryVal, primarySrc);
 
   let [secondaryVal, secondarySrc] = pick(
+    [tailwind?.colors?.secondary, 'tailwind'],
     [bf?.secondaryColor, 'brandfetch'],
     [enrichment.secondaryColor, 'gpt'],
     [brand.secondaryColor, 'existing']
@@ -321,6 +377,7 @@ async function runEnrichment(brand, brandId, run = null) {
   setIf('secondaryColor', secondaryVal, secondarySrc);
 
   let [accentVal, accentSrc] = pick(
+    [tailwind?.colors?.accent, 'tailwind'],
     [bf?.accentColor, 'brandfetch'],
     [enrichment.accentColor, 'gpt'],
     [brand.accentColor, 'existing']
@@ -328,6 +385,7 @@ async function runEnrichment(brand, brandId, run = null) {
   setIf('accentColor', accentVal, accentSrc);
 
   let [fontColorVal, fontColorSrc] = pick(
+    [tailwind?.colors?.font, 'tailwind'],
     [bf?.fontColor, 'brandfetch'],
     [enrichment.fontColor, 'gpt'],
     [brand.fontColor, 'existing']
@@ -338,10 +396,17 @@ async function runEnrichment(brand, brandId, run = null) {
   // Scraped only — never theme-color, never GPT guess (dark accents would
   // reintroduce product-on-black). Respects curatedFields via setIf.
   let [websiteBgVal, websiteBgSrc] = pick(
+    [tailwind?.colors?.background, 'tailwind'],
     [scrapedWebsiteBackground, 'scraped'],
     [normalizeWebsiteBackgroundHex(brand.websiteBackground), 'existing']
   );
   setIf('websiteBackground', websiteBgVal, websiteBgSrc);
+
+  if (tailwind && !isCurated('tailwindTheme')) {
+    const previousTailwind = brand.tailwindTheme;
+    brand.tailwindTheme = tailwind;
+    overrides.push({ field: 'tailwindTheme', oldVal: previousTailwind ? '(previous)' : null, newVal: `${tailwind.source}/${tailwind.confidence}`, source: 'tailwind' });
+  }
 
   let [taglineVal, taglineSrc] = pick(
     [enrichment.tagline, 'gpt'],
@@ -423,6 +488,7 @@ async function runEnrichment(brand, brandId, run = null) {
   // know whether to backfill (e.g. Brandfetch came online later).
   const newSourcesAttempted = new Set(brand.enrichmentSources || []);
   if (wantBrandfetch)   newSourcesAttempted.add('brandfetch');
+  if (wantTailwind)     newSourcesAttempted.add('tailwind');
   if (wantScraped)      newSourcesAttempted.add('scraped');
   if (wantGpt && !skipLLM) newSourcesAttempted.add('gpt');
   if (wantBrandReviews) newSourcesAttempted.add('brand-reviews');
@@ -431,6 +497,30 @@ async function runEnrichment(brand, brandId, run = null) {
   brand.source = 'enriched';
   brand.enrichedAt = new Date();
   await brand.save();
+
+  // Initial brand ingest now includes the customer's real website font
+  // files. This remains best-effort: a blocked stylesheet or commercial
+  // foundry must not fail the rest of brand enrichment.
+  if (wantFontIngest && brand.websiteUrl) {
+    if (run) { await run.checkpoint(); run.stage('website fonts'); }
+    try {
+      const { ingestBrandFonts } = require('./brandFontIngestService');
+      const { applyFontIngestResult } = require('./brandFontPersistenceService');
+      const fontResult = await ingestBrandFonts(brand, { trackProgress: false });
+      applyFontIngestResult(brand, fontResult);
+      await brand.save();
+      console.log(
+        `   · website fonts: ${fontResult.ingested.length} usable, ` +
+        `${fontResult.flagged.length} flagged, heading=${fontResult.usage?.heading || 'unknown'}, ` +
+        `body=${fontResult.usage?.body || 'unknown'}`
+      );
+    } catch (err) {
+      brand.fontIngestedAt = new Date();
+      brand.fontIngestError = String(err.message || err).slice(0, 2000);
+      await brand.save().catch(() => {});
+      console.warn(`   ⚠️  website font ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
 
   // Per-field override log — fire-and-forget calls go to the same
   // server log stream, so this is the only visibility into what the
@@ -447,9 +537,12 @@ async function runEnrichment(brand, brandId, run = null) {
 
   const ranThisTime = [
     wantBrandfetch ? 'brandfetch' : null,
+    wantTailwind ? 'tailwind' : null,
     wantScraped    ? 'scraped'    : null,
     (wantGpt && !skipLLM) ? 'gpt'  : null,
-    wantBrandReviews ? 'brand-reviews' : null
+    wantBrandReviews ? 'brand-reviews' : null,
+    wantFontIngest ? 'website-fonts' : null,
+    wantLogoIngest ? 'website-logo' : null
   ].filter(Boolean).join('+');
   console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), ${brand.brandReviews?.quotes?.length || 0} brand review(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
   return { ok: true, brand, overrides };
@@ -471,38 +564,6 @@ function extractTextFromHtml(html) {
 function hostnameFromUrl(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); }
   catch { return null; }
-}
-
-// Find the largest apple-touch-icon link in the HTML and resolve it to
-// an absolute URL. Apple-touch-icons are typically 180-512px PNGs of the
-// brand mark — much higher quality than the 128px Google favicon and
-// usually clean (sites care about how their iOS bookmark looks).
-// Returns null if no link found.
-function extractAppleTouchIcon(html, baseUrl) {
-  if (!html) return null;
-  const linkRegex = /<link\b[^>]*rel=["']apple-touch-icon(?:-precomposed)?["'][^>]*>/gi;
-  const candidates = [];
-  let m;
-  while ((m = linkRegex.exec(html)) !== null) {
-    const tag = m[0];
-    const hrefMatch = tag.match(/href=["']([^"']+)["']/i);
-    if (!hrefMatch) continue;
-    const sizesMatch = tag.match(/sizes=["']([^"']+)["']/i);
-    let size = 0;
-    if (sizesMatch) {
-      const dim = sizesMatch[1].match(/(\d+)x(\d+)/i);
-      if (dim) size = Math.max(parseInt(dim[1], 10), parseInt(dim[2], 10));
-    }
-    candidates.push({ href: hrefMatch[1], size });
-  }
-  if (!candidates.length) return null;
-  // Largest icon wins (sites with sizes="180x180" beat sizes="").
-  candidates.sort((a, b) => b.size - a.size);
-  try {
-    return new URL(candidates[0].href, baseUrl).toString();
-  } catch {
-    return null;
-  }
 }
 
 // Find the primary Google Fonts family loaded by the page. Looks for

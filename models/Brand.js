@@ -46,6 +46,13 @@ const brandSchema = new mongoose.Schema({
   tagline:        String,                            // one-liner positioning (≤ 12 words)
   summary:        String,                            // 2-4 sentence verbose brand description
   logoUrl:        String,
+  // Logo provenance and ingest audit. Website logos are discovered from
+  // structured data, header/nav markup, manifests and rendered storefronts,
+  // then mirrored to Cloudinary before this URL is stored.
+  logoSource:      { type: String, default: null },
+  logoOriginalUrl: { type: String, default: null },
+  logoIngestedAt:  { type: Date, default: null },
+  logoIngestError: { type: String, default: null },
   primaryColor:   String,
   secondaryColor: String,
   accentColor:    String,
@@ -72,7 +79,7 @@ const brandSchema = new mongoose.Schema({
   // validation. Mongoose's enum check rejects null even on non-
   // required fields when a default isn't matched, so we explicitly
   // allow it here.
-  fontSource:     { type: String, enum: ['brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
+  fontSource:     { type: String, enum: ['tailwind', 'website', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
   tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
   hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
   tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')
@@ -94,16 +101,24 @@ const brandSchema = new mongoose.Schema({
   // Which auto-enrichment sources have been ATTEMPTED on this brand
   // (regardless of whether each returned data). Drives re-enrichment
   // logic — if a tier is missing, we re-run enrichment so it can
-  // backfill. Values: 'brandfetch' | 'scraped' | 'gpt' | 'brand-reviews'.
+  // backfill. Values: 'tailwind' | 'brandfetch' | 'scraped' | 'gpt' |
+  // 'brand-reviews'.
   // Resets when curation explicitly removes a field, when the
   // websiteUrl changes, or via /refresh-enrichment.
   enrichmentSources: [String],
 
+  // Public Tailwind theme signals recovered from a brand's published site.
+  // A real tailwind.config file is rarely exposed, so this stores only
+  // confidence-gated inline config or generated-CSS variables; never a
+  // guessed reconstruction. Automatic precedence is Tailwind > Brandfetch
+  // > scrape/GPT, while curated fields always win.
+  tailwindTheme: { type: mongoose.Schema.Types.Mixed, default: null },
+
   // Currently-running enrichment tier name, or null when nothing is
   // running. Updated incrementally by enrichBrandFromUrl so the brand
   // page can poll and show "Detecting brand kit (Brandfetch)…" etc.
-  // Values mirror enrichmentSources entries: 'brandfetch' | 'scraped'
-  // | 'gpt' | 'brand-reviews' | null.
+  // Values mirror enrichmentSources entries: 'tailwind' | 'brandfetch' |
+  // 'scraped' | 'gpt' | 'brand-reviews' | null.
   enrichmentStage:    { type: String, default: null },
 
   // Brand-level review snapshot. Populated by enrichBrandFromUrl
@@ -232,6 +247,15 @@ const brandSchema = new mongoose.Schema({
   // field — route handlers must markModified('videoSettings') on writes.
   videoSettings: { type: mongoose.Schema.Types.Mixed, default: null },
 
+  // Runtime-selectable static-ad renderer. This is intentionally stored on
+  // the Brand, not in a deploy-time environment variable: operators can
+  // switch the next concept-driven static render from the application.
+  staticImagePipeline: {
+    type: String,
+    enum: ['direct_overlay', 'html'],
+    default: 'direct_overlay'
+  },
+
   // Per-brand overrides of the meta-field cascades (services/metaCascadeConfig.js).
   // Sparse map of `field → source[]`. A field present here REPLACES the
   // default cascade for that field entirely (simpler mental model than
@@ -354,6 +378,16 @@ const brandSchema = new mongoose.Schema({
   // client must supply licensed files. fontResolverService prefers
   // these over Google Fonts when families match.
   customFonts: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  // Font roles observed in the customer's own CSS during font ingest.
+  // Shape: { heading?, body?, button?, evidence: [{ family, role, selector }] }.
+  // This lets the resolver choose the website's actual heading/body face
+  // when the site declares several @font-face families.
+  websiteFontUsage: { type: mongoose.Schema.Types.Mixed, default: null },
+  // Successful or attempted automatic website-font scan. A timestamp is
+  // recorded even when the site exposes no reusable faces so render-time
+  // resolution does not repeatedly crawl the storefront.
+  fontIngestedAt: { type: Date, default: null },
+  fontIngestError: { type: String, default: null },
 
   // Derived voice — structured profile extracted by
   // brandVoiceDerivationService from the brand's existing Meta/Google

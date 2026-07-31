@@ -483,7 +483,7 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 
 ### Titling composite
 
-- Downstream of base video: `brandScriptExecutor` + Remotion (default) or canvas override.
+- Downstream of base video: `brandScriptExecutor` → **Remotion only**. There is no working canvas override — `resolveTitlingEngine` is hard-wired to remotion (`brandScriptExecutor.js:806`); `TITLING_ENGINE` and `videoSettings.titlingEngine` are inert. See `docs/TITLING.md` §0.
 - Title template for layoutInput derivation is **canonical `ai_brand_led`** unless cascaded `titleTemplate` override.
 - Placement mode / engine: see `docs/TITLING.md` (`titlePlacementMode`, `titleStyleSpec` cascade including category).
 - **Does not use overlay zones** — text is scripted, not zone-driven product overlay.
@@ -555,6 +555,14 @@ Secret: `ATLAS_API_KEY`.
 ---
 
 ## 7. Progress + activity system
+
+> **Out-of-band alerting:** progress rows are in-app only — nobody sees them
+> unless a browser is open. Push alerts for crashes, dropped work, stalled
+> runs, and spend spikes go to Telegram; see **[docs/ALERTING.md](ALERTING.md)**.
+> That doc also records *why* video batches stall: `runRenderLoop` executes
+> in the **web** process, which Render replaces on deploy **and** on
+> autoscale (`min 1 / max 3`, CPU+memory at 60%), and reaped ads land in
+> `queued` where nothing drains them automatically.
 
 ### Core
 

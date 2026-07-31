@@ -4,6 +4,13 @@ require('dotenv').config();
 // — dotenv never overrides an already-set var. Secrets are NOT in this file.
 require('dotenv').config({ path: require('path').join(__dirname, 'config', 'defaults.env') });
 console.log(`⚙️  config: defaults.env applied — WORKER_CONCURRENCY=${process.env.WORKER_CONCURRENCY} CATALOG_DETECT_PRECOMPUTE=${process.env.CATALOG_DETECT_PRECOMPUTE} AI_IMAGE_REF_MODEL_ID=${process.env.AI_IMAGE_REF_MODEL_ID} GENERIC_CATALOG_PDP_CONCURRENCY=${process.env.GENERIC_CATALOG_PDP_CONCURRENCY}`);
+// Crash / restart / shutdown alerting. Installed FIRST — before any other
+// require can throw — so a boot-time failure is still reported. Also the
+// only thing standing between an unhandled rejection in a fire-and-forget
+// render loop and a silent process death that strands every in-flight
+// video generation.
+require('./services/processAlerts').installProcessAlerts({ role: 'web' });
+
 const express = require('express');
 const session = require('express-session');
 const passport = require('passport');
@@ -120,7 +127,12 @@ app.use(passport.session());
 app.use('/auth', authRoutes);
 
 // ── Protected API routes ─────────────────────────────────────────────────────
-app.use(express.json());
+// Raised from Express's 100kb default — the ad regenerate-with-prompt-
+// override flow (routes/ads.js POST /:id/regenerate) accepts up to a
+// 40,000-char system + 40,000-char user prompt, which in JSON-escaped form
+// can exceed 100kb before that route's own friendlier length check ever
+// runs, surfacing an opaque body-parser 413 instead.
+app.use(express.json({ limit: '2mb' }));
 app.use('/api/upload', requireAuth, uploadRoutes);
 app.use('/api/jobs', requireAuth, jobRoutes);
 app.use('/api/detect', requireAuth, detectRoutes);

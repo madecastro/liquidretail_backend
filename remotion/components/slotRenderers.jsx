@@ -44,8 +44,19 @@ const BASE_SIZE = {
   brandLogo:    { vertical: 0, feed: 0, landscape: 0 },
 };
 
+// 'square' (1080x1080) reuses feed's sizes: identical 1080 width means an identical
+// horizontal text budget, and these are text SIZES, not vertical positions. Aliasing
+// here rather than adding a 20th `square:` key to every row above keeps the two from
+// drifting apart.
+//
+// The alias is load-bearing, not tidiness: the `?? 24` fallback below does not throw
+// on an unknown format, it silently renders EVERY slot at 24px. A 1:1 ad would have
+// looked subtly broken rather than failed loudly.
+const SIZE_FORMAT_ALIAS = { square: 'feed' };
+
 export function baseSize(slotKey, format, sizeScale) {
-  const base = BASE_SIZE[slotKey]?.[format] ?? 24;
+  const f = SIZE_FORMAT_ALIAS[format] || format;
+  const base = BASE_SIZE[slotKey]?.[f] ?? 24;
   return clampPx(base * (sizeScale || 1), 10, 200);
 }
 

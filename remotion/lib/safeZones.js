@@ -9,6 +9,11 @@
 export const SAFE_ZONES = {
   vertical: { top: 0.14, bottom: 0.35, left: 0.075, right: 0.075 },
   feed: { top: 0.06, bottom: 0.06, left: 0.065, right: 0.06 },
+  // square (1:1, 1080x1080) — same surface as feed, same width, so the same
+  // padding. Stated explicitly rather than leaning on the `|| SAFE_ZONES.feed`
+  // fallback below, so that a future tuning pass has an obvious place to land and
+  // so a typo'd format never silently inherits feed's zones.
+  square: { top: 0.06, bottom: 0.06, left: 0.065, right: 0.06 },
   landscape: { top: 0.1, bottom: 0.1, left: 0.075, right: 0.075 },
 };
 

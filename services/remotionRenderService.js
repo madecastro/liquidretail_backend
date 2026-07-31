@@ -31,6 +31,7 @@ const { FONT_CACHE_DIR } = require('./fontResolverService');
 const COMPOSITION_BY_FORMAT = {
   vertical: 'CanonicalVertical',
   feed: 'CanonicalFeed',
+  square: 'CanonicalSquare',   // 1080x1080 Meta Feed 1:1 — see remotion/Root.jsx
   landscape: 'CanonicalLandscape',
 };
 

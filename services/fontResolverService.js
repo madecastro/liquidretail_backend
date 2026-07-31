@@ -38,6 +38,7 @@ const DEFAULT_ROLE_FONTS = {
 const SERIF_HINTS = /serif|playfair|lora|cormorant|garamond|fraunces|caslon|bodoni|didot|georgia|times|libre|crimson|merriweather|spectral|eb garamond|prata|domine/i;
 
 const memoryCache = new Map(); // family|weight -> resolved entry or null
+const inFlight = new Map();    // key -> Promise; prevents same-font download races
 const CACHE_VER = 'v2'; // v2: latin-subset selection (v1 files may be cyrillic-only)
 
 function slugify(family, weight, ext) {
@@ -63,10 +64,38 @@ async function downloadTo(url, filePath, { headers = {} } = {}) {
   if (buf.length < 1024) throw new Error(`suspiciously small font payload (${buf.length}B) from ${url}`);
   // temp + rename: a partially-written file must never satisfy the
   // size-based cache check on the next run.
-  const tmp = `${filePath}.tmp-${process.pid}`;
-  await fsp.writeFile(tmp, buf);
-  await fsp.rename(tmp, filePath);
+  const tmp = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  try {
+    await fsp.writeFile(tmp, buf);
+    await fsp.rename(tmp, filePath);
+  } finally {
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+  }
   return filePath;
+}
+
+function dedupeRequest(key, work) {
+  if (inFlight.has(key)) return inFlight.get(key);
+  const promise = Promise.resolve().then(work).finally(() => inFlight.delete(key));
+  inFlight.set(key, promise);
+  return promise;
+}
+
+const GENERIC_FAMILIES = new Set([
+  'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui',
+  'ui-serif', 'ui-sans-serif', 'ui-monospace', 'inherit', 'initial', 'unset'
+]);
+
+function normalizeFontFamily(value) {
+  for (const part of String(value || '').split(',')) {
+    const family = part.trim().replace(/^['"]+|['"]+$/g, '').trim();
+    if (family && !GENERIC_FAMILIES.has(family.toLowerCase())) return family;
+  }
+  return null;
+}
+
+function familyKey(value) {
+  return String(normalizeFontFamily(value) || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 /**
@@ -98,8 +127,11 @@ function pickLatinFace(cssText) {
  * family isn't served by Google Fonts.
  */
 async function resolveGoogleFamily(family, weight = 400) {
+  family = normalizeFontFamily(family);
+  if (!family) return null;
   const cacheKey = `google|${family}|${weight}`;
   if (memoryCache.has(cacheKey)) return memoryCache.get(cacheKey);
+  return dedupeRequest(cacheKey, async () => {
   // Inside the failure boundary below via first use — an unwritable cache
   // dir must degrade to the default-font path, never throw upward.
 
@@ -130,7 +162,11 @@ async function resolveGoogleFamily(family, weight = 400) {
     if (!stat || stat.size < 1024) await downloadTo(face.url, woff2Path);
     // remoteUrl: browser-loadable origin (gstatic serves CORS *) — the
     // frontend @remotion/player preview loads fonts from here directly.
-    const entry = { family, weight: effectiveWeight, localPath: woff2Path, remoteUrl: face.url, fallback: fallbackFor(family), source: 'google' };
+    const entry = {
+      family, weight: effectiveWeight, localPath: woff2Path, remoteUrl: face.url,
+      fallback: fallbackFor(family), source: 'google', exact: true,
+      requestedFamily: family, resolvedFamily: family
+    };
     memoryCache.set(cacheKey, entry);
     return entry;
   } catch (e) {
@@ -144,45 +180,59 @@ async function resolveGoogleFamily(family, weight = 400) {
     }
     return null;
   }
+  });
 }
 
 /**
  * Find an ingested website font on the brand matching `family`
- * (case/space-insensitive), preferring the requested weight and normal
- * style (an italic-only match still wins over no match).
+ * (case/space-insensitive), preferring the requested weight. The style
+ * must match so a roman request never silently renders with an italic face.
  */
 function matchCustomFont(brand, family, { weight = 400, style = 'normal' } = {}) {
   const list = Array.isArray(brand?.customFonts) ? brand.customFonts : [];
-  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-  const want = norm(family);
+  const want = familyKey(family);
   if (!want) return null;
-  const usable = list.filter((f) => f && f.url && f.license !== 'commercial' && norm(f.family) === want);
+  const usable = list.filter((f) =>
+    f && f.url && f.license !== 'commercial' && !f.needsLicense &&
+    familyKey(f.family) === want &&
+    (f.style || 'normal') === style
+  );
   if (!usable.length) return null;
   usable.sort((a, b) => {
-    const styleRank = (f) => ((f.style || 'normal') === style ? 0 : 1);
-    if (styleRank(a) !== styleRank(b)) return styleRank(a) - styleRank(b);
-    return Math.abs((a.weight || 400) - weight) - Math.abs((b.weight || 400) - weight);
+    const distance = (font) => {
+      if (Number.isFinite(font.weightMin) && Number.isFinite(font.weightMax) &&
+          weight >= font.weightMin && weight <= font.weightMax) return 0;
+      return Math.abs((font.weight || 400) - weight);
+    };
+    return distance(a) - distance(b);
   });
   return usable[0];
 }
 
-async function resolveCustomFont(brand, custom) {
-  const cacheKey = `custom|${custom.url}`;
+async function resolveCustomFont(brand, custom, requestedWeight = custom.weight || 400) {
+  const variableWeight = Number.isFinite(custom.weightMin) && Number.isFinite(custom.weightMax) &&
+    requestedWeight >= custom.weightMin && requestedWeight <= custom.weightMax;
+  const effectiveWeight = variableWeight ? requestedWeight : (custom.weight || 400);
+  const cacheKey = `custom|${custom.url}|${effectiveWeight}|${custom.style || 'normal'}`;
   if (memoryCache.has(cacheKey)) return memoryCache.get(cacheKey);
+  return dedupeRequest(cacheKey, async () => {
   const ext = custom.format === 'ttf' || custom.format === 'otf' ? custom.format : 'woff2';
-  const localPath = path.join(FONT_CACHE_DIR, slugify(`${brand._id || 'brand'}-${custom.family}`, custom.weight || 400, ext));
+  const localPath = path.join(FONT_CACHE_DIR, slugify(`${brand._id || 'brand'}-${custom.family}`, effectiveWeight, ext));
   try {
     await ensureCacheDir();
     const stat = await fsp.stat(localPath).catch(() => null);
     if (!stat || stat.size < 1024) await downloadTo(custom.url, localPath);
     const entry = {
       family: custom.family,
-      weight: custom.weight || 400,
+      weight: effectiveWeight,
       style: custom.style || 'normal',
       localPath,
       remoteUrl: custom.url, // Cloudinary raw mirror — browser-loadable
       fallback: fallbackFor(custom.family),
       source: 'custom',
+      exact: true,
+      requestedFamily: custom.family,
+      resolvedFamily: custom.family,
     };
     memoryCache.set(cacheKey, entry);
     return entry;
@@ -194,6 +244,54 @@ async function resolveCustomFont(brand, custom) {
     if (gone) memoryCache.set(cacheKey, null);
     return null;
   }
+  });
+}
+
+// Common proprietary families mapped to the nearest face in the bundled,
+// redistributable Google-font library. This tier is reached only after an
+// exact customer-website face and an exact Google Fonts lookup both fail.
+const LIBRARY_SUBSTITUTIONS = [
+  { pattern: /helvetica|arial|univers|frutiger|neue haas/i, family: 'Inter', reason: 'neutral grotesk sans' },
+  { pattern: /gotham|proxima|futura|century gothic|brandon/i, family: 'Montserrat', reason: 'geometric sans' },
+  { pattern: /avenir|circular|museo sans|sofia pro/i, family: 'DM Sans', reason: 'modern humanist sans' },
+  { pattern: /din|trade gothic|franklin gothic|league gothic/i, family: 'Oswald', reason: 'condensed industrial sans' },
+  { pattern: /impact|haettenschweiler/i, family: 'Anton', reason: 'heavy display sans' },
+  { pattern: /bodoni|didot|walbaum/i, family: 'Playfair Display', reason: 'high-contrast editorial serif' },
+  { pattern: /garamond|caslon|baskerville|minion|adobe jenson/i, family: 'Cormorant Garamond', reason: 'old-style editorial serif' },
+  { pattern: /script|brush|handwriting|calligraphy/i, family: 'Great Vibes', reason: 'formal script' }
+];
+
+let libraryReadyPromise = null;
+async function resolveLibraryMatch(requestedFamily, weight = 400) {
+  const requested = normalizeFontFamily(requestedFamily);
+  if (!requested) return null;
+  const substitution = LIBRARY_SUBSTITUTIONS.find((item) => item.pattern.test(requested));
+  const matchedFamily = substitution?.family || (fallbackFor(requested) === 'serif' ? 'Lora' : 'Inter');
+  const { ensureFontsLoaded, FONTS, FONTS_DIR } = require('./fontLoader');
+  if (!libraryReadyPromise) libraryReadyPromise = ensureFontsLoaded();
+  await libraryReadyPromise;
+  const key = familyKey(matchedFamily);
+  const font = FONTS.find((item) =>
+    familyKey(item.family) === key ||
+    (item.aliases || []).some((alias) => familyKey(alias) === key)
+  );
+  if (!font) return null;
+  const localPath = path.join(FONTS_DIR, font.file);
+  const stat = await fsp.stat(localPath).catch(() => null);
+  if (!stat || stat.size < 1024) return null;
+  return {
+    family: font.family,
+    weight,
+    style: 'normal',
+    localPath,
+    remoteUrl: null,
+    fallback: fallbackFor(font.family),
+    source: 'library-match',
+    exact: false,
+    requestedFamily: requested,
+    resolvedFamily: font.family,
+    matchReason: substitution?.reason || `${fallbackFor(requested)} fallback`
+  };
 }
 
 /**
@@ -202,19 +300,28 @@ async function resolveCustomFont(brand, custom) {
  * null means "let the browser fall back" (family kept for CSS stacks).
  */
 async function resolveFamily(family, { brand = null, weight = 400 } = {}) {
-  if (!family || !String(family).trim()) return null;
-  family = String(family).trim();
+  family = normalizeFontFamily(family);
+  if (!family) return null;
 
   const custom = matchCustomFont(brand, family, { weight });
   if (custom) {
-    const entry = await resolveCustomFont(brand, custom);
+    const entry = await resolveCustomFont(brand, custom, weight);
     if (entry) return entry;
   }
 
   const google = await resolveGoogleFamily(family, weight);
   if (google) return google;
 
-  console.warn(`🔤 fontResolver: '${family}' not ingested and not on Google Fonts — falling back to defaults for brand ${brand?.name || '?'}`);
+  const library = await resolveLibraryMatch(family, weight);
+  if (library) {
+    console.warn(
+      `🔤 fontResolver: '${family}' unavailable — using closest library face ` +
+      `'${library.family}' (${library.matchReason}) for brand ${brand?.name || '?'}`
+    );
+    return library;
+  }
+
+  console.warn(`🔤 fontResolver: '${family}' unavailable and library match failed for brand ${brand?.name || '?'}`);
   return null;
 }
 
@@ -226,8 +333,12 @@ async function resolveFamily(family, { brand = null, weight = 400 } = {}) {
  * asset-server URL before it reaches the browser.
  */
 async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = null } = {}) {
-  const theme = brand?.styleTheme || {};
+  const styleThemeIsCurated = Array.isArray(brand?.curatedFields) && brand.curatedFields.includes('styleTheme');
+  const theme = styleThemeIsCurated ? (brand?.styleTheme || {}) : {};
+  const tailwind = brand?.tailwindTheme || {};
+  const websiteUsage = brand?.websiteFontUsage || {};
   const scanned = brand?.fontFamily || layoutInputBrand?.font_family || null;
+  const fontIsCurated = Array.isArray(brand?.curatedFields) && brand.curatedFields.includes('fontFamily');
 
   // One shared brand family used by EVERY role that has no explicit per-role
   // font. Without this, `quote` skipped `scanned` and fell straight to serif
@@ -236,12 +347,16 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
   // brand family → the curated role default (Playfair/Inter/Lora, an
   // intentional pairing used only when the brand has NO family at all, so
   // the three still work together rather than mixing arbitrarily).
-  const sharedFamily = scanned || theme.bodyFontFamily || theme.headingFontFamily || null;
+  const sharedFamily = normalizeFontFamily(
+    (fontIsCurated ? scanned : null) ||
+    tailwind?.fonts?.body || websiteUsage.body || scanned ||
+    theme.bodyFontFamily || theme.headingFontFamily || null
+  );
 
   const wanted = {
-    heading: overrides.heading?.family || theme.headingFontFamily || sharedFamily || DEFAULT_ROLE_FONTS.heading.family,
-    body: overrides.body?.family || theme.bodyFontFamily || sharedFamily || DEFAULT_ROLE_FONTS.body.family,
-    quote: overrides.quote?.family || theme.quoteFontFamily || sharedFamily || DEFAULT_ROLE_FONTS.quote.family,
+    heading: normalizeFontFamily(overrides.heading?.family || theme.headingFontFamily || (fontIsCurated ? scanned : null) || tailwind?.fonts?.heading || websiteUsage.heading || sharedFamily) || DEFAULT_ROLE_FONTS.heading.family,
+    body: normalizeFontFamily(overrides.body?.family || theme.bodyFontFamily || (fontIsCurated ? scanned : null) || tailwind?.fonts?.body || websiteUsage.body || sharedFamily) || DEFAULT_ROLE_FONTS.body.family,
+    quote: normalizeFontFamily(overrides.quote?.family || theme.quoteFontFamily || websiteUsage.quote || sharedFamily) || DEFAULT_ROLE_FONTS.quote.family,
   };
   const weights = {
     heading: overrides.heading?.weight || 700,
@@ -260,8 +375,21 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
     // requested weight when a family only ships one cut) — FontFace must be
     // registered with the file's weight so the browser matches + synthesizes.
     out[role] = entry
-      ? { family: entry.family, weight: entry.weight, style: entry.style || 'normal', url: entry.localPath, remoteUrl: entry.remoteUrl || null, fallback: entry.fallback, source: entry.source }
-      : { family: def.family, weight: def.weight, style: 'normal', url: null, remoteUrl: null, fallback: def.fallback, source: 'default' };
+      ? {
+          family: entry.family, weight: entry.weight, style: entry.style || 'normal',
+          url: entry.localPath, remoteUrl: entry.remoteUrl || null,
+          fallback: entry.fallback, source: entry.source,
+          exact: entry.exact !== false,
+          requestedFamily: entry.requestedFamily || wanted[role],
+          resolvedFamily: entry.resolvedFamily || entry.family,
+          matchReason: entry.matchReason || null
+        }
+      : {
+          family: def.family, weight: def.weight, style: 'normal', url: null,
+          remoteUrl: null, fallback: def.fallback, source: 'default',
+          exact: false, requestedFamily: wanted[role], resolvedFamily: def.family,
+          matchReason: 'role default'
+        };
   }
   return out;
 }
@@ -270,6 +398,9 @@ module.exports = {
   resolveBrandFonts,
   resolveFamily,
   resolveGoogleFamily,
+  resolveLibraryMatch,
+  normalizeFontFamily,
+  matchCustomFont,
   FONT_CACHE_DIR,
   DEFAULT_ROLE_FONTS,
 };

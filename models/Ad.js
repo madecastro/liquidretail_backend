@@ -197,6 +197,11 @@ const adSchema = new mongoose.Schema({
       mode:        { type: String, enum: ['light', 'full'] },  // light = chrome-only re-comp; full = re-run pipeline
       requestedBy: String,
       videoModel:  String,   // per-run model override from the regenerate dropdown (null = brand/product default)
+      // true when this run used a verbatim prompt-text override (operator
+      // edited the exact prompt in the Generation Details modal) rather
+      // than the refinement-note path. The full text lives on the
+      // AiCanvasArtifact (htmlPromptSystem/htmlPromptUser), not here.
+      rawPromptEdit: { type: Boolean, default: false },
       at:          Date,
       status:      { type: String, enum: ['pending', 'done', 'failed'] },
       error:       String,
@@ -243,6 +248,34 @@ const adSchema = new mongoose.Schema({
   // transcode, no 423 race.
   veoAspectRatio:     { type: String, default: null },
   veoPrompt:          { type: String, default: null },  // storyboard prompt sent to Veo — preserved for debugging + reproduction
+  // The provider's prediction id, persisted IMMEDIATELY after the billable submit
+  // succeeds — before polling starts.
+  //
+  // This is a SPEND RECEIPT, not telemetry. Previously the id lived only as a local
+  // variable inside generateForAd, so a web-process death between submit and
+  // completion (deploy, autoscale replacement, OOM) lost it: Atlas was generating a
+  // video we had paid for, with no handle to reclaim it, and the orphan reaper would
+  // flip the ad back to 'queued' so the next run submitted AGAIN. That is a guaranteed
+  // double charge, ~$1.00 a time. Not hypothetical here — Render's SIGKILL lands after
+  // a 300s drain window while MAX_POLL_MS is 10 minutes, so an in-flight poll cannot
+  // be drained cleanly.
+  //
+  // Persisting it makes the orphan reconcilable: a restart can poll this id and finish
+  // the ad instead of re-submitting. Nothing consumes it that way YET — that resume
+  // path belongs with the render-queue move (ARCHITECTURE_REVIEW.md "The render-queue
+  // architecture problem"). Until then it is the audit trail that turns a silent
+  // double-bill into a visible orphan.
+  veoPredictionId:    { type: String, default: null },
+  // Face-safe base-plate crop, computed by services/basePlateCropService.js before Remotion
+  // titling. Shape: { version, format, sourceUrl, videoUrl|null, rect?, sourceW?, sourceH?,
+  // frames?, faceHits?, envelope?, reason?, computedAt }.
+  //   videoUrl non-null -> the liveness-probed Cloudinary c_crop derivative titling consumes
+  //   videoUrl null     -> a persisted SKIP (reason says why) so re-titles don't re-pay detection
+  // BINDING INVARIANT: only honoured when sourceUrl === the ad's CURRENT veoVideoUrl — a
+  // regenerated base video must never ship a crop of footage the operator replaced. The consumer
+  // (basePlateCropService.resolveBasePlateVideoUrl) enforces this; anything that rewrites
+  // veoVideoUrl can leave this stale without harm, but SHOULD clear it to save a wasted lookup.
+  basePlate:          { type: mongoose.Schema.Types.Mixed, default: null },
   veoReferenceImages: { type: [String], default: [] },  // exact reference-image stack sent to the model (pos 0 = seed, then product hero + alts) — for the generation inspector
   // GPT-composed structured storyboard. Null when VEO_USE_GPT_STORYBOARD
   // is off or the GPT call failed (Veo prompt then carries the legacy
@@ -279,6 +312,19 @@ const adSchema = new mongoose.Schema({
   // Brand (which drift), so this gives the generation-inspector byte-exact
   // historical titling. Written by brandScriptExecutor at render time.
   titlingSnapshot:    { type: mongoose.Schema.Types.Mixed, default: null },
+  // Exact font resolution audit for the direct static-image path.
+  // { heading/body: { requestedFamily, resolvedFamily, source, exact } }
+  fontResolution:     { type: mongoose.Schema.Types.Mixed, default: null },
+  // Verbatim audit of the image-model request, captured at submit time from
+  // the POST body itself (atlasImageService.buildSubmissionRecord):
+  // { provider, model, predictionId, submittedAt, prompt, size, quality,
+  //   imageCount, images: [{ position, submittedUrl, sourceUrl, role }] }.
+  // The generation inspector renders ONLY this — it must never reconstruct a
+  // plausible-looking stack, because a diagnostic that shows what should have
+  // been sent instead of what was sent silently misdirects every diagnosis
+  // built on it. Null on renders that predate this capture; the inspector
+  // says so rather than guessing.
+  imageGeneration:    { type: mongoose.Schema.Types.Mixed, default: null },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },

@@ -26,6 +26,11 @@ const axios = require('axios');
 const sharp = require('sharp');
 
 const Media                     = require('../models/Media');
+// Required for the charge-point veoPredictionId write in generateForAd. NOTE this file
+// previously had no Ad import at all — `node --check` passes on an undefined identifier,
+// so the missing require would only have surfaced as a runtime ReferenceError on the
+// first real video generation, inside the very guard meant to protect spend.
+const Ad                        = require('../models/Ad');
 const Brand                     = require('../models/Brand');
 const Campaign                  = require('../models/Campaign');
 const CatalogProduct            = require('../models/CatalogProduct');
@@ -43,29 +48,42 @@ const { buildLayoutInput }   = require('./layoutInputService');
 // switch + model/resolution/skip-threshold are all env-tunable.
 // Ported from ReachSocialLLMExpander runSafeZoneReframe (uncrop-v1 ladder).
 const REFRAME_ENABLED = () => String(process.env.REFRAME_ENABLED ?? 'true').toLowerCase() !== 'false';
-// Model tier: '-developer' is a BILLING variant, not a quality tier. Verified
-// against the live Atlas catalogue (2026-07-24): it carries the same
-// price.origin.base_price ($0.08) as plain /edit and differs only by a 50%
-// discount factor; `profile` text is verbatim identical and the readmes are
-// byte-identical. The same pattern holds across all 12 '-developer' variants,
-// while a genuine quality up-tier (nano-banana-pro/edit-ultra) gets its own
-// higher list price. Distillation is the separate '-lite' axis, which composes
-// independently. So: half price, no evidenced fidelity cost.
+// Model tier: for THIS model ('google/nano-banana-2/edit') '-developer' is a BILLING
+// variant, not a quality tier. Verified against the live Atlas catalogue
+// (2026-07-24): it carries the same price.origin.base_price ($0.08) as plain /edit
+// and differs only by a 50% discount factor; `profile` text is verbatim identical
+// and the readmes are byte-identical. A genuine quality up-tier
+// (nano-banana-pro/edit-ultra) gets its own higher list price. Distillation is the
+// separate '-lite' axis, which composes independently. So here: half price, no
+// evidenced fidelity cost.
+//
+// CORRECTION 2026-07-29 — this comment used to claim "the same pattern holds across
+// all 12 '-developer' variants". That generalisation is FALSE. Diffed live for
+// gemini-omni-flash/image-to-video: plain vs '-developer' differ in input shape
+// (`image` single string vs `images[]` 1-7), duration (range 3-10 vs enum 4/6/8/10),
+// resolution (720p ONLY vs 720p/1080p/4k), `thinking_level` (present vs ABSENT), and
+// the pricing formula itself. Never assume the suffix is cosmetic — diff the two
+// schemas for the specific slug. See docs/ATLAS.md §8.
 const REFRAME_OUTPAINT_MODEL = () => process.env.REFRAME_OUTPAINT_MODEL || 'google/nano-banana-2/edit-developer';
 // 1k is the schema default for both variants (enum 1k|2k|4k). Deliberately NOT
 // 4k: no Atlas model exposes a mask or pixel-passthrough, so the whole canvas
 // is re-synthesised every call — at 4k the decoder must commit to letterforms
 // and logo strokes it can only guess, which is the artifact we were seeing.
-// And the reframed reference is never consumed at 4k anyway: it feeds a 720p
-// video render (~9x area downsample). Raise ATLAS_VIDEO_RESOLUTION, not this,
-// if you want more resolution where viewers actually see it.
+// And the reframed reference is heavily downsampled by the video render anyway.
+// Raise ATLAS_VIDEO_RESOLUTION, not this, for resolution viewers actually see.
 // 4k per operator decision (2026-07-24) after reviewing 20 live generations
 // side by side: at 4k the conservative 'reframe' prompt held product geometry
 // better than 1k did, and the reframed reference is surfaced at full size in
-// the generation inspector. Note the video render itself is 720p by default
-// (ATLAS_VIDEO_RESOLUTION), so 4k benefits inspection rather than the finished
-// ad — and the readme prices 4k at 2x, hence REFRAME_COST_USD below. Schema
-// enum is 1k|2k|4k; 4k is the maximum offered.
+// the generation inspector. The readme prices 4k at 2x, hence REFRAME_COST_USD
+// below. Schema enum is 1k|2k|4k; 4k is the MAXIMUM offered — there is no higher
+// tier to raise this to.
+// UPDATED 2026-07-29: ATLAS_VIDEO_RESOLUTION is now 1080p (it is the same price as
+// 720p — see config/defaults.env), so the downsample from a 4k reference is ~4x
+// area rather than ~9x. That makes the operator's 4k choice MORE justified than
+// when it was made, not less: more of the fidelity now survives into the finished
+// ad instead of only into the inspector.
+// Worth knowing if 4k is ever revisited: the readme prices 1k and 2k IDENTICALLY
+// ($0.08), so 2k is a free upgrade over 1k, while 4k alone costs 2x ($0.16).
 const REFRAME_RESOLUTION = () => process.env.REFRAME_RESOLUTION || '4k';
 // 'reframe' (conservative, default) | 'uncrop' (scene-revealing, riskier on
 // product imagery). See reframeOutpaintPrompt for the measured tradeoff.
@@ -474,6 +492,35 @@ function resolveAspectRatioForModel(requested, caps) {
   return best;
 }
 
+// Omni renders 16:9 or 9:16 only. Rather than fall back to Grok for
+// every other aspect (4:5, 3:4, 2:3, 3:2, 4:3, 1.91:1 — which Grok either
+// doesn't support natively either, or produces at higher cost), pick the
+// FAMILY native: 9:16 for anything portrait, 16:9 for anything landscape.
+// The downstream compositor's c_fill,g_auto (see videoCompositeService)
+// crops the render aspect to the canvas aspect at composite time using
+// saliency-aware gravity, so a 9:16 source in a 4:5 canvas gets a clean
+// content-centered vertical crop with no letterboxing.
+//
+// Square (1:1) has no clean family native — a 44%-of-frame crop from
+// portrait or landscape drops too much subject; keep the Grok fallback
+// for it. Non-numeric aspects (unrecognized string) also fall through.
+function omniFamilyNativeFor(requestedAspect) {
+  const r = aspectToNumeric(requestedAspect);
+  if (r == null) return null;
+  if (Math.abs(r - 1) < 0.01) {
+    // Square via Omni (owner decision 2026-07-29, flipped after side-testing). The "44% crop
+    // drops too much subject" objection above predates the face-safe base-plate crop
+    // (services/basePlateCropService.js): 1:1 now renders at Omni 9:16 and titling crops it
+    // face-anchored — crown may be sacrificed up to FACE_TOP_CROP_ALLOWANCE_FRAC, forehead never
+    // (faceSafeCrop.js). When detection finds no head, BasePlate's centre crop is the accepted
+    // fallback. Env off-switch restores the Grok fallback for square only.
+    return String(process.env.SQUARE_VIA_OMNI_CROP ?? 'true').toLowerCase() !== 'false'
+      ? '9:16'
+      : null;
+  }
+  return r < 1 ? '9:16' : '16:9';
+}
+
 // ── Model + aspect resolution (shared) ────────────────────────────────
 //
 // The single decision point both prepareStoryboard and generateForAd go
@@ -483,16 +530,25 @@ function resolveAspectRatioForModel(requested, caps) {
 //   2. requiresVideoSeed degrade: Omni reference-to-video transforms an
 //      existing clip — an image-seeded ad can't feed it, so it degrades
 //      to the built-in i2v default rather than failing the render.
-//   3. Aspect fallback: Omni models only render 16:9/9:16. Any other
-//      canvas routes to ASPECT_FALLBACK_MODEL (Grok 1.5), whose refs are
-//      already pre-cropped to the canvas by the existing resize system.
-//      Explicitly-selected Grok/Veo models never "fall back".
-//   4. resolveAspectRatioForModel runs against the FINAL model's caps
-//      (formats even Grok lacks — 4:5, 5:4, 1.91:1 — keep the
-//      closest-aspect render + Cloudinary eager re-crop path).
+//   3. Omni family route: Omni models only render 16:9 / 9:16. For any
+//      other portrait / landscape target we render at the FAMILY native
+//      (9:16 or 16:9) and let the compositor's c_fill,g_auto crop to
+//      the platform aspect. Cheaper + higher quality than Grok fallback,
+//      and avoids the "no native 4:5" trap that used to two-hop through
+//      Grok@3:4. Square (1:1) still falls back to Grok since neither
+//      Omni family is a clean crop source.
+//   4. Grok fallback: square-only remainder (or explicitly-selected
+//      non-Omni models whose caps.paramShape !== 'gemini-omni-*').
+//   5. resolveAspectRatioForModel runs against the FINAL model's caps
+//      (formats even Grok lacks — 5:4, 1.91:1 — keep the closest-aspect
+//      render + Cloudinary eager re-crop path).
 //
-// Returns { model, caps, aspectRatio, fallback } where fallback is
-// null or { from, reason } for logging / the Ad doc.
+// Returns { model, caps, renderAspect, targetAspect, aspectRatio, fallback }.
+//   renderAspect  — what the video model will emit (submit body, ref pre-crop)
+//   targetAspect  — the platform aspect the ad ends up as (chrome + compositor)
+//   aspectRatio   — backwards-compat alias for renderAspect
+//   fallback      — null, or { from, to?, kind, reason } for logging / Ad doc.
+//                   kind ∈ 'video-seed-degrade' | 'omni-family-crop' | 'grok-fallback'
 function resolveModelAndAspect({
   brand = null, product = null, categories = [], canvasKeys = [],
   platformAspect, modelOverride = null, hasVideoSeed = false
@@ -511,20 +567,58 @@ function resolveModelAndAspect({
   let caps = capsFor(model);
 
   if (caps.requiresVideoSeed && !hasVideoSeed) {
-    fallback = { from: model, reason: 'model requires a video seed; ad is image-seeded' };
+    fallback = { from: model, kind: 'video-seed-degrade', reason: 'model requires a video seed; ad is image-seeded' };
     model = BUILT_IN_DEFAULT_MODEL;
     caps = capsFor(model);
   }
 
   const isOmni = String(caps.paramShape || '').startsWith('gemini-omni');
   if (isOmni && platformAspect && !(caps.supportedAspectRatios || []).includes(platformAspect)) {
-    fallback = { from: model, reason: `aspect ${platformAspect} unsupported (${(caps.supportedAspectRatios || []).join('/')})` };
+    const familyNative = omniFamilyNativeFor(platformAspect);
+    if (familyNative) {
+      // Family route — keep Omni, render at its native, compositor crops.
+      fallback = {
+        from:   platformAspect,
+        to:     familyNative,
+        kind:   'omni-family-crop',
+        reason: `render at Omni family native ${familyNative}; compositor c_fill,g_auto crops to ${platformAspect}`
+      };
+      return {
+        model, caps,
+        renderAspect: familyNative,
+        targetAspect: platformAspect,
+        aspectRatio:  familyNative,
+        fallback
+      };
+    }
+    // Square (or unrecognized) — no clean Omni family, fall back to Grok.
+    fallback = { from: model, kind: 'grok-fallback', reason: `aspect ${platformAspect} unsupported (${(caps.supportedAspectRatios || []).join('/')})` };
     model = ASPECT_FALLBACK_MODEL;
     caps = capsFor(model);
   }
 
-  const aspectRatio = resolveAspectRatioForModel(platformAspect, caps);
-  return { model, caps, aspectRatio, fallback };
+  const renderAspect = resolveAspectRatioForModel(platformAspect, caps);
+  return {
+    model, caps,
+    renderAspect,
+    targetAspect: platformAspect,
+    aspectRatio:  renderAspect,
+    fallback
+  };
+}
+
+// Emit the resolver's outcome as ONE log line per ad instead of the old
+// two-line "model fallback ... / remapped aspect ..." split. Keeps the
+// resolver's dispatch decision in a single grep-able place.
+function logResolution(adId, model, renderAspect, targetAspect, fallback) {
+  if (!fallback && renderAspect === targetAspect) {
+    console.log(`🎬 atlasVideo[ad=${adId}]: model=${model} aspect=${renderAspect}`);
+    return;
+  }
+  const cropNote = renderAspect !== targetAspect ? ` → crop to ${targetAspect}` : '';
+  const kind = fallback?.kind ? ` [${fallback.kind}]` : '';
+  const reason = fallback?.reason ? ` — ${fallback.reason}` : '';
+  console.log(`🎬 atlasVideo[ad=${adId}]: model=${model} render=${renderAspect}${cropNote}${kind}${reason}`);
 }
 
 // ── Cloudinary aspect cropping ────────────────────────────────────────
@@ -687,7 +781,11 @@ async function submitImageGeneration({ model, images, prompt, aspectRatio, resol
     { model, images, prompt, aspect_ratio: aspectRatio, resolution },
     {
       headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json' },
-      timeout: 60000
+      timeout: 60000,
+      // See the same guard on the video submit: axios's default maxRedirects of 5
+      // re-sends the body on a 307/308, double-charging inside one call. This path
+      // already refuses to retry; that promise is void unless redirects are off too.
+      maxRedirects: 0
     }
   );
   const id = res.data?.data?.id;
@@ -1821,7 +1919,124 @@ function isRateLimit(summary) {
   if (!summary) return false;
   if (summary.status === 429) return true;
   const body = String(summary.body || summary.message || '').toLowerCase();
-  return /(\bcode\b\s*[:=]\s*429|\bstatus\b\s*[:=]\s*429|http status code:\s*429|rate[- ]?limit|too many requests)/i.test(body);
+  // Same `(?!\d)` digit-boundary guard as isDefinite429 below — `code: 42901` is
+  // not a 429. Harmless here (a mis-read only lengthens a poll backoff, and polls
+  // are free to retry) but wrong is wrong, and the two predicates should not
+  // disagree about what the word "429" means.
+  return /(\bcode\b"?\s*[:=]\s*429(?!\d)|\bstatus\b"?\s*[:=]\s*429(?!\d)|http status code:\s*429(?!\d)|rate[- ]?limit|too many requests)/i.test(body);
+}
+
+// STRICTER sibling of isRateLimit, for the BILLABLE submit path only.
+//
+// isRateLimit is correct for polling, where a retry is free — so it casts wide,
+// including the bare phrases "rate limit" / "too many requests" matched against
+// JSON.stringify(<arbitrary envelope>).slice(0, 400). On a submit a retry is a
+// second POST, so inference from a loose substring is the wrong evidence bar:
+// we retry only on a STRUCTURED 429 signal, which is positive proof the request
+// was rejected upstream before any generation began (and therefore unbilled).
+//
+// Deliberately NOT matched here: bare "rate limit"/"too many requests" prose. A
+// 5xx from an unrelated cause whose envelope merely contains those words would
+// otherwise be replayed. Cost of being wrong is asymmetric — a declined submit
+// is a retryable ad, a duplicated submit is money already spent.
+//
+// Client-side failures (ECONNRESET, "timeout of 60000ms exceeded") match neither
+// this nor isRateLimit, so they still throw on the first attempt. That is the
+// correct call: a timed-out POST may well have landed server-side, and there is
+// no prediction id to reconcile against.
+// Two details here are load-bearing, NOT decoration. Both were caught by tests
+// after adversarial review; keep them if this regex is ever edited.
+//
+// 1. `(?!\d)` after each 429. Without it `code: 42901`, `status: 42917` and
+//    `http status code: 42999` all match — any longer integer merely PREFIXED by
+//    429. A validation error carrying such a field id would read as a definite
+//    rate-limit and get replayed: a second billable POST for an error that had
+//    nothing to do with rate limiting.
+// 2. `"?` before the separator. The documented Atlas envelope embeds JSON —
+//    `{"error":"unexpected http status code: 429, body: {\"code\":429,...}"}` —
+//    and `\bcode\b\s*[:=]` cannot match `"code":429`, because the quote sits
+//    between the key and the colon. That envelope only matched at all via the
+//    `http status code: 429` alternative; a body carrying ONLY the JSON marker
+//    would have been misread as "not a rate limit". Safe direction (fail rather
+//    than double-bill) but wrong, so it is fixed rather than tolerated.
+function isDefinite429(summary) {
+  if (!summary) return false;
+  if (summary.status === 429) return true;
+  const body = String(summary.body || summary.message || '');
+  return /(\bcode\b"?\s*[:=]\s*429(?!\d)|\bstatus\b"?\s*[:=]\s*429(?!\d)|http status code:\s*429(?!\d))/i.test(body);
+}
+
+/**
+ * The whole replay decision for a failed billable submit, as ONE pure function.
+ *
+ * Extracted from the catch block so the money-critical choice is unit-testable
+ * without mocking axios — scripts/verifySubmitGuard.js drives this directly. The
+ * catch block must contain no replay logic of its own; if a case is missing, add
+ * it HERE so the harness covers it.
+ *
+ * Returns one of:
+ *   'retry'            — proven 429 and attempts remain: safe to POST again
+ *   'throw-429'        — proven 429 but attempts exhausted
+ *   'throw-maybe-429'  — looks rate-limited but unproven: deliberately NOT replayed
+ *   'throw-other'      — anything else, including timeouts and resets
+ */
+function submitRetryDecision(summary, attempt, maxAttempts) {
+  if (isDefinite429(summary)) {
+    return attempt < maxAttempts ? 'retry' : 'throw-429';
+  }
+  if (isRateLimit(summary)) return 'throw-maybe-429';
+  return 'throw-other';
+}
+
+// ── Per-model submit pacing ───────────────────────────────────────────
+//
+// Atlas rate limits are per (team, model) RPS and some models are 1 RPS. Firing
+// N same-model submits at once bursts past that and all-but-one fail server-side
+// — which is exactly the condition the submit retry below was added to absorb.
+// Pacing PREVENTS the collision instead of reacting to it: same-model submits are
+// serialized and spaced >= SUBMIT_SPACING_MS apart (start-to-start), while
+// different models run in parallel as independent buckets.
+//
+// This only ever DELAYS the single POST a task makes — it never retries one.
+// Ported from reach-social-llm-expander src/lib/atlas.ts:69-99; keep the two in
+// step, the reasoning is identical.
+//
+// SINGLE-PROCESS ASSUMPTION, and it matters: this gate is in-memory, so two web
+// instances keep two independent gates and the effective rate doubles. It is a
+// real improvement within one process and NOT a global limiter. It becomes
+// globally true once rendering moves to the single-instance worker (see
+// ARCHITECTURE_REVIEW.md "The render-queue architecture problem"); until then
+// VEO_CONCURRENCY per-process remains the weak link (routes/ads.js:144).
+const SUBMIT_SPACING_MS = (() => {
+  const n = Number(process.env.ATLAS_SUBMIT_SPACING_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 1200;
+})();
+
+const _modelSubmitGate = new Map();
+const _modelLastSubmitAt = new Map();
+
+/** Run `fn` serialized + rate-spaced against other submits for the SAME model, process-wide. */
+function pacedModelSubmit(model, fn) {
+  const run = async () => {
+    if (SUBMIT_SPACING_MS > 0) {
+      const last = _modelLastSubmitAt.get(model);
+      const wait = last == null ? 0 : last + SUBMIT_SPACING_MS - Date.now();
+      if (wait > 0) {
+        console.log(`   ⏱️  atlasVideo: pacing submit for ${model} — waiting ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
+    // Stamp BEFORE the call so spacing is start-to-start: a slow submit must not
+    // let the next one fire the instant it returns.
+    _modelLastSubmitAt.set(model, Date.now());
+    return fn();
+  };
+  // Chain after the previous submit for this model to serialize the bucket. The
+  // stored tail swallows the outcome so one failure never wedges the chain, while
+  // the caller still sees `next` reject.
+  const next = (_modelSubmitGate.get(model) || Promise.resolve()).then(run);
+  _modelSubmitGate.set(model, next.then(() => undefined, () => undefined));
+  return next;
 }
 
 async function pollPrediction(predictionId, { shouldCancel = null } = {}) {
@@ -1930,6 +2145,30 @@ async function pollPrediction(predictionId, { shouldCancel = null } = {}) {
 // paramShape still applies model-specific bounds (enum snap, ends≤10,
 // maxDuration) as a defensive floor, but callers should not rely on
 // that path for operator-facing validation.
+// Which of the assembled reference images this model shape ACTUALLY receives.
+//
+// Single source of truth for two consumers that must never disagree: the request
+// body below, and the audit record persisted as Ad.veoReferenceImages and shown
+// in the generation inspector. Previously the inspector was handed the full
+// assembled stack while several shapes submit less than that — so on a
+// 1-reference model (grok-imagine i2v, veo3.1) the inspector displayed three
+// images when exactly one was sent, with nothing indicating the difference. An
+// audit surface that overstates what a paid call received is worse than no audit
+// surface, because it is trusted.
+//
+// Keep this switch EXHAUSTIVE against buildSubmissionBody's cases.
+function submittedImageUrls(imageUrls, caps) {
+  const urls = Array.isArray(imageUrls) ? imageUrls : [];
+  switch (caps?.paramShape) {
+    case 'gemini-omni':     return urls;                                        // images: full stack
+    case 'gemini-omni-r2v': return urls.slice(0, caps.maxReferenceImages || 5);  // images: clamped
+    case 'grok':            return urls;                                        // image_urls: full stack
+    case 'grok-i2v':                                                            // image_url: single frame
+    case 'veo':                                                                 // image_url: single frame
+    default:                return urls.slice(0, 1);                            // generic: single frame
+  }
+}
+
 function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null }) {
   switch (caps.paramShape) {
     case 'gemini-omni':
@@ -1938,7 +2177,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        images: imageUrls,
+        images: submittedImageUrls(imageUrls, caps),
         duration: durationSec || caps.defaultDuration || 8,
         aspect_ratio: aspectRatio,
         resolution: process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p'
@@ -1954,7 +2193,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
         model,
         prompt,
         video_clips: [{ url: videoClipUrl, start: 0, ends: Math.min(10, duration) }],
-        images: imageUrls.slice(0, caps.maxReferenceImages || 5),
+        images: submittedImageUrls(imageUrls, caps),
         duration,
         aspect_ratio: aspectRatio,
         resolution: process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p'
@@ -1964,7 +2203,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        image_urls: imageUrls,
+        image_urls: submittedImageUrls(imageUrls, caps),
         duration: Math.min(caps.maxDuration, durationSec || 8),
         resolution: '720p',
         aspect_ratio: aspectRatio
@@ -1977,7 +2216,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        image_url: imageUrls[0],
+        image_url: submittedImageUrls(imageUrls, caps)[0],
         duration: durationSec || caps.defaultDuration || 8,
         resolution: caps.defaultResolution || '720p',
         aspect_ratio: aspectRatio
@@ -1986,14 +2225,14 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       return {
         model,
         prompt,
-        image_url: imageUrls[0],
+        image_url: submittedImageUrls(imageUrls, caps)[0],
         aspect_ratio: aspectRatio
       };
     default:
       return {
         model,
         prompt,
-        image_url: imageUrls[0]
+        image_url: submittedImageUrls(imageUrls, caps)[0]
       };
   }
 }
@@ -2001,53 +2240,89 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
 async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null }) {
   const body = buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
 
+  // refs= reports what the model RECEIVES, and names the assembled count too
+  // when the shape takes fewer. Reading "refs=3" for a 1-reference model was
+  // misleading in exactly the place you would check it — and it hid the fact
+  // that two of those reframes had been paid for and then discarded.
+  const sentRefs = submittedImageUrls(imageUrls, caps);
+  const refsLabel = sentRefs.length === imageUrls.length
+    ? `refs=${sentRefs.length}`
+    : `refs=${sentRefs.length} (of ${imageUrls.length} assembled — ${caps.paramShape} accepts fewer)`;
   console.log(
-    `🎬 atlasVideo.submit: model=${model} aspect=${aspectRatio} refs=${imageUrls.length} ` +
+    `🎬 atlasVideo.submit: model=${model} aspect=${aspectRatio} ${refsLabel} ` +
     `paramShape=${caps.paramShape} promptChars=${prompt.length} promptBytes=${Buffer.byteLength(prompt, 'utf8')} promptProfile=${promptProfileFor(caps)}`
   );
 
 
 
-  // Bounded rate-limit retry — same isRateLimit detection + RATE_LIMIT_BACKOFF_MS
-  // schedule as pollPrediction. Under VEO_CONCURRENCY > 1 the provider 429s
-  // (sometimes wrapped in an Atlas 500) on submit; without this the ad fails
-  // before any prediction id exists. Non-rate-limit errors still throw
-  // immediately. Cap of 4 attempts (1 initial + 3 backoffs).
+  // Bounded retry on a STRUCTURED 429 only — see isDefinite429. Pacing above
+  // (pacedModelSubmit) is the primary defence: it spaces same-model submits so the
+  // per-(team,model) RPS ceiling is not breached in the first place. This retry is
+  // the residual safety net for a 429 we did not manage to avoid, and it fires only
+  // when the response proves the request was rejected before any generation began.
+  //
+  // Everything else — client timeouts, connection resets, 5xx with no explicit 429
+  // marker, loose "rate limit" prose — throws on the first attempt. A POST that may
+  // have landed is NEVER replayed: there is no prediction id to reconcile against,
+  // so a replay risks paying twice for one ad.
+  // Cap of 4 attempts (1 initial + 3 backoffs).
   const maxAttempts = 4;
   let consecutiveRateLimits = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await axios.post(
+      const res = await pacedModelSubmit(model, () => axios.post(
         `${BASE_URL}/model/generateVideo`,
         body,
         {
           headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json' },
-          timeout: 60000
+          timeout: 60000,
+          // maxRedirects: 0 — axios defaults to 5 and RE-SENDS the request body on a
+          // 307/308, which on a billable endpoint is a silent double submit inside a
+          // single call (invisible to the retry logic below, which never sees it). A
+          // generation endpoint has no legitimate reason to redirect, so treat any 3xx
+          // as an error: axios then rejects, the catch runs, no 429 marker matches, and
+          // we surface it instead of paying twice.
+          maxRedirects: 0
         }
-      );
+      ));
       const predictionId = res.data?.data?.id;
       if (!predictionId) throw new Error(`atlasVideo: no prediction id in response: ${JSON.stringify(res.data).slice(0, 300)}`);
       return predictionId;
     } catch (err) {
       // "no prediction id" is a successful HTTP response with a bad body —
-      // not a rate-limit; rethrow immediately.
+      // not a rate-limit; rethrow immediately. NB this is also the one case where
+      // a billable generation may exist without us holding its id.
       if (err.message && err.message.startsWith('atlasVideo: no prediction id')) throw err;
 
       const summary = summarizeAxiosError(err);
-      if (isRateLimit(summary) && attempt < maxAttempts) {
+      const decision = submitRetryDecision(summary, attempt, maxAttempts);
+      if (decision === 'retry') {
         consecutiveRateLimits++;
         const backoffMs = RATE_LIMIT_BACKOFF_MS[Math.min(consecutiveRateLimits - 1, RATE_LIMIT_BACKOFF_MS.length - 1)];
         console.warn(
           `   ⏳ atlasVideo: submit rate-limited ` +
           `(hit #${consecutiveRateLimits}, attempt ${attempt}/${maxAttempts}, backing off ${backoffMs / 1000}s): ${summary.body || summary.message}`
         );
+        // NOTE: after this sleep the retry re-enters pacedModelSubmit and therefore
+        // joins the BACK of the model's queue — pacing wait stacks on top of the
+        // backoff. Bounded by maxAttempts, but a deep same-model backlog makes the
+        // submit phase noticeably slower than backoff alone suggests. Accepted:
+        // arriving late beats arriving twice.
         await new Promise(r => setTimeout(r, backoffMs));
         continue;
       }
-      // Exhausted retries, or a non-rate-limit error — surface immediately.
-      if (isRateLimit(summary)) {
+      // Exhausted retries on a proven 429 — distinct message so the two cases stay
+      // legible in the logs.
+      if (decision === 'throw-429') {
         throw new Error(
           `atlasVideo: submit rate-limited after ${maxAttempts} attempts: ${summary.body || summary.message}`
+        );
+      }
+      // Rate-limit-ISH but without structured proof: not replayed by design.
+      if (decision === 'throw-maybe-429') {
+        throw new Error(
+          `atlasVideo: submit failed with a possible rate-limit but no explicit 429 marker — ` +
+          `not retried (a replay could double-bill): ${summary.body || summary.message}`
         );
       }
       const status = summary.status;
@@ -2085,29 +2360,30 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
   // must come after the loads. Shared with generateForAd so both stages
   // of one ad agree on model + aspect (incl. the Grok aspect fallback).
   const platformAspect = aspectRatioForPlatformFormat(ad.platformFormat) || ad.aspectRatio || '9:16';
-  const { model, aspectRatio, fallback } = resolveModelAndAspect({
+  const { model, renderAspect, targetAspect, aspectRatio, fallback } = resolveModelAndAspect({
     brand, product, categories, canvasKeys: [ad.platformFormat, platformAspect],
     platformAspect, modelOverride, hasVideoSeed: media.fileType === 'video'
   });
-  if (fallback) {
-    console.log(`🎬 atlasVideo[ad=${ad._id}]: model fallback ${fallback.from} → ${model} (${fallback.reason})`);
-  }
+  logResolution(ad._id, model, renderAspect, targetAspect, fallback);
 
   // Derive layoutInput if missing — the brand-script overlay downstream
-  // reads its copy/proof/product/theme fields directly. Cached per
-  // (mediaId, template, aspectRatio, productId, variantKind,
-  // campaignContextHash). Non-fatal on failure.
+  // reads its copy/proof/product/theme fields directly. The overlay is
+  // sized to the FINAL canvas (targetAspect), so derivation runs at the
+  // platform aspect, NOT the render aspect. Passing renderAspect here
+  // was the source of the "template ai_brand_led does not support
+  // aspect ratio 3:4" warnings on 4:5 ads — the template supports 4:5
+  // fine; it was being asked about the Grok fallback aspect.
   let layoutInput = layoutInputInitial;
   const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
   if (lpEmpty && ad.productId) {
     const tmpl = resolveTitleTemplate({ brand, product, categories });
     try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${aspectRatio}, product=${ad.productId})...`);
+      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
       const t0 = Date.now();
       await buildLayoutInput({
         mediaId:     media._id,
         template:    tmpl,
-        aspectRatio,
+        aspectRatio: targetAspect,
         options: {
           campaignKind:  campaign?.kind || 'product',
           variantKind:   'product_image',
@@ -2166,19 +2442,11 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // per-run override, the r2v video-seed degrade, and the Omni → Grok
   // aspect fallback (shared with prepareStoryboard).
   const platformAspect = aspectRatioForPlatformFormat(ad.platformFormat) || ad.aspectRatio || '9:16';
-  const { model, caps, aspectRatio, fallback } = resolveModelAndAspect({
+  const { model, caps, renderAspect, targetAspect, aspectRatio, fallback } = resolveModelAndAspect({
     brand, product, categories, canvasKeys: [ad.platformFormat, platformAspect],
     platformAspect, modelOverride, hasVideoSeed: media.fileType === 'video'
   });
-  if (fallback) {
-    console.log(`🎬 atlasVideo[ad=${ad._id}]: model fallback ${fallback.from} → ${model} (${fallback.reason})`);
-  }
-  if (aspectRatio !== platformAspect) {
-    console.log(
-      `🎬 atlasVideo[ad=${ad._id}]: remapped aspect ${platformAspect} → ${aspectRatio} ` +
-      `(unsupported by ${model}; closest of ${caps.supportedAspectRatios.join(', ')})`
-    );
-  }
+  logResolution(ad._id, model, renderAspect, targetAspect, fallback);
   // Per-ad render length — wizard-stamped Ad.videoDurationSec (or the
   // standard 8s), clamped/enum-snapped to the resolved model's caps.
   const durationSec = resolveDurationSec(ad.videoDurationSec, caps);
@@ -2191,20 +2459,20 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // creative director no longer influences it. The builder caches per
   // (mediaId, template, aspectRatio, productId, variantKind,
   // campaignContextHash) — so subsequent runs hit the cache instead of
-  // re-deriving. Non-fatal: if derivation fails (e.g. Gemini credits
-  // exhausted), we fall back to whatever data was already on the artifact
-  // / CatalogProduct.
+  // re-deriving. Derivation runs at the TARGET (platform) aspect since
+  // the derived layout describes chrome sized to the final canvas, not
+  // the raw video render aspect. Non-fatal on failure.
   let layoutInput = layoutInputInitial;
   const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
   if (lpEmpty && ad.productId) {
     const tmpl = resolveTitleTemplate({ brand, product, categories });
     try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${aspectRatio}, product=${ad.productId})...`);
+      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
       const t0 = Date.now();
       await buildLayoutInput({
         mediaId:     media._id,
         template:    tmpl,
-        aspectRatio,
+        aspectRatio: targetAspect,
         options: {
           campaignKind:  campaign?.kind || 'product',
           variantKind:   'product_image',
@@ -2315,9 +2583,61 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     ? (buildVideoSegmentUrl(media.fileUrl, aspectRatio, durationSec) || media.fileUrl)
     : null;
 
+  // Resolution the submission body will actually request — computed BEFORE the submit
+  // because the cost estimate is now ledgered at the charge point, not on success.
+  const renderResolution = String(caps.paramShape || '').startsWith('gemini-omni')
+    ? (process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p')
+    : (caps.defaultResolution || '720p');
+  const costUsd = estimateRenderCostUsd({ model, durationSec, resolution: renderResolution });
+
   const t0 = Date.now();
   const predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
+  const submitMs = Date.now() - t0;
   console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
+
+  // ── CHARGE POINT ──────────────────────────────────────────────────────────
+  // The submit returned an id, so the provider has accepted a billable job. Money is
+  // committed HERE, whatever happens to the poll, the download, or the Cloudinary
+  // mirror. Both writes below therefore happen now rather than at the end:
+  //
+  //   1. veoPredictionId — the spend receipt. Without it a crash mid-poll loses the
+  //      only handle to work we have paid for, and the reaper re-queues the ad into a
+  //      second submit. See models/Ad.js for the full reasoning.
+  //   2. the CostLog row — previously written only after poll + download + upload
+  //      succeeded, so a timeout or a failed upload spent ~$1.00 and recorded $0.
+  //
+  // ONE row per billable submit, deliberately. Outcome lives on the Ad (status,
+  // renderUrl); CostLog records SPEND, and spend happened. The trade-off is that
+  // durationMs here is submit latency rather than end-to-end render time — the full
+  // elapsed time is logged on completion below instead of creating a second row that
+  // would double-count the charge.
+  //
+  // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
+  // generation post-payment, because the caller would then never store videoUrl and a
+  // retry would double-bill.
+  try {
+    await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
+  } catch (err) {
+    console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
+  }
+  try {
+    await recordFlatCost({
+      stage:      'atlas_video_render',
+      provider:   'atlas',
+      model,
+      purposeTag: caps.paramShape,
+      brandId:    media.brandId || null,
+      campaignId: ad.campaignId || null,
+      adId:       ad._id || null,
+      mediaId:    media._id || null,
+      productId:  ad.productId || null,
+      costUsd:    costUsd || 0,
+      durationMs: submitMs,
+      status:     'submitted'
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
+  }
 
   const remoteVideoUrl = await pollPrediction(predictionId);
   const videoBuffer = await downloadToBuffer(remoteVideoUrl);
@@ -2350,39 +2670,15 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
 
   const elapsedMs = Date.now() - t0;
 
-  // Cost telemetry — flat per-render estimate from the registry's
-  // pricing entry, mirroring the duration/resolution the submission
-  // body requested. Lands in CostLog alongside the pipeline's LLM
-  // entries so per-brand/per-campaign rollups include video spend.
-  const renderResolution = String(caps.paramShape || '').startsWith('gemini-omni')
-    ? (process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p')
-    : (caps.defaultResolution || '720p');
-  const costUsd = estimateRenderCostUsd({
-    model,
-    durationSec,
-    resolution:  renderResolution
-  });
-  // Non-fatal: render + Cloudinary mirror already succeeded. A telemetry
-  // rejection here must not fail generateForAd post-payment — the caller
-  // would never store videoUrl, and a retry would double-bill the provider.
-  try {
-    await recordFlatCost({
-      stage:      'atlas_video_render',
-      provider:   'atlas',
-      model,
-      purposeTag: caps.paramShape,
-      brandId:    media.brandId || null,
-      campaignId: ad.campaignId || null,
-      adId:       ad._id || null,
-      mediaId:    media._id || null,
-      productId:  ad.productId || null,
-      costUsd:    costUsd || 0,
-      durationMs: elapsedMs
-    });
-  } catch (err) {
-    console.warn('⚠️ atlasVideo cost telemetry failed (non-fatal): ' + err.message);
-  }
-
+  // NO cost record here. The charge was ledgered at the CHARGE POINT above, right after
+  // the submit returned a prediction id. Writing a second row on success would
+  // double-count every completed render, and — worse — would restore the original bug
+  // by implication: that spend is only real once the whole chain succeeds. It isn't.
+  // The provider bills the submit. Everything after it is delivery.
+  //
+  // End-to-end timing therefore lives in this log line rather than CostLog.durationMs
+  // (which holds submit latency). If per-render duration is ever needed in reports,
+  // update the existing row by adId + predictionId — do not create a new one.
   console.log(
     `🎬 atlasVideo[ad=${ad._id}]: done — model=${model} aspect=${aspectRatio} ` +
     `took=${Math.round(elapsedMs / 1000)}s cost≈$${(costUsd ?? 0).toFixed(2)}`
@@ -2396,7 +2692,13 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     track:              media.fileType === 'video' ? 1 : 2,
     prompt,
     storyboard,
-    referenceImages:    imageUrls,   // the exact stack sent to the model (pos 0 = seed, then product hero + alts) — for the generation inspector
+    // The images the model ACTUALLY received, per its param shape — not the
+    // full assembled stack. Several shapes submit fewer (r2v clamps to
+    // maxReferenceImages; grok-i2v/veo/generic take a single frame), so
+    // reporting imageUrls here overstated what a paid call was given. Position 0
+    // is the seed, then product hero + alts. Feeds Ad.veoReferenceImages and the
+    // generation inspector.
+    referenceImages:    submittedImageUrls(imageUrls, caps),
     elapsedMs,
     model,
     modelFallback:      fallback,
@@ -2485,5 +2787,12 @@ module.exports = {
   buildVideoSegmentUrl,
   buildReferenceImages,
   pickProductOnlyUrl,
-  buildPromptScaffold
+  buildPromptScaffold,
+  // Billable-submit replay guard. Exported for scripts/verifySubmitGuard.js —
+  // these decide whether a charged POST is repeated, so they are tested directly
+  // rather than through a mocked axios.
+  isRateLimit,
+  isDefinite429,
+  submitRetryDecision,
+  summarizeAxiosError
 };

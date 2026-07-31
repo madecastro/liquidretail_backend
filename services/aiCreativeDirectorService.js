@@ -380,15 +380,36 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   const brandRatingCount = brand?.brandReviews?.reviewCount || null;
   const brandReviewSource = brand?.brandReviews?.source || null;
 
-  // Effective values — prefer product, fall back to brand.
-  const ratingValue    = productRatingValue ?? brandRatingValue;
-  const ratingCount    = productRatingCount ?? brandRatingCount;
-  const primaryQuoteObj = productReviewQuotes[0] || brandReviewQuotes[0] || null;
+  // Effective values — prefer product, fall back to brand ONLY when no
+  // product is in scope.
+  //
+  // This fallback is how another product's words reached a product ad. On a
+  // multi-SKU brand, brand-level reviews and ratings are about whatever the
+  // reviewer bought; handing one to the Director as this product's
+  // primary_quote, while COPY PICKS instructs it to ground copy on exactly
+  // that field, is an instruction to write about the wrong item. It is also
+  // invisible: the ad comes out with the right product id and the right
+  // photo, and only the language belongs to something else.
+  //
+  // The layout tier withholds brand quotes for the same reason, but that
+  // alone does not help here — the Director writes copy_picks from this
+  // object, well upstream of the layout artifact.
+  const isProductScoped = !!product;
+  const ratingValue    = productRatingValue ?? (isProductScoped ? null : brandRatingValue);
+  const ratingCount    = productRatingCount ?? (isProductScoped ? null : brandRatingCount);
+  const primaryQuoteObj = productReviewQuotes[0] || (isProductScoped ? null : brandReviewQuotes[0]) || null;
+  if (isProductScoped && !productReviewQuotes.length && brandReviewQuotes.length) {
+    console.log(`🔒 director scope — ${brandReviewQuotes.length} brand review(s) withheld from a product concept (cross-product copy risk)`);
+  }
   // Source attribution — null when the quote is in-catalog product
   // review (no external attribution needed); non-null (e.g.
   // "WeddingWire") when the quote came from the brand-level scrape.
   // Lets the Layout Generator decide whether to surface attribution.
-  const primaryQuoteSource = (!productReviewQuotes.length && brandReviewQuotes[0])
+  // Keyed off the quote actually chosen, not off what was available — a
+  // product concept now withholds brand quotes, and attributing a
+  // brand-scrape source to a quote that was never included would label a
+  // null.
+  const primaryQuoteSource = (!productReviewQuotes.length && primaryQuoteObj)
     ? brandReviewSource
     : null;
 
@@ -414,7 +435,11 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
       : null,
     top_comments:     topComments,
     strongest_signal: strongestSignal,
-    proof_density:    productReviewQuotes.length + brandReviewQuotes.length + topComments.length    // brand fallback contributes to richness
+    // Counts only proof the Director can actually use: on a product concept
+    // the brand quotes are withheld, so including them here would advertise a
+    // richness that is not in the payload and push the model toward a
+    // proof-led archetype it cannot ground.
+    proof_density:    productReviewQuotes.length + (isProductScoped ? 0 : brandReviewQuotes.length) + topComments.length
   };
 
   // ── Performance signal — totals + rates + per-media percentiles ──
@@ -1083,10 +1108,23 @@ function renderBrandVoiceBlock(voice) {
   return lines.join('\n');
 }
 
-function renderCampaignBriefBlock(brief) {
+function renderCampaignBriefBlock(brief, productName = null) {
   if (!brief) return '';
   const lines = [];
   lines.push(`CAMPAIGN BRIEF (the intent of THIS specific campaign — concepts must serve it):`);
+  // A campaign brief is written once for the CAMPAIGN, and its goal routinely
+  // names one specific product ("Introduce the Training Straight Leg Leggings
+  // in Strength Pink..."). Every product generated under that campaign then
+  // received it verbatim, under the instruction that concepts MUST serve it —
+  // so the Director dutifully wrote leggings copy for a t-shirt, and the
+  // one-product rule below lost the argument to a more specific instruction
+  // sitting in the same prompt.
+  //
+  // The brief's STRATEGY still applies to every product in the campaign; only
+  // the product its goal happens to name does not.
+  if (productName) {
+    lines.push(`  SCOPE: this concept is for "${productName}". Where the goal or pitch below names a DIFFERENT product, that naming does NOT apply here — it is campaign-level context. Serve the campaign's strategy (funnel stage, tone, audience, CTA emphasis) for THIS product, and never carry another product's name, category, or attributes into your copy.`);
+  }
   if (brief.goal)         lines.push(`  Goal: ${brief.goal}`);
   if (brief.pitch)        lines.push(`  Pitch: ${brief.pitch}`);
   if (brief.focus)        lines.push(`  Dominant lever: ${brief.focus}`);
@@ -1102,14 +1140,18 @@ function renderCampaignBriefBlock(brief) {
     if (Array.isArray(a.segments) && a.segments.length) fragments.push(`segments ${a.segments.slice(0, 4).join(', ')}`);
     if (fragments.length) lines.push(`    (${fragments.join('; ')})`);
   }
-  lines.push(`  Every concept you emit MUST serve the campaign goal + pitch. If a concept doesn't advance this brief, drop it for one that does.`);
+  lines.push(
+    productName
+      ? `  Every concept you emit MUST serve this campaign's STRATEGY — its funnel stage, tone, audience and CTA emphasis — as applied to "${productName}". If a concept doesn't advance that, drop it for one that does. Serving the brief never means advertising a product other than "${productName}".`
+      : `  Every concept you emit MUST serve the campaign goal + pitch. If a concept doesn't advance this brief, drop it for one that does.`
+  );
   return lines.join('\n');
 }
 
 function buildPromptRound({ inputSummary, creativeIntent, platformFormat, universe, roundIndex, avoidList, derivedVoice = null, creativeBrief = null }) {
   const formatConstraints = buildFormatConstraints(platformFormat);
   const brandVoiceBlock   = renderBrandVoiceBlock(derivedVoice);
-  const campaignBriefBlock = renderCampaignBriefBlock(creativeBrief);
+  const campaignBriefBlock = renderCampaignBriefBlock(creativeBrief, inputSummary?.product_signal?.name || null);
 
   // Build the universe block — the LLM uses these media_id values
   // verbatim in concept.media_picks. Roles surface so the LLM knows
@@ -1160,6 +1202,7 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       ? `- OUTPUT SHAPE (Reels): format MUST be "reels_storyboard". duration_sec ∈ [${REELS_DURATION_MIN_SEC}, ${REELS_DURATION_MAX_SEC}] (Veo native clip range). storyboard_beats is an array of overlay timing events Puppeteer renders as transparent PNGs and Cloudinary composites onto Veo's base video. Each beat: { t_start (seconds), t_end, role ∈ ${STORYBOARD_BEAT_ROLES.join('|')}, position ∈ ${STORYBOARD_POSITIONS.join('|')}, emphasis ∈ ${STORYBOARD_EMPHASIS.join('|')} }. Beats may overlap. Honor the Reels safe zones in your position picks (top reserved 0-220px, bottom reserved 1558-1778px — use middle positions for chrome that needs to be visible past IG/FB UI).`
       : `- OUTPUT SHAPE (Feed): format ∈ ${FEED_OUTPUT_SHAPES.join(' | ')}; tile_count matches media_picks.length.`,
     `- COPY PICKS: write the final strings the renderer will ship. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, and social_proof_signal.primary_quote when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy_picks by role — each beat's role MUST map to a non-null copy_picks field (e.g. role=headline beat requires copy_picks.headline non-null).`,
+    `- ONE PRODUCT ONLY: every string you write describes product_signal.name and nothing else. brand_signal.* and brand_reviews_summary cover the WHOLE catalog — they are there for voice and tone, never for product facts. Never name, describe, or borrow the attributes of another item (a different garment, cut, fabric, or use case) even when the brand material talks about it. If the brand voice material is about a different product, take only its register and write fresh copy about THIS one. Concretely: a t-shirt ad never mentions leggings, joggers, or their fit.`,
     `- CREATIVE STYLE: pick one of ${CREATIVE_STYLES_ENUM.join(' | ')}.`,
     ``,
     formatConstraints,

@@ -35,31 +35,84 @@ const TIMEOUT_MS = Number(process.env.ATLAS_IMAGE_TIMEOUT_MS || 180_000);
 
 function isConfigured() { return !!KEY(); }
 
+function positiveTimeout(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 // ── live pricing cache (per-image flat costs) ──────────────────────────────
+//
+// FIXED 2026-07-29 (ARCHITECTURE_REVIEW.md XREPO-1). This read
+// `m.pricing?.actual?.price ?? m.pricing?.actual?.output_price`. There is **no
+// `pricing` key** on an Atlas catalog entry — verified against the live catalog:
+// 0 of 444 entries have `pricing`, 444 of 444 have `price`. So every lookup missed,
+// `priceCache` was populated with nothing, and `?? 0` meant **every image generation
+// ledgered $0.00**. Silent, because a $0 cost is indistinguishable from a free model.
+//
+// The real shape is `price.actual.base_price`, a STRING. `actual` is what we pay
+// (`origin` is list, `discount` the percentage). Verified live: gpt-image-1.5 = 0.008,
+// nano-banana-2/edit = 0.08.
+//
+// Two traps kept in mind here:
+//   • 123 of 444 entries have NO `base_price` — they are per-token LLM models shaped
+//     `{type:'flat', input_price, output_price, cache_price}`. Those must not silently
+//     resolve to 0; they are simply not this function's business.
+//   • For VIDEO models `base_price` is **$/sec**, not per-generation. This function
+//     serves image models only, where it is per-image. Do not reuse it for video —
+//     see estimateRenderCostUsd in atlasVideoService.js for that.
+/**
+ * Catalog entries -> Map(model -> flat USD price). Pure, and exported for
+ * scripts/verifyImagePricing.js — the parsing is the part that was wrong, so it is the
+ * part that needs to be testable without a network call.
+ *
+ * base_price only. An absent one means "not a flat-priced media model" (per-token LLM
+ * entries are shaped {type:'flat', input_price, output_price, cache_price}), which is a
+ * different thing from "free" — so those are OMITTED rather than cached as 0, and the
+ * caller warns on a miss.
+ */
+function buildPriceMap(entries) {
+  const map = new Map();
+  for (const m of entries || []) {
+    const raw = m?.price?.actual?.base_price;
+    if (raw == null) continue;
+    const p = Number(raw);
+    if (Number.isFinite(p)) map.set(m.model, p);
+  }
+  return map;
+}
+
 let priceCache = null;
 async function priceFor(model) {
   try {
     if (!priceCache) {
       const res = await axios.get(`${BASE}/models`, { timeout: 20_000 });
-      priceCache = new Map();
-      for (const m of res.data?.data || []) {
-        const p = Number(m.pricing?.actual?.price ?? m.pricing?.actual?.output_price ?? NaN);
-        if (Number.isFinite(p)) priceCache.set(m.model, p);
-      }
+      priceCache = buildPriceMap(res.data?.data);
+      console.log(`💲 atlasImage: priced ${priceCache.size} models from the live catalog`);
     }
-    return priceCache.get(model) ?? 0;
-  } catch {
+    const hit = priceCache.get(model);
+    if (hit == null) {
+      // Loud, because the bug this replaced was silent. Still returns 0 so a pricing
+      // gap never blocks a generation — but it will no longer hide in the ledger.
+      console.warn(
+        `⚠️  atlasImage: no base_price for '${model}' in the live catalog — ` +
+        `ledgering $0. Check the slug and the price shape before trusting spend reports.`
+      );
+      return 0;
+    }
+    return hit;
+  } catch (err) {
+    console.warn(`⚠️  atlasImage: catalog price lookup failed (${err.message}) — ledgering $0`);
     return 0;
   }
 }
 
 // ── upload helper (buffers → temporary public URLs for edit inputs) ────────
-async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png') {
+async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png', timeoutMs = 60_000) {
   const fd = new FormData();
   fd.append('file', new Blob([buf], { type: mime }), filename);
   const res = await axios.post(`${BASE}/model/uploadMedia`, fd, {
     headers: { Authorization: `Bearer ${KEY()}` },
-    timeout: 60_000,
+    timeout: positiveTimeout(timeoutMs, 60_000),
   });
   const url = res.data?.data?.download_url;
   if (!url) throw new Error(`uploadMedia returned no URL: ${JSON.stringify(res.data).slice(0, 200)}`);
@@ -67,29 +120,46 @@ async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png') {
 }
 
 // ── submit + poll ──────────────────────────────────────────────────────────
-async function submitAndPoll(model, params, meta = {}) {
+async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS } = {}) {
+  const generationTimeoutMs = positiveTimeout(timeoutMs, TIMEOUT_MS);
   const t0 = Date.now();
   const submit = await axios.post(`${BASE}/model/generateImage`, { model, ...params }, {
     headers: { Authorization: `Bearer ${KEY()}`, 'Content-Type': 'application/json' },
-    timeout: 60_000,
+    timeout: Math.min(60_000, generationTimeoutMs),
     validateStatus: () => true,
+    // BILLABLE POST — axios defaults to maxRedirects 21 and re-sends the body on a
+    // 307/308, which is a double charge inside a single call and invisible to any
+    // retry logic. Redirects are followed BEFORE validateStatus runs, so
+    // `validateStatus: () => true` above does not protect against it. With 0, a 3xx
+    // becomes the final response and the status check below turns it into a clear
+    // error. Same guard as both billable POSTs in atlasVideoService.js.
+    maxRedirects: 0,
   });
   if (submit.status !== 200 || !submit.data?.data?.id) {
     throw new Error(`Atlas image submit ${submit.status}: ${JSON.stringify(submit.data).slice(0, 200)}`);
   }
   const id = submit.data.data.id;
+  let lastStatus = null;
+  console.log(`   ⏳ atlasImage: submitted ${id} (${model}); deadline=${generationTimeoutMs}ms`);
 
-  while (Date.now() - t0 < TIMEOUT_MS) {
-    await new Promise((r) => setTimeout(r, POLL_MS));
+  while (Date.now() - t0 < generationTimeoutMs) {
+    const remainingBeforePoll = generationTimeoutMs - (Date.now() - t0);
+    await new Promise((r) => setTimeout(r, Math.min(POLL_MS, Math.max(0, remainingBeforePoll))));
+    const remaining = generationTimeoutMs - (Date.now() - t0);
+    if (remaining <= 0) break;
     const poll = await axios.get(`${BASE}/model/prediction/${id}`, {
       headers: { Authorization: `Bearer ${KEY()}` },
-      timeout: 30_000,
+      timeout: Math.min(30_000, Math.max(1000, remaining)),
       validateStatus: () => true,
     });
-    const st = poll.data?.data?.status;
+    const st = String(poll.data?.data?.status || 'unknown').toLowerCase();
+    if (st !== lastStatus) {
+      console.log(`   ⏳ atlasImage: ${id} status=${st} elapsed=${Date.now() - t0}ms`);
+      lastStatus = st;
+    }
     if (st === 'completed' || st === 'succeeded') {
       const out = poll.data.data.outputs?.[0];
-      if (!out) throw new Error('Atlas image completed with no outputs');
+      if (!out) throw await chargedError('Atlas image completed with no outputs', id, model, meta, t0);
       recordFlatCost({
         ...meta, provider: 'atlas', model,
         costUsd: await priceFor(model), durationMs: Date.now() - t0, status: 'ok',
@@ -97,16 +167,50 @@ async function submitAndPoll(model, params, meta = {}) {
       // Output is a URL (or base64 when enable_base64_output was set) —
       // normalize to a b64 payload so callers get buffers without egress.
       if (/^https?:\/\//.test(out)) {
-        const img = await axios.get(out, { responseType: 'arraybuffer', timeout: 60_000 });
-        return { b64: Buffer.from(img.data).toString('base64'), url: out };
+        const img = await axios.get(out, { responseType: 'arraybuffer', timeout: 20_000 });
+        return { b64: Buffer.from(img.data).toString('base64'), url: out, predictionId: id };
       }
-      return { b64: out, url: null };
+      return { b64: out, url: null, predictionId: id };
     }
-    if (st === 'failed') {
+    if (['failed', 'error', 'cancelled', 'canceled', 'rejected'].includes(st)) {
+      // Atlas explicitly reported failure. Providers generally do not bill a failed
+      // generation, so this is NOT marked charged — but the attempt is ledgered at $0
+      // so it is still visible in spend reports rather than vanishing.
+      recordFlatCost({
+        ...meta, provider: 'atlas', model,
+        costUsd: 0, durationMs: Date.now() - t0, status: 'failed',
+      }).catch?.(() => {});
       throw new Error(`Atlas image failed: ${JSON.stringify(poll.data?.data).slice(0, 200)}`);
     }
   }
-  throw new Error(`Atlas image timed out after ${TIMEOUT_MS}ms (prediction ${id})`);
+  // Timed out waiting. The submit succeeded, so Atlas is doing (or has done) the work
+  // and will bill for it — and it may well complete after we stop polling. Charged.
+  throw await chargedError(`Atlas image timed out after ${generationTimeoutMs}ms`, id, model, meta, t0);
+}
+
+/**
+ * Build an error for a failure that happened AFTER a successful billable submit.
+ *
+ * Ledgers the spend before throwing, because the alternative is losing it: the success
+ * path was previously the only place recordFlatCost fired, so a no-outputs response or
+ * a poll timeout charged real money and recorded nothing (ARCHITECTURE_REVIEW.md
+ * XREPO-4 for the video equivalent).
+ *
+ * `charged` is the same flag atlasVideoService.submitImageGeneration sets, and it is
+ * what tells the caller a direct-provider fallback would mean paying TWICE for one
+ * image rather than once.
+ */
+async function chargedError(message, predictionId, model, meta, t0) {
+  const costUsd = await priceFor(model);
+  recordFlatCost({
+    ...meta, provider: 'atlas', model,
+    costUsd, durationMs: Date.now() - t0, status: 'charged-no-output',
+  }).catch?.(() => {});
+  const err = new Error(`${message} (prediction ${predictionId})`);
+  err.charged = true;
+  err.predictionId = predictionId;
+  err.costUsd = costUsd;
+  return err;
 }
 
 // Model-specific request bodies (mirrors atlasVideoService's paramShape).
@@ -124,6 +228,43 @@ function buildParams(model, { prompt, size, quality, images, inputFidelity, aspe
   if (images?.length) p.images = images;
   if (inputFidelity) p.input_fidelity = inputFidelity;
   return p;
+}
+
+/**
+ * An audit record of what was ACTUALLY sent to the image model, built from the
+ * same `params` object that becomes the POST body — never from what a caller
+ * intended to send. The generation inspector renders this verbatim.
+ *
+ * `submittedUrl` + `imageCount` are ground truth (they are the body). `sourceUrl`
+ * and `role` are caller-supplied labels for the same positions: they name where a
+ * buffer came from, because uploaded reference URLs are ephemeral Atlas handles
+ * that expire and would be useless in a diagnostic later. Labels never replace or
+ * reorder the submitted list — a missing label leaves null rather than guessing.
+ */
+function buildSubmissionRecord({ provider, model, params = {}, predictionId = null, imageMeta = [] }) {
+  const images = Array.isArray(params.images) ? params.images : [];
+  // An explicit null from a caller would defeat the default and throw on
+  // indexing — after a billable submit has already succeeded, which would
+  // discard a paid-for image over a labelling detail.
+  const labels = Array.isArray(imageMeta) ? imageMeta : [];
+  return {
+    provider,
+    model,
+    predictionId,
+    submittedAt: new Date().toISOString(),
+    prompt:        params.prompt ?? null,
+    size:          params.size ?? null,
+    quality:       params.quality ?? null,
+    aspectRatio:   params.aspect_ratio ?? null,
+    inputFidelity: params.input_fidelity ?? null,
+    imageCount:    images.length,
+    images: images.map((url, i) => ({
+      position:     i,
+      submittedUrl: typeof url === 'string' ? url : null,
+      sourceUrl:    labels[i]?.sourceUrl ?? null,
+      role:         labels[i]?.role ?? null
+    }))
+  };
 }
 
 // ── direct-OpenAI fallback (original models, original API) ─────────────────
@@ -150,17 +291,56 @@ async function directOpenAiImages({ kind, prompt, size, quality, buffers, fallba
  * generateImage({ prompt, size?, quality?, model?, fallbackModel?, meta? })
  * → { data: [{ b64_json }], url } (OpenAI-images shape).
  */
-async function generateImage({ prompt, size, quality, model, fallbackModel, aspectRatio, meta = {} }) {
+async function generateImage({
+  prompt, size, quality, model, fallbackModel, aspectRatio, meta = {},
+  timeoutMs, allowFallback = true
+}) {
   const m = model || DEFAULT_T2I_MODEL;
   try {
     if (!isConfigured()) throw new Error('ATLAS_API_KEY not configured');
-    const out = await submitAndPoll(m, buildParams(m, { prompt, size, quality, aspectRatio }), meta);
-    return { data: [{ b64_json: out.b64 }], url: out.url };
+    // Built inside the try so a throw here still reaches the provider
+    // fallback, matching editImage.
+    const params = buildParams(m, { prompt, size, quality, aspectRatio });
+    const out = await submitAndPoll(m, params, meta, { timeoutMs });
+    return {
+      data: [{ b64_json: out.b64 }],
+      url: out.url,
+      submission: buildSubmissionRecord({ provider: 'atlas', model: m, params, predictionId: out.predictionId })
+    };
   } catch (err) {
+    if (!allowFallback) throw err;
+    warnIfDoublePaying(err, 'generate');
     const fb = await directOpenAiImages({ kind: 'generate', prompt, size, quality, fallbackModel }).catch((e) => { throw new Error(`${err.message}; fallback: ${e.message}`); });
     if (!fb) throw err;
-    return { data: [{ b64_json: fb.b64 }], url: fb.url };
+    // The fallback is a DIFFERENT provider and model. Reporting the Atlas
+    // attempt here would describe a request that produced nothing.
+    return {
+      data: [{ b64_json: fb.b64 }],
+      url: fb.url,
+      submission: buildSubmissionRecord({
+        provider: 'openai-direct',
+        model: fallbackModel || 'gpt-image-1',
+        params: { prompt, size, quality }
+      })
+    };
   }
+}
+
+/**
+ * The fallback below is deliberate (operator directive at the top of this file: keep
+ * fallbacks with direct providers). But when the Atlas failure happened AFTER a
+ * successful billable submit, falling back means paying two providers for one image.
+ * That is an accepted cost, not an accident — so say so out loud instead of letting it
+ * hide. Both charges are in the ledger: Atlas via chargedError, OpenAI via its own
+ * recordFlatCost path.
+ */
+function warnIfDoublePaying(err, kind) {
+  if (!err?.charged) return;
+  console.warn(
+    `💸 atlasImage.${kind}: Atlas already charged ~$${(err.costUsd ?? 0).toFixed(4)} for ` +
+    `prediction ${err.predictionId} before failing — falling back to direct OpenAI means ` +
+    `PAYING TWICE for one image. Proceeding per the keep-fallbacks directive.`
+  );
 }
 
 /**
@@ -169,18 +349,32 @@ async function generateImage({ prompt, size, quality, model, fallbackModel, aspe
  * → { data: [{ b64_json }], url }. NO mask support — mask inpainting
  * stays on direct OpenAI (openaiImageService) by design.
  */
-async function editImage({ prompt, images = [], size, quality, inputFidelity, model, fallbackModel, aspectRatio, meta = {} }) {
+async function editImage({
+  prompt, images = [], size, quality, inputFidelity, model, fallbackModel,
+  aspectRatio, meta = {}, timeoutMs, uploadTimeoutMs, allowFallback = true,
+  imageMeta = []
+}) {
   const m = model || DEFAULT_EDIT_MODEL;
   const buffers = images.filter((i) => Buffer.isBuffer(i));
   try {
     if (!isConfigured()) throw new Error('ATLAS_API_KEY not configured');
-    const urls = [];
-    for (const img of images) {
-      urls.push(Buffer.isBuffer(img) ? await uploadBuffer(img) : img);
-    }
-    const out = await submitAndPoll(m, buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio }), meta);
-    return { data: [{ b64_json: out.b64 }], url: out.url };
+    // Independent reference uploads should not multiply startup latency. A
+    // two-reference static ad now waits for the slower upload, not both.
+    const urls = await Promise.all(images.map((img, index) => (
+      Buffer.isBuffer(img)
+        ? uploadBuffer(img, `reference-${index + 1}.png`, 'image/png', uploadTimeoutMs)
+        : img
+    )));
+    const params = buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio });
+    const out = await submitAndPoll(m, params, meta, { timeoutMs });
+    return {
+      data: [{ b64_json: out.b64 }],
+      url: out.url,
+      submission: buildSubmissionRecord({ provider: 'atlas', model: m, params, predictionId: out.predictionId, imageMeta })
+    };
   } catch (err) {
+    if (!allowFallback) throw err;
+    warnIfDoublePaying(err, 'edit');
     // Direct fallback needs buffers; URL inputs get downloaded first.
     let fbBuffers = buffers;
     if (!fbBuffers.length && images.length) {
@@ -188,8 +382,19 @@ async function editImage({ prompt, images = [], size, quality, inputFidelity, mo
     }
     const fb = await directOpenAiImages({ kind: 'edit', prompt, size, quality, buffers: fbBuffers, fallbackModel }).catch((e) => { throw new Error(`${err.message}; fallback: ${e.message}`); });
     if (!fb) throw err;
-    return { data: [{ b64_json: fb.b64 }], url: fb.url };
+    // Buffers go to OpenAI as multipart files, so there is no submitted URL to
+    // record — only the true count and the caller's position labels.
+    return {
+      data: [{ b64_json: fb.b64 }],
+      url: fb.url,
+      submission: buildSubmissionRecord({
+        provider: 'openai-direct',
+        model: fallbackModel || 'gpt-image-1',
+        params: { prompt, size, quality, images: fbBuffers },
+        imageMeta
+      })
+    };
   }
 }
 
-module.exports = { generateImage, editImage, uploadBuffer, isConfigured };
+module.exports = { generateImage, editImage, uploadBuffer, isConfigured, buildPriceMap, buildSubmissionRecord };

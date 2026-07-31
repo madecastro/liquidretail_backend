@@ -10,6 +10,20 @@ const Campaign = require('../models/Campaign');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const ProductMatchArtifact = require('../models/ProductMatchArtifact');
 const { validateVideoSettings } = require('../services/atlasVideoService');
+// Single source of truth for titling format ids — was duplicated as a literal
+// ['vertical','feed','landscape'] in five places in this file, which is how adding
+// 'square' nearly shipped as a silent fall-through to 'feed'. Import it; do not
+// re-list it. Order and membership live in services/titleSpecValidator.js.
+const { FORMATS: TITLING_FORMATS } = require('../services/titleSpecValidator');
+// format id -> the aspectRatio a synthetic ad must carry for
+// brandScriptExecutor.classifyFormat to classify it back to that same format.
+// Every entry here MUST round-trip; scripts/verifyTitlingFormats.js asserts it.
+const ASPECT_BY_TITLING_FORMAT = {
+  vertical:  '9:16',
+  feed:      '4:5',
+  square:    '1:1',
+  landscape: '16:9'
+};
 
 // ── Preview plate resolver ─────────────────────────────────────────
 //
@@ -147,6 +161,25 @@ router.get('/', async (req, res) => {
       .select('name nameNormalized logoUrl websiteUrl primaryColor fontFamily fontSource source enrichmentSources curatedFields createdAt')
       .sort({ name: 1 })
       .lean();
+
+    // Connected IG handle per brand — identity for the ad-preview
+    // placement chrome (Instagram Reels/Stories/Feed mockups) on the
+    // frontend. One batched query for the whole list rather than a
+    // lookup per brand. Best-effort: a brand with no active Instagram
+    // credential just has no handle and the UI slugs its name.
+    const igHandleByBrand = new Map();
+    try {
+      const creds = await IntegrationCredential
+        .find({ brandId: { $in: brands.map(b => b._id) }, type: 'instagram', status: 'active' })
+        .select('brandId igUsername')
+        .lean();
+      for (const c of creds) {
+        if (c.igUsername && !igHandleByBrand.has(String(c.brandId))) {
+          igHandleByBrand.set(String(c.brandId), c.igUsername);
+        }
+      }
+    } catch { /* optional enrichment — never fail the brand list over it */ }
+
     res.json({
       brands: brands.map(b => ({
         id:           String(b._id),
@@ -154,6 +187,7 @@ router.get('/', async (req, res) => {
         slug:         b.nameNormalized,
         logoUrl:      b.logoUrl || null,
         websiteUrl:   b.websiteUrl || null,
+        igHandle:     igHandleByBrand.get(String(b._id)) || null,
         primaryColor: b.primaryColor || null,
         source:       b.source,
         enrichmentSources: b.enrichmentSources || [],
@@ -251,7 +285,15 @@ router.patch('/:id', express.json(), async (req, res) => {
                       'brandSafety', 'styleOverrides', 'styleScript',
                       'styleScriptVertical', 'styleScriptLandscape', 'styleTheme',
                       'videoSettings', 'titleStyleSpec', 'titleStylePreset',
-                      'metaCascades'];
+                      'metaCascades', 'staticImagePipeline'];
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'staticImagePipeline')) {
+      const pipeline = String(req.body.staticImagePipeline || '').trim();
+      if (!['direct_overlay', 'html'].includes(pipeline)) {
+        return res.status(400).json({ error: "staticImagePipeline must be 'direct_overlay' or 'html'" });
+      }
+      req.body.staticImagePipeline = pipeline;
+    }
 
     // videoSettings carries model slugs consumed at render time — reject
     // unknown slugs here (nicer UX than the render-time warn-and-fall-
@@ -322,6 +364,8 @@ router.patch('/:id', express.json(), async (req, res) => {
     }
     const fontTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'fontFamily');
     const fontCleared = fontTouched && (req.body.fontFamily == null || req.body.fontFamily === '');
+    const logoTouched = Object.prototype.hasOwnProperty.call(req.body || {}, 'logoUrl');
+    const logoCleared = logoTouched && (req.body.logoUrl == null || req.body.logoUrl === '');
     const before = { websiteUrl: brand.websiteUrl };
     const curatedSet = new Set(brand.curatedFields || []);
 
@@ -330,6 +374,7 @@ router.patch('/:id', express.json(), async (req, res) => {
     // ESPECIALLY when clearing to null. Applies to any field the
     // Brand schema declares as mongoose.Schema.Types.Mixed.
     const MIXED_FIELDS = new Set(['styleOverrides', 'styleTheme', 'brandSafety', 'videoSettings', 'titleStyleSpec', 'metaCascades']);
+    const RUNTIME_SETTINGS = new Set(['staticImagePipeline']);
 
     for (const k of editable) {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
@@ -355,8 +400,10 @@ router.patch('/:id', express.json(), async (req, res) => {
         if (MIXED_FIELDS.has(k)) brand.markModified(k);
         // Clearing a field is a request to RE-enrich it, not lock the
         // empty value as curated. Setting a value is curation.
-        if (isEmpty) curatedSet.delete(k);
-        else         curatedSet.add(k);
+        if (!RUNTIME_SETTINGS.has(k)) {
+          if (isEmpty) curatedSet.delete(k);
+          else         curatedSet.add(k);
+        }
       }
     }
     // Renormalize the slug if name changed.
@@ -367,6 +414,12 @@ router.patch('/:id', express.json(), async (req, res) => {
     // Font provenance: setting a value = 'curated'; clearing = null so
     // the next enrichment can re-attribute it to whichever tier wins.
     if (fontTouched) brand.fontSource = fontCleared ? null : 'curated';
+    if (logoTouched) {
+      brand.logoSource = logoCleared ? null : 'curated';
+      brand.logoOriginalUrl = logoCleared ? null : brand.logoUrl;
+      brand.logoIngestedAt = logoCleared ? null : new Date();
+      brand.logoIngestError = null;
+    }
     await brand.save();
 
     // Re-enrich when the websiteUrl actually changed (new domain →
@@ -374,6 +427,21 @@ router.patch('/:id', express.json(), async (req, res) => {
     if (before.websiteUrl !== brand.websiteUrl) {
       // Reset enrichmentSources so all tiers re-attempt against the new URL.
       brand.enrichmentSources = [];
+      // Website fonts belong to the old domain and must never leak into
+      // renders for the replacement storefront.
+      brand.customFonts = [];
+      brand.websiteFontUsage = null;
+      brand.fontIngestedAt = null;
+      brand.fontIngestError = null;
+      brand.logoIngestedAt = null;
+      brand.logoIngestError = null;
+      brand.logoOriginalUrl = null;
+      if (!brand.curatedFields?.includes('logoUrl')) {
+        brand.logoUrl = null;
+        brand.logoSource = null;
+      }
+      brand.markModified('customFonts');
+      brand.markModified('websiteFontUsage');
       await brand.save();
       triggerEnrichment(brand, 'website-url changed');
     }
@@ -961,7 +1029,7 @@ router.post('/:id/title-still', express.json({ limit: '1mb' }), async (req, res)
     if (!brand) return res.status(404).json({ error: 'brand not found' });
 
     const rawFormat = String(req.body?.format || 'vertical').toLowerCase();
-    if (!['vertical', 'feed', 'landscape'].includes(rawFormat)) {
+    if (!TITLING_FORMATS.includes(rawFormat)) {
       return res.status(400).json({ error: `unknown format '${rawFormat}'` });
     }
 
@@ -1100,10 +1168,14 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
     const bodyScript = req.body?.script ? String(req.body.script).trim() : null;
     const bodyTheme  = req.body?.theme && typeof req.body.theme === 'object' ? req.body.theme : null;
     const rawFormat  = String(req.body?.format || '').toLowerCase();
-    const format     = ['vertical', 'landscape', 'feed'].includes(rawFormat) ? rawFormat : 'feed';
+    const format     = TITLING_FORMATS.includes(rawFormat) ? rawFormat : 'feed';
     const brandScriptField = ({
       vertical:  'styleScriptVertical',
       landscape: 'styleScriptLandscape',
+      // square has no dedicated brand field — it shares feed's custom script, the
+      // same way it shares feed's canonical. Adding styleScriptSquare later means a
+      // row here plus one in brandScriptExecutor.BRAND_SCRIPT_FIELD.
+      square:    'styleScript',
       feed:      'styleScript'
     })[format];
 
@@ -1114,7 +1186,7 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
     const bodyEngine = ['canvas', 'remotion'].includes(req.body?.engine) ? req.body.engine : null;
     // classifyFormat keys off platformFormat regexes / aspectRatio — the
     // synthetic ad must use an aspectRatio it actually recognizes.
-    const fakeAd = { aspectRatio: { vertical: '9:16', landscape: '16:9', feed: '4:5' }[format] };
+    const fakeAd = { aspectRatio: ASPECT_BY_TITLING_FORMAT[format] };
     let engine = bodyScript
       ? 'canvas'
       : bodyEngine || resolveTitlingEngine(brand, fakeAd).engine;
@@ -1240,18 +1312,14 @@ router.post('/:id/ingest-fonts', express.json(), async (req, res) => {
     if (!brand.websiteUrl) return res.status(400).json({ error: 'brand has no websiteUrl to scan' });
 
     const { ingestBrandFonts } = require('../services/brandFontIngestService');
-    const { ingested, flagged, errors } = await ingestBrandFonts(brand);
-
-    // Merge by family+weight+style — re-ingests refresh, never duplicate.
-    const keyOf = (f) => `${String(f.family).toLowerCase()}|${f.weight || 400}|${f.style || 'normal'}`;
-    const merged = new Map((brand.customFonts || []).map((f) => [keyOf(f), f]));
-    for (const entry of [...ingested, ...flagged]) merged.set(keyOf(entry), entry);
-    brand.customFonts = [...merged.values()];
-    brand.markModified('customFonts');
+    const result = await ingestBrandFonts(brand);
+    const { ingested, flagged, errors } = result;
+    const { applyFontIngestResult } = require('../services/brandFontPersistenceService');
+    applyFontIngestResult(brand, result);
     await brand.save();
 
     console.log(`🔤 ingest-fonts[${brand.name}]: ${ingested.length} ingested, ${flagged.length} flagged, ${errors.length} errors`);
-    res.json({ ok: true, ingested, flagged, errors, customFonts: brand.customFonts });
+    res.json({ ok: true, ingested, flagged, errors, usage: result.usage, customFonts: brand.customFonts });
   } catch (err) {
     console.error('ingest-fonts failed:', err.message);
     res.status(err.status || 500).json({ error: err.message || 'font ingest failed' });
@@ -1314,7 +1382,7 @@ router.get('/:id/title-spec', async (req, res) => {
 
     const { resolveSpecForBrand, buildBrandTokens, hydrateAllSlotKeys, PRESET_DIR } = require('../services/titleSpecService');
     const resolved = {};
-    for (const format of ['vertical', 'feed', 'landscape']) {
+    for (const format of TITLING_FORMATS) {
       try {
         const { spec, source } = resolveSpecForBrand(brand, format);
         // Hydrate stub entries for every SLOT_KEYS not present so the
@@ -1586,7 +1654,7 @@ router.post('/:id/title-spec/modify', express.json(), async (req, res) => {
     if (!request) return res.status(400).json({ error: 'request text required' });
     if (request.length > 2000) return res.status(400).json({ error: 'request too long (2000 chars max)' });
     const rawFormat = String(req.body?.format || 'vertical').toLowerCase();
-    if (!['vertical', 'feed', 'landscape'].includes(rawFormat)) {
+    if (!TITLING_FORMATS.includes(rawFormat)) {
       return res.status(400).json({ error: `unknown format '${rawFormat}'` });
     }
     // Optional chat history for multi-turn context. Client-side chats
@@ -1842,8 +1910,12 @@ const CANONICAL_FILE_BY_FORMAT = {
   landscape: 'local_scrim_landscape.script.js'
 };
 
+// Fed to the script-generation LLM prompt, so these strings are load-bearing:
+// feed's aspect used to read '4:5 (also serves 1:1)', which was true only because
+// 1:1 was mis-bucketed into feed. Square now has its own composition and canonical.
 const DIMS_BY_FORMAT = {
-  feed:      { width: 1080, height: 1350, aspect: '4:5 (also serves 1:1)' },
+  feed:      { width: 1080, height: 1350, aspect: '4:5' },
+  square:    { width: 1080, height: 1080, aspect: '1:1' },
   vertical:  { width: 1080, height: 1920, aspect: '9:16' },
   landscape: { width: 1920, height: 1080, aspect: '16:9' }
 };
@@ -2327,6 +2399,10 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
       return res.status(400).json({ error: 'brand has no websiteUrl — set one via PATCH first' });
     }
     brand.enrichmentSources = [];
+    if (!(brand.curatedFields || []).includes('logoUrl')) {
+      brand.logoIngestedAt = null;
+      brand.logoIngestError = null;
+    }
     // Auto-unlock any field that's currently empty. A curated lock on an
     // empty value defeats the user's intent — they cleared it because
     // they want enrichment to fill it. Non-empty curated fields stay
@@ -2338,6 +2414,12 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
       return true;
     });
     if (unlocked.includes('fontFamily')) brand.fontSource = null;
+    if (unlocked.includes('logoUrl')) {
+      brand.logoSource = null;
+      brand.logoOriginalUrl = null;
+      brand.logoIngestedAt = null;
+      brand.logoIngestError = null;
+    }
     if (unlocked.length) {
       console.log(`   · refresh: unlocked empty curated fields for "${brand.name}": ${unlocked.join(', ')}`);
     }
@@ -2514,6 +2596,10 @@ function serializeBrand(b) {
     tagline:      b.tagline || null,
     summary:      b.summary || null,
     logoUrl:      b.logoUrl || null,
+    logoSource:   b.logoSource || null,
+    logoOriginalUrl: b.logoOriginalUrl || null,
+    logoIngestedAt: b.logoIngestedAt || null,
+    logoIngestError: b.logoIngestError || null,
     websiteUrl:   b.websiteUrl || null,
     primaryColor: b.primaryColor || null,
     secondaryColor: b.secondaryColor || null,
@@ -2522,12 +2608,17 @@ function serializeBrand(b) {
     websiteBackground: b.websiteBackground || null,
     fontFamily:   b.fontFamily || null,
     fontSource:   b.fontSource || null,
+    staticImagePipeline: b.staticImagePipeline || 'direct_overlay',
     tone:         b.tone || [],
     hashtags:     b.hashtags || [],
     tags:         b.tags || [],
     source:       b.source,
     enrichmentSources: b.enrichmentSources || [],
     curatedFields:     b.curatedFields || [],
+    tailwindTheme:     b.tailwindTheme || null,
+    websiteFontUsage:  b.websiteFontUsage || null,
+    fontIngestedAt:    b.fontIngestedAt || null,
+    fontIngestError:   b.fontIngestError || null,
     // Per-brand video-generation overrides — included so the PATCH
     // response confirms a videoSettings save (GET already returns the
     // raw lean doc, which carries it).

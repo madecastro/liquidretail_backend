@@ -54,7 +54,7 @@ function enabled() {
 // the JSON spec generation completes. Idempotent on (aiCanvasArtifactId,
 // htmlSchemaVersion) — if the artifact already has outputHtml at the
 // current schema version, skip.
-async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operatorPrompt = null }) {
+async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operatorPrompt = null, rawPromptOverride = null }) {
   if (!enabled() && !refresh) {
     return { skipped: true, reason: 'AI_HTML_LAYOUT_ENABLED=false' };
   }
@@ -210,7 +210,7 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
     mediaUrlMap = new Map(docs.map(d => [String(d._id), toStillIfVideo(d.fileUrl)]));
   }
 
-  const { system, user, images } = isV2Concept
+  const built = isV2Concept
     ? buildPromptV2({
         canvas, concept, input, richContext, dims, videoMode, mediaRect, platformFormat,
         mediaUrlMap, sourceText, sourceSubjects, sourcePrimarySubjectDesc, operatorPrompt
@@ -219,6 +219,16 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
         canvas, concept, input, richContext, dims, videoMode, mediaRect, platformFormat,
         sourceText, sourceSubjects, sourcePrimarySubjectDesc, operatorPrompt
       });
+
+  // Raw prompt override — the operator edited the exact prompt text
+  // shown in the Generation Details modal and hit Regenerate. Their
+  // text replaces the auto-composed system/user verbatim; the vision
+  // images stay whatever the normal build resolved (mediaUrlMap /
+  // concept media picks) since an override only edits wording, not
+  // which images ground the generation.
+  const system = (rawPromptOverride?.system) || built.system;
+  const user   = (rawPromptOverride?.user)   || built.user;
+  const images = built.images;
 
   const nCandidates = N_CANDIDATES_DEFAULT;
   const responseSchema = buildResponseSchema();
@@ -368,7 +378,12 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
         // Stash the raw response for diagnostic visibility (mirrors the
         // JSON Generator's rawResponse pattern). One field, winner only;
         // multi-candidate raws are not persisted for cost / index size.
-        htmlRawResponse:   candidateRaws[winnerIndex] || null
+        htmlRawResponse:   candidateRaws[winnerIndex] || null,
+        // The exact prompt just sent to the model (post raw-override, if
+        // any) — see field comment on the schema for why this is distinct
+        // from promptSystem/promptUser.
+        htmlPromptSystem:  system,
+        htmlPromptUser:    user
       }
     }
   );
@@ -624,12 +639,16 @@ function buildPromptV2({ canvas, concept, input, richContext, dims, videoMode = 
     `HARD RULES:`,
     `- Output a complete <html>...</html> document. <head> with <meta charset>, <title>, single inline <style>. <body> with the ad's visible content.`,
     `- <body> MUST be sized exactly ${dims.width}px × ${dims.height}px via inline style="width:${dims.width}px;height:${dims.height}px;margin:0;overflow:hidden". No scrollbars, no overflow.`,
+    `- BOTTOM SAFETY BAND — reserve at least 32px between the bottom edge of any TEXT or INTERACTIVE element (h1, h2, subheadline, .cta, .btn, button, price, footer text, brand mark) and the ${dims.height}px canvas bottom. Same rule for top edge (≥ 24px), left/right (≥ 24px). Fonts render at slightly larger metrics in Chromium than the LLM's mental model — bottom < 32px reliably clips descenders and button borders in the final PNG. Decorative shapes (background circles, gradient orbs, image bleeds) MAY sit against or beyond the edge; content must not.`,
     `- NO <script>. NO external <link rel="stylesheet"> or @import EXCEPT for a single Google Fonts <link> in <head>.`,
     `- Google Fonts allowed. Use ONE <link href="https://fonts.googleapis.com/css2?family=<Family>:wght@<weights>&display=swap" rel="stylesheet"> in <head>, then reference the family in font-family. WHITELIST (pick 1-2 families max): Inter, Playfair Display, Lora, Cormorant, Cormorant Garamond, Antonio, Montserrat, Great Vibes, DM Sans, Bebas Neue, Anton, Oswald, IBM Plex Sans, Poppins, Nunito, Quicksand. If unsure, use Inter (sans) + Playfair Display (serif). No other font hosts.`,
     `- All <img src> values MUST come from the ALLOWED URLS block below — verbatim, no transformations, no invented URLs. Hosts outside res.cloudinary.com / cdn.brandfetch.io / cdn.shopify.com / scontent.cdninstagram.com / *.fbcdn.net auto-fail validation.`,
     `- Render copy VERBATIM from the COPY block — no rewriting, no substitution, no Lorem Ipsum. Omit elements whose copy is "(none)".`,
     `- Render copy LEGIBLY: white-space, kerning, no clipping. Color text + background pairs must achieve WCAG AA contrast (≥ 4.5:1 normal, ≥ 3:1 for ≥ 24px or bold ≥ 19px).`,
     `- All positioning via flexbox / grid / absolute. Use ${dims.width}×${dims.height}px-scoped values (px / %) — NO vw/vh.`,
+    `- SOCIAL PROOF — at most ONE testimonial in the ad. One quote OR one comment, never both, and never a second one as a footer, caption, or supporting line.`,
+    `- Use social_proof.primary_quote.snippet when present: it is the ad-ready form, already shortened to a whole word and a whole thought. Render it VERBATIM — do not re-trim it, do not add an ellipsis, do not "fit" it to your layout. Size the element to the text, not the text to the element.`,
+    `- Any proof line you render — quote, review, or social comment — MUST be ≤60 characters and MUST end on a complete word and a complete thought. If the only candidate is longer, choose a different, shorter one that is genuinely positive about THIS product rather than cutting the end off a long one. A quote that stops mid-thought reads as broken, not as intriguing.`,
     ``,
     conceptStrategy,
     ``,
@@ -746,6 +765,7 @@ function buildPrompt({ canvas, concept, input, richContext, dims, videoMode = fa
     `HARD RULES:`,
     `- Output a complete <html>...</html> document. <head> with <meta charset>, <title>, single inline <style>. <body> with the ad's visible content.`,
     `- <body> MUST be sized exactly ${dims.width}px × ${dims.height}px via inline style="width:${dims.width}px;height:${dims.height}px;margin:0;overflow:hidden". No scrollbars, no overflow.`,
+    `- BOTTOM SAFETY BAND — reserve at least 32px between the bottom edge of any TEXT or INTERACTIVE element (h1, h2, subheadline, .cta, .btn, button, price, footer text, brand mark) and the ${dims.height}px canvas bottom. Same rule for top edge (≥ 24px), left/right (≥ 24px). Fonts render at slightly larger metrics in Chromium than the LLM's mental model — bottom < 32px reliably clips descenders and button borders in the final PNG. Decorative shapes (background circles, gradient orbs, image bleeds) MAY sit against or beyond the edge; content must not.`,
     `- NO <script>. NO external <link rel="stylesheet"> or @import (renderer runs offline; external requests time out).`,
     `- NO external fonts. Use system stack: \`font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif\` OR \`font-family: Georgia, "Times New Roman", serif\` for editorial vibe.`,
     `- All image src URLs MUST come from the supplied crop maps or richContext VERBATIM — use the actual URL strings from product.hero_media.image, product.image, product.product_image.image, product.lifestyle_image.image, product.hero_media.crops.<ratio_key>, brand.logo (if logo_present). Do NOT invent or modify URLs.`,
@@ -778,7 +798,12 @@ function buildPrompt({ canvas, concept, input, richContext, dims, videoMode = fa
     `  4. Match brand.tone: "premium / minimal" → restrained near-monochrome; "energetic / playful" → saturated + bold.`,
     `  5. Emit the picked colors as a 2-5 entry color_palette array of #rrggbb strings.`,
     ``,
-    `CRITICAL: if hierarchy_spec.strategy.social_proof_type is anything OTHER than "none" / "absent" / empty, your HTML MUST include a visible proof element bound to actual proof data — quote text from social_proof.primary_quote.text / secondary_quotes[*].text, rating from product.rating + product.review_count, top_comment from social_context.top_comments[*].text, or rating distribution from product.rating_distribution. Don't fake testimonials. If no proof data exists, set proof zone to absent in your hierarchy_spec.`,
+    `CRITICAL: if hierarchy_spec.strategy.social_proof_type is anything OTHER than "none" / "absent" / empty, your HTML MUST include a visible proof element bound to actual proof data — quote text from social_proof.primary_quote.snippet (PREFER THIS) or .text, rating from product.rating + product.review_count, top_comment from social_context.top_comments[*].text, or rating distribution from product.rating_distribution. Don't fake testimonials. If no proof data exists, set proof zone to absent in your hierarchy_spec.`,
+    ``,
+    `TESTIMONIALS — these are direct-response ads read in under two seconds on a phone:`,
+    `  - Bind social_proof.primary_quote.snippet, NOT .text. The snippet is the ad-ready form of the quote: already shortened, already positive, already ending on a whole word and a whole thought.`,
+    `  - Render it VERBATIM. Do not trim it, re-cut it, add an ellipsis, or "fit" it to your layout — it has been shortened once, correctly, and shortening it again is what produces quotes that stop mid-thought. Size the element to the text, not the text to the element.`,
+    `  - Include AT MOST ONE testimonial in the whole ad. Do not add a second quote from secondary_quotes as a footer, caption, or supporting line.`,
     ``,
     `OUTPUT JSON shape (response_format strict):`,
     `  html             — complete <html>…</html> document (200-30000 chars)`,

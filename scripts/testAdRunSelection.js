@@ -264,7 +264,11 @@ check('Stop: cancelled ads are ARCHIVED, never returned to the queue', () => {
 
 check('Stop: the campaign backlog behind the run is archived too', () => {
   // Without this, Stop only pauses — the next Generate drains the leftovers.
-  assert.ok(/campaignId: job\.campaignId, status: 'queued'/.test(loopSrc),
+  // Either source for the campaign id is correct — run.campaignId is required
+  // on the CampaignRun schema, job.campaignId comes from expandWizardJob's
+  // return. Pinning the assertion to one spelling tested the wording, not the
+  // behaviour.
+  assert.ok(/campaignId: (?:run|job)\.campaignId, status: 'queued'/.test(loopSrc),
     'cancel should also clear the campaign\'s remaining queued inventory');
 });
 

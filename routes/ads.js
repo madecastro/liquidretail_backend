@@ -37,6 +37,8 @@ const { deleteFromCloudinary } = require('../services/cloudinaryService');
 const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
 const { buildPreviewHtmlForAd }  = require('../services/adPreviewPageService');
 const registry = require('../services/templateRegistry');
+const alerts   = require('../services/alertService');
+const inFlight = require('../services/inFlight');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
@@ -45,6 +47,14 @@ function parsePhase3WizardFields(body = {}) {
   const {
     directorVariants = false,
     seedMediaIds = [],
+    // Ordered (productId, mediaId) pairs. Supersedes seedMediaIds when present.
+    // Exists because a flat mediaId list cannot express which product a related/
+    // social post is seeding, nor the same post seeding TWO products — the
+    // backend had to guess from matchedProducts, and that guess could flip if
+    // detect rewrote its scores, changing the ad's identityDigest.
+    // seedMediaIds is retained so links and clients minted before this keep
+    // working (expandDeterministicVideo still resolves those by association).
+    seedPicks = null,
     videoPromptGuidance = null,
     videoPromptRaw = null
   } = body;
@@ -70,10 +80,47 @@ function parsePhase3WizardFields(body = {}) {
     }
   }
 
+  let parsedSeedPicks = null;
+  if (seedPicks != null) {
+    if (!Array.isArray(seedPicks)) {
+      return { ok: false, status: 400, error: 'seedPicks must be an array of { productId, mediaId }' };
+    }
+    // Bound the array. Spend is already capped downstream (one ad per product,
+    // references clamped to the model's maxReferenceImages), so a huge array
+    // cannot run up a bill — but it can bloat the request, the Ad rows and this
+    // validation loop. 200 pairs is ~28 products at a full 7-reference stack,
+    // far past any real run.
+    if (seedPicks.length > 200) {
+      return { ok: false, status: 400, error: 'seedPicks may not exceed 200 entries' };
+    }
+    parsedSeedPicks = [];
+    const seenPairs = new Set();
+    for (const p of seedPicks) {
+      if (!p || typeof p !== 'object') {
+        return { ok: false, status: 400, error: 'seedPicks entry must be an object with productId and mediaId' };
+      }
+      if (!mongoose.isValidObjectId(p.productId)) {
+        return { ok: false, status: 400, error: `seedPicks productId is not a valid ObjectId: ${p.productId}` };
+      }
+      if (!mongoose.isValidObjectId(p.mediaId)) {
+        return { ok: false, status: 400, error: `seedPicks mediaId is not a valid ObjectId: ${p.mediaId}` };
+      }
+      // Same media may legitimately appear under DIFFERENT products (one
+      // flat-lay seeding two SKUs' videos), so dedupe on the PAIR, not on
+      // mediaId. A repeated identical pair is an operator double-click, not
+      // an instruction to send the image twice.
+      const key = `${String(p.productId)}|${String(p.mediaId)}`;
+      if (seenPairs.has(key)) continue;
+      seenPairs.add(key);
+      parsedSeedPicks.push({ productId: String(p.productId), mediaId: String(p.mediaId) });
+    }
+  }
+
   return {
     ok: true,
     fields: {
       directorVariants: !!directorVariants,
+      seedPicks: parsedSeedPicks,
       seedMediaIds: Array.isArray(seedMediaIds) ? seedMediaIds : [],
       videoPromptGuidance: (typeof videoPromptGuidance === 'string' && videoPromptGuidance.trim())
         ? videoPromptGuidance
@@ -159,6 +206,7 @@ router.post('/preview', async (req, res) => {
       videoDurationSec,
       directorVariants: phase3.fields.directorVariants,
       seedMediaIds: phase3.fields.seedMediaIds,
+      seedPicks: phase3.fields.seedPicks,
       videoPromptGuidance: phase3.fields.videoPromptGuidance,
       videoPromptRaw: phase3.fields.videoPromptRaw,
       requestedBy: req.user?.userId || null,
@@ -308,6 +356,7 @@ router.post('/generate', async (req, res) => {
           videoDurationSec: parsedVideoDurationSec,
           directorVariants: phase3.fields.directorVariants,
           seedMediaIds: phase3.fields.seedMediaIds,
+          seedPicks: phase3.fields.seedPicks,
           videoPromptGuidance: phase3.fields.videoPromptGuidance,
           videoPromptRaw: phase3.fields.videoPromptRaw,
           requestedBy: req.user?.userId || null
@@ -322,12 +371,10 @@ router.post('/generate', async (req, res) => {
           return;
         }
 
-        // Scoped to the products the operator actually picked. Unscoped, this
+        // Scope to the product(s) the operator actually picked. Unscoped, this
         // renders the campaign's OLDEST queued ads (see selectAdsForRun), so a
-        // Generate for one Pelagic product spent most of a 20-slot run on
-        // leftovers from earlier sessions for other products.
-        // POST /api/ads/runs below stays unscoped on purpose — draining
-        // whole-campaign inventory is that endpoint's entire job.
+        // Generate for one product filled most of its 20 slots with leftovers
+        // from earlier sessions for OTHER products — and billed for them.
         adIds = await selectAdsForRun({
           campaignId,
           limit: MAX_CREATIVES_PER_RUN,
@@ -358,6 +405,14 @@ router.post('/generate', async (req, res) => {
         await runRenderLoop(run, { ...job, platformFormat }, adIds, renderToken);
       } catch (err) {
         console.error(`❌ campaign run ${runId} prep/render crashed:`, err);
+        inFlight.untrack(runId);
+        alerts.notifyAsync({
+          level: 'error',
+          title: 'Campaign run crashed during prep/render',
+          key:   'run-crash:generate',
+          fields: { run: runId, campaign: campaignId, ads: (adIds || []).length, error: err.message || String(err) },
+          detail: err.stack || null
+        });
         if (adIds && adIds.length) {
           await Ad.updateMany(
             { _id: { $in: adIds }, status: 'rendering' },
@@ -461,6 +516,14 @@ router.post('/runs', express.json(), async (req, res) => {
     setImmediate(() => {
       runRenderLoop(run, job, adIds, renderToken).catch(err => {
         console.error(`❌ campaign run ${runId} crashed:`, err);
+        inFlight.untrack(runId);
+        alerts.notifyAsync({
+          level: 'error',
+          title: 'Campaign run crashed (queued drain)',
+          key:   'run-crash:runs',
+          fields: { run: runId, campaign: String(campaign._id), ads: adIds.length, error: err.message || String(err) },
+          detail: err.stack || null
+        });
         Ad.updateMany(
           { _id: { $in: adIds }, status: 'rendering' },
           { $set: { status: 'queued', updatedAt: new Date() } }
@@ -483,16 +546,27 @@ router.post('/runs', express.json(), async (req, res) => {
 // poller can show real-time progress.
 async function runRenderLoop(run, job, adIds, renderToken) {
   const t0 = Date.now();
-  // Veo calls are expensive and quota-limited — serialize them by default.
-  // Derive from the actual ads (not job.platformFormat) so mixed / non-reels
-  // veo batches still get VEO_CONCURRENCY.
-  const veoCount    = await Ad.countDocuments({ _id: { $in: adIds }, renderRoute: 'veo' });
-  const isVeoRun    = veoCount > 0;
-  const concurrency = isVeoRun ? VEO_CONCURRENCY : RENDER_CONCURRENCY;
+  // Partition the batch by renderRoute so veo (quota-limited) and image
+  // (cheap, parallelizable) render in independent pools. A single mixed
+  // batch used to fall back to VEO_CONCURRENCY for ALL ads because "any
+  // veo ad ⇒ serialize everything" — which meant a 20-min Grok poll
+  // starved 3 image ads that could have finished in <1 min. Two pools
+  // dispatched via Promise.all restores parallelism.
+  const routes = await Ad.find({ _id: { $in: adIds } }).select('_id renderRoute').lean();
+  const routeById = new Map(routes.map((r) => [String(r._id), r.renderRoute || null]));
+  const veoIds   = adIds.filter((id) => routeById.get(String(id)) === 'veo');
+  const otherIds = adIds.filter((id) => routeById.get(String(id)) !== 'veo');
+  const isVeoRun = veoIds.length > 0;
   console.log(
     `🚀 [campaignRun ${run.runId}] start — ${adIds.length} ad(s) ` +
-    `concurrency=${concurrency}${isVeoRun ? ' (veo)' : ''} brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
+    `concurrency=veo:${VEO_CONCURRENCY}(${veoIds.length}) image:${RENDER_CONCURRENCY}(${otherIds.length}) ` +
+    `brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
   );
+
+  // Register with the in-flight registry so the SIGTERM handler can report
+  // exactly how much work an instance replacement is about to orphan. This
+  // loop lives in the web process and dies with it — see services/inFlight.js.
+  inFlight.track(run.runId, { total: adIds.length, brandId: job.brandId, veo: isVeoRun });
 
   // Unified progress row (ActivityDock) — mirrors the CampaignRun
   // counters and adds cooperative cancel: the pool stops claiming new
@@ -504,107 +578,110 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     advertiserId: brandDoc?.advertiserId,
     brandId: job.brandId,
     total: adIds.length,
-    label: isVeoRun ? 'Video ad generation' : 'Ad generation',
+    // Label reflects the mix — mostly for the ActivityDock header.
+    label: isVeoRun && otherIds.length ? 'Ad generation (mixed)'
+         : isVeoRun ? 'Video ad generation'
+         : 'Ad generation',
   });
   progressRun.stage('rendering');
 
-  const queue = adIds.map((adId, i) => ({ adId, index: i }));
-  let inflight = 0;
-  let next     = 0;
-  let done     = 0;
+  // Preserve stable "position in batch" via the shared adIds order — the
+  // index gets stamped into CampaignRun.errors[] rows and log lines. Each
+  // pool consumes its own slice but keeps the original index.
+  const indexOf = new Map(adIds.map((id, i) => [String(id), i]));
+  let done      = 0;
   let cancelled = false;
+  // Each pool tracks its own remaining-work cursor so the cancel path
+  // can requeue precisely what it didn't reach.
+  const pools = [
+    { name: 'veo',   concurrency: VEO_CONCURRENCY,    queue: veoIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })),   next: 0, inflight: 0 },
+    { name: 'image', concurrency: RENDER_CONCURRENCY, queue: otherIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })), next: 0, inflight: 0 }
+  ].filter((p) => p.queue.length > 0);
 
-  await new Promise((resolve) => {
-    // AWAITED, not fire-and-forget. checkpoint() is async (it reads
-    // cancelRequested from Mongo) and signals cancellation by THROWING, so
-    // `.catch(() => cancelled = true)` could only ever run on a later
-    // microtask. The synchronous while-loop below therefore ran first with a
-    // stale `cancelled === false` and claimed a whole extra wave of renders
-    // AFTER the operator pressed Stop — every one of them billable. Awaiting
-    // it costs one already-throttled read (1/s cache in progressService) per
-    // dispatch cycle and makes Stop mean stop.
+  await Promise.all(pools.map((pool) => new Promise((resolve) => {
     const dispatch = async () => {
+      // AWAITED, not fire-and-forget. checkpoint() is async (it reads
+      // cancelRequested from Mongo) and signals cancellation by THROWING, so
+      // `.catch(() => cancelled = true)` could only ever run on a later
+      // microtask. The synchronous while-loop below therefore ran first with a
+      // stale `cancelled === false` and claimed a whole extra wave of renders
+      // AFTER the operator pressed Stop — every one of them billable. Awaiting
+      // costs one already-throttled read (1/s cache in progressService) per
+      // dispatch cycle and makes Stop mean stop.
       try {
         await progressRun.checkpoint();
       } catch {
         cancelled = true;
       }
-      if (cancelled && inflight === 0) return resolve();
-      while (!cancelled && inflight < concurrency && next < queue.length) {
-        const { adId, index } = queue[next++];
-        inflight++;
+      if (cancelled && pool.inflight === 0) return resolve();
+      while (!cancelled && pool.inflight < pool.concurrency && pool.next < pool.queue.length) {
+        const { adId, index } = pool.queue[pool.next++];
+        pool.inflight++;
         renderOne(run, job, adId, index, renderToken)
           .catch(err => {
-            console.error(`❌ [campaignRun ${run.runId}] #${index} dispatch crash:`, err.message || err);
+            console.error(`❌ [campaignRun ${run.runId}] #${index} (${pool.name}) dispatch crash:`, err.message || err);
           })
           .finally(() => {
-            inflight--;
+            pool.inflight--;
             progressRun.tick(++done, adIds.length);
-            if ((next >= queue.length || cancelled) && inflight === 0) resolve();
+            inFlight.progress(run.runId, done);
+            // Liveness heartbeat for the reaper — see the comment on the
+            // pre-partition version for why we refresh updatedAt on every
+            // completion instead of just at claim time. Scoped to
+            // status:'rendering' so it never resurrects ads the cancel
+            // path already re-queued.
+            Ad.updateMany(
+              { _id: { $in: adIds }, status: 'rendering' },
+              { $set: { updatedAt: new Date() } }
+            ).catch(() => {});
+            if ((pool.next >= pool.queue.length || cancelled) && pool.inflight === 0) resolve();
             else dispatch().catch(() => resolve());
           });
       }
-      if (cancelled && inflight === 0) resolve();
+      if (cancelled && pool.inflight === 0) resolve();
     };
-    // dispatch() is async now, so an unhandled rejection here would take the
-    // process down instead of ending the batch.
     dispatch().catch(() => resolve());
-  });
+  })));
 
-  // STOP MEANS STOP — nothing survives to be generated later.
-  //
-  // This block used to put the unrendered ads BACK to status:'queued', which
-  // is the opposite of what pressing Stop means: selectAdsForRun re-drained
-  // them on the operator's next Generate, so cancelled work reappeared —
-  // often against a different product, because that selector filters on
-  // campaignId only and sorts oldest-first. Stopping a batch then cost money
-  // later, on ads nobody asked for twice.
-  //
-  // Now cancellation ARCHIVES instead. 'archived' is in the Ad status enum and
-  // selectAdsForRun only ever matches 'queued', so archived ads are invisible
-  // to every future run while remaining inspectable — and reversible in bulk
-  // via `node scripts/purgeQueuedAds.js --apply --restore`.
-  //
-  // Two scopes are archived, because "no more generation happens" means both:
-  //   1. this run's claimed-but-unrendered ads (status 'rendering'), and
-  //   2. the rest of the campaign's queued inventory sitting behind this run.
-  // Without (2), Stop only pauses: the backlog is still there and the next
-  // Generate press drains it.
-  //
-  // TRADE-OFF, deliberate: this empties the pool that "Generate more from this
-  // campaign" (POST /api/ads/runs) draws on, so after a Stop that button has
-  // nothing to render until the operator generates again. That is the correct
-  // reading of Stop — the alternative silently bills for cancelled work.
-  //
-  // What this CANNOT do is abort renders already in flight. A dispatched Veo
-  // call is already paid for; those finish and are kept.
+  // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at
+  // claim time, before the loop) go BACK to the queue — they count as
+  // skipped for this run and the next run's selectAdsForRun re-drains
+  // them. Matching on status:'rendering' is load-bearing: the old
+  // status:'queued' filter matched nothing post-claim, stranding
+  // unclaimed ads in 'rendering' forever (adversarial-review find).
+  // With two pools we requeue the untouched tail of each.
   if (cancelled) {
+    // ARCHIVE, do not re-queue. Putting cancelled ads back to 'queued' meant
+    // the work the operator just stopped reappeared on the next Generate and
+    // billed — Stop hid the button but bought the renders anyway. 'archived'
+    // is in the Ad status enum and selectAdsForRun only ever matches 'queued',
+    // so archived ads are invisible to every future run while staying
+    // inspectable, and reversible in bulk.
+    //
+    // Two scopes, because "no more generation happens" means both: this run's
+    // unclaimed tail, AND the campaign's remaining queued backlog that a
+    // subsequent Generate would otherwise drain.
+    //
+    // Renders already in flight cannot be recalled — a dispatched image or
+    // video call is already paid for — so those finish and are kept.
     let archivedThisRun = 0;
-    if (next < queue.length) {
-      const remaining = queue.slice(next).map((q) => q.adId);
+    const remaining = pools.flatMap((p) => p.queue.slice(p.next).map((q) => q.adId));
+    if (remaining.length) {
       const r = await Ad.updateMany(
         { _id: { $in: remaining }, status: 'rendering' },
         { $set: { status: 'archived', updatedAt: new Date() } }
       ).catch(() => null);
       archivedThisRun = r?.modifiedCount || 0;
-      await CampaignRun.updateOne(
-        { _id: run._id },
-        { $inc: { skipped: remaining.length } }
-      ).catch(() => {});
+      await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
     }
-
-    // The backlog behind this run.
     const backlog = await Ad.updateMany(
-      { campaignId: job.campaignId, status: 'queued' },
+      { campaignId: run.campaignId, status: 'queued' },
       { $set: { status: 'archived', updatedAt: new Date() } }
     ).catch(() => null);
     const archivedBacklog = backlog?.modifiedCount || 0;
-
-    console.log(
-      `🛑 [campaignRun ${run.runId}] stopped by operator — archived ` +
-      `${archivedThisRun} unrendered from this batch + ${archivedBacklog} queued in the campaign; ` +
-      `${inflight} render(s) were already in flight and were allowed to finish`
-    );
+    // Recorded on the run's own error log rather than as new top-level
+    // fields: CampaignRun is strict, so unknown keys would be silently
+    // stripped and the record would simply not exist.
     await CampaignRun.updateOne(
       { _id: run._id },
       { $push: { errors: {
@@ -613,6 +690,9 @@ async function runRenderLoop(run, job, adIds, renderToken) {
           message: `Stopped by operator — ${archivedThisRun + archivedBacklog} pending ad(s) archived, not re-queued`
       } } }
     ).catch(() => {});
+    console.log(
+      `🛑 [campaignRun ${run.runId}] stopped by operator — archived ${archivedThisRun} unclaimed + ${archivedBacklog} backlog ad(s); in-flight renders finish`
+    );
   }
 
   await CampaignRun.updateOne(
@@ -620,13 +700,43 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     { status: 'done', completedAt: new Date() }
   );
   const totalMs = Date.now() - t0;
-  const final = await CampaignRun.findById(run._id).select('succeeded skipped failed').lean();
+  inFlight.untrack(run.runId);
+  const final = await CampaignRun.findById(run._id).select('succeeded skipped failed errors').lean();
   if (cancelled) await progressRun.markCancelled(`Stopped — ${final?.succeeded || 0} finished, rest skipped`);
   else await progressRun.succeed({ succeeded: final?.succeeded || 0, skipped: final?.skipped || 0, failed: final?.failed || 0 });
   console.log(
     `🎉 [campaignRun ${run.runId}] done in ${totalMs}ms — ` +
     `${final?.succeeded || 0} succeeded · ${final?.skipped || 0} skipped · ${final?.failed || 0} failed${cancelled ? ' (cancelled by operator)' : ''}`
   );
+
+  // Report batches that finished with losses. An operator-cancelled run is
+  // expected, so it stays quiet; a run that failed every ad is escalated.
+  const nFailed = final?.failed || 0;
+  if (!cancelled && nFailed > 0) {
+    const nOk = final?.succeeded || 0;
+    alerts.notifyAsync({
+      level: nOk === 0 ? 'error' : 'warn',
+      title: nOk === 0
+        ? `Campaign run failed entirely — ${nFailed} ad(s)`
+        : `Campaign run finished with ${nFailed} failed ad(s)`,
+      key:   `run-failed:${nOk === 0 ? 'total' : 'partial'}`,
+      fields: {
+        run:      run.runId,
+        brand:    job.brandId,
+        outcome:  `${nOk}✓ / ${nFailed}✗ / ${final?.skipped || 0}⊘ of ${adIds.length}`,
+        route:    isVeoRun ? 'video' : 'static',
+        took:     `${Math.round(totalMs / 1000)}s`
+      },
+      // The per-ad errors array is the actual diagnosis; the run counters
+      // alone never say WHY. Defensive per-entry: this runs AFTER the run
+      // was persisted as 'done', still inside runRenderLoop — a throw here
+      // would surface in the caller's catch and falsely re-mark the run
+      // 'failed'.
+      detail: (Array.isArray(final?.errors) ? final.errors : []).slice(-6)
+        .map((e) => `#${e?.index ?? '?'} [${e?.stage ?? '?'}] ${String(e?.message ?? '').slice(0, 200)}`)
+        .join('\n') || null
+    });
+  }
 }
 
 async function renderOne(run, job, adId, index, renderToken) {
@@ -659,7 +769,7 @@ async function renderOne(run, job, adId, index, renderToken) {
         .select('fileType fileUrl brandId').lean();
       const brandDoc = sourceMedia?.brandId
         ? await Brand.findById(sourceMedia.brandId)
-            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily derivedVoice videoSettings titleStyleSpec titleStylePreset customFonts').lean()
+            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset').lean()
         : null;
 
       // Grok-skip branch — when the seed is already a video, we keep
@@ -755,6 +865,7 @@ async function renderOne(run, job, adId, index, renderToken) {
             posterUrl:          fallbackPosterUrl || veoVideoUrl,
             cloudinaryPublicId: veoCloudinaryPublicId,
             sourceFileType:     'video',
+            renderedAt:         new Date(),
             updatedAt:          new Date()
           },
           $inc: { renderAttempts: 1 }
@@ -780,6 +891,20 @@ async function renderOne(run, job, adId, index, renderToken) {
       await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
     } catch (err) {
       console.error(`❌ veoReference[ad=${adId}]:`, err.message || err);
+      // Video is the expensive, slow, vendor-dependent stage — the one
+      // worth a push. Deduped on the message shape, not the ad id, so a
+      // vendor outage that fails 20 ads sends one alert with a count
+      // rather than 20 separate ones. String() the message defensively:
+      // a vendor error like {message: 429} has a truthy non-string
+      // .message, and a synchronous throw HERE would skip the CampaignRun/
+      // Ad failure bookkeeping below, wedging the ad in 'rendering'.
+      const vmsg = String((err && err.message) || err);
+      alerts.notifyAsync({
+        level:  'error',
+        title:  'Video generation failed',
+        key:    `video-failed:${vmsg.slice(0, 60)}`,
+        fields: { ad: String(adId), run: run.runId, brand: job.brandId, error: vmsg.slice(0, 300) }
+      });
       await CampaignRun.updateOne(
         { _id: run._id },
         {
@@ -1318,13 +1443,20 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 });
 
 // POST /api/ads/:id/regenerate — re-run the render pipeline for this
-// ad with an operator refinement prompt. Body: { prompt, mode? }.
-//   prompt: required, up to ~1000 chars
-//   mode:   'light' (default, video only — re-runs chrome + composite,
-//                    Veo unchanged) | 'full' (re-runs Veo too).
-//           Image ads always do full HTML Gen re-render; mode ignored.
+// ad with an operator refinement prompt, OR a verbatim prompt override.
+// Body: { prompt?, mode?, promptOverride? }.
+//   prompt:  a refinement note appended to the auto-composed prompt.
+//            Required UNLESS promptOverride is given. Up to ~1000 chars.
+//   mode:    'light' (default, video only — re-runs chrome + composite,
+//                     Veo unchanged) | 'full' (re-runs Veo too).
+//            Image ads always do full HTML Gen re-render; mode ignored.
+//   promptOverride: { system, user } — image ads only. The operator
+//            edited the EXACT prompt shown in the Generation Details
+//            modal; this text replaces the auto-composed prompt
+//            verbatim instead of being appended as a refinement note.
 // Returns 202 with a poll target. Frontend polls
-// /api/catalog/:productId/ads-detail watching ad.regenerating.
+// /api/catalog/:productId/ads-detail (or this ad's generation-inspector)
+// watching ad.regenerating.
 router.post('/:id/regenerate', express.json(), async (req, res) => {
   try {
     const brandId = req.query.brandId || req.headers['x-brand-id'];
@@ -1335,8 +1467,21 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       if (e.status === 404) return res.status(404).json({ error: e.message });
       throw e;
     }
+
+    const MAX_OVERRIDE_LEN = 40000;
+    let promptOverride = null;
+    if (req.body?.promptOverride && typeof req.body.promptOverride === 'object') {
+      const sys = String(req.body.promptOverride.system || '').trim();
+      const usr = String(req.body.promptOverride.user   || '').trim();
+      if (!sys || !usr) return res.status(400).json({ error: 'promptOverride requires both system and user text' });
+      if (sys.length > MAX_OVERRIDE_LEN || usr.length > MAX_OVERRIDE_LEN) {
+        return res.status(400).json({ error: `promptOverride text is too long (max ${MAX_OVERRIDE_LEN} chars each)` });
+      }
+      promptOverride = { system: sys, user: usr };
+    }
+
     const prompt = String(req.body?.prompt || '').trim();
-    if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+    if (!prompt && !promptOverride) return res.status(400).json({ error: 'prompt or promptOverride is required' });
     if (prompt.length > 1000) return res.status(400).json({ error: 'prompt is too long (max 1000 chars)' });
     const mode = req.body?.mode === 'full' ? 'full' : 'light';
 
@@ -1360,6 +1505,9 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     } catch (err) {
       return res.status(err.status || 400).json({ error: err.message });
     }
+    if (promptOverride && ad.kind !== 'image') {
+      return res.status(400).json({ error: 'promptOverride is only supported for image ads' });
+    }
     const requestedBy = req.user?.userId || req.user?.email || null;
 
     // 202 — operator polls /api/catalog/:productId/ads-detail for stage.
@@ -1371,7 +1519,7 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     });
 
     setImmediate(() => {
-      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel })
+      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel, promptOverride })
         .catch(err => console.error(`❌ regenerate setImmediate crash: ${err.message}`));
     });
   } catch (err) {
@@ -1529,13 +1677,31 @@ router.get('/:id/generation-inspector', async (req, res) => {
     const brand = await Brand.findById(brandId).lean();
 
     const out = {
-      adId:        String(ad._id),
-      kind:        ad.kind,
-      template:    ad.template,
-      aspectRatio: ad.aspectRatio,
-      status:      ad.status,
-      productId:   ad.productId ? String(ad.productId) : null,
-      warnings:    []
+      adId:               String(ad._id),
+      kind:               ad.kind,
+      template:           ad.template,
+      aspectRatio:        ad.aspectRatio,
+      status:             ad.status,
+      // Prefer the moment the render actually completed. Older video
+      // rows predate renderedAt persistence, so fall back to the time
+      // the generation row was created rather than leaving the UI blank.
+      generatedAt:        ad.renderedAt || ad.generatedAt || ad.createdAt || null,
+      productId:          ad.productId ? String(ad.productId) : null,
+      // Regenerate-with-prompt state — surfaced here so the Generation
+      // Details modal can poll this same endpoint while a regen runs,
+      // and so it can gate edit/regenerate on exported ads (read-only).
+      metaSyncStatus:     ad.metaSyncStatus || null,
+      regenerating:       !!ad.regenerating,
+      regenerationStage:  ad.regenerationStage || null,
+      // Last regen outcome (done/failed/pending) — lets a poller distinguish
+      // "finished successfully" from "finished but failed" once regenerating
+      // flips back to false (both look identical from that flag alone).
+      lastRegeneration: (() => {
+        const h = Array.isArray(ad.regenerationHistory) ? ad.regenerationHistory : [];
+        const last = h.length ? h[h.length - 1] : null;
+        return last ? { status: last.status, error: last.error || null, at: last.at || null } : null;
+      })(),
+      warnings:           []
     };
 
     // ── Seed media (the source the generation animated/composed) ──
@@ -1567,22 +1733,22 @@ router.get('/:id/generation-inspector', async (req, res) => {
 
     // ── Video generation inputs ──
     if (ad.kind === 'video' || ad.veoPrompt || ad.veoVideoUrl) {
-      // Reference-image stack the director actually fed the model
-      // (pos 0 = seed, then product hero + alts). Persisted on newer ads;
-      // reconstructed from seed + catalog product images for older ones.
-      let referenceImages = Array.isArray(ad.veoReferenceImages) ? ad.veoReferenceImages.filter(Boolean) : [];
-      let referenceImagesReconstructed = false;
+      // The reference-image stack the model ACTUALLY received (pos 0 = seed),
+      // exactly as persisted at submit time. This used to fall back to a guess
+      // rebuilt from the seed + the product's current catalog images, which is
+      // both unfaithful (catalog images drift after the render) and actively
+      // misleading in a diagnostic — an operator comparing output against a
+      // reconstructed input stack is debugging a request that never happened.
+      // Ads rendered before this was persisted report an empty list and say so.
+      const referenceImages = Array.isArray(ad.veoReferenceImages) ? ad.veoReferenceImages.filter(Boolean) : [];
       if (!referenceImages.length) {
-        const recon = [];
-        if (seed?.url) recon.push(seed.url);
-        if (ad.productId) {
-          const CatalogProduct = require('../models/CatalogProduct');
-          const cp = await CatalogProduct.findById(ad.productId).select('imageUrl additionalImages').lean();
-          if (cp?.imageUrl) recon.push(cp.imageUrl);
-          for (const u of (Array.isArray(cp?.additionalImages) ? cp.additionalImages : [])) if (u) recon.push(u);
-        }
-        referenceImages = [...new Set(recon)];
-        referenceImagesReconstructed = referenceImages.length > 0;
+        // Empty is ambiguous — an unrecorded render and a genuinely
+        // reference-free one look identical here. State that rather than
+        // picking the more flattering explanation.
+        out.warnings.push({
+          code: 'reference-images-not-recorded',
+          message: 'No reference images are stored for this ad — either none were sent or the render predates submit-time capture. Nothing is shown, because what a past render received cannot be recovered after the fact.'
+        });
       }
       out.video = {
         model:       ad.veoModel || null,
@@ -1591,8 +1757,23 @@ router.get('/:id/generation-inspector', async (req, res) => {
         storyboard:  ad.veoStoryboard || null,
         rawVideoUrl: ad.veoVideoUrl || null,    // BEFORE titling — compare vs finalUrl to locate garble
         finalUrl:    ad.renderUrl || null,       // AFTER titling overlay
-        referenceImages,                         // the images the director chose (pos 0 = seed)
-        referenceImagesReconstructed
+        // Omni-family models render portrait masters at 9:16. Feed and
+        // square deliverables are cropped from that Cloudinary master.
+        // Expose the provenance explicitly so the inspector can show a
+        // linked source thumbnail without guessing from URL strings.
+        derivedFrom: (
+          ['1:1', '4:5'].includes(ad.aspectRatio) &&
+          ad.veoAspectRatio === '9:16' &&
+          typeof ad.veoVideoUrl === 'string' &&
+          ad.veoVideoUrl.includes('/video/upload/')
+        ) ? {
+          aspectRatio:  '9:16',
+          videoUrl:     ad.veoVideoUrl,
+          thumbnailUrl: ad.veoVideoUrl
+            .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good,w_360/')
+            .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
+        } : null,
+        referenceImages                           // exactly what was submitted (pos 0 = seed); never reconstructed
       };
       if (!ad.veoPrompt) {
         out.warnings.push({ code: 'no-video-prompt', message: 'No stored video prompt — ad predates prompt persistence or was not a Veo render.' });
@@ -1615,24 +1796,61 @@ router.get('/:id/generation-inspector', async (req, res) => {
     }
 
     // ── Static image generation inputs ──
-    if (ad.kind === 'image' || ad.aiCanvasArtifactId) {
+    if (ad.kind === 'image' || ad.aiCanvasArtifactId || ad.imageGeneration) {
       const image = {
         aiCanvasArtifactId:    ad.aiCanvasArtifactId ? String(ad.aiCanvasArtifactId) : null,
-        layoutInputArtifactId: ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null
+        layoutInputArtifactId: ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null,
+        fontResolution:        ad.fontResolution || null,
+        // THE image-model request, verbatim from the POST body at submit time.
+        // Distinct from layoutPrompt below, which belongs to the *layout* LLM
+        // that writes HTML — conflating the two is what made an operator read
+        // "one front image" while gpt-image-2 had in fact been handed two
+        // references. Never reconstructed: null means not recorded.
+        imageGeneration:       ad.imageGeneration || null
       };
+      if (!ad.imageGeneration) {
+        // Deliberately does NOT assert a cause. An HTML/Puppeteer render makes
+        // no image-model call at all, so "predates capture" would be a fresh
+        // untruth in the very field that exists to stop guessing.
+        out.warnings.push({
+          code: 'image-generation-not-recorded',
+          message: 'No image-model request is stored for this ad — either none was made (HTML layout pipeline) or the render predates submit-time capture. Any prompt or image below belongs to the layout LLM, NOT the image model.'
+        });
+      }
       if (ad.aiCanvasArtifactId) {
         const AiCanvasArtifact = require('../models/AiCanvasArtifact');
         const c = await AiCanvasArtifact.findById(ad.aiCanvasArtifactId)
-          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks').lean();
+          .select('promptSystem promptUser promptImages canvasSpec outputHtml colorPalette copyPicks modelId htmlPromptSystem htmlPromptUser')
+          .lean();
         if (c) {
-          image.layoutPrompt = { system: c.promptSystem || null, user: c.promptUser || null, images: c.promptImages || [] };
+          // htmlPromptSystem/User is the EXACT prompt the HTML Generator
+          // sent for the current outputHtml. promptSystem/User is the
+          // older JSON Generator's own (different) prompt — kept as a
+          // fallback for ads rendered before htmlPrompt* was captured,
+          // but it does NOT necessarily match outputHtml, so flag it.
+          const exact = !!(c.htmlPromptSystem && c.htmlPromptUser);
+          image.layoutPrompt = {
+            system: c.htmlPromptSystem || c.promptSystem || null,
+            user:   c.htmlPromptUser   || c.promptUser   || null,
+            images: c.promptImages || []
+          };
+          image.promptIsExact = exact;
           image.canvasSpec   = c.canvasSpec || null;
           image.outputHtml   = c.outputHtml || null;
           image.colorPalette = c.colorPalette || null;
           image.copyPicks    = c.copyPicks || null;
+          image.model        = c.modelId || null;   // e.g. 'gpt-4.1' — the layout-generation model
+          if (!exact && (image.layoutPrompt.system || image.layoutPrompt.user)) {
+            out.warnings.push({
+              code: 'layout-prompt-legacy',
+              message: 'Shown prompt is from the legacy JSON layout generator, not the HTML generator that actually produced this render — it may not exactly match the image. Editing and regenerating will still work off your edited text going forward.'
+            });
+          } else if (!image.layoutPrompt.system && !image.layoutPrompt.user) {
+            out.warnings.push({ code: 'layout-prompt-missing', message: 'No layout prompt captured for this ad.' });
+          }
         }
       }
-      // NOTE: the gpt-image-2 image-ref prompt (AiFullRenderArtifact) is
+      // NOTE: the shadow image-ref artifact (AiFullRenderArtifact) is still
       // intentionally NOT joined here — it has no FK on the Ad and its
       // uniqueness is an 8-field cache key (mediaId+template+aspectRatio+
       // productId+variantKind+campaignContextHash+paletteSource+creativeStyle),
@@ -1641,6 +1859,9 @@ router.get('/:id/generation-inspector', async (req, res) => {
       // correctly-joined image-ref + creative-direction detail is available
       // via GET /api/ai-layouts/spec/by-artifact/:aiCanvasArtifactId (exposed
       // above) — the frontend can deep-link to it.
+      // This is why `imageGeneration` above is captured at submit time on the
+      // Ad itself: an FK-less join is guesswork, and the one thing this
+      // endpoint must never do is guess about what the model was sent.
       out.image = image;
     }
 
