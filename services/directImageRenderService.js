@@ -36,10 +36,22 @@ const PLATE_QUALITY = process.env.AI_DIRECT_IMAGE_QUALITY || 'medium';
 // marked `charged`, so every one of those paid for an image that finished a
 // few seconds after we stopped listening, then threw it away.
 //
-// 180s keeps the call bounded (the point of the original limit) while sitting
-// clear of the measured floor plus load variance. Tune with
-// AI_DIRECT_IMAGE_TIMEOUT_MS; re-measure before lowering it.
-const PLATE_TIMEOUT_MS = Number(process.env.AI_DIRECT_IMAGE_TIMEOUT_MS || 180_000);
+// 600s. Deliberately generous, because waiting is now nearly free: the poller
+// reads Atlas's error envelope ({code,msg} + HTTP status) and fails the moment
+// the provider actually rejects something, so a long ceiling is only ever
+// spent on a request that is genuinely still processing. Before that fix a
+// large timeout would have meant sitting on a dead request for the full
+// duration, which is why a tight bound looked reasonable.
+//
+// NOT unbounded, and the ceiling is not arbitrary: worker.js reaps ads stale
+// in 'rendering' at REAP_STALE_MIN (default 15 min / 900s), after which an ad
+// can be reclaimed and re-selected into another run — a second billable
+// submit for one ad. 600s keeps a 5-minute margin under that, so a slow
+// render can never be reaped out from under itself.
+//
+// Tune with AI_DIRECT_IMAGE_TIMEOUT_MS. Keep it below REAP_STALE_MIN, and
+// re-measure before lowering it toward the ~70s floor.
+const PLATE_TIMEOUT_MS = Number(process.env.AI_DIRECT_IMAGE_TIMEOUT_MS || 600_000);
 const REFERENCE_TIMEOUT_MS = Number(process.env.AI_DIRECT_REFERENCE_TIMEOUT_MS || 15_000);
 const UPLOAD_TIMEOUT_MS = Number(process.env.AI_DIRECT_UPLOAD_TIMEOUT_MS || 20_000);
 
