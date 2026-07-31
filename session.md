@@ -1,7 +1,197 @@
 # session.md — liquidretail_backend
 
 ## Next-session prompt
-_(empty — no pending owner prompt)_
+
+### PICK UP HERE (2026-07-31, late) — retro review found FABRICATED PROOF shipping live
+
+Full review output is committed at `docs/reviews/retro-2026-07-31-*.md`. Read
+`4-creative.md` FIRST — it is the one that matters and it found blockers.
+
+**FIX THESE FIRST — they violate the owner's "never invent proof" rule in production:**
+
+1. **BLOCKER — invented customer quotes ship as proof.** `layoutInputService.js:1889-1941`
+   builds the quote pool with SIX tiers. Tiers 5-6 are **not real reviews**: tier 5 is
+   LLM "notional" persona quotes (`:1179-1182` literally asks for notional reviews), tier 6
+   is `synthesizeQuoteFromReviewSummary` — the first sentence of an LLM *summary*, stamped
+   `origin:'synthesized', verbatim:false` (`:1676-1691`). `buildIntentData`
+   (`directImageRenderService.js:240-247`) maps `primary_quote.snippet || .text` with **no
+   `origin`/`verbatim` check**, so those strings are typeset into the ad as a customer
+   testimonial. FIX: reject any quote whose `origin` is synthesized/llm or whose
+   `verbatim !== true` before it reaches the intent mapper.
+2. **BLOCKER — attribution invents identity.** `layoutInputService.js:1548-1550`
+   `author_name: q.author_name || q.author || q.source || (verified ? 'Verified buyer' :
+   'Anonymous Customer')`. So an ad can print `— Verified buyer` with no name (owner rule is
+   "Anonymous Customer" only when there is no name), or `— <source>` using a platform label
+   as a person's byline.
+3. **HIGH — snippet is not always the full quote.** `buildIntentData:240` prefers
+   `primary_quote.snippet`, which `quoteSnippetService.js:134-166` may produce by mechanical
+   truncation ending in `…`. It is then wrapped in quotation marks as if it were the
+   customer's whole sentence, which can invert meaning if the rest qualified the praise.
+4. **HIGH — category-tier quote on a product ad.** `layoutInputService.js:1896-1931` tier 2
+   is "same category on this brand", not this SKU. The brand-tier guard at `:1914-1918` was
+   written to stop exactly this class; one tier up is still open.
+5. **HIGH — Director headlines can fabricate proof.** `validateDirectorPayload:959-961` only
+   blocks the product NAME and price/discount regexes. It does not block invented scale,
+   ratings, awards or "10,000 women swear by this", which then ship as `BRAND LINE`.
+6. **MEDIUM — rating not canonically formatted.** Director rounds
+   (`aiCreativeDirectorService.js:440` `toFixed(1)`); the static intent does not
+   (`buildIntentData:243` `String(proof.rating_value)`), so `4.85` ships as `"4.85 ★"`.
+   Also `rating_value: 0` becomes the string `"0"` and passes the eligibility check.
+
+**THEN the three builds the owner asked for, in this order:**
+
+- **A. Video fan-out — 1 generation = 3 sizes.** Owner: "1 generation = 3 sizes regardless of
+  the size chosen", and "veo should only generate a video once for each product unless it is
+  revised or another custom video is selected". Design is SETTLED and must stay race-free:
+  **queue ONLY the 9:16 master; create the 4:5 and 1:1 rows AFTER its `veoVideoUrl` lands**,
+  reusing `services/videoCropUrl.js` (already live-probed) via the existing
+  `basePlateCropService` face-safe crop. DO NOT queue all three and have each check "does a
+  master exist" — `VEO_CONCURRENCY` is now **4**, so all three would submit at once and bill
+  3x. Facts already verified: `omniFamilyNativeFor` returns `'9:16'` for ANY aspect < 1, so
+  4:5 and 1:1 ALREADY generate at 9:16 and crop down; `computeDeterministicVideoDigest`
+  includes `platformFormat` so 3 rows will not collide; `expandDeterministicVideo` currently
+  emits ONE row (`aspectRatio` is a single value at `:1813`).
+- **B. Safe-zone unification.** TWO unreconciled tables: `platformFormats.safeArea` (canvas
+  PIXELS, read by `htmlValidationService` for static) and `remotion/lib/safeZones.js`
+  `SAFE_ZONES` (FRACTIONS, keyed by ASPECT CLASS). Because `classifyFormat` collapses Reels
+  and Stories both to `'vertical'`, **their overlays are identical today** despite declared
+  reserves of 204 vs 250. NOTE: titling IS safe-zone aware (`vertical` = top 14% / bottom
+  35%, and `stackContainerStyle` clamps) and is currently MORE conservative than Meta
+  requires, so nothing is drawn under chrome today — an earlier claim in this session that
+  titling was "not aware" was WRONG. Also unresolved: Stories' `250` looks denominated in
+  DELIVERY pixels while Reels' `204` is canvas-space (220 x 1778/1920 ≈ 204), so Stories
+  over-reserves ~1pp. Make `platformFormats.safeArea` the single source of truth and derive
+  Remotion per SURFACE.
+- **C. Status screen UI + copy button.** Backend is DONE and merged-pending:
+  `GET /api/ads/render-activity` returns technical rows (status, live stage + age, `stalled`
+  past 600s, pipeline, model, predictionId, per-stage timings, intent resolution, asset URL,
+  error, all ids, requester) plus a server-built `diagnostic` one-paste block per row. Owner
+  wants it technical, with assetID, and a copy button that emits that block.
+
+**Owner process instruction (standing, from this session):** run Grok adversarially on EVERY
+diff — it caught the fan-out cap bug and a false runtime prompt string that I missed, and the
+creative retro above. There is NO limit on how much Grok is used. But note the worst defects
+this session were found by testing against REALITY, not by reading: the second POLISHING copy
+(found by grepping the DEPLOYED bundle), the `populate('requestedBy')` crash (found by running
+the query on prod), and the cross-tenant leak (found by comparing to conventions in the same
+file). Do both.
+
+_(Also still open from earlier: M1-M4 paid-render integrity, the four §12 bugs, and
+`services/siteTaxonomyService.js` is still uncommitted and needs review + a harness.)_
+
+## VETTED 2026-07-31 — the parallel-HTML / double-spend diagnosis is STALE
+
+A remote session concluded that a `direct_overlay` brand still runs an HTML-seeded, billable
+image-ref shadow, and recommended flipping `AI_IMAGE_REFERENCE_ENABLED=false` +
+`IMAGE_REF_DUMP_SEEDS=false`. **The mechanism it describes is real in the source, but it has not
+run since 2026-07-30 22:45 UTC.** Measured on prod logs for all of 2026-07-31:
+
+| marker | hits on 07-31 |
+|---|---|
+| `🖼 image-ref shadow` (billable shadow) | **0** — last ever 07-30 22:04 |
+| `🌐 [render] HTML path` | **0** — last ever 07-30 22:45 |
+| `🖼️ direct-image ready` | **7** (all `model=openai/gpt-image-2/edit`) |
+
+Cause of the fix: `17c5e3e` widened the direct-image guard so **every** static `ai_*` render enters
+`renderService.js:439` and returns at `:469` on success — before the eager `ensureCanvasAndHtml` at
+`:492`. Since `getOrGenerate` is only reachable from `ensureCanvasAndHtml` (plus inspector routes
+`routes/aiCanvasSpec.js:67`, `routes/layout.js:51,165`), the shadow sites at
+`aiCanvasSpecService.js:1329` and `:1582` cannot fire on the ad-gen path. Confirmed independently
+by a Grok repo-wide caller trace. `routedToHtml` (the only HTML entry) has **zero** log hits ever,
+so no brand has been deliberately routed to HTML.
+
+**Two corrections to that write-up, both load-bearing:**
+
+1. **Editing `config/defaults.env` for these flags is a NO-OP in prod.** All 8 pipeline flags
+   (`AI_IMAGE_REFERENCE_ENABLED`, `IMAGE_REF_DUMP_SEEDS`, `AI_IMAGE_REF_MODEL_ID`,
+   `AI_IMAGE_REF_QUALITY`, `AI_HTML_LAYOUT_ENABLED`, `AI_LAYOUT_DIRECT_HTML`, `RENDER_USE_HTML`,
+   `RENDER_USE_RESOLVED`) are set as **Render dashboard env vars** (verified via
+   `GET /v1/services/{id}/env-vars`). `index.js:1-5` loads the real environment FIRST and
+   `defaults.env` second, and dotenv never overrides an already-set var — the comment there says
+   so. So the dashboard wins; change flags there, not in the file. Nothing is trapped behind an
+   un-editable `.env`.
+2. **The `refresh:true` bypass is not a live hole.** `aiImageReferenceService.js:79`
+   (`if (!enabled() && !refresh)`) would skip the env gate, but no caller passes `refresh:true`
+   to image-ref anywhere in the repo, and no HTTP route invokes `generateForArtifact` — routes only
+   read existing artifacts.
+
+**What the live `direct_overlay` path actually is** (matters, because expectations have drifted):
+gpt-image-2 produces a **text-free plate**, then sharp/SVG composites headline/CTA/logo locally —
+`directImageRenderService.js:435` (`sharp(plate).composite(layers)`), header comment at `:1-5`: the
+image model "is deliberately never asked to render copy, prices, CTAs, or logos." That is exactly
+the UI's "Direct image + exact overlay". A pipeline where gpt-image-2 renders the **whole** ad
+including copy **does not exist** — `git log --all` has no commit removing the overlay compositing,
+and `models/Brand.js:255` still enumerates only `['direct_overlay','html']`, matching the two
+choices in the UI. So a 07-31 ad that looks flat/unpolished is the direct-overlay output behaving as
+designed; the photoreal "polish" is precisely the shadow that stopped running. Adding an
+all-to-gpt-image-2 path is **new work / a third enum value**, not a flag flip.
+
+**Still-open money bug (dormant, not fixed):** `aiImageReferenceService.js:55-58`
+`estimateCostUsd(size)` returns $0.042/$0.063 — medium-tier **gpt-image-1** prices — while prod runs
+`AI_IMAGE_REF_QUALITY=high` on **gpt-image-2**. The file's own comment at `:38` puts high at $0.167
+per 1024². So every `AiFullRenderArtifact.costEstimateUsd` under-reports by roughly 4×. Harmless
+while the shadow is off; wrong the instant anyone re-enables it. Per CLAUDE.md the real number must
+come from the Atlas catalog (`price.actual.base_price`), not this hardcoded table.
+
+## Ops access — live Render shell + logs (set up 2026-07-31)
+
+You can now get a shell **inside the running production service** and read its logs
+without the dashboard. Use this instead of guessing at prod state.
+
+**Services** (workspace `Reach-Social`, region oregon, both on branch `main`):
+
+| alias | service | id | plan |
+|---|---|---|---|
+| `backend` | `liquidretail-backend` web | `srv-d1vuktqli9vc73ft07ng` | pro_plus |
+| `worker` | `liquidretail-backend-yjmx` background worker | `srv-d8128c1o3t8c73e8kb30` | pro |
+
+**Shell — `~/bin/render-ssh <alias> '<cmd>'`** (on PATH):
+
+```bash
+render-ssh backend 'echo $RENDER_GIT_COMMIT; ls -la uploads | head'
+render-ssh worker  'ps aux | head'
+render-ssh backend                       # no cmd -> interactive shell
+```
+
+App root is `/opt/render/project/src`, node v22.23.2, user `render`.
+
+**Why the wrapper exists — do not "simplify" it away.** Render's SSH gateway is
+**interactive-only**: it accepts publickey auth and then closes the channel on an
+`exec` request, so plain `ssh <srv>@ssh.oregon.render.com 'cmd'` always dies with
+`Connection closed by remote host` — and `-tt` alone does **not** fix it. The wrapper
+allocates a real PTY via `script(1)`, feeds the command over stdin, fences output with
+markers to strip prompt/echo noise, and propagates the remote exit code. `render ssh`
+(the CLI) is interactive-only too, by its own `--help`.
+
+`~/.ssh/config` also has `render-backend` / `render-worker` aliases, but those are for
+**interactive** shells only, same reason.
+
+**Command length limit — bit me, now guarded.** The remote PTY is in canonical mode with a ~1KB
+input line buffer. A longer single line is silently truncated, leaving the remote shell blocked on
+an unterminated quote: the session hangs to timeout with **zero output**, which looks exactly like
+a network fault. Cost real time inlining a base64'd diagnostic script. The wrapper now refuses
+commands over 900 chars with a clear message. To run a real script on the instance, have the remote
+fetch it rather than inlining it. Also note `node` resolves `require()` from the **script's**
+directory, not cwd — a script in `/tmp` cannot see the app's `node_modules` (from
+`/opt/render/project/src`, `require('mongoose')` takes 193ms and works fine).
+
+**Auth.** Dedicated key `~/.ssh/render_ed25519`
+(`SHA256:I+6baPoiIguPGND0d01/ZoN4VtQLW8fnbPkSnZ0HH6A`), registered on the Render
+account as **"claude-code-diagnostics (The-Box)"**. Deliberately separate from the
+`nicknsheth-beep` GitHub key so it can be revoked on its own — Account settings → SSH
+Public Keys. The public API has **no** ssh-keys endpoint (404); key registration is
+dashboard-only.
+
+**Logs — works non-interactively, no SSH needed:**
+
+```bash
+render logs --resources srv-d1vuktqli9vc73ft07ng --limit 50 --output text --confirm
+```
+
+Add `--text <substr>`, `--level error`, or `--tail` to narrow. `render psql` is
+available if a Render Postgres is ever added (workspace currently has 4 services, no
+managed DB). CLI tokens expire **7 days** after creation — on auth failure run
+`render login`.
 
 ## Current state (2026-07-31, later) — social proof judged by inference
 
@@ -448,6 +638,9 @@ A fresh independent Grok adversarial pass (run before merging, on the staged dif
 - Multi-instance caveat: retitle/preview job stores are in-memory (single-instance).
 - Canvas engine still scrim-based + brand-font-poor by design — only reachable via custom scripts or explicit engine override now.
 - **Not yet verified** (raised by the adversarial pass, plausible but unconfirmed): `plateIntelService.analyzePlate`'s `BANDS` were retuned for vertical's new safe zone, but the function takes no `format` param — could misapply vertical geometry if `titlePlacementMode:'content'` is ever used on a feed-format ad. Narrow blast radius (content mode is opt-in; default is canonical). Worth a look before anyone flips a brand to content mode on feed placements.
+- **`postinstall`'s `npx remotion browser ensure` has never once succeeded** — found 2026-07-31 via live prod logs. Every build logs `npm error could not determine executable to run` (~10×/day across deploys, seen at 05:37, 06:43, 12:01, 17:32 …). Cause: the `remotion` CLI binary ships in **`@remotion/cli`**, which is **not a dependency** — 13 `@remotion/*` packages are installed at 4.0.495, `@remotion/cli` is absent, so `node_modules/.bin/remotion` does not exist. The `|| true` in `postinstall` swallows it and the build still reports "Build successful 🎉".
+  **Currently harmless, but latent.** Verified on the live instance that a working browser *is* present anyway: `node_modules/.remotion/chrome-headless-shell/linux64/.../chrome-headless-shell`, 219MB, executable, reports **Chromium 149.0.7790.0**. It arrives via the tracked-`node_modules` tree / build cache (mtime matches build time), **not** via the ensure step. So Remotion renders fine today — the risk is that the repair step is a no-op: if that binary is ever missing from the cache or the tracked tree, nothing self-heals it. This is the same failure shape as the Puppeteer-cache bug already recorded in the workspace `session.md`.
+  Fix is either add `@remotion/cli` as a devDependency, or drop the dead `npx remotion browser ensure` and rely on `@remotion/renderer`'s own `ensureBrowser()`. **Do not** just delete the `|| true` — that would turn a silent no-op into a hard build failure.
 
 ## Session log
 - 2026-07-22: All of the above implemented (Grok CLI drafted; Fable reviewed line-by-line + one hand-edit: guardrail defaults to Reels bands when chrome=None; adversarial Grok pass run pre-commit). Owner decisions: corrections now / calibrate later; guardrail toggle yes; tighten vertical safe zone now.
