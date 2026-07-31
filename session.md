@@ -3,7 +3,81 @@
 ## Next-session prompt
 _(empty — no pending owner prompt)_
 
-## Current state (2026-07-31) — static-ad correctness pass, VERIFIED LIVE
+## Current state (2026-07-31, later) — social proof judged by inference
+
+Backend `main` @ **PR #40**. Merged since the block below: #36 #37 #38 (render
+timeout + recovery), **#39** (proof judge), **#40** (platform surfaces).
+
+### #39 — comments are judged by inference at ingest, not by keyword
+`hasPositiveSignal` was a regex lexicon: a comment counted as praise if a
+positive word appeared in it. It accepted *"Not great, would not buy again"*
+because "great" is in it; adding a complaint blocklist then rejected
+*"Hasn't faded at all after a year, love it"* because "faded" is — which is
+**risk reversal**, the single most persuasive thing a customer can write and the
+form the snippet prompt is explicitly told to prefer. An allowlist and a
+blocklist cannot both be right about a negation.
+
+The decision is now one batched inference call, made **once at ingest** and
+persisted to `Comment.proofJudgment`; the same call returns the ad-ready
+shortened line, so a comment is judged and shortened exactly once (~$0.00002
+per set, `review-text` role). **Five consumers read that one verdict** — four
+previously each decided for themselves with three different answers, and the
+Director had no screen at all: it got the most-liked comments verbatim,
+truncated to 180 chars, so a complaint could seed the concept an entire ad was
+built around. Every consumer now over-fetches and lets the judge narrow, rather
+than taking top-N by likes and screening after (on a popular post the top
+comments are noise while real praise sits below the cut). **No lexical
+fallback** — Atlas, then the direct provider, then alert and throw; one shared
+policy turns that into zero comments, never a raw one, because an unavailable
+*comment* judge must not kill an ad holding 4.5★ review quotes.
+Full rationale + failure table: **`docs/PROOF_JUDGE.md`**.
+
+Reviews are deliberately NOT run through it — they carry the reviewer's own
+stars (4.5 gate) and their text already passes through `extractSnippet`.
+
+Also in #39, from a PR #34 compatibility audit: the **product quote tier was
+structurally empty on every hydrated match** (hydration writes `productReviews`
+top-level; the read site looked only at `identification.details`), so #34's
+whole scraped-review engine never reached an ad and nothing failed — the ad just
+quoted a category review instead. Plus: two disagreeing star floors collapsed to
+one (`QUOTE_MIN_RATING` 4.5), ratings normalized before every comparison (a
+90/100 added **+85** to a single-digit text score and won outright), the dead
+`quote-snippet`→`gpt-5-nano` role deleted, and snippet cost no longer attributed
+to a null product.
+
+### #40 — every declared platform surface is first-class
+`platformFormats.js` lists five surfaces; three places kept hand-written
+subsets. `AiCanvasArtifact`'s enum had 2 of 5, so **Stories / Feed 4:5 / PMax
+could not persist a canvas spec at all** (ValidationError).
+`buildFormatConstraintsBlock` was `if (reels) else {feed 1:1}`, so **Stories was
+told it was square with no safe zones** when it reserves 250px top and bottom
+for the creator chip and reply input. `ARCHETYPE_WEIGHTING` had no Stories
+entry. All three now table-driven; `scripts/verifyPlatformSurfaces.js` (51
+checks) asserts the table IS the contract.
+
+### Open, for the owner
+- **Per-surface canonical templates** (owner authoring later). Instruction-level
+  plumbing is ready. Still keyed by ASPECT RATIO not surface: canvas template
+  variants, and Remotion titling (Stories and Reels share the `vertical`
+  geometry class). Needed only if templates must differ at the geometry level.
+- **`isReels` contract call.** It picks the video-storyboard output shape for
+  `meta_reels_9_16` only. Stories accepts image AND video, so Stories video gets
+  the static shape. Generalizing renames the Director's output schemas.
+- **A real generation has NOT been re-run since the 600s timeout fix** (#37).
+  Last real batch: 3/3 failed at the old 60s bound. Still the top verification.
+- **`preparing`-phase status detail** — `GET /api/ads/runs/:runId` publishes no
+  stage, so the UI can only show a bare spinner.
+- **Reclaim pass** for abandoned-but-paid Atlas renders (unblocked by #38).
+- `scoreQuote`'s `NEGATIVE_SENTIMENT` still hard-rejects a 5★ risk-reversal
+  review quote. Same class of bug as #39, on the review ranking path.
+
+Harnesses, all green: `verifyPlatformSurfaces` 51, `verifyQuoteGate` 47,
+`verifySubmitGuard` 31, `verifyImagePricing` 9, `testAdRunSelection` 12,
+`verifyTitlingFormats` 49.
+
+---
+
+## Earlier state (2026-07-31) — static-ad correctness pass, VERIFIED LIVE
 
 Backend `main` @ PR #34. Frontend `master` @ PR #19. Everything below is
 merged, deployed, and **confirmed in a real generated ad** (not just code
