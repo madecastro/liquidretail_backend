@@ -371,7 +371,15 @@ router.post('/generate', async (req, res) => {
           return;
         }
 
-        adIds = await selectAdsForRun({ campaignId, limit: MAX_CREATIVES_PER_RUN });
+        // Scope to the product(s) the operator actually picked. Unscoped, this
+        // renders the campaign's OLDEST queued ads (see selectAdsForRun), so a
+        // Generate for one product filled most of its 20 slots with leftovers
+        // from earlier sessions for OTHER products — and billed for them.
+        adIds = await selectAdsForRun({
+          campaignId,
+          limit: MAX_CREATIVES_PER_RUN,
+          productIds
+        });
         if (!adIds.length) {
           await CampaignRun.updateOne(
             { _id: run._id },

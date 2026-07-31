@@ -864,7 +864,35 @@ async function expandWizardJob({
 // Selection — "next N queued ads for this campaign, ranked by
 // readinessScore desc (videos with null score sort last, FIFO by
 // queuedAt as tiebreaker)." Returns Ad IDs (strings).
-async function selectAdsForRun({ campaignId, limit }) {
+async function selectAdsForRun({ campaignId, limit, productIds = null }) {
+  // productIds (optional) SCOPES the selection to those products.
+  //
+  // Without it this selects on { campaignId, status:'queued' } alone, and tier
+  // 0 sorts queuedAt ASCENDING — so pressing Generate for one product renders
+  // the OLDEST queued ads on the campaign, which routinely belong to a
+  // DIFFERENT product from an earlier session. One product yields ~1-5 ads, so
+  // a 20-slot run fills the remaining ~15 from that backlog and the operator
+  // watches an unrelated product render as "1 of 20".
+  //
+  // Scoping by product rather than by the ids expandWizardJob just inserted is
+  // deliberate: the unique index on (campaignId, identityDigest) means a repeat
+  // Generate for the same product inserts NOTHING (newAdIds comes back empty)
+  // while that product's ads sit in 'queued' from the earlier press. Selecting
+  // on productId picks up both the new rows and those.
+  const asked = Array.isArray(productIds) ? productIds.filter(v => v != null && v !== '') : [];
+  const scoped = asked.map(toObjectId).filter(Boolean);
+  // FAIL CLOSED. An empty/absent list means "no scoping" (brand-only ads carry
+  // productId:null and must still be selectable). But a NON-EMPTY list whose
+  // ids are all malformed means the caller asked to scope and we could not —
+  // widening to the whole campaign there would re-create the exact bug this
+  // parameter exists to fix, silently and while spending money.
+  const productScope = scoped.length
+    ? { productId: { $in: scoped } }
+    : (asked.length ? { _id: { $in: [] } } : {});
+  if (asked.length && !scoped.length) {
+    console.warn(`⚠️  selectAdsForRun: ${asked.length} productId(s) supplied but none were valid ObjectIds — selecting nothing rather than the whole campaign`);
+  }
+
   // Tier 0 — DETERMINISTIC baseline video ads (Phase 3) drain FIRST so the
   // guaranteed per-product standard video always renders before optional
   // director variants / concept images can fill the run cap. Discriminator:
@@ -874,7 +902,8 @@ async function selectAdsForRun({ campaignId, limit }) {
   // (plus any pre-Phase-3 legacy veo ads, which rendering first is harmless).
   const det = await Ad.find({
     campaignId, status: 'queued',
-    conceptId: null, judgeRank: null, renderRoute: 'veo'
+    conceptId: null, judgeRank: null, renderRoute: 'veo',
+    ...productScope
   })
     .sort({ queuedAt: 1 })
     .limit(limit)
@@ -888,7 +917,7 @@ async function selectAdsForRun({ campaignId, limit }) {
   // remaining slots by readinessScore. Separate queries because MongoDB
   // sorts nulls before non-nulls in ASC order.
   const afterDet = limit - detIds.length;
-  const v2 = await Ad.find({ campaignId, status: 'queued', judgeRank: { $ne: null } })
+  const v2 = await Ad.find({ campaignId, status: 'queued', judgeRank: { $ne: null }, ...productScope })
     .sort({ judgeRank: 1, queuedAt: 1 })
     .limit(afterDet)
     .select('_id')
@@ -902,7 +931,8 @@ async function selectAdsForRun({ campaignId, limit }) {
   const detOids = det.map(r => r._id);
   const v1 = await Ad.find({
     campaignId, status: 'queued', judgeRank: null,
-    _id: { $nin: detOids }
+    _id: { $nin: detOids },
+    ...productScope
   })
     .sort({ readinessScore: -1, queuedAt: 1 })
     .limit(remaining)
