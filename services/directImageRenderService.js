@@ -32,6 +32,10 @@ const CatalogProduct = require('../models/CatalogProduct');
 const Media = require('../models/Media');
 const intents = require('./staticAdIntents');
 const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
+// Defence in depth. layoutInputService already withholds these at pool
+// assembly, so this gate should never fire — it exists because an artifact
+// cached before the producer-side filter landed can still carry one.
+const { isPrintableCustomerQuote } = require('./quoteProvenance');
 
 const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
@@ -372,22 +376,40 @@ function intentForTemplate(template) {
 function buildIntentData({ concept, layoutInput, brand, cta }) {
   const copy = concept?.copy_picks || {};
   const proof = layoutInput?.social_proof || {};
-  const quote = proof.primary_quote || null;
+  // ALLOWLIST. A quote reaches the pixels only if something positively vouched
+  // for it — never merely because nothing flagged it.
+  const quote = isPrintableCustomerQuote(proof.primary_quote) ? proof.primary_quote : null;
+  if (proof.primary_quote && !quote) {
+    console.log(
+      `🔒 direct-image: quote withheld (tier=${proof.primary_quote.tier || 'unstamped'} ` +
+      `origin=${proof.primary_quote.origin || 'unstamped'}) — rendering this ad with no testimonial`
+    );
+  }
 
-  // Verbatim only. `snippet` is the <=50-char word-safe form of the SAME
-  // sentence (extractive, verified non-paraphrasing upstream), so it is a legal
-  // shortening — prefer it because the model has to typeset this.
+  // `snippet` is the <=50-char word-safe shortening of the SAME sentence. It is
+  // preferred because the model has to typeset this, and a 200-character quote
+  // set at testimonial size is unreadable at feed scale.
   const quoteText = quote ? String(quote.snippet || quote.text || '').trim() : '';
 
   return {
-    rating: typeof proof.rating_value === 'number' ? String(proof.rating_value) : undefined,
+    // `> 0` on BOTH, and an upper bound. typeof 0 === 'number', so the old test
+    // printed a rating of zero as the string "0" — a zero-star rating typeset on
+    // an advertisement. review_count already had this guard; rating did not, and
+    // the asymmetry sat on adjacent lines. The 0-5 bound catches a vendor that
+    // reports a 0-100 scale, which would otherwise render as "87 stars".
+    rating: typeof proof.rating_value === 'number' && proof.rating_value > 0 && proof.rating_value <= 5
+      ? String(Number(proof.rating_value.toFixed(1)))
+      : undefined,
     reviewCount: typeof proof.review_count === 'number' && proof.review_count > 0
       ? proof.review_count
       : undefined,
     quote: quoteText || undefined,
-    // Only ever the reviewer's own byline. normalizeQuote already resolves this
-    // to "Anonymous Customer" when there is no name and no verified purchase,
-    // which claims only that someone reviewed the product.
+    // The reviewer's OWN name or no byline at all. normalizeQuote no longer
+    // manufactures one: it used to fall back to the quote's `source` — a site,
+    // which is how "vertexaisearch.cloud.google.com" became the customer who
+    // said the words on 80 live artifacts — and then to "Verified buyer" or
+    // "Anonymous Customer", which assert things about a person we cannot name.
+    // An unattributed real quote is honest. An attributed fake is not.
     attribution: quoteText && quote?.author_name ? String(quote.author_name).trim() : undefined,
     // The Director's line. Not the product name — that is dropped entirely by
     // owner instruction and is separately forbidden in the absence block.

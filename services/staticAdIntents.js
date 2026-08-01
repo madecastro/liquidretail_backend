@@ -438,7 +438,7 @@ THIS PRODUCT HAS NONE OF THE FOLLOWING, so none of it may appear:
 ${absent.map(a => `  — ${a}`).join('\n')}
 If an element is not listed in the text above, it does not exist. Leave the space empty rather than filling it — empty space is a legitimate design choice and inventing proof is not.
 
-Keep the ${product.logoCorner || 'bottom-right'} corner OF THE SAFE BOX described below clear of text and graphics — not the corner of the frame you are generating. The real logo is composited into that space afterwards, and it is placed inside the safe box because anything outside it is either cut away by the delivery crop or covered by the platform's own interface.
+Keep the ${product.logoCorner || 'bottom-right'} corner clear of text and graphics — the corner of the SAFE BOX described below, not of the frame you are generating. The real logo is composited into that space afterwards, inside the safe box, because anything outside it is either cut away by the delivery crop or covered by the platform's own interface.
 
 ${geometryBlock(s)}`;
 
