@@ -2,82 +2,80 @@
 
 ## Next-session prompt
 
-### PICK UP HERE (2026-07-31, late) — retro review found FABRICATED PROOF shipping live
+### PICK UP HERE (2026-07-31, later) — proof + geometry blockers FIXED, one decision waiting
 
-Full review output is committed at `docs/reviews/retro-2026-07-31-*.md`. Read
-`4-creative.md` FIRST — it is the one that matters and it found blockers.
+Three commits on `feat/render-activity-board`, **not yet pushed, no PR**:
+`10c9479` geometry, `64bf6d6` fabricated proof, `52e5a08` snippet inversion.
+All 14 `scripts/verify*.js` green. Each fix is revert-proven.
 
-**FIX THESE FIRST — they violate the owner's "never invent proof" rule in production:**
+#### THE ONE DECISION WAITING FOR THE OWNER
 
-1. **BLOCKER — invented customer quotes ship as proof.** `layoutInputService.js:1889-1941`
-   builds the quote pool with SIX tiers. Tiers 5-6 are **not real reviews**: tier 5 is
-   LLM "notional" persona quotes (`:1179-1182` literally asks for notional reviews), tier 6
-   is `synthesizeQuoteFromReviewSummary` — the first sentence of an LLM *summary*, stamped
-   `origin:'synthesized', verbatim:false` (`:1676-1691`). `buildIntentData`
-   (`directImageRenderService.js:240-247`) maps `primary_quote.snippet || .text` with **no
-   `origin`/`verbatim` check**, so those strings are typeset into the ad as a customer
-   testimonial. FIX: reject any quote whose `origin` is synthesized/llm or whose
-   `verbatim !== true` before it reaches the intent mapper.
-2. **BLOCKER — attribution invents identity.** `layoutInputService.js:1548-1550`
-   `author_name: q.author_name || q.author || q.source || (verified ? 'Verified buyer' :
-   'Anonymous Customer')`. So an ad can print `— Verified buyer` with no name (owner rule is
-   "Anonymous Customer" only when there is no name), or `— <source>` using a platform label
-   as a person's byline.
-3. **HIGH — snippet is not always the full quote.** `buildIntentData:240` prefers
-   `primary_quote.snippet`, which `quoteSnippetService.js:134-166` may produce by mechanical
-   truncation ending in `…`. It is then wrapped in quotation marks as if it were the
-   customer's whole sentence, which can invert meaning if the rest qualified the praise.
-4. **HIGH — category-tier quote on a product ad.** `layoutInputService.js:1896-1931` tier 2
-   is "same category on this brand", not this SKU. The brand-tier guard at `:1914-1918` was
-   written to stop exactly this class; one tier up is still open.
-5. **HIGH — Director headlines can fabricate proof.** `validateDirectorPayload:959-961` only
-   blocks the product NAME and price/discount regexes. It does not block invented scale,
-   ratings, awards or "10,000 women swear by this", which then ship as `BRAND LINE`.
-6. **MEDIUM — rating not canonically formatted.** Director rounds
-   (`aiCreativeDirectorService.js:440` `toFixed(1)`); the static intent does not
-   (`buildIntentData:243` `String(proof.rating_value)`), so `4.85` ships as `"4.85 ★"`.
-   Also `rating_value: 0` becomes the string `"0"` and passes the eligibility check.
+`services/quoteProvenance.js` — `PRINTABLE_QUOTE_ORIGINS` currently EXCLUDES
+`'llm-web'`. That is ~82% of all quotes in the database, so **most ads now ship
+with no testimonial**. One-line flip in that file if the owner wants them back.
 
-**THEN the three builds the owner asked for, in this order:**
+Measured 2026-07-31 against prod, and this is the context for the decision:
+of 1073 catalog products carrying reviews, **883 are `gemini-search`** (3345
+quotes, LLM web search) and **190 are unlabelled storefront imports** (748
+quotes, per-quote `source:'store'`). **ZERO first-party review scrapes exist.**
+So there is no "real" review capture to fall back on — the honest options are
+(a) ship fewer testimonials, (b) accept LLM-extracted third-party quotes with
+honest attribution, or (c) build first-party review scraping.
 
-- **A. Video fan-out — 1 generation = 3 sizes.** Owner: "1 generation = 3 sizes regardless of
-  the size chosen", and "veo should only generate a video once for each product unless it is
-  revised or another custom video is selected". Design is SETTLED and must stay race-free:
-  **queue ONLY the 9:16 master; create the 4:5 and 1:1 rows AFTER its `veoVideoUrl` lands**,
-  reusing `services/videoCropUrl.js` (already live-probed) via the existing
-  `basePlateCropService` face-safe crop. DO NOT queue all three and have each check "does a
-  master exist" — `VEO_CONCURRENCY` is now **4**, so all three would submit at once and bill
-  3x. Facts already verified: `omniFamilyNativeFor` returns `'9:16'` for ANY aspect < 1, so
-  4:5 and 1:1 ALREADY generate at 9:16 and crop down; `computeDeterministicVideoDigest`
-  includes `platformFormat` so 3 rows will not collide; `expandDeterministicVideo` currently
-  emits ONE row (`aspectRatio` is a single value at `:1813`).
-- **B. Safe-zone unification.** TWO unreconciled tables: `platformFormats.safeArea` (canvas
-  PIXELS, read by `htmlValidationService` for static) and `remotion/lib/safeZones.js`
-  `SAFE_ZONES` (FRACTIONS, keyed by ASPECT CLASS). Because `classifyFormat` collapses Reels
-  and Stories both to `'vertical'`, **their overlays are identical today** despite declared
-  reserves of 204 vs 250. NOTE: titling IS safe-zone aware (`vertical` = top 14% / bottom
-  35%, and `stackContainerStyle` clamps) and is currently MORE conservative than Meta
-  requires, so nothing is drawn under chrome today — an earlier claim in this session that
-  titling was "not aware" was WRONG. Also unresolved: Stories' `250` looks denominated in
-  DELIVERY pixels while Reels' `204` is canvas-space (220 x 1778/1920 ≈ 204), so Stories
-  over-reserves ~1pp. Make `platformFormats.safeArea` the single source of truth and derive
-  Remotion per SURFACE.
-- **C. Status screen UI + copy button.** Backend is DONE and merged-pending:
-  `GET /api/ads/render-activity` returns technical rows (status, live stage + age, `stalled`
-  past 600s, pipeline, model, predictionId, per-stage timings, intent resolution, asset URL,
-  error, all ids, requester) plus a server-built `diagnostic` one-paste block per row. Owner
-  wants it technical, with assetID, and a copy button that emits that block.
+#### WHAT WAS ACTUALLY WRONG (all verified against prod, not inferred)
 
-**Owner process instruction (standing, from this session):** run Grok adversarially on EVERY
-diff — it caught the fan-out cap bug and a false runtime prompt string that I missed, and the
-creative retro above. There is NO limit on how much Grok is used. But note the worst defects
-this session were found by testing against REALITY, not by reading: the second POLISHING copy
-(found by grepping the DEPLOYED bundle), the `populate('requestedBy')` crash (found by running
-the query on prod), and the cross-tenant leak (found by comparing to conventions in the same
-file). Do both.
+- Provenance was **inert end to end**. 718/718 layout artifacts had `origin`
+  unstamped; 0/1073 products and 0/74 categories had a quote-level stamp.
+  `quoteTier` was computed, logged, and thrown away. Every gate built on
+  `origin` was decorative.
+- Live bylines included `Verified buyer` (104), `Reddit (r/BuyItForLife)` (41),
+  `Peloton Apparel` (145) and `vertexaisearch.cloud.google.com` (**80**) — sites
+  and claims printed as the customer who said the words.
+- `dimsFor()` returned `canvas` values (a 1000px HTML reference width) while the
+  prompt promised `deliveryDims`; its `default` squared everything unnamed, so
+  **pmax 16:9 shipped as a square**.
+- Sharp ran `fit:'cover', position:'attention'` — a saliency crop — while the
+  prompt told the model a specific CENTRED band would be cut away.
+- The logo was composited 150px inside Stories' 250px reply-bar reserve.
+- `isExtractive` was substring containment, so `'worth it'` extracted from
+  `'Not worth it for the price'` passed and inverted the review.
 
-_(Also still open from earlier: M1-M4 paid-render integrity, the four §12 bugs, and
-`services/siteTaxonomyService.js` is still uncommitted and needs review + a harness.)_
+#### STILL OPEN, IN PRIORITY ORDER
+
+1. **B5 — Director headline is unvalidated** (retro blocker, NOT fixed).
+   `copy_picks.headline` goes straight to the image prompt and can assert a
+   price, a discount, a guarantee, a superlative or a clinical claim with
+   nothing checking it. Grok drafted a validator; the reconcile agent rejected
+   5 of its regex arms as too blunt (bare `\blifetime\b`, `\bforever\b`) —
+   the owner's rule is that creative must not be lobotomised by a blunt gate.
+   Full proposal: `/private/tmp/.../scratchpad/proposals.json` key
+   `B5-director-headline`, and the narrowings are in `_PLAN.rejected`.
+2. **Producer still ASKS for fabricated quotes.** `layoutInputService.js:1171-1182`
+   still prompts for "NOTIONAL persona-authored reviews". They are dropped at
+   pool assembly now, but it is paid tokens for output that is always discarded,
+   and it is a loaded gun if someone re-wires `derivation.quotes`.
+3. **HTML + video paths.** The provenance gate is producer-side so they inherit
+   it, but Remotion brand scripts hold their own byline defaults — check for
+   more manufactured attributions like the `metaCascadeConfig` one already fixed.
+4. **Build A: video fan-out** — 1 generation = 3 sizes, race-free (queue 9:16
+   master only; create 4:5/1:1 after `veoVideoUrl` lands), reuse `videoCropUrl`.
+5. **Build B: safe-zone unification** — `platformFormats.safeArea` as the single
+   source; `remotion/lib/safeZones.js` still keys per ASPECT CLASS, so Reels 204
+   and Stories 250 collapse into one `vertical` entry.
+6. **Build C: status screen UI + copy button** (backend done, on this branch).
+7. `feat/render-activity-board` has never had a PR opened.
+
+#### PROCESS NOTE THAT PAID OFF
+
+Grok reviewed every diff before it landed and caught three things that would
+have shipped: geometry validation placed AFTER the billable submit, an
+allowlist forgeable via `source` (fixed by stamping `origin`, which
+DERIVATION_SCHEMA cannot emit), and a `stampOrigin` else-arm that would have
+laundered every legacy category row as printable. Grok also correctly refuted
+one of my own claims (`dimsFor` mirrors `canvas`, it is not a rogue table).
+Two Grok calls died after the preamble when the prompt carried a full diff —
+Grok reads the working tree itself, so pass pointers, not diffs.
+
 
 ## VETTED 2026-07-31 — the parallel-HTML / double-spend diagnosis is STALE
 
