@@ -161,6 +161,35 @@ for (const [value, expected] of [[0, undefined], [-5, undefined], [12, 12], [nul
     d.reviewCount === expected, `got ${JSON.stringify(d.reviewCount)}`);
 }
 
+// ── P5: shortening must not invert the review ───────────────────────────
+// The snippet is what the model typesets, so a shortening that flips a
+// complaint into praise puts words in a named customer's mouth. The old check
+// was plain substring containment, which passes every one of these.
+const snippets = require('../services/quoteSnippetService');
+const EXTRACTS = [
+  // Negation-stripped: legal substrings, inverted meaning.
+  ['worth it', 'Not worth it for the price', false],
+  ['sure about the fabric', "I wasn't sure about the fabric", false],
+  ['holds up', 'It never holds up in the wash', false],
+  ['really sure', 'I was not really sure about it', false],
+  ['comfortable', "These are hardly comfortable after an hour", false],
+  // Clean extracts must still pass, or the fix has broken the feature.
+  ['I would buy again', 'I would buy again in a heartbeat', true],
+  ['true to size', 'Runs true to size and washes well', true],
+  ['still looks new', 'Still looks new after eight months', true],
+  // A repeated span: the FIRST occurrence is negated, a later one is not.
+  ['worth it', 'Not worth it at first, but honestly worth it now', true],
+  // Word boundaries: the old character test matched 'art' inside 'start'.
+  ['art', 'I love the start of every season', false],
+  // Paraphrase / reordering must still be rejected.
+  ['fabric the about sure', 'I was sure about the fabric', false],
+  ['incredibly soft', 'The fabric is soft', false]
+];
+for (const [snippet, source, expected] of EXTRACTS) {
+  check(`P5 extract ${JSON.stringify(snippet)} from ${JSON.stringify(source)} -> ${expected}`,
+    snippets.isExtractive(snippet, source) === expected);
+}
+
 if (failures.length) {
   console.error(`\n❌ quote provenance: ${failures.length} FAILED, ${pass} passed\n`);
   failures.forEach((f) => console.error(`   • ${f}`));
