@@ -88,20 +88,160 @@ const UPLOAD_TIMEOUT_MS = Number(process.env.AI_DIRECT_UPLOAD_TIMEOUT_MS || 20_0
 // `value || default` coercion per caller is how a pipeline flag drifts.
 
 
-// Delivery dimensions only. `overlayStart` is gone with the overlay renderer,
-// and `atlasSize` is gone too: the GENERATION size now comes from the intent
-// module's surface computation, because the prompt's geometry block tells the
-// model in as many words which pixels will survive the crop ("the top and bottom
-// 256px of what you generate WILL BE CUT AWAY"). If this function chose the
-// generation size independently, that sentence could contradict the request we
-// actually send, and the model would protect the wrong region.
-function dimsFor(aspectRatio) {
-  switch (aspectRatio) {
-    case '4:5': return { width: 1000, height: 1250 };
-    case '9:16': return { width: 1000, height: 1778 };
-    case '1:1': return { width: 1000, height: 1000 };
-    default: return { width: 1000, height: 1000 };
+// Delivery geometry, derived from the one surface object the prompt was built
+// from. The GENERATION size comes from the intent module's surface computation,
+// because the prompt's geometry block tells the model in as many words which
+// pixels will survive the crop ("the top and bottom 128px of what you generate
+// WILL BE CUT AWAY"). If anything here chose a size independently, that sentence
+// could contradict the request we actually send, and the model would protect the
+// wrong region.
+//
+// That warning used to sit directly above a function that did exactly what it
+// warned against. `dimsFor(aspectRatio)` was a hand-written switch whose
+// `default` returned 1000x1000, so every aspect it did not name — '16:9' among
+// them — was silently squared, and a pmax landscape ad has been squashed into a
+// square since static fan-out started emitting pmax_16_9. The three sizes it did
+// name were the `canvas` fields of platformFormats.js (a 1000px reference width
+// belonging to the retired HTML/Puppeteer path), not the `deliveryDims` fields,
+// so the geometry block promised the model "delivered at 1080x1080" while Sharp
+// wrote 1000x1000. The comment above it was false about all four cases, the
+// 256px it quoted included: geometryBlock speaks the PER-EDGE half, so 4:5 reads
+// "128px".
+//
+// Split in two along the billable line. A submit to the image model is charged
+// on submit (CLAUDE.md §2), so every check that CAN run before it MUST run
+// before it — validating geometry after the pixels come back means paying for a
+// render we then refuse.
+
+/**
+ * Pre-submit. Frame-independent, so it runs before anything is charged.
+ *
+ * Validates that the surface can be delivered at all, and — the part worth
+ * having — asserts that its kept region scales UNIFORMLY to its delivery box.
+ * The caller resizes with fit:'fill', which is a pure scale only while those two
+ * share an aspect. A deliveryDims that drifted from its own aspectRatio would
+ * otherwise stretch every ad on that surface by a few percent, which is exactly
+ * the kind of wrongness that ships unnoticed for months.
+ */
+function deliveryGeometryFor(s) {
+  const [aw, ah] = String(s?.aspect || '').split(':').map(Number);
+  const [deliverW, deliverH] = String(s?.deliver || '').split('x').map(Number);
+  const [genW, genH] = String(s?.generate || '').split(/[x*]/).map(Number);
+  if (!(aw > 0 && ah > 0 && deliverW > 0 && deliverH > 0 && genW > 0 && genH > 0)) {
+    throw taggedError(
+      `surface ${s?.key || 'unknown'} has no usable delivery geometry ` +
+      `(aspect=${s?.aspect} generate=${s?.generate} deliver=${s?.deliver})`,
+      { alertLevel: 'error', alertKey: 'direct-image:surface-geometry' }
+    );
   }
+  // The kept region the geometry block promised the model, in generated pixels.
+  const c = s.cropPx || {};
+  const keepW = genW - (c.left || 0) - (c.right || 0);
+  const keepH = genH - (c.top || 0) - (c.bottom || 0);
+  if (!(keepW > 0 && keepH > 0)) {
+    throw taggedError(
+      `surface ${s.key}: crop ${JSON.stringify(c)} leaves a degenerate ${keepW}x${keepH} region of ${genW}x${genH}`,
+      { alertLevel: 'error', alertKey: 'direct-image:surface-geometry' }
+    );
+  }
+  const sx = deliverW / keepW;
+  const sy = deliverH / keepH;
+  if (Math.abs(sx - sy) / Math.max(sx, sy) > 0.005) {
+    throw taggedError(
+      `surface ${s.key}: kept region ${keepW}x${keepH} does not scale uniformly to ` +
+      `${deliverW}x${deliverH} (${sx.toFixed(4)} vs ${sy.toFixed(4)}) — refusing to stretch the creative`,
+      { alertLevel: 'error', alertKey: 'direct-image:surface-geometry' }
+    );
+  }
+  return { width: deliverW, height: deliverH };
+}
+
+/**
+ * Post-submit. The CENTRED extract, computed from the frame we actually got
+ * back rather than the frame we asked for — a model that returns an off-size
+ * image still gets cropped to the right aspect instead of being stretched.
+ *
+ * Centred is not a stylistic choice: geometryBlock tells the model a specific
+ * symmetric band "WILL BE CUT AWAY and never seen", so these are the pixels it
+ * was instructed to treat as already gone. The previous implementation ran
+ * `fit:'cover', position:'attention'`, a saliency crop that removes whichever
+ * edges Sharp's heuristic prefers — so the model protected one region and we
+ * discarded a different one, on every non-1:1 surface.
+ */
+function extractFor(s, frameW, frameH) {
+  const [aw, ah] = String(s?.aspect || '').split(':').map(Number);
+  if (!(frameW > 0 && frameH > 0)) {
+    throw new Error(`cannot crop a ${frameW}x${frameH} frame for surface ${s?.key}`);
+  }
+  const target = aw / ah;
+  let keepW = frameW;
+  let keepH = frameH;
+  if (frameW / frameH > target) keepW = Math.round(frameH * target);
+  else if (frameW / frameH < target) keepH = Math.round(frameW / target);
+  return {
+    left: Math.floor((frameW - keepW) / 2),
+    top: Math.floor((frameH - keepH) / 2),
+    width: keepW,
+    height: keepH
+  };
+}
+
+/**
+ * The prompt's safe box, in DELIVERED pixels.
+ *
+ * computeSurface expresses the box as percentages of the GENERATED frame,
+ * because that is the frame the model is drawing into. Anything composited
+ * afterwards lives in the delivered frame, so it has to cross two transforms to
+ * land in the same place the model was told to keep clear: subtract the crop,
+ * then scale the kept region up to the delivery box.
+ */
+function safeBoxInDeliveredPx(s, dims) {
+  const [genW, genH] = String(s.generate).split(/[x*]/).map(Number);
+  const c = s.cropPx || {};
+  const keepW = genW - (c.left || 0) - (c.right || 0);
+  const keepH = genH - (c.top || 0) - (c.bottom || 0);
+  const sx = dims.width / keepW;
+  const sy = dims.height / keepH;
+  const b = s.box || {};
+  return {
+    left:   Math.round(((b.left   / 100) * genW - (c.left || 0)) * sx),
+    right:  Math.round(((b.right  / 100) * genW - (c.left || 0)) * sx),
+    top:    Math.round(((b.top    / 100) * genH - (c.top  || 0)) * sy),
+    bottom: Math.round(((b.bottom / 100) * genH - (c.top  || 0)) * sy)
+  };
+}
+
+/**
+ * Where the composited logomark goes.
+ *
+ * Derived from the SAME safe box the prompt just described to the model, not
+ * from a margin chosen here. That distinction is the entire bug: the previous
+ * placement was a flat `top: height - 100`, which on Stories put the brand's
+ * logomark 150px inside the 250px reply-bar reserve — invisible in feed, on the
+ * one element the owner specified must be composited rather than drawn. Picking
+ * a fresh margin here instead would have reintroduced the same class of drift:
+ * measured against the real surfaces, a 4%-of-short-edge margin lands the mark
+ * outside the promised box on three of the four.
+ *
+ * Returns null when the box cannot fit the mark, so the caller skips the
+ * composite rather than placing it somewhere the model did not reserve.
+ */
+function logoPlacementFor({ surface, dims, logoW, logoH }) {
+  const box = safeBoxInDeliveredPx(surface, dims);
+  // Clamp the BOX into the delivered frame before placing anything in it, rather
+  // than clamping the result afterwards. Clamping afterwards can shove the mark
+  // back across the very edge the box exists to enforce — and the percentage
+  // round-trip does put an edge a pixel outside on 4:5 (top computes to -1), so
+  // this is not hypothetical arithmetic.
+  const left = Math.max(0, box.left);
+  const right = Math.min(dims.width, box.right);
+  const top = Math.max(0, box.top);
+  const bottom = Math.min(dims.height, box.bottom);
+  if (!(logoW > 0 && logoH > 0)) return null;
+  if (right - left < logoW || bottom - top < logoH) return null;
+  // Bottom-right of the clamped box. Inside it by construction, so there is no
+  // second adjustment that could invalidate the guarantee above.
+  return { top: bottom - logoH, left: right - logoW, width: logoW, height: logoH };
 }
 
 /**
@@ -361,7 +501,9 @@ async function renderDirectImage({
     );
   }
   const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl').lean() : null);
-  const dims = dimsFor(aspectRatio);
+  // Delivery dims are NOT derived here any more: they come from the surface the
+  // prompt is built from, a few lines below, so the size Sharp writes and the
+  // size the geometry block promised the model cannot disagree.
   // ONE reference by default: the media this ad was actually built from.
   //
   // This used to send the selected media AND the product's hero image on every
@@ -463,6 +605,10 @@ async function renderDirectImage({
   // is "WxH" chosen by least-crop arithmetic against this surface's aspect, so it
   // and the prompt can never disagree.
   const genSize = built.surface.generate;
+  // BEFORE the billable submit, deliberately. Everything this validates is known
+  // from the surface alone, and an image model call is charged on submit — so a
+  // surface we would refuse to deliver must be refused while it is still free.
+  const dims = deliveryGeometryFor(built.surface);
   const meta = { stage: 'direct_image', service: 'directImageRenderService', purposeTag: template || 'untagged', brandId: resolvedBrand?._id || brandId || null, productId: resolvedProduct?._id || productId || null, mediaId: mediaId || null };
   // When Atlas is configured, the established renderer is the recovery path.
   // Starting a second provider request after a submitted Atlas prediction both
@@ -483,8 +629,26 @@ async function renderDirectImage({
   // The model's output IS the ad. Sharp's only remaining jobs are the delivery
   // crop and the logo — every text layer this used to composite is gone with the
   // overlay renderer.
-  const rendered = await sharp(Buffer.from(b64, 'base64'))
-    .resize(dims.width, dims.height, { fit: 'cover', position: 'attention' })
+  //
+  // Two steps, and the order matters. First a CENTRED extract to the delivery
+  // aspect, taking exactly the pixels the prompt told the model would be cut
+  // away. Then a pure scale to the delivery box: because the extract already has
+  // the delivery aspect (asserted pre-submit), fit:'fill' cannot crop or stretch
+  // — it is a resample and nothing else. The old single `fit:'cover',
+  // position:'attention'` call did both jobs at once and got both wrong.
+  const rawFrame = Buffer.from(b64, 'base64');
+  const frame = await sharp(rawFrame).metadata();
+  const box = extractFor(built.surface, frame.width, frame.height);
+  const [reqW, reqH] = String(genSize).split(/[x*]/).map(Number);
+  if (frame.width !== reqW || frame.height !== reqH) {
+    console.warn(
+      `   ⚠️  direct-image: model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
+      `cropping the ${built.surface.aspect} centre of what arrived`
+    );
+  }
+  const rendered = await sharp(rawFrame)
+    .extract(box)
+    .resize(dims.width, dims.height, { fit: 'fill', kernel: sharp.kernel.lanczos3 })
     .png()
     .toBuffer();
 
@@ -494,12 +658,32 @@ async function renderDirectImage({
   // reads as a counterfeit rather than a stylisation. So the prompt reserves the
   // corner (see product.logoCorner above, and the absence line forbidding any
   // drawn logo) and the real asset is composited into that reserved space here.
+  //
+  // Sized against the SHORTER edge so the mark is the same physical size on every
+  // surface, and placed inside the content rect rather than at a flat offset from
+  // the bottom. The flat offset put it 150px inside Stories' 250px reply-bar
+  // reserve — the brand's logomark, on the one surface where it was invisible.
   const layers = [];
   const logo = await optionalImage(resolvedBrand?.logoUrl || effectiveLayout.input?.brand?.logo);
   if (logo) {
     try {
-      const logoPng = await sharp(logo).resize({ width: 160, height: 56, fit: 'inside', withoutEnlargement: true }).png().toBuffer();
-      layers.push({ input: logoPng, top: dims.height - 100, left: dims.width - 224 });
+      const boxW = Math.round(0.16 * Math.min(dims.width, dims.height));
+      const logoPng = await sharp(logo)
+        .resize({ width: boxW, height: Math.round(boxW * 0.35), fit: 'inside', withoutEnlargement: true })
+        .png()
+        .toBuffer();
+      // Measure what came out: fit:'inside' preserves aspect, so a tall or a wide
+      // mark occupies less than the box and placing by the box would leave it
+      // floating off the corner it was promised.
+      const lm = await sharp(logoPng).metadata();
+      const place = logoPlacementFor({
+        surface: built.surface,
+        dims,
+        logoW: lm.width,
+        logoH: lm.height
+      });
+      if (place) layers.push({ input: logoPng, top: place.top, left: place.left });
+      else console.warn(`   ⚠️  direct-image: no room for the logo inside ${surface}'s content rect — skipping it rather than covering it with platform UI`);
     } catch (err) { console.warn(`   ⚠️  direct-image: logo compose failed (${err.message})`); }
   }
   const buffer = layers.length
@@ -542,7 +726,10 @@ async function renderDirectImage({
 module.exports = {
   // Exported for the offline harness. renderDirectImage is the only entry point
   // the render path uses.
-  dimsFor,
+  deliveryGeometryFor,
+  safeBoxInDeliveredPx,
+  extractFor,
+  logoPlacementFor,
   intentForTemplate,
   buildIntentData,
   describeProductForPrompt,
