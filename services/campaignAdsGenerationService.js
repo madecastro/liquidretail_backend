@@ -103,7 +103,8 @@ const TEMPLATE_SUPPORTS_VARIANT = {
 const {
   PLATFORM_FORMATS,
   LIVE_PLATFORM_FORMAT_KEYS,
-  resolvePreset
+  resolvePreset,
+  assertGeneratablePlatformFormat
 } = require('./platformFormats');
 // Only live surfaces contribute shipping ratios — coming_soon aspects (e.g.
 // 1.91:1 Demand Gen) must not unlock billable legacy-cartesian work.
@@ -313,10 +314,10 @@ async function expandWizardJob({
   // Wizard format PRESET. Superset of the three-knob API (platformFormat +
   // kinds + expandStaticFormats). Default 'single' reproduces prior behaviour
   // byte-identically from those knobs. Named presets:
-  //   meta_static — 3 billable image gens per concept (Meta static fan-out)
-  //   meta_video  — 1 billable Veo submit per product (9:16 master ONLY)
-  //   meta_all    — both
-  //   google_pmax — live PMax only
+  //   meta_static   — 3 billable image gens per concept (Meta static fan-out)
+  //   meta_video    — 1 billable Veo submit per product (9:16 master ONLY)
+  //   meta_all      — both
+  //   google_static / google_video / google_all — empty while Google is coming_soon
   preset = 'single',
   // Operator opted into "All static formats" in the wizard. When true, every
   // image concept is emitted once per Meta static surface
@@ -396,9 +397,22 @@ async function expandWizardJob({
   // via the platformFormat function parameter — operator selects on
   // Step 1 of the wizard. Wizard override wins; campaign field is the
   // fallback for sources that don't pass it (e.g. legacy callers).
-  // Allowlist is LIVE_PLATFORM_FORMAT_KEYS (from platformFormats.js) — never
-  // the coming_soon Google surfaces. Duplicating the key list here previously
-  // drifted from the table.
+  //
+  // Status is the gate: a request that NAMES a coming_soon format
+  // (preset 'single' path) is REFUSED, not silently empty / fall-through.
+  // Named presets ignore platformFormat for their format lists, so we only
+  // assert when the operator actually supplied a format (or campaign is used).
+  // Allowlist for successful resolution is LIVE_PLATFORM_FORMAT_KEYS.
+  const presetName = preset || 'single';
+  if (platformFormat) {
+    // Explicit wizard override — refuse coming_soon with a clear error.
+    assertGeneratablePlatformFormat(platformFormat);
+  } else if (presetName === 'single' && campaign.platformFormat) {
+    // Legacy single path with no override: campaign field is the effective
+    // choice. Refuse if it is coming_soon so we don't quietly fall back to
+    // meta_feed_1_1 and bill the wrong surface.
+    assertGeneratablePlatformFormat(campaign.platformFormat);
+  }
   const wizardFormat = platformFormat && LIVE_PLATFORM_FORMAT_KEYS.includes(platformFormat)
     ? platformFormat
     : null;

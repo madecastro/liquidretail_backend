@@ -39,7 +39,8 @@ const META3 = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16'];
 for (const k of META3) eq(`  ${k}`, pf.staticFanoutForPlatformFormat(k), META3);
 // pmax is a different ad platform — one format in, one out. Fanning it to Meta
 // sizes would bill three Meta generations for a Google request.
-eq('  pmax_16_9 (not fanned to Meta)', pf.staticFanoutForPlatformFormat('pmax_16_9'), ['pmax_16_9']);
+// Frozen 2026-08-02: Google is coming_soon, so pmax fans out to nothing at all.
+eq('  pmax_16_9 (frozen — fans out to nothing)', pf.staticFanoutForPlatformFormat('pmax_16_9'), []);
 // Reels declares kinds:['video'] — it ships no static image, so no image work.
 eq('  meta_reels_9_16 (video-only)', pf.staticFanoutForPlatformFormat('meta_reels_9_16'), []);
 eq('  unknown format', pf.staticFanoutForPlatformFormat('not_a_format'), []);
@@ -53,6 +54,8 @@ check('  every fanned surface actually accepts image',
   pf.META_STATIC_FANOUT.every(k => pf.kindsForPlatformFormat(k).includes('image')));
 check('  every fanned surface is a real declared format',
   pf.META_STATIC_FANOUT.every(k => pf.PLATFORM_FORMAT_KEYS.includes(k)));
+check('  every fanned surface is live',
+  pf.META_STATIC_FANOUT.every(k => pf.isLiveFormat(k)));
 check('  reels is NOT in the fan-out set',
   !pf.META_STATIC_FANOUT.includes('meta_reels_9_16'));
 check('  pmax is NOT in the fan-out set',
@@ -137,7 +140,14 @@ const estimate = (flag, fmt) => Math.min(3, CAP) * (flag ? Math.max(1, pf.static
 check('  flag off, feed 1:1 → 3 images/product (unchanged)', estimate(false, 'meta_feed_1_1') === 3);
 check('  flag on,  feed 1:1 → 9 images/product', estimate(true, 'meta_feed_1_1') === 9);
 check('  flag on,  stories  → 9 images/product', estimate(true, 'meta_stories_9_16') === 9);
-check('  flag on,  pmax     → 3 images/product (never 9)', estimate(true, 'pmax_16_9') === 3);
+// The estimate helper mirrors production's Math.max(1, fanout.length) floor, so a
+// frozen format still *estimates* 3. That is fine — the real guard is upstream:
+// resolvePreset emits nothing for it and the route refuses it outright. Assert the
+// guard, not the estimator's floor.
+check('  pmax fans out to nothing while Google is frozen',
+  pf.staticFanoutForPlatformFormat('pmax_16_9').length === 0);
+check('  frozen pmax yields no formats from any preset',
+  pf.resolvePreset('single', 'pmax_16_9', { kinds: 'both' }).staticFormats.length === 0);
 check('  estimate equals what the cap actually keeps (9)', estimate(true, 'meta_feed_1_1') === keptFan.length);
 
 const total = pass + failures.length;

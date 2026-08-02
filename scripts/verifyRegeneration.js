@@ -145,7 +145,9 @@ const KINDS = [
   ['meta_feed_1_1', 'video', ['video']],
   ['meta_feed_4_5', 'image', ['image']],
   ['meta_stories_9_16', 'image', ['image']],
-  ['pmax_16_9', 'image', ['image']],
+  // pmax is frozen (coming_soon) — any request yields nothing (never generatable).
+  ['pmax_16_9', 'image', []],
+  ['pmax_16_9', 'both', []],
   // The inversion that billed a video to someone who picked static.
   ['meta_reels_9_16', 'image', []],
   ['meta_reels_9_16', 'video', ['video']],
@@ -158,7 +160,7 @@ for (const [fmt, requested, expected] of KINDS) {
     JSON.stringify(got) === JSON.stringify(expected), `got ${JSON.stringify(got)}`);
 }
 check('R2 a static request never yields a billable video kind',
-  ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16', 'pmax_16_9', 'meta_reels_9_16']
+  ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16', 'pmax_16_9', 'meta_reels_9_16']  // pmax included on purpose: frozen must still never yield video
     .every((f) => !pf.resolveKinds(f, 'image').includes('video')));
 
 if (failures.length) {

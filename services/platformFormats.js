@@ -110,9 +110,18 @@ const PLATFORM_FORMATS = {
       'personal. Native creative is overlay-heavy (text, stickers, polls). Drive curiosity or ' +
       'urgency rather than direct sell. Top 250 + bottom 250 reserved for the creator chip and reply input.'
   },
+  // ── Google — ALL coming_soon (owner deferred 2026-08-02) ─────────────
+  // Visible in the UI so operators see the roadmap. NEVER generatable:
+  // filtered out of every fan-out, every resolvePreset path, and refused
+  // by assertGeneratablePlatformFormat when named on a generate request.
+  //
+  // pmax_16_9 is FROZEN (was live). 45 existing Ads keep this key for
+  // read paths (labels, geometry, render-activity board); they become
+  // non-regenerable. Do NOT delete the key. kinds/canvas/deliveryDims/
+  // safeArea stay byte-identical so lookups still resolve.
   pmax_16_9: {
     platform:    'google',
-    status:      'live',
+    status:      'coming_soon',
     aspectRatio: '16:9',
     surface:     'pmax',
     label:       'Google Performance Max',
@@ -129,11 +138,93 @@ const PLATFORM_FORMATS = {
       'commercial. Treat it as a billboard, not a social post.'
   },
 
-  // ── Google COMING SOON ────────────────────────────────────────────────
-  // Visible in the UI (status:'coming_soon') so operators know what is on
-  // the roadmap. NEVER generatable: filtered out of every fan-out, every
-  // resolvePreset path, and the expandWizardJob allowlist. deliveryDims are
-  // Google's published recommended asset sizes for Demand Gen / Shorts.
+  // Recommended Google Performance Max marketing-image sizes (static).
+  // deliveryDims = Google's published recommended asset sizes. No logo
+  // asset sizes — logos are uploaded brand assets, not generated ads.
+  pmax_landscape_1_91_1: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '1.91:1',
+    surface:     'pmax',
+    label:       'PMax Landscape',
+    kinds:       ['image'],
+    canvas:       { width: 1000, height: 524 },
+    deliveryDims: { width: 1200, height: 628 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial'],
+    creativeBrief: 'Google Performance Max landscape marketing image (1.91:1) — coming soon.'
+  },
+  pmax_square_1_1: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '1:1',
+    surface:     'pmax',
+    label:       'PMax Square',
+    kinds:       ['image'],
+    canvas:       { width: 1000, height: 1000 },
+    deliveryDims: { width: 1200, height: 1200 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial'],
+    creativeBrief: 'Google Performance Max square marketing image — coming soon.'
+  },
+  pmax_portrait_4_5: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '4:5',
+    surface:     'pmax',
+    label:       'PMax Portrait',
+    kinds:       ['image'],
+    canvas:       { width: 1000, height: 1250 },
+    deliveryDims: { width: 960, height: 1200 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial'],
+    creativeBrief: 'Google Performance Max portrait marketing image (4:5) — coming soon.'
+  },
+
+  // Recommended Google Performance Max video sizes (separate from static —
+  // one click must never double-spend static + video the way google_pmax did).
+  pmax_video_16_9: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '16:9',
+    surface:     'pmax',
+    label:       'PMax Video Landscape',
+    kinds:       ['video'],
+    canvas:       { width: 1000, height: 563 },
+    deliveryDims: { width: 1920, height: 1080 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial', 'yt_shorts'],
+    creativeBrief: 'Google Performance Max landscape video (16:9) — coming soon.'
+  },
+  pmax_video_1_1: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '1:1',
+    surface:     'pmax',
+    label:       'PMax Video Square',
+    kinds:       ['video'],
+    canvas:       { width: 1000, height: 1000 },
+    deliveryDims: { width: 1080, height: 1080 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial'],
+    creativeBrief: 'Google Performance Max square video — coming soon.'
+  },
+  pmax_video_9_16: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '9:16',
+    surface:     'pmax',
+    label:       'PMax Video Portrait',
+    kinds:       ['video'],
+    canvas:       { width: 1000, height: 1778 },
+    deliveryDims: { width: 1080, height: 1920 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['yt_shorts', 'editorial'],
+    creativeBrief: 'Google Performance Max vertical video (9:16) — coming soon.'
+  },
+
+  // Demand Gen / Shorts — also Google, also coming soon. Both PMax and
+  // Demand Gen are legitimate Google surfaces.
   google_demandgen_1_1: {
     platform:    'google',
     status:      'coming_soon',
@@ -363,41 +454,90 @@ function videoFanoutForPlatformFormat(platformFormat) {
     : [];
 }
 
+// ── Google format sets (intent for when Google goes live) ────────────────
+// Split static vs video so one click never double-spends both (the bug
+// google_pmax had with pmax_16_9 kinds:['image','video']). Today every
+// entry is coming_soon, so filterLiveFormats returns [] and the three
+// Google presets resolve empty — no second mechanism needed.
+//
+// Static: PMax marketing images + Demand Gen images. pmax_16_9 (legacy
+// dual-kind key) is intentionally omitted from the static fan-out; the
+// dedicated pmax_landscape / square / portrait stubs replace it.
+// Video: dedicated PMax video sizes + YouTube Shorts. Logo asset sizes
+// are never listed — logos are uploaded brand assets, not generated ads.
+const GOOGLE_STATIC_FANOUT = [
+  'pmax_landscape_1_91_1',
+  'pmax_square_1_1',
+  'pmax_portrait_4_5',
+  'google_demandgen_1_1',
+  'google_demandgen_4_5',
+  'google_demandgen_1_91_1'
+];
+const GOOGLE_VIDEO_FANOUT = [
+  'pmax_video_16_9',
+  'pmax_video_1_1',
+  'pmax_video_9_16',
+  'google_shorts_9_16'
+];
+
 // ── PRESETS ─────────────────────────────────────────────────────────────
 // Operator-facing choices that replace platformFormat + kinds + expandStaticFormats.
 // Each preset resolves to concrete format lists the expansion path can queue.
 //
-//   meta_static  — 3 billable image gens per concept (one per Meta static size)
-//   meta_video   — 1 billable Veo submit per product (9:16 master only)
-//   meta_all     — both of the above
-//   google_pmax  — live Google PMax only (image + video on pmax_16_9)
-//   single       — back-compat: reproduce prior three-knob behaviour exactly
+//   meta_static   — 3 billable image gens per concept (one per Meta static size)
+//   meta_video    — 1 billable Veo submit per product (9:16 master only)
+//   meta_all      — both of the above
+//   google_static — Google static sizes (all coming_soon today → empty)
+//   google_video  — Google video sizes (all coming_soon today → empty)
+//   google_all    — both Google static + video (empty today)
+//   single        — back-compat: reproduce prior three-knob behaviour exactly
 //
 // coming_soon formats never appear in any resolved list.
 const PRESETS = {
   meta_static: {
-    label: 'Meta Static',
+    platform:    'meta',
+    label:       'Meta Static',
     description: 'One generation per concept per Meta static size (1:1, 4:5, Stories 9:16).'
   },
   meta_video: {
-    label: 'Meta Video',
+    platform:    'meta',
+    label:       'Meta Video',
     description: 'One 9:16 master per product; other Meta video sizes are derived (Phase 3), not generated.'
   },
   meta_all: {
-    label: 'All sizes, all formats',
+    platform:    'meta',
+    label:       'All sizes, all formats',
     description: 'Meta static fan-out + one Meta video master per product.'
   },
-  google_pmax: {
-    label: 'Google Performance Max',
-    description: 'Live Google PMax 16:9 only. Other Google formats are coming soon.'
+  google_static: {
+    platform:    'google',
+    label:       'Google Static',
+    description: 'Google Performance Max + Demand Gen marketing images. Coming soon.'
+  },
+  google_video: {
+    platform:    'google',
+    label:       'Google Video',
+    description: 'Google Performance Max video + YouTube Shorts. Coming soon.'
+  },
+  google_all: {
+    platform:    'google',
+    label:       'Google All',
+    description: 'Google static + video sizes. Coming soon.'
   },
   single: {
-    label: 'Single format',
+    platform:    null,
+    label:       'Single format',
     description: 'Legacy three-knob path (platformFormat + kinds + expandStaticFormats).'
   }
 };
 
 const PRESET_KEYS = Object.keys(PRESETS);
+
+// Named presets the UI should offer per platform (excludes 'single').
+const PLATFORM_PRESET_KEYS = {
+  meta:   ['meta_static', 'meta_video', 'meta_all'],
+  google: ['google_static', 'google_video', 'google_all']
+};
 
 /**
  * Resolve a wizard preset into the concrete format lists expandWizardJob queues.
@@ -413,11 +553,24 @@ const PRESET_KEYS = Object.keys(PRESETS);
  *   meta_static → 3 billable image submits per concept
  *   meta_video  → 1 billable Veo submit per product (videoFormats length === 1)
  *   meta_all    → both
+ *   google_*    → empty while every Google format is coming_soon
  * Never emit a coming_soon key.
  */
 function resolvePreset(preset, platformFormat, opts = {}) {
   const { kinds = null, expandStaticFormats = false } = opts;
-  const name = PRESET_KEYS.includes(preset) ? preset : 'single';
+  // An ABSENT preset means "the caller predates presets" and legitimately means
+  // 'single'. An unrecognised STRING means someone named a preset that does not
+  // exist, and silently substituting 'single' is how that becomes a wrong bill
+  // instead of an error: the run succeeds, produces a different format set than
+  // asked for, and nothing reports it. `google_pmax` was removed on 2026-08-02
+  // and any caller still sending it must find out, not quietly get one square
+  // Meta ad. Same failure shape as the done/total:0 runs — fail loudly instead.
+  if (preset != null && preset !== '' && !PRESET_KEYS.includes(preset)) {
+    throw new Error(
+      `unknown ad-format preset "${preset}" — expected one of: ${PRESET_KEYS.join(', ')}`
+    );
+  }
+  const name = preset || 'single';
 
   if (name === 'meta_static') {
     // 3 billable image generations per concept — expected, same cost shape as
@@ -453,21 +606,33 @@ function resolvePreset(preset, platformFormat, opts = {}) {
     return { staticFormats, videoFormats, kinds: kindsOut };
   }
 
-  if (name === 'google_pmax') {
-    // Only the live Google surface. Demand Gen / Shorts are coming_soon and
-    // must not appear here even if someone later appends them to a Google fan-out.
-    const pf = 'pmax_16_9';
-    if (!isLiveFormat(pf)) {
-      return { staticFormats: [], videoFormats: [], kinds: [] };
-    }
-    const allowed = kindsForPlatformFormat(pf);
-    const staticFormats = allowed.includes('image') ? [pf] : [];
-    const videoFormats = allowed.includes('video') ? [pf] : [];
+  if (name === 'google_static') {
+    // Intended list is GOOGLE_STATIC_FANOUT; filterLiveFormats drops every
+    // coming_soon key so today this is always empty. No special-case.
+    const staticFormats = filterLiveFormats([...GOOGLE_STATIC_FANOUT]);
     return {
       staticFormats,
-      videoFormats,
-      kinds: [...(staticFormats.length ? ['image'] : []), ...(videoFormats.length ? ['video'] : [])]
+      videoFormats: [],
+      kinds: staticFormats.length ? ['image'] : []
     };
+  }
+
+  if (name === 'google_video') {
+    const videoFormats = filterLiveFormats([...GOOGLE_VIDEO_FANOUT]);
+    return {
+      staticFormats: [],
+      videoFormats,
+      kinds: videoFormats.length ? ['video'] : []
+    };
+  }
+
+  if (name === 'google_all') {
+    const staticFormats = filterLiveFormats([...GOOGLE_STATIC_FANOUT]);
+    const videoFormats = filterLiveFormats([...GOOGLE_VIDEO_FANOUT]);
+    const kindsOut = [];
+    if (staticFormats.length) kindsOut.push('image');
+    if (videoFormats.length) kindsOut.push('video');
+    return { staticFormats, videoFormats, kinds: kindsOut };
   }
 
   // ── 'single' — exact reproduction of pre-preset three-knob behaviour ──
@@ -483,6 +648,9 @@ function resolvePreset(preset, platformFormat, opts = {}) {
   //   video always uses [platformFormat] when video is wanted — no video fan-out
   //
   // coming_soon / unknown pf → resolveKinds returns [] → nothing queued.
+  // NOTE: expandWizardJob ALSO refuses an explicitly named coming_soon
+  // platformFormat via assertGeneratablePlatformFormat — empty resolve is
+  // the money belt; the assert is the operator-facing gate.
   const requested = kinds == null || kinds === '' ? 'image' : kinds;
   const resolvedKinds = resolveKinds(platformFormat, requested);
   const wantsImage = resolvedKinds.includes('image');
@@ -517,6 +685,120 @@ function resolvePreset(preset, platformFormat, opts = {}) {
   return { staticFormats, videoFormats, kinds: kindsOut };
 }
 
+/**
+ * Gate for generate / preview when the operator names a platformFormat
+ * directly (preset 'single'). coming_soon must be REFUSED with a clear
+ * error — not silently fall through to campaign default or empty queue.
+ *
+ * @param {string|null|undefined} platformFormat
+ * @throws {Error} when the format is declared but not yet available
+ */
+function assertGeneratablePlatformFormat(platformFormat) {
+  if (platformFormat == null || platformFormat === '') return;
+  const key = String(platformFormat);
+  if (!PLATFORM_FORMATS[key]) return; // unknown → existing fall-through
+  if (!isLiveFormat(key)) {
+    const label = PLATFORM_FORMATS[key].label || key;
+    const err = new Error(
+      `Platform format "${key}" (${label}) is not yet available (coming soon).`
+    );
+    err.code = 'PLATFORM_FORMAT_COMING_SOON';
+    err.platformFormat = key;
+    throw err;
+  }
+}
+
+/**
+ * UI catalog: every platform, its presets, and the formats each preset
+ * would produce — including coming_soon entries so the frontend can draw
+ * greyed cards without hardcoding keys. resolvePreset still never emits
+ * coming_soon into a queue; this is display-only.
+ *
+ * @returns {{
+ *   platforms: Array<{
+ *     id: string,
+ *     label: string,
+ *     presets: Array<{
+ *       key: string,
+ *       label: string,
+ *       description: string,
+ *       formats: Array<{
+ *         key: string,
+ *         label: string,
+ *         aspectRatio: string,
+ *         deliveryDims: { width: number, height: number },
+ *         kinds: string[],
+ *         status: string
+ *       }>
+ *     }>,
+ *     formats: Array<{ key, label, aspectRatio, deliveryDims, kinds, status }>
+ *   }>
+ * }}
+ */
+function formatCatalog() {
+  function formatEntry(key) {
+    const caps = PLATFORM_FORMATS[key];
+    if (!caps) return null;
+    return {
+      key,
+      label: caps.label,
+      aspectRatio: caps.aspectRatio,
+      deliveryDims: { ...caps.deliveryDims },
+      kinds: [...caps.kinds],
+      status: caps.status
+    };
+  }
+
+  // Intent lists per named preset (unfiltered — catalog shows stubs).
+  // meta_video shows only the billable master (not the Phase 3 derivation set).
+  const presetFormatKeys = {
+    meta_static:   [...META_STATIC_FANOUT],
+    meta_video:    [META_VIDEO_MASTER],
+    meta_all:      [...META_STATIC_FANOUT, META_VIDEO_MASTER],
+    google_static: [...GOOGLE_STATIC_FANOUT],
+    google_video:  [...GOOGLE_VIDEO_FANOUT],
+    google_all:    [...GOOGLE_STATIC_FANOUT, ...GOOGLE_VIDEO_FANOUT]
+  };
+
+  const platformOrder = ['meta', 'google'];
+  const platforms = platformOrder.map((id) => {
+    const presetKeys = PLATFORM_PRESET_KEYS[id] || [];
+    const presets = presetKeys.map((pkey) => {
+      const meta = PRESETS[pkey] || {};
+      const keys = presetFormatKeys[pkey] || [];
+      // Deduplicate while preserving order (meta_all master may already be in static).
+      const seen = new Set();
+      const formats = [];
+      for (const k of keys) {
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const entry = formatEntry(k);
+        if (entry) formats.push(entry);
+      }
+      return {
+        key: pkey,
+        label: meta.label || pkey,
+        description: meta.description || '',
+        formats
+      };
+    });
+
+    const platformFormats = PLATFORM_FORMAT_KEYS
+      .filter((k) => PLATFORM_FORMATS[k].platform === id)
+      .map(formatEntry)
+      .filter(Boolean);
+
+    return {
+      id,
+      label: id === 'meta' ? 'Meta' : id === 'google' ? 'Google' : id,
+      presets,
+      formats: platformFormats
+    };
+  });
+
+  return { platforms };
+}
+
 module.exports = {
   PLATFORM_FORMATS,
   PLATFORM_FORMAT_KEYS,
@@ -538,9 +820,14 @@ module.exports = {
   META_STATIC_FANOUT,
   META_VIDEO_FANOUT,
   META_VIDEO_MASTER,
+  GOOGLE_STATIC_FANOUT,
+  GOOGLE_VIDEO_FANOUT,
   staticFanoutForPlatformFormat,
   videoFanoutForPlatformFormat,
   PRESETS,
   PRESET_KEYS,
-  resolvePreset
+  PLATFORM_PRESET_KEYS,
+  resolvePreset,
+  assertGeneratablePlatformFormat,
+  formatCatalog
 };
