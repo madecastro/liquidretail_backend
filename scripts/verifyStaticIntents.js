@@ -311,9 +311,11 @@ for (const intentKey of intents) {
 console.log('\nD. describeSurfaces() inspection helper');
 const rows = describeSurfaces();
 truthy('describeSurfaces returns a non-empty array', Array.isArray(rows) && rows.length > 0);
+// Policy keys must all be present. describeSurfaces may also list
+// coming_soon table entries (UI-only formats) — those are extra, not a miss.
 check('describeSurfaces covers every SURFACE_POLICY key',
-  rows.map(r => r.surface).sort().join(','),
-  surfaces.slice().sort().join(','));
+  surfaces.every((s) => rows.some((r) => r.surface === s)),
+  true);
 for (const row of rows) {
   truthy(`${row.surface}: has generate size`, !!row.generate);
   truthy(`${row.surface}: has box`, row.box && typeof row.box.left === 'number');

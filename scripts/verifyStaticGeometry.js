@@ -32,10 +32,12 @@ function check(name, cond, detail) {
   failures.push(`${name}${detail ? ` — ${detail}` : ''}`);
 }
 
-// Only surfaces that actually take a static image. meta_reels_9_16 is declared
-// kinds:['video'], so the static renderer never sees it.
+// Only LIVE surfaces that actually take a static image. meta_reels_9_16 is
+// kinds:['video']; coming_soon Google Demand Gen sizes are UI-only until live.
 const SURFACES = pf.PLATFORM_FORMAT_KEYS.filter(
-  (k) => pf.PLATFORM_FORMATS[k] && (pf.kindsForPlatformFormat(k) || []).includes('image')
+  (k) => pf.PLATFORM_FORMATS[k] &&
+    pf.PLATFORM_FORMATS[k].status === 'live' &&
+    (pf.kindsForPlatformFormat(k) || []).includes('image')
 );
 
 if (!SURFACES.length) {

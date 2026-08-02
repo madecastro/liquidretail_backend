@@ -173,13 +173,16 @@ router.post('/preview', async (req, res) => {
       urlParams   = '',
       platformFormat = null,   // Phase 2 wizard override; null → use campaign.platformFormat
       kinds          = null,   // 'image' | 'video' | 'both'; null → use campaign.adKinds
+      // Format PRESET — supersedes the three-knob API when not 'single'.
+      // Default 'single' keeps old callers byte-identical.
+      preset         = 'single',
       excludePairings = [],
       includeCategoryMatched = false,
       includeBrandMatched    = false,
       videoDurationSec = null,
       // "All static formats" wizard button. See expandWizardJob for what
       // this actually does — each additional format is a separate billable
-      // image generation, not a crop.
+      // image generation, not a crop. Ignored for named presets.
       expandStaticFormats = false
     } = req.body || {};
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
@@ -204,6 +207,7 @@ router.post('/preview', async (req, res) => {
       urlParams,
       platformFormat,
       kinds,
+      preset,
       excludePairings,
       includeCategoryMatched,
       includeBrandMatched,
@@ -238,6 +242,11 @@ router.post('/generate', async (req, res) => {
       urlParams   = '',
       platformFormat = null,   // Phase 2 wizard override; null → use campaign.platformFormat
       kinds          = null,   // 'image' | 'video' | 'both'; null → use campaign.adKinds
+      // Format PRESET — supersedes platformFormat+kinds+expandStaticFormats
+      // when not 'single'. Default 'single' keeps old callers byte-identical.
+      // meta_video queues ONE 9:16 master per product (one billable Veo submit);
+      // meta_static fans each concept to 3 Meta static sizes (3 billable images).
+      preset         = 'single',
       // [{ productId, mediaId }] — operator-deselected pairings from
       // the Step 2 picker. Forwarded into expandWizardJob to drop the
       // matching tuples from the cartesian.
@@ -255,6 +264,7 @@ router.post('/generate', async (req, res) => {
       // every Meta static surface (staticFanoutForPlatformFormat) instead of
       // just platformFormat. EACH SIZE IS A SEPARATE BILLABLE GENERATION.
       // Default false: existing callers get exactly prior behavior.
+      // Ignored for named presets (meta_static / meta_all already fan out).
       expandStaticFormats = false
     } = req.body || {};
 
@@ -392,6 +402,7 @@ router.post('/generate', async (req, res) => {
           urlParams,
           platformFormat,
           kinds,
+          preset,
           excludePairings,
           includeCategoryMatched,
           includeBrandMatched,

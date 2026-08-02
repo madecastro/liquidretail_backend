@@ -6,10 +6,17 @@
 // format. Reels is video-only by definition; other formats accept either.
 //
 // Adding a new surface: append to the enum here AND mirror the enum in
-//   models/Campaign.js + models/Ad.js (mongoose `enum` is per-doc).
+//   models/Campaign.js + models/Ad.js (mongoose `enum` is per-doc) for any
+//   surface that is status:'live' and can be persisted on those models.
+//   coming_soon entries live only in this table until they go live.
 //
 // Wizard, expandWizardJob, and dispatch all read this table — don't hard-code
 // platform strings anywhere else.
+//
+// PRESETS (2026-08-01) replace the three-knob API (platformFormat + kinds +
+// expandStaticFormats) with one operator choice. Old callers still work via
+// preset='single' (the default), which reproduces prior behaviour byte-for-
+// byte from those three knobs.
 
 // safeArea defines the UI band reserved by the host platform — anything
 // in those bands gets covered by native chrome (IG comments, like/share
@@ -23,6 +30,8 @@
 // native UI overlay.
 const PLATFORM_FORMATS = {
   meta_feed_1_1: {
+    platform:    'meta',
+    status:      'live',
     aspectRatio: '1:1',
     surface:     'meta_feed',
     label:       'Meta Feed (Square)',
@@ -38,6 +47,8 @@ const PLATFORM_FORMATS = {
       'thumb-stopping clarity in the first half-second; CTA should land within the first frame, no scroll required.'
   },
   meta_feed_4_5: {
+    platform:    'meta',
+    status:      'live',
     aspectRatio: '4:5',
     surface:     'meta_feed',
     label:       'Meta Feed (Portrait)',
@@ -53,6 +64,8 @@ const PLATFORM_FORMATS = {
       'behavior as 1:1; the first half-second still decides engagement.'
   },
   meta_reels_9_16: {
+    platform:    'meta',
+    status:      'live',
     aspectRatio: '9:16',
     surface:     'meta_reels',
     label:       'Meta Reels',
@@ -64,6 +77,9 @@ const PLATFORM_FORMATS = {
     // re-titled for the new frame — no second generation, so no second charge.
     // 1080x1920 centre-crops to 1080x1350 (4:5) and 1080x1080 (1:1), both of which
     // sit inside the 204px safe bands, so nothing meaningful is lost.
+    // NOTE: `companions` is DEAD data (zero consumers as of 2026-08-01). The live
+    // video derivation intent is META_VIDEO_FANOUT + Phase 3 derivation, not this
+    // field. Kept for back-compat with any external reader of the table shape.
     companions:  ['meta_feed_4_5', 'meta_feed_1_1'],
     chromeStyleHints: ['ig_reels', 'tiktok', 'yt_shorts', 'editorial'],
     creativeBrief:
@@ -74,6 +90,8 @@ const PLATFORM_FORMATS = {
       'Top + bottom 204px reserved for IG\'s caption + reaction UI.'
   },
   meta_stories_9_16: {
+    platform:    'meta',
+    status:      'live',
     aspectRatio: '9:16',
     surface:     'meta_stories',
     label:       'Meta Stories',
@@ -83,6 +101,7 @@ const PLATFORM_FORMATS = {
     safeArea:     { top: 250, bottom: 250 },  // IG Stories: top creator chip + bottom reply input
     // Same 9:16 master, same cheap-crop companions. Stories reserves MORE than
     // Reels (250 vs 204), so a crop that is safe here is safe for Reels too.
+    // NOTE: `companions` is DEAD data — see meta_reels_9_16.
     companions:  ['meta_feed_4_5', 'meta_feed_1_1'],
     chromeStyleHints: ['ig_reels', 'editorial'],
     creativeBrief:
@@ -92,6 +111,8 @@ const PLATFORM_FORMATS = {
       'urgency rather than direct sell. Top 250 + bottom 250 reserved for the creator chip and reply input.'
   },
   pmax_16_9: {
+    platform:    'google',
+    status:      'live',
     aspectRatio: '16:9',
     surface:     'pmax',
     label:       'Google Performance Max',
@@ -106,13 +127,107 @@ const PLATFORM_FORMATS = {
       'a YouTube pre-roll AND a Display banner. Direct-response copy, prominent CTA, broad-appeal ' +
       'imagery. Avoid platform-native styling cues (no IG/TikTok aesthetics) — go editorial / clean / ' +
       'commercial. Treat it as a billboard, not a social post.'
+  },
+
+  // ── Google COMING SOON ────────────────────────────────────────────────
+  // Visible in the UI (status:'coming_soon') so operators know what is on
+  // the roadmap. NEVER generatable: filtered out of every fan-out, every
+  // resolvePreset path, and the expandWizardJob allowlist. deliveryDims are
+  // Google's published recommended asset sizes for Demand Gen / Shorts.
+  google_demandgen_1_1: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '1:1',
+    surface:     'google_demandgen',
+    label:       'Google Demand Gen (Square)',
+    kinds:       ['image'],
+    canvas:       { width: 1000, height: 1000 },
+    deliveryDims: { width: 1200, height: 1200 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial'],
+    creativeBrief: 'Google Demand Gen square — coming soon.'
+  },
+  google_demandgen_4_5: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '4:5',
+    surface:     'google_demandgen',
+    label:       'Google Demand Gen (Portrait)',
+    kinds:       ['image'],
+    canvas:       { width: 1000, height: 1250 },
+    deliveryDims: { width: 960, height: 1200 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial'],
+    creativeBrief: 'Google Demand Gen portrait — coming soon.'
+  },
+  google_demandgen_1_91_1: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '1.91:1',
+    surface:     'google_demandgen',
+    label:       'Google Demand Gen (Landscape)',
+    kinds:       ['image'],
+    canvas:       { width: 1000, height: 524 },
+    deliveryDims: { width: 1200, height: 628 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['editorial'],
+    creativeBrief: 'Google Demand Gen landscape (1.91:1) — coming soon.'
+  },
+  google_shorts_9_16: {
+    platform:    'google',
+    status:      'coming_soon',
+    aspectRatio: '9:16',
+    surface:     'google_shorts',
+    label:       'YouTube Shorts',
+    kinds:       ['video'],
+    canvas:       { width: 1000, height: 1778 },
+    deliveryDims: { width: 1080, height: 1920 },
+    safeArea:     { top: 0, bottom: 0 },
+    chromeStyleHints: ['yt_shorts', 'editorial'],
+    creativeBrief: 'YouTube Shorts vertical — coming soon.'
   }
 };
 
 const PLATFORM_FORMAT_KEYS = Object.keys(PLATFORM_FORMATS);
 
+// Live (generatable) subset — the expandWizardJob allowlist and any path that
+// must refuse coming_soon. Prefer this over PLATFORM_FORMAT_KEYS when deciding
+// whether a format may queue billable work.
+const LIVE_PLATFORM_FORMAT_KEYS = PLATFORM_FORMAT_KEYS.filter(
+  (k) => PLATFORM_FORMATS[k].status === 'live'
+);
+
 function getFormatCaps(platformFormat) {
   return PLATFORM_FORMATS[platformFormat] || null;
+}
+
+function isLiveFormat(platformFormat) {
+  return PLATFORM_FORMATS[platformFormat]?.status === 'live';
+}
+
+function isComingSoonFormat(platformFormat) {
+  return PLATFORM_FORMATS[platformFormat]?.status === 'coming_soon';
+}
+
+// Channel label for a format key. Prefers the declared `platform` field;
+// falls back to key-prefix sniffing for unknown / legacy keys so callers
+// that held historical strings keep working.
+function platformForFormat(platformFormat) {
+  const caps = PLATFORM_FORMATS[platformFormat];
+  if (caps?.platform) return caps.platform;
+  const f = String(platformFormat || '');
+  if (f.startsWith('meta_')) return 'meta';
+  if (f.startsWith('pmax_') || f.startsWith('google_')) return 'google';
+  if (f.startsWith('tiktok_')) return 'tiktok';
+  return null;
+}
+
+function channelLabelForFormat(platformFormat) {
+  const p = platformForFormat(platformFormat);
+  if (p === 'meta') return 'Meta';
+  if (p === 'google') return 'Google';
+  if (p === 'tiktok') return 'TikTok';
+  return null;
 }
 
 function aspectRatioForPlatformFormat(platformFormat) {
@@ -143,7 +258,12 @@ function kindsForPlatformFormat(platformFormat) {
 // Resolve operator's kind choice ('image' | 'video' | 'both') to the
 // concrete kind list, intersected with what the format actually allows.
 // Falls back to all supported kinds when input is empty/null.
+// coming_soon formats always resolve to [] — they are never generatable.
 function resolveKinds(platformFormat, requested) {
+  if (!isLiveFormat(platformFormat) && PLATFORM_FORMATS[platformFormat]) {
+    // Declared but not live → nothing to generate.
+    return [];
+  }
   const allowed = kindsForPlatformFormat(platformFormat);
   if (!allowed.length) return [];
   if (!requested || requested === 'both') return allowed;
@@ -164,6 +284,12 @@ function renderRouteForKind(kind) {
   return kind === 'video' ? 'veo' : 'html_gen';
 }
 
+// Keep only live, declared format keys. Used at every fan-out / preset
+// boundary so a coming_soon key can never slip into an Ad payload.
+function filterLiveFormats(keys) {
+  return (keys || []).filter((k) => isLiveFormat(k));
+}
+
 // The Meta static surfaces that ONE "static ads" selection fans out to, so an
 // operator picking static gets every size they actually run, not just the one
 // they happened to click. Owner-set 2026-07-31.
@@ -172,6 +298,7 @@ function renderRouteForKind(kind) {
 //   - meta_reels_9_16 — declared kinds:['video']; it ships no static image.
 //   - pmax_16_9 — Google Performance Max, a different ad platform. Available
 //     when explicitly selected, never fanned out from a Meta choice.
+//   - any coming_soon entry — never generatable.
 //
 // EACH ENTRY IS A SEPARATE BILLABLE GENERATION, and that is not an oversight.
 // The `companions: [...]` fields still declared on the 9:16 formats describe an
@@ -185,6 +312,25 @@ function renderRouteForKind(kind) {
 // crop without first moving text compositing back out of the model.
 const META_STATIC_FANOUT = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16'];
 
+// Meta VIDEO derivation set. INTENT ONLY in this pass (Phase 3 builds the
+// derivation). Semantics:
+//   - ONE billable 9:16 Veo submit (the master: META_VIDEO_MASTER)
+//   - THREE free derivations (reels retitle + feed 1:1 + feed 4:5 crops)
+// Queueing four video Ads would be a money bug. resolvePreset('meta_video')
+// therefore returns videoFormats: [META_VIDEO_MASTER] only — the full fan-out
+// list is for Phase 3 derivation consumers, not for expandWizardJob.
+//
+// Master is Stories 9:16: its safeArea (250/250) is STRICTER than Reels
+// (204/204), so a master composed for Stories is safe to retitle for Reels.
+// Feed 1:1 and 4:5 are centre-crops of the same 1080x1920 plate.
+const META_VIDEO_MASTER = 'meta_stories_9_16';
+const META_VIDEO_FANOUT = [
+  'meta_stories_9_16', // master — the ONE billable Veo submit
+  'meta_reels_9_16',   // derivation (Phase 3)
+  'meta_feed_1_1',     // derivation (Phase 3)
+  'meta_feed_4_5'      // derivation (Phase 3)
+];
+
 // Every static surface an operator's chosen format should produce.
 //
 // A Meta static pick fans out to all three Meta static surfaces. Any other
@@ -192,15 +338,194 @@ const META_STATIC_FANOUT = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16
 // because fanning a Google placement out to Meta sizes would spend money on
 // surfaces the operator never asked for. A format that supports no static image
 // at all (Reels) returns [] so the caller queues no image work for it.
+// coming_soon always returns [] — never generatable.
 function staticFanoutForPlatformFormat(platformFormat) {
-  if (META_STATIC_FANOUT.includes(platformFormat)) return [...META_STATIC_FANOUT];
-  return kindsForPlatformFormat(platformFormat).includes('image') ? [platformFormat] : [];
+  if (!isLiveFormat(platformFormat)) return [];
+  if (META_STATIC_FANOUT.includes(platformFormat)) {
+    return filterLiveFormats([...META_STATIC_FANOUT]);
+  }
+  return kindsForPlatformFormat(platformFormat).includes('image')
+    ? filterLiveFormats([platformFormat])
+    : [];
+}
+
+// Mirror of staticFanoutForPlatformFormat for the Meta video derivation set.
+// Returns the FULL fan-out (master + derivations) for Phase 3 consumers.
+// expandWizardJob / resolvePreset must NOT queue one Ad per entry — only the
+// master is billable. coming_soon / non-Meta / non-video → [].
+function videoFanoutForPlatformFormat(platformFormat) {
+  if (!isLiveFormat(platformFormat)) return [];
+  if (META_VIDEO_FANOUT.includes(platformFormat)) {
+    return filterLiveFormats([...META_VIDEO_FANOUT]);
+  }
+  return kindsForPlatformFormat(platformFormat).includes('video')
+    ? filterLiveFormats([platformFormat])
+    : [];
+}
+
+// ── PRESETS ─────────────────────────────────────────────────────────────
+// Operator-facing choices that replace platformFormat + kinds + expandStaticFormats.
+// Each preset resolves to concrete format lists the expansion path can queue.
+//
+//   meta_static  — 3 billable image gens per concept (one per Meta static size)
+//   meta_video   — 1 billable Veo submit per product (9:16 master only)
+//   meta_all     — both of the above
+//   google_pmax  — live Google PMax only (image + video on pmax_16_9)
+//   single       — back-compat: reproduce prior three-knob behaviour exactly
+//
+// coming_soon formats never appear in any resolved list.
+const PRESETS = {
+  meta_static: {
+    label: 'Meta Static',
+    description: 'One generation per concept per Meta static size (1:1, 4:5, Stories 9:16).'
+  },
+  meta_video: {
+    label: 'Meta Video',
+    description: 'One 9:16 master per product; other Meta video sizes are derived (Phase 3), not generated.'
+  },
+  meta_all: {
+    label: 'All sizes, all formats',
+    description: 'Meta static fan-out + one Meta video master per product.'
+  },
+  google_pmax: {
+    label: 'Google Performance Max',
+    description: 'Live Google PMax 16:9 only. Other Google formats are coming soon.'
+  },
+  single: {
+    label: 'Single format',
+    description: 'Legacy three-knob path (platformFormat + kinds + expandStaticFormats).'
+  }
+};
+
+const PRESET_KEYS = Object.keys(PRESETS);
+
+/**
+ * Resolve a wizard preset into the concrete format lists expandWizardJob queues.
+ *
+ * @param {string} preset            one of PRESET_KEYS; unknown → treated as 'single'
+ * @param {string} platformFormat    used by 'single' (and as a soft default elsewhere)
+ * @param {object} [opts]
+ * @param {string|null} [opts.kinds]              'image'|'video'|'both'|null — 'single' only
+ * @param {boolean} [opts.expandStaticFormats]    'single' only; default false
+ * @returns {{ staticFormats: string[], videoFormats: string[], kinds: string[] }}
+ *
+ * MONEY:
+ *   meta_static → 3 billable image submits per concept
+ *   meta_video  → 1 billable Veo submit per product (videoFormats length === 1)
+ *   meta_all    → both
+ * Never emit a coming_soon key.
+ */
+function resolvePreset(preset, platformFormat, opts = {}) {
+  const { kinds = null, expandStaticFormats = false } = opts;
+  const name = PRESET_KEYS.includes(preset) ? preset : 'single';
+
+  if (name === 'meta_static') {
+    // 3 billable image generations per concept — expected, same cost shape as
+    // expandStaticFormats:true on a Meta static surface today.
+    const staticFormats = filterLiveFormats([...META_STATIC_FANOUT]);
+    return {
+      staticFormats,
+      videoFormats: [],
+      kinds: staticFormats.length ? ['image'] : []
+    };
+  }
+
+  if (name === 'meta_video') {
+    // ONE billable Veo submit per product — the 9:16 master only.
+    // Do NOT return META_VIDEO_FANOUT here; the other three sizes are
+    // Phase 3 derivations, not separate Ad rows / billable submits.
+    const master = isLiveFormat(META_VIDEO_MASTER) ? META_VIDEO_MASTER : null;
+    const videoFormats = master ? [master] : [];
+    return {
+      staticFormats: [],
+      videoFormats,
+      kinds: videoFormats.length ? ['video'] : []
+    };
+  }
+
+  if (name === 'meta_all') {
+    const staticFormats = filterLiveFormats([...META_STATIC_FANOUT]);
+    const master = isLiveFormat(META_VIDEO_MASTER) ? META_VIDEO_MASTER : null;
+    const videoFormats = master ? [master] : [];
+    const kindsOut = [];
+    if (staticFormats.length) kindsOut.push('image');
+    if (videoFormats.length) kindsOut.push('video');
+    return { staticFormats, videoFormats, kinds: kindsOut };
+  }
+
+  if (name === 'google_pmax') {
+    // Only the live Google surface. Demand Gen / Shorts are coming_soon and
+    // must not appear here even if someone later appends them to a Google fan-out.
+    const pf = 'pmax_16_9';
+    if (!isLiveFormat(pf)) {
+      return { staticFormats: [], videoFormats: [], kinds: [] };
+    }
+    const allowed = kindsForPlatformFormat(pf);
+    const staticFormats = allowed.includes('image') ? [pf] : [];
+    const videoFormats = allowed.includes('video') ? [pf] : [];
+    return {
+      staticFormats,
+      videoFormats,
+      kinds: [...(staticFormats.length ? ['image'] : []), ...(videoFormats.length ? ['video'] : [])]
+    };
+  }
+
+  // ── 'single' — exact reproduction of pre-preset three-knob behaviour ──
+  //
+  // Today (expandWizardJob):
+  //   requestedKinds = kinds || campaign.adKinds || 'image'  (caller supplies
+  //     the already-defaulted value via opts.kinds; we default to 'image' here
+  //     to match that terminal fallback when opts.kinds is null/undefined)
+  //   resolvedKinds  = resolveKinds(platformFormat, requestedKinds)
+  //   static fan-out only when expandStaticFormats && image is wanted:
+  //     staticFormats = staticFanoutForPlatformFormat(pf)  (may be [])
+  //     else image uses [platformFormat] when image-capable
+  //   video always uses [platformFormat] when video is wanted — no video fan-out
+  //
+  // coming_soon / unknown pf → resolveKinds returns [] → nothing queued.
+  const requested = kinds == null || kinds === '' ? 'image' : kinds;
+  const resolvedKinds = resolveKinds(platformFormat, requested);
+  const wantsImage = resolvedKinds.includes('image');
+  const wantsVideo = resolvedKinds.includes('video');
+
+  let staticFormats = [];
+  if (wantsImage) {
+    if (expandStaticFormats) {
+      staticFormats = staticFanoutForPlatformFormat(platformFormat);
+      // When fan-out returns [] (e.g. Reels video-only) there is no image work.
+      // When fan-out is off, the live path used [platformFormat] even if the
+      // empty-staticFormats branch in runConceptDrivenExpansion fell through —
+      // mirror that by emitting [pf] for a live image-capable surface.
+    } else if (isLiveFormat(platformFormat) && kindsForPlatformFormat(platformFormat).includes('image')) {
+      staticFormats = [platformFormat];
+    }
+  }
+
+  let videoFormats = [];
+  if (wantsVideo && isLiveFormat(platformFormat) && kindsForPlatformFormat(platformFormat).includes('video')) {
+    videoFormats = [platformFormat];
+  }
+
+  // Final belt-and-braces: never let a coming_soon key through.
+  staticFormats = filterLiveFormats(staticFormats);
+  videoFormats = filterLiveFormats(videoFormats);
+
+  const kindsOut = [];
+  if (staticFormats.length && wantsImage) kindsOut.push('image');
+  if (videoFormats.length && wantsVideo) kindsOut.push('video');
+
+  return { staticFormats, videoFormats, kinds: kindsOut };
 }
 
 module.exports = {
   PLATFORM_FORMATS,
   PLATFORM_FORMAT_KEYS,
+  LIVE_PLATFORM_FORMAT_KEYS,
   getFormatCaps,
+  isLiveFormat,
+  isComingSoonFormat,
+  platformForFormat,
+  channelLabelForFormat,
   aspectRatioForPlatformFormat,
   canvasForPlatformFormat,
   safeAreaForPlatformFormat,
@@ -209,6 +534,13 @@ module.exports = {
   kindsForPlatformFormat,
   resolveKinds,
   renderRouteForKind,
+  filterLiveFormats,
   META_STATIC_FANOUT,
-  staticFanoutForPlatformFormat
+  META_VIDEO_FANOUT,
+  META_VIDEO_MASTER,
+  staticFanoutForPlatformFormat,
+  videoFanoutForPlatformFormat,
+  PRESETS,
+  PRESET_KEYS,
+  resolvePreset
 };
