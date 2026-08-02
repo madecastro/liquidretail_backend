@@ -10,6 +10,53 @@ security, money, or the render queue** — it carries verified P0s with `path:li
 
 ---
 
+## 00. THE CATALOG PRODUCT-AD PIPELINE — owner-stated, 2026-08-02
+
+**This is the whole architecture for catalog-based product ads. There are no
+other generation pathways for them. Do not propose, restore, or "fall back to"
+one.** Owner, verbatim: *"We are no longer using ANY other generation pathways
+for video or static ads … we are not using any other generation pathways for
+catalog based product ads."*
+
+**VIDEO** — one generation, four deliverables:
+
+1. Resize the hero image to **9:16** with the **current** resizing system.
+2. **Omni** image-to-video → the 9:16 **master**. `google/gemini-omni-flash/
+   image-to-video-developer`. ONE submit per product. See §2 — everything named
+   `veo*` is this Omni pipeline under a legacy name.
+3. **Crop** the master to **4:5** and **1:1** (`videoCropUrl` +
+   `basePlateCropService`, face-anchored). Never a second generation.
+4. **Title each surface appropriately** — burned into the delivered file, using
+   that surface's own safe zone. Reels (204) and Stories (250) differ and must
+   not share one entry.
+5. **Preview** the result inside the matching **Meta surface overlay**.
+
+**STATIC** — direct to **gpt-image-2/edit**, one call returns the finished ad
+(`directImageRenderService`). No HTML, no Puppeteer, no SVG overlay compositing.
+
+### The overlay is PREVIEW ONLY — and it is not the titling
+
+Two different things, repeatedly confused, so state both:
+
+- **Titling / "chrome"** in `brandScriptExecutor` → `remotionRenderService` **is
+  burned into the video**. Correct and intended.
+- **The Meta surface overlay** — the simulated IG/FB furniture *including Meta's
+  current CTA treatment for that surface* — is **PREVIEW ONLY and MUST NOT be
+  burned in**. Owner: *"the meta overlays should include the current meta
+  treatment for CTA as those are not burned in the video."* An advertiser
+  uploads a clean asset; Meta draws its own UI.
+
+### SCOPE — read this before deleting anything
+
+Exclusivity covers **catalog-based product ads only**. Owner: *"existing
+alternate pathways will exist for social media images that get repurposed for
+ads."* So the HTML/Puppeteer and canvas paths are **not** automatically dead —
+some serve social-image repurposing. Before removing any renderer, prove which
+path a given entry point serves. And note `headlessScrapeService` uses Puppeteer
+for **scraping**, not generation — it stays regardless.
+
+---
+
 ## 0. THE ONE RULE THAT WOULD HAVE SAVED THE MOST TIME
 
 **Code being present does not mean the path is live.** This repo retires paths by
