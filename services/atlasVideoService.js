@@ -535,8 +535,11 @@ function omniFamilyNativeFor(requestedAspect) {
 //      (9:16 or 16:9) and let the compositor's c_fill,g_auto crop to
 //      the platform aspect. Cheaper + higher quality than Grok fallback,
 //      and avoids the "no native 4:5" trap that used to two-hop through
-//      Grok@3:4. Square (1:1) still falls back to Grok since neither
-//      Omni family is a clean crop source.
+//      Grok@3:4. Square (1:1) ALSO routes to Omni 9:16 by default — the
+//      "still falls back to Grok" this comment used to claim was already
+//      false when written: omniFamilyNativeFor returns '9:16' for 1:1
+//      unless SQUARE_VIA_OMNI_CROP=false (see the note at that function,
+//      owner decision 2026-07-29). Grok is now the square OPT-OUT only.
 //   4. Grok fallback: square-only remainder (or explicitly-selected
 //      non-Omni models whose caps.paramShape !== 'gemini-omni-*').
 //   5. resolveAspectRatioForModel runs against the FINAL model's caps

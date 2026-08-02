@@ -116,8 +116,28 @@ scraping. Video never launches a browser.
   instances; `VEO_CONCURRENCY` is per-process too (`routes/ads.js:144`).
 - **Each aspect ratio is its own billable generation.** `identityDigest` includes
   `aspectRatio`, so 1:1 + 4:5 + 9:16 = three Ads = three video submits. Nothing
-  reuses a sibling's `veoVideoUrl`. Omni supports only 16:9/9:16, so 1:1 and 4:5
-  force-route to Grok (`ASPECT_FALLBACK_MODEL`) — same concept, different model.
+  reuses a sibling's `veoVideoUrl`. **Measured in production 2026-08-01:** four
+  runs on one campaign/product/media produced four independent submits at 1:1,
+  1:1, 4:5 and 9:16 — four unrelated creatives, not one master in four sizes.
+- **"veo" IS A LEGACY NAME — the video model is Omni.** Corrected 2026-08-02.
+  `BUILT_IN_DEFAULT_MODEL` is `google/gemini-omni-flash/image-to-video-developer`
+  (`atlasVideoService.js:231`) and `ATLAS_VIDEO_MODEL` is **blank** in
+  `config/defaults.env`, so that default is what runs. Veo 3.1 is in `MODEL_CAPS`
+  but is not selectable. Everything spelled veo — `renderRoute:'veo'`,
+  `veoPredictionId`, `veoVideoUrl`, `VEO_CONCURRENCY`, `AI_VEO_FEED`,
+  `veoPromptBuilder`, `buildVeoPrompt` — is an Omni pipeline wearing an old name.
+  Do not infer the model from any of those identifiers.
+- **Every Meta video aspect already renders at Omni 9:16.** Omni's
+  `supportedAspectRatios` is exactly `['16:9','9:16']`, and
+  `omniFamilyNativeFor()` (`atlasVideoService.js:507`) ends
+  `return r < 1 ? '9:16' : '16:9'` — so 4:5 routes to 9:16, and 1:1 also routes
+  to 9:16 unless `SQUARE_VIA_OMNI_CROP=false`. The compositor then crops
+  face-anchored via `basePlateCropService` + `faceSafeCrop`. The previous claim
+  here — that 1:1 and 4:5 "force-route to Grok" — was **false**;
+  `ASPECT_FALLBACK_MODEL` (Grok Imagine) is now only the square opt-out and
+  explicitly-selected non-Omni models. Consequence: the crop-from-9:16 machinery
+  the owner asked to reuse already exists and is proven, so one-master fan-out is
+  about SHARING a master across sibling Ads, not about building cropping.
 
 ---
 
