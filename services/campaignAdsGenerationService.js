@@ -2366,8 +2366,21 @@ async function runConceptDrivenExpansion({
         batchRationale
       };
     } catch (err) {
+      // Carry the error CLASS as well as the message. A ReferenceError thrown
+      // inside the Director used to arrive at the operator as "Nothing to
+      // render", because the route could not distinguish a thrown product from
+      // an empty selection — see the errorEntries branch in routes/ads.js.
+      //
+      // Still return rather than rethrow: one product blowing up must not abort
+      // the siblings mid-Promise.all, which would change who gets billed.
       console.error(`📦 conceptDriven[${productTag}]: failed (${err.message})`);
-      return { productId, payloads: [], skipped: 'error', error: err.message };
+      return {
+        productId,
+        payloads: [],
+        skipped: 'error',
+        error: err && err.message ? err.message : String(err),
+        errorName: (err && err.constructor && err.constructor.name) || 'Error'
+      };
     }
   }));
 

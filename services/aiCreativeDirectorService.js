@@ -1460,7 +1460,13 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     // is false now. Corrected rather than left in place — a comment describing
     // retired behaviour is precisely what makes this codebase expensive to read.
     (() => {
-      const n = Array.isArray(seededUniverse) ? seededUniverse.length : 0;
+      // `universe` — the parameter this function actually declares. It read
+      // `seededUniverse` (the name the CALLER uses for the same array), which is
+      // an undeclared free variable, so every fresh Director round threw
+      // ReferenceError. Runs served from a cached CreativeDirectionArtifact were
+      // unaffected, which is why generation looked intermittently broken rather
+      // than broken.
+      const n = Array.isArray(universe) ? universe.length : 0;
       const ceiling = Math.min(4, Math.max(1, n));
       const pickPhrase = ceiling === 1
         ? `Pick EXACTLY 1 media per concept — the universe below holds a single image.`

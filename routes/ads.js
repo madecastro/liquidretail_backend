@@ -419,7 +419,31 @@ router.post('/generate', async (req, res) => {
         // video drafts and zero queued, and two consecutive Generates produced
         // nothing at all.
         const newlyQueued = Array.isArray(job.newAdIds) ? job.newAdIds.length : (job.newlyQueued || 0);
+
+        // A product that THREW is not a product that produced nothing, and the
+        // two used to collapse into the same "Nothing to render" done/total:0
+        // run. That is how a ReferenceError inside the Director — which broke
+        // every fresh concept round — reached the operator as an empty
+        // selection with no way to tell it from a hang.
+        const productErrors = (Array.isArray(job.perProduct) ? job.perProduct : [])
+          .filter((r) => r && r.skipped === 'error');
+        const errorEntries = productErrors.map((r, i) => ({
+          index: i,
+          stage: 'expand',
+          message: `${r.errorName || 'Error'}: ${r.error || 'unknown error'}` +
+                   (r.productId ? ` (product=${r.productId})` : '')
+        }));
+
         if (newlyQueued === 0) {
+          // Threw, so the run FAILED — it did not quietly finish with nothing.
+          if (errorEntries.length) {
+            await CampaignRun.updateOne(
+              { _id: run._id },
+              { status: 'failed', completedAt: new Date(),
+                $push: { errors: { $each: errorEntries } } }
+            );
+            return;
+          }
           // Say WHY. A run that ends done/total:0 with no reason is
           // indistinguishable from a hang, and that is how this shipped.
           const reason = job.alreadyQueued
@@ -431,6 +455,16 @@ router.post('/generate', async (req, res) => {
               $push: { errors: { index: 0, stage: 'expand', message: reason } } }
           );
           return;
+        }
+
+        // PARTIAL: some products queued, others threw. Record the throws so the
+        // run is not presented as a clean success, but do not abort — the ads
+        // that did queue are already paid for and must still render.
+        if (errorEntries.length) {
+          await CampaignRun.updateOne(
+            { _id: run._id },
+            { $push: { errors: { $each: errorEntries } } }
+          );
         }
 
         // Scope to the product(s) the operator actually picked. Unscoped, this
