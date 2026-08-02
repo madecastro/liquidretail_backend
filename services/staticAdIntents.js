@@ -412,10 +412,14 @@ function buildPrompt({ intentKey, data, product, surface }) {
    * read as type to set.
    */
   const textBlock = kept.length
-    ? `SET EXACTLY THESE STRINGS, verbatim, each appearing exactly once. Spelling is critical; a misspelling makes this unusable.
+    ? `SET EXACTLY THESE STRINGS, verbatim, each appearing exactly once — and set NOTHING ELSE. This is the complete and only text for this ad. It is not a template to fill in and nothing is missing from it. Spelling is critical; a misspelling makes this unusable.
 The words to the LEFT of each arrow name the element for your reference and must NEVER appear in the image. Render ONLY the text to the right of the arrow:
 ${kept.map(([role, str]) => `  ${role.toLowerCase()} -> ${str}`).join('\n')}
-Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.`
+Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.
+
+NEVER CREATE INFORMATION. Not a quote, not a name, not a rating, not a review count, not a price, discount, percentage, guarantee, award, certification or trust badge — not even a plausible one, not even to balance the composition. If it is not in the list above, it does not exist and it does not go in the ad. Leaving an element out is a design choice; inventing one is a false claim about the product.
+
+NONE OF THESE ELEMENTS IS REQUIRED. A shorter list is not a deficient brief — it is the accurate one. An ad carrying only a headline, or only a product shot and a CTA, is a finished ad.`
     : `THIS AD CARRIES NO TEXT AT ALL. Render a pure product image: no words, numerals, letterforms, logos or graphic marks of any kind, anywhere in the frame — including on signage, packaging, screens or clothing within the scene. The photograph alone has to do the work.`;
 
   const prompt = `Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
@@ -428,7 +432,7 @@ WHAT THIS AD HAS TO DO: ${typeof spec.goal === 'function' ? spec.goal(kept_) : s
 
 WHAT SHOULD WIN ATTENTION, in this order:
 ${emphasis.map((e, i) => `  ${i + 1}. ${e}`).join('\n')}
-That is an order of importance, not a layout. Express it however reads fastest.
+That is an order of importance, not a layout, and not a checklist. Express it however reads fastest. Any item in it that has no string in the text block below is simply not part of this ad — rank what is left and do not substitute anything for what is missing.
 
 ${textBlock}
 

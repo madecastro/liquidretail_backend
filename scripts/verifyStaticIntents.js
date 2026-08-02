@@ -181,6 +181,17 @@ for (const intentKey of intents) {
         falsy(`${label} no dangling set-text heading`, /SET EXACTLY THESE STRINGS/.test(p));
       } else {
         truthy(`${label} set-text heading present`, /SET EXACTLY THESE STRINGS/.test(p));
+        // The prompt must state, in as many words, that nothing may be invented
+        // and that no element is mandatory. Both sentences are load-bearing:
+        // a live render on 2026-08-01 carried the Director's own note that "No
+        // proof signal exists (no rating, no quote) ... rather than fabricated
+        // testimonial energy" AND a fabricated quote attributed to a named
+        // person, in the same prompt. The model was never told the list it was
+        // handed was already complete.
+        truthy(`${label} forbids inventing information`, /NEVER CREATE INFORMATION/.test(p));
+        truthy(`${label} declares no element mandatory`, /NONE OF THESE ELEMENTS IS REQUIRED/.test(p));
+        truthy(`${label} says the text list is complete`, /complete and only text for this ad/i.test(p));
+        truthy(`${label} emphasis list is not a checklist`, /not a checklist/i.test(p));
         const blockLines = (p.split('SET EXACTLY THESE STRINGS')[1] || '')
           .split('Set no other words')[0].trim().split('\n').length;
         truthy(`${label} text block non-empty`, blockLines > 1);
