@@ -46,14 +46,38 @@ Two different things, repeatedly confused, so state both:
   treatment for CTA as those are not burned in the video."* An advertiser
   uploads a clean asset; Meta draws its own UI.
 
-### SCOPE — read this before deleting anything
+### SCOPE — what constrains deletion, and what does not
 
-Exclusivity covers **catalog-based product ads only**. Owner: *"existing
-alternate pathways will exist for social media images that get repurposed for
-ads."* So the HTML/Puppeteer and canvas paths are **not** automatically dead —
-some serve social-image repurposing. Before removing any renderer, prove which
-path a given entry point serves. And note `headlessScrapeService` uses Puppeteer
-for **scraping**, not generation — it stays regardless.
+Exclusivity covers **catalog-based product ads** (`Ad.variantKind ===
+'product_image'`). Owner: *"existing alternate pathways will exist for social
+media images that get repurposed for ads."* `'ugc'` is that repurposed social
+image — **and it is also moving to the new pipeline** (owner, same day).
+
+Three things that do **NOT** constrain deletion, all owner-confirmed:
+
+- **Already-generated ads.** *"I am not worried about ads that have been
+  previously generated, they are already there."* They hold finished
+  `renderUrl`s. Old renderer code is only needed to RE-render them, which is not
+  a requirement. ~777 ugc and ~466 product_image rows sit on `html_gen`; none of
+  them is a reason to keep code.
+- **Brand pipeline flags.** *"All brands should be on the new pipeline now"* —
+  confirmed: 33 brands `null`, 1 `direct_overlay`, **zero** on `'html'`, and
+  `resolveStaticPipeline` maps everything except literal `'html'` to
+  `DIRECT_IMAGE`.
+- **`renderRoute: 'html_gen'`.** ANOTHER MISNOMER, same family as `veo*`.
+  `renderRouteForKind()` returns `'html_gen'` for every image ad regardless of
+  brand or variant — it means "static", not "the HTML renderer". The real
+  renderer is chosen inside `renderService`: `:470` sends every `ai_*` static ad
+  to `renderDirectImage` and returns. Production proves it — 20 rows are
+  `html_gen` + pipeline `direct_image`.
+
+**So the HTML renderer is unreachable for new generation.** It survives only for
+non-`ai_*` legacy templates, which §1 already documents as routing to the dead
+`renderViaSpec`.
+
+Still must stay: `headlessScrapeService`, `brandLogoIngestService` and
+`reviewHeadlessCapture` use Puppeteer for **scraping / ingest / review capture**,
+not generation.
 
 ---
 
