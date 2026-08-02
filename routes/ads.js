@@ -29,6 +29,7 @@ const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
 const { expandWizardJob, selectAdsForRun } = require('../services/campaignAdsGenerationService');
+const { assertGeneratablePlatformFormat } = require('../services/platformFormats');
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
@@ -187,6 +188,15 @@ router.post('/preview', async (req, res) => {
     } = req.body || {};
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
+    // Refuse an explicitly named coming_soon format with 400 (not empty/500).
+    try {
+      if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+    } catch (e) {
+      if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
+        return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
+      }
+      throw e;
+    }
 
     const phase3 = parsePhase3WizardFields(req.body || {});
     if (!phase3.ok) return res.status(phase3.status).json({ error: phase3.error });
@@ -223,6 +233,9 @@ router.post('/preview', async (req, res) => {
     });
     res.json(job);
   } catch (err) {
+    if (err.code === 'PLATFORM_FORMAT_COMING_SOON') {
+      return res.status(400).json({ error: err.message, code: err.code, platformFormat: err.platformFormat });
+    }
     console.error(`❌ POST /api/ads/preview failed: ${err.message}\n${err.stack || ''}`);
     res.status(500).json({ error: err.message || 'preview failed' });
   }
@@ -270,6 +283,15 @@ router.post('/generate', async (req, res) => {
 
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
+    // Refuse coming_soon before minting a CampaignRun / returning 202.
+    try {
+      if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+    } catch (e) {
+      if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
+        return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
+      }
+      throw e;
+    }
 
     const phase3 = parsePhase3WizardFields(req.body || {});
     if (!phase3.ok) return res.status(phase3.status).json({ error: phase3.error });
