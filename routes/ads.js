@@ -370,14 +370,33 @@ router.post('/generate', async (req, res) => {
           seedPicks: phase3.fields.seedPicks,
           videoPromptGuidance: phase3.fields.videoPromptGuidance,
           videoPromptRaw: phase3.fields.videoPromptRaw,
+          // Scopes the static identityDigest to THIS run, so generating twice on
+          // the same campaign produces two sets of ads instead of the second one
+          // colliding with the first and expanding to nothing.
+          generationRunId: run.runId,
           requestedBy: req.user?.userId || null
         });
 
-        if (job.queuedCount === 0) {
+        // `newlyQueued`, NOT `queuedCount`. queuedCount is
+        // countDocuments({ campaignId, status: 'queued' }) — every queued ad in
+        // the whole campaign, which is a different question entirely. It read 0
+        // for any campaign whose ads had all moved on to draft/rendered/failed,
+        // so a perfectly good expansion was discarded before selectAdsForRun and
+        // the run finished as done/total:0 with nothing on screen. Observed in
+        // production on 2026-08-01: campaign 6a6a52cd had 63 image drafts, 23
+        // video drafts and zero queued, and two consecutive Generates produced
+        // nothing at all.
+        const newlyQueued = Array.isArray(job.newAdIds) ? job.newAdIds.length : (job.newlyQueued || 0);
+        if (newlyQueued === 0) {
+          // Say WHY. A run that ends done/total:0 with no reason is
+          // indistinguishable from a hang, and that is how this shipped.
+          const reason = job.alreadyQueued
+            ? `Nothing new to render: all ${job.alreadyQueued} creative(s) for this selection are already queued.`
+            : 'Nothing to render: this selection produced no creatives. Check that the product has usable imagery and at least one template is selected.';
           await CampaignRun.updateOne(
             { _id: run._id },
             { status: 'done', completedAt: new Date(),
-              $push: { errors: { index: 0, stage: 'expand', message: 'No renderable creatives' } } }
+              $push: { errors: { index: 0, stage: 'expand', message: reason } } }
           );
           return;
         }

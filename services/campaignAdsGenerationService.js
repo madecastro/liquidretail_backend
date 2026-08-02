@@ -221,8 +221,33 @@ function readinessScoreForProductImage(matchTier) {
 // rejects the duplicate insert. paletteSource doubles the identity
 // space so media-palette and brand-palette renders for the same
 // (media, product, template, ratio, variant) coexist as separate Ads.
-function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams, rafflePrizeMediaId, kind }) {
+function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams, rafflePrizeMediaId, kind, generationRunId }) {
   const payload = JSON.stringify({
+    // SCOPED TO ONE RUN, by owner instruction: "there should be no limitation on
+    // creating new ads that may be duplicates since generative ads always have
+    // new seeds". Two Generate clicks on the same product/template/ratio are two
+    // different images, so refusing the second is wrong.
+    //
+    // The unique index still does its real job, because this is the RUN id, not
+    // a random value. Within a run the digest is stable, so the index keeps
+    // rejecting a genuine double-insert — a replayed handler, a retried batch,
+    // a reaper requeue — which is the money invariant it exists for (CLAUDE.md
+    // §2: generation POSTs are billable, submit once). Across runs it differs,
+    // so a fresh click produces fresh ads.
+    //
+    // Serialized as undefined when absent, which JSON.stringify OMITS — so the
+    // payload for any caller that does not pass it is byte-identical to the
+    // pre-2026-08-01 payload and their digests are unchanged.
+    // STATIC ONLY, enforced HERE rather than at the call site. The two kinds
+    // have opposite owner instructions — static is "no limitation on creating
+    // new ads that may be duplicates", video is "veo should only generate a
+    // video once for each product unless it is revised" — and a video digest
+    // that varied by run would re-bill a Veo master on every Generate. That is
+    // the expensive kind, so the rule belongs inside the function where no
+    // future caller can forget the ternary.
+    generationRunId: (generationRunId && String(kind || 'image') !== 'video')
+      ? String(generationRunId)
+      : undefined,
     campaignId:    String(campaignId),
     productId:     productId ? String(productId) : null,
     mediaId:       String(mediaId),
@@ -277,6 +302,13 @@ async function expandWizardJob({
   // behavior — one format, one generation per concept. Video is untouched by
   // this flag; it has its own (not yet built) companion-crop story.
   expandStaticFormats = false,
+  // The CampaignRun this expansion belongs to. Mixed into the static
+  // identityDigest so a second Generate on the same campaign produces new ads
+  // rather than colliding with the first run's and silently expanding to
+  // nothing — see computeIdentityDigest. Optional: when omitted the digest is
+  // byte-identical to the pre-2026-08-01 one, so the preview endpoint and any
+  // other caller keep their existing behaviour.
+  generationRunId = null,
   requestedBy  = null,
   // [{ productId, mediaId }] — globally drop these (productId, mediaId)
   // tuples from the cartesian. The wizard's Step 2 picker collects
@@ -415,7 +447,14 @@ async function expandWizardJob({
   // Resolve operator-requested kinds against the format's allowed kinds.
   // Wizard input (kinds param) wins over campaign.adKinds; falls back to
   // 'both' so legacy callers get the previous behavior.
-  const requestedKinds = kinds || campaign.adKinds || 'both';
+  // Defaults to STATIC, not 'both'. The product has two separate presets and
+  // the operator always picks one, so an unset value means "the wizard didn't
+  // say", never "make me one of each" — and 'both' made every static run also
+  // queue a Veo video, the most expensive kind, unasked. Measured 2026-08-01:
+  // 27 of 127 campaigns have adKinds unset and so took this path, and campaign
+  // 6a6a52cd carries 23 video drafts alongside its 63 image drafts as a result.
+  // A caller that genuinely wants both still passes 'both' explicitly.
+  const requestedKinds = kinds || campaign.adKinds || 'image';
   const { resolveKinds } = require('./platformFormats');
   let resolvedKinds = resolveKinds(effectivePlatformFormat, requestedKinds);
 
@@ -709,6 +748,9 @@ async function expandWizardJob({
               variantKind:   seed.variantKind,
               paletteSource,
               kind,
+              // Passed unconditionally; computeIdentityDigest drops it for
+              // video so a Veo master is not re-billed on every Generate.
+              generationRunId,
               ctaText, ctaUrl, ctaUrlParams,
               rafflePrizeMediaId
             });

@@ -147,7 +147,15 @@ function resolveKinds(platformFormat, requested) {
   const allowed = kindsForPlatformFormat(platformFormat);
   if (!allowed.length) return [];
   if (!requested || requested === 'both') return allowed;
-  return allowed.includes(requested) ? [requested] : allowed;
+  // A kind this surface does not support yields NOTHING for this surface.
+  //
+  // It used to fall back to `allowed`, which inverted the operator's choice
+  // into its opposite: asking for static on meta_reels_9_16 (kinds:['video'])
+  // returned ['video'] and billed a Veo generation for someone who picked
+  // static. The product has two separate presets — static fans out to the three
+  // Meta static sizes, video derives 4:5 and 1:1 from one 9:16 seed — so "you
+  // asked for a kind I don't have" must resolve to zero, not to the other one.
+  return allowed.includes(requested) ? [requested] : [];
 }
 
 // renderRoute the render pipeline dispatches on. Image → existing HTML Gen
