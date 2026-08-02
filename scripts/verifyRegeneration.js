@@ -89,6 +89,56 @@ for (const [field, value] of [
     d({ kind: 'image', generationRunId: runA }) !== d({ kind: 'image', generationRunId: runA, [field]: value }));
 }
 
+// ── R1c: the LIVE path. This is the one that mattered. ──────────────────
+// AI_CONCEPT_DRIVEN=true in config/defaults.env and on Render, so static ads
+// are built by runConceptDrivenExpansion and keyed by computeV2IdentityDigest.
+// The first version of this harness only exercised the legacy V1 digest and so
+// passed 22/22 while the live path was completely unfixed — an adversarial
+// review caught it, not these tests. Do not delete these.
+const V2 = {
+  campaignId: '6a6a52cdcb097b4db3f8084d',
+  productId: '6a6a4d58054561c15f3ff8a2',
+  platformFormat: 'meta_feed_1_1',
+  ctaText: 'Shop Now', ctaUrl: 'https://example.com', ctaUrlParams: ''
+};
+const v2 = (over) => gen.computeV2IdentityDigest({ ...V2, ...over });
+
+// concept_id is a SHORT SLUG the Director is told to make "unique within this
+// round" — so the same slug recurs across rounds by design. That reuse is what
+// made a second Generate produce nothing.
+const SLUG = 'cd_quote_lead';
+
+check('R1c V2: same run + same concept slug -> SAME digest',
+  v2({ conceptId: SLUG, kind: 'image', generationRunId: runA }) ===
+  v2({ conceptId: SLUG, kind: 'image', generationRunId: runA }));
+
+check('R1c V2: a REUSED concept slug in a NEW run -> DIFFERENT digest',
+  v2({ conceptId: SLUG, kind: 'image', generationRunId: runA }) !==
+  v2({ conceptId: SLUG, kind: 'image', generationRunId: runB }),
+  'this is the exact production failure: the Director reuses slugs, so without run scope the second Generate collides and yields zero ads');
+
+check('R1c V2: video ignores the run id (Veo once per product)',
+  v2({ conceptId: SLUG, kind: 'video', generationRunId: runA }) ===
+  v2({ conceptId: SLUG, kind: 'video', generationRunId: runB }));
+
+check('R1c V2: omitting the run id is byte-identical to legacy',
+  v2({ conceptId: SLUG, kind: 'image' }) === v2({ conceptId: SLUG, kind: 'image', generationRunId: null }));
+
+// The three static sizes of ONE concept in ONE run must stay distinct, or the
+// fan-out silently collapses to a single ad.
+const fanout = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16']
+  .map((fmt) => v2({ conceptId: SLUG, kind: 'image', platformFormat: fmt, generationRunId: runA }));
+check('R1c V2: the three static formats of one concept stay distinct in one run',
+  new Set(fanout).size === 3, `got ${new Set(fanout).size} distinct digests`);
+
+check('R1c V2: different concepts in one run stay distinct',
+  v2({ conceptId: 'cd_a', kind: 'image', generationRunId: runA }) !==
+  v2({ conceptId: 'cd_b', kind: 'image', generationRunId: runA }));
+
+check('R1c V2: image and video of one concept stay distinct',
+  v2({ conceptId: SLUG, kind: 'image', generationRunId: runA }) !==
+  v2({ conceptId: SLUG, kind: 'video', generationRunId: runA }));
+
 // ── R2: presets do not bleed into each other ────────────────────────────
 const KINDS = [
   ['meta_feed_1_1', 'image', ['image']],

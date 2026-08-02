@@ -303,6 +303,38 @@ router.post('/generate', async (req, res) => {
     //      the run to status='running' with total set and start the render
     //      loop. Errors land the run as status='failed' with a single
     //      error entry so the UI can surface them.
+    // ONE generation in flight per campaign. Checked in the DATABASE, not in
+    // memory: services/inFlight.js is per-process and this web service
+    // autoscales across several Render instances, so two clicks can land on two
+    // processes that cannot see each other.
+    //
+    // This guard is load-bearing as of 2026-08-01. Until the identityDigest was
+    // scoped to the run, a double-click was silently free — the second run's ads
+    // collided with the first's on the unique index and inserted nothing. That
+    // accident was the only thing standing between a stray double-click and a
+    // second full set of billable generations, and scoping the digest (which the
+    // owner asked for, so repeat Generates actually produce new creative)
+    // removed it. Every generation POST is charged on submit (CLAUDE.md §2).
+    //
+    // Stale runs are not allowed to lock a campaign forever: a 'preparing' or
+    // 'running' row older than the render ceiling is treated as dead. That bound
+    // is REAP_STALE_MIN, the same one worker.js uses to reclaim stuck ads, so the
+    // two cannot drift into disagreeing about what "stale" means.
+    const staleMin = Number(process.env.REAP_STALE_MIN || 15);
+    const active = await CampaignRun.findOne({
+      campaignId,
+      status: { $in: ['preparing', 'running'] },
+      createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
+    }).select('runId status createdAt').lean();
+    if (active) {
+      return res.status(409).json({
+        error: 'A generation is already running for this campaign. Wait for it to finish, or reload to see its progress.',
+        code: 'generation-already-running',
+        runId: active.runId,
+        startedAt: active.createdAt
+      });
+    }
+
     const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const renderToken = jwt.sign(
       {

@@ -229,11 +229,17 @@ function computeIdentityDigest({ campaignId, productId, mediaId, template, aspec
     // different images, so refusing the second is wrong.
     //
     // The unique index still does its real job, because this is the RUN id, not
-    // a random value. Within a run the digest is stable, so the index keeps
-    // rejecting a genuine double-insert — a replayed handler, a retried batch,
-    // a reaper requeue — which is the money invariant it exists for (CLAUDE.md
-    // §2: generation POSTs are billable, submit once). Across runs it differs,
+    // a random value: within a run the digest is stable, so a genuine
+    // double-insert inside one expansion still collides. Across runs it differs,
     // so a fresh click produces fresh ads.
+    //
+    // What this does NOT protect against, stated plainly because an earlier
+    // draft of this comment claimed otherwise: the worker reaper does not
+    // re-expand (worker.js only flips rendering->queued), and expand runs once
+    // per POST with no retry — so there is no requeue path for the index to
+    // catch here. The real remaining exposure is two rapid Generates minting
+    // two runIds and therefore two billable sets, which needs a concurrency
+    // guard on the route, not a digest change.
     //
     // Serialized as undefined when absent, which JSON.stringify OMITS — so the
     // payload for any caller that does not pass it is byte-identical to the
@@ -528,7 +534,8 @@ async function expandWizardJob({
         includeCategoryMatched, includeBrandMatched,
         excludePairings, creativeIntent: null,
         videoDurationSec,
-        videoPromptGuidance, videoPromptRaw
+        videoPromptGuidance, videoPromptRaw,
+        generationRunId
       });
     }
 
@@ -1573,10 +1580,26 @@ const CREATIVE_STYLE_TO_TEMPLATE = {
 // Per-concept identity. campaignId scopes uniqueness; conceptId +
 // productId + platformFormat distinguish within campaign. Independent
 // of media/template since the concept declares its own media + style.
-function computeV2IdentityDigest({ campaignId, productId, conceptId, platformFormat, kind, ctaText, ctaUrl, ctaUrlParams }) {
+function computeV2IdentityDigest({ campaignId, productId, conceptId, platformFormat, kind, ctaText, ctaUrl, ctaUrlParams, generationRunId }) {
   const parts = [
     String(campaignId),
     productId ? String(productId) : 'NULL',
+    // Run-scoped for STATIC, so a second Generate produces a second set of ads
+    // instead of colliding with the first on the (campaignId, identityDigest)
+    // unique index. Owner: "there should be no limitation on creating new ads
+    // that may be duplicates since generative ads always have new seeds."
+    //
+    // conceptId ALONE could never carry that, and the comment further down this
+    // file claiming fresh concept_ids make collisions "rare" is wrong:
+    // aiCreativeDirectorService asks the model for a "short slug (must be unique
+    // within this round)", so slugs like cd_quote_lead recur across rounds by
+    // design. That reuse is exactly what made two Generates in a row produce
+    // nothing on 2026-08-01.
+    //
+    // Video is excluded — "veo should only generate a video once for each
+    // product unless it is revised" — so a video digest stays run-independent
+    // and a repeat Generate cannot re-bill a Veo master.
+    (generationRunId && String(kind || 'image') !== 'video') ? String(generationRunId) : '',
     String(conceptId || ''),
     String(platformFormat || ''),
     String(kind || 'image'),                       // kind distinguishes image vs video variants of the same concept
@@ -2118,7 +2141,11 @@ async function runConceptDrivenExpansion({
   excludePairings, creativeIntent,
   videoDurationSec = null,                          // wizard-requested video length (sec); null = standard 8s
   videoPromptGuidance = null,                       // run-level guidance — stamped on video Ad rows
-  videoPromptRaw = null                             // run-level raw override — stamped on video Ad rows
+  videoPromptRaw = null,                            // run-level raw override — stamped on video Ad rows
+  // The CampaignRun this expansion belongs to. Mixed into the STATIC V2 digest
+  // so a repeat Generate makes new ads rather than colliding with the previous
+  // run's. Optional: omitting it reproduces the pre-2026-08-01 digest exactly.
+  generationRunId = null
 }) {
   const { resolveKinds, renderRouteForKind } = require('./platformFormats');
   const resolvedKinds = (Array.isArray(kinds) && kinds.length)
@@ -2311,7 +2338,9 @@ async function runConceptDrivenExpansion({
                 conceptId: concept.concept_id,
                 platformFormat: fmt,
                 kind,
-                ctaText, ctaUrl, ctaUrlParams
+                ctaText, ctaUrl, ctaUrlParams,
+                // Dropped for video inside computeV2IdentityDigest.
+                generationRunId
               }),
               ctaText, ctaUrl, ctaUrlParams,
               queuedAt:          new Date(),
@@ -2397,11 +2426,18 @@ async function runConceptDrivenExpansion({
   }
 
   // Bulk insert — ordered: false swallows dup-key per (campaignId,
-  // identityDigest) so re-running the wizard with the same product
-  // picks doesn't double-queue the same concepts. Note: each Generate
-  // press creates a NEW round with NEW concept_ids, so dup-key only
-  // hits when the operator re-runs without changing state and the
-  // Director happens to produce an identically-id'd concept (rare).
+  // identityDigest) so one expansion cannot double-queue the same concept.
+  //
+  // This used to claim "each Generate press creates a NEW round with NEW
+  // concept_ids, so dup-key only hits ... (rare)". That was false, and it is
+  // why static generation silently produced nothing. aiCreativeDirectorService
+  // asks the model for a "short slug (must be unique within this round)" — so
+  // slugs like cd_quote_lead recur across rounds BY DESIGN, and a second
+  // Generate collided on essentially every concept. Three runs on 2026-08-01
+  // ended done/total:0 for exactly this reason. The V2 digest is now scoped to
+  // the CampaignRun for static, so cross-run collision no longer happens and
+  // dup-key here is once again what the comment always said it was: a
+  // within-expansion safety net.
   let inserted = [];
   try {
     inserted = await Ad.insertMany(payloads, { ordered: false });
