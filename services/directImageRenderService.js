@@ -465,6 +465,30 @@ function taggedError(message, { alertLevel = 'error', alertKey }) {
   return err;
 }
 
+/**
+ * Map the regenerate API's promptOverride into the single flat prompt the
+ * image model accepts.
+ *
+ * Image/edit endpoints have NO system channel (CLAUDE.md §3). The route and
+ * Generation Details modal still speak `{ system, user }` because that was the
+ * HTML-layout LLM's shape. Dropping either half would silently discard the
+ * operator's edit; concatenating is the honest single-channel mapping.
+ * A bare string is also accepted for callers that already hold the flat prompt
+ * (e.g. Ad.imageGeneration.prompt from a prior direct_image render).
+ */
+function resolveImagePromptOverride(rawPromptOverride) {
+  if (rawPromptOverride == null) return null;
+  if (typeof rawPromptOverride === 'string') {
+    const s = rawPromptOverride.trim();
+    return s || null;
+  }
+  if (typeof rawPromptOverride !== 'object') return null;
+  const system = String(rawPromptOverride.system || '').trim();
+  const user   = String(rawPromptOverride.user   || '').trim();
+  if (system && user) return `${system}\n\n${user}`;
+  return user || system || null;
+}
+
 async function renderDirectImage({
   layoutInputArtifactId, aspectRatio, mediaId, productId, brandId,
   adConceptArtifactId, adConceptId, template, referenceMediaIds = [],
@@ -476,7 +500,13 @@ async function renderDirectImage({
   // The surface drives the safe box and the generation size. renderStage already
   // threads platformFormat through ...args and defaults it to meta_feed_1_1, so
   // this is a rename at the boundary, not a new requirement on callers.
-  platformFormat = 'meta_feed_1_1'
+  platformFormat = 'meta_feed_1_1',
+  // Regenerate hooks (adRegenerateService.runImage). Neither is charged until
+  // the single editImage submit below — they only rewrite the prompt string.
+  //   operatorPrompt     — refinement note appended to the auto-built prompt
+  //   rawPromptOverride  — verbatim replacement ({system,user} or string)
+  operatorPrompt = null,
+  rawPromptOverride = null
 }) {
   const surface = platformFormat || 'meta_feed_1_1';
   // Credentials are checked further down, AFTER brand routing: a brand
@@ -631,16 +661,40 @@ async function renderDirectImage({
   if (built.skipped) {
     return { skipped: true, routedToHtml: false, reason: `surface ${surface} takes no static image: ${built.skipped}` };
   }
-  if (built.error || !built.prompt) {
+  // Geometry (gen size + delivery crop) always comes from the intent surface,
+  // even when the operator replaces the prompt text — Sharp still needs the
+  // same crop band the model was told about, and a free surface lookup must
+  // not become a second billable submit.
+  if (built.error || !built.surface) {
     throw taggedError(
-      `intent prompt could not be built for ${intentKey}/${surface}: ${built.error || 'no prompt returned'}`,
+      `intent prompt could not be built for ${intentKey}/${surface}: ${built.error || 'no surface returned'}`,
       { alertLevel: 'error', alertKey: 'direct-image:intent-prompt-failed' }
     );
   }
-  const prompt = built.prompt;
+  const overrideText = resolveImagePromptOverride(rawPromptOverride);
+  let prompt;
+  if (overrideText) {
+    // Verbatim replacement — operator edited the exact prompt in Generation
+    // Details (or sent {system,user} from the legacy modal shape). One channel.
+    prompt = overrideText;
+  } else if (built.prompt) {
+    prompt = built.prompt;
+    // Refinement-note path: append, do not replace. Matches the HTML path's
+    // operatorPrompt threading without a second submit.
+    const note = String(operatorPrompt || '').trim();
+    if (note) {
+      prompt = `${prompt}\n\nOPERATOR REFINEMENT (honour this):\n${note}`;
+    }
+  } else {
+    throw taggedError(
+      `intent prompt could not be built for ${intentKey}/${surface}: no prompt returned`,
+      { alertLevel: 'error', alertKey: 'direct-image:intent-prompt-failed' }
+    );
+  }
   // The size the geometry block just promised the model. `built.surface.generate`
   // is "WxH" chosen by least-crop arithmetic against this surface's aspect, so it
-  // and the prompt can never disagree.
+  // and the prompt can never disagree when the auto-prompt is used; when the
+  // operator overrides text they still get this surface's crop/size.
   const genSize = built.surface.generate;
   // BEFORE the billable submit, deliberately. Everything this validates is known
   // from the surface alone, and an image model call is charged on submit — so a
@@ -772,5 +826,6 @@ module.exports = {
   describeProductForPrompt,
   conceptLook,
   normalizeReference,
+  resolveImagePromptOverride,
   renderDirectImage
 };

@@ -60,11 +60,15 @@ function toObjectId(id) {
   return mongoose.isValidObjectId(id) ? new mongoose.Types.ObjectId(String(id)) : null;
 }
 
+// Queueable templates ONLY. Stage 1 (2026-08-02): the 7 non-ai_* legacy
+// templates (creator_endorsement, product_overlay, results_proof,
+// review_collage, testimonial_overlay, testimonial_spotlight,
+// ugc_split_screen) are removed from this set so the cartesian can never
+// queue one. They route to renderViaSpec which cannot render (CLAUDE.md §1).
+// Existing Ads that already reference them keep their template string —
+// inspector / board / labels still resolve via templateRegistry. Do not
+// delete the registry entries.
 const SUPPORTED_TEMPLATES = new Set([
-  'testimonial_spotlight',
-  'ugc_split_screen',
-  'testimonial_overlay',
-  'product_overlay',
   // AI templates — each maps 1:1 to a creativeStyle in aiCanvasSpecService.
   // Operator enables one or more; cartesian fans across them so a 3-style
   // pick on 4 media = 12 ads in 3 directions instead of one safe default.
@@ -79,7 +83,8 @@ const SUPPORTED_TEMPLATES = new Set([
 // (the design IS a creator quote over a real-world photo) and don't
 // make sense for a catalog hero shot; others work for either source.
 // Cartesian is filtered by this map so we don't queue combos that
-// will look obviously wrong.
+// will look obviously wrong. Legacy keys kept for read-safety if any
+// code path still consults the map for an existing Ad's template.
 const TEMPLATE_SUPPORTS_VARIANT = {
   testimonial_spotlight: new Set(['ugc', 'product_image']),
   ugc_split_screen:      new Set(['ugc', 'product_image']),

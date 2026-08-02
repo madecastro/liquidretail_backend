@@ -1854,11 +1854,14 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 //            Required UNLESS promptOverride is given. Up to ~1000 chars.
 //   mode:    'light' (default, video only — re-runs chrome + composite,
 //                     Veo unchanged) | 'full' (re-runs Veo too).
-//            Image ads always do full HTML Gen re-render; mode ignored.
+//            Image ads always re-run the live direct_image renderer
+//            (gpt-image-2/edit); mode ignored.
 //   promptOverride: { system, user } — image ads only. The operator
 //            edited the EXACT prompt shown in the Generation Details
 //            modal; this text replaces the auto-composed prompt
 //            verbatim instead of being appended as a refinement note.
+//            Image models have one flat prompt channel — system+user
+//            are concatenated (see resolveImagePromptOverride).
 // Returns 202 with a poll target. Frontend polls
 // /api/catalog/:productId/ads-detail (or this ad's generation-inspector)
 // watching ad.regenerating.
