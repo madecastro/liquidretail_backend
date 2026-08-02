@@ -685,22 +685,27 @@ function buildPrompt({ input, template, aspectRatio, creativeStyle, richContext,
   // Hierarchy_spec the LLM emits should match the concept's archetype
   // and priorities — that's checked by the V2 consistency validator.
   if (directionConcept) {
+    // Project so v3 nested routing dual-reads flat and rationale is absent
+    // from the Generator prompt (2026-08-01 quarantine).
+    const { conceptForRender } = require('./conceptProjection');
+    const dc = conceptForRender(directionConcept) || directionConcept;
     userLines.push(`── CREATIVE DIRECTION (from the Director — MATERIALIZE THIS CONCEPT) ──`);
     userLines.push('```json');
     userLines.push(JSON.stringify({
-      concept_id:             directionConcept.concept_id,
-      name:                   directionConcept.name,
-      archetype:              directionConcept.archetype,
-      layout_family:          directionConcept.layout_family,
-      emotional_hook:         directionConcept.emotional_hook,
-      social_proof_type:      directionConcept.social_proof_type,
-      product_priority:       directionConcept.product_priority,
-      ugc_priority:           directionConcept.ugc_priority,
-      comment_priority:       directionConcept.comment_priority,
-      stat_priority:          directionConcept.stat_priority,
-      cta_emphasis:           directionConcept.cta_emphasis,
-      recommended_components: directionConcept.recommended_components || {},
-      rationale:              directionConcept.rationale
+      concept_id:             dc.concept_id,
+      name:                   dc.name,
+      archetype:              dc.archetype,
+      layout_family:          dc.layout_family,
+      emotional_hook:         dc.emotional_hook,
+      social_proof_type:      dc.social_proof_type,
+      product_priority:       dc.product_priority,
+      ugc_priority:           dc.ugc_priority,
+      comment_priority:       dc.comment_priority,
+      stat_priority:          dc.stat_priority,
+      cta_emphasis:           dc.cta_emphasis,
+      recommended_components: dc.recommended_components || {}
+      // rationale deliberately omitted — private Director reasoning must not
+      // reach the Generator prompt (2026-08-01 quarantine).
     }, null, 2));
     userLines.push('```');
     userLines.push(``);

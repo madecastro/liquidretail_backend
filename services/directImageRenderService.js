@@ -36,6 +36,9 @@ const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // assembly, so this gate should never fire — it exists because an artifact
 // cached before the producer-side filter landed can still carry one.
 const { isPrintableCustomerQuote } = require('./quoteProvenance');
+// THE sanctioned concept reader. Direct reads of concept.rationale on this
+// path are how private Director reasoning became art direction on 2026-08-01.
+const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
 
 const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
@@ -290,15 +293,22 @@ function describeProductForPrompt({ concept, product, layoutInput }) {
   ).slice(0, 400).trim();
 }
 
-/** The brand's visual world, handed to the model instead of a font family. */
-function conceptLook(concept, layoutInput) {
-  const parts = [
-    concept?.art_direction || concept?.rationale || null,
-    concept?.emotional_hook || null,
-    layoutInput?.brand?.visual_style || null
-  ].filter(Boolean).map(v => String(v).trim());
-  if (!parts.length) return null;
-  return parts.join(' ').slice(0, 600);
+/**
+ * The brand's visual world, handed to the model instead of a font family.
+ *
+ * WAS (2026-08-01 live defect): fell through art_direction || rationale, then
+ * concatenated emotional_hook and layoutInput.brand.visual_style. art_direction
+ * was never emitted by any Director schema, so rationale — private honesty-rule
+ * notes, objection analysis — became the art brief 100% of the time. visual_style
+ * is never assembled by layoutInputService either. emotional_hook names a purchase
+ * objection, not a mood.
+ *
+ * NOW: art_direction only, via conceptProjection. Null when the Director gave
+ * none; the prompt sentence is then omitted. No Brand.tone fallback — voice
+ * words are not a visual world (absent means absent).
+ */
+function conceptLook(concept /*, layoutInput — retained arg position unused */) {
+  return artDirectionLook(concept);
 }
 
 // ── The SVG overlay renderer was DELETED here on 2026-07-31 ───────────────
@@ -374,7 +384,8 @@ function intentForTemplate(template) {
  *     owner's density rule sacrifices it first anyway.
  */
 function buildIntentData({ concept, layoutInput, brand, cta }) {
-  const copy = concept?.copy_picks || {};
+  // Dual-read v3 copy / v2 copy_picks. Never invent a headline from product name.
+  const copy = renderableCopy(concept);
   const proof = layoutInput?.social_proof || {};
   // ALLOWLIST. A quote reaches the pixels only if something positively vouched
   // for it — never merely because nothing flagged it.
@@ -437,7 +448,11 @@ async function resolveConcept({ adConceptArtifactId, adConceptId, expectedProduc
       { alertLevel: 'error', alertKey: 'direct-image:concept-product-mismatch' }
     );
   }
-  return artifact.concepts?.find((c) => c.concept_id === adConceptId) || null;
+  const raw = artifact.concepts?.find((c) => c.concept_id === adConceptId) || null;
+  // Project before any prompt builder can see the Mongo Mixed subdoc. Reasoning
+  // (rationale) is stripped here so the live image path cannot re-introduce the
+  // 2026-08-01 leak by reading concept.rationale directly.
+  return conceptForRender(raw);
 }
 
 // Tag an error with how loudly it should be reported. renderService raises
@@ -606,7 +621,7 @@ async function renderDirectImage({
     data: intentData,
     product: {
       desc: describeProductForPrompt({ concept, product: resolvedProduct, layoutInput: effectiveLayout.input || {} }),
-      look: conceptLook(concept, effectiveLayout.input || {}),
+      look: conceptLook(concept),
       logoCorner: 'bottom-right'
     },
     surface

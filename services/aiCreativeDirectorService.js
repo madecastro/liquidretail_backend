@@ -38,7 +38,7 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '2.4.0';   // 2.4: platform-format-aware (Phase 3). Director now receives platformFormat (meta_feed_1_1 | meta_reels_9_16) and the prompt has a FORMAT CONSTRAINTS section that weights archetypes per surface — Reels deprioritizes typographic_dominant + magazine_editorial + product_card_grid (text/inset patterns don't read on tall vertical with safe-area reservations), favors hero_quote_overlay + full_bleed_hero_bottom_panel (chrome lives in the middle safe band). 2.3: PMA-based matchedMediaIds + brand-review fallback. 2.2: file_type_distribution added. 2.1: N_CONCEPTS 2 → 4. 2.0: full data projection.
+const DIRECTOR_SIGNALS_VERSION = '3.0.0';   // 3.0: nest concept into { routing, copy, art_direction, reasoning } so private rationale cannot fall through into image prompts as art direction (2026-08-01 leak). art_direction is OPTIONAL visual prose only; copy.* are the only letterforms; reasoning.rationale is private. Bumps cache so existing flat v2 artifacts re-derive. 2.4: platform-format-aware (Phase 3). 2.3: PMA-based matchedMediaIds + brand-review fallback. 2.2: file_type_distribution. 2.1: N_CONCEPTS 2 → 4. 2.0: full data projection.
 
 // Canonical archetype enum (the 8 we've been using, with descriptive
 // names matching the contract). Director picks from these; Generator
@@ -935,8 +935,10 @@ function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbidd
     reasons.push(`"concepts" must contain exactly ${nConcepts} items, got ${concepts.length}`);
   }
 
-  // Only strings that end up rendered count as ad copy.
-  const copyOf = (c) => Object.values(c?.copy_picks || {}).filter(v => typeof v === 'string');
+  // Only strings that end up rendered count as ad copy. Dual-read v3 `copy`
+  // and legacy v2 `copy_picks` so a mixed batch during the nest migration is
+  // still scanned for product-name / pricing leaks.
+  const copyOf = (c) => Object.values(c?.copy || c?.copy_picks || {}).filter(v => typeof v === 'string');
   // A one- or two-character product name would match almost any copy; substring
   // matching is only meaningful for a reasonably distinctive name.
   const checkable = forbiddenStrings.filter(s => String(s).trim().length >= 4);
@@ -945,19 +947,20 @@ function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbidd
   concepts.forEach((c, i) => {
     if (!c || typeof c !== 'object') { reasons.push(`concepts[${i}] is not an object`); return; }
 
-    // copy_picks.headline is the contract field; the others are older shapes kept
-    // so a contract change does not silently disable the duplicate check.
-    const primary = c.copy_picks?.headline ?? c.headline ?? c.primary_line ?? null;
+    // copy.headline (v3) / copy_picks.headline (v2) is the contract field; older
+    // flat shapes kept so a contract change does not silently disable the
+    // duplicate check.
+    const primary = c.copy?.headline ?? c.copy_picks?.headline ?? c.headline ?? c.primary_line ?? null;
     if (primary && String(primary).trim()) primaries.push(String(primary).trim().toLowerCase());
 
     const copy = copyOf(c).join('  ');
     for (const bad of checkable) {
       if (copy.toLowerCase().includes(String(bad).toLowerCase())) {
-        reasons.push(`concepts[${i}].copy_picks contains the product name "${bad}", which must not appear in ad copy`);
+        reasons.push(`concepts[${i}].copy contains the product name "${bad}", which must not appear in ad copy`);
       }
     }
     if (/(\$\s?\d|[£€]\s?\d|\b\d+% ?off\b|\bdiscount\b|\bsavings?\b|\bsale\b)/i.test(copy)) {
-      reasons.push(`concepts[${i}].copy_picks contains pricing or discount language, which is switched off system-wide`);
+      reasons.push(`concepts[${i}].copy contains pricing or discount language, which is switched off system-wide`);
     }
   });
 
@@ -972,7 +975,7 @@ function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbidd
 }
 
 const N_CONCEPTS_ROUND       = 3;
-const ROUND_VERSION          = '1.0.0';   // bump when the round schema/prompt shape changes
+const ROUND_VERSION          = '3.0.0';   // 3.0: nested {routing,copy,art_direction,reasoning}; bump when the round schema/prompt shape changes
 const DIRECTOR_ROUND_MODEL   = 'director'; // claude-sonnet-5 — see atlasModelMap
 // Lowered from 0.8. The bake-off's one real defect was a REPEATED primary line
 // across two concepts, and the same prompt produced it on one run and not the
@@ -1280,8 +1283,8 @@ async function directConceptsRound({
   // append-only inserts don't collide with the legacy unique constraint.
   const artifact = await CreativeDirectionArtifact.create({
     ...filter,
-    contractVersion:    '2.0',
-    contractSchemaId:   'creative_direction_round.v1',
+    contractVersion:    '3.0',
+    contractSchemaId:   'creative_direction_round.v3',
     signalsVersion:     DIRECTOR_SIGNALS_VERSION,
     roundIndex,
     seedUniverseHash,
@@ -1321,16 +1324,23 @@ async function loadAvoidList(filter, maxRounds) {
   const out = [];
   for (const row of rows.reverse()) {  // chronological order in the prompt
     for (const c of row.concepts || []) {
-      const mediaPickIds = Array.isArray(c.media_picks)
-        ? c.media_picks.map(p => p.media_id).filter(Boolean).slice(0, 4).join(',')
-        : '-';
-      const headline = c.copy_picks?.headline
-        ? `copy="${String(c.copy_picks.headline).slice(0, 60)}"`
+      // Dual-read flat v2 and nested v3 so the avoid list still summarises
+      // cached pre-nest artifacts during the one-deploy dual-read window.
+      const routing = c.routing || {};
+      const picks = Array.isArray(routing.media_picks) ? routing.media_picks
+        : (Array.isArray(c.media_picks) ? c.media_picks : []);
+      const mediaPickIds = picks.map(p => p.media_id).filter(Boolean).slice(0, 4).join(',') || '-';
+      const headlineStr = c.copy?.headline ?? c.copy_picks?.headline;
+      const headline = headlineStr
+        ? `copy="${String(headlineStr).slice(0, 60)}"`
         : '';
+      const archetype = routing.archetype ?? c.archetype;
+      const style = routing.creative_style ?? c.creative_style;
+      const shape = (routing.output_shape ?? c.output_shape)?.format;
       out.push(
-        `[round ${row.roundIndex}] archetype=${c.archetype || '-'} ` +
-        `style=${c.creative_style || '-'} ` +
-        `shape=${c.output_shape?.format || '-'} ` +
+        `[round ${row.roundIndex}] archetype=${archetype || '-'} ` +
+        `style=${style || '-'} ` +
+        `shape=${shape || '-'} ` +
         `media=[${mediaPickIds}] ${headline}`.trim()
       );
     }
@@ -1355,7 +1365,7 @@ function renderBrandVoiceBlock(voice) {
     lines.push(`  CTA patterns (dominant): ${top}`);
   }
   if (voice.voice_summary) lines.push(`  Summary: ${voice.voice_summary}`);
-  lines.push(`  Use this voice profile to calibrate emotional_hook, copy_picks tone, and CTA wording. Where it conflicts with the operator's tagline, the operator wins; where it conflicts with the campaign brief below, the campaign brief wins.`);
+  lines.push(`  Use this voice profile to calibrate emotional_hook, copy.* tone, and CTA wording. Where it conflicts with the operator's tagline, the operator wins; where it conflicts with the campaign brief below, the campaign brief wins.`);
   return lines.join('\n');
 }
 
@@ -1436,17 +1446,23 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
   const system = [
     `You are a senior creative director planning social-media ad creative.`,
     ``,
-    `Your job: emit ${N_CONCEPTS_ROUND} distinct creative concepts. Each concept declares: archetype + composition strategy (the V1 fields), WHICH media from the seeded universe it uses (media_picks), what output shape it materializes (output_shape), and the final copy strings it ships (copy_picks).`,
+    `Your job: emit ${N_CONCEPTS_ROUND} distinct creative concepts. Each concept declares: archetype + composition strategy inside routing, WHICH media from the seeded universe it uses (routing.media_picks), what output shape it materializes (routing.output_shape), the final copy strings it ships (copy), optional visual art_direction, and private reasoning.`,
     ``,
     `ROUND CONTEXT: this is round ${roundIndex} for this product on ${platformFormat}. Earlier rounds (if any) are summarized in the AVOID block below. Each Generate press from the operator triggers a new round; concept diversity across rounds matters as much as within-round diversity.`,
     ``,
     OBJECTIVE_BLOCK,
     ``,
+    `STRUCTURAL RULES (absolute — violating these ships broken ads):`,
+    `- copy.headline / copy.subheadline / copy.eyebrow / copy.cta are the ONLY strings that may appear as letterforms in the ad. Write them as final, shippable copy — not notes, not strategy.`,
+    `- art_direction is OPTIONAL visual prose only: mood, light, material, type energy, palette feel. It MUST be null when you have no visual brief. NEVER put honesty-rule notes, "because", "no proof", "leans on", objection analysis, or any "why I chose this" text in art_direction. Those belong exclusively in reasoning.rationale.`,
+    `- reasoning.rationale is PRIVATE. It explains which purchase objection the concept removes and which signal supports it. It is NEVER rendered, NEVER shown to an image model, NEVER used as art direction. "Looks premium" is not a rationale.`,
+    `- ABSENT MEANS ABSENT. Never invent proof, ratings, quotes, or a visual world to fill a gap. If there is no visual brief, art_direction is null — do not substitute honesty notes or brand-voice commentary.`,
+    ``,
     `RULES:`,
     `- DO NOT generate coordinates, rects, or pixel positions. The Layout stage materializes pixels from your strategy + media_picks + output_shape declaration.`,
     `- The ${N_CONCEPTS_ROUND} concepts MUST be meaningfully different — different archetype OR different media-pick combination OR different output_shape OR different copy angle.`,
     `- Lead with the STRONGEST signal in the data.`,
-    `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself.`,
+    `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set routing.social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself. Record that choice in reasoning.rationale only — never in art_direction or copy.`,
     // The pick ceiling is derived from the universe actually supplied, not
     // hardcoded. It used to always say "1-4" even when the universe held a
     // single hero — asking for a multi-image composition that cannot be built
@@ -1471,15 +1487,15 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       const pickPhrase = ceiling === 1
         ? `Pick EXACTLY 1 media per concept — the universe below holds a single image.`
         : `Pick 1-${ceiling} media per concept; every one you pick is sent to the image model as a reference, so pick only what the composition genuinely uses.`;
-      return `- MEDIA PICKS: every media_id you reference in media_picks MUST appear in the SEEDED UNIVERSE block below. Pick by media_id verbatim. role is a short label describing how the media sits in your composition. ${pickPhrase} Reels picks 1 video (preferred) or 1-4 image references for Veo synthesis.`;
+      return `- MEDIA PICKS: every media_id you reference in routing.media_picks MUST appear in the SEEDED UNIVERSE block below. Pick by media_id verbatim. role is a short label describing how the media sits in your composition. ${pickPhrase} Reels picks 1 video (preferred) or 1-4 image references for Veo synthesis.`;
     })(),
-    `- [CRITICAL] The SEEDED UNIVERSE is PRE-RANKED by shot-type quality: lifestyle > on_model > flat_lay > product_only > detail > packaging. Earlier entries are BETTER seeds for animation and stronger composition anchors — STRONGLY prefer them for media_picks[0]. Only reach for lower-ranked entries when a specific concept archetype requires that shot type (e.g. product_card_grid can use flat_lay/product_only intentionally, hero_quote_overlay wants lifestyle/on_model).`,
+    `- [CRITICAL] The SEEDED UNIVERSE is PRE-RANKED by shot-type quality: lifestyle > on_model > flat_lay > product_only > detail > packaging. Earlier entries are BETTER seeds for animation and stronger composition anchors — STRONGLY prefer them for routing.media_picks[0]. Only reach for lower-ranked entries when a specific concept archetype requires that shot type (e.g. product_card_grid can use flat_lay/product_only intentionally, hero_quote_overlay wants lifestyle/on_model).`,
     platformFormat === 'meta_reels_9_16'
-      ? `- OUTPUT SHAPE (Reels): format MUST be "reels_storyboard". duration_sec ∈ [${REELS_DURATION_MIN_SEC}, ${REELS_DURATION_MAX_SEC}] (Veo native clip range). storyboard_beats is an array of overlay timing events Puppeteer renders as transparent PNGs and Cloudinary composites onto Veo's base video. Each beat: { t_start (seconds), t_end, role ∈ ${STORYBOARD_BEAT_ROLES.join('|')}, position ∈ ${STORYBOARD_POSITIONS.join('|')}, emphasis ∈ ${STORYBOARD_EMPHASIS.join('|')} }. Beats may overlap. Honor the Reels safe zones in your position picks (top reserved 0-220px, bottom reserved 1558-1778px — use middle positions for chrome that needs to be visible past IG/FB UI).`
-      : `- OUTPUT SHAPE (Feed): format ∈ ${FEED_OUTPUT_SHAPES.join(' | ')}; tile_count matches media_picks.length.`,
-    `- COPY PICKS: write the final strings the renderer will ship. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, and social_proof_signal.primary_quote when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy_picks by role — each beat's role MUST map to a non-null copy_picks field (e.g. role=headline beat requires copy_picks.headline non-null).`,
+      ? `- OUTPUT SHAPE (Reels): routing.output_shape.format MUST be "reels_storyboard". duration_sec ∈ [${REELS_DURATION_MIN_SEC}, ${REELS_DURATION_MAX_SEC}] (Veo native clip range). storyboard_beats is an array of overlay timing events Puppeteer renders as transparent PNGs and Cloudinary composites onto Veo's base video. Each beat: { t_start (seconds), t_end, role ∈ ${STORYBOARD_BEAT_ROLES.join('|')}, position ∈ ${STORYBOARD_POSITIONS.join('|')}, emphasis ∈ ${STORYBOARD_EMPHASIS.join('|')} }. Beats may overlap. Honor the Reels safe zones in your position picks (top reserved 0-220px, bottom reserved 1558-1778px — use middle positions for chrome that needs to be visible past IG/FB UI).`
+      : `- OUTPUT SHAPE (Feed): routing.output_shape.format ∈ ${FEED_OUTPUT_SHAPES.join(' | ')}; tile_count matches media_picks.length.`,
+    `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, and social_proof_signal.primary_quote when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`,
     `- ONE PRODUCT ONLY: every string you write describes product_signal.name and nothing else. brand_signal.* and brand_reviews_summary cover the WHOLE catalog — they are there for voice and tone, never for product facts. Never name, describe, or borrow the attributes of another item (a different garment, cut, fabric, or use case) even when the brand material talks about it. If the brand voice material is about a different product, take only its register and write fresh copy about THIS one. Concretely: a t-shirt ad never mentions leggings, joggers, or their fit.`,
-    `- CREATIVE STYLE: pick one of ${CREATIVE_STYLES_ENUM.join(' | ')}.`,
+    `- CREATIVE STYLE: pick one of ${CREATIVE_STYLES_ENUM.join(' | ')} into routing.creative_style.`,
     ``,
     formatConstraints,
     ``,
@@ -1492,32 +1508,34 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     campaignBriefBlock ? campaignBriefBlock + '\n' : '',
     avoidBlock,
     ``,
-    `SEEDED MEDIA UNIVERSE (use media_id verbatim in media_picks; vision attachments below show the first ${VISION_ATTACHMENT_CAP}):`,
+    `SEEDED MEDIA UNIVERSE (use media_id verbatim in routing.media_picks; vision attachments below show the first ${VISION_ATTACHMENT_CAP}):`,
     universeBlock,
     ``,
-    `AVAILABLE ARCHETYPES (pick one per concept):`,
+    `AVAILABLE ARCHETYPES (pick one per concept into routing.archetype):`,
     AVAILABLE_ARCHETYPES.map(a => `  ${a}`).join('\n'),
     ``,
-    `AVAILABLE ROLES (used in recommended_components — map of role → component_style):`,
+    `AVAILABLE ROLES (used in routing.recommended_components — map of role → component_style):`,
     ROLES.map(r => `  ${r}: [${(COMPONENT_STYLE_BY_ROLE[r] || []).join(', ')}]`).join('\n'),
     ``,
-    `Per concept emit:`,
-    `  concept_id       — short slug (must be unique within this round)`,
-    `  name             — human-readable concept name`,
-    `  archetype        — one of the available archetypes`,
-    `  layout_family    — short alias`,
-    `  emotional_hook   — what the ad triggers`,
-    `  social_proof_type — testimonial / stat / creator / review / rating / none`,
-    `  *_priority       — high/medium/low/absent for product, ugc, comment, stat`,
-    `  cta_emphasis     — primary/secondary/minimal/absent`,
-    `  creative_style   — one of the creative styles enum`,
-    `  recommended_components — map of role → component_style`,
-    `  media_picks      — [{ media_id, role, notes }] referencing SEEDED UNIVERSE`,
+    `Per concept emit (nested shape — additionalProperties false at every level):`,
+    `  concept_id          — short slug (must be unique within this round)`,
+    `  name                — human-readable concept name`,
+    `  routing             — strategy block:`,
+    `    archetype         — one of the available archetypes`,
+    `    layout_family     — short alias`,
+    `    emotional_hook    — purchase OBJECTION the concept dissolves ("fit certainty", "worth the price"), not a visual mood`,
+    `    social_proof_type — testimonial / stat / creator / review / rating / none`,
+    `    *_priority        — high/medium/low/absent for product, ugc, comment, stat`,
+    `    cta_emphasis      — primary/secondary/minimal/absent`,
+    `    creative_style    — one of the creative styles enum`,
+    `    recommended_components — map of role → component_style`,
+    `    media_picks       — [{ media_id, role, notes }] referencing SEEDED UNIVERSE`,
     platformFormat === 'meta_reels_9_16'
-      ? `  output_shape     — { format: 'reels_storyboard', duration_sec, storyboard_beats: [{t_start, t_end, role, position, emphasis}] }`
-      : `  output_shape     — { format, tile_count }`,
-    `  copy_picks       — { headline, subheadline, eyebrow, cta } final strings (nullable per role)`,
-    `  rationale        — 1-2 sentences explaining how the signal + universe drove the call`
+      ? `    output_shape      — { format: 'reels_storyboard', duration_sec, storyboard_beats: [{t_start, t_end, role, position, emphasis}] }`
+      : `    output_shape      — { format, tile_count }`,
+    `  copy                — { headline, subheadline, eyebrow, cta } final strings (nullable per role) — ONLY letterforms`,
+    `  art_direction       — null OR { look, palette_hint, typography_hint } visual prose only; null if no visual brief`,
+    `  reasoning           — { rationale } PRIVATE: which objection + which signal. Never visual notes.`
   ].join('\n');
 
   const user = [
@@ -1528,7 +1546,7 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     ``,
     creativeIntent ? `OPERATOR HINT: ${creativeIntent}` : `OPERATOR HINT: none — you decide.`,
     ``,
-    `Emit ${N_CONCEPTS_ROUND} distinct concepts that honor the AVOID block, draw from the SEEDED UNIVERSE, and ground every copy_pick in real signal.`
+    `Emit ${N_CONCEPTS_ROUND} distinct concepts that honor the AVOID block, draw from the SEEDED UNIVERSE, and ground every copy.* field in real signal.`
   ].join('\n');
 
   return { system, user, visionImages };
@@ -1582,8 +1600,93 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
         }
       };
 
+  // Nested v3 shape. Private reasoning lives under reasoning.rationale so a
+  // render path that only reads art_direction / copy cannot reach it. Transport
+  // is still response_format json_object (Atlas 400s on strict json_schema for
+  // Anthropic); this schema is for the hand-rolled non-fatal validator only.
+  const routingSchema = {
+    type: 'object',
+    additionalProperties: false,
+    required: [
+      'archetype', 'layout_family', 'emotional_hook', 'social_proof_type',
+      'product_priority', 'ugc_priority', 'comment_priority', 'stat_priority',
+      'cta_emphasis', 'creative_style', 'recommended_components',
+      'media_picks', 'output_shape'
+    ],
+    properties: {
+      archetype:         { type: 'string', enum: AVAILABLE_ARCHETYPES },
+      layout_family:     { type: 'string' },
+      emotional_hook:    { type: 'string' },
+      social_proof_type: { type: 'string' },
+      product_priority:  { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
+      ugc_priority:      { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
+      comment_priority:  { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
+      stat_priority:     { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
+      cta_emphasis:      { type: 'string', enum: ['primary', 'secondary', 'minimal', 'absent'] },
+      creative_style:    { type: 'string', enum: [...CREATIVE_STYLES_ENUM] },
+      recommended_components: {
+        type: 'object',
+        additionalProperties: false,
+        required: [...ROLES],
+        properties: Object.fromEntries(
+          ROLES.map(r => [r, { type: ['string', 'null'] }])
+        )
+      },
+      media_picks: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 4,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['media_id', 'role', 'notes'],
+          properties: {
+            media_id: { type: 'string' },
+            role:     { type: 'string' },
+            notes:    { type: ['string', 'null'] }
+          }
+        }
+      },
+      output_shape: outputShapeSchema
+    }
+  };
+
+  const copySchema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['headline', 'subheadline', 'eyebrow', 'cta'],
+    properties: {
+      headline:    { type: ['string', 'null'] },
+      subheadline: { type: ['string', 'null'] },
+      eyebrow:     { type: ['string', 'null'] },
+      cta:         { type: ['string', 'null'] }
+    }
+  };
+
+  const artDirectionSchema = {
+    // null = no visual brief (correct when honesty rule leaves only typography
+    // strategy). Object is OPTIONAL visual prose only — never honesty notes.
+    type: ['object', 'null'],
+    additionalProperties: false,
+    required: ['look', 'palette_hint', 'typography_hint'],
+    properties: {
+      look:             { type: ['string', 'null'] },
+      palette_hint:     { type: ['string', 'null'] },
+      typography_hint:  { type: ['string', 'null'] }
+    }
+  };
+
+  const reasoningSchema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['rationale'],
+    properties: {
+      rationale: { type: 'string' }
+    }
+  };
+
   return {
-    name: isReels ? 'creative_director_round_reels_v1' : 'creative_director_round_feed_v1',
+    name: isReels ? 'creative_director_round_reels_v3' : 'creative_director_round_feed_v3',
     schema: {
       type: 'object',
       additionalProperties: false,
@@ -1597,62 +1700,15 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
             type: 'object',
             additionalProperties: false,
             required: [
-              'concept_id', 'name', 'archetype', 'layout_family',
-              'emotional_hook', 'social_proof_type',
-              'product_priority', 'ugc_priority', 'comment_priority', 'stat_priority', 'cta_emphasis',
-              'creative_style',
-              'recommended_components', 'rationale',
-              'media_picks', 'output_shape', 'copy_picks'
+              'concept_id', 'name', 'routing', 'copy', 'art_direction', 'reasoning'
             ],
             properties: {
-              concept_id:        { type: 'string' },
-              name:              { type: 'string' },
-              archetype:         { type: 'string', enum: AVAILABLE_ARCHETYPES },
-              layout_family:     { type: 'string' },
-              emotional_hook:    { type: 'string' },
-              social_proof_type: { type: 'string' },
-              product_priority:  { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
-              ugc_priority:      { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
-              comment_priority:  { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
-              stat_priority:     { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
-              cta_emphasis:      { type: 'string', enum: ['primary', 'secondary', 'minimal', 'absent'] },
-              creative_style:    { type: 'string', enum: [...CREATIVE_STYLES_ENUM] },
-              recommended_components: {
-                type: 'object',
-                additionalProperties: false,
-                required: [...ROLES],
-                properties: Object.fromEntries(
-                  ROLES.map(r => [r, { type: ['string', 'null'] }])
-                )
-              },
-              rationale: { type: 'string' },
-              media_picks: {
-                type: 'array',
-                minItems: 1,
-                maxItems: 4,
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  required: ['media_id', 'role', 'notes'],
-                  properties: {
-                    media_id: { type: 'string' },
-                    role:     { type: 'string' },
-                    notes:    { type: ['string', 'null'] }
-                  }
-                }
-              },
-              output_shape: outputShapeSchema,
-              copy_picks: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['headline', 'subheadline', 'eyebrow', 'cta'],
-                properties: {
-                  headline:    { type: ['string', 'null'] },
-                  subheadline: { type: ['string', 'null'] },
-                  eyebrow:     { type: ['string', 'null'] },
-                  cta:         { type: ['string', 'null'] }
-                }
-              }
+              concept_id:    { type: 'string' },
+              name:          { type: 'string' },
+              routing:       routingSchema,
+              copy:          copySchema,
+              art_direction: artDirectionSchema,
+              reasoning:     reasoningSchema
             }
           }
         }
@@ -1662,12 +1718,13 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
   };
 }
 
-// Soft-warning validator for V2 concepts. Hard rejection moves to the
+// Soft-warning validator for round concepts. Hard rejection moves to the
 // Judge in A4. Here we surface useful diagnostics:
 //   • duplicate concept_ids within a round
 //   • media_picks referencing IDs outside the seeded universe
 //   • output_shape.tile_count != media_picks.length
-//   • all copy_picks null (probably an LLM miss)
+//   • all copy fields null (probably an LLM miss)
+// Dual-reads flat v2 and nested v3 so a mixed cache window still diagnoses.
 function validateConceptsRound(concepts, seededUniverse) {
   const warnings = [];
   if (!Array.isArray(concepts) || !concepts.length) {
@@ -1677,6 +1734,10 @@ function validateConceptsRound(concepts, seededUniverse) {
   const universeIds = new Set(seededUniverse.map(u => String(u.mediaId)));
   const conceptIds = new Set();
 
+  // Flatten routing + copy for dual-read of v2 (flat) and v3 (nested).
+  const routeOf = (c) => (c && c.routing && typeof c.routing === 'object') ? c.routing : (c || {});
+  const copyOf  = (c) => (c && (c.copy || c.copy_picks)) || {};
+
   for (const c of concepts) {
     if (!c?.concept_id) continue;
     if (conceptIds.has(c.concept_id)) {
@@ -1684,7 +1745,9 @@ function validateConceptsRound(concepts, seededUniverse) {
     }
     conceptIds.add(c.concept_id);
 
-    const picks = Array.isArray(c.media_picks) ? c.media_picks : [];
+    const r = routeOf(c);
+    const picks = Array.isArray(r.media_picks) ? r.media_picks
+      : (Array.isArray(c.media_picks) ? c.media_picks : []);
     for (const p of picks) {
       if (!p?.media_id) continue;
       if (!universeIds.has(String(p.media_id))) {
@@ -1692,36 +1755,37 @@ function validateConceptsRound(concepts, seededUniverse) {
       }
     }
 
-    const tileCount = c.output_shape?.tile_count;
+    const shape = r.output_shape ?? c.output_shape;
+    const tileCount = shape?.tile_count;
     if (typeof tileCount === 'number' && tileCount !== picks.length) {
       warnings.push(`concept ${c.concept_id}: output_shape.tile_count=${tileCount} != media_picks.length=${picks.length}`);
     }
 
-    const cp = c.copy_picks || {};
+    const cp = copyOf(c);
     if (cp.headline == null && cp.subheadline == null && cp.eyebrow == null && cp.cta == null) {
-      warnings.push(`concept ${c.concept_id}: all copy_picks are null (likely LLM miss)`);
+      warnings.push(`concept ${c.concept_id}: all copy fields are null (likely LLM miss)`);
     }
 
     // Single-format sanity
-    if (c.output_shape?.format === 'static_single' && picks.length !== 1) {
+    if (shape?.format === 'static_single' && picks.length !== 1) {
       warnings.push(`concept ${c.concept_id}: output_shape=static_single requires 1 media_pick (got ${picks.length})`);
     }
-    if (['static_collage', 'static_grid'].includes(c.output_shape?.format) && (picks.length < 2 || picks.length > 4)) {
-      warnings.push(`concept ${c.concept_id}: output_shape=${c.output_shape.format} requires 2-4 media_picks (got ${picks.length})`);
+    if (['static_collage', 'static_grid'].includes(shape?.format) && (picks.length < 2 || picks.length > 4)) {
+      warnings.push(`concept ${c.concept_id}: output_shape=${shape.format} requires 2-4 media_picks (got ${picks.length})`);
     }
 
     // Reels storyboard sanity (Phase B1):
     //   • duration_sec within [REELS_DURATION_MIN_SEC, REELS_DURATION_MAX_SEC]
     //   • beats t_end > t_start
     //   • beats t_end <= duration_sec
-    //   • beat role maps to a non-null copy_picks field (where applicable)
+    //   • beat role maps to a non-null copy field (where applicable)
     //   • at least one beat present
-    if (c.output_shape?.format === 'reels_storyboard') {
-      const dur = c.output_shape.duration_sec;
+    if (shape?.format === 'reels_storyboard') {
+      const dur = shape.duration_sec;
       if (typeof dur !== 'number' || dur < REELS_DURATION_MIN_SEC || dur > REELS_DURATION_MAX_SEC) {
         warnings.push(`concept ${c.concept_id}: reels_storyboard duration_sec=${dur} outside [${REELS_DURATION_MIN_SEC},${REELS_DURATION_MAX_SEC}]`);
       }
-      const beats = Array.isArray(c.output_shape.storyboard_beats) ? c.output_shape.storyboard_beats : [];
+      const beats = Array.isArray(shape.storyboard_beats) ? shape.storyboard_beats : [];
       if (!beats.length) {
         warnings.push(`concept ${c.concept_id}: reels_storyboard has zero storyboard_beats`);
       }
@@ -1730,7 +1794,7 @@ function validateConceptsRound(concepts, seededUniverse) {
         eyebrow:     'eyebrow',
         subheadline: 'subheadline',
         cta:         'cta'
-        // badge/quote/stat/logo don't bind to copy_picks — they're
+        // badge/quote/stat/logo don't bind to copy — they're
         // either signal-derived (rating, stat) or brand-derived (logo).
       };
       for (const beat of beats) {
@@ -1743,7 +1807,7 @@ function validateConceptsRound(concepts, seededUniverse) {
         }
         const requiredCopyField = copyRoleToField[beat.role];
         if (requiredCopyField && cp[requiredCopyField] == null) {
-          warnings.push(`concept ${c.concept_id}: beat role=${beat.role} references copy_picks.${requiredCopyField} which is null`);
+          warnings.push(`concept ${c.concept_id}: beat role=${beat.role} references copy.${requiredCopyField} which is null`);
         }
       }
     }
@@ -1752,10 +1816,13 @@ function validateConceptsRound(concepts, seededUniverse) {
   // Distinctness — fingerprint by archetype + output_shape + media-pick-set + headline angle.
   if (concepts.length >= 2) {
     const fingerprints = concepts.map(c => {
-      const ms = Array.isArray(c.media_picks)
-        ? c.media_picks.map(p => p.media_id).sort().join(',')
-        : '';
-      return `${c.archetype}|${c.output_shape?.format}|${ms}|${(c.copy_picks?.headline || '').slice(0, 30)}`;
+      const r = routeOf(c);
+      const picks = Array.isArray(r.media_picks) ? r.media_picks
+        : (Array.isArray(c.media_picks) ? c.media_picks : []);
+      const ms = picks.map(p => p.media_id).sort().join(',');
+      const shape = r.output_shape ?? c.output_shape;
+      const headline = (c.copy?.headline || c.copy_picks?.headline || '').slice(0, 30);
+      return `${r.archetype ?? c.archetype}|${shape?.format}|${ms}|${headline}`;
     });
     if (new Set(fingerprints).size < concepts.length) {
       warnings.push(`concepts not distinct — fingerprints: ${fingerprints.join(' / ')}`);
