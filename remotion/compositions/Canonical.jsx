@@ -18,6 +18,9 @@ import { SLOT_RENDERERS } from '../components/slotRenderers.jsx';
 import { slotEnvelope, slotProgress, specTimeScale } from '../lib/timing.js';
 import { stackContainerStyle, SAFE_ZONES } from '../lib/safeZones.js';
 import { contrastToken } from '../lib/tokens.js';
+import { resolveSlotContent } from '../lib/slotContent.js';
+// Re-export pure resolver for offline harnesses (same decision as render).
+export { resolveSlotContent, resolveSlotContentCore, truncateWordSafe } from '../lib/slotContent.js';
 
 const BAND_FOR_ANCHOR = { top: 'top', upperThird: 'top', center: 'middle', lowerThird: 'bottom', bottom: 'bottom' };
 
@@ -74,7 +77,7 @@ function resolveGroupAnchor(plateHints, authoredAnchor, atSec, { logShift = fals
 // follows the bulk of the visible copy, and the layered shadows carry
 // the minority band. Votes the EFFECTIVE (post keep-out) anchor so ink
 // matches the pixels actually under the shifted stack.
-function plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors) {
+function plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors, allSlots) {
   // Render console — sweeps grep `inkVote:`. Always emit so every render
   // is auditable even when plate scan is off / empty.
   const logVote = (lightWeight, darkWeight, onLight) => {
@@ -91,7 +94,7 @@ function plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors) {
   let darkWeight = 0;
   for (const group of groups) {
     const first = group.items[0];
-    const rendered = group.items.filter((s) => resolveSlotContent(s, meta) != null).length;
+    const rendered = group.items.filter((s) => resolveSlotContent(s, meta, allSlots) != null).length;
     if (!rendered) continue;
     const atSec = first.timing.enterAtSec * timeScale + 0.5;
     const key = `${group.phase}|${group.anchor}`;
@@ -104,107 +107,6 @@ function plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors) {
   const onLight = lightWeight > darkWeight;
   logVote(lightWeight, darkWeight, onLight);
   return onLight;
-}
-
-// Extract the value a bind-chain entry contributes at this render.
-// Entries are either meta field names (strings) OR literal fallback
-// objects ({ literal: <value> }). Literals always "win" if reached —
-// they're the operator's "if nothing else, show this" floor.
-function extractBindEntry(entry, meta) {
-  if (entry && typeof entry === 'object' && Object.prototype.hasOwnProperty.call(entry, 'literal')) {
-    return entry.literal;
-  }
-  return meta?.[entry];
-}
-
-// Word-safe display cap: never cut mid-word; ellipsis only BETWEEN words.
-// Used for productName (close-phase / endcard lead) and multi-item strings
-// that previously hard-sliced. If no space exists in the first half of the
-// window, fall back to a hard cut so pathological one-word titles still fit.
-export function truncateWordSafe(str, maxLen) {
-  const s = String(str ?? '').replace(/\s+/g, ' ').trim();
-  if (!maxLen || maxLen < 1 || s.length <= maxLen) return s;
-  const window = s.slice(0, maxLen);
-  let cut = window.lastIndexOf(' ');
-  if (cut < Math.floor(maxLen * 0.5)) cut = maxLen;
-  const out = s.slice(0, cut).trimEnd();
-  return out.length < s.length ? `${out}…` : out;
-}
-
-// Per-slot character caps for on-screen text. productName is the one that
-// previously printed mid-word SKU titles on the close phase ("…(Dark…").
-const TEXT_CHAR_CAP = {
-  productName: 48,
-  headline: 72,
-  quote: 120,
-  deliveryLine: 40,
-  badge: 28,
-  promo: 28,
-  productDescription: 80,
-  tagline: 56,
-};
-
-function resolveSlotContent(slot, meta) {
-  const brandMode = meta?.endcardMode === 'brand';
-  if (!slot.visible) return null;
-  if (brandMode && slot.brandMode === 'hide') return null;
-
-  if (slot.key === 'rating') {
-    const rating = Number(meta?.rating);
-    if (!Number.isFinite(rating) || rating <= 0) return null;
-    return {
-      rating: Math.min(5, Math.max(0, rating)),
-      reviewsText: meta?.reviewsText || (meta?.reviewCount ? `${meta.reviewCount} reviews` : ''),
-    };
-  }
-
-  const chain = brandMode && slot.brandModeBind ? slot.brandModeBind : slot.bind;
-
-  // Multi-value slots return the source array (capped at maxItems, empty
-  // slots skipped). Bind chain picks the first non-empty array; a
-  // literal entry always short-circuits with its embedded array.
-  // Item COUNT is still sliced at maxItems; each item string is
-  // word-safe-truncated so CSS line-clamp is not the only mid-word risk.
-  if (slot.slotType === 'multi') {
-    for (const entry of chain) {
-      const arr = extractBindEntry(entry, meta);
-      if (Array.isArray(arr) && arr.length > 0) {
-        const cap = slot.treatment?.maxItems ?? 4;
-        const itemCharCap = 40;
-        const items = arr
-          .filter((v) => v != null && String(v).trim() !== '')
-          .map((v) => truncateWordSafe(String(v).trim(), itemCharCap))
-          .slice(0, cap);
-        if (items.length > 0) return items;
-      }
-    }
-    return null;
-  }
-
-  // Image slots return the URL string. Same first-non-empty semantics as
-  // text, but the value stays as-is (no .trim() on URLs beyond whitespace).
-  if (slot.slotType === 'image') {
-    for (const entry of chain) {
-      const v = extractBindEntry(entry, meta);
-      if (typeof v === 'string' && v.trim() !== '') return v.trim();
-    }
-    return null;
-  }
-
-  // Text: first non-empty stringified value in the bind chain. Literal
-  // entries always contribute (they can't be "empty" by construction —
-  // the validator rejects null literals). productName (and a few other
-  // long-copy slots) get word-safe char caps so the close phase never
-  // prints a mid-word SKU clip.
-  for (const entry of chain) {
-    const v = extractBindEntry(entry, meta);
-    if (v != null && String(v).trim() !== '') {
-      const raw = String(v).trim();
-      const charCap = TEXT_CHAR_CAP[slot.key];
-      return charCap ? truncateWordSafe(raw, charCap) : raw;
-    }
-  }
-  return null;
 }
 
 function groupSlots(slots) {
@@ -263,11 +165,15 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
     }
     return map;
   }, [plateHints, groups, timeScale]);
+  // Full slot list for visibleWhenEmpty sibling lookups (same array the
+  // group map was built from — includes every phase/anchor).
+  const allSlots = spec?.slots || [];
+
   // Global ink color — every group flips together or not at all. Votes the
   // post keep-out band so ink matches pixels under the shifted stack.
   const inkOnLight = useMemo(
-    () => plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors),
-    [plateHints, groups, timeScale, meta, groupAnchors]
+    () => plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors, allSlots),
+    [plateHints, groups, timeScale, meta, groupAnchors, allSlots]
   );
 
   return (
@@ -290,8 +196,11 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
         return (
           <div key={`${group.phase}|${group.anchor}`} style={{ ...container, gap: Math.round((spec.stack?.rowGapPct ?? 0.018) * height) }}>
             {rows.map((row, ri) => {
-              const rendered = row.slots.map((rawSlot) => {
-                const content = resolveSlotContent(rawSlot, meta);
+              const rendered = row.slots.map((rawSlot, si) => {
+                // Same-anchor same-phase slots stack as a flex column (container
+                // gap). Empty siblings drop out — e.g. proof falls back to
+                // claim+rating when quote is gated empty (visibleWhenEmpty).
+                const content = resolveSlotContent(rawSlot, meta, allSlots);
                 if (content == null) return null;
                 const Renderer = SLOT_RENDERERS[rawSlot.key];
                 if (!Renderer) return null;
@@ -310,7 +219,7 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
                 const progress = slotProgress({ frame, fps, timing: slot.timing, durationInFrames, timeScale });
                 return (
                   <div
-                    key={slot.key}
+                    key={`${group.phase}|${slot.key}|${ri}-${si}`}
                     style={{
                       opacity: env.opacity,
                       transform: env.transform,

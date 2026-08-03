@@ -104,7 +104,7 @@
             "fontRole": "heading",
             "weight": 700,
             "maxLines": 3,
-            "sizeScale": 1.1
+            "sizeScale": 1.32
           }
         },
         {
@@ -130,8 +130,41 @@
             "casing": "none",
             "fontRole": "quote",
             "weight": 500,
-            "maxLines": 3
+            "maxLines": 3,
+            "sizeScale": 1.15
           }
+        },
+        {
+          "key": "headline",
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 4,
+            "exitAtSec": 6.3,
+            "enterDurationSec": 0.7,
+            "exitDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 3,
+            "sizeScale": 1.122
+          },
+          "bind": [
+            "headline"
+          ],
+          "visibleWhenEmpty": "quote",
+          "_note": "Proof claim restatement when quote is gated empty \u2014 sits above rating lockup (owner 2026-08-05)."
         },
         {
           "key": "reviewer",
@@ -184,7 +217,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -209,7 +243,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "maxLines": 2
+            "maxLines": 2,
+            "sizeScale": 1.2
           }
         },
         {
@@ -235,7 +270,8 @@
             "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           },
           "visible": true
         }
@@ -329,7 +365,7 @@
             "fontRole": "heading",
             "weight": 700,
             "maxLines": 2,
-            "sizeScale": 1.05
+            "sizeScale": 1.26
           }
         },
         {
@@ -354,7 +390,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "maxLines": 2
+            "maxLines": 2,
+            "sizeScale": 1.2
           }
         },
         {
@@ -378,7 +415,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -404,7 +442,8 @@
             "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           },
           "visible": true
         }
@@ -498,7 +537,7 @@
             "fontRole": "heading",
             "weight": 700,
             "maxLines": 1,
-            "sizeScale": 1.05
+            "sizeScale": 1.26
           }
         },
         {
@@ -523,7 +562,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.2
           }
         },
         {
@@ -547,7 +587,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -573,7 +614,8 @@
             "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           },
           "visible": true
         }
@@ -671,7 +713,7 @@
             "fontRole": "heading",
             "weight": 700,
             "maxLines": 3,
-            "sizeScale": 1.05
+            "sizeScale": 1.26
           }
         },
         {
@@ -697,7 +739,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -722,7 +765,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "maxLines": 2
+            "maxLines": 2,
+            "sizeScale": 1.2
           }
         },
         {
@@ -749,7 +793,8 @@
             "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           },
           "visible": true
         }

@@ -1,6 +1,6 @@
 {
   "name": "proto-bottom-editorial",
-  "description": "EXPERIMENTAL scoring prototype — inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
+  "description": "EXPERIMENTAL scoring prototype \u2014 inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -49,7 +49,7 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 700,
-            "sizeScale": 1.1,
+            "sizeScale": 1.32,
             "maxLines": 2
           }
         },
@@ -76,9 +76,41 @@
             "casing": "none",
             "fontRole": "quote",
             "weight": 500,
-            "sizeScale": 1,
+            "sizeScale": 1.15,
             "maxLines": 2
           }
+        },
+        {
+          "key": "headline",
+          "phase": "proof",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.88
+          },
+          "timing": {
+            "enterAtSec": 2.75,
+            "exitAtSec": 4.8,
+            "enterDurationSec": 0.55,
+            "exitDurationSec": 0.4
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 3,
+            "sizeScale": 1.122
+          },
+          "bind": [
+            "headline"
+          ],
+          "visibleWhenEmpty": "quote",
+          "_note": "Proof claim restatement when quote is gated empty \u2014 sits above rating lockup (owner 2026-08-05)."
         },
         {
           "key": "reviewer",
@@ -132,7 +164,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -157,7 +190,7 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "sizeScale": 1,
+            "sizeScale": 1.2,
             "maxLines": 2
           }
         },
@@ -185,7 +218,7 @@
             "fontRole": "body",
             "weight": 600,
             "maxLines": 1,
-            "sizeScale": 1.1
+            "sizeScale": 1.265
           }
         },
         {
@@ -214,7 +247,8 @@
             "weight": 700,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           }
         }
       ]
@@ -255,7 +289,7 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 700,
-            "sizeScale": 1.05,
+            "sizeScale": 1.26,
             "maxLines": 2
           }
         },
@@ -281,7 +315,8 @@
             "casing": "none",
             "fontRole": "quote",
             "weight": 500,
-            "maxLines": 2
+            "maxLines": 2,
+            "sizeScale": 1.15
           }
         },
         {
@@ -333,7 +368,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -358,7 +394,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "maxLines": 2
+            "maxLines": 2,
+            "sizeScale": 1.2
           }
         },
         {
@@ -385,7 +422,7 @@
             "fontRole": "body",
             "weight": 600,
             "maxLines": 1,
-            "sizeScale": 1.1
+            "sizeScale": 1.265
           }
         },
         {
@@ -414,7 +451,8 @@
             "weight": 700,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           }
         }
       ]
@@ -455,7 +493,7 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 700,
-            "sizeScale": 1.05,
+            "sizeScale": 1.26,
             "maxLines": 1
           }
         },
@@ -481,7 +519,8 @@
             "casing": "none",
             "fontRole": "quote",
             "weight": 500,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.15
           }
         },
         {
@@ -506,7 +545,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -531,7 +571,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.2
           }
         },
         {
@@ -558,7 +599,7 @@
             "fontRole": "body",
             "weight": 600,
             "maxLines": 1,
-            "sizeScale": 1.1
+            "sizeScale": 1.265
           }
         },
         {
@@ -587,7 +628,8 @@
             "weight": 700,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           }
         }
       ]
@@ -628,7 +670,7 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 700,
-            "sizeScale": 1.05,
+            "sizeScale": 1.26,
             "maxLines": 2
           }
         },
@@ -654,7 +696,8 @@
             "casing": "none",
             "fontRole": "quote",
             "weight": 500,
-            "maxLines": 2
+            "maxLines": 2,
+            "sizeScale": 1.15
           }
         },
         {
@@ -679,7 +722,8 @@
             "casing": "none",
             "fontRole": "body",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.25
           }
         },
         {
@@ -704,7 +748,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 600,
-            "maxLines": 1
+            "maxLines": 1,
+            "sizeScale": 1.2
           }
         },
         {
@@ -731,7 +776,7 @@
             "fontRole": "body",
             "weight": 600,
             "maxLines": 1,
-            "sizeScale": 1.1
+            "sizeScale": 1.265
           }
         },
         {
@@ -760,7 +805,8 @@
             "weight": 700,
             "maxLines": 1,
             "colorToken": "ctaText",
-            "trackingPx": 1.2
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
           }
         }
       ]
