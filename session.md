@@ -7,7 +7,26 @@ was judged superseded and dropped **deliberately**, not lost.
 
 ## Next-session prompt
 
-_(empty — no pending owner prompt)_
+**START HERE — 2026-08-04 pickup, in this order.**
+
+1. **MERGE PR #32 FIRST — it makes every spend number meaningful.** Open since 2026-07-31.
+   `models/CostLog.js:53` enum is `['ok','error','timeout']` but
+   `atlasVideoService.js:2636` writes `status:'submitted'`, so mongoose REJECTS the write and
+   `persistCost` swallows it by design (console.warn only). **Every Atlas video generation
+   since `f60c1c7` has recorded ZERO spend.** Same bug hits image `'failed'` and
+   `'charged-no-output'` — the latter being the "paid but got nothing" path that
+   `atlasImageService.js:414` calls the most under-reported spend in the ledger.
+   This supersedes the softer framing in item 6 below (I recorded video cost as
+   *unreconciled*; it is in fact *unrecorded*). It also explains why the 2026-08-03 spend-alert
+   test looked inconclusive — there were no rows to aggregate. Three-value enum widen.
+
+2. **Then the Remotion compositor failure (item 4a).** Until titling completes, nothing about
+   fonts, safe zones or the canonical prompt can be evaluated — every run yields a paid master
+   and no titled output.
+
+3. **Then fonts (4b) and safe zones (4c)** — both silent, both live, both cheap.
+
+Everything from 2026-08-03 is merged and deployed. Working tree clean, 29/29 verify green.
 
 ---
 
