@@ -782,12 +782,53 @@ under them was broken — the star-row guard pin matched an identical expression
 the regex pin matched the old pattern quoted in its own explanatory comment. Source pins must
 strip comments and assert PROXIMITY. Both were caught only by revert-proofing.
 
-**STILL TO DO (owner-gated):** land/abandon the concurrent session → commit → deploy both services
-→ run `node scripts/backfillBrandReviews.js` (dry run first; owner approved apply-to-all) → $0
-re-title of AllBirds `6a70c584f33c6cfd76d43e54` + GymShark `6a70cf95f33c6cfd76d46b6b` (both
-confirmed to hold paid masters) → frame-check the proof beat after settle (~4.6s) at native res.
-NOTE the brand-quote path cannot be validated by re-title alone: `primary_quote` is baked in at
-ASSEMBLY time, so those media need a `buildLayoutInput` rebuild first.
+### 0.29999 SHIPPED — live on prod, both services (2026-08-03 18:39)
+
+**The concurrent session committed MY work along with theirs**: `0319c68` ("Parallel generations
++ wizard reference prewarm; land session's titling work") → merged `9fda078`. Both Render
+services report `Live 9fda078e…`, finished 18:39. Every fix verified present in HEAD after their
+merge (nothing mangled), and the **full suite is 40/40 on the merged tree**.
+So the shared-tree problem resolved itself — no cherry-picking was needed.
+
+**NOT YET EXERCISED IN PROD.** Checked the logs after deploy: zero `ratingPair:` lines, and the
+newest `quote scope` lines still carry the OLD "withheld" wording from 16:46. Nothing has
+rendered since 18:38. Confidence rests on 40/40 harnesses + the 26-check proof-beat harness +
+the 9-shape execution trace — not on a live frame yet.
+**It will engage on its own with the team's next video generation**: the generation path now
+refreshes a stale artifact automatically (`refreshStaleLayoutInput`), so a fresh 4.1 artifact
+with the brand-tier quote is built before titling. No manual step needed for NEW videos.
+Watch for `ratingPair: source=brand-count` and `🔓 quote scope — brand-tier quote WON`.
+
+**BACKFILL: STOOD DOWN, and it was the right call twice over.**
+1. Owner 2026-08-03: *"don't make any changes to ingestion my colleague is working on that,
+   let's focus on the selection, curation, and integration into the ads."* The backfill drives
+   `brandEnrichmentService` = ingestion. Out of scope now.
+2. The dry run proved it would be **waste anyway**: all 17 candidate brands already carry
+   `brand-reviews` in `enrichmentSources`, so `wantBrandReviews` is false for every one — it
+   would fetch **zero** brand ratings while still firing billable `gpt`/`scraped`/`brandfetch`/
+   logo/font tiers, on a list that is mostly junk (`Apple`, `Test`, `Test 2`, `Egami`, two
+   duplicate `Hot Crispy Oil` docs). Re-fetching brand reviews would require clearing
+   `brand-reviews` from `enrichmentSources` — deliberately NOT done unilaterally.
+   `scripts/backfillBrandReviews.js` is committed and dry-run-safe for whenever it IS wanted.
+
+**CORRECTION — AllBirds DOES have brand review data.** Earlier in this session I reported "AllBirds
+has no brand rating at all" and it is in the plan file that way. Queried fresh post-deploy:
+**AllBirds `3.8 / 2,667 reviews / 6 quotes`** (`enrichmentSources`: brandfetch, tailwind, scraped,
+gpt, brand-reviews) and **GymShark `3.3 / 41,000 / 6 quotes`**. Both FAIL the >4.5 star gate and
+both have a real count plus brand quotes — so both are now ideal live cases for the count-only
+proof beat, and neither needs any enrichment. My earlier "no data" read was wrong; this is the
+record.
+
+**Remaining (optional) validation:** $0 re-title of AllBirds `6a70c584f33c6cfd76d43e54` or
+GymShark `6a70cf95f33c6cfd76d46b6b` (both hold paid masters) to see the beat without waiting for a
+generation. Requires a `buildLayoutInput({…, refresh:true})` first, because `primary_quote` is
+baked in at ASSEMBLY time and both artifacts predate the brand-tier fallback. Reuse the existing
+artifact's own `template`/`aspectRatio` for the refresh so the right cache entry is overwritten.
+**Blocked purely on ops:** `render-ssh` rate-limits after ~10 rapid sessions and was exhausted by
+script staging. `resolveTitleTemplate` is NOT exported from atlasVideoService — read the template
+off the artifact doc instead. And a driver in `/tmp` cannot resolve app modules by relative path:
+require via absolute `/opt/render/project/src/...` (`process.chdir` does NOT fix module
+resolution — that trap cost two runs).
 
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
