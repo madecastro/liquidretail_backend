@@ -1,0 +1,681 @@
+{
+  "name": "proto-bottom-editorial",
+  "description": "EXPERIMENTAL scoring prototype — inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens.",
+  "byFormat": {
+    "vertical": {
+      "version": 1,
+      "phases": [
+        { "key": "hook", "startSec": 0, "endSec": 3 },
+        { "key": "proof", "startSec": 3, "endSec": 6.2 },
+        { "key": "close", "startSec": 6.2, "endSec": 8 }
+      ],
+      "stack": { "rowGapPct": 0.018 },
+      "slots": [
+        {
+          "key": "headline",
+          "phase": "hook",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 0.2,
+            "exitAtSec": 2.7,
+            "enterDurationSec": 0.6,
+            "exitDurationSec": 0.45
+          },
+          "transition": { "type": "slide", "direction": "up" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "sizeScale": 1.1,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "quote",
+          "phase": "proof",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.88
+          },
+          "timing": {
+            "enterAtSec": 3.05,
+            "exitAtSec": 5.9,
+            "enterDurationSec": 0.55,
+            "exitDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "sizeScale": 1,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "reviewer",
+          "phase": "proof",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.85
+          },
+          "timing": {
+            "enterAtSec": 3.4,
+            "exitAtSec": 5.9,
+            "enterDurationSec": 0.5,
+            "exitDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "sizeScale": 0.95,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "proof",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.85
+          },
+          "timing": {
+            "enterAtSec": 3.6,
+            "exitAtSec": 5.9,
+            "enterDurationSec": 0.45,
+            "exitDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "close",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 6.2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.55
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "sizeScale": 1,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "close",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "row": "ctaRow",
+            "maxWidthPct": 0.55
+          },
+          "timing": {
+            "enterAtSec": 6.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary"
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "close",
+          "visible": true,
+          "position": {
+            "anchor": "bottom",
+            "align": "right",
+            "row": "ctaRow",
+            "maxWidthPct": 0.4
+          },
+          "timing": {
+            "enterAtSec": 6.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2
+          }
+        }
+      ]
+    },
+    "feed": {
+      "version": 1,
+      "phases": [
+        { "key": "main", "startSec": 0, "endSec": 8 }
+      ],
+      "stack": { "rowGapPct": 0.014 },
+      "slots": [
+        {
+          "key": "headline",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 0.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.55
+          },
+          "transition": { "type": "slide", "direction": "up" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "sizeScale": 1.05,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.88
+          },
+          "timing": {
+            "enterAtSec": 0.85,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "reviewer",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.85
+          },
+          "timing": {
+            "enterAtSec": 1.15,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.85
+          },
+          "timing": {
+            "enterAtSec": 1.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 1.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "row": "ctaRow",
+            "maxWidthPct": 0.55
+          },
+          "timing": {
+            "enterAtSec": 2.15,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary"
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "visible": true,
+          "position": {
+            "anchor": "bottom",
+            "align": "right",
+            "row": "ctaRow",
+            "maxWidthPct": 0.4
+          },
+          "timing": {
+            "enterAtSec": 2.15,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2
+          }
+        }
+      ]
+    },
+    "square": {
+      "version": 1,
+      "phases": [
+        { "key": "main", "startSec": 0, "endSec": 8 }
+      ],
+      "stack": { "rowGapPct": 0.012 },
+      "slots": [
+        {
+          "key": "headline",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 0.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": { "type": "slide", "direction": "up" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "sizeScale": 1.05,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.88
+          },
+          "timing": {
+            "enterAtSec": 0.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.85
+          },
+          "timing": {
+            "enterAtSec": 1.1,
+            "exitAtSec": null,
+            "enterDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 1.55,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "row": "ctaRow",
+            "maxWidthPct": 0.55
+          },
+          "timing": {
+            "enterAtSec": 1.9,
+            "exitAtSec": null,
+            "enterDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary"
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "visible": true,
+          "position": {
+            "anchor": "bottom",
+            "align": "right",
+            "row": "ctaRow",
+            "maxWidthPct": 0.4
+          },
+          "timing": {
+            "enterAtSec": 1.9,
+            "exitAtSec": null,
+            "enterDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2
+          }
+        }
+      ]
+    },
+    "landscape": {
+      "version": 1,
+      "phases": [
+        { "key": "main", "startSec": 0, "endSec": 8 }
+      ],
+      "stack": { "rowGapPct": 0.016 },
+      "slots": [
+        {
+          "key": "headline",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.48
+          },
+          "timing": {
+            "enterAtSec": 0.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.55
+          },
+          "transition": { "type": "slide", "direction": "up" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "sizeScale": 1.05,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.48
+          },
+          "timing": {
+            "enterAtSec": 0.85,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 2
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.45
+          },
+          "timing": {
+            "enterAtSec": 1.2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.4
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "maxWidthPct": 0.48
+          },
+          "timing": {
+            "enterAtSec": 1.7,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 1
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "row": "ctaRow",
+            "maxWidthPct": 0.3
+          },
+          "timing": {
+            "enterAtSec": 2.05,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary"
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "visible": true,
+          "position": {
+            "anchor": "bottom",
+            "align": "left",
+            "row": "ctaRow",
+            "maxWidthPct": 0.22
+          },
+          "timing": {
+            "enterAtSec": 2.05,
+            "exitAtSec": null,
+            "enterDurationSec": 0.45
+          },
+          "transition": { "type": "fade" },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2
+          }
+        }
+      ]
+    }
+  }
+}
