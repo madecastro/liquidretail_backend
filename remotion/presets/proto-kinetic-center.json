@@ -1,20 +1,37 @@
 {
   "name": "proto-kinetic-center",
-  "description": "EXPERIMENTAL scoring prototype — platform-native hypothesis. Center-anchored big type with pop/spring staggered entries vs canonical's editorial-left upperThird. Tests whether centered kinetic headlines win on Reels/Stories. Scrim none; CTA visible all formats; brand-neutral tokens.",
+  "description": "EXPERIMENTAL scoring prototype \u2014 platform-native hypothesis. Center-anchored big type with pop/spring staggered entries vs canonical's editorial-left upperThird. Tests whether centered kinetic headlines win on Reels/Stories. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
       "phases": [
-        { "key": "hook", "startSec": 0, "endSec": 3 },
-        { "key": "proof", "startSec": 3, "endSec": 6.2 },
-        { "key": "close", "startSec": 6.2, "endSec": 8 }
+        {
+          "key": "hook",
+          "startSec": 0,
+          "endSec": 2.7
+        },
+        {
+          "key": "proof",
+          "startSec": 2.7,
+          "endSec": 5.1
+        },
+        {
+          "key": "close",
+          "startSec": 5.1,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.02 },
+      "stack": {
+        "rowGapPct": 0.02
+      },
       "slots": [
         {
           "key": "brandPill",
           "phase": "hook",
-          "position": { "anchor": "top", "align": "center" },
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
           "timing": {
             "enterAtSec": 0.1,
             "exitAtSec": null,
@@ -24,7 +41,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 180, "mass": 0.9 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 180,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -47,14 +68,18 @@
           },
           "timing": {
             "enterAtSec": 0.35,
-            "exitAtSec": 2.75,
+            "exitAtSec": 2.4,
             "enterDurationSec": 0.55,
             "exitDurationSec": 0.45
           },
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 200, "mass": 0.85 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 200,
+              "mass": 0.85
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -75,15 +100,19 @@
             "maxWidthPct": 0.88
           },
           "timing": {
-            "enterAtSec": 3.05,
-            "exitAtSec": 5.95,
+            "enterAtSec": 2.75,
+            "exitAtSec": 4.85,
             "enterDurationSec": 0.5,
             "exitDurationSec": 0.4
           },
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 170, "mass": 1 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 170,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -104,15 +133,19 @@
             "maxWidthPct": 0.85
           },
           "timing": {
-            "enterAtSec": 3.45,
-            "exitAtSec": 5.95,
+            "enterAtSec": 3.15,
+            "exitAtSec": 4.85,
             "enterDurationSec": 0.45,
             "exitDurationSec": 0.4
           },
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 16, "stiffness": 160, "mass": 1 }
+            "spring": {
+              "damping": 16,
+              "stiffness": 160,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -135,15 +168,19 @@
             "maxWidthPct": 0.85
           },
           "timing": {
-            "enterAtSec": 3.7,
-            "exitAtSec": 5.95,
+            "enterAtSec": 3.4,
+            "exitAtSec": 4.85,
             "enterDurationSec": 0.4,
             "exitDurationSec": 0.4
           },
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 16, "stiffness": 160, "mass": 1 }
+            "spring": {
+              "damping": 16,
+              "stiffness": 160,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -164,14 +201,18 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 6.2,
+            "enterAtSec": 5.1,
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
           "transition": {
             "type": "slide",
             "direction": "up",
-            "spring": { "damping": 18, "stiffness": 140, "mass": 1 }
+            "spring": {
+              "damping": 18,
+              "stiffness": 140,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -193,14 +234,18 @@
             "maxWidthPct": 0.7
           },
           "timing": {
-            "enterAtSec": 6.55,
+            "enterAtSec": 5.45,
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 190, "mass": 0.9 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 190,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -219,14 +264,23 @@
     "feed": {
       "version": 1,
       "phases": [
-        { "key": "main", "startSec": 0, "endSec": 8 }
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.018 },
+      "stack": {
+        "rowGapPct": 0.018
+      },
       "slots": [
         {
           "key": "brandPill",
           "phase": "main",
-          "position": { "anchor": "top", "align": "center" },
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
           "timing": {
             "enterAtSec": 0.15,
             "exitAtSec": null,
@@ -235,7 +289,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 180, "mass": 0.9 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 180,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -264,7 +322,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 200, "mass": 0.85 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 200,
+              "mass": 0.85
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -292,7 +354,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 170, "mass": 1 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 170,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -320,7 +386,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 16, "stiffness": 160, "mass": 1 }
+            "spring": {
+              "damping": 16,
+              "stiffness": 160,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -350,7 +420,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 16, "stiffness": 160, "mass": 1 }
+            "spring": {
+              "damping": 16,
+              "stiffness": 160,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -377,7 +451,11 @@
           "transition": {
             "type": "slide",
             "direction": "up",
-            "spring": { "damping": 18, "stiffness": 140, "mass": 1 }
+            "spring": {
+              "damping": 18,
+              "stiffness": 140,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -405,7 +483,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 190, "mass": 0.9 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 190,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -424,14 +506,23 @@
     "square": {
       "version": 1,
       "phases": [
-        { "key": "main", "startSec": 0, "endSec": 8 }
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.016 },
+      "stack": {
+        "rowGapPct": 0.016
+      },
       "slots": [
         {
           "key": "brandPill",
           "phase": "main",
-          "position": { "anchor": "top", "align": "center" },
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
           "timing": {
             "enterAtSec": 0.15,
             "exitAtSec": null,
@@ -440,7 +531,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 180, "mass": 0.9 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 180,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -469,7 +564,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 200, "mass": 0.85 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 200,
+              "mass": 0.85
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -497,7 +596,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 170, "mass": 1 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 170,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -524,7 +627,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 16, "stiffness": 160, "mass": 1 }
+            "spring": {
+              "damping": 16,
+              "stiffness": 160,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -551,7 +658,11 @@
           "transition": {
             "type": "slide",
             "direction": "up",
-            "spring": { "damping": 18, "stiffness": 140, "mass": 1 }
+            "spring": {
+              "damping": 18,
+              "stiffness": 140,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -579,7 +690,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 190, "mass": 0.9 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 190,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -598,9 +713,15 @@
     "landscape": {
       "version": 1,
       "phases": [
-        { "key": "main", "startSec": 0, "endSec": 8 }
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.02 },
+      "stack": {
+        "rowGapPct": 0.02
+      },
       "slots": [
         {
           "key": "brandPill",
@@ -618,7 +739,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 180, "mass": 0.9 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 180,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -647,7 +772,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 200, "mass": 0.85 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 200,
+              "mass": 0.85
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -675,7 +804,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 14, "stiffness": 170, "mass": 1 }
+            "spring": {
+              "damping": 14,
+              "stiffness": 170,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -702,7 +835,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 16, "stiffness": 160, "mass": 1 }
+            "spring": {
+              "damping": 16,
+              "stiffness": 160,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -729,7 +866,11 @@
           "transition": {
             "type": "slide",
             "direction": "up",
-            "spring": { "damping": 18, "stiffness": 140, "mass": 1 }
+            "spring": {
+              "damping": 18,
+              "stiffness": 140,
+              "mass": 1
+            }
           },
           "treatment": {
             "scrim": "none",
@@ -757,7 +898,11 @@
           "transition": {
             "type": "pop",
             "direction": "up",
-            "spring": { "damping": 12, "stiffness": 190, "mass": 0.9 }
+            "spring": {
+              "damping": 12,
+              "stiffness": 190,
+              "mass": 0.9
+            }
           },
           "treatment": {
             "scrim": "none",

@@ -1,15 +1,29 @@
 {
   "name": "proto-bottom-editorial",
-  "description": "EXPERIMENTAL scoring prototype — inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens.",
+  "description": "EXPERIMENTAL scoring prototype \u2014 inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
       "phases": [
-        { "key": "hook", "startSec": 0, "endSec": 3 },
-        { "key": "proof", "startSec": 3, "endSec": 6.2 },
-        { "key": "close", "startSec": 6.2, "endSec": 8 }
+        {
+          "key": "hook",
+          "startSec": 0,
+          "endSec": 2.7
+        },
+        {
+          "key": "proof",
+          "startSec": 2.7,
+          "endSec": 5.1
+        },
+        {
+          "key": "close",
+          "startSec": 5.1,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.018 },
+      "stack": {
+        "rowGapPct": 0.018
+      },
       "slots": [
         {
           "key": "headline",
@@ -21,11 +35,14 @@
           },
           "timing": {
             "enterAtSec": 0.2,
-            "exitAtSec": 2.7,
+            "exitAtSec": 2.4,
             "enterDurationSec": 0.6,
             "exitDurationSec": 0.45
           },
-          "transition": { "type": "slide", "direction": "up" },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -45,12 +62,14 @@
             "maxWidthPct": 0.88
           },
           "timing": {
-            "enterAtSec": 3.05,
-            "exitAtSec": 5.9,
+            "enterAtSec": 2.75,
+            "exitAtSec": 4.8,
             "enterDurationSec": 0.55,
             "exitDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -70,12 +89,14 @@
             "maxWidthPct": 0.85
           },
           "timing": {
-            "enterAtSec": 3.4,
-            "exitAtSec": 5.9,
+            "enterAtSec": 3.1,
+            "exitAtSec": 4.8,
             "enterDurationSec": 0.5,
             "exitDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -97,12 +118,14 @@
             "maxWidthPct": 0.85
           },
           "timing": {
-            "enterAtSec": 3.6,
-            "exitAtSec": 5.9,
+            "enterAtSec": 3.3,
+            "exitAtSec": 4.8,
             "enterDurationSec": 0.45,
             "exitDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -121,11 +144,13 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 6.2,
+            "enterAtSec": 5.1,
             "exitAtSec": null,
             "enterDurationSec": 0.55
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -146,11 +171,13 @@
             "maxWidthPct": 0.55
           },
           "timing": {
-            "enterAtSec": 6.5,
+            "enterAtSec": 5.4,
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -172,11 +199,13 @@
             "maxWidthPct": 0.4
           },
           "timing": {
-            "enterAtSec": 6.5,
+            "enterAtSec": 5.4,
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -193,9 +222,15 @@
     "feed": {
       "version": 1,
       "phases": [
-        { "key": "main", "startSec": 0, "endSec": 8 }
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.014 },
+      "stack": {
+        "rowGapPct": 0.014
+      },
       "slots": [
         {
           "key": "headline",
@@ -210,7 +245,10 @@
             "exitAtSec": null,
             "enterDurationSec": 0.55
           },
-          "transition": { "type": "slide", "direction": "up" },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -234,7 +272,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -257,7 +297,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -282,7 +324,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -305,7 +349,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -329,7 +375,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -355,7 +403,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -372,9 +422,15 @@
     "square": {
       "version": 1,
       "phases": [
-        { "key": "main", "startSec": 0, "endSec": 8 }
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.012 },
+      "stack": {
+        "rowGapPct": 0.012
+      },
       "slots": [
         {
           "key": "headline",
@@ -389,7 +445,10 @@
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
-          "transition": { "type": "slide", "direction": "up" },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -413,7 +472,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -436,7 +497,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -459,7 +522,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -483,7 +548,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -509,7 +576,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -526,9 +595,15 @@
     "landscape": {
       "version": 1,
       "phases": [
-        { "key": "main", "startSec": 0, "endSec": 8 }
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
       ],
-      "stack": { "rowGapPct": 0.016 },
+      "stack": {
+        "rowGapPct": 0.016
+      },
       "slots": [
         {
           "key": "headline",
@@ -543,7 +618,10 @@
             "exitAtSec": null,
             "enterDurationSec": 0.55
           },
-          "transition": { "type": "slide", "direction": "up" },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -567,7 +645,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -590,7 +670,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.4
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -613,7 +695,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "layered",
@@ -637,7 +721,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",
@@ -663,7 +749,9 @@
             "exitAtSec": null,
             "enterDurationSec": 0.45
           },
-          "transition": { "type": "fade" },
+          "transition": {
+            "type": "fade"
+          },
           "treatment": {
             "scrim": "none",
             "shadow": "soft",

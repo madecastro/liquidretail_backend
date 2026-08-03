@@ -1,6 +1,6 @@
 {
   "name": "canonical-conversion",
-  "description": "Funnel variant — CONVERSION (static social_proof_led twin). productName + rating + deliveryLine + CTA from ~1.5s, CTA persistent to end. Quote/reviewer proof mid-clip. Social proof led, clear shop intent.",
+  "description": "Funnel variant \u2014 CONVERSION (static social_proof_led twin). productName + rating + deliveryLine + CTA from ~1.5s, CTA persistent to end. Quote/reviewer proof mid-clip. Social proof led, clear shop intent. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -13,11 +13,11 @@
         {
           "key": "proof",
           "startSec": 2.5,
-          "endSec": 5.5
+          "endSec": 5.1
         },
         {
           "key": "close",
-          "startSec": 5.5,
+          "startSec": 5.1,
           "endSec": 8
         }
       ],
@@ -216,8 +216,8 @@
             "maxWidthPct": 0.92
           },
           "timing": {
-            "enterAtSec": 2.5,
-            "exitAtSec": 5.3,
+            "enterAtSec": 2.7,
+            "exitAtSec": 4.8,
             "enterDurationSec": 0.7,
             "exitDurationSec": 0.5
           },
@@ -242,8 +242,8 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 2.8,
-            "exitAtSec": 5.3,
+            "enterAtSec": 3.0,
+            "exitAtSec": 4.8,
             "enterDurationSec": 0.6,
             "exitDurationSec": 0.5
           },
