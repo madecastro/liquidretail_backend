@@ -339,7 +339,27 @@ Video never launches a browser.
 - **~1-in-3 static ads** render a competitor-shaped brand mark on the product
   (e.g. tree emblem reading as Timberland on an Allbirds shoe). Prompts already
   ask for fidelity — fix is measure-and-reject, not prompt tuning. Video path
-  not QC'd on this.
+  not QC'd on this. **STILL OPEN after the 2026-08-03 prompt hardening — that
+  hardening is owner-directed work on top of this note, NOT a fix for it, and it
+  has no measured effect on this defect yet.** The static prompt now opens with a
+  long `PRODUCT_FIDELITY` block (`staticAdIntents.js`) covering source-of-truth,
+  category/brand-prior, form, construction, surface, colour, on-item graphics,
+  details and condition — plus carve-outs in `absences` / `textBlock` so the
+  no-added-text rules cannot erase the product's OWN printed label (they read
+  literally as "strip marks from clothing/packaging in the scene", and on this
+  catalog the product often IS the clothing or the packaging). **`adVisionQcService`
+  remains the actual fix.** Reversible without a deploy via
+  `STATIC_PROMPT_FIDELITY_HARDENING=false`, which restores a **byte-identical**
+  pre-hardening prompt — block *and* both carve-out sites revert together, so the
+  A/B control arm really is the arm that was measured. **The cost is real and
+  unmeasured:** the prompt more than doubled (~3.5-4.1k → ~7.8-8.4k chars) and the
+  block sits above `SET EXACTLY THESE STRINGS` on a path whose measured text
+  fidelity is 139/140 strings across 20 renders, and where `quality:high` already
+  measured WORSE than `medium` by losing a string. If the next render sample shows
+  copy defects, suspect this before anything else and flip the flag. Precedent for
+  that outcome: PR #61 hardened the VIDEO prompt and was rolled back in full
+  (§00). Pinned by `scripts/verifyStaticFidelityPrompt.js` (419 checks, both arms,
+  revert-proven on three mutations).
 - **Static geometry — two defects FIXED 2026-08-03; read the diagnostic before
   re-opening.** (A) `staticAdIntents.computeSurface` combined the post-generation
   crop band with the 6% edge margin via `Math.max`, so on every *cropped* surface

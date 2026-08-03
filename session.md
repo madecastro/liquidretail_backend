@@ -104,6 +104,66 @@ of its four claims were wrong. Read §0 CORRECTIONS before anything else.
 
 ---
 
+## 0.0 STATIC PROMPT — product-fidelity hardening (2026-08-03, UNCOMMITTED)
+
+Owner-directed. Targets **product drift** on the gpt-image-2 direct static path:
+hallucinated logos, shifted colour, altered fit, "improved" construction.
+
+**There is ONE prompt builder, not three.** The owner expected three; the three are the
+three *intents* (`social_proof_led`, `product_first_lifestyle`, `objection_resolved`),
+which all share `staticAdIntents.buildPrompt`. Hardening that one function covers all
+three. `aiImageReferenceService.buildPrompt` and `aiLayoutStudioService.buildGenerationPrompt`
+are also gpt-image prompts but are **not** on this path (shadow artifact, default
+`AI_IMAGE_REFERENCE_ENABLED=false`; and layout exploration never delivered as an ad) — both
+were deliberately left alone.
+
+**Changed** (`services/staticAdIntents.js`, `+133`):
+- `PRODUCT_FIDELITY` — replaces the one hedged sentence that was losing to the creative
+  instructions below it. Source-of-truth, no category/brand-prior inference, preserve
+  form / construction / surface / colour / on-item graphics / details / condition, a NEVER
+  list, a hidden-geometry rule, an explicit WHAT MAY CHANGE list, and a closing check.
+- Carve-outs in `absences` and both `textBlock` branches so the no-added-text rules cannot
+  strip the product's **own** printed label. That conflict **predates** this work: those rules
+  ban marks "on packaging or clothing within the scene" and on this catalog the product often
+  IS the packaging or the clothing. Every carve-out is anchored to *"visible … in the reference
+  photograph"*, never *"on the product"* — the loose phrasing lets a model invent a label it
+  believes the product normally carries.
+- `absences` also generalised off apparel ("garment" → "product").
+- Stale comment fixed at `directImageRenderService.js:706-712` (it quoted the deleted sentence).
+
+**Kill switch `STATIC_PROMPT_FIDELITY_HARDENING` (default true).** `false` restores a
+**byte-identical** pre-hardening prompt — block *and* both carve-out sites revert together,
+verified by diffing all six intent×surface prompts against a pre-change dump. Partial revert
+would give an A/B whose control arm is not the arm that was measured. Precedent: PR #61
+hardened the VIDEO prompt and the owner rolled all three parts back (CLAUDE.md §00).
+
+**THE RISK, unmeasured and the reason the flag exists.** The prompt more than doubled,
+**~3.5-4.1k → ~7.8-8.4k chars**, and the block sits **above** `SET EXACTLY THESE STRINGS` on
+a path whose measured text fidelity is **139/140 strings across 20 renders**, and where
+`quality:high` already measured WORSE than `medium` *by losing a string*. Mitigations applied:
+the precedence sentence explicitly exempts the text contract and defers to the reserved-corner
+rule, and the closing check covers copy as well as product. **First render sample after this
+lands: check copy fidelity before anything else. If strings degrade, flip the flag.**
+
+This does **not** fix the ~1-in-3 competitor-mark defect and must not be described as fixing
+it — `adVisionQcService` (measure-and-reject) is still that fix. See CLAUDE.md §2 Known open.
+
+**Verify:** `scripts/verifyStaticFidelityPrompt.js` — 419 checks, both arms, revert-proven on
+three mutations (hardwire flag off / delete the text-exemption clause / loosen the reference
+anchor); all three fail the harness. Full suite **46/46 green**.
+
+⚠️ **ANOTHER SESSION WAS EDITING THIS SAME WORKING TREE CONCURRENTLY.** Mid-task the tree held
+uncommitted `services/ratingDisplay.js` (+431) + `scripts/verifyCoherentSocialProof.js`; those
+landed as **`9b61b02`** ("Tier-coherent social proof") while this work was in progress, and
+`remotion/compositions/Canonical.jsx` + `services/adRegenerateService.js` then appeared dirty
+from that same session. **None of it is part of this work and none of it was touched.** The
+fidelity changes were re-verified against the moved HEAD afterwards (46/46 suite, 419-check
+harness, byte-identical revert all still hold). If two agents share this checkout again, expect
+`git status` to include work that is not yours — check `git log` before assuming a dirty file is
+your own.
+
+---
+
 ## 0. CORRECTIONS — 2026-08-04. Read before trusting anything below.
 
 Four claims in this file were wrong. Each was verified against live code, the installed

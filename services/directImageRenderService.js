@@ -705,9 +705,11 @@ async function renderDirectImage({
   });
   // A total absence of any product reference is not a degraded input to
   // improvise past — it is unrecoverable, the same way a missing Director
-  // concept is above. buildPrompt's opening paragraph unconditionally instructs
-  // the model to "reproduce this exact item faithfully" from "the supplied
-  // photograph" — true and necessary when refs.length > 0, but if this fired
+  // concept is above. buildPrompt's opening section (`PRODUCT_FIDELITY`, and the
+  // one-sentence legacy paragraph before it) unconditionally calls the supplied
+  // reference photograph "the single source of truth for the product" and
+  // forbids inferring the product from its category or from brand priors —
+  // true and necessary when refs.length > 0, but if this fired
   // with zero references the model would be told a photograph exists when none
   // does, and would have nothing to ground the product's actual appearance in.
   // For a system whose whole purpose is faithfully depicting a real product,

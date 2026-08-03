@@ -403,9 +403,18 @@ function absences(d, { rendersQuote, rendersRating, rendersBadge }, dropped = []
     `no CTA button, no "shop now", "learn more", "swipe up", "link in bio", arrow or tap affordance of any kind — ${policy.ctaNote || 'the platform supplies it'}`);
   out.push('no price, currency symbol, discount, saving, offer or countdown');
   // "no brand wordmark" fought "reproduce any branding printed on the product".
-  // Separate the two: the garment's own mark is product identity, not ad chrome.
-  out.push('no product name, website, hashtag or small print');
-  out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo already printed on the garment itself stays exactly as it is, but nothing new is drawn');
+  // Separate the two: the product's own mark is product identity, not ad chrome.
+  // "garment" was apparel-specific wording on a multi-category catalog, and the
+  // carve-out has to name the product generically or a bottle's own label reads
+  // as ad chrome to be removed. Gated with the rest of the hardening so the
+  // flag-off arm is the exact prompt that was measured — see FIDELITY_HARDENING.
+  if (FIDELITY_HARDENING) {
+    out.push('no product name, website, hashtag or small print added anywhere in the scene — wording already printed on the product itself is not an addition and stays exactly as the reference shows it');
+    out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo, wordmark or label already printed on the product itself stays exactly as it is, reproduced from the reference rather than redrawn, but nothing new is drawn');
+  } else {
+    out.push('no product name, website, hashtag or small print');
+    out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo already printed on the garment itself stays exactly as it is, but nothing new is drawn');
+  }
   return out;
 }
 
@@ -523,6 +532,98 @@ function applyDensity(text, spec, policy) {
   return { kept, dropped };
 }
 
+/**
+ * PRODUCT-FIDELITY HARDENING — kill switch, default ON.
+ *
+ * `false` restores a **byte-identical** pre-hardening prompt: the one-sentence
+ * `LEGACY_PRODUCT_FIDELITY` paragraph, and the product-own-print carve-outs in
+ * `absences` and `textBlock` reverted too. That completeness is the point — a
+ * flag that reverts "most of" the change gives an A/B whose control arm is not
+ * the arm that was measured, so the comparison proves nothing.
+ *
+ * It exists because of the precedent in CLAUDE.md §00: PR #61 hardened the
+ * VIDEO prompt the same way and the owner rolled all three parts back —
+ * *"This is creating additional hallucinations and the previous output was
+ * better."* Prompt hardening is not self-evidently an improvement on this
+ * stack, and this path has a measured baseline worth being able to return to
+ * without a deploy (see `PRODUCT_FIDELITY` below).
+ */
+const FIDELITY_HARDENING = process.env.STATIC_PROMPT_FIDELITY_HARDENING !== 'false';
+
+/** The exact pre-2026-08-03 wording. Do not edit — it is the A/B control arm. */
+const LEGACY_PRODUCT_FIDELITY = `The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.`;
+
+/**
+ * PRODUCT FIDELITY — the anti-drift block. Owner-directed, 2026-08-03.
+ *
+ * Replaces the single hedged sentence above, which was losing to the creative
+ * instructions below it: renders came back with hallucinated logos, shifted
+ * colours, altered fit and "improved" construction. The wording is absolute and
+ * front-loaded because the failure mode was not the model missing the
+ * instruction — it was the model resolving a conflict between accuracy and
+ * styling in favour of styling, so the block has to state its own precedence.
+ *
+ * READ THIS BEFORE CITING THE ~1-IN-3 COMPETITOR-MARK DEFECT AS ITS
+ * JUSTIFICATION. CLAUDE.md §2 "Known open" records that defect and says the fix
+ * is **measure-and-reject, not prompt tuning** — `adVisionQcService` is that
+ * fix and it remains the real one. This block is owner-directed hardening on
+ * top, not a replacement for it, and it must not be described as closing that
+ * known-open. If the next render sample still shows competitor marks, that is
+ * the expected outcome, not evidence this block was written wrong.
+ *
+ * Five things in here are load-bearing and must not be trimmed as redundant:
+ *   1. the "do not infer from category or brand prior" clause — the tree emblem
+ *      that read as Timberland on an Allbirds shoe is the model rendering what
+ *      the CATEGORY usually looks like, not what the reference shows;
+ *   2. the carve-out that the product's OWN printing is product identity, which
+ *      has to be stated positively or the no-added-text rules erase the label
+ *      (matching carve-outs live in `absences` and in `textBlock` below);
+ *   3. the WHAT MAY CHANGE list, which keeps this from being read as a ban on
+ *      creative staging — without it the model returns a catalogue shot, and the
+ *      whole point of this path is a new scene around the same item;
+ *   4. the sentence naming the reserved logo corner. The block claims to outrank
+ *      what follows it, and the "never draw the logomark, the real asset is
+ *      composited afterwards" rule is *below* it — so without this the highest
+ *      priority section reads as blanket authority over brand marks. See the
+ *      logo note in `directImageRenderService`'s header;
+ *   5. the closing check covering BOTH product and copy. Product-only would have
+ *      hung a closing gate on the new objective and none on the old one.
+ *
+ * WHAT THE PRECEDENCE SENTENCE DELIBERATELY DOES NOT SAY: it scopes itself to
+ * creative and styling instructions and explicitly exempts the text contract.
+ * An unqualified "outranks everything that follows" put a ~4k-char wall between
+ * the opening line and SET EXACTLY THESE STRINGS *and* told the model the wall
+ * mattered more — and text fidelity is the whole game on this path (see the
+ * PLATE_QUALITY note in `directImageRenderService`: quality `high` measured
+ * WORSE than `medium` precisely because it lost a string). The prompt more than
+ * doubled, ~3.5-4.1k chars to ~7.8-8.4k; the measured baseline it is spending
+ * against is 139/140 strings across 20 renders. That is the trade this flag is
+ * here to let the owner unwind.
+ *
+ * This is prose for a model, not a spec for a human: it is deliberately
+ * repetitive, and the enumerations are open ("including but not limited to")
+ * because the catalog spans apparel, footwear, bottles, devices and jewellery.
+ */
+const PRODUCT_FIDELITY = `PRODUCT FIDELITY — HIGHEST PRIORITY. Wherever product accuracy conflicts with a creative or styling instruction below, product accuracy wins. This does not relax the text instructions below, which are absolute in their own right, and it does not override the reserved-corner rule below.
+The supplied reference photograph is the single source of truth for the product; where several are supplied, the first is the primary product reference and the rest are further views of the same item. It is a PRODUCT REFERENCE ONLY — not a composition to copy. Treat every visible characteristic of the item as immutable. This advertisement must feature the exact same physical item that reference shows, as though that same item had been carried into a new photoshoot and photographed again — not recreated from memory. Do not redesign, reinterpret, simplify, modernise, improve, repair, stylise, approximate or substitute any part of it.
+Do not infer the product from its category, and do not infer it from anything you know about the brand. If the reference disagrees with what products of this type usually look like, or with your prior knowledge of this brand, the reference is correct and your prior is wrong.
+
+PRESERVE EXACTLY, as the reference shows it:
+  — Form: shape, proportions, dimensions, silhouette, geometry, profile, contours, edges and curvature. Fit and cut are part of the form and may not be altered, though the item may of course be posed, worn or placed differently.
+  — Construction: seams, stitching, panel layout, assembly, joints, fasteners, hardware, hinges, closures, buttons, buckles, snaps, zips, clasps, laces, straps.
+  — Surface: material, fabric, leather, knit, wood grain, metal and plastic finish, gloss, matte, texture, weave, grain, embossing, engraving, reflectivity, transparency, opacity.
+  — Colour: the item's own colours exactly. Do not shift hue, recolour, bleach, tint, darken, brighten, or invent an alternate colourway. New lighting may fall across those colours; it may not change them.
+  — Graphics already on the item: logos, branding, icons, artwork, patterns, prints, typography, embroidery, embossing, debossing, decals, labels and tags — same wording, same lettering, same placement, same scale. Reproduce them from the reference; never redraw them from imagination, and never add, remove or modify any branding. This preserves marks that are ALREADY on the item; it is never licence to place a brand mark anywhere else in the frame.
+  — Details, including but not limited to: pockets, collars, sleeves, cuffs, necklines, hems, soles, heels, eyelets, handles, bezels, screens, lenses, caps, applicators, gemstones, chain links, watch faces, grips, blades, wheels, buttons, ports, vents and sensors. Every feature visible in the reference must appear unchanged; no feature absent from the reference may be added.
+  — Condition: wrinkles, folds, creases, wear, polish, finish, and the shadows the item casts on itself. Do not “improve” the item, smooth its surfaces, or clean away its natural characteristics.
+
+NEVER: substitute a similar-looking version; invent a feature that is absent; remove a visible feature; redesign any component; merge this item with another design; produce a newer, cleaner, alternative or special edition of it; produce a different size, fit or variation; simplify it; stylise it; or hallucinate any detail that is not visible in the reference.
+If part of the item is not visible in the reference, do not invent or redesign the hidden portion. Infer only the minimum geometry a believable photograph needs, fully consistent with the parts you can see — and infer geometry only, never a graphic, a label or a marking.
+
+WHAT MAY CHANGE — everything that is not the item itself, and you should change it: the model or models, pose, hands, how and where the item is worn or placed, environment, background, set, props, styling, lighting, mood, composition, crop, camera, perspective, focal length, depth of field, the colour grading of the scene, and the typographic treatment of the copy specified below. Build an entirely new scene around the item; do not reuse the reference's background, crop or lighting.
+
+BEFORE YOU FINISH, check two things. The product: a customer would recognise it as the identical item, your image could pass as another photograph of that same physical item, and no feature of the item has been added, removed, modified, recoloured or reshaped — judged on the item itself, not on where it sits in the new frame. The copy: every string you were given below appears exactly once, spelled exactly as given, and no other text appears anywhere. If either check fails, correct it before finishing the advertisement.`;
+
 function buildPrompt({ intentKey, data, product, surface }) {
   const policy = SURFACE_POLICY[surface];
   if (!policy) return { error: `unknown surface ${surface}` };
@@ -555,16 +656,35 @@ function buildPrompt({ intentKey, data, product, surface }) {
    * renders. Lowercase descriptions read as instructions; uppercase field names
    * read as type to set.
    */
+  /**
+   * The product-own-print carve-outs. Both no-added-text rules ban letterforms
+   * and marks "anywhere in the frame … including on packaging or clothing within
+   * the scene" — and on this catalog the product frequently IS the packaging or
+   * the clothing, so read literally they order the model to strip a real label.
+   * That conflict predates the fidelity hardening; it is fixed alongside it
+   * because a block demanding the label be preserved makes it live.
+   *
+   * Both are anchored to "visible … in the reference photograph", never to "on
+   * the product". The looser phrasing is a justification handle: a model that
+   * knows the brand's usual neck label or size stamp can invent one and call it
+   * something the product already has. The anchor has to be the pixels.
+   */
+  const carveOutWithCopy = FIDELITY_HARDENING
+    ? ' The single exception is lettering already visible on the product itself in the reference photograph: that lettering is part of the product, so it stays exactly as the reference shows it, reproduced and not restyled, and it does not count as text you set.'
+    : '';
+  const carveOutNoCopy = FIDELITY_HARDENING
+    ? ' Lettering, labels and logos already visible on the product itself in the reference photograph are the one exception: they are part of the product and stay exactly as the reference shows them. Reproduce only what is visible there — nothing may be added, and no marking may be inferred from what products of this kind usually carry.'
+    : '';
   const textBlock = kept.length
     ? `SET EXACTLY THESE STRINGS, verbatim, each appearing exactly once — and set NOTHING ELSE. This is the complete and only text for this ad. It is not a template to fill in and nothing is missing from it. Spelling is critical; a misspelling makes this unusable.
 The words to the LEFT of each arrow name the element for your reference and must NEVER appear in the image. Render ONLY the text to the right of the arrow:
 ${kept.map(([role, str]) => `  ${role.toLowerCase()} -> ${str}`).join('\n')}
-Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.`
-    : `THIS AD CARRIES NO TEXT AT ALL. Render a pure product image: no words, numerals, letterforms, logos or graphic marks of any kind, anywhere in the frame — including on signage, packaging, screens or clothing within the scene. The photograph alone has to do the work.`;
+Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.${carveOutWithCopy}`
+    : `THIS AD CARRIES NO TEXT AT ALL. Render a pure product image: no words, numerals, letterforms, logos or graphic marks of any kind, anywhere in the frame — including on signage, packaging, screens or clothing within the scene.${carveOutNoCopy} The photograph alone has to do the work.`;
 
   const prompt = `Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
 
-The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.
+${FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY}
 
 PRODUCT: ${product.desc}
 
@@ -595,6 +715,7 @@ module.exports = {
   SACRIFICE_ORDER,
   FALLBACK_ORDER,
   buildPrompt,
+  PRODUCT_FIDELITY,
   resolveIntent,
   absences,
   applyDensity,
