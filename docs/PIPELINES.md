@@ -1,6 +1,6 @@
 # LiquidRetail Backend — Background & Creative Pipelines
 
-This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-07-23** (deterministic-first video rework: backend PRs #11/#12/#13, frontend #10). Prefer this doc over tribal memory; when in doubt, open the cited files.
+This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`; verify suite 28 scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
 
 > **Cost hot-spots (read first)**
 >
@@ -8,8 +8,8 @@ This is the engineer reference for every background and creative pipeline in the
 > |---|---|---|---|
 > | **Overlay zones** (`overlayZoneService.analyzeOverlayZones`, Gemini-2.5 vision) | Per catalog-product image after detect | ~**13–26s / image** Gemini vision | **Deferred** to ad time (`CATALOG_DETECT_PRECOMPUTE=false`); only products a campaign will use |
 > | **User-actuated product enrichment** (SerpAPI shopping + immersive + Gemini grounded-search) | Sales Demos **Enrich** button | ~**$0.05–0.12 / product** | Opt-in only; auto path is reviews gap-fill |
-> | **Static ad photoreal finish** (`gpt-image-2` image-ref, quality `high`) | After GPT-4.1 HTML layout + Puppeteer raster | Dominant static-ad $ when enabled | `AI_IMAGE_REFERENCE_ENABLED` / quality knob; seed dumps via `IMAGE_REF_DUMP_SEEDS` |
-> | **Veo / Atlas video** | Video ad generation | Provider rate limits (429 at concurrency >1) | `VEO_CONCURRENCY=1` — **do not raise** |
+> | **Static ad plate** (`openai/gpt-image-2/edit` via `directImageRenderService`) | Every static `ai_*` ad (default pipeline) | Dominant static-ad $ | One billable edit submit per ad; stages on poll ticks (`ATLAS_IMAGE_POLL_MS` 3s). **Was falsely documented** as "GPT-4.1 HTML → Puppeteer → gpt-image-2 photoreal polish" — that chain is **not** the live default |
+> | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | ~$1.00 / 8s @ 1080p (720p same list price) | `VEO_CONCURRENCY=4` (self-imposed probe 2026-08-02; Omni RPS unpublished). **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. Re-measure before raising past 4 |
 > | **Catalog scan (sitemap + JSON-LD)** | Demo / catalog sync | Deterministic HTTP only — **no LLM** | Caps + per-host min-gap; bounded PDP concurrency |
 
 Non-secret defaults live in `config/defaults.env` (versioned). Secrets stay in the Render environment only (see [§9](#9-configuration--secrets)).
@@ -282,22 +282,42 @@ Both paths: kind `enrichment`, cancellable; partials kept. Idempotent via 30-day
 
 ### Surfacing a POSITIVE review on an ad
 
-`services/layoutInputService.js` `pickStrongestQuote` runs over the 6-tier quote pool (product → category → brand → social comment → LLM → synth):
+`services/layoutInputService.js` builds a 6-tier quote pool (product → category → brand → social comment → LLM → synth) and picks via `pickStrongestQuote`. **Provenance is the first gate**, not an afterthought.
 
-- There is **one** star threshold, **`QUOTE_MIN_RATING` (4.5)**, enforced in two places against the same constant: `gateQuotesByRating` filters a whole review-backed tier, and `pickStrongestQuote` re-applies it per candidate for any tier that reaches it ungated. A small bonus (0–0.5) breaks ties in favour of 5-star over 4.5-star. Tiers with no ratings (comments, LLM-authored) are unaffected and fall through to the lexical scorer as before.
-- Ratings are normalized to a 5-point scale (`toFiveScale`) before **every** comparison — vendor adapters store each review's stars verbatim, so a 90/100 read literally would clear any threshold and, as a tie-break bonus, would outrank the prose score outright.
-- The product tier reads `productReviewsOf(match)`, which checks `identification.details.productReviews` (the operator's seed pick) then the hydrated top-level `match.productReviews`. Reading only the former left the tier structurally empty on every hydrated match, so scraped SKU-specific quotes never reached an ad.
-- The lexical `scoreQuote` sentiment gate still applies on top; stars decide *eligibility*, prose decides *which* eligible quote wins.
-- `normalizeQuote` carries `rating` + `title` through onto the artifact, so the renderer can draw stars next to the quote and use the reviewer’s own headline.
-- Star ratings do **not** exist on Gemini web-wide quotes; those still rely on the lexical gate alone.
+**Print gate (single definition):** `services/quoteProvenance.js` `toPrintableCustomerQuote()`. ALLOWLIST only — deciding by what a quote is *not* was the bug shape this replaces. Printable origins:
+
+| `origin` | Prints? | Attribution |
+|---|---|---|
+| `scraped` | yes | byline kept |
+| `social_comment` | yes | byline kept |
+| `store-import` | yes | byline kept |
+| **`llm-web`** | **yes (TEXT ONLY)** | **byline fields + `source` + `verified` structurally `delete`d** — callers MUST use the **return value**, not the input object |
+| `synthesized` | **no** | rejected (producer deleted) |
+| `unknown` / unstamped | **no** | rejected by omission |
+
+**`llm-web` is PRINTABLE.** That is a deliberate reversal of older docs that treated it as fabricated. Verified: `geminiSearchProvider.js` uses `tools:[{google_search:{}}]` (real grounded search) and records `groundingMetadata.groundingChunks` domains — Gemini is the **retrieval** mechanism, not the author. What *was* broken was attribution: bylines like `Reddit (r/BuyItForLife)` and — 80 times — `vertexaisearch.cloud.google.com` (Google’s grounding-redirect hostname printed as the customer). Strip attribution; keep the words.
+
+**`verbatim:false` is not a blanket fidelity confession.** On first-party origins it still hard-rejects. On `llm-web` it is a **source-class stamp** (“not a first-party scrape”) set blanket by the producer (`geminiSearchProvider`); the gate ignores `verbatim` for anonymous-print origins so ~82% of the pool is not re-excluded. See the header comment in `quoteProvenance.js:106-118`.
+
+**Where the gate runs:**
+
+1. **At pool assembly** in `layoutInputService` (`printableOnly` → `toPrintableCustomerQuote` before rating/lexical pick) so `primary_quote` / `secondary_quotes` are clean for every consumer of the artifact.
+2. **At video titling** in `brandScriptExecutor.buildMetaForAd` via `gateLayoutInputQuotes` — reuses the **same** predicate. **Was false:** static dual-gated, video did not; a `LayoutInputArtifact` cached before the provenance fix could burn a fabricated claim into Remotion chrome.
+
+**Also still true:**
+
+- One star threshold, **`QUOTE_MIN_RATING` (4.5)**, via `gateQuotesByRating` + re-apply in `pickStrongestQuote`.
+- Ratings normalized to 5-point scale before every comparison.
+- Product tier reads `productReviewsOf(match)` (seed pick then hydrated top-level).
+- Lexical `scoreQuote` on top of stars.
+- `isFirstPartyQuote()` (`layoutInputService.js:1559`) is a **denylist helper for normalize defaults**, not the print gate — do not use it as a substitute for `toPrintableCustomerQuote`.
 
 ### Surfacing a COMMENT on an ad
 
 Comments carry no star rating, so sentiment is the only gate — and it is made by
 **inference at ingest**, not by a keyword lexicon. The verdict is persisted to
 `Comment.proofJudgment` and read by every surface that renders a comment
-(quote tier, `top_comments`, the AI-canvas builder, the Director, the
-image-reference builder). If the judge is unreachable it **alerts and throws**;
+(quote tier, `top_comments`, the AI-canvas builder, the Director). If the judge is unreachable it **alerts and throws**;
 there is no lexical fallback. Full rationale, failure policy and consumer list:
 **[docs/PROOF_JUDGE.md](PROOF_JUDGE.md)**.
 
@@ -305,74 +325,90 @@ there is no lexical fallback. Full rationale, failure policy and consumer list:
 
 ## 5. Static-image ad generation (THE default ad path)
 
-> **Critical:** the default static ad is **not** a diffusion image model from a text prompt alone.  
-> Flow: **GPT-4.1 authors an HTML/CSS layout** → **Puppeteer rasterizes** → (optional) **image model re-renders** that screenshot for a photoreal finish.
+> **Critical (corrected 2026-07-31 / re-verified 2026-08-03):** the default static ad is **one billable `openai/gpt-image-2/edit` call** that returns the finished ad (`services/directImageRenderService.js` `renderDirectImage`). **Was false:** "GPT-4.1 authors HTML → Puppeteer rasterizes → optional gpt-image-2 photoreal polish." That chain is **legacy HTML** only — reached solely when `Brand.staticImagePipeline === 'html'`. `resolveStaticPipeline` (`services/staticPipeline.js:69-70`) maps every other stored value (including `null`, `direct_overlay`, typos) to `direct_image`. Clients may only **write** `'direct_image'`; writing `'html'` is rejected.
 
 ### Trigger
 
 - `routes/ads.js` `POST /generate` → **202** + `setImmediate` → `campaignAdsGenerationService.expandWizardJob` → `selectAdsForRun` → `runRenderLoop` (all in the **web** process).
+- `POST /api/ads/runs` drains already-queued inventory: `selectAdsForRun` then **`claimAdsForRun()`** (`routes/ads.js:645-750`) — atomic `updateMany` with `status:'queued'`, ownership re-read (`status:'rendering'` + `campaignRunIds: runId`), `modifiedCount` cross-check, post-claim requeue on throw. **Was false:** `/runs` lacked the claim `/generate` already had (double-bill hole on concurrent "render next batch").
 - `CampaignRun` tracks batch status; ad-batch progress via OperationRun kind `ad-batch`.
+- `GET /api/ads/runs/:runId` returns `perProduct` (machine codes + messages from `services/perProductReasons.js`). New code `concepts_no_usable_media` distinguishes "Director returned nothing" from "returned concepts but none usable". Run-level empty message uses `summarizeEmptyExpansion`, not the old generic "check imagery and templates".
 
-### Stages
+### Concept contract (load-bearing — zero-ads root cause, fixed 2026-08-02)
+
+Director schema **v3** nests strategy fields under `concept.routing` (`media_picks`, `creative_style`, `output_shape`, …). The producer dual-read both shapes and logged `warnings=0` while **every consumer that still read flat v2 discarded the concepts** → `payloads=0` (zero ads, paid Director rounds wasted). **One helper only:** `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`. Consumers include `campaignAdsGenerationService`, `aiJudgeService`, `aiCanvasHtmlGeneratorService`, `veoStoryboardService`. `scripts/verifyConceptContract.js` (125 checks) **fails the suite** if any `services/` or `routes/` file reads a `ROUTING_NESTED_FIELDS` name off a concept without the helper. Verified live after fix: `concepts=3 payloads=3` where it was `payloads=0`.
+
+### Hero-image default
+
+`DIRECTOR_UNIVERSE_TOP_N` default **1** (was 10) — a **default** change, not a capability removal. Ceiling stays 10; multi-image fully wired; operator multi-select still widens via `Math.max(mediaIds.length, TOP_N)` (`campaignAdsGenerationService.js:184,2331-2333`). Side effects of TOP_N=1:
+
+- Judge `media_utilization` axis is **N/A** (excluded from average) — it was docking every concept for obeying our own constraint (`aiJudgeService.js:423-431`).
+- Output-shape menu narrows to **`static_single` only** so the model cannot emit a collage declaring one tile (`aiCreativeDirectorService.js` `feedOutputShapesForUniverse`).
+
+### Stages (live direct-image path)
+
+Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image generation (surface))` (`routes/ads.js:1403`) → `renderStage` (`renderService.js:482-511`) for every static `ai_*` template → `directImage.renderDirectImage`. Stages are fire-and-forget via `services/adStage.js` (NEVER awaited — sits where Atlas is already billed; `AD_STAGE_MIN_MS` floor default ~3s). Poll progress piggybacks the **existing** image poll tick (`ATLAS_IMAGE_POLL_MS` default 3s), e.g. `plate generation (meta_feed_1_1) — polling 20s (7)`.
 
 1. **Ensure product imagery** — `ensureDetectForProducts` for campaign products ([§3](#3-per-product-detect--overlay-zones--ad-readiness-deferred-to-ad-time)).
-2. **Concept / seed selection** — wizard expansion; when `AI_CONCEPT_DRIVEN=true`, concept-driven V2 path (`aiCreativeDirectorService` / related).
-3. **HTML layout (default creative)** — `services/aiCanvasHtmlGeneratorService.js`  
-   - `MODEL_ID = 'gpt-4.1'`  
-   - Gated by `AI_HTML_LAYOUT_ENABLED`  
-   - Templates: `ai_brand_led` / `ai_ugc_led` / `ai_social_proof_led` / `ai_editorial` / `ai_promotional`  
-   - Older overlay templates: `product_overlay` / `testimonial_overlay` via `services/overlayPlacementService.js`
-4. **Rasterize** — `services/renderService.js` (Puppeteer).
-5. **Image-ref photoreal finish** (when `AI_IMAGE_REFERENCE_ENABLED=TRUE`, **on in prod**):  
-   - `services/aiImageReferenceService.js`  
-   - `AI_IMAGE_REF_MODEL_ID` = **`gpt-image-2`** (prod via defaults)  
-   - `AI_IMAGE_REF_QUALITY` = **`high`**  
-   - `Campaign.useImageRefAsProduction` (default **true**) swaps it in as production creative via `services/adDisplayUrlService.js`.
+2. **Concept expansion** — when `AI_CONCEPT_DRIVEN=true` (default): Director + Judge → Ad rows with `renderRoute: 'html_gen'` (**misnomer** — means "static", not "the HTML renderer"; real path is chosen inside `renderService`). Reads of `media_picks` / `creative_style` / `output_shape` go through `conceptProjection` only.
+3. **Derive layout / resolve concept** — `adStage(…, deriving layout (surface))`; missing concept **throws** (not a silent HTML fallthrough).
+4. **Fetch references** — seed media (+ Director/operator multi-pick when present). Zero refs → refuse before spend.
+5. **Build prompt + geometry** — intent / copy from concept projection (never invents art from `rationale`); customer quotes only via `toPrintableCustomerQuote`.
+6. **Plate submit + poll** — one `openai/gpt-image-2/edit` (or `AI_DIRECT_IMAGE_EDIT_MODEL`) via `atlasImageService`; stages on poll ticks.
+7. **Crop + logo composite** — local post; terminal asset on `Ad.renderUrl`; `adStage(…, 'done')` on success.
 
-**Other image-model uses (not the default full-ad path):**
+**Legacy HTML path** (only `Brand.staticImagePipeline === 'html'`): GPT-4.1 HTML (`aiCanvasHtmlGeneratorService`) → Puppeteer raster in `renderService`. Image-ref "photoreal polish" (`aiImageReferenceService`) is **not on the render path** — `AI_IMAGE_REFERENCE_*` vars are kept inert so old deploys resolve; `defaults.env` sets them false and documents them as deleted consumers. Do not re-enable expecting a polish step.
 
-- Extended-crop outpainting — `services/openaiImageService.js` (`gpt-image-1`, masked) before overlay zones exist.
-- Atlas gateway — `services/atlasImageService.js` defaults `openai/gpt-image-1.5` for text-to-image/edit.
-
-### Overlay-zone consumers in this path
+### Overlay-zone / spatial consumers
 
 | Service | Role |
 |---|---|
 | `adSuitabilityService` | Ad-readiness score (catalog UI + Generate Ads picker) |
-| `overlayPlacementService` | `product_overlay` text placement / contrast from brightness + density grids |
-| `aiCanvasInputBuilder` | `spatial_analysis` block for the GPT-4.1 layout LLM |
+| `overlayPlacementService` | legacy `product_overlay` templates only |
+| Direct-image path | Does **not** depend on overlay zones for the finished plate |
 
 ### Models & cost
 
 | Stage | Model | Notes |
 |---|---|---|
-| Layout authoring | **GPT-4.1** | HTML/CSS layout spec |
-| Raster | Puppeteer | CPU/memory on web process |
-| Photoreal finish | **gpt-image-2** (prod) | Quality `high` — main static $ driver when enabled |
-| Extended crop / Atlas edit | gpt-image-1 / gpt-image-1.5 | Secondary paths |
+| Finished static plate (default) | **`openai/gpt-image-2/edit`** | One billable edit; quality via `AI_DIRECT_IMAGE_QUALITY` (default `medium`) |
+| Concept / judge | GPT (Director + Judge) | Expansion cost, not the plate |
+| Legacy HTML layout | GPT-4.1 + Puppeteer | Only brands on `staticImagePipeline='html'` |
+| Extended crop / Atlas edit | gpt-image-1 / nano-banana etc. | Secondary paths (video reframe, etc.) |
 
 ### Env knobs
 
 | Var | Default (repo) | Role |
 |---|---|---|
-| `AI_IMAGE_REFERENCE_ENABLED` | `TRUE` | Enable image-ref re-render |
-| `AI_IMAGE_REF_MODEL_ID` | `gpt-image-2` | Image-ref model |
-| `AI_IMAGE_REF_QUALITY` | `high` | Image-ref quality |
-| `IMAGE_REF_DUMP_SEEDS` | `true` | Diagnostic — uploads every seed PNG; **candidate to turn off** to cut Cloudinary writes |
-| `AI_CONCEPT_DRIVEN` | `true` | Concept-driven V2 expansion |
-| `AI_HTML_LAYOUT_ENABLED` | `true` | GPT-4.1 HTML layout path |
-| `AI_LAYOUT_DIRECT_HTML` | `true` | Direct HTML (JSON-gen retirement path) |
-| `RENDER_CONCURRENCY` | `4` | Parallel static renders in `runRenderLoop` |
+| `AI_CONCEPT_DRIVEN` | `true` | Concept-driven expansion |
+| `DIRECTOR_UNIVERSE_TOP_N` | **`1`** | Director seed window without operator picks (ceiling 10) |
+| `AI_DIRECT_IMAGE_EDIT_MODEL` | `openai/gpt-image-2/edit` | Plate edit model |
+| `AI_DIRECT_IMAGE_QUALITY` | `medium` | Plate quality |
+| `AI_DIRECT_IMAGE_TIMEOUT_MS` | `600000` | Wall clock for plate |
+| `ATLAS_IMAGE_POLL_MS` | `3000` (code default) | Image prediction poll; also drives stage piggyback |
+| `AD_STAGE_MIN_MS` | `3000` (code default; **not** in `defaults.env`) | Stage write floor for same phase |
+| `RENDER_CONCURRENCY` | **`8`** | Parallel static ads in `runRenderLoop` (raised 4→8 2026-08-02; measured clean) |
+| `AI_HTML_LAYOUT_ENABLED` / `RENDER_USE_HTML` | `true` | Still used by the **legacy** HTML arm only |
+| `AI_IMAGE_REFERENCE_*` | `false` / inert | **Not read by the live render path** — was falsely documented as prod-on polish |
 
-### Progress / cancel
+### Progress / cancel / stage telemetry
 
-- OperationRun kinds: `ad-batch` (pool stops claiming; in-flight finish; unclaimed → draft), `ad-regenerate`, `ai-layout` as applicable.
-- Cancel semantics: item/pool boundaries via `progressService.checkpoint`.
+- OperationRun kinds: `ad-batch`, `ad-regenerate`, `ai-layout` as applicable.
+- Per-ad `Ad.renderStage` / `renderStageAt` via `adStage()` — closed the previous multi-minute blind spot during Atlas polls. No new timers.
+- Cancel: item/pool boundaries via `progressService.checkpoint`.
+- **Known open:** `queued` ads still never auto-drain after a web-process death; reaper flips `rendering` → `queued` only.
+
+### Routes worth knowing
+
+| Route | Role |
+|---|---|
+| `GET /api/ads/formats` | `formatCatalog()` verbatim — display-only, brand-agnostic, no `brandId` (`routes/ads.js:1998-2000`) |
+| Named routes before `/:id` | **ROUTE ORDER is load-bearing.** `mongoose.isValidObjectId('video-models') === true` (any 12-byte string casts), so `router.param` ObjectId guards (`routes/ads.js:2105-2112`) cannot protect a 12-char route name — they only turn bad ids into 404 instead of 500 CastError |
 
 ### Consumers
 
 - `Ad` documents / display URLs → Meta & Google push, previews, campaign UI.
-- `Campaign.useImageRefAsProduction` controls whether image-ref or HTML screenshot is production.
+- Direct-image output is production; there is no separate image-ref swap.
 
 ---
 
@@ -411,9 +447,9 @@ Results from deterministic + concept expanders are combined with **`mergeExpansi
 
 #### Concept / director path
 
-- Image concepts: still Director + Judge (`aiCreativeDirectorService` / `aiJudgeService`); template label maps from `concept.creative_style`.
-- Video concepts: only when `conceptVideo` is true; still capped at `VEO_ADS_PER_PRODUCT_CAP` (default **1**) per product in the concept expander.
-- **Director does not drive video titling or the camera prompt** (PR #11). Layout-input / title template for video is **canonical `ai_brand_led`** unless Title Studio overrides cascade (below). `concept.creative_style` is ignored for video titling.
+- Image concepts: still Director + Judge (`aiCreativeDirectorService` / `aiJudgeService`); template label maps from `conceptField(concept, 'creative_style')` (v3 dual-read — flat `concept.creative_style` alone is wrong; see §5 concept contract).
+- Video concepts: only when `conceptVideo` is true; still capped at `VEO_ADS_PER_PRODUCT_CAP` (default **1**) per product in the concept expander. Storyboard text path reads archetype / hooks via `conceptField` (`veoStoryboardService.js`).
+- **Director does not drive video titling or the camera prompt** (PR #11). Layout-input / title template for video is **canonical `ai_brand_led`** unless Title Studio overrides cascade (below). `creative_style` is ignored for video titling.
 
 #### Run selection (`selectAdsForRun`)
 
@@ -495,10 +531,27 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 
 ### Titling composite
 
-- Downstream of base video: `brandScriptExecutor` → **Remotion only**. There is no working canvas override — `resolveTitlingEngine` is hard-wired to remotion (`brandScriptExecutor.js:806`); `TITLING_ENGINE` and `videoSettings.titlingEngine` are inert. See `docs/TITLING.md` §0.
+- Downstream of base video: `brandScriptExecutor` → **Remotion only**. There is no working canvas override — `resolveTitlingEngine` returns `{ engine: 'remotion' }` **unconditionally** (`brandScriptExecutor.js:913-922`); the cascade below it is inside `/* … */`. `TITLING_ENGINE` and `videoSettings.titlingEngine` are inert. See `docs/TITLING.md` §0. **Was falsely cited at `:806`** — that line region is now `deriveTheme`.
 - Title template for layoutInput derivation is **canonical `ai_brand_led`** unless cascaded `titleTemplate` override.
 - Placement mode / engine: see `docs/TITLING.md` (`titlePlacementMode`, `titleStyleSpec` cascade including category).
 - **Does not use overlay zones** — text is scripted, not zone-driven product overlay.
+- **Quote gate on video:** `buildMetaForAd` runs `gateLayoutInputQuotes` → `toPrintableCustomerQuote` on `primary_quote` before Remotion chrome typesets it (`brandScriptExecutor.js` ~588-646, call at ~679). Same allowlist as static. **Was false:** video path did not dual-gate.
+
+### Master → titling outcome (money + status)
+
+**Untitled video is no longer a success** (`routes/ads.js:1258-1361`):
+
+1. Omni master lands → stamp `veoVideoUrl` / `renderUrl` and set `status:'draft'` **before** titling. Intermediate draft is deliberate: without it a crash mid-titling leaves `rendering`, the reaper requeues, and the next drain **pays Omni again**.
+2. Remotion titling runs (`adStage` `titling <aspect>`). No-chrome is intentional success (raw master ships).
+3. If titling **throws**: ad → `status:'failed'`, `renderStage: 'master rendered; titling failed'`, counted against the run’s `failed`; **raw master KEPT** (it was paid for). Not counted as `succeeded`.
+4. Only after clean titling (or deliberate no-chrome) is the run’s `succeeded` counter incremented and `adStage(…, 'done')`.
+
+**Known open (do not claim fixed):**
+
+- `veoPredictionId` is a spend receipt that is **never resumed** — process death + re-drain can double-bill.
+- `queued` ads still never auto-drain after web-process death (reaper only flips `rendering` → `queued`).
+- Static: ~1-in-3 ads render a competitor-shaped brand mark on the product (prompts already demand fidelity — fix is measure-and-reject, not prompt tuning). **Video path not QC’d** for the same defect 2026-08-03.
+- Meta surface preview chrome still shows placeholder copy (“Lorem ipsum dolor sit amet”) in places — preview-only furniture, not burned-in titles.
 
 ### Wizard controls (frontend PR #10; backend contract)
 
@@ -511,21 +564,43 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 
 ### Stages / files
 
+**"veo" is a legacy name — the live model is Omni.** `BUILT_IN_DEFAULT_MODEL` is `google/gemini-omni-flash/image-to-video-developer`; `ATLAS_VIDEO_MODEL` is blank in `defaults.env`, so that default runs. Everything spelled `veo*` / `AI_VEO_*` / `renderRoute:'veo'` is this pipeline wearing an old name.
+
 | Piece | File | Role |
 |---|---|---|
-| Expansion + det digest + merge + selection | `services/campaignAdsGenerationService.js` | Routing, `expandDeterministicVideo`, `selectAdsForRun` |
+| Expansion + det digest + merge + selection | `services/campaignAdsGenerationService.js` | Routing, `expandDeterministicVideo`, `selectAdsForRun`; concept reads via `conceptProjection` |
 | Category chain | `services/categoryChainService.js` | Leaf→root Category docs for cascades |
-| Atlas submit/poll + refs + model/prompt resolve | `services/atlasVideoService.js` | `generateForAd`, `buildReferenceImages`, resolvers, scaffold |
+| Atlas submit/poll + refs + model/prompt resolve | `services/atlasVideoService.js` | `generateForAd`, `buildReferenceImages`, resolvers, scaffold; poll ticks write `adStage` |
+| Per-ad stage telemetry | `services/adStage.js` | Fire-and-forget `renderStage` writes; never awaited |
 | Camera prompt builder | `services/veoPromptBuilder.js` | `buildVeoPrompt`, `enforceRawByteCap` |
 | Title style cascade | `services/titleSpecService.js` | `resolveSpec` (ad > product > category > brand) |
-| Brand title/script composite | `services/brandScriptExecutor.js` | Titling over base video |
+| Brand title/script composite | `services/brandScriptExecutor.js` | Titling over base video + video quote gate |
 | Provider router | `services/videoRouter.js` | `VIDEO_PROVIDER` → atlas / vertex |
 | Storyboard text (Vertex / legacy) | `services/veoStoryboardService.js` | GPT storyboard when that path uses it; **Atlas path retired storyboard** (Ken Burns prompt is complete) |
 | Direct Veo fallback (deprecated) | `services/aiVideoReferenceService.js` | `VIDEO_PROVIDER=vertex` |
 
+**Render-loop stage map (video)** — `routes/ads.js` + `atlasVideoService` + `brandScriptExecutor` piggyback existing poll ticks (`ATLAS_POLL_INTERVAL_MS` 15s). No new timers.
+
+| Stage string (examples) | When |
+|---|---|
+| `reusing video seed segment (no generation)` | Seed Media is already video → Cloudinary 8s segment, skip Omni |
+| `preparing video context` | Pre-submit: model/aspect resolve, layout warm |
+| `master video generation (9:16)` | Outer marker before `generateForAd` |
+| `reference reframe (…)` | Generative reframe / pad ladder on reference images |
+| `master video submit (…)` / `master video generation (…) — polling 4m10s (17)` | Inside Atlas submit/poll (`adStage` on each poll tick) |
+| `downloading master video` / `mirror upload` | Post-terminal fetch + Cloudinary |
+| (intermediate) `status:'draft'` + raw master on `renderUrl` | Money guard before titling — not a success claim |
+| `face-safe crop (…)` | `basePlateCropService` / `brandScriptExecutor` — crop 9:16 master → surface AR |
+| `titling …` / `uploading titled video (…)` | Remotion composite + upload |
+| `no titling (…) — shipping master` | Intentional no-chrome success |
+| `master rendered; titling failed` | Titling threw; master kept, status `failed` |
+| `done` | Clean success only |
+
 ### Models & cost
 
-- Atlas image-to-video (default Gemini Omni; Grok / Veo slugs in `MODEL_CAPS`) — rate-limited; **429s if concurrency > 1**.
+- Atlas image-to-video (**default Gemini Omni**; Grok / Veo slugs in `MODEL_CAPS` as fallbacks) — Omni RPS **unpublished/unmeasured**. Same-model video submits paced by `pacedModelSubmit` (`ATLAS_SUBMIT_SPACING_MS` default 1200ms). Grok (aspect-fallback only) stays ≤1 RPS via `GROK_MAX_RPS` floor regardless of `VEO_CONCURRENCY`.
+- **Was false:** "429s if concurrency > 1 / keep VEO_CONCURRENCY=1". That justification belonged to retired direct Google Veo and to Grok’s documented 1 RPS — not the primary Omni path. Current default **`VEO_CONCURRENCY=4`** (2026-08-02 probe). Re-measure before raising further.
+- Resolution default **`ATLAS_VIDEO_RESOLUTION=1080p`** — same list price as 720p on Omni; matches Meta `deliveryDims` (all 1080-wide).
 - Per-ref generative reframe (nano-banana-2 class edit when enabled) — ladder is exact-fit skip → product-only $0 pad → outpaint → $0 pad fallback; outpaint billed at `REFRAME_COST_USD` per image (default `$0.08` @ `4k`), cached per media+aspect on first success. Product-only shots (`Media.classification.shotType`) never reach the billable POST.
 - LayoutInput derivation (Gemini / existing builder) when artifact missing — non-fatal.
 - GPT storyboard only on non-Atlas paths that still call it.
@@ -537,15 +612,18 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 | `VIDEO_PROVIDER` | `atlas` | `atlas` \| `vertex` |
 | `AI_VEO_FEED` | `true` | Enable video for non-Reels formats |
 | `AI_VEO_REELS` | `true` | Enable video for 9:16 Reels |
-| `VEO_CONCURRENCY` | **`1`** | **Keep at 1** — provider 429s above this |
+| `VEO_CONCURRENCY` | **`4`** | Self-imposed in-flight video ads per run (raised 1→4 2026-08-02; re-measure before higher) |
 | `VEO_ADS_PER_PRODUCT_CAP` | `1` | Cap on **concept** video variants only (not deterministic) |
 | `VEO_USE_GPT_STORYBOARD` | `true` | Storyboard on paths that still use it (not Atlas Ken Burns) |
 | `ATLAS_VIDEO_FORCE_CHROME` | `true` | Force chrome handling on Atlas path |
-| `ATLAS_POLL_INTERVAL_MS` | `15000` (`defaults.env`; code fallback `5000`) | Prediction poll interval |
-| `ATLAS_VIDEO_MODEL` | (empty) | Optional model override in resolve chain |
+| `ATLAS_POLL_INTERVAL_MS` | `15000` (`defaults.env`; code fallback `5000`) | Prediction poll interval (+ stage piggyback) |
+| `ATLAS_VIDEO_RESOLUTION` | `1080p` | Omni output; same list $ as 720p |
+| `ATLAS_VIDEO_MODEL` | (empty) | Optional model override in resolve chain; empty → Omni built-in |
+| `ATLAS_SUBMIT_SPACING_MS` | `1200` | Same-model **video** submit spacing |
+| `GROK_MAX_RPS` | `1` | Provider ceiling on Grok Imagine submits |
 | `REFRAME_ENABLED` | `true` | Master switch for generative reframe of video reference images; `false` → Cloudinary crop only |
 | `REFRAME_OUTPAINT_MODEL` | `google/nano-banana-2/edit-developer` | Atlas image-edit model for outpaint (billable per image, single submit; `-developer` is a half-price billing variant, not a lower-fidelity tier) |
-| `REFRAME_RESOLUTION` | `4k` | Outpaint output resolution (`1k`\|`2k`\|`4k`). `4k` per operator decision (2026-07-24) after reviewing 20 live generations side by side — held product geometry better than `1k`; the reframed reference is also surfaced at full size in the generation inspector. The render itself stays 720p (`ATLAS_VIDEO_RESOLUTION`) |
+| `REFRAME_RESOLUTION` | `4k` | Outpaint output resolution (`1k`\|`2k`\|`4k`). `4k` per operator decision (2026-07-24) after reviewing 20 live generations side by side — held product geometry better than `1k`; the reframed reference is also surfaced at full size in the generation inspector. The video render itself is **`ATLAS_VIDEO_RESOLUTION=1080p`** (same list $ as 720p on Omni) — **was falsely documented as "stays 720p"** |
 | `REFRAME_PROMPT_STYLE` | `reframe` | `reframe` (conservative, default) \| `uncrop` (scene-revealing, riskier on product-only imagery — see reframe ladder step 5); unrecognised values fall back to `reframe` |
 | `REFRAME_SKIP_THRESHOLD` | `0.985` | Skip outpaint when source aspect is within this ratio of target (0–1) |
 | `REFRAME_COST_USD` | `0.08` | Per-image outpaint price recorded in the cost ledger (observability only, not a spend gate). `0.08` reflects `-developer` @ `4k`; readme documents "4K costs 2x" but not whether that stacks on the discounted `-developer` base, so this deliberately errs high |
@@ -559,6 +637,7 @@ Secret: `ATLAS_API_KEY`.
 ### Progress / cancel
 
 - Kind `veo-video` / regenerate stages; poll accepts `shouldCancel` (stops waiting; provider job may still finish server-side). See `docs/PROGRESS.md`.
+- Per-ad stage strings on `Ad.renderStage` via `adStage` (see stage map above). Floor `AD_STAGE_MIN_MS` (~3s) throttles same-phase poll rewrites.
 
 ### Consumers
 
@@ -570,11 +649,20 @@ Secret: `ATLAS_API_KEY`.
 
 > **Out-of-band alerting:** progress rows are in-app only — nobody sees them
 > unless a browser is open. Push alerts for crashes, dropped work, stalled
-> runs, and spend spikes go to Telegram; see **[docs/ALERTING.md](ALERTING.md)**.
+> runs, and spend spikes go to **Slack** (`services/alertService.js`); see
+> **[docs/ALERTING.md](ALERTING.md)**. **Telegram is gone** — there is no
+> Telegram transport, token, or channel left in the live path.
+>
+> **Slack config:**
+> - **Only secret:** `SLACK_BOT_TOKEN` — service-level Render env var on **both** web and worker.
+> - **Channels are committed** non-secrets in `config/defaults.env`: `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, and `SLACK_ALERT_CHANNEL_STATUS` (**recorded but READ BY NOTHING** — reserved for a per-run live feed that is **not built**).
+> - **CRITICAL API trap:** Slack returns HTTP 200 with `{ok:false,error:…}` on logical failure (bad token, `channel_not_found`, `not_in_channel`, …). Checking `res.ok` alone reports success while nothing was delivered (`alertService.js:220-240`). Always require `body.ok === true`.
+> - Boot: worker logs `🔔 alerts: Slack configured` when the token is present (`worker.js`).
+>
 > That doc also records *why* video batches stall: `runRenderLoop` executes
 > in the **web** process, which Render replaces on deploy **and** on
 > autoscale (`min 1 / max 3`, CPU+memory at 60%), and reaped ads land in
-> `queued` where nothing drains them automatically.
+> `queued` where nothing drains them automatically (**still known-open**).
 
 ### Core
 
@@ -610,17 +698,23 @@ Deeper instrumentation notes: `docs/PROGRESS.md`.
 
 ## 8. Concurrency knobs
 
-| Knob | Default | Prod / notes |
-|---|---|---|
-| `WORKER_CONCURRENCY` | 4 (`worker.js` fallback) | **5** in `defaults.env` — DetectRun / job poll workers |
-| `RENDER_CONCURRENCY` | 4 | Static ad Puppeteer pool (`routes/ads.js`) |
-| `VEO_CONCURRENCY` | **1** | **Do not raise** — provider 429s at >1 |
-| `CATALOG_ENRICHMENT_CONCURRENCY` | 6 | Enrich auto + full path |
-| `GENERIC_CATALOG_PDP_CONCURRENCY` | 5 | Parallel PDP fetches (no crawl-delay) |
-| Category inference concurrency | **6** | Hardcoded in post-sync call; per-domain throttled |
-| `HTTP_SCRAPE_DOMAIN_CONCURRENCY` | 3 | In-flight HTTP per host |
+Single resolver: `services/concurrency.js` (frozen `concurrency` object; boot logs the table). `defaults.env` + code defaults agree on the numbers below as of 2026-08-03.
 
-Video and static image runs share `runRenderLoop` but pick concurrency by run type (`isVeoRun` → `VEO_CONCURRENCY`, else `RENDER_CONCURRENCY`).
+| Knob | Default | Ceiling kind / notes |
+|---|---|---|
+| `WORKER_CONCURRENCY` | **5** | SELF — DetectRun / job poll workers |
+| `RENDER_CONCURRENCY` | **8** | SELF — in-flight static/image ads per run. Raised 4→8 (2026-08-02): unpaced `gpt-image-2/edit` measured clean (85s wall, zero 429s). **Was falsely documented as 4 / "Puppeteer pool"** — the live pool is direct-image Atlas submits |
+| `VEO_CONCURRENCY` | **4** | SELF — in-flight video ads per run. Raised 1→4 (2026-08-02) as an Omni probe. **Was falsely documented as "keep at 1 — provider 429s"**; that belonged to retired direct-Veo + Grok 1 RPS, not Omni. Re-measure before >4 |
+| `MAX_CREATIVES_PER_RUN` | 20 | SELF — ads claimed into one `CampaignRun` |
+| `ATLAS_SUBMIT_SPACING_MS` | 1200 | SELF — same-model **video** submit spacing only; image submits unpaced |
+| `GROK_MAX_RPS` | 1 | **PROVIDER** — env may lower, cannot raise above 1; floors Grok slug spacing independent of `VEO_CONCURRENCY` |
+| `CATALOG_ENRICHMENT_CONCURRENCY` | 6 | SELF — enrich auto + full path |
+| `GENERIC_CATALOG_PDP_CONCURRENCY` | 5 | SELF — parallel PDP fetches (no crawl-delay) |
+| Category inference concurrency | **6** | SELF — post-sync; per-domain throttled |
+| `HTTP_SCRAPE_DOMAIN_CONCURRENCY` | 3 | In-flight HTTP per host |
+| `DIRECTOR_UNIVERSE_TOP_N` | **1** | Not a render pool — Director seed window (see §5) |
+
+`runRenderLoop` runs **two pools in parallel** (`routes/ads.js:960-961`): `veo` at `VEO_CONCURRENCY` and `image` at `RENDER_CONCURRENCY`. Mixed batches no longer collapse both kinds onto one knob.
 
 ---
 
@@ -635,15 +729,17 @@ Versioned with the repo. Loaded in `index.js` / `worker.js` **after** the proces
 | Category | Examples |
 |---|---|
 | AI creative feature flags | `AI_CONCEPT_DRIVEN`, `AI_HTML_LAYOUT_ENABLED`, `AI_LAYOUT_DIRECT_HTML`, `CANONICAL_DR_V1`, `RENDER_USE_HTML`, `RENDER_USE_RESOLVED` |
-| Static image-ref path | `AI_IMAGE_REFERENCE_ENABLED`, `AI_IMAGE_REF_MODEL_ID`, `AI_IMAGE_REF_QUALITY`, `IMAGE_REF_DUMP_SEEDS` |
-| Video (Veo / Atlas) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY` |
-| Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY`, `VEO_CONCURRENCY` |
+| Director seed window | `DIRECTOR_UNIVERSE_TOP_N=1` |
+| Static direct-image path | `AI_DIRECT_IMAGE_*` (edit model / quality / timeout). `AI_IMAGE_REFERENCE_*` kept **inert** (no live consumer) |
+| Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=4` |
+| Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8`, `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |
+| Slack alert channels (non-secret) | `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, `SLACK_ALERT_CHANNEL_STATUS` (status = reserved, unread) |
 | Ingest tuning | `APIFY_*`, `POST_FETCH_LIMIT`, `CATALOG_SYNC_MAX_ITEMS`, `CATALOG_VISUAL_MATCH_MAX_IMAGES` |
 | Generic catalog scraper | `GENERIC_CATALOG_*`, `HTTP_SCRAPE_MIN_GAP_MS` |
 | Catalog detect / enrichment | `CATALOG_DETECT_PRECOMPUTE`, `CATALOG_ENRICHMENT_*` |
 | Public IDs / URLs | Cloudinary cloud name, frontend URLs, Google/Meta client IDs & redirect URIs, Jira base/email, sales-demo admins, Shopify store domain |
 
-**Never put secrets in this file** — it is committed to git.
+**Never put secrets in this file** — it is committed to git. Channel ids are not secrets; bot tokens are.
 
 ### Secrets — Render env only
 
@@ -666,6 +762,9 @@ Versioned with the repo. Loaded in `index.js` / `worker.js` **after** the proces
 | `SERPAPI_API_KEY` | Shopping / immersive product enrichment |
 | `SESSION_SECRET` | Session cookies |
 | `SHOPIFY_ACCESS_TOKEN` / `SHOPIFY_API_KEY` / `SHOPIFY_API_SECRET` | Shopify API |
+| **`SLACK_BOT_TOKEN`** | **Only** alerting secret — both web + worker. Channels live in `defaults.env` |
+
+No Telegram secrets remain. Alerts stay disabled until `SLACK_BOT_TOKEN` is set.
 
 ---
 
@@ -677,9 +776,15 @@ Versioned with the repo. Loaded in `index.js` / `worker.js` **after** the proces
 | Post-sync trio | `genericCatalogIngestService.js` (end-of-run), `catalogProductDetectService.js`, `catalogProductEnrichmentService.js`, `productCategoryInferenceService.js` |
 | Detect / overlay / readiness | `pipelines/detect.js`, `yoloService.js`, `overlayZoneService.js`, `adSuitabilityService.js`, `worker.js` |
 | Enrichment | `catalogProductEnrichmentService.js`, `productDetailsService.js` |
-| Static ads | `routes/ads.js`, `campaignAdsGenerationService.js`, `aiCanvasHtmlGeneratorService.js`, `renderService.js`, `aiImageReferenceService.js`, `overlayPlacementService.js`, `aiCanvasInputBuilder.js` |
-| Video (deterministic-first + director opt-in) | `campaignAdsGenerationService.js` (expand/select), `atlasVideoService.js`, `veoPromptBuilder.js`, `categoryChainService.js`, `titleSpecService.js`, `brandScriptExecutor.js`, `videoRouter.js`, `routes/ads.js` (`/preview`, `/generate`, `/veo-prompt-scaffold`), `routes/catalog.js` (`PATCH .../categories/:id`) |
+| Quote provenance | `quoteProvenance.js` (`toPrintableCustomerQuote`), `layoutInputService.js` (pool), `brandScriptExecutor.js` (video gate) |
+| Concept dual-read (v2/v3) | `conceptProjection.js` — **only** sanctioned reader of Director routing fields |
+| Per-product expand reasons | `perProductReasons.js`, stamped on `CampaignRun.perProduct` |
+| Static ads (default direct-image) | `routes/ads.js`, `campaignAdsGenerationService.js`, `directImageRenderService.js`, `staticPipeline.js`, `renderService.js`, `atlasImageService.js`, `adStage.js` |
+| Static ads (legacy HTML only) | `aiCanvasHtmlGeneratorService.js`, Puppeteer arm of `renderService.js` — only `Brand.staticImagePipeline==='html'` |
+| Video (deterministic-first + director opt-in; Omni under `veo*`) | `campaignAdsGenerationService.js` (expand/select), `atlasVideoService.js`, `veoPromptBuilder.js`, `categoryChainService.js`, `titleSpecService.js`, `brandScriptExecutor.js`, `videoRouter.js`, `adStage.js`, `routes/ads.js` (`/preview`, `/generate`, `/runs` + `claimAdsForRun`, `/formats`, `/veo-prompt-scaffold`), `routes/catalog.js` (`PATCH .../categories/:id`) |
+| Concurrency table | `services/concurrency.js`, `config/defaults.env` |
+| Alerting | `alertService.js` (Slack), `processAlerts.js` (worker watchdog) |
 | Progress | `progressService.js`, `models/OperationRun.js`, `routes/progress.js`, `routes/salesDemos.js` (`/activity`) |
 | Config | `config/defaults.env`, `index.js`, `worker.js` |
 
-Related docs: `docs/PROGRESS.md` (progress/cancel details), `docs/ai-creative-pipeline.md` (creative depth), `docs/ATLAS.md` (Atlas migration), `docs/TITLING.md` (video titling engine).
+Related docs: `docs/PROGRESS.md` (progress/cancel details), `docs/ai-creative-pipeline.md` (creative depth), `docs/ATLAS.md` (Atlas migration), `docs/TITLING.md` (video titling engine), `docs/ALERTING.md` (Slack).

@@ -50,7 +50,7 @@ logConcurrencyConfig();
 const REAP_STALE_MIN     = Math.max(1, parseInt(process.env.REAP_STALE_MIN, 10)     || 15);
 const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 10)  || 5);
 
-// Health sweep → Telegram (services/backlogWatchdog.js). Separate cadence
+// Health sweep → Slack (services/backlogWatchdog.js). Separate cadence
 // from the reaper so the thresholds can be tuned independently.
 const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_INTERVAL_MIN, 10) || 5);
 

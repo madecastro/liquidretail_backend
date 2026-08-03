@@ -7,7 +7,7 @@ _(empty — no pending owner prompt)_
 ### PICK UP HERE — 2026-08-03, everything below is MERGED AND LIVE on `main`
 
 Live prod = **`13cf679`** on both services (web `srv-d1vuktqli9vc73ft07ng`,
-worker `srv-d8128c1o3t8c73e8kb30`). Verify suite **28 scripts, all green**.
+worker `srv-d8128c1o3t8c73e8kb30`). Verify suite **29 scripts, all green**.
 
 Today closed a day-long gap where prod ran `a80ae0b` while 24 fixes sat
 unpushed — so every QC observation before this session was made against the
@@ -52,8 +52,11 @@ zero: `concepts=3 payloads=3 conceptSkips=0`, 3 ads queued, 2 rendered clean.
   `serviceLinks: []`** — nothing in it reaches any process; that is why alerts
   were silent. Do not "fix" it by linking the group: it also carries
   MONGODB_URI and Cloudinary secrets that could shadow service-level values.
-- `SLACK_ALERT_CHANNEL_STATUS` (C0BMMD5AN84) is recorded but **read by
-  nothing** — reserved for a per-run live feed that is NOT built.
+- `SLACK_ALERT_CHANNEL_STATUS` (C0BMMD5AN84) **now drives the per-run feed**
+  (`services/runFeedService.js`): one parent message per run edited live, the
+  full event log in its thread, poll ticks filtered structurally. `onStage` is a
+  SYNCHRONOUS buffer with a detached flush and must stay that way — it sits on
+  paths where Atlas has already been billed.
 - **Render API key** lives at `~/Documents/API Keys/Claude_Reach_Social_Key.txt`
   (`rnd_` prefix). Env group id `evg-d21udjm3jp1c738b17lg`.
 

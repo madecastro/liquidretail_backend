@@ -17,7 +17,7 @@
 // would leave the process alive until Render SIGKILLs it.
 //
 // Inside the ~FLUSH_MS shutdown window (default 2.5s) we do two things in
-// parallel: send the Telegram alert AND persist a diagnostic for any ads
+// parallel: send the Slack alert AND persist a diagnostic for any ads
 // this process had in flight (requeue rendering→queued, stamp a shutdown
 // row on CampaignRun.errors[], flip the run failed). Without the persist
 // step the reaper would eventually notice ~15 min later, but with an
@@ -65,7 +65,7 @@ function inFlightFields() {
 //      leaves operators with no signal to debug from.
 //
 // This runs inside the shutdown flush window (~FLUSH_MS, default 2.5s),
-// in parallel with the Telegram alert. Skipped entirely if Mongoose
+// in parallel with the Slack alert. Skipped entirely if Mongoose
 // isn't connected — e.g. a crash during boot before the DB came up —
 // so the shutdown path never blocks on a dead connection.
 async function persistOrphans({ signal, role }) {

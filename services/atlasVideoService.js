@@ -502,9 +502,13 @@ function resolveAspectRatioForModel(requested, caps) {
 // saliency-aware gravity, so a 9:16 source in a 4:5 canvas gets a clean
 // content-centered vertical crop with no letterboxing.
 //
-// Square (1:1) has no clean family native — a 44%-of-frame crop from
-// portrait or landscape drops too much subject; keep the Grok fallback
-// for it. Non-numeric aspects (unrecognized string) also fall through.
+// SUPERSEDED BY THE BODY BELOW — kept because it explains the original
+// reasoning, not because it is still true. It said square (1:1) has no clean
+// family native (a 44%-of-frame crop drops too much subject) so Grok stays
+// the fallback for it. The owner reversed that on 2026-07-29 after the
+// face-safe base-plate crop landed: square now renders at Omni 9:16 by
+// default and only falls back to Grok when SQUARE_VIA_OMNI_CROP=false.
+// Non-numeric aspects (unrecognized string) do still fall through to null.
 function omniFamilyNativeFor(requestedAspect) {
   const r = aspectToNumeric(requestedAspect);
   if (r == null) return null;

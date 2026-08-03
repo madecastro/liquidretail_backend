@@ -9,7 +9,7 @@ raw source text, never a raw star number.
 | Social comment | `Comment.text` | `Comment.proofJudgment.{usable,line}` |
 | Product review | `productReviews.quotes[].text` | `extractSnippet()` output, behind the 4.5★ gate |
 | Star rating | `quotes[].rating` | `toFiveScale(rating) >= QUOTE_MIN_RATING` |
-| Provenance | — | `origin` / `verbatim` / `scope` on every quote |
+| Provenance | — | `origin` / `verbatim` / `scope` on every quote; print only via `toPrintableCustomerQuote()` |
 
 ---
 
@@ -100,7 +100,8 @@ Callers must not catch the throw and render the comments anyway. The one
 deliberate exception is the ingest hook itself: a judge failure there does not
 fail the comment *fetch* (the comments are stored and correct, they simply have
 no verdict yet) because the read path will judge them lazily. The judge has
-already alerted by that point.
+already alerted by that point. Alerts ship over **Slack** (`SLACK_BOT_TOKEN` +
+committed channel ids in `config/defaults.env`); Telegram is gone.
 
 ## Consumers
 
@@ -129,10 +130,65 @@ better: the reviewer's own star rating.
 - The review's *text* still passes through inference — `extractSnippet`, the one
   place a quote is shortened, whose prompt enforces positive / on-product /
   complete-thought / no-shipping-or-service.
-- Category- and brand-tier quotes come from an LLM web search and carry no
-  per-review rating. They are allowed through unrated
-  (`QUOTE_REQUIRE_RATING=false`) and are accepted when no product-specific quote
-  exists.
+- Category- and brand-tier quotes come from grounded Gemini web search
+  (`geminiSearchProvider` with `tools:[{google_search:{}}]`). They carry no
+  per-review rating and are allowed through unrated
+  (`QUOTE_REQUIRE_RATING=false`) when no product-specific quote exists — but
+  only after the **printable provenance** gate below. They are **not** free
+  of provenance rules.
+
+## Printable provenance (customer quote on an ad)
+
+**One definition** of "may this print as a customer's own words" lives in
+`services/quoteProvenance.js`. Every producer and every renderer must use
+`toPrintableCustomerQuote(q)` and **must use the return value** (a sanitized
+copy, or `null`). Checking a boolean and then printing the original object is
+the bug this module exists to end.
+
+| `origin` | Printable? | Notes |
+|---|---|---|
+| `scraped` | yes | First-hand review engine / headless capture |
+| `social_comment` | yes | Real commenter; text is the ingest judge's extract |
+| `store-import` | yes | Merchant storefront import |
+| `llm-web` | **yes, text only** | Grounded web search. Attribution stripped. |
+| `synthesized` | **no** | LLM prose *about* reviews. Producer deleted; still rejected. |
+| `unknown` | **no** | Provenance we could not establish. Excluded by omission. |
+
+**`llm-web` was previously treated as excluded.** That claim is **false** as of
+2026-08-03. Rationale, verified in code:
+
+- `geminiSearchProvider.js:254,399` call Gemini with real
+  `tools:[{google_search:{}}]` grounded search, and `:266,411` record
+  `groundingMetadata.groundingChunks` (actual source domains). Gemini is the
+  **retrieval** mechanism, not the author. These are real sentences from real
+  pages, stamped `origin:'llm-web'`.
+- `verbatim: false` on those rows (`stampLlmQuotes` at
+  `geminiSearchProvider.js:33`) is a **source-class** marker meaning "not a
+  first-party scrape", **not** a paraphrase confession. For first-party
+  origins (`scraped` / `social_comment` / `store-import`), `verbatim:false`
+  still hard-rejects. For `llm-web` the gate **ignores** `verbatim`
+  (`quoteProvenance.js:113-118,125`).
+- What *was* broken was **attribution**: bylines like `Reddit (r/BuyItForLife)`
+  and — 80 times in production — `vertexaisearch.cloud.google.com` (Google's
+  grounding-redirect hostname printed as the customer).
+  `toPrintableCustomerQuote` `delete`s byline fields plus `source` and
+  `verified` for `ANONYMOUS_PRINT_ORIGINS` (`llm-web`). Callers that ignore the
+  return value re-print the poison byline.
+
+Pool assembly applies the gate in `layoutInputService` via
+`printableOnly` → `.map(toPrintableCustomerQuote)` (`layoutInputService.js`
+around the quote-tier build). Static render dual-gates again in
+`directImageRenderService` (`toPrintableCustomerQuote(proof.primary_quote)`).
+
+### Video dual-gate (same predicate)
+
+Static was dual-gated; video was not. A `LayoutInputArtifact` cached **before**
+the producer-side provenance gate could burn a fabricated claim into Remotion
+chrome. That hole is closed: `brandScriptExecutor.gateLayoutInputQuotes`
+(called from `buildMetaForAd`) reuses the **same**
+`toPrintableCustomerQuote` — reseats `primary_quote` with the sanitized copy
+or nulls it. Local clone only; never mutates the artifact; never throws after
+a billed Omni submit (`brandScriptExecutor.js:586-680`).
 
 ## Known gap
 
