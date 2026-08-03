@@ -32,6 +32,9 @@ const FILES = [
   'services/capabilityExecutors/catalogListProducts.js',
   'services/capabilityExecutors/adInspect.js',
   'services/capabilityExecutors/spendToday.js',
+  'services/capabilityExecutors/adArchive.js',
+  'services/capabilityExecutors/adRestore.js',
+  'services/capabilityExecutors/brandUpdateTagline.js',
   'routes/agent.js'
 ];
 for (const rel of FILES) {
@@ -194,10 +197,110 @@ async function checkParser() {
     `second chunk delta.content === " there"`);
 }
 
+// ── 9. Tier 1 capabilities + gate machinery (PR #3) ───────────────
+console.log('\n[9] Tier 1 capabilities + confirmation gate');
+
+const tier1Ids = ['ad.archive', 'ad.restore', 'brand.updateTagline'];
+for (const id of tier1Ids) {
+  const cap = registry.capabilityById(id);
+  assert(cap, `capability "${id}" registered`);
+  if (cap) assert(cap.tier === 1, `${id}: tier === 1 (got ${cap.tier})`);
+}
+
+// The endpoint MUST advertise the four gate-related surfaces:
+//   - proposed-action SSE event
+//   - splitByGate helper (renamed/refactored is fine as long as gating happens)
+//   - replayConfirmations helper (or equivalent)
+//   - confirmations request field validation
+assert(/event:\s*['"]?proposed-action['"]?/.test(agentSrc),
+  `routes/agent.js emits proposed-action event`);
+assert(/pending_confirmations/.test(agentSrc),
+  `routes/agent.js sets stop_reason='pending_confirmations' on gated calls`);
+assert(/confirmations/.test(agentSrc),
+  `routes/agent.js references the confirmations[] request field`);
+assert(/needsConfirmation/.test(agentSrc),
+  `routes/agent.js emits needsConfirmation flag on synthetic pending tool_results`);
+assert(/splitByGate|split.*Gate/.test(agentSrc),
+  `routes/agent.js has a gate-splitter helper`);
+assert(/replayConfirmations|replay.*Confirmation/.test(agentSrc),
+  `routes/agent.js has a confirmation-replay helper`);
+
+// Regression: the system prompt must instruct the LLM on the
+// confirmation flow. Without this the model will misinterpret the
+// synthetic pending result as a hard failure.
+assert(/needsConfirmation|TIER 1 CONFIRMATION FLOW/i.test(agentSrc),
+  `routes/agent.js system prompt describes the confirmation flow`);
+
+// Executor smoke: adArchive with a bogus advertiser scope MUST fail
+// closed; brandUpdateTagline MUST validate length; adRestore MUST
+// refuse a non-archived ad by name. These are cheap in-memory checks
+// (no DB call) via the pre-existing tenant-guard path.
+async function checkTier1Executors() {
+  const noScope = {};
+  const adArchive = require('../services/capabilityExecutors/adArchive');
+  const adRestore = require('../services/capabilityExecutors/adRestore');
+  const brandUpdateTagline = require('../services/capabilityExecutors/brandUpdateTagline');
+
+  const r1 = await adArchive.run({ req: noScope, args: { adId: 'x' } });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `adArchive: no-scope → rejects at auth guard`);
+
+  const r2 = await adRestore.run({ req: noScope, args: { adId: 'x' } });
+  assert(r2.ok === false && /advertiser scope/i.test(r2.error),
+    `adRestore: no-scope → rejects at auth guard`);
+
+  const r3 = await brandUpdateTagline.run({ req: noScope, args: { brandId: 'x', tagline: 'y' } });
+  assert(r3.ok === false && /advertiser scope/i.test(r3.error),
+    `brandUpdateTagline: no-scope → rejects at auth guard`);
+
+  // Tagline length guard (needs a real advertiserId but bogus brand → 200 chars)
+  const longTagline = 'x'.repeat(201);
+  const r4 = await brandUpdateTagline.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', tagline: longTagline }
+  });
+  assert(r4.ok === false && /too long/i.test(r4.error),
+    `brandUpdateTagline: 201-char tagline rejected`);
+
+  // Empty tagline
+  const r5 = await brandUpdateTagline.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', tagline: '   ' }
+  });
+  assert(r5.ok === false && /required/i.test(r5.error),
+    `brandUpdateTagline: whitespace-only tagline rejected`);
+}
+
+// Gate split: pure-function check — Tier 0 goes to dispatch, Tier 1
+// without confirmation goes to gate, Tier 1 with confirmation goes to
+// dispatch, unknown tool goes to gate (fail closed).
+function checkGateSplit() {
+  // The splitByGate function lives inside routes/agent.js and isn't
+  // exported. Reach into it by requiring the router module — the
+  // function itself won't be reachable, but we can verify the SHAPE
+  // via the file's tool-name mangling contract instead.
+  const fakeCalls = [
+    { id: 'a', function: { name: 'catalog__listProducts' } },   // Tier 0
+    { id: 'b', function: { name: 'ad__archive' } },             // Tier 1
+    { id: 'c', function: { name: 'brand__updateTagline' } },    // Tier 1
+    { id: 'd', function: { name: 'unknown__tool' } }            // unknown → gate
+  ];
+  // We can at least verify the registry-level classification.
+  for (const c of fakeCalls) {
+    const cap = registry.capabilityByToolName(c.function.name);
+    if (c.id === 'a') assert(cap?.tier === 0, `gate split: ${c.function.name} → tier 0`);
+    if (c.id === 'b') assert(cap?.tier === 1, `gate split: ${c.function.name} → tier 1`);
+    if (c.id === 'c') assert(cap?.tier === 1, `gate split: ${c.function.name} → tier 1`);
+    if (c.id === 'd') assert(!cap, `gate split: ${c.function.name} unknown → fail closed`);
+  }
+}
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
   await checkParser();
+  await checkTier1Executors();
+  checkGateSplit();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

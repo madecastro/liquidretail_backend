@@ -6,13 +6,38 @@
 // happen instead of one blob at the end.
 //
 // EVENT VOCABULARY (client-facing contract — DO NOT change silently):
-//   event: assistant-delta      data: { text }
-//   event: tool-use-start       data: { toolCallId, toolName }
-//   event: tool-use-complete    data: { toolCallId, toolName, args }
-//   event: tool-result          data: { toolCallId, result }
-//   event: iteration            data: { n }
-//   event: done                 data: { stop_reason, iterations, model }
-//   event: error                data: { error }
+//   event: assistant-delta         data: { text }
+//   event: tool-use-start          data: { toolCallId, toolName }
+//   event: tool-use-complete       data: { toolCallId, toolName, args }
+//   event: tool-result             data: { toolCallId, result }
+//   event: proposed-action         data: { toolCallId, toolName, args, tier }
+//   event: iteration               data: { n }
+//   event: done                    data: { stop_reason, iterations, model }
+//   event: error                   data: { error }
+//
+// CONFIRMATION GATE (Tier ≥ 1):
+//
+// PR #3 introduces server-side gating so the LLM cannot cause a write
+// without an explicit operator confirmation. When the LLM emits a
+// tool_call for a Tier ≥ 1 capability that is NOT in the request's
+// `confirmations: string[]` array, the server:
+//   1. Emits `proposed-action { toolCallId, toolName, args, tier }`
+//   2. Inserts a synthetic pending tool_result into the message
+//      history: `{ ok:false, needsConfirmation:true, ... }`
+//   3. Emits `tool-result` for the client's UI stream
+//   4. Sets stop_reason='pending_confirmations' and breaks the loop
+//      (still finishes the current iteration's text streaming first).
+//
+// On the operator's confirmation click, the client re-POSTs the same
+// message history + `confirmations: [<tool_call_id>, …]`. The server
+// walks the LAST assistant message with tool_calls, dispatches every
+// call whose id ∈ confirmations, and REPLACES the synthetic pending
+// tool_result in the messages history with the real result before
+// entering the LLM loop. The LLM's next iteration sees real results
+// and produces a natural "done" answer.
+//
+// A rogue LLM cannot self-confirm — the `confirmations` array is
+// authoritative, and it comes from the client, not from the model.
 //
 // Each frame is `event: <name>\ndata: <json>\n\n`. Client hooks with
 // EventSource.addEventListener('assistant-delta', …) etc.
@@ -65,7 +90,13 @@ function buildSystemPrompt(context = {}) {
     '- tier 2: billable write; ASK + estimate the cost before running.',
     '- tier 3: external / hard-to-reverse; ASK with explicit "type YES to confirm".',
     '- tier 4: multi-step workflow; propose a plan first.',
-    'This build ships tier-0 capabilities only. If the operator asks for something that would need a higher tier, name that clearly rather than pretending you can\'t help.',
+    'This build ships tier-0 (read-only) AND tier-1 (cheap-write, reversible) capabilities. Tier-2/3/4 land in follow-up releases. If the operator asks for something a higher tier would need, say so clearly rather than pretending you can\'t help.',
+    '',
+    'TIER 1 CONFIRMATION FLOW (server-enforced, do NOT try to bypass):',
+    '- When the operator asks for a tier-1 action, CALL THE TOOL as usual. The server will intercept the call and return a synthetic result `{ ok:false, needsConfirmation:true }` — this is the gate, not a failure.',
+    '- Your next message to the operator should DESCRIBE the exact action, its target, and its reversibility, then ask for explicit confirmation. Example: "I\'d like to archive ad X (currently in status \'draft\'). This is reversible via ad.restore. Confirm?"',
+    '- On the operator\'s confirmation, the SERVER dispatches the previously-proposed tool call — do NOT re-emit it. Your next message just summarises what happened based on the real tool_result you\'ll see.',
+    '- If the operator declines, acknowledge and do nothing.',
     '',
     `AVAILABLE CAPABILITIES (${registry.CAPABILITIES.length}):`,
     registry.describeManifest(),
@@ -95,6 +126,14 @@ function validateBody(body) {
     }
   }
   if (body.context != null && typeof body.context !== 'object') return 'context must be an object';
+  if (body.confirmations != null) {
+    if (!Array.isArray(body.confirmations)) return 'confirmations must be an array of strings';
+    for (const [i, c] of body.confirmations.entries()) {
+      if (typeof c !== 'string' || c.length === 0 || c.length > 200) {
+        return `confirmations[${i}] must be a non-empty string ≤200 chars`;
+      }
+    }
+  }
   return null;
 }
 
@@ -129,6 +168,87 @@ function sseWrite(res, event, data) {
 // Concatenate `arguments` string by index; id + name come only on the
 // first fragment for that index. finish_reason:'tool_calls' signals
 // the args are complete and safe to JSON.parse.
+
+// ── Gate: split assembled tool_calls into dispatch vs confirm-required ─
+//
+// Tier 0 → always dispatch. Tier ≥ 1 → dispatch only if the call id is
+// in the request's `confirmations` set; otherwise gate. Unknown tools
+// fail closed (treated as maximum-tier gate) — cheaper than dispatching
+// an executor that doesn't exist and leaking the reason via a stack.
+function splitByGate(toolCalls, confirmationsSet) {
+  const toDispatch = [];
+  const toGate = [];
+  for (const call of toolCalls) {
+    const cap = registry.capabilityByToolName(call.function.name);
+    const tier = cap ? cap.tier : 999;   // fail closed
+    if (tier === 0 || confirmationsSet.has(call.id)) {
+      toDispatch.push({ call, tier, cap });
+    } else {
+      toGate.push({ call, tier, cap });
+    }
+  }
+  return { toDispatch, toGate };
+}
+
+// ── Confirmation replay ─────────────────────────────────────────────
+//
+// When the client re-POSTs with `confirmations: [...ids]`, walk the
+// LAST assistant message that emitted tool_calls, dispatch each
+// confirmed call, and REPLACE the synthetic pending tool_result in
+// the messages history with the real result. The LLM's next iteration
+// then sees real data and produces a natural summary. Emits
+// tool-result SSE events per dispatched call so the client can update
+// its UI in real time.
+async function replayConfirmations({ working, confirmationsSet, req, context, res }) {
+  if (!confirmationsSet.size) return { dispatched: 0 };
+
+  // Find the last assistant message carrying tool_calls.
+  let assistantIdx = -1;
+  for (let i = working.length - 1; i >= 0; i--) {
+    if (working[i].role === 'assistant' && Array.isArray(working[i].tool_calls) && working[i].tool_calls.length) {
+      assistantIdx = i;
+      break;
+    }
+  }
+  if (assistantIdx < 0) return { dispatched: 0 };
+
+  let dispatched = 0;
+  for (const call of working[assistantIdx].tool_calls) {
+    if (!confirmationsSet.has(call.id)) continue;
+
+    // Locate the pending tool message we need to replace.
+    let toolIdx = -1;
+    for (let j = assistantIdx + 1; j < working.length; j++) {
+      if (working[j].role === 'tool' && working[j].tool_call_id === call.id) {
+        toolIdx = j;
+        break;
+      }
+    }
+    // No pending stub → the tool_call was never processed by this
+    // server (e.g. history was hand-crafted). Nothing to replay; skip.
+    if (toolIdx < 0) continue;
+
+    let args = {};
+    try { args = call.function?.arguments ? JSON.parse(call.function.arguments) : {}; }
+    catch { args = {}; }
+
+    const result = await agentTools.dispatch({
+      toolName: call.function?.name,
+      args,
+      req,
+      context
+    });
+
+    working[toolIdx] = {
+      role:         'tool',
+      tool_call_id: call.id,
+      content:      JSON.stringify(result)
+    };
+    sseWrite(res, 'tool-result', { toolCallId: call.id, result });
+    dispatched++;
+  }
+  return { dispatched };
+}
 
 function accumulateToolCallDelta(pending, deltaCalls) {
   const started = [];   // indices that just got id+name (client should see tool-use-start)
@@ -181,6 +301,7 @@ router.post('/chat', async (req, res) => {
   });
 
   const context = sanitiseContext(req.body.context);
+  const confirmationsSet = new Set(Array.isArray(req.body.confirmations) ? req.body.confirmations : []);
   const clientMessages = req.body.messages.filter((m) => m.role !== 'system');
   const system = buildSystemPrompt(context);
   const tools = registry.capabilitiesToTools();
@@ -197,6 +318,17 @@ router.post('/chat', async (req, res) => {
   let iterations = 0;
 
   try {
+    // Confirmation replay — dispatch any Tier ≥ 1 calls the client
+    // just confirmed and replace their synthetic pending tool_results
+    // in the history with real ones BEFORE the LLM sees this turn.
+    if (confirmationsSet.size) {
+      const { dispatched } = await replayConfirmations({
+        working, confirmationsSet, req, context, res
+      });
+      if (dispatched > 0) {
+        console.log(`🤝 agent chat: replayed ${dispatched} confirmed tool call(s)`);
+      }
+    }
     for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
       if (aborted) { stopReason = 'aborted'; break; }
       iterations++;
@@ -263,9 +395,13 @@ router.post('/chat', async (req, res) => {
         break;
       }
 
-      // Dispatch each tool call. Errors surface as ok:false results so
-      // the model can respond gracefully next turn.
-      for (const call of assembledToolCalls) {
+      // Split by risk tier. Tier 0 dispatches immediately; Tier ≥ 1
+      // requires an explicit id in confirmationsSet (populated on the
+      // request AFTER the operator clicks Confirm in the UI).
+      const { toDispatch, toGate } = splitByGate(assembledToolCalls, confirmationsSet);
+
+      // Dispatch confirmed / Tier-0 calls.
+      for (const { call } of toDispatch) {
         if (aborted) break;
         let args = {};
         try {
@@ -293,6 +429,57 @@ router.post('/chat', async (req, res) => {
           tool_call_id: call.id,
           content:      JSON.stringify(result)
         });
+      }
+
+      // Gate everything else. Emit proposed-action so the client can
+      // render a confirmation card, insert a synthetic pending
+      // tool_result so the LLM's message history stays well-formed
+      // (every tool_call needs a matching tool_result on the next
+      // turn), and remember that we're breaking after this iteration.
+      let anyGated = false;
+      for (const { call, tier } of toGate) {
+        let args = {};
+        try {
+          args = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+        } catch (err) {
+          args = { _parseError: err.message, _raw: call.function.arguments };
+        }
+        sseWrite(res, 'tool-use-complete', {
+          toolCallId: call.id,
+          toolName:   call.function.name,
+          args
+        });
+        sseWrite(res, 'proposed-action', {
+          toolCallId: call.id,
+          toolName:   call.function.name,
+          args,
+          tier
+        });
+        const pendingResult = {
+          ok: false,
+          needsConfirmation: true,
+          toolCallId: call.id,
+          toolName:   call.function.name,
+          tier,
+          note: 'Awaiting operator confirmation. Server will not dispatch until the client re-POSTs with this tool_call_id in the confirmations[] array.'
+        };
+        sseWrite(res, 'tool-result', { toolCallId: call.id, result: pendingResult });
+        working.push({
+          role:         'tool',
+          tool_call_id: call.id,
+          content:      JSON.stringify(pendingResult)
+        });
+        anyGated = true;
+      }
+
+      if (anyGated) {
+        // Stop after this iteration. The LLM already produced its
+        // text alongside the tool_calls; the client renders that text
+        // + the proposed-action cards. On confirm, the client re-POSTs
+        // with confirmations[] and replayConfirmations dispatches for
+        // real, then the loop continues from a fresh iteration.
+        stopReason = 'pending_confirmations';
+        break;
       }
 
       if (iter === MAX_ITERATIONS - 1) {

@@ -127,9 +127,76 @@ const CAPABILITIES = [
       service: './capabilityExecutors/spendToday',
       method:  'run'
     }
+  },
+
+  // ── Tier 1: cheap writes, inline confirmation required ───────────
+
+  {
+    id:       'ad.archive',
+    title:    'Archive ad',
+    describe: 'Move one ad to status \'archived\'. Reversible via ad.restore. Does not delete the render or the artifact — just hides the ad from active views. Requires operator confirmation.',
+    tier:     1,
+    scope:    'ad',
+    args: {
+      type: 'object',
+      required: ['adId'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adArchive',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'ad.restore',
+    title:    'Restore archived ad',
+    describe: 'Move an archived ad back to status \'draft\'. Reverses ad.archive. Requires operator confirmation.',
+    tier:     1,
+    scope:    'ad',
+    args: {
+      type: 'object',
+      required: ['adId'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adRestore',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'brand.updateTagline',
+    title:    'Update brand tagline',
+    describe: 'Set a brand\'s tagline (marketing one-liner used in generated ads and layout inputs). Reversible by calling again with the previous value. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'tagline'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        tagline: { type: 'string', minLength: 1, maxLength: 200,
+                   description: 'New tagline text. Max 200 chars.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandUpdateTagline',
+      method:  'run'
+    }
   }
 
-  // Tier 1+ entries land in follow-up PRs (see backlog row 167).
+  // Tier 2+ entries land in follow-up PRs (see backlog row 167).
 ];
 
 // ═══════════════════════════════════════════════════════════════════
