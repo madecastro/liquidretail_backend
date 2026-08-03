@@ -82,6 +82,16 @@ const campaignRunSchema = new mongoose.Schema({
 
   requestedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
+  // Per-run Slack live feed (services/runFeedService.js). Parent message
+  // ts is claimed atomically across web instances (min 1 / max 3) so two
+  // processes working the same run do not each create a parent. Only the
+  // winner of the conditional updateOne writes this; losers re-read and
+  // thread under the winner's ts. See claimParentTs.
+  slackFeed: {
+    ts:      { type: String, default: null },
+    channel: { type: String, default: null }
+  },
+
   startedAt:    { type: Date, default: Date.now },
   completedAt:  { type: Date, default: null }
 }, { timestamps: true });

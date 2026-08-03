@@ -67,6 +67,18 @@ function adStage(adId, stage) {
   if (prev && prev.base === base && (now - prev.at) < stageMinMs()) return;
   _lastByAd.set(id, { base, at: now });
 
+  // Per-run Slack feed — fire-and-forget, never awaited. runFeedService
+  // itself never throws; the try is belt-and-braces so a require/load
+  // failure cannot fail a paid render. Poll-tick filtering lives inside
+  // the feed (structural match on "— polling Ns (k)"), not here: the
+  // Mongo write above still wants the latest poll progress for the UI.
+  try {
+    // Lazy require: keeps adStage load free of the feed's optional deps
+    // and avoids a cycle if the feed ever pulls adStage helpers.
+    // eslint-disable-next-line global-require
+    require('./runFeedService').onStage(id, text);
+  } catch { /* never escape to a render path */ }
+
   Ad.updateOne(
     { _id: adId },
     { $set: { renderStage: text, renderStageAt: new Date(), updatedAt: new Date() } }

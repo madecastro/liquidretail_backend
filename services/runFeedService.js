@@ -1,0 +1,1017 @@
+'use strict';
+//
+// runFeedService — per-CampaignRun Slack live feed.
+//
+// One parent message per run (chat.update'd on a throttle = the live status
+// screen). A thread under it carries the FULL chronological event log, batched
+// so a burst of stage transitions becomes one threaded post.
+//
+// Channel: SLACK_ALERT_CHANNEL_STATUS (committed in config/defaults.env).
+//
+// ── SAFETY CONTRACT (acceptance criterion — this sits on paid paths) ──────
+//   1. Never awaited on a render path. Every export is fire-and-forget.
+//   2. Never throws. Absolute try/catch backstop on every entry point.
+//   3. BOUNDED memory. Fixed-size ring buffer per run; when full, DROP
+//      OLDEST and count the drops. Surface "(N events dropped)" on the next
+//      post so the log is honest about being lossy. Never buffer unboundedly,
+//      never block a producer.
+//   4. Never sleep on a render path. HTTP 429 → log Retry-After, drop that
+//      flush. Same rule alertService already follows.
+//   5. Completely inert when SLACK_ALERT_CHANNEL_STATUS or SLACK_BOT_TOKEN
+//      is unset — no fetch, no timer, one warn per process at most.
+//   6. All Slack I/O happens on a DETACHED interval, never inside a caller's
+//      stack.
+//
+// Multi-instance: parent message ts is claimed atomically on CampaignRun
+// (slackFeed: { ts, channel }). Conditional updateOne only sets when unset;
+// the winner creates the parent, everyone else threads under the winner's ts.
+// A lost claim must NOT create a second parent.
+//
+// Hook surface: services/adStage.js (every stage write) + runRenderLoop
+// start/finish in routes/ads.js. Poll ticks
+// ("… — polling 20s (7)") are filtered structurally from the thread log;
+// they still refresh the parent's "now:" line.
+
+const os = require('os');
+const { stageBase, formatElapsed } = require('./adStage');
+
+// ── config (lazy, so tests can flip env between cases) ────────────────────
+const BOT_TOKEN = () => (process.env.SLACK_BOT_TOKEN || '').trim();
+const CHANNEL   = () => (process.env.SLACK_ALERT_CHANNEL_STATUS || '').trim();
+
+// Master switch. Default ON when the channel is set; set RUN_FEED_ENABLED=false
+// to mute without unsetting the channel.
+const ENABLED = () => String(process.env.RUN_FEED_ENABLED ?? 'true').toLowerCase() !== 'false';
+
+const PARENT_THROTTLE_MS = () =>
+  Math.max(1000, parseInt(process.env.RUN_FEED_PARENT_THROTTLE_MS || '10000', 10) || 10000);
+const THREAD_FLUSH_MS = () =>
+  Math.max(250, parseInt(process.env.RUN_FEED_THREAD_FLUSH_MS || '2000', 10) || 2000);
+const RING_SIZE = () =>
+  Math.max(1, parseInt(process.env.RUN_FEED_RING_SIZE || '200', 10) || 200);
+const SEND_TIMEOUT_MS = () =>
+  Math.max(1000, parseInt(process.env.RUN_FEED_SEND_TIMEOUT_MS || '8000', 10) || 8000);
+
+// Hard cap on concurrently tracked runs in this process (finished runs are
+// pruned first). Prevents a long-lived web instance from retaining forever.
+const MAX_TRACKED_RUNS = 40;
+
+const ENV_LABEL = () => process.env.ALERT_ENV_LABEL || process.env.NODE_ENV || 'prod';
+const ROLE      = () => process.env.ALERT_ROLE || (process.env.RENDER_SERVICE_TYPE === 'background_worker' ? 'worker' : 'web');
+const INSTANCE  = () => (process.env.RENDER_INSTANCE_ID || os.hostname() || '?').slice(-8);
+
+const SLACK_MAX = 3900; // leave headroom under Slack's ~4000 text limit
+
+// ── poll-tick filter (structural — no caller flag) ────────────────────────
+// Matches adStage.stageBase's suffix: " — polling 20s (7)" / " — polling 4m10s (17)".
+// These are the same stage advancing, not new events. Parent still sees them
+// via lastStageByAd; the thread log must not.
+const POLL_TICK_RE = /\s*—\s*polling\s+\S+\s*\(\d+\)\s*$/i;
+
+function isPollTick(stage) {
+  return POLL_TICK_RE.test(String(stage || ''));
+}
+
+// ── ring buffer ───────────────────────────────────────────────────────────
+// Fixed capacity. push() never blocks, never grows past capacity. When full,
+// the oldest item is dropped and dropCount increments. drain() hands the
+// consumer both the items and the accumulated drop count so the next post
+// can honestly report "(N events dropped)".
+class RingBuffer {
+  constructor(capacity) {
+    this.capacity = Math.max(1, capacity | 0);
+    this.items = [];
+    this.dropCount = 0;
+  }
+  get size() { return this.items.length; }
+  push(item) {
+    if (this.items.length >= this.capacity) {
+      this.items.shift();
+      this.dropCount++;
+    }
+    this.items.push(item);
+  }
+  /** Drain pending items + reset drop counter. Returns { items, dropped }. */
+  drain() {
+    const items = this.items;
+    const dropped = this.dropCount;
+    this.items = [];
+    this.dropCount = 0;
+    return { items, dropped };
+  }
+}
+
+// ── in-process state ──────────────────────────────────────────────────────
+/** @type {Map<string, RunState>} runId → state */
+const runs = new Map();
+/** adId → runId (so adStage can route without a Mongo round-trip) */
+const adToRun = new Map();
+/** adId → { template, aspectRatio, mediaId, platformFormat } */
+const adMeta = new Map();
+
+let timer = null;
+let timerIntervalMs = 0;
+let warnedUnconfigured = false;
+let flushInFlight = false;
+
+// Injectable deps for offline tests (no real Mongo / network).
+let _CampaignRun = null;
+let _Ad = null;
+let _fetch = null;
+let _now = () => Date.now();
+// Test seam: force an internal throw from entry points under the try/catch.
+let _forceThrow = false;
+
+function CampaignRunModel() {
+  if (_CampaignRun) return _CampaignRun;
+  // Lazy require — keeps module load free of mongoose side-effects for pure tests.
+  // eslint-disable-next-line global-require
+  return require('../models/CampaignRun');
+}
+function AdModel() {
+  if (_Ad) return _Ad;
+  // eslint-disable-next-line global-require
+  return require('../models/Ad');
+}
+function doFetch(url, opts) {
+  const f = _fetch || global.fetch;
+  return f(url, opts);
+}
+
+function isConfigured() {
+  return Boolean(ENABLED() && BOT_TOKEN() && CHANNEL());
+}
+
+function warnUnconfiguredOnce() {
+  if (warnedUnconfigured) return;
+  warnedUnconfigured = true;
+  try {
+    console.warn('📡 runFeed: SLACK_BOT_TOKEN / SLACK_ALERT_CHANNEL_STATUS not set — feed disabled');
+  } catch { /* ignore */ }
+}
+
+// ── formatting ────────────────────────────────────────────────────────────
+function esc(v) {
+  return String(v ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function clip(s, max) {
+  const str = String(s ?? '');
+  return str.length <= max ? str : `${str.slice(0, max - 1)}…`;
+}
+
+function redact(text) {
+  const token = BOT_TOKEN();
+  let s = String(text ?? '');
+  if (token && token.length > 4) s = s.split(token).join('<token>');
+  s = s.replace(/xox[baprs]-[A-Za-z0-9-]+/g, 'xox<redacted>');
+  return s;
+}
+
+function hhmmss(ms) {
+  try {
+    return new Date(ms).toISOString().slice(11, 19);
+  } catch {
+    return '??:??:??';
+  }
+}
+
+function shortId(id) {
+  const s = String(id || '');
+  return s.length <= 6 ? s : s.slice(-6);
+}
+
+function iconFor(stage) {
+  const s = String(stage || '').toLowerCase();
+  if (/^failed\b|fail|error/.test(s)) return '✗';
+  if (/^done\b|shipping master/.test(s)) return '✔';
+  if (/upload/.test(s)) return '☁';
+  if (/submit/.test(s)) return '⬆';
+  if (/titling|title/.test(s)) return '✎';
+  if (/crop|logo|composite/.test(s)) return '✂';
+  if (/skip|archived/.test(s)) return '⊘';
+  if (/stall/.test(s)) return '⏱';
+  if (/ready|download|mirror|plate generation(?!.*polling)/.test(s)) return '✓';
+  if (/start|generat|render|static image|master video|preparing|deriving|fetching|building|reference|reusing/.test(s)) {
+    return '▶';
+  }
+  return '•';
+}
+
+/**
+ * One thread-log line.
+ * e.g. "03:00:44  ▶ static image generation (meta_feed_1_1)  ai_brand_led/1:1  media=…7686"
+ */
+function formatThreadLine(ev) {
+  const t = hhmmss(ev.t);
+  const icon = iconFor(ev.stage);
+  const base = stageBase(ev.stage) || ev.stage || '?';
+  const meta = ev.meta || {};
+  const bits = [`${t}  ${icon} ${base}`];
+  if (meta.template || meta.aspectRatio) {
+    bits.push(`${meta.template || '?'}/${meta.aspectRatio || '?'}`);
+  }
+  if (meta.mediaId) bits.push(`media=…${shortId(meta.mediaId)}`);
+  if (ev.adId) bits.push(`ad=…${shortId(ev.adId)}`);
+  return bits.join('  ');
+}
+
+function buildParentText(state, live) {
+  const rid = String(state.runId || '');
+  const shortRun = rid.length > 10 ? `${rid.slice(0, 8)}…` : rid;
+  const brand = state.brandName || state.brandId || 'brand';
+  const product = state.productLabel || null;
+  const total = live?.total ?? state.total ?? 0;
+  const head = product
+    ? `▸ ${shortRun} · ${brand} · ${product} · ${total} ads`
+    : `▸ ${shortRun} · ${brand} · ${total} ads`;
+
+  const counts = live?.counts || state.counts || {};
+  const parts = [];
+  for (const k of ['draft', 'rendering', 'queued', 'failed', 'live', 'archived', 'succeeded', 'skipped']) {
+    const n = Number(counts[k]) || 0;
+    if (n > 0) parts.push(`${n} ${k}`);
+  }
+  // Prefer CampaignRun counters when Ad aggregation is empty (early run).
+  if (!parts.length && live?.runCounters) {
+    const rc = live.runCounters;
+    if (rc.succeeded) parts.push(`${rc.succeeded} succeeded`);
+    if (rc.failed) parts.push(`${rc.failed} failed`);
+    if (rc.skipped) parts.push(`${rc.skipped} skipped`);
+    const remaining = Math.max(0, (rc.total || total) - (rc.succeeded || 0) - (rc.failed || 0) - (rc.skipped || 0));
+    if (remaining > 0 && state.status !== 'done') parts.push(`${remaining} in flight`);
+  }
+  const elapsedMs = Math.max(0, (live?.now || _now()) - (state.startedAt || _now()));
+  const countLine = `${parts.join(' · ') || 'starting…'} · ${formatElapsed(elapsedMs)}`;
+
+  // "now:" — collapse identical stages with xN
+  const stageMap = live?.stages || state.lastStageByAd;
+  const stageCounts = new Map();
+  if (stageMap && typeof stageMap.forEach === 'function') {
+    stageMap.forEach((st) => {
+      const b = stageBase(st) || st;
+      if (!b) return;
+      stageCounts.set(b, (stageCounts.get(b) || 0) + 1);
+    });
+  } else if (stageMap && typeof stageMap === 'object') {
+    for (const st of Object.values(stageMap)) {
+      const b = stageBase(st) || st;
+      if (!b) continue;
+      stageCounts.set(b, (stageCounts.get(b) || 0) + 1);
+    }
+  }
+  let nowLine = '';
+  if (stageCounts.size) {
+    const bits = [...stageCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([s, n]) => (n > 1 ? `${s} x${n}` : s));
+    nowLine = `now: ${bits.join(', ')}`;
+  } else if (state.finished) {
+    nowLine = state.cancelled ? 'stopped' : 'finished';
+  }
+
+  const foot = `\`${ENV_LABEL()}·${ROLE()}·${INSTANCE()}\``;
+  const lines = [head, `    ${countLine}`];
+  if (nowLine) lines.push(`    ${nowLine}`);
+  if (state.finished && state.finishSummary) lines.push(`    ${state.finishSummary}`);
+  lines.push(foot);
+  return clip(lines.join('\n'), SLACK_MAX);
+}
+
+// ── Slack transport (never throws; never sleeps) ──────────────────────────
+async function slackApi(method, body) {
+  const token = BOT_TOKEN();
+  if (!token) return { ok: false, error: 'no_token' };
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), SEND_TIMEOUT_MS());
+  try {
+    const res = await doFetch(`https://slack.com/api/${method}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json; charset=utf-8'
+      },
+      body: JSON.stringify(body),
+      signal: ctl.signal
+    });
+
+    // 429: log Retry-After, drop this flush. NEVER sleep.
+    if (res.status === 429) {
+      const ra = (res.headers && (res.headers.get?.('retry-after') || res.headers.get?.('Retry-After'))) || '?';
+      console.warn(`📡 runFeed: Slack 429 (Retry-After: ${ra}s) — dropping this flush`);
+      return { ok: false, error: 'rate_limited', status: 429, retryAfter: ra };
+    }
+
+    let json = null;
+    try { json = await res.json(); } catch { json = null; }
+
+    if (!res.ok) {
+      const why = json ? JSON.stringify(json) : `HTTP ${res.status}`;
+      console.warn(`📡 runFeed: Slack ${res.status} — ${redact(clip(why, 300))}`);
+      return { ok: false, error: 'http_error', status: res.status };
+    }
+
+    // CRITICAL: Slack returns HTTP 200 + {ok:false} on logical failure.
+    if (!json || json.ok !== true) {
+      const errName = (json && json.error) ? String(json.error) : 'unknown (no ok field)';
+      console.warn(`📡 runFeed: Slack ok=false — ${redact(clip(errName, 300))}`);
+      return { ok: false, error: errName, body: json };
+    }
+    return { ok: true, body: json };
+  } catch (err) {
+    const why = err && err.name === 'AbortError'
+      ? `timeout after ${SEND_TIMEOUT_MS()}ms`
+      : (err && err.message) || String(err);
+    console.warn(`📡 runFeed: Slack ${method} failed — ${redact(why)}`);
+    return { ok: false, error: why };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── atomic parent-ts claim ────────────────────────────────────────────────
+/**
+ * Claim parent message ts for a run. Only the winner's updateOne matches
+ * (filter requires slackFeed.ts unset). Losers re-read the winner's ts.
+ *
+ * Mirrors claimAdsForRun: conditional write, then re-read ownership.
+ *
+ * @returns {Promise<{ won: boolean, ts: string|null, channel: string|null }>}
+ */
+async function claimParentTs(runId, channel, ts, CampaignRun = CampaignRunModel()) {
+  const rid = String(runId);
+  const ch = String(channel);
+  const parentTs = String(ts);
+
+  // Conditional set: only when slackFeed.ts is missing/null.
+  // $or covers docs that never had slackFeed and docs with an empty shell.
+  const writeResult = await CampaignRun.updateOne(
+    {
+      runId: rid,
+      $or: [
+        { slackFeed: { $exists: false } },
+        { 'slackFeed.ts': { $exists: false } },
+        { 'slackFeed.ts': null },
+        { 'slackFeed.ts': '' }
+      ]
+    },
+    { $set: { slackFeed: { ts: parentTs, channel: ch } } }
+  );
+  const modified = Number(writeResult && (writeResult.modifiedCount ?? writeResult.nModified)) || 0;
+
+  if (modified > 0) {
+    return { won: true, ts: parentTs, channel: ch };
+  }
+
+  // Lost the race (or already claimed). Re-read the winner.
+  const doc = await CampaignRun.findOne({ runId: rid }).select('slackFeed').lean();
+  const existing = doc && doc.slackFeed && doc.slackFeed.ts
+    ? String(doc.slackFeed.ts)
+    : null;
+  const existingCh = doc && doc.slackFeed && doc.slackFeed.channel
+    ? String(doc.slackFeed.channel)
+    : ch;
+  return { won: false, ts: existing, channel: existingCh };
+}
+
+/** Read already-claimed parent ts (no write). */
+async function readParentTs(runId, CampaignRun = CampaignRunModel()) {
+  const doc = await CampaignRun.findOne({ runId: String(runId) }).select('slackFeed').lean();
+  if (!doc || !doc.slackFeed || !doc.slackFeed.ts) return null;
+  return {
+    ts: String(doc.slackFeed.ts),
+    channel: doc.slackFeed.channel ? String(doc.slackFeed.channel) : CHANNEL()
+  };
+}
+
+// ── run state ─────────────────────────────────────────────────────────────
+/**
+ * @typedef {object} RunState
+ * @property {string} runId
+ * @property {string|null} brandId
+ * @property {string|null} brandName
+ * @property {string|null} productLabel
+ * @property {number} total
+ * @property {number} startedAt
+ * @property {string|null} parentTs
+ * @property {string|null} channel
+ * @property {boolean} claimInFlight
+ * @property {boolean} parentCreateInFlight
+ * @property {RingBuffer} ring
+ * @property {Map<string,string>} lastStageByAd
+ * @property {object} counts
+ * @property {boolean} finished
+ * @property {boolean} cancelled
+ * @property {string|null} finishSummary
+ * @property {number} lastParentAt
+ * @property {boolean} parentDirty
+ * @property {boolean} needsParent
+ */
+
+function makeRunState(opts) {
+  return {
+    runId: String(opts.runId),
+    brandId: opts.brandId ? String(opts.brandId) : null,
+    brandName: opts.brandName || null,
+    productLabel: opts.productLabel || null,
+    total: Number(opts.total) || 0,
+    startedAt: _now(),
+    parentTs: null,
+    channel: CHANNEL(),
+    claimInFlight: false,
+    parentCreateInFlight: false,
+    ring: new RingBuffer(RING_SIZE()),
+    lastStageByAd: new Map(),
+    counts: {},
+    finished: false,
+    cancelled: false,
+    finishSummary: null,
+    lastParentAt: 0,
+    parentDirty: true,
+    needsParent: true
+  };
+}
+
+function pruneRuns() {
+  if (runs.size <= MAX_TRACKED_RUNS) return;
+  // Drop finished runs first (oldest startedAt).
+  const finished = [...runs.entries()]
+    .filter(([, s]) => s.finished)
+    .sort((a, b) => a[1].startedAt - b[1].startedAt);
+  for (const [rid, st] of finished) {
+    if (runs.size <= MAX_TRACKED_RUNS) break;
+    // Unmap ads for this run.
+    for (const [adId, r] of adToRun) {
+      if (r === rid) {
+        adToRun.delete(adId);
+        adMeta.delete(adId);
+      }
+    }
+    runs.delete(rid);
+    void st;
+  }
+  // If still over (all active), drop oldest by startedAt — lossy by design.
+  if (runs.size > MAX_TRACKED_RUNS) {
+    const ordered = [...runs.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt);
+    while (runs.size > MAX_TRACKED_RUNS && ordered.length) {
+      const [rid] = ordered.shift();
+      for (const [adId, r] of adToRun) {
+        if (r === rid) {
+          adToRun.delete(adId);
+          adMeta.delete(adId);
+        }
+      }
+      runs.delete(rid);
+    }
+  }
+}
+
+function ensureTimer() {
+  if (!isConfigured()) return;
+  const ms = THREAD_FLUSH_MS();
+  if (timer && timerIntervalMs === ms) return;
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  timerIntervalMs = ms;
+  timer = setInterval(() => {
+    // Detached — never part of a caller's stack. unref so this timer alone
+    // cannot keep a shutting-down process alive.
+    Promise.resolve()
+      .then(() => flushAll())
+      .catch(() => {});
+  }, ms);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
+function stopTimerIfIdle() {
+  if (!timer) return;
+  let anyActive = false;
+  for (const st of runs.values()) {
+    if (!st.finished || st.ring.size > 0 || st.parentDirty || st.needsParent) {
+      anyActive = true;
+      break;
+    }
+  }
+  if (!anyActive) {
+    clearInterval(timer);
+    timer = null;
+    timerIntervalMs = 0;
+  }
+}
+
+// ── public entry points (never throw, never await by callers) ─────────────
+
+/**
+ * Register a CampaignRun for live feed updates. Fire-and-forget.
+ * Call at runRenderLoop start (after claim).
+ */
+function startRun(opts = {}) {
+  try {
+    if (_forceThrow) throw new Error('runFeed forced throw');
+    if (!opts || !opts.runId) return;
+    if (!isConfigured()) {
+      warnUnconfiguredOnce();
+      return;
+    }
+    const rid = String(opts.runId);
+    let st = runs.get(rid);
+    if (!st) {
+      st = makeRunState(opts);
+      runs.set(rid, st);
+    } else {
+      // Re-entry (second pool / retry): refresh totals, keep parentTs.
+      if (opts.total != null) st.total = Number(opts.total) || st.total;
+      if (opts.brandName) st.brandName = opts.brandName;
+      if (opts.productLabel) st.productLabel = opts.productLabel;
+      st.finished = false;
+      st.parentDirty = true;
+    }
+    const adIds = Array.isArray(opts.adIds) ? opts.adIds : [];
+    for (const raw of adIds) {
+      const id = String(raw);
+      adToRun.set(id, rid);
+    }
+    // Optional preloaded meta: [{ _id, template, aspectRatio, mediaId, ... }]
+    if (Array.isArray(opts.adDocs)) {
+      for (const d of opts.adDocs) {
+        if (!d || d._id == null) continue;
+        const id = String(d._id);
+        adToRun.set(id, rid);
+        adMeta.set(id, {
+          template: d.template || null,
+          aspectRatio: d.aspectRatio || null,
+          mediaId: d.mediaId ? String(d.mediaId) : null,
+          platformFormat: d.platformFormat || null
+        });
+      }
+    } else if (adIds.length) {
+      // Fire-and-forget meta enrich — never on the caller's critical path.
+      // Failures leave events without template/media suffixes; acceptable.
+      Promise.resolve()
+        .then(async () => {
+          try {
+            const docs = await AdModel()
+              .find({ _id: { $in: adIds } })
+              .select('template aspectRatio mediaId platformFormat')
+              .lean();
+            for (const d of docs || []) {
+              if (!d || d._id == null) continue;
+              adMeta.set(String(d._id), {
+                template: d.template || null,
+                aspectRatio: d.aspectRatio || null,
+                mediaId: d.mediaId ? String(d.mediaId) : null,
+                platformFormat: d.platformFormat || null
+              });
+            }
+          } catch { /* ignore */ }
+        })
+        .catch(() => {});
+    }
+    // Lifecycle event into the ring (not a poll tick).
+    st.ring.push({
+      t: _now(),
+      stage: `run start — ${st.total} ad(s)`,
+      adId: null,
+      meta: {}
+    });
+    st.parentDirty = true;
+    st.needsParent = true;
+    pruneRuns();
+    ensureTimer();
+  } catch (err) {
+    try { console.warn(`📡 runFeed.startRun: ${err && err.message}`); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Mark a run finished. Fire-and-forget. Final parent update + last thread
+ * flush happen on the next interval tick.
+ */
+function finishRun(opts = {}) {
+  try {
+    if (_forceThrow) throw new Error('runFeed forced throw');
+    if (!opts || !opts.runId) return;
+    if (!isConfigured()) {
+      warnUnconfiguredOnce();
+      return;
+    }
+    const rid = String(opts.runId);
+    let st = runs.get(rid);
+    if (!st) {
+      // Finish without start (edge): still emit a one-shot summary if configured.
+      st = makeRunState(opts);
+      runs.set(rid, st);
+    }
+    st.finished = true;
+    st.cancelled = !!opts.cancelled;
+    const ok = Number(opts.succeeded) || 0;
+    const fail = Number(opts.failed) || 0;
+    const skip = Number(opts.skipped) || 0;
+    const ms = Number(opts.totalMs) || 0;
+    st.finishSummary = st.cancelled
+      ? `stopped — ${ok}✓ / ${fail}✗ / ${skip}⊘ · ${formatElapsed(ms)}`
+      : `finished — ${ok}✓ / ${fail}✗ / ${skip}⊘ · ${formatElapsed(ms)}`;
+    st.ring.push({
+      t: _now(),
+      stage: st.cancelled
+        ? `run stopped — ${ok}✓ ${fail}✗ ${skip}⊘`
+        : `run finished — ${ok}✓ ${fail}✗ ${skip}⊘ · ${formatElapsed(ms)}`,
+      adId: null,
+      meta: {}
+    });
+    st.parentDirty = true;
+    ensureTimer();
+  } catch (err) {
+    try { console.warn(`📡 runFeed.finishRun: ${err && err.message}`); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Record a stage transition for an ad. Called from adStage (choke point).
+ * Fire-and-forget. Poll ticks update the parent "now:" view only — they do
+ * NOT enter the thread ring buffer.
+ */
+function onStage(adId, stage) {
+  try {
+    if (_forceThrow) throw new Error('runFeed forced throw');
+    if (adId == null || stage == null || stage === '') return;
+    if (!isConfigured()) return; // silent when unconfigured (startRun already warned)
+
+    const id = String(adId);
+    const text = String(stage);
+    const rid = adToRun.get(id);
+    if (!rid) return; // not part of a tracked run in this process
+
+    const st = runs.get(rid);
+    if (!st) return;
+
+    // Parent "now:" always wants the latest stage, including poll progress.
+    st.lastStageByAd.set(id, text);
+    st.parentDirty = true;
+
+    // Thread log: exclude poll ticks structurally.
+    if (isPollTick(text)) return;
+
+    const meta = adMeta.get(id) || {};
+    st.ring.push({
+      t: _now(),
+      stage: text,
+      adId: id,
+      meta
+    });
+    ensureTimer();
+  } catch (err) {
+    try { console.warn(`📡 runFeed.onStage: ${err && err.message}`); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Optional direct event (run-level, not from adStage). Fire-and-forget.
+ */
+function noteEvent(runId, stage, meta = {}) {
+  try {
+    if (_forceThrow) throw new Error('runFeed forced throw');
+    if (!runId || stage == null || stage === '') return;
+    if (!isConfigured()) return;
+    if (isPollTick(stage)) return;
+    const rid = String(runId);
+    const st = runs.get(rid);
+    if (!st) return;
+    st.ring.push({
+      t: _now(),
+      stage: String(stage),
+      adId: meta.adId ? String(meta.adId) : null,
+      meta: meta || {}
+    });
+    st.parentDirty = true;
+    ensureTimer();
+  } catch (err) {
+    try { console.warn(`📡 runFeed.noteEvent: ${err && err.message}`); } catch { /* ignore */ }
+  }
+}
+
+// ── detached flush ────────────────────────────────────────────────────────
+
+async function ensureParent(st) {
+  if (st.parentTs) return st.parentTs;
+  if (st.claimInFlight || st.parentCreateInFlight) return null;
+  if (!isConfigured()) return null;
+
+  st.claimInFlight = true;
+  try {
+    // 1. Already claimed by another instance?
+    const existing = await readParentTs(st.runId);
+    if (existing && existing.ts) {
+      st.parentTs = existing.ts;
+      st.channel = existing.channel || st.channel;
+      st.needsParent = false;
+      return st.parentTs;
+    }
+
+    // 2. Create parent message, then claim its ts.
+    st.parentCreateInFlight = true;
+    const channel = CHANNEL();
+    const text = buildParentText(st, { now: _now() });
+    const posted = await slackApi('chat.postMessage', {
+      channel,
+      text,
+      // mrkdwn default
+    });
+    st.parentCreateInFlight = false;
+
+    if (!posted.ok || !posted.body || !posted.body.ts) {
+      // Failed to create — try again next tick. Do NOT claim a fake ts.
+      return null;
+    }
+    const newTs = String(posted.body.ts);
+    const ch = posted.body.channel ? String(posted.body.channel) : channel;
+
+    // 3. Atomic claim — only one instance wins.
+    const claim = await claimParentTs(st.runId, ch, newTs);
+    if (claim.won) {
+      st.parentTs = claim.ts;
+      st.channel = claim.channel || ch;
+      st.needsParent = false;
+      st.lastParentAt = _now();
+      st.parentDirty = false;
+      return st.parentTs;
+    }
+
+    // 4. Lost the race — use the winner's ts. Best-effort delete our orphan
+    // parent so the channel does not accumulate duplicates.
+    if (claim.ts) {
+      st.parentTs = claim.ts;
+      st.channel = claim.channel || ch;
+      st.needsParent = false;
+      // Delete the message we just posted (orphan). Never throw, never await
+      // from a caller — we are already on the detached flush path.
+      slackApi('chat.delete', { channel: ch, ts: newTs }).catch(() => {});
+      return st.parentTs;
+    }
+
+    // Claim lost and no winner visible — leave needsParent for next tick.
+    // Delete orphan to avoid spam.
+    slackApi('chat.delete', { channel: ch, ts: newTs }).catch(() => {});
+    return null;
+  } catch (err) {
+    try { console.warn(`📡 runFeed.ensureParent: ${err && err.message}`); } catch { /* ignore */ }
+    return null;
+  } finally {
+    st.claimInFlight = false;
+    st.parentCreateInFlight = false;
+  }
+}
+
+async function loadLiveSnapshot(st) {
+  const out = {
+    now: _now(),
+    total: st.total,
+    counts: {},
+    stages: new Map(),
+    runCounters: null
+  };
+  try {
+    const Ad = AdModel();
+    const CampaignRun = CampaignRunModel();
+    const rid = st.runId;
+
+    const [agg, rendering, runDoc] = await Promise.all([
+      Ad.aggregate([
+        { $match: { campaignRunIds: rid } },
+        { $group: { _id: '$status', n: { $sum: 1 } } }
+      ]).catch(() => []),
+      Ad.find({ campaignRunIds: rid, status: 'rendering' })
+        .select('renderStage')
+        .lean()
+        .catch(() => []),
+      CampaignRun.findOne({ runId: rid })
+        .select('total succeeded failed skipped status brandId')
+        .lean()
+        .catch(() => null)
+    ]);
+
+    for (const row of agg || []) {
+      if (row && row._id) out.counts[String(row._id)] = Number(row.n) || 0;
+    }
+    for (const a of rendering || []) {
+      if (a && a.renderStage) out.stages.set(String(a._id), String(a.renderStage));
+    }
+    // Fall back to local lastStageByAd for ads this instance knows about
+    // that may not have flushed renderStage yet.
+    for (const [adId, stage] of st.lastStageByAd) {
+      if (!out.stages.has(adId)) out.stages.set(adId, stage);
+    }
+    if (runDoc) {
+      out.runCounters = {
+        total: runDoc.total,
+        succeeded: runDoc.succeeded,
+        failed: runDoc.failed,
+        skipped: runDoc.skipped,
+        status: runDoc.status
+      };
+      if (runDoc.total != null) out.total = runDoc.total;
+    }
+
+    // Enrich brand name once (best-effort, non-blocking for future ticks).
+    if (!st.brandName && st.brandId) {
+      try {
+        // eslint-disable-next-line global-require
+        const Brand = require('../models/Brand');
+        const b = await Brand.findById(st.brandId).select('name').lean();
+        if (b && b.name) st.brandName = b.name;
+      } catch { /* ignore */ }
+    }
+  } catch {
+    // Snapshot failure: parent update still uses local state.
+  }
+  return out;
+}
+
+async function flushRun(st) {
+  if (!isConfigured()) return;
+
+  // Ensure parent exists before threading.
+  const parentTs = await ensureParent(st);
+  if (!parentTs) {
+    // Cannot post thread without parent; keep events in the ring (bounded).
+    return;
+  }
+
+  const channel = st.channel || CHANNEL();
+
+  // ── thread batch ────────────────────────────────────────────────────
+  const { items, dropped } = st.ring.drain();
+  if (items.length || dropped > 0) {
+    const lines = [];
+    if (dropped > 0) {
+      lines.push(`_(${dropped} event${dropped === 1 ? '' : 's'} dropped)_`);
+    }
+    for (const ev of items) {
+      lines.push(formatThreadLine(ev));
+    }
+    // Slack text limit — split if needed.
+    let buf = [];
+    let len = 0;
+    const flushBuf = async () => {
+      if (!buf.length) return;
+      const text = buf.join('\n');
+      buf = [];
+      len = 0;
+      await slackApi('chat.postMessage', {
+        channel,
+        text: clip(text, SLACK_MAX),
+        thread_ts: parentTs
+      });
+    };
+    for (const line of lines) {
+      const add = line.length + (buf.length ? 1 : 0);
+      if (len + add > SLACK_MAX - 32 && buf.length) {
+        await flushBuf();
+      }
+      buf.push(line);
+      len += add;
+    }
+    await flushBuf();
+  }
+
+  // ── parent update (throttled) ───────────────────────────────────────
+  const now = _now();
+  const due = st.parentDirty && (now - st.lastParentAt >= PARENT_THROTTLE_MS());
+  const forceFinal = st.finished && st.parentDirty;
+  if (due || forceFinal) {
+    const live = await loadLiveSnapshot(st);
+    const text = buildParentText(st, live);
+    const upd = await slackApi('chat.update', {
+      channel,
+      ts: parentTs,
+      text
+    });
+    if (upd.ok) {
+      st.lastParentAt = now;
+      st.parentDirty = false;
+    }
+    // On failure leave parentDirty so the next tick retries.
+  }
+}
+
+async function flushAll() {
+  if (flushInFlight) return;
+  if (!isConfigured()) {
+    // Inert: cancel timer so we do not spin forever when misconfigured mid-flight.
+    stopTimerIfIdle();
+    return;
+  }
+  flushInFlight = true;
+  try {
+    const list = [...runs.values()];
+    for (const st of list) {
+      try {
+        await flushRun(st);
+      } catch (err) {
+        try { console.warn(`📡 runFeed.flushRun(${st.runId}): ${err && err.message}`); } catch { /* ignore */ }
+      }
+    }
+    // Prune finished runs whose ring is empty and parent is clean
+    // (keep briefly so a late onStage can still land — 2 flush cycles).
+    for (const [rid, st] of runs) {
+      if (st.finished && st.ring.size === 0 && !st.parentDirty && !st.needsParent) {
+        // Mark for delayed prune via startedAt reorder — drop ads map entries.
+        if (!st._pruneAfter) st._pruneAfter = _now() + PARENT_THROTTLE_MS();
+        if (_now() >= st._pruneAfter) {
+          for (const [adId, r] of adToRun) {
+            if (r === rid) {
+              adToRun.delete(adId);
+              adMeta.delete(adId);
+            }
+          }
+          runs.delete(rid);
+        }
+      }
+    }
+    pruneRuns();
+    stopTimerIfIdle();
+  } finally {
+    flushInFlight = false;
+  }
+}
+
+// ── test seams ────────────────────────────────────────────────────────────
+function _resetState() {
+  runs.clear();
+  adToRun.clear();
+  adMeta.clear();
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  timerIntervalMs = 0;
+  warnedUnconfigured = false;
+  flushInFlight = false;
+  _forceThrow = false;
+  _CampaignRun = null;
+  _Ad = null;
+  _fetch = null;
+  _now = () => Date.now();
+}
+
+function _setDeps(deps = {}) {
+  if ('CampaignRun' in deps) _CampaignRun = deps.CampaignRun;
+  if ('Ad' in deps) _Ad = deps.Ad;
+  if ('fetch' in deps) _fetch = deps.fetch;
+  if ('now' in deps) _now = typeof deps.now === 'function' ? deps.now : () => Date.now();
+  if ('forceThrow' in deps) _forceThrow = !!deps.forceThrow;
+}
+
+function _getRunState(runId) {
+  return runs.get(String(runId)) || null;
+}
+
+function _trackedRunCount() {
+  return runs.size;
+}
+
+function _adMapSize() {
+  return adToRun.size;
+}
+
+/** Force one flush cycle (tests). Still never throws to the caller. */
+async function _flushOnce() {
+  try {
+    await flushAll();
+  } catch {
+    // absolute backstop
+  }
+}
+
+module.exports = {
+  // public API
+  startRun,
+  finishRun,
+  onStage,
+  noteEvent,
+  isConfigured,
+  isPollTick,
+  // pure helpers (tests + formatting reuse)
+  formatThreadLine,
+  buildParentText,
+  claimParentTs,
+  RingBuffer,
+  // test seams
+  _resetState,
+  _setDeps,
+  _getRunState,
+  _trackedRunCount,
+  _adMapSize,
+  _flushOnce,
+  _ensureTimer: ensureTimer,
+  // exported for structural asserts
+  _POLL_TICK_RE: POLL_TICK_RE,
+  _MAX_TRACKED_RUNS: MAX_TRACKED_RUNS
+};

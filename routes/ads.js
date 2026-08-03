@@ -42,6 +42,7 @@ const registry = require('../services/templateRegistry');
 const alerts   = require('../services/alertService');
 const inFlight = require('../services/inFlight');
 const { adStage } = require('../services/adStage');
+const runFeed  = require('../services/runFeedService');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
@@ -931,11 +932,28 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // loop lives in the web process and dies with it — see services/inFlight.js.
   inFlight.track(run.runId, { total: adIds.length, brandId: job.brandId, veo: isVeoRun });
 
+  // Per-run Slack feed — fire-and-forget, never awaited. Registers adIds so
+  // adStage can route events without a Mongo round-trip. Parent message +
+  // thread posts are owned by runFeedService's detached interval.
+  runFeed.startRun({
+    runId:   run.runId,
+    brandId: job.brandId,
+    total:   adIds.length,
+    adIds
+  });
+
   // Unified progress row (ActivityDock) — mirrors the CampaignRun
   // counters and adds cooperative cancel: the pool stops claiming new
   // ads, in-flight renders finish, unclaimed ads flip to skipped.
   const { startRun } = require('../services/progressService');
-  const brandDoc = await require('../models/Brand').findById(job.brandId).select('advertiserId').lean().catch(() => null);
+  const brandDoc = await require('../models/Brand').findById(job.brandId).select('advertiserId name').lean().catch(() => null);
+  if (brandDoc?.name) {
+    // Best-effort label enrichment — still fire-and-forget.
+    runFeed.startRun({
+      runId: run.runId, brandId: job.brandId, brandName: brandDoc.name,
+      total: adIds.length, adIds
+    });
+  }
   const progressRun = await startRun({
     kind: 'ad-batch',
     advertiserId: brandDoc?.advertiserId,
@@ -1006,13 +1024,18 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     dispatch().catch(() => resolve());
   })));
 
-  // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at
-  // claim time, before the loop) go BACK to the queue — they count as
-  // skipped for this run and the next run's selectAdsForRun re-drains
-  // them. Matching on status:'rendering' is load-bearing: the old
-  // status:'queued' filter matched nothing post-claim, stranding
+  // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at claim
+  // time, before the loop) are ARCHIVED — see the block below for why.
+  //
+  // This comment used to say they "go BACK to the queue … we requeue the
+  // untouched tail", which is the OPPOSITE of what the code does and was left
+  // behind when the behaviour changed. It is money-adjacent — requeued ads get
+  // billed on the next Generate — so a reader who trusts the top of the block
+  // and stops there gets exactly the wrong model. Corrected 2026-08-03.
+  //
+  // Still true and still load-bearing: match on status:'rendering'. The
+  // original status:'queued' filter matched nothing post-claim and stranded
   // unclaimed ads in 'rendering' forever (adversarial-review find).
-  // With two pools we requeue the untouched tail of each.
   if (cancelled) {
     // ARCHIVE, do not re-queue. Putting cancelled ads back to 'queued' meant
     // the work the operator just stopped reappeared on the next Generate and
@@ -1071,6 +1094,17 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     `🎉 [campaignRun ${run.runId}] done in ${totalMs}ms — ` +
     `${final?.succeeded || 0} succeeded · ${final?.skipped || 0} skipped · ${final?.failed || 0} failed${cancelled ? ' (cancelled by operator)' : ''}`
   );
+
+  // Slack feed close-out — fire-and-forget. Detached interval posts the
+  // final parent update + any remaining thread events.
+  runFeed.finishRun({
+    runId:     run.runId,
+    succeeded: final?.succeeded || 0,
+    skipped:   final?.skipped || 0,
+    failed:    final?.failed || 0,
+    totalMs,
+    cancelled
+  });
 
   // Report batches that finished with losses. An operator-cancelled run is
   // expected, so it stays quiet; a run that failed every ad is escalated.

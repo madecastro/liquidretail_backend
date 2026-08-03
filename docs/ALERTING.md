@@ -7,7 +7,9 @@ Implemented in `services/alertService.js` (transport + dedupe),
 `services/inFlight.js` (what a shutdown is about to destroy).
 
 Transport is **Slack via bot token** (`chat.postMessage`). Telegram is
-removed; there is no live fallback.
+removed; there is no live fallback. Verified live (prod `13cf679`):
+worker boot log reads `🔔 alerts: Slack configured`
+(`worker.js:120`).
 
 ## Why this exists — the failure it was built to expose
 
@@ -45,9 +47,10 @@ architecture** — see *Known gap* at the end.
 
 | Var | Where it lives | How to get it |
 |---|---|---|
-| `SLACK_BOT_TOKEN` | **Render env only** — never committed | [api.slack.com/apps](https://api.slack.com/apps) → Create app → **OAuth & Permissions** → Bot Token Scopes: `chat:write` (and `chat:write.public` if you post to channels the bot is not in) → Install to workspace → copy the **Bot User OAuth Token** (`xoxb-…`) |
-| `SLACK_ALERT_CHANNEL` | `config/defaults.env` (committed) | Channel id (`C…`) or `#name`. Invite the bot (`/invite @YourBot`) unless you granted `chat:write.public` |
-| `SLACK_ALERT_CHANNEL_FATAL` | `config/defaults.env` (committed) | Optional. Separate channel for `fatal` only; defaults to `SLACK_ALERT_CHANNEL` |
+| `SLACK_BOT_TOKEN` | **Render env only** — never committed. **The only secret.** | [api.slack.com/apps](https://api.slack.com/apps) → Create app → **OAuth & Permissions** → Bot Token Scopes: `chat:write` (and `chat:write.public` if you post to channels the bot is not in) → Install to workspace → copy the **Bot User OAuth Token** (`xoxb-…`) |
+| `SLACK_ALERT_CHANNEL` | `config/defaults.env` (committed) | Channel id (`C…`) or `#name`. Invite the bot (`/invite @YourBot`) unless you granted `chat:write.public`. Read by `CHANNEL()` (`alertService.js:41`) |
+| `SLACK_ALERT_CHANNEL_FATAL` | `config/defaults.env` (committed) | Optional. Separate channel for `fatal` only; falls back to `SLACK_ALERT_CHANNEL` (`CHANNEL_FOR`, `alertService.js:43-48`) |
+| `SLACK_ALERT_CHANNEL_STATUS` | `config/defaults.env` (committed) | Per-run live feed (`services/runFeedService.js`). One parent message per `CampaignRun` (`chat.update` on a throttle) + threaded chronological event log (batched). Inert without `SLACK_BOT_TOKEN`. See **Per-run feed** below. |
 
 **Why the channels are committed and the token is not.** A channel id or
 `#name` discloses nothing and is useless without the token, so it belongs
@@ -64,9 +67,13 @@ is where the stalled-render sweep and the orphan reaper live, so a token on
 the web service alone leaves the most important alerts silent.
 
 Until `SLACK_BOT_TOKEN` is set, alerting stays **silently disabled** (one
-console line on the first attempt, then quiet). The worker still logs
-configured-vs-not at boot (that string may still say "Telegram" until a
-follow-up pass retitles it; `isConfigured()` already means Slack).
+console line on the first attempt, then quiet — `alertService.js:310-316`).
+`isConfigured()` is true only when token **and** `SLACK_ALERT_CHANNEL` are
+present and `ALERTS_ENABLED` is not `false` (`alertService.js:378`). The
+channel ships in `defaults.env`, so the operator action is the token alone.
+The worker logs configured-vs-not at boot with the correct Slack wording
+(`worker.js:120`) — the older claim that this line still said "Telegram"
+was **false** after the cutover retitle.
 
 ### Critical API trap — `ok:false` on HTTP 200
 
@@ -75,18 +82,51 @@ Slack's Web API returns **HTTP 200** with a JSON body
 `not_in_channel`, `is_archived`, …) for logical failures. Checking only
 `response.ok` reports success while **nothing was delivered**.
 
-`sendSlack()` always parses the JSON body and requires `ok === true`. An
-`ok:false` result is a **failed send**: the dedupe slot is released and
-any held suppressed tally is restored, so a bad channel or token does not
-silence a key for the whole dedupe window. Covered by
+`sendSlack()` always parses the JSON body and requires `ok === true`
+(`alertService.js:220-241`). An `ok:false` result is a **failed send**: the
+dedupe slot is released and any held suppressed tally is restored, so a bad
+channel or token does not silence a key for the whole dedupe window
+(`notify` at `alertService.js:347-354`). Covered by
 `scripts/verifySlackAlert.js` (revert-proven).
 
 ### Rate limits
 
 HTTP **429** with a `Retry-After` header (seconds) is honoured by
 **logging** the value and **dropping that delivery** — the alert path
-never sleeps on a render thread waiting for Slack. Same failed-send
-semantics (slot released, tally kept).
+never sleeps on a render thread waiting for Slack (`alertService.js:211-218`).
+Same failed-send semantics (slot released, tally kept).
+
+## Per-run feed (`SLACK_ALERT_CHANNEL_STATUS`)
+
+Implemented in `services/runFeedService.js`. Hooked at the single choke point
+`services/adStage.js` (every stage write) plus `runRenderLoop` start/finish in
+`routes/ads.js`. **Not** an alert — a live operator feed of every generation,
+titling run, upload, etc.
+
+| Shape | Behaviour |
+|---|---|
+| Parent message | One per `CampaignRun`. `chat.update`d on `RUN_FEED_PARENT_THROTTLE_MS` (default 10s) with status counts, in-flight stages, elapsed |
+| Thread | Full chronological event log, flushed every `RUN_FEED_THREAD_FLUSH_MS` (default 2s), batched |
+| Poll ticks | **Excluded** from the thread (`… — polling 20s (7)`). Parent "now:" still shows them |
+| Multi-instance | Parent `ts` claimed atomically on `CampaignRun.slackFeed` — only the winner creates the parent |
+
+**Safety (paid-path contract, same family as `adStage` / `alertService`):**
+
+1. Never awaited on a render path — fire-and-forget entry points.
+2. Never throws — absolute try/catch on every export.
+3. Bounded memory — fixed ring (`RUN_FEED_RING_SIZE`); DROP OLDEST + report `(N events dropped)`.
+4. Never sleeps on 429 — logs `Retry-After`, drops that flush.
+5. Inert when channel or token unset (one warn per process).
+6. All Slack I/O on a detached `unref`'d interval.
+
+Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape assertion).
+
+| Var | Default | Notes |
+|---|---|---|
+| `RUN_FEED_ENABLED` | `true` | `false` mutes without unsetting the channel |
+| `RUN_FEED_PARENT_THROTTLE_MS` | `10000` | Min ms between parent `chat.update`s |
+| `RUN_FEED_THREAD_FLUSH_MS` | `2000` | Detached drain interval |
+| `RUN_FEED_RING_SIZE` | `200` | Per-run event buffer capacity |
 
 ## What fires
 
@@ -113,9 +153,11 @@ inventory, not a fault. It is carried as *context* on the alerts above.
 ## Failure payload — lockstep with render-activity
 
 `GET /api/ads/render-activity` builds a pre-formatted `diagnostic` block
-(`routes/ads.js` ~1662–1676) with the fields an operator needs without
+(`routes/ads.js:1944-1958`) with the fields an operator needs without
 SSH: asset id, status/stage, kind/format/aspect, pipeline/model,
-predictionId, timings, run/product/media, error, asset URL.
+predictionId, timings, run/product/media, error, asset URL. Per-ad
+`stage` / `stageAgeSec` come from `Ad.renderStage` / `renderStageAt`
+written by fire-and-forget `services/adStage.js` (see `docs/PROGRESS.md`).
 
 `alertService` does **not** own a second schema. Callers pass:
 
@@ -133,7 +175,7 @@ Non-secret, all in `config/defaults.env`, all overridable per-service:
 
 | Var | Default | Notes |
 |---|---|---|
-| `ALERTS_ENABLED` | `true` | `false` mutes without unsetting the secrets |
+| `ALERTS_ENABLED` | `true` | `false` mutes without unsetting the token |
 | `ALERT_MIN_LEVEL` | `warn` | `info` \| `warn` \| `error` \| `fatal` |
 | `ALERT_DEDUPE_WINDOW_MIN` | `15` | Per-key; repeats are counted and folded into the next delivery (`+7 more since 18:51Z`) |
 | `ALERT_RATE_LIMIT_MAX` | `20` | Hard ceiling per minute, independent of dedupe |
@@ -142,23 +184,31 @@ Non-secret, all in `config/defaults.env`, all overridable per-service:
 | `ALERT_RUN_STALE_MIN` | `45` | A 20-ad video batch legitimately runs a long time |
 | `ALERT_DETECT_BACKLOG_COUNT` / `_MIN` | `25` / `20` | Both must trip |
 | `ALERT_HOURLY_SPEND_USD` | `25` | See spend note below |
-| `ALERT_EXIT_FLUSH_MS` | `2500` | Bounded window to deliver one message before exit |
-| `ALERT_SEND_TIMEOUT_MS` | `8000` | Abort a hung Slack POST |
+| `ALERT_EXIT_FLUSH_MS` | `2500` | Bounded window to deliver one message before exit (code default; not in `defaults.env`) |
+| `ALERT_SEND_TIMEOUT_MS` | `8000` | Abort a hung Slack POST (code default; not in `defaults.env`) |
 
 ### Spend note
 
-Video dominates cost, and one routing decision dominates video: the Omni
-default (`google/gemini-omni-flash/image-to-video-developer`) supports
-**16:9 and 9:16 only**. A 4:5 Feed canvas therefore falls back to
-`xai/grok-imagine-video-v1.5/image-to-video`, which the ledger rates at
-`$0.50/s` — about **$4.00 for an 8s clip vs ~$1.00** on the default, and it
-also remaps 4:5 → 3:4. A 20-ad Feed batch is ~$80 of estimated spend.
+Video dominates cost. The live default model is Omni
+(`google/gemini-omni-flash/image-to-video-developer`), which natively
+supports **16:9 and 9:16 only**. **An older claim that 4:5 (and 1:1)
+force-route to Grok Imagine was false** — and is still wrong in some
+header comments (`backlogWatchdog.js:12-15`, `defaults.env:233-235`).
+What the code actually does (`atlasVideoService.js:508-522`,
+`:579-597`):
 
-That `$0.50/s` figure is flagged **UNVERIFIED** in `MODEL_CAPS`
-(`services/atlasVideoService.js`) — carried as a conservative upper bound
-until a real invoice confirms it. The alert threshold is set against the
-ledger, so treat the dollar figure as "what we recorded", not "what we were
-charged".
+- Portrait (including **4:5**) → Omni at **9:16**, then face-anchored crop
+  (`basePlateCropService` / compositor) to the platform canvas.
+- Landscape → Omni at **16:9**, same crop path.
+- Square (**1:1**) → Omni at **9:16** unless `SQUARE_VIA_OMNI_CROP=false`.
+- `ASPECT_FALLBACK_MODEL` (Grok Imagine 1.5) is only the **square opt-out**
+  and explicitly selected non-Omni models — not the 4:5 path.
+
+Grok's ledger rate in `MODEL_CAPS` is still `$0.50/s` and flagged
+**UNVERIFIED** (`atlasVideoService.js:324-328`) — a conservative upper
+bound when that model *is* used (~$4.00 for an 8s clip vs ~$1.00-class
+Omni). The alert threshold reads the ledger, so treat the dollar figure
+as "what we recorded", not "what we were charged".
 
 ## Guarantees
 
@@ -168,12 +218,14 @@ charged".
   `console.warn`. This matters more than usual: with an
   `unhandledRejection` handler installed, an alerting path that rejected
   would kill the process it exists to watch.
-- **Exit semantics are unchanged.** Attaching a listener suppresses Node's
-  default disposition, so each handler restores it: crashes `exit(1)` from a
-  `finally` (unconditional, even if the handler itself throws), and
-  SIGTERM/SIGINT **re-raise** after removing the listener rather than calling
-  `process.exit()` — which preserves the 128+signo status *and* still runs
-  any cleanup handler puppeteer/remotion registered for that signal.
+- **Exit semantics are restored deliberately.** Attaching a listener
+  suppresses Node's default disposition, so each handler re-establishes
+  death: crashes `exit(1)` from a `finally` (unconditional, even if the
+  handler itself throws). SIGTERM/SIGINT arm a **1s hard `process.exit(128+signo)`
+  timer**, then remove the listener and **re-raise** the signal so
+  puppeteer/remotion cleanup still runs — re-raise alone is not enough
+  because puppeteer's own handler closes Chrome without exiting
+  (`processAlerts.js:205-224`).
 - **Bounded memory.** Dedupe keys embed error-message fragments, so their
   cardinality is unbounded; `pruneDedupeState` evicts past-window entries and
   caps the maps at 500.
@@ -184,8 +236,10 @@ charged".
   *before* clipping, so the size budget is real, and only the text *inside*
   a fenced code block is ever truncated — a blind clip of the assembled
   message would cut through ` ``` ` fences and emit a broken payload.
-- **Inert when unconfigured.** No token → `notify()` returns false, does
-  not throw, does not call Slack, and warns at most once per process.
+- **Inert when unconfigured.** Missing token or channel → `notify()`
+  returns false, does not throw, does not call Slack, and warns at most
+  once per process (`alertService.js:307-316`). Channel ships in
+  `defaults.env`, so the practical gate is the token.
 
 ## Offline verify
 
