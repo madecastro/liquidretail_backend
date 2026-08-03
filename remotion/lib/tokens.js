@@ -72,6 +72,43 @@ export const TEXT_SHADOWS = {
   none: 'none',
 };
 
+// LIGHT-INK COUNTERPARTS. Same geometry, inverted polarity.
+//
+// Every shadow above is BLACK, which silently assumed white type on dark
+// footage. The plate-intel contrast flip means the opposite happens routinely:
+// on a light plate the ink flips DARK, and a black shadow behind dark text adds
+// nothing at all. Measured on a delivered Vuori ad — dark type over a mid-tone
+// face, black shadow, unreadable. A light halo is what separates dark ink from
+// a mid-tone background, so the polarity has to follow the ink.
+export const TEXT_SHADOWS_ON_LIGHT = {
+  layered: '0 0 2px rgba(255,255,255,0.85), 0 2px 5px rgba(255,255,255,0.7), 0 6px 18px rgba(255,255,255,0.55)',
+  soft: '0 0 2px rgba(255,255,255,0.8), 0 1px 4px rgba(255,255,255,0.65), 0 4px 14px rgba(255,255,255,0.5)',
+  none: 'none',
+};
+
+/** Relative luminance (0..1) of a #rrggbb / #rgb string. Null when unparseable. */
+export function hexLuminance(hex) {
+  const s = String(hex || '').trim().replace(/^#/, '');
+  const full = s.length === 3 ? s.split('').map((c) => c + c).join('') : s;
+  if (!/^[0-9a-fA-F]{6}$/.test(full)) return null;
+  const r = parseInt(full.slice(0, 2), 16) / 255;
+  const g = parseInt(full.slice(2, 4), 16) / 255;
+  const b = parseInt(full.slice(4, 6), 16) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
+ * Pick the shadow whose polarity actually separates this ink from its backdrop:
+ * dark ink → light halo, light ink → the original dark shadow.
+ * Unparseable colour falls back to the dark table (previous behaviour).
+ */
+export function textShadowFor(name, inkHex) {
+  const key = name in TEXT_SHADOWS ? name : 'soft';
+  if (key === 'none') return 'none';
+  const lum = hexLuminance(inkHex);
+  return lum != null && lum < 0.5 ? TEXT_SHADOWS_ON_LIGHT[key] : TEXT_SHADOWS[key];
+}
+
 export const BOX_SHADOWS = {
   layered: '0 2px 6px rgba(0,0,0,0.25), 0 12px 36px rgba(0,0,0,0.28)',
   soft: '0 4px 14px rgba(0,0,0,0.20)',

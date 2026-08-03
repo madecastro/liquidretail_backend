@@ -1820,8 +1820,63 @@ async function attachProductNames(perProduct, brandId) {
   }
 }
 
+// VIDEO SEED = THE FIRST CATALOG IMAGE IN FEED ORDER. Never the 'hero' stamp.
+//
+// Owner, 2026-08-03: *"the default video behaviour should be the first three
+// images, not the 'hero' image, especially since we don't know how that is
+// determined."*
+//
+// The stamp was NOT a reliable stand-in for "the feed's first image":
+// `metadata.imageRole:'hero'` is written by catalogProductDetectService off
+// `CatalogProduct.imageUrl`, so it depends on that materialisation having
+// happened and having succeeded. When the stamp is missing the old cascade fell
+// through to earliest-createdAt anyway, which means the SAME product could seed
+// from a different image depending on whether an ingest step ran — exactly the
+// opacity the owner is objecting to. Dropping the tier makes the rule one thing:
+// earliest-createdAt catalog Media, which is the order ingest materialises the
+// feed in (imageUrl first, then additionalImages).
+//
+// This only decides POSITION 0. The reference stack was already feed-ordered
+// (`.sort({createdAt: 1})` in atlasVideoService's catalogMedias load, no
+// hero-first ranking), so seed + mirrors now give "the first three images" with
+// no further change.
+//
+// MONEY: this changes WHICH image seeds the video, never how many submits
+// happen — still one Omni submit per product (CLAUDE.md §2).
+//
+// KILL SWITCH: VIDEO_SEED_FEED_ORDER, DEFAULT ON. It changes what a billable
+// generation is seeded with, so it must be reversible without a deploy.
+function isVideoSeedFeedOrderEnabled() {
+  const raw = process.env.VIDEO_SEED_FEED_ORDER;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+/**
+ * The product's first catalog image in feed order.
+ *
+ * With the flag ON (default) this is purely earliest-createdAt. With it OFF the
+ * historical hero-stamp-first cascade is restored verbatim, so flipping the env
+ * var reproduces the old seed exactly.
+ */
+async function firstCatalogMediaForProduct(productOid) {
+  if (!isVideoSeedFeedOrderEnabled()) {
+    const stamped = await Media.findOne({
+      source: 'catalog-product',
+      'metadata.catalogProductId': productOid,
+      'metadata.imageRole': 'hero'
+    }).select('_id').lean();
+    if (stamped) return stamped;
+  }
+  return Media.findOne({
+    source: 'catalog-product',
+    'metadata.catalogProductId': productOid
+  }).sort({ createdAt: 1 }).select('_id').lean();
+}
+
 // Deterministic video expansion: one video Ad per product, seeded on
-// operator-ordered catalog picks (or the feed-order hero when no picks).
+// operator-ordered catalog picks (or the first catalog image in feed order when
+// there are no picks).
 // seedMediaIds is ORDER-SIGNIFICANT. No VEO_ADS_PER_PRODUCT_CAP — always
 // exactly one ad per product that has a resolvable seed.
 async function expandDeterministicVideo({
@@ -2059,15 +2114,9 @@ async function expandDeterministicVideo({
         return direct != null && String(direct) === pidStr;
       });
       if (!hasCatalogAnchor) {
-        const anchor = await Media.findOne({
-          source: 'catalog-product',
-          'metadata.catalogProductId': productOid,
-          'metadata.imageRole': 'hero'
-        }).select('_id').lean()
-          || await Media.findOne({
-            source: 'catalog-product',
-            'metadata.catalogProductId': productOid
-          }).sort({ createdAt: 1 }).select('_id').lean();
+        // Same feed-order rule as the default seed — the anchor is the product's
+        // first catalog image, not whatever carries the 'hero' stamp.
+        const anchor = await firstCatalogMediaForProduct(productOid);
         if (anchor?._id && !referenceMediaIds.some(x => String(x) === String(anchor._id))) {
           referenceMediaIds.push(anchor._id);
           console.log(
@@ -2082,19 +2131,10 @@ async function expandDeterministicVideo({
         }
       }
     } else {
-      // Feed-order hero: imageRole hero → earliest createdAt → lazy materialize.
-      let hero = await Media.findOne({
-        source: 'catalog-product',
-        'metadata.catalogProductId': productOid,
-        'metadata.imageRole': 'hero'
-      }).select('_id').lean();
-
-      if (!hero) {
-        hero = await Media.findOne({
-          source: 'catalog-product',
-          'metadata.catalogProductId': productOid
-        }).sort({ createdAt: 1 }).select('_id').lean();
-      }
+      // FEED ORDER: the product's first catalog image → lazy materialize.
+      // The 'hero'-stamp tier was removed at owner instruction — see
+      // firstCatalogMediaForProduct.
+      let hero = await firstCatalogMediaForProduct(productOid);
 
       if (!hero) {
         // Lazy materialize — same pattern as seedsFromProduct ~:1133-1155.

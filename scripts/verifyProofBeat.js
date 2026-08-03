@@ -515,6 +515,97 @@ check('L2 the badge renders as plain text, not a filled pill', () => {
   assert.ok(/textPrimary/.test(body), 'badge should inherit primary ink so the contrast flip drives it');
 });
 
+// ── S2: shadow polarity must follow the ink ─────────────────────────────
+
+check('S2-1 textShadowFor inverts for dark ink', () => {
+  // Every shadow in TEXT_SHADOWS is BLACK, which assumed white type on dark
+  // footage. The plate-intel flip makes the ink DARK on light plates, and a
+  // black shadow behind dark type separates nothing — measured on a delivered
+  // Vuori ad where the title vanished into a face. tokens.js is ESM and this
+  // harness is CJS, so evaluate the exported helpers from source.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'remotion', 'lib', 'tokens.js'), 'utf8');
+  const pick = (re) => {
+    const m = src.match(re);
+    assert.ok(m, `tokens.js must export ${re}`);
+    return m[0].replace('export ', '');
+  };
+  const sandbox = {};
+  const code = [
+    pick(/export const TEXT_SHADOWS = \{[\s\S]*?\};/),
+    pick(/export const TEXT_SHADOWS_ON_LIGHT = \{[\s\S]*?\};/),
+    pick(/export function hexLuminance[\s\S]*?\n\}/),
+    pick(/export function textShadowFor[\s\S]*?\n\}/),
+    'sandbox.textShadowFor = textShadowFor; sandbox.hexLuminance = hexLuminance;',
+  ].join('\n');
+  // eslint-disable-next-line no-new-func
+  new Function('sandbox', code)(sandbox);
+  const { textShadowFor, hexLuminance } = sandbox;
+
+  assert.ok(textShadowFor('soft', '#16181D').includes('255,255,255'), 'dark ink must get a LIGHT halo');
+  assert.ok(textShadowFor('layered', '#000000').includes('255,255,255'), 'black ink must get a LIGHT halo');
+  assert.ok(textShadowFor('soft', '#FFFFFF').includes('0,0,0'), 'white ink keeps the dark shadow');
+  assert.strictEqual(textShadowFor('none', '#16181D'), 'none', 'none stays none');
+  assert.ok(textShadowFor('soft', 'not-a-hex').includes('0,0,0'), 'unparseable ink falls back to previous behaviour');
+  assert.strictEqual(hexLuminance('#FFFFFF'), 1);
+  assert.strictEqual(hexLuminance('#000000'), 0);
+});
+
+check('S2-2 no renderer hardcodes the dark-only shadow table', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'remotion', 'components', 'slotRenderers.jsx'), 'utf8');
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  assert.ok(
+    !/textShadow:\s*TEXT_SHADOWS[.[]/.test(code),
+    'every textShadow must route through textShadowFor so the polarity follows the ink'
+  );
+});
+
+// ── V: video seed is the first catalog image in FEED order ──────────────
+
+check('V1 the video seed no longer prefers the imageRole hero stamp', () => {
+  // Owner: "the default video behaviour should be the first three images, not
+  // the 'hero' image, especially since we don't know how that is determined."
+  // The stamp depended on a materialisation step having run, so the same product
+  // could seed differently depending on ingest state.
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'campaignAdsGenerationService.js'), 'utf8');
+  const start = src.indexOf('async function expandDeterministicVideo');
+  assert.ok(start > -1, 'expandDeterministicVideo must exist');
+  const body = src.slice(start);
+  assert.ok(
+    !/'metadata\.imageRole':\s*'hero'/.test(body),
+    'the video expansion must not query the hero stamp — feed order only'
+  );
+  // The helper must exist, must be reversible, and — the part that matters —
+  // its DEFAULT path must not consult the stamp.
+  //
+  // An earlier version of this check only scanned from expandDeterministicVideo
+  // onward and therefore could not see the helper, which is declared above it.
+  // It passed with the hero query restored as the helper's own return value.
+  // Caught by revert-proofing; assert on the helper's structure instead.
+  const hStart = src.indexOf('async function firstCatalogMediaForProduct');
+  assert.ok(hStart > -1, 'feed-order helper must exist');
+  const hEnd = src.indexOf('\n}', hStart);
+  const helper = src.slice(hStart, hEnd);
+  assert.ok(/VIDEO_SEED_FEED_ORDER|isVideoSeedFeedOrderEnabled/.test(src), 'the change must have an env kill switch');
+
+  const heroIdx  = helper.indexOf("'metadata.imageRole'");
+  const guardIdx = helper.indexOf('if (!isVideoSeedFeedOrderEnabled())');
+  if (heroIdx > -1) {
+    // A hero query may exist ONLY inside the flag-off restore path.
+    assert.ok(guardIdx > -1 && guardIdx < heroIdx,
+      'any hero-stamp query must sit behind the !isVideoSeedFeedOrderEnabled() guard');
+  }
+  // The DEFAULT (unguarded, final) resolution must be the feed-order query.
+  const tail = helper.slice(helper.lastIndexOf('return '));
+  assert.ok(/sort\(\{\s*createdAt:\s*1\s*\}\)/.test(tail),
+    'the default seed resolution must be the earliest-createdAt catalog Media');
+  assert.ok(!/imageRole/.test(tail),
+    'the default seed resolution must not reference the hero stamp');
+});
+
 // ── report ─────────────────────────────────────────────────────────────
 
 if (failures.length) {

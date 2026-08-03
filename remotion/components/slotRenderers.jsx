@@ -13,7 +13,9 @@ import {
   applyCasing,
   clampPx,
   TEXT_SHADOWS,
+  TEXT_SHADOWS_ON_LIGHT,
   BOX_SHADOWS,
+  textShadowFor,
 } from '../lib/tokens.js';
 import {
   STAR_COUNT,
@@ -114,13 +116,17 @@ function scrimStyle(treatment, tokens, dims) {
 function textCoreStyle(slot, tokens, dims, format) {
   const t = slot.treatment;
   const font = tokenFont(tokens, t.fontRole);
+  const ink = tokenColor(tokens, t.colorToken);
   return {
     fontFamily: fontFamilyCss(font),
     fontWeight: t.weight,
     fontSize: baseSize(slot.key, format, t.sizeScale),
     letterSpacing: t.trackingPx ? `${t.trackingPx}px` : 'normal',
-    color: tokenColor(tokens, t.colorToken),
-    textShadow: t.scrim === 'none' ? TEXT_SHADOWS[t.shadow] : TEXT_SHADOWS[t.shadow === 'layered' ? 'soft' : t.shadow],
+    color: ink,
+    // Shadow polarity follows the INK, not the token table — see textShadowFor.
+    // A black shadow behind dark type (the on-light contrast flip) separated
+    // nothing, which is how titles became unreadable over skin.
+    textShadow: textShadowFor(t.scrim === 'none' ? t.shadow : (t.shadow === 'layered' ? 'soft' : t.shadow), ink),
     lineHeight: 1.16,
     display: '-webkit-box',
     WebkitBoxOrient: 'vertical',
@@ -350,7 +356,7 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
             fontSize: Math.round(size * 0.82),
             fontWeight: 500,
             fontFamily: fontFamilyCss(font),
-            textShadow: TEXT_SHADOWS.soft,
+            textShadow: textShadowFor(t.shadow, tokenColor(tokens, secondaryToken)),
             maxWidth: '100%',
             // Tabular figures keep the rolling digits from jittering row width.
             fontVariantNumeric: 'tabular-nums',
@@ -374,7 +380,7 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
             fontSize: Math.round(size * 0.82),
             fontWeight: 500,
             fontFamily: fontFamilyCss(font),
-            textShadow: TEXT_SHADOWS.soft,
+            textShadow: textShadowFor(t.shadow, tokenColor(tokens, secondaryToken)),
             maxWidth: '100%',
             opacity: op,
           }}
@@ -421,7 +427,7 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
             localFrame={localFrame}
             fps={fps}
           />
-          <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
+          <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
             {rating.toFixed(1)}/5
           </span>
         </div>
@@ -611,7 +617,7 @@ export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
-          textShadow: TEXT_SHADOWS[t.shadow] || TEXT_SHADOWS.soft,
+          textShadow: textShadowFor(t.shadow, color),
         }}
       >
         {applyCasing(content, t.casing)}
@@ -630,7 +636,7 @@ export const PriceSlot = ({ slot, content, tokens, dims, format }) => {
   const text = /[$€£¥]|usd|eur|gbp/i.test(raw) ? raw : `$${raw}`;
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-block' }}>
-      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: Math.max(t.weight, 700), fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: TEXT_SHADOWS.soft }}>
+      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: Math.max(t.weight, 700), fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
         {text}
       </span>
     </div>
@@ -663,7 +669,7 @@ export const LikesSlot = ({ slot, content, tokens, dims, format }) => {
       <svg width={Math.round(size * 1.05)} height={Math.round(size * 1.05)} viewBox="0 0 24 24" style={{ display: 'block' }}>
         <path d="M12 21s-7.5-4.6-9.6-9.5C.9 7.6 3.5 4 7 4c2 0 3.5 1 5 2.7C13.5 5 15 4 17 4c3.5 0 6.1 3.6 4.6 7.5C19.5 16.4 12 21 12 21z" fill={color} />
       </svg>
-      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color, textShadow: TEXT_SHADOWS.soft }}>
+      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color, textShadow: textShadowFor(t.shadow, color) }}>
         {applyCasing(label, t.casing)}
       </span>
     </div>
@@ -683,7 +689,7 @@ export const ReviewCountSlot = ({ slot, content, tokens, dims, format }) => {
     : raw;
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-block' }}>
-      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: TEXT_SHADOWS.soft }}>
+      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
         {applyCasing(label, t.casing)}
       </span>
     </div>
@@ -757,13 +763,13 @@ function renderMultiValue({ slot, content, tokens, dims, format, progress, sizeK
           return (
             <div key={i} style={{ ...commonSpan, display: 'inline-flex', alignItems: 'baseline', gap: Math.round(size * 0.4), fontFamily: fontFamilyCss(font) }}>
               <span style={{ width: Math.round(size * 0.4), height: Math.round(size * 0.4), borderRadius: '50%', backgroundColor: fg, display: 'inline-block', alignSelf: 'center' }} />
-              <span style={{ fontSize: size, fontWeight: t.weight, color: fg, textShadow: TEXT_SHADOWS.soft }}>{label}</span>
+              <span style={{ fontSize: size, fontWeight: t.weight, color: fg, textShadow: textShadowFor(t.shadow, fg) }}>{label}</span>
             </div>
           );
         }
         // plain
         return (
-          <span key={i} style={{ ...commonSpan, fontSize: size, fontWeight: t.weight, color: fg, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
+          <span key={i} style={{ ...commonSpan, fontSize: size, fontWeight: t.weight, color: fg, fontFamily: fontFamilyCss(font), textShadow: textShadowFor(t.shadow, fg) }}>
             {label}
           </span>
         );
