@@ -400,7 +400,7 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**28 scripts** as of 2026-08-03). Add a
+  relevant `scripts/verify*.js` harness (**37 scripts** as of 2026-08-03). Add a
   harness for money/security-critical logic, and **revert-prove it** — back the
   fix out and confirm the test fails. A test that cannot fail is not a test.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
