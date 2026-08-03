@@ -62,6 +62,10 @@ const {
 const { noteRenderIssue } = require('./adStage');
 
 const ENABLED = () => String(process.env.BASE_PLATE_CROP_ENABLED ?? 'true').toLowerCase() !== 'false';
+// Face keep-out for titling (plateHints band avoid flags). Off → behaviour
+// identical to pre-keep-out: no detection call from the keep-out path.
+const FACE_KEEPOUT_ENABLED = () =>
+  String(process.env.TITLE_FACE_KEEPOUT ?? 'true').toLowerCase() !== 'false';
 
 // Cloudinary's video pipeline delivers at a capped resolution (account-dependent; the v1 bbox bug
 // was crop coords beyond that cap being silently clipped then black-padded). Dims here are measured
@@ -226,11 +230,20 @@ async function detectFrameBoxes(frameUrl, meta) {
 
 /**
  * Sample the clip and reconcile per-frame boxes.
- * Returns { subject, head, frames, faceHits, envelope } — head is null without a quorum.
+ * Returns { subject, head, frames, faceHits, envelope, faceSamples } —
+ * head is null without a quorum.
+ *
+ * faceSamples: [{ atSec, face }] per sampled still (face may be null).
+ * Coordinate space: face boxes are NORMALIZED FRACTIONS 0..1 of the
+ * SOURCE frame (see DETECT_SYSTEM_PROMPT) — not pixel rects. Stills are
+ * 640-wide for bandwidth; the model still returns fractions of the full
+ * frame, so no pixel conversion is needed for keep-out mapping.
  */
 async function detectClipBoxes(sourceUrl, durationSec, meta) {
   const frames = buildFrameUrls(sourceUrl, durationSec, { width: 640, isReel: true });
-  if (!frames.length) return { subject: null, head: null, frames: 0, faceHits: 0, envelope: null };
+  if (!frames.length) {
+    return { subject: null, head: null, frames: 0, faceHits: 0, envelope: null, faceSamples: [] };
+  }
 
   const results = [];
   // Serial, deliberately: 3-4 frames, and vision RPS buckets are shared with the rest of the
@@ -243,12 +256,17 @@ async function detectClipBoxes(sourceUrl, durationSec, meta) {
   const subject = unionBoxes(frameBoxes);
   const head = consensusFaceBox(frameBoxes, frameFaces);
   const envelope = unionBoxes(frameFaces);
+  const faceSamples = frames.map((f, i) => ({
+    atSec: f.timestampSec,
+    face: frameFaces[i] || null,
+  }));
   return {
     subject,
     head,
     frames: frames.length,
     faceHits: frameFaces.filter(Boolean).length,
     envelope,
+    faceSamples,
   };
 }
 
@@ -346,36 +364,53 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
       (decision.action === 'crop' ? `crop ${JSON.stringify(decision.rect)}` : `skip:${decision.reason}`)
     );
 
-    if (decision.action !== 'crop') { await persistSkip(ad, format, decision.reason); return { ...raw, reason: decision.reason }; }
+    // Detection already paid — always stash faceSamples/envelope so titling
+    // keep-out can reuse them free of charge, even when the crop itself skips
+    // (full-frame 9:16, no-face-quorum, …).
+    const faceExtras = detectionExtras(det, dims);
+
+    if (decision.action !== 'crop') {
+      await persistSkip(ad, format, decision.reason, faceExtras);
+      return { ...raw, reason: decision.reason };
+    }
 
     const url = buildVideoCropUrl({
       sourceUrl: ad.veoVideoUrl, rect: decision.rect, sourceW: dims.sourceW, sourceH: dims.sourceH,
     });
-    if (!url) { await persistSkip(ad, format, 'url-build-refused'); return { ...raw, reason: 'url-build-refused' }; }
-    if (url === ad.veoVideoUrl) { await persistSkip(ad, format, 'full-frame'); return { ...raw, reason: 'full-frame' }; }
+    if (!url) {
+      await persistSkip(ad, format, 'url-build-refused', faceExtras);
+      return { ...raw, reason: 'url-build-refused' };
+    }
+    if (url === ad.veoVideoUrl) {
+      await persistSkip(ad, format, 'full-frame', faceExtras);
+      return { ...raw, reason: 'full-frame' };
+    }
 
     if (!(await probeUrlLive(url))) {
       // Not persisted as a permanent skip: a cold-cache 423-ish failure may succeed on the next
-      // render. Fall back for THIS render only.
+      // render. Fall back for THIS render only. Face extras ride on a faces-only write so
+      // keep-out can reuse them without locking the crop decision to "skip".
+      await persistFaceExtrasOnly(ad, format, faceExtras);
       console.warn(`   ⚠️  basePlateCrop[ad=${ad._id}]: derived URL failed liveness probe — using raw plate this render`);
       return { ...raw, reason: 'probe-failed' };
     }
 
+    const next = {
+      version: CURRENT_VERSION,
+      format,
+      sourceUrl: ad.veoVideoUrl,
+      videoUrl: url,
+      rect: decision.rect,
+      sourceW: dims.sourceW, sourceH: dims.sourceH,
+      frames: det.frames, faceHits: det.faceHits, envelope: det.envelope,
+      faceSamples: det.faceSamples || [],
+      facesComputed: true,
+      computedAt: new Date(),
+    };
     await Ad.updateOne({ _id: ad._id }, {
-      $set: {
-        basePlate: {
-          version: CURRENT_VERSION,
-          format,
-          sourceUrl: ad.veoVideoUrl,
-          videoUrl: url,
-          rect: decision.rect,
-          sourceW: dims.sourceW, sourceH: dims.sourceH,
-          frames: det.frames, faceHits: det.faceHits, envelope: det.envelope,
-          computedAt: new Date(),
-        },
-        updatedAt: new Date(),
-      },
+      $set: { basePlate: next, updatedAt: new Date() },
     }).catch((err) => console.warn(`   ⚠️  basePlateCrop: persist failed (${err.message}) — crop still used this render`));
+    ad.basePlate = next;
 
     return { videoUrl: url, cropped: true, rect: decision.rect };
   } catch (err) {
@@ -384,17 +419,33 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
   }
 }
 
+/** Fields stashed on Ad.basePlate so titling keep-out never re-pays vision. */
+function detectionExtras(det, dims) {
+  if (!det) return {};
+  return {
+    frames: det.frames,
+    faceHits: det.faceHits,
+    envelope: det.envelope || null,
+    faceSamples: Array.isArray(det.faceSamples) ? det.faceSamples : [],
+    facesComputed: true,
+    sourceW: dims?.sourceW || null,
+    sourceH: dims?.sourceH || null,
+  };
+}
+
 /** Persist a skip so re-titles of the same base don't re-pay detection. */
-async function persistSkip(ad, format, reason) {
+async function persistSkip(ad, format, reason, extras = {}) {
+  const next = {
+    version: CURRENT_VERSION, format, sourceUrl: ad.veoVideoUrl,
+    videoUrl: null, reason, computedAt: new Date(),
+    ...extras,
+  };
   await Ad.updateOne({ _id: ad._id }, {
-    $set: {
-      basePlate: {
-        version: CURRENT_VERSION, format, sourceUrl: ad.veoVideoUrl,
-        videoUrl: null, reason, computedAt: new Date(),
-      },
-      updatedAt: new Date(),
-    },
+    $set: { basePlate: next, updatedAt: new Date() },
   }).catch(() => {});
+  // Keep the in-memory ad consistent so ensureFaceDetectionForKeepOut (same
+  // request) reuses faceSamples without a second vision round-trip.
+  if (ad) ad.basePlate = next;
   // Also surface on renderError so GET /api/ads/render-activity shows the
   // reason without a route change. Soft note — status is not flipped.
   noteRenderIssue(ad?._id, {
@@ -403,11 +454,154 @@ async function persistSkip(ad, format, reason) {
   });
 }
 
+/**
+ * Write face detection onto basePlate without forcing a crop skip.
+ * Used when detection paid but the crop URL failed liveness — next render
+ * must still be free to retry the crop.
+ */
+async function persistFaceExtrasOnly(ad, format, extras = {}) {
+  if (!ad?._id || !extras.facesComputed) return;
+  const prev = (ad.basePlate && ad.basePlate.sourceUrl === ad.veoVideoUrl) ? ad.basePlate : {};
+  const next = {
+    version: CURRENT_VERSION,
+    format: prev.format || format,
+    sourceUrl: ad.veoVideoUrl,
+    videoUrl: prev.videoUrl ?? null,
+    rect: prev.rect ?? null,
+    reason: prev.reason,
+    computedAt: new Date(),
+    ...extras,
+    sourceW: extras.sourceW || prev.sourceW || null,
+    sourceH: extras.sourceH || prev.sourceH || null,
+  };
+  await Ad.updateOne({ _id: ad._id }, {
+    $set: { basePlate: next, updatedAt: new Date() },
+  }).catch(() => {});
+  ad.basePlate = next;
+}
+
+/**
+ * Face boxes for titling keep-out (plateHints band `avoid` flags).
+ *
+ * Cache key: veoVideoUrl + format + version (same binding as base-plate crop).
+ * Reuses Ad.basePlate faceSamples/envelope when present for this source;
+ * otherwise runs detectClipBoxes ONCE and persists (ledgered via chatCompletion).
+ *
+ * Returns null when disabled / no source / detection impossible — caller
+ * leaves plateHints unchanged (pre-keep-out behaviour).
+ *
+ * @returns {Promise<null|{ faceSamples: Array, envelope, sourceW, sourceH, cropRect, fromCache: boolean }>}
+ */
+async function ensureFaceDetectionForKeepOut({ ad, format }) {
+  if (!FACE_KEEPOUT_ENABLED()) return null;
+  if (!ad?.veoVideoUrl) return null;
+
+  const cached = ad.basePlate;
+  // Reuse detection bound to this source video. Face boxes are in SOURCE
+  // fraction space — independent of titling format — so any same-source
+  // facesComputed entry is usable. cropRect only applies when THIS format's
+  // crop is the plate Remotion will composite onto.
+  if (
+    cached
+    && cached.version === CURRENT_VERSION
+    && cached.sourceUrl === ad.veoVideoUrl
+    && cached.facesComputed
+  ) {
+    return {
+      faceSamples: faceSamplesFromCache(cached),
+      envelope: cached.envelope || null,
+      sourceW: cached.sourceW || null,
+      sourceH: cached.sourceH || null,
+      cropRect: (cached.format === format && cached.videoUrl && cached.rect) ? cached.rect : null,
+      fromCache: true,
+    };
+  }
+
+  // Older crop caches stored envelope without facesComputed / faceSamples —
+  // still free to reuse (envelope covers all sample times, conservative).
+  if (
+    cached
+    && cached.version === CURRENT_VERSION
+    && cached.sourceUrl === ad.veoVideoUrl
+    && cached.envelope
+  ) {
+    return {
+      faceSamples: faceSamplesFromCache(cached),
+      envelope: cached.envelope,
+      sourceW: cached.sourceW || null,
+      sourceH: cached.sourceH || null,
+      cropRect: (cached.format === format && cached.videoUrl && cached.rect) ? cached.rect : null,
+      fromCache: true,
+    };
+  }
+
+  // Need a fresh detection. Frame stills require a Cloudinary /upload/ URL.
+  if (!isTransformableVideoUrl(ad.veoVideoUrl)) {
+    console.warn(`   ⚠️  faceKeepOut[ad=${ad._id}]: source not transformable — keep-out skipped`);
+    return null;
+  }
+
+  try {
+    const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
+    const dims = await measureDeliveryDims(ad.veoVideoUrl);
+    const det = await detectClipBoxes(ad.veoVideoUrl, durationSec, {
+      brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
+    });
+    const extras = detectionExtras(det, dims);
+    // Merge into existing basePlate when present (preserve crop videoUrl/rect/reason).
+    const prev = (cached && cached.sourceUrl === ad.veoVideoUrl) ? cached : {};
+    const next = {
+      version: CURRENT_VERSION,
+      format: prev.format || format,
+      sourceUrl: ad.veoVideoUrl,
+      videoUrl: prev.videoUrl ?? null,
+      rect: prev.rect ?? null,
+      reason: prev.reason ?? (prev.videoUrl ? undefined : 'faces-only'),
+      computedAt: new Date(),
+      ...extras,
+      // Prefer measured dims; fall back to prior cache.
+      sourceW: extras.sourceW || prev.sourceW || null,
+      sourceH: extras.sourceH || prev.sourceH || null,
+    };
+    await Ad.updateOne({ _id: ad._id }, {
+      $set: { basePlate: next, updatedAt: new Date() },
+    }).catch((err) => console.warn(`   ⚠️  faceKeepOut: persist failed (${err.message})`));
+    // Keep the in-memory ad object consistent for the rest of this render.
+    if (ad.basePlate !== undefined) ad.basePlate = next;
+
+    console.log(
+      `   🎯 faceKeepOut[ad=${ad._id}] format=${format} frames=${det.frames} ` +
+      `faceHits=${det.faceHits} (fresh detection)`
+    );
+
+    return {
+      faceSamples: det.faceSamples || [],
+      envelope: det.envelope || null,
+      sourceW: next.sourceW,
+      sourceH: next.sourceH,
+      cropRect: (next.format === format && next.videoUrl && next.rect) ? next.rect : null,
+      fromCache: false,
+    };
+  } catch (err) {
+    console.warn(`   ⚠️  faceKeepOut[ad=${ad?._id}]: ${err.message} — keep-out skipped`);
+    return null;
+  }
+}
+
+/** Prefer per-frame faceSamples; fall back to a single envelope sample (atSec null → all times). */
+function faceSamplesFromCache(cached) {
+  if (Array.isArray(cached.faceSamples) && cached.faceSamples.length) return cached.faceSamples;
+  if (cached.envelope) return [{ atSec: null, face: cached.envelope }];
+  return [];
+}
+
 module.exports = {
   resolveBasePlateVideoUrl,
+  ensureFaceDetectionForKeepOut,
   decideBasePlateCrop,       // pure — for the harness
   preGateBasePlateCrop,      // pure — for the harness
   TARGET_BY_FORMAT,
   DETECT_SYSTEM_PROMPT,      // for the harness (headwear sentence asserted)
-  _internal: { parseBox, measureDeliveryDims, probeUrlLive, detectClipBoxes },
+  FACE_KEEPOUT_ENABLED,      // for the harness
+  _internal: { parseBox, measureDeliveryDims, probeUrlLive, detectClipBoxes, faceSamplesFromCache, detectionExtras },
 };

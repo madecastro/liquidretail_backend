@@ -1109,7 +1109,8 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
   // derivative, or ad.veoVideoUrl unchanged on ANY gate/failure. Never throws.
   const { adStage, noteRenderIssue } = require('./adStage');
   adStage(ad._id, `face-safe crop (${ad.aspectRatio || format})`);
-  const basePlate = await require('./basePlateCropService').resolveBasePlateVideoUrl({ ad, format });
+  const basePlateCrop = require('./basePlateCropService');
+  const basePlate = await basePlateCrop.resolveBasePlateVideoUrl({ ad, format });
   const plateUrl = basePlate.videoUrl || ad.veoVideoUrl;
   if (!basePlate.cropped && basePlate.reason) {
     // Soft note: ad still titles, but the operator can see why heads may be centre-cropped.
@@ -1118,6 +1119,17 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       stage: 'face-safe-crop'
     });
     adStage(ad._id, `face-safe crop skipped (${basePlate.reason})`);
+  }
+
+  // Face keep-out for plateHints: reuse Ad.basePlate detection when the crop
+  // path already paid for it; otherwise (vertical full-frame) detect once and
+  // cache. TITLE_FACE_KEEPOUT=false → null → bands stay avoid:false.
+  // Never throws — keep-out is legibility intelligence, not a render gate.
+  let faceKeepOut = null;
+  try {
+    faceKeepOut = await basePlateCrop.ensureFaceDetectionForKeepOut({ ad, format });
+  } catch (err) {
+    console.warn(`   ⚠️  brandScript[ad=${ad._id}]: face keep-out resolve failed (${err.message})`);
   }
 
   let result;
@@ -1133,6 +1145,15 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       adId:      String(ad._id),
       brand,
       placementMode: placement,
+      // Cropped plate: face boxes must be mapped through cropRect (source→plate).
+      faceKeepOut: faceKeepOut
+        ? {
+            ...faceKeepOut,
+            cropRect: basePlate.cropped
+              ? (basePlate.rect || faceKeepOut.cropRect || null)
+              : null,
+          }
+        : null,
     });
   } catch (err) {
     // A cropped-plate failure must NEVER cost the titles: renderBrandScriptAndSave's callers
@@ -1148,6 +1169,8 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
         adId:      String(ad._id),
         brand,
         placementMode: placement,
+        // Raw plate = source frame; identity mapping (no cropRect).
+        faceKeepOut: faceKeepOut ? { ...faceKeepOut, cropRect: null } : null,
       });
     } else {
       throw err;

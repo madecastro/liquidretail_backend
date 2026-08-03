@@ -360,7 +360,7 @@ async function warmup() {
  * contract: returns { finalPath, tempDir, timings } — the caller uploads
  * finalPath and removes tempDir.
  */
-async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, placementMode = null, brand = null }) {
+async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, placementMode = null, brand = null, faceKeepOut = null }) {
   if (!videoUrl) throw new Error('renderTitles: videoUrl required');
   if (!spec) throw new Error('renderTitles: spec required');
   const compositionId = COMPOSITION_BY_FORMAT[format];
@@ -405,7 +405,7 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
       // scan was wired to the placement feature; legibility needs it always.
       // Kill switch TITLE_PLATE_SCAN=off still disables the scan entirely
       // via resolveTitlePlacementMode + the explicit check below.
-      const { analyzePlate, resolveTitlePlacementMode } = require('./plateIntelService');
+      const { analyzePlate, resolveTitlePlacementMode, applyFaceKeepOut } = require('./plateIntelService');
       const placement = resolveTitlePlacementMode({ placementMode, brand });
       timings.placementMode = placement;
       t = Date.now();
@@ -417,6 +417,21 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
           // Legibility intelligence must never fail a render; null keeps the
           // pre-fix behaviour (brand default ink).
           console.warn(`🎬 remotion[ad=${adId || '?'}]: plate scan failed (${err.message}) — ink flip unavailable`);
+        }
+      }
+      // Face keep-out: map cached (or freshly-detected) face boxes onto band
+      // avoid flags. faceKeepOut comes from brandScriptExecutor after
+      // ensureFaceDetectionForKeepOut — both ad + plateHints exist here.
+      // Failures leave plateHints unchanged (pre-keep-out behaviour).
+      if (plateHints && faceKeepOut?.faceSamples?.length) {
+        try {
+          plateHints = applyFaceKeepOut(plateHints, faceKeepOut.faceSamples, {
+            cropRect: faceKeepOut.cropRect || null,
+            sourceW: faceKeepOut.sourceW || null,
+            sourceH: faceKeepOut.sourceH || null,
+          });
+        } catch (err) {
+          console.warn(`🎬 remotion[ad=${adId || '?'}]: face keep-out failed (${err.message}) — bands unflagged`);
         }
       }
       timings.plateScanMs = Date.now() - t;
