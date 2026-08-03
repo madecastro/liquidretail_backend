@@ -37,36 +37,124 @@
 const PRINTABLE_QUOTE_ORIGINS = new Set([
   'scraped',         // captured first-hand by the review engine or headless capture
   'social_comment',  // a real commenter; text is the ingest judge's contiguous extract
-  'store-import'     // reviews imported from the merchant's own storefront
-  // 'llm-web'     — an LLM found, extracted and attributed it. Excluded; see below.
+  'store-import',    // reviews imported from the merchant's own storefront
+  'llm-web'          // grounded web search (Gemini google_search tool). TEXT ONLY —
+                     // attribution is stripped structurally by toPrintableCustomerQuote.
   // 'synthesized' — LLM prose ABOUT reviews. Excluded, and its producer is deleted.
   // 'unknown'     — provenance we could not establish. Excluded by omission.
 ]);
 
 /**
- * 'llm-web' is excluded, and it is the consequential call because it is ~82% of
- * the pool. Those quotes are not invented — they are real sentences from real
- * pages — but an LLM did the finding, the extracting and the attributing, and
- * nothing verified any of the three. geminiSearchProvider stamps them
- * `verbatim: false` itself, which is the capture layer saying it cannot youch
- * for the wording.
+ * Origins whose capture layer cannot name a real person as the speaker. For
+ * these, the WORDS may print but every byline field is stripped at the gate —
+ * not by caller convention. A renderer that forgets to clear author_name still
+ * cannot print one, because the object it received never had one.
  *
- * The observed damage is not theoretical. That path is where bylines like
- * "Reddit (r/BuyItForLife)", "UBeauty.com" and — 80 times over —
- * "vertexaisearch.cloud.google.com" came from, and it collected negative quotes
- * ("the luxury price premium really wasn't worth it") into a pool whose only
- * gate for unrated tiers is sentiment.
- *
- * The owner's standing rule breaks the tie: an ad showing no testimonial is a
- * thinner ad; an ad misquoting a named stranger is a liability. If that trade is
- * ever revisited, revisit it in THIS FILE — it is the only place all three
- * renderers agree on.
+ * Today that set is exactly {'llm-web'}. Keep the set so a future origin that
+ * shares the same "real text, untrustworthy speaker label" shape inherits the
+ * strip without another allowlist edit.
  */
-function isPrintableCustomerQuote(q) {
-  if (!q || !String(q.text || '').trim()) return false;
-  // An explicit non-verbatim stamp disqualifies whatever the origin claims.
-  if (q.verbatim === false) return false;
-  return PRINTABLE_QUOTE_ORIGINS.has(q.origin);
+const ANONYMOUS_PRINT_ORIGINS = new Set(['llm-web']);
+
+/**
+ * Byline fields that must never reach a renderer for ANONYMOUS_PRINT_ORIGINS.
+ * Includes every name the cascade, intent builder, and normalizeQuote have
+ * ever read as "who said this".
+ *
+ * Deliberately generous. The point of a structural strip is that it does not
+ * depend on knowing every producer: a future capture path will invent a field
+ * name (`reviewer`, `user_name`, `platform`, `site`, …) and will not know about
+ * this gate. No producer writes those four today — this is hardening, not a
+ * live hole — but omitting them would make the strip a denylist of known
+ * producers, which is the bug shape this module exists to end.
+ */
+const BYLINE_FIELDS = Object.freeze([
+  'author_name',
+  'author',
+  'author_title',
+  'handle',
+  'username',
+  'reviewer',
+  'user_name',
+  'platform',
+  'site'
+]);
+
+/**
+ * 'llm-web' is PRINTABLE as anonymous text. Why, and what was actually wrong:
+ *
+ * geminiSearchProvider calls Gemini with `tools: [{ google_search: {} }]` —
+ * real grounded search — and records `groundingMetadata.groundingChunks` as
+ * source domains. The prompts demand SPECIFIC, DIRECT customer quotes in
+ * quotation marks and "do NOT paraphrase or invent quotes that aren't
+ * present." Gemini is the RETRIEVAL mechanism, not the author. These are real
+ * sentences from real review pages.
+ *
+ * What WAS broken was ATTRIBUTION. The observed bylines —
+ * "Reddit (r/BuyItForLife)", "UBeauty.com", and — 80 times —
+ * "vertexaisearch.cloud.google.com" (Google's own grounding-redirect
+ * hostname, printed as if it were the customer who spoke) — are SOURCES, not
+ * people. That liability is separable from the words: print the text, never
+ * a byline. toPrintableCustomerQuote enforces the strip; isPrintableCustomerQuote
+ * alone would have left author fields intact for any caller that checked the
+ * boolean and then used the original object.
+ *
+ * 'synthesized' stays excluded: that was LLM prose ABOUT reviews (genuinely
+ * fabricated), and its producer was deleted. 'unknown' stays excluded by
+ * omission.
+ *
+ * ── verbatim semantics ──────────────────────────────────────────────────
+ * `verbatim: false` is NOT a blanket fidelity confession.
+ *
+ * On first-party origins (scraped / social_comment / store-import) it means
+ * "this wording was rewritten or is not the customer's own text" and still
+ * hard-rejects.
+ *
+ * On 'llm-web' it is a SOURCE-CLASS marker. geminiSearchProvider stamps
+ * `verbatim: false` blanket on every row so a consumer that needs a genuine
+ * first-party scrape can tell the difference (see stampLlmQuotes header).
+ * Treating that stamp as "untrustworthy wording" re-excluded ~82% of the pool
+ * and left ads with no testimonial at all. The gate therefore ignores
+ * `verbatim` for ANONYMOUS_PRINT_ORIGINS.
+ */
+function toPrintableCustomerQuote(q) {
+  if (!q || !String(q.text || '').trim()) return null;
+  if (!PRINTABLE_QUOTE_ORIGINS.has(q.origin)) return null;
+
+  // Fidelity confession only for first-party origins. See header.
+  if (q.verbatim === false && !ANONYMOUS_PRINT_ORIGINS.has(q.origin)) return null;
+
+  // First-party (and any future attributed printable origin): keep as-is.
+  // Return a shallow copy so callers cannot mutate the pool entry through the
+  // gate's return value, and so the reseat path in video/static gates is uniform.
+  if (!ANONYMOUS_PRINT_ORIGINS.has(q.origin)) {
+    return { ...q };
+  }
+
+  // Structural anonymity: copy, then force every byline field OFF the object.
+  // delete (not undefined assignment) so `in` checks and JSON both see absence,
+  // and so a renderer that does `quote.author_name || quote.author || quote.source`
+  // cannot resurrect a site-as-author from residual keys. `source` is also
+  // stripped from the printable surface for the same reason — it is a domain /
+  // platform label, not a person, and was the historical byline fallback.
+  const out = { ...q };
+  for (const f of BYLINE_FIELDS) {
+    delete out[f];
+  }
+  delete out.source;
+  // A "Verified buyer" claim without a name is still a persona. Drop it.
+  delete out.verified;
+  return out;
 }
 
-module.exports = { PRINTABLE_QUOTE_ORIGINS, isPrintableCustomerQuote };
+function isPrintableCustomerQuote(q) {
+  return toPrintableCustomerQuote(q) != null;
+}
+
+module.exports = {
+  PRINTABLE_QUOTE_ORIGINS,
+  ANONYMOUS_PRINT_ORIGINS,
+  BYLINE_FIELDS,
+  toPrintableCustomerQuote,
+  isPrintableCustomerQuote
+};

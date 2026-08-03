@@ -12,6 +12,8 @@
  *   P1  A quote prints only on POSITIVE provenance (allowlist, not denylist).
  *       Was: buildIntentData read primary_quote with no origin/verbatim check,
  *       so LLM-authored "notional persona" quotes were typeset as testimonials.
+ *       2026-08-02: llm-web (grounded search) is now PRINTABLE as anonymous
+ *       text; synthesized / unknown stay withheld.
  *   P2  A byline is a real person's name or nothing.
  *       Was: normalizeQuote fell back to the quote's SOURCE — a website — then
  *       to "Verified buyer"/"Anonymous Customer". 80 live artifacts carried
@@ -21,12 +23,21 @@
  *   P4  The gate cannot be forged from the LLM path.
  *       `origin` is not a DERIVATION_SCHEMA property; `source` is, and the
  *       derivation call is strict:false.
+ *   P6  Grounded llm-web is printable TEXT ONLY — attribution stripped
+ *       structurally by toPrintableCustomerQuote, not by caller convention.
+ *       Revert-prove: blank the strip and author fields reappear in intent.
  *
  * Run: node scripts/verifyQuoteProvenance.js
  */
 const direct = require('../services/directImageRenderService');
 const layout = require('../services/layoutInputService');
 const provenance = require('../services/quoteProvenance');
+const {
+  gateLayoutInputQuotes
+} = require('../services/brandScriptExecutor');
+const {
+  resolveMeta, mergeCascades, buildContext, DEFAULT_META_CASCADES
+} = require('../services/metaCascadeResolver');
 
 let pass = 0;
 const failures = [];
@@ -42,15 +53,26 @@ const PRINTABLE = [
   ['scraped + verbatim', { text: REAL_TEXT, origin: 'scraped', verbatim: true }],
   ['scraped, unspecified verbatim', { text: REAL_TEXT, origin: 'scraped' }],
   ['social comment', { text: REAL_TEXT, origin: 'social_comment', verbatim: true }],
-  ['store import', { text: REAL_TEXT, origin: 'store-import' }]
+  ['store import', { text: REAL_TEXT, origin: 'store-import' }],
+  // Grounded search: Gemini + google_search tool. Text is real; byline is not.
+  // verbatim:false is the source-class stamp from stampLlmQuotes, not a fidelity
+  // confession — must still print.
+  ['LLM web search (grounded, verbatim:false)', {
+    text: REAL_TEXT, origin: 'llm-web', verbatim: false,
+    author_name: 'vertexaisearch.cloud.google.com', source: 'Reddit (r/BuyItForLife)'
+  }],
+  ['LLM web search (grounded, no verbatim flag)', {
+    text: REAL_TEXT, origin: 'llm-web', author: 'Someone on UBeauty.com'
+  }]
 ];
 const WITHHELD = [
   // The two that were shipping as customer testimonials.
   ['LLM persona (unstamped — the tier-5 shape)', { text: REAL_TEXT, source: 'testimonial', author_name: 'Sarah, busy mum' }],
   ['LLM summary sentence', { text: REAL_TEXT, origin: 'synthesized', verbatim: false }],
-  ['LLM web search', { text: REAL_TEXT, origin: 'llm-web' }],
   // Provenance we simply do not have is not provenance we can print.
   ['unstamped legacy row', { text: REAL_TEXT }],
+  // First-party origin with an explicit non-verbatim stamp still means the
+  // wording is untrustworthy — that is where verbatim keeps its teeth.
   ['explicitly non-verbatim, otherwise fine', { text: REAL_TEXT, origin: 'scraped', verbatim: false }],
   ['empty text', { text: '   ', origin: 'scraped', verbatim: true }],
   ['null quote', null],
@@ -188,6 +210,304 @@ const EXTRACTS = [
 for (const [snippet, source, expected] of EXTRACTS) {
   check(`P5 extract ${JSON.stringify(snippet)} from ${JSON.stringify(source)} -> ${expected}`,
     snippets.isExtractive(snippet, source) === expected);
+}
+
+// ── P6: grounded llm-web is printable, attribution stripped structurally ─
+// Owner decision 2026-08-02. Behavioural, not a source scan.
+const GROUNDED = {
+  text: REAL_TEXT,
+  origin: 'llm-web',
+  verbatim: false,
+  author_name: 'vertexaisearch.cloud.google.com',
+  author: 'Reddit (r/BuyItForLife)',
+  author_title: 'Verified buyer',
+  source: 'UBeauty.com',
+  verified: true,
+  handle: '@fakehandle'
+};
+
+{
+  // Gate admits the quote.
+  check('P6 isPrintable admits grounded llm-web + verbatim:false',
+    provenance.isPrintableCustomerQuote(GROUNDED) === true);
+
+  const printable = provenance.toPrintableCustomerQuote(GROUNDED);
+  check('P6 toPrintable returns a quote object', !!printable);
+  check('P6 toPrintable keeps the text',
+    printable && printable.text === REAL_TEXT, `got ${JSON.stringify(printable && printable.text)}`);
+  check('P6 toPrintable keeps origin llm-web',
+    printable && printable.origin === 'llm-web');
+
+  // Every byline field is gone from the returned object — structural, not a
+  // "please don't print this" flag the caller could ignore.
+  for (const f of provenance.BYLINE_FIELDS) {
+    check(`P6 toPrintable strips ${f}`,
+      printable && !(f in printable) && printable[f] == null,
+      `got ${JSON.stringify(printable && printable[f])}`);
+  }
+  check('P6 toPrintable strips source (site-as-author vector)',
+    printable && !('source' in printable) && printable.source == null,
+    `got ${JSON.stringify(printable && printable.source)}`);
+  check('P6 toPrintable strips verified (persona claim without a name)',
+    printable && !('verified' in printable),
+    `got ${JSON.stringify(printable && printable.verified)}`);
+
+  // The ORIGINAL object is untouched — strip is on the copy.
+  check('P6 original author_name still present on input (no mutation)',
+    GROUNDED.author_name === 'vertexaisearch.cloud.google.com');
+
+  // Static renderer (buildIntentData): text yes, attribution no.
+  const d = intentFor(GROUNDED);
+  check('P6 static intent prints the grounded text',
+    d.quote === REAL_TEXT, `got ${JSON.stringify(d.quote)}`);
+  check('P6 static intent prints NO attribution for grounded',
+    d.attribution === undefined, `got ${JSON.stringify(d.attribution)}`);
+
+  // A caller that somehow re-attaches a byline on an llm-web quote and re-runs
+  // the gate still cannot get it through — the gate re-strips.
+  const reattached = { ...printable, author_name: 'Resurrected Name', author: 'Also Resurrected' };
+  const restripped = provenance.toPrintableCustomerQuote(reattached);
+  check('P6 re-attached author_name cannot survive a second gate pass',
+    restripped && !('author_name' in restripped) && restripped.author_name == null,
+    `got ${JSON.stringify(restripped && restripped.author_name)}`);
+  const d2 = intentFor(reattached);
+  check('P6 static intent still has no attribution after re-attach attempt',
+    d2.attribution === undefined, `got ${JSON.stringify(d2.attribution)}`);
+
+  // Video path: gateLayoutInputQuotes reseats primary_quote with the stripped
+  // copy; cascade's reviewer arms (author_name / author) resolve to nothing.
+  const gated = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: GROUNDED } }
+  });
+  const gatedPq = gated?.input?.social_proof?.primary_quote;
+  check('P6 video gate admits grounded primary_quote',
+    !!gatedPq && gatedPq.text === REAL_TEXT,
+    `got ${JSON.stringify(gatedPq)}`);
+  check('P6 video gate stripped author_name on reseated quote',
+    gatedPq && !('author_name' in gatedPq),
+    `got ${JSON.stringify(gatedPq && gatedPq.author_name)}`);
+  check('P6 video gate stripped author on reseated quote',
+    gatedPq && !('author' in gatedPq),
+    `got ${JSON.stringify(gatedPq && gatedPq.author)}`);
+
+  const ctx = buildContext({ ad: {}, layoutInput: gated });
+  const meta = resolveMeta(mergeCascades(DEFAULT_META_CASCADES, null), ctx);
+  check('P6 video cascade burns quote text',
+    meta.quote === REAL_TEXT, `got ${JSON.stringify(meta.quote)}`);
+  check('P6 video cascade burns NO reviewer (metaCascadeConfig author_name/author)',
+    meta.reviewer === undefined, `got ${JSON.stringify(meta.reviewer)}`);
+
+  // synthesized still rejected end-to-end.
+  const synth = { text: REAL_TEXT, origin: 'synthesized', verbatim: false, author_name: 'Bot' };
+  check('P6 synthesized still withheld by predicate',
+    provenance.isPrintableCustomerQuote(synth) === false);
+  const dSynth = intentFor(synth);
+  check('P6 static emits no quote for synthesized', dSynth.quote === undefined);
+  const gatedSynth = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: synth } }
+  });
+  check('P6 video gate nulls synthesized primary_quote',
+    gatedSynth?.input?.social_proof?.primary_quote === null);
+
+  // unknown still rejected.
+  check('P6 unknown still withheld',
+    provenance.isPrintableCustomerQuote({ text: REAL_TEXT, origin: 'unknown' }) === false);
+
+  // Scraped still keeps attribution through the same path.
+  const scraped = {
+    text: REAL_TEXT, origin: 'scraped', verbatim: true, author_name: 'Jessica L.'
+  };
+  const scrapedPrintable = provenance.toPrintableCustomerQuote(scraped);
+  check('P6 scraped toPrintable keeps author_name',
+    scrapedPrintable && scrapedPrintable.author_name === 'Jessica L.',
+    `got ${JSON.stringify(scrapedPrintable && scrapedPrintable.author_name)}`);
+  const dScraped = intentFor(scraped);
+  check('P6 scraped static still prints byline',
+    dScraped.attribution === 'Jessica L.', `got ${JSON.stringify(dScraped.attribution)}`);
+  const gatedScraped = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: scraped } }
+  });
+  const metaScraped = resolveMeta(
+    mergeCascades(DEFAULT_META_CASCADES, null),
+    buildContext({ ad: {}, layoutInput: gatedScraped })
+  );
+  check('P6 scraped video cascade still burns reviewer',
+    metaScraped.reviewer === 'Jessica L.',
+    `got ${JSON.stringify(metaScraped.reviewer)}`);
+}
+
+// ── P6-revert-surface: the strip must be structural ─────────────────────
+// If someone rewrites toPrintable to `return { ...q }` for llm-web (admits
+// the quote but forgets to strip), every check below fails. That is the
+// revert-proof for the attribution half of the owner decision.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const src = fs.readFileSync(
+    path.join(__dirname, '../services/quoteProvenance.js'), 'utf8'
+  );
+  check('P6-revert surface: ANONYMOUS_PRINT_ORIGINS includes llm-web',
+    /ANONYMOUS_PRINT_ORIGINS[\s\S]*?llm-web/.test(src));
+  check('P6-revert surface: toPrintable deletes byline fields (not just a comment)',
+    /delete out\[f\]/.test(src) || /for\s*\(.*BYLINE_FIELDS/.test(src));
+  check('P6-revert surface: directImage uses toPrintable return value',
+    /toPrintableCustomerQuote\s*\(\s*proof\.primary_quote\s*\)/.test(
+      fs.readFileSync(path.join(__dirname, '../services/directImageRenderService.js'), 'utf8')
+    ));
+  check('P6-revert surface: layout pool maps toPrintable (not boolean filter alone)',
+    /\.map\s*\(\s*toPrintableCustomerQuote\s*\)/.test(
+      fs.readFileSync(path.join(__dirname, '../services/layoutInputService.js'), 'utf8')
+    ));
+  check('P6-revert surface: video gate reseats primary_quote with printable',
+    /primary_quote:\s*printable/.test(
+      fs.readFileSync(path.join(__dirname, '../services/brandScriptExecutor.js'), 'utf8')
+    ));
+  // Widened BYLINE_FIELDS — structural strip must cover future producers.
+  for (const f of ['reviewer', 'user_name', 'platform', 'site']) {
+    check(`P6 BYLINE_FIELDS includes ${f}`, provenance.BYLINE_FIELDS.includes(f));
+  }
+}
+
+// ── P7: SHOW-to-LLM — derivation prompt + Director brand signal ─────────
+// We stopped PRINTING bylines but still SHOWed them to the LLMs that author
+// copy. Those models echo bylines into input.copy.* / copy.headline, which
+// burn without re-gating. Behavioural, not a source scan.
+{
+  const director = require('../services/aiCreativeDirectorService');
+  const LLM_WEB_QUOTE = {
+    text: REAL_TEXT,
+    origin: 'llm-web',
+    verbatim: false,
+    author: 'vertexaisearch.cloud.google.com',
+    author_name: 'Reddit (r/BuyItForLife)',
+    source: 'UBeauty.com',
+    verified: true
+  };
+
+  // Product-mode derivation prompt: quote TEXT yes; author/source/persona no.
+  const productPrompt = layout.buildDerivationPrompt(
+    {
+      media: {},
+      detection: null,
+      match: {
+        outcome: 'product_match',
+        productReviews: { quotes: [LLM_WEB_QUOTE] }
+      },
+      brand: {}
+    },
+    'testimonial_spotlight',
+    '1:1',
+    {}
+  );
+  check('P7 derivation prompt contains quote TEXT',
+    productPrompt.includes(REAL_TEXT),
+    `prompt excerpt: ${JSON.stringify(productPrompt.slice(0, 400))}`);
+  check('P7 derivation prompt has no site-as-author (vertexaisearch)',
+    !productPrompt.includes('vertexaisearch'),
+    `leaked in: ${JSON.stringify((productPrompt.match(/.*vertexaisearch.*/i) || [])[0])}`);
+  check('P7 derivation prompt has no Reddit byline',
+    !productPrompt.includes('Reddit'),
+    `leaked in: ${JSON.stringify((productPrompt.match(/.*Reddit.*/i) || [])[0])}`);
+  check('P7 derivation prompt has no UBeauty source domain',
+    !productPrompt.includes('UBeauty'),
+    `leaked in: ${JSON.stringify((productPrompt.match(/.*UBeauty.*/i) || [])[0])}`);
+  check('P7 derivation prompt has no invented "Verified buyer"',
+    !productPrompt.includes('Verified buyer'),
+    `leaked in: ${JSON.stringify((productPrompt.match(/.*Verified buyer.*/i) || [])[0])}`);
+  check('P7 derivation prompt has no invented "Anonymous Customer"',
+    !productPrompt.includes('Anonymous Customer'),
+    `leaked in: ${JSON.stringify((productPrompt.match(/.*Anonymous Customer.*/i) || [])[0])}`);
+
+  // Brand-mode derivation path (sibling site) — same rule.
+  const brandPrompt = layout.buildDerivationPrompt(
+    {
+      media: {},
+      detection: null,
+      match: {
+        outcome: 'brand_match',
+        brandReviews: {
+          quotes: [{
+            text: REAL_TEXT,
+            author: 'vertexaisearch.cloud.google.com',
+            source: 'Reddit (r/BuyItForLife)',
+            origin: 'llm-web',
+            verbatim: false
+          }]
+        }
+      },
+      brand: {}
+    },
+    'testimonial_spotlight',
+    '1:1',
+    {}
+  );
+  check('P7 brand derivation prompt contains quote TEXT',
+    brandPrompt.includes(REAL_TEXT));
+  check('P7 brand derivation prompt has no author/source byline',
+    !brandPrompt.includes('vertexaisearch') && !brandPrompt.includes('Reddit'),
+    `leaked: ${JSON.stringify((brandPrompt.match(/.*(?:vertexaisearch|Reddit).*/i) || [])[0])}`);
+
+  // quoteLineForTonePrompt unit: never invents persona when fields empty.
+  const emptyLine = layout.quoteLineForTonePrompt({
+    text: REAL_TEXT, origin: 'llm-web', verified: true
+  });
+  check('P7 tone line for llm-web is text-only',
+    emptyLine === `    - "${REAL_TEXT}"`,
+    `got ${JSON.stringify(emptyLine)}`);
+  const invented = layout.quoteLineForTonePrompt({
+    text: REAL_TEXT, verified: true
+  });
+  check('P7 unstamped verified still invents no persona',
+    invented === `    - "${REAL_TEXT}"` &&
+      !String(invented).includes('Verified') &&
+      !String(invented).includes('Anonymous'),
+    `got ${JSON.stringify(invented)}`);
+  // First-party with a real name still may carry the name (tonal voice).
+  const scrapedLine = layout.quoteLineForTonePrompt({
+    text: REAL_TEXT, origin: 'scraped', author: 'Jessica L.', verbatim: true
+  });
+  check('P7 scraped tone line may keep a real author',
+    scrapedLine === `    - "${REAL_TEXT}" — Jessica L.`,
+    `got ${JSON.stringify(scrapedLine)}`);
+
+  // Director brand-mode signal: author stripped.
+  const dirSignal = director.brandQuoteForDirectorSignal(LLM_WEB_QUOTE);
+  check('P7 Director brand signal keeps text',
+    dirSignal && dirSignal.text === REAL_TEXT,
+    `got ${JSON.stringify(dirSignal)}`);
+  check('P7 Director brand signal carries no author',
+    dirSignal && (dirSignal.author == null || dirSignal.author === undefined),
+    `got author=${JSON.stringify(dirSignal && dirSignal.author)}`);
+  // String form (enrichment can store plain strings).
+  const dirString = director.brandQuoteForDirectorSignal(REAL_TEXT);
+  check('P7 Director brand signal from string has no author',
+    dirString && dirString.text === REAL_TEXT && dirString.author == null,
+    `got ${JSON.stringify(dirString)}`);
+}
+
+// ── P7-revert-surface: derivation prompt must use the tone helper ───────
+// If someone restores `q.author || q.source || (verified ? 'Verified buyer'
+// : 'Anonymous Customer')` the behavioural checks above fail; this surface
+// check names the call site so a partial revert is also caught.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const layoutSrc = fs.readFileSync(
+    path.join(__dirname, '../services/layoutInputService.js'), 'utf8'
+  );
+  check('P7-revert surface: layout uses quoteLineForTonePrompt (not inline author invent)',
+    /quoteLineForTonePrompt\s*\(/.test(layoutSrc) &&
+      !/Verified buyer.*Anonymous Customer|Anonymous Customer.*Verified buyer/.test(layoutSrc));
+  check('P7-revert surface: no Verified buyer / Anonymous Customer invent in layoutInputService',
+    !/q\.author\s*\|\|\s*q\.source\s*\|\|\s*\(q\.verified\s*\?\s*['"]Verified buyer['"]/.test(layoutSrc));
+  const dirSrc = fs.readFileSync(
+    path.join(__dirname, '../services/aiCreativeDirectorService.js'), 'utf8'
+  );
+  check('P7-revert surface: Director brand quotes go through brandQuoteForDirectorSignal',
+    /brandQuoteForDirectorSignal/.test(dirSrc) &&
+      /\.map\s*\(\s*brandQuoteForDirectorSignal\s*\)/.test(dirSrc));
+  check('P7-revert surface: brandQuoteForDirectorSignal calls toPrintableCustomerQuote',
+    /function brandQuoteForDirectorSignal[\s\S]*?toPrintableCustomerQuote/.test(dirSrc));
 }
 
 if (failures.length) {

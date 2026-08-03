@@ -115,7 +115,8 @@ module.exports = {
     const rating       = Number(meta.rating ?? 4.9);
     const reviewCount  = meta.reviewCount || '327 reviews';
     const quote        = normalizeQuote(meta.quote || 'Highly rated for comfort, durability, and standout style.');
-    const reviewer     = meta.reviewer || 'Verified customer';
+    // No fabricated purchase persona. Absent reviewer → no byline rendered.
+    const reviewer     = meta.reviewer || '';
     const deliveryLine = isBrandMode
       ? (meta.brandWebsiteUrl
           ? String(meta.brandWebsiteUrl).replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '')
@@ -408,6 +409,8 @@ module.exports = {
     cursor += quoteBoxH + Math.round(H * 0.008);
 
     // ── 6. Reviewer attribution — smaller nested scrim ──────────
+    // Skip entirely when no real byline was provided (no 'Verified customer').
+    if (reviewer) {
     ctx.save();
     ctx.globalAlpha = quoteT;
     const reviewerFontSize = isVertical ? 18 : 15;
@@ -433,6 +436,7 @@ module.exports = {
     ctx.fillText(reviewerLabel, reviewerBoxX + reviewerPadX, reviewerBoxY + reviewerBoxH / 2 + 1);
     ctx.restore();
     cursor += reviewerBoxH + rowGap;
+    }
 
     // ── 7. Delivery / brand-website line ─────────────────────────
     // Product mode: "Ships free — arrives 2-3 days" with a truck icon.

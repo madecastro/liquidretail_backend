@@ -64,8 +64,9 @@ console.warn = (...args) => {
 };
 
 // ── A. Non-printable quotes are dropped from cascaded meta ──────────
+// llm-web is no longer here: owner 2026-08-02 admits grounded-search text
+// (anonymous). synthesized / unknown / first-party non-verbatim stay out.
 const BAD = [
-  ['llm-web', { text: REAL_TEXT, origin: 'llm-web' }],
   ['synthesized', { text: REAL_TEXT, origin: 'synthesized', verbatim: false }],
   ['unstamped legacy', { text: REAL_TEXT }],
   ['unknown', { text: REAL_TEXT, origin: 'unknown' }],
@@ -82,6 +83,25 @@ for (const [label, q] of BAD) {
   check(`A cascade drops quoteSnippet for: ${label}`,
     m.quoteSnippet === undefined, `got ${JSON.stringify(m.quoteSnippet)}`);
   check(`A cascade drops reviewer for: ${label}`,
+    m.reviewer === undefined, `got ${JSON.stringify(m.reviewer)}`);
+}
+
+// ── A2. llm-web (grounded) prints text, NEVER a byline ───────────────
+{
+  const q = {
+    text: REAL_TEXT,
+    origin: 'llm-web',
+    verbatim: false,
+    author_name: 'vertexaisearch.cloud.google.com',
+    author: 'Reddit (r/BuyItForLife)',
+    source: 'UBeauty.com'
+  };
+  check('A2 predicate admits llm-web + verbatim:false',
+    provenance.isPrintableCustomerQuote(q) === true);
+  const m = videoMetaFor(q);
+  check('A2 cascade burns grounded quote text',
+    m.quote === REAL_TEXT, `got ${JSON.stringify(m.quote)}`);
+  check('A2 cascade burns NO reviewer for grounded (source-as-author blocked)',
     m.reviewer === undefined, `got ${JSON.stringify(m.reviewer)}`);
 }
 
@@ -114,11 +134,24 @@ for (const [label, q] of BAD) {
 }
 
 // ── C. Operator override (ad.copy.quote) still wins ─────────────────
-// Cascade tier 0 is ad.copy.quote. Nulling primary_quote must not
-// silence an operator PATCH.
+// Cascade tier 0 is ad.copy.quote. A non-printable artifact quote must
+// not silence an operator PATCH. Use synthesized (still withheld) so
+// the override is the only source of quote text.
 {
-  const m = videoMetaFor({ text: REAL_TEXT, origin: 'llm-web' }, 'Operator-authored line');
-  check('C ad.copy.quote wins even when artifact quote is llm-web',
+  const m = videoMetaFor(
+    { text: REAL_TEXT, origin: 'synthesized', verbatim: false },
+    'Operator-authored line'
+  );
+  check('C ad.copy.quote wins even when artifact quote is synthesized',
+    m.quote === 'Operator-authored line', `got ${JSON.stringify(m.quote)}`);
+}
+// llm-web is now printable: override still outranks the artifact text.
+{
+  const m = videoMetaFor(
+    { text: REAL_TEXT, origin: 'llm-web', verbatim: false },
+    'Operator-authored line'
+  );
+  check('C ad.copy.quote also outranks a printable llm-web artifact quote',
     m.quote === 'Operator-authored line', `got ${JSON.stringify(m.quote)}`);
 }
 {
@@ -164,21 +197,48 @@ for (const raw of NO_THROW) {
 }
 
 // ── E. Clone only — never mutate the input artifact ─────────────────
+// Non-printable path: nulls primary_quote on the clone.
 {
   const artifact = {
     input: {
       social_proof: {
-        primary_quote: { text: REAL_TEXT, origin: 'llm-web', author_name: 'Fake' }
+        primary_quote: { text: REAL_TEXT, origin: 'synthesized', author_name: 'Fake' }
       }
     }
   };
   const before = JSON.stringify(artifact);
   const gated = gateLayoutInputQuotes(artifact);
-  check('E input artifact is not mutated',
+  check('E input artifact is not mutated (withhold path)',
     JSON.stringify(artifact) === before);
-  check('E gated output nulls primary_quote',
+  check('E gated output nulls non-printable primary_quote',
     gated.input.social_proof.primary_quote === null);
-  check('E gated output is a different object',
+  check('E gated output is a different object (withhold path)',
+    gated !== artifact);
+}
+// Printable llm-web path: reseats a stripped copy; original untouched.
+{
+  const artifact = {
+    input: {
+      social_proof: {
+        primary_quote: {
+          text: REAL_TEXT,
+          origin: 'llm-web',
+          verbatim: false,
+          author_name: 'vertexaisearch.cloud.google.com'
+        }
+      }
+    }
+  };
+  const before = JSON.stringify(artifact);
+  const gated = gateLayoutInputQuotes(artifact);
+  check('E input artifact is not mutated (admit path)',
+    JSON.stringify(artifact) === before);
+  check('E gated output keeps grounded text',
+    gated.input.social_proof.primary_quote?.text === REAL_TEXT);
+  check('E gated output strips author_name on admit',
+    gated.input.social_proof.primary_quote &&
+      !('author_name' in gated.input.social_proof.primary_quote));
+  check('E gated output is a different object (admit path)',
     gated !== artifact);
 }
 
@@ -191,11 +251,13 @@ const bseSrc = fs.readFileSync(
 );
 check('F buildMetaForAd calls gateLayoutInputQuotes',
   /layoutInput\s*=\s*gateLayoutInputQuotes\s*\(\s*layoutInput\s*\)/.test(bseSrc));
-check('F gate uses isPrintableCustomerQuote from quoteProvenance (one allowlist)',
+check('F gate uses toPrintableCustomerQuote from quoteProvenance (one allowlist + strip)',
   /require\(['"]\.\/quoteProvenance['"]\)/.test(bseSrc) &&
-  /isPrintableCustomerQuote/.test(bseSrc));
-check('F gate nulls primary_quote (does not delete social_proof wholesale)',
+  /toPrintableCustomerQuote/.test(bseSrc));
+check('F gate nulls primary_quote on withhold (does not delete social_proof wholesale)',
   /primary_quote:\s*null/.test(bseSrc));
+check('F gate reseats primary_quote with printable on admit (structural strip)',
+  /primary_quote:\s*printable/.test(bseSrc));
 
 // restore console
 console.log = realLog;

@@ -594,9 +594,15 @@ function hexToRgb(hex) {
 //
 // Local clone only — never mutates the artifact document. Dropping the
 // quote degrades the slot to absent; this must never throw (Atlas video
-// is already billed by the time titling runs). ONE predicate
-// (quoteProvenance.isPrintableCustomerQuote); do not invent a second
+// is already billed by the time titling runs). ONE gate
+// (quoteProvenance.toPrintableCustomerQuote); do not invent a second
 // allowlist that can drift from static.
+//
+// ALWAYS reseats primary_quote with the gate's return value when admitting.
+// That is load-bearing for llm-web: those quotes print as TEXT ONLY, and
+// the strip of author_name/author/source happens inside toPrintable so a
+// cached artifact carrying "vertexaisearch.cloud.google.com" as author
+// cannot reach metaCascadeConfig's reviewer cascade.
 //
 // Pure + exported so the offline harness can drive the real production
 // path without Mongo. Call site in buildMetaForAd is the live wire.
@@ -604,19 +610,33 @@ function gateLayoutInputQuotes(layoutInput) {
   try {
     const pq = layoutInput?.input?.social_proof?.primary_quote;
     if (!pq) return layoutInput;
-    const { isPrintableCustomerQuote } = require('./quoteProvenance');
-    if (isPrintableCustomerQuote(pq)) return layoutInput;
-    console.log(
-      `🔒 brandScript: quote withheld (tier=${pq.tier || 'unstamped'} ` +
-      `origin=${pq.origin || 'unstamped'}) — titling with no testimonial`
-    );
+    const { toPrintableCustomerQuote } = require('./quoteProvenance');
+    const printable = toPrintableCustomerQuote(pq);
+    if (!printable) {
+      console.log(
+        `🔒 brandScript: quote withheld (tier=${pq.tier || 'unstamped'} ` +
+        `origin=${pq.origin || 'unstamped'}) — titling with no testimonial`
+      );
+      return {
+        ...layoutInput,
+        input: {
+          ...layoutInput.input,
+          social_proof: {
+            ...layoutInput.input.social_proof,
+            primary_quote: null
+          }
+        }
+      };
+    }
+    // Reseat even when the quote was already clean: the gate's copy is the
+    // only object cascade is allowed to read, so llm-web bylines stay gone.
     return {
       ...layoutInput,
       input: {
         ...layoutInput.input,
         social_proof: {
           ...layoutInput.input.social_proof,
-          primary_quote: null
+          primary_quote: printable
         }
       }
     };

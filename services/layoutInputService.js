@@ -170,7 +170,10 @@ const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 // overlayBoxes prompt section. Cached docs re-derive against the
 // new placement + budgets.
 // One definition of printable provenance, shared with every renderer.
-const { isPrintableCustomerQuote } = require('./quoteProvenance');
+const {
+  toPrintableCustomerQuote,
+  ANONYMOUS_PRINT_ORIGINS
+} = require('./quoteProvenance');
 
 const INPUT_SCHEMA_VERSION = '4.1';   // 4.1: quote provenance (origin + tier) stamped on primary_quote; LLM tiers removed
 
@@ -836,6 +839,41 @@ async function runDerivation(ctx, template, aspectRatio, options) {
   }
 }
 
+/**
+ * One line of quote text for the derivation / tone prompt.
+ *
+ * The quote TEXT is the tonal signal. The byline is a liability: on llm-web
+ * rows it is a site or platform label ("vertexaisearch.cloud.google.com",
+ * "Reddit (r/BuyItForLife)"), and inventing "Verified buyer" / "Anonymous
+ * Customer" because a field is empty seeds the same LLM that writes
+ * input.copy.* — which the video cascade can burn as headline when
+ * ad.copy.headline is empty (metaCascadeConfig). Never synthesise a persona.
+ * Never pass source as a person. Anonymous-print origins are text-only.
+ */
+function quoteLineForTonePrompt(q) {
+  const text = String(q?.text || '').trim();
+  if (!text) return null;
+
+  // Prefer a stamped origin; brand/product gemini rows already carry
+  // origin:'llm-web'. Unstamped rows get text only — never invent.
+  const origin = q.origin || null;
+  if (origin && ANONYMOUS_PRINT_ORIGINS.has(origin)) {
+    return `    - "${text}"`;
+  }
+  if (origin) {
+    // First-party / attributed printable: a real name only, never source.
+    const printable = toPrintableCustomerQuote({ ...q, origin, text });
+    if (printable) {
+      const author = printable.author_name || printable.author || null;
+      return author ? `    - "${text}" — ${author}` : `    - "${text}"`;
+    }
+    // Non-printable origin: still useful as tone, text only.
+    return `    - "${text}"`;
+  }
+  // Unstamped: text only. Do not fall back to q.source or invent a persona.
+  return `    - "${text}"`;
+}
+
 function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   const { media, detection, match, brand } = ctx;
   const ident = match?.identification || {};
@@ -1022,7 +1060,8 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
       if (Array.isArray(br.quotes) && br.quotes.length) {
         lines.push('  Real brand quotes (use these to inform tone, do NOT copy verbatim):');
         for (const q of br.quotes.slice(0, 5)) {
-          lines.push(`    - "${q.text}"${q.author ? ` — ${q.author}` : ''}${q.source ? ` (${q.source})` : ''}`);
+          const line = quoteLineForTonePrompt(q);
+          if (line) lines.push(line);
         }
       }
       lines.push('');
@@ -1039,11 +1078,8 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     if (productReviews?.quotes?.length) {
       lines.push('  Real product quotes (use these to inform tone, do NOT copy verbatim):');
       for (const q of productReviews.quotes.slice(0, 5)) {
-        // Neutral default, not "Verified buyer": this text is handed to the
-        // copy LLM, and seeding it with an unearned verified-purchase claim is
-        // how that claim ends up written into the ad.
-        const author = q.author || q.source || (q.verified ? 'Verified buyer' : 'Anonymous Customer');
-        lines.push(`    - "${q.text}" — ${author}${q.source && q.source !== author ? ` (${q.source})` : ''}`);
+        const line = quoteLineForTonePrompt(q);
+        if (line) lines.push(line);
       }
     }
     lines.push('');
@@ -1951,8 +1987,12 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // video overlays read the same artifact and would have carried on typesetting
   // whatever it held. Filtering at assembly means primary_quote AND
   // secondary_quotes are clean for every consumer, present and future.
+  // Map through toPrintableCustomerQuote (not a boolean filter): llm-web
+  // quotes come back with byline fields structurally removed, so every
+  // downstream consumer — primary_quote, secondary_quotes, any renderer —
+  // inherits anonymity without a separate "don't print author" convention.
   const printableOnly = (quotes, tierName) => {
-    const kept = (quotes || []).filter(Boolean).filter(isPrintableCustomerQuote);
+    const kept = (quotes || []).filter(Boolean).map(toPrintableCustomerQuote).filter(Boolean);
     const dropped = (quotes || []).filter(Boolean).length - kept.length;
     if (dropped) {
       console.log(`🔒 quote provenance[${tierName}] — ${dropped} quote(s) withheld: origin not printable as a customer testimonial`);
@@ -3246,5 +3286,9 @@ module.exports = {
   normalizeQuote,
   productReviewsOf,
   toFiveScale,
-  QUOTE_MIN_RATING
+  QUOTE_MIN_RATING,
+  // Exported so the provenance harness can pin: derivation prompt gets quote
+  // TEXT for tone, never a byline/persona for anonymous-print origins.
+  buildDerivationPrompt,
+  quoteLineForTonePrompt
 };

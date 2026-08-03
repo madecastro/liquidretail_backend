@@ -93,10 +93,11 @@ module.exports = {
       'Stunning and lasted all week.'
     );
 
+    // No fabricated purchase persona. Empty → showReviewer block below skips.
     const reviewer = String(
       meta.reviewer ||
       meta.customerName ||
-      'Verified customer'
+      ''
     ).toUpperCase();
 
     // ── Brand-driven theme ─────────────────────────────────────────

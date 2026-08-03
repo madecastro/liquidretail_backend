@@ -59,7 +59,8 @@ module.exports = {
     // ── Copy resolution ────────────────────────────────────────────
     const headline     = String(meta.headline || meta.hookHeadline || '').trim();
     const quote        = String(meta.quoteSnippet || meta.quote || '').trim();
-    const reviewer     = String(meta.reviewer || 'Verified customer').trim().toUpperCase();
+    // No fabricated purchase persona. Absent reviewer → drawProof skips byline.
+    const reviewer     = String(meta.reviewer || '').trim().toUpperCase();
 
     // ── Phase gating ───────────────────────────────────────────────
     if (t < 3) {
@@ -182,15 +183,19 @@ function drawProof(ctx, W, H, quote, reviewer, alpha, colors, fonts, rgba) {
     if (w > widestQuote) widestQuote = w;
   }
 
-  // Attribution typography — measure so scrim can span both blocks.
+  // Attribution only when a real byline exists — never "— " with a blank.
+  const hasReviewer = !!String(reviewer || '').trim();
   const attribSize = clampNum(Math.round(H * 0.018), 18, 30);
-  const attribGap  = Math.round(H * 0.020);
-  const attribText = `— ${reviewer}`;
-  ctx.font = `600 ${attribSize}px "${fonts.body}"`;
-  const attribW = ctx.measureText(attribText).width;
+  const attribGap  = hasReviewer ? Math.round(H * 0.020) : 0;
+  const attribText = hasReviewer ? `— ${reviewer}` : '';
+  let attribW = 0;
+  if (hasReviewer) {
+    ctx.font = `600 ${attribSize}px "${fonts.body}"`;
+    attribW = ctx.measureText(attribText).width;
+  }
 
   const widest = Math.max(widestQuote, attribW);
-  const totalH = quoteBlockH + attribGap + attribSize;
+  const totalH = quoteBlockH + (hasReviewer ? attribGap + attribSize : 0);
   // Same upper-anchor + safe-zone clamp math as drawHook. Proof's
   // totalH is larger than the hook's blockH (quote + attribution
   // stack), so the clamp typically pushes proof down further than
@@ -224,10 +229,12 @@ function drawProof(ctx, W, H, quote, reviewer, alpha, colors, fonts, rgba) {
   }
 
   // Attribution — small caps sans, dimmer color, inside the same scrim.
-  ctx.font = `600 ${attribSize}px "${fonts.body}"`;
-  ctx.fillStyle = rgba(colors.reviewerText, 1);
-  ctx.shadowBlur = 8;
-  ctx.fillText(attribText, padX, yStart + quoteBlockH + attribGap);
+  if (hasReviewer) {
+    ctx.font = `600 ${attribSize}px "${fonts.body}"`;
+    ctx.fillStyle = rgba(colors.reviewerText, 1);
+    ctx.shadowBlur = 8;
+    ctx.fillText(attribText, padX, yStart + quoteBlockH + attribGap);
+  }
 
   ctx.restore();
 }
