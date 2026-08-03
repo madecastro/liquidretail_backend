@@ -7,26 +7,212 @@ was judged superseded and dropped **deliberately**, not lost.
 
 ## Next-session prompt
 
-**START HERE — 2026-08-04 pickup, in this order.**
+**START HERE — 2026-08-05 pickup.** The 2026-08-04 session rewrote this block because three
+of its four claims were wrong. Read §0 CORRECTIONS before anything else.
 
-1. **MERGE PR #32 FIRST — it makes every spend number meaningful.** Open since 2026-07-31.
-   `models/CostLog.js:53` enum is `['ok','error','timeout']` but
-   `atlasVideoService.js:2636` writes `status:'submitted'`, so mongoose REJECTS the write and
-   `persistCost` swallows it by design (console.warn only). **Every Atlas video generation
-   since `f60c1c7` has recorded ZERO spend.** Same bug hits image `'failed'` and
-   `'charged-no-output'` — the latter being the "paid but got nothing" path that
-   `atlasImageService.js:414` calls the most under-reported spend in the ledger.
-   This supersedes the softer framing in item 6 below (I recorded video cost as
-   *unreconciled*; it is in fact *unrecorded*). It also explains why the 2026-08-03 spend-alert
-   test looked inconclusive — there were no rows to aggregate. Three-value enum widen.
+1. **LAND `fix/remotion-font-fatal-load`** (branch exists, working tree, NOT committed —
+   commit was not authorised). It fixes the fatal video bug. 30/30 verify green including a
+   new `scripts/verifyFontServing.js`. Two adversarial passes were run — read their findings
+   in §0 before committing.
 
-2. **Then the Remotion compositor failure (item 4a).** Until titling completes, nothing about
-   fonts, safe zones or the canonical prompt can be evaluated — every run yields a paid master
-   and no titled output.
+2. **THEN apply the post-render vision QC patch** — drafted, reviewed, NOT applied. It lives
+   at **`.drafts/ad-vision-qc/`** (gitignored; `ad-vision-qc.patch` + `APPLY.sh` +
+   `DESIGN-NOTES.md`). 1288 lines across 8 files, touches billable paths, so it needs its own
+   focused pass with two adversarial reviews. **One change required before applying: the draft
+   picks `google/gemini-2.5-flash`; use `google/gemini-2.5-pro` instead** — see §0.
 
-3. **Then fonts (4b) and safe zones (4c)** — both silent, both live, both cheap.
+3. **THEN the video canonical prompt.** This is now the biggest *creative* defect and it is
+   NOT a titling problem — titling works. See §0.
 
-Everything from 2026-08-03 is merged and deployed. Working tree clean, 29/29 verify green.
+**Do NOT start by merging PR #32.** That instruction was wrong; see §0.
+
+---
+
+## 0. CORRECTIONS — 2026-08-04. Read before trusting anything below.
+
+Four claims in this file were wrong. Each was verified against live code, the installed
+packages, or a real production render.
+
+**(a) "MERGE PR #32 FIRST — video spend is UNRECORDED" — STALE. Already fixed, better.**
+`models/CostLog.js:34` now has `COST_STATUSES = ['ok','error','timeout','rejected',
+'rejected-billing','failed','charged-no-output','submitted']` — all three values PR #32 wanted,
+plus two more. And `services/costTracker.js:148-160` now *normalises* an unknown status to
+`'error'` with a loud `❌` log instead of dropping the row, so the whole class of bug is closed
+structurally. Landed via PR #43 / `68a0ee0`, not PR #32. PR #32 is 3 commits stale and
+`CONFLICTING`. **Its one still-valuable piece is the unlanded GEN-1 security guard** (an
+`engine !== 'remotion'` 400 on `POST /api/brand/:id/preview-script`, closing an
+authenticated-tenant RCE via three doors). Land that on its own; do not merge the branch.
+
+**(b) "The font errors are a RED HERRING … chasing the font 404 first would waste a session"
+— EXACTLY BACKWARDS. The font 404 IS the root cause of the fatal video failure.**
+Chain, every link verified:
+1. `library-match` Inter resolves to `localPath = FONTS_DIR/Inter.ttf`
+   (`fontResolverService.js:279`, `fontLoader.js:31`).
+2. `fontsToUrls` (`remotionRenderService.js:291`) rewrites to `/fonts/<basename>`, and
+   `assetPathFor` (`:149-150`) maps `/fonts/*` ONLY to `FONT_CACHE_DIR` (= `assets/webfonts`).
+   File is in `fonts/`, lookup in `webfonts/` → **404**.
+3. The 404 branch set **no CORS header** (only the success path did, `:176`), so the browser
+   reported a CORS failure and `FontFace.load()` rejected with `A network error occurred`.
+4. **`node_modules/@remotion/fonts/dist/cjs/load-font.js` ends `catch (err) { cancelRender(err) }`.**
+   `loadFont` cancels the render ITSELF. Confirmed in the installed package, v4.0.495.
+5. `FontLoader.jsx`'s `.catch(...)` logging *"using fallback stack"* is a **FALSE SAFETY NET** —
+   it runs after `cancelRender` and cannot un-cancel. The file's header comment claiming "a
+   render must never fail because a webfont 404'd" was a lie in the code.
+`Could not extract frame from compositor / Request closed` is downstream collateral from the
+aborted page, not the fault. **Control proof:** 2026-08-01 renders succeeded because that
+brand's fonts all resolved via Google, so the files really were in `webfonts/`. The bug is
+deterministic for `library-match` — which is where the curated Inter/Lora defaults live.
+Also note the fix is NOT a directory rename: google + custom fonts legitimately live in
+`webfonts/`, so renaming would break the two branches that work.
+
+**(c) "Safe zones do not reconcile … titles are floating far higher than necessary" —
+REAL BUT MISDIAGNOSED. Fixing `safeZones.js` alone would change NOTHING.**
+Measured every one of the 192 frames of a real Stories render (1080x1920):
+- topmost text y=279 = **0.1453** of H (safe top 0.14) — sits exactly on the boundary
+- lowest text  y=744 = **0.3875** of H, against an allowed limit of **0.65**
+- left x=84 = 0.0778 (safe 0.075); right x=965 = 0.8935 (limit 0.925)
+**Zero safe-zone breaches anywhere in the video.** Text never descends past 0.3875 while
+permitted to 0.65, so `bottom: 0.35` is NOT the binding constraint — **504px / 26.2% of frame
+height is unused because the layout is top/upperThird-anchored** (`remotion/lib/safeZones.js`
+`ANCHOR_TOP`). The lever is anchor selection, not the safe-zone constant.
+The Reels/Stories collapse is still a real latent bug, and the numbers still disagree — but
+note **neither source is right for both surfaces**: remotion's 0.35 bottom is plausibly correct
+for *Reels* (tall caption/action rail) and far too conservative for *Stories*, while
+`platformFormats`' 250px is plausibly right for *Stories* and its 204px looks too small for
+*Reels*. **Confirm against Meta's published spec before locking any number in** — do not derive
+the fractions from `platformFormats`, that would push Reels titles under the caption rail.
+
+**(d) "Video path not QC'd on [competitor marks]" — now QC'd, and it HAS the defect.**
+See §0.1.
+
+### 0.1 What a real render actually looks like (2026-08-04)
+
+**Static** — pulled the three live `2026-08-03` renders and viewed them. **1 of 3 carries the
+competitor mark**, matching the reported rate. The defect ad is `ai_editorial`
+(`1_1-ai_editorial-69977681-7447a677.png`): a **Timberland tree emblem on the midfoot of an
+Allbirds shoe**. I pulled the ORIGINAL product photo
+(`Media.fileUrl`, media `6a4e7ea956509c2169977681`) — it is **completely clean, no mark on the
+panel**. The emblem is a pure hallucination with no source.
+**Likely mechanism, worth testing: the product is "Men's Tree Runner NZ".** A literal *tree*
+emblem on a product named *Tree Runner* looks like product-name semantics leaking into the
+artwork, not a random competitor logo. That suggests a targeted prompt/negative lever in
+addition to measure-and-reject.
+The other two renders are genuinely good — clean type hierarchy, correct `allbirds` wordmark
+and debossed midsole mark.
+
+**Video** — the 2026-08-01 titled Story (`brand_script/product-1785618231946-9-ia67yyu7.mp4`,
+Gymshark Muscle Tee, 8s @ 24fps) is the only titled output that exists. **Titling itself is
+fine**: serif headline "Meet your new favorite Muscle Tee", then a working quote gate
+rendering *"The athletic fit is perfect."* — ALEX R. The creative failure is the **last 29% of
+the clip**:
+- text absent frames **137–191 = 5.71s→7.96s (2.29s)** — no title, no CTA, no end card
+- the model is **fully back-turned** — featureless black shirt back, Gymshark chest logo gone
+- **white Nike sneakers with clearly visible swooshes**, sharp and stable across every frame
+So the ad's final impression is a competitor's logo. Confirmed with output-seeking (`-i` before
+`-ss`) across three stable frames; this is not a decode artifact.
+
+**ROOT CAUSE — it is the REFERENCE STACK, not the prompt and not hallucination.**
+`Ad.veoReferenceImages` for ad `6a6e5e6a57a1c6217fd33e8a` holds exactly three images:
+| pos | content |
+|---|---|
+| REF0 (seed) | model **front-facing**, **black** sneakers |
+| REF1 | model **fully back-turned**, wearing **white Nike sneakers, swoosh visible** |
+| REF2 | three-quarter view, black socks |
+The back-turned ending and the Nikes are **REF1, faithfully reproduced**. Omni did what the
+prompt told it — *"the first image is the primary scene, the rest are additional views of the
+same product"* (`veoPromptBuilder.js:337-340`) — treated the stack as a sequence and dissolved
+through the views. That also explains the ~5.0s cross-dissolve (front → back), which is
+therefore normal behaviour, NOT a generation artifact. Two earlier reads in this session were
+wrong and are corrected here: the ghosting is a legitimate shot transition, and the Nikes are
+not the model inventing a competitor mark.
+**Fix is view-aware reference selection/ordering** (`buildReferenceImages` passes hero + alts in
+"stored order"), so a rear view never becomes the closing beat. Tracked as its own item.
+
+**Secondary, still worth doing — the canonical prompt has real gaps** (`veoPromptBuilder.js`
+`OMNI_DIRECTIVES:156-193`):
+- It locks the CAMERA and the PRODUCT but never the PERSON. `cameraStyle` says "The product
+  stays completely static"; `physicalAccuracy:186-188` preserves "face, hair, skin tone, and
+  identity" — **identity, but not pose or orientation**. For apparel the product is worn by a
+  person the prompt does not govern.
+- **Self-contradiction:** `transitions:172` allows *"Smooth crossfades only, ~0.25s"* while
+  `doNot:190-192` bans *"morphing, or dissolves."* A crossfade IS a dissolve. The measured one
+  also ran ~0.4s+, longer than the stated 0.25s.
+
+### 0.2 Vision QC — there was none, at all
+
+Verified: `aiJudgeService` runs BEFORE render and scores Director *concepts*
+(`campaignAdsGenerationService.js:2293`); `judgeService.judgeDetections({imageUrl,...})` has
+**zero call sites** (dead code); `directImageRenderService.js:711` states validation runs
+*"BEFORE the billable submit, deliberately"*; and nothing reads the final `renderUrl`.
+**That is why the Timberland emblem ships — nothing ever looks at the output**, and it is why
+"the fix is measure-and-reject" was never actionable: the measure half did not exist.
+
+**Model, probed LIVE against the real defect** (not chosen from a spec sheet). Both candidates
+route and both caught the emblem:
+| model | verdict | cost/check | contract |
+|---|---|---|---|
+| `google/gemini-2.5-pro` | "competitor's logo (Timberland) … debossed into the heel counter … absent from the original" | ~$0.011 | **exact requested JSON shape** |
+| `google/gemini-2.5-flash` | also caught it, localised it slightly better | ~$0.0016 | **BROKE the shape** — returned `competitor_marks: false` as a bare bool, hoisted `findings` |
+**Use `gemini-2.5-pro`.** The $0.0094 delta is noise against the $0.01–0.17 generation it
+protects, and a malformed verdict either ships a bad ad or burns a needless regeneration.
+Register it as a **new `vision-qc` role** — do NOT repoint `'gpt-4.1'`, which
+`atlasModelMap.js` warns is shared by 11 services.
+Owner-approved behaviour: **auto-regenerate exactly ONCE**, then `status:'failed'` + Slack;
+**keep the discarded render** (already paid for); **surface findings in the generation details**
+(follow `imageGeneration`/`intentResolution`: `models/Ad.js:337,347` → `renderService.js:1157`
+→ `routes/ads.js:1888-1889,1944-1953`). All four checks: competitor marks, product fidelity vs
+original, text defects, layout/safe-box.
+
+**KNOWN LIMIT OF THIS QC — it cannot catch the video Nike case.** The check compares render
+against the ORIGINAL, so it only catches marks the model INVENTED. The Timberland emblem
+qualifies (original was clean → caught). The Nike sneakers do NOT: they are genuinely present
+in REF1, a real Gymshark catalog photo sitting in our own Media library, so render-vs-original
+correctly passes them. **Competitor branding that enters through source imagery needs a
+separate brand-safety screen at media ingest / reference-selection time.** Two different
+defects that look identical in the finished ad; do not expect one control to cover both.
+
+### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
+
+| change | files |
+|---|---|
+| FontLoader loads via raw `FontFace`; a font failure warns and continues, never `cancelRender` | `remotion/components/FontLoader.jsx` |
+| Dual asset routes `/fonts` (google+custom) + `/libfonts` (library-match) via `fontRouteForLocalPath()`; traversal guard applied to every base | `services/remotionRenderService.js` |
+| CORS headers on 404/416/500 so a miss is a clean error | `services/remotionRenderService.js` |
+| Owner rule "we only use stars over 4.5" → `RATING_STAR_MIN = 4.5`, strict `>` | `services/directImageRenderService.js:357-359,414-423` |
+| New harness, revert-proven | `scripts/verifyFontServing.js` |
+| P3 fixtures updated for the 4.5 floor (deliberate contract change, documented) | `scripts/verifyQuoteProvenance.js` |
+
+**Verify suite is now 30 scripts, 30/30 green** (`verifyQuoteProvenance` 161 checks,
+`verifyFontServing` 23).
+
+**Two adversarial passes were run on this diff and BOTH independently found the same HIGH bug**
+— proof the two-pass rule earns its cost. Fixed before any commit:
+- **The star gate tested the RAW value but the ad displayed the ROUNDED one.** `4.51/4.54/4.55`
+  passed `> 4.5` and then printed **`"4.5"`** — the exact string the owner rule forbids, and it
+  also kept `social_proof_led` eligible. Now ONE shared helper `services/ratingDisplay.js`
+  (`formatDisplayRating`) gates on the DISPLAYED value. Verified: 3.2/4.4/4.5/4.51/4.55/87 →
+  withheld; 4.6→"4.6", 4.66→"4.7", 5→"5".
+- **The rule was static-only; video chrome rendered any `rating > 0`**
+  (`remotion/compositions/Canonical.jsx:78`). Prod holds a real catalog rating of **3.2**, so
+  that was live exposure, not theory. Now gated at the single meta source
+  (`brandScriptExecutor.js:747-748`) using the same shared helper. Both cascade sources
+  (`layoutInput.input.social_proof.rating_value`, `catalogProduct.rating`) confirmed to store
+  JS numbers in prod, so the strict `typeof === 'number'` check is safe.
+- **`FontLoader` created its delay handle in `useState`,** so an effect re-run loaded fonts
+  against an already-continued handle and silently lost the wait. Handle is now created INSIDE
+  the effect, with all three exit paths releasing it (settle / batch-catch / cleanup).
+  **Reviewed by hand — a leaked handle hangs a render forever.**
+
+**Still open from adversarial pass 1** (tracked, not done): soft-fail font loading converts a
+hard crash into a SILENT off-brand ship, so font-resolution failures should be recorded on the
+Ad and surfaced in the inspector; `fontRouteForLocalPath` should prefer the existing
+`source:'library-match'` field over path matching; and `verifyFontServing`'s T* traversal checks
+overclaim (`path.normalize` runs before the head split, so `..` returns null via unknown-head
+even with the guard deleted).
+The star gate makes `social_proof_led` ineligible below 4.5; the existing
+`FALLBACK_ORDER` (`staticAdIntents.js:347`) handles it — `product_first_lifestyle` is always
+eligible. `badges:['top rated']` deliberately left at `>= 4.5`: different concept, and
+`buildIntentData` does not pass `proof_badges` to intent text anyway.
 
 ---
 
