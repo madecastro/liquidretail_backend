@@ -71,12 +71,65 @@ Owner-set: **production quality first, money hardening after output is proven.**
    product IS maroon, so the ad's quote *"the perfect vibrant pink"* was a **fabricated
    claim**, not a render bug.
 
-3. **The video path is STILL NOT TESTED.** Two attempts on 2026-08-03 did not exercise Omni:
-   the second was deduped by `identityDigest` ("all 1 creative(s) already queued") before any
-   billable submit. Five changes are live and unproven on video — poll-tick instrumentation,
-   the untitled-video honesty fix, the intermediate `draft` money guard, the video quote gate,
-   and `veoStoryboardService` finally receiving a non-blank archetype/hook. **Use a product
-   with no existing Reels ad, or a fresh campaign, or dedupe will swallow it again.**
+3. **VIDEO PATH CANNOT COMPLETE — Remotion titling fails on every run.**
+   Tested end-to-end 2026-08-03 (`run_1785731053755_32f1569f`, Women's Breezer Point Warm
+   Red, meta_reels_9_16). Omni generated AND uploaded the master successfully; **titling
+   then failed**:
+
+   ```
+   Could not extract frame from compositor  Error: Request closed
+     at @remotion/renderer/dist/offthread-video-server.js:99
+   ```
+
+   **The font errors in that log are a RED HERRING.** `font load failed for Inter … — using
+   fallback stack` is explicitly non-fatal and it recovered; the compositor failure is the
+   fatal one. Chasing the font 404 first would waste a session. (Cosmetic but confusing:
+   boot logs `fontLoader: 16 downloaded → services/brandScripts/assets/fonts` while Remotion
+   serves `/fonts/Inter.ttf` from its own asset server — a path mismatch.)
+
+   Until fixed, the video path produces a PAID master and no titled deliverable.
+
+   **PROVEN by the same run:**
+   - Poll instrumentation on video: `17s (1)` → `1m24s (5)`, `stageAgeSec` cycling under the
+     15s interval — the stage is genuinely rewritten each tick.
+   - Titling honesty: `status:'failed'`, `stage:'master rendered; titling failed'`,
+     `failed:1 / ok:0`. Before today: `draft`, counted **succeeded**, console.warn only — an
+     untitled ad reported as a win.
+   - Money guard: the paid Omni master was **KEPT** (`assetUrl` present), not discarded and
+     not left to a reaper requeue + second submit.
+
+   **Still unproven** (titling died before chrome rendered): the video quote gate admitting an
+   anonymous testimonial into Remotion chrome.
+
+4. **THE VIDEO PROMPT IS DELIBERATELY CAMERA-ONLY — and the Director is OFF for video.**
+   *Corrected 2026-08-03 after I got this wrong.* I initially reported that the video prompt
+   uses "3 of the Director's 13 routing fields" and should be passed `art_direction`. **That
+   is wrong for the live path.** The owner confirmed the Director is disabled for video and a
+   canonical prompt is used, and the code agrees:
+
+   - `meta_video` goes through `expandDeterministicVideo` — deterministic, no concept expansion.
+   - `atlasVideoService.js:2593` — *"Camera-only prompt — the canonical brand-script overlay
+     composites all on-screen text downstream from ad.copy + LayoutInputArtifact."*
+   - `buildVeoPrompt` takes `{brand, product, media, layoutInput, sourceMedia, aspectRatio,
+     seedHasText, hasProductReference, storyboard, caps, durationSec}` — **no Director concept.**
+
+   So `veoStoryboardService`'s `conceptField` reads only matter where a storyboard is built
+   from a concept; they are not the deterministic path's prompt source.
+
+   **The real levers**, three-tier priority at `atlasVideoService.js:2595-2620`:
+   | tier | source | behaviour |
+   |---|---|---|
+   | 1 | `operatorPrompt` (regenerate) | prepended to canonical |
+   | 2 | `ad.videoPromptRaw` | FULL replacement — warns "canonical directives bypassed" |
+   | 3 | guidance cascade (`videoPromptGuidance`) | prepended to canonical |
+
+   Both are already plumbed through `expandDeterministicVideo` (`:1823-1824`) and exposed in
+   the wizard as "Video prompt guidance" and "Advanced — raw prompt". **Prefer guidance
+   (tier 3)** — raw replacement discards the canonical camera mechanics.
+
+   So the prompt is generic BY DESIGN (text is composited downstream by titling), not because
+   fields are missing. If per-concept video variation is wanted again, that is a decision to
+   re-enable the Director for video, not a field-plumbing fix.
 
 4. **`perProduct` over-reports.** It says `"Queued 1 creative(s)"` with `payloads: 1` while the
    run-level message correctly says *"all 1 already queued"* — it counts payloads BUILT, not
