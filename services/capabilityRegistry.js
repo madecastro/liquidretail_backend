@@ -194,9 +194,51 @@ const CAPABILITIES = [
       service: './capabilityExecutors/brandUpdateTagline',
       method:  'run'
     }
+  },
+
+  // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
+
+  {
+    id:       'ad.regenerateWithPrompt',
+    title:    'Regenerate image ad with edited prompt',
+    describe: 'Re-run the gpt-image-2/edit render for one image ad using a verbatim prompt override the operator supplied. Billable (~$0.15 per call). Regeneration happens asynchronously (30-90s) — this capability kicks it off and returns immediately; poll ad.inspect for status. Image ads only; refuses ads that have been synced to Meta. Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'ad',
+    // Static cost estimate. Measured 2026-07-31: real openai/gpt-image-2/
+    // edit call at quality:'medium' with 1 reference at 1024x1024
+    // is ~$0.15 per call. spendGuard reads this + the advertiser's
+    // rolling 24h spend to enforce AGENT_DAILY_CAP_USD.
+    estimateUsd: 0.15,
+    args: {
+      type: 'object',
+      required: ['adId', 'promptOverride'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId (must be a kind=\'image\' ad, not synced to Meta).' },
+        promptOverride: {
+          type: 'object',
+          required: ['system', 'user'],
+          properties: {
+            system: { type: 'string', minLength: 1, maxLength: 40000,
+                      description: 'System prompt sent to the image model verbatim.' },
+            user:   { type: 'string', minLength: 1, maxLength: 40000,
+                      description: 'User prompt sent to the image model verbatim.' }
+          },
+          additionalProperties: false,
+          description: 'Verbatim {system, user} prompt pair. Both required, ≤40000 chars each.'
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adRegenerateWithPrompt',
+      method:  'run'
+    }
   }
 
-  // Tier 2+ entries land in follow-up PRs (see backlog row 167).
+  // Tier 3 (external / hard-to-reverse) + Tier 4 (workflows) land in
+  // follow-up PRs — see backlog rows 167 (parent epic) and 168 (review
+  // refresh workflow).
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -321,6 +363,16 @@ function validateManifest(caps = CAPABILITIES) {
       problems.push(`${at} execute service+method required`);
     if (c.args && c.args.type !== 'object')
       problems.push(`${at} args.type must be 'object' (got '${c.args.type}')`);
+    // Tier ≥ 2 needs a cost estimator — spendGuard rejects capabilities
+    // without one. Enforce here so a new Tier 2+ entry can't be added
+    // without spend-guard coverage.
+    if (typeof c.tier === 'number' && c.tier >= 2) {
+      const e = c.estimateUsd;
+      const hasEstimator = (typeof e === 'number' && e >= 0) || typeof e === 'function';
+      if (!hasEstimator) {
+        problems.push(`${at} tier ${c.tier} requires estimateUsd (number ≥ 0 or function returning one)`);
+      }
+    }
   }
   return problems;
 }

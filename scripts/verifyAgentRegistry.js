@@ -35,6 +35,8 @@ const FILES = [
   'services/capabilityExecutors/adArchive.js',
   'services/capabilityExecutors/adRestore.js',
   'services/capabilityExecutors/brandUpdateTagline.js',
+  'services/capabilityExecutors/adRegenerateWithPrompt.js',
+  'services/spendGuard.js',
   'routes/agent.js'
 ];
 for (const rel of FILES) {
@@ -295,12 +297,106 @@ function checkGateSplit() {
   }
 }
 
+// ── 10. Tier 2 billable writes + spend-guard (PR #4) ──────────────
+console.log('\n[10] Tier 2 capabilities + spend-guard');
+
+const cap = registry.capabilityById('ad.regenerateWithPrompt');
+assert(cap, `capability "ad.regenerateWithPrompt" registered`);
+if (cap) {
+  assert(cap.tier === 2, `ad.regenerateWithPrompt: tier === 2 (got ${cap.tier})`);
+  assert(typeof cap.estimateUsd === 'number' && cap.estimateUsd > 0,
+    `ad.regenerateWithPrompt: static estimateUsd (got ${JSON.stringify(cap.estimateUsd)})`);
+}
+
+// validateManifest MUST reject a Tier ≥ 2 entry lacking estimateUsd —
+// this is the fail-closed rule that prevents new billable capabilities
+// from slipping past spendGuard.
+{
+  const shadow = [...registry.CAPABILITIES, {
+    id: '_test_.uncappedTier2',
+    title: 'test',
+    describe: 'test',
+    tier: 2,
+    scope: 'ad',
+    args: { type: 'object', properties: {}, additionalProperties: false },
+    execute: { kind: 'service', service: './capabilityExecutors/adInspect', method: 'run' }
+    // deliberately no estimateUsd
+  }];
+  const problems = registry.validateManifest(shadow);
+  assert(problems.some((p) => /estimateUsd/.test(p)),
+    `validateManifest rejects Tier ≥ 2 without estimateUsd (got: ${problems.join(' / ')})`);
+}
+
+// spendGuard.check contract — ok:false when capability lacks estimator;
+// ok:false with reason when projected exceeds cap; ok:true otherwise.
+const guard = require('../services/spendGuard');
+async function checkSpendGuard() {
+  // 1. Missing advertiserId → allowed:false with 'no advertiser scope'
+  {
+    const g = await guard.check({ advertiserId: null, capability: cap, args: {} });
+    assert(g.allowed === false && /advertiser scope/i.test(g.reason),
+      `spendGuard: rejects missing advertiser scope`);
+  }
+  // 2. Capability without estimator → allowed:false with 'no estimateUsd'
+  {
+    const bogus = { id: 'test.noestimator', tier: 2 };
+    const g = await guard.check({ advertiserId: '000000000000000000000000', capability: bogus, args: {} });
+    assert(g.allowed === false && /estimateUsd/i.test(g.reason),
+      `spendGuard: rejects capability without estimator`);
+  }
+  // 3. estimateUsd === 0 → allowed:true trivially (no DB read needed)
+  {
+    const free = { id: 'test.free', tier: 2, estimateUsd: 0 };
+    const g = await guard.check({ advertiserId: '000000000000000000000000', capability: free, args: {} });
+    assert(g.allowed === true, `spendGuard: allows zero-estimate capability trivially`);
+  }
+  // 4. dailyCap() reads AGENT_DAILY_CAP_USD (or 10 default). Sanity.
+  assert(typeof guard.dailyCap() === 'number' && guard.dailyCap() > 0,
+    `spendGuard.dailyCap() returns a positive number`);
+}
+
+// Endpoint plumbing for Tier 2.
+assert(/spendGuard/.test(agentSrc),
+  `routes/agent.js imports spendGuard`);
+assert(/event:\s*['"]?spend-guard-block['"]?/.test(agentSrc),
+  `routes/agent.js emits spend-guard-block event`);
+assert(/spendGuardBlocked/.test(agentSrc),
+  `routes/agent.js sets spendGuardBlocked flag on blocked results`);
+assert(/tier\s*>=\s*2|tier\s*>\s*1/.test(agentSrc),
+  `routes/agent.js gates on tier ≥ 2`);
+assert(/AGENT_DAILY_CAP_USD/.test(fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8')),
+  `AGENT_DAILY_CAP_USD declared in defaults.env`);
+
+// Executor guard: adRegenerateWithPrompt rejects a missing advertiser
+// scope, missing adId, malformed promptOverride, and refuses non-image
+// ad kinds via message shape (structural check only — no DB).
+async function checkTier2Executor() {
+  const exec = require('../services/capabilityExecutors/adRegenerateWithPrompt');
+  const r1 = await exec.run({ req: {}, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `adRegenerateWithPrompt: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /adId required/i.test(r2.error),
+    `adRegenerateWithPrompt: missing adId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { adId: 'not-an-oid' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `adRegenerateWithPrompt: invalid adId → rejects`);
+  const r4 = await exec.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000' }   // no promptOverride
+  });
+  assert(r4.ok === false && /promptOverride required/i.test(r4.error),
+    `adRegenerateWithPrompt: missing promptOverride → rejects`);
+}
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
   await checkParser();
   await checkTier1Executors();
   checkGateSplit();
+  await checkSpendGuard();
+  await checkTier2Executor();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

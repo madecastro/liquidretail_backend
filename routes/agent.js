@@ -11,6 +11,8 @@
 //   event: tool-use-complete       data: { toolCallId, toolName, args }
 //   event: tool-result             data: { toolCallId, result }
 //   event: proposed-action         data: { toolCallId, toolName, args, tier }
+//   event: spend-guard-block       data: { toolCallId, toolName, reason,
+//                                          dailyCap, spent, estimateUsd, projected }
 //   event: iteration               data: { n }
 //   event: done                    data: { stop_reason, iterations, model }
 //   event: error                   data: { error }
@@ -56,6 +58,7 @@ const router = express.Router();
 
 const registry = require('../services/capabilityRegistry');
 const agentTools = require('../services/agentTools');
+const spendGuard = require('../services/spendGuard');
 const { streamChatCompletion } = require('../services/atlasLlmStreamService');
 
 // ── Tunables ────────────────────────────────────────────────────────
@@ -90,13 +93,18 @@ function buildSystemPrompt(context = {}) {
     '- tier 2: billable write; ASK + estimate the cost before running.',
     '- tier 3: external / hard-to-reverse; ASK with explicit "type YES to confirm".',
     '- tier 4: multi-step workflow; propose a plan first.',
-    'This build ships tier-0 (read-only) AND tier-1 (cheap-write, reversible) capabilities. Tier-2/3/4 land in follow-up releases. If the operator asks for something a higher tier would need, say so clearly rather than pretending you can\'t help.',
+    'This build ships tier-0 (read-only), tier-1 (cheap-write, reversible), and tier-2 (billable) capabilities. Tier-3/4 land in follow-up releases. If the operator asks for something a higher tier would need, say so clearly rather than pretending you can\'t help.',
     '',
-    'TIER 1 CONFIRMATION FLOW (server-enforced, do NOT try to bypass):',
-    '- When the operator asks for a tier-1 action, CALL THE TOOL as usual. The server will intercept the call and return a synthetic result `{ ok:false, needsConfirmation:true }` — this is the gate, not a failure.',
-    '- Your next message to the operator should DESCRIBE the exact action, its target, and its reversibility, then ask for explicit confirmation. Example: "I\'d like to archive ad X (currently in status \'draft\'). This is reversible via ad.restore. Confirm?"',
+    'CONFIRMATION FLOW (tier ≥ 1, server-enforced — do NOT try to bypass):',
+    '- When the operator asks for a tier-1+ action, CALL THE TOOL as usual. The server will intercept the call and return a synthetic result `{ ok:false, needsConfirmation:true }` — this is the gate, not a failure.',
+    '- Your next message to the operator should DESCRIBE the exact action, its target, cost (for tier 2), and reversibility, then ask for explicit confirmation. Example: "I\'d like to regenerate ad X with your edited prompt — estimated $0.15, non-reversible (previous render will be overwritten). Confirm?"',
     '- On the operator\'s confirmation, the SERVER dispatches the previously-proposed tool call — do NOT re-emit it. Your next message just summarises what happened based on the real tool_result you\'ll see.',
     '- If the operator declines, acknowledge and do nothing.',
+    '',
+    'SPEND CAP (tier ≥ 2, server-enforced):',
+    '- Tier 2 actions are billable. The server enforces a per-advertiser daily USD cap on top of confirmation.',
+    '- If a confirmed action would exceed the cap, dispatch is blocked and you receive `{ ok:false, spendGuardBlocked:true, reason, dailyCap, spent, projected }`.',
+    '- Communicate the block honestly: state the cap, what\'s spent today, and what the operator can do (raise the cap, wait for the 24h window to roll, run a cheaper capability). Do not retry the same action — the block is authoritative.',
     '',
     `AVAILABLE CAPABILITIES (${registry.CAPABILITIES.length}):`,
     registry.describeManifest(),
@@ -231,6 +239,47 @@ async function replayConfirmations({ working, confirmationsSet, req, context, re
     let args = {};
     try { args = call.function?.arguments ? JSON.parse(call.function.arguments) : {}; }
     catch { args = {}; }
+
+    // Tier ≥ 2 replays still hit spendGuard — the operator confirmed
+    // the ACTION, but the daily cap may have moved between propose and
+    // confirm (a parallel agent session may have spent since). Blocked
+    // replays surface both events + a spend-guard tool_result so the
+    // LLM sees the same shape as an in-loop block.
+    const cap = registry.capabilityByToolName(call.function?.name);
+    if (cap && cap.tier >= 2) {
+      const guard = await spendGuard.check({
+        advertiserId: req.advertiserId,
+        capability:   cap,
+        args
+      });
+      if (!guard.allowed) {
+        sseWrite(res, 'spend-guard-block', {
+          toolCallId: call.id,
+          toolName:   call.function.name,
+          reason:     guard.reason,
+          dailyCap:   guard.dailyCap,
+          spent:      guard.spent,
+          estimateUsd: guard.estimateUsd,
+          projected:  guard.projected
+        });
+        const blockedResult = {
+          ok: false,
+          spendGuardBlocked: true,
+          reason:      guard.reason,
+          dailyCap:    guard.dailyCap,
+          spent:       guard.spent,
+          estimateUsd: guard.estimateUsd,
+          projected:   guard.projected
+        };
+        working[toolIdx] = {
+          role:         'tool',
+          tool_call_id: call.id,
+          content:      JSON.stringify(blockedResult)
+        };
+        sseWrite(res, 'tool-result', { toolCallId: call.id, result: blockedResult });
+        continue;
+      }
+    }
 
     const result = await agentTools.dispatch({
       toolName: call.function?.name,
@@ -400,8 +449,10 @@ router.post('/chat', async (req, res) => {
       // request AFTER the operator clicks Confirm in the UI).
       const { toDispatch, toGate } = splitByGate(assembledToolCalls, confirmationsSet);
 
-      // Dispatch confirmed / Tier-0 calls.
-      for (const { call } of toDispatch) {
+      // Dispatch confirmed / Tier-0 calls. For Tier ≥ 2, spendGuard
+      // runs BEFORE dispatch — a confirmed billable action still gets
+      // blocked if it would exceed the daily cap.
+      for (const { call, tier, cap } of toDispatch) {
         if (aborted) break;
         let args = {};
         try {
@@ -414,6 +465,45 @@ router.post('/chat', async (req, res) => {
           toolName:   call.function.name,
           args
         });
+
+        // Spend cap gate. Tier 0/1 skip (no billable dispatch). Tier ≥ 2
+        // rejects both when the capability lacks estimateUsd (fail
+        // closed) and when spent + est would exceed AGENT_DAILY_CAP_USD.
+        if (tier >= 2 && cap) {
+          const guard = await spendGuard.check({
+            advertiserId: req.advertiserId,
+            capability:   cap,
+            args
+          });
+          if (!guard.allowed) {
+            sseWrite(res, 'spend-guard-block', {
+              toolCallId: call.id,
+              toolName:   call.function.name,
+              reason:     guard.reason,
+              dailyCap:   guard.dailyCap,
+              spent:      guard.spent,
+              estimateUsd: guard.estimateUsd,
+              projected:  guard.projected
+            });
+            const blockedResult = {
+              ok: false,
+              spendGuardBlocked: true,
+              reason:      guard.reason,
+              dailyCap:    guard.dailyCap,
+              spent:       guard.spent,
+              estimateUsd: guard.estimateUsd,
+              projected:   guard.projected
+            };
+            sseWrite(res, 'tool-result', { toolCallId: call.id, result: blockedResult });
+            working.push({
+              role:         'tool',
+              tool_call_id: call.id,
+              content:      JSON.stringify(blockedResult)
+            });
+            continue;
+          }
+        }
+
         const result = await agentTools.dispatch({
           toolName: call.function.name,
           args,
