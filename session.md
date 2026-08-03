@@ -27,12 +27,12 @@ product ads and supersedes anything older in this file.
 - **`chrome` is the TITLING overlay**, burned in and correct. The Meta surface overlay
   (with Meta's per-surface CTA) is **PREVIEW ONLY** and must never be burned in.
 
-#### IN FLIGHT WHEN THIS WAS WRITTEN
-- **p7 concurrency consolidation — Grok RUNNING, will leave uncommitted edits.**
-  Spec: `/private/tmp/.../scratchpad/p7.md`. One `services/concurrency.js`, every knob
-  env-tunable, `RENDER_CONCURRENCY` 4→8, `VEO_CONCURRENCY` 1→4. **Verify before committing:**
-  Grok's 1 RPS must survive per-model-slug, and raising concurrency must not push renders
-  past `REAP_STALE_MIN` (reaper requeue = double bill).
+#### NEXT UP
+- **p7 concurrency — DONE and committed (`49589ba`).** `services/concurrency.js` is the
+  single declaration point; `RENDER_CONCURRENCY` 4→8, `VEO_CONCURRENCY` 1→4 (a probe, not a
+  resting place — Omni's real ceiling is still unmeasured). Grok's 1 RPS survives per-slug.
+  108-check harness, suite 20/20. **Still unverified:** whether a deeper pool can push a
+  render past `REAP_STALE_MIN` and trigger a reaper requeue = double bill. Check that next.
 - **p8 spec WRITTEN, not started:** `/private/tmp/.../scratchpad/p8-models-spec.md`.
   Grok is NOT a fallback (stays selectable); no automatic fallback anywhere
   (`allowFallback` default → false); model registry; OpenAI-direct + Gemini-direct as
