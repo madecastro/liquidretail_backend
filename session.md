@@ -321,6 +321,45 @@ the §0.2 vision QC "product fidelity vs original" check is for, and it is measu
 to dodge glyph mangling — test "$125"); and the product sat mid-frame leaving dead space
 instead of the requested lower-centre.
 
+### 0.296 TITLING "REGRESSION" — DIAGNOSED. A stale stored brand spec shadows canonical.
+
+Owner, on seeing the re-titled Allbirds render: *"We had really great titles going and now I am
+seeing scrim again"*, *"this is not the canonical titling we were using last"*, *"this font is
+incorrect"*. All three are correct. Mechanism, verified:
+
+**There is NO LLM in the live titling path.** `services/titleSpecService.js` has zero
+`chatCompletion` references. `resolveSpec` (`:121-162`) is purely deterministic:
+ 1. stored override docs — **ad > product > category > brand** (`:123-138`)
+ 2. pinned named preset `brand.titleStylePreset` (`:141-152`)
+ 3. canonical floor `remotion/presets/canonical.json` (`:155-161`)
+Title Studio (`aiLayoutStudioService.js:219`) DOES call an LLM, but it **persists** a
+`titleStyleSpec`; the renderer just replays that stored document.
+
+**The render logged `spec=brand`.** Per `:130-135` that tier only returns when
+`brand.titleStyleSpec[format]` exists AND validates. So Allbirds carries a persisted `vertical`
+spec that wins over everything below it.
+
+**Canonical is clean — proving the render was not canonical.** `remotion/presets/canonical.json`
+`byFormat.vertical` has `scrim: "none"` for every slot. The render HAS a heavy scrim, so it
+categorically did not use canonical. The `0e885c5` / `da1f2b4` "no-scrim cinema standard" is
+being bypassed for any brand holding a stored spec.
+
+**Where the good titles came from:** `remotion/presets/` holds CURATED per-brand presets —
+`soludos-mediterranean-editorial`, `soludos-summer-postcard`, `pelagic-bluewater-editorial`,
+`pelagic-offshore-bold`, `babyboo-editorial-monochrome`, `babyboo-main-character`. Allbirds has
+NO preset, so it never reaches tier 2 or 3.
+
+**THE STRUCTURAL BUG:** a persisted brand spec permanently shadows the canonical standard.
+Improving canonical reaches only brands with no stored override. Any brand frozen with an old
+spec keeps that look forever, silently. Needs a version/freshness stamp on stored specs so a
+stale one falls through, or an explicit "prefer canonical unless curated" rule.
+
+**Owner direction:** *"even the canonical titling is okay but use the right fonts and right
+positioning."* So the target is: reach CANONICAL (not the stale stored spec), with correct brand
+fonts (see §0.27 — Allbirds gets Inter because "Self Modern" matches no substitution) and better
+positioning. NOTE canonical's only anchor is `upperThird`, which is exactly the top-heavy layout
+measured in §0(c) — 26% of frame height unused. Positioning is a CANONICAL-level fix.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
