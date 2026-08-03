@@ -1,4 +1,4 @@
-// Operational alerting → Telegram.
+// Operational alerting → Slack (bot token + chat.postMessage).
 //
 // Why this exists: ad rendering (including every video generation) runs
 // in-process on the web service as a fire-and-forget loop after the HTTP
@@ -13,23 +13,40 @@
 // Contract — this module NEVER throws and NEVER blocks the caller:
 //   • every export is safe to call un-awaited from inside a render loop,
 //     a catch block, or a process-exit handler;
-//   • a missing token, a network failure, or a Telegram 4xx degrades to a
-//     console line, never to a rejected promise;
+//   • a missing token, a network failure, a Slack HTTP error, or
+//     Slack's {ok:false} on HTTP 200 degrades to a console line, never
+//     to a rejected promise;
 //   • notify() returns a promise only so callers who want to await
 //     delivery (the crash handlers, before exit) can.
 //
-// Secrets live in Render env only. TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+// Secrets live in Render env only. SLACK_BOT_TOKEN / SLACK_ALERT_CHANNEL
 // are read from process.env and never logged: the token appears solely in
-// the request URL, and everything printed on a failure path runs through
-// redact() first (a malformed-URL TypeError quotes the URL verbatim).
+// the Authorization header, and everything printed on a failure path runs
+// through redact() first.
+//
+// Failure payload contract (lockstep with GET /api/ads/render-activity):
+// that endpoint builds a pre-formatted `diagnostic` block
+// (routes/ads.js ~1662-1676). Callers that already have that string
+// SHOULD pass it as `detail` — buildMessage() drops it into the fenced
+// block with only size-clipping applied (no re-formatting, no second
+// schema). Do not invent a parallel field layout here; the activity
+// board is the source of truth for what an operator needs.
 
 const os = require('os');
 
 // ── config ───────────────────────────────────────────────────────────────────
 // Read lazily on every call so a Render env change takes effect on the next
 // process boot without any code branch caring about load order.
-const BOT_TOKEN = () => (process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const CHAT_ID   = () => (process.env.TELEGRAM_CHAT_ID   || '').trim();
+const BOT_TOKEN = () => (process.env.SLACK_BOT_TOKEN || '').trim();
+const CHANNEL   = () => (process.env.SLACK_ALERT_CHANNEL || '').trim();
+// Optional override for fatal; falls back to the main channel.
+const CHANNEL_FOR = (lvl) => {
+  if (lvl === 'fatal') {
+    const fatal = (process.env.SLACK_ALERT_CHANNEL_FATAL || '').trim();
+    if (fatal) return fatal;
+  }
+  return CHANNEL();
+};
 
 // Master switch. Default ON so that configuring the two secrets is the
 // only step needed; set ALERTS_ENABLED=false to mute without unsetting them.
@@ -46,7 +63,7 @@ const DEDUPE_WINDOW_MS = () =>
   Math.max(0, parseInt(process.env.ALERT_DEDUPE_WINDOW_MIN || '15', 10)) * 60 * 1000;
 
 // Absolute ceiling on outbound messages, independent of dedupe — protects
-// the channel (and Telegram's own 20 msg/min limit) if something goes wrong
+// the channel (and Slack's own rate limits) if something goes wrong
 // in a tight loop with varying keys.
 const RATE_LIMIT_MAX     = () => Math.max(1, parseInt(process.env.ALERT_RATE_LIMIT_MAX || '20', 10));
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -60,14 +77,13 @@ const INSTANCE  = () => (process.env.RENDER_INSTANCE_ID || os.hostname() || '?')
 
 const SEND_TIMEOUT_MS = () => Math.max(1000, parseInt(process.env.ALERT_SEND_TIMEOUT_MS || '8000', 10));
 
-// Telegram hard-caps a message at 4096 chars AND requires balanced HTML
-// tags under parse_mode=HTML. Both constraints are enforced by budgeting
-// the ESCAPED text (escaping can inflate 1 char into 5, so a pre-escape
-// budget guarantees nothing) and by never clipping the assembled string —
-// only the pieces that go inside a tag. A blind clip of the final message
-// would cut inside <pre>…</pre> and Telegram would 400 the whole thing.
-const TELEGRAM_MAX = 4096;
-const SAFETY_MARGIN = 64;   // room for the joins and the <pre> wrapper
+// Slack's text field allows far more, but alerts stay scannable. Budget the
+// ESCAPED text (escaping can inflate 1 char into 5) and never clip the
+// assembled string — only the pieces that go inside a wrapper. A blind clip
+// of the final message would cut inside a fenced code block and emit a
+// broken payload.
+const SLACK_MAX     = 4000;
+const SAFETY_MARGIN = 64;   // room for the joins and the ``` wrapper
 const MAX_FIELDS    = 12;   // caller-supplied; bound it so the head can't blow the budget
 const MAX_TITLE     = 200;
 const MAX_FIELD_VAL = 200;
@@ -103,9 +119,9 @@ function withinRateLimit() {
   return true;
 }
 
-// Telegram parse_mode=HTML accepts a small tag subset; everything else must
-// be escaped or the API rejects the whole message with a 400. Only these
-// three characters are special.
+// Slack mrkdwn treats &, <, > as control characters (links, mentions). They
+// must be entity-encoded when used as literal text. Do NOT carry over
+// Telegram HTML tags; Slack does not use parse_mode=HTML.
 function esc(v) {
   return String(v ?? '')
     .replace(/&/g, '&amp;')
@@ -127,14 +143,16 @@ function safeEsc(v, max) {
   return `${s.slice(0, Math.max(0, max - 1)).replace(/&[a-zA-Z]*$/, '')}…`;
 }
 
-// The token appears only in the request URL, never in a body or a field —
-// but a malformed-URL TypeError from fetch quotes the whole URL, which
-// would put the token in the log. Scrub it from anything we print.
+// The token appears only in the Authorization header — but a failed
+// request or a misconfigured logger can still echo it. Scrub every
+// known token shape from anything we print.
 function redact(text) {
   const token = BOT_TOKEN();
   let s = String(text ?? '');
   if (token && token.length > 4) s = s.split(token).join('<token>');
-  // Belt-and-braces: any bot<digits>:<secret> shape, in case of a variant.
+  // Slack bot / user / app tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-).
+  s = s.replace(/xox[baprs]-[A-Za-z0-9-]+/g, 'xox<redacted>');
+  // Legacy Telegram bot<digits>:<secret> shape, if it ever appears.
   return s.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>');
 }
 
@@ -164,55 +182,82 @@ function pruneDedupeState(now) {
 }
 
 // ── transport ────────────────────────────────────────────────────────────────
-async function sendTelegram(text) {
-  const token = BOT_TOKEN();
-  const chat  = CHAT_ID();
-  if (!token || !chat) return false;
+async function sendSlack(text, lvl) {
+  const token   = BOT_TOKEN();
+  const channel = CHANNEL_FOR(lvl);
+  if (!token || !channel) return false;
 
   // Node 20+ (package.json engines: >=20 <23) — global fetch, matching the
   // convention in httpScrapeClient / shopifyPublicIngestService.
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), SEND_TIMEOUT_MS());
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const res = await fetch('https://slack.com/api/chat.postMessage', {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        // buildMessage() already guarantees <= TELEGRAM_MAX with balanced
-        // tags; clipping here would be the thing that breaks them.
-        chat_id: chat,
-        text,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type':  'application/json; charset=utf-8'
+      },
+      body: JSON.stringify({
+        // buildMessage() already guarantees <= SLACK_MAX with balanced
+        // fences; clipping here would be the thing that breaks them.
+        channel,
+        text
+        // mrkdwn is the default for text; we escape & < > in user content.
       }),
       signal: ctl.signal
     });
+
+    // Rate limit: honour Retry-After by logging it, but NEVER sleep on a
+    // render path. Drop this delivery; notify() will release the dedupe
+    // slot and restore the held tally so the count is not lost.
+    if (res.status === 429) {
+      const ra = res.headers.get('retry-after') || res.headers.get('Retry-After') || '?';
+      console.warn(`🔔 alert: Slack 429 (Retry-After: ${ra}s) — dropping this delivery`);
+      return false;
+    }
+
+    // CRITICAL TRAP: Slack returns HTTP 200 with { ok: false, error: "..." }
+    // for logical failures (bad token, channel_not_found, not_in_channel,
+    // is_archived, …). A res.ok check alone reports success while nothing
+    // was delivered. Always parse the body and require ok === true.
+    let body = null;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+
     if (!res.ok) {
-      // Read the body for the reason (Telegram explains 400s clearly),
-      // redacted in case any variant echoes the token back.
-      const why = await res.text().catch(() => '');
-      console.warn(`🔔 alert: Telegram ${res.status} — ${redact(clip(why, 300))}`);
+      const why = body && (body.error || body) ? JSON.stringify(body) : `HTTP ${res.status}`;
+      console.warn(`🔔 alert: Slack ${res.status} — ${redact(clip(why, 300))}`);
+      return false;
+    }
+
+    if (!body || body.ok !== true) {
+      const errName = (body && body.error) ? String(body.error) : 'unknown (no ok field)';
+      console.warn(`🔔 alert: Slack ok=false — ${redact(clip(errName, 300))}`);
       return false;
     }
     return true;
   } catch (err) {
-    // A malformed-URL TypeError quotes the whole URL — which contains the
-    // token. redact() before this ever reaches a log.
     const why = err.name === 'AbortError' ? `timeout after ${SEND_TIMEOUT_MS()}ms` : err.message;
-    console.warn(`🔔 alert: Telegram send failed — ${redact(why)}`);
+    console.warn(`🔔 alert: Slack send failed — ${redact(why)}`);
     return false;
   } finally {
     clearTimeout(timer);
   }
 }
 
-// Assemble the outgoing HTML, budgeting the ESCAPED length so the result is
-// always <= TELEGRAM_MAX with every tag closed. The detail block gets
-// whatever room the header and fields leave over.
+// Assemble the outgoing mrkdwn, budgeting the ESCAPED length so the result
+// is always <= SLACK_MAX with every fence closed. The detail block gets
+// whatever room the header and fields leave over. When `detail` is a
+// pre-built diagnostic from render-activity, it is used as-is (after
+// safeEsc size-clipping only) — never re-parsed into a second schema.
 function buildMessage({ lvl, title, fields, detail, held }) {
   const lines = [
-    `${ICON[lvl]} <b>${safeEsc(title || '(no title)', MAX_TITLE)}</b>`,
-    `<code>${safeEsc(`${ENV_LABEL()}·${ROLE()}·${INSTANCE()}`, 120)}</code>`
+    `${ICON[lvl]} *${safeEsc(title || '(no title)', MAX_TITLE)}*`,
+    `\`${safeEsc(`${ENV_LABEL()}·${ROLE()}·${INSTANCE()}`, 120)}\``
   ];
 
   if (fields && typeof fields === 'object' && !Array.isArray(fields)) {
@@ -220,23 +265,24 @@ function buildMessage({ lvl, title, fields, detail, held }) {
     for (const [k, v] of Object.entries(fields)) {
       if (v === undefined || v === null || v === '') continue;
       if (++n > MAX_FIELDS) break;
-      lines.push(`${safeEsc(k, 60)}: <b>${safeEsc(v, MAX_FIELD_VAL)}</b>`);
+      lines.push(`${safeEsc(k, 60)}: *${safeEsc(v, MAX_FIELD_VAL)}*`);
     }
   }
 
   if (held && held.count > 0) {
     let since = '';
     try { since = new Date(held.since).toISOString().slice(11, 19); } catch { /* ignore */ }
-    lines.push('', `<i>+${Number(held.count) || 0} more${since ? ` since ${since}Z` : ''} (suppressed)</i>`);
+    lines.push('', `_+${Number(held.count) || 0} more${since ? ` since ${since}Z` : ''} (suppressed)_`);
   }
 
   const head = lines.join('\n');
-  if (!detail) return head.slice(0, TELEGRAM_MAX);
+  if (!detail) return head.slice(0, SLACK_MAX);
 
-  // '\n\n<pre>' + '</pre>' is 19 chars of wrapper.
-  const room = TELEGRAM_MAX - head.length - 19 - SAFETY_MARGIN;
-  if (room < 80) return head.slice(0, TELEGRAM_MAX);   // no useful space left
-  return `${head}\n\n<pre>${safeEsc(detail, room)}</pre>`;
+  // '\n\n```\n' + '\n```' is 10 chars of wrapper.
+  const FENCE_OVERHEAD = 10;
+  const room = SLACK_MAX - head.length - FENCE_OVERHEAD - SAFETY_MARGIN;
+  if (room < 80) return head.slice(0, SLACK_MAX);   // no useful space left
+  return `${head}\n\n\`\`\`\n${safeEsc(detail, room)}\n\`\`\``;
 }
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -246,7 +292,7 @@ function buildMessage({ lvl, title, fields, detail, held }) {
  * @param {object}  o
  * @param {'info'|'warn'|'error'|'fatal'} o.level
  * @param {string}  o.title   one-line summary
- * @param {string} [o.detail] free text (stack, message, counts) — escaped
+ * @param {string} [o.detail] free text (stack, message, diagnostic) — escaped for mrkdwn
  * @param {object} [o.fields] key→value lines rendered under the title
  * @param {string} [o.key]    dedupe key; defaults to level+title
  * @returns {Promise<boolean>} true if a message was actually delivered
@@ -259,13 +305,13 @@ async function notify({ level = 'warn', title, detail, fields, key } = {}) {
     if (LEVELS[lvl] < MIN_LEVEL()) return false;
 
     const token = BOT_TOKEN();
-    const chat  = CHAT_ID();
+    const chat  = CHANNEL();
     if (!token || !chat) {
       // One console line so a misconfigured deploy is diagnosable without
       // being noisy on every single call.
       if (!notify._warnedUnconfigured) {
         notify._warnedUnconfigured = true;
-        console.warn('🔔 alert: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — alerts disabled');
+        console.warn('🔔 alert: SLACK_BOT_TOKEN / SLACK_ALERT_CHANNEL not set — alerts disabled');
       }
       return false;
     }
@@ -298,7 +344,7 @@ async function notify({ level = 'warn', title, detail, fields, key } = {}) {
     const held = suppressed.get(dedupeKey);
     suppressed.delete(dedupeKey);
 
-    const ok = await sendTelegram(buildMessage({ lvl, title, fields, detail, held }));
+    const ok = await sendSlack(buildMessage({ lvl, title, fields, detail, held }), lvl);
     if (!ok) {
       // A failed send shouldn't hold the dedupe slot — a transient network
       // blip would otherwise silence this key for the whole window. Put the
@@ -328,8 +374,8 @@ function notifyAsync(opts) {
   Promise.resolve().then(() => notify(opts)).catch(() => {});
 }
 
-/** True when the two secrets are present — lets callers skip building payloads. */
-const isConfigured = () => Boolean(BOT_TOKEN() && CHAT_ID() && ENABLED());
+/** True when the Slack pair is present — lets callers skip building payloads. */
+const isConfigured = () => Boolean(BOT_TOKEN() && CHANNEL() && ENABLED());
 
 /** Test seam: clears dedupe + rate-limit state. Not used in production code. */
 function _resetState() {
@@ -348,5 +394,6 @@ module.exports = {
   _esc: esc, _clip: clip, _safeEsc: safeEsc, _redact: redact,
   _buildMessage: buildMessage, _resetState, _LEVELS: LEVELS,
   _stateSize: () => ({ lastSentAt: lastSentAt.size, suppressed: suppressed.size }),
-  _resetRateWindow: () => { windowStart = 0; windowCount = 0; rateLimitedNoted = false; }
+  _resetRateWindow: () => { windowStart = 0; windowCount = 0; rateLimitedNoted = false; },
+  _SLACK_MAX: SLACK_MAX
 };

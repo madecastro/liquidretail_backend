@@ -40,6 +40,7 @@ const { buildPreviewHtmlForAd }  = require('../services/adPreviewPageService');
 const registry = require('../services/templateRegistry');
 const alerts   = require('../services/alertService');
 const inFlight = require('../services/inFlight');
+const { adStage } = require('../services/adStage');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
@@ -588,13 +589,151 @@ router.post('/generate', async (req, res) => {
   }
 });
 
+// ── claimAdsForRun ────────────────────────────────────────────────────
+// THE claim sequence for POST /runs. Live handler and offline harness
+// both call this function. Data access is injected so the harness can
+// drive the exact same code path with an in-memory fake — not a parallel
+// model that drifts from production.
+//
+// Sequence (do not reorder; 422/anomaly before any 202):
+//   1. Atomic updateMany with status:'queued' (load-bearing — Atlas bills
+//      on submit; without this filter two concurrent /runs both render).
+//   2. Ownership re-read: status:'rendering' + campaignRunIds: runId.
+//   3. modifiedCount vs re-read cross-check (anomaly → release + error).
+//   4. Outcome: empty → 422; won → claimed set as renderIds/total.
+//
+// ads must expose:
+//   updateMany(filter, update) → Promise<{ modifiedCount: number }>
+//   find(filter)               → Promise<Array<{ _id }>>
+//   (optional, for harness completeness) countDocuments is NOT part of
+//   this function — the route uses it after a successful claim.
+
+/**
+ * @param {{
+ *   updateMany: (filter: object, update: object) => Promise<{modifiedCount?: number}>,
+ *   find: (filter: object) => Promise<Array<{_id: any}>>
+ * }} ads
+ * @param {{ selectedIds: any[], runId: string }} args
+ */
+async function claimAdsForRun(ads, { selectedIds, runId }) {
+  // ATOMIC CLAIM. `status: 'queued'` in the filter is load-bearing and
+  // is what makes this a claim rather than an announcement.
+  //
+  // selectAdsForRun reads queued ads, and this write marks them
+  // rendering. Without the status condition, between the read and the
+  // write a concurrent /runs (or a racing /generate) can select the SAME
+  // ads and claim them too — both runs then render them. Atlas bills
+  // image/video generation ON SUBMIT, so that is a straight double charge
+  // for one ad, with the second result overwriting the first. Two live
+  // frontend callers hit this endpoint; a double-clicked "render next
+  // batch" is enough.
+  //
+  // Conditioning on 'queued' means the loser's update matches nothing for
+  // that ad, so exactly one run can own it.
+  const writeResult = await ads.updateMany(
+    { _id: { $in: selectedIds }, status: 'queued' },
+    {
+      $addToSet: { campaignRunIds: runId },
+      $set:      { status: 'rendering', updatedAt: new Date() }
+    }
+  );
+  const modifiedCount = Number(writeResult && writeResult.modifiedCount) || 0;
+
+  // Re-read what we ACTUALLY won. updateMany's modifiedCount cannot tell
+  // us WHICH ids were claimed, and rendering an ad this run does not own
+  // is the double-charge we just closed. Ownership filters are load-bearing:
+  // gutting them to `{ _id: { $in: selectedIds } }` re-opens double-charge
+  // for the loser of a concurrent claim.
+  const claimedDocs = await ads.find({
+    _id: { $in: selectedIds },
+    status: 'rendering',
+    campaignRunIds: runId
+  });
+  const claimedById = new Set(
+    (Array.isArray(claimedDocs) ? claimedDocs : []).map((a) => String(a._id))
+  );
+  // Preserve selection order so renderIds is a stable subset of selectedIds.
+  const claimedIds = selectedIds
+    .map((id) => String(id))
+    .filter((id) => claimedById.has(id));
+
+  // Anomaly: the write reported success but the ownership re-read found
+  // nothing. Under primary reads + acknowledged writes this should never
+  // fire — if it does, the ads may sit in 'rendering' with this runId while
+  // the client is told "another run took them" (a lie that orphans them).
+  // Release best-effort, log loudly, return a confirmation error — NOT 422.
+  if (modifiedCount > 0 && claimedIds.length === 0) {
+    console.error(
+      `🚨 [campaignRun ${runId}] CLAIM ANOMALY: updateMany modifiedCount=${modifiedCount} ` +
+      `but ownership re-read returned 0 of ${selectedIds.length} selected id(s). ` +
+      `Releasing claim; client will not be told "another run took them".`
+    );
+    try {
+      await ads.updateMany(
+        { _id: { $in: selectedIds }, status: 'rendering', campaignRunIds: runId },
+        { $set: { status: 'queued', updatedAt: new Date() } }
+      );
+    } catch (releaseErr) {
+      console.error(
+        `🚨 [campaignRun ${runId}] CLAIM ANOMALY: failed to release after unconfirmed claim:`,
+        releaseErr
+      );
+    }
+    return {
+      kind: 'anomaly',
+      httpStatus: 500,
+      error: 'Claim could not be confirmed; nothing will be rendered',
+      createCampaignRun: false,
+      startRenderLoop: false,
+      total: 0,
+      renderIds: [],
+      claimedIds: [],
+      modifiedCount
+    };
+  }
+
+  if (!claimedIds.length) {
+    // Normal empty claim: write matched nothing, re-read confirms zero.
+    return {
+      kind: 'empty',
+      httpStatus: 422,
+      error: 'Selected ads were claimed by another run; nothing left to render',
+      createCampaignRun: false,
+      startRenderLoop: false,
+      total: 0,
+      renderIds: [],
+      claimedIds: [],
+      modifiedCount
+    };
+  }
+
+  // CLAIMED count — not selectedIds.length. A partial claim must not
+  // advertise or render ads this run lost. renderIds MUST come from the
+  // re-read; aliasing back to selectedIds is a double-charge regression.
+  return {
+    kind: 'ok',
+    httpStatus: 202,
+    createCampaignRun: true,
+    startRenderLoop: true,
+    total: claimedIds.length,
+    renderIds: claimedIds,
+    claimedIds,
+    modifiedCount
+  };
+}
+
 // POST /api/ads/runs
 // Body: { campaignId }
 // "Generate more from this campaign" — picks the next N queued ads
 // and renders them in a new CampaignRun. No re-queueing; just drains
 // inventory that expandWizardJob already created.
 // Response: 202 Accepted { campaignRunId, total, queuedRemaining, status }
+//           422 if selection was empty OR the atomic claim won nothing
 router.post('/runs', express.json(), async (req, res) => {
+  // Tracks ads this request successfully claimed so the catch can release
+  // them if a later step throws (countDocuments / CampaignRun.create).
+  // Without that, ads sit status:'rendering' with nobody rendering them.
+  let claimedIds = [];
   try {
     const { campaignId } = req.body || {};
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
@@ -609,14 +748,10 @@ router.post('/runs', express.json(), async (req, res) => {
     const campaign = await Campaign.findById(campaignId).lean();
     if (!campaign) return res.status(404).json({ error: 'campaign not found' });
 
-    const adIds = await selectAdsForRun({ campaignId, limit: MAX_CREATIVES_PER_RUN });
-    if (!adIds.length) {
+    const selectedIds = await selectAdsForRun({ campaignId, limit: MAX_CREATIVES_PER_RUN });
+    if (!selectedIds.length) {
       return res.status(422).json({ error: 'No queued ads remaining for this campaign' });
     }
-
-    const queuedRemaining = Math.max(0,
-      (await Ad.countDocuments({ campaignId, status: 'queued' })) - adIds.length
-    );
 
     const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 
@@ -632,20 +767,43 @@ router.post('/runs', express.json(), async (req, res) => {
       { expiresIn: '1h' }
     );
 
-    await Ad.updateMany(
-      { _id: { $in: adIds } },
+    // Live Ad model adapter — same function the offline harness drives
+    // with an in-memory fake. Do not inline a second claim path here.
+    const claim = await claimAdsForRun(
       {
-        $addToSet: { campaignRunIds: runId },
-        $set:      { status: 'rendering', updatedAt: new Date() }
-      }
+        updateMany: (filter, update) => Ad.updateMany(filter, update),
+        find: (filter) => Ad.find(filter).select('_id').lean()
+      },
+      { selectedIds, runId }
     );
+
+    // Claim + empty-claim 422 / anomaly MUST complete before the 202 is
+    // flushed — once we respond 202 we cannot take it back.
+    if (claim.kind === 'anomaly') {
+      return res.status(claim.httpStatus).json({ error: claim.error });
+    }
+    if (claim.httpStatus === 422) {
+      return res.status(422).json({ error: claim.error });
+    }
+
+    claimedIds = claim.claimedIds;
+    if (claimedIds.length !== selectedIds.length) {
+      console.warn(
+        `⚠️  [campaignRun ${runId}] /runs claimed ${claimedIds.length}/${selectedIds.length} ad(s) — ` +
+        `the rest were taken by a concurrent run`
+      );
+    }
+
+    // Recompute AFTER the claim so we don't subtract ads we never owned
+    // (and so concurrent winners are reflected in the remainder).
+    const queuedRemaining = await Ad.countDocuments({ campaignId, status: 'queued' });
 
     const run = await CampaignRun.create({
       runId,
       brandId:      String(campaign.brandId),
       campaignId:   String(campaign._id),
       campaignKind: campaign.kind || 'promotional',
-      total:        adIds.length,
+      total:        claim.total,
       status:       'running',
       requestedBy:  req.user?.userId || null,
       startedAt:    new Date()
@@ -656,31 +814,35 @@ router.post('/runs', express.json(), async (req, res) => {
       campaignId:      String(campaign._id),
       brandId:         String(campaign.brandId),
       campaignKind:    campaign.kind || 'promotional',
-      total:           adIds.length,
+      total:           claim.total,
       queuedRemaining,
       status:          'running'
     });
 
     // Reuse the same runRenderLoop. job arg only carries the brand /
     // campaign metadata renderOne needs to thread into renderCreative.
+    // Render ONLY claim.renderIds — never the pre-claim selection.
+    // (Aliasing renderIds = selectedIds is a double-charge regression the
+    // harness is designed to fail on.)
+    const renderIds = claim.renderIds;
     const job = {
       brandId:      String(campaign.brandId),
       campaignId:   String(campaign._id),
       campaignKind: campaign.kind || 'promotional'
     };
     setImmediate(() => {
-      runRenderLoop(run, job, adIds, renderToken).catch(err => {
+      runRenderLoop(run, job, renderIds, renderToken).catch(err => {
         console.error(`❌ campaign run ${runId} crashed:`, err);
         inFlight.untrack(runId);
         alerts.notifyAsync({
           level: 'error',
           title: 'Campaign run crashed (queued drain)',
           key:   'run-crash:runs',
-          fields: { run: runId, campaign: String(campaign._id), ads: adIds.length, error: err.message || String(err) },
+          fields: { run: runId, campaign: String(campaign._id), ads: renderIds.length, error: err.message || String(err) },
           detail: err.stack || null
         });
         Ad.updateMany(
-          { _id: { $in: adIds }, status: 'rendering' },
+          { _id: { $in: renderIds }, status: 'rendering' },
           { $set: { status: 'queued', updatedAt: new Date() } }
         ).catch(() => {});
         CampaignRun.updateOne(
@@ -691,7 +853,26 @@ router.post('/runs', express.json(), async (req, res) => {
     });
 
   } catch (err) {
+    // Mirror /generate: a post-claim throw must release the lock this
+    // request took and then failed to use. Without requeue, ads sit
+    // status:'rendering' with this runId until the reaper (~15 min) flips
+    // them to 'queued' — and nothing auto-drains that queue. Guard the
+    // requeue so a failure there cannot mask the original error.
     console.error('ads runs (queued drain) failed:', err);
+    if (claimedIds.length) {
+      try {
+        await Ad.updateMany(
+          { _id: { $in: claimedIds }, status: 'rendering' },
+          { $set: { status: 'queued', updatedAt: new Date() } }
+        );
+      } catch (requeueErr) {
+        console.error(
+          `ads runs: failed to requeue ${claimedIds.length} claimed ad(s) after error ` +
+          `(original: ${err && err.message ? err.message : err}):`,
+          requeueErr
+        );
+      }
+    }
     res.status(500).json({ error: err.message || 'ads runs failed' });
   }
 });
@@ -923,23 +1104,6 @@ async function renderOne(run, job, adId, index, renderToken) {
   }
 }
 
-/**
- * Record which stage a specific ad is in, so an operator can read one assetId's
- * state instead of grepping logs for it.
- *
- * FIRE-AND-FORGET BY CONTRACT. Not awaited, and a failed write is swallowed.
- * This is telemetry on a path where Atlas has already been billed; a Mongo blip
- * must never be able to fail a paid render. The trade is that a stage can be
- * missed under load — acceptable, because the next transition overwrites it and
- * the terminal status is written by the real persist path, not by this.
- */
-function adStage(adId, stage) {
-  Ad.updateOne(
-    { _id: adId },
-    { $set: { renderStage: stage, renderStageAt: new Date(), updatedAt: new Date() } }
-  ).catch(() => {});
-}
-
 async function renderOneInner(run, job, adId, index, renderToken) {
   // Fetch the queued Ad doc and shape it into the request the
   // render service expects. The doc carries everything the old
@@ -1028,13 +1192,30 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // The billable one. Named so the status screen says exactly what is
         // being paid for, and so a stall here is distinguishable from a stall in
         // titling or upload.
+        // Submit/poll stages are owned by atlasVideoService (piggybacked on
+        // the existing poll tick). This outer label is the pre-enter marker
+        // so a stall before the service even runs is still visible.
         adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
         const veoResult = await veoGenerateForAd({ ad, storyboard });
         if (veoResult.skipped) {
+          // Previously re-queued forever with no reason on the Ad — the board
+          // showed "rendering" until the reaper, and the next Generate billed
+          // again for a provider that is still off. Terminal + reason so the
+          // operator can fix the key/config and regen deliberately.
+          const skipMsg = veoResult.reason || 'video generation skipped (provider disabled or unconfigured)';
           await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
           await Ad.updateOne(
             { _id: adId },
-            { $set: { status: 'queued', updatedAt: new Date() } }  // re-queues for next run when Veo is enabled
+            {
+              $set: {
+                status: 'failed',
+                renderError: { message: skipMsg, stage: 'veo-skipped', at: new Date() },
+                renderStage: `skipped: ${skipMsg}`.slice(0, 200),
+                renderStageAt: new Date(),
+                updatedAt: new Date()
+              },
+              $inc: { renderAttempts: 1 }
+            }
           );
           return;
         }
@@ -1047,10 +1228,14 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         veoReferenceImages    = veoResult.referenceImages || [];
       }
 
-      // Stamp the video URL + Ad state. Done BEFORE the brand-script
-      // overlay so a composite failure still leaves a viewable ad
-      // (raw Grok video or Cloudinary segment). Composite overwrites
-      // renderUrl/posterUrl/cloudinaryPublicId on success.
+      // Stamp the master video URL BEFORE titling so a titling failure still
+      // leaves a viewable, paid-for asset. status:'draft' here is a MONEY
+      // guard (the reaper only requeues status:'rendering' — leaving the ad
+      // in rendering after a paid Omni submit is a double-bill hole if the
+      // process dies mid-titling). It is NOT a success claim: the run's
+      // succeeded counter and the clean "done" stage only move after
+      // titling finishes (or no-chrome ships the master deliberately).
+      // CLAUDE.md §00 step 4: title each surface is required of the pipeline.
       const fallbackPosterUrl = veoVideoUrl?.includes('/video/upload/')
         ? veoVideoUrl
             .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good/')
@@ -1060,6 +1245,8 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         { _id: adId },
         {
           $set: {
+            // draft = asset exists and is not requeueable. Titling still pending
+            // is visible via renderStage; failure flips status to 'failed'.
             status:             'draft',
             kind:               'video',
             veoVideoUrl,
@@ -1079,13 +1266,13 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         }
       );
 
-      // Stage 3 — brand-script canvas overlay. Resolver picks the right
-      // script based on the ad's format (vertical vs feed) and the
-      // brand's per-format opt-ins. When no chrome is configured for
-      // this format, the resolver returns cleanly and the raw Grok
-      // video (already stamped as renderUrl in Stage 2.5) is the final
-      // output. Failure is non-fatal for the same reason.
+      // Stage 3 — brand-script canvas overlay (titling). Resolver picks the
+      // right script based on the ad's format. When no chrome is configured,
+      // the raw master is the final deliverable and counts as success.
+      // Titling failure is NO LONGER counted as success: the master is kept
+      // (paid for), but the outcome is "master rendered, titling failed".
       const adFinal = await Ad.findById(adId).lean();
+      let titlingFailed = null;
       if (brandDoc) {
         try {
           const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
@@ -1094,13 +1281,58 @@ async function renderOneInner(run, job, adId, index, renderToken) {
           // overlay, so "titling 1:1" and "master video generation" being
           // distinct is what makes a stall attributable.
           adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '9:16'}`);
-          await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+          const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+          // no-chrome is intentional success (raw master is the deliverable).
+          if (chromeOut?.skipped) {
+            adStage(adId, `no titling (${chromeOut.reason || 'no-chrome'}) — shipping master`);
+          }
         } catch (scriptErr) {
-          console.warn(`⚠️ brandScript[ad=${adId}]: failed (non-fatal) — ${scriptErr.message}`);
+          titlingFailed = scriptErr;
+          console.warn(
+            `⚠️ brandScript[ad=${adId}]: titling failed — master kept, not counted as success: ${scriptErr.message}`
+          );
         }
       }
 
-      await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
+      if (titlingFailed) {
+        const tmsg = `master rendered; titling failed: ${titlingFailed.message || titlingFailed}`;
+        await Ad.updateOne(
+          { _id: adId },
+          {
+            $set: {
+              // Keep renderUrl = raw master. Do not delete the paid asset.
+              status: 'failed',
+              renderError: { message: tmsg, stage: 'titling', at: new Date() },
+              renderStage: 'master rendered; titling failed',
+              renderStageAt: new Date(),
+              updatedAt: new Date()
+            }
+          }
+        );
+        await CampaignRun.updateOne(
+          { _id: run._id },
+          {
+            $inc:  { failed: 1 },
+            $push: { errors: buildErrorEntry(creative, index, 'titling', titlingFailed) }
+          }
+        );
+      } else {
+        // Title landed (or no chrome / no brand). Promote to draft now.
+        // Soft notes written mid-pipeline (face-crop skip etc.) stay on
+        // renderError so the board still shows "what degraded" after ship.
+        await Ad.updateOne(
+          { _id: adId },
+          {
+            $set: {
+              status:     'draft',
+              renderedAt: new Date(),
+              updatedAt:  new Date()
+            }
+          }
+        );
+        await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
+        adStage(adId, 'done');
+      }
     } catch (err) {
       console.error(`❌ veoReference[ad=${adId}]:`, err.message || err);
       // Video is the expensive, slow, vendor-dependent stage — the one
@@ -1189,8 +1421,27 @@ async function renderOneInner(run, job, adId, index, renderToken) {
 
     if (result.status === 'success') {
       await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
+      adStage(adId, 'done');
     } else if (result.status === 'skipped') {
+      // Template validation (and similar) used to leave the Ad in
+      // status:'rendering' with no renderError — the run's skipped counter
+      // moved but the board / reaper saw a still-in-flight asset. Terminal
+      // state + reason so a human can decide what to change before a regen.
+      const skipMsg = result.skipReason || 'skipped';
       await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
+      await Ad.updateOne(
+        { _id: adId },
+        {
+          $set: {
+            status: 'failed',
+            renderError: { message: skipMsg, stage: 'validate', at: new Date() },
+            renderStage: `skipped: ${skipMsg}`.slice(0, 200),
+            renderStageAt: new Date(),
+            updatedAt: new Date()
+          },
+          $inc: { renderAttempts: 1 }
+        }
+      );
     } else {
       await CampaignRun.updateOne(
         { _id: run._id },
@@ -2414,3 +2665,5 @@ function projectAd(ad, full = false, extras = {}) {
 }
 
 module.exports = router;
+// Live claim function — offline harness drives THIS (scripts/verifyRunsClaim.js).
+module.exports.claimAdsForRun = claimAdsForRun;

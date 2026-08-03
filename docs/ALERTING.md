@@ -1,4 +1,4 @@
-# Operational alerting → Telegram
+# Operational alerting → Slack
 
 Push alerts for crashes, dropped work, stalled runs, and spend spikes.
 Implemented in `services/alertService.js` (transport + dedupe),
@@ -6,14 +6,17 @@ Implemented in `services/alertService.js` (transport + dedupe),
 `services/backlogWatchdog.js` (periodic health sweep), and
 `services/inFlight.js` (what a shutdown is about to destroy).
 
+Transport is **Slack via bot token** (`chat.postMessage`). Telegram is
+removed; there is no live fallback.
+
 ## Why this exists — the failure it was built to expose
 
 Ad rendering, **including every paid video generation**, does not run on a
 durable queue. `POST /api/ads/generate` and `POST /api/ads/runs` flush a
 `202 Accepted` and then run `runRenderLoop` in a `setImmediate` **inside the
 web service process** (`routes/ads.js`). Video ads run at
-`VEO_CONCURRENCY=1`, roughly a minute per ad, so a 20-ad batch occupies that
-process for 25–35 minutes.
+`VEO_CONCURRENCY` concurrent Omni submits, so a large batch occupies that
+process for a long time.
 
 That process does not survive that long reliably:
 
@@ -38,21 +41,52 @@ architecture** — see *Known gap* at the end.
 
 ## Setup
 
-Two secrets, set in **Render env only** (never committed; `.env.example`
-lists the names, `config/defaults.env` holds only non-secret tuning):
+**Exactly one secret.** Everything else is committed config.
 
-| Var | How to get it |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Message [@BotFather](https://t.me/BotFather) → `/newbot` → it replies with the token |
-| `TELEGRAM_CHAT_ID` | Send the new bot any message, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `result[0].message.chat.id`. For a group: add the bot to the group, post once, same call — **group ids are negative** |
+| Var | Where it lives | How to get it |
+|---|---|---|
+| `SLACK_BOT_TOKEN` | **Render env only** — never committed | [api.slack.com/apps](https://api.slack.com/apps) → Create app → **OAuth & Permissions** → Bot Token Scopes: `chat:write` (and `chat:write.public` if you post to channels the bot is not in) → Install to workspace → copy the **Bot User OAuth Token** (`xoxb-…`) |
+| `SLACK_ALERT_CHANNEL` | `config/defaults.env` (committed) | Channel id (`C…`) or `#name`. Invite the bot (`/invite @YourBot`) unless you granted `chat:write.public` |
+| `SLACK_ALERT_CHANNEL_FATAL` | `config/defaults.env` (committed) | Optional. Separate channel for `fatal` only; defaults to `SLACK_ALERT_CHANNEL` |
 
-Set both on **both** services (`liquidretail_backend` web *and* worker) —
-they alert about different things. Until both are present alerting stays
-silently disabled; the worker logs which state it is in at boot:
+**Why the channels are committed and the token is not.** A channel id or
+`#name` discloses nothing and is useless without the token, so it belongs
+with every other non-secret public id in `config/defaults.env` — which
+makes "where do alerts go" a reviewable diff instead of an untracked
+dashboard edit that no one can archaeology later. Real env is still loaded
+FIRST and dotenv never overrides an already-set var, so a single service
+can still be pointed at a different channel from the Render dashboard
+without a deploy.
 
-```
-🔔 alerts: Telegram configured; watchdog every 5m
-```
+Set the **token** on **both** services (`liquidretail-backend` web *and*
+the background worker) — they alert about different things, and the worker
+is where the stalled-render sweep and the orphan reaper live, so a token on
+the web service alone leaves the most important alerts silent.
+
+Until `SLACK_BOT_TOKEN` is set, alerting stays **silently disabled** (one
+console line on the first attempt, then quiet). The worker still logs
+configured-vs-not at boot (that string may still say "Telegram" until a
+follow-up pass retitles it; `isConfigured()` already means Slack).
+
+### Critical API trap — `ok:false` on HTTP 200
+
+Slack's Web API returns **HTTP 200** with a JSON body
+`{ "ok": false, "error": "channel_not_found" }` (or `invalid_auth`,
+`not_in_channel`, `is_archived`, …) for logical failures. Checking only
+`response.ok` reports success while **nothing was delivered**.
+
+`sendSlack()` always parses the JSON body and requires `ok === true`. An
+`ok:false` result is a **failed send**: the dedupe slot is released and
+any held suppressed tally is restored, so a bad channel or token does not
+silence a key for the whole dedupe window. Covered by
+`scripts/verifySlackAlert.js` (revert-proven).
+
+### Rate limits
+
+HTTP **429** with a `Retry-After` header (seconds) is honoured by
+**logging** the value and **dropping that delivery** — the alert path
+never sleeps on a render thread waiting for Slack. Same failed-send
+semantics (slot released, tally kept).
 
 ## What fires
 
@@ -76,6 +110,23 @@ silently disabled; the worker logs which state it is in at boot:
 `MAX_CREATIVES_PER_RUN` (20) drains in one run, so that count is normal
 inventory, not a fault. It is carried as *context* on the alerts above.
 
+## Failure payload — lockstep with render-activity
+
+`GET /api/ads/render-activity` builds a pre-formatted `diagnostic` block
+(`routes/ads.js` ~1662–1676) with the fields an operator needs without
+SSH: asset id, status/stage, kind/format/aspect, pipeline/model,
+predictionId, timings, run/product/media, error, asset URL.
+
+`alertService` does **not** own a second schema. Callers pass:
+
+- `fields` — short key→value lines under the title (free-form, capped)
+- `detail` — free text dropped into a fenced code block
+
+When a caller already has the activity-board `diagnostic` string, pass it
+as `detail`; `buildMessage()` uses it **verbatim** (only size-clipped via
+`safeEsc`, never re-parsed). That is how the two stay from drifting: one
+builder (render-activity), one envelope (alertService).
+
 ## Tuning
 
 Non-secret, all in `config/defaults.env`, all overridable per-service:
@@ -88,10 +139,11 @@ Non-secret, all in `config/defaults.env`, all overridable per-service:
 | `ALERT_RATE_LIMIT_MAX` | `20` | Hard ceiling per minute, independent of dedupe |
 | `ALERT_WATCHDOG_INTERVAL_MIN` | `5` | Health-sweep cadence |
 | `ALERT_RENDERING_STALE_MIN` | `12` | **Keep below `REAP_STALE_MIN` (15)** |
-| `ALERT_RUN_STALE_MIN` | `45` | A 20-ad video batch legitimately runs 25–35 min |
+| `ALERT_RUN_STALE_MIN` | `45` | A 20-ad video batch legitimately runs a long time |
 | `ALERT_DETECT_BACKLOG_COUNT` / `_MIN` | `25` / `20` | Both must trip |
 | `ALERT_HOURLY_SPEND_USD` | `25` | See spend note below |
 | `ALERT_EXIT_FLUSH_MS` | `2500` | Bounded window to deliver one message before exit |
+| `ALERT_SEND_TIMEOUT_MS` | `8000` | Abort a hung Slack POST |
 
 ### Spend note
 
@@ -112,9 +164,10 @@ charged".
 
 - **Never throws.** Every export is safe to call un-awaited from a catch
   block, a `.finally()`, or a signal handler. A missing token, a network
-  failure, or a Telegram 4xx degrades to one `console.warn`. This matters
-  more than usual now: with an `unhandledRejection` handler installed, an
-  alerting path that rejected would kill the process it exists to watch.
+  failure, an HTTP error, or Slack `{ok:false}` degrades to one
+  `console.warn`. This matters more than usual: with an
+  `unhandledRejection` handler installed, an alerting path that rejected
+  would kill the process it exists to watch.
 - **Exit semantics are unchanged.** Attaching a listener suppresses Node's
   default disposition, so each handler restores it: crashes `exit(1)` from a
   `finally` (unconditional, even if the handler itself throws), and
@@ -124,13 +177,25 @@ charged".
 - **Bounded memory.** Dedupe keys embed error-message fragments, so their
   cardinality is unbounded; `pruneDedupeState` evicts past-window entries and
   caps the maps at 500.
-- **The token never reaches a log.** It appears only in the request URL. A
-  malformed-URL `TypeError` quotes that URL, so everything printed goes
-  through `redact()` first.
-- **Telegram-safe payloads.** Escaping is applied *before* clipping, so the
-  4096 limit is a real character budget, and only the text *inside* a tag is
-  ever truncated — a blind clip of the assembled message would cut through
-  `<pre>…</pre>` and Telegram would reject the whole alert.
+- **The token never reaches a log.** It appears only in the `Authorization`
+  header. `redact()` scrubs the configured token plus any `xoxb-`/`xoxp-`
+  (etc.) shape before printing.
+- **Slack-safe payloads.** `&`, `<`, `>` are entity-encoded for mrkdwn
+  *before* clipping, so the size budget is real, and only the text *inside*
+  a fenced code block is ever truncated — a blind clip of the assembled
+  message would cut through ` ``` ` fences and emit a broken payload.
+- **Inert when unconfigured.** No token → `notify()` returns false, does
+  not throw, does not call Slack, and warns at most once per process.
+
+## Offline verify
+
+```bash
+node scripts/verifySlackAlert.js
+```
+
+Covers: unconfigured silence, `ok:false` on 200 as failed send (dedupe +
+tally), 429 non-blocking, dedupe fold, rate limit, `xoxb-` redaction,
+balanced fences at the size limit.
 
 ## Known gap this does not close
 
@@ -144,8 +209,9 @@ POST) and is deliberately not bundled here.
 
 Interim mitigations, cheapest first:
 
-1. **Run video batches smaller.** `MAX_CREATIVES_PER_RUN=20` at ~1 min/ad is
-   a 25–35 minute exposure window. Lower it and each loss is smaller.
+1. **Run video batches smaller.** `MAX_CREATIVES_PER_RUN=20` at concurrent
+   Omni still leaves a long exposure window on the web process. Lower it
+   and each loss is smaller.
 2. **Pin the web service to one instance** (autoscaling `max: 1`) so
    scale-in stops being a cause. Deploys still are.
 3. Deploy when nothing is rendering — now observable, because SIGTERM alerts

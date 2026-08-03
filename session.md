@@ -2,10 +2,20 @@
 
 ## Next-session prompt
 
-### PICK UP HERE (2026-08-02, late) — everything below is COMMITTED, nothing pushed
+### PICK UP HERE (2026-08-02) — render stages work is UNCOMMITTED on top of prior unpushed stack
 
-Branch `feat/render-activity-board`. **11 commits, zero pushed, zero deployed.**
-Live prod still runs `a80ae0b`. All **19** `scripts/verify*.js` green.
+Branch `feat/render-activity-board`. Prior commits still unpushed. Live prod still
+`a80ae0b`. Verify suite now **23** scripts (incl. `verifyRenderStages` + `verifyRunsClaim`).
+
+**UNCOMMITTED (this session):** close the status blind spot on both render paths —
+`services/adStage.js` extracted; static + video stage vocabulary; Task 3 terminal
+reasons; Task 4 titling-fail not counted as success. **Do not touch the uncommitted
+`claimAdsForRun` money fix in `routes/ads.js`** (verifyRunsClaim 67/67).
+
+### PRIOR (2026-08-02, late) — everything below is COMMITTED, nothing pushed
+
+Branch `feat/render-activity-board`. Prior commits, zero pushed, zero deployed.
+Live prod still runs `a80ae0b`.
 
 | commit | what |
 |---|---|

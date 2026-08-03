@@ -28,6 +28,7 @@ const registry              = require('./templateRegistry');
 const { buildLayoutInput }  = require('./layoutInputService');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const { buildVideoCompositeUrl } = require('./videoCompositeService');
+const { adStage } = require('./adStage');
 
 // Templates whose canvas variants have a clean media slot (kind:'media',
 // slot:'product.hero_media'). Only these templates render as video in V1
@@ -82,6 +83,7 @@ async function renderCreative(req) {
   // 1. derive — build / load the LayoutInputArtifact
   let input, layoutInputArtifactId;
   try {
+    adStage(req.adId, 'deriving layout');
     const t = Date.now();
     const r = await deriveStage(req);
     input = r.input;
@@ -90,6 +92,12 @@ async function renderCreative(req) {
     console.log(`   📐 ${tag} derive ok in ${stages.derive}ms (artifact=${layoutInputArtifactId || 'none'})`);
   } catch (err) {
     console.error(`   ❌ ${tag} derive: ${err.message || err}`);
+    // Persist reason so the board / regen path see more than console silence.
+    // Terminal status is written by the caller (routes/ads) from failed().
+    if (req.adId) {
+      const { noteRenderIssue } = require('./adStage');
+      noteRenderIssue(req.adId, { message: err.message || String(err), stage: 'derive' });
+    }
     return failed(jobId, 'derive', err);
   }
 
@@ -104,6 +112,7 @@ async function renderCreative(req) {
     }
     const reason = `template validation: ${reasons.join('; ') || 'unknown'}`;
     console.log(`   ⏭️  ${tag} skipped — ${reason}`);
+    adStage(req.adId, `skipped: ${reason}`.slice(0, 200));
     return { jobId, status: 'skipped', skipReason: reason };
   }
 
@@ -137,7 +146,7 @@ async function renderCreative(req) {
     } catch (_) { /* default to V1 path */ }
   }
 
-  // 4. render — Puppeteer screenshot
+  // 4. render — Puppeteer screenshot / direct image
   let renderOutput;
   try {
     const t = Date.now();
@@ -148,6 +157,7 @@ async function renderCreative(req) {
       expectedKind: req.creative.expectedKind,
       mediaId:      req.creative.mediaId,
       brandId:      req.brandId,
+      adId:         req.adId || null,
       authToken:    req.authToken || null,
       renderMode:   'static',
       // V2 routing — only set when the campaign opted in. The legacy
@@ -215,6 +225,7 @@ async function renderCreative(req) {
   // composite URL that layers it over the cropped source video.
   let upload;
   try {
+    adStage(req.adId, 'uploading static');
     const t = Date.now();
     upload = await uploadStage(renderOutput, {
       brandId:          req.brandId,
@@ -240,6 +251,7 @@ async function renderCreative(req) {
   // 6. persist — Ad doc
   let ad;
   try {
+    adStage(req.adId, 'persisting static');
     const t = Date.now();
     ad = await persistStage({
       req,
