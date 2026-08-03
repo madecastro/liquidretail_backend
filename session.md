@@ -4,188 +4,117 @@
 
 _(empty — no pending owner prompt)_
 
-### PICK UP HERE (2026-08-02) — Director contract + per-product reasons (UNCOMMITTED)
+### PICK UP HERE — 2026-08-03, everything below is MERGED AND LIVE on `main`
 
-Branch `fix/surface-per-product-reasons` off `main`. Verify suite **25**
-scripts; `verifyConceptContract` **125/125** after fix round.
+Live prod = **`13cf679`** on both services (web `srv-d1vuktqli9vc73ft07ng`,
+worker `srv-d8128c1o3t8c73e8kb30`). Verify suite **28 scripts, all green**.
 
-**UNCOMMITTED:**
+Today closed a day-long gap where prod ran `a80ae0b` while 24 fixes sat
+unpushed — so every QC observation before this session was made against the
+WRONG BINARY. Re-QC anything you read in an older section of this file.
 
-1. **Per-product expand reasons** (prior on this branch) — thread expansion
-   `perProduct` skip reasons through `CampaignRun` + `GET /runs/:runId`.
-2. **Director v3 contract fix (generation behaviour change):**
-   - Consumer dual-reads `routing.media_picks` / flat via shared
-     `conceptField` / `conceptMediaPicks` in `conceptProjection.js`.
-     Root cause of zero-ads AllBirds run (every v3 concept discarded).
-   - Same helper wired through Judge, HTML isV2 detect, veoStoryboard,
-     and the Director's own dual-reads.
-   - `DIRECTOR_UNIVERSE_TOP_N` default **10 → 1** (hero only); ceiling 10
-     stays; operator multi-select still widens via `Math.max(mediaIds.length, TOP_N)`.
-     Knob in `config/defaults.env`.
-   - Pathological `concepts>0 && payloads===0` → per-product reason
-     `concepts_no_usable_media` + Slack `alertService.error`.
-3. **Fix round (adversarial #1 agreed) — still uncommitted:**
-   - `conceptMediaPicks` restored true `Array.isArray` order (non-array
-     nested falls through to flat; empty nested `[]` still wins).
-   - Judge: `media_utilization` N/A when universe size ≤ 1 (prompt +
-     score-axis exclusion via `seededUniverse` → `universeIds.length`).
-   - Director shape menu: `feedOutputShapesForUniverse` narrows to
-     `static_single` when universe < 2 (prompt + schema enum).
-   - V1 `validateConcepts` dual-reads via `conceptField`.
-   - Harness grew 87 → 125: C7 non-array fallthrough (revert-proven),
-     falsy nested `conceptField` fixtures, exhaustive services/routes
-     flat-read scan with documented allowlist.
+#### THE HEADLINE BUG — generation produced ZERO ads, and now doesn't
 
-Not committed/pushed/deployed.
+The Director's schema moved `media_picks` under `routing` (v3). The producer
+**dual-reads** both shapes, so its own validator was satisfied and logged
+`warnings=0` while everything it produced was discarded downstream. **Six**
+consumers still read the flat v2 location; only one failed loudly:
 
-### PRIOR (2026-08-02, late) — everything below is COMMITTED, nothing pushed
-
-Branch `feat/render-activity-board`. Prior commits, zero pushed, zero deployed.
-Live prod still runs `a80ae0b`.
-
-| commit | what |
+| consumer | effect |
 |---|---|
-| `c4bbb12` | Phase 0 — ReferenceError that broke every fresh Director round |
-| `53f6486` | Director reasoning quarantined from image prompts (110-check harness) |
-| `919627a` `e3e1578` `d038053` | Presets: platform-grouped, Google frozen, coming_soon → 400 |
-| `ccf4328` | **The video model is OMNI, not Veo** — corrected + 2 stale claims |
-| `30b21d9` `a1dca08` | CLAUDE.md **§00** — the catalog pipeline, written down |
-| `01e7d1c` | Three doors to the old renderer closed; **image regenerate fixed** |
+| `campaignAdsGenerationService` (media_picks) | every concept dropped → **zero ads** |
+| `campaignAdsGenerationService` (creative_style) | style lost |
+| `aiJudgeService` ×2 | judge ranking concepts with fields it could not see |
+| `aiCanvasHtmlGeneratorService` | v2 detect + id resolve wrong |
+| `veoStoryboardService` | storyboards built from blank archetype/hook |
 
-**READ CLAUDE.md §00 FIRST.** It is the owner-stated architecture for catalog
-product ads and supersedes anything older in this file.
+All six now go through **one** `conceptField`/`conceptMediaPicks` helper
+(`services/conceptProjection.js`), and the producer's own dual-reads moved onto
+it too. `scripts/verifyConceptContract.js` (125 checks) includes an
+**exhaustive scan of `services/` + `routes/`** that fails if any file reads a
+routing-nested field off a concept without the helper.
 
-#### THREE MISNOMERS — each cost a wrong conclusion this session
-- **`veo*` is OMNI.** `BUILT_IN_DEFAULT_MODEL = google/gemini-omni-flash/image-to-video-developer`,
-  `ATLAS_VIDEO_MODEL` blank. `renderRoute:'veo'`, `veoPredictionId`, `VEO_CONCURRENCY` — all Omni.
-- **`renderRoute:'html_gen'` means STATIC**, not "HTML renderer". Every image ad gets it.
-  `renderService.js:470` sends every `ai_*` static ad to `renderDirectImage` and returns.
-- **`chrome` is the TITLING overlay**, burned in and correct. The Meta surface overlay
-  (with Meta's per-surface CTA) is **PREVIEW ONLY** and must never be burned in.
+**Verified live 2026-08-03 03:00 UTC** — same product/campaign that yielded
+zero: `concepts=3 payloads=3 conceptSkips=0`, 3 ads queued, 2 rendered clean.
 
-#### NEXT UP
-- **p7 concurrency — DONE and committed (`49589ba`).** `services/concurrency.js` is the
-  single declaration point; `RENDER_CONCURRENCY` 4→8, `VEO_CONCURRENCY` 1→4 (a probe, not a
-  resting place — Omni's real ceiling is still unmeasured). Grok's 1 RPS survives per-slug.
-  108-check harness, suite 20/20. **Still unverified:** whether a deeper pool can push a
-  render past `REAP_STALE_MIN` and trigger a reaper requeue = double bill. Check that next.
-- **p8 spec WRITTEN, not started:** `/private/tmp/.../scratchpad/p8-models-spec.md`.
-  Grok is NOT a fallback (stays selectable); no automatic fallback anywhere
-  (`allowFallback` default → false); model registry; OpenAI-direct + Gemini-direct as
-  options; **Telegram deleted, Slack the only transport** (7 files carry Telegram today).
+#### DO NOT RE-DERIVE THESE — verified today
 
-#### CONCURRENCY AUDIT — findings (Grok, verified)
-- `VEO_CONCURRENCY=1`'s justification is **stale and mis-attributed**: commit `3a98cd4`
-  wrote it for retired direct-Veo; `1492dca` for **Grok's real 1 RPS** (fallback model, not
-  Omni). `atlasVideoService.js:265` admits Omni's RPS is **unpublished/unmeasured**.
-  Cost: `backlogWatchdog.js:36` — a 20-video batch takes **20 minutes**.
-- **Atlas advertises no rate-limit headers.** Empirical today: **8 concurrent
-  gpt-image-2/edit, 85s, zero 429s.** Image submits are entirely **unpaced**
-  (`atlasImageService.js:162`); `pacedModelSubmit` is video-only.
-- **Titling is already order-free** — per-asset once `veoVideoUrl` exists, no sibling join.
-  Remotion serialises *execution* (resource-bound), never input order. Nothing to fix.
-- **REAL HOLE: nothing auto-drains `queued` Ads.** Only `/generate` and `/runs` drain;
-  `worker.js:184-189`'s reaper only flips `rendering→queued`. Order 50 → 30 sit forever.
+- **`mongoose.isValidObjectId('video-models') === true`** — any 12-byte string
+  casts. The `router.param` guard CANNOT protect a 12-char route name; **route
+  ORDER** is what protects named routes. Keep them above `/:id`.
+- **`DIRECTOR_UNIVERSE_TOP_N` default is now 1** (hero only), ceiling still 10,
+  multi-image fully wired. Operator multi-select still widens via
+  `Math.max(mediaIds.length, TOP_N)`. Owner: widen the window later.
+- **Slack is the alert transport and it works.** `SLACK_BOT_TOKEN` is a
+  service-level env var on BOTH services. The channels are committed in
+  `config/defaults.env` (non-secret). Worker boot log now reads
+  `🔔 alerts: Slack configured`. **The "Liquid Retail" Render env GROUP has
+  `serviceLinks: []`** — nothing in it reaches any process; that is why alerts
+  were silent. Do not "fix" it by linking the group: it also carries
+  MONGODB_URI and Cloudinary secrets that could shadow service-level values.
+- `SLACK_ALERT_CHANNEL_STATUS` (C0BMMD5AN84) is recorded but **read by
+  nothing** — reserved for a per-run live feed that is NOT built.
+- **Render API key** lives at `~/Documents/API Keys/Claude_Reach_Social_Key.txt`
+  (`rnd_` prefix). Env group id `evg-d21udjm3jp1c738b17lg`.
 
-#### STEPWISE REFINEMENT A/B — done, anchoring wins
-`gpt-image-2/edit` on Atlas is **STATELESS** (live schema: `images`, `prompt`, `size`,
-`quality`, `output_format`, `moderation` only — no turn/conversation id). So stepwise
-must re-supply the previous render. Flat **$0.01** per prediction regardless of input
-count, so **anchoring is free**.
-4 difficulties × pure vs anchored on a Gymshark duffle. At the hard rung (reposition),
-**anchored held product fidelity** — front-on like the catalogue, both cream end panels,
-crisper GYMSHARK arc — while **pure drifted** (three-quarter angle, one panel, reshaped).
-Build **anchored** (previous render + product photo, product photo authoritative) with a
-"start over from product photo" control.
-**Bonus finding:** the duffle renders maroon and the product IS maroon — so the ad's quote
-*"the perfect vibrant pink"* is a **fabricated claim**, not a render bug.
+#### CORRECTIONS TO THE OLDER RECORD BELOW
 
-#### STATIC CREATIVE DEFECTS — found by QC, NONE fixed
-Garment branding redrawn as gibberish (Gymshark shark-fin → "elf 7" on the sports bra);
-composited logo at **1.12:1 contrast** (invisible); same SKU as two colourways; safe-box
-breaches. These are the remaining blockers to "perfect" Meta static.
+- **B5 "Director headline is unvalidated" is STALE/overstated.** Price,
+  discount and product-name ARE gated (`aiCreativeDirectorService.js:957-964`).
+  Only superlative/guarantee/clinical are ungated, and the owner has
+  explicitly deprioritised those ("they are going to be summaries anyway").
+- **The static path description below is WRONG.** The vetted 2026-07-31 note
+  says gpt-image-2 produces a *text-free plate* with copy composited locally.
+  It does not: the SVG text overlay was DELETED
+  (`directImageRenderService.js:314-327`) and **the model typesets the copy**.
+  Only the LOGO is sharp-composited. Confirmed by live output today.
 
-### Google frozen + preset split — COMMITTED (e3e1578, d038053). Frontend still to do
+#### QC OF LIVE OUTPUT — 2026-08-03, two ads inspected visually
 
-Backend-only Google freeze + preset split:
-- `platformFormats.js` — pmax frozen, google presets empty, `formatCatalog()`
-- campaign/ads refuse coming_soon with 400
-All verify scripts green. Frontend: consume `formatCatalog()` for greyed Google.
+Product: Men's Tree Runner NZ. Both `ai_brand_led`/1:1, gpt-image-2/edit,
+~83s render.
 
-### Proof + geometry blockers — COMMITTED (10c9479, 64bf6d6, 52e5a08). One decision still waiting
+- **Clean:** typography, spelling, faithful product, no garbled garment
+  branding, no safe-box breach. Ad 2 ("Natural White") is shippable as-is.
+- **REPRODUCED — the logo contrast defect.** Ad 1 ("Natural Materials") has a
+  near-invisible `allbirds` wordmark, light-on-light on sunlit stone, and
+  clipped at the right edge. Ad 2's is legible. Same asset, same run — it
+  depends entirely on what is underneath. Cause confirmed:
+  `directImageRenderService.js:758-781` composites with **no plate sampling,
+  no scrim, no contrast gate**; `utils/contrastGuard.js` is wired only to the
+  dead HTML path (`templateRegistry.js:25`).
+- **Meta preview chrome shows "Lorem ipsum dolor sit amet"** as the link
+  description. Preview-only furniture, not burned in, but it is placeholder
+  text where real copy belongs.
 
-Three commits on `feat/render-activity-board`, **not yet pushed, no PR**:
-`10c9479` geometry, `64bf6d6` fabricated proof, `52e5a08` snippet inversion.
-(verify suite now 18 scripts.)
+#### NEXT, IN PRIORITY ORDER (owner-set: production quality first, money later)
 
-#### THE ONE DECISION WAITING FOR THE OWNER
+1. **Logo contrast/scrim** — highest shippability per line of code. Sample the
+   plate under the logo rect, add a scrim or stroke, refuse below a WCAG
+   threshold. Deterministic, affects every static ad.
+2. **"Lorem ipsum" in the Meta preview link description.**
+3. **Post-render measurement** — the prompts already say the right things
+   (`staticAdIntents.js:261-264,423`); what is missing is checking whether the
+   model complied. Text-outside-safe-box and garment-mark OCR are the two that
+   kill Meta QC.
+4. **Video path has NOT been QC'd today.** Only static was exercised. The
+   untitled-video-counted-as-success fix and the poll instrumentation are live
+   but unproven against a real Omni run.
+5. **Deferred by owner until output is tested and live:** money hardening
+   (the `queued` drain, reaper/re-drain double-bill on process death — note
+   `veoPredictionId` is a spend receipt that is NEVER resumed).
 
-`services/quoteProvenance.js` — `PRINTABLE_QUOTE_ORIGINS` currently EXCLUDES
-`'llm-web'`. That is ~82% of all quotes in the database, so **most ads now ship
-with no testimonial**. One-line flip in that file if the owner wants them back.
+#### KNOWN-OPEN, NOT STARTED
 
-Measured 2026-07-31 against prod, and this is the context for the decision:
-of 1073 catalog products carrying reviews, **883 are `gemini-search`** (3345
-quotes, LLM web search) and **190 are unlabelled storefront imports** (748
-quotes, per-quote `source:'store'`). **ZERO first-party review scrapes exist.**
-So there is no "real" review capture to fall back on — the honest options are
-(a) ship fewer testimonials, (b) accept LLM-extracted third-party quotes with
-honest attribution, or (c) build first-party review scraping.
+- `RENDER_CONCURRENCY=4` at boot vs `8` in `defaults.env` — a Render dashboard
+  var shadows the committed default. File is now misleading about what runs.
+- `RENDER_AUTH_TOKEN` logs `EXPIRED` at every boot (dead `renderViaSpec` path).
+- `npm error could not determine executable to run` during postinstall
+  (`npx remotion browser ensure`), non-fatal via `|| true`.
+- Video multi-surface fan-out (§00 Phase 3) still not built — one Omni master
+  per aspect, each its own billable submit.
 
-#### WHAT WAS ACTUALLY WRONG (all verified against prod, not inferred)
-
-- Provenance was **inert end to end**. 718/718 layout artifacts had `origin`
-  unstamped; 0/1073 products and 0/74 categories had a quote-level stamp.
-  `quoteTier` was computed, logged, and thrown away. Every gate built on
-  `origin` was decorative.
-- Live bylines included `Verified buyer` (104), `Reddit (r/BuyItForLife)` (41),
-  `Peloton Apparel` (145) and `vertexaisearch.cloud.google.com` (**80**) — sites
-  and claims printed as the customer who said the words.
-- `dimsFor()` returned `canvas` values (a 1000px HTML reference width) while the
-  prompt promised `deliveryDims`; its `default` squared everything unnamed, so
-  **pmax 16:9 shipped as a square**.
-- Sharp ran `fit:'cover', position:'attention'` — a saliency crop — while the
-  prompt told the model a specific CENTRED band would be cut away.
-- The logo was composited 150px inside Stories' 250px reply-bar reserve.
-- `isExtractive` was substring containment, so `'worth it'` extracted from
-  `'Not worth it for the price'` passed and inverted the review.
-
-#### STILL OPEN, IN PRIORITY ORDER
-
-1. **B5 — Director headline is unvalidated** (retro blocker, NOT fixed).
-   `copy_picks.headline` goes straight to the image prompt and can assert a
-   price, a discount, a guarantee, a superlative or a clinical claim with
-   nothing checking it. Grok drafted a validator; the reconcile agent rejected
-   5 of its regex arms as too blunt (bare `\blifetime\b`, `\bforever\b`) —
-   the owner's rule is that creative must not be lobotomised by a blunt gate.
-   Full proposal: `/private/tmp/.../scratchpad/proposals.json` key
-   `B5-director-headline`, and the narrowings are in `_PLAN.rejected`.
-2. **Producer still ASKS for fabricated quotes.** `layoutInputService.js:1171-1182`
-   still prompts for "NOTIONAL persona-authored reviews". They are dropped at
-   pool assembly now, but it is paid tokens for output that is always discarded,
-   and it is a loaded gun if someone re-wires `derivation.quotes`.
-3. **HTML + video paths.** The provenance gate is producer-side so they inherit
-   it, but Remotion brand scripts hold their own byline defaults — check for
-   more manufactured attributions like the `metaCascadeConfig` one already fixed.
-4. **Build A: video fan-out** — 1 generation = 3 sizes, race-free (queue 9:16
-   master only; create 4:5/1:1 after `veoVideoUrl` lands), reuse `videoCropUrl`.
-5. **Build B: safe-zone unification** — `platformFormats.safeArea` as the single
-   source; `remotion/lib/safeZones.js` still keys per ASPECT CLASS, so Reels 204
-   and Stories 250 collapse into one `vertical` entry.
-6. **Build C: status screen UI + copy button** (backend done, on this branch).
-7. `feat/render-activity-board` has never had a PR opened.
-
-#### PROCESS NOTE THAT PAID OFF
-
-Grok reviewed every diff before it landed and caught three things that would
-have shipped: geometry validation placed AFTER the billable submit, an
-allowlist forgeable via `source` (fixed by stamping `origin`, which
-DERIVATION_SCHEMA cannot emit), and a `stampOrigin` else-arm that would have
-laundered every legacy category row as printable. Grok also correctly refuted
-one of my own claims (`dimsFor` mirrors `canvas`, it is not a rogue table).
-Two Grok calls died after the preamble when the prompt carried a full diff —
-Grok reads the working tree itself, so pass pointers, not diffs.
-
+---
 
 ## VETTED 2026-07-31 — the parallel-HTML / double-spend diagnosis is STALE
 
