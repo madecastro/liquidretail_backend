@@ -271,6 +271,28 @@ visibly better than Remotion's), and have Remotion **cut to it**. Highest-value 
 - fixes BOTH §0.26(1) the truncated raw-SKU endcard AND §0.26(2) the ad ending on a shoe heel
 - text-accuracy risk (image models misspell) is exactly what the §0.2 vision QC catches
 
+### 0.29 HOW MUCH PRODUCT INFO DO WE HAVE? (measured, answers the owner's question)
+
+Coverage over 500 Media docs — the detect pipeline is thorough:
+`classification` 100%, `adSuitability` 100%, `subjects` 95%, `primarySubjectDesc` 95%,
+`primarySubjectLabel` 95%, `background` 95%, `technicalInsights` 94%, `text` 71%,
+`refinedProducts` 45%.
+
+So we are NOT missing perception generally — we are missing exactly ONE dimension: view/angle.
+That makes the reference-ordering fix much smaller than it first looked.
+
+**And the signal is already half-captured.** 42% of `primarySubjectDesc` values contain angle
+vocabulary, e.g. *"Black short-sleeve crew neck t-shirt, **plain back**, ..."*. But it is NOT
+reliably regex-extractable: another sample reads *"standing in **front** of a classic black
+muscle car"*, where "front" is the car's position, not the camera angle.
+
+**CHEAPEST FIX — add a `view` field to the EXISTING detect call's output schema.** That call
+already looks at every image and writes the description; asking it for
+`view: front|back|side|three_quarter|detail|lifestyle|packaging` costs **zero additional API
+calls** and needs no new vision pass. Prefer this over a separate per-image classification pass
+(my earlier suggestion — superseded, it was more expensive for the same result). Only existing
+media would need a backfill.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
