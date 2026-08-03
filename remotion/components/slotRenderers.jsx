@@ -324,7 +324,20 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
   const font = tokenFont(tokens, 'body');
   // Secondary color follows the slot's (possibly contrast-flipped) token:
   // when the group flips to on-light colors, the count line flips too.
-  const secondaryToken = t.colorToken === 'textOnLight' ? 'textSecondaryOnLight' : 'textSecondary';
+  // PRIMARY ink for the reviews line, not the dim secondary token.
+  //
+  // MEASURED on a delivered Vuori 1:1 (owner: "the number of reviews and
+  // everything on that line is simply not legible"): against the same backdrop,
+  // the headline rendered at 6.87:1 contrast and the reviews line at 3.35:1 —
+  // its glyphs peaked at 0.715 luminance because textSecondary is a deliberately
+  // dimmed grey. 3.35:1 is below the 4.5:1 floor for text this size, so the line
+  // was failing on any mid-tone plate, not just that one.
+  //
+  // Same mistake, same fix as DeliverySlot ("Inherit primary ink — do NOT demote
+  // to textSecondary"). Dimming is a valid choice on a flat studio backdrop and a
+  // bug on footage; the whole point of the plate-intel ink flip is that we do not
+  // know which we have until we look.
+  const secondaryToken = t.colorToken === 'textOnLight' ? 'textOnLight' : 'textPrimary';
 
   // Internal choreography is relative to the slot's own enterAtSec (group
   // enter transition is already applied by Canonical around this renderer).

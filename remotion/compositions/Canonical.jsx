@@ -41,35 +41,70 @@ const KEEP_OUT_CANDIDATES = {
 // content is on screen: bright band → dark type; avoid band → shift group
 // to a clear band (see resolveGroupAnchor).
 function bandStateFor(plateHints, anchor, atSec) {
-  if (!plateHints?.samples?.length) return { isLight: false, avoid: false };
+  if (!plateHints?.samples?.length) return { isLight: false, avoid: false, busy: 0 };
   let best = plateHints.samples[0];
   for (const s of plateHints.samples) {
     if (Math.abs(s.atSec - atSec) < Math.abs(best.atSec - atSec)) best = s;
   }
   const band = best.bands?.[BAND_FOR_ANCHOR[anchor] || 'middle'];
-  if (!band) return { isLight: false, avoid: false };
-  return { isLight: band.lum > 0.62, avoid: !!band.avoid };
+  if (!band) return { isLight: false, avoid: false, busy: 0 };
+  // `busy` (local luma variance, plateIntelService) was computed for every band
+  // from the first version of the plate scan and never read by ANY consumer.
+  // It is the signal that tells detail-heavy footage from flat footage, which is
+  // exactly what decides whether type survives on top of it.
+  return {
+    isLight: band.lum > 0.62,
+    avoid: !!band.avoid,
+    busy: Number.isFinite(band.busy) ? band.busy : 0,
+  };
 }
+
+/**
+ * How much better a rival band must measure before the group leaves the band the
+ * template authored. Without hysteresis the stack would hop between bands on
+ * noise, and the authored anchor carries real design intent.
+ */
+const BAND_SWITCH_MARGIN = 0.03;
+
+/** A face costs more than any amount of texture — never trade a clear band for a face. */
+const FACE_PENALTY = 1;
 
 // Stable per-group keep-out decision: one anchor for the whole group for the
 // whole clip (no per-slot divergence, no mid-phase jumping). Evaluated at the
 // group's first slot enter time (+0.5s into the visible window).
 // logShift: only the once-per-render groupAnchors path should log (ink vote reuses).
+// SCORED, not first-acceptable. The previous version returned the first candidate
+// whose band was not face-flagged, which had two failure modes seen in delivered
+// ads:
+//   - It never looked at TEXTURE. On a Gymshark 4:5 the authored lower third was
+//     un-flagged, so the stack stayed there — directly on top of a giant GYMSHARK
+//     wordmark printed across the garment. Measured: bottom busy 0.199, top 0.144.
+//   - Because it accepted the authored band whenever that band merely lacked a
+//     face, it could not move at all for busy-but-faceless footage, and on 9:16
+//     the reverse case (authored upper third sitting ON the face while the bottom
+//     was the clean band) only resolved if the face flag happened to be set.
+// Scoring every candidate on face + texture handles both directions with one rule.
 function resolveGroupAnchor(plateHints, authoredAnchor, atSec, { logShift = false } = {}) {
   const candidates = KEEP_OUT_CANDIDATES[authoredAnchor] || [authoredAnchor];
+  let best = null;
   for (const cand of candidates) {
-    const { avoid } = bandStateFor(plateHints, cand, atSec);
-    if (!avoid) {
-      if (logShift && cand !== authoredAnchor) {
-        // Render console — sweeps grep `keepOut:`.
-        // eslint-disable-next-line no-console
-        console.log(`keepOut: ${authoredAnchor}->${cand} (face band)`);
-      }
-      return cand;
-    }
+    const { avoid, busy } = bandStateFor(plateHints, cand, atSec);
+    // Lower is better. The authored band gets the margin as a head start so a
+    // negligible texture win never overrides the template's composition.
+    const score = (avoid ? FACE_PENALTY : 0) + busy - (cand === authoredAnchor ? BAND_SWITCH_MARGIN : 0);
+    if (!best || score < best.score) best = { cand, score, avoid, busy };
   }
-  // All candidates flagged — keep authored anchor (safe-zone clamp still holds).
-  return authoredAnchor;
+  if (!best) return authoredAnchor;
+  if (logShift && best.cand !== authoredAnchor) {
+    const why = best.avoid === false && (KEEP_OUT_CANDIDATES[authoredAnchor] || [])[0] === authoredAnchor
+      ? 'busier band' : 'face band';
+    // Render console — sweeps grep `keepOut:`.
+    // eslint-disable-next-line no-console
+    console.log(
+      `keepOut: ${authoredAnchor}->${best.cand} (${why}; busy ${best.busy.toFixed(3)})`
+    );
+  }
+  return best.cand;
 }
 
 // ONE contrast decision per render, not per band: copy must never mix ink
