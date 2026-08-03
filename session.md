@@ -125,8 +125,43 @@ through the views. That also explains the ~5.0s cross-dissolve (front → back),
 therefore normal behaviour, NOT a generation artifact. Two earlier reads in this session were
 wrong and are corrected here: the ghosting is a legitimate shot transition, and the Nikes are
 not the model inventing a competitor mark.
-**Fix is view-aware reference selection/ordering** (`buildReferenceImages` passes hero + alts in
-"stored order"), so a rear view never becomes the closing beat. Tracked as its own item.
+**OWNER INPUT 2026-08-04 — read before "fixing" this.** A back view is **not** a bad reference;
+the owner considers it useful for fidelity. And: *"we found with too many images it was
+hallucinating"* — so **do NOT raise the reference count** to compensate. Corroborating evidence:
+the static Timberland ad sent **exactly ONE** reference and still invented the emblem, so ref
+COUNT is not the driver; ref quality/role is. `DEFAULT_REFERENCE_IMAGE_COUNT = 3`,
+`MAX = 7` (`atlasVideoService.js:762-763`) — keep 3.
+
+**Selection is purely positional today.** `buildReferenceImages` (`atlasVideoService.js:1791-1807`)
+= seed at position 0, then catalog mirrors in `hero-first / createdAt asc`, truncated. Owner,
+verbatim: *"we are taking the first three images by default."* Whatever lands 2nd/3rd by
+createdAt becomes a reference — for a typical PDP set that is LEFT/BACK.
+
+**PREVALENCE — this is NOT an edge case.** 423 video ads; 130 carry reference stacks across 86
+products and 10 brands; refcount distribution `{1:35, 2:10, 3:85}` — **65% carry three refs**.
+Confirmed on a second brand/category: Allbirds "Men's Wool Cruiser" ref R2 is literally named
+`..._PDP_BACK_....png`. Also spotted: "Fujimurasaki Matcha" uses an
+`encrypted-tbn0.gstatic.com/shopping?q=tbn:` **Google Shopping thumbnail** as a reference for a
+$1.00 video generation — a separate reference-quality bug.
+
+**THE MISSING PIECE: there is no view/angle field on Media.** The detect pipeline already
+populates `subjects`, `text`, `background`, `primarySubjectDesc/Label`, `technicalInsights`,
+`adSuitability`, `classification`, `refinedProducts` — but nothing records front vs back vs
+detail. That is exactly why selection is positional: it has nothing else to sort on.
+
+**RECOMMENDED DIRECTION (discussed with owner, not yet built):**
+1. **Minimal, free, testable first:** the stack is consumed as a SEQUENCE, so the fix is not
+   reordering but making the CLOSING BEAT return to the primary view. `buildVeoPrompt` Scene 3
+   says *"zoom out to reveal the full product"* without saying WHICH view. Prompt-only change.
+2. **Classify view ONCE at ingest**, not per generation — stamp Media with
+   `view: front|back|detail|lifestyle|packaging` (~$0.0016/image with flash, one time). Ordering
+   then becomes free and deterministic forever; a per-generation Director call re-pays that cost
+   and is non-reproducible.
+3. **Share that ingest call with the brand-safety screen** (§0.2 known limit / task): one look at
+   each ingested image returns view angle + competitor marks + text presence.
+4. Leave the **Director** to sequence a script from already-labelled views, which matches the
+   owner's stated intent that an enabled Director should drive the camera prompt — rather than
+   doing perception work per run.
 
 **Secondary, still worth doing — the canonical prompt has real gaps** (`veoPromptBuilder.js`
 `OMNI_DIRECTIVES:156-193`):
@@ -170,6 +205,71 @@ in REF1, a real Gymshark catalog photo sitting in our own Media library, so rend
 correctly passes them. **Competitor branding that enters through source imagery needs a
 separate brand-safety screen at media ingest / reference-selection time.** Two different
 defects that look identical in the finished ad; do not expect one control to cover both.
+
+### 0.25 PROVEN LIVE — the font fix works ($0 validation, 2026-08-04)
+
+Deployed `45b7419` to both services, then re-ran ONLY Remotion titling against the already-paid
+master of the ad that failed on 08-03 (`6a7017ee51cea04158ad8b47`, Allbirds, meta_reels_9_16).
+Zero new spend. Log:
+
+```
+fonts=heading:Inter(library-match) body:Inter(library-match) quote:Lora(google)
+render 25% -> 50% -> 75% -> 100%
+TITLING_OK 76.2s
+AFTER url=.../brand_script/product-1785735868132-1-uajivuga.mp4
+```
+
+That is the exact `library-match` case that used to die at ~3s. **No compositor error, no
+"A network error occurred", and critically NO `font load failed for Inter` warning** — which is
+the positive proof Inter actually LOADED rather than soft-failing to a fallback. Deployment
+sanity check on the box: `assets/fonts` = 17 files, `assets/webfonts` = **0** (it only fills
+on-demand per brand), which is exactly why every library-match request 404'd before.
+
+**Non-fatal, worth tracking:** a `ProtocolError: Page.bringToFront: Target closed` fires after
+75% during teardown, yet the render still reaches 100% and succeeds. Benign shutdown race.
+
+### 0.26 CREATIVE DEFECTS in the newly titled output (viewed frame by frame)
+
+1. **The endcard prints the raw catalog SKU title, truncated:**
+   `"Women's Breezer Point - Warm Red (Dark..."` — colorway parenthetical and all, clipped
+   mid-word (cap applied at `remotion/compositions/Canonical.jsx:98` `.slice(0, cap)`).
+   Note `CLAUDE.md` says the product name is *"dropped entirely by owner instruction"* for
+   STATIC, yet the video endcard leads with it.
+2. **The closing beat is the heel/back view AGAIN** — arc was side -> three-quarter -> top-down
+   -> heel -> heel. Reference-stack ordering reproduced on a SECOND product and category
+   (footwear vs apparel). Confirms §0.1.
+3. Headline sits on a heavy grey translucent scrim; reads unpolished next to the static ads.
+
+### 0.27 FONT FALLBACK IS NEARLY A CONSTANT (owner flagged; confirmed)
+
+Owner: *"those fonts are the same ones that always get used"* / *"there should be much better
+fallback choices."* Correct, and worse than it looks:
+- `fontResolverService.js:269` — `substitution?.family || (fallbackFor(requested)==='serif' ? 'Lora' : 'Inter')`.
+  A **binary** default.
+- `LIBRARY_SUBSTITUTIONS` (`:253-262`) only fires when the **requested font NAME** matches a known
+  foundry name (helvetica/futura/bodoni/...). Brands with proprietary typefaces — Allbirds
+  **"Self Modern"** — match nothing and always land on Inter. That is the common case for premium DTC.
+- `fontLoader.js:46-61` downloads **16** faces; only **8** are reachable via substitution.
+  **Unreachable by ANY fallback path:** Cormorant, Antonio, Bebas Neue, IBM Plex Sans, Poppins,
+  Nunito, Quicksand.
+Fix: classify once per BRAND (site/logo/theme signals) -> pick best of the 16 -> cache on the
+Brand doc. Same "classify once, reuse forever" pattern as view-angle.
+
+### 0.28 OWNER ASK — gpt-image-2 for titling. Transparency is NOT available; do this instead.
+
+Checked the LIVE schema (`openai-gpt-image-2-edit.json`): `output_format` is
+`enum ['jpeg','png']` and there is **no `background: transparent` param** (OpenAI's native API
+has one; Atlas does not expose it). PNG alone does not give alpha, so a per-frame composited
+transparent title layer is NOT reliably achievable.
+
+**Better architecture, no transparency needed:** don't overlay — have `gpt-image-2/edit` render a
+COMPLETE designed frame (exactly what the static pipeline already does, and its typography is
+visibly better than Remotion's), and have Remotion **cut to it**. Highest-value slice is an
+**AI-designed ENDCARD** for the final ~1.5-2s:
+- `size: '1152x2048'` is in the enum and is **exactly 9:16** -> clean downscale to 1080x1920
+- $0.01 flat, one call per video
+- fixes BOTH §0.26(1) the truncated raw-SKU endcard AND §0.26(2) the ad ending on a shoe heel
+- text-accuracy risk (image models misspell) is exactly what the §0.2 vision QC catches
 
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
