@@ -360,6 +360,56 @@ fonts (see §0.27 — Allbirds gets Inter because "Self Modern" matches no subst
 positioning. NOTE canonical's only anchor is `upperThird`, which is exactly the top-heavy layout
 measured in §0(c) — 26% of frame height unused. Positioning is a CANONICAL-level fix.
 
+### 0.297 THE SWEEP EXERCISE (2026-08-04, owner-directed, plan-approved)
+
+Owner authorized unlimited $0 re-renders; objective: re-title EVERY 9:16/4:5/1:1 master
+(367 of 374; 238 reels / 28 stories / 64 4:5 / 37 1:1), score on six axes (positioning,
+color, legibility, on-brand, conversion, animations), report recommendations.
+Plan: ~/.claude-work/plans/shimmying-orbiting-panda.md. Fable is CREATIVE DIRECTOR for
+templates (owner-directed); Grok drafts; scoring agents are persona-primed.
+
+**THE BIG ONE — canonical was the OLD template.** Owner: "we had a new titling template you
+are using the old one." Verified: the three curated presets share a 9-slot/3-phase
+architecture (hook -> proof with rating stars+count -> close with productName/deliveryLine/
+CTA at lowerThird) that canonical.json never received. Now REBUILT (PR #60, merged a29be17):
+canonical + three funnel variants (awareness/consideration/conversion, mirroring the static
+intents — owner wants funnel-position ads like static) + two experimental prototypes
+(proto-kinetic-center, proto-bottom-editorial) for the scoring pilot.
+- CTA visible:true everywhere (owner decision; was false even in the presets).
+- There is NO separate endcard in the Remotion path (canvas-era only) — the close phase IS
+  the endcard. The card seen at 7.8s in the 08-04 re-title came from the stale brand spec.
+- Fable direction pass: canonical/conversion/protos cut text phases ON the camera cuts
+  (2.7/5.1 = buildVeoPrompt scene marks dur/3, 0.64*dur); CTA rides the reveal (+60% screen
+  time). Awareness/consideration keep divergent pacing AS their A/B hypothesis.
+  **Owner caveat (correct): camera beats drift per video** — requested marks are a prior.
+  Sweep adds mechanical scene-cut detection (local ffmpeg, $0) as a per-video metric;
+  if drift is material, fast-follow = per-render beat-snap via plate intelligence
+  (timing.js already time-warps specs; precedent exists).
+- resolveSpec tier 0: presetOverride argument (never persisted) for funnel A/B;
+  driver --preset flag. titlingSnapshot records 'override:<name>'.
+- productName cleaned for display (parenthetical stripped; productNameFull preserved);
+  word-safe truncation. NOTE: my earlier claim that Canonical.jsx:98 .slice(0,cap) was the
+  truncation site was WRONG (that is a maxItems cap); the clip was CSS line-clamp on the raw
+  SKU. Fixed at the meta source.
+- scripts/retitleDriver.js: serial $0 sweep driver, money-invariant verified line-by-line
+  (renderBrandScriptAndSave only; side cost ~$0.02/cropped-format ad for face-detect vision
+  on cache miss, ledgered; worst case ~$2 across the 101 cropped ads).
+
+**Sweep state:** deploy of a29be17 in progress. NEXT: owner-gate render (ONE Allbirds
+vertical on new canonical — owner must approve frames before sweep), then format smokes,
+then pilot: 12 ads x 6 templates = 72 renders ($0), persona-primed scoring
+(Brand.demographics/tone/tagline — pulled to scratchpad sweep/brand-personas.txt; GymShark/
+Peloton/Soludos2/Fellow have EMPTY profiles -> category-generic fallback + recommend brand
+enrichment), then full 367 sweep + report. Pilot manifest: scratchpad sweep/pilot-manifest.txt.
+NOTE: no brand has titleStylePreset set, so the whole sweep renders pure canonical-family —
+clean single-variable test.
+
+**Adversarial reviews on the diff found and fixed pre-commit:** failed re-ingest clobbering a
+good font mirror; no magic-byte check on downloads (HTML-as-200 became a "usable" face); human
+needsLicense holds wiped by re-ingest; commercial faces starving the ingest cap. Documented
+footgun (not yet fixed): Title Studio still authors/previews persisted specs that renders now
+ignore — preview != ship; needs a UI warning.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
