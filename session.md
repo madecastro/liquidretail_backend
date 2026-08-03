@@ -483,8 +483,9 @@ gate-passing quote nor a >4.5 rating pair (product or brandReviews). AllBirds sh
 it. Not a crash — just a quiet middle beat. Brand enrichment for GymShark/Peloton/Soludos2/
 Fellow would populate personas + brandReviews.
 
-**GROK CLI IS SIGNED OUT** (`Not signed in`) — every Grok path is down until `grok login`
-(or device-code) is run interactively. Subagents covered tonight's remaining work.
+**Grok CLI: re-authed by owner 2026-08-04 morning, probe verified (0.2.117).** (It had signed
+out overnight mid-session — auth sessions can expire; on `Not signed in`, fall back to
+subagents and tell the owner, don't retry.)
 
 **Efficiency audit** (owner-requested): two subagent audits over render + generation paths
 were in flight at handoff-write; findings land in this file / the conversation when done.
