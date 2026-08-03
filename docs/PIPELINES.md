@@ -1,6 +1,6 @@
 # LiquidRetail Backend — Background & Creative Pipelines
 
-This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`; verify suite 28 scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
+This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`; verify suite 29 scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
 
 > **Cost hot-spots (read first)**
 >
@@ -415,6 +415,8 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 ## 6. Video generation (Veo / Atlas) — deterministic-first
 
 > **Default path:** product campaigns queue **one deterministic video ad per product** (hero seed or operator-ordered catalog stack). The Creative Director no longer drives video by default — it serves **static image ads** and **opt-in video variants** only (backend PRs #11/#12/#13; wizard controls frontend PR #10).
+>
+> **Owner position (2026-08-03):** *"we disabled the director for the video path for now"* / *"we were using a canonical prompt"* / more archetypes may come later — **right now get the canonical prompt right.** Archetype-driven video is **deferred, not missing.** Camera prompt is generic **by design** (titling burns text downstream); levers are `videoPromptGuidance` + canonical directives in `buildVeoPrompt`, **not** concept fields. Prompt changes are **not evaluable** until Remotion titling is fixed (see Known open below).
 
 ### Trigger
 
@@ -448,8 +450,8 @@ Results from deterministic + concept expanders are combined with **`mergeExpansi
 #### Concept / director path
 
 - Image concepts: still Director + Judge (`aiCreativeDirectorService` / `aiJudgeService`); template label maps from `conceptField(concept, 'creative_style')` (v3 dual-read — flat `concept.creative_style` alone is wrong; see §5 concept contract).
-- Video concepts: only when `conceptVideo` is true; still capped at `VEO_ADS_PER_PRODUCT_CAP` (default **1**) per product in the concept expander. Storyboard text path reads archetype / hooks via `conceptField` (`veoStoryboardService.js`).
-- **Director does not drive video titling or the camera prompt** (PR #11). Layout-input / title template for video is **canonical `ai_brand_led`** unless Title Studio overrides cascade (below). `creative_style` is ignored for video titling.
+- Video concepts: only when `conceptVideo` is true (opt-in `directorVariants`; default **off**); still capped at `VEO_ADS_PER_PRODUCT_CAP` (default **1**) per product in the concept expander. Storyboard text path reads archetype / hooks via `conceptField` (`veoStoryboardService.js`) — **Atlas/Omni camera prompt does not use that path** (storyboard retired on Atlas; see stages table). Opt-in queues extra concept **Ads**; it does **not** make Director drive the live camera prompt.
+- **Director does not drive video titling or the camera prompt** (PR #11) — **even when `directorVariants` is on.** Layout-input / title template for video is **canonical `ai_brand_led`** unless Title Studio overrides cascade (below). `creative_style` / `archetype` / `art_direction` are ignored for the camera prompt and for video titling.
 
 #### Run selection (`selectAdsForRun`)
 
@@ -483,16 +485,18 @@ Category settings sit **between product and brand**, ordered **leaf → root**, 
 
 ### Per-run / per-level video prompt
 
+**Camera-only by design** (`atlasVideoService.js:2593-2620`). Code comment: *"Camera-only prompt — the canonical brand-script overlay composites all on-screen text downstream from ad.copy + LayoutInputArtifact."* `buildVeoPrompt` receives **no Director concept** — args are `{brand, product, media, layoutInput, sourceMedia, aspectRatio, seedHasText, hasProductReference, storyboard, caps, durationSec}`. A generic-looking Omni prompt is intentional, not a wiring gap. **Do not** "fix" it by plumbing `art_direction` / `creative_style` / `archetype` into the camera prompt. **Levers:** `videoPromptGuidance` (prepend), the canonical directives inside `buildVeoPrompt`, and `videoPromptRaw` (full replace). **Current objective: tune the canonical prompt**; archetype-driven video is deferred.
+
 | Field | Semantics |
 |---|---|
 | **`videoPromptGuidance`** | Short operator note (≤1000 chars). Merged as **`operatorPrompt` prepend** inside `buildVeoPrompt` via the guidance cascade above. |
-| **`videoPromptRaw`** | Full prompt replacement (≤4000 chars body validation). **Bypasses** `buildVeoPrompt`; clamped with `enforceRawByteCap` to the model’s `promptByteCap`. |
+| **`videoPromptRaw`** | Full prompt replacement (≤4000 chars body validation). **FULL replacement** of canonical — logs *"canonical directives bypassed"*; clamped with `enforceRawByteCap` to the model’s `promptByteCap`. |
 
-**`generateForAd` priority** (`atlasVideoService.js`):
+**`generateForAd` priority** (`atlasVideoService.js:2595-2620`):
 
-1. Explicit **`operatorPrompt`** argument (regenerate UI) — non-empty after trim → `buildVeoPrompt({ operatorPrompt })`.
-2. Else **`ad.videoPromptRaw`** — full replace + byte cap.
-3. Else guidance cascade → `buildVeoPrompt({ operatorPrompt: effectiveGuidance })`.
+1. Explicit **`operatorPrompt`** argument (regenerate UI) — non-empty after trim → **prepended** to canonical via `buildVeoPrompt({ operatorPrompt })`.
+2. Else **`ad.videoPromptRaw`** — **full replacement** of canonical (bypasses `buildVeoPrompt`); byte cap.
+3. Else guidance cascade (`videoPromptGuidance` via `resolvePromptGuidance`) → **prepended** to canonical via `buildVeoPrompt({ operatorPrompt: effectiveGuidance })`.
 
 **Wizard Advanced editor feed:** `GET /api/ads/veo-prompt-scaffold?campaignId=&productId?&platformFormat?&durationSec?` → `buildPromptScaffold` returns `{ prompt, model, aspectRatio, durationSec, byteCap }` (canonical prompt; `media=null`; placeholder product title when no product).
 
@@ -548,6 +552,7 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 
 **Known open (do not claim fixed):**
 
+- **Remotion titling fails on every run** — `Could not extract frame from compositor / Request closed` (`@remotion/renderer` `offthread-video-server.js:99`). Result: paid Omni master, ad `failed` with `master rendered; titling failed`, **no titled output**. Prompt / canonical-tuning work is **unobservable** until this is fixed. Font 404/CORS lines in the same log are a **red herring** — FontLoader says "using fallback stack" and recovers; they are not the fatal error.
 - `veoPredictionId` is a spend receipt that is **never resumed** — process death + re-drain can double-bill.
 - `queued` ads still never auto-drain after web-process death (reaper only flips `rendering` → `queued`).
 - Static: ~1-in-3 ads render a competitor-shaped brand mark on the product (prompts already demand fidelity — fix is measure-and-reject, not prompt tuning). **Video path not QC’d** for the same defect 2026-08-03.
