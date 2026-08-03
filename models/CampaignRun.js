@@ -44,6 +44,42 @@ const campaignRunSchema = new mongoose.Schema({
     message:    String
   }],
 
+  // Per-product expansion outcomes. Written when expandWizardJob finishes
+  // (success, empty, or partial). The poller (GET /runs/:runId) returns
+  // this so the UI can tell "no imagery" from "Director returned nothing"
+  // instead of the generic expand error that used to discard the real
+  // reason. Shape owned by services/perProductReasons.js — keep fields
+  // in sync with normalizePerProductEntry.
+  perProduct: [{
+    _id:               false,
+    productId:         String,
+    productName:       String,
+    reason:            String,   // machine code, null when the product queued
+    message:           String,   // human sentence for this row
+    skipped:           Boolean,
+    payloads:          Number,
+    mediaId:           String,
+    mediaIds:          [String],
+    conceptCount:      Number,
+    conceptSkips: [{
+      _id:       false,
+      conceptId: String,
+      reason:    String,
+      mediaId:   String
+    }],
+    capped: [{
+      _id:     false,
+      kind:    String,
+      format:  String,
+      before:  Number,
+      after:   Number,
+      dropped: Number
+    }],
+    payloadsBeforeCap: Number,
+    error:             String,
+    errorName:         String
+  }],
+
   requestedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
   startedAt:    { type: Date, default: Date.now },
