@@ -101,7 +101,46 @@ Owner-set: **production quality first, money hardening after output is proven.**
    **Still unproven** (titling died before chrome rendered): the video quote gate admitting an
    anonymous testimonial into Remotion chrome.
 
-4. **THE VIDEO PROMPT IS DELIBERATELY CAMERA-ONLY — and the Director is OFF for video.**
+4. **TITLING IS BROKEN IN THREE SEPARATE WAYS — all found 2026-08-03, all silent.**
+
+   **(a) FATAL: Remotion cannot extract frames.**
+   `Could not extract frame from compositor / Request closed`
+   (`@remotion/renderer/dist/offthread-video-server.js:99`). Every video run yields a paid
+   master and NO titled deliverable. Fix this first — nothing else about video is observable
+   until it completes.
+
+   **(b) EVERY TITLE RENDERS IN THE WRONG TYPEFACE — a one-word directory mismatch.**
+   ```
+   services/fontLoader.js:31           .../brandScripts/assets/fonts      ← boot downloads 16 fonts HERE
+   services/fontResolverService.js:26  .../brandScripts/assets/webfonts   ← Remotion serves /fonts/* FROM HERE
+   ```
+   `fonts` vs `webfonts`. The asset server maps `/fonts/<file>` → `FONT_CACHE_DIR`
+   (`remotionRenderService.js:149-150`) which is the **webfonts** dir — empty. Result: 404 +
+   CORS, and `FontLoader.jsx:39-41` **catches it and continues with a fallback stack**. Inter
+   never loads.
+
+   The boot line `🔤 fontLoader: 16 downloaded, 0 cached, 0 failed` is reassuring and
+   meaningless — it fills a directory the live renderer never reads. I initially dismissed
+   this as a red herring; it IS a red herring for the crash, but it is a real permanent
+   typography defect on its own.
+
+   **(c) SAFE ZONES DO NOT RECONCILE — two sources of truth, ~2.7x apart.**
+   ```
+   platformFormats.js:75   meta_reels_9_16    safeArea top 204 / bottom 204   (px, real surfaces)
+   platformFormats.js:101  meta_stories_9_16  safeArea top 250 / bottom 250
+   remotion/lib/safeZones.js:10   vertical: { top: 0.14, bottom: 0.35 }  ← ONE entry for BOTH
+   ```
+   Reels and Stories collapse into one `vertical` key, so Stories' 250px reserve renders against
+   Reels' geometry. And the numbers disagree outright: `bottom: 0.35` on 1080x1920 is **672px**
+   vs a declared 204/250px reserve. Remotion uses Meta community-consensus FRACTIONS;
+   `platformFormats` declares PIXEL reserves from the actual surfaces, and nothing reconciles
+   them. The 0.35 is deliberately conservative (its comment cites Meta's bottom-40% legal-text
+   rule), so titles probably do not breach — they are likely floating far higher than necessary
+   and wasting the frame. `platformFormats.safeArea`, the value derived from real surfaces, is
+   not what the renderer uses. This is session.md's old "Build B: safe-zone unification" and it
+   is live, not theoretical.
+
+5. **THE VIDEO PROMPT IS DELIBERATELY CAMERA-ONLY — and the Director is OFF for video.**
    *Corrected 2026-08-03 after I got this wrong.* I initially reported that the video prompt
    uses "3 of the Director's 13 routing fields" and should be passed `art_direction`. **That
    is wrong for the live path.** The owner confirmed the Director is disabled for video and a
@@ -130,7 +169,20 @@ Owner-set: **production quality first, money hardening after output is proven.**
    So the prompt is generic BY DESIGN (text is composited downstream by titling), not because
    fields are missing.
 
-   **OWNER DIRECTION 2026-08-03:** *"we may choose to use more archetypes and create them in
+   **OWNER DIRECTION 2026-08-03 — TWO PARTS, do not conflate them:**
+
+   *When the toggle is OFF (the default, and today's focus):* tune the CANONICAL prompt.
+   Verbatim: *"we may choose to use more archetypes and create them in the future, but right
+   now we want to get it right with the canonical prompt."*
+
+   *When `directorVariants` is ON:* verbatim — *"I think when it is on it should drive
+   everything considering the images it is provided."* So the intended behaviour is that an
+   enabled Director drives the CAMERA PROMPT too, not just concept selection. **This reverses
+   `docs/PIPELINES.md:452` / PR #11** ("Director does not drive video titling or the camera
+   prompt"), which documents the CURRENT code, not the target. Do not delete that line — it is
+   accurate today; mark it as superseded-by-intent when the toggle-on path is built.
+
+      **Original wording:** *"we may choose to use more archetypes and create them in
    the future, but right now we want to get it right with the canonical prompt."* So the work
    is TUNING THE CANONICAL PROMPT, not re-enabling the Director for video and not plumbing
    concept fields into it. Treat archetype-driven video as explicitly deferred, not missing.
@@ -148,7 +200,7 @@ Owner-set: **production quality first, money hardening after output is proven.**
    run-level message correctly says *"all 1 already queued"* — it counts payloads BUILT, not
    ads INSERTED. Two contradictory statements in one response. Introduced 2026-08-03.
 
-5. **VIDEO COST IS NEVER RECONCILED — the expensive path runs on a guess.**
+6. **VIDEO COST IS NEVER RECONCILED — the expensive path runs on a guess.**
    Images ARE reconciled: `scheduleCostReconcile` (`atlasImageService.js:134-157`) polls
    `GET /model/prediction/{id}` at 3s/10s/30s, reads `res.data.data.price` — the ACTUAL
    Atlas price — and flips the CostLog row from `costSource:'estimated'` to `'actual'`,
@@ -163,7 +215,7 @@ Owner-set: **production quality first, money hardening after output is proven.**
    (`atlasVideoService.js:2666`), which is exactly the handle `scheduleCostReconcile` needs.
    Same three-line pattern, pointed at the video prediction endpoint.
 
-6. **ALLOW EXPLICIT VIDEO REGENERATION — owner-approved 2026-08-03, reversing an earlier
+7. **ALLOW EXPLICIT VIDEO REGENERATION — owner-approved 2026-08-03, reversing an earlier
    owner call.** `computeV2IdentityDigest` (`campaignAdsGenerationService.js:1685-1704`)
    scopes the digest to `generationRunId` for STATIC but deliberately EXCLUDES video, citing
    the owner: *"veo should only generate a video once for each product unless it is revised"*
@@ -180,23 +232,23 @@ Owner-set: **production quality first, money hardening after output is proven.**
    Do NOT simply delete the video carve-out — that reopens the $1.00-per-misclick hole the
    original owner instruction was protecting against.
 
-7. **`input_fidelity` DOES NOT EXIST on `gpt-image-2/edit`** — checked against the LIVE Atlas
+8. **`input_fidelity` DOES NOT EXIST on `gpt-image-2/edit`** — checked against the LIVE Atlas
    schema 2026-08-03. Accepted params are exactly: `enable_base64_output`, `enable_sync_mode`,
    `images`, `moderation`, `output_format`, `prompt`, `quality`, `size`. Do not go looking for
    it again. This leaves only THREE levers for product fidelity: more/better product
    references (anchoring, item 2), the prompt (already correct and not working), and
    post-render measure-and-reject.
 
-8. **Meta preview chrome shows "Lorem ipsum dolor sit amet"** as the link description.
+9. **Meta preview chrome shows "Lorem ipsum dolor sit amet"** as the link description.
 
-9. **Post-render safe-box measurement.** Geometry is computed and stated correctly; nothing
+10. **Post-render safe-box measurement.** Geometry is computed and stated correctly; nothing
    verifies the model complied.
 
-10. **Logo contrast/scrim.** Lower than previously recorded — it did NOT reproduce at full
+11. **Logo contrast/scrim.** Lower than previously recorded — it did NOT reproduce at full
    resolution on 2026-08-03 (an earlier call off a low-res thumbnail was wrong). Still worth a
    scrim (`directImageRenderService.js:758-781` has no plate sampling); not a blocker.
 
-11. **Deferred by owner until output is proven:** `queued` ads never auto-drain;
+12. **Deferred by owner until output is proven:** `queued` ads never auto-drain;
    `veoPredictionId` is a spend receipt never resumed, so process death + re-drain double-bills.
 
 ---

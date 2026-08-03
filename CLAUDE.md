@@ -48,6 +48,28 @@ free crop/retitle **intent** (Phase 3 queue fan-out not live — see step 3):
 5. **Preview** the result inside the matching **Meta surface overlay**
    (preview chrome only — known-open: placeholder "Lorem ipsum" copy).
 
+**Video prompt (owner 2026-08-03):** Live path is the **canonical camera-only
+prompt** via `buildVeoPrompt` — not Director concepts. Comment + priority at
+`atlasVideoService.js:2593-2620`: on-screen text is **not** in the Omni prompt;
+Remotion brand-script titling composites it from `ad.copy` + LayoutInputArtifact.
+Generic-looking camera prose is **by design**, not a missing field. Do **not**
+plumb `art_direction` / `creative_style` / `archetype` into the camera prompt.
+**Levers:** `videoPromptGuidance` (prepend), `videoPromptRaw` (full replace;
+logs *"canonical directives bypassed"*), and the canonical directives inside
+`buildVeoPrompt`. `buildVeoPrompt` receives **no** Director concept — args are
+`{brand, product, media, layoutInput, sourceMedia, aspectRatio, seedHasText,
+hasProductReference, storyboard, caps, durationSec}`. Director is **off for
+video by default** (`directorVariants` opt-in; wizard "AI DIRECTOR VARIANTS —
+Off"). Even when on, Director does **not** drive the camera prompt or video
+titling (`docs/PIPELINES.md` §6). `meta_video` / `meta_all` use
+`expandDeterministicVideo` — one Ad per product, no concept expansion.
+**Current objective: tune the canonical prompt.** Archetype-driven video is
+**deferred, not missing.** **None of this is evaluable until Remotion titling
+is fixed** — it dies at `Could not extract frame from compositor / Request
+closed` (`offthread-video-server.js:99`); every run pays for a master with no
+titled output, so prompt changes are unobservable. Font 404/CORS in that log
+is a red herring (FontLoader recovers with fallback stack).
+
 **STATIC** — direct to **gpt-image-2/edit**, one call returns the finished ad
 (`directImageRenderService`). No HTML, no Puppeteer, no SVG overlay compositing.
 Each Meta static size is its own billable image gen (`meta_static` = 3 —

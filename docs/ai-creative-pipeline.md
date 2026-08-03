@@ -60,6 +60,12 @@ ad.** That was the Phase 6 plan for the layout-chain renderer and is **false
 as a description of catalog product-ad delivery today.** Puppeteer remains for
 scraping / logo ingest / review capture, not for new `ai_*` plate generation.
 
+**Video is not the Director path above.** Product video (`meta_video` /
+`meta_all`) queues via `expandDeterministicVideo` — one Ad per product, no
+Director/Judge/concept. The diagram’s Director → Judge → expand chain is the
+**static** (and opt-in `directorVariants` video) path. Default video uses the
+**canonical camera-only prompt**; archetype fields are unused on that path.
+
 Layout Generator / Resolver / RendererJob artifacts (`LayoutGenerationArtifact`,
 `ResolvedLayoutArtifact`, `RendererJobArtifact`) remain in the contract table
 below as Phase 2–6 work; do not assume they sit on the live catalog path
@@ -81,6 +87,17 @@ Every artifact carries `contract_type` + `version` + `cache_key` in its body, so
 Director schema **v3 nests strategy fields under `concept.routing`**:
 `media_picks`, `archetype`, `creative_style`, `output_shape`, priorities, etc.
 (`services/conceptProjection.js` `ROUTING_NESTED_FIELDS`).
+
+**Video path does not consume these today.** Live presets (`meta_video` /
+`meta_all`) expand via `expandDeterministicVideo` — one Ad per product, **no**
+concept expansion. `buildVeoPrompt` takes **no** Director concept
+(`atlasVideoService.js:2593-2620`); `archetype` / `creative_style` /
+`art_direction` do **not** enter the camera prompt. Director remains live for
+**static**. Camera prompt is generic **by design** (Remotion titling burns
+text downstream). Levers are `videoPromptGuidance` + canonical directives in
+`buildVeoPrompt`, not concept fields. Archetype-driven video is **deferred**
+(owner 2026-08-03), not a missing wire. See `docs/PIPELINES.md` §6 and
+CLAUDE.md §00.
 
 **The defect (fixed 2026-08-03):** the producer dual-read both shapes, so its
 validator logged `warnings=0`, while six consumers still read **flat v2 only**
@@ -148,6 +165,12 @@ Omni again). If Remotion titling then throws, the ad is **`failed`** with
 `master rendered; titling failed`, counted against the run; raw master
 **kept** (paid for). No-chrome shipping the master deliberately still counts
 as success (`routes/ads.js:1258-1345`).
+
+**Live blocker (do not claim video end-to-end works):** Remotion currently
+dies every run at `Could not extract frame from compositor / Request closed`
+(`offthread-video-server.js:99`) — paid master, no titled output. Canonical
+prompt tuning is **unobservable** until this is fixed. Font 404/CORS in that
+log is a red herring (FontLoader recovers with fallback stack).
 
 ### `/runs` claim (money)
 
@@ -285,7 +308,7 @@ Phase 0 establishes baseline. Subsequent phases each have a measurable gate befo
 | Phase | Gate |
 |---|---|
 | 0 | CostLog populating; baseline $/ad and cache-hit-rate metrics for current pipeline |
-| 1 | Director vocabulary spread (archetype/emotional_hook/social_proof_type variety); conceptProjection dual-read green |
+| 1 | Director vocabulary spread (archetype/emotional_hook/social_proof_type variety) on **static** concepts; video path does not consume archetype today (canonical camera prompt; deferred); conceptProjection dual-read green |
 | 2 | v2 spec visual quality at parity; cost-per-spec drops 30% vs v1 |
 | 3 | Judge agreement with operator picks; universe-size-aware axes; cost reduction 60-70% vs naive proposal |
 | 4 | Copy variety (3-5 distinct candidates per slot per style) |
@@ -297,6 +320,9 @@ Phase 0 establishes baseline. Subsequent phases each have a measurable gate befo
 
 ## Known open (do not claim fixed)
 
+- **Remotion titling fails every run** — compositor frame extract
+  (`offthread-video-server.js:99`); paid master, no titled output. Font
+  404/CORS is non-fatal. Blocks evaluation of video prompt work.
 - **1-in-3 static ads** can still render a competitor-shaped brand mark on the
   product (e.g. tree emblem reading as Timberland on an Allbirds shoe) —
   prompts already ask for fidelity; fix is measure-and-reject, not more
