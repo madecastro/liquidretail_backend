@@ -55,11 +55,49 @@
 const pf = require('./platformFormats');
 
 // ── generation sizes + surface geometry ─────────────────────────────────
-// The only sizes the edit endpoint accepts. Verified live, not assumed.
+// gpt-image-2/edit size contract: the SCHEMA is operative (the model README is
+// stale and still lists only three sizes). The schema enum has fourteen WxH
+// values, and for gpt-image-2 the description further allows arbitrary
+// WIDTHxHEIGHT strings where both dims are divisible by 16, aspect is between
+// 1:3 and 3:1, and max is 3840x2160.
+//
+// That arbitrary-size clause is spliced from OpenAI's own docs and carries an
+// unpublished "must also satisfy the model's current pixel and edge limits", so
+// it was NOT taken on trust — the failure mode we feared was a silent coercion
+// to the 1024x1024 default, which would hand a SQUARE frame to a 4:5 surface and
+// then centre-crop it. It was PROBED instead, one billable submit, 2026-08-03:
+// size=1088x1360 returned exactly 1088x1360 (aspect 0.800000), prediction
+// 65d1931505bc4620bcf0d7efcdd7aff9. So the gateway does honour arbitrary
+// div-16 sizes on this model.
+//
+// RULE ANYWAY: a size goes in this table only if it is an enum member OR has
+// been probed live, and scripts/verifyStaticSafeBox.js S4 enforces exactly that
+// with the probe evidence recorded alongside. Do not add a size on the strength
+// of the schema prose alone.
+//
+// We keep a SMALL curated table rather than the whole enum: every extra entry
+// can change least-crop selection for some aspect, and every call is billable.
+// Adding a size is a cost and geometry decision, not free.
+//
+// PREVIOUS WRONG TABLE: only the three legacy sizes, above the comment "The
+// only sizes the edit endpoint accepts. Verified live, not assumed." — false for
+// this model. It forced every 9:16 surface onto 1024x1536 and then centre-cropped
+// 80px off EACH SIDE, straight through the typeset CTA and edge copy the model
+// had just painted. platformFormats.js:394-403 already explains why
+// META_STATIC_FANOUT cannot crop one master into three aspects (copy is baked
+// into the pixels by the model); the identical hazard was still happening INSIDE
+// each individual generation. 1152x2048 is on the schema enum, is exactly 9:16,
+// and is proven live on this account (a real submit returned exactly 1152x2048).
+//
+// ORDER IS LOAD-BEARING. chooseGenSize keeps the first entry on a loss tie
+// (`loss < best.loss`, strict — not `<=`), so the legacy sizes stay ahead of any
+// later equal-loss entry. Do not reorder casually.
 const GEN_SIZES = [
   { w: 1024, h: 1024 },
   { w: 1024, h: 1536 },
-  { w: 1536, h: 1024 }
+  { w: 1536, h: 1024 },
+  { w: 1152, h: 2048 }, // enum member, exact 9:16; absent before → 15.6% side crop
+  { w: 1088, h: 1360 }  // PROBED non-enum, exact 4:5; absent before → 16.7% top/bottom crop
 ];
 
 const EDGE_MARGIN_PCT = 6; // convention, ours — not a platform reserve
@@ -90,6 +128,30 @@ function aspectOf(key) {
   return { str: a, value: w / h };
 }
 
+/**
+ * Percent of `total`, rounded INWARD toward the frame centre — ceil for a
+ * low edge (left/top), floor for a high edge (right/bottom).
+ *
+ * The previous `+((v / total) * 100).toFixed(1)` rounded HALF-UP in both
+ * directions, and because `right` is structurally `100 - left` the pair always
+ * rounded the SAME way — so it was coupled, not coincidental. On a crop
+ * boundary it rounded OUTWARD, into the band the geometry prose had just told
+ * the model would be destroyed: 8.3% of 1536 is 127.488px against a cut line at
+ * exactly 128, and 7.8% of 1024 is 79.872px against a cut at 80. Sub-pixel, but
+ * it meant the emitted box was provably not inside the region it described.
+ *
+ * Works in tenths-of-a-percent integers so the guard is exact. The 1e-9 nudge
+ * absorbs pure float dust on values that are mathematically whole tenths —
+ * 69.12/1152 is exactly 6%, yet in IEEE754 it lands at 60.000000000000014
+ * tenths, and a naive ceil would report 6.1% and quietly tighten the box.
+ */
+function pctInward(v, total, side) {
+  const tenths = (v / total) * 1000;
+  return side === 'lo'
+    ? Math.ceil(tenths - 1e-9) / 10
+    : Math.floor(tenths + 1e-9) / 10;
+}
+
 function computeSurface(key) {
   const aspect = aspectOf(key);
   const canvas = pf.canvasForPlatformFormat(key);
@@ -109,20 +171,90 @@ function computeSurface(key) {
   const topReservePx = topReserveFrac * keptH;
   const botReservePx = botReserveFrac * keptH;
 
-  // Text-safe box in generated pixels, before the margin convention.
-  let x0 = cropLeftPx;
-  let x1 = cropLeftPx + keptW;
-  let y0 = cropTopPx + topReservePx;
-  let y1 = cropTopPx + keptH - botReservePx;
+  // Text-safe box in generated pixels.
+  //
+  // PREVIOUS WRONG VERSION — the margin was applied as
+  //   x0 = Math.max(cropLeftPx, marginPx)
+  //   y0 = Math.max(cropTopPx + topReservePx, marginPx)
+  // measured from the GENERATED origin. That treats the crop band and our edge
+  // margin as ALTERNATIVES when they are ADDITIVE. marginPx was 61.44px on every
+  // live surface and the crop band was always larger — 128px on 4:5, 80px on the
+  // old 9:16 — so `Math.max` discarded the margin entirely and the safe box
+  // edges BECAME the crop lines. The live path emitted, verbatim: "The top and
+  // bottom 128px of what you generate WILL BE CUT AWAY and never seen. EVERY
+  // element ... must sit inside the box from 6% to 94% of width and 8.3% to
+  // 91.7% of height" — and 8.3% of 1536 is 127.5px. The model was told text may
+  // sit flush against pixels the same paragraph called destroyed. Only 1:1
+  // escaped, because its crop is zero.
+  //
+  // The proof this was real in DELIVERED pixels needs no model compliance and no
+  // billable call: the logomark is composited by us from this same box
+  // (directImageRenderService.logoPlacementFor). Measured before the fix, the
+  // clamped box's right edge equalled the frame width on Stories and its bottom
+  // edge equalled the frame height on 4:5, so the brand's logomark shipped FLUSH
+  // to the delivered edge — 0px gap, for any logo size. That is the same defect
+  // class the logo-placement docstring in directImageRenderService claims to
+  // have fixed, arrived at by different arithmetic.
+  //
+  // A quieter twin of the same conflation, also fixed here: marginPx was based
+  // on Math.min(gen.w, gen.h) — the GENERATED short side, which includes pixels
+  // that are about to be destroyed and never seen. It is now based on the KEPT
+  // short side, i.e. the canvas that actually exists by the time anyone looks at
+  // the ad. Note the second-order effect: on a heavily cropped landscape frame
+  // this makes the absolute margin SMALLER (pmax 16:9 goes 61.44 → 51.84) even
+  // as its vertical margin goes from zero to real. That is correct under the
+  // "margin against the canvas that will be seen" rule, not a free tightening.
+  //
+  // With 1152x2048 and 1088x1360 in the table, EVERY live static surface now
+  // generates at its exact delivery aspect, so cropPx is all-zero and this
+  // arithmetic reduces to reserve + margin. The crop terms are kept rather than
+  // deleted because they are still load-bearing for the frozen 16:9 surface, and
+  // because extractFor remains the defence against a model that returns an
+  // off-size frame. A future surface with an awkward aspect will crop again.
+  const marginPx = (EDGE_MARGIN_PCT / 100) * Math.min(keptW, keptH);
 
-  // Edge margin, applied against the generated frame's short side.
-  const marginPx = (EDGE_MARGIN_PCT / 100) * Math.min(gen.w, gen.h);
-  x0 = Math.max(x0, marginPx);
-  x1 = Math.min(x1, gen.w - marginPx);
-  y0 = Math.max(y0, marginPx);
-  y1 = Math.min(y1, gen.h - marginPx);
+  let x0 = cropLeftPx + marginPx;
+  let x1 = cropLeftPx + keptW - marginPx;
+  let y0 = cropTopPx + topReservePx + marginPx;
+  let y1 = cropTopPx + keptH - botReservePx - marginPx;
 
-  const pct = (v, total) => +( (v / total) * 100 ).toFixed(1);
+  // Degenerate guard. A tiny kept region, or a platform reserve larger than the
+  // kept band, can invert the box once the margin is applied. Drop the margin
+  // rather than emit left > right: a zero-margin box is still geometrically
+  // honest, an inverted one is nonsense the model would have to guess at. Do not
+  // "fix" this by collapsing to the midpoint — that pins every element onto a
+  // single pixel row.
+  if (x0 >= x1) {
+    x0 = cropLeftPx;
+    x1 = cropLeftPx + keptW;
+  }
+  if (y0 >= y1) {
+    y0 = cropTopPx + topReservePx;
+    y1 = cropTopPx + keptH - botReservePx;
+    // The reserve alone can still invert it (a reserve taller than the kept
+    // band). Fall all the way back to the full kept band.
+    if (y0 >= y1) {
+      y0 = cropTopPx;
+      y1 = cropTopPx + keptH;
+    }
+  }
+
+  // Safety net — never emit a coordinate outside the generated frame.
+  x0 = Math.max(0, Math.min(x0, gen.w));
+  x1 = Math.max(0, Math.min(x1, gen.w));
+  y0 = Math.max(0, Math.min(y0, gen.h));
+  y1 = Math.max(0, Math.min(y1, gen.h));
+
+  // The clamp itself can collapse a NON-inverted pair: if x0 and x1 both sit on
+  // the same side of [0, gen.w] — both negative, or both past the edge — they map
+  // to the same boundary and the box becomes zero-width. The guards above only
+  // catch x0 >= x1 BEFORE clamping, so they cannot see this. Unreachable from
+  // today's centred-crop arithmetic (every coordinate is already in range), but
+  // "the guards above prevent a degenerate box" would otherwise be a claim the
+  // code does not actually make. A zero-width box tells the model to put every
+  // element on one pixel column, which is worse than no constraint at all.
+  if (x0 >= x1) { x0 = 0; x1 = gen.w; }
+  if (y0 >= y1) { y0 = 0; y1 = gen.h; }
 
   return {
     key,
@@ -133,7 +265,12 @@ function computeSurface(key) {
     cropPx: { left: cropLeftPx, right: cropLeftPx, top: cropTopPx, bottom: cropTopPx },
     platformReservePx: { top: Math.round(topReservePx), bottom: Math.round(botReservePx) },
     platformReserveDeclared: { top: safe.top || 0, bottom: safe.bottom || 0, left: safe.left ?? null, right: safe.right ?? null },
-    box: { left: pct(x0, gen.w), right: pct(x1, gen.w), top: pct(y0, gen.h), bottom: pct(y1, gen.h) },
+    box: {
+      left:   pctInward(x0, gen.w, 'lo'),
+      right:  pctInward(x1, gen.w, 'hi'),
+      top:    pctInward(y0, gen.h, 'lo'),
+      bottom: pctInward(y1, gen.h, 'hi')
+    },
     lossPct: +(gen.loss * 100).toFixed(1)
   };
 }
@@ -153,7 +290,14 @@ function geometryBlock(s) {
     lines.push(`${s0.charAt(0).toUpperCase()}${s0.slice(1)} of what you generate WILL BE CUT AWAY and never seen.`);
   }
   if (s.platformReservePx.top || s.platformReservePx.bottom) {
-    lines.push(`The platform then covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the surviving image with its own interface.`);
+    // "then … the surviving image" only parses when a cut sentence preceded it.
+    // Now that every live static surface generates at its exact aspect there is
+    // no cut, and the old wording left the model reading a sequel to a sentence
+    // that was never emitted — and implying a crop that is not happening.
+    const cut = s.cropPx.top || s.cropPx.left;
+    lines.push(cut
+      ? `The platform then covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the surviving image with its own interface.`
+      : `The platform covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the frame with its own interface.`);
   }
   // Element-agnostic on purpose. Naming "the CTA" here asserted a CTA exists,
   // which on Stories (platform supplies it) contradicted the absence list — the

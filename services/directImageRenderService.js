@@ -764,10 +764,20 @@ async function renderDirectImage({
   const box = extractFor(built.surface, frame.width, frame.height);
   const [reqW, reqH] = String(genSize).split(/[x*]/).map(Number);
   if (frame.width !== reqW || frame.height !== reqH) {
-    console.warn(
-      `   ⚠️  direct-image: model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
-      `cropping the ${built.surface.aspect} centre of what arrived`
-    );
+    const msg =
+      `model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
+      `cropping the ${built.surface.aspect} centre of what arrived`;
+    console.warn(`   ⚠️  direct-image: ${msg}`);
+    // Surfaced per-ad, not just in logs, because this is the alarm for the one
+    // operational risk the exact-aspect size table takes on: 4:5 generates at
+    // 1088x1360, which is NOT a member of the schema's size enum and is in use on
+    // the strength of a single live probe. If the gateway ever starts coercing an
+    // arbitrary size to its 1024x1024 default, the symptom is precisely this
+    // mismatch — and because extractFor then centre-crops to the surface aspect,
+    // the ad would still LOOK plausible while cropping through typeset copy
+    // exactly as the old stale table did. A console warning on a worker nobody is
+    // tailing is not an alarm; a renderIssue on the Ad is.
+    noteRenderIssue(adId, { message: msg, stage: 'generation-size' });
   }
   const rendered = await sharp(rawFrame)
     .extract(box)

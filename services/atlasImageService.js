@@ -437,7 +437,12 @@ function buildParams(model, { prompt, size, quality, images, inputFidelity, aspe
     if (aspectRatio) p.aspect_ratio = aspectRatio;
     return p;
   }
-  // gpt-image family: size enum 1024x1024|1024x1536|1536x1024, quality low|medium|high.
+  // gpt-image family: `size` is a WxH string. The live schema enum lists 14
+  // presets (not the 3 this comment used to claim), and gpt-image-2 additionally
+  // documents arbitrary sizes divisible by 16, aspect 1:3–3:1, max 3840x2160 —
+  // though that clause is unproven on the Atlas gateway. Passed through below
+  // with NO clamp, so callers own size legality; see staticAdIntents.GEN_SIZES.
+  // quality low|medium|high.
   const p = { prompt };
   if (size) p.size = size;
   if (quality) p.quality = quality;
