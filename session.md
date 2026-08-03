@@ -2,11 +2,85 @@
 
 ## Next-session prompt
 
-### PICK UP HERE (2026-07-31, later) — proof + geometry blockers FIXED, one decision waiting
+### PICK UP HERE (2026-08-02, late) — everything below is COMMITTED, nothing pushed
+
+Branch `feat/render-activity-board`. **11 commits, zero pushed, zero deployed.**
+Live prod still runs `a80ae0b`. All **19** `scripts/verify*.js` green.
+
+| commit | what |
+|---|---|
+| `c4bbb12` | Phase 0 — ReferenceError that broke every fresh Director round |
+| `53f6486` | Director reasoning quarantined from image prompts (110-check harness) |
+| `919627a` `e3e1578` `d038053` | Presets: platform-grouped, Google frozen, coming_soon → 400 |
+| `ccf4328` | **The video model is OMNI, not Veo** — corrected + 2 stale claims |
+| `30b21d9` `a1dca08` | CLAUDE.md **§00** — the catalog pipeline, written down |
+| `01e7d1c` | Three doors to the old renderer closed; **image regenerate fixed** |
+
+**READ CLAUDE.md §00 FIRST.** It is the owner-stated architecture for catalog
+product ads and supersedes anything older in this file.
+
+#### THREE MISNOMERS — each cost a wrong conclusion this session
+- **`veo*` is OMNI.** `BUILT_IN_DEFAULT_MODEL = google/gemini-omni-flash/image-to-video-developer`,
+  `ATLAS_VIDEO_MODEL` blank. `renderRoute:'veo'`, `veoPredictionId`, `VEO_CONCURRENCY` — all Omni.
+- **`renderRoute:'html_gen'` means STATIC**, not "HTML renderer". Every image ad gets it.
+  `renderService.js:470` sends every `ai_*` static ad to `renderDirectImage` and returns.
+- **`chrome` is the TITLING overlay**, burned in and correct. The Meta surface overlay
+  (with Meta's per-surface CTA) is **PREVIEW ONLY** and must never be burned in.
+
+#### IN FLIGHT WHEN THIS WAS WRITTEN
+- **p7 concurrency consolidation — Grok RUNNING, will leave uncommitted edits.**
+  Spec: `/private/tmp/.../scratchpad/p7.md`. One `services/concurrency.js`, every knob
+  env-tunable, `RENDER_CONCURRENCY` 4→8, `VEO_CONCURRENCY` 1→4. **Verify before committing:**
+  Grok's 1 RPS must survive per-model-slug, and raising concurrency must not push renders
+  past `REAP_STALE_MIN` (reaper requeue = double bill).
+- **p8 spec WRITTEN, not started:** `/private/tmp/.../scratchpad/p8-models-spec.md`.
+  Grok is NOT a fallback (stays selectable); no automatic fallback anywhere
+  (`allowFallback` default → false); model registry; OpenAI-direct + Gemini-direct as
+  options; **Telegram deleted, Slack the only transport** (7 files carry Telegram today).
+
+#### CONCURRENCY AUDIT — findings (Grok, verified)
+- `VEO_CONCURRENCY=1`'s justification is **stale and mis-attributed**: commit `3a98cd4`
+  wrote it for retired direct-Veo; `1492dca` for **Grok's real 1 RPS** (fallback model, not
+  Omni). `atlasVideoService.js:265` admits Omni's RPS is **unpublished/unmeasured**.
+  Cost: `backlogWatchdog.js:36` — a 20-video batch takes **20 minutes**.
+- **Atlas advertises no rate-limit headers.** Empirical today: **8 concurrent
+  gpt-image-2/edit, 85s, zero 429s.** Image submits are entirely **unpaced**
+  (`atlasImageService.js:162`); `pacedModelSubmit` is video-only.
+- **Titling is already order-free** — per-asset once `veoVideoUrl` exists, no sibling join.
+  Remotion serialises *execution* (resource-bound), never input order. Nothing to fix.
+- **REAL HOLE: nothing auto-drains `queued` Ads.** Only `/generate` and `/runs` drain;
+  `worker.js:184-189`'s reaper only flips `rendering→queued`. Order 50 → 30 sit forever.
+
+#### STEPWISE REFINEMENT A/B — done, anchoring wins
+`gpt-image-2/edit` on Atlas is **STATELESS** (live schema: `images`, `prompt`, `size`,
+`quality`, `output_format`, `moderation` only — no turn/conversation id). So stepwise
+must re-supply the previous render. Flat **$0.01** per prediction regardless of input
+count, so **anchoring is free**.
+4 difficulties × pure vs anchored on a Gymshark duffle. At the hard rung (reposition),
+**anchored held product fidelity** — front-on like the catalogue, both cream end panels,
+crisper GYMSHARK arc — while **pure drifted** (three-quarter angle, one panel, reshaped).
+Build **anchored** (previous render + product photo, product photo authoritative) with a
+"start over from product photo" control.
+**Bonus finding:** the duffle renders maroon and the product IS maroon — so the ad's quote
+*"the perfect vibrant pink"* is a **fabricated claim**, not a render bug.
+
+#### STATIC CREATIVE DEFECTS — found by QC, NONE fixed
+Garment branding redrawn as gibberish (Gymshark shark-fin → "elf 7" on the sports bra);
+composited logo at **1.12:1 contrast** (invisible); same SKU as two colourways; safe-box
+breaches. These are the remaining blockers to "perfect" Meta static.
+
+### Google frozen + preset split — COMMITTED (e3e1578, d038053). Frontend still to do
+
+Backend-only Google freeze + preset split:
+- `platformFormats.js` — pmax frozen, google presets empty, `formatCatalog()`
+- campaign/ads refuse coming_soon with 400
+All verify scripts green. Frontend: consume `formatCatalog()` for greyed Google.
+
+### Proof + geometry blockers — COMMITTED (10c9479, 64bf6d6, 52e5a08). One decision still waiting
 
 Three commits on `feat/render-activity-board`, **not yet pushed, no PR**:
 `10c9479` geometry, `64bf6d6` fabricated proof, `52e5a08` snippet inversion.
-All 14 `scripts/verify*.js` green. Each fix is revert-proven.
+(verify suite now 18 scripts.)
 
 #### THE ONE DECISION WAITING FOR THE OWNER
 
@@ -639,6 +713,14 @@ A fresh independent Grok adversarial pass (run before merging, on the staged dif
 - **`postinstall`'s `npx remotion browser ensure` has never once succeeded** — found 2026-07-31 via live prod logs. Every build logs `npm error could not determine executable to run` (~10×/day across deploys, seen at 05:37, 06:43, 12:01, 17:32 …). Cause: the `remotion` CLI binary ships in **`@remotion/cli`**, which is **not a dependency** — 13 `@remotion/*` packages are installed at 4.0.495, `@remotion/cli` is absent, so `node_modules/.bin/remotion` does not exist. The `|| true` in `postinstall` swallows it and the build still reports "Build successful 🎉".
   **Currently harmless, but latent.** Verified on the live instance that a working browser *is* present anyway: `node_modules/.remotion/chrome-headless-shell/linux64/.../chrome-headless-shell`, 219MB, executable, reports **Chromium 149.0.7790.0**. It arrives via the tracked-`node_modules` tree / build cache (mtime matches build time), **not** via the ensure step. So Remotion renders fine today — the risk is that the repair step is a no-op: if that binary is ever missing from the cache or the tracked tree, nothing self-heals it. This is the same failure shape as the Puppeteer-cache bug already recorded in the workspace `session.md`.
   Fix is either add `@remotion/cli` as a devDependency, or drop the dead `npx remotion browser ensure` and rely on `@remotion/renderer`'s own `ensureBrowser()`. **Do not** just delete the `|| true` — that would turn a silent no-op into a hard build failure.
+- **Atlas/LLM cost-ledger gap — dev prototype harnesses silently drop `CostLog` rows (found 2026-08-01, NOT fixed).** `prototypes-2026-07-31/gpt2test/*` (~20 one-off scripts — `run.js`, `bakeoff/*`, `nametest.js`, `reliability.js`, `soludos/run.js`, etc.) `require()` the REAL `services/atlasImageService.js` / `atlasLlmService.js` straight out of this repo (not copies), so every generation they run is a real billable Atlas call — but none of these scripts ever open a Mongoose/Mongo connection. `costTracker.persistCost`'s `CostLog.create(...)` therefore almost certainly hits Mongoose's connection-buffering timeout (default ~10s) and fails silently (the generic `catch` branch, `console.warn` only — not the loud schema-drift/`ValidationError` path), so every dollar these harnesses spend (session.md already documents ~$1.28 + ~$0.80 + ~$0.48 across three named A/B runs alone, plus ~15 other scripts) is invisible to the ledger, and each Atlas call in them likely eats an extra ~10s hang on the buffer timeout. Reasoned from the code, not confirmed by running anything (that would spend real money). Not a defect in the harnesses themselves — they're intentionally throwaway and were never meant to hit prod Mongo. Fix, if wanted, is narrow: either (a) have these scripts open a short-lived Mongoose connection before calling the real services so genuine dev spend gets ledgered, or (b) give `costTracker` a no-DB/local mode (stdout or a local JSON file) so ad-hoc dev spend is visible without touching prod data. Owner call: test harness itself is fine as-is; this is a note to fix the ledgering gap, not the harness.
+- **Atlas/LLM cost-ledger audit (2026-08-01) — 17 confirmed LIVE gaps found (real spend, zero `CostLog` row), 8 partial.** Full 69-call-site audit run as an 8-group Workflow (Grok find + independent adversarial verify per group, 0 errors) plus manual spot-checks; report not committed to the repo, ask the session that ran it if the file is still needed. Priority order to fix:
+  1. **`services/providers/geminiSearchProvider.js`** — all 4 exported functions (`match` 100-108, `lookupBrandCategoryUrl` 187-195 [dead, no live caller], `lookupBrandReviews` 250-258+296-337, `lookupProductReviews` 395-403+439-481) fire raw `axios.post` to Gemini's grounded-search endpoint with zero `costTracker` reference in the file. `match()`/`lookupProductReviews()`/`lookupBrandReviews()` are LIVE — `match()` fires on essentially every DetectRun via `pipelines/detect.js` → `runProductMatchChain`; `lookupProductReviews()` also fires synchronously from an operator button, `routes/integrations.js:824` `POST /api/integrations/instagram/catalog/:productId/refresh-reviews`. Highest call-volume gap found. Also unlogged via the same pattern: `services/productDetailsService.js` (`serp()` SerpAPI Google Shopping/Immersive calls — not LLM but same invisibility — plus a real `fetchReviewSummary()` Gemini call, fires on every catalog sync) and `services/categoryReviewsService.js fetchCategoryReviews()` (Tier-2.5 of `productMatchService.enrichOneMatchInPlace`).
+  2. **`services/atlasImageService.js directOpenAiImages()`** (475-490) — the direct-OpenAI fallback (`images.generate`/`images.edit`) used by `generateImage()`/`editImage()` whenever the Atlas leg fails, has ZERO `recordFlatCost`/`trackLlmCall` call — directly contradicts the file's own comment at 534-539 claiming "OpenAI via its own recordFlatCost path" (no such path exists). Reachable from all 6 production consumers, most importantly **`services/directImageRenderService.js`** — its own header calls it *"THE production static-ad render path"* — so an Atlas outage during static-ad gen means invisible OpenAI spend on the core feature. Also inherited by `services/personaAvatarService.js` (live, `POST /api/brand/:id/personas/:index/avatar`) and `services/openaiService.js`'s DALL-E marketing-image step (`fallbackModel:'dall-e-3'` explicitly configured).
+  3. **`services/atlasTextService.js`** — a second Claude-via-Atlas transport, completely separate from `atlasLlmService.js`, zero `costTracker` reference anywhere. 3 live call sites in `routes/brand.js` (~1558 `runModifyTitleSpec` title-spec chat edits, up to 2 retries; ~1852 canvas-theme JSON gen; ~2157 canvas-script gen/modification, `maxTokens:12000` — the largest single unlogged call found).
+  4. **`services/aiVideoReferenceService.js`** — the direct-Google Veo 3.1 "vertex" fallback video path (`submitVeoJob`), zero `costTracker` reference in the 415-line file. Dormant only because `config/defaults.env` sets `VIDEO_PROVIDER=atlas` (default); `services/videoRouter.js` is the only gate and adds no warning on the unlogged branch. Would silently leak spend (video is the most expensive per-call surface, ~$1-2.40/render) the moment anyone flips `VIDEO_PROVIDER=vertex` during an Atlas outage.
+  5. **`services/geminiImageService.js polishImage()`** — rows ARE written (both callers, `aiVideoPosterService`/`aiOverlayPolishService`, wrap it in `trackLlmCall`), but `costTracker.MODEL_RATES` has no entry for `'gemini-2.5-flash-image'` (only `'gemini-2.5-flash'`, no `-image` suffix) — every call logs **$0**. Also double-counts: when the Atlas leg succeeds, `atlasImageService.editImage()` already records the real price internally, so a successful call writes two rows (one real, one duplicate $0).
+  Lower-priority partials (rows written, coverage/accuracy incomplete): `atlasImageService.submitAndPoll()` and `atlasVideoService.js`'s video-submit + reframe-submit charge points have no try/catch around the raw axios call, so a network-level exception (not an HTTP error) after a successful, already-billed submit skips the ledger row entirely; `atlasVideoService.js` never stamps `providerRequestId` on video rows, so `reconcileCost()` can never upgrade an estimated video cost to actual (permanently affects the still-`UNVERIFIED` `xai/grok-imagine-video-v1.5` pricing flagged since 2026-07-21). Confirmed dead code, no action needed: `services/whisperService.js transcribeAudio()` (caller never invoked), `services/openaiImageService.js` (mask inpainting — zero callers anywhere, `docs/ATLAS.md` §3 still lists it as live, doc is stale), `services/aiImageReferenceService.js` (shadow wiring deliberately removed 2026-07-31). 44 of 69 call sites audited are correctly ledgered.
 
 ## Session log
 - 2026-07-22: All of the above implemented (Grok CLI drafted; Fable reviewed line-by-line + one hand-edit: guardrail defaults to Reels bands when chrome=None; adversarial Grok pass run pre-commit). Owner decisions: corrections now / calibrate later; guardrail toggle yes; tighten vertical safe zone now.
