@@ -1067,13 +1067,19 @@ function resolveTitlingEngine(brand, ad) {
 // BRAND_SCRIPT_RETAIN_TMP is set for post-mortem.
 async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSnapshot = null }) {
   const fs = require('fs');
-  const { uploadBufferToCloudinary } = require('./cloudinaryService');
+  const { uploadFileToCloudinary } = require('./cloudinaryService');
   const Ad = require('../models/Ad');
   const { adStage } = require('./adStage');
   try {
     adStage(ad._id, `uploading titled video (${ad.aspectRatio || 'video'})`);
-    const buffer = await fs.promises.readFile(finalPath);
-    const uploaded = await uploadBufferToCloudinary(buffer, {
+    // Stream straight from disk (efficiency finding #4) instead of the old
+    // fs.promises.readFile(finalPath) -> uploadBufferToCloudinary(buffer, ...)
+    // path: that read the whole rendered mp4 into one in-memory Buffer (tens/
+    // hundreds of MB for a titled master) only to have uploadBufferToCloudinary
+    // immediately re-wrap it in a streamifier Readable for upload_stream.
+    // finalPath isn't needed for anything else afterward (only tempDir is,
+    // for cleanup below), so there's nothing lost by not buffering it.
+    const uploaded = await uploadFileToCloudinary(finalPath, {
       folder:       'liquidretail/brand_script',
       resourceType: 'video',
       overwrite:    true
