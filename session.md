@@ -542,6 +542,43 @@ are corrected here so nobody re-chases them:
    the lever is fewer polls for rate-limit headroom, and no sync/webhook field exists in any
    of the 5 param shapes — upstream capability UNVERIFIED.
 
+### 0.2999 UI END-TO-END TEST + ITERATIONS 3/4 (2026-08-04, owner driving)
+
+**UI test (owner's Chrome, staging): TEAM PATH PASSES end to end.** Wizard -> dispatch ->
+2 Omni masters ($1 each, ledgered `submitted`) -> square face-crop titling -> playable in Meta
+preview -> run `done` -> **Slack per-run feed POSTED (first live observation —
+CampaignRun.slackFeed {ts, channel})**. Video dedupe protected the third product (Warm Red
+already owns video ads — not re-billed). 8s is the wizard default. UI findings logged as
+tasks: Render Activity board never fetches its data (#13); format chips only register on the
+active card + video cards mislabeled AI_BRAND_LED (#14); preview-chrome "Lorem ipsum"
+confirmed live (known-open).
+
+**Iteration 3 (PR #63, deployed):** sizeScale bumps (~x1.2 family-wide, fit arithmetic
+verified); `visibleWhenEmpty:"<slotKey>"` spec property (cycle-proof) + proof-phase fallback
+headline when the quote is gated empty; animated rating lockup — stars pop L->R on staggered
+springs with TRUE partial-star fill (clipPath; stars were full-only before), count rolls 0->N
+ease-out with tabular-nums; settle 1.48s; all useCurrentFrame-deterministic. Suite 35/35
+(verifyRatingMotion 26).
+
+**canon4 (14 ads = pilot 12 + the 2 UI-run ads) frame review — CORRECTIONS:**
+- An initial "proof beat regressed, quote+stars gone" read was WRONG twice: (a) the quote gate
+  withholds on EVERY pilot ad (unstamped provenance) — the fallback claim rendering is the
+  DESIGNED behaviour, canon3 never had quotes either; (b) the sheet's 3.2s proof frame caught
+  the stars MID-ANIMATION at near-zero scale — at 4.6s the Pelagic lockup is exactly as
+  directed (brand-navy claim + large gold ★★★★★ 5.0/5). Sheet proof frame moved to 4.6s.
+- Pelagic's blue type = its own brand on-light token (inkVote flipped on-light) — the
+  "multi-color if on-brand" direction emerging naturally.
+- **REAL defect 1: keep-out NEVER fires** — zero `keepOut:` log lines; the basic plate scan
+  never sets band `avoid` flags (luma-only). Text still lands on faces.
+- **REAL defect 2: ink tie rule** — `light=3 dark=3 -> brand-default` put white type on a
+  near-white wall (AllBirds proof beat).
+
+**Iteration 4 (in flight):** wire the EXISTING cached face detection (detectClipBoxes,
+~$0.02/master once, ledgered) into plateHints `avoid` bands behind TITLE_FACE_KEEPOUT
+(default true), incl. explicit pixel->fraction coordinate conversion; ink tie breaks toward
+global median plate luma (>0.55 -> on-light), logged. Then canon5 re-render + artifact
+refresh (same URL).
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
