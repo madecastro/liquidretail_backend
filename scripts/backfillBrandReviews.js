@@ -31,13 +31,33 @@
 //     IS ledgered: every call goes through costTracker.trackLlmCall into the
 //     CostLog collection (atlasLlmService.js:24-30, costTracker.js).
 //   - Tier 4 (brand reviews — the tier this script cares about,
-//     services/providers/geminiSearchProvider.js:lookupBrandReviews) is NOT
-//     ledgered anywhere: it calls axios.post directly against the raw Gemini
-//     generativelanguage endpoint with no costTracker/CostLog involvement.
-//     This script does not add ledgering (that is a service-level change,
-//     out of scope for a read-only-elsewhere driver) — flagging it here so
-//     the gap is documented at the one place an operator will look before
-//     running a paid sweep.
+//     services/providers/geminiSearchProvider.js:lookupBrandReviews) IS NOW
+//     LEDGERED. This comment previously said it was not, and that was true
+//     when written: the provider called axios.post directly against the raw
+//     Gemini generativelanguage endpoint with no costTracker involvement, so
+//     brand-enrichment spend was invisible in month-to-date totals. That gap
+//     is closed — all four billable POSTs now route through one
+//     trackedGenerate() helper into costTracker.trackLlmCall, and costTracker
+//     carries GROUNDED_SEARCH_COST_PER_REQUEST_USD for the search surcharge.
+//     Corrected 2026-08-03 after verifying the live call chain; left in place
+//     rather than deleted because this is the one spot an operator reads
+//     before authorising a paid sweep, and "spend is invisible" is exactly the
+//     kind of stale warning that stops a legitimate run.
+//
+// KNOWN BLOCKER — READ BEFORE PLANNING A SWEEP. As of 2026-08-03 a dry run over
+// production reports the brand-reviews tier WILL NOT RETRY for any of the 17
+// brands missing a rating, and GEMINI_API_KEY is present on the box, so the
+// cause is the other half of the gate: `wantBrandReviews` is
+// `!!GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews')`
+// (brandEnrichmentService.js:116), and every one of those brands already has
+// 'brand-reviews' in `enrichmentSources` from an earlier attempt that returned
+// nothing. So `--apply` today would fire the OTHER pending tiers (gpt,
+// brandfetch, scrape — several of them billable) and still write zero reviews.
+// Unblocking means clearing 'brand-reviews' from enrichmentSources for the
+// specific brands you want retried. Note also that 10 of those 17 are test or
+// duplicate records (Apple, Egami, Test, Test 2, three Hot Crispy Oil variants
+// including a typo'd domain, and a livingspaces/Living Spaces pair) — a blind
+// 17-brand sweep would spend most of its money on junk.
 //
 // DEFAULT IS DRY-RUN. Nothing is written and no billable call is made unless
 // --apply is passed.
