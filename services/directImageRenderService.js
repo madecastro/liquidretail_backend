@@ -574,7 +574,11 @@ async function renderDirectImage({
   //   operatorPrompt     — refinement note appended to the auto-built prompt
   //   rawPromptOverride  — verbatim replacement ({system,user} or string)
   operatorPrompt = null,
-  rawPromptOverride = null
+  rawPromptOverride = null,
+  // Post-render vision QC re-entry guard. The single allowed regeneration
+  // calls renderDirectImage again with skipVisionQc:true so the QC loop
+  // cannot nest (money: would otherwise allow unbounded regenerations).
+  skipVisionQc = false
 }) {
   const surface = platformFormat || 'meta_feed_1_1';
   // Credentials are checked further down, AFTER brand routing: a brand
@@ -936,7 +940,7 @@ async function renderDirectImage({
     `text=${built.text.length}${built.dropped.length ? ` dropped=${built.dropped.join('+')}` : ''} ` +
     `model=${PLATE_EDIT_MODEL}`
   );
-  return {
+  const firstOutput = {
     buffer, contentType: 'image/png', width: dims.width, height: dims.height,
     bytes: buffer.length, kind: 'image', directImage: true,
     // Verbatim audit of the image-model request, built at submit time inside
@@ -959,7 +963,112 @@ async function renderDirectImage({
       droppedRoles: built.dropped,
       generateSize: genSize,
       logoComposited: layers.length > 0
+    },
+    visionQc: null
+  };
+
+  // ── Post-render vision QC ──────────────────────────────────────────
+  // skipVisionQc: re-entry from the single allowed regeneration must not
+  // nest another QC loop (that would break the one-retry money bound).
+  if (skipVisionQc) return firstOutput;
+
+  const adVisionQc = require('./adVisionQcService');
+  if (!adVisionQc.isEnabled()) {
+    return firstOutput;
+  }
+
+  // ORIGINAL product photo — the first reference we actually sent. A check
+  // that only sees the render cannot tell an invented Timberland emblem from
+  // a real brand mark (owner requirement: both images in one vision call).
+  const originalProductUrl = imageMeta[0]?.sourceUrl || null;
+  if (!originalProductUrl) {
+    console.warn('   ⚠️  direct-image: vision QC enabled but no original product URL — shipping without QC');
+    return firstOutput;
+  }
+
+  const safeBox = safeBoxInDeliveredPx(built.surface, dims);
+  const expectedText = built.text.map(([, str]) => str);
+
+  adStage(adId, `vision QC (${surface})`);
+  const qcResult = await adVisionQc.runPostRenderQc({
+    enabled: true,
+    originalProductUrl,
+    brandName: resolvedBrand?.name || null,
+    safeBox,
+    deliveryDims: dims,
+    expectedText,
+    brandId: resolvedBrand?._id || brandId || null,
+    productId: resolvedProduct?._id || productId || null,
+    adId: adId || null,
+    // MONEY: generate() attempt 1 returns the already-paid firstOutput.
+    // attempt 2 (at most once) re-enters renderDirectImage with a corrective
+    // operatorPrompt and skipVisionQc:true — one more billable editImage.
+    generate: async ({ attempt, correctiveNote }) => {
+      if (attempt === 1) return firstOutput;
+      adStage(adId, `vision QC regen (${surface})`);
+      return renderDirectImage({
+        layoutInputArtifactId,
+        aspectRatio,
+        mediaId,
+        productId,
+        brandId,
+        adId,
+        adConceptArtifactId,
+        adConceptId,
+        template,
+        referenceMediaIds,
+        referenceSource,
+        platformFormat,
+        operatorPrompt: correctiveNote,
+        rawPromptOverride,
+        skipVisionQc: true
+      });
+    },
+    // Keep discarded (paid) renders durable — owner requirement.
+    uploadAttempt: async ({ buffer: buf, attempt }) => {
+      try {
+        const { uploadBufferToCloudinary } = require('./cloudinaryService');
+        const up = await uploadBufferToCloudinary(buf, {
+          folder: `ads/qc-discarded/${brandId || 'unknown'}`,
+          publicId: `${adId || 'ad'}-qc-a${attempt}-${Date.now()}`,
+          resourceType: 'image',
+          overwrite: false
+        });
+        return up.secure_url || up.url || null;
+      } catch (err) {
+        console.warn(`   ⚠️  direct-image: QC discard upload failed: ${err.message}`);
+        return null;
+      }
     }
+  });
+
+  if (!qcResult.ok) {
+    adVisionQc.alertQcFailure({
+      adId,
+      brandId: resolvedBrand?._id || brandId,
+      productId: resolvedProduct?._id || productId,
+      brandName: resolvedBrand?.name,
+      visionQc: qcResult.visionQc
+    });
+    const lastSummary = (qcResult.visionQc?.attempts || []).slice(-1)[0]?.summary || 'fail';
+    const err = taggedError(
+      `vision QC failed after ${qcResult.regenerationCount} regeneration(s): ${lastSummary}`,
+      { alertLevel: 'error', alertKey: 'vision-qc:failed-after-retry' }
+    );
+    // MONEY: at least one image submit was charged; surface that + the verdict
+    // (with discarded URLs) so the failure path can persist them.
+    err.charged = true;
+    err.visionQc = qcResult.visionQc;
+    throw err;
+  }
+
+  console.log(
+    `   ✅ direct-image vision QC pass — attempt=${qcResult.visionQc.finalAttempt} ` +
+    `regens=${qcResult.regenerationCount}`
+  );
+  return {
+    ...qcResult.output,
+    visionQc: qcResult.visionQc
   };
 }
 

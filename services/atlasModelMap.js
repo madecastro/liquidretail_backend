@@ -100,6 +100,22 @@ const MAP = Object.freeze({
   'gpt-4o':           { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4o' } },
   'gemini-2.5-flash': { atlas: 'google/gemini-2.5-flash', direct: { provider: 'google', model: 'gemini-2.5-flash' } },
   'gemini-2.5-pro':   { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
+  // Post-render vision QC role (services/adVisionQcService.js). Points at the
+  // same google/gemini-2.5-flash slug already used for vision identify/match
+  // (geminiIdentifyService, visualCatalogMatchService). CHEAP + vision-
+  // capable. CRITICAL: confirm ROUTABLE with a live chat probe before
+  // enabling AD_VISION_QC_ENABLED — catalog listing alone is not enough
+  // (openai/gpt-5-nano is listed but returns HTTP 400 "router not found").
+  // Override: ATLAS_MODEL_AD_VISION_QC=<slug>.
+  // PRO, not flash — and the draft that introduced this role had it wrong.
+  // Both were probed live against a real defect (a Timberland-shaped emblem
+  // hallucinated onto an Allbirds shoe) and BOTH caught it, but flash broke the
+  // requested JSON shape: it returned `competitor_marks` as a bare boolean and
+  // hoisted `findings` out of its object. A malformed verdict is worse than no
+  // verdict here — it either ships a bad ad or burns the single allowed
+  // regeneration for nothing. The ~$0.0094 delta per check is noise against the
+  // $0.01–0.17 generation it protects.
+  'ad-vision-qc':     { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
   // NO 'quote-snippet' ROLE — deliberately removed, do not re-add it.
   // It mapped to openai/gpt-5-nano, which the benchmark above records as
   // HTTP 400 "router not found": listed in the catalog, not routable. A role

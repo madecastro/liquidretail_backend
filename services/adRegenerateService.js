@@ -567,6 +567,7 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
         bytes:              output.bytes  || uploaded.bytes  || null,
         imageGeneration:    output.imageGeneration  || null,
         intentResolution:   output.intentResolution || null,
+        visionQc:           output.visionQc || null,
         renderedAt:         new Date(),
         updatedAt:          new Date()
       }

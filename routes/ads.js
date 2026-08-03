@@ -1659,6 +1659,14 @@ async function renderOneInner(run, job, adId, index, renderToken) {
               charged:      result.error?.charged === true,
               at:           new Date()
             },
+            // Keep vision QC verdict (incl. discarded paid URLs) on failure.
+            ...(result.error?.visionQc ? { visionQc: result.error.visionQc } : {}),
+            // Surface the last attempt's pixels when QC kept a URL.
+            ...(() => {
+              const attempts = result.error?.visionQc?.attempts || [];
+              const lastUrl = [...attempts].reverse().find(a => a?.renderUrl)?.renderUrl;
+              return lastUrl ? { renderUrl: lastUrl } : {};
+            })(),
             updatedAt:   new Date()
           },
           $inc: { renderAttempts: 1 }
@@ -2016,7 +2024,7 @@ router.get('/render-activity', async (req, res) => {
     const ads = await Ad.find(filter)
       .select('status renderStage renderStageAt kind template platformFormat aspectRatio ' +
               'renderUrl renderError renderAttempts renderStages imageGeneration ' +
-              'intentResolution veoPredictionId veoAspectRatio veoVideoUrl ' +
+              'intentResolution visionQc veoPredictionId veoAspectRatio veoVideoUrl ' +
               'campaignId campaignRunIds productId mediaId brandId conceptId ' +
               'queuedAt renderedAt updatedAt')
       .sort({ updatedAt: -1 })
@@ -2082,6 +2090,15 @@ router.get('/render-activity', async (req, res) => {
           ? { requested: a.intentResolution.requested, delivered: a.intentResolution.delivered,
               fellBackFrom: a.intentResolution.fellBackFrom || null,
               dropped: a.intentResolution.droppedRoles || [] }
+          : null,
+        visionQc:      a.visionQc
+          ? { passed: a.visionQc.passed, finalAttempt: a.visionQc.finalAttempt,
+              skipped: !!a.visionQc.skipped, disabled: !!a.visionQc.disabled,
+              attempts: (a.visionQc.attempts || []).map(t => ({
+                attempt: t.attempt, pass: t.pass, summary: t.summary,
+                discarded: !!t.discarded, renderUrl: t.renderUrl || null,
+                discardedRenderUrl: t.discardedRenderUrl || null
+              })) }
           : null,
         assetUrl:      a.renderUrl || null,
         error:         a.renderError?.message || (typeof a.renderError === 'string' ? a.renderError : null),
@@ -2759,6 +2776,9 @@ router.get('/:id/generation-inspector', async (req, res) => {
         // Which intent ran, whether it fell back, what got sacrificed to the
         // density budget. See models/Ad.js for the full field description.
         intentResolution:      ad.intentResolution || null,
+        // Post-render vision QC (original product vs finished render).
+        // Includes per-attempt scores/findings and discarded paid render URLs.
+        visionQc:              ad.visionQc || null,
         // Per-stage wall time for THIS render (derive/render/upload ms) — the
         // direct answer to "why is this one slow" without a log search.
         renderStages:          ad.renderStages || null

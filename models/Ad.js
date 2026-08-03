@@ -349,6 +349,14 @@ const adSchema = new mongoose.Schema({
   // field (including the legacy HTML/overlay paths, which never resolved an
   // intent) and on any ad that failed before the intent was built.
   intentResolution:   { type: mongoose.Schema.Types.Mixed, default: null },
+  // Post-render vision QC verdict (static direct-image path only).
+  // { schemaVersion, skipped, disabled, passed, finalAttempt, maxRegenerations,
+  //   attempts:[{ attempt, pass, categories, findings, summary, renderUrl,
+  //               discarded, discardedRenderUrl, imageGeneration }] }.
+  // Per-attempt renderUrl is KEPT when discarded — the first render was
+  // already paid for (mirrors Omni master keep on titling failure).
+  // Null when AD_VISION_QC_ENABLED is off or the ad predates this field.
+  visionQc:           { type: mongoose.Schema.Types.Mixed, default: null },
   // Per-stage wall time in ms for THIS render, whichever pipeline ran:
   // { deriveMs, renderMs, uploadMs }. Answers "why is this ad slow" without a
   // log-diving session — direct_image's renderMs is the Atlas submit+poll
