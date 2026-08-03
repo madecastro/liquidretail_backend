@@ -235,6 +235,69 @@ function safeBoxInDeliveredPx(s, dims) {
  * Returns null when the box cannot fit the mark, so the caller skips the
  * composite rather than placing it somewhere the model did not reserve.
  */
+/**
+ * Which ink a composited logomark should use, given the mean luminance (0..1)
+ * of the artwork directly behind it. Light plate → black mark, dark plate →
+ * white mark. Pure black/white on purpose: owner asked for "clean and minimal",
+ * and a brand-tinted mark on arbitrary generated backgrounds is what produced
+ * unreadable marks before.
+ *
+ * Exported so scripts/verifyProofBeat.js can pin the threshold.
+ */
+function monochromeInkFor(meanLum) {
+  const n = Number(meanLum);
+  if (!Number.isFinite(n)) return null;      // unknown → caller keeps the original asset
+  return n > 0.5 ? { r: 0, g: 0, b: 0 } : { r: 255, g: 255, b: 255 };
+}
+
+/**
+ * Re-render a logo as a single-ink silhouette.
+ *
+ * WHY: the asset is composited verbatim, so a logo delivered on an OPAQUE white
+ * canvas paints a white rectangle onto the ad. Owner, on a delivered AllBirds
+ * ad: *"I noticed the allbirds logo is put on a block of white, the logo should
+ * just be rendered in black or white depending on the color of the background.
+ * It should be clean and minimal."*
+ *
+ * Coverage (what becomes the mark) is taken from:
+ *   - the ALPHA channel when the asset has one — the normal, correct case; or
+ *   - LUMINANCE when it does not, in whichever polarity matches the asset's own
+ *     background. Border pixels decide that polarity, so dark-artwork-on-white
+ *     and white-artwork-on-black both resolve correctly instead of one of them
+ *     inverting into a solid block.
+ */
+async function monochromeLogoBuffer(logoPng, ink) {
+  const meta = await sharp(logoPng).metadata();
+  const w = meta.width, h = meta.height;
+  if (!(w > 0 && h > 0)) return null;
+
+  let coverage;
+  if (meta.hasAlpha) {
+    coverage = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
+  } else {
+    // Sample the outer border to learn the asset's own background polarity.
+    const grey = sharp(logoPng).removeAlpha().greyscale();
+    const edge = Math.max(1, Math.round(Math.min(w, h) * 0.04));
+    const strip = await grey.clone()
+      .extract({ left: 0, top: 0, width: w, height: edge })
+      .stats();
+    const bgIsLight = (strip.channels[0].mean / 255) > 0.5;
+    // bgIsLight → the mark is the DARK pixels, so invert to make them opaque.
+    coverage = bgIsLight
+      ? await grey.clone().negate().raw().toBuffer()
+      : await grey.clone().raw().toBuffer();
+  }
+
+  const solid = await sharp({
+    create: { width: w, height: h, channels: 3, background: ink },
+  }).raw().toBuffer();
+
+  return sharp(solid, { raw: { width: w, height: h, channels: 3 } })
+    .joinChannel(coverage, { raw: { width: w, height: h, channels: 1 } })
+    .png()
+    .toBuffer();
+}
+
 function logoPlacementFor({ surface, dims, logoW, logoH }) {
   const box = safeBoxInDeliveredPx(surface, dims);
   // Clamp the BOX into the delivered frame before placing anything in it, rather
@@ -815,8 +878,38 @@ async function renderDirectImage({
         logoW: lm.width,
         logoH: lm.height
       });
-      if (place) layers.push({ input: logoPng, top: place.top, left: place.left });
-      else {
+      if (place) {
+        // Monochrome the mark against whatever the model actually rendered in
+        // that corner, so it never ships as a white block (owner, 2026-08-03).
+        // Any failure falls back to the original asset — a correctly-placed
+        // logo with an ugly backing beats no logo at all.
+        let toPlace = logoPng;
+        try {
+          const region = await sharp(rendered)
+            .extract({
+              left: Math.max(0, Math.min(place.left, dims.width - 1)),
+              top: Math.max(0, Math.min(place.top, dims.height - 1)),
+              width: Math.max(1, Math.min(lm.width, dims.width - place.left)),
+              height: Math.max(1, Math.min(lm.height, dims.height - place.top)),
+            })
+            .greyscale()
+            .stats();
+          const ink = monochromeInkFor(region.channels[0].mean / 255);
+          if (ink) {
+            const mono = await monochromeLogoBuffer(logoPng, ink);
+            if (mono) {
+              toPlace = mono;
+              console.log(
+                `   🖼️  direct-image: logomark inked ${ink.r ? 'white' : 'black'} ` +
+                `(behind lum=${(region.channels[0].mean / 255).toFixed(2)})`
+              );
+            }
+          }
+        } catch (err) {
+          console.warn(`   ⚠️  direct-image: logo monochrome skipped (${err.message}) — using original asset`);
+        }
+        layers.push({ input: toPlace, top: place.top, left: place.left });
+      } else {
         const msg = `no room for the logo inside ${surface}'s content rect — ad ships without logo`;
         console.warn(`   ⚠️  direct-image: ${msg}`);
         noteRenderIssue(adId, { message: msg, stage: 'logo' });
@@ -877,6 +970,8 @@ module.exports = {
   safeBoxInDeliveredPx,
   extractFor,
   logoPlacementFor,
+  monochromeInkFor,
+  monochromeLogoBuffer,
   intentForTemplate,
   buildIntentData,
   describeProductForPrompt,

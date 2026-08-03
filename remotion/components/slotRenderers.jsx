@@ -456,21 +456,37 @@ const Pill = ({ children, bg, text, stroke, dims, size, tracking }) => (
   </div>
 );
 
+// PLAIN TEXT, NO PILL — owner direction 2026-08-03.
+//
+// This slot used to render a filled Pill using the brand's badgeBg/badgeText
+// tokens. Because those tokens come from brand theme, the same slot shipped a
+// CHARCOAL box on Vuori and a cream one on GymShark — and on a light plate the
+// dark box read as exactly the scrim treatment the no-scrim standard exists to
+// remove. Owner, seeing it in a delivered ad: *"there is a dark pill"*, and when
+// asked how the badge should read: *"Plain text, no pill."*
+//
+// So the badge now renders as small-caps type in the SAME ink as the rest of the
+// group (textPrimary, which the plate-intel contrast flip already drives), which
+// also makes it consistent across brands instead of per-token. `Pill` is still
+// used by CTA/promo, which are meant to read as buttons.
 export const BadgeSlot = ({ slot, content, tokens, dims, format }) => {
   const t = slot.treatment;
   const size = baseSize('badge', format, t.sizeScale);
   const font = tokenFont(tokens, 'body');
   return (
-    <div style={{ fontFamily: fontFamilyCss(font) }}>
-      <Pill
-        bg={hexToRgba(tokenColor(tokens, 'badgeBg'), 0.96)}
-        text={tokenColor(tokens, 'badgeText')}
-        dims={dims}
-        size={size}
-        tracking={t.trackingPx || 1}
+    <div style={{ ...scrimStyle(t, tokens, dims), fontFamily: fontFamilyCss(font) }}>
+      <span
+        style={{
+          fontFamily: fontFamilyCss(font),
+          fontWeight: t.weight || 700,
+          fontSize: size,
+          letterSpacing: `${t.trackingPx ?? 1.5}px`,
+          color: tokenColor(tokens, t.colorToken || 'textPrimary'),
+          whiteSpace: 'nowrap',
+        }}
       >
         {applyCasing(content, t.casing === 'none' ? 'upper' : t.casing)}
-      </Pill>
+      </span>
     </div>
   );
 };

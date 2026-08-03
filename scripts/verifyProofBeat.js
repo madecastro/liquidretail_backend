@@ -484,6 +484,37 @@ check('P1 brand projections that feed titling include brandReviews', () => {
   }
 });
 
+// ── L: logomark ink + badge treatment (owner direction 2026-08-03) ──────
+
+check('L1 logomark ink follows the background luminance', () => {
+  const { monochromeInkFor } = require('../services/directImageRenderService');
+  // Owner: "the logo should just be rendered in black or white depending on the
+  // color of the background. It should be clean and minimal." Light plate →
+  // black mark, dark plate → white mark.
+  assert.deepStrictEqual(monochromeInkFor(0.9), { r: 0, g: 0, b: 0 }, 'light bg → black mark');
+  assert.deepStrictEqual(monochromeInkFor(0.51), { r: 0, g: 0, b: 0 }, 'just-light bg → black mark');
+  assert.deepStrictEqual(monochromeInkFor(0.5), { r: 255, g: 255, b: 255 }, 'mid/dark bg → white mark');
+  assert.deepStrictEqual(monochromeInkFor(0.05), { r: 255, g: 255, b: 255 }, 'dark bg → white mark');
+  // Unknown luminance must NOT guess — the caller keeps the original asset.
+  assert.strictEqual(monochromeInkFor(NaN), null);
+  assert.strictEqual(monochromeInkFor(undefined), null);
+});
+
+check('L2 the badge renders as plain text, not a filled pill', () => {
+  // Owner saw the brand-token pill ship as a charcoal box on a light plate
+  // ("there is a dark pill") and chose "Plain text, no pill". The Pill component
+  // stays in use for CTA/promo, which are meant to read as buttons — so assert
+  // specifically that BadgeSlot no longer renders one.
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'remotion', 'components', 'slotRenderers.jsx'), 'utf8');
+  const start = src.indexOf('export const BadgeSlot');
+  assert.ok(start > -1, 'BadgeSlot must exist');
+  const body = src.slice(start, src.indexOf('export const', start + 10));
+  assert.ok(!/<Pill\b/.test(body), 'BadgeSlot must not render a <Pill> — owner asked for plain text');
+  assert.ok(!/badgeBg/.test(body), 'BadgeSlot must not paint the brand badgeBg background');
+  assert.ok(/textPrimary/.test(body), 'badge should inherit primary ink so the contrast flip drives it');
+});
+
 // ── report ─────────────────────────────────────────────────────────────
 
 if (failures.length) {
