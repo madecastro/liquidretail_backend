@@ -66,11 +66,39 @@ Off"). Even when on, Director does **not** drive the camera prompt or video
 titling (`docs/PIPELINES.md` §6). `meta_video` / `meta_all` use
 `expandDeterministicVideo` — one Ad per product, no concept expansion.
 **Current objective: tune the canonical prompt.** Archetype-driven video is
-**deferred, not missing.** **None of this is evaluable until Remotion titling
-is fixed** — it dies at `Could not extract frame from compositor / Request
-closed` (`offthread-video-server.js:99`); every run pays for a master with no
-titled output, so prompt changes are unobservable. Font 404/CORS in that log
-is a red herring (FontLoader recovers with fallback stack).
+**deferred, not missing.**
+
+**FULL PR #61 camera-prompt ROLLBACK (owner 2026-08-03, commit `be5b83f`):**
+Commit `134db56` added three camera-prompt changes in
+`services/veoPromptBuilder.js`; **all three are reverted**. Owner, verbatim:
+*"This is creating additional hallucinations and the previous output was
+better."* The three reverted pieces: (1) Scene 3 "RETURN TO THE PRIMARY VIEW"
++ two PRODUCT FIDELITY sentences claiming the FINAL reference repeats the
+primary view; (2) the `subjectContinuity` directive (both `OMNI_DIRECTIVES`
+and `GROK_DIRECTIVES`, plus its `lines.push` in `buildVeoPrompt`); (3) the
+crossfade-vs-long-dissolve policy rewording. **Mechanical acceptance test:**
+the file now differs from `git show 134db56~1:services/veoPromptBuilder.js` in
+exactly **two hunks**, both comment/export only (`OMNI_DIRECTIVES` /
+`GROK_DIRECTIVES` module exports for harnesses + the rollback comment block) —
+**zero prompt-string hunks.** Pinned by `scripts/verifyPostPilotBatch.js`
+(B1–B14); **B14** rebuilds the prompt from the `134db56~1` source out of git
+and asserts byte-identity. **CRITICAL — the restored text is deliberately
+self-contradictory:** `transitions` permits "Smooth crossfades only, ~0.25s"
+while `doNot` bare-bans "dissolves", and a crossfade **is** a short dissolve.
+Owner-confirmed: that contradictory prompt is the version that produced better
+output. **Anyone "fixing" the contradiction is reintroducing the
+regression.** Do not soften, split, or reword either string to resolve it.
+
+**Primary-reference repeat is default OFF** (same day / same reason): both the
+code default (`isRepeatPrimaryReferenceEnabled`, `atlasVideoService.js:829`)
+and `config/defaults.env` `REPEAT_PRIMARY_REFERENCE=false`. Default stack =
+the first **3 DISTINCT** refs with nothing appended. Turning the repeat off
+removed the only clamp on that branch (`REPEAT_PRIMARY_TOTAL_CAP=4` applies
+**only** to the opt-in flag-on path), which would have let
+`videoSettings.referenceImageCount=7` ship seven refs against the owner's
+"too many images hallucinated" finding — so **`MAX_DISTINCT_REFERENCES=5`**
+(`atlasVideoService.js:813`) is the new hard ceiling on the default branch.
+`REPEAT_PRIMARY_TOTAL_CAP=4` still applies only when the flag is explicitly on.
 
 **STATIC** — direct to **gpt-image-2/edit**, one call returns the finished ad
 (`directImageRenderService`). No HTML, no Puppeteer, no SVG overlay compositing.
@@ -380,8 +408,10 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `git checkout -- node_modules/.package-lock.json` so the tracked file is not
   committed. Stage explicit paths, never `git add -A`.
 - **`config/defaults.env` is committed** and `dotenv`-loaded at boot. It is the real
-  source of defaults — `.env.example` is documentation only and several vars there are
-  blank while `defaults.env` sets them.
+  source of non-secret defaults — `.env.example` is documentation only and several
+  vars there are blank while `defaults.env` sets them. **Secrets stay in the
+  Render dashboard only** (migration COMPLETE 2026-08-03 — see §4a). Precedence:
+  process env wins; a dashboard var of the same name **always shadows** the file.
 - **Docs have described commented-out code.** `TITLING.md` documented the disabled
   canvas cascade as live. When you find such a case, fix the doc in the same commit.
 - **Director concept contract (v3 nested under `routing`).** Schema v3 moved
@@ -456,6 +486,29 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   of it, including that the promotion is **not** folded into the shared
   `rankMergedPool` — that would silently re-order operator picks. Details:
   `docs/PIPELINES.md` §5 *Seed selection — image vs video*.
+- **Static regenerate RE-DERIVES the catalog-first seed
+  (`REGEN_RESEED_CATALOG_FIRST`, default ON).** Ship in `be5b83f`.
+  `services/adRegenerateService.js` used to **replay** the stored
+  `Ad.mediaIds` stack forever, so ads queued under `TOP_N=10` still sent 3+
+  refs on every regen. **NOT a trim:** historical stacks were shotType-ranked
+  LIFESTYLE-FIRST over a catalog+UGC merged pool, so `mediaIds[0]` is often a
+  UGC post and trimming would lock a social image in. Instead it re-derives
+  via the same cascade as generation-time catalog-first: imageRole hero →
+  earliest-`createdAt` catalog entry → nothing. **Every query is pinned to
+  `source:'catalog-product'` + the ad's own product AND brand**
+  (`deriveFirstCatalogMediaId`, `adRegenerateService.js:215-261`); a catalog
+  **VIDEO** can never win (`fileType === 'video'` and
+  `metadata.imageRole === 'video'` are both rejected —
+  `isCatalogMediaForProduct` `:150-172`). An unusable/missing `fileUrl` is an
+  **honest skip** (tier 3 / `NO_CATALOG_MEDIA`), not a silent fallback to the
+  ad's original seed (that path would re-lock the UGC seed while logging
+  success). **Gates:** `variantKind === 'product_image'` only (owner: *"UGC
+  ads shouldn't be affected by this change, we haven't optimized that path
+  yet"*); skipped when `Ad.referenceMediaIds` is non-empty (operator pick
+  always wins); video regenerates never reseed. **Nothing is persisted back
+  onto the Ad** — the derived stack is render-call-only, so the kill switch
+  (`REGEN_RESEED_CATALOG_FIRST=false`) stays effective on the next regen.
+  Pinned by `scripts/verifyRegeneration.js` (R3 / R3b / R3c).
 - **Customer quotes: `llm-web` is PRINTABLE; attribution is stripped.**
   Prior denylist / "llm-web never prints" claims were **false**.
   `services/providers/geminiSearchProvider.js:254,399` use
@@ -485,6 +538,68 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
 - **`GET /api/ads/formats`** returns `formatCatalog()` verbatim — display-only,
   brand-agnostic, no `brandId` (`routes/ads.js:1998-2000`). Must stay
   registered above `/:id`.
+
+---
+
+## 4a. Render dashboard vs `config/defaults.env` (migration COMPLETE 2026-08-03)
+
+Owner rule, verbatim: *"The dashboard in render should only contain secrets,
+everything else should be editable outside of the dashboard."*
+
+**PRECEDENCE — the trap that caused the half-done rollout.**
+`index.js:1-5` and `worker.js:18-20` load the process environment **first**
+(Render dashboard / local `.env`) and `config/defaults.env` **second**.
+`dotenv` **never overrides an already-set var**. A dashboard var always wins;
+a value in `defaults.env` is the **effective** value only when no dashboard
+var of that name exists. **Diagnostic for a silent config lie:** a var set in
+**both** places with **different** values. Next-session check: compare the
+live dashboard key list against
+`grep -oE '^[A-Z_][A-Z0-9_]*=' config/defaults.env` — any intersection whose
+values disagree is lying about what prod runs.
+
+**Migration status: FINISHED 2026-08-03** (was half-done; the file header used
+to say "until the migrated vars are removed from the Render dashboard, they
+shadow these defaults"). Verified live in the Render dashboard:
+
+| Service | id | Before → after |
+|---|---|---|
+| WEB | `srv-d1vuktqli9vc73ft07ng` | 64 env vars → **23** (41 deleted) |
+| WORKER | `srv-d8128c1o3t8c73e8kb30` | 24 env vars → **14** (10 deleted) |
+
+Every deleted key existed in `config/defaults.env` with an **identical**
+value, so the deletions were runtime no-ops — **except one** (below).
+
+**Delete rule (load-bearing):** only delete a dashboard var that exists in
+`config/defaults.env` with an **identical** value. A dashboard-only var must
+be **migrated into the file first**, never just deleted — or the value is
+lost with nothing to fall back on. That is why **`JIRA_PROJECT_KEY` was
+RETAINED** even though it is not a secret: it does not exist in
+`config/defaults.env`.
+
+**What stays on the dashboard:** secrets only, plus `JIRA_PROJECT_KEY`.
+
+**The per-key list is DELIBERATELY NOT REPEATED HERE.**
+`docs/PIPELINES.md` §9 *"Stays in Render env"* is **canonical** — it carries the
+full table with per-service (WEB / WORKER) columns and what each key is for.
+Two copies of a 37-key list will drift, and a stale list here is worse than no
+list: someone would trust it while deleting a dashboard var. This section owns
+the *rules* (precedence, the delete rule, the counts, the one non-no-op); §9
+owns the *inventory*. Keep it that way.
+
+Note the audience split, which is why this is written in both places at all:
+`CLAUDE.md` is read by Claude sessions, but env vars are edited by humans and by
+other agents (Grok edits this repo directly and reads `docs/PIPELINES.md`, not
+this file). The rule has to be findable from either direction — the inventory
+only needs to exist once.
+
+**The one non-no-op: `RENDER_CONCURRENCY`.** The dashboard pinned **4** while
+the file said **8**. Earlier docs ("defaults raised 2026-08-02: RENDER 4→8")
+described the **file** change only — production stayed at 4 for a day because
+the dashboard shadowed it. Owner chose to delete the dashboard copy on
+2026-08-03, so the file's **8 is now live** on the web service. Render
+concurrency **doubled 4→8 on 2026-08-03 as a consequence of this cleanup**,
+not as a separate tuning decision. Re-measure before going higher
+(`services/concurrency.js`).
 
 ---
 

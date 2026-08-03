@@ -5,11 +5,11 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
-## 2026-08-03 — OWNER DECISIONS IN FLIGHT. Read this before the next-session prompt below.
+## 2026-08-03 — OWNER DECISIONS (landed). Read this before the next-session prompt below.
 
-Four owner decisions landed in one session. Nothing is committed; the tree is on `main`, so a
-feature branch is required before any commit. **Verify each item against the diff — several of
-these reverse advice written earlier in this same file.**
+Five owner decisions from 2026-08-03. Items 1–4 shipped in `be5b83f` (on `main`); item 5
+(Render secrets-only migration) is a live dashboard change + the doc pass that records it.
+**Verify each item against the code — several reverse advice written earlier in this same file.**
 
 1. **Static seed default = THE FIRST IMAGE THAT CAME FROM THE CATALOG.** Not the `imageRole`
    `'hero'` label. Owner: *"I actually just want to use the first image that comes from the
@@ -34,11 +34,11 @@ these reverse advice written earlier in this same file.**
 3. **VIDEO: primary-ref repeat is OFF by default.** Both the code default
    (`isRepeatPrimaryReferenceEnabled`) and `config/defaults.env`. Default stack = the first
    **three distinct** references, nothing appended. Capability kept reachable via
-   `REPEAT_PRIMARY_REFERENCE=true` for a future A/B; `REPEAT_PRIMARY_TOTAL_CAP` (=4) is now inert.
-   ⚠️ **`index.js:4` — "dotenv never overrides an already-set var."** If the Render dashboard
-   defines `REPEAT_PRIMARY_REFERENCE`, the committed `false` is IGNORED in prod. Same trap for
-   `DIRECTOR_UNIVERSE_TOP_N` and `AI_CONCEPT_DRIVEN`. **Check all three on BOTH the web and
-   worker services before trusting any of this in production.**
+   `REPEAT_PRIMARY_REFERENCE=true` for a future A/B; `REPEAT_PRIMARY_TOTAL_CAP` (=4) applies
+   **only** to that opt-in path. On the default (flag-off) branch the hard ceiling is
+   `MAX_DISTINCT_REFERENCES=5` (`atlasVideoService.js:813`) — turning the repeat off had
+   removed the only clamp. Full PR #61 camera-prompt rollback is also landed (all three
+   pieces; B14 byte-identity pin) — see CLAUDE.md §00 and `docs/PIPELINES.md` §6.
 
 4. **UGC ads must not be affected — "we haven't optimized that path yet" (owner).** Concretely:
    - brand-only runs (`isBrandOnly`) → promotion skipped, UGC can still win index 0. Unaffected.
@@ -46,16 +46,30 @@ these reverse advice written earlier in this same file.**
    - product mode, no picks → seed is now always catalog, so the ad is `product_image` where it
      could previously have been `ugc`. **Deliberate** — this is the same UGC-as-default worry as
      item 1.
-   **HARD REQUIREMENT for the not-yet-built regenerate change: gate on
-   `variantKind === 'product_image'`.** A `variantKind:'ugc'` ad is *supposed* to seed from a
-   social image; re-deriving it to a catalog image would break it by design.
+   - **static regenerate** (`REGEN_RESEED_CATALOG_FIRST`, default ON) gates on
+     `variantKind === 'product_image'` and skips non-empty `referenceMediaIds`. Built in
+     `be5b83f` — see below.
 
-**NOT YET BUILT — "trim on regenerate" (owner-approved).** `adRegenerateService.js:257-263`
-replays the stored stack (operator `referenceMediaIds` → else `mediaIds`) and never re-derives,
-so ads queued under the old `TOP_N=10` send 3+ refs on regenerate forever. Owner chose to fix it.
-**It must RE-DERIVE via the catalog-first cascade, NOT trim to `mediaIds[0]`** — those historical
-stacks were shotType-ranked, which puts **lifestyle first**, so `mediaIds[0]` is often a UGC post
-and trimming would lock UGC in. Preserve the operator override (`referenceMediaIds` still wins).
+5. **Render env migration COMPLETE (2026-08-03).** Owner: *"The dashboard in render should
+   only contain secrets, everything else should be editable outside of the dashboard."*
+   WEB 64→23, WORKER 24→14. Every deleted key matched `config/defaults.env` identically
+   (no-ops) **except `RENDER_CONCURRENCY`** (dashboard 4, file 8) — deleting the dashboard
+   pin made **8 live**. `JIRA_PROJECT_KEY` retained (not a secret, not in the file). Canonical
+   write-up: CLAUDE.md §4a; stays-in-Render list: `docs/PIPELINES.md` §9.
+   ⚠️ **Precedence still matters forever:** `index.js:1-5` / `worker.js:18-20` load process
+   env FIRST; dotenv never overrides. A dashboard var of the same name still shadows the
+   file. Diagnostic: compare the dashboard list against
+   `grep -oE '^[A-Z_][A-Z0-9_]*=' config/defaults.env`.
+
+**BUILT — catalog-first reseed on static regenerate (`REGEN_RESEED_CATALOG_FIRST=true`).**
+Was "NOT YET BUILT" earlier the same day; shipped in `be5b83f`. `adRegenerateService.js`
+re-derives via imageRole hero → earliest-`createdAt` catalog entry → nothing (every query
+pinned to `source:'catalog-product'` + ad product + ad brand). **NOT a trim** of
+`mediaIds[0]` (historical stacks are lifestyle-first over catalog+UGC, so [0] is often UGC).
+Gates: `variantKind==='product_image'` only; operator `referenceMediaIds` always wins;
+catalog VIDEO never selected; missing `fileUrl` is an honest skip; **nothing persisted**
+back onto the Ad so the kill switch stays effective. Pinned by
+`scripts/verifyRegeneration.js` (R3/R3b/R3c).
 
 **Reference count is COST-NEUTRAL** (measured, not assumed): flat price per submit, no
 `images.length` multiplier (`atlasImageService.js:75-104`). What multiplies spend is the Meta
@@ -1659,7 +1673,10 @@ Owner-set: **production quality first, money hardening after output is proven.**
   where Atlas is already billed.
 - **`node_modules` is partially tracked and missing `https-proxy-agent`** — a fresh checkout
   fails MODULE_NOT_FOUND before any test runs.
-- **`RENDER_CONCURRENCY` is 4 at boot but 8 in `defaults.env`** — a dashboard var shadows it.
+- **`RENDER_CONCURRENCY` was 4 at boot while `defaults.env` said 8** — a dashboard var
+  shadowed it. **RESOLVED 2026-08-03:** dashboard pin deleted as part of the secrets-only
+  migration; file's **8 is now live**. Doubling was a cleanup consequence, not a separate
+  tune. See CLAUDE.md §4a.
 - **Spend figures are calibrated against two errors in opposite directions:** video cost was
   overstated ~4x in `defaults.env`/`backlogWatchdog.js` (now corrected), while
   `atlasImageService.js:414` notes the image catalog estimate **understates by ~6x**. Re-tune
