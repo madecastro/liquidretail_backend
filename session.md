@@ -782,6 +782,57 @@ under them was broken — the star-row guard pin matched an identical expression
 the regex pin matched the old pattern quoted in its own explanatory comment. Source pins must
 strip comments and assert PROXIMITY. Both were caught only by revert-proofing.
 
+### 0.3000 VALIDATED IN PIXELS — the proof beat works end to end (2026-08-03 19:04)
+
+Live Chrome test on staging found a BLOCKER that no harness could, then confirmed the whole
+chain in a real frame. Prod = `56569a2` both services. Suite **40/40**, `verifyProofBeat` **28**.
+
+**THE BLOCKER: `ctx.brand` was null for GymShark, so the brand-tier fallback could never fire.**
+`loadContext` resolves the brand by NAME, and the name on a Media/CatalogProduct is scraped page
+text. GymShark's catalog media carries `metadata.brand = "Gymshark | Be a visionary."` — name plus
+site tagline — which `normalizeBrandName` turns into `"gymshark be a visionary"`, and that can
+never match the real doc's `"gymshark"`. `findBrandByName` returned null, so EVERY brand-sourced
+field silently vanished: `brandReviews` (empty brand quote pool → the new fallback was
+structurally unable to fire), `styleTheme`, logo, tagline. `media.brandId` pointed at the correct
+Brand doc the whole time (`6a6a4d58…` → "GymShark", 6 quotes, 3.3/41000).
+Fix (`f2f26bf`): use the FK **only when the name lookup already returned null**, so every
+resolution that works today is byte-identical, and log when it rescues one. Pinned by B1/B2 in
+`verifyProofBeat` (B2 fails if the normalizer ever learns to strip taglines, i.e. if the FK stops
+being what rescues this brand). **Deliberately did NOT touch the scraped name — that is ingestion,
+owned by a colleague** (owner instruction, same session: *"don't make any changes to ingestion …
+let's focus on the selection, curation, and integration into the ads"*).
+
+**The full live chain, GymShark ad `6a70cf95…` (square), $0 re-title over the paid master:**
+```
+🔗 brand name lookup failed for "Gymshark | Be a visionary." — resolved via brandId FK to "GymShark"
+🔓 6 brand-tier quote(s) demoted to last-resort on a product ad
+🔓 brand-tier quote WON as last-resort fallback on product ad
+📐 quote pool product=3 category=0 brand=6 comment=0 → winner=brand "clothes look and feel great…"
+ratingPair: source=brand-count rating=none count=41000
+🎨 brandScript: engine=remotion format=square spec=canonical
+```
+Note `product=3` yet brand won: all three product quotes failed `pickStrongestQuote`'s score
+floor, so the last-resort ladder behaved exactly as designed.
+
+**THE FRAME** (Cloudinary still, `so_4.6` post-settle, 1080x1080):
+badge "TOP RATED COMFORT" · headline "Gymshark Campus Crest Sweatshirt" ·
+**"41,000 reviews · GymShark"** · *"clothes look and feel great and reasonably priced"* ·
+"Best Seller" · SHOP NOW. Type sits below the chin (face keep-out fired), dark ink on the light
+plate (inkVote on-light).
+- **NO STARS** — 3.3 suppressed per the owner rule, while the volume still lands. Report 3 fixed.
+- **The quote prints with NO byline** — anonymous llm-web text, provenance gate holding. Report 2
+  fixed.
+- **"41,000" is COMMA-FORMATTED** — direct proof the `parseReviewsLeadingNumber` fix works. Before
+  it, this exact string rolled 0→410 with a stray "00" beside it.
+Still: `…/video/upload/so_4.6/v1785783858/liquidretail/brand_script/product-1785783857757-1-8zltbuf2.jpg`
+
+**Also confirmed live on the OTHER path** (AllBirds `6a7017ee…`, via the UI's "Re-render title"
+button — a $0 titling-only action worth knowing about, no Omni submit):
+`📐 buildMetaForAd: layoutInput STALE (schemaVersion=4.0 want=4.1) — serving non-quote fields;
+quote withheld by the provenance gate` + `ratingPair: source=none`. That is the stale-artifact
+correction working as intended: non-quote fields still served, only the unstamped quote withheld.
+A pre-4.1 artifact legitimately shows no proof beat until it is re-derived.
+
 ### 0.29999 SHIPPED — live on prod, both services (2026-08-03 18:39)
 
 **The concurrent session committed MY work along with theirs**: `0319c68` ("Parallel generations
