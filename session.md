@@ -410,6 +410,53 @@ needsLicense holds wiped by re-ingest; commercial faces starving the ingest cap.
 footgun (not yet fixed): Title Studio still authors/previews persisted specs that renders now
 ignore — preview != ship; needs a UI warning.
 
+### 0.298 CANONICAL TITLING TEST — iteration log (2026-08-04 overnight; TEAM TESTS TOMORROW)
+
+**Owner deadline: canonical titles working by morning; the whole team tests static + video
+production.** Iterations, each frame-verified, all $0 re-titles of the same 12 pilot ads:
+
+- **v1 (PR #60):** 9-slot canonical worked (fonts, CTA, cleaned names, close on the reveal) but
+  proof phase ran empty when quote+rating were withheld, and white ink shipped on light plates.
+- **Ink root cause (PR #61):** the plate scan only ran for placement='content' — canonical
+  renders had plateHints=null so the contrast flip could NEVER fire. Scan now always on (render
+  + preview), kill switch intact. ALSO in #61: atomic brand-rating fallback
+  (`resolveAtomicRatingPair`, Brand.brandReviews same-snapshot pair, honest attribution, >4.5
+  gate, mixing bug pinned); camera-prompt subject-lock + Scene-3 return-to-primary + crossfade
+  policy; REPEAT_PRIMARY_REFERENCE (default true, cap 4 refs).
+- **v2 sheets (canon2):** ink flip fired (AllBirds dark Playfair on light wall ✓), stars+counts
+  live (Pelagic 5.0/5, Vuori 4.6/5 + 15,545 ✓), CTAs everywhere ✓. NEW defects: rating rows on
+  FACES (keep-out computed but never applied); ink flip inconsistent (Vuori white-on-light);
+  Vuori brandPill rendered a broken gradient box; "- Warm Red" / "| ..." suffixes; deliveryLine
+  faint.
+- **Iteration 2 (PR #62):** keep-out APPLIED (group shifts to first clear band, stable, logged
+  `keepOut:`); ink vote inputs fixed (band rects tightened to the real text strips — old top
+  band spanned 26% incl. faces; median luma; 5 sample times; logged `inkVote:`); deeper name
+  cleaning (parenthetical -> pipe -> dash-colorway w/ short-name guard); deliveryLine w600
+  primary ink. brandPill hidden by default everywhere (owner: Meta draws its own page identity;
+  doubly validated — Vuori's pill rendered broken).
+
+**Owner directions recorded:** multi-color type allowed when brand-tokened (per-group ink =
+NEXT iteration, deliberately not tonight); owner waits for the canon3 contact sheet; funnel
+variant A/B + 6-template pilot PARKED until canonical is approved (variants + protos exist and
+validate; sweep infra ready).
+
+**$1 REGENERATE (end-to-end pipeline test) — all green + one discovery:**
+- Ledger PROVEN live: `atlas_video_render | $1 | submitted` — the widened-enum fix recording
+  real video spend. Crop-vision rows ledgered (~$0.004).
+- Money guard observed live: renderUrl briefly = raw master (draft stamp) then titled.
+- Owner's prompt idea WORKED: "end on the FIRST reference image's view" -> front-on close, CTA
+  riding it. The structural repeat-primary version is deployed but has NEVER run a live
+  generation (regen predated #61) — MUST validate with one $1 regen before the team generates,
+  else flip REPEAT_PRIMARY_REFERENCE=false.
+- **NEW DEFECT CLASS: Omni mangles on-product wordmarks on zoom shots** — tongue label rendered
+  "wfoirds" in the 3.5s detail shot. Video-side proof of the vision-QC case (§0.2).
+
+**Ops learnings tonight (cost real time):** `nohup &` dies with the render-ssh PTY — use
+`setsid nohup ... < /dev/null &`. The BACKEND web service is MULTI-INSTANCE — a file written in
+one render-ssh session may not exist in the next; write+launch in ONE session, monitor via DB.
+The worker is single-instance and safe for long drivers. /tmp scripts can't require app
+modules (documented trap; bit again — run from /opt/render/project/src).
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
