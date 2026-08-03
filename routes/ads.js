@@ -29,6 +29,7 @@ const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
 const { expandWizardJob, selectAdsForRun } = require('../services/campaignAdsGenerationService');
+const { summarizeEmptyExpansion, REASON: PER_PRODUCT_REASON } = require('../services/perProductReasons');
 const { assertGeneratablePlatformFormat } = require('../services/platformFormats');
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
@@ -449,14 +450,27 @@ router.post('/generate', async (req, res) => {
         // run. That is how a ReferenceError inside the Director — which broke
         // every fresh concept round — reached the operator as an empty
         // selection with no way to tell it from a hang.
-        const productErrors = (Array.isArray(job.perProduct) ? job.perProduct : [])
-          .filter((r) => r && r.skipped === 'error');
+        //
+        // After normalizePerProductEntry, `skipped` is a boolean and the
+        // machine code lives on `reason`. Accept both shapes so a partial
+        // rollout or a raw expansion row cannot re-hide the error.
+        const perProduct = Array.isArray(job.perProduct) ? job.perProduct : [];
+        const productErrors = perProduct.filter((r) =>
+          r && (r.reason === PER_PRODUCT_REASON.ERROR || r.skipped === 'error' ||
+                (r.skipped === true && r.reason === PER_PRODUCT_REASON.ERROR))
+        );
         const errorEntries = productErrors.map((r, i) => ({
           index: i,
           stage: 'expand',
-          message: `${r.errorName || 'Error'}: ${r.error || 'unknown error'}` +
+          productId: r.productId || undefined,
+          message: `${r.errorName || 'Error'}: ${r.error || r.message || 'unknown error'}` +
                    (r.productId ? ` (product=${r.productId})` : '')
         }));
+
+        // Persist per-product outcomes on every terminal expand path so the
+        // poller can show them. A reporting write failure must not abort the
+        // run — catch individually on each update below is already the pattern.
+        const perProductSet = { perProduct };
 
         if (newlyQueued === 0) {
           // Threw, so the run FAILED — it did not quietly finish with nothing.
@@ -464,18 +478,24 @@ router.post('/generate', async (req, res) => {
             await CampaignRun.updateOne(
               { _id: run._id },
               { status: 'failed', completedAt: new Date(),
+                $set: perProductSet,
                 $push: { errors: { $each: errorEntries } } }
             );
             return;
           }
-          // Say WHY. A run that ends done/total:0 with no reason is
-          // indistinguishable from a hang, and that is how this shipped.
-          const reason = job.alreadyQueued
-            ? `Nothing new to render: all ${job.alreadyQueued} creative(s) for this selection are already queued.`
-            : 'Nothing to render: this selection produced no creatives. Check that the product has usable imagery and at least one template is selected.';
+          // Say the REAL reason. perProduct already carries machine codes;
+          // summarizeEmptyExpansion turns a uniform skip into that sentence
+          // and mixed skips into a count summary. The old generic line
+          // ("check imagery and templates") actively misled when the
+          // Director returned nothing.
+          const reason = summarizeEmptyExpansion({
+            perProduct,
+            alreadyQueued: job.alreadyQueued
+          });
           await CampaignRun.updateOne(
             { _id: run._id },
             { status: 'done', completedAt: new Date(),
+              $set: perProductSet,
               $push: { errors: { index: 0, stage: 'expand', message: reason } } }
           );
           return;
@@ -484,11 +504,18 @@ router.post('/generate', async (req, res) => {
         // PARTIAL: some products queued, others threw. Record the throws so the
         // run is not presented as a clean success, but do not abort — the ads
         // that did queue are already paid for and must still render.
+        // Always stamp perProduct so the UI can show which products skipped
+        // even when the run continues into render.
         if (errorEntries.length) {
           await CampaignRun.updateOne(
             { _id: run._id },
-            { $push: { errors: { $each: errorEntries } } }
+            { $set: perProductSet, $push: { errors: { $each: errorEntries } } }
           );
+        } else if (perProduct.length) {
+          await CampaignRun.updateOne(
+            { _id: run._id },
+            { $set: perProductSet }
+          ).catch(() => {});
         }
 
         // Scope to the product(s) the operator actually picked. Unscoped, this
@@ -1569,6 +1596,10 @@ router.get('/runs/:runId', async (req, res) => {
       status:          run.status,
       queuedRemaining,
       errors:          run.errors || [],
+      // Per-product expansion outcomes (why each product queued or skipped).
+      // Empty until expandWizardJob finishes; the poller is the source of
+      // truth because the 202 response flushes before expansion completes.
+      perProduct:      run.perProduct || [],
       startedAt:       run.startedAt,
       completedAt:     run.completedAt
     });
@@ -1958,6 +1989,17 @@ router.get('/video-models', async (req, res) => {
   res.json({ models });
 });
 
+// GET /api/ads/formats — platform / preset / format catalog for the wizard UI.
+// Display-only and brand-agnostic: every platform, its presets, and the
+// formats each preset would produce — including coming_soon stubs so the
+// SPA can grey cards without hardcoding keys. resolvePreset still never
+// emits coming_soon into a queue. No brandId: this exposes no tenant data.
+// NOTE: must stay registered above the '/:id' routes.
+router.get('/formats', async (req, res) => {
+  const { formatCatalog } = require('../services/platformFormats');
+  res.json(formatCatalog());
+});
+
 // GET /api/ads/veo-prompt-scaffold
 // Query: campaignId, productId?, platformFormat?, durationSec?
 // Returns the canonical Veo prompt + resolved model/aspect/duration for
@@ -2051,6 +2093,23 @@ router.post('/push-to-meta', express.json(), async (req, res) => {
        .json({ error: err.message || 'push-to-meta failed', code: err.code || null });
   }
 });
+
+// Guard every /:id and /:adId param so a non-ObjectId path segment never
+// reaches Mongoose's Cast. Without this, unmatched paths (e.g. GET
+// /api/ads/formats before it was registered, or /api/ads/zzz-not-a-route)
+// fall through to the /:id handler and return 500 with a raw CastError —
+// a client miss reported as a server error, leaking model/path internals,
+// and destroying the 404-vs-other deploy-verification signal.
+// Prefer one param guard over per-handler checks: every /:id* route in
+// this file shares the cast surface.
+function requireValidAdObjectId(req, res, next, value) {
+  if (!mongoose.isValidObjectId(value)) {
+    return res.status(404).json({ error: 'ad not found' });
+  }
+  next();
+}
+router.param('id', requireValidAdObjectId);
+router.param('adId', requireValidAdObjectId);
 
 // PATCH /api/ads/:id — flip status. Body: { status: 'draft' | 'live' | 'archived' }.
 // Caller passes ?brandId or X-Brand-Id so the lookup is tenant-scoped.
