@@ -220,4 +220,192 @@ async function analyzePlate(platePath, { durationSec = 8, isImage = false } = {}
   }
 }
 
-module.exports = { analyzePlate, resolveTitlePlacementMode, BAND_FOR_ANCHOR };
+// ── Face keep-out (title-band avoid flags from cached vision boxes) ─────────
+//
+// Detection boxes (basePlateCropService.detectClipBoxes) are NORMALIZED
+// FRACTIONS 0..1 of the SOURCE frame — the vision prompt returns left/top/
+// right/bottom as fractions, not pixels of the 640-wide still.
+// plateHints bands are also fractions of the PLATE (Remotion's canvas).
+//
+// When the plate IS the source (full-frame 9:16, or raw-plate retry):
+//   plateFrac = sourceFrac   (identity)
+// When the plate is a face-safe crop of the source (rect in SOURCE PIXELS):
+//   plateX = (sourceFracX * sourceW - rect.cx) / rect.cw
+//   plateY = (sourceFracY * sourceH - rect.cy) / rect.ch
+// (see mapSourceFaceToPlate)
+
+/** Fraction of band area a face must cover before the band is flagged avoid. */
+const FACE_BAND_OVERLAP_THRESHOLD = 0.20;
+
+// Horizontal span of text stacks — matches analyzeFrameBands safe left/right.
+const BAND_X0 = 0.08;
+const BAND_X1 = 0.92;
+
+/**
+ * Intersection area of two axis-aligned rects, as a fraction of `band`'s area.
+ * Both rects: { left, top, right, bottom } in the same fraction space.
+ */
+function bandFaceOverlapFrac(band, face) {
+  if (!band || !face) return 0;
+  const nums = [band.left, band.top, band.right, band.bottom, face.left, face.top, face.right, face.bottom];
+  if (!nums.every((n) => typeof n === 'number' && Number.isFinite(n))) return 0;
+  const ix0 = Math.max(band.left, face.left);
+  const iy0 = Math.max(band.top, face.top);
+  const ix1 = Math.min(band.right, face.right);
+  const iy1 = Math.min(band.bottom, face.bottom);
+  if (ix1 <= ix0 || iy1 <= iy0) return 0;
+  const inter = (ix1 - ix0) * (iy1 - iy0);
+  const bandArea = (band.right - band.left) * (band.bottom - band.top);
+  if (!(bandArea > 0)) return 0;
+  return inter / bandArea;
+}
+
+/** Union of normalized face boxes (same shape as faceSafeCrop.unionBoxes). */
+function unionFaceBoxes(boxes) {
+  const usable = (boxes || []).filter(
+    (b) => b && [b.left, b.top, b.right, b.bottom].every((n) => typeof n === 'number' && Number.isFinite(n))
+      && b.right > b.left && b.bottom > b.top
+  );
+  if (!usable.length) return null;
+  return {
+    left: Math.min(...usable.map((b) => b.left)),
+    top: Math.min(...usable.map((b) => b.top)),
+    right: Math.max(...usable.map((b) => b.right)),
+    bottom: Math.max(...usable.map((b) => b.bottom)),
+  };
+}
+
+/**
+ * Map a SOURCE-fraction face box into PLATE-fraction space.
+ *
+ * Coord conversion (explicit):
+ *   source: face.{left,top,right,bottom} ∈ [0,1] of sourceW×sourceH
+ *   crop:   rect.{cx,cy,cw,ch} in SOURCE PIXELS (faceSafeCrop CropRect)
+ *   plate:  full canvas of the cropped delivery = rect window
+ *   plateLeft = (face.left * sourceW - rect.cx) / rect.cw
+ *   …same for top/right/bottom
+ * Uncropped (no rect / missing dims): identity.
+ */
+function mapSourceFaceToPlate(face, { cropRect = null, sourceW = null, sourceH = null } = {}) {
+  if (!face) return null;
+  if (
+    !cropRect
+    || !Number.isFinite(sourceW) || sourceW < 1
+    || !Number.isFinite(sourceH) || sourceH < 1
+    || ![cropRect.cx, cropRect.cy, cropRect.cw, cropRect.ch].every((n) => Number.isFinite(n))
+    || !(cropRect.cw > 0) || !(cropRect.ch > 0)
+  ) {
+    return { left: face.left, top: face.top, right: face.right, bottom: face.bottom };
+  }
+  const toPlate = (fx, fy) => ({
+    x: (fx * sourceW - cropRect.cx) / cropRect.cw,
+    y: (fy * sourceH - cropRect.cy) / cropRect.ch,
+  });
+  const tl = toPlate(face.left, face.top);
+  const br = toPlate(face.right, face.bottom);
+  return {
+    left: Math.min(tl.x, br.x),
+    top: Math.min(tl.y, br.y),
+    right: Math.max(tl.x, br.x),
+    bottom: Math.max(tl.y, br.y),
+  };
+}
+
+function bandRect(bandKey) {
+  const extent = BANDS[bandKey];
+  if (!extent) return null;
+  return { left: BAND_X0, top: extent[0], right: BAND_X1, bottom: extent[1] };
+}
+
+/**
+ * Flag plateHints bands `avoid:true` where a face covers > FACE_BAND_OVERLAP_THRESHOLD
+ * of the band area. Pure — mutates a shallow copy of samples/bands, never throws.
+ *
+ * faceSamples: [{ atSec, face }] — atSec null → apply to ALL plate samples
+ * (envelope fallback). Each timed sample maps to the nearest plateHints
+ * sample; when equidistant, both get the face (conservative).
+ *
+ * Multiple faces at one sample time are UNIONED before the overlap test.
+ *
+ * @returns {object|null} new plateHints (or null input unchanged)
+ */
+function applyFaceKeepOut(plateHints, faceSamples, opts = {}) {
+  if (!plateHints?.samples?.length) return plateHints;
+  const samplesIn = Array.isArray(faceSamples) ? faceSamples : [];
+  if (!samplesIn.length) return plateHints;
+  const threshold = typeof opts.overlapThreshold === 'number'
+    ? opts.overlapThreshold
+    : FACE_BAND_OVERLAP_THRESHOLD;
+
+  // Deep-enough copy so we don't mutate the analyzePlate object in place.
+  const out = {
+    samples: plateHints.samples.map((s) => ({
+      atSec: s.atSec,
+      bands: Object.fromEntries(
+        Object.entries(s.bands || {}).map(([k, v]) => [k, { ...v }])
+      ),
+    })),
+  };
+
+  // face index → list of plate sample indices it applies to
+  const facesByPlateIdx = out.samples.map(() => []);
+
+  for (const fs of samplesIn) {
+    if (!fs?.face) continue;
+    const plateFace = mapSourceFaceToPlate(fs.face, opts);
+    if (!plateFace) continue;
+
+    if (fs.atSec == null || !Number.isFinite(fs.atSec)) {
+      // Envelope / untimed: cover every sample (conservative).
+      for (let i = 0; i < out.samples.length; i++) facesByPlateIdx[i].push(plateFace);
+      continue;
+    }
+
+    // Nearest plateHints sample; ties → all minima (conservative).
+    let bestDist = Infinity;
+    const winners = [];
+    for (let i = 0; i < out.samples.length; i++) {
+      const d = Math.abs(out.samples[i].atSec - fs.atSec);
+      if (d < bestDist - 1e-9) {
+        bestDist = d;
+        winners.length = 0;
+        winners.push(i);
+      } else if (Math.abs(d - bestDist) <= 1e-9) {
+        winners.push(i);
+      }
+    }
+    for (const i of winners) facesByPlateIdx[i].push(plateFace);
+  }
+
+  let flagged = 0;
+  for (let i = 0; i < out.samples.length; i++) {
+    const union = unionFaceBoxes(facesByPlateIdx[i]);
+    if (!union) continue;
+    const bands = out.samples[i].bands;
+    for (const bandKey of Object.keys(BANDS)) {
+      if (!bands[bandKey]) continue;
+      const br = bandRect(bandKey);
+      const overlap = bandFaceOverlapFrac(br, union);
+      if (overlap > threshold) {
+        bands[bandKey].avoid = true;
+        flagged += 1;
+      }
+    }
+  }
+  if (flagged) {
+    console.log(`🔎 plateIntel: face keep-out flagged ${flagged} band-sample(s) (threshold=${threshold})`);
+  }
+  return out;
+}
+
+module.exports = {
+  analyzePlate,
+  resolveTitlePlacementMode,
+  BAND_FOR_ANCHOR,
+  BANDS,
+  applyFaceKeepOut,
+  bandFaceOverlapFrac,
+  mapSourceFaceToPlate,
+  unionFaceBoxes,
+  FACE_BAND_OVERLAP_THRESHOLD,
+};

@@ -19,8 +19,10 @@ import { slotEnvelope, slotProgress, specTimeScale } from '../lib/timing.js';
 import { stackContainerStyle, SAFE_ZONES } from '../lib/safeZones.js';
 import { contrastToken } from '../lib/tokens.js';
 import { resolveSlotContent } from '../lib/slotContent.js';
+import { decideInkOnLight } from '../lib/plateHints.js';
 // Re-export pure resolver for offline harnesses (same decision as render).
 export { resolveSlotContent, resolveSlotContentCore, truncateWordSafe } from '../lib/slotContent.js';
+export { decideInkOnLight } from '../lib/plateHints.js';
 
 const BAND_FOR_ANCHOR = { top: 'top', upperThird: 'top', center: 'middle', lowerThird: 'bottom', bottom: 'bottom' };
 
@@ -77,18 +79,29 @@ function resolveGroupAnchor(plateHints, authoredAnchor, atSec, { logShift = fals
 // follows the bulk of the visible copy, and the layered shadows carry
 // the minority band. Votes the EFFECTIVE (post keep-out) anchor so ink
 // matches the pixels actually under the shifted stack.
+//
+// Tie-break (only on light==dark): median luma across ALL sampled text-band
+// readings vs 0.55 — near-white studio walls that split 3/3 no longer fall
+// through to brand-default white type. See remotion/lib/plateHints.js.
 function plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors, allSlots) {
   // Render console — sweeps grep `inkVote:`. Always emit so every render
   // is auditable even when plate scan is off / empty.
-  const logVote = (lightWeight, darkWeight, onLight) => {
+  const logVote = (lightWeight, darkWeight, decision) => {
     // eslint-disable-next-line no-console
-    console.log(
-      `inkVote: light=${lightWeight} dark=${darkWeight} -> ${onLight ? 'on-light' : 'brand-default'} tokens`
-    );
+    if (decision.tied && decision.globalLum != null) {
+      console.log(
+        `inkVote: light=${lightWeight} dark=${darkWeight} tie -> globalLum ${decision.globalLum.toFixed(2)} -> ${decision.onLight ? 'on-light' : 'brand-default'}`
+      );
+    } else {
+      console.log(
+        `inkVote: light=${lightWeight} dark=${darkWeight} -> ${decision.onLight ? 'on-light' : 'brand-default'} tokens`
+      );
+    }
   };
   if (!plateHints?.samples?.length) {
-    logVote(0, 0, false);
-    return false;
+    const d = decideInkOnLight(0, 0, null);
+    logVote(0, 0, d);
+    return d.onLight;
   }
   let lightWeight = 0;
   let darkWeight = 0;
@@ -103,10 +116,9 @@ function plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors, a
     if (isLight) lightWeight += rendered;
     else darkWeight += rendered;
   }
-  // Tie or no copy → keep the brand's default (light-type) tokens.
-  const onLight = lightWeight > darkWeight;
-  logVote(lightWeight, darkWeight, onLight);
-  return onLight;
+  const decision = decideInkOnLight(lightWeight, darkWeight, plateHints);
+  logVote(lightWeight, darkWeight, decision);
+  return decision.onLight;
 }
 
 function groupSlots(slots) {
