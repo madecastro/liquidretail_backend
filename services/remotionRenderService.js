@@ -88,10 +88,30 @@ function resolveBrowserExecutable() {
   globDir('/opt/pw-browsers', (root, e) =>
     e.startsWith('chromium_headless_shell') ? path.join(root, e, 'chrome-linux', 'headless_shell') : null
   );
-  // Render.com: puppeteer cache pinned to <repo>/.cache/puppeteer (.puppeteerrc.cjs)
-  globDir(path.join(__dirname, '..', '.cache', 'puppeteer', 'chrome-headless-shell'), (root, e) =>
-    path.join(root, e, 'chrome-headless-shell-linux64', 'chrome-headless-shell')
-  );
+  // DELIBERATELY NO CANDIDATE for Remotion's own cache — it resolves that itself.
+  //
+  // What used to be here was a glob of `<repo>/.cache/puppeteer/chrome-headless-shell`
+  // whose comment claimed .puppeteerrc.cjs pinned the puppeteer cache there. It
+  // does not, and has not since f89e30b moved the cache to
+  // `node_modules/.puppeteer-cache` precisely BECAUSE Render loses `.cache/`
+  // between the build and serve containers (see .puppeteerrc.cjs's header). So
+  // that candidate could never match, and this was not a cosmetic wart: it was
+  // why every fresh instance fell through to ensureBrowser() below and downloaded
+  // ~92MB of headless shell on its FIRST render, on a user-visible request.
+  //
+  // Verified on the live box before removing it: `.cache/puppeteer` does not
+  // exist at all, and `node_modules/.puppeteer-cache` holds only puppeteer's full
+  // `chrome` — not a headless shell, so it is not a candidate for Remotion either.
+  //
+  // The fix is NOT a replacement glob. Remotion's cache nests three levels deep
+  // and platform-specifically
+  // (`node_modules/.remotion/chrome-headless-shell/<platform>/chrome-headless-shell-<platform>/chrome-headless-shell`),
+  // so hand-rolling that path here would be brittle for no benefit —
+  // ensureBrowser() already finds its own cache correctly. The actual fix is
+  // scripts/ensureRemotionBrowser.js, which pre-warms that cache at BUILD time so
+  // the download lands in the artifact and the runtime fallback becomes a no-op.
+  // Keep the Playwright candidate above: that one is a genuinely external browser
+  // this code could not otherwise discover.
   return firstExisting(candidates.filter(Boolean));
 }
 
