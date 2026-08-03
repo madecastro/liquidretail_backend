@@ -128,7 +128,20 @@ Owner-set: **production quality first, money hardening after output is proven.**
    (tier 3)** — raw replacement discards the canonical camera mechanics.
 
    So the prompt is generic BY DESIGN (text is composited downstream by titling), not because
-   fields are missing. If per-concept video variation is wanted again, that is a decision to
+   fields are missing.
+
+   **OWNER DIRECTION 2026-08-03:** *"we may choose to use more archetypes and create them in
+   the future, but right now we want to get it right with the canonical prompt."* So the work
+   is TUNING THE CANONICAL PROMPT, not re-enabling the Director for video and not plumbing
+   concept fields into it. Treat archetype-driven video as explicitly deferred, not missing.
+
+   Practical consequence: iterate via `videoPromptGuidance` (tier 3, prepend — keeps the
+   canonical camera mechanics) and by editing the canonical directives in `buildVeoPrompt`
+   itself. Reach for `videoPromptRaw` only to A/B a wholesale alternative, since it bypasses
+   the canonical directives entirely and warns when it does.
+
+   **You cannot evaluate any of this until item 3 is fixed** — every run currently yields a
+   paid master with no titled output, so prompt changes are unobservable. If per-concept video variation is wanted again, that is a decision to
    re-enable the Director for video, not a field-plumbing fix.
 
 4. **`perProduct` over-reports.** It says `"Queued 1 creative(s)"` with `payloads: 1` while the
