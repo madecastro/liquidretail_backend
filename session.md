@@ -384,19 +384,8 @@ managed DB). CLI tokens expire **7 days** after creation — on auth failure run
 
 ---
 
-## 6. ARCHIVE — one line per prior session
+## 6. HISTORY
 
-- **2026-08-02** — Director reasoning quarantined; presets platform-grouped, Google frozen;
-  CLAUDE.md §00 written; video model corrected to **Omni, not Veo**; concurrency knobs to env.
-- **2026-08-01** — measured 4 independent Omni submits for one campaign/product on the
-  non-preset path.
-- **2026-07-31** — static geometry, fabricated proof and snippet inversion fixed; provenance
-  found inert end-to-end; Render shell access set up.
-- **2026-07-30** — static-ad diagnostics; the image-ref "photoreal polish" shadow stopped.
-- **2026-07-29** — Atlas facts verified: 720p and 1080p identically priced; Omni prompt cap
-  20k chars; no image/video endpoint supports a system prompt.
-- **2026-07-27** — video batch stalls diagnosed; Telegram alerting built (now Slack); reaper
-  false-reap window closed.
-- **2026-07-23** — pipeline cost/perf pass; `config/defaults.env` introduced.
-- **2026-07-22** — generic sitemap + JSON-LD catalog scraper after the Living Spaces incident.
-- **2026-07-21/22** — org repos stood up; SPA cutover to Netlify; Render backend live.
+Moved to **`CHANGELOG.md`**. Settled history does not belong in the live handoff — this file
+regrew to ~760 lines once by appending a narrative per session, and answering "is this still
+true?" then meant reading two weeks of it. Add new entries there, not here.
