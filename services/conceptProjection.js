@@ -1,4 +1,4 @@
-// Single sanctioned way to read a Creative Director concept on any render path.
+// Single sanctioned way to read a Creative Director concept on any path.
 //
 // THE DEFECT (2026-08-01, live on gpt-image-2):
 //   conceptLook() in directImageRenderService fell through
@@ -11,10 +11,92 @@
 //   direction. emotional_hook (purchase-objection name, not mood) and the
 //   permanently-null layoutInput.brand.visual_style were concatenated in too.
 //
+// THE CONTRACT DEFECT (2026-08-02, live on concept-driven generation):
+//   Director schema v3 nests strategy fields under concept.routing
+//   (media_picks, archetype, creative_style, output_shape, …). The
+//   producer's own validator dual-reads flat v2 and nested v3, but the
+//   expansion consumer only read concept.media_picks (flat). Every v3
+//   concept was discarded as "no media_picks" and paid Director rounds
+//   produced zero ads. conceptField() is the single dual-read helper so
+//   the next schema move is one edit, not a hunt across consumers.
+//
 // RULE: absent means absent. Never invent a visual world from voice words or
-// honesty notes. No export from this module may return rationale / reasoning.
+// honesty notes. No export from this module may return rationale / reasoning
+// into a render projection (conceptForRender). conceptField itself is a
+// structural dual-read and does not invent values.
 
 'use strict';
+
+// Fields the Director nests under `routing` in schema v3. Listed so the
+// next reader knows what moved — conceptField dual-reads ANY name the same
+// way (routing first, then flat), but these are the ones that actually
+// nest today.
+const ROUTING_NESTED_FIELDS = Object.freeze([
+  'archetype',
+  'layout_family',
+  'emotional_hook',
+  'social_proof_type',
+  'product_priority',
+  'ugc_priority',
+  'comment_priority',
+  'stat_priority',
+  'cta_emphasis',
+  'creative_style',
+  'recommended_components',
+  'media_picks',
+  'output_shape'
+]);
+
+/**
+ * Dual-read one field from a Director concept: prefer nested v3
+ * `concept.routing[name]`, fall back to flat v2 `concept[name]`.
+ *
+ * Nullish nested values (`null` / `undefined`) fall through to flat so a
+ * partial nest does not blank a legacy flat sibling. Falsy-but-present
+ * nested values (`''`, `0`, `false`) win — same as `!= null`, not `||`.
+ *
+ * media_picks is special: use conceptMediaPicks, which preserves the
+ * producer's Array.isArray order (nested array wins including empty;
+ * non-array nested falls through to a flat array).
+ *
+ * @param {object|null|undefined} concept
+ * @param {string} name
+ * @returns {*}
+ */
+function conceptField(concept, name) {
+  if (!concept || typeof concept !== 'object' || !name) return undefined;
+  const r = (concept.routing && typeof concept.routing === 'object')
+    ? concept.routing
+    : null;
+  if (r && r[name] != null) return r[name];
+  return concept[name];
+}
+
+/**
+ * media_picks as an array, dual-reading nested v3 and flat v2.
+ *
+ * True Array.isArray ordering (matches the pre-helper producer):
+ *   1. nested array wins — including empty [] (nested-present means nested)
+ *   2. non-array nested value falls through to a flat array when present
+ *   3. otherwise []
+ *
+ * Do NOT route this through conceptField then coerce non-arrays to []:
+ * that drops the flat sibling when routing.media_picks is a non-array
+ * non-null (`{}`, `"bad"`, `false`, `0`, `''`) and reintroduces the
+ * no_media_picks outage in a narrower case.
+ *
+ * @param {object|null|undefined} concept
+ * @returns {Array}
+ */
+function conceptMediaPicks(concept) {
+  if (!concept || typeof concept !== 'object') return [];
+  const r = (concept.routing && typeof concept.routing === 'object')
+    ? concept.routing
+    : null;
+  if (r && Array.isArray(r.media_picks)) return r.media_picks;
+  if (Array.isArray(concept.media_picks)) return concept.media_picks;
+  return [];
+}
 
 /**
  * Copy-ready strings the renderer may typeset. Dual-reads v3 `copy` and
@@ -74,15 +156,12 @@ function artDirectionLook(concept) {
  * reading fields off this object.
  *
  * Dual-reads flat v2 rows and nested v3 rows into one flat, strategy-safe
- * shape. copy and copy_picks both point at the same projected copy so
- * dual-read call sites do not have to change overnight.
+ * shape via conceptField. copy and copy_picks both point at the same
+ * projected copy so dual-read call sites do not have to change overnight.
  */
 function conceptForRender(concept) {
   if (!concept || typeof concept !== 'object') return null;
 
-  const r = (concept.routing && typeof concept.routing === 'object')
-    ? concept.routing
-    : {};
   const copy = renderableCopy(concept);
   const look = artDirectionLook(concept);
 
@@ -95,19 +174,19 @@ function conceptForRender(concept) {
   return {
     concept_id:             concept.concept_id ?? null,
     name:                   concept.name ?? null,
-    archetype:              r.archetype ?? concept.archetype ?? null,
-    layout_family:          r.layout_family ?? concept.layout_family ?? null,
-    emotional_hook:         r.emotional_hook ?? concept.emotional_hook ?? null,
-    social_proof_type:      r.social_proof_type ?? concept.social_proof_type ?? null,
-    product_priority:       r.product_priority ?? concept.product_priority ?? null,
-    ugc_priority:           r.ugc_priority ?? concept.ugc_priority ?? null,
-    comment_priority:       r.comment_priority ?? concept.comment_priority ?? null,
-    stat_priority:          r.stat_priority ?? concept.stat_priority ?? null,
-    cta_emphasis:           r.cta_emphasis ?? concept.cta_emphasis ?? null,
-    creative_style:         r.creative_style ?? concept.creative_style ?? null,
-    recommended_components: r.recommended_components ?? concept.recommended_components ?? null,
-    media_picks:            r.media_picks ?? concept.media_picks ?? null,
-    output_shape:           r.output_shape ?? concept.output_shape ?? null,
+    archetype:              conceptField(concept, 'archetype') ?? null,
+    layout_family:          conceptField(concept, 'layout_family') ?? null,
+    emotional_hook:         conceptField(concept, 'emotional_hook') ?? null,
+    social_proof_type:      conceptField(concept, 'social_proof_type') ?? null,
+    product_priority:       conceptField(concept, 'product_priority') ?? null,
+    ugc_priority:           conceptField(concept, 'ugc_priority') ?? null,
+    comment_priority:       conceptField(concept, 'comment_priority') ?? null,
+    stat_priority:          conceptField(concept, 'stat_priority') ?? null,
+    cta_emphasis:           conceptField(concept, 'cta_emphasis') ?? null,
+    creative_style:         conceptField(concept, 'creative_style') ?? null,
+    recommended_components: conceptField(concept, 'recommended_components') ?? null,
+    media_picks:            conceptMediaPicks(concept),
+    output_shape:           conceptField(concept, 'output_shape') ?? null,
     // Dual-compat: both names are the same projected object.
     copy,
     copy_picks:             copy,
@@ -117,6 +196,9 @@ function conceptForRender(concept) {
 }
 
 module.exports = {
+  ROUTING_NESTED_FIELDS,
+  conceptField,
+  conceptMediaPicks,
   renderableCopy,
   artDirectionLook,
   conceptForRender
