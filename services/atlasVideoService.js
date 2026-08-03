@@ -761,6 +761,69 @@ function pickProductOnlyUrl(catalogMedias, product) {
 // seed-only) per brand/product via videoSettings.referenceImageCount.
 const DEFAULT_REFERENCE_IMAGE_COUNT = 3;
 const MAX_REFERENCE_IMAGE_COUNT     = 7;
+// Owner constraint (hallucination at high ref counts): with the primary
+// repeat, the intended stack is 3 distinct + primary again = 4 total.
+// Never raise past this when REPEAT_PRIMARY_REFERENCE is on.
+const REPEAT_PRIMARY_TOTAL_CAP = 4;
+
+/**
+ * REPEAT_PRIMARY_REFERENCE env flag (default true).
+ * When on, buildReferenceImages appends the primary (position 0) URL again
+ * as the final reference so the model's closing beat returns to the front
+ * view by construction. Offline harnesses flip this via process.env.
+ */
+function isRepeatPrimaryReferenceEnabled() {
+  const raw = process.env.REPEAT_PRIMARY_REFERENCE;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+/**
+ * Pure: append primary URL as final ref when there is room under the
+ * total cap. Runs AFTER final-URL dedupe so a deliberate duplicate is kept
+ * (seenFinal would otherwise drop a naive pre-dedupe push of the same URL).
+ * Never evicts a real view — only appends when length < totalCap.
+ *
+ * @param {string[]} urls  Ordered reframed URLs (post-dedupe).
+ * @param {{ enabled?: boolean, totalCap?: number }} opts
+ * @returns {string[]}
+ */
+function appendPrimaryReferenceRepeat(urls, opts = {}) {
+  const enabled = opts.enabled !== undefined ? !!opts.enabled : isRepeatPrimaryReferenceEnabled();
+  const totalCap = Number.isFinite(opts.totalCap) ? opts.totalCap : REPEAT_PRIMARY_TOTAL_CAP;
+  if (!enabled || !Array.isArray(urls) || urls.length === 0) return urls ? urls.slice() : [];
+  if (urls.length >= totalCap) return urls.slice();
+  const out = urls.slice();
+  out.push(out[0]);
+  return out;
+}
+
+/**
+ * Pure: compute stack budget when primary-repeat is on.
+ * Distinct views fill first; one slot is left for the primary repeat when
+ * possible. Caps total at REPEAT_PRIMARY_TOTAL_CAP (3 distinct + primary).
+ * Bumps a default-3 request so the closing slot fits without dropping a view.
+ *
+ * @returns {{ distinctCap: number, totalCap: number }}
+ */
+function referenceStackBudget({ effectiveMax, modelMax, repeatEnabled }) {
+  const model = Number.isFinite(modelMax) && modelMax >= 1 ? modelMax : MAX_REFERENCE_IMAGE_COUNT;
+  const eff = Number.isFinite(effectiveMax) && effectiveMax >= 1 ? effectiveMax : DEFAULT_REFERENCE_IMAGE_COUNT;
+  if (!repeatEnabled) {
+    const cap = Math.min(eff, model);
+    return { distinctCap: cap, totalCap: cap };
+  }
+  // Owner: 3 distinct + repeated primary = 4. More refs hallucinated.
+  const totalCap = Math.min(
+    Math.max(eff, Math.min(DEFAULT_REFERENCE_IMAGE_COUNT + 1, REPEAT_PRIMARY_TOTAL_CAP)),
+    model,
+    REPEAT_PRIMARY_TOTAL_CAP
+  );
+  // Leave one slot for the primary repeat when we have at least one ref
+  // to repeat; never shrink distinct below 1.
+  const distinctCap = Math.max(1, totalCap - 1);
+  return { distinctCap, totalCap };
+}
 
 // Same most-specific-wins chain as resolveVideoModel. Non-numeric and
 // out-of-range values warn and fall through; the result is additionally
@@ -1839,14 +1902,30 @@ async function buildReferenceImages({
   // ceiling on a deliberate choice — silently dropping picks 4+ was the "why did
   // it ignore the images I selected?" surprise. Still bounded by the model's own
   // maxReferenceImages, which is a hard API limit we cannot exceed.
+  //
+  // When REPEAT_PRIMARY_REFERENCE is on, owner constraint caps the stack at 4
+  // (3 distinct + primary again) — more refs hallucinated in pilot. Distinct
+  // views fill first; the primary is appended AFTER final-URL dedupe so the
+  // deliberate duplicate is kept (seenMediaIds/seenUrls and seenFinal would
+  // drop a naive in-loop repeat). Never evict a real view to make room for
+  // the duplicate — only append when length < totalCap.
+  const modelMax = caps?.maxReferenceImages || MAX_REFERENCE_IMAGE_COUNT;
   const effectiveMax = usedOrdered
-    ? Math.min(ids.length, caps?.maxReferenceImages || MAX_REFERENCE_IMAGE_COUNT)
+    ? Math.min(ids.length, modelMax)
     : maxImages;
-  const capped = ids.slice(0, effectiveMax);
-  if (usedOrdered && ids.length > effectiveMax) {
+  const repeatEnabled = isRepeatPrimaryReferenceEnabled();
+  const { distinctCap, totalCap } = referenceStackBudget({
+    effectiveMax,
+    modelMax,
+    repeatEnabled,
+  });
+  const capped = ids.slice(0, distinctCap);
+  if (usedOrdered && ids.length > distinctCap) {
     console.warn(
-      `⚠️  buildReferenceImages: ${ids.length} operator picks exceed the model's ` +
-      `maxReferenceImages (${effectiveMax}) — using the first ${effectiveMax} in pick order`
+      `⚠️  buildReferenceImages: ${ids.length} operator picks exceed the stack budget ` +
+      `(distinctCap=${distinctCap}, modelMax=${modelMax}` +
+      `${repeatEnabled ? ', REPEAT_PRIMARY_REFERENCE reserves 1 closing slot' : ''}) — ` +
+      `using the first ${distinctCap} in pick order`
     );
   }
 
@@ -1868,7 +1947,12 @@ async function buildReferenceImages({
     seenFinal.add(u);
     out.push(u);
   }
-  return out;
+
+  // Primary-as-closing-ref: append AFTER seenFinal so the same URL may
+  // appear twice. Plain post-dedupe duplicate is fine — consumers send the
+  // array as ordered reference images; nothing re-dedupes downstream of here
+  // before the model payload is built.
+  return appendPrimaryReferenceRepeat(out, { enabled: repeatEnabled, totalCap });
 }
 
 // ── Polling ───────────────────────────────────────────────────────────
@@ -2826,6 +2910,7 @@ module.exports = {
   BUILT_IN_DEFAULT_MODEL,
   DEFAULT_REFERENCE_IMAGE_COUNT,
   MAX_REFERENCE_IMAGE_COUNT,
+  REPEAT_PRIMARY_TOTAL_CAP,
   capsFor,
   resolveVideoModel,
   resolveModelAndAspect,
@@ -2839,6 +2924,10 @@ module.exports = {
   cropImageUrlForAspect,
   buildVideoSegmentUrl,
   buildReferenceImages,
+  // Pure helpers for scripts/verifyPrimaryReferenceRepeat.js (offline).
+  isRepeatPrimaryReferenceEnabled,
+  appendPrimaryReferenceRepeat,
+  referenceStackBudget,
   pickProductOnlyUrl,
   buildPromptScaffold,
   // Billable-submit replay guard. Exported for scripts/verifySubmitGuard.js —

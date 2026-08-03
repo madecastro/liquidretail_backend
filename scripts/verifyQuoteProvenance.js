@@ -194,17 +194,18 @@ for (const [value, expected, why] of RATINGS) {
     formatDisplayRating(value) === expected,
     `helper=${JSON.stringify(formatDisplayRating(value))} intent=${JSON.stringify(d.rating)}`);
 }
-// Video chrome source pin: buildMetaForAd must apply formatDisplayRating so a
-// 3.2 catalog rating cannot reach Remotion. Offline we cannot run the async
-// Mongo path; pin the require + call site instead (revert-prove by deleting it).
+// Video chrome source pin: buildMetaForAd must gate ratings so a 3.2 catalog
+// rating cannot reach Remotion. Atomic pair resolver (resolveAtomicRatingPair)
+// applies formatDisplayRating per tier; offline we cannot run the async Mongo
+// path — pin the require + call site instead (revert-prove by deleting it).
 {
   const src = require('fs').readFileSync(
     require('path').join(__dirname, '..', 'services', 'brandScriptExecutor.js'), 'utf8'
   );
-  check('P3 video meta gates rating via formatDisplayRating',
-    /formatDisplayRating\s*\(\s*cascaded\.rating\s*\)/.test(src)
+  check('P3 video meta gates rating via resolveAtomicRatingPair',
+    /resolveAtomicRatingPair\s*\(/.test(src)
     && /require\s*\(\s*['"]\.\/ratingDisplay['"]\s*\)/.test(src),
-    'buildMetaForAd must call formatDisplayRating(cascaded.rating)');
+    'buildMetaForAd must call resolveAtomicRatingPair (gates via formatDisplayRating)');
 }
 for (const [value, expected] of [[0, undefined], [-5, undefined], [12, 12], [null, undefined]]) {
   const d = direct.buildIntentData({

@@ -169,6 +169,9 @@ const OMNI_DIRECTIVES = {
     `Do NOT recreate, redraw, regenerate, enhance, sharpen with generative fill, or use AI on any part. ` +
     `Do NOT change colors, stitching, textures, materials, logos, shape, or proportions, or alter lighting, shadows, or reflections. ` +
     `Do NOT add or remove any part or detail. The only motion is the virtual camera.`,
+  // Policy: permit brief ~0.25s crossfades (Ken Burns scene joins); ban long
+  // dissolves and morphing blends. doNot must not ban "dissolves" alone —
+  // a crossfade IS a short dissolve (see doNot phrasing below).
   transitions: `Transitions: Smooth crossfades only, ~0.25s. No wipes, flashes, or animated transitions.`,
   cameraStyle:
     `Camera style: Luxury, slow, elegant, stable. Ease in/out. ` +
@@ -186,10 +189,16 @@ const OMNI_DIRECTIVES = {
     `PHYSICAL ACCURACY: Any person visible must remain anatomically correct — 5-fingered hands, symmetric matching eyes, ` +
     `natural skin texture, real body proportions. No extra digits, warped features, or impossible angles. ` +
     `If the photographs show a person, preserve their face, hair, skin tone, and identity throughout — no morphing mid-shot.`,
+  // Subject continuity: camera+product were locked; the person was not.
+  subjectContinuity:
+    `SUBJECT CONTINUITY: Any person in the photographs keeps pose and orientation continuity across scenes. ` +
+    `Do NOT turn them fully away from camera as a closing beat; face and body orientation stay consistent with the source views.`,
   doNot:
     `Do NOT: regenerate/morph/warp/bend the product, hallucinate geometry, invent textures, change branding/logos/stitching/colors, ` +
     `create fake shadows/reflections/depth, animate the product or any of its parts, use generative fill, or create new backgrounds. ` +
-    `No fantasy motion — no sparkles, particles, lens flares, floating props, morphing, or dissolves.`
+    // Crossfade ~0.25s is allowed (see transitions); ban morphing + long dissolves only.
+    `No fantasy motion — no sparkles, particles, lens flares, floating props, morphing blends, or long dissolves ` +
+    `(brief ~0.25s crossfades between scenes are allowed).`
 };
 
 // ── GROK default prompt — optimized for xai/grok-imagine-video-v1.5/image-to-video (4,096-byte cap) ──
@@ -208,6 +217,7 @@ const GROK_DIRECTIVES = {
     `Do NOT recreate, redraw, regenerate, enhance, generative-fill, or AI-alter any part. ` +
     `Do NOT change colors, stitching, textures, materials, logos, shape, proportions, lighting, shadows, or reflections. ` +
     `Do NOT add or remove detail. Only motion is the virtual camera.`,
+  // Same transition policy as OMNI: brief ~0.25s crossfades OK; long dissolves/morphs banned.
   transitions: `Transitions: Smooth crossfades ~0.25s only. No wipes, flashes, or animated transitions.`,
   cameraStyle:
     `Camera style: Luxury, slow, elegant, stable. Ease in/out. ` +
@@ -225,10 +235,14 @@ const GROK_DIRECTIVES = {
     `PHYSICAL ACCURACY: Persons must stay anatomically correct — 5-fingered hands, symmetric eyes, ` +
     `natural skin, real proportions. No extra digits, warped features, or impossible angles. ` +
     `Preserve face, hair, skin tone, identity — no mid-shot morphing.`,
+  subjectContinuity:
+    `SUBJECT CONTINUITY: Any person keeps pose/orientation continuity. ` +
+    `Do NOT turn fully away from camera as a closing beat; match source-view orientation.`,
   doNot:
     `Do NOT: regenerate/morph/warp/bend the product, hallucinate geometry, invent textures, change branding/logos/stitching/colors, ` +
     `fake shadows/reflections/depth, animate the product or parts, use generative fill, or create new backgrounds. ` +
-    `No fantasy motion — no sparkles, particles, flares, floating props, morphing, or dissolves.`
+    `No fantasy motion — no sparkles, particles, flares, floating props, morphing blends, or long dissolves ` +
+    `(brief ~0.25s crossfades between scenes are allowed).`
 };
 
 // Main export. Builds the camera-only "Ken Burns" video prompt for the
@@ -300,7 +314,9 @@ function buildVeoPrompt({
     `Timeline (${dur.toFixed(1)}s): ` +
     `Scene 1 (0.0–${t1}s): slow horizontal pan left→right, ~10–15% movement. No zoom, rotation, or perspective shift. ` +
     `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
-    `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain center framing.`
+    // Closing beat returns to the primary (first reference) view by construction.
+    `Scene 3 (${t2}–${dur.toFixed(1)}s): RETURN TO THE PRIMARY VIEW — end on the view shown in the FIRST reference image (the primary scene), ` +
+    `full product visible. Begin slightly cropped if needed, slow zoom out ~10–12% to reveal the full product. Maintain center framing.`
   );
   lines.push(d.transitions);
   lines.push(d.cameraStyle);
@@ -327,15 +343,20 @@ function buildVeoPrompt({
   }
 
   lines.push(d.physicalAccuracy);
+  lines.push(d.subjectContinuity);
 
   // Reference stack: position 0 is the seed (main image); subsequent
   // positions are the product hero + alternate views in stored order
-  // (buildReferenceImages). hasProductReference is false only when the
-  // stack is seed-only (no product imagery available, or a 1-ref model).
+  // (buildReferenceImages). When REPEAT_PRIMARY_REFERENCE is on, the FINAL
+  // reference deliberately repeats the primary view so Scene 3 can match it.
+  // hasProductReference is false only when the stack is seed-only (no product
+  // imagery available, or a 1-ref model).
   if (hasProductReference) {
     lines.push(
       `PRODUCT FIDELITY: All supplied images show the exact catalog SKU — the first image is the primary scene, ` +
-      `the rest are additional views of the same product. Together they are the ABSOLUTE source of truth for shape, color, ` +
+      `the rest are additional views of the same product. ` +
+      `The FINAL reference image repeats the primary view; the video's closing shot must match that primary/final view, full product visible. ` +
+      `Together they are the ABSOLUTE source of truth for shape, color, ` +
       `label text, packaging, and proportions. If any images disagree on a detail, the dedicated product shots win over the scene image. ` +
       `Do NOT blend the views into new angles, reinterpret the label, shift colors, or generate a similar-but-different variant.`
     );
@@ -343,6 +364,7 @@ function buildVeoPrompt({
     lines.push(
       `PRODUCT FIDELITY: The product visible in the scene image is the catalog product. ` +
       `Preserve its exact shape, color, label text, packaging, and proportions throughout. ` +
+      `End on that same primary view, full product visible. ` +
       `Do NOT reinterpret the label, shift colors, or generate a similar-but-different variant.`
     );
   }
@@ -426,6 +448,9 @@ module.exports = {
   PLATFORM_FORMAT_ASPECT,
   promptProfileFor,
   PROMPT_PROFILES,
-  enforceRawByteCap
+  enforceRawByteCap,
+  // Exported for offline verify harnesses (directive continuity / policy).
+  OMNI_DIRECTIVES,
+  GROK_DIRECTIVES,
 };
 

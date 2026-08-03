@@ -396,16 +396,28 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
       const fps = probe.fps;
       const durationInFrames = Math.max(1, Math.round(probe.durationSec * fps));
 
-      // Placement: 'canonical' skips plate scan (static titles); 'content'
-      // runs analyzePlate (TITLE_PLATE_SCAN depth). Kill switch TITLE_PLATE_SCAN=off
-      // forces canonical via resolveTitlePlacementMode.
+      // Placement: 'canonical' keeps static title positions; 'content' also
+      // uses the scan for placement. The plate scan itself now runs for BOTH
+      // placements: Canonical.jsx's ink contrast flip (plateIsLightGlobal ->
+      // on-light text tokens) consumes plateHints, and with hints null the
+      // flip can never fire -- which shipped WHITE text on a near-white
+      // studio plate (found live 2026-08-04, "this is hard to read"). The
+      // scan was wired to the placement feature; legibility needs it always.
+      // Kill switch TITLE_PLATE_SCAN=off still disables the scan entirely
+      // via resolveTitlePlacementMode + the explicit check below.
       const { analyzePlate, resolveTitlePlacementMode } = require('./plateIntelService');
       const placement = resolveTitlePlacementMode({ placementMode, brand });
       timings.placementMode = placement;
       t = Date.now();
       let plateHints = null;
-      if (placement === 'content') {
-        plateHints = await analyzePlate(platePath, { durationSec: probe.durationSec });
+      if (String(process.env.TITLE_PLATE_SCAN || '').toLowerCase() !== 'off') {
+        try {
+          plateHints = await analyzePlate(platePath, { durationSec: probe.durationSec });
+        } catch (err) {
+          // Legibility intelligence must never fail a render; null keeps the
+          // pre-fix behaviour (brand default ink).
+          console.warn(`🎬 remotion[ad=${adId || '?'}]: plate scan failed (${err.message}) — ink flip unavailable`);
+        }
       }
       timings.plateScanMs = Date.now() - t;
       console.log(`🎬 remotion[ad=${adId || '?'}]: placement=${placement} format=${format}`);
@@ -540,16 +552,26 @@ async function renderPreview({ meta, spec, tokens, format, plateImagePath = null
         fps = probe.fps;
         durationSec = probe.durationSec;
         plate = { videoUrl: `${base}/jobs/${jobId}/plate.mp4` };
-        if (placement === 'content') {
-          plateHints = await analyzePlate(target, { durationSec: probe.durationSec });
+        // Scan for BOTH placements (same rationale as renderTitles): the ink
+        // contrast flip needs hints, and preview must match production.
+        if (String(process.env.TITLE_PLATE_SCAN || '').toLowerCase() !== 'off') {
+          try {
+            plateHints = await analyzePlate(target, { durationSec: probe.durationSec });
+          } catch (err) {
+            console.warn(`🎬 remotion preview: plate scan failed (${err.message}) — ink flip unavailable`);
+          }
         }
       } else if (plateImagePath) {
         const ext = path.extname(plateImagePath) || '.jpg';
         const target = path.join(jobDir, `plate${ext}`);
         await fsp.copyFile(plateImagePath, target);
         plate = { imageUrl: `${base}/jobs/${jobId}/plate${ext}` };
-        if (placement === 'content') {
-          plateHints = await analyzePlate(plateImagePath, { isImage: true });
+        if (String(process.env.TITLE_PLATE_SCAN || '').toLowerCase() !== 'off') {
+          try {
+            plateHints = await analyzePlate(plateImagePath, { isImage: true });
+          } catch (err) {
+            console.warn(`🎬 remotion preview: plate scan failed (${err.message}) — ink flip unavailable`);
+          }
         }
       }
       const durationInFrames = Math.max(1, Math.round(durationSec * fps));
