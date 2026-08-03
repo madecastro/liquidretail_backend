@@ -1211,6 +1211,43 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
       ? 'canvas'
       : bodyEngine || resolveTitlingEngine(brand, fakeAd).engine;
 
+    // SECURITY (GEN-1) — canvas previews EXECUTE a brand script through
+    // vm.compileFunction (brandScriptRunner.child.js:139) with no parsingContext, so
+    // the compiled body resolves free identifiers against the live V8 global and
+    // `globalThis.process.mainModule.require('child_process')` is one expression away.
+    // The child is spawned same-uid with only a shallow env scrub, so
+    // /proc/<ppid>/environ still yields MONGODB_URI, ATLAS_API_KEY and every
+    // Cloudinary credential (GEN-2). Tenant scoping does not help — the attacker
+    // supplies the script for a brand they already own.
+    //
+    // THREE doors reached that sink, not one, which is why the originally prescribed
+    // fix (delete the bodyScript branch) was insufficient — it left a two-request
+    // exploit:
+    //   1. body.script          → forces 'canvas' directly above
+    //   2. body.engine:'canvas' → the bodyEngine hatch, which short-circuits BEFORE
+    //                             resolveTitlingEngine is ever consulted
+    //   3. a styleScript / styleScriptVertical / styleScriptLandscape persisted
+    //      earlier via PATCH /api/brand/:id (allow-listed with no validation), then
+    //      previewed with {engine:'canvas'} and no body.script at all
+    //
+    // Guarding the ENGINE closes all three at once, and stays closed if
+    // resolveTitlingEngine is ever un-hardwired from 'remotion'. Note that adding
+    // parsingContext would NOT have fixed the sink: the injected params (helpers,
+    // canvas, …) are parent-realm objects, so
+    // `helpers.clamp.constructor("return process")()` escapes a fresh context anyway.
+    // The route guard is the control, not the VM options.
+    //
+    // Nothing live loses a feature: canvas titling is already dead on the render path
+    // (resolveTitlingEngine returns 'remotion' unconditionally), and the only UI
+    // caller of this route — StyleOverridesCard.tsx — is commented out of
+    // Brand/index.tsx at both its import and its usage. scripts/testBrandScript.js
+    // still reaches runChild by design, which is why the child cannot just be deleted.
+    if (engine !== 'remotion') {
+      return res.status(400).json({
+        error: 'canvas script previews are disabled — brand script source is not executable'
+      });
+    }
+
     let requestPlacement = null;
     if (req.body?.placementMode != null && String(req.body.placementMode).trim() !== '') {
       requestPlacement = String(req.body.placementMode).trim();

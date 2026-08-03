@@ -160,9 +160,23 @@ Verified 2026-07-29; line anchors re-checked 2026-08-03. Each looks live; none i
   displays "engine: canvas" while rendering with remotion. All of
   `services/brandScripts/*.script.js`, `brandScriptRunner.child.js`, and the
   canvas `sharp.resize(fit:'cover')` paths are dead. See `docs/TITLING.md` §0.
-  **Exception:** `POST /api/brand/:id/preview-script` forces `engine='canvas'`,
-  bypassing the switch — the only route reaching the `vm.compileFunction` escape
-  (`ARCHITECTURE_REVIEW.md` GEN-1).
+  **The former exception is now CLOSED (2026-08-03).**
+  `POST /api/brand/:id/preview-script` used to reach the `vm.compileFunction` escape
+  via **three** doors, not one: `body.script` (forces `'canvas'`), the
+  `body.engine:'canvas'` hatch (which short-circuits *before* `resolveTitlingEngine`
+  is consulted), and a `styleScript*` persisted earlier through the unvalidated
+  `PATCH /api/brand/:id` allow-list and then previewed with `{engine:'canvas'}` and no
+  `body.script` at all. An `engine !== 'remotion'` → 400 guard immediately after the
+  engine resolution (`routes/brand.js`, search `SECURITY (GEN-1)`) closes all three
+  and stays closed if `resolveTitlingEngine` is ever un-hardwired. **No HTTP route
+  reaches `runChild` now**; `scripts/testBrandScript.js` still does by design, which
+  is why `brandScriptRunner.child.js` cannot simply be deleted. Pinned by
+  `scripts/verifyPreviewScriptGuard.js` (8 checks; removing the guard fails 3).
+  Note the original prescribed fix — delete the `bodyScript` branch — was
+  **insufficient**, leaving a two-request exploit; and `parsingContext` would not have
+  helped either, because the injected params are parent-realm objects
+  (`helpers.clamp.constructor("return process")()` escapes a fresh context).
+  See `ARCHITECTURE_REVIEW.md` GEN-1.
 - **`renderViaSpec` + the whole `frontend/client/` tree.** `renderViaSpec`
   (`renderService.js:895`) fetches `${FRONTEND_URL}/ads.html`, but the frontend's
   `netlify.toml` publishes only `frontend/app/dist` and its `/*` fallback
