@@ -18,6 +18,9 @@ const crypto = require('crypto');
 
 const AiJudgeResultArtifact = require('../models/AiJudgeResultArtifact');
 const { trackLlmCall } = require('./costTracker');
+const {
+  conceptField, conceptMediaPicks, renderableCopy
+} = require('./conceptProjection');
 
 const { chatCompletion } = require('./atlasLlmService');
 
@@ -209,19 +212,21 @@ function buildPrompt({ summaries, concept, inputSummary, brandSignal }) {
   if (concept) {
     userLines.push(`CREATIVE CONCEPT THE GENERATOR WAS MATERIALIZING:`);
     userLines.push('```json');
+    // Dual-read nested v3 routing + flat v2 so the Judge anchors on the
+    // same fields the Director actually emitted.
     userLines.push(JSON.stringify({
       concept_id:        concept.concept_id,
       name:              concept.name,
-      archetype:         concept.archetype,
-      layout_family:     concept.layout_family,
-      emotional_hook:    concept.emotional_hook,
-      social_proof_type: concept.social_proof_type,
-      product_priority:  concept.product_priority,
-      ugc_priority:      concept.ugc_priority,
-      comment_priority:  concept.comment_priority,
-      stat_priority:     concept.stat_priority,
-      cta_emphasis:      concept.cta_emphasis,
-      recommended_components: concept.recommended_components || {}
+      archetype:         conceptField(concept, 'archetype'),
+      layout_family:     conceptField(concept, 'layout_family'),
+      emotional_hook:    conceptField(concept, 'emotional_hook'),
+      social_proof_type: conceptField(concept, 'social_proof_type'),
+      product_priority:  conceptField(concept, 'product_priority'),
+      ugc_priority:      conceptField(concept, 'ugc_priority'),
+      comment_priority:  conceptField(concept, 'comment_priority'),
+      stat_priority:     conceptField(concept, 'stat_priority'),
+      cta_emphasis:      conceptField(concept, 'cta_emphasis'),
+      recommended_components: conceptField(concept, 'recommended_components') || {}
     }, null, 2));
     userLines.push('```');
     userLines.push('');
@@ -332,31 +337,35 @@ const CONCEPT_AXES = ['strategy_fit', 'brand_match', 'media_utilization', 'proof
 // Compress one concept into the Judge's reading payload. Strip prompt-
 // builder fields (long rationales, recommended_components verbosity) so
 // the prompt stays cheap on input tokens.
+//
+// Dual-reads nested v3 routing + flat v2 via conceptField so a v3
+// concept still shows media_picks / archetype / creative_style to the
+// Judge (a flat-only read made media_utilization scoring blind).
 function compressConceptForJudge(concept, index) {
   if (!concept || typeof concept !== 'object') return { index, error: 'no concept' };
-  const mp = Array.isArray(concept.media_picks) ? concept.media_picks : [];
-  const cp = concept.copy_picks || {};
+  const mp = conceptMediaPicks(concept);
+  const cp = renderableCopy(concept);
   return {
     index,
     concept_id:        concept.concept_id || null,
     name:              concept.name || null,
-    archetype:         concept.archetype || null,
-    layout_family:     concept.layout_family || null,
-    emotional_hook:    concept.emotional_hook || null,
-    social_proof_type: concept.social_proof_type || null,
-    creative_style:    concept.creative_style || null,
+    archetype:         conceptField(concept, 'archetype') || null,
+    layout_family:     conceptField(concept, 'layout_family') || null,
+    emotional_hook:    conceptField(concept, 'emotional_hook') || null,
+    social_proof_type: conceptField(concept, 'social_proof_type') || null,
+    creative_style:    conceptField(concept, 'creative_style') || null,
     priorities: {
-      product: concept.product_priority || 'unknown',
-      ugc:     concept.ugc_priority     || 'unknown',
-      comment: concept.comment_priority || 'unknown',
-      stat:    concept.stat_priority    || 'unknown'
+      product: conceptField(concept, 'product_priority') || 'unknown',
+      ugc:     conceptField(concept, 'ugc_priority')     || 'unknown',
+      comment: conceptField(concept, 'comment_priority') || 'unknown',
+      stat:    conceptField(concept, 'stat_priority')    || 'unknown'
     },
-    cta_emphasis: concept.cta_emphasis || 'unknown',
+    cta_emphasis: conceptField(concept, 'cta_emphasis') || 'unknown',
     media_picks: mp.map(p => ({
       media_id: p.media_id || null,
       role:     p.role     || null
     })),
-    output_shape: concept.output_shape || null,
+    output_shape: conceptField(concept, 'output_shape') || null,
     copy_picks: {
       headline:    cp.headline    || null,
       subheadline: cp.subheadline || null,
@@ -411,6 +420,15 @@ async function judgeConceptsRound({
 
   const summaries = concepts.map((c, i) => compressConceptForJudge(c, i));
   const universeIds = seededUniverse.map(u => String(u.mediaId));
+  // When the Director universe holds ≤1 image, media_utilization's
+  // "always-just-hero" penalty is not applicable — every concept is
+  // structurally hero-only. Exclude it from the average so it cannot
+  // depress scores for obeying a constraint we imposed. Criterion stays
+  // live when the Director genuinely had alternates (universe ≥ 2).
+  const universeSize = universeIds.length;
+  const scoreAxes = universeSize <= 1
+    ? CONCEPT_AXES.filter((ax) => ax !== 'media_utilization')
+    : CONCEPT_AXES;
 
   const { system, user } = buildConceptRoundPrompt({
     summaries, inputSummary, brandSignal, universeIds
@@ -450,19 +468,22 @@ async function judgeConceptsRound({
 
   // The schema enforces concept_scores length = concepts.length and
   // each entry's per-axis 0..10 values. Compute judgeScore (0..1) as
-  // the average of axes / 10. judgeRank by judgeScore desc; stable
-  // ordering on ties uses input order.
+  // the average of applicable axes / 10. judgeRank by judgeScore desc;
+  // stable ordering on ties uses input order.
   const parsedScores = Array.isArray(parsed.concept_scores) ? parsed.concept_scores : [];
   const scored = concepts.map((c, i) => {
     const row    = parsedScores[i] || {};
     const axes   = row.criteria_scores || {};
-    const sum    = CONCEPT_AXES.reduce((s, ax) => s + (typeof axes[ax] === 'number' ? axes[ax] : 0), 0);
-    const score  = Math.max(0, Math.min(1, sum / (CONCEPT_AXES.length * 10)));
+    const sum    = scoreAxes.reduce((s, ax) => s + (typeof axes[ax] === 'number' ? axes[ax] : 0), 0);
+    const score  = Math.max(0, Math.min(1, sum / (scoreAxes.length * 10)));
     return {
       index:        i,
       conceptId:    c.concept_id || null,
       judgeScore:   score,
-      criteriaScores: Object.fromEntries(CONCEPT_AXES.map(ax => [ax, typeof axes[ax] === 'number' ? axes[ax] : null])),
+      criteriaScores: Object.fromEntries(CONCEPT_AXES.map((ax) => {
+        if (ax === 'media_utilization' && universeSize <= 1) return [ax, null];
+        return [ax, typeof axes[ax] === 'number' ? axes[ax] : null];
+      })),
       hardViolations: Array.isArray(row.hard_violations) ? row.hard_violations.filter(v => typeof v === 'string') : []
     };
   });
@@ -525,16 +546,24 @@ async function judgeConceptsRound({
 function buildConceptRoundPrompt({ summaries, inputSummary, brandSignal, universeIds }) {
   const proofData = inputSummary?.social_proof_signal || {};
   const hasAnyProof = !!(proofData.primary_quote || (proofData.top_comments?.length) || proofData.rating?.value);
+  const universeSize = Array.isArray(universeIds) ? universeIds.length : 0;
+  // Universe size reaches the judge here via seededUniverse → universeIds.
+  // When size ≤ 1 the Director was told to pick exactly 1; "always-just-hero"
+  // is structural, not a quality failure. Keep the axis in the schema for
+  // multi-image rounds; mark it N/A in the prompt for hero-only universes.
+  const mediaUtilizationAxis = universeSize <= 1
+    ? `  media_utilization  — NOT APPLICABLE this round: the seeded universe has ${universeSize} image(s), so every concept is structurally hero-only (static_single / single pick). Score this axis 10 for every concept that picks from the universe; do NOT penalize "always-just-hero" or missing collage/grid. Still penalize media_ids outside the universe and tile_count mismatches.`
+    : `  media_utilization  — does media_picks use the seeded universe SMARTLY? Penalize: always-just-hero (single static_single when collage/grid would showcase alts), random picks unrelated to the archetype, output_shape tile_count mismatching media_picks length.`;
 
   const system = [
     `You are a senior ad creative director scoring ${summaries.length} candidate creative concepts emitted by a Director LLM.`,
     ``,
-    `Score every concept on 5 axes (each 0-10). DO NOT cull — every concept gets a score. The pipeline downstream ships them in rank order; your scores set the rank.`,
+    `Score every concept on 6 axes (each 0-10). DO NOT cull — every concept gets a score. The pipeline downstream ships them in rank order; your scores set the rank.`,
     ``,
     `SCORING AXES:`,
     `  strategy_fit       — does the concept's archetype + priorities + emotional_hook match the strongest signal in the input? Penalize concepts that ignore obvious strengths or invent strategies the signal can't back.`,
     `  brand_match        — do copy_picks + creative_style align with brand voice / tone? Reject pure clichés and off-tone copy.`,
-    `  media_utilization  — does media_picks use the seeded universe SMARTLY? Penalize: always-just-hero (single static_single when collage/grid would showcase alts), random picks unrelated to the archetype, output_shape tile_count mismatching media_picks length.`,
+    mediaUtilizationAxis,
     `  proof_coherence    — when social_proof_type != "none", inputSummary MUST have actual proof data to back it (primary_quote, top_comments, or rating). When proof_coherence fails, ALSO emit a "claimed_proof_no_data" hard_violation.`,
     `  distinctness       — how meaningfully does this concept differ from its peers in this round (different archetype OR different media-pick combo OR different copy angle)?`,
     `  conversion_strength — this is DIRECT-RESPONSE advertising: would this concept move someone who is BROWSING into BUYING? Score high when the concept REMOVES A SPECIFIC PURCHASE OBJECTION (fit, colour accuracy, durability, worth-the-price) and backs it with a specific checkable claim. Score low for: generic praise as the proof ("I love it!"), a mood-only emotional_hook ("trust", "quality") where the data supported something concrete, superlatives in place of specifics, competing CTAs, or any concept leaning on shipping/delivery/packaging/customer-service — those describe the retailer, not the product, and do not move a purchase decision. A concept can be perfectly coherent on the other five axes and still score low here; that is the point of this axis.`,
@@ -552,7 +581,7 @@ function buildConceptRoundPrompt({ summaries, inputSummary, brandSignal, univers
     ``,
     `Be decisive on scoring. If all concepts are similar, surface the differences via the distinctness axis.`,
     ``,
-    `SEEDED UNIVERSE media_ids (use to validate media_picks coverage):`,
+    `SEEDED UNIVERSE media_ids (size=${universeSize}; use to validate media_picks coverage):`,
     universeIds.length ? `  ${universeIds.join(', ')}` : `  (universe empty — no media_pick validation possible)`,
     ``,
     hasAnyProof ? `PROOF DATA PRESENT: rating=${proofData.rating?.value ?? '-'} comments=${(proofData.top_comments || []).length} quote=${proofData.primary_quote ? '"' + String(proofData.primary_quote.text || '').slice(0, 60) + '"' : 'none'}` : `PROOF DATA: NONE present — any concept claiming social_proof_type != "none" gets the claimed_proof_no_data hard_violation.`
@@ -632,5 +661,6 @@ module.exports = {
   DEFAULT_JUDGE_MODEL,
   compressSpecForJudge,
   compressConceptForJudge,
+  buildConceptRoundPrompt,
   CONCEPT_AXES
 };

@@ -27,7 +27,10 @@ const { validateCandidate }     = require('./htmlValidationService');
 
 const { chatCompletion } = require('./atlasLlmService');
 // Quarantine: never pass Director reasoning into HTML/image prompts.
-const { conceptForRender, renderableCopy } = require('./conceptProjection');
+// Dual-read nested v3 routing + flat v2 for media_picks / output_shape.
+const {
+  conceptForRender, renderableCopy, conceptField, conceptMediaPicks
+} = require('./conceptProjection');
 
 const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
@@ -191,14 +194,18 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
   // becomes "execute the declared layout" rather than "pick a strategy
   // and invent a layout." Legacy concepts (no media_picks / no
   // output_shape) keep the existing prompt.
+  //
+  // Dual-read nested v3 routing + flat v2 — a flat-only check treated
+  // every live Director concept as legacy and skipped the V2 path.
+  const resolvedPicksForDetect = concept ? conceptMediaPicks(concept) : [];
+  const resolvedShape = concept ? conceptField(concept, 'output_shape') : null;
   const isV2Concept = !!(concept && (
-    (Array.isArray(concept.media_picks) && concept.media_picks.length > 0)
-    || concept.output_shape
+    resolvedPicksForDetect.length > 0 || resolvedShape
   ));
   let mediaUrlMap = null;
   if (isV2Concept) {
-    // Resolve concept.media_picks[*].media_id → Media.fileUrl for the
-    // V2 prompt's "use THESE URLs verbatim" block. One bulk query per
+    // Resolve media_picks[*].media_id → Media.fileUrl for the V2
+    // prompt's "use THESE URLs verbatim" block. One bulk query per
     // generation; misses default to null and the prompt builder
     // gracefully skips them.
     //
@@ -207,7 +214,7 @@ async function generateForArtifact({ aiCanvasArtifactId, refresh = false, operat
     // block. HTML Gen only runs for kind='image' output, and <img>
     // tags can't render .mp4 sources.
     const Media = require('../models/Media');
-    const ids = concept.media_picks.map(p => p.media_id).filter(Boolean);
+    const ids = resolvedPicksForDetect.map(p => p.media_id).filter(Boolean);
     const docs = ids.length ? await Media.find({ _id: { $in: ids } }).select('_id fileUrl').lean() : [];
     mediaUrlMap = new Map(docs.map(d => [String(d._id), toStillIfVideo(d.fileUrl)]));
   }

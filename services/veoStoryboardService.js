@@ -13,6 +13,7 @@
 
 const { trackLlmCall } = require('./costTracker');
 const { archetypeDescription } = require('./veoPromptBuilder');
+const { conceptField } = require('./conceptProjection');
 
 const { chatCompletion } = require('./atlasLlmService');
 
@@ -75,12 +76,17 @@ function buildUserPrompt({ concept, brand, product, scene, lighting, mood, subje
     lines.push(`Derived brand voice (from live campaigns): ${brand.derivedVoice.voice_summary}`);
   }
 
-  if (concept?.archetype) {
-    lines.push(`Concept archetype: ${concept.archetype} — ${archetypeDescription(concept.archetype)}`);
+  // Dual-read nested v3 routing + flat v2 so storyboard variance still
+  // sees archetype / hook when the Director nests them under routing.
+  const archetype = conceptField(concept, 'archetype');
+  const emotionalHook = conceptField(concept, 'emotional_hook');
+  const socialProofType = conceptField(concept, 'social_proof_type');
+  if (archetype) {
+    lines.push(`Concept archetype: ${archetype} — ${archetypeDescription(archetype)}`);
   }
-  if (concept?.emotional_hook) lines.push(`Emotional hook: ${concept.emotional_hook}`);
-  if (concept?.social_proof_type && concept.social_proof_type !== 'none' && concept.social_proof_type !== 'absent') {
-    lines.push(`Social proof angle: ${concept.social_proof_type}`);
+  if (emotionalHook) lines.push(`Emotional hook: ${emotionalHook}`);
+  if (socialProofType && socialProofType !== 'none' && socialProofType !== 'absent') {
+    lines.push(`Social proof angle: ${socialProofType}`);
   }
 
   if (scene)    lines.push(`Scene: ${scene}`);

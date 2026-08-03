@@ -583,6 +583,61 @@ function hexToRgb(hex) {
 
 // ── High-level helpers ─────────────────────────────────────────────
 
+// Defence in depth for video chrome — same dual-gate as
+// directImageRenderService.buildIntentData. layoutInputService already
+// withholds non-printable quotes at pool assembly, so this should rarely
+// fire. It exists because a LayoutInputArtifact cached BEFORE the
+// producer-side provenance gate landed can still carry a fabricated
+// primary_quote, and the cascade engine is path-blind: it only ever sees
+// .text / .snippet / .author, never origin. Without this re-check,
+// Remotion burns that claim into delivered video chrome.
+//
+// Local clone only — never mutates the artifact document. Dropping the
+// quote degrades the slot to absent; this must never throw (Atlas video
+// is already billed by the time titling runs). ONE predicate
+// (quoteProvenance.isPrintableCustomerQuote); do not invent a second
+// allowlist that can drift from static.
+//
+// Pure + exported so the offline harness can drive the real production
+// path without Mongo. Call site in buildMetaForAd is the live wire.
+function gateLayoutInputQuotes(layoutInput) {
+  try {
+    const pq = layoutInput?.input?.social_proof?.primary_quote;
+    if (!pq) return layoutInput;
+    const { isPrintableCustomerQuote } = require('./quoteProvenance');
+    if (isPrintableCustomerQuote(pq)) return layoutInput;
+    console.log(
+      `🔒 brandScript: quote withheld (tier=${pq.tier || 'unstamped'} ` +
+      `origin=${pq.origin || 'unstamped'}) — titling with no testimonial`
+    );
+    return {
+      ...layoutInput,
+      input: {
+        ...layoutInput.input,
+        social_proof: {
+          ...layoutInput.input.social_proof,
+          primary_quote: null
+        }
+      }
+    };
+  } catch (err) {
+    // Prefer a thinner ad over a crash after a billed Omni submit, and
+    // over accidentally shipping a quote we could not validate.
+    console.warn(`🔒 brandScript: quote gate error (${err.message}) — withholding`);
+    if (!layoutInput?.input?.social_proof) return layoutInput;
+    return {
+      ...layoutInput,
+      input: {
+        ...layoutInput.input,
+        social_proof: {
+          ...layoutInput.input.social_proof,
+          primary_quote: null
+        }
+      }
+    };
+  }
+}
+
 // Build the text-var meta object that a brand script sees. Pulls
 // preferred fields from ad.copy first, then falls back to the ad's
 // LayoutInputArtifact bundle if present. Called by both the initial
@@ -600,6 +655,9 @@ async function buildMetaForAd(ad, brand) {
     const LayoutInputArtifact = require('../models/LayoutInputArtifact');
     layoutInput = await LayoutInputArtifact.findOne({ mediaId: ad.mediaId }).sort({ createdAt: -1 }).lean();
   } catch { /* optional */ }
+
+  // Video dual-gate: strip non-printable primary_quote before cascade.
+  layoutInput = gateLayoutInputQuotes(layoutInput);
 
   let catalogProduct = null;
   if (ad.productId) {
@@ -1084,4 +1142,4 @@ async function renderBrandScriptAndSave({ ad, brand }) {
   });
 }
 
-module.exports = { renderBrandScript, renderBrandScriptAndSave, buildMetaForAd, previewBrandScript, previewBrandScriptAsVideo, resolveBrandRenderer, resolveTitlingEngine, isVerticalFormat, isLandscapeFormat, isSquareFormat, classifyFormat, BRAND_SCRIPT_FIELD };
+module.exports = { renderBrandScript, renderBrandScriptAndSave, buildMetaForAd, gateLayoutInputQuotes, previewBrandScript, previewBrandScriptAsVideo, resolveBrandRenderer, resolveTitlingEngine, isVerticalFormat, isLandscapeFormat, isSquareFormat, classifyFormat, BRAND_SCRIPT_FIELD };

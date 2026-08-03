@@ -113,7 +113,11 @@ mongoose.connect(process.env.MONGODB_URI, {
   const watchdogTick = () => runWatchdog().catch(err => console.warn(`⚠️  watchdog failed: ${err.message}`));
   setTimeout(watchdogTick, 90 * 1000);
   setInterval(watchdogTick, WATCHDOG_INTERVAL_MIN * 60 * 1000);
-  console.log(`🔔 alerts: ${alerts.isConfigured() ? 'Telegram configured' : 'Telegram NOT configured (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)'}; watchdog every ${WATCHDOG_INTERVAL_MIN}m`);
+  // Name the vars the code ACTUALLY reads. This line said "Telegram … set
+  // TELEGRAM_BOT_TOKEN" for the whole of the Slack cutover, so the one place
+  // an operator looks to find out why alerts are silent told them to set two
+  // variables nothing reads any more.
+  console.log(`🔔 alerts: ${alerts.isConfigured() ? 'Slack configured' : 'Slack NOT configured (set SLACK_BOT_TOKEN in Render env; SLACK_ALERT_CHANNEL ships in config/defaults.env)'}; watchdog every ${WATCHDOG_INTERVAL_MIN}m`);
 
   for (let i = 1; i <= CONCURRENCY; i++) {
     workerLoop(i).catch(err => console.error(`❌ worker[${i}] crashed:`, err));

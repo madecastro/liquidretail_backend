@@ -23,6 +23,7 @@ const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact')
 const { ROLES, COMPONENT_STYLE_BY_ROLE } = require('./aiVocabulary');
 const alerts = require('./alertService');
 const { trackLlmCall, recordCacheHit } = require('./costTracker');
+const { conceptField, conceptMediaPicks } = require('./conceptProjection');
 
 const { chatCompletion } = require('./atlasLlmService');
 const { usableProofCommentsOrNone } = require('./quoteSnippetService');
@@ -778,10 +779,11 @@ function validateConcepts(concepts) {
   }
 
   // Distinctness: the N concepts should differ on at least one of
-  // (archetype, emotional_hook, social_proof_type).
+  // (archetype, emotional_hook, social_proof_type). Dual-read via
+  // conceptField so nested v3 routing is not invisible to this soft check.
   if (concepts.length >= 2) {
     const fingerprints = concepts.map(c =>
-      `${c.archetype}|${c.emotional_hook}|${c.social_proof_type}`
+      `${conceptField(c, 'archetype')}|${conceptField(c, 'emotional_hook')}|${conceptField(c, 'social_proof_type')}`
     );
     if (new Set(fingerprints).size < concepts.length) {
       warnings.push(`concepts are not distinct — fingerprints: ${fingerprints.join(' / ')}`);
@@ -790,8 +792,9 @@ function validateConcepts(concepts) {
 
   // Validate recommended component styles against the vocabulary.
   for (const c of concepts) {
-    if (!c?.recommended_components) continue;
-    for (const [role, style] of Object.entries(c.recommended_components)) {
+    const rec = conceptField(c, 'recommended_components');
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) continue;
+    for (const [role, style] of Object.entries(rec)) {
       if (style == null) continue;
       const allowed = COMPONENT_STYLE_BY_ROLE[role];
       if (!allowed) {
@@ -1004,6 +1007,29 @@ const FEED_OUTPUT_SHAPES = Object.freeze([
   'static_collage',  // 2-4 images in an asymmetric arrangement (overlapping, off-grid)
   'static_grid'      // 2-4 images in a clean grid (2x2, 1x3, etc.)
 ]);
+
+// Shapes that require 2–4 media picks. When the seeded universe cannot
+// satisfy that (size < 2), the menu narrows to static_single only so the
+// Director cannot emit a self-inconsistent collage/grid with one tile.
+const MULTI_PICK_FEED_SHAPES = Object.freeze(['static_collage', 'static_grid']);
+
+/**
+ * Feed output_shape.format values the universe can actually satisfy.
+ * Universe size reaches the shape menu via seededUniverse.length on both
+ * the prompt line and the response-schema enum (buildPromptRound /
+ * buildResponseSchemaRound). Narrow the menu — do not hard-reject after
+ * the fact (that would wipe a paid round for a shape the model was offered).
+ *
+ * @param {number|Array} universeOrSize
+ * @returns {string[]}
+ */
+function feedOutputShapesForUniverse(universeOrSize) {
+  const n = Array.isArray(universeOrSize)
+    ? universeOrSize.length
+    : (Number(universeOrSize) || 0);
+  if (n < 2) return ['static_single'];
+  return [...FEED_OUTPUT_SHAPES];
+}
 
 // Reels output shapes (Phase B1). reels_storyboard declares per-beat
 // timing for chrome overlays Puppeteer will render on top of a Veo
@@ -1324,19 +1350,18 @@ async function loadAvoidList(filter, maxRounds) {
   const out = [];
   for (const row of rows.reverse()) {  // chronological order in the prompt
     for (const c of row.concepts || []) {
-      // Dual-read flat v2 and nested v3 so the avoid list still summarises
-      // cached pre-nest artifacts during the one-deploy dual-read window.
-      const routing = c.routing || {};
-      const picks = Array.isArray(routing.media_picks) ? routing.media_picks
-        : (Array.isArray(c.media_picks) ? c.media_picks : []);
+      // Dual-read flat v2 and nested v3 via conceptField so the avoid list
+      // still summarises cached pre-nest artifacts — same helper the
+      // expansion consumer uses (conceptProjection).
+      const picks = conceptMediaPicks(c);
       const mediaPickIds = picks.map(p => p.media_id).filter(Boolean).slice(0, 4).join(',') || '-';
       const headlineStr = c.copy?.headline ?? c.copy_picks?.headline;
       const headline = headlineStr
         ? `copy="${String(headlineStr).slice(0, 60)}"`
         : '';
-      const archetype = routing.archetype ?? c.archetype;
-      const style = routing.creative_style ?? c.creative_style;
-      const shape = (routing.output_shape ?? c.output_shape)?.format;
+      const archetype = conceptField(c, 'archetype');
+      const style = conceptField(c, 'creative_style');
+      const shape = conceptField(c, 'output_shape')?.format;
       out.push(
         `[round ${row.roundIndex}] archetype=${archetype || '-'} ` +
         `style=${style || '-'} ` +
@@ -1492,7 +1517,16 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `- [CRITICAL] The SEEDED UNIVERSE is PRE-RANKED by shot-type quality: lifestyle > on_model > flat_lay > product_only > detail > packaging. Earlier entries are BETTER seeds for animation and stronger composition anchors — STRONGLY prefer them for routing.media_picks[0]. Only reach for lower-ranked entries when a specific concept archetype requires that shot type (e.g. product_card_grid can use flat_lay/product_only intentionally, hero_quote_overlay wants lifestyle/on_model).`,
     platformFormat === 'meta_reels_9_16'
       ? `- OUTPUT SHAPE (Reels): routing.output_shape.format MUST be "reels_storyboard". duration_sec ∈ [${REELS_DURATION_MIN_SEC}, ${REELS_DURATION_MAX_SEC}] (Veo native clip range). storyboard_beats is an array of overlay timing events Puppeteer renders as transparent PNGs and Cloudinary composites onto Veo's base video. Each beat: { t_start (seconds), t_end, role ∈ ${STORYBOARD_BEAT_ROLES.join('|')}, position ∈ ${STORYBOARD_POSITIONS.join('|')}, emphasis ∈ ${STORYBOARD_EMPHASIS.join('|')} }. Beats may overlap. Honor the Reels safe zones in your position picks (top reserved 0-220px, bottom reserved 1558-1778px — use middle positions for chrome that needs to be visible past IG/FB UI).`
-      : `- OUTPUT SHAPE (Feed): routing.output_shape.format ∈ ${FEED_OUTPUT_SHAPES.join(' | ')}; tile_count matches media_picks.length.`,
+      : (() => {
+          // Universe size reaches the shape menu here (same array the MEDIA
+          // PICKS ceiling uses). When n < 2, multi-pick shapes are off the
+          // menu so the model cannot declare a collage it cannot fill.
+          const offered = feedOutputShapesForUniverse(universe);
+          const multiNote = offered.length === 1
+            ? ' (universe has fewer than 2 images — collage/grid are not available this round)'
+            : '';
+          return `- OUTPUT SHAPE (Feed): routing.output_shape.format ∈ ${offered.join(' | ')}${multiNote}; tile_count matches media_picks.length.`;
+        })(),
     `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, and social_proof_signal.primary_quote when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`,
     `- ONE PRODUCT ONLY: every string you write describes product_signal.name and nothing else. brand_signal.* and brand_reviews_summary cover the WHOLE catalog — they are there for voice and tone, never for product facts. Never name, describe, or borrow the attributes of another item (a different garment, cut, fabric, or use case) even when the brand material talks about it. If the brand voice material is about a different product, take only its register and write fresh copy about THIS one. Concretely: a t-shirt ad never mentions leggings, joggers, or their fit.`,
     `- CREATIVE STYLE: pick one of ${CREATIVE_STYLES_ENUM.join(' | ')} into routing.creative_style.`,
@@ -1590,15 +1624,22 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
           }
         }
       }
-    : {
-        type: 'object',
-        additionalProperties: false,
-        required: ['format', 'tile_count'],
-        properties: {
-          format:     { type: 'string', enum: [...FEED_OUTPUT_SHAPES] },
-          tile_count: { type: 'integer' }
-        }
-      };
+    : (() => {
+        // Same universe-size gate as the prompt: enum only what the universe
+        // can satisfy. schema is soft (json_object transport) but the hand-
+        // rolled validator and the prompt must agree on the menu.
+        const offered = feedOutputShapesForUniverse(seededUniverse);
+        const maxTiles = Math.min(4, Math.max(1, Array.isArray(seededUniverse) ? seededUniverse.length : 1));
+        return {
+          type: 'object',
+          additionalProperties: false,
+          required: ['format', 'tile_count'],
+          properties: {
+            format:     { type: 'string', enum: offered },
+            tile_count: { type: 'integer', minimum: 1, maximum: maxTiles }
+          }
+        };
+      })();
 
   // Nested v3 shape. Private reasoning lives under reasoning.rationale so a
   // render path that only reads art_direction / copy cannot reach it. Transport
@@ -1734,9 +1775,9 @@ function validateConceptsRound(concepts, seededUniverse) {
   const universeIds = new Set(seededUniverse.map(u => String(u.mediaId)));
   const conceptIds = new Set();
 
-  // Flatten routing + copy for dual-read of v2 (flat) and v3 (nested).
-  const routeOf = (c) => (c && c.routing && typeof c.routing === 'object') ? c.routing : (c || {});
-  const copyOf  = (c) => (c && (c.copy || c.copy_picks)) || {};
+  // Dual-read v2 (flat) and v3 (nested) via the shared conceptProjection
+  // helpers — same contract the expansion consumer uses.
+  const copyOf = (c) => (c && (c.copy || c.copy_picks)) || {};
 
   for (const c of concepts) {
     if (!c?.concept_id) continue;
@@ -1745,9 +1786,7 @@ function validateConceptsRound(concepts, seededUniverse) {
     }
     conceptIds.add(c.concept_id);
 
-    const r = routeOf(c);
-    const picks = Array.isArray(r.media_picks) ? r.media_picks
-      : (Array.isArray(c.media_picks) ? c.media_picks : []);
+    const picks = conceptMediaPicks(c);
     for (const p of picks) {
       if (!p?.media_id) continue;
       if (!universeIds.has(String(p.media_id))) {
@@ -1755,7 +1794,7 @@ function validateConceptsRound(concepts, seededUniverse) {
       }
     }
 
-    const shape = r.output_shape ?? c.output_shape;
+    const shape = conceptField(c, 'output_shape');
     const tileCount = shape?.tile_count;
     if (typeof tileCount === 'number' && tileCount !== picks.length) {
       warnings.push(`concept ${c.concept_id}: output_shape.tile_count=${tileCount} != media_picks.length=${picks.length}`);
@@ -1816,13 +1855,11 @@ function validateConceptsRound(concepts, seededUniverse) {
   // Distinctness — fingerprint by archetype + output_shape + media-pick-set + headline angle.
   if (concepts.length >= 2) {
     const fingerprints = concepts.map(c => {
-      const r = routeOf(c);
-      const picks = Array.isArray(r.media_picks) ? r.media_picks
-        : (Array.isArray(c.media_picks) ? c.media_picks : []);
+      const picks = conceptMediaPicks(c);
       const ms = picks.map(p => p.media_id).sort().join(',');
-      const shape = r.output_shape ?? c.output_shape;
+      const shape = conceptField(c, 'output_shape');
       const headline = (c.copy?.headline || c.copy_picks?.headline || '').slice(0, 30);
-      return `${r.archetype ?? c.archetype}|${shape?.format}|${ms}|${headline}`;
+      return `${conceptField(c, 'archetype')}|${shape?.format}|${ms}|${headline}`;
     });
     if (new Set(fingerprints).size < concepts.length) {
       warnings.push(`concepts not distinct — fingerprints: ${fingerprints.join(' / ')}`);
@@ -1840,6 +1877,8 @@ module.exports = {
   CREATIVE_RULES,
   CREATIVE_STYLES_ENUM,
   FEED_OUTPUT_SHAPES,
+  feedOutputShapesForUniverse,
+  MULTI_PICK_FEED_SHAPES,
   REELS_OUTPUT_SHAPES,
   STORYBOARD_BEAT_ROLES,
   STORYBOARD_POSITIONS,

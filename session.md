@@ -2,15 +2,41 @@
 
 ## Next-session prompt
 
-### PICK UP HERE (2026-08-02) — render stages work is UNCOMMITTED on top of prior unpushed stack
+_(empty — no pending owner prompt)_
 
-Branch `feat/render-activity-board`. Prior commits still unpushed. Live prod still
-`a80ae0b`. Verify suite now **23** scripts (incl. `verifyRenderStages` + `verifyRunsClaim`).
+### PICK UP HERE (2026-08-02) — Director contract + per-product reasons (UNCOMMITTED)
 
-**UNCOMMITTED (this session):** close the status blind spot on both render paths —
-`services/adStage.js` extracted; static + video stage vocabulary; Task 3 terminal
-reasons; Task 4 titling-fail not counted as success. **Do not touch the uncommitted
-`claimAdsForRun` money fix in `routes/ads.js`** (verifyRunsClaim 67/67).
+Branch `fix/surface-per-product-reasons` off `main`. Verify suite **25**
+scripts; `verifyConceptContract` **125/125** after fix round.
+
+**UNCOMMITTED:**
+
+1. **Per-product expand reasons** (prior on this branch) — thread expansion
+   `perProduct` skip reasons through `CampaignRun` + `GET /runs/:runId`.
+2. **Director v3 contract fix (generation behaviour change):**
+   - Consumer dual-reads `routing.media_picks` / flat via shared
+     `conceptField` / `conceptMediaPicks` in `conceptProjection.js`.
+     Root cause of zero-ads AllBirds run (every v3 concept discarded).
+   - Same helper wired through Judge, HTML isV2 detect, veoStoryboard,
+     and the Director's own dual-reads.
+   - `DIRECTOR_UNIVERSE_TOP_N` default **10 → 1** (hero only); ceiling 10
+     stays; operator multi-select still widens via `Math.max(mediaIds.length, TOP_N)`.
+     Knob in `config/defaults.env`.
+   - Pathological `concepts>0 && payloads===0` → per-product reason
+     `concepts_no_usable_media` + Slack `alertService.error`.
+3. **Fix round (adversarial #1 agreed) — still uncommitted:**
+   - `conceptMediaPicks` restored true `Array.isArray` order (non-array
+     nested falls through to flat; empty nested `[]` still wins).
+   - Judge: `media_utilization` N/A when universe size ≤ 1 (prompt +
+     score-axis exclusion via `seededUniverse` → `universeIds.length`).
+   - Director shape menu: `feedOutputShapesForUniverse` narrows to
+     `static_single` when universe < 2 (prompt + schema enum).
+   - V1 `validateConcepts` dual-reads via `conceptField`.
+   - Harness grew 87 → 125: C7 non-array fallthrough (revert-proven),
+     falsy nested `conceptField` fixtures, exhaustive services/routes
+     flat-read scan with documented allowlist.
+
+Not committed/pushed/deployed.
 
 ### PRIOR (2026-08-02, late) — everything below is COMMITTED, nothing pushed
 

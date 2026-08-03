@@ -51,6 +51,13 @@ const Ad                    = require('../models/Ad');
 const registry                       = require('./templateRegistry');
 const { aspectRatioForPlatformFormat } = require('./veoPromptBuilder');
 const { rankByShotType }              = require('./shotTypeRank');
+const {
+  REASON: PER_PRODUCT_REASON,
+  normalizePerProductList,
+  summarizeEmptyExpansion
+} = require('./perProductReasons');
+const { conceptField, conceptMediaPicks } = require('./conceptProjection');
+const alertService = require('./alertService');
 
 // Cast a string/ObjectId to ObjectId. Required when querying
 // metadata.catalogProductId (Mixed type) — Mongoose doesn't auto-cast
@@ -159,15 +166,22 @@ const MAX_ADS_PER_GENERATION_RUN = Math.max(1, parseInt(process.env.MAX_ADS_PER_
 const ADS_PER_PRODUCT_CAP     = Math.max(1, parseInt(process.env.ADS_PER_PRODUCT_CAP,     10) || 3);
 // How many candidate images the Director sees when the operator picked none.
 //
-// The renderer now honours the Director's full pick list (renderService threads
+// DEFAULT IS 1 (hero only). Owner 2026-08-02: "we are supposed to be defaulting
+// to one image sent to the director, the hero image." Hero-only means the
+// composition matches the reference exactly. Multi-image support stays fully
+// wired — the ceiling is 10 and the window is expected to widen later by
+// raising this one value (or DIRECTOR_UNIVERSE_TOP_N in env). Do NOT delete
+// multi-pick code when the default is 1; it is dormant, not dead.
+//
+// Explicit operator picks still widen the universe:
+//   operatorPickedMedia ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
+// so pinning 3 images with TOP_N=1 yields max(3,1)=3.
+//
+// The renderer honours the Director's full pick list (renderService threads
 // Ad.mediaIds through when there is no explicit operator stack), so a wider
 // universe genuinely produces multi-reference ads instead of silently
 // discarding every pick past the first.
-//
-// Set DIRECTOR_UNIVERSE_TOP_N=1 to get the single-hero behaviour: the Director
-// sees one image, picks it, and the composition matches the reference exactly.
-// That is a one-value flip and needs no code change.
-const DIRECTOR_UNIVERSE_TOP_N = Math.max(1, parseInt(process.env.DIRECTOR_UNIVERSE_TOP_N, 10) || 10);
+const DIRECTOR_UNIVERSE_TOP_N = Math.max(1, parseInt(process.env.DIRECTOR_UNIVERSE_TOP_N, 10) || 1);
 const VEO_ADS_PER_PRODUCT_CAP = Math.max(1, parseInt(process.env.VEO_ADS_PER_PRODUCT_CAP, 10) || 1);
 
 // Composite product popularity. Primary signal: how many UGC posts
@@ -1764,6 +1778,37 @@ function mergeExpansionResults(a, b) {
   };
 }
 
+// Look up product titles for the UI. Scoped to brandId so a run payload
+// cannot carry another advertiser's product names even if an id leaked
+// into the expansion. Never throws — reporting must not fail generation.
+async function attachProductNames(perProduct, brandId) {
+  if (!Array.isArray(perProduct) || !perProduct.length) return perProduct || [];
+  try {
+    const ids = [...new Set(
+      perProduct
+        .map(r => (r && r.productId != null ? String(r.productId) : null))
+        .filter(Boolean)
+    )];
+    if (!ids.length) return normalizePerProductList(perProduct);
+    const oids = ids.map(toObjectId).filter(Boolean);
+    if (!oids.length) return normalizePerProductList(perProduct);
+    const filter = { _id: { $in: oids } };
+    // brandId is the tenant scope for CatalogProduct rows.
+    if (brandId && mongoose.isValidObjectId(brandId)) {
+      filter.brandId = toObjectId(brandId);
+    }
+    const docs = await CatalogProduct.find(filter).select('title').lean();
+    const nameById = {};
+    for (const d of docs) {
+      if (d && d._id && d.title) nameById[String(d._id)] = String(d.title);
+    }
+    return normalizePerProductList(perProduct, nameById);
+  } catch (err) {
+    console.warn(`   ⚠️  attachProductNames failed (continuing without names): ${err.message}`);
+    return normalizePerProductList(perProduct);
+  }
+}
+
 // Deterministic video expansion: one video Ad per product, seeded on
 // operator-ordered catalog picks (or the feed-order hero when no picks).
 // seedMediaIds is ORDER-SIGNIFICANT. No VEO_ADS_PER_PRODUCT_CAP — always
@@ -1972,7 +2017,7 @@ async function expandDeterministicVideo({
     const pidStr = String(productId);
     const productOid = toObjectId(productId);
     if (!productOid) {
-      perProduct.push({ productId: pidStr, skipped: 'invalid_product_id' });
+      perProduct.push({ productId: pidStr, skipped: PER_PRODUCT_REASON.INVALID_PRODUCT_ID });
       continue;
     }
 
@@ -2066,7 +2111,7 @@ async function expandDeterministicVideo({
       }
 
       if (!hero) {
-        perProduct.push({ productId: pidStr, skipped: 'no_hero_media' });
+        perProduct.push({ productId: pidStr, skipped: PER_PRODUCT_REASON.NO_HERO_MEDIA });
         continue;
       }
       mediaId = hero._id;
@@ -2076,7 +2121,7 @@ async function expandDeterministicVideo({
     // excludePairings on (productId, mediaId) — mirror V2 filterUniverseForProduct.
     const pairKey = `${pidStr}|${String(mediaId)}`;
     if (excludeSet.has(pairKey)) {
-      perProduct.push({ productId: pidStr, skipped: 'excluded_pairing', mediaId: String(mediaId) });
+      perProduct.push({ productId: pidStr, skipped: PER_PRODUCT_REASON.EXCLUDED_PAIRING, mediaId: String(mediaId) });
       continue;
     }
 
@@ -2137,12 +2182,16 @@ async function expandDeterministicVideo({
     });
   }
 
+  // Normalise before return so routes/CampaignRun never see raw payload
+  // objects or skip codes without human messages.
+  const perProductNorm = await attachProductNames(perProduct, brandId);
+
   if (!payloads.length) {
     return {
       campaignId: String(campaignId), brandId, campaignKind,
       queuedCount: await Ad.countDocuments({ campaignId, status: 'queued' }),
       newlyQueued: 0, alreadyQueued: 0, newAdIds: [], total: 0,
-      byProduct: {}, perProduct, byMode: { deterministic: 0 }
+      byProduct: {}, perProduct: perProductNorm, byMode: { deterministic: 0 }
     };
   }
 
@@ -2181,7 +2230,7 @@ async function expandDeterministicVideo({
       acc[k] = (acc[k] || 0) + 1;
       return acc;
     }, {}),
-    perProduct,
+    perProduct: perProductNorm,
     byMode: { deterministic: payloads.length }
   };
 }
@@ -2276,10 +2325,8 @@ async function runConceptDrivenExpansion({
       // restrictToMediaIds constrains the pool to exactly what they chose and
       // topN widens to fit, so a 5-image selection is never truncated to 1.
       //
-      // Absent picks, the Director sees DIRECTOR_UNIVERSE_TOP_N candidates and
-      // its chosen subset now actually reaches the renderer (see the
-      // referenceMediaIds fallback in renderService). Set that env to 1 for
-      // single-hero behaviour.
+      // Absent picks, the Director sees DIRECTOR_UNIVERSE_TOP_N candidates
+      // (default 1 = hero only). Operator multi-select widens via max().
       const operatorPickedMedia = Array.isArray(mediaIds) && mediaIds.length > 0;
       const universeTopN = operatorPickedMedia
         ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
@@ -2294,7 +2341,7 @@ async function runConceptDrivenExpansion({
       const filtered = filterUniverseForProduct(productId, universe);
       if (!filtered.length) {
         console.log(`📦 conceptDriven[${productTag}]: empty universe after excludePairings — skipping`);
-        return { productId, payloads: [], skipped: 'empty_universe' };
+        return { productId, payloads: [], skipped: PER_PRODUCT_REASON.EMPTY_UNIVERSE };
       }
 
       // 2. Director round (3 concepts). campaignId threaded so the
@@ -2308,7 +2355,7 @@ async function runConceptDrivenExpansion({
         });
       if (!concepts.length) {
         console.warn(`📦 conceptDriven[${productTag}]: Director returned no concepts — skipping`);
-        return { productId, payloads: [], skipped: 'no_concepts' };
+        return { productId, payloads: [], skipped: PER_PRODUCT_REASON.NO_CONCEPTS };
       }
 
       // 3. Judge — score + rank all concepts (no culling)
@@ -2338,29 +2385,54 @@ async function runConceptDrivenExpansion({
       }
       const scoreByConcept = new Map(conceptScores.map(s => [s.conceptId, s]));
 
-      // 4. Map concepts → Ad payloads
+      // 4. Map concepts → Ad payloads.
+      // Dual-read routing.media_picks (v3) and concept.media_picks (v2) —
+      // the producer nests under routing; a flat-only read discarded every
+      // concept and produced zero ads after a paid Director round.
+      // conceptSkips used to be console-only and could silently reduce a
+      // 3-concept expansion to zero creatives with no operator-visible
+      // reason. Record every drop; the zero-payload case becomes a real
+      // per-product reason + Slack alert below.
       const universeById = new Map(filtered.map(u => [String(u.mediaId), u]));
       const payloads = [];
+      const conceptSkips = [];
       for (const concept of concepts) {
-        const mp = Array.isArray(concept.media_picks) ? concept.media_picks : [];
+        const mp = conceptMediaPicks(concept);
         if (!mp.length) {
           console.warn(`   ⛔ concept ${concept.concept_id}: no media_picks — skipping`);
+          conceptSkips.push({
+            conceptId: concept.concept_id,
+            reason: 'no_media_picks'
+          });
           continue;
         }
         const primaryId = String(mp[0].media_id);
         const primaryUniverseEntry = universeById.get(primaryId);
         if (!primaryUniverseEntry) {
           console.warn(`   ⛔ concept ${concept.concept_id}: media_pick[0]="${primaryId}" not in filtered universe — skipping`);
+          conceptSkips.push({
+            conceptId: concept.concept_id,
+            reason: 'media_outside_universe',
+            mediaId: primaryId
+          });
           continue;
         }
         const mediaIdObjs = mp
           .map(p => p.media_id)
           .filter(id => universeById.has(String(id)))
           .map(id => new mongoose.Types.ObjectId(String(id)));
-        if (!mediaIdObjs.length) continue;
+        if (!mediaIdObjs.length) {
+          conceptSkips.push({
+            conceptId: concept.concept_id,
+            reason: 'media_outside_universe',
+            mediaId: primaryId
+          });
+          continue;
+        }
 
         const score = scoreByConcept.get(concept.concept_id) || {};
-        const template = CREATIVE_STYLE_TO_TEMPLATE[concept.creative_style] || 'ai_brand_led';
+        const creativeStyle = conceptField(concept, 'creative_style');
+        const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || 'ai_brand_led';
         const role = primaryUniverseEntry.role;
 
         // One payload per requested kind — and, for image, per STATIC SURFACE.
@@ -2443,11 +2515,57 @@ async function runConceptDrivenExpansion({
         `universe=${filtered.length} (catalog=${counts.catalog || (counts.catalog_hero + counts.catalog_alt)} ` +
         `ugc=${counts.ugc_product_match + counts.ugc_product_category + counts.ugc_brand_match}) ` +
         `concepts=${concepts.length} payloads=${payloads.length} ` +
+        `conceptSkips=${conceptSkips.length} ` +
         `dirWarnings=${dirWarnings.length} judge=${judgeArtifactId ? 'ok' : 'skipped'}`
       );
 
+      // Concepts returned but every one was discarded (missing picks or
+      // picks outside the universe). Distinct from NO_CONCEPTS — the
+      // Director was paid and produced output that was thrown away.
+      // That must never be console-only again: surface a real reason AND
+      // fire a Slack error so the pathological case is operationally visible.
+      if (!payloads.length && concepts.length > 0) {
+        const skipSummary = conceptSkips
+          .slice(0, 10)
+          .map(s => `${s.conceptId || '?'}:${s.reason || '?'}`)
+          .join(', ');
+        try {
+          alertService.error(
+            'Director concepts discarded — zero payloads',
+            {
+              detail:
+                `product=${productId} concepts=${concepts.length} payloads=0 ` +
+                `conceptSkips=${conceptSkips.length}` +
+                (skipSummary ? ` [${skipSummary}]` : ''),
+              fields: {
+                productId:    String(productId),
+                concepts:     String(concepts.length),
+                payloads:     '0',
+                conceptSkips: String(conceptSkips.length),
+                reason:       PER_PRODUCT_REASON.CONCEPTS_NO_USABLE_MEDIA
+              },
+              key: `director-zero-payloads:${productId}`
+            }
+          );
+        } catch (_) { /* alert path must never throw into expansion */ }
+
+        return {
+          productId,
+          payloads: [],
+          skipped: PER_PRODUCT_REASON.CONCEPTS_NO_USABLE_MEDIA,
+          conceptCount: concepts.length,
+          conceptSkips,
+          roundIndex,
+          conceptArtifactId: String(artifact._id),
+          judgeArtifactId:   judgeArtifactId ? String(judgeArtifactId) : null,
+          batchRationale
+        };
+      }
+
       return {
         productId, payloads,
+        conceptCount: concepts.length,
+        conceptSkips,
         roundIndex,
         conceptArtifactId: String(artifact._id),
         judgeArtifactId:   judgeArtifactId ? String(judgeArtifactId) : null,
@@ -2465,7 +2583,7 @@ async function runConceptDrivenExpansion({
       return {
         productId,
         payloads: [],
-        skipped: 'error',
+        skipped: PER_PRODUCT_REASON.ERROR,
         error: err && err.message ? err.message : String(err),
         errorName: (err && err.constructor && err.constructor.name) || 'Error'
       };
@@ -2491,9 +2609,16 @@ async function runConceptDrivenExpansion({
   // Keyed by format, the cap means what it reads like: up to N concepts PER
   // SIZE. Behaviour with fan-out off is unchanged — every payload of a kind
   // shares one format, so there is exactly one bucket, exactly as before.
+  //
+  // Cap discards used to be console-only. Fold them into perProduct so the
+  // operator can see why a lower-ranked concept never queued. Behaviour of
+  // the slice itself is unchanged.
   const CAP_BY_KIND = { video: VEO_ADS_PER_PRODUCT_CAP, image: ADS_PER_PRODUCT_CAP };
-  const payloads = perProductResults.flatMap(r => {
-    if (!r.payloads.length) return [];
+  const payloads = [];
+  const perProductAfterCap = perProductResults.map(r => {
+    if (!r.payloads || !r.payloads.length) {
+      return r;
+    }
     const byBucket = new Map();
     for (const p of r.payloads) {
       const k = p.kind || 'image';
@@ -2502,6 +2627,8 @@ async function runConceptDrivenExpansion({
       byBucket.get(bucket).push(p);
     }
     const kept = [];
+    const capped = [];
+    const payloadsBeforeCap = r.payloads.length;
     for (const [bucket, list] of byBucket.entries()) {
       const [kind, fmt] = bucket.split('|');
       const cap = CAP_BY_KIND[kind] ?? Infinity;
@@ -2510,18 +2637,40 @@ async function runConceptDrivenExpansion({
       if (slice.length < list.length) {
         const tag = r.productId ? `product=${r.productId}` : 'brand-only';
         console.log(`📦 conceptDriven[${tag}]: capped ${list.length} → ${slice.length} ${kind} payload(s) for ${fmt} (cap=${cap})`);
+        capped.push({
+          kind,
+          format: fmt,
+          before: list.length,
+          after: slice.length,
+          dropped: list.length - slice.length
+        });
       }
       kept.push(...slice);
     }
-    return kept;
+    payloads.push(...kept);
+    return {
+      ...r,
+      payloads: kept,
+      payloadsBeforeCap,
+      capped: capped.length ? capped : undefined
+    };
   });
+  // Prefer post-cap rows for the returned perProduct (counts match what
+  // actually queued). Names attached below — never throws.
+  let perProductFinal;
+  try {
+    perProductFinal = await attachProductNames(perProductAfterCap, brandId);
+  } catch (_) {
+    perProductFinal = normalizePerProductList(perProductAfterCap);
+  }
+
   if (!payloads.length) {
     return {
       campaignId: String(campaignId), brandId, campaignKind,
       queuedCount: await Ad.countDocuments({ campaignId, status: 'queued' }),
       newlyQueued: 0, alreadyQueued: 0, newAdIds: [], total: 0, byProduct: {},
       conceptDriven: true,
-      perProduct: perProductResults,
+      perProduct: perProductFinal,
       byMode: { director: 0 }
     };
   }
@@ -2579,7 +2728,7 @@ async function runConceptDrivenExpansion({
     newAdIds, total: payloads.length,
     byProduct,
     conceptDriven: true,
-    perProduct: perProductResults,
+    perProduct: perProductFinal,
     byMode: { director: directorCount }
   };
 }
@@ -2593,9 +2742,13 @@ module.exports = {
   expandDeterministicVideo,
   mergeExpansionResults,
   runConceptDrivenExpansion,
+  attachProductNames,
   SUPPORTED_TEMPLATES,
   // Exposed so picker endpoints can apply the same content-nature
   // gate the seed expansion uses — otherwise the picker shows posts
   // that would be silently dropped at expansion time.
-  isMediaEligibleByContentNature
+  isMediaEligibleByContentNature,
+  // Offline harness + routes re-use the pure reason helpers.
+  summarizeEmptyExpansion,
+  PER_PRODUCT_REASON
 };
