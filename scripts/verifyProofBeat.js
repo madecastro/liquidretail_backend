@@ -606,6 +606,98 @@ check('V1 the video seed no longer prefers the imageRole hero stamp', () => {
     'the default seed resolution must not reference the hero stamp');
 });
 
+// ── K: band choice — faces disqualify, texture breaks ties ──────────────
+
+// Mirror of resolveGroupAnchor's decision (Canonical.jsx is ESM/JSX and cannot be
+// required from CJS). K2 pins the source so the two cannot drift apart.
+const KEEP_OUT = {
+  top:        ['top', 'upperThird', 'center', 'lowerThird'],
+  upperThird: ['upperThird', 'center', 'lowerThird'],
+  center:     ['center', 'upperThird', 'lowerThird'],
+  lowerThird: ['lowerThird', 'center', 'upperThird'],
+  bottom:     ['bottom', 'lowerThird', 'center', 'upperThird'],
+};
+const SWITCH_MARGIN = 0.03;
+function chooseBand(authored, bands) {
+  const scored = (KEEP_OUT[authored] || [authored]).map((c) => ({ cand: c, ...(bands[c] || { avoid: false, busy: 0 }) }));
+  const clear = scored.filter((s) => !s.avoid);
+  if (!clear.length) return authored;
+  let best = null;
+  for (const s of clear) {
+    const score = s.busy - (s.cand === authored ? SWITCH_MARGIN : 0);
+    if (!best || score < best.score) best = { ...s, score };
+  }
+  return best.cand;
+}
+
+check('K1 a face band can never be chosen while a clear band exists', () => {
+  // THE COUNTEREXAMPLE THAT BROKE THE FIRST VERSION, from adversarial review.
+  // With a numeric FACE_PENALTY of 1 and busy capped at 1.0, a SMOOTH face on the
+  // authored band scored 1 + 0.0 - 0.03 = 0.97 and beat a clear-but-detailed band
+  // at 0.99 — so it picked the face. That is exactly the footage the change exists
+  // to fix (smooth face, product filling the busy region). Faces are now excluded
+  // outright, so no busy value can buy one.
+  const got = chooseBand('upperThird', {
+    upperThird: { avoid: true,  busy: 0.0 },
+    center:     { avoid: false, busy: 0.99 },
+    lowerThird: { avoid: false, busy: 0.99 },
+  });
+  assert.notStrictEqual(got, 'upperThird', 'must leave the face band');
+  assert.ok(['center', 'lowerThird'].includes(got));
+
+  // Exhaustive: for every busy value, a face must never win over a clear band.
+  for (let b = 0; b <= 1.0001; b += 0.05) {
+    const pick = chooseBand('upperThird', {
+      upperThird: { avoid: true,  busy: 0 },
+      center:     { avoid: false, busy: Math.min(1, b) },
+      lowerThird: { avoid: false, busy: Math.min(1, b) },
+    });
+    assert.notStrictEqual(pick, 'upperThird', `face won against clear busy=${b.toFixed(2)}`);
+  }
+});
+
+check('K2 the real measured ads land on the band the frames prove is cleanest', () => {
+  // Numbers measured off the delivered frames the owner rejected.
+  assert.strictEqual(chooseBand('upperThird', {   // Pelagic 9:16 — title was on the face
+    upperThird: { avoid: true,  busy: 0.238 },
+    center:     { avoid: false, busy: 0.176 },
+    lowerThird: { avoid: false, busy: 0.175 },
+  }), 'lowerThird');
+  assert.strictEqual(chooseBand('lowerThird', {   // GymShark 4:5 — title was on the wordmark
+    lowerThird: { avoid: false, busy: 0.199 },
+    center:     { avoid: false, busy: 0.199 },
+    upperThird: { avoid: false, busy: 0.144 },
+  }), 'upperThird');
+  assert.strictEqual(chooseBand('lowerThird', {   // Vuori 1:1
+    lowerThird: { avoid: false, busy: 0.223 },
+    center:     { avoid: false, busy: 0.203 },
+    upperThird: { avoid: false, busy: 0.188 },
+  }), 'upperThird');
+  // Hysteresis: a sub-margin win must NOT move the group.
+  assert.strictEqual(chooseBand('lowerThird', {
+    lowerThird: { avoid: false, busy: 0.20 },
+    center:     { avoid: false, busy: 0.19 },
+    upperThird: { avoid: false, busy: 0.18 },
+  }), 'lowerThird');
+  // Degenerate: every band a face → keep authored (unchanged from the old code).
+  assert.strictEqual(chooseBand('lowerThird', {
+    lowerThird: { avoid: true, busy: 0.5 },
+    center:     { avoid: true, busy: 0.4 },
+    upperThird: { avoid: true, busy: 0.3 },
+  }), 'lowerThird');
+  // No plate data at all → authored, never a crash.
+  assert.strictEqual(chooseBand('lowerThird', {}), 'lowerThird');
+});
+
+check('K3 the renderer disqualifies faces rather than pricing them', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'remotion', 'compositions', 'Canonical.jsx'), 'utf8');
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  assert.ok(/FACE_DISQUALIFIES/.test(code), 'faces must be excluded, not scored');
+  assert.ok(!/FACE_PENALTY/.test(code), 'a numeric face penalty is refutable — busy reaches 1.0');
+  assert.ok(/busy/.test(code), 'texture must be consulted for the tiebreak');
+});
+
 // ── report ─────────────────────────────────────────────────────────────
 
 if (failures.length) {

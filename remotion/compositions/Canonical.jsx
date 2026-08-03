@@ -66,8 +66,19 @@ function bandStateFor(plateHints, anchor, atSec) {
  */
 const BAND_SWITCH_MARGIN = 0.03;
 
-/** A face costs more than any amount of texture — never trade a clear band for a face. */
-const FACE_PENALTY = 1;
+/**
+ * A face is DISQUALIFYING, not expensive.
+ *
+ * This started as a numeric penalty of 1 and adversarial review broke it with
+ * arithmetic: `busy` is capped at 1.0, so a smooth face on the authored band
+ * scored 1 + 0.0 - 0.03 = 0.97 while a clear-but-detailed band scored 0.99 — the
+ * face won. That is not a corner case, it is precisely the footage this change
+ * exists to fix (a smooth face with the product filling the busy region: the
+ * Pelagic 9:16 ads). Any penalty value is a guess about the busy distribution,
+ * so faces are hard-excluded instead: texture only ever breaks ties BETWEEN
+ * clear bands.
+ */
+const FACE_DISQUALIFIES = true;
 
 // Stable per-group keep-out decision: one anchor for the whole group for the
 // whole clip (no per-slot divergence, no mid-phase jumping). Evaluated at the
@@ -86,22 +97,40 @@ const FACE_PENALTY = 1;
 // Scoring every candidate on face + texture handles both directions with one rule.
 function resolveGroupAnchor(plateHints, authoredAnchor, atSec, { logShift = false } = {}) {
   const candidates = KEEP_OUT_CANDIDATES[authoredAnchor] || [authoredAnchor];
+  const scored = candidates.map((cand) => ({ cand, ...bandStateFor(plateHints, cand, atSec) }));
+
+  // Faces are excluded outright while ANY face-free band is available, so no
+  // amount of texture can ever buy a face.
+  const clear = scored.filter((s) => !s.avoid);
+
+  // EVERY band is a face (extreme close-up — the crop is all head). There is no
+  // safe placement, texture is not a meaningful tiebreak between two faces, and
+  // the template's composition is the best remaining signal. Keep the authored
+  // band, which is also exactly what the previous implementation did, so this
+  // degenerate case gains no new behaviour. An earlier draft ranked the faces by
+  // busy here while the comment claimed otherwise — caught by replaying the case.
+  if (FACE_DISQUALIFIES && !clear.length) return authoredAnchor;
+
   let best = null;
-  for (const cand of candidates) {
-    const { avoid, busy } = bandStateFor(plateHints, cand, atSec);
+  for (const s of clear) {
     // Lower is better. The authored band gets the margin as a head start so a
     // negligible texture win never overrides the template's composition.
-    const score = (avoid ? FACE_PENALTY : 0) + busy - (cand === authoredAnchor ? BAND_SWITCH_MARGIN : 0);
-    if (!best || score < best.score) best = { cand, score, avoid, busy };
+    const score = s.busy - (s.cand === authoredAnchor ? BAND_SWITCH_MARGIN : 0);
+    if (!best || score < best.score) best = { ...s, score };
   }
   if (!best) return authoredAnchor;
+
   if (logShift && best.cand !== authoredAnchor) {
-    const why = best.avoid === false && (KEEP_OUT_CANDIDATES[authoredAnchor] || [])[0] === authoredAnchor
-      ? 'busier band' : 'face band';
+    // Reason must reflect why we LEFT the authored band, not the state of the
+    // band we landed on — an earlier version read `best.avoid` and so reported
+    // "busier band" on every face escape.
+    const authored = scored.find((s) => s.cand === authoredAnchor);
+    const why = authored?.avoid ? 'face band' : 'busier band';
     // Render console — sweeps grep `keepOut:`.
     // eslint-disable-next-line no-console
     console.log(
-      `keepOut: ${authoredAnchor}->${best.cand} (${why}; busy ${best.busy.toFixed(3)})`
+      `keepOut: ${authoredAnchor}->${best.cand} (${why}; ` +
+      `authored busy ${(authored?.busy ?? 0).toFixed(3)} -> ${best.busy.toFixed(3)})`
     );
   }
   return best.cand;
