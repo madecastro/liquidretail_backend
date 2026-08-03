@@ -63,8 +63,9 @@ module.exports = {
       meta.quote || meta.reviewQuote || 'Genuinely worth every penny.'
     );
 
+    // No fabricated purchase persona. Empty → showReviewer block below skips.
     const reviewer = String(
-      meta.reviewer || meta.customerName || 'Verified customer'
+      meta.reviewer || meta.customerName || ''
     ).toUpperCase();
 
     // ── Brand-driven theme ─────────────────────────────────────────

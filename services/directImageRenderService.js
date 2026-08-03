@@ -35,7 +35,7 @@ const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // Defence in depth. layoutInputService already withholds these at pool
 // assembly, so this gate should never fire — it exists because an artifact
 // cached before the producer-side filter landed can still carry one.
-const { isPrintableCustomerQuote } = require('./quoteProvenance');
+const { toPrintableCustomerQuote } = require('./quoteProvenance');
 // THE sanctioned concept reader. Direct reads of concept.rationale on this
 // path are how private Director reasoning became art direction on 2026-08-01.
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
@@ -388,9 +388,12 @@ function buildIntentData({ concept, layoutInput, brand, cta }) {
   // Dual-read v3 copy / v2 copy_picks. Never invent a headline from product name.
   const copy = renderableCopy(concept);
   const proof = layoutInput?.social_proof || {};
-  // ALLOWLIST. A quote reaches the pixels only if something positively vouched
-  // for it — never merely because nothing flagged it.
-  const quote = isPrintableCustomerQuote(proof.primary_quote) ? proof.primary_quote : null;
+  // ALLOWLIST via toPrintableCustomerQuote — returns a sanitized copy or null.
+  // Using the return value (not a boolean + original object) is load-bearing:
+  // llm-web quotes arrive with author/source fields that must never print, and
+  // the gate strips them structurally so this path cannot re-surface a byline
+  // by forgetting to clear author_name.
+  const quote = toPrintableCustomerQuote(proof.primary_quote);
   if (proof.primary_quote && !quote) {
     console.log(
       `🔒 direct-image: quote withheld (tier=${proof.primary_quote.tier || 'unstamped'} ` +

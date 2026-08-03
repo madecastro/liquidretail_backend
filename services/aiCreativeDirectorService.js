@@ -27,6 +27,33 @@ const { conceptField, conceptMediaPicks } = require('./conceptProjection');
 
 const { chatCompletion } = require('./atlasLlmService');
 const { usableProofCommentsOrNone } = require('./quoteSnippetService');
+const { toPrintableCustomerQuote } = require('./quoteProvenance');
+
+/**
+ * Pure brand-quote → Director primary_quote shape. brandReviews is the
+ * llm-web pool; route through the gate so the Director never sees a byline
+ * it can echo into copy.headline / subheadline. Exported for the provenance
+ * harness.
+ */
+function brandQuoteForDirectorSignal(q) {
+  const raw = (typeof q === 'string')
+    ? { text: q, origin: 'llm-web', verbatim: false }
+    : {
+        text:        q?.text   || q?.body || q?.content || null,
+        author:      q?.author || q?.reviewer || q?.user_name || null,
+        author_name: q?.author_name || null,
+        source:      q?.source || null,
+        verified:    q?.verified,
+        origin:      q?.origin || 'llm-web',
+        verbatim:    q?.verbatim !== undefined ? q.verbatim : false
+      };
+  const printable = toPrintableCustomerQuote(raw);
+  if (!printable) return null;
+  return {
+    text:   printable.text,
+    author: printable.author || printable.author_name || null
+  };
+}
 
 // ── Tunables ─────────────────────────────────────────────────────────
 
@@ -370,17 +397,14 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     .filter(r => typeof r.text === 'string' && r.text.trim().length > 30);
 
   // Brand-level — only consulted to fill in what product-level missed.
-  // brandReviews.quotes can be either {text, author} objects or plain
-  // strings depending on the enrichment provider.
+  // brandReviews.quotes is the llm-web pool (geminiSearchProvider.stampLlmQuotes
+  // with scope:'brand'). Route every row through toPrintableCustomerQuote so
+  // the Director never sees a site-as-author byline it can echo into
+  // copy.headline / subheadline — fields that ship without reaching a render
+  // gate. Product path below reads Immersive product.reviews and is unchanged.
   const brandReviewQuotes = (Array.isArray(brand?.brandReviews?.quotes) ? brand.brandReviews.quotes : [])
-    .map(q => {
-      if (typeof q === 'string') return { text: q, author: null };
-      return {
-        text:   q?.text   || q?.body || q?.content || null,
-        author: q?.author || q?.reviewer || q?.user_name || null
-      };
-    })
-    .filter(q => typeof q.text === 'string' && q.text.trim().length > 30);
+    .map(brandQuoteForDirectorSignal)
+    .filter(q => q && typeof q.text === 'string' && q.text.trim().length > 30);
   const brandRatingValue = typeof brand?.brandReviews?.rating === 'number' && brand.brandReviews.rating > 0
     ? brand.brandReviews.rating : null;
   const brandRatingCount = brand?.brandReviews?.reviewCount || null;
@@ -1892,5 +1916,6 @@ module.exports = {
   buildPromptRound,
   buildResponseSchemaRound,
   validateConceptsRound,
-  loadAvoidList
+  loadAvoidList,
+  brandQuoteForDirectorSignal
 };

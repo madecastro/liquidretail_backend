@@ -258,6 +258,10 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
       cta_text:       layoutInput.cta?.text || copy.cta_text || 'Shop now',
       cta_micro_copy: derivedCopy?.cta_micro_copy?.length ? derivedCopy.cta_micro_copy : nonEmptyArray([layoutInput.cta?.text || copy.cta_text || 'Shop now']),
       short_benefits: Array.isArray(product.short_benefits) ? product.short_benefits : [],
+      // DEAD PATH (catalog ai_* static ads): renderDirectImage owns that path.
+      // author is taken from author_name with NO render-time re-gate via
+      // toPrintableCustomerQuote. A re-gate is REQUIRED before this HTML/canvas
+      // path is ever revived — otherwise llm-web site-as-author bylines print.
       quotes: (layoutInput.social_proof?.secondary_quotes || []).concat(
                  layoutInput.social_proof?.primary_quote ? [layoutInput.social_proof.primary_quote] : []
                ).slice(0, 5).map(q => ({

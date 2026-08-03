@@ -141,9 +141,14 @@ const ALLOWED_SLOTS = [
   // every static layout took the full review — which overflows its container
   // and gets clipped mid-word at paint time.
   'social_proof.primary_quote.snippet',
+  // DEAD PATH (catalog ai_* static ads): renderDirectImage owns that path.
+  // author_name is surfaced here with NO render-time re-gate through
+  // toPrintableCustomerQuote. A re-gate is REQUIRED before this HTML/canvas
+  // path is ever revived — otherwise llm-web site-as-author bylines print.
   'social_proof.primary_quote.author_name',
   'social_proof.rating_value', 'social_proof.review_count',
   'social_proof.secondary_quotes.0.text',
+  // Same dead path / same re-gate requirement as primary_quote.author_name.
   'social_proof.secondary_quotes.0.author_name',
   // Social context (grafted from richContext at render time — likes,
   // creator handle, top comments, caption: all real UGC signal the LLM

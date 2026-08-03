@@ -335,6 +335,10 @@ function buildResolvedPropsForVariant({ role, componentStyle, resolvedValue, inp
   if (typeof resolvedValue === 'object' && !Array.isArray(resolvedValue)) {
     // quote / cta / media / etc. — copy through obvious keys.
     if (resolvedValue.text)         props.text         = resolvedValue.text;
+    // DEAD PATH (catalog ai_* static ads): renderDirectImage owns that path.
+    // author_name / author are copied through with NO render-time re-gate via
+    // toPrintableCustomerQuote. A re-gate is REQUIRED before this HTML/canvas
+    // path is ever revived — otherwise llm-web site-as-author bylines print.
     if (resolvedValue.author_name)  props.author       = resolvedValue.author_name;
     if (resolvedValue.author)       props.author       = resolvedValue.author;
     if (resolvedValue.avatarUrl)    props.avatarUrl    = resolvedValue.avatarUrl;
