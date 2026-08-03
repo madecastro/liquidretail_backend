@@ -13,6 +13,7 @@
 //   event: proposed-action         data: { toolCallId, toolName, args, tier }
 //   event: spend-guard-block       data: { toolCallId, toolName, reason,
 //                                          dailyCap, spent, estimateUsd, projected }
+//   event: tier3-phrase-block      data: { toolCallId, toolName, reason, required }
 //   event: iteration               data: { n }
 //   event: done                    data: { stop_reason, iterations, model }
 //   event: error                   data: { error }
@@ -93,7 +94,7 @@ function buildSystemPrompt(context = {}) {
     '- tier 2: billable write; ASK + estimate the cost before running.',
     '- tier 3: external / hard-to-reverse; ASK with explicit "type YES to confirm".',
     '- tier 4: multi-step workflow; propose a plan first.',
-    'This build ships tier-0 (read-only), tier-1 (cheap-write, reversible), and tier-2 (billable) capabilities. Tier-3/4 land in follow-up releases. If the operator asks for something a higher tier would need, say so clearly rather than pretending you can\'t help.',
+    'This build ships tier-0 (read-only), tier-1 (cheap-write, reversible), tier-2 (billable), and tier-3 (external / hard-to-reverse) capabilities. Tier-4 workflows land in a follow-up release. If the operator asks for something a higher tier would need, say so clearly rather than pretending you can\'t help.',
     '',
     'CONFIRMATION FLOW (tier ≥ 1, server-enforced — do NOT try to bypass):',
     '- When the operator asks for a tier-1+ action, CALL THE TOOL as usual. The server will intercept the call and return a synthetic result `{ ok:false, needsConfirmation:true }` — this is the gate, not a failure.',
@@ -105,6 +106,11 @@ function buildSystemPrompt(context = {}) {
     '- Tier 2 actions are billable. The server enforces a per-advertiser daily USD cap on top of confirmation.',
     '- If a confirmed action would exceed the cap, dispatch is blocked and you receive `{ ok:false, spendGuardBlocked:true, reason, dailyCap, spent, projected }`.',
     '- Communicate the block honestly: state the cap, what\'s spent today, and what the operator can do (raise the cap, wait for the 24h window to roll, run a cheaper capability). Do not retry the same action — the block is authoritative.',
+    '',
+    'EXPLICIT PHRASE (tier ≥ 3, server-enforced):',
+    '- Tier 3 actions are external / hard-to-reverse (e.g. publishing to Meta). On top of confirmation, the operator must TYPE an exact phrase in the client\'s confirmation UI (declared per-capability, e.g. "PUBLISH TO META").',
+    '- Your proposed-action message must state the phrase clearly. Example: "I\'d like to publish these 3 ads to Meta adset X. This will make them live to real users after Meta\'s review. To confirm, click Confirm and type PUBLISH TO META in the phrase field."',
+    '- If the client sends a confirmation WITHOUT the phrase (or with a wrong phrase), you receive `{ ok:false, tier3PhraseBlocked:true, reason, required }`. Do not retry — ask the operator to re-confirm with the correct phrase.',
     '',
     `AVAILABLE CAPABILITIES (${registry.CAPABILITIES.length}):`,
     registry.describeManifest(),
@@ -139,6 +145,19 @@ function validateBody(body) {
     for (const [i, c] of body.confirmations.entries()) {
       if (typeof c !== 'string' || c.length === 0 || c.length > 200) {
         return `confirmations[${i}] must be a non-empty string ≤200 chars`;
+      }
+    }
+  }
+  if (body.explicitConfirmations != null) {
+    if (typeof body.explicitConfirmations !== 'object' || Array.isArray(body.explicitConfirmations)) {
+      return 'explicitConfirmations must be an object keyed by tool_call_id';
+    }
+    for (const [k, v] of Object.entries(body.explicitConfirmations)) {
+      if (typeof k !== 'string' || k.length === 0 || k.length > 200) {
+        return `explicitConfirmations key "${k}" invalid`;
+      }
+      if (typeof v !== 'string' || v.length === 0 || v.length > 200) {
+        return `explicitConfirmations["${k}"] must be a non-empty string ≤200 chars`;
       }
     }
   }
@@ -177,6 +196,28 @@ function sseWrite(res, event, data) {
 // first fragment for that index. finish_reason:'tool_calls' signals
 // the args are complete and safe to JSON.parse.
 
+// ── Tier 3+ phrase check ──────────────────────────────────────────
+//
+// Returns null when the phrase matches (or the capability requires no
+// phrase), otherwise a reason string. Called for every Tier ≥ 3
+// dispatch — even confirmed ones — so a phrase-less confirmation
+// cannot smuggle a hard-to-reverse action past the gate.
+function phraseCheck(capability, callId, explicitConfirmations) {
+  if (!capability || capability.tier < 3) return null;
+  const required = capability.explicitConfirmation;
+  if (typeof required !== 'string' || !required) {
+    // Registry validator prevents this in normal operation; a manifest
+    // that reached here without a phrase declared is a bug — fail
+    // closed rather than dispatching an unbounded external action.
+    return `capability "${capability.id}" is tier ${capability.tier} but declares no explicitConfirmation phrase`;
+  }
+  const supplied = explicitConfirmations?.[callId];
+  if (typeof supplied !== 'string' || supplied !== required) {
+    return `tier ${capability.tier} action requires the exact phrase "${required}" typed by the operator (received: ${supplied === undefined ? 'nothing' : JSON.stringify(String(supplied).slice(0, 60))})`;
+  }
+  return null;
+}
+
 // ── Gate: split assembled tool_calls into dispatch vs confirm-required ─
 //
 // Tier 0 → always dispatch. Tier ≥ 1 → dispatch only if the call id is
@@ -207,7 +248,7 @@ function splitByGate(toolCalls, confirmationsSet) {
 // then sees real data and produces a natural summary. Emits
 // tool-result SSE events per dispatched call so the client can update
 // its UI in real time.
-async function replayConfirmations({ working, confirmationsSet, req, context, res }) {
+async function replayConfirmations({ working, confirmationsSet, explicitConfirmations, req, context, res }) {
   if (!confirmationsSet.size) return { dispatched: 0 };
 
   // Find the last assistant message carrying tool_calls.
@@ -240,12 +281,42 @@ async function replayConfirmations({ working, confirmationsSet, req, context, re
     try { args = call.function?.arguments ? JSON.parse(call.function.arguments) : {}; }
     catch { args = {}; }
 
+    const cap = registry.capabilityByToolName(call.function?.name);
+
+    // Tier 3+ phrase check on replay — a confirmation missing the
+    // exact phrase still blocks a hard-to-reverse action. Uses the
+    // same phraseCheck helper the in-loop path uses so both sites
+    // stay in sync.
+    if (cap && cap.tier >= 3) {
+      const problem = phraseCheck(cap, call.id, explicitConfirmations);
+      if (problem) {
+        sseWrite(res, 'tier3-phrase-block', {
+          toolCallId: call.id,
+          toolName:   call.function.name,
+          reason:     problem,
+          required:   cap.explicitConfirmation
+        });
+        const blockedResult = {
+          ok: false,
+          tier3PhraseBlocked: true,
+          reason:   problem,
+          required: cap.explicitConfirmation
+        };
+        working[toolIdx] = {
+          role:         'tool',
+          tool_call_id: call.id,
+          content:      JSON.stringify(blockedResult)
+        };
+        sseWrite(res, 'tool-result', { toolCallId: call.id, result: blockedResult });
+        continue;
+      }
+    }
+
     // Tier ≥ 2 replays still hit spendGuard — the operator confirmed
     // the ACTION, but the daily cap may have moved between propose and
     // confirm (a parallel agent session may have spent since). Blocked
     // replays surface both events + a spend-guard tool_result so the
     // LLM sees the same shape as an in-loop block.
-    const cap = registry.capabilityByToolName(call.function?.name);
     if (cap && cap.tier >= 2) {
       const guard = await spendGuard.check({
         advertiserId: req.advertiserId,
@@ -351,6 +422,8 @@ router.post('/chat', async (req, res) => {
 
   const context = sanitiseContext(req.body.context);
   const confirmationsSet = new Set(Array.isArray(req.body.confirmations) ? req.body.confirmations : []);
+  const explicitConfirmations = (req.body.explicitConfirmations && typeof req.body.explicitConfirmations === 'object')
+    ? req.body.explicitConfirmations : {};
   const clientMessages = req.body.messages.filter((m) => m.role !== 'system');
   const system = buildSystemPrompt(context);
   const tools = registry.capabilitiesToTools();
@@ -372,7 +445,7 @@ router.post('/chat', async (req, res) => {
     // in the history with real ones BEFORE the LLM sees this turn.
     if (confirmationsSet.size) {
       const { dispatched } = await replayConfirmations({
-        working, confirmationsSet, req, context, res
+        working, confirmationsSet, explicitConfirmations, req, context, res
       });
       if (dispatched > 0) {
         console.log(`🤝 agent chat: replayed ${dispatched} confirmed tool call(s)`);
@@ -465,6 +538,37 @@ router.post('/chat', async (req, res) => {
           toolName:   call.function.name,
           args
         });
+
+        // Tier 3+ phrase gate — the operator must have typed the
+        // explicit phrase in the confirmation UI. Runs BEFORE
+        // spendGuard so a phrase-less confirmation can't reach a
+        // billable estimate check (irrelevant here since
+        // publishToMeta is estimateUsd:0, but the ordering matters
+        // for future Tier 3 capabilities that ARE billable).
+        if (tier >= 3 && cap) {
+          const problem = phraseCheck(cap, call.id, explicitConfirmations);
+          if (problem) {
+            sseWrite(res, 'tier3-phrase-block', {
+              toolCallId: call.id,
+              toolName:   call.function.name,
+              reason:     problem,
+              required:   cap.explicitConfirmation
+            });
+            const blockedResult = {
+              ok: false,
+              tier3PhraseBlocked: true,
+              reason:   problem,
+              required: cap.explicitConfirmation
+            };
+            sseWrite(res, 'tool-result', { toolCallId: call.id, result: blockedResult });
+            working.push({
+              role:         'tool',
+              tool_call_id: call.id,
+              content:      JSON.stringify(blockedResult)
+            });
+            continue;
+          }
+        }
 
         // Spend cap gate. Tier 0/1 skip (no billable dispatch). Tier ≥ 2
         // rejects both when the capability lacks estimateUsd (fail

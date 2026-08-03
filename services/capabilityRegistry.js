@@ -234,11 +234,50 @@ const CAPABILITIES = [
       service: './capabilityExecutors/adRegenerateWithPrompt',
       method:  'run'
     }
+  },
+
+  // ── Tier 3: external / hard-to-reverse ────────────────────────────
+
+  {
+    id:       'ads.publishToMeta',
+    title:    'Publish ads to Meta',
+    describe: 'Push a batch of rendered ads to a Meta Ads adset. Ads become live in Meta the moment they clear review — this is not reversible from here (an operator can pause the adset in Meta Ads Manager). Requires operator confirmation AND the explicit phrase "PUBLISH TO META" typed in the confirmation UI. Ads must have a renderUrl and cannot already be synced.',
+    tier:     3,
+    scope:    'brand',
+    // Tier 3 machinery: the operator must type this exact string in
+    // the client's confirmation UI. Endpoint checks
+    // req.body.explicitConfirmations[tool_call_id] === explicitConfirmation
+    // before dispatching, in addition to the id being in confirmations[].
+    explicitConfirmation: 'PUBLISH TO META',
+    // Zero USD cost — Meta API for ad creation is free (ad spend is
+    // billed by Meta separately per the adset budget). Declared
+    // explicitly to satisfy the validateManifest tier ≥ 2 rule.
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId', 'adsetId', 'adIds'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        adsetId: { type: 'string', description: 'Meta Ads adset external id (not our ObjectId).' },
+        adIds:   {
+          type: 'array',
+          minItems: 1,
+          maxItems: 20,
+          items: { type: 'string' },
+          description: 'Ad ObjectIds to publish. All must belong to the brand and have a renderUrl. Batch capped at 20 — split larger runs.'
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adsPublishToMeta',
+      method:  'run'
+    }
   }
 
-  // Tier 3 (external / hard-to-reverse) + Tier 4 (workflows) land in
-  // follow-up PRs — see backlog rows 167 (parent epic) and 168 (review
-  // refresh workflow).
+  // Tier 4 (workflows) lands in a follow-up PR — see backlog rows
+  // 167 (parent epic) and 168 (review refresh workflow).
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -371,6 +410,16 @@ function validateManifest(caps = CAPABILITIES) {
       const hasEstimator = (typeof e === 'number' && e >= 0) || typeof e === 'function';
       if (!hasEstimator) {
         problems.push(`${at} tier ${c.tier} requires estimateUsd (number ≥ 0 or function returning one)`);
+      }
+    }
+    // Tier ≥ 3 needs an explicit-confirmation phrase — the "type YES"
+    // ceremony that separates hard-to-reverse actions from ordinary
+    // Tier 1/2 confirmations. Endpoint enforces the phrase match; the
+    // manifest here enforces that a phrase is declared.
+    if (typeof c.tier === 'number' && c.tier >= 3) {
+      const p = c.explicitConfirmation;
+      if (typeof p !== 'string' || p.length < 4 || p.length > 100) {
+        problems.push(`${at} tier ${c.tier} requires explicitConfirmation (4-100 char phrase the operator must type)`);
       }
     }
   }

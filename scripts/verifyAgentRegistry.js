@@ -36,6 +36,7 @@ const FILES = [
   'services/capabilityExecutors/adRestore.js',
   'services/capabilityExecutors/brandUpdateTagline.js',
   'services/capabilityExecutors/adRegenerateWithPrompt.js',
+  'services/capabilityExecutors/adsPublishToMeta.js',
   'services/spendGuard.js',
   'routes/agent.js'
 ];
@@ -389,6 +390,85 @@ async function checkTier2Executor() {
     `adRegenerateWithPrompt: missing promptOverride → rejects`);
 }
 
+// ── 11. Tier 3 external actions + explicit-phrase gate (PR #5) ────
+console.log('\n[11] Tier 3 capabilities + explicit-phrase gate');
+
+const tier3Cap = registry.capabilityById('ads.publishToMeta');
+assert(tier3Cap, `capability "ads.publishToMeta" registered`);
+if (tier3Cap) {
+  assert(tier3Cap.tier === 3, `ads.publishToMeta: tier === 3 (got ${tier3Cap.tier})`);
+  assert(typeof tier3Cap.explicitConfirmation === 'string' && tier3Cap.explicitConfirmation.length >= 4,
+    `ads.publishToMeta: has explicitConfirmation phrase (got ${JSON.stringify(tier3Cap.explicitConfirmation)})`);
+  assert(tier3Cap.estimateUsd === 0,
+    `ads.publishToMeta: estimateUsd=0 (Meta ad create is free API-wise)`);
+}
+
+// validateManifest MUST reject a Tier ≥ 3 entry lacking explicit-
+// Confirmation. Same fail-closed rule the Tier ≥ 2 estimator rule
+// applies — a new hard-to-reverse capability can't slip past the
+// phrase gate.
+{
+  const shadow = [...registry.CAPABILITIES, {
+    id: '_test_.noPhraseTier3',
+    title: 'test',
+    describe: 'test',
+    tier: 3,
+    scope: 'ad',
+    estimateUsd: 0,
+    args: { type: 'object', properties: {}, additionalProperties: false },
+    execute: { kind: 'service', service: './capabilityExecutors/adInspect', method: 'run' }
+    // deliberately no explicitConfirmation
+  }];
+  const problems = registry.validateManifest(shadow);
+  assert(problems.some((p) => /explicitConfirmation/.test(p)),
+    `validateManifest rejects Tier ≥ 3 without explicitConfirmation (got: ${problems.join(' / ')})`);
+}
+
+// Endpoint plumbing for Tier 3.
+assert(/tier3-phrase-block/.test(agentSrc),
+  `routes/agent.js emits tier3-phrase-block event`);
+assert(/tier3PhraseBlocked/.test(agentSrc),
+  `routes/agent.js sets tier3PhraseBlocked flag on blocked results`);
+assert(/explicitConfirmations/.test(agentSrc),
+  `routes/agent.js references the explicitConfirmations request field`);
+assert(/phraseCheck/.test(agentSrc),
+  `routes/agent.js has a phraseCheck helper`);
+assert(/tier\s*>=\s*3|tier\s*>\s*2/.test(agentSrc),
+  `routes/agent.js gates on tier ≥ 3`);
+
+// Executor structural guards.
+async function checkTier3Executor() {
+  const exec = require('../services/capabilityExecutors/adsPublishToMeta');
+  const r1 = await exec.run({ req: {}, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `adsPublishToMeta: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /brandId required/i.test(r2.error),
+    `adsPublishToMeta: missing brandId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'b', adIds: [] } });
+  assert(r3.ok === false && /adsetId required/i.test(r3.error),
+    `adsPublishToMeta: missing adsetId → rejects`);
+  const r4 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'b', adsetId: 'a' } });
+  assert(r4.ok === false && /adIds required/i.test(r4.error),
+    `adsPublishToMeta: missing adIds → rejects`);
+  const tooMany = Array(21).fill('000000000000000000000000');
+  const r5 = await exec.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', adsetId: 'x', adIds: tooMany }
+  });
+  assert(r5.ok === false && /max 20/i.test(r5.error),
+    `adsPublishToMeta: >20 adIds rejected`);
+}
+
+// phraseCheck contract: null when phrase matches or tier < 3;
+// non-null reason string otherwise. Since phraseCheck lives inline
+// in routes/agent.js and isn't exported, we probe indirectly via
+// its callers' effect on the source — assert the string checks
+// above already cover the wiring; here we assert the manifest's
+// per-tier requirement.
+assert(registry.CAPABILITIES.filter((c) => c.tier >= 3).every((c) => c.explicitConfirmation),
+  `every Tier ≥ 3 capability declares explicitConfirmation`);
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
@@ -397,6 +477,7 @@ async function checkTier2Executor() {
   checkGateSplit();
   await checkSpendGuard();
   await checkTier2Executor();
+  await checkTier3Executor();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
