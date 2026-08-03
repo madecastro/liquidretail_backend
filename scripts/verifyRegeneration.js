@@ -163,6 +163,234 @@ check('R2 a static request never yields a billable video kind',
   ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16', 'pmax_16_9', 'meta_reels_9_16']  // pmax included on purpose: frozen must still never yield video
     .every((f) => !pf.resolveKinds(f, 'image').includes('video')));
 
+// ── R3: catalog-first reseed on STATIC regenerate ───────────────────────
+// Regenerate used to REPLAY the stored Ad.mediaIds stack, so an ad queued while
+// DIRECTOR_UNIVERSE_TOP_N was 10 still sent 3+ references on every regen — for
+// ever. It now RE-DERIVES the seed. It must NOT be a trim to mediaIds[0]: those
+// stacks were shotType-ranked LIFESTYLE-FIRST (services/shotTypeRank.js) over a
+// pool merging catalog media with product_match UGC, so [0] is frequently a UGC
+// post and trimming would lock a social image in as the seed permanently.
+//
+// Everything below is the PURE decision + PURE tier selection — no DB, no
+// network, no API key. The money shape is untouched: this changes WHICH image
+// seeds the ad, never how many billable submits happen (still exactly one
+// gpt-image-2/edit per regenerate, and reference count does not move the price).
+const regen = require('../services/adRegenerateService');
+
+const PRODUCT = '6a6a4d58054561c15f3ff8a2';
+const BRAND   = '6a6a4d58054561c15f3ff800';
+const AD = (over) => ({
+  kind: 'image',
+  variantKind: 'product_image',
+  referenceMediaIds: [],
+  productId: PRODUCT,
+  brandId: BRAND,
+  mediaIds: ['aaaaaaaaaaaaaaaaaaaaaaa1', 'aaaaaaaaaaaaaaaaaaaaaaa2', 'aaaaaaaaaaaaaaaaaaaaaaa3'],
+  ...over
+});
+const decide = (over, flagEnabled = true) =>
+  regen.reseedDecision({ ad: AD(over), flagEnabled });
+
+// (b) THE OWNER GATE, verbatim: "UGC ads shouldn't be affected by this change,
+// we haven't optimized that path yet." A variantKind:'ugc' ad is SUPPOSED to
+// seed from a social image.
+check('R3 variantKind ugc is NEVER re-seeded (owner: UGC path is unoptimized)',
+  decide({ variantKind: 'ugc' }).reseed === false,
+  'a ugc ad would be re-derived to a catalog photo, breaking it by design');
+check('R3 variantKind ugc skip reason names variantKind',
+  decide({ variantKind: 'ugc' }).reason === regen.RESEED_SKIP.NOT_PRODUCT_IMAGE);
+check('R3 a missing variantKind is NOT treated as product_image',
+  decide({ variantKind: undefined }).reseed === false);
+
+// The whole point of the change.
+check('R3 product_image with empty referenceMediaIds IS re-seeded',
+  decide({}).reseed === true, 'the stale 3-ref Director stack would replay for ever');
+check('R3 re-seeding returns no skip reason',
+  decide({}).reason === null);
+
+// (c) owner: "unless the user overrides it".
+check('R3 non-empty referenceMediaIds is NEVER re-seeded (operator pick wins)',
+  decide({ referenceMediaIds: ['bbbbbbbbbbbbbbbbbbbbbbb1'] }).reseed === false);
+check('R3 operator-override skip reason names referenceMediaIds',
+  decide({ referenceMediaIds: ['bbbbbbbbbbbbbbbbbbbbbbb1'] }).reason === regen.RESEED_SKIP.OPERATOR_REFS);
+
+// (d) nothing to derive from.
+check('R3 no productId is NEVER re-seeded',
+  decide({ productId: null }).reseed === false);
+check('R3 no-productId skip reason names productId',
+  decide({ productId: null }).reason === regen.RESEED_SKIP.NO_PRODUCT);
+
+// (a) static only.
+check('R3 a video regenerate is NEVER re-seeded',
+  decide({ kind: 'video' }).reseed === false,
+  'video reference assembly is a different pipeline and is out of scope');
+check('R3 video skip reason names video',
+  decide({ kind: 'video' }).reason === regen.RESEED_SKIP.VIDEO);
+
+// Kill switch.
+check('R3 flag off -> NEVER re-seeded',
+  decide({}, false).reseed === false);
+check('R3 flag-off skip reason names REGEN_RESEED_CATALOG_FIRST',
+  decide({}, false).reason === regen.RESEED_SKIP.FLAG_OFF);
+
+const savedFlag = process.env.REGEN_RESEED_CATALOG_FIRST;
+try {
+  delete process.env.REGEN_RESEED_CATALOG_FIRST;
+  check('R3 flag UNSET means ON (the owner asked for this behaviour)',
+    regen.isRegenReseedCatalogFirstEnabled() === true);
+  process.env.REGEN_RESEED_CATALOG_FIRST = '';
+  check('R3 flag EMPTY means ON',
+    regen.isRegenReseedCatalogFirstEnabled() === true);
+  for (const off of ['false', 'FALSE', '0', 'no', 'off', ' off ']) {
+    process.env.REGEN_RESEED_CATALOG_FIRST = off;
+    check(`R3 flag ${JSON.stringify(off)} means OFF`,
+      regen.isRegenReseedCatalogFirstEnabled() === false);
+  }
+  for (const on of ['true', '1', 'yes', 'on']) {
+    process.env.REGEN_RESEED_CATALOG_FIRST = on;
+    check(`R3 flag ${JSON.stringify(on)} means ON`,
+      regen.isRegenReseedCatalogFirstEnabled() === true);
+  }
+  // End-to-end through the gate with the real env read, flag unset.
+  delete process.env.REGEN_RESEED_CATALOG_FIRST;
+  check('R3 flag unset + product_image + no operator refs -> re-seeded (default ON)',
+    regen.shouldReseedFromCatalog({
+      ad: AD({}), flagEnabled: regen.isRegenReseedCatalogFirstEnabled()
+    }) === true);
+  process.env.REGEN_RESEED_CATALOG_FIRST = 'false';
+  check('R3 flag false + product_image + no operator refs -> NOT re-seeded',
+    regen.shouldReseedFromCatalog({
+      ad: AD({}), flagEnabled: regen.isRegenReseedCatalogFirstEnabled()
+    }) === false);
+} finally {
+  if (savedFlag === undefined) delete process.env.REGEN_RESEED_CATALOG_FIRST;
+  else process.env.REGEN_RESEED_CATALOG_FIRST = savedFlag;
+}
+
+// ── R3b: the tier cascade. Mirrors campaignAdsGenerationService.js:2085. ──
+const SCOPE = { productId: PRODUCT, brandId: BRAND };
+// fileUrl is part of the fixture because it is part of the CONTRACT: a derived id
+// is only usable if it resolves to an image the renderer can fetch. Omitting it
+// (as this fixture originally did) made four checks pass for the wrong reason once
+// the fileUrl guard landed. `over.fileUrl === null` builds the unusable case on
+// purpose; pass fileUrl:'' for the empty-string variant.
+const cat = (id, over = {}) => ({
+  _id: id,
+  source: 'catalog-product',
+  brandId: BRAND,
+  fileType: over.fileType || 'image',
+  fileUrl: 'fileUrl' in over ? over.fileUrl : `https://cdn.example/${id}.jpg`,
+  createdAt: over.createdAt || '2026-01-01T00:00:00Z',
+  metadata: { catalogProductId: PRODUCT, ...(over.metadata || {}) }
+});
+const pick = (list) => regen.pickFirstCatalogMediaId(list, SCOPE);
+
+// ── R3c: a derived id must be USABLE, not merely well-scoped. ─────────────
+// Found by adversarial review of the finished diff, agreed independently by two
+// reviewers. The derivation returns only an id; renderDirectImage then loads it
+// and, on finding ZERO resolvable references, silently falls back to
+// media.fileUrl — the ad's ORIGINAL seed, which on exactly the historical rows
+// this feature exists to fix is frequently the UGC/lifestyle image. Combined with
+// the "catalog reseed — stack N → 1" log already emitted, that produced a false
+// success over a silent UGC seed AND a real billable submit. So an unusable doc
+// must be rejected here and become an honest tier-3 skip.
+{
+  const noUrl    = cat('no_url',    { fileUrl: null, metadata: { imageRole: 'hero' } });
+  const blankUrl = cat('blank_url', { fileUrl: '   ', metadata: { imageRole: 'hero' } });
+  const good     = cat('good_alt',  { createdAt: '2026-09-01T00:00:00Z' });
+
+  check('R3c a hero doc with a NULL fileUrl is not selectable',
+    pick([noUrl]) === null);
+  check('R3c a hero doc with a whitespace-only fileUrl is not selectable',
+    pick([blankUrl]) === null);
+  check('R3c an unusable hero does not shadow a usable catalog image — tier 2 still wins',
+    pick([noUrl, good])?.mediaId === 'good_alt');
+  check('R3c a catalog VIDEO is never selectable as the first catalog IMAGE',
+    pick([cat('vid', { fileType: 'video', metadata: { imageRole: 'video' } })]) === null);
+  check('R3c the imageRole video stamp alone also disqualifies',
+    pick([cat('vid2', { metadata: { imageRole: 'video' } })]) === null);
+  check('R3c a video does not shadow a usable image',
+    pick([cat('vid3', { fileType: 'video', createdAt: '2020-01-01T00:00:00Z' }), good])?.mediaId === 'good_alt');
+}
+
+// TIER 1 beats TIER 2 even when the hero doc is the NEWEST in the list — that
+// ordering is the whole difference between "hero stamp" and "earliest".
+const heroLate  = cat('hero_late',  { createdAt: '2026-06-01T00:00:00Z', metadata: { imageRole: 'hero' } });
+const altEarly  = cat('alt_early',  { createdAt: '2026-01-01T00:00:00Z', metadata: { imageRole: 'alt' } });
+check('R3b tier 1 (imageRole hero) beats tier 2 even when it is the newest doc',
+  pick([altEarly, heroLate])?.mediaId === 'hero_late');
+check('R3b tier 1 reports tier "hero"',
+  pick([altEarly, heroLate])?.tier === 'hero');
+
+// TIER 2 — no hero stamp anywhere: earliest createdAt wins, regardless of the
+// order the docs arrive in.
+const a2 = cat('alt_2026_03', { createdAt: '2026-03-01T00:00:00Z', metadata: { imageRole: 'alt' } });
+const a1 = cat('alt_2026_01', { createdAt: '2026-01-15T00:00:00Z', metadata: { imageRole: 'alt' } });
+const a3 = cat('alt_2026_09', { createdAt: '2026-09-01T00:00:00Z', metadata: { imageRole: 'alt' } });
+check('R3b tier 2 is used when no doc carries the hero stamp',
+  pick([a2, a1, a3])?.mediaId === 'alt_2026_01');
+check('R3b tier 2 is order-independent (reversed input, same winner)',
+  pick([a3, a2, a1])?.mediaId === 'alt_2026_01');
+check('R3b tier 2 reports tier "earliest-createdAt"',
+  pick([a2, a1, a3])?.tier === 'earliest-createdAt');
+
+// TIER 3 — no catalog media at all: derive NOTHING so the ad's existing
+// behaviour is left completely untouched.
+check('R3b tier 3: an empty candidate list derives NOTHING',
+  pick([]) === null);
+check('R3b tier 3: a list with no catalog media derives NOTHING',
+  pick([{ _id: 'ugc_1', source: 'instagram', brandId: BRAND, metadata: { catalogProductId: PRODUCT } }]) === null);
+
+// THE CENTRAL SAFETY PROPERTY. A UGC doc must be unselectable no matter what
+// metadata it carries — including the hero stamp, which is exactly the trap that
+// querying imageRole alone would fall into. This is the case that makes the
+// cascade structurally incapable of seeding an ad from a social post.
+const ugcHero = {
+  _id: 'ugc_hero', source: 'instagram', brandId: BRAND,
+  createdAt: '2020-01-01T00:00:00Z',                       // earliest of everything
+  metadata: { catalogProductId: PRODUCT, imageRole: 'hero' } // and stamped hero
+};
+check('R3b a UGC doc stamped imageRole:hero can NEVER be selected',
+  pick([ugcHero, a2])?.mediaId === 'alt_2026_03',
+  'querying imageRole without pinning source:catalog-product would pick the social post');
+check('R3b a UGC doc is not selected even when it is the ONLY candidate',
+  pick([ugcHero]) === null);
+check('R3b every non-catalog source is rejected',
+  ['instagram', 'tiktok', 'upload', 'brand-site', 'competitor', null, undefined]
+    .every((src) => pick([{ ...ugcHero, source: src }]) === null));
+check('R3b the guard rejects any non-catalog source directly',
+  !regen.isCatalogMediaForProduct(ugcHero, SCOPE));
+
+// Cross-product and cross-tenant leaks. Either one would put another product's
+// (or another advertiser's) photograph into this ad.
+check('R3b a catalog doc for a DIFFERENT product is rejected',
+  pick([cat('other_product', { metadata: { catalogProductId: 'ffffffffffffffffffffffff', imageRole: 'hero' } })]) === null);
+check('R3b a catalog doc for a DIFFERENT brand is rejected (cross-tenant)',
+  pick([{ ...cat('other_brand', { metadata: { imageRole: 'hero' } }), brandId: 'ffffffffffffffffffffffff' }]) === null);
+check('R3b a catalog doc with no catalogProductId is rejected',
+  pick([cat('no_product', { metadata: { catalogProductId: null, imageRole: 'hero' } })]) === null);
+check('R3b a catalog doc with no brandId is rejected',
+  pick([{ ...cat('no_brand', { metadata: { imageRole: 'hero' } }), brandId: null }]) === null);
+check('R3b ids compare by string, so ObjectId-vs-string never causes a miss',
+  regen.isCatalogMediaForProduct(cat('str_ok'), { productId: { toString: () => PRODUCT }, brandId: { toString: () => BRAND } }));
+
+// A missing createdAt must never beat a stamped doc. Built literally, NOT via
+// cat(), because cat()'s `||` default would coerce a null createdAt back to a
+// real date and silently defeat the assertion.
+const noTs = {
+  _id: 'no_ts', source: 'catalog-product', brandId: BRAND,
+  // fileType/fileUrl carried explicitly: this fixture is built as a literal
+  // rather than via cat(), so it does not inherit the helper's defaults. It is
+  // testing the MISSING-createdAt path, not the unusable-media path — leaving
+  // fileUrl off would have made it fail the usability guard for the wrong reason.
+  fileType: 'image', fileUrl: 'https://cdn.example/no_ts.jpg',
+  createdAt: null, metadata: { catalogProductId: PRODUCT, imageRole: 'alt' }
+};
+check('R3b a doc with no createdAt loses tier 2 to a stamped doc',
+  pick([noTs, a3])?.mediaId === 'alt_2026_09');
+check('R3b a doc with no createdAt is still selectable when it is the only one',
+  pick([noTs])?.mediaId === 'no_ts');
+
 if (failures.length) {
   console.error(`\n❌ regeneration: ${failures.length} FAILED, ${pass} passed\n`);
   failures.forEach((f) => console.error(`   • ${f}`));

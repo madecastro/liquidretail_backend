@@ -338,12 +338,54 @@ there is no lexical fallback. Full rationale, failure policy and consumer list:
 
 Director schema **v3** nests strategy fields under `concept.routing` (`media_picks`, `creative_style`, `output_shape`, …). The producer dual-read both shapes and logged `warnings=0` while **every consumer that still read flat v2 discarded the concepts** → `payloads=0` (zero ads, paid Director rounds wasted). **One helper only:** `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`. Consumers include `campaignAdsGenerationService`, `aiJudgeService`, `aiCanvasHtmlGeneratorService`, `veoStoryboardService`. `scripts/verifyConceptContract.js` (125 checks) **fails the suite** if any `services/` or `routes/` file reads a `ROUTING_NESTED_FIELDS` name off a concept without the helper. Verified live after fix: `concepts=3 payloads=3` where it was `payloads=0`.
 
-### Hero-image default
+### Seed selection — image vs video (the first-catalog-image rule)
 
-`DIRECTOR_UNIVERSE_TOP_N` default **1** (was 10) — a **default** change, not a capability removal. Ceiling stays 10; multi-image fully wired; operator multi-select still widens via `Math.max(mediaIds.length, TOP_N)` (`campaignAdsGenerationService.js:184,2331-2333`). Side effects of TOP_N=1:
+> **Was falsely documented (corrected 2026-08-03):** this section used to be titled *"Hero-image default"* and presented `DIRECTOR_UNIVERSE_TOP_N=1` as delivering the owner's rule. **TOP_N=1 is a COUNT, not a choice of image.** It trims a shotType-ranked pool to one entry; which entry survived was decided by shot type, and catalog media routinely lost.
+>
+> **Amended the same day.** The rule is no longer stated in terms of the `imageRole: 'hero'` LABEL. Owner, verbatim 2026-08-03: *"I actually just want to use the first image that comes from the catalog not the 'hero' image since that may also come from social media or UGC?"* The default image seed is **the first image that came from the catalog**, and it **can never resolve to UGC**.
+
+**The two rails have genuinely different seed MECHANISMS, but now the same rule. Do not generalize the mechanism.**
+
+| Rail | Default seed | Mechanism |
+|---|---|---|
+| **Static image** (§5, `runConceptDrivenExpansion` → `buildSeededUniverse`) | the **first image that came from the catalog**, pinned explicitly | shotType ranking **then** the `preferFirstCatalogImage` hoist (a 3-tier cascade), then trim to `topN` |
+| **Deterministic video** (§6) | the **first image that came from the catalog**, queried directly | `Media.findOne({ 'metadata.imageRole': 'hero' })` → earliest `createdAt` → lazy materialize. Shot type is never consulted |
+
+**Why the static rail needed a fix.** `buildSeededUniverse`'s auto-assembly branch (`seededUniverseService.js:400-534`) merges catalog media **and** `product_match` UGC into ONE pool, then ranks it with `rankMergedPool` (`:96-120`) by `classification.shotType` first — lifestyle → on_model → flat_lay → product_only → detail → packaging → unknown (`shotTypeRank.js:15-23`). `metadata.imageRole === 'hero'` is only a tiebreak **within** a tier, key #2 of 4 (after the `wantsVideo` burned-text penalty, before engagement and `createdAt`). Source does not gate order, by design: a UGC lifestyle post ranks equal to a catalog lifestyle shot. So `.slice(0, 1)` of that ranking handed the Director a lifestyle catalog **ALT** — or a **UGC post**, which then also flipped `Ad.variantKind` to `'ugc'` via `matchTierForUniverseRole` / `variantKindForUniverseRole`.
+
+**What pins the catalog's first image:** the opt-in `opts.preferFirstCatalogImage`. `promoteFirstCatalogImage` (`seededUniverseService.js:178`) returns a **new array** (pure, non-mutating) with one entry moved to index 0, every other entry keeping its relative order. It is a **cascade**, and every tier is gated on `role === 'catalog'`, so **no tier can select UGC**:
+
+| Tier | Selects | Why |
+|---|---|---|
+| **1** | first entry with `role === 'catalog'` **and** `media.metadata.imageRole === 'hero'` | That stamp is written in exactly one place: `catalogProductDetectService` materialises `CatalogProduct.imageUrl` — the catalog feed's **first** image — with `imageRole: 'hero'` (`:60`); `additionalImages[]` get `'alt'` (`:80`, `:513`). So tier 1 *is* "the first image from the catalog", wearing a legacy name. Nothing stamps `'hero'` on social/UGC media (the only other writer is `shopifyPublicIngestService.js:526`, which writes `'video'`) |
+| **2** | else, among `role === 'catalog'` entries, the one with the **earliest `media.createdAt`** | **This tier is the point of the amendment.** The tier-1 stamp can be **ABSENT** — hero materialisation failed, or the row predates the stamp. A tier-1-only helper returned the pool unchanged in that case, and the shotType ranking then decided index 0 out of a pool that **merges catalog with `product_match` UGC** — which is exactly how a UGC post became the default seed of a catalog product ad. The **fallthrough** is the failure mode; tier 2 removes it, so an **unstamped catalog set still beats UGC**. Catalog `Media` rows are materialised in feed order, so earliest ≈ first |
+| **3** | nothing — an unchanged copy | No `role === 'catalog'` entry exists in the pool at all. Nothing came from the catalog, so there is nothing to pin, and the cascade does **not** settle for a UGC entry as a consolation prize |
+
+Tier 2 determinism: the scan uses a strict `<`, so an **equal** `createdAt` never displaces the incumbent and the earlier entry in **ranked** order keeps index 0. A **missing or unparseable** `createdAt` maps to `Infinity` — it sorts **last**, never first, so a legacy row with no timestamp cannot win "earliest" by defaulting to epoch 0. If *every* catalog entry lacks a timestamp they all tie and the earliest in ranked order wins.
+
+Applied at `:504`, on the ranked wrappers, **before** `projectEntry()` and **before** `.slice(0, topN)` — with `topN=1` the slice is the whole decision, so a promotion after it would be inert; and `projectEntry` drops `createdAt` entirely, so tier 2 could not run after it.
+
+**The `role === 'catalog'` test is load-bearing in every tier**, not defensive: UGC docs carry `metadata.imageRole` too (we do not author creator-side metadata), so a creator post stamped `'hero'` must lose tier 1 to an *unstamped* catalog image via tier 2, and must never be selectable by tier 2 either.
+
+**This cascade deliberately mirrors** the proven one on the deterministic video rail, `campaignAdsGenerationService.js:2085` (*"Feed-order hero: imageRole hero → earliest createdAt → lazy materialize"*) — same tier 1, same tier 2. That rail's third step lazily materialises `Media` from `CatalogProduct.imageUrl`, a DB write that cannot live in a pure ranking helper; here tier 3 is "leave the pool alone".
+
+**Where it deliberately does NOT apply** (all three are required, not defensive):
+
+- **`preferFirstCatalogImage` defaults to `false`.** Only `runConceptDrivenExpansion` opts in, and only for image runs with no operator picks: `preferFirstCatalogImage: !operatorPickedMedia && resolvedKinds.includes('image')` (`campaignAdsGenerationService.js:2388`). Every other caller — including `scripts/inspectImageSelection.js` — is byte-identical to before.
+- **The `restrictToMediaIds` branch** (`seededUniverseService.js:339-397`) returns before the promotion. Operator picks **are** the "unless the user overrides it" half of the rule; re-ordering them would override the override. They still widen the window via `Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)` (`campaignAdsGenerationService.js:2343-2345`) rather than being truncated to 1. Note the override is a **membership** override, not an ordering one — that branch still shotType-ranks the picks.
+- **Brand-only runs** (`productId === null`) pool every product's catalog media, so many docs are *some* SKU's first catalog image and "the catalog's first image" has no meaning; promoting one would silently pick a SKU. Gated by `!isBrandOnly`.
+
+**Deliberate precedence:** a catalog image with burned-in text is still promoted, even on a mixed image+video run where `rankMergedPool` penalizes burned text. The owner rule outranks that tiebreak.
+
+**Pinned by** `scripts/verifySeededUniverseHeroDefault.js` — **111 offline checks** (pure, no DB / network / key), covering all three tiers, the tie and missing-`createdAt` outcomes, purity and stability, the end-to-end `buildSeededUniverse` shape at `topN=1` for both tier 1 and tier 2, the override and brand-only gates, and the source wiring (including that the promotion is **not** folded into the shared `rankMergedPool`, which would silently re-order operator picks). Its header carries the revert-proof recipe.
+
+`DIRECTOR_UNIVERSE_TOP_N` default **1** (was 10) is still a **default** change, not a capability removal. Ceiling stays 10; multi-image fully wired (`campaignAdsGenerationService.js:195,2343-2345`). Side effects of TOP_N=1:
 
 - Judge `media_utilization` axis is **N/A** (excluded from average) — it was docking every concept for obeying our own constraint (`aiJudgeService.js:423-431`).
 - Output-shape menu narrows to **`static_single` only** so the model cannot emit a collage declaring one tile (`aiCreativeDirectorService.js` `feedOutputShapesForUniverse`).
+- The Director's AVOID block asks each round to prefer media the previous round did not use. At universe size 1 that is unsatisfiable regardless of this fix — one entry every round.
+
+**Known-stale prompt text (not changed here):** `aiCreativeDirectorService.js:1541` tells the model the universe is "PRE-RANKED by shot-type quality … earlier entries are BETTER seeds". That stays true at the default (TOP_N=1 ⇒ one entry, nothing to order), but if `DIRECTOR_UNIVERSE_TOP_N` is raised above 1 **with no operator picks**, index 0 is now the pinned first-catalog-image rather than the top shot-type candidate, and that sentence would need rewording before the wider window is used.
 
 ### Stages (live direct-image path)
 
@@ -405,6 +447,71 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 | `GET /api/ads/formats` | `formatCatalog()` verbatim — display-only, brand-agnostic, no `brandId` (`routes/ads.js:1998-2000`) |
 | Named routes before `/:id` | **ROUTE ORDER is load-bearing.** `mongoose.isValidObjectId('video-models') === true` (any 12-byte string casts), so `router.param` ObjectId guards (`routes/ads.js:2105-2112`) cannot protect a 12-char route name — they only turn bad ids into 404 instead of 500 CastError |
 
+### Surface geometry — generation size and the safe box
+
+`META_STATIC_FANOUT` is three **separate billable** `openai/gpt-image-2/edit`
+calls, one per surface, because the model typesets headline / CTA / price **into
+the pixels**. `platformFormats.js:394-403` explains why one master cannot be
+cropped into three aspects: the crop would slice through that typeset copy.
+
+**Every live static surface now generates at its EXACT delivery aspect**, so
+nothing is destroyed after the billable call:
+
+| surface | aspect | generate | deliver | scale | post-gen crop |
+|---|---|---|---|---|---|
+| `meta_feed_1_1` | 1:1 | `1024x1024` | 1080x1080 | 1.0547 | none |
+| `meta_feed_4_5` | 4:5 | `1088x1360` | 1080x1350 | 0.9926 | none |
+| `meta_stories_9_16` | 9:16 | `1152x2048` | 1080x1920 | 0.9375 | none |
+| `pmax_16_9` *(frozen)* | 16:9 | `1536x1024` | 1920x1080 | 1.25 | 80px top+bottom (15.6%) |
+
+Selection stays least-crop over `staticAdIntents.GEN_SIZES` — no per-surface
+hardcoding. **Table order is load-bearing:** `chooseGenSize` uses strict
+`loss < best.loss`, so an equal-loss tie keeps the earlier entry.
+
+**Size legality is a two-tier rule.** The schema `size` enum has 14 values and is
+the operative contract; the model README still lists three and is stale. The
+schema *also* documents arbitrary `WIDTHxHEIGHT` divisible by 16 for gpt-image-2,
+but that text is spliced from OpenAI's own docs and carries an unpublished "must
+satisfy the model's current pixel and edge limits" — so **prose is not warrant to
+send a size.** A non-enum size is only allowed once a live probe proves it, and
+`scripts/verifyStaticSafeBox.js` S4 enforces that with the prediction id
+recorded. `1152x2048` is an enum member. `1088x1360` is not, and was probed
+(2026-08-03, one submit, returned exactly 1088x1360, aspect 0.800000). The
+failure mode that rule guards against is not a 400 — it is a silent coercion to
+the `1024x1024` default, which would hand a square frame to a 4:5 surface and
+then centre-crop it.
+
+**The safe box is inset from the KEPT region, additively.** Order is crop →
+platform UI reserve → our 6% edge margin, with the margin measured on the *kept*
+short side. The previous code used `Math.max(cropBand, marginPx)`, which treated
+crop and margin as alternatives: the margin was 61.44px and the crop band was
+always larger, so on every cropped surface the margin collapsed to **zero** and
+the box handed to the model *was* the crop line. The tell needed no model
+compliance — `logoPlacementFor` composites the logomark from that same box, and
+it shipped flush to the delivered frame edge (0px gap) on Stories and 4:5.
+Emitted percentages are rounded **inward** (ceil low edge, floor high edge) so
+one-decimal rounding cannot walk an edge back into a destroyed band.
+
+**Crop machinery is retained deliberately.** `cropPx` / `extractFor` /
+`deliveryGeometryFor` are now no-ops on the live surfaces, but they still serve
+the frozen 16:9 surface and still centre-crop a model response that comes back
+off-size instead of stretching it. `deliveryGeometryFor` throws unless the kept
+region scales uniformly to `deliveryDims` within 0.5%.
+
+**Cost, stated honestly.** The catalog `base_price` is a flat `$0.01`, but real
+billing is token-based on `size` *and* aspect:
+`tokens = ceil(base × round(base × short/long) × (2,000,000 + W×H) / 4,000,000)`.
+Atlas never publishes `base`, so only ratios are derivable: 9:16 at `1152x2048`
+is ~**1.03×** the old `1024x1536`, and exact-4:5 is ~**1.11×**. Fewer pixels
+pushes cost down while a squarer frame pushes it up, which is why a pixel-count
+argument alone gets the direction wrong. Reported spend does not move either way —
+the ledger books the flat catalog estimate, which `atlasImageService` already
+notes understates this model ~6×.
+
+Offline check: `scripts/verifyStaticSafeBox.js` (329 checks, revert-proven six
+ways). `describeSurfaces()` dumps every declared surface including frozen and
+`coming_soon` entries.
+
 ### Consumers
 
 - `Ad` documents / display URLs → Meta & Google push, previews, campaign UI.
@@ -444,6 +551,9 @@ Results from deterministic + concept expanders are combined with **`mergeExpansi
 - **Seed selection**
   - If the operator passes ordered catalog-product `seedMediaIds`: grouped by `metadata.catalogProductId`, order preserved; **position 0 = primary seed** (`mediaId` + `referenceMediaIds` stack).
   - Else: feed-order **hero** (`imageRole: 'hero'` → earliest `createdAt` → lazy materialize from `product.imageUrl`); empty `referenceMediaIds` so render derives hero + alts.
+  - **This rail's default is a literal query cascade, not a ranking** — `Media.findOne({ source:'catalog-product', 'metadata.catalogProductId': productOid, 'metadata.imageRole':'hero' })`, else `.sort({ createdAt: 1 })` over the same catalog scope, else lazy materialize (`campaignAdsGenerationService.js:2074-2118`, same query for the catalog-anchor append). Shot type is never consulted and the scope is `source:'catalog-product'`, so it could never resolve to UGC and nothing here needed the §5 `preferFirstCatalogImage` fix — §5's cascade was written to **mirror this one**. Contrast with the static rail, whose seed comes out of a shotType-ranked merged pool → [§5 *Seed selection — image vs video*](#seed-selection--image-vs-video-the-first-catalog-image-rule).
+- **Reference stack (what the model actually receives)** — `buildReferenceImages` (`atlasVideoService.js:1917`) sends the first **3 DISTINCT** views: primary seed at position 0, then catalog mirrors in the order the caller supplied (`buildReferenceImages` does not sort — it trusts the arrival order of `catalogMedias`). Count comes from `DEFAULT_REFERENCE_IMAGE_COUNT = 3` (`:800`), overridable per brand/product via `videoSettings.referenceImageCount` up to `MAX_REFERENCE_IMAGE_COUNT = 7`, and always clamped to the resolved model's `maxReferenceImages`. An explicit operator pick list defines its own count (picking 5 means 5, not "5 truncated to 3") but is still clamped to the stack budget, with a warn.
+  - **`REPEAT_PRIMARY_REFERENCE` is OFF** — env `false` (`config/defaults.env:100`) **and** the code default is now `false` when the var is unset/blank (`isRepeatPrimaryReferenceEnabled`, `:824-829`). Owner 2026-08-03: the repeated primary **increased** hallucination and the pre-repeat output was better, so the closing-repeat and its matching return-to-primary prompt text were both reverted. Kept as a flag for a future A/B, not deleted. **When set true** it becomes 3 distinct + the primary appended again = **4 total** (`referenceStackBudget` `:865` → `distinctCap 3` / `totalCap 4` from `REPEAT_PRIMARY_TOTAL_CAP = 4` `:808`); the duplicate is appended **after** final-URL dedupe so it survives, and it never evicts a real view — it only appends while `length < totalCap`. Anything above that hallucinated in pilot, so do not raise the cap.
 - **Ad shape:** `renderRoute: 'veo'`, `kind: 'video'`, `template: 'ai_brand_led'`, `conceptId` / `judgeRank` null, `variantKind: 'product_image'`, run-level `videoPromptGuidance` / `videoPromptRaw` stamped when provided.
 - **Identity digest:** namespaced **`det-video:v1`** via `computeDeterministicVideoDigest` (campaign, product, ordered ref key or mediaId, platformFormat, CTA fields, guidance/raw). Does not collide with V1 JSON or V2 concept digests.
 

@@ -166,12 +166,23 @@ const MAX_ADS_PER_GENERATION_RUN = Math.max(1, parseInt(process.env.MAX_ADS_PER_
 const ADS_PER_PRODUCT_CAP     = Math.max(1, parseInt(process.env.ADS_PER_PRODUCT_CAP,     10) || 3);
 // How many candidate images the Director sees when the operator picked none.
 //
-// DEFAULT IS 1 (hero only). Owner 2026-08-02: "we are supposed to be defaulting
-// to one image sent to the director, the hero image." Hero-only means the
-// composition matches the reference exactly. Multi-image support stays fully
-// wired — the ceiling is 10 and the window is expected to widen later by
-// raising this one value (or DIRECTOR_UNIVERSE_TOP_N in env). Do NOT delete
-// multi-pick code when the default is 1; it is dormant, not dead.
+// DEFAULT IS 1. Owner 2026-08-02: "we are supposed to be defaulting to one
+// image sent to the director, the hero image." That quote is the REQUIREMENT;
+// this constant only delivers the "one image" half. **It does not pick the
+// hero** — the earlier version of this comment said "DEFAULT IS 1 (hero only)"
+// and was wrong for as long as it stood. buildSeededUniverse ranks a merged
+// catalog+UGC pool by classification.shotType first and treats
+// metadata.imageRole==='hero' as a within-tier tiebreak, so trimming to 1
+// yields the top lifestyle candidate (a catalog ALT, or a UGC post). What
+// actually pins the catalog's first image is `preferFirstCatalogImage`,
+// passed from runConceptDrivenExpansion (see the buildSeededUniverse call)
+// and implemented in seededUniverseService.promoteFirstCatalogImage.
+//
+// One-image means the composition matches the reference exactly. Multi-image
+// support stays fully wired — the ceiling is 10 and the window is expected to
+// widen later by raising this one value (or DIRECTOR_UNIVERSE_TOP_N in env).
+// Do NOT delete multi-pick code when the default is 1; it is dormant, not
+// dead.
 //
 // Explicit operator picks still widen the universe:
 //   operatorPickedMedia ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
@@ -2326,7 +2337,8 @@ async function runConceptDrivenExpansion({
       // topN widens to fit, so a 5-image selection is never truncated to 1.
       //
       // Absent picks, the Director sees DIRECTOR_UNIVERSE_TOP_N candidates
-      // (default 1 = hero only). Operator multi-select widens via max().
+      // (default 1). TOP_N=1 is a COUNT, not a choice of image — see
+      // preferFirstCatalogImage below. Operator multi-select widens via max().
       const operatorPickedMedia = Array.isArray(mediaIds) && mediaIds.length > 0;
       const universeTopN = operatorPickedMedia
         ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
@@ -2336,7 +2348,44 @@ async function runConceptDrivenExpansion({
           includeCategoryMatched, includeBrandMatched,
           topN: universeTopN,
           wantsVideo: resolvedKinds.includes('video'),
-          restrictToMediaIds: operatorPickedMedia ? mediaIds : null
+          restrictToMediaIds: operatorPickedMedia ? mediaIds : null,
+          // Owner rule, 2026-08-03, verbatim: "I actually just want to use
+          // the first image that comes from the catalog not the 'hero' image
+          // since that may also come from social media or UGC?"
+          //
+          // DIRECTOR_UNIVERSE_TOP_N=1 does NOT deliver that on its own, which
+          // is what every doc in this repo used to claim.
+          // buildSeededUniverse ranks catalog media and product_match UGC in
+          // ONE merged pool by classification.shotType first (lifestyle →
+          // on_model → … → unknown) and only breaks within-tier ties on
+          // metadata.imageRole==='hero'. So `.slice(0, 1)` of that ranking
+          // routinely returned a lifestyle catalog ALT — or a UGC post — and
+          // no catalog image was guaranteed to reach the Director.
+          // preferFirstCatalogImage pins the catalog's FIRST image at index 0
+          // before the trim, via a cascade that can only ever select
+          // role==='catalog' media: imageRole==='hero' (the stamp
+          // catalogProductDetectService writes on CatalogProduct.imageUrl),
+          // else the earliest-createdAt catalog entry, else nothing. Tier 2
+          // is what closes the hole — when the stamp is missing the old
+          // tier-1-only rule fell back to the shotType ranking over that
+          // merged pool, which is exactly how a UGC post became the default.
+          //
+          // The !operatorPickedMedia term is redundant with the service-side
+          // gate (restrictToMediaIds returns before the promotion runs) and is
+          // kept anyway so the override reads at the CALL SITE: an operator
+          // multi-select is the "unless the user overrides it" half of the
+          // rule, and it still widens the window via
+          // universeTopN = Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
+          // rather than being re-ordered or truncated to 1.
+          //
+          // Image-only: the deterministic video rail runs the SAME cascade
+          // directly against Mongo (imageRole==='hero' → earliest createdAt →
+          // lazy materialize, `:2085`) and builds its own reference stack, so
+          // it never needs this. A mixed image+video concept run does opt in —
+          // a burned-text catalog image is still promoted there, which is the
+          // intended precedence (owner rule over the wantsVideo burned-text
+          // tiebreak).
+          preferFirstCatalogImage: !operatorPickedMedia && resolvedKinds.includes('image')
         });
       const filtered = filterUniverseForProduct(productId, universe);
       if (!filtered.length) {

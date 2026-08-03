@@ -799,20 +799,36 @@ function pickProductOnlyUrl(catalogMedias, product) {
 // seed-only) per brand/product via videoSettings.referenceImageCount.
 const DEFAULT_REFERENCE_IMAGE_COUNT = 3;
 const MAX_REFERENCE_IMAGE_COUNT     = 7;
-// Owner constraint (hallucination at high ref counts): with the primary
-// repeat, the intended stack is 3 distinct + primary again = 4 total.
-// Never raise past this when REPEAT_PRIMARY_REFERENCE is on.
+// Ceiling that applies ONLY when the (now default-off) primary repeat is
+// explicitly switched back on: 3 distinct + primary again = 4 total. Owner
+// constraint from the high-ref-count hallucination finding — never raise past
+// this while REPEAT_PRIMARY_REFERENCE is on. With the flag off (the default)
+// this cap is not consulted; the stack is simply the first `effectiveMax`
+// distinct views (3 by default).
 const REPEAT_PRIMARY_TOTAL_CAP = 4;
+// Hard ceiling on DISTINCT references when the primary repeat is OFF (the
+// default since 2026-08-03). Owner-set to 5 on 2026-08-03. Without it that
+// branch was unclamped up to MAX_REFERENCE_IMAGE_COUNT (7), which contradicted
+// the owner's measured "too many images hallucinated" finding.
+const MAX_DISTINCT_REFERENCES = 5;
 
 /**
- * REPEAT_PRIMARY_REFERENCE env flag (default true).
+ * REPEAT_PRIMARY_REFERENCE env flag (DEFAULT FALSE since 2026-08-03).
  * When on, buildReferenceImages appends the primary (position 0) URL again
  * as the final reference so the model's closing beat returns to the front
- * view by construction. Offline harnesses flip this via process.env.
+ * view by construction.
+ *
+ * The owner rolled this off as the default: the repeated primary INCREASED
+ * hallucination and the pre-repeat output was better. The capability is kept
+ * (not deleted) so it stays available for a future A/B — an explicit truthy
+ * value still turns it on. An unset or empty env yields FALSE.
+ * `config/defaults.env` also sets it to false, so both the code default and
+ * the dotenv-loaded production default agree. Offline harnesses flip this via
+ * process.env.
  */
 function isRepeatPrimaryReferenceEnabled() {
   const raw = process.env.REPEAT_PRIMARY_REFERENCE;
-  if (raw == null || raw === '') return true;
+  if (raw == null || raw === '') return false;
   return !/^(0|false|no|off)$/i.test(String(raw).trim());
 }
 
@@ -837,21 +853,39 @@ function appendPrimaryReferenceRepeat(urls, opts = {}) {
 }
 
 /**
- * Pure: compute stack budget when primary-repeat is on.
- * Distinct views fill first; one slot is left for the primary repeat when
- * possible. Caps total at REPEAT_PRIMARY_TOTAL_CAP (3 distinct + primary).
- * Bumps a default-3 request so the closing slot fits without dropping a view.
+ * Pure: compute the reference-stack budget.
+ *
+ * repeatEnabled false — THE DEFAULT since 2026-08-03: no slot is reserved and
+ * no duplicate is appended, so distinctCap === totalCap === min(effectiveMax,
+ * modelMax). A default request (effectiveMax 3, modelMax 7) therefore ships
+ * exactly the first three distinct images.
+ *
+ * repeatEnabled true — opt-in only: distinct views fill first, one slot is
+ * left for the primary repeat when possible, and the total is capped at
+ * REPEAT_PRIMARY_TOTAL_CAP (3 distinct + primary). A default-3 request is
+ * bumped so the closing slot fits without dropping a view.
  *
  * @returns {{ distinctCap: number, totalCap: number }}
  */
 function referenceStackBudget({ effectiveMax, modelMax, repeatEnabled }) {
   const model = Number.isFinite(modelMax) && modelMax >= 1 ? modelMax : MAX_REFERENCE_IMAGE_COUNT;
   const eff = Number.isFinite(effectiveMax) && effectiveMax >= 1 ? effectiveMax : DEFAULT_REFERENCE_IMAGE_COUNT;
+  // DEFAULT PATH (flag off since 2026-08-03): no reserved slot, no duplicate —
+  // just the first `eff` distinct views, so a default request ships 3 refs.
+  //
+  // MAX_DISTINCT_REFERENCES is a HARD CEILING and it is load-bearing. Turning the
+  // primary repeat off removed the only clamp on this branch (the repeat path
+  // caps at REPEAT_PRIMARY_TOTAL_CAP), so `videoSettings.referenceImageCount=7`
+  // or an operator ordering 7 seeds in the wizard rail would have sent all seven
+  // — against the owner's measured finding that "with too many images it was
+  // hallucinating". Owner set the ceiling at FIVE on 2026-08-03. Found by
+  // adversarial review of this very change, not by writing it.
   if (!repeatEnabled) {
-    const cap = Math.min(eff, model);
+    const cap = Math.min(eff, model, MAX_DISTINCT_REFERENCES);
     return { distinctCap: cap, totalCap: cap };
   }
-  // Owner: 3 distinct + repeated primary = 4. More refs hallucinated.
+  // OPT-IN PATH ONLY (flag explicitly on). Older owner constraint for that
+  // path: 3 distinct + repeated primary = 4; more refs hallucinated.
   const totalCap = Math.min(
     Math.max(eff, Math.min(DEFAULT_REFERENCE_IMAGE_COUNT + 1, REPEAT_PRIMARY_TOTAL_CAP)),
     model,
@@ -1979,12 +2013,15 @@ async function buildReferenceImages({
   // it ignore the images I selected?" surprise. Still bounded by the model's own
   // maxReferenceImages, which is a hard API limit we cannot exceed.
   //
-  // When REPEAT_PRIMARY_REFERENCE is on, owner constraint caps the stack at 4
-  // (3 distinct + primary again) — more refs hallucinated in pilot. Distinct
-  // views fill first; the primary is appended AFTER final-URL dedupe so the
-  // deliberate duplicate is kept (seenMediaIds/seenUrls and seenFinal would
-  // drop a naive in-loop repeat). Never evict a real view to make room for
-  // the duplicate — only append when length < totalCap.
+  // REPEAT_PRIMARY_REFERENCE is OFF by default (owner 2026-08-03: repeating the
+  // primary increased hallucination). With it off the stack is just the first
+  // `effectiveMax` distinct views — 3 on a default request — and nothing is
+  // appended. When an operator explicitly switches it back on for an A/B, the
+  // owner's older constraint applies: cap the stack at 4 (3 distinct + primary
+  // again), distinct views fill first, and the primary is appended AFTER
+  // final-URL dedupe so the deliberate duplicate is kept (seenMediaIds/seenUrls
+  // and seenFinal would drop a naive in-loop repeat). Never evict a real view
+  // to make room for the duplicate — only append when length < totalCap.
   const modelMax = caps?.maxReferenceImages || MAX_REFERENCE_IMAGE_COUNT;
   const effectiveMax = usedOrdered
     ? Math.min(ids.length, modelMax)
@@ -3003,6 +3040,7 @@ module.exports = {
   DEFAULT_REFERENCE_IMAGE_COUNT,
   MAX_REFERENCE_IMAGE_COUNT,
   REPEAT_PRIMARY_TOTAL_CAP,
+  MAX_DISTINCT_REFERENCES,
   capsFor,
   resolveVideoModel,
   resolveModelAndAspect,

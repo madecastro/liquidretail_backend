@@ -20,6 +20,27 @@
 //   3. platformStats.engagement  — likes + comments signal (UGC only)
 //   4. createdAt desc            — recency
 //
+// THE DEFAULT IMAGE SEED IS NOT THE RANKING. Owner rule, 2026-08-03,
+// verbatim: "I actually just want to use the first image that comes from
+// the catalog not the 'hero' image since that may also come from social
+// media or UGC?" So the default seed for a catalog image gen is THE FIRST
+// IMAGE THAT CAME FROM THE CATALOG, and it can never resolve to a UGC
+// post. Read the tiebreak list above literally — imageRole='hero' is key
+// #2 *within* a shot-type tier, so a catalog lifestyle ALT (or a UGC
+// lifestyle post) outranks a product_only catalog image outright.
+// Trimming to DIRECTOR_UNIVERSE_TOP_N=1 therefore does not even
+// guarantee a catalog image; it yields the best lifestyle candidate,
+// which is how a UGC post reached a catalog product ad.
+// `opts.preferFirstCatalogImage` (default FALSE, so no existing caller
+// changes) is what implements the rule: promoteFirstCatalogImage() hoists
+// the first CATALOG-SOURCED entry to index 0 AFTER ranking and BEFORE the
+// top-N trim, via a cascade — role==='catalog' + imageRole==='hero' (the
+// catalog feed's first image), else the earliest-createdAt catalog entry,
+// else nothing. It is deliberately skipped for operator picks
+// (restrictToMediaIds IS the override) and for brand-only runs (every
+// SKU's catalog media is pooled, so "the catalog's first image" is
+// undefined).
+//
 // UGC tier 2 (product_category) and tier 3 (brand_match) are still
 // opt-in via `includeCategoryMatched` / `includeBrandMatched` flags,
 // and still have their cross-product guards (tier 2 drops different-SKU
@@ -96,6 +117,121 @@ function rankMergedPool(entries, { wantsVideo = false } = {}) {
     const bt = b.media.createdAt ? new Date(b.media.createdAt).getTime() : 0;
     return bt - at;
   });
+}
+
+// Hoist THE FIRST IMAGE THAT CAME FROM THE CATALOG to the front of an
+// already-ranked pool. PURE: returns a NEW array, never mutates the input.
+//
+// Owner rule, 2026-08-03, verbatim: "I actually just want to use the first
+// image that comes from the catalog not the 'hero' image since that may also
+// come from social media or UGC?"
+//
+// THE CASCADE — first tier that matches wins, and EVERY tier can only ever
+// select an entry whose role is 'catalog':
+//   TIER 1  the first entry with role === 'catalog' AND
+//           media.metadata.imageRole === 'hero'. That stamp is written in
+//           exactly one place: catalogProductDetectService materialises
+//           CatalogProduct.imageUrl — the catalog feed's FIRST image — with
+//           imageRole:'hero' (`:60`), and additionalImages[] with 'alt'
+//           (`:80`, `:513`). So tier 1 IS "the first image from the catalog",
+//           wearing a legacy name.
+//   TIER 2  else, among role === 'catalog' entries, the one with the EARLIEST
+//           media.createdAt. Catalog Media rows are materialised in feed
+//           order, so earliest ≈ first. Ties — equal timestamps, or none
+//           usable — resolve to the earlier entry in the incoming RANKED
+//           order, so the outcome is deterministic and the ranker still
+//           breaks the tie. An entry with a missing / unparseable createdAt
+//           sorts LAST, never first: a legacy row with no timestamp must not
+//           win "earliest" by defaulting to epoch 0.
+//   TIER 3  else there is no catalog entry in the pool at all → an unchanged
+//           copy. There is nothing from the catalog to pin.
+//
+// WHY TIER 2 EXISTS — this is the point of the rule, not a nicety. The pool
+// this runs on is a SINGLE merged pool of catalog media AND product_match UGC
+// (rankMergedPool deliberately does not let source gate order, so a UGC
+// lifestyle post ranks equal to a catalog lifestyle shot). Tier 1 on its own
+// is not enough because the imageRole stamp can be ABSENT — hero
+// materialisation failed, or the row predates the stamp. A tier-1-only helper
+// returned the pool unchanged in that case, and the shotType ranking then
+// decided index 0 out of that merged pool — which is exactly how a UGC post
+// became the default seed of a catalog product ad. The FALLTHROUGH is the
+// failure mode; tier 2 removes it, so an UNSTAMPED catalog set still beats
+// UGC.
+//
+// The `entry.role === 'catalog'` test is LOAD-BEARING IN EVERY TIER, not
+// defensive. It is what makes "can never resolve to UGC" true rather than
+// hopeful: metadata.imageRole lives on UGC docs too (we do not author
+// creator-side metadata and do not control what it says), so a creator post
+// stamped imageRole='hero' must still lose tier 1 to an unstamped catalog
+// image via tier 2, and must never be selectable by tier 2 either.
+//
+// Stable: every non-promoted entry keeps its relative order, so the
+// shotType ranking still decides positions 1..n (which matter as soon as
+// DIRECTOR_UNIVERSE_TOP_N is raised above 1).
+//
+// MIRRORS the proven cascade on the deterministic VIDEO seed path,
+// campaignAdsGenerationService.js:2085 ("Feed-order hero: imageRole hero →
+// earliest createdAt → lazy materialize") — same tier 1, same tier 2. That
+// rail's third step lazily materialises Media from CatalogProduct.imageUrl,
+// which is a DB write and cannot live in a pure ranking helper; here tier 3
+// is "leave the pool alone".
+function promoteFirstCatalogImage(rankedEntries) {
+  if (!Array.isArray(rankedEntries)) return [];
+  if (rankedEntries.length < 2) return rankedEntries.slice();
+
+  // The only membership test in this function. Nothing that fails this can be
+  // selected by any tier.
+  //
+  // role==='catalog' means source==='catalog-product' — which is NOT the same as
+  // "is an image". Catalog VIDEOS live under that same source: shopifyPublic-
+  // IngestService upserts { source:'catalog-product', fileType:'video',
+  // metadata:{ imageRole:'video', catalogProductId } } (:513-546), and the pool
+  // query applies no fileType filter. Tier 1 was safe by accident (it demands
+  // imageRole==='hero'), but tier 2 selects on createdAt alone, so a product
+  // whose images are unstamped and whose catalog carries a video could hand a
+  // VIDEO to a STATIC image generation as "the first catalog image".
+  //
+  // Excluding an EXPLICIT video rather than requiring fileType==='image' is
+  // deliberate: a legacy row with a null/absent fileType must still satisfy
+  // tier 2, because the alternative is falling through to tier 3, where the
+  // shotType ranking can hand index 0 to a UGC post — the exact bug this
+  // function exists to prevent. Both signals are checked because either one
+  // alone identifies a video in the data we actually have.
+  const isCatalog = (e) =>
+    !!e
+    && e.role === 'catalog'
+    && e.media?.fileType !== 'video'
+    && e.media?.metadata?.imageRole !== 'video';
+  // Missing / unparseable createdAt sorts LAST (Infinity), never first.
+  const createdAtOf = (e) => {
+    const t = e.media?.createdAt ? new Date(e.media.createdAt).getTime() : NaN;
+    return Number.isFinite(t) ? t : Infinity;
+  };
+
+  // TIER 1 — the catalog feed's first image, as stamped at materialisation.
+  let idx = rankedEntries.findIndex(
+    (e) => isCatalog(e) && e.media?.metadata?.imageRole === 'hero'
+  );
+
+  // TIER 2 — no stamp anywhere in the catalog set: earliest createdAt wins.
+  // Strict `<` means an equal timestamp never displaces the incumbent, so the
+  // earlier entry in ranked order keeps index 0.
+  if (idx < 0) {
+    let best = Infinity;
+    for (let i = 0; i < rankedEntries.length; i++) {
+      if (!isCatalog(rankedEntries[i])) continue;
+      const t = createdAtOf(rankedEntries[i]);
+      if (idx < 0 || t < best) { idx = i; best = t; }
+    }
+  }
+
+  // TIER 3 (idx === -1) — no catalog entry at all. Also covers "already
+  // first" (idx === 0), where there is nothing to move.
+  if (idx <= 0) return rankedEntries.slice();
+  const out = rankedEntries.slice();
+  const [firstCatalogImage] = out.splice(idx, 1);
+  out.unshift(firstCatalogImage);
+  return out;
 }
 
 function toObjectId(id) {
@@ -191,6 +327,14 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
   const restrictToMediaIds = Array.isArray(opts.restrictToMediaIds) && opts.restrictToMediaIds.length
     ? opts.restrictToMediaIds.map(String)
     : null;
+  // preferFirstCatalogImage — opt-in implementation of the owner's
+  // default-image-seed rule, "the first image that came from the catalog"
+  // (see the file header). DEFAULT FALSE on purpose: every caller that does
+  // not ask for it gets byte-identical behaviour to before this option
+  // existed, so the diagnostic script and any future caller are unaffected.
+  // Only the concept-driven IMAGE path opts in
+  // (campaignAdsGenerationService.runConceptDrivenExpansion).
+  const preferFirstCatalogImage = opts.preferFirstCatalogImage === true;
 
   const counts = {
     catalog: 0,
@@ -207,6 +351,11 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
   // 'ugc_brand_match' as a safe default — the exact UGC tier only
   // matters for downstream match-tier accounting, not for the
   // Director's picks).
+  //
+  // This branch deliberately never applies preferFirstCatalogImage. An
+  // explicit pick list IS the "unless the user overrides it" half of the
+  // owner rule; hoisting our idea of the catalog's first image to the front
+  // would override the override.
   if (restrictToMediaIds) {
     const oids = restrictToMediaIds
       .map(id => toObjectId(id))
@@ -348,7 +497,55 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
   });
 
   // ── Rank the merged pool by shotType, then project ─────────────
-  const ranked = rankMergedPool(pool, { wantsVideo });
+  let ranked = rankMergedPool(pool, { wantsVideo });
+
+  // Default image seed = the first image that came from the catalog (owner
+  // rule — see the file header and promoteFirstCatalogImage's cascade).
+  // Applied HERE, on the ranked wrappers, because:
+  //   • it must land before projectEntry() — the cascade tests entry.role,
+  //     media.metadata.imageRole and media.createdAt, and projectEntry
+  //     flattens the first two into a Director-facing shape and drops the
+  //     third entirely;
+  //   • it must land before `.slice(0, topN)` below — with topN=1 the slice
+  //     IS the whole decision, so a promotion after it does nothing;
+  //   • it must NOT live inside rankMergedPool, which is also called by the
+  //     operator-picked branch above (that branch is the override and
+  //     returns before reaching this line);
+  //   • !isBrandOnly is a required gate, not a nicety: brand mode pools the
+  //     catalog media of EVERY product for the brand, so many docs are some
+  //     SKU's first catalog image and "the catalog's first image" has no
+  //     meaning — promoting whichever came back first would silently pick a
+  //     SKU.
+  //
+  // A catalog image with burned-in text is still promoted, including on
+  // wantsVideo runs where rankMergedPool penalizes burned text: the owner
+  // rule outranks that tiebreak. Trade-off is deliberate and pinned by
+  // scripts/verifySeededUniverseHeroDefault.js.
+  if (preferFirstCatalogImage && !isBrandOnly) {
+    const promoted = promoteFirstCatalogImage(ranked);
+    const head = promoted[0] || null;
+    // Post-cascade, head is role==='catalog' whenever the pool held ANY
+    // catalog entry (tier 2 is exhaustive over them), so this doubles as the
+    // tier-3 detector.
+    const headIsCatalog = !!head && head.role === 'catalog';
+    if (headIsCatalog && head !== ranked[0]) {
+      const tier = head.media?.metadata?.imageRole === 'hero'
+        ? "tier 1 (imageRole='hero')"
+        : 'tier 2 (earliest catalog createdAt)';
+      console.log(
+        `🎯 seeded universe — first catalog image ${String(head.media._id)} promoted to index 0 ` +
+        `from rank ${ranked.indexOf(head)} of ${ranked.length} via ${tier} ` +
+        `(product ${productId}, topN=${topN}): shotType ranking had it below another candidate`
+      );
+    } else if (!headIsCatalog && ranked.length) {
+      console.log(
+        `🎯 seeded universe — preferFirstCatalogImage requested but no catalog entry in the pool ` +
+        `for product ${productId} (pool=${ranked.length}) — keeping shotType rank`
+      );
+    }
+    ranked = promoted;
+  }
+
   const universe = ranked.map(x => projectEntry(x.media, x.role));
 
   const trimmed = universe.slice(0, topN);
@@ -362,5 +559,6 @@ module.exports = {
   computeSeedUniverseHash,
   // Exposed for testing / reuse by adjacent services.
   rankMergedPool,
+  promoteFirstCatalogImage,
   isContentNatureEligible
 };

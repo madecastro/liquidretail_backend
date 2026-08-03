@@ -602,7 +602,16 @@ async function renderDirectImage({
       // and are what an operator reads in the inspector when asking "why is this
       // photo in my ad" — calling a Director pick an "operator-pick" sends that
       // question to the wrong place entirely.
-      const prefix = referenceSource === 'director' ? 'director-pick' : 'operator-pick';
+      // Derive the label from the source instead of a two-way ternary. The old
+      // `=== 'director' ? … : 'operator-pick'` collapsed EVERY non-director
+      // source onto "operator-pick", so a system-derived seed (regenerate's
+      // catalog-first reseed, referenceSource 'catalog-first') was reported to
+      // the operator as their own pick — exactly the misattribution the comment
+      // above warns about, just in the other direction. Unknown sources now
+      // label themselves rather than borrowing someone else's name.
+      const prefix = referenceSource === 'director' ? 'director-pick'
+        : referenceSource === 'operator' ? 'operator-pick'
+        : `${referenceSource}-pick`;
       if (doc?.fileUrl) refCandidates.push({ sourceUrl: doc.fileUrl, role: i === 0 ? prefix : `${prefix}-${i}` });
     });
     if (refCandidates.length < orderedIds.length) {

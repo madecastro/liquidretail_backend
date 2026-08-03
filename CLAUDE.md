@@ -8,9 +8,11 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 **Read `session.md` for live state. Read `ARCHITECTURE_REVIEW.md` before touching
 security, money, or the render queue** — it carries verified P0s with `path:line`.
 
-Live prod (2026-08-03) = `13cf679` (both services). Offline verify suite = **29
-scripts, all green** (includes `verifyRunFeed.js`). Claims written against
-pre-deploy binaries are suspect.
+Live prod (2026-08-03) = `13cf679` (both services). Offline verify suite = **42
+scripts, all green** (re-run 2026-08-03 with
+`for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
+no aggregate runner and no `npm test`). Claims written against pre-deploy
+binaries are suspect.
 
 ---
 
@@ -296,6 +298,27 @@ Video never launches a browser.
   (e.g. tree emblem reading as Timberland on an Allbirds shoe). Prompts already
   ask for fidelity — fix is measure-and-reject, not prompt tuning. Video path
   not QC'd on this.
+- **Static geometry — two defects FIXED 2026-08-03; read the diagnostic before
+  re-opening.** (A) `staticAdIntents.computeSurface` combined the post-generation
+  crop band with the 6% edge margin via `Math.max`, so on every *cropped* surface
+  the margin collapsed to zero and the safe box handed to the image model *was*
+  the crop line. Proof needing no model compliance: the composited logomark
+  shipped **flush to the delivered frame edge** on Stories and 4:5 — inspectable
+  in any ad delivered before the fix. (B) `GEN_SIZES` was stale (three sizes;
+  the live schema enum has 14), so 9:16 generated at `1024x1536` and lost 80px per
+  side. All live static surfaces now generate at their exact delivery aspect —
+  zero crop. Pinned by `scripts/verifyStaticSafeBox.js`.
+  **DIAGNOSTIC, and it matters:** `meta_feed_1_1` was immune to *both* defects
+  (zero crop, full 61px margin) and it is the **default** surface
+  (`directImageRenderService.js:508,516`). So truncated copy on a **square** ad is
+  *not* this bug class — it is the model disregarding the percentage box. Use the
+  surface signature to split geometry from model non-compliance before re-opening
+  size work.
+  **Non-enum sizes need a live probe, not the schema prose.** The schema's
+  "arbitrary resolutions divisible by 16" clause is spliced from OpenAI's docs and
+  carries an unpublished pixel/edge-limit caveat. `1088x1360` (4:5) is in use only
+  because it was probed; the risk being guarded is silent coercion to the
+  `1024x1024` default, which would square a 4:5 surface and then crop it.
 - **`queued` ads never auto-drain** — still require an explicit `/runs` (or
   equivalent) claim.
 - **`veoPredictionId` is a spend receipt that is never resumed** — process
@@ -372,15 +395,53 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `{ok:false,error:…}` on logical failure; checking only `res.ok` reports
   success while nothing delivered (`alertService.js:220-222`). Worker boot:
   `🔔 alerts: Slack configured`.
-- **`DIRECTOR_UNIVERSE_TOP_N` default is 1** (`config/defaults.env:30`,
-  `campaignAdsGenerationService.js:184`). Ceiling stays 10
+- **`DIRECTOR_UNIVERSE_TOP_N` default is 1** (`config/defaults.env:35`,
+  `campaignAdsGenerationService.js:195`). Ceiling stays 10
   (`seededUniverseService` `DEFAULT_TOP_N`); multi-image remains wired;
   operator multi-select widens via `Math.max(mediaIds.length, TOP_N)`
-  (`campaignAdsGenerationService.js:2332-2333`). Side effects of universe 1:
+  (`campaignAdsGenerationService.js:2343-2345`). Side effects of universe 1:
   judge `media_utilization` is N/A (`aiJudgeService.js:423-430`); output-shape
   menu narrows to `static_single` only
   (`aiCreativeDirectorService.js:feedOutputShapesForUniverse` `:1050-1055`) so
   the model cannot emit a collage declaring one tile.
+- **`TOP_N=1` IS NOT THE DEFAULT-IMAGE-SEED RULE — `preferFirstCatalogImage`
+  is, and the rule is "the FIRST IMAGE THAT CAME FROM THE CATALOG", not the
+  `imageRole:'hero'` label.** This file, `config/defaults.env`,
+  `docs/PIPELINES.md` and two code comments all called TOP_N=1 the "Hero-image
+  default" for a day. It never was. `buildSeededUniverse`'s auto-assembly
+  branch merges catalog media **and** `product_match` UGC into ONE pool and
+  ranks it by `classification.shotType` first (`seededUniverseService.js:96` →
+  `shotTypeRank.js:15-23`: lifestyle → on_model → flat_lay → product_only →
+  detail → packaging → unknown); `metadata.imageRole === 'hero'` is only a
+  **within-tier tiebreak**, key #2 of 4. So TOP_N=1 trims a shotType-ranked pool
+  to one entry and that entry was routinely a lifestyle catalog **ALT** or a
+  **UGC post**. Owner, verbatim 2026-08-03: *"I actually just want to use the
+  first image that comes from the catalog not the 'hero' image since that may
+  also come from social media or UGC?"* Implemented by the opt-in
+  `opts.preferFirstCatalogImage` → `promoteFirstCatalogImage`
+  (`seededUniverseService.js:178`, applied `:504`) — a pure, non-mutating
+  **CASCADE** applied to the ranked wrappers before `projectEntry()` and before
+  the top-N trim. **Every tier is gated on `role === 'catalog'`, so it can never
+  resolve to UGC:** (1) first `role==='catalog'` + `imageRole==='hero'` entry —
+  that stamp is written only by `catalogProductDetectService:60` off
+  `CatalogProduct.imageUrl`, i.e. the feed's first image (`:80`/`:513` write
+  `'alt'`; the only other writer is `shopifyPublicIngestService.js:526`, which
+  writes `'video'`); (2) else the **earliest-`createdAt` `role==='catalog'`
+  entry** — this tier is the fix: the stamp can be **absent** (materialisation
+  failed, legacy row), and a tier-1-only rule then fell through to the shotType
+  ranking over that merged pool, which is exactly how a UGC post became the
+  default; (3) else no promotion. Tier-2 ties use a strict `<` so the earlier
+  entry in ranked order keeps index 0, and a missing/unparseable `createdAt`
+  maps to `Infinity` (sorts last, never wins "earliest"). Deliberately mirrors
+  the video rail's cascade at `campaignAdsGenerationService.js:2085`. Passed
+  only for image runs with no operator picks
+  (`campaignAdsGenerationService.js:2388`). Deliberately **not** applied in the
+  `restrictToMediaIds` branch (operator picks ARE the override) or in brand-only
+  mode (every SKU's catalog media is pooled, so "the catalog's first image" is
+  undefined). `scripts/verifySeededUniverseHeroDefault.js` (111 checks) pins all
+  of it, including that the promotion is **not** folded into the shared
+  `rankMergedPool` — that would silently re-order operator picks. Details:
+  `docs/PIPELINES.md` §5 *Seed selection — image vs video*.
 - **Customer quotes: `llm-web` is PRINTABLE; attribution is stripped.**
   Prior denylist / "llm-web never prints" claims were **false**.
   `services/providers/geminiSearchProvider.js:254,399` use
@@ -419,7 +480,7 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**40 scripts** as of 2026-08-03). Add a
+  relevant `scripts/verify*.js` harness (**42 scripts** as of 2026-08-03). Add a
   harness for money/security-critical logic, and **revert-prove it** — back the
   fix out and confirm the test fails. A test that cannot fail is not a test.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the

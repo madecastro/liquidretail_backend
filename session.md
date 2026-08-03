@@ -5,6 +5,68 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-03 — OWNER DECISIONS IN FLIGHT. Read this before the next-session prompt below.
+
+Four owner decisions landed in one session. Nothing is committed; the tree is on `main`, so a
+feature branch is required before any commit. **Verify each item against the diff — several of
+these reverse advice written earlier in this same file.**
+
+1. **Static seed default = THE FIRST IMAGE THAT CAME FROM THE CATALOG.** Not the `imageRole`
+   `'hero'` label. Owner: *"I actually just want to use the first image that comes from the
+   catalog not the 'hero' image since that may also come from social media or UGC?"* The label
+   itself is never stamped on UGC (only `catalogProductDetectService.js:60` writes it, from
+   `CatalogProduct.imageUrl`) — but it can be **absent**, and the old predicate then fell through
+   to the shotType ranking, whose pool merges catalog with `product_match` UGC, so the default
+   could be a UGC post. Implemented as `preferFirstCatalogImage` + `promoteFirstCatalogImage`
+   cascade: hero stamp → earliest-`createdAt` catalog entry → nothing. Mirrors the proven
+   cascade at `campaignAdsGenerationService.js:2085`.
+
+2. **VIDEO: the whole of PR #61's prompt work is ROLLED BACK.** All three parts — Scene 3
+   return-to-primary, the crossfade/long-dissolve policy, AND `subjectContinuity`. Owner:
+   *"This is creating additional hallucinations and the previous output was better."* Acceptance
+   test is mechanical: the prompt built from `services/veoPromptBuilder.js` must be
+   **byte-identical** to the prompt built from `134db56~1`. Only intentional differences are the
+   `OMNI_DIRECTIVES`/`GROK_DIRECTIVES` module exports (harness plumbing) and comments.
+   **The restored old prompt is self-contradictory on purpose** — `transitions` permits ~0.25s
+   crossfades while `doNot` bans "dissolves". Owner-confirmed: that contradictory prompt is the
+   version that produced better output. DO NOT "repair" it.
+
+3. **VIDEO: primary-ref repeat is OFF by default.** Both the code default
+   (`isRepeatPrimaryReferenceEnabled`) and `config/defaults.env`. Default stack = the first
+   **three distinct** references, nothing appended. Capability kept reachable via
+   `REPEAT_PRIMARY_REFERENCE=true` for a future A/B; `REPEAT_PRIMARY_TOTAL_CAP` (=4) is now inert.
+   ⚠️ **`index.js:4` — "dotenv never overrides an already-set var."** If the Render dashboard
+   defines `REPEAT_PRIMARY_REFERENCE`, the committed `false` is IGNORED in prod. Same trap for
+   `DIRECTOR_UNIVERSE_TOP_N` and `AI_CONCEPT_DRIVEN`. **Check all three on BOTH the web and
+   worker services before trusting any of this in production.**
+
+4. **UGC ads must not be affected — "we haven't optimized that path yet" (owner).** Concretely:
+   - brand-only runs (`isBrandOnly`) → promotion skipped, UGC can still win index 0. Unaffected.
+   - operator-picked media (`restrictToMediaIds`) → promotion never applied. Unaffected.
+   - product mode, no picks → seed is now always catalog, so the ad is `product_image` where it
+     could previously have been `ugc`. **Deliberate** — this is the same UGC-as-default worry as
+     item 1.
+   **HARD REQUIREMENT for the not-yet-built regenerate change: gate on
+   `variantKind === 'product_image'`.** A `variantKind:'ugc'` ad is *supposed* to seed from a
+   social image; re-deriving it to a catalog image would break it by design.
+
+**NOT YET BUILT — "trim on regenerate" (owner-approved).** `adRegenerateService.js:257-263`
+replays the stored stack (operator `referenceMediaIds` → else `mediaIds`) and never re-derives,
+so ads queued under the old `TOP_N=10` send 3+ refs on regenerate forever. Owner chose to fix it.
+**It must RE-DERIVE via the catalog-first cascade, NOT trim to `mediaIds[0]`** — those historical
+stacks were shotType-ranked, which puts **lifestyle first**, so `mediaIds[0]` is often a UGC post
+and trimming would lock UGC in. Preserve the operator override (`referenceMediaIds` still wins).
+
+**Reference count is COST-NEUTRAL** (measured, not assumed): flat price per submit, no
+`images.length` multiplier (`atlasImageService.js:75-104`). What multiplies spend is the Meta
+static SIZE fan-out (3 surfaces = 3 submits). So all of the above is quality, not spend.
+
+**Grok CLI headless CAN read files** — `-p --always-approve --sandbox read-only` executes read
+tools (verified on 0.2.117). §0.29996's claim that it never executes tool calls is WRONG; that
+was `--permission-mode acceptEdits`. Writes from headless remain unproven — use subagents to edit.
+
+---
+
 ## Next-session prompt
 
 **START HERE — 2026-08-05 pickup.** The 2026-08-04 session rewrote this block because three
@@ -1109,6 +1171,95 @@ so that credential is in the 2026-08-03 transcript and is worth rotating.
 
 ---
 
+### 0.31 STATIC IMAGE GEOMETRY — two defects, both fixed, suite 42/42 (2026-08-03)
+
+Owner report: *"images are getting cropped after generation … truncated CTAs and
+cropped words."* Correct, and it was **two independent defects**. The owner's other
+question — does the path fire a separate `gpt-image-2` call per size — is **yes**,
+that part was always working (`META_STATIC_FANOUT` = 3 billable submits).
+
+**Defect A — the edge margin was discarded on every cropped surface.**
+`computeSurface` did `Math.max(cropBand, marginPx)`, treating the post-generation
+crop band and our 6% margin as ALTERNATIVES rather than additive. marginPx was
+61.44px and the crop band was always larger (128px on 4:5, 80px on 9:16), so the
+margin collapsed to **zero** and the safe box handed to the model *was* the crop
+line. The live path emitted, verbatim: *"The top and bottom 128px of what you
+generate WILL BE CUT AWAY and never seen. EVERY element … must sit inside the box
+from 6% to 94% of width and 8.3% to 91.7% of height"* — and 8.3% of 1536 is
+127.5px.
+**The proof needs no billable call and no model compliance:** the logomark is
+composited by *us* from that same box. Measured pre-fix, delivered insets were
+`4:5 top/bottom = -1/-1` and `Stories left/right = 0/0`, so the brand's logomark
+shipped **flush to the delivered frame edge, 0px gap, for any logo size**. Same
+defect class the `logoPlacementFor` docstring already claims to have fixed,
+reached by different arithmetic. Inspectable in every 4:5 / Stories ad delivered
+before today.
+A coupled twin, also fixed: `pct()`'s `toFixed(1)` rounded half-up, and since
+`right = 100 - left` the pair always rounded the *same* way, outward into the
+destroyed band. Correct guard is **ceil low edge, floor high edge** (an earlier
+draft of this note had it backwards).
+
+**Defect B — the size table was stale.** `GEN_SIZES` held three sizes under the
+comment *"The only sizes the edit endpoint accepts. Verified live, not assumed."*
+False for this model: the live schema enum has **14**. Added `1152x2048` (enum
+member, exactly 9:16) and `1088x1360` (exactly 4:5). **All four live static
+surfaces now generate at their exact delivery aspect — zero crop**, and 9:16 went
+from a 1.25× upscale to a 0.9375× downscale, so typeset glyphs got sharper too.
+Frozen `pmax_16_9` still crops 80px (its exact-16:9 enum member `2048x1152` was
+deliberately NOT added — unrequested cost change on a path nobody generates to).
+
+**`1088x1360` is NOT an enum member — it was PROBED, owner-approved.** One submit,
+~$0.01: asked `1088x1360`, returned exactly `1088x1360`, aspect 0.800000,
+prediction `65d1931505bc4620bcf0d7efcdd7aff9`. Necessary because the schema's
+"arbitrary resolutions divisible by 16" clause is spliced from OpenAI's own docs
+and carries an unpublished *"must also satisfy the model's current pixel and edge
+limits"*. The risk was never a 400 — it was a **silent coercion to the
+`1024x1024` default**, which would hand a square frame to a 4:5 surface and then
+centre-crop it. `verifyStaticSafeBox.js` S4 now requires any non-enum size to cite
+its probe. **NOTE: this probe was run outside the app, so it is NOT in `CostLog`** —
+reconcile ~$0.01 manually.
+
+**COST RATIOS — an earlier in-session claim of mine was WRONG.** I compared only
+the `(2e6 + W×H)/4e6` term and dropped `round(base × short/long)`, which moves the
+other way. Corrected, asymptotic and base-independent: 9:16 → `1152x2048` is
+**~1.03×** (not the "+50%" a pixel count suggests), and exact-4:5 is **~1.11×**,
+i.e. *more* expensive, not cheaper as I first said. Absolute dollars are not
+derivable — Atlas never publishes `base`. Reported spend does not move: the ledger
+books the flat catalog `$0.01`, already noted as ~6× understated on this model.
+
+**THE DIAGNOSTIC THAT MATTERS FOR THE NEXT REPORT.** `meta_feed_1_1` was immune to
+both defects — zero crop, full 61px margin, logo gaps 65/65 — and it is the
+**default** surface (`directImageRenderService.js:508,516`). So truncated copy on a
+**square** ad is *not* this bug class; it is the model disregarding the percentage
+box. Split on surface signature before re-opening size work.
+
+**Harness: `scripts/verifyStaticSafeBox.js`, 329 checks, revert-proven SIX ways.**
+Worth recording why it needed a second pass: the first version passed 170/170
+while Defect A was backed out. The inward rounding *masks* the margin collapse —
+with the margin swallowed, `ceil` nudges the box 1px inside the crop line and an
+`inset > 0` assertion is satisfied by that 1px. Threshold tests cannot pin this.
+S2b therefore recomputes the whole box from first principles and requires a match
+within a tenth of a percent; that single block catches the `Math.max` revert, the
+margin-basis revert, the half-up rounding revert *and* the missing float-dust
+epsilon. `verifyStaticGeometry.js` (49 checks) passed throughout both defects
+because its G4 pre-clamps with `Math.max(0, sb.top)` — it launders away exactly
+the condition that was broken.
+
+**Also found, not fixed (no owner ask):** `adRegenerateService.js:277` passes
+`ad.platformFormat` with **no live-format gate**, so the 45 Ads frozen on
+`pmax_16_9` still regenerate through the full path. Defect A's fix is
+surface-agnostic and reaches them. And an OCR / text-bbox capability **already
+exists** (`adSuitabilityService.js:46,162`, `Media.text[]`) but is aimed at
+*ingested source media*, not the rendered ad — which makes the long-discussed
+measure-and-reject control much cheaper than §0.2 assumed.
+
+**Files touched:** `services/staticAdIntents.js`, `services/atlasImageService.js`
+(stale 3-size comment), `scripts/verifyStaticSafeBox.js` (new), `docs/PIPELINES.md`
+§5, `CLAUDE.md` §2 Known-open. **NOT committed** — the working tree is shared with
+a concurrent session (see §0.29997).
+
+---
+
 ## 1. CURRENT STATE
 
 **Live prod = `ab255f4`** on both services. Verify suite = **29 scripts, all green**.
@@ -1121,7 +1272,8 @@ recorded before 2026-08-03 may describe a binary that was never deployed.**
 |---|---|
 | Zero-ads root cause | **FIXED + verified live** — `payloads=0` → `payloads=3`, 3 ads rendered |
 | Director concept contract | 6 consumers unified on `services/conceptProjection.js` |
-| Hero-image default | `DIRECTOR_UNIVERSE_TOP_N` 10 → **1**; ceiling 10, multi-image wired |
+| Default image seed (COUNT) | `DIRECTOR_UNIVERSE_TOP_N` 10 → **1**; ceiling 10, multi-image wired. TOP_N=1 is the count only — it does NOT select which image |
+| Default image seed (SELECTION) | **NEW 2026-08-03:** `seededUniverseService.promoteFirstCatalogImage` + opt-in `preferFirstCatalogImage`, passed from `runConceptDrivenExpansion` for image runs with no operator picks. Rule is **"the first image that came from the catalog"**, not the `imageRole:'hero'` label (owner amendment same day: the label could leave an unstamped catalog set falling through to the shotType ranking, where a UGC post won). 3-tier cascade, every tier gated on `role==='catalog'` so it can never resolve to UGC: `imageRole==='hero'` → earliest-`createdAt` catalog entry → no promotion. Mirrors the video rail's cascade at `campaignAdsGenerationService.js:2085`. Auto-assembly branch only — `restrictToMediaIds` (operator override) and brand-only mode untouched. `scripts/verifySeededUniverseHeroDefault.js` = **111 checks**, revert-proven; suite 42 scripts, 42 green (re-measured 2026-08-03) |
 | Per-product reasons | on `CampaignRun`, returned by `GET /api/ads/runs/:runId` |
 | Stage instrumentation | both paths, piggybacked on existing polls |
 | Untitled video | no longer counted as success |
