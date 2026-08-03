@@ -293,6 +293,34 @@ calls** and needs no new vision pass. Prefer this over a separate per-image clas
 (my earlier suggestion — superseded, it was more expensive for the same result). Only existing
 media would need a backfill.
 
+### 0.295 ENDCARD PROBE — VALIDATED, $0.01 (2026-08-04)
+
+Ran one live `gpt-image-2/edit` call on the Allbirds Breezer Point to test the §0.28 endcard
+idea before building anything. **It works.**
+
+- `size:"1152x2048"` accepted -> returned exactly 1152x2048 = **0.5625 = perfect 9:16**
+  (note `buildParams`' comment at `atlasImageService.js:440` lists only 3 sizes — STALE, the
+  live schema has 14)
+- 115s, $0.01, one submit
+- Output: elegant editorial serif headline, clean price line, pill CTA, generous negative space,
+  bottom-right corner left EMPTY for logo compositing as instructed, all spelling correct
+- **No invented logo on the product** — the explicit "Do NOT add, invent, or redraw ANY logo,
+  emblem, badge or wordmark; it carries none" instruction HELD. Worth reusing verbatim in the
+  static path, given the Timberland defect.
+- Qualitatively far better than the current Remotion CSS card, and the raw-SKU-title problem
+  disappears because copy is authored, not concatenated.
+
+**Measured product-fidelity drift** (mean saturated-red pixel, source vs render):
+`#a03849` -> `#b15760` — ~11% lighter, ~13% LESS saturated, shifted pink. NOTE: an earlier
+eyeball read in-session called it "deeper burgundy" and that was WRONG in direction; the
+measurement is the record. Part of the shift is legitimately the warm scene lighting that was
+requested, so this is a judgement call rather than an unambiguous bug — but it is exactly what
+the §0.2 vision QC "product fidelity vs original" check is for, and it is measurable this way.
+
+**Two prompt fixes for the next iteration:** "125 dollars" rendered literally (written that way
+to dodge glyph mangling — test "$125"); and the product sat mid-frame leaving dead space
+instead of the requested lower-centre.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
