@@ -1023,6 +1023,39 @@ locking its own products), **`/runs` scope**, and a **compound index** for the g
 Explicitly NOT a double-bill, verified: a rejected/429'd submit is not charged, and
 `/runs`'s atomic claim still means one owner per ad row.
 
+### Live verification on prod `9fda078` (Chrome, 2026-08-03 ~18:50)
+
+Both features tested against the deployed build; total Atlas spend for the whole
+verification was **$0**.
+
+- **Prewarm, end-to-end through the UI:** one click on a COLD product tile (Men's Runner
+  NZ Remix, 5 medias, 0 warm) → one `POST /api/ads/video-ref-prewarm → 202` from the
+  Step2Picker effect → the 3 stack medias (hero + 2 alts) came back cached
+  `pad-product-only` with URLs. All product_only shots, so $0 — no CostLog rows. An
+  already-warm product correctly did nothing.
+- **Gate, both directions, $0.** Staged a synthetic `preparing` CampaignRun scoped to one
+  product rather than paying for a real run. Same product → **409** `reason:
+  product-overlap`, naming the conflicting run and the overlapping id. Disjoint product →
+  **202, run minted while the other was in flight** — the exact thing the team was blocked
+  on. The allowed run stamped `requestedProductIds` correctly and ended
+  `done total=0` ("no usable imagery") with **0 ads and 0 cost rows**, because the disjoint
+  id was deliberately a valid-but-nonexistent ObjectId. Synthetic row deleted after.
+
+**UNEXPLAINED, benign, worth knowing:** an earlier wizard-triggered prewarm (18:44, during
+the deploy rollout) returned 202 but never warmed its cold product, while a direct call to
+the same service on the same instance warmed it in 2.7s. Most likely the fire-and-forget
+background work died with an instance being replaced mid-rollout — unconfirmed, since we
+have no log access from here. Self-healing either way: an unwarmed product just reframes
+on demand during the run, exactly as before the feature existed.
+
+**Diagnostic note for next session:** running app scripts over `render-ssh` on the WORKER
+gives a shell WITHOUT `ATLAS_API_KEY`, so `atlasVideoService.enabled()` is false and the
+reframe ladder silently returns deterministic crops with no persist — a direct-call test
+there looks like "warmed N refs" while caching nothing. Source the running process env
+first: `set -a && . <(tr "\0" "\n" < /proc/1/environ | grep -E "^(ATLAS_API_KEY|MONGODB_URI|CLOUDINARY|VIDEO_PROVIDER|REFRAME)") && set +a`.
+Beware: bash job-control can echo a sourced `MONGODB_URI` in a "Done" line — it did here,
+so that credential is in the 2026-08-03 transcript and is worth rotating.
+
 ---
 
 ## 1. CURRENT STATE
