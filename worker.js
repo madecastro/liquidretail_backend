@@ -36,11 +36,11 @@ const { processLegacyUploadJob } = require('./pipelines/inventory');
 const { sleep }                  = require('./pipelines/shared');
 const { startScheduler }         = require('./services/scheduledSyncService');
 
-// Default 4 parallel worker loops (was 2). Detect/render/ad work is
-// I/O- and API-bound, so more loops drain the queues faster without
-// contention; the Mongo pool below scales with it. Prod overrides via
-// WORKER_CONCURRENCY (currently 5). Hard-capped at 100.
-const CONCURRENCY = Math.max(1, Math.min(parseInt(process.env.WORKER_CONCURRENCY, 10) || 4, 100));
+// Parallel worker loops — resolved in services/concurrency.js
+// (WORKER_CONCURRENCY, hard-capped at 100).
+const { concurrency: CONC, logConcurrencyConfig } = require('./services/concurrency');
+const CONCURRENCY = CONC.WORKER_CONCURRENCY;
+logConcurrencyConfig();
 
 // Orphan reaper tuning. STALE_MIN is the threshold past which a claimed
 // (status: 'processing' / 'rendering' / 'running') doc is presumed
