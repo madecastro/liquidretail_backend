@@ -125,8 +125,43 @@ through the views. That also explains the ~5.0s cross-dissolve (front → back),
 therefore normal behaviour, NOT a generation artifact. Two earlier reads in this session were
 wrong and are corrected here: the ghosting is a legitimate shot transition, and the Nikes are
 not the model inventing a competitor mark.
-**Fix is view-aware reference selection/ordering** (`buildReferenceImages` passes hero + alts in
-"stored order"), so a rear view never becomes the closing beat. Tracked as its own item.
+**OWNER INPUT 2026-08-04 — read before "fixing" this.** A back view is **not** a bad reference;
+the owner considers it useful for fidelity. And: *"we found with too many images it was
+hallucinating"* — so **do NOT raise the reference count** to compensate. Corroborating evidence:
+the static Timberland ad sent **exactly ONE** reference and still invented the emblem, so ref
+COUNT is not the driver; ref quality/role is. `DEFAULT_REFERENCE_IMAGE_COUNT = 3`,
+`MAX = 7` (`atlasVideoService.js:762-763`) — keep 3.
+
+**Selection is purely positional today.** `buildReferenceImages` (`atlasVideoService.js:1791-1807`)
+= seed at position 0, then catalog mirrors in `hero-first / createdAt asc`, truncated. Owner,
+verbatim: *"we are taking the first three images by default."* Whatever lands 2nd/3rd by
+createdAt becomes a reference — for a typical PDP set that is LEFT/BACK.
+
+**PREVALENCE — this is NOT an edge case.** 423 video ads; 130 carry reference stacks across 86
+products and 10 brands; refcount distribution `{1:35, 2:10, 3:85}` — **65% carry three refs**.
+Confirmed on a second brand/category: Allbirds "Men's Wool Cruiser" ref R2 is literally named
+`..._PDP_BACK_....png`. Also spotted: "Fujimurasaki Matcha" uses an
+`encrypted-tbn0.gstatic.com/shopping?q=tbn:` **Google Shopping thumbnail** as a reference for a
+$1.00 video generation — a separate reference-quality bug.
+
+**THE MISSING PIECE: there is no view/angle field on Media.** The detect pipeline already
+populates `subjects`, `text`, `background`, `primarySubjectDesc/Label`, `technicalInsights`,
+`adSuitability`, `classification`, `refinedProducts` — but nothing records front vs back vs
+detail. That is exactly why selection is positional: it has nothing else to sort on.
+
+**RECOMMENDED DIRECTION (discussed with owner, not yet built):**
+1. **Minimal, free, testable first:** the stack is consumed as a SEQUENCE, so the fix is not
+   reordering but making the CLOSING BEAT return to the primary view. `buildVeoPrompt` Scene 3
+   says *"zoom out to reveal the full product"* without saying WHICH view. Prompt-only change.
+2. **Classify view ONCE at ingest**, not per generation — stamp Media with
+   `view: front|back|detail|lifestyle|packaging` (~$0.0016/image with flash, one time). Ordering
+   then becomes free and deterministic forever; a per-generation Director call re-pays that cost
+   and is non-reproducible.
+3. **Share that ingest call with the brand-safety screen** (§0.2 known limit / task): one look at
+   each ingested image returns view angle + competitor marks + text presence.
+4. Leave the **Director** to sequence a script from already-labelled views, which matches the
+   owner's stated intent that an enabled Director should drive the camera prompt — rather than
+   doing perception work per run.
 
 **Secondary, still worth doing — the canonical prompt has real gaps** (`veoPromptBuilder.js`
 `OMNI_DIRECTIVES:156-193`):
