@@ -37,6 +37,7 @@ const CatalogProduct            = require('../models/CatalogProduct');
 const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
 const { recordFlatCost } = require('./costTracker');
+const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
 
@@ -2053,12 +2054,28 @@ function pacedModelSubmit(model, fn) {
   return next;
 }
 
-async function pollPrediction(predictionId, { shouldCancel = null } = {}) {
+/**
+ * Poll an Atlas prediction to completion.
+ *
+ * @param {string} predictionId
+ * @param {{ shouldCancel?: Function, adId?: any, stagePrefix?: string }} [opts]
+ *   stagePrefix — when set with adId, each poll tick fire-and-forget-writes
+ *   `"${stagePrefix} — polling 4m10s (17)"` so the activity board shows motion
+ *   without a new timer. Defaults to no stage write (reframe / non-ad callers).
+ */
+async function pollPrediction(predictionId, { shouldCancel = null, adId = null, stagePrefix = null } = {}) {
   const t0 = Date.now();
   let pollCount = 0;
   let consecutiveErrors = 0;
   let consecutiveRateLimits = 0;
   let lastError = null;
+  const writePollStage = () => {
+    // Fire-and-forget, never awaited. Throttled inside adStage.
+    if (adId && stagePrefix) {
+      adStage(adId, `${stagePrefix} — polling ${formatElapsed(Date.now() - t0)} (${pollCount})`);
+    }
+  };
+  writePollStage();
   while (Date.now() - t0 < MAX_POLL_MS) {
     // Jitter the poll interval by 0–3s so concurrent jobs desync — without
     // this, N workers with the same POLL_INTERVAL burn through Grok's 1 RPS
@@ -2075,6 +2092,7 @@ async function pollPrediction(predictionId, { shouldCancel = null } = {}) {
       throw e;
     }
     pollCount++;
+    writePollStage();
     let res;
     try {
       res = await axios.get(`${BASE_URL}/model/prediction/${predictionId}`, {
@@ -2411,6 +2429,10 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
         .sort({ createdAt: -1 }).lean();
     } catch (err) {
       console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
+      noteRenderIssue(ad._id, {
+        message: `layoutInput derivation failed: ${err.message}`,
+        stage: 'layoutInput'
+      });
     }
   }
 
@@ -2500,6 +2522,10 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
         .sort({ createdAt: -1 }).lean();
     } catch (err) {
       console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
+      noteRenderIssue(ad._id, {
+        message: `layoutInput derivation failed: ${err.message}`,
+        stage: 'layoutInput'
+      });
     }
   }
 
@@ -2541,6 +2567,7 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     }
   }
   const referenceCount = resolveReferenceImageCount({ brand, product });
+  adStage(ad._id, `reference reframe (${aspectRatio})`);
   const imageUrls = await buildReferenceImages({
     media, product, catalogMedias, aspectRatio, caps, referenceCount, brand,
     orderedReferenceMedia
@@ -2605,6 +2632,8 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   const costUsd = estimateRenderCostUsd({ model, durationSec, resolution: renderResolution });
 
   const t0 = Date.now();
+  // Fire-and-forget stage: never awaited on this billable path.
+  adStage(ad._id, `master video submit (${aspectRatio})`);
   const predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
   const submitMs = Date.now() - t0;
   console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
@@ -2653,7 +2682,12 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
   }
 
-  const remoteVideoUrl = await pollPrediction(predictionId);
+  const stagePrefix = `master video generation (${aspectRatio})`;
+  const remoteVideoUrl = await pollPrediction(predictionId, {
+    adId: ad._id,
+    stagePrefix
+  });
+  adStage(ad._id, `downloading master video (${aspectRatio})`);
   const videoBuffer = await downloadToBuffer(remoteVideoUrl);
 
   // Mirror to Cloudinary. The eager transform pre-generates the
@@ -2680,6 +2714,7 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   if (!aspectsMatch) {
     uploadOpts.eager = [{ raw_transformation: `c_fill,${arParamForAspect(platformAspect)},g_auto` }];
   }
+  adStage(ad._id, `mirror upload (${aspectRatio})`);
   const uploaded = await uploadBufferToCloudinary(videoBuffer, uploadOpts);
 
   const elapsedMs = Date.now() - t0;

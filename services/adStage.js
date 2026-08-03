@@ -1,0 +1,115 @@
+'use strict';
+//
+// adStage — per-ad render progress telemetry.
+//
+// FIRE-AND-FORGET BY CONTRACT. Callers must NEVER await these helpers, and a
+// failed write is swallowed. This is telemetry on a path where Atlas has
+// already been billed (or is about to be); a Mongo blip must never be able to
+// fail a paid render. A stage can be missed under load — acceptable, because
+// the next transition overwrites it and the terminal status is written by the
+// real persist path, not by this.
+//
+// Throttle floor (AD_STAGE_MIN_MS, default 3000): poll loops piggyback stage
+// writes on their existing tick. If someone lowers ATLAS_IMAGE_POLL_MS /
+// ATLAS_POLL_INTERVAL_MS below the floor, we still write at most once per floor
+// for the same phase. Distinct phase transitions always write immediately so a
+// fast derive→fetch→submit sequence is not collapsed into silence.
+//
+// Do NOT add this knob to config/defaults.env — another change owns that file.
+
+const Ad = require('../models/Ad');
+
+/** Last write per ad: { base, at }. Lazy-read env so tests can flip the knob. */
+const _lastByAd = new Map();
+
+function stageMinMs() {
+  const n = Number(process.env.AD_STAGE_MIN_MS);
+  return Number.isFinite(n) && n > 0 ? n : 3000;
+}
+
+/**
+ * Strip the poll-progress suffix so "master video generation (9:16) — polling 4m10s (17)"
+ * and "... — polling 4m25s (18)" share a base and throttle against each other, while
+ * "titling 9:16" is a different phase and always lands.
+ */
+function stageBase(stage) {
+  return String(stage || '')
+    .replace(/\s*—\s*polling\s+\S+\s*\(\d+\)\s*$/i, '')
+    .trim();
+}
+
+/** Format elapsed ms as "4m10s" / "12s" for poll stage strings. */
+function formatElapsed(ms) {
+  const s = Math.max(0, Math.floor(Number(ms) / 1000) || 0);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}m${String(r).padStart(2, '0')}s`;
+}
+
+/**
+ * Record which stage a specific ad is in, so an operator can read one assetId's
+ * state instead of grepping logs for it.
+ *
+ * NOT AWAITED. Never throws.
+ *
+ * @param {string|object} adId
+ * @param {string} stage
+ */
+function adStage(adId, stage) {
+  if (adId == null || stage == null || stage === '') return;
+  const id = String(adId);
+  const text = String(stage);
+  const now = Date.now();
+  const base = stageBase(text);
+  const prev = _lastByAd.get(id);
+  // Same phase within the floor → drop (poll ticks). Different phase → always write.
+  if (prev && prev.base === base && (now - prev.at) < stageMinMs()) return;
+  _lastByAd.set(id, { base, at: now });
+
+  Ad.updateOne(
+    { _id: adId },
+    { $set: { renderStage: text, renderStageAt: new Date(), updatedAt: new Date() } }
+  ).catch(() => {});
+}
+
+/**
+ * Persist a renderError-shaped diagnostic without flipping status.
+ *
+ * Used for non-fatal degradations (logo skip, face-crop skip, layout derive
+ * miss) so GET /api/ads/render-activity can surface a reason the operator can
+ * act on in a regen. Terminal failures that also flip status should use a
+ * normal awaited Ad.updateOne on the caller's bookkeeping path instead.
+ *
+ * FIRE-AND-FORGET. Never throws. Never awaited.
+ */
+function noteRenderIssue(adId, { message, stage, predictionId, charged, atlasCode } = {}) {
+  if (adId == null || !message) return;
+  const renderError = {
+    message: String(message).slice(0, 1000),
+    stage:   stage ? String(stage) : 'unknown',
+    at:      new Date()
+  };
+  if (predictionId != null) renderError.predictionId = String(predictionId);
+  if (charged === true)     renderError.charged = true;
+  if (atlasCode != null)    renderError.atlasCode = Number(atlasCode);
+
+  Ad.updateOne(
+    { _id: adId },
+    { $set: { renderError, updatedAt: new Date() } }
+  ).catch(() => {});
+}
+
+/** Test-only: clear throttle state between harness cases. */
+function _resetThrottleForTests() {
+  _lastByAd.clear();
+}
+
+module.exports = {
+  adStage,
+  noteRenderIssue,
+  formatElapsed,
+  stageBase,
+  stageMinMs,
+  _resetThrottleForTests
+};

@@ -59,6 +59,7 @@ const {
 const {
   buildVideoCropUrl, isTransformableVideoUrl, hasExistingCropTransform,
 } = require('./videoCropUrl');
+const { noteRenderIssue } = require('./adStage');
 
 const ENABLED = () => String(process.env.BASE_PLATE_CROP_ENABLED ?? 'true').toLowerCase() !== 'false';
 
@@ -394,6 +395,12 @@ async function persistSkip(ad, format, reason) {
       updatedAt: new Date(),
     },
   }).catch(() => {});
+  // Also surface on renderError so GET /api/ads/render-activity shows the
+  // reason without a route change. Soft note — status is not flipped.
+  noteRenderIssue(ad?._id, {
+    message: `face-safe crop skipped: ${reason}`,
+    stage: 'face-safe-crop'
+  });
 }
 
 module.exports = {

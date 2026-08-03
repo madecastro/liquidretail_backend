@@ -25,6 +25,7 @@
 const axios = require('axios');
 const { recordFlatCost, reconcileCost } = require('./costTracker');
 const { classify, mayResubmit, retryAfterFrom } = require('./atlasErrorPolicy');
+const { adStage, formatElapsed } = require('./adStage');
 
 const BASE = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
 const KEY = () => process.env.ATLAS_API_KEY;
@@ -202,6 +203,14 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
   const id = submit.data.data.id;
   let lastStatus = null;
   let transientPolls = 0;   // backoff counter for throttles seen while polling
+  let pollCount = 0;
+  // Stage label for the activity board. piggybacked on this loop's existing
+  // tick — no new timer. meta.adId is optional so non-ad callers stay silent.
+  const stageFmt = meta.platformFormat || meta.aspectRatio || 'image';
+  const stageLabel = () =>
+    `plate generation (${stageFmt}) — polling ${formatElapsed(Date.now() - t0)} (${pollCount})`;
+  // Fire-and-forget: never awaited on this billable path.
+  adStage(meta.adId, stageLabel());
   console.log(`   ⏳ atlasImage: submitted ${id} (${model}); deadline=${generationTimeoutMs}ms`);
 
   while (Date.now() - t0 < generationTimeoutMs) {
@@ -209,6 +218,9 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     await new Promise((r) => setTimeout(r, Math.min(POLL_MS, Math.max(0, remainingBeforePoll))));
     const remaining = generationTimeoutMs - (Date.now() - t0);
     if (remaining <= 0) break;
+    pollCount++;
+    // One write per existing poll tick (throttled inside adStage). Not awaited.
+    adStage(meta.adId, stageLabel());
     const poll = await axios.get(`${BASE}/model/prediction/${id}`, {
       headers: { Authorization: `Bearer ${KEY()}` },
       timeout: Math.min(30_000, Math.max(1000, remaining)),

@@ -868,7 +868,9 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
   const fs = require('fs');
   const { uploadBufferToCloudinary } = require('./cloudinaryService');
   const Ad = require('../models/Ad');
+  const { adStage } = require('./adStage');
   try {
+    adStage(ad._id, `uploading titled video (${ad.aspectRatio || 'video'})`);
     const buffer = await fs.promises.readFile(finalPath);
     const uploaded = await uploadBufferToCloudinary(buffer, {
       folder:       'liquidretail/brand_script',
@@ -877,6 +879,10 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
     });
     const set = {
       renderUrl:  uploaded.secure_url,
+      // Titling is the last required step — promote to draft here so a
+      // mid-titling crash leaves status:'rendering' (or the caller's
+      // failure path), not a false draft success with an untitled master.
+      status:     'draft',
       renderedAt: new Date(),
       updatedAt:  new Date()
     };
@@ -957,11 +963,22 @@ async function renderWithRemotionAndSave({ ad, brand, format }) {
   // at Omni's 9:16 native and BasePlate.jsx objectFit:'cover' centre-crops it blind — measured
   // 131px of head lost on a high head. The resolver returns a liveness-probed Cloudinary c_crop
   // derivative, or ad.veoVideoUrl unchanged on ANY gate/failure. Never throws.
+  const { adStage, noteRenderIssue } = require('./adStage');
+  adStage(ad._id, `face-safe crop (${ad.aspectRatio || format})`);
   const basePlate = await require('./basePlateCropService').resolveBasePlateVideoUrl({ ad, format });
   const plateUrl = basePlate.videoUrl || ad.veoVideoUrl;
+  if (!basePlate.cropped && basePlate.reason) {
+    // Soft note: ad still titles, but the operator can see why heads may be centre-cropped.
+    noteRenderIssue(ad._id, {
+      message: `face-safe crop skipped: ${basePlate.reason}`,
+      stage: 'face-safe-crop'
+    });
+    adStage(ad._id, `face-safe crop skipped (${basePlate.reason})`);
+  }
 
   let result;
   try {
+    adStage(ad._id, `titling ${ad.aspectRatio || format}`);
     result = await renderTitles({
       videoUrl:  plateUrl,
       meta,

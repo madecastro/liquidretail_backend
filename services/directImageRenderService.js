@@ -39,6 +39,7 @@ const { isPrintableCustomerQuote } = require('./quoteProvenance');
 // THE sanctioned concept reader. Direct reads of concept.rationale on this
 // path are how private Director reasoning became art direction on 2026-08-01.
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
+const { adStage, noteRenderIssue } = require('./adStage');
 
 const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
@@ -491,6 +492,7 @@ function resolveImagePromptOverride(rawPromptOverride) {
 
 async function renderDirectImage({
   layoutInputArtifactId, aspectRatio, mediaId, productId, brandId,
+  adId = null,
   adConceptArtifactId, adConceptId, template, referenceMediaIds = [],
   // Where referenceMediaIds came from, purely so the per-reference role labels
   // and the inspector tell the truth. 'operator' = an explicit wizard stack;
@@ -514,6 +516,7 @@ async function renderDirectImage({
   // needs no image-model key, so failing it here for a missing Atlas key would
   // break a path that does not use Atlas.
 
+  adStage(adId, `deriving layout (${surface})`);
   const [layout, concept, brand, product, media] = await Promise.all([
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
     resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
@@ -527,6 +530,10 @@ async function renderDirectImage({
   // brand block. Render a generic layout rather than losing the ad.
   if (!layout) {
     console.warn(`   ⚠️  direct-image: layout input ${layoutInputArtifactId} missing — rendering with a generic layout`);
+    noteRenderIssue(adId, {
+      message: `layout input ${layoutInputArtifactId || 'none'} missing — rendering with a generic layout`,
+      stage: 'derive'
+    });
   }
   const effectiveLayout = layout || { input: {}, brandId: brandId || null, productId: productId || null };
 
@@ -607,6 +614,7 @@ async function renderDirectImage({
   }
   // Carry each buffer's origin alongside it: the uploaded Atlas handles are
   // ephemeral, so only this makes the submission legible in the inspector.
+  adStage(adId, `fetching references (${surface})`);
   const fetchedRefs = await Promise.all(refCandidates.map(async (c) => {
     const raw = await optionalImage(c.sourceUrl);
     return raw ? await normalizeReference(raw) : null;
@@ -639,6 +647,7 @@ async function renderDirectImage({
   // ratio, because the safe box depends on the platform's own UI reserve and on
   // how much of the generated frame the delivery crop destroys — neither is
   // derivable from "1:1".
+  adStage(adId, `building prompt + geometry (${surface})`);
   const intentKey = intentForTemplate(template);
   const intentData = buildIntentData({
     concept,
@@ -700,7 +709,16 @@ async function renderDirectImage({
   // from the surface alone, and an image model call is charged on submit — so a
   // surface we would refuse to deliver must be refused while it is still free.
   const dims = deliveryGeometryFor(built.surface);
-  const meta = { stage: 'direct_image', service: 'directImageRenderService', purposeTag: template || 'untagged', brandId: resolvedBrand?._id || brandId || null, productId: resolvedProduct?._id || productId || null, mediaId: mediaId || null };
+  // adId + platformFormat ride on meta so atlasImageService can piggyback
+  // poll-tick stage writes without requiring the route module.
+  const meta = {
+    stage: 'direct_image', service: 'directImageRenderService', purposeTag: template || 'untagged',
+    brandId: resolvedBrand?._id || brandId || null,
+    productId: resolvedProduct?._id || productId || null,
+    mediaId: mediaId || null,
+    adId: adId || null,
+    platformFormat: surface
+  };
   // When Atlas is configured, the established renderer is the recovery path.
   // Starting a second provider request after a submitted Atlas prediction both
   // extends the user's wait and can double-charge the same ad.
@@ -709,6 +727,7 @@ async function renderDirectImage({
   // instruction ("if there is no image there is no generation") — the throw
   // above already refuses to reach here with zero references, so this is never
   // asked to invent a product from words alone.
+  adStage(adId, `plate submit (${surface})`);
   const result = await atlasImage.editImage({
     model: PLATE_EDIT_MODEL, images: refs, imageMeta, prompt, size: genSize,
     quality: PLATE_QUALITY, meta, timeoutMs: PLATE_TIMEOUT_MS,
@@ -720,6 +739,7 @@ async function renderDirectImage({
   // The model's output IS the ad. Sharp's only remaining jobs are the delivery
   // crop and the logo — every text layer this used to composite is gone with the
   // overlay renderer.
+  adStage(adId, `crop + logo composite (${surface})`);
   //
   // Two steps, and the order matters. First a CENTRED extract to the delivery
   // aspect, taking exactly the pixels the prompt told the model would be cut
@@ -774,8 +794,22 @@ async function renderDirectImage({
         logoH: lm.height
       });
       if (place) layers.push({ input: logoPng, top: place.top, left: place.left });
-      else console.warn(`   ⚠️  direct-image: no room for the logo inside ${surface}'s content rect — skipping it rather than covering it with platform UI`);
-    } catch (err) { console.warn(`   ⚠️  direct-image: logo compose failed (${err.message})`); }
+      else {
+        const msg = `no room for the logo inside ${surface}'s content rect — ad ships without logo`;
+        console.warn(`   ⚠️  direct-image: ${msg}`);
+        noteRenderIssue(adId, { message: msg, stage: 'logo' });
+      }
+    } catch (err) {
+      const msg = `logo compose failed (${err.message}) — ad ships without logo`;
+      console.warn(`   ⚠️  direct-image: ${msg}`);
+      noteRenderIssue(adId, { message: msg, stage: 'logo' });
+    }
+  } else if (resolvedBrand?.logoUrl || effectiveLayout.input?.brand?.logo) {
+    // URL was present but fetch failed (optionalImage swallowed it).
+    noteRenderIssue(adId, {
+      message: 'logo fetch failed — ad ships without logo',
+      stage: 'logo'
+    });
   }
   const buffer = layers.length
     ? await sharp(rendered).composite(layers).png().toBuffer()
