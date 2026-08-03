@@ -337,12 +337,34 @@ check('G8 presetOverride bogus name falls through to normal ladder', () => {
     `bogus override with brand preset should fall to preset, got ${r2.source}`);
 });
 
-check('G9 productName cleaning strips parenthetical; full preserved', () => {
-  // FAIL-IF-CLEAN-REGRESSED: close-phase SKU titles must not print colorways.
+check('G9 productName cleaning strips parenthetical / pipe / trailing dash; full preserved', () => {
+  // FAIL-IF-CLEAN-REGRESSED: close-phase SKU titles must not print colorways,
+  // pipe-suffixes, or trailing " - <colorway|fit>" segments.
+  // Parenthetical only (legacy case — dash segment kept because remainder
+  // is long enough; wait: after paren strip we get "... - Warm Red" which
+  // has head "Women's Breezer Point" ≥2 words → dash also strips now).
   const sample = "Women's Breezer Point - Warm Red (Dark Cocoa Sole)";
   const { productName, productNameFull } = cleanProductNameForDisplay(sample);
-  assert.strictEqual(productName, "Women's Breezer Point - Warm Red");
+  assert.strictEqual(productName, "Women's Breezer Point");
   assert.strictEqual(productNameFull, sample);
+
+  // Live frame: trailing " - <colorway>" with no paren.
+  const colorway = "Women's Breezer Point - Warm Red";
+  const c = cleanProductNameForDisplay(colorway);
+  assert.strictEqual(c.productName, "Women's Breezer Point");
+  assert.strictEqual(c.productNameFull, colorway);
+
+  // Live frame: pipe-suffix + trailing dash (order: paren → pipe → dash).
+  const pipe = 'Short Sleeve Bridge Button Down - Relaxed Fit | Blue Stripe';
+  const p = cleanProductNameForDisplay(pipe);
+  assert.strictEqual(p.productName, 'Short Sleeve Bridge Button Down');
+  assert.strictEqual(p.productNameFull, pipe);
+
+  // Guard: short name whose dash is integral — remainder too short to strip.
+  const guard = 'Mach 5 - Turbo';
+  const g = cleanProductNameForDisplay(guard);
+  assert.strictEqual(g.productName, 'Mach 5 - Turbo');
+  assert.strictEqual(g.productNameFull, guard);
 
   const plain = cleanProductNameForDisplay('Simple Shoe');
   assert.strictEqual(plain.productName, 'Simple Shoe');

@@ -1,6 +1,6 @@
 {
   "name": "canonical-consideration",
-  "description": "Funnel variant — CONSIDERATION (static objection_resolved twin). Proof phase longest: quote + reviewer + rating hold ~3–6.5s. Short hook headline. productName + medium CTA in close. Customer sentence is the ad.",
+  "description": "Funnel variant \u2014 CONSIDERATION (static objection_resolved twin). Proof phase longest: quote + reviewer + rating hold ~3\u20136.5s. Short hook headline. productName + medium CTA in close. Customer sentence is the ad.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -48,7 +48,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -275,7 +277,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -468,7 +472,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -662,7 +668,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",

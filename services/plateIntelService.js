@@ -41,14 +41,23 @@ const BAND_FOR_ANCHOR = {
   bottom: 'bottom',
 };
 
-// Vertical extents of each band (fractions of H). Aligned with vertical
-// safe zones in remotion/lib/safeZones.js (top 0.14 / bottom 0.35 clear;
-// titles cannot render below 0.65 H). Top band starts at safe.top;
-// bottom band ends at the safe-zone floor (1 - 0.35 = 0.65).
+// Vertical extents of each band (fractions of H) — MUST match where
+// remotion stacks actually paint, not crude frame-thirds.
+//
+// Anchor geometry (remotion/lib/safeZones.js ANCHOR_TOP + SAFE_ZONES.vertical):
+//   top / upperThird stack top ≈ 0.14 / 0.135; a rating+headline group is
+//   ~2–3 lines ≈ 0.12 H tall → sample strip [0.14, 0.28].
+//   center is flex-centered in the safe window → mid strip [0.40, 0.55].
+//   lowerThird top = 0.54; bottom-anchored content ends by 0.65 (1 - 0.35)
+//   → sample strip [0.52, 0.65].
+//
+// Prior rects top:[0.14,0.40] / bottom:[0.40,0.65] swallowed the subject
+// torso/face mid-frame; mean luma then voted "dark" while text sat on a
+// light wall above the face (Vuori contact-sheet failure).
 const BANDS = {
-  top: [0.14, 0.40],
-  middle: [0.38, 0.6],
-  bottom: [0.40, 0.65],
+  top: [0.14, 0.28],
+  middle: [0.40, 0.55],
+  bottom: [0.52, 0.65],
 };
 
 async function extractFrames(platePath, times, outDir) {
@@ -71,26 +80,40 @@ async function extractFrames(platePath, times, outDir) {
 
 async function analyzeFrameBands(framePath) {
   const sharp = require('sharp');
-  const img = sharp(framePath).greyscale().resize(96, 96, { fit: 'fill' });
+  // 160px tall keeps band strips ≥ ~20 rows after the tightened BANDS
+  // geometry (top band is only 0.14 of H); 96 left too few rows for a
+  // stable median.
+  const img = sharp(framePath).greyscale().resize(96, 160, { fit: 'fill' });
   const { data, info } = await img.raw().toBuffer({ resolveWithObject: true });
   const H = info.height;
   const W = info.width;
   const bands = {};
   for (const [band, [y0, y1]] of Object.entries(BANDS)) {
     const rows = [Math.floor(y0 * H), Math.ceil(y1 * H)];
+    const values = [];
     let sum = 0;
     let sumSq = 0;
-    let n = 0;
     for (let y = rows[0]; y < rows[1]; y++) {
+      // Horizontal span mirrors stackContainerStyle safe left/right (~0.075).
       for (let x = Math.floor(W * 0.08); x < Math.ceil(W * 0.92); x++) {
         const v = data[y * W + x] / 255;
+        values.push(v);
         sum += v;
         sumSq += v * v;
-        n++;
       }
     }
-    const lum = n ? sum / n : 0.5;
-    const busy = n ? Math.sqrt(Math.max(0, sumSq / n - lum * lum)) : 0;
+    const n = values.length;
+    // MEDIAN luma — a dark face/product that occupies a minority of the
+    // text strip no longer drags mean below the light threshold (the
+    // Vuori wall failure: mean dark, text on light wall).
+    let lum = 0.5;
+    if (n) {
+      values.sort((a, b) => a - b);
+      const mid = Math.floor(n / 2);
+      lum = n % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2;
+    }
+    const mean = n ? sum / n : 0.5;
+    const busy = n ? Math.sqrt(Math.max(0, sumSq / n - mean * mean)) : 0;
     bands[band] = { lum: Number(lum.toFixed(3)), busy: Number(Math.min(1, busy * 3).toFixed(3)), avoid: false };
   }
   return bands;
@@ -153,12 +176,19 @@ async function analyzePlate(platePath, { durationSec = 8, isImage = false } = {}
   if (mode === 'off') return null;
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'platescan_'));
   try {
-    // All sample times clamped inside the known duration (probe fallback
-    // can overstate it; seeking past EOF would just drop samples).
+    // Sample times clamped inside the known duration (probe fallback can
+    // overstate it; seeking past EOF would just drop samples).
+    // Denser than the old 3-point grid so enter windows of hook / proof /
+    // close (canonical cuts ~0.5 / 2.7 / 5.1 on an 8s plate) each land
+    // near a real sample — nearest-sample in bandStateFor otherwise voted
+    // on a frame seconds away from where text is visible.
     const maxT = Math.max(0.2, durationSec - 0.3);
     const times = isImage
       ? [0]
-      : [...new Set([0.8, durationSec * 0.4, durationSec * 0.7].map((t) => Number(Math.min(t, maxT).toFixed(2))))];
+      : [...new Set(
+          [0.5, 1.5, durationSec * 0.35, durationSec * 0.55, durationSec * 0.75]
+            .map((t) => Number(Math.min(Math.max(t, 0.2), maxT).toFixed(2)))
+        )];
     const frames = isImage
       ? [{ atSec: 0, path: platePath }]
       : await extractFrames(platePath, times, tmpDir);

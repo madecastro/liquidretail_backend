@@ -21,9 +21,20 @@ import { contrastToken } from '../lib/tokens.js';
 
 const BAND_FOR_ANCHOR = { top: 'top', upperThird: 'top', center: 'middle', lowerThird: 'bottom', bottom: 'bottom' };
 
+// Keep-out candidate order: prefer the authored band, then step toward the
+// frame center / opposite third. First non-avoid wins; all-flagged → keep
+// authored (never crash, never leave safe area — stackContainerStyle clamps).
+const KEEP_OUT_CANDIDATES = {
+  top: ['top', 'upperThird', 'center', 'lowerThird'],
+  upperThird: ['upperThird', 'center', 'lowerThird'],
+  center: ['center', 'upperThird', 'lowerThird'],
+  lowerThird: ['lowerThird', 'center', 'upperThird'],
+  bottom: ['bottom', 'lowerThird', 'center', 'upperThird'],
+};
+
 // Look up the plate-intelligence band under a slot group at the time its
-// content is on screen: bright band → dark type; avoid band → gentle nudge
-// toward the frame edge (clamped by the safe zones like any offset).
+// content is on screen: bright band → dark type; avoid band → shift group
+// to a clear band (see resolveGroupAnchor).
 function bandStateFor(plateHints, anchor, atSec) {
   if (!plateHints?.samples?.length) return { isLight: false, avoid: false };
   let best = plateHints.samples[0];
@@ -35,26 +46,64 @@ function bandStateFor(plateHints, anchor, atSec) {
   return { isLight: band.lum > 0.62, avoid: !!band.avoid };
 }
 
+// Stable per-group keep-out decision: one anchor for the whole group for the
+// whole clip (no per-slot divergence, no mid-phase jumping). Evaluated at the
+// group's first slot enter time (+0.5s into the visible window).
+// logShift: only the once-per-render groupAnchors path should log (ink vote reuses).
+function resolveGroupAnchor(plateHints, authoredAnchor, atSec, { logShift = false } = {}) {
+  const candidates = KEEP_OUT_CANDIDATES[authoredAnchor] || [authoredAnchor];
+  for (const cand of candidates) {
+    const { avoid } = bandStateFor(plateHints, cand, atSec);
+    if (!avoid) {
+      if (logShift && cand !== authoredAnchor) {
+        // Render console — sweeps grep `keepOut:`.
+        // eslint-disable-next-line no-console
+        console.log(`keepOut: ${authoredAnchor}->${cand} (face band)`);
+      }
+      return cand;
+    }
+  }
+  // All candidates flagged — keep authored anchor (safe-zone clamp still holds).
+  return authoredAnchor;
+}
+
 // ONE contrast decision per render, not per band: copy must never mix ink
 // colors within a video (dark headline on a light band + light CTA on a
 // dark band reads as a bug, not adaptivity). Weigh each group's band
 // verdict by how many slots actually render copy there — the scheme
 // follows the bulk of the visible copy, and the layered shadows carry
-// the minority band.
-function plateIsLightGlobal(plateHints, groups, timeScale, meta) {
-  if (!plateHints?.samples?.length) return false;
+// the minority band. Votes the EFFECTIVE (post keep-out) anchor so ink
+// matches the pixels actually under the shifted stack.
+function plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors) {
+  // Render console — sweeps grep `inkVote:`. Always emit so every render
+  // is auditable even when plate scan is off / empty.
+  const logVote = (lightWeight, darkWeight, onLight) => {
+    // eslint-disable-next-line no-console
+    console.log(
+      `inkVote: light=${lightWeight} dark=${darkWeight} -> ${onLight ? 'on-light' : 'brand-default'} tokens`
+    );
+  };
+  if (!plateHints?.samples?.length) {
+    logVote(0, 0, false);
+    return false;
+  }
   let lightWeight = 0;
   let darkWeight = 0;
   for (const group of groups) {
     const first = group.items[0];
     const rendered = group.items.filter((s) => resolveSlotContent(s, meta) != null).length;
     if (!rendered) continue;
-    const { isLight } = bandStateFor(plateHints, group.anchor, first.timing.enterAtSec * timeScale + 0.5);
+    const atSec = first.timing.enterAtSec * timeScale + 0.5;
+    const key = `${group.phase}|${group.anchor}`;
+    const effectiveAnchor = (groupAnchors && groupAnchors.get(key)) || group.anchor;
+    const { isLight } = bandStateFor(plateHints, effectiveAnchor, atSec);
     if (isLight) lightWeight += rendered;
     else darkWeight += rendered;
   }
   // Tie or no copy → keep the brand's default (light-type) tokens.
-  return lightWeight > darkWeight;
+  const onLight = lightWeight > darkWeight;
+  logVote(lightWeight, darkWeight, onLight);
+  return onLight;
 }
 
 // Extract the value a bind-chain entry contributes at this render.
@@ -201,8 +250,25 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
   const groups = useMemo(() => (spec?.slots ? groupSlots(spec.slots) : []), [spec]);
   // Compress spec-authored times onto shorter real plates (see timing.js).
   const timeScale = useMemo(() => specTimeScale(spec, durationInFrames, fps), [spec, durationInFrames, fps]);
-  // Global ink color — every group flips together or not at all.
-  const inkOnLight = useMemo(() => plateIsLightGlobal(plateHints, groups, timeScale, meta), [plateHints, groups, timeScale, meta]);
+  // Keep-out anchors resolved once per group (stable for the whole clip).
+  const groupAnchors = useMemo(() => {
+    const map = new Map();
+    for (const group of groups) {
+      const first = group.items[0];
+      const atSec = first.timing.enterAtSec * timeScale + 0.5;
+      map.set(
+        `${group.phase}|${group.anchor}`,
+        resolveGroupAnchor(plateHints, group.anchor, atSec, { logShift: true })
+      );
+    }
+    return map;
+  }, [plateHints, groups, timeScale]);
+  // Global ink color — every group flips together or not at all. Votes the
+  // post keep-out band so ink matches pixels under the shifted stack.
+  const inkOnLight = useMemo(
+    () => plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors),
+    [plateHints, groups, timeScale, meta, groupAnchors]
+  );
 
   return (
     <AbsoluteFill style={{ backgroundColor: '#000' }}>
@@ -210,15 +276,14 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
       {groups.map((group) => {
         const rows = foldRows(group.items);
         const first = group.items[0];
-        const band = bandStateFor(plateHints, group.anchor, first.timing.enterAtSec * timeScale + 0.5);
-        // Keep-out nudge: slide the group away from the flagged band —
-        // downward for top-anchored groups, upward for bottom-anchored.
-        const nudge = band.avoid ? (group.anchor === 'bottom' || group.anchor === 'lowerThird' ? -0.05 : 0.05) : 0;
+        // Keep-out: whole group shifts to the first clear band (deterministic,
+        // stable for the clip). stackContainerStyle still clamps to safe zones.
+        const effectiveAnchor = groupAnchors.get(`${group.phase}|${group.anchor}`) || group.anchor;
         const container = stackContainerStyle({
           format,
-          anchor: group.anchor,
+          anchor: effectiveAnchor,
           offsetX: first.position.offsetX,
-          offsetY: first.position.offsetY + nudge,
+          offsetY: first.position.offsetY,
           width,
           height,
         });

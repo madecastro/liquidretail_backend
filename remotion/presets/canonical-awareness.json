@@ -1,6 +1,6 @@
 {
   "name": "canonical-awareness",
-  "description": "Funnel variant — AWARENESS (static product_first_lifestyle twin). Headline-dominant, long hook (~0–4s), brandPill on, rating only in proof, soft late CTA in close only. No deliveryLine. Aspirational lifestyle framing.",
+  "description": "Funnel variant \u2014 AWARENESS (static product_first_lifestyle twin). Headline-dominant, long hook (~0\u20134s), brandPill on, rating only in proof, soft late CTA in close only. No deliveryLine. Aspirational lifestyle framing.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -48,7 +48,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -275,7 +277,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -442,7 +446,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -610,7 +616,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
