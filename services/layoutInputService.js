@@ -59,6 +59,10 @@ const ProductMatchArtifact   = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact    = require('../models/OverlayZoneArtifact');
 const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
 const CatalogProduct         = require('../models/CatalogProduct');
+// Brand is resolved by NAME first (findBrandByName); this is for the brandId
+// FK fallback in loadContext, which rescues brands whose scraped name carries
+// a tagline and therefore never matches nameNormalized.
+const Brand                  = require('../models/Brand');
 const Category               = require('../models/Category');
 const Comment                = require('../models/Comment');
 const { findBrandByName }    = require('./brandCatalogService');
@@ -643,9 +647,35 @@ async function loadContext(mediaId, options = {}) {
   }
   const runId = detection?.runId || null;
   const brandName = match?.identification?.brand || media.metadata?.brand || null;
-  const brand = brandName
+  let brand = brandName
     ? await findBrandByName(brandName).then(b => b?.toObject?.() || b).catch(() => null)
     : null;
+  // FK FALLBACK — deliberately only when the NAME lookup failed, so every
+  // resolution that works today is byte-identical.
+  //
+  // The name on a Media/CatalogProduct is scraped page text and is often not
+  // the brand's name at all. Measured in production: GymShark's catalog media
+  // carries `metadata.brand = "Gymshark | Be a visionary."` (name + site
+  // tagline), which normalizeBrandName turns into "gymshark be a visionary" —
+  // it can never match the real doc's "gymshark". So findBrandByName returned
+  // null, ctx.brand was null, and EVERY brand-sourced field silently vanished:
+  // brandReviews (so the brand-tier quote fallback had an empty pool and could
+  // never fire), styleTheme, logo, tagline.
+  // media.brandId / match.brandId is the authoritative FK and was correct all
+  // along. Not fixing the scraped name here on purpose — that is ingestion,
+  // owned elsewhere; this is the lookup being resilient to it.
+  if (!brand) {
+    const brandFk = media.brandId || match?.brandId || null;
+    if (brandFk) {
+      brand = await Brand.findById(brandFk).lean().catch(() => null);
+      if (brand) {
+        console.log(
+          `🔗 layoutInput: brand name lookup failed for ${JSON.stringify(brandName)} — ` +
+          `resolved via brandId FK to "${brand.name}" (scraped name is not the brand name)`
+        );
+      }
+    }
+  }
 
   // Category-pool resolution. When the match resolves to a Category
   // (either via the linked CatalogProduct.categoryRef or via the
