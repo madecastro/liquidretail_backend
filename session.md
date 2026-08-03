@@ -497,6 +497,50 @@ never reconciled to actuals (veoPredictionId is persisted; image reconcile patte
 full 367 sweep + persona scoring, AI endcard arm ($0.01/video), per-group brand-tokened ink
 (owner allowed multi-color), Title Studio preview!=ship warning.
 
+### 0.2995 EFFICIENCY AUDIT (owner-requested, 2026-08-04 night) — verified findings, NOT yet implemented
+
+Two subagent audits (Grok signed out), every load-bearing citation spot-checked by hand.
+Post-team-day work; nothing deployed. THREE of the audit's seed premises (mine) were WRONG and
+are corrected here so nobody re-chases them:
+
+- **Webpack bundle is ALREADY cached** — module-scope memo (`remotionRenderService.js:45-62`)
+  + @remotion/bundler filesystem cache (enableCaching default). The 4-10s observed was
+  warm-cache. The sweep driver is one process -> bundle paid ONCE per sweep. No fix needed;
+  just never chunk the sweep into many separate invocations.
+- **Plate scan is LOCAL ffmpeg**, not Cloudinary network (`plateIntelService.js:63-79,174-221`
+  runs against the already-downloaded platePath). The Cloudinary so_<sec> stills belong to the
+  face-crop detector, which is ALREADY cached per (veoVideoUrl, format) via `Ad.basePlate`
+  (`basePlateCropService.js:298-311`).
+- **Storyboard LLM on regen is DEAD CODE on the Atlas path** — `prepareStoryboard` returns
+  `storyboard:null` (`atlasVideoService.js:2527-2533`); `buildVeoPrompt` marks the param
+  unconsumed. $0 today. (`VEO_USE_GPT_STORYBOARD=true` in defaults.env is a no-op — hygiene.)
+
+**Real wins, ranked (effort S unless noted):**
+1. **Video cost reconcile to actuals** (accuracy, M): `reconcileCost` has one call site
+   (images). Video charge point already persists `veoPredictionId`; NOTE the terminal poll
+   already hits `GET /model/prediction/{id}` — the settled `price` may ride the completion
+   response for ZERO extra requests (verify live; images' comment warns price can lag).
+2. **`Ad.plateHints` cache** keyed by (plateUrl, FORMAT — not just veoVideoUrl; cropped plates
+   differ per format), mirroring `Ad.basePlate`: skips 5x ffmpeg+sharp per repeat re-title.
+   ~0.5-2s/render on preset-sweep reruns.
+3. **Regenerate flow Mongo diet:** `prepareStoryboard` call in `adRegenerateService.js:195` is
+   pure overhead (outputs discarded, cache-warm no-op on re-renders) — 6-10 round-trips;
+   `loadBrand` (`:174-181`) re-derives brand via Ad->Media->Brand when `ad.brandId` is on the
+   doc; 4x Brand loads and 4x Ad loads per regenerate, 2 of each avoidable.
+4. **Upload double-buffer** (`brandScriptExecutor.js:1012` readFile -> `cloudinaryService.js:46`
+   streamifier): stream disk->network directly. Tens-to-100s of ms.
+5. **Chrome pre-warm may be silently failing:** postinstall runs `npx remotion browser ensure
+   || true` (`package.json:11`) yet a fresh instance downloaded 91.9MB at first render. The
+   `|| true` swallows failures and vendored remotion pkg has `bin:null` — CHECK RENDER BUILD
+   LOGS for that step's real output. Same class as the f89e30b Puppeteer saga.
+6. Cosmetic/doc: stale `resolveBrowserExecutable` comment (`remotionRenderService.js:91-94`
+   points at the pre-f89e30b puppeteer cache path); `docs/TITLING.md:215-232` still documents
+   content-mode-only 3-sample scan — violates the fix-docs-in-same-commit rule; fix with the
+   plateHints work.
+7. Omni polling: fixed 15s+jitter is fine for wall-clock (completion detection lag <=18s);
+   the lever is fewer polls for rate-limit headroom, and no sync/webhook field exists in any
+   of the 5 param shapes — upstream capability UNVERIFIED.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
