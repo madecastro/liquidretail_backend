@@ -20,6 +20,10 @@
  *       "vertexaisearch.cloud.google.com" as the customer's name.
  *   P3  Ratings are bounded and formatted, never printed raw.
  *       Was: typeof 0 === 'number', so a zero rating rendered as "0".
+ *       Also: owner product rule (2026-08) — only stars *over* 4.5 print.
+ *       Gate is on the DISPLAYED (one-decimal) value, not the raw one:
+ *       4.51 / 4.55 round to 4.5 and must be withheld (raw-gate bug).
+ *       Shared via services/ratingDisplay.js for static + video chrome.
  *   P4  The gate cannot be forged from the LLM path.
  *       `origin` is not a DERIVATION_SCHEMA property; `source` is, and the
  *       derivation call is strict:false.
@@ -155,25 +159,52 @@ for (const [label, raw, expected] of [
 }
 
 // ── P3: rating bounds and formatting ────────────────────────────────────
+// Deliberate contract change (not a test bent to pass): owner rule
+// "we only use stars over 4.5" — exclusive floor at RATING_STAR_MIN (4.5).
+// Gate is on the rounded DISPLAY value: raw 4.51 must not print as "4.5".
+const { formatDisplayRating, RATING_STAR_MIN } = require('../services/ratingDisplay');
 const RATINGS = [
   [0, undefined, 'a zero rating is not a rating'],
   [-1, undefined, 'negative'],
   [6, undefined, 'above the 5-star scale'],
   [87, undefined, 'a 0-100 scale vendor would print "87 stars"'],
-  [4, '4', 'a clean integer stays clean'],
-  [4.5, '4.5', 'one decimal'],
+  [4, undefined, 'below the 4.5 floor'],
+  [4.4, undefined, '4.4 rounds to 4.4, still under floor'],
+  [4.5, undefined, 'exactly 4.5 is NOT over 4.5 (exclusive floor)'],
+  // Finding 1 boundary: raw > 4.5 but displayed === 4.5 must withhold.
+  [4.51, undefined, '4.51 rounds to 4.5 — must not print the forbidden floor'],
+  [4.55, undefined, '4.55 rounds to 4.5 (JS toFixed) — same raw-gate hole'],
+  [4.6, '4.6', 'just over the floor still prints'],
+  [4.66, '4.7', '4.66 rounds to 4.7 and prints'],
   [4.666666, '4.7', 'a raw float is rounded, not printed in full'],
   [5, '5', 'top of scale'],
   ['4.5', undefined, 'a string is not a number'],
   [null, undefined, 'null'],
   [NaN, undefined, 'NaN']
 ];
+check('P3 RATING_STAR_MIN is 4.5', RATING_STAR_MIN === 4.5);
 for (const [value, expected, why] of RATINGS) {
   const d = direct.buildIntentData({
     concept: {}, layoutInput: { social_proof: { rating_value: value } }, brand: {}, cta: 'X'
   });
   check(`P3 rating ${JSON.stringify(value)} -> ${JSON.stringify(expected)} (${why})`,
     d.rating === expected, `got ${JSON.stringify(d.rating)}`);
+  // Shared pure helper must agree with the static intent path (one rule).
+  check(`P3 formatDisplayRating(${JSON.stringify(value)}) matches intent`,
+    formatDisplayRating(value) === expected,
+    `helper=${JSON.stringify(formatDisplayRating(value))} intent=${JSON.stringify(d.rating)}`);
+}
+// Video chrome source pin: buildMetaForAd must apply formatDisplayRating so a
+// 3.2 catalog rating cannot reach Remotion. Offline we cannot run the async
+// Mongo path; pin the require + call site instead (revert-prove by deleting it).
+{
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'services', 'brandScriptExecutor.js'), 'utf8'
+  );
+  check('P3 video meta gates rating via formatDisplayRating',
+    /formatDisplayRating\s*\(\s*cascaded\.rating\s*\)/.test(src)
+    && /require\s*\(\s*['"]\.\/ratingDisplay['"]\s*\)/.test(src),
+    'buildMetaForAd must call formatDisplayRating(cascaded.rating)');
 }
 for (const [value, expected] of [[0, undefined], [-5, undefined], [12, 12], [null, undefined]]) {
   const d = direct.buildIntentData({

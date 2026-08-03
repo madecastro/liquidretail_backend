@@ -36,6 +36,7 @@ const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // assembly, so this gate should never fire — it exists because an artifact
 // cached before the producer-side filter landed can still carry one.
 const { toPrintableCustomerQuote } = require('./quoteProvenance');
+const { formatDisplayRating } = require('./ratingDisplay');
 // THE sanctioned concept reader. Direct reads of concept.rationale on this
 // path are how private Director reasoning became art direction on 2026-08-01.
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
@@ -354,6 +355,9 @@ async function optionalImage(url) {
  * eligible — an unknown template degrades to "a good product photograph", never
  * to a broken render.
  */
+// Rating floor lives in ratingDisplay.js (shared with video chrome) so the
+// "stars over 4.5" rule cannot drift between surfaces.
+
 const TEMPLATE_INTENT = {
   ai_social_proof_led: 'social_proof_led',
   ai_promotional: 'objection_resolved'
@@ -407,14 +411,10 @@ function buildIntentData({ concept, layoutInput, brand, cta }) {
   const quoteText = quote ? String(quote.snippet || quote.text || '').trim() : '';
 
   return {
-    // `> 0` on BOTH, and an upper bound. typeof 0 === 'number', so the old test
-    // printed a rating of zero as the string "0" — a zero-star rating typeset on
-    // an advertisement. review_count already had this guard; rating did not, and
-    // the asymmetry sat on adjacent lines. The 0-5 bound catches a vendor that
-    // reports a 0-100 scale, which would otherwise render as "87 stars".
-    rating: typeof proof.rating_value === 'number' && proof.rating_value > 0 && proof.rating_value <= 5
-      ? String(Number(proof.rating_value.toFixed(1)))
-      : undefined,
+    // Owner rule: "we only use stars over 4.5". Gated on the DISPLAYED
+    // (one-decimal) value via formatDisplayRating — a raw >4.5 gate let
+    // 4.51 print as "4.5". See services/ratingDisplay.js.
+    rating: formatDisplayRating(proof.rating_value),
     reviewCount: typeof proof.review_count === 'number' && proof.review_count > 0
       ? proof.review_count
       : undefined,

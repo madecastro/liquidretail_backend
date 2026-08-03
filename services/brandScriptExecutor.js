@@ -740,6 +740,13 @@ async function buildMetaForAd(ad, brand) {
   const rc = cascaded.reviewCount;
   const reviewsText = rc != null ? `${rc} review${rc === 1 ? '' : 's'}` : null;
 
+  // Owner star rule applies to video chrome too (not static-only). Gate here
+  // at the meta source so Remotion Canonical / canvas scripts never see a
+  // raw 3.2 or a 4.51 that would round-display as the forbidden "4.5".
+  // ONE implementation: services/ratingDisplay.js (shared with static).
+  const { formatDisplayRating } = require('./ratingDisplay');
+  const rating = formatDisplayRating(cascaded.rating) ?? null;
+
   // deliveryLine and promoText share their two highest-priority sources
   // (ad.copy.offer_text, then layoutInput.input.cta.offer_text), so any ad
   // with an offer set resolves both to the SAME string and paints it twice —
@@ -768,7 +775,7 @@ async function buildMetaForAd(ad, brand) {
     deliveryLine:       cascaded.deliveryLine       ?? null,
     ctaText:            cascaded.ctaText            ?? null,
     cta:                cascaded.ctaText            ?? null,   // legacy alias for older scripts reading meta.cta
-    rating:             cascaded.rating             ?? null,
+    rating,
     reviewCount:        cascaded.reviewCount        ?? null,
     likes:              cascaded.likes              ?? null,
     quoteSnippet:       cascaded.quoteSnippet       ?? null,

@@ -27,6 +27,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 
 const { FONT_CACHE_DIR } = require('./fontResolverService');
+const { FONTS_DIR } = require('./fontLoader');
 
 const COMPOSITION_BY_FORMAT = {
   vertical: 'CanonicalVertical',
@@ -136,7 +137,14 @@ const MIME = {
 };
 
 // URL space:  /jobs/<jobId>/<file>  → ASSET_ROOT/<jobId>/<file>
-//             /fonts/<file>        → FONT_CACHE_DIR/<file>
+//             /fonts/<file>         → FONT_CACHE_DIR/<file>   (google/custom cache)
+//             /libfonts/<file>      → FONTS_DIR/<file>        (library-match TTFs)
+//
+// Two font directories exist: fontResolverService library-match writes under
+// FONTS_DIR (fontLoader.js), while Google/custom downloads land in
+// FONT_CACHE_DIR (webfonts/). Mapping every /fonts/* hit to FONT_CACHE_DIR
+// 404s library-match files (and, pre-fix, that 404 lacked CORS so FontFace
+// reported "A network error occurred" → @remotion/fonts cancelRender).
 function assetPathFor(urlPath) {
   const clean = path.normalize(decodeURIComponent(urlPath)).replace(/^\/+/, '');
   const [head, ...rest] = clean.split(path.sep);
@@ -149,11 +157,17 @@ function assetPathFor(urlPath) {
   } else if (head === 'fonts') {
     base = FONT_CACHE_DIR;
     rel = rest.join(path.sep);
+  } else if (head === 'libfonts') {
+    base = FONTS_DIR;
+    rel = rest.join(path.sep);
   } else {
     return null;
   }
   const abs = path.join(base, rel);
-  if (!abs.startsWith(base + path.sep)) return null; // traversal guard
+  // TRAVERSAL GUARD — human review: identical shape for EVERY base (jobs,
+  // fonts, libfonts). Rejects abs that escapes base via .. segments after
+  // path.join. Do not weaken to a bare includes() check.
+  if (!abs.startsWith(base + path.sep)) return null;
   return abs;
 }
 
@@ -165,21 +179,23 @@ function getAssetServer() {
         try {
           const abs = assetPathFor(new URL(req.url, 'http://x').pathname);
           const stat = abs ? await fsp.stat(abs).catch(() => null) : null;
+          // FontFace fetches from the bundle origin are CORS-enforced
+          // (media elements are not) — allow all, we only serve loopback.
+          // CORS on 404 too: a miss must surface as a clean network/404 error,
+          // not an opaque CORS failure that masks the real problem.
           if (!stat || !stat.isFile()) {
-            res.writeHead(404);
+            res.writeHead(404, { 'Access-Control-Allow-Origin': '*' });
             res.end('not found');
             return;
           }
           const type = MIME[path.extname(abs).toLowerCase()] || 'application/octet-stream';
-          // FontFace fetches from the bundle origin are CORS-enforced
-          // (media elements are not) — allow all, we only serve loopback.
           res.setHeader('Access-Control-Allow-Origin', '*');
           const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
           if (range && (range[1] !== '' || range[2] !== '')) {
             const start = range[1] === '' ? Math.max(0, stat.size - Number(range[2])) : Number(range[1]);
             const end = range[2] === '' || range[1] === '' ? stat.size - 1 : Math.min(Number(range[2]), stat.size - 1);
             if (start > end || start >= stat.size) {
-              res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+              res.writeHead(416, { 'Content-Range': `bytes */${stat.size}`, 'Access-Control-Allow-Origin': '*' });
               res.end();
               return;
             }
@@ -195,7 +211,7 @@ function getAssetServer() {
             fs.createReadStream(abs).pipe(res);
           }
         } catch (e) {
-          res.writeHead(500);
+          res.writeHead(500, { 'Access-Control-Allow-Origin': '*' });
           res.end(String(e.message));
         }
       });
@@ -281,14 +297,34 @@ async function probePlate(filePath) {
   return { fps: safeFps, durationSec, width: dimensions?.width, height: dimensions?.height };
 }
 
+/**
+ * Choose asset-server route for a resolved font localPath (which is stashed
+ * on the token as `url` by resolveBrandFonts — still a filesystem path until
+ * fontsToUrls rewrites it).
+ *
+ * library-match → FONTS_DIR → /libfonts/
+ * google/custom → FONT_CACHE_DIR → /fonts/
+ * unknown path  → /fonts/ (legacy default; will 404 cleanly if missing)
+ */
+function fontRouteForLocalPath(localPath) {
+  if (!localPath || typeof localPath !== 'string') return 'fonts';
+  const abs = path.resolve(localPath);
+  // Same membership test shape as the assetPathFor traversal guard.
+  if (abs === FONTS_DIR || abs.startsWith(FONTS_DIR + path.sep)) return 'libfonts';
+  if (abs === FONT_CACHE_DIR || abs.startsWith(FONT_CACHE_DIR + path.sep)) return 'fonts';
+  return 'fonts';
+}
+
 // Rewrite resolved font local paths into asset-server URLs the browser can load.
+// Called at both renderTitles (:410) and renderPreview (:543) inputProps sites.
 function fontsToUrls(fonts, base) {
   const out = {};
   for (const [role, f] of Object.entries(fonts || {})) {
     if (!f) continue;
+    const route = fontRouteForLocalPath(f.url);
     out[role] = {
       ...f,
-      url: f.url ? `${base}/fonts/${encodeURIComponent(path.basename(f.url))}` : null,
+      url: f.url ? `${base}/${route}/${encodeURIComponent(path.basename(f.url))}` : null,
     };
   }
   return out;
@@ -618,4 +654,8 @@ module.exports = {
   renderTitles,
   renderPreview,
   COMPOSITION_BY_FORMAT,
+  // test surface for scripts/verifyFontServing.js (pure helpers)
+  assetPathFor,
+  fontRouteForLocalPath,
+  fontsToUrls,
 };
