@@ -1,4 +1,4 @@
-// Periodic health sweep → Telegram. Runs in the worker alongside the
+// Periodic health sweep → Slack. Runs in the worker alongside the
 // orphan reaper.
 //
 // The reaper itself alerts when it reaps (that IS the "work got dropped"
@@ -10,9 +10,14 @@
 //   3. The DetectRun queue growing — the one queue the worker actually
 //      drains, so a real backlog there means the worker is wedged.
 //   4. Spend in the trailing hour above a ceiling. Video is the expensive
-//      stage: a 4:5 canvas can't run on the Omni default (16:9/9:16 only)
-//      so it falls back to Grok at a ledger rate of $0.50/s — ~$4.00 for an
-//      8s clip, ~4× the default. A 20-ad batch is real money.
+//      stage, but the cost model this once cited was FALSE: it said a 4:5
+//      canvas can't run on Omni and falls back to Grok at $0.50/s (~$4.00
+//      per 8s clip). `omniFamilyNativeFor()` (atlasVideoService.js:508-522)
+//      returns '9:16' for any r < 1, so 4:5 runs on Omni; Grok is only the
+//      square opt-out and explicitly-selected non-Omni models. An 8s 1080p
+//      Omni clip is ~$1.00. The threshold in defaults.env was tuned against
+//      the inflated figure and is correspondingly too high — see the note
+//      there. A 20-ad batch is still real money.
 //
 // Deliberately NOT alerted on: a nonzero count of 'queued' Ads. That is
 // normal inventory — expandWizardJob routinely queues more creatives than
