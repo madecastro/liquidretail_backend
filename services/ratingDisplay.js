@@ -67,13 +67,31 @@ function brandAttributionLabel(brand) {
 }
 
 /**
+ * Build the brand-tier reviewsText string (count + optional attribution).
+ * Extracted so the brand-rating branch and the brand-count-only branch
+ * (allowBrandCountWithoutStars) share ONE pluralisation/attribution
+ * implementation — the same count must read identically whether or not
+ * stars are printing alongside it.
+ * @returns {string|null}
+ */
+function formatBrandReviewsText(rc, brandAttribution) {
+  if (rc == null) return null;
+  const label = brandAttribution && String(brandAttribution).trim();
+  return label
+    ? `${rc} review${rc === 1 ? '' : 's'} · ${label}`
+    : `${rc} review${rc === 1 ? '' : 's'}`;
+}
+
+/**
  * ATOMIC rating + reviewCount pair resolution.
  *
  * CRITICAL HISTORY: a brand-level cascade tier once mixed sources — a product's
  * 41,000-review count printed next to the brand's 3.3 rating. That path was
  * removed. This resolver is the ONLY brand fallback and is ATOMIC: rating and
  * count always come from the SAME tier (product pair OR brand pair), never
- * mixed.
+ * mixed. The new brand-count-without-stars outcome below is still tier-atomic
+ * — it only ever pairs the brand's own count with the brand's own quote (see
+ * the call site gate in buildMetaForAd), never a product-tier quote.
  *
  * Product pair first. If it yields no displayable rating (formatDisplayRating
  * gate), try the brand pair (same gate). When the brand pair is used,
@@ -83,12 +101,24 @@ function brandAttributionLabel(brand) {
  * If brand rating passes but brand count is missing → show rating with NO
  * count (never the product's count).
  *
+ * If NEITHER pair clears the star gate (most brands: only 4 of 34 clear
+ * >4.5 today — e.g. GymShark sits at 3.3 with 41,000 reviews, AllBirds has
+ * no brand rating at all), a failing/missing rating would otherwise mean NO
+ * social proof at all. `allowBrandCountWithoutStars` lets the brand's review
+ * COUNT print alone (no stars — the owner rule "we only use stars over 4.5"
+ * is untouched, see formatDisplayRating) when the caller has independently
+ * confirmed the accompanying quote is also brand-tier — count and quote must
+ * still come from the same tier, so this must never be turned on next to a
+ * product-tier quote.
+ *
  * Data source for brand pair (caller's responsibility): Brand.brandReviews
  * ({ rating, reviewCount }) — same Gemini grounded-search snapshot written by
  * enrichBrandFromUrl / productMatchService. Prefer that over averaging
  * CatalogProduct rows (partial coverage, not a true brand aggregate).
  *
- * @returns {{ rating: string|null, reviewCount: number|null, reviewsText: string|null, source: 'product'|'brand'|null }}
+ * @param {boolean} [allowBrandCountWithoutStars=false] Only set true when the
+ *   quote alongside this pair is confirmed brand-tier (never product-tier).
+ * @returns {{ rating: string|null, reviewCount: number|null, reviewsText: string|null, source: 'product'|'brand'|'brand-count'|null }}
  */
 function resolveAtomicRatingPair({
   productRating = null,
@@ -96,6 +126,7 @@ function resolveAtomicRatingPair({
   brandRating = null,
   brandReviewCount = null,
   brandAttribution = null,
+  allowBrandCountWithoutStars = false,
 } = {}) {
   const productDisplay = formatDisplayRating(productRating);
   if (productDisplay) {
@@ -113,19 +144,27 @@ function resolveAtomicRatingPair({
   if (brandDisplay) {
     // Brand pair — count from brand tier ONLY. Never productReviewCount.
     const rc = normalizeReviewCount(brandReviewCount);
-    let reviewsText = null;
-    if (rc != null) {
-      const label = brandAttribution && String(brandAttribution).trim();
-      reviewsText = label
-        ? `${rc} review${rc === 1 ? '' : 's'} · ${label}`
-        : `${rc} review${rc === 1 ? '' : 's'}`;
-    }
     return {
       rating: brandDisplay,
       reviewCount: rc,
-      reviewsText,
+      reviewsText: formatBrandReviewsText(rc, brandAttribution),
       source: 'brand',
     };
+  }
+
+  if (allowBrandCountWithoutStars) {
+    // Neither tier clears the star gate, but a strong brand review COUNT is
+    // still honest, strong social proof on its own. Rating stays null (no
+    // stars print) — only the count text prints.
+    const rc = normalizeReviewCount(brandReviewCount);
+    if (rc != null) {
+      return {
+        rating: null,
+        reviewCount: rc,
+        reviewsText: formatBrandReviewsText(rc, brandAttribution),
+        source: 'brand-count',
+      };
+    }
   }
 
   return { rating: null, reviewCount: null, reviewsText: null, source: null };

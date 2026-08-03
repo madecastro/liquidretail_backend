@@ -1,0 +1,426 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * verifyProofBeat — offline guard for the canonical PROOF phase.
+ *
+ * WHY THIS EXISTS
+ * 2026-08-04: the owner reported three separate defects — "not seeing the
+ * canonical title on videos", "not seeing customer comments", "what happened to
+ * the star reviews and review counts". All three were ONE root cause: the
+ * canonical proof beat (quote + reviewer + rating lockup) was rendering empty,
+ * so `visibleWhenEmpty:"quote"` handed the beat to a repeated headline and the
+ * video no longer read as the new template.
+ *
+ * Two things had to change, and each is easy to silently undo:
+ *
+ *   1. A brand's review COUNT may print with NO STARS. Measured in production,
+ *      only 4 of 34 brands clear the owner's ">4.5 stars only" rule — GymShark
+ *      sits at 3.3 with 41,000 reviews. Suppressing the stars is correct;
+ *      suppressing the volume too left the beat empty.
+ *   2. That count is only honest next to a BRAND-tier quote. Pairing a brand
+ *      count with a product-tier quote is the exact cross-tier mix that once
+ *      printed a product's 41,000 reviews beside the brand's 3.3 stars.
+ *
+ * The second rule is enforced at a distance: buildMetaForAd reads
+ * `primary_quote.tier === 'brand'`, and that `tier` has to survive
+ * toPrintableCustomerQuote's byline strip. Nothing else pins that, and the strip
+ * is deliberately generous about what it deletes — so a future field added to
+ * BYLINE_FIELDS could disable the whole count path with no test failing.
+ *
+ * Offline: no DB, no network, no API key, no browser. Remotion JSX/ESM cannot be
+ * required from CJS, so the renderer is covered by source pins — the same
+ * approach scripts/verifyRatingMotion.js already uses.
+ *
+ *   node scripts/verifyProofBeat.js
+ */
+
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+
+const {
+  resolveAtomicRatingPair,
+  formatDisplayRating,
+} = require('../services/ratingDisplay');
+const {
+  toPrintableCustomerQuote,
+  BYLINE_FIELDS,
+} = require('../services/quoteProvenance');
+const { gateLayoutInputQuotes } = require('../services/brandScriptExecutor');
+
+let pass = 0;
+const failures = [];
+function check(label, fn) {
+  try { fn(); pass++; }
+  catch (err) { failures.push(`${label}: ${err.message}`); }
+}
+
+const BRAND_LABEL = 'gymshark.com';
+
+// ── R: the atomic rating/count pair ────────────────────────────────────
+
+check('R1 product rating that clears the gate still wins, with its own count', () => {
+  const r = resolveAtomicRatingPair({
+    productRating: 4.8, productReviewCount: 120,
+    brandRating: 3.3, brandReviewCount: 41000, brandAttribution: BRAND_LABEL,
+  });
+  assert.strictEqual(r.source, 'product');
+  assert.strictEqual(r.rating, '4.8');
+  assert.strictEqual(r.reviewCount, 120);
+});
+
+check('R2 brand rating that clears the gate wins when product fails', () => {
+  const r = resolveAtomicRatingPair({
+    productRating: 3.9, productReviewCount: 120,
+    brandRating: 4.7, brandReviewCount: 8343, brandAttribution: BRAND_LABEL,
+  });
+  assert.strictEqual(r.source, 'brand');
+  assert.strictEqual(r.rating, '4.7');
+  assert.strictEqual(r.reviewCount, 8343);
+  assert.ok(r.reviewsText.includes(BRAND_LABEL), 'brand count must be attributed');
+});
+
+check('R3 DEFAULT OFF — both ratings failing yields no proof at all', () => {
+  const r = resolveAtomicRatingPair({
+    productRating: 3.9, productReviewCount: 120,
+    brandRating: 3.3, brandReviewCount: 41000, brandAttribution: BRAND_LABEL,
+  });
+  assert.strictEqual(r.source, null, 'omitting the flag must not change behaviour');
+  assert.strictEqual(r.rating, null);
+  assert.strictEqual(r.reviewCount, null);
+  assert.strictEqual(r.reviewsText, null);
+});
+
+check('R4 count prints WITHOUT stars when opted in (the GymShark case)', () => {
+  const r = resolveAtomicRatingPair({
+    productRating: null, productReviewCount: null,
+    brandRating: 3.3, brandReviewCount: 41000, brandAttribution: BRAND_LABEL,
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(r.source, 'brand-count');
+  assert.strictEqual(r.rating, null, 'a 3.3 rating must NEVER print as stars');
+  assert.strictEqual(r.reviewCount, 41000);
+  assert.strictEqual(r.reviewsText, `41000 reviews · ${BRAND_LABEL}`);
+});
+
+check('R5 opting in cannot invent a count that does not exist (AllBirds)', () => {
+  const r = resolveAtomicRatingPair({
+    productRating: 4.4, productReviewCount: null,
+    brandRating: null, brandReviewCount: null, brandAttribution: 'allbirds.com',
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(r.source, null);
+  assert.strictEqual(r.reviewsText, null);
+});
+
+check('R6 ATOMICITY — a brand count never rides a product rating', () => {
+  const r = resolveAtomicRatingPair({
+    productRating: 4.8, productReviewCount: null,
+    brandRating: 3.3, brandReviewCount: 41000, brandAttribution: BRAND_LABEL,
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(r.source, 'product', 'product stars win');
+  assert.strictEqual(r.reviewCount, null, 'must NOT borrow the brand 41,000');
+  assert.strictEqual(r.reviewsText, null);
+});
+
+check('R7 ATOMICITY — the count-only path never borrows the PRODUCT count', () => {
+  // The historical bug in reverse: a product count surfacing under a brand
+  // decision. brandReviewCount is absent, so there must be no count at all.
+  const r = resolveAtomicRatingPair({
+    productRating: 3.2, productReviewCount: 41000,
+    brandRating: 3.3, brandReviewCount: null, brandAttribution: BRAND_LABEL,
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(r.reviewCount, null, 'product 41,000 must not leak into a brand decision');
+  assert.strictEqual(r.source, null);
+});
+
+check('R8 the rounding trap still withholds stars (4.51/4.55 display as 4.5)', () => {
+  for (const raw of [4.51, 4.54, 4.55, 4.5]) {
+    assert.strictEqual(formatDisplayRating(raw), undefined, `${raw} must be withheld`);
+  }
+  assert.strictEqual(formatDisplayRating(4.6), '4.6');
+  assert.strictEqual(formatDisplayRating(4.66), '4.7');
+  assert.strictEqual(formatDisplayRating(5), '5');
+});
+
+check('R9 a suppressed rating with a rounding-trap value still shows its count', () => {
+  const r = resolveAtomicRatingPair({
+    brandRating: 4.54, brandReviewCount: 8343, brandAttribution: BRAND_LABEL,
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(r.source, 'brand-count');
+  assert.strictEqual(r.rating, null, '4.54 rounds to 4.5 — stars stay withheld');
+  assert.strictEqual(r.reviewCount, 8343);
+});
+
+check('R10 count text pluralises and drops attribution when unknown', () => {
+  const one = resolveAtomicRatingPair({
+    brandRating: 3.3, brandReviewCount: 1, brandAttribution: BRAND_LABEL,
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(one.reviewsText, `1 review · ${BRAND_LABEL}`);
+  const anon = resolveAtomicRatingPair({
+    brandRating: 3.3, brandReviewCount: 12, brandAttribution: null,
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(anon.reviewsText, '12 reviews');
+});
+
+check('R11 a 0-100 vendor scale never becomes stars, but its count survives', () => {
+  const r = resolveAtomicRatingPair({
+    brandRating: 87, brandReviewCount: 500, brandAttribution: BRAND_LABEL,
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(r.rating, null, '87 must never print as a star value');
+  assert.strictEqual(r.source, 'brand-count');
+});
+
+// ── T: `tier` must survive the byline strip ────────────────────────────
+// buildMetaForAd keys the count-only decision off primary_quote.tier, so the
+// strip deleting `tier` would silently disable the whole path.
+
+check('T1 llm-web keeps tier while every byline field is deleted', () => {
+  const printable = toPrintableCustomerQuote({
+    text: 'These are the comfiest shorts I own.',
+    origin: 'llm-web',
+    verbatim: false,
+    tier: 'brand',
+    author_name: 'vertexaisearch.cloud.google.com',
+    source: 'Reddit (r/BuyItForLife)',
+    verified: true,
+  });
+  assert.ok(printable, 'grounded llm-web text must remain printable');
+  assert.strictEqual(printable.tier, 'brand', 'tier must survive — the count path depends on it');
+  for (const f of BYLINE_FIELDS) {
+    assert.ok(!(f in printable), `byline field ${f} must be absent, not falsy`);
+  }
+  assert.ok(!('source' in printable), 'source is a domain, not a person');
+  assert.ok(!('verified' in printable), 'an unnamed "verified buyer" is still a persona');
+});
+
+check('T2 the video gate reseats the printable quote and preserves tier', () => {
+  const gated = gateLayoutInputQuotes({
+    input: {
+      social_proof: {
+        primary_quote: {
+          text: 'Held up through two seasons of training.',
+          origin: 'llm-web',
+          verbatim: false,
+          tier: 'brand',
+          author_name: 'UBeauty.com',
+        },
+      },
+    },
+  });
+  const pq = gated.input.social_proof.primary_quote;
+  assert.ok(pq, 'quote must be admitted');
+  assert.strictEqual(pq.tier, 'brand');
+  assert.ok(!('author_name' in pq), 'the gate must hand the cascade a stripped copy');
+});
+
+check('T3 an unstamped quote is withheld, so the count path stays shut', () => {
+  const gated = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: { text: 'Great!', tier: 'brand' } } },
+  });
+  const pq = gated.input.social_proof.primary_quote;
+  assert.strictEqual(pq, null, 'unstamped provenance must not print');
+  // This is what buildMetaForAd evaluates; it must be false, never throw.
+  assert.strictEqual(pq?.tier === 'brand', false);
+});
+
+check('T4 a product-tier quote must not enable the brand count', () => {
+  const gated = gateLayoutInputQuotes({
+    input: {
+      social_proof: {
+        primary_quote: { text: 'The shoes are very comfortable', origin: 'llm-web', tier: 'product' },
+      },
+    },
+  });
+  const pq = gated.input.social_proof.primary_quote;
+  assert.strictEqual(pq.tier, 'product');
+  assert.strictEqual(pq?.tier === 'brand', false, 'only a brand-tier quote may carry a brand count');
+});
+
+// ── C: the count-up parser must not truncate an uncommaed count ────────
+// Found by adversarial review, reproduced before fixing. reviewsText is built
+// UNCOMMAED by ratingDisplay ("41000 reviews · gymshark.com"), and the old
+// pattern `\d{1,3}(?:,\d{3})*|\d+` matched only "410" of "41000" because
+// alternation is ordered — so the count rolled 0→410 with a stray "00" beside
+// it and mid-animation frames read fabricated totals like "18800 reviews".
+// Only the settled frame looked correct, which is why post-settle contact
+// sheets never caught it. Mirrors the regex in remotion/lib/ratingMotion.js
+// (ESM, not requireable from CJS); C2 pins the source so the two cannot drift.
+const COUNT_RE = /^(\d+(?:,\d{3})*)/;
+function parseLeading(s) {
+  const m = String(s ?? '').match(COUNT_RE);
+  if (!m) return null;
+  return { target: Number(m[1].replace(/,/g, '')), suffix: String(s).slice(m[0].length) };
+}
+
+check('C1 uncommaed and commaed counts both parse whole', () => {
+  const cases = [
+    ['41000 reviews · gymshark.com', 41000, ' reviews · gymshark.com'],
+    ['8343 reviews · x.com',          8343, ' reviews · x.com'],
+    ['15,545 reviews',              15545, ' reviews'],
+    ['128 reviews',                   128, ' reviews'],
+    ['1 review',                        1, ' review'],
+    ['1,234,567 reviews',         1234567, ' reviews'],
+  ];
+  for (const [input, target, suffix] of cases) {
+    const got = parseLeading(input);
+    assert.ok(got, `${input} must parse`);
+    assert.strictEqual(got.target, target, `${input} target`);
+    assert.strictEqual(got.suffix, suffix, `${input} suffix must not swallow digits`);
+  }
+  assert.strictEqual(parseLeading('Trusted by thousands'), null, 'no leading integer → fade, not count');
+});
+
+check('C2 the renderer uses the same non-truncating pattern', () => {
+  const motionSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'remotion', 'lib', 'ratingMotion.js'), 'utf8');
+  // Strip comments before matching: the fix is DOCUMENTED by quoting the old
+  // broken pattern, so a naive source test fails on its own explanation.
+  const code = motionSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  assert.ok(
+    /\/\^\(\\d\+\(\?:,\\d\{3\}\)\*\)\//.test(code),
+    'ratingMotion must match \\d+ first, then optional comma groups'
+  );
+  assert.ok(
+    !/\\d\{1,3\}\(\?:,\\d\{3\}\)\*\|\\d\+/.test(code),
+    'the ordered-alternation pattern truncates uncommaed counts — must not come back'
+  );
+});
+
+// ── Q: the brand count may only ride the quote that ACTUALLY renders ───
+
+check('Q1 a brand count requires the rendered quote to BE the brand quote', () => {
+  // Mirrors the gate in buildMetaForAd. The rendered quote is cascaded.quote,
+  // and that cascade puts ad.copy.quote FIRST — so tier alone is not proof
+  // that the brand quote is what viewers see.
+  const gate = (pq, renderedQuote) => {
+    const brandQuoteText = pq?.tier === 'brand' ? String(pq.text || '').trim() : '';
+    return !!brandQuoteText && String(renderedQuote || '').trim() === brandQuoteText;
+  };
+  const brandPq = { tier: 'brand', text: 'Love this brand' };
+  assert.strictEqual(gate(brandPq, 'Love this brand'), true, 'brand quote renders → count allowed');
+  assert.strictEqual(
+    gate(brandPq, 'These leggings are perfect'), false,
+    'ad.copy.quote won the cascade → a brand count must NOT ride it'
+  );
+  assert.strictEqual(gate({ tier: 'product', text: 'x' }, 'x'), false, 'product tier never allows a brand count');
+  assert.strictEqual(gate(null, 'anything'), false, 'a withheld quote never allows a brand count');
+  assert.strictEqual(gate({ tier: 'brand', text: '' }, ''), false, 'an empty brand quote is not a quote');
+});
+
+check('Q2 buildMetaForAd compares against the rendered cascade value', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'brandScriptExecutor.js'), 'utf8');
+  assert.ok(
+    /renderedQuote\s*===\s*brandQuoteText/.test(src),
+    'the gate must compare the brand quote against cascaded.quote, not just read tier'
+  );
+});
+
+// ── S: renderer source pins (JSX/ESM is not requireable from CJS) ──────
+
+const slotContentSrc = fs.readFileSync(
+  path.join(__dirname, '..', 'remotion', 'lib', 'slotContent.js'), 'utf8');
+const slotRenderersSrc = fs.readFileSync(
+  path.join(__dirname, '..', 'remotion', 'components', 'slotRenderers.jsx'), 'utf8');
+
+check('S1 the rating slot is not emptied when only a count is present', () => {
+  // Was: `if (!Number.isFinite(rating) || rating <= 0) return null;` — which
+  // made a count-without-stars slot invisible no matter what upstream sent.
+  assert.ok(
+    /return null;/.test(slotContentSrc) && /!hasRating\s*&&\s*!reviewsText/.test(slotContentSrc),
+    'slotContent must only bail when there is NEITHER a rating nor a count'
+  );
+  assert.ok(
+    !/if\s*\(!Number\.isFinite\(rating\)\s*\|\|\s*rating\s*<=\s*0\)\s*return null/.test(slotContentSrc),
+    'the old rating-only bail must be gone'
+  );
+});
+
+check('S2 no rating resolves to null — distinguishable from zero stars', () => {
+  assert.ok(
+    /rating:\s*hasRating\s*\?/.test(slotContentSrc),
+    'rating must be conditional on hasRating so the renderer can tell null from 0'
+  );
+});
+
+check('S3 the star row is skipped entirely when there is no rating', () => {
+  // StarRow computes Math.max(0, Number(rating) || 0), so a null rating would
+  // draw FIVE EMPTY STARS — worse than showing nothing for a brand whose
+  // rating the owner rule deliberately suppressed.
+  const starRowIdx = slotRenderersSrc.indexOf('<StarRow');
+  assert.ok(starRowIdx > -1, '<StarRow> must still exist for the rating-present path');
+  // Proximity matters. A bare "does the file contain `rating != null ?`" pin
+  // stays GREEN when the guard is deleted, because countStartSec uses the same
+  // expression ~80 lines earlier — proven by revert-proofing this very check.
+  // So require the guard in the window immediately preceding <StarRow>.
+  const window = slotRenderersSrc.slice(Math.max(0, starRowIdx - 400), starRowIdx);
+  assert.ok(
+    /rating\s*!=\s*null\s*\?/.test(window),
+    'the star row must be wrapped in a `rating != null ?` guard, not merely mentioned elsewhere'
+  );
+});
+
+check('S4 the count animation does not wait for stars that never render', () => {
+  assert.ok(
+    /countStartSec\s*=\s*rating\s*!=\s*null\s*\?\s*lastStarLandSec\(\)\s*:\s*0/.test(slotRenderersSrc),
+    'with no stars there is nothing to wait for — start the count at slot enter'
+  );
+});
+
+check('S5 the proof beat stays Remotion-deterministic', () => {
+  // Match CALL syntax, not prose: these files legitimately discuss the ban in
+  // comments ("never Date/random/setTimeout"), and a substring test on the bare
+  // name fails on the documentation instead of on real non-determinism.
+  const CALLS = [/\bDate\.now\s*\(/, /\bMath\.random\s*\(/, /\bsetTimeout\s*\(/, /\bnew\s+Date\s*\(/];
+  for (const [name, src] of [['slotContent.js', slotContentSrc], ['slotRenderers.jsx', slotRenderersSrc]]) {
+    const stripped = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1');
+    for (const re of CALLS) {
+      assert.ok(!re.test(stripped), `${name} must not call ${re.source} — it breaks frame-derived rendering`);
+    }
+  }
+});
+
+// ── A: artifact selection prefers fresh but never discards usable data ──
+
+const executorSrc = fs.readFileSync(
+  path.join(__dirname, '..', 'services', 'brandScriptExecutor.js'), 'utf8');
+
+check('A1 buildMetaForAd scopes the artifact lookup by productId', () => {
+  // Without this, media carrying several products can hand an ad ANOTHER
+  // product's copy and quote via the createdAt sort.
+  assert.ok(
+    /productId:\s*productIdKey/.test(executorSrc) || /productId:\s*ad\.productId\s*\|\|\s*null/.test(executorSrc),
+    'the lookup must be scoped to the ad\'s product'
+  );
+});
+
+check('A2 a stale artifact is DEMOTED, never discarded', () => {
+  // Ten meta fields take layoutInput as their FIRST cascade source —
+  // including rating and reviewCount themselves, plus deliveryLine, badges,
+  // benefits. Filtering stale artifacts out of the query would thin the close
+  // phase and delete the very stars this work restores. The unstamped quote is
+  // already handled by gateLayoutInputQuotes.
+  const scoped = /findOne\(scope\)/.test(executorSrc);
+  assert.ok(scoped, 'there must be a fallback lookup without the schemaVersion filter');
+  assert.ok(/STALE/.test(executorSrc), 'serving a stale artifact must be logged');
+});
+
+// ── report ─────────────────────────────────────────────────────────────
+
+if (failures.length) {
+  console.error(`\n❌ verifyProofBeat: ${failures.length} failed, ${pass} passed`);
+  for (const f of failures) console.error(`   - ${f}`);
+  process.exit(1);
+}
+console.log(`✅ verifyProofBeat: ${pass}/${pass} checks passed`);

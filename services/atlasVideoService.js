@@ -41,7 +41,11 @@ const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
 
-const { buildLayoutInput }   = require('./layoutInputService');
+// INPUT_SCHEMA_VERSION drives the staleness check in
+// refreshStaleLayoutInput() below (see that function's comment) — it is
+// layoutInputService's own constant, imported rather than hardcoded so the
+// two files can't drift on what "current schema" means.
+const { buildLayoutInput, INPUT_SCHEMA_VERSION } = require('./layoutInputService');
 
 // Generative reframe (video reference path only). Outpaint every ref to
 // the target aspect so the product stays fully visible; store labeled
@@ -181,6 +185,40 @@ const REFRAME_CLAIM_TTL_MS = () => {
   // also absorbs modest clock skew between processes, since `claim.at` is
   // written from each process's own wall clock rather than server time.
   return Math.max(configured, MAX_POLL_MS + 10 * 60 * 1000);
+};
+
+// How long a claim LOSER polls for the winner's reframe before degrading to
+// the deterministic crop. waitForReframeUrl sleeps 1s,2s,…,Ns between reads,
+// so attempts=26 ≈ 5m51s — sized to the measured worst-case cold reframe
+// stage (5m19s, 3 serialized outpaints). Raised from the historical 3 (~6s)
+// when the wizard prewarm landed: a Generate clicked while a prewarm outpaint
+// is mid-flight used to lose the claim, give up after 6s, and silently ship a
+// CROPPED reference where every other run got the generative one. Waiting for
+// the winner is strictly better: the loser path NEVER submits, so a longer
+// wait cannot create spend — worst case (winner died mid-flight) the
+// claim-death early exit below fires and it crops in seconds.
+//
+// HARD COUPLING TO THE LEASE: waitForReframeUrl sleeps 1s,2s,…,Ns, so a run of
+// n attempts spans sum(1..n) seconds. That total MUST stay under
+// REFRAME_CLAIM_TTL_MS: once the lease ages out, a third process may steal the
+// claim and submit — and a loser still sleeping past that point would return a
+// url (or crop) chosen while a second billable flight was already away. The
+// clamp below walks n down until the span fits, so raising the env var can
+// never reopen the steal window (adversarial finding 5). n=26 → 351s, well
+// under the ≥20 min TTL floor.
+const REFRAME_CLAIM_WAIT_ATTEMPTS = () => {
+  const n = Number(process.env.REFRAME_CLAIM_WAIT_ATTEMPTS);
+  const requested = Number.isFinite(n) && n >= 1 ? Math.min(60, Math.floor(n)) : 26;
+  const ttlSec = REFRAME_CLAIM_TTL_MS() / 1000;
+  let capped = requested;
+  while (capped > 1 && (capped * (capped + 1)) / 2 >= ttlSec) capped--;
+  if (capped !== requested) {
+    console.warn(
+      `⚠️  REFRAME_CLAIM_WAIT_ATTEMPTS=${requested} would sleep past the claim lease ` +
+      `(${Math.round(ttlSec)}s) — clamped to ${capped}`
+    );
+  }
+  return capped;
 };
 
 // Titling is CANONICAL by default. The layoutInput derivation template is
@@ -1334,19 +1372,54 @@ async function releaseReframeClaim(mediaId, aspectKey, claimBy) {
   }
 }
 
-// Loser wait: a couple of short re-reads for the winner's url. Generation can
-// take minutes, so this usually returns null and the caller crops — never
-// spends. Next render hits the persistent cache once the winner persists.
+// Loser wait: re-read for the winner's url with 1s,2s,…,Ns backoff, returning
+// the moment it lands. Attempts come from REFRAME_CLAIM_WAIT_ATTEMPTS at the
+// claim-loss call site (default ≈6 min — sized to a full cold reframe so a
+// run racing the wizard prewarm inherits the generative asset instead of
+// degrading to a crop). Never spends; on timeout the caller crops.
 // Deliberately accepts a STALE url too: during a re-derive the older asset is
 // still a real, correctly-shaped image, so serving it to a concurrent render
 // beats a destructive crop and costs nothing.
+//
+// CLAIM-DEATH EARLY EXIT — the reason a multi-minute wait is safe. Sleeping the
+// full span only makes sense while a winner is actually working; if the holder
+// died (instance replaced mid-deploy — the prewarm is a long fire-and-forget on
+// the web process, so this is a real shape) a fixed wait would burn the whole
+// span and then crop anyway, holding a render slot for nothing. Two cheap
+// signals end the wait immediately, both read from the same document we already
+// fetch each tick:
+//   • entry gone / no claim → releaseReframeClaim ran with no url, i.e. the
+//     winner gave up. Nothing is coming.
+//   • claim.at older than the lease → holder is dead; the claim is now
+//     stealable, so waiting on it is waiting on nobody.
+// Neither can fire while a live holder works: tryClaimReframe writes claim
+// before the submit and the lease floor (≥20 min) far outlasts a reframe.
+// Returning null degrades to the caller's deterministic crop — never spend.
 async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
+  const path = reframeClaimPath(aspectKey);
+  const claimTtlMs = REFRAME_CLAIM_TTL_MS();
   for (let i = 0; i < attempts; i++) {
     await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     try {
-      const fresh = await Media.findById(mediaId).select(`metadata.reframes.${aspectKey}`).lean();
-      const url = fresh?.metadata?.reframes?.[aspectKey]?.url;
+      const fresh = await Media.findById(mediaId).select(path).lean();
+      const entry = fresh?.metadata?.reframes?.[aspectKey];
+      const url = entry?.url;
       if (typeof url === 'string' && url.trim()) return url;
+
+      if (!entry || !entry.claim) {
+        console.log(
+          `   ⏳ reframe[${aspectKey}]: winner released without a result — cropping now (no spend)`
+        );
+        return null;
+      }
+      const claimedAt = Date.parse(entry.claim.at);
+      if (Number.isFinite(claimedAt) && Date.now() - claimedAt > claimTtlMs) {
+        console.warn(
+          `⚠️  reframe[${aspectKey}]: winner's claim aged past the lease ` +
+          `(${Math.round((Date.now() - claimedAt) / 1000)}s) — holder presumed dead, cropping now`
+        );
+        return null;
+      }
     } catch { /* retry / fall through */ }
   }
   return null;
@@ -1511,9 +1584,12 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         const won = await tryClaimReframe(media._id, aspectKey, claimBy);
         if (!won) {
           console.log(
-            `   ⏳ reframe[${aspectKey}]: claim held by another process — waiting briefly, no spend`
+            `   ⏳ reframe[${aspectKey}]: claim held by another process — waiting for winner ` +
+            `(≤${REFRAME_CLAIM_WAIT_ATTEMPTS()} reads, no spend)`
           );
-          const winnerUrl = await waitForReframeUrl(media._id, aspectKey);
+          const winnerUrl = await waitForReframeUrl(
+            media._id, aspectKey, REFRAME_CLAIM_WAIT_ATTEMPTS()
+          );
           if (winnerUrl) return winnerUrl;
           console.warn(
             `⚠️  reframeReferenceForAspect[${aspectKey}]: claim loser — winner result not ready, cropping (no spend)`
@@ -2457,6 +2533,59 @@ async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, v
 
 // ── Public API ────────────────────────────────────────────────────────
 
+// Rebuild the LayoutInputArtifact when it's missing OR stale — built
+// against an older INPUT_SCHEMA_VERSION than layoutInputService emits
+// today. Only emptiness used to gate a rebuild at both call sites below,
+// so a stale-but-populated artifact was served forever: 722 of 738
+// production artifacts predate the 4.1 quote-provenance stamp, and the
+// render-time provenance gate (quoteProvenance.js) silently WITHHOLDS
+// any customer quote that isn't stamped with today's provenance fields —
+// which is why customer quotes were disappearing from videos even
+// though the underlying reviews existed. This helper defers the actual
+// staleness decision to buildLayoutInput's own cache lookup (a
+// schemaVersion mismatch is already treated as a cache MISS there, see
+// layoutInputService.js ~282-293) rather than re-deriving that rule a
+// third time here — the lpStale check below is only a cheap guard so we
+// don't call buildLayoutInput at all when the artifact is already
+// current. Shared by prepareStoryboard and generateForAd, which both
+// call it with the same shape of already-loaded docs. Preserves exactly:
+// the non-fatal try/catch, the noteRenderIssue({...}) call, the timing
+// log ("derived in Nms"), and the post-build re-read keyed on
+// {mediaId, productId}.
+async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product, categories, campaign, targetAspect }) {
+  const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
+  const lpStale = !lpEmpty && layoutInput.schemaVersion !== INPUT_SCHEMA_VERSION;
+  if ((lpEmpty || lpStale) && ad.productId) {
+    const tmpl = resolveTitleTemplate({ brand, product, categories });
+    try {
+      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
+      const t0 = Date.now();
+      await buildLayoutInput({
+        mediaId:     media._id,
+        template:    tmpl,
+        aspectRatio: targetAspect,
+        options: {
+          campaignKind:  campaign?.kind || 'product',
+          variantKind:   'product_image',
+          productId:     ad.productId,
+          paletteSource: 'media'
+        }
+      });
+      console.log(`📐 layoutInput[ad=${ad._id}]: derived in ${Date.now() - t0}ms`);
+      layoutInput = await LayoutInputArtifact
+        .findOne({ mediaId: media._id, productId: ad.productId })
+        .sort({ createdAt: -1 }).lean();
+    } catch (err) {
+      console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
+      noteRenderIssue(ad._id, {
+        message: `layoutInput derivation failed: ${err.message}`,
+        stage: 'layoutInput'
+      });
+    }
+  }
+  return layoutInput;
+}
+
 // Prepare the storyboard for an ad — context load + GPT storyboard
 // generation, no video generation. Used by the orchestrator to produce
 // the storyboard once before dispatching Grok and chrome in parallel.
@@ -2486,43 +2615,22 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
   });
   logResolution(ad._id, model, renderAspect, targetAspect, fallback);
 
-  // Derive layoutInput if missing — the brand-script overlay downstream
-  // reads its copy/proof/product/theme fields directly. The overlay is
-  // sized to the FINAL canvas (targetAspect), so derivation runs at the
-  // platform aspect, NOT the render aspect. Passing renderAspect here
-  // was the source of the "template ai_brand_led does not support
-  // aspect ratio 3:4" warnings on 4:5 ads — the template supports 4:5
-  // fine; it was being asked about the Grok fallback aspect.
+  // Derive layoutInput if missing OR stale (schemaVersion !== the
+  // current INPUT_SCHEMA_VERSION) — the brand-script overlay downstream
+  // reads its copy/proof/product/theme fields directly, INCLUDING the
+  // provenance-stamped primary_quote. A stale-but-populated artifact
+  // used to be served forever because only the empty check gated a
+  // rebuild; see refreshStaleLayoutInput() above for why that silently
+  // withholds customer quotes at render time. The overlay is sized to
+  // the FINAL canvas (targetAspect), so derivation runs at the platform
+  // aspect, NOT the render aspect. Passing renderAspect here was the
+  // source of the "template ai_brand_led does not support aspect ratio
+  // 3:4" warnings on 4:5 ads — the template supports 4:5 fine; it was
+  // being asked about the Grok fallback aspect.
   let layoutInput = layoutInputInitial;
-  const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
-  if (lpEmpty && ad.productId) {
-    const tmpl = resolveTitleTemplate({ brand, product, categories });
-    try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
-      const t0 = Date.now();
-      await buildLayoutInput({
-        mediaId:     media._id,
-        template:    tmpl,
-        aspectRatio: targetAspect,
-        options: {
-          campaignKind:  campaign?.kind || 'product',
-          variantKind:   'product_image',
-          productId:     ad.productId,
-          paletteSource: 'media'
-        }
-      });
-      console.log(`📐 layoutInput[ad=${ad._id}]: derived in ${Date.now() - t0}ms`);
-      layoutInput = await LayoutInputArtifact
-        .findOne({ mediaId: media._id, productId: ad.productId })
-        .sort({ createdAt: -1 }).lean();
-    } catch (err) {
-      console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
-      noteRenderIssue(ad._id, {
-        message: `layoutInput derivation failed: ${err.message}`,
-        stage: 'layoutInput'
-      });
-    }
-  }
+  layoutInput = await refreshStaleLayoutInput({
+    layoutInput, ad, media, brand, product, categories, campaign, targetAspect
+  });
 
   // Storyboard retired on the Atlas path: the Ken Burns prompt fully
   // specifies camera + timeline for every registered model, so the GPT
@@ -2578,44 +2686,28 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // Video pipeline previously skipped layoutInput derivation, so
   // products that hadn't been through the image-gen pipeline arrived
   // here with no derived rating/price/benefits/badges/proof data.
-  // Trigger derivation now if the artifact is missing or empty, using the
-  // CANONICAL template (or the brand/product Title Studio override) — the
-  // creative director no longer influences it. The builder caches per
-  // (mediaId, template, aspectRatio, productId, variantKind,
+  // Trigger derivation now if the artifact is missing OR stale
+  // (schemaVersion !== INPUT_SCHEMA_VERSION), using the CANONICAL
+  // template (or the brand/product Title Studio override) — the
+  // creative director no longer influences it. Staleness matters as
+  // much as emptiness: 722 of 738 production artifacts predate the 4.1
+  // quote-provenance stamp, and a stale-but-populated artifact used to
+  // be served forever (only the empty check gated a rebuild) — its
+  // UNSTAMPED customer quotes then get silently withheld by the
+  // render-time provenance gate, which is why customer quotes were
+  // disappearing from videos. See refreshStaleLayoutInput() above: it
+  // defers to buildLayoutInput's own cache, which already treats a
+  // schemaVersion mismatch as a MISS and rebuilds (layoutInputService.js
+  // ~282-293), rather than duplicating that rule here. The builder
+  // caches per (mediaId, template, aspectRatio, productId, variantKind,
   // campaignContextHash) — so subsequent runs hit the cache instead of
   // re-deriving. Derivation runs at the TARGET (platform) aspect since
   // the derived layout describes chrome sized to the final canvas, not
   // the raw video render aspect. Non-fatal on failure.
   let layoutInput = layoutInputInitial;
-  const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
-  if (lpEmpty && ad.productId) {
-    const tmpl = resolveTitleTemplate({ brand, product, categories });
-    try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
-      const t0 = Date.now();
-      await buildLayoutInput({
-        mediaId:     media._id,
-        template:    tmpl,
-        aspectRatio: targetAspect,
-        options: {
-          campaignKind:  campaign?.kind || 'product',
-          variantKind:   'product_image',
-          productId:     ad.productId,
-          paletteSource: 'media'
-        }
-      });
-      console.log(`📐 layoutInput[ad=${ad._id}]: derived in ${Date.now() - t0}ms`);
-      layoutInput = await LayoutInputArtifact
-        .findOne({ mediaId: media._id, productId: ad.productId })
-        .sort({ createdAt: -1 }).lean();
-    } catch (err) {
-      console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
-      noteRenderIssue(ad._id, {
-        message: `layoutInput derivation failed: ${err.message}`,
-        stage: 'layoutInput'
-      });
-    }
-  }
+  layoutInput = await refreshStaleLayoutInput({
+    layoutInput, ad, media, brand, product, categories, campaign, targetAspect
+  });
 
   const lpInput    = layoutInput?.input || null;
   const lpSrcMedia = lpInput?.source_media || null;

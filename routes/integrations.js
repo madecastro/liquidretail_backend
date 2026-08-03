@@ -824,7 +824,9 @@ router.post('/instagram/catalog/:productId/refresh-reviews', async (req, res) =>
     const fresh = await geminiSearch.lookupProductReviews({
       productName: product.title,
       brandName:   brand?.name,
-      productUrl:  product.productUrl
+      productUrl:  product.productUrl,
+      brandId,                        // cost-ledger linkage (CostLog.brandId)
+      productId:   product._id
     });
     if (!fresh) {
       return res.status(502).json({ error: 'review lookup returned no result' });

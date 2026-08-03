@@ -364,6 +364,40 @@ genuinely beats a heuristic:
 | `geminiSearchProvider.lookup{Brand,Product}Reviews` | grounded web search when the free scrape found **nothing** | gap-fill only, capped `CATALOG_ENRICHMENT_MAX_PER_RUN` (500), cached 30 days | `gemini-2.5-flash` |
 | `productDetailsService.fetchReviewSummary` | narrative review summary | user-actuated "Enrich" only (~$0.05-0.12/product) | `gemini-2.5-flash` |
 
+#### What a grounded review lookup actually costs — and where it lands
+
+`lookup{Brand,Product}Reviews` are **two** billable POSTs each, not one: a grounded
+`google_search` pass, then a plain JSON-structuring pass. Both now ledger to
+**`CostLog`** under `stage: 'brand_reviews' | 'product_reviews'`, split by
+`purposeTag: 'grounded_search' | 'json_structure'` — see
+`scripts/verifyGeminiSearchCost.js`. Until 2026-08-03 they were the only
+review-path LLM calls with **no cost tracking at all**, because they hit the raw
+`generativelanguage` REST endpoint rather than `atlasLlmService`.
+
+**Grounding dominates the bill, and it is not a token cost.** Google charges
+Search grounding *per prompt* on 2.5 models — $35/1,000 after a free 1,500/day —
+so one lookup is roughly:
+
+| component | cost |
+|---|---|
+| grounded pass tokens (~1.5k out) | ~$0.004 |
+| **grounding surcharge** | **$0.035** |
+| structuring pass tokens | ~$0.001 |
+| **total per lookup** | **~$0.040** |
+
+Token math alone would have reported ~$0.005 — about **10x** understated. The
+surcharge is `costTracker.GROUNDED_SEARCH_COST_PER_REQUEST_USD`; set
+`GEMINI_GROUNDING_COST_USD=0` while inside the free daily allowance. Two
+approximations are deliberate and documented at that constant: the surcharge is
+*declared* (the tool was enabled) rather than *confirmed* from
+`groundingMetadata`, and per-prompt billing is a **2.5-era rule** — Gemini 3 bills
+per executed search query, so a model bump changes the unit.
+
+**Still unledgered on this path (known gap, not fixed here):**
+`geminiSearchProvider.match` / `.lookupBrandCategoryUrl`,
+`categoryReviewsService`, and `productDetailsService.fetchReviewSummary` all POST
+the same raw endpoint with no `trackLlmCall` and no `maxRedirects: 0`.
+
 ### The `review-text` role — chosen by measurement
 
 Added to `services/atlasModelMap.js` so review-text model choice lives in **one**
