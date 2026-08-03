@@ -660,20 +660,36 @@ function gateLayoutInputQuotes(layoutInput) {
 
 /**
  * Clean a catalog product title for on-screen DISPLAY.
- * Strips a trailing parenthetical colorway/variant
- * ("Women's Breezer Point - Warm Red (Dark Cocoa Sole)" →
- *  "Women's Breezer Point - Warm Red"), collapses whitespace.
- * Returns { productName, productNameFull } so callers keep the raw title.
- * Exported for the verify harness.
+ * Order: trailing parenthetical → pipe-suffix → trailing " - X" segment
+ * (dash only when remainder is ≥2 words or ≥8 chars so short names like
+ * "Mach 5 - Turbo" keep their integral dash). productNameFull is untouched.
+ * Returns { productName, productNameFull }. Exported for the verify harness.
  */
 function cleanProductNameForDisplay(name) {
   if (name == null) return { productName: null, productNameFull: null };
   const full = String(name).replace(/\s+/g, ' ').trim();
   if (!full) return { productName: null, productNameFull: null };
-  // Strip one or more trailing "(…)" segments (colorways, sole, pack size).
   let cleaned = full;
+  // 1) Strip one or more trailing "(…)" segments (colorways, sole, pack size).
   while (/\s*\([^)]*\)\s*$/.test(cleaned)) {
     cleaned = cleaned.replace(/\s*\([^)]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
+  }
+  // 2) Strip everything from the first " | " onward (fit notes, SKU tail).
+  const pipeIdx = cleaned.indexOf(' | ');
+  if (pipeIdx > 0) {
+    cleaned = cleaned.slice(0, pipeIdx).replace(/\s+/g, ' ').trim();
+  }
+  // 3) Strip a trailing " - X" segment only when what remains is still a
+  // real product name: ≥2 words AND ≥8 chars. Either gate alone is not
+  // enough — "Mach 5 - Turbo" (2 words, 6 chars) must keep its dash;
+  // "Women's Breezer Point - Warm Red" (3 words, 21 chars) strips.
+  const dashMatch = cleaned.match(/^(.*?)(\s+-\s+.+)$/);
+  if (dashMatch) {
+    const head = dashMatch[1].replace(/\s+/g, ' ').trim();
+    const wordCount = head ? head.split(/\s+/).length : 0;
+    if (head && wordCount >= 2 && head.length >= 8) {
+      cleaned = head;
+    }
   }
   if (!cleaned) cleaned = full;
   return { productName: cleaned, productNameFull: full };

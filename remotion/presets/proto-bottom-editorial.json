@@ -1,6 +1,6 @@
 {
   "name": "proto-bottom-editorial",
-  "description": "EXPERIMENTAL scoring prototype \u2014 inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
+  "description": "EXPERIMENTAL scoring prototype — inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -183,9 +183,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {
@@ -383,9 +383,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {
@@ -556,9 +556,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {
@@ -729,9 +729,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {

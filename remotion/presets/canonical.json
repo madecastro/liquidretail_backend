@@ -1,6 +1,6 @@
 {
   "name": "canonical",
-  "description": "Default canonical titling \u2014 brand-neutral 9-slot / 3-phase architecture (hook \u2192 proof \u2192 close). Vertical uses the full height of the frame: upper editorial for hook/proof, lower conversion close for productName + delivery + CTA. Feed/square keep a bottom-anchored conversion stack; square is feed single-lined for the 1:1 canvas. Landscape is a left-column stack with delivery + visible CTA. Times authored for the nominal 8s clip (timing.js compresses to shorter plates). CTA visible on every format. Scrim none everywhere. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
+  "description": "Default canonical titling — brand-neutral 9-slot / 3-phase architecture (hook → proof → close). Vertical uses the full height of the frame: upper editorial for hook/proof, lower conversion close for productName + delivery + CTA. Feed/square keep a bottom-anchored conversion stack; square is feed single-lined for the 1:1 canvas. Landscape is a left-column stack with delivery + visible CTA. Times authored for the nominal 8s clip (timing.js compresses to shorter plates). CTA visible on every format. Scrim none everywhere. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -232,9 +232,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {
@@ -453,9 +453,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {
@@ -674,9 +674,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {
@@ -905,9 +905,9 @@
             "shadow": "soft",
             "casing": "none",
             "fontRole": "body",
-            "weight": 500,
+            "weight": 600,
             "maxLines": 1,
-            "colorToken": "textSecondary"
+            "sizeScale": 1.1
           }
         },
         {

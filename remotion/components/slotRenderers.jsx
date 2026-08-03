@@ -391,7 +391,9 @@ export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
   const t = slot.treatment;
   const size = baseSize('deliveryLine', format, t.sizeScale);
   const font = tokenFont(tokens, 'body');
-  const color = tokenColor(tokens, t.colorToken === 'textPrimary' ? 'textSecondary' : t.colorToken);
+  // Inherit primary ink (and plate-intel contrast flip) — do NOT demote to
+  // textSecondary. Weight comes from treatment (presets set 600).
+  const color = tokenColor(tokens, t.colorToken || 'textPrimary');
   const showTruck = meta?.endcardMode !== 'brand';
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-flex', alignItems: 'center', gap: Math.round(size * 0.5) }}>
@@ -399,13 +401,13 @@ export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
       <span
         style={{
           fontFamily: fontFamilyCss(font),
-          fontWeight: 500,
+          fontWeight: t.weight || 600,
           fontSize: size,
           color,
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
-          textShadow: TEXT_SHADOWS.soft,
+          textShadow: TEXT_SHADOWS[t.shadow] || TEXT_SHADOWS.soft,
         }}
       >
         {applyCasing(content, t.casing)}
