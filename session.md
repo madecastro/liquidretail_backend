@@ -579,6 +579,19 @@ ease-out with tabular-nums; settle 1.48s; all useCurrentFrame-deterministic. Sui
 global median plate luma (>0.55 -> on-light), logged. Then canon5 re-render + artifact
 refresh (same URL).
 
+### 0.29995 CANON5 — iteration 4 VERIFIED IN FRAME; artifact refreshed (same URL)
+
+14/14 re-titled on `b97991d`. Live log evidence: `keepOut: top->center (face band)` x2 fired;
+`inkVote: light=3 dark=3 tie -> globalLum 0.81 -> on-light` — both iteration-4 mechanisms
+working. Frame review: Pelagic proof lockup fully OFF the face (brand-navy claim + large gold
+5.0/5); Vuori shows the complete lockup incl. "15445 reviews · vuoriclothing.com"; AllBirds
+proof headline rides the red toe in white Playfair — correct per-plate ink (verified at full
+res; three separate low-res sheet misreads this session — ALWAYS zoom the native frame before
+judging ink/animation; sheet proof frame is 4.6s post-settle for this reason).
+Approval-grid artifact refreshed in place:
+https://claude.ai/code/artifact/535b2728-b623-4898-9841-518e89b03798 (iteration 4 status).
+AWAITING OWNER: approve -> full 367 sweep + persona scoring; or flag -> next $0 iteration.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
