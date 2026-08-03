@@ -457,6 +457,46 @@ one render-ssh session may not exist in the next; write+launch in ONE session, m
 The worker is single-instance and safe for long drivers. /tmp scripts can't require app
 modules (documented trap; bit again — run from /opt/render/project/src).
 
+### 0.299 TEAM-DAY READINESS — VALIDATED 2026-08-04 ~02:30 (read this first tomorrow)
+
+**Prod = `bb024b8` on both services. Suite 34/34. Canonical titling: WORKING, frame-verified
+in all four sizes** (final contact sheets delivered to owner ~02:05; canon3 = iteration-2
+build: keep-out off faces, consistent ink, cleaned names, legible deliveryLine, CTA everywhere,
+no brand pill).
+
+**Production validations run tonight (total ~$2.05):**
+- STATIC regenerate: 74s, healthy, logo composited, >4.5 star gate live (weak rating correctly
+  suppressed), NO invented emblem this sample. $0.01 ledgered `ok`.
+- VIDEO regenerate, DEFAULT PATH (empty prompt — exactly what the team clicks): **full pipeline
+  97s** (Omni was fast: submit 09:06:47Z -> master +52s -> titled +41s), $1 ledgered
+  `submitted`, **REPEAT-PRIMARY CONFIRMED LIVE** (1 distinct ref -> [primary, primary]), and
+  the close RETURNS TO THE FRONT-FACING PRIMARY VIEW with CTA + allbirds.com attribution.
+  NOTE a correction: an earlier in-session read that empty-prompt regens dedupe to $0 was
+  WRONG — the explicit regenerate route always regens fully (adRegenerateService: "video
+  always regens fully", effMode='full'). Every explicit video regenerate costs ~$1. The
+  accidental-double-click protection lives on the GENERATE path digest, not regenerate.
+- Earlier prompt-lever regen ($1): ending fixed via operator prompt; found Omni mangles
+  on-product wordmarks on zoom shots ("wfoirds") — vision-QC case, video-side proof.
+
+**KNOWN LIMITATION for tomorrow:** proof phase renders empty when a brand has neither a
+gate-passing quote nor a >4.5 rating pair (product or brandReviews). AllBirds sheet row shows
+it. Not a crash — just a quiet middle beat. Brand enrichment for GymShark/Peloton/Soludos2/
+Fellow would populate personas + brandReviews.
+
+**GROK CLI IS SIGNED OUT** (`Not signed in`) — every Grok path is down until `grok login`
+(or device-code) is run interactively. Subagents covered tonight's remaining work.
+
+**Efficiency audit** (owner-requested): two subagent audits over render + generation paths
+were in flight at handoff-write; findings land in this file / the conversation when done.
+Seeds already measured: webpack bundle rebuilt per driver invocation (4-10s), Chrome 91.9MB
+per fresh instance, plate scan now per-render (cacheable on Ad like basePlate crops),
+storyboard-LLM-on-regen possibly wasted on canonical path, fixed 15s Omni poll, video costs
+never reconciled to actuals (veoPredictionId is persisted; image reconcile pattern exists).
+
+**PARKED, awaiting owner:** funnel-variant A/B (presets exist + validate), 6-template pilot,
+full 367 sweep + persona scoring, AI endcard arm ($0.01/video), per-group brand-tokened ink
+(owner allowed multi-color), Title Studio preview!=ship warning.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
