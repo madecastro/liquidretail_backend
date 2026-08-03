@@ -14,6 +14,56 @@
 const RATING_STAR_MIN = 4.5;
 
 /**
+ * Product-tier volume exception (owner, verbatim):
+ *   "if the count is large (greater than 5000), than stars above 4.19 is allowed"
+ *
+ * Both comparisons are STRICT (`>`), as written. Both are applied to the
+ * ROUNDED one-decimal display value (same convention as RATING_STAR_MIN), so
+ * the viewer never sees a number the floor would forbid.
+ *
+ * BOUNDARY CONSEQUENCE (not a bug): a raw 4.15 displays as "4.2" and therefore
+ * PASSES a 4.19 floor (`4.2 > 4.19`). The gate is deliberately on what the
+ * VIEWER READS, matching the existing `>4.5` convention. The effective raw
+ * cutoff under one-decimal rounding is therefore 4.15 (anything that rounds
+ * to 4.1 fails; anything that rounds to 4.2 with count > 5000 passes). Do not
+ * "fix" this by asserting raw 4.19 refuses — raw 4.19 also displays as 4.2.
+ *
+ * Count floor is exclusive: 5000 does NOT unlock; 5001 does.
+ *
+ * SCOPE: product-tier only. Brand keeps the strict >4.5 rule (see
+ * BRAND_VOLUME_EXCEPTION_ENABLED below for a one-line overrule).
+ */
+const RATING_STAR_VOLUME_MIN = 4.19;
+const RATING_STAR_VOLUME_COUNT_MIN = 5000;
+
+/**
+ * One-line switch: set true to also apply the volume exception to brand stars.
+ * Default OFF — brand already has a defined fail path (count without stars
+ * beside a brand-side quote). Owner may overrule later without hunting call sites.
+ */
+const BRAND_VOLUME_EXCEPTION_ENABLED = false;
+
+/**
+ * Quote tier → which NUMBER snapshot may print beside it.
+ *
+ * Owner decision 2026-08-03: category sits on the BRAND side, accepting that a
+ * category quote beside a catalog-wide count is a looser claim than product.
+ * Edit THIS table only if that policy changes — do not scatter tier checks
+ * across renderers.
+ *
+ *   product  → product numbers only
+ *   comment  → product numbers only   (product-scoped social comments)
+ *   category → brand numbers only     (owner: brand side — looser claim accepted)
+ *   brand    → brand numbers only
+ */
+const QUOTE_TIER_NUMBER_SIDE = Object.freeze({
+  product:  'product',
+  comment:  'product',
+  category: 'brand',
+  brand:    'brand',
+});
+
+/**
  * Format a raw rating for display, or withhold it.
  *
  * WHY the gate tests the ROUNDED (one-decimal) value, not the raw one:
@@ -24,16 +74,26 @@ const RATING_STAR_MIN = 4.5;
  *   rating_value=4.54  passesGate=true  -> displays "4.5"
  *   rating_value=4.55  passesGate=true  -> displays "4.5"
  * Compute the displayed number first, then require THAT to be
- * `> RATING_STAR_MIN` and `<= 5`. Upper bound still catches a 0–100 vendor
+ * `> starMin` and `<= 5`. Upper bound still catches a 0–100 vendor
  * scale that would otherwise render as "87 stars".
  *
+ * BOUNDARY CONSEQUENCE for a non-default floor (e.g. volume 4.19): a raw 4.15
+ * displays as "4.2" and therefore passes `displayed > 4.19`. The gate is on
+ * what the VIEWER READS, matching the existing `>4.5` convention; the
+ * effective raw cutoff under one-decimal rounding is 4.15. Not a bug.
+ *
  * @param {*} raw  Candidate rating (must be a finite number to print).
+ * @param {number|{starMin?:number}} [opts] Optional star floor. A bare number
+ *   or `{ starMin }` both work. Default is RATING_STAR_MIN (today's behaviour).
  * @returns {string|undefined} display string (e.g. "4.6") or undefined to withhold.
  */
-function formatDisplayRating(raw) {
+function formatDisplayRating(raw, opts) {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined;
+  const starMin = (opts != null && typeof opts === 'object')
+    ? (typeof opts.starMin === 'number' ? opts.starMin : RATING_STAR_MIN)
+    : (typeof opts === 'number' ? opts : RATING_STAR_MIN);
   const displayed = Number(raw.toFixed(1));
-  if (!(displayed > RATING_STAR_MIN && displayed <= 5)) return undefined;
+  if (!(displayed > starMin && displayed <= 5)) return undefined;
   return String(displayed);
 }
 
@@ -83,6 +143,42 @@ function formatBrandReviewsText(rc, brandAttribution) {
 }
 
 /**
+ * Compact count for image-model typesetting. Full "41000 reviews · domain"
+ * is a fidelity hazard on static (gpt-image-2 mangles long digit strings).
+ * Video keeps the full form via formatBrandReviewsText / product reviewsText.
+ * @returns {string|null}
+ */
+function formatCompactCount(n) {
+  if (n == null) return null;
+  const v = normalizeReviewCount(n);
+  if (v == null) return null;
+  if (v < 1000) return String(v);
+  const k = v / 1000;
+  const rounded = Math.round(k * 10) / 10;
+  return `${rounded}k`;
+}
+
+function formatProductReviewsText(rc) {
+  if (rc == null) return null;
+  return `${rc} review${rc === 1 ? '' : 's'}`;
+}
+
+function formatProductReviewsTextShort(rc) {
+  const c = formatCompactCount(rc);
+  return c != null ? `${c} reviews` : null;
+}
+
+function formatBrandReviewsTextShort(rc, brandAttribution) {
+  if (rc == null) return null;
+  const c = formatCompactCount(rc);
+  if (!c) return null;
+  const label = brandAttribution && String(brandAttribution).trim();
+  return label
+    ? `${c} reviews · ${label}`
+    : `${c} reviews`;
+}
+
+/**
  * ATOMIC rating + reviewCount pair resolution.
  *
  * CRITICAL HISTORY: a brand-level cascade tier once mixed sources — a product's
@@ -116,8 +212,18 @@ function formatBrandReviewsText(rc, brandAttribution) {
  * enrichBrandFromUrl / productMatchService. Prefer that over averaging
  * CatalogProduct rows (partial coverage, not a true brand aggregate).
  *
+ * NOTE: this resolver cannot see the quote. Its "brand wins when product fails"
+ * behaviour is correct FOR A RESOLVER THAT CANNOT SEE THE QUOTE. Quote-aware
+ * tier coherence is owned by resolveCoherentSocialProof, which withholds the
+ * ineligible side's inputs before calling here.
+ *
  * @param {boolean} [allowBrandCountWithoutStars=false] Only set true when the
  *   quote alongside this pair is confirmed brand-tier (never product-tier).
+ * @param {number} [productStarMin=RATING_STAR_MIN] Optional product star floor
+ *   (volume exception passes RATING_STAR_VOLUME_MIN when count clears the
+ *   threshold). Brand always uses RATING_STAR_MIN unless brandStarMin is set.
+ * @param {number} [brandStarMin=RATING_STAR_MIN] Optional brand star floor
+ *   (reserved for BRAND_VOLUME_EXCEPTION_ENABLED overrule).
  * @returns {{ rating: string|null, reviewCount: number|null, reviewsText: string|null, source: 'product'|'brand'|'brand-count'|null }}
  */
 function resolveAtomicRatingPair({
@@ -127,8 +233,10 @@ function resolveAtomicRatingPair({
   brandReviewCount = null,
   brandAttribution = null,
   allowBrandCountWithoutStars = false,
+  productStarMin = RATING_STAR_MIN,
+  brandStarMin = RATING_STAR_MIN,
 } = {}) {
-  const productDisplay = formatDisplayRating(productRating);
+  const productDisplay = formatDisplayRating(productRating, productStarMin);
   if (productDisplay) {
     // Product pair — count from product tier only (may be null).
     const rc = normalizeReviewCount(productReviewCount);
@@ -140,7 +248,7 @@ function resolveAtomicRatingPair({
     };
   }
 
-  const brandDisplay = formatDisplayRating(brandRating);
+  const brandDisplay = formatDisplayRating(brandRating, brandStarMin);
   if (brandDisplay) {
     // Brand pair — count from brand tier ONLY. Never productReviewCount.
     const rc = normalizeReviewCount(brandReviewCount);
@@ -170,10 +278,328 @@ function resolveAtomicRatingPair({
   return { rating: null, reviewCount: null, reviewsText: null, source: null };
 }
 
+/**
+ * Product star floor for a pre-bundled product pair: classic >4.5, OR volume
+ * exception when count strictly exceeds the threshold.
+ * @returns {number}
+ */
+function productStarFloorForCount(productReviewCount) {
+  const rc = normalizeReviewCount(productReviewCount);
+  if (rc != null && rc > RATING_STAR_VOLUME_COUNT_MIN) {
+    return RATING_STAR_VOLUME_MIN;
+  }
+  return RATING_STAR_MIN;
+}
+
+/**
+ * Brand star floor. Default is always RATING_STAR_MIN. Flip
+ * BRAND_VOLUME_EXCEPTION_ENABLED to true to reuse the product volume path.
+ * @returns {number}
+ */
+function brandStarFloorForCount(brandReviewCount) {
+  if (!BRAND_VOLUME_EXCEPTION_ENABLED) return RATING_STAR_MIN;
+  const rc = normalizeReviewCount(brandReviewCount);
+  if (rc != null && rc > RATING_STAR_VOLUME_COUNT_MIN) {
+    return RATING_STAR_VOLUME_MIN;
+  }
+  return RATING_STAR_MIN;
+}
+
+/**
+ * Whether a quote is considered ON FRAME for count-only / tier locking.
+ * When renderedQuoteText is supplied, it must match the quote's text or
+ * snippet (F4: cascade must not authorize numbers for a different line).
+ */
+function quotePrintsOnFrame(quote, renderedQuoteText) {
+  if (!quote || typeof quote !== 'object') return false;
+  const quoteText = String(quote.text || '').trim();
+  if (!quoteText) return false;
+  const quoteSnippet = quote.snippet != null ? String(quote.snippet).trim() : '';
+  // NO DEFAULT. An earlier version fell back to `quoteSnippet || quoteText` when
+  // the caller passed nothing, which made the comparison trivially true and turned
+  // this guard into a no-op for any caller that forgot the argument — fail-open on
+  // the one check standing between a testimonial and a review count we cannot tie
+  // to it. The caller must state what actually renders; silence is not proof.
+  if (renderedQuoteText == null) return false;
+  const rendered = String(renderedQuoteText).trim();
+  if (!rendered) return false;
+  return rendered === quoteText || (!!quoteSnippet && rendered === quoteSnippet);
+}
+
+function emptyCoherentProof(quote, quoteTier) {
+  const quoteText = quote ? String(quote.text || '').trim() : '';
+  const quoteSnippet = quote && quote.snippet != null
+    ? String(quote.snippet).trim() : '';
+  return {
+    quote: quote && quoteText
+      ? { ...quote, text: quoteText, snippet: quoteSnippet || null, tier: quoteTier || null }
+      : null,
+    quoteTier: quoteTier || null,
+    rating: null,
+    reviewCount: null,
+    source: null,
+    reviewsText: null,
+    reviewsTextShort: null,
+  };
+}
+
+/**
+ * Pack a coherent decision + both presentation strings. Presentation is a pure
+ * function of the same numbers — never a second tier decision.
+ */
+function packCoherentProof({ quote, quoteTier, rating, reviewCount, source, brandAttribution }) {
+  const quoteText = quote ? String(quote.text || '').trim() : '';
+  const quoteSnippet = quote && quote.snippet != null
+    ? String(quote.snippet).trim() : '';
+  const isBrandSide = source === 'brand' || source === 'brand-count';
+  const rc = reviewCount;
+  return {
+    quote: quote && quoteText
+      ? { ...quote, text: quoteText, snippet: quoteSnippet || null, tier: quoteTier || null }
+      : null,
+    quoteTier: quoteTier || null,
+    rating: rating || null,
+    reviewCount: rc,
+    source,
+    reviewsText: isBrandSide
+      ? formatBrandReviewsText(rc, brandAttribution)
+      : formatProductReviewsText(rc),
+    reviewsTextShort: isBrandSide
+      ? formatBrandReviewsTextShort(rc, brandAttribution)
+      : formatProductReviewsTextShort(rc),
+  };
+}
+
+/**
+ * COHERENT social-proof decision — the ONLY place quote-tier ↔ number-tier
+ * pairing is decided. Callers (later): buildMetaForAd (video) and
+ * buildIntentData (static). Nothing calls this yet; wiring is a separate change.
+ *
+ * HARD INVARIANTS (revised shape, owner 2026-08-03):
+ *
+ * 1. If source ∈ {'product','product-count'} → numbers from the PRODUCT
+ *    snapshot only. When a quote is printing, quoteTier ∈ {product, comment}
+ *    (from QUOTE_TIER_NUMBER_SIDE). Stars-only with no quote still allows
+ *    source:'product' (not product-count).
+ *
+ * 2. If source ∈ {'brand','brand-count'} → numbers from the BRAND snapshot
+ *    only. When a quote is printing, quoteTier ∈ {brand, category}
+ *    (category is brand-side by owner decision). Stars-only with no quote
+ *    still allows source:'brand' (not brand-count).
+ *
+ * 3. brand-count and product-count both require a coherent quote ON FRAME.
+ *    With no quote, neither count-only outcome unlocks — only stars are
+ *    eligible (product first, then brand).
+ *
+ * 4. NEVER:
+ *    - product/comment quote + brand numbers (stars or count)
+ *    - brand/category quote + product numbers
+ *    - rating from tier A + count from tier B
+ *    - brand-count / product-count without a coherent quote on frame
+ *    - brand stars earned via the volume exception (product-only; see
+ *      BRAND_VOLUME_EXCEPTION_ENABLED for the one-line overrule)
+ *
+ * HOW R1 closes without changing resolveAtomicRatingPair's contract: this
+ * function WITHHOLDS the ineligible side's inputs entirely before delegating
+ * to resolveAtomicRatingPair, so a product/comment quote can never reach
+ * brand numbers and vice versa. The pair resolver still prefers product then
+ * brand when both sides are present (rating-only ads).
+ *
+ * Inputs are PRE-BUNDLED pairs (product snapshot, brand snapshot) — never two
+ * independently-sourced scalars. That is the R2 hole.
+ *
+ * @param {object} args
+ * @param {null|{text?:string,snippet?:string,tier?:string,origin?:string,author_name?:string}} args.quote
+ *   Already provenance-gated by the caller. null = no quote on frame.
+ * @param {null|{rating?:*,reviewCount?:*}} args.product  Pre-bundled product pair.
+ * @param {null|{rating?:*,reviewCount?:*}} args.brand    Pre-bundled brand pair.
+ * @param {string|null} [args.brandAttribution]
+ * @param {string|null} [args.renderedQuoteText]
+ *   Exact string the surface will typeset. When set, must match quote text or
+ *   snippet; when omitted, uses snippet||text.
+ * @returns {{
+ *   quote: object|null,
+ *   quoteTier: string|null,
+ *   rating: string|null,
+ *   reviewCount: number|null,
+ *   source: 'product'|'product-count'|'brand'|'brand-count'|null,
+ *   reviewsText: string|null,
+ *   reviewsTextShort: string|null,
+ * }}
+ */
+function resolveCoherentSocialProof({
+  quote = null,
+  product = null,
+  brand = null,
+  brandAttribution = null,
+  renderedQuoteText = null,
+} = {}) {
+  const productPair = product && typeof product === 'object' ? product : null;
+  const brandPair = brand && typeof brand === 'object' ? brand : null;
+
+  const quoteTier = quote && quote.tier ? String(quote.tier) : null;
+  const onFrame = quotePrintsOnFrame(quote, renderedQuoteText);
+  const side = (quoteTier && QUOTE_TIER_NUMBER_SIDE[quoteTier]) || null;
+
+  // FAIL CLOSED — and do NOT conflate these two cases, because the first draft of
+  // this function did and it reopened the exact hole the function exists to close:
+  //
+  //   quote === null            → no quote on frame at all. Rating-only social
+  //                               proof is legitimate; there is no tier to cohere
+  //                               with. Falls through to the branch below.
+  //   quote supplied, but either unverifiable against what actually renders, or
+  //   carrying no tier stamp     → SOMETHING is printing whose tier we cannot
+  //                               vouch for. Numbers must be WITHHELD.
+  //
+  // The bug: on a mismatch `onFrame` goes false, and without this guard control
+  // fell through to the rating-only branch, which passes BOTH product and brand
+  // inputs to the resolver. So a product-tier quote whose rendered text had been
+  // substituted (a `Brand.metaCascades.quoteSnippet` override — precisely the F4
+  // case) could still end up beside brand stars. That is R1, reintroduced through
+  // the path meant to prevent it.
+  //
+  // Note this also makes `renderedQuoteText` effectively REQUIRED whenever a quote
+  // is supplied: a caller that omits it cannot prove which line renders, so it
+  // gets no numbers. That is deliberate ceremony at the two wiring sites — it
+  // converts a silent assumption into an obligation, and an unauthorised number
+  // beside a testimonial is a claim we cannot substantiate.
+  if (quote && (!onFrame || !quoteTier || !side)) {
+    return emptyCoherentProof(quote, quoteTier);
+  }
+
+  // ── Quote on frame: tier locks the number side; withhold the other ──
+  if (onFrame && quoteTier) {
+    if (side === 'product') {
+      // Product/comment quote → product numbers ONLY. No brand fallback (R1).
+      const productRating = productPair ? productPair.rating : null;
+      const productReviewCount = productPair ? productPair.reviewCount : null;
+      const productStarMin = productStarFloorForCount(productReviewCount);
+
+      const pair = resolveAtomicRatingPair({
+        productRating,
+        productReviewCount,
+        // Withhold brand entirely — resolver must not fall through.
+        brandRating: null,
+        brandReviewCount: null,
+        brandAttribution: null,
+        allowBrandCountWithoutStars: false,
+        productStarMin,
+      });
+
+      // THE LOAD-BEARING GUARD IS THIS WHITELIST, not the withholding above.
+      // Both are here on purpose, but they are not equally strong, and a
+      // revert-proof pass proved it: backing out the brand-input withholding
+      // changed NO observable behaviour, because a `source:'brand'` result
+      // reaching this line is discarded here anyway. Deleting THIS check while
+      // trusting the withholding would be the dangerous edit — the resolver's
+      // documented contract is "brand wins when product fails", so anything that
+      // lets brand inputs back in (a refactor, a new caller, a merge) would
+      // immediately print brand numbers beside a product quote. Keep both; if you
+      // only keep one, keep this.
+      if (pair.source === 'product') {
+        return packCoherentProof({
+          quote,
+          quoteTier,
+          rating: pair.rating,
+          reviewCount: pair.reviewCount,
+          source: 'product',
+          brandAttribution: null,
+        });
+      }
+
+      // Stars refused both gates → product count only (requires quote on frame).
+      const rc = normalizeReviewCount(productReviewCount);
+      if (rc != null) {
+        return packCoherentProof({
+          quote,
+          quoteTier,
+          rating: null,
+          reviewCount: rc,
+          source: 'product-count',
+          brandAttribution: null,
+        });
+      }
+      return emptyCoherentProof(quote, quoteTier);
+    }
+
+    if (side === 'brand') {
+      // Brand/category quote → brand numbers ONLY. No product fallback.
+      const brandRating = brandPair ? brandPair.rating : null;
+      const brandReviewCount = brandPair ? brandPair.reviewCount : null;
+      const brandStarMin = brandStarFloorForCount(brandReviewCount);
+
+      const pair = resolveAtomicRatingPair({
+        // Withhold product entirely.
+        productRating: null,
+        productReviewCount: null,
+        brandRating,
+        brandReviewCount,
+        brandAttribution,
+        // Coherent brand-side quote on frame → count-only is allowed.
+        allowBrandCountWithoutStars: true,
+        brandStarMin,
+      });
+
+      if (pair.source === 'brand' || pair.source === 'brand-count') {
+        return packCoherentProof({
+          quote,
+          quoteTier,
+          rating: pair.rating,
+          reviewCount: pair.reviewCount,
+          source: pair.source,
+          brandAttribution,
+        });
+      }
+      return emptyCoherentProof(quote, quoteTier);
+    }
+
+    // Unknown / unstamped tier with a printing quote → numbers withheld.
+    return emptyCoherentProof(quote, quoteTier);
+  }
+
+  // ── No quote on frame: rating-only social proof ────────────────────
+  // Product pair first (with volume exception), then brand stars.
+  // product-count and brand-count both require a coherent quote — not here.
+  const productRating = productPair ? productPair.rating : null;
+  const productReviewCount = productPair ? productPair.reviewCount : null;
+  const brandRating = brandPair ? brandPair.rating : null;
+  const brandReviewCount = brandPair ? brandPair.reviewCount : null;
+
+  const pair = resolveAtomicRatingPair({
+    productRating,
+    productReviewCount,
+    brandRating,
+    brandReviewCount,
+    brandAttribution,
+    allowBrandCountWithoutStars: false,
+    productStarMin: productStarFloorForCount(productReviewCount),
+    brandStarMin: brandStarFloorForCount(brandReviewCount),
+  });
+
+  if (pair.source === 'product' || pair.source === 'brand') {
+    return packCoherentProof({
+      quote: null,
+      quoteTier: null,
+      rating: pair.rating,
+      reviewCount: pair.reviewCount,
+      source: pair.source,
+      brandAttribution: pair.source === 'brand' ? brandAttribution : null,
+    });
+  }
+
+  return emptyCoherentProof(null, null);
+}
+
 module.exports = {
   RATING_STAR_MIN,
+  RATING_STAR_VOLUME_MIN,
+  RATING_STAR_VOLUME_COUNT_MIN,
+  BRAND_VOLUME_EXCEPTION_ENABLED,
+  QUOTE_TIER_NUMBER_SIDE,
   formatDisplayRating,
   normalizeReviewCount,
   brandAttributionLabel,
+  formatCompactCount,
   resolveAtomicRatingPair,
+  resolveCoherentSocialProof,
 };
