@@ -559,6 +559,21 @@ const TruckIcon = ({ size, color }) => (
   </svg>
 );
 
+// Does this line actually make a delivery/shipping claim? The truck icon is
+// only honest when it does.
+//
+// WHY THIS IS NEEDED: the slot is named deliveryLine and labelled "Delivery /
+// offer line", but its cascade binds `layoutInput.input.product.badges[1]`
+// (metaCascadeConfig.js) — the SECOND BADGE. So the text is routinely
+// "Premium Cotton", "Best Seller", "New Arrival"… and the old condition
+// (`endcardMode !== 'brand'`, i.e. every product ad) stapled a shipping truck
+// onto all of them. Owner, seeing it in a delivered ad: *"I am seeing the
+// shipping car show back up."* A truck beside "Premium Cotton" is a claim the
+// copy never made.
+// Content-driven, so the icon returns automatically if a real delivery line is
+// ever bound to the slot, without another code change.
+const DELIVERY_CLAIM = /\b(ship(s|ped|ping)?|deliver(s|ed|y)?|free\s+(ship|deliver)|arrives?|arriving|next[- ]day|same[- ]day|overnight|\d+\s*[-–]?\s*\d*\s*(business\s+)?days?|returns?|exchange)\b/i;
+
 export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
   const t = slot.treatment;
   const size = baseSize('deliveryLine', format, t.sizeScale);
@@ -566,7 +581,8 @@ export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
   // Inherit primary ink (and plate-intel contrast flip) — do NOT demote to
   // textSecondary. Weight comes from treatment (presets set 600).
   const color = tokenColor(tokens, t.colorToken || 'textPrimary');
-  const showTruck = meta?.endcardMode !== 'brand';
+  const showTruck = meta?.endcardMode !== 'brand'
+    && DELIVERY_CLAIM.test(String(content ?? ''));
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-flex', alignItems: 'center', gap: Math.round(size * 0.5) }}>
       {showTruck ? <TruckIcon size={size} color={color} /> : null}

@@ -1312,9 +1312,20 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       // sourceMedia.fileType; the brand-script overlay needs brandDoc.
       const sourceMedia = await Media.findById(ad.mediaId)
         .select('fileType fileUrl brandId').lean();
+      // brandReviews is LOAD-BEARING for the proof beat, not optional metadata:
+      // buildMetaForAd reads brand.brandReviews for the atomic rating+count pair
+      // (services/ratingDisplay.resolveAtomicRatingPair). Omitting it from this
+      // projection made brandPair null, so resolveAtomicRatingPair returned
+      // source=none and EVERY generated ad rendered with no stars and no review
+      // count — including brands that clear the >4.5 gate outright (Vuori 4.58 /
+      // 15,545 reviews shipped bare). The bug was invisible because a projection
+      // omission looks identical to a brand with no review data, and because
+      // routes/brand.js re-titles load the full doc and therefore worked.
+      // Keep this list in sync with adRegenerateService.loadBrand; both are
+      // pinned by scripts/verifyProofBeat.js P1.
       const brandDoc = sourceMedia?.brandId
         ? await Brand.findById(sourceMedia.brandId)
-            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset').lean()
+            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
         : null;
 
       // Grok-skip branch — when the seed is already a video, we keep

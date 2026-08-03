@@ -389,9 +389,13 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
 async function loadBrand(adId) {
   const ad = await Ad.findById(adId).select('mediaId').lean();
   const media = ad?.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
+  // brandReviews is load-bearing for the proof beat — see the same note in
+  // routes/ads.js. Without it buildMetaForAd's brandPair is null and every
+  // regenerated ad loses its stars AND its review count, even for brands that
+  // clear the >4.5 gate. Pinned by scripts/verifyProofBeat.js P1.
   return media?.brandId
     ? await Brand.findById(media.brandId)
-        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts videoSettings titleStyleSpec titleStylePreset').lean()
+        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
     : null;
 }
 

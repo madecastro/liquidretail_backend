@@ -451,6 +451,39 @@ check('B2 the normalizer genuinely cannot bridge a tagline-polluted name', () =>
   );
 });
 
+// ── P: every brand projection feeding titling must carry brandReviews ──
+
+check('P1 brand projections that feed titling include brandReviews', () => {
+  // The defect this pins SHIPPED and reached the owner: routes/ads.js (the
+  // wizard/generation path) and adRegenerateService.loadBrand both .select()
+  // an explicit field list, and neither listed brandReviews. buildMetaForAd
+  // then saw brand.brandReviews === undefined, so brandPair was null and
+  // resolveAtomicRatingPair returned source=none — every generated ad rendered
+  // with NO stars and NO review count, including Vuori (4.58 / 15,545) which
+  // clears the >4.5 gate outright.
+  //
+  // A projection omission is invisible: it looks exactly like a brand that has
+  // no review data, and it cannot be caught by testing resolveAtomicRatingPair
+  // (which was correct all along) or by re-titling through routes/brand.js
+  // (which loads the full doc). So assert on the projection strings themselves.
+  const targets = [
+    ['routes/ads.js', /\.select\('name styleScript[^']*'\)/g],
+    ['services/adRegenerateService.js', /\.select\('name styleScript[^']*'\)/g],
+  ];
+  for (const [rel, re] of targets) {
+    const src = fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
+    const matches = src.match(re);
+    assert.ok(matches && matches.length, `${rel}: expected a brand titling projection`);
+    for (const m of matches) {
+      assert.ok(
+        /\bbrandReviews\b/.test(m),
+        `${rel}: a brand projection feeding titling omits brandReviews — ` +
+        `the proof beat silently loses stars AND review count: ${m.slice(0, 90)}…`
+      );
+    }
+  }
+});
+
 // ── report ─────────────────────────────────────────────────────────────
 
 if (failures.length) {
