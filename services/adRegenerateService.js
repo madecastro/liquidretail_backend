@@ -4,13 +4,14 @@
 //
 // Two modes (chosen by routes/ads.js based on ad.kind):
 //
-//   image:
-//     1. Re-run aiCanvasHtmlGeneratorService.generateForArtifact with
-//        refresh:true + operatorPrompt — updates the AiCanvasArtifact's
-//        outputHtml.
-//     2. Puppeteer screenshots the new HTML at canvas dims.
-//     3. Upload to Cloudinary (overwrites previous publicId so the
-//        Ad's renderUrl stays stable across regens).
+//   image (2026-08-02 — Stage 1 catalog pipeline exclusive):
+//     1. Re-run the LIVE static renderer (directImageRenderService /
+//        gpt-image-2/edit) from the Ad's own fields — layoutInput, concept,
+//        media, platformFormat. No aiCanvasArtifactId, no HTML Gen, no
+//        Puppeteer. Exactly ONE billable image submit per invocation.
+//     2. Upload the finished PNG to Cloudinary (overwrite publicId so
+//        Ad.renderUrl stays stable across regens).
+//     3. Stamp renderUrl + imageGeneration + intentResolution.
 //
 //   video (always "full" — LIGHT mode was retired with the HTML/Puppeteer
 //   chrome pipeline; brand-script chrome is deterministic and cheap
@@ -34,22 +35,13 @@
 // backward-compat with the current frontend UI that may still send
 // mode='light'.
 
-const fs        = require('fs');
-const fsp       = require('fs/promises');
-const os        = require('os');
-const path      = require('path');
-const crypto    = require('crypto');
-
 const Ad                    = require('../models/Ad');
-const AiCanvasArtifact      = require('../models/AiCanvasArtifact');
-const CatalogProduct        = require('../models/CatalogProduct');
 const Media                 = require('../models/Media');
 const Brand                 = require('../models/Brand');
-const htmlGen               = require('./aiCanvasHtmlGeneratorService');
 const veoService            = require('./videoRouter');
 const brandScriptExecutor   = require('./brandScriptExecutor');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
-const { canvasForPlatformFormat }  = require('./platformFormats');
+const directImage           = require('./directImageRenderService');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
@@ -97,10 +89,10 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
     mode:          effMode,
     requestedBy:   requestedBy || null,
     videoModel:    videoModel || null,
-    // The full override text lives on the AiCanvasArtifact
-    // (htmlPromptSystem/htmlPromptUser), overwritten each run — the
-    // history entry just flags that THIS run was a verbatim prompt
-    // edit rather than a refinement note appended to the auto-prompt.
+    // true when this run used a verbatim prompt-text override (operator
+    // edited the exact prompt in the Generation Details modal) rather
+    // than the refinement-note path. The full text is what the image
+    // model receives (see resolveImagePromptOverride); history only flags.
     rawPromptEdit: !!promptOverride,
     at:            new Date(startedAt),
     status:        'pending'
@@ -243,46 +235,77 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null)
   }
 }
 
-// IMAGE regeneration. Re-runs HTML Gen (forces refresh + threads
-// operatorPrompt) then screenshots the new outputHtml with Puppeteer
-// at the canvas's normalized dims, uploads to Cloudinary, and updates
-// the Ad's renderUrl.
+// IMAGE regeneration via the live direct_image renderer.
+//
+// Re-derives everything renderDirectImage needs from the Ad row itself:
+// layoutInputArtifactId, aspectRatio, mediaId, productId, template,
+// conceptArtifactId/conceptId, platformFormat, referenceMediaIds /
+// mediaIds. Does NOT require aiCanvasArtifactId (the previous
+// precondition that made regenerate fail for every ad the current
+// pipeline produces — directImageRenderService never stamps it).
+//
+// MONEY: renderDirectImage performs exactly one editImage submit.
+// There is no retry-on-failure here. If the provider already charged
+// (err.charged), the failure is recorded and the caller does not
+// re-submit — same convention as renderService's direct-image path.
 async function runImage(adId, prompt, progressRun = null, promptOverride = null) {
   if (progressRun) { await progressRun.checkpoint(); progressRun.stage('generating image'); }
   await setStage(adId, 'image-gen');
   const ad = await Ad.findById(adId).lean();
-  if (!ad.aiCanvasArtifactId) {
-    throw new Error('Ad has no aiCanvasArtifactId — regenerate requires a V2 concept-driven Ad');
+  if (!ad) throw new Error(`Ad ${adId} not found`);
+
+  // Reference stack: same precedence as renderService (operator stack
+  // wins; else Director concept mediaIds; else seed media alone inside
+  // renderDirectImage).
+  const hasOperatorRefs = Array.isArray(ad.referenceMediaIds) && ad.referenceMediaIds.length > 0;
+  const referenceMediaIds = hasOperatorRefs
+    ? ad.referenceMediaIds
+    : (Array.isArray(ad.mediaIds) ? ad.mediaIds : []);
+  const referenceSource = hasOperatorRefs ? 'operator' : 'director';
+
+  let output;
+  try {
+    output = await directImage.renderDirectImage({
+      layoutInputArtifactId: ad.layoutInputArtifactId || null,
+      aspectRatio:           ad.aspectRatio,
+      mediaId:               ad.mediaId,
+      productId:             ad.productId || null,
+      brandId:               ad.brandId || null,
+      adConceptArtifactId:   ad.conceptArtifactId || null,
+      adConceptId:           ad.conceptId || null,
+      template:              ad.template,
+      platformFormat:        ad.platformFormat || 'meta_feed_1_1',
+      referenceMediaIds,
+      referenceSource,
+      // Refinement note (Product Ads modal) OR verbatim override
+      // (Generation Details). Override wins inside renderDirectImage.
+      operatorPrompt:        prompt || null,
+      rawPromptOverride:     promptOverride || null
+    });
+  } catch (err) {
+    // Carry charged/predictionId so a charged failure is visible in
+    // logs and progress, and so no outer layer invents a second submit.
+    if (err.charged) {
+      console.error(
+        `💸 regenerate[ad=${adId}]: image submit was charged` +
+        (err.predictionId ? ` (prediction ${err.predictionId})` : '') +
+        ` before failing — not retrying`
+      );
+    }
+    throw err;
   }
 
-  // Re-run HTML Gen on the existing artifact with the operator prompt.
-  // refresh:true ignores the htmlSchemaVersion cache so the prompt is
-  // honored even if the artifact was generated this version. When
-  // promptOverride is set (operator edited the exact prompt text in the
-  // Generation Details modal), it replaces the auto-composed prompt
-  // verbatim — operatorPrompt (the refinement-note path) is moot in
-  // that case since the override already contains whatever the
-  // operator wanted said.
-  const out = await htmlGen.generateForArtifact({
-    aiCanvasArtifactId: ad.aiCanvasArtifactId,
-    refresh:            true,
-    operatorPrompt:     prompt,
-    rawPromptOverride:  promptOverride
-  });
-  if (out?.skipped) throw new Error(`HTML Gen skipped: ${out.reason || 'unknown'}`);
+  if (output?.skipped) {
+    throw new Error(`direct-image regenerate skipped: ${output.reason || 'unknown'}`);
+  }
+  if (!output?.buffer) {
+    throw new Error('direct-image regenerate returned no image buffer');
+  }
 
-  // Read the freshly written outputHtml + canvas dims.
-  const canvas = await AiCanvasArtifact.findById(ad.aiCanvasArtifactId)
-    .select('outputHtml platformFormat aspectRatio').lean();
-  if (!canvas?.outputHtml) throw new Error('outputHtml missing after HTML Gen');
-  const dims = canvasForPlatformFormat(canvas.platformFormat)
-            || { width: 1000, height: 1000 };
-
-  // Screenshot + upload to Cloudinary (overwrite existing publicId
-  // when possible so the Ad's renderUrl stays stable).
-  const png       = await screenshotHtml(canvas.outputHtml, dims);
-  const publicId  = ad.cloudinaryPublicId || undefined;
-  const uploaded  = await uploadBufferToCloudinary(png, {
+  // Upload — overwrite existing publicId when present so the Ad's
+  // renderUrl stays stable across regens (same contract as the old path).
+  const publicId = ad.cloudinaryPublicId || undefined;
+  const uploaded = await uploadBufferToCloudinary(output.buffer, {
     folder:       'liquidretail/ad_renders',
     publicId,
     resourceType: 'image',
@@ -295,36 +318,16 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
       $set: {
         renderUrl:          uploaded.secure_url,
         cloudinaryPublicId: uploaded.public_id,
+        width:              output.width  || uploaded.width  || null,
+        height:             output.height || uploaded.height || null,
+        bytes:              output.bytes  || uploaded.bytes  || null,
+        imageGeneration:    output.imageGeneration  || null,
+        intentResolution:   output.intentResolution || null,
         renderedAt:         new Date(),
         updatedAt:          new Date()
       }
     }
   );
-}
-
-// ── Puppeteer screenshot helper (image regen) ─────────────────────────
-
-const puppeteer = require('puppeteer');
-
-async function screenshotHtml(html, dims) {
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-    const page = await browser.newPage();
-    await page.setViewport({ width: dims.width, height: dims.height, deviceScaleFactor: 1 });
-    await page.setContent(html, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction('document.fonts.ready');
-    return await page.screenshot({
-      type:           'png',
-      omitBackground: false,
-      clip: { x: 0, y: 0, width: dims.width, height: dims.height }
-    });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
 }
 
 // ── State helpers ──────────────────────────────────────────────────────
@@ -360,5 +363,8 @@ async function markComplete(adId, { status, durationMs, error }) {
 module.exports = {
   preflight,
   regenerateAd,
+  // Exported so the offline harness can assert the direct-image path
+  // (no aiCanvasArtifactId precondition) without invoking providers.
+  runImage,
   DAILY_CAP
 };

@@ -412,7 +412,7 @@ function buildPrompt({ intentKey, data, product, surface }) {
    * read as type to set.
    */
   const textBlock = kept.length
-    ? `SET EXACTLY THESE STRINGS, verbatim, each appearing exactly once. Spelling is critical; a misspelling makes this unusable.
+    ? `SET EXACTLY THESE STRINGS, verbatim, each appearing exactly once — and set NOTHING ELSE. This is the complete and only text for this ad. It is not a template to fill in and nothing is missing from it. Spelling is critical; a misspelling makes this unusable.
 The words to the LEFT of each arrow name the element for your reference and must NEVER appear in the image. Render ONLY the text to the right of the arrow:
 ${kept.map(([role, str]) => `  ${role.toLowerCase()} -> ${str}`).join('\n')}
 Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.`
@@ -428,7 +428,7 @@ WHAT THIS AD HAS TO DO: ${typeof spec.goal === 'function' ? spec.goal(kept_) : s
 
 WHAT SHOULD WIN ATTENTION, in this order:
 ${emphasis.map((e, i) => `  ${i + 1}. ${e}`).join('\n')}
-That is an order of importance, not a layout. Express it however reads fastest.
+That is an order of importance, not a layout, and not a checklist. Express it however reads fastest.
 
 ${textBlock}
 
@@ -436,9 +436,9 @@ YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, whe
 
 THIS PRODUCT HAS NONE OF THE FOLLOWING, so none of it may appear:
 ${absent.map(a => `  — ${a}`).join('\n')}
-If an element is not listed in the text above, it does not exist. Leave the space empty rather than filling it — empty space is a legitimate design choice and inventing proof is not.
+If an element is not listed in the text above, it does not exist, and its absence is the accurate brief rather than a gap to fill. Leave the space empty rather than filling it — empty space is a legitimate design choice and inventing proof is not.
 
-Keep the ${product.logoCorner || 'bottom-right'} corner clear of text and graphics; the real logo is composited there afterwards.
+Keep the ${product.logoCorner || 'bottom-right'} corner clear of text and graphics — the corner of the SAFE BOX described below, not of the frame you are generating. The real logo is composited into that space afterwards, inside the safe box, because anything outside it is either cut away by the delivery crop or covered by the platform's own interface.
 
 ${geometryBlock(s)}`;
 

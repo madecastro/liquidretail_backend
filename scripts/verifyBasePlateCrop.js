@@ -64,7 +64,9 @@ for (const [format, target] of Object.entries(TARGET_BY_FORMAT)) {
       `${target} != ${comp.width}x${comp.height} — a crop to ${target} would be RE-CROPPED by objectFit:'cover'`);
   });
 }
+// Live surfaces only — coming_soon formats are never base-plated (never generated).
 for (const [pfId, pf] of Object.entries(PLATFORM_FORMATS)) {
+  if (pf.status === 'coming_soon') continue;
   check(`T3 ${pfId}: classifyFormat's target matches deliveryDims aspect`, () => {
     const format = classifyFormat({ platformFormat: pfId, aspectRatio: pf.aspectRatio });
     const target = TARGET_BY_FORMAT[format];
@@ -90,6 +92,7 @@ check('G2 an unknown/legacy platformFormat cannot reach the crop', () => {
 });
 check('G3 every REAL (platformFormat, aspect) pair passes the guard for its own format', () => {
   for (const [pfId, pf] of Object.entries(PLATFORM_FORMATS)) {
+    if (pf.status === 'coming_soon') continue;
     const format = classifyFormat({ platformFormat: pfId, aspectRatio: pf.aspectRatio });
     const pre = preGateBasePlateCrop({ format, platformFormat: pfId, sourceUrl: SRC });
     assert.strictEqual(pre.action, 'proceed', `${pfId} -> ${format}: ${pre.reason}`);

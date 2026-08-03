@@ -32,6 +32,13 @@ const CatalogProduct = require('../models/CatalogProduct');
 const Media = require('../models/Media');
 const intents = require('./staticAdIntents');
 const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
+// Defence in depth. layoutInputService already withholds these at pool
+// assembly, so this gate should never fire — it exists because an artifact
+// cached before the producer-side filter landed can still carry one.
+const { isPrintableCustomerQuote } = require('./quoteProvenance');
+// THE sanctioned concept reader. Direct reads of concept.rationale on this
+// path are how private Director reasoning became art direction on 2026-08-01.
+const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
 
 const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
@@ -88,20 +95,160 @@ const UPLOAD_TIMEOUT_MS = Number(process.env.AI_DIRECT_UPLOAD_TIMEOUT_MS || 20_0
 // `value || default` coercion per caller is how a pipeline flag drifts.
 
 
-// Delivery dimensions only. `overlayStart` is gone with the overlay renderer,
-// and `atlasSize` is gone too: the GENERATION size now comes from the intent
-// module's surface computation, because the prompt's geometry block tells the
-// model in as many words which pixels will survive the crop ("the top and bottom
-// 256px of what you generate WILL BE CUT AWAY"). If this function chose the
-// generation size independently, that sentence could contradict the request we
-// actually send, and the model would protect the wrong region.
-function dimsFor(aspectRatio) {
-  switch (aspectRatio) {
-    case '4:5': return { width: 1000, height: 1250 };
-    case '9:16': return { width: 1000, height: 1778 };
-    case '1:1': return { width: 1000, height: 1000 };
-    default: return { width: 1000, height: 1000 };
+// Delivery geometry, derived from the one surface object the prompt was built
+// from. The GENERATION size comes from the intent module's surface computation,
+// because the prompt's geometry block tells the model in as many words which
+// pixels will survive the crop ("the top and bottom 128px of what you generate
+// WILL BE CUT AWAY"). If anything here chose a size independently, that sentence
+// could contradict the request we actually send, and the model would protect the
+// wrong region.
+//
+// That warning used to sit directly above a function that did exactly what it
+// warned against. `dimsFor(aspectRatio)` was a hand-written switch whose
+// `default` returned 1000x1000, so every aspect it did not name — '16:9' among
+// them — was silently squared, and a pmax landscape ad has been squashed into a
+// square since static fan-out started emitting pmax_16_9. The three sizes it did
+// name were the `canvas` fields of platformFormats.js (a 1000px reference width
+// belonging to the retired HTML/Puppeteer path), not the `deliveryDims` fields,
+// so the geometry block promised the model "delivered at 1080x1080" while Sharp
+// wrote 1000x1000. The comment above it was false about all four cases, the
+// 256px it quoted included: geometryBlock speaks the PER-EDGE half, so 4:5 reads
+// "128px".
+//
+// Split in two along the billable line. A submit to the image model is charged
+// on submit (CLAUDE.md §2), so every check that CAN run before it MUST run
+// before it — validating geometry after the pixels come back means paying for a
+// render we then refuse.
+
+/**
+ * Pre-submit. Frame-independent, so it runs before anything is charged.
+ *
+ * Validates that the surface can be delivered at all, and — the part worth
+ * having — asserts that its kept region scales UNIFORMLY to its delivery box.
+ * The caller resizes with fit:'fill', which is a pure scale only while those two
+ * share an aspect. A deliveryDims that drifted from its own aspectRatio would
+ * otherwise stretch every ad on that surface by a few percent, which is exactly
+ * the kind of wrongness that ships unnoticed for months.
+ */
+function deliveryGeometryFor(s) {
+  const [aw, ah] = String(s?.aspect || '').split(':').map(Number);
+  const [deliverW, deliverH] = String(s?.deliver || '').split('x').map(Number);
+  const [genW, genH] = String(s?.generate || '').split(/[x*]/).map(Number);
+  if (!(aw > 0 && ah > 0 && deliverW > 0 && deliverH > 0 && genW > 0 && genH > 0)) {
+    throw taggedError(
+      `surface ${s?.key || 'unknown'} has no usable delivery geometry ` +
+      `(aspect=${s?.aspect} generate=${s?.generate} deliver=${s?.deliver})`,
+      { alertLevel: 'error', alertKey: 'direct-image:surface-geometry' }
+    );
   }
+  // The kept region the geometry block promised the model, in generated pixels.
+  const c = s.cropPx || {};
+  const keepW = genW - (c.left || 0) - (c.right || 0);
+  const keepH = genH - (c.top || 0) - (c.bottom || 0);
+  if (!(keepW > 0 && keepH > 0)) {
+    throw taggedError(
+      `surface ${s.key}: crop ${JSON.stringify(c)} leaves a degenerate ${keepW}x${keepH} region of ${genW}x${genH}`,
+      { alertLevel: 'error', alertKey: 'direct-image:surface-geometry' }
+    );
+  }
+  const sx = deliverW / keepW;
+  const sy = deliverH / keepH;
+  if (Math.abs(sx - sy) / Math.max(sx, sy) > 0.005) {
+    throw taggedError(
+      `surface ${s.key}: kept region ${keepW}x${keepH} does not scale uniformly to ` +
+      `${deliverW}x${deliverH} (${sx.toFixed(4)} vs ${sy.toFixed(4)}) — refusing to stretch the creative`,
+      { alertLevel: 'error', alertKey: 'direct-image:surface-geometry' }
+    );
+  }
+  return { width: deliverW, height: deliverH };
+}
+
+/**
+ * Post-submit. The CENTRED extract, computed from the frame we actually got
+ * back rather than the frame we asked for — a model that returns an off-size
+ * image still gets cropped to the right aspect instead of being stretched.
+ *
+ * Centred is not a stylistic choice: geometryBlock tells the model a specific
+ * symmetric band "WILL BE CUT AWAY and never seen", so these are the pixels it
+ * was instructed to treat as already gone. The previous implementation ran
+ * `fit:'cover', position:'attention'`, a saliency crop that removes whichever
+ * edges Sharp's heuristic prefers — so the model protected one region and we
+ * discarded a different one, on every non-1:1 surface.
+ */
+function extractFor(s, frameW, frameH) {
+  const [aw, ah] = String(s?.aspect || '').split(':').map(Number);
+  if (!(frameW > 0 && frameH > 0)) {
+    throw new Error(`cannot crop a ${frameW}x${frameH} frame for surface ${s?.key}`);
+  }
+  const target = aw / ah;
+  let keepW = frameW;
+  let keepH = frameH;
+  if (frameW / frameH > target) keepW = Math.round(frameH * target);
+  else if (frameW / frameH < target) keepH = Math.round(frameW / target);
+  return {
+    left: Math.floor((frameW - keepW) / 2),
+    top: Math.floor((frameH - keepH) / 2),
+    width: keepW,
+    height: keepH
+  };
+}
+
+/**
+ * The prompt's safe box, in DELIVERED pixels.
+ *
+ * computeSurface expresses the box as percentages of the GENERATED frame,
+ * because that is the frame the model is drawing into. Anything composited
+ * afterwards lives in the delivered frame, so it has to cross two transforms to
+ * land in the same place the model was told to keep clear: subtract the crop,
+ * then scale the kept region up to the delivery box.
+ */
+function safeBoxInDeliveredPx(s, dims) {
+  const [genW, genH] = String(s.generate).split(/[x*]/).map(Number);
+  const c = s.cropPx || {};
+  const keepW = genW - (c.left || 0) - (c.right || 0);
+  const keepH = genH - (c.top || 0) - (c.bottom || 0);
+  const sx = dims.width / keepW;
+  const sy = dims.height / keepH;
+  const b = s.box || {};
+  return {
+    left:   Math.round(((b.left   / 100) * genW - (c.left || 0)) * sx),
+    right:  Math.round(((b.right  / 100) * genW - (c.left || 0)) * sx),
+    top:    Math.round(((b.top    / 100) * genH - (c.top  || 0)) * sy),
+    bottom: Math.round(((b.bottom / 100) * genH - (c.top  || 0)) * sy)
+  };
+}
+
+/**
+ * Where the composited logomark goes.
+ *
+ * Derived from the SAME safe box the prompt just described to the model, not
+ * from a margin chosen here. That distinction is the entire bug: the previous
+ * placement was a flat `top: height - 100`, which on Stories put the brand's
+ * logomark 150px inside the 250px reply-bar reserve — invisible in feed, on the
+ * one element the owner specified must be composited rather than drawn. Picking
+ * a fresh margin here instead would have reintroduced the same class of drift:
+ * measured against the real surfaces, a 4%-of-short-edge margin lands the mark
+ * outside the promised box on three of the four.
+ *
+ * Returns null when the box cannot fit the mark, so the caller skips the
+ * composite rather than placing it somewhere the model did not reserve.
+ */
+function logoPlacementFor({ surface, dims, logoW, logoH }) {
+  const box = safeBoxInDeliveredPx(surface, dims);
+  // Clamp the BOX into the delivered frame before placing anything in it, rather
+  // than clamping the result afterwards. Clamping afterwards can shove the mark
+  // back across the very edge the box exists to enforce — and the percentage
+  // round-trip does put an edge a pixel outside on 4:5 (top computes to -1), so
+  // this is not hypothetical arithmetic.
+  const left = Math.max(0, box.left);
+  const right = Math.min(dims.width, box.right);
+  const top = Math.max(0, box.top);
+  const bottom = Math.min(dims.height, box.bottom);
+  if (!(logoW > 0 && logoH > 0)) return null;
+  if (right - left < logoW || bottom - top < logoH) return null;
+  // Bottom-right of the clamped box. Inside it by construction, so there is no
+  // second adjustment that could invalidate the guarantee above.
+  return { top: bottom - logoH, left: right - logoW, width: logoW, height: logoH };
 }
 
 /**
@@ -146,15 +293,22 @@ function describeProductForPrompt({ concept, product, layoutInput }) {
   ).slice(0, 400).trim();
 }
 
-/** The brand's visual world, handed to the model instead of a font family. */
-function conceptLook(concept, layoutInput) {
-  const parts = [
-    concept?.art_direction || concept?.rationale || null,
-    concept?.emotional_hook || null,
-    layoutInput?.brand?.visual_style || null
-  ].filter(Boolean).map(v => String(v).trim());
-  if (!parts.length) return null;
-  return parts.join(' ').slice(0, 600);
+/**
+ * The brand's visual world, handed to the model instead of a font family.
+ *
+ * WAS (2026-08-01 live defect): fell through art_direction || rationale, then
+ * concatenated emotional_hook and layoutInput.brand.visual_style. art_direction
+ * was never emitted by any Director schema, so rationale — private honesty-rule
+ * notes, objection analysis — became the art brief 100% of the time. visual_style
+ * is never assembled by layoutInputService either. emotional_hook names a purchase
+ * objection, not a mood.
+ *
+ * NOW: art_direction only, via conceptProjection. Null when the Director gave
+ * none; the prompt sentence is then omitted. No Brand.tone fallback — voice
+ * words are not a visual world (absent means absent).
+ */
+function conceptLook(concept /*, layoutInput — retained arg position unused */) {
+  return artDirectionLook(concept);
 }
 
 // ── The SVG overlay renderer was DELETED here on 2026-07-31 ───────────────
@@ -230,24 +384,43 @@ function intentForTemplate(template) {
  *     owner's density rule sacrifices it first anyway.
  */
 function buildIntentData({ concept, layoutInput, brand, cta }) {
-  const copy = concept?.copy_picks || {};
+  // Dual-read v3 copy / v2 copy_picks. Never invent a headline from product name.
+  const copy = renderableCopy(concept);
   const proof = layoutInput?.social_proof || {};
-  const quote = proof.primary_quote || null;
+  // ALLOWLIST. A quote reaches the pixels only if something positively vouched
+  // for it — never merely because nothing flagged it.
+  const quote = isPrintableCustomerQuote(proof.primary_quote) ? proof.primary_quote : null;
+  if (proof.primary_quote && !quote) {
+    console.log(
+      `🔒 direct-image: quote withheld (tier=${proof.primary_quote.tier || 'unstamped'} ` +
+      `origin=${proof.primary_quote.origin || 'unstamped'}) — rendering this ad with no testimonial`
+    );
+  }
 
-  // Verbatim only. `snippet` is the <=50-char word-safe form of the SAME
-  // sentence (extractive, verified non-paraphrasing upstream), so it is a legal
-  // shortening — prefer it because the model has to typeset this.
+  // `snippet` is the <=50-char word-safe shortening of the SAME sentence. It is
+  // preferred because the model has to typeset this, and a 200-character quote
+  // set at testimonial size is unreadable at feed scale.
   const quoteText = quote ? String(quote.snippet || quote.text || '').trim() : '';
 
   return {
-    rating: typeof proof.rating_value === 'number' ? String(proof.rating_value) : undefined,
+    // `> 0` on BOTH, and an upper bound. typeof 0 === 'number', so the old test
+    // printed a rating of zero as the string "0" — a zero-star rating typeset on
+    // an advertisement. review_count already had this guard; rating did not, and
+    // the asymmetry sat on adjacent lines. The 0-5 bound catches a vendor that
+    // reports a 0-100 scale, which would otherwise render as "87 stars".
+    rating: typeof proof.rating_value === 'number' && proof.rating_value > 0 && proof.rating_value <= 5
+      ? String(Number(proof.rating_value.toFixed(1)))
+      : undefined,
     reviewCount: typeof proof.review_count === 'number' && proof.review_count > 0
       ? proof.review_count
       : undefined,
     quote: quoteText || undefined,
-    // Only ever the reviewer's own byline. normalizeQuote already resolves this
-    // to "Anonymous Customer" when there is no name and no verified purchase,
-    // which claims only that someone reviewed the product.
+    // The reviewer's OWN name or no byline at all. normalizeQuote no longer
+    // manufactures one: it used to fall back to the quote's `source` — a site,
+    // which is how "vertexaisearch.cloud.google.com" became the customer who
+    // said the words on 80 live artifacts — and then to "Verified buyer" or
+    // "Anonymous Customer", which assert things about a person we cannot name.
+    // An unattributed real quote is honest. An attributed fake is not.
     attribution: quoteText && quote?.author_name ? String(quote.author_name).trim() : undefined,
     // The Director's line. Not the product name — that is dropped entirely by
     // owner instruction and is separately forbidden in the absence block.
@@ -275,7 +448,11 @@ async function resolveConcept({ adConceptArtifactId, adConceptId, expectedProduc
       { alertLevel: 'error', alertKey: 'direct-image:concept-product-mismatch' }
     );
   }
-  return artifact.concepts?.find((c) => c.concept_id === adConceptId) || null;
+  const raw = artifact.concepts?.find((c) => c.concept_id === adConceptId) || null;
+  // Project before any prompt builder can see the Mongo Mixed subdoc. Reasoning
+  // (rationale) is stripped here so the live image path cannot re-introduce the
+  // 2026-08-01 leak by reading concept.rationale directly.
+  return conceptForRender(raw);
 }
 
 // Tag an error with how loudly it should be reported. renderService raises
@@ -286,6 +463,30 @@ function taggedError(message, { alertLevel = 'error', alertKey }) {
   err.alertLevel = alertLevel;
   err.alertKey = alertKey;
   return err;
+}
+
+/**
+ * Map the regenerate API's promptOverride into the single flat prompt the
+ * image model accepts.
+ *
+ * Image/edit endpoints have NO system channel (CLAUDE.md §3). The route and
+ * Generation Details modal still speak `{ system, user }` because that was the
+ * HTML-layout LLM's shape. Dropping either half would silently discard the
+ * operator's edit; concatenating is the honest single-channel mapping.
+ * A bare string is also accepted for callers that already hold the flat prompt
+ * (e.g. Ad.imageGeneration.prompt from a prior direct_image render).
+ */
+function resolveImagePromptOverride(rawPromptOverride) {
+  if (rawPromptOverride == null) return null;
+  if (typeof rawPromptOverride === 'string') {
+    const s = rawPromptOverride.trim();
+    return s || null;
+  }
+  if (typeof rawPromptOverride !== 'object') return null;
+  const system = String(rawPromptOverride.system || '').trim();
+  const user   = String(rawPromptOverride.user   || '').trim();
+  if (system && user) return `${system}\n\n${user}`;
+  return user || system || null;
 }
 
 async function renderDirectImage({
@@ -299,7 +500,13 @@ async function renderDirectImage({
   // The surface drives the safe box and the generation size. renderStage already
   // threads platformFormat through ...args and defaults it to meta_feed_1_1, so
   // this is a rename at the boundary, not a new requirement on callers.
-  platformFormat = 'meta_feed_1_1'
+  platformFormat = 'meta_feed_1_1',
+  // Regenerate hooks (adRegenerateService.runImage). Neither is charged until
+  // the single editImage submit below — they only rewrite the prompt string.
+  //   operatorPrompt     — refinement note appended to the auto-built prompt
+  //   rawPromptOverride  — verbatim replacement ({system,user} or string)
+  operatorPrompt = null,
+  rawPromptOverride = null
 }) {
   const surface = platformFormat || 'meta_feed_1_1';
   // Credentials are checked further down, AFTER brand routing: a brand
@@ -361,7 +568,9 @@ async function renderDirectImage({
     );
   }
   const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl').lean() : null);
-  const dims = dimsFor(aspectRatio);
+  // Delivery dims are NOT derived here any more: they come from the surface the
+  // prompt is built from, a few lines below, so the size Sharp writes and the
+  // size the geometry block promised the model cannot disagree.
   // ONE reference by default: the media this ad was actually built from.
   //
   // This used to send the selected media AND the product's hero image on every
@@ -442,7 +651,7 @@ async function renderDirectImage({
     data: intentData,
     product: {
       desc: describeProductForPrompt({ concept, product: resolvedProduct, layoutInput: effectiveLayout.input || {} }),
-      look: conceptLook(concept, effectiveLayout.input || {}),
+      look: conceptLook(concept),
       logoCorner: 'bottom-right'
     },
     surface
@@ -452,17 +661,45 @@ async function renderDirectImage({
   if (built.skipped) {
     return { skipped: true, routedToHtml: false, reason: `surface ${surface} takes no static image: ${built.skipped}` };
   }
-  if (built.error || !built.prompt) {
+  // Geometry (gen size + delivery crop) always comes from the intent surface,
+  // even when the operator replaces the prompt text — Sharp still needs the
+  // same crop band the model was told about, and a free surface lookup must
+  // not become a second billable submit.
+  if (built.error || !built.surface) {
     throw taggedError(
-      `intent prompt could not be built for ${intentKey}/${surface}: ${built.error || 'no prompt returned'}`,
+      `intent prompt could not be built for ${intentKey}/${surface}: ${built.error || 'no surface returned'}`,
       { alertLevel: 'error', alertKey: 'direct-image:intent-prompt-failed' }
     );
   }
-  const prompt = built.prompt;
+  const overrideText = resolveImagePromptOverride(rawPromptOverride);
+  let prompt;
+  if (overrideText) {
+    // Verbatim replacement — operator edited the exact prompt in Generation
+    // Details (or sent {system,user} from the legacy modal shape). One channel.
+    prompt = overrideText;
+  } else if (built.prompt) {
+    prompt = built.prompt;
+    // Refinement-note path: append, do not replace. Matches the HTML path's
+    // operatorPrompt threading without a second submit.
+    const note = String(operatorPrompt || '').trim();
+    if (note) {
+      prompt = `${prompt}\n\nOPERATOR REFINEMENT (honour this):\n${note}`;
+    }
+  } else {
+    throw taggedError(
+      `intent prompt could not be built for ${intentKey}/${surface}: no prompt returned`,
+      { alertLevel: 'error', alertKey: 'direct-image:intent-prompt-failed' }
+    );
+  }
   // The size the geometry block just promised the model. `built.surface.generate`
   // is "WxH" chosen by least-crop arithmetic against this surface's aspect, so it
-  // and the prompt can never disagree.
+  // and the prompt can never disagree when the auto-prompt is used; when the
+  // operator overrides text they still get this surface's crop/size.
   const genSize = built.surface.generate;
+  // BEFORE the billable submit, deliberately. Everything this validates is known
+  // from the surface alone, and an image model call is charged on submit — so a
+  // surface we would refuse to deliver must be refused while it is still free.
+  const dims = deliveryGeometryFor(built.surface);
   const meta = { stage: 'direct_image', service: 'directImageRenderService', purposeTag: template || 'untagged', brandId: resolvedBrand?._id || brandId || null, productId: resolvedProduct?._id || productId || null, mediaId: mediaId || null };
   // When Atlas is configured, the established renderer is the recovery path.
   // Starting a second provider request after a submitted Atlas prediction both
@@ -483,8 +720,26 @@ async function renderDirectImage({
   // The model's output IS the ad. Sharp's only remaining jobs are the delivery
   // crop and the logo — every text layer this used to composite is gone with the
   // overlay renderer.
-  const rendered = await sharp(Buffer.from(b64, 'base64'))
-    .resize(dims.width, dims.height, { fit: 'cover', position: 'attention' })
+  //
+  // Two steps, and the order matters. First a CENTRED extract to the delivery
+  // aspect, taking exactly the pixels the prompt told the model would be cut
+  // away. Then a pure scale to the delivery box: because the extract already has
+  // the delivery aspect (asserted pre-submit), fit:'fill' cannot crop or stretch
+  // — it is a resample and nothing else. The old single `fit:'cover',
+  // position:'attention'` call did both jobs at once and got both wrong.
+  const rawFrame = Buffer.from(b64, 'base64');
+  const frame = await sharp(rawFrame).metadata();
+  const box = extractFor(built.surface, frame.width, frame.height);
+  const [reqW, reqH] = String(genSize).split(/[x*]/).map(Number);
+  if (frame.width !== reqW || frame.height !== reqH) {
+    console.warn(
+      `   ⚠️  direct-image: model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
+      `cropping the ${built.surface.aspect} centre of what arrived`
+    );
+  }
+  const rendered = await sharp(rawFrame)
+    .extract(box)
+    .resize(dims.width, dims.height, { fit: 'fill', kernel: sharp.kernel.lanczos3 })
     .png()
     .toBuffer();
 
@@ -494,12 +749,32 @@ async function renderDirectImage({
   // reads as a counterfeit rather than a stylisation. So the prompt reserves the
   // corner (see product.logoCorner above, and the absence line forbidding any
   // drawn logo) and the real asset is composited into that reserved space here.
+  //
+  // Sized against the SHORTER edge so the mark is the same physical size on every
+  // surface, and placed inside the content rect rather than at a flat offset from
+  // the bottom. The flat offset put it 150px inside Stories' 250px reply-bar
+  // reserve — the brand's logomark, on the one surface where it was invisible.
   const layers = [];
   const logo = await optionalImage(resolvedBrand?.logoUrl || effectiveLayout.input?.brand?.logo);
   if (logo) {
     try {
-      const logoPng = await sharp(logo).resize({ width: 160, height: 56, fit: 'inside', withoutEnlargement: true }).png().toBuffer();
-      layers.push({ input: logoPng, top: dims.height - 100, left: dims.width - 224 });
+      const boxW = Math.round(0.16 * Math.min(dims.width, dims.height));
+      const logoPng = await sharp(logo)
+        .resize({ width: boxW, height: Math.round(boxW * 0.35), fit: 'inside', withoutEnlargement: true })
+        .png()
+        .toBuffer();
+      // Measure what came out: fit:'inside' preserves aspect, so a tall or a wide
+      // mark occupies less than the box and placing by the box would leave it
+      // floating off the corner it was promised.
+      const lm = await sharp(logoPng).metadata();
+      const place = logoPlacementFor({
+        surface: built.surface,
+        dims,
+        logoW: lm.width,
+        logoH: lm.height
+      });
+      if (place) layers.push({ input: logoPng, top: place.top, left: place.left });
+      else console.warn(`   ⚠️  direct-image: no room for the logo inside ${surface}'s content rect — skipping it rather than covering it with platform UI`);
     } catch (err) { console.warn(`   ⚠️  direct-image: logo compose failed (${err.message})`); }
   }
   const buffer = layers.length
@@ -542,11 +817,15 @@ async function renderDirectImage({
 module.exports = {
   // Exported for the offline harness. renderDirectImage is the only entry point
   // the render path uses.
-  dimsFor,
+  deliveryGeometryFor,
+  safeBoxInDeliveredPx,
+  extractFor,
+  logoPlacementFor,
   intentForTemplate,
   buildIntentData,
   describeProductForPrompt,
   conceptLook,
   normalizeReference,
+  resolveImagePromptOverride,
   renderDirectImage
 };

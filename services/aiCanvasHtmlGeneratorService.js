@@ -26,6 +26,8 @@ const { trackLlmCall }          = require('./costTracker');
 const { validateCandidate }     = require('./htmlValidationService');
 
 const { chatCompletion } = require('./atlasLlmService');
+// Quarantine: never pass Director reasoning into HTML/image prompts.
+const { conceptForRender, renderableCopy } = require('./conceptProjection');
 
 const MODEL_ID            = 'gpt-4.1';
 const TEMPERATURE         = 0.85;
@@ -572,19 +574,21 @@ function buildPromptV2({ canvas, concept, input, richContext, dims, videoMode = 
   const avoidTextBlock    = buildAvoidExistingTextBlock(sourceText, dims);
   const avoidSubjectBlock = buildAvoidSubjectBlock(sourceSubjects, sourcePrimarySubjectDesc, dims);
 
-  // Resolve concept.media_picks → URLs. Skip picks whose mediaId
-  // didn't resolve (defensive — should not happen since the Director
-  // round only emits universe-resident IDs, but the validator drops
-  // any survivors anyway).
-  const resolvedPicks = (concept.media_picks || []).map(p => ({
+  // Project first so dual-read v2/v3 lands on one flat shape and rationale
+  // is physically unreachable from this prompt builder (2026-08-01).
+  const projected = conceptForRender(concept) || concept;
+  // Resolve media_picks → URLs. Skip picks whose mediaId didn't resolve
+  // (defensive — should not happen since the Director round only emits
+  // universe-resident IDs, but the validator drops any survivors anyway).
+  const resolvedPicks = (projected.media_picks || []).map(p => ({
     media_id: p.media_id,
     role:     p.role,
     notes:    p.notes || null,
     url:      mediaUrlMap?.get(String(p.media_id)) || null
   })).filter(p => p.url);
 
-  const shape = concept.output_shape || {};
-  const cp = concept.copy_picks || {};
+  const shape = projected.output_shape || {};
+  const cp = renderableCopy(projected);
 
   const shapeGuidance = (() => {
     switch (shape.format) {
@@ -601,16 +605,17 @@ function buildPromptV2({ canvas, concept, input, richContext, dims, videoMode = 
 
   const conceptStrategy = [
     `CREATIVE CONCEPT (from the Director — MATERIALIZE THIS, don't reinvent):`,
-    `  concept_id:        ${concept.concept_id}`,
-    `  name:              ${concept.name || '-'}`,
-    `  archetype:         ${concept.archetype}`,
-    `  layout_family:     ${concept.layout_family || '-'}`,
-    `  creative_style:    ${concept.creative_style}`,
-    `  emotional_hook:    ${concept.emotional_hook}`,
-    `  social_proof_type: ${concept.social_proof_type}`,
-    `  cta_emphasis:      ${concept.cta_emphasis}`,
-    `  output_shape:      format=${shape.format} tile_count=${shape.tile_count || resolvedPicks.length}`,
-    `  rationale:         ${concept.rationale || '-'}`
+    `  concept_id:        ${projected.concept_id}`,
+    `  name:              ${projected.name || '-'}`,
+    `  archetype:         ${projected.archetype}`,
+    `  layout_family:     ${projected.layout_family || '-'}`,
+    `  creative_style:    ${projected.creative_style}`,
+    `  emotional_hook:    ${projected.emotional_hook}`,
+    `  social_proof_type: ${projected.social_proof_type}`,
+    `  cta_emphasis:      ${projected.cta_emphasis}`,
+    `  output_shape:      format=${shape.format} tile_count=${shape.tile_count || resolvedPicks.length}`
+    // rationale deliberately omitted — private Director reasoning must not
+    // reach any image/HTML model (2026-08-01 quarantine).
   ].join('\n');
 
   const mediaBlock = resolvedPicks.map((p, i) => (
@@ -666,7 +671,7 @@ function buildPromptV2({ canvas, concept, input, richContext, dims, videoMode = 
     `  html             — complete <html>…</html> document (200-30000 chars)`,
     `  css_extracted    — leave ""`,
     `  rationale        — 1-2 sentences on how composition serves the declared archetype + output_shape`,
-    `  creative_style   — echo ${concept.creative_style}`,
+    `  creative_style   — echo ${projected.creative_style}`,
     `  color_palette    — array of 2-5 hex strings you picked`,
     `  copy_picks       — ECHO the COPY block back verbatim: { headline, subheadline, eyebrow, cta } — null where the copy was null`,
     `  elements_used    — array of role names you rendered`,
@@ -830,22 +835,24 @@ function buildPrompt({ canvas, concept, input, richContext, dims, videoMode = fa
     userLines.push(``);
   }
 
+  // Project so v3 nested routing dual-reads flat and rationale is absent.
+  const projectedDir = conceptForRender(concept) || concept || {};
   userLines.push(`── CREATIVE DIRECTION (from the Director — MATERIALIZE THIS CONCEPT) ──`);
   userLines.push('```json');
   userLines.push(JSON.stringify({
-    concept_id:             concept.concept_id,
-    name:                   concept.name,
-    archetype:              concept.archetype,
-    layout_family:          concept.layout_family,
-    emotional_hook:         concept.emotional_hook,
-    social_proof_type:      concept.social_proof_type,
-    product_priority:       concept.product_priority,
-    ugc_priority:           concept.ugc_priority,
-    comment_priority:       concept.comment_priority,
-    stat_priority:          concept.stat_priority,
-    cta_emphasis:           concept.cta_emphasis,
-    recommended_components: concept.recommended_components || {},
-    rationale:              concept.rationale
+    concept_id:             projectedDir.concept_id,
+    name:                   projectedDir.name,
+    archetype:              projectedDir.archetype,
+    layout_family:          projectedDir.layout_family,
+    emotional_hook:         projectedDir.emotional_hook,
+    social_proof_type:      projectedDir.social_proof_type,
+    product_priority:       projectedDir.product_priority,
+    ugc_priority:           projectedDir.ugc_priority,
+    comment_priority:       projectedDir.comment_priority,
+    stat_priority:          projectedDir.stat_priority,
+    cta_emphasis:           projectedDir.cta_emphasis,
+    recommended_components: projectedDir.recommended_components || {}
+    // rationale deliberately omitted — private Director reasoning (2026-08-01).
   }, null, 2));
   userLines.push('```');
   userLines.push(``);

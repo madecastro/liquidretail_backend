@@ -60,11 +60,15 @@ function toObjectId(id) {
   return mongoose.isValidObjectId(id) ? new mongoose.Types.ObjectId(String(id)) : null;
 }
 
+// Queueable templates ONLY. Stage 1 (2026-08-02): the 7 non-ai_* legacy
+// templates (creator_endorsement, product_overlay, results_proof,
+// review_collage, testimonial_overlay, testimonial_spotlight,
+// ugc_split_screen) are removed from this set so the cartesian can never
+// queue one. They route to renderViaSpec which cannot render (CLAUDE.md §1).
+// Existing Ads that already reference them keep their template string —
+// inspector / board / labels still resolve via templateRegistry. Do not
+// delete the registry entries.
 const SUPPORTED_TEMPLATES = new Set([
-  'testimonial_spotlight',
-  'ugc_split_screen',
-  'testimonial_overlay',
-  'product_overlay',
   // AI templates — each maps 1:1 to a creativeStyle in aiCanvasSpecService.
   // Operator enables one or more; cartesian fans across them so a 3-style
   // pick on 4 media = 12 ads in 3 directions instead of one safe default.
@@ -79,7 +83,8 @@ const SUPPORTED_TEMPLATES = new Set([
 // (the design IS a creator quote over a real-world photo) and don't
 // make sense for a catalog hero shot; others work for either source.
 // Cartesian is filtered by this map so we don't queue combos that
-// will look obviously wrong.
+// will look obviously wrong. Legacy keys kept for read-safety if any
+// code path still consults the map for an existing Ad's template.
 const TEMPLATE_SUPPORTS_VARIANT = {
   testimonial_spotlight: new Set(['ugc', 'product_image']),
   ugc_split_screen:      new Set(['ugc', 'product_image']),
@@ -100,9 +105,19 @@ const TEMPLATE_SUPPORTS_VARIANT = {
 // route through the legacy cartesian and hit this filter; keeping it
 // dynamic means any new platformFormat addition auto-unlocks the same
 // aspect for brand campaigns.
-const { PLATFORM_FORMATS, staticFanoutForPlatformFormat } = require('./platformFormats');
+const {
+  PLATFORM_FORMATS,
+  LIVE_PLATFORM_FORMAT_KEYS,
+  resolvePreset,
+  assertGeneratablePlatformFormat
+} = require('./platformFormats');
+// Only live surfaces contribute shipping ratios — coming_soon aspects (e.g.
+// 1.91:1 Demand Gen) must not unlock billable legacy-cartesian work.
 const SHIPPING_RATIOS = new Set(
-  Object.values(PLATFORM_FORMATS).map(f => f.aspectRatio).filter(Boolean)
+  Object.values(PLATFORM_FORMATS)
+    .filter((f) => f.status === 'live')
+    .map(f => f.aspectRatio)
+    .filter(Boolean)
 );
 
 // Brand-only inventory cap. Without picks, this limits how many of
@@ -221,8 +236,39 @@ function readinessScoreForProductImage(matchTier) {
 // rejects the duplicate insert. paletteSource doubles the identity
 // space so media-palette and brand-palette renders for the same
 // (media, product, template, ratio, variant) coexist as separate Ads.
-function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams, rafflePrizeMediaId, kind }) {
+function computeIdentityDigest({ campaignId, productId, mediaId, template, aspectRatio, variantKind, paletteSource, ctaText, ctaUrl, ctaUrlParams, rafflePrizeMediaId, kind, generationRunId }) {
   const payload = JSON.stringify({
+    // SCOPED TO ONE RUN, by owner instruction: "there should be no limitation on
+    // creating new ads that may be duplicates since generative ads always have
+    // new seeds". Two Generate clicks on the same product/template/ratio are two
+    // different images, so refusing the second is wrong.
+    //
+    // The unique index still does its real job, because this is the RUN id, not
+    // a random value: within a run the digest is stable, so a genuine
+    // double-insert inside one expansion still collides. Across runs it differs,
+    // so a fresh click produces fresh ads.
+    //
+    // What this does NOT protect against, stated plainly because an earlier
+    // draft of this comment claimed otherwise: the worker reaper does not
+    // re-expand (worker.js only flips rendering->queued), and expand runs once
+    // per POST with no retry — so there is no requeue path for the index to
+    // catch here. The real remaining exposure is two rapid Generates minting
+    // two runIds and therefore two billable sets, which needs a concurrency
+    // guard on the route, not a digest change.
+    //
+    // Serialized as undefined when absent, which JSON.stringify OMITS — so the
+    // payload for any caller that does not pass it is byte-identical to the
+    // pre-2026-08-01 payload and their digests are unchanged.
+    // STATIC ONLY, enforced HERE rather than at the call site. The two kinds
+    // have opposite owner instructions — static is "no limitation on creating
+    // new ads that may be duplicates", video is "veo should only generate a
+    // video once for each product unless it is revised" — and a video digest
+    // that varied by run would re-bill a Veo master on every Generate. That is
+    // the expensive kind, so the rule belongs inside the function where no
+    // future caller can forget the ternary.
+    generationRunId: (generationRunId && String(kind || 'image') !== 'video')
+      ? String(generationRunId)
+      : undefined,
     campaignId:    String(campaignId),
     productId:     productId ? String(productId) : null,
     mediaId:       String(mediaId),
@@ -270,13 +316,29 @@ async function expandWizardJob({
   // tagged for Feed can still run a one-off Reels batch without
   // mutating Campaign.platformFormat.
   platformFormat = null,
+  // Wizard format PRESET. Superset of the three-knob API (platformFormat +
+  // kinds + expandStaticFormats). Default 'single' reproduces prior behaviour
+  // byte-identically from those knobs. Named presets:
+  //   meta_static   — 3 billable image gens per concept (Meta static fan-out)
+  //   meta_video    — 1 billable Veo submit per product (9:16 master ONLY)
+  //   meta_all      — both
+  //   google_static / google_video / google_all — empty while Google is coming_soon
+  preset = 'single',
   // Operator opted into "All static formats" in the wizard. When true, every
   // image concept is emitted once per Meta static surface
   // (staticFanoutForPlatformFormat) instead of once for platformFormat alone.
   // Default false: a caller that doesn't pass this gets EXACTLY prior
   // behavior — one format, one generation per concept. Video is untouched by
   // this flag; it has its own (not yet built) companion-crop story.
+  // Ignored when preset is a named preset other than 'single'.
   expandStaticFormats = false,
+  // The CampaignRun this expansion belongs to. Mixed into the static
+  // identityDigest so a second Generate on the same campaign produces new ads
+  // rather than colliding with the first run's and silently expanding to
+  // nothing — see computeIdentityDigest. Optional: when omitted the digest is
+  // byte-identical to the pre-2026-08-01 one, so the preview endpoint and any
+  // other caller keep their existing behaviour.
+  generationRunId = null,
   requestedBy  = null,
   // [{ productId, mediaId }] — globally drop these (productId, mediaId)
   // tuples from the cartesian. The wizard's Step 2 picker collects
@@ -340,12 +402,30 @@ async function expandWizardJob({
   // via the platformFormat function parameter — operator selects on
   // Step 1 of the wizard. Wizard override wins; campaign field is the
   // fallback for sources that don't pass it (e.g. legacy callers).
-  const ALLOWED_PLATFORM_FORMATS = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16', 'meta_stories_9_16', 'pmax_16_9'];
-  const wizardFormat = platformFormat && ALLOWED_PLATFORM_FORMATS.includes(platformFormat)
+  //
+  // Status is the gate: a request that NAMES a coming_soon format
+  // (preset 'single' path) is REFUSED, not silently empty / fall-through.
+  // Named presets ignore platformFormat for their format lists, so we only
+  // assert when the operator actually supplied a format (or campaign is used).
+  // Allowlist for successful resolution is LIVE_PLATFORM_FORMAT_KEYS.
+  const presetName = preset || 'single';
+  if (platformFormat) {
+    // Explicit wizard override — refuse coming_soon with a clear error.
+    assertGeneratablePlatformFormat(platformFormat);
+  } else if (presetName === 'single' && campaign.platformFormat) {
+    // Legacy single path with no override: campaign field is the effective
+    // choice. Refuse if it is coming_soon so we don't quietly fall back to
+    // meta_feed_1_1 and bill the wrong surface.
+    assertGeneratablePlatformFormat(campaign.platformFormat);
+  }
+  const wizardFormat = platformFormat && LIVE_PLATFORM_FORMAT_KEYS.includes(platformFormat)
     ? platformFormat
     : null;
+  const campaignFormat = campaign.platformFormat && LIVE_PLATFORM_FORMAT_KEYS.includes(campaign.platformFormat)
+    ? campaign.platformFormat
+    : null;
   const effectivePlatformFormat = wizardFormat
-    || campaign.platformFormat
+    || campaignFormat
     || 'meta_feed_1_1';
   const promotionalDetails = campaign.promotionalDetails || null;
   const allowedTemplates = templateIds.filter(t => SUPPORTED_TEMPLATES.has(t));
@@ -414,16 +494,51 @@ async function expandWizardJob({
   // concept-driven path is product-scoped.
   // Resolve operator-requested kinds against the format's allowed kinds.
   // Wizard input (kinds param) wins over campaign.adKinds; falls back to
-  // 'both' so legacy callers get the previous behavior.
-  const requestedKinds = kinds || campaign.adKinds || 'both';
-  const { resolveKinds } = require('./platformFormats');
-  let resolvedKinds = resolveKinds(effectivePlatformFormat, requestedKinds);
+  // 'image' so legacy callers get the previous behavior.
+  // Defaults to STATIC, not 'both'. The product has two separate presets and
+  // the operator always picks one, so an unset value means "the wizard didn't
+  // say", never "make me one of each" — and 'both' made every static run also
+  // queue a Veo video, the most expensive kind, unasked. Measured 2026-08-01:
+  // 27 of 127 campaigns have adKinds unset and so took this path, and campaign
+  // 6a6a52cd carries 23 video drafts alongside its 63 image drafts as a result.
+  // A caller that genuinely wants both still passes 'both' explicitly.
+  const requestedKinds = kinds || campaign.adKinds || 'image';
+
+  // PRESET resolution. 'single' (default) is byte-identical to the old
+  // three-knob path. Named presets own their format lists and kinds.
+  // MONEY: meta_video → videoFormats length === 1 (the 9:16 master). Queueing
+  // four video Ads for META_VIDEO_FANOUT would be four billable Veo submits;
+  // resolvePreset refuses that. Phase 3 derives the other sizes after the
+  // master lands.
+  const resolvedPreset = resolvePreset(preset || 'single', effectivePlatformFormat, {
+    kinds: requestedKinds,
+    expandStaticFormats: !!expandStaticFormats
+  });
+  let resolvedKinds = [...resolvedPreset.kinds];
+  // Static surfaces each image concept is emitted for. Empty means "use the
+  // run platformFormat alone" for the single/no-fanout path; named presets
+  // always populate this explicitly.
+  const presetStaticFormats = resolvedPreset.staticFormats || [];
+  // Video master (at most one for meta_video / meta_all). Empty → no video.
+  const presetVideoFormats = resolvedPreset.videoFormats || [];
+  // Platform format stamped on video Ad rows and used for Veo gating.
+  // Prefer the preset's video master when present so meta_video always
+  // queues against the 9:16 master regardless of campaign.platformFormat.
+  const videoPlatformFormat = presetVideoFormats[0] || effectivePlatformFormat;
+  // Platform format for image director / legacy path when static list is set.
+  const imagePlatformFormat = presetStaticFormats[0] || effectivePlatformFormat;
+  // Run-level format for seeds / logs / director when mixed or single.
+  const runPlatformFormat = resolvedKinds.includes('video') && !resolvedKinds.includes('image')
+    ? videoPlatformFormat
+    : resolvedKinds.includes('image') && !resolvedKinds.includes('video')
+      ? imagePlatformFormat
+      : effectivePlatformFormat;
 
   // Drop 'video' if Veo isn't enabled for this format. AI_VEO_REELS gates
   // Reels (9:16); AI_VEO_FEED gates everything else. If the operator asked
   // for video-only on a format with Veo disabled, this leaves resolvedKinds
   // empty and the early-return below short-circuits with zero queued.
-  const veoFlag = effectivePlatformFormat === 'meta_reels_9_16'
+  const veoFlag = videoPlatformFormat === 'meta_reels_9_16'
     ? process.env.AI_VEO_REELS
     : process.env.AI_VEO_FEED;
   const veoEnabled = String(veoFlag || '').toLowerCase() === 'true';
@@ -446,7 +561,13 @@ async function expandWizardJob({
   // mixed image+video run with the flag OFF must still route image through
   // the Director rather than silently dropping it.
   const aiConceptDriven    = String(process.env.AI_CONCEPT_DRIVEN || '').toLowerCase() === 'true';
-  const conceptImage       = wantsImage && (aiConceptDriven || wantsVideo);
+  // Multi-format static lists (meta_static / meta_all / expandStaticFormats) only
+  // fan out inside runConceptDrivenExpansion. Force the concept image path when
+  // more than one static surface is requested so the fan-out cannot silently
+  // collapse to a single legacy-cartesian format.
+  const conceptImage       = wantsImage && (
+    aiConceptDriven || wantsVideo || presetStaticFormats.length > 1
+  );
   const deterministicVideo = wantsVideo && productIds.length > 0;
   const conceptVideo       = wantsVideo && (productIds.length === 0 || directorVariants === true);
 
@@ -455,12 +576,16 @@ async function expandWizardJob({
     let conceptResult = null;
 
     if (deterministicVideo) {
+      // ONE video Ad per product at videoPlatformFormat.
+      // For preset meta_video / meta_all this is the 9:16 master only — ONE
+      // billable Veo submit. The other Meta video sizes are Phase 3
+      // derivations, not additional queued Ads.
       detResult = await expandDeterministicVideo({
         campaignId, brandId, campaignKind, productIds,
         seedMediaIds,
         seedPicks,
         ctaText, ctaUrl, ctaUrlParams,
-        platformFormat: effectivePlatformFormat,
+        platformFormat: videoPlatformFormat,
         videoDurationSec,
         videoPromptGuidance, videoPromptRaw,
         excludePairings
@@ -471,25 +596,34 @@ async function expandWizardJob({
       ...(conceptImage ? ['image'] : []),
       ...(conceptVideo ? ['video'] : [])
     ];
-    // Computed here, not earlier: only meaningful once we know an image
-    // concept is actually in this run. staticFanoutForPlatformFormat is a
-    // no-op passthrough for pmax_16_9 (one format in, one out) and for any
-    // format outside the Meta static three, so this is always safe to pass.
-    const staticFanout = (expandStaticFormats && conceptImage)
-      ? staticFanoutForPlatformFormat(effectivePlatformFormat)
-      : [];
+    // Static fan-out list for image concepts.
+    // Named presets (meta_static / meta_all) always supply presetStaticFormats
+    // (the 3 Meta static sizes). 'single' with expandStaticFormats:true supplies
+    // the same list via resolvePreset. 'single' with the flag off leaves the
+    // list empty so runConceptDrivenExpansion falls through to [platformFormat]
+    // — byte-identical to pre-preset behaviour.
+    const staticFanout = conceptImage ? presetStaticFormats : [];
+    // Director / concept video stamp: use image primary when image is in the
+    // run (so concept digests key off a static surface), else the video master.
+    const conceptPlatformFormat = conceptImage
+      ? (presetStaticFormats[0] || imagePlatformFormat)
+      : videoPlatformFormat;
     if (conceptKinds.length) {
       conceptResult = await runConceptDrivenExpansion({
         campaignId, brandId, campaignKind, productIds,
         mediaIds,   // operator-picked UGC seeds — restricts the Director's universe when non-empty
         ctaText, ctaUrl, ctaUrlParams,
-        platformFormat: effectivePlatformFormat,
+        platformFormat: conceptPlatformFormat,
         staticFormats: staticFanout,
+        // When conceptVideo is on, video rows use platformFormat above — which
+        // for meta_video is the single 9:16 master. Never pass the full
+        // META_VIDEO_FANOUT as staticFormats-style expansion for video.
         kinds: conceptKinds,
         includeCategoryMatched, includeBrandMatched,
         excludePairings, creativeIntent: null,
         videoDurationSec,
-        videoPromptGuidance, videoPromptRaw
+        videoPromptGuidance, videoPromptRaw,
+        generationRunId
       });
     }
 
@@ -509,10 +643,10 @@ async function expandWizardJob({
     // Estimate itself is always 1 det ad/product regardless of pick count.
     const estimateProducts = productIds.length > 0 ? productIds : [null];
     // How many static surfaces each image concept will be emitted for. Mirrors
-    // the live path's `staticFanout` exactly; 1 when the operator has not opted
-    // into the fan-out, so the estimate is unchanged for every existing caller.
-    const staticFanoutCount = (expandStaticFormats && conceptImage)
-      ? Math.max(1, staticFanoutForPlatformFormat(effectivePlatformFormat).length)
+    // the live path's staticFanout exactly. Named presets and expandStaticFormats
+    // both land in presetStaticFormats; empty list → 1 (single-format path).
+    const staticFanoutCount = conceptImage
+      ? Math.max(1, presetStaticFormats.length || 1)
       : 1;
     const byProduct = {};
     let detTotal = 0;
@@ -604,7 +738,7 @@ async function expandWizardJob({
   // image seeds (Track 2, image-to-video) — so all fileTypes are valid.
   // Without AI_VEO_REELS, image-only seeds produce a still-on-video which
   // looks bad on a motion-expected surface, so we drop them.
-  if (effectivePlatformFormat === 'meta_reels_9_16' && !veoEnabled) {
+  if (runPlatformFormat === 'meta_reels_9_16' && !veoEnabled) {
     const before = seeds.length;
     seeds = seeds.filter(s => s.fileType === 'video' && s.variantKind !== 'product_image');
     const dropped = before - seeds.length;
@@ -647,7 +781,7 @@ async function expandWizardJob({
   // platformFormat (line 1427); this brings the legacy cartesian into
   // parity for brand campaigns (which have no productIds and never
   // reach the concept-driven path).
-  const platformAspect = aspectRatioForPlatformFormat(effectivePlatformFormat) || null;
+  const platformAspect = aspectRatioForPlatformFormat(runPlatformFormat) || null;
   const grid = [];
   for (const templateId of allowedTemplates) {
     const tpl = registry.getNormalized(templateId);
@@ -709,6 +843,9 @@ async function expandWizardJob({
               variantKind:   seed.variantKind,
               paletteSource,
               kind,
+              // Passed unconditionally; computeIdentityDigest drops it for
+              // video so a Veo master is not re-billed on every Generate.
+              generationRunId,
               ctaText, ctaUrl, ctaUrlParams,
               rafflePrizeMediaId
             });
@@ -724,7 +861,7 @@ async function expandWizardJob({
               template:       cell.templateId,
               aspectRatio:    cell.aspectRatio,
               campaignKind,
-              platformFormat: effectivePlatformFormat,
+              platformFormat: runPlatformFormat,
               videoDurationSec: kind === 'video' ? (videoDurationSec || null) : null,
               matchTier:      seed.matchTier,
               variantKind:    seed.variantKind,
@@ -873,7 +1010,7 @@ async function expandWizardJob({
       productIds:     uniqueProductIds,
       campaignKind,
       creativeIntent: null,  // Phase 9 UX adds an operator hint here
-      platformFormat: effectivePlatformFormat
+      platformFormat: runPlatformFormat
     }),
     runCopyDerivationEager({
       brandId,
@@ -1531,10 +1668,26 @@ const CREATIVE_STYLE_TO_TEMPLATE = {
 // Per-concept identity. campaignId scopes uniqueness; conceptId +
 // productId + platformFormat distinguish within campaign. Independent
 // of media/template since the concept declares its own media + style.
-function computeV2IdentityDigest({ campaignId, productId, conceptId, platformFormat, kind, ctaText, ctaUrl, ctaUrlParams }) {
+function computeV2IdentityDigest({ campaignId, productId, conceptId, platformFormat, kind, ctaText, ctaUrl, ctaUrlParams, generationRunId }) {
   const parts = [
     String(campaignId),
     productId ? String(productId) : 'NULL',
+    // Run-scoped for STATIC, so a second Generate produces a second set of ads
+    // instead of colliding with the first on the (campaignId, identityDigest)
+    // unique index. Owner: "there should be no limitation on creating new ads
+    // that may be duplicates since generative ads always have new seeds."
+    //
+    // conceptId ALONE could never carry that, and the comment further down this
+    // file claiming fresh concept_ids make collisions "rare" is wrong:
+    // aiCreativeDirectorService asks the model for a "short slug (must be unique
+    // within this round)", so slugs like cd_quote_lead recur across rounds by
+    // design. That reuse is exactly what made two Generates in a row produce
+    // nothing on 2026-08-01.
+    //
+    // Video is excluded — "veo should only generate a video once for each
+    // product unless it is revised" — so a video digest stays run-independent
+    // and a repeat Generate cannot re-bill a Veo master.
+    (generationRunId && String(kind || 'image') !== 'video') ? String(generationRunId) : '',
     String(conceptId || ''),
     String(platformFormat || ''),
     String(kind || 'image'),                       // kind distinguishes image vs video variants of the same concept
@@ -2076,7 +2229,11 @@ async function runConceptDrivenExpansion({
   excludePairings, creativeIntent,
   videoDurationSec = null,                          // wizard-requested video length (sec); null = standard 8s
   videoPromptGuidance = null,                       // run-level guidance — stamped on video Ad rows
-  videoPromptRaw = null                             // run-level raw override — stamped on video Ad rows
+  videoPromptRaw = null,                            // run-level raw override — stamped on video Ad rows
+  // The CampaignRun this expansion belongs to. Mixed into the STATIC V2 digest
+  // so a repeat Generate makes new ads rather than colliding with the previous
+  // run's. Optional: omitting it reproduces the pre-2026-08-01 digest exactly.
+  generationRunId = null
 }) {
   const { resolveKinds, renderRouteForKind } = require('./platformFormats');
   const resolvedKinds = (Array.isArray(kinds) && kinds.length)
@@ -2269,7 +2426,9 @@ async function runConceptDrivenExpansion({
                 conceptId: concept.concept_id,
                 platformFormat: fmt,
                 kind,
-                ctaText, ctaUrl, ctaUrlParams
+                ctaText, ctaUrl, ctaUrlParams,
+                // Dropped for video inside computeV2IdentityDigest.
+                generationRunId
               }),
               ctaText, ctaUrl, ctaUrlParams,
               queuedAt:          new Date(),
@@ -2295,8 +2454,21 @@ async function runConceptDrivenExpansion({
         batchRationale
       };
     } catch (err) {
+      // Carry the error CLASS as well as the message. A ReferenceError thrown
+      // inside the Director used to arrive at the operator as "Nothing to
+      // render", because the route could not distinguish a thrown product from
+      // an empty selection — see the errorEntries branch in routes/ads.js.
+      //
+      // Still return rather than rethrow: one product blowing up must not abort
+      // the siblings mid-Promise.all, which would change who gets billed.
       console.error(`📦 conceptDriven[${productTag}]: failed (${err.message})`);
-      return { productId, payloads: [], skipped: 'error', error: err.message };
+      return {
+        productId,
+        payloads: [],
+        skipped: 'error',
+        error: err && err.message ? err.message : String(err),
+        errorName: (err && err.constructor && err.constructor.name) || 'Error'
+      };
     }
   }));
 
@@ -2355,11 +2527,18 @@ async function runConceptDrivenExpansion({
   }
 
   // Bulk insert — ordered: false swallows dup-key per (campaignId,
-  // identityDigest) so re-running the wizard with the same product
-  // picks doesn't double-queue the same concepts. Note: each Generate
-  // press creates a NEW round with NEW concept_ids, so dup-key only
-  // hits when the operator re-runs without changing state and the
-  // Director happens to produce an identically-id'd concept (rare).
+  // identityDigest) so one expansion cannot double-queue the same concept.
+  //
+  // This used to claim "each Generate press creates a NEW round with NEW
+  // concept_ids, so dup-key only hits ... (rare)". That was false, and it is
+  // why static generation silently produced nothing. aiCreativeDirectorService
+  // asks the model for a "short slug (must be unique within this round)" — so
+  // slugs like cd_quote_lead recur across rounds BY DESIGN, and a second
+  // Generate collided on essentially every concept. Three runs on 2026-08-01
+  // ended done/total:0 for exactly this reason. The V2 digest is now scoped to
+  // the CampaignRun for static, so cross-run collision no longer happens and
+  // dup-key here is once again what the comment always said it was: a
+  // within-expansion safety net.
   let inserted = [];
   try {
     inserted = await Ad.insertMany(payloads, { ordered: false });

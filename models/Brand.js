@@ -260,14 +260,17 @@ const brandSchema = new mongoose.Schema({
   // composited locally and is never sent to the model — owner-specified, and the
   // one deliberate exception to "the model renders everything".
   //
+  // 2026-08-02 Stage 1 — 'html' REMOVED from the writeable enum. Zero brands
+  // used it. The brand write route rejects it with 400. resolveStaticPipeline()
+  // still reads a stored 'html' safely (legacy), but nothing can SET it now.
+  //
   // NO BACKFILL (house rule: forward-only). Brands still holding the retired
-  // 'direct_overlay' string are not migrated; resolveStaticPipeline() below
-  // treats anything that is not exactly 'html' as the direct path, so those rows
-  // land on 'direct_image' by themselves and nothing throws on read. The enum is
-  // only consulted on write, so an old value can never break a render.
+  // 'direct_overlay' string are not migrated; resolveStaticPipeline() treats
+  // anything that is not exactly 'html' as the direct path, so those rows
+  // land on 'direct_image' by themselves and nothing throws on read.
   staticImagePipeline: {
     type: String,
-    enum: ['direct_image', 'html'],
+    enum: ['direct_image'],
     default: 'direct_image'
   },
 

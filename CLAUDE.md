@@ -10,6 +10,77 @@ security, money, or the render queue** — it carries verified P0s with `path:li
 
 ---
 
+## 00. THE CATALOG PRODUCT-AD PIPELINE — owner-stated, 2026-08-02
+
+**This is the whole architecture for catalog-based product ads. There are no
+other generation pathways for them. Do not propose, restore, or "fall back to"
+one.** Owner, verbatim: *"We are no longer using ANY other generation pathways
+for video or static ads … we are not using any other generation pathways for
+catalog based product ads."*
+
+**VIDEO** — one generation, four deliverables:
+
+1. Resize the hero image to **9:16** with the **current** resizing system.
+2. **Omni** image-to-video → the 9:16 **master**. `google/gemini-omni-flash/
+   image-to-video-developer`. ONE submit per product. See §2 — everything named
+   `veo*` is this Omni pipeline under a legacy name.
+3. **Crop** the master to **4:5** and **1:1** (`videoCropUrl` +
+   `basePlateCropService`, face-anchored). Never a second generation.
+4. **Title each surface appropriately** — burned into the delivered file, using
+   that surface's own safe zone. Reels (204) and Stories (250) differ and must
+   not share one entry.
+5. **Preview** the result inside the matching **Meta surface overlay**.
+
+**STATIC** — direct to **gpt-image-2/edit**, one call returns the finished ad
+(`directImageRenderService`). No HTML, no Puppeteer, no SVG overlay compositing.
+
+### The overlay is PREVIEW ONLY — and it is not the titling
+
+Two different things, repeatedly confused, so state both:
+
+- **Titling / "chrome"** in `brandScriptExecutor` → `remotionRenderService` **is
+  burned into the video**. Correct and intended.
+- **The Meta surface overlay** — the simulated IG/FB furniture *including Meta's
+  current CTA treatment for that surface* — is **PREVIEW ONLY and MUST NOT be
+  burned in**. Owner: *"the meta overlays should include the current meta
+  treatment for CTA as those are not burned in the video."* An advertiser
+  uploads a clean asset; Meta draws its own UI.
+
+### SCOPE — what constrains deletion, and what does not
+
+Exclusivity covers **catalog-based product ads** (`Ad.variantKind ===
+'product_image'`). Owner: *"existing alternate pathways will exist for social
+media images that get repurposed for ads."* `'ugc'` is that repurposed social
+image — **and it is also moving to the new pipeline** (owner, same day).
+
+Three things that do **NOT** constrain deletion, all owner-confirmed:
+
+- **Already-generated ads.** *"I am not worried about ads that have been
+  previously generated, they are already there."* They hold finished
+  `renderUrl`s. Old renderer code is only needed to RE-render them, which is not
+  a requirement. ~777 ugc and ~466 product_image rows sit on `html_gen`; none of
+  them is a reason to keep code.
+- **Brand pipeline flags.** *"All brands should be on the new pipeline now"* —
+  confirmed: 33 brands `null`, 1 `direct_overlay`, **zero** on `'html'`, and
+  `resolveStaticPipeline` maps everything except literal `'html'` to
+  `DIRECT_IMAGE`.
+- **`renderRoute: 'html_gen'`.** ANOTHER MISNOMER, same family as `veo*`.
+  `renderRouteForKind()` returns `'html_gen'` for every image ad regardless of
+  brand or variant — it means "static", not "the HTML renderer". The real
+  renderer is chosen inside `renderService`: `:470` sends every `ai_*` static ad
+  to `renderDirectImage` and returns. Production proves it — 20 rows are
+  `html_gen` + pipeline `direct_image`.
+
+**So the HTML renderer is unreachable for new generation.** It survives only for
+non-`ai_*` legacy templates, which §1 already documents as routing to the dead
+`renderViaSpec`.
+
+Still must stay: `headlessScrapeService`, `brandLogoIngestService` and
+`reviewHeadlessCapture` use Puppeteer for **scraping / ingest / review capture**,
+not generation.
+
+---
+
 ## 0. THE ONE RULE THAT WOULD HAVE SAVED THE MOST TIME
 
 **Code being present does not mean the path is live.** This repo retires paths by
@@ -116,8 +187,28 @@ scraping. Video never launches a browser.
   instances; `VEO_CONCURRENCY` is per-process too (`routes/ads.js:144`).
 - **Each aspect ratio is its own billable generation.** `identityDigest` includes
   `aspectRatio`, so 1:1 + 4:5 + 9:16 = three Ads = three video submits. Nothing
-  reuses a sibling's `veoVideoUrl`. Omni supports only 16:9/9:16, so 1:1 and 4:5
-  force-route to Grok (`ASPECT_FALLBACK_MODEL`) — same concept, different model.
+  reuses a sibling's `veoVideoUrl`. **Measured in production 2026-08-01:** four
+  runs on one campaign/product/media produced four independent submits at 1:1,
+  1:1, 4:5 and 9:16 — four unrelated creatives, not one master in four sizes.
+- **"veo" IS A LEGACY NAME — the video model is Omni.** Corrected 2026-08-02.
+  `BUILT_IN_DEFAULT_MODEL` is `google/gemini-omni-flash/image-to-video-developer`
+  (`atlasVideoService.js:231`) and `ATLAS_VIDEO_MODEL` is **blank** in
+  `config/defaults.env`, so that default is what runs. Veo 3.1 is in `MODEL_CAPS`
+  but is not selectable. Everything spelled veo — `renderRoute:'veo'`,
+  `veoPredictionId`, `veoVideoUrl`, `VEO_CONCURRENCY`, `AI_VEO_FEED`,
+  `veoPromptBuilder`, `buildVeoPrompt` — is an Omni pipeline wearing an old name.
+  Do not infer the model from any of those identifiers.
+- **Every Meta video aspect already renders at Omni 9:16.** Omni's
+  `supportedAspectRatios` is exactly `['16:9','9:16']`, and
+  `omniFamilyNativeFor()` (`atlasVideoService.js:507`) ends
+  `return r < 1 ? '9:16' : '16:9'` — so 4:5 routes to 9:16, and 1:1 also routes
+  to 9:16 unless `SQUARE_VIA_OMNI_CROP=false`. The compositor then crops
+  face-anchored via `basePlateCropService` + `faceSafeCrop`. The previous claim
+  here — that 1:1 and 4:5 "force-route to Grok" — was **false**;
+  `ASPECT_FALLBACK_MODEL` (Grok Imagine) is now only the square opt-out and
+  explicitly-selected non-Omni models. Consequence: the crop-from-9:16 machinery
+  the owner asked to reuse already exists and is proven, so one-master fan-out is
+  about SHARING a master across sibling Ads, not about building cropping.
 
 ---
 

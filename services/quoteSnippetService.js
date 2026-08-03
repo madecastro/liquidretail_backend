@@ -79,12 +79,71 @@ function normalize(s) {
   return String(s).toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// The snippet is considered extractive if its normalized form is a
-// contiguous substring of the normalized source. Punctuation and case
-// are ignored; word order matters. This catches paraphrases without
-// being fooled by trivial punctuation differences.
+// Tokens, not characters. Apostrophes are removed rather than turned into
+// spaces so "wasn't" survives as one token `wasnt` and can be recognised as the
+// negator it is — `normalize()` above splits it into `wasn` + `t`, which is fine
+// for containment and useless for meaning.
+function tokens(s) {
+  return String(s).toLowerCase().replace(/['’]/g, '').replace(/[^\w\s]/g, ' ').trim().split(/\s+/).filter(Boolean);
+}
+
+// Words that inverting-scope a phrase that follows them. Dropping one of these
+// from the front of an extracted span leaves a perfectly legal contiguous
+// substring that says the opposite of what the customer said.
+const NEGATORS = new Set([
+  'not', 'no', 'never', 'none', 'nothing', 'nor', 'cannot', 'cant', 'wasnt', 'isnt',
+  'arent', 'werent', 'wont', 'dont', 'doesnt', 'didnt', 'hasnt', 'havent', 'hadnt',
+  'couldnt', 'wouldnt', 'shouldnt', 'aint', 'barely', 'hardly', 'scarcely', 'rarely',
+  'seldom', 'without', 'unless', 'stopped', 'fails', 'failed', 'refused', 'wish'
+]);
+// How far back to look. "not worth it" is adjacent; "not really worth it" and
+// "I was not at all sure" put one or two words in between.
+const NEGATION_LOOKBACK = 3;
+
+/**
+ * Is `snippet` a faithful extract of `source`?
+ *
+ * Contiguous-substring containment was the whole test, and it conflates "these
+ * characters appear in order" with "this means what the reviewer meant". Those
+ * come apart at exactly one place — a negator immediately before the span — and
+ * that is not a hypothetical: verified against the real function,
+ *
+ *   isExtractive('worth it',              'Not worth it for the price')      -> true
+ *   isExtractive('sure about the fabric', "I wasn't sure about the fabric")  -> true
+ *   isExtractive('holds up',              'It never holds up in the wash')   -> true
+ *
+ * Every one of those is a legal substring introducing no new words, and every
+ * one inverts a complaint into praise under a named customer's byline. The LLM
+ * is told to pick positive phrases, which is precisely the instruction that
+ * makes it reach into a negative sentence for the positive-sounding half.
+ *
+ * Also now word-boundary aware. The old character test matched 'art' inside
+ * 'the start of every season'.
+ *
+ * A span may occur more than once, so ALL occurrences are checked and the
+ * snippet is accepted if ANY of them is clean — testing only the first is wrong
+ * in both directions ("Not worth it at first, but honestly worth it now"
+ * legitimately contains a clean second occurrence).
+ */
 function isExtractive(snippet, source) {
-  return normalize(source).includes(normalize(snippet));
+  const sn = tokens(snippet);
+  const src = tokens(source);
+  if (!sn.length || sn.length > src.length) return false;
+
+  for (let i = 0; i + sn.length <= src.length; i++) {
+    let match = true;
+    for (let j = 0; j < sn.length; j++) {
+      if (src[i + j] !== sn[j]) { match = false; break; }
+    }
+    if (!match) continue;
+    // A clean occurrence is one with no negator in the window before it.
+    let negated = false;
+    for (let k = Math.max(0, i - NEGATION_LOOKBACK); k < i; k++) {
+      if (NEGATORS.has(src[k])) { negated = true; break; }
+    }
+    if (!negated) return true;
+  }
+  return false;
 }
 
 /**
@@ -554,6 +613,9 @@ async function usableProofCommentsOrNone(comments, ctx = {}, where = 'unknown') 
 module.exports = {
   extractSnippet,
   truncateAtWordBoundary,   // exported for testing / direct fallback callers
+  // Exported for scripts/verifyQuoteProvenance.js. A negation-stripping
+  // extract passes plain substring containment and inverts the review.
+  isExtractive,
   strongestSentence,
   bestClause,
   shortenProofLine,

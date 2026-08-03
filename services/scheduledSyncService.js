@@ -18,6 +18,7 @@ const IntegrationCredential = require('../models/IntegrationCredential');
 const { syncCatalog } = require('./catalogSyncService');
 const { syncPosts }   = require('./postSyncService');
 const { syncCampaigns } = require('./campaignSyncService');
+const { concurrency: CONC } = require('./concurrency');
 
 const AD_PLATFORMS = ['meta-ads', 'google-ads'];
 
@@ -159,8 +160,8 @@ async function runDueSyncs() {
 }
 
 // One-shot sweep: find brands whose derivedVoice is stale and refresh
-// them with concurrency=2 so a backlog doesn't burn the OpenAI quota
-// in one tick. Returns the count of refreshes attempted (success and
+// them with VOICE_SWEEP_CONCURRENCY so a backlog doesn't burn the OpenAI
+// quota in one tick. Returns the count of refreshes attempted (success and
 // skip both increment — skipped means the brand had < MIN_AD_CORPUS
 // ads, so there's nothing to derive).
 async function sweepStaleBrandVoices() {
@@ -189,7 +190,7 @@ async function sweepStaleBrandVoices() {
   if (!eligible.length) return 0;
 
   console.log(`🗣️  voiceSweep: refreshing ${eligible.length} brand voice profile(s)`);
-  const CONCURRENCY = 2;
+  const CONCURRENCY = CONC.VOICE_SWEEP_CONCURRENCY;
   let cursor = 0;
   let refreshed = 0;
   const workers = Array.from({ length: Math.min(CONCURRENCY, eligible.length) }, async () => {

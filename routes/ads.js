@@ -29,6 +29,7 @@ const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
 const { expandWizardJob, selectAdsForRun } = require('../services/campaignAdsGenerationService');
+const { assertGeneratablePlatformFormat } = require('../services/platformFormats');
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
@@ -137,22 +138,12 @@ function parsePhase3WizardFields(body = {}) {
 // manually drive those.
 const AD_STATUSES = ['draft', 'live', 'archived'];
 
-// Render concurrency. Puppeteer + Cloudinary is the bottleneck;
-// running too many in parallel on the small Render instance OOMs
-// Chromium. 2 in flight at once is a safe starting point.
-const RENDER_CONCURRENCY     = parseInt(process.env.RENDER_CONCURRENCY     || '2', 10);
-const VEO_CONCURRENCY        = parseInt(process.env.VEO_CONCURRENCY        || '1', 10);
-
-// Hard cap on creatives per generation. Cartesian expansion
-// (products × templates × supported ratios) blows up fast. Bumped
-// from 6 to 20 after the wizard simplification — the operator no
-// longer picks 1-2 templates, so the default fanout grew (all 5
-// ai_* templates × 4 concepts), and a 6-cap meant only a slice of
-// the seed × template × concept matrix ever rendered per run.
-// 20 still fits inside Chromium's warm-render window at concurrency
-// 2 in roughly 10-15 minutes — adjust POLL_TIMEOUT_MS in the Ads
-// page if you push this further.
-const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '20', 10);
+// Render / video pool sizes + per-run cap — resolved in services/concurrency.js
+// (env-tunable; defaults raised 2026-08-02: RENDER 4→8, VEO 1→4).
+const { concurrency: CONC } = require('../services/concurrency');
+const RENDER_CONCURRENCY    = CONC.RENDER_CONCURRENCY;
+const VEO_CONCURRENCY       = CONC.VEO_CONCURRENCY;
+const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +
@@ -173,17 +164,29 @@ router.post('/preview', async (req, res) => {
       urlParams   = '',
       platformFormat = null,   // Phase 2 wizard override; null → use campaign.platformFormat
       kinds          = null,   // 'image' | 'video' | 'both'; null → use campaign.adKinds
+      // Format PRESET — supersedes the three-knob API when not 'single'.
+      // Default 'single' keeps old callers byte-identical.
+      preset         = 'single',
       excludePairings = [],
       includeCategoryMatched = false,
       includeBrandMatched    = false,
       videoDurationSec = null,
       // "All static formats" wizard button. See expandWizardJob for what
       // this actually does — each additional format is a separate billable
-      // image generation, not a crop.
+      // image generation, not a crop. Ignored for named presets.
       expandStaticFormats = false
     } = req.body || {};
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
+    // Refuse an explicitly named coming_soon format with 400 (not empty/500).
+    try {
+      if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+    } catch (e) {
+      if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
+        return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
+      }
+      throw e;
+    }
 
     const phase3 = parsePhase3WizardFields(req.body || {});
     if (!phase3.ok) return res.status(phase3.status).json({ error: phase3.error });
@@ -204,6 +207,7 @@ router.post('/preview', async (req, res) => {
       urlParams,
       platformFormat,
       kinds,
+      preset,
       excludePairings,
       includeCategoryMatched,
       includeBrandMatched,
@@ -219,6 +223,9 @@ router.post('/preview', async (req, res) => {
     });
     res.json(job);
   } catch (err) {
+    if (err.code === 'PLATFORM_FORMAT_COMING_SOON') {
+      return res.status(400).json({ error: err.message, code: err.code, platformFormat: err.platformFormat });
+    }
     console.error(`❌ POST /api/ads/preview failed: ${err.message}\n${err.stack || ''}`);
     res.status(500).json({ error: err.message || 'preview failed' });
   }
@@ -238,6 +245,11 @@ router.post('/generate', async (req, res) => {
       urlParams   = '',
       platformFormat = null,   // Phase 2 wizard override; null → use campaign.platformFormat
       kinds          = null,   // 'image' | 'video' | 'both'; null → use campaign.adKinds
+      // Format PRESET — supersedes platformFormat+kinds+expandStaticFormats
+      // when not 'single'. Default 'single' keeps old callers byte-identical.
+      // meta_video queues ONE 9:16 master per product (one billable Veo submit);
+      // meta_static fans each concept to 3 Meta static sizes (3 billable images).
+      preset         = 'single',
       // [{ productId, mediaId }] — operator-deselected pairings from
       // the Step 2 picker. Forwarded into expandWizardJob to drop the
       // matching tuples from the cartesian.
@@ -255,11 +267,21 @@ router.post('/generate', async (req, res) => {
       // every Meta static surface (staticFanoutForPlatformFormat) instead of
       // just platformFormat. EACH SIZE IS A SEPARATE BILLABLE GENERATION.
       // Default false: existing callers get exactly prior behavior.
+      // Ignored for named presets (meta_static / meta_all already fan out).
       expandStaticFormats = false
     } = req.body || {};
 
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
+    // Refuse coming_soon before minting a CampaignRun / returning 202.
+    try {
+      if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+    } catch (e) {
+      if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
+        return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
+      }
+      throw e;
+    }
 
     const phase3 = parsePhase3WizardFields(req.body || {});
     if (!phase3.ok) return res.status(phase3.status).json({ error: phase3.error });
@@ -303,6 +325,38 @@ router.post('/generate', async (req, res) => {
     //      the run to status='running' with total set and start the render
     //      loop. Errors land the run as status='failed' with a single
     //      error entry so the UI can surface them.
+    // ONE generation in flight per campaign. Checked in the DATABASE, not in
+    // memory: services/inFlight.js is per-process and this web service
+    // autoscales across several Render instances, so two clicks can land on two
+    // processes that cannot see each other.
+    //
+    // This guard is load-bearing as of 2026-08-01. Until the identityDigest was
+    // scoped to the run, a double-click was silently free — the second run's ads
+    // collided with the first's on the unique index and inserted nothing. That
+    // accident was the only thing standing between a stray double-click and a
+    // second full set of billable generations, and scoping the digest (which the
+    // owner asked for, so repeat Generates actually produce new creative)
+    // removed it. Every generation POST is charged on submit (CLAUDE.md §2).
+    //
+    // Stale runs are not allowed to lock a campaign forever: a 'preparing' or
+    // 'running' row older than the render ceiling is treated as dead. That bound
+    // is REAP_STALE_MIN, the same one worker.js uses to reclaim stuck ads, so the
+    // two cannot drift into disagreeing about what "stale" means.
+    const staleMin = Number(process.env.REAP_STALE_MIN || 15);
+    const active = await CampaignRun.findOne({
+      campaignId,
+      status: { $in: ['preparing', 'running'] },
+      createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
+    }).select('runId status createdAt').lean();
+    if (active) {
+      return res.status(409).json({
+        error: 'A generation is already running for this campaign. Wait for it to finish, or reload to see its progress.',
+        code: 'generation-already-running',
+        runId: active.runId,
+        startedAt: active.createdAt
+      });
+    }
+
     const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const renderToken = jwt.sign(
       {
@@ -360,6 +414,7 @@ router.post('/generate', async (req, res) => {
           urlParams,
           platformFormat,
           kinds,
+          preset,
           excludePairings,
           includeCategoryMatched,
           includeBrandMatched,
@@ -370,16 +425,69 @@ router.post('/generate', async (req, res) => {
           seedPicks: phase3.fields.seedPicks,
           videoPromptGuidance: phase3.fields.videoPromptGuidance,
           videoPromptRaw: phase3.fields.videoPromptRaw,
+          // Scopes the static identityDigest to THIS run, so generating twice on
+          // the same campaign produces two sets of ads instead of the second one
+          // colliding with the first and expanding to nothing.
+          generationRunId: run.runId,
           requestedBy: req.user?.userId || null
         });
 
-        if (job.queuedCount === 0) {
+        // `newlyQueued`, NOT `queuedCount`. queuedCount is
+        // countDocuments({ campaignId, status: 'queued' }) — every queued ad in
+        // the whole campaign, which is a different question entirely. It read 0
+        // for any campaign whose ads had all moved on to draft/rendered/failed,
+        // so a perfectly good expansion was discarded before selectAdsForRun and
+        // the run finished as done/total:0 with nothing on screen. Observed in
+        // production on 2026-08-01: campaign 6a6a52cd had 63 image drafts, 23
+        // video drafts and zero queued, and two consecutive Generates produced
+        // nothing at all.
+        const newlyQueued = Array.isArray(job.newAdIds) ? job.newAdIds.length : (job.newlyQueued || 0);
+
+        // A product that THREW is not a product that produced nothing, and the
+        // two used to collapse into the same "Nothing to render" done/total:0
+        // run. That is how a ReferenceError inside the Director — which broke
+        // every fresh concept round — reached the operator as an empty
+        // selection with no way to tell it from a hang.
+        const productErrors = (Array.isArray(job.perProduct) ? job.perProduct : [])
+          .filter((r) => r && r.skipped === 'error');
+        const errorEntries = productErrors.map((r, i) => ({
+          index: i,
+          stage: 'expand',
+          message: `${r.errorName || 'Error'}: ${r.error || 'unknown error'}` +
+                   (r.productId ? ` (product=${r.productId})` : '')
+        }));
+
+        if (newlyQueued === 0) {
+          // Threw, so the run FAILED — it did not quietly finish with nothing.
+          if (errorEntries.length) {
+            await CampaignRun.updateOne(
+              { _id: run._id },
+              { status: 'failed', completedAt: new Date(),
+                $push: { errors: { $each: errorEntries } } }
+            );
+            return;
+          }
+          // Say WHY. A run that ends done/total:0 with no reason is
+          // indistinguishable from a hang, and that is how this shipped.
+          const reason = job.alreadyQueued
+            ? `Nothing new to render: all ${job.alreadyQueued} creative(s) for this selection are already queued.`
+            : 'Nothing to render: this selection produced no creatives. Check that the product has usable imagery and at least one template is selected.';
           await CampaignRun.updateOne(
             { _id: run._id },
             { status: 'done', completedAt: new Date(),
-              $push: { errors: { index: 0, stage: 'expand', message: 'No renderable creatives' } } }
+              $push: { errors: { index: 0, stage: 'expand', message: reason } } }
           );
           return;
+        }
+
+        // PARTIAL: some products queued, others threw. Record the throws so the
+        // run is not presented as a clean success, but do not abort — the ads
+        // that did queue are already paid for and must still render.
+        if (errorEntries.length) {
+          await CampaignRun.updateOne(
+            { _id: run._id },
+            { $push: { errors: { $each: errorEntries } } }
+          );
         }
 
         // Scope to the product(s) the operator actually picked. Unscoped, this
@@ -815,6 +923,23 @@ async function renderOne(run, job, adId, index, renderToken) {
   }
 }
 
+/**
+ * Record which stage a specific ad is in, so an operator can read one assetId's
+ * state instead of grepping logs for it.
+ *
+ * FIRE-AND-FORGET BY CONTRACT. Not awaited, and a failed write is swallowed.
+ * This is telemetry on a path where Atlas has already been billed; a Mongo blip
+ * must never be able to fail a paid render. The trade is that a stage can be
+ * missed under load — acceptable, because the next transition overwrites it and
+ * the terminal status is written by the real persist path, not by this.
+ */
+function adStage(adId, stage) {
+  Ad.updateOne(
+    { _id: adId },
+    { $set: { renderStage: stage, renderStageAt: new Date(), updatedAt: new Date() } }
+  ).catch(() => {});
+}
+
 async function renderOneInner(run, job, adId, index, renderToken) {
   // Fetch the queued Ad doc and shape it into the request the
   // render service expects. The doc carries everything the old
@@ -871,6 +996,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         } else {
           veoVideoUrl    = segmentUrl;
           veoAspectRatio = ad.aspectRatio || '9:16';
+          adStage(adId, 'reusing video seed segment (no generation)');
           console.log(
             `🎬 [veo] ad=${adId} seed=video → skip Grok, 8s Cloudinary segment ` +
             `(aspect=${veoAspectRatio}) → ${segmentUrl.slice(0, 120)}…`
@@ -887,6 +1013,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // storyboard is always null on the Atlas path now (the Ken Burns
         // prompt directs motion; the GPT storyboard stage is retired) —
         // the stamp below only fires for legacy/vertex storyboards.
+        adStage(adId, 'preparing video context');
         const { storyboard } = await veoPrepareStoryboard({ ad });
         veoStoryboard = storyboard || null;
 
@@ -898,6 +1025,10 @@ async function renderOneInner(run, job, adId, index, renderToken) {
 
         // Stage 2 — generate the base video via Grok. Chrome (if any)
         // runs after Grok completes in Stage 3.
+        // The billable one. Named so the status screen says exactly what is
+        // being paid for, and so a stall here is distinguishable from a stall in
+        // titling or upload.
+        adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
         const veoResult = await veoGenerateForAd({ ad, storyboard });
         if (veoResult.skipped) {
           await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
@@ -958,6 +1089,11 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       if (brandDoc) {
         try {
           const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
+          // Titling names its target aspect: this is the stage that face-crops
+          // the 9:16 master down (basePlateCropService) and composites the
+          // overlay, so "titling 1:1" and "master video generation" being
+          // distinct is what makes a stall attributable.
+          adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '9:16'}`);
           await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
         } catch (scriptErr) {
           console.warn(`⚠️ brandScript[ad=${adId}]: failed (non-fatal) — ${scriptErr.message}`);
@@ -1005,6 +1141,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
 
   // ── HTML Gen render path (Feed) ─────────────────────────────────────
   try {
+    adStage(adId, `static image generation (${ad.platformFormat || 'meta_feed_1_1'})`);
     const result = await renderCreative({
       jobId:         crypto.randomBytes(8).toString('hex'),
       adId:          String(ad._id),
@@ -1387,6 +1524,166 @@ router.get('/meta-adsets', async (req, res) => {
   }
 });
 
+// GET /api/ads/render-activity — technical status board.
+//
+// Exists because the only way to answer "what is this asset doing / why did it
+// stall" used to be an SSH session and a log grep, which meant asking whoever
+// had shell access. Everything here is READ from the Ad document; nothing is
+// reconstructed or inferred, so a field being absent means it was never
+// recorded rather than that this endpoint could not work it out.
+//
+// `diagnostic` is a pre-formatted one-paste block. It is built server-side on
+// purpose: a copy button that assembles its own text drifts from what is
+// actually useful to hand to someone debugging, and then the paste is missing
+// the one id that mattered.
+//
+// NOTE: must stay registered above the '/:id' routes.
+router.get('/render-activity', async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+
+    // TENANT SCOPING — brandId is REQUIRED and verified, matching GET /api/ads.
+    //
+    // This board originally queried Ad with no tenant filter at all, which would
+    // have let any authenticated user read EVERY advertiser's assets: prompts,
+    // prediction ids, Cloudinary URLs, product and campaign ids. A cross-tenant
+    // data leak, on a diagnostic endpoint, is not an acceptable trade for
+    // convenience.
+    //
+    // Ad carries brandId and not advertiserId, so the generic tenantFilter()
+    // does not apply; a brand belongs to exactly one advertiser, so an
+    // assertBrandInTenant'd brandId IS the scope. Same reasoning and same
+    // helper as the ads list route.
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    try {
+      await assertBrandInTenant(brandId, req);
+    } catch (e) {
+      if (e.status === 404) return res.status(404).json({ error: e.message });
+      throw e;
+    }
+
+    const filter = { brandId };
+    if (req.query.runId)    filter.campaignRunIds = String(req.query.runId);
+    if (req.query.status)   filter.status = String(req.query.status);
+
+    const ads = await Ad.find(filter)
+      .select('status renderStage renderStageAt kind template platformFormat aspectRatio ' +
+              'renderUrl renderError renderAttempts renderStages imageGeneration ' +
+              'intentResolution veoPredictionId veoAspectRatio veoVideoUrl ' +
+              'campaignId campaignRunIds productId mediaId brandId conceptId ' +
+              'queuedAt renderedAt updatedAt')
+      .sort({ updatedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    // Who asked. Resolved per run, not per ad, so a 20-ad run is one lookup.
+    const runIds = [...new Set(ads.flatMap(a => a.campaignRunIds || []).map(String))];
+    const runs = runIds.length
+      ? await CampaignRun.find({ runId: { $in: runIds } })
+          .select('runId requestedBy status startedAt completedAt total succeeded failed skipped')
+          .lean()
+      : [];
+    const runById = new Map(runs.map(r => [String(r.runId), r]));
+
+    // Resolve requester emails WITHOUT populate. `.populate('requestedBy')`
+    // throws "Schema hasn't been registered for model User" here — routes/ads.js
+    // never requires the User model, and mongoose resolves refs lazily against
+    // whatever is registered in the process. That would have 500'd the entire
+    // board over a cosmetic field. Verified against prod before shipping.
+    //
+    // The require is guarded and the lookup is best-effort for the same reason:
+    // a status board must degrade to showing ids, never fail.
+    const userById = new Map();
+    const requesterIds = [...new Set(runs.map(r => r.requestedBy).filter(Boolean).map(String))];
+    if (requesterIds.length) {
+      try {
+        const User = require('../models/User');
+        const users = await User.find({ _id: { $in: requesterIds } }).select('email name').lean();
+        users.forEach(u => userById.set(String(u._id), u));
+      } catch (err) {
+        console.warn(`   ⚠️  render-activity: requester lookup skipped (${err.message}) — showing ids`);
+      }
+    }
+
+    const now = Date.now();
+    const rows = ads.map(a => {
+      const run = (a.campaignRunIds || []).map(String).map(id => runById.get(id)).find(Boolean) || null;
+      const predictionId = a.imageGeneration?.predictionId || a.veoPredictionId || null;
+      const stageAgeSec = a.renderStageAt ? Math.round((now - new Date(a.renderStageAt).getTime()) / 1000) : null;
+      const t = a.renderStages || {};
+      const row = {
+        assetId:       String(a._id),
+        status:        a.status,
+        stage:         a.renderStage || null,
+        stageAgeSec,
+        // A render sitting in one stage far longer than that stage's normal cost
+        // is the signal worth surfacing; 600s is the Atlas image deadline and the
+        // video poll ceiling, so past that something is genuinely wrong.
+        stalled:       a.status === 'rendering' && stageAgeSec != null && stageAgeSec > 600,
+        kind:          a.kind,
+        template:      a.template,
+        platformFormat: a.platformFormat,
+        aspectRatio:   a.aspectRatio,
+        pipeline:      a.imageGeneration?.pipeline || (a.kind === 'video' ? 'veo' : null),
+        model:         a.imageGeneration?.model || null,
+        predictionId,
+        // Provenance for the multi-size video story: a 1:1 or 4:5 video whose
+        // veoAspectRatio is 9:16 was CROPPED from a master, not generated.
+        derivedFromMaster: a.kind === 'video' && a.veoAspectRatio === '9:16' && a.aspectRatio !== '9:16',
+        timingsMs:     { derive: t.deriveMs ?? null, render: t.renderMs ?? null, upload: t.uploadMs ?? null },
+        intent:        a.intentResolution
+          ? { requested: a.intentResolution.requested, delivered: a.intentResolution.delivered,
+              fellBackFrom: a.intentResolution.fellBackFrom || null,
+              dropped: a.intentResolution.droppedRoles || [] }
+          : null,
+        assetUrl:      a.renderUrl || null,
+        error:         a.renderError?.message || (typeof a.renderError === 'string' ? a.renderError : null),
+        attempts:      a.renderAttempts ?? null,
+        ids:           {
+          campaignId: a.campaignId ? String(a.campaignId) : null,
+          runId:      run?.runId || (a.campaignRunIds || [])[0] || null,
+          productId:  a.productId ? String(a.productId) : null,
+          mediaId:    a.mediaId ? String(a.mediaId) : null,
+          brandId:    a.brandId ? String(a.brandId) : null,
+          conceptId:  a.conceptId || null
+        },
+        requestedBy:   (() => {
+          const uid = run?.requestedBy ? String(run.requestedBy) : null;
+          if (!uid) return null;
+          const u = userById.get(uid);
+          return u?.email || u?.name || uid;   // id is still useful; never blank
+        })(),
+        run:           run ? { status: run.status, total: run.total, succeeded: run.succeeded, failed: run.failed, skipped: run.skipped } : null,
+        queuedAt:      a.queuedAt || null,
+        renderedAt:    a.renderedAt || null,
+        updatedAt:     a.updatedAt || null
+      };
+      row.diagnostic = [
+        `asset=${row.assetId}`,
+        `status=${row.status}${row.stalled ? ' STALLED' : ''}`,
+        `stage=${row.stage || '-'}${row.stageAgeSec != null ? ` (${row.stageAgeSec}s)` : ''}`,
+        `kind=${row.kind} fmt=${row.platformFormat} aspect=${row.aspectRatio}`,
+        `pipeline=${row.pipeline || '-'} model=${row.model || '-'}`,
+        `prediction=${row.predictionId || '-'}`,
+        row.derivedFromMaster ? 'derivedFromMaster=true (cropped, not generated)' : null,
+        `timings(ms) derive=${row.timingsMs.derive ?? '-'} render=${row.timingsMs.render ?? '-'} upload=${row.timingsMs.upload ?? '-'}`,
+        row.intent ? `intent=${row.intent.delivered}${row.intent.fellBackFrom ? ` (fellBackFrom ${row.intent.fellBackFrom})` : ''}${row.intent.dropped.length ? ` dropped=${row.intent.dropped.join('+')}` : ''}` : null,
+        `run=${row.ids.runId || '-'} by=${row.requestedBy || '-'}`,
+        `product=${row.ids.productId || '-'} media=${row.ids.mediaId || '-'} concept=${row.ids.conceptId || '-'}`,
+        row.error ? `error=${row.error}` : null,
+        row.assetUrl ? `asset=${row.assetUrl}` : null
+      ].filter(Boolean).join('\n');
+      return row;
+    });
+
+    res.json({ rows, count: rows.length, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error(`❌ GET /api/ads/render-activity failed: ${err.message}`);
+    res.status(500).json({ error: err.message || 'render-activity failed' });
+  }
+});
+
 // GET /api/ads/video-models — the operator-selectable video generation
 // models, for the Brand settings card and the regenerate dropdown.
 // Derived from atlasVideoService.MODEL_CAPS (single source of truth);
@@ -1547,11 +1844,14 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 //            Required UNLESS promptOverride is given. Up to ~1000 chars.
 //   mode:    'light' (default, video only — re-runs chrome + composite,
 //                     Veo unchanged) | 'full' (re-runs Veo too).
-//            Image ads always do full HTML Gen re-render; mode ignored.
+//            Image ads always re-run the live direct_image renderer
+//            (gpt-image-2/edit); mode ignored.
 //   promptOverride: { system, user } — image ads only. The operator
 //            edited the EXACT prompt shown in the Generation Details
 //            modal; this text replaces the auto-composed prompt
 //            verbatim instead of being appended as a refinement note.
+//            Image models have one flat prompt channel — system+user
+//            are concatenated (see resolveImagePromptOverride).
 // Returns 202 with a poll target. Frontend polls
 // /api/catalog/:productId/ads-detail (or this ad's generation-inspector)
 // watching ad.regenerating.

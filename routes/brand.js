@@ -293,7 +293,16 @@ router.patch('/:id', express.json(), async (req, res) => {
       // this route, the Brand enum and the renderer cannot drift. It also absorbs
       // the retired 'direct_overlay' from a frontend build that predates the
       // rename, storing it as 'direct_image' instead of 400-ing a working client.
-      const pipeline = normalizeStaticPipelineInput(req.body.staticImagePipeline);
+      // 'html' is rejected: the HTML/Puppeteer static path is no longer opt-in
+      // (Stage 1 catalog pipeline exclusive, 2026-08-02).
+      const rawPipeline = req.body.staticImagePipeline;
+      if (String(rawPipeline == null ? '' : rawPipeline).trim().toLowerCase() === 'html') {
+        return res.status(400).json({
+          error: "staticImagePipeline 'html' is retired — catalog product ads render via direct_image only. Allowed: " +
+            STATIC_PIPELINES.join(', ')
+        });
+      }
+      const pipeline = normalizeStaticPipelineInput(rawPipeline);
       if (!pipeline) {
         return res.status(400).json({
           error: `staticImagePipeline must be one of: ${STATIC_PIPELINES.join(', ')}`

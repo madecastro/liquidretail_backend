@@ -41,19 +41,28 @@ const truthy = (label, v) => check(label, !!v, true);
 
 console.log('\nverifyPlatformSurfaces\n');
 
-const KEYS = P.PLATFORM_FORMAT_KEYS;
-console.log(`A. the surface table (${KEYS.length} surfaces: ${KEYS.join(', ')})`);
-truthy('more than one surface is declared', KEYS.length > 1);
-for (const k of KEYS) {
+// Live surfaces are the end-to-end contract (generatable + titled + canvas-spec).
+// coming_soon entries are declared in the table for UI but are not yet first-class
+// through the generator / artifact path — they are checked for shape only.
+const KEYS = P.LIVE_PLATFORM_FORMAT_KEYS || P.PLATFORM_FORMAT_KEYS.filter(
+  (k) => P.PLATFORM_FORMATS[k]?.status === 'live'
+);
+const ALL_KEYS = P.PLATFORM_FORMAT_KEYS;
+console.log(`A. the surface table (${ALL_KEYS.length} declared, ${KEYS.length} live: ${KEYS.join(', ')})`);
+truthy('more than one surface is declared', ALL_KEYS.length > 1);
+for (const k of ALL_KEYS) {
   const caps = P.getFormatCaps(k);
   truthy(`${k}: has aspectRatio, canvas, deliveryDims, kinds`,
     caps?.aspectRatio && caps?.canvas?.width && caps?.deliveryDims?.width && Array.isArray(caps?.kinds) && caps.kinds.length);
   truthy(`${k}: declares a safeArea (top and bottom, may be 0)`,
     caps?.safeArea && typeof caps.safeArea.top === 'number' && typeof caps.safeArea.bottom === 'number');
+  truthy(`${k}: declares platform + status`,
+    (caps?.platform === 'meta' || caps?.platform === 'google') &&
+    (caps?.status === 'live' || caps?.status === 'coming_soon'));
 }
 
-// ── B. the artifact can actually persist every surface ────────────────
-console.log('\nB. AiCanvasArtifact accepts every declared surface');
+// ── B. the artifact can actually persist every LIVE surface ───────────
+console.log('\nB. AiCanvasArtifact accepts every live surface');
 for (const k of KEYS) {
   const doc = new AiCanvasArtifact({ platformFormat: k });
   const err = doc.validateSync();
@@ -64,7 +73,7 @@ const bogus = new AiCanvasArtifact({ platformFormat: 'not_a_surface' });
 truthy('an undeclared surface is still rejected', !!bogus.validateSync()?.errors?.platformFormat);
 
 // ── C. format constraints are per-surface, not Feed-for-everyone ──────
-console.log('\nC. the generator is told the truth about each surface');
+console.log('\nC. the generator is told the truth about each live surface');
 const blocks = {};
 for (const k of KEYS) {
   const caps = P.getFormatCaps(k);
@@ -104,8 +113,8 @@ if (stories && reels && feed) {
   fail++; console.log('  ✗ expected meta_stories_9_16, meta_reels_9_16 and meta_feed_1_1 to be declared');
 }
 
-// ── E. every surface that reserves screen gets archetype guidance ─────
-console.log('\nE. archetype weighting covers every surface with reserved chrome');
+// ── E. every LIVE surface that reserves screen gets archetype guidance ─
+console.log('\nE. archetype weighting covers every live surface with reserved chrome');
 const directorSrc = require('fs').readFileSync(
   path.join(__dirname, '..', 'services', 'aiCreativeDirectorService.js'), 'utf8');
 for (const k of KEYS) {

@@ -169,7 +169,10 @@ const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 // Gemini's headline + cta + quote copy length via a new
 // overlayBoxes prompt section. Cached docs re-derive against the
 // new placement + budgets.
-const INPUT_SCHEMA_VERSION = '4.0';
+// One definition of printable provenance, shared with every renderer.
+const { isPrintableCustomerQuote } = require('./quoteProvenance');
+
+const INPUT_SCHEMA_VERSION = '4.1';   // 4.1: quote provenance (origin + tier) stamped on primary_quote; LLM tiers removed
 
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
@@ -1536,17 +1539,29 @@ function normalizeQuote(q) {
   const verified = q.verified !== undefined ? q.verified : firstParty;
   return {
     text:        String(q.text).trim(),
-    // "Verified buyer" is a CLAIM, and it must track the `verified` flag rather
-    // than merely first-party-ness. The vendor adapters capture a per-review
-    // verified boolean, so a review a platform explicitly marked UNVERIFIED
-    // was still being given the byline "Verified buyer" — this field was
-    // deciding on `firstParty` while the field right below it honoured the
-    // vendor's actual answer. Same laundering the provenance stamps exist to
-    // prevent, one line further along.
-    // "Anonymous Customer" when we have no name and no verified purchase: it
-    // claims only that someone reviewed the product, which is all we know.
-    author_name: q.author_name || q.author || q.source ||
-                 (verified ? 'Verified buyer' : 'Anonymous Customer'),
+    // A REAL name, or nothing at all. Every fallback that used to live here
+    // manufactured a person:
+    //
+    //   q.source     — a SITE, not a human. Measured against production, this
+    //                  is where bylines like "Reddit (r/BuyItForLife)",
+    //                  "UBeauty.com", "Peloton Apparel" and — 80 times over —
+    //                  "vertexaisearch.cloud.google.com" came from. An ad that
+    //                  prints a search endpoint as the customer who said the
+    //                  words is not a formatting bug, it is a fabricated
+    //                  attribution.
+    //   'Verified buyer'    — a CLAIM about a purchase, asserted for someone we
+    //                  cannot name. 104 live artifacts carry it.
+    //   'Anonymous Customer' — reads as a real byline in a serif italic under a
+    //                  testimonial, which is exactly how it renders.
+    //
+    // An unattributed real quote is honest; an attributed fake is not.
+    // `verified` and `source` survive below as their own fields for anything
+    // that wants to reason about them without printing them as a name.
+    //
+    // NOT a claim that no surface can still manufacture one: metaCascadeConfig
+    // and the Remotion brand scripts hold their own byline defaults, and those
+    // are fixed separately. This field simply stops being the place it happens.
+    author_name: q.author_name || q.author || undefined,
     source:      q.source || undefined,
     verified,
     // Carried through from the scrape so pickStrongestQuote can gate on
@@ -1642,8 +1657,19 @@ async function loadBrandCommentsForQuotePool(ctx) {
     // the judge did not approve.
     return filtered.slice(0, 10).map(c => normalizeQuote({
       text:        c.proofLine,
-      author_name: c.authorUsername || 'Instagram commenter',
+      // The commenter's real handle or no byline. "Instagram commenter" named
+      // nobody — same manufactured attribution as the "Verified buyer" default
+      // normalizeQuote used to apply.
+      author_name: c.authorUsername || undefined,
       source:      'social_comment',
+      // POSITIVE provenance stamp, and it is deliberately `origin` rather than
+      // `source`. DERIVATION_SCHEMA declares a `source` property and the
+      // derivation call is strict:false, so the LLM persona tier can emit any
+      // `source` string it likes — including this one. It cannot emit `origin`,
+      // because nothing downstream of the schema ever sets it. A consumer
+      // allowlist keyed on origin therefore cannot be forged from the LLM path.
+      origin:      'social_comment',
+      verbatim:    true,   // proofLine is the ingest judge's contiguous extract
       verified:    false
     })).filter(Boolean);
   } catch (err) {
@@ -1670,26 +1696,16 @@ async function loadCategoryReviewsForMatch(match) {
   }
 }
 
-// short primary quote from its first sentence. Keeps hero zones populated in
-// the low-signal case. Never invents text — only surfaces what Gemini
-// already wrote in the review-summary step.
-function synthesizeQuoteFromReviewSummary(ctx) {
-  const summary = ctx.match?.identification?.details?.reviewSummary?.summary;
-  if (!summary || typeof summary !== 'string') return null;
-  const first = summary.trim().split(/(?<=[.!?])\s+/)[0];
-  if (!first || first.length < 20 || first.length > 220) return null;
-  return {
-    text:     first,
-    source:   'review',
-    verified: false,
-    // PROVENANCE: reviewSummary is LLM-written prose ABOUT the reviews, so its
-    // first sentence is not a review and must never be stored or rendered as
-    // one — even though it reads like a quote. See docs/REVIEW_VENDORS.md §7.
-    origin:   'synthesized',
-    verbatim: false,
-    scope:    'product'
-  };
-}
+// synthesizeQuoteFromReviewSummary was DELETED on 2026-07-31, not disabled.
+//
+// It took the first sentence of `reviewSummary.summary` — LLM-written prose
+// ABOUT the reviews — and returned it shaped as a customer quote, stamped
+// origin:'synthesized', verbatim:false by the author who knew exactly what it
+// was. Its own comment said the text "must never be stored or rendered as one",
+// and the tier-6 fallback then stored and rendered it. It is removed rather
+// than kill-switched because this repo has been bitten repeatedly by retired
+// paths left in place (see CLAUDE.md §0/§1), and a function that manufactures
+// proof is the last one that should be sitting around waiting to be re-called.
 
 // Rating/review-driven badge defaults when the LLM returned none. Fills the
 // badge_row / product.badges / social_proof.proof_badges slots that
@@ -1886,15 +1902,67 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   //   Tier 2: category.categoryReviews.quotes (same category on this brand)
   //   Tier 3: brand.brandReviews.quotes[]     (brand-level, always available)
   //   Tier 4: brand-scoped social comments    (Instagram / TikTok, real user language)
-  //   Tier 5: LLM-authored derivation.quotes  (Gemini-generated)
-  //   Tier 6: synthesizeQuoteFromReviewSummary (last-resort blank prevention)
+  //
+  // There is no tier 5 or 6. Both were LLM-authored — notional persona reviews
+  // and a sentence lifted from an LLM summary — and both are removed below
+  // rather than demoted, because a fabricated quote is not a weaker quote.
   //
   // First non-empty tier's best-scoring quote wins the primary slot.
   // Everything else across all tiers goes to secondary_quotes so the
   // renderer can rotate through them.
-  const tierProduct = gateQuotesByRating((productReviewsOf(ctx.match)?.quotes || []).map(normalizeQuote).filter(Boolean), 'product');
+  // Provenance is stamped HERE, from the container the quotes arrived in,
+  // because this is the last point at which it is known. Every review document
+  // in production carries `source` on the container ('gemini-search' or, for
+  // older store imports, null) and nothing carries an origin stamp — measured,
+  // not assumed: 0 of 1073 products and 0 of 74 categories had one. So the
+  // stamps that normalizeQuote faithfully carries through were always empty,
+  // and every gate built on them was inert.
+  // POSITIVE identification on both sides. The first cut of this said "anything
+  // that is not 'gemini-search' is a store import", which is a denylist wearing
+  // an allowlist's clothes — and it had exactly the hole denylists always have:
+  // categoryReviewsService writes `sources` (plural, a list of domains) and no
+  // `source` at all, so every legacy category row — LLM web-search output —
+  // would have been stamped 'store-import' and printed as a customer quote.
+  //
+  // So: name what a thing IS, and call everything else unknown. An unknown
+  // origin is not printable, which is the correct answer for provenance we
+  // cannot establish.
+  const stampOrigin = (container, quotes) => {
+    const containerSource = container?.source || null;
+    return (quotes || []).map((q) => {
+      // A per-quote stamp from the capture layer always wins — mapReviewNode and
+      // reviewHeadlessCapture write 'scraped', geminiSearchProvider and
+      // categoryReviewsService write 'llm-web'.
+      let origin = q?.origin || null;
+      if (!origin) {
+        if (containerSource === 'gemini-search') origin = 'llm-web';
+        // The merchant's own storefront. Verified against production: the 190
+        // product docs with a null container source carry per-quote
+        // source:'store' (748 quotes), written by the JSON-LD/Shopify importers
+        // before the shared scrape engine started labelling the container.
+        else if (q?.source === 'store') origin = 'store-import';
+        else origin = 'unknown';
+      }
+      return normalizeQuote({ ...q, origin });
+    });
+  };
+  // The allowlist is applied HERE, at the producer, not only at the renderer.
+  // A consumer-side gate fixes one renderer: the HTML/Puppeteer path and the
+  // video overlays read the same artifact and would have carried on typesetting
+  // whatever it held. Filtering at assembly means primary_quote AND
+  // secondary_quotes are clean for every consumer, present and future.
+  const printableOnly = (quotes, tierName) => {
+    const kept = (quotes || []).filter(Boolean).filter(isPrintableCustomerQuote);
+    const dropped = (quotes || []).filter(Boolean).length - kept.length;
+    if (dropped) {
+      console.log(`🔒 quote provenance[${tierName}] — ${dropped} quote(s) withheld: origin not printable as a customer testimonial`);
+    }
+    return kept;
+  };
+  const productReviewsForMatch = productReviewsOf(ctx.match);
+  const tierProduct = gateQuotesByRating(printableOnly(stampOrigin(productReviewsForMatch, productReviewsForMatch?.quotes), 'product'), 'product');
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
-  const tierCategory = gateQuotesByRating((catReviewsForMatch?.quotes || []).map(normalizeQuote).filter(Boolean), 'category');
+  const tierCategory = gateQuotesByRating(printableOnly(stampOrigin(catReviewsForMatch, catReviewsForMatch?.quotes), 'category'), 'category');
   // Brand-tier reviews are catalog-wide: they are about whatever the reviewer
   // bought, which on a multi-SKU brand is usually NOT this product. Rendering
   // one under this product's photo presents another item's praise as if it
@@ -1910,36 +1978,57 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // have left isProductScoped false on real product ads and leaked the brand
   // quotes this guard exists to withhold.
   const isProductScoped = !!(ctx.match?.catalogProductId || ctx.match?.identification?.details?.catalogProductId);
-  const brandQuotesRaw = (ctx.match?.brandReviews?.quotes || ctx.brand?.brandReviews?.quotes || []);
+  const brandReviewsContainer = ctx.match?.brandReviews || ctx.brand?.brandReviews || null;
+  const brandQuotesRaw = (brandReviewsContainer?.quotes || []);
   const tierBrand = isProductScoped
     ? []
-    : gateQuotesByRating(brandQuotesRaw.map(normalizeQuote).filter(Boolean), 'brand');
+    : gateQuotesByRating(printableOnly(stampOrigin(brandReviewsContainer, brandQuotesRaw), 'brand'), 'brand');
   if (isProductScoped && brandQuotesRaw.length) {
     console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk)`);
   }
-  const tierComment  = await loadBrandCommentsForQuotePool(ctx);
-  // Unrated tier, so sentiment is the only gate — same rule as comments.
-  const tierLlm      = (Array.isArray(derivation.quotes) ? derivation.quotes : [])
-    .map(normalizeQuote)
-    .filter(q => q && hasPositiveSignal(q.text));
+  const tierComment  = printableOnly(await loadBrandCommentsForQuotePool(ctx), 'comment');
+
+  // TIERS 5 AND 6 ARE GONE, and they are not coming back behind a flag.
+  //
+  // Tier 5 was `derivation.quotes` — the LLM's own output. The prompt that
+  // produces it (:1180) asks in as many words for "NOTIONAL persona-authored
+  // reviews", with "author_name is the persona's name". That is an invented
+  // person saying an invented sentence, and it was eligible to win the primary
+  // quote slot and be typeset into a paid advertisement as a customer
+  // testimonial. Tier 6 was synthesizeQuoteFromReviewSummary, the first
+  // sentence of LLM prose ABOUT the reviews, stamped verbatim:false by the
+  // function that built it.
+  //
+  // Neither is proof. The owner's rule is that an absent field renders as
+  // absent — the intent module states missing proof as an explicit prohibition
+  // ("this ad has NO customer quote"), so losing this slot degrades correctly
+  // instead of leaving a hole. An ad with no testimonial is a thinner ad; an ad
+  // with a fabricated one is a lie in the pixels.
+  const llmQuoteCount = Array.isArray(derivation.quotes) ? derivation.quotes.length : 0;
+  if (llmQuoteCount) {
+    console.log(`🔒 quote pool — ${llmQuoteCount} LLM-authored quote(s) withheld: notional personas are not customer proof`);
+  }
 
   const pickedProduct  = pickStrongestQuote(tierProduct);
   const pickedCategory = pickedProduct  ? null : pickStrongestQuote(tierCategory);
   const pickedBrand    = pickedProduct || pickedCategory ? null : pickStrongestQuote(tierBrand);
   const pickedComment  = pickedProduct || pickedCategory || pickedBrand ? null : pickStrongestQuote(tierComment);
-  const pickedLlm      = pickedProduct || pickedCategory || pickedBrand || pickedComment ? null : pickStrongestQuote(tierLlm);
-  let primaryQuote = pickedProduct || pickedCategory || pickedBrand || pickedComment || pickedLlm || null;
-  let quoteTier = pickedProduct  ? 'product'
-                : pickedCategory ? 'category'
-                : pickedBrand    ? 'brand'
-                : pickedComment  ? 'comment'
-                : pickedLlm      ? 'llm'
-                :                  null;
+  let primaryQuote = pickedProduct || pickedCategory || pickedBrand || pickedComment || null;
+  const quoteTier = pickedProduct  ? 'product'
+                  : pickedCategory ? 'category'
+                  : pickedBrand    ? 'brand'
+                  : pickedComment  ? 'comment'
+                  :                  null;
 
-  if (!primaryQuote) {
-    const syn = synthesizeQuoteFromReviewSummary(ctx);
-    if (syn) { primaryQuote = normalizeQuote(syn); quoteTier = 'synth'; }
-  }
+  // The synth fallback that used to sit here is gone with tier 6. It existed to
+  // keep hero zones populated; an empty zone is the correct rendering of proof
+  // we do not have.
+  //
+  // The tier is STAMPED onto the quote, not merely logged. It was computed
+  // right here, printed to stdout at the line below, and then dropped — so the
+  // artifact recorded no provenance at all and every consumer had to guess.
+  // Persisting it is what makes a render-time gate possible.
+  if (primaryQuote) primaryQuote.tier = quoteTier;
 
   // Snippet extraction — a ≤50-char punchy version of the winning quote,
   // for the 3-second proof overlay in the vertical DR video template.
@@ -1967,17 +2056,19 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   console.log(
     `📐 quote pool[media=${media._id}] ` +
     `product=${tierProduct.length} category=${tierCategory.length} ` +
-    `brand=${tierBrand.length} comment=${tierComment.length} llm=${tierLlm.length} ` +
+    `brand=${tierBrand.length} comment=${tierComment.length} llm-withheld=${llmQuoteCount} ` +
     `→ winner=${quoteTier || 'none'}${primaryQuote ? ` "${(primaryQuote.snippet || primaryQuote.text).slice(0, 60)}${(primaryQuote.snippet || primaryQuote.text).length > 60 ? '…' : ''}"` : ''}`
   );
 
-  // Secondaries: every other quote from every tier, minus the primary.
+  // Secondaries: every other quote from every SURVIVING tier, minus the primary.
   // Every tier feeding this is gated before it gets here — the review-backed
-  // ones on the reviewer's own stars (gateQuotesByRating), the unrated ones
-  // (comments, LLM-authored) on sentiment. That matters because
-  // secondary_quotes is rendered by rotation, so anything in this array can
-  // reach an ad without pickStrongestQuote ever having judged it.
-  const allQuotes = [...tierProduct, ...tierCategory, ...tierBrand, ...tierComment, ...tierLlm];
+  // ones on the reviewer's own stars (gateQuotesByRating), the comment tier on
+  // sentiment. That matters because secondary_quotes is rendered by rotation, so
+  // anything in this array can reach an ad without pickStrongestQuote ever
+  // having judged it — which is precisely why the LLM tier must not be here
+  // either. Excluding it from the primary slot while leaving it in the rotation
+  // pool would have moved the fabricated quote rather than removed it.
+  const allQuotes = [...tierProduct, ...tierCategory, ...tierBrand, ...tierComment];
   const secondaryQuotes = primaryQuote
     ? allQuotes.filter(q => q.text !== primaryQuote.text).map(q => ({ ...q }))
     : allQuotes.map(q => ({ ...q }));
@@ -3149,6 +3240,10 @@ module.exports = {
   // broken once by a merge with nothing to catch it.
   gateQuotesByRating,
   pickStrongestQuote,
+  // Exported for scripts/verifyQuoteProvenance.js, which pins the rule that a
+  // byline is a real person's name or nothing — this function used to substitute
+  // the quote's SOURCE (a website) when no name was known.
+  normalizeQuote,
   productReviewsOf,
   toFiveScale,
   QUOTE_MIN_RATING

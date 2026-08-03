@@ -13,6 +13,7 @@
 // user-approved extractions into the template registry.
 
 const { chatCompletion } = require('./atlasLlmService');
+const { concurrency: CONC } = require('./concurrency');
 
 const Media                = require('../models/Media');
 const DetectionArtifact    = require('../models/DetectionArtifact');
@@ -324,7 +325,7 @@ async function runSession(sessionId) {
     // the claim-time cancel check real AND caps provider stampede.
     progressRun.stage('generating layout references');
     let combosDone = 0;
-    const COMBO_CONCURRENCY = 3;
+    const COMBO_CONCURRENCY = CONC.AI_LAYOUT_COMBO_CONCURRENCY;
     let comboCursor = 0;
     await Promise.all(Array.from({ length: Math.min(COMBO_CONCURRENCY, combos.length) }, async () => {
       while (comboCursor < combos.length) {

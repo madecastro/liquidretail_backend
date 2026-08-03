@@ -33,8 +33,9 @@ const N = (name, dflt) => {
 // 12 min sits under worker.js's REAP_STALE_MIN (15) on purpose — we want the
 // warning before the reaper rewrites the evidence.
 const RENDERING_STALE_MIN = () => N('ALERT_RENDERING_STALE_MIN', 12);
-// A 20-ad veo batch is ~1 min/ad serialized (VEO_CONCURRENCY=1), so a live
-// run can legitimately sit at 25-35 min. 45 is "this is not progressing".
+// A 20-ad veo batch at VEO_CONCURRENCY=4 is ~1 min/ad wall-clock per slot
+// (~5 min for 20 if each takes ~1 min). 45 is "this is not progressing".
+// (Historical: at VEO_CONCURRENCY=1 a 20-ad batch was ~20–35 min.)
 const RUN_STALE_MIN       = () => N('ALERT_RUN_STALE_MIN', 45);
 const DETECT_BACKLOG_MIN  = () => N('ALERT_DETECT_BACKLOG_MIN', 20);
 const DETECT_BACKLOG_N    = () => N('ALERT_DETECT_BACKLOG_COUNT', 25);

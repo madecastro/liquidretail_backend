@@ -189,14 +189,17 @@ router.get('/ads-summary', async (req, res) => {
     }
 
     // Project channels from the platformFormat distribution on this
-    // campaign's ads. Meta surfaces (feed/reels/stories) collapse to
-    // 'Meta'; PMax to 'Google'. Empty when no ads yet — frontend renders
-    // the campaign's platform field as fallback.
+    // campaign's ads. Prefers platformFormats.platform field; falls back
+    // to key-prefix sniffing for unknown/legacy keys. Empty when no ads
+    // yet — frontend renders the campaign's platform field as fallback.
+    const { channelLabelForFormat } = require('../services/platformFormats');
     function channelsFromFormats(formats) {
       const set = new Set();
       for (const f of formats || []) {
         if (!f) continue;
-        if (f.startsWith('meta_')) set.add('Meta');
+        const label = channelLabelForFormat(f);
+        if (label) set.add(label);
+        else if (f.startsWith('meta_')) set.add('Meta');
         else if (f.startsWith('pmax_') || f.startsWith('google_')) set.add('Google');
         else if (f.startsWith('tiktok_')) set.add('TikTok');
       }

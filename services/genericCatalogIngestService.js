@@ -23,6 +23,7 @@ const CatalogProduct = require('../models/CatalogProduct');
 const Category = require('../models/Category');
 const { resolveGenericCatalog, DEFAULT_CAP } = require('./genericCatalogResolver');
 const ingestHelpers = require('./shopifyPublicIngestService');
+const { concurrency: CONC } = require('./concurrency');
 
 const LOG = '🗺';
 
@@ -309,7 +310,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
             label:        'Category inference'
           });
           const result = await inference.inferBatch(candidates.map(c => c._id), {
-            concurrency: 6,
+            concurrency: CONC.CATEGORY_INFERENCE_BATCH_CONCURRENCY,
             onProgress: async (done, total) => {
               catRun.tick(done, total, `category inference ${done}/${total}`);
               try { await catRun.checkpoint(); } catch { throw new Error('cancelled'); }

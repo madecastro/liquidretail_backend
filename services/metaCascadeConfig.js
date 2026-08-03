@@ -54,10 +54,18 @@ const DEFAULT_META_CASCADES = {
     { type: 'doc', doc: 'layoutInput', path: 'input.social_proof.primary_quote.snippet' },
     { type: 'doc', doc: 'layoutInput', path: 'input.social_proof.primary_quote.text' },
   ],
+  // No literal tail, deliberately. 'Verified customer' asserted a purchase by a
+  // person this pipeline could not name, and it fired precisely when the real
+  // byline was missing — so the cascade manufactured proof exactly in the case
+  // where there was none. layoutInputService stopped inventing bylines on
+  // 2026-07-31 (it used to substitute the quote's SOURCE, which is how
+  // "vertexaisearch.cloud.google.com" reached 80 live artifacts as a customer
+  // name); leaving this literal here would have re-created the same claim one
+  // layer down. An unattributed real quote is honest — resolve to nothing and
+  // let the surface render no byline.
   reviewer: [
     { type: 'doc', doc: 'layoutInput', path: 'input.social_proof.primary_quote.author_name' },
     { type: 'doc', doc: 'layoutInput', path: 'input.social_proof.primary_quote.author' },
-    { type: 'literal', value: 'Verified customer' },
   ],
   ctaText: [
     { type: 'doc', doc: 'ad',          path: 'copy.cta_text' },

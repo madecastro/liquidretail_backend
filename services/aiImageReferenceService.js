@@ -482,16 +482,20 @@ function buildPrompt({ brand, product, media, concept, proofData, aspectRatio, c
   lines.push(`Creative style: ${creativeStyle}.`);
 
   if (concept) {
+    // Project so v3 dual-reads flat and rationale is unreachable here.
+    const { conceptForRender } = require('./conceptProjection');
+    const c = conceptForRender(concept) || concept;
     lines.push(``);
     lines.push(`Strategy from creative director:`);
-    if (concept.archetype)        lines.push(`- Archetype: ${humanArchetype(concept.archetype)}`);
-    if (concept.layout_family)    lines.push(`- Layout family: ${concept.layout_family}`);
-    if (concept.emotional_hook)   lines.push(`- Emotional hook: ${concept.emotional_hook}`);
-    if (concept.social_proof_type && concept.social_proof_type !== 'none') {
-      lines.push(`- Social proof type: ${concept.social_proof_type}`);
+    if (c.archetype)        lines.push(`- Archetype: ${humanArchetype(c.archetype)}`);
+    if (c.layout_family)    lines.push(`- Layout family: ${c.layout_family}`);
+    if (c.emotional_hook)   lines.push(`- Emotional hook: ${c.emotional_hook}`);
+    if (c.social_proof_type && c.social_proof_type !== 'none') {
+      lines.push(`- Social proof type: ${c.social_proof_type}`);
     }
-    if (concept.cta_emphasis)     lines.push(`- CTA emphasis: ${concept.cta_emphasis}`);
-    if (concept.rationale)        lines.push(`- Rationale: ${concept.rationale}`);
+    if (c.cta_emphasis)     lines.push(`- CTA emphasis: ${c.cta_emphasis}`);
+    // rationale deliberately omitted — private Director reasoning (2026-08-01
+    // leak: honesty-rule notes were reaching the image model as art direction).
   }
 
   // ── Real proof signals ────────────────────────────────────────────

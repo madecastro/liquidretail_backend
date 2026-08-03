@@ -181,6 +181,32 @@ for (const intentKey of intents) {
         falsy(`${label} no dangling set-text heading`, /SET EXACTLY THESE STRINGS/.test(p));
       } else {
         truthy(`${label} set-text heading present`, /SET EXACTLY THESE STRINGS/.test(p));
+        // The one sentence that actually fixes the observed failure: the model
+        // must be told the list it received is already complete, so a short list
+        // does not read as a template with gaps.
+        //
+        // Two other paragraphs were added here on 2026-08-01 and REVERTED the
+        // same day after review. Recorded so they are not reintroduced:
+        //   - A "NEVER CREATE INFORMATION" block enumerating rating/badge/price/
+        //     percentage/etc. It was UNCONDITIONAL, so on a social_proof_led ad it
+        //     forbade a rating ~400 chars below `rating -> 4.8 ★`. absences()
+        //     already states each of those only when the datum is genuinely
+        //     absent, and says "the single rating string above is the ONLY rating
+        //     mark permitted" when it is present — nuance the flat block destroyed.
+        //   - "NONE OF THESE ELEMENTS IS REQUIRED", whose nearest antecedent is the
+        //     SET EXACTLY THESE STRINGS list, so it read as permission to drop the
+        //     verbatim strings.
+        // An emphasis-list sentence was reverted too: every emphasis list is
+        // already filtered by kept(), so the only entries without a string are the
+        // unconditional ones — measured across 768 buildable prompts, that is
+        // always THE PRODUCT, ranked #1 in 576. It told the model its hero subject
+        // was not part of the ad.
+        truthy(`${label} says the text list is complete`, /complete and only text for this ad/i.test(p));
+        truthy(`${label} sets nothing else`, /set NOTHING ELSE/.test(p));
+        truthy(`${label} absence is the brief, not a gap`, /accurate brief rather than a gap to fill/.test(p));
+        falsy(`${label} does not enumerate forbidden proof nouns unconditionally`, /NEVER CREATE INFORMATION/.test(p));
+        falsy(`${label} does not tell the model elements are optional`, /NONE OF THESE ELEMENTS IS REQUIRED/.test(p));
+        falsy(`${label} never says an emphasis item is not part of the ad`, /not part of this ad/.test(p));
         const blockLines = (p.split('SET EXACTLY THESE STRINGS')[1] || '')
           .split('Set no other words')[0].trim().split('\n').length;
         truthy(`${label} text block non-empty`, blockLines > 1);
@@ -285,9 +311,11 @@ for (const intentKey of intents) {
 console.log('\nD. describeSurfaces() inspection helper');
 const rows = describeSurfaces();
 truthy('describeSurfaces returns a non-empty array', Array.isArray(rows) && rows.length > 0);
+// Policy keys must all be present. describeSurfaces may also list
+// coming_soon table entries (UI-only formats) — those are extra, not a miss.
 check('describeSurfaces covers every SURFACE_POLICY key',
-  rows.map(r => r.surface).sort().join(','),
-  surfaces.slice().sort().join(','));
+  surfaces.every((s) => rows.some((r) => r.surface === s)),
+  true);
 for (const row of rows) {
   truthy(`${row.surface}: has generate size`, !!row.generate);
   truthy(`${row.surface}: has box`, row.box && typeof row.box.left === 'number');

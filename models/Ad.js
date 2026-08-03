@@ -352,6 +352,22 @@ const adSchema = new mongoose.Schema({
   // ad, not the whole pipeline, points at that one Atlas call rather than at
   // the code. Null on ads that predate this field.
   renderStages:       { type: mongoose.Schema.Types.Mixed, default: null },
+  // LIVE per-ad stage, e.g. 'director' | 'master video generation' |
+  // 'titling 9:16' | 'cropping 4:5' | 'uploading'. Updated as the render
+  // progresses and left at its final value afterwards, so a finished or failed
+  // ad still says where it got to.
+  //
+  // Deliberately PER-AD and not the OperationRun's `stage`. That field is
+  // run-level, and with RENDER_CONCURRENCY/VEO_CONCURRENCY > 1 several ads
+  // render at once, so the run's stage is whichever ad wrote last — useless for
+  // answering "what is THIS asset doing". The whole point of this field is that
+  // an operator can read a specific assetId's state without asking someone to
+  // grep the logs.
+  //
+  // Never load-bearing: it is written fire-and-forget and a failed write is
+  // swallowed. Telemetry must not be able to fail a paid render.
+  renderStage:        { type: String, default: null },
+  renderStageAt:      { type: Date, default: null },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },

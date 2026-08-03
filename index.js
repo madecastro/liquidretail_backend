@@ -4,6 +4,8 @@ require('dotenv').config();
 // — dotenv never overrides an already-set var. Secrets are NOT in this file.
 require('dotenv').config({ path: require('path').join(__dirname, 'config', 'defaults.env') });
 console.log(`⚙️  config: defaults.env applied — WORKER_CONCURRENCY=${process.env.WORKER_CONCURRENCY} CATALOG_DETECT_PRECOMPUTE=${process.env.CATALOG_DETECT_PRECOMPUTE} AI_IMAGE_REF_MODEL_ID=${process.env.AI_IMAGE_REF_MODEL_ID} GENERIC_CATALOG_PDP_CONCURRENCY=${process.env.GENERIC_CATALOG_PDP_CONCURRENCY}`);
+// Full concurrency table (self- vs provider-imposed) — single source of truth.
+require('./services/concurrency').logConcurrencyConfig();
 // Crash / restart / shutdown alerting. Installed FIRST — before any other
 // require can throw — so a boot-time failure is still reported. Also the
 // only thing standing between an unhandled rejection in a fire-and-forget

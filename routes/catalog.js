@@ -500,7 +500,7 @@ router.post('/brands/:id/infer-categories', async (req, res) => {
     const t0 = Date.now();
     const result = await inference.inferBatch(
       candidates.map(c => c._id),
-      { concurrency: 6, force }
+      { concurrency: require('../services/concurrency').concurrency.CATEGORY_INFERENCE_BATCH_CONCURRENCY, force }
     );
     res.json({
       ok:         true,

@@ -101,7 +101,11 @@ for (const f of FORMATS) {
 // Every real platform format must classify to a declared titling format, and its
 // deliveryDims must match the composition it will actually be rendered in. THIS is
 // the check that catches the original bug.
+// Only live (generatable) surfaces must round-trip through titling. coming_soon
+// entries are UI-only until they go live; they may declare Google sizes that
+// have no Remotion composition yet (e.g. Demand Gen 1.91:1).
 for (const [pfId, pf] of Object.entries(PLATFORM_FORMATS)) {
+  if (pf.status === 'coming_soon') continue;
   check(`B2 platformFormat ${pfId} (${pf.aspectRatio}) classifies to a known format`, () => {
     const f = classifyFormat({ platformFormat: pfId, aspectRatio: pf.aspectRatio });
     assert.ok(FORMATS.includes(f), `classified to '${f}', which is not in FORMATS`);

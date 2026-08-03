@@ -14,6 +14,7 @@ const CatalogProduct = require('../models/CatalogProduct');
 const { decrypt } = require('./integrationCryptoService');
 const { inferCoarseEnum, resolveCoarseCategoryRef } = require('./categoryClassifier');
 const { startRun, CancelledError } = require('./progressService');
+const { concurrency: CONC } = require('./concurrency');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -340,7 +341,7 @@ async function syncCatalogForCred(cred, run = null) {
         }).select('_id').lean();
         if (!candidates.length) return;
         console.log(`🔎 categoryInference: brand=${brandId} scheduling ${candidates.length} product page scrapes`);
-        const result = await inference.inferBatch(candidates.map(c => c._id), { concurrency: 6 });
+        const result = await inference.inferBatch(candidates.map(c => c._id), { concurrency: CONC.CATEGORY_INFERENCE_BATCH_CONCURRENCY });
         console.log(`🔎 categoryInference: brand=${brandId} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
       } catch (err) {
         console.warn(`   ⚠️  category inference enqueue failed: ${err.message}`);
