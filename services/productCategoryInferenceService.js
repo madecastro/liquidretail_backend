@@ -26,6 +26,7 @@ const {
   normalizeBreadcrumb,
   extractBreadcrumb
 } = require('./breadcrumbParser');
+const { concurrency: CONC } = require('./concurrency');
 
 // Realistic browser UA — many e-commerce hosts (Cloudflare-protected
 // Shopify stores in particular) serve a managed-challenge page to
@@ -43,9 +44,10 @@ const CHALLENGED_TTL_DAYS = 1;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;   // 2 MB — most product pages are 200–500 KB
 
 // Per-domain concurrency cap. Some e-commerce hosts (especially behind
-// Cloudflare/Fastly) 429 aggressive scrapers. 3 concurrent + 250 ms
+// Cloudflare/Fastly) 429 aggressive scrapers. Default 3 concurrent + 250 ms
 // post-finish gap is polite enough for ~10 RPS sustained per domain.
-const DOMAIN_CONCURRENCY = 3;
+// Override via CATEGORY_INFERENCE_DOMAIN_CONCURRENCY.
+const DOMAIN_CONCURRENCY = CONC.CATEGORY_INFERENCE_DOMAIN_CONCURRENCY;
 const POST_FETCH_DELAY_MS = 250;
 
 // BREADCRUMB_SKIP / extractJsonLdBlocks / findByType / normalizeBreadcrumb
@@ -280,7 +282,7 @@ async function inferAndStamp(productId, { force = false } = {}) {
 // can surface live progress (and cancel — a throwing onProgress stops the
 // batch: workers exit, in-flight items finish). Kept optional so the
 // existing callers are unaffected.
-async function inferBatch(productIds, { concurrency = 8, force = false, onProgress = null } = {}) {
+async function inferBatch(productIds, { concurrency = CONC.CATEGORY_INFERENCE_BATCH_CONCURRENCY, force = false, onProgress = null } = {}) {
   const results = { ok: 0, skipped: 0, challenged: 0, failed: 0, total: productIds.length };
   let cursor = 0;
   let done = 0;

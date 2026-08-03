@@ -138,22 +138,12 @@ function parsePhase3WizardFields(body = {}) {
 // manually drive those.
 const AD_STATUSES = ['draft', 'live', 'archived'];
 
-// Render concurrency. Puppeteer + Cloudinary is the bottleneck;
-// running too many in parallel on the small Render instance OOMs
-// Chromium. 2 in flight at once is a safe starting point.
-const RENDER_CONCURRENCY     = parseInt(process.env.RENDER_CONCURRENCY     || '2', 10);
-const VEO_CONCURRENCY        = parseInt(process.env.VEO_CONCURRENCY        || '1', 10);
-
-// Hard cap on creatives per generation. Cartesian expansion
-// (products × templates × supported ratios) blows up fast. Bumped
-// from 6 to 20 after the wizard simplification — the operator no
-// longer picks 1-2 templates, so the default fanout grew (all 5
-// ai_* templates × 4 concepts), and a 6-cap meant only a slice of
-// the seed × template × concept matrix ever rendered per run.
-// 20 still fits inside Chromium's warm-render window at concurrency
-// 2 in roughly 10-15 minutes — adjust POLL_TIMEOUT_MS in the Ads
-// page if you push this further.
-const MAX_CREATIVES_PER_RUN = parseInt(process.env.MAX_CREATIVES_PER_RUN || '20', 10);
+// Render / video pool sizes + per-run cap — resolved in services/concurrency.js
+// (env-tunable; defaults raised 2026-08-02: RENDER 4→8, VEO 1→4).
+const { concurrency: CONC } = require('../services/concurrency');
+const RENDER_CONCURRENCY    = CONC.RENDER_CONCURRENCY;
+const VEO_CONCURRENCY       = CONC.VEO_CONCURRENCY;
+const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +

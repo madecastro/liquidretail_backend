@@ -9,6 +9,7 @@
 
 const IntegrationCredential = require('../models/IntegrationCredential');
 const Campaign = require('../models/Campaign');
+const { concurrency: CONC } = require('./concurrency');
 
 // Adapter registry. Each adapter exports:
 //   syncForCredential(credDoc) → { ok, campaigns: [normalizedCampaign], errors: [] }
@@ -143,9 +144,9 @@ async function enqueueDerivations({ brandId, platform }) {
   if (stale.length) {
     console.log(`📋 campaignBrief: enqueueing ${stale.length} stale brief(s) for brand=${brandId}`);
     // Concurrency-limited rolling batch — derivation hits OpenAI per
-    // campaign, so we cap to 3 in-flight to avoid stampeding.
+    // campaign, so we cap in-flight (CAMPAIGN_BRIEF_CONCURRENCY) to avoid stampeding.
     const queue = stale.map(c => c._id);
-    const CONCURRENCY = 3;
+    const CONCURRENCY = CONC.CAMPAIGN_BRIEF_CONCURRENCY;
     let cursor = 0;
     const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
       while (cursor < queue.length) {

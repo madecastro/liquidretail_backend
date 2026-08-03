@@ -21,15 +21,15 @@ const Ad                    = require('../models/Ad');
 const Campaign              = require('../models/Campaign');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const { decrypt }           = require('./integrationCryptoService');
+const { concurrency: CONC } = require('./concurrency');
 
 const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 // Per-batch concurrency cap. Meta's per-app rate limit is generous
 // (200 calls/hr/user) but ad-account-level write throttling kicks in
-// faster. 3 in-flight is conservative; bump if a brand's batches feel
-// slow once we have telemetry.
-const PUSH_CONCURRENCY = 3;
+// faster. Default 3 in-flight is conservative; override via META_PUSH_CONCURRENCY.
+const PUSH_CONCURRENCY = CONC.META_PUSH_CONCURRENCY;
 
 // Video processing — Meta's /advideos is async. Upload returns
 // immediately with a video_id, but the video isn't usable in an

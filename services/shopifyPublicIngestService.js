@@ -674,7 +674,9 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
           }).select('_id').lean();
           if (!candidates.length) return;
           console.log(`🔎 categoryInference: brand=${brand._id} scheduling ${candidates.length} product page scrapes`);
-          const result = await inference.inferBatch(candidates.map(c => c._id), { concurrency: 6 });
+          const result = await inference.inferBatch(candidates.map(c => c._id), {
+            concurrency: require('./concurrency').concurrency.CATEGORY_INFERENCE_BATCH_CONCURRENCY
+          });
           console.log(`🔎 categoryInference: brand=${brand._id} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
         } catch (err) {
           console.warn(`   ⚠️  🛍  category inference enqueue failed: ${err.message}`);

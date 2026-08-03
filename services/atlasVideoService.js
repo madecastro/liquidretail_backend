@@ -1997,8 +1997,15 @@ function submitRetryDecision(summary, attempt, maxAttempts) {
 // N same-model submits at once bursts past that and all-but-one fail server-side
 // — which is exactly the condition the submit retry below was added to absorb.
 // Pacing PREVENTS the collision instead of reacting to it: same-model submits are
-// serialized and spaced >= SUBMIT_SPACING_MS apart (start-to-start), while
-// different models run in parallel as independent buckets.
+// serialized and spaced apart (start-to-start) PER MODEL SLUG, while different
+// models run in parallel as independent buckets.
+//
+// PER-MODEL-SLUG is load-bearing for VEO_CONCURRENCY > 1: Omni and Grok have
+// separate gates. Raising the video pool must not let Grok (aspect-fallback,
+// documented 1 RPS) share a global serial queue OR lose its floor. Spacing is
+// resolved by services/concurrency.submitSpacingMsForModel — Grok always gets
+// at least GROK_MIN_SUBMIT_SPACING_MS (PROVIDER-IMPOSED 1 RPS) even when
+// ATLAS_SUBMIT_SPACING_MS is 0.
 //
 // This only ever DELAYS the single POST a task makes — it never retries one.
 // Ported from reach-social-llm-expander src/lib/atlas.ts:69-99; keep the two in
@@ -2009,21 +2016,24 @@ function submitRetryDecision(summary, attempt, maxAttempts) {
 // real improvement within one process and NOT a global limiter. It becomes
 // globally true once rendering moves to the single-instance worker (see
 // ARCHITECTURE_REVIEW.md "The render-queue architecture problem"); until then
-// VEO_CONCURRENCY per-process remains the weak link (routes/ads.js:144).
-const SUBMIT_SPACING_MS = (() => {
-  const n = Number(process.env.ATLAS_SUBMIT_SPACING_MS);
-  return Number.isFinite(n) && n >= 0 ? n : 1200;
-})();
+// VEO_CONCURRENCY per-process remains the weak link.
+const {
+  concurrency: CONC,
+  submitSpacingMsForModel,
+  isGrokModel
+} = require('./concurrency');
+const SUBMIT_SPACING_MS = CONC.ATLAS_SUBMIT_SPACING_MS;
 
 const _modelSubmitGate = new Map();
 const _modelLastSubmitAt = new Map();
 
 /** Run `fn` serialized + rate-spaced against other submits for the SAME model, process-wide. */
 function pacedModelSubmit(model, fn) {
+  const spacingMs = submitSpacingMsForModel(model);
   const run = async () => {
-    if (SUBMIT_SPACING_MS > 0) {
+    if (spacingMs > 0) {
       const last = _modelLastSubmitAt.get(model);
-      const wait = last == null ? 0 : last + SUBMIT_SPACING_MS - Date.now();
+      const wait = last == null ? 0 : last + spacingMs - Date.now();
       if (wait > 0) {
         console.log(`   ⏱️  atlasVideo: pacing submit for ${model} — waiting ${wait}ms`);
         await new Promise(r => setTimeout(r, wait));
@@ -2036,7 +2046,8 @@ function pacedModelSubmit(model, fn) {
   };
   // Chain after the previous submit for this model to serialize the bucket. The
   // stored tail swallows the outcome so one failure never wedges the chain, while
-  // the caller still sees `next` reject.
+  // the caller still sees `next` reject. Keyed by model slug — Omni and Grok
+  // never share a gate.
   const next = (_modelSubmitGate.get(model) || Promise.resolve()).then(run);
   _modelSubmitGate.set(model, next.then(() => undefined, () => undefined));
   return next;
@@ -2797,5 +2808,10 @@ module.exports = {
   isRateLimit,
   isDefinite429,
   submitRetryDecision,
-  summarizeAxiosError
+  summarizeAxiosError,
+  // Per-model submit gate — exported for scripts/verifyConcurrencyConfig.js
+  // so the harness can prove Grok stays <=1 RPS under raised VEO_CONCURRENCY.
+  pacedModelSubmit,
+  SUBMIT_SPACING_MS,
+  isGrokModel
 };

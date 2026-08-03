@@ -1038,7 +1038,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
   // spacing is the client's own min-gap do we parallelize.
   const pdpConcurrency = pdpGapMs > 0
     ? 1
-    : Math.max(1, parseInt(process.env.GENERIC_CATALOG_PDP_CONCURRENCY, 10) || 5);
+    : require('./concurrency').concurrency.GENERIC_CATALOG_PDP_CONCURRENCY;
 
   // Fetch + parse ONE page. Pure w.r.t. scan state — returns an outcome
   // the reduce step applies; never touches stats/products/seenIds.

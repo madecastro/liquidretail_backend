@@ -61,10 +61,8 @@ const {
   maybeFetchProductReviewsCached
 } = require('./productMatchService');
 
-const CONCURRENCY = Math.max(
-  1,
-  parseInt(process.env.CATALOG_ENRICHMENT_CONCURRENCY, 10) || 6
-);
+const { concurrency: CONC } = require('./concurrency');
+const CONCURRENCY = CONC.CATALOG_ENRICHMENT_CONCURRENCY;
 // Hard cap on how many products we'll enrich per run. Large catalogs
 // (5000+ items) shouldn't dump $500 of API spend in one go; the rest
 // lazy-fetch on first match or on the next "Enrich" click.

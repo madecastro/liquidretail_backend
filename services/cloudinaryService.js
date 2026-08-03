@@ -1,5 +1,6 @@
 const cloudinary = require('cloudinary').v2;
 const streamifier = require('streamifier');
+const { concurrency: CONC } = require('./concurrency');
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -91,8 +92,8 @@ async function deleteFromCloudinary(url) {
 
 // Bulk delete with a small concurrency limiter. Cloudinary's free
 // tier rate-limits at 500 ops/hr; keep concurrency modest so cascade
-// deletes for big brands don't trip it.
-async function deleteManyFromCloudinary(urls, { concurrency = 4 } = {}) {
+// deletes for big brands don't trip it. Override via CLOUDINARY_DELETE_CONCURRENCY.
+async function deleteManyFromCloudinary(urls, { concurrency = CONC.CLOUDINARY_DELETE_CONCURRENCY } = {}) {
   const out = [];
   let i = 0;
   async function worker() {
