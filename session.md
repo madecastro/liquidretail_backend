@@ -844,6 +844,81 @@ under them was broken — the star-row guard pin matched an identical expression
 the regex pin matched the old pattern quoted in its own explanatory comment. Source pins must
 strip comments and assert PROXIMITY. Both were caught only by revert-proofing.
 
+### 0.3001 OWNER TEAM-TEST ROUND 2 — three complaints, all real, all fixed (2026-08-03 22:0x)
+
+Owner, on delivered ads: *"these titles are not the canonical titling we have discussed, I am
+seeing the shipping car show back up, there is a dark pill, I am not seeing star ratings or
+reviews, I am unclear why we reverted to this again?"* Prod now `8febbf2`, suite **42/42**,
+`verifyProofBeat` **31**.
+
+**"why we reverted" — WE DID NOT. The template is intact.** `git log b97991d..HEAD` over
+`canonical.json` + `slotRenderers.jsx` + `Canonical.jsx` + `slotContent.js` returns exactly ONE
+commit, `0319c68`, which is the merge that landed this session's own work. Every recent render
+logs `spec=canonical placement=canonical`, and the four newest ads' `titlingSnapshot.spec.source`
+is `canonical`. What the owner saw was three separate defects on top of an unchanged template.
+
+**(1) NO STARS / NO REVIEW COUNT — a PROJECTION, not the rating logic. THE BIG ONE.**
+`routes/ads.js:1315` (generation — what the wizard runs) and
+`adRegenerateService.loadBrand:393` both `.select()` an explicit brand field list, and **neither
+listed `brandReviews`**. So `buildMetaForAd` saw `brand.brandReviews === undefined` → `brandPair`
+null → `resolveAtomicRatingPair` returned `source=none`, and **every generated ad shipped with no
+stars and no count** — including **Vuori at 4.58 / 15,545**, which clears the >4.5 gate outright.
+Why it hid: a projection omission is indistinguishable from a brand with no review data;
+`resolveAtomicRatingPair` was correct all along so unit coverage passed; and — the part that
+matters — **the canon5 sheets the owner approved were rendered by `scripts/retitleDriver.js`,
+which loads the FULL brand doc.** Stars appeared there and were NEVER achievable through the
+generation path. That is the whole "we had it and lost it" feeling, and it was never a regression.
+Proven live after deploy: `PROJECTED brandReviews={r:4.58,c:15545}` → `ratingPair: source=brand
+rating=4.6 count=15545` → frame shows gold ★★★★½ 4.6/5 + "15,545 reviews · vuoriclothing.com".
+Pinned by `verifyProofBeat` P1 (revert-proven).
+
+**(2) "SHIPPING CAR" — a truck icon stapled to copy that never mentioned delivery.**
+The `deliveryLine` slot is labelled "Delivery / offer line" but its cascade binds
+`layoutInput.input.product.badges[1]` — the SECOND BADGE. Text is routinely "Premium Cotton",
+"Best Seller", "New Arrival", and the old condition (`endcardMode !== 'brand'`, i.e. every product
+ad) drew a truck next to all of them. Icon is now content-gated (`DELIVERY_CLAIM`), so it appears
+only for an actual delivery/shipping line and returns automatically if one is ever bound.
+**The cascade mismatch is left alone deliberately** — the line reads fine as badge text; rebinding
+it changes what copy appears and is an owner call.
+
+**(3) "DARK PILL" — brand-token pill read as scrim.** `BadgeSlot` filled a `Pill` from
+`badgeBg`/`badgeText`, so the same slot shipped CHARCOAL on Vuori and cream on GymShark, and on a
+light plate the dark box was exactly the scrim the no-scrim standard exists to remove. Owner chose
+*"Plain text, no pill"*. Badge now renders small-caps in `textPrimary`, so the contrast flip drives
+it and it is consistent across brands. `Pill` stays for CTA/promo, which should read as buttons.
+
+**(4) LOGO — owner: *"keep the static but I noticed the allbirds logo is put on a block of white,
+the logo should just be rendered in black or white depending on the color of the background."***
+Static compositing stays ON (the model is still forbidden from drawing a logo). The asset was
+composited verbatim, so a logo on an OPAQUE white canvas painted a white rectangle. Now re-inked
+as a single-colour silhouette chosen from the mean luminance behind it (`monochromeInkFor`,
+>0.5 → black else white); coverage from alpha when present, else luminance in whichever polarity
+the asset's own border implies, so white-on-black assets don't invert into a block. Failure falls
+back to the original asset. **NOT yet visually verified — needs one static render (~$0.01).**
+Video titling was never the source: `brandPill` and `brandLogo` are both off in canonical.
+
+### 0.3002 TEXT-ON-FACE — the camera prompt is NOT the cause. Measured.
+
+Owner picked "constrain the camera prompt" for the close-up legibility problem, but the numbers
+say that would not have fixed it, so it was NOT implemented pending a decision.
+
+Measured on the Vuori square ad (`6a710c82…`): `basePlate` = source **1080x1920**, crop rect
+`{cx:0, cy:67, cw:1080, ch:1080, anchorY:'face-safe'}`, face envelope `top 0.035 → bottom 0.558`.
+That is a face **1,004px tall — 52% of the master's height**. A 1080px square crop therefore
+**cannot** contain that face and still leave a clear title band; there is no cy that works. And
+`anchorY:'face-safe'` exists to keep the face IN frame, which is the opposite of what titling
+wants. Same shape on GymShark (`cy:39`, envelope to 0.35 — less extreme, still tight).
+So the chain is: the MASTER is a tight portrait → the square/4:5 face-anchored crop preserves the
+face → titles have nowhere clear to go. A zoom cap in `buildVeoPrompt` changes the last ~10% and
+cannot undo a seed that is already a portrait.
+**Also relevant, and a reason for caution:** `be5b83f` rolled back ALL of PR#61's camera-prompt
+changes because the owner found they *"creat[ed] additional hallucinations and the previous output
+was better."* Adding camera directives is the one lever with a proven history of backfiring here.
+Real levers, in order of effect: (a) VIDEO SEED framing — prefer a wider on-model/full-product
+shot over a tight portrait for ads that will be cropped square; (b) legibility treatment (soft
+shadow, no box) which works on EXISTING masters at $0; (c) crop bias for less-extreme masters;
+(d) camera zoom cap — marginal, and needs its own live A/B given (be5b83f).
+
 ### 0.3000 VALIDATED IN PIXELS — the proof beat works end to end (2026-08-03 19:04)
 
 Live Chrome test on staging found a BLOCKER that no harness could, then confirmed the whole
