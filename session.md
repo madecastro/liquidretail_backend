@@ -1253,10 +1253,22 @@ exists** (`adSuitabilityService.js:46,162`, `Media.text[]`) but is aimed at
 *ingested source media*, not the rendered ad — which makes the long-discussed
 measure-and-reject control much cheaper than §0.2 assumed.
 
-**Files touched:** `services/staticAdIntents.js`, `services/atlasImageService.js`
-(stale 3-size comment), `scripts/verifyStaticSafeBox.js` (new), `docs/PIPELINES.md`
-§5, `CLAUDE.md` §2 Known-open. **NOT committed** — the working tree is shared with
-a concurrent session (see §0.29997).
+**COMMITTED as `c9942bb`** on branch `fix/catalog-first-seed-and-video-prompt-rollback`,
+on top of the concurrent session's `be5b83f`. Suite 42/42 green at both commits.
+**NOT pushed, NOT merged to `main`** — deploy is still the owner's call.
+
+Code in `c9942bb`: `services/staticAdIntents.js`, `services/atlasImageService.js`
+(stale 3-size comment), `services/directImageRenderService.js` (renderIssue on a
+generation-size mismatch), `scripts/verifyStaticSafeBox.js` (new, 334 checks).
+**The DOCS for this work are in `be5b83f`, not `c9942bb`** — the concurrent session
+committed the shared tree while `docs/PIPELINES.md` §5, `CLAUDE.md` §2 Known-open
+and this §0.31 were already edited in it. Nothing was lost, but do not go looking
+for the doc changes in the code commit.
+
+Also: this branch now carries BOTH sessions' work. `be5b83f`'s
+`verifySeededUniverseHeroDefault.js` was briefly red mid-session (110/111,
+`S8 role === 'catalog'`) and is now 119/119 — that was their work in flight, not a
+regression from this change.
 
 ---
 
