@@ -249,6 +249,25 @@ Video never launches a browser.
   re-read (`campaignRunIds` + `rendering`), `modifiedCount` cross-check, and
   post-claim requeue on throw (`routes/ads.js:645-750`, `:882-902`). Covered by
   `scripts/verifyRunsClaim.js` (67 checks). Do not inline a second claim path.
+- **The `/generate` concurrency gate is the ONLY double-click protection, and the
+  atomic claim does NOT back it up.** Each expansion mints its OWN ads
+  (`identityDigest` scoped via `generationRunId`), so two runs on the same product
+  never race for a row — they each claim what they just created and both bill.
+  Since 2026-08-03 the gate allows CONCURRENT runs whose product sets are
+  **disjoint** and blocks overlap (`services/generationGate.js`,
+  `scripts/verifyGenerationGate.js` — 65 checks, four revert-proven). Rules that
+  are load-bearing, not stylistic: (a) keyed on `productIds` **only** — never on
+  format/preset, because presets fan out (`meta_all` ⊃ `meta_static` surfaces) so
+  two same-product runs with different presets CAN expand the same
+  (product, template, aspect) into two differently-digested ads = one creative,
+  two charges; (b) **fail-closed** — any run or request whose scope is unreadable
+  blocks, which is why `CampaignRun.requestedProductIds` must be stamped at mint
+  time by EVERY creator (`/generate` from the body, `/runs` from the claimed ads,
+  and `[]` — not a partial list — when any claimed ad lacks a `productId`);
+  (c) **mint-then-verify** after `CampaignRun.create` closes the read-then-write
+  race where two clicks both read an idle campaign; both racers compute the same
+  winner via (`createdAt`, `runId`) and the loser aborts before expanding, so a
+  false abort costs a 409 and nothing else.
 - **Never leave a paid Omni master in `status:'rendering'`.** Stamp `draft`
   with `veoVideoUrl` before titling (`routes/ads.js:1258-1294`). Titling failure
   → `failed` + keep master; success/no-chrome → finished. Counting an untitled
@@ -400,7 +419,7 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**28 scripts** as of 2026-08-03). Add a
+  relevant `scripts/verify*.js` harness (**40 scripts** as of 2026-08-03). Add a
   harness for money/security-critical logic, and **revert-prove it** — back the
   fix out and confirm the test fails. A test that cannot fail is not a test.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the

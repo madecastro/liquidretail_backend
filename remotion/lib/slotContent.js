@@ -51,10 +51,19 @@ export function resolveSlotContentCore(slot, meta) {
 
   if (slot.key === 'rating') {
     const rating = Number(meta?.rating);
-    if (!Number.isFinite(rating) || rating <= 0) return null;
+    const hasRating = Number.isFinite(rating) && rating > 0;
+    const reviewsText = meta?.reviewsText || (meta?.reviewCount ? `${meta.reviewCount} reviews` : '');
+    // Owner's ">4.5 stars only" rule can suppress a real-but-low rating
+    // upstream (services/ratingDisplay.js sends rating:null in that case)
+    // while the brand still has review volume worth showing (e.g. GymShark:
+    // 41,000 reviews, 3.3 stars — correctly suppressed but not nothing to say).
+    // Only hide the slot when there is truly neither a rating nor a count.
+    if (!hasRating && !reviewsText) return null;
     return {
-      rating: Math.min(5, Math.max(0, rating)),
-      reviewsText: meta?.reviewsText || (meta?.reviewCount ? `${meta.reviewCount} reviews` : ''),
+      // null (not 0, not 5) so the renderer can tell "no stars" apart from
+      // "zero stars" — clamp only applies once we know it's a real rating.
+      rating: hasRating ? Math.min(5, Math.max(0, rating)) : null,
+      reviewsText,
     };
   }
 

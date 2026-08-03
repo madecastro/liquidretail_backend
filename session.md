@@ -592,6 +592,203 @@ Approval-grid artifact refreshed in place:
 https://claude.ai/code/artifact/535b2728-b623-4898-9841-518e89b03798 (iteration 4 status).
 AWAITING OWNER: approve -> full 367 sweep + persona scoring; or flag -> next $0 iteration.
 
+### 0.29996 TEAM-DAY LIVE REPORTS — THREE REPORTS, ONE ROOT-CAUSE FAMILY (2026-08-04)
+
+*Rewritten after measurement. An earlier version of this block claimed brand stars were read
+from the wrong document and treated the schemaVersion hole as the whole story. Both were wrong;
+corrected below. Full plan: `~/.claude-work/plans/graceful-forging-gem.md`.*
+
+Owner, mid-testing: (1) *"not seeing the canonical title being used on videos"*; (2) *"we are not
+seeing customer comments … there should be at least brand slugs … we opened up the llm gating
+removing attribution, but I am not seeing that"*; (3) *"what happened to the star reviews and
+review counts? We were going to brand level stars and counts but now I am not seeing any."*
+
+**These are ONE root cause.** The titling IS canonical — prod web+worker both on `b97991d`
+(`render-ssh` `RENDER_GIT_COMMIT`), no `TITLE_SPEC_*` env override, and every `🎨 brandScript`
+line since 10:26 logs `spec=canonical` (the lone `spec=brand` was 04:26, pre-fix; the SAME ad
+re-titled at 17:15 logs `spec=canonical`). What is missing is the **proof phase** — canonical's
+quote + reviewer + rating lockup, the distinctive part of the template. With the quote withheld
+AND the rating withheld, `headline` takes over via `visibleWhenEmpty:"quote"` and the beat
+degrades to a repeated headline. So report 1 is a *symptom* of reports 2 and 3.
+
+| # | finding | evidence |
+|---|---|---|
+| A | `buildMetaForAd` loads the artifact by **`mediaId` only** — no `productId`, no `schemaVersion` | `brandScriptExecutor.js:713` |
+| B | **722 of 738** layout artifacts are pre-`4.1` → unstamped quotes the gate must withhold | prod count |
+| C | Video path rebuilds **only when the artifact is empty**, so stale-but-populated is never refreshed | `atlasVideoService.js` `lpEmpty` ~:2497/:2590 |
+| D | Brand-tier quotes **withheld from product ads** by design | `layoutInputService.js:2023-2028`; live `🔒 quote scope` |
+| E | Brand stars cannot clear `>4.5`: **only 4 of 34 brands qualify** | prod query |
+
+Live proof of B/C: `quote withheld (tier=unstamped origin=unstamped)` fired at 17:10 and 17:15
+today. **STATIC is unaffected** — `renderService.js:332` calls `buildLayoutInput`
+unconditionally and its cache treats a `schemaVersion` mismatch as a MISS → rebuild → stamped
+`llm-web` quotes flow (live: `winner=product "The shoes are very comfortable"`). The hole is
+video-only.
+
+**On E, the numbers that matter.** Brands with a brand rating = 16/34; clearing the owner's
+`>4.5` rule = **4** (Pohnpei 4.7, Camelbackflowers 4.9, Ubeauty 4.8, Vuori 4.58→4.6). The two
+brands under test today both fail: **GymShark 3.3** (with 41,000 reviews and 6 brand quotes) and
+**AllBirds has no `brandReviews` at all**. Nothing regressed — `resolveAtomicRatingPair` (PR #61)
+is correct and live; the DATA cannot clear the gate the owner asked for.
+
+**TWO HYPOTHESES TESTED AND KILLED — do not re-chase:**
+- *Brand stars read from the wrong doc:* **FALSE.** `ProductMatchArtifact.brandReviews` is `null`
+  for every ad checked; `Brand.brandReviews` is the correct source. AllBirds simply has no data.
+- *The `llm-web` attribution opening regressed:* **FALSE.** `quoteProvenance.js` is correct and
+  live; `llm-web` prints as anonymous text with bylines structurally deleted. What blocks these
+  ads is B/C (stale artifacts) and D (brand tier withheld), not the provenance rule.
+
+**Owner decisions this session:** stars → when the brand rating fails `>4.5`, print the **review
+count paired with a positive brand-level quote**, no stars (*"let's try using the number of
+reviews with a positive review that we have plucked out at the brand level"*); brand-tier quotes
+→ allowed as **last-resort fallback** on product ads, anonymous; enrichment → backfill
+`brandReviews` for all brands missing it; **NO sweep** (*"just make a fix and redeploy so we can
+keep testing"*).
+
+**INTEGRATION GAP found while building (important).** `buildMetaForAd` only READS artifacts —
+`buildLayoutInput` is what rebuilds. So a `schemaVersion` filter makes a stale artifact resolve to
+"none" → degrade to `ad.copy` → still no quote on a $0 re-title; only NEW generations rebuild.
+Worse for the brand-tier fallback: `primary_quote` is baked in at **assembly** time, so existing
+v4.1 artifacts assembled before the change hold no brand quote (GymShark `6a70cf95` is v4.1 with
+`q=NONE`). Re-titling alone therefore cannot validate the brand-quote path — the artifact must be
+rebuilt first. Deliberately NOT fixed by adding an LLM call to the render path (`retitleDriver`
+must stay ~$0).
+
+**Grok CLI headless: NO for edits, YES for review — with the diff INLINED.**
+`grok -p …` prints narration and exits WITHOUT executing tool calls: no file edits, exit 0,
+silently. `--max-turns 60` and `--permission-mode acceptEdits` do not change it;
+`bypassPermissions` is blocked by Claude Code's classifier. So use **subagents** for anything
+that edits files.
+**But review works and EARNED ITS KEEP.** An earlier version of this note claimed review was
+useless too — that was wrong, written before the long pass returned. With the full diff pasted
+into the prompt (no file access needed), one high-effort pass found **two real HIGH defects that
+37 green harnesses and my own line-by-line read both missed** (§0.29998). The other pass, given a
+"look for interaction bugs" steer, returned narration only. Lesson: inline the diff, ask for
+refutation, allow it several minutes, and do not judge the run from a truncated interim file.
+
+### 0.29997 IMPLEMENTATION — code COMPLETE + verified, DEPLOY HELD BY OWNER (2026-08-04)
+
+Landed in the working tree, NOT committed (owner held it — see the shared-tree note below).
+`config/defaults.env` gains `QUOTE_BRAND_TIER_FALLBACK=true`.
+
+| change | file |
+|---|---|
+| Artifact lookup scoped by `productId`; fresh schema PREFERRED, stale DEMOTED not dropped | `services/brandScriptExecutor.js` |
+| `allowBrandCountWithoutStars` — third outcome: count prints, stars withheld, `source:'brand-count'` | `services/ratingDisplay.js` |
+| Brand tier demoted to last-resort on product ads (flagged, default on); brand-ad order UNCHANGED | `services/layoutInputService.js` |
+| Stale artifacts rebuilt on the video path (one `refreshStaleLayoutInput` helper, both call sites) | `services/atlasVideoService.js` |
+| Rating slot non-empty on count alone; `rating:null` distinguishes "no stars" from "zero stars" | `remotion/lib/slotContent.js` |
+| Star row + score skipped entirely when `rating == null`; count animation starts at slot enter | `remotion/components/slotRenderers.jsx` |
+| New revert-proven harness (22 checks) | `scripts/verifyProofBeat.js` |
+| New dry-run-default enrichment driver, NOT yet run | `scripts/backfillBrandReviews.js` |
+
+**Verify: 37/37 scripts green.** `verifyProofBeat` revert-proven 5 ways (break the count-only
+branch → 4 fail; delete `tier` in the byline strip → 3 fail; restore the old rating-only bail →
+S1 fails; remove the star-row guard → S3 fails; unconditional `countStartSec` → S4 fails).
+**One pin was initially too weak and passed while the guard was deleted** — a bare
+`/rating != null ?/` matched the `countStartSec` line ~80 lines away. Now requires the guard
+within 400 chars of `<StarRow>`. That is the whole argument for revert-proving.
+
+**A REGRESSION THE FAN-OUT ALMOST SHIPPED — corrected by hand.** The subagent filtered the
+artifact query on `schemaVersion`, which drops a stale artifact ENTIRELY. But **ten** meta fields
+take `layoutInput` as their FIRST cascade source — including `rating` and `reviewCount` themselves,
+plus `deliveryLine`, `badgeText`, `badges`, `benefits`, `productDescription`, `likes`. With 722/738
+artifacts stale that would have thinned the close phase and DELETED the very stars this work
+restores. Freshness is now a preference with a fallback; the unstamped quote is still withheld by
+`gateLayoutInputQuotes`, which is all the filter ever bought.
+
+**Adversarially verified BY EXECUTION** (Grok review unusable, see above) across the real
+production shapes. Every row traced pair → Remotion slot:
+| input | renders |
+|---|---|
+| stale AllBirds: product 4.4, no brand data | slot EMPTY → headline fallback |
+| GymShark: brand 3.3 / 41,000, brand-tier quote | **no stars, "41000 reviews · gymshark.com"** |
+| brand count, no brand rating | no stars, count prints |
+| brand 4.7, no count | 4.7 stars, no count line |
+| 0–100 scale (87) | no stars, count only — 87 never becomes a star value |
+| `reviewCount: 0` | slot EMPTY — never "0 reviews" |
+| product count 41,000 + brand rating fails, no brand count | slot EMPTY — **cross-tier leak blocked** |
+No forbidden star value reaches the screen on any path, and nothing crashes (`rating.toFixed(1)`
+was a latent throw on null before the guard).
+
+**Two latent items, deliberately NOT fixed (no live consumer):**
+1. Brand quotes now also enter `secondary_quotes` on product ads. That pool bypasses the
+   last-resort ordering. Read ONLY by `aiCanvas*` / HTML services, which §1 documents as dead for
+   new generation; the Remotion path binds `primary_quote` only. If a canvas path is ever revived
+   it needs its own scoping decision.
+2. A rating stored as a STRING ("4.7") that would legitimately clear the gate now renders
+   count-only, because `formatDisplayRating` requires `typeof === 'number'`. Pre-existing and
+   harmless (never prints a WRONG value), but it silently forfeits real stars.
+
+**COST — re-titling is no longer unconditionally $0.** `buildLayoutInput` runs an LLM derivation
+on a cache miss, so rebuilding a stale artifact costs one derivation per ad. Scoped to the stale
+population (722/738); schema-current rows still cache-hit at $0. A full sweep would therefore be
+billable — a second reason the owner's "no sweep" call is right.
+
+**SHARED WORKING TREE — why nothing is committed.** A concurrent session is editing this same
+tree: `routes/ads.js` (new `POST /api/ads/video-ref-prewarm`), new
+`services/videoRefPrewarmService.js`, and `services/costTracker.js` (re-prices
+`gemini-2.5-flash` 3x input / 6x output as Flash-LITE numbers, and adds a $0.035/call
+grounded-search surcharge). `services/atlasVideoService.js` is MIXED — the proof-beat helper and
+their prewarm/reframe hunks share the file. Owner chose HOLD: land that session first, then commit
+and deploy this on top. **Do not commit the tree as-is** without deciding on those three files.
+
+**Money-invariant gap found in passing:** the Gemini brand-reviews tier
+(`geminiSearchProvider.lookupBrandReviews`) calls `axios.post` against the raw Gemini endpoint with
+**no costTracker/CostLog involvement at all** — unlike the GPT tier, which is ledgered. So brand
+enrichment spend is invisible in month-to-date totals. The concurrent session's `costTracker.js`
+grounded-search surcharge may be addressing exactly this; reconcile rather than double-ledger.
+
+### 0.29998 ADVERSARIAL REVIEW FOUND TWO REAL HIGH BUGS — both fixed, both revert-proven
+
+The two-pass rule paid for itself again. Neither defect was caught by 37 green harnesses, by the
+9-shape execution trace, or by my own line-by-line read. Suite now **39/39**, `verifyProofBeat`
+at **26 checks**.
+
+**HIGH 1 — the count-up animation printed FABRICATED totals.** `parseReviewsLeadingNumber`
+(`remotion/lib/ratingMotion.js:93`) used `/^(\d{1,3}(?:,\d{3})*|\d+)/`. Alternation is ORDERED, so
+on an uncommaed run of digits branch one won: **"41000" matched only "410"** (`\d{1,3}` greedy,
+then zero comma groups) → `target:410`, `suffix:"00 reviews · gymshark.com"`. The count rolled
+0→410 with a stray "00" beside it, so mid-animation frames read **"18800 reviews"**, "30800", … —
+numbers no source ever produced — for ~0.9s of paid video. Only the SETTLED frame looked right,
+which is exactly why every post-settle contact sheet passed it. `reviewsText` is built uncommaed
+by `ratingDisplay.js`, so any count ≥1000 was affected ("8343" → 834 + "3 reviews").
+Reproduced before fixing. Fix: `/^(\d+(?:,\d{3})*)/` — `\d+` first, comma groups optional.
+Verified: 41000/8343/15,545/128/1/1,234,567 all parse whole; mid-roll now "18,860 reviews",
+settled "41,000 reviews · gymshark.com". **This was PRE-EXISTING** (Vuori's 15445 shipped through
+it) but the count-only path makes an uncommaed count the primary proof, so it became load-bearing.
+
+**HIGH 2 — the brand count could ride a quote that was not the brand's.** The gate read
+`primary_quote.tier === 'brand'`, but the quote that RENDERS is `cascaded.quote`, and that cascade
+puts **`ad.copy.quote` FIRST**, layoutInput's primary_quote second (`metaCascadeConfig.js:49-52`).
+So an ad carrying an operator-edited or stale `ad.copy.quote` rendered THAT line while tier still
+said 'brand' — hanging a catalog-wide review count off a product-specific claim that never passed
+the provenance gate. Fix: require the brand quote to be the one that actually prints
+(`renderedQuote === brandQuoteText`).
+
+**Three further findings ASSESSED, deliberately not code-changed:**
+- *Product stars + a brand-tier last-resort quote on one ad.* Rating/count atomicity still holds
+  (both product-tier). What remains is the cross-product quote risk the owner **explicitly
+  accepted** when approving the fallback. Documented, not "fixed" — fixing it would gut the
+  feature that was asked for.
+- *Brand stars beside a product-tier quote.* Real but **pre-existing**: the brand-rating branch is
+  untouched by this work. Out of scope; worth its own pass.
+- *`slotContent` does not re-apply the >4.5 rule.* Defence-in-depth gap, pre-existing — the
+  renderer trusts `meta.rating`, and `buildMetaForAd` is the only writer. Adding a second
+  enforcement point risks the two diverging; left as the single-source design.
+
+**METHOD NOTE worth keeping:** two of my own source-pin checks initially passed while the code
+under them was broken — the star-row guard pin matched an identical expression 80 lines away, and
+the regex pin matched the old pattern quoted in its own explanatory comment. Source pins must
+strip comments and assert PROXIMITY. Both were caught only by revert-proofing.
+
+**STILL TO DO (owner-gated):** land/abandon the concurrent session → commit → deploy both services
+→ run `node scripts/backfillBrandReviews.js` (dry run first; owner approved apply-to-all) → $0
+re-title of AllBirds `6a70c584f33c6cfd76d43e54` + GymShark `6a70cf95f33c6cfd76d46b6b` (both
+confirmed to hold paid masters) → frame-check the proof beat after settle (~4.6s) at native res.
+NOTE the brand-quote path cannot be validated by re-title alone: `primary_quote` is baked in at
+ASSEMBLY time, so those media need a `buildLayoutInput` rebuild first.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |
@@ -634,6 +831,156 @@ The star gate makes `social_proof_led` ineligible below 4.5; the existing
 `FALLBACK_ORDER` (`staticAdIntents.js:347`) handles it — `product_first_lifestyle` is always
 eligible. `badges:['top rated']` deliberately left at `>= 4.5`: different concept, and
 `buildIntentData` does not pass `proof_badges` to intent text anyway.
+
+### 0.29997 COST LEDGER — the grounded-search path was invisible (2026-08-03)
+
+`geminiSearchProvider.lookupBrandReviews` / `lookupProductReviews` hit the RAW
+`generativelanguage` REST endpoint with axios, so they bypassed `atlasLlmService` and
+ledgered **nothing** — while the sibling GPT-4.1 tier in the same `brandEnrichmentService`
+appeared on every spend report. Each function is **two** billable POSTs (grounded
+`google_search` pass, then a JSON-structuring pass), on every brand/product enrichment run.
+Now ledgered via a single `trackedGenerate()` helper → `costTracker.trackLlmCall`,
+`stage:'brand_reviews'|'product_reviews'`, `purposeTag:'grounded_search'|'json_structure'`,
+with brandId/productId threaded from all four call sites.
+
+**Three things a plain wrap would have gotten wrong — all verified live, not assumed:**
+
+- **Grounding is billed PER REQUEST, not per token, and it dominates.** $35/1,000 grounded
+  prompts = $0.035, against ~$0.004 of tokens. Token-only math understates this path **~10x**.
+  New `costTracker.GROUNDED_SEARCH_COST_PER_REQUEST_USD` + `CostLog.groundedRequests`.
+  **Per-PROMPT billing is a 2.5-era rule** — Google bills Gemini 3 per executed *query*, so a
+  model bump changes the unit.
+- **`MODEL_RATES['gemini-2.5-flash']` was wrong: 0.10/0.40 are Flash-LITE numbers.** Live is
+  **0.30/2.50/0.03**. Every direct-flash row understated input 3x, output 6x. The Atlas sibling
+  `google/gemini-2.5-flash` already carried the right values, which is what gave it away.
+  ⚠️ **Expect a step change in flash spend reports — it is the fix, not a regression.**
+- **`extractUsage` counted `candidatesTokenCount` only.** Gemini reports `thoughtsTokenCount`
+  separately but bills it at the OUTPUT rate, and 2.5 thinks by default (pass 1 sets no
+  thinkingBudget). `toolUsePromptTokenCount` also added — ~1% of a row, and Google does *not*
+  explicitly document it as billable, so the comment says so honestly.
+
+`scripts/verifyGeminiSearchCost.js` — 20 checks, offline (axios + `CostLog.create` stubbed),
+**revert-proven against 6 separate mutations**. Suite now **39/39 green**.
+
+**Adversarial pass (Grok, high effort) — two findings accepted, both now pinned in code:**
+its `toolUsePromptTokenCount` challenge was fair (unproven → comment made honest), and the
+error path ledgers **$0 even for a grounded call that may have been billed**. That is
+*pre-existing* `trackLlmCall` behaviour for every consumer; fixing it means distinguishing
+"never left the box" from "server answered / we timed out" — shared error semantics, out of
+scope. **Deliberately pinned in harness check C7 so it stays a decision, not an accident.**
+
+**Two policy calls left to the owner** (both one-liners): the free **1,500 grounded
+prompts/day** allowance means $0.035 *overstates* until it is exhausted —
+`GEMINI_GROUNDING_COST_USD=0` ledgers the free tier honestly; and
+**`MODEL_RATES['gemini-2.5-pro']` output is ALSO stale** (5.00 vs live 10.00, caching 0.31 vs
+0.125), understating `layoutInputService` 2x — left untouched on purpose, flagged in-code.
+
+**Still unledgered, same class:** `geminiSearchProvider.match` (every detect run!),
+`.lookupBrandCategoryUrl`, `categoryReviewsService`, `productDetailsService` — all POST the
+same raw endpoint with no tracking and no `maxRedirects:0`.
+
+⚠️ **These edits sit in the `fix/remotion-font-fatal-load` working tree**, on top of that
+branch's own uncommitted work. Nothing was committed. Six files + one new script; the cost
+change is separable from the font fix if you want it on its own branch.
+
+---
+
+## 0.1 THROUGHPUT WORK — 2026-08-03 PM (uncommitted, suite 40/40 green)
+
+Owner question that started it: *"why are these generation runs taking so long?"* — asked
+while looking at the **activity log**, not at wall-clock. Two distinct answers came out of
+it, and both are now addressed in the working tree.
+
+### Where the time actually goes (MEASURED, run `…b9f4a5d1`, 1 video + 3 statics, 1:1)
+
+Cost-ledger + `renderStage` waterfall, 12m38s end to end, run finished `succeeded=4`:
+
+| window | stage |
+|---|---|
+| 0:00–1:42 | copy LLM calls, ad expansion (ads created 1:42) |
+| 1:42–3:48 | quote grounding + layoutInput derivation |
+| **3:48–9:07** | **reference reframe — 5m19s, 42% of the run.** 3 outpaints submitted in parallel by our code but the ledger shows them completing ~2m15s APART — the `-developer` tier serializes per account |
+| 9:07–11:52 | Omni $1 master, 2m45s (normal, irreducible) |
+| 11:52–12:38 | download, face-safe crop, Remotion titling, upload — **46s total** |
+
+Statics all finished by minute 5, fully overlapped. Earlier same-day runs measured 293s /
+304s per video and 88–133s per static — those were **cache-warm** on reframes. Cold vs warm
+reframe IS the 5-vs-13-minute spread; nothing was ever stuck.
+
+Prod reframe-method distribution (226 Media, 242 entries): 9:16 → **137 outpaint / 70
+product-only pad / 1 exact**; 1:1 → 8/1/2; 3:4 → 9/14/0. So ~66% of 9:16 refs go generative.
+
+### Owner constraints stated during this work — do not violate
+
+- **"I don't want to change the cropping logic for video, its working well now."** The
+  reframe ladder and every crop path are UNTOUCHED. Do not "optimise" them.
+- **"No generative unless a video is requested — I don't want to run the entire catalog
+  through it."** Prewarm-at-catalog-ingest was proposed, then **KILLED**. Generative work
+  stays scoped to products someone is actively making a video from.
+- Only the generative outpaint rung is billable / developer-tier; exact-fit and
+  product-only-pad are Cloudinary URL rewrites, $0, milliseconds.
+
+### (a) Wizard-triggered reference prewarm — NEW
+
+Starts the SAME reframes when the operator begins configuring a video, so the paid run
+finds a warm cache. `services/videoRefPrewarmService.js` (reuses `buildReferenceImages`,
+so all cache/claim/billing guards apply unchanged), `POST /api/ads/video-ref-prewarm`
+(`routes/ads.js`, above `/:id`, 202-then-background, `requireAuth`),
+frontend `Step2Picker.tsx` 1.5s-debounced fire-and-forget.
+`scripts/verifyVideoRefPrewarm.js` — 39 checks, 3 revert-proven.
+
+Verified by hand, not assumed: every Meta video aspect resolves to 9:16 via
+`omniFamilyNativeFor`, so the prewarm warms the SAME cache key the run reads; and the only
+billable path reachable from the service is the reframe ladder (`categoryChainService` is
+DB-only, `resolveModelAndAspect`/`resolveReferenceImageCount` are pure).
+
+Adversarial pass found and we fixed: **unbounded spend** (authenticated but unthrottled;
+~$2.88/request, no rate limit → `VIDEO_REF_PREWARM_BRAND_HOURLY_CAP=24` rolling per-brand
+ceiling, claimed immediately before the billable call so DB reads never consume it) and a
+**dead-holder stall** (a Generate racing a prewarm killed mid-deploy burned ~6 min then
+cropped anyway → `waitForReframeUrl` now exits early when the claim entry is gone or its
+lease aged out). Also clamped `REFRAME_CLAIM_WAIT_ATTEMPTS` so its sleep span can never
+outlive `REFRAME_CLAIM_TTL_MS` (past the lease a third process may steal and bill).
+
+KNOWN LIMITS (documented in the service header, not bugs): warms the feed-order-hero stack
+only, so a run with explicit operator `seedPicks` may still cold-reframe its lifestyle
+primary; no-op for products with only `CatalogProduct.imageUrl` and no catalog Media
+(materialising means billable detect vision).
+
+### (b) Concurrent generations — the activity-log complaint
+
+Owner: *"the system is preventing me from starting a new generation when any ad from the
+campaign is currently being generated"* → *"i want to make things as parallel as possible."*
+The gate was ONE run per campaign for any `preparing|running` row younger than
+`REAP_STALE_MIN`. Now product-set aware — see CLAUDE.md §2 for the load-bearing rules
+(`services/generationGate.js`, `scripts/verifyGenerationGate.js` 65 checks, 4
+revert-proven). Disjoint product sets run in parallel; overlap still blocks; `/runs` now
+declares its scope from the ads it claimed so a drain no longer blocks Generates.
+
+**Premise worth keeping straight:** the atomic `status:'queued'` claim does NOT protect
+against a double-click — each run mints its own ads under a run-scoped digest, so there is
+no row to race for. The gate is the only protection, which is why mint-then-verify was
+added for the read-then-write window.
+
+**Not yet raised: `VEO_CONCURRENCY` (4) / `RENDER_CONCURRENCY` (8).** Concurrent runs now
+multiply in-flight submits on their own (pools are per-process, `pacedModelSubmit` spacing
+is per-process and in-memory). `services/concurrency.js` says re-measure before going
+higher; do that with real 429 observation rather than raising blind.
+
+Adversarial pass on the gate raised 11 findings. Fixed in-tree: **ObjectId-shape validation**
+(a client posting `[{id:P}]` stamped `'[object Object]'`, read as disjoint from a real `[P]`
+→ both expand and bill; `normalizeProductIdList` is now all-or-nothing, an unreadable entry
+voids the list so it fails closed), **the wedged-`preparing` money path** (a run past the
+stale window stops holding its products; it now re-reads its own status and aborts before
+`expandWizardJob`, so waking up late costs nothing), **zombie loser** (the superseded run's
+status write no longer swallows errors — on failure the row is deleted rather than left
+locking its own products), **`/runs` scope**, and a **compound index** for the gate query
+(it runs twice per generation). Deferred with reasoning as tasks #17 (global in-flight caps
+— the real cost of parallel runs), #18 (reap stale `preparing`), #19 (legacy
+`seedsFromMedia` can mint ads outside the stamped scope).
+
+Explicitly NOT a double-bill, verified: a rejected/429'd submit is not charged, and
+`/runs`'s atomic claim still means one owner per ad row.
 
 ---
 

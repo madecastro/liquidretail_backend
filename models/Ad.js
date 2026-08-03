@@ -266,15 +266,19 @@ const adSchema = new mongoose.Schema({
   // architecture problem"). Until then it is the audit trail that turns a silent
   // double-bill into a visible orphan.
   veoPredictionId:    { type: String, default: null },
-  // Face-safe base-plate crop, computed by services/basePlateCropService.js before Remotion
-  // titling. Shape: { version, format, sourceUrl, videoUrl|null, rect?, sourceW?, sourceH?,
-  // frames?, faceHits?, envelope?, reason?, computedAt }.
+  // Face-safe base-plate crop + face keep-out cache, computed by
+  // services/basePlateCropService.js before Remotion titling. Shape:
+  // { version, format, sourceUrl, videoUrl|null, rect?, sourceW?, sourceH?,
+  //   frames?, faceHits?, envelope?, faceSamples?, facesComputed?, reason?, computedAt }.
   //   videoUrl non-null -> the liveness-probed Cloudinary c_crop derivative titling consumes
   //   videoUrl null     -> a persisted SKIP (reason says why) so re-titles don't re-pay detection
+  //   faceSamples/envelope/facesComputed -> vision boxes (SOURCE fractions 0..1) reused by
+  //     title keep-out (applyFaceKeepOut) so a second detect is never paid for the same master
   // BINDING INVARIANT: only honoured when sourceUrl === the ad's CURRENT veoVideoUrl — a
   // regenerated base video must never ship a crop of footage the operator replaced. The consumer
-  // (basePlateCropService.resolveBasePlateVideoUrl) enforces this; anything that rewrites
-  // veoVideoUrl can leave this stale without harm, but SHOULD clear it to save a wasted lookup.
+  // (basePlateCropService.resolveBasePlateVideoUrl / ensureFaceDetectionForKeepOut) enforces
+  // this; anything that rewrites veoVideoUrl can leave this stale without harm, but SHOULD clear
+  // it to save a wasted lookup.
   basePlate:          { type: mongoose.Schema.Types.Mixed, default: null },
   veoReferenceImages: { type: [String], default: [] },  // exact reference-image stack sent to the model (pos 0 = seed, then product hero + alts) — for the generation inspector
   // GPT-composed structured storyboard. Null when VEO_USE_GPT_STORYBOARD

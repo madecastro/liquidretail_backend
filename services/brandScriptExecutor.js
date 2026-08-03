@@ -710,8 +710,49 @@ async function buildMetaForAd(ad, brand) {
   let layoutInput = null;
   try {
     const LayoutInputArtifact = require('../models/LayoutInputArtifact');
-    layoutInput = await LayoutInputArtifact.findOne({ mediaId: ad.mediaId }).sort({ createdAt: -1 }).lean();
-  } catch { /* optional */ }
+    const { INPUT_SCHEMA_VERSION } = require('./layoutInputService');
+    // productId must be part of the match: on media carrying several
+    // products, the createdAt race can hand this ad ANOTHER product's
+    // copy/quote. LayoutInputArtifact.productId defaults to `null` (never
+    // undefined — see models/LayoutInputArtifact.js), so `ad.productId ||
+    // null` matches both a real id and the legacy/no-product artifacts —
+    // same shape atlasVideoService.js already re-reads with.
+    //
+    // Schema freshness is a PREFERENCE, not a filter. Requiring
+    // schemaVersion === INPUT_SCHEMA_VERSION in the query looks safer but is
+    // a regression: 722 of 738 production artifacts are pre-4.1, and TEN meta
+    // fields take layoutInput as their FIRST cascade source — including
+    // `rating` and `reviewCount` themselves, plus deliveryLine, badgeText,
+    // badges, benefits, productDescription. Dropping a stale artifact
+    // outright would thin the canonical close phase AND delete the very
+    // stars this change exists to restore.
+    // It buys nothing either: the stale artifact's only unsafe field is the
+    // unstamped primary_quote, and gateLayoutInputQuotes (below) already
+    // withholds exactly that — 161 checks in verifyQuoteProvenance.js pin it.
+    // So: prefer a current-schema artifact, fall back to the newest stale one,
+    // and log which we served so a thin proof beat is diagnosable from Render
+    // logs without a DB query.
+    const productIdKey = ad.productId || null;
+    const scope = { mediaId: ad.mediaId, productId: productIdKey };
+    layoutInput = await LayoutInputArtifact.findOne({
+      ...scope,
+      schemaVersion: INPUT_SCHEMA_VERSION
+    }).sort({ createdAt: -1 }).lean();
+
+    if (!layoutInput) {
+      layoutInput = await LayoutInputArtifact.findOne(scope).sort({ createdAt: -1 }).lean();
+      console.log(
+        layoutInput
+          ? `📐 buildMetaForAd[ad=${ad._id}]: layoutInput STALE (schemaVersion=${layoutInput.schemaVersion || 'unstamped'} ` +
+            `want=${INPUT_SCHEMA_VERSION}) — serving non-quote fields; quote withheld by the provenance gate. Re-derive to restore it.`
+          : `📐 buildMetaForAd[ad=${ad._id}]: no layoutInput for (mediaId=${ad.mediaId} productId=${productIdKey}) — degrading to ad.copy`
+      );
+    }
+  } catch (err) {
+    // Prefer a thinner ad over a crash — Atlas video is already billed by
+    // the time titling runs.
+    console.log(`buildMetaForAd[ad=${ad._id}]: layoutInput lookup failed (${err.message}) — degrading to ad.copy`);
+  }
 
   // Video dual-gate: strip non-printable primary_quote before cascade.
   layoutInput = gateLayoutInputQuotes(layoutInput);
@@ -783,13 +824,35 @@ async function buildMetaForAd(ad, brand) {
   const brandPair = brand?.brandReviews && typeof brand.brandReviews === 'object'
     ? brand.brandReviews
     : null;
+  // Only let a failing/missing rating still show the brand COUNT when the
+  // quote riding alongside it is ALSO brand-tier (both from the same
+  // Brand.brandReviews snapshot) — a product-tier quote next to a brand
+  // count is the exact cross-tier mix the atomic-pair invariant above
+  // exists to forbid.
+  //
+  // Testing primary_quote.tier ALONE is not enough, and this is the subtle
+  // part: the rendered quote is `cascaded.quote`, whose cascade puts
+  // `ad.copy.quote` FIRST and layoutInput's primary_quote SECOND
+  // (metaCascadeConfig.js). So an ad carrying an operator-edited or stale
+  // ad.copy.quote renders THAT, while primary_quote.tier still says 'brand' —
+  // which would hang a brand-wide review count off a product-specific line
+  // that never went through the provenance gate at all.
+  // Require the brand quote to be the one that actually prints.
+  const pq = layoutInput?.input?.social_proof?.primary_quote;
+  const brandQuoteText = pq?.tier === 'brand' ? String(pq.text || '').trim() : '';
+  const renderedQuote = String(cascaded.quote || '').trim();
+  const allowBrandCountWithoutStars = !!brandQuoteText && renderedQuote === brandQuoteText;
   const ratingPair = resolveAtomicRatingPair({
     productRating:      cascaded.rating,
     productReviewCount: cascaded.reviewCount,
     brandRating:        brandPair?.rating ?? null,
     brandReviewCount:   brandPair?.reviewCount ?? null,
     brandAttribution:   brandAttributionLabel(brand),
+    allowBrandCountWithoutStars,
   });
+  console.log(
+    `ratingPair: source=${ratingPair.source || 'none'} rating=${ratingPair.rating || 'none'} count=${ratingPair.reviewCount ?? 'none'}`
+  );
   const rating = ratingPair.rating;
   const reviewsText = ratingPair.reviewsText;
 

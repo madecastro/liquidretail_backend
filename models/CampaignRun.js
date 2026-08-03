@@ -22,6 +22,17 @@ const campaignRunSchema = new mongoose.Schema({
   campaignId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', required: true, index: true },
   campaignKind: { type: String, default: null },
 
+  // The productIds this run was ASKED for, stamped at mint time (before the
+  // background expansion runs, which is the whole point — the concurrency gate
+  // in POST /generate has to make its decision while this run is still
+  // 'preparing' and `perProduct` is necessarily empty).
+  //
+  // Load-bearing for money: services/generationGate.js allows a second
+  // concurrent run only when its product set is DISJOINT from every in-flight
+  // run's. An empty/absent array here means "scope unknown" and blocks — so do
+  // not stop writing it, and do not backfill it with a guess.
+  requestedProductIds: { type: [String], default: [] },
+
   total:        { type: Number, default: 0 },
   succeeded:    { type: Number, default: 0 },
   skipped:      { type: Number, default: 0 },
@@ -97,5 +108,10 @@ const campaignRunSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 campaignRunSchema.index({ brandId: 1, createdAt: -1 });
+// The /generate concurrency gate runs this exact shape twice per request
+// (pre-check, then mint-then-verify): campaignId + in-flight status + the stale
+// window. Separate campaignId/status indexes make it a scan over the campaign's
+// whole run history, and this query sits in front of every generation.
+campaignRunSchema.index({ campaignId: 1, status: 1, createdAt: -1 });
 
 module.exports = mongoose.model('CampaignRun', campaignRunSchema);

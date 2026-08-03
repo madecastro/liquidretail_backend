@@ -12,6 +12,7 @@ const axios = require('axios');
 // Narrative summaries were cut with slice(0, 200), which ends mid-word. Prefer
 // whole sentences and fall back to a word-boundary cut.
 const { truncateWords } = require('../../utils/htmlEntities');
+const { trackLlmCall } = require('../costTracker');
 
 /**
  * stampLlmQuotes(rows, scope) → quote[]
@@ -52,6 +53,52 @@ const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODE
 const PROVIDER_NAME = 'gemini-search';
 
 function isEnabled() { return !!process.env.GEMINI_API_KEY; }
+
+/**
+ * trackedGenerate — the ledgered generateContent transport.
+ *
+ * These are billable calls against the raw generativelanguage REST API, which
+ * is not behind atlasLlmService, so nothing ledgered them: brand-reviews and
+ * product-reviews spend was invisible in CostLog while the sibling GPT-4.1 tier
+ * in brandEnrichmentService showed up on every report.
+ *
+ * Two things this has to get right that a naive wrap does not:
+ *
+ *  1. **Return `res.data`, not the axios response.** costTracker.extractUsage
+ *     reads `usageMetadata` off the object the fn resolves to, and on raw REST
+ *     that lives on the response BODY. Returning the axios envelope logs a row
+ *     with 0 tokens and $0 — worse than no row, because it looks measured.
+ *
+ *  2. **Declare grounding.** Google bills Search grounding per REQUEST on top
+ *     of tokens ($35/1,000 prompts). A grounded pass here is ~$0.004 of tokens
+ *     and ~$0.035 of grounding, so `grounded` is most of the true cost, not a
+ *     rounding detail. See costTracker.GROUNDED_SEARCH_COST_PER_REQUEST_USD.
+ *
+ * `ledger` carries the linkage ids (brandId / productId) so these rows join
+ * back to a brand the way every other CostLog row does.
+ */
+async function trackedGenerate({ stage, purposeTag, grounded, ledger }, body, timeout = 30000) {
+  return trackLlmCall(
+    {
+      stage,
+      provider:   'gemini',
+      model:      MODEL,
+      purposeTag,
+      groundedRequests: grounded ? 1 : 0,
+      ...(ledger || {})
+    },
+    async () => {
+      const r = await axios.post(
+        `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+        body,
+        // maxRedirects:0 per CLAUDE.md §2 — axios defaults to 21 and re-sends
+        // the body on 307/308, which is a silent double charge inside one call.
+        { timeout, maxRedirects: 0 }
+      );
+      return r.data;
+    }
+  );
+}
 
 async function match({ brand, category, caption, primarySubject, textDetected = [], cropImageUrl = null }) {
   if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
@@ -229,11 +276,14 @@ async function lookupBrandCategoryUrl({ brandUrl, brandName, label, category }) 
 // formatting requests when the google_search tool is enabled), so we
 // run a second plain call with responseMimeType: application/json to
 // structure the narrative into typed fields.
-async function lookupBrandReviews({ brandName, brandUrl }) {
+async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
   if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
   if (!brandName) return null;
 
   const t0 = Date.now();
+  // Linkage for the cost ledger. brandId is optional — a caller that hasn't
+  // resolved a Brand row still gets a row, just without the join.
+  const ledger = { brandId, cacheKey: brandName };
 
   // ── Pass 1: grounded narrative ──
   const searchPrompt =
@@ -245,23 +295,22 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
     `overall average star rating (0-5) and approximate total review count if you can see them, ` +
     `plus a one-sentence summary of the brand's reputation. Write naturally — do not format as JSON.`;
 
-  let searchRes;
+  let searchData;
   try {
-    searchRes = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+    searchData = await trackedGenerate(
+      { stage: 'brand_reviews', purposeTag: 'grounded_search', grounded: true, ledger },
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
         generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
-      },
-      { timeout: 30000 }
+      }
     );
   } catch (err) {
     console.warn(`   ⚠️  brand-reviews search failed: ${err.message}`);
     return null;
   }
 
-  const searchCand = searchRes.data?.candidates?.[0];
+  const searchCand = searchData?.candidates?.[0];
   const narrative = (searchCand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
   const sourceDomains = (searchCand?.groundingMetadata?.groundingChunks || [])
     .map(c => c.web?.uri && extractDomain(c.web.uri))
@@ -291,10 +340,10 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
     `}\n` +
     `Use direct quotes verbatim from the narrative; do NOT paraphrase or invent quotes that aren't present.`;
 
-  let structRes;
+  let structData;
   try {
-    structRes = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+    structData = await trackedGenerate(
+      { stage: 'brand_reviews', purposeTag: 'json_structure', grounded: false, ledger },
       {
         contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
         generationConfig: {
@@ -332,15 +381,14 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
             required: ['quotes']
           }
         }
-      },
-      { timeout: 30000 }
+      }
     );
   } catch (err) {
     console.warn(`   ⚠️  brand-reviews structuring failed: ${err.message}`);
     return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
-  const structCand = structRes.data?.candidates?.[0];
+  const structCand = structData?.candidates?.[0];
   const jsonText = (structCand?.content?.parts || []).map(p => p.text || '').join('').trim();
 
   let parsed = null;
@@ -372,12 +420,14 @@ async function lookupBrandReviews({ brandName, brandUrl }) {
 // lookupBrandReviews — pass 1 grounded search returns prose, pass 2
 // plain Gemini call structures it as JSON. Shape mirrors
 // lookupBrandReviews so caller code can use identical render logic.
-async function lookupProductReviews({ productName, brandName, productUrl }) {
+async function lookupProductReviews({ productName, brandName, productUrl, brandId = null, productId = null }) {
   if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
   if (!productName) return null;
 
   const t0 = Date.now();
   const productLabel = brandName ? `${brandName}'s "${productName}"` : `"${productName}"`;
+  // Linkage for the cost ledger; both ids are optional (see lookupBrandReviews).
+  const ledger = { brandId, productId, cacheKey: productName };
 
   // ── Pass 1: grounded narrative ──
   const searchPrompt =
@@ -390,23 +440,22 @@ async function lookupProductReviews({ productName, brandName, productUrl }) {
     `and approximate review count if visible, plus a one-sentence summary of how reviewers feel ` +
     `about this specific product. Write naturally — do not format as JSON.`;
 
-  let searchRes;
+  let searchData;
   try {
-    searchRes = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+    searchData = await trackedGenerate(
+      { stage: 'product_reviews', purposeTag: 'grounded_search', grounded: true, ledger },
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
         generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
-      },
-      { timeout: 30000 }
+      }
     );
   } catch (err) {
     console.warn(`   ⚠️  product-reviews search failed: ${err.message}`);
     return null;
   }
 
-  const searchCand = searchRes.data?.candidates?.[0];
+  const searchCand = searchData?.candidates?.[0];
   const narrative = (searchCand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
   const sourceDomains = (searchCand?.groundingMetadata?.groundingChunks || [])
     .map(c => c.web?.uri && extractDomain(c.web.uri))
@@ -434,10 +483,10 @@ async function lookupProductReviews({ productName, brandName, productUrl }) {
     `}\n` +
     `Use direct quotes verbatim from the narrative; do NOT paraphrase or invent quotes that aren't present.`;
 
-  let structRes;
+  let structData;
   try {
-    structRes = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+    structData = await trackedGenerate(
+      { stage: 'product_reviews', purposeTag: 'json_structure', grounded: false, ledger },
       {
         contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
         generationConfig: {
@@ -476,15 +525,14 @@ async function lookupProductReviews({ productName, brandName, productUrl }) {
             required: ['quotes']
           }
         }
-      },
-      { timeout: 30000 }
+      }
     );
   } catch (err) {
     console.warn(`   ⚠️  product-reviews structuring failed: ${err.message}`);
     return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
-  const structCand = structRes.data?.candidates?.[0];
+  const structCand = structData?.candidates?.[0];
   const jsonText = (structCand?.content?.parts || []).map(p => p.text || '').join('').trim();
 
   let parsed = null;

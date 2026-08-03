@@ -323,7 +323,12 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
   // Internal choreography is relative to the slot's own enterAtSec (group
   // enter transition is already applied by Canonical around this renderer).
   const localFrame = ratingLocalFrame(frame, fps, slot.timing?.enterAtSec ?? 0, timeScale);
-  const countStartSec = lastStarLandSec(); // ~0.58s — after 5th star lands
+  // Reviews line normally waits for the 5th star to land (~0.58s) so the
+  // count-up doesn't roll while stars are still popping in. When rating is
+  // null (owner's ">4.5 stars only" rule suppressed a real-but-low rating,
+  // e.g. GymShark 3.3★/41k reviews) there are no stars rendered at all, so
+  // there is nothing to wait for — start right at the slot's own enter.
+  const countStartSec = rating != null ? lastStarLandSec() : 0;
   const parsed = reviewsText ? parseReviewsLeadingNumber(reviewsText) : null;
 
   let reviewsNode = null;
@@ -382,6 +387,12 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
 
   // Lockup: stars+score on line 1; reviewsText UNDER as line 2 (same max
   // width). No reviewsText → stars+score only (unchanged empty behaviour).
+  // rating === null → no stars / no score row at all: StarRow's labelFill
+  // is Math.min(count, Math.max(0, Number(rating) || 0)), so feeding it a
+  // null rating would silently draw FIVE EMPTY STARS — worse than nothing
+  // for a brand the owner's rule deliberately suppressed. Skip the whole
+  // row instead (not just hide it) so there's no leftover flex gap above
+  // the reviews line.
   return (
     <div
       style={{
@@ -393,26 +404,28 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
         maxWidth: '100%',
       }}
     >
-      <div
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: Math.round(dims.width * 0.016),
-        }}
-      >
-        <StarRow
-          color={tokenColor(tokens, 'stars')}
-          size={Math.round(size * 1.15)}
-          gap={Math.round(size * 0.15)}
-          rating={rating}
-          count={STAR_COUNT}
-          localFrame={localFrame}
-          fps={fps}
-        />
-        <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
-          {rating.toFixed(1)}/5
-        </span>
-      </div>
+      {rating != null ? (
+        <div
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: Math.round(dims.width * 0.016),
+          }}
+        >
+          <StarRow
+            color={tokenColor(tokens, 'stars')}
+            size={Math.round(size * 1.15)}
+            gap={Math.round(size * 0.15)}
+            rating={rating}
+            count={STAR_COUNT}
+            localFrame={localFrame}
+            fps={fps}
+          />
+          <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
+            {rating.toFixed(1)}/5
+          </span>
+        </div>
+      ) : null}
       {reviewsNode}
     </div>
   );

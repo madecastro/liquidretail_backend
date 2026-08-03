@@ -77,6 +77,11 @@ const costLogSchema = new mongoose.Schema({
   outputTokens: { type: Number, default: 0 },
   cachedInputTokens: { type: Number, default: 0 },   // OpenAI prompt-cache hits
   visionImages: { type: Number, default: 0 },        // count of image_url parts (cost driver)
+  // Count of Google-Search-grounded requests in this call. Google bills
+  // grounding PER REQUEST on top of tokens ($35/1,000 grounded prompts), so
+  // this is the multiplier behind the non-token part of costUsd — recorded so
+  // a row whose dollars dwarf its token count is explicable rather than suspect.
+  groundedRequests: { type: Number, default: 0 },
   costUsd:      { type: Number, default: 0 },        // best-effort; computed from token counts × model rate
   durationMs:   { type: Number, default: 0 },
 

@@ -1420,6 +1420,16 @@ const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.5);
 // them and reports the gap; set true once coverage is good.
 const QUOTE_REQUIRE_RATING = String(process.env.QUOTE_REQUIRE_RATING || 'false').toLowerCase() === 'true';
 
+// Brand-tier review quotes are catalog-wide (see the isProductScoped guard
+// below): on a product-scoped ad they used to be withheld outright, so a
+// brand with zero product/category-level reviews rendered no testimonial at
+// all even when it had brand reviews to spare. Default ON (owner decision,
+// 2026-08-03): let brand quotes serve as a LAST-RESORT fallback on product
+// ads — below product, category, AND product-scoped comments — rather than
+// showing nothing. Set false to restore the old withhold-entirely behavior
+// without a deploy.
+const QUOTE_BRAND_TIER_FALLBACK = String(process.env.QUOTE_BRAND_TIER_FALLBACK || 'true').toLowerCase() === 'true';
+
 function gateQuotesByRating(candidates, tierName) {
   if (!Array.isArray(candidates) || !candidates.length) return [];
   let rated = 0, dropped = 0, unrated = 0;
@@ -2007,24 +2017,38 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // bought, which on a multi-SKU brand is usually NOT this product. Rendering
   // one under this product's photo presents another item's praise as if it
   // were about this one — a leggings review as the testimonial on a tee ad.
-  // Brand reviews therefore only back a BRAND ad, where no single product is
-  // being claimed. A product ad with no product- or category-level review
-  // shows no testimonial, which is the honest result.
+  // Brand reviews therefore only back a BRAND ad outright — on a product ad
+  // they are demoted to a LAST-RESORT fallback (QUOTE_BRAND_TIER_FALLBACK,
+  // default on): they may still win, but only when product, category, AND
+  // product-scoped comments all yielded nothing, so a brand with zero
+  // product-level proof isn't left with no testimonial at all. Set the flag
+  // false to restore the pre-2026-08-03 behavior of withholding brand quotes
+  // from product ads entirely, without a deploy.
   // catalogProductId is the FK on ProductMatchArtifact (:78) and is what the
   // rest of this file tests product scope with (:653, :1850). The nested
   // identification.details.catalogProductId is NOT hydrated —
   // productMatchHydration rebuilds that object from the CatalogProduct's
   // commerce fields and never writes an id onto it — so reading it here would
   // have left isProductScoped false on real product ads and leaked the brand
-  // quotes this guard exists to withhold.
+  // quotes this guard exists to demote.
   const isProductScoped = !!(ctx.match?.catalogProductId || ctx.match?.identification?.details?.catalogProductId);
   const brandReviewsContainer = ctx.match?.brandReviews || ctx.brand?.brandReviews || null;
   const brandQuotesRaw = (brandReviewsContainer?.quotes || []);
-  const tierBrand = isProductScoped
+  // Withhold entirely only when this IS a product ad AND the fallback flag is
+  // off (the old behavior, kept as the revert path). Otherwise brand quotes
+  // go through the SAME gates as every other tier — stampOrigin →
+  // printableOnly (toPrintableCustomerQuote) → gateQuotesByRating — no second
+  // allowlist. Ranking (last-resort on product ads vs. legitimate top-tier
+  // proof on brand ads) is enforced below, at pick time, not by hiding the
+  // pool here.
+  const withholdBrandOnProductAd = isProductScoped && !QUOTE_BRAND_TIER_FALLBACK;
+  const tierBrand = withholdBrandOnProductAd
     ? []
     : gateQuotesByRating(printableOnly(stampOrigin(brandReviewsContainer, brandQuotesRaw), 'brand'), 'brand');
-  if (isProductScoped && brandQuotesRaw.length) {
-    console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk)`);
+  if (withholdBrandOnProductAd && brandQuotesRaw.length) {
+    console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk; QUOTE_BRAND_TIER_FALLBACK=false)`);
+  } else if (isProductScoped && brandQuotesRaw.length) {
+    console.log(`🔓 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) demoted to last-resort on a product ad (cross-product risk; wins only if product/category/comment tiers are empty)`);
   }
   const tierComment  = printableOnly(await loadBrandCommentsForQuotePool(ctx), 'comment');
 
@@ -2050,15 +2074,40 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   }
 
   const pickedProduct  = pickStrongestQuote(tierProduct);
-  const pickedCategory = pickedProduct  ? null : pickStrongestQuote(tierCategory);
-  const pickedBrand    = pickedProduct || pickedCategory ? null : pickStrongestQuote(tierBrand);
-  const pickedComment  = pickedProduct || pickedCategory || pickedBrand ? null : pickStrongestQuote(tierComment);
+  const pickedCategory = pickedProduct ? null : pickStrongestQuote(tierCategory);
+  // Precedence forks here on ad type, and ONLY here:
+  //
+  // - Product ad (isProductScoped): product -> category -> comment -> brand.
+  //   Brand is dead last — comment outranks it — because comment quotes are
+  //   already product-scoped (loadBrandCommentsForQuotePool) while brand
+  //   quotes are catalog-wide cross-product risk. Brand only wins when
+  //   product, category, AND comment all yielded nothing.
+  // - Brand ad (!isProductScoped): product -> category -> brand -> comment,
+  //   UNCHANGED from before this change. No product is being claimed, so a
+  //   brand-tier review is legitimate top-tier proof and still outranks a
+  //   comment, same as it always has.
+  let pickedBrand;
+  let pickedComment;
+  if (isProductScoped) {
+    pickedComment = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierComment);
+    pickedBrand   = (pickedProduct || pickedCategory || pickedComment) ? null : pickStrongestQuote(tierBrand);
+  } else {
+    pickedBrand   = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierBrand);
+    pickedComment = (pickedProduct || pickedCategory || pickedBrand) ? null : pickStrongestQuote(tierComment);
+  }
   let primaryQuote = pickedProduct || pickedCategory || pickedBrand || pickedComment || null;
   const quoteTier = pickedProduct  ? 'product'
                   : pickedCategory ? 'category'
                   : pickedBrand    ? 'brand'
                   : pickedComment  ? 'comment'
                   :                  null;
+  // This decision must stay visible in Render logs: brand tier winning a
+  // primary slot on a product ad is the fallback actually firing, not just
+  // being available. (Brand winning on a brand ad is the long-standing,
+  // unchanged path and isn't logged here.)
+  if (isProductScoped && quoteTier === 'brand') {
+    console.log(`🔓 quote scope — brand-tier quote WON as last-resort fallback on product ad (media=${media._id})`);
+  }
 
   // The synth fallback that used to sit here is gone with tier 6. It existed to
   // keep hero zones populated; an empty zone is the correct rendering of proof
@@ -3290,5 +3339,10 @@ module.exports = {
   // Exported so the provenance harness can pin: derivation prompt gets quote
   // TEXT for tone, never a byline/persona for anonymous-print origins.
   buildDerivationPrompt,
-  quoteLineForTonePrompt
+  quoteLineForTonePrompt,
+  // Exported so buildMetaForAd (brandScriptExecutor.js) can require a
+  // fresh-schema artifact instead of hardcoding '4.1' — a stale artifact
+  // carries pre-provenance UNSTAMPED quotes that the printability gate
+  // then withholds wholesale.
+  INPUT_SCHEMA_VERSION
 };
