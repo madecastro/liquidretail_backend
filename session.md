@@ -410,6 +410,138 @@ needsLicense holds wiped by re-ingest; commercial faces starving the ingest cap.
 footgun (not yet fixed): Title Studio still authors/previews persisted specs that renders now
 ignore — preview != ship; needs a UI warning.
 
+### 0.298 CANONICAL TITLING TEST — iteration log (2026-08-04 overnight; TEAM TESTS TOMORROW)
+
+**Owner deadline: canonical titles working by morning; the whole team tests static + video
+production.** Iterations, each frame-verified, all $0 re-titles of the same 12 pilot ads:
+
+- **v1 (PR #60):** 9-slot canonical worked (fonts, CTA, cleaned names, close on the reveal) but
+  proof phase ran empty when quote+rating were withheld, and white ink shipped on light plates.
+- **Ink root cause (PR #61):** the plate scan only ran for placement='content' — canonical
+  renders had plateHints=null so the contrast flip could NEVER fire. Scan now always on (render
+  + preview), kill switch intact. ALSO in #61: atomic brand-rating fallback
+  (`resolveAtomicRatingPair`, Brand.brandReviews same-snapshot pair, honest attribution, >4.5
+  gate, mixing bug pinned); camera-prompt subject-lock + Scene-3 return-to-primary + crossfade
+  policy; REPEAT_PRIMARY_REFERENCE (default true, cap 4 refs).
+- **v2 sheets (canon2):** ink flip fired (AllBirds dark Playfair on light wall ✓), stars+counts
+  live (Pelagic 5.0/5, Vuori 4.6/5 + 15,545 ✓), CTAs everywhere ✓. NEW defects: rating rows on
+  FACES (keep-out computed but never applied); ink flip inconsistent (Vuori white-on-light);
+  Vuori brandPill rendered a broken gradient box; "- Warm Red" / "| ..." suffixes; deliveryLine
+  faint.
+- **Iteration 2 (PR #62):** keep-out APPLIED (group shifts to first clear band, stable, logged
+  `keepOut:`); ink vote inputs fixed (band rects tightened to the real text strips — old top
+  band spanned 26% incl. faces; median luma; 5 sample times; logged `inkVote:`); deeper name
+  cleaning (parenthetical -> pipe -> dash-colorway w/ short-name guard); deliveryLine w600
+  primary ink. brandPill hidden by default everywhere (owner: Meta draws its own page identity;
+  doubly validated — Vuori's pill rendered broken).
+
+**Owner directions recorded:** multi-color type allowed when brand-tokened (per-group ink =
+NEXT iteration, deliberately not tonight); owner waits for the canon3 contact sheet; funnel
+variant A/B + 6-template pilot PARKED until canonical is approved (variants + protos exist and
+validate; sweep infra ready).
+
+**$1 REGENERATE (end-to-end pipeline test) — all green + one discovery:**
+- Ledger PROVEN live: `atlas_video_render | $1 | submitted` — the widened-enum fix recording
+  real video spend. Crop-vision rows ledgered (~$0.004).
+- Money guard observed live: renderUrl briefly = raw master (draft stamp) then titled.
+- Owner's prompt idea WORKED: "end on the FIRST reference image's view" -> front-on close, CTA
+  riding it. The structural repeat-primary version is deployed but has NEVER run a live
+  generation (regen predated #61) — MUST validate with one $1 regen before the team generates,
+  else flip REPEAT_PRIMARY_REFERENCE=false.
+- **NEW DEFECT CLASS: Omni mangles on-product wordmarks on zoom shots** — tongue label rendered
+  "wfoirds" in the 3.5s detail shot. Video-side proof of the vision-QC case (§0.2).
+
+**Ops learnings tonight (cost real time):** `nohup &` dies with the render-ssh PTY — use
+`setsid nohup ... < /dev/null &`. The BACKEND web service is MULTI-INSTANCE — a file written in
+one render-ssh session may not exist in the next; write+launch in ONE session, monitor via DB.
+The worker is single-instance and safe for long drivers. /tmp scripts can't require app
+modules (documented trap; bit again — run from /opt/render/project/src).
+
+### 0.299 TEAM-DAY READINESS — VALIDATED 2026-08-04 ~02:30 (read this first tomorrow)
+
+**Prod = `bb024b8` on both services. Suite 34/34. Canonical titling: WORKING, frame-verified
+in all four sizes** (final contact sheets delivered to owner ~02:05; canon3 = iteration-2
+build: keep-out off faces, consistent ink, cleaned names, legible deliveryLine, CTA everywhere,
+no brand pill).
+
+**Production validations run tonight (total ~$2.05):**
+- STATIC regenerate: 74s, healthy, logo composited, >4.5 star gate live (weak rating correctly
+  suppressed), NO invented emblem this sample. $0.01 ledgered `ok`.
+- VIDEO regenerate, DEFAULT PATH (empty prompt — exactly what the team clicks): **full pipeline
+  97s** (Omni was fast: submit 09:06:47Z -> master +52s -> titled +41s), $1 ledgered
+  `submitted`, **REPEAT-PRIMARY CONFIRMED LIVE** (1 distinct ref -> [primary, primary]), and
+  the close RETURNS TO THE FRONT-FACING PRIMARY VIEW with CTA + allbirds.com attribution.
+  NOTE a correction: an earlier in-session read that empty-prompt regens dedupe to $0 was
+  WRONG — the explicit regenerate route always regens fully (adRegenerateService: "video
+  always regens fully", effMode='full'). Every explicit video regenerate costs ~$1. The
+  accidental-double-click protection lives on the GENERATE path digest, not regenerate.
+- Earlier prompt-lever regen ($1): ending fixed via operator prompt; found Omni mangles
+  on-product wordmarks on zoom shots ("wfoirds") — vision-QC case, video-side proof.
+
+**KNOWN LIMITATION for tomorrow:** proof phase renders empty when a brand has neither a
+gate-passing quote nor a >4.5 rating pair (product or brandReviews). AllBirds sheet row shows
+it. Not a crash — just a quiet middle beat. Brand enrichment for GymShark/Peloton/Soludos2/
+Fellow would populate personas + brandReviews.
+
+**Grok CLI: re-authed by owner 2026-08-04 morning, probe verified (0.2.117).** (It had signed
+out overnight mid-session — auth sessions can expire; on `Not signed in`, fall back to
+subagents and tell the owner, don't retry.)
+
+**Efficiency audit** (owner-requested): two subagent audits over render + generation paths
+were in flight at handoff-write; findings land in this file / the conversation when done.
+Seeds already measured: webpack bundle rebuilt per driver invocation (4-10s), Chrome 91.9MB
+per fresh instance, plate scan now per-render (cacheable on Ad like basePlate crops),
+storyboard-LLM-on-regen possibly wasted on canonical path, fixed 15s Omni poll, video costs
+never reconciled to actuals (veoPredictionId is persisted; image reconcile pattern exists).
+
+**PARKED, awaiting owner:** funnel-variant A/B (presets exist + validate), 6-template pilot,
+full 367 sweep + persona scoring, AI endcard arm ($0.01/video), per-group brand-tokened ink
+(owner allowed multi-color), Title Studio preview!=ship warning.
+
+### 0.2995 EFFICIENCY AUDIT (owner-requested, 2026-08-04 night) — verified findings, NOT yet implemented
+
+Two subagent audits (Grok signed out), every load-bearing citation spot-checked by hand.
+Post-team-day work; nothing deployed. THREE of the audit's seed premises (mine) were WRONG and
+are corrected here so nobody re-chases them:
+
+- **Webpack bundle is ALREADY cached** — module-scope memo (`remotionRenderService.js:45-62`)
+  + @remotion/bundler filesystem cache (enableCaching default). The 4-10s observed was
+  warm-cache. The sweep driver is one process -> bundle paid ONCE per sweep. No fix needed;
+  just never chunk the sweep into many separate invocations.
+- **Plate scan is LOCAL ffmpeg**, not Cloudinary network (`plateIntelService.js:63-79,174-221`
+  runs against the already-downloaded platePath). The Cloudinary so_<sec> stills belong to the
+  face-crop detector, which is ALREADY cached per (veoVideoUrl, format) via `Ad.basePlate`
+  (`basePlateCropService.js:298-311`).
+- **Storyboard LLM on regen is DEAD CODE on the Atlas path** — `prepareStoryboard` returns
+  `storyboard:null` (`atlasVideoService.js:2527-2533`); `buildVeoPrompt` marks the param
+  unconsumed. $0 today. (`VEO_USE_GPT_STORYBOARD=true` in defaults.env is a no-op — hygiene.)
+
+**Real wins, ranked (effort S unless noted):**
+1. **Video cost reconcile to actuals** (accuracy, M): `reconcileCost` has one call site
+   (images). Video charge point already persists `veoPredictionId`; NOTE the terminal poll
+   already hits `GET /model/prediction/{id}` — the settled `price` may ride the completion
+   response for ZERO extra requests (verify live; images' comment warns price can lag).
+2. **`Ad.plateHints` cache** keyed by (plateUrl, FORMAT — not just veoVideoUrl; cropped plates
+   differ per format), mirroring `Ad.basePlate`: skips 5x ffmpeg+sharp per repeat re-title.
+   ~0.5-2s/render on preset-sweep reruns.
+3. **Regenerate flow Mongo diet:** `prepareStoryboard` call in `adRegenerateService.js:195` is
+   pure overhead (outputs discarded, cache-warm no-op on re-renders) — 6-10 round-trips;
+   `loadBrand` (`:174-181`) re-derives brand via Ad->Media->Brand when `ad.brandId` is on the
+   doc; 4x Brand loads and 4x Ad loads per regenerate, 2 of each avoidable.
+4. **Upload double-buffer** (`brandScriptExecutor.js:1012` readFile -> `cloudinaryService.js:46`
+   streamifier): stream disk->network directly. Tens-to-100s of ms.
+5. **Chrome pre-warm may be silently failing:** postinstall runs `npx remotion browser ensure
+   || true` (`package.json:11`) yet a fresh instance downloaded 91.9MB at first render. The
+   `|| true` swallows failures and vendored remotion pkg has `bin:null` — CHECK RENDER BUILD
+   LOGS for that step's real output. Same class as the f89e30b Puppeteer saga.
+6. Cosmetic/doc: stale `resolveBrowserExecutable` comment (`remotionRenderService.js:91-94`
+   points at the pre-f89e30b puppeteer cache path); `docs/TITLING.md:215-232` still documents
+   content-mode-only 3-sample scan — violates the fix-docs-in-same-commit rule; fix with the
+   plateHints work.
+7. Omni polling: fixed 15s+jitter is fine for wall-clock (completion detection lag <=18s);
+   the lever is fewer polls for rate-limit headroom, and no sync/webhook field exists in any
+   of the 5 param shapes — upstream capability UNVERIFIED.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |

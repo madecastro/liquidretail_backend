@@ -397,6 +397,181 @@ check('H1 proto presets load + validate for all 4 formats; scrim none; cta visib
   }
 });
 
+// ── I. Type-scale bumps + proof claim fallback (owner 2026-08-05) ──────────
+const { resolveSlotContent } = require('../remotion/lib/slotContent.js');
+
+const TYPE_SCALE_FLOOR = {
+  headline: 1.2,
+  quote: 1.15,
+  productName: 1.2,
+  rating: 1.25,
+  deliveryLine: 1.15,
+  cta: 1.15,
+};
+
+function minimalSpec(extraSlots = []) {
+  return {
+    version: 1,
+    phases: [
+      { key: 'hook', startSec: 0, endSec: 2.7 },
+      { key: 'proof', startSec: 2.7, endSec: 5.1 },
+    ],
+    slots: [
+      {
+        key: 'headline',
+        phase: 'hook',
+        position: { anchor: 'upperThird', align: 'left', maxWidthPct: 0.9 },
+        timing: { enterAtSec: 0.15, exitAtSec: 2.4, enterDurationSec: 0.7, exitDurationSec: 0.6 },
+        transition: { type: 'fade' },
+        treatment: { sizeScale: 1.2, maxLines: 3, fontRole: 'heading', weight: 700 },
+      },
+      {
+        key: 'quote',
+        phase: 'proof',
+        position: { anchor: 'upperThird', align: 'left', maxWidthPct: 0.92 },
+        timing: { enterAtSec: 2.7, exitAtSec: 4.8, enterDurationSec: 0.8, exitDurationSec: 0.6 },
+        transition: { type: 'fade' },
+        treatment: { maxLines: 3, fontRole: 'quote', weight: 500 },
+      },
+      ...extraSlots,
+    ],
+  };
+}
+
+check('I1 validator accepts visibleWhenEmpty referencing an existing slot', () => {
+  // FAIL-IF-GATE-DROPPED: proof claim fallback grammar must validate.
+  const spec = minimalSpec([{
+    key: 'headline',
+    phase: 'proof',
+    bind: ['headline'],
+    visibleWhenEmpty: 'quote',
+    position: { anchor: 'upperThird', align: 'left', maxWidthPct: 0.9 },
+    timing: { enterAtSec: 2.7, exitAtSec: 4.8, enterDurationSec: 0.7, exitDurationSec: 0.6 },
+    transition: { type: 'fade' },
+    treatment: { sizeScale: 1.02, maxLines: 3, fontRole: 'heading', weight: 700 },
+  }]);
+  const res = validateTitleSpec(spec, { format: 'vertical' });
+  assert.ok(res.ok, `expected ok, got: ${(res.errors || []).join('; ')}`);
+  const fb = res.normalized.slots.find((s) => s.visibleWhenEmpty === 'quote');
+  assert.ok(fb, 'normalized must retain visibleWhenEmpty');
+  assert.strictEqual(fb.key, 'headline');
+  assert.deepStrictEqual(fb.bind, ['headline']);
+});
+
+check('I2 validator rejects visibleWhenEmpty referencing an unknown slot', () => {
+  // FAIL-IF-REF-UNCHECKED: unknown sibling keys must hard-fail save.
+  const spec = minimalSpec([{
+    key: 'headline',
+    phase: 'proof',
+    bind: ['headline'],
+    visibleWhenEmpty: 'notARealSlot',
+    position: { anchor: 'upperThird' },
+    timing: { enterAtSec: 2.7, exitAtSec: 4.8 },
+    transition: { type: 'fade' },
+    treatment: { sizeScale: 1.02 },
+  }]);
+  const res = validateTitleSpec(spec, { format: 'vertical' });
+  assert.strictEqual(res.ok, false, 'unknown visibleWhenEmpty ref must fail');
+  assert.ok(
+    (res.errors || []).some((e) => /visibleWhenEmpty/.test(e) && /notARealSlot/.test(e)),
+    `expected visibleWhenEmpty ref error, got: ${(res.errors || []).join('; ')}`
+  );
+});
+
+check('I3 canonical.vertical has proof fallback-headline bound like headline + visibleWhenEmpty:quote', () => {
+  // FAIL-IF-FALLBACK-MISSING: rating-only proof beat needs the claim restatement.
+  clearPresetCache();
+  const raw = loadPresetFile('canonical');
+  const slots = raw.byFormat.vertical.slots || [];
+  const fb = slots.find((s) => s.visibleWhenEmpty === 'quote');
+  assert.ok(fb, 'canonical.vertical missing visibleWhenEmpty:"quote" slot');
+  assert.strictEqual(fb.key, 'headline', `fallback key must be headline, got ${fb.key}`);
+  assert.strictEqual(fb.phase, 'proof', `fallback phase must be proof, got ${fb.phase}`);
+  const bind = fb.bind || ['headline']; // default bind for headline is ['headline']
+  assert.ok(
+    bind.includes('headline'),
+    `fallback bind must include 'headline', got ${JSON.stringify(bind)}`
+  );
+  // After validate, default bind is applied.
+  const res = validateTitleSpec(raw.byFormat.vertical, { format: 'vertical' });
+  assert.ok(res.ok, `canonical.vertical invalid: ${(res.errors || []).join('; ')}`);
+  const nfb = res.normalized.slots.find((s) => s.visibleWhenEmpty === 'quote');
+  assert.deepStrictEqual(nfb.bind, ['headline']);
+});
+
+check('I4 sizeScale bumps present on the six slots in canonical.vertical (pin floors)', () => {
+  // FAIL-IF-SCALE-REVERTED: owner type-scale raise (headline×1.2 … cta×1.15).
+  // Floors are the post-multiply values for a previously-unscaled slot so a
+  // full revert fails; deliveryLine already had 1.1 → floor 1.265.
+  clearPresetCache();
+  const slots = loadPresetFile('canonical').byFormat.vertical.slots || [];
+  // Prefer the hook/non-fallback instance for headline (not visibleWhenEmpty).
+  const pick = (key) => {
+    if (key === 'headline') {
+      return slots.find((s) => s.key === 'headline' && !s.visibleWhenEmpty)
+        || slots.find((s) => s.key === 'headline');
+    }
+    return slots.find((s) => s.key === key);
+  };
+  const floors = {
+    headline: 1.2,
+    quote: 1.15,
+    productName: 1.2,
+    rating: 1.25,
+    deliveryLine: 1.265,
+    cta: 1.15,
+  };
+  for (const [key, floor] of Object.entries(floors)) {
+    const s = pick(key);
+    assert.ok(s, `canonical.vertical missing slot '${key}'`);
+    const ss = Number(s.treatment?.sizeScale ?? 1);
+    assert.ok(
+      ss + 1e-9 >= floor,
+      `canonical.vertical.${key}.sizeScale ${ss} < floor ${floor}`
+    );
+  }
+});
+
+check('I5 resolveSlotContent: visibleWhenEmpty:quote yields content only when quote empty', () => {
+  // Behavioural (no browser): pure core of the proof claim fallback.
+  const res = validateTitleSpec(minimalSpec([{
+    key: 'headline',
+    phase: 'proof',
+    bind: ['headline'],
+    visibleWhenEmpty: 'quote',
+    position: { anchor: 'upperThird' },
+    timing: { enterAtSec: 2.7, exitAtSec: 4.8 },
+    transition: { type: 'fade' },
+    treatment: { sizeScale: 1.02, maxLines: 3 },
+  }]), { format: 'vertical' });
+  assert.ok(res.ok, (res.errors || []).join('; '));
+  const slots = res.normalized.slots;
+  const fb = slots.find((s) => s.visibleWhenEmpty === 'quote');
+  assert.ok(fb);
+
+  const withQuote = resolveSlotContent(
+    fb,
+    { headline: 'All-day comfort', quote: 'Best shoes I own', quoteSnippet: 'Best shoes I own' },
+    slots
+  );
+  assert.strictEqual(withQuote, null, 'fallback must hide when quote is usable');
+
+  const noQuote = resolveSlotContent(
+    fb,
+    { headline: 'All-day comfort', rating: 4.8, reviewCount: 120 },
+    slots
+  );
+  assert.strictEqual(noQuote, 'All-day comfort', `fallback must show claim when quote empty, got ${JSON.stringify(noQuote)}`);
+
+  // Empty-string quote still counts as empty (resolveSlotContentCore returns null).
+  const emptyStr = resolveSlotContent(
+    fb,
+    { headline: 'All-day comfort', quote: '   ' },
+    slots
+  );
+  assert.strictEqual(emptyStr, 'All-day comfort');
+});
+
 // ── report ────────────────────────────────────────────────────────────────
 if (SAVED === undefined) delete process.env.TITLE_SPEC_IGNORE_PERSISTED;
 else process.env.TITLE_SPEC_IGNORE_PERSISTED = SAVED;

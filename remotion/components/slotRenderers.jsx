@@ -4,7 +4,7 @@
 // slot's visible-window progress (drives accent reveals).
 
 import React from 'react';
-import { Img } from 'remotion';
+import { Img, spring, useCurrentFrame, useVideoConfig } from 'remotion';
 import {
   tokenColor,
   tokenFont,
@@ -15,6 +15,21 @@ import {
   TEXT_SHADOWS,
   BOX_SHADOWS,
 } from '../lib/tokens.js';
+import {
+  STAR_COUNT,
+  STAR_POP_SEC,
+  COUNT_DUR_SEC,
+  SUFFIX_FADE_SEC,
+  ratingLocalFrame,
+  starStartSec,
+  starFillAt,
+  lastStarLandSec,
+  parseReviewsLeadingNumber,
+  countUpValue,
+  formatReviewsCount,
+  suffixOpacityAt,
+  lineFadeOpacityAt,
+} from '../lib/ratingMotion.js';
 
 // Base text size (px at native canvas) per slot per format — derived from
 // the canvas canonicals' clamp() outputs at 1080×1920 / 1080×1350 / 1920×1080.
@@ -155,8 +170,24 @@ const Accent = ({ accent, tokens, progress, dims }) => {
 // showed tofu boxes on shipped ads. `size` is the outer diameter of
 // each star (matches the previous font-px value); `gap` is horizontal
 // spacing between stars.
-function StarRow({ color, size, gap, count = 5 }) {
+//
+// Partial fill (e.g. 4.6 → 5th star 60%): a dim full-star polygon under a
+// solid polygon clipped by a left-anchored rect whose width = size * fill.
+// (Same clip approach the canvas scripts use for half-stars — no font glyph,
+// no mask image.) When `localFrame`/`fps` are provided, each star spring-pops
+// L→R and its fill fraction ramps 0→target during its own pop window.
+function StarRow({
+  color,
+  size,
+  gap,
+  rating = STAR_COUNT,
+  count = STAR_COUNT,
+  localFrame = null,
+  fps = 30,
+}) {
   const points = starPoints(size / 2, (size / 2) * 0.4);
+  const animate = localFrame != null && Number.isFinite(localFrame) && fps > 0;
+  const labelFill = Math.min(count, Math.max(0, Number(rating) || 0));
   return (
     <span
       style={{
@@ -167,19 +198,70 @@ function StarRow({ color, size, gap, count = 5 }) {
         // Non-breaking so a 5-star row never wraps mid-row on tight rating scrims.
         whiteSpace: 'nowrap',
       }}
-      aria-label={`${count} out of ${count} stars`}
+      aria-label={`${labelFill} out of ${count} stars`}
     >
-      {Array.from({ length: count }, (_, i) => (
-        <svg
-          key={i}
-          width={size}
-          height={size}
-          viewBox={`0 0 ${size} ${size}`}
-          style={{ display: 'block' }}
-        >
-          <polygon points={points} fill={color} />
-        </svg>
-      ))}
+      {Array.from({ length: count }, (_, i) => {
+        let scale = 1;
+        let fill;
+        if (animate) {
+          const startF = Math.round(starStartSec(i) * fps);
+          const rel = localFrame - startF;
+          scale = rel < 0
+            ? 0
+            : spring({
+                frame: rel,
+                fps,
+                config: { damping: 12, stiffness: 200, mass: 0.65 },
+                // Cap the impulse so low-fps clips still settle inside STAR_POP_SEC.
+                durationInFrames: Math.max(4, Math.round(STAR_POP_SEC * fps * 1.35)),
+              });
+          fill = starFillAt(localFrame, fps, rating, i);
+        } else {
+          // Static path (no frame): show the settled fill immediately.
+          fill = starFillAt(1e9, 30, rating, i);
+        }
+        return (
+          <span
+            key={i}
+            style={{
+              display: 'inline-flex',
+              transform: `scale(${scale})`,
+              transformOrigin: 'center center',
+              // Keep layout width even while scaled to 0 so the row doesn't reflow.
+              width: size,
+              height: size,
+            }}
+          >
+            <svg
+              width={size}
+              height={size}
+              viewBox={`0 0 ${size} ${size}`}
+              style={{ display: 'block', overflow: 'visible' }}
+            >
+              {/* Dim full outline so empty / partial stars still read as a 5-star row. */}
+              <polygon points={points} fill={color} opacity={0.22} />
+              {fill > 0.001 ? (
+                fill >= 0.999 ? (
+                  <polygon points={points} fill={color} />
+                ) : (
+                  <>
+                    <defs>
+                      <clipPath id={`rating-star-fill-${i}`}>
+                        <rect x={0} y={0} width={size * fill} height={size} />
+                      </clipPath>
+                    </defs>
+                    <polygon
+                      points={points}
+                      fill={color}
+                      clipPath={`url(#rating-star-fill-${i})`}
+                    />
+                  </>
+                )
+              ) : null}
+            </svg>
+          </span>
+        );
+      })}
     </span>
   );
 }
@@ -222,39 +304,116 @@ export const TextSlot = ({ slot, content, tokens, dims, format, progress }) => {
   );
 };
 
-export const RatingSlot = ({ slot, content, tokens, dims, format }) => {
+export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 }) => {
+  // Motion is frame-derived (Remotion contract) — never Date/random/setTimeout.
+  // Parent also passes frame/fps; hooks are the authoritative source so a
+  // standalone preview composition still animates without prop plumbing.
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
   const t = slot.treatment;
+  // Stars + score share the same sizeScale-driven base (SVG star diameter
+  // tracks font size so a rating sizeScale bump enlarges the whole lockup).
   const size = baseSize('rating', format, t.sizeScale);
   const { rating, reviewsText } = content;
   const font = tokenFont(tokens, 'body');
   // Secondary color follows the slot's (possibly contrast-flipped) token:
-  // when the group flips to on-light colors, the divider + count flip too.
+  // when the group flips to on-light colors, the count line flips too.
   const secondaryToken = t.colorToken === 'textOnLight' ? 'textSecondaryOnLight' : 'textSecondary';
+
+  // Internal choreography is relative to the slot's own enterAtSec (group
+  // enter transition is already applied by Canonical around this renderer).
+  const localFrame = ratingLocalFrame(frame, fps, slot.timing?.enterAtSec ?? 0, timeScale);
+  const countStartSec = lastStarLandSec(); // ~0.58s — after 5th star lands
+  const parsed = reviewsText ? parseReviewsLeadingNumber(reviewsText) : null;
+
+  let reviewsNode = null;
+  if (reviewsText) {
+    if (parsed) {
+      const n = countUpValue(localFrame, fps, parsed.target, {
+        startSec: countStartSec,
+        durationSec: COUNT_DUR_SEC,
+      });
+      const suffixOp = suffixOpacityAt(localFrame, fps, {
+        startSec: countStartSec,
+        durationSec: COUNT_DUR_SEC,
+        fadeSec: SUFFIX_FADE_SEC,
+      });
+      reviewsNode = (
+        <span
+          style={{
+            color: tokenColor(tokens, secondaryToken),
+            fontSize: Math.round(size * 0.82),
+            fontWeight: 500,
+            fontFamily: fontFamilyCss(font),
+            textShadow: TEXT_SHADOWS.soft,
+            maxWidth: '100%',
+            // Tabular figures keep the rolling digits from jittering row width.
+            fontVariantNumeric: 'tabular-nums',
+            fontFeatureSettings: '"tnum" 1',
+          }}
+        >
+          <span>{formatReviewsCount(n)}</span>
+          <span style={{ opacity: suffixOp }}>{parsed.suffix}</span>
+        </span>
+      );
+    } else {
+      // No leading integer → skip count-up; fade the whole line in after stars.
+      const op = lineFadeOpacityAt(localFrame, fps, {
+        startSec: countStartSec,
+        durationSec: SUFFIX_FADE_SEC,
+      });
+      reviewsNode = (
+        <span
+          style={{
+            color: tokenColor(tokens, secondaryToken),
+            fontSize: Math.round(size * 0.82),
+            fontWeight: 500,
+            fontFamily: fontFamilyCss(font),
+            textShadow: TEXT_SHADOWS.soft,
+            maxWidth: '100%',
+            opacity: op,
+          }}
+        >
+          {reviewsText}
+        </span>
+      );
+    }
+  }
+
+  // Lockup: stars+score on line 1; reviewsText UNDER as line 2 (same max
+  // width). No reviewsText → stars+score only (unchanged empty behaviour).
   return (
-    <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-flex', alignItems: 'center', gap: Math.round(dims.width * 0.016) }}>
-      <StarRow
-        color={tokenColor(tokens, 'stars')}
-        size={Math.round(size * 1.15)}
-        gap={Math.round(size * 0.15)}
-      />
-      <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
-        {rating.toFixed(1)}/5
-      </span>
-      {reviewsText ? (
-        <>
-          <span
-            style={{
-              width: 2,
-              alignSelf: 'stretch',
-              margin: `${Math.round(size * 0.2)}px 0`,
-              backgroundColor: hexToRgba(tokenColor(tokens, secondaryToken), 0.6),
-            }}
-          />
-          <span style={{ color: tokenColor(tokens, secondaryToken), fontSize: Math.round(size * 0.82), fontWeight: 500, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
-            {reviewsText}
-          </span>
-        </>
-      ) : null}
+    <div
+      style={{
+        ...scrimStyle(t, tokens, dims),
+        display: 'inline-flex',
+        flexDirection: 'column',
+        alignItems: 'flex-start',
+        gap: Math.round(size * 0.28),
+        maxWidth: '100%',
+      }}
+    >
+      <div
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: Math.round(dims.width * 0.016),
+        }}
+      >
+        <StarRow
+          color={tokenColor(tokens, 'stars')}
+          size={Math.round(size * 1.15)}
+          gap={Math.round(size * 0.15)}
+          rating={rating}
+          count={STAR_COUNT}
+          localFrame={localFrame}
+          fps={fps}
+        />
+        <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
+          {rating.toFixed(1)}/5
+        </span>
+      </div>
+      {reviewsNode}
     </div>
   );
 };

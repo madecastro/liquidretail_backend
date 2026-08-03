@@ -19,11 +19,15 @@
 //     fonts:  { heading: { family, weight? }, body: {...}, quote: {...} }
 //   },
 //   slots: [ {
-//     key: 'headline',              // one of SLOT_KEYS, unique per spec
+//     key: 'headline',              // one of SLOT_KEYS (duplicates allowed when
+//                                   // phases need the same renderer twice —
+//                                   // e.g. proof claim fallback + hook headline)
 //     visible: true,
 //     bind: ['headline'],           // meta fields tried in order (text slots)
 //     brandMode: 'keep'|'hide',     // behavior when meta.endcardMode==='brand'
 //     brandModeBind: ['brandTagline'],   // alternate binding in brand mode
+//     visibleWhenEmpty: 'quote',    // optional: render ONLY when named sibling
+//                                   // slot resolves to no content this render
 //     phase: 'hook',                // must reference phases[].key
 //     position: {
 //       anchor: 'top'|'upperThird'|'center'|'lowerThird'|'bottom',
@@ -302,19 +306,22 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
   }
 
   // slots
+  // Ceiling allows one extra per key for phase-local repeats (e.g. hook
+  // headline + proof claim fallback both key:'headline'). Hard cap keeps
+  // LLM-authored specs from exploding.
+  const MAX_SLOTS = SLOT_KEYS.length + 4;
   const slots = [];
   if (!Array.isArray(spec.slots) || spec.slots.length < 1) {
     err('slots must be a non-empty array');
-  } else if (spec.slots.length > SLOT_KEYS.length) {
-    err(`at most ${SLOT_KEYS.length} slots (got ${spec.slots.length})`);
+  } else if (spec.slots.length > MAX_SLOTS) {
+    err(`at most ${MAX_SLOTS} slots (got ${spec.slots.length})`);
   } else {
-    const seen = new Set();
+    // Duplicate keys are legal (same renderer in two phases). React keys in
+    // Canonical.jsx include phase+index so the tree stays stable.
     for (const [i, s] of spec.slots.entries()) {
       const where = `slots[${i}]`;
       if (!isPlainObject(s)) { err(`${where} must be an object`); continue; }
       if (!SLOT_KEYS.includes(s.key)) { err(`${where}.key '${s.key}' unknown — valid: ${SLOT_KEYS.join(', ')}`); continue; }
-      if (seen.has(s.key)) { err(`duplicate slot '${s.key}'`); continue; }
-      seen.add(s.key);
 
       const out = { key: s.key, visible: s.visible !== false };
       const slotType = slotTypeForKey(s.key);
@@ -405,6 +412,20 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
         bmBind = cleanBmBind;
       }
       out.brandModeBind = bmBind;
+
+      // visibleWhenEmpty — optional sibling gate. Slot renders ONLY when the
+      // named sibling resolves to no content (e.g. claim restated when quote
+      // is withheld). Ref must be a slot key present in this format; checked
+      // in a post-pass once every slot key is known.
+      if (s.visibleWhenEmpty != null) {
+        if (typeof s.visibleWhenEmpty !== 'string' || !s.visibleWhenEmpty.trim()) {
+          err(`${where}.visibleWhenEmpty must be a non-empty string slot key`); continue;
+        }
+        if (s.visibleWhenEmpty.trim() === s.key) {
+          err(`${where}.visibleWhenEmpty cannot reference the slot's own key`); continue;
+        }
+        out.visibleWhenEmpty = s.visibleWhenEmpty.trim();
+      }
 
       // phase
       if (typeof s.phase !== 'string' || !phaseKeys.has(s.phase)) {
@@ -545,6 +566,17 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
       }
 
       slots.push(out);
+    }
+  }
+
+  // Post-pass: visibleWhenEmpty must name a slot key present in this format.
+  if (!errors.length && slots.length) {
+    const keysPresent = new Set(slots.map((s) => s.key));
+    for (const [i, s] of slots.entries()) {
+      if (!s.visibleWhenEmpty) continue;
+      if (!keysPresent.has(s.visibleWhenEmpty)) {
+        err(`slots[${i}] ('${s.key}').visibleWhenEmpty '${s.visibleWhenEmpty}' does not reference a slot key in this format (have: ${[...keysPresent].join(', ')})`);
+      }
     }
   }
 
