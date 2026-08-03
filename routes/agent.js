@@ -1,26 +1,28 @@
-// POST /api/agent/chat — the home-page conversational agent.
+// POST /api/agent/chat — SSE-streaming conversational agent.
 //
-// Stateless per-request: the client holds the full message history and
-// resends it every turn. Server holds no chat state. Simpler ownership,
-// no new collection, cross-device chat history handled by client
-// localStorage until stateful sessions land in a follow-up PR.
+// Replaces the buffered endpoint from PR #1. Same tool loop, same
+// registry, same dispatch — but the response is text/event-stream so
+// the frontend chat drawer sees tokens + tool calls + results as they
+// happen instead of one blob at the end.
 //
-// TOOL LOOP shape (OpenAI-compatible via atlasLlmService):
-//   1. Build system prompt = role + risk-tier rules + capability
-//      manifest + UI-context snapshot.
-//   2. Ask the model with tools=[all capabilities].
-//   3. If the response carries tool_calls[]: dispatch each via
-//      agentTools, append the assistant + tool messages to history,
-//      loop back to step 2.
-//   4. Otherwise: return the final message.
-//   5. Iteration cap (AGENT_MAX_ITERATIONS, default 8) prevents runaway
-//      loops if the model keeps calling tools.
+// EVENT VOCABULARY (client-facing contract — DO NOT change silently):
+//   event: assistant-delta      data: { text }
+//   event: tool-use-start       data: { toolCallId, toolName }
+//   event: tool-use-complete    data: { toolCallId, toolName, args }
+//   event: tool-result          data: { toolCallId, result }
+//   event: iteration            data: { n }
+//   event: done                 data: { stop_reason, iterations, model }
+//   event: error                data: { error }
 //
-// PR #1 scope: buffered response (no streaming). Streaming (SSE) lands
-// as PR #2 alongside a new atlasLlmStreamService.
+// Each frame is `event: <name>\ndata: <json>\n\n`. Client hooks with
+// EventSource.addEventListener('assistant-delta', …) etc.
 //
-// GATE: AGENT_ENABLED must be truthy. The route file requires early so
-// the mount can be conditional in index.js.
+// STATELESS per-request: the client holds the full message history
+// and resends it every turn. Server holds no chat state.
+//
+// CLIENT DISCONNECT: an AbortController is wired to req.on('close') so
+// an abandoned tab aborts the in-flight LLM call and stops the tool
+// loop — no wasted tokens, no dangling dispatches.
 
 'use strict';
 
@@ -29,7 +31,7 @@ const router = express.Router();
 
 const registry = require('../services/capabilityRegistry');
 const agentTools = require('../services/agentTools');
-const { chatCompletion } = require('../services/atlasLlmService');
+const { streamChatCompletion } = require('../services/atlasLlmStreamService');
 
 // ── Tunables ────────────────────────────────────────────────────────
 
@@ -39,13 +41,10 @@ const MAX_MESSAGES = Math.max(2, Number(process.env.AGENT_MAX_MESSAGES || 40));
 const MAX_TOKENS_PER_CALL = Math.max(256, Number(process.env.AGENT_MAX_TOKENS || 2048));
 const TEMPERATURE = Number.isFinite(Number(process.env.AGENT_TEMPERATURE))
   ? Number(process.env.AGENT_TEMPERATURE)
-  : 0.2;   // low — tool-picking is a routing task, not a creativity task
+  : 0.2;
 
 // ── System prompt ───────────────────────────────────────────────────
 
-// Constant chunks — the manifest changes only when the registry does,
-// so keeping them concatenated fresh per request is fine. Prompt
-// caching (PR #2) will key on this string.
 function buildSystemPrompt(context = {}) {
   const contextLines = Object.entries(context)
     .filter(([, v]) => v != null && v !== '')
@@ -66,7 +65,7 @@ function buildSystemPrompt(context = {}) {
     '- tier 2: billable write; ASK + estimate the cost before running.',
     '- tier 3: external / hard-to-reverse; ASK with explicit "type YES to confirm".',
     '- tier 4: multi-step workflow; propose a plan first.',
-    'This PR ships tier-0 capabilities only. If the operator asks for something that would need a higher tier, name that clearly rather than pretending you can\'t help.',
+    'This build ships tier-0 capabilities only. If the operator asks for something that would need a higher tier, name that clearly rather than pretending you can\'t help.',
     '',
     `AVAILABLE CAPABILITIES (${registry.CAPABILITIES.length}):`,
     registry.describeManifest(),
@@ -79,7 +78,7 @@ function buildSystemPrompt(context = {}) {
   ].join('\n');
 }
 
-// ── Request validation ──────────────────────────────────────────────
+// ── Request validation (unchanged from PR #1) ──────────────────────
 
 function validateBody(body) {
   if (!body || typeof body !== 'object') return 'body must be a JSON object';
@@ -91,22 +90,15 @@ function validateBody(body) {
     if (!['user', 'assistant', 'tool', 'system'].includes(m.role)) {
       return `messages[${i}].role must be user|assistant|tool|system`;
     }
-    // system messages from the client are ignored below (we build our
-    // own), but we still validate their shape rather than silently
-    // dropping something structurally broken.
     if (typeof m.content !== 'string' && !Array.isArray(m.content) && m.content !== null) {
-      return `messages[${i}].content must be string, array, or null (tool_calls carry no content)`;
+      return `messages[${i}].content must be string, array, or null`;
     }
   }
   if (body.context != null && typeof body.context !== 'object') return 'context must be an object';
   return null;
 }
 
-// Whitelist of UI-context keys that flow into system prompt + tool
-// dispatch. Extra keys are dropped silently so a rogue client can't
-// smuggle arbitrary fields into an executor.
 const CONTEXT_KEYS = ['brandId', 'adId', 'campaignId', 'productId'];
-
 function sanitiseContext(raw = {}) {
   const out = {};
   for (const k of CONTEXT_KEYS) {
@@ -114,6 +106,46 @@ function sanitiseContext(raw = {}) {
     if (typeof v === 'string' && v.length > 0 && v.length < 100) out[k] = v;
   }
   return out;
+}
+
+// ── SSE writer ──────────────────────────────────────────────────────
+
+// Named-event SSE framing. Not enough boilerplate to justify a lib —
+// two lines per event, no framing state on the server side.
+function sseWrite(res, event, data) {
+  if (res.writableEnded || res.destroyed) return false;
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  // Node's res.write returns true unless the internal buffer overflows;
+  // caller doesn't need it here since events are small and infrequent.
+  return true;
+}
+
+// ── Tool-call accumulator ───────────────────────────────────────────
+//
+// Streaming providers ship tool calls incrementally:
+//   chunk 1: [{ index:0, id:'call_1', function:{ name:'foo', arguments:'' } }]
+//   chunk 2: [{ index:0, function:{ arguments:'{"a"' } }]
+//   chunk 3: [{ index:0, function:{ arguments:':1}' } }]
+// Concatenate `arguments` string by index; id + name come only on the
+// first fragment for that index. finish_reason:'tool_calls' signals
+// the args are complete and safe to JSON.parse.
+
+function accumulateToolCallDelta(pending, deltaCalls) {
+  const started = [];   // indices that just got id+name (client should see tool-use-start)
+  for (const d of deltaCalls || []) {
+    if (d.index == null) continue;
+    let slot = pending.get(d.index);
+    if (!slot) {
+      slot = { id: null, name: null, argsBuffer: '' };
+      pending.set(d.index, slot);
+    }
+    const wasStarted = slot.id && slot.name;
+    if (d.id)                        slot.id   = d.id;
+    if (d.function?.name)            slot.name = d.function.name;
+    if (typeof d.function?.arguments === 'string') slot.argsBuffer += d.function.arguments;
+    if (!wasStarted && slot.id && slot.name) started.push(d.index);
+  }
+  return started;
 }
 
 // ── The endpoint ────────────────────────────────────────────────────
@@ -125,104 +157,161 @@ router.post('/chat', async (req, res) => {
   const problem = validateBody(req.body);
   if (problem) return res.status(400).json({ error: problem });
 
+  // SSE headers must precede any write. Flush headers immediately so
+  // the client's EventSource sees the connection open — some proxies
+  // otherwise buffer the response until the first body byte.
+  res.status(200).set({
+    'Content-Type':       'text/event-stream; charset=utf-8',
+    'Cache-Control':      'no-cache, no-transform',
+    Connection:           'keep-alive',
+    'X-Accel-Buffering':  'no'   // hint to nginx-style proxies
+  });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  // Client-disconnect abort. AbortController -> passed into
+  // streamChatCompletion so the upstream axios request is cancelled.
+  // `aborted` also short-circuits the tool loop.
+  const abort = new AbortController();
+  let aborted = false;
+  req.on('close', () => {
+    if (!aborted) {
+      aborted = true;
+      abort.abort();
+    }
+  });
+
   const context = sanitiseContext(req.body.context);
   const clientMessages = req.body.messages.filter((m) => m.role !== 'system');
   const system = buildSystemPrompt(context);
   const tools = registry.capabilitiesToTools();
 
   const meta = {
+    stage:      'agent-chat',
     service:    'agent-chat',
     purposeTag: 'agent',
     brandId:    context.brandId || null
   };
 
-  // Working message list — LLM sees system + full client history + any
-  // new assistant + tool messages we append during the loop.
   const working = [{ role: 'system', content: system }, ...clientMessages];
-  const appended = [];   // returned to the client so it can persist
   let stopReason = 'end_turn';
+  let iterations = 0;
 
-  for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
-    let completion;
-    try {
-      completion = await chatCompletion(meta, {
-        model:       AGENT_MODEL,
-        messages:    working,
-        tools,
-        tool_choice: 'auto',
-        temperature: TEMPERATURE,
-        max_tokens:  MAX_TOKENS_PER_CALL
-      });
-    } catch (err) {
-      console.error(`❌ agent chat: chatCompletion failed on iter ${iter}: ${err.message}`);
-      return res.status(502).json({ error: `LLM call failed: ${err.message}` });
-    }
+  try {
+    for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
+      if (aborted) { stopReason = 'aborted'; break; }
+      iterations++;
+      sseWrite(res, 'iteration', { n: iter });
 
-    const assistantMsg = completion.choices?.[0]?.message;
-    if (!assistantMsg) {
-      return res.status(502).json({ error: 'LLM returned no message' });
-    }
+      // Per-iteration accumulators. Tool-call args stream across many
+      // chunks; we assemble here and dispatch after finish_reason.
+      const pendingCalls = new Map();   // index → { id, name, argsBuffer }
+      let assistantContent = '';
+      let finishReason = null;
 
-    // Append the assistant turn verbatim. Some providers put tool_calls
-    // AND content on the same message; keep both.
-    const toRecord = {
-      role:    'assistant',
-      content: assistantMsg.content ?? null
-    };
-    if (Array.isArray(assistantMsg.tool_calls) && assistantMsg.tool_calls.length) {
-      toRecord.tool_calls = assistantMsg.tool_calls;
-    }
-    working.push(toRecord);
-    appended.push(toRecord);
-
-    // No tool call → we're done.
-    if (!Array.isArray(assistantMsg.tool_calls) || !assistantMsg.tool_calls.length) {
-      stopReason = 'end_turn';
-      break;
-    }
-
-    // Dispatch each tool call. Errors are shipped back as ok:false
-    // results so the model can respond gracefully next turn.
-    for (const call of assistantMsg.tool_calls) {
-      let args = {};
       try {
-        args = call.function?.arguments
-          ? JSON.parse(call.function.arguments)
-          : {};
-      } catch (err) {
-        args = { _parseError: err.message };
-      }
-      const result = await agentTools.dispatch({
-        toolName: call.function?.name,
-        args,
-        req,
-        context
-      });
-      const toolMsg = {
-        role:         'tool',
-        tool_call_id: call.id,
-        content:      JSON.stringify(result)
-      };
-      working.push(toolMsg);
-      appended.push(toolMsg);
-    }
-    // Fall through to next iteration — the model reads its own tool
-    // results and either answers or calls another tool.
-    if (iter === MAX_ITERATIONS - 1) stopReason = 'max_iterations';
-  }
+        for await (const chunk of streamChatCompletion(meta, {
+          model:       AGENT_MODEL,
+          messages:    working,
+          tools,
+          tool_choice: 'auto',
+          temperature: TEMPERATURE,
+          max_tokens:  MAX_TOKENS_PER_CALL
+        }, { signal: abort.signal })) {
+          if (aborted) break;
+          const choice = chunk.choices?.[0];
+          if (!choice) continue;
 
-  res.json({
-    messages: appended,
-    stop_reason: stopReason,
-    model: AGENT_MODEL,
-    iterations: appended.filter((m) => m.role === 'assistant').length
-  });
+          if (typeof choice.delta?.content === 'string' && choice.delta.content.length) {
+            assistantContent += choice.delta.content;
+            sseWrite(res, 'assistant-delta', { text: choice.delta.content });
+          }
+          if (Array.isArray(choice.delta?.tool_calls) && choice.delta.tool_calls.length) {
+            const started = accumulateToolCallDelta(pendingCalls, choice.delta.tool_calls);
+            for (const idx of started) {
+              const slot = pendingCalls.get(idx);
+              sseWrite(res, 'tool-use-start', {
+                toolCallId: slot.id,
+                toolName:   slot.name
+              });
+            }
+          }
+          if (choice.finish_reason) {
+            finishReason = choice.finish_reason;
+          }
+        }
+      } catch (streamErr) {
+        if (aborted) { stopReason = 'aborted'; break; }
+        throw streamErr;
+      }
+
+      // Record the assistant turn in history — content + assembled
+      // tool_calls, matching the shape the LLM expects on the next turn.
+      const assembledToolCalls = [...pendingCalls.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, s]) => ({
+          id:       s.id,
+          type:     'function',
+          function: { name: s.name, arguments: s.argsBuffer || '' }
+        }));
+      const assistantMsg = { role: 'assistant', content: assistantContent || null };
+      if (assembledToolCalls.length) assistantMsg.tool_calls = assembledToolCalls;
+      working.push(assistantMsg);
+
+      // No tool calls → the assistant's message IS the answer, we're done.
+      if (!assembledToolCalls.length) {
+        stopReason = finishReason === 'length' ? 'length' : 'end_turn';
+        break;
+      }
+
+      // Dispatch each tool call. Errors surface as ok:false results so
+      // the model can respond gracefully next turn.
+      for (const call of assembledToolCalls) {
+        if (aborted) break;
+        let args = {};
+        try {
+          args = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+        } catch (err) {
+          args = { _parseError: err.message, _raw: call.function.arguments };
+        }
+        sseWrite(res, 'tool-use-complete', {
+          toolCallId: call.id,
+          toolName:   call.function.name,
+          args
+        });
+        const result = await agentTools.dispatch({
+          toolName: call.function.name,
+          args,
+          req,
+          context
+        });
+        sseWrite(res, 'tool-result', {
+          toolCallId: call.id,
+          result
+        });
+        working.push({
+          role:         'tool',
+          tool_call_id: call.id,
+          content:      JSON.stringify(result)
+        });
+      }
+
+      if (iter === MAX_ITERATIONS - 1) {
+        stopReason = 'max_iterations';
+      }
+    }
+
+    sseWrite(res, 'done', { stop_reason: stopReason, iterations, model: AGENT_MODEL });
+  } catch (err) {
+    console.error(`❌ agent chat: ${err.message}`);
+    sseWrite(res, 'error', { error: err.message });
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
 });
 
 function isEnabled() {
   return String(process.env.AGENT_ENABLED || '').toLowerCase() === 'true';
 }
-
 router.isEnabled = isEnabled;
 
 module.exports = router;
