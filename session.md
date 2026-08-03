@@ -897,6 +897,57 @@ the asset's own border implies, so white-on-black assets don't invert into a blo
 back to the original asset. **NOT yet visually verified — needs one static render (~$0.01).**
 Video titling was never the source: `brandPill` and `brandLogo` are both off in canonical.
 
+### 0.3003 SEED = FEED ORDER, and the legibility fix was a POLARITY bug (prod `caec844`)
+
+**VIDEO SEED — the 'hero' stamp is gone.** Owner: *"the default video behaviour should be the
+first three images, not the 'hero' image, especially since we don't know how that is determined."*
+Removed the `metadata.imageRole:'hero'` tier from `expandDeterministicVideo` — BOTH the default
+seed and the non-catalog-picks product anchor — via one helper,
+`firstCatalogMediaForProduct()`. The stamp was never a dependable "first image": it is written by
+`catalogProductDetectService` off `CatalogProduct.imageUrl`, so it required that materialisation to
+have run, and when absent the cascade fell through to earliest-`createdAt` anyway — the SAME
+product could seed differently depending on ingest state. Now one rule: earliest `createdAt`.
+**No change was needed for "the first three"**: `atlasVideoService` already loads `catalogMedias`
+with `.sort({createdAt: 1})` and no hero ranking, and `DEFAULT_REFERENCE_IMAGE_COUNT = 3` with
+`REPEAT_PRIMARY_REFERENCE=false`, so seed + mirrors ARE the first three in feed order.
+Money unchanged — one Omni submit per product. Kill switch `VIDEO_SEED_FEED_ORDER` (default on)
+restores the old cascade without a deploy. Pinned by `verifyProofBeat` V1.
+
+**ANSWERING THE OWNER'S QUESTION — automatic, not a prompt.** Seed selection is fully automatic
+and there is no operator prompt today. The override that exists is operator picks
+(`referenceMediaIds` → `orderedReferenceMedia`, position 0 = primary seed), which bypasses the
+default assembly entirely. Nothing warns an operator when the automatic pick is poor for video.
+
+**LEGIBILITY WAS A POLARITY BUG, not a missing shadow.** Every entry in `TEXT_SHADOWS` is BLACK,
+which silently assumed white type on dark footage. The plate-intel contrast flip makes the ink
+DARK on light plates, so a black shadow behind dark type separated *nothing* — which is exactly
+why the Vuori title vanished into a face while `inkVote` was behaving correctly. Added
+`TEXT_SHADOWS_ON_LIGHT` + `textShadowFor(name, inkHex)`: polarity follows the ink's luminance
+(dark ink → light halo, light ink → the original dark shadow, unparseable → previous behaviour).
+Wired through EVERY `textShadow` site, including the rating row and reviews line — the two worst
+affected. No boxes, no scrim. Verified in frame: headline, `4.6/5` and `15,545 reviews` all legible
+over the beard where the headline had been invisible. Pinned by S2-1/S2-2 (S2-2 bans any
+`textShadow: TEXT_SHADOWS[...]` so a new slot cannot reintroduce the dark-only assumption).
+
+**TWO THINGS MEASURED AND DELIBERATELY NOT BUILT:**
+1. **The camera-prompt constraint the owner asked for.** Not implemented — it could not have fixed
+   the observed ads (§0.3002 numbers), and camera directives are the one lever already rolled back
+   for causing hallucinations (`be5b83f`). Raised with the owner rather than shipped.
+2. **An automatic "prefer a wider seed" picker.** There is NO signal for it.
+   `OverlayZoneArtifact.zones.restrictions` looked perfect — it has a `'face'` classification with
+   `rectPct` geometry and "any visible face gets ≥0.9" — and 95% of catalog media have the artifact
+   (3446/3624). But **0 of 120 sampled carry a `face` restriction at all**, so face coverage is not
+   derivable from existing data. `classification.shotType` cannot substitute: it has no
+   shot-distance axis, so "on_model full body" and "on_model face close-up" are the same value and
+   both rank 1–2. Getting this signal needs either a new field on the existing detect call (free,
+   but that is INGEST — a colleague's area, owner-scoped-out) or a vision call per candidate seed
+   (~$0.02, cached) at generation time.
+
+**HARNESS LESSON, worth repeating:** V1's first version PASSED with the regression restored — it
+scanned only from `expandDeterministicVideo` onward and could not see the helper declared above it.
+Caught solely by revert-proofing. Source-anchored checks must assert on the structure that actually
+decides the behaviour, not on a region that merely contains its call site.
+
 ### 0.3002 TEXT-ON-FACE — the camera prompt is NOT the cause. Measured.
 
 Owner picked "constrain the camera prompt" for the close-up legibility problem, but the numbers
