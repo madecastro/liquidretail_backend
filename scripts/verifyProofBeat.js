@@ -416,6 +416,41 @@ check('A2 a stale artifact is DEMOTED, never discarded', () => {
   assert.ok(/STALE/.test(executorSrc), 'serving a stale artifact must be logged');
 });
 
+// ── B: brand resolution must survive a scraped name that cannot match ──
+
+check('B1 loadContext falls back to the brandId FK when the name lookup fails', () => {
+  // Found by live testing, not by any harness: the brand-tier quote fallback
+  // could never fire for GymShark because ctx.brand was null. Its catalog media
+  // carries metadata.brand = "Gymshark | Be a visionary." (name + site tagline),
+  // which normalizeBrandName turns into "gymshark be a visionary" — it can never
+  // match the real doc's "gymshark". So brandReviews, styleTheme, logo and
+  // tagline all silently vanished. media.brandId was correct all along.
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'layoutInputService.js'), 'utf8');
+  assert.ok(
+    /media\.brandId\s*\|\|\s*match\?\.brandId/.test(src),
+    'loadContext must consult the brandId FK'
+  );
+  // Order matters: the FK is a FALLBACK so every name resolution that works
+  // today stays byte-identical. Assert the FK block is guarded by !brand.
+  const fkIdx = src.indexOf('media.brandId || match?.brandId');
+  const guard = src.lastIndexOf('if (!brand)', fkIdx);
+  assert.ok(guard > -1 && fkIdx - guard < 400, 'the FK lookup must be gated on the name lookup having failed');
+});
+
+check('B2 the normalizer genuinely cannot bridge a tagline-polluted name', () => {
+  // Pins the premise of the fix — if normalizeBrandName ever starts stripping
+  // taglines, B1's fallback stops being load-bearing and this check says so.
+  const { normalizeBrandName } = require('../models/Brand');
+  assert.strictEqual(normalizeBrandName('Gymshark | Be a visionary.'), 'gymshark be a visionary');
+  assert.strictEqual(normalizeBrandName('GymShark'), 'gymshark');
+  assert.notStrictEqual(
+    normalizeBrandName('Gymshark | Be a visionary.'),
+    normalizeBrandName('GymShark'),
+    'if these ever match, the FK fallback is no longer what rescues this brand'
+  );
+});
+
 // ── report ─────────────────────────────────────────────────────────────
 
 if (failures.length) {
