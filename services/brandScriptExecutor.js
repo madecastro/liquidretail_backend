@@ -658,6 +658,27 @@ function gateLayoutInputQuotes(layoutInput) {
   }
 }
 
+/**
+ * Clean a catalog product title for on-screen DISPLAY.
+ * Strips a trailing parenthetical colorway/variant
+ * ("Women's Breezer Point - Warm Red (Dark Cocoa Sole)" →
+ *  "Women's Breezer Point - Warm Red"), collapses whitespace.
+ * Returns { productName, productNameFull } so callers keep the raw title.
+ * Exported for the verify harness.
+ */
+function cleanProductNameForDisplay(name) {
+  if (name == null) return { productName: null, productNameFull: null };
+  const full = String(name).replace(/\s+/g, ' ').trim();
+  if (!full) return { productName: null, productNameFull: null };
+  // Strip one or more trailing "(…)" segments (colorways, sole, pack size).
+  let cleaned = full;
+  while (/\s*\([^)]*\)\s*$/.test(cleaned)) {
+    cleaned = cleaned.replace(/\s*\([^)]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
+  }
+  if (!cleaned) cleaned = full;
+  return { productName: cleaned, productNameFull: full };
+}
+
 // Build the text-var meta object that a brand script sees. Pulls
 // preferred fields from ad.copy first, then falls back to the ad's
 // LayoutInputArtifact bundle if present. Called by both the initial
@@ -757,6 +778,10 @@ async function buildMetaForAd(ad, brand) {
     ? null
     : (cascaded.promoText ?? null);
 
+  // Display-clean productName (strip trailing parentheticals); keep full
+  // raw cascade value as productNameFull so nothing loses data.
+  const productNameCleaned = cleanProductNameForDisplay(cascaded.productName ?? null);
+
   return {
     // Cascaded fields — every one of these can be re-pointed via
     // Brand.metaCascades[<field>] without a code change. Undefined
@@ -764,7 +789,8 @@ async function buildMetaForAd(ad, brand) {
     // to preserve the shape callers expect.
     brandName:          cascaded.brandName          ?? null,
     badgeText:          cascaded.badgeText          ?? null,
-    productName:        cascaded.productName        ?? null,
+    productName:        productNameCleaned.productName,
+    productNameFull:    productNameCleaned.productNameFull,
     productDescription: cascaded.productDescription ?? null,
     price:              cascaded.price              ?? null,
     benefits:           cascaded.benefits           ?? [],
@@ -1001,7 +1027,7 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
 // Remotion path: spec + tokens resolved server-side, composition rendered
 // by services/remotionRenderService. Never "no chrome" — the canonical
 // preset always exists.
-async function renderWithRemotionAndSave({ ad, brand, format }) {
+async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = null }) {
   if (!ad?.veoVideoUrl) {
     const e = new Error('ad has no veoVideoUrl — Grok has not rendered yet');
     e.status = 400;
@@ -1011,10 +1037,13 @@ async function renderWithRemotionAndSave({ ad, brand, format }) {
   const { renderTitles } = require('./remotionRenderService');
 
   const meta = await buildMetaForAd(ad, brand);
-  // Resolve the spec through the full cascade: ad override > product
-  // override > category leaf→root > brand spec > preset > canonical.
-  // Fetch the product's override doc (cheap, lean) when the ad is
-  // product-linked; category chain is one extra query when categoryRef set.
+  // Resolve the spec for RENDER. With TITLE_SPEC_IGNORE_PERSISTED=true
+  // (default), tier-1 persisted titleStyleSpec docs (ad/product/category/
+  // brand) are skipped — only brand.titleStylePreset (curated file) or
+  // canonical apply. Optional `presetOverride` (argument only, never
+  // persisted) wins over brand.titleStylePreset when the named file
+  // validates. Product/category still fetched for cascade completeness
+  // when the flag is flipped off without a code change.
   let productForSpec = null;
   let categories = [];
   if (ad.productId) {
@@ -1027,7 +1056,10 @@ async function renderWithRemotionAndSave({ ad, brand, format }) {
       }
     } catch { /* non-fatal — falls back to brand/canonical */ }
   }
-  const { spec, source } = resolveSpec({ brand, product: productForSpec, ad, format, categories });
+  // No honourPersistedOverrides — render path must not use stored brand specs.
+  const { spec, source } = resolveSpec({
+    brand, product: productForSpec, ad, format, categories, presetOverride,
+  });
   // Same LayoutInputArtifact tier buildMetaForAd uses — brands without
   // explicit color/font fields still inherit the creative director's
   // brand block (input.brand.primary_color / font_family / …).
@@ -1115,10 +1147,10 @@ async function renderWithRemotionAndSave({ ad, brand, format }) {
 // timings. Caller decides how to handle errors — this helper doesn't
 // swallow them, so both fatal (pipeline) and non-fatal (script preview)
 // call sites can choose behavior.
-async function renderBrandScriptAndSave({ ad, brand }) {
+async function renderBrandScriptAndSave({ ad, brand, presetOverride = null }) {
   const engineChoice = resolveTitlingEngine(brand, ad);
   if (engineChoice.engine === 'remotion') {
-    return renderWithRemotionAndSave({ ad, brand, format: engineChoice.format });
+    return renderWithRemotionAndSave({ ad, brand, format: engineChoice.format, presetOverride });
   }
   if (engineChoice.source === 'custom-script') {
     console.log(`🎨 brandScript[ad=${ad._id}]: custom ${engineChoice.format} script → canvas engine`);
@@ -1169,4 +1201,19 @@ async function renderBrandScriptAndSave({ ad, brand }) {
   });
 }
 
-module.exports = { renderBrandScript, renderBrandScriptAndSave, buildMetaForAd, gateLayoutInputQuotes, previewBrandScript, previewBrandScriptAsVideo, resolveBrandRenderer, resolveTitlingEngine, isVerticalFormat, isLandscapeFormat, isSquareFormat, classifyFormat, BRAND_SCRIPT_FIELD };
+module.exports = {
+  renderBrandScript,
+  renderBrandScriptAndSave,
+  buildMetaForAd,
+  cleanProductNameForDisplay,
+  gateLayoutInputQuotes,
+  previewBrandScript,
+  previewBrandScriptAsVideo,
+  resolveBrandRenderer,
+  resolveTitlingEngine,
+  isVerticalFormat,
+  isLandscapeFormat,
+  isSquareFormat,
+  classifyFormat,
+  BRAND_SCRIPT_FIELD,
+};

@@ -293,6 +293,73 @@ calls** and needs no new vision pass. Prefer this over a separate per-image clas
 (my earlier suggestion — superseded, it was more expensive for the same result). Only existing
 media would need a backfill.
 
+### 0.295 ENDCARD PROBE — VALIDATED, $0.01 (2026-08-04)
+
+Ran one live `gpt-image-2/edit` call on the Allbirds Breezer Point to test the §0.28 endcard
+idea before building anything. **It works.**
+
+- `size:"1152x2048"` accepted -> returned exactly 1152x2048 = **0.5625 = perfect 9:16**
+  (note `buildParams`' comment at `atlasImageService.js:440` lists only 3 sizes — STALE, the
+  live schema has 14)
+- 115s, $0.01, one submit
+- Output: elegant editorial serif headline, clean price line, pill CTA, generous negative space,
+  bottom-right corner left EMPTY for logo compositing as instructed, all spelling correct
+- **No invented logo on the product** — the explicit "Do NOT add, invent, or redraw ANY logo,
+  emblem, badge or wordmark; it carries none" instruction HELD. Worth reusing verbatim in the
+  static path, given the Timberland defect.
+- Qualitatively far better than the current Remotion CSS card, and the raw-SKU-title problem
+  disappears because copy is authored, not concatenated.
+
+**Measured product-fidelity drift** (mean saturated-red pixel, source vs render):
+`#a03849` -> `#b15760` — ~11% lighter, ~13% LESS saturated, shifted pink. NOTE: an earlier
+eyeball read in-session called it "deeper burgundy" and that was WRONG in direction; the
+measurement is the record. Part of the shift is legitimately the warm scene lighting that was
+requested, so this is a judgement call rather than an unambiguous bug — but it is exactly what
+the §0.2 vision QC "product fidelity vs original" check is for, and it is measurable this way.
+
+**Two prompt fixes for the next iteration:** "125 dollars" rendered literally (written that way
+to dodge glyph mangling — test "$125"); and the product sat mid-frame leaving dead space
+instead of the requested lower-centre.
+
+### 0.296 TITLING "REGRESSION" — DIAGNOSED. A stale stored brand spec shadows canonical.
+
+Owner, on seeing the re-titled Allbirds render: *"We had really great titles going and now I am
+seeing scrim again"*, *"this is not the canonical titling we were using last"*, *"this font is
+incorrect"*. All three are correct. Mechanism, verified:
+
+**There is NO LLM in the live titling path.** `services/titleSpecService.js` has zero
+`chatCompletion` references. `resolveSpec` (`:121-162`) is purely deterministic:
+ 1. stored override docs — **ad > product > category > brand** (`:123-138`)
+ 2. pinned named preset `brand.titleStylePreset` (`:141-152`)
+ 3. canonical floor `remotion/presets/canonical.json` (`:155-161`)
+Title Studio (`aiLayoutStudioService.js:219`) DOES call an LLM, but it **persists** a
+`titleStyleSpec`; the renderer just replays that stored document.
+
+**The render logged `spec=brand`.** Per `:130-135` that tier only returns when
+`brand.titleStyleSpec[format]` exists AND validates. So Allbirds carries a persisted `vertical`
+spec that wins over everything below it.
+
+**Canonical is clean — proving the render was not canonical.** `remotion/presets/canonical.json`
+`byFormat.vertical` has `scrim: "none"` for every slot. The render HAS a heavy scrim, so it
+categorically did not use canonical. The `0e885c5` / `da1f2b4` "no-scrim cinema standard" is
+being bypassed for any brand holding a stored spec.
+
+**Where the good titles came from:** `remotion/presets/` holds CURATED per-brand presets —
+`soludos-mediterranean-editorial`, `soludos-summer-postcard`, `pelagic-bluewater-editorial`,
+`pelagic-offshore-bold`, `babyboo-editorial-monochrome`, `babyboo-main-character`. Allbirds has
+NO preset, so it never reaches tier 2 or 3.
+
+**THE STRUCTURAL BUG:** a persisted brand spec permanently shadows the canonical standard.
+Improving canonical reaches only brands with no stored override. Any brand frozen with an old
+spec keeps that look forever, silently. Needs a version/freshness stamp on stored specs so a
+stale one falls through, or an explicit "prefer canonical unless curated" rule.
+
+**Owner direction:** *"even the canonical titling is okay but use the right fonts and right
+positioning."* So the target is: reach CANONICAL (not the stale stored spec), with correct brand
+fonts (see §0.27 — Allbirds gets Inter because "Self Modern" matches no substitution) and better
+positioning. NOTE canonical's only anchor is `upperThird`, which is exactly the top-heavy layout
+measured in §0(c) — 26% of frame height unused. Positioning is a CANONICAL-level fix.
+
 ### 0.3 Landed this session (branch `fix/remotion-font-fatal-load`, NOT committed)
 
 | change | files |

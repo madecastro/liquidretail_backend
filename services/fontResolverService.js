@@ -53,6 +53,39 @@ async function ensureCacheDir() {
   await fsp.mkdir(FONT_CACHE_DIR, { recursive: true });
 }
 
+// Font container magic (first 4 bytes). Mirrors brandFontIngestService —
+// duplicated here to avoid a resolver→ingest dependency for a 5-line check.
+// Known good: wOFF, wOF2, OTTO, 00010000 (ttf), ttcf. HTML interstitials
+// and other non-font 200 bodies fail this check.
+function isFontMagicLocal(buf) {
+  if (!buf || buf.length < 4) return false;
+  const head = Buffer.isBuffer(buf) ? buf.subarray(0, 4) : Buffer.from(buf).subarray(0, 4);
+  return (
+    head.equals(Buffer.from('wOFF')) ||
+    head.equals(Buffer.from('wOF2')) ||
+    head.equals(Buffer.from('OTTO')) ||
+    head.equals(Buffer.from([0x00, 0x01, 0x00, 0x00])) ||
+    head.equals(Buffer.from('ttcf'))
+  );
+}
+
+/** Read first 4 bytes of a cached file; false if missing / short / not font. */
+async function localCacheIsFont(filePath) {
+  try {
+    const fh = await fsp.open(filePath, 'r');
+    try {
+      const head = Buffer.alloc(4);
+      const { bytesRead } = await fh.read(head, 0, 4, 0);
+      if (bytesRead < 4) return false;
+      return isFontMagicLocal(head);
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
 async function downloadTo(url, filePath, { headers = {} } = {}) {
   const res = await axios.get(url, {
     responseType: 'arraybuffer',
@@ -184,19 +217,36 @@ async function resolveGoogleFamily(family, weight = 400) {
 }
 
 /**
+ * BRAND_FONT_ASSUME_LICENSED (default true): when on, commercial-CDN faces
+ * that were successfully mirrored (url set, needsLicense not explicitly true)
+ * are eligible for use. Classification is not rewritten — only use is gated.
+ * Read at call time so tests can flip the env without reloading the module.
+ */
+function brandFontAssumeLicensed() {
+  return String(process.env.BRAND_FONT_ASSUME_LICENSED ?? 'true').toLowerCase() !== 'false';
+}
+
+/**
  * Find an ingested website font on the brand matching `family`
  * (case/space-insensitive), preferring the requested weight. The style
  * must match so a roman request never silently renders with an italic face.
+ *
+ * Always rejects entries with no url (failed mirror is unusable) and
+ * entries with needsLicense:true (explicit human hold). Commercial faces
+ * require BRAND_FONT_ASSUME_LICENSED to be on.
  */
 function matchCustomFont(brand, family, { weight = 400, style = 'normal' } = {}) {
   const list = Array.isArray(brand?.customFonts) ? brand.customFonts : [];
   const want = familyKey(family);
   if (!want) return null;
-  const usable = list.filter((f) =>
-    f && f.url && f.license !== 'commercial' && !f.needsLicense &&
-    familyKey(f.family) === want &&
-    (f.style || 'normal') === style
-  );
+  const assumeLicensed = brandFontAssumeLicensed();
+  const usable = list.filter((f) => {
+    if (!f || !f.url) return false;
+    // Explicit human hold always wins over the assume-licensed flag.
+    if (f.needsLicense === true) return false;
+    if (f.license === 'commercial' && !assumeLicensed) return false;
+    return familyKey(f.family) === want && (f.style || 'normal') === style;
+  });
   if (!usable.length) return null;
   usable.sort((a, b) => {
     const distance = (font) => {
@@ -221,7 +271,20 @@ async function resolveCustomFont(brand, custom, requestedWeight = custom.weight 
   try {
     await ensureCacheDir();
     const stat = await fsp.stat(localPath).catch(() => null);
-    if (!stat || stat.size < 1024) await downloadTo(custom.url, localPath);
+    // Size alone is not enough: a prior 200 HTML interstitial can sit in
+    // cache at ≥1KB. Magic-byte check self-heals bad caches (re-download).
+    // Real font files (woff/woff2/otf/ttf/ttc) always pass — no risk to
+    // previously good mirrors.
+    let cacheOk = stat && stat.size >= 1024 && await localCacheIsFont(localPath);
+    if (!cacheOk) {
+      if (stat) await fsp.rm(localPath, { force: true }).catch(() => {});
+      await downloadTo(custom.url, localPath);
+      // Reject a freshly downloaded non-font the same way as a miss.
+      if (!(await localCacheIsFont(localPath))) {
+        await fsp.rm(localPath, { force: true }).catch(() => {});
+        throw new Error(`custom font payload not-a-font for '${custom.family}'`);
+      }
+    }
     const entry = {
       family: custom.family,
       weight: effectiveWeight,
@@ -250,7 +313,16 @@ async function resolveCustomFont(brand, custom, requestedWeight = custom.weight 
 // Common proprietary families mapped to the nearest face in the bundled,
 // redistributable Google-font library. This tier is reached only after an
 // exact customer-website face and an exact Google Fonts lookup both fail.
+//
+// Order matters:
+//   1) foundry names first (stable for brands that already matched),
+//   2) commercial DTC webfonts (specific named faces — must beat generic
+//      classification tokens like "display"/"grotesk" in "Domaine Display"),
+//   3) type-classification vocabulary (proprietary names like "Self Modern").
+// Foundry + classification row contents/order relative to each other are
+// unchanged; commercial is inserted between so named faces win over class words.
 const LIBRARY_SUBSTITUTIONS = [
+  // ── Foundry names (do not reorder relative to each other) ──────────────
   { pattern: /helvetica|arial|univers|frutiger|neue haas/i, family: 'Inter', reason: 'neutral grotesk sans' },
   { pattern: /gotham|proxima|futura|century gothic|brandon/i, family: 'Montserrat', reason: 'geometric sans' },
   { pattern: /avenir|circular|museo sans|sofia pro/i, family: 'DM Sans', reason: 'modern humanist sans' },
@@ -258,15 +330,336 @@ const LIBRARY_SUBSTITUTIONS = [
   { pattern: /impact|haettenschweiler/i, family: 'Anton', reason: 'heavy display sans' },
   { pattern: /bodoni|didot|walbaum/i, family: 'Playfair Display', reason: 'high-contrast editorial serif' },
   { pattern: /garamond|caslon|baskerville|minion|adobe jenson/i, family: 'Cormorant Garamond', reason: 'old-style editorial serif' },
-  { pattern: /script|brush|handwriting|calligraphy/i, family: 'Great Vibes', reason: 'formal script' }
+  { pattern: /script|brush|handwriting|calligraphy/i, family: 'Great Vibes', reason: 'formal script' },
+  // ── Commercial DTC webfonts (named faces; before classification) ───────
+  // Used when the brand face cannot be mirrored (foundry CDN 403 / subset /
+  // obfuscation). Every target MUST be one of the 16 curated faces in
+  // fontLoader.FONTS — a target outside that list 404s at render. Foundry
+  // rows above still win first for overlaps (e.g. Circular → DM Sans).
+  { pattern: /s[oö]hne|soehne/i, family: 'Inter', reason: 'Söhne → Inter (Klim neo-grotesk)' },
+  { pattern: /gt\s*america/i, family: 'Inter', reason: 'GT America → Inter (Grilli American grotesque)' },
+  { pattern: /untitled\s*sans/i, family: 'Inter', reason: 'Untitled Sans → Inter (Klim neo-grotesk)' },
+  { pattern: /\bcanela\b/i, family: 'Playfair Display', reason: 'Canela → Playfair (Commercial Type high-contrast serif)' },
+  { pattern: /\btiempos\b/i, family: 'Lora', reason: 'Tiempos → Lora (Klim editorial text serif)' },
+  { pattern: /\bgraphik\b/i, family: 'Inter', reason: 'Graphik → Inter (Commercial Type neo-grotesk)' },
+  { pattern: /\bsuisse\b/i, family: 'Inter', reason: 'Suisse → Inter (Swiss Typefaces grotesque)' },
+  { pattern: /maison\s*neue/i, family: 'Montserrat', reason: 'Maison Neue → Montserrat (geometric sans)' },
+  { pattern: /\baeonik\b/i, family: 'Montserrat', reason: 'Aeonik → Montserrat (CoType geometric sans)' },
+  { pattern: /national\s*2/i, family: 'DM Sans', reason: 'National 2 → DM Sans (Klim soft grotesque)' },
+  { pattern: /neue\s*montreal/i, family: 'Inter', reason: 'Neue Montreal → Inter (Pangram neo-grotesk)' },
+  { pattern: /sharp\s*grotesk/i, family: 'Inter', reason: 'Sharp Grotesk → Inter (Sharp Type display grotesque)' },
+  { pattern: /\brecoleta\b/i, family: 'Cormorant', reason: 'Recoleta → Cormorant (soft rounded display serif)' },
+  { pattern: /\bdomaine\b/i, family: 'Playfair Display', reason: 'Domaine → Playfair (Klim fashion display serif)' },
+  { pattern: /aperc[uú]|aperçu/i, family: 'Montserrat', reason: 'Aperçu → Montserrat (Colophon geometric grotesk)' },
+  { pattern: /founders\s*grotesk/i, family: 'Inter', reason: 'Founders Grotesk → Inter (Klim neo-grotesk)' },
+  { pattern: /\bdruk\b/i, family: 'Bebas Neue', reason: 'Druk → Bebas Neue (Commercial Type condensed display)' },
+  { pattern: /gt\s*walsheim/i, family: 'Montserrat', reason: 'GT Walsheim → Montserrat (Grilli geometric sans)' },
+  { pattern: /gt\s*sectra/i, family: 'Playfair Display', reason: 'GT Sectra → Playfair (Grilli contrast serif)' },
+  { pattern: /editorial\s*new/i, family: 'Playfair Display', reason: 'Editorial New → Playfair (Pangram editorial display serif)' },
+  { pattern: /pp\s*mori/i, family: 'Montserrat', reason: 'PP Mori → Montserrat (Pangram geometric sans)' },
+  { pattern: /\bwhyte\b/i, family: 'Inter', reason: 'Whyte → Inter (Dinamo neo-grotesk)' },
+  { pattern: /\bfavorit\b/i, family: 'Montserrat', reason: 'Favorit → Montserrat (Dinamo geometric sans)' },
+  { pattern: /\bakkurat\b/i, family: 'Inter', reason: 'Akkurat → Inter (Lineto Swiss grotesk)' },
+  { pattern: /\bpublico\b/i, family: 'Lora', reason: 'Publico → Lora (Commercial Type news text serif)' },
+  { pattern: /\bstyrene\b/i, family: 'Montserrat', reason: 'Styrene → Montserrat (Commercial Type geometric sans)' },
+  { pattern: /\broobert\b/i, family: 'Montserrat', reason: 'Roobert → Montserrat (Displaay geometric sans)' },
+  { pattern: /ideal\s*sans/i, family: 'DM Sans', reason: 'Ideal Sans → DM Sans (Hoefler humanist sans)' },
+  { pattern: /\bfreight\b/i, family: 'Lora', reason: 'Freight → Lora (GarageFonts editorial serif)' },
+  { pattern: /sang\s*bleu|sangbleu/i, family: 'Cormorant', reason: 'SangBleu → Cormorant (Swiss Typefaces fashion serif)' },
+  { pattern: /monument\s*grotesk/i, family: 'Inter', reason: 'Monument Grotesk → Inter (Dinamo neo-grotesk)' },
+  { pattern: /abc\s*diatype|\bdiatype\b/i, family: 'Montserrat', reason: 'ABC Diatype → Montserrat (Dinamo geometric sans)' },
+  { pattern: /noe\s*display/i, family: 'Playfair Display', reason: 'Noe Display → Playfair (Schwartzco display serif)' },
+  { pattern: /\bsaans\b/i, family: 'Inter', reason: 'Saans → Inter (Displaay neo-grotesk)' },
+  // Circular also appears in foundry row above (same target); listed for audit.
+  { pattern: /ll\s*circular|\bcircular\b/i, family: 'DM Sans', reason: 'Circular → DM Sans (Lineto geometric-humanist sans)' },
+  { pattern: /\baustin(\s+(text|display))?\b/i, family: 'Playfair Display', reason: 'Austin → Playfair (Commercial Type Didone)' },
+  // ── Type-classification vocabulary (proprietary DTC names often carry these) ──
+  // More specific compounds before single-token classes (humanist serif before
+  // humanist; grotesk before bare "modern" so "Modern Grotesk" stays a sans).
+  { pattern: /old.?style|humanist serif/i, family: 'Cormorant Garamond', reason: 'old-style/humanist-serif classification' },
+  { pattern: /grotesk|grotesque/i, family: 'Inter', reason: 'grotesk/grotesque classification' },
+  { pattern: /geometric/i, family: 'Montserrat', reason: 'geometric classification' },
+  { pattern: /humanist/i, family: 'DM Sans', reason: 'humanist sans classification' },
+  { pattern: /condensed|compressed|narrow/i, family: 'Oswald', reason: 'condensed classification' },
+  { pattern: /extended|wide/i, family: 'Anton', reason: 'extended/wide display classification' },
+  { pattern: /display|poster|headline/i, family: 'Bebas Neue', reason: 'display/poster classification' },
+  { pattern: /rounded|soft/i, family: 'Quicksand', reason: 'rounded/soft classification' },
+  { pattern: /mono|plex|technical/i, family: 'IBM Plex Sans', reason: 'mono/technical classification' },
+  { pattern: /elegant|luxe|couture/i, family: 'Cormorant', reason: 'elegant/luxe classification' },
+  // No true slab in the 16-face library; Lora is the closest transitional
+  // serif with enough weight to stand in for Rockwell/Roboto Slab-class faces.
+  { pattern: /slab/i, family: 'Lora', reason: 'slab → Lora (closest available; no true slab in library)' },
+  // "Modern" as a classification = Didone (high-contrast serif). Word-boundary
+  // so we do not steal longer tokens; "Self Modern" / "Modern" both match.
+  { pattern: /didone|\bmodern\b/i, family: 'Playfair Display', reason: 'modern/didone classification' },
 ];
 
-let libraryReadyPromise = null;
-async function resolveLibraryMatch(requestedFamily, weight = 400) {
+// Faces that must not land on body copy (legibility). Applied only when
+// role === 'body'; foundry/classification non-regression tests use heading
+// or null role so script→Great Vibes etc. stay unchanged.
+const BODY_UNSAFE_FACES = new Set(['Anton', 'Bebas Neue', 'Great Vibes', 'Antonio']);
+
+// Serif faces in the curated 16 (must stay aligned with SERIF_HINTS /
+// fallbackFor). Great Vibes is a script; treated as serif-intent for the
+// serif/sans constraint when it is the chosen face.
+const LIBRARY_SERIF_FACES = new Set([
+  'Playfair Display', 'Lora', 'Cormorant', 'Cormorant Garamond', 'Great Vibes',
+]);
+
+/**
+ * Flatten brand fields that carry typographic signal into one lowercased
+ * string. Deterministic: fixed field order, no dates/ids/mutable stamps.
+ */
+function brandSignalText(brand) {
+  if (!brand || typeof brand !== 'object') return '';
+  const parts = [];
+  const push = (v) => {
+    if (v == null) return;
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      parts.push(String(v));
+      return;
+    }
+    if (Array.isArray(v)) {
+      for (const item of v) push(item);
+      return;
+    }
+    if (typeof v === 'object') {
+      // Stable key order so the same brand object always yields the same blob.
+      for (const key of Object.keys(v).sort()) {
+        // Skip ids/timestamps that would break determinism if they ever appear.
+        if (/^(updatedAt|createdAt|adjustedAt|_id|id|fetchedAt|ingestedAt)$/i.test(key)) continue;
+        push(v[key]);
+      }
+    }
+  };
+  push(brand.brandSafety && brand.brandSafety.category);
+  push(brand.category);
+  push(brand.tone);
+  push(brand.tags);
+  push(brand.styleTheme);
+  push(brand.tailwindTheme);
+  push(brand.websiteFontUsage);
+  return parts.join(' ').toLowerCase();
+}
+
+// Ordered brand-signal rules. First match wins. Each rule names a face per
+// (role, serif|sans) so heading can take a display face while body stays
+// legible. Covers the faces that classification vocabulary alone cannot
+// always reach (Antonio, Poppins, Nunito, …).
+const BRAND_SIGNAL_RULES = [
+  {
+    re: /luxury|premium|luxe|couture|jewelry|jewellery|beauty/,
+    reason: 'brand signal: luxury/premium',
+    faces: {
+      heading: { serif: 'Cormorant', 'sans-serif': 'Montserrat' },
+      body: { serif: 'Cormorant Garamond', 'sans-serif': 'DM Sans' },
+      quote: { serif: 'Cormorant', 'sans-serif': 'DM Sans' },
+    },
+  },
+  {
+    re: /sport|athletic|fitness|outdoor|outdoors|rugged/,
+    reason: 'brand signal: sport/athletic',
+    faces: {
+      heading: { serif: 'Playfair Display', 'sans-serif': 'Antonio' },
+      // Body stays on a highly-legible face (not condensed display).
+      body: { serif: 'Lora', 'sans-serif': 'IBM Plex Sans' },
+      quote: { serif: 'Lora', 'sans-serif': 'Oswald' },
+    },
+  },
+  {
+    re: /tech|software|saas|digital|\bai\b|electronics/,
+    reason: 'brand signal: tech',
+    faces: {
+      heading: { serif: 'Lora', 'sans-serif': 'IBM Plex Sans' },
+      body: { serif: 'Lora', 'sans-serif': 'IBM Plex Sans' },
+      quote: { serif: 'Lora', 'sans-serif': 'IBM Plex Sans' },
+    },
+  },
+  {
+    re: /food|cpg|beverage|restaurant|grocery|cafe|coffee/,
+    reason: 'brand signal: food/cpg',
+    faces: {
+      heading: { serif: 'Lora', 'sans-serif': 'Nunito' },
+      body: { serif: 'Lora', 'sans-serif': 'Nunito' },
+      quote: { serif: 'Lora', 'sans-serif': 'Nunito' },
+    },
+  },
+  {
+    re: /playful|fun|friendly|kids|toy|whimsical/,
+    reason: 'brand signal: playful/friendly',
+    faces: {
+      heading: { serif: 'Lora', 'sans-serif': 'Poppins' },
+      body: { serif: 'Lora', 'sans-serif': 'Poppins' },
+      quote: { serif: 'Lora', 'sans-serif': 'Poppins' },
+    },
+  },
+  {
+    re: /warm|casual|soft|rounded|cozy/,
+    reason: 'brand signal: warm/casual',
+    faces: {
+      heading: { serif: 'Lora', 'sans-serif': 'Nunito' },
+      body: { serif: 'Lora', 'sans-serif': 'Quicksand' },
+      quote: { serif: 'Lora', 'sans-serif': 'Nunito' },
+    },
+  },
+  {
+    re: /bold|loud|energetic|impactful/,
+    reason: 'brand signal: bold/loud',
+    faces: {
+      heading: { serif: 'Playfair Display', 'sans-serif': 'Bebas Neue' },
+      body: { serif: 'Lora', 'sans-serif': 'Montserrat' },
+      quote: { serif: 'Playfair Display', 'sans-serif': 'Anton' },
+    },
+  },
+  {
+    re: /apparel|fashion|clothing|footwear|shoe|sneaker/,
+    reason: 'brand signal: apparel/fashion',
+    faces: {
+      heading: { serif: 'Playfair Display', 'sans-serif': 'Montserrat' },
+      body: { serif: 'Lora', 'sans-serif': 'Poppins' },
+      quote: { serif: 'Playfair Display', 'sans-serif': 'DM Sans' },
+    },
+  },
+  {
+    re: /minimal|clean|professional|corporate/,
+    reason: 'brand signal: minimal/clean',
+    faces: {
+      heading: { serif: 'Cormorant Garamond', 'sans-serif': 'DM Sans' },
+      body: { serif: 'Lora', 'sans-serif': 'DM Sans' },
+      quote: { serif: 'Lora', 'sans-serif': 'DM Sans' },
+    },
+  },
+];
+
+function roleKey(role) {
+  if (role === 'heading' || role === 'body' || role === 'quote') return role;
+  return 'body';
+}
+
+/**
+ * When a classification/foundry pick lands on a display/script face for body
+ * copy, remap to a legible peer keeping serif/sans intent.
+ */
+function enforceBodyLegibility(family, intent) {
+  if (!BODY_UNSAFE_FACES.has(family)) return { family, remapped: false };
+  if (intent === 'serif') {
+    return { family: 'Lora', remapped: true };
+  }
+  // Sans display/script → neutral grotesk (never a second display face).
+  return { family: 'Inter', remapped: true };
+}
+
+/**
+ * Role-aware default when neither a name match nor a brand signal fires.
+ * Deterministic; preserves serif/sans intent from the requested family.
+ */
+function defaultLibraryPick(intent, role) {
+  const r = roleKey(role);
+  if (intent === 'serif') {
+    if (r === 'heading') {
+      return { family: 'Playfair Display', reason: 'serif heading default (library)' };
+    }
+    if (r === 'quote') {
+      return { family: 'Lora', reason: 'serif quote default (library)' };
+    }
+    return { family: 'Lora', reason: 'serif body default (library)' };
+  }
+  if (r === 'heading') {
+    return { family: 'Inter', reason: 'sans heading default (library)' };
+  }
+  return { family: 'Inter', reason: 'sans body default (library)' };
+}
+
+/**
+ * Pure library-face chooser (no I/O). Used by resolveLibraryMatch and the
+ * offline verify harness. Same brand+role+requestedFamily ALWAYS returns
+ * the same face — no randomness, no mutable stamps.
+ *
+ * @returns {{ family: string, matchReason: string, requestedFamily: string, intent: string } | null}
+ */
+function pickLibraryFamily(requestedFamily, { brand = null, role = null } = {}) {
   const requested = normalizeFontFamily(requestedFamily);
   if (!requested) return null;
+
+  const intent = fallbackFor(requested); // 'serif' | 'sans-serif'
+  const r = roleKey(role);
+
+  // 1) Name-based foundry + classification table. Classification is
+  // authoritative (e.g. "Self Modern" → Didone/Playfair even though the
+  // bare name does not look serif to fallbackFor). Do not undo these with
+  // the intent guard below.
   const substitution = LIBRARY_SUBSTITUTIONS.find((item) => item.pattern.test(requested));
-  const matchedFamily = substitution?.family || (fallbackFor(requested) === 'serif' ? 'Lora' : 'Inter');
+  let family = null;
+  let matchReason = null;
+  let fromNameTable = false;
+
+  if (substitution) {
+    family = substitution.family;
+    matchReason = substitution.reason;
+    fromNameTable = true;
+  } else {
+    // 2) Brand-signal-informed chooser (category / tone / theme / tags).
+    const signals = brandSignalText(brand);
+    if (signals) {
+      for (const rule of BRAND_SIGNAL_RULES) {
+        if (!rule.re.test(signals)) continue;
+        const byRole = rule.faces[r] || rule.faces.body;
+        const candidate = byRole[intent] || byRole['sans-serif'];
+        if (candidate) {
+          family = candidate;
+          matchReason = rule.reason;
+          break;
+        }
+      }
+    }
+    // 3) Role-aware serif/sans default (replaces binary Lora/Inter).
+    if (!family) {
+      const def = defaultLibraryPick(intent, r);
+      family = def.family;
+      matchReason = def.reason;
+    }
+  }
+
+  // Body must stay legible — never burn display/script into paragraph copy.
+  // Applies even to name-table hits (script → Great Vibes on body is wrong).
+  if (r === 'body') {
+    const safe = enforceBodyLegibility(family, intent);
+    if (safe.remapped) {
+      matchReason = `${matchReason}; body-safe remap → ${safe.family}`;
+      family = safe.family;
+    }
+  }
+
+  // Serif/sans intent guard for brand-signal + default paths only. Name-table
+  // hits already encode classification knowledge (modern→Didone, script→…).
+  // Constraint: a serif-hinted request never lands on a grotesk, and a
+  // non-serif request never lands on a serif when we chose by brand/default.
+  if (!fromNameTable) {
+    const familyIsSerif = LIBRARY_SERIF_FACES.has(family);
+    if (intent === 'serif' && !familyIsSerif) {
+      const def = defaultLibraryPick('serif', r);
+      matchReason = `${matchReason}; serif-intent guard → ${def.family}`;
+      family = def.family;
+    } else if (intent === 'sans-serif' && familyIsSerif) {
+      const def = defaultLibraryPick('sans-serif', r);
+      matchReason = `${matchReason}; sans-intent guard → ${def.family}`;
+      family = def.family;
+    }
+  }
+
+  return {
+    family,
+    matchReason,
+    requestedFamily: requested,
+    intent,
+  };
+}
+
+let libraryReadyPromise = null;
+async function resolveLibraryMatch(requestedFamily, weight = 400, { brand = null, role = null } = {}) {
+  const pick = pickLibraryFamily(requestedFamily, { brand, role });
+  if (!pick) return null;
+  const matchedFamily = pick.family;
   const { ensureFontsLoaded, FONTS, FONTS_DIR } = require('./fontLoader');
   if (!libraryReadyPromise) libraryReadyPromise = ensureFontsLoaded();
   await libraryReadyPromise;
@@ -288,9 +681,9 @@ async function resolveLibraryMatch(requestedFamily, weight = 400) {
     fallback: fallbackFor(font.family),
     source: 'library-match',
     exact: false,
-    requestedFamily: requested,
+    requestedFamily: pick.requestedFamily,
     resolvedFamily: font.family,
-    matchReason: substitution?.reason || `${fallbackFor(requested)} fallback`
+    matchReason: pick.matchReason,
   };
 }
 
@@ -299,7 +692,7 @@ async function resolveLibraryMatch(requestedFamily, weight = 400) {
  * { family, weight, style, localPath|null, fallback, source } — localPath
  * null means "let the browser fall back" (family kept for CSS stacks).
  */
-async function resolveFamily(family, { brand = null, weight = 400 } = {}) {
+async function resolveFamily(family, { brand = null, weight = 400, role = null } = {}) {
   family = normalizeFontFamily(family);
   if (!family) return null;
 
@@ -312,7 +705,9 @@ async function resolveFamily(family, { brand = null, weight = 400 } = {}) {
   const google = await resolveGoogleFamily(family, weight);
   if (google) return google;
 
-  const library = await resolveLibraryMatch(family, weight);
+  // Library fallback only — brand + role inform the curated-face pick when
+  // the proprietary name misses both custom and Google (common DTC case).
+  const library = await resolveLibraryMatch(family, weight, { brand, role });
   if (library) {
     console.warn(
       `🔤 fontResolver: '${family}' unavailable — using closest library face ` +
@@ -367,9 +762,9 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
   const out = {};
   for (const role of ['heading', 'body', 'quote']) {
     const def = DEFAULT_ROLE_FONTS[role];
-    let entry = await resolveFamily(wanted[role], { brand, weight: weights[role] });
+    let entry = await resolveFamily(wanted[role], { brand, weight: weights[role], role });
     if (!entry && wanted[role] !== def.family) {
-      entry = await resolveFamily(def.family, { brand, weight: def.weight });
+      entry = await resolveFamily(def.family, { brand, weight: def.weight, role });
     }
     // entry.weight is the weight of the actual font FILE (may differ from the
     // requested weight when a family only ships one cut) — FontFace must be
@@ -399,8 +794,15 @@ module.exports = {
   resolveFamily,
   resolveGoogleFamily,
   resolveLibraryMatch,
+  pickLibraryFamily,
   normalizeFontFamily,
   matchCustomFont,
+  brandFontAssumeLicensed,
+  fallbackFor,
+  brandSignalText,
+  LIBRARY_SUBSTITUTIONS,
+  BODY_UNSAFE_FACES,
+  LIBRARY_SERIF_FACES,
   FONT_CACHE_DIR,
   DEFAULT_ROLE_FONTS,
 };

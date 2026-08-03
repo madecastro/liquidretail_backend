@@ -9,9 +9,14 @@
 //
 // License policy — the whole point of this service vs. "just hotlink it":
 //   · fonts.gstatic.com / fonts.googleapis.com   → 'google'   (ingest)
-//   · known commercial foundry/webfont CDNs      → 'commercial' — NEVER
-//     downloaded; returned in `flagged` with url:null + needsLicense:true
-//     so a human can clear the license before the face is usable.
+//   · known commercial foundry/webfont CDNs      → 'commercial'
+//     Classification is ALWAYS recorded as license:'commercial' (audit).
+//     Download/use is gated by BRAND_FONT_ASSUME_LICENSED (default true —
+//     owner posture: advertiser's typeface in advertiser's own ads):
+//       true  → attempt mirror like any other face; success → url set,
+//               needsLicense:false; failure → flagged url:null (non-fatal,
+//               library-match fallback still works).
+//       false → never download; flagged with url:null + needsLicense:true.
 //   · self-hosted / generic CDN                  → 'open' when the URL
 //     hints OFL, else 'unknown' — still ingested (the brand already serves
 //     the file publicly on its own storefront) but the license is recorded
@@ -36,10 +41,26 @@ const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 
 const MAX_STYLESHEETS = 12;   // fetch cap — big themes ship dozens of sheets
-const MAX_INGESTED_FACES = 12; // upload cap — enough for any sane brand kit
+// Face mirror budgets — commercial is SEPARATE so a Typekit kit cannot
+// starve open/Google/self-hosted faces of their full open budget.
+//   open / google / unknown  → MAX_INGESTED_FACES (12)
+//   commercial               → MAX_COMMERCIAL_FACES (6)
+// Total mirrored can be up to 18 when both classes are present.
+const MAX_INGESTED_FACES = 12;   // open / google / self-hosted (unknown) budget
+const MAX_COMMERCIAL_FACES = 6;  // commercial-CDN budget (independent)
 const MIN_FONT_BYTES = 1024;             // smaller = error page / tracking pixel
 const MAX_FONT_BYTES = 5 * 1024 * 1024;  // larger = CJK mega-font, not worth mirroring
 const MAX_HTML_BYTES = 6 * 1024 * 1024;
+
+// Font file magic (first 4 bytes). Anything else is an interstitial / HTML
+// challenge / error page that foundry CDNs sometimes return as HTTP 200.
+const FONT_MAGIC_SIGNATURES = [
+  Buffer.from('wOFF'),                   // woff
+  Buffer.from('wOF2'),                   // woff2
+  Buffer.from('OTTO'),                   // otf (CFF OpenType)
+  Buffer.from([0x00, 0x01, 0x00, 0x00]), // ttf / TrueType sfnt
+  Buffer.from('ttcf'),                   // TrueType / OpenType collection
+];
 
 const GOOGLE_FONT_HOSTS = ['fonts.gstatic.com', 'fonts.googleapis.com'];
 
@@ -74,9 +95,20 @@ const FORMAT_RANK = { woff2: 4, woff: 3, ttf: 2, otf: 1 };
 // ── License classification ─────────────────────────────────────────────
 
 /**
+ * Owner-accepted licensing posture (BRAND_FONT_ASSUME_LICENSED, default true):
+ * attempt commercial-CDN downloads and treat successful mirrors as usable.
+ * Read at call time so tests / ops can flip without reloading the module.
+ * Classification is independent — this flag never rewrites license labels.
+ */
+function brandFontAssumeLicensed() {
+  return String(process.env.BRAND_FONT_ASSUME_LICENSED ?? 'true').toLowerCase() !== 'false';
+}
+
+/**
  * Classify a font file / CSS URL by host → 'google' | 'commercial' |
  * 'open' | 'unknown'. 'unknown' is still ingestable (self-hosted file the
- * brand serves publicly); 'commercial' is never downloaded.
+ * brand serves publicly). 'commercial' is always labeled commercial; whether
+ * we attempt a download is governed by brandFontAssumeLicensed().
  */
 function classifyFontSource(url) {
   let host, pathname;
@@ -91,6 +123,59 @@ function classifyFontSource(url) {
   if (COMMERCIAL_FOUNDRY_HOSTS.some((h) => host.includes(h))) return 'commercial';
   if (OPEN_LICENSE_HINT.test(pathname)) return 'open';
   return 'unknown';
+}
+
+/**
+ * Distinct failure class for ops logs — foundry CDNs commonly 403/obfuscate.
+ * Never throws; pure of (err).
+ */
+function downloadFailureClass(err) {
+  const status = err && err.response && err.response.status;
+  if (status === 403) return 'http-403';
+  if (status === 404) return 'http-404';
+  if (status === 401) return 'http-401';
+  if (Number.isFinite(status)) return `http-${status}`;
+  const msg = String((err && err.message) || err || '');
+  if (/timeout|ETIMEDOUT|ECONNABORTED|ESOCKETTIMEDOUT/i.test(msg)) return 'timeout';
+  if (/ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|network/i.test(msg)) return 'network';
+  if (/not-a-font/i.test(msg)) return 'not-a-font';
+  if (/too small|error page/i.test(msg)) return 'payload-invalid';
+  if (/too large/i.test(msg)) return 'payload-too-large';
+  if (/parse|unexpected/i.test(msg)) return 'parse';
+  return 'download-error';
+}
+
+/**
+ * True when buf starts with a known font magic (woff / woff2 / otf / ttf / ttc).
+ * Pure of (buf). Used before treating any download as a usable face.
+ */
+function isFontMagic(buf) {
+  if (!buf || buf.length < 4) return false;
+  const head = Buffer.isBuffer(buf) ? buf.subarray(0, 4) : Buffer.from(buf).subarray(0, 4);
+  return FONT_MAGIC_SIGNATURES.some((sig) => head.equals(sig));
+}
+
+/**
+ * Whether another face of this license class may still be mirrored.
+ * Commercial and open/google/unknown budgets are independent — a Typekit
+ * kit filling commercial slots must not consume the open budget.
+ * Pure of (license, counts). Drive this from tests; do not re-implement.
+ *
+ * @param {string} license  'commercial' | 'google' | 'open' | 'unknown'
+ * @param {{ open?: number, commercial?: number }} counts  successes so far
+ */
+function canMirrorFace(license, counts = {}) {
+  if (license === 'commercial') {
+    return (counts.commercial || 0) < MAX_COMMERCIAL_FACES;
+  }
+  return (counts.open || 0) < MAX_INGESTED_FACES;
+}
+
+/** Bump the class counter after a successful mirror. Mutates counts. */
+function bumpMirrorCount(license, counts) {
+  if (license === 'commercial') counts.commercial = (counts.commercial || 0) + 1;
+  else counts.open = (counts.open || 0) + 1;
+  return counts;
 }
 
 // ── @font-face parsing ─────────────────────────────────────────────────
@@ -433,17 +518,34 @@ function dedupeFaces(faces) {
 
 // ── Download + mirror ──────────────────────────────────────────────────
 
-async function downloadFontFile(url) {
+async function downloadFontFile(url, { referer } = {}) {
+  // Foundry CDNs often 403 without a browser-like Referer/Origin from the
+  // brand site that embedded the kit. Best-effort only — failure is non-fatal.
+  const headers = {
+    'User-Agent': UA,
+    Accept: 'font/woff2,font/woff,font/ttf,application/font-woff2,application/octet-stream,*/*;q=0.1',
+  };
+  if (referer) {
+    headers.Referer = referer;
+    try { headers.Origin = new URL(referer).origin; } catch { /* ignore */ }
+  }
   const res = await axios.get(url, {
     responseType: 'arraybuffer',
     timeout: 30_000,
     maxRedirects: 5,
     maxContentLength: MAX_FONT_BYTES,
-    headers: { 'User-Agent': UA }
+    headers
   });
   const buf = Buffer.from(res.data);
   if (buf.length < MIN_FONT_BYTES) throw new Error(`font payload too small (${buf.length}B) — likely an error page`);
   if (buf.length > MAX_FONT_BYTES) throw new Error(`font payload too large (${buf.length}B)`);
+  // Foundry CDNs sometimes 200 an HTML interstitial / bot challenge. Reject
+  // anything that is not a real font container — same failure path as 403
+  // (commercial → flagged needsLicense; open → errors[] only).
+  if (!isFontMagic(buf)) {
+    const magicHex = buf.subarray(0, 4).toString('hex');
+    throw new Error(`font payload not-a-font (magic=0x${magicHex}, ${buf.length}B)`);
+  }
   return buf;
 }
 
@@ -579,6 +681,8 @@ async function ingestBrandFontsInner(brand, run) {
   // 4–6. Classify, then mirror ingestable faces to Cloudinary.
   const ingested = [];
   const flagged = [];
+  // Separate budgets: commercial cannot starve open/google/self-hosted.
+  const mirrorCounts = { open: 0, commercial: 0 };
   let cancelled = false;
   run.stage('mirroring font faces');
   let faceIdx = 0;
@@ -606,15 +710,17 @@ async function ingestBrandFontsInner(brand, run) {
       ingestedAt: new Date().toISOString()
     };
 
-    if (license === 'commercial') {
-      // Licensed to the brand, not to us — never download, flag for a human.
+    // Flag OFF: commercial faces are never downloaded (legacy gate).
+    // Flag ON: attempt download below; license stays 'commercial' for audit.
+    if (license === 'commercial' && !brandFontAssumeLicensed()) {
       flagged.push({ ...entryBase, url: null, needsLicense: true });
       continue;
     }
-    if (ingested.length >= MAX_INGESTED_FACES) continue;
+    // Class-specific caps (see canMirrorFace / MAX_* constants above).
+    if (!canMirrorFace(license, mirrorCounts)) continue;
 
     try {
-      const buf = await downloadFontFile(face.url);
+      const buf = await downloadFontFile(face.url, { referer: pageUrl });
       // 'i' suffix keeps italic cuts from colliding with the roman at the
       // same weight; extension lives IN the public_id for raw resources so
       // the delivered URL keeps its .woff2/.ttf suffix.
@@ -627,14 +733,29 @@ async function ingestBrandFontsInner(brand, run) {
         // overwrite:false, which silently returns the OLD asset forever.
         overwrite: true
       });
+      // Success: real url, usable by matchCustomFont when flag is on.
+      // needsLicense:false = machine cleared; human may still set true later.
       ingested.push({ ...entryBase, url: uploaded.secure_url, needsLicense: false });
+      bumpMirrorCount(license, mirrorCounts);
     } catch (err) {
-      errors.push(`ingest failed for "${face.family}" ${face.weight} ${face.style}: ${err.message}`);
+      const failClass = downloadFailureClass(err);
+      const msg = `ingest failed for "${face.family}" ${face.weight} ${face.style} [${failClass}]: ${err.message}`;
+      errors.push(msg);
+      if (license === 'commercial') {
+        // Never leave a half-written commercial entry — flag cleanly so
+        // library-match fallback still runs. Distinct log for ops.
+        console.warn(
+          `🔤 brand font ingest: commercial CDN face not mirrored (${failClass}) ` +
+          `"${face.family}" ${face.weight} ${face.style} from ${face.url}: ${err.message}`
+        );
+        flagged.push({ ...entryBase, url: null, needsLicense: true });
+      }
     }
   }
 
   console.log(
-    `🔤 brand font ingest for "${brand.name || brandId}": ${ingested.length} ingested, ${flagged.length} flagged commercial, ${errors.length} error(s) from ${sheets.length} sheet(s) (${faces.length} unique face(s)) in ${Date.now() - t0}ms${cancelled ? ' [cancelled]' : ''}`
+    `🔤 brand font ingest for "${brand.name || brandId}": ${ingested.length} ingested, ${flagged.length} flagged commercial, ${errors.length} error(s) from ${sheets.length} sheet(s) (${faces.length} unique face(s)) in ${Date.now() - t0}ms${cancelled ? ' [cancelled]' : ''}` +
+    ` [assumeLicensed=${brandFontAssumeLicensed()}]`
   );
 
   return { ingested, flagged, errors, cancelled, usage };
@@ -643,6 +764,13 @@ async function ingestBrandFontsInner(brand, run) {
 module.exports = {
   ingestBrandFonts,
   classifyFontSource,
+  brandFontAssumeLicensed,
+  downloadFailureClass,
+  isFontMagic,
+  canMirrorFace,
+  bumpMirrorCount,
+  MAX_INGESTED_FACES,
+  MAX_COMMERCIAL_FACES,
   parseFontFacesFromCss,
   extractFontUsageFromCss
 };

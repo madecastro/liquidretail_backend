@@ -1,6 +1,6 @@
 {
-  "name": "canonical",
-  "description": "Default canonical titling \u2014 brand-neutral 9-slot / 3-phase architecture (hook \u2192 proof \u2192 close). Vertical uses the full height of the frame: upper editorial for hook/proof, lower conversion close for productName + delivery + CTA. Feed/square keep a bottom-anchored conversion stack; square is feed single-lined for the 1:1 canvas. Landscape is a left-column stack with delivery + visible CTA. Times authored for the nominal 8s clip (timing.js compresses to shorter plates). CTA visible on every format. Scrim none everywhere. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
+  "name": "canonical-awareness",
+  "description": "Funnel variant — AWARENESS (static product_first_lifestyle twin). Headline-dominant, long hook (~0–4s), brandPill on, rating only in proof, soft late CTA in close only. No deliveryLine. Aspirational lifestyle framing.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -8,16 +8,16 @@
         {
           "key": "hook",
           "startSec": 0,
-          "endSec": 2.7
+          "endSec": 4
         },
         {
           "key": "proof",
-          "startSec": 2.7,
-          "endSec": 5.1
+          "startSec": 4,
+          "endSec": 6.5
         },
         {
           "key": "close",
-          "startSec": 5.1,
+          "startSec": 6.5,
           "endSec": 8
         }
       ],
@@ -60,7 +60,7 @@
           },
           "timing": {
             "enterAtSec": 0.5,
-            "exitAtSec": 2.4,
+            "exitAtSec": 3.6,
             "enterDurationSec": 0.6,
             "exitDurationSec": 0.6
           },
@@ -83,13 +83,13 @@
           "position": {
             "anchor": "upperThird",
             "align": "left",
-            "maxWidthPct": 0.9,
-            "offsetY": 0.055
+            "maxWidthPct": 0.92,
+            "offsetY": 0.05
           },
           "timing": {
             "enterAtSec": 0.15,
-            "exitAtSec": 2.4,
-            "enterDurationSec": 0.7,
+            "exitAtSec": 3.7,
+            "enterDurationSec": 0.8,
             "exitDurationSec": 0.6
           },
           "transition": {
@@ -101,7 +101,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 700,
-            "maxLines": 3
+            "maxLines": 3,
+            "sizeScale": 1.1
           }
         },
         {
@@ -110,13 +111,13 @@
           "position": {
             "anchor": "upperThird",
             "align": "left",
-            "maxWidthPct": 0.92
+            "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 2.7,
-            "exitAtSec": 4.8,
-            "enterDurationSec": 0.8,
-            "exitDurationSec": 0.6
+            "enterAtSec": 4,
+            "exitAtSec": 6.3,
+            "enterDurationSec": 0.7,
+            "exitDurationSec": 0.5
           },
           "transition": {
             "type": "fade"
@@ -139,10 +140,10 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 3.1,
-            "exitAtSec": 4.8,
-            "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "enterAtSec": 4.3,
+            "exitAtSec": 6.3,
+            "enterDurationSec": 0.6,
+            "exitDurationSec": 0.5
           },
           "transition": {
             "type": "fade"
@@ -152,7 +153,7 @@
             "shadow": "soft",
             "casing": "upper",
             "fontRole": "body",
-            "weight": 600,
+            "weight": 500,
             "maxLines": 1,
             "colorToken": "textSecondary",
             "trackingPx": 1.5
@@ -167,10 +168,10 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 3.3,
-            "exitAtSec": 4.8,
-            "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "enterAtSec": 4.5,
+            "exitAtSec": 6.3,
+            "enterDurationSec": 0.6,
+            "exitDurationSec": 0.5
           },
           "transition": {
             "type": "fade"
@@ -193,7 +194,7 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 5.1,
+            "enterAtSec": 6.5,
             "exitAtSec": null,
             "enterDurationSec": 0.7
           },
@@ -210,41 +211,14 @@
           }
         },
         {
-          "key": "deliveryLine",
-          "phase": "close",
-          "position": {
-            "anchor": "lowerThird",
-            "align": "left",
-            "row": "ctaRow"
-          },
-          "timing": {
-            "enterAtSec": 5.4,
-            "exitAtSec": null,
-            "enterDurationSec": 0.7
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "soft",
-            "casing": "none",
-            "fontRole": "body",
-            "weight": 500,
-            "maxLines": 1,
-            "colorToken": "textSecondary"
-          }
-        },
-        {
           "key": "cta",
           "phase": "close",
           "position": {
             "anchor": "lowerThird",
-            "align": "right",
-            "row": "ctaRow"
+            "align": "right"
           },
           "timing": {
-            "enterAtSec": 5.4,
+            "enterAtSec": 6.8,
             "exitAtSec": null,
             "enterDurationSec": 0.6
           },
@@ -256,7 +230,7 @@
             "shadow": "soft",
             "casing": "upper",
             "fontRole": "body",
-            "weight": 700,
+            "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
             "trackingPx": 1.2
@@ -329,6 +303,32 @@
           }
         },
         {
+          "key": "headline",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.92
+          },
+          "timing": {
+            "enterAtSec": 0.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.8
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 2,
+            "sizeScale": 1.05
+          }
+        },
+        {
           "key": "productName",
           "phase": "main",
           "position": {
@@ -337,9 +337,9 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 0.9,
+            "enterAtSec": 1.4,
             "exitAtSec": null,
-            "enterDurationSec": 0.8
+            "enterDurationSec": 0.7
           },
           "transition": {
             "type": "fade"
@@ -361,9 +361,9 @@
             "align": "left"
           },
           "timing": {
-            "enterAtSec": 1.3,
+            "enterAtSec": 2,
             "exitAtSec": null,
-            "enterDurationSec": 0.7
+            "enterDurationSec": 0.6
           },
           "transition": {
             "type": "fade"
@@ -378,92 +378,14 @@
           }
         },
         {
-          "key": "quote",
-          "phase": "main",
-          "position": {
-            "anchor": "lowerThird",
-            "align": "left",
-            "maxWidthPct": 0.9
-          },
-          "timing": {
-            "enterAtSec": 1.6,
-            "exitAtSec": null,
-            "enterDurationSec": 0.8
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "layered",
-            "casing": "none",
-            "fontRole": "quote",
-            "weight": 500,
-            "maxLines": 2
-          }
-        },
-        {
-          "key": "reviewer",
-          "phase": "main",
-          "position": {
-            "anchor": "lowerThird",
-            "align": "left"
-          },
-          "timing": {
-            "enterAtSec": 1.6,
-            "exitAtSec": null,
-            "enterDurationSec": 0.8
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "soft",
-            "casing": "upper",
-            "fontRole": "body",
-            "weight": 500,
-            "maxLines": 1,
-            "colorToken": "textSecondary",
-            "trackingPx": 1.5
-          }
-        },
-        {
-          "key": "deliveryLine",
-          "phase": "main",
-          "position": {
-            "anchor": "lowerThird",
-            "align": "left",
-            "row": "ctaRow"
-          },
-          "timing": {
-            "enterAtSec": 2.1,
-            "exitAtSec": null,
-            "enterDurationSec": 0.7
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "soft",
-            "casing": "none",
-            "fontRole": "body",
-            "weight": 500,
-            "maxLines": 1,
-            "colorToken": "textSecondary"
-          }
-        },
-        {
           "key": "cta",
           "phase": "main",
           "position": {
             "anchor": "lowerThird",
-            "align": "right",
-            "row": "ctaRow"
+            "align": "right"
           },
           "timing": {
-            "enterAtSec": 2.1,
+            "enterAtSec": 3.5,
             "exitAtSec": null,
             "enterDurationSec": 0.6
           },
@@ -475,7 +397,7 @@
             "shadow": "soft",
             "casing": "upper",
             "fontRole": "body",
-            "weight": 700,
+            "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
             "trackingPx": 1.2
@@ -548,6 +470,32 @@
           }
         },
         {
+          "key": "headline",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.92
+          },
+          "timing": {
+            "enterAtSec": 0.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.8
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.05
+          }
+        },
+        {
           "key": "productName",
           "phase": "main",
           "position": {
@@ -556,9 +504,9 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 0.9,
+            "enterAtSec": 1.4,
             "exitAtSec": null,
-            "enterDurationSec": 0.8
+            "enterDurationSec": 0.7
           },
           "transition": {
             "type": "fade"
@@ -580,9 +528,9 @@
             "align": "left"
           },
           "timing": {
-            "enterAtSec": 1.3,
+            "enterAtSec": 2,
             "exitAtSec": null,
-            "enterDurationSec": 0.7
+            "enterDurationSec": 0.6
           },
           "transition": {
             "type": "fade"
@@ -597,92 +545,14 @@
           }
         },
         {
-          "key": "quote",
-          "phase": "main",
-          "position": {
-            "anchor": "lowerThird",
-            "align": "left",
-            "maxWidthPct": 0.9
-          },
-          "timing": {
-            "enterAtSec": 1.6,
-            "exitAtSec": null,
-            "enterDurationSec": 0.8
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "layered",
-            "casing": "none",
-            "fontRole": "quote",
-            "weight": 500,
-            "maxLines": 1
-          }
-        },
-        {
-          "key": "reviewer",
-          "phase": "main",
-          "position": {
-            "anchor": "lowerThird",
-            "align": "left"
-          },
-          "timing": {
-            "enterAtSec": 1.6,
-            "exitAtSec": null,
-            "enterDurationSec": 0.8
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "soft",
-            "casing": "upper",
-            "fontRole": "body",
-            "weight": 500,
-            "maxLines": 1,
-            "colorToken": "textSecondary",
-            "trackingPx": 1.5
-          }
-        },
-        {
-          "key": "deliveryLine",
-          "phase": "main",
-          "position": {
-            "anchor": "lowerThird",
-            "align": "left",
-            "row": "ctaRow"
-          },
-          "timing": {
-            "enterAtSec": 2.1,
-            "exitAtSec": null,
-            "enterDurationSec": 0.7
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "soft",
-            "casing": "none",
-            "fontRole": "body",
-            "weight": 500,
-            "maxLines": 1,
-            "colorToken": "textSecondary"
-          }
-        },
-        {
           "key": "cta",
           "phase": "main",
           "position": {
             "anchor": "lowerThird",
-            "align": "right",
-            "row": "ctaRow"
+            "align": "right"
           },
           "timing": {
-            "enterAtSec": 2.1,
+            "enterAtSec": 3.5,
             "exitAtSec": null,
             "enterDurationSec": 0.6
           },
@@ -694,7 +564,7 @@
             "shadow": "soft",
             "casing": "upper",
             "fontRole": "body",
-            "weight": 700,
+            "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
             "trackingPx": 1.2
@@ -776,10 +646,10 @@
             "anchor": "upperThird",
             "align": "left",
             "offsetY": 0.07,
-            "maxWidthPct": 0.46
+            "maxWidthPct": 0.5
           },
           "timing": {
-            "enterAtSec": 0.8,
+            "enterAtSec": 0.7,
             "exitAtSec": null,
             "enterDurationSec": 0.8
           },
@@ -792,7 +662,8 @@
             "casing": "none",
             "fontRole": "heading",
             "weight": 700,
-            "maxLines": 2
+            "maxLines": 3,
+            "sizeScale": 1.05
           }
         },
         {
@@ -805,9 +676,9 @@
             "maxWidthPct": 0.46
           },
           "timing": {
-            "enterAtSec": 1.2,
+            "enterAtSec": 2.2,
             "exitAtSec": null,
-            "enterDurationSec": 0.7
+            "enterDurationSec": 0.6
           },
           "transition": {
             "type": "fade"
@@ -822,70 +693,15 @@
           }
         },
         {
-          "key": "quote",
-          "phase": "main",
-          "position": {
-            "anchor": "upperThird",
-            "align": "left",
-            "offsetY": 0.07,
-            "maxWidthPct": 0.46
-          },
-          "timing": {
-            "enterAtSec": 1.5,
-            "exitAtSec": null,
-            "enterDurationSec": 0.8
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "layered",
-            "casing": "none",
-            "fontRole": "quote",
-            "weight": 500,
-            "maxLines": 2
-          }
-        },
-        {
-          "key": "reviewer",
-          "phase": "main",
-          "position": {
-            "anchor": "upperThird",
-            "align": "left",
-            "offsetY": 0.07,
-            "maxWidthPct": 0.46
-          },
-          "timing": {
-            "enterAtSec": 1.5,
-            "exitAtSec": null,
-            "enterDurationSec": 0.8
-          },
-          "transition": {
-            "type": "fade"
-          },
-          "treatment": {
-            "scrim": "none",
-            "shadow": "soft",
-            "casing": "upper",
-            "fontRole": "body",
-            "weight": 600,
-            "maxLines": 1,
-            "colorToken": "textSecondary",
-            "trackingPx": 1.5
-          }
-        },
-        {
-          "key": "deliveryLine",
+          "key": "productName",
           "phase": "main",
           "position": {
             "anchor": "lowerThird",
             "align": "left",
-            "maxWidthPct": 0.46,
-            "row": "ctaRow"
+            "maxWidthPct": 0.46
           },
           "timing": {
-            "enterAtSec": 2,
+            "enterAtSec": 3,
             "exitAtSec": null,
             "enterDurationSec": 0.7
           },
@@ -894,12 +710,11 @@
           },
           "treatment": {
             "scrim": "none",
-            "shadow": "soft",
+            "shadow": "layered",
             "casing": "none",
-            "fontRole": "body",
-            "weight": 500,
-            "maxLines": 1,
-            "colorToken": "textSecondary"
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 2
           }
         },
         {
@@ -908,11 +723,10 @@
           "position": {
             "anchor": "lowerThird",
             "align": "left",
-            "maxWidthPct": 0.46,
-            "row": "ctaRow"
+            "maxWidthPct": 0.46
           },
           "timing": {
-            "enterAtSec": 2,
+            "enterAtSec": 3.5,
             "exitAtSec": null,
             "enterDurationSec": 0.6
           },
@@ -924,7 +738,7 @@
             "shadow": "soft",
             "casing": "upper",
             "fontRole": "body",
-            "weight": 700,
+            "weight": 600,
             "maxLines": 1,
             "colorToken": "ctaText",
             "trackingPx": 1.2

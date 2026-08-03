@@ -68,6 +68,33 @@ function extractBindEntry(entry, meta) {
   return meta?.[entry];
 }
 
+// Word-safe display cap: never cut mid-word; ellipsis only BETWEEN words.
+// Used for productName (close-phase / endcard lead) and multi-item strings
+// that previously hard-sliced. If no space exists in the first half of the
+// window, fall back to a hard cut so pathological one-word titles still fit.
+export function truncateWordSafe(str, maxLen) {
+  const s = String(str ?? '').replace(/\s+/g, ' ').trim();
+  if (!maxLen || maxLen < 1 || s.length <= maxLen) return s;
+  const window = s.slice(0, maxLen);
+  let cut = window.lastIndexOf(' ');
+  if (cut < Math.floor(maxLen * 0.5)) cut = maxLen;
+  const out = s.slice(0, cut).trimEnd();
+  return out.length < s.length ? `${out}…` : out;
+}
+
+// Per-slot character caps for on-screen text. productName is the one that
+// previously printed mid-word SKU titles on the close phase ("…(Dark…").
+const TEXT_CHAR_CAP = {
+  productName: 48,
+  headline: 72,
+  quote: 120,
+  deliveryLine: 40,
+  badge: 28,
+  promo: 28,
+  productDescription: 80,
+  tagline: 56,
+};
+
 function resolveSlotContent(slot, meta) {
   const brandMode = meta?.endcardMode === 'brand';
   if (!slot.visible) return null;
@@ -87,14 +114,17 @@ function resolveSlotContent(slot, meta) {
   // Multi-value slots return the source array (capped at maxItems, empty
   // slots skipped). Bind chain picks the first non-empty array; a
   // literal entry always short-circuits with its embedded array.
+  // Item COUNT is still sliced at maxItems; each item string is
+  // word-safe-truncated so CSS line-clamp is not the only mid-word risk.
   if (slot.slotType === 'multi') {
     for (const entry of chain) {
       const arr = extractBindEntry(entry, meta);
       if (Array.isArray(arr) && arr.length > 0) {
         const cap = slot.treatment?.maxItems ?? 4;
+        const itemCharCap = 40;
         const items = arr
           .filter((v) => v != null && String(v).trim() !== '')
-          .map((v) => String(v).trim())
+          .map((v) => truncateWordSafe(String(v).trim(), itemCharCap))
           .slice(0, cap);
         if (items.length > 0) return items;
       }
@@ -114,10 +144,16 @@ function resolveSlotContent(slot, meta) {
 
   // Text: first non-empty stringified value in the bind chain. Literal
   // entries always contribute (they can't be "empty" by construction —
-  // the validator rejects null literals).
+  // the validator rejects null literals). productName (and a few other
+  // long-copy slots) get word-safe char caps so the close phase never
+  // prints a mid-word SKU clip.
   for (const entry of chain) {
     const v = extractBindEntry(entry, meta);
-    if (v != null && String(v).trim() !== '') return String(v).trim();
+    if (v != null && String(v).trim() !== '') {
+      const raw = String(v).trim();
+      const charCap = TEXT_CHAR_CAP[slot.key];
+      return charCap ? truncateWordSafe(raw, charCap) : raw;
+    }
   }
   return null;
 }

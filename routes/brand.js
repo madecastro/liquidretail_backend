@@ -1080,7 +1080,11 @@ router.post('/:id/title-still', express.json({ limit: '1mb' }), async (req, res)
       if (!check.ok) return res.status(400).json({ error: `spec invalid: ${check.errors.slice(0, 5).join('; ')}`, errors: check.errors });
       spec = check.normalized;
     } else {
-      spec = resolveSpecForBrand(brand, rawFormat).spec;
+      // Title Studio authoring: honour stored brand.titleStyleSpec so the
+      // operator can still preview/edit a saved override. Production render
+      // (brandScriptExecutor) uses resolveSpec without this flag and ignores
+      // tier-1 persisted docs when TITLE_SPEC_IGNORE_PERSISTED=true.
+      spec = resolveSpecForBrand(brand, rawFormat, { honourPersistedOverrides: true }).spec;
     }
 
     const frames = (Array.isArray(req.body?.frames) ? req.body.frames : [1.5])
@@ -1228,7 +1232,8 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
         if (!specRes.ok) return res.status(400).json({ error: `spec invalid: ${specRes.errors.slice(0, 5).join('; ')}` });
         previewSpec = specRes.normalized;
       } else {
-        previewSpec = resolveSpecForBrand(brand, format).spec;
+        // Title Studio authoring — see honourPersistedOverrides note above.
+        previewSpec = resolveSpecForBrand(brand, format, { honourPersistedOverrides: true }).spec;
       }
       previewTokens = await buildBrandTokens(brand, { specFontOverrides: previewSpec.tokenOverrides?.fonts || {} });
     } else if (bodyScript) {
@@ -1319,8 +1324,8 @@ router.get('/:id/preview-script/:jobId', async (req, res) => {
 // font files (the "titling must use the brand's real fonts" scan).
 // Synchronous (a site fetch + a few font downloads — seconds, not
 // minutes). OFL/Google/self-hosted faces are mirrored to Cloudinary and
-// upserted into brand.customFonts; commercial-foundry faces are recorded
-// flagged-only (needsLicense) and never downloaded.
+// upserted into brand.customFonts; commercial-foundry faces are attempted
+// when BRAND_FONT_ASSUME_LICENSED=true (default) and flagged on failure.
 router.post('/:id/ingest-fonts', express.json(), async (req, res) => {
   try {
     const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
@@ -1400,7 +1405,9 @@ router.get('/:id/title-spec', async (req, res) => {
     const resolved = {};
     for (const format of TITLING_FORMATS) {
       try {
-        const { spec, source } = resolveSpecForBrand(brand, format);
+        // Title Studio authoring — honour stored overrides so the operator
+        // sees/edits what is on the brand doc. Live renders ignore tier 1.
+        const { spec, source } = resolveSpecForBrand(brand, format, { honourPersistedOverrides: true });
         // Hydrate stub entries for every SLOT_KEYS not present so the
         // Title Studio dropdown surfaces every available slot (all
         // visible: false — operator flips them on as needed). Doesn't
@@ -1696,7 +1703,8 @@ router.post('/:id/title-spec/modify', express.json(), async (req, res) => {
       baseSpec = check.normalized;
       source = 'client';
     } else {
-      const resolved = resolveSpecForBrand(brand, rawFormat);
+      // Title Studio AI-modify base — honour stored brand titleStyleSpec.
+      const resolved = resolveSpecForBrand(brand, rawFormat, { honourPersistedOverrides: true });
       baseSpec = resolved.spec;
       source = resolved.source;
     }
