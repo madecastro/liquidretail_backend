@@ -82,16 +82,55 @@ Owner-set: **production quality first, money hardening after output is proven.**
    run-level message correctly says *"all 1 already queued"* — it counts payloads BUILT, not
    ads INSERTED. Two contradictory statements in one response. Introduced 2026-08-03.
 
-5. **Meta preview chrome shows "Lorem ipsum dolor sit amet"** as the link description.
+5. **VIDEO COST IS NEVER RECONCILED — the expensive path runs on a guess.**
+   Images ARE reconciled: `scheduleCostReconcile` (`atlasImageService.js:134-157`) polls
+   `GET /model/prediction/{id}` at 3s/10s/30s, reads `res.data.data.price` — the ACTUAL
+   Atlas price — and flips the CostLog row from `costSource:'estimated'` to `'actual'`,
+   logging "never published" if it gives up. **`reconcileCost(` has exactly ONE call site
+   in the repo** and it is the image one. `atlasVideoService` calls `recordFlatCost` at
+   `:1571` and `:2671` with a pre-computed estimate and never revisits it.
 
-6. **Post-render safe-box measurement.** Geometry is computed and stated correctly; nothing
+   So the ledger holds ACTUALS for images (~$0.01-0.17) and ESTIMATES for video (~$1.00
+   a clip). The path where being wrong costs real money is the un-reconciled one.
+
+   The fix is small: the video path already persists `veoPredictionId` at the charge point
+   (`atlasVideoService.js:2666`), which is exactly the handle `scheduleCostReconcile` needs.
+   Same three-line pattern, pointed at the video prediction endpoint.
+
+6. **ALLOW EXPLICIT VIDEO REGENERATION — owner-approved 2026-08-03, reversing an earlier
+   owner call.** `computeV2IdentityDigest` (`campaignAdsGenerationService.js:1685-1704`)
+   scopes the digest to `generationRunId` for STATIC but deliberately EXCLUDES video, citing
+   the owner: *"veo should only generate a video once for each product unless it is revised"*
+   — so a repeat Generate cannot re-bill an Omni master.
+
+   The owner has now reversed this: *"if there is an existing ad it shouldn't stop anyone
+   from running one again"*, with the reason being that **video prompt iteration is the
+   current workflow** — re-running the same product with a different prompt is normal, not
+   accidental.
+
+   Approved design: scope the video digest to the run **only when regeneration is explicit**.
+   A plain repeat Generate still dedupes (accidental double-click protection intact); an
+   operator who explicitly asks for another video gets one, and the spend is deliberate.
+   Do NOT simply delete the video carve-out — that reopens the $1.00-per-misclick hole the
+   original owner instruction was protecting against.
+
+7. **`input_fidelity` DOES NOT EXIST on `gpt-image-2/edit`** — checked against the LIVE Atlas
+   schema 2026-08-03. Accepted params are exactly: `enable_base64_output`, `enable_sync_mode`,
+   `images`, `moderation`, `output_format`, `prompt`, `quality`, `size`. Do not go looking for
+   it again. This leaves only THREE levers for product fidelity: more/better product
+   references (anchoring, item 2), the prompt (already correct and not working), and
+   post-render measure-and-reject.
+
+8. **Meta preview chrome shows "Lorem ipsum dolor sit amet"** as the link description.
+
+9. **Post-render safe-box measurement.** Geometry is computed and stated correctly; nothing
    verifies the model complied.
 
-7. **Logo contrast/scrim.** Lower than previously recorded — it did NOT reproduce at full
+10. **Logo contrast/scrim.** Lower than previously recorded — it did NOT reproduce at full
    resolution on 2026-08-03 (an earlier call off a low-res thumbnail was wrong). Still worth a
    scrim (`directImageRenderService.js:758-781` has no plate sampling); not a blocker.
 
-8. **Deferred by owner until output is proven:** `queued` ads never auto-drain;
+11. **Deferred by owner until output is proven:** `queued` ads never auto-drain;
    `veoPredictionId` is a spend receipt never resumed, so process death + re-drain double-bills.
 
 ---
