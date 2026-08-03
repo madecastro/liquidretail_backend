@@ -48,7 +48,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -299,7 +301,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -518,7 +522,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
@@ -738,7 +744,9 @@
             "weight": 600,
             "maxLines": 1,
             "trackingPx": 2.2
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
         },
         {
           "key": "badge",
