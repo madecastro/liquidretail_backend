@@ -753,20 +753,29 @@ async function buildMetaForAd(ad, brand) {
   // endcardMode routes the canonical scripts' brand vs product endcard
   // branch. reviewsText is a formatted string built from reviewCount.
   const endcardMode = ad.productId ? 'product' : 'brand';
-  // Null when we have no count, so the slot is skipped. The old fallback was
-  // the literal '53 reviews' — a number invented for a product we hold no
-  // review data for, printed as social proof. Removing the brand-level
-  // rating/reviewCount fallback from the cascade makes an unknown count more
-  // common, which makes inventing one worse, not more excusable.
-  const rc = cascaded.reviewCount;
-  const reviewsText = rc != null ? `${rc} review${rc === 1 ? '' : 's'}` : null;
 
-  // Owner star rule applies to video chrome too (not static-only). Gate here
-  // at the meta source so Remotion Canonical / canvas scripts never see a
-  // raw 3.2 or a 4.51 that would round-display as the forbidden "4.5".
-  // ONE implementation: services/ratingDisplay.js (shared with static).
-  const { formatDisplayRating } = require('./ratingDisplay');
-  const rating = formatDisplayRating(cascaded.rating) ?? null;
+  // ATOMIC rating + reviewCount pair (services/ratingDisplay.js).
+  // Product pair = cascade (layoutInput.social_proof → catalogProduct).
+  // Brand pair = Brand.brandReviews (same enrichment snapshot — rating and
+  // reviewCount together). NEVER mix tiers: historical bug printed a
+  // product's 41k reviews next to the brand's 3.3★. When the brand pair
+  // is used, reviewsText attributes the count ("N reviews · domain") so
+  // Remotion Canonical never implies product-level reviews.
+  const {
+    resolveAtomicRatingPair, brandAttributionLabel,
+  } = require('./ratingDisplay');
+  const brandPair = brand?.brandReviews && typeof brand.brandReviews === 'object'
+    ? brand.brandReviews
+    : null;
+  const ratingPair = resolveAtomicRatingPair({
+    productRating:      cascaded.rating,
+    productReviewCount: cascaded.reviewCount,
+    brandRating:        brandPair?.rating ?? null,
+    brandReviewCount:   brandPair?.reviewCount ?? null,
+    brandAttribution:   brandAttributionLabel(brand),
+  });
+  const rating = ratingPair.rating;
+  const reviewsText = ratingPair.reviewsText;
 
   // deliveryLine and promoText share their two highest-priority sources
   // (ad.copy.offer_text, then layoutInput.input.cta.offer_text), so any ad
@@ -802,7 +811,9 @@ async function buildMetaForAd(ad, brand) {
     ctaText:            cascaded.ctaText            ?? null,
     cta:                cascaded.ctaText            ?? null,   // legacy alias for older scripts reading meta.cta
     rating,
-    reviewCount:        cascaded.reviewCount        ?? null,
+    // Count from the SAME tier as rating (atomic pair). Null when the
+    // chosen tier has no count — never a cross-tier mix.
+    reviewCount:        ratingPair.reviewCount,
     likes:              cascaded.likes              ?? null,
     quoteSnippet:       cascaded.quoteSnippet       ?? null,
     promoText,   // null lets the renderer skip the promo pill (see dedupe above)

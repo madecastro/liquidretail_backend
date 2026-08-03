@@ -134,14 +134,12 @@ const DEFAULT_META_CASCADES = {
   ],
 
   // ── Social proof (numeric) ───────────────────────────────────────
-  // No brand-level fallback. layoutInput.social_proof already decides when
-  // brand rating/review_count may stand in — only when the match outcome is
-  // brand_match, i.e. a brand ad claiming no single SKU — and tier 1 below
-  // carries that decision. A third tier reading Brand.brandReviews directly
-  // reached around that gate, so a product ad with no reviews of its own
-  // displayed the brand's aggregate beside one item: a $28 t-shirt credited
-  // with 41,000 reviews and the brand's 3.3 rating. Product ads now show the
-  // product's own numbers or none.
+  // Product-tier sources only in the cascade. Brand-level fallback is NOT
+  // a cascade tier — it is an ATOMIC pair resolved in buildMetaForAd via
+  // resolveAtomicRatingPair (ratingDisplay.js) from Brand.brandReviews.
+  // HISTORY: a cascade tier that read Brand.brandReviews mixed sources —
+  // a product's 41,000-review count printed next to the brand's 3.3 rating.
+  // Do not re-add brand fields here; the pair resolver is the only safe path.
   rating: [
     { type: 'doc', doc: 'layoutInput',    path: 'input.social_proof.rating_value' },
     { type: 'doc', doc: 'catalogProduct', path: 'rating' },
