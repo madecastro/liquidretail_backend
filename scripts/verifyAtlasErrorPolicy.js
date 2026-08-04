@@ -91,6 +91,50 @@ expect('moderation detected from the message',
   { http: 200, msg: 'rejected by the safety filter' },
   { name: 'moderationBlocked', action: 'give-up', terminal: true });
 
+// REGRESSION, 2026-08-04. This is Atlas's ACTUAL live wording, copied verbatim
+// from a production video failure. It matched none of the original safety
+// alternatives (system|filter), so a real moderation block was classified
+// predictionFailed and RETRIED — futile by definition, and shown to the
+// operator as a generic prediction failure. If this case ever goes red again,
+// safety rejections are silently being retried.
+expect('the REAL Atlas safety-review wording is moderation, not a retryable failure',
+  { predictionStatus: 'failed',
+    msg: 'Your input or generated content was blocked by safety review. Please revise your input and try again. (code: generation_failed)' },
+  { name: 'moderationBlocked', action: 'give-up', terminal: true, charged: false });
+
+expect('safety check is moderation too',
+  { predictionStatus: 'failed', msg: 'blocked by safety check' },
+  { name: 'moderationBlocked', action: 'give-up' });
+
+expect('safety guidelines is moderation too',
+  { predictionStatus: 'failed', msg: 'violates safety guidelines' },
+  { name: 'moderationBlocked', action: 'give-up' });
+
+// The other half of the contract: the matcher must NOT be so loose that a
+// retryable fault gets marked terminal. A false positive here throws away a
+// render that would have succeeded on the second attempt, which is why the
+// safety alternatives stay ENUMERATED rather than `safety\s+\w+`, and why
+// bare `blocked` is still not matched.
+expect('an infrastructure "blocked" is NOT moderation',
+  { predictionStatus: 'failed', msg: 'upstream blocked the connection' },
+  { name: 'predictionFailed', action: 'retry' });
+
+expect('a generic prediction failure is NOT moderation',
+  { predictionStatus: 'failed', msg: 'prediction failed: internal error' },
+  { name: 'predictionFailed', action: 'retry' });
+
+// The operator-facing heading. The ads page shows Ad.renderError.message, and
+// "prediction failed" told an operator nothing actionable about a safety block.
+check('moderationBlocked carries the operator label',
+  classify({ predictionStatus: 'failed', msg: 'blocked by safety review' }).label === 'Model Moderation Error',
+  classify({ predictionStatus: 'failed', msg: 'blocked by safety review' }).label);
+
+// Only the classes we have deliberately named carry a label; everything else
+// keeps the provider's own wording rather than inventing a friendlier one.
+check('an unlabelled class exposes label === null',
+  classify({ predictionStatus: 'failed', msg: 'internal error' }).label === null,
+  String(classify({ predictionStatus: 'failed', msg: 'internal error' }).label));
+
 expect('cancelled prediction',
   { predictionStatus: 'cancelled' }, { name: 'predictionFailed', action: 'retry' });
 
