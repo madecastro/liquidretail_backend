@@ -266,11 +266,16 @@ function compileAdPreset(ad, plan) {
             ] },
           ],
           temperature: 0.2,
-          max_tokens: 1200,
+          // See typeTemplateExtract: gemini-2.5 spends hidden reasoning tokens out
+          // of max_tokens, so a small budget returns an EMPTY body with
+          // finish_reason 'length' — and it is still billed.
+          max_tokens: 6000,
           response_format: { type: 'json_object' },
         }
       );
       const raw = res?.choices?.[0]?.message?.content || '';
+      const finish = res?.choices?.[0]?.finish_reason || '?';
+      if (!String(raw).trim()) throw new Error(`empty response (finish_reason=${finish})`);
       parsed = JSON.parse(String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, ''));
     } catch (err) {
       skipped[ad.adId] = `vision call failed: ${String(err.message || err).slice(0, 90)}`;

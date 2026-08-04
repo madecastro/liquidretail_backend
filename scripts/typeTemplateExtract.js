@@ -465,18 +465,31 @@ function compilePreset(brandName, tpl, { brandId = null, headingFamily = null } 
           model: 'gemini-2.5-pro',
           messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content }],
           temperature: 0.0,
-          max_tokens: 1800,
+          // 9 CALLS WERE BILLED FOR NOTHING AT 1800. gemini-2.5 spends hidden
+          // REASONING tokens out of max_tokens (atlasLlmService documents this:
+          // finish_reason 'length' with an empty message at small budgets), and a
+          // long schema prompt over three images exhausted the budget before a
+          // single character of JSON was emitted. Every brand failed with
+          // "Unexpected end of JSON input", which is what an empty body parses to.
+          max_tokens: 8000,
           // json_object, not json_schema: strict schema 400s on some Atlas
           // routes (see adVisionQcService). Shape is validated here instead.
           response_format: { type: 'json_object' },
         }
       );
       rawText = res?.choices?.[0]?.message?.content || '';
+      const finish = res?.choices?.[0]?.finish_reason || '?';
+      // DIAGNOSE, don't just fail. "Unexpected end of JSON input" told me nothing;
+      // finish_reason and the body length name the cause immediately.
+      if (!rawText.trim()) {
+        throw new Error(`empty response (finish_reason=${finish}) — raise max_tokens if 'length'`);
+      }
       const cleaned = String(rawText).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-      parsed = JSON.parse(cleaned);
+      try { parsed = JSON.parse(cleaned); }
+      catch (e) { throw new Error(`unparseable JSON (finish_reason=${finish}, ${cleaned.length} chars): ${cleaned.slice(0, 80)}`); }
     } catch (err) {
       // NO AUTO-RETRY on a billable call. Report and move on.
-      skipped[name] = `vision call failed: ${String(err.message || err).slice(0, 120)}`;
+      skipped[name] = `vision call failed: ${String(err.message || err).slice(0, 160)}`;
       console.warn(`⚠️  ${name}: ${skipped[name]}`);
       continue;
     }

@@ -147,11 +147,15 @@ function normalizeVerdict(raw) {
                 { type: 'image_url', image_url: { url: frame } },
               ] },
             ],
-            temperature: 0.0, max_tokens: 900,
+            // Reasoning tokens come out of this budget on gemini-2.5 — too small
+            // and the body comes back EMPTY but still billed.
+            temperature: 0.0, max_tokens: 5000,
             response_format: { type: 'json_object' },
           }
         );
         const raw = res?.choices?.[0]?.message?.content || '';
+        const finish = res?.choices?.[0]?.finish_reason || '?';
+        if (!String(raw).trim()) throw new Error(`empty response (finish_reason=${finish})`);
         const v = normalizeVerdict(JSON.parse(String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '')));
         v.frame = frame;
         verdicts[adId][arm] = v;
