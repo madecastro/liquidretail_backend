@@ -52,6 +52,46 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const WORKER = fs.readFileSync(path.join(ROOT, 'worker.js'), 'utf8');
 const ALERTS = fs.readFileSync(path.join(ROOT, 'services', 'processAlerts.js'), 'utf8');
+
+// Conservative JS comment stripper, used by every source assertion in this file.
+//
+// LOAD-BEARING (2026-08-04). An adversarial pass found these checks false-passing:
+// with the real `receiptFree` import COMMENTED OUT — so the identifier is genuinely
+// unbound at runtime, reproducing the exact production bug this harness exists to
+// catch — a raw-text regex still matched the commented line and the harness went
+// green. A check a comment can satisfy is the same defect it was written to catch.
+// It also matters for X1: a commented-out receiptFree( inside a requeue block would
+// make an UNGUARDED money write look guarded.
+// Respects string/template literals so an import quoted in a string cannot pass
+// either. Comment bodies become spaces so offsets stay stable.
+function stripComments(src) {
+  let out = '';
+  let i = 0;
+  let quote = null;   // ' " ` when inside a string
+  while (i < src.length) {
+    const c = src[i], n = src[i + 1];
+    if (quote) {
+      if (c === '\\') { out += c + (n || ''); i += 2; continue; }
+      if (c === quote) quote = null;
+      out += c; i++; continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { quote = c; out += c; i++; continue; }
+    if (c === '/' && n === '/') {
+      while (i < src.length && src[i] !== '\n') { out += ' '; i++; }
+      continue;
+    }
+    if (c === '/' && n === '*') {
+      out += '  '; i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) {
+        out += src[i] === '\n' ? '\n' : ' '; i++;
+      }
+      out += '  '; i += 2;
+      continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
 const GUARD  = fs.readFileSync(path.join(ROOT, 'services', 'spendReceipt.js'), 'utf8');
 
 // The ONE definition. If these field names drift from models/Ad.js, every site
@@ -146,11 +186,35 @@ checkTrue('R4 HAS_RECEIPT is the exact inverse ($nin), for the held-back count',
 // A third site added later would silently reintroduce the double-bill, and no
 // unit test would catch it because the money moves in a different file.
 const SCAN_DIRS = [path.join(ROOT, 'services'), path.join(ROOT, 'routes')];
+
+// RECURSIVE, deliberately (widened 2026-08-04). The previous version read only
+// each dir's top level, so 36 .js files under services/providers,
+// services/capabilityExecutors, services/reviewAdapters, services/brandStyles
+// and services/brandScripts were invisible to this check. capabilityExecutors
+// is the newest surface that mutates ads, so "a third requeue site added later"
+// — the exact thing X1 exists to catch — could have landed there unguarded.
+// No nested file matches today; this closes the hole before it is used.
+function walkJs(dir) {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      // node_modules is never scanned; assets/fonts holds no source.
+      if (entry.name === 'node_modules' || entry.name === 'assets') continue;
+      out.push(...walkJs(full));
+    } else if (entry.name.endsWith('.js')) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 const offenders = [];
 for (const dir of SCAN_DIRS) {
-  for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.js'))) {
-    const full = path.join(dir, f);
-    const src = fs.readFileSync(full, 'utf8');
+  for (const full of walkJs(dir)) {
+    // Comment-stripped: a commented-out receiptFree( must not make an unguarded
+    // rendering->queued write look guarded.
+    const src = stripComments(fs.readFileSync(full, 'utf8'));
     let idx = src.indexOf("$set: { status: 'queued'");
     while (idx >= 0) {
       const from = src.lastIndexOf('updateMany(', idx);
@@ -171,6 +235,82 @@ for (const dir of SCAN_DIRS) {
 }
 checkTrue('X1 no unguarded rendering->queued requeue anywhere in services/ or routes/',
   offenders.length === 0, offenders.join(', '));
+
+// ── I: every receiptFree( call site must actually import it ──────────
+// guardsBothReceipts is a regex over source TEXT. It proves the call is
+// written; it cannot see that the identifier is unbound. `node --check`
+// cannot catch it either — a ReferenceError is runtime, not syntax. That is
+// why a live money guard shipped broken with a green harness (processAlerts
+// called receiptFree without importing it; SIGTERM requeue was a no-op).
+// Derive the file list by scanning, so the next new call site is guarded too.
+//
+// EVERY TEST BELOW RUNS ON COMMENT-STRIPPED SOURCE, and that is load-bearing.
+// An adversarial pass found the first version of these checks false-passing: with
+// the real import COMMENTED OUT — i.e. `receiptFree` genuinely unbound at runtime,
+// reproducing the exact production bug — the raw-text regex still matched the
+// commented line and the harness reported all green. A check that a comment can
+// satisfy is the same defect it was written to catch, one level up. Revert-proven
+// against BOTH deleting the import and commenting it out.
+{
+  const callSites = [];
+  const scanRoots = [
+    path.join(ROOT, 'services'),
+    path.join(ROOT, 'routes'),
+    path.join(ROOT, 'worker.js')
+  ];
+  function scanFile(full) {
+    if (!full.endsWith('.js')) return;
+    // The definition file itself is not a call site.
+    if (path.basename(full) === 'spendReceipt.js') return;
+    // CODE only — a commented-out call is not a call site, and a commented-out
+    // import must not satisfy the binding check below.
+    const src = stripComments(fs.readFileSync(full, 'utf8'));
+    if (!/\breceiptFree\s*\(/.test(src)) return;
+    callSites.push({ rel: path.relative(ROOT, full), full, src });
+  }
+  // Recursive for the same reason X1 is — a call site in a subdirectory
+  // (services/capabilityExecutors, services/providers, …) must not be able to
+  // call receiptFree without importing it just because it is one level down.
+  for (const root of scanRoots) {
+    if (fs.statSync(root).isFile()) scanFile(root);
+    else for (const full of walkJs(root)) scanFile(full);
+  }
+  checkTrue('I0 at least one receiptFree( call site exists to scan', callSites.length > 0,
+    'scan found zero call sites');
+
+  const unbound = [];
+  for (const site of callSites) {
+    // require('./spendReceipt') or require('../services/spendReceipt') etc.,
+    // with a destructuring that includes receiptFree.
+    const importsIt = /require\s*\(\s*['"][^'"]*spendReceipt['"]\s*\)/.test(site.src)
+      && /\{[^}]*\breceiptFree\b[^}]*\}\s*=\s*require\s*\(\s*['"][^'"]*spendReceipt['"]\s*\)/.test(site.src);
+    if (!importsIt) unbound.push(site.rel);
+  }
+  checkTrue('I1 every file that calls receiptFree( also imports it from spendReceipt',
+    unbound.length === 0, unbound.join(', '));
+
+  // Genuine RUNTIME assertion: the module loads, the source binds receiptFree,
+  // and spendReceipt.receiptFree is a real function. Do not execute persistOrphans
+  // (needs mongoose + inFlight state).
+  let processAlertsLoaded = false;
+  try {
+    require('../services/processAlerts');
+    processAlertsLoaded = true;
+  } catch (err) {
+    failures.push(`I2 processAlerts.js module loads — ${err && err.message}`);
+  }
+  if (processAlertsLoaded) pass++;
+
+  // Comment-stripped for the reason documented at the top of this block: the raw
+  // source false-passes when the import is merely commented out.
+  const ALERTS_CODE = stripComments(ALERTS);
+  checkTrue('I3 processAlerts CODE references receiptFree inside persistOrphans',
+    /async function persistOrphans[\s\S]*?receiptFree\s*\(/.test(ALERTS_CODE));
+  checkTrue('I4 processAlerts CODE destructures receiptFree from spendReceipt (not in a comment)',
+    /\{[^}]*\breceiptFree\b[^}]*\}\s*=\s*require\s*\(\s*['"]\.\/spendReceipt['"]\s*\)/.test(ALERTS_CODE));
+  checkTrue('I5 spendReceipt.receiptFree is a function (runtime bind)',
+    typeof require('../services/spendReceipt').receiptFree === 'function');
+}
 
 const total = pass + failures.length;
 if (failures.length) {
