@@ -1156,6 +1156,123 @@ check('K6 ink is chosen for the band the type lands on, not the whole plate', ()
     'and the per-band rule agrees it must not take dark ink — the global vote was the bug');
 });
 
+check('Q3 a limitation is not a testimonial, and stage/angle re-rank honestly', () => {
+  // Owner, on a delivered GymShark ad: the quote "low-support option best suited
+  // for lighter activities" is "not great". MEASURED cause: STRONG_POSITIVE
+  // matches the word "best" inside "best suited for", so a phrase that NARROWS
+  // the product scored as praise — 2.5, beating "This cactus is such a statement
+  // piece" (0) and "Customers consistently praise the Vuori fabric" (1).
+  //
+  // Executes the REAL scorer out of the service. A mirror would restate the rule
+  // and could not catch the rule being removed, which has already happened twice
+  // in this harness.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'layoutInputService.js'), 'utf8');
+  const names = ['NEGATED_POSITIVE', 'NEGATIVE_SENTIMENT', 'STRONG_POSITIVE', 'MODERATE_POSITIVE',
+    'SCORING_POSITIVE', 'PHRASE_STRONG', 'DURATION_REF', 'EXPERIENCE_VERB', 'SOFT_HEDGE',
+    'HEDGED_EXPECTATION', 'BEST_AS_LIMITER', 'STAGE_ALIASES', 'STAGE_WEIGHT', 'BIAS_CAP',
+    'ANGLE_WEIGHT'];
+  const parts = names.map((n) => {
+    const m = src.match(new RegExp(`const ${n} = [\\s\\S]*?;\\n`));
+    assert.ok(m, `missing ${n} — the scorer's inputs changed shape`);
+    return m[0];
+  });
+  // HARD_LIMITER is built with new RegExp(...) so it needs its own extraction.
+  const hard = src.match(/const HARD_LIMITER = new RegExp\([\s\S]*?'i'\);/);
+  assert.ok(hard, 'HARD_LIMITER must exist');
+  parts.push(hard[0]);
+  // ANCHORING IS THE POINT. Built by joining bare strings it matched inside other
+  // words — "fol(low support)", "yel(low-support)", "not great (for)tune".
+  assert.ok(/\(\?:\^\|\[\^a-z\]\)/.test(hard[0]),
+    'HARD_LIMITER must anchor on a non-letter so it cannot match inside a word');
+  const stageTerms = src.match(/const STAGE_TERMS = \{[\s\S]*?\n\};/);
+  assert.ok(stageTerms, 'STAGE_TERMS must exist — funnel stage is an owner requirement');
+  parts.push(stageTerms[0]);
+  const nrm = src.match(/function normalizeStage\(v\)[\s\S]*?\n}/);
+  const fn = src.match(/function scoreQuote\(text[\s\S]*?\n}/);
+  assert.ok(nrm && fn, 'normalizeStage and scoreQuote must be extractable');
+  // eslint-disable-next-line no-new-func
+  const score = new Function(`${parts.join('\n')}\n${nrm[0]}\n${fn[0]}\nreturn scoreQuote;`)();
+
+  // NO CONTROL CHARACTERS. A heredoc turned every \b in these regexes into a
+  // literal backspace byte, silently stripping the word boundaries and making the
+  // stage lever inert while every test still "passed".
+  const raw = fs.readFileSync(path.join(__dirname, '..', 'services', 'layoutInputService.js'));
+  assert.ok(![...raw].some((b) => b === 8 || b === 11 || b === 12),
+    'the source must contain no backspace/vtab/formfeed bytes — they corrupt regex word boundaries');
+
+  // 1. The limitation is disqualified outright.
+  assert.strictEqual(score('low-support option best suited for lighter activities'), -Infinity,
+    'a phrase that narrows the product must never win the primary slot');
+  assert.strictEqual(score('Not ideal for wide feet'), -Infinity, 'an explicit unsuitability is not proof');
+  // 2. "best" alone is still praise — the fix must not blunt the positive lexicon.
+  assert.ok(score('Simply the best leggings I have ever bought') > 3,
+    '"best" on its own must still score as praise');
+  // ...but "best FOR x" narrows the product exactly like "best suited for x", and
+  // it is NOT covered by HARD_LIMITER, so the lexical deduction is the only thing
+  // standing between it and a praise score. Without this case the deduction looks
+  // redundant and survives deletion.
+  assert.ok(score('Best for layering under a jacket in mild weather') < 1,
+    '"best for X" narrows the product and must fall below the primary-slot floor');
+  // 3. A hedge costs, but does not disqualify — "softer than I expected" is positive.
+  assert.ok(score('Softer than I expected and I wear them every day') > 0,
+    'a hedge inside a genuinely positive line must survive');
+  // 4. Purely factual copy is demoted below the primary-slot floor.
+  assert.ok(score('Customers consistently praise the Vuori fabric') < 1,
+    'brand-voice copy with no customer enthusiasm must fall below SCORE_FLOOR');
+
+  // 4b. THE FALSE POSITIVES ADVERSARIAL REVIEW FOUND. Every one of these is a
+  // genuinely positive review that the first, unanchored limiter killed.
+  for (const good of [
+    'I follow support protocol and these are perfect',
+    'The yellow-support straps are sturdy and I love them',
+    'I wish I had bought these sooner, absolutely perfect',
+    'If you want a legging that lasts forever, buy these',
+    'My only complaint is that I did not buy two pairs',
+  ]) {
+    assert.notStrictEqual(score(good), -Infinity, `a positive review must survive: ${good}`);
+  }
+  // "best for the price" is PRAISE and must stay ABOVE the primary-slot floor, not
+  // merely escape rejection — a bare "best for" veto demoted it to unprintable
+  // while still passing a not-rejected assertion.
+  assert.ok(score('the absolute best for the price, I love them') >= 1,
+    '"best for the price" is praise and must remain printable');
+  // ...while a narrowing use case after "best for" is still caught.
+  assert.ok(score('Best for layering under a jacket in mild weather') < 1,
+    '"best for <narrow use>" must fall below the primary-slot floor');
+  // 4c. THE GATE MUST NOT WIDEN. Apparel terms score but must not qualify a bare
+  // fragment as an endorsement — hasPositiveSignal shares MODERATE_POSITIVE.
+  assert.ok(!/soft|breathable|flattering|true to size/.test(
+    (src.match(/const MODERATE_POSITIVE = [^\n]*/) || [''])[0]),
+    'apparel scoring terms must stay OUT of MODERATE_POSITIVE, which gates printability');
+  assert.ok(/const SCORING_POSITIVE/.test(src), 'they belong in a scoring-only lexicon');
+
+  // 5. STAGE RE-RANKS, and does so in the right direction.
+  const durability = 'Easy to wash, they are super comfortable and held up after 6 months';
+  const repeat = 'Worth every penny, I bought a second pair the next week';
+  assert.ok(score(durability, { stage: 'consideration' }) > score(durability),
+    'consideration must lift an objection-removing quote');
+  assert.ok(score(repeat, { stage: 'conversion' }) > score(repeat),
+    'conversion must lift a repeat-purchase quote');
+  assert.ok(score(repeat, { stage: 'conversion' }) > score(durability, { stage: 'conversion' }),
+    'at conversion the purchase-justifying quote must outrank the durability one');
+  assert.ok(score(durability, { stage: 'consideration' }) > score(repeat, { stage: 'consideration' }),
+    'at consideration that ordering must reverse');
+  // 6. A stage nudge must NOT rescue a rejected limitation.
+  assert.strictEqual(score('low-support option best suited for lighter activities', { stage: 'conversion' }),
+    -Infinity, 'no stage may promote a limitation');
+  // 7. Director angle lifts an on-hook quote, bounded so it cannot dominate.
+  const withAngle = score(durability, { angleTerms: ['wash', 'durable'] });
+  assert.ok(withAngle > score(durability), 'a quote matching the concept hook must score higher');
+  // ONE cap over stage AND angle together. Bounded separately they still summed to
+  // 5.4, rivalling the entire sentiment band (capped at 5).
+  const capped = score(durability, { stage: 'consideration', angleTerms: ['wash', 'comfortable'] });
+  assert.ok(capped - score(durability) <= Number(process.env.QUOTE_BIAS_CAP || 3) + 0.001,
+    'stage and angle together must not exceed the single bias cap');
+  // 8. Aliases the campaign brief actually uses.
+  assert.ok(score(repeat, { stage: 'bottom' }) > score(repeat), 'bottom-of-funnel alias must resolve');
+  assert.ok(score(durability, { stage: 'mofu' }) > score(durability), 'mofu alias must resolve');
+});
+
 // ── A: a product-tier rating names its product ──────────────────────────
 
 check('A1 product-tier review counts carry the product name', () => {
