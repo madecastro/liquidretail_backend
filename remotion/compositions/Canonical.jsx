@@ -46,16 +46,43 @@ function bandStateFor(plateHints, anchor, atSec) {
   for (const s of plateHints.samples) {
     if (Math.abs(s.atSec - atSec) < Math.abs(best.atSec - atSec)) best = s;
   }
-  const band = best.bands?.[BAND_FOR_ANCHOR[anchor] || 'middle'];
+  const bandKey = BAND_FOR_ANCHOR[anchor] || 'middle';
+  const band = best.bands?.[bandKey];
   if (!band) return { isLight: false, avoid: false, busy: 0 };
+
+  // ACROSS TIME, not at one instant — for `avoid` and `busy`.
+  //
+  // Face flags are time-localised: applyFaceKeepOut assigns each detected face
+  // box to the NEAREST plate sample, and there are typically 3 face samples
+  // against 5 plate samples, so some samples carry no face flag at all. The group
+  // anchor is ONE decision for the WHOLE clip, but it read a single sample — so
+  // whether it saw the face was luck. Measured on two delivered ads with
+  // identical geometry: Pelagic 9:16 read a flagged sample and correctly moved
+  // off the face, while Vuori 1:1 read an unflagged one and walked onto it. The
+  // probe confirms the flags themselves are right (top=true for both).
+  //
+  // A face that occupies a band at ANY point in the clip disqualifies that band
+  // for text that is on screen across that clip, and the worst-case texture is
+  // what legibility depends on — so take the union of avoid and the max of busy.
+  let avoidAny = !!band.avoid;
+  let busyMax = Number.isFinite(band.busy) ? band.busy : 0;
+  for (const s of plateHints.samples) {
+    const b = s.bands?.[bandKey];
+    if (!b) continue;
+    if (b.avoid) avoidAny = true;
+    if (Number.isFinite(b.busy) && b.busy > busyMax) busyMax = b.busy;
+  }
   // `busy` (local luma variance, plateIntelService) was computed for every band
   // from the first version of the plate scan and never read by ANY consumer.
   // It is the signal that tells detail-heavy footage from flat footage, which is
   // exactly what decides whether type survives on top of it.
   return {
+    // isLight stays NEAREST-sample: ink is decided by a separate weighted vote
+    // across all groups and samples (plateIsLightGlobal), and widening it here
+    // would double-count.
     isLight: band.lum > 0.62,
-    avoid: !!band.avoid,
-    busy: Number.isFinite(band.busy) ? band.busy : 0,
+    avoid: avoidAny,
+    busy: busyMax,
   };
 }
 

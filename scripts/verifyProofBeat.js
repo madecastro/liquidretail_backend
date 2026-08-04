@@ -811,6 +811,78 @@ check('K2 the real measured ads land on the band the frames prove is cleanest', 
   assert.strictEqual(chooseBand('lowerThird', {}), 'lowerThird');
 });
 
+check('K4 a face anywhere in the clip disqualifies the band (time union)', () => {
+  // THE DEFECT THIS PINS REACHED THE OWNER. applyFaceKeepOut assigns each face box
+  // to the NEAREST plate sample, so with 3 face samples against 5 plate samples
+  // some samples carry no face flag. The group anchor is ONE decision for the whole
+  // clip but read a SINGLE sample, so whether it saw the face was luck: measured on
+  // two delivered ads with identical geometry, Pelagic 9:16 read a flagged sample
+  // and moved off the face while Vuori 1:1 read an unflagged one and walked onto it.
+  const BAND = { upperThird: 'top', center: 'middle', lowerThird: 'bottom' };
+  const bandState = (hints, anchor, atSec) => {
+    let best = hints.samples[0];
+    for (const s of hints.samples) if (Math.abs(s.atSec - atSec) < Math.abs(best.atSec - atSec)) best = s;
+    const k = BAND[anchor];
+    const band = best.bands[k];
+    let avoidAny = !!band.avoid, busyMax = band.busy;
+    for (const s of hints.samples) {
+      const b = s.bands[k]; if (!b) continue;
+      if (b.avoid) avoidAny = true;
+      if (b.busy > busyMax) busyMax = b.busy;
+    }
+    return { avoid: avoidAny, busy: busyMax };
+  };
+  const pickAt = (hints, authored, atSec) => {
+    const scored = (KEEP_OUT[authored] || [authored]).map((c) => ({ cand: c, ...bandState(hints, c, atSec) }));
+    const clear = scored.filter((s) => !s.avoid);
+    if (!clear.length) return authored;
+    let best = null;
+    for (const s of clear) {
+      const sc = s.busy - (s.cand === authored ? SWITCH_MARGIN : 0);
+      if (!best || sc < best.score) best = { ...s, score: sc };
+    }
+    return best.cand;
+  };
+  // The real Vuori shape: TOP is the least-busy band (so texture wants it) and a
+  // face occupies it at t=2 only.
+  const hints = { samples: [0.5, 2.0, 3.5, 5.0, 6.5].map((t) => ({
+    atSec: t,
+    bands: {
+      top:    { avoid: t === 2.0, busy: 0.36 },
+      middle: { avoid: t === 2.0, busy: 0.50 },
+      bottom: { avoid: false,     busy: 0.57 },
+    },
+  })) };
+  // Whichever sample the group's decision lands on, it must never choose the face.
+  for (const t of [0.5, 2.0, 3.5, 5.0, 6.5]) {
+    assert.strictEqual(pickAt(hints, 'lowerThird', t), 'lowerThird',
+      `group at ${t}s chose a band a face occupies at t=2 (single-sample read)`);
+  }
+  // Sanity: with NO face anywhere, texture is free to take the cleaner top band.
+  const noFace = { samples: hints.samples.map((s) => ({
+    atSec: s.atSec,
+    bands: Object.fromEntries(Object.entries(s.bands).map(([k, v]) => [k, { ...v, avoid: false }])),
+  })) };
+  assert.strictEqual(pickAt(noFace, 'lowerThird', 0.5), 'upperThird',
+    'with no face at any time, the least-busy band should still win');
+});
+
+check('K5 the renderer takes the union over samples, not the nearest one', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'remotion', 'compositions', 'Canonical.jsx'), 'utf8');
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  const fn = code.slice(code.indexOf('function bandStateFor'), code.indexOf('function resolveGroupAnchor'));
+  assert.ok(/avoidAny/.test(fn) && /busyMax/.test(fn),
+    'bandStateFor must aggregate avoid/busy across samples');
+  assert.ok(/for \(const s of plateHints\.samples\)/.test(fn),
+    'the aggregation must iterate every sample, not just the nearest');
+  assert.ok(/avoid:\s*avoidAny/.test(fn) && /busy:\s*busyMax/.test(fn),
+    'the returned avoid/busy must be the aggregated values');
+  // isLight must stay nearest-sample: ink is decided by its own weighted vote.
+  assert.ok(/isLight:\s*band\.lum/.test(fn),
+    'isLight must remain a nearest-sample read so the ink vote is not double-counted');
+});
+
 check('K3 the renderer disqualifies faces rather than pricing them', () => {
   const src = fs.readFileSync(
     path.join(__dirname, '..', 'remotion', 'compositions', 'Canonical.jsx'), 'utf8');
