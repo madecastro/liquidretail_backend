@@ -41,8 +41,10 @@ const { buildPreviewHtmlForAd }  = require('../services/adPreviewPageService');
 const registry = require('../services/templateRegistry');
 const alerts   = require('../services/alertService');
 const inFlight = require('../services/inFlight');
+const crashReporter = require('../services/crashReporter');
 const { adStage } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
+const { buildAdRow, buildAdDiagnostic } = require('../services/renderDiagnostic');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 const {
   generationGateDecision, normalizeProductIdList, pickSupersedingRun
@@ -1117,12 +1119,26 @@ async function runRenderLoop(run, job, adIds, renderToken) {
       while (!cancelled && pool.inflight < pool.concurrency && pool.next < pool.queue.length) {
         const { adId, index } = pool.queue[pool.next++];
         pool.inflight++;
+        // Ad-level in-flight: lets the SIGTERM handler name which ads (and
+        // whether a charged submit already returned) are about to be lost.
+        // Format is not on the queue entry — omit rather than invent.
+        inFlight.trackAd(run.runId, adId, { kind: pool.name });
         renderOne(run, job, adId, index, renderToken)
           .catch(err => {
             console.error(`❌ [campaignRun ${run.runId}] #${index} (${pool.name}) dispatch crash:`, err.message || err);
+            // Fire-and-forget — never await on a render path. console.error stays.
+            crashReporter.reportSync({
+              kind:  'dispatch-crash',
+              title: `Dispatch crash #${index} (${pool.name})`,
+              err,
+              ad:    { _id: adId },
+              run,
+              stage: 'dispatch'
+            });
           })
           .finally(() => {
             pool.inflight--;
+            inFlight.untrackAd(adId);
             progressRun.tick(++done, adIds.length);
             inFlight.progress(run.runId, done);
             // Liveness heartbeat for the reaper — see the comment on the
@@ -1292,8 +1308,16 @@ async function renderOneInner(run, job, adId, index, renderToken) {
   if (!ad) {
     await CampaignRun.updateOne(
       { _id: run._id },
-      { $inc: { failed: 1 }, $push: { errors: { index, stage: 'fetch', message: `Ad ${adId} not found` } } }
+      { $inc: { failed: 1 }, $push: { errors: { index, stage: 'fetch', message: `Ad ${adId} not found`, adId: String(adId), at: new Date() } } }
     );
+    crashReporter.reportSync({
+      kind:  'ad-not-found',
+      title: `Ad not found: ${adId}`,
+      err:   `Ad ${adId} not found`,
+      ad:    { _id: adId },
+      run,
+      stage: 'fetch'
+    });
     return;
   }
   const creative = {
@@ -1504,9 +1528,20 @@ async function renderOneInner(run, job, adId, index, renderToken) {
           { _id: run._id },
           {
             $inc:  { failed: 1 },
-            $push: { errors: buildErrorEntry(creative, index, 'titling', titlingFailed) }
+            $push: { errors: buildErrorEntry(creative, index, 'titling', titlingFailed, { adId }) }
           }
         );
+        // Master is paid for and kept; titling failure is still a real failure
+        // worth a push (raw master is NOT the intended deliverable when chrome
+        // was configured). Fire-and-forget — no await on the render path.
+        crashReporter.reportSync({
+          kind:  'video-titling-failed',
+          title: 'Video titling failed',
+          err:   titlingFailed,
+          ad:    adFinal || ad || { _id: adId },
+          run,
+          stage: 'titling'
+        });
       } else {
         // Title landed (or no chrome / no brand). Promote to draft now.
         // Soft notes written mid-pipeline (face-crop skip etc.) stay on
@@ -1527,24 +1562,30 @@ async function renderOneInner(run, job, adId, index, renderToken) {
     } catch (err) {
       console.error(`❌ veoReference[ad=${adId}]:`, err.message || err);
       // Video is the expensive, slow, vendor-dependent stage — the one
-      // worth a push. Deduped on the message shape, not the ad id, so a
-      // vendor outage that fails 20 ads sends one alert with a count
-      // rather than 20 separate ones. String() the message defensively:
-      // a vendor error like {message: 429} has a truthy non-string
-      // .message, and a synchronous throw HERE would skip the CampaignRun/
-      // Ad failure bookkeeping below, wedging the ad in 'rendering'.
+      // worth a push. crashReporter keys each incident uniquely (no folding);
+      // rate-limit spill is the only silent drop. String() the message
+      // defensively for the fields line: a vendor error like {message: 429}
+      // has a truthy non-string .message, and a synchronous throw HERE would
+      // skip the CampaignRun/Ad failure bookkeeping below, wedging the ad
+      // in 'rendering'.
       const vmsg = String((err && err.message) || err);
-      alerts.notifyAsync({
-        level:  'error',
+      // Replaces the former alerts.notifyAsync (title-only, no detail).
+      // crashReporter writes IncidentLog then Slack with diagnostic + money
+      // tags — do NOT also call alerts here (would double-send).
+      crashReporter.reportSync({
+        kind:   'video-generation-failed',
         title:  'Video generation failed',
-        key:    `video-failed:${vmsg.slice(0, 60)}`,
-        fields: { ad: String(adId), run: run.runId, brand: job.brandId, error: vmsg.slice(0, 300) }
+        err,
+        ad,
+        run,
+        stage:  'veo',
+        fields: { brand: job.brandId, error: vmsg.slice(0, 300) }
       });
       await CampaignRun.updateOne(
         { _id: run._id },
         {
           $inc:  { failed: 1 },
-          $push: { errors: buildErrorEntry(creative, index, 'veo', err) }
+          $push: { errors: buildErrorEntry(creative, index, 'veo', err, { adId }) }
         }
       );
       await Ad.updateOne(
@@ -1638,11 +1679,12 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         { _id: run._id },
         {
           $inc: { failed: 1 },
-          $push: { errors: buildErrorEntry(creative, index, result.stage, result.error) }
+          $push: { errors: buildErrorEntry(creative, index, result.stage, result.error, { adId }) }
         }
       );
       // Mark the Ad failed with diagnostic context.
       const errMsg = typeof result.error === 'object' ? (result.error.message || JSON.stringify(result.error)) : String(result.error || 'unknown');
+      const failStage = result.stage || result.error?.stage || 'unknown';
       await Ad.updateOne(
         { _id: adId },
         {
@@ -1653,7 +1695,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             // instead of re-submitting and paying twice.
             renderError: {
               message:      errMsg,
-              stage:        result.stage || result.error?.stage || 'unknown',
+              stage:        failStage,
               predictionId: result.error?.predictionId || null,
               atlasCode:    result.error?.atlasCode ?? null,
               charged:      result.error?.charged === true,
@@ -1672,13 +1714,21 @@ async function renderOneInner(run, job, adId, index, renderToken) {
           $inc: { renderAttempts: 1 }
         }
       );
+      crashReporter.reportSync({
+        kind:  'static-render-failed',
+        title: 'Static render failed',
+        err:   result.error,
+        ad,
+        run,
+        stage: failStage
+      });
     }
   } catch (err) {
     await CampaignRun.updateOne(
       { _id: run._id },
       {
         $inc: { failed: 1 },
-        $push: { errors: buildErrorEntry(creative, index, 'crash', err) }
+        $push: { errors: buildErrorEntry(creative, index, 'crash', err, { adId }) }
       }
     );
     await Ad.updateOne(
@@ -1704,6 +1754,16 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         $inc: { renderAttempts: 1 }
       }
     );
+    // Same money tags the renderError write above just stamped — crashReporter
+    // re-derives them from err / err.cause (and ad.renderError if present).
+    crashReporter.reportSync({
+      kind:  'render-crash',
+      title: 'Render crash',
+      err,
+      ad,
+      run,
+      stage: 'crash'
+    });
   }
 }
 
@@ -1712,7 +1772,12 @@ async function renderOneInner(run, job, adId, index, renderToken) {
 // per-stage errors as objects, so we have to extract .message rather
 // than letting Mongoose stringify the whole object (which fails the
 // String cast on errors[].message).
-function buildErrorEntry(creative, index, stageHint, errLike) {
+//
+// Optional 5th arg `{ adId, incidentId }` — existing 4-arg callers keep
+// working. Money tags (predictionId / charged) are derived from the error
+// the same way the render-crash renderError write does, so CampaignRun.errors[]
+// can join to a charged Atlas submit even when the Ad row is gone.
+function buildErrorEntry(creative, index, stageHint, errLike, { adId, incidentId } = {}) {
   const errStage = (errLike && typeof errLike === 'object' && errLike.stage)
     ? errLike.stage
     : (stageHint || 'unknown');
@@ -1724,6 +1789,13 @@ function buildErrorEntry(creative, index, stageHint, errLike) {
   } else {
     message = errLike ? String(errLike) : 'unknown';
   }
+  // Same derivation as the render-crash path (~renderError write above).
+  const predictionId = (errLike && typeof errLike === 'object')
+    ? (errLike.predictionId || errLike.cause?.predictionId || null)
+    : null;
+  const charged = (errLike && typeof errLike === 'object')
+    ? (errLike.charged === true || errLike.cause?.charged === true)
+    : false;
   return {
     index,
     stage:       errStage,
@@ -1731,7 +1803,12 @@ function buildErrorEntry(creative, index, stageHint, errLike) {
     aspectRatio: creative.aspectRatio,
     mediaId:     creative.mediaId   ? String(creative.mediaId)   : null,
     productId:   creative.productId ? String(creative.productId) : null,
-    message
+    message,
+    adId:         adId != null && adId !== '' ? String(adId) : null,
+    predictionId: predictionId != null ? String(predictionId) : null,
+    charged:      charged === true,
+    incidentId:   incidentId != null && incidentId !== '' ? String(incidentId) : null,
+    at:           new Date()
   };
 }
 
@@ -2060,83 +2137,10 @@ router.get('/render-activity', async (req, res) => {
       }
     }
 
-    const now = Date.now();
     const rows = ads.map(a => {
       const run = (a.campaignRunIds || []).map(String).map(id => runById.get(id)).find(Boolean) || null;
-      const predictionId = a.imageGeneration?.predictionId || a.veoPredictionId || null;
-      const stageAgeSec = a.renderStageAt ? Math.round((now - new Date(a.renderStageAt).getTime()) / 1000) : null;
-      const t = a.renderStages || {};
-      const row = {
-        assetId:       String(a._id),
-        status:        a.status,
-        stage:         a.renderStage || null,
-        stageAgeSec,
-        // A render sitting in one stage far longer than that stage's normal cost
-        // is the signal worth surfacing; 600s is the Atlas image deadline and the
-        // video poll ceiling, so past that something is genuinely wrong.
-        stalled:       a.status === 'rendering' && stageAgeSec != null && stageAgeSec > 600,
-        kind:          a.kind,
-        template:      a.template,
-        platformFormat: a.platformFormat,
-        aspectRatio:   a.aspectRatio,
-        pipeline:      a.imageGeneration?.pipeline || (a.kind === 'video' ? 'veo' : null),
-        model:         a.imageGeneration?.model || null,
-        predictionId,
-        // Provenance for the multi-size video story: a 1:1 or 4:5 video whose
-        // veoAspectRatio is 9:16 was CROPPED from a master, not generated.
-        derivedFromMaster: a.kind === 'video' && a.veoAspectRatio === '9:16' && a.aspectRatio !== '9:16',
-        timingsMs:     { derive: t.deriveMs ?? null, render: t.renderMs ?? null, upload: t.uploadMs ?? null },
-        intent:        a.intentResolution
-          ? { requested: a.intentResolution.requested, delivered: a.intentResolution.delivered,
-              fellBackFrom: a.intentResolution.fellBackFrom || null,
-              dropped: a.intentResolution.droppedRoles || [] }
-          : null,
-        visionQc:      a.visionQc
-          ? { passed: a.visionQc.passed, finalAttempt: a.visionQc.finalAttempt,
-              skipped: !!a.visionQc.skipped, disabled: !!a.visionQc.disabled,
-              attempts: (a.visionQc.attempts || []).map(t => ({
-                attempt: t.attempt, pass: t.pass, summary: t.summary,
-                discarded: !!t.discarded, renderUrl: t.renderUrl || null,
-                discardedRenderUrl: t.discardedRenderUrl || null
-              })) }
-          : null,
-        assetUrl:      a.renderUrl || null,
-        error:         a.renderError?.message || (typeof a.renderError === 'string' ? a.renderError : null),
-        attempts:      a.renderAttempts ?? null,
-        ids:           {
-          campaignId: a.campaignId ? String(a.campaignId) : null,
-          runId:      run?.runId || (a.campaignRunIds || [])[0] || null,
-          productId:  a.productId ? String(a.productId) : null,
-          mediaId:    a.mediaId ? String(a.mediaId) : null,
-          brandId:    a.brandId ? String(a.brandId) : null,
-          conceptId:  a.conceptId || null
-        },
-        requestedBy:   (() => {
-          const uid = run?.requestedBy ? String(run.requestedBy) : null;
-          if (!uid) return null;
-          const u = userById.get(uid);
-          return u?.email || u?.name || uid;   // id is still useful; never blank
-        })(),
-        run:           run ? { status: run.status, total: run.total, succeeded: run.succeeded, failed: run.failed, skipped: run.skipped } : null,
-        queuedAt:      a.queuedAt || null,
-        renderedAt:    a.renderedAt || null,
-        updatedAt:     a.updatedAt || null
-      };
-      row.diagnostic = [
-        `asset=${row.assetId}`,
-        `status=${row.status}${row.stalled ? ' STALLED' : ''}`,
-        `stage=${row.stage || '-'}${row.stageAgeSec != null ? ` (${row.stageAgeSec}s)` : ''}`,
-        `kind=${row.kind} fmt=${row.platformFormat} aspect=${row.aspectRatio}`,
-        `pipeline=${row.pipeline || '-'} model=${row.model || '-'}`,
-        `prediction=${row.predictionId || '-'}`,
-        row.derivedFromMaster ? 'derivedFromMaster=true (cropped, not generated)' : null,
-        `timings(ms) derive=${row.timingsMs.derive ?? '-'} render=${row.timingsMs.render ?? '-'} upload=${row.timingsMs.upload ?? '-'}`,
-        row.intent ? `intent=${row.intent.delivered}${row.intent.fellBackFrom ? ` (fellBackFrom ${row.intent.fellBackFrom})` : ''}${row.intent.dropped.length ? ` dropped=${row.intent.dropped.join('+')}` : ''}` : null,
-        `run=${row.ids.runId || '-'} by=${row.requestedBy || '-'}`,
-        `product=${row.ids.productId || '-'} media=${row.ids.mediaId || '-'} concept=${row.ids.conceptId || '-'}`,
-        row.error ? `error=${row.error}` : null,
-        row.assetUrl ? `asset=${row.assetUrl}` : null
-      ].filter(Boolean).join('\n');
+      const row = buildAdRow(a, { run, userById });
+      row.diagnostic = buildAdDiagnostic(row);
       return row;
     });
 

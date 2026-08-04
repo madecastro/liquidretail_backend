@@ -447,6 +447,120 @@ async function main() {
   checkTrue('I3 safeEsc clips without broken entity',
     !/&[a-zA-Z]*$/.test(alerts._safeEsc('&&&&&&&&&', 5).replace(/…$/, '')));
 
+  // ── J. wrappers accept BOTH shapes ───────────────────────────────────
+  // REGRESSION GUARD. Three production call sites called warn()/error() with a
+  // single options object against a (title, opts) signature, so the object
+  // became the title: Slack rendered `[object Object]` and detail/fields/key
+  // were silently dropped. Live in prod on a money-adjacent path
+  // (costTracker "Cost row dropped"). Both shapes must work.
+  await withEnv(CFG, async () => {
+    alerts._resetState();
+    installFetch(async () => jsonRes(200, { ok: true }));
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const r = await alerts.error({
+        title: 'Cost row dropped — CostLog schema drift',
+        detail: 'ValidationError: costUsd required',
+        fields: { stage: 'atlas_image' },
+        key: 'costlog-validation'
+      });
+      check('J1 object form delivers', r, true);
+      const text = JSON.parse(fetchCalls[0].opts.body).text;
+      checkTrue('J2 object form renders the REAL title', text.includes('Cost row dropped'));
+      checkTrue('J3 object form does NOT render [object Object]', !text.includes('[object Object]'));
+      checkTrue('J4 object form keeps detail', text.includes('ValidationError'));
+      checkTrue('J5 object form keeps fields', /stage: \*atlas_image\*/.test(text));
+
+      // The object form must honour `key`, not derive one from a stringified
+      // object — otherwise dedupe collapses unrelated alerts together.
+      alerts._resetState();
+      restoreFetch();
+      installFetch(async () => jsonRes(200, { ok: true }));
+      await alerts.error({ title: 'first', key: 'shared-key' });
+      const second = await alerts.error({ title: 'second', key: 'shared-key' });
+      check('J6 object form honours the explicit dedupe key', second, false);
+
+      // Positional form unchanged.
+      alerts._resetState();
+      restoreFetch();
+      installFetch(async () => jsonRes(200, { ok: true }));
+      const p = await alerts.warn('positional title', { detail: 'pd', fields: { a: 'b' } });
+      check('J7 positional form still delivers', p, true);
+      const ptext = JSON.parse(fetchCalls[0].opts.body).text;
+      checkTrue('J8 positional title intact', ptext.includes('positional title'));
+      checkTrue('J9 positional detail intact', ptext.includes('pd'));
+    } finally {
+      console.warn = origWarn;
+      restoreFetch();
+    }
+  });
+
+  // ── K. non-string title is coerced AND warned about ──────────────────
+  await withEnv(CFG, async () => {
+    let warned = '';
+    const origWarn = console.warn;
+    console.warn = (m) => { warned += String(m); };
+    try {
+      const msg = alerts._buildMessage({ lvl: 'error', title: { title: 'inner title' } });
+      checkTrue('K1 non-string title never emits [object Object]', !msg.includes('[object Object]'));
+      checkTrue('K2 non-string title prefers .title', msg.includes('inner title'));
+      checkTrue('K3 non-string title logs a warning', /non-string title/i.test(warned));
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  // ── L. outbound message is REDACTED, not just console output ─────────
+  // crashReporter now routinely ships error messages and full stacks through
+  // this builder. A stack from a failed authenticated request can contain the
+  // bot token verbatim, and Slack channel history is workspace-readable and
+  // exportable — so redaction has to happen on the way OUT, not only on the
+  // console failure paths where it originally lived.
+  await withEnv(CFG, async () => {
+    const FAKE = ['xoxb', '9999999999', 'zyxwvutsrqponm'].join('-');
+    const msg = alerts._buildMessage({
+      lvl: 'fatal',
+      title: `crashed calling api with ${FAKE}`,
+      fields: { token: FAKE },
+      detail: `Error: auth failed\n  at fetch (Authorization: Bearer ${FAKE})`
+    });
+    checkTrue('L1 token scrubbed from the title', !msg.includes(FAKE));
+    checkTrue('L2 token scrubbed from fields', !/xoxb-9999999999/.test(msg));
+    checkTrue('L3 token scrubbed from the detail block', !msg.includes('zyxwvutsrqponm'));
+    // The marker arrives entity-encoded, because redaction runs BEFORE mrkdwn
+    // escaping (deliberate: escaping first would let a clipped tail hide a
+    // token). Slack renders `xox&lt;redacted&gt;` back as `xox<redacted>`.
+    checkTrue('L4 redaction leaves a marker', /xox&lt;redacted&gt;/.test(msg));
+    checkTrue('L5 redact is a public export', typeof alerts.redact === 'function');
+  });
+
+  // ── M. rate-limit spill is reported, not silently dropped ────────────
+  // With crash alerts deliberately un-folded (unique key per incident), this
+  // ceiling is the ONLY silent drop point. A burst that drops N and then goes
+  // quiet must still report — a rollover-only flush would never fire, because
+  // nothing calls withinRateLimit() again once the burst ends.
+  await withEnv({ ...CFG, ALERT_RATE_LIMIT_MAX: '3', ALERT_DEDUPE_WINDOW_MIN: '0' }, async () => {
+    alerts._resetState();
+    installFetch(async () => jsonRes(200, { ok: true }));
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      let delivered = 0;
+      for (let i = 0; i < 8; i++) {
+        if (await alerts.notify({ level: 'error', title: `burst ${i}`, key: `burst-${i}` })) delivered++;
+      }
+      check('M1 ceiling enforced', delivered, 3);
+      const spill = alerts._spillPending();
+      check('M2 drops counted', spill.drops, 5);
+      checkTrue('M3 spill timer ARMED (fires without further traffic)', spill.armed === true);
+    } finally {
+      console.warn = origWarn;
+      restoreFetch();
+      alerts._resetState();
+    }
+  });
+
   // ── summary ──────────────────────────────────────────────────────────
   console.log(`\nverifySlackAlert: ${pass} passed, ${failures.length} failed\n`);
   if (failures.length) {

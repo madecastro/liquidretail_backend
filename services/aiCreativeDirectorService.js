@@ -1310,12 +1310,13 @@ async function directConceptsRound({
       `🎭 directorRound[r${roundIndex}]: proceeding with ${parsed.concepts.length} concept(s) ` +
       `despite ${reasons.length} contract warning(s) — ${reasons.slice(0, 4).join('; ')}`
     );
-    alerts.warn({
+    alerts.notifyAsync({
+      level: 'warn',
       title: 'Director payload did not satisfy the round contract',
       detail: reasons.slice(0, 6).join('\n'),
       fields: { model: DIRECTOR_ROUND_MODEL, round: roundIndex, concepts: parsed.concepts.length },
       key: 'director:contract-warn'
-    }).catch(() => {});
+    });
   }
 
   const elapsedMs = Date.now() - t0;

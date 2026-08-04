@@ -2747,6 +2747,24 @@ async function runConceptDrivenExpansion({
       // Still return rather than rethrow: one product blowing up must not abort
       // the siblings mid-Promise.all, which would change who gets billed.
       console.error(`📦 conceptDriven[${productTag}]: failed (${err.message})`);
+      try {
+        const crashReporter = require('./crashReporter');
+        crashReporter.reportSync({
+          kind: 'expansion-product-failed',
+          level: 'error',
+          title: `conceptDriven product failed: ${err && err.message ? err.message : err}`,
+          err,
+          ids: {
+            productId: productId != null ? String(productId) : null,
+            brandId: brandId != null ? String(brandId) : null,
+            campaignId: campaignId != null ? String(campaignId) : null
+          },
+          fields: {
+            product: productId != null ? String(productId) : '-',
+            errorName: (err && err.constructor && err.constructor.name) || 'Error'
+          }
+        });
+      } catch (_) { /* alert path must never throw into expansion */ }
       return {
         productId,
         payloads: [],

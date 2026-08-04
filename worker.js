@@ -55,6 +55,7 @@ const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 1
 const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_INTERVAL_MIN, 10) || 5);
 
 const alerts = require('./services/alertService');
+const crashReporter = require('./services/crashReporter');
 
 // Mongoose default pool is 100 max. With 50+ concurrent workers each
 // firing several queries per pipeline stage, we want a roomy pool to
@@ -99,9 +100,25 @@ mongoose.connect(process.env.MONGODB_URI, {
   // holder process died without releasing them. Runs once at boot
   // (catches crashes since last restart) and on a timer (catches
   // mid-run crashes of the web service while this worker stays alive).
-  await reapOrphans().catch(err => console.warn(`⚠️  initial reap failed: ${err.message}`));
+  await reapOrphans().catch(err => {
+    console.warn(`⚠️  initial reap failed: ${err.message}`);
+    crashReporter.reportSync({
+      kind: 'reaper-failed',
+      level: 'warn',
+      title: `Initial orphan reaper failed: ${err.message || err}`,
+      err
+    });
+  });
   setInterval(() => {
-    reapOrphans().catch(err => console.warn(`⚠️  periodic reap failed: ${err.message}`));
+    reapOrphans().catch(err => {
+      console.warn(`⚠️  periodic reap failed: ${err.message}`);
+      crashReporter.reportSync({
+        kind: 'reaper-failed',
+        level: 'warn',
+        title: `Periodic orphan reaper failed: ${err.message || err}`,
+        err
+      });
+    });
   }, REAP_INTERVAL_MIN * 60 * 1000);
 
   // Health sweep — wedged renders, stalled runs, detect backlog, spend.
@@ -120,7 +137,16 @@ mongoose.connect(process.env.MONGODB_URI, {
   console.log(`🔔 alerts: ${alerts.isConfigured() ? 'Slack configured' : 'Slack NOT configured (set SLACK_BOT_TOKEN in Render env; SLACK_ALERT_CHANNEL ships in config/defaults.env)'}; watchdog every ${WATCHDOG_INTERVAL_MIN}m`);
 
   for (let i = 1; i <= CONCURRENCY; i++) {
-    workerLoop(i).catch(err => console.error(`❌ worker[${i}] crashed:`, err));
+    workerLoop(i).catch(err => {
+      console.error(`❌ worker[${i}] crashed:`, err);
+      crashReporter.reportSync({
+        kind: 'worker-loop-crash',
+        level: 'error',
+        title: `worker[${i}] loop crashed: ${err && err.message ? err.message : err}`,
+        err,
+        fields: { worker: String(i) }
+      });
+    });
   }
   // Scheduled IG sync — independent timer so it doesn't compete with
   // the queue loop for cycles. Catalog daily, posts hourly per Brand
@@ -152,10 +178,29 @@ async function reapOrphans() {
   // not exist on the schema; with the default `strict: true` mongoose
   // silently stripped it, so the write was always a no-op. Removed rather
   // than "fixed" — there is nothing that needs clearing.
-  const ads = await Ad.updateMany(
+  //
+  // Query ids FIRST so the Slack alert can name what was reaped (same
+  // technique as processAlerts.persistOrphans). Update stays scoped to
+  // that exact id list so the filter and the write cannot diverge.
+  const staleAds = await Ad.find(
     { status: 'rendering', updatedAt: { $lt: cutoff } },
-    { $set: { status: 'queued', updatedAt: new Date() } }
-  );
+    { _id: 1 }
+  ).lean();
+  const reapedAdIds = staleAds.map(a => String(a._id));
+  // The id list is for REPORTING; the write keeps the ORIGINAL predicate.
+  // Narrowing to `_id` alone would open a race the single updateMany never
+  // had: an ad that legitimately finished between the find and the update
+  // would be flipped back to 'queued' and later re-rendered — on the video
+  // path that is a second billable Omni submit (~$1) for an ad that already
+  // succeeded. So re-assert status + cutoff here. Consequence: reapedAdIds
+  // can over-report by a racing ad, which is why modifiedCount below stays
+  // the authoritative count in the alert.
+  const ads = reapedAdIds.length
+    ? await Ad.updateMany(
+        { _id: { $in: reapedAdIds }, status: 'rendering', updatedAt: { $lt: cutoff } },
+        { $set: { status: 'queued', updatedAt: new Date() } }
+      )
+    : { modifiedCount: 0 };
 
   // CampaignRun: stuck 'running' → mark 'failed' with completedAt so
   // the frontend poller resolves. The individual Ads inside the run
@@ -168,10 +213,22 @@ async function reapOrphans() {
   // 20-ad video batch legitimately runs 25-35 — the healthy long batch
   // would be marked failed while still rendering. A run whose counters
   // haven't moved in 15 minutes is genuinely dead.
-  const runs = await CampaignRun.updateMany(
+  const staleRuns = await CampaignRun.find(
     { status: 'running', updatedAt: { $lt: cutoff } },
-    { $set: { status: 'failed', completedAt: new Date() } }
+    { _id: 1, runId: 1 }
+  ).lean();
+  const reapedRunObjectIds = staleRuns.map(r => r._id);
+  const reapedRunIds = staleRuns.map(r =>
+    r.runId != null ? String(r.runId) : String(r._id)
   );
+  // Same reasoning as the ads above — keep the original predicate so a run
+  // that reached 'done' in the race window is not marked failed.
+  const runs = reapedRunObjectIds.length
+    ? await CampaignRun.updateMany(
+        { _id: { $in: reapedRunObjectIds }, status: 'running', updatedAt: { $lt: cutoff } },
+        { $set: { status: 'failed', completedAt: new Date() } }
+      )
+    : { modifiedCount: 0 };
 
   const nDetects = detects.modifiedCount || 0;
   const nAds     = ads.modifiedCount     || 0;
@@ -192,17 +249,31 @@ async function reapOrphans() {
     // DetectRuns is benign — the worker re-claims those itself — so that
     // case stays at warn.
     const dropped = nAds + nRuns;
+    const idLines = [];
+    if (reapedAdIds.length) {
+      idLines.push(`ad ids: ${reapedAdIds.join(', ')}`);
+    }
+    if (reapedRunIds.length) {
+      idLines.push(`run ids: ${reapedRunIds.join(', ')}`);
+    }
     alerts.notifyAsync({
       level: dropped > 0 ? 'error' : 'warn',
       title: dropped > 0
         ? `Dropped work reclaimed — ${nAds} ad(s), ${nRuns} run(s)`
         : `Reclaimed ${nDetects} stale detect run(s)`,
       key: 'reaper:reaped',
+      detail: idLines.length ? idLines.join('\n') : null,
       fields: {
         'ads reset to queued': nAds || undefined,
         'runs marked failed':  nRuns || undefined,
         'detect runs requeued': nDetects || undefined,
         'stale threshold':     `${REAP_STALE_MIN}m`,
+        ...(reapedAdIds.length
+          ? { 'ad ids': reapedAdIds.slice(0, 30).join(', ') + (reapedAdIds.length > 30 ? ` (+${reapedAdIds.length - 30} more)` : '') }
+          : {}),
+        ...(reapedRunIds.length
+          ? { 'run ids': reapedRunIds.slice(0, 30).join(', ') + (reapedRunIds.length > 30 ? ` (+${reapedRunIds.length - 30} more)` : '') }
+          : {}),
         ...(nAds > 0 ? { 'action needed': 'ads sit in queued until someone re-runs the campaign' } : {})
       }
     });

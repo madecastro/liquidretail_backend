@@ -52,7 +52,16 @@ const campaignRunSchema = new mongoose.Schema({
     aspectRatio: String,
     mediaId:    String,
     productId:  String,
-    message:    String
+    message:    String,
+    // Correlation for crash / money-at-risk rows. All optional and
+    // backwards compatible — existing errors[] stamps omit them.
+    // Populated by buildErrorEntry (routes/ads.js) when the caller has
+    // the ad / incident in hand.
+    adId:         String,
+    predictionId: String,
+    charged:      Boolean,
+    incidentId:   String,
+    at:           Date
   }],
 
   // Per-product expansion outcomes. Written when expandWizardJob finishes

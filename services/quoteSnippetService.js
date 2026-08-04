@@ -412,7 +412,7 @@ async function judgeProofLines(texts, { brandId = null, productId = null } = {})
     alerts.notifyAsync({
       level,
       title: 'Social-proof judge unavailable',
-      body: `${message}. Comments cannot be screened for sentiment, so no ad may render social proof until this clears.`,
+      detail: `${message}. Comments cannot be screened for sentiment, so no ad may render social proof until this clears.`,
       key:  err.alertKey
     });
     return err;

@@ -43,6 +43,8 @@ const veoService            = require('./videoRouter');
 const brandScriptExecutor   = require('./brandScriptExecutor');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const directImage           = require('./directImageRenderService');
+const crashReporter         = require('./crashReporter');
+const inFlight              = require('./inFlight');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
@@ -352,6 +354,12 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
     label: kind === 'video' ? 'Video ad regenerate' : 'Ad regenerate'
   });
 
+  // Regenerate never enters the render pool, so nothing else registers it as
+  // in-flight — yet an explicit video regenerate always costs ~$1 (see
+  // session.md §0.299: "video always regens fully"). Without this, a deploy
+  // landing mid-regenerate reported nothing at all.
+  inFlight.trackAd(null, adId, { kind });
+
   try {
     if (kind === 'video') {
       await runVideoFull(adId, prompt, progressRun, videoModel);
@@ -377,8 +385,20 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
       return;
     }
     console.error(`❌ regenerate[ad=${adId}]: failed after ${Math.round(durationMs / 1000)}s — ${err.message}`);
+    crashReporter.reportSync({
+      kind: 'regenerate-failed',
+      level: 'error',
+      title: `regenerate failed: ${err.message || err}`,
+      err,
+      ad,
+      stage: 'regenerate'
+    });
     await markComplete(adId, { status: 'failed', durationMs, error: err.message || String(err) });
     await progressRun.fail(err);
+  } finally {
+    // Must run on every exit — including the CancelledError early return above
+    // — or a stale entry would keep reporting this ad as in flight.
+    inFlight.untrackAd(adId);
   }
 }
 

@@ -25,12 +25,13 @@
 // through redact() first.
 //
 // Failure payload contract (lockstep with GET /api/ads/render-activity):
-// that endpoint builds a pre-formatted `diagnostic` block
-// (routes/ads.js ~1662-1676). Callers that already have that string
+// services/renderDiagnostic.js is the single builder (buildAdRow /
+// buildAdDiagnostic / diagnosticForAd) shared by the route and by
+// crashReporter. Callers that already have that diagnostic string
 // SHOULD pass it as `detail` — buildMessage() drops it into the fenced
 // block with only size-clipping applied (no re-formatting, no second
 // schema). Do not invent a parallel field layout here; the activity
-// board is the source of truth for what an operator needs.
+// board builder is the source of truth for what an operator needs.
 
 const os = require('os');
 
@@ -64,8 +65,10 @@ const DEDUPE_WINDOW_MS = () =>
 
 // Absolute ceiling on outbound messages, independent of dedupe — protects
 // the channel (and Slack's own rate limits) if something goes wrong
-// in a tight loop with varying keys.
-const RATE_LIMIT_MAX     = () => Math.max(1, parseInt(process.env.ALERT_RATE_LIMIT_MAX || '20', 10));
+// in a tight loop with varying keys. Default 60 (was 20) — with no
+// folding of crash alerts, this is the only silent drop point, so the
+// ceiling is higher and spill is itself reported to Slack (below).
+const RATE_LIMIT_MAX     = () => Math.max(1, parseInt(process.env.ALERT_RATE_LIMIT_MAX || '60', 10));
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 // Shown in every message so staging and prod are distinguishable, and so
@@ -84,7 +87,13 @@ const SEND_TIMEOUT_MS = () => Math.max(1000, parseInt(process.env.ALERT_SEND_TIM
 // broken payload.
 const SLACK_MAX     = 4000;
 const SAFETY_MARGIN = 64;   // room for the joins and the ``` wrapper
-const MAX_FIELDS    = 12;   // caller-supplied; bound it so the head can't blow the budget
+// caller-supplied; bound it so the head can't blow the budget. Raised 12 → 20
+// for crash/shutdown reports, which legitimately carry ~18 (identity + money +
+// in-flight counts + requeue results + likely cause). The detail block takes
+// whatever room the head leaves, so a larger head just shortens the stack —
+// it cannot overflow SLACK_MAX. Overflow past this cap is still DROPPED
+// silently, which is why crashReporter inserts identity fields first.
+const MAX_FIELDS    = 20;
 const MAX_TITLE     = 200;
 const MAX_FIELD_VAL = 200;
 
@@ -100,6 +109,39 @@ const suppressed   = new Map(); // key → { count, since }
 let   windowStart  = 0;
 let   windowCount  = 0;
 let   rateLimitedNoted = false;
+// Drops this window. With no crash-alert folding, the rate limit is the
+// only silent drop point — count them and emit ONE spill summary on
+// rollover so the channel still learns something was lost. IncidentLog
+// is the system of record (written before Slack); the spill just points
+// operators at that collection.
+let   rateLimitDrops = 0;
+let   spillTimer   = null;
+
+// A rollover-only flush would be a lie: withinRateLimit() is only called when
+// something tries to send, so a burst that drops 40 alerts and then goes quiet
+// would roll over with nobody there to notice. That is exactly the case the
+// spill exists for. So the FIRST drop of a window arms a detached timer that
+// reports regardless of any later traffic. unref'd — same pattern as
+// runFeedService's drain interval — so it can never hold the process open on a
+// shutdown path.
+function armSpillTimer() {
+  if (spillTimer) return;
+  const due = Math.max(0, RATE_LIMIT_WINDOW_MS - (Date.now() - windowStart)) + 50;
+  spillTimer = setTimeout(() => {
+    spillTimer = null;
+    flushRateLimitSpill();
+  }, due);
+  if (typeof spillTimer.unref === 'function') spillTimer.unref();
+}
+
+function flushRateLimitSpill() {
+  const dropped = rateLimitDrops;
+  rateLimitDrops = 0;
+  // Via a bypass path so it never consumes a slot / re-enters the counter
+  // (a recursive notify → withinRateLimit would be fatal for the one
+  // message that exists to report drops).
+  if (dropped > 0) scheduleRateLimitSpill(dropped);
+}
 
 function withinRateLimit() {
   const now = Date.now();
@@ -107,8 +149,14 @@ function withinRateLimit() {
     windowStart = now;
     windowCount = 0;
     rateLimitedNoted = false;
+    // The armed timer may not have fired yet (its 50ms margin, or an idle
+    // event loop). Report now rather than carrying the count into a window
+    // it did not belong to.
+    flushRateLimitSpill();
   }
   if (windowCount >= RATE_LIMIT_MAX()) {
+    rateLimitDrops++;
+    armSpillTimer();
     if (!rateLimitedNoted) {
       rateLimitedNoted = true;
       console.warn(`🔔 alert: rate limit hit (${RATE_LIMIT_MAX()}/min) — suppressing further alerts this minute`);
@@ -117,6 +165,38 @@ function withinRateLimit() {
   }
   windowCount++;
   return true;
+}
+
+// Fire-and-forget: never await on a render path, never throw.
+function scheduleRateLimitSpill(n) {
+  Promise.resolve()
+    .then(() => emitRateLimitSpill(n))
+    .catch(() => {});
+}
+
+async function emitRateLimitSpill(n) {
+  // Bypass the rate-limit counter entirely. Do NOT call withinRateLimit
+  // and do not increment windowCount — this summary must never be the
+  // dropped message. Still go through notify() for min-level / config /
+  // transport / never-throws, with an explicit bypass flag.
+  const count = Number(n) || 0;
+  if (count <= 0) return;
+  try {
+    await notify({
+      level: 'warn',
+      title: `${count} crash alert(s) suppressed by the rate limit`,
+      fields: {
+        dropped: String(count),
+        // IncidentLog is written BEFORE every Slack send (crashReporter
+        // ordering rule); the dropped messages still have rows.
+        'incident log': 'IncidentLog — query by kind + at for the missing window',
+      },
+      key: `alert-rate-limit-spill:${windowStart}`,
+      _bypassRateLimit: true,
+    });
+  } catch {
+    /* absolute backstop — notify itself never throws, but be sure */
+  }
 }
 
 // Slack mrkdwn treats &, <, > as control characters (links, mentions). They
@@ -249,14 +329,48 @@ async function sendSlack(text, lvl) {
   }
 }
 
+// Coerce a non-string title into something readable for Slack. The dual-
+// shape wrappers (§4a) close the known `[object Object]` call sites, but
+// if a future caller still passes an object as `title` we want a console
+// warning naming the offender and a scannable message — not silent
+// `[object Object]` in the channel.
+function coerceTitle(title) {
+  if (title == null || typeof title === 'string') return title;
+  try {
+    const preview = typeof title === 'object'
+      ? (title.title != null ? String(title.title)
+        : (typeof title.message === 'string' ? title.message
+          : clip(JSON.stringify(title), MAX_TITLE)))
+      : String(title);
+    console.warn(
+      `🔔 alert: non-string title (typeof=${typeof title}` +
+      `${title && title.constructor && title.constructor.name ? `, ${title.constructor.name}` : ''})` +
+      ` — coercing; offender preview: ${clip(preview, 120)}`
+    );
+    if (typeof title === 'object' && title.title != null) return String(title.title);
+    try { return clip(JSON.stringify(title), MAX_TITLE); }
+    catch { return String(title); }
+  } catch {
+    return String(title);
+  }
+}
+
 // Assemble the outgoing mrkdwn, budgeting the ESCAPED length so the result
 // is always <= SLACK_MAX with every fence closed. The detail block gets
 // whatever room the header and fields leave over. When `detail` is a
 // pre-built diagnostic from render-activity, it is used as-is (after
 // safeEsc size-clipping only) — never re-parsed into a second schema.
 function buildMessage({ lvl, title, fields, detail, held }) {
+  // Redact BEFORE escaping and budgeting, so the size budget is computed on
+  // the text that actually ships and a token can never survive by hiding in a
+  // clipped tail. Until crashReporter existed, redact() only guarded
+  // console.warn — but alerts now routinely carry error messages and full
+  // stacks, and a stack from a failed authenticated request can contain the
+  // bot token verbatim. A Slack channel is readable by the whole workspace and
+  // its history is exportable, so that is a real credential disclosure.
+  const titleStr = redact(coerceTitle(title));
   const lines = [
-    `${ICON[lvl]} *${safeEsc(title || '(no title)', MAX_TITLE)}*`,
+    `${ICON[lvl]} *${safeEsc(titleStr || '(no title)', MAX_TITLE)}*`,
     `\`${safeEsc(`${ENV_LABEL()}·${ROLE()}·${INSTANCE()}`, 120)}\``
   ];
 
@@ -265,7 +379,7 @@ function buildMessage({ lvl, title, fields, detail, held }) {
     for (const [k, v] of Object.entries(fields)) {
       if (v === undefined || v === null || v === '') continue;
       if (++n > MAX_FIELDS) break;
-      lines.push(`${safeEsc(k, 60)}: *${safeEsc(v, MAX_FIELD_VAL)}*`);
+      lines.push(`${safeEsc(redact(k), 60)}: *${safeEsc(redact(v), MAX_FIELD_VAL)}*`);
     }
   }
 
@@ -277,6 +391,7 @@ function buildMessage({ lvl, title, fields, detail, held }) {
 
   const head = lines.join('\n');
   if (!detail) return head.slice(0, SLACK_MAX);
+  detail = redact(detail);
 
   // '\n\n```\n' + '\n```' is 10 chars of wrapper.
   const FENCE_OVERHEAD = 10;
@@ -297,7 +412,7 @@ function buildMessage({ lvl, title, fields, detail, held }) {
  * @param {string} [o.key]    dedupe key; defaults to level+title
  * @returns {Promise<boolean>} true if a message was actually delivered
  */
-async function notify({ level = 'warn', title, detail, fields, key } = {}) {
+async function notify({ level = 'warn', title, detail, fields, key, _bypassRateLimit = false } = {}) {
   try {
     if (!ENABLED()) return false;
 
@@ -333,7 +448,10 @@ async function notify({ level = 'warn', title, detail, fields, key } = {}) {
     // first await. Two callers racing on the same key must not both send.
     lastSentAt.set(dedupeKey, now);
 
-    if (!withinRateLimit()) {
+    // Rate-limit spill summaries bypass the counter so they can never
+    // themselves be the dropped message (and so emitRateLimitSpill cannot
+    // recurse into withinRateLimit).
+    if (!_bypassRateLimit && !withinRateLimit()) {
       // Rate-limited, not delivered — release the slot so the key isn't
       // silenced for the whole dedupe window by a burst it never joined.
       lastSentAt.delete(dedupeKey);
@@ -360,11 +478,18 @@ async function notify({ level = 'warn', title, detail, fields, key } = {}) {
   }
 }
 
-// Convenience wrappers. Deliberately un-awaited at most call sites.
-const info  = (title, o = {}) => notify({ ...o, level: 'info',  title });
-const warn  = (title, o = {}) => notify({ ...o, level: 'warn',  title });
-const error = (title, o = {}) => notify({ ...o, level: 'error', title });
-const fatal = (title, o = {}) => notify({ ...o, level: 'fatal', title });
+// Convenience wrappers. Accept either positional (title, opts) or a single
+// options object ({ title, detail, fields, key }). Three production call
+// sites pass the object form; without this branch the object becomes the
+// title and Slack renders `[object Object]` with detail/fields/key dropped.
+const wrap = (level) => (a, b = {}) =>
+  (a && typeof a === 'object' && !Array.isArray(a))
+    ? notify({ ...a, level })            // object form: title lives inside
+    : notify({ ...b, level, title: a }); // positional form (unchanged)
+const info  = wrap('info');
+const warn  = wrap('warn');
+const error = wrap('error');
+const fatal = wrap('fatal');
 
 /**
  * Fire-and-forget: for use in hot paths and catch blocks where even the
@@ -384,6 +509,8 @@ function _resetState() {
   windowStart = 0;
   windowCount = 0;
   rateLimitedNoted = false;
+  rateLimitDrops = 0;
+  if (spillTimer) { clearTimeout(spillTimer); spillTimer = null; }
   delete notify._warnedUnconfigured;
 }
 
@@ -391,9 +518,17 @@ module.exports = {
   notify, notifyAsync, info, warn, error, fatal,
   isConfigured,
   // exported for unit tests
+  // redact is a PRODUCTION export, not just a test seam: crashReporter must
+  // scrub the same token shapes before it persists a stack to Mongo, and
+  // duplicating the regex would let the two drift.
+  redact,
   _esc: esc, _clip: clip, _safeEsc: safeEsc, _redact: redact,
   _buildMessage: buildMessage, _resetState, _LEVELS: LEVELS,
   _stateSize: () => ({ lastSentAt: lastSentAt.size, suppressed: suppressed.size }),
-  _resetRateWindow: () => { windowStart = 0; windowCount = 0; rateLimitedNoted = false; },
+  _resetRateWindow: () => {
+    windowStart = 0; windowCount = 0; rateLimitedNoted = false; rateLimitDrops = 0;
+    if (spillTimer) { clearTimeout(spillTimer); spillTimer = null; }
+  },
+  _spillPending: () => ({ drops: rateLimitDrops, armed: Boolean(spillTimer) }),
   _SLACK_MAX: SLACK_MAX
 };

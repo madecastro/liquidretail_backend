@@ -240,11 +240,12 @@ async function persistCost(record) {
     // costs us the whole row — loud, because it is a code bug, not a blip.
     if (err?.name === 'ValidationError') {
       console.error(`   ❌ costTracker.persist DROPPED a cost row (schema drift): ${err.message}`);
-      alerts.error({
+      alerts.notifyAsync({
+        level: 'error',
         title: 'Cost row dropped — CostLog schema drift',
         detail: err.message,
         key: 'costlog-validation'
-      }).catch(() => {});
+      });
     } else {
       console.warn(`   ⚠️  costTracker.persist failed: ${err.message}`);
     }

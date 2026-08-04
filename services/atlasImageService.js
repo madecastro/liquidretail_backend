@@ -26,6 +26,7 @@ const axios = require('axios');
 const { recordFlatCost, reconcileCost } = require('./costTracker');
 const { classify, mayResubmit, retryAfterFrom } = require('./atlasErrorPolicy');
 const { adStage, formatElapsed } = require('./adStage');
+const inFlight                  = require('./inFlight');
 
 const BASE = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
 const KEY = () => process.env.ATLAS_API_KEY;
@@ -201,6 +202,14 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     throw err;                       // no predictionId => wrapper may resubmit
   }
   const id = submit.data.data.id;
+  // The submit returned an id, so the task IS billable from here (the refusal
+  // branch above throws with charged:false precisely because nothing was
+  // created). Mark it before the poll loop so a SIGTERM landing mid-poll
+  // reports this ad as a CHARGED loss rather than a free one — static is the
+  // higher-volume charge path (3 billable submits per product on meta_static),
+  // so leaving it unmarked understated real spend in exactly the common case.
+  // In-memory, non-throwing, never awaited; safe on a billable path.
+  inFlight.markSubmitted(meta.adId, { predictionId: id });
   let lastStatus = null;
   let transientPolls = 0;   // backoff counter for throttles seen while polling
   let pollCount = 0;

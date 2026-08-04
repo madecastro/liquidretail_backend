@@ -38,6 +38,7 @@ const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
 const { recordFlatCost } = require('./costTracker');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
+const inFlight                  = require('./inFlight');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
 
@@ -2875,6 +2876,14 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
   // generation post-payment, because the caller would then never store videoUrl and a
   // retry would double-bill.
+  // Mark the ad as CHARGED in the in-memory in-flight registry BEFORE the DB
+  // write, deliberately. The money is already spent by this point, and if the
+  // updateOne below fails the predictionId is never persisted — the exact
+  // "orphan would be unreconcilable" case the catch warns about. Recording it
+  // first means a SIGTERM landing in that window still reports the ad as a
+  // charged loss instead of a free one. In-memory and non-throwing, so it
+  // cannot affect a post-payment path.
+  inFlight.markSubmitted(ad._id, { predictionId });
   try {
     await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
   } catch (err) {

@@ -437,8 +437,15 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   feed — `services/runFeedService.js`; parent `chat.update` + threaded event
   log; fire-and-forget, never on a render path). Slack returns HTTP 200 with
   `{ok:false,error:…}` on logical failure; checking only `res.ok` reports
-  success while nothing delivered (`alertService.js:220-222`). Worker boot:
-  `🔔 alerts: Slack configured`.
+  success while nothing delivered (`alertService.js` `sendSlack`: require
+  `body.ok === true`). Worker boot: `🔔 alerts: Slack configured`.
+  **IncidentLog** (`models/IncidentLog.js`) is the durable system of record;
+  Slack is notification — `crashReporter` writes the row **before** the Slack
+  send, never conditional on it. Crash alerts do **not** fold
+  (`key: 'crash:' + incidentId`); other alerts still dedupe.
+  `services/renderDiagnostic.js` is the one failure-payload builder shared by
+  `GET /api/ads/render-activity` and the crash alerts. Full write-up:
+  `docs/ALERTING.md`. Offline-verified only (not yet exercised in prod).
 - **`DIRECTOR_UNIVERSE_TOP_N` default is 1** (`config/defaults.env:35`,
   `campaignAdsGenerationService.js:195`). Ceiling stays 10
   (`seededUniverseService` `DEFAULT_TOP_N`); multi-image remains wired;

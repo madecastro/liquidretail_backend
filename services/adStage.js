@@ -79,6 +79,14 @@ function adStage(adId, stage) {
     require('./runFeedService').onStage(id, text);
   } catch { /* never escape to a render path */ }
 
+  // in-memory stage for signal-handler snapshots (zero DB). Same never-throw
+  // contract as the feed hook — a bad require or garbage id must not fail a
+  // paid render path that only called us for telemetry.
+  try {
+    // eslint-disable-next-line global-require
+    require('./inFlight').adStage(id, text);
+  } catch { /* never escape to a render path */ }
+
   Ad.updateOne(
     { _id: adId },
     { $set: { renderStage: text, renderStageAt: new Date(), updatedAt: new Date() } }

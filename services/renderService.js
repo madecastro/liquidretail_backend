@@ -29,6 +29,7 @@ const { buildLayoutInput }  = require('./layoutInputService');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const { buildVideoCompositeUrl } = require('./videoCompositeService');
 const { adStage } = require('./adStage');
+const crashReporter = require('./crashReporter');
 
 // Templates whose canvas variants have a clean media slot (kind:'media',
 // slot:'product.hero_media'). Only these templates render as video in V1
@@ -98,6 +99,15 @@ async function renderCreative(req) {
       const { noteRenderIssue } = require('./adStage');
       noteRenderIssue(req.adId, { message: err.message || String(err), stage: 'derive' });
     }
+    crashReporter.reportSync({
+      kind: 'render-stage-failed',
+      level: 'error',
+      title: `render derive failed: ${err.message || err}`,
+      err,
+      ad: req.adId ? { _id: req.adId } : null,
+      run: req.campaignRunId ? { runId: req.campaignRunId } : null,
+      stage: 'derive'
+    });
     return failed(jobId, 'derive', err);
   }
 
@@ -217,6 +227,15 @@ async function renderCreative(req) {
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB, mode=static)`);
   } catch (err) {
     console.error(`   ❌ ${tag} render: ${err.message || err}`);
+    crashReporter.reportSync({
+      kind: 'render-stage-failed',
+      level: 'error',
+      title: `render stage failed: ${err.message || err}`,
+      err,
+      ad: req.adId ? { _id: req.adId } : null,
+      run: req.campaignRunId ? { runId: req.campaignRunId } : null,
+      stage: 'render'
+    });
     return failed(jobId, 'render', err);
   }
 
@@ -240,6 +259,15 @@ async function renderCreative(req) {
     console.log(`   ☁️  ${tag} upload ok in ${stages.upload}ms (publicId=${upload.cloudinaryPublicId})`);
   } catch (err) {
     console.error(`   ❌ ${tag} upload: ${err.message || err}`);
+    crashReporter.reportSync({
+      kind: 'render-stage-failed',
+      level: 'error',
+      title: `render upload failed: ${err.message || err}`,
+      err,
+      ad: req.adId ? { _id: req.adId } : null,
+      run: req.campaignRunId ? { runId: req.campaignRunId } : null,
+      stage: 'upload'
+    });
     return failed(jobId, 'upload', err);
   }
 
@@ -270,6 +298,15 @@ async function renderCreative(req) {
     console.log(`   💾 ${tag} persist ok in ${stages.persist}ms (Ad ${ad._id})`);
   } catch (err) {
     console.error(`   ❌ ${tag} persist: ${err.message || err}`);
+    crashReporter.reportSync({
+      kind: 'render-stage-failed',
+      level: 'error',
+      title: `render persist failed: ${err.message || err}`,
+      err,
+      ad: req.adId ? { _id: req.adId } : null,
+      run: req.campaignRunId ? { runId: req.campaignRunId } : null,
+      stage: 'persist'
+    });
     return failed(jobId, 'persist', err);
   }
 
@@ -515,6 +552,19 @@ async function renderStage(args) {
     if (!output?.skipped) return output;
     if (!output.routedToHtml) {
       console.error(`   ❌ [render direct-image] unavailable — ${output.reason}`);
+      crashReporter.reportSync({
+        kind: 'direct-image-unavailable',
+        level: 'error',
+        title: `direct-image unavailable: ${output.reason}`,
+        ad: args.adId ? { _id: args.adId } : null,
+        run: args.campaignRunId ? { runId: args.campaignRunId } : null,
+        stage: 'render',
+        fields: {
+          template: String(template || '-'),
+          aspectRatio: String(aspectRatio || '-'),
+          reason: String(output.reason || '-')
+        }
+      });
       throw new Error(`direct-image render unavailable: ${output.reason}`);
     }
     console.log(`   🖼️  [render direct-image] brand routed to HTML — ${output.reason}`);
