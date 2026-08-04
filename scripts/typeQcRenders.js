@@ -137,7 +137,7 @@ function normalizeVerdict(raw) {
       calls++;
       try {
         const res = await chatCompletion(
-          { service: 'typeQcRenders', purpose: 'type-readability-qc', visionImages: 1 },
+          { stage: 'type_readability_qc', service: 'typeQcRenders', purpose: 'type-readability-qc', visionImages: 1 },
           {
             model: 'gemini-2.5-pro',
             messages: [

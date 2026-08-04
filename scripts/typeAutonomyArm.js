@@ -255,7 +255,7 @@ function compileAdPreset(ad, plan) {
     let parsed = null;
     try {
       const res = await chatCompletion(
-        { service: 'typeAutonomyArm', purpose: 'per-ad-type-plan', visionImages: 1 },
+        { stage: 'type_autonomy_plan', service: 'typeAutonomyArm', purpose: 'per-ad-type-plan', visionImages: 1 },
         {
           model: 'gemini-2.5-pro',
           messages: [
