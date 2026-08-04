@@ -47,6 +47,186 @@ const directImage           = require('./directImageRenderService');
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
 
+// ── Video prompt override lengths on regenerate ────────────────────────
+// Same product-policy caps as the wizard body parser (routes/ads.js
+// parsePhase3WizardFields: guidance ≤1000 chars, raw ≤4000 chars). Do NOT
+// raise these to the Omni model promptByteCap (20000) — the wizard and
+// regenerate screens must agree, and ATLAS.md documents the deliberate
+// 4000-char API ceiling even though Omni can accept more. The model cap
+// is still applied later by enforceRawByteCap inside generateForAd.
+const VIDEO_PROMPT_GUIDANCE_MAX = 1000;
+const VIDEO_PROMPT_RAW_MAX      = 4000;
+
+// ── Image prompt override length on regenerate ─────────────────────────
+// DELIBERATELY 10x the video ceiling, and it must not be "harmonised" down
+// to 4000 for symmetry. The static prompt this replaces is ~7.8-8.4k chars
+// after the PRODUCT_FIDELITY hardening (staticAdIntents.js), so a 4000 cap
+// would truncate the very prompt the operator just loaded and make the
+// feature useless. 40000 matches MAX_OVERRIDE_LEN on the existing
+// promptOverride channel (routes/ads.js), so the two static full-replace
+// entry points agree. There is no provider cap to respect: image models
+// publish no prompt maximum (docs/ATLAS.md:211, CLAUDE.md §3), and
+// atlasImageService passes the string through unaltered.
+const IMAGE_PROMPT_RAW_MAX      = 40000;
+
+// ── Pure regenerate request helpers (offline-harnessable) ──────────────
+// These exist so scripts/verifyRegeneration.js can pin the request gate
+// and the raw-replace / guidance-prepend contract without DB, network,
+// or an API key. Production routes/ads.js and runVideoFull call the same
+// functions — do not reimplement the rules at the call site.
+
+// Does this regenerate body carry ANY legal intent? A completely empty
+// body must 400. Mirrors the static `!prompt && !promptOverride` gate,
+// extended so a video re-roll with only videoPromptRaw / videoPromptGuidance
+// is legal (that was the gap: the API already allowed empty refinement
+// when promptOverride was set for images, but video had no equivalent).
+function regenerateHasIntent({
+  prompt = null,
+  promptOverride = null,
+  videoPromptRaw = null,
+  videoPromptGuidance = null,
+  imagePromptRaw = null
+} = {}) {
+  if (typeof prompt === 'string' && prompt.trim()) return true;
+  if (promptOverride && typeof promptOverride === 'object') return true;
+  if (typeof videoPromptRaw === 'string' && videoPromptRaw.trim()) return true;
+  if (typeof videoPromptGuidance === 'string' && videoPromptGuidance.trim()) return true;
+  if (typeof imagePromptRaw === 'string' && imagePromptRaw.trim()) return true;
+  return false;
+}
+
+// Validate + normalise the optional video prompt override fields on
+// POST /api/ads/:id/regenerate. Same length ceilings as the wizard
+// (VIDEO_PROMPT_GUIDANCE_MAX / VIDEO_PROMPT_RAW_MAX). Whitespace-only
+// collapses to null so a blank Advanced textarea does not count as intent.
+function parseRegenVideoPromptFields(body = {}) {
+  const rawIn = body.videoPromptRaw;
+  const gIn   = body.videoPromptGuidance;
+
+  let videoPromptRaw = null;
+  let videoPromptGuidance = null;
+
+  if (rawIn != null && rawIn !== '') {
+    if (typeof rawIn !== 'string') {
+      return { ok: false, error: 'videoPromptRaw must be a string' };
+    }
+    if (rawIn.length > VIDEO_PROMPT_RAW_MAX) {
+      return {
+        ok: false,
+        error: `videoPromptRaw must be a string ≤${VIDEO_PROMPT_RAW_MAX} characters`
+      };
+    }
+    const t = rawIn.trim();
+    if (t) videoPromptRaw = t;
+  }
+
+  if (gIn != null && gIn !== '') {
+    if (typeof gIn !== 'string') {
+      return { ok: false, error: 'videoPromptGuidance must be a string' };
+    }
+    if (gIn.length > VIDEO_PROMPT_GUIDANCE_MAX) {
+      return {
+        ok: false,
+        error: `videoPromptGuidance must be a string ≤${VIDEO_PROMPT_GUIDANCE_MAX} characters`
+      };
+    }
+    const t = gIn.trim();
+    if (t) videoPromptGuidance = t;
+  }
+
+  return { ok: true, videoPromptRaw, videoPromptGuidance };
+}
+
+// Validate + normalise the optional IMAGE raw prompt on
+// POST /api/ads/:id/regenerate. Same shape of contract as
+// parseRegenVideoPromptFields — non-string rejected, over-cap rejected with
+// the cap named, whitespace-only collapsed to null so a blank Advanced
+// textarea is not mistaken for intent.
+//
+// Cap is IMAGE_PROMPT_RAW_MAX (40000), NOT the video 4000 — see the constant.
+function parseRegenImagePromptField(body = {}) {
+  const rawIn = body.imagePromptRaw;
+
+  let imagePromptRaw = null;
+
+  if (rawIn != null && rawIn !== '') {
+    if (typeof rawIn !== 'string') {
+      return { ok: false, error: 'imagePromptRaw must be a string' };
+    }
+    if (rawIn.length > IMAGE_PROMPT_RAW_MAX) {
+      return {
+        ok: false,
+        error: `imagePromptRaw must be a string ≤${IMAGE_PROMPT_RAW_MAX} characters`
+      };
+    }
+    const t = rawIn.trim();
+    if (t) imagePromptRaw = t;
+  }
+
+  return { ok: true, imagePromptRaw };
+}
+
+// Resolve what runVideoFull will pass into generateForAd / prepareStoryboard.
+//
+// PASS-THROUGH ONLY — never write these back onto the Ad row. The wizard
+// PERSISTS videoPromptRaw / videoPromptGuidance on mint so a later Generate
+// reuses them; regenerate is a one-shot A/B of the camera prompt. Leaving
+// the next regenerate without overrides reverts to (a) any wizard-stamped
+// fields still on the row, else (b) the canonical buildVeoPrompt path.
+// Persisting here would lock every subsequent re-roll to this experiment.
+//
+// Priority for THIS call (matches atlasVideoService.generateForAd):
+//   1. per-call videoPromptRaw  → stamp onto the in-memory ad clone so the
+//      EXISTING raw branch runs (logs "canonical directives bypassed").
+//      Refinement prompt + videoPromptGuidance are ignored while raw is
+//      active — wizard parity (guidance disabled when raw is set).
+//   2. refinement `prompt` OR per-call videoPromptGuidance → operatorPrompt
+//      prepend via buildVeoPrompt (OPERATOR REFINEMENT header).
+//   3. neither → generateForAd falls through to ad.videoPromptRaw (wizard
+//      stamp) or the guidance cascade on the real Ad row.
+//
+// MONEY: this only chooses the prompt string. It does not change the number
+// of billable Omni submits — still exactly one generateForAd → submitGeneration.
+function resolveVideoRegenCall({
+  prompt = null,
+  videoPromptRaw = null,
+  videoPromptGuidance = null,
+  ad = null
+} = {}) {
+  const adForGen = ad && typeof ad === 'object' ? { ...ad } : {};
+  const raw = (typeof videoPromptRaw === 'string' && videoPromptRaw.trim())
+    ? videoPromptRaw.trim()
+    : null;
+  const guidance = (typeof videoPromptGuidance === 'string' && videoPromptGuidance.trim())
+    ? videoPromptGuidance.trim()
+    : null;
+  const refinement = (typeof prompt === 'string' && prompt.trim())
+    ? prompt.trim()
+    : null;
+
+  if (raw) {
+    // Force the generateForAd raw branch: operatorPrompt must be empty so
+    // it does not take priority over ad.videoPromptRaw (see atlasVideoService
+    // priority comment: operatorPrompt → raw → guidance cascade).
+    adForGen.videoPromptRaw = raw;
+    return {
+      operatorPrompt: null,
+      adForGen,
+      path: 'raw'
+    };
+  }
+
+  // Prepend path. Refinement textarea wins over the advanced guidance field
+  // when both are present — both are the same mechanism (operator direction
+  // prepended at highest priority), so we pick one rather than concatenate.
+  const operatorPrompt = refinement || guidance || null;
+  return {
+    operatorPrompt,
+    adForGen,
+    path: operatorPrompt ? 'prepend' : 'cascade'
+  };
+}
+
 // ── Catalog-first reseed on regenerate ────────────────────────────────
 //
 // THE PROBLEM. Regenerate used to REPLAY a stored reference stack and never
@@ -291,7 +471,23 @@ async function preflight(adId, brandId) {
 // route responds 202 with { regenerating: true } and the worker runs
 // in the background. The frontend polls /api/catalog/:id/ads-detail
 // every 5s watching Ad.regenerating.
-async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, promptOverride = null }) {
+async function regenerateAd({
+  ad,
+  prompt,
+  mode,
+  requestedBy,
+  videoModel = null,
+  promptOverride = null,
+  // Per-call video camera-prompt overrides (PASS-THROUGH — not persisted).
+  // See resolveVideoRegenCall for priority + next-regenerate behaviour.
+  videoPromptRaw = null,
+  videoPromptGuidance = null,
+  // Per-call IMAGE prompt full replacement (PASS-THROUGH — not persisted,
+  // same one-shot A/B rule as the video fields above). Routed into the
+  // existing promptOverride slot on runImage: resolveImagePromptOverride
+  // already accepts a bare string, so no new render-path argument.
+  imagePromptRaw = null
+}) {
   const adId      = String(ad._id);
   const kind      = ad.kind || 'image';
   // Video always regens fully (new Grok video + brand-script chrome).
@@ -308,7 +504,10 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
     // edited the exact prompt in the Generation Details modal) rather
     // than the refinement-note path. The full text is what the image
     // model receives (see resolveImagePromptOverride); history only flags.
-    rawPromptEdit: !!promptOverride,
+    // Also true for video when videoPromptRaw is supplied (full camera-
+    // prompt replace via the existing generateForAd raw branch), and for
+    // static when imagePromptRaw is supplied (full image-prompt replace).
+    rawPromptEdit: !!(promptOverride || videoPromptRaw || imagePromptRaw),
     at:            new Date(startedAt),
     status:        'pending'
   };
@@ -316,7 +515,16 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
   console.log(
     `🔁 regenerate[ad=${adId}]: kind=${kind} mode=${effMode}` +
     (videoModel ? ` videoModel=${videoModel}` : '') +
-    (promptOverride ? ' rawPromptEdit=true' : ` prompt="${historyEntry.prompt.slice(0, 60)}${historyEntry.prompt.length > 60 ? '…' : ''}"`)
+    (videoPromptRaw ? ' videoPromptRaw=true' : '') +
+    (videoPromptGuidance && !videoPromptRaw ? ' videoPromptGuidance=true' : '') +
+    (imagePromptRaw ? ' imagePromptRaw=true' : '') +
+    // Flags only — never the override text. imagePromptRaw runs ~8k chars and
+    // the refinement may legitimately be empty when raw carries the intent.
+    (promptOverride
+      ? ' rawPromptEdit=true'
+      : imagePromptRaw
+        ? ''
+        : ` prompt="${historyEntry.prompt.slice(0, 60)}${historyEntry.prompt.length > 60 ? '…' : ''}"`)
   );
 
   // Atomic lock + append in-flight history entry. Filter requires
@@ -354,9 +562,27 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
 
   try {
     if (kind === 'video') {
-      await runVideoFull(adId, prompt, progressRun, videoModel);
+      await runVideoFull(adId, prompt, progressRun, videoModel, {
+        videoPromptRaw,
+        videoPromptGuidance
+      });
     } else {
-      await runImage(adId, prompt, progressRun, promptOverride);
+      // imagePromptRaw and promptOverride are mutually exclusive at the route
+      // (both land in this one slot, and silently picking a winner would hide
+      // which text the operator's money paid for). The `||` is therefore a
+      // selection between two never-simultaneous values, not a precedence rule.
+      //
+      // A refinement sent ALONGSIDE a full replacement is dropped inside
+      // renderDirectImage (the override wins) — same rule as the video raw
+      // path, so the two screens agree. Say so out loud: historyEntry.prompt
+      // still stores the refinement text, so a silent drop would leave an
+      // audit trail implying both were used on a charged submit.
+      if (imagePromptRaw && String(prompt || '').trim()) {
+        console.log(
+          `🔁 regenerate[ad=${adId}]: refinement IGNORED — imagePromptRaw replaces the whole prompt`
+        );
+      }
+      await runImage(adId, prompt, progressRun, imagePromptRaw || promptOverride);
     }
 
     const durationMs = Date.now() - startedAt;
@@ -401,24 +627,52 @@ async function loadBrand(adId) {
 
 // Video regen — always full. Regenerates the storyboard + Grok base
 // video, then applies brand-script chrome (or no chrome, per resolver).
-async function runVideoFull(adId, prompt, progressRun = null, videoModel = null) {
+//
+// videoOpts.videoPromptRaw / videoOpts.videoPromptGuidance are per-call
+// only (see resolveVideoRegenCall). They ride into generateForAd via an
+// in-memory ad clone + operatorPrompt so the EXISTING atlasVideoService
+// branches fire:
+//   raw     → ad.videoPromptRaw path (logs "canonical directives bypassed")
+//   prepend → operatorPrompt → buildVeoPrompt OPERATOR REFINEMENT header
+// MONEY: still exactly one generateForAd → one billable Omni submit.
+async function runVideoFull(adId, prompt, progressRun = null, videoModel = null, videoOpts = {}) {
   // Stage 1 — context prep (model + aspect resolution, layoutInput
   // warm). storyboard is null on the Atlas path — the Ken Burns prompt
-  // directs motion; the operator's refinement prompt is threaded into
-  // the video prompt itself in Stage 2. videoModel (the regenerate
+  // directs motion; the operator's refinement / raw override is threaded
+  // into the video prompt itself in Stage 2. videoModel (the regenerate
   // dropdown's per-run override) goes to BOTH stages so they resolve
   // the same model.
   if (progressRun) { await progressRun.checkpoint(); progressRun.stage('generating video'); }
   await setStage(adId, 'veo');
   const ad1 = await Ad.findById(adId).lean();
-  const { storyboard } = await veoService.prepareStoryboard({ ad: ad1, operatorPrompt: prompt, modelOverride: videoModel });
+  const { operatorPrompt, adForGen, path } = resolveVideoRegenCall({
+    prompt,
+    videoPromptRaw:      videoOpts.videoPromptRaw || null,
+    videoPromptGuidance: videoOpts.videoPromptGuidance || null,
+    ad: ad1
+  });
+  if (path === 'raw') {
+    console.log(`🔁 regenerate[ad=${adId}]: videoPromptRaw active — canonical directives will be bypassed`);
+  }
+  const { storyboard } = await veoService.prepareStoryboard({
+    ad: adForGen,
+    operatorPrompt,
+    modelOverride: videoModel
+  });
 
   if (storyboard) {
     await Ad.updateOne({ _id: adId }, { $set: { veoStoryboard: storyboard, updatedAt: new Date() } });
   }
 
   // Stage 2 — new base video (model per override → settings → default).
-  const veoResult = await veoService.generateForAd({ ad: ad1, operatorPrompt: prompt, storyboard, modelOverride: videoModel });
+  // ONE billable submit inside generateForAd; prompt overrides do not
+  // add or remove submits.
+  const veoResult = await veoService.generateForAd({
+    ad: adForGen,
+    operatorPrompt,
+    storyboard,
+    modelOverride: videoModel
+  });
   if (veoResult.skipped) throw new Error(`Veo skipped: ${veoResult.reason}`);
 
   // Stamp the raw render before chrome so a chrome failure still
@@ -619,5 +873,16 @@ module.exports = {
   reseedDecision,
   shouldReseedFromCatalog,
   isCatalogMediaForProduct,
-  pickFirstCatalogMediaId
+  pickFirstCatalogMediaId,
+  // Video regenerate prompt overrides — pure helpers for the offline harness
+  // (R4 in scripts/verifyRegeneration.js) and the route gate.
+  VIDEO_PROMPT_GUIDANCE_MAX,
+  VIDEO_PROMPT_RAW_MAX,
+  regenerateHasIntent,
+  parseRegenVideoPromptFields,
+  resolveVideoRegenCall,
+  // Static regenerate raw prompt — pure helper + cap for the offline harness
+  // (R5 in scripts/verifyRegeneration.js) and the route gate.
+  IMAGE_PROMPT_RAW_MAX,
+  parseRegenImagePromptField
 };

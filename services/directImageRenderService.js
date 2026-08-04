@@ -587,6 +587,28 @@ function taggedError(message, { alertLevel = 'error', alertKey }) {
 }
 
 /**
+ * Fold a vision-QC corrective note INTO a full-replacement override.
+ *
+ * MONEY. The QC retry re-enters renderDirectImage with `operatorPrompt:
+ * correctiveNote` AND the original `rawPromptOverride` still set. Because the
+ * override wins below, the branch that appends the note is never reached — so
+ * without this the single allowed regeneration re-submits a BYTE-IDENTICAL
+ * prompt, earns the identical verdict, and burns a second billable
+ * gpt-image-2/edit submit for nothing.
+ *
+ * Deliberately NOT applied on the normal path: an operator who sends both a
+ * refinement and an override still gets "override wins, note dropped", which
+ * is the documented contract the route and the harness pin. This only rescues
+ * the machine-generated retry, where dropping the note is never intentional.
+ */
+function composeCorrectiveOverride(overrideText, correctiveNote) {
+  const base = String(overrideText || '');
+  const note = String(correctiveNote || '').trim();
+  if (!base || !note) return overrideText;
+  return `${base}\n\nQC CORRECTION (previous attempt failed review — fix this):\n${note}`;
+}
+
+/**
  * Map the regenerate API's promptOverride into the single flat prompt the
  * image model accepts.
  *
@@ -1075,8 +1097,13 @@ async function renderDirectImage({
         referenceMediaIds,
         referenceSource,
         platformFormat,
-        operatorPrompt: correctiveNote,
-        rawPromptOverride,
+        // When the operator replaced the prompt, the corrective note has to
+        // ride INSIDE the override or it is discarded and this paid retry is a
+        // guaranteed repeat of the failure. See composeCorrectiveOverride.
+        operatorPrompt: overrideText ? null : correctiveNote,
+        rawPromptOverride: overrideText
+          ? composeCorrectiveOverride(overrideText, correctiveNote)
+          : rawPromptOverride,
         skipVisionQc: true
       });
     },
@@ -1143,5 +1170,8 @@ module.exports = {
   conceptLook,
   normalizeReference,
   resolveImagePromptOverride,
+  // MONEY: pinned by scripts/verifyRegeneration.js (R5) — without it the one
+  // allowed vision-QC retry re-submits an identical prompt for a second charge.
+  composeCorrectiveOverride,
   renderDirectImage
 };
