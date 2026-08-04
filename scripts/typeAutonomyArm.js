@@ -126,14 +126,16 @@ const oneOf = (v, l, d) => (l.includes(v) ? v : d);
 const clamp = (v, lo, hi, d) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
 
 function normalizePlan(raw) {
-  const role = (o = {}, dw) => ({
+  // Same null-vs-undefined trap as the extractor: an explicit null bypasses a
+  // default parameter and throws.
+  const role = (raw0, dw) => { const o = raw0 || {}; return {
     casing: oneOf(o.casing, CASINGS, 'none'),
     weight: Math.round(clamp(o.weight, 100, 900, dw)),
     trackingPx: Math.round(clamp(o.trackingPx, 0, 8, 0) * 10) / 10,
     align: oneOf(o.align, ALIGNS, 'center'),
     maxLines: Math.round(clamp(o.maxLines, 1, 4, 2)),
     sizeScale: Math.round(clamp(o.sizeScale, 0.6, 1.6, 1) * 100) / 100,
-  });
+  }; };
   const out = {
     placement: {
       zone: oneOf(raw?.placement?.zone, ANCHORS, null),
