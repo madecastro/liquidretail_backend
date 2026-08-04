@@ -1,0 +1,152 @@
+#!/usr/bin/env node
+'use strict';
+//
+// verifyVideoResume — pins the one property that makes resume safe:
+//
+//   RESUMING A GENERATION MUST NEVER SUBMIT ONE.
+//
+// WHY THIS EXISTS (2026-08-04):
+//   Ad.veoPredictionId is a spend receipt: the provider charged at submit. The
+//   only correct response to finding one is to COLLECT what we already paid
+//   for. A submit on this path pays a second time for the same asset — the hole
+//   services/spendReceipt.js documents, and the reason "restart in-progress
+//   generations" had to be built as RESUME rather than RESTART.
+//
+//   peekPrediction is a single GET on purpose. pollPrediction blocks up to
+//   MAX_POLL_MS (10 min), which is correct inside a render and wrong at boot:
+//   recovery must not hold startup open, and an ad still processing is simply
+//   re-checked on the next sweep.
+//
+// This harness is pure + offline: no DB, no network, no API key. The behavioural
+// cases are the ones reachable without a provider (missing receipt, missing
+// key); the no-submit guarantee is asserted on the SOURCE, because a unit test
+// cannot prove the absence of a call it never happens to trigger.
+//   node scripts/verifyVideoResume.js
+//
+// Revert-prove:
+//   (a) Add any submit call (axios.post / submitImageGeneration /
+//       pacedModelSubmit) inside peekPrediction or resumeForAd -> N* fail.
+//   (b) Make peekPrediction return 'failed' on a transport error instead of
+//       'unknown' -> U1 fails.
+//   (c) Make a completed-with-no-output return 'processing' -> C1 fails.
+//   Report the failing output verbatim when proving.
+//
+// Covered:
+//   N*  neither function can submit (the money guarantee)
+//   B*  behaviour reachable offline: no receipt, no key, no id
+//   U*  'unknown' is distinct from 'failed' — a transport error is NOT a failure
+//   C*  completed-without-output is a classified failure, not still-running
+
+const fs   = require('fs');
+const path = require('path');
+
+const SRC_PATH = path.join(__dirname, '..', 'services', 'atlasVideoService.js');
+const SRC = fs.readFileSync(SRC_PATH, 'utf8');
+
+const { peekPrediction, resumeForAd } = require('../services/atlasVideoService');
+
+let pass = 0;
+const failures = [];
+function checkTrue(label, cond, extra) {
+  if (cond) { pass++; return; }
+  failures.push(label + (extra ? ` — ${extra}` : ''));
+}
+
+// Extract a function body by brace matching so an assertion cannot be satisfied
+// (or broken) by code in a neighbouring function.
+function bodyOf(src, decl) {
+  const at = src.indexOf(decl);
+  if (at < 0) return '';
+  // Skip the PARAMETER LIST first. `async function resumeForAd({ ad } = {}) {`
+  // has braces in its params, so searching for the next '{' after the name
+  // returns the destructuring pattern — a 6-character "body" that silently
+  // passes every absence assertion. Find the params' closing ')' first.
+  const paren = src.indexOf('(', at);
+  let pdepth = 0, afterParams = -1;
+  for (let i = paren; i >= 0 && i < src.length; i++) {
+    if (src[i] === '(') pdepth++;
+    else if (src[i] === ')') { pdepth--; if (pdepth === 0) { afterParams = i; break; } }
+  }
+  if (afterParams < 0) return '';
+  const open = src.indexOf('{', afterParams);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(open, i + 1); }
+  }
+  return '';
+}
+
+// ── N: the money guarantee ───────────────────────────────────────────
+// Every way this file can spend money. If any appears in a resume body, a
+// restart re-buys an asset we already own.
+const SUBMIT_MARKERS = [
+  'axios.post',            // any POST on this service is a billable submit
+  'submitImageGeneration',
+  'pacedModelSubmit',      // the gate every billable submit passes through
+  'generateForAd'
+];
+for (const [name, decl] of [
+  ['peekPrediction', 'async function peekPrediction'],
+  ['resumeForAd',    'async function resumeForAd']
+]) {
+  const body = bodyOf(SRC, decl);
+  checkTrue(`N0 ${name} body extracted`, body.length > 40, `${body.length} chars`);
+  for (const marker of SUBMIT_MARKERS) {
+    checkTrue(`N1 ${name} contains no submit call (${marker})`, !body.includes(marker));
+  }
+  // Positive: it must actually be a GET, not merely free of POSTs.
+  if (name === 'peekPrediction') {
+    checkTrue('N2 peekPrediction reads via GET', /axios\.get\(/.test(body));
+    checkTrue('N3 peekPrediction is single-shot — no poll loop',
+      !/while \(/.test(body) && !/MAX_POLL_MS/.test(body));
+  }
+}
+checkTrue('N4 resumeForAd delegates to peekPrediction rather than its own request',
+  /peekPrediction\(/.test(bodyOf(SRC, 'async function resumeForAd')));
+
+// ── B: offline behaviour ─────────────────────────────────────────────
+(async () => {
+  const noReceipt = await resumeForAd({ ad: {} });
+  checkTrue('B1 an ad with no receipt is not resumed', noReceipt.resumed === false);
+  checkTrue('B2 and it is reported as no-receipt, not as a failure',
+    noReceipt.state === 'no-receipt', JSON.stringify(noReceipt));
+  const noArgs = await resumeForAd();
+  checkTrue('B3 resumeForAd tolerates no arguments', noArgs.resumed === false);
+
+  const nullId = await peekPrediction(null);
+  checkTrue('B4 peekPrediction with no id returns unknown, never failed',
+    nullId.state === 'unknown', JSON.stringify(nullId));
+
+  // ── U: unknown must never be conflated with failed ─────────────────
+  // A transport error tells us NOTHING about the prediction. Calling it failed
+  // is how a paid asset gets written off — or re-submitted.
+  const body = bodyOf(SRC, 'async function peekPrediction');
+  checkTrue('U1 a transport error yields unknown, not failed',
+    /catch \(err\) \{\s*return \{ state: 'unknown'/.test(body));
+  checkTrue('U2 a non-200 yields unknown, not failed',
+    /res\.status !== 200[\s\S]{0,120}state: 'unknown'/.test(body));
+  checkTrue('U3 a missing API key yields unknown rather than pretending to know',
+    /apiKey\(\)[\s\S]{0,120}state: 'unknown'/.test(body));
+
+  // ── C: completed-with-no-output is a failure, not still-running ─────
+  checkTrue('C1 completed without an output url is a classified failure',
+    /completed with no output url/.test(body) && /completedNoOutput/.test(body));
+  // A failed prediction must be classified, so a moderation block is named
+  // rather than shown as a generic fault (see atlasErrorPolicy).
+  checkTrue('C2 a failed prediction is classified through atlasErrorPolicy',
+    /classify\(\{/.test(body) && /policy\.label/.test(body));
+
+  const total = pass + failures.length;
+  if (failures.length) {
+    console.error(`verifyVideoResume: ${pass}/${total} passed, ${failures.length} FAILED`);
+    for (const f of failures) console.error('  FAIL', f);
+    process.exit(1);
+  }
+  console.log(`verifyVideoResume: ${pass}/${total} passed`);
+  process.exit(0);
+})().catch((err) => {
+  console.error('verifyVideoResume: harness error —', err.message);
+  process.exit(1);
+});

@@ -2380,6 +2380,80 @@ function pacedModelSubmit(model, fn) {
  *   `"${stagePrefix} — polling 4m10s (17)"` so the activity board shows motion
  *   without a new timer. Defaults to no stage write (reframe / non-ad callers).
  */
+/**
+ * SINGLE-SHOT prediction status check. Free — a GET, never a submit.
+ *
+ * pollPrediction blocks up to MAX_POLL_MS (10 min), which is right inside a
+ * render and wrong at boot: recovery must not hold startup open, and an ad that
+ * is still processing simply gets checked again on the next sweep.
+ *
+ * Returns one of:
+ *   { state: 'done',       videoUrl }        terminal, asset available
+ *   { state: 'processing' }                  still running — leave it alone
+ *   { state: 'failed',     message, policy } terminal, classified
+ *   { state: 'unknown',    message }         we could not tell; DO NOT act
+ *
+ * 'unknown' is deliberately distinct from 'failed'. A transport error tells us
+ * nothing about the prediction, and treating it as failure is how a paid asset
+ * gets written off — or worse, re-submitted.
+ */
+async function peekPrediction(predictionId) {
+  if (!predictionId) return { state: 'unknown', message: 'no prediction id' };
+  if (!apiKey()) return { state: 'unknown', message: 'ATLAS_API_KEY not configured' };
+  let res;
+  try {
+    res = await axios.get(`${BASE_URL}/model/prediction/${predictionId}`, {
+      headers: { Authorization: `Bearer ${apiKey()}` },
+      timeout: 20_000,
+      validateStatus: () => true
+    });
+  } catch (err) {
+    return { state: 'unknown', message: err.message };
+  }
+  if (res.status !== 200) {
+    return { state: 'unknown', message: `HTTP ${res.status}` };
+  }
+  const data = res.data?.data || {};
+  const status = String(data.status || '').toLowerCase();
+  if (status === 'completed' || status === 'succeeded') {
+    const raw = data.outputs ?? data.output ?? [];
+    const url = Array.isArray(raw) ? raw[0] : raw;
+    // Completed WITHOUT an output is the genuine "paid for nothing" case and is
+    // classified as such rather than silently treated as still-running.
+    return url
+      ? { state: 'done', videoUrl: url }
+      : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput' };
+  }
+  if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
+    const providerMsg = data.error || status;
+    const policy = classify({
+      predictionStatus: 'failed', msg: providerMsg, nsfw: data.has_nsfw_contents ?? null
+    });
+    return {
+      state: 'failed',
+      message: `${policy.label || 'atlasVideo: prediction failed'}: ${providerMsg}`,
+      policy: policy.name
+    };
+  }
+  return { state: 'processing' };
+}
+
+/**
+ * RESUME a video generation from its spend receipt (Ad.veoPredictionId).
+ *
+ * THIS FUNCTION MUST NEVER SUBMIT. That is its entire reason to exist: the
+ * receipt means the provider already charged us, so the only correct move is to
+ * collect what we paid for. A submit here would double-bill, which is precisely
+ * the hole services/spendReceipt.js documents. scripts/verifyVideoResume.js
+ * asserts on this function's source that it contains no submit call.
+ */
+async function resumeForAd({ ad } = {}) {
+  const predictionId = ad?.veoPredictionId || null;
+  if (!predictionId) return { resumed: false, state: 'no-receipt' };
+  const peek = await peekPrediction(predictionId);
+  return { resumed: peek.state === 'done', predictionId, ...peek };
+}
+
 async function pollPrediction(predictionId, { shouldCancel = null, adId = null, stagePrefix = null } = {}) {
   const t0 = Date.now();
   let pollCount = 0;
@@ -3210,5 +3284,9 @@ module.exports = {
   // Cloudinary upload ceiling — exported for scripts/verifyReframeUploadCeiling.js
   // so the harness can prove a >20 MiB 4K outpaint is refitted rather than lost.
   fitBufferForCloudinary,
-  CLOUDINARY_MAX_UPLOAD_BYTES
+  CLOUDINARY_MAX_UPLOAD_BYTES,
+  // Resume-from-receipt. Exported for scripts/verifyVideoResume.js, which pins
+  // that neither of these can ever submit.
+  peekPrediction,
+  resumeForAd
 };
