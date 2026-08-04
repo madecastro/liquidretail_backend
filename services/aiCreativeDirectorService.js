@@ -70,7 +70,7 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '3.0.0';   // 3.0: nest concept into { routing, copy, art_direction, reasoning } so private rationale cannot fall through into image prompts as art direction (2026-08-01 leak). art_direction is OPTIONAL visual prose only; copy.* are the only letterforms; reasoning.rationale is private. Bumps cache so existing flat v2 artifacts re-derive. 2.4: platform-format-aware (Phase 3). 2.3: PMA-based matchedMediaIds + brand-review fallback. 2.2: file_type_distribution. 2.1: N_CONCEPTS 2 → 4. 2.0: full data projection.
+const DIRECTOR_SIGNALS_VERSION = '3.1.0';   // 3.1: brand_signal.description now reads brand.summary (was a permanently-null brand.description), has_logo reads logoUrl, dead badges key dropped; bumps cache so artifacts derived from the starved brief re-derive. Load-bearing: cache-hit test is cached.signalsVersion === DIRECTOR_SIGNALS_VERSION, so without the bump every product with an existing CreativeDirectionArtifact keeps serving concepts built from the starved brief and the fix looks like a no-op. 3.0: nest concept into { routing, copy, art_direction, reasoning } so private rationale cannot fall through into image prompts as art direction (2026-08-01 leak). art_direction is OPTIONAL visual prose only; copy.* are the only letterforms; reasoning.rationale is private. Bumps cache so existing flat v2 artifacts re-derive. 2.4: platform-format-aware (Phase 3). 2.3: PMA-based matchedMediaIds + brand-review fallback. 2.2: file_type_distribution. 2.1: N_CONCEPTS 2 → 4. 2.0: full data projection.
 
 // Canonical archetype enum (the 8 we've been using, with descriptive
 // names matching the contract). Director picks from these; Generator
@@ -307,10 +307,14 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   const brandSignal = {
     name:        brand?.name        || null,
     tagline:     brand?.tagline     || null,
-    description: snippetText(brand?.description, 280),
+    // Brand field is `summary` ("2-4 sentence verbose brand description"); brand.description
+    // does not exist on brandSchema (it is demographicSchema's field). Reading brand.description
+    // left brand_signal.description permanently null while the round prompt asked the model to
+    // pull from it — JSON key stays `description` so prompt refs brand_signal.description hold.
+    description: snippetText(brand?.summary, 280),
     tone:        Array.isArray(brand?.tone) ? brand.tone.slice(0, 6) : [],
     brand_reviews_summary: snippetText(brand?.brandReviews?.summary, 240),
-    has_logo:    !!brand?.logo
+    has_logo:    !!brand?.logoUrl  // field is logoUrl; brand.logo never existed → permanently false
   };
 
   // ── Product signal ──
@@ -321,7 +325,7 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     price:          product?.price ?? null,
     currency:       product?.currency    || null,
     availability:   product?.availability || null,
-    badges:         Array.isArray(product?.shortBenefits) ? product.shortBenefits.slice(0, 4) : [],
+    // shortBenefits is not on CatalogProduct schema (always sent []); benefits would have to come from the layout derivation artifact instead.
     review_summary: snippetText(product?.reviewSummary?.summary || product?.productReviews?.summary, 240),
     priority:       !productId ? 'absent' :
                     campaignKind === 'product' ? 'high' :
@@ -1972,6 +1976,11 @@ function validateConceptsRound(concepts, seededUniverse) {
     const cp = copyOf(c);
     if (cp.headline == null && cp.subheadline == null && cp.eyebrow == null && cp.cta == null) {
       warnings.push(`concept ${c.concept_id}: all copy fields are null (likely LLM miss)`);
+    } else if (cp.headline == null) {
+      // Blind spot closed: static render typesets only copy.headline (directImageRenderService
+      // buildIntentData). A concept that writes subheadline/eyebrow and nulls headline previously
+      // logged dirWarnings=0 while shipping an ad whose only text was the CTA.
+      warnings.push(`concept ${c.concept_id}: copy.headline is null (static path typesets headline only)`);
     }
 
     // Single-format sanity

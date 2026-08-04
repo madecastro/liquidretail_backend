@@ -26,7 +26,7 @@ const {
   normalizeWebsiteBackgroundHex
 } = require('../utils/websiteBackground');
 
-const { chatCompletion } = require('./atlasLlmService');
+const { chatCompletion, isConfigured: atlasLlmConfigured } = require('./atlasLlmService');
 const { inspectTailwindTheme } = require('./tailwindTokenExtractor');
 const MAX_HTML_CHARS = 25000;
 
@@ -112,7 +112,29 @@ async function runEnrichment(brand, brandId, run = null) {
   const wantBrandfetch   = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
   const wantTailwind     = !sourcesAttempted.has('tailwind');
   const wantScraped      = !sourcesAttempted.has('scraped');
-  const wantGpt          = !!process.env.OPENAI_API_KEY && !sourcesAttempted.has('gpt');
+  /**
+   * ATLAS IS THE PRIMARY, OPENAI IS ONLY THE FALLBACK — so gate on either.
+   *
+   * This tier's call goes through `atlasLlmService.chatCompletion` (see the
+   * import above), whose primary is Atlas (`ATLAS_API_KEY`) with direct
+   * providers kept only as a fallback per operator directive. Gating the tier
+   * on `OPENAI_API_KEY` alone meant that after the move to Atlas, a deployment
+   * holding only Atlas credentials **silently skipped the entire GPT
+   * enrichment tier** — a precondition checking a key the call no longer
+   * needs. That tier owns most of the derived brand attributes:
+   * `ENRICHMENT_SCHEMA` (:33) writes tagline, summary, tone, hashtags, tags,
+   * demographics, the colours and fontSuggestion. `summary` in particular has
+   * NO other automated writer (`setIf('summary', …, 'gpt')`), so it stayed
+   * empty for every non-curated brand — and `brand_signal.description` in the
+   * Director brief reads exactly that field.
+   *
+   * NOT the same as `wantBrandReviews` below: `geminiSearchProvider` calls
+   * Google's grounded-search endpoint DIRECTLY with `GEMINI_API_KEY` and is
+   * deliberately not behind `atlasLlmService` (Atlas does not proxy grounded
+   * retrieval), so gating that tier on its own key is correct.
+   */
+  const wantGpt          = (atlasLlmConfigured() || !!process.env.OPENAI_API_KEY)
+                             && !sourcesAttempted.has('gpt');
   const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
   const wantFontIngest   = !brand.fontIngestedAt;
   const logoIsCurated    = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('logoUrl');

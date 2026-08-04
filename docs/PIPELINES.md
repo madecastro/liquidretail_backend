@@ -417,6 +417,53 @@ Every query pins `source:'catalog-product'` **and** the ad's own `metadata.catal
 
 **Pinned by** `scripts/verifyRegeneration.js` (R3 gate matrix, R3b cascade tiers, R3c fileUrl/video/cross-tenant).
 
+### Brand-led intent + copy cascade (`STATIC_BRAND_LED_COPY`)
+
+Shipped to close a real defect: **`ai_brand_led` static ads shipped with no copy.** Cause was not missing data — it was that `ai_brand_led` had no brand-led implementation on the static path.
+
+**What was wrong (measured against the pre-fix code):**
+
+- `TEMPLATE_INTENT` (`directImageRenderService.js:484-488`) mapped only `ai_social_proof_led` → `social_proof_led` and `ai_promotional` → `objection_resolved`. Unmapped templates fall to `DEFAULT_INTENT = product_first_lifestyle` (`:489`), whose text contract is at most BRAND LINE + TRUST MARK + CTA BUTTON (`staticAdIntents.js:489-493`).
+- `resolveIntent` short-circuits at chain index 0 when the requested intent is eligible (`:572-578`). `product_first_lifestyle.eligible` is unconditional (`:482`), so the path never escalated even with a strong rating and a printable quote already loaded.
+- `buildIntentData` read only `concept.copy.headline` (via `renderableCopy`). `renderableCopy` also returns `subheadline` / `eyebrow` / `cta`, and `layoutInput.copy` (LLM-derived headline + subheadline, the latter itself falling back to `brand.tagline` at `layoutInputService.js:2441-2442`) was populated and **never read** by the static path. Product name/title/description are deliberately **not** cascade sources — `resolvedProduct` is `.select('title imageUrl')`, and the product name is forbidden as ad copy.
+- With no headline, feed surfaces requested ONE string ("SHOP NOW"); Stories (`drawCta:false`) hit `kept.length === 0` and took the "THIS AD CARRIES NO TEXT AT ALL" branch.
+- Director brief was also starved: `brand_signal.description` read `brand.description` and `has_logo` read `brand.logo`. Neither exists on `brandSchema` (`models/Brand.js:31`) — `description` is `demographicSchema`'s field (`:24`); real fields are `summary` (`:47`) and `logoUrl` (`:48`). `Brand.findById().lean()` is unprojected, so both were permanently null/false while the round prompt told the model to pull from `brand_signal.tagline / description / brand_reviews_summary` and to null any ungrounded copy role. `product?.shortBenefits` was a third dead read (not on `CatalogProduct`, always `[]`). Fixed with `DIRECTOR_SIGNALS_VERSION` `3.0.0 → 3.1.0` (`aiCreativeDirectorService.js:73`) — see load-bearing note below.
+- The copy warning fired only when **all four** copy fields were null (`:1977-1978`), so a concept that wrote subheadline/eyebrow and nulled headline logged `dirWarnings=0` while shipping a bare ad. Now also warns on `copy.headline` alone null (`:1979-1983`).
+
+**Mechanism.**
+
+| Piece | Where | What |
+|---|---|---|
+| Intent | `INTENTS.brand_led` (`staticAdIntents.js:533-562`) | `core:['BRAND LINE']`; `renders {rendersQuote:false, rendersRating:true, rendersBadge:false, rendersSubhead:true}`; slots BRAND LINE / SUBHEAD / TRUST MARK / CTA BUTTON. Derived from `aiCanvasSpecService.CREATIVE_STYLES.brand_led` (de-emphasises quote_card / proof_bar / badge_row) — rating trust mark only, **no quote** (owner decision). Not in `FALLBACK_ORDER` (`:565`) — reachable only as an explicitly requested intent. |
+| Template map | `TEMPLATE_INTENT` (`directImageRenderService.js:484-488`) | `ai_brand_led → 'brand_led'` only when the flag is on |
+| Copy cascade | `buildIntentData` (`:537-603`) | Headline: Director → `layoutInput.copy.headline` → `brand.tagline`. Subhead: Director → `layoutInput.copy.subheadline`. Case-insensitive dedupe (headline wins — it is core) because `layoutInput.copy.subheadline` itself falls back to `brand.tagline`. Resolved tier logged per render (`headline=director\|layout\|tagline\|none`). |
+| Density | `SACRIFICE_ORDER` (`staticAdIntents.js:377`) | `'SUBHEAD'` sits before `'TRUST MARK'`. Max 4 elements; feed 1:1 / 4:5 and pmax budget 4 → fits; stories budget 3 with `drawCta:false` strips CTA before `applyDensity` → 3 → fits. **Nothing sacrificed in the maximum case.** |
+| Absences | `absences` (`:412-413`) | `rendersSubhead && (!d.subhead \|\| lost('SUBHEAD'))`. **Polarity trap:** condition **MUST** lead with `rendersSubhead`. Only `brand_led` declares it; every other intent stays `undefined`/falsy and its prompt is unchanged. Flipping to `!rendersSubhead \|\| …` silently adds an absence line to **every** existing prompt. |
+
+**Template → intent map** (flag on; `intentForTemplate` / `DEFAULT_INTENT`):
+
+| Template | Intent | Notes |
+|---|---|---|
+| `ai_brand_led` | `brand_led` | Only when `STATIC_BRAND_LED_COPY !== 'false'` |
+| `ai_social_proof_led` | `social_proof_led` | Mapped unconditionally |
+| `ai_promotional` | `objection_resolved` | Mapped unconditionally (pricing off system-wide) |
+| `ai_ugc_led` | `product_first_lifestyle` | Unmapped → default. Still no own intent. |
+| `ai_editorial` | `product_first_lifestyle` | Unmapped → default. Still no own intent. |
+
+**Consequence 1 (deliberate, not a leak):** `buildIntentData` is shared, so the headline cascade also feeds `product_first_lifestyle` — i.e. `ai_ugc_led` and `ai_editorial` now get a brand line where they previously had none. Strictly additive (no new roles for them: SUBHEAD requires `rendersSubhead`, which only `brand_led` declares) and covered by the same kill switch. It was **not** scoped to brand_led because the shared function is where the defect lived.
+
+**Consequence 2 (known open — do not "fix" without owner decision):** a `brand_led` ad with **no** headline from any cascade tier fails `eligible` and degrades through `FALLBACK_ORDER` (`social_proof_led` → `objection_resolved` → `product_first_lifestyle`). If a rating exists it lands on `social_proof_led`, which **can** print a customer quote — sitting against the "no quote on brand_led" decision. Reachable only when Director copy, layout-derived copy **and** `brand.tagline` are all absent. Documented deliberately rather than closed: the descent hierarchy is owner-specified, and a hollow brand-led ad is what `core` exists to prevent.
+
+**Kill switch `STATIC_BRAND_LED_COPY` (default true, `config/defaults.env:105`).** `false` restores a **byte-identical** pre-change prompt: the `TEMPLATE_INTENT` entry, both cascades, and the SUBHEAD role revert **together** (`staticAdIntents.js:619-631`; `directImageRenderService` imports `BRAND_LED_COPY` rather than re-reading the env). **Measured, not asserted:** 105 prompt comparisons across every pre-existing intent × 5 surfaces × 7 data conditions produced **zero** differences in **both** arms — the change is additive even with the flag on, not merely revertible.
+
+**Load-bearing: `DIRECTOR_SIGNALS_VERSION` bump `3.0.0 → 3.1.0`.** Cache-hit test is `cached.signalsVersion === DIRECTOR_SIGNALS_VERSION` (`aiCreativeDirectorService.js:149`). Without the bump every product with an existing `CreativeDirectionArtifact` keeps serving concepts built from the starved brief and the Director half of the fix is a no-op.
+
+**Pinned by:**
+- `scripts/verifyStaticIntents.js` — **1882 checks** (section E: brand_led shape, behavioural unreachability as a fallback, degradation with `fellBackFrom`, slot counts 4/4/3/4 by surface, additive-safety guard that no non-`brand_led` prompt ever contains "subhead")
+- `scripts/verifyBrandLedCopy.js` — **29 checks** (both flag arms via require-cache invalidation of **both** modules; all cascade tiers; dedupe incl. case/whitespace; product name never a source)
+- `scripts/verifyDirectorPrompt.js` — **40 checks** (section E: real field names `summary`/`logoUrl`, dead `shortBenefits` read removed, version bump, headline warning)
+- Revert-proven: 5 mutations against the static/cascade harnesses and 5 against the Director harness, each confirmed to FAIL the harness. Full suite **53** `scripts/verify*.js`, 0 failing.
+
 ### Stages (live direct-image path)
 
 Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image generation (surface))` (`routes/ads.js:1403`) → `renderStage` (`renderService.js:482-511`) for every static `ai_*` template → `directImage.renderDirectImage`. Stages are fire-and-forget via `services/adStage.js` (NEVER awaited — sits where Atlas is already billed; `AD_STAGE_MIN_MS` floor default ~3s). Poll progress piggybacks the **existing** image poll tick (`ATLAS_IMAGE_POLL_MS` default 3s), e.g. `plate generation (meta_feed_1_1) — polling 20s (7)`.
@@ -425,7 +472,7 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 2. **Concept expansion** — when `AI_CONCEPT_DRIVEN=true` (default): Director + Judge → Ad rows with `renderRoute: 'html_gen'` (**misnomer** — means "static", not "the HTML renderer"; real path is chosen inside `renderService`). Reads of `media_picks` / `creative_style` / `output_shape` go through `conceptProjection` only.
 3. **Derive layout / resolve concept** — `adStage(…, deriving layout (surface))`; missing concept **throws** (not a silent HTML fallthrough).
 4. **Fetch references** — seed media (+ Director/operator multi-pick when present). Zero refs → refuse before spend.
-5. **Build prompt + geometry** — intent / copy from concept projection (never invents art from `rationale`); customer quotes only via `toPrintableCustomerQuote`.
+5. **Build prompt + geometry** — `intentForTemplate` → `buildIntentData` → `resolveIntent` → `buildPrompt` (`directImageRenderService` + `staticAdIntents`). Copy from concept projection (`renderableCopy`) with the brand-led cascade when `STATIC_BRAND_LED_COPY` is on (Director → `layoutInput.copy` → `brand.tagline` for headline; never invents art from `rationale`; product name is never a cascade source). Customer quotes only via `toPrintableCustomerQuote`. Template → intent map and kill switch: [Brand-led intent + copy cascade](#brand-led-intent--copy-cascade-static_brand_led_copy).
 6. **Plate submit + poll** — one `openai/gpt-image-2/edit` (or `AI_DIRECT_IMAGE_EDIT_MODEL`) via `atlasImageService`; stages on poll ticks.
 7. **Crop + logo composite** — local post; terminal asset on `Ad.renderUrl`; `adStage(…, 'done')` on success.
 
@@ -462,6 +509,8 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 | `RENDER_CONCURRENCY` | **`8`** | Parallel static ads in `runRenderLoop`. File raised 4→8 on 2026-08-02; **live in prod 2026-08-03** when the dashboard pin of 4 was deleted (see §9 / CLAUDE.md §4a) |
 | `AI_HTML_LAYOUT_ENABLED` / `RENDER_USE_HTML` | `true` | Still used by the **legacy** HTML arm only |
 | `AI_IMAGE_REFERENCE_*` | `false` / inert | **Not read by the live render path** — was falsely documented as prod-on polish |
+| `STATIC_PROMPT_FIDELITY_HARDENING` | `true` | Product-fidelity block + own-print carve-outs; `false` restores byte-identical pre-hardening prompt (see known open) |
+| `STATIC_BRAND_LED_COPY` | `true` | Maps `ai_brand_led` → `brand_led` + headline/subhead cascade; `false` restores byte-identical pre-change prompt (see [Brand-led intent](#brand-led-intent--copy-cascade-static_brand_led_copy)) |
 
 ### Progress / cancel / stage telemetry
 
@@ -710,7 +759,8 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 - **Remotion titling fatal on `library-match` fonts (verified 2026-08-04).** Root cause is a path mismatch: `library-match` Inter resolves to `fonts/Inter.ttf`, but `assetPathFor` maps `/fonts/*` only to `FONT_CACHE_DIR` (`assets/webfonts`) → **404**; the 404 branch set no CORS header so `FontFace.load()` rejects; and installed `@remotion/fonts` `load-font.js` ends `catch (err) { cancelRender(err) }` — so `FontLoader.jsx`'s ".catch → using fallback stack" is a **false safety net** (runs after cancel, cannot un-cancel). `Could not extract frame from compositor / Request closed` is **downstream collateral**, not the fault. Control proof: brands whose fonts resolve via Google (files really in `webfonts/`) render clean. **Fix branch** `fix/remotion-font-fatal-load` exists (working tree; not authorised to commit as of the 2026-08-05 pickup) — see `session.md` §0. **Do not re-claim "font 404 is a red herring."**
 - `veoPredictionId` is a spend receipt that is **never resumed** — process death + re-drain can double-bill.
 - `queued` ads still never auto-drain after web-process death (reaper only flips `rendering` → `queued`).
-- Static: ~1-in-3 ads render a competitor-shaped brand mark on the product (prompts already demand fidelity — fix is measure-and-reject, not prompt tuning). **Video path not QC’d** for the same defect 2026-08-03.
+- Static: ~1-in-3 ads render a competitor-shaped brand mark on the product (prompts already demand fidelity — fix is measure-and-reject, not prompt tuning). **Video path not QC’d** for the same defect 2026-08-03. **Still open after the 2026-08-03 product-fidelity prompt hardening** — that is owner-directed work layered on top, not a fix for this, and `adVisionQcService` remains the actual fix. The static prompt now opens with `staticAdIntents.PRODUCT_FIDELITY` (source-of-truth, no category/brand-prior inference, preserve form/construction/surface/colour/on-item-graphics/details/condition), plus carve-outs in `absences` and `textBlock` so the no-added-text rules cannot strip the product's own printed label. Kill switch `STATIC_PROMPT_FIDELITY_HARDENING=false` restores a **byte-identical** pre-hardening prompt (block + both carve-out sites revert together). **Watch for a text-fidelity regression:** the prompt more than doubled (~3.5-4.1k → ~7.8-8.4k chars) and sits above `SET EXACTLY THESE STRINGS`, whose measured baseline is 139/140 strings over 20 renders. Pinned by `scripts/verifyStaticFidelityPrompt.js` (419 checks, both arms).
+- **Static `ai_brand_led` with zero cascade headline can still print a customer quote.** `INTENTS.brand_led` declares `rendersQuote:false` (owner: rating trust mark only). But with no headline from Director / `layoutInput.copy` / `brand.tagline`, `eligible` fails and `resolveIntent` walks `FALLBACK_ORDER` — and if a rating exists the ad lands on `social_proof_led`, which **can** emit a quote. Documented deliberately, not "fixed": the descent hierarchy is owner-specified and a hollow brand-led ad is what `core` exists to prevent. Reachable only when all three headline tiers are absent. See §5 *Brand-led intent + copy cascade*.
 - Meta surface preview chrome still shows placeholder copy (“Lorem ipsum dolor sit amet”) in places — preview-only furniture, not burned-in titles.
 
 ### Wizard controls (frontend PR #10; backend contract)
@@ -901,6 +951,7 @@ Versioned with the repo. Feature flags, tuning knobs, public IDs/URLs, Slack cha
 | AI creative feature flags | `AI_CONCEPT_DRIVEN`, `AI_HTML_LAYOUT_ENABLED`, `AI_LAYOUT_DIRECT_HTML`, `CANONICAL_DR_V1`, `RENDER_USE_HTML`, `RENDER_USE_RESOLVED` |
 | Director seed window | `DIRECTOR_UNIVERSE_TOP_N=1` |
 | Static regenerate reseed | `REGEN_RESEED_CATALOG_FIRST=true` (default ON; kill switch for catalog-first reseed on regenerate — see §5) |
+| Static prompt kill switches | `STATIC_PROMPT_FIDELITY_HARDENING=true` (product-fidelity block); `STATIC_BRAND_LED_COPY=true` (`ai_brand_led` → `brand_led` + copy cascade — see §5). Both default ON; `false` restores a **byte-identical** pre-change prompt |
 | Static direct-image path | `AI_DIRECT_IMAGE_*` (edit model / quality / timeout). `AI_IMAGE_REFERENCE_*` kept **inert** (no live consumer) |
 | Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=4`, `REPEAT_PRIMARY_REFERENCE=false` |
 | Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8` (**live since 2026-08-03** — see above), `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |

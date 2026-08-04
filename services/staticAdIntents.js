@@ -368,8 +368,13 @@ const SURFACE_POLICY = {
  * Which element goes first when over the density budget. Earlier = sacrificed
  * sooner. A role in an intent's `core` is never sacrificed — losing it would
  * defeat the intent, in which case the intent should not have run.
+ *
+ * SUBHEAD sits immediately before TRUST MARK: it is supporting copy, so it is
+ * sacrificed before the trust mark the owner chose to keep. Additive-safe —
+ * no pre-existing intent emits a SUBHEAD role, so applyDensity's findIndex
+ * returns -1 and every existing prompt is unchanged.
  */
-const SACRIFICE_ORDER = ['BADGE', 'ATTRIBUTION', 'TRUST MARK', 'CUSTOMER QUOTE', 'RATING', 'BRAND LINE'];
+const SACRIFICE_ORDER = ['BADGE', 'ATTRIBUTION', 'SUBHEAD', 'TRUST MARK', 'CUSTOMER QUOTE', 'RATING', 'BRAND LINE'];
 
 // ── absence, stated ─────────────────────────────────────────────────────
 /**
@@ -377,7 +382,7 @@ const SACRIFICE_ORDER = ['BADGE', 'ATTRIBUTION', 'TRUST MARK', 'CUSTOMER QUOTE',
  * intent that never shows a quote must say so even when a quote exists, or the
  * model borrows it from context.
  */
-function absences(d, { rendersQuote, rendersRating, rendersBadge }, dropped = [], policy = {}) {
+function absences(d, { rendersQuote, rendersRating, rendersBadge, rendersSubhead }, dropped = [], policy = {}) {
   const out = [];
   const lost = (role) => dropped.includes(role);
   if (!rendersQuote || !d.quote || lost('CUSTOMER QUOTE')) out.push(
@@ -399,6 +404,13 @@ function absences(d, { rendersQuote, rendersRating, rendersBadge }, dropped = []
   }
   if (!rendersBadge || !d.badge || lost('BADGE')) out.push(
     'no badge, pill, ribbon, seal or corner flag — never Best Seller, Top Rated, Customer Favorite, #1 or As Seen On');
+  // CRITICAL: condition MUST lead with rendersSubhead, NOT !rendersSubhead.
+  // Only brand_led declares rendersSubhead, so every existing intent stays
+  // undefined → falsy → this line is never emitted for them → their prompts
+  // stay byte-identical. Getting this backwards adds a new absence line to
+  // every existing intent and breaks the flag-off baseline.
+  if (rendersSubhead && (!d.subhead || lost('SUBHEAD'))) out.push(
+    'no subheading, supporting line, descriptive sentence or secondary copy beneath the brand line');
   if (policy.drawCta === false) out.push(
     `no CTA button, no "shop now", "learn more", "swipe up", "link in bio", arrow or tap affordance of any kind — ${policy.ctaNote || 'the platform supplies it'}`);
   out.push('no price, currency symbol, discount, saving, offer or countdown');
@@ -502,6 +514,51 @@ const INTENTS = {
       d.badge ? ['BADGE', d.badge] : null,
       ['CTA BUTTON', d.cta]
     ].filter(Boolean)
+  },
+
+  /**
+   * Brand visual identity as hero (aiCanvasSpecService CREATIVE_STYLES.brand_led):
+   * brand colours dominate, logo prominent, short punchy headline carries the
+   * brand voice, product supporting. de_emphasized there is quote_card /
+   * proof_bar / badge_row — social proof here is the rating trust mark only,
+   * no quote. Not in FALLBACK_ORDER: reachable only as an explicitly requested
+   * intent (TEMPLATE_INTENT.ai_brand_led when BRAND_LED_COPY is on), which is
+   * what makes the kill switch total.
+   *
+   * Density already fits the maximum case: max 4 elements (BRAND LINE + SUBHEAD
+   * + TRUST MARK + CTA); feed 1:1 / 4:5 and pmax budget 4 → fits; stories
+   * budget 3 with drawCta:false strips CTA before applyDensity → 3 → fits.
+   * Nothing is sacrificed in the maximum case.
+   */
+  brand_led: {
+    priority: 3.5,
+    ownerBrief: 'Brand visual identity is the hero. Brand colours dominate. Logo prominent. A short punchy headline carries the brand voice; product appears in a supporting position (small card or inset). Hero media covers most of the frame. De-emphasised: quote card, proof bar, badge row. Rating trust mark only if available — no customer quote.',
+    /**
+     * Goal is a function of what survives: never promise an element the text
+     * block may not carry (see product_first_lifestyle).
+     */
+    goal: (kept) => 'A stranger scrolling past should recognise the brand first — its colours, its voice, its mark — with the product supporting rather than leading. '
+      + (kept('BRAND LINE')
+        ? 'The brand line carries the voice.'
+        : 'Here the brand identity has to do the work without a line.'),
+    renders: { rendersQuote: false, rendersRating: true, rendersBadge: false, rendersSubhead: true },
+    core: ['BRAND LINE'],
+    /** Eligibility: without a line at all it degrades through FALLBACK_ORDER to product_first_lifestyle rather than shipping a hollow brand-led ad. */
+    eligible: (d) => d.headline ? null : 'no brand line — brand_led is the brand line',
+    emphasis: (d, kept) => [
+      'the brand itself — colours, mark, visual identity dominating the frame',
+      kept('BRAND LINE') ? "the brand's line, punchy and unmistakable" : null,
+      kept('SUBHEAD') ? 'a supporting line beneath the brand line' : null,
+      'the product, clearly present but supporting',
+      kept('TRUST MARK') ? 'a quiet trust mark, secondary to the brand' : null,
+      kept('CTA BUTTON') ? 'the CTA' : null
+    ].filter(Boolean),
+    text: (d) => [
+      d.headline ? ['BRAND LINE', d.headline] : null,
+      d.subhead  ? ['SUBHEAD', d.subhead]     : null,
+      d.rating   ? ['TRUST MARK', `${d.rating} ★`] : null,
+      ['CTA BUTTON', d.cta]
+    ].filter(Boolean)
   }
 };
 
@@ -558,6 +615,20 @@ function applyDensity(text, spec, policy) {
  * without a deploy (see `PRODUCT_FIDELITY` below).
  */
 const FIDELITY_HARDENING = process.env.STATIC_PROMPT_FIDELITY_HARDENING !== 'false';
+
+/**
+ * BRAND-LED COPY — kill switch, default ON.
+ *
+ * `false` restores a **byte-identical** pre-change prompt because the
+ * `TEMPLATE_INTENT` entry, both copy cascades in `buildIntentData`, and the
+ * SUBHEAD role all revert **together**. A flag that reverts only part of it
+ * gives an A/B whose control arm is not the arm that was measured, so the
+ * comparison proves nothing.
+ *
+ * Single source of truth — `directImageRenderService` imports this rather
+ * than re-reading the env var.
+ */
+const BRAND_LED_COPY = process.env.STATIC_BRAND_LED_COPY !== 'false';
 
 /** The exact pre-2026-08-03 wording. Do not edit — it is the A/B control arm. */
 const LEGACY_PRODUCT_FIDELITY = `The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.`;
@@ -770,5 +841,6 @@ module.exports = {
   computeSurface,
   geometryBlock,
   EDGE_MARGIN_PCT,
-  describeSurfaces
+  describeSurfaces,
+  BRAND_LED_COPY
 };

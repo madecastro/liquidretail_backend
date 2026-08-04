@@ -33,7 +33,8 @@ const {
   SURFACE_POLICY,
   INTENTS,
   resolveIntent,
-  describeSurfaces
+  describeSurfaces,
+  BRAND_LED_COPY
 } = require('../services/staticAdIntents');
 
 const PRODUCT = {
@@ -321,6 +322,123 @@ for (const row of rows) {
   truthy(`${row.surface}: has box`, row.box && typeof row.box.left === 'number');
   truthy(`${row.surface}: has geometry string`, typeof row.geometry === 'string' && row.geometry.length > 0);
   truthy(`${row.surface}: geometry starts with FORMAT`, /^FORMAT:/.test(row.geometry));
+}
+
+// ── E. brand_led intent + additive-safety (SUBHEAD / rendersSubhead) ────
+// brand_led is reachable only as an explicitly requested intent (not in
+// FALLBACK_ORDER). SUBHEAD was added to SACRIFICE_ORDER and absences gained a
+// rendersSubhead branch — both must be additive: every pre-existing intent's
+// prompt must stay free of "subhead" in any case. Flipping the absences
+// condition to `!rendersSubhead || ...` would silently rewrite every existing
+// prompt; E6 is the permanent form of that guard.
+console.log('\nE. brand_led intent shape, reachability, density, additive-safety');
+
+/** Count `  <role> -> <string>` lines in the SET EXACTLY block (same parse as C). */
+const countEmittedStrings = (prompt) => {
+  const textBlock = (prompt || '').split('SET EXACTLY THESE STRINGS')[1]?.split('Set no other words')[0] || '';
+  return textBlock.split('\n').filter((l) => /^\s*.+?\s*->\s*.+$/.test(l)).length;
+};
+
+// E1 shape
+{
+  const bl = INTENTS.brand_led;
+  truthy('E1 brand_led exists', !!bl);
+  check('E1 core is [BRAND LINE]', bl && bl.core, ['BRAND LINE']);
+  check('E1 rendersSubhead true', bl && bl.renders && bl.renders.rendersSubhead, true);
+  check('E1 rendersQuote false', bl && bl.renders && bl.renders.rendersQuote, false);
+  check('E1 rendersBadge false', bl && bl.renders && bl.renders.rendersBadge, false);
+  check('E1 rendersRating true', bl && bl.renders && bl.renders.rendersRating, true);
+}
+
+// E2 reachability — never selected as a fallback from any other requested intent
+{
+  const otherKeys = intents.filter((k) => k !== 'brand_led');
+  const reachData = [
+    ['RICH', DATA.RICH],
+    ['rating_only', { rating: '4.8', cta: 'SHOP NOW' }],
+    ['quote_only', { quote: 'Fits great.', cta: 'SHOP NOW' }],
+    ['empty', {}]
+  ];
+  for (const requested of otherKeys) {
+    for (const [dataKey, d] of reachData) {
+      const r = resolveIntent(requested, d);
+      check(`E2 ${requested}/${dataKey} never resolves to brand_led`, r.key !== 'brand_led', true);
+    }
+  }
+}
+
+// E3 eligible brand_led stays on brand_led
+{
+  const r = resolveIntent('brand_led', { headline: 'Built for salt', cta: 'SHOP NOW' });
+  check("E3 brand_led + headline stays brand_led", r.key, 'brand_led');
+}
+
+// E4 degradation, not hollow render
+{
+  const cases = [
+    ['rating_only', { rating: '4.8', cta: 'SHOP NOW' }],
+    ['quote_only', { quote: 'Fits great.', cta: 'SHOP NOW' }],
+    ['cta_only', { cta: 'SHOP NOW' }]
+  ];
+  for (const [name, d] of cases) {
+    const r = resolveIntent('brand_led', d);
+    check(`E4 brand_led + ${name} is not brand_led`, r.key !== 'brand_led', true);
+    truthy(`E4 brand_led + ${name} is a real intent key`, !!r.key && !!INTENTS[r.key]);
+    check(`E4 brand_led + ${name} fellBackFrom is brand_led`, r.fellBackFrom, 'brand_led');
+  }
+}
+
+// E5 slot counts with full brand_led data
+{
+  const full = { headline: 'Built for salt', subhead: 'Every tide.', rating: '4.8', cta: 'SHOP NOW' };
+  const fourSurfaces = ['meta_feed_1_1', 'meta_feed_4_5', 'pmax_16_9'];
+  for (const surface of fourSurfaces) {
+    const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface });
+    const n = countEmittedStrings(r.prompt);
+    check(`E5 brand_led/${surface} emits 4 strings`, n, 4);
+    check(`E5 brand_led/${surface} count <= maxTextElements`,
+      n <= SURFACE_POLICY[surface].maxTextElements, true);
+  }
+  {
+    const surface = 'meta_stories_9_16';
+    const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface });
+    const n = countEmittedStrings(r.prompt);
+    check(`E5 brand_led/${surface} emits 3 strings (CTA stripped)`, n, 3);
+    check(`E5 brand_led/${surface} count <= maxTextElements`,
+      n <= SURFACE_POLICY[surface].maxTextElements, true);
+  }
+}
+
+// E6 additive-safety: no "subhead" in any pre-existing intent's prompt
+{
+  const otherKeys = intents.filter((k) => k !== 'brand_led');
+  for (const intentKey of otherKeys) {
+    for (const surface of surfaces) {
+      for (const [dataKey, d] of Object.entries(DATA)) {
+        const r = buildPrompt({ intentKey, data: d, product: PRODUCT, surface });
+        if (r.skipped || r.error || !r.prompt) continue;
+        falsy(`E6 ${intentKey}/${surface}/${dataKey} no "subhead" in prompt`,
+          /subhead/i.test(r.prompt));
+      }
+    }
+  }
+}
+
+// E7 brand_led states subhead absence when no subhead supplied
+{
+  const r = buildPrompt({
+    intentKey: 'brand_led',
+    data: { headline: 'X', cta: 'SHOP NOW' },
+    product: PRODUCT,
+    surface: 'meta_feed_1_1'
+  });
+  truthy('E7 brand_led without subhead states no subheading',
+    /no subheading/i.test(r.prompt || ''));
+}
+
+// E8 kill-switch export
+{
+  check('E8 BRAND_LED_COPY is exported boolean', typeof BRAND_LED_COPY, 'boolean');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} verifyStaticIntents: ${pass}/${pass + fail} checks passed\n`);

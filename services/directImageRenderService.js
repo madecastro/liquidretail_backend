@@ -31,6 +31,7 @@ const Brand = require('../models/Brand');
 const CatalogProduct = require('../models/CatalogProduct');
 const Media = require('../models/Media');
 const intents = require('./staticAdIntents');
+const { BRAND_LED_COPY } = intents;
 const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // Defence in depth. layoutInputService already withholds these at pool
 // assembly, so this gate should never fire — it exists because an artifact
@@ -421,9 +422,15 @@ async function optionalImage(url) {
 // Rating floor lives in ratingDisplay.js (shared with video chrome) so the
 // "stars over 4.5" rule cannot drift between surfaces.
 
+// With BRAND_LED_COPY off, ai_brand_led is absent from the map so
+// intentForTemplate returns DEFAULT_INTENT and INTENTS.brand_led is unreachable
+// (it is not in FALLBACK_ORDER, so it can only be selected as an explicitly
+// requested intent). ai_ugc_led / ai_editorial stay on the default intent —
+// out of scope.
 const TEMPLATE_INTENT = {
   ai_social_proof_led: 'social_proof_led',
-  ai_promotional: 'objection_resolved'
+  ai_promotional: 'objection_resolved',
+  ...(BRAND_LED_COPY ? { ai_brand_led: 'brand_led' } : {})
 };
 const DEFAULT_INTENT = 'product_first_lifestyle';
 
@@ -473,6 +480,74 @@ function buildIntentData({ concept, layoutInput, brand, cta }) {
   // set at testimonial size is unreadable at feed scale.
   const quoteText = quote ? String(quote.snippet || quote.text || '').trim() : '';
 
+  // Headline / subhead. Flag-off: exact pre-change expression (Director
+  // headline only; subhead undefined). Flag-on: cascade through layoutInput
+  // then brand.tagline so ai_brand_led still has a brand line when Director
+  // nulls the headline. Do NOT cascade product name/title or description —
+  // resolvedProduct is .select('title imageUrl') so description is not loaded,
+  // and the product name is forbidden as ad copy by owner directive and
+  // fenced in absences.
+  //
+  // Trim every tier; empty string is absent (matches renderableCopy's one()).
+  let headline;
+  let subhead;
+  if (BRAND_LED_COPY) {
+    const one = (v) => {
+      if (v == null) return undefined;
+      const s = String(v).trim();
+      return s || undefined;
+    };
+    const directorHeadline = one(copy.headline);
+    const layoutHeadline = one(layoutInput?.copy?.headline);
+    const tagline = one(brand?.tagline || layoutInput?.brand?.tagline);
+    let headlineTier = 'none';
+    if (directorHeadline) {
+      headline = directorHeadline;
+      headlineTier = 'director';
+    } else if (layoutHeadline) {
+      headline = layoutHeadline;
+      headlineTier = 'layout';
+    } else if (tagline) {
+      headline = tagline;
+      headlineTier = 'tagline';
+    }
+
+    const directorSub = one(copy.subheadline);
+    const layoutSub = one(layoutInput?.copy?.subheadline);
+    let subheadTier = 'none';
+    if (directorSub) {
+      subhead = directorSub;
+      subheadTier = 'director';
+    } else if (layoutSub) {
+      subhead = layoutSub;
+      subheadTier = 'layout';
+    }
+
+    // DEDUPE — required. layoutInput.copy.subheadline itself falls back to
+    // brand.tagline, so the same string can legitimately resolve into BOTH
+    // slots. The prompt contract is "each appearing exactly once"
+    // (staticAdIntents textBlock), so a duplicate is a contract violation that
+    // renders as visibly broken. Headline wins because it is core.
+    let deduped = false;
+    if (subhead && headline && subhead.toLowerCase() === headline.toLowerCase()) {
+      subhead = undefined;
+      // keep subheadTier as the cascade that produced the duplicate; the
+      // marker below is how a later session sees the drop without a DB query
+      deduped = true;
+    }
+
+    // Says "static copy", not "brand-led": buildIntentData is intent-agnostic and
+    // runs for every static render, so labelling this brand-led would mislabel an
+    // ai_social_proof_led or ai_promotional render in the logs.
+    console.log(
+      `🔒 direct-image: static copy headline=${headlineTier} subhead=${subheadTier}` +
+      (deduped ? ' (subhead deduped — matched headline)' : '')
+    );
+  } else {
+    headline = copy.headline ? String(copy.headline).trim() : undefined;
+    // subhead stays undefined — pre-change shape
+  }
+
   return {
     // Owner rule: "we only use stars over 4.5". Gated on the DISPLAYED
     // (one-decimal) value via formatDisplayRating — a raw >4.5 gate let
@@ -489,9 +564,11 @@ function buildIntentData({ concept, layoutInput, brand, cta }) {
     // "Anonymous Customer", which assert things about a person we cannot name.
     // An unattributed real quote is honest. An attributed fake is not.
     attribution: quoteText && quote?.author_name ? String(quote.author_name).trim() : undefined,
-    // The Director's line. Not the product name — that is dropped entirely by
-    // owner instruction and is separately forbidden in the absence block.
-    headline: copy.headline ? String(copy.headline).trim() : undefined,
+    // The Director's line (or cascade when BRAND_LED_COPY). Not the product
+    // name — that is dropped entirely by owner instruction and is separately
+    // forbidden in the absence block.
+    headline,
+    subhead,
     badge: undefined,
     cta: cta || 'SHOP NOW'
   };

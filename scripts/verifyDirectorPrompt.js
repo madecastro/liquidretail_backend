@@ -255,6 +255,65 @@ if (fnSrc) {
   );
 }
 
+// ── E. brand_signal reads fields that EXIST on models/Brand.js ───────────
+/**
+ * Source-level, not runtime: `assembleSignals` does DB reads, so the field
+ * names are pinned by scanning the source the way verifyConceptContract.js
+ * scans services/ + routes/.
+ *
+ * THE DEFECT (2026-08-04): `brandSignal.description` read `brand.description`
+ * and `has_logo` read `brand.logo`. Neither exists on `brandSchema`
+ * (models/Brand.js:31) — `description` belongs to `demographicSchema` (:24),
+ * and the real fields are `summary` (:47) and `logoUrl` (:48).
+ * `Brand.findById(brandId).lean()` is unprojected, so both reads were
+ * permanently null/false while the round prompt told the model to "Pull from
+ * brand_signal.tagline / description / brand_reviews_summary" and to null any
+ * ungrounded copy role. That starved brief is how static ads shipped with no
+ * copy at all.
+ */
+check(
+  'E1 brand_signal.description sources brand.summary',
+  /description:\s*snippetText\(brand\?\.summary,/.test(fileSrc),
+  'brand.description does not exist on brandSchema — the field is summary'
+);
+check(
+  'E2 no read of the non-existent brand.description',
+  !/brand\?\.description/.test(fileSrc),
+  'brand.description is demographicSchema\'s field, not brandSchema\'s — permanently null'
+);
+check(
+  'E3 has_logo sources brand.logoUrl',
+  /has_logo:\s*!!brand\?\.logoUrl/.test(fileSrc),
+  'the Brand field is logoUrl'
+);
+check(
+  // Negative lookahead is load-bearing: `brand?.logoUrl` CONTAINS the literal
+  // `brand?.logo`, so a plain substring test would pass on the correct code
+  // and never be able to fail. Match `brand?.logo` only when NOT followed by
+  // another identifier character.
+  'E4 no read of the non-existent brand.logo',
+  !/brand\?\.logo(?![A-Za-z0-9_])/.test(fileSrc),
+  'brand.logo never existed — has_logo was permanently false'
+);
+check(
+  'E5 dead product.shortBenefits read is gone',
+  !/product\?\.shortBenefits/.test(fileSrc),
+  'shortBenefits is not on models/CatalogProduct.js — it always sent []'
+);
+check(
+  // Without the bump, the cache-hit test (cached.signalsVersion ===
+  // DIRECTOR_SIGNALS_VERSION) keeps serving concepts derived from the starved
+  // brief, and the fix above is a no-op on every existing artifact.
+  'E6 DIRECTOR_SIGNALS_VERSION bumped past the starved-brief 3.0.0',
+  /const DIRECTOR_SIGNALS_VERSION = '(?!3\.0\.0')/.test(fileSrc),
+  'signals version must be bumped so existing CreativeDirectionArtifacts re-derive'
+);
+check(
+  'E7 a null copy.headline warns on its own',
+  /cp\.headline == null\)/.test(fileSrc) && /headline is null/.test(fileSrc),
+  'the all-four-null warning alone lets a headline-less concept log dirWarnings=0'
+);
+
 if (failures.length) {
   console.error(`\n❌ director prompt: ${failures.length} FAILED, ${pass} passed\n`);
   failures.forEach((f) => console.error(`   • ${f}`));
