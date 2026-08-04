@@ -455,8 +455,26 @@ function packCoherentProof({ quote, quoteTier, rating, reviewCount, source, bran
  * @param {null|{rating?:*,reviewCount?:*}} args.brand    Pre-bundled brand pair.
  * @param {string|null} [args.brandAttribution]
  * @param {string|null} [args.renderedQuoteText]
- *   Exact string the surface will typeset. When set, must match quote text or
- *   snippet; when omitted, uses snippet||text.
+ *   The exact string the surface will typeset. **REQUIRED whenever `quote` is
+ *   non-null** — it must equal the quote's `text` or its `snippet`, or every number
+ *   is withheld.
+ *
+ *   This JSDoc previously said "when omitted, uses snippet||text", which described
+ *   an earlier draft and was left stale by the fix below it — a dangerous lie on a
+ *   fail-closed contract, because a caller trusting it would assume omitting the
+ *   argument is harmless when in fact it silently suppresses all social proof.
+ *   Omitting it now makes `quotePrintsOnFrame` return false, and a quote that is
+ *   present but unverifiable withholds numbers rather than falling through to the
+ *   rating-only path (that fall-through is how a substituted quote could earn brand
+ *   stars). Pinned by N1/N2/N3 in scripts/verifyCoherentSocialProof.js.
+ *
+ *   Callers with a cascade or bind list between the meta and the pixels (the video
+ *   path: `titleSpecValidator` DEFAULT_BIND `quote: ['quoteSnippet','quote']`, itself
+ *   overridable per slot, plus `Brand.metaCascades.quoteSnippet`) must resolve that
+ *   chain and pass the RESULT. Callers where the string handed over IS what renders
+ *   (the static path feeds verbatim strings to the image model, with no cascade and
+ *   no bind list) may pass the quote text itself — there, it is a statement of fact,
+ *   not ceremony.
  * @returns {{
  *   quote: object|null,
  *   quoteTier: string|null,
