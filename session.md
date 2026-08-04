@@ -5,6 +5,36 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## STANDING RULE — NEVER MODIFY THE EXISTING AD LIBRARY (owner, 2026-08-04)
+
+Owner, verbatim: *"I dont' want to make any changes at any time to the existing library of ads."*
+Earlier the same day, on the title-placement fix: *"do not roll the placement fix across the
+library it should only apply to new renders."*
+
+**Scope:** any operation that overwrites, re-titles, re-renders or otherwise mutates an ad that
+already exists — `Ad.renderUrl` above all. Fixes and template improvements reach production
+through **NEW renders only**. Existing ads keep whatever they shipped with, permanently.
+
+**This is not a deferral and it is not per-fix.** Do not ask again whether a given improvement
+should be backfilled across the library. The answer is no — including when the sweep is $0, when
+the dry run is green, and when we are "already in there". Every previously-open sweep question in
+this file has been closed against this rule, not left pending.
+
+**What it forbids in practice:** `scripts/retitleDriver.js` against existing ads (its
+no-`--ids` mode re-titles the WHOLE library — see §0.3004); the `POST /api/brand/:id/retitle-videos`
+batch re-title (`docs/TITLING.md`); and any experiment whose A/B substrate is existing masters.
+
+**Still allowed:** rendering NEW ads, and read-only inspection of existing ones — pulling a
+`renderUrl` to view frames changes nothing.
+
+**ONE STANDING EXCEPTION, owner-granted 2026-08-04:** the §0.3005 TYPE EXPERIMENT may overwrite its
+30 selected masters — *"actually if this is an experiment let it do what it wants."* Narrow by
+construction: that experiment, those 30 ads, and reversible (baseline URLs are recorded and the old
+Cloudinary assets survive — see §0.3005). Do not generalise it into permission for any other
+re-title.
+
+---
+
 ## 2026-08-03 — OWNER DECISIONS (landed). Read this before the next-session prompt below.
 
 Five owner decisions from 2026-08-03. Items 1–4 shipped in `be5b83f` (on `main`); item 5
@@ -101,6 +131,119 @@ of its four claims were wrong. Read §0 CORRECTIONS before anything else.
    NOT a titling problem — titling works. See §0.
 
 **Do NOT start by merging PR #32.** That instruction was wrong; see §0.
+
+---
+
+## 0.00 CRASH ALERTING HARDENED — branch `worktree-harden-crash-alerting` (2026-08-03)
+
+**Why:** a colleague hit a crash notice mid-generation (owner had deployed during their run) and
+the Slack alert was not diagnosable in isolation. Verified root cause — it was not vagueness, it
+was structural:
+
+- The alert was `processAlerts.js` *"web shutting down with N ad(s) in flight"*. `inFlight` tracked
+  **runs only**, so no ad ids existed in memory to report.
+- `persistOrphans` **did** know which ads it requeued, but it ran in `Promise.all` **parallel** with
+  the alert, so that knowledge could never reach the message.
+- `RENDER_GIT_COMMIT` appeared only on the **info**-level boot alert, muted at the default
+  `ALERT_MIN_LEVEL=warn` — so nothing tied the crash to a deploy.
+
+**Also found and fixed — three alert call sites were firing as `[object Object]` in production**
+(single object passed to the `(title, opts)` wrappers, so `detail`/`fields`/`key` were dropped):
+`aiCreativeDirectorService.js:1313`, `costTracker.js:243` (money-adjacent), and
+`quoteSnippetService.js:415` (passed `body:` where `notify()` reads `detail:`).
+
+**Owner decisions implemented:** one Slack message per crash (no folding); a new `IncidentLog`
+collection plus enriched existing docs; every identified swallow point closed.
+
+**Shape.** `services/crashReporter.js` is the single choke point. **THE ORDERING RULE:** the
+`IncidentLog` row is written **before** the Slack send and never conditional on it — with folding
+off, `ALERT_RATE_LIMIT_MAX` is the only silent drop point, so the row must already exist when it
+fires. No-folding is achieved structurally via `key: 'crash:<incidentId>'` (unique per incident);
+`alertService`'s dedupe logic was **not** weakened for the alerts that still rely on it.
+
+`services/renderDiagnostic.js` extracts the render-activity row/diagnostic builder out of
+`routes/ads.js`, so the long-standing doc claim that alerts reuse one failure-payload builder is
+now actually true in code (it previously *could not* be — the builder was inline in the route).
+
+**Defects caught by my own review of the delegated work, all fixed — read these before touching:**
+1. **MONEY, both files.** `worker.js` reapOrphans and `processAlerts.js` persistOrphans were
+   refactored find-then-update, and the write was narrowed to `_id: {$in: ids}` — dropping the
+   `status`/`updatedAt` guards. An ad completing in that race window would be flipped back to
+   `queued` and re-rendered: a second billable Omni submit (~$1) for work that already succeeded.
+   The predicate is now **re-asserted** on the write; the id list is for reporting only, so
+   `modifiedCount` stays the authoritative count.
+2. **`level: 'info'` was coerced to `'error'`** in crashReporter, so every *clean* deploy shutdown
+   would have fired an error-level alert — the exact noise that teaches people to ignore a channel.
+   `info` is now honoured and is in the `IncidentLog` LEVELS enum (a clean shutdown still gets a
+   durable row while staying muted in Slack).
+3. **`incident` id was appended last** into the Slack fields, so `MAX_FIELDS` truncation dropped the
+   only Slack↔DB join key on exactly the richest alerts. Identity fields now go first; cap 12→20.
+4. **Token leak into Slack and Mongo.** `redact()` only ever guarded `console.warn`, but alerts now
+   routinely carry stacks, and a stack from a failed authenticated request can contain the bot
+   token. Redaction now runs on the way out of `buildMessage` (before escaping/budgeting, so a
+   clipped tail cannot hide a token) and before the `IncidentLog` write.
+5. **`raceDeadline` timers** were never cleared (one leaked 2s timer per report); my first fix
+   `unref`'d them, which was worse — Node then judged the loop empty and exited before the deadline
+   fired, so `report()` silently never returned. Caught by `verifyCrashReporter`. Now cleared, not
+   unref'd.
+6. **Rate-limit spill only flushed on rollover**, i.e. only if something *else* tried to send later.
+   A burst that dropped N and then went quiet reported nothing. Now armed on the first drop via a
+   detached unref'd timer.
+7. `inFlight.snapshot().oldestAgeMs` had ad ages folded into it, but `processAlerts` renders that
+   field as the label **"oldest run"** — added `oldestAdAgeMs` instead rather than let the label lie.
+
+**A high-effort adversarial pass then found five more, all fixed.** It explicitly cleared the
+areas I most wanted challenged — the requeue race (predicate genuinely re-asserted), never-throws
+and the require graph (no cycles), leaks, byte-identity of the extraction, and whether the schema
+could reject a legitimate crash. What it broke:
+
+8. **CRITICAL — 2-3 Slack messages per static failure.** One failing ad surfaces at three layers
+   (`renderService` stage catch → the route's failed-result branch → the route's outer catch) and
+   unique crash keys mean nothing collapses them: a 20-ad vendor blip would post **40-60**
+   messages. The owner asked for one message per *crash*, not per *layer*. Fixed with a per-ad
+   Slack window (`CRASH_AD_WINDOW_MS`, default 60s): **every** layer still writes its IncidentLog
+   row, only the first pages. Suppressed rows carry `duplicateOf` + a `slackError` explaining
+   themselves. Ads never suppress each other, so no-folding across ads is intact. Query
+   `{duplicateOf: null}` for "what a human was actually paged about".
+9. **HIGH — sequencing persist-before-report made the two compete for one flush budget.** Slow
+   Mongo or many orphans could burn the whole window, cutting the IncidentLog write and the Slack
+   send — the entire point of the module, and something the old parallel version never risked.
+   Split: `PERSIST_SHARE = 0.45`, the rest **reserved** for the report.
+10. **HIGH — `markSubmitted` was video-only.** Static is the higher-volume charge path
+    (3 billable submits per product on `meta_static`), so a deploy mid-static-submit reported
+    `charged in flight: 0` while money was spent. Now called from `atlasImageService` too, right
+    after the submit returns an id. Also made `markSubmitted` **self-register** rather than no-op
+    on an untracked ad — the regenerate path bills ~$1/video and never enters the render pool, so
+    it was invisible; `adRegenerateService` now tracks/untracks around it as well.
+11. **MEDIUM — the requeue count lied.** `requeuedCount` came from the find-list length, but the
+    write re-asserts `status:'rendering'`, so a racing ad is skipped. Now `modifiedCount`, and when
+    the two disagree the id list is relabelled `requeue candidates`.
+12. Reviewer also confirmed a **pre-existing** hole not introduced here and deliberately not
+    bundled: a charged-but-not-yet-drafted ad is still requeued by `persistOrphans` and can be
+    re-submitted via `/runs`. The new telemetry now *labels* that spend; it does not prevent it.
+    That is the durable-queue fix in *Known gap*.
+
+**`markSubmitted` placement is deliberate** (`atlasVideoService.js`, just before the
+`veoPredictionId` write): the money is already spent, and if that write fails the id is never
+persisted — the "orphan would be unreconcilable" case. Marking first means a SIGTERM in that window
+still reports the ad as a **charged** loss, not a free one.
+
+**Verify: 48/48 offline green** (45 base + `verifyCrashReporter` 70 checks, `verifyProcessAlerts` 41,
+`verifyRenderDiagnostic` 30; `verifySlackAlert` extended 58→78). Each new harness is
+**revert-proven** — including the puppeteer case (remove the 1s hard exit timer and the process
+hangs past 6s, which the harness catches) and byte-identity of the extraction against a **frozen**
+copy of the pre-extraction builder.
+
+⚠️ **NOT VALIDATED IN PRODUCTION. Nothing here has run against real Mongo or real Slack.** The
+end-to-end smoke ran with Mongo absent, which correctly reported
+`incident log: skipped (mongo not connected)`. Before trusting it: deploy and confirm one real
+crash and one real shutdown produce `IncidentLog` rows with `slackDelivered: true`, and confirm
+the TTL index builds on an empty collection.
+
+**Open follow-up (deliberately not bundled):** a single static failure can now emit ~2 messages
+from different layers (`renderService`'s pre-existing direct-image alert, plus `render-crash` from
+the route's outer catch). With folding off that is duplication rather than signal — worth
+collapsing once real volume is observed.
 
 ---
 
@@ -928,8 +1071,9 @@ production.** Iterations, each frame-verified, all $0 re-titles of the same 12 p
 
 **Owner directions recorded:** multi-color type allowed when brand-tokened (per-group ink =
 NEXT iteration, deliberately not tonight); owner waits for the canon3 contact sheet; funnel
-variant A/B + 6-template pilot PARKED until canonical is approved (variants + protos exist and
-validate; sweep infra ready).
+variant A/B + 6-template pilot **CANCELLED 2026-08-04** — both were designed as re-titles of
+existing ads, which the standing rule at the top of this file forbids (variants + protos exist and
+validate, and remain available to NEW renders).
 
 **$1 REGENERATE (end-to-end pipeline test) — all green + one discovery:**
 - Ledger PROVEN live: `atlas_video_render | $1 | submitted` — the widened-enum fix recording
@@ -985,9 +1129,10 @@ per fresh instance, plate scan now per-render (cacheable on Ad like basePlate cr
 storyboard-LLM-on-regen possibly wasted on canonical path, fixed 15s Omni poll, video costs
 never reconciled to actuals (veoPredictionId is persisted; image reconcile pattern exists).
 
-**PARKED, awaiting owner:** funnel-variant A/B (presets exist + validate), 6-template pilot,
-full 367 sweep + persona scoring, AI endcard arm ($0.01/video), per-group brand-tokened ink
-(owner allowed multi-color), Title Studio preview!=ship warning.
+**CANCELLED 2026-08-04** (standing rule — all three were re-titles of existing ads):
+funnel-variant A/B, 6-template pilot, full 367 sweep + persona scoring.
+**STILL PARKED, awaiting owner** (these do not touch existing ads): AI endcard arm ($0.01/video),
+per-group brand-tokened ink (owner allowed multi-color), Title Studio preview!=ship warning.
 
 ### 0.2995 EFFICIENCY AUDIT (owner-requested, 2026-08-04 night) — verified findings, NOT yet implemented
 
@@ -1081,7 +1226,9 @@ res; three separate low-res sheet misreads this session — ALWAYS zoom the nati
 judging ink/animation; sheet proof frame is 4.6s post-settle for this reason).
 Approval-grid artifact refreshed in place:
 https://claude.ai/code/artifact/535b2728-b623-4898-9841-518e89b03798 (iteration 4 status).
-AWAITING OWNER: approve -> full 367 sweep + persona scoring; or flag -> next $0 iteration.
+CLOSED 2026-08-04: the full 367 sweep + persona scoring is **cancelled**, not awaiting approval —
+it re-titled existing ads (standing rule, top of file). Iteration 4 itself stands as verified; it
+applies to new renders.
 
 ### 0.29996 TEAM-DAY LIVE REPORTS — THREE REPORTS, ONE ROOT-CAUSE FAMILY (2026-08-04)
 
@@ -1328,6 +1475,26 @@ Video titling was never the source: `brandPill` and `brandLogo` are both off in 
 
 ### 0.3005 TYPE EXPERIMENT — OWNER-DIRECTED WORKSTREAM (2026-08-04). READ THIS BEFORE CONTINUING.
 
+✅ **EXPLICIT OWNER EXCEPTION to the no-library-changes standing rule (2026-08-04).** Raised with
+the owner because this experiment's three arms run over **the SAME 30 existing masters** and
+re-titling **overwrites their `renderUrl`s** (`typeExperimentRun.js` — "both overwrite
+Ad.renderUrl"; the driver's write is `Ad.updateOne { renderUrl, status:'draft' }`). There is **no
+duplication**: the `baseline` phase records the pre-experiment URL *strings* only, it does not
+clone the ad or the asset. Owner ruling, verbatim: *"actually if this is an experiment let it do
+what it wants."*
+
+So this experiment MAY mutate its 30 selected ads. The exception is **narrow — this experiment,
+those 30 masters.** It is not a precedent for sweeps, backfills, or any other re-title of existing
+ads; the standing rule at the top of this file still governs everything else.
+
+**It is reversible, which is why the cost is acceptable.** Verified: the render tail uploads with a
+fresh unique `public_id` (`cloudinaryService.js` — `overwrite:true` is passed but no `publicId`, so
+each render lands at a NEW URL rather than replacing the old asset). The prior renders therefore
+still exist at the URLs the `baseline` column captured, and the 30 ads can be restored by writing
+those URLs back. Two caveats if that restore is ever needed: `status` is also flipped to `'draft'`
+by the same write, and the `baseline` phase refuses to re-record once populated — so **do not lose
+the baseline column**, it is the only copy of the before-state.
+
 **Owner verdict on the 17-ad sample** (artifact 3f801888-f0d0-4d28-af66-1ee62078d894): good EXCEPT
 Pelagic (font style regressed — my styleTheme alias moved it Oswald→Montserrat) and BabyBoo
 (before better). Verbatim directives: *"let's just stick to black or white type only when on a
@@ -1389,7 +1556,7 @@ its counts (miscounted twice); the presets round-trip at `indent=2`.
 **Tasks #13-#16 track the four workstreams. Owner is compacting the conversation after this
 commit — continue from THIS section.**
 
-### 0.3004 TITLE PLACEMENT — the bug was TIMING, not geometry. Tested, awaiting rollout call.
+### 0.3004 TITLE PLACEMENT — the bug was TIMING, not geometry. Fixed; NEW RENDERS ONLY (owner, closed).
 
 Prod `53e26a4`. Suite 46/46, `verifyProofBeat` 53. **Tested on the three ads the owner
 flagged; NOT yet rolled out to the library — that is an owner decision.**
@@ -1470,8 +1637,23 @@ it does not catch a wiring revert, which is why both exist.
 - The driver's stdout goes to its own file, NOT the Render log stream — `render logs` will never
   show `keepOut:` lines from a `retitleDriver` run.
 
-**AWAITING OWNER:** roll the placement fix across the library (a $0 re-title sweep, 382 ads, dry
-run green) or leave it applying to new renders only.
+**OWNER DECIDED 2026-08-04: NO LIBRARY SWEEP. The placement fix applies to NEW RENDERS ONLY.**
+Owner, verbatim: *"do not roll the placement fix across the library it should only apply to new
+renders."* Do not re-raise this as an open question, and do not run the 382-ad sweep "while we're
+in there" — it is a decision, not a deferral. Generalised the same day into the STANDING RULE at
+the top of this file.
+
+**Nothing had to be switched off to honour it.** The fix lives in the render path, so it is
+already applied to every new render; the sweep was purely optional backfill of the 382 existing
+ads. Verified the same day that `scripts/retitleDriver.js` has **no automated caller** — no cron,
+no `render.yaml` (there is none), no `package.json` script, and no reference from `services/` or
+`routes/`. Its only callers are a human on the box and `scripts/typeExperimentRun.js`.
+
+⚠️ **FOOTGUN this decision now makes expensive:** `retitleDriver` with **no `--ids`** re-titles
+the WHOLE library — the trap `typeExperimentRun.js` already warns about ("NEVER hand the driver an
+empty `--ids`"). A future scoped experiment that computes an empty id list therefore sweeps 382
+production ads. Always pass `--ids=` (or `--limit=`), and check the driver's own
+`retitleDriver: <total> ad(s)` preamble before letting it proceed.
 
 ### 0.3003 SEED = FEED ORDER, and the legibility fix was a POLARITY bug (prod `caec844`)
 
