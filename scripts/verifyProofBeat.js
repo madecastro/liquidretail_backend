@@ -598,11 +598,16 @@ check('V1 the video seed no longer prefers the imageRole hero stamp', () => {
     assert.ok(guardIdx > -1 && guardIdx < heroIdx,
       'any hero-stamp query must sit behind the !isVideoSeedFeedOrderEnabled() guard');
   }
-  // The DEFAULT (unguarded, final) resolution must be the feed-order query.
-  const tail = helper.slice(helper.lastIndexOf('return '));
-  assert.ok(/sort\(\{\s*createdAt:\s*1\s*\}\)/.test(tail),
-    'the default seed resolution must be the earliest-createdAt catalog Media');
-  assert.ok(!/imageRole/.test(tail),
+  // The DEFAULT resolution must read the catalog set in FEED ORDER, and must not
+  // consult the hero stamp anywhere outside the flag-off restore path.
+  // (This originally asserted on the helper's final `return`. That broke when the
+  // subject-dominance guard landed and the last return became `acceptable ||
+  // candidates[0]` — the behaviour was still feed-ordered, but the check was
+  // anchored to a line rather than to the rule. Assert the rule.)
+  const afterGuard = guardIdx > -1 ? helper.slice(helper.indexOf('}', guardIdx)) : helper;
+  assert.ok(/sort\(\{\s*createdAt:\s*1\s*\}\)/.test(afterGuard),
+    'the default seed resolution must read catalog Media in createdAt (feed) order');
+  assert.ok(!/imageRole/.test(afterGuard),
     'the default seed resolution must not reference the hero stamp');
 });
 
@@ -696,6 +701,133 @@ check('K3 the renderer disqualifies faces rather than pricing them', () => {
   assert.ok(/FACE_DISQUALIFIES/.test(code), 'faces must be excluded, not scored');
   assert.ok(!/FACE_PENALTY/.test(code), 'a numeric face penalty is refutable — busy reaches 1.0');
   assert.ok(/busy/.test(code), 'texture must be consulted for the tiebreak');
+});
+
+// ── F: a CSS variable is not a font family ──────────────────────────────
+
+check('F1 normalizeFontFamily rejects CSS plumbing', () => {
+  // THE BUG THIS PINS SHIPPED AND CONFUSED THE OWNER FOR A DAY. AllBirds' font
+  // scrape stored websiteFontUsage.body = "var(--font-sans)". Nothing filtered it,
+  // so the string reached family matching as if it were a typeface, matched
+  // nothing, and resolution fell through to the tone rules — the same ad rendered
+  // Inter, then Playfair Display, then Poppins. The brand's real fonts (Geograph,
+  // Self Modern) were in customFonts the whole time.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+  const sandbox = {};
+  const pick = (re) => { const m = src.match(re); assert.ok(m, `missing ${re}`); return m[0]; };
+  // eslint-disable-next-line no-new-func
+  new Function('sandbox', [
+    'const GENERIC_FAMILIES = new Set(["serif","sans-serif","monospace","cursive","fantasy","system-ui","ui-sans-serif","ui-serif","ui-monospace"]);',
+    pick(/function isNonFamilyToken[\s\S]*?\n}/),
+    pick(/function normalizeFontFamily[\s\S]*?\n}/),
+    'sandbox.n = normalizeFontFamily;',
+  ].join('\n'))(sandbox);
+  const n = sandbox.n;
+
+  for (const bad of ['var(--font-sans)', 'var(--brand-font, serif)', '--font-sans', 'inherit',
+                     'initial', 'unset', 'none', 'normal', 'calc(1px)', 'env(x)', '', '   ']) {
+    assert.strictEqual(n(bad), null, `${JSON.stringify(bad)} must not be treated as a family`);
+  }
+  // Real families still resolve, including past a leading var() in a stack.
+  assert.strictEqual(n('Self Modern'), 'Self Modern');
+  assert.strictEqual(n('var(--font-sans), Geograph'), 'Geograph');
+  assert.strictEqual(n('"Playfair Display", serif'), 'Playfair Display');
+  assert.strictEqual(n('sans-serif'), null, 'generic families were already excluded');
+});
+
+check('F2 the scraped brand family and both styleTheme spellings are consulted', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+  // styleTheme stores sansFontFamily/serifFontFamily; the resolver used to read
+  // only headingFontFamily/bodyFontFamily, so curated themes governed nothing
+  // except quote (which is why AllBirds' Lora never drifted while heading did).
+  assert.ok(/sansFontFamily/.test(src), 'must accept the sansFontFamily spelling');
+  assert.ok(/serifFontFamily/.test(src), 'must accept the serifFontFamily spelling');
+  // brand.fontFamily must participate as a last resort even when not curated,
+  // otherwise a real scraped family loses to an unusable higher tier.
+  const chain = src.slice(src.indexOf('const sharedFamily'), src.indexOf('const wanted'));
+  const curatedOnly = /\(fontIsCurated \? scanned : null\)/.test(chain);
+  const bareScanned = /\|\|\s*\n?\s*scanned\b/.test(chain) || /\bscanned \|\|/.test(chain);
+  assert.ok(curatedOnly && bareScanned,
+    'the curated tier must stay AND an uncurated scanned family must appear as a fallback');
+});
+
+// ── A: a product-tier rating names its product ──────────────────────────
+
+check('A1 product-tier review counts carry the product name', () => {
+  const { resolveAtomicRatingPair } = require('../services/ratingDisplay');
+  // Owner: a product-specific star rating must sit beside a product-specific
+  // quote OR name the product — because the neighbouring quote can legitimately
+  // be brand-tier via the last-resort fallback.
+  const withName = resolveAtomicRatingPair({
+    productRating: 4.8, productReviewCount: 200, productAttribution: "Women's Breezer Point",
+  });
+  assert.strictEqual(withName.source, 'product');
+  assert.strictEqual(withName.reviewsText, "200 reviews · Women's Breezer Point");
+  // No name available → unchanged from before, never a dangling separator.
+  const noName = resolveAtomicRatingPair({ productRating: 4.8, productReviewCount: 200 });
+  assert.strictEqual(noName.reviewsText, '200 reviews');
+  assert.ok(!/·\s*$/.test(noName.reviewsText));
+  // Singular still agrees.
+  assert.strictEqual(
+    resolveAtomicRatingPair({ productRating: 5, productReviewCount: 1, productAttribution: 'Tee' }).reviewsText,
+    '1 review · Tee');
+  // The brand tier keeps its own domain attribution.
+  assert.strictEqual(
+    resolveAtomicRatingPair({ productRating: 3.0, brandRating: 4.58, brandReviewCount: 15545, brandAttribution: 'vuoriclothing.com' }).reviewsText,
+    '15545 reviews · vuoriclothing.com');
+});
+
+// ── C: pill ink is derived from the pill fill ───────────────────────────
+
+check('C-ink CTA/promo/badge ink is chosen from the fill, not assumed', () => {
+  // Owner, on a delivered Gymshark 4:5 whose accent is cream: "it should be
+  // visible, not white on white." ctaText defaulted to #FFFFFF and promoText to
+  // #16161A regardless of the fill behind them.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'titleSpecService.js'), 'utf8');
+  assert.ok(/readableOn\(/.test(src), 'pill ink must go through a contrast-derived helper');
+  assert.ok(!/ctaText:\s*themeColor\(theme, 'ctaTextColor'\) \|\| themeColor\(theme, 'ctaText'\) \|\| '#FFFFFF'/.test(src),
+    'ctaText must not fall back to a fixed white');
+  for (const call of src.match(/readableOn\([^)]*\)/g) || []) {
+    assert.ok(/Resolved/.test(call), `readableOn must receive the resolved fill: ${call}`);
+  }
+  // Behaviour: light fill -> dark ink, dark fill -> white ink, explicit wins.
+  const readableOn = (bgHex, explicit) => {
+    if (explicit) return explicit;
+    const s = String(bgHex || '').replace(/^#/, '');
+    if (!/^[0-9a-fA-F]{6}$/.test(s)) return '#FFFFFF';
+    const lum = (0.2126 * parseInt(s.slice(0, 2), 16) + 0.7152 * parseInt(s.slice(2, 4), 16) + 0.0722 * parseInt(s.slice(4, 6), 16)) / 255;
+    return lum > 0.55 ? '#16181D' : '#FFFFFF';
+  };
+  assert.strictEqual(readableOn('#F1EFE9'), '#16181D', 'cream pill needs dark ink');
+  assert.strictEqual(readableOn('#16181D'), '#FFFFFF', 'dark pill needs white ink');
+  assert.strictEqual(readableOn('#F1EFE9', '#123456'), '#123456', 'an explicit brand colour wins');
+  assert.strictEqual(readableOn('garbage'), '#FFFFFF', 'unparseable falls back safely');
+});
+
+// ── S3: the video seed skips a subject-dominant first image ─────────────
+
+check('S3 seed guard preserves feed order but skips subject-dominant images', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'campaignAdsGenerationService.js'), 'utf8');
+  assert.ok(/primarySubjectAreaFraction/.test(src), 'guard must use the already-stored suitability metric');
+  assert.ok(/VIDEO_SEED_MAX_SUBJECT_FRACTION/.test(src), 'threshold must be env-tunable');
+  assert.ok(/sort\(\{\s*createdAt:\s*1\s*\}\)/.test(src), 'candidates must stay in feed order');
+
+  // Mirror of the selection rule.
+  const T = 0.6;
+  const pick = (arr) => {
+    const f = (m) => (Number.isFinite(m.frac) ? m.frac : null);
+    return (arr.find((m) => f(m) == null || f(m) <= T) || arr[0]).id;
+  };
+  // The real failing case: feed-first is 0.65 -> skip to the next acceptable.
+  assert.strictEqual(pick([{ id: 'a', frac: 0.65 }, { id: 'b', frac: 0.42 }]), 'b');
+  // Feed-first is fine -> it wins, order preserved.
+  assert.strictEqual(pick([{ id: 'a', frac: 0.30 }, { id: 'b', frac: 0.10 }]), 'a');
+  // Unmeasured is ACCEPTABLE — missing data must never reorder the feed.
+  assert.strictEqual(pick([{ id: 'a', frac: null }, { id: 'b', frac: 0.1 }]), 'a');
+  // Every candidate dominant -> keep the first, never block the ad.
+  assert.strictEqual(pick([{ id: 'a', frac: 0.9 }, { id: 'b', frac: 0.8 }]), 'a');
+  // Exactly at the threshold is acceptable (<=).
+  assert.strictEqual(pick([{ id: 'a', frac: 0.6 }, { id: 'b', frac: 0.1 }]), 'a');
 });
 
 // ── report ─────────────────────────────────────────────────────────────

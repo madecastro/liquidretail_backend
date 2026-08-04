@@ -119,10 +119,46 @@ const GENERIC_FAMILIES = new Set([
   'ui-serif', 'ui-sans-serif', 'ui-monospace', 'inherit', 'initial', 'unset'
 ]);
 
+/**
+ * Values that are CSS PLUMBING, not font families. A scraped stylesheet yields
+ * these constantly and every one of them is a dead end for family matching.
+ *
+ * THIS COST A DAY. AllBirds' font scrape stored
+ *   websiteFontUsage = { heading: null, body: "var(--font-sans)", … }
+ * because the site declares its stack through a custom property and the scraper
+ * captured the reference rather than resolving it. Nothing filtered it, so
+ * "var(--font-sans)" travelled all the way into family matching as if it were a
+ * typeface name. It matched no custom font, no Google font and no substitution
+ * entry, so resolution fell through to the brand-signal rules, where the tone
+ * string "friendly" selected Poppins — and the SAME ad re-rendered as Inter, then
+ * Playfair Display, then Poppins across three renders as this field churned.
+ *
+ * The brand's real fonts were sitting in `customFonts` the whole time (Geograph,
+ * Self Modern, Akkurat Mono, all ingested by that same scrape). The matcher never
+ * failed; it was never given a name to match.
+ */
+function isNonFamilyToken(family) {
+  const f = String(family || '').trim().toLowerCase();
+  if (!f) return true;
+  // ANY parenthesis disqualifies. A real family name never contains one, and this
+  // is what makes comma-splitting safe: "var(--brand-font, serif)" splits into
+  // `var(--brand-font` and `serif)`, and the second fragment is NOT caught by the
+  // generic-family list because "serif)" !== "serif" — it would have been returned
+  // as a typeface called "serif)". Caught by the harness sweeping var() forms,
+  // after the narrower startsWith checks had already been written.
+  if (f.includes('(') || f.includes(')')) return true;
+  if (f.startsWith('--')) return true;                             // bare custom-property name
+  // CSS-wide keywords: legal in a font-family declaration, useless as a family.
+  return ['inherit', 'initial', 'unset', 'revert', 'revert-layer', 'none', 'auto', 'normal'].includes(f);
+}
+
 function normalizeFontFamily(value) {
   for (const part of String(value || '').split(',')) {
     const family = part.trim().replace(/^['"]+|['"]+$/g, '').trim();
-    if (family && !GENERIC_FAMILIES.has(family.toLowerCase())) return family;
+    if (!family) continue;
+    if (GENERIC_FAMILIES.has(family.toLowerCase())) continue;
+    if (isNonFamilyToken(family)) continue;
+    return family;
   }
   return null;
 }
@@ -742,16 +778,36 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
   // brand family → the curated role default (Playfair/Inter/Lora, an
   // intentional pairing used only when the brand has NO family at all, so
   // the three still work together rather than mixing arbitrarily).
+  // styleTheme STORES DIFFERENT KEYS THAN THIS FILE READ. The brand docs carry
+  // `sansFontFamily` / `serifFontFamily` / `productFontFamily` (the canvas-era
+  // vocabulary), while the chain below asked for `headingFontFamily` /
+  // `bodyFontFamily`. So a curated styleTheme silently governed NOTHING for
+  // heading and body — the only key that lined up was `quoteFontFamily`, which is
+  // exactly why AllBirds' quote font stayed Lora across three renders while its
+  // heading and body drifted Inter -> Playfair -> Poppins. Accept both spellings.
+  const themeHeading = theme.headingFontFamily || theme.sansFontFamily || null;
+  const themeBody    = theme.bodyFontFamily    || theme.sansFontFamily || null;
+  const themeQuote   = theme.quoteFontFamily   || theme.serifFontFamily || null;
+
+  // The SCRAPED family (brand.fontFamily, e.g. AllBirds' "Self Modern" from
+  // brandfetch) is now a LAST-RESORT tier instead of being discarded whenever a
+  // human had not marked fontFamily as curated. It stays BELOW websiteUsage so
+  // a brand whose stylesheet names a real family keeps that behaviour unchanged;
+  // it only speaks up when the higher tiers yield nothing usable — which is
+  // precisely the case the `var(--font-sans)` guard above now creates. For
+  // AllBirds this resolves "Self Modern", which IS in customFonts, so the brand's
+  // own typeface renders instead of a tone-guessed substitute.
   const sharedFamily = normalizeFontFamily(
     (fontIsCurated ? scanned : null) ||
-    tailwind?.fonts?.body || websiteUsage.body || scanned ||
-    theme.bodyFontFamily || theme.headingFontFamily || null
+    tailwind?.fonts?.body || websiteUsage.body ||
+    themeBody || themeHeading ||
+    scanned || null
   );
 
   const wanted = {
-    heading: normalizeFontFamily(overrides.heading?.family || theme.headingFontFamily || (fontIsCurated ? scanned : null) || tailwind?.fonts?.heading || websiteUsage.heading || sharedFamily) || DEFAULT_ROLE_FONTS.heading.family,
-    body: normalizeFontFamily(overrides.body?.family || theme.bodyFontFamily || (fontIsCurated ? scanned : null) || tailwind?.fonts?.body || websiteUsage.body || sharedFamily) || DEFAULT_ROLE_FONTS.body.family,
-    quote: normalizeFontFamily(overrides.quote?.family || theme.quoteFontFamily || websiteUsage.quote || sharedFamily) || DEFAULT_ROLE_FONTS.quote.family,
+    heading: normalizeFontFamily(overrides.heading?.family || themeHeading || (fontIsCurated ? scanned : null) || tailwind?.fonts?.heading || websiteUsage.heading || sharedFamily) || DEFAULT_ROLE_FONTS.heading.family,
+    body: normalizeFontFamily(overrides.body?.family || themeBody || (fontIsCurated ? scanned : null) || tailwind?.fonts?.body || websiteUsage.body || sharedFamily) || DEFAULT_ROLE_FONTS.body.family,
+    quote: normalizeFontFamily(overrides.quote?.family || themeQuote || websiteUsage.quote || sharedFamily) || DEFAULT_ROLE_FONTS.quote.family,
   };
   const weights = {
     heading: overrides.heading?.weight || 700,

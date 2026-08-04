@@ -232,6 +232,7 @@ function resolveAtomicRatingPair({
   brandRating = null,
   brandReviewCount = null,
   brandAttribution = null,
+  productAttribution = null,
   allowBrandCountWithoutStars = false,
   productStarMin = RATING_STAR_MIN,
   brandStarMin = RATING_STAR_MIN,
@@ -240,10 +241,28 @@ function resolveAtomicRatingPair({
   if (productDisplay) {
     // Product pair — count from product tier only (may be null).
     const rc = normalizeReviewCount(productReviewCount);
+    // NAME THE PRODUCT when the stars are product-level.
+    //
+    // Owner: *"when there is a product specific star rating, make sure it is next
+    // to a product specific quote, or it includes the product name."* The risk is
+    // real rather than theoretical: the quote beside these stars can legitimately
+    // be brand-tier, because that last-resort fallback is deliberate
+    // (layoutInputService's tier ladder). An unlabelled "4.8 ★ · 200 reviews"
+    // sitting next to a catalog-wide testimonial reads as though the testimonial
+    // were about THIS product. Attributing the count to the product states the
+    // scope outright instead of withholding either element — and it mirrors what
+    // the brand tier below already does with its domain label.
+    let reviewsText = null;
+    if (rc != null) {
+      const label = productAttribution && String(productAttribution).trim();
+      reviewsText = label
+        ? `${rc} review${rc === 1 ? '' : 's'} · ${label}`
+        : `${rc} review${rc === 1 ? '' : 's'}`;
+    }
     return {
       rating: productDisplay,
       reviewCount: rc,
-      reviewsText: rc != null ? `${rc} review${rc === 1 ? '' : 's'}` : null,
+      reviewsText,
       source: 'product',
     };
   }

@@ -287,6 +287,32 @@ async function buildBrandTokens(brand, { layoutInputBrand = null, specFontOverri
   const secondary = themeColor(theme, 'secondaryColor') || hexOrNull(brand?.secondaryColor) || hexOrNull(layoutInputBrand?.secondary_color);
   const accent = themeColor(theme, 'accentColor') || hexOrNull(brand?.accentColor) || hexOrNull(layoutInputBrand?.accent_color) || primary;
 
+  // A pill's INK MUST BE DERIVED FROM ITS OWN FILL, never assumed.
+  //
+  // ctaText defaulted to '#FFFFFF' and promoText to '#16161A' — both fixed,
+  // whatever the pill was filled with. ctaBg falls back to the brand accent, so a
+  // brand with a light accent shipped WHITE TEXT ON A CREAM PILL. Owner, on a
+  // delivered Gymshark 4:5: *"if it is supposed to be there for that surface then
+  // it should be visible, not white on white."* promoText carries the mirror bug:
+  // a dark promo fill got dark ink.
+  //
+  // An explicit brand value always wins — this only replaces the blind default.
+  // Same principle as the composited logomark and the text-shadow polarity: pick
+  // the ink from the thing it sits on.
+  const readableOn = (bgHex, explicit) => {
+    if (explicit) return explicit;
+    const s = String(bgHex || '').replace(/^#/, '');
+    if (!/^[0-9a-fA-F]{6}$/.test(s)) return '#FFFFFF';
+    const lum = (0.2126 * parseInt(s.slice(0, 2), 16)
+               + 0.7152 * parseInt(s.slice(2, 4), 16)
+               + 0.0722 * parseInt(s.slice(4, 6), 16)) / 255;
+    return lum > 0.55 ? '#16181D' : '#FFFFFF';
+  };
+
+  const ctaBgResolved   = themeColor(theme, 'ctaBgColor') || themeColor(theme, 'ctaBg') || accent || primary || '#46783E';
+  const promoBgResolved = themeColor(theme, 'promoBgColor') || themeColor(theme, 'promoBg') || accent || '#F5B70A';
+  const badgeBgResolved = themeColor(theme, 'badgeBgColor') || themeColor(theme, 'badgeBg') || themeColor(theme, 'calloutBgColor') || accent || '#BEC282';
+
   // Curated styleTheme docs use the CANVAS engine's key vocabulary
   // (ctaBgColor, badgeTextColor, promoBgColor, accentGold, …) — read those
   // first so a brand renders identically on both engines; the short forms
@@ -295,18 +321,18 @@ async function buildBrandTokens(brand, { layoutInputBrand = null, specFontOverri
     primary: primary || '#0B0F14',
     secondary: secondary || '#DCDCDC',
     accent: accent || '#F5B70A',
-    ctaBg: themeColor(theme, 'ctaBgColor') || themeColor(theme, 'ctaBg') || accent || primary || '#46783E',
-    ctaText: themeColor(theme, 'ctaTextColor') || themeColor(theme, 'ctaText') || '#FFFFFF',
+    ctaBg: ctaBgResolved,
+    ctaText: readableOn(ctaBgResolved, themeColor(theme, 'ctaTextColor') || themeColor(theme, 'ctaText')),
     scrim: themeColor(theme, 'scrimColor') || '#0C0906',
     textPrimary: themeColor(theme, 'textPrimary') || '#FFFFFF',
     textSecondary: themeColor(theme, 'textSecondary') || secondary || '#DCDCDC',
     // stars deliberately never fall to brand accent (dark accents = invisible
     // stars) — same rule as the canvas deriveTheme.
     stars: themeColor(theme, 'starColor') || themeColor(theme, 'accentGold') || '#F5B70A',
-    badgeBg: themeColor(theme, 'badgeBgColor') || themeColor(theme, 'badgeBg') || themeColor(theme, 'calloutBgColor') || accent || '#BEC282',
-    badgeText: themeColor(theme, 'badgeTextColor') || themeColor(theme, 'badgeText') || '#1F2219',
-    promoBg: themeColor(theme, 'promoBgColor') || themeColor(theme, 'promoBg') || accent || '#F5B70A',
-    promoText: themeColor(theme, 'promoTextColor') || themeColor(theme, 'promoText') || '#16161A',
+    badgeBg: badgeBgResolved,
+    badgeText: readableOn(badgeBgResolved, themeColor(theme, 'badgeTextColor') || themeColor(theme, 'badgeText')),
+    promoBg: promoBgResolved,
+    promoText: readableOn(promoBgResolved, themeColor(theme, 'promoTextColor') || themeColor(theme, 'promoText')),
     // Plate-intelligence contrast flips (light footage → dark type).
     textOnLight: themeColor(theme, 'textOnLight') || primary || '#16181D',
     textSecondaryOnLight: themeColor(theme, 'textSecondaryOnLight') || '#3A4048',

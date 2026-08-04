@@ -1859,6 +1859,40 @@ function isVideoSeedFeedOrderEnabled() {
  * historical hero-stamp-first cascade is restored verbatim, so flipping the env
  * var reproduces the old seed exactly.
  */
+/**
+ * Skip a first image whose subject fills the frame, because the product cannot
+ * survive the crop.
+ *
+ * Owner: *"I just don't want text directly on the face, and I don't want it to
+ * zoom so close into a face that I can't see the actual product."*
+ *
+ * WHY THE SEED AND NOT THE CROP: measured on the ad that prompted this — the
+ * master's face envelope spanned 0.035→0.558 of a 1080x1920 frame, i.e. a head
+ * 1,004px tall. A 1:1 delivery crops a 1080px window, so NO crop offset can hold
+ * that head and still leave room for the garment or a title band. faceSafeCrop
+ * already pushes the head as high as its margins allow (that is what
+ * FACE_TOP_MARGIN_FRAC is for) and it had nothing left to give. The only lever
+ * that changes the outcome is which image Omni animates.
+ *
+ * SIGNAL, and it costs nothing: adSuitabilityService already derives
+ * `metrics.primarySubjectAreaFraction` from the overlay-zone geometry and stores
+ * it on every Media. No vision call, no ingest change.
+ *
+ * THRESHOLD: measured across 600 catalog images — median 0.57, p90 0.87. The
+ * failing seed measured 0.65, which the STATIC scorer rates as *positive*
+ * (its good band is 0.10–0.65, because a big subject flatters a still). Video
+ * that gets cropped needs its own line, so this does not touch that scoring.
+ *
+ * FEED ORDER IS PRESERVED: candidates stay in createdAt order and the FIRST
+ * acceptable one wins — this only skips past images that would bury the product.
+ * If every candidate is subject-dominant it returns the first anyway, so a
+ * product can never lose its video for want of a wider photo.
+ */
+const VIDEO_SEED_MAX_SUBJECT_FRACTION = (() => {
+  const n = Number(process.env.VIDEO_SEED_MAX_SUBJECT_FRACTION);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : 0.6;
+})();
+
 async function firstCatalogMediaForProduct(productOid) {
   if (!isVideoSeedFeedOrderEnabled()) {
     const stamped = await Media.findOne({
@@ -1868,10 +1902,44 @@ async function firstCatalogMediaForProduct(productOid) {
     }).select('_id').lean();
     if (stamped) return stamped;
   }
-  return Media.findOne({
+
+  // Feed order, with the suitability metric alongside so the guard needs no
+  // second query. Bounded: a product's catalog set is small.
+  const candidates = await Media.find({
     source: 'catalog-product',
     'metadata.catalogProductId': productOid
-  }).sort({ createdAt: 1 }).select('_id').lean();
+  })
+    .sort({ createdAt: 1 })
+    .select('_id adSuitability.metrics.primarySubjectAreaFraction')
+    .limit(24)
+    .lean();
+
+  if (!candidates.length) return null;
+
+  const fractionOf = (m) => {
+    const v = m?.adSuitability?.metrics?.primarySubjectAreaFraction;
+    return Number.isFinite(v) ? v : null;
+  };
+  // Unmeasured media is treated as ACCEPTABLE, not rejected — absent data must
+  // never reorder the feed.
+  const acceptable = candidates.find((m) => {
+    const f = fractionOf(m);
+    return f == null || f <= VIDEO_SEED_MAX_SUBJECT_FRACTION;
+  });
+
+  if (acceptable && String(acceptable._id) !== String(candidates[0]._id)) {
+    console.log(
+      `🎬 videoSeed: skipped ${candidates[0]._id} (primary subject ` +
+      `${(fractionOf(candidates[0]) ?? 0).toFixed(2)} of frame > ${VIDEO_SEED_MAX_SUBJECT_FRACTION}) ` +
+      `-> ${acceptable._id} (${(fractionOf(acceptable) ?? 0).toFixed(2)}); product would not survive the crop`
+    );
+  } else if (!acceptable) {
+    console.log(
+      `🎬 videoSeed: every catalog image for ${productOid} is subject-dominant ` +
+      `(first ${(fractionOf(candidates[0]) ?? 0).toFixed(2)}) — keeping feed order`
+    );
+  }
+  return acceptable || candidates[0];
 }
 
 // Deterministic video expansion: one video Ad per product, seeded on

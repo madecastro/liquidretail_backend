@@ -848,10 +848,20 @@ async function buildMetaForAd(ad, brand) {
     brandRating:        brandPair?.rating ?? null,
     brandReviewCount:   brandPair?.reviewCount ?? null,
     brandAttribution:   brandAttributionLabel(brand),
+    // Display-cleaned name (colorway parenthetical already stripped) so the
+    // attribution reads as a product, not a raw SKU string.
+    productAttribution: cleanProductNameForDisplay(cascaded.productName ?? null).productName,
     allowBrandCountWithoutStars,
   });
+  // Log the QUOTE tier alongside the rating tier: a product-tier rating beside a
+  // brand-tier quote is the case the product attribution exists to disambiguate,
+  // and without this line there is no way to spot it in a render log.
+  const quoteTierForLog = layoutInput?.input?.social_proof?.primary_quote?.tier || 'none';
   console.log(
-    `ratingPair: source=${ratingPair.source || 'none'} rating=${ratingPair.rating || 'none'} count=${ratingPair.reviewCount ?? 'none'}`
+    `ratingPair: source=${ratingPair.source || 'none'} rating=${ratingPair.rating || 'none'} ` +
+    `count=${ratingPair.reviewCount ?? 'none'} quoteTier=${quoteTierForLog}` +
+    (ratingPair.source && quoteTierForLog !== 'none' && ratingPair.source !== quoteTierForLog
+      ? ' (cross-tier: attribution names the scope)' : '')
   );
   const rating = ratingPair.rating;
   const reviewsText = ratingPair.reviewsText;
