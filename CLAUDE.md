@@ -103,7 +103,16 @@ removed the only clamp on that branch (`REPEAT_PRIMARY_TOTAL_CAP=4` applies
 **STATIC** — direct to **gpt-image-2/edit**, one call returns the finished ad
 (`directImageRenderService`). No HTML, no Puppeteer, no SVG overlay compositing.
 Each Meta static size is its own billable image gen (`meta_static` = 3 —
-`platformFormats.js:576-583`).
+`platformFormats.js:576-583`). **`ai_brand_led`** (when `STATIC_BRAND_LED_COPY`
+is on, default true) resolves to its own `brand_led` intent
+(`staticAdIntents.js:533-562`) with a BRAND LINE + SUBHEAD + TRUST MARK + CTA
+contract and a copy cascade in `buildIntentData` (Director →
+`layoutInput.copy` → `brand.tagline` for headline; Director →
+`layoutInput.copy.subheadline` for subhead; case-insensitive dedupe). Flag-off
+restores a **byte-identical** pre-change prompt (`TEMPLATE_INTENT` entry + both
+cascades + SUBHEAD role revert together). `ai_ugc_led` / `ai_editorial` still
+fall to `product_first_lifestyle` (unmapped). Full write-up:
+`docs/PIPELINES.md` §5 *Brand-led intent + copy cascade*.
 
 ### The overlay is PREVIEW ONLY — and it is not the titling
 
@@ -378,6 +387,61 @@ Video never launches a browser.
   that outcome: PR #61 hardened the VIDEO prompt and was rolled back in full
   (§00). Pinned by `scripts/verifyStaticFidelityPrompt.js` (419 checks, both arms,
   revert-proven on three mutations).
+- **Director round JSON is not enforced by the gateway (SEPARATE from the
+  competitor-mark defect above).** The `director` role maps to
+  `anthropic/claude-sonnet-5-ccmax` (`services/atlasModelMap.js:98`). Atlas
+  **silently ignores** `response_format:{type:'json_object'}` for that model —
+  probed live 2026-08-04, two arms (flag on / flag off), **both** returned
+  conversational prose. Distinct from the already-documented fact that
+  `json_schema` HTTP 400s for Anthropic; "use `json_object`" is now known to be
+  **insufficient**. Measured from Render logs over 24h: **10 Director round
+  failures, 1 success** — failures open with prose ("I don't have enough
+  information…", "Before I generate…", "No AVOID block…", "Two inputs…",
+  "A couple of things…"); each failure = a product with **zero ads** (paid
+  Director call wasted). The round system prompt never independently demanded
+  JSON, so compliance was luck; thin-signal SKUs reliably tipped the model into
+  clarifying questions. The handler was asymmetric: schema-validation miss
+  re-asked once, JSON parse failure threw with no salvage and no retry. **Code
+  fix is applied in the working tree and offline-verified, but UNCOMMITTED and
+  NOT deployed — do not claim production is fixed.** Fix: (a)
+  `safeParseDirectorJSON` + `extractFirstBalancedObject` (string-aware
+  balanced-brace salvage; mirrors `judgeService.safeParseJSON` but not greedy);
+  (b) one-shot corrective re-ask that **shares** the existing `attempt` budget
+  (worst case stays two paid Director calls per product/round); (c) `OUTPUT
+  CONTRACT` block in the round system prompt naming the observed refusal
+  openings and stating THIN DATA IS NOT A STOP. Pinned by
+  `scripts/verifyDirectorJsonSalvage.js` (32 checks; revert-proven against three
+  mutations: salvage removed → 28/32; unconditional throw → 30/32; OUTPUT
+  CONTRACT deleted → 31/32).
+  **Starved brief — FIXED (do not re-diagnose).** Separately from the JSON
+  gateway issue, the Director input summary used to read fields that do not
+  exist on the schemas: `brand.description` / `brand.logo` (neither on
+  `brandSchema` — `models/Brand.js:31`; `description` is `demographicSchema`'s
+  field at `:24`; real fields are `summary` `:47` and `logoUrl` `:48`) and
+  `product.shortBenefits` (not on `CatalogProduct`, always `[]`). The round
+  prompt told the model to pull from `brand_signal.tagline / description /
+  brand_reviews_summary` and to null any ungrounded copy role — so copy came
+  back empty while `dirWarnings=0` (the warning only fired when **all four**
+  copy fields were null). Fixed: `brand_signal.description` ← `brand.summary`,
+  `has_logo` ← `!!brand.logoUrl`, dead `shortBenefits` read dropped
+  (`aiCreativeDirectorService.js:307-329`); warning on `copy.headline` alone
+  null (`:1979-1983`); **`DIRECTOR_SIGNALS_VERSION` bumped `3.0.0 → 3.1.0`**
+  (`:73`) so cached `CreativeDirectionArtifact` rows re-derive. Without the
+  bump the brief fix is a no-op on every product that already has an artifact
+  (cache-hit test is `cached.signalsVersion === DIRECTOR_SIGNALS_VERSION` at
+  `:149` — same "looks right, silently does nothing" class as §0). Pinned by
+  `scripts/verifyDirectorPrompt.js` (40 checks, section E).
+- **Static `ai_brand_led` with zero cascade headline can still print a customer
+  quote (known open — not "broken").** `INTENTS.brand_led` declares
+  `rendersQuote:false` (owner: rating trust mark only, no quote —
+  `staticAdIntents.js:544`). But with no headline from Director /
+  `layoutInput.copy` / `brand.tagline`, `eligible` fails and `resolveIntent`
+  walks `FALLBACK_ORDER` (`:565` / `:572-578`); if a rating exists the ad lands
+  on `social_proof_led`, which **can** emit a customer quote. Documented
+  deliberately rather than closed: the descent hierarchy is owner-specified,
+  and a hollow brand-led ad is what `core:['BRAND LINE']` exists to prevent.
+  Reachable only when all three headline tiers are absent. Full write-up:
+  `docs/PIPELINES.md` §5 *Brand-led intent + copy cascade*.
 - **Static geometry — two defects FIXED 2026-08-03; read the diagnostic before
   re-opening.** (A) `staticAdIntents.computeSurface` combined the post-generation
   crop band with the 6% edge margin via `Math.max`, so on every *cropped* surface
@@ -450,6 +514,65 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   vars there are blank while `defaults.env` sets them. **Secrets stay in the
   Render dashboard only** (migration COMPLETE 2026-08-03 — see §4a). Precedence:
   process env wins; a dashboard var of the same name **always shadows** the file.
+- **`absences` `rendersSubhead` polarity.** The condition at
+  `staticAdIntents.js:412` is `rendersSubhead && (!d.subhead || lost('SUBHEAD'))`.
+  It **MUST** lead with `rendersSubhead` — only `brand_led` declares that flag,
+  so every other intent stays `undefined`/falsy and its prompt is unchanged.
+  Flipping to `!rendersSubhead || …` silently adds an absence line to **every**
+  existing prompt and breaks the flag-off byte-identity baseline. Pinned by
+  `verifyStaticIntents.js` E6 (additive-safety: no non-`brand_led` prompt
+  contains "subhead"). Same trap class as §0.
+- **`DIRECTOR_SIGNALS_VERSION` bump is load-bearing on any brief fix.** Cache-hit
+  test is `cached.signalsVersion === DIRECTOR_SIGNALS_VERSION`
+  (`aiCreativeDirectorService.js:149`). A code fix that feeds better brand /
+  product signal **without** bumping the version leaves every product that
+  already has a `CreativeDirectionArtifact` serving concepts built from the old
+  brief — the fix looks deployed and is a no-op. Current value `3.1.0` (`:73`)
+  was the starved-brief repair (`summary` / `logoUrl`); any future signal-shape
+  change needs the same bump.
+- **`brand.logo` IS CORRECT on a `layoutInput.brand` object and WRONG on a Mongoose
+  Brand doc. Check which object you are holding before "fixing" either.** The two
+  are different shapes with overlapping names, which is how the Director bug hid.
+  `layoutInputService.js:2227` builds `layoutInput.brand.logo` **from**
+  `brand.logoUrl`, so `brand.logo` is a real field on that projection — and
+  `aiCanvasInputBuilder.js:133/329/330` read it legitimately, because `:37` is
+  `const brand = layoutInput.brand || {}`. `ALLOWED_SLOTS`
+  (`aiCanvasSpecService.js:115`) and the prompt text at `:555`/`:749` are
+  slot-binding **contract paths** and context-object **key names**, not property
+  reads — renaming any of them breaks the binding contract. A Mongoose Brand doc
+  has only `logoUrl` / `summary`. Both directions are pinned by
+  `scripts/verifyBrandFieldNames.js` (17 checks): Group B forbids
+  `brandDoc.description` / `brandDoc.logo`, and **Group D asserts the layoutInput
+  usages still exist**, so an over-eager cleanup fails the harness. Group B is
+  deliberately scoped to the variable name `brandDoc` — a bare `brand` is
+  ambiguous repo-wide, and a check that cannot tell the two apart would have to
+  allowlist half the services.
+- **`.select()` of a field that does not exist is SILENT.** Mongoose neither throws
+  nor warns; the path is simply absent on the result, so the read downstream is
+  `undefined` forever. `aiCanvasInputBuilder` did
+  `.select('description tagline brandReviews tone')` on Brand — `description` is
+  not a brandSchema field, so the rich-context `description` key handed to the
+  canvas Generator was permanently empty. Same defect as the Director's
+  `brand?.description`, one layer earlier. Group A of
+  `verifyBrandFieldNames.js` parses the real top-level `brandSchema` keys out of
+  `models/Brand.js` (58 today) and asserts every `Brand.find*().select(…)` path in
+  `services/` + `routes/` is one of them — it is the general form of this trap, so
+  prefer extending it over adding a one-off string check.
+- **Gate a provider tier on the PRIMARY key, never the fallback.** `wantGpt`
+  (`brandEnrichmentService.js`) gated on `OPENAI_API_KEY` while the call itself goes
+  through `atlasLlmService.chatCompletion`, whose primary is Atlas and whose direct
+  providers are only a fallback. After the move to Atlas, a deployment holding just
+  Atlas credentials **silently skipped the whole GPT enrichment tier** — and that
+  tier's `ENRICHMENT_SCHEMA` owns tagline, summary, tone, hashtags, tags,
+  demographics, colours and fontSuggestion. `summary` has **no other automated
+  writer**, and `brand_signal.description` in the Director brief reads exactly that
+  field, so the starved brief had a starved *source*. Now
+  `(atlasLlmConfigured() || !!process.env.OPENAI_API_KEY)`. **Not the same as
+  `wantBrandReviews`:** `geminiSearchProvider` calls Google's grounded-search
+  endpoint directly with `GEMINI_API_KEY` and is deliberately *not* behind
+  `atlasLlmService` (Atlas does not proxy grounded retrieval), so gating that tier
+  on its own key is correct. Before "fixing" a key gate, read which client the tier
+  actually calls.
 - **Docs have described commented-out code.** `TITLING.md` documented the disabled
   canvas cascade as live. When you find such a case, fix the doc in the same commit.
 - **Director concept contract (v3 nested under `routing`).** Schema v3 moved

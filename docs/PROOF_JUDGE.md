@@ -125,7 +125,7 @@ complaint could seed the concept the entire ad is then built around, and
 Reviews are **not** run through the comment judge, because they carry something
 better: the reviewer's own star rating.
 
-- `QUOTE_MIN_RATING` (4.5) is the single threshold, normalized through
+- `QUOTE_MIN_RATING` (4.35 as of 2026-08-04; env-tunable in `config/defaults.env`) is the single threshold, normalized through
   `toFiveScale` first so a 90/100 is read as 4.5 and not as 90.
 - The review's *text* still passes through inference — `extractSnippet`, the one
   place a quote is shortened, whose prompt enforces positive / on-product /

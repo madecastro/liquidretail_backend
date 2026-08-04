@@ -1326,6 +1326,15 @@ const STRONG_POSITIVE = /\b(love[ds]?|loving|adore[ds]?|adoring|obsess(ed|ion)|a
 
 const MODERATE_POSITIVE = /\b(great|excellent|high[- ]?quality|top[- ]?notch|first[- ]?rate|solid|dependable|reliable|sturdy|durable|comfortable|cozy|effective|efficient|recommend(ed|ing|ation)?|happy|satisfied|pleased|smooth|reliable|noticeable|convenient|handy|well[- ]?made|thoughtful|beautifully|nicely)\b/gi;
 
+// SCORING ONLY — deliberately NOT part of hasPositiveSignal.
+// "soft", "breathable", "true to size" are how apparel and bedding reviews
+// actually praise a product, so they belong in the RANKING. They must not open the
+// printability gate: hasPositiveSignal shares MODERATE_POSITIVE, and putting them
+// there made bare fragments like "True to size" or "Soft enough for light
+// activity" qualify as endorsements. Ranking and permission are different
+// questions, and adversarial review caught them being conflated.
+const SCORING_POSITIVE = /\b(soft|softer|softest|breathable|flattering|supportive|true to size|holds? (?:its )?shape)\b/gi;
+
 const PHRASE_STRONG = /\b(worth every penny|worth the money|worth it|highly recommend|would recommend|five stars?|5[- ]?stars?|10\/10|hands down|blown away|blew me away|exceeded (my )?expectations|pleasantly surprised|fell in love|in love with|couldn't be happier|couldn'?t be more pleased|better than expected)\b/gi;
 
 const EXPERIENCE_VERB = /\b(bought|purchas(ed|ing)|got|use[ds]?|using|wore|wearing|wear|tr(ied|ying)|ordered|received|installed|took|been (using|wearing|loving)|have had|had (this|it|them)|own(ed)?|opened|unboxed)\b/i;
@@ -1352,9 +1361,12 @@ const NEGATED_POSITIVE = /\b(not|no|never|hardly|barely|isn'?t|wasn'?t|aren'?t|w
 // physical breakage, buyer's remorse, or emotional negatives.
 const NEGATIVE_SENTIMENT = /\b(terrible|awful|horrible|dreadful|abysmal|garbage|trash|junk|useless|worthless|disappoint(ed|ing|ment)?|frustrat(ed|ing)|annoy(ed|ing)|regret(ted)?|avoid|scam|ripoff|rip[- ]?off|misleading|deceptive|false|fake|counterfeit|cheap(ly)?[- ]?made|poor(ly)?[- ]?made|shoddy|flimsy|defect(ive)?|broken|broke|snapped|torn|tore|ripped|shattered|cracked|leak(ed|ing|s)?|melt(ed|ing)?|faded|peel(ed|ing)?|stain(ed)?|smell(ed|s|y)|stink(s|y|ing)?|reek(s|ed)|hate[ds]?|hating|loathe|despise|worst|refund(ed|ing)?|return(ed|ing)?[- ]?it|returning|sent[- ]?back|had to return|took it back|would not (buy|recommend|purchase)|wouldn'?t (buy|recommend|purchase)|don'?t (buy|waste|bother)|do not (buy|waste|bother)|save your (money|time)|beware|warning|stay away|not for me|not what i expected|nothing like (the picture|advertised)|false advertising|not as (described|advertised|shown|pictured)|two[- ]?star|one[- ]?star|1\/5|2\/5|one star|two stars?)\b/i;
 
-function scoreQuote(text) {
+function scoreQuote(text, { stage = null, angleTerms = null } = {}) {
   const s = String(text || '').trim();
   if (!s) return -Infinity;
+
+  // A hard limiter disqualifies outright: it argues against the purchase.
+  if (HARD_LIMITER.test(s)) return -Infinity;
 
   // Sentiment gate — disqualifies negative quotes outright. Runs before
   // scoring so a well-structured 1-star review can't accumulate points.
@@ -1374,10 +1386,45 @@ function scoreQuote(text) {
 
   // Sentiment magnitude — capped so a review can't win purely by piling on
   // superlatives; the specificity signals below break ties for lived-experience quotes.
-  const strongHits   = (s.match(STRONG_POSITIVE)   || []).length;
+  let strongHits     = (s.match(STRONG_POSITIVE)   || []).length;
   const moderateHits = (s.match(MODERATE_POSITIVE) || []).length;
   const phraseHits   = (s.match(PHRASE_STRONG)     || []).length;
-  score += Math.min(strongHits * 1.5 + phraseHits * 2 + moderateHits, 5);
+  // "best" is in STRONG_POSITIVE, but "best suited for" is a limitation, not
+  // praise. Do not let the narrowing phrase earn a positivity point.
+  if (BEST_AS_LIMITER.test(s)) strongHits = Math.max(0, strongHits - 1);
+  const scoringHits  = (s.match(SCORING_POSITIVE) || []).length;
+  score += Math.min(strongHits * 1.5 + phraseHits * 2 + moderateHits + Math.min(scoringHits, 2), 5);
+  const positiveSignals = strongHits + moderateHits + phraseHits + scoringHits;
+
+  // Soft hedges qualify the praise around them.
+  if (SOFT_HEDGE.test(s) || HEDGED_EXPECTATION.test(s)) score -= 1.5;
+
+  // PURELY FACTUAL LINES ARE NOT PROOF. "Customers consistently praise the
+  // fabric" and "Ballet flat design is a bit dressier than I expected" carry no
+  // enthusiasm; they read as product copy, not as a customer speaking.
+  if (positiveSignals === 0) score -= 2;
+
+  // STAGE AFFINITY — a bounded nudge, never a gate.
+  let bias = 0;
+  const stageKey = normalizeStage(stage);
+  if (stageKey && STAGE_TERMS[stageKey]) {
+    const hits = (s.match(STAGE_TERMS[stageKey]) || []).length;
+    bias += Math.min(hits, 2) * STAGE_WEIGHT;
+  }
+
+  // DIRECTOR ANGLE AFFINITY — when a concept is driving the ad, a quote that
+  // speaks to the same hook is worth more than a generically strong one.
+  if (Array.isArray(angleTerms) && angleTerms.length) {
+    // WORD-BOUNDED, and short terms ignored: a substring test let ['soft'] match
+    // "Microsoft" and a one-letter term match every quote ever written.
+    const hits = angleTerms.filter((t) => {
+      const term = String(t || '').trim();
+      if (term.length < 4) return false;
+      return new RegExp(`(?:^|[^a-z])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z])`, 'i').test(s);
+    }).length;
+    bias += Math.min(hits, 2) * ANGLE_WEIGHT;
+  }
+  score += Math.min(bias, BIAS_CAP);
 
   // Specificity signals
   if (/\d/.test(s))            score += 1;
@@ -1442,7 +1489,101 @@ function toFiveScale(rating) {
 //
 // Applies to reviews only. Instagram comments and LLM-authored lines carry no
 // star rating and are gated by sentiment elsewhere.
-const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.5);
+// QUOTE ELIGIBILITY FLOOR — which reviewers may be QUOTED. Distinct from the STAR
+// floor (ratingDisplay.RATING_STAR_MIN), which governs which NUMBER may print.
+//
+// 4.35 as of 2026-08-04, following the owner moving the star floor so a DISPLAYED
+// 4.4 prints. Left at 4.5 the two gates contradict each other on one ad: a
+// 4.4-rated product would show "4.4 ★★★★★" while its own reviewers' words were
+// filtered out, and the quote beside its stars would come from the category or
+// brand tier instead. Owner chose to keep them coherent.
+//
+// WHY 4.35 AND NOT 4.4. This gate compares the RAW rating via toFiveScale, not the
+// rounded display value the star gate uses. A raw 4.37 DISPLAYS as 4.4, so it
+// prints stars; a 4.4 cut-off here would still refuse to quote that reviewer.
+//
+// Env-tunable via config/defaults.env, so the floor can move without a deploy.
+const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.35);
+
+// ── LIMITATIONS ARE NOT TESTIMONIALS ───────────────────────────────────
+//
+// Owner, on a delivered GymShark ad: the quote "low-support option best suited
+// for lighter activities" is "not great". It is not negative, so the sentiment
+// gate passed it; and it scored 2.5, BEATING "This cactus is such a statement
+// piece" (0) and "Customers consistently praise the Vuori fabric" (1). The reason
+// is precise and slightly absurd: STRONG_POSITIVE matches the word "best" inside
+// "best suited for", counting a phrase that NARROWS the product as praise.
+//
+// A limiting qualifier tells a shopper what the product is NOT for. That is the
+// opposite of proof, and on a paid ad it argues against the sale.
+// ANCHORED, AND NARROW. The first cut joined bare strings with no word
+// boundaries, so it matched INSIDE other words — "fol(low support)",
+// "yel(low-support)", "not great (for)tune" — and it was far too broad: adversarial
+// review found six genuinely positive reviews it killed, including
+//   "I wish I had bought these sooner"   (a strong conversion quote)
+//   "If you want a legging that lasts, buy these"
+//   "My only complaint is I did not buy two pairs"
+// Those read as praise. Only phrases that UNAMBIGUOUSLY narrow the product's
+// suitability veto a quote; anything hedgier is a scored penalty instead.
+const HARD_LIMITER = new RegExp(
+  "(?:^|[^a-z])(?:"
+  + [
+      "best suited (?:for|to)\\b",
+      "better suited (?:for|to)\\b",
+      "not (?:ideal|meant|designed|suitable|intended) for\\b",
+      "isn'?t (?:ideal|meant|designed|suitable) for\\b",
+      "runs (?:small|large|big|narrow|tight)\\b",
+      "low[- ]?support\\b",
+      "not enough (?:support|coverage|padding)\\b",
+    ].join("|")
+  + ")", 'i');
+
+// Softer hedges: they can sit inside a genuinely positive line ("softer than I
+// expected"), so they are penalised rather than disqualifying.
+const SOFT_HEDGE = /\b(?:a bit|a little (?:small|large|tight|loose|thin|sheer)|slightly|somewhat|although|however|but the|but it|for the price|at this price)\b/i;
+// "better than expected" / "softer than I expected" are PRAISE; only an unqualified
+// expectation clause is a hedge.
+const HEDGED_EXPECTATION = /(?:^|[^a-z])(?<!better |softer |nicer |cheaper |faster |bigger |more )than (?:i )?expected\b/i;
+
+// "best" only counts as praise when it is not narrowing the product.
+// "the best for the price" and "the best for me" are PRAISE — a bare "best for"
+// veto demoted them. Only strip the positive hit when a NARROWING use case follows.
+const BEST_AS_LIMITER = /\bbest (?:suited\b|for (?:light|casual|lounging|layering|mild|warm|cool|beginners?|occasional|short))/i;
+
+// ── FUNNEL STAGE ───────────────────────────────────────────────────────
+//
+// Owner: "the quote selection should be influenced by the director and the
+// position in the funnel". The same review is not equally useful at every stage:
+// top of funnel needs a feeling, mid funnel needs an objection removed, bottom of
+// funnel needs the purchase justified. Terms are additive nudges (bounded), never
+// gates — a stage must not be able to promote a weak quote over a strong one.
+const STAGE_TERMS = {
+  // Discovery: sensory, emotional, "people noticed".
+  awareness: /\b(obsessed|in love|gorgeous|stunning|beautiful|compliment(s|ed)?|every ?day|favou?rite|so soft|feels? (amazing|incredible|luxurious)|turn(s|ed)? heads|statement)\b/gi,
+  // Objection removal: fit, quality, durability, comparison, care.
+  consideration: /\b(true to size|fits? (perfectly|great|true)|held up|holds up|washed?|washing|durable|quality|sturdy|after (weeks|months|years)|compared|versus|vs\.?|sizing|runs true|breathable|no pilling|still looks?)\b/gi,
+  // Decision: value, repeat purchase, regret-free.
+  conversion: /\b(worth (every penny|the money|it)|bought (another|a second|two|more)|reorder(ed|ing)?|repurchas(ed|ing)|buy(ing)? again|wish i('?d| had) (bought|ordered)|no regrets|best purchase|highly recommend|10\/10)\b/gi,
+};
+const STAGE_ALIASES = { awareness: 'awareness', consideration: 'consideration', conversion: 'conversion',
+  top: 'awareness', mid: 'consideration', middle: 'consideration', bottom: 'conversion', bofu: 'conversion',
+  tofu: 'awareness', mofu: 'consideration' };
+function normalizeStage(v) {
+  const k = String(v || '').toLowerCase().replace(/[^a-z]/g, '');
+  return STAGE_ALIASES[k] || null;
+}
+const STAGE_WEIGHT = Number(process.env.QUOTE_STAGE_WEIGHT || 1.2);
+// ONE cap over stage AND angle combined: separately bounded they still summed to
+// 5.4, rivalling the whole sentiment band (capped at 5). A bias that can outrank
+// what the review actually says is not a bias, it is an override.
+const BIAS_CAP = Number(process.env.QUOTE_BIAS_CAP || 3);
+const ANGLE_WEIGHT = Number(process.env.QUOTE_ANGLE_WEIGHT || 1.5);
+// NO SECOND FLOOR HERE. SCORE_FLOOR (=1) plus hasPositiveSignal already decide
+// whether a candidate may take the primary slot, and this file records what
+// happens when a filter brings its own lower threshold along: it is a no-op until
+// some caller skips the first gate, and then it silently admits what the first
+// gate existed to reject. A limp quote is rejected by SCORE_FLOOR; the changes
+// above only make the SCORE honest.
 // Whether a quote with NO recorded rating may still be used. Per-review stars
 // were not captured until recently, so every already-synced product has
 // unrated quotes: requiring a rating outright would strip testimonials from
@@ -1483,7 +1624,7 @@ function gateQuotesByRating(candidates, tierName) {
   return kept;
 }
 
-function pickStrongestQuote(candidates) {
+function pickStrongestQuote(candidates, opts = {}) {
   if (!Array.isArray(candidates) || candidates.length === 0) return null;
 
   // STAR VERDICT BEATS TEXT SENTIMENT. Scraped reviews now carry the
@@ -1518,7 +1659,7 @@ function pickStrongestQuote(candidates) {
     // not outrank the text.
     const normalized = toFiveScale(q.rating);
     const starBonus = normalized === null ? 0 : (normalized - QUOTE_MIN_RATING);
-    const score = scoreQuote(q.text) + starBonus;
+    const score = scoreQuote(q.text, opts) + starBonus;
     if (score > bestScore) {
       bestScore = score;
       best = q;
@@ -2103,8 +2244,20 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
     console.log(`🔒 quote pool — ${llmQuoteCount} LLM-authored quote(s) withheld: notional personas are not customer proof`);
   }
 
-  const pickedProduct  = pickStrongestQuote(tierProduct);
-  const pickedCategory = pickedProduct ? null : pickStrongestQuote(tierCategory);
+  // Funnel stage and Director angle come from the caller (options), so this is
+  // inert unless something supplies them — every existing caller keeps today's
+  // behaviour exactly. Owner: "the quote selection should be influenced by the
+  // director and the position in the funnel".
+  const quoteOpts = {
+    stage: normalizeStage(options?.funnelStage || options?.stage || null),
+    angleTerms: Array.isArray(options?.conceptAngle) ? options.conceptAngle.slice(0, 8) : null,
+  };
+  if (quoteOpts.stage || quoteOpts.angleTerms) {
+    console.log(`📐 quote bias[media=${media._id}] stage=${quoteOpts.stage || '-'} ` +
+      `angle=${quoteOpts.angleTerms ? quoteOpts.angleTerms.join('|') : '-'}`);
+  }
+  const pickedProduct  = pickStrongestQuote(tierProduct, quoteOpts);
+  const pickedCategory = pickedProduct ? null : pickStrongestQuote(tierCategory, quoteOpts);
   // Precedence forks here on ad type, and ONLY here:
   //
   // - Product ad (isProductScoped): product -> category -> comment -> brand.
@@ -2119,11 +2272,11 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   let pickedBrand;
   let pickedComment;
   if (isProductScoped) {
-    pickedComment = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierComment);
-    pickedBrand   = (pickedProduct || pickedCategory || pickedComment) ? null : pickStrongestQuote(tierBrand);
+    pickedComment = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierComment, quoteOpts);
+    pickedBrand   = (pickedProduct || pickedCategory || pickedComment) ? null : pickStrongestQuote(tierBrand, quoteOpts);
   } else {
-    pickedBrand   = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierBrand);
-    pickedComment = (pickedProduct || pickedCategory || pickedBrand) ? null : pickStrongestQuote(tierComment);
+    pickedBrand   = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierBrand, quoteOpts);
+    pickedComment = (pickedProduct || pickedCategory || pickedBrand) ? null : pickStrongestQuote(tierComment, quoteOpts);
   }
   let primaryQuote = pickedProduct || pickedCategory || pickedBrand || pickedComment || null;
   const quoteTier = pickedProduct  ? 'product'

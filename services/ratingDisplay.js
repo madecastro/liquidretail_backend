@@ -8,10 +8,17 @@
  * Owner rule is about star display generally, not one surface — a raw 3.2 must
  * not burn into a Reel either.
  *
- * Owner rule (verbatim): "we only use stars over 4.5". Strictly greater than
- * this floor is required; exactly 4.5 does not print.
+ * Owner rule (verbatim, 2026-08-04): "anything above a 4.4 is acceptable
+ * actually, brand stars can use the brand volume exception." This SUPERSEDES the
+ * earlier rule, also verbatim, which read: "we only use stars over 4.5".
+ *
+ * WHY THE CONSTANT IS 4.39 AND NOT 4.4. The gate is strictly greater than this
+ * floor, applied to the ROUNDED one-decimal DISPLAY value. A displayed 4.4 must
+ * print, and `4.4 > 4.4` is false — so 4.4 as the constant would refuse exactly
+ * the case the owner asked for. 4.39 follows the convention already established
+ * by RATING_STAR_VOLUME_MIN, which is 4.19 precisely so a displayed 4.2 passes.
  */
-const RATING_STAR_MIN = 4.5;
+const RATING_STAR_MIN = 4.39;
 
 /**
  * Longest product label allowed on the rating line. The line sits at ~0.82x body
@@ -48,18 +55,26 @@ function truncateWordSafe(value, cap) {
  *
  * Count floor is exclusive: 5000 does NOT unlock; 5001 does.
  *
- * SCOPE: product-tier only. Brand keeps the strict >4.5 rule (see
- * BRAND_VOLUME_EXCEPTION_ENABLED below for a one-line overrule).
+ * SCOPE: product AND brand as of 2026-08-04 — the owner enabled the brand path
+ * (see BRAND_VOLUME_EXCEPTION_ENABLED below).
  */
 const RATING_STAR_VOLUME_MIN = 4.19;
 const RATING_STAR_VOLUME_COUNT_MIN = 5000;
 
 /**
- * One-line switch: set true to also apply the volume exception to brand stars.
- * Default OFF — brand already has a defined fail path (count without stars
- * beside a brand-side quote). Owner may overrule later without hunting call sites.
+ * One-line switch: apply the volume exception to brand stars too.
+ *
+ * ON as of 2026-08-04. Owner: "brand stars can use the brand volume exception",
+ * asked to mirror product EXACTLY. He was shown the consequence and chose it:
+ * brand stars can now print down to a DISPLAYED 4.2 when the brand review count
+ * exceeds 5000. Concretely, on today's data that admits BabyBoo (4.3 / 17,645)
+ * and still refuses GymShark (3.3) no matter how many reviews back it — volume
+ * widens the exception's REACH, never its floor.
+ *
+ * The brand fail path (count without stars, beside a brand-side quote) still
+ * applies to everything that misses both bars.
  */
-const BRAND_VOLUME_EXCEPTION_ENABLED = false;
+const BRAND_VOLUME_EXCEPTION_ENABLED = true;
 
 /**
  * Quote tier → which NUMBER snapshot may print beside it.

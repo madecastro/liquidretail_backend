@@ -306,7 +306,7 @@ Both paths: kind `enrichment`, cancellable; partials kept. Idempotent via 30-day
 
 **Also still true:**
 
-- One star threshold, **`QUOTE_MIN_RATING` (4.5)**, via `gateQuotesByRating` + re-apply in `pickStrongestQuote`.
+- One star threshold, **`QUOTE_MIN_RATING` (4.35 as of 2026-08-04, env-tunable in `config/defaults.env`)**, via `gateQuotesByRating` + re-apply in `pickStrongestQuote`. It is deliberately LOWER than the star floor's 4.39 because this gate reads the RAW rating while the star gate reads the rounded display value — a raw 4.37 displays as 4.4, so both must admit it.
 - Ratings normalized to 5-point scale before every comparison.
 - Product tier reads `productReviewsOf(match)` (seed pick then hydrated top-level).
 - Lexical `scoreQuote` on top of stars.

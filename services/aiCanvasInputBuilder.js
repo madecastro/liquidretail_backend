@@ -53,7 +53,13 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
       const CatalogModel  = require('../models/CatalogProduct');
       const MediaModel    = require('../models/Media');
       const [bd, pd] = await Promise.all([
-        brandId   ? BrandModel.findById(brandId).select('description tagline brandReviews tone').lean()   : null,
+        // `summary`, NOT `description` — brandSchema (models/Brand.js:31) has no
+        // `description`; that field belongs to demographicSchema (:24). The real
+        // 2-4 sentence brand prose is `summary` (:47). Selecting a non-existent
+        // path is silent in Mongoose, so this projected nothing and the read
+        // below was permanently undefined. Same defect as the Director brief
+        // (aiCreativeDirectorService.js:310) fixed 2026-08-04.
+        brandId   ? BrandModel.findById(brandId).select('summary tagline brandReviews tone').lean()   : null,
         productId ? CatalogModel.findById(productId).select('matchedMedia sellers specs availability productReviews rating ratingDistribution').lean() : null
       ]);
       brandDoc = bd;
@@ -120,7 +126,13 @@ async function buildAiCanvasContext({ ctx, layoutInput, aspectRatio, brandId = n
       // brand_reviews_summary captures the Gemini narrative for what
       // people actually say about the brand (different from product
       // reviews — brand-level positioning).
-      description:    snippetText(brandDoc?.description, 280),
+      // Output key stays `description` — the Generator prompt names it
+      // (aiCanvasSpecService.js:749 "brand.description / brand.brand_reviews_summary"),
+      // so renaming the key would strand that reference. Only the SOURCE moves,
+      // brandDoc.description -> brandDoc.summary. Note `brand` above is
+      // layoutInput.brand (:37); `brandDoc` is the Mongoose doc — the two are
+      // different objects and only the doc has this bug.
+      description:    snippetText(brandDoc?.summary, 280),
       brand_reviews_summary: snippetText(brandDoc?.brandReviews?.summary, 240),
       tone:           Array.isArray(brand.tone) ? brand.tone : [],
       // Brand colors + font intentionally omitted. The Generator picks

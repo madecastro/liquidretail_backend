@@ -8,7 +8,7 @@
  * resolveAtomicRatingPair cannot see the quote. Its brand-star fallback is
  * correct for a quote-unaware resolver, but live call sites that pass both
  * product and brand pairs can print brand stars next to a product quote when
- * the product rating fails >4.5 (R1 hole). resolveCoherentSocialProof closes
+ * the product rating fails the star floor (R1 hole). resolveCoherentSocialProof closes
  * that by withholding the ineligible side before delegating, and adds:
  *   - QUOTE_TIER_NUMBER_SIDE (category → brand; comment → product)
  *   - product volume exception (displayed >4.19 AND count >5000)
@@ -99,8 +99,8 @@ console.log('\nverifyCoherentSocialProof\n');
 
 // ── C0 constants / table ───────────────────────────────────────────────
 
-check('C0 RATING_STAR_MIN is 4.5', () => {
-  assertEq(RATING_STAR_MIN, 4.5);
+check('C0 RATING_STAR_MIN is 4.39 (owner 2026-08-04: "anything above a 4.4 is acceptable"; 4.39 so a DISPLAYED 4.4 clears a strict >)', () => {
+  assertEq(RATING_STAR_MIN, 4.39);
 });
 
 check('C0 RATING_STAR_VOLUME_MIN is 4.19', () => {
@@ -112,7 +112,8 @@ check('C0 RATING_STAR_VOLUME_COUNT_MIN is 5000', () => {
 });
 
 check('C0 brand volume exception is OFF by default', () => {
-  assertEq(BRAND_VOLUME_EXCEPTION_ENABLED, false);
+  // ON as of 2026-08-04 — owner: "brand stars can use the brand volume exception".
+  assertEq(BRAND_VOLUME_EXCEPTION_ENABLED, true);
 });
 
 check('C0 QUOTE_TIER_NUMBER_SIDE maps product/comment → product', () => {
@@ -135,7 +136,7 @@ check('C1 category quote + brand count → ALLOWED (source brand-count)', () => 
     brandAttribution: ATTR,
   });
   assertEq(r.source, 'brand-count');
-  assertEq(r.rating, null, 'stars withheld under >4.5');
+  assertEq(r.rating, null, 'stars withheld under the star floor');
   assertEq(r.reviewCount, 41000);
   assertEq(r.quoteTier, 'category');
   assert(r.reviewsText && /brand review/.test(r.reviewsText),
@@ -265,7 +266,7 @@ check('C2 displayed 4.1 with any count → stars REFUSED', () => {
   assertEq(r.reviewCount, 9999);
 });
 
-check('C2 displayed 4.6 with count 12 → ALLOWED via original >4.5 rule', () => {
+check('C2 displayed 4.6 with count 12 → ALLOWED via the plain star floor', () => {
   const r = proof({
     quote: q('product'),
     product: product(4.6, 12),
@@ -277,16 +278,43 @@ check('C2 displayed 4.6 with count 12 → ALLOWED via original >4.5 rule', () =>
   assertEq(r.reviewCount, 12);
 });
 
-check('C2 brand displayed 4.3 with count 41000 → stars REFUSED (no brand volume exception)', () => {
+check('C2 brand displayed 4.3 with count 41000 → stars ALLOWED via the brand volume exception', () => {
+  // FLIPPED DELIBERATELY on 2026-08-04. Owner: "brand stars can use the brand
+  // volume exception", asked to mirror product exactly, and was shown this
+  // consequence before choosing it — brand stars now print down to a displayed 4.2
+  // when the brand review count exceeds 5000.
   const r = proof({
     quote: q('brand'),
     product: product(4.8, 120),
     brand: brand(4.3, 41000),
     brandAttribution: ATTR,
   });
-  assertEq(r.source, 'brand-count');
-  assertEq(r.rating, null, 'brand must not earn stars via volume exception');
+  assertEq(r.source, 'brand');
+  assertEq(r.rating, '4.3', 'volume unlocks brand stars at a displayed 4.3');
   assertEq(r.reviewCount, 41000);
+});
+
+check('C2 the brand volume exception widens REACH, never the floor', () => {
+  // A displayed 4.1 is below RATING_STAR_VOLUME_MIN, so no amount of volume
+  // unlocks it — which is why GymShark at 3.3 with 41,000 reviews still shows no
+  // stars. This is the half of the contract the flip must not erode.
+  const low = proof({
+    quote: q('brand'),
+    product: product(null, null),
+    brand: brand(3.3, 41000),
+    brandAttribution: ATTR,
+  });
+  assertEq(low.rating, null, 'volume cannot rescue a 3.3');
+  assertEq(low.source, 'brand-count', 'the count still prints beside a brand quote');
+  // ...and a high rating with a THIN count still fails the volume path, falling back
+  // to the plain floor (4.3 > 4.39 is false).
+  const thin = proof({
+    quote: q('brand'),
+    product: product(null, null),
+    brand: brand(4.3, 900),
+    brandAttribution: ATTR,
+  });
+  assertEq(thin.rating, null, 'a 4.3 with only 900 reviews clears neither bar');
 });
 
 check('C2 volume count boundary: exactly 5000 does NOT unlock stars', () => {
@@ -301,7 +329,7 @@ check('C2 volume count boundary: exactly 5000 does NOT unlock stars', () => {
 });
 
 check('C2 formatDisplayRating default floor still withholds 4.2', () => {
-  // Without volume floor, classic path refuses 4.2 (4.2 > 4.5 is false).
+  // Without the volume floor, the plain path refuses 4.2 (4.2 > 4.39 is false).
   assertEq(formatDisplayRating(4.2), undefined);
   assertEq(formatDisplayRating(4.2, RATING_STAR_VOLUME_MIN), '4.2');
   assertEq(formatDisplayRating(4.14, RATING_STAR_VOLUME_MIN), undefined);
@@ -490,10 +518,15 @@ check('C7 resolveAtomicRatingPair R3 default still null when both fail', () => {
   assertEq(r.source, null);
 });
 
-check('C7 formatDisplayRating one-arg call matches today (4.51 withheld, 4.6 passes)', () => {
-  assertEq(formatDisplayRating(4.51), undefined);
+check('C7 formatDisplayRating one-arg call matches today (displayed 4.4+ passes)', () => {
+  // FLIPPED DELIBERATELY on 2026-08-04. Under the old >4.5 floor a raw 4.51
+  // displayed as "4.5" and was WITHHELD; under 4.39 it prints, which is the whole
+  // point of the owner's change. A displayed 4.3 must still be refused.
+  assertEq(formatDisplayRating(4.51), '4.5');
   assertEq(formatDisplayRating(4.6), '4.6');
-  assertEq(formatDisplayRating(4.5), undefined);
+  assertEq(formatDisplayRating(4.5), '4.5');
+  assertEq(formatDisplayRating(4.4), '4.4');
+  assertEq(formatDisplayRating(4.3), undefined);
   assertEq(formatDisplayRating('4.8'), undefined);
   assertEq(formatDisplayRating(87), undefined);
 });
@@ -714,8 +747,8 @@ process.exit(0);
  *                C2 formatDisplayRating default floor still withholds 4.2
  *                (the formatDisplayRating(4.14, VOLUME_MIN) === undefined pin).
  *
- * INV-6  brand has NO volume exception
- *   Back out: set BRAND_VOLUME_EXCEPTION_ENABLED = true.
+ * INV-6  brand mirrors product's volume exception (enabled 2026-08-04)
+ *   Back out: set BRAND_VOLUME_EXCEPTION_ENABLED = false.
  *   Must go red: C0 brand volume exception is OFF by default;
  *                C2 brand displayed 4.3 with count 41000 → stars REFUSED.
  *
