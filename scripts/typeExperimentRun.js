@@ -19,13 +19,18 @@
 // PHASES
 //   pool      $0  select the masters, resolve each brand's real type + ink
 //   baseline  $0  record the renderUrl of every selected ad BEFORE anything
-//                 overwrites it. Must run before either arm.
+//                 overwrites it. Must run before any arm.
 //   armA      $0  re-title all selected ads on the deployed canonical engine
-//   extract   ¢   one vision call per brand -> type template -> preset file
+//                 (disciplined deterministic: monochrome ink + the font ladder)
+//   extract   ¢   one vision call per BRAND -> type template -> preset file
 //   armB      $0  re-title each brand's ads with --preset=typetpl-<brand>
+//   autonomy  ¢   one vision call per AD -> a per-ad type plan (arm C)
+//   armC      $0  re-title each ad with its OWN plan, --preset=typeauto-<adId>
 //   collect   $0  read every renderUrl back and write results.json
+//   qc        ¢   judge every row of every arm for readability + on-brand feel
 //
-// MONEY: the only billable phase is `extract` (cents of LLM). Every re-title is
+// MONEY: the billable phases are `extract`, `autonomy` and `qc` (cents of vision
+// LLM each, ledgered, never auto-retried). Every re-title is
 // $0 — retitleDriver re-composites Remotion chrome over the already-paid Omni
 // master and never submits a generation. Face-detection vision can cost ~$0.02
 // on a cold basePlate cache for cropped formats; these masters have been titled
@@ -48,13 +53,15 @@ const has = (n) => args.includes(`--${n}`);
 const DIR = flag('dir', '/tmp/typeexp');
 const COUNT = flag('count', '30');
 const DRY_RUN = has('dry-run');
-const ALL_PHASES = ['pool', 'baseline', 'armA', 'extract', 'armB', 'collect'];
+const ALL_PHASES = ['pool', 'baseline', 'armA', 'extract', 'armB', 'autonomy', 'armC', 'collect', 'qc'];
 const PHASES = (flag('phases', ALL_PHASES.join(',')) || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BRANDS_FILTER = flag('brands', '');
 
 const F = {
   pool: path.join(DIR, 'pool.json'),
   templates: path.join(DIR, 'templates.json'),
+  autonomy: path.join(DIR, 'autonomy.json'),
+  qc: path.join(DIR, 'qc.json'),
   results: path.join(DIR, 'results.json'),
   log: path.join(DIR, 'run.log'),
 };
@@ -197,6 +204,35 @@ const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').repla
     if (!DRY_RUN) recordColumn('armB', await currentUrls(adIds), { engine: 'per-brand type template from own statics' });
   }
 
+  // ── autonomy (ARM C plans — billable, one vision call per AD) ───────
+  if (PHASES.includes('autonomy')) {
+    const a = [`--pool=${F.pool}`, `--out=${F.autonomy}`, '--emit-presets'];
+    if (DRY_RUN) a.push('--dry-run');
+    log(`💰 autonomy: up to ${adIds.length} billable vision call(s), one per AD`);
+    if (!run('typeAutonomyArm.js', a)) log('✖ arm C planning failed — arm C will have no presets');
+  }
+
+  // ── arm C ───────────────────────────────────────────────────────────
+  if (PHASES.includes('armC')) {
+    const plans = fs.existsSync(F.autonomy) ? readJson(F.autonomy) : { plans: {} };
+    let ran = 0;
+    for (const ad of pool.ads) {
+      const plan = plans.plans?.[ad.adId];
+      if (!plan || plan._dryRun) { log(`⏭  ${ad.adId}: no arm C plan`); continue; }
+      const preset = `typeauto-${ad.adId}`;
+      if (!fs.existsSync(path.join(__dirname, '..', 'remotion', 'presets', `${preset}.json`)) && !DRY_RUN) {
+        log(`⏭  ${ad.adId}: ${preset}.json missing — skipping rather than rendering arm A again`);
+        continue;
+      }
+      // One driver invocation per ad: each ad has its OWN preset in this arm.
+      run('retitleDriver.js', [`--ids=${ad.adId}`, `--preset=${preset}`,
+        `--log=${path.join(DIR, 'armC.progress.log')}`]);
+      ran++;
+    }
+    log(`arm C: ${ran} ad(s) re-titled with a per-ad plan`);
+    if (!DRY_RUN) recordColumn('armC', await currentUrls(adIds), { engine: 'per-ad LLM type plan (autonomy)' });
+  }
+
   // ── collect ─────────────────────────────────────────────────────────
   if (PHASES.includes('collect') && !DRY_RUN) {
     const results = fs.existsSync(F.results) ? readJson(F.results) : { columns: [], rows: {}, meta: {} };
@@ -221,6 +257,14 @@ const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').repla
     log(`📝 ${F.results} — columns: ${results.columns.join(', ')}`);
     const complete = Object.values(results.rows).filter((r) => results.columns.every((c) => r[c])).length;
     log(`📊 rows complete across every column: ${complete}/${Object.keys(results.rows).length}`);
+  }
+
+  // ── qc (billable: one vision call per row per arm) ──────────────────
+  if (PHASES.includes('qc')) {
+    const a = [`--results=${F.results}`, `--out=${F.qc}`];
+    if (DRY_RUN) a.push('--dry-run');
+    log('💰 qc: one billable vision call per row per arm');
+    run('typeQcRenders.js', a);
   }
 
   if (mongoose.connection.readyState) await mongoose.disconnect();
