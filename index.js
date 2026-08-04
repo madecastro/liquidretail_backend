@@ -192,6 +192,12 @@ app.use((req, res, next) => {
 app.use('/api/ads',       requireAuth, adsRoutes);
 app.use('/api/seeds',     requireAuth, seedsRoutes);
 app.use('/api/sales-demos', requireAuth, require('./routes/salesDemos'));
+// Home-page agent (backlog rows 167, 168). Mounted unconditionally so a
+// disabled agent returns 503 with a clear reason instead of a 404 the
+// frontend can't distinguish from a missing deploy. Enable per env with
+// AGENT_ENABLED=true; see config/defaults.env.
+const agentRoutes = require('./routes/agent');
+app.use('/api/agent',     requireAuth, agentRoutes);
 
 app.post('/api/products/:id/push-to-shopify', requireAuth, async (req, res) => {
   try {
