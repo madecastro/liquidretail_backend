@@ -455,6 +455,19 @@ router.post('/chat', async (req, res) => {
   });
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
+  // Keep-alive pings — comment lines (`: <text>\n\n`) that SSE parsers
+  // ignore but that Render / Netlify / any HTTP-level proxy sees as
+  // traffic. Without these, an LLM call that stalls for 30-60s (cold
+  // model, provider throttle) can trigger an idle-connection reap that
+  // truncates the response BEFORE our `done` event lands — leaving the
+  // client stuck at "Thinking…" with no terminal signal. 15s is well
+  // under every default idle-reap window we care about.
+  const keepAlive = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) {
+      try { res.write(': keep-alive\n\n'); } catch { /* ignore — cleanup fires next tick */ }
+    }
+  }, 15_000);
+
   // Client-disconnect abort. AbortController -> passed into
   // streamChatCompletion so the upstream axios request is cancelled.
   // `aborted` also short-circuits the tool loop.
@@ -863,6 +876,7 @@ router.post('/chat', async (req, res) => {
     console.error(`❌ agent chat: ${err.message}`);
     sseWrite(res, 'error', { error: err.message });
   } finally {
+    clearInterval(keepAlive);
     if (!res.writableEnded) res.end();
   }
 });
