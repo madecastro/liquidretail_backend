@@ -853,6 +853,49 @@ check('S3 seed guard preserves feed order but skips subject-dominant images', ()
   assert.strictEqual(pick([{ id: 'a', frac: 0.6 }, { id: 'b', frac: 0.1 }]), 'a');
 });
 
+// ── M: no burned-in CTA on Meta surfaces ────────────────────────────────
+
+check('M1 the canonical family ships no CTA on Meta formats, but keeps it on landscape', () => {
+  // Owner: "turn off the CTA for meta surfaces." Meta draws its own CTA button in
+  // the surrounding chrome for Reels / Stories / Feed — the app's own preview
+  // renders it — so a burned-in pill duplicates it. It was also the element most
+  // prone to collision: a cream-accent brand shipped white-on-cream (C-ink).
+  //
+  // landscape is pmax / YouTube, NOT Meta, and keeps its CTA deliberately.
+  //
+  // Asserted through validateTitleSpec rather than the raw JSON, because the
+  // validator is what the renderer actually consumes and it fills defaults — a
+  // raw-file check would pass on a spec whose normalized form re-enables the slot.
+  const { loadPresetFile, clearPresetCache } = require('../services/titleSpecService');
+  const { validateTitleSpec } = require('../services/titleSpecValidator');
+  clearPresetCache();
+  const META = new Set(['vertical', 'feed', 'square']);
+  const family = ['canonical', 'canonical-awareness', 'canonical-consideration',
+                  'canonical-conversion', 'proto-kinetic-center', 'proto-bottom-editorial'];
+  let checkedMeta = 0, checkedLandscape = 0;
+  for (const name of family) {
+    const preset = loadPresetFile(name);
+    assert.ok(preset?.byFormat, `${name} must load`);
+    for (const [fmt, raw] of Object.entries(preset.byFormat)) {
+      const res = validateTitleSpec(raw, { format: fmt });
+      assert.ok(res.ok, `${name}/${fmt} must validate: ${res.errors?.[0]}`);
+      const cta = res.normalized.slots.find((s) => s.key === 'cta');
+      if (!cta) continue;
+      if (META.has(fmt)) {
+        assert.strictEqual(cta.visible, false,
+          `${name}/${fmt}: Meta draws its own CTA — a burned-in one must stay off`);
+        checkedMeta += 1;
+      } else {
+        assert.strictEqual(cta.visible, true,
+          `${name}/${fmt}: non-Meta surfaces (pmax/YouTube) still need their own CTA`);
+        checkedLandscape += 1;
+      }
+    }
+  }
+  assert.ok(checkedMeta >= 18, `expected every Meta format covered, saw ${checkedMeta}`);
+  assert.ok(checkedLandscape >= 6, `expected landscape covered, saw ${checkedLandscape}`);
+});
+
 // ── report ─────────────────────────────────────────────────────────────
 
 if (failures.length) {

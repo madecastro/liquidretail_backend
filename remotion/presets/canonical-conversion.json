@@ -211,7 +211,7 @@
             "trackingPx": 1.2,
             "sizeScale": 1.15
           },
-          "visible": true
+          "visible": false
         },
         {
           "key": "quote",
@@ -471,7 +471,7 @@
             "trackingPx": 1.2,
             "sizeScale": 1.15
           },
-          "visible": true
+          "visible": false
         },
         {
           "key": "quote",
@@ -696,7 +696,7 @@
             "trackingPx": 1.2,
             "sizeScale": 1.15
           },
-          "visible": true
+          "visible": false
         },
         {
           "key": "quote",

@@ -230,11 +230,34 @@ function assertAllScrimNone(doc, label) {
   }
 }
 
-function assertCtaVisibleAllFormats(doc, label) {
+/**
+ * CTA POLICY, revised 2026-08-03 by owner instruction: *"turn off the CTA for
+ * meta surfaces."*
+ *
+ * Meta renders its own CTA button in the chrome around Reels / Stories / Feed —
+ * the app's own surface preview draws it — so a burned-in pill duplicated it, and
+ * it was the element most prone to contrast collisions (a cream-accent brand
+ * shipped white-on-cream). `landscape` is pmax / YouTube, which has no such
+ * furniture, so it KEEPS its CTA.
+ *
+ * This helper previously asserted visible:true on all four formats, encoding the
+ * earlier "CTA everywhere" decision. It is updated rather than deleted so the
+ * contract stays pinned in both directions — off where Meta draws one, on where
+ * nobody does.
+ */
+const META_FORMATS = new Set(['vertical', 'feed', 'square']);
+
+function assertCtaPolicyAllFormats(doc, label) {
   for (const fmt of FORMATS) {
     const cta = (doc.byFormat[fmt].slots || []).find((s) => s.key === 'cta');
     assert.ok(cta, `${label}.${fmt} missing cta slot`);
-    assert.notStrictEqual(cta.visible, false, `${label}.${fmt}.cta must be visible:true (got visible:${cta.visible})`);
+    if (META_FORMATS.has(fmt)) {
+      assert.strictEqual(cta.visible, false,
+        `${label}.${fmt}.cta must be visible:false — Meta draws its own CTA (got visible:${cta.visible})`);
+    } else {
+      assert.notStrictEqual(cta.visible, false,
+        `${label}.${fmt}.cta must stay visible — ${fmt} is not a Meta surface (got visible:${cta.visible})`);
+    }
   }
 }
 
@@ -275,9 +298,9 @@ check('G3 canonical.vertical has rating + productName + deliveryLine + cta', () 
   }
 });
 
-check('G4 cta visible:true on every format of canonical', () => {
+check('G4 cta off on Meta formats, on for landscape (canonical)', () => {
   // FAIL-IF-CTA-HIDDEN: owner decision — CTA visible on all formats.
-  assertCtaVisibleAllFormats(loadPresetFile('canonical'), 'canonical');
+  assertCtaPolicyAllFormats(loadPresetFile('canonical'), 'canonical');
 });
 
 check('G5 scrim none on every slot of every format of canonical + funnel variants', () => {
@@ -290,7 +313,7 @@ check('G5 scrim none on every slot of every format of canonical + funnel variant
   }
 });
 
-check('G6 funnel variants load + validate for all 4 formats; cta visible', () => {
+check('G6 funnel variants load + validate for all 4 formats; cta policy', () => {
   // FAIL-IF-VARIANT-BROKEN: each funnel preset must be a complete 4-format doc.
   for (const name of FUNNEL_VARIANTS) {
     clearPresetCache();
@@ -301,7 +324,7 @@ check('G6 funnel variants load + validate for all 4 formats; cta visible', () =>
       const res = validateTitleSpec(doc.byFormat[fmt], { format: fmt });
       assert.ok(res.ok, `${name}.${fmt} invalid: ${(res.errors || []).join('; ')}`);
     }
-    assertCtaVisibleAllFormats(doc, name);
+    assertCtaPolicyAllFormats(doc, name);
   }
 });
 
@@ -381,7 +404,7 @@ check('G9 productName cleaning strips parenthetical / pipe / trailing dash; full
 });
 
 // ── H. Experimental proto presets (scoring pilot) ─────────────────────────
-check('H1 proto presets load + validate for all 4 formats; scrim none; cta visible', () => {
+check('H1 proto presets load + validate for all 4 formats; scrim none; cta policy', () => {
   // FAIL-IF-PROTO-BROKEN: scoring-pilot prototypes must stay legal grammar.
   for (const name of PROTO_PRESETS) {
     clearPresetCache();
@@ -393,7 +416,7 @@ check('H1 proto presets load + validate for all 4 formats; scrim none; cta visib
       assert.ok(res.ok, `${name}.${fmt} invalid: ${(res.errors || []).join('; ')}`);
     }
     assertAllScrimNone(doc, name);
-    assertCtaVisibleAllFormats(doc, name);
+    assertCtaPolicyAllFormats(doc, name);
   }
 });
 
