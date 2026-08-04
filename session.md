@@ -1404,7 +1404,102 @@ the asset's own border implies, so white-on-black assets don't invert into a blo
 back to the original asset. **NOT yet visually verified — needs one static render (~$0.01).**
 Video titling was never the source: `brandPill` and `brandLogo` are both off in canonical.
 
-### 0.3005 TYPE EXPERIMENT — OWNER-DIRECTED WORKSTREAM (2026-08-04). READ THIS BEFORE CONTINUING.
+### 0.3006 TYPE EXPERIMENT — ARM A SHIPPED, THREE ARMS RUNNING (2026-08-04). Supersedes 0.3005's plan.
+
+**ARM A IS A REAL PRODUCTION CHANGE and is deployed.** Everything else in this section is
+experiment scaffolding. The owner drew that line explicitly: *"The QC gate is experimental just
+for this test, not to be applied to production."* Two production files changed, both on owner
+directive; six new `scripts/type*.js` files are additive with **zero imports from
+`services/`, `routes/`, `models/` or `remotion/`** (verified, not assumed) and are to be moved to
+`scripts/experiments/` or deleted once the run is judged.
+
+**INK — `titleSpecService.buildBrandTokens`.** `textOnLight` fell back to the brand PRIMARY and
+`textSecondary` to the brand SECONDARY, so scraped palette values were rendering as letterforms
+(Pelagic `#4d92b6` blue, BabyBoo `#ba3357` red). Both now default to neutrals; a curated value
+still wins. **Measured justification, which is stronger than the owner's aesthetic call alone:**
+unlike `ctaText`/`badgeText`/`promoText`, `textOnLight` never went through the contrast helper, so a
+brand with a PALE scraped primary shipped type at **1.03–1.21:1** on a light plate (AllBirds
+`#ECE9E2` = 1.21:1). The neutral is **17.76:1**. Every real production primary except pure black is
+LESS legible than what replaced it.
+
+**FONT ORDER — `resolveBrandFonts`.** Was: collapse the cascade to ONE family, resolve it, else fall
+to a hardcoded default — so a tier could win and render nothing it named. Now an ordered ladder of
+`[family, requireExact]` pairs; the scraped face outranks the generic `styleTheme` alias **only when
+servable exactly**. Pelagic → Oswald (the owner's report). AllBirds with the file held → still
+DM Sans.
+**TWO HIGH REGRESSIONS IN MY FIRST DRAFT, both caught by independent adversarial review:**
+- Camelback `{fontFamily:'Lora', theme.sans:'DM Sans', theme.serif:'Lora'}` — Lora IS servable, so
+  an unconditional promotion made heading+body+quote ALL Lora and collapsed a deliberate sans/serif
+  pairing. Rule that separates it from Pelagic without a special case: **promote only when the theme
+  does not already name the scraped face in some role.**
+- I had moved the curated-`fontFamily` tier ABOVE the theme, which it never was. Moved back.
+`ownFace` is exact-only too: a claimed file that will not load must yield to the curated theme.
+Reviewers DISAGREED on Camelback (one called it working-as-designed); I judged the collapse a
+degradation. One boolean reverses that if the owner prefers scraped-first everywhere.
+
+**F3 NOW DRIVES THE REAL RESOLVER.** The walk arrived refactored in the shared tree
+(`buildFontLadders` + `resolveLadder(ladder, resolveOne)`, resolver injected); semantics verified
+identical, and it lets the pin exercise the real code over six production brand shapes instead of a
+mirror. Three things that exposed: `check()` was **synchronous**, so a returned promise counted as a
+PASS regardless — a test that could not fail; the order assertion read the requireExact flag out of a
+Map when the scanned family legitimately appears TWICE in the ladder; and `entry || firstInexact` is
+**defensive and currently unreachable** (sharedFamily always re-offers the scanned family
+unrestricted), so it keeps a structural pin with that fact written down. Revert-proven on nine
+mutations; suite 46/46, `verifyProofBeat` 55.
+
+**⚠️ THE POD'S `/tmp` IS PER-SSH-SESSION, NOT PER-POD.** Measured: a manifest written at 08:22:56 was
+gone 30s later in the next `render-ssh` call, `/tmp` empty and freshly stamped. The older note
+("wiped on pod rotation") understates this. **Why it matters beyond convenience:** the pool captures
+each ad's CURRENT `renderUrl` as the baseline, so losing the manifest and re-deriving after an arm
+has run makes the "before" column that arm's own output — comparing an arm against itself, plausibly.
+Every phase artifact is now mirrored into `type_experiment_state` in Mongo keyed by `--run`, restored
+when a local file is missing, and the results column is persisted the instant it is written. Drop
+with `db.type_experiment_state.deleteMany({})`.
+
+**THE THREE ARMS** (`scripts/typeExperimentRun.js`, phases resumable):
+- **A disciplined deterministic** — the shipped engine above. $0.
+- **B per-brand template** (`typeTemplateExtract.js`) — read 2-3 of the brand's OWN gpt-image-2
+  statics with vision, compile the observed type onto a canonical-shaped preset. **9 of 10 brands
+  have usable statics, so NO image generation is needed** — the owner's $0.04-0.07/brand approval
+  goes unspent.
+- **C per-ad autonomy** (`typeAutonomyArm.js`) — owner: *"if we want to set another test that gives
+  the LLM more autonomy, do that also."* Shows the model the ACTUAL frame and lets it choose
+  placement, alignment, casing, weight, size and ink polarity for that ad alone. Four constraints are
+  enforced, not merely requested: no type over a face, black/white only, no scrim, no caps quotes.
+  The engine's face keep-out still runs ON TOP of the model's anchor, so a plan that would land on a
+  face is corrected rather than shipped.
+
+**ADVERSARIAL REVIEW OF ARM B FOUND A SILENT-NO-OP CLASS** — the worst possible outcome, because
+"the template made no difference" and "the template never ran" look identical:
+`sizeScale` was DEAD (guarded `== null`, but canonical already authors it, so the biggest type lever
+never applied — now MULTIPLIES the authored value so canonical's hierarchy survives); a missing
+preset file makes `--preset` fall through to canonical **with only a warning**; and there was no
+zero-delta check. Also: `staticsForBrand` had no `variantKind` filter, so a repurposed **UGC** static
+could have trained a brand's type template. The vision contract now REJECTS rather than clamps —
+caps quotes, weight/tracking ceilings, any scrim, confidence <0.4 — because clamping ships a template
+worse than canonical while reporting success.
+
+**GROK WAS DOWN MID-SESSION** (HTTP 521 on three calls, trivial probe fine → size-related, not
+credits). Fell back to two Sonnet reviewers with different lenses rather than stalling; a smaller
+Grok prompt then worked and found the two HIGH font regressions. Lesson: split the prompt, don't
+retry the same size.
+
+**FONTS FILLED IN FROM LIVE SITES** (owner: *"if needed check on their websites or meta ads"*), read
+from computed styles, not memory: GymShark → **Montserrat** (h1/h2/h3 700; Anton/Druk also loaded),
+Peloton → **Inter**, Soludos 2 → **Newsreader** (the sibling row's stored "Poppins" appears nowhere
+on the live site). Deliberately NOT recorded because an unservable name looks like real data while
+resolving to a lookalike: Vuori (`aktiv-grotesk`, Adobe) and Fellow (`Fellow Solar` + `Sohne`) — both
+already stored correctly, neither renderable. That took the pool from 6 to **10 real client brands**.
+
+**LATENT, NOT MINE TO FIX SILENTLY:** `babyboo-editorial-monochrome.json` sets the **price digits** to
+`colorToken:'accent'` with `accent:#BA3357`, i.e. pink letterforms, and `contrastToken()` never
+remaps `accent` so it gets no plate-adaptive protection either. Six brand-specific presets also set
+`deliveryLine` to `textSecondary`, the dim token the code's own comments warn against. **Every
+`canonical*` and `proto-*` preset is clean** — this is confined to hand-art-directed presets, so it
+only bites a brand pinned via `titleStylePreset`. The pool reports such brands rather than dropping
+them. Owner's call whether to change someone's art direction.
+
+### 0.3005 TYPE EXPERIMENT — OWNER-DIRECTED WORKSTREAM (2026-08-04). Superseded by 0.3006 above.
 
 **Owner verdict on the 17-ad sample** (artifact 3f801888-f0d0-4d28-af66-1ee62078d894): good EXCEPT
 Pelagic (font style regressed — my styleTheme alias moved it Oswald→Montserrat) and BabyBoo
