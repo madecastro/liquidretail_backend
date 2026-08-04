@@ -213,6 +213,79 @@ identical `size` enum is why `verifyStaticSafeBox` still passes — noted in tha
 model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
 no code deploy.
 
+### 0.0g HANDOFF — 2026-08-04. NOTHING IS MERGED. Read this first.
+
+**MERGE STATE: 6 commits on `feat/static-product-fidelity-hardening`, tip `8e655aa`, PUSHED but
+NOT merged and NO PR open.** `origin/main` is at `bee82b7` and does not contain any of it.
+Production therefore still serves the LEGACY prompt with the permissive person clause on
+`gpt-image-2/edit`. Everything below is unshipped.
+
+Commits, oldest first: `bb81717` hardening v1 + kill switch · `63e9d39` pricing correction +
+prompt v2 · `f11934a` revert to non-dev model · `9f8c6f3` person rule · `8686398` identity +
+compression · `8e655aa` revert compression, keep one simple identity sentence.
+
+**The pricing fix in `63e9d39` is a correctness bug independent of all the prompt work** —
+`base_price` under-reports the charge ~7x and `scheduleCostReconcile` gave up too early. That is
+worth merging on its own merits even if every prompt change is rejected.
+
+#### OPEN EXPERIMENT — split the typesetting from the glyphs
+
+Owner's goal: keep `gpt-image-2`'s typesetting *judgement* without letting any model draw the
+glyphs. Driver is the trade in §0.0f — `gpt-image-1.5/edit` + `input_fidelity: high` gives
+**0/12 model swaps and is 62% cheaper**, but breaks the rating string (fabricated counts, a wrong
+`4.4` for 4.6).
+
+**THE CONSTRAINT:** any pixels a model produces for text carry its error. A returned "mask with
+copy" is still model-drawn letterforms. Model output is usable as **position and styling only**.
+
+**PRECEDENT, and it is strong:** this pipeline already does exactly this for the LOGO —
+`directImageRenderService` reserves a corner, forbids the model drawing any logo, and composites
+the real asset locally (`logoPlacementFor` + `layers.push`, `:935-971`). A misspelled rating is
+the same defect class and worse, because it is a proof claim. Extending that slot to the rating
+is the smallest viable version.
+
+**Arms:** A = 20 existing model-typeset renders (free, already on disk).
+B = coherent text-free plate + locally composited type at fixed safe-box placement.
+C = B with placement from a vision-model spec per plate.
+
+**FIRST ATTEMPT WAS INVALID — do not trust `samples13/` or `armB/`.** The text-free block was
+SPLICED into a `social_proof_led` prompt whose attention order still demanded *"the rating and how
+many people gave it / the customer's own words / the CTA"*. Self-contradictory. **All 8 plates
+fabricated proof claims** — invented ratings (4.8), invented counts (6,942 / 734 / 2,391 / 1,952 /
+1,702) and invented testimonials, against real values of 4.6 and 318.
+
+⚠️ **That is a finding worth keeping on its own: a CONTRADICTION anywhere in the prompt can flip
+the model into inventing social proof, with no bad data involved.** The `absences` rules hold when
+the prompt is coherent and fail when it is not. Second contamination-by-splicing of the session
+(the first was the "Triple-strap" description) — **use the genuine code path, never surgery.**
+
+**Corrected runs, in flight at compaction:** empty `data` on `meta_stories_9_16` (the one surface
+with `drawCta:false`), which makes goal, emphasis and absences all adapt together — verified
+coherent, and the harness now ABORTS if the prompt still demands rating/quote/CTA.
+`samples14/` = 1.5+high at `1024x1536` (its enum has no 1152x2048); `samples15/` = gpt-image-2 at
+native `1152x2048`. 8 plates each, ~$0.84.
+
+**Judge on:** do the plates come back genuinely text-free? does either model fabricate proof from
+a COHERENT prompt? Then composite (`<scratchpad>/composite.js`, safe box must be re-set for
+Stories: box top 17.5% / bottom 82.5%, not the square 6/94).
+
+**TWO QUESTIONS FOR THE OWNER, both still unanswered:**
+1. Reserve **just the rating** (where essentially all measured defects live — quote and CTA were
+   correct in 12/12 even on 1.5) or the whole copy block?
+2. The 2026-07-31 retirement of "direct image + exact overlay" — *"nobody liked the output"* — was
+   that the **placement** or the **typography**? If typography, local compositing inherits the
+   problem no matter what chooses the position, and arm C is not worth building.
+
+**Harness/scratchpad map** (`/private/tmp/claude-502/-Volumes-Sayulita-Projects-RS/57cf15d6-ebb6-4803-bc54-5afba3628073/scratchpad/`):
+`render-samples5..15.js` one per cell · `recover.js` re-polls any billed prediction whose image is
+missing (never abandon billed work — poll loops with no deadline, ids ledgered to
+`<out>/predictions.jsonl` before polling) · `sheet.js` / `audit.js` contact sheets ·
+`BRIEF-typesetting-split.md` the test brief · seeds `ref.jpg` shoe, `ref2.jpg` Gymshark Flutter,
+`ref3.jpg` PELAGIC Torrent, `ref4.jpg` Gymshark Campus Crest.
+
+Measured prices: `gpt-image-2/edit` **$0.07593**, `-developer` **$0.03586**, `gpt-image-1.5/edit`
+**$0.0289**. Session spend to date ≈ **$17.75**.
+
 ### 0.0f SHIPPING STATE + THE MEASURED GRID (2026-08-03). READ THIS BEFORE RE-RUNNING ANYTHING.
 
 **SHIPPING STATE: the pre-compression prompt plus ONE sentence.** `WHO WEARS OR HOLDS IT` now
