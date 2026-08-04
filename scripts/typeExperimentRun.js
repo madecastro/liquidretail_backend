@@ -107,11 +107,23 @@ async function recordColumn(name, urlsByAdId, extra = {}) {
   }
   results.meta[name] = { recordedAt: new Date().toISOString(), ...extra };
   writeJson(F.results, results);
-  // AWAITED, not fire-and-forget. The first version pushed the promise onto a
-  // list awaited only at exit, and the write never landed — the state document
-  // held `pool` and nothing else. A dropped session after an arm must not lose the
-  // only record of that arm's URLs, because the next re-title overwrites them.
-  if (!DRY_RUN) await stateSave('results', results);
+  // ATOMIC PER CELL, because whole-document writes lose updates. Several sessions
+  // run arms in parallel (the SSH drop window forces chunking), and each one
+  // restored `results`, added its own column, and wrote the WHOLE document back —
+  // so the last writer silently erased everything the others had recorded since it
+  // started. That is why re-recorded arm-A URLs kept disappearing and no ad ended
+  // up holding both an armA and a distinct armB. Targeted $set touches only the
+  // cells this session actually produced.
+  if (!DRY_RUN) {
+    const set = {};
+    for (const [adId, url] of Object.entries(urlsByAdId)) set[`results.rows.${adId}.${name}`] = url;
+    set[`results.meta.${name}`] = { recordedAt: new Date().toISOString(), ...extra };
+    await mongoose.connection.collection(STATE_COLL).updateOne(
+      { _id: RUN_ID },
+      { $set: { ...set, updatedAt: new Date() }, $addToSet: { 'results.columns': name } },
+      { upsert: true }
+    );
+  }
   const missing = Object.values(urlsByAdId).filter((u) => !u).length;
   log(`📊 column '${name}': ${Object.keys(urlsByAdId).length} ads, ${missing} with no renderUrl`);
 }
@@ -167,13 +179,19 @@ async function stateRestore() {
   }
   log(`state: restored ${restored} artifact(s) from run '${RUN_ID}' (saved ${doc.updatedAt?.toISOString?.() || '?'})`);
 }
-/** Mirror whatever this session produced back into the durable copy. */
+/**
+ * Mirror this session's single-writer artifacts back into the durable copy.
+ *
+ * `results` is DELIBERATELY EXCLUDED: it is written concurrently by parallel arm
+ * chunks and is maintained by atomic per-cell $set in recordColumn. Writing it
+ * wholesale here is exactly what lost other sessions' records.
+ */
 async function statePersist() {
   for (const [key, file] of [['pool', F.pool], ['templates', F.templates],
-    ['autonomy', F.autonomy], ['results', F.results], ['qc', F.qc]]) {
+    ['autonomy', F.autonomy], ['qc', F.qc]]) {
     if (fs.existsSync(file)) await stateSave(key, readJson(file));
   }
-  log(`state: persisted run '${RUN_ID}'`);
+  log(`state: persisted run '${RUN_ID}' (results excluded — written atomically per cell)`);
 }
 
 (async () => {
