@@ -213,6 +213,62 @@ identical `size` enum is why `verifyStaticSafeBox` still passes — noted in tha
 model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
 no code deploy.
 
+### 0.0h TYPESETTING SPLIT — where it actually got to (2026-08-04)
+
+Still an EXPERIMENT. No production code written. Nothing merged.
+
+**OWNER ANSWER that reframed it:** the 2026-07-31 overlay retirement was about
+**TYPOGRAPHY**, not placement. And **"I hate the scrim. no scrim!"** — panels are banned
+outright, so legibility must come from position and ink colour alone.
+
+**PLATES ARE SOLVED.** The genuine no-text path (empty `data` on `meta_stories_9_16`,
+the one surface with `drawCta:false`, so goal/emphasis/absences all adapt) produced
+**16/16 clean text-free plates across two image models, zero fabricated proof.** The
+earlier 8-for-8 invention of ratings and review counts came ENTIRELY from a
+self-contradictory spliced prompt, not from the models. Product fidelity on
+1.5+`input_fidelity:high` plates is excellent.
+
+**BRAND FONT PIPELINE WORKS.** PELAGIC's real face (Archivo Variable) pulled from their
+Shopify CDN — `@font-face` in the homepage HTML, `/cdn/shop/t/587/assets/` — converted
+woff2→ttf with fontTools in a venv, registered via a local `FONTCONFIG_FILE`. Renders
+correctly including the ★ glyph. **Gymshark's face was NOT obtainable** from their site,
+so the Gymshark rows use Archivo too — not brand-accurate, fine for comparing direction.
+
+**FOUR ARMS × THREE BRANDS, all rendered:** `gemini-3.5-flash`, `gpt-5.4`,
+`claude-sonnet-5`, and a STYLE-TRANSFER arm (gpt-5.4 shown gpt-image-2's own finished ad
+as the typography exemplar plus the target plate — the owner's idea, and the arm that
+produced the most confident scale).
+
+**WHAT THE RENDERER HAD TO OWN, because the models got it wrong:**
+1. **Ink colour.** All arms chose white regardless of background; **8 of 11 elements
+   failed 4.5:1 contrast.** The renderer now measures luminance under the real ink box
+   and overrides to near-black/white only when the model's own choice is below 4.5:1.
+   Result: **9/11 fully legible, up from 3/11.**
+2. **Scale.** sonnet and gemini specced 14–36px type on a 1536px frame — captions, not
+   ads. One PROPORTIONAL lift keyed off the quote (floor 3% of height, cap 2.6x), so each
+   model's own hierarchy survives instead of being clamped flat.
+3. **Text measurement.** v1 estimated widths from character counts, which is why panels
+   didn't fit and baselines collided. Now every line is rendered and trimmed to its real
+   ink box; the renderer owns wrapping and the model never gives a baseline.
+
+⚠️ **THE NO-SCRIM CONSTRAINT IS NOT ALWAYS SATISFIABLE.** Two cells still fail contrast
+(`pelagic/sonnet` rating, `flutter/gpt54` rating) because the block sits on a MID-TONE
+region where neither white nor near-black clears 4.5:1. With scrims banned the only fixes
+are to move the block or reject the render. Any real implementation needs that fallback.
+
+**OPEN AESTHETIC QUESTION — the owner's, and it is not settled:** *"I still think the
+GPT2 images might have looked better."* `final-compare.jpg` puts gpt-image-2's own
+typesetting in column 1 against all four composited arms. That judgement is the gate for
+whether any of this gets built. Nobody should write production code before it is answered.
+
+**Scratchpad additions:** `typeset2.js` measured/flowed/no-scrim compositor (exports
+`compose`, `measure`, `contrastUnder`) · `bakeoff.js` four-arm driver · `rerender.js`
+re-renders from saved specs with ZERO API calls · `bake/specs.json` all 11 specs ·
+`bake2/` fixed composites · `final-compare.jpg` the decision sheet · `fonts/`,
+`fc/fonts.conf` the brand-font setup · plates in `samples14/16/17`.
+
+Session spend ≈ **$18.90** — no further image calls were made after this point.
+
 ### 0.0g HANDOFF — 2026-08-04. NOTHING IS MERGED. Read this first.
 
 **MERGE STATE: 6 commits on `feat/static-product-fidelity-hardening`, tip `8e655aa`, PUSHED but
