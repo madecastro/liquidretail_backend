@@ -385,6 +385,17 @@ function collectPrompts(mod, data) {
     ['category-agnostic', 'apparel, footwear, jewellery'],
     ['final check covers framing', 'roughly the same share of the frame'],
     ['do-not-invent catch-all', 'if a word, numeral or mark is not in the text above'],
+    // Owner instruction 2026-08-03. A PELAGIC jacket seeded from an ON-MODEL photo
+    // came back as the jacket lying on a deck with nobody in it — because the
+    // creative-freedom list literally offered "whether a person appears". The
+    // replacement is asymmetric: a person in the reference must stay, a person
+    // absent from it may be added. Pin all three parts; the negative pin below is
+    // the one that matters, since restoring the old clause reopens the hole.
+    ['person-in-reference must stay', 'WHO WEARS OR HOLDS IT'],
+    ['cannot strip the wearer', 'you may NOT remove them and show the item lying on its own'],
+    ['no hanger/mannequin/flat-lay substitute', 'a hanger, a mannequin, a surface or a flat lay'],
+    ['adding a person stays discretionary', 'you may introduce a person or leave it unpeopled'],
+    ['worn-ness excluded from the free list', 'whether the item is worn, which the paragraph above ties to the reference'],
   ];
   for (const [name, needle] of clauses) {
     for (const { intentKey, surface, prompt } of rows) {
@@ -402,6 +413,16 @@ function collectPrompts(mod, data) {
   check('F7 free-list explicitly excludes product size in frame',
     F.includes('deliberately NOT on that list'));
 
+  // THE load-bearing negative pin for the person rule. `whether a person appears`
+  // must be gone from the HARDENED prompt entirely — leaving it in flatly
+  // contradicts WHO WEARS OR HOLDS IT, and the model demonstrably follows the
+  // permissive clause when both are present.
+  for (const { intentKey, surface, prompt } of rows) {
+    check(`F7 ${intentKey}/${surface}: "whether a person appears" is GONE when hardened`,
+      !prompt.includes('whether a person appears'),
+      'the permissive clause is back; it contradicts WHO WEARS OR HOLDS IT');
+  }
+
   // The v2 additions must revert with the flag, like everything else.
   const off = loadIntents('false');
   for (const { intentKey, surface, prompt } of collectPrompts(off, DATA)) {
@@ -411,6 +432,12 @@ function collectPrompts(mod, data) {
       !prompt.includes('approximately the same share of the frame'));
     check(`F7 flag off ${intentKey}/${surface}: no do-not-invent catch-all`,
       !prompt.includes('if a word, numeral or mark is not in the text above'));
+    check(`F7 flag off ${intentKey}/${surface}: no WHO WEARS OR HOLDS IT rule`,
+      !prompt.includes('WHO WEARS OR HOLDS IT'));
+    // And the baseline KEEPS the permissive clause — that is what byte-identity means.
+    check(`F7 flag off ${intentKey}/${surface}: "whether a person appears" RETAINED`,
+      prompt.includes('whether a person appears'),
+      'flag-off must reproduce the measured baseline exactly, permissive clause included');
   }
 }
 

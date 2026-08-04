@@ -632,7 +632,9 @@ If part of the item is not visible in the reference, do not invent or redesign t
 
 PRODUCT SCALE AND FRAMING. The reference photograph also defines how the product is framed, and that carries over. Give the item approximately the same visual prominence and approximately the same share of the frame as the reference does — within about a tenth either way — from approximately the same camera distance and a similar perspective. Do not zoom in dramatically, zoom out dramatically, or crop substantially tighter or wider than the reference. Compose the advertisement around the item at that size: fit the environment to the product, never the product to the environment, and never rescale the item just to make a layout easier. This governs how large the item sits inside the frame; it does not govern the frame itself — the output's dimensions and aspect are fixed by the FORMAT block at the end, and the safe box and reserved corner still apply.
 
-WHAT MAY CHANGE — everything that is not the item itself, and you should change it: the model or models, pose, hands, how and where the item is worn or placed, environment, background, set, props, styling, lighting, shadows, mood, atmosphere, camera angle, focal length, depth of field, the colour grading of the scene, and the typographic treatment of the copy specified below. Build an entirely new scene around the item; do not reuse the reference's background or lighting. Note what is deliberately NOT on that list: the product's size in frame and the camera's distance from it, which the paragraph above holds close to the reference.
+WHO WEARS OR HOLDS IT. If the reference photograph shows the item worn, held or carried by a person, then a person wears or holds it in your image too, the same way, on the same part of the body. You may change who that person is, their pose, their hands and how they are framed — you may NOT remove them and show the item lying on its own, and you may not move a worn garment onto a hanger, a mannequin, a surface or a flat lay. If the reference shows the item by itself, you may introduce a person or leave it unpeopled, whichever makes the better advertisement.
+
+WHAT MAY CHANGE — everything that is not the item itself, and you should change it: who the model is, their pose and hands, environment, background, set, props, styling, lighting, shadows, mood, atmosphere, camera angle, focal length, depth of field, the colour grading of the scene, and the typographic treatment of the copy specified below. Build an entirely new scene around the item; do not reuse the reference's background or lighting. Note what is deliberately NOT on that list: the product's size in frame and the camera's distance from it, which the paragraph above holds close to the reference — and whether the item is worn, which the paragraph above ties to the reference.
 
 ADVERTISING QUALITY. This has to read as work a premium creative agency shipped, not a stock photograph and not a template that was filled in. Make the lighting feel intentional and the typography feel art-directed. Use whitespace deliberately. Keep the product the primary focal point and give it the greatest visual emphasis in the frame. Aim for premium, modern and editorial — and put the inventiveness in the photography, the light and the typography, never in the product and never in the claims.
 
@@ -704,6 +706,30 @@ Set no other words, numerals or letterforms anywhere in the image — including 
     ? 'You are an expert advertising creative director, commercial product photographer and graphic designer.\n\n'
     : '';
 
+  /**
+   * "whether a person appears" — REMOVED from the creative-freedom list when the
+   * hardening is on. Owner instruction 2026-08-03, after live renders: a
+   * PELAGIC jacket seeded from an ON-MODEL photograph came back as the jacket
+   * lying on a deck with nobody in it, in 3 of 6 LEGACY renders and 2 of 6
+   * hardened ones. It was not drift — this clause explicitly handed the model
+   * the choice, and it took it.
+   *
+   * Two reasons that is wrong for apparel: an unworn garment is a weaker ad, and
+   * it discards the fit and drape information PRODUCT_FIDELITY spends a whole
+   * paragraph protecting. It also fights PRODUCT SCALE AND FRAMING, which asks
+   * for the same share of frame as the reference — a person competes for that
+   * area, so dropping them is the cheapest way to comply.
+   *
+   * The replacement rule is ASYMMETRIC and lives in PRODUCT_FIDELITY: if the
+   * reference shows the item worn or held, a person must stay; if it does not,
+   * adding one is discretionary. No new plumbing is needed for that conditional —
+   * `buildPrompt` never learns whether the seed contains a person, but the MODEL
+   * can see the reference and evaluates the condition itself.
+   *
+   * Gated so the flag-off arm stays byte-identical to the measured baseline.
+   */
+  const personClause = FIDELITY_HARDENING ? '' : 'whether a person appears, ';
+
   const prompt = `${rolePreamble}Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
 
 ${FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY}
@@ -718,7 +744,7 @@ That is an order of importance, not a layout, and not a checklist. Express it ho
 
 ${textBlock}
 
-YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, whether a person appears, lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.
+YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, ${personClause}lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.
 
 THIS PRODUCT HAS NONE OF THE FOLLOWING, so none of it may appear:
 ${absent.map(a => `  — ${a}`).join('\n')}

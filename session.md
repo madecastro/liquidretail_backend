@@ -213,6 +213,55 @@ identical `size` enum is why `verifyStaticSafeBox` still passes — noted in tha
 model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
 no code deploy.
 
+### 0.0d THE PERSON RULE — the one prompt change with a MEASURED win (2026-08-03)
+
+Owner instruction, after live renders on real catalog products: **remove the clause letting the
+model decide whether a person appears.** `staticAdIntents.js` line ~721 read
+*"YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, **whether a person
+appears**, lighting and mood…"* — that clause predates all of this work and it is why a PELAGIC
+jacket seeded from an ON-MODEL photo came back as a jacket lying on a deck.
+
+**Replacement is asymmetric** (`WHO WEARS OR HOLDS IT`, inside `PRODUCT_FIDELITY`): if the
+reference shows the item worn/held, a person must wear or hold it the same way — who they are,
+their pose, hands and framing stay free, but they cannot be removed and the garment cannot be
+moved to a hanger, mannequin, surface or flat lay. If the reference shows the item alone, adding
+a person is discretionary. **No plumbing needed for that conditional** — `buildPrompt` never
+learns whether the seed has a person, but the MODEL can see the reference and evaluates it
+itself.
+
+**MEASURED, Pelagic Torrent seed, 12 hardened renders:**
+
+| | product-only renders | colour drift |
+|---|---|---|
+| legacy prompt | 3 of 6 | 1 of 6 |
+| hardened, no person rule | 2 of 6 | 2 of 6 |
+| **hardened + person rule** | **0 of 12** | **0 of 12** |
+
+**Why this matters more than the wording.** The causal chain runs through a rule I added:
+`PRODUCT SCALE AND FRAMING` asks for the same share of frame as the reference, a person competes
+for that area, so dropping the person is the cheapest way to comply — and an unpeopled render is
+where the product drifts. On the Gymshark Campus Crest seed the hardened arm invented a whole
+different product (dark brown tee with a large `GYMSHARK` varsity crest, laurel wreath,
+`EST. 2012`) in **5 of 11** renders against legacy's **2 of 12** — and **4 of those 5 were the
+product-only shots**. Owner's read, confirmed by the data: *"the only ones the shirts changed
+colors are the images where the person was removed."*
+
+So: the framing rule opened a hole and the person rule closes it. Do not remove one without
+re-testing the other.
+
+**STILL OPEN — the Campus Crest case is the first reproducible fidelity failure found, and the
+hardening made it WORSE (45% vs 17%).** Prime suspect is the `PRODUCT:` description, which in
+production is the real catalog title: *"Gymshark Campus Crest T-Shirt, brown"*. The model appears
+to render the NAME — a campus crest, in brown — over the reference, which is exactly what the
+block's "do not infer the product from its category… the reference is correct and your prior is
+wrong" clause is supposed to prevent. A plausible aggravator is the block's long enumeration of
+graphic types ("logos, branding, icons, artwork, patterns, prints, typography…") priming graphic
+output. **Re-measure with the person rule on before drawing conclusions** — the Pelagic re-run
+suggests much of the 45% may have travelled through the product-only path that is now closed.
+
+Pinned by `scripts/verifyStaticFidelityPrompt.js` — 711 checks, revert-proven on three mutations
+(restore the permissive clause, delete the no-flat-lay rule, invert the gate).
+
 ### 0.0c RENDER SAMPLES — run 1 VOID, run 2 in flight
 
 **Run 1 (40 renders, non-dev model, $2.87) is VOID for product fidelity.** The `PRODUCT:`
