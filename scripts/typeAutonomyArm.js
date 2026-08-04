@@ -293,6 +293,12 @@ function compileAdPreset(ad, plan) {
       continue;
     }
     plans[ad.adId] = plan;
+    // Checkpointed per ad: the first arm-C run lost every plan it had paid for when
+    // the SSH session dropped mid-way, because nothing was written until the end.
+    if (OUT) {
+      try { fs.writeFileSync(OUT, JSON.stringify({ generatedAt: new Date().toISOString(), llmCalls: calls, plans, skipped }, null, 2)); }
+      catch (e) { console.warn(`⚠️  checkpoint failed: ${e.message}`); }
+    }
     console.log(`✅ ${ad.brand} ${ad.aspectRatio}: ${plan.placement.zone} / ${plan.headline.align} / ` +
       `${plan.headline.casing} ${plan.headline.weight} x${plan.headline.sizeScale} / ink ${plan.inkOnThisFrame}` +
       `  — ${plan.placement.why}`);
