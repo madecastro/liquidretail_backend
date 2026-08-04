@@ -42,6 +42,7 @@ const FILES = [
   'services/capabilityExecutors/campaignList.js',
   'services/capabilityExecutors/runStatus.js',
   'services/capabilityExecutors/adUpdateCta.js',
+  'services/capabilityExecutors/platformListFormats.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -592,6 +593,52 @@ async function checkLifestyleExecutor() {
 }
 
 // Per-product service structural check — the workflow's unit.
+// PR #10 — platform.listFormats
+console.log('\n[14] platform.listFormats surface coverage');
+
+const platformCap = registry.capabilityById('platform.listFormats');
+assert(platformCap, `capability "platform.listFormats" registered`);
+if (platformCap) {
+  assert(platformCap.tier === 0, `platform.listFormats: tier === 0`);
+  assert(platformCap.scope === 'global', `platform.listFormats: scope === 'global'`);
+}
+
+async function checkPlatformListExecutor() {
+  const exec = require('../services/capabilityExecutors/platformListFormats');
+  // no-scope guard (even a global-scope capability requires auth)
+  const r1 = await exec.run({ req: {}, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `platformListFormats: no-scope → rejects`);
+  // Full catalog fetch (no filter)
+  const r2 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: {}
+  });
+  assert(r2.ok === true, `platformListFormats: no-filter → ok`);
+  if (r2.ok) {
+    assert(Array.isArray(r2.data.formats) && r2.data.formats.length > 0,
+      `platformListFormats: returns non-empty formats[]`);
+    assert(r2.data.formats.every((f) => f.key && f.platform && f.aspectRatio && Array.isArray(f.kinds)),
+      `platformListFormats: every format row has key + platform + aspectRatio + kinds[]`);
+    assert(Array.isArray(r2.data.platforms) && r2.data.platforms.length > 0,
+      `platformListFormats: returns grouped platforms[]`);
+  }
+  // Unknown platform filter
+  const r3 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { platform: 'bogusplatform' }
+  });
+  assert(r3.ok === false && /not found/i.test(r3.error),
+    `platformListFormats: unknown platform → rejects`);
+  // Unknown format key filter
+  const r4 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { formatKey: 'bogus_format_key' }
+  });
+  assert(r4.ok === false && /not found/i.test(r4.error),
+    `platformListFormats: unknown formatKey → rejects`);
+}
+
 async function checkLifestyleUnitService() {
   const svc = require('../services/catalogProductLifestyleImageService');
   assert(typeof svc.generateOne === 'function',
@@ -680,6 +727,7 @@ async function checkSurfaceWideningExecutors() {
   await checkSurfaceWideningExecutors();
   await checkLifestyleExecutor();
   await checkLifestyleUnitService();
+  await checkPlatformListExecutor();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

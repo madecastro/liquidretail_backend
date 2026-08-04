@@ -131,6 +131,27 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'platform.listFormats',
+    title:    'List supported ad surfaces',
+    describe: 'Enumerate every ad surface the platform supports (Meta feed 1:1 / 4:5, Meta reels 9:16, Meta stories 9:16, PMax 16:9, etc.). Returns per-format canvas dims, delivery dims, safe zones, aspect ratio, supported kinds (image / video), status (live / coming_soon), and a one-line creativeBrief describing the surface. Also groups by platform with each platform\'s presets (\'meta_static\', \'meta_video\', \'meta_all\', ...) so the agent can answer both "which formats exist?" and "what does the meta_all preset cover?" without a second call. Optional filters: platform (\'meta\' | \'google\') or formatKey (a specific format).',
+    tier:     0,
+    scope:    'global',
+    args: {
+      type: 'object',
+      properties: {
+        platform:  { type: 'string', description: 'Optional platform filter (e.g. "meta", "google").' },
+        formatKey: { type: 'string', description: 'Optional specific format key (e.g. "meta_feed_4_5"). Returns just that row.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/platformListFormats',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'run.status',
     title:    'Get CampaignRun status',
     describe: 'Return the current status of one CampaignRun (a generation batch) by runId string or ObjectId. Includes counts, ad-level status rollup ({queued, rendering, draft, failed, ...}), and up to 6 recent errors[] rows so the agent can answer "why is my run stuck?" without a second call.',
