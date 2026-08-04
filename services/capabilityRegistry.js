@@ -84,6 +84,31 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'ad.list',
+    title:    'List recent ads',
+    describe: 'List recent ads for the current brand, newest first. Filter by kind (\'image\' | \'video\'), status (queued/rendering/draft/live/archived/failed), and sinceHoursAgo (default 24, cap 168 = 7 days). Returns count + sample rows with renderUrl, template, aspect, status, and timestamps — enough to answer "what did I just generate?" without a follow-up ad.inspect on each.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        kind:    { type: 'string', enum: ['image', 'video'], description: 'Optional filter.' },
+        status:  { type: 'string', enum: ['queued', 'rendering', 'draft', 'live', 'archived', 'failed'], description: 'Optional filter.' },
+        sinceHoursAgo: { type: 'integer', minimum: 1, maximum: 168, description: 'Window in hours (default 24). Cap 168 = 7 days.' },
+        limit:   { type: 'integer', minimum: 1, maximum: 50, description: 'Row cap (default 10). The count is always the full total.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adList',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'ad.inspect',
     title:    'Inspect ad',
     describe: 'Return the generation-inspector payload for one ad — model, prompt, references, warnings, regen state. Same source the Generation Details modal reads.',
