@@ -175,7 +175,29 @@ publishes it *after* the image returns — measured **7 of 38** had it at comple
 `[3s,10s,30s]` → `[3s,10s,30s,60s,120s,300s]`; at the old budget most rows kept a 7x-low
 estimate forever, which is how a static ad appeared to cost $0.01.
 
-### 0.0b STATIC EDIT MODEL → `-developer` variant (owner, 2026-08-03)
+### 0.0b STATIC EDIT MODEL — switched to `-developer`, then REVERTED same day (owner, 2026-08-03)
+
+**FINAL STATE: `openai/gpt-image-2/edit` (the plain variant).** Both `PLATE_EDIT_MODEL`'s code
+default and `AI_DIRECT_IMAGE_EDIT_MODEL` in `config/defaults.env` point there.
+
+The `-developer` variant was adopted for its 50% discount and reverted hours later on measured
+reliability:
+
+| variant | submits | hard `prediction failed` | rate |
+|---|---|---|---|
+| `-developer` | 76 | **13** | **17.1%** |
+| plain | 38 | **0** | 0% |
+
+Three independent developer runs failed at **15.8% / 15.0% / 22.2%** — consistent, not a bad
+afternoon. Each failure is a BILLED submit returning `outputs: null` with no error message,
+which reaches the operator as a failed ad and bills a failure. Cost per SUCCESSFUL render still
+favoured developer ($0.0426 vs $0.0757), so **this was deliberately not a cost decision** — the
+owner chose delivered ads over unit price. Re-measure before reaching for `-developer` again.
+
+The original switch rationale below is kept because the schema/price comparison is worth having
+on record.
+
+### 0.0b-orig The `-developer` switch, as originally written
 
 `PLATE_EDIT_MODEL` default and `AI_DIRECT_IMAGE_EDIT_MODEL` in `config/defaults.env` both
 now point at `openai/gpt-image-2-developer/edit`. **Halves static spend** — a 3-surface

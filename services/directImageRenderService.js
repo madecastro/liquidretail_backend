@@ -43,7 +43,24 @@ const { renderableCopy, artDirectionLook, conceptForRender } = require('./concep
 const { adStage, noteRenderIssue } = require('./adStage');
 
 /**
- * Owner decision 2026-08-03: the `-developer` variant, not the plain one.
+ * REVERTED to the plain variant, owner decision 2026-08-03 — same day the switch
+ * was made, on measured reliability. The `-developer` variant is half price and
+ * schema-identical, but it fails hard far too often:
+ *
+ *     variant      submits   hard `prediction failed`   rate
+ *     -developer     76               13                17.1%
+ *     plain          38                0                 0%
+ *
+ * Three independent runs on the developer model (38 / 20 / 18 submits) failed at
+ * 15.8% / 15.0% / 22.2% — consistent, not a bad afternoon. Each failure is a
+ * BILLED submit that returns `outputs: null` with no error message, which reaches
+ * the operator as a failed ad and bills a failure. Cost per SUCCESSFUL render
+ * still favoured developer ($0.0426 vs $0.0757), so this is deliberately NOT a
+ * cost decision — the owner chose delivered ads over unit price.
+ *
+ * The switch and its reasoning are kept below because the comparison is worth
+ * having on record, and because the developer variant is a legitimate lever if
+ * Atlas ever fixes its reliability. Re-measure before reaching for it again.
  *
  * VERIFIED live before switching, because a model id is never taken from memory
  * (CLAUDE.md §2). Both entries resolve to the same POST
@@ -65,8 +82,21 @@ const { adStage, noteRenderIssue } = require('./adStage');
  * ran both arms on the developer model, so it compares prompts, not models. The
  * schemas and readme are identical and 20 developer renders looked clean, but if
  * output degrades, this is the first thing to put back.
+ *
+ * ⚠️ OPEN — MEASURED RELIABILITY GAP, 38 submits per model on 2026-08-03:
+ *     non-dev    36/38 ok, 0 hard failures (2 poll timeouts, likely completed late)
+ *     developer  32/38 ok, **6 hard `prediction failed`** (15.8%), outputs null,
+ *                no error message, has_nsfw_contents null
+ * Cost per SUCCESSFUL render still favours developer — $0.0426 vs $0.0757, ~44%
+ * cheaper even after paying for the failures — so the money case survives. But a
+ * ~16% hard-failure rate is a PRODUCT problem, not just a cost one: each one is a
+ * charged submit with no asset, which surfaces to the operator as a failed ad and
+ * bills a failure. NOT a controlled comparison (n=38 each, one session, and the two
+ * runs used different prompt text), so treat it as a signal to re-measure, not a
+ * verdict. If static failure rates rise after this ships, revert via
+ * AI_DIRECT_IMAGE_EDIT_MODEL before investigating anything else.
  */
-const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2-developer/edit';
+const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
 // should never be a text to image fallback period" / "if there is no image
 // there is no generation" — the taggedError thrown below when refs.length is 0
