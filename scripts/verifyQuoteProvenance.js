@@ -160,7 +160,8 @@ for (const [label, raw, expected] of [
 
 // ── P3: rating bounds and formatting ────────────────────────────────────
 // Deliberate contract change (not a test bent to pass): owner rule
-// "we only use stars over 4.5" — exclusive floor at RATING_STAR_MIN (4.5).
+// Owner 2026-08-04: "anything above a 4.4 is acceptable" — exclusive floor at
+// RATING_STAR_MIN (4.39), applied to the ROUNDED display value so a shown 4.4 prints.
 // Gate is on the rounded DISPLAY value: raw 4.51 must not print as "4.5".
 const { formatDisplayRating, RATING_STAR_MIN } = require('../services/ratingDisplay');
 const RATINGS = [
@@ -168,21 +169,23 @@ const RATINGS = [
   [-1, undefined, 'negative'],
   [6, undefined, 'above the 5-star scale'],
   [87, undefined, 'a 0-100 scale vendor would print "87 stars"'],
-  [4, undefined, 'below the 4.5 floor'],
-  [4.4, undefined, '4.4 rounds to 4.4, still under floor'],
-  [4.5, undefined, 'exactly 4.5 is NOT over 4.5 (exclusive floor)'],
-  // Finding 1 boundary: raw > 4.5 but displayed === 4.5 must withhold.
-  [4.51, undefined, '4.51 rounds to 4.5 — must not print the forbidden floor'],
-  [4.55, undefined, '4.55 rounds to 4.5 (JS toFixed) — same raw-gate hole'],
+  [4, undefined, 'below the floor'],
+  [4.3, undefined, 'a displayed 4.3 is under the 4.39 floor'],
+  [4.34, undefined, '4.34 rounds to 4.3 — the rounding trap, one step down'],
+  [4.4, '4.4', 'a DISPLAYED 4.4 prints: the owner\'s 2026-08-04 change'],
+  [4.44, '4.4', '4.44 rounds to 4.4 and prints'],
+  [4.5, '4.5', 'above the 4.39 floor'],
+  [4.51, '4.5', 'raw 4.51 displays 4.5, which now clears the floor'],
+  [4.55, '4.5', 'JS toFixed puts 4.55 at "4.5", and that prints now'],
   [4.6, '4.6', 'just over the floor still prints'],
   [4.66, '4.7', '4.66 rounds to 4.7 and prints'],
   [4.666666, '4.7', 'a raw float is rounded, not printed in full'],
   [5, '5', 'top of scale'],
-  ['4.5', undefined, 'a string is not a number'],
+  ['4.5', undefined, 'a string is not a number — type strictness is unchanged'],
   [null, undefined, 'null'],
   [NaN, undefined, 'NaN']
 ];
-check('P3 RATING_STAR_MIN is 4.5', RATING_STAR_MIN === 4.5);
+check('P3 RATING_STAR_MIN is 4.39', RATING_STAR_MIN === 4.39);
 for (const [value, expected, why] of RATINGS) {
   const d = direct.buildIntentData({
     concept: {}, layoutInput: { social_proof: { rating_value: value } }, brand: {}, cta: 'X'

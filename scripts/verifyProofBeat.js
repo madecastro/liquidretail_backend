@@ -120,13 +120,26 @@ check('R4 count prints WITHOUT stars when opted in (the GymShark case)', () => {
 });
 
 check('R5 opting in cannot invent a count that does not exist (AllBirds)', () => {
-  const r = resolveAtomicRatingPair({
+  // A displayed 4.4 now CLEARS the floor (owner, 2026-08-04), so this case no
+  // longer proves its point by failing the gate — it proves it where it matters:
+  // the stars print and the count stays absent rather than being fabricated.
+  const printable = resolveAtomicRatingPair({
     productRating: 4.4, productReviewCount: null,
     brandRating: null, brandReviewCount: null, brandAttribution: 'allbirds.com',
     allowBrandCountWithoutStars: true,
   });
-  assert.strictEqual(r.source, null);
-  assert.strictEqual(r.reviewsText, null);
+  assert.strictEqual(printable.rating, '4.4', 'a displayed 4.4 is printable under the new floor');
+  assert.strictEqual(printable.reviewCount, null, 'no count exists');
+  assert.strictEqual(printable.reviewsText, null, 'and none may be invented');
+  // Below the floor, nothing prints at all — neither stars nor a count.
+  const belowFloor = resolveAtomicRatingPair({
+    productRating: 4.3, productReviewCount: null,
+    brandRating: null, brandReviewCount: null, brandAttribution: 'allbirds.com',
+    allowBrandCountWithoutStars: true,
+  });
+  assert.strictEqual(belowFloor.source, null);
+  assert.strictEqual(belowFloor.rating, null);
+  assert.strictEqual(belowFloor.reviewsText, null);
 });
 
 check('R6 ATOMICITY — a brand count never rides a product rating', () => {
@@ -152,22 +165,35 @@ check('R7 ATOMICITY — the count-only path never borrows the PRODUCT count', ()
   assert.strictEqual(r.source, null);
 });
 
-check('R8 the rounding trap still withholds stars (4.51/4.55 display as 4.5)', () => {
-  for (const raw of [4.51, 4.54, 4.55, 4.5]) {
-    assert.strictEqual(formatDisplayRating(raw), undefined, `${raw} must be withheld`);
+check('R8 the rounding trap still bites, at the NEW floor (4.31/4.34 display as 4.3)', () => {
+  // THE TRAP MOVED, IT DID NOT GO AWAY. The floor became 4.39 on 2026-08-04 so a
+  // DISPLAYED 4.4 prints (owner: "anything above a 4.4 is acceptable"). The gate is
+  // still strict `>` on the ROUNDED value, so the same trap now sits one step down:
+  // a raw 4.34 displays as "4.3" and is refused even though it is numerically
+  // above 4.3. Re-anchored rather than deleted — the rounding contract is the point.
+  for (const raw of [4.31, 4.34, 4.3, 4.2]) {
+    assert.strictEqual(formatDisplayRating(raw), undefined, `${raw} displays as <=4.3 and must be withheld`);
   }
+  // And everything the owner's change was FOR now prints.
+  assert.strictEqual(formatDisplayRating(4.4), '4.4');
+  assert.strictEqual(formatDisplayRating(4.44), '4.4');
+  assert.strictEqual(formatDisplayRating(4.5), '4.5', 'a displayed 4.5 no longer falls in the trap');
+  assert.strictEqual(formatDisplayRating(4.51), '4.5');
   assert.strictEqual(formatDisplayRating(4.6), '4.6');
   assert.strictEqual(formatDisplayRating(4.66), '4.7');
   assert.strictEqual(formatDisplayRating(5), '5');
 });
 
 check('R9 a suppressed rating with a rounding-trap value still shows its count', () => {
+  // Re-anchored to the new boundary: 4.34 displays as "4.3", which the 4.39 floor
+  // refuses, so the count still prints without stars. 4.54 now PASSES and would no
+  // longer exercise this path at all.
   const r = resolveAtomicRatingPair({
-    brandRating: 4.54, brandReviewCount: 8343, brandAttribution: BRAND_LABEL,
+    brandRating: 4.34, brandReviewCount: 8343, brandAttribution: BRAND_LABEL,
     allowBrandCountWithoutStars: true,
   });
   assert.strictEqual(r.source, 'brand-count');
-  assert.strictEqual(r.rating, null, '4.54 rounds to 4.5 — stars stay withheld');
+  assert.strictEqual(r.rating, null, '4.34 rounds to 4.3 — stars stay withheld');
   assert.strictEqual(r.reviewCount, 8343);
 });
 

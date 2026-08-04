@@ -50,7 +50,11 @@ console.log('\nverifyQuoteGate\n');
 
 // ── A. one threshold, and it is 4.5 ──────────────────────────────────
 console.log('A. a single star threshold');
-check('QUOTE_MIN_RATING is 4.5', QUOTE_MIN_RATING, 4.5);
+// 4.35 as of 2026-08-04. The STAR floor moved to 4.39 so a displayed 4.4 prints;
+// left at 4.5 this gate would filter out a 4.4-rated product's own reviewers while
+// its stars showed. 4.35 not 4.4 because this gate reads the RAW rating, and a raw
+// 4.37 displays as 4.4. Owner chose to keep the two gates coherent.
+check('QUOTE_MIN_RATING is 4.35', QUOTE_MIN_RATING, 4.35);
 truthy('no second threshold constant is exported', svc.MIN_STARS_FOR_AD === undefined);
 
 // ── B. scale normalization ───────────────────────────────────────────
@@ -75,17 +79,23 @@ check('a real 0 is a real rating',      toFiveScale(0),         0);
 console.log('\nC. gateQuotesByRating drops reviews the reviewer scored low');
 const gated = quiet(() => gateQuotesByRating([
   { text: 'five star',        rating: 5   },
-  { text: 'exactly the bar',  rating: 4.5 },
-  { text: 'just under',       rating: 4.4 },
+  { text: 'old bar',          rating: 4.5 },
+  // 4.4 USED to be "just under" the 4.5 gate. It now passes, which is the point of
+  // the 2026-08-04 change: a 4.4-rated product may quote its own reviewers, the
+  // same reviewers whose stars it is allowed to display.
+  { text: 'a 4.4 reviewer',   rating: 4.4 },
+  { text: 'below the new bar', rating: 4.3 },
   { text: 'four star',        rating: 4   },
   { text: 'one star',         rating: 1   },
   { text: 'ninety percent',   rating: 90  },
   { text: 'sixty percent',    rating: 60  },
   { text: 'no rating at all' }
 ], 'test'));
-check('keeps only >= 4.5 (normalized), plus unrated',
+check('keeps only >= 4.35 (normalized), plus unrated',
   gated.map(q => q.text),
-  ['five star', 'exactly the bar', 'ninety percent', 'no rating at all']);
+  ['five star', 'old bar', 'a 4.4 reviewer', 'ninety percent', 'no rating at all']);
+check('a 4.3 reviewer is still dropped — the floor moved, it did not vanish',
+  gated.some(q => q.text === 'below the new bar'), false);
 check('a 4-star review does not survive the gate',
   gated.some(q => q.text === 'four star'), false);
 check('60/100 is 3 stars and is dropped, not read as 60',

@@ -1489,7 +1489,21 @@ function toFiveScale(rating) {
 //
 // Applies to reviews only. Instagram comments and LLM-authored lines carry no
 // star rating and are gated by sentiment elsewhere.
-const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.5);
+// QUOTE ELIGIBILITY FLOOR — which reviewers may be QUOTED. Distinct from the STAR
+// floor (ratingDisplay.RATING_STAR_MIN), which governs which NUMBER may print.
+//
+// 4.35 as of 2026-08-04, following the owner moving the star floor so a DISPLAYED
+// 4.4 prints. Left at 4.5 the two gates contradict each other on one ad: a
+// 4.4-rated product would show "4.4 ★★★★★" while its own reviewers' words were
+// filtered out, and the quote beside its stars would come from the category or
+// brand tier instead. Owner chose to keep them coherent.
+//
+// WHY 4.35 AND NOT 4.4. This gate compares the RAW rating via toFiveScale, not the
+// rounded display value the star gate uses. A raw 4.37 DISPLAYS as 4.4, so it
+// prints stars; a 4.4 cut-off here would still refuse to quote that reviewer.
+//
+// Env-tunable via config/defaults.env, so the floor can move without a deploy.
+const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.35);
 
 // ── LIMITATIONS ARE NOT TESTIMONIALS ───────────────────────────────────
 //

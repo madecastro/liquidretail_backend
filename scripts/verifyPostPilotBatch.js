@@ -96,7 +96,7 @@ console.log('\nverifyPostPilotBatch\n');
 // ═══════════════════════════════════════════════════════════════════════
 console.log('A. atomic rating pair (product first, brand fallback, never mix)');
 
-check('A0 star floor is 4.5', RATING_STAR_MIN, 4.5);
+check('A0 star floor is 4.39 (owner 2026-08-04: "anything above a 4.4 is acceptable"; 4.39 so a DISPLAYED 4.4 clears a strict >)', RATING_STAR_MIN, 4.39);
 
 // Product pair present and above gate → used (brand ignored)
 {
@@ -128,7 +128,10 @@ check('A0 star floor is 4.5', RATING_STAR_MIN, 4.5);
   check('A2 honest attribution marker', r.reviewsText, '8900 brand reviews');
 }
 
-// Product exactly 4.5 fails gate (strictly greater)
+// Boundary re-anchored 2026-08-04: the floor moved to 4.39 so a DISPLAYED 4.4
+// prints (owner: "anything above a 4.4 is acceptable"). A product 4.5 therefore
+// now CLEARS the gate and keeps its own pair — it must NOT fall through to brand,
+// because falling through is what breaks atomicity.
 {
   const r = resolveAtomicRatingPair({
     productRating: 4.5,
@@ -137,8 +140,23 @@ check('A0 star floor is 4.5', RATING_STAR_MIN, 4.5);
     brandReviewCount: 100,
     brandAttribution: 'allbirds.com',
   });
-  check('A3 product 4.5 fails gate → brand', r.source, 'brand');
-  check('A3 brand rating', r.rating, '4.9');
+  check('A3 product 4.5 now clears the gate and stays product', r.source, 'product');
+  check('A3 product rating', r.rating, '4.5');
+  check('A3 product keeps its OWN count, never the brand count', r.reviewCount, 50);
+}
+
+// ...and a product BELOW the new floor still falls through to brand.
+{
+  const r = resolveAtomicRatingPair({
+    productRating: 4.3,
+    productReviewCount: 50,
+    brandRating: 4.9,
+    brandReviewCount: 100,
+    brandAttribution: 'allbirds.com',
+  });
+  check('A3b product 4.3 fails the floor → brand', r.source, 'brand');
+  check('A3b brand rating', r.rating, '4.9');
+  check('A3b brand count, not the product count', r.reviewCount, 100);
 }
 
 // Brand rating without count → rating, no count (never product's count)
@@ -193,9 +211,15 @@ check('A7 attribution prefers domain', brandAttributionLabel({
 check('A8 attribution falls back to name', brandAttributionLabel({
   name: 'Allbirds',
 }), 'Allbirds');
-check('A9 formatDisplayRating still gates 4.51 as withhold',
-  formatDisplayRating(4.51), undefined);
-// 4.55 → toFixed(1) is "4.5" under IEEE (withheld); 4.6 is the first clean pass.
+// Re-anchored 2026-08-04: the floor is 4.39, so a raw 4.51 (displays "4.5") now
+// PASSES — that is the owner's change, not a regression. The rounding contract is
+// re-pinned one step down, where it still bites: raw 4.34 displays as "4.3".
+check('A9 formatDisplayRating passes 4.51 under the 4.39 floor',
+  formatDisplayRating(4.51), '4.5');
+check('A9b the rounding trap moved down, not away (4.34 displays 4.3)',
+  formatDisplayRating(4.34), undefined);
+check('A9c a displayed 4.4 prints — the case the owner asked for',
+  formatDisplayRating(4.4), '4.4');
 check('A10 formatDisplayRating passes 4.6',
   formatDisplayRating(4.6), '4.6');
 
