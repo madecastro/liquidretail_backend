@@ -50,9 +50,19 @@ const { gateLayoutInputQuotes } = require('../services/brandScriptExecutor');
 
 let pass = 0;
 const failures = [];
+// A check may return a PROMISE (F3 drives the real async resolver). A plain
+// `try { fn() }` would count a rejected promise as a pass — a test that cannot
+// fail — so async results are collected and awaited before the report.
+const pending = [];
 function check(label, fn) {
-  try { fn(); pass++; }
-  catch (err) { failures.push(`${label}: ${err.message}`); }
+  try {
+    const out = fn();
+    if (out && typeof out.then === 'function') {
+      pending.push(out.then(() => { pass++; }, (err) => { failures.push(`${label}: ${err.message || err}`); }));
+    } else {
+      pass++;
+    }
+  } catch (err) { failures.push(`${label}: ${err.message}`); }
 }
 
 const BRAND_LABEL = 'gymshark.com';
@@ -991,129 +1001,99 @@ check('F2 the scraped brand family and both styleTheme spellings are consulted',
 });
 
 check('F3 the scraped face wins only when it can actually be served', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+  // THIS CHECK DRIVES THE REAL CODE, not a mirror of it. buildFontLadders and
+  // resolveLadder are exported and resolveLadder takes its resolver as an
+  // argument, so the actual tier order and the actual walk can be exercised
+  // offline with a fake resolver. That closes the mirror-vs-wiring gap: a mirror
+  // cannot catch a wiring revert, which is why other rules here need two checks.
+  const { buildFontLadders, resolveLadder } = require('../services/fontResolverService');
 
-  // WIRING. The naive reading of the owner's note — "put the scraped family
-  // first" — breaks the licence-hold case in the other direction: AllBirds'
-  // scraped face is "Self Modern", and with the file held back there is nothing
-  // to serve, so the curated "DM Sans" is the correct answer. The bare scraped
-  // tier therefore carries requireExact, and the walker must honour it.
-  // Asserted PER ROLE. A whole-file regex passes while only one of the two
-  // ladders still carries the flag — the first revert-proof of this check hit
-  // exactly that, so "somewhere in the file" is not a pin.
-  const ladders = src.slice(src.indexOf('const ladders = {'), src.indexOf('// Kept for diagnostics'));
-  const roleLadder = (role, next) => {
-    const start = ladders.indexOf(`${role}: [`);
-    assert.ok(start > -1, `${role} ladder must exist`);
-    return ladders.slice(start, next ? ladders.indexOf(`${next}: [`) : undefined);
+  // `exact` mirrors resolveFamily's contract: an ingested custom file or a real
+  // Google family is exact; a tone-based library substitution is not.
+  const GOOGLE = new Set(['Oswald', 'Montserrat', 'DM Sans', 'Playfair Display', 'Lora', 'Inter']);
+  const fakeResolver = (ownedFiles) => async (family) => {
+    if (ownedFiles.includes(family)) return { family, exact: true, source: 'custom' };
+    if (GOOGLE.has(family)) return { family, exact: true, source: 'google' };
+    return { family: 'Inter', exact: false, source: 'library-match' };
   };
-  for (const [role, next] of [['heading', 'body'], ['body', 'quote']]) {
-    const l = roleLadder(role, next);
-    assert.ok(/\[scannedPromoted,\s*true\]/.test(l),
-      `the ${role} scraped tier must require an exact resolution`);
-    // ownFace is exact-only too: we claim it only because a usable file was
-    // found, so if that file will not load, a curated theme beats a lookalike.
-    assert.ok(/\[ownFace,\s*true\]/.test(l),
-      `the ${role} owned-face tier must require exactness so a failed file yields to the theme`);
-  }
-  // THE PROMOTION IS CONDITIONAL. Camelback proved an unconditional one wrong:
-  // {fontFamily:'Lora', theme.sans:'DM Sans', theme.serif:'Lora'} — Lora IS a
-  // real Google family, so promoting it unconditionally made heading, body AND
-  // quote all Lora and collapsed a deliberate sans/serif pairing. When the theme
-  // already names the scraped face, the theme is a considered pairing.
-  assert.ok(/scannedPromoted\s*=\s*scannedFamily && !themeFamilies\.includes\(familyKey\(scannedFamily\)\)/.test(src),
-    'the promotion must be withheld when the curated theme already names the scraped face');
-  assert.ok(/themeFamilies\s*=\s*\[themeHeading, themeBody, themeQuote\]/.test(src),
-    'all three theme roles must be consulted — a pairing can name the face in any role');
-  const walker = src.slice(src.indexOf('for (const [rawFamily, requireExact]'), src.indexOf('if (!entry) entry = firstInexact'));
-  assert.ok(walker.length > 100, 'the ladder walker must exist');
-  assert.ok(/candidate\.exact === false/.test(walker),
-    'exactness must be read off the resolved entry, not guessed from the family name');
-  assert.ok(/if \(requireExact\) continue;/.test(walker),
-    'a requireExact tier must yield when its resolution is a substitution');
-  assert.ok(/firstInexact/.test(walker) && /if \(!entry\) entry = firstInexact/.test(src),
-    'the closest substitution must survive as the fallback — never jump straight to the role default');
-  // The old single-winner shape must be gone, or the ladder is decorative.
-  assert.ok(!/heading: normalizeFontFamily\(overrides\.heading/.test(src),
-    'the collapsed single-winner cascade must be replaced, not shadowed');
-
-  // THE RULE, mirrored, over the four real production cases. `exact` mirrors
-  // resolveFamily: a custom ingested file or a real Google family is exact; a
-  // tone-based library substitution is not.
-  const walk = (ladder, resolve) => {
-    let firstInexact = null;
-    for (const [family, requireExact] of ladder) {
-      if (!family) continue;
-      const c = resolve(family);
-      if (!c) continue;
-      if (c.exact === false) {
-        if (!firstInexact) firstInexact = c;
-        if (requireExact) continue;
-      }
-      return c.family;
-    }
-    return firstInexact ? firstInexact.family : null;
-  };
-  const GOOGLE = new Set(['Oswald', 'Montserrat', 'DM Sans', 'Playfair Display', 'Lora']);
-  const resolver = (ownedFiles) => (family) => {
-    if (ownedFiles.includes(family)) return { family, exact: true };
-    if (GOOGLE.has(family)) return { family, exact: true };
-    return { family: 'Inter', exact: false }; // library substitution
-  };
-  // Mirrors the real ladder shape, INCLUDING the conditional promotion and the
-  // curated tier's position below the theme. `themeRoles` is every family the
-  // curated theme names, because a pairing can name the scraped face in any role.
-  const ladderFor = ({ ownFace = null, scanned = null, theme = null, themeRoles = null,
-                       curated = false, shared = null }) => {
-    const named = (themeRoles || [theme]).filter(Boolean);
-    const promoted = scanned && !named.includes(scanned) ? scanned : null;
-    return [
-      [null, false], [ownFace, true], [promoted, true], [theme, false],
-      [curated ? scanned : null, false], [null, false], [null, false], [shared, false],
-    ];
+  const headingFor = async (brand, ownedFiles = []) => {
+    const { ladders } = buildFontLadders(brand, {});
+    const walked = await resolveLadder(ladders.heading, fakeResolver(ownedFiles));
+    return walked.entry ? walked.entry.family : null;
   };
 
-  // Pelagic: scraped Oswald IS a Google family and the theme names it nowhere →
-  // it beats theme Montserrat. This is the owner's reported regression.
-  assert.strictEqual(
-    walk(ladderFor({ scanned: 'Oswald', theme: 'Montserrat', themeRoles: ['Montserrat', 'Playfair Display'],
-      shared: 'Oswald' }), resolver([])),
-    'Oswald', 'a Google-servable scraped face must beat the generic theme alias');
-  // Camelback: the curated theme ALREADY names the scraped face as its serif, so
-  // the pairing stands and heading stays the theme's sans. Promoting Lora here
-  // would make heading+body+quote all Lora.
-  assert.strictEqual(
-    walk(ladderFor({ scanned: 'Lora', theme: 'DM Sans', themeRoles: ['DM Sans', 'Lora'], shared: 'Lora' }),
-      resolver([])),
-    'DM Sans', 'a curated pairing that already names the scraped face must not be overridden');
-  // AllBirds, file held: "Self Modern" resolves only to a substitution, so the
-  // curated theme is right — this is the case a naive "scanned first" breaks.
-  assert.strictEqual(
-    walk(ladderFor({ scanned: 'Self Modern', theme: 'DM Sans', shared: 'Self Modern' }), resolver([])),
-    'DM Sans', 'an unservable scraped face must yield to the curated theme');
-  // Same, but with fontFamily ALSO curated — the tier that the first draft put
-  // above the theme. An operator confirming an unservable name must not lock a
-  // library lookalike over a servable curated theme family.
-  assert.strictEqual(
-    walk(ladderFor({ scanned: 'Self Modern', theme: 'DM Sans', curated: true, shared: 'Self Modern' }),
-      resolver([])),
-    'DM Sans', 'a curated-but-unservable fontFamily must still yield to the theme');
-  // AllBirds, file ingested: the owned face wins outright, licence gate upstream.
-  assert.strictEqual(
-    walk(ladderFor({ ownFace: 'Self Modern', scanned: 'Self Modern', theme: 'DM Sans', shared: 'Self Modern' }),
-      resolver(['Self Modern'])),
-    'Self Modern', 'a held brand file outranks everything below it');
-  // Owned face whose FILE fails to load (CDN miss): exact-only, so it yields to
-  // the curated theme rather than locking a tone-matched guess.
-  assert.strictEqual(
-    walk(ladderFor({ ownFace: 'Self Modern', scanned: 'Self Modern', theme: 'DM Sans', shared: 'Self Modern' }),
-      resolver([])),
-    'DM Sans', 'a claimed brand file that will not load must yield to the theme');
-  // Vuori: "Aktiv Grotesk" is neither ingested nor Google, and there is no theme
-  // — the closest library face must still be used, exactly as before.
-  assert.strictEqual(
-    walk(ladderFor({ scanned: 'Aktiv Grotesk', shared: 'Aktiv Grotesk' }), resolver([])),
-    'Inter', 'with nothing servable the substitution must still render');
+  const cases = [
+    // Pelagic, the owner's reported regression: the scraped face is a real Google
+    // family and the theme names it nowhere, so it beats the theme alias.
+    ['pelagic', { name: 'Pelagic Gear', fontFamily: 'Oswald', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'Montserrat', serifFontFamily: 'Playfair Display' } }, [], 'Oswald'],
+    // Camelback: the curated theme ALREADY names the scraped face as its serif, so
+    // the pairing stands. Promoting Lora here made heading+body+quote all Lora.
+    ['camelback', { name: 'Camelback', fontFamily: 'Lora', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans', serifFontFamily: 'Lora' } }, [], 'DM Sans'],
+    // AllBirds with the file held back: 'Self Modern' can only substitute, so the
+    // curated theme is correct. This is the case a naive "scanned first" breaks.
+    ['allbirds-held', { name: 'AllBirds', fontFamily: 'Self Modern', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans' } }, [], 'DM Sans'],
+    // Same, but with fontFamily ALSO curated — the tier an earlier draft wrongly
+    // promoted above the theme, which locked a library lookalike.
+    ['allbirds-curated-held', { name: 'AllBirds', fontFamily: 'Self Modern',
+      curatedFields: ['styleTheme', 'fontFamily'], styleTheme: { sansFontFamily: 'DM Sans' } }, [], 'DM Sans'],
+    // AllBirds with the file ingested: the brand's own face wins outright.
+    ['allbirds-owned', { name: 'AllBirds', fontFamily: 'Self Modern', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans' },
+      customFonts: [{ family: 'Self Modern', url: 'https://x/f.woff2' }] }, ['Self Modern'], 'Self Modern'],
+    // Same brand, but the file we CLAIM to hold does not actually load (CDN miss,
+    // corrupt cache). ownFace is exact-only precisely for this: a curated theme
+    // family we can serve beats a tone-matched guess. Without the flag this
+    // returns the library substitution instead, and nothing else catches it.
+    ['allbirds-file-fails', { name: 'AllBirds', fontFamily: 'Self Modern', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans' },
+      customFonts: [{ family: 'Self Modern', url: 'https://x/f.woff2' }] }, [], 'DM Sans'],
+    // Vuori: nothing servable and no theme — the closest library face must still
+    // render, exactly as before the change.
+    ['vuori', { name: 'Vuori Clothing', fontFamily: 'Aktiv Grotesk' }, [], 'Inter'],
+  ];
+
+  return Promise.all(cases.map(async ([label, brand, owned, expected]) => {
+    const got = await headingFor(brand, owned);
+    assert.strictEqual(got, expected, `${label}: heading resolved '${got}', expected '${expected}'`);
+  })).then(() => {
+    // ORDER, read off the real ladder rather than a regex over the source.
+    const { ladders } = buildFontLadders({
+      name: 'X', fontFamily: 'Oswald', curatedFields: ['styleTheme', 'fontFamily'],
+      styleTheme: { sansFontFamily: 'Montserrat' },
+    }, {});
+    const families = ladders.heading.map(([f]) => f);
+    const idx = (f) => families.indexOf(f);
+    assert.ok(idx('Oswald') > -1 && idx('Montserrat') > -1, 'both the scraped face and the theme must be present');
+    assert.ok(idx('Oswald') < idx('Montserrat'), 'an exactly-servable scraped face must outrank the theme alias');
+    // The scanned family appears TWICE for this brand shape — once as the promoted
+    // exact-only tier and again as the curated tier below the theme — so the flag
+    // must be read at the first occurrence's index, not looked up by family.
+    assert.strictEqual(ladders.heading[idx('Oswald')][1], true,
+      'the promoted scraped tier must be exact-only');
+    // The curated-fontFamily tier is the SECOND occurrence of the scanned family,
+    // and it must sit BELOW the theme.
+    const lastOswald = families.lastIndexOf('Oswald');
+    assert.ok(lastOswald > idx('Montserrat'),
+      'a curated-but-unservable fontFamily must yield to a curated theme family we can serve');
+    // The quote ladder must never carry the brand's sans face directly.
+    const quoteFamilies = ladders.quote.map(([f]) => f).filter(Boolean);
+    assert.ok(!quoteFamilies.includes('Oswald') || quoteFamilies.indexOf('Oswald') === quoteFamilies.length - 1,
+      'the quote role must not take the scraped sans face above its own tiers');
+
+    // STRUCTURAL, and deliberately so. The `entry || firstInexact` fallback is
+    // DEFENSIVE and currently unreachable: sharedFamily always re-offers the
+    // scanned family with requireExact false, so a rejected exact-only tier is
+    // always given a second, unrestricted chance. No brand shape can therefore
+    // exercise it behaviourally — and removing it survived every behavioural case
+    // above. It still must not be deleted, because it is the only thing standing
+    // between a future ladder edit and a silent jump to the role default.
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+    assert.ok(/entry \|\| firstInexact/.test(src),
+      'the closest substitution must survive as the fallback — never jump straight to the role default');
+  });
 });
 
 // ── A: a product-tier rating names its product ──────────────────────────
@@ -1275,9 +1255,12 @@ check('M1 the canonical family ships no CTA on Meta formats, but keeps it on lan
 
 // ── report ─────────────────────────────────────────────────────────────
 
-if (failures.length) {
-  console.error(`\n❌ verifyProofBeat: ${failures.length} failed, ${pass} passed`);
-  for (const f of failures) console.error(`   - ${f}`);
-  process.exit(1);
-}
-console.log(`✅ verifyProofBeat: ${pass}/${pass} checks passed`);
+(async () => {
+  await Promise.all(pending);
+  if (failures.length) {
+    console.error(`\n❌ verifyProofBeat: ${failures.length} failed, ${pass} passed`);
+    for (const f of failures) console.error(`   - ${f}`);
+    process.exit(1);
+  }
+  console.log(`✅ verifyProofBeat: ${pass}/${pass} checks passed`);
+})();
