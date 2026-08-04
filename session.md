@@ -104,6 +104,136 @@ of its four claims were wrong. Read §0 CORRECTIONS before anything else.
 
 ---
 
+## 0.0 STATIC PROMPT — product-fidelity hardening (2026-08-03, UNCOMMITTED)
+
+Owner-directed. Targets **product drift** on the gpt-image-2 direct static path:
+hallucinated logos, shifted colour, altered fit, "improved" construction.
+
+**There is ONE prompt builder, not three.** The owner expected three; the three are the
+three *intents* (`social_proof_led`, `product_first_lifestyle`, `objection_resolved`),
+which all share `staticAdIntents.buildPrompt`. Hardening that one function covers all
+three. `aiImageReferenceService.buildPrompt` and `aiLayoutStudioService.buildGenerationPrompt`
+are also gpt-image prompts but are **not** on this path (shadow artifact, default
+`AI_IMAGE_REFERENCE_ENABLED=false`; and layout exploration never delivered as an ad) — both
+were deliberately left alone.
+
+**Changed** (`services/staticAdIntents.js`, `+133`):
+- `PRODUCT_FIDELITY` — replaces the one hedged sentence that was losing to the creative
+  instructions below it. Source-of-truth, no category/brand-prior inference, preserve
+  form / construction / surface / colour / on-item graphics / details / condition, a NEVER
+  list, a hidden-geometry rule, an explicit WHAT MAY CHANGE list, and a closing check.
+- Carve-outs in `absences` and both `textBlock` branches so the no-added-text rules cannot
+  strip the product's **own** printed label. That conflict **predates** this work: those rules
+  ban marks "on packaging or clothing within the scene" and on this catalog the product often
+  IS the packaging or the clothing. Every carve-out is anchored to *"visible … in the reference
+  photograph"*, never *"on the product"* — the loose phrasing lets a model invent a label it
+  believes the product normally carries.
+- `absences` also generalised off apparel ("garment" → "product").
+- Stale comment fixed at `directImageRenderService.js:706-712` (it quoted the deleted sentence).
+
+**Kill switch `STATIC_PROMPT_FIDELITY_HARDENING` (default true).** `false` restores a
+**byte-identical** pre-hardening prompt — block *and* both carve-out sites revert together,
+verified by diffing all six intent×surface prompts against a pre-change dump. Partial revert
+would give an A/B whose control arm is not the arm that was measured. Precedent: PR #61
+hardened the VIDEO prompt and the owner rolled all three parts back (CLAUDE.md §00).
+
+**THE RISK, unmeasured and the reason the flag exists.** The prompt more than doubled,
+**~3.5-4.1k → ~7.8-8.4k chars**, and the block sits **above** `SET EXACTLY THESE STRINGS` on
+a path whose measured text fidelity is **139/140 strings across 20 renders**, and where
+`quality:high` already measured WORSE than `medium` *by losing a string*. Mitigations applied:
+the precedence sentence explicitly exempts the text contract and defers to the reserved-corner
+rule, and the closing check covers copy as well as product. **First render sample after this
+lands: check copy fidelity before anything else. If strings degrade, flip the flag.**
+
+This does **not** fix the ~1-in-3 competitor-mark defect and must not be described as fixing
+it — `adVisionQcService` (measure-and-reject) is still that fix. See CLAUDE.md §2 Known open.
+
+**Verify:** `scripts/verifyStaticFidelityPrompt.js` — 419 checks, both arms, revert-proven on
+three mutations (hardwire flag off / delete the text-exemption clause / loosen the reference
+anchor); all three fail the harness. Full suite **46/46 green**.
+
+### 0.0a PRICING CORRECTED — `base_price` is not the charge (2026-08-03, MEASURED)
+
+Found by running live renders. **`price.actual.base_price` under-reports the real charge
+by ~7.17x.** CLAUDE.md §2, `docs/ATLAS.md` and the `buildPriceMap` comment all said
+`actual` "is what we pay"; all three are now fixed.
+
+| model | catalog base | **measured charge** |
+|---|---|---|
+| `openai/gpt-image-2/edit` | $0.010 | **$0.07173** |
+| `openai/gpt-image-2-developer/edit` | $0.005 | **$0.03586** |
+
+Dead-consistent across every priced prediction. The multiplier is **not** in the catalog
+and was measured only at `1024x1024` / `quality: medium` — do not hardcode it or carry it
+to another model. `buildPriceMap` is a **floor-grade estimate** whose only job is to stop a
+$0.00 row.
+
+**Owner rule: always read the actual price back from Atlas after generation.** Authoritative
+figure = `price` on the **settled** prediction (`GET /model/prediction/:id`). Atlas usually
+publishes it *after* the image returns — measured **7 of 38** had it at completion — so
+`scheduleCostReconcile` is the normal path, not a rare top-up. Its budget was widened
+`[3s,10s,30s]` → `[3s,10s,30s,60s,120s,300s]`; at the old budget most rows kept a 7x-low
+estimate forever, which is how a static ad appeared to cost $0.01.
+
+### 0.0b STATIC EDIT MODEL → `-developer` variant (owner, 2026-08-03)
+
+`PLATE_EDIT_MODEL` default and `AI_DIRECT_IMAGE_EDIT_MODEL` in `config/defaults.env` both
+now point at `openai/gpt-image-2-developer/edit`. **Halves static spend** — a 3-surface
+`meta_static` fanout goes ~$0.215 → ~$0.108 per product. Submit COUNT is unchanged.
+
+Verified live before switching (never take a model id from memory): both ids resolve to the
+same `POST /model/generateImage` and their request schemas are **field-for-field identical**
+— same `required`, same 14-value `size` enum, same `quality` enum, neither exposes
+`input_fidelity`, and they share one `readme`. Drop-in; `buildParams` unchanged. The
+identical `size` enum is why `verifyStaticSafeBox` still passes — noted in that file.
+
+⚠️ **NOT verified: output quality dev vs non-dev.** The A/B ran both arms on the developer
+model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
+no code deploy.
+
+⚠️ **OPEN — measured reliability gap. Decide before merging.** 38 submits per model, same day:
+
+| model | ok | hard failures | $/successful render |
+|---|---|---|---|
+| `openai/gpt-image-2/edit` | 36/38 | **0** (2 poll timeouts, likely late completions) | $0.0757 |
+| `openai/gpt-image-2-developer/edit` | 32/38 | **6 `prediction failed`** (15.8%), null outputs, no error | **$0.0426** |
+
+The money case survives — developer is ~44% cheaper **per successful render** even after
+paying for the failures. But a ~16% hard-failure rate is a product problem, not a cost one:
+each is a charged submit with no asset, which reaches the operator as a failed ad and bills a
+failure. **NOT a controlled comparison** (n=38 each, one session, and the two runs used
+different prompt text), so this is a signal to re-measure, not a verdict.
+
+### 0.0c RENDER SAMPLES — run 1 VOID, run 2 in flight
+
+**Run 1 (40 renders, non-dev model, $2.87) is VOID for product fidelity.** The `PRODUCT:`
+description said *"Triple-strap"* — a miscount, the seed has **two** straps — and it went
+into **both** arms, so every render was told three while shown two. Both arms produced a mix
+of 2 and 3. Do not cite run 1 for strap/product fidelity.
+
+**What run 1 DID establish, and it is the important part:** no copy regression. All 38
+renders in both arms produced the rating, quote, attribution and CTA — so doubling the
+prompt above `SET EXACTLY THESE STRINGS` did not break text fidelity, which was the whole
+risk of this change. The `UNIFORM·SHOE` insole label also survived in both arms, confirming
+the carve-out works.
+
+**Run 2** re-runs on the developer model with a description that is accurate AND deliberately
+**silent on strap count**, so the reference image is the only source for that attribute —
+which is precisely what `PRODUCT_FIDELITY` claims to enforce. Harness:
+`<scratchpad>/render-samples2.js` (not repo code; it re-polls Atlas for real prices).
+
+⚠️ **ANOTHER SESSION WAS EDITING THIS SAME WORKING TREE CONCURRENTLY.** Mid-task the tree held
+uncommitted `services/ratingDisplay.js` (+431) + `scripts/verifyCoherentSocialProof.js`; those
+landed as **`9b61b02`** ("Tier-coherent social proof") while this work was in progress, and
+`remotion/compositions/Canonical.jsx` + `services/adRegenerateService.js` then appeared dirty
+from that same session. **None of it is part of this work and none of it was touched.** The
+fidelity changes were re-verified against the moved HEAD afterwards (46/46 suite, 419-check
+harness, byte-identical revert all still hold). If two agents share this checkout again, expect
+`git status` to include work that is not yours — check `git log` before assuming a dirty file is
+your own.
+
+---
+
 ## 0. CORRECTIONS — 2026-08-04. Read before trusting anything below.
 
 Four claims in this file were wrong. Each was verified against live code, the installed
@@ -911,6 +1041,90 @@ the asset's own border implies, so white-on-black assets don't invert into a blo
 back to the original asset. **NOT yet visually verified — needs one static render (~$0.01).**
 Video titling was never the source: `brandPill` and `brandLogo` are both off in canonical.
 
+### 0.3004 TITLE PLACEMENT — the bug was TIMING, not geometry. Tested, awaiting rollout call.
+
+Prod `53e26a4`. Suite 46/46, `verifyProofBeat` 53. **Tested on the three ads the owner
+flagged; NOT yet rolled out to the library — that is an owner decision.**
+
+**ROOT CAUSE, and it is not what either of us assumed.** `applyFaceKeepOut` assigns each
+detected face box to the NEAREST plate sample. There are typically 3 face samples against 5
+plate samples, so some samples carry no face flag at all. `resolveGroupAnchor` makes ONE
+decision for the WHOLE clip but read a SINGLE sample — so whether it saw the face was luck.
+Proven by running the real path against the real cached data:
+```
+Vuori   square:   avoid top=TRUE mid=true bot=false
+Pelagic vertical: avoid top=TRUE
+```
+The flags were CORRECT in both. Pelagic's group happened to read a flagged sample and moved off
+the face; Vuori's read an unflagged one and walked onto it. Two of my own hypotheses were wrong
+first (missing face detection — it was present; then a coordinate-conversion error — the numbers
+check out at 0.84 overlap). Do not re-chase either.
+**My texture ranking made it worse rather than causing it:** a smooth face is LOW variance, so
+once a face flag was missed, skin became the most attractive band in the frame.
+
+**FIX:** `bandStateFor` returns the UNION of `avoid` and the MAX of `busy` across every sample.
+A face occupying a band at any point disqualifies it for text on screen across that clip, and
+worst-case texture is what legibility depends on. `isLight` deliberately stays nearest-sample —
+ink has its own weighted vote (`plateIsLightGlobal`) and widening it would double-count.
+Strictly more conservative: it can only ADD avoid flags, and when every band is flagged the
+authored anchor is kept, i.e. pre-change behaviour.
+
+**LIVE EVIDENCE — the log reason flipped, which is the tell:**
+```
+keepOut: top->lowerThird        (face band; authored busy 0.516 -> 0.655)
+keepOut: upperThird->lowerThird (face band; authored busy 0.970 -> 0.467)
+keepOut: lowerThird->upperThird (busier band; authored busy 0.875 -> 0.497)
+```
+Same ads previously reported `busier band` (no face seen). Note line 1 moved to a BUSIER band
+because the authored one held a face — correct priority: faces disqualify, texture only breaks
+ties among clear bands. Frames confirm: Pelagic 9:16 well clear, Vuori 1:1 down off the
+eyes/nose, GymShark 4:5 still clear of the wordmark.
+
+**Pinned by K4** (the rule: whichever sample the group lands on, a band a face occupies at t=2
+is never chosen; with no face anywhere, texture still wins) **and K5** (the wiring: aggregation
+must iterate every sample AND be what is returned). K5 revert-proven — K4 uses mirrored logic so
+it does not catch a wiring revert, which is why both exist.
+
+**ALSO SHIPPED THIS ROUND** (all owner-approved, all with revert-proven pins):
+- **No burned-in CTA on Meta surfaces** (`a2e8e79`). Meta draws its own button; ours duplicated it
+  and was the element most prone to contrast collisions. `landscape` (pmax/YouTube) keeps its CTA.
+  `verifyTitleSpecResolution`'s G4/G6/H1 correctly FAILED this and were updated to pin the new
+  contract both ways rather than deleted.
+- **Pill ink from the fill** — `ctaText` defaulted to white regardless of the fill, so a
+  cream-accent brand shipped white-on-cream. Adversarial review then broke my first fix with
+  arithmetic: a `lum > 0.55` threshold picks WHITE on mid-tones (#5B8C5A → 1.93:1 when dark gives
+  9.3:1). Now computes the WCAG ratio both ways and takes the winner.
+- **Font plumbing guard** — `var(--font-sans)` and anything containing a parenthesis is no longer
+  treated as a typeface. My own harness caught that `"var(--brand-font, serif)"` comma-splits to
+  `serif)`, which is NOT in the generic list and would have returned a font named `serif)`.
+- **The brand's own face wins when we hold the file.** Data settled this: of 34 brands ZERO set
+  `headingFontFamily` (that tier was always dead) and FOUR set `sansFontFamily`, all four
+  disagreeing with their scraped face (AllBirds theme "DM Sans" vs real "Self Modern"). Naively
+  enabling the alias would have replaced real typefaces with generic Google ones. The scraped
+  family now outranks the theme ONLY when `matchCustomFont` finds a USABLE ingested file, so
+  licence holds still apply. Verified: AllBirds → Self Modern, licence-held → DM Sans, Pelagic
+  (no file) → Montserrat.
+- **Product-tier counts name the product** (capped 28 chars, word-safe) and the render log now
+  reports `quoteTier` and flags the cross-tier case.
+- **Seed guard** skips a first catalog image whose `primarySubjectAreaFraction` > 0.6, preserving
+  feed order. Two of my own bugs fixed after review: `limit(24)` was a silent wrong-seed generator,
+  and a missing `fileType` filter could land on a catalog VIDEO and switch Omni's seed track.
+
+**PROCESS TRAPS HIT THIS ROUND, all worth remembering:**
+- A regex JSON edit inserted a DUPLICATE `"visible"` key (non-greedy terminator stopped inside the
+  nested `position` object). JSON keeps the last occurrence, so files still parsed as `true` while
+  the script reported success. **Verify by parsing, never by trusting the edit log.** The presets
+  round-trip exactly at `indent=2`, so structural edits are clean.
+- `render-ssh` rate-limits hard; an `until` loop with no sleep hammers it into refusing everything.
+  Back off, then make ONE call. `/tmp` on the worker is wiped by every pod rotation, and a deploy
+  rotates the pod — so a detached driver launched right after a deploy dies with it. Monitor via
+  the DB, not the log file.
+- The driver's stdout goes to its own file, NOT the Render log stream — `render logs` will never
+  show `keepOut:` lines from a `retitleDriver` run.
+
+**AWAITING OWNER:** roll the placement fix across the library (a $0 re-title sweep, 382 ads, dry
+run green) or leave it applying to new renders only.
+
 ### 0.3003 SEED = FEED ORDER, and the legibility fix was a POLARITY bug (prod `caec844`)
 
 **VIDEO SEED — the 'hero' stamp is gone.** Owner: *"the default video behaviour should be the
@@ -1409,6 +1623,149 @@ Also: this branch now carries BOTH sessions' work. `be5b83f`'s
 `verifySeededUniverseHeroDefault.js` was briefly red mid-session (110/111,
 `S8 role === 'catalog'`) and is now 119/119 — that was their work in flight, not a
 regression from this change.
+
+---
+
+### 0.32 UNAPPLIED-WORK SWEEP + FIVE LANDED FIXES (2026-08-03, later session)
+
+Owner asked what was sitting unapplied, then said ship it. All pushed and on
+`origin/main`. Suite 46/46 throughout.
+
+| commit | what |
+|---|---|
+| `2bab8be` | Post-render vision QC applied from `.drafts/ad-vision-qc/` — **SHIPPING DARK** |
+| `6b224f9` | **SECURITY** GEN-1: authenticated-tenant RCE on `preview-script` closed |
+| `f52d79a` | `backfillBrandReviews` — stale money warning corrected, real blocker recorded |
+| `45155af` | Remotion headless-shell pre-warm at build time; dead browser candidate removed |
+| `b38965c` | Video uploads stream from disk; three stale plate-scan claims fixed |
+| `9b61b02` | Tier-coherent social proof chokepoint (**not wired yet** — see below) |
+
+**VISION QC IS OFF.** `AD_VISION_QC_ENABLED=false`. Enabling it is a spend decision
+(a billable vision call + a possible second image submit). Two corrections to the
+draft: the model role is `google/gemini-2.5-pro`, NOT the flash the draft picked
+(flash was probed live and BROKE the JSON shape); and the draft's claim that
+`judgeDetections` has zero call sites is false — it has two, both on ingested source
+media, so the substance holds but its cited evidence did not.
+
+**GEN-1 closed three doors, not one.** `body.script`, the `body.engine:'canvas'`
+hatch that short-circuits before `resolveTitlingEngine`, and a `styleScript*`
+persisted through the unvalidated PATCH allow-list. The fix originally prescribed in
+`ARCHITECTURE_REVIEW` (delete the `bodyScript` branch) was INSUFFICIENT — it left a
+two-request exploit. `parsingContext` would not have helped either; the injected
+params are parent-realm objects. Nothing live lost a feature: `StyleOverridesCard.tsx`
+is commented out of the frontend at both import and usage.
+
+**CHROME: two findings were one bug, and the "cosmetic" one was not cosmetic.** The
+`resolveBrowserExecutable` glob looked in `.cache/puppeteer`, which **does not exist
+on the box** (f89e30b moved the cache into `node_modules` because Render loses
+`.cache/` between build and serve). So it never matched, every fresh instance fell
+through to `ensureBrowser()`, and the shell was being downloaded ~92MB deep into a
+user-visible render. The pre-warm meant to prevent that ran `npx remotion browser
+ensure`, which also could never work — vendored `remotion` has no `bin` and
+`@remotion/cli` is not installed. **NOT verified: the build-log effect. Check the next
+deploy's log for the pre-warm line and confirm a fresh instance no longer downloads.**
+
+**BACKFILL IS A NO-OP TODAY — do not run it expecting reviews.** All 17 brands missing
+a rating already carry `brand-reviews` in `enrichmentSources`, and `GEMINI_API_KEY` IS
+present, so `wantBrandReviews` is false for every one. `--apply` would fire the other
+pending tiers (gpt, brandfetch, scrape — billable) and write ZERO reviews. 10 of the 17
+are test/duplicate records. Owner declined the targeted run: *"we are working on the
+reviews data."*
+
+### 0.33 TIER-COHERENT SOCIAL PROOF — policy landed, WIRING IS THE NEXT JOB
+
+Owner rule, verbatim: *"I don't care if the catalog wide review count is used as long
+as it is paired with a brand level quote, if it is a product specific quote it should
+rely on product specific ratings. As for the brand review path, they should be the same
+across both."*
+
+Three violations were found and all three are real:
+1. `layoutInputService.js:2382-2393` lets `Brand.brandReviews` enter
+   `social_proof.rating_value`/`review_count` via two independent fallbacks, so brand
+   numbers reach `resolveAtomicRatingPair` through its PRODUCT slots and come back
+   `source:'product'` with no brand attribution.
+2. `resolveAtomicRatingPair`'s brand-star fallback never consults quote tier at all —
+   so whenever product fails `>4.5` and brand passes, a **product quote prints beside
+   brand stars**. More common than the count case.
+3. **Static has no brand tier.** `directImageRenderService` reads only
+   `proof.rating_value`/`review_count`, never `Brand.brandReviews`, and
+   `staticAdIntents` can only print a count INSIDE a rating string. For the ~30 of 34
+   brands failing `>4.5`, static ships no stars AND no count while video prints
+   "41000 reviews · gymshark.com". Also `social_proof_led.eligible` requires
+   `d.rating`, so count-without-stars cannot even enter the static proof intent.
+
+**`resolveCoherentSocialProof()` (`ratingDisplay.js`) is the agreed chokepoint** and is
+committed. It returns the tier decision AS DATA; each renderer formats its own strings
+(static legitimately differs: in-model typesetting, no animation, a density budget, and
+image models mangle long strings — so parity is on POLICY, not presentation).
+
+Owner policy decisions 2026-08-03: `product|comment` → product numbers;
+**`category|brand` → brand numbers** (category on the brand side is the owner's call);
+product stars at `>4.5` OR (`count > 5000` AND `>4.19`); brand stars `>4.5` only, no
+volume exception; stars refused + coherent count → `product-count`/`brand-count`;
+either count REQUIRES a coherent quote on frame; no quote → rating-only stars fine.
+
+**ROUNDING — do not "fix" this.** Both gates compare the DISPLAYED one-decimal value,
+matching the existing convention. So the `>4.19` floor has an effective RAW cutoff of
+**4.15** (4.15 displays "4.2"), and the owner's "4.19 exactly must refuse" case is not
+expressible under round-first. It is deliberately NOT asserted; a test written that way
+fights the rounding rule, not the policy.
+
+**NOTHING CALLS THE CHOKEPOINT YET.** Wiring = `buildMetaForAd`, `buildIntentData`, the
+static intents, and the `layoutInputService` source fix. Deferred only because a
+concurrent session had all of those files open. The change is additive — optional
+star-floor args default to today's behaviour — so `verifyProofBeat` R1/R2/R3 and
+`verifyQuoteProvenance` P3 stay green and need no rewrite. Wiring MUST pass
+`renderedQuoteText`; the chokepoint withholds all numbers without it, by design.
+
+Harness `scripts/verifyCoherentSocialProof.js`, 48 checks, revert-proven 8 ways. Two
+notes that make it trustworthy rather than decorative: the tier invariant is guarded
+TWICE (withhold inputs, then whitelist `pair.source`) and the layers MASK each other,
+so neither is behaviourally observable — group G pins both in source with
+branch-bounded regions. And G's first version used a fixed byte window that overran
+into the brand branch and tripped on its legitimate whitelist.
+
+### 0.34 STILL OPEN from the sweep (verified, not started)
+
+- **#17 global in-flight caps — STILL NECESSARY.** `RENDER_CONCURRENCY`/`VEO_CONCURRENCY`
+  are per-process and frozen at module load; `runRenderLoop` builds a fresh pool per
+  call. Since the gate now admits disjoint-product concurrent runs, real submit
+  concurrency scales with parallel runs, unbounded.
+- **#18 reap stale `preparing` — STILL NECESSARY.** `reapOrphans` covers
+  `DetectRun.processing`, `Ad.rendering`, `CampaignRun.running`. No `preparing` clause
+  anywhere; `backlogWatchdog` only watches `running`.
+- **#19 `seedsFromMedia` out-of-scope minting — MOOT.** Verified on BOTH services:
+  web has `AI_CONCEPT_DRIVEN=true` set explicitly, worker is unset in the dashboard and
+  inherits `defaults.env:18` `=true`. Legacy cartesian is unreachable.
+- **Efficiency #1 video cost reconcile** — the only money-ledger item; needs a live
+  probe (does the terminal Omni poll already carry `data.price`?) plus a revert-proven
+  harness. **#2 `Ad.plateHints` cache** and **#3 regenerate Mongo diet** — both blocked
+  only on concurrent edits to `remotionRenderService.js` / `adRegenerateService.js`.
+  **#7 Omni polling** — no upstream lever; none of the 5 param shapes has a webhook field.
+- **Count-up settles after the slot fades** on short plates, so the last frame shows a
+  fabricated total (~40,519 for a 41,000 target at 24fps). Absolute-second constants in
+  `ratingMotion.js` ignore `timing.js`'s time-scaling; `verifyRatingMotion` E1 cannot
+  see it because it checks the settle budget without comparing it to the scaled
+  `exitAtSec`. Video-only.
+- `feat/gemini-search-cost-ledger` and the root `.bundle` are **stale duplicates** —
+  their content is already on `main` under different hashes. Safe to delete. Judge by
+  content, not ancestry: two "orphaned" branches this session turned out to be landed.
+
+### 0.35 MODEL ROUTING — hard rule now in global CLAUDE.md
+
+Owner, twice: *"I don't want four opus models looking through code, that should go to
+grok or haiku"* / *"you should be using grok first"*. Two Workflows in this session
+omitted `model` on `agent()`, which silently inherits the main-loop model — 732K and
+**1.25M Opus tokens** on what was file tracing. Direct `Agent` calls were correctly
+Sonnet; the Workflows were the leak.
+
+Rule (now in `~/.claude-work/CLAUDE.md`, binding on every session): **Grok first**,
+then Haiku, then Sonnet; Opus only for the orchestrator's correctness gate and
+adversarial verification of money/security logic. **`model` is not optional on
+`agent()` inside a Workflow.** Grok reads AND writes files headless — `--sandbox
+read-only` for audits, `--sandbox workspace` for edits (`workspace-write` is NOT a
+valid profile; it refuses to start). `--prompt-file` without `-p`. Grok drafted the
+chokepoint here and I caught two real defects in it, so the gate still earns its place.
 
 ---
 
