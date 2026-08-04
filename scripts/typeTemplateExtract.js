@@ -155,7 +155,13 @@ const oneOf = (v, list, def) => (list.includes(v) ? v : def);
  */
 function normalizeTemplate(raw) {
   const bad = [];
-  const role = (o = {}, defWeight) => ({
+  // `o = {}` DOES NOT protect against an explicit null — default parameters only
+  // apply to `undefined`. The prompt tells the model to use null for anything it
+  // cannot observe, so a null role object was guaranteed, and it crashed the whole
+  // run mid-way (after a billable call had already been paid for). Normalise first.
+  const role = (raw0, defWeight) => {
+    const o = raw0 || {};
+    return {
     casing: oneOf(o.casing, CASINGS, 'none'),
     weight: clampInt(o.weight, 100, 900, defWeight),
     // 0..8, NOT negative. titleSpecValidator rejects a negative trackingPx and a
@@ -168,7 +174,8 @@ function normalizeTemplate(raw) {
     maxLines: clampInt(o.maxLines, 1, 4, 2),
     relativeSize: oneOf(o.relativeSize, ['small', 'medium', 'large', 'hero'], 'medium'),
     italic: !!o.italic,
-  });
+    };
+  };
   const ink = raw?.ink || {};
   for (const k of ['onDarkBackground', 'onLightBackground']) {
     if (ink[k] && !HEX.test(ink[k])) bad.push(`ink.${k}=${ink[k]}`);
@@ -439,6 +446,7 @@ function compilePreset(brandName, tpl, { brandId = null, headingFamily = null } 
   const rejectedTemplates = {};
   const skipped = {};
   let calls = 0;
+  const outPathEarly = flag('out', null);
 
   for (const name of brandNames) {
     const brand = await Brand.findOne({ name }).select('_id name').lean();
@@ -513,6 +521,12 @@ function compilePreset(brandName, tpl, { brandId = null, headingFamily = null } 
       console.log(`   ℹ face '${tpl.typefaceObserved.headlineLooksLike}' not exactly servable — keeping canonical type`);
     }
     templates[name] = tpl;
+    // WRITTEN AFTER EVERY BRAND, not at the end. A crash on brand 2 previously
+    // discarded brand 1's answer even though it had already been paid for.
+    if (outPathEarly) {
+      try { fs.writeFileSync(outPathEarly, JSON.stringify({ generatedAt: new Date().toISOString(), llmCalls: calls, templates, rejectedTemplates, skipped }, null, 2)); }
+      catch (e) { console.warn(`⚠️  could not checkpoint ${outPathEarly}: ${e.message}`); }
+    }
     console.log(`   → ink=${tpl.ink.policy} headline=${tpl.headline.casing}/${tpl.headline.weight}` +
       `/track${tpl.headline.trackingPx}/${tpl.headline.align} scrim=${tpl.background.scrim}` +
       ` face≈${tpl.typefaceObserved.headlineLooksLike} conf=${tpl.confidence}` +
