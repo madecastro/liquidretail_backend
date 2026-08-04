@@ -590,6 +590,7 @@ Results from deterministic + concept expanders are combined with **`mergeExpansi
 #### Concept / director path
 
 - Image concepts: still Director + Judge (`aiCreativeDirectorService` / `aiJudgeService`); template label maps from `conceptField(concept, 'creative_style')` (v3 dual-read — flat `concept.creative_style` alone is wrong; see §5 concept contract).
+- **Director JSON contract lives in the prompt + salvage, not `response_format`.** The `director` role is `anthropic/claude-sonnet-5-ccmax` (`atlasModelMap.js:98`). Atlas **silently ignores** `response_format:{type:'json_object'}` for that model (probed live 2026-08-04 — both arms returned conversational prose; distinct from `json_schema` HTTP 400). Round system prompt now carries an `OUTPUT CONTRACT` block; parse path is `safeParseDirectorJSON` / `extractFirstBalancedObject` plus a one-shot corrective re-ask that shares the existing `attempt` budget (worst case still two paid Director calls). Measured pre-fix from Render logs over 24h: **10 Director round failures / 1 success** (prose openings → zero ads for that product). Code is applied in the working tree and offline-pinned by `scripts/verifyDirectorJsonSalvage.js` (32 checks, revert-proven); **uncommitted and not deployed** — do not claim production is fixed.
 - Video concepts: only when `conceptVideo` is true (opt-in `directorVariants`; default **off**); still capped at `VEO_ADS_PER_PRODUCT_CAP` (default **1**) per product in the concept expander. Storyboard text path reads archetype / hooks via `conceptField` (`veoStoryboardService.js`) — **Atlas/Omni camera prompt does not use that path** (storyboard retired on Atlas; see stages table). Opt-in queues extra concept **Ads**; it does **not** make Director drive the live camera prompt.
 - **Director does not drive video titling or the camera prompt** (PR #11) — **even when `directorVariants` is on.** Layout-input / title template for video is **canonical `ai_brand_led`** unless Title Studio overrides cascade (below). `creative_style` / `archetype` / `art_direction` are ignored for the camera prompt and for video titling.
 
@@ -913,12 +914,12 @@ Channel ids are not secrets; bot tokens are.
 
 ### Stays in Render env (secrets + one deliberate exception)
 
-Verified live 2026-08-03 after the cleanup. **WEB service** (`srv-d1vuktqli9vc73ft07ng`): **23** keys. **WORKER** (`srv-d8128c1o3t8c73e8kb30`): **14** keys. Everything else that used to live on the dashboard and also lived in `defaults.env` with the same value was deleted (runtime no-ops).
+Verified live 2026-08-03 after the cleanup; **WORKER recount 2026-08-04** after `ATLAS_API_KEY` was added. **WEB service** (`srv-d1vuktqli9vc73ft07ng`): **23** keys. **WORKER** (`srv-d8128c1o3t8c73e8kb30`): **15** keys. Everything else that used to live on the dashboard and also lived in `defaults.env` with the same value was deleted (runtime no-ops).
 
 | Key | WEB | WORKER | Used for |
 |---|---|---|---|
 | `APIFY_TOKEN` | ✓ | | Apify actors (IG / Shopify scrapers) |
-| `ATLAS_API_KEY` | ✓ | | Atlas video / image / LLM gateway |
+| `ATLAS_API_KEY` | ✓ | ✓ | Atlas video / image / LLM gateway |
 | `BRANDFETCH_API_KEY` | ✓ | ✓ | Brand enrichment |
 | `CLOUDINARY_API_KEY` | ✓ | ✓ | Media storage |
 | `CLOUDINARY_API_SECRET` | ✓ | ✓ | Media storage |
@@ -942,6 +943,8 @@ Verified live 2026-08-03 after the cleanup. **WEB service** (`srv-d1vuktqli9vc73
 | **`SLACK_BOT_TOKEN`** | ✓ | ✓ | **Only** alerting secret. Channels live in `defaults.env` |
 
 No Telegram secrets remain. Alerts stay disabled until `SLACK_BOT_TOKEN` is set.
+
+**`ATLAS_API_KEY` on WORKER (added 2026-08-04):** post-cleanup this table marked it WEB-only, but that was a **config gap**, not a design choice — the worker reaches Atlas LLM code on every DetectRun (`atlasLlmService.js:52` `isConfigured()` is `!!process.env.ATLAS_API_KEY`; cropRefine / overlayZone / subjectText / judge all fall back to direct OpenAI/Gemini when unset). Verified live via Render API: WEB had it, WORKER did not (env-group "Liquid Retail" has zero vars), worker logged `ATLAS_API_KEY not configured` continuously until the key was copied onto WORKER (14 → 15) and redeployed; zero such lines after the 16:24Z boot. **Billable consequence:** the key flips `geminiImageService.viaAtlasOrDirect` (`services/geminiImageService.js:12`) onto Atlas `nano-banana-2/edit` for DetectRun extended crops — up to 4 billable image edits per **non-catalog** DetectRun. Catalog DetectRuns are unaffected (`pipelines/detect.js:628` `skipExtendedCrops: true`). Measured 2026-08-04: 115 detect runs in 24h, **all catalog**, **zero** extended-crop activity — exposure is real but currently dormant. Provider **shift** (those crops already billed Gemini direct), not new spend from zero.
 
 **The one non-no-op of the cleanup:** `RENDER_CONCURRENCY`. Dashboard had pinned **4** while the file said **8**; deleting the dashboard copy made the file's **8 live on 2026-08-03**. That is a real concurrency double, not a no-op — consequence of the migration, not a separate tuning decision.
 

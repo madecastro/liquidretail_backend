@@ -81,9 +81,12 @@ const MAP = Object.freeze({
   // reference image. Sonnet is also the cheapest Claude of the three at $2/$10
   // per M — $0.105 per director run against $0.223 for opus.
   //
-  // TWO CONSTRAINTS, probed live rather than assumed:
+  // THREE CONSTRAINTS, probed live rather than assumed:
   //  - response_format json_schema  -> HTTP 400, on text AND vision alike.
-  //    Callers MUST use json_object and validate in code.
+  //  - response_format json_object  -> accepted but NOT ENFORCED (probed
+  //    2026-08-04: with and without the flag both returned prose). Callers
+  //    MUST put the JSON contract in the prompt and salvage/validate in code
+  //    (see aiCreativeDirectorService OUTPUT CONTRACT + safeParseDirectorJSON).
   //  - vision (image_url parts)     -> works; confirmed sees_image=true and a
   //    correct colour reading. Earlier notes claiming Claude could not do vision
   //    with structured output were wrong: strict schema is the only blocker.
