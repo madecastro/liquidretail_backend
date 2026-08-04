@@ -2380,17 +2380,10 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
     },
 
     social_proof: {
-      // For 'branding' outcome (no SKU) fall back to brand-level rating /
-      // review_count from Gemini brand-reviews lookup so the proof bar
-      // isn't blank when only brand sentiment is available.
-      rating_value:    typeof details.rating === 'number'
-                          ? details.rating
-                          : (ctx.match?.outcome === 'brand_match' && typeof ctx.match?.brandReviews?.rating === 'number'
-                              ? ctx.match.brandReviews.rating : undefined),
-      review_count:    typeof details.reviewCount === 'number'
-                          ? details.reviewCount
-                          : (ctx.match?.outcome === 'brand_match' && typeof ctx.match?.brandReviews?.reviewCount === 'number'
-                              ? ctx.match.brandReviews.reviewCount : undefined),
+      // rating_value / review_count are an ATOMIC PAIR — see
+      // deriveSocialProofNumbers() below for the R2 fix and the
+      // stale-artifact handling (`rating_source`).
+      ...deriveSocialProofNumbers(details, ctx),
       trusted_by_text: derivation.trusted_by_text || trustedByFromStats(details) || undefined,
       proof_badges:    limitArray(derivedBadges, 4),
       primary_quote:   primaryQuote || undefined,
@@ -3229,6 +3222,75 @@ function buildPerformanceMetrics(media, match) {
   return metrics.slice(0, 6);
 }
 
+/**
+ * ATOMIC rating_value/review_count pair for `social_proof` (R2 fix,
+ * 2026-08-03).
+ *
+ * HISTORY — the hole this closes: the previous code resolved rating_value
+ * and review_count as TWO INDEPENDENT ternaries, each falling to
+ * ctx.match.brandReviews on its own for a 'brand_match' outcome. Ratings and
+ * review counts are frequently scraped separately, so a product carrying a
+ * rating but no count kept its product-tier rating while the count alone
+ * fell through to the BRAND aggregate — printing a catalog-wide review
+ * count beside a single product's stars. That is the exact cross-tier mix
+ * services/ratingDisplay.js's resolveCoherentSocialProof exists to forbid.
+ *
+ * FIX: decide the winning TIER once for the whole pair. If the product
+ * (`details`) carries EITHER field, the pair is product-tier and BOTH
+ * fields come from `details` — a field product doesn't have stays empty
+ * rather than borrowing the other tier's value. Only when product has
+ * NEITHER field does the pair fall to the brand aggregate, and then BOTH
+ * fields come from ctx.match.brandReviews together.
+ *
+ * `rating_source` ('product'|'brand'|null) records which tier won. This is
+ * the mechanism for the ~722/738 artifacts already cached under the OLD
+ * two-ternary code: those documents were written before this field existed,
+ * so they carry NO `rating_source` at all. A tier-aware consumer
+ * (brandScriptExecutor.buildMetaForAd) treats that ABSENCE as "provenance
+ * unknown" and does not trust a stale artifact's rating_value/review_count
+ * as a coherent PRODUCT pair — CatalogProduct becomes the sole product-tier
+ * source for those ads instead (or no product pair at all, if CatalogProduct
+ * also has nothing). This does NOT drop proof a brand legitimately has:
+ * Brand.brandReviews is fetched independently by buildMetaForAd for the
+ * BRAND tier and is untouched by any of this — only the product-shaped
+ * fallback that used to live here is what a stale artifact loses.
+ *
+ * A fix that only changed future writes would not be sufficient on its own
+ * (this file cannot rewrite already-persisted Mongo documents) — the
+ * `rating_source` marker is what lets a consumer distinguish "written under
+ * the atomic rule" from "written under the old, possibly-mixed rule"
+ * without a schema-version bump (which would force a live re-derivation —
+ * runDerivation() calls the Gemini layout-derivation LLM — across every
+ * cached artifact; far too large and costly a side effect for this fix).
+ *
+ * @returns {{ rating_value: number|undefined, review_count: number|undefined, rating_source: 'product'|'brand'|null }}
+ */
+function deriveSocialProofNumbers(details, ctx) {
+  const hasProductNumber = typeof details.rating === 'number' || typeof details.reviewCount === 'number';
+  if (hasProductNumber) {
+    return {
+      rating_value:  details.rating,
+      review_count:  details.reviewCount,
+      rating_source: 'product',
+    };
+  }
+  // For 'branding' outcome (no SKU) fall back to brand-level rating /
+  // review_count from Gemini brand-reviews lookup so the proof bar isn't
+  // blank when only brand sentiment is available — atomic, both fields
+  // from the SAME brandReviews snapshot.
+  const brandReviews = ctx.match?.outcome === 'brand_match' ? ctx.match?.brandReviews : null;
+  const hasBrandNumber = brandReviews
+    && (typeof brandReviews.rating === 'number' || typeof brandReviews.reviewCount === 'number');
+  if (hasBrandNumber) {
+    return {
+      rating_value:  brandReviews.rating,
+      review_count:  brandReviews.reviewCount,
+      rating_source: 'brand',
+    };
+  }
+  return { rating_value: undefined, review_count: undefined, rating_source: null };
+}
+
 function trustedByFromStats(details) {
   if (typeof details.reviewCount === 'number' && details.reviewCount >= 50) {
     return `Trusted by ${formatCount(details.reviewCount)}+ customers`;
@@ -3354,6 +3416,14 @@ module.exports = {
   // Shared so every surface that renders a social comment as proof applies
   // the same definition of praise, rather than each growing its own lexicon.
   hasPositiveSignal,
+  // Exported so scripts/verifyProofBeat.js can pin the R2 fix BEHAVIOURALLY
+  // rather than by source scan. This is the function that decides ONE winning
+  // tier for the rating/count pair and stamps `rating_source`; before it, two
+  // independent ternaries could take a product rating and a brand count on the
+  // same artifact, and downstream had no way to tell brand numbers from product
+  // numbers. A revert-proof pass showed nothing failed when the marker was
+  // removed, which is why it is exported now.
+  deriveSocialProofNumbers,
   // Quote-selection internals, exported so scripts/verifyQuoteGate.js can pin
   // the 4.5-star floor and the product-review lookup. Both have already been
   // broken once by a merge with nothing to catch it.

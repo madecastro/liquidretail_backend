@@ -316,12 +316,129 @@ check('Q1 a brand count requires the rendered quote to BE the brand quote', () =
   assert.strictEqual(gate({ tier: 'brand', text: '' }, ''), false, 'an empty brand quote is not a quote');
 });
 
-check('Q2 buildMetaForAd compares against the rendered cascade value', () => {
+// REWRITTEN 2026-08-03, deliberately — this pinned the OLD implementation, not the
+// invariant. It regexed the literal `renderedQuote === brandQuoteText`, which was the
+// ad hoc guard that only ever protected the brand-COUNT outcome. That guard has been
+// replaced by resolveCoherentSocialProof, which enforces tier coherence for every
+// tier (product / comment / category / brand) and for stars as well as counts — so the
+// invariant is now enforced more broadly than this check could see. Deleting the check
+// would have been wrong; so would leaving a regex that fails on strictly better code.
+// ── S: the layoutInput SOURCE fix (R2), pinned behaviourally ────────────
+//
+// Added 2026-08-03 after a revert-proof pass found NOTHING failed when the
+// `rating_source` marker was deleted. That marker is the whole mechanism by which a
+// downstream consumer can tell brand numbers from product numbers — before it, two
+// independent ternaries could take a product RATING and a brand COUNT on the same
+// artifact and hand the mix downstream labelled as product proof. An unpinned fix is
+// not a fix, so `deriveSocialProofNumbers` is now exported and tested directly.
+{
+  const lis = require('../services/layoutInputService');
+  const derive = lis.deriveSocialProofNumbers;
+
+  check('S0 deriveSocialProofNumbers is exported for pinning', () => {
+    assert.strictEqual(typeof derive, 'function',
+      'the R2 fix must stay testable — do not un-export it');
+  });
+
+  if (typeof derive === 'function') {
+    const brandCtx = (rating, reviewCount) => ({
+      match: { outcome: 'brand_match', brandReviews: { rating, reviewCount } }
+    });
+
+    check('S1 a product number wins the WHOLE pair — brand never fills the gap', () => {
+      // THE R2 BUG: product rating present, product count absent, brand count
+      // available. The old independent ternaries produced rating=4.8 + count=41000,
+      // a catalog-wide count riding a product rating.
+      const r = derive({ rating: 4.8 }, brandCtx(3.3, 41000));
+      assert.strictEqual(r.rating_source, 'product');
+      assert.strictEqual(r.rating_value, 4.8);
+      assert.strictEqual(r.review_count, undefined,
+        'the brand count must NOT backfill a product rating');
+    });
+
+    check('S2 a product count alone also claims the pair', () => {
+      const r = derive({ reviewCount: 120 }, brandCtx(4.9, 41000));
+      assert.strictEqual(r.rating_source, 'product');
+      assert.strictEqual(r.review_count, 120);
+      assert.strictEqual(r.rating_value, undefined,
+        'the brand rating must NOT backfill a product count');
+    });
+
+    check('S3 brand fills only when product has NEITHER, and does so atomically', () => {
+      const r = derive({}, brandCtx(4.7, 8900));
+      assert.strictEqual(r.rating_source, 'brand');
+      assert.strictEqual(r.rating_value, 4.7);
+      assert.strictEqual(r.review_count, 8900);
+    });
+
+    check('S4 brand numbers are ignored unless the outcome is brand_match', () => {
+      const r = derive({}, { match: { outcome: 'product_match', brandReviews: { rating: 4.7, reviewCount: 8900 } } });
+      assert.strictEqual(r.rating_source, null);
+      assert.strictEqual(r.rating_value, undefined);
+      assert.strictEqual(r.review_count, undefined);
+    });
+
+    check('S5 no numbers anywhere -> source null, nothing invented', () => {
+      const r = derive({}, {});
+      assert.strictEqual(r.rating_source, null);
+      assert.strictEqual(r.rating_value, undefined);
+      assert.strictEqual(r.review_count, undefined);
+    });
+
+    check('S6 every outcome carries a rating_source marker (never undefined)', () => {
+      for (const [d, c] of [[{ rating: 4.8 }, brandCtx(3.3, 41000)], [{}, brandCtx(4.7, 8900)], [{}, {}]]) {
+        const r = derive(d, c);
+        assert.ok('rating_source' in r,
+          'a consumer cannot route a tier it cannot see — the marker must always be present');
+      }
+    });
+  }
+
+  check('S7 the CONSUMER requires the product marker before trusting layoutInput', () => {
+    const raw = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'brandScriptExecutor.js'), 'utf8');
+    // STRIP COMMENTS FIRST. The first version of this check matched the phrase in a
+    // COMMENT (brandScriptExecutor.js:922 documents the rule in backticks) and stayed
+    // GREEN while the real guard 15 lines below it was broken — the exact
+    // "regex matched a comment 80 chars from the guard" failure this repo already has
+    // on record. Any source-scan pin in this file should scan code, not prose.
+    const code = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')   // block comments
+      .replace(/^[ \t]*\/\/.*$/gm, '')    // whole-line // comments
+      .replace(/([^:])\/\/.*$/gm, '$1');  // trailing // comments, sparing "://" in urls
+    assert.ok(
+      /rating_source\s*===\s*['"]product['"]/.test(code),
+      'buildMetaForAd must require rating_source === "product" before using '
+      + 'layoutInput.social_proof as the product pair — ~722 cached artifacts predate '
+      + 'the marker and their numbers are of unknown tier'
+    );
+  });
+}
+
+check('Q2 buildMetaForAd routes social proof through the coherence chokepoint', () => {
   const src = fs.readFileSync(
     path.join(__dirname, '..', 'services', 'brandScriptExecutor.js'), 'utf8');
   assert.ok(
-    /renderedQuote\s*===\s*brandQuoteText/.test(src),
-    'the gate must compare the brand quote against cascaded.quote, not just read tier'
+    /resolveCoherentSocialProof\s*\(/.test(src),
+    'buildMetaForAd must call resolveCoherentSocialProof, not resolve numbers itself'
+  );
+  // The chokepoint withholds ALL numbers unless the caller states which line renders,
+  // so passing this argument is the load-bearing half of the wiring.
+  assert.ok(
+    /renderedQuoteText/.test(src),
+    'buildMetaForAd must pass renderedQuoteText or every number is withheld'
+  );
+  // And it must be the REAL resolved bind value, not a hardcoded guess. The old F4
+  // hole was comparing a pre-cascade value while the renderer bound something else;
+  // reproducing DEFAULT_BIND by hand here would recreate it in a new form.
+  assert.ok(
+    /resolveSlotContentCore\s*\(/.test(src),
+    'renderedQuoteText must come from the real slot bind resolution (resolveSlotContentCore), ' +
+    'not a hand-rolled quoteSnippet||quote'
+  );
+  assert.ok(
+    !/renderedQuote\s*===\s*brandQuoteText/.test(src),
+    'the superseded ad hoc brand-count guard must not be reintroduced alongside the chokepoint'
   );
 });
 
