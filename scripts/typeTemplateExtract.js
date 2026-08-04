@@ -533,7 +533,14 @@ function compilePreset(brandName, tpl, { brandId = null, headingFamily = null } 
       (tpl._coerced.length ? ` ⚠️ coerced: ${tpl._coerced.join(',')}` : ''));
   }
 
-  const out = { generatedAt: new Date().toISOString(), llmCalls: calls, templates, rejectedTemplates, skipped };
+  // The map the sweep must consult instead of recomputing the filename formula.
+  const presetsByBrand = {};
+  for (const [brandName, tpl] of Object.entries(templates)) {
+    if (tpl._dryRun) continue;
+    const slug = slugify(brandName);
+    presetsByBrand[brandName] = `typetpl-${slug}${tpl._brandId ? `-${String(tpl._brandId).slice(-6)}` : ''}`;
+  }
+  const out = { generatedAt: new Date().toISOString(), llmCalls: calls, templates, presetsByBrand, rejectedTemplates, skipped };
   const outPath = flag('out', null);
   if (outPath) { fs.writeFileSync(outPath, JSON.stringify(out, null, 2)); console.log(`📝 wrote ${outPath}`); }
   else console.log(JSON.stringify(out, null, 2));

@@ -289,12 +289,19 @@ async function statePersist() {
   if (PHASES.includes('armB')) {
     const templates = fs.existsSync(F.templates) ? readJson(F.templates) : { templates: {} };
     const byBrand = new Map();
-    for (const a of pool.ads) {
+    // sliceAds, NOT pool.ads — an earlier edit missed this and every chunk ignored
+    // --ads, re-titling all thirty each time.
+    for (const a of sliceAds) {
       if (!byBrand.has(a.brand)) byBrand.set(a.brand, []);
       byBrand.get(a.brand).push(a.adId);
     }
     for (const [brand, ids] of byBrand) {
-      const preset = `typetpl-${slugify(brand)}`;
+      // READ the name the extractor actually emitted rather than recomputing the
+      // formula. Recomputing it is what broke arm B: the writer appends a brand-id
+      // suffix for slug collisions ("typetpl-living-spaces-55aa9f") and this side
+      // asked for "typetpl-living-spaces", so the preset never loaded and every
+      // arm-B render was silently arm A.
+      const preset = templates.presetsByBrand?.[brand] || `typetpl-${slugify(brand)}`;
       const presetFile = path.join(__dirname, '..', 'remotion', 'presets', `${preset}.json`);
       if (!templates.templates?.[brand]) { log(`⏭  ${brand}: no template extracted — skipping ${ids.length} ad(s)`); continue; }
       if (!fs.existsSync(presetFile) && !DRY_RUN) {

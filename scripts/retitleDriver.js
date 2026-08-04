@@ -226,6 +226,26 @@ async function main() {
     ` log=${opts.log}`
   );
 
+  // A --preset THAT CANNOT BE LOADED IS A SILENT NO-OP, and it invalidated an
+  // entire experiment arm before this guard existed. loadPresetFile returns null
+  // for an unknown name, resolveSpec then falls through to the normal ladder with
+  // only a warning, and every ad renders exactly as it would have without
+  // --preset. The run reports success and the comparison reads "the preset made no
+  // difference" when the truth is that it was never applied. Measured: two
+  // supposedly different arms produced pixel-identical frames (mean abs diff
+  // 0.000) because the requested name lacked a brand-id suffix the writer adds.
+  if (opts.preset) {
+    const { loadPresetFile } = require('../services/titleSpecService');
+    if (!loadPresetFile(opts.preset)) {
+      console.error(
+        `✖ --preset='${opts.preset}' cannot be loaded from remotion/presets — refusing to run. ` +
+        `Every ad would silently render with the default spec instead, which looks like success.`
+      );
+      process.exit(2);
+    }
+    console.error(`✅ preset '${opts.preset}' loaded — it will override the spec ladder`);
+  }
+
   if (opts.dryRun) {
     for (let i = 0; i < total; i++) {
       const ad = await Ad.findById(adIds[i])
