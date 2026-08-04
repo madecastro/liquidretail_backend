@@ -36,6 +36,8 @@
 //   B*  behaviour reachable offline: no receipt, no key, no id
 //   U*  'unknown' is distinct from 'failed' — a transport error is NOT a failure
 //   C*  completed-without-output is a classified failure, not still-running
+//   O*  the boot ORCHESTRATION: receipt-scoped, staleness-windowed, lease-free
+//       via status-filtered idempotent writes, and wired before the reaper
 
 const fs   = require('fs');
 const path = require('path');
@@ -137,6 +139,48 @@ checkTrue('N4 resumeForAd delegates to peekPrediction rather than its own reques
   // rather than shown as a generic fault (see atlasErrorPolicy).
   checkTrue('C2 a failed prediction is classified through atlasErrorPolicy',
     /classify\(\{/.test(body) && /policy\.label/.test(body));
+
+  // ── O: boot orchestration ──────────────────────────────────────────
+  const REC = fs.readFileSync(path.join(__dirname, '..', 'services', 'bootRecoveryService.js'), 'utf8');
+  const WRK = fs.readFileSync(path.join(__dirname, '..', 'worker.js'), 'utf8');
+  const rec = require('../services/bootRecoveryService');
+
+  checkTrue('O1 recovery only considers ads that HOLD a receipt',
+    /HAS_RECEIPT/.test(REC) && /status: 'rendering'/.test(REC));
+  // renderOne heartbeats updatedAt every 60s, so a staleness window is what
+  // stops us stamping `draft` underneath an instance that is still rendering.
+  checkTrue('O2 recovery only touches ads stale past a heartbeat window',
+    /updatedAt: \{ \$lt: cutoff \}/.test(REC) && /RESUME_STALE_MIN/.test(REC));
+  // Lease-free: safety comes from the status filter on every write, so two
+  // instances booting together cannot conflict.
+  checkTrue('O3 the recovered-master write is status-filtered (idempotent, no lease needed)',
+    /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,200}status: 'draft'/.test(REC));
+  checkTrue('O4 the failure write is status-filtered too',
+    /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,240}status: 'failed'/.test(REC));
+  // A receipt means we were billed. Recording charged:false would understate
+  // spend, and an understated ledger is the direction that cannot be corrected.
+  checkTrue('O5 a resumed failure is ledgered as CHARGED (a receipt means billed)',
+    /'renderError\.charged':\s*true/.test(REC));
+  checkTrue('O6 the recovered master rests at draft (the reaper-safe money guard)',
+    /status: 'draft'/.test(REC));
+  // processing/unknown must be left alone — acting on ignorance writes off a
+  // paid asset.
+  checkTrue('O7 processing and unknown are left untouched for the next pass',
+    /LEAVE IT ALONE/.test(REC) && /stillRunning\+\+/.test(REC));
+  checkTrue('O8 recovery has a kill switch', /RESUME_IN_FLIGHT_ON_BOOT/.test(REC)
+    && rec.enabled() === true);
+  checkTrue('O9 recovery is bounded per pass so boot cannot hang', /RESUME_MAX_ADS/.test(REC)
+    && /\.limit\(limit\)/.test(REC));
+  checkTrue('O10 recovery cannot submit (it delegates to resumeForAd)',
+    /resumeForAd/.test(REC) && !/pacedModelSubmit|axios\.post|submitImageGeneration/.test(REC));
+  // Wiring: recovery must run BEFORE the reaper, and must not be able to crash
+  // boot — an unhandled rejection in fire-and-forget work is the crash class
+  // this whole effort came from.
+  const bootOrder = WRK.indexOf('recoverTick()') < WRK.indexOf('await reapOrphans()');
+  checkTrue('O11 recovery is wired BEFORE the boot reap', bootOrder);
+  checkTrue('O12 recovery failures cannot crash boot', /boot recovery failed/.test(WRK));
+  checkTrue('O13 recovery also runs on the reap interval (processing ads need re-checking)',
+    /setInterval\(\(\) => \{\s*recoverTick\(\);/.test(WRK));
 
   const total = pass + failures.length;
   if (failures.length) {

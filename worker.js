@@ -101,8 +101,24 @@ mongoose.connect(process.env.MONGODB_URI, {
   // holder process died without releasing them. Runs once at boot
   // (catches crashes since last restart) and on a timer (catches
   // mid-run crashes of the web service while this worker stays alive).
+  // BOOT RECOVERY RUNS BEFORE THE REAPER, deliberately. An ad holding a spend
+  // receipt should become `draft` with its recovered master, not sit in
+  // `rendering` waiting to be noticed. The reaper no longer requeues those ads
+  // (services/spendReceipt.js), so this is about collecting the asset promptly
+  // rather than about avoiding a race — but ordering keeps the two legible:
+  // recovery resolves what it can, the reaper handles what is genuinely orphaned.
+  //
+  // Awaited at boot so the log reads in causal order, and .catch()'d because a
+  // recovery failure must never stop the queues from starting. It is also on the
+  // reap interval: 'processing' ads need re-checking until they terminate.
+  const { resumeInFlightAds } = require('./services/bootRecoveryService');
+  const recoverTick = () => resumeInFlightAds()
+    .catch(err => console.warn(`⚠️  boot recovery failed: ${err.message}`));
+  await recoverTick();
+
   await reapOrphans().catch(err => console.warn(`⚠️  initial reap failed: ${err.message}`));
   setInterval(() => {
+    recoverTick();
     reapOrphans().catch(err => console.warn(`⚠️  periodic reap failed: ${err.message}`));
   }, REAP_INTERVAL_MIN * 60 * 1000);
 
