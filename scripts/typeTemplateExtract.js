@@ -460,7 +460,7 @@ function compilePreset(brandName, tpl, { brandId = null, headingFamily = null } 
     let parsed = null, rawText = '';
     try {
       const res = await chatCompletion(
-        { service: 'typeTemplateExtract', purpose: 'type-template', visionImages: rows.length },
+        { stage: 'type_template_extract', service: 'typeTemplateExtract', purpose: 'type-template', visionImages: rows.length },
         {
           model: 'gemini-2.5-pro',
           messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content }],
