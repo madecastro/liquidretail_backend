@@ -41,14 +41,14 @@ const KEEP_OUT_CANDIDATES = {
 // content is on screen: bright band → dark type; avoid band → shift group
 // to a clear band (see resolveGroupAnchor).
 function bandStateFor(plateHints, anchor, atSec) {
-  if (!plateHints?.samples?.length) return { isLight: false, avoid: false, busy: 0 };
+  if (!plateHints?.samples?.length) return { isLight: false, avoid: false, busy: 0, lum: null };
   let best = plateHints.samples[0];
   for (const s of plateHints.samples) {
     if (Math.abs(s.atSec - atSec) < Math.abs(best.atSec - atSec)) best = s;
   }
   const bandKey = BAND_FOR_ANCHOR[anchor] || 'middle';
   const band = best.bands?.[bandKey];
-  if (!band) return { isLight: false, avoid: false, busy: 0 };
+  if (!band) return { isLight: false, avoid: false, busy: 0, lum: null };
 
   // ACROSS TIME, not at one instant — for `avoid` and `busy`.
   //
@@ -83,6 +83,39 @@ function bandStateFor(plateHints, anchor, atSec) {
     isLight: band.lum > 0.62,
     avoid: avoidAny,
     busy: busyMax,
+    // The raw band luminance, so ink can be chosen for the band the type
+    // ACTUALLY lands on rather than from a whole-clip vote. See inkForBand.
+    lum: Number.isFinite(band.lum) ? band.lum : null,
+  };
+}
+
+// ── PER-BAND INK, because a global vote loses on mid-tone footage ───────
+//
+// THE DEFECT THIS FIXES, seen on a delivered AllBirds 4:5: the plate is mostly
+// light (cream shoe, pale ground) so the global vote flipped ink DARK, but the
+// band the type landed on was a mid-grey wool insole at ~0.45 luminance. Near
+// black on mid grey is barely readable, and since the owner ruled out scrims and
+// the shadow was deliberately tightened after "the halo is way too much", nothing
+// rescued it. The plate average was never the surface the words sat on.
+//
+// Chooses by CONTRAST RATIO rather than a threshold — the same lesson the pill
+// ink already learned: a single luminance cut-off picks the wrong ink on mid-tones
+// (a 0.55 threshold puts white on #5B8C5A at 1.93:1 when dark gives 9.3:1).
+// `marginal` means even the better choice is under WCAG AA, which is the real
+// signal that placement alone will not carry it and the shadow must do more.
+const INK_DARK_LUM = 0.0091;   // #16181D, sRGB-linearised
+const INK_LIGHT_LUM = 1.0;     // #FFFFFF
+function inkForBand(lum) {
+  if (!Number.isFinite(lum)) return null;
+  const lin = (v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+  const ratio = (a, b) => (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+  const bg = lin(lum);
+  const onDarkInk = ratio(INK_DARK_LUM, bg);
+  const onLightInk = ratio(INK_LIGHT_LUM, bg);
+  return {
+    onLight: onDarkInk > onLightInk,           // true → dark ink, i.e. on-light tokens
+    marginal: Math.max(onDarkInk, onLightInk) < 4.5,
+    best: Math.round(Math.max(onDarkInk, onLightInk) * 100) / 100,
   };
 }
 
@@ -272,9 +305,10 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
   // group map was built from — includes every phase/anchor).
   const allSlots = spec?.slots || [];
 
-  // Global ink color — every group flips together or not at all. Votes the
-  // post keep-out band so ink matches pixels under the shifted stack.
-  const inkOnLight = useMemo(
+  // The whole-clip vote is now only the FALLBACK: it still decides when a group's
+  // own band luminance is unavailable (plate scan off or empty), so behaviour is
+  // unchanged in that case.
+  const inkOnLightGlobal = useMemo(
     () => plateIsLightGlobal(plateHints, groups, timeScale, meta, groupAnchors, allSlots),
     [plateHints, groups, timeScale, meta, groupAnchors, allSlots]
   );
@@ -288,6 +322,22 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
         // Keep-out: whole group shifts to the first clear band (deterministic,
         // stable for the clip). stackContainerStyle still clamps to safe zones.
         const effectiveAnchor = groupAnchors.get(`${group.phase}|${group.anchor}`) || group.anchor;
+        // Ink for THIS group, from the band it actually occupies after keep-out.
+        const groupAtSec = first.timing.enterAtSec * timeScale + 0.5;
+        const bandLum = bandStateFor(plateHints, effectiveAnchor, groupAtSec).lum;
+        const bandInk = inkForBand(bandLum);
+        const inkOnLight = bandInk ? bandInk.onLight : inkOnLightGlobal;
+        // Even the better ink is below AA on this band: placement cannot carry it,
+        // so the strongest authored shadow does. 'layered' is an existing validated
+        // treatment value, not a new one.
+        const reinforceShadow = !!bandInk?.marginal;
+        // eslint-disable-next-line no-console
+        console.log(
+          `inkBand: ${group.phase}|${effectiveAnchor} lum=${bandLum == null ? '?' : bandLum.toFixed(2)} ` +
+          `-> ${inkOnLight ? 'dark ink (on-light tokens)' : 'light ink'}` +
+          `${bandInk ? ` best=${bandInk.best}:1` : ' (no band data -> global vote)'}` +
+          `${reinforceShadow ? ' MARGINAL -> layered shadow' : ''}`
+        );
         const container = stackContainerStyle({
           format,
           anchor: effectiveAnchor,
@@ -309,12 +359,15 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
                 if (!Renderer) return null;
                 // Bright plate (globally decided) → flip text tokens to
                 // their on-light variants (brand pills/CTA keep brand color).
-                const slot = inkOnLight
+                const slot = (inkOnLight || reinforceShadow)
                   ? {
                       ...rawSlot,
                       treatment: {
                         ...rawSlot.treatment,
-                        colorToken: contrastToken(mergedTokens, rawSlot.treatment.colorToken, true),
+                        colorToken: inkOnLight
+                          ? contrastToken(mergedTokens, rawSlot.treatment.colorToken, true)
+                          : rawSlot.treatment.colorToken,
+                        shadow: reinforceShadow ? 'layered' : rawSlot.treatment.shadow,
                       },
                     }
                   : rawSlot;
