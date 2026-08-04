@@ -124,9 +124,35 @@ OpenAPI schema**). Every catalog entry from `GET /api/v1/models` carries three U
    tables and pricing. **Primary.**
 2. `schema` → `https://static.atlascloud.ai/model/schema/<slug>.json` — machine enums.
 3. `price` → on the catalog entry itself. Field is **`price.actual.base_price`**, a
-   string. There is **no `pricing` key**.
+   string. There is **no `pricing` key**. ⚠️ **This is a BASE, not the amount charged
+   — see below.**
 
 README and schema agreed on all eight models checked. Re-run before trusting these.
+
+### `base_price` is not the charge (measured 2026-08-03)
+
+Corrected after a 40-render live sample. `base_price` under-reports the real charge by
+a multiplier that is **not published anywhere in the catalog**:
+
+| model | catalog `actual.base_price` | **measured charge** | ratio |
+|---|---|---|---|
+| `openai/gpt-image-2/edit` | $0.01 | **$0.07173** | 7.17x |
+| `openai/gpt-image-2-developer/edit` | $0.005 | **$0.03586** | 7.17x |
+
+Both were dead-consistent across every priced prediction, so the 50% `-developer`
+discount is real — but the multiplier sits on top of both. Do **not** hardcode 7.17
+or carry it to another model, size or quality; it was measured only at
+`1024x1024` / `quality: medium`.
+
+**Always read the price back from Atlas after generation** (owner rule). The
+authoritative figure is `price` on the **settled** prediction from
+`GET /api/v1/model/prediction/:id`. Atlas usually publishes it *after* the image is
+returned — **7 of 38** predictions had it at completion time — so a single read when
+the image lands misses most of them. `atlasImageService.scheduleCostReconcile` is the
+mechanism, and its retry budget was widened to
+`[3s, 10s, 30s, 60s, 120s, 300s]` on the same date for that reason. `buildPriceMap`
+gives a floor-grade estimate only; its job is to stop a $0.00 ledger row, not to
+answer "what did this cost".
 
 ### Selectable video models (`selectable: true` in `MODEL_CAPS`)
 

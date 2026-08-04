@@ -357,7 +357,13 @@ Phase 0 establishes baseline. Subsequent phases each have a measurable gate befo
 - **1-in-3 static ads** can still render a competitor-shaped brand mark on the
   product (e.g. tree emblem reading as Timberland on an Allbirds shoe) —
   prompts already ask for fidelity; fix is measure-and-reject, not more
-  prompt tuning. Video path not QC'd as of 2026-08-03.
+  prompt tuning. Video path not QC'd as of 2026-08-03. **Still open after the
+  2026-08-03 `PRODUCT_FIDELITY` hardening** (`staticAdIntents.js`), which is
+  owner-directed work on top of this note rather than a fix for it —
+  `adVisionQcService` remains the fix. Kill switch
+  `STATIC_PROMPT_FIDELITY_HARDENING=false` restores a byte-identical
+  pre-hardening prompt. Watch for a text-fidelity regression: the prompt more
+  than doubled and now sits above `SET EXACTLY THESE STRINGS`. See CLAUDE.md §2.
 - **`queued` ads never auto-drain** — operator/API must claim them.
 - **`veoPredictionId` is a spend receipt that is never resumed** — process
   death + re-drain double-bills.
