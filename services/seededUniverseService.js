@@ -202,27 +202,38 @@ function promoteFirstCatalogImage(rankedEntries) {
     && e.role === 'catalog'
     && e.media?.fileType !== 'video'
     && e.media?.metadata?.imageRole !== 'video';
-  // Missing / unparseable createdAt sorts LAST (Infinity), never first.
-  const createdAtOf = (e) => {
-    const t = e.media?.createdAt ? new Date(e.media.createdAt).getTime() : NaN;
-    return Number.isFinite(t) ? t : Infinity;
-  };
+  // NOTE: tier 2 used to sort on createdAt. It no longer does — see the tier 2
+  // comment below for why feed order starved the Director.
 
   // TIER 1 — the catalog feed's first image, as stamped at materialisation.
   let idx = rankedEntries.findIndex(
     (e) => isCatalog(e) && e.media?.metadata?.imageRole === 'hero'
   );
 
-  // TIER 2 — no stamp anywhere in the catalog set: earliest createdAt wins.
-  // Strict `<` means an equal timestamp never displaces the incumbent, so the
-  // earlier entry in ranked order keeps index 0.
+  // TIER 2 — no hero stamp anywhere in the catalog set: the BEST-RANKED
+  // catalog image wins. `rankedEntries` arrives already sorted by
+  // rankMergedPool (shotType first: lifestyle > on_model > flat_lay >
+  // product_only > detail > packaging, with the hero stamp as a within-tier
+  // tiebreak), so the first catalog entry in that order IS the best-ranked
+  // one. No separate sort is needed or wanted.
+  //
+  // WHY THIS CHANGED (2026-08-04, owner-directed). Tier 2 used to take the
+  // earliest-`createdAt` catalog entry — the catalog feed's first image. That
+  // is FEED ORDER, not quality, and it is routinely a bare packshot on white.
+  // With DIRECTOR_UNIVERSE_TOP_N=1 that single packshot became the Director's
+  // ENTIRE universe, and on SKUs whose description and reviews are empty the
+  // brief got thin enough that the model stopped emitting concepts and started
+  // asking clarifying questions instead ("I don't have enough information…").
+  // Measured: 51 concept rounds / 0 failures on 2026-08-03 (before the
+  // catalog-first cascade shipped) vs 10 failures / 11 rounds on 2026-08-04
+  // (after). Ranking within the catalog set fixes the starvation without
+  // giving up either guarantee that matters:
+  //   - still exactly ONE primary seed (owner: keep the single seed);
+  //   - still catalog-ONLY, because `isCatalog` gates every tier, so a UGC or
+  //     social post can never win index 0 — the whole point of the cascade.
+  // Tier 1 (the explicit hero stamp) is untouched and still wins outright.
   if (idx < 0) {
-    let best = Infinity;
-    for (let i = 0; i < rankedEntries.length; i++) {
-      if (!isCatalog(rankedEntries[i])) continue;
-      const t = createdAtOf(rankedEntries[i]);
-      if (idx < 0 || t < best) { idx = i; best = t; }
-    }
+    idx = rankedEntries.findIndex(isCatalog);
   }
 
   // TIER 3 (idx === -1) — no catalog entry at all. Also covers "already
@@ -531,7 +542,7 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
     if (headIsCatalog && head !== ranked[0]) {
       const tier = head.media?.metadata?.imageRole === 'hero'
         ? "tier 1 (imageRole='hero')"
-        : 'tier 2 (earliest catalog createdAt)';
+        : 'tier 2 (best-ranked catalog image)';
       console.log(
         `🎯 seeded universe — first catalog image ${String(head.media._id)} promoted to index 0 ` +
         `from rank ${ranked.indexOf(head)} of ${ranked.length} via ${tier} ` +

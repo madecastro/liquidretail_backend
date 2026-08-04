@@ -26,16 +26,29 @@
 //     TIER 1  role==='catalog' && metadata.imageRole==='hero' — the stamp
 //             catalogProductDetectService writes on CatalogProduct.imageUrl
 //             (`:60`), i.e. the catalog feed's first image.
-//     TIER 2  else the earliest-createdAt role==='catalog' entry. THIS TIER IS
+//     TIER 2  else the BEST-RANKED role==='catalog' entry. THIS TIER IS
 //             THE AMENDMENT: the tier-1 stamp can be ABSENT (materialisation
 //             failed, legacy row), and a tier-1-only helper then returned the
 //             pool unchanged so the shotType ranking decided index 0 out of a
 //             pool that MERGES catalog with product_match UGC — which is
 //             exactly how a UGC post became the default seed.
 //     TIER 3  else no catalog entry exists → unchanged copy.
-//   Ties in tier 2 (equal timestamps, or none usable) resolve to the earlier
-//   entry in RANKED order; a missing/unparseable createdAt sorts LAST, never
-//   first.
+//   `rankedEntries` arrives already sorted by rankMergedPool, so "best-ranked"
+//   is just the FIRST catalog entry in that order. No separate sort.
+//
+// AMENDED 2026-08-04 — tier 2 used to take the earliest `createdAt`, i.e. the
+//   catalog feed's first image. That is FEED ORDER, not quality, and it is
+//   routinely a bare packshot: B9's fixture picked a DETAIL shot over a
+//   LIFESTYLE one purely because it was older, and R6's picked product_only
+//   over lifestyle. With DIRECTOR_UNIVERSE_TOP_N=1 that single weak image was
+//   the Director's ENTIRE universe, and on SKUs with an empty description and
+//   no reviews the brief got thin enough that the model stopped emitting
+//   concepts and started asking clarifying questions. Measured on the web
+//   service: 51 concept rounds / 0 failures on 2026-08-03 (before the cascade
+//   shipped) against 10 failures / 11 rounds on 2026-08-04 (after).
+//   Ranking WITHIN the catalog set fixes that while keeping both guarantees:
+//   exactly ONE primary seed, and catalog-only so a UGC post can never win
+//   index 0. `createdAt` is no longer read by this function at all.
 //
 // This harness is pure + offline: no DB, no network, no API key. The
 // buildSeededUniverse cases drive the REAL exported function with its three
@@ -51,11 +64,16 @@
 //       → 7 fail: P7 ×3, T3, T5 ×2, S8 "TIER 1 is role-gated AND stamp-gated".
 //         A UGC post carrying imageRole='hero' wins index 0 — the exact media
 //         class this rule exists to dethrone.
-//   (a2) Let TIER 2 match ANY role — replace `if (!isCatalog(...)) continue;`
-//        with `if (!rankedEntries[i]) continue;`
-//        → 9 fail: P7 ×2, T2 ×2, T3, T4 ×2, T5, S8 "TIER 2 skips every
-//          non-catalog entry". A UGC post wins tier 2, so the cascade can
-//          resolve to UGC — which the rule forbids outright.
+//   (a2) Let TIER 2 match ANY role — replace
+//        `idx = rankedEntries.findIndex(isCatalog);` with
+//        `idx = rankedEntries.findIndex((e) => !!e);`
+//        → 22 fail (MEASURED 2026-08-04), incl. P7 ×2, T1 ×3, T2 ×2, S8
+//          "TIER 2 selects only through isCatalog". A UGC post wins tier 2, so
+//          the cascade can resolve to UGC — which the rule forbids outright.
+//   (a2b) Take the LAST catalog entry instead of the best-ranked one
+//        → 20 fail (MEASURED 2026-08-04), incl. T1 "it does NOT pick the older,
+//          lower-ranked catalog entry", R6 ×2, B9 ×2. This is the 2026-08-04
+//          starvation regression itself.
 //   (a3) Delete the whole TIER 2 loop (`if (idx < 0) { … }`), i.e. go back to
 //        tier-1-only → 23 fail: P7 ×2, P11 (tier-2 path), T1 ×3, T2 ×2, T3,
 //        T4 ×4, R6 ×2, B9 ×4, L4, S8 ×3. An UNSTAMPED catalog set falls
@@ -106,9 +124,10 @@
 //   • Nothing about the deterministic VIDEO rail, which runs the same cascade
 //     as direct Mongo queries (`campaignAdsGenerationService.js:2085`) and
 //     never calls buildSeededUniverse.
-//   • Nothing about whether catalog Media.createdAt really is feed order in
-//     prod. Tier 2 assumes materialisation order ≈ feed order; that is an
-//     assumption about ingest, not something a pure function can assert.
+//   • Nothing about whether classification.shotType is CORRECT in prod. Tier 2
+//     now trusts the classifier's ranking; a mislabelled lifestyle shot will be
+//     seeded as one. That is an assumption about classification quality, not
+//     something a pure function can assert.
 
 const fs   = require('fs');
 const path = require('path');
@@ -321,21 +340,27 @@ const universeIds = (u) => (u || []).map(e => String(e.mediaId));
 
 {
   // T1 — TIER 2 FIRES. Catalog entries present, NONE stamped hero → the
-  // earliest-createdAt catalog entry is promoted to index 0.
+  // BEST-RANKED catalog entry is promoted to index 0. Entries arrive already
+  // shotType-ranked, so "best-ranked" is simply the first catalog entry in the
+  // given order. A UGC post heads the input so the tier actually MOVES
+  // something rather than trivially finding a catalog entry already at 0.
+  const ugcHead = entry(media(oid(203), { shotType: 'lifestyle', source: 'instagram', engagement: 99 }), 'ugc_product_match');
   const late   = entry(media(oid(200), { shotType: 'lifestyle', imageRole: 'alt', createdAt: '2026-05-05T00:00:00.000Z' }), 'catalog');
   const early  = entry(media(oid(201), { shotType: 'detail',    imageRole: 'alt', createdAt: '2024-02-02T00:00:00.000Z' }), 'catalog');
   const middle = entry(media(oid(202), { shotType: 'flat_lay',  imageRole: 'alt', createdAt: '2025-03-03T00:00:00.000Z' }), 'catalog');
-  const input  = [late, middle, early];
+  const input  = [ugcHead, late, middle, early];
   const before = ids(input);
   const out    = promoteFirstCatalogImage(input);
 
-  check('T1 tier 2 fires with no stamped entry: earliest-createdAt catalog entry is index 0',
-    ids(out)[0], oid(201));
+  check('T1 tier 2 fires with no stamped entry: BEST-RANKED catalog entry is index 0',
+    ids(out)[0], oid(200));
+  check('T1 it does NOT pick the older, lower-ranked catalog entry (feed order is not quality)',
+    ids(out)[0] === oid(201), false);
   check('T1 the rest keep their ranked order behind it',
-    ids(out), [oid(201), oid(200), oid(202)]);
+    ids(out), [oid(200), oid(203), oid(202), oid(201)]);
   check('T1 tier 2 does not mutate the input', ids(input), before);
   checkTrue('T1 tier 2 returns a NEW array', out !== input);
-  checkTrue('T1 tier 2 promotes the same object, not a clone', out[0] === early);
+  checkTrue('T1 tier 2 promotes the same object, not a clone', out[0] === late);
 }
 
 {
@@ -390,13 +415,14 @@ const universeIds = (u) => (u || []).map(e => String(e.mediaId));
   const dated   = entry(media(oid(234), { shotType: 'detail', imageRole: 'alt', createdAt: '2026-04-04T00:00:00.000Z' }), 'catalog');
   checkTrue('T4 the missing-createdAt fixture really has no createdAt key',
     !('createdAt' in noDate.media));
-  check('T4 a catalog entry with NO createdAt loses to one that has it, even when ranked first',
-    ids(promoteFirstCatalogImage([noDate, dated])), [oid(234), oid(233)]);
+  // createdAt is NO LONGER read by tier 2 — ranked order alone decides.
+  check('T4 createdAt is not consulted: an undated catalog entry ranked first still wins',
+    ids(promoteFirstCatalogImage([noDate, dated])), [oid(233), oid(234)]);
   check('T4 …and does not displace a dated entry from behind either',
     ids(promoteFirstCatalogImage([dated, noDate])), [oid(234), oid(233)]);
   const bogus = entry(media(oid(235), { shotType: 'detail', imageRole: 'alt', createdAt: 'not-a-date' }), 'catalog');
-  check('T4 an UNPARSEABLE createdAt is treated as missing (sorts last, does not win)',
-    ids(promoteFirstCatalogImage([bogus, dated])), [oid(234), oid(235)]);
+  check('T4 an UNPARSEABLE createdAt is equally irrelevant — ranked order decides',
+    ids(promoteFirstCatalogImage([bogus, dated])), [oid(235), oid(234)]);
 
   // Every catalog entry missing createdAt → all tie at Infinity → the earliest
   // in ranked order wins, which is index 0 here, so the array is unchanged.
@@ -504,10 +530,14 @@ const universeIds = (u) => (u || []).map(e => String(e.mediaId));
   const ranked   = rankMergedPool([catFirst, altLate, ugc], { wantsVideo: false });
   check('R6 unstamped pool: the ranker still puts the UGC post at index 0',
     ids(ranked)[0], oid(74));
-  check('R6 THE AMENDMENT: tier 2 pulls the earliest-createdAt catalog entry to index 0 anyway',
-    ids(promoteFirstCatalogImage(ranked).slice(0, 1)), [oid(75)]);
+  // oid(73) is the LIFESTYLE catalog shot; oid(75) is an older product_only.
+  // Tier 2 ranks within the catalog set, so quality wins over feed order.
+  check('R6 THE AMENDMENT: tier 2 pulls the BEST-RANKED catalog entry to index 0 anyway',
+    ids(promoteFirstCatalogImage(ranked).slice(0, 1)), [oid(73)]);
+  check('R6 it does NOT pick the older, weaker product_only shot',
+    ids(promoteFirstCatalogImage(ranked).slice(0, 1)), [oid(73)]);
   check('R6 and the rest keep their shotType order behind it',
-    ids(promoteFirstCatalogImage(ranked)), [oid(75), oid(74), oid(73)]);
+    ids(promoteFirstCatalogImage(ranked)), [oid(73), oid(74), oid(75)]);
 }
 
 {
@@ -627,8 +657,18 @@ async function main() {
       && /from rank \d+/.test(l) && /tier 1 \(imageRole='hero'\)/.test(l)));
 
   // B9 — TIER 2 END TO END, same money shape. No catalog doc carries the
-  // imageRole stamp, so tier 1 matches nothing; the earliest-createdAt catalog
-  // doc must still beat the UGC post the ranker put at index 0.
+  // imageRole stamp, so tier 1 matches nothing; the BEST-RANKED catalog doc
+  // must still beat the UGC post the ranker put at index 0.
+  //
+  // This fixture is also the regression case for the 2026-08-04 change. oid(130)
+  // is a LIFESTYLE catalog shot; oid(131) is a DETAIL catalog shot that happens
+  // to be three years older. The old tier 2 took earliest-createdAt and so
+  // handed the Director the DETAIL shot — feed order, not quality. With
+  // DIRECTOR_UNIVERSE_TOP_N=1 that one weak image was the entire universe, and
+  // thin-signal SKUs starved the Director into clarifying questions instead of
+  // concepts. Tier 2 now takes the best-ranked catalog entry, so the lifestyle
+  // shot wins — while `isCatalog` still gates every tier, so the UGC post at
+  // oid(132) can never be selected.
   const T2_FIXT = {
     catalog: [
       media(oid(130), { shotType: 'lifestyle', createdAt: '2026-06-06T00:00:00.000Z' }),
@@ -645,19 +685,22 @@ async function main() {
   const t2Fixed = await withStubs(T2_FIXT, () => withCapturedLogs(() =>
     buildSeededUniverse(BRAND_ID, PRODUCT_ID, { topN: 1, preferFirstCatalogImage: true })
   ));
-  check('B9 unstamped pool, option ON: tier 2 yields the earliest-createdAt CATALOG doc',
-    universeIds(t2Fixed.value.universe), [oid(131)]);
+  // The LIFESTYLE catalog shot, not the older DETAIL one — quality, not feed order.
+  check('B9 unstamped pool, option ON: tier 2 yields the BEST-RANKED catalog doc',
+    universeIds(t2Fixed.value.universe), [oid(130)]);
+  check('B9 tier 2 does NOT pick the older, weaker catalog shot (the starvation regression)',
+    universeIds(t2Fixed.value.universe).includes(oid(131)), false);
   check('B9 that entry is role=catalog (never UGC)', t2Fixed.value.universe[0].role, 'catalog');
   check('B9 and it carries NO imageRole stamp — tier 2, not tier 1',
     t2Fixed.value.universe[0].metadata.imageRole, null);
   checkTrue('L4 the tier-2 promotion names tier 2 in the log',
-    t2Fixed.lines.some(l => l.includes(oid(131)) && /promoted to index 0/.test(l)
-      && /tier 2 \(earliest catalog createdAt\)/.test(l)));
+    t2Fixed.lines.some(l => l.includes(oid(130)) && /promoted to index 0/.test(l)
+      && /tier 2 \(best-ranked catalog image\)/.test(l)));
   const t2Wide = await withStubs(T2_FIXT, () => withCapturedLogs(() =>
     buildSeededUniverse(BRAND_ID, PRODUCT_ID, { topN: 10, preferFirstCatalogImage: true })
   ));
   check('B9 topN=10 → tier-2 winner first, then the untouched shotType ranking',
-    universeIds(t2Wide.value.universe), [oid(131), oid(132), oid(130)]);
+    universeIds(t2Wide.value.universe), [oid(130), oid(132), oid(131)]);
 
   // B3 — a wider window keeps the shotType ranking behind the pinned image.
   const wide = await withStubs(FIXT, () => withCapturedLogs(() =>
@@ -824,12 +867,16 @@ async function main() {
       /findIndex\(\s*\(e\) => isCatalog\(e\) && e\.media\?\.metadata\?\.imageRole === 'hero'\s*\)/.test(helper));
     checkTrue('S8 TIER 2 only runs when tier 1 found nothing',
       /if \(idx < 0\) \{/.test(helper));
-    checkTrue('S8 TIER 2 skips every non-catalog entry (so the cascade can never resolve to UGC)',
-      /if \(!isCatalog\(rankedEntries\[i\]\)\) continue;/.test(helper));
-    checkTrue('S8 TIER 2 keeps the earliest createdAt with a STRICT < (ties keep ranked order)',
-      /if \(idx < 0 \|\| t < best\) \{ idx = i; best = t; \}/.test(helper));
-    checkTrue('S8 a missing / unparseable createdAt maps to Infinity, not epoch 0',
-      /return Number\.isFinite\(t\) \? t : Infinity;/.test(helper));
+    // Tier 2 selects THROUGH isCatalog, so a UGC/social entry can never win
+    // index 0. This is the load-bearing guarantee of the whole cascade.
+    checkTrue('S8 TIER 2 selects only through isCatalog (so the cascade can never resolve to UGC)',
+      /idx = rankedEntries\.findIndex\(isCatalog\);/.test(helper));
+    // Feed order is what starved the Director on 2026-08-04. rankedEntries is
+    // already shotType-ranked, so findIndex yields the BEST catalog entry.
+    checkTrue('S8 TIER 2 no longer reads createdAt at all (feed order is not quality)',
+      !/createdAt/.test(helper));
+    checkTrue('S8 TIER 2 relies on the pre-ranked order rather than re-sorting',
+      !/best = Infinity/.test(helper) && !/\.sort\(/.test(helper));
     checkTrue('S8 TIER 3 / already-first is the `idx <= 0` bail',
       /if \(idx <= 0\) return rankedEntries\.slice\(\);/.test(helper));
   }
