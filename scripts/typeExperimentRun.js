@@ -85,6 +85,7 @@ function run(script, scriptArgs) {
   return res.status === 0;
 }
 
+const pendingPersist = [];
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
 const writeJson = (p, v) => fs.writeFileSync(p, JSON.stringify(v, null, 2));
 
@@ -98,6 +99,9 @@ function recordColumn(name, urlsByAdId, extra = {}) {
   }
   results.meta[name] = { recordedAt: new Date().toISOString(), ...extra };
   writeJson(F.results, results);
+  // Mirrored immediately: a dropped SSH session after an arm must not lose the
+  // only record of that arm's URLs, which the next re-title would overwrite.
+  pendingPersist.push(stateSave('results', results));
   const missing = Object.values(urlsByAdId).filter((u) => !u).length;
   log(`📊 column '${name}': ${Object.keys(urlsByAdId).length} ads, ${missing} with no renderUrl`);
 }
@@ -114,14 +118,71 @@ async function currentUrls(adIds) {
 
 const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 
+// ── STATE MUST OUTLIVE THE SSH SESSION ─────────────────────────────────
+//
+// The pod's /tmp is PER-SSH-SESSION, not per-pod: a manifest written in one
+// `render-ssh` call is gone by the next one (measured — /tmp was empty and
+// freshly stamped 30 seconds after a successful pool run). That breaks resumable
+// phases, and it corrupts the experiment in a way that would not be obvious:
+// re-deriving the pool after arm A has run captures ARM A's renderUrl as the
+// "baseline", so the before/after comparison would silently compare an arm
+// against itself.
+//
+// So every phase artifact is mirrored into one Mongo document, and any missing
+// local file is restored from it on start. The collection is created on demand
+// and is defined HERE rather than in models/ — this is experiment scaffolding and
+// must add no production surface. Drop it with:
+//   db.type_experiment_state.deleteMany({})
+const RUN_ID = flag('run', 'default');
+const STATE_COLL = 'type_experiment_state';
+
+async function stateDoc() {
+  return mongoose.connection.collection(STATE_COLL).findOne({ _id: RUN_ID });
+}
+async function stateSave(key, value) {
+  await mongoose.connection.collection(STATE_COLL).updateOne(
+    { _id: RUN_ID },
+    { $set: { [key]: value, updatedAt: new Date() } },
+    { upsert: true }
+  );
+}
+/** Restore any phase file this session is missing from the durable copy. */
+async function stateRestore() {
+  const doc = await stateDoc();
+  if (!doc) { log(`state: no durable copy for run '${RUN_ID}' yet`); return; }
+  let restored = 0;
+  for (const [key, file] of [['pool', F.pool], ['templates', F.templates],
+    ['autonomy', F.autonomy], ['results', F.results], ['qc', F.qc]]) {
+    if (doc[key] && !fs.existsSync(file)) { writeJson(file, doc[key]); restored++; }
+  }
+  log(`state: restored ${restored} artifact(s) from run '${RUN_ID}' (saved ${doc.updatedAt?.toISOString?.() || '?'})`);
+}
+/** Mirror whatever this session produced back into the durable copy. */
+async function statePersist() {
+  for (const [key, file] of [['pool', F.pool], ['templates', F.templates],
+    ['autonomy', F.autonomy], ['results', F.results], ['qc', F.qc]]) {
+    if (fs.existsSync(file)) await stateSave(key, readJson(file));
+  }
+  log(`state: persisted run '${RUN_ID}'`);
+}
+
 (async () => {
-  log(`=== type experiment: phases ${PHASES.join(',')} → ${DIR} ===`);
+  log(`=== type experiment: run '${RUN_ID}', phases ${PHASES.join(',')} → ${DIR} ===`);
+  // Connect BEFORE the pool phase so a previous session's manifest can be
+  // restored — otherwise `pool` would re-derive and clobber the baseline.
+  if (!DRY_RUN) { await mongoose.connect(process.env.MONGODB_URI); await stateRestore(); }
 
   // ── pool ────────────────────────────────────────────────────────────
   if (PHASES.includes('pool')) {
-    const a = [`--count=${COUNT}`, `--out=${F.pool}`, '--print'];
-    if (BRANDS_FILTER) a.push(`--brands=${BRANDS_FILTER}`);
-    if (!run('typeExperimentPool.js', a)) process.exit(1);
+    if (fs.existsSync(F.pool) && !has('reselect')) {
+      log('⏭  pool already exists for this run — reusing it (pass --reselect to pick a new set). ' +
+        'Re-deriving after an arm has run would capture that arm as the baseline.');
+    } else {
+      const a = [`--count=${COUNT}`, `--out=${F.pool}`, '--print'];
+      if (BRANDS_FILTER) a.push(`--brands=${BRANDS_FILTER}`);
+      if (!run('typeExperimentPool.js', a)) process.exit(1);
+      if (!DRY_RUN) await stateSave('pool', readJson(F.pool));
+    }
   }
   if (!fs.existsSync(F.pool) && !DRY_RUN) {
     log(`✖ no ${F.pool} — run the pool phase first`); process.exit(1);
@@ -138,8 +199,6 @@ const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').repla
       `titleStylePreset (${[...new Set(pinned.map((p) => `${p.brand}→${pool.brands[p.brand].titleStylePreset}`))].join(', ')}) ` +
       `— their canonical arm is not what renders. Reported, not silently dropped.`);
   }
-
-  if (!DRY_RUN) await mongoose.connect(process.env.MONGODB_URI);
 
   // ── baseline ────────────────────────────────────────────────────────
   if (PHASES.includes('baseline')) {
@@ -267,6 +326,7 @@ const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').repla
     run('typeQcRenders.js', a);
   }
 
+  if (!DRY_RUN) { await Promise.all(pendingPersist); await statePersist(); }
   if (mongoose.connection.readyState) await mongoose.disconnect();
   log('=== done ===');
   process.exit(0);
