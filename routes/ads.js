@@ -19,6 +19,8 @@ const crypto = require('crypto');
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
+// Receipt guard — a requeue must never re-submit work we have paid for.
+const { receiptFree } = require('../services/spendReceipt');
 const router = express.Router();
 
 const Ad           = require('../models/Ad');
@@ -695,7 +697,7 @@ router.post('/generate', async (req, res) => {
         });
         if (adIds && adIds.length) {
           await Ad.updateMany(
-            { _id: { $in: adIds }, status: 'rendering' },
+            receiptFree({ _id: { $in: adIds }, status: 'rendering' }),
             { $set: { status: 'queued', updatedAt: new Date() } }
           ).catch(() => {});
         }
@@ -989,7 +991,7 @@ router.post('/runs', express.json(), async (req, res) => {
           detail: err.stack || null
         });
         Ad.updateMany(
-          { _id: { $in: renderIds }, status: 'rendering' },
+          receiptFree({ _id: { $in: renderIds }, status: 'rendering' }),
           { $set: { status: 'queued', updatedAt: new Date() } }
         ).catch(() => {});
         CampaignRun.updateOne(
@@ -1009,7 +1011,7 @@ router.post('/runs', express.json(), async (req, res) => {
     if (claimedIds.length) {
       try {
         await Ad.updateMany(
-          { _id: { $in: claimedIds }, status: 'rendering' },
+          receiptFree({ _id: { $in: claimedIds }, status: 'rendering' }),
           { $set: { status: 'queued', updatedAt: new Date() } }
         );
       } catch (requeueErr) {
