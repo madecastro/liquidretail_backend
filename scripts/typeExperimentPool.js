@@ -61,6 +61,12 @@ const POOL_LIMIT = parseInt(flag('pool', '400'), 10);
 const BRAND_FILTER = (flag('brands', '') || '').split(',').map((s) => s.trim()).filter(Boolean);
 const ALLOW_FONTLESS = has('allow-fontless');
 const PRINT = has('print');
+// Test and scratch brand rows are real rows with real masters, so nothing else
+// filters them — but "a mix of clients" (owner) does not mean two variants of the
+// same client plus a row literally called Test. Overridable, and reported.
+const DEFAULT_EXCLUDE = /(^|\s)test(\s|$|\d)|^ub\d+$/i;
+const EXCLUDE = flag('exclude', null) ? new RegExp(flag('exclude'), 'i') : DEFAULT_EXCLUDE;
+const NO_EXCLUDE = has('no-exclude');
 
 // ── measurement ────────────────────────────────────────────────────────
 
@@ -159,16 +165,21 @@ const bucket3 = (v, lo, hi) => (v == null ? 'unknown' : v < lo ? 'low' : v < hi 
   const byMedia = new Map(medias.map((m) => [String(m._id), m]));
 
   const candidates = [];
-  const rejected = { noBrand: 0, noFont: 0, brandFilter: 0 };
+  const rejected = { noBrand: 0, noFont: 0, brandFilter: 0, excluded: 0 };
+  const excludedBrands = new Set();
   for (const a of ads) {
     const t = brandType.get(String(a.brandId));
     if (!t) { rejected[BRAND_FILTER.length ? 'brandFilter' : 'noBrand']++; continue; }
+    if (!NO_EXCLUDE && !BRAND_FILTER.length && EXCLUDE.test(t.name)) {
+      rejected.excluded++; excludedBrands.add(t.name); continue;
+    }
     if (!ALLOW_FONTLESS && !hasRealFont(t)) { rejected.noFont++; continue; }
     const m = byMedia.get(String(a.mediaId));
     candidates.push({
       adId: String(a._id),
       brand: t.name,
       brandId: String(a.brandId),
+      mediaId: String(a.mediaId || ''),
       aspectRatio: a.aspectRatio,
       status: a.status,
       headline: (a.copy?.headline || '').slice(0, 60),
@@ -181,7 +192,9 @@ const bucket3 = (v, lo, hi) => (v == null ? 'unknown' : v < lo ? 'low' : v < hi 
   }
 
   console.log(`📊 pool: ${ads.length} re-titleable ads → ${candidates.length} on brands with real type ` +
-    `(rejected: ${rejected.noFont} fontless, ${rejected.noBrand} unresolvable brand, ${rejected.brandFilter} filtered)`);
+    `(rejected: ${rejected.noFont} fontless, ${rejected.noBrand} unresolvable brand, ` +
+    `${rejected.brandFilter} filtered, ${rejected.excluded} test/scratch brands` +
+    `${excludedBrands.size ? ` [${[...excludedBrands].join(', ')}]` : ''})`);
   const perBrand = {};
   for (const c of candidates) perBrand[c.brand] = (perBrand[c.brand] || 0) + 1;
   console.log('📊 candidates per brand:', JSON.stringify(perBrand));
@@ -219,7 +232,7 @@ const bucket3 = (v, lo, hi) => (v == null ? 'unknown' : v < lo ? 'low' : v < hi 
   // Final pick. Greedy over a novelty score: an unseen brand beats an unseen
   // aspect ratio beats an unseen composition bucket beats an unseen lightness
   // bucket. Deterministic — no randomness, so a re-run reproduces the set.
-  const seen = { brand: new Set(), ar: new Set(), comp: new Set(), lum: new Set(), pair: new Set() };
+  const seen = { brand: new Set(), ar: new Set(), comp: new Set(), lum: new Set(), pair: new Set(), media: new Set() };
   const picked = [];
   const remaining = [...shortlist];
   while (picked.length < COUNT && remaining.length) {
@@ -230,16 +243,26 @@ const bucket3 = (v, lo, hi) => (v == null ? 'unknown' : v < lo ? 'low' : v < hi 
       let score = 0;
       if (!seen.brand.has(c.brand)) score += 1000;
       if (!seen.ar.has(c.aspectRatio)) score += 300;
+      // DIFFERENT FOOTAGE, not just a different row. The first run picked three
+      // ads off one media (identical lum 0.843) and called it variety — they are
+      // the same picture at three crops, which tests nothing about colour or
+      // composition.
+      if (c.mediaId && !seen.media.has(c.mediaId)) score += 250;
       if (!seen.pair.has(`${c.brand}|${c.aspectRatio}`)) score += 120;
       if (!seen.comp.has(comp)) score += 60;
       if (!seen.lum.has(lum)) score += 60;
       if (!seen.comp.has(`${c.brand}|${comp}`)) score += 20;
       if (!seen.lum.has(`${c.brand}|${lum}`)) score += 20;
+      // An unmeasured seed carries no variety information, so it must not beat a
+      // measured one for the same slot.
+      if (c.seedLum == null) score -= 200;
+      if (c.subjectFraction == null) score -= 50;
       if (score > bestScore) { bestScore = score; best = c; }
     }
     const comp = bucket3(best.subjectFraction, 0.25, 0.5);
     const lum = bucket3(best.seedLum, 0.35, 0.6);
     seen.brand.add(best.brand); seen.ar.add(best.aspectRatio);
+    if (best.mediaId) seen.media.add(best.mediaId);
     seen.pair.add(`${best.brand}|${best.aspectRatio}`);
     seen.comp.add(comp); seen.comp.add(`${best.brand}|${comp}`);
     seen.lum.add(lum); seen.lum.add(`${best.brand}|${lum}`);

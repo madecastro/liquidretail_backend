@@ -45,6 +45,21 @@ const Ad = require('../models/Ad');
 const Brand = require('../models/Brand');
 const { chatCompletion } = require('../services/atlasLlmService');
 const { validateTitleSpec } = require('../services/titleSpecValidator');
+const { resolveFamily, normalizeFontFamily } = require('../services/fontResolverService');
+const axios = require('axios');
+
+/**
+ * The observed family, but ONLY if we can serve it exactly (a real Google family
+ * or an ingested brand file). A proprietary or hallucinated name would otherwise
+ * resolve to a tone-matched lookalike, which is not the brand's face — arm B
+ * would then look worse for a reason unrelated to the template.
+ */
+async function exactFamilyOrNull(name, brand) {
+  const fam = normalizeFontFamily(name);
+  if (!fam) return null;
+  const entry = await resolveFamily(fam, { brand, weight: 700, role: 'heading', quiet: true });
+  return entry && entry.exact !== false ? entry.family : null;
+}
 
 const PRESET_DIR = path.join(__dirname, '..', 'remotion', 'presets');
 const CANONICAL = path.join(PRESET_DIR, 'canonical.json');
@@ -183,6 +198,28 @@ function normalizeTemplate(raw) {
     notes: String(raw?.notes || '').slice(0, 200),
     _coerced: bad,
   };
+
+  // REJECT, DON'T CLAMP. Clamping every field means a template that is WORSE
+  // than canonical still ships and still reports success — all-caps 900-weight
+  // quotes at +8 tracking behind a solid scrim all pass a clamp. These are
+  // typographic red lines, not preferences, so a template that crosses one is
+  // thrown away and that brand keeps canonical.
+  const reject = [];
+  if (out.quote.casing === 'upper') reject.push('quote set in all caps');
+  if (out.quote.weight > 700) reject.push(`quote weight ${out.quote.weight}`);
+  if (out.headline.weight > 800) reject.push(`headline weight ${out.headline.weight}`);
+  if (out.headline.trackingPx > 4) reject.push(`headline tracking ${out.headline.trackingPx}px`);
+  if (out.quote.trackingPx > 2) reject.push(`quote tracking ${out.quote.trackingPx}px`);
+  // The owner removed scrims and pills from this design language deliberately
+  // ("plain text, no pill"). This experiment tests type, not scrim reintroduction.
+  if (out.background.scrim !== 'none') reject.push(`scrim '${out.background.scrim}'`);
+  if (out.confidence < 0.4) reject.push(`confidence ${out.confidence}`);
+  // An answer with no real headline observation is a default-filled shell that
+  // merely LOOKS like a template.
+  if (raw?.headline == null || raw.headline.casing == null || raw.headline.weight == null) {
+    reject.push('no headline observation');
+  }
+  out._reject = reject;
   return out;
 }
 
@@ -197,16 +234,40 @@ function normalizeTemplate(raw) {
 async function staticsForBrand(brandId, want) {
   const base = {
     brandId, renderRoute: 'html_gen', renderUrl: { $ne: null },
-    status: { $nin: ['failed', 'archived'] },
+    // variantKind MATTERS: without it, a repurposed social/UGC static trains the
+    // brand's "type template". UGC is a different design language and the owner
+    // has said that path is not optimised yet — it must not define brand type.
+    variantKind: 'product_image',
+    // A finished render only. 'queued'/'rendering' rows can carry a stale
+    // renderUrl from a previous attempt, which would be read as current.
+    status: { $in: ['draft', 'live'] },
     template: /^ai_/,
   };
-  const approved = await Ad.find({ ...base, approved: true })
-    .select('renderUrl aspectRatio template approved createdAt').sort({ createdAt: -1 }).limit(want).lean();
-  if (approved.length >= want) return { rows: approved, approvedOnly: true };
-  const rest = await Ad.find({ ...base, approved: { $ne: true } })
-    .select('renderUrl aspectRatio template approved createdAt').sort({ createdAt: -1 })
-    .limit(want - approved.length).lean();
-  return { rows: [...approved, ...rest], approvedOnly: approved.length === want };
+  const sel = 'renderUrl aspectRatio template approved createdAt';
+  const approved = await Ad.find({ ...base, approved: true }).select(sel).sort({ createdAt: -1 }).limit(want * 2).lean();
+  const rest = approved.length >= want ? []
+    : await Ad.find({ ...base, approved: { $ne: true } }).select(sel).sort({ createdAt: -1 }).limit(want * 2).lean();
+
+  // Verify each URL actually serves an image BEFORE paying for a vision call. A
+  // renderUrl can be a 404 Cloudinary id or a raw catalog photo copied onto the
+  // ad; either bills us to describe the wrong thing.
+  const usable = [];
+  for (const row of [...approved, ...rest]) {
+    if (usable.length >= want) break;
+    try {
+      const head = await axios.head(row.renderUrl, { timeout: 12000, maxRedirects: 3, validateStatus: () => true });
+      const type = String(head.headers['content-type'] || '');
+      const len = Number(head.headers['content-length'] || 0);
+      if (head.status >= 400 || !/^image\//.test(type) || (len && len < 8000)) {
+        console.warn(`   ⏭ ${row.renderUrl.slice(-28)}: status=${head.status} type=${type} len=${len}`);
+        continue;
+      }
+      usable.push(row);
+    } catch (err) {
+      console.warn(`   ⏭ ${row.renderUrl.slice(-28)}: ${String(err.message).slice(0, 40)}`);
+    }
+  }
+  return { rows: usable, approvedOnly: usable.length > 0 && usable.every((r) => r.approved) };
 }
 
 // ── preset compilation ─────────────────────────────────────────────────
@@ -220,10 +281,14 @@ const SIZE_SCALE = { small: 0.85, medium: 1, large: 1.15, hero: 1.3 };
  * phases, bindings and visibility all stay canonical — this experiment tests
  * typography, so anything else changing would confound the comparison.
  */
-function compilePreset(brandName, tpl) {
+function compilePreset(brandName, tpl, { brandId = null, headingFamily = null } = {}) {
   const canonical = JSON.parse(fs.readFileSync(CANONICAL, 'utf8'));
   const preset = JSON.parse(JSON.stringify(canonical));
-  preset.name = `typetpl-${slugify(brandName)}`;
+  const slug = slugify(brandName);
+  if (!slug) throw new Error(`brand name '${brandName}' slugifies to nothing`);
+  // Brand id suffix: two brands can slugify identically ("Pelagic Gear" and
+  // "Pelagic-Gear"), and the second would silently overwrite the first's preset.
+  preset.name = `typetpl-${slug}${brandId ? `-${String(brandId).slice(-6)}` : ''}`;
   preset.description = `Type template extracted from ${brandName}'s own approved statics ` +
     `(arm B, ${new Date().toISOString().slice(0, 10)}). Structure is canonical; only type differs.`;
 
@@ -253,9 +318,28 @@ function compilePreset(brandName, tpl) {
       slot.treatment.shadow = tpl.background.shadow;
       slot.position = slot.position || {};
       slot.position.align = r.align;
-      if (r.relativeSize && SIZE_SCALE[r.relativeSize] && slot.treatment.sizeScale == null) {
-        slot.treatment.sizeScale = SIZE_SCALE[r.relativeSize];
-      }
+      // SIZE IS THE BIGGEST LEVER AND THE FIRST DRAFT LEFT IT DEAD: the guard was
+      // `sizeScale == null`, but canonical already authors a sizeScale on these
+      // slots, so the observed size feel was never applied. MULTIPLY the authored
+      // value rather than replacing it — canonical's relative hierarchy between
+      // slots is deliberate and a flat overwrite would flatten it (and can push
+      // text out of the safe zone). Clamped to the validator's 0.5..2.
+      const mult = SIZE_SCALE[r.relativeSize] || 1;
+      const authored = Number.isFinite(Number(slot.treatment.sizeScale)) ? Number(slot.treatment.sizeScale) : 1;
+      slot.treatment.sizeScale = Math.round(Math.min(2, Math.max(0.5, authored * mult)) * 100) / 100;
+    }
+  }
+
+  // TYPEFACE. The model names the face it sees ("Druk Condensed"). Honour it only
+  // when we can serve that family EXACTLY — the same rule arm A uses — otherwise
+  // a made-up or proprietary name would resolve to a tone-matched guess, which is
+  // not the brand's face and would make arm B look worse for a reason that has
+  // nothing to do with the template. Resolution happens in the caller (async).
+  if (headingFamily) {
+    for (const fmt of Object.keys(preset.byFormat)) {
+      const spec = preset.byFormat[fmt];
+      spec.tokenOverrides = spec.tokenOverrides || {};
+      spec.tokenOverrides.fonts = { heading: { family: headingFamily, weight: tpl.headline.weight } };
     }
   }
 
@@ -263,16 +347,20 @@ function compilePreset(brandName, tpl) {
   // case; when the model reports the brand genuinely sets its words in colour we
   // do NOT honour it — the owner ruled coloured type out explicitly, and this arm
   // is meant to test typography, not relitigate that. Recorded either way.
-  const overrides = { colors: {} };
+  const inkColors = {};
   if (tpl.ink.onLightBackground && tpl.ink.policy === 'monochrome') {
-    overrides.colors.textOnLight = tpl.ink.onLightBackground;
+    inkColors.textOnLight = tpl.ink.onLightBackground;
   }
   if (tpl.ink.onDarkBackground && tpl.ink.policy === 'monochrome') {
-    overrides.colors.textPrimary = tpl.ink.onDarkBackground;
+    inkColors.textPrimary = tpl.ink.onDarkBackground;
   }
-  if (Object.keys(overrides.colors).length) {
+  if (Object.keys(inkColors).length) {
     for (const fmt of Object.keys(preset.byFormat)) {
-      preset.byFormat[fmt].tokenOverrides = overrides;
+      const spec = preset.byFormat[fmt];
+      // MERGE, never assign: the font override written above lives on the same
+      // object, and a bare assignment here silently dropped it.
+      spec.tokenOverrides = spec.tokenOverrides || {};
+      spec.tokenOverrides.colors = { ...(spec.tokenOverrides.colors || {}), ...inkColors };
     }
   }
   preset._armB = {
@@ -291,6 +379,29 @@ function compilePreset(brandName, tpl) {
       throw new Error(`compiled preset invalid for ${fmt}: ${res.errors.slice(0, 5).join('; ')}`);
     }
   }
+
+  // ZERO-DELTA GUARD. If every field the template writes already matches
+  // canonical, this arm renders IDENTICALLY to arm A while reporting success —
+  // and the comparison would read as "the template made no difference" when the
+  // truth is "the template said nothing". Those must not look alike.
+  const deltas = [];
+  for (const fmt of Object.keys(preset.byFormat)) {
+    const before = canonical.byFormat[fmt], after = preset.byFormat[fmt];
+    for (let i = 0; i < (after.slots || []).length; i++) {
+      const a = after.slots[i], b = before.slots[i];
+      if (!b) continue;
+      for (const k of ['casing', 'weight', 'trackingPx', 'maxLines', 'scrim', 'shadow', 'sizeScale']) {
+        if ((a.treatment || {})[k] !== (b.treatment || {})[k]) deltas.push(`${fmt}.${a.key}.${k}`);
+      }
+      if ((a.position || {}).align !== (b.position || {}).align) deltas.push(`${fmt}.${a.key}.align`);
+    }
+    if (after.tokenOverrides) deltas.push(`${fmt}.tokenOverrides`);
+  }
+  if (!deltas.length) {
+    throw new Error('compiled preset is byte-identical to canonical — the template carries no signal');
+  }
+  preset._armB.deltaCount = deltas.length;
+  preset._armB.deltaSample = [...new Set(deltas)].slice(0, 12);
   return preset;
 }
 
@@ -304,7 +415,7 @@ function compilePreset(brandName, tpl) {
     const data = JSON.parse(fs.readFileSync(templatesPath, 'utf8'));
     let n = 0;
     for (const [brandName, tpl] of Object.entries(data.templates || {})) {
-      const preset = compilePreset(brandName, tpl);
+      const preset = compilePreset(brandName, tpl, { brandId: tpl._brandId, headingFamily: tpl._headingFamily });
       const file = path.join(PRESET_DIR, `${preset.name}.json`);
       fs.writeFileSync(file, JSON.stringify(preset, null, 2));
       console.log(`📝 ${file}  (confidence ${tpl.confidence}, ink ${tpl.ink.policy})`);
@@ -325,6 +436,7 @@ function compilePreset(brandName, tpl) {
   if (!brandNames.length) { console.error('need --brands= or --from-pool='); process.exit(2); }
 
   const templates = {};
+  const rejectedTemplates = {};
   const skipped = {};
   let calls = 0;
 
@@ -372,6 +484,21 @@ function compilePreset(brandName, tpl) {
     const tpl = normalizeTemplate(parsed);
     tpl._sourceUrls = rows.map((r) => r.renderUrl);
     tpl._approvedSources = approvedOnly;
+    tpl._brandId = String(brand._id);
+    if (tpl._reject.length) {
+      // Paid for, and deliberately discarded. Recorded so the spend is not
+      // invisible and so the artifact can say WHY a brand has no arm-B column.
+      skipped[name] = `template rejected: ${tpl._reject.join('; ')}`;
+      console.warn(`   ✖ ${skipped[name]}`);
+      rejectedTemplates[name] = tpl;
+      continue;
+    }
+    // Honour the observed typeface only if we can serve it exactly.
+    const fullBrand = await Brand.findById(brand._id).lean();
+    tpl._headingFamily = await exactFamilyOrNull(tpl.typefaceObserved.headlineLooksLike, fullBrand);
+    if (tpl.typefaceObserved.headlineLooksLike && !tpl._headingFamily) {
+      console.log(`   ℹ face '${tpl.typefaceObserved.headlineLooksLike}' not exactly servable — keeping canonical type`);
+    }
     templates[name] = tpl;
     console.log(`   → ink=${tpl.ink.policy} headline=${tpl.headline.casing}/${tpl.headline.weight}` +
       `/track${tpl.headline.trackingPx}/${tpl.headline.align} scrim=${tpl.background.scrim}` +
@@ -379,7 +506,7 @@ function compilePreset(brandName, tpl) {
       (tpl._coerced.length ? ` ⚠️ coerced: ${tpl._coerced.join(',')}` : ''));
   }
 
-  const out = { generatedAt: new Date().toISOString(), llmCalls: calls, templates, skipped };
+  const out = { generatedAt: new Date().toISOString(), llmCalls: calls, templates, rejectedTemplates, skipped };
   const outPath = flag('out', null);
   if (outPath) { fs.writeFileSync(outPath, JSON.stringify(out, null, 2)); console.log(`📝 wrote ${outPath}`); }
   else console.log(JSON.stringify(out, null, 2));
@@ -389,7 +516,7 @@ function compilePreset(brandName, tpl) {
   if (EMIT_PRESETS) {
     for (const [brandName, tpl] of Object.entries(templates)) {
       if (tpl._dryRun) continue;
-      const preset = compilePreset(brandName, tpl);
+      const preset = compilePreset(brandName, tpl, { brandId: tpl._brandId, headingFamily: tpl._headingFamily });
       fs.writeFileSync(path.join(PRESET_DIR, `${preset.name}.json`), JSON.stringify(preset, null, 2));
       console.log(`📝 remotion/presets/${preset.name}.json`);
     }
