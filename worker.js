@@ -55,6 +55,8 @@ const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 1
 const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_INTERVAL_MIN, 10) || 5);
 
 const alerts = require('./services/alertService');
+// Receipt guard for every rendering->queued requeue — see services/spendReceipt.js.
+const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
 
 // Mongoose default pool is 100 max. With 50+ concurrent workers each
 // firing several queries per pipeline stage, we want a roomy pool to
@@ -152,10 +154,44 @@ async function reapOrphans() {
   // not exist on the schema; with the default `strict: true` mongoose
   // silently stripped it, so the write was always a no-op. Removed rather
   // than "fixed" — there is nothing that needs clearing.
+  // RECEIPT-AWARE, and this split is the whole point (2026-08-04).
+  //
+  // This used to be ONE updateMany over every stale `rendering` ad. An ad that
+  // holds a spend receipt — Ad.veoPredictionId for video, or
+  // imageGeneration.predictionId for static — has ALREADY been billed: the
+  // provider accepted the job and charged for it at submit. Sending that ad
+  // back to `queued` means the next run SUBMITS IT AGAIN, so we pay a second
+  // time for a generation Atlas may have already delivered. That is exactly the
+  // hole atlasVideoService's own comment describes: "without it a crash mid-poll
+  // loses the only handle to work we have paid for, and the reaper re-queues the
+  // ad into a second submit."
+  //
+  // So only RECEIPT-FREE ads are requeued. Those were never billed — the
+  // process died before or during submit — so re-running them costs one charge,
+  // which is the charge that was always owed.
+  //
+  // Receipt-holding ads are deliberately LEFT IN `rendering`. That looks
+  // untidy and it is the correct trade: `rendering` is honest (the outcome
+  // genuinely is unknown until the receipt is polled), the ad stays visible to
+  // ALERT_RENDERING_STALE_MIN, and the receipt survives for a resume pass to
+  // recover the asset for free. Requeuing would replace an untidy state with a
+  // duplicate charge. Never trade money for tidiness here.
   const ads = await Ad.updateMany(
-    { status: 'rendering', updatedAt: { $lt: cutoff } },
+    receiptFree({ status: 'rendering', updatedAt: { $lt: cutoff } }),
     { $set: { status: 'queued', updatedAt: new Date() } }
   );
+
+  // Count what we deliberately did NOT requeue, so "why is this ad still
+  // rendering?" has an answer in the log instead of looking like a reaper bug.
+  const heldForReceipt = await Ad.countDocuments({
+    status: 'rendering', updatedAt: { $lt: cutoff }, ...HAS_RECEIPT
+  }).catch(() => 0);
+  if (heldForReceipt > 0) {
+    console.warn(
+      `   💰 reaper: ${heldForReceipt} stale rendering ad(s) hold a spend receipt — NOT requeued ` +
+      `(requeuing would re-submit work already paid for). Poll the receipt to recover.`
+    );
+  }
 
   // CampaignRun: stuck 'running' → mark 'failed' with completedAt so
   // the frontend poller resolves. The individual Ads inside the run
