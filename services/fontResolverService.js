@@ -728,7 +728,7 @@ async function resolveLibraryMatch(requestedFamily, weight = 400, { brand = null
  * { family, weight, style, localPath|null, fallback, source } — localPath
  * null means "let the browser fall back" (family kept for CSS stacks).
  */
-async function resolveFamily(family, { brand = null, weight = 400, role = null } = {}) {
+async function resolveFamily(family, { brand = null, weight = 400, role = null, quiet = false } = {}) {
   family = normalizeFontFamily(family);
   if (!family) return null;
 
@@ -745,10 +745,17 @@ async function resolveFamily(family, { brand = null, weight = 400, role = null }
   // the proprietary name misses both custom and Google (common DTC case).
   const library = await resolveLibraryMatch(family, weight, { brand, role });
   if (library) {
-    console.warn(
-      `🔤 fontResolver: '${family}' unavailable — using closest library face ` +
-      `'${library.family}' (${library.matchReason}) for brand ${brand?.name || '?'}`
-    );
+    // `quiet` is passed by a caller that may REJECT this substitution (an
+    // exact-only ladder tier). Without it the log claimed "using closest library
+    // face 'Inter'" for a font that never reached the render — the tier was
+    // discarded and a lower tier resolved exactly. A log that names the wrong
+    // font is worse than no log; the winning face is reported by the caller.
+    if (!quiet) {
+      console.warn(
+        `🔤 fontResolver: '${family}' unavailable — using closest library face ` +
+        `'${library.family}' (${library.matchReason}) for brand ${brand?.name || '?'}`
+      );
+    }
     return library;
   }
 
@@ -817,14 +824,101 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
     scanned || null
   );
 
-  const wanted = {
-    heading: normalizeFontFamily(overrides.heading?.family || ownFace || themeHeading || (fontIsCurated ? scanned : null) || tailwind?.fonts?.heading || websiteUsage.heading || sharedFamily) || DEFAULT_ROLE_FONTS.heading.family,
-    body: normalizeFontFamily(overrides.body?.family || ownFace || themeBody || (fontIsCurated ? scanned : null) || tailwind?.fonts?.body || websiteUsage.body || sharedFamily) || DEFAULT_ROLE_FONTS.body.family,
+  // WHEN THE CURATED THEME ALREADY NAMES THE SCRAPED FACE, THE THEME IS A
+  // PAIRING AND MUST BE LEFT ALONE.
+  //
+  // Adversarial review killed the naive version of the promotion below with
+  // Camelback: {fontFamily:'Lora', theme.sans:'DM Sans', theme.serif:'Lora'}.
+  // Lora IS a real Google family, so an unconditional promotion resolved
+  // heading, body AND quote to Lora and collapsed a deliberate sans/serif
+  // pairing into one serif. Pelagic is the case the owner actually reported:
+  // {fontFamily:'Oswald', theme.sans:'Montserrat'} — the theme names a face the
+  // brand does not use anywhere, i.e. a generic guess that contradicts the scan.
+  //
+  // The rule that separates them without a special case: promote the scraped
+  // face over the theme only when the theme does not already use it in SOME
+  // role. Theme mentions it -> the curated pairing already accounts for the real
+  // face, respect it. Theme contradicts the scan entirely -> the scan wins.
+  const themeFamilies = [themeHeading, themeBody, themeQuote]
+    .map(normalizeFontFamily).filter(Boolean).map(familyKey);
+  const scannedPromoted = scannedFamily && !themeFamilies.includes(familyKey(scannedFamily))
+    ? scannedFamily
+    : null;
+
+  // AN ORDERED LADDER OF CANDIDATES, NOT ONE PRE-PICKED WINNER.
+  //
+  // This used to collapse the whole cascade to a single family and then fall
+  // straight to the role default if that family could not be resolved — so a
+  // tier could win the cascade and still render nothing of what it named. That
+  // is how the owner's font regression happened: Pelagic's scraped face is
+  // "Oswald", a REAL Google family we can serve exactly, but the curated
+  // styleTheme alias ("Montserrat") sat above it and won outright. Owner, on the
+  // 17-ad sample: *"for pelagic, the before looked better in terms of font
+  // style."* The before was Oswald.
+  //
+  // The fix is not simply "scanned first" — that would break the licence-hold
+  // case in the other direction (AllBirds' real face is "Self Modern"; with the
+  // file held back there is nothing to serve, and the curated "DM Sans" is the
+  // right answer). So the bare scraped family carries `requireExact`: it wins
+  // only when it resolves to an ACTUAL FILE — a custom ingested font or a real
+  // Google family — and otherwise yields to the theme. A tone-based library
+  // substitution is not the brand's face and must not outrank a curated choice.
+  // Every other tier keeps today's behaviour and accepts a substitution.
+  //
+  // Order per role: explicit override → the brand's own ingested face (licence
+  // respected) → an operator-curated fontFamily → the scraped face IF exactly
+  // resolvable → curated theme → tailwind → website usage → shared family.
+  //
+  // TIER ORDER IS LOAD-BEARING AND TWO REVIEWERS BROKE THE FIRST DRAFT OF IT.
+  // The curated-fontFamily tier stays BELOW the theme, exactly where the old
+  // cascade had it: an operator-confirmed family that we cannot actually serve
+  // must yield to a curated theme family we CAN serve, not lock a lookalike.
+  // (Shape that proved it: curatedFields ['fontFamily','styleTheme'] +
+  // fontFamily 'Self Modern' never ingested + theme.sans 'DM Sans' — promoting
+  // the curated tier renders library Playfair instead of real DM Sans.) The only
+  // tier this change ADDS above the theme is scannedPromoted, and it is
+  // exact-only.
+  // ownFace is exact-only too: we only claim it because matchCustomFont found a
+  // usable file, so if that file will not actually load, a curated theme beats a
+  // tone-matched guess.
+  const ladders = {
+    heading: [
+      [overrides.heading?.family, false],
+      [ownFace, true],
+      [scannedPromoted, true],
+      [themeHeading, false],
+      [fontIsCurated ? scanned : null, false],
+      [tailwind?.fonts?.heading, false],
+      [websiteUsage.heading, false],
+      [sharedFamily, false],
+    ],
+    body: [
+      [overrides.body?.family, false],
+      [ownFace, true],
+      [scannedPromoted, true],
+      [themeBody, false],
+      [fontIsCurated ? scanned : null, false],
+      [tailwind?.fonts?.body, false],
+      [websiteUsage.body, false],
+      [sharedFamily, false],
+    ],
     // Quote keeps theme priority: serifFontFamily is a deliberate pairing choice
     // (it is why AllBirds' Lora held steady), and a sans brand face must not
     // silently replace a curated serif quote voice.
-    quote: normalizeFontFamily(overrides.quote?.family || themeQuote || websiteUsage.quote || sharedFamily) || DEFAULT_ROLE_FONTS.quote.family,
+    quote: [
+      [overrides.quote?.family, false],
+      [themeQuote, false],
+      [websiteUsage.quote, false],
+      [sharedFamily, false],
+    ],
   };
+  // Kept for diagnostics and for the requestedFamily field: the family the old
+  // single-winner cascade would have named, i.e. the first live tier.
+  const wanted = {};
+  for (const role of ['heading', 'body', 'quote']) {
+    const first = ladders[role].map(([f]) => normalizeFontFamily(f)).find(Boolean);
+    wanted[role] = first || DEFAULT_ROLE_FONTS[role].family;
+  }
   const weights = {
     heading: overrides.heading?.weight || 700,
     body: overrides.body?.weight || 500,
@@ -834,7 +928,38 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
   const out = {};
   for (const role of ['heading', 'body', 'quote']) {
     const def = DEFAULT_ROLE_FONTS[role];
-    let entry = await resolveFamily(wanted[role], { brand, weight: weights[role], role });
+    // Walk the ladder. Bounded by the ladder length (8 tiers, 4 for quote) — it
+    // cannot re-enter. Cost: the Google and custom lookups inside resolveFamily
+    // memoise per family|weight, so a family named by two tiers is one HTTP
+    // lookup; the library-substitution step is NOT cached, which is why the local
+    // `tried` map exists. Worst realistic case versus the old single-winner
+    // cascade is one extra resolveFamily per role (the rejected exact-only tier).
+    let entry = null;
+    let firstInexact = null;
+    const tried = new Map();
+    for (const [rawFamily, requireExact] of ladders[role]) {
+      const family = normalizeFontFamily(rawFamily);
+      if (!family) continue;
+      let candidate;
+      if (tried.has(family)) candidate = tried.get(family);
+      else {
+        candidate = await resolveFamily(family, { brand, weight: weights[role], role, quiet: requireExact });
+        tried.set(family, candidate);
+      }
+      if (!candidate) continue;
+      if (candidate.exact === false) {
+        // A library substitution, not the named face. Remember it as the
+        // best-effort answer, but let a lower tier that CAN be served exactly
+        // (or a tier allowed to substitute) speak first.
+        if (!firstInexact) firstInexact = candidate;
+        if (requireExact) continue;
+      }
+      entry = candidate;
+      break;
+    }
+    // Nothing resolvable exactly → the closest substitution any tier produced,
+    // which is what the previous single-winner cascade would have rendered.
+    if (!entry) entry = firstInexact;
     if (!entry && wanted[role] !== def.family) {
       entry = await resolveFamily(def.family, { brand, weight: def.weight, role });
     }

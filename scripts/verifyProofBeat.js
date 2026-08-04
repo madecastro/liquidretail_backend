@@ -955,21 +955,165 @@ check('F2 the scraped brand family and both styleTheme spellings are consulted',
   // Modern"). Theme-first would therefore have replaced real brand typefaces with
   // generic Google ones, the opposite of the intent. The brand's own ingested face
   // must come FIRST in the heading/body chains.
-  const headingChain = src.slice(src.indexOf('heading: normalizeFontFamily('), src.indexOf('body: normalizeFontFamily('));
-  const ownIdx = headingChain.indexOf('ownFace');
-  const themeIdx = headingChain.indexOf('themeHeading');
-  assert.ok(ownIdx > -1 && themeIdx > -1, 'heading chain must consult both the owned face and the theme');
+  const ladderSrc = src.slice(src.indexOf('const ladders = {'), src.indexOf('// Kept for diagnostics'));
+  assert.ok(ladderSrc.length > 100, 'the per-role candidate ladder must exist');
+  const headingLadder = ladderSrc.slice(ladderSrc.indexOf('heading: ['), ladderSrc.indexOf('body: ['));
+  const ownIdx = headingLadder.indexOf('ownFace');
+  const themeIdx = headingLadder.indexOf('themeHeading');
+  const scannedIdx = headingLadder.indexOf('[scannedPromoted');
+  const curatedIdx = headingLadder.indexOf('fontIsCurated');
+  assert.ok(ownIdx > -1 && themeIdx > -1, 'heading ladder must consult both the owned face and the theme');
   assert.ok(ownIdx < themeIdx, 'the brand\'s own ingested face must outrank a generic curated theme family');
+  // ARM A, the owner's font-style regression: a scraped family we can serve
+  // EXACTLY (Pelagic "Oswald" is a real Google family) must outrank the generic
+  // styleTheme alias ("Montserrat"). Owner: "for pelagic, the before looked
+  // better in terms of font style" — the before was Oswald.
+  assert.ok(scannedIdx > -1 && scannedIdx < themeIdx,
+    'an exactly-servable scraped face must outrank the generic theme alias');
+  // ...but the CURATED-fontFamily tier stays BELOW the theme, where the old
+  // cascade had it. Two independent reviewers caught the first draft promoting
+  // it: with curatedFields ['fontFamily','styleTheme'], fontFamily 'Self Modern'
+  // never ingested and theme.sans 'DM Sans', promoting the curated tier renders
+  // a library Playfair instead of the real, servable DM Sans.
+  assert.ok(curatedIdx > themeIdx,
+    'a curated-but-unservable fontFamily must yield to a curated theme family we can serve');
 
-  // ...and it may only outrank the theme when a USABLE file exists, which is what
-  // makes it the real face rather than a brandfetch guess. matchCustomFont is
-  // reused so licence holds still apply.
+  // ...and the owned-face tier may only outrank the theme when a USABLE file
+  // exists, which is what makes it the real face rather than a brandfetch guess.
+  // matchCustomFont is reused so licence holds still apply.
   assert.ok(/scannedIsOwnedFace\s*=\s*!!\(\s*scannedFamily\s*&&\s*matchCustomFont\(/.test(src),
     'the owned-face tier must be gated on matchCustomFont, so licence holds are respected');
   // Quote must NOT take the owned face — serifFontFamily is a deliberate pairing.
-  const quoteChain = src.slice(src.indexOf('quote: normalizeFontFamily('));
-  assert.ok(!/ownFace/.test(quoteChain.slice(0, quoteChain.indexOf('\n'))),
+  const quoteLadder = ladderSrc.slice(ladderSrc.indexOf('quote: ['));
+  assert.ok(quoteLadder.length > 20, 'the quote ladder must be locatable');
+  assert.ok(!/ownFace|scannedFamily/.test(quoteLadder),
     'a sans brand face must not silently replace a curated serif quote voice');
+});
+
+check('F3 the scraped face wins only when it can actually be served', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+
+  // WIRING. The naive reading of the owner's note — "put the scraped family
+  // first" — breaks the licence-hold case in the other direction: AllBirds'
+  // scraped face is "Self Modern", and with the file held back there is nothing
+  // to serve, so the curated "DM Sans" is the correct answer. The bare scraped
+  // tier therefore carries requireExact, and the walker must honour it.
+  // Asserted PER ROLE. A whole-file regex passes while only one of the two
+  // ladders still carries the flag — the first revert-proof of this check hit
+  // exactly that, so "somewhere in the file" is not a pin.
+  const ladders = src.slice(src.indexOf('const ladders = {'), src.indexOf('// Kept for diagnostics'));
+  const roleLadder = (role, next) => {
+    const start = ladders.indexOf(`${role}: [`);
+    assert.ok(start > -1, `${role} ladder must exist`);
+    return ladders.slice(start, next ? ladders.indexOf(`${next}: [`) : undefined);
+  };
+  for (const [role, next] of [['heading', 'body'], ['body', 'quote']]) {
+    const l = roleLadder(role, next);
+    assert.ok(/\[scannedPromoted,\s*true\]/.test(l),
+      `the ${role} scraped tier must require an exact resolution`);
+    // ownFace is exact-only too: we claim it only because a usable file was
+    // found, so if that file will not load, a curated theme beats a lookalike.
+    assert.ok(/\[ownFace,\s*true\]/.test(l),
+      `the ${role} owned-face tier must require exactness so a failed file yields to the theme`);
+  }
+  // THE PROMOTION IS CONDITIONAL. Camelback proved an unconditional one wrong:
+  // {fontFamily:'Lora', theme.sans:'DM Sans', theme.serif:'Lora'} — Lora IS a
+  // real Google family, so promoting it unconditionally made heading, body AND
+  // quote all Lora and collapsed a deliberate sans/serif pairing. When the theme
+  // already names the scraped face, the theme is a considered pairing.
+  assert.ok(/scannedPromoted\s*=\s*scannedFamily && !themeFamilies\.includes\(familyKey\(scannedFamily\)\)/.test(src),
+    'the promotion must be withheld when the curated theme already names the scraped face');
+  assert.ok(/themeFamilies\s*=\s*\[themeHeading, themeBody, themeQuote\]/.test(src),
+    'all three theme roles must be consulted — a pairing can name the face in any role');
+  const walker = src.slice(src.indexOf('for (const [rawFamily, requireExact]'), src.indexOf('if (!entry) entry = firstInexact'));
+  assert.ok(walker.length > 100, 'the ladder walker must exist');
+  assert.ok(/candidate\.exact === false/.test(walker),
+    'exactness must be read off the resolved entry, not guessed from the family name');
+  assert.ok(/if \(requireExact\) continue;/.test(walker),
+    'a requireExact tier must yield when its resolution is a substitution');
+  assert.ok(/firstInexact/.test(walker) && /if \(!entry\) entry = firstInexact/.test(src),
+    'the closest substitution must survive as the fallback — never jump straight to the role default');
+  // The old single-winner shape must be gone, or the ladder is decorative.
+  assert.ok(!/heading: normalizeFontFamily\(overrides\.heading/.test(src),
+    'the collapsed single-winner cascade must be replaced, not shadowed');
+
+  // THE RULE, mirrored, over the four real production cases. `exact` mirrors
+  // resolveFamily: a custom ingested file or a real Google family is exact; a
+  // tone-based library substitution is not.
+  const walk = (ladder, resolve) => {
+    let firstInexact = null;
+    for (const [family, requireExact] of ladder) {
+      if (!family) continue;
+      const c = resolve(family);
+      if (!c) continue;
+      if (c.exact === false) {
+        if (!firstInexact) firstInexact = c;
+        if (requireExact) continue;
+      }
+      return c.family;
+    }
+    return firstInexact ? firstInexact.family : null;
+  };
+  const GOOGLE = new Set(['Oswald', 'Montserrat', 'DM Sans', 'Playfair Display', 'Lora']);
+  const resolver = (ownedFiles) => (family) => {
+    if (ownedFiles.includes(family)) return { family, exact: true };
+    if (GOOGLE.has(family)) return { family, exact: true };
+    return { family: 'Inter', exact: false }; // library substitution
+  };
+  // Mirrors the real ladder shape, INCLUDING the conditional promotion and the
+  // curated tier's position below the theme. `themeRoles` is every family the
+  // curated theme names, because a pairing can name the scraped face in any role.
+  const ladderFor = ({ ownFace = null, scanned = null, theme = null, themeRoles = null,
+                       curated = false, shared = null }) => {
+    const named = (themeRoles || [theme]).filter(Boolean);
+    const promoted = scanned && !named.includes(scanned) ? scanned : null;
+    return [
+      [null, false], [ownFace, true], [promoted, true], [theme, false],
+      [curated ? scanned : null, false], [null, false], [null, false], [shared, false],
+    ];
+  };
+
+  // Pelagic: scraped Oswald IS a Google family and the theme names it nowhere →
+  // it beats theme Montserrat. This is the owner's reported regression.
+  assert.strictEqual(
+    walk(ladderFor({ scanned: 'Oswald', theme: 'Montserrat', themeRoles: ['Montserrat', 'Playfair Display'],
+      shared: 'Oswald' }), resolver([])),
+    'Oswald', 'a Google-servable scraped face must beat the generic theme alias');
+  // Camelback: the curated theme ALREADY names the scraped face as its serif, so
+  // the pairing stands and heading stays the theme's sans. Promoting Lora here
+  // would make heading+body+quote all Lora.
+  assert.strictEqual(
+    walk(ladderFor({ scanned: 'Lora', theme: 'DM Sans', themeRoles: ['DM Sans', 'Lora'], shared: 'Lora' }),
+      resolver([])),
+    'DM Sans', 'a curated pairing that already names the scraped face must not be overridden');
+  // AllBirds, file held: "Self Modern" resolves only to a substitution, so the
+  // curated theme is right — this is the case a naive "scanned first" breaks.
+  assert.strictEqual(
+    walk(ladderFor({ scanned: 'Self Modern', theme: 'DM Sans', shared: 'Self Modern' }), resolver([])),
+    'DM Sans', 'an unservable scraped face must yield to the curated theme');
+  // Same, but with fontFamily ALSO curated — the tier that the first draft put
+  // above the theme. An operator confirming an unservable name must not lock a
+  // library lookalike over a servable curated theme family.
+  assert.strictEqual(
+    walk(ladderFor({ scanned: 'Self Modern', theme: 'DM Sans', curated: true, shared: 'Self Modern' }),
+      resolver([])),
+    'DM Sans', 'a curated-but-unservable fontFamily must still yield to the theme');
+  // AllBirds, file ingested: the owned face wins outright, licence gate upstream.
+  assert.strictEqual(
+    walk(ladderFor({ ownFace: 'Self Modern', scanned: 'Self Modern', theme: 'DM Sans', shared: 'Self Modern' }),
+      resolver(['Self Modern'])),
+    'Self Modern', 'a held brand file outranks everything below it');
+  // Owned face whose FILE fails to load (CDN miss): exact-only, so it yields to
+  // the curated theme rather than locking a tone-matched guess.
+  assert.strictEqual(
+    walk(ladderFor({ ownFace: 'Self Modern', scanned: 'Self Modern', theme: 'DM Sans', shared: 'Self Modern' }),
+      resolver([])),
+    'DM Sans', 'a claimed brand file that will not load must yield to the theme');
+  // Vuori: "Aktiv Grotesk" is neither ingested nor Google, and there is no theme
+  // — the closest library face must still be used, exactly as before.
+  assert.strictEqual(
+    walk(ladderFor({ scanned: 'Aktiv Grotesk', shared: 'Aktiv Grotesk' }), resolver([])),
+    'Inter', 'with nothing servable the substitution must still render');
 });
 
 // ── A: a product-tier rating names its product ──────────────────────────
@@ -1023,6 +1167,41 @@ check('C-ink CTA/promo/badge ink is chosen from the fill, not assumed', () => {
   assert.strictEqual(readableOn('#16181D'), '#FFFFFF', 'dark pill needs white ink');
   assert.strictEqual(readableOn('#F1EFE9', '#123456'), '#123456', 'an explicit brand colour wins');
   assert.strictEqual(readableOn('garbage'), '#FFFFFF', 'unparseable falls back safely');
+});
+
+check('C-mono the WORDS are monochrome — brand colour lives in fills, not type', () => {
+  // Owner, on a 17-ad sample (2026-08-04): "let's just stick to black or white
+  // type only when on a dark subject with a dark background, either with a drop
+  // shadow. The red lettering and white lettering you are choosing is tacky and
+  // doesn't look professional."
+  //
+  // Both offending inks fell back to a SCRAPED BRAND COLOUR: textOnLight to
+  // primary (Pelagic #4d92b6 blue, BabyBoo #ba3357 red on any light plate) and
+  // textSecondary to secondary. Neither is a decision anyone made per brand —
+  // they are palette values leaking into type.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'titleSpecService.js'), 'utf8');
+  const inkLine = (key) => {
+    const m = src.match(new RegExp(`^\\s*${key}:.*$`, 'm'));
+    assert.ok(m, `${key} must exist in the token map`);
+    return m[0];
+  };
+  for (const [key, colour] of [['textOnLight', 'primary'], ['textSecondary', 'secondary'],
+                               ['textSecondaryOnLight', 'secondary'], ['textPrimary', 'primary']]) {
+    const line = inkLine(key);
+    assert.ok(!new RegExp(`\\|\\|\\s*${colour}\\b`).test(line),
+      `${key} must not fall back to the brand ${colour} colour — type is monochrome: ${line.trim()}`);
+  }
+  // The defaults are the two inks, and an explicit curated value still wins so a
+  // brand can deliberately opt out later.
+  assert.ok(/textOnLight: themeColor\(theme, 'textOnLight'\) \|\| '#16181D'/.test(src),
+    'textOnLight defaults to near-black, after the curated value');
+  assert.ok(/textPrimary: themeColor\(theme, 'textPrimary'\) \|\| '#FFFFFF'/.test(src),
+    'textPrimary defaults to white, after the curated value');
+  // Brand colour is NOT banished — it still fills the CTA/badge/promo and the
+  // stars stay gold. This check would be wrong if it removed those.
+  assert.ok(/ctaBgResolved\s*=[\s\S]{0,200}accent \|\| primary/.test(src),
+    'the CTA fill must still use the brand palette');
+  assert.ok(/stars: themeColor\(theme, 'starColor'\)/.test(src), 'stars stay gold, not monochrome');
 });
 
 // ── S3: the video seed skips a subject-dominant first image ─────────────

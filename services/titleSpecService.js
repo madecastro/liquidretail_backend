@@ -348,7 +348,12 @@ async function buildBrandTokens(brand, { layoutInputBrand = null, specFontOverri
     ctaText: readableOn(ctaBgResolved, themeColor(theme, 'ctaTextColor') || themeColor(theme, 'ctaText')),
     scrim: themeColor(theme, 'scrimColor') || '#0C0906',
     textPrimary: themeColor(theme, 'textPrimary') || '#FFFFFF',
-    textSecondary: themeColor(theme, 'textSecondary') || secondary || '#DCDCDC',
+    // Same rule as textOnLight below, and the same bug: the secondary ink fell
+    // back to the brand's SCRAPED secondaryColor, so the supporting line under a
+    // headline could print in a saturated palette colour on dark footage. Type is
+    // monochrome; a neutral is the only default. An explicit curated
+    // textSecondary still wins.
+    textSecondary: themeColor(theme, 'textSecondary') || '#DCDCDC',
     // stars deliberately never fall to brand accent (dark accents = invisible
     // stars) — same rule as the canvas deriveTheme.
     stars: themeColor(theme, 'starColor') || themeColor(theme, 'accentGold') || '#F5B70A',
@@ -357,7 +362,18 @@ async function buildBrandTokens(brand, { layoutInputBrand = null, specFontOverri
     promoBg: promoBgResolved,
     promoText: readableOn(promoBgResolved, themeColor(theme, 'promoTextColor') || themeColor(theme, 'promoText')),
     // Plate-intelligence contrast flips (light footage → dark type).
-    textOnLight: themeColor(theme, 'textOnLight') || primary || '#16181D',
+    //
+    // TYPE INK IS BLACK OR WHITE. Owner, after reviewing a 17-ad sample
+    // (2026-08-04): *"let's just stick to black or white type only … The red
+    // lettering and white lettering you are choosing is tacky and doesn't look
+    // professional."* The tacky ink came from THIS line: textOnLight used to
+    // fall back to the brand PRIMARY colour, so on any light plate Pelagic
+    // rendered #4d92b6 blue type and BabyBoo #ba3357 red. Brand colour still
+    // lives in the CTA/badge fills and the gold stars; the words themselves are
+    // monochrome, like the gpt-image-2 static ads the owner holds up as the
+    // reference. An explicit curated textOnLight (none exists in prod today)
+    // still wins, so a brand can deliberately opt out later.
+    textOnLight: themeColor(theme, 'textOnLight') || '#16181D',
     textSecondaryOnLight: themeColor(theme, 'textSecondaryOnLight') || '#3A4048',
   };
 
