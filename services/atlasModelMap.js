@@ -95,7 +95,19 @@ const MAP = Object.freeze({
   // reasoning:{effort} form showed no reproducible benefit on this task (the
   // run-to-run spread at temperature 0.7 was larger than the effect). Consistency
   // comes from the lower temperature and the validator below instead.
-  'director':         { atlas: 'anthropic/claude-sonnet-5-ccmax', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
+  // ROUTE CHANGED 2026-08-04: '-ccmax' → the plain route. `-ccmax` is a Claude
+  // CODE agent endpoint, not a plain completion route. Probed live: it returned
+  // a tool call named `Grep` — a tool WE NEVER DEFINED — so it carries its own
+  // coding-agent toolset, and it ignores `tool_choice` as well as
+  // `response_format`. That is why it answered with markdown documents
+  // ("## Concept") and conversational preambles instead of JSON.
+  // 4 trials each, identical prompt, thin brief:
+  //   -ccmax  1/4 usable · 2/4 missing `name` · 1/4 unparseable JSON
+  //   plain   4/4 usable, every concept carrying routing.media_picks
+  // The 'name'-missing arm matches the `concepts[0].name is missing` warnings
+  // production logged. Same model family the 2026-07-31 bake-off picked —
+  // this drops the agent wrapper, not the model.
+  'director':         { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
 
   'gpt-4.1':          { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4.1' } },
   'gpt-4.1-mini':     { atlas: 'openai/gpt-5.6-luna',  direct: { provider: 'openai', model: 'gpt-4.1-mini' } },
