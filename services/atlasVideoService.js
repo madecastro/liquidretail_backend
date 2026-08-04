@@ -24,6 +24,9 @@
 
 const axios = require('axios');
 const sharp = require('sharp');
+// Shared failure taxonomy. The image path has always used this; the video
+// poll below did not, so a moderation block read as a generic failure.
+const { classify } = require('./atlasErrorPolicy');
 
 const Media                     = require('../models/Media');
 // Required for the charge-point veoPredictionId write in generateForAd. NOTE this file
@@ -2359,7 +2362,26 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       return url;
     }
     if (status === 'failed') {
-      throw new Error(`atlasVideo: prediction failed: ${data.error || 'unknown'} (id=${predictionId})`);
+      // Classify before throwing. The image path has routed failures through
+      // atlasErrorPolicy since it was written; this one never did, so a safety
+      // rejection surfaced to the operator as a bare "prediction failed" and
+      // read as a transient fault. Real example, 2026-08-04:
+      //   "Your input or generated content was blocked by safety review."
+      // A moderation block is deterministic — the same prompt and reference
+      // will be blocked again — so it must be NAMED, not retried behind
+      // generic prose. `label` is null for every other class, which keeps the
+      // provider's own wording for anything we have not classified.
+      const providerMsg = data.error || 'unknown';
+      const policy = classify({
+        predictionStatus: status,
+        msg: providerMsg,
+        nsfw: data.has_nsfw_contents ?? null
+      });
+      const heading = policy.label || 'atlasVideo: prediction failed';
+      const err = new Error(`${heading}: ${providerMsg} (id=${predictionId})`);
+      err.atlasPolicy = policy.name;
+      err.terminal    = policy.terminal;
+      throw err;
     }
     const elapsedSec   = Math.round((Date.now() - t0) / 1000);
     const remainingSec = Math.round((MAX_POLL_MS - (Date.now() - t0)) / 1000);

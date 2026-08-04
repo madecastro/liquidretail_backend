@@ -24,11 +24,11 @@ const SPEC = Object.freeze({
   // ── Render / video pools (routes/ads.js runRenderLoop) ──────────────
   RENDER_CONCURRENCY: {
     env: 'RENDER_CONCURRENCY',
-    default: 8,
+    default: 24,
     min: 1,
     max: 64,
     ceiling: 'SELF-IMPOSED',
-    why: 'In-flight static/image ads per campaign run. Raised 4→8 (2026-08-02): image submits are unpaced and 8 concurrent openai/gpt-image-2/edit predictions measured clean today (85s wall, zero 429s).'
+    why: 'In-flight static/image ads per campaign run. 4→8 (2026-08-02): image submits are unpaced and 8 concurrent openai/gpt-image-2/edit measured clean (85s wall, zero 429s). 8→24 (2026-08-04, owner-directed: renders should all go to Atlas at once). MAX_CREATIVES_PER_RUN=20, so 24 makes this gate non-binding for a full run. Spend is unchanged — the submit COUNT is fixed by the ad count, only the rate moves. Unmeasured above 8: watch for 429 backoff on the first full-size run.'
   },
   VEO_CONCURRENCY: {
     env: 'VEO_CONCURRENCY',
