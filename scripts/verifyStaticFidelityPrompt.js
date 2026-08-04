@@ -190,13 +190,19 @@ function collectPrompts(mod, data) {
     ['precedence exempts text contract', 'does not relax the text instructions'],
     ['precedence defers to reserved corner', 'does not override the reserved-corner rule'],
     ['category/brand prior', 'Do not infer the product from its category'],
-    ['colour lock', 'Do not shift hue, recolour'],
+    ['colour lock', 'No hue shift, recolour'],
     ['lighting-vs-colour scope', 'New lighting may fall across those colours'],
     ['no-new-branding', 'never licence to place a brand mark anywhere else in the frame'],
-    ['hidden geometry', 'infer geometry only, never a graphic'],
+    ['hidden geometry', 'geometry only, never a graphic, label or marking'],
     ['creative freedom retained', 'WHAT MAY CHANGE'],
     ['closing check: BEFORE YOU FINISH', 'BEFORE YOU FINISH'],
-    ['closing check: every string once', 'every string you were given below appears exactly once']
+    ['closing check: every string once', 'every string given below appears exactly once'],
+    ['no-substitute / no-variant line', 'NEVER substitute a similar-looking version'],
+    ['material swap ban', 'Never swap in a richer or cheaper-looking material'],
+    ['hidden-closure ban', 'A closure the reference hides under a flap stays hidden'],
+    ['no-added-pocket ban', 'a pocket the reference does not show is never added'],
+    ['logo may not be resized or restyled', 'never resized, restyled or swapped for a different mark'],
+    ['name-prior ban', 'its name']
   ];
 
   for (const { intentKey, surface, prompt } of rows) {
@@ -330,8 +336,8 @@ function collectPrompts(mod, data) {
     typeof mod.PRODUCT_FIDELITY === 'string');
   check('F6 PRODUCT_FIDELITY contains no ${ sequence',
     !mod.PRODUCT_FIDELITY.includes('${'));
-  check('F6 PRODUCT_FIDELITY is over 3000 chars',
-    mod.PRODUCT_FIDELITY.length > 3000,
+  check('F6 PRODUCT_FIDELITY is over 4000 chars',
+    mod.PRODUCT_FIDELITY.length > 4000,
     `length=${mod.PRODUCT_FIDELITY.length}`);
 
   const rows = collectPrompts(mod, DATA);
@@ -374,16 +380,17 @@ function collectPrompts(mod, data) {
   const clauses = [
     ['role preamble', 'You are an expert advertising creative director'],
     ['scale/framing rule', 'approximately the same share of the frame'],
-    ['framing tolerance stated', 'within about a tenth either way'],
-    ['no dramatic zoom/crop', 'Do not zoom in dramatically'],
+    ['framing tolerance stated', 'within about a tenth'],
+    ['no dramatic zoom/crop', 'Do not zoom or crop dramatically'],
     ['environment fits product', 'fit the environment to the product, never the product to the environment'],
     ['framing defers to FORMAT', 'fixed by the FORMAT block'],
-    ['advertising quality', 'ADVERTISING QUALITY'],
+    ['advertising quality', 'MAKE IT GOOD'],
     ['not stock photography', 'not a stock photograph'],
     ['product is focal point', 'primary focal point'],
-    ['materials list', 'carbon fibre'],
-    ['category-agnostic', 'apparel, footwear, jewellery'],
+    ['materials list', 'fabric, leather, knit, mesh, rubber, plastic, metal, wood, glass'],
+    ['no-inference-from-name', 'Do not infer the product from its category, its name'],
     ['final check covers framing', 'roughly the same share of the frame'],
+    ['final check covers the wearer', 'the person from the reference is still the one wearing it'],
     ['do-not-invent catch-all', 'if a word, numeral or mark is not in the text above'],
     // Owner instruction 2026-08-03. A PELAGIC jacket seeded from an ON-MODEL photo
     // came back as the jacket lying on a deck with nobody in it — because the
@@ -391,11 +398,14 @@ function collectPrompts(mod, data) {
     // replacement is asymmetric: a person in the reference must stay, a person
     // absent from it may be added. Pin all three parts; the negative pin below is
     // the one that matters, since restoring the old clause reopens the hole.
-    ['person-in-reference must stay', 'WHO WEARS OR HOLDS IT'],
-    ['cannot strip the wearer', 'you may NOT remove them and show the item lying on its own'],
+    ['person section present', 'THE PERSON.'],
+    ['SAME person, identity held', 'do not replace them with someone else'],
+    ['identity attributes named', 'Keep their face, hair, skin tone, build and identity'],
+    ['rationale recorded in-prompt', "the person is held for the product's sake"],
+    ['cannot strip the wearer', 'do not remove them to show the item on its own'],
     ['no hanger/mannequin/flat-lay substitute', 'a hanger, a mannequin, a surface or a flat lay'],
-    ['adding a person stays discretionary', 'you may introduce a person or leave it unpeopled'],
-    ['worn-ness excluded from the free list', 'whether the item is worn, which the paragraph above ties to the reference'],
+    ['adding a person stays discretionary', 'adding one is your choice'],
+    ['worn-ness AND wearer excluded from free list', 'whether the item is worn, and who wears it'],
   ];
   for (const [name, needle] of clauses) {
     for (const { intentKey, surface, prompt } of rows) {
@@ -411,7 +421,7 @@ function collectPrompts(mod, data) {
     !F.includes("do not reuse the reference's background, crop or lighting"),
     'old wording restored; it contradicts holding framing near the reference');
   check('F7 free-list explicitly excludes product size in frame',
-    F.includes('deliberately NOT on that list'));
+    F.includes('Deliberately NOT on that list'));
 
   // THE load-bearing negative pin for the person rule. `whether a person appears`
   // must be gone from the HARDENED prompt entirely — leaving it in flatly

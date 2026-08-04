@@ -213,6 +213,46 @@ identical `size` enum is why `verifyStaticSafeBox` still passes — noted in tha
 model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
 no code deploy.
 
+### 0.0e HOLD THE WEARER, AND CUT THE PROMPT DOWN (owner, 2026-08-03)
+
+Two owner instructions, and they fit together — pinning the wearer let several hedges be deleted.
+
+**1. The person is now held, not just required.** `THE PERSON` says the same person appears,
+*keeping their face, hair, skin tone, build and identity*; they may not be replaced, removed, or
+swapped for a hanger/mannequin/flat lay. Pose, expression, hands and framing stay free.
+
+**WHY — measured, and it is a PRODUCT rule not a casting rule.** On the Pelagic Torrent seed,
+every faithful render kept the seed's model and every drifting render had swapped him:
+
+| | garment drift |
+|---|---|
+| same model as the seed (7 renders) | **0** |
+| model replaced (5 renders) | **5** |
+
+Verified at matched zoom: the swapped-model renders gained an **exposed black centre zip** where
+the seed hides it under a storm flap, replaced the small rectangular badge with a plain `PELAGIC`
+wordmark or an enlarged patch, and shifted the grey darker. Mechanism: preserving the person makes
+this a local edit around a kept subject; replacing them makes it a full subject regeneration, and
+the garment is then drawn from the model's prior instead of the reference. Same signature on the
+Gymshark Campus Crest seed — its one on-model wrong-shirt render also had a swapped face.
+
+Two specific bans were added from that evidence: **a closure the reference hides under a flap
+stays hidden**, and **a pocket the reference does not show is never added**. Plus the graphics rule
+now says a mark may never be *resized, restyled or swapped for a different mark*.
+
+**2. The prompt is SHORTER despite gaining rules.** 11,732 → **9,619 chars**; `PRODUCT_FIDELITY`
+itself 7.5k → **5.4k**. Cut: the product-category list (the "don't infer from category" rule does
+not need one), the standalone NEVER paragraph (folded to one line), duplicated enumerations across
+materials/details, and the ceremonial section formatting. Every enforceable rule survived — the
+harness grew from 711 to **831 checks** while the text shrank, which is the point. `ADVERTISING
+QUALITY` is now `MAKE IT GOOD`. Also added: *do not infer the product from its category, **its
+name**, or anything you know about the brand* — aimed squarely at the Campus Crest failure, where
+the model appears to render the catalog TITLE rather than the reference.
+
+Still byte-identical on flag-off. Harness revert-proven on five mutations: deleting the identity
+ban, vaguing the identity attributes, dropping the wearer from the not-free list, weakening the
+added-pocket ban, and deleting the logo-restyle ban. All five fail.
+
 ### 0.0d THE PERSON RULE — the one prompt change with a MEASURED win (2026-08-03)
 
 Owner instruction, after live renders on real catalog products: **remove the clause letting the
