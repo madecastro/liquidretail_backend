@@ -213,9 +213,83 @@ identical `size` enum is why `verifyStaticSafeBox` still passes — noted in tha
 model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
 no code deploy.
 
+### 0.0i THE PLATE WAS NEVER ASKED TO LEAVE ROOM (2026-08-04) — read before §0.0h
+
+**SHAREABLE REPORT: https://ad-typesetting-split.pages.dev/** (Cloudflare Pages project
+`ad-typesetting-split`; rebuild with `node buildsite.js` then `wrangler pages deploy site
+--project-name=ad-typesetting-split --branch=main`). Every number on that page is read
+off a measurement file, never hand-typed.
+
+**MERGED. `origin/main` is `8d8a48c`** — the 8-commit static hardening branch plus the
+pricing correction went in on owner instruction. Only `session.md` conflicted; all code
+auto-merged. Verified ON THE MERGED TREE (not just the branch): `verifyStaticFidelityPrompt`
+736, `verifyStaticSafeBox` 334, `verifyCoherentSocialProof`, `verifyQuoteProvenance` — all
+pass. So the hardened prompt and `STATIC_PROMPT_FIDELITY_HARDENING=true` are now trunk.
+
+#### The omission, owner-spotted
+
+Owner: *"we haven't asked the image call to make space for the copy like we would in
+production correct?"* Correct, and worse than an omission. The genuine no-text branch
+(`staticAdIntents.js:699`) ENDS with `The photograph alone has to do the work.`, which
+pushes the model toward a self-sufficient filled frame, and `PRODUCT SCALE AND FRAMING`
+pins the product's share of frame. **Every plate in the §0.0h bake-off was composed as a
+complete photograph, so the compositor was hunting for clean regions that never existed.**
+All earlier composited-type results silently carried that handicap. Note the architecture
+already reserves a corner so a real logo can be composited — it was simply never extended
+to copy.
+
+**MEASURED with a band scan** (`cleanband.js`, zero cost — slides a 20%-height window down
+the safe box, scores evenness and value, "usable" = spread ≤28, mean outside the 110-138
+dead zone, best ink ≥4.5:1):
+
+| plates | usable band | median usable bands/plate |
+|---|---|---|
+| OLD, no space asked for (16) | 4/16 | **0** |
+| NEW, reservation clause (8) | 4/8 | **4** |
+
+The median is the real signal: when the clause lands the model opens most of the frame;
+when it misses it misses completely. **Still only ~half obey it** — `flutter` came back very
+dark but BUSY (spread 31-32), `campus-02` landed at mean 112 (inside the dead zone the
+clause explicitly warns about), `shoe-02`'s quietest band was spread 64. A plate without a
+usable band is DETECTABLE BEFORE any typesetting spend, so the fix is regenerate-on-fail.
+
+**How the clause is applied, and why it must be a REPLACE:** `platespace.js` builds the
+genuine prompt then substitutes the closing sentence. Appending would leave "the photograph
+alone has to do the work" next to "leave room for text" — the same self-contradiction that
+made an earlier spliced prompt fabricate proof claims in 8/8 plates. Both directions are
+asserted: the old sentence must be found (ABORT otherwise, so an upstream rewording can
+never let it silently no-op) and must be gone afterwards.
+
+#### Results on plates that have room
+
+`gpt-image-1.5/edit` + `input_fidelity:high`, 4 seeds × 2 plates. **MEASURED $0.3468 for 8
+plates = $0.04335 each** (all 8 priced after reconcile). That is 50% above the $0.23 I
+estimated, so **1.5 is ~40% cheaper than gpt-image-2's $0.07173, NOT 62%.**
+
+Two director arms, owner-chosen: `gpt-5.4` direct, and `xfer` (gpt-5.4 shown gpt-image-2's
+own finished ad as the typography exemplar). **16/16 composites, 48/48 elements clear
+4.5:1, zero failures**, 11 inks corrected by the renderer. The arms differ in hierarchy:
+gpt54 makes the QUOTE largest (52-68px), xfer makes the RATING largest and pins the quote
+at 46px on every single plate — it is anchoring to the exemplar's scale.
+
+⚠️ **ASPECT IS 2:3, NOT 9:16.** Verified live against the schema: `gpt-image-1.5/edit`
+offers only `1024x1024 / 1024x1536 / 1536x1024`. The prompt's own FORMAT block declares
+1152×2048, so plate geometry and declared geometry disagree. Unavoidable on this model.
+The §0.0h composites have the same mismatch and I mislabelled them 9:16.
+
+**Also fixed:** `typeset2.js` ink fallback is now ranked over pure `#000000`/`#ffffff`
+instead of branching on `#12161c` — that is what took the 192-element cross-apply from 9
+failures to 0. `crossapply.js` is the harness; `rerender.js`/`buildsite.js` are zero-cost.
+
+**STILL THE GATE:** the aesthetic call. Exactness is settled — composited copy is exact by
+construction and 4.5:1 is now guaranteed on any background. Whether it looks shippable next
+to gpt-image-2's own typesetting is the owner's judgement and no production code should be
+written before it is answered.
+
 ### 0.0h TYPESETTING SPLIT — where it actually got to (2026-08-04)
 
-Still an EXPERIMENT. No production code written. Nothing merged.
+Still an EXPERIMENT. No production code written. **Its plates carried a handicap that
+§0.0i identifies — read that first, and treat the contrast conclusions here as superseded.**
 
 **OWNER ANSWER that reframed it:** the 2026-07-31 overlay retirement was about
 **TYPOGRAPHY**, not placement. And **"I hate the scrim. no scrim!"** — panels are banned
@@ -251,10 +325,14 @@ produced the most confident scale).
    didn't fit and baselines collided. Now every line is rendered and trimmed to its real
    ink box; the renderer owns wrapping and the model never gives a baseline.
 
-⚠️ **THE NO-SCRIM CONSTRAINT IS NOT ALWAYS SATISFIABLE.** Two cells still fail contrast
-(`pelagic/sonnet` rating, `flutter/gpt54` rating) because the block sits on a MID-TONE
-region where neither white nor near-black clears 4.5:1. With scrims banned the only fixes
-are to move the block or reject the render. Any real implementation needs that fallback.
+~~⚠️ **THE NO-SCRIM CONSTRAINT IS NOT ALWAYS SATISFIABLE.**~~ **WRONG — RETRACTED
+2026-08-04, see §0.0i.** The two failing cells were not evidence of an unsatisfiable
+constraint, they were evidence of a bad fallback palette. The dark fallback was
+`#12161c`, a designer near-black whose own luminance only clears 4.5:1 from background
+≥126.3, while white clears it up to ≤118.7 — which MANUFACTURES a dead zone at
+118.7..126.3. Pure `#000000` clears from ≥116.1, which OVERLAPS white's range, so every
+background is coverable and there is no dead zone at all. Re-measured over 192 elements:
+9 failures became **0**. Do not re-derive the "unsatisfiable" claim from those two cells.
 
 **OPEN AESTHETIC QUESTION — the owner's, and it is not settled:** *"I still think the
 GPT2 images might have looked better."* `final-compare.jpg` puts gpt-image-2's own
