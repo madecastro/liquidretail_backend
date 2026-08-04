@@ -1290,6 +1290,79 @@ async function outputRatioOk(buffer, wr, hr) {
   }
 }
 
+// Cloudinary rejects an oversized upload with HTTP 400 "File size too large.
+// Got <n>. Maximum is <limit>."
+//
+// THE LIMIT IS PLAN-DEPENDENT, NOT A FIXED API CONSTANT. An earlier version of
+// this comment claimed it was a hard API limit; that was WRONG. Production hit
+// the ceiling at 20971520 (20 MiB) on 2026-08-04, and the account was upgraded
+// to 40 MiB the same day — the number moved, so it lives in the environment.
+// Read the current value out of the failing message rather than assuming:
+// Cloudinary states its own limit in the 400 body.
+//
+// REFRAME_RESOLUTION is '4k', so a healthy outpaint can return more than
+// whatever the ceiling is: the 2026-08-04 crash was Got 24232221 (24.2 MB)
+// against a 20 MiB plan. The pre-upload guard only had a FLOOR
+// (`outBuf.length >= 512`) and no ceiling, so a perfectly good 4K generation
+// passed the check and died on upload — AFTER `billed = true`. We had already
+// paid for that asset and then discarded it, which is exactly what the "a
+// single blip here used to discard a generation we had already paid for"
+// comment further down exists to prevent. Raising the plan removes today's
+// trigger; it does not remove the class, which is why the refit stays.
+const CLOUDINARY_MAX_UPLOAD_BYTES = (() => {
+  const raw = parseInt(process.env.CLOUDINARY_MAX_UPLOAD_BYTES || '', 10);
+  // Floor at 1 MiB so a typo cannot refit every asset into oblivion.
+  return Number.isFinite(raw) && raw >= 1048576 ? raw : 40 * 1024 * 1024;  // 41943040
+})();
+
+/**
+ * Bring an oversized render under Cloudinary's ceiling WITHOUT throwing away a
+ * generation we have already been billed for.
+ *
+ * Recompresses to JPEG at descending quality, then scales down, stopping at the
+ * first result that fits. JPEG rather than PNG deliberately: this buffer is a
+ * VIDEO REFERENCE IMAGE handed to Omni, never a delivered asset, so lossy
+ * compression costs nothing that survives into the output — whereas losing the
+ * asset costs a paid 4K generation.
+ *
+ * Returns the original buffer untouched when it already fits, and null only
+ * when nothing we can do gets it under the limit (caller then falls back to
+ * pad, same as any other outpaint failure).
+ */
+async function fitBufferForCloudinary(buf, label = 'reframe') {
+  if (!Buffer.isBuffer(buf) || buf.length <= CLOUDINARY_MAX_UPLOAD_BYTES) return buf;
+  const startedAt = Date.now();
+  for (const attempt of [
+    { quality: 90 }, { quality: 80 }, { quality: 72 },
+    { quality: 80, scale: 0.75 }, { quality: 72, scale: 0.6 }
+  ]) {
+    try {
+      let pipeline = sharp(buf);
+      if (attempt.scale) {
+        const md = await sharp(buf).metadata();
+        if (md?.width) {
+          pipeline = pipeline.resize(Math.max(640, Math.round(md.width * attempt.scale)));
+        }
+      }
+      const out = await pipeline.jpeg({ quality: attempt.quality, mozjpeg: true }).toBuffer();
+      if (out.length <= CLOUDINARY_MAX_UPLOAD_BYTES) {
+        console.log(
+          `   🗜  ${label}: ${buf.length} bytes exceeded Cloudinary's ${CLOUDINARY_MAX_UPLOAD_BYTES} — ` +
+          `refit to ${out.length} (q=${attempt.quality}${attempt.scale ? `, scale=${attempt.scale}` : ''}) ` +
+          `in ${Date.now() - startedAt}ms`
+        );
+        return out;
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  ${label}: refit attempt failed — ${err.message}`);
+    }
+  }
+  console.warn(
+    `   ⚠️  ${label}: could not bring ${buf.length} bytes under ${CLOUDINARY_MAX_UPLOAD_BYTES} — giving up on this tier`
+  );
+  return null;
+}
+
 // In-process single-flight for reframes. The product fan-out emits several
 // ads that SHARE reference medias, and workers run those ads in parallel —
 // without this, the same media+aspect would outpaint 2–3× concurrently
@@ -1690,9 +1763,22 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
           // here used to discard a generation we had already paid for.
           const outBuf = await fetchOutpaintOutput(outUrl);
           if (outBuf.length >= 512 && await outputRatioOk(outBuf, wr, hr)) {
-            const up = await uploadBufferToCloudinary(outBuf, { folder: 'liquidretail/reframes' });
-            const url = up.secure_url || up.url;
-            if (url) { resultUrl = url; method = 'outpaint'; }
+            // CEILING, not just a floor. At REFRAME_RESOLUTION=4k this buffer
+            // regularly exceeds Cloudinary's 20 MiB limit; before this guard the
+            // upload 400'd and a generation we had ALREADY BEEN BILLED for was
+            // thrown away. Refit rather than discard. Ratio is checked on the
+            // ORIGINAL buffer above, and the refit only recompresses/scales
+            // uniformly, so the aspect the ratio check approved still holds.
+            const fitted = await fitBufferForCloudinary(outBuf, `reframe[${aspectKey}]`);
+            if (!fitted) {
+              console.warn(
+                `⚠️  reframeReferenceForAspect[${aspectKey}]: output ${outBuf.length} bytes cannot be stored — pad fallback`
+              );
+            } else {
+              const up = await uploadBufferToCloudinary(fitted, { folder: 'liquidretail/reframes' });
+              const url = up.secure_url || up.url;
+              if (url) { resultUrl = url; method = 'outpaint'; }
+            }
           } else {
             console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: output rejected (bytes=${outBuf.length}) — pad fallback`);
           }
@@ -1730,8 +1816,15 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
             const padBuf = fill.uniform
               ? (await padSolidBuffer(srcNorm.buffer, W, H, fill.hex)) || (await padToRatioBuffer(srcNorm.buffer, W, H))
               : await padToRatioBuffer(srcNorm.buffer, W, H);
-            if (padBuf) {
-              const up = await uploadBufferToCloudinary(padBuf, { folder: 'liquidretail/reframes' });
+            // Same ceiling applies here — a pad built from a 4K source is just
+            // as capable of exceeding 20 MiB as the outpaint was. This tier is
+            // free, so a refit failure is not a money loss, but an unguarded
+            // 400 here is the same fatal rejection.
+            const paddedFitted = padBuf
+              ? await fitBufferForCloudinary(padBuf, `reframe-pad[${aspectKey}]`)
+              : null;
+            if (paddedFitted) {
+              const up = await uploadBufferToCloudinary(paddedFitted, { folder: 'liquidretail/reframes' });
               const url = up.secure_url || up.url;
               if (url) { resultUrl = url; method = 'pad-fallback'; }
             }
@@ -2046,12 +2139,32 @@ async function buildReferenceImages({
   }
 
   // Reframe all in parallel; preserve order.
+  //
+  // PER-ITEM CATCH — load-bearing, not defensive dressing. Promise.all settles
+  // on the FIRST rejection, and a sibling that rejects afterwards has no
+  // listener left, which on Node 20 is a FATAL unhandledRejection. That is how
+  // production died on 2026-08-04: a Cloudinary "File size too large" surfaced
+  // here, killed the web process one second after a 411s Omni master had
+  // already been paid for, and took the whole run with it (4 ads requeued, 1
+  // run marked failed).
+  //
+  // reframeReferenceForAspect is DOCUMENTED as never throwing — it resolves to
+  // a URL or a deterministic crop. That contract is exactly what proved unsafe
+  // to lean on, so it is now enforced here instead of assumed. null is already
+  // handled: the dedupe loop below skips falsy entries, so a failed reframe
+  // simply drops out of the reference stack and the remaining refs still ship.
   const reframed = await Promise.all(
     capped.map(id => reframeReferenceForAspect({
       media: id.mediaDoc,
       sourceUrl: id.sourceUrl,
       aspectRatio,
       brand
+    }).catch((err) => {
+      console.warn(
+        `⚠️  buildReferenceImages: reframe failed for ${id.mediaDoc?._id || id.sourceUrl} ` +
+        `[${aspectRatio}] — dropping this reference, run continues: ${err?.message || err}`
+      );
+      return null;
     }))
   );
 
@@ -3093,5 +3206,9 @@ module.exports = {
   // so the harness can prove Grok stays <=1 RPS under raised VEO_CONCURRENCY.
   pacedModelSubmit,
   SUBMIT_SPACING_MS,
-  isGrokModel
+  isGrokModel,
+  // Cloudinary upload ceiling — exported for scripts/verifyReframeUploadCeiling.js
+  // so the harness can prove a >20 MiB 4K outpaint is refitted rather than lost.
+  fitBufferForCloudinary,
+  CLOUDINARY_MAX_UPLOAD_BYTES
 };
