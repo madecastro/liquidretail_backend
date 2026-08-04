@@ -2402,19 +2402,50 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 
 // POST /api/ads/:id/regenerate — re-run the render pipeline for this
 // ad with an operator refinement prompt, OR a verbatim prompt override.
-// Body: { prompt?, mode?, promptOverride? }.
-//   prompt:  a refinement note appended to the auto-composed prompt.
-//            Required UNLESS promptOverride is given. Up to ~1000 chars.
+// Body: { prompt?, mode?, promptOverride?, videoPromptRaw?,
+//          videoPromptGuidance?, imagePromptRaw? }.
+//   prompt:  a refinement note PREPENDED to the auto-composed prompt
+//            (video: OPERATOR REFINEMENT header inside buildVeoPrompt;
+//            image: refinement note into the live direct_image path).
+//            Required UNLESS one of the override fields below is given.
+//            Up to 1000 chars.
 //   mode:    'light' (default, video only — re-runs chrome + composite,
 //                     Veo unchanged) | 'full' (re-runs Veo too).
 //            Image ads always re-run the live direct_image renderer
-//            (gpt-image-2/edit); mode ignored.
+//            (gpt-image-2/edit); mode ignored. Note: adRegenerateService
+//            currently normalises video to full regardless of mode.
 //   promptOverride: { system, user } — image ads only. The operator
 //            edited the EXACT prompt shown in the Generation Details
 //            modal; this text replaces the auto-composed prompt
 //            verbatim instead of being appended as a refinement note.
 //            Image models have one flat prompt channel — system+user
 //            are concatenated (see resolveImagePromptOverride).
+//   videoPromptRaw: string ≤4000 — video only. FULL replacement of the
+//            canonical camera prompt for THIS regenerate call. Reuses
+//            the existing generateForAd raw branch (logs "canonical
+//            directives bypassed"). PASS-THROUGH — not written to Ad.
+//            Same length ceiling as the wizard (parsePhase3WizardFields).
+//   videoPromptGuidance: string ≤1000 — video only. PREPENDS as the
+//            operator refinement when `prompt` is empty and raw is not
+//            set. Same ceiling as the wizard. PASS-THROUGH — not written.
+//   imagePromptRaw: string ≤40000 — IMAGE ads only. FULL replacement of
+//            the auto-composed static prompt for THIS regenerate call, via
+//            the existing rawPromptOverride channel (which already accepts a
+//            bare string). The operator loads the exact prompt that produced
+//            the current render — Ad.imageGeneration.prompt, served by
+//            /generation-inspector — edits it, and sends it back.
+//            Cap is 40000, NOT the video 4000: the static prompt runs
+//            ~7.8-8.4k chars, so 4000 would truncate it (see
+//            adRegenerateService.IMAGE_PROMPT_RAW_MAX).
+//            MUTUALLY EXCLUSIVE with promptOverride — both target the same
+//            slot, so sending both 400s rather than picking a silent winner.
+//            Replaces, so it DROPS product-fidelity, the exact-copy contract
+//            and the safe-box geometry prose unless the operator keeps them;
+//            gen size, delivery crop, reference stack and logo compositing
+//            still come from the surface. When set, `prompt` is ignored (the
+//            override wins inside renderDirectImage).
+//            PASS-THROUGH — not written to the Ad, so the next regenerate
+//            with an empty field reverts to the auto-composed prompt.
 // Returns 202 with a poll target. Frontend polls
 // /api/catalog/:productId/ads-detail (or this ad's generation-inspector)
 // watching ad.regenerating.
@@ -2429,6 +2460,8 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       throw e;
     }
 
+    const regen = require('../services/adRegenerateService');
+
     const MAX_OVERRIDE_LEN = 40000;
     let promptOverride = null;
     if (req.body?.promptOverride && typeof req.body.promptOverride === 'object') {
@@ -2441,8 +2474,44 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       promptOverride = { system: sys, user: usr };
     }
 
+    // Video camera-prompt overrides — same caps as the wizard body parser.
+    // Empty/whitespace collapses to null inside parseRegenVideoPromptFields.
+    const videoFields = regen.parseRegenVideoPromptFields(req.body || {});
+    if (!videoFields.ok) {
+      return res.status(400).json({ error: videoFields.error });
+    }
+    const { videoPromptRaw, videoPromptGuidance } = videoFields;
+
+    // Static raw prompt — full replacement of the auto-composed image prompt.
+    // Cap is 40000 (IMAGE_PROMPT_RAW_MAX), not the video 4000: the prompt this
+    // replaces is ~8k chars. Whitespace-only collapses to null inside.
+    const imageFields = regen.parseRegenImagePromptField(req.body || {});
+    if (!imageFields.ok) {
+      return res.status(400).json({ error: imageFields.error });
+    }
+    const { imagePromptRaw } = imageFields;
+
+    // Both imagePromptRaw and promptOverride land in the SAME full-replace slot
+    // (runImage's promptOverride argument → resolveImagePromptOverride). Sending
+    // both is a client bug: silently picking a winner would hide which text the
+    // billable submit actually used.
+    if (imagePromptRaw && promptOverride) {
+      return res.status(400).json({
+        error: 'send either imagePromptRaw or promptOverride, not both — they both replace the whole image prompt'
+      });
+    }
+
     const prompt = String(req.body?.prompt || '').trim();
-    if (!prompt && !promptOverride) return res.status(400).json({ error: 'prompt or promptOverride is required' });
+    // Gate: at least ONE of prompt / promptOverride / videoPromptRaw /
+    // videoPromptGuidance. Empty regenerate still 400s. Uses the pure
+    // helper so the offline harness pins the same predicate.
+    if (!regen.regenerateHasIntent({
+      prompt, promptOverride, videoPromptRaw, videoPromptGuidance, imagePromptRaw
+    })) {
+      return res.status(400).json({
+        error: 'prompt, promptOverride, videoPromptRaw, videoPromptGuidance, or imagePromptRaw is required'
+      });
+    }
     if (prompt.length > 1000) return res.status(400).json({ error: 'prompt is too long (max 1000 chars)' });
     const mode = req.body?.mode === 'full' ? 'full' : 'light';
 
@@ -2459,7 +2528,6 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       videoModel = slug;
     }
 
-    const regen = require('../services/adRegenerateService');
     let ad;
     try {
       ad = await regen.preflight(req.params.id, brandId);
@@ -2468,6 +2536,19 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     }
     if (promptOverride && ad.kind !== 'image') {
       return res.status(400).json({ error: 'promptOverride is only supported for image ads' });
+    }
+    // Video-only fields on an image ad are a client bug, not a silent no-op.
+    if ((videoPromptRaw || videoPromptGuidance) && ad.kind !== 'video') {
+      return res.status(400).json({
+        error: 'videoPromptRaw / videoPromptGuidance are only supported for video ads'
+      });
+    }
+    // ...and the mirror: a raw IMAGE prompt on a video ad would be silently
+    // dropped by runVideoFull, which is worse than a 400.
+    if (imagePromptRaw && ad.kind !== 'image') {
+      return res.status(400).json({
+        error: 'imagePromptRaw is only supported for image ads'
+      });
     }
     const requestedBy = req.user?.userId || req.user?.email || null;
 
@@ -2480,8 +2561,10 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     });
 
     setImmediate(() => {
-      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel, promptOverride })
-        .catch(err => console.error(`❌ regenerate setImmediate crash: ${err.message}`));
+      regen.regenerateAd({
+        ad, prompt, mode, requestedBy, videoModel, promptOverride,
+        videoPromptRaw, videoPromptGuidance, imagePromptRaw
+      }).catch(err => console.error(`❌ regenerate setImmediate crash: ${err.message}`));
     });
   } catch (err) {
     console.error('regenerate request failed:', err);
