@@ -175,7 +175,29 @@ publishes it *after* the image returns — measured **7 of 38** had it at comple
 `[3s,10s,30s]` → `[3s,10s,30s,60s,120s,300s]`; at the old budget most rows kept a 7x-low
 estimate forever, which is how a static ad appeared to cost $0.01.
 
-### 0.0b STATIC EDIT MODEL → `-developer` variant (owner, 2026-08-03)
+### 0.0b STATIC EDIT MODEL — switched to `-developer`, then REVERTED same day (owner, 2026-08-03)
+
+**FINAL STATE: `openai/gpt-image-2/edit` (the plain variant).** Both `PLATE_EDIT_MODEL`'s code
+default and `AI_DIRECT_IMAGE_EDIT_MODEL` in `config/defaults.env` point there.
+
+The `-developer` variant was adopted for its 50% discount and reverted hours later on measured
+reliability:
+
+| variant | submits | hard `prediction failed` | rate |
+|---|---|---|---|
+| `-developer` | 76 | **13** | **17.1%** |
+| plain | 38 | **0** | 0% |
+
+Three independent developer runs failed at **15.8% / 15.0% / 22.2%** — consistent, not a bad
+afternoon. Each failure is a BILLED submit returning `outputs: null` with no error message,
+which reaches the operator as a failed ad and bills a failure. Cost per SUCCESSFUL render still
+favoured developer ($0.0426 vs $0.0757), so **this was deliberately not a cost decision** — the
+owner chose delivered ads over unit price. Re-measure before reaching for `-developer` again.
+
+The original switch rationale below is kept because the schema/price comparison is worth having
+on record.
+
+### 0.0b-orig The `-developer` switch, as originally written
 
 `PLATE_EDIT_MODEL` default and `AI_DIRECT_IMAGE_EDIT_MODEL` in `config/defaults.env` both
 now point at `openai/gpt-image-2-developer/edit`. **Halves static spend** — a 3-surface
@@ -191,18 +213,281 @@ identical `size` enum is why `verifyStaticSafeBox` still passes — noted in tha
 model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
 no code deploy.
 
-⚠️ **OPEN — measured reliability gap. Decide before merging.** 38 submits per model, same day:
+### 0.0h TYPESETTING SPLIT — where it actually got to (2026-08-04)
 
-| model | ok | hard failures | $/successful render |
+Still an EXPERIMENT. No production code written. Nothing merged.
+
+**OWNER ANSWER that reframed it:** the 2026-07-31 overlay retirement was about
+**TYPOGRAPHY**, not placement. And **"I hate the scrim. no scrim!"** — panels are banned
+outright, so legibility must come from position and ink colour alone.
+
+**PLATES ARE SOLVED.** The genuine no-text path (empty `data` on `meta_stories_9_16`,
+the one surface with `drawCta:false`, so goal/emphasis/absences all adapt) produced
+**16/16 clean text-free plates across two image models, zero fabricated proof.** The
+earlier 8-for-8 invention of ratings and review counts came ENTIRELY from a
+self-contradictory spliced prompt, not from the models. Product fidelity on
+1.5+`input_fidelity:high` plates is excellent.
+
+**BRAND FONT PIPELINE WORKS.** PELAGIC's real face (Archivo Variable) pulled from their
+Shopify CDN — `@font-face` in the homepage HTML, `/cdn/shop/t/587/assets/` — converted
+woff2→ttf with fontTools in a venv, registered via a local `FONTCONFIG_FILE`. Renders
+correctly including the ★ glyph. **Gymshark's face was NOT obtainable** from their site,
+so the Gymshark rows use Archivo too — not brand-accurate, fine for comparing direction.
+
+**FOUR ARMS × THREE BRANDS, all rendered:** `gemini-3.5-flash`, `gpt-5.4`,
+`claude-sonnet-5`, and a STYLE-TRANSFER arm (gpt-5.4 shown gpt-image-2's own finished ad
+as the typography exemplar plus the target plate — the owner's idea, and the arm that
+produced the most confident scale).
+
+**WHAT THE RENDERER HAD TO OWN, because the models got it wrong:**
+1. **Ink colour.** All arms chose white regardless of background; **8 of 11 elements
+   failed 4.5:1 contrast.** The renderer now measures luminance under the real ink box
+   and overrides to near-black/white only when the model's own choice is below 4.5:1.
+   Result: **9/11 fully legible, up from 3/11.**
+2. **Scale.** sonnet and gemini specced 14–36px type on a 1536px frame — captions, not
+   ads. One PROPORTIONAL lift keyed off the quote (floor 3% of height, cap 2.6x), so each
+   model's own hierarchy survives instead of being clamped flat.
+3. **Text measurement.** v1 estimated widths from character counts, which is why panels
+   didn't fit and baselines collided. Now every line is rendered and trimmed to its real
+   ink box; the renderer owns wrapping and the model never gives a baseline.
+
+⚠️ **THE NO-SCRIM CONSTRAINT IS NOT ALWAYS SATISFIABLE.** Two cells still fail contrast
+(`pelagic/sonnet` rating, `flutter/gpt54` rating) because the block sits on a MID-TONE
+region where neither white nor near-black clears 4.5:1. With scrims banned the only fixes
+are to move the block or reject the render. Any real implementation needs that fallback.
+
+**OPEN AESTHETIC QUESTION — the owner's, and it is not settled:** *"I still think the
+GPT2 images might have looked better."* `final-compare.jpg` puts gpt-image-2's own
+typesetting in column 1 against all four composited arms. That judgement is the gate for
+whether any of this gets built. Nobody should write production code before it is answered.
+
+**Scratchpad additions:** `typeset2.js` measured/flowed/no-scrim compositor (exports
+`compose`, `measure`, `contrastUnder`) · `bakeoff.js` four-arm driver · `rerender.js`
+re-renders from saved specs with ZERO API calls · `bake/specs.json` all 11 specs ·
+`bake2/` fixed composites · `final-compare.jpg` the decision sheet · `fonts/`,
+`fc/fonts.conf` the brand-font setup · plates in `samples14/16/17`.
+
+Session spend ≈ **$18.90** — no further image calls were made after this point.
+
+### 0.0g HANDOFF — 2026-08-04. NOTHING IS MERGED. Read this first.
+
+**MERGE STATE: 6 commits on `feat/static-product-fidelity-hardening`, tip `8e655aa`, PUSHED but
+NOT merged and NO PR open.** `origin/main` is at `bee82b7` and does not contain any of it.
+Production therefore still serves the LEGACY prompt with the permissive person clause on
+`gpt-image-2/edit`. Everything below is unshipped.
+
+Commits, oldest first: `bb81717` hardening v1 + kill switch · `63e9d39` pricing correction +
+prompt v2 · `f11934a` revert to non-dev model · `9f8c6f3` person rule · `8686398` identity +
+compression · `8e655aa` revert compression, keep one simple identity sentence.
+
+**The pricing fix in `63e9d39` is a correctness bug independent of all the prompt work** —
+`base_price` under-reports the charge ~7x and `scheduleCostReconcile` gave up too early. That is
+worth merging on its own merits even if every prompt change is rejected.
+
+#### OPEN EXPERIMENT — split the typesetting from the glyphs
+
+Owner's goal: keep `gpt-image-2`'s typesetting *judgement* without letting any model draw the
+glyphs. Driver is the trade in §0.0f — `gpt-image-1.5/edit` + `input_fidelity: high` gives
+**0/12 model swaps and is 62% cheaper**, but breaks the rating string (fabricated counts, a wrong
+`4.4` for 4.6).
+
+**THE CONSTRAINT:** any pixels a model produces for text carry its error. A returned "mask with
+copy" is still model-drawn letterforms. Model output is usable as **position and styling only**.
+
+**PRECEDENT, and it is strong:** this pipeline already does exactly this for the LOGO —
+`directImageRenderService` reserves a corner, forbids the model drawing any logo, and composites
+the real asset locally (`logoPlacementFor` + `layers.push`, `:935-971`). A misspelled rating is
+the same defect class and worse, because it is a proof claim. Extending that slot to the rating
+is the smallest viable version.
+
+**Arms:** A = 20 existing model-typeset renders (free, already on disk).
+B = coherent text-free plate + locally composited type at fixed safe-box placement.
+C = B with placement from a vision-model spec per plate.
+
+**FIRST ATTEMPT WAS INVALID — do not trust `samples13/` or `armB/`.** The text-free block was
+SPLICED into a `social_proof_led` prompt whose attention order still demanded *"the rating and how
+many people gave it / the customer's own words / the CTA"*. Self-contradictory. **All 8 plates
+fabricated proof claims** — invented ratings (4.8), invented counts (6,942 / 734 / 2,391 / 1,952 /
+1,702) and invented testimonials, against real values of 4.6 and 318.
+
+⚠️ **That is a finding worth keeping on its own: a CONTRADICTION anywhere in the prompt can flip
+the model into inventing social proof, with no bad data involved.** The `absences` rules hold when
+the prompt is coherent and fail when it is not. Second contamination-by-splicing of the session
+(the first was the "Triple-strap" description) — **use the genuine code path, never surgery.**
+
+**Corrected runs, in flight at compaction:** empty `data` on `meta_stories_9_16` (the one surface
+with `drawCta:false`), which makes goal, emphasis and absences all adapt together — verified
+coherent, and the harness now ABORTS if the prompt still demands rating/quote/CTA.
+`samples14/` = 1.5+high at `1024x1536` (its enum has no 1152x2048); `samples15/` = gpt-image-2 at
+native `1152x2048`. 8 plates each, ~$0.84.
+
+**Judge on:** do the plates come back genuinely text-free? does either model fabricate proof from
+a COHERENT prompt? Then composite (`<scratchpad>/composite.js`, safe box must be re-set for
+Stories: box top 17.5% / bottom 82.5%, not the square 6/94).
+
+**TWO QUESTIONS FOR THE OWNER, both still unanswered:**
+1. Reserve **just the rating** (where essentially all measured defects live — quote and CTA were
+   correct in 12/12 even on 1.5) or the whole copy block?
+2. The 2026-07-31 retirement of "direct image + exact overlay" — *"nobody liked the output"* — was
+   that the **placement** or the **typography**? If typography, local compositing inherits the
+   problem no matter what chooses the position, and arm C is not worth building.
+
+**Harness/scratchpad map** (`/private/tmp/claude-502/-Volumes-Sayulita-Projects-RS/57cf15d6-ebb6-4803-bc54-5afba3628073/scratchpad/`):
+`render-samples5..15.js` one per cell · `recover.js` re-polls any billed prediction whose image is
+missing (never abandon billed work — poll loops with no deadline, ids ledgered to
+`<out>/predictions.jsonl` before polling) · `sheet.js` / `audit.js` contact sheets ·
+`BRIEF-typesetting-split.md` the test brief · seeds `ref.jpg` shoe, `ref2.jpg` Gymshark Flutter,
+`ref3.jpg` PELAGIC Torrent, `ref4.jpg` Gymshark Campus Crest.
+
+Measured prices: `gpt-image-2/edit` **$0.07593**, `-developer` **$0.03586**, `gpt-image-1.5/edit`
+**$0.0289**. Session spend to date ≈ **$17.75**.
+
+### 0.0f SHIPPING STATE + THE MEASURED GRID (2026-08-03). READ THIS BEFORE RE-RUNNING ANYTHING.
+
+**SHIPPING STATE: the pre-compression prompt plus ONE sentence.** `WHO WEARS OR HOLDS IT` now
+contains *"Keep the same person — do not replace them with someone else."* replacing the old
+permissive *"You may change who that person is"*. The 2026-08-03 compression, the five-attribute
+identity list, the closure/zip bans, the added-pocket ban and the logo-restyle ban are all
+**REVERTED** — they measured worse. Prompt is 11.8k chars. `gpt-image-2/edit` remains the model.
+
+**SIX 12-RENDER CELLS, ONE SEED (Pelagic Torrent, on-model). Do not re-derive these.**
+
+`openai/gpt-image-2/edit` — text-safe, product-drifty:
+
+| prompt | identity rule | model swaps | text defects |
 |---|---|---|---|
-| `openai/gpt-image-2/edit` | 36/38 | **0** (2 poll timeouts, likely late completions) | $0.0757 |
-| `openai/gpt-image-2-developer/edit` | 32/38 | **6 `prediction failed`** (15.8%), null outputs, no error | **$0.0426** |
+| long 11.7k | permissive | 5/12 | 0/12 |
+| compressed 9.6k | none | 5/12 | 0/12 |
+| compressed 9.6k | 5-attribute list + closure bans | 7/12 | 0/12 |
+| **long 11.9k (shipping)** | **one simple sentence** | **2/12** | **0/12** |
 
-The money case survives — developer is ~44% cheaper **per successful render** even after
-paying for the failures. But a ~16% hard-failure rate is a product problem, not a cost one:
-each is a charged submit with no asset, which reaches the operator as a failed ad and bills a
-failure. **NOT a controlled comparison** (n=38 each, one session, and the two runs used
-different prompt text), so this is a signal to re-measure, not a verdict.
+`openai/gpt-image-1.5/edit` + `input_fidelity: high` — product-perfect, text-broken:
+
+| prompt | identity rule | model swaps | rating defects |
+|---|---|---|---|
+| compressed 9.6k | 5-attribute | **0/12** | 3/12, incl. a FABRICATED count ("438 reviews" for 318) |
+| long 11.9k | simple sentence | **0/12** | ~11/12, incl. a WRONG VALUE (`4.4` for 4.6) |
+
+**FOUR CONCLUSIONS, and three of them contradict what a reasonable person would guess:**
+
+1. **Prompt LENGTH does not drive model swapping.** With the identity rule absent from both cells,
+   long = 5/12 and compressed = 5/12. Identical. The compression was neither the problem nor a fix.
+2. **A SIMPLE identity sentence beats an elaborate one, 2/12 vs 7/12.** Five named attributes plus
+   three specific bans did *worse* than one sentence. Dilution operates at the clause level, not
+   just at prompt scale. **Do not "strengthen" this sentence by adding detail — that was tried and
+   measured worse.**
+3. **Naming closures/zips in a preservation list did not help and plausibly hurt** (5/12 → 7/12
+   when added, confounded with the identity list). Classic negation priming. Note the exposed zip
+   ALSO appeared before that language existed, so the language did not introduce the defect — but
+   nothing about it earned its place.
+4. **Model swap is the mechanism for garment drift, in every cell.** Renders that keep the seed's
+   person are faithful; renders that swap the person gain exposed closures, restyled badges and
+   shifted colour together. Owner's read, confirmed: *"the only ones the shirts changed colors are
+   the images where the person was removed."*
+
+**`input_fidelity` IS THE REAL FIDELITY LEVER, AND IT IS BLOCKED ON TEXT.** `gpt-image-1.5/edit`
+exposes `input_fidelity` (enum low|high, **default high**), documented by Atlas as preserving
+"elements like faces or logos". It gave **0/12 swaps in both cells** — absolute product fidelity —
+and is **62% cheaper** ($0.0289 vs $0.07593 measured). `gpt-image-2/edit` has no such parameter.
+It cannot ship while the model typesets the rating: it invents star rows, and twice produced a
+false number (a fabricated review count, and 4.4 for 4.6). A wrong rating is a false proof claim,
+which is what `quoteProvenance` exists to prevent. **1.5 + high becomes the obvious choice the
+moment the rating stops being model-rendered** — which cuts against the 2026-07-31 removal of SVG
+overlay compositing, so it is a pipeline decision, not a prompt one.
+
+**Across ~170 renders on four seeds, no fidelity WORDING has ever beaten the legacy prompt.** The
+only measured wins are the person rule (product-only renders 3/6 → 0/12) and this identity sentence
+(swaps 5/12 → 2/12). Everything else is unproven. CLAUDE.md §2's standing note — the fix is
+measure-and-reject, not prompt tuning — has held up all day.
+
+### 0.0e HOLD THE WEARER, AND CUT THE PROMPT DOWN (owner, 2026-08-03)
+
+Two owner instructions, and they fit together — pinning the wearer let several hedges be deleted.
+
+**1. The person is now held, not just required.** `THE PERSON` says the same person appears,
+*keeping their face, hair, skin tone, build and identity*; they may not be replaced, removed, or
+swapped for a hanger/mannequin/flat lay. Pose, expression, hands and framing stay free.
+
+**WHY — measured, and it is a PRODUCT rule not a casting rule.** On the Pelagic Torrent seed,
+every faithful render kept the seed's model and every drifting render had swapped him:
+
+| | garment drift |
+|---|---|
+| same model as the seed (7 renders) | **0** |
+| model replaced (5 renders) | **5** |
+
+Verified at matched zoom: the swapped-model renders gained an **exposed black centre zip** where
+the seed hides it under a storm flap, replaced the small rectangular badge with a plain `PELAGIC`
+wordmark or an enlarged patch, and shifted the grey darker. Mechanism: preserving the person makes
+this a local edit around a kept subject; replacing them makes it a full subject regeneration, and
+the garment is then drawn from the model's prior instead of the reference. Same signature on the
+Gymshark Campus Crest seed — its one on-model wrong-shirt render also had a swapped face.
+
+Two specific bans were added from that evidence: **a closure the reference hides under a flap
+stays hidden**, and **a pocket the reference does not show is never added**. Plus the graphics rule
+now says a mark may never be *resized, restyled or swapped for a different mark*.
+
+**2. The prompt is SHORTER despite gaining rules.** 11,732 → **9,619 chars**; `PRODUCT_FIDELITY`
+itself 7.5k → **5.4k**. Cut: the product-category list (the "don't infer from category" rule does
+not need one), the standalone NEVER paragraph (folded to one line), duplicated enumerations across
+materials/details, and the ceremonial section formatting. Every enforceable rule survived — the
+harness grew from 711 to **831 checks** while the text shrank, which is the point. `ADVERTISING
+QUALITY` is now `MAKE IT GOOD`. Also added: *do not infer the product from its category, **its
+name**, or anything you know about the brand* — aimed squarely at the Campus Crest failure, where
+the model appears to render the catalog TITLE rather than the reference.
+
+Still byte-identical on flag-off. Harness revert-proven on five mutations: deleting the identity
+ban, vaguing the identity attributes, dropping the wearer from the not-free list, weakening the
+added-pocket ban, and deleting the logo-restyle ban. All five fail.
+
+### 0.0d THE PERSON RULE — the one prompt change with a MEASURED win (2026-08-03)
+
+Owner instruction, after live renders on real catalog products: **remove the clause letting the
+model decide whether a person appears.** `staticAdIntents.js` line ~721 read
+*"YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, **whether a person
+appears**, lighting and mood…"* — that clause predates all of this work and it is why a PELAGIC
+jacket seeded from an ON-MODEL photo came back as a jacket lying on a deck.
+
+**Replacement is asymmetric** (`WHO WEARS OR HOLDS IT`, inside `PRODUCT_FIDELITY`): if the
+reference shows the item worn/held, a person must wear or hold it the same way — who they are,
+their pose, hands and framing stay free, but they cannot be removed and the garment cannot be
+moved to a hanger, mannequin, surface or flat lay. If the reference shows the item alone, adding
+a person is discretionary. **No plumbing needed for that conditional** — `buildPrompt` never
+learns whether the seed has a person, but the MODEL can see the reference and evaluates it
+itself.
+
+**MEASURED, Pelagic Torrent seed, 12 hardened renders:**
+
+| | product-only renders | colour drift |
+|---|---|---|
+| legacy prompt | 3 of 6 | 1 of 6 |
+| hardened, no person rule | 2 of 6 | 2 of 6 |
+| **hardened + person rule** | **0 of 12** | **0 of 12** |
+
+**Why this matters more than the wording.** The causal chain runs through a rule I added:
+`PRODUCT SCALE AND FRAMING` asks for the same share of frame as the reference, a person competes
+for that area, so dropping the person is the cheapest way to comply — and an unpeopled render is
+where the product drifts. On the Gymshark Campus Crest seed the hardened arm invented a whole
+different product (dark brown tee with a large `GYMSHARK` varsity crest, laurel wreath,
+`EST. 2012`) in **5 of 11** renders against legacy's **2 of 12** — and **4 of those 5 were the
+product-only shots**. Owner's read, confirmed by the data: *"the only ones the shirts changed
+colors are the images where the person was removed."*
+
+So: the framing rule opened a hole and the person rule closes it. Do not remove one without
+re-testing the other.
+
+**STILL OPEN — the Campus Crest case is the first reproducible fidelity failure found, and the
+hardening made it WORSE (45% vs 17%).** Prime suspect is the `PRODUCT:` description, which in
+production is the real catalog title: *"Gymshark Campus Crest T-Shirt, brown"*. The model appears
+to render the NAME — a campus crest, in brown — over the reference, which is exactly what the
+block's "do not infer the product from its category… the reference is correct and your prior is
+wrong" clause is supposed to prevent. A plausible aggravator is the block's long enumeration of
+graphic types ("logos, branding, icons, artwork, patterns, prints, typography…") priming graphic
+output. **Re-measure with the person rule on before drawing conclusions** — the Pelagic re-run
+suggests much of the 45% may have travelled through the product-only path that is now closed.
+
+Pinned by `scripts/verifyStaticFidelityPrompt.js` — 711 checks, revert-proven on three mutations
+(restore the permissive clause, delete the no-flat-lay rule, invert the gate).
 
 ### 0.0c RENDER SAMPLES — run 1 VOID, run 2 in flight
 
@@ -1040,6 +1325,69 @@ as a single-colour silhouette chosen from the mean luminance behind it (`monochr
 the asset's own border implies, so white-on-black assets don't invert into a block. Failure falls
 back to the original asset. **NOT yet visually verified — needs one static render (~$0.01).**
 Video titling was never the source: `brandPill` and `brandLogo` are both off in canonical.
+
+### 0.3005 TYPE EXPERIMENT — OWNER-DIRECTED WORKSTREAM (2026-08-04). READ THIS BEFORE CONTINUING.
+
+**Owner verdict on the 17-ad sample** (artifact 3f801888-f0d0-4d28-af66-1ee62078d894): good EXCEPT
+Pelagic (font style regressed — my styleTheme alias moved it Oswald→Montserrat) and BabyBoo
+(before better). Verbatim directives: *"let's just stick to black or white type only when on a
+dark subject with a dark background, either with a drop shadow. The red lettering and white
+lettering you are choosing is tacky and doesn't look professional"* — measured cause: `textOnLight`
+fell back to brand PRIMARY (`titleSpecService.js` — Pelagic `#4d92b6` blue, BabyBoo `#ba3357`
+red). And: *"look at the GPT2 static ads, those look perfect with regards to font usage, color,
+placement"* — note the static path does NOT prescribe type; it hands typography to gpt-image-2
+("typeface and weight, the scale and colour of every text element", `staticAdIntents.js:747`).
+There is NO downloadable type rulebook in the repo; the constraint must be encoded.
+
+**THE EXPERIMENT (owner-approved, including LLM spend and $0.01 image calls for brands lacking
+statics): three arms over the SAME 30 masters, variety of colour/composition/size, then compare.**
+- **Baseline** = current pre-fix renders. CAPTURE BEFORE URLS FIRST — re-titling overwrites them.
+- **Arm A: disciplined deterministic** = current engine + black/white-only ink + font-order revert.
+  STATE: ink fix EDITED (uncommitted) in `titleSpecService.js` — `textOnLight` default `#16181D`,
+  no primary fallback; explicit curated `textOnLight` still wins (none in prod). REMAINING: font
+  order — a Google-resolvable scanned family (Pelagic "Oswald") must outrank the generic
+  `styleTheme.sansFontFamily` alias ("Montserrat"); `ownFace` (usable custom file, AllBirds "Self
+  Modern") stays top; update `verifyProofBeat` F2 ordering pins to match; suite; commit; deploy.
+- **Arm B: GPT-derived type template** = per-brand: collect 2-3 of the brand's OWN approved
+  gpt-image-2 static `renderUrl`s (for brands with none, generate ONE $0.01 static via the live
+  pipeline first — owner approved); send to a vision LLM with a STRICT JSON schema → type template
+  (ink discipline, casing, weight, tracking, alignment, size feel, NO scrim); map onto a
+  canonical-shaped preset JSON; write to `remotion/presets/` AT RUNTIME on the worker pod
+  (writable but EPHEMERAL — write + retitle in the SAME pod session); drive via the EXISTING
+  tier-0 `presetOverride` / driver `--preset` flag (never persisted).
+  MODEL: verify live before use (CLAUDE.md rule) — `google/gemini-2.5-pro` was probed for vision
+  QC (§0.2, exact-JSON-shape compliant; flash BROKE the shape). LLM calls are billable: ledger
+  them, no auto-retry, `maxRedirects: 0`.
+  **Grok adversarial review of the extractor BEFORE any billable call** (standing rule; it found
+  real defects in every diff this session).
+- **"Test the entire proposed workstream"** (owner, verbatim): after both arms work individually,
+  one end-to-end run — selection → baseline capture → arm A sweep → frames → arm B template
+  extraction → arm B sweep → frames → 3-column artifact (30 rows: baseline / disciplined /
+  template, annotated with each brand's ink+font inputs) — as a single scripted pipeline, not
+  hand-stitched steps, so it can be re-run.
+
+**Selection (30):** variety via stored metrics — `adSuitability.metrics.primarySubjectAreaFraction`
+(composition), overlay-zone band `lum` (colour/lightness), ≥8 brands, all four Meta formats
+(+pmax only with a live brand — three legacy pmax ads failed `brand not found — skip`, correctly).
+
+**BRAND INPUT TABLE (queried live, saves a round-trip):**
+| brand | scanned | theme.sans | primary | customFonts |
+|---|---|---|---|---|
+| Pelagic Gear | Oswald | Montserrat | #4d92b6 | none |
+| BabyBooFashion | Playfair Display | — | #ba3357 | none |
+| AllBirds | Self Modern | DM Sans | #ECE9E2 | Geograph×8, Self Modern, Akkurat Mono |
+| Vuori Clothing | Aktiv Grotesk | — | #333333 | none |
+(`textOnLight` explicitly set: NONE. GymShark 3.3/41000, Vuori 4.58/15545, Pelagic 3.2/22,
+BabyBoo 4.3/17645, Camelback 4.9, Peloton no data.)
+
+**OPS (relearned the hard way, all this session):** render-ssh <900 chars/cmd, rate-limits under
+sleepless loops — back off 60s, ONE call; worker `/tmp` wiped on every pod rotation and a DEPLOY
+ROTATES THE POD (never launch a driver right after deploying); driver stdout goes to its own file,
+NOT `render logs`; verify JSON edits by PARSING; Haiku is fine for mechanical fan-out but verify
+its counts (miscounted twice); the presets round-trip at `indent=2`.
+
+**Tasks #13-#16 track the four workstreams. Owner is compacting the conversation after this
+commit — continue from THIS section.**
 
 ### 0.3004 TITLE PLACEMENT — the bug was TIMING, not geometry. Tested, awaiting rollout call.
 

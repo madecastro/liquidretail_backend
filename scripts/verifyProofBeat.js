@@ -50,9 +50,19 @@ const { gateLayoutInputQuotes } = require('../services/brandScriptExecutor');
 
 let pass = 0;
 const failures = [];
+// A check may return a PROMISE (F3 drives the real async resolver). A plain
+// `try { fn() }` would count a rejected promise as a pass — a test that cannot
+// fail — so async results are collected and awaited before the report.
+const pending = [];
 function check(label, fn) {
-  try { fn(); pass++; }
-  catch (err) { failures.push(`${label}: ${err.message}`); }
+  try {
+    const out = fn();
+    if (out && typeof out.then === 'function') {
+      pending.push(out.then(() => { pass++; }, (err) => { failures.push(`${label}: ${err.message || err}`); }));
+    } else {
+      pass++;
+    }
+  } catch (err) { failures.push(`${label}: ${err.message}`); }
 }
 
 const BRAND_LABEL = 'gymshark.com';
@@ -955,21 +965,135 @@ check('F2 the scraped brand family and both styleTheme spellings are consulted',
   // Modern"). Theme-first would therefore have replaced real brand typefaces with
   // generic Google ones, the opposite of the intent. The brand's own ingested face
   // must come FIRST in the heading/body chains.
-  const headingChain = src.slice(src.indexOf('heading: normalizeFontFamily('), src.indexOf('body: normalizeFontFamily('));
-  const ownIdx = headingChain.indexOf('ownFace');
-  const themeIdx = headingChain.indexOf('themeHeading');
-  assert.ok(ownIdx > -1 && themeIdx > -1, 'heading chain must consult both the owned face and the theme');
+  const ladderSrc = src.slice(src.indexOf('const ladders = {'), src.indexOf('// Kept for diagnostics'));
+  assert.ok(ladderSrc.length > 100, 'the per-role candidate ladder must exist');
+  const headingLadder = ladderSrc.slice(ladderSrc.indexOf('heading: ['), ladderSrc.indexOf('body: ['));
+  const ownIdx = headingLadder.indexOf('ownFace');
+  const themeIdx = headingLadder.indexOf('themeHeading');
+  const scannedIdx = headingLadder.indexOf('[scannedPromoted');
+  const curatedIdx = headingLadder.indexOf('fontIsCurated');
+  assert.ok(ownIdx > -1 && themeIdx > -1, 'heading ladder must consult both the owned face and the theme');
   assert.ok(ownIdx < themeIdx, 'the brand\'s own ingested face must outrank a generic curated theme family');
+  // ARM A, the owner's font-style regression: a scraped family we can serve
+  // EXACTLY (Pelagic "Oswald" is a real Google family) must outrank the generic
+  // styleTheme alias ("Montserrat"). Owner: "for pelagic, the before looked
+  // better in terms of font style" — the before was Oswald.
+  assert.ok(scannedIdx > -1 && scannedIdx < themeIdx,
+    'an exactly-servable scraped face must outrank the generic theme alias');
+  // ...but the CURATED-fontFamily tier stays BELOW the theme, where the old
+  // cascade had it. Two independent reviewers caught the first draft promoting
+  // it: with curatedFields ['fontFamily','styleTheme'], fontFamily 'Self Modern'
+  // never ingested and theme.sans 'DM Sans', promoting the curated tier renders
+  // a library Playfair instead of the real, servable DM Sans.
+  assert.ok(curatedIdx > themeIdx,
+    'a curated-but-unservable fontFamily must yield to a curated theme family we can serve');
 
-  // ...and it may only outrank the theme when a USABLE file exists, which is what
-  // makes it the real face rather than a brandfetch guess. matchCustomFont is
-  // reused so licence holds still apply.
+  // ...and the owned-face tier may only outrank the theme when a USABLE file
+  // exists, which is what makes it the real face rather than a brandfetch guess.
+  // matchCustomFont is reused so licence holds still apply.
   assert.ok(/scannedIsOwnedFace\s*=\s*!!\(\s*scannedFamily\s*&&\s*matchCustomFont\(/.test(src),
     'the owned-face tier must be gated on matchCustomFont, so licence holds are respected');
   // Quote must NOT take the owned face — serifFontFamily is a deliberate pairing.
-  const quoteChain = src.slice(src.indexOf('quote: normalizeFontFamily('));
-  assert.ok(!/ownFace/.test(quoteChain.slice(0, quoteChain.indexOf('\n'))),
+  const quoteLadder = ladderSrc.slice(ladderSrc.indexOf('quote: ['));
+  assert.ok(quoteLadder.length > 20, 'the quote ladder must be locatable');
+  assert.ok(!/ownFace|scannedFamily/.test(quoteLadder),
     'a sans brand face must not silently replace a curated serif quote voice');
+});
+
+check('F3 the scraped face wins only when it can actually be served', () => {
+  // THIS CHECK DRIVES THE REAL CODE, not a mirror of it. buildFontLadders and
+  // resolveLadder are exported and resolveLadder takes its resolver as an
+  // argument, so the actual tier order and the actual walk can be exercised
+  // offline with a fake resolver. That closes the mirror-vs-wiring gap: a mirror
+  // cannot catch a wiring revert, which is why other rules here need two checks.
+  const { buildFontLadders, resolveLadder } = require('../services/fontResolverService');
+
+  // `exact` mirrors resolveFamily's contract: an ingested custom file or a real
+  // Google family is exact; a tone-based library substitution is not.
+  const GOOGLE = new Set(['Oswald', 'Montserrat', 'DM Sans', 'Playfair Display', 'Lora', 'Inter']);
+  const fakeResolver = (ownedFiles) => async (family) => {
+    if (ownedFiles.includes(family)) return { family, exact: true, source: 'custom' };
+    if (GOOGLE.has(family)) return { family, exact: true, source: 'google' };
+    return { family: 'Inter', exact: false, source: 'library-match' };
+  };
+  const headingFor = async (brand, ownedFiles = []) => {
+    const { ladders } = buildFontLadders(brand, {});
+    const walked = await resolveLadder(ladders.heading, fakeResolver(ownedFiles));
+    return walked.entry ? walked.entry.family : null;
+  };
+
+  const cases = [
+    // Pelagic, the owner's reported regression: the scraped face is a real Google
+    // family and the theme names it nowhere, so it beats the theme alias.
+    ['pelagic', { name: 'Pelagic Gear', fontFamily: 'Oswald', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'Montserrat', serifFontFamily: 'Playfair Display' } }, [], 'Oswald'],
+    // Camelback: the curated theme ALREADY names the scraped face as its serif, so
+    // the pairing stands. Promoting Lora here made heading+body+quote all Lora.
+    ['camelback', { name: 'Camelback', fontFamily: 'Lora', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans', serifFontFamily: 'Lora' } }, [], 'DM Sans'],
+    // AllBirds with the file held back: 'Self Modern' can only substitute, so the
+    // curated theme is correct. This is the case a naive "scanned first" breaks.
+    ['allbirds-held', { name: 'AllBirds', fontFamily: 'Self Modern', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans' } }, [], 'DM Sans'],
+    // Same, but with fontFamily ALSO curated — the tier an earlier draft wrongly
+    // promoted above the theme, which locked a library lookalike.
+    ['allbirds-curated-held', { name: 'AllBirds', fontFamily: 'Self Modern',
+      curatedFields: ['styleTheme', 'fontFamily'], styleTheme: { sansFontFamily: 'DM Sans' } }, [], 'DM Sans'],
+    // AllBirds with the file ingested: the brand's own face wins outright.
+    ['allbirds-owned', { name: 'AllBirds', fontFamily: 'Self Modern', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans' },
+      customFonts: [{ family: 'Self Modern', url: 'https://x/f.woff2' }] }, ['Self Modern'], 'Self Modern'],
+    // Same brand, but the file we CLAIM to hold does not actually load (CDN miss,
+    // corrupt cache). ownFace is exact-only precisely for this: a curated theme
+    // family we can serve beats a tone-matched guess. Without the flag this
+    // returns the library substitution instead, and nothing else catches it.
+    ['allbirds-file-fails', { name: 'AllBirds', fontFamily: 'Self Modern', curatedFields: ['styleTheme'],
+      styleTheme: { sansFontFamily: 'DM Sans' },
+      customFonts: [{ family: 'Self Modern', url: 'https://x/f.woff2' }] }, [], 'DM Sans'],
+    // Vuori: nothing servable and no theme — the closest library face must still
+    // render, exactly as before the change.
+    ['vuori', { name: 'Vuori Clothing', fontFamily: 'Aktiv Grotesk' }, [], 'Inter'],
+  ];
+
+  return Promise.all(cases.map(async ([label, brand, owned, expected]) => {
+    const got = await headingFor(brand, owned);
+    assert.strictEqual(got, expected, `${label}: heading resolved '${got}', expected '${expected}'`);
+  })).then(() => {
+    // ORDER, read off the real ladder rather than a regex over the source.
+    const { ladders } = buildFontLadders({
+      name: 'X', fontFamily: 'Oswald', curatedFields: ['styleTheme', 'fontFamily'],
+      styleTheme: { sansFontFamily: 'Montserrat' },
+    }, {});
+    const families = ladders.heading.map(([f]) => f);
+    const idx = (f) => families.indexOf(f);
+    assert.ok(idx('Oswald') > -1 && idx('Montserrat') > -1, 'both the scraped face and the theme must be present');
+    assert.ok(idx('Oswald') < idx('Montserrat'), 'an exactly-servable scraped face must outrank the theme alias');
+    // The scanned family appears TWICE for this brand shape — once as the promoted
+    // exact-only tier and again as the curated tier below the theme — so the flag
+    // must be read at the first occurrence's index, not looked up by family.
+    assert.strictEqual(ladders.heading[idx('Oswald')][1], true,
+      'the promoted scraped tier must be exact-only');
+    // The curated-fontFamily tier is the SECOND occurrence of the scanned family,
+    // and it must sit BELOW the theme.
+    const lastOswald = families.lastIndexOf('Oswald');
+    assert.ok(lastOswald > idx('Montserrat'),
+      'a curated-but-unservable fontFamily must yield to a curated theme family we can serve');
+    // The quote ladder must never carry the brand's sans face directly.
+    const quoteFamilies = ladders.quote.map(([f]) => f).filter(Boolean);
+    assert.ok(!quoteFamilies.includes('Oswald') || quoteFamilies.indexOf('Oswald') === quoteFamilies.length - 1,
+      'the quote role must not take the scraped sans face above its own tiers');
+
+    // STRUCTURAL, and deliberately so. The `entry || firstInexact` fallback is
+    // DEFENSIVE and currently unreachable: sharedFamily always re-offers the
+    // scanned family with requireExact false, so a rejected exact-only tier is
+    // always given a second, unrestricted chance. No brand shape can therefore
+    // exercise it behaviourally — and removing it survived every behavioural case
+    // above. It still must not be deleted, because it is the only thing standing
+    // between a future ladder edit and a silent jump to the role default.
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+    assert.ok(/entry \|\| firstInexact/.test(src),
+      'the closest substitution must survive as the fallback — never jump straight to the role default');
+  });
 });
 
 // ── A: a product-tier rating names its product ──────────────────────────
@@ -1023,6 +1147,41 @@ check('C-ink CTA/promo/badge ink is chosen from the fill, not assumed', () => {
   assert.strictEqual(readableOn('#16181D'), '#FFFFFF', 'dark pill needs white ink');
   assert.strictEqual(readableOn('#F1EFE9', '#123456'), '#123456', 'an explicit brand colour wins');
   assert.strictEqual(readableOn('garbage'), '#FFFFFF', 'unparseable falls back safely');
+});
+
+check('C-mono the WORDS are monochrome — brand colour lives in fills, not type', () => {
+  // Owner, on a 17-ad sample (2026-08-04): "let's just stick to black or white
+  // type only when on a dark subject with a dark background, either with a drop
+  // shadow. The red lettering and white lettering you are choosing is tacky and
+  // doesn't look professional."
+  //
+  // Both offending inks fell back to a SCRAPED BRAND COLOUR: textOnLight to
+  // primary (Pelagic #4d92b6 blue, BabyBoo #ba3357 red on any light plate) and
+  // textSecondary to secondary. Neither is a decision anyone made per brand —
+  // they are palette values leaking into type.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'titleSpecService.js'), 'utf8');
+  const inkLine = (key) => {
+    const m = src.match(new RegExp(`^\\s*${key}:.*$`, 'm'));
+    assert.ok(m, `${key} must exist in the token map`);
+    return m[0];
+  };
+  for (const [key, colour] of [['textOnLight', 'primary'], ['textSecondary', 'secondary'],
+                               ['textSecondaryOnLight', 'secondary'], ['textPrimary', 'primary']]) {
+    const line = inkLine(key);
+    assert.ok(!new RegExp(`\\|\\|\\s*${colour}\\b`).test(line),
+      `${key} must not fall back to the brand ${colour} colour — type is monochrome: ${line.trim()}`);
+  }
+  // The defaults are the two inks, and an explicit curated value still wins so a
+  // brand can deliberately opt out later.
+  assert.ok(/textOnLight: themeColor\(theme, 'textOnLight'\) \|\| '#16181D'/.test(src),
+    'textOnLight defaults to near-black, after the curated value');
+  assert.ok(/textPrimary: themeColor\(theme, 'textPrimary'\) \|\| '#FFFFFF'/.test(src),
+    'textPrimary defaults to white, after the curated value');
+  // Brand colour is NOT banished — it still fills the CTA/badge/promo and the
+  // stars stay gold. This check would be wrong if it removed those.
+  assert.ok(/ctaBgResolved\s*=[\s\S]{0,200}accent \|\| primary/.test(src),
+    'the CTA fill must still use the brand palette');
+  assert.ok(/stars: themeColor\(theme, 'starColor'\)/.test(src), 'stars stay gold, not monochrome');
 });
 
 // ── S3: the video seed skips a subject-dominant first image ─────────────
@@ -1096,9 +1255,12 @@ check('M1 the canonical family ships no CTA on Meta formats, but keeps it on lan
 
 // ── report ─────────────────────────────────────────────────────────────
 
-if (failures.length) {
-  console.error(`\n❌ verifyProofBeat: ${failures.length} failed, ${pass} passed`);
-  for (const f of failures) console.error(`   - ${f}`);
-  process.exit(1);
-}
-console.log(`✅ verifyProofBeat: ${pass}/${pass} checks passed`);
+(async () => {
+  await Promise.all(pending);
+  if (failures.length) {
+    console.error(`\n❌ verifyProofBeat: ${failures.length} failed, ${pass} passed`);
+    for (const f of failures) console.error(`   - ${f}`);
+    process.exit(1);
+  }
+  console.log(`✅ verifyProofBeat: ${pass}/${pass} checks passed`);
+})();

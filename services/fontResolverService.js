@@ -35,7 +35,10 @@ const DEFAULT_ROLE_FONTS = {
 
 // Families we treat as serif for CSS fallback purposes (heuristic; anything
 // else falls back to sans-serif).
-const SERIF_HINTS = /serif|playfair|lora|cormorant|garamond|fraunces|caslon|bodoni|didot|georgia|times|libre|crimson|merriweather|spectral|eb garamond|prata|domine/i;
+// Must stay aligned with LIBRARY_SERIF_FACES: a library serif whose name misses
+// this regex gets `fallback: 'sans-serif'`, so if the file fails to load the
+// browser substitutes a sans for a serif face.
+const SERIF_HINTS = /serif|playfair|lora|cormorant|garamond|fraunces|caslon|bodoni|didot|georgia|times|libre|crimson|merriweather|spectral|eb garamond|prata|domine|slab|arvo|marcellus|italiana|cinzel/i;
 
 const memoryCache = new Map(); // family|weight -> resolved entry or null
 const inFlight = new Map();    // key -> Promise; prevents same-font download races
@@ -365,6 +368,9 @@ const LIBRARY_SUBSTITUTIONS = [
   { pattern: /din|trade gothic|franklin gothic|league gothic/i, family: 'Oswald', reason: 'condensed industrial sans' },
   { pattern: /impact|haettenschweiler/i, family: 'Anton', reason: 'heavy display sans' },
   { pattern: /bodoni|didot|walbaum/i, family: 'Playfair Display', reason: 'high-contrast editorial serif' },
+  // Before the broad garamond row: we now ship the actual EB Garamond specimen,
+  // so asking for it must not resolve to a different Garamond revival.
+  { pattern: /eb\s*garamond/i, family: 'EB Garamond', reason: 'EB Garamond → the library specimen itself' },
   { pattern: /garamond|caslon|baskerville|minion|adobe jenson/i, family: 'Cormorant Garamond', reason: 'old-style editorial serif' },
   { pattern: /script|brush|handwriting|calligraphy/i, family: 'Great Vibes', reason: 'formal script' },
   // ── Commercial DTC webfonts (named faces; before classification) ───────
@@ -376,7 +382,7 @@ const LIBRARY_SUBSTITUTIONS = [
   { pattern: /gt\s*america/i, family: 'Inter', reason: 'GT America → Inter (Grilli American grotesque)' },
   { pattern: /untitled\s*sans/i, family: 'Inter', reason: 'Untitled Sans → Inter (Klim neo-grotesk)' },
   { pattern: /\bcanela\b/i, family: 'Playfair Display', reason: 'Canela → Playfair (Commercial Type high-contrast serif)' },
-  { pattern: /\btiempos\b/i, family: 'Lora', reason: 'Tiempos → Lora (Klim editorial text serif)' },
+  { pattern: /\btiempos\b/i, family: 'Source Serif 4', reason: 'Tiempos → Source Serif 4 (Klim editorial text serif)' },
   { pattern: /\bgraphik\b/i, family: 'Inter', reason: 'Graphik → Inter (Commercial Type neo-grotesk)' },
   { pattern: /\bsuisse\b/i, family: 'Inter', reason: 'Suisse → Inter (Swiss Typefaces grotesque)' },
   { pattern: /maison\s*neue/i, family: 'Montserrat', reason: 'Maison Neue → Montserrat (geometric sans)' },
@@ -384,47 +390,108 @@ const LIBRARY_SUBSTITUTIONS = [
   { pattern: /national\s*2/i, family: 'DM Sans', reason: 'National 2 → DM Sans (Klim soft grotesque)' },
   { pattern: /neue\s*montreal/i, family: 'Inter', reason: 'Neue Montreal → Inter (Pangram neo-grotesk)' },
   { pattern: /sharp\s*grotesk/i, family: 'Inter', reason: 'Sharp Grotesk → Inter (Sharp Type display grotesque)' },
-  { pattern: /\brecoleta\b/i, family: 'Cormorant', reason: 'Recoleta → Cormorant (soft rounded display serif)' },
-  { pattern: /\bdomaine\b/i, family: 'Playfair Display', reason: 'Domaine → Playfair (Klim fashion display serif)' },
+  { pattern: /\brecoleta\b/i, family: 'Fraunces', reason: 'Recoleta → Fraunces (soft optical display serif)' },
+  { pattern: /\bdomaine\b/i, family: 'Prata', reason: 'Domaine → Prata (Klim fashion didone)' },
   { pattern: /aperc[uú]|aperçu/i, family: 'Montserrat', reason: 'Aperçu → Montserrat (Colophon geometric grotesk)' },
   { pattern: /founders\s*grotesk/i, family: 'Inter', reason: 'Founders Grotesk → Inter (Klim neo-grotesk)' },
   { pattern: /\bdruk\b/i, family: 'Bebas Neue', reason: 'Druk → Bebas Neue (Commercial Type condensed display)' },
   { pattern: /gt\s*walsheim/i, family: 'Montserrat', reason: 'GT Walsheim → Montserrat (Grilli geometric sans)' },
-  { pattern: /gt\s*sectra/i, family: 'Playfair Display', reason: 'GT Sectra → Playfair (Grilli contrast serif)' },
-  { pattern: /editorial\s*new/i, family: 'Playfair Display', reason: 'Editorial New → Playfair (Pangram editorial display serif)' },
+  { pattern: /gt\s*sectra/i, family: 'Spectral', reason: 'GT Sectra → Spectral (Grilli contrast serif)' },
+  { pattern: /editorial\s*new/i, family: 'DM Serif Display', reason: 'Editorial New → DM Serif Display (Pangram editorial display serif)' },
   { pattern: /pp\s*mori/i, family: 'Montserrat', reason: 'PP Mori → Montserrat (Pangram geometric sans)' },
   { pattern: /\bwhyte\b/i, family: 'Inter', reason: 'Whyte → Inter (Dinamo neo-grotesk)' },
   { pattern: /\bfavorit\b/i, family: 'Montserrat', reason: 'Favorit → Montserrat (Dinamo geometric sans)' },
   { pattern: /\bakkurat\b/i, family: 'Inter', reason: 'Akkurat → Inter (Lineto Swiss grotesk)' },
-  { pattern: /\bpublico\b/i, family: 'Lora', reason: 'Publico → Lora (Commercial Type news text serif)' },
+  { pattern: /\bpublico\b/i, family: 'Merriweather', reason: 'Publico → Merriweather (Commercial Type news text serif)' },
   { pattern: /\bstyrene\b/i, family: 'Montserrat', reason: 'Styrene → Montserrat (Commercial Type geometric sans)' },
   { pattern: /\broobert\b/i, family: 'Montserrat', reason: 'Roobert → Montserrat (Displaay geometric sans)' },
   { pattern: /ideal\s*sans/i, family: 'DM Sans', reason: 'Ideal Sans → DM Sans (Hoefler humanist sans)' },
-  { pattern: /\bfreight\b/i, family: 'Lora', reason: 'Freight → Lora (GarageFonts editorial serif)' },
-  { pattern: /sang\s*bleu|sangbleu/i, family: 'Cormorant', reason: 'SangBleu → Cormorant (Swiss Typefaces fashion serif)' },
+  { pattern: /\bfreight\b/i, family: 'Merriweather', reason: 'Freight → Merriweather (GarageFonts editorial serif)' },
+  { pattern: /sang\s*bleu|sangbleu/i, family: 'Prata', reason: 'SangBleu → Prata (Swiss Typefaces fashion serif)' },
   { pattern: /monument\s*grotesk/i, family: 'Inter', reason: 'Monument Grotesk → Inter (Dinamo neo-grotesk)' },
   { pattern: /abc\s*diatype|\bdiatype\b/i, family: 'Montserrat', reason: 'ABC Diatype → Montserrat (Dinamo geometric sans)' },
-  { pattern: /noe\s*display/i, family: 'Playfair Display', reason: 'Noe Display → Playfair (Schwartzco display serif)' },
+  { pattern: /noe\s*display/i, family: 'DM Serif Display', reason: 'Noe Display → DM Serif Display (Schwartzco display serif)' },
   { pattern: /\bsaans\b/i, family: 'Inter', reason: 'Saans → Inter (Displaay neo-grotesk)' },
   // Circular also appears in foundry row above (same target); listed for audit.
   { pattern: /ll\s*circular|\bcircular\b/i, family: 'DM Sans', reason: 'Circular → DM Sans (Lineto geometric-humanist sans)' },
-  { pattern: /\baustin(\s+(text|display))?\b/i, family: 'Playfair Display', reason: 'Austin → Playfair (Commercial Type Didone)' },
+  { pattern: /\baustin(\s+(text|display))?\b/i, family: 'Prata', reason: 'Austin → Prata (Commercial Type Didone)' },
+  // ── Names unlocked by the 16 → 48 library expansion (2026-08-04) ────────
+  // These were unrepresentable before: a slab, a mono, a fashion didone and a
+  // casual script had no target in the 16-face library, so every one of them
+  // resolved to something from the wrong class.
+  // NOTE the foundry rows above still run FIRST — in particular
+  // /script|brush|handwriting|calligraphy/ → Great Vibes claims any name
+  // containing "script", so a row here matching e.g. "Wedding Script" would be
+  // dead code. The script rows below deliberately match only names that do not
+  // carry those tokens.
+  // Slab
+  { pattern: /rockwell|archer|sentinel|museo\s*slab|clarendon/i, family: 'Zilla Slab', reason: 'Rockwell/Archer/Sentinel → Zilla Slab (true slab)' },
+  { pattern: /egyptian\s*slab|\bcandida\b/i, family: 'Arvo', reason: 'Egyptian slab → Arvo' },
+  { pattern: /josefin\s*slab/i, family: 'Josefin Slab', reason: 'Josefin Slab → the library specimen itself' },
+  // Mono — named faces before the classification /mono/ row.
+  { pattern: /space\s*mono/i, family: 'Space Mono', reason: 'Space Mono → the library specimen itself' },
+  { pattern: /(?:ibm\s*)?plex\s*mono/i, family: 'IBM Plex Mono', reason: 'IBM Plex Mono → the library specimen itself' },
+  { pattern: /jetbrains\s*mono/i, family: 'JetBrains Mono', reason: 'JetBrains Mono → the library specimen itself' },
+  { pattern: /input\s*mono|sf\s*mono|source\s*code/i, family: 'IBM Plex Mono', reason: 'system/dev mono → IBM Plex Mono' },
+  // Editorial / text serif
+  { pattern: /\bogg\b/i, family: 'DM Serif Display', reason: 'Ogg → DM Serif Display (Sharp Type display serif)' },
+  { pattern: /\breckless\b/i, family: 'Italiana', reason: 'Reckless → Italiana (fashion display serif)' },
+  { pattern: /value\s*serif|source\s*serif/i, family: 'Source Serif 4', reason: 'Value Serif/Source Serif → Source Serif 4' },
+  // "Feature" only with a qualifier — bare "feature" is common product copy and
+  // would hijack unrelated names.
+  { pattern: /feature\s*(display|serif|text)|\bsignifier\b/i, family: 'Spectral', reason: 'Feature/Signifier → Spectral (editorial contrast serif)' },
+  { pattern: /\btimes\b|\bgeorgia\b|\bcharter\b|\bmiller\b/i, family: 'Merriweather', reason: 'Times/Georgia/Charter/Miller → Merriweather (news text serif)' },
+  // Geometric / grotesk sans
+  { pattern: /\bgilroy\b|product\s*sans|cerebri/i, family: 'Outfit', reason: 'Gilroy/Product Sans → Outfit (geometric sans)' },
+  { pattern: /\bsatoshi\b|general\s*sans/i, family: 'Manrope', reason: 'Satoshi/General Sans → Manrope (geometric sans)' },
+  { pattern: /clash\s*grotesk|space\s*grotesk/i, family: 'Space Grotesk', reason: 'Clash/Space Grotesk → Space Grotesk' },
+  { pattern: /aktiv\s*grotesk|work\s*sans/i, family: 'Work Sans', reason: 'Aktiv Grotesk → Work Sans (neo-grotesk)' },
+  { pattern: /\bverdana\b|\btahoma\b|\btrebuchet\b/i, family: 'Work Sans', reason: 'Verdana/Tahoma/Trebuchet → Work Sans (humanist UI sans)' },
+  { pattern: /public\s*sans|source\s*sans/i, family: 'Public Sans', reason: 'Public/Source Sans → Public Sans' },
+  { pattern: /\barchivo\b(?!\s*(narrow|black))/i, family: 'Archivo', reason: 'Archivo → the library specimen itself' },
+  // Condensed. Plain "Barlow" is NOT a condensed face — only the Condensed cut
+  // maps to Barlow Condensed; the regular width goes to a normal-width grotesk.
+  { pattern: /barlow\s*condensed/i, family: 'Barlow Condensed', reason: 'Barlow Condensed → the library specimen itself' },
+  { pattern: /\bbarlow\b/i, family: 'Work Sans', reason: 'Barlow (regular width) → Work Sans (low-contrast grotesk)' },
+  { pattern: /archivo\s*narrow|heroic\s*condensed|knockout/i, family: 'Archivo Narrow', reason: 'Archivo Narrow/Knockout → Archivo Narrow' },
+  // Wide / heavy display
+  { pattern: /archivo\s*black|ultra\s*black|extra\s*black/i, family: 'Archivo Black', reason: 'Archivo Black / ultra-black → Archivo Black' },
+  { pattern: /\bsyne\b/i, family: 'Syne', reason: 'Syne → the library specimen itself' },
+  // Rounded
+  { pattern: /vag\s*rounded|\bbaloo\b/i, family: 'Baloo 2', reason: 'VAG Rounded/Baloo → Baloo 2' },
+  { pattern: /\bcomfortaa\b/i, family: 'Comfortaa', reason: 'Comfortaa → the library specimen itself' },
+  // Script / hand — casual and formal scripts are different voices; Great Vibes
+  // (formal copperplate) was standing in for both.
+  { pattern: /snell\s*roundhand|bickham|edwardian/i, family: 'Dancing Script', reason: 'Snell/Bickham/Edwardian → Dancing Script' },
+  { pattern: /\bpacifico\b|\blobster\b|satisfy/i, family: 'Pacifico', reason: 'Pacifico/Lobster/Satisfy → Pacifico (casual script)' },
+  { pattern: /marker\s*felt|comic\s*sans|chalkboard|hand.?letter/i, family: 'Caveat', reason: 'Comic/marker/hand-letter → Caveat' },
+  // Didone / fashion / luxury
+  { pattern: /\bprata\b/i, family: 'Prata', reason: 'Prata → the library specimen itself' },
+  { pattern: /\bitaliana\b/i, family: 'Italiana', reason: 'Italiana → the library specimen itself' },
+  { pattern: /dm\s*serif(\s*display)?/i, family: 'DM Serif Display', reason: 'DM Serif Display → the library specimen itself' },
+  { pattern: /\bmarcellus\b|orpheus/i, family: 'Marcellus', reason: 'Marcellus/Orpheus → Marcellus (fashion serif)' },
+  { pattern: /\bfraunces\b|soft\s*serif|wonky\s*serif/i, family: 'Fraunces', reason: 'Fraunces/soft-serif → Fraunces' },
+  { pattern: /copperplate|\btrajan\b|inscriptional/i, family: 'Cinzel', reason: 'Copperplate/Trajan → Cinzel (inscriptional display)' },
+  { pattern: /\boptima\b|zapf\s*humanist|tenor\s*sans/i, family: 'Tenor Sans', reason: 'Optima → Tenor Sans (flare-humanist sans)' },
   // ── Type-classification vocabulary (proprietary DTC names often carry these) ──
   // More specific compounds before single-token classes (humanist serif before
   // humanist; grotesk before bare "modern" so "Modern Grotesk" stays a sans).
-  { pattern: /old.?style|humanist serif/i, family: 'Cormorant Garamond', reason: 'old-style/humanist-serif classification' },
+  { pattern: /old.?style|humanist serif/i, family: 'EB Garamond', reason: 'old-style/humanist-serif classification' },
   { pattern: /grotesk|grotesque/i, family: 'Inter', reason: 'grotesk/grotesque classification' },
   { pattern: /geometric/i, family: 'Montserrat', reason: 'geometric classification' },
   { pattern: /humanist/i, family: 'DM Sans', reason: 'humanist sans classification' },
   { pattern: /condensed|compressed|narrow/i, family: 'Oswald', reason: 'condensed classification' },
-  { pattern: /extended|wide/i, family: 'Anton', reason: 'extended/wide display classification' },
+  { pattern: /extended|wide/i, family: 'Syne', reason: 'extended/wide display classification' },
   { pattern: /display|poster|headline/i, family: 'Bebas Neue', reason: 'display/poster classification' },
   { pattern: /rounded|soft/i, family: 'Quicksand', reason: 'rounded/soft classification' },
-  { pattern: /mono|plex|technical/i, family: 'IBM Plex Sans', reason: 'mono/technical classification' },
+  // Split: a name saying "mono" wants a MONOSPACE face. The single old row sent
+  // all of these to IBM Plex Sans — a proportional sans — so "Akkurat Mono"
+  // rendered proportionally. "monospace" itself never arrives here (it is a
+  // CSS generic, filtered by normalizeFontFamily), so it is not listed.
+  { pattern: /courier|monaco|consolas|menlo|\bmono\b/i, family: 'IBM Plex Mono', reason: 'mono/monospace classification' },
+  { pattern: /plex|technical/i, family: 'IBM Plex Sans', reason: 'plex/technical classification' },
   { pattern: /elegant|luxe|couture/i, family: 'Cormorant', reason: 'elegant/luxe classification' },
-  // No true slab in the 16-face library; Lora is the closest transitional
-  // serif with enough weight to stand in for Rockwell/Roboto Slab-class faces.
-  { pattern: /slab/i, family: 'Lora', reason: 'slab → Lora (closest available; no true slab in library)' },
+  { pattern: /slab/i, family: 'Zilla Slab', reason: 'slab classification' },
   // "Modern" as a classification = Didone (high-contrast serif). Word-boundary
   // so we do not steal longer tokens; "Self Modern" / "Modern" both match.
   { pattern: /didone|\bmodern\b/i, family: 'Playfair Display', reason: 'modern/didone classification' },
@@ -433,13 +500,26 @@ const LIBRARY_SUBSTITUTIONS = [
 // Faces that must not land on body copy (legibility). Applied only when
 // role === 'body'; foundry/classification non-regression tests use heading
 // or null role so script→Great Vibes etc. stay unchanged.
-const BODY_UNSAFE_FACES = new Set(['Anton', 'Bebas Neue', 'Great Vibes', 'Antonio']);
+const BODY_UNSAFE_FACES = new Set([
+  'Anton', 'Bebas Neue', 'Great Vibes', 'Antonio',
+  // Heavy / wide display
+  'Archivo Black', 'Syne',
+  // Didone + inscriptional display: high stroke contrast and tight apertures
+  // that close up at caption sizes.
+  'Prata', 'Italiana', 'DM Serif Display', 'Marcellus', 'Cinzel',
+  // Scripts
+  'Dancing Script', 'Pacifico', 'Caveat',
+]);
 
-// Serif faces in the curated 16 (must stay aligned with SERIF_HINTS /
-// fallbackFor). Great Vibes is a script; treated as serif-intent for the
-// serif/sans constraint when it is the chosen face.
+// Serif faces in the curated library (must stay aligned with SERIF_HINTS /
+// fallbackFor). Scripts are treated as serif-intent for the serif/sans
+// constraint when one is the chosen face — the Great Vibes convention.
 const LIBRARY_SERIF_FACES = new Set([
   'Playfair Display', 'Lora', 'Cormorant', 'Cormorant Garamond', 'Great Vibes',
+  'Zilla Slab', 'Arvo', 'Josefin Slab',
+  'Source Serif 4', 'Merriweather', 'Spectral', 'EB Garamond', 'Fraunces',
+  'Prata', 'Italiana', 'DM Serif Display', 'Marcellus', 'Cinzel',
+  'Dancing Script', 'Pacifico', 'Caveat',
 ]);
 
 /**
@@ -728,7 +808,7 @@ async function resolveLibraryMatch(requestedFamily, weight = 400, { brand = null
  * { family, weight, style, localPath|null, fallback, source } — localPath
  * null means "let the browser fall back" (family kept for CSS stacks).
  */
-async function resolveFamily(family, { brand = null, weight = 400, role = null } = {}) {
+async function resolveFamily(family, { brand = null, weight = 400, role = null, quiet = false } = {}) {
   family = normalizeFontFamily(family);
   if (!family) return null;
 
@@ -745,10 +825,17 @@ async function resolveFamily(family, { brand = null, weight = 400, role = null }
   // the proprietary name misses both custom and Google (common DTC case).
   const library = await resolveLibraryMatch(family, weight, { brand, role });
   if (library) {
-    console.warn(
-      `🔤 fontResolver: '${family}' unavailable — using closest library face ` +
-      `'${library.family}' (${library.matchReason}) for brand ${brand?.name || '?'}`
-    );
+    // `quiet` is passed by a caller that may REJECT this substitution (an
+    // exact-only ladder tier). Without it the log claimed "using closest library
+    // face 'Inter'" for a font that never reached the render — the tier was
+    // discarded and a lower tier resolved exactly. A log that names the wrong
+    // font is worse than no log; the winning face is reported by the caller.
+    if (!quiet) {
+      console.warn(
+        `🔤 fontResolver: '${family}' unavailable — using closest library face ` +
+        `'${library.family}' (${library.matchReason}) for brand ${brand?.name || '?'}`
+      );
+    }
     return library;
   }
 
@@ -757,13 +844,15 @@ async function resolveFamily(family, { brand = null, weight = 400, role = null }
 }
 
 /**
- * Resolve the three role fonts for a brand.
- * `overrides` comes from spec.tokenOverrides.fonts ({ heading: {family, weight}, ... }).
- * Returns { heading, body, quote } each { family, weight, style, url|null, fallback, source }.
- * `url` is a LOCAL FILE PATH here; remotionRenderService swaps it for an
- * asset-server URL before it reaches the browser.
+ * Build the per-role candidate ladders for a brand. PURE — no network, no fs,
+ * no Mongoose. Split out of resolveBrandFonts so the tier ORDER (the part that
+ * decides whether a brand renders in its real typeface) is unit-testable
+ * offline; resolveBrandFonts itself cannot be, because resolving a family
+ * reaches Google Fonts.
+ * Returns { ladders, wanted, weights }; each ladder entry is
+ * [familyOrNull, requireExact].
  */
-async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = null } = {}) {
+function buildFontLadders(brand, { overrides = {}, layoutInputBrand = null } = {}) {
   const styleThemeIsCurated = Array.isArray(brand?.curatedFields) && brand.curatedFields.includes('styleTheme');
   const theme = styleThemeIsCurated ? (brand?.styleTheme || {}) : {};
   const tailwind = brand?.tailwindTheme || {};
@@ -817,24 +906,166 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
     scanned || null
   );
 
-  const wanted = {
-    heading: normalizeFontFamily(overrides.heading?.family || ownFace || themeHeading || (fontIsCurated ? scanned : null) || tailwind?.fonts?.heading || websiteUsage.heading || sharedFamily) || DEFAULT_ROLE_FONTS.heading.family,
-    body: normalizeFontFamily(overrides.body?.family || ownFace || themeBody || (fontIsCurated ? scanned : null) || tailwind?.fonts?.body || websiteUsage.body || sharedFamily) || DEFAULT_ROLE_FONTS.body.family,
+  // WHEN THE CURATED THEME ALREADY NAMES THE SCRAPED FACE, THE THEME IS A
+  // PAIRING AND MUST BE LEFT ALONE.
+  //
+  // Adversarial review killed the naive version of the promotion below with
+  // Camelback: {fontFamily:'Lora', theme.sans:'DM Sans', theme.serif:'Lora'}.
+  // Lora IS a real Google family, so an unconditional promotion resolved
+  // heading, body AND quote to Lora and collapsed a deliberate sans/serif
+  // pairing into one serif. Pelagic is the case the owner actually reported:
+  // {fontFamily:'Oswald', theme.sans:'Montserrat'} — the theme names a face the
+  // brand does not use anywhere, i.e. a generic guess that contradicts the scan.
+  //
+  // The rule that separates them without a special case: promote the scraped
+  // face over the theme only when the theme does not already use it in SOME
+  // role. Theme mentions it -> the curated pairing already accounts for the real
+  // face, respect it. Theme contradicts the scan entirely -> the scan wins.
+  const themeFamilies = [themeHeading, themeBody, themeQuote]
+    .map(normalizeFontFamily).filter(Boolean).map(familyKey);
+  const scannedPromoted = scannedFamily && !themeFamilies.includes(familyKey(scannedFamily))
+    ? scannedFamily
+    : null;
+
+  // AN ORDERED LADDER OF CANDIDATES, NOT ONE PRE-PICKED WINNER.
+  //
+  // This used to collapse the whole cascade to a single family and then fall
+  // straight to the role default if that family could not be resolved — so a
+  // tier could win the cascade and still render nothing of what it named. That
+  // is how the owner's font regression happened: Pelagic's scraped face is
+  // "Oswald", a REAL Google family we can serve exactly, but the curated
+  // styleTheme alias ("Montserrat") sat above it and won outright. Owner, on the
+  // 17-ad sample: *"for pelagic, the before looked better in terms of font
+  // style."* The before was Oswald.
+  //
+  // The fix is not simply "scanned first" — that would break the licence-hold
+  // case in the other direction (AllBirds' real face is "Self Modern"; with the
+  // file held back there is nothing to serve, and the curated "DM Sans" is the
+  // right answer). So the bare scraped family carries `requireExact`: it wins
+  // only when it resolves to an ACTUAL FILE — a custom ingested font or a real
+  // Google family — and otherwise yields to the theme. A tone-based library
+  // substitution is not the brand's face and must not outrank a curated choice.
+  // Every other tier keeps today's behaviour and accepts a substitution.
+  //
+  // Order per role: explicit override → the brand's own ingested face (licence
+  // respected) → an operator-curated fontFamily → the scraped face IF exactly
+  // resolvable → curated theme → tailwind → website usage → shared family.
+  //
+  // TIER ORDER IS LOAD-BEARING AND TWO REVIEWERS BROKE THE FIRST DRAFT OF IT.
+  // The curated-fontFamily tier stays BELOW the theme, exactly where the old
+  // cascade had it: an operator-confirmed family that we cannot actually serve
+  // must yield to a curated theme family we CAN serve, not lock a lookalike.
+  // (Shape that proved it: curatedFields ['fontFamily','styleTheme'] +
+  // fontFamily 'Self Modern' never ingested + theme.sans 'DM Sans' — promoting
+  // the curated tier renders library Playfair instead of real DM Sans.) The only
+  // tier this change ADDS above the theme is scannedPromoted, and it is
+  // exact-only.
+  // ownFace is exact-only too: we only claim it because matchCustomFont found a
+  // usable file, so if that file will not actually load, a curated theme beats a
+  // tone-matched guess.
+  const ladders = {
+    heading: [
+      [overrides.heading?.family, false],
+      [ownFace, true],
+      [scannedPromoted, true],
+      [themeHeading, false],
+      [fontIsCurated ? scanned : null, false],
+      [tailwind?.fonts?.heading, false],
+      [websiteUsage.heading, false],
+      [sharedFamily, false],
+    ],
+    body: [
+      [overrides.body?.family, false],
+      [ownFace, true],
+      [scannedPromoted, true],
+      [themeBody, false],
+      [fontIsCurated ? scanned : null, false],
+      [tailwind?.fonts?.body, false],
+      [websiteUsage.body, false],
+      [sharedFamily, false],
+    ],
     // Quote keeps theme priority: serifFontFamily is a deliberate pairing choice
     // (it is why AllBirds' Lora held steady), and a sans brand face must not
     // silently replace a curated serif quote voice.
-    quote: normalizeFontFamily(overrides.quote?.family || themeQuote || websiteUsage.quote || sharedFamily) || DEFAULT_ROLE_FONTS.quote.family,
+    quote: [
+      [overrides.quote?.family, false],
+      [themeQuote, false],
+      [websiteUsage.quote, false],
+      [sharedFamily, false],
+    ],
   };
+  // Kept for diagnostics and for the requestedFamily field: the family the old
+  // single-winner cascade would have named, i.e. the first live tier.
+  const wanted = {};
+  for (const role of ['heading', 'body', 'quote']) {
+    const first = ladders[role].map(([f]) => normalizeFontFamily(f)).find(Boolean);
+    wanted[role] = first || DEFAULT_ROLE_FONTS[role].family;
+  }
   const weights = {
     heading: overrides.heading?.weight || 700,
     body: overrides.body?.weight || 500,
     quote: overrides.quote?.weight || 400,
   };
 
+  return { ladders, wanted, weights };
+}
+
+/**
+ * Walk one ladder and return the winning candidate. `resolveOne(family,
+ * requireExact)` resolves a single family (injected so this is testable without
+ * network). Bounded by the ladder length — it cannot re-enter.
+ *
+ * A `requireExact` tier that only produces a library SUBSTITUTION is rejected
+ * and remembered: the substitution is not the brand's face, so a lower tier
+ * that can be served exactly (or one allowed to substitute) speaks first. If no
+ * tier resolves at all, the remembered substitution is the answer — which is
+ * what the old single-winner cascade would have rendered.
+ *
+ * Cost note: the Google and custom lookups inside resolveFamily memoise per
+ * family|weight, but the library-substitution step does NOT, which is why the
+ * local `tried` map exists — a family named by two tiers costs one resolve.
+ */
+async function resolveLadder(ladder, resolveOne) {
+  let entry = null;
+  let firstInexact = null;
+  const tried = new Map();
+  for (const [rawFamily, requireExact] of ladder) {
+    const family = normalizeFontFamily(rawFamily);
+    if (!family) continue;
+    let candidate;
+    if (tried.has(family)) candidate = tried.get(family);
+    else {
+      candidate = await resolveOne(family, requireExact);
+      tried.set(family, candidate);
+    }
+    if (!candidate) continue;
+    if (candidate.exact === false) {
+      if (!firstInexact) firstInexact = candidate;
+      if (requireExact) continue;
+    }
+    entry = candidate;
+    break;
+  }
+  return { entry: entry || firstInexact, firstInexact };
+}
+
+/**
+ * Resolve the three role fonts for a brand.
+ * `overrides` comes from spec.tokenOverrides.fonts ({ heading: {family, weight}, ... }).
+ * Returns { heading, body, quote } each { family, weight, style, url|null, fallback, source }.
+ * `url` is a LOCAL FILE PATH here; remotionRenderService swaps it for an
+ * asset-server URL before it reaches the browser.
+ */
+async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = null } = {}) {
+  const { ladders, wanted, weights } = buildFontLadders(brand, { overrides, layoutInputBrand });
+
   const out = {};
   for (const role of ['heading', 'body', 'quote']) {
     const def = DEFAULT_ROLE_FONTS[role];
-    let entry = await resolveFamily(wanted[role], { brand, weight: weights[role], role });
+    const walked = await resolveLadder(ladders[role], (family, requireExact) =>
+      resolveFamily(family, { brand, weight: weights[role], role, quiet: requireExact })
+    );
+    let entry = walked.entry;
     if (!entry && wanted[role] !== def.family) {
       entry = await resolveFamily(def.family, { brand, weight: def.weight, role });
     }
@@ -863,6 +1094,8 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
 
 module.exports = {
   resolveBrandFonts,
+  buildFontLadders,
+  resolveLadder,
   resolveFamily,
   resolveGoogleFamily,
   resolveLibraryMatch,
