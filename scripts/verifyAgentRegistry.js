@@ -38,10 +38,12 @@ const FILES = [
   'services/capabilityExecutors/adRegenerateWithPrompt.js',
   'services/capabilityExecutors/adsPublishToMeta.js',
   'services/capabilityExecutors/catalogRefreshReviewsForBrand.js',
+  'services/capabilityExecutors/catalogGenerateLifestyleImages.js',
   'services/capabilityExecutors/campaignList.js',
   'services/capabilityExecutors/runStatus.js',
   'services/capabilityExecutors/adUpdateCta.js',
   'services/catalogProductReviewRefreshService.js',
+  'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
   'routes/agent.js'
 ];
@@ -561,6 +563,43 @@ assert(/onProgress/.test(agentSrc),
 assert(registry.CAPABILITIES.filter((c) => c.tier === 4).every((c) => c.execute?.workflow === true),
   `every Tier 4 capability declares execute.workflow=true`);
 
+// PR #9 — second Tier 4 workflow (catalog.generateLifestyleImages).
+const lifestyleCap = registry.capabilityById('catalog.generateLifestyleImages');
+assert(lifestyleCap, `capability "catalog.generateLifestyleImages" registered`);
+if (lifestyleCap) {
+  assert(lifestyleCap.tier === 4, `catalog.generateLifestyleImages: tier === 4`);
+  assert(lifestyleCap.execute?.workflow === true,
+    `catalog.generateLifestyleImages: execute.workflow === true`);
+  assert(typeof lifestyleCap.estimateUsd === 'number' && lifestyleCap.estimateUsd > 0,
+    `catalog.generateLifestyleImages: estimateUsd > 0 (billable)`);
+}
+
+async function checkLifestyleExecutor() {
+  const exec = require('../services/capabilityExecutors/catalogGenerateLifestyleImages');
+  assert(typeof exec.preview === 'function',
+    `catalogGenerateLifestyleImages exports preview()`);
+  assert(typeof exec.execute === 'function',
+    `catalogGenerateLifestyleImages exports execute()`);
+  const p1 = await exec.preview({ req: {}, args: {} });
+  assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+    `lifestyle.preview: no-scope → rejects`);
+  const e1 = await exec.execute({ req: {}, args: {} });
+  assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+    `lifestyle.execute: no-scope → rejects`);
+  const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+  assert(p2.ok === false && /brandId required/i.test(p2.error),
+    `lifestyle.preview: missing brandId → rejects`);
+}
+
+// Per-product service structural check — the workflow's unit.
+async function checkLifestyleUnitService() {
+  const svc = require('../services/catalogProductLifestyleImageService');
+  assert(typeof svc.generateOne === 'function',
+    `catalogProductLifestyleImageService.generateOne exists`);
+  assert(typeof svc.PER_UNIT_ESTIMATE_USD === 'number' && svc.PER_UNIT_ESTIMATE_USD > 0,
+    `catalogProductLifestyleImageService.PER_UNIT_ESTIMATE_USD > 0`);
+}
+
 // ── 13. Surface-widening additions (PR #8) ────────────────────────
 console.log('\n[13] Additional Tier 0/1 capabilities');
 
@@ -639,6 +678,8 @@ async function checkSurfaceWideningExecutors() {
   await checkTier3Executor();
   await checkTier4Executor();
   await checkSurfaceWideningExecutors();
+  await checkLifestyleExecutor();
+  await checkLifestyleUnitService();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

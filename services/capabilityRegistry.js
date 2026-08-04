@@ -375,6 +375,34 @@ const CAPABILITIES = [
       },
       additionalProperties: false
     }
+  },
+
+  {
+    id:       'catalog.generateLifestyleImages',
+    title:    'Generate lifestyle images for products missing one',
+    describe: 'Fan-out: for every product under a brand that lacks a lifestyle_image AND has a hero image to ground the generation, call gpt-image-2/edit with a lifestyle-scene prompt and upload the result to Cloudinary as CatalogProduct.lifestyle_image. Billable (~$0.04 per image; batch capped at 50 products per run so max cost is ~$2). On invocation you receive a PLAN (which products, aggregate cost, wall time); the operator must confirm before execution begins.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogGenerateLifestyleImages',
+      workflow: true
+    },
+    // Static UPPER-BOUND estimate — MAX_STEPS_PER_RUN (50) *
+    // PER_UNIT_ESTIMATE_USD ($0.04) = $2.00. Overestimates rather than
+    // underestimates: spendGuard rejects when spent + $2 > cap, even
+    // if the brand has only 5 products with $0.20 real cost. A live
+    // estimator (async query per dispatch) is a follow-up if the
+    // overestimate rejects too aggressively; static is safer for MVP.
+    estimateUsd: 2.00,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Products under this brand lacking lifestyle_image (and having a hero image) are the fan-out set.' }
+      },
+      additionalProperties: false
+    }
   }
 ];
 
