@@ -39,6 +39,15 @@ const Ad = require('../models/Ad');
 const { HAS_RECEIPT } = require('./spendReceipt');
 const { resumeForAd } = require('./atlasVideoService');
 const alerts = require('./alertService');
+// Single source of the recovery→titling state and the poster derivation, so the
+// writer here and the reader there can never drift. Requiring this module is cheap
+// on the worker: titlingResumeService lazy-requires brandScriptExecutor, so no
+// remotion/ffmpeg weight is pulled in at boot (asserted by verifyTitlingResume).
+const {
+  STATE_PENDING,
+  TITLING_PENDING,
+  fallbackPosterUrl
+} = require('./titlingResumeService');
 
 // Five missed 60s heartbeats. Lower than REAP_STALE_MIN (15) on purpose: the
 // point is to recover the asset BEFORE the reaper or a re-run gets involved.
@@ -100,18 +109,42 @@ async function resumeInFlightAds({ limit = RESUME_MAX_ADS, staleMinutes = RESUME
         // ad, so this becomes a no-op instead of a conflicting write.
         //
         // `draft` is the canonical resting state for a landed master — the
-        // reaper-safe money guard from CLAUDE.md §00 step 4. Titling has NOT run,
-        // so this ad is deliberately untitled; §00 is explicit that an untitled
-        // master is not success, and it stays draft until titling completes
-        // through the normal path. The alternative — leaving it `rendering` —
-        // invites the reaper and a re-buy, which is the whole thing we are fixing.
+        // reaper-safe money guard from CLAUDE.md §00 step 4. The ad is now
+        // immediately VIEWABLE (renderUrl / posterUrl / kind written so
+        // projectAd can serialise an asset) and is claimed for titling via the
+        // renderStage sentinel (TITLING_PENDING). Do NOT requeue — the normal
+        // render path declares veoVideoUrl fresh and never reads ad.veoVideoUrl,
+        // so a requeue would re-submit to Omni. Titling is resumed by
+        // services/titlingResumeService on the web process.
+        // The alternative — leaving it `rendering` — invites the reaper and a
+        // re-buy, which is the whole thing we are fixing.
+        const poster = fallbackPosterUrl(r.videoUrl);
         const res = await Ad.updateOne(
           { _id: ad._id, status: 'rendering' },
-          { $set: { veoVideoUrl: r.videoUrl, status: 'draft', updatedAt: new Date() } }
+          {
+            $set: {
+              veoVideoUrl: r.videoUrl,
+              status: 'draft',
+              kind: 'video',
+              renderUrl: r.videoUrl,
+              posterUrl: poster || r.videoUrl,
+              // The real state the sweeper queries. NOT renderStage — adStage
+              // (adStage.js:82-85) $sets renderStage all through titling, so a
+              // sentinel parked there is clobbered seconds in and a crashed
+              // render could never be re-swept. renderStage below is a
+              // human-readable breadcrumb only.
+              titlingResumeState: STATE_PENDING,
+              renderStage: TITLING_PENDING,
+              renderStageAt: new Date(),
+              updatedAt: new Date()
+            }
+          }
         );
         if (res.modifiedCount > 0) {
           out.recovered++;
-          console.log(`   ✅ bootRecovery[${ad._id}]: master recovered from receipt ${r.predictionId} — stamped draft (untitled)`);
+          console.log(
+            `   ✅ bootRecovery[${ad._id}]: master recovered from receipt ${r.predictionId} — queued for titling`
+          );
         }
       } catch (err) {
         console.warn(`   ⚠️  bootRecovery[${ad._id}]: recovered but could not persist — ${err.message}`);
