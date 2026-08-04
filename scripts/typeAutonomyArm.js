@@ -42,6 +42,10 @@ const flag = (n, d = null) => { const h = args.find((a) => a.startsWith(`--${n}=
 const has = (n) => args.includes(`--${n}`);
 
 const POOL = flag('pool', null);
+// Preset FILES cannot survive an SSH session change (the pod filesystem is
+// per-session), but the per-ad plans are billable and must not be re-paid. With
+// --plans= the plans are read from disk and only the presets are recompiled.
+const PLANS_IN = flag('plans', null);
 const OUT = flag('out', null);
 const DRY_RUN = has('dry-run');
 const EMIT = has('emit-presets');
@@ -206,6 +210,24 @@ function compileAdPreset(ad, plan) {
 (async () => {
   if (!POOL) { console.error('need --pool=<pool.json>'); process.exit(2); }
   const pool = JSON.parse(fs.readFileSync(POOL, 'utf8'));
+
+  // Recompile-only mode: no DB, no LLM, no spend.
+  if (PLANS_IN) {
+    const stored = JSON.parse(fs.readFileSync(PLANS_IN, 'utf8'));
+    let n = 0;
+    for (const ad of pool.ads) {
+      const plan = stored.plans?.[ad.adId];
+      if (!plan || plan._dryRun || plan._reject?.length) continue;
+      try {
+        const preset = compileAdPreset(ad, plan);
+        fs.writeFileSync(path.join(PRESET_DIR, `${preset.name}.json`), JSON.stringify(preset, null, 2));
+        n++;
+      } catch (err) { console.warn(`⚠️  ${ad.adId}: ${err.message}`); }
+    }
+    console.log(`📝 recompiled ${n} per-ad preset(s) from ${PLANS_IN} — $0`);
+    process.exit(0);
+  }
+
   await mongoose.connect(process.env.MONGODB_URI);
 
   const plans = {};
