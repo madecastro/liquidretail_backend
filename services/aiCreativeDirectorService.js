@@ -13,6 +13,10 @@
 // Generator to read concepts from here.
 
 const crypto = require('crypto');
+// Salvage parser for Director output — Atlas silently ignores
+// response_format:json_object on the Anthropic director model, so a reply can
+// arrive fenced or wrapped in prose. Mirrors judgeService's JSON5 precedent.
+const JSON5 = require('json5');
 
 const Brand                 = require('../models/Brand');
 const CatalogProduct        = require('../models/CatalogProduct');
@@ -1264,14 +1268,42 @@ async function directConceptsRound({
 
     raw = completion.choices?.[0]?.message?.content;
     if (!raw) throw new Error('Director (round) returned no content');
-    // Some gateways wrap json_object output in a fence despite the setting.
-    const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-    try { parsed = JSON.parse(cleaned); }
-    catch (err) {
+    // Atlas SILENTLY IGNORES response_format:{type:'json_object'} on the
+    // Anthropic director model — probed live 2026-08-04, both with and without
+    // the flag, and both returned conversational prose. So the JSON contract is
+    // carried by the prompt's OUTPUT CONTRACT block plus this salvage, not by
+    // the flag. Measured before this landed: 10 failures / 1 success in 24h,
+    // every failure opening with prose ("I don't have enough information…").
+    try {
+      parsed = safeParseDirectorJSON(raw);
+    } catch (err) {
+      // Truncation stays a distinct hard fail: a "return JSON only" re-ask
+      // cannot fix a response that ran out of tokens, and the message names
+      // the actual lever.
       if (completion.choices?.[0]?.finish_reason === 'length') {
         throw new Error(`Director (round) response truncated at ${DIRECTOR_ROUND_TOKENS} tokens — raise DIRECTOR_ROUND_TOKENS`);
       }
-      throw new Error(`Director (round) response not JSON: ${err.message}`);
+      // ONE corrective budget shared with the schema-validation re-ask below
+      // (`attempt >= 1`). Parse-retry and validation-retry must not stack into
+      // four paid Director calls — worst case stays TWO, as it was before.
+      if (attempt >= 1) {
+        throw new Error(`Director (round) response not JSON: ${err.message}`);
+      }
+      console.warn(
+        `🎭 directorRound[r${roundIndex}]: response not JSON, re-asking once — ${err.message}`
+      );
+      messages.push({ role: 'assistant', content: raw });
+      messages.push({
+        role: 'user',
+        content:
+          'You returned prose or clarifying questions instead of the required JSON object. ' +
+          'Return ONLY the JSON object described in the system prompt — no preamble, no markdown ' +
+          'fences, no questions. If signal data is thin, still emit best-effort concepts from ' +
+          'product_signal.name, brand_signal voice and the seeded media; set ungrounded nullable ' +
+          'fields (art_direction, proof) to null rather than asking for more input.'
+      });
+      attempt++;
+      continue;
     }
 
     reasons = validateDirectorPayload(parsed, { schema: responseSchema, nConcepts: N_CONCEPTS_ROUND, forbiddenStrings });
@@ -1593,7 +1625,21 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       : `    output_shape      — { format, tile_count }`,
     `  copy                — { headline, subheadline, eyebrow, cta } final strings (nullable per role) — ONLY letterforms`,
     `  art_direction       — null OR { look, palette_hint, typography_hint } visual prose only; null if no visual brief`,
-    `  reasoning           — { rationale } PRIVATE: which objection + which signal. Never visual notes.`
+    `  reasoning           — { rationale } PRIVATE: which objection + which signal. Never visual notes.`,
+    ``,
+    // Atlas drops response_format:json_object for the Anthropic director model,
+    // so the JSON contract has to live in the prompt. Without this block the
+    // model answered with clarifying questions on thin-signal SKUs and the
+    // round threw — 10 failures / 1 success measured over 24h on 2026-08-04.
+    `OUTPUT CONTRACT (absolute — non-negotiable):`,
+    `- Your entire reply MUST be a single JSON object. No prose before or after it. No markdown fences. No clarifying questions. Never open with "I don't have enough information", "Before I generate", "A couple of things" or any similar preamble.`,
+    `- Do NOT ask the operator for more data. This is a non-interactive batch job; the JSON object is your only deliverable.`,
+    // NOTE the deliberate wording on product_signal.name: it identifies WHAT you
+    // are directing, and must never be pushed into the copy strings.
+    // validateDirectorPayload rejects any concept whose copy contains the product
+    // name (owner directive), and that rejection would consume the single shared
+    // corrective re-ask that exists for genuine parse failures.
+    `- THIN DATA IS NOT A STOP. When product_signal.description, reviews, ugc_signal or social_proof_signal are null or empty, still emit ${N_CONCEPTS_ROUND} concepts. Use product_signal.name only to know WHAT the product is — never write it into copy.* — and build from brand_signal voice and the SEEDED UNIVERSE imagery. Set social_proof_type to "none", art_direction to null, and any ungrounded copy role to null. Prefer photo-led or brand-voice archetypes over inventing proof. Never refuse.`
   ].join('\n');
 
   const user = [
@@ -1604,10 +1650,109 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     ``,
     creativeIntent ? `OPERATOR HINT: ${creativeIntent}` : `OPERATOR HINT: none — you decide.`,
     ``,
-    `Emit ${N_CONCEPTS_ROUND} distinct concepts that honor the AVOID block, draw from the SEEDED UNIVERSE, and ground every copy.* field in real signal.`
+    `Return ONLY a JSON object containing ${N_CONCEPTS_ROUND} distinct concepts. No preamble, no questions, no markdown fences. Honor the AVOID block, draw media_ids from the SEEDED UNIVERSE, and ground every copy.* field in real signal where it exists — where signal is thin, still emit best-effort concepts rather than asking for more input.`
   ].join('\n');
 
   return { system, user, visionImages };
+}
+
+/**
+ * Salvage Director output when the gateway ignores response_format.
+ *
+ * Atlas silently drops `response_format:{type:'json_object'}` for
+ * `anthropic/claude-sonnet-5-ccmax` (probed live 2026-08-04 — both arms
+ * returned prose), so a reply can arrive fenced, or as a JSON object embedded
+ * in commentary. Order: strip fences → JSON.parse → scan EVERY balanced {...}
+ * span → JSON5. Mirrors judgeService.safeParseJSON, but uses balanced-brace
+ * extraction rather than a greedy /\{[\s\S]*\}/ — the greedy form swallows
+ * trailing prose and turns a salvageable reply into a parse error.
+ *
+ * WHY IT SCANS EVERY CANDIDATE RATHER THAN THE FIRST (adversarial review,
+ * 2026-08-04): committing to the first '{' is defeated by prose that merely
+ * CONTAINS braces. "I considered {option A} vs {option B}.\n{...real json...}"
+ * extracts "{option A}", fails to parse, and the whole salvage throws even
+ * though a valid payload sits right there. Scanning every span fixes that.
+ *
+ * SELECTION RULE when several spans parse: prefer the LAST one carrying a
+ * `concepts` array, else the first parseable object. A leading object is far
+ * more likely to be an illustrative sketch than the answer — models that
+ * preface their work put the real payload last. This is a heuristic on
+ * genuinely ambiguous input; validateDirectorPayload + forbiddenStrings still
+ * gate whatever comes back, so a wrong pick degrades to a contract warning
+ * rather than shipping silently.
+ *
+ * This CANNOT rescue a pure refusal that contains no JSON at all; that is what
+ * the prompt's OUTPUT CONTRACT block and the one corrective re-ask are for.
+ */
+function safeParseDirectorJSON(raw) {
+  let text = String(raw == null ? '' : raw).trim();
+  if (!text) throw new Error('empty response');
+  text = text
+    .replace(/^\s*```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/i, '')
+    .trim();
+  try { return JSON.parse(text); } catch { /* fall through to extraction */ }
+
+  const parsed = [];
+  let i = text.indexOf('{');
+  while (i >= 0) {
+    const span = balancedSpanFrom(text, i);
+    if (!span) { i = text.indexOf('{', i + 1); continue; }
+    let obj;
+    let ok = true;
+    try { obj = JSON.parse(span); }
+    catch { try { obj = JSON5.parse(span); } catch { ok = false; } }
+    if (ok) {
+      parsed.push(obj);
+      // A parsed span's nested objects are not separate candidates.
+      i = text.indexOf('{', i + span.length);
+    } else {
+      // Unparseable span (e.g. prose braces) — look inside it too.
+      i = text.indexOf('{', i + 1);
+    }
+  }
+
+  if (!parsed.length) throw new Error('no parseable JSON object in response');
+  const withConcepts = parsed.filter((o) => o && Array.isArray(o.concepts));
+  return withConcepts.length ? withConcepts[withConcepts.length - 1] : parsed[0];
+}
+
+/**
+ * The balanced {...} span starting at `start`, tracked with string-aware brace
+ * depth so a brace inside a quoted string cannot end the object early.
+ *
+ * BOTH quote characters are tracked. JSON5 permits single-quoted strings, and
+ * this salvage falls back to JSON5 — a scanner that only knew `"` would cut
+ * `{'note': 'use } here'}` at the brace inside the single-quoted value and
+ * then hand JSON5 a truncated span. Returns null when nothing balances.
+ */
+function balancedSpanFrom(s, start) {
+  if (start < 0 || s[start] !== '{') return null;
+  let depth = 0;
+  let quote = null;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (escape) { escape = false; continue; }
+      if (c === '\\') { escape = true; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/** First balanced {...} span in `text`, or null. Thin wrapper for callers. */
+function extractFirstBalancedObject(text) {
+  const s = String(text);
+  return balancedSpanFrom(s, s.indexOf('{'));
 }
 
 function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_1') {
@@ -1917,5 +2062,7 @@ module.exports = {
   buildResponseSchemaRound,
   validateConceptsRound,
   loadAvoidList,
-  brandQuoteForDirectorSignal
+  brandQuoteForDirectorSignal,
+  safeParseDirectorJSON,
+  extractFirstBalancedObject
 };

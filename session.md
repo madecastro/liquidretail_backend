@@ -81,9 +81,83 @@ was `--permission-mode acceptEdits`. Writes from headless remain unproven — us
 
 ---
 
+## 2026-08-04 — PRODUCTION INCIDENT: concept-driven STATIC ads were ~90% dead
+
+Owner reported "the platform seems to be crashing while doing generations". **Nothing was
+crashing** — no OOM, no restarts, every Render deploy healthy. Two independent defects.
+
+### A. Director round returned prose, not JSON (STATIC path only) — FIX APPLIED, NOT COMMITTED
+
+**Introduced by `12b6aa8` (2026-07-31, PR #43) "…move the director to Claude".** That commit
+moved `DIRECTOR_ROUND_MODEL` from `'gpt-4.1'` to `'director'`
+(`anthropic/claude-sonnet-5-ccmax`) and, because **Atlas 400s on strict `json_schema` for
+Anthropic**, downgraded `response_format` from `json_schema` → `json_object`. The commit
+documents the 400 honestly. What it could not know: **`json_object` is accepted but NOT
+ENFORCED for Anthropic on Atlas.** Probed live 2026-08-04, two arms (flag on / flag off) —
+**both returned prose**. Enforcement went from a hard schema guarantee to nothing, and the
+round system prompt never independently demanded JSON, so compliance was luck.
+
+Measured: **first failure 2026-07-31 17:10Z, ~5h after the commit landed**; 9 failures that
+day, 10 on 2026-08-04 (none 08-01→08-03 — that path simply wasn't exercised, NOT evidence it
+worked). Early failures were markdown documents (`"## Concept"`, `"# 3 Creati"`); by 08-04 they
+had shifted to conversational refusals (`"I don't have…"`, `"A couple o…"`). Each failure =
+a product with **zero ads** and a wasted paid Director call.
+
+**SCOPE — STATIC ONLY. Video was never affected.** `deterministicVideo` →
+`expandDeterministicVideo` never touches the Director
+(`campaignAdsGenerationService.js:593-597`); `conceptVideo` needs `productIds.length === 0` or
+`directorVariants === true` (defaults false, `:394`). Proven in prod logs: at 15:49:27
+`expandDeterministicVideo … payloads=1` succeeded while `conceptDriven` failed at 15:50:14.
+
+**Fix (working tree, UNCOMMITTED, NOT DEPLOYED)** in `services/aiCreativeDirectorService.js`:
+`safeParseDirectorJSON` + `balancedSpanFrom` (string-aware, scans EVERY candidate span, tracks
+both quote chars for the JSON5 fallback); a one-shot corrective re-ask **sharing** the existing
+`attempt` budget so worst case stays **two** paid Director calls; and an `OUTPUT CONTRACT`
+block naming the observed refusal openings. Pinned by `scripts/verifyDirectorJsonSalvage.js`
+(**37 checks**, revert-proven on four mutations). Full suite **49/49**.
+
+**An adversarial pass refuted the first draft** — first-`{` extraction is defeated by prose
+that merely contains braces (`"I considered {option A}…"` → whole salvage throws). Hence the
+scan-every-span rewrite. Two other draft defects were caught before apply: `JSON5` was used but
+never imported (ReferenceError exactly when salvage was needed), and an array insert after a
+non-comma-terminated element (module-level syntax error).
+
+### B. WORKER had no `ATLAS_API_KEY` — FIXED LIVE
+
+Worker had **14** env vars, no Atlas key, and logged `ATLAS_API_KEY not configured` continuously
+— every worker LLM call silently falling back to direct OpenAI/Gemini. `docs/PIPELINES.md:921`
+recorded it as WEB-only, so nothing flagged it; that was a **config gap, not a design choice**.
+Copied web's exact value onto WORKER (14 → 15), redeployed `dep-d9p13vfavr4c73admgv0`, zero
+fallback lines since the 16:24Z boot. Only env group ("Liquid Retail") has **0 vars**, so
+nothing was supplying it from a group.
+
+⚠️ **Billable consequence, currently dormant — watch it.** The key flips
+`geminiImageService.viaAtlasOrDirect` (`:12`) onto Atlas `nano-banana-2/edit` for DetectRun
+extended crops: **up to 4 billable image edits per NON-catalog DetectRun**, and DetectRuns
+DO auto-drain via the worker loop. Catalog runs are exempt (`detect.js:628`
+`skipExtendedCrops: true`). Measured 08-04: **115 detect runs in 24h, all catalog, zero
+extended-crop activity.** It is a provider SHIFT (those crops already billed Gemini direct),
+not new spend from zero. If IG post sync starts producing non-catalog DetectRuns, this becomes
+real money and a quality change — gate Atlas image on the worker if that is not wanted.
+
+### Also seen, NOT fixed (separate issues)
+- `RENDER_AUTH_TOKEN` on web is **EXPIRED** (`exp=2026-05-07`), and `FRONTEND_URL` points at
+  `liquidretail.netlify.app` — the **stale** pre-transfer Netlify site.
+- One billable Omni submit lost to `blocked by safety review` (ad `6a7207ce80833259b2005cfe`).
+
+---
+
 ## Next-session prompt
 
-**START HERE — 2026-08-05 pickup.** The 2026-08-04 session rewrote this block because three
+**START HERE — 2026-08-05 pickup.**
+
+0. **COMMIT + DEPLOY the Director JSON fix** (§ 2026-08-04 A above). It is applied, offline-
+   verified (37/37 + 49/49) and adversarially reviewed, but **uncommitted and not deployed** —
+   production is still ~90% failing on concept-driven static. After deploy, watch for
+   `response not JSON, re-asking once` (salvage/re-ask working) vs `response not JSON`
+   (still refusing) and confirm `conceptDriven … concepts=3 payloads=3`.
+
+Then the pre-existing queue. The 2026-08-04 session rewrote this block because three
 of its four claims were wrong. Read §0 CORRECTIONS before anything else.
 
 1. **LAND `fix/remotion-font-fatal-load`** (branch exists, working tree, NOT committed —
