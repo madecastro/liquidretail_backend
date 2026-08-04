@@ -126,9 +126,21 @@ function normalizeReviewCount(raw) {
 }
 
 /**
- * Honest brand label for attribution when the brand aggregate rating pair is
- * used (never imply the count is product-level). Prefer domain from websiteUrl,
- * else brand name.
+ * A brand's display label — domain from websiteUrl, else the brand name.
+ *
+ * **NO LONGER ON THE PROOF-LINE PATH (2026-08-03).** This used to supply the
+ * attribution appended to a brand review count (`41000 reviews · gymshark.com`).
+ * The owner replaced that with the fixed BRAND_SCOPE_LABEL below, so nothing this
+ * returns reaches rendered ad copy any more — see that constant for why (Meta
+ * already draws page identity; the brand-NAME fallback collided with the
+ * "no added brand wordmark" absence rule; a hostname is punctuation-dense for an
+ * image model).
+ *
+ * Kept rather than deleted because it is a legitimate utility and a future surface
+ * (an endcard, a link line) may legitimately want a brand's domain. But it is NOT
+ * the answer to "how do we attribute a review count" — reach for BRAND_SCOPE_LABEL.
+ * `scripts/verifyPostPilotBatch.js` A7/A8 pin its domain-then-name preference as a
+ * utility contract, not as rendered output.
  */
 function brandAttributionLabel(brand) {
   if (!brand || typeof brand !== 'object') return null;
@@ -145,19 +157,42 @@ function brandAttributionLabel(brand) {
 }
 
 /**
- * Build the brand-tier reviewsText string (count + optional attribution).
- * Extracted so the brand-rating branch and the brand-count-only branch
- * (allowBrandCountWithoutStars) share ONE pluralisation/attribution
- * implementation — the same count must read identically whether or not
- * stars are printing alongside it.
+ * Build the brand-tier reviewsText string. Both brand branches (stars+count, and
+ * count-only via allowBrandCountWithoutStars) share this ONE implementation, so the
+ * same count reads identically whether or not stars print alongside it.
  * @returns {string|null}
+ *
+ * SCOPE LABEL, not brand identity — owner decision 2026-08-03.
+ *
+ * A brand-tier count printed bare reads as THIS PRODUCT's reviews, which is the
+ * defect that started the whole tier-coherence exercise. So the count must always
+ * carry a qualifier. It used to carry the brand's DOMAIN (`41000 reviews ·
+ * gymshark.com`); the owner replaced that with a plain scope phrase, and it is a
+ * better answer for three reasons worth recording:
+ *
+ *   1. Meta already draws the advertiser's page identity around the creative, so
+ *      burning the domain in repeated information the viewer already had.
+ *   2. `brandAttributionLabel` FALLS BACK TO THE BRAND NAME when a brand has no
+ *      websiteUrl — so for those brands we were typesetting "Gymshark" into the
+ *      pixels while the same static prompt's `absences` list says "no added brand
+ *      logo, wordmark or lockup anywhere in the scene". A self-contradictory prompt,
+ *      the same class as the CTA and crossfade/dissolve contradictions this repo has
+ *      already been bitten by.
+ *   3. A hostname is punctuation-dense (dots, no spaces) and static hands verbatim
+ *      strings to an image model whose text fidelity is the whole game. Plain words
+ *      are lower risk than a domain.
+ *
+ * UNCONDITIONAL on purpose. The old formatter dropped the qualifier entirely when
+ * attribution was unknown, emitting a bare "12 reviews" — the exact unscoped form the
+ * qualifier exists to prevent. There is no such hole now: a brand-tier count is always
+ * labelled as one.
  */
-function formatBrandReviewsText(rc, brandAttribution) {
+const BRAND_SCOPE_LABEL = 'brand reviews';
+
+function formatBrandReviewsText(rc) {
   if (rc == null) return null;
-  const label = brandAttribution && String(brandAttribution).trim();
-  return label
-    ? `${rc} review${rc === 1 ? '' : 's'} · ${label}`
-    : `${rc} review${rc === 1 ? '' : 's'}`;
+  // Singular still reads as brand-scoped: "1 brand review".
+  return rc === 1 ? `1 brand review` : `${rc} ${BRAND_SCOPE_LABEL}`;
 }
 
 /**
@@ -186,14 +221,14 @@ function formatProductReviewsTextShort(rc) {
   return c != null ? `${c} reviews` : null;
 }
 
-function formatBrandReviewsTextShort(rc, brandAttribution) {
+function formatBrandReviewsTextShort(rc) {
   if (rc == null) return null;
   const c = formatCompactCount(rc);
   if (!c) return null;
-  const label = brandAttribution && String(brandAttribution).trim();
-  return label
-    ? `${c} reviews · ${label}`
-    : `${c} reviews`;
+  // "41k brand reviews". Same scope label as the long form — the static surface may
+  // shorten the NUMBER (image models mangle long strings) but must never drop the
+  // qualifier, or a compact count becomes an unscoped claim.
+  return `${c} ${BRAND_SCOPE_LABEL}`;
 }
 
 /**
@@ -295,7 +330,7 @@ function resolveAtomicRatingPair({
     return {
       rating: brandDisplay,
       reviewCount: rc,
-      reviewsText: formatBrandReviewsText(rc, brandAttribution),
+      reviewsText: formatBrandReviewsText(rc),
       source: 'brand',
     };
   }
@@ -309,7 +344,7 @@ function resolveAtomicRatingPair({
       return {
         rating: null,
         reviewCount: rc,
-        reviewsText: formatBrandReviewsText(rc, brandAttribution),
+        reviewsText: formatBrandReviewsText(rc),
         source: 'brand-count',
       };
     }
@@ -402,10 +437,10 @@ function packCoherentProof({ quote, quoteTier, rating, reviewCount, source, bran
     reviewCount: rc,
     source,
     reviewsText: isBrandSide
-      ? formatBrandReviewsText(rc, brandAttribution)
+      ? formatBrandReviewsText(rc)
       : formatProductReviewsText(rc),
     reviewsTextShort: isBrandSide
-      ? formatBrandReviewsTextShort(rc, brandAttribution)
+      ? formatBrandReviewsTextShort(rc)
       : formatProductReviewsTextShort(rc),
   };
 }

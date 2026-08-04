@@ -138,7 +138,9 @@ check('C1 category quote + brand count → ALLOWED (source brand-count)', () => 
   assertEq(r.rating, null, 'stars withheld under >4.5');
   assertEq(r.reviewCount, 41000);
   assertEq(r.quoteTier, 'category');
-  assert(r.reviewsText && r.reviewsText.includes(ATTR), 'brand count must be attributed');
+  assert(r.reviewsText && /brand review/.test(r.reviewsText),
+    'a brand count must be scoped as brand-level');
+  assert(!r.reviewsText.includes(ATTR), 'the domain must not reach ad copy');
   assert(r.reviewsText && !r.reviewsText.includes('120'), 'product count must not leak');
 });
 
@@ -448,8 +450,15 @@ check('C6 reviewsTextShort compact form for brand-count', () => {
     brandAttribution: ATTR,
   });
   assertEq(r.source, 'brand-count');
-  assertEq(r.reviewsText, `41000 reviews · ${ATTR}`);
-  assertEq(r.reviewsTextShort, `41k reviews · ${ATTR}`);
+  // Owner 2026-08-03: the qualifier is a SCOPE phrase, not the brand's domain.
+  assertEq(r.reviewsText, '41000 brand reviews');
+  // The short form shortens the NUMBER (41000 -> 41k) for the static surface, whose
+  // text fidelity is the whole game, but it must keep the scope label. A compact
+  // count without it would be an unscoped claim, which is the defect the qualifier
+  // exists to prevent.
+  assertEq(r.reviewsTextShort, '41k brand reviews');
+  assert(!String(r.reviewsTextShort).includes(ATTR),
+    'the domain must not survive into the compact form either');
 });
 
 // ── C7 existing resolver contract unchanged (additive) ─────────────────

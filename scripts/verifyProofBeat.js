@@ -77,7 +77,13 @@ check('R2 brand rating that clears the gate wins when product fails', () => {
   assert.strictEqual(r.source, 'brand');
   assert.strictEqual(r.rating, '4.7');
   assert.strictEqual(r.reviewCount, 8343);
-  assert.ok(r.reviewsText.includes(BRAND_LABEL), 'brand count must be attributed');
+  // SCOPED, not attributed to a hostname (owner 2026-08-03). What matters is that a
+  // catalog-wide count cannot read as this product's reviews; the brand's domain was
+  // one way to say that and a plain scope phrase is a better one.
+  assert.ok(/brand review/.test(r.reviewsText),
+    'a brand count must be scoped as brand-level, not left bare');
+  assert.ok(!r.reviewsText.includes(BRAND_LABEL),
+    'the domain must no longer be burned into ad copy');
 });
 
 check('R3 DEFAULT OFF — both ratings failing yields no proof at all', () => {
@@ -100,7 +106,7 @@ check('R4 count prints WITHOUT stars when opted in (the GymShark case)', () => {
   assert.strictEqual(r.source, 'brand-count');
   assert.strictEqual(r.rating, null, 'a 3.3 rating must NEVER print as stars');
   assert.strictEqual(r.reviewCount, 41000);
-  assert.strictEqual(r.reviewsText, `41000 reviews · ${BRAND_LABEL}`);
+  assert.strictEqual(r.reviewsText, '41000 brand reviews');
 });
 
 check('R5 opting in cannot invent a count that does not exist (AllBirds)', () => {
@@ -155,17 +161,20 @@ check('R9 a suppressed rating with a rounding-trap value still shows its count',
   assert.strictEqual(r.reviewCount, 8343);
 });
 
-check('R10 count text pluralises and drops attribution when unknown', () => {
+check('R10 count text pluralises and is ALWAYS scoped, even with no brand label', () => {
   const one = resolveAtomicRatingPair({
     brandRating: 3.3, brandReviewCount: 1, brandAttribution: BRAND_LABEL,
     allowBrandCountWithoutStars: true,
   });
-  assert.strictEqual(one.reviewsText, `1 review · ${BRAND_LABEL}`);
+  assert.strictEqual(one.reviewsText, '1 brand review');
   const anon = resolveAtomicRatingPair({
     brandRating: 3.3, brandReviewCount: 12, brandAttribution: null,
     allowBrandCountWithoutStars: true,
   });
-  assert.strictEqual(anon.reviewsText, '12 reviews');
+  // THE OLD HOLE: with attribution unknown the formatter dropped the qualifier and
+  // emitted a bare '12 reviews' — the exact unscoped claim the qualifier exists to
+  // prevent. The scope label is unconditional now, so there is no such gap.
+  assert.strictEqual(anon.reviewsText, '12 brand reviews');
 });
 
 check('R11 a 0-100 vendor scale never becomes stars, but its count survives', () => {
@@ -986,7 +995,7 @@ check('A1 product-tier review counts carry the product name', () => {
   // The brand tier keeps its own domain attribution.
   assert.strictEqual(
     resolveAtomicRatingPair({ productRating: 3.0, brandRating: 4.58, brandReviewCount: 15545, brandAttribution: 'vuoriclothing.com' }).reviewsText,
-    '15545 reviews · vuoriclothing.com');
+    '15545 brand reviews');
 });
 
 // ── C: pill ink is derived from the pill fill ───────────────────────────

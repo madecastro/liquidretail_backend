@@ -125,7 +125,7 @@ check('A0 star floor is 4.5', RATING_STAR_MIN, 4.5);
   check('A2 brand pair when product fails gate', r.source, 'brand');
   check('A2 brand rating display', r.rating, '4.7');
   check('A2 brand count (NOT product 41000)', r.reviewCount, 8900);
-  check('A2 honest attribution marker', r.reviewsText, '8900 reviews · allbirds.com');
+  check('A2 honest attribution marker', r.reviewsText, '8900 brand reviews');
 }
 
 // Product exactly 4.5 fails gate (strictly greater)
