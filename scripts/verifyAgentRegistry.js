@@ -38,6 +38,9 @@ const FILES = [
   'services/capabilityExecutors/adRegenerateWithPrompt.js',
   'services/capabilityExecutors/adsPublishToMeta.js',
   'services/capabilityExecutors/catalogRefreshReviewsForBrand.js',
+  'services/capabilityExecutors/campaignList.js',
+  'services/capabilityExecutors/runStatus.js',
+  'services/capabilityExecutors/adUpdateCta.js',
   'services/catalogProductReviewRefreshService.js',
   'services/spendGuard.js',
   'routes/agent.js'
@@ -558,6 +561,73 @@ assert(/onProgress/.test(agentSrc),
 assert(registry.CAPABILITIES.filter((c) => c.tier === 4).every((c) => c.execute?.workflow === true),
   `every Tier 4 capability declares execute.workflow=true`);
 
+// ── 13. Surface-widening additions (PR #8) ────────────────────────
+console.log('\n[13] Additional Tier 0/1 capabilities');
+
+for (const id of ['campaign.list', 'run.status', 'ad.updateCta']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+}
+assert(registry.capabilityById('campaign.list')?.tier === 0,
+  `campaign.list: tier === 0`);
+assert(registry.capabilityById('run.status')?.tier === 0,
+  `run.status: tier === 0`);
+assert(registry.capabilityById('ad.updateCta')?.tier === 1,
+  `ad.updateCta: tier === 1`);
+
+async function checkSurfaceWideningExecutors() {
+  const noScope = {};
+  const campaignList = require('../services/capabilityExecutors/campaignList');
+  const runStatus    = require('../services/capabilityExecutors/runStatus');
+  const adUpdateCta  = require('../services/capabilityExecutors/adUpdateCta');
+
+  // Structural rejects (all before any DB call).
+  const r1 = await campaignList.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `campaignList: no-scope → rejects`);
+  const r2 = await campaignList.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /brandId required/i.test(r2.error),
+    `campaignList: missing brandId → rejects`);
+  const r3 = await campaignList.run({ req: { advertiserId: 'x' }, args: { brandId: 'not-an-oid' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `campaignList: invalid brandId → rejects`);
+
+  const r4 = await runStatus.run({ req: noScope, args: {} });
+  assert(r4.ok === false && /advertiser scope/i.test(r4.error),
+    `runStatus: no-scope → rejects`);
+  const r5 = await runStatus.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r5.ok === false && /runId required/i.test(r5.error),
+    `runStatus: missing runId → rejects`);
+
+  const r6 = await adUpdateCta.run({ req: noScope, args: {} });
+  assert(r6.ok === false && /advertiser scope/i.test(r6.error),
+    `adUpdateCta: no-scope → rejects`);
+  const r7 = await adUpdateCta.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r7.ok === false && /adId required/i.test(r7.error),
+    `adUpdateCta: missing adId → rejects`);
+  // No CTA field supplied → rejected (no-op waste guard).
+  const r8 = await adUpdateCta.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000' }
+  });
+  assert(r8.ok === false && /at least one/i.test(r8.error),
+    `adUpdateCta: no CTA fields → rejects`);
+  // Bad URL scheme.
+  const r9 = await adUpdateCta.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000', ctaUrl: 'ftp://example.com' }
+  });
+  assert(r9.ok === false && /http/i.test(r9.error),
+    `adUpdateCta: non-http URL rejected`);
+  // Text too long.
+  const r10 = await adUpdateCta.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000', ctaText: 'x'.repeat(61) }
+  });
+  assert(r10.ok === false && /too long/i.test(r10.error),
+    `adUpdateCta: 61-char ctaText rejected`);
+}
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
@@ -568,6 +638,7 @@ assert(registry.CAPABILITIES.filter((c) => c.tier === 4).every((c) => c.execute?
   await checkTier2Executor();
   await checkTier3Executor();
   await checkTier4Executor();
+  await checkSurfaceWideningExecutors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

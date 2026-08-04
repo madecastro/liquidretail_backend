@@ -106,6 +106,52 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'campaign.list',
+    title:    'List campaigns',
+    describe: 'List campaigns for the current brand. Returns count + per-campaign summary (name, platform, kind, status, adsetCount). Filter by platform (\'meta-ads\', \'google-ads\', \'reach-social\') to narrow.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:  { type: 'string', description: 'Brand ObjectId.' },
+        platform: { type: 'string', enum: ['meta-ads', 'google-ads', 'reach-social'],
+                    description: 'Optional platform filter.' },
+        limit:    { type: 'integer', minimum: 1, maximum: 100,
+                    description: 'Row cap (default 20). The count is always the full total.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignList',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'run.status',
+    title:    'Get CampaignRun status',
+    describe: 'Return the current status of one CampaignRun (a generation batch) by runId string or ObjectId. Includes counts, ad-level status rollup ({queued, rendering, draft, failed, ...}), and up to 6 recent errors[] rows so the agent can answer "why is my run stuck?" without a second call.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['runId'],
+      properties: {
+        runId: { type: 'string', description: 'Either the string runId (e.g. \'run_1785268035192_...\') or the CampaignRun ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/runStatus',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'spend.today',
     title:    'Spend today',
     describe: 'Return the current advertiser\'s ad-generation spend since midnight UTC. Breaks down by provider (Atlas video, Atlas image, LLM) and returns a total in USD.',
@@ -192,6 +238,30 @@ const CAPABILITIES = [
     execute: {
       kind:    'service',
       service: './capabilityExecutors/brandUpdateTagline',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'ad.updateCta',
+    title:    'Update ad CTA',
+    describe: 'Set an ad\'s CTA text, URL, or URL params. Reversible via a second call with the previous values (returned as priorCta). Refuses ads already synced to Meta (mutation would drift from the canonical Meta record). The already-rendered PNG/MP4 still shows the OLD CTA — regenerate to update the pixels. Requires operator confirmation.',
+    tier:     1,
+    scope:    'ad',
+    args: {
+      type: 'object',
+      required: ['adId'],
+      properties: {
+        adId:         { type: 'string', description: 'Ad ObjectId.' },
+        ctaText:      { type: 'string', maxLength: 60, description: 'New CTA button text (e.g. "Shop Now"). Empty string clears.' },
+        ctaUrl:       { type: 'string', maxLength: 2000, description: 'New CTA destination URL (must start with http:// or https:// when non-empty). Empty string clears.' },
+        ctaUrlParams: { type: 'string', maxLength: 500, description: 'Optional URL params suffix (e.g. "utm_source=meta&utm_campaign=…"). Empty string clears.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adUpdateCta',
       method:  'run'
     }
   },
