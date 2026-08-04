@@ -212,8 +212,8 @@ Controls whether titles react to footage content or stay fully static (canonical
 
 | Mode | Behavior |
 |------|----------|
-| `canonical` (default) | Skip `analyzePlate`; pass `plateHints: null`. Composition renders fully static — no position nudge, no ink flip. |
-| `content` | Run `analyzePlate`; scan depth from `TITLE_PLATE_SCAN` (`basic` default, `gemini` optional). |
+| `canonical` (default) | **No longer skips `analyzePlate`.** Fixed 2026-08-04 — see "Plate intelligence" below for why the old `plateHints: null` behavior shipped unreadable ads. Titles still render at their authored, static positions; the scan's only effect here is feeding the global ink flip. |
+| `content` | Same `analyzePlate` scan as `canonical` (scan depth from `TITLE_PLATE_SCAN`, `basic` default / `gemini` optional). Historically also meant to drive position-nudging off avoid bands, but `remotionRenderService.js` never threads the resolved mode into the composition's `inputProps` — only `plateHints` reaches `Canonical.jsx`, so today `canonical` vs `content` has no code-level effect on what gets rendered; it's still resolved/validated/echoed in responses for the brand-setting / per-request override plumbing. |
 
 **Resolution precedence** (`resolveTitlePlacementMode` in `plateIntelService.js`):
 
@@ -227,12 +227,12 @@ Threaded through `renderWithRemotionAndSave` → `renderTitles` / `renderPreview
 
 ### Plate intelligence
 
-`services/plateIntelService.js` `analyzePlate(platePath, {durationSec, isImage})` — only invoked in **content** mode. Scan depth controlled by TITLE_PLATE_SCAN ('basic' default | 'gemini' | 'off'). Never throws.
+`services/plateIntelService.js` `analyzePlate(platePath, {durationSec, isImage})` — **runs unconditionally, in both placement modes, as of 2026-08-04.** It used to fire only in `content` mode (leaving `plateHints: null` in `canonical`), but `canonical` is the default and the global ink flip (`plateIsLightGlobal` in `Canonical.jsx`) reads `plateHints` to decide light-vs-dark title ink — with hints permanently null, that flip could never fire, and a near-white studio plate shipped **white-on-white title text** in `canonical` mode (found live 2026-08-04, "this is hard to read"). The scan is now wired to legibility, not to the placement feature, so it always runs. The only thing that still skips it is the `TITLE_PLATE_SCAN=off` kill switch (scan depth otherwise 'basic' default | 'gemini' | 'off'). Never throws.
 
-- basic: ffmpeg extract (3 samples or [0] for image), sharp greyscale 96x96, per-band (top/middle/bottom) lum (0..1) + busy (0..1) inside safe zones (BAND_FOR_ANCHOR maps anchors).
+- basic: ffmpeg extract (**5 samples** — `[0.5, 1.5, .35×dur, .55×dur, .75×dur]`, clamped inside the probed duration and de-duped — or `[0]` for a still image; widened from the original 3-point grid so the hook/proof/close enter-windows of a canonical cut each land near a real sample instead of voting off a frame seconds away from where text is actually visible), sharp greyscale 96x160, per-band (top/middle/bottom) lum (0..1) + busy (0..1) inside safe zones (BAND_FOR_ANCHOR maps anchors).
 - gemini: + vision pass (TITLE_SCAN_MODEL=gemini-2.5-flash) marking avoid bands (faces/product/focal); falls back silently.
 - Output: {samples: [{atSec, bands: {top|middle|bottom: {lum, busy, avoid}}}] }.
-- Contrast: ONE global ink decision per render (plateIsLightGlobal in Canonical.jsx) — band verdicts weighted by how many slots render copy there; majority wins, so copy never mixes ink colors across light/dark bands in one video (the minority band leans on the layered shadows). Keep-out `avoid` nudges stay per-band (positional only). With `plateHints: null` (canonical mode), Canonical.jsx stays fully static — already verified.
+- Contrast: ONE global ink decision per render (plateIsLightGlobal in Canonical.jsx) — band verdicts weighted by how many slots render copy there; majority wins, so copy never mixes ink colors across light/dark bands in one video (the minority band leans on the layered shadows). Keep-out `avoid` nudges stay per-band (positional only) and in practice only fire from the gemini pass or face-keep-out — basic-only scans never set `avoid`, so `Canonical.jsx` still renders at its authored static positions whenever gemini/face-keep-out are absent, regardless of placement mode. `plateHints: null` (no hints at all) now only happens if the kill switch is set or the scan throws/finds nothing.
 
 ## 5) Operator flows (routes/brand.js, all under /api/brand/:id, Bearer + tenant-scoped)
 

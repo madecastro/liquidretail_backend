@@ -710,8 +710,49 @@ async function buildMetaForAd(ad, brand) {
   let layoutInput = null;
   try {
     const LayoutInputArtifact = require('../models/LayoutInputArtifact');
-    layoutInput = await LayoutInputArtifact.findOne({ mediaId: ad.mediaId }).sort({ createdAt: -1 }).lean();
-  } catch { /* optional */ }
+    const { INPUT_SCHEMA_VERSION } = require('./layoutInputService');
+    // productId must be part of the match: on media carrying several
+    // products, the createdAt race can hand this ad ANOTHER product's
+    // copy/quote. LayoutInputArtifact.productId defaults to `null` (never
+    // undefined — see models/LayoutInputArtifact.js), so `ad.productId ||
+    // null` matches both a real id and the legacy/no-product artifacts —
+    // same shape atlasVideoService.js already re-reads with.
+    //
+    // Schema freshness is a PREFERENCE, not a filter. Requiring
+    // schemaVersion === INPUT_SCHEMA_VERSION in the query looks safer but is
+    // a regression: 722 of 738 production artifacts are pre-4.1, and TEN meta
+    // fields take layoutInput as their FIRST cascade source — including
+    // `rating` and `reviewCount` themselves, plus deliveryLine, badgeText,
+    // badges, benefits, productDescription. Dropping a stale artifact
+    // outright would thin the canonical close phase AND delete the very
+    // stars this change exists to restore.
+    // It buys nothing either: the stale artifact's only unsafe field is the
+    // unstamped primary_quote, and gateLayoutInputQuotes (below) already
+    // withholds exactly that — 161 checks in verifyQuoteProvenance.js pin it.
+    // So: prefer a current-schema artifact, fall back to the newest stale one,
+    // and log which we served so a thin proof beat is diagnosable from Render
+    // logs without a DB query.
+    const productIdKey = ad.productId || null;
+    const scope = { mediaId: ad.mediaId, productId: productIdKey };
+    layoutInput = await LayoutInputArtifact.findOne({
+      ...scope,
+      schemaVersion: INPUT_SCHEMA_VERSION
+    }).sort({ createdAt: -1 }).lean();
+
+    if (!layoutInput) {
+      layoutInput = await LayoutInputArtifact.findOne(scope).sort({ createdAt: -1 }).lean();
+      console.log(
+        layoutInput
+          ? `📐 buildMetaForAd[ad=${ad._id}]: layoutInput STALE (schemaVersion=${layoutInput.schemaVersion || 'unstamped'} ` +
+            `want=${INPUT_SCHEMA_VERSION}) — serving non-quote fields; quote withheld by the provenance gate. Re-derive to restore it.`
+          : `📐 buildMetaForAd[ad=${ad._id}]: no layoutInput for (mediaId=${ad.mediaId} productId=${productIdKey}) — degrading to ad.copy`
+      );
+    }
+  } catch (err) {
+    // Prefer a thinner ad over a crash — Atlas video is already billed by
+    // the time titling runs.
+    console.log(`buildMetaForAd[ad=${ad._id}]: layoutInput lookup failed (${err.message}) — degrading to ad.copy`);
+  }
 
   // Video dual-gate: strip non-printable primary_quote before cascade.
   layoutInput = gateLayoutInputQuotes(layoutInput);
@@ -720,7 +761,12 @@ async function buildMetaForAd(ad, brand) {
   if (ad.productId) {
     try {
       const CatalogProduct = require('../models/CatalogProduct');
-      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating reviewCount imageUrl').lean();
+      // titleStyleSpec + categoryRef are not consumed for copy/rating here —
+      // they're read below only to reproduce, byte-for-byte, the SAME
+      // titleSpecService.resolveSpec() call renderWithRemotionAndSave makes
+      // moments after this function returns, so renderedQuoteText reflects
+      // the spec that will actually be resolved for this ad's render.
+      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating reviewCount imageUrl titleStyleSpec categoryRef').lean();
     } catch { /* optional */ }
   }
 
@@ -770,28 +816,169 @@ async function buildMetaForAd(ad, brand) {
   // branch. reviewsText is a formatted string built from reviewCount.
   const endcardMode = ad.productId ? 'product' : 'brand';
 
-  // ATOMIC rating + reviewCount pair (services/ratingDisplay.js).
-  // Product pair = cascade (layoutInput.social_proof → catalogProduct).
-  // Brand pair = Brand.brandReviews (same enrichment snapshot — rating and
-  // reviewCount together). NEVER mix tiers: historical bug printed a
-  // product's 41k reviews next to the brand's 3.3★. When the brand pair
-  // is used, reviewsText attributes the count ("N reviews · domain") so
-  // Remotion Canonical never implies product-level reviews.
+  // ── Tier-coherent social proof (services/ratingDisplay.js) ──────────
+  // resolveCoherentSocialProof is the ONE place quote-tier <-> number-tier
+  // pairing is decided (committed, 48 revert-proven checks in
+  // scripts/verifyCoherentSocialProof.js). This replaces the ad hoc guard
+  // that used to live here (allowBrandCountWithoutStars / renderedQuote ===
+  // brandQuoteText): that guard only ever protected the BRAND-count-without-
+  // stars outcome and could not see a product-tier or category-tier quote
+  // mixing with the wrong number tier at all (R1).
   const {
-    resolveAtomicRatingPair, brandAttributionLabel,
+    resolveCoherentSocialProof, brandAttributionLabel,
   } = require('./ratingDisplay');
-  const brandPair = brand?.brandReviews && typeof brand.brandReviews === 'object'
-    ? brand.brandReviews
+
+  // Already provenance-gated above (gateLayoutInputQuotes / toPrintable
+  // CustomerQuote) — the chokepoint expects an already-gated quote and does
+  // not re-gate provenance itself.
+  const pq = layoutInput?.input?.social_proof?.primary_quote;
+
+  // ── renderedQuoteText: the line the 'quote' SLOT will ACTUALLY typeset ──
+  // quotePrintsOnFrame (ratingDisplay.js) has NO default — omit this and the
+  // chokepoint withholds every number. The naive guess `meta.quoteSnippet ||
+  // meta.quote` is WRONG: the live binding is a per-slot BIND LIST
+  // (titleSpecValidator.DEFAULT_BIND.quote = ['quoteSnippet','quote']),
+  // itself resolved per format via titleSpecService.resolveSpec's tier
+  // ladder (ad/product/category/brand titleStyleSpec -> brand.titleStylePreset
+  // -> canonical — tier-1 persisted docs are skipped by default via
+  // TITLE_SPEC_IGNORE_PERSISTED), and the bind list is overridable per slot.
+  // renderWithRemotionAndSave calls resolveSpec with these SAME inputs
+  // moments after this function returns — reproduce that resolution here
+  // (not a hardcoded guess) so the compared string is what will really
+  // render. Run it through the real renderer resolver
+  // (remotion/lib/slotContent.js resolveSlotContentCore, same module
+  // scripts/verifyTitleSpecResolution.js already requires from a CJS
+  // harness) so the 120-char word-safe cap the composition applies is
+  // honoured too — an untruncated compare would authorise numbers beside a
+  // quote that actually renders shorter than what was checked.
+  //
+  // F4 (fixed here): the old guard compared `cascaded.quote` ALONE, but the
+  // renderer's default bind checks `quoteSnippet` FIRST — a
+  // Brand.metaCascades.quoteSnippet override could substitute a different
+  // line the old guard never looked at.
+  let renderedQuoteText = null;
+  if (pq && String(pq.text || '').trim()) {
+    try {
+      const { resolveSpec } = require('./titleSpecService');
+      const { resolveSlotContentCore } = require('../remotion/lib/slotContent.js');
+      const format = classifyFormat(ad);
+      let categoriesForSpec = [];
+      if (catalogProduct) {
+        try {
+          const { loadCategoryChainForProduct } = require('./categoryChainService');
+          categoriesForSpec = await loadCategoryChainForProduct(catalogProduct);
+        } catch { /* spec still resolves via the preset/canonical tiers */ }
+      }
+      // No presetOverride here — neither live caller of buildMetaForAd
+      // (renderWithRemotionAndSave, or the dead canvas branch below it)
+      // ever passes one through to this function.
+      const { spec: resolvedTitleSpec } = resolveSpec({
+        brand, product: catalogProduct, ad, format, categories: categoriesForSpec, presetOverride: null,
+      });
+      const quoteSlot = resolvedTitleSpec?.slots?.find((s) => s.key === 'quote') || null;
+      if (quoteSlot) {
+        // Only the fields the quote slot's bind chain can read — the
+        // pre-decision cascade values (BEFORE the chokepoint's own
+        // quote/quoteSnippet overwrite below), since we're checking what
+        // WOULD render absent that overwrite.
+        const candidateMeta = {
+          quote:        cascaded.quote        ?? null,
+          quoteSnippet: cascaded.quoteSnippet ?? null,
+          endcardMode,
+        };
+        const resolvedValue = resolveSlotContentCore(quoteSlot, candidateMeta);
+        renderedQuoteText = typeof resolvedValue === 'string' && resolvedValue ? resolvedValue : null;
+      }
+    } catch (err) {
+      // Never throw on a billed render path. An unresolved bind means we
+      // cannot prove what renders, so numbers get withheld (fail-closed) —
+      // the same outcome as an explicit mismatch, not a crash.
+      console.warn(`🔒 buildMetaForAd[ad=${ad._id}]: quote-slot bind resolution failed (${err.message}) — renderedQuoteText withheld, numbers gated closed`);
+      renderedQuoteText = null;
+      // Surface it PER-AD, not just in a worker log. Failing closed is right —
+      // an unverifiable quote must not carry a review count — but the visible
+      // consequence is an ad that silently ships with no stars and no count,
+      // which looks identical to a brand that simply has no review data. Without
+      // this the operator has no way to tell "we withheld proof because we could
+      // not prove which line renders" from "this brand has no proof". Same
+      // reasoning as the generation-size mismatch issue on the static path: a
+      // console warning on a worker nobody is tailing is not an alarm.
+      try {
+        const { noteRenderIssue } = require('./adStage');
+        noteRenderIssue(ad._id, {
+          message: `social proof withheld — could not resolve which quote line renders (${err.message})`,
+          stage: 'social-proof-gate'
+        });
+      } catch { /* telemetry is fire-and-forget; never let it break a render */ }
+    }
+  }
+
+  // ── Product snapshot: ONE document, never two independently-cascaded
+  // scalars (the R2 hole: metaCascadeConfig.js resolves `rating` and
+  // `reviewCount` as two INDEPENDENT cascades, so a rating from one
+  // snapshot could pair with a count from another). Prefer CatalogProduct
+  // when it carries EITHER field; else layoutInput.social_proof AS A PAIR —
+  // but only when that artifact's own pair is verified atomic
+  // (`rating_source === 'product'`, stamped by
+  // layoutInputService.deriveSocialProofNumbers). A stale artifact (written
+  // before that fix — ~722/738 in production — carries NO `rating_source`
+  // at all, so its pair is NOT trusted as product numbers here;
+  // CatalogProduct becomes the sole product-tier source for those ads
+  // instead (or no product pair, if CatalogProduct also has nothing). This
+  // does not drop brand-legitimate proof: the BRAND snapshot below is
+  // Brand.brandReviews, fetched independently and unaffected by any of this.
+  const catalogHasRatingOrCount = !!catalogProduct
+    && (typeof catalogProduct.rating === 'number' || typeof catalogProduct.reviewCount === 'number');
+  let productSnapshot = null;
+  if (catalogHasRatingOrCount) {
+    productSnapshot = { rating: catalogProduct.rating ?? null, reviewCount: catalogProduct.reviewCount ?? null };
+  } else {
+    const liSocialProof = layoutInput?.input?.social_proof;
+    if (liSocialProof && liSocialProof.rating_source === 'product'
+        && (typeof liSocialProof.rating_value === 'number' || typeof liSocialProof.review_count === 'number')) {
+      productSnapshot = { rating: liSocialProof.rating_value ?? null, reviewCount: liSocialProof.review_count ?? null };
+    }
+  }
+
+  // ── Brand snapshot: Brand.brandReviews, ONE document (rating + count
+  // written together by enrichment) — never averaged from CatalogProduct
+  // rows, never the layoutInput brand-fallback pair (that exists only so a
+  // no-SKU ad isn't blank; the video path always has this real snapshot).
+  const brandSnapshot = brand?.brandReviews && typeof brand.brandReviews === 'object'
+    ? { rating: brand.brandReviews.rating ?? null, reviewCount: brand.brandReviews.reviewCount ?? null }
     : null;
-  const ratingPair = resolveAtomicRatingPair({
-    productRating:      cascaded.rating,
-    productReviewCount: cascaded.reviewCount,
-    brandRating:        brandPair?.rating ?? null,
-    brandReviewCount:   brandPair?.reviewCount ?? null,
-    brandAttribution:   brandAttributionLabel(brand),
+  const brandAttribution = brandAttributionLabel(brand);
+
+  const coherent = resolveCoherentSocialProof({
+    quote: pq || null,
+    product: productSnapshot,
+    brand: brandSnapshot,
+    brandAttribution,
+    renderedQuoteText,
   });
-  const rating = ratingPair.rating;
-  const reviewsText = ratingPair.reviewsText;
+
+  // Log the decision: a product-tier rating beside a brand-tier quote (or
+  // vice versa) can no longer happen post-chokepoint, but source/tier
+  // pairing is worth seeing in Render logs for diagnosability.
+  console.log(
+    `coherentProof[ad=${ad._id}]: source=${coherent.source || 'none'} rating=${coherent.rating || 'none'} ` +
+    `count=${coherent.reviewCount ?? 'none'} quoteTier=${coherent.quoteTier || 'none'}`
+  );
+  const rating = coherent.rating;
+  const reviewCount = coherent.reviewCount;
+  const reviewsText = coherent.reviewsText;
+
+  // F4 IMPOSSIBLE BY CONSTRUCTION: once the chokepoint has decided which
+  // quote (if any) is coherent with these numbers, THAT is the quote that
+  // ships. A tenant cascade override (Brand.metaCascades.quote /
+  // quoteSnippet) cannot substitute a different line after the fact — when
+  // the chokepoint's decision carries a non-null quote, it OVERWRITES both
+  // quote fields; only when it carries none (no gated quote existed at all)
+  // do the ordinary cascaded values stand. Deliberately fail-closed: a
+  // tenant override for proof copy losing to the gated line is a smaller
+  // cost than an unsubstantiated number beside a testimonial.
+  const finalQuoteText = coherent.quote ? (coherent.quote.text || null) : (cascaded.quote ?? null);
+  const finalQuoteSnippet = coherent.quote ? (coherent.quote.snippet ?? null) : (cascaded.quoteSnippet ?? null);
 
   // deliveryLine and promoText share their two highest-priority sources
   // (ad.copy.offer_text, then layoutInput.input.cta.offer_text), so any ad
@@ -821,17 +1008,19 @@ async function buildMetaForAd(ad, brand) {
     benefits:           cascaded.benefits           ?? [],
     badges:             cascaded.badges             ?? [],
     headline:           cascaded.headline           ?? null,
-    quote:              cascaded.quote              ?? null,
+    // quote / quoteSnippet: forced to the chokepoint's verified line when
+    // one exists — see the "F4 IMPOSSIBLE BY CONSTRUCTION" comment above.
+    quote:              finalQuoteText,
     reviewer:           cascaded.reviewer           ?? null,
     deliveryLine:       cascaded.deliveryLine       ?? null,
     ctaText:            cascaded.ctaText            ?? null,
     cta:                cascaded.ctaText            ?? null,   // legacy alias for older scripts reading meta.cta
     rating,
-    // Count from the SAME tier as rating (atomic pair). Null when the
+    // Count from the SAME tier as rating (coherent pair). Null when the
     // chosen tier has no count — never a cross-tier mix.
-    reviewCount:        ratingPair.reviewCount,
+    reviewCount,
     likes:              cascaded.likes              ?? null,
-    quoteSnippet:       cascaded.quoteSnippet       ?? null,
+    quoteSnippet:       finalQuoteSnippet,
     promoText,   // null lets the renderer skip the promo pill (see dedupe above)
     productOnlyImageUrl: cascaded.productOnlyImageUrl ?? null,
 
@@ -1004,13 +1193,19 @@ function resolveTitlingEngine(brand, ad) {
 // BRAND_SCRIPT_RETAIN_TMP is set for post-mortem.
 async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSnapshot = null }) {
   const fs = require('fs');
-  const { uploadBufferToCloudinary } = require('./cloudinaryService');
+  const { uploadFileToCloudinary } = require('./cloudinaryService');
   const Ad = require('../models/Ad');
   const { adStage } = require('./adStage');
   try {
     adStage(ad._id, `uploading titled video (${ad.aspectRatio || 'video'})`);
-    const buffer = await fs.promises.readFile(finalPath);
-    const uploaded = await uploadBufferToCloudinary(buffer, {
+    // Stream straight from disk (efficiency finding #4) instead of the old
+    // fs.promises.readFile(finalPath) -> uploadBufferToCloudinary(buffer, ...)
+    // path: that read the whole rendered mp4 into one in-memory Buffer (tens/
+    // hundreds of MB for a titled master) only to have uploadBufferToCloudinary
+    // immediately re-wrap it in a streamifier Readable for upload_stream.
+    // finalPath isn't needed for anything else afterward (only tempDir is,
+    // for cleanup below), so there's nothing lost by not buffering it.
+    const uploaded = await uploadFileToCloudinary(finalPath, {
       folder:       'liquidretail/brand_script',
       resourceType: 'video',
       overwrite:    true

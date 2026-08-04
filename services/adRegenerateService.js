@@ -35,6 +35,7 @@
 // backward-compat with the current frontend UI that may still send
 // mode='light'.
 
+const mongoose              = require('mongoose');
 const Ad                    = require('../models/Ad');
 const Media                 = require('../models/Media');
 const Brand                 = require('../models/Brand');
@@ -45,6 +46,400 @@ const directImage           = require('./directImageRenderService');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
+
+// ── Video prompt override lengths on regenerate ────────────────────────
+// Same product-policy caps as the wizard body parser (routes/ads.js
+// parsePhase3WizardFields: guidance ≤1000 chars, raw ≤4000 chars). Do NOT
+// raise these to the Omni model promptByteCap (20000) — the wizard and
+// regenerate screens must agree, and ATLAS.md documents the deliberate
+// 4000-char API ceiling even though Omni can accept more. The model cap
+// is still applied later by enforceRawByteCap inside generateForAd.
+const VIDEO_PROMPT_GUIDANCE_MAX = 1000;
+const VIDEO_PROMPT_RAW_MAX      = 4000;
+
+// ── Image prompt override length on regenerate ─────────────────────────
+// DELIBERATELY 10x the video ceiling, and it must not be "harmonised" down
+// to 4000 for symmetry. The static prompt this replaces is ~7.8-8.4k chars
+// after the PRODUCT_FIDELITY hardening (staticAdIntents.js), so a 4000 cap
+// would truncate the very prompt the operator just loaded and make the
+// feature useless. 40000 matches MAX_OVERRIDE_LEN on the existing
+// promptOverride channel (routes/ads.js), so the two static full-replace
+// entry points agree. There is no provider cap to respect: image models
+// publish no prompt maximum (docs/ATLAS.md:211, CLAUDE.md §3), and
+// atlasImageService passes the string through unaltered.
+const IMAGE_PROMPT_RAW_MAX      = 40000;
+
+// ── Pure regenerate request helpers (offline-harnessable) ──────────────
+// These exist so scripts/verifyRegeneration.js can pin the request gate
+// and the raw-replace / guidance-prepend contract without DB, network,
+// or an API key. Production routes/ads.js and runVideoFull call the same
+// functions — do not reimplement the rules at the call site.
+
+// Does this regenerate body carry ANY legal intent? A completely empty
+// body must 400. Mirrors the static `!prompt && !promptOverride` gate,
+// extended so a video re-roll with only videoPromptRaw / videoPromptGuidance
+// is legal (that was the gap: the API already allowed empty refinement
+// when promptOverride was set for images, but video had no equivalent).
+function regenerateHasIntent({
+  prompt = null,
+  promptOverride = null,
+  videoPromptRaw = null,
+  videoPromptGuidance = null,
+  imagePromptRaw = null
+} = {}) {
+  if (typeof prompt === 'string' && prompt.trim()) return true;
+  if (promptOverride && typeof promptOverride === 'object') return true;
+  if (typeof videoPromptRaw === 'string' && videoPromptRaw.trim()) return true;
+  if (typeof videoPromptGuidance === 'string' && videoPromptGuidance.trim()) return true;
+  if (typeof imagePromptRaw === 'string' && imagePromptRaw.trim()) return true;
+  return false;
+}
+
+// Validate + normalise the optional video prompt override fields on
+// POST /api/ads/:id/regenerate. Same length ceilings as the wizard
+// (VIDEO_PROMPT_GUIDANCE_MAX / VIDEO_PROMPT_RAW_MAX). Whitespace-only
+// collapses to null so a blank Advanced textarea does not count as intent.
+function parseRegenVideoPromptFields(body = {}) {
+  const rawIn = body.videoPromptRaw;
+  const gIn   = body.videoPromptGuidance;
+
+  let videoPromptRaw = null;
+  let videoPromptGuidance = null;
+
+  if (rawIn != null && rawIn !== '') {
+    if (typeof rawIn !== 'string') {
+      return { ok: false, error: 'videoPromptRaw must be a string' };
+    }
+    if (rawIn.length > VIDEO_PROMPT_RAW_MAX) {
+      return {
+        ok: false,
+        error: `videoPromptRaw must be a string ≤${VIDEO_PROMPT_RAW_MAX} characters`
+      };
+    }
+    const t = rawIn.trim();
+    if (t) videoPromptRaw = t;
+  }
+
+  if (gIn != null && gIn !== '') {
+    if (typeof gIn !== 'string') {
+      return { ok: false, error: 'videoPromptGuidance must be a string' };
+    }
+    if (gIn.length > VIDEO_PROMPT_GUIDANCE_MAX) {
+      return {
+        ok: false,
+        error: `videoPromptGuidance must be a string ≤${VIDEO_PROMPT_GUIDANCE_MAX} characters`
+      };
+    }
+    const t = gIn.trim();
+    if (t) videoPromptGuidance = t;
+  }
+
+  return { ok: true, videoPromptRaw, videoPromptGuidance };
+}
+
+// Validate + normalise the optional IMAGE raw prompt on
+// POST /api/ads/:id/regenerate. Same shape of contract as
+// parseRegenVideoPromptFields — non-string rejected, over-cap rejected with
+// the cap named, whitespace-only collapsed to null so a blank Advanced
+// textarea is not mistaken for intent.
+//
+// Cap is IMAGE_PROMPT_RAW_MAX (40000), NOT the video 4000 — see the constant.
+function parseRegenImagePromptField(body = {}) {
+  const rawIn = body.imagePromptRaw;
+
+  let imagePromptRaw = null;
+
+  if (rawIn != null && rawIn !== '') {
+    if (typeof rawIn !== 'string') {
+      return { ok: false, error: 'imagePromptRaw must be a string' };
+    }
+    if (rawIn.length > IMAGE_PROMPT_RAW_MAX) {
+      return {
+        ok: false,
+        error: `imagePromptRaw must be a string ≤${IMAGE_PROMPT_RAW_MAX} characters`
+      };
+    }
+    const t = rawIn.trim();
+    if (t) imagePromptRaw = t;
+  }
+
+  return { ok: true, imagePromptRaw };
+}
+
+// Resolve what runVideoFull will pass into generateForAd / prepareStoryboard.
+//
+// PASS-THROUGH ONLY — never write these back onto the Ad row. The wizard
+// PERSISTS videoPromptRaw / videoPromptGuidance on mint so a later Generate
+// reuses them; regenerate is a one-shot A/B of the camera prompt. Leaving
+// the next regenerate without overrides reverts to (a) any wizard-stamped
+// fields still on the row, else (b) the canonical buildVeoPrompt path.
+// Persisting here would lock every subsequent re-roll to this experiment.
+//
+// Priority for THIS call (matches atlasVideoService.generateForAd):
+//   1. per-call videoPromptRaw  → stamp onto the in-memory ad clone so the
+//      EXISTING raw branch runs (logs "canonical directives bypassed").
+//      Refinement prompt + videoPromptGuidance are ignored while raw is
+//      active — wizard parity (guidance disabled when raw is set).
+//   2. refinement `prompt` OR per-call videoPromptGuidance → operatorPrompt
+//      prepend via buildVeoPrompt (OPERATOR REFINEMENT header).
+//   3. neither → generateForAd falls through to ad.videoPromptRaw (wizard
+//      stamp) or the guidance cascade on the real Ad row.
+//
+// MONEY: this only chooses the prompt string. It does not change the number
+// of billable Omni submits — still exactly one generateForAd → submitGeneration.
+function resolveVideoRegenCall({
+  prompt = null,
+  videoPromptRaw = null,
+  videoPromptGuidance = null,
+  ad = null
+} = {}) {
+  const adForGen = ad && typeof ad === 'object' ? { ...ad } : {};
+  const raw = (typeof videoPromptRaw === 'string' && videoPromptRaw.trim())
+    ? videoPromptRaw.trim()
+    : null;
+  const guidance = (typeof videoPromptGuidance === 'string' && videoPromptGuidance.trim())
+    ? videoPromptGuidance.trim()
+    : null;
+  const refinement = (typeof prompt === 'string' && prompt.trim())
+    ? prompt.trim()
+    : null;
+
+  if (raw) {
+    // Force the generateForAd raw branch: operatorPrompt must be empty so
+    // it does not take priority over ad.videoPromptRaw (see atlasVideoService
+    // priority comment: operatorPrompt → raw → guidance cascade).
+    adForGen.videoPromptRaw = raw;
+    return {
+      operatorPrompt: null,
+      adForGen,
+      path: 'raw'
+    };
+  }
+
+  // Prepend path. Refinement textarea wins over the advanced guidance field
+  // when both are present — both are the same mechanism (operator direction
+  // prepended at highest priority), so we pick one rather than concatenate.
+  const operatorPrompt = refinement || guidance || null;
+  return {
+    operatorPrompt,
+    adForGen,
+    path: operatorPrompt ? 'prepend' : 'cascade'
+  };
+}
+
+// ── Catalog-first reseed on regenerate ────────────────────────────────
+//
+// THE PROBLEM. Regenerate used to REPLAY a stored reference stack and never
+// re-derive it. Ads queued while DIRECTOR_UNIVERSE_TOP_N was 10 still hold 3+
+// entries in Ad.mediaIds, so regenerating them today still sends 3+ references
+// — forever, on every future regen.
+//
+// WHY THIS IS NOT A TRIM. Trimming Ad.mediaIds to its first element would be
+// actively harmful. Those historical stacks were ordered by the shotType
+// ranking (services/shotTypeRank.js), which sorts LIFESTYLE FIRST, over a pool
+// that MERGES catalog media with product_match UGC. So mediaIds[0] on an old ad
+// is frequently a UGC/lifestyle post; trimming to [0] would permanently lock a
+// social image in as the seed — the exact outcome the owner is guarding
+// against. So we RE-DERIVE from the catalog instead.
+//
+// THE DERIVATION mirrors the live "Feed-order hero" cascade at
+// campaignAdsGenerationService.js:2085 (imageRole hero → earliest createdAt →
+// nothing) and the owner rule documented for
+// seededUniverseService.promoteFirstCatalogImage: "the first image that came
+// from the catalog". It is REIMPLEMENTED LOCALLY rather than imported because
+// campaignAdsGenerationService is mid-edit in a separate change and importing a
+// symbol out of it would couple this behaviour to that file's in-flight state.
+// buildSeededUniverse is deliberately NOT called: it is heavier, also mid-edit,
+// and its ranked pool contains UGC by construction.
+//
+// STRUCTURALLY CATALOG-ONLY. Every query pins source:'catalog-product', and
+// every candidate is re-checked by isCatalogMediaForProduct() before it can be
+// selected. imageRole is never queried on its own — a UGC doc carrying
+// metadata.imageRole:'hero' can therefore never be picked. Scope is BOTH the
+// ad's own product (metadata.catalogProductId) AND the ad's brand
+// (Media.brandId), so neither a cross-product nor a cross-tenant photo can
+// leak into the ad.
+//
+// MONEY (CLAUDE.md §2). This changes WHICH image seeds the ad, never HOW MANY
+// submits happen. renderDirectImage still performs exactly one gpt-image-2/edit
+// submit per invocation, and reference COUNT does not move the price (flat
+// model base_price, no images.length multiplier — atlasImageService.js:75-104).
+//
+// NOT PERSISTED. The derived stack is computed at regenerate time and passed
+// into the render call only. Writing it back onto Ad.mediaIds would silently
+// rewrite historical rows and make the kill switch useless for anything already
+// regenerated once.
+//
+// KILL SWITCH: REGEN_RESEED_CATALOG_FIRST, DEFAULT ON. This changes how
+// ALREADY-GENERATED ads look when regenerated, so it must be reversible without
+// a code deploy.
+
+const RESEED_SKIP = {
+  FLAG_OFF:          'REGEN_RESEED_CATALOG_FIRST=false',
+  VIDEO:             'video regenerate (static-only behaviour)',
+  NOT_PRODUCT_IMAGE: 'variantKind is not product_image (UGC path is unoptimized — owner)',
+  OPERATOR_REFS:     'operator referenceMediaIds present (explicit pick always wins)',
+  NO_PRODUCT:        'ad has no productId',
+  NO_CATALOG_MEDIA:  'no catalog-product Media for this product+brand'
+};
+
+// Kill switch. Follows the repo's boolean-flag idiom
+// (atlasVideoService.isRepeatPrimaryReferenceEnabled) — unset/empty falls to the
+// documented default, and only an explicit 0/false/no/off turns it off. Default
+// here is ON because the owner asked for this behaviour.
+function isRegenReseedCatalogFirstEnabled() {
+  const raw = process.env.REGEN_RESEED_CATALOG_FIRST;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+// PURE. The whole gate, in one place, so the offline harness can assert it
+// without a DB. Returns { reseed, reason } — reason is the log-ready skip
+// reason, null when reseeding.
+//
+// ALL FOUR conditions must hold. Any one false → behave exactly as before.
+function reseedDecision({ ad, flagEnabled }) {
+  if (!flagEnabled)                        return { reseed: false, reason: RESEED_SKIP.FLAG_OFF };
+  // (a) STATIC only. runImage is the static worker (regenerateAd routes
+  //     kind==='video' to runVideoFull), but the gate is restated here so the
+  //     pure function is the single source of truth and the harness can prove
+  //     a video ad is never reseeded.
+  if ((ad?.kind || 'image') === 'video')   return { reseed: false, reason: RESEED_SKIP.VIDEO };
+  // (b) HARD OWNER REQUIREMENT, verbatim: "UGC ads shouldn't be affected by
+  //     this change, we haven't optimized that path yet." A variantKind:'ugc'
+  //     ad is SUPPOSED to seed from a social image — re-deriving it to a
+  //     catalog photo breaks it by design. NOT OPTIONAL.
+  if (ad?.variantKind !== 'product_image') return { reseed: false, reason: RESEED_SKIP.NOT_PRODUCT_IMAGE };
+  // (c) A non-empty referenceMediaIds is an explicit operator pick — owner:
+  //     "unless the user overrides it".
+  if (Array.isArray(ad?.referenceMediaIds) && ad.referenceMediaIds.length > 0) {
+    return { reseed: false, reason: RESEED_SKIP.OPERATOR_REFS };
+  }
+  // (d) No product → nothing to derive from.
+  if (!ad?.productId)                      return { reseed: false, reason: RESEED_SKIP.NO_PRODUCT };
+  return { reseed: true, reason: null };
+}
+
+function shouldReseedFromCatalog({ ad, flagEnabled }) {
+  return reseedDecision({ ad, flagEnabled }).reseed;
+}
+
+// PURE. The single predicate that makes the cascade structurally incapable of
+// returning non-catalog / cross-product / cross-tenant media. Nothing is
+// selectable unless it passes this, regardless of which query produced it.
+function isCatalogMediaForProduct(doc, { productId, brandId }) {
+  if (!doc || !doc._id) return false;
+  if (doc.source !== 'catalog-product') return false;
+  // source==='catalog-product' is NOT "is an image". Catalog VIDEOS share that
+  // source (shopifyPublicIngestService.js:513-546 writes fileType:'video' +
+  // metadata.imageRole:'video' and does resolve catalogProductId), so without
+  // this the tier-2 earliest-createdAt branch could seed a STATIC image
+  // regenerate with an .mp4. Tier 1 is safe only incidentally, via the hero
+  // stamp. Excluding an EXPLICIT video rather than demanding fileType==='image'
+  // keeps legacy rows with an absent fileType eligible — the same reasoning as
+  // seededUniverseService.promoteFirstCatalogImage, so the two cascades agree.
+  if (doc.fileType === 'video') return false;
+  if (doc.metadata?.imageRole === 'video') return false;
+  // A derived id is only usable if it actually resolves to an image the renderer
+  // can fetch. An empty/absent fileUrl means renderDirectImage would resolve zero
+  // references and silently fall back to the ad's original seed while we had
+  // already logged a successful reseed — see the SELECT comment below.
+  if (typeof doc.fileUrl !== 'string' || !doc.fileUrl.trim()) return false;
+  const docProduct = doc.metadata?.catalogProductId;
+  if (docProduct == null || String(docProduct) !== String(productId)) return false;
+  if (doc.brandId == null || String(doc.brandId) !== String(brandId)) return false;
+  return true;
+}
+
+// PURE tier selection over an in-memory candidate list. Mirrors the tier order
+// at campaignAdsGenerationService.js:2085.
+//   TIER 1  metadata.imageRole === 'hero'
+//   TIER 2  else earliest createdAt
+//   TIER 3  else null → derive NOTHING
+// Returns { mediaId, tier } | null.
+function pickFirstCatalogMediaId(candidates, { productId, brandId }) {
+  const eligible = (Array.isArray(candidates) ? candidates : [])
+    .filter((doc) => isCatalogMediaForProduct(doc, { productId, brandId }));
+  if (!eligible.length) return null;
+
+  const hero = eligible.find((doc) => doc.metadata?.imageRole === 'hero');
+  if (hero) return { mediaId: hero._id, tier: 'hero' };
+
+  // Stable earliest-createdAt: ties keep input (feed) order. A missing
+  // createdAt sorts last so a stamped doc always beats an unstamped one.
+  const ts = (doc) => {
+    const t = doc.createdAt ? new Date(doc.createdAt).getTime() : NaN;
+    return Number.isFinite(t) ? t : Infinity;
+  };
+  let earliest = eligible[0];
+  for (const doc of eligible.slice(1)) if (ts(doc) < ts(earliest)) earliest = doc;
+  return { mediaId: earliest._id, tier: 'earliest-createdAt' };
+}
+
+// DB side. Two findOne queries, both pinning source + product + brand, then the
+// pure guard above vets the result.
+//
+// NOT identical to the generation-time cascade, and the difference is deliberate:
+// the deterministic-video cascade (campaignAdsGenerationService.js:2085) scopes by
+// source + metadata.catalogProductId ONLY, relying on catalogProductId being
+// globally unique. We additionally require brandId. Consequence, stated honestly
+// rather than glossed: a legacy catalog Media row with a null or wrong brandId is
+// selectable by the generation-time promotion (which gates on role, not brandId)
+// but NOT here — this returns nothing and the regenerate keeps today's behaviour.
+// That is failing CLOSED (no change to the ad) rather than risking a cross-tenant
+// seed, which is the right direction for the trade, but it does mean the two paths
+// can disagree on such a row. Do not "align" them by dropping brandId.
+//
+// metadata is a Mixed path, so mongoose does NOT cast a string id inside it;
+// the ObjectId conversion is load-bearing, not cosmetic.
+async function deriveFirstCatalogMediaId({ productId, brandId }) {
+  if (!productId || !brandId) return null;
+  let productOid, brandOid;
+  try {
+    productOid = new mongoose.Types.ObjectId(String(productId));
+    brandOid   = new mongoose.Types.ObjectId(String(brandId));
+  } catch { return null; }
+
+  // fileType MUST be projected: the guard below rejects fileType==='video', and
+  // an unprojected field is undefined, which would silently pass that check and
+  // leave only the metadata.imageRole half of the video defence working.
+  //
+  // fileUrl MUST be projected for the same class of reason, and it is the more
+  // dangerous omission. Without it the guard cannot tell a usable Media from a
+  // deleted or half-materialised one, so we would log
+  // "catalog reseed — stack 3 ref(s) → 1" and hand renderDirectImage an id that
+  // resolves to nothing; it then finds zero reference candidates and falls back
+  // to media.fileUrl — the ad's ORIGINAL seed, which on the historical rows this
+  // feature exists to fix is frequently the UGC/lifestyle image. That is the
+  // worst available outcome: a success log over a silent UGC seed, costing a real
+  // billable submit. Requiring fileUrl turns it into an honest tier-3 skip.
+  const SELECT = '_id source brandId fileType fileUrl metadata createdAt';
+  // $ne:'video' also matches docs where fileType is absent or null, which is the
+  // behaviour we want — legacy untyped rows stay eligible for tier 2 rather than
+  // falling through to tier 3. The post-query guard re-checks it regardless.
+  const scope  = {
+    source: 'catalog-product',
+    brandId: brandOid,
+    'metadata.catalogProductId': productOid,
+    fileType: { $ne: 'video' },
+  };
+
+  // TIER 1 — the hero stamp. Note imageRole is only ever an ADDITIONAL filter
+  // on top of the catalog scope; it is never queried alone.
+  const hero = await Media.findOne({ ...scope, 'metadata.imageRole': 'hero' }).select(SELECT).lean();
+  if (isCatalogMediaForProduct(hero, { productId: productOid, brandId: brandOid })) {
+    return { mediaId: hero._id, tier: 'hero' };
+  }
+
+  // TIER 2 — earliest catalog entry in feed order.
+  const earliest = await Media.findOne(scope).sort({ createdAt: 1 }).select(SELECT).lean();
+  if (isCatalogMediaForProduct(earliest, { productId: productOid, brandId: brandOid })) {
+    return { mediaId: earliest._id, tier: 'earliest-createdAt' };
+  }
+
+  // TIER 3 — nothing. Caller leaves existing behaviour completely untouched.
+  return null;
+}
 
 // ── Public API ────────────────────────────────────────────────────────
 
@@ -76,7 +471,23 @@ async function preflight(adId, brandId) {
 // route responds 202 with { regenerating: true } and the worker runs
 // in the background. The frontend polls /api/catalog/:id/ads-detail
 // every 5s watching Ad.regenerating.
-async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, promptOverride = null }) {
+async function regenerateAd({
+  ad,
+  prompt,
+  mode,
+  requestedBy,
+  videoModel = null,
+  promptOverride = null,
+  // Per-call video camera-prompt overrides (PASS-THROUGH — not persisted).
+  // See resolveVideoRegenCall for priority + next-regenerate behaviour.
+  videoPromptRaw = null,
+  videoPromptGuidance = null,
+  // Per-call IMAGE prompt full replacement (PASS-THROUGH — not persisted,
+  // same one-shot A/B rule as the video fields above). Routed into the
+  // existing promptOverride slot on runImage: resolveImagePromptOverride
+  // already accepts a bare string, so no new render-path argument.
+  imagePromptRaw = null
+}) {
   const adId      = String(ad._id);
   const kind      = ad.kind || 'image';
   // Video always regens fully (new Grok video + brand-script chrome).
@@ -93,7 +504,10 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
     // edited the exact prompt in the Generation Details modal) rather
     // than the refinement-note path. The full text is what the image
     // model receives (see resolveImagePromptOverride); history only flags.
-    rawPromptEdit: !!promptOverride,
+    // Also true for video when videoPromptRaw is supplied (full camera-
+    // prompt replace via the existing generateForAd raw branch), and for
+    // static when imagePromptRaw is supplied (full image-prompt replace).
+    rawPromptEdit: !!(promptOverride || videoPromptRaw || imagePromptRaw),
     at:            new Date(startedAt),
     status:        'pending'
   };
@@ -101,7 +515,16 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
   console.log(
     `🔁 regenerate[ad=${adId}]: kind=${kind} mode=${effMode}` +
     (videoModel ? ` videoModel=${videoModel}` : '') +
-    (promptOverride ? ' rawPromptEdit=true' : ` prompt="${historyEntry.prompt.slice(0, 60)}${historyEntry.prompt.length > 60 ? '…' : ''}"`)
+    (videoPromptRaw ? ' videoPromptRaw=true' : '') +
+    (videoPromptGuidance && !videoPromptRaw ? ' videoPromptGuidance=true' : '') +
+    (imagePromptRaw ? ' imagePromptRaw=true' : '') +
+    // Flags only — never the override text. imagePromptRaw runs ~8k chars and
+    // the refinement may legitimately be empty when raw carries the intent.
+    (promptOverride
+      ? ' rawPromptEdit=true'
+      : imagePromptRaw
+        ? ''
+        : ` prompt="${historyEntry.prompt.slice(0, 60)}${historyEntry.prompt.length > 60 ? '…' : ''}"`)
   );
 
   // Atomic lock + append in-flight history entry. Filter requires
@@ -139,9 +562,27 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
 
   try {
     if (kind === 'video') {
-      await runVideoFull(adId, prompt, progressRun, videoModel);
+      await runVideoFull(adId, prompt, progressRun, videoModel, {
+        videoPromptRaw,
+        videoPromptGuidance
+      });
     } else {
-      await runImage(adId, prompt, progressRun, promptOverride);
+      // imagePromptRaw and promptOverride are mutually exclusive at the route
+      // (both land in this one slot, and silently picking a winner would hide
+      // which text the operator's money paid for). The `||` is therefore a
+      // selection between two never-simultaneous values, not a precedence rule.
+      //
+      // A refinement sent ALONGSIDE a full replacement is dropped inside
+      // renderDirectImage (the override wins) — same rule as the video raw
+      // path, so the two screens agree. Say so out loud: historyEntry.prompt
+      // still stores the refinement text, so a silent drop would leave an
+      // audit trail implying both were used on a charged submit.
+      if (imagePromptRaw && String(prompt || '').trim()) {
+        console.log(
+          `🔁 regenerate[ad=${adId}]: refinement IGNORED — imagePromptRaw replaces the whole prompt`
+        );
+      }
+      await runImage(adId, prompt, progressRun, imagePromptRaw || promptOverride);
     }
 
     const durationMs = Date.now() - startedAt;
@@ -174,32 +615,64 @@ async function regenerateAd({ ad, prompt, mode, requestedBy, videoModel = null, 
 async function loadBrand(adId) {
   const ad = await Ad.findById(adId).select('mediaId').lean();
   const media = ad?.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
+  // brandReviews is load-bearing for the proof beat — see the same note in
+  // routes/ads.js. Without it buildMetaForAd's brandPair is null and every
+  // regenerated ad loses its stars AND its review count, even for brands that
+  // clear the >4.5 gate. Pinned by scripts/verifyProofBeat.js P1.
   return media?.brandId
     ? await Brand.findById(media.brandId)
-        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts videoSettings titleStyleSpec titleStylePreset').lean()
+        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
     : null;
 }
 
 // Video regen — always full. Regenerates the storyboard + Grok base
 // video, then applies brand-script chrome (or no chrome, per resolver).
-async function runVideoFull(adId, prompt, progressRun = null, videoModel = null) {
+//
+// videoOpts.videoPromptRaw / videoOpts.videoPromptGuidance are per-call
+// only (see resolveVideoRegenCall). They ride into generateForAd via an
+// in-memory ad clone + operatorPrompt so the EXISTING atlasVideoService
+// branches fire:
+//   raw     → ad.videoPromptRaw path (logs "canonical directives bypassed")
+//   prepend → operatorPrompt → buildVeoPrompt OPERATOR REFINEMENT header
+// MONEY: still exactly one generateForAd → one billable Omni submit.
+async function runVideoFull(adId, prompt, progressRun = null, videoModel = null, videoOpts = {}) {
   // Stage 1 — context prep (model + aspect resolution, layoutInput
   // warm). storyboard is null on the Atlas path — the Ken Burns prompt
-  // directs motion; the operator's refinement prompt is threaded into
-  // the video prompt itself in Stage 2. videoModel (the regenerate
+  // directs motion; the operator's refinement / raw override is threaded
+  // into the video prompt itself in Stage 2. videoModel (the regenerate
   // dropdown's per-run override) goes to BOTH stages so they resolve
   // the same model.
   if (progressRun) { await progressRun.checkpoint(); progressRun.stage('generating video'); }
   await setStage(adId, 'veo');
   const ad1 = await Ad.findById(adId).lean();
-  const { storyboard } = await veoService.prepareStoryboard({ ad: ad1, operatorPrompt: prompt, modelOverride: videoModel });
+  const { operatorPrompt, adForGen, path } = resolveVideoRegenCall({
+    prompt,
+    videoPromptRaw:      videoOpts.videoPromptRaw || null,
+    videoPromptGuidance: videoOpts.videoPromptGuidance || null,
+    ad: ad1
+  });
+  if (path === 'raw') {
+    console.log(`🔁 regenerate[ad=${adId}]: videoPromptRaw active — canonical directives will be bypassed`);
+  }
+  const { storyboard } = await veoService.prepareStoryboard({
+    ad: adForGen,
+    operatorPrompt,
+    modelOverride: videoModel
+  });
 
   if (storyboard) {
     await Ad.updateOne({ _id: adId }, { $set: { veoStoryboard: storyboard, updatedAt: new Date() } });
   }
 
   // Stage 2 — new base video (model per override → settings → default).
-  const veoResult = await veoService.generateForAd({ ad: ad1, operatorPrompt: prompt, storyboard, modelOverride: videoModel });
+  // ONE billable submit inside generateForAd; prompt overrides do not
+  // add or remove submits.
+  const veoResult = await veoService.generateForAd({
+    ad: adForGen,
+    operatorPrompt,
+    storyboard,
+    modelOverride: videoModel
+  });
   if (veoResult.skipped) throw new Error(`Veo skipped: ${veoResult.reason}`);
 
   // Stamp the raw render before chrome so a chrome failure still
@@ -258,10 +731,35 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
   // wins; else Director concept mediaIds; else seed media alone inside
   // renderDirectImage).
   const hasOperatorRefs = Array.isArray(ad.referenceMediaIds) && ad.referenceMediaIds.length > 0;
-  const referenceMediaIds = hasOperatorRefs
+  let referenceMediaIds = hasOperatorRefs
     ? ad.referenceMediaIds
     : (Array.isArray(ad.mediaIds) ? ad.mediaIds : []);
-  const referenceSource = hasOperatorRefs ? 'operator' : 'director';
+  let referenceSource = hasOperatorRefs ? 'operator' : 'director';
+
+  // CATALOG-FIRST RESEED. Replaces the replayed Director stack with the ad's
+  // first catalog image (see the block header above). Nothing is written back to
+  // the Ad — the derived stack goes into this render call only. Still exactly
+  // one billable submit either way.
+  const reseed = reseedDecision({ ad, flagEnabled: isRegenReseedCatalogFirstEnabled() });
+  if (!reseed.reseed) {
+    console.log(`🔁 regenerate[ad=${adId}]: catalog reseed skipped — ${reseed.reason}`);
+  } else {
+    const derived = await deriveFirstCatalogMediaId({ productId: ad.productId, brandId: ad.brandId });
+    if (!derived) {
+      console.log(`🔁 regenerate[ad=${adId}]: catalog reseed skipped — ${RESEED_SKIP.NO_CATALOG_MEDIA}`);
+    } else {
+      console.log(
+        `🔁 regenerate[ad=${adId}]: catalog reseed — stack ${referenceMediaIds.length} ref(s) → ` +
+        `1 (${derived.tier} ${derived.mediaId})`
+      );
+      referenceMediaIds = [derived.mediaId];
+      // 'catalog-first', NOT 'catalog-hero': tier 2 resolves by earliest
+      // createdAt, so the chosen image often carries no hero stamp at all, and
+      // the owner explicitly moved off "hero" as the naming for this rule
+      // (2026-08-03) precisely because it implied a label that may be absent.
+      referenceSource   = 'catalog-first';
+    }
+  }
 
   let output;
   try {
@@ -323,6 +821,7 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
         bytes:              output.bytes  || uploaded.bytes  || null,
         imageGeneration:    output.imageGeneration  || null,
         intentResolution:   output.intentResolution || null,
+        visionQc:           output.visionQc || null,
         renderedAt:         new Date(),
         updatedAt:          new Date()
       }
@@ -366,5 +865,24 @@ module.exports = {
   // Exported so the offline harness can assert the direct-image path
   // (no aiCanvasArtifactId precondition) without invoking providers.
   runImage,
-  DAILY_CAP
+  DAILY_CAP,
+  // Catalog-first reseed. The decision and the tier selection are pure so
+  // scripts/verifyRegeneration.js can assert them with no DB, network or key.
+  RESEED_SKIP,
+  isRegenReseedCatalogFirstEnabled,
+  reseedDecision,
+  shouldReseedFromCatalog,
+  isCatalogMediaForProduct,
+  pickFirstCatalogMediaId,
+  // Video regenerate prompt overrides — pure helpers for the offline harness
+  // (R4 in scripts/verifyRegeneration.js) and the route gate.
+  VIDEO_PROMPT_GUIDANCE_MAX,
+  VIDEO_PROMPT_RAW_MAX,
+  regenerateHasIntent,
+  parseRegenVideoPromptFields,
+  resolveVideoRegenCall,
+  // Static regenerate raw prompt — pure helper + cap for the offline harness
+  // (R5 in scripts/verifyRegeneration.js) and the route gate.
+  IMAGE_PROMPT_RAW_MAX,
+  parseRegenImagePromptField
 };

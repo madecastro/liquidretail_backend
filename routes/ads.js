@@ -19,6 +19,8 @@ const crypto = require('crypto');
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
+// Receipt guard — a requeue must never re-submit work we have paid for.
+const { receiptFree } = require('../services/spendReceipt');
 const router = express.Router();
 
 const Ad           = require('../models/Ad');
@@ -44,6 +46,9 @@ const inFlight = require('../services/inFlight');
 const { adStage } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
+const {
+  generationGateDecision, normalizeProductIdList, pickSupersedingRun
+} = require('../services/generationGate');
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
 // Returns { ok:true, fields } or { ok:false, status, error }.
@@ -328,10 +333,11 @@ router.post('/generate', async (req, res) => {
     //      the run to status='running' with total set and start the render
     //      loop. Errors land the run as status='failed' with a single
     //      error entry so the UI can surface them.
-    // ONE generation in flight per campaign. Checked in the DATABASE, not in
-    // memory: services/inFlight.js is per-process and this web service
-    // autoscales across several Render instances, so two clicks can land on two
-    // processes that cannot see each other.
+    // CONCURRENT GENERATIONS: allowed when their product sets are DISJOINT,
+    // blocked when they overlap. Checked in the DATABASE, not in memory:
+    // services/inFlight.js is per-process and this web service autoscales across
+    // several Render instances, so two clicks can land on two processes that
+    // cannot see each other.
     //
     // This guard is load-bearing as of 2026-08-01. Until the identityDigest was
     // scoped to the run, a double-click was silently free — the second run's ads
@@ -339,24 +345,40 @@ router.post('/generate', async (req, res) => {
     // accident was the only thing standing between a stray double-click and a
     // second full set of billable generations, and scoping the digest (which the
     // owner asked for, so repeat Generates actually produce new creative)
-    // removed it. Every generation POST is charged on submit (CLAUDE.md §2).
+    // removed it. Note the atomic status:'queued' claim below does NOT cover
+    // this case — each run claims the ads it just minted, so there is no race to
+    // lose. Every generation POST is charged on submit (CLAUDE.md §2).
+    //
+    // It was ONE run per campaign until 2026-08-03, which also blocked a second
+    // batch of different products — a parallel run the team legitimately wants.
+    // The overlap rule (services/generationGate.js) keeps the double-click
+    // protection exactly where the money is and nowhere else; that module owns
+    // the reasoning, including why format/preset is deliberately not part of it.
     //
     // Stale runs are not allowed to lock a campaign forever: a 'preparing' or
     // 'running' row older than the render ceiling is treated as dead. That bound
     // is REAP_STALE_MIN, the same one worker.js uses to reclaim stuck ads, so the
     // two cannot drift into disagreeing about what "stale" means.
     const staleMin = Number(process.env.REAP_STALE_MIN || 15);
-    const active = await CampaignRun.findOne({
+    const activeRuns = await CampaignRun.find({
       campaignId,
       status: { $in: ['preparing', 'running'] },
       createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
-    }).select('runId status createdAt').lean();
-    if (active) {
+    }).select('runId status createdAt requestedProductIds').lean();
+    const gate = generationGateDecision({ activeRuns, requestedProductIds: productIds });
+    if (gate.blocked) {
+      const conflict = activeRuns.find(r => String(r.runId) === String(gate.conflictRunId)) || activeRuns[0];
+      const error = gate.reason === 'product-overlap'
+        ? `A generation is already running for ${gate.overlap.length} of the selected product(s). ` +
+          'Wait for it to finish, or start a run for different products — those run in parallel.'
+        : 'A generation is already running for this campaign. Wait for it to finish, or reload to see its progress.';
       return res.status(409).json({
-        error: 'A generation is already running for this campaign. Wait for it to finish, or reload to see its progress.',
+        error,
         code: 'generation-already-running',
-        runId: active.runId,
-        startedAt: active.createdAt
+        reason: gate.reason,
+        runId: conflict?.runId,
+        startedAt: conflict?.createdAt,
+        overlappingProductIds: gate.overlap || []
       });
     }
 
@@ -392,8 +414,66 @@ router.post('/generate', async (req, res) => {
       total:        0,
       status:       'preparing',
       requestedBy:  req.user?.userId || null,
-      startedAt:    new Date()
+      startedAt:    new Date(),
+      // Scope for the concurrency gate above. MUST be written here, at mint
+      // time: the gate runs while sibling runs are still 'preparing', long
+      // before the expansion fills perProduct. An unstamped run reads as
+      // "scope unknown" and blocks every concurrent Generate on the campaign.
+      requestedProductIds: normalizeProductIdList(productIds)
     });
+
+    // MINT-THEN-VERIFY — closes the read-then-write race in the gate above.
+    // Two clicks can both read activeRuns before either row exists, both see an
+    // idle campaign, and both go on to expand and bill. Now that our own run IS
+    // inserted, re-read: if an EARLIER in-flight run already claimed any of these
+    // products, we are the loser and abort here — before expandWizardJob, so
+    // nothing has been minted or charged. services/generationGate.js owns the
+    // ordering rule; both racers compute the same winner, so exactly one aborts.
+    const superseding = pickSupersedingRun({
+      selfRun: { runId, createdAt: run.createdAt },
+      activeRuns: await CampaignRun.find({
+        campaignId,
+        status: { $in: ['preparing', 'running'] },
+        createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
+      }).select('runId status createdAt requestedProductIds').lean(),
+      requestedProductIds: productIds
+    });
+    if (superseding) {
+      console.warn(
+        `⚠️  [campaignRun ${runId}] superseded by concurrent run ${superseding.runId} ` +
+        `on ${superseding.overlap.length || 'unscoped'} overlapping product(s) — aborting before expand`
+      );
+      // Do NOT swallow this write. A loser left in 'preparing' is a zombie that
+      // blocks its own products for the whole stale window — the exact
+      // false-block this change exists to remove. If the update fails, drop the
+      // row instead: it describes work that never happened, so there is nothing
+      // worth keeping, and a lingering lock is the more expensive outcome.
+      try {
+        await CampaignRun.updateOne(
+          { _id: run._id },
+          { status: 'failed', completedAt: new Date(),
+            $push: { errors: { index: 0, stage: 'gate',
+              message: `Superseded by concurrent run ${superseding.runId}; nothing was generated.` } } }
+        );
+      } catch (err) {
+        console.error(
+          `❌ [campaignRun ${runId}] could not mark superseded run failed (${err.message}) — ` +
+          `deleting the row so it cannot lock these products`
+        );
+        await CampaignRun.deleteOne({ _id: run._id }).catch(e =>
+          console.error(`❌ [campaignRun ${runId}] delete also failed: ${e.message} — ` +
+            `row may block overlapping products until the stale window expires`));
+      }
+      return res.status(409).json({
+        error: 'Another generation for these products started at the same moment. ' +
+               'Nothing was generated or charged for this request — watch the other run.',
+        code: 'generation-already-running',
+        reason: 'raced-concurrent-run',
+        runId: superseding.runId,
+        startedAt: superseding.createdAt,
+        overlappingProductIds: superseding.overlap || []
+      });
+    }
 
     res.status(202).json({
       campaignRunId: runId,
@@ -408,6 +488,24 @@ router.post('/generate', async (req, res) => {
     setImmediate(async () => {
       let adIds;
       try {
+        // SELF-STATUS CHECK before spending a cent. The gate only considers runs
+        // younger than REAP_STALE_MIN, so a run wedged in 'preparing' past that
+        // window stops holding its products — a sibling Generate for the SAME
+        // products is then allowed. If this run later wakes up and expands
+        // anyway, both bill. Re-reading our own status makes that terminal: a run
+        // whose row was reaped, failed, or superseded aborts instead of minting.
+        // Cheap (one indexed read) and it runs before expandWizardJob, so an
+        // abort costs nothing.
+        const stillOurs = await CampaignRun.findOne({ _id: run._id })
+          .select('status').lean();
+        if (!stillOurs || stillOurs.status !== 'preparing') {
+          console.warn(
+            `⚠️  [campaignRun ${runId}] no longer preparing ` +
+            `(status=${stillOurs?.status || 'deleted'}) — aborting before expand, nothing charged`
+          );
+          return;
+        }
+
         const job = await expandWizardJob({
           campaignId,
           productIds,
@@ -599,7 +697,7 @@ router.post('/generate', async (req, res) => {
         });
         if (adIds && adIds.length) {
           await Ad.updateMany(
-            { _id: { $in: adIds }, status: 'rendering' },
+            receiptFree({ _id: { $in: adIds }, status: 'rendering' }),
             { $set: { status: 'queued', updatedAt: new Date() } }
           ).catch(() => {});
         }
@@ -826,6 +924,28 @@ router.post('/runs', express.json(), async (req, res) => {
     // (and so concurrent winners are reflected in the remainder).
     const queuedRemaining = await Ad.countDocuments({ campaignId, status: 'queued' });
 
+    // Declare this run's product scope for the /generate concurrency gate, so a
+    // drain of pre-queued ads no longer blocks a Generate for OTHER products.
+    // Read off the ads we actually claimed — that IS the scope.
+    //
+    // Overlap still has to block: these ads are already minted, but a /generate
+    // for the same product would mint NEW ads for the same
+    // (product, template, aspect) under a fresh run-scoped digest — one
+    // creative, two charges. So partial knowledge is not good enough: if ANY
+    // claimed ad has no productId, we cannot describe the scope honestly, and an
+    // empty array is the value the gate reads as "unknown" and fails closed on.
+    let claimedProductIds = [];
+    try {
+      const claimedAds = await Ad.find({ _id: { $in: claimedIds } })
+        .select('productId').lean();
+      claimedProductIds = claimedAds.some(a => !a.productId)
+        ? []
+        : normalizeProductIdList(claimedAds.map(a => a.productId));
+    } catch (err) {
+      // Unreadable → leave empty (fail closed), never guess a narrower scope.
+      console.warn(`   ⚠️  [campaignRun ${runId}] could not scope claimed products: ${err.message}`);
+    }
+
     const run = await CampaignRun.create({
       runId,
       brandId:      String(campaign.brandId),
@@ -834,7 +954,8 @@ router.post('/runs', express.json(), async (req, res) => {
       total:        claim.total,
       status:       'running',
       requestedBy:  req.user?.userId || null,
-      startedAt:    new Date()
+      startedAt:    new Date(),
+      requestedProductIds: claimedProductIds
     });
 
     res.status(202).json({
@@ -870,7 +991,7 @@ router.post('/runs', express.json(), async (req, res) => {
           detail: err.stack || null
         });
         Ad.updateMany(
-          { _id: { $in: renderIds }, status: 'rendering' },
+          receiptFree({ _id: { $in: renderIds }, status: 'rendering' }),
           { $set: { status: 'queued', updatedAt: new Date() } }
         ).catch(() => {});
         CampaignRun.updateOne(
@@ -890,7 +1011,7 @@ router.post('/runs', express.json(), async (req, res) => {
     if (claimedIds.length) {
       try {
         await Ad.updateMany(
-          { _id: { $in: claimedIds }, status: 'rendering' },
+          receiptFree({ _id: { $in: claimedIds }, status: 'rendering' }),
           { $set: { status: 'queued', updatedAt: new Date() } }
         );
       } catch (requeueErr) {
@@ -1193,9 +1314,20 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       // sourceMedia.fileType; the brand-script overlay needs brandDoc.
       const sourceMedia = await Media.findById(ad.mediaId)
         .select('fileType fileUrl brandId').lean();
+      // brandReviews is LOAD-BEARING for the proof beat, not optional metadata:
+      // buildMetaForAd reads brand.brandReviews for the atomic rating+count pair
+      // (services/ratingDisplay.resolveAtomicRatingPair). Omitting it from this
+      // projection made brandPair null, so resolveAtomicRatingPair returned
+      // source=none and EVERY generated ad rendered with no stars and no review
+      // count — including brands that clear the >4.5 gate outright (Vuori 4.58 /
+      // 15,545 reviews shipped bare). The bug was invisible because a projection
+      // omission looks identical to a brand with no review data, and because
+      // routes/brand.js re-titles load the full doc and therefore worked.
+      // Keep this list in sync with adRegenerateService.loadBrand; both are
+      // pinned by scripts/verifyProofBeat.js P1.
       const brandDoc = sourceMedia?.brandId
         ? await Brand.findById(sourceMedia.brandId)
-            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset').lean()
+            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
         : null;
 
       // Grok-skip branch — when the seed is already a video, we keep
@@ -1529,6 +1661,14 @@ async function renderOneInner(run, job, adId, index, renderToken) {
               charged:      result.error?.charged === true,
               at:           new Date()
             },
+            // Keep vision QC verdict (incl. discarded paid URLs) on failure.
+            ...(result.error?.visionQc ? { visionQc: result.error.visionQc } : {}),
+            // Surface the last attempt's pixels when QC kept a URL.
+            ...(() => {
+              const attempts = result.error?.visionQc?.attempts || [];
+              const lastUrl = [...attempts].reverse().find(a => a?.renderUrl)?.renderUrl;
+              return lastUrl ? { renderUrl: lastUrl } : {};
+            })(),
             updatedAt:   new Date()
           },
           $inc: { renderAttempts: 1 }
@@ -1886,7 +2026,7 @@ router.get('/render-activity', async (req, res) => {
     const ads = await Ad.find(filter)
       .select('status renderStage renderStageAt kind template platformFormat aspectRatio ' +
               'renderUrl renderError renderAttempts renderStages imageGeneration ' +
-              'intentResolution veoPredictionId veoAspectRatio veoVideoUrl ' +
+              'intentResolution visionQc veoPredictionId veoAspectRatio veoVideoUrl ' +
               'campaignId campaignRunIds productId mediaId brandId conceptId ' +
               'queuedAt renderedAt updatedAt')
       .sort({ updatedAt: -1 })
@@ -1953,6 +2093,15 @@ router.get('/render-activity', async (req, res) => {
               fellBackFrom: a.intentResolution.fellBackFrom || null,
               dropped: a.intentResolution.droppedRoles || [] }
           : null,
+        visionQc:      a.visionQc
+          ? { passed: a.visionQc.passed, finalAttempt: a.visionQc.finalAttempt,
+              skipped: !!a.visionQc.skipped, disabled: !!a.visionQc.disabled,
+              attempts: (a.visionQc.attempts || []).map(t => ({
+                attempt: t.attempt, pass: t.pass, summary: t.summary,
+                discarded: !!t.discarded, renderUrl: t.renderUrl || null,
+                discardedRenderUrl: t.discardedRenderUrl || null
+              })) }
+          : null,
         assetUrl:      a.renderUrl || null,
         error:         a.renderError?.message || (typeof a.renderError === 'string' ? a.renderError : null),
         attempts:      a.renderAttempts ?? null,
@@ -1997,6 +2146,76 @@ router.get('/render-activity', async (req, res) => {
   } catch (err) {
     console.error(`❌ GET /api/ads/render-activity failed: ${err.message}`);
     res.status(500).json({ error: err.message || 'render-activity failed' });
+  }
+});
+
+// POST /api/ads/video-ref-prewarm — wizard-triggered 9:16 reference reframe
+// prewarm. Reuses buildReferenceImages (same path as the paid video run)
+// so cold outpaints warm into the persistent reframe cache before
+// /generate. Responds 202 immediately; work is fire-and-forget.
+// Body: { brandId, productIds: [] } — brandId may also come from
+// x-brand-id (same as GET /render-activity).
+// Kill-switch: VIDEO_REF_PREWARM_ENABLED (default true).
+//
+// NOTE: must stay registered above the '/:id' routes.
+router.post('/video-ref-prewarm', async (req, res) => {
+  try {
+    // Default ON — only the literal string 'false' disables (same shape
+    // as REFRAME_ENABLED).
+    if (String(process.env.VIDEO_REF_PREWARM_ENABLED ?? 'true').toLowerCase() === 'false') {
+      return res.status(200).json({ accepted: false, reason: 'disabled' });
+    }
+
+    const brandId = (req.body && req.body.brandId) || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    try {
+      await assertBrandInTenant(brandId, req);
+    } catch (e) {
+      if (e.status === 404) return res.status(404).json({ error: e.message });
+      throw e;
+    }
+
+    const raw = (req.body && req.body.productIds) || [];
+    if (!Array.isArray(raw)) {
+      return res.status(400).json({ error: 'productIds must be an array of ObjectId strings' });
+    }
+
+    const {
+      prewarmVideoRefsForProducts,
+      PREWARM_MAX_PRODUCTS
+    } = require('../services/videoRefPrewarmService');
+
+    const seen = new Set();
+    const productIds = [];
+    for (const id of raw) {
+      const s = String(id || '');
+      if (!mongoose.isValidObjectId(s)) continue;
+      if (seen.has(s)) continue;
+      seen.add(s);
+      productIds.push(s);
+    }
+    if (productIds.length > PREWARM_MAX_PRODUCTS) {
+      const dropped = productIds.length - PREWARM_MAX_PRODUCTS;
+      productIds.length = PREWARM_MAX_PRODUCTS;
+      console.warn(
+        `⚠️  video-ref-prewarm: productIds capped at ${PREWARM_MAX_PRODUCTS} (dropped ${dropped})`
+      );
+    }
+
+    // 202 first — warm is opportunistic; never block the wizard on
+    // outpaint latency. Background work must never surface as unhandled
+    // rejection.
+    res.status(202).json({ accepted: true, products: productIds.length });
+
+    prewarmVideoRefsForProducts({ brandId: String(brandId), productIds })
+      .catch(err => console.warn(
+        `⚠️  video-ref-prewarm: background warm failed: ${err && err.message ? err.message : err}`
+      ));
+  } catch (err) {
+    console.error(`❌ POST /api/ads/video-ref-prewarm failed: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || 'video-ref-prewarm failed' });
+    }
   }
 });
 
@@ -2183,19 +2402,50 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 
 // POST /api/ads/:id/regenerate — re-run the render pipeline for this
 // ad with an operator refinement prompt, OR a verbatim prompt override.
-// Body: { prompt?, mode?, promptOverride? }.
-//   prompt:  a refinement note appended to the auto-composed prompt.
-//            Required UNLESS promptOverride is given. Up to ~1000 chars.
+// Body: { prompt?, mode?, promptOverride?, videoPromptRaw?,
+//          videoPromptGuidance?, imagePromptRaw? }.
+//   prompt:  a refinement note PREPENDED to the auto-composed prompt
+//            (video: OPERATOR REFINEMENT header inside buildVeoPrompt;
+//            image: refinement note into the live direct_image path).
+//            Required UNLESS one of the override fields below is given.
+//            Up to 1000 chars.
 //   mode:    'light' (default, video only — re-runs chrome + composite,
 //                     Veo unchanged) | 'full' (re-runs Veo too).
 //            Image ads always re-run the live direct_image renderer
-//            (gpt-image-2/edit); mode ignored.
+//            (gpt-image-2/edit); mode ignored. Note: adRegenerateService
+//            currently normalises video to full regardless of mode.
 //   promptOverride: { system, user } — image ads only. The operator
 //            edited the EXACT prompt shown in the Generation Details
 //            modal; this text replaces the auto-composed prompt
 //            verbatim instead of being appended as a refinement note.
 //            Image models have one flat prompt channel — system+user
 //            are concatenated (see resolveImagePromptOverride).
+//   videoPromptRaw: string ≤4000 — video only. FULL replacement of the
+//            canonical camera prompt for THIS regenerate call. Reuses
+//            the existing generateForAd raw branch (logs "canonical
+//            directives bypassed"). PASS-THROUGH — not written to Ad.
+//            Same length ceiling as the wizard (parsePhase3WizardFields).
+//   videoPromptGuidance: string ≤1000 — video only. PREPENDS as the
+//            operator refinement when `prompt` is empty and raw is not
+//            set. Same ceiling as the wizard. PASS-THROUGH — not written.
+//   imagePromptRaw: string ≤40000 — IMAGE ads only. FULL replacement of
+//            the auto-composed static prompt for THIS regenerate call, via
+//            the existing rawPromptOverride channel (which already accepts a
+//            bare string). The operator loads the exact prompt that produced
+//            the current render — Ad.imageGeneration.prompt, served by
+//            /generation-inspector — edits it, and sends it back.
+//            Cap is 40000, NOT the video 4000: the static prompt runs
+//            ~7.8-8.4k chars, so 4000 would truncate it (see
+//            adRegenerateService.IMAGE_PROMPT_RAW_MAX).
+//            MUTUALLY EXCLUSIVE with promptOverride — both target the same
+//            slot, so sending both 400s rather than picking a silent winner.
+//            Replaces, so it DROPS product-fidelity, the exact-copy contract
+//            and the safe-box geometry prose unless the operator keeps them;
+//            gen size, delivery crop, reference stack and logo compositing
+//            still come from the surface. When set, `prompt` is ignored (the
+//            override wins inside renderDirectImage).
+//            PASS-THROUGH — not written to the Ad, so the next regenerate
+//            with an empty field reverts to the auto-composed prompt.
 // Returns 202 with a poll target. Frontend polls
 // /api/catalog/:productId/ads-detail (or this ad's generation-inspector)
 // watching ad.regenerating.
@@ -2210,6 +2460,8 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       throw e;
     }
 
+    const regen = require('../services/adRegenerateService');
+
     const MAX_OVERRIDE_LEN = 40000;
     let promptOverride = null;
     if (req.body?.promptOverride && typeof req.body.promptOverride === 'object') {
@@ -2222,8 +2474,44 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       promptOverride = { system: sys, user: usr };
     }
 
+    // Video camera-prompt overrides — same caps as the wizard body parser.
+    // Empty/whitespace collapses to null inside parseRegenVideoPromptFields.
+    const videoFields = regen.parseRegenVideoPromptFields(req.body || {});
+    if (!videoFields.ok) {
+      return res.status(400).json({ error: videoFields.error });
+    }
+    const { videoPromptRaw, videoPromptGuidance } = videoFields;
+
+    // Static raw prompt — full replacement of the auto-composed image prompt.
+    // Cap is 40000 (IMAGE_PROMPT_RAW_MAX), not the video 4000: the prompt this
+    // replaces is ~8k chars. Whitespace-only collapses to null inside.
+    const imageFields = regen.parseRegenImagePromptField(req.body || {});
+    if (!imageFields.ok) {
+      return res.status(400).json({ error: imageFields.error });
+    }
+    const { imagePromptRaw } = imageFields;
+
+    // Both imagePromptRaw and promptOverride land in the SAME full-replace slot
+    // (runImage's promptOverride argument → resolveImagePromptOverride). Sending
+    // both is a client bug: silently picking a winner would hide which text the
+    // billable submit actually used.
+    if (imagePromptRaw && promptOverride) {
+      return res.status(400).json({
+        error: 'send either imagePromptRaw or promptOverride, not both — they both replace the whole image prompt'
+      });
+    }
+
     const prompt = String(req.body?.prompt || '').trim();
-    if (!prompt && !promptOverride) return res.status(400).json({ error: 'prompt or promptOverride is required' });
+    // Gate: at least ONE of prompt / promptOverride / videoPromptRaw /
+    // videoPromptGuidance. Empty regenerate still 400s. Uses the pure
+    // helper so the offline harness pins the same predicate.
+    if (!regen.regenerateHasIntent({
+      prompt, promptOverride, videoPromptRaw, videoPromptGuidance, imagePromptRaw
+    })) {
+      return res.status(400).json({
+        error: 'prompt, promptOverride, videoPromptRaw, videoPromptGuidance, or imagePromptRaw is required'
+      });
+    }
     if (prompt.length > 1000) return res.status(400).json({ error: 'prompt is too long (max 1000 chars)' });
     const mode = req.body?.mode === 'full' ? 'full' : 'light';
 
@@ -2240,7 +2528,6 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
       videoModel = slug;
     }
 
-    const regen = require('../services/adRegenerateService');
     let ad;
     try {
       ad = await regen.preflight(req.params.id, brandId);
@@ -2249,6 +2536,19 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     }
     if (promptOverride && ad.kind !== 'image') {
       return res.status(400).json({ error: 'promptOverride is only supported for image ads' });
+    }
+    // Video-only fields on an image ad are a client bug, not a silent no-op.
+    if ((videoPromptRaw || videoPromptGuidance) && ad.kind !== 'video') {
+      return res.status(400).json({
+        error: 'videoPromptRaw / videoPromptGuidance are only supported for video ads'
+      });
+    }
+    // ...and the mirror: a raw IMAGE prompt on a video ad would be silently
+    // dropped by runVideoFull, which is worse than a 400.
+    if (imagePromptRaw && ad.kind !== 'image') {
+      return res.status(400).json({
+        error: 'imagePromptRaw is only supported for image ads'
+      });
     }
     const requestedBy = req.user?.userId || req.user?.email || null;
 
@@ -2261,8 +2561,10 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     });
 
     setImmediate(() => {
-      regen.regenerateAd({ ad, prompt, mode, requestedBy, videoModel, promptOverride })
-        .catch(err => console.error(`❌ regenerate setImmediate crash: ${err.message}`));
+      regen.regenerateAd({
+        ad, prompt, mode, requestedBy, videoModel, promptOverride,
+        videoPromptRaw, videoPromptGuidance, imagePromptRaw
+      }).catch(err => console.error(`❌ regenerate setImmediate crash: ${err.message}`));
     });
   } catch (err) {
     console.error('regenerate request failed:', err);
@@ -2559,6 +2861,9 @@ router.get('/:id/generation-inspector', async (req, res) => {
         // Which intent ran, whether it fell back, what got sacrificed to the
         // density budget. See models/Ad.js for the full field description.
         intentResolution:      ad.intentResolution || null,
+        // Post-render vision QC (original product vs finished render).
+        // Includes per-attempt scores/findings and discarded paid render URLs.
+        visionQc:              ad.visionQc || null,
         // Per-stage wall time for THIS render (derive/render/upload ms) — the
         // direct answer to "why is this one slow" without a log search.
         renderStages:          ad.renderStages || null

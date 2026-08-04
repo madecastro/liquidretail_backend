@@ -27,9 +27,19 @@ const MODEL_RATES = Object.freeze({
   'claude-opus-4-7':   { input: 15.00, output: 75.00, cachedInput: 1.50 },
   'claude-sonnet-4-6': { input: 3.00,  output: 15.00, cachedInput: 0.30 },
   'claude-haiku-4.5':  { input: 1.00,  output: 5.00,  cachedInput: 0.10 },
-  // Google (https://ai.google.dev/pricing)
+  // Google direct (https://ai.google.dev/gemini-api/docs/pricing)
+  // NOTE (2026-08-03): re-read live while ledgering the grounded-search path.
+  // 'gemini-2.5-pro' output is ALSO stale here — the live page says $10.00
+  // (<=200k prompts), not 5.00, and caching is 0.125, not 0.31. Left untouched
+  // deliberately: it is outside this change and moving it silently re-prices
+  // every layoutInputService row. Tracked separately; do not treat 5.00 as
+  // confirmed.
   'gemini-2.5-pro':    { input: 1.25,  output: 5.00,  cachedInput: 0.31 },
-  'gemini-2.5-flash':  { input: 0.10,  output: 0.40,  cachedInput: 0.025 },
+  // Was 0.10/0.40/0.025 — those are Flash-LITE numbers, so every direct
+  // gemini-2.5-flash row understated input 3x and output 6x. The sibling
+  // Atlas slug below already carried the correct 0.30/2.50. Output price
+  // INCLUDES thinking tokens, which is why extractUsage adds thoughtsTokenCount.
+  'gemini-2.5-flash':  { input: 0.30,  output: 2.50,  cachedInput: 0.03 },
   // Atlas Cloud gateway IDs (https://api.atlascloud.ai/api/v1/models —
   // pricing fields verified live 2026-07-21). Same underlying vendors,
   // provider-prefixed slugs.
@@ -68,6 +78,39 @@ const warnedUnknownModels = new Set();
 // rough cost based on default-quality assumption.
 const VISION_IMAGE_COST_PER_IMAGE_USD = 0.005;   // ~mid-range estimate
 
+// Google Search grounding surcharge — billed PER REQUEST on top of tokens,
+// not per token. Live figure 2026-08-03
+// (https://ai.google.dev/gemini-api/docs/pricing), identical for 2.5 Flash and
+// 2.5 Pro: "1,500 RPD (free) … then $35 / 1,000 grounded prompts".
+//
+// $0.035 a call against roughly $0.004 of tokens for a 1.5k-token grounded
+// pass — so omitting it understates a grounded path by ~10x. That is the whole
+// reason this constant exists; token math alone is not a ledger for these calls.
+//
+// UNIT — per PROMPT, and that is model-generation-specific. Google, verbatim
+// (ai.google.dev/gemini-api/docs/google-search): with Gemini 3 "your project is
+// billed for each search query that the model decides to execute", but "when you
+// use search grounding with Gemini 2.5 or older models, your project is billed
+// per prompt." We are on 2.5, so one grounded request == one billable unit.
+// MOVING TO A GEMINI 3 MODEL BREAKS THAT ASSUMPTION — a single prompt can then
+// bill several queries, and callers would need to count
+// groundingMetadata.webSearchQueries instead of passing 1.
+//
+// TWO KNOWN APPROXIMATIONS, both erring toward never understating:
+//  · It is DECLARED, not confirmed. A caller sets it because it enabled the
+//    google_search tool, not because the response proved a search ran. A prompt
+//    the model answers without searching still ledgers the surcharge.
+//  · Inside the free 1,500/day allowance the true marginal cost is $0, so this
+//    overstates until that is exhausted. Set GEMINI_GROUNDING_COST_USD=0 to
+//    ledger the free tier honestly.
+// Rows stamp costSource:'estimated' either way.
+const GROUNDED_SEARCH_COST_PER_REQUEST_USD = (() => {
+  const raw = process.env.GEMINI_GROUNDING_COST_USD;
+  if (raw === undefined || String(raw).trim() === '') return 0.035;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 0.035;
+})();
+
 async function trackLlmCall(meta, fn) {
   const t0 = Date.now();
   let result, status = 'ok', errorMessage = null;
@@ -86,12 +129,14 @@ async function trackLlmCall(meta, fn) {
   // usage.{input_tokens, output_tokens, cache_read_input_tokens?}; Gemini
   // returns usageMetadata.{promptTokenCount, candidatesTokenCount}.
   const usage = extractUsage(result, meta.provider);
-  const { costUsd, inputTokens, outputTokens, cachedInputTokens } = computeCost(meta.model, usage, meta.visionImages || 0);
+  const { costUsd, inputTokens, outputTokens, cachedInputTokens } =
+    computeCost(meta.model, usage, meta.visionImages || 0, meta.groundedRequests || 0);
 
   await persistCost({
     ...meta,
     inputTokens, outputTokens, cachedInputTokens,
     visionImages: meta.visionImages || 0,
+    groundedRequests: meta.groundedRequests || 0,
     costUsd,
     durationMs: Date.now() - t0,
     status
@@ -181,6 +226,7 @@ async function persistCost(record) {
       outputTokens:record.outputTokens || 0,
       cachedInputTokens: record.cachedInputTokens || 0,
       visionImages:record.visionImages || 0,
+      groundedRequests: record.groundedRequests || 0,
       costUsd:     record.costUsd || 0,
       durationMs:  record.durationMs || 0,
       status:      status,
@@ -236,31 +282,58 @@ function extractUsage(result, provider) {
     };
   }
   if (provider === 'gemini') {
+    // Raw generativelanguage REST puts this on the response BODY, so a caller
+    // wrapping axios must return `res.data` (not the axios response) or every
+    // token count silently reads 0. The `.response` path covers the Google SDK.
     const u = result.usageMetadata || result.response?.usageMetadata || {};
     return {
-      input:  u.promptTokenCount     || 0,
-      output: u.candidatesTokenCount || 0,
+      // toolUsePromptTokenCount is reported separately from promptTokenCount.
+      // HONEST CAVEAT: Google's docs do NOT explicitly state that search-injected
+      // tool context is billed as input, and totalTokenCount is documented as
+      // prompt + thoughts + candidates without naming it. Counted here as the
+      // never-understate choice; it is ~1% of a grounded row ($0.0003 per 1k
+      // tokens against a $0.035 grounding surcharge), so it cannot distort a
+      // report either way. Drop it if Google ever documents it as free.
+      input:  (u.promptTokenCount || 0) + (u.toolUsePromptTokenCount || 0),
+      // thoughtsTokenCount is reported SEPARATELY from candidatesTokenCount but
+      // is billed at the output rate ("Output price includes thinking tokens").
+      // Counting candidates alone understates every thinking-enabled call —
+      // which on 2.5 models is the default unless thinkingBudget is 0.
+      output: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0),
+      // promptTokenCount already includes the cached portion, so the
+      // full-vs-cached split in computeCost stays correct.
       cached: u.cachedContentTokenCount || 0
     };
   }
   return { input: 0, output: 0, cached: 0 };
 }
 
-function computeCost(model, usage, visionImages) {
+function computeCost(model, usage, visionImages, groundedRequests) {
+  // Per-request surcharges are independent of the token table — keep them out
+  // here so an unknown/renamed model id cannot zero them too.
+  const surcharges =
+    ((visionImages || 0) * VISION_IMAGE_COST_PER_IMAGE_USD) +
+    ((groundedRequests || 0) * GROUNDED_SEARCH_COST_PER_REQUEST_USD);
+
   const rate = MODEL_RATES[model];
   if (!rate) {
     if (model && !warnedUnknownModels.has(model)) {
       warnedUnknownModels.add(model);
-      console.warn(`💰 costTracker: no rate for model '${model}' — logging $0 (add it to MODEL_RATES)`);
+      console.warn(`💰 costTracker: no rate for model '${model}' — tokens log $0 (add it to MODEL_RATES)`);
     }
-    return { costUsd: 0, inputTokens: usage.input, outputTokens: usage.output, cachedInputTokens: usage.cached };
+    // Previously returned a hard 0, which also discarded any per-request
+    // surcharge — a $0.035 grounded call behind a renamed slug ledgered as free.
+    return {
+      costUsd: Number(surcharges.toFixed(6)),
+      inputTokens: usage.input, outputTokens: usage.output, cachedInputTokens: usage.cached
+    };
   }
   const fullInput = Math.max(0, usage.input - (usage.cached || 0));
   const usd = (
     (fullInput        / 1_000_000) * rate.input +
     (usage.output     / 1_000_000) * rate.output +
     ((usage.cached || 0) / 1_000_000) * rate.cachedInput
-  ) + (visionImages * VISION_IMAGE_COST_PER_IMAGE_USD);
+  ) + surcharges;
   return {
     costUsd: Number(usd.toFixed(6)),
     inputTokens: usage.input,
@@ -275,5 +348,6 @@ module.exports = {
   recordFlatCost,
   reconcileCost,
   MODEL_RATES,
-  VISION_IMAGE_COST_PER_IMAGE_USD
+  VISION_IMAGE_COST_PER_IMAGE_USD,
+  GROUNDED_SEARCH_COST_PER_REQUEST_USD
 };

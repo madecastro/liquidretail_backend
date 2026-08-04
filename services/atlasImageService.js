@@ -51,9 +51,24 @@ function positiveTimeout(value, fallback) {
 // `priceCache` was populated with nothing, and `?? 0` meant **every image generation
 // ledgered $0.00**. Silent, because a $0 cost is indistinguishable from a free model.
 //
-// The real shape is `price.actual.base_price`, a STRING. `actual` is what we pay
-// (`origin` is list, `discount` the percentage). Verified live: gpt-image-1.5 = 0.008,
+// The real shape is `price.actual.base_price`, a STRING (`origin` is list,
+// `discount` the percentage). Verified live: gpt-image-1.5 = 0.008,
 // nano-banana-2/edit = 0.08.
+//
+// ⚠️ CORRECTED 2026-08-03 — `base_price` IS NOT WHAT WE PAY. This comment, CLAUDE.md
+// §2 and docs/ATLAS.md all used to say `actual` is the amount charged. It is a BASE.
+// MEASURED against 40 live edits: `openai/gpt-image-2/edit` publishes
+// base_price 0.01 and charged **$0.07173** every time (7.17x); the
+// `-developer` variant publishes 0.005 and charged **$0.03586** — so the
+// discount is real, but the multiplier applies on top of both. The multiplier is
+// NOT derivable from the catalog and almost certainly varies by size/quality/model,
+// so do not hardcode 7.17 and do not extrapolate it to another model.
+//
+// What that means for this map: it produces a floor-grade ESTIMATE, good enough to
+// stop a $0.00 ledger row, and nothing more. **The only authoritative figure is
+// `price` on the settled prediction** — see scheduleCostReconcile below, which is
+// what upgrades the row and flips costSource off 'estimated'. Any budgeting,
+// margin or per-ad cost claim must come from reconciled rows, never from here.
 //
 // Two traps kept in mind here:
 //   • 123 of 444 entries have NO `base_price` — they are per-token LLM models shaped
@@ -132,9 +147,22 @@ async function uploadBuffer(buf, filename = 'image.png', mime = 'image/png', tim
  * unreconciled row is queryable rather than invisible.
  */
 function scheduleCostReconcile(predictionId, attempt = 0) {
-  const delays = [3000, 10_000, 30_000];
+  /**
+   * WIDENED 2026-08-03. Was [3000, 10_000, 30_000] — ~43s total, and that was not
+   * enough often enough to matter. Measured over 40 live edits: only **7 of 38**
+   * predictions had published a `price` by the time the image came back, so the
+   * reconcile is not a rare top-up, it is the normal path for most rows. Giving up
+   * at 43s left the majority on a base_price estimate that is ~7x low (see the
+   * pricing note above), which is how a static ad appears to cost $0.01.
+   *
+   * Owner instruction, 2026-08-03: the actual price must always be read back from
+   * Atlas after generation. These are unauthenticated-cost GET polls on a detached,
+   * unref'd timer — widening them cannot delay or fail a render, so the budget is
+   * cheap to extend and the only cost of the last attempt is one HTTP read.
+   */
+  const delays = [3000, 10_000, 30_000, 60_000, 120_000, 300_000];
   if (attempt >= delays.length) {
-    console.warn(`   ⚠️  atlasImage: cost for ${predictionId} never published — row stays estimated`);
+    console.warn(`   ⚠️  atlasImage: cost for ${predictionId} never published after ${delays.length} reads — row stays estimated (base_price floor, ~7x LOW; do not treat as spend)`);
     return;
   }
   setTimeout(async () => {
@@ -437,7 +465,12 @@ function buildParams(model, { prompt, size, quality, images, inputFidelity, aspe
     if (aspectRatio) p.aspect_ratio = aspectRatio;
     return p;
   }
-  // gpt-image family: size enum 1024x1024|1024x1536|1536x1024, quality low|medium|high.
+  // gpt-image family: `size` is a WxH string. The live schema enum lists 14
+  // presets (not the 3 this comment used to claim), and gpt-image-2 additionally
+  // documents arbitrary sizes divisible by 16, aspect 1:3–3:1, max 3840x2160 —
+  // though that clause is unproven on the Atlas gateway. Passed through below
+  // with NO clamp, so callers own size legality; see staticAdIntents.GEN_SIZES.
+  // quality low|medium|high.
   const p = { prompt };
   if (size) p.size = size;
   if (quality) p.quality = quality;

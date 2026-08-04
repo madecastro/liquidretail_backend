@@ -86,8 +86,25 @@ async function persistOrphans({ signal, role }) {
 
   try {
     const [adRes, runRes] = await Promise.all([
+      // RECEIPT-AWARE (2026-08-04). This requeue runs on EVERY SIGTERM, so it
+      // fires on every deploy — which makes it the more dangerous of the two
+      // requeue sites (the worker reaper only sweeps every 15 minutes).
+      //
+      // An ad holding a spend receipt (Ad.veoPredictionId for video,
+      // imageGeneration.predictionId for static) has ALREADY been billed —
+      // the provider charged at submit. Requeuing it means the next run
+      // SUBMITS AGAIN and we pay twice for a generation Atlas may have
+      // already delivered. Measured today: a 411s Omni master completed at
+      // 17:27:09 and this path requeued its run one second later.
+      //
+      // Receipt-FREE ads are requeued exactly as before: they were never
+      // billed, so re-running them costs the one charge that was always owed.
+      // Receipt-holding ads stay in `rendering` on purpose — honest (the
+      // outcome is genuinely unknown until the receipt is polled), still
+      // visible to ALERT_RENDERING_STALE_MIN, and the receipt survives so the
+      // asset can be recovered for free instead of re-bought.
       Ad.updateMany(
-        { campaignRunIds: { $in: s.runIds }, status: 'rendering' },
+        receiptFree({ campaignRunIds: { $in: s.runIds }, status: 'rendering' }),
         { $set: { status: 'queued', updatedAt: now } }
       ),
       CampaignRun.updateMany(

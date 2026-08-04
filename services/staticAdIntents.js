@@ -55,11 +55,49 @@
 const pf = require('./platformFormats');
 
 // ── generation sizes + surface geometry ─────────────────────────────────
-// The only sizes the edit endpoint accepts. Verified live, not assumed.
+// gpt-image-2/edit size contract: the SCHEMA is operative (the model README is
+// stale and still lists only three sizes). The schema enum has fourteen WxH
+// values, and for gpt-image-2 the description further allows arbitrary
+// WIDTHxHEIGHT strings where both dims are divisible by 16, aspect is between
+// 1:3 and 3:1, and max is 3840x2160.
+//
+// That arbitrary-size clause is spliced from OpenAI's own docs and carries an
+// unpublished "must also satisfy the model's current pixel and edge limits", so
+// it was NOT taken on trust — the failure mode we feared was a silent coercion
+// to the 1024x1024 default, which would hand a SQUARE frame to a 4:5 surface and
+// then centre-crop it. It was PROBED instead, one billable submit, 2026-08-03:
+// size=1088x1360 returned exactly 1088x1360 (aspect 0.800000), prediction
+// 65d1931505bc4620bcf0d7efcdd7aff9. So the gateway does honour arbitrary
+// div-16 sizes on this model.
+//
+// RULE ANYWAY: a size goes in this table only if it is an enum member OR has
+// been probed live, and scripts/verifyStaticSafeBox.js S4 enforces exactly that
+// with the probe evidence recorded alongside. Do not add a size on the strength
+// of the schema prose alone.
+//
+// We keep a SMALL curated table rather than the whole enum: every extra entry
+// can change least-crop selection for some aspect, and every call is billable.
+// Adding a size is a cost and geometry decision, not free.
+//
+// PREVIOUS WRONG TABLE: only the three legacy sizes, above the comment "The
+// only sizes the edit endpoint accepts. Verified live, not assumed." — false for
+// this model. It forced every 9:16 surface onto 1024x1536 and then centre-cropped
+// 80px off EACH SIDE, straight through the typeset CTA and edge copy the model
+// had just painted. platformFormats.js:394-403 already explains why
+// META_STATIC_FANOUT cannot crop one master into three aspects (copy is baked
+// into the pixels by the model); the identical hazard was still happening INSIDE
+// each individual generation. 1152x2048 is on the schema enum, is exactly 9:16,
+// and is proven live on this account (a real submit returned exactly 1152x2048).
+//
+// ORDER IS LOAD-BEARING. chooseGenSize keeps the first entry on a loss tie
+// (`loss < best.loss`, strict — not `<=`), so the legacy sizes stay ahead of any
+// later equal-loss entry. Do not reorder casually.
 const GEN_SIZES = [
   { w: 1024, h: 1024 },
   { w: 1024, h: 1536 },
-  { w: 1536, h: 1024 }
+  { w: 1536, h: 1024 },
+  { w: 1152, h: 2048 }, // enum member, exact 9:16; absent before → 15.6% side crop
+  { w: 1088, h: 1360 }  // PROBED non-enum, exact 4:5; absent before → 16.7% top/bottom crop
 ];
 
 const EDGE_MARGIN_PCT = 6; // convention, ours — not a platform reserve
@@ -90,6 +128,30 @@ function aspectOf(key) {
   return { str: a, value: w / h };
 }
 
+/**
+ * Percent of `total`, rounded INWARD toward the frame centre — ceil for a
+ * low edge (left/top), floor for a high edge (right/bottom).
+ *
+ * The previous `+((v / total) * 100).toFixed(1)` rounded HALF-UP in both
+ * directions, and because `right` is structurally `100 - left` the pair always
+ * rounded the SAME way — so it was coupled, not coincidental. On a crop
+ * boundary it rounded OUTWARD, into the band the geometry prose had just told
+ * the model would be destroyed: 8.3% of 1536 is 127.488px against a cut line at
+ * exactly 128, and 7.8% of 1024 is 79.872px against a cut at 80. Sub-pixel, but
+ * it meant the emitted box was provably not inside the region it described.
+ *
+ * Works in tenths-of-a-percent integers so the guard is exact. The 1e-9 nudge
+ * absorbs pure float dust on values that are mathematically whole tenths —
+ * 69.12/1152 is exactly 6%, yet in IEEE754 it lands at 60.000000000000014
+ * tenths, and a naive ceil would report 6.1% and quietly tighten the box.
+ */
+function pctInward(v, total, side) {
+  const tenths = (v / total) * 1000;
+  return side === 'lo'
+    ? Math.ceil(tenths - 1e-9) / 10
+    : Math.floor(tenths + 1e-9) / 10;
+}
+
 function computeSurface(key) {
   const aspect = aspectOf(key);
   const canvas = pf.canvasForPlatformFormat(key);
@@ -109,20 +171,90 @@ function computeSurface(key) {
   const topReservePx = topReserveFrac * keptH;
   const botReservePx = botReserveFrac * keptH;
 
-  // Text-safe box in generated pixels, before the margin convention.
-  let x0 = cropLeftPx;
-  let x1 = cropLeftPx + keptW;
-  let y0 = cropTopPx + topReservePx;
-  let y1 = cropTopPx + keptH - botReservePx;
+  // Text-safe box in generated pixels.
+  //
+  // PREVIOUS WRONG VERSION — the margin was applied as
+  //   x0 = Math.max(cropLeftPx, marginPx)
+  //   y0 = Math.max(cropTopPx + topReservePx, marginPx)
+  // measured from the GENERATED origin. That treats the crop band and our edge
+  // margin as ALTERNATIVES when they are ADDITIVE. marginPx was 61.44px on every
+  // live surface and the crop band was always larger — 128px on 4:5, 80px on the
+  // old 9:16 — so `Math.max` discarded the margin entirely and the safe box
+  // edges BECAME the crop lines. The live path emitted, verbatim: "The top and
+  // bottom 128px of what you generate WILL BE CUT AWAY and never seen. EVERY
+  // element ... must sit inside the box from 6% to 94% of width and 8.3% to
+  // 91.7% of height" — and 8.3% of 1536 is 127.5px. The model was told text may
+  // sit flush against pixels the same paragraph called destroyed. Only 1:1
+  // escaped, because its crop is zero.
+  //
+  // The proof this was real in DELIVERED pixels needs no model compliance and no
+  // billable call: the logomark is composited by us from this same box
+  // (directImageRenderService.logoPlacementFor). Measured before the fix, the
+  // clamped box's right edge equalled the frame width on Stories and its bottom
+  // edge equalled the frame height on 4:5, so the brand's logomark shipped FLUSH
+  // to the delivered edge — 0px gap, for any logo size. That is the same defect
+  // class the logo-placement docstring in directImageRenderService claims to
+  // have fixed, arrived at by different arithmetic.
+  //
+  // A quieter twin of the same conflation, also fixed here: marginPx was based
+  // on Math.min(gen.w, gen.h) — the GENERATED short side, which includes pixels
+  // that are about to be destroyed and never seen. It is now based on the KEPT
+  // short side, i.e. the canvas that actually exists by the time anyone looks at
+  // the ad. Note the second-order effect: on a heavily cropped landscape frame
+  // this makes the absolute margin SMALLER (pmax 16:9 goes 61.44 → 51.84) even
+  // as its vertical margin goes from zero to real. That is correct under the
+  // "margin against the canvas that will be seen" rule, not a free tightening.
+  //
+  // With 1152x2048 and 1088x1360 in the table, EVERY live static surface now
+  // generates at its exact delivery aspect, so cropPx is all-zero and this
+  // arithmetic reduces to reserve + margin. The crop terms are kept rather than
+  // deleted because they are still load-bearing for the frozen 16:9 surface, and
+  // because extractFor remains the defence against a model that returns an
+  // off-size frame. A future surface with an awkward aspect will crop again.
+  const marginPx = (EDGE_MARGIN_PCT / 100) * Math.min(keptW, keptH);
 
-  // Edge margin, applied against the generated frame's short side.
-  const marginPx = (EDGE_MARGIN_PCT / 100) * Math.min(gen.w, gen.h);
-  x0 = Math.max(x0, marginPx);
-  x1 = Math.min(x1, gen.w - marginPx);
-  y0 = Math.max(y0, marginPx);
-  y1 = Math.min(y1, gen.h - marginPx);
+  let x0 = cropLeftPx + marginPx;
+  let x1 = cropLeftPx + keptW - marginPx;
+  let y0 = cropTopPx + topReservePx + marginPx;
+  let y1 = cropTopPx + keptH - botReservePx - marginPx;
 
-  const pct = (v, total) => +( (v / total) * 100 ).toFixed(1);
+  // Degenerate guard. A tiny kept region, or a platform reserve larger than the
+  // kept band, can invert the box once the margin is applied. Drop the margin
+  // rather than emit left > right: a zero-margin box is still geometrically
+  // honest, an inverted one is nonsense the model would have to guess at. Do not
+  // "fix" this by collapsing to the midpoint — that pins every element onto a
+  // single pixel row.
+  if (x0 >= x1) {
+    x0 = cropLeftPx;
+    x1 = cropLeftPx + keptW;
+  }
+  if (y0 >= y1) {
+    y0 = cropTopPx + topReservePx;
+    y1 = cropTopPx + keptH - botReservePx;
+    // The reserve alone can still invert it (a reserve taller than the kept
+    // band). Fall all the way back to the full kept band.
+    if (y0 >= y1) {
+      y0 = cropTopPx;
+      y1 = cropTopPx + keptH;
+    }
+  }
+
+  // Safety net — never emit a coordinate outside the generated frame.
+  x0 = Math.max(0, Math.min(x0, gen.w));
+  x1 = Math.max(0, Math.min(x1, gen.w));
+  y0 = Math.max(0, Math.min(y0, gen.h));
+  y1 = Math.max(0, Math.min(y1, gen.h));
+
+  // The clamp itself can collapse a NON-inverted pair: if x0 and x1 both sit on
+  // the same side of [0, gen.w] — both negative, or both past the edge — they map
+  // to the same boundary and the box becomes zero-width. The guards above only
+  // catch x0 >= x1 BEFORE clamping, so they cannot see this. Unreachable from
+  // today's centred-crop arithmetic (every coordinate is already in range), but
+  // "the guards above prevent a degenerate box" would otherwise be a claim the
+  // code does not actually make. A zero-width box tells the model to put every
+  // element on one pixel column, which is worse than no constraint at all.
+  if (x0 >= x1) { x0 = 0; x1 = gen.w; }
+  if (y0 >= y1) { y0 = 0; y1 = gen.h; }
 
   return {
     key,
@@ -133,7 +265,12 @@ function computeSurface(key) {
     cropPx: { left: cropLeftPx, right: cropLeftPx, top: cropTopPx, bottom: cropTopPx },
     platformReservePx: { top: Math.round(topReservePx), bottom: Math.round(botReservePx) },
     platformReserveDeclared: { top: safe.top || 0, bottom: safe.bottom || 0, left: safe.left ?? null, right: safe.right ?? null },
-    box: { left: pct(x0, gen.w), right: pct(x1, gen.w), top: pct(y0, gen.h), bottom: pct(y1, gen.h) },
+    box: {
+      left:   pctInward(x0, gen.w, 'lo'),
+      right:  pctInward(x1, gen.w, 'hi'),
+      top:    pctInward(y0, gen.h, 'lo'),
+      bottom: pctInward(y1, gen.h, 'hi')
+    },
     lossPct: +(gen.loss * 100).toFixed(1)
   };
 }
@@ -153,7 +290,14 @@ function geometryBlock(s) {
     lines.push(`${s0.charAt(0).toUpperCase()}${s0.slice(1)} of what you generate WILL BE CUT AWAY and never seen.`);
   }
   if (s.platformReservePx.top || s.platformReservePx.bottom) {
-    lines.push(`The platform then covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the surviving image with its own interface.`);
+    // "then … the surviving image" only parses when a cut sentence preceded it.
+    // Now that every live static surface generates at its exact aspect there is
+    // no cut, and the old wording left the model reading a sequel to a sentence
+    // that was never emitted — and implying a crop that is not happening.
+    const cut = s.cropPx.top || s.cropPx.left;
+    lines.push(cut
+      ? `The platform then covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the surviving image with its own interface.`
+      : `The platform covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the frame with its own interface.`);
   }
   // Element-agnostic on purpose. Naming "the CTA" here asserted a CTA exists,
   // which on Stories (platform supplies it) contradicted the absence list — the
@@ -259,9 +403,27 @@ function absences(d, { rendersQuote, rendersRating, rendersBadge }, dropped = []
     `no CTA button, no "shop now", "learn more", "swipe up", "link in bio", arrow or tap affordance of any kind — ${policy.ctaNote || 'the platform supplies it'}`);
   out.push('no price, currency symbol, discount, saving, offer or countdown');
   // "no brand wordmark" fought "reproduce any branding printed on the product".
-  // Separate the two: the garment's own mark is product identity, not ad chrome.
-  out.push('no product name, website, hashtag or small print');
-  out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo already printed on the garment itself stays exactly as it is, but nothing new is drawn');
+  // Separate the two: the product's own mark is product identity, not ad chrome.
+  // "garment" was apparel-specific wording on a multi-category catalog, and the
+  // carve-out has to name the product generically or a bottle's own label reads
+  // as ad chrome to be removed. Gated with the rest of the hardening so the
+  // flag-off arm is the exact prompt that was measured — see FIDELITY_HARDENING.
+  if (FIDELITY_HARDENING) {
+    out.push('no product name, website, hashtag or small print added anywhere in the scene — wording already printed on the product itself is not an addition and stays exactly as the reference shows it');
+    out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo, wordmark or label already printed on the product itself stays exactly as it is, reproduced from the reference rather than redrawn, but nothing new is drawn');
+    /**
+     * Owner-supplied catch-all, 2026-08-03. Deliberately phrased as "invent"
+     * and "not given to you", NOT as a flat ban on the nouns: several of these
+     * ARE supplied on some intents (a rating, a badge), and the conditional
+     * rules above already permit exactly those and fence the rest. A blanket
+     * "no ratings" line here would contradict the supplied rating string and
+     * undo the tuned star-row rule above it.
+     */
+    out.push('no award, laurel, ribbon, seal, guarantee, warranty or money-back claim, QR code, barcode, legal or regulatory small print, or promotional claim of any kind — and nothing else you were not given: if a word, numeral or mark is not in the text above, it does not belong in the image');
+  } else {
+    out.push('no product name, website, hashtag or small print');
+    out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo already printed on the garment itself stays exactly as it is, but nothing new is drawn');
+  }
   return out;
 }
 
@@ -379,6 +541,105 @@ function applyDensity(text, spec, policy) {
   return { kept, dropped };
 }
 
+/**
+ * PRODUCT-FIDELITY HARDENING — kill switch, default ON.
+ *
+ * `false` restores a **byte-identical** pre-hardening prompt: the one-sentence
+ * `LEGACY_PRODUCT_FIDELITY` paragraph, and the product-own-print carve-outs in
+ * `absences` and `textBlock` reverted too. That completeness is the point — a
+ * flag that reverts "most of" the change gives an A/B whose control arm is not
+ * the arm that was measured, so the comparison proves nothing.
+ *
+ * It exists because of the precedent in CLAUDE.md §00: PR #61 hardened the
+ * VIDEO prompt the same way and the owner rolled all three parts back —
+ * *"This is creating additional hallucinations and the previous output was
+ * better."* Prompt hardening is not self-evidently an improvement on this
+ * stack, and this path has a measured baseline worth being able to return to
+ * without a deploy (see `PRODUCT_FIDELITY` below).
+ */
+const FIDELITY_HARDENING = process.env.STATIC_PROMPT_FIDELITY_HARDENING !== 'false';
+
+/** The exact pre-2026-08-03 wording. Do not edit — it is the A/B control arm. */
+const LEGACY_PRODUCT_FIDELITY = `The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.`;
+
+/**
+ * PRODUCT FIDELITY — the anti-drift block. Owner-directed, 2026-08-03.
+ *
+ * Replaces the single hedged sentence above, which was losing to the creative
+ * instructions below it: renders came back with hallucinated logos, shifted
+ * colours, altered fit and "improved" construction. The wording is absolute and
+ * front-loaded because the failure mode was not the model missing the
+ * instruction — it was the model resolving a conflict between accuracy and
+ * styling in favour of styling, so the block has to state its own precedence.
+ *
+ * READ THIS BEFORE CITING THE ~1-IN-3 COMPETITOR-MARK DEFECT AS ITS
+ * JUSTIFICATION. CLAUDE.md §2 "Known open" records that defect and says the fix
+ * is **measure-and-reject, not prompt tuning** — `adVisionQcService` is that
+ * fix and it remains the real one. This block is owner-directed hardening on
+ * top, not a replacement for it, and it must not be described as closing that
+ * known-open. If the next render sample still shows competitor marks, that is
+ * the expected outcome, not evidence this block was written wrong.
+ *
+ * Five things in here are load-bearing and must not be trimmed as redundant:
+ *   1. the "do not infer from category or brand prior" clause — the tree emblem
+ *      that read as Timberland on an Allbirds shoe is the model rendering what
+ *      the CATEGORY usually looks like, not what the reference shows;
+ *   2. the carve-out that the product's OWN printing is product identity, which
+ *      has to be stated positively or the no-added-text rules erase the label
+ *      (matching carve-outs live in `absences` and in `textBlock` below);
+ *   3. the WHAT MAY CHANGE list, which keeps this from being read as a ban on
+ *      creative staging — without it the model returns a catalogue shot, and the
+ *      whole point of this path is a new scene around the same item;
+ *   4. the sentence naming the reserved logo corner. The block claims to outrank
+ *      what follows it, and the "never draw the logomark, the real asset is
+ *      composited afterwards" rule is *below* it — so without this the highest
+ *      priority section reads as blanket authority over brand marks. See the
+ *      logo note in `directImageRenderService`'s header;
+ *   5. the closing check covering BOTH product and copy. Product-only would have
+ *      hung a closing gate on the new objective and none on the old one.
+ *
+ * WHAT THE PRECEDENCE SENTENCE DELIBERATELY DOES NOT SAY: it scopes itself to
+ * creative and styling instructions and explicitly exempts the text contract.
+ * An unqualified "outranks everything that follows" put a ~4k-char wall between
+ * the opening line and SET EXACTLY THESE STRINGS *and* told the model the wall
+ * mattered more — and text fidelity is the whole game on this path (see the
+ * PLATE_QUALITY note in `directImageRenderService`: quality `high` measured
+ * WORSE than `medium` precisely because it lost a string). The prompt more than
+ * doubled, ~3.5-4.1k chars to ~7.8-8.4k; the measured baseline it is spending
+ * against is 139/140 strings across 20 renders. That is the trade this flag is
+ * here to let the owner unwind.
+ *
+ * This is prose for a model, not a spec for a human: it is deliberately
+ * repetitive, and the enumerations are open ("including but not limited to")
+ * because the catalog spans apparel, footwear, bottles, devices and jewellery.
+ */
+const PRODUCT_FIDELITY = `PRODUCT FIDELITY — HIGHEST PRIORITY. Wherever product accuracy conflicts with a creative or styling instruction below, product accuracy wins. This does not relax the text instructions below, which are absolute in their own right, and it does not override the reserved-corner rule or the FORMAT block below.
+The supplied reference photograph is the single source of truth for the product; where several are supplied, the first is the primary product reference and the rest are further views of the same item. It is a PRODUCT REFERENCE ONLY — not a composition to copy. Treat every visible characteristic of the item as immutable. This advertisement must feature the exact same physical item that reference shows, as though that same item had been carried into a new professional photoshoot and photographed again — not recreated from memory. Do not redesign, reinterpret, simplify, modernise, improve, repair, stylise, approximate or substitute any part of it.
+Do not infer the product from its category, and do not infer it from anything you know about the brand. If the reference disagrees with what products of this type usually look like, or with your prior knowledge of this brand, the reference is correct and your prior is wrong. This holds for every category — apparel, footwear, jewellery, bags, accessories, cosmetics, skincare, electronics, furniture, sporting goods, home goods, toys, tools, and packaged or food goods alike.
+
+PRESERVE EXACTLY, as the reference shows it:
+  — Form: shape, proportions, overall dimensions, silhouette, geometry, profile, contours, edges, thickness, volume and curvature. Fit and cut are part of the form and may not be altered, though the item may of course be posed, worn or placed differently.
+  — Construction: seams, stitching, panel layout, assembly, joints, fasteners, hardware, hinges, closures, buttons, buckles, snaps, zips, clasps, laces, eyelets, straps, handles.
+  — Materials: fabric, knit, mesh, leather, suede, rubber, plastic, metal, wood, glass, ceramic, gemstone, carbon fibre, foam, paper and packaging material — each rendered as the same material the reference shows, never swapped for a richer or cheaper-looking one.
+  — Surface: texture, weave, grain, gloss, matte, satin, brushed and polished finishes, transparency, opacity, reflectivity.
+  — Colour: the item's own colours exactly. Do not shift hue, recolour, bleach, tint, darken, brighten, saturate, desaturate, or invent an alternate colourway. New lighting may fall across those colours; it may not change them.
+  — Graphics already on the item: logos, branding, icons, artwork, patterns, prints, typography, embroidery, embossing, debossing, engraving, decals, labels and tags — same wording, same lettering, same placement, same scale. Reproduce them from the reference; never redraw them from imagination, and never add, remove or modify any branding. This preserves marks that are ALREADY on the item; it is never licence to place a brand mark anywhere else in the frame.
+  — Details, including but not limited to: pockets, collars, sleeves, cuffs, necklines, hems, soles, heels, eyelets, handles, bezels, displays, screens, lenses, caps, applicators, chains, gemstones, watch faces, grips, blades, wheels, buttons, ports, vents and sensors. Every feature visible in the reference must appear unchanged; no feature absent from the reference may be added.
+  — Condition: wrinkles, folds, creases, wear, polish, finish, surface imperfections, and the shadows the item casts on itself. Do not “improve” the item, smooth its surfaces, or clean away its natural characteristics.
+
+NEVER: substitute a similar-looking version; invent a feature that is absent; remove a visible feature; redesign any component; merge this item with another design; produce a newer, cleaner, alternative or special edition of it; produce a different size, fit or variation; simplify it; stylise it; or hallucinate any detail that is not visible in the reference.
+If part of the item is not visible in the reference, do not invent or redesign the hidden portion. Infer only the minimum physically plausible geometry a believable photograph needs, fully consistent with the parts you can see — and infer geometry only, never a graphic, a label or a marking.
+
+PRODUCT SCALE AND FRAMING. The reference photograph also defines how the product is framed, and that carries over. Give the item approximately the same visual prominence and approximately the same share of the frame as the reference does — within about a tenth either way — from approximately the same camera distance and a similar perspective. Do not zoom in dramatically, zoom out dramatically, or crop substantially tighter or wider than the reference. Compose the advertisement around the item at that size: fit the environment to the product, never the product to the environment, and never rescale the item just to make a layout easier. This governs how large the item sits inside the frame; it does not govern the frame itself — the output's dimensions and aspect are fixed by the FORMAT block at the end, and the safe box and reserved corner still apply.
+
+WHO WEARS OR HOLDS IT. If the reference photograph shows the item worn, held or carried by a person, then a person wears or holds it in your image too, the same way, on the same part of the body. Keep the same person — do not replace them with someone else. Their pose, their hands and how they are framed are yours to direct, but you may NOT remove them and show the item lying on its own, and you may not move a worn garment onto a hanger, a mannequin, a surface or a flat lay. If the reference shows the item by itself, you may introduce a person or leave it unpeopled, whichever makes the better advertisement.
+
+WHAT MAY CHANGE — everything that is not the item itself, and you should change it: who the model is, their pose and hands, environment, background, set, props, styling, lighting, shadows, mood, atmosphere, camera angle, focal length, depth of field, the colour grading of the scene, and the typographic treatment of the copy specified below. Build an entirely new scene around the item; do not reuse the reference's background or lighting. Note what is deliberately NOT on that list: the product's size in frame and the camera's distance from it, which the paragraph above holds close to the reference — and whether the item is worn, which the paragraph above ties to the reference.
+
+ADVERTISING QUALITY. This has to read as work a premium creative agency shipped, not a stock photograph and not a template that was filled in. Make the lighting feel intentional and the typography feel art-directed. Use whitespace deliberately. Keep the product the primary focal point and give it the greatest visual emphasis in the frame. Aim for premium, modern and editorial — and put the inventiveness in the photography, the light and the typography, never in the product and never in the claims.
+
+BEFORE YOU FINISH, check three things. The product: a customer would recognise it as the identical physical item; nothing has been redesigned, added, removed, recoloured or reshaped; and colour, branding, materials and construction all match the reference. The framing: the item occupies roughly the same share of the frame as it does in the reference, and the whole image could pass as another photograph of that same item taken in a new commercial shoot. The copy: every string you were given below appears exactly once, spelled exactly as given, and no other text appears anywhere. If any check fails, correct it before finishing the advertisement.`;
+
 function buildPrompt({ intentKey, data, product, surface }) {
   const policy = SURFACE_POLICY[surface];
   if (!policy) return { error: `unknown surface ${surface}` };
@@ -411,16 +672,67 @@ function buildPrompt({ intentKey, data, product, surface }) {
    * renders. Lowercase descriptions read as instructions; uppercase field names
    * read as type to set.
    */
+  /**
+   * The product-own-print carve-outs. Both no-added-text rules ban letterforms
+   * and marks "anywhere in the frame … including on packaging or clothing within
+   * the scene" — and on this catalog the product frequently IS the packaging or
+   * the clothing, so read literally they order the model to strip a real label.
+   * That conflict predates the fidelity hardening; it is fixed alongside it
+   * because a block demanding the label be preserved makes it live.
+   *
+   * Both are anchored to "visible … in the reference photograph", never to "on
+   * the product". The looser phrasing is a justification handle: a model that
+   * knows the brand's usual neck label or size stamp can invent one and call it
+   * something the product already has. The anchor has to be the pixels.
+   */
+  const carveOutWithCopy = FIDELITY_HARDENING
+    ? ' The single exception is lettering already visible on the product itself in the reference photograph: that lettering is part of the product, so it stays exactly as the reference shows it, reproduced and not restyled, and it does not count as text you set.'
+    : '';
+  const carveOutNoCopy = FIDELITY_HARDENING
+    ? ' Lettering, labels and logos already visible on the product itself in the reference photograph are the one exception: they are part of the product and stay exactly as the reference shows them. Reproduce only what is visible there — nothing may be added, and no marking may be inferred from what products of this kind usually carry.'
+    : '';
   const textBlock = kept.length
     ? `SET EXACTLY THESE STRINGS, verbatim, each appearing exactly once — and set NOTHING ELSE. This is the complete and only text for this ad. It is not a template to fill in and nothing is missing from it. Spelling is critical; a misspelling makes this unusable.
 The words to the LEFT of each arrow name the element for your reference and must NEVER appear in the image. Render ONLY the text to the right of the arrow:
 ${kept.map(([role, str]) => `  ${role.toLowerCase()} -> ${str}`).join('\n')}
-Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.`
-    : `THIS AD CARRIES NO TEXT AT ALL. Render a pure product image: no words, numerals, letterforms, logos or graphic marks of any kind, anywhere in the frame — including on signage, packaging, screens or clothing within the scene. The photograph alone has to do the work.`;
+Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.${carveOutWithCopy}`
+    : `THIS AD CARRIES NO TEXT AT ALL. Render a pure product image: no words, numerals, letterforms, logos or graphic marks of any kind, anywhere in the frame — including on signage, packaging, screens or clothing within the scene.${carveOutNoCopy} The photograph alone has to do the work.`;
 
-  const prompt = `Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
+  /**
+   * Role framing. Owner-supplied 2026-08-03. Gated with the rest of the hardening
+   * so the flag-off arm stays byte-identical to the measured baseline.
+   */
+  const rolePreamble = FIDELITY_HARDENING
+    ? 'You are an expert advertising creative director, commercial product photographer and graphic designer.\n\n'
+    : '';
 
-The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.
+  /**
+   * "whether a person appears" — REMOVED from the creative-freedom list when the
+   * hardening is on. Owner instruction 2026-08-03, after live renders: a
+   * PELAGIC jacket seeded from an ON-MODEL photograph came back as the jacket
+   * lying on a deck with nobody in it, in 3 of 6 LEGACY renders and 2 of 6
+   * hardened ones. It was not drift — this clause explicitly handed the model
+   * the choice, and it took it.
+   *
+   * Two reasons that is wrong for apparel: an unworn garment is a weaker ad, and
+   * it discards the fit and drape information PRODUCT_FIDELITY spends a whole
+   * paragraph protecting. It also fights PRODUCT SCALE AND FRAMING, which asks
+   * for the same share of frame as the reference — a person competes for that
+   * area, so dropping them is the cheapest way to comply.
+   *
+   * The replacement rule is ASYMMETRIC and lives in PRODUCT_FIDELITY: if the
+   * reference shows the item worn or held, a person must stay; if it does not,
+   * adding one is discretionary. No new plumbing is needed for that conditional —
+   * `buildPrompt` never learns whether the seed contains a person, but the MODEL
+   * can see the reference and evaluates the condition itself.
+   *
+   * Gated so the flag-off arm stays byte-identical to the measured baseline.
+   */
+  const personClause = FIDELITY_HARDENING ? '' : 'whether a person appears, ';
+
+  const prompt = `${rolePreamble}Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
+
+${FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY}
 
 PRODUCT: ${product.desc}
 
@@ -432,7 +744,7 @@ That is an order of importance, not a layout, and not a checklist. Express it ho
 
 ${textBlock}
 
-YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, whether a person appears, lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.
+YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, ${personClause}lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.
 
 THIS PRODUCT HAS NONE OF THE FOLLOWING, so none of it may appear:
 ${absent.map(a => `  — ${a}`).join('\n')}
@@ -451,6 +763,7 @@ module.exports = {
   SACRIFICE_ORDER,
   FALLBACK_ORDER,
   buildPrompt,
+  PRODUCT_FIDELITY,
   resolveIntent,
   absences,
   applyDensity,

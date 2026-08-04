@@ -86,11 +86,23 @@ export function lastStarLandSec({
  * instead of counting up.
  *
  *   "15,545 reviews · vuoriclothing.com" → { target: 15545, suffix: " reviews · vuoriclothing.com" }
+ *   "41000 reviews · gymshark.com"       → { target: 41000, suffix: " reviews · gymshark.com" }
  *   "Trusted by thousands" → null
+ *
+ * The pattern is `\d+` FIRST, then optional comma groups — not
+ * `\d{1,3}(?:,\d{3})*|\d+`. Alternation is ordered, so that older pattern let
+ * branch one win on an UNCOMMAED run of digits: "41000" matched just "410"
+ * (`\d{1,3}` greedy, then zero comma groups), yielding target 410 and suffix
+ * "00 reviews · …". The count then rolled 0→410 while the leftover "00" sat
+ * beside it, so mid-animation frames read fabricated totals like "18800
+ * reviews" — only the settled frame looked right, which is exactly why a
+ * post-settle contact sheet never caught it. Any count ≥1000 without commas
+ * was affected ("8343" → 834 + "3 reviews"), and reviewsText is built
+ * uncommaed by services/ratingDisplay.js.
  */
 export function parseReviewsLeadingNumber(reviewsText) {
   const s = String(reviewsText ?? '');
-  const m = s.match(/^(\d{1,3}(?:,\d{3})*|\d+)/);
+  const m = s.match(/^(\d+(?:,\d{3})*)/);
   if (!m) return null;
   const target = Number(m[1].replace(/,/g, ''));
   if (!Number.isFinite(target)) return null;

@@ -202,10 +202,16 @@ for (const [value, expected, why] of RATINGS) {
   const src = require('fs').readFileSync(
     require('path').join(__dirname, '..', 'services', 'brandScriptExecutor.js'), 'utf8'
   );
-  check('P3 video meta gates rating via resolveAtomicRatingPair',
-    /resolveAtomicRatingPair\s*\(/.test(src)
+  // REWRITTEN 2026-08-03: this pinned the function NAME, not the guarantee. video meta
+  // now gates through resolveCoherentSocialProof, which calls resolveAtomicRatingPair
+  // internally (and therefore still gates via formatDisplayRating) while additionally
+  // enforcing that the quote's tier matches the numbers' tier. Pinning the old name
+  // would fail on code that is strictly stronger.
+  check('P3 video meta gates rating via the coherence chokepoint',
+    /resolveCoherentSocialProof\s*\(/.test(src)
     && /require\s*\(\s*['"]\.\/ratingDisplay['"]\s*\)/.test(src),
-    'buildMetaForAd must call resolveAtomicRatingPair (gates via formatDisplayRating)');
+    'buildMetaForAd must gate numbers through resolveCoherentSocialProof (which gates via '
+    + 'resolveAtomicRatingPair -> formatDisplayRating and adds tier coherence)');
 }
 for (const [value, expected] of [[0, undefined], [-5, undefined], [12, 12], [null, undefined]]) {
   const d = direct.buildIntentData({

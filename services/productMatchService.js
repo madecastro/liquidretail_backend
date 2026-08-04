@@ -1468,8 +1468,8 @@ async function tryLookupBrandCategoryUrl(args) {
     return null;
   }
 }
-async function tryLookupBrandReviews(brandName, brandUrl) {
-  try { return await geminiSearch.lookupBrandReviews({ brandName, brandUrl }); }
+async function tryLookupBrandReviews(brandName, brandUrl, brandId = null) {
+  try { return await geminiSearch.lookupBrandReviews({ brandName, brandUrl, brandId }); }
   catch (err) {
     console.warn(`   ⚠️  brand-reviews lookup failed: ${err.message}`);
     return null;
@@ -1507,8 +1507,10 @@ async function fetchBrandReviewsCachedOrFresh({ brand: brandName, brandUrl, adve
     console.log(`   · brand-reviews: cache stale for "${brandName}" (age ${Math.round(ageMs / 86400000)}d > 30d), refetching`);
   }
 
-  // Fresh fetch.
-  const fresh = await tryLookupBrandReviews(brandName, brandUrl);
+  // Fresh fetch. brandDoc is null when the advertiser has no Brand row for
+  // this name yet (resolution case 3) — the cost row is still written, just
+  // without the brand join.
+  const fresh = await tryLookupBrandReviews(brandName, brandUrl, brandDoc?._id || null);
   if (!fresh || !Array.isArray(fresh.quotes) || fresh.quotes.length === 0) return fresh;
 
   // Write back to the catalog if we have a row to write to.
@@ -2123,7 +2125,7 @@ async function maybeFetchProductReviewsCached({ catalogProductId, productName, b
 
   // Pull dedup keys (gtin/mpn) so we can look up siblings — V3 #2.
   const row = await CatalogProduct.findById(catalogProductId)
-    .select('productReviews title gtin mpn').lean();
+    .select('productReviews title gtin mpn brandId').lean();   // brandId: cost-ledger linkage
   if (!row) return null;
 
   // 1. Cache hit on this row?
@@ -2175,7 +2177,13 @@ async function maybeFetchProductReviewsCached({ catalogProductId, productName, b
   }
 
   // 3. Fire-and-forget Gemini fetch — don't block detect.
-  geminiSearch.lookupProductReviews({ productName, brandName, productUrl })
+  geminiSearch.lookupProductReviews({
+    productName, brandName, productUrl,
+    // Cost-ledger linkage. This is a fire-and-forget billable call, which is
+    // exactly the kind that goes unnoticed without a row to point at.
+    brandId:   row.brandId || null,
+    productId: catalogProductId
+  })
     .then(async (fresh) => {
       if (!fresh || !Array.isArray(fresh.quotes) || fresh.quotes.length === 0) return;
       try {

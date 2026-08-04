@@ -507,6 +507,9 @@ async function renderStage(args) {
       wrapped.atlasCode    = err.atlasCode ?? null;
       wrapped.alertLevel   = err.alertLevel;
       wrapped.alertKey     = err.alertKey;
+      // Vision QC double-fail attaches the verdict so routes can persist
+      // discarded (already-paid) render URLs on the failed Ad.
+      wrapped.visionQc     = err.visionQc || null;
       throw wrapped;
     }
     if (!output?.skipped) return output;
@@ -1155,6 +1158,7 @@ async function persistStage({ req, input, layoutInputArtifactId, renderOutput, u
       fontResolution:     renderOutput.fontResolution || null,
       imageGeneration:    renderOutput.imageGeneration || null,
       intentResolution:   renderOutput.intentResolution || null,
+      visionQc:           renderOutput.visionQc || null,
       renderStages:       stagesMs || null,
       copy,
       status:             'draft',
@@ -1433,7 +1437,9 @@ function failed(jobId, stage, err) {
       // unreachable and the retry pays a second time for the same picture.
       predictionId: err.predictionId || null,
       atlasCode:    err.atlasCode ?? null,
-      charged:      err.charged === true
+      charged:      err.charged === true,
+      // Post-render vision QC verdict (incl. discarded paid render URLs).
+      visionQc:     err.visionQc || err.cause?.visionQc || null
     }
   };
 }

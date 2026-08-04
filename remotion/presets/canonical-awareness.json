@@ -273,7 +273,7 @@
             "trackingPx": 1.2,
             "sizeScale": 1.15
           },
-          "visible": true
+          "visible": false
         }
       ]
     },
@@ -445,7 +445,7 @@
             "trackingPx": 1.2,
             "sizeScale": 1.15
           },
-          "visible": true
+          "visible": false
         }
       ]
     },
@@ -617,7 +617,7 @@
             "trackingPx": 1.2,
             "sizeScale": 1.15
           },
-          "visible": true
+          "visible": false
         }
       ]
     },

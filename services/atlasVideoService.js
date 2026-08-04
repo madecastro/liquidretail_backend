@@ -24,6 +24,9 @@
 
 const axios = require('axios');
 const sharp = require('sharp');
+// Shared failure taxonomy. The image path has always used this; the video
+// poll below did not, so a moderation block read as a generic failure.
+const { classify } = require('./atlasErrorPolicy');
 
 const Media                     = require('../models/Media');
 // Required for the charge-point veoPredictionId write in generateForAd. NOTE this file
@@ -41,7 +44,11 @@ const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
 
-const { buildLayoutInput }   = require('./layoutInputService');
+// INPUT_SCHEMA_VERSION drives the staleness check in
+// refreshStaleLayoutInput() below (see that function's comment) — it is
+// layoutInputService's own constant, imported rather than hardcoded so the
+// two files can't drift on what "current schema" means.
+const { buildLayoutInput, INPUT_SCHEMA_VERSION } = require('./layoutInputService');
 
 // Generative reframe (video reference path only). Outpaint every ref to
 // the target aspect so the product stays fully visible; store labeled
@@ -181,6 +188,40 @@ const REFRAME_CLAIM_TTL_MS = () => {
   // also absorbs modest clock skew between processes, since `claim.at` is
   // written from each process's own wall clock rather than server time.
   return Math.max(configured, MAX_POLL_MS + 10 * 60 * 1000);
+};
+
+// How long a claim LOSER polls for the winner's reframe before degrading to
+// the deterministic crop. waitForReframeUrl sleeps 1s,2s,…,Ns between reads,
+// so attempts=26 ≈ 5m51s — sized to the measured worst-case cold reframe
+// stage (5m19s, 3 serialized outpaints). Raised from the historical 3 (~6s)
+// when the wizard prewarm landed: a Generate clicked while a prewarm outpaint
+// is mid-flight used to lose the claim, give up after 6s, and silently ship a
+// CROPPED reference where every other run got the generative one. Waiting for
+// the winner is strictly better: the loser path NEVER submits, so a longer
+// wait cannot create spend — worst case (winner died mid-flight) the
+// claim-death early exit below fires and it crops in seconds.
+//
+// HARD COUPLING TO THE LEASE: waitForReframeUrl sleeps 1s,2s,…,Ns, so a run of
+// n attempts spans sum(1..n) seconds. That total MUST stay under
+// REFRAME_CLAIM_TTL_MS: once the lease ages out, a third process may steal the
+// claim and submit — and a loser still sleeping past that point would return a
+// url (or crop) chosen while a second billable flight was already away. The
+// clamp below walks n down until the span fits, so raising the env var can
+// never reopen the steal window (adversarial finding 5). n=26 → 351s, well
+// under the ≥20 min TTL floor.
+const REFRAME_CLAIM_WAIT_ATTEMPTS = () => {
+  const n = Number(process.env.REFRAME_CLAIM_WAIT_ATTEMPTS);
+  const requested = Number.isFinite(n) && n >= 1 ? Math.min(60, Math.floor(n)) : 26;
+  const ttlSec = REFRAME_CLAIM_TTL_MS() / 1000;
+  let capped = requested;
+  while (capped > 1 && (capped * (capped + 1)) / 2 >= ttlSec) capped--;
+  if (capped !== requested) {
+    console.warn(
+      `⚠️  REFRAME_CLAIM_WAIT_ATTEMPTS=${requested} would sleep past the claim lease ` +
+      `(${Math.round(ttlSec)}s) — clamped to ${capped}`
+    );
+  }
+  return capped;
 };
 
 // Titling is CANONICAL by default. The layoutInput derivation template is
@@ -761,20 +802,36 @@ function pickProductOnlyUrl(catalogMedias, product) {
 // seed-only) per brand/product via videoSettings.referenceImageCount.
 const DEFAULT_REFERENCE_IMAGE_COUNT = 3;
 const MAX_REFERENCE_IMAGE_COUNT     = 7;
-// Owner constraint (hallucination at high ref counts): with the primary
-// repeat, the intended stack is 3 distinct + primary again = 4 total.
-// Never raise past this when REPEAT_PRIMARY_REFERENCE is on.
+// Ceiling that applies ONLY when the (now default-off) primary repeat is
+// explicitly switched back on: 3 distinct + primary again = 4 total. Owner
+// constraint from the high-ref-count hallucination finding — never raise past
+// this while REPEAT_PRIMARY_REFERENCE is on. With the flag off (the default)
+// this cap is not consulted; the stack is simply the first `effectiveMax`
+// distinct views (3 by default).
 const REPEAT_PRIMARY_TOTAL_CAP = 4;
+// Hard ceiling on DISTINCT references when the primary repeat is OFF (the
+// default since 2026-08-03). Owner-set to 5 on 2026-08-03. Without it that
+// branch was unclamped up to MAX_REFERENCE_IMAGE_COUNT (7), which contradicted
+// the owner's measured "too many images hallucinated" finding.
+const MAX_DISTINCT_REFERENCES = 5;
 
 /**
- * REPEAT_PRIMARY_REFERENCE env flag (default true).
+ * REPEAT_PRIMARY_REFERENCE env flag (DEFAULT FALSE since 2026-08-03).
  * When on, buildReferenceImages appends the primary (position 0) URL again
  * as the final reference so the model's closing beat returns to the front
- * view by construction. Offline harnesses flip this via process.env.
+ * view by construction.
+ *
+ * The owner rolled this off as the default: the repeated primary INCREASED
+ * hallucination and the pre-repeat output was better. The capability is kept
+ * (not deleted) so it stays available for a future A/B — an explicit truthy
+ * value still turns it on. An unset or empty env yields FALSE.
+ * `config/defaults.env` also sets it to false, so both the code default and
+ * the dotenv-loaded production default agree. Offline harnesses flip this via
+ * process.env.
  */
 function isRepeatPrimaryReferenceEnabled() {
   const raw = process.env.REPEAT_PRIMARY_REFERENCE;
-  if (raw == null || raw === '') return true;
+  if (raw == null || raw === '') return false;
   return !/^(0|false|no|off)$/i.test(String(raw).trim());
 }
 
@@ -799,21 +856,39 @@ function appendPrimaryReferenceRepeat(urls, opts = {}) {
 }
 
 /**
- * Pure: compute stack budget when primary-repeat is on.
- * Distinct views fill first; one slot is left for the primary repeat when
- * possible. Caps total at REPEAT_PRIMARY_TOTAL_CAP (3 distinct + primary).
- * Bumps a default-3 request so the closing slot fits without dropping a view.
+ * Pure: compute the reference-stack budget.
+ *
+ * repeatEnabled false — THE DEFAULT since 2026-08-03: no slot is reserved and
+ * no duplicate is appended, so distinctCap === totalCap === min(effectiveMax,
+ * modelMax). A default request (effectiveMax 3, modelMax 7) therefore ships
+ * exactly the first three distinct images.
+ *
+ * repeatEnabled true — opt-in only: distinct views fill first, one slot is
+ * left for the primary repeat when possible, and the total is capped at
+ * REPEAT_PRIMARY_TOTAL_CAP (3 distinct + primary). A default-3 request is
+ * bumped so the closing slot fits without dropping a view.
  *
  * @returns {{ distinctCap: number, totalCap: number }}
  */
 function referenceStackBudget({ effectiveMax, modelMax, repeatEnabled }) {
   const model = Number.isFinite(modelMax) && modelMax >= 1 ? modelMax : MAX_REFERENCE_IMAGE_COUNT;
   const eff = Number.isFinite(effectiveMax) && effectiveMax >= 1 ? effectiveMax : DEFAULT_REFERENCE_IMAGE_COUNT;
+  // DEFAULT PATH (flag off since 2026-08-03): no reserved slot, no duplicate —
+  // just the first `eff` distinct views, so a default request ships 3 refs.
+  //
+  // MAX_DISTINCT_REFERENCES is a HARD CEILING and it is load-bearing. Turning the
+  // primary repeat off removed the only clamp on this branch (the repeat path
+  // caps at REPEAT_PRIMARY_TOTAL_CAP), so `videoSettings.referenceImageCount=7`
+  // or an operator ordering 7 seeds in the wizard rail would have sent all seven
+  // — against the owner's measured finding that "with too many images it was
+  // hallucinating". Owner set the ceiling at FIVE on 2026-08-03. Found by
+  // adversarial review of this very change, not by writing it.
   if (!repeatEnabled) {
-    const cap = Math.min(eff, model);
+    const cap = Math.min(eff, model, MAX_DISTINCT_REFERENCES);
     return { distinctCap: cap, totalCap: cap };
   }
-  // Owner: 3 distinct + repeated primary = 4. More refs hallucinated.
+  // OPT-IN PATH ONLY (flag explicitly on). Older owner constraint for that
+  // path: 3 distinct + repeated primary = 4; more refs hallucinated.
   const totalCap = Math.min(
     Math.max(eff, Math.min(DEFAULT_REFERENCE_IMAGE_COUNT + 1, REPEAT_PRIMARY_TOTAL_CAP)),
     model,
@@ -1215,6 +1290,79 @@ async function outputRatioOk(buffer, wr, hr) {
   }
 }
 
+// Cloudinary rejects an oversized upload with HTTP 400 "File size too large.
+// Got <n>. Maximum is <limit>."
+//
+// THE LIMIT IS PLAN-DEPENDENT, NOT A FIXED API CONSTANT. An earlier version of
+// this comment claimed it was a hard API limit; that was WRONG. Production hit
+// the ceiling at 20971520 (20 MiB) on 2026-08-04, and the account was upgraded
+// to 40 MiB the same day — the number moved, so it lives in the environment.
+// Read the current value out of the failing message rather than assuming:
+// Cloudinary states its own limit in the 400 body.
+//
+// REFRAME_RESOLUTION is '4k', so a healthy outpaint can return more than
+// whatever the ceiling is: the 2026-08-04 crash was Got 24232221 (24.2 MB)
+// against a 20 MiB plan. The pre-upload guard only had a FLOOR
+// (`outBuf.length >= 512`) and no ceiling, so a perfectly good 4K generation
+// passed the check and died on upload — AFTER `billed = true`. We had already
+// paid for that asset and then discarded it, which is exactly what the "a
+// single blip here used to discard a generation we had already paid for"
+// comment further down exists to prevent. Raising the plan removes today's
+// trigger; it does not remove the class, which is why the refit stays.
+const CLOUDINARY_MAX_UPLOAD_BYTES = (() => {
+  const raw = parseInt(process.env.CLOUDINARY_MAX_UPLOAD_BYTES || '', 10);
+  // Floor at 1 MiB so a typo cannot refit every asset into oblivion.
+  return Number.isFinite(raw) && raw >= 1048576 ? raw : 40 * 1024 * 1024;  // 41943040
+})();
+
+/**
+ * Bring an oversized render under Cloudinary's ceiling WITHOUT throwing away a
+ * generation we have already been billed for.
+ *
+ * Recompresses to JPEG at descending quality, then scales down, stopping at the
+ * first result that fits. JPEG rather than PNG deliberately: this buffer is a
+ * VIDEO REFERENCE IMAGE handed to Omni, never a delivered asset, so lossy
+ * compression costs nothing that survives into the output — whereas losing the
+ * asset costs a paid 4K generation.
+ *
+ * Returns the original buffer untouched when it already fits, and null only
+ * when nothing we can do gets it under the limit (caller then falls back to
+ * pad, same as any other outpaint failure).
+ */
+async function fitBufferForCloudinary(buf, label = 'reframe') {
+  if (!Buffer.isBuffer(buf) || buf.length <= CLOUDINARY_MAX_UPLOAD_BYTES) return buf;
+  const startedAt = Date.now();
+  for (const attempt of [
+    { quality: 90 }, { quality: 80 }, { quality: 72 },
+    { quality: 80, scale: 0.75 }, { quality: 72, scale: 0.6 }
+  ]) {
+    try {
+      let pipeline = sharp(buf);
+      if (attempt.scale) {
+        const md = await sharp(buf).metadata();
+        if (md?.width) {
+          pipeline = pipeline.resize(Math.max(640, Math.round(md.width * attempt.scale)));
+        }
+      }
+      const out = await pipeline.jpeg({ quality: attempt.quality, mozjpeg: true }).toBuffer();
+      if (out.length <= CLOUDINARY_MAX_UPLOAD_BYTES) {
+        console.log(
+          `   🗜  ${label}: ${buf.length} bytes exceeded Cloudinary's ${CLOUDINARY_MAX_UPLOAD_BYTES} — ` +
+          `refit to ${out.length} (q=${attempt.quality}${attempt.scale ? `, scale=${attempt.scale}` : ''}) ` +
+          `in ${Date.now() - startedAt}ms`
+        );
+        return out;
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  ${label}: refit attempt failed — ${err.message}`);
+    }
+  }
+  console.warn(
+    `   ⚠️  ${label}: could not bring ${buf.length} bytes under ${CLOUDINARY_MAX_UPLOAD_BYTES} — giving up on this tier`
+  );
+  return null;
+}
+
 // In-process single-flight for reframes. The product fan-out emits several
 // ads that SHARE reference medias, and workers run those ads in parallel —
 // without this, the same media+aspect would outpaint 2–3× concurrently
@@ -1334,19 +1482,54 @@ async function releaseReframeClaim(mediaId, aspectKey, claimBy) {
   }
 }
 
-// Loser wait: a couple of short re-reads for the winner's url. Generation can
-// take minutes, so this usually returns null and the caller crops — never
-// spends. Next render hits the persistent cache once the winner persists.
+// Loser wait: re-read for the winner's url with 1s,2s,…,Ns backoff, returning
+// the moment it lands. Attempts come from REFRAME_CLAIM_WAIT_ATTEMPTS at the
+// claim-loss call site (default ≈6 min — sized to a full cold reframe so a
+// run racing the wizard prewarm inherits the generative asset instead of
+// degrading to a crop). Never spends; on timeout the caller crops.
 // Deliberately accepts a STALE url too: during a re-derive the older asset is
 // still a real, correctly-shaped image, so serving it to a concurrent render
 // beats a destructive crop and costs nothing.
+//
+// CLAIM-DEATH EARLY EXIT — the reason a multi-minute wait is safe. Sleeping the
+// full span only makes sense while a winner is actually working; if the holder
+// died (instance replaced mid-deploy — the prewarm is a long fire-and-forget on
+// the web process, so this is a real shape) a fixed wait would burn the whole
+// span and then crop anyway, holding a render slot for nothing. Two cheap
+// signals end the wait immediately, both read from the same document we already
+// fetch each tick:
+//   • entry gone / no claim → releaseReframeClaim ran with no url, i.e. the
+//     winner gave up. Nothing is coming.
+//   • claim.at older than the lease → holder is dead; the claim is now
+//     stealable, so waiting on it is waiting on nobody.
+// Neither can fire while a live holder works: tryClaimReframe writes claim
+// before the submit and the lease floor (≥20 min) far outlasts a reframe.
+// Returning null degrades to the caller's deterministic crop — never spend.
 async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
+  const path = reframeClaimPath(aspectKey);
+  const claimTtlMs = REFRAME_CLAIM_TTL_MS();
   for (let i = 0; i < attempts; i++) {
     await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     try {
-      const fresh = await Media.findById(mediaId).select(`metadata.reframes.${aspectKey}`).lean();
-      const url = fresh?.metadata?.reframes?.[aspectKey]?.url;
+      const fresh = await Media.findById(mediaId).select(path).lean();
+      const entry = fresh?.metadata?.reframes?.[aspectKey];
+      const url = entry?.url;
       if (typeof url === 'string' && url.trim()) return url;
+
+      if (!entry || !entry.claim) {
+        console.log(
+          `   ⏳ reframe[${aspectKey}]: winner released without a result — cropping now (no spend)`
+        );
+        return null;
+      }
+      const claimedAt = Date.parse(entry.claim.at);
+      if (Number.isFinite(claimedAt) && Date.now() - claimedAt > claimTtlMs) {
+        console.warn(
+          `⚠️  reframe[${aspectKey}]: winner's claim aged past the lease ` +
+          `(${Math.round((Date.now() - claimedAt) / 1000)}s) — holder presumed dead, cropping now`
+        );
+        return null;
+      }
     } catch { /* retry / fall through */ }
   }
   return null;
@@ -1511,9 +1694,12 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         const won = await tryClaimReframe(media._id, aspectKey, claimBy);
         if (!won) {
           console.log(
-            `   ⏳ reframe[${aspectKey}]: claim held by another process — waiting briefly, no spend`
+            `   ⏳ reframe[${aspectKey}]: claim held by another process — waiting for winner ` +
+            `(≤${REFRAME_CLAIM_WAIT_ATTEMPTS()} reads, no spend)`
           );
-          const winnerUrl = await waitForReframeUrl(media._id, aspectKey);
+          const winnerUrl = await waitForReframeUrl(
+            media._id, aspectKey, REFRAME_CLAIM_WAIT_ATTEMPTS()
+          );
           if (winnerUrl) return winnerUrl;
           console.warn(
             `⚠️  reframeReferenceForAspect[${aspectKey}]: claim loser — winner result not ready, cropping (no spend)`
@@ -1577,9 +1763,22 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
           // here used to discard a generation we had already paid for.
           const outBuf = await fetchOutpaintOutput(outUrl);
           if (outBuf.length >= 512 && await outputRatioOk(outBuf, wr, hr)) {
-            const up = await uploadBufferToCloudinary(outBuf, { folder: 'liquidretail/reframes' });
-            const url = up.secure_url || up.url;
-            if (url) { resultUrl = url; method = 'outpaint'; }
+            // CEILING, not just a floor. At REFRAME_RESOLUTION=4k this buffer
+            // regularly exceeds Cloudinary's 20 MiB limit; before this guard the
+            // upload 400'd and a generation we had ALREADY BEEN BILLED for was
+            // thrown away. Refit rather than discard. Ratio is checked on the
+            // ORIGINAL buffer above, and the refit only recompresses/scales
+            // uniformly, so the aspect the ratio check approved still holds.
+            const fitted = await fitBufferForCloudinary(outBuf, `reframe[${aspectKey}]`);
+            if (!fitted) {
+              console.warn(
+                `⚠️  reframeReferenceForAspect[${aspectKey}]: output ${outBuf.length} bytes cannot be stored — pad fallback`
+              );
+            } else {
+              const up = await uploadBufferToCloudinary(fitted, { folder: 'liquidretail/reframes' });
+              const url = up.secure_url || up.url;
+              if (url) { resultUrl = url; method = 'outpaint'; }
+            }
           } else {
             console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: output rejected (bytes=${outBuf.length}) — pad fallback`);
           }
@@ -1617,8 +1816,15 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
             const padBuf = fill.uniform
               ? (await padSolidBuffer(srcNorm.buffer, W, H, fill.hex)) || (await padToRatioBuffer(srcNorm.buffer, W, H))
               : await padToRatioBuffer(srcNorm.buffer, W, H);
-            if (padBuf) {
-              const up = await uploadBufferToCloudinary(padBuf, { folder: 'liquidretail/reframes' });
+            // Same ceiling applies here — a pad built from a 4K source is just
+            // as capable of exceeding 20 MiB as the outpaint was. This tier is
+            // free, so a refit failure is not a money loss, but an unguarded
+            // 400 here is the same fatal rejection.
+            const paddedFitted = padBuf
+              ? await fitBufferForCloudinary(padBuf, `reframe-pad[${aspectKey}]`)
+              : null;
+            if (paddedFitted) {
+              const up = await uploadBufferToCloudinary(paddedFitted, { folder: 'liquidretail/reframes' });
               const url = up.secure_url || up.url;
               if (url) { resultUrl = url; method = 'pad-fallback'; }
             }
@@ -1903,12 +2109,15 @@ async function buildReferenceImages({
   // it ignore the images I selected?" surprise. Still bounded by the model's own
   // maxReferenceImages, which is a hard API limit we cannot exceed.
   //
-  // When REPEAT_PRIMARY_REFERENCE is on, owner constraint caps the stack at 4
-  // (3 distinct + primary again) — more refs hallucinated in pilot. Distinct
-  // views fill first; the primary is appended AFTER final-URL dedupe so the
-  // deliberate duplicate is kept (seenMediaIds/seenUrls and seenFinal would
-  // drop a naive in-loop repeat). Never evict a real view to make room for
-  // the duplicate — only append when length < totalCap.
+  // REPEAT_PRIMARY_REFERENCE is OFF by default (owner 2026-08-03: repeating the
+  // primary increased hallucination). With it off the stack is just the first
+  // `effectiveMax` distinct views — 3 on a default request — and nothing is
+  // appended. When an operator explicitly switches it back on for an A/B, the
+  // owner's older constraint applies: cap the stack at 4 (3 distinct + primary
+  // again), distinct views fill first, and the primary is appended AFTER
+  // final-URL dedupe so the deliberate duplicate is kept (seenMediaIds/seenUrls
+  // and seenFinal would drop a naive in-loop repeat). Never evict a real view
+  // to make room for the duplicate — only append when length < totalCap.
   const modelMax = caps?.maxReferenceImages || MAX_REFERENCE_IMAGE_COUNT;
   const effectiveMax = usedOrdered
     ? Math.min(ids.length, modelMax)
@@ -1930,12 +2139,32 @@ async function buildReferenceImages({
   }
 
   // Reframe all in parallel; preserve order.
+  //
+  // PER-ITEM CATCH — load-bearing, not defensive dressing. Promise.all settles
+  // on the FIRST rejection, and a sibling that rejects afterwards has no
+  // listener left, which on Node 20 is a FATAL unhandledRejection. That is how
+  // production died on 2026-08-04: a Cloudinary "File size too large" surfaced
+  // here, killed the web process one second after a 411s Omni master had
+  // already been paid for, and took the whole run with it (4 ads requeued, 1
+  // run marked failed).
+  //
+  // reframeReferenceForAspect is DOCUMENTED as never throwing — it resolves to
+  // a URL or a deterministic crop. That contract is exactly what proved unsafe
+  // to lean on, so it is now enforced here instead of assumed. null is already
+  // handled: the dedupe loop below skips falsy entries, so a failed reframe
+  // simply drops out of the reference stack and the remaining refs still ship.
   const reframed = await Promise.all(
     capped.map(id => reframeReferenceForAspect({
       media: id.mediaDoc,
       sourceUrl: id.sourceUrl,
       aspectRatio,
       brand
+    }).catch((err) => {
+      console.warn(
+        `⚠️  buildReferenceImages: reframe failed for ${id.mediaDoc?._id || id.sourceUrl} ` +
+        `[${aspectRatio}] — dropping this reference, run continues: ${err?.message || err}`
+      );
+      return null;
     }))
   );
 
@@ -2151,6 +2380,80 @@ function pacedModelSubmit(model, fn) {
  *   `"${stagePrefix} — polling 4m10s (17)"` so the activity board shows motion
  *   without a new timer. Defaults to no stage write (reframe / non-ad callers).
  */
+/**
+ * SINGLE-SHOT prediction status check. Free — a GET, never a submit.
+ *
+ * pollPrediction blocks up to MAX_POLL_MS (10 min), which is right inside a
+ * render and wrong at boot: recovery must not hold startup open, and an ad that
+ * is still processing simply gets checked again on the next sweep.
+ *
+ * Returns one of:
+ *   { state: 'done',       videoUrl }        terminal, asset available
+ *   { state: 'processing' }                  still running — leave it alone
+ *   { state: 'failed',     message, policy } terminal, classified
+ *   { state: 'unknown',    message }         we could not tell; DO NOT act
+ *
+ * 'unknown' is deliberately distinct from 'failed'. A transport error tells us
+ * nothing about the prediction, and treating it as failure is how a paid asset
+ * gets written off — or worse, re-submitted.
+ */
+async function peekPrediction(predictionId) {
+  if (!predictionId) return { state: 'unknown', message: 'no prediction id' };
+  if (!apiKey()) return { state: 'unknown', message: 'ATLAS_API_KEY not configured' };
+  let res;
+  try {
+    res = await axios.get(`${BASE_URL}/model/prediction/${predictionId}`, {
+      headers: { Authorization: `Bearer ${apiKey()}` },
+      timeout: 20_000,
+      validateStatus: () => true
+    });
+  } catch (err) {
+    return { state: 'unknown', message: err.message };
+  }
+  if (res.status !== 200) {
+    return { state: 'unknown', message: `HTTP ${res.status}` };
+  }
+  const data = res.data?.data || {};
+  const status = String(data.status || '').toLowerCase();
+  if (status === 'completed' || status === 'succeeded') {
+    const raw = data.outputs ?? data.output ?? [];
+    const url = Array.isArray(raw) ? raw[0] : raw;
+    // Completed WITHOUT an output is the genuine "paid for nothing" case and is
+    // classified as such rather than silently treated as still-running.
+    return url
+      ? { state: 'done', videoUrl: url }
+      : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput' };
+  }
+  if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
+    const providerMsg = data.error || status;
+    const policy = classify({
+      predictionStatus: 'failed', msg: providerMsg, nsfw: data.has_nsfw_contents ?? null
+    });
+    return {
+      state: 'failed',
+      message: `${policy.label || 'atlasVideo: prediction failed'}: ${providerMsg}`,
+      policy: policy.name
+    };
+  }
+  return { state: 'processing' };
+}
+
+/**
+ * RESUME a video generation from its spend receipt (Ad.veoPredictionId).
+ *
+ * THIS FUNCTION MUST NEVER SUBMIT. That is its entire reason to exist: the
+ * receipt means the provider already charged us, so the only correct move is to
+ * collect what we paid for. A submit here would double-bill, which is precisely
+ * the hole services/spendReceipt.js documents. scripts/verifyVideoResume.js
+ * asserts on this function's source that it contains no submit call.
+ */
+async function resumeForAd({ ad } = {}) {
+  const predictionId = ad?.veoPredictionId || null;
+  if (!predictionId) return { resumed: false, state: 'no-receipt' };
+  const peek = await peekPrediction(predictionId);
+  return { resumed: peek.state === 'done', predictionId, ...peek };
+}
+
 async function pollPrediction(predictionId, { shouldCancel = null, adId = null, stagePrefix = null } = {}) {
   const t0 = Date.now();
   let pollCount = 0;
@@ -2246,7 +2549,26 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       return url;
     }
     if (status === 'failed') {
-      throw new Error(`atlasVideo: prediction failed: ${data.error || 'unknown'} (id=${predictionId})`);
+      // Classify before throwing. The image path has routed failures through
+      // atlasErrorPolicy since it was written; this one never did, so a safety
+      // rejection surfaced to the operator as a bare "prediction failed" and
+      // read as a transient fault. Real example, 2026-08-04:
+      //   "Your input or generated content was blocked by safety review."
+      // A moderation block is deterministic — the same prompt and reference
+      // will be blocked again — so it must be NAMED, not retried behind
+      // generic prose. `label` is null for every other class, which keeps the
+      // provider's own wording for anything we have not classified.
+      const providerMsg = data.error || 'unknown';
+      const policy = classify({
+        predictionStatus: status,
+        msg: providerMsg,
+        nsfw: data.has_nsfw_contents ?? null
+      });
+      const heading = policy.label || 'atlasVideo: prediction failed';
+      const err = new Error(`${heading}: ${providerMsg} (id=${predictionId})`);
+      err.atlasPolicy = policy.name;
+      err.terminal    = policy.terminal;
+      throw err;
     }
     const elapsedSec   = Math.round((Date.now() - t0) / 1000);
     const remainingSec = Math.round((MAX_POLL_MS - (Date.now() - t0)) / 1000);
@@ -2457,6 +2779,59 @@ async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, v
 
 // ── Public API ────────────────────────────────────────────────────────
 
+// Rebuild the LayoutInputArtifact when it's missing OR stale — built
+// against an older INPUT_SCHEMA_VERSION than layoutInputService emits
+// today. Only emptiness used to gate a rebuild at both call sites below,
+// so a stale-but-populated artifact was served forever: 722 of 738
+// production artifacts predate the 4.1 quote-provenance stamp, and the
+// render-time provenance gate (quoteProvenance.js) silently WITHHOLDS
+// any customer quote that isn't stamped with today's provenance fields —
+// which is why customer quotes were disappearing from videos even
+// though the underlying reviews existed. This helper defers the actual
+// staleness decision to buildLayoutInput's own cache lookup (a
+// schemaVersion mismatch is already treated as a cache MISS there, see
+// layoutInputService.js ~282-293) rather than re-deriving that rule a
+// third time here — the lpStale check below is only a cheap guard so we
+// don't call buildLayoutInput at all when the artifact is already
+// current. Shared by prepareStoryboard and generateForAd, which both
+// call it with the same shape of already-loaded docs. Preserves exactly:
+// the non-fatal try/catch, the noteRenderIssue({...}) call, the timing
+// log ("derived in Nms"), and the post-build re-read keyed on
+// {mediaId, productId}.
+async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product, categories, campaign, targetAspect }) {
+  const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
+  const lpStale = !lpEmpty && layoutInput.schemaVersion !== INPUT_SCHEMA_VERSION;
+  if ((lpEmpty || lpStale) && ad.productId) {
+    const tmpl = resolveTitleTemplate({ brand, product, categories });
+    try {
+      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
+      const t0 = Date.now();
+      await buildLayoutInput({
+        mediaId:     media._id,
+        template:    tmpl,
+        aspectRatio: targetAspect,
+        options: {
+          campaignKind:  campaign?.kind || 'product',
+          variantKind:   'product_image',
+          productId:     ad.productId,
+          paletteSource: 'media'
+        }
+      });
+      console.log(`📐 layoutInput[ad=${ad._id}]: derived in ${Date.now() - t0}ms`);
+      layoutInput = await LayoutInputArtifact
+        .findOne({ mediaId: media._id, productId: ad.productId })
+        .sort({ createdAt: -1 }).lean();
+    } catch (err) {
+      console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
+      noteRenderIssue(ad._id, {
+        message: `layoutInput derivation failed: ${err.message}`,
+        stage: 'layoutInput'
+      });
+    }
+  }
+  return layoutInput;
+}
+
 // Prepare the storyboard for an ad — context load + GPT storyboard
 // generation, no video generation. Used by the orchestrator to produce
 // the storyboard once before dispatching Grok and chrome in parallel.
@@ -2486,43 +2861,22 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
   });
   logResolution(ad._id, model, renderAspect, targetAspect, fallback);
 
-  // Derive layoutInput if missing — the brand-script overlay downstream
-  // reads its copy/proof/product/theme fields directly. The overlay is
-  // sized to the FINAL canvas (targetAspect), so derivation runs at the
-  // platform aspect, NOT the render aspect. Passing renderAspect here
-  // was the source of the "template ai_brand_led does not support
-  // aspect ratio 3:4" warnings on 4:5 ads — the template supports 4:5
-  // fine; it was being asked about the Grok fallback aspect.
+  // Derive layoutInput if missing OR stale (schemaVersion !== the
+  // current INPUT_SCHEMA_VERSION) — the brand-script overlay downstream
+  // reads its copy/proof/product/theme fields directly, INCLUDING the
+  // provenance-stamped primary_quote. A stale-but-populated artifact
+  // used to be served forever because only the empty check gated a
+  // rebuild; see refreshStaleLayoutInput() above for why that silently
+  // withholds customer quotes at render time. The overlay is sized to
+  // the FINAL canvas (targetAspect), so derivation runs at the platform
+  // aspect, NOT the render aspect. Passing renderAspect here was the
+  // source of the "template ai_brand_led does not support aspect ratio
+  // 3:4" warnings on 4:5 ads — the template supports 4:5 fine; it was
+  // being asked about the Grok fallback aspect.
   let layoutInput = layoutInputInitial;
-  const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
-  if (lpEmpty && ad.productId) {
-    const tmpl = resolveTitleTemplate({ brand, product, categories });
-    try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
-      const t0 = Date.now();
-      await buildLayoutInput({
-        mediaId:     media._id,
-        template:    tmpl,
-        aspectRatio: targetAspect,
-        options: {
-          campaignKind:  campaign?.kind || 'product',
-          variantKind:   'product_image',
-          productId:     ad.productId,
-          paletteSource: 'media'
-        }
-      });
-      console.log(`📐 layoutInput[ad=${ad._id}]: derived in ${Date.now() - t0}ms`);
-      layoutInput = await LayoutInputArtifact
-        .findOne({ mediaId: media._id, productId: ad.productId })
-        .sort({ createdAt: -1 }).lean();
-    } catch (err) {
-      console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
-      noteRenderIssue(ad._id, {
-        message: `layoutInput derivation failed: ${err.message}`,
-        stage: 'layoutInput'
-      });
-    }
-  }
+  layoutInput = await refreshStaleLayoutInput({
+    layoutInput, ad, media, brand, product, categories, campaign, targetAspect
+  });
 
   // Storyboard retired on the Atlas path: the Ken Burns prompt fully
   // specifies camera + timeline for every registered model, so the GPT
@@ -2578,44 +2932,28 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // Video pipeline previously skipped layoutInput derivation, so
   // products that hadn't been through the image-gen pipeline arrived
   // here with no derived rating/price/benefits/badges/proof data.
-  // Trigger derivation now if the artifact is missing or empty, using the
-  // CANONICAL template (or the brand/product Title Studio override) — the
-  // creative director no longer influences it. The builder caches per
-  // (mediaId, template, aspectRatio, productId, variantKind,
+  // Trigger derivation now if the artifact is missing OR stale
+  // (schemaVersion !== INPUT_SCHEMA_VERSION), using the CANONICAL
+  // template (or the brand/product Title Studio override) — the
+  // creative director no longer influences it. Staleness matters as
+  // much as emptiness: 722 of 738 production artifacts predate the 4.1
+  // quote-provenance stamp, and a stale-but-populated artifact used to
+  // be served forever (only the empty check gated a rebuild) — its
+  // UNSTAMPED customer quotes then get silently withheld by the
+  // render-time provenance gate, which is why customer quotes were
+  // disappearing from videos. See refreshStaleLayoutInput() above: it
+  // defers to buildLayoutInput's own cache, which already treats a
+  // schemaVersion mismatch as a MISS and rebuilds (layoutInputService.js
+  // ~282-293), rather than duplicating that rule here. The builder
+  // caches per (mediaId, template, aspectRatio, productId, variantKind,
   // campaignContextHash) — so subsequent runs hit the cache instead of
   // re-deriving. Derivation runs at the TARGET (platform) aspect since
   // the derived layout describes chrome sized to the final canvas, not
   // the raw video render aspect. Non-fatal on failure.
   let layoutInput = layoutInputInitial;
-  const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
-  if (lpEmpty && ad.productId) {
-    const tmpl = resolveTitleTemplate({ brand, product, categories });
-    try {
-      console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
-      const t0 = Date.now();
-      await buildLayoutInput({
-        mediaId:     media._id,
-        template:    tmpl,
-        aspectRatio: targetAspect,
-        options: {
-          campaignKind:  campaign?.kind || 'product',
-          variantKind:   'product_image',
-          productId:     ad.productId,
-          paletteSource: 'media'
-        }
-      });
-      console.log(`📐 layoutInput[ad=${ad._id}]: derived in ${Date.now() - t0}ms`);
-      layoutInput = await LayoutInputArtifact
-        .findOne({ mediaId: media._id, productId: ad.productId })
-        .sort({ createdAt: -1 }).lean();
-    } catch (err) {
-      console.warn(`⚠️  layoutInput[ad=${ad._id}]: derivation failed (non-fatal) — ${err.message}`);
-      noteRenderIssue(ad._id, {
-        message: `layoutInput derivation failed: ${err.message}`,
-        stage: 'layoutInput'
-      });
-    }
-  }
+  layoutInput = await refreshStaleLayoutInput({
+    layoutInput, ad, media, brand, product, categories, campaign, targetAspect
+  });
 
   const lpInput    = layoutInput?.input || null;
   const lpSrcMedia = lpInput?.source_media || null;
@@ -2911,6 +3249,7 @@ module.exports = {
   DEFAULT_REFERENCE_IMAGE_COUNT,
   MAX_REFERENCE_IMAGE_COUNT,
   REPEAT_PRIMARY_TOTAL_CAP,
+  MAX_DISTINCT_REFERENCES,
   capsFor,
   resolveVideoModel,
   resolveModelAndAspect,
@@ -2941,5 +3280,13 @@ module.exports = {
   // so the harness can prove Grok stays <=1 RPS under raised VEO_CONCURRENCY.
   pacedModelSubmit,
   SUBMIT_SPACING_MS,
-  isGrokModel
+  isGrokModel,
+  // Cloudinary upload ceiling — exported for scripts/verifyReframeUploadCeiling.js
+  // so the harness can prove a >20 MiB 4K outpaint is refitted rather than lost.
+  fitBufferForCloudinary,
+  CLOUDINARY_MAX_UPLOAD_BYTES,
+  // Resume-from-receipt. Exported for scripts/verifyVideoResume.js, which pins
+  // that neither of these can ever submit.
+  peekPrediction,
+  resumeForAd
 };

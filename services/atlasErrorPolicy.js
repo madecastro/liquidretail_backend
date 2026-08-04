@@ -116,12 +116,25 @@ const POLICIES = Object.freeze({
     // "blocked" is deliberately NOT matched on its own — it appears in unrelated
     // infrastructure messages, and misreading one as moderation would mark a
     // retryable failure permanently futile.
+    // `review|check|guideline` were ADDED to the safety alternatives on
+    // 2026-08-04. Atlas's live wording is "Your input or generated content was
+    // blocked by safety REVIEW", which matched none of the original
+    // alternatives, so a real moderation block fell through to predictionFailed
+    // and was RETRIED — futile by definition, and mislabelled as a prediction
+    // failure in every log and on the ad. Verified against the production
+    // message.
+    //
+    // The list stays ENUMERATED rather than `safety\s+\w+`: a false positive
+    // here is not cosmetic, it downgrades a retryable failure to give-up and
+    // throws away a render that would have succeeded on the second attempt.
+    // `blocked` alone is still deliberately not matched, for the same reason.
     match: ({ nsfw, msg }) =>
       nsfw === true
       || (Array.isArray(nsfw) && nsfw.some(Boolean))
-      || /moderation|safety system|content policy|safety filter|flagged as unsafe/i.test(msg),
+      || /moderation|safety\s+(system|filter|review|check|guidelines?)|content policy|flagged as unsafe/i.test(msg),
     // Deterministic: the same prompt and reference will be blocked again.
     charged: false, action: 'give-up', maxAttempts: 1,
+    label: 'Model Moderation Error',
     alertLevel: 'warn', alertKey: 'atlas:moderation',
     why: 'safety filter rejected the input — identical retry is futile; the prompt or reference must change'
   },
@@ -228,6 +241,10 @@ function finalize(name, p, ctx, retryAfterSec) {
     probeFirst: p.action === 'probe',
     terminal: p.action === 'fix-config' || p.action === 'give-up',
     maxAttempts: p.maxAttempts,
+    /** Operator-facing heading for this failure class, or null to use the raw
+     *  provider text. Surfaced on Ad.renderError.message so the ads page names
+     *  the failure class instead of echoing provider prose. */
+    label: p.label || null,
     alertLevel: LEVELS.includes(p.alertLevel) ? p.alertLevel : 'warn',
     alertKey: p.alertKey,
     why: p.why,

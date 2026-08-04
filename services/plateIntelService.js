@@ -169,7 +169,18 @@ function resolveTitlePlacementMode({ placementMode = null, brand = null } = {}) 
 /**
  * Analyze a plate (video file or single image) and return plateHints.
  * Never throws — titling must render even when analysis fails.
- * Only called when placement mode is 'content'; scan depth via TITLE_PLATE_SCAN.
+ *
+ * Called unconditionally by both placement modes (fixed 2026-08-04 — this
+ * docstring used to say "only called when placement mode is 'content'",
+ * which was already false at every call site: remotionRenderService.js
+ * gates the call on `TITLE_PLATE_SCAN !== 'off'` only, never on the
+ * resolved placement mode. That mismatch wasn't cosmetic — 'canonical' is
+ * the default, and Canonical.jsx's global ink flip (plateIsLightGlobal)
+ * needs real plateHints to ever flip off the default dark ink. Skipping
+ * the scan in canonical mode left plateHints permanently null there,
+ * so the flip could never fire and a near-white studio plate shipped
+ * white-on-white title text. Scan depth (not whether it runs at all)
+ * is controlled by TITLE_PLATE_SCAN ('basic' default | 'gemini' | 'off').
  */
 async function analyzePlate(platePath, { durationSec = 8, isImage = false } = {}) {
   const mode = (process.env.TITLE_PLATE_SCAN || 'basic').toLowerCase();

@@ -12,7 +12,7 @@ This is the engineer reference for every background and creative pipeline in the
 > | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | ~$1.00 / 8s @ 1080p (720p same list price) | `VEO_CONCURRENCY=4` (self-imposed probe 2026-08-02; Omni RPS unpublished). **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. Re-measure before raising past 4 |
 > | **Catalog scan (sitemap + JSON-LD)** | Demo / catalog sync | Deterministic HTTP only — **no LLM** | Caps + per-host min-gap; bounded PDP concurrency |
 
-Non-secret defaults live in `config/defaults.env` (versioned). Secrets stay in the Render environment only (see [§9](#9-configuration--secrets)).
+Non-secret defaults live in `config/defaults.env` (versioned). The Render dashboard holds **secrets only** (plus one deliberate non-secret exception, `JIRA_PROJECT_KEY`) — migration complete 2026-08-03; see [§9](#9-configuration--secrets) and CLAUDE.md §4a.
 
 ---
 
@@ -338,12 +338,84 @@ there is no lexical fallback. Full rationale, failure policy and consumer list:
 
 Director schema **v3** nests strategy fields under `concept.routing` (`media_picks`, `creative_style`, `output_shape`, …). The producer dual-read both shapes and logged `warnings=0` while **every consumer that still read flat v2 discarded the concepts** → `payloads=0` (zero ads, paid Director rounds wasted). **One helper only:** `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`. Consumers include `campaignAdsGenerationService`, `aiJudgeService`, `aiCanvasHtmlGeneratorService`, `veoStoryboardService`. `scripts/verifyConceptContract.js` (125 checks) **fails the suite** if any `services/` or `routes/` file reads a `ROUTING_NESTED_FIELDS` name off a concept without the helper. Verified live after fix: `concepts=3 payloads=3` where it was `payloads=0`.
 
-### Hero-image default
+### Seed selection — image vs video (the first-catalog-image rule)
 
-`DIRECTOR_UNIVERSE_TOP_N` default **1** (was 10) — a **default** change, not a capability removal. Ceiling stays 10; multi-image fully wired; operator multi-select still widens via `Math.max(mediaIds.length, TOP_N)` (`campaignAdsGenerationService.js:184,2331-2333`). Side effects of TOP_N=1:
+> **Was falsely documented (corrected 2026-08-03):** this section used to be titled *"Hero-image default"* and presented `DIRECTOR_UNIVERSE_TOP_N=1` as delivering the owner's rule. **TOP_N=1 is a COUNT, not a choice of image.** It trims a shotType-ranked pool to one entry; which entry survived was decided by shot type, and catalog media routinely lost.
+>
+> **Amended the same day.** The rule is no longer stated in terms of the `imageRole: 'hero'` LABEL. Owner, verbatim 2026-08-03: *"I actually just want to use the first image that comes from the catalog not the 'hero' image since that may also come from social media or UGC?"* The default image seed is **the first image that came from the catalog**, and it **can never resolve to UGC**.
+
+**The two rails have genuinely different seed MECHANISMS, but now the same rule. Do not generalize the mechanism.**
+
+| Rail | Default seed | Mechanism |
+|---|---|---|
+| **Static image** (§5, `runConceptDrivenExpansion` → `buildSeededUniverse`) | the **first image that came from the catalog**, pinned explicitly | shotType ranking **then** the `preferFirstCatalogImage` hoist (a 3-tier cascade), then trim to `topN` |
+| **Deterministic video** (§6) | the **first image that came from the catalog**, queried directly | `Media.findOne({ 'metadata.imageRole': 'hero' })` → earliest `createdAt` → lazy materialize. Shot type is never consulted |
+
+**Why the static rail needed a fix.** `buildSeededUniverse`'s auto-assembly branch (`seededUniverseService.js:400-534`) merges catalog media **and** `product_match` UGC into ONE pool, then ranks it with `rankMergedPool` (`:96-120`) by `classification.shotType` first — lifestyle → on_model → flat_lay → product_only → detail → packaging → unknown (`shotTypeRank.js:15-23`). `metadata.imageRole === 'hero'` is only a tiebreak **within** a tier, key #2 of 4 (after the `wantsVideo` burned-text penalty, before engagement and `createdAt`). Source does not gate order, by design: a UGC lifestyle post ranks equal to a catalog lifestyle shot. So `.slice(0, 1)` of that ranking handed the Director a lifestyle catalog **ALT** — or a **UGC post**, which then also flipped `Ad.variantKind` to `'ugc'` via `matchTierForUniverseRole` / `variantKindForUniverseRole`.
+
+**What pins the catalog's first image:** the opt-in `opts.preferFirstCatalogImage`. `promoteFirstCatalogImage` (`seededUniverseService.js:178`) returns a **new array** (pure, non-mutating) with one entry moved to index 0, every other entry keeping its relative order. It is a **cascade**, and every tier is gated on `role === 'catalog'`, so **no tier can select UGC**:
+
+| Tier | Selects | Why |
+|---|---|---|
+| **1** | first entry with `role === 'catalog'` **and** `media.metadata.imageRole === 'hero'` | That stamp is written in exactly one place: `catalogProductDetectService` materialises `CatalogProduct.imageUrl` — the catalog feed's **first** image — with `imageRole: 'hero'` (`:60`); `additionalImages[]` get `'alt'` (`:80`, `:513`). So tier 1 *is* "the first image from the catalog", wearing a legacy name. Nothing stamps `'hero'` on social/UGC media (the only other writer is `shopifyPublicIngestService.js:526`, which writes `'video'`) |
+| **2** | else, among `role === 'catalog'` entries, the one with the **earliest `media.createdAt`** | **This tier is the point of the amendment.** The tier-1 stamp can be **ABSENT** — hero materialisation failed, or the row predates the stamp. A tier-1-only helper returned the pool unchanged in that case, and the shotType ranking then decided index 0 out of a pool that **merges catalog with `product_match` UGC** — which is exactly how a UGC post became the default seed of a catalog product ad. The **fallthrough** is the failure mode; tier 2 removes it, so an **unstamped catalog set still beats UGC**. Catalog `Media` rows are materialised in feed order, so earliest ≈ first |
+| **3** | nothing — an unchanged copy | No `role === 'catalog'` entry exists in the pool at all. Nothing came from the catalog, so there is nothing to pin, and the cascade does **not** settle for a UGC entry as a consolation prize |
+
+Tier 2 determinism: the scan uses a strict `<`, so an **equal** `createdAt` never displaces the incumbent and the earlier entry in **ranked** order keeps index 0. A **missing or unparseable** `createdAt` maps to `Infinity` — it sorts **last**, never first, so a legacy row with no timestamp cannot win "earliest" by defaulting to epoch 0. If *every* catalog entry lacks a timestamp they all tie and the earliest in ranked order wins.
+
+Applied at `:504`, on the ranked wrappers, **before** `projectEntry()` and **before** `.slice(0, topN)` — with `topN=1` the slice is the whole decision, so a promotion after it would be inert; and `projectEntry` drops `createdAt` entirely, so tier 2 could not run after it.
+
+**The `role === 'catalog'` test is load-bearing in every tier**, not defensive: UGC docs carry `metadata.imageRole` too (we do not author creator-side metadata), so a creator post stamped `'hero'` must lose tier 1 to an *unstamped* catalog image via tier 2, and must never be selectable by tier 2 either.
+
+**This cascade deliberately mirrors** the proven one on the deterministic video rail, `campaignAdsGenerationService.js:2085` (*"Feed-order hero: imageRole hero → earliest createdAt → lazy materialize"*) — same tier 1, same tier 2. That rail's third step lazily materialises `Media` from `CatalogProduct.imageUrl`, a DB write that cannot live in a pure ranking helper; here tier 3 is "leave the pool alone".
+
+**Where it deliberately does NOT apply** (all three are required, not defensive):
+
+- **`preferFirstCatalogImage` defaults to `false`.** Only `runConceptDrivenExpansion` opts in, and only for image runs with no operator picks: `preferFirstCatalogImage: !operatorPickedMedia && resolvedKinds.includes('image')` (`campaignAdsGenerationService.js:2388`). Every other caller — including `scripts/inspectImageSelection.js` — is byte-identical to before.
+- **The `restrictToMediaIds` branch** (`seededUniverseService.js:339-397`) returns before the promotion. Operator picks **are** the "unless the user overrides it" half of the rule; re-ordering them would override the override. They still widen the window via `Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)` (`campaignAdsGenerationService.js:2343-2345`) rather than being truncated to 1. Note the override is a **membership** override, not an ordering one — that branch still shotType-ranks the picks.
+- **Brand-only runs** (`productId === null`) pool every product's catalog media, so many docs are *some* SKU's first catalog image and "the catalog's first image" has no meaning; promoting one would silently pick a SKU. Gated by `!isBrandOnly`.
+
+**Deliberate precedence:** a catalog image with burned-in text is still promoted, even on a mixed image+video run where `rankMergedPool` penalizes burned text. The owner rule outranks that tiebreak.
+
+**Pinned by** `scripts/verifySeededUniverseHeroDefault.js` — **111 offline checks** (pure, no DB / network / key), covering all three tiers, the tie and missing-`createdAt` outcomes, purity and stability, the end-to-end `buildSeededUniverse` shape at `topN=1` for both tier 1 and tier 2, the override and brand-only gates, and the source wiring (including that the promotion is **not** folded into the shared `rankMergedPool`, which would silently re-order operator picks). Its header carries the revert-proof recipe.
+
+`DIRECTOR_UNIVERSE_TOP_N` default **1** (was 10) is still a **default** change, not a capability removal. Ceiling stays 10; multi-image fully wired (`campaignAdsGenerationService.js:195,2343-2345`). Side effects of TOP_N=1:
 
 - Judge `media_utilization` axis is **N/A** (excluded from average) — it was docking every concept for obeying our own constraint (`aiJudgeService.js:423-431`).
 - Output-shape menu narrows to **`static_single` only** so the model cannot emit a collage declaring one tile (`aiCreativeDirectorService.js` `feedOutputShapesForUniverse`).
+- The Director's AVOID block asks each round to prefer media the previous round did not use. At universe size 1 that is unsatisfiable regardless of this fix — one entry every round.
+
+**Known-stale prompt text (not changed here):** `aiCreativeDirectorService.js:1541` tells the model the universe is "PRE-RANKED by shot-type quality … earlier entries are BETTER seeds". That stays true at the default (TOP_N=1 ⇒ one entry, nothing to order), but if `DIRECTOR_UNIVERSE_TOP_N` is raised above 1 **with no operator picks**, index 0 is now the pinned first-catalog-image rather than the top shot-type candidate, and that sentence would need rewording before the wider window is used.
+
+### Static regenerate — catalog-first reseed (`REGEN_RESEED_CATALOG_FIRST`)
+
+Shipped in `be5b83f` (2026-08-03). **Default ON** (`config/defaults.env`; unset/empty also ON — only `0`/`false`/`no`/`off` turns it off; `isRegenReseedCatalogFirstEnabled`, `adRegenerateService.js:110-114`).
+
+**Why it exists.** `runImage` used to **replay** the stored stack (`Ad.referenceMediaIds` if non-empty, else `Ad.mediaIds`) and never re-derive (`adRegenerateService.js:477-482` is still that path when the reseed is skipped). Ads queued while `DIRECTOR_UNIVERSE_TOP_N` was 10 still hold 3+ entries in `mediaIds`, so every future regen re-sent that stack forever.
+
+**NOT a trim.** Historical stacks were shotType-ranked **LIFESTYLE-FIRST** over a pool that **merges catalog with `product_match` UGC** (`shotTypeRank.js`). So `mediaIds[0]` is often a UGC post; trimming to `[0]` would permanently lock a social image as the seed. The fix **re-derives** the first catalog image instead.
+
+**Cascade** (`deriveFirstCatalogMediaId` / pure `pickFirstCatalogMediaId`, mirrors `campaignAdsGenerationService.js:2085` and `promoteFirstCatalogImage`):
+
+| Tier | Selects |
+|---|---|
+| **1** | `source:'catalog-product'` + ad product + ad brand + `metadata.imageRole === 'hero'` |
+| **2** | else same scope, earliest `createdAt` |
+| **3** | nothing — leave existing behaviour untouched (`NO_CATALOG_MEDIA`) |
+
+Every query pins `source:'catalog-product'` **and** the ad's own `metadata.catalogProductId` **and** `Media.brandId`. `isCatalogMediaForProduct` re-checks every candidate (`adRegenerateService.js:150-172`). A catalog **VIDEO** can never win (`fileType === 'video'` and `metadata.imageRole === 'video'` both reject — `source:'catalog-product'` includes videos from Shopify ingest). An unusable/missing `fileUrl` is an **honest skip**, not a silent fallback to the ad's original seed (that would re-lock the UGC seed under a success log).
+
+**Gates** (`reseedDecision`, all four required):
+
+1. Flag on.
+2. `ad.kind !== 'video'` (static only).
+3. `ad.variantKind === 'product_image'` only — owner: *"UGC ads shouldn't be affected by this change, we haven't optimized that path yet."* A `variantKind:'ugc'` ad is supposed to seed from a social image.
+4. `Ad.referenceMediaIds` empty — a non-empty operator pick **always wins**.
+5. `ad.productId` present.
+
+**NOT persisted.** The derived stack is computed at regenerate time and passed into `renderDirectImage` only (`referenceSource: 'catalog-first'`). Writing it back onto `Ad.mediaIds` would rewrite historical rows and make the kill switch useless after one regen. Flipping `REGEN_RESEED_CATALOG_FIRST=false` restores the old output on the next regen with no code deploy. **Not a money knob** — still exactly one `gpt-image-2/edit` per regen; reference count does not move price (`atlasImageService.js:75-104`).
+
+**Pinned by** `scripts/verifyRegeneration.js` (R3 gate matrix, R3b cascade tiers, R3c fileUrl/video/cross-tenant).
 
 ### Stages (live direct-image path)
 
@@ -387,7 +459,7 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 | `AI_DIRECT_IMAGE_TIMEOUT_MS` | `600000` | Wall clock for plate |
 | `ATLAS_IMAGE_POLL_MS` | `3000` (code default) | Image prediction poll; also drives stage piggyback |
 | `AD_STAGE_MIN_MS` | `3000` (code default; **not** in `defaults.env`) | Stage write floor for same phase |
-| `RENDER_CONCURRENCY` | **`8`** | Parallel static ads in `runRenderLoop` (raised 4→8 2026-08-02; measured clean) |
+| `RENDER_CONCURRENCY` | **`8`** | Parallel static ads in `runRenderLoop`. File raised 4→8 on 2026-08-02; **live in prod 2026-08-03** when the dashboard pin of 4 was deleted (see §9 / CLAUDE.md §4a) |
 | `AI_HTML_LAYOUT_ENABLED` / `RENDER_USE_HTML` | `true` | Still used by the **legacy** HTML arm only |
 | `AI_IMAGE_REFERENCE_*` | `false` / inert | **Not read by the live render path** — was falsely documented as prod-on polish |
 
@@ -405,6 +477,71 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 | `GET /api/ads/formats` | `formatCatalog()` verbatim — display-only, brand-agnostic, no `brandId` (`routes/ads.js:1998-2000`) |
 | Named routes before `/:id` | **ROUTE ORDER is load-bearing.** `mongoose.isValidObjectId('video-models') === true` (any 12-byte string casts), so `router.param` ObjectId guards (`routes/ads.js:2105-2112`) cannot protect a 12-char route name — they only turn bad ids into 404 instead of 500 CastError |
 
+### Surface geometry — generation size and the safe box
+
+`META_STATIC_FANOUT` is three **separate billable** `openai/gpt-image-2/edit`
+calls, one per surface, because the model typesets headline / CTA / price **into
+the pixels**. `platformFormats.js:394-403` explains why one master cannot be
+cropped into three aspects: the crop would slice through that typeset copy.
+
+**Every live static surface now generates at its EXACT delivery aspect**, so
+nothing is destroyed after the billable call:
+
+| surface | aspect | generate | deliver | scale | post-gen crop |
+|---|---|---|---|---|---|
+| `meta_feed_1_1` | 1:1 | `1024x1024` | 1080x1080 | 1.0547 | none |
+| `meta_feed_4_5` | 4:5 | `1088x1360` | 1080x1350 | 0.9926 | none |
+| `meta_stories_9_16` | 9:16 | `1152x2048` | 1080x1920 | 0.9375 | none |
+| `pmax_16_9` *(frozen)* | 16:9 | `1536x1024` | 1920x1080 | 1.25 | 80px top+bottom (15.6%) |
+
+Selection stays least-crop over `staticAdIntents.GEN_SIZES` — no per-surface
+hardcoding. **Table order is load-bearing:** `chooseGenSize` uses strict
+`loss < best.loss`, so an equal-loss tie keeps the earlier entry.
+
+**Size legality is a two-tier rule.** The schema `size` enum has 14 values and is
+the operative contract; the model README still lists three and is stale. The
+schema *also* documents arbitrary `WIDTHxHEIGHT` divisible by 16 for gpt-image-2,
+but that text is spliced from OpenAI's own docs and carries an unpublished "must
+satisfy the model's current pixel and edge limits" — so **prose is not warrant to
+send a size.** A non-enum size is only allowed once a live probe proves it, and
+`scripts/verifyStaticSafeBox.js` S4 enforces that with the prediction id
+recorded. `1152x2048` is an enum member. `1088x1360` is not, and was probed
+(2026-08-03, one submit, returned exactly 1088x1360, aspect 0.800000). The
+failure mode that rule guards against is not a 400 — it is a silent coercion to
+the `1024x1024` default, which would hand a square frame to a 4:5 surface and
+then centre-crop it.
+
+**The safe box is inset from the KEPT region, additively.** Order is crop →
+platform UI reserve → our 6% edge margin, with the margin measured on the *kept*
+short side. The previous code used `Math.max(cropBand, marginPx)`, which treated
+crop and margin as alternatives: the margin was 61.44px and the crop band was
+always larger, so on every cropped surface the margin collapsed to **zero** and
+the box handed to the model *was* the crop line. The tell needed no model
+compliance — `logoPlacementFor` composites the logomark from that same box, and
+it shipped flush to the delivered frame edge (0px gap) on Stories and 4:5.
+Emitted percentages are rounded **inward** (ceil low edge, floor high edge) so
+one-decimal rounding cannot walk an edge back into a destroyed band.
+
+**Crop machinery is retained deliberately.** `cropPx` / `extractFor` /
+`deliveryGeometryFor` are now no-ops on the live surfaces, but they still serve
+the frozen 16:9 surface and still centre-crop a model response that comes back
+off-size instead of stretching it. `deliveryGeometryFor` throws unless the kept
+region scales uniformly to `deliveryDims` within 0.5%.
+
+**Cost, stated honestly.** The catalog `base_price` is a flat `$0.01`, but real
+billing is token-based on `size` *and* aspect:
+`tokens = ceil(base × round(base × short/long) × (2,000,000 + W×H) / 4,000,000)`.
+Atlas never publishes `base`, so only ratios are derivable: 9:16 at `1152x2048`
+is ~**1.03×** the old `1024x1536`, and exact-4:5 is ~**1.11×**. Fewer pixels
+pushes cost down while a squarer frame pushes it up, which is why a pixel-count
+argument alone gets the direction wrong. Reported spend does not move either way —
+the ledger books the flat catalog estimate, which `atlasImageService` already
+notes understates this model ~6×.
+
+Offline check: `scripts/verifyStaticSafeBox.js` (329 checks, revert-proven six
+ways). `describeSurfaces()` dumps every declared surface including frozen and
+`coming_soon` entries.
+
 ### Consumers
 
 - `Ad` documents / display URLs → Meta & Google push, previews, campaign UI.
@@ -416,7 +553,7 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 
 > **Default path:** product campaigns queue **one deterministic video ad per product** (hero seed or operator-ordered catalog stack). The Creative Director no longer drives video by default — it serves **static image ads** and **opt-in video variants** only (backend PRs #11/#12/#13; wizard controls frontend PR #10).
 >
-> **Owner position (2026-08-03):** *"we disabled the director for the video path for now"* / *"we were using a canonical prompt"* / more archetypes may come later — **right now get the canonical prompt right.** Archetype-driven video is **deferred, not missing.** Camera prompt is generic **by design** (titling burns text downstream); levers are `videoPromptGuidance` + canonical directives in `buildVeoPrompt`, **not** concept fields. Prompt changes are **not evaluable** until Remotion titling is fixed (see Known open below).
+> **Owner position (2026-08-03):** *"we disabled the director for the video path for now"* / *"we were using a canonical prompt"* / more archetypes may come later — **right now get the canonical prompt right.** Archetype-driven video is **deferred, not missing.** Camera prompt is generic **by design** (titling burns text downstream); levers are `videoPromptGuidance` + canonical directives in `buildVeoPrompt`, **not** concept fields. **PR #61's three camera-prompt changes are fully rolled back** (see *Full PR #61 camera-prompt rollback* below) — tune the restored canonical text, do not re-land those three.
 
 ### Trigger
 
@@ -444,12 +581,16 @@ Results from deterministic + concept expanders are combined with **`mergeExpansi
 - **Seed selection**
   - If the operator passes ordered catalog-product `seedMediaIds`: grouped by `metadata.catalogProductId`, order preserved; **position 0 = primary seed** (`mediaId` + `referenceMediaIds` stack).
   - Else: feed-order **hero** (`imageRole: 'hero'` → earliest `createdAt` → lazy materialize from `product.imageUrl`); empty `referenceMediaIds` so render derives hero + alts.
+  - **This rail's default is a literal query cascade, not a ranking** — `Media.findOne({ source:'catalog-product', 'metadata.catalogProductId': productOid, 'metadata.imageRole':'hero' })`, else `.sort({ createdAt: 1 })` over the same catalog scope, else lazy materialize (`campaignAdsGenerationService.js:2074-2118`, same query for the catalog-anchor append). Shot type is never consulted and the scope is `source:'catalog-product'`, so it could never resolve to UGC and nothing here needed the §5 `preferFirstCatalogImage` fix — §5's cascade was written to **mirror this one**. Contrast with the static rail, whose seed comes out of a shotType-ranked merged pool → [§5 *Seed selection — image vs video*](#seed-selection--image-vs-video-the-first-catalog-image-rule).
+- **Reference stack (what the model actually receives)** — `buildReferenceImages` (`atlasVideoService.js:1917`) sends the first **3 DISTINCT** views: primary seed at position 0, then catalog mirrors in the order the caller supplied (`buildReferenceImages` does not sort — it trusts the arrival order of `catalogMedias`). Count comes from `DEFAULT_REFERENCE_IMAGE_COUNT = 3` (`:800`), overridable per brand/product via `videoSettings.referenceImageCount` up to `MAX_REFERENCE_IMAGE_COUNT = 7`, and always clamped to the resolved model's `maxReferenceImages`. An explicit operator pick list defines its own count (picking 5 means 5, not "5 truncated to 3") but is still clamped to the stack budget, with a warn.
+  - **`REPEAT_PRIMARY_REFERENCE` is OFF** — env `false` (`config/defaults.env:126`) **and** the code default is now `false` when the var is unset/blank (`isRepeatPrimaryReferenceEnabled`, `atlasVideoService.js:829-833`). Owner 2026-08-03: the repeated primary **increased** hallucination and the pre-repeat output was better, so the closing-repeat and its matching return-to-primary prompt text were both reverted (part of the full PR #61 rollback below). Kept as a flag for a future A/B, not deleted. **When set true** it becomes 3 distinct + the primary appended again = **4 total** (`referenceStackBudget` `:865` → `distinctCap 3` / `totalCap 4` from `REPEAT_PRIMARY_TOTAL_CAP = 4` `:808`); the duplicate is appended **after** final-URL dedupe so it survives, and it never evicts a real view — it only appends while `length < totalCap`. Anything above that hallucinated in pilot, so do not raise the cap. **`REPEAT_PRIMARY_TOTAL_CAP` applies only to the flag-on path.** On the default (flag-off) branch the hard ceiling is **`MAX_DISTINCT_REFERENCES = 5`** (`atlasVideoService.js:813`) — owner-set 2026-08-03 because turning the repeat off removed the only clamp, which would have let `videoSettings.referenceImageCount=7` ship seven refs against the owner's "too many images hallucinated" finding.
 - **Ad shape:** `renderRoute: 'veo'`, `kind: 'video'`, `template: 'ai_brand_led'`, `conceptId` / `judgeRank` null, `variantKind: 'product_image'`, run-level `videoPromptGuidance` / `videoPromptRaw` stamped when provided.
 - **Identity digest:** namespaced **`det-video:v1`** via `computeDeterministicVideoDigest` (campaign, product, ordered ref key or mediaId, platformFormat, CTA fields, guidance/raw). Does not collide with V1 JSON or V2 concept digests.
 
 #### Concept / director path
 
 - Image concepts: still Director + Judge (`aiCreativeDirectorService` / `aiJudgeService`); template label maps from `conceptField(concept, 'creative_style')` (v3 dual-read — flat `concept.creative_style` alone is wrong; see §5 concept contract).
+- **Director JSON contract lives in the prompt + salvage, not `response_format`.** The `director` role is `anthropic/claude-sonnet-5-ccmax` (`atlasModelMap.js:98`). Atlas **silently ignores** `response_format:{type:'json_object'}` for that model (probed live 2026-08-04 — both arms returned conversational prose; distinct from `json_schema` HTTP 400). Round system prompt now carries an `OUTPUT CONTRACT` block; parse path is `safeParseDirectorJSON` / `extractFirstBalancedObject` plus a one-shot corrective re-ask that shares the existing `attempt` budget (worst case still two paid Director calls). Measured pre-fix from Render logs over 24h: **10 Director round failures / 1 success** (prose openings → zero ads for that product). Code is applied in the working tree and offline-pinned by `scripts/verifyDirectorJsonSalvage.js` (32 checks, revert-proven); **uncommitted and not deployed** — do not claim production is fixed.
 - Video concepts: only when `conceptVideo` is true (opt-in `directorVariants`; default **off**); still capped at `VEO_ADS_PER_PRODUCT_CAP` (default **1**) per product in the concept expander. Storyboard text path reads archetype / hooks via `conceptField` (`veoStoryboardService.js`) — **Atlas/Omni camera prompt does not use that path** (storyboard retired on Atlas; see stages table). Opt-in queues extra concept **Ads**; it does **not** make Director drive the live camera prompt.
 - **Director does not drive video titling or the camera prompt** (PR #11) — **even when `directorVariants` is on.** Layout-input / title template for video is **canonical `ai_brand_led`** unless Title Studio overrides cascade (below). `creative_style` / `archetype` / `art_direction` are ignored for the camera prompt and for video titling.
 
@@ -486,6 +627,20 @@ Category settings sit **between product and brand**, ordered **leaf → root**, 
 ### Per-run / per-level video prompt
 
 **Camera-only by design** (`atlasVideoService.js:2593-2620`). Code comment: *"Camera-only prompt — the canonical brand-script overlay composites all on-screen text downstream from ad.copy + LayoutInputArtifact."* `buildVeoPrompt` receives **no Director concept** — args are `{brand, product, media, layoutInput, sourceMedia, aspectRatio, seedHasText, hasProductReference, storyboard, caps, durationSec}`. A generic-looking Omni prompt is intentional, not a wiring gap. **Do not** "fix" it by plumbing `art_direction` / `creative_style` / `archetype` into the camera prompt. **Levers:** `videoPromptGuidance` (prepend), the canonical directives inside `buildVeoPrompt`, and `videoPromptRaw` (full replace). **Current objective: tune the canonical prompt**; archetype-driven video is deferred.
+
+#### Full PR #61 camera-prompt rollback (owner 2026-08-03)
+
+Commit `134db56` (PR #61) added three camera-prompt changes in `services/veoPromptBuilder.js`. **All three are reverted** (shipped `be5b83f`). Owner, verbatim: *"This is creating additional hallucinations and the previous output was better."*
+
+| # | Reverted piece |
+|---|---|
+| 1 | Scene 3 "RETURN TO THE PRIMARY VIEW" + two PRODUCT FIDELITY sentences claiming the FINAL reference repeats the primary view |
+| 2 | `subjectContinuity` directive — both `OMNI_DIRECTIVES` and `GROK_DIRECTIVES`, plus its `lines.push` in `buildVeoPrompt` |
+| 3 | Crossfade-vs-long-dissolve policy rewording |
+
+**Mechanical acceptance test (worth treating as such):** the file now differs from `git show 134db56~1:services/veoPromptBuilder.js` in exactly **two hunks**, both comment/export only (rollback comment block + `OMNI_DIRECTIVES` / `GROK_DIRECTIVES` module exports for harnesses) — **zero prompt-string hunks**. Pinned by `scripts/verifyPostPilotBatch.js` (B1–B14). **B14** rebuilds the prompt from the `134db56~1` source out of git (`git show` only; skips loudly if the baseline is unreachable) and asserts byte-identity.
+
+**CRITICAL — the restored text is deliberately self-contradictory.** `transitions` permits "Smooth crossfades only, ~0.25s" while `doNot` bare-bans "dissolves", and a crossfade **is** a short dissolve. Owner-confirmed after the contradiction was pointed out: that contradictory pair is the version that produced better output. **Anyone "fixing" it is reintroducing the regression.** Do not soften, split, or reword either string to resolve it (`veoPromptBuilder.js:193-207` comment block).
 
 | Field | Semantics |
 |---|---|
@@ -552,10 +707,10 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 
 **Known open (do not claim fixed):**
 
-- **Remotion titling fails on every run** — `Could not extract frame from compositor / Request closed` (`@remotion/renderer` `offthread-video-server.js:99`). Result: paid Omni master, ad `failed` with `master rendered; titling failed`, **no titled output**. Prompt / canonical-tuning work is **unobservable** until this is fixed. Font 404/CORS lines in the same log are a **red herring** — FontLoader says "using fallback stack" and recovers; they are not the fatal error.
+- **Remotion titling fatal on `library-match` fonts (verified 2026-08-04).** Root cause is a path mismatch: `library-match` Inter resolves to `fonts/Inter.ttf`, but `assetPathFor` maps `/fonts/*` only to `FONT_CACHE_DIR` (`assets/webfonts`) → **404**; the 404 branch set no CORS header so `FontFace.load()` rejects; and installed `@remotion/fonts` `load-font.js` ends `catch (err) { cancelRender(err) }` — so `FontLoader.jsx`'s ".catch → using fallback stack" is a **false safety net** (runs after cancel, cannot un-cancel). `Could not extract frame from compositor / Request closed` is **downstream collateral**, not the fault. Control proof: brands whose fonts resolve via Google (files really in `webfonts/`) render clean. **Fix branch** `fix/remotion-font-fatal-load` exists (working tree; not authorised to commit as of the 2026-08-05 pickup) — see `session.md` §0. **Do not re-claim "font 404 is a red herring."**
 - `veoPredictionId` is a spend receipt that is **never resumed** — process death + re-drain can double-bill.
 - `queued` ads still never auto-drain after web-process death (reaper only flips `rendering` → `queued`).
-- Static: ~1-in-3 ads render a competitor-shaped brand mark on the product (prompts already demand fidelity — fix is measure-and-reject, not prompt tuning). **Video path not QC’d** for the same defect 2026-08-03.
+- Static: ~1-in-3 ads render a competitor-shaped brand mark on the product (prompts already demand fidelity — fix is measure-and-reject, not prompt tuning). **Video path not QC’d** for the same defect 2026-08-03. **Still open after the 2026-08-03 product-fidelity prompt hardening** — that is owner-directed work layered on top, not a fix for this, and `adVisionQcService` remains the actual fix. The static prompt now opens with `staticAdIntents.PRODUCT_FIDELITY` (source-of-truth, no category/brand-prior inference, preserve form/construction/surface/colour/on-item-graphics/details/condition), plus carve-outs in `absences` and `textBlock` so the no-added-text rules cannot strip the product's own printed label. Kill switch `STATIC_PROMPT_FIDELITY_HARDENING=false` restores a **byte-identical** pre-hardening prompt (block + both carve-out sites revert together). **Watch for a text-fidelity regression:** the prompt more than doubled (~3.5-4.1k → ~7.8-8.4k chars) and sits above `SET EXACTLY THESE STRINGS`, whose measured baseline is 139/140 strings over 20 renders. Pinned by `scripts/verifyStaticFidelityPrompt.js` (419 checks, both arms).
 - Meta surface preview chrome still shows placeholder copy (“Lorem ipsum dolor sit amet”) in places — preview-only furniture, not burned-in titles.
 
 ### Wizard controls (frontend PR #10; backend contract)
@@ -708,7 +863,7 @@ Single resolver: `services/concurrency.js` (frozen `concurrency` object; boot lo
 | Knob | Default | Ceiling kind / notes |
 |---|---|---|
 | `WORKER_CONCURRENCY` | **5** | SELF — DetectRun / job poll workers |
-| `RENDER_CONCURRENCY` | **8** | SELF — in-flight static/image ads per run. Raised 4→8 (2026-08-02): unpaced `gpt-image-2/edit` measured clean (85s wall, zero 429s). **Was falsely documented as 4 / "Puppeteer pool"** — the live pool is direct-image Atlas submits |
+| `RENDER_CONCURRENCY` | **8** | SELF — in-flight static/image ads per run. File raised 4→8 (2026-08-02): unpaced `gpt-image-2/edit` measured clean (85s wall, zero 429s). **Became live in prod on 2026-08-03** when the Render dashboard pin of 4 was deleted as part of the secrets-only migration (dotenv never overrides an already-set var — the file change alone did not move prod for a day). Doubling was a consequence of that cleanup, not a separate tuning decision. **Was also falsely documented as "Puppeteer pool"** — the live pool is direct-image Atlas submits |
 | `VEO_CONCURRENCY` | **4** | SELF — in-flight video ads per run. Raised 1→4 (2026-08-02) as an Omni probe. **Was falsely documented as "keep at 1 — provider 429s"**; that belonged to retired direct-Veo + Grok 1 RPS, not Omni. Re-measure before >4 |
 | `MAX_CREATIVES_PER_RUN` | 20 | SELF — ads claimed into one `CampaignRun` |
 | `ATLAS_SUBMIT_SPACING_MS` | 1200 | SELF — same-model **video** submit spacing only; image submits unpaced |
@@ -725,9 +880,19 @@ Single resolver: `services/concurrency.js` (frozen `concurrency` object; boot lo
 
 ## 9. Configuration & secrets
 
+Owner rule (2026-08-03), verbatim: *"The dashboard in render should only contain secrets, everything else should be editable outside of the dashboard."* **Migration COMPLETE 2026-08-03.**
+
+**This section is CANONICAL for configuration ownership** — the precedence rule, the delete rule, and the per-key "stays in Render env" inventory below. It is deliberately here rather than in `CLAUDE.md`, because env vars are edited by humans and by other agents, not only by Claude sessions. `CLAUDE.md` §4a carries the same *rules* as a summary for Claude sessions and points back here for the key list; it must **not** grow its own copy of the inventory. If the two ever disagree, this file wins.
+
+### Precedence (the trap)
+
+`index.js:1-5` and `worker.js:18-20` load the process environment **first** (Render dashboard / local `.env`) and `config/defaults.env` **second**. `dotenv` **never overrides an already-set var**. A dashboard var always wins; a value in `defaults.env` is the effective value **only** when no dashboard var of that name exists. A var set in **both** with **different** values is a silent config lie — that is exactly how `RENDER_CONCURRENCY` stayed at 4 in prod for a day after the file said 8. Diagnostic: compare the live dashboard key list against `grep -oE '^[A-Z_][A-Z0-9_]*=' config/defaults.env`.
+
+**Delete rule:** only delete a dashboard var that exists in `config/defaults.env` with an **identical** value. A dashboard-only var must be **migrated into the file first**, never just deleted.
+
 ### Non-secret config — `config/defaults.env`
 
-Versioned with the repo. Loaded in `index.js` / `worker.js` **after** the process environment so **env always wins** (Render dashboard or local `.env` can override without editing the file).
+Versioned with the repo. Feature flags, tuning knobs, public IDs/URLs, Slack channel ids. **Never put secrets in this file** — it is committed to git.
 
 **Categories in `defaults.env`:**
 
@@ -735,41 +900,53 @@ Versioned with the repo. Loaded in `index.js` / `worker.js` **after** the proces
 |---|---|
 | AI creative feature flags | `AI_CONCEPT_DRIVEN`, `AI_HTML_LAYOUT_ENABLED`, `AI_LAYOUT_DIRECT_HTML`, `CANONICAL_DR_V1`, `RENDER_USE_HTML`, `RENDER_USE_RESOLVED` |
 | Director seed window | `DIRECTOR_UNIVERSE_TOP_N=1` |
+| Static regenerate reseed | `REGEN_RESEED_CATALOG_FIRST=true` (default ON; kill switch for catalog-first reseed on regenerate — see §5) |
 | Static direct-image path | `AI_DIRECT_IMAGE_*` (edit model / quality / timeout). `AI_IMAGE_REFERENCE_*` kept **inert** (no live consumer) |
-| Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=4` |
-| Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8`, `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |
-| Slack alert channels (non-secret) | `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, `SLACK_ALERT_CHANNEL_STATUS` (status = reserved, unread) |
+| Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=4`, `REPEAT_PRIMARY_REFERENCE=false` |
+| Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8` (**live since 2026-08-03** — see above), `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |
+| Slack alert channels (non-secret) | `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, `SLACK_ALERT_CHANNEL_STATUS` (per-run live feed via `runFeedService`) |
 | Ingest tuning | `APIFY_*`, `POST_FETCH_LIMIT`, `CATALOG_SYNC_MAX_ITEMS`, `CATALOG_VISUAL_MATCH_MAX_IMAGES` |
 | Generic catalog scraper | `GENERIC_CATALOG_*`, `HTTP_SCRAPE_MIN_GAP_MS` |
 | Catalog detect / enrichment | `CATALOG_DETECT_PRECOMPUTE`, `CATALOG_ENRICHMENT_*` |
 | Public IDs / URLs | Cloudinary cloud name, frontend URLs, Google/Meta client IDs & redirect URIs, Jira base/email, sales-demo admins, Shopify store domain |
 
-**Never put secrets in this file** — it is committed to git. Channel ids are not secrets; bot tokens are.
+Channel ids are not secrets; bot tokens are.
 
-### Secrets — Render env only
+### Stays in Render env (secrets + one deliberate exception)
 
-| Secret | Used for |
-|---|---|
-| `APIFY_TOKEN` | Apify actors (IG / Shopify scrapers) |
-| `ATLAS_API_KEY` | Atlas video / image / LLM gateway |
-| `BRANDFETCH_API_KEY` | Brand enrichment |
-| `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Media storage |
-| `GEMINI_API_KEY` | Vision, grounded search, overlay zones |
-| `GOOGLE_CLIENT_SECRET` | Google OAuth (app login) |
-| `GOOGLE_ADS_CLIENT_SECRET` / `GOOGLE_ADS_DEVELOPER_TOKEN` | Google Ads integration |
-| `INTEGRATION_ENCRYPTION_KEY` | Encrypted integration credentials at rest |
-| `JIRA_API_TOKEN` | Jira integration |
-| `JWT_SECRET` | Auth tokens |
-| `META_APP_SECRET` | Meta / Instagram OAuth & webhooks |
-| `MONGODB_URI` | Database |
-| `OPENAI_API_KEY` | GPT / image models (direct OpenAI paths) |
-| `RENDER_AUTH_TOKEN` | Render-protected service auth |
-| `SERPAPI_API_KEY` | Shopping / immersive product enrichment |
-| `SESSION_SECRET` | Session cookies |
-| `SHOPIFY_ACCESS_TOKEN` / `SHOPIFY_API_KEY` / `SHOPIFY_API_SECRET` | Shopify API |
-| **`SLACK_BOT_TOKEN`** | **Only** alerting secret — both web + worker. Channels live in `defaults.env` |
+Verified live 2026-08-03 after the cleanup; **WORKER recount 2026-08-04** after `ATLAS_API_KEY` was added. **WEB service** (`srv-d1vuktqli9vc73ft07ng`): **23** keys. **WORKER** (`srv-d8128c1o3t8c73e8kb30`): **15** keys. Everything else that used to live on the dashboard and also lived in `defaults.env` with the same value was deleted (runtime no-ops).
+
+| Key | WEB | WORKER | Used for |
+|---|---|---|---|
+| `APIFY_TOKEN` | ✓ | | Apify actors (IG / Shopify scrapers) |
+| `ATLAS_API_KEY` | ✓ | ✓ | Atlas video / image / LLM gateway |
+| `BRANDFETCH_API_KEY` | ✓ | ✓ | Brand enrichment |
+| `CLOUDINARY_API_KEY` | ✓ | ✓ | Media storage |
+| `CLOUDINARY_API_SECRET` | ✓ | ✓ | Media storage |
+| `GEMINI_API_KEY` | ✓ | ✓ | Vision, grounded search, overlay zones |
+| `GOOGLE_ADS_CLIENT_SECRET` | ✓ | | Google Ads integration |
+| `GOOGLE_ADS_DEVELOPER_TOKEN` | ✓ | ✓ | Google Ads integration |
+| `GOOGLE_CLIENT_SECRET` | ✓ | | Google OAuth (app login) |
+| `INTEGRATION_ENCRYPTION_KEY` | ✓ | ✓ | Encrypted integration credentials at rest |
+| `JIRA_API_TOKEN` | ✓ | | Jira integration |
+| **`JIRA_PROJECT_KEY`** | ✓ | | **Not a secret.** Retained because it does **not** exist in `config/defaults.env` — deleting it would lose the value with nothing to fall back on. Migrate into the file before ever deleting the dashboard copy. |
+| `JWT_SECRET` | ✓ | | Auth tokens |
+| `META_APP_SECRET` | ✓ | ✓ | Meta / Instagram OAuth & webhooks |
+| `MONGODB_URI` | ✓ | ✓ | Database |
+| `OPENAI_API_KEY` | ✓ | ✓ | GPT / image models (direct OpenAI paths) |
+| `RENDER_AUTH_TOKEN` | ✓ | | Render-protected service auth |
+| `SERPAPI_API_KEY` | ✓ | ✓ | Shopping / immersive product enrichment |
+| `SESSION_SECRET` | ✓ | | Session cookies |
+| `SHOPIFY_ACCESS_TOKEN` | ✓ | ✓ | Shopify API |
+| `SHOPIFY_API_KEY` | ✓ | ✓ | Shopify API |
+| `SHOPIFY_API_SECRET` | ✓ | ✓ | Shopify API |
+| **`SLACK_BOT_TOKEN`** | ✓ | ✓ | **Only** alerting secret. Channels live in `defaults.env` |
 
 No Telegram secrets remain. Alerts stay disabled until `SLACK_BOT_TOKEN` is set.
+
+**`ATLAS_API_KEY` on WORKER (added 2026-08-04):** post-cleanup this table marked it WEB-only, but that was a **config gap**, not a design choice — the worker reaches Atlas LLM code on every DetectRun (`atlasLlmService.js:52` `isConfigured()` is `!!process.env.ATLAS_API_KEY`; cropRefine / overlayZone / subjectText / judge all fall back to direct OpenAI/Gemini when unset). Verified live via Render API: WEB had it, WORKER did not (env-group "Liquid Retail" has zero vars), worker logged `ATLAS_API_KEY not configured` continuously until the key was copied onto WORKER (14 → 15) and redeployed; zero such lines after the 16:24Z boot. **Billable consequence:** the key flips `geminiImageService.viaAtlasOrDirect` (`services/geminiImageService.js:12`) onto Atlas `nano-banana-2/edit` for DetectRun extended crops — up to 4 billable image edits per **non-catalog** DetectRun. Catalog DetectRuns are unaffected (`pipelines/detect.js:628` `skipExtendedCrops: true`). Measured 2026-08-04: 115 detect runs in 24h, **all catalog**, **zero** extended-crop activity — exposure is real but currently dormant. Provider **shift** (those crops already billed Gemini direct), not new spend from zero.
+
+**The one non-no-op of the cleanup:** `RENDER_CONCURRENCY`. Dashboard had pinned **4** while the file said **8**; deleting the dashboard copy made the file's **8 live on 2026-08-03**. That is a real concurrency double, not a no-op — consequence of the migration, not a separate tuning decision.
 
 ---
 

@@ -224,7 +224,7 @@
         {
           "key": "cta",
           "phase": "close",
-          "visible": true,
+          "visible": false,
           "position": {
             "anchor": "bottom",
             "align": "right",
@@ -428,7 +428,7 @@
         {
           "key": "cta",
           "phase": "main",
-          "visible": true,
+          "visible": false,
           "position": {
             "anchor": "bottom",
             "align": "right",
@@ -605,7 +605,7 @@
         {
           "key": "cta",
           "phase": "main",
-          "visible": true,
+          "visible": false,
           "position": {
             "anchor": "bottom",
             "align": "right",

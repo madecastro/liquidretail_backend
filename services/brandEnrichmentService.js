@@ -467,7 +467,8 @@ async function runEnrichment(brand, brandId, run = null) {
     try {
       brandReviewsResult = await lookupBrandReviews({
         brandName: brand.name,
-        brandUrl:  brand.websiteUrl
+        brandUrl:  brand.websiteUrl,
+        brandId                       // cost-ledger linkage (CostLog.brandId)
       });
       if (brandReviewsResult && Array.isArray(brandReviewsResult.quotes) && brandReviewsResult.quotes.length) {
         brandReviewsResult.fetchedAt = new Date();

@@ -1,3 +1,4 @@
+const fs = require('fs');
 const cloudinary = require('cloudinary').v2;
 const streamifier = require('streamifier');
 const { concurrency: CONC } = require('./concurrency');
@@ -44,6 +45,52 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
       resolve(result);
     });
     streamifier.createReadStream(buffer).pipe(stream);
+  });
+}
+
+// Path-based sibling of uploadBufferToCloudinary — same options, same return
+// shape, but streams straight from disk with fs.createReadStream instead of
+// reading the whole file into a Buffer first. Added for already-rendered
+// video masters (brandScriptExecutor's uploadRenderAndStamp): those files can
+// be tens/hundreds of MB, and the buffer variant's path was
+// disk -> full Buffer in RAM -> streamifier re-wraps it -> network, which
+// double-holds the file in memory (fs read buffer + Buffer object) for no
+// benefit since upload_stream only ever wants a Readable. Use this whenever
+// the source is already a file on disk; keep uploadBufferToCloudinary for
+// callers that only have bytes in memory (multer buffers, sharp output, etc).
+function uploadFileToCloudinary(filePath, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const uploadOpts = {
+      folder: opts.folder || 'liquidretail',
+      public_id: _uniqueId(),
+      unique_filename: false,
+      // overwrite=true so re-renders of the same (campaignId, identityDigest)
+      // can replace the existing asset without orphaning. Caller-side de-dupe
+      // (queue-time unique index) usually short-circuits before we get here.
+      overwrite: opts.overwrite ?? false,
+      resource_type: opts.resourceType || 'image',
+      ...(opts.publicId ? { public_id: opts.publicId } : {}),
+      // Eager transformations — Cloudinary starts pre-generating these
+      // derivatives the moment the upload lands instead of lazily on first
+      // request. Critical for the composite path: the chrome compositor
+      // hits a c_fill,ar_<canvas>,g_auto transform URL immediately after
+      // upload, and without an eager hint the lazy transcode is still
+      // running, returning 423 Locked. Eager + eager_async (default true
+      // for video) gives the transcode a head start without blocking the
+      // upload response.
+      ...(Array.isArray(opts.eager) && opts.eager.length
+        ? { eager: opts.eager, eager_async: opts.eagerAsync !== false }
+        : {})
+    };
+    const stream = cloudinary.uploader.upload_stream(uploadOpts, (err, result) => {
+      if (err) return reject(err);
+      resolve(result);
+    });
+    // Forward read errors (e.g. ENOENT if the caller's tempDir was already
+    // cleaned up) to the promise — an unhandled 'error' on a Readable throws
+    // and would crash the process instead of rejecting like the buffer
+    // variant's readFile-then-upload call site did.
+    fs.createReadStream(filePath).on('error', reject).pipe(stream);
   });
 }
 
@@ -108,6 +155,7 @@ async function deleteManyFromCloudinary(urls, { concurrency = CONC.CLOUDINARY_DE
 
 module.exports = {
   uploadBufferToCloudinary,
+  uploadFileToCloudinary,
   uploadUrlToCloudinary,
   deleteFromCloudinary,
   deleteManyFromCloudinary,

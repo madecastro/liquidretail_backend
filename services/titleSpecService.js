@@ -287,6 +287,55 @@ async function buildBrandTokens(brand, { layoutInputBrand = null, specFontOverri
   const secondary = themeColor(theme, 'secondaryColor') || hexOrNull(brand?.secondaryColor) || hexOrNull(layoutInputBrand?.secondary_color);
   const accent = themeColor(theme, 'accentColor') || hexOrNull(brand?.accentColor) || hexOrNull(layoutInputBrand?.accent_color) || primary;
 
+  // A pill's INK MUST BE DERIVED FROM ITS OWN FILL, never assumed.
+  //
+  // ctaText defaulted to '#FFFFFF' and promoText to '#16161A' — both fixed,
+  // whatever the pill was filled with. ctaBg falls back to the brand accent, so a
+  // brand with a light accent shipped WHITE TEXT ON A CREAM PILL. Owner, on a
+  // delivered Gymshark 4:5: *"if it is supposed to be there for that surface then
+  // it should be visible, not white on white."* promoText carries the mirror bug:
+  // a dark promo fill got dark ink.
+  //
+  // An explicit brand value always wins — this only replaces the blind default.
+  // Same principle as the composited logomark and the text-shadow polarity: pick
+  // the ink from the thing it sits on.
+  // PICK THE HIGHER CONTRAST, don't threshold. A single luminance cut-off is the
+  // wrong method and adversarial review broke it with arithmetic: a mid-tone fill
+  // like #5B8C5A has luminance 0.494, so a `> 0.55 ? dark : white` rule chose
+  // WHITE at 1.93:1 — while dark ink on that same fill measures 9.3:1. Every
+  // mid-tone brand colour (mid greens, slate blues, ~#888 greys) hit that hole,
+  // and those are common accents. Computing both ratios and taking the winner has
+  // no such gap and needs no tuned constant.
+  const relLum = (hex) => {
+    const s = String(hex || '').replace(/^#/, '');
+    if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+    // sRGB channel linearisation, per WCAG — a plain 0..1 average overstates the
+    // contrast of saturated fills.
+    const chan = (v) => {
+      const c = parseInt(v, 16) / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * chan(s.slice(0, 2)) + 0.7152 * chan(s.slice(2, 4)) + 0.0722 * chan(s.slice(4, 6));
+  };
+  const contrastRatio = (l1, l2) => {
+    const hi = Math.max(l1, l2), lo = Math.min(l1, l2);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  const INK_DARK = '#16181D';
+  const INK_LIGHT = '#FFFFFF';
+  const readableOn = (bgHex, explicit) => {
+    if (explicit) return explicit;
+    const bg = relLum(bgHex);
+    if (bg == null) return INK_LIGHT;
+    return contrastRatio(relLum(INK_DARK), bg) >= contrastRatio(relLum(INK_LIGHT), bg)
+      ? INK_DARK
+      : INK_LIGHT;
+  };
+
+  const ctaBgResolved   = themeColor(theme, 'ctaBgColor') || themeColor(theme, 'ctaBg') || accent || primary || '#46783E';
+  const promoBgResolved = themeColor(theme, 'promoBgColor') || themeColor(theme, 'promoBg') || accent || '#F5B70A';
+  const badgeBgResolved = themeColor(theme, 'badgeBgColor') || themeColor(theme, 'badgeBg') || themeColor(theme, 'calloutBgColor') || accent || '#BEC282';
+
   // Curated styleTheme docs use the CANVAS engine's key vocabulary
   // (ctaBgColor, badgeTextColor, promoBgColor, accentGold, …) — read those
   // first so a brand renders identically on both engines; the short forms
@@ -295,20 +344,36 @@ async function buildBrandTokens(brand, { layoutInputBrand = null, specFontOverri
     primary: primary || '#0B0F14',
     secondary: secondary || '#DCDCDC',
     accent: accent || '#F5B70A',
-    ctaBg: themeColor(theme, 'ctaBgColor') || themeColor(theme, 'ctaBg') || accent || primary || '#46783E',
-    ctaText: themeColor(theme, 'ctaTextColor') || themeColor(theme, 'ctaText') || '#FFFFFF',
+    ctaBg: ctaBgResolved,
+    ctaText: readableOn(ctaBgResolved, themeColor(theme, 'ctaTextColor') || themeColor(theme, 'ctaText')),
     scrim: themeColor(theme, 'scrimColor') || '#0C0906',
     textPrimary: themeColor(theme, 'textPrimary') || '#FFFFFF',
-    textSecondary: themeColor(theme, 'textSecondary') || secondary || '#DCDCDC',
+    // Same rule as textOnLight below, and the same bug: the secondary ink fell
+    // back to the brand's SCRAPED secondaryColor, so the supporting line under a
+    // headline could print in a saturated palette colour on dark footage. Type is
+    // monochrome; a neutral is the only default. An explicit curated
+    // textSecondary still wins.
+    textSecondary: themeColor(theme, 'textSecondary') || '#DCDCDC',
     // stars deliberately never fall to brand accent (dark accents = invisible
     // stars) — same rule as the canvas deriveTheme.
     stars: themeColor(theme, 'starColor') || themeColor(theme, 'accentGold') || '#F5B70A',
-    badgeBg: themeColor(theme, 'badgeBgColor') || themeColor(theme, 'badgeBg') || themeColor(theme, 'calloutBgColor') || accent || '#BEC282',
-    badgeText: themeColor(theme, 'badgeTextColor') || themeColor(theme, 'badgeText') || '#1F2219',
-    promoBg: themeColor(theme, 'promoBgColor') || themeColor(theme, 'promoBg') || accent || '#F5B70A',
-    promoText: themeColor(theme, 'promoTextColor') || themeColor(theme, 'promoText') || '#16161A',
+    badgeBg: badgeBgResolved,
+    badgeText: readableOn(badgeBgResolved, themeColor(theme, 'badgeTextColor') || themeColor(theme, 'badgeText')),
+    promoBg: promoBgResolved,
+    promoText: readableOn(promoBgResolved, themeColor(theme, 'promoTextColor') || themeColor(theme, 'promoText')),
     // Plate-intelligence contrast flips (light footage → dark type).
-    textOnLight: themeColor(theme, 'textOnLight') || primary || '#16181D',
+    //
+    // TYPE INK IS BLACK OR WHITE. Owner, after reviewing a 17-ad sample
+    // (2026-08-04): *"let's just stick to black or white type only … The red
+    // lettering and white lettering you are choosing is tacky and doesn't look
+    // professional."* The tacky ink came from THIS line: textOnLight used to
+    // fall back to the brand PRIMARY colour, so on any light plate Pelagic
+    // rendered #4d92b6 blue type and BabyBoo #ba3357 red. Brand colour still
+    // lives in the CTA/badge fills and the gold stars; the words themselves are
+    // monochrome, like the gpt-image-2 static ads the owner holds up as the
+    // reference. An explicit curated textOnLight (none exists in prod today)
+    // still wins, so a brand can deliberately opt out later.
+    textOnLight: themeColor(theme, 'textOnLight') || '#16181D',
     textSecondaryOnLight: themeColor(theme, 'textSecondaryOnLight') || '#3A4048',
   };
 

@@ -81,9 +81,12 @@ const MAP = Object.freeze({
   // reference image. Sonnet is also the cheapest Claude of the three at $2/$10
   // per M — $0.105 per director run against $0.223 for opus.
   //
-  // TWO CONSTRAINTS, probed live rather than assumed:
+  // THREE CONSTRAINTS, probed live rather than assumed:
   //  - response_format json_schema  -> HTTP 400, on text AND vision alike.
-  //    Callers MUST use json_object and validate in code.
+  //  - response_format json_object  -> accepted but NOT ENFORCED (probed
+  //    2026-08-04: with and without the flag both returned prose). Callers
+  //    MUST put the JSON contract in the prompt and salvage/validate in code
+  //    (see aiCreativeDirectorService OUTPUT CONTRACT + safeParseDirectorJSON).
   //  - vision (image_url parts)     -> works; confirmed sees_image=true and a
   //    correct colour reading. Earlier notes claiming Claude could not do vision
   //    with structured output were wrong: strict schema is the only blocker.
@@ -92,7 +95,19 @@ const MAP = Object.freeze({
   // reasoning:{effort} form showed no reproducible benefit on this task (the
   // run-to-run spread at temperature 0.7 was larger than the effect). Consistency
   // comes from the lower temperature and the validator below instead.
-  'director':         { atlas: 'anthropic/claude-sonnet-5-ccmax', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
+  // ROUTE CHANGED 2026-08-04: '-ccmax' → the plain route. `-ccmax` is a Claude
+  // CODE agent endpoint, not a plain completion route. Probed live: it returned
+  // a tool call named `Grep` — a tool WE NEVER DEFINED — so it carries its own
+  // coding-agent toolset, and it ignores `tool_choice` as well as
+  // `response_format`. That is why it answered with markdown documents
+  // ("## Concept") and conversational preambles instead of JSON.
+  // 4 trials each, identical prompt, thin brief:
+  //   -ccmax  1/4 usable · 2/4 missing `name` · 1/4 unparseable JSON
+  //   plain   4/4 usable, every concept carrying routing.media_picks
+  // The 'name'-missing arm matches the `concepts[0].name is missing` warnings
+  // production logged. Same model family the 2026-07-31 bake-off picked —
+  // this drops the agent wrapper, not the model.
+  'director':         { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
 
   'gpt-4.1':          { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4.1' } },
   'gpt-4.1-mini':     { atlas: 'openai/gpt-5.6-luna',  direct: { provider: 'openai', model: 'gpt-4.1-mini' } },
@@ -100,6 +115,22 @@ const MAP = Object.freeze({
   'gpt-4o':           { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4o' } },
   'gemini-2.5-flash': { atlas: 'google/gemini-2.5-flash', direct: { provider: 'google', model: 'gemini-2.5-flash' } },
   'gemini-2.5-pro':   { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
+  // Post-render vision QC role (services/adVisionQcService.js). Points at the
+  // same google/gemini-2.5-flash slug already used for vision identify/match
+  // (geminiIdentifyService, visualCatalogMatchService). CHEAP + vision-
+  // capable. CRITICAL: confirm ROUTABLE with a live chat probe before
+  // enabling AD_VISION_QC_ENABLED — catalog listing alone is not enough
+  // (openai/gpt-5-nano is listed but returns HTTP 400 "router not found").
+  // Override: ATLAS_MODEL_AD_VISION_QC=<slug>.
+  // PRO, not flash — and the draft that introduced this role had it wrong.
+  // Both were probed live against a real defect (a Timberland-shaped emblem
+  // hallucinated onto an Allbirds shoe) and BOTH caught it, but flash broke the
+  // requested JSON shape: it returned `competitor_marks` as a bare boolean and
+  // hoisted `findings` out of its object. A malformed verdict is worse than no
+  // verdict here — it either ships a bad ad or burns the single allowed
+  // regeneration for nothing. The ~$0.0094 delta per check is noise against the
+  // $0.01–0.17 generation it protects.
+  'ad-vision-qc':     { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
   // NO 'quote-snippet' ROLE — deliberately removed, do not re-add it.
   // It mapped to openai/gpt-5-nano, which the benchmark above records as
   // HTTP 400 "router not found": listed in the catalog, not routable. A role

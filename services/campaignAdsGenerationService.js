@@ -166,12 +166,23 @@ const MAX_ADS_PER_GENERATION_RUN = Math.max(1, parseInt(process.env.MAX_ADS_PER_
 const ADS_PER_PRODUCT_CAP     = Math.max(1, parseInt(process.env.ADS_PER_PRODUCT_CAP,     10) || 3);
 // How many candidate images the Director sees when the operator picked none.
 //
-// DEFAULT IS 1 (hero only). Owner 2026-08-02: "we are supposed to be defaulting
-// to one image sent to the director, the hero image." Hero-only means the
-// composition matches the reference exactly. Multi-image support stays fully
-// wired — the ceiling is 10 and the window is expected to widen later by
-// raising this one value (or DIRECTOR_UNIVERSE_TOP_N in env). Do NOT delete
-// multi-pick code when the default is 1; it is dormant, not dead.
+// DEFAULT IS 1. Owner 2026-08-02: "we are supposed to be defaulting to one
+// image sent to the director, the hero image." That quote is the REQUIREMENT;
+// this constant only delivers the "one image" half. **It does not pick the
+// hero** — the earlier version of this comment said "DEFAULT IS 1 (hero only)"
+// and was wrong for as long as it stood. buildSeededUniverse ranks a merged
+// catalog+UGC pool by classification.shotType first and treats
+// metadata.imageRole==='hero' as a within-tier tiebreak, so trimming to 1
+// yields the top lifestyle candidate (a catalog ALT, or a UGC post). What
+// actually pins the catalog's first image is `preferFirstCatalogImage`,
+// passed from runConceptDrivenExpansion (see the buildSeededUniverse call)
+// and implemented in seededUniverseService.promoteFirstCatalogImage.
+//
+// One-image means the composition matches the reference exactly. Multi-image
+// support stays fully wired — the ceiling is 10 and the window is expected to
+// widen later by raising this one value (or DIRECTOR_UNIVERSE_TOP_N in env).
+// Do NOT delete multi-pick code when the default is 1; it is dormant, not
+// dead.
 //
 // Explicit operator picks still widen the universe:
 //   operatorPickedMedia ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
@@ -1809,8 +1820,141 @@ async function attachProductNames(perProduct, brandId) {
   }
 }
 
+// VIDEO SEED = THE FIRST CATALOG IMAGE IN FEED ORDER. Never the 'hero' stamp.
+//
+// Owner, 2026-08-03: *"the default video behaviour should be the first three
+// images, not the 'hero' image, especially since we don't know how that is
+// determined."*
+//
+// The stamp was NOT a reliable stand-in for "the feed's first image":
+// `metadata.imageRole:'hero'` is written by catalogProductDetectService off
+// `CatalogProduct.imageUrl`, so it depends on that materialisation having
+// happened and having succeeded. When the stamp is missing the old cascade fell
+// through to earliest-createdAt anyway, which means the SAME product could seed
+// from a different image depending on whether an ingest step ran — exactly the
+// opacity the owner is objecting to. Dropping the tier makes the rule one thing:
+// earliest-createdAt catalog Media, which is the order ingest materialises the
+// feed in (imageUrl first, then additionalImages).
+//
+// This only decides POSITION 0. The reference stack was already feed-ordered
+// (`.sort({createdAt: 1})` in atlasVideoService's catalogMedias load, no
+// hero-first ranking), so seed + mirrors now give "the first three images" with
+// no further change.
+//
+// MONEY: this changes WHICH image seeds the video, never how many submits
+// happen — still one Omni submit per product (CLAUDE.md §2).
+//
+// KILL SWITCH: VIDEO_SEED_FEED_ORDER, DEFAULT ON. It changes what a billable
+// generation is seeded with, so it must be reversible without a deploy.
+function isVideoSeedFeedOrderEnabled() {
+  const raw = process.env.VIDEO_SEED_FEED_ORDER;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+/**
+ * The product's first catalog image in feed order.
+ *
+ * With the flag ON (default) this is purely earliest-createdAt. With it OFF the
+ * historical hero-stamp-first cascade is restored verbatim, so flipping the env
+ * var reproduces the old seed exactly.
+ */
+/**
+ * Skip a first image whose subject fills the frame, because the product cannot
+ * survive the crop.
+ *
+ * Owner: *"I just don't want text directly on the face, and I don't want it to
+ * zoom so close into a face that I can't see the actual product."*
+ *
+ * WHY THE SEED AND NOT THE CROP: measured on the ad that prompted this — the
+ * master's face envelope spanned 0.035→0.558 of a 1080x1920 frame, i.e. a head
+ * 1,004px tall. A 1:1 delivery crops a 1080px window, so NO crop offset can hold
+ * that head and still leave room for the garment or a title band. faceSafeCrop
+ * already pushes the head as high as its margins allow (that is what
+ * FACE_TOP_MARGIN_FRAC is for) and it had nothing left to give. The only lever
+ * that changes the outcome is which image Omni animates.
+ *
+ * SIGNAL, and it costs nothing: adSuitabilityService already derives
+ * `metrics.primarySubjectAreaFraction` from the overlay-zone geometry and stores
+ * it on every Media. No vision call, no ingest change.
+ *
+ * THRESHOLD: measured across 600 catalog images — median 0.57, p90 0.87. The
+ * failing seed measured 0.65, which the STATIC scorer rates as *positive*
+ * (its good band is 0.10–0.65, because a big subject flatters a still). Video
+ * that gets cropped needs its own line, so this does not touch that scoring.
+ *
+ * FEED ORDER IS PRESERVED: candidates stay in createdAt order and the FIRST
+ * acceptable one wins — this only skips past images that would bury the product.
+ * If every candidate is subject-dominant it returns the first anyway, so a
+ * product can never lose its video for want of a wider photo.
+ */
+const VIDEO_SEED_MAX_SUBJECT_FRACTION = (() => {
+  const n = Number(process.env.VIDEO_SEED_MAX_SUBJECT_FRACTION);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : 0.6;
+})();
+
+async function firstCatalogMediaForProduct(productOid) {
+  if (!isVideoSeedFeedOrderEnabled()) {
+    const stamped = await Media.findOne({
+      source: 'catalog-product',
+      'metadata.catalogProductId': productOid,
+      'metadata.imageRole': 'hero'
+    }).select('_id').lean();
+    if (stamped) return stamped;
+  }
+
+  // Feed order, with the suitability metric alongside so the guard needs no
+  // second query. Bounded: a product's catalog set is small.
+  // NO limit(): a cap here is a silent wrong-seed generator. With limit(24), a
+  // product whose first 24 images are all subject-dominant and whose 25th is the
+  // wide shot would never load the wide shot and would keep the dominant image —
+  // the exact failure this guard exists to prevent, hidden behind a number.
+  // Catalog sets are small and this selects two fields.
+  //
+  // fileType EXCLUDES VIDEO. Unmeasured media counts as acceptable, and a catalog
+  // VIDEO carries no adSuitability, so without this filter skipping a dominant
+  // still could land on a video and silently switch Omni to its image-to-video
+  // seed track. The regenerate path already guards this; this helper did not.
+  const candidates = await Media.find({
+    source: 'catalog-product',
+    'metadata.catalogProductId': productOid,
+    fileType: { $ne: 'video' }
+  })
+    .sort({ createdAt: 1 })
+    .select('_id adSuitability.metrics.primarySubjectAreaFraction')
+    .lean();
+
+  if (!candidates.length) return null;
+
+  const fractionOf = (m) => {
+    const v = m?.adSuitability?.metrics?.primarySubjectAreaFraction;
+    return Number.isFinite(v) ? v : null;
+  };
+  // Unmeasured media is treated as ACCEPTABLE, not rejected — absent data must
+  // never reorder the feed.
+  const acceptable = candidates.find((m) => {
+    const f = fractionOf(m);
+    return f == null || f <= VIDEO_SEED_MAX_SUBJECT_FRACTION;
+  });
+
+  if (acceptable && String(acceptable._id) !== String(candidates[0]._id)) {
+    console.log(
+      `🎬 videoSeed: skipped ${candidates[0]._id} (primary subject ` +
+      `${(fractionOf(candidates[0]) ?? 0).toFixed(2)} of frame > ${VIDEO_SEED_MAX_SUBJECT_FRACTION}) ` +
+      `-> ${acceptable._id} (${(fractionOf(acceptable) ?? 0).toFixed(2)}); product would not survive the crop`
+    );
+  } else if (!acceptable) {
+    console.log(
+      `🎬 videoSeed: every catalog image for ${productOid} is subject-dominant ` +
+      `(first ${(fractionOf(candidates[0]) ?? 0).toFixed(2)}) — keeping feed order`
+    );
+  }
+  return acceptable || candidates[0];
+}
+
 // Deterministic video expansion: one video Ad per product, seeded on
-// operator-ordered catalog picks (or the feed-order hero when no picks).
+// operator-ordered catalog picks (or the first catalog image in feed order when
+// there are no picks).
 // seedMediaIds is ORDER-SIGNIFICANT. No VEO_ADS_PER_PRODUCT_CAP — always
 // exactly one ad per product that has a resolvable seed.
 async function expandDeterministicVideo({
@@ -2048,15 +2192,9 @@ async function expandDeterministicVideo({
         return direct != null && String(direct) === pidStr;
       });
       if (!hasCatalogAnchor) {
-        const anchor = await Media.findOne({
-          source: 'catalog-product',
-          'metadata.catalogProductId': productOid,
-          'metadata.imageRole': 'hero'
-        }).select('_id').lean()
-          || await Media.findOne({
-            source: 'catalog-product',
-            'metadata.catalogProductId': productOid
-          }).sort({ createdAt: 1 }).select('_id').lean();
+        // Same feed-order rule as the default seed — the anchor is the product's
+        // first catalog image, not whatever carries the 'hero' stamp.
+        const anchor = await firstCatalogMediaForProduct(productOid);
         if (anchor?._id && !referenceMediaIds.some(x => String(x) === String(anchor._id))) {
           referenceMediaIds.push(anchor._id);
           console.log(
@@ -2071,19 +2209,10 @@ async function expandDeterministicVideo({
         }
       }
     } else {
-      // Feed-order hero: imageRole hero → earliest createdAt → lazy materialize.
-      let hero = await Media.findOne({
-        source: 'catalog-product',
-        'metadata.catalogProductId': productOid,
-        'metadata.imageRole': 'hero'
-      }).select('_id').lean();
-
-      if (!hero) {
-        hero = await Media.findOne({
-          source: 'catalog-product',
-          'metadata.catalogProductId': productOid
-        }).sort({ createdAt: 1 }).select('_id').lean();
-      }
+      // FEED ORDER: the product's first catalog image → lazy materialize.
+      // The 'hero'-stamp tier was removed at owner instruction — see
+      // firstCatalogMediaForProduct.
+      let hero = await firstCatalogMediaForProduct(productOid);
 
       if (!hero) {
         // Lazy materialize — same pattern as seedsFromProduct ~:1133-1155.
@@ -2326,7 +2455,8 @@ async function runConceptDrivenExpansion({
       // topN widens to fit, so a 5-image selection is never truncated to 1.
       //
       // Absent picks, the Director sees DIRECTOR_UNIVERSE_TOP_N candidates
-      // (default 1 = hero only). Operator multi-select widens via max().
+      // (default 1). TOP_N=1 is a COUNT, not a choice of image — see
+      // preferFirstCatalogImage below. Operator multi-select widens via max().
       const operatorPickedMedia = Array.isArray(mediaIds) && mediaIds.length > 0;
       const universeTopN = operatorPickedMedia
         ? Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
@@ -2336,7 +2466,44 @@ async function runConceptDrivenExpansion({
           includeCategoryMatched, includeBrandMatched,
           topN: universeTopN,
           wantsVideo: resolvedKinds.includes('video'),
-          restrictToMediaIds: operatorPickedMedia ? mediaIds : null
+          restrictToMediaIds: operatorPickedMedia ? mediaIds : null,
+          // Owner rule, 2026-08-03, verbatim: "I actually just want to use
+          // the first image that comes from the catalog not the 'hero' image
+          // since that may also come from social media or UGC?"
+          //
+          // DIRECTOR_UNIVERSE_TOP_N=1 does NOT deliver that on its own, which
+          // is what every doc in this repo used to claim.
+          // buildSeededUniverse ranks catalog media and product_match UGC in
+          // ONE merged pool by classification.shotType first (lifestyle →
+          // on_model → … → unknown) and only breaks within-tier ties on
+          // metadata.imageRole==='hero'. So `.slice(0, 1)` of that ranking
+          // routinely returned a lifestyle catalog ALT — or a UGC post — and
+          // no catalog image was guaranteed to reach the Director.
+          // preferFirstCatalogImage pins the catalog's FIRST image at index 0
+          // before the trim, via a cascade that can only ever select
+          // role==='catalog' media: imageRole==='hero' (the stamp
+          // catalogProductDetectService writes on CatalogProduct.imageUrl),
+          // else the earliest-createdAt catalog entry, else nothing. Tier 2
+          // is what closes the hole — when the stamp is missing the old
+          // tier-1-only rule fell back to the shotType ranking over that
+          // merged pool, which is exactly how a UGC post became the default.
+          //
+          // The !operatorPickedMedia term is redundant with the service-side
+          // gate (restrictToMediaIds returns before the promotion runs) and is
+          // kept anyway so the override reads at the CALL SITE: an operator
+          // multi-select is the "unless the user overrides it" half of the
+          // rule, and it still widens the window via
+          // universeTopN = Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)
+          // rather than being re-ordered or truncated to 1.
+          //
+          // Image-only: the deterministic video rail runs the SAME cascade
+          // directly against Mongo (imageRole==='hero' → earliest createdAt →
+          // lazy materialize, `:2085`) and builds its own reference stack, so
+          // it never needs this. A mixed image+video concept run does opt in —
+          // a burned-text catalog image is still promoted there, which is the
+          // intended precedence (owner rule over the wantsVideo burned-text
+          // tiebreak).
+          preferFirstCatalogImage: !operatorPickedMedia && resolvedKinds.includes('image')
         });
       const filtered = filterUniverseForProduct(productId, universe);
       if (!filtered.length) {

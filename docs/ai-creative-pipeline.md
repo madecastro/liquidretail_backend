@@ -120,10 +120,36 @@ name off a concept without the helper.
 `conceptForRender` projects a strategy-safe flat object and **never** exports
 `rationale` / reasoning into image prompts.
 
-### Seeded universe default (hero-only)
+### Seeded universe default — one image, and it is the first image from the catalog
 
-`DIRECTOR_UNIVERSE_TOP_N` default is **1** (`config/defaults.env:30`,
-`campaignAdsGenerationService.js:184`). This is a **default** change, not a
+> **Canonical explanation lives in [docs/PIPELINES.md](PIPELINES.md) §5
+> *Seed selection — image vs video (the first-catalog-image rule)*.** Read that
+> for the mechanism; this section carries only the concept-stack side effects.
+> **Was falsely titled** *"Seeded universe default (hero-only)"* until
+> 2026-08-03: `DIRECTOR_UNIVERSE_TOP_N=1` sets the COUNT, and on its own it did
+> **not** select an image. `buildSeededUniverse` ranks catalog media and
+> `product_match` UGC in one merged pool by `classification.shotType` first and
+> treats `metadata.imageRole === 'hero'` as a within-tier tiebreak, so trimming
+> to 1 returned the top lifestyle candidate — a catalog ALT, or a UGC post.
+>
+> **The rule is no longer stated in terms of the `imageRole: 'hero'` label.**
+> Owner, verbatim 2026-08-03: *"I actually just want to use the first image that
+> comes from the catalog not the 'hero' image since that may also come from
+> social media or UGC?"* The default seed is now pinned by the opt-in
+> `preferFirstCatalogImage` (`seededUniverseService.promoteFirstCatalogImage`),
+> a cascade in which **every tier is gated on `role === 'catalog'`**, so it can
+> **never** resolve to UGC: tier 1 = `imageRole === 'hero'` (the stamp
+> `catalogProductDetectService` writes on `CatalogProduct.imageUrl`, i.e. the
+> feed's first image); tier 2 = else the **earliest-`createdAt` catalog entry**,
+> which is what stops an *unstamped* catalog set from falling through to the
+> shotType ranking (that fallthrough is how a UGC post became the default);
+> tier 3 = else no promotion. Passed only for image runs with no operator picks,
+> and deliberately skipped in the `restrictToMediaIds` override branch and in
+> brand-only mode. Pinned by `scripts/verifySeededUniverseHeroDefault.js`
+> (111 offline checks).
+
+`DIRECTOR_UNIVERSE_TOP_N` default is **1** (`config/defaults.env:35`,
+`campaignAdsGenerationService.js:195`). This is a **default** change, not a
 capability removal: ceiling stays 10, multi-image remains fully wired, and
 operator multi-select still widens via
 `Math.max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)`.
@@ -262,6 +288,11 @@ services/
   adStage.js                      ← fire-and-forget render progress
   costTracker.js                  ← wraps every LLM call
   campaignAdsGenerationService.js ← universe → Director → Judge → Ad payloads
+  seededUniverseService.js        ← BUILDS the universe: which media the
+                                    Director ever sees, and in what order
+                                    (preferFirstCatalogImage pins the first
+                                    image that came from the catalog)
+  shotTypeRank.js                 ← the shotType table that order comes from
   aiCreativeDirectorService.js    ← Director producer
   aiJudgeService.js               ← concept-round judge (universe-aware)
   directImageRenderService.js     ← static terminal for ai_* product ads
@@ -326,7 +357,13 @@ Phase 0 establishes baseline. Subsequent phases each have a measurable gate befo
 - **1-in-3 static ads** can still render a competitor-shaped brand mark on the
   product (e.g. tree emblem reading as Timberland on an Allbirds shoe) —
   prompts already ask for fidelity; fix is measure-and-reject, not more
-  prompt tuning. Video path not QC'd as of 2026-08-03.
+  prompt tuning. Video path not QC'd as of 2026-08-03. **Still open after the
+  2026-08-03 `PRODUCT_FIDELITY` hardening** (`staticAdIntents.js`), which is
+  owner-directed work on top of this note rather than a fix for it —
+  `adVisionQcService` remains the fix. Kill switch
+  `STATIC_PROMPT_FIDELITY_HARDENING=false` restores a byte-identical
+  pre-hardening prompt. Watch for a text-fidelity regression: the prompt more
+  than doubled and now sits above `SET EXACTLY THESE STRINGS`. See CLAUDE.md §2.
 - **`queued` ads never auto-drain** — operator/API must claim them.
 - **`veoPredictionId` is a spend receipt that is never resumed** — process
   death + re-drain double-bills.

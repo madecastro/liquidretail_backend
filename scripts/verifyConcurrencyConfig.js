@@ -70,7 +70,14 @@ for (const k of ENV_KEYS) {
 // Re-apply defaults.env so subsequent checks see file defaults.
 require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.env') });
 const fromDefaults = resolveAll();
-check('A defaults.env RENDER_CONCURRENCY is 8', fromDefaults.RENDER_CONCURRENCY, 8);
+// 8 -> 24 on 2026-08-04 (owner: renders should all go to Atlas at once).
+// MAX_CREATIVES_PER_RUN is 20, so this gate is now non-binding for a full run —
+// every static ad submits together. Pinned so the file and the code default
+// cannot drift apart: a disagreement between them is the exact "silent config
+// lie" CLAUDE.md 4a warns about.
+check('A defaults.env RENDER_CONCURRENCY is 24', fromDefaults.RENDER_CONCURRENCY, 24);
+check('A RENDER_CONCURRENCY exceeds MAX_CREATIVES_PER_RUN, so a full run fires at once',
+  fromDefaults.RENDER_CONCURRENCY >= fromDefaults.MAX_CREATIVES_PER_RUN, true);
 check('A defaults.env VEO_CONCURRENCY is 4', fromDefaults.VEO_CONCURRENCY, 4);
 check('A defaults.env ATLAS_SUBMIT_SPACING_MS is 1200', fromDefaults.ATLAS_SUBMIT_SPACING_MS, 1200);
 check('A defaults.env GROK_MAX_RPS is 1', fromDefaults.GROK_MAX_RPS, 1);

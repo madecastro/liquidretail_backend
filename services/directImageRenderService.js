@@ -42,6 +42,60 @@ const { formatDisplayRating } = require('./ratingDisplay');
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
 const { adStage, noteRenderIssue } = require('./adStage');
 
+/**
+ * REVERTED to the plain variant, owner decision 2026-08-03 — same day the switch
+ * was made, on measured reliability. The `-developer` variant is half price and
+ * schema-identical, but it fails hard far too often:
+ *
+ *     variant      submits   hard `prediction failed`   rate
+ *     -developer     76               13                17.1%
+ *     plain          38                0                 0%
+ *
+ * Three independent runs on the developer model (38 / 20 / 18 submits) failed at
+ * 15.8% / 15.0% / 22.2% — consistent, not a bad afternoon. Each failure is a
+ * BILLED submit that returns `outputs: null` with no error message, which reaches
+ * the operator as a failed ad and bills a failure. Cost per SUCCESSFUL render
+ * still favoured developer ($0.0426 vs $0.0757), so this is deliberately NOT a
+ * cost decision — the owner chose delivered ads over unit price.
+ *
+ * The switch and its reasoning are kept below because the comparison is worth
+ * having on record, and because the developer variant is a legitimate lever if
+ * Atlas ever fixes its reliability. Re-measure before reaching for it again.
+ *
+ * VERIFIED live before switching, because a model id is never taken from memory
+ * (CLAUDE.md §2). Both entries resolve to the same POST
+ * `/api/v1/model/generateImage`; their request schemas are **field-for-field
+ * identical** — same `required` (`model`, `images`, `prompt`), same 14-value `size`
+ * enum, same `quality` low|medium|high, same `moderation` / `output_format` /
+ * `enable_sync_mode` / `enable_base64_output`, and neither exposes
+ * `input_fidelity`. They even share one `readme` URL. So this is a drop-in swap:
+ * nothing in buildParams or the payload below changes.
+ *
+ * Price, MEASURED not read off the catalog (see the pricing note in
+ * atlasImageService — `base_price` is a base and under-reports ~7x):
+ *   openai/gpt-image-2/edit            base 0.010  ->  charged $0.07173
+ *   openai/gpt-image-2-developer/edit  base 0.005  ->  charged $0.03586
+ * Exactly half, dead-consistent across every priced prediction. A 3-surface
+ * meta_static fanout goes ~$0.215 -> ~$0.108 per product.
+ *
+ * NOT VERIFIED: output quality between the two variants. The A/B that prompted this
+ * ran both arms on the developer model, so it compares prompts, not models. The
+ * schemas and readme are identical and 20 developer renders looked clean, but if
+ * output degrades, this is the first thing to put back.
+ *
+ * ⚠️ OPEN — MEASURED RELIABILITY GAP, 38 submits per model on 2026-08-03:
+ *     non-dev    36/38 ok, 0 hard failures (2 poll timeouts, likely completed late)
+ *     developer  32/38 ok, **6 hard `prediction failed`** (15.8%), outputs null,
+ *                no error message, has_nsfw_contents null
+ * Cost per SUCCESSFUL render still favours developer — $0.0426 vs $0.0757, ~44%
+ * cheaper even after paying for the failures — so the money case survives. But a
+ * ~16% hard-failure rate is a PRODUCT problem, not just a cost one: each one is a
+ * charged submit with no asset, which surfaces to the operator as a failed ad and
+ * bills a failure. NOT a controlled comparison (n=38 each, one session, and the two
+ * runs used different prompt text), so treat it as a signal to re-measure, not a
+ * verdict. If static failure rates rise after this ships, revert via
+ * AI_DIRECT_IMAGE_EDIT_MODEL before investigating anything else.
+ */
 const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
 // should never be a text to image fallback period" / "if there is no image
@@ -235,6 +289,69 @@ function safeBoxInDeliveredPx(s, dims) {
  * Returns null when the box cannot fit the mark, so the caller skips the
  * composite rather than placing it somewhere the model did not reserve.
  */
+/**
+ * Which ink a composited logomark should use, given the mean luminance (0..1)
+ * of the artwork directly behind it. Light plate → black mark, dark plate →
+ * white mark. Pure black/white on purpose: owner asked for "clean and minimal",
+ * and a brand-tinted mark on arbitrary generated backgrounds is what produced
+ * unreadable marks before.
+ *
+ * Exported so scripts/verifyProofBeat.js can pin the threshold.
+ */
+function monochromeInkFor(meanLum) {
+  const n = Number(meanLum);
+  if (!Number.isFinite(n)) return null;      // unknown → caller keeps the original asset
+  return n > 0.5 ? { r: 0, g: 0, b: 0 } : { r: 255, g: 255, b: 255 };
+}
+
+/**
+ * Re-render a logo as a single-ink silhouette.
+ *
+ * WHY: the asset is composited verbatim, so a logo delivered on an OPAQUE white
+ * canvas paints a white rectangle onto the ad. Owner, on a delivered AllBirds
+ * ad: *"I noticed the allbirds logo is put on a block of white, the logo should
+ * just be rendered in black or white depending on the color of the background.
+ * It should be clean and minimal."*
+ *
+ * Coverage (what becomes the mark) is taken from:
+ *   - the ALPHA channel when the asset has one — the normal, correct case; or
+ *   - LUMINANCE when it does not, in whichever polarity matches the asset's own
+ *     background. Border pixels decide that polarity, so dark-artwork-on-white
+ *     and white-artwork-on-black both resolve correctly instead of one of them
+ *     inverting into a solid block.
+ */
+async function monochromeLogoBuffer(logoPng, ink) {
+  const meta = await sharp(logoPng).metadata();
+  const w = meta.width, h = meta.height;
+  if (!(w > 0 && h > 0)) return null;
+
+  let coverage;
+  if (meta.hasAlpha) {
+    coverage = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
+  } else {
+    // Sample the outer border to learn the asset's own background polarity.
+    const grey = sharp(logoPng).removeAlpha().greyscale();
+    const edge = Math.max(1, Math.round(Math.min(w, h) * 0.04));
+    const strip = await grey.clone()
+      .extract({ left: 0, top: 0, width: w, height: edge })
+      .stats();
+    const bgIsLight = (strip.channels[0].mean / 255) > 0.5;
+    // bgIsLight → the mark is the DARK pixels, so invert to make them opaque.
+    coverage = bgIsLight
+      ? await grey.clone().negate().raw().toBuffer()
+      : await grey.clone().raw().toBuffer();
+  }
+
+  const solid = await sharp({
+    create: { width: w, height: h, channels: 3, background: ink },
+  }).raw().toBuffer();
+
+  return sharp(solid, { raw: { width: w, height: h, channels: 3 } })
+    .joinChannel(coverage, { raw: { width: w, height: h, channels: 1 } })
+    .png()
+    .toBuffer();
+}
+
 function logoPlacementFor({ surface, dims, logoW, logoH }) {
   const box = safeBoxInDeliveredPx(surface, dims);
   // Clamp the BOX into the delivered frame before placing anything in it, rather
@@ -470,6 +587,28 @@ function taggedError(message, { alertLevel = 'error', alertKey }) {
 }
 
 /**
+ * Fold a vision-QC corrective note INTO a full-replacement override.
+ *
+ * MONEY. The QC retry re-enters renderDirectImage with `operatorPrompt:
+ * correctiveNote` AND the original `rawPromptOverride` still set. Because the
+ * override wins below, the branch that appends the note is never reached — so
+ * without this the single allowed regeneration re-submits a BYTE-IDENTICAL
+ * prompt, earns the identical verdict, and burns a second billable
+ * gpt-image-2/edit submit for nothing.
+ *
+ * Deliberately NOT applied on the normal path: an operator who sends both a
+ * refinement and an override still gets "override wins, note dropped", which
+ * is the documented contract the route and the harness pin. This only rescues
+ * the machine-generated retry, where dropping the note is never intentional.
+ */
+function composeCorrectiveOverride(overrideText, correctiveNote) {
+  const base = String(overrideText || '');
+  const note = String(correctiveNote || '').trim();
+  if (!base || !note) return overrideText;
+  return `${base}\n\nQC CORRECTION (previous attempt failed review — fix this):\n${note}`;
+}
+
+/**
  * Map the regenerate API's promptOverride into the single flat prompt the
  * image model accepts.
  *
@@ -511,7 +650,11 @@ async function renderDirectImage({
   //   operatorPrompt     — refinement note appended to the auto-built prompt
   //   rawPromptOverride  — verbatim replacement ({system,user} or string)
   operatorPrompt = null,
-  rawPromptOverride = null
+  rawPromptOverride = null,
+  // Post-render vision QC re-entry guard. The single allowed regeneration
+  // calls renderDirectImage again with skipVisionQc:true so the QC loop
+  // cannot nest (money: would otherwise allow unbounded regenerations).
+  skipVisionQc = false
 }) {
   const surface = platformFormat || 'meta_feed_1_1';
   // Credentials are checked further down, AFTER brand routing: a brand
@@ -602,7 +745,16 @@ async function renderDirectImage({
       // and are what an operator reads in the inspector when asking "why is this
       // photo in my ad" — calling a Director pick an "operator-pick" sends that
       // question to the wrong place entirely.
-      const prefix = referenceSource === 'director' ? 'director-pick' : 'operator-pick';
+      // Derive the label from the source instead of a two-way ternary. The old
+      // `=== 'director' ? … : 'operator-pick'` collapsed EVERY non-director
+      // source onto "operator-pick", so a system-derived seed (regenerate's
+      // catalog-first reseed, referenceSource 'catalog-first') was reported to
+      // the operator as their own pick — exactly the misattribution the comment
+      // above warns about, just in the other direction. Unknown sources now
+      // label themselves rather than borrowing someone else's name.
+      const prefix = referenceSource === 'director' ? 'director-pick'
+        : referenceSource === 'operator' ? 'operator-pick'
+        : `${referenceSource}-pick`;
       if (doc?.fileUrl) refCandidates.push({ sourceUrl: doc.fileUrl, role: i === 0 ? prefix : `${prefix}-${i}` });
     });
     if (refCandidates.length < orderedIds.length) {
@@ -629,9 +781,11 @@ async function renderDirectImage({
   });
   // A total absence of any product reference is not a degraded input to
   // improvise past — it is unrecoverable, the same way a missing Director
-  // concept is above. buildPrompt's opening paragraph unconditionally instructs
-  // the model to "reproduce this exact item faithfully" from "the supplied
-  // photograph" — true and necessary when refs.length > 0, but if this fired
+  // concept is above. buildPrompt's opening section (`PRODUCT_FIDELITY`, and the
+  // one-sentence legacy paragraph before it) unconditionally calls the supplied
+  // reference photograph "the single source of truth for the product" and
+  // forbids inferring the product from its category or from brand priors —
+  // true and necessary when refs.length > 0, but if this fired
   // with zero references the model would be told a photograph exists when none
   // does, and would have nothing to ground the product's actual appearance in.
   // For a system whose whole purpose is faithfully depicting a real product,
@@ -755,10 +909,20 @@ async function renderDirectImage({
   const box = extractFor(built.surface, frame.width, frame.height);
   const [reqW, reqH] = String(genSize).split(/[x*]/).map(Number);
   if (frame.width !== reqW || frame.height !== reqH) {
-    console.warn(
-      `   ⚠️  direct-image: model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
-      `cropping the ${built.surface.aspect} centre of what arrived`
-    );
+    const msg =
+      `model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
+      `cropping the ${built.surface.aspect} centre of what arrived`;
+    console.warn(`   ⚠️  direct-image: ${msg}`);
+    // Surfaced per-ad, not just in logs, because this is the alarm for the one
+    // operational risk the exact-aspect size table takes on: 4:5 generates at
+    // 1088x1360, which is NOT a member of the schema's size enum and is in use on
+    // the strength of a single live probe. If the gateway ever starts coercing an
+    // arbitrary size to its 1024x1024 default, the symptom is precisely this
+    // mismatch — and because extractFor then centre-crops to the surface aspect,
+    // the ad would still LOOK plausible while cropping through typeset copy
+    // exactly as the old stale table did. A console warning on a worker nobody is
+    // tailing is not an alarm; a renderIssue on the Ad is.
+    noteRenderIssue(adId, { message: msg, stage: 'generation-size' });
   }
   const rendered = await sharp(rawFrame)
     .extract(box)
@@ -796,8 +960,38 @@ async function renderDirectImage({
         logoW: lm.width,
         logoH: lm.height
       });
-      if (place) layers.push({ input: logoPng, top: place.top, left: place.left });
-      else {
+      if (place) {
+        // Monochrome the mark against whatever the model actually rendered in
+        // that corner, so it never ships as a white block (owner, 2026-08-03).
+        // Any failure falls back to the original asset — a correctly-placed
+        // logo with an ugly backing beats no logo at all.
+        let toPlace = logoPng;
+        try {
+          const region = await sharp(rendered)
+            .extract({
+              left: Math.max(0, Math.min(place.left, dims.width - 1)),
+              top: Math.max(0, Math.min(place.top, dims.height - 1)),
+              width: Math.max(1, Math.min(lm.width, dims.width - place.left)),
+              height: Math.max(1, Math.min(lm.height, dims.height - place.top)),
+            })
+            .greyscale()
+            .stats();
+          const ink = monochromeInkFor(region.channels[0].mean / 255);
+          if (ink) {
+            const mono = await monochromeLogoBuffer(logoPng, ink);
+            if (mono) {
+              toPlace = mono;
+              console.log(
+                `   🖼️  direct-image: logomark inked ${ink.r ? 'white' : 'black'} ` +
+                `(behind lum=${(region.channels[0].mean / 255).toFixed(2)})`
+              );
+            }
+          }
+        } catch (err) {
+          console.warn(`   ⚠️  direct-image: logo monochrome skipped (${err.message}) — using original asset`);
+        }
+        layers.push({ input: toPlace, top: place.top, left: place.left });
+      } else {
         const msg = `no room for the logo inside ${surface}'s content rect — ad ships without logo`;
         console.warn(`   ⚠️  direct-image: ${msg}`);
         noteRenderIssue(adId, { message: msg, stage: 'logo' });
@@ -824,7 +1018,7 @@ async function renderDirectImage({
     `text=${built.text.length}${built.dropped.length ? ` dropped=${built.dropped.join('+')}` : ''} ` +
     `model=${PLATE_EDIT_MODEL}`
   );
-  return {
+  const firstOutput = {
     buffer, contentType: 'image/png', width: dims.width, height: dims.height,
     bytes: buffer.length, kind: 'image', directImage: true,
     // Verbatim audit of the image-model request, built at submit time inside
@@ -847,7 +1041,117 @@ async function renderDirectImage({
       droppedRoles: built.dropped,
       generateSize: genSize,
       logoComposited: layers.length > 0
+    },
+    visionQc: null
+  };
+
+  // ── Post-render vision QC ──────────────────────────────────────────
+  // skipVisionQc: re-entry from the single allowed regeneration must not
+  // nest another QC loop (that would break the one-retry money bound).
+  if (skipVisionQc) return firstOutput;
+
+  const adVisionQc = require('./adVisionQcService');
+  if (!adVisionQc.isEnabled()) {
+    return firstOutput;
+  }
+
+  // ORIGINAL product photo — the first reference we actually sent. A check
+  // that only sees the render cannot tell an invented Timberland emblem from
+  // a real brand mark (owner requirement: both images in one vision call).
+  const originalProductUrl = imageMeta[0]?.sourceUrl || null;
+  if (!originalProductUrl) {
+    console.warn('   ⚠️  direct-image: vision QC enabled but no original product URL — shipping without QC');
+    return firstOutput;
+  }
+
+  const safeBox = safeBoxInDeliveredPx(built.surface, dims);
+  const expectedText = built.text.map(([, str]) => str);
+
+  adStage(adId, `vision QC (${surface})`);
+  const qcResult = await adVisionQc.runPostRenderQc({
+    enabled: true,
+    originalProductUrl,
+    brandName: resolvedBrand?.name || null,
+    safeBox,
+    deliveryDims: dims,
+    expectedText,
+    brandId: resolvedBrand?._id || brandId || null,
+    productId: resolvedProduct?._id || productId || null,
+    adId: adId || null,
+    // MONEY: generate() attempt 1 returns the already-paid firstOutput.
+    // attempt 2 (at most once) re-enters renderDirectImage with a corrective
+    // operatorPrompt and skipVisionQc:true — one more billable editImage.
+    generate: async ({ attempt, correctiveNote }) => {
+      if (attempt === 1) return firstOutput;
+      adStage(adId, `vision QC regen (${surface})`);
+      return renderDirectImage({
+        layoutInputArtifactId,
+        aspectRatio,
+        mediaId,
+        productId,
+        brandId,
+        adId,
+        adConceptArtifactId,
+        adConceptId,
+        template,
+        referenceMediaIds,
+        referenceSource,
+        platformFormat,
+        // When the operator replaced the prompt, the corrective note has to
+        // ride INSIDE the override or it is discarded and this paid retry is a
+        // guaranteed repeat of the failure. See composeCorrectiveOverride.
+        operatorPrompt: overrideText ? null : correctiveNote,
+        rawPromptOverride: overrideText
+          ? composeCorrectiveOverride(overrideText, correctiveNote)
+          : rawPromptOverride,
+        skipVisionQc: true
+      });
+    },
+    // Keep discarded (paid) renders durable — owner requirement.
+    uploadAttempt: async ({ buffer: buf, attempt }) => {
+      try {
+        const { uploadBufferToCloudinary } = require('./cloudinaryService');
+        const up = await uploadBufferToCloudinary(buf, {
+          folder: `ads/qc-discarded/${brandId || 'unknown'}`,
+          publicId: `${adId || 'ad'}-qc-a${attempt}-${Date.now()}`,
+          resourceType: 'image',
+          overwrite: false
+        });
+        return up.secure_url || up.url || null;
+      } catch (err) {
+        console.warn(`   ⚠️  direct-image: QC discard upload failed: ${err.message}`);
+        return null;
+      }
     }
+  });
+
+  if (!qcResult.ok) {
+    adVisionQc.alertQcFailure({
+      adId,
+      brandId: resolvedBrand?._id || brandId,
+      productId: resolvedProduct?._id || productId,
+      brandName: resolvedBrand?.name,
+      visionQc: qcResult.visionQc
+    });
+    const lastSummary = (qcResult.visionQc?.attempts || []).slice(-1)[0]?.summary || 'fail';
+    const err = taggedError(
+      `vision QC failed after ${qcResult.regenerationCount} regeneration(s): ${lastSummary}`,
+      { alertLevel: 'error', alertKey: 'vision-qc:failed-after-retry' }
+    );
+    // MONEY: at least one image submit was charged; surface that + the verdict
+    // (with discarded URLs) so the failure path can persist them.
+    err.charged = true;
+    err.visionQc = qcResult.visionQc;
+    throw err;
+  }
+
+  console.log(
+    `   ✅ direct-image vision QC pass — attempt=${qcResult.visionQc.finalAttempt} ` +
+    `regens=${qcResult.regenerationCount}`
+  );
+  return {
+    ...qcResult.output,
+    visionQc: qcResult.visionQc
   };
 }
 
@@ -858,11 +1162,16 @@ module.exports = {
   safeBoxInDeliveredPx,
   extractFor,
   logoPlacementFor,
+  monochromeInkFor,
+  monochromeLogoBuffer,
   intentForTemplate,
   buildIntentData,
   describeProductForPrompt,
   conceptLook,
   normalizeReference,
   resolveImagePromptOverride,
+  // MONEY: pinned by scripts/verifyRegeneration.js (R5) — without it the one
+  // allowed vision-QC retry re-submits an identical prompt for a second charge.
+  composeCorrectiveOverride,
   renderDirectImage
 };

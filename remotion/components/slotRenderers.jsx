@@ -13,7 +13,9 @@ import {
   applyCasing,
   clampPx,
   TEXT_SHADOWS,
+  TEXT_SHADOWS_ON_LIGHT,
   BOX_SHADOWS,
+  textShadowFor,
 } from '../lib/tokens.js';
 import {
   STAR_COUNT,
@@ -114,13 +116,17 @@ function scrimStyle(treatment, tokens, dims) {
 function textCoreStyle(slot, tokens, dims, format) {
   const t = slot.treatment;
   const font = tokenFont(tokens, t.fontRole);
+  const ink = tokenColor(tokens, t.colorToken);
   return {
     fontFamily: fontFamilyCss(font),
     fontWeight: t.weight,
     fontSize: baseSize(slot.key, format, t.sizeScale),
     letterSpacing: t.trackingPx ? `${t.trackingPx}px` : 'normal',
-    color: tokenColor(tokens, t.colorToken),
-    textShadow: t.scrim === 'none' ? TEXT_SHADOWS[t.shadow] : TEXT_SHADOWS[t.shadow === 'layered' ? 'soft' : t.shadow],
+    color: ink,
+    // Shadow polarity follows the INK, not the token table — see textShadowFor.
+    // A black shadow behind dark type (the on-light contrast flip) separated
+    // nothing, which is how titles became unreadable over skin.
+    textShadow: textShadowFor(t.scrim === 'none' ? t.shadow : (t.shadow === 'layered' ? 'soft' : t.shadow), ink),
     lineHeight: 1.16,
     display: '-webkit-box',
     WebkitBoxOrient: 'vertical',
@@ -318,12 +324,30 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
   const font = tokenFont(tokens, 'body');
   // Secondary color follows the slot's (possibly contrast-flipped) token:
   // when the group flips to on-light colors, the count line flips too.
-  const secondaryToken = t.colorToken === 'textOnLight' ? 'textSecondaryOnLight' : 'textSecondary';
+  // PRIMARY ink for the reviews line, not the dim secondary token.
+  //
+  // MEASURED on a delivered Vuori 1:1 (owner: "the number of reviews and
+  // everything on that line is simply not legible"): against the same backdrop,
+  // the headline rendered at 6.87:1 contrast and the reviews line at 3.35:1 —
+  // its glyphs peaked at 0.715 luminance because textSecondary is a deliberately
+  // dimmed grey. 3.35:1 is below the 4.5:1 floor for text this size, so the line
+  // was failing on any mid-tone plate, not just that one.
+  //
+  // Same mistake, same fix as DeliverySlot ("Inherit primary ink — do NOT demote
+  // to textSecondary"). Dimming is a valid choice on a flat studio backdrop and a
+  // bug on footage; the whole point of the plate-intel ink flip is that we do not
+  // know which we have until we look.
+  const secondaryToken = t.colorToken === 'textOnLight' ? 'textOnLight' : 'textPrimary';
 
   // Internal choreography is relative to the slot's own enterAtSec (group
   // enter transition is already applied by Canonical around this renderer).
   const localFrame = ratingLocalFrame(frame, fps, slot.timing?.enterAtSec ?? 0, timeScale);
-  const countStartSec = lastStarLandSec(); // ~0.58s — after 5th star lands
+  // Reviews line normally waits for the 5th star to land (~0.58s) so the
+  // count-up doesn't roll while stars are still popping in. When rating is
+  // null (owner's ">4.5 stars only" rule suppressed a real-but-low rating,
+  // e.g. GymShark 3.3★/41k reviews) there are no stars rendered at all, so
+  // there is nothing to wait for — start right at the slot's own enter.
+  const countStartSec = rating != null ? lastStarLandSec() : 0;
   const parsed = reviewsText ? parseReviewsLeadingNumber(reviewsText) : null;
 
   let reviewsNode = null;
@@ -345,7 +369,7 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
             fontSize: Math.round(size * 0.82),
             fontWeight: 500,
             fontFamily: fontFamilyCss(font),
-            textShadow: TEXT_SHADOWS.soft,
+            textShadow: textShadowFor(t.shadow, tokenColor(tokens, secondaryToken)),
             maxWidth: '100%',
             // Tabular figures keep the rolling digits from jittering row width.
             fontVariantNumeric: 'tabular-nums',
@@ -369,7 +393,7 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
             fontSize: Math.round(size * 0.82),
             fontWeight: 500,
             fontFamily: fontFamilyCss(font),
-            textShadow: TEXT_SHADOWS.soft,
+            textShadow: textShadowFor(t.shadow, tokenColor(tokens, secondaryToken)),
             maxWidth: '100%',
             opacity: op,
           }}
@@ -382,6 +406,12 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
 
   // Lockup: stars+score on line 1; reviewsText UNDER as line 2 (same max
   // width). No reviewsText → stars+score only (unchanged empty behaviour).
+  // rating === null → no stars / no score row at all: StarRow's labelFill
+  // is Math.min(count, Math.max(0, Number(rating) || 0)), so feeding it a
+  // null rating would silently draw FIVE EMPTY STARS — worse than nothing
+  // for a brand the owner's rule deliberately suppressed. Skip the whole
+  // row instead (not just hide it) so there's no leftover flex gap above
+  // the reviews line.
   return (
     <div
       style={{
@@ -393,26 +423,28 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
         maxWidth: '100%',
       }}
     >
-      <div
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: Math.round(dims.width * 0.016),
-        }}
-      >
-        <StarRow
-          color={tokenColor(tokens, 'stars')}
-          size={Math.round(size * 1.15)}
-          gap={Math.round(size * 0.15)}
-          rating={rating}
-          count={STAR_COUNT}
-          localFrame={localFrame}
-          fps={fps}
-        />
-        <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
-          {rating.toFixed(1)}/5
-        </span>
-      </div>
+      {rating != null ? (
+        <div
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: Math.round(dims.width * 0.016),
+          }}
+        >
+          <StarRow
+            color={tokenColor(tokens, 'stars')}
+            size={Math.round(size * 1.15)}
+            gap={Math.round(size * 0.15)}
+            rating={rating}
+            count={STAR_COUNT}
+            localFrame={localFrame}
+            fps={fps}
+          />
+          <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
+            {rating.toFixed(1)}/5
+          </span>
+        </div>
+      ) : null}
       {reviewsNode}
     </div>
   );
@@ -443,21 +475,37 @@ const Pill = ({ children, bg, text, stroke, dims, size, tracking }) => (
   </div>
 );
 
+// PLAIN TEXT, NO PILL — owner direction 2026-08-03.
+//
+// This slot used to render a filled Pill using the brand's badgeBg/badgeText
+// tokens. Because those tokens come from brand theme, the same slot shipped a
+// CHARCOAL box on Vuori and a cream one on GymShark — and on a light plate the
+// dark box read as exactly the scrim treatment the no-scrim standard exists to
+// remove. Owner, seeing it in a delivered ad: *"there is a dark pill"*, and when
+// asked how the badge should read: *"Plain text, no pill."*
+//
+// So the badge now renders as small-caps type in the SAME ink as the rest of the
+// group (textPrimary, which the plate-intel contrast flip already drives), which
+// also makes it consistent across brands instead of per-token. `Pill` is still
+// used by CTA/promo, which are meant to read as buttons.
 export const BadgeSlot = ({ slot, content, tokens, dims, format }) => {
   const t = slot.treatment;
   const size = baseSize('badge', format, t.sizeScale);
   const font = tokenFont(tokens, 'body');
   return (
-    <div style={{ fontFamily: fontFamilyCss(font) }}>
-      <Pill
-        bg={hexToRgba(tokenColor(tokens, 'badgeBg'), 0.96)}
-        text={tokenColor(tokens, 'badgeText')}
-        dims={dims}
-        size={size}
-        tracking={t.trackingPx || 1}
+    <div style={{ ...scrimStyle(t, tokens, dims), fontFamily: fontFamilyCss(font) }}>
+      <span
+        style={{
+          fontFamily: fontFamilyCss(font),
+          fontWeight: t.weight || 700,
+          fontSize: size,
+          letterSpacing: `${t.trackingPx ?? 1.5}px`,
+          color: tokenColor(tokens, t.colorToken || 'textPrimary'),
+          whiteSpace: 'nowrap',
+        }}
       >
         {applyCasing(content, t.casing === 'none' ? 'upper' : t.casing)}
-      </Pill>
+      </span>
     </div>
   );
 };
@@ -546,6 +594,21 @@ const TruckIcon = ({ size, color }) => (
   </svg>
 );
 
+// Does this line actually make a delivery/shipping claim? The truck icon is
+// only honest when it does.
+//
+// WHY THIS IS NEEDED: the slot is named deliveryLine and labelled "Delivery /
+// offer line", but its cascade binds `layoutInput.input.product.badges[1]`
+// (metaCascadeConfig.js) — the SECOND BADGE. So the text is routinely
+// "Premium Cotton", "Best Seller", "New Arrival"… and the old condition
+// (`endcardMode !== 'brand'`, i.e. every product ad) stapled a shipping truck
+// onto all of them. Owner, seeing it in a delivered ad: *"I am seeing the
+// shipping car show back up."* A truck beside "Premium Cotton" is a claim the
+// copy never made.
+// Content-driven, so the icon returns automatically if a real delivery line is
+// ever bound to the slot, without another code change.
+const DELIVERY_CLAIM = /\b(ship(s|ped|ping)?|deliver(s|ed|y)?|free\s+(ship|deliver)|arrives?|arriving|next[- ]day|same[- ]day|overnight|\d+\s*[-–]?\s*\d*\s*(business\s+)?days?|returns?|exchange)\b/i;
+
 export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
   const t = slot.treatment;
   const size = baseSize('deliveryLine', format, t.sizeScale);
@@ -553,7 +616,8 @@ export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
   // Inherit primary ink (and plate-intel contrast flip) — do NOT demote to
   // textSecondary. Weight comes from treatment (presets set 600).
   const color = tokenColor(tokens, t.colorToken || 'textPrimary');
-  const showTruck = meta?.endcardMode !== 'brand';
+  const showTruck = meta?.endcardMode !== 'brand'
+    && DELIVERY_CLAIM.test(String(content ?? ''));
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-flex', alignItems: 'center', gap: Math.round(size * 0.5) }}>
       {showTruck ? <TruckIcon size={size} color={color} /> : null}
@@ -566,7 +630,7 @@ export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
-          textShadow: TEXT_SHADOWS[t.shadow] || TEXT_SHADOWS.soft,
+          textShadow: textShadowFor(t.shadow, color),
         }}
       >
         {applyCasing(content, t.casing)}
@@ -585,7 +649,7 @@ export const PriceSlot = ({ slot, content, tokens, dims, format }) => {
   const text = /[$€£¥]|usd|eur|gbp/i.test(raw) ? raw : `$${raw}`;
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-block' }}>
-      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: Math.max(t.weight, 700), fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: TEXT_SHADOWS.soft }}>
+      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: Math.max(t.weight, 700), fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
         {text}
       </span>
     </div>
@@ -618,7 +682,7 @@ export const LikesSlot = ({ slot, content, tokens, dims, format }) => {
       <svg width={Math.round(size * 1.05)} height={Math.round(size * 1.05)} viewBox="0 0 24 24" style={{ display: 'block' }}>
         <path d="M12 21s-7.5-4.6-9.6-9.5C.9 7.6 3.5 4 7 4c2 0 3.5 1 5 2.7C13.5 5 15 4 17 4c3.5 0 6.1 3.6 4.6 7.5C19.5 16.4 12 21 12 21z" fill={color} />
       </svg>
-      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color, textShadow: TEXT_SHADOWS.soft }}>
+      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color, textShadow: textShadowFor(t.shadow, color) }}>
         {applyCasing(label, t.casing)}
       </span>
     </div>
@@ -638,7 +702,7 @@ export const ReviewCountSlot = ({ slot, content, tokens, dims, format }) => {
     : raw;
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-block' }}>
-      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: TEXT_SHADOWS.soft }}>
+      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
         {applyCasing(label, t.casing)}
       </span>
     </div>
@@ -712,13 +776,13 @@ function renderMultiValue({ slot, content, tokens, dims, format, progress, sizeK
           return (
             <div key={i} style={{ ...commonSpan, display: 'inline-flex', alignItems: 'baseline', gap: Math.round(size * 0.4), fontFamily: fontFamilyCss(font) }}>
               <span style={{ width: Math.round(size * 0.4), height: Math.round(size * 0.4), borderRadius: '50%', backgroundColor: fg, display: 'inline-block', alignSelf: 'center' }} />
-              <span style={{ fontSize: size, fontWeight: t.weight, color: fg, textShadow: TEXT_SHADOWS.soft }}>{label}</span>
+              <span style={{ fontSize: size, fontWeight: t.weight, color: fg, textShadow: textShadowFor(t.shadow, fg) }}>{label}</span>
             </div>
           );
         }
         // plain
         return (
-          <span key={i} style={{ ...commonSpan, fontSize: size, fontWeight: t.weight, color: fg, fontFamily: fontFamilyCss(font), textShadow: TEXT_SHADOWS.soft }}>
+          <span key={i} style={{ ...commonSpan, fontSize: size, fontWeight: t.weight, color: fg, fontFamily: fontFamilyCss(font), textShadow: textShadowFor(t.shadow, fg) }}>
             {label}
           </span>
         );

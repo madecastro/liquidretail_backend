@@ -59,6 +59,10 @@ const ProductMatchArtifact   = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact    = require('../models/OverlayZoneArtifact');
 const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
 const CatalogProduct         = require('../models/CatalogProduct');
+// Brand is resolved by NAME first (findBrandByName); this is for the brandId
+// FK fallback in loadContext, which rescues brands whose scraped name carries
+// a tagline and therefore never matches nameNormalized.
+const Brand                  = require('../models/Brand');
 const Category               = require('../models/Category');
 const Comment                = require('../models/Comment');
 const { findBrandByName }    = require('./brandCatalogService');
@@ -643,9 +647,35 @@ async function loadContext(mediaId, options = {}) {
   }
   const runId = detection?.runId || null;
   const brandName = match?.identification?.brand || media.metadata?.brand || null;
-  const brand = brandName
+  let brand = brandName
     ? await findBrandByName(brandName).then(b => b?.toObject?.() || b).catch(() => null)
     : null;
+  // FK FALLBACK — deliberately only when the NAME lookup failed, so every
+  // resolution that works today is byte-identical.
+  //
+  // The name on a Media/CatalogProduct is scraped page text and is often not
+  // the brand's name at all. Measured in production: GymShark's catalog media
+  // carries `metadata.brand = "Gymshark | Be a visionary."` (name + site
+  // tagline), which normalizeBrandName turns into "gymshark be a visionary" —
+  // it can never match the real doc's "gymshark". So findBrandByName returned
+  // null, ctx.brand was null, and EVERY brand-sourced field silently vanished:
+  // brandReviews (so the brand-tier quote fallback had an empty pool and could
+  // never fire), styleTheme, logo, tagline.
+  // media.brandId / match.brandId is the authoritative FK and was correct all
+  // along. Not fixing the scraped name here on purpose — that is ingestion,
+  // owned elsewhere; this is the lookup being resilient to it.
+  if (!brand) {
+    const brandFk = media.brandId || match?.brandId || null;
+    if (brandFk) {
+      brand = await Brand.findById(brandFk).lean().catch(() => null);
+      if (brand) {
+        console.log(
+          `🔗 layoutInput: brand name lookup failed for ${JSON.stringify(brandName)} — ` +
+          `resolved via brandId FK to "${brand.name}" (scraped name is not the brand name)`
+        );
+      }
+    }
+  }
 
   // Category-pool resolution. When the match resolves to a Category
   // (either via the linked CatalogProduct.categoryRef or via the
@@ -1420,6 +1450,16 @@ const QUOTE_MIN_RATING     = Number(process.env.QUOTE_MIN_RATING || 4.5);
 // them and reports the gap; set true once coverage is good.
 const QUOTE_REQUIRE_RATING = String(process.env.QUOTE_REQUIRE_RATING || 'false').toLowerCase() === 'true';
 
+// Brand-tier review quotes are catalog-wide (see the isProductScoped guard
+// below): on a product-scoped ad they used to be withheld outright, so a
+// brand with zero product/category-level reviews rendered no testimonial at
+// all even when it had brand reviews to spare. Default ON (owner decision,
+// 2026-08-03): let brand quotes serve as a LAST-RESORT fallback on product
+// ads — below product, category, AND product-scoped comments — rather than
+// showing nothing. Set false to restore the old withhold-entirely behavior
+// without a deploy.
+const QUOTE_BRAND_TIER_FALLBACK = String(process.env.QUOTE_BRAND_TIER_FALLBACK || 'true').toLowerCase() === 'true';
+
 function gateQuotesByRating(candidates, tierName) {
   if (!Array.isArray(candidates) || !candidates.length) return [];
   let rated = 0, dropped = 0, unrated = 0;
@@ -2007,24 +2047,38 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // bought, which on a multi-SKU brand is usually NOT this product. Rendering
   // one under this product's photo presents another item's praise as if it
   // were about this one — a leggings review as the testimonial on a tee ad.
-  // Brand reviews therefore only back a BRAND ad, where no single product is
-  // being claimed. A product ad with no product- or category-level review
-  // shows no testimonial, which is the honest result.
+  // Brand reviews therefore only back a BRAND ad outright — on a product ad
+  // they are demoted to a LAST-RESORT fallback (QUOTE_BRAND_TIER_FALLBACK,
+  // default on): they may still win, but only when product, category, AND
+  // product-scoped comments all yielded nothing, so a brand with zero
+  // product-level proof isn't left with no testimonial at all. Set the flag
+  // false to restore the pre-2026-08-03 behavior of withholding brand quotes
+  // from product ads entirely, without a deploy.
   // catalogProductId is the FK on ProductMatchArtifact (:78) and is what the
   // rest of this file tests product scope with (:653, :1850). The nested
   // identification.details.catalogProductId is NOT hydrated —
   // productMatchHydration rebuilds that object from the CatalogProduct's
   // commerce fields and never writes an id onto it — so reading it here would
   // have left isProductScoped false on real product ads and leaked the brand
-  // quotes this guard exists to withhold.
+  // quotes this guard exists to demote.
   const isProductScoped = !!(ctx.match?.catalogProductId || ctx.match?.identification?.details?.catalogProductId);
   const brandReviewsContainer = ctx.match?.brandReviews || ctx.brand?.brandReviews || null;
   const brandQuotesRaw = (brandReviewsContainer?.quotes || []);
-  const tierBrand = isProductScoped
+  // Withhold entirely only when this IS a product ad AND the fallback flag is
+  // off (the old behavior, kept as the revert path). Otherwise brand quotes
+  // go through the SAME gates as every other tier — stampOrigin →
+  // printableOnly (toPrintableCustomerQuote) → gateQuotesByRating — no second
+  // allowlist. Ranking (last-resort on product ads vs. legitimate top-tier
+  // proof on brand ads) is enforced below, at pick time, not by hiding the
+  // pool here.
+  const withholdBrandOnProductAd = isProductScoped && !QUOTE_BRAND_TIER_FALLBACK;
+  const tierBrand = withholdBrandOnProductAd
     ? []
     : gateQuotesByRating(printableOnly(stampOrigin(brandReviewsContainer, brandQuotesRaw), 'brand'), 'brand');
-  if (isProductScoped && brandQuotesRaw.length) {
-    console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk)`);
+  if (withholdBrandOnProductAd && brandQuotesRaw.length) {
+    console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk; QUOTE_BRAND_TIER_FALLBACK=false)`);
+  } else if (isProductScoped && brandQuotesRaw.length) {
+    console.log(`🔓 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) demoted to last-resort on a product ad (cross-product risk; wins only if product/category/comment tiers are empty)`);
   }
   const tierComment  = printableOnly(await loadBrandCommentsForQuotePool(ctx), 'comment');
 
@@ -2050,15 +2104,40 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   }
 
   const pickedProduct  = pickStrongestQuote(tierProduct);
-  const pickedCategory = pickedProduct  ? null : pickStrongestQuote(tierCategory);
-  const pickedBrand    = pickedProduct || pickedCategory ? null : pickStrongestQuote(tierBrand);
-  const pickedComment  = pickedProduct || pickedCategory || pickedBrand ? null : pickStrongestQuote(tierComment);
+  const pickedCategory = pickedProduct ? null : pickStrongestQuote(tierCategory);
+  // Precedence forks here on ad type, and ONLY here:
+  //
+  // - Product ad (isProductScoped): product -> category -> comment -> brand.
+  //   Brand is dead last — comment outranks it — because comment quotes are
+  //   already product-scoped (loadBrandCommentsForQuotePool) while brand
+  //   quotes are catalog-wide cross-product risk. Brand only wins when
+  //   product, category, AND comment all yielded nothing.
+  // - Brand ad (!isProductScoped): product -> category -> brand -> comment,
+  //   UNCHANGED from before this change. No product is being claimed, so a
+  //   brand-tier review is legitimate top-tier proof and still outranks a
+  //   comment, same as it always has.
+  let pickedBrand;
+  let pickedComment;
+  if (isProductScoped) {
+    pickedComment = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierComment);
+    pickedBrand   = (pickedProduct || pickedCategory || pickedComment) ? null : pickStrongestQuote(tierBrand);
+  } else {
+    pickedBrand   = (pickedProduct || pickedCategory) ? null : pickStrongestQuote(tierBrand);
+    pickedComment = (pickedProduct || pickedCategory || pickedBrand) ? null : pickStrongestQuote(tierComment);
+  }
   let primaryQuote = pickedProduct || pickedCategory || pickedBrand || pickedComment || null;
   const quoteTier = pickedProduct  ? 'product'
                   : pickedCategory ? 'category'
                   : pickedBrand    ? 'brand'
                   : pickedComment  ? 'comment'
                   :                  null;
+  // This decision must stay visible in Render logs: brand tier winning a
+  // primary slot on a product ad is the fallback actually firing, not just
+  // being available. (Brand winning on a brand ad is the long-standing,
+  // unchanged path and isn't logged here.)
+  if (isProductScoped && quoteTier === 'brand') {
+    console.log(`🔓 quote scope — brand-tier quote WON as last-resort fallback on product ad (media=${media._id})`);
+  }
 
   // The synth fallback that used to sit here is gone with tier 6. It existed to
   // keep hero zones populated; an empty zone is the correct rendering of proof
@@ -2301,17 +2380,10 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
     },
 
     social_proof: {
-      // For 'branding' outcome (no SKU) fall back to brand-level rating /
-      // review_count from Gemini brand-reviews lookup so the proof bar
-      // isn't blank when only brand sentiment is available.
-      rating_value:    typeof details.rating === 'number'
-                          ? details.rating
-                          : (ctx.match?.outcome === 'brand_match' && typeof ctx.match?.brandReviews?.rating === 'number'
-                              ? ctx.match.brandReviews.rating : undefined),
-      review_count:    typeof details.reviewCount === 'number'
-                          ? details.reviewCount
-                          : (ctx.match?.outcome === 'brand_match' && typeof ctx.match?.brandReviews?.reviewCount === 'number'
-                              ? ctx.match.brandReviews.reviewCount : undefined),
+      // rating_value / review_count are an ATOMIC PAIR — see
+      // deriveSocialProofNumbers() below for the R2 fix and the
+      // stale-artifact handling (`rating_source`).
+      ...deriveSocialProofNumbers(details, ctx),
       trusted_by_text: derivation.trusted_by_text || trustedByFromStats(details) || undefined,
       proof_badges:    limitArray(derivedBadges, 4),
       primary_quote:   primaryQuote || undefined,
@@ -3150,6 +3222,75 @@ function buildPerformanceMetrics(media, match) {
   return metrics.slice(0, 6);
 }
 
+/**
+ * ATOMIC rating_value/review_count pair for `social_proof` (R2 fix,
+ * 2026-08-03).
+ *
+ * HISTORY — the hole this closes: the previous code resolved rating_value
+ * and review_count as TWO INDEPENDENT ternaries, each falling to
+ * ctx.match.brandReviews on its own for a 'brand_match' outcome. Ratings and
+ * review counts are frequently scraped separately, so a product carrying a
+ * rating but no count kept its product-tier rating while the count alone
+ * fell through to the BRAND aggregate — printing a catalog-wide review
+ * count beside a single product's stars. That is the exact cross-tier mix
+ * services/ratingDisplay.js's resolveCoherentSocialProof exists to forbid.
+ *
+ * FIX: decide the winning TIER once for the whole pair. If the product
+ * (`details`) carries EITHER field, the pair is product-tier and BOTH
+ * fields come from `details` — a field product doesn't have stays empty
+ * rather than borrowing the other tier's value. Only when product has
+ * NEITHER field does the pair fall to the brand aggregate, and then BOTH
+ * fields come from ctx.match.brandReviews together.
+ *
+ * `rating_source` ('product'|'brand'|null) records which tier won. This is
+ * the mechanism for the ~722/738 artifacts already cached under the OLD
+ * two-ternary code: those documents were written before this field existed,
+ * so they carry NO `rating_source` at all. A tier-aware consumer
+ * (brandScriptExecutor.buildMetaForAd) treats that ABSENCE as "provenance
+ * unknown" and does not trust a stale artifact's rating_value/review_count
+ * as a coherent PRODUCT pair — CatalogProduct becomes the sole product-tier
+ * source for those ads instead (or no product pair at all, if CatalogProduct
+ * also has nothing). This does NOT drop proof a brand legitimately has:
+ * Brand.brandReviews is fetched independently by buildMetaForAd for the
+ * BRAND tier and is untouched by any of this — only the product-shaped
+ * fallback that used to live here is what a stale artifact loses.
+ *
+ * A fix that only changed future writes would not be sufficient on its own
+ * (this file cannot rewrite already-persisted Mongo documents) — the
+ * `rating_source` marker is what lets a consumer distinguish "written under
+ * the atomic rule" from "written under the old, possibly-mixed rule"
+ * without a schema-version bump (which would force a live re-derivation —
+ * runDerivation() calls the Gemini layout-derivation LLM — across every
+ * cached artifact; far too large and costly a side effect for this fix).
+ *
+ * @returns {{ rating_value: number|undefined, review_count: number|undefined, rating_source: 'product'|'brand'|null }}
+ */
+function deriveSocialProofNumbers(details, ctx) {
+  const hasProductNumber = typeof details.rating === 'number' || typeof details.reviewCount === 'number';
+  if (hasProductNumber) {
+    return {
+      rating_value:  details.rating,
+      review_count:  details.reviewCount,
+      rating_source: 'product',
+    };
+  }
+  // For 'branding' outcome (no SKU) fall back to brand-level rating /
+  // review_count from Gemini brand-reviews lookup so the proof bar isn't
+  // blank when only brand sentiment is available — atomic, both fields
+  // from the SAME brandReviews snapshot.
+  const brandReviews = ctx.match?.outcome === 'brand_match' ? ctx.match?.brandReviews : null;
+  const hasBrandNumber = brandReviews
+    && (typeof brandReviews.rating === 'number' || typeof brandReviews.reviewCount === 'number');
+  if (hasBrandNumber) {
+    return {
+      rating_value:  brandReviews.rating,
+      review_count:  brandReviews.reviewCount,
+      rating_source: 'brand',
+    };
+  }
+  return { rating_value: undefined, review_count: undefined, rating_source: null };
+}
+
 function trustedByFromStats(details) {
   if (typeof details.reviewCount === 'number' && details.reviewCount >= 50) {
     return `Trusted by ${formatCount(details.reviewCount)}+ customers`;
@@ -3275,6 +3416,14 @@ module.exports = {
   // Shared so every surface that renders a social comment as proof applies
   // the same definition of praise, rather than each growing its own lexicon.
   hasPositiveSignal,
+  // Exported so scripts/verifyProofBeat.js can pin the R2 fix BEHAVIOURALLY
+  // rather than by source scan. This is the function that decides ONE winning
+  // tier for the rating/count pair and stamps `rating_source`; before it, two
+  // independent ternaries could take a product rating and a brand count on the
+  // same artifact, and downstream had no way to tell brand numbers from product
+  // numbers. A revert-proof pass showed nothing failed when the marker was
+  // removed, which is why it is exported now.
+  deriveSocialProofNumbers,
   // Quote-selection internals, exported so scripts/verifyQuoteGate.js can pin
   // the 4.5-star floor and the product-review lookup. Both have already been
   // broken once by a merge with nothing to catch it.
@@ -3290,5 +3439,10 @@ module.exports = {
   // Exported so the provenance harness can pin: derivation prompt gets quote
   // TEXT for tone, never a byline/persona for anonymous-print origins.
   buildDerivationPrompt,
-  quoteLineForTonePrompt
+  quoteLineForTonePrompt,
+  // Exported so buildMetaForAd (brandScriptExecutor.js) can require a
+  // fresh-schema artifact instead of hardcoding '4.1' — a stale artifact
+  // carries pre-provenance UNSTAMPED quotes that the printability gate
+  // then withholds wholesale.
+  INPUT_SCHEMA_VERSION
 };
