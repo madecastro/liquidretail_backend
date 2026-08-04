@@ -1096,6 +1096,66 @@ check('F3 the scraped face wins only when it can actually be served', () => {
   });
 });
 
+check('K6 ink is chosen for the band the type lands on, not the whole plate', () => {
+  // THE DELIVERED DEFECT: an AllBirds 4:5 whose plate is mostly light (cream shoe,
+  // pale ground) flipped ink DARK by the global vote, while the band the type
+  // actually occupied was a mid-grey insole at ~0.45 luminance. Near-black on mid
+  // grey is barely readable, and with scrims ruled out and the shadow tightened
+  // after "the halo is way too much", nothing rescued it.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'remotion', 'compositions', 'Canonical.jsx'), 'utf8');
+
+  // WIRING: the per-group decision must exist AND be what the slot consumes.
+  assert.ok(/function inkForBand\(/.test(src), 'a per-band ink decision must exist');
+  assert.ok(/const bandInk = inkForBand\(bandLum\)/.test(src), 'each group must evaluate its own band');
+  assert.ok(/const inkOnLight = bandInk \? bandInk\.onLight : inkOnLightGlobal/.test(src),
+    'the per-band decision must win, with the global vote only as the fallback');
+  assert.ok(/lum: Number\.isFinite\(band\.lum\) \? band\.lum : null/.test(src),
+    'bandStateFor must expose the raw luminance');
+  assert.ok(/shadow: reinforceShadow \? 'layered' : rawSlot\.treatment\.shadow/.test(src),
+    'a marginal band must reinforce the shadow, since placement alone cannot carry it');
+
+  // THE REAL FUNCTION, extracted and executed — not a mirror. A mirror re-states
+  // the rule, so it cannot catch the rule being replaced: swapping the contrast
+  // comparison for a `lum > 0.38` threshold passed a mirrored version of this
+  // check while shipping exactly the bug it exists to prevent.
+  const sandbox = {};
+  const pick = (re) => { const m = src.match(re); assert.ok(m, `missing ${re}`); return m[0]; };
+  // eslint-disable-next-line no-new-func
+  new Function('sandbox', [
+    pick(/const INK_DARK_LUM = [^\n]*/),
+    pick(/const INK_LIGHT_LUM = [^\n]*/),
+    pick(/function inkForBand\(lum\) \{[\s\S]*?\n\}/),
+    'sandbox.f = inkForBand;',
+  ].join('\n'))(sandbox);
+  const inkForBand = sandbox.f;
+  // MEASURED CONTRAST, so the numbers are on record rather than asserted by feel:
+  //   lum 0.45  dark 3.73:1  white 4.76:1  -> WHITE
+  //   lum 0.48  dark 4.16:1  white 4.27:1  -> WHITE, and marginal (the crossover)
+  //   lum 0.52  dark 4.79:1  white 3.71:1  -> DARK
+  //   lum 0.92  dark 14.85:1 white 1.20:1  -> DARK
+  // The delivered AllBirds failure sat at ~0.45 and was rendered in DARK ink at
+  // 3.73:1. Choosing per band gives white at 4.76:1 — the same footage, above AA.
+  const mid = inkForBand(0.45);
+  assert.strictEqual(mid.onLight, false, 'on a mid-grey band, white type out-contrasts near-black');
+  assert.strictEqual(mid.marginal, false, '0.45 clears AA with white (4.76:1) — do not over-flag');
+  // The genuine crossover, where neither ink reaches AA and the shadow must carry it.
+  const cross = inkForBand(0.48);
+  assert.strictEqual(cross.marginal, true, '0.48 tops out at 4.27:1 — below AA either way');
+  // Clearly light and clearly dark bands are unambiguous and not marginal.
+  assert.strictEqual(inkForBand(0.92).onLight, true, 'a bright band takes dark ink');
+  assert.strictEqual(inkForBand(0.92).marginal, false, 'a bright band reaches AA with dark ink');
+  assert.strictEqual(inkForBand(0.06).onLight, false, 'a dark band takes light ink');
+  assert.strictEqual(inkForBand(0.06).marginal, false, 'a dark band reaches AA with white ink');
+  // No band data → caller falls back to the global vote rather than guessing.
+  assert.strictEqual(inkForBand(null), null, 'missing luminance must not invent a decision');
+  // The OLD rule was `band.lum > 0.62 -> light plate -> dark ink`. On the failing
+  // band that is false, so the band was called dark while the GLOBAL vote called
+  // the plate light and flipped ink dark anyway — the contradiction that shipped.
+  assert.strictEqual(0.45 > 0.62, false, 'the failing band was not light by the old threshold');
+  assert.strictEqual(inkForBand(0.45).onLight, false,
+    'and the per-band rule agrees it must not take dark ink — the global vote was the bug');
+});
+
 // ── A: a product-tier rating names its product ──────────────────────────
 
 check('A1 product-tier review counts carry the product name', () => {

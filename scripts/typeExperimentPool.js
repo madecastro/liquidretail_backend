@@ -143,14 +143,36 @@ const bucket3 = (v, lo, hi) => (v == null ? 'unknown' : v < lo ? 'low' : v < hi 
     }
   }
 
-  // A brand "has a real font" when its HEADING face is an ingested file or a
-  // real Google family. 'library-match' means we substituted a lookalike and
-  // 'default' means it has nothing at all — neither is the brand's own type.
-  // The four source values fontResolverService can emit: 'custom' (an ingested
-  // brand file), 'google' (a real Google family), 'library-match' (a lookalike
-  // we substituted) and 'default' (the brand has nothing).
+  // A brand "has a real font" when its HEADING face is one the BRAND supplied and
+  // we can actually serve.
+  //
+  // SOURCE ALONE IS NOT ENOUGH, and this let a wrong brand into the first run:
+  // when nothing on the ladder resolves, resolveBrandFonts falls back to the ROLE
+  // DEFAULT (Playfair Display) via resolveFamily — which returns
+  // source:'google', exact:true. So "the brand has no servable font" was
+  // indistinguishable from "the brand uses a real Google font". Vuori Clothing
+  // passed the gate showing 'Playfair Display', a high-contrast SERIF, for a brand
+  // whose real face is a grotesque (aktiv-grotesk, proprietary, no file).
+  //
+  // The fix is to require the resolved family to be one the brand actually named:
+  // the scraped family, an ingested customFont, or a curated styleTheme family.
   const REAL_FONT_SOURCES = new Set(['custom', 'google']);
-  const hasRealFont = (t) => !!t && REAL_FONT_SOURCES.has(t.fonts.heading.source) && t.fonts.heading.exact !== false;
+  const famKey = (f) => String(f || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const brandNamedFamilies = (b) => {
+    const th = (Array.isArray(b?.curatedFields) && b.curatedFields.includes('styleTheme'))
+      ? (b.styleTheme || {}) : {};
+    return new Set([
+      b?.fontFamily,
+      ...(b?.customFonts || []).map((f) => f.family || f.name),
+      th.headingFontFamily, th.sansFontFamily, th.bodyFontFamily, th.serifFontFamily, th.quoteFontFamily,
+      b?.tailwindTheme?.fonts?.heading, b?.tailwindTheme?.fonts?.body,
+      b?.websiteFontUsage?.heading, b?.websiteFontUsage?.body,
+    ].filter(Boolean).map(famKey));
+  };
+  const hasRealFont = (t, b) => {
+    if (!t || !REAL_FONT_SOURCES.has(t.fonts.heading.source) || t.fonts.heading.exact === false) return false;
+    return brandNamedFamilies(b).has(famKey(t.fonts.heading.family));
+  };
 
   const ads = await Ad.find({
     renderRoute: 'veo',
@@ -167,13 +189,16 @@ const bucket3 = (v, lo, hi) => (v == null ? 'unknown' : v < lo ? 'low' : v < hi 
   const candidates = [];
   const rejected = { noBrand: 0, noFont: 0, brandFilter: 0, excluded: 0 };
   const excludedBrands = new Set();
+  const noFontBrands = new Set();
   for (const a of ads) {
     const t = brandType.get(String(a.brandId));
     if (!t) { rejected[BRAND_FILTER.length ? 'brandFilter' : 'noBrand']++; continue; }
     if (!NO_EXCLUDE && !BRAND_FILTER.length && EXCLUDE.test(t.name)) {
       rejected.excluded++; excludedBrands.add(t.name); continue;
     }
-    if (!ALLOW_FONTLESS && !hasRealFont(t)) { rejected.noFont++; continue; }
+    if (!ALLOW_FONTLESS && !hasRealFont(t, byId.get(String(a.brandId)))) {
+      rejected.noFont++; noFontBrands.add(`${t.name}→${t.fonts.heading.family}`); continue;
+    }
     const m = byMedia.get(String(a.mediaId));
     candidates.push({
       adId: String(a._id),
@@ -195,6 +220,10 @@ const bucket3 = (v, lo, hi) => (v == null ? 'unknown' : v < lo ? 'low' : v < hi 
     `(rejected: ${rejected.noFont} fontless, ${rejected.noBrand} unresolvable brand, ` +
     `${rejected.brandFilter} filtered, ${rejected.excluded} test/scratch brands` +
     `${excludedBrands.size ? ` [${[...excludedBrands].join(', ')}]` : ''})`);
+  if (noFontBrands.size) {
+    console.log(`📊 brands rejected for having no OWN servable face (resolved family is a ` +
+      `substitute or the role default): ${[...noFontBrands].join(', ')}`);
+  }
   const perBrand = {};
   for (const c of candidates) perBrand[c.brand] = (perBrand[c.brand] || 0) + 1;
   console.log('📊 candidates per brand:', JSON.stringify(perBrand));
