@@ -274,10 +274,38 @@ const CAPABILITIES = [
       service: './capabilityExecutors/adsPublishToMeta',
       method:  'run'
     }
-  }
+  },
 
-  // Tier 4 (workflows) lands in a follow-up PR — see backlog rows
-  // 167 (parent epic) and 168 (review refresh workflow).
+  // ── Tier 4: multi-step workflows (plan-preview + confirm-then-execute) ─
+
+  {
+    id:       'catalog.refreshReviewsForBrand',
+    title:    'Refresh on-site reviews for a brand',
+    describe: 'Fan-out: for every product under a brand that hasn\'t been through the on-site scraper, invoke the 3-tier review engine (JSON-LD → vendor API → optional headless). Captures per-review star ratings that the gemini-search fallback drops. Non-billable (HTTP GETs only). On invocation you receive a PLAN (which products, estimated wall time); the operator must confirm before execution begins.',
+    tier:     4,
+    scope:    'brand',
+    // Tier 4 executors export preview() + execute() instead of run().
+    // The endpoint's gate calls preview when the tool_call is not yet
+    // confirmed, execute when the operator has confirmed.
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogRefreshReviewsForBrand',
+      // No single 'method' — two-phase Tier 4. Names locked as
+      // 'preview' + 'execute' by the endpoint's gate logic.
+      workflow: true
+    },
+    // Non-billable — HTTP scrape, no LLM/model cost. Declared explicitly
+    // to satisfy the validateManifest tier ≥ 2 estimateUsd rule.
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Products under this brand missing on-site review data are the fan-out set.' }
+      },
+      additionalProperties: false
+    }
+  }
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -398,8 +426,21 @@ function validateManifest(caps = CAPABILITIES) {
     if (!c.execute)                          problems.push(`${at} missing execute block`);
     if (c.execute && !VALID_KINDS.has(c.execute.kind))
       problems.push(`${at} execute.kind='${c.execute.kind}' invalid (want one of ${[...VALID_KINDS].join(',')})`);
-    if (c.execute?.kind === 'service' && (!c.execute.service || !c.execute.method))
-      problems.push(`${at} execute service+method required`);
+    // Two execute shapes: standard (kind:'service', service, method) OR
+    // workflow (kind:'service', service, workflow:true) for two-phase
+    // Tier 4 executors that export preview() + execute() instead of
+    // a single method.
+    if (c.execute?.kind === 'service') {
+      if (!c.execute.service) {
+        problems.push(`${at} execute.service required`);
+      } else if (c.execute.workflow === true) {
+        if (c.execute.method) {
+          problems.push(`${at} workflow executors must not declare method (they export preview/execute)`);
+        }
+      } else if (!c.execute.method) {
+        problems.push(`${at} execute service+method required (or set workflow:true for two-phase Tier 4 executors)`);
+      }
+    }
     if (c.args && c.args.type !== 'object')
       problems.push(`${at} args.type must be 'object' (got '${c.args.type}')`);
     // Tier ≥ 2 needs a cost estimator — spendGuard rejects capabilities
@@ -412,14 +453,26 @@ function validateManifest(caps = CAPABILITIES) {
         problems.push(`${at} tier ${c.tier} requires estimateUsd (number ≥ 0 or function returning one)`);
       }
     }
-    // Tier ≥ 3 needs an explicit-confirmation phrase — the "type YES"
-    // ceremony that separates hard-to-reverse actions from ordinary
-    // Tier 1/2 confirmations. Endpoint enforces the phrase match; the
-    // manifest here enforces that a phrase is declared.
-    if (typeof c.tier === 'number' && c.tier >= 3) {
+    // Tier 3 needs an explicit-confirmation phrase — the "type YES"
+    // ceremony that separates external / hard-to-reverse actions from
+    // ordinary Tier 1/2 confirmations. Tier 4 workflows use the
+    // plan-preview + confirm cycle as their ceremony instead; they MAY
+    // additionally declare a phrase (a workflow that publishes to Meta
+    // in bulk, say), but it's optional. Endpoint's phraseCheck honours
+    // the declaration when present regardless of tier.
+    if (c.tier === 3) {
       const p = c.explicitConfirmation;
       if (typeof p !== 'string' || p.length < 4 || p.length > 100) {
-        problems.push(`${at} tier ${c.tier} requires explicitConfirmation (4-100 char phrase the operator must type)`);
+        problems.push(`${at} tier 3 requires explicitConfirmation (4-100 char phrase the operator must type)`);
+      }
+    }
+    // Any capability that DID declare a phrase must meet the shape rule
+    // regardless of tier — a length-2 phrase or a non-string would
+    // slip past the endpoint check silently.
+    if (c.explicitConfirmation != null) {
+      const p = c.explicitConfirmation;
+      if (typeof p !== 'string' || p.length < 4 || p.length > 100) {
+        problems.push(`${at} explicitConfirmation must be a 4-100 char string when declared`);
       }
     }
   }

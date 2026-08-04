@@ -14,6 +14,8 @@
 //   event: spend-guard-block       data: { toolCallId, toolName, reason,
 //                                          dailyCap, spent, estimateUsd, projected }
 //   event: tier3-phrase-block      data: { toolCallId, toolName, reason, required }
+//   event: plan-proposed           data: { toolCallId, toolName, plan }
+//   event: workflow-progress       data: { toolCallId, toolName, step, totalSteps, item, outcome, ... }
 //   event: iteration               data: { n }
 //   event: done                    data: { stop_reason, iterations, model }
 //   event: error                   data: { error }
@@ -94,7 +96,7 @@ function buildSystemPrompt(context = {}) {
     '- tier 2: billable write; ASK + estimate the cost before running.',
     '- tier 3: external / hard-to-reverse; ASK with explicit "type YES to confirm".',
     '- tier 4: multi-step workflow; propose a plan first.',
-    'This build ships tier-0 (read-only), tier-1 (cheap-write, reversible), tier-2 (billable), and tier-3 (external / hard-to-reverse) capabilities. Tier-4 workflows land in a follow-up release. If the operator asks for something a higher tier would need, say so clearly rather than pretending you can\'t help.',
+    'This build ships all tiers: tier-0 (read-only), tier-1 (cheap-write, reversible), tier-2 (billable), tier-3 (external / hard-to-reverse), and tier-4 (multi-step workflows with plan-preview). If the operator asks for something no capability covers, say so clearly rather than pretending you can\'t help.',
     '',
     'CONFIRMATION FLOW (tier ≥ 1, server-enforced — do NOT try to bypass):',
     '- When the operator asks for a tier-1+ action, CALL THE TOOL as usual. The server will intercept the call and return a synthetic result `{ ok:false, needsConfirmation:true }` — this is the gate, not a failure.',
@@ -111,6 +113,12 @@ function buildSystemPrompt(context = {}) {
     '- Tier 3 actions are external / hard-to-reverse (e.g. publishing to Meta). On top of confirmation, the operator must TYPE an exact phrase in the client\'s confirmation UI (declared per-capability, e.g. "PUBLISH TO META").',
     '- Your proposed-action message must state the phrase clearly. Example: "I\'d like to publish these 3 ads to Meta adset X. This will make them live to real users after Meta\'s review. To confirm, click Confirm and type PUBLISH TO META in the phrase field."',
     '- If the client sends a confirmation WITHOUT the phrase (or with a wrong phrase), you receive `{ ok:false, tier3PhraseBlocked:true, reason, required }`. Do not retry — ask the operator to re-confirm with the correct phrase.',
+    '',
+    'WORKFLOWS (tier 4, plan-first):',
+    '- Tier 4 capabilities are multi-step workflows. On the first call, you receive a PLAN result — `{ ok:true, kind:\'plan\', data:{ workflowId, summary, totalSteps, estimateUsd, estimateWallMs, sampleSteps, ... } }`. This is NOT a failure — the server has run the preview phase (side-effect-free) and is waiting for the operator to confirm execution.',
+    '- Your message to the operator should surface the plan\'s summary, totalSteps, estimateWallMs (in minutes for anything > 60 seconds), and any skipped-item notes. Ask whether to proceed.',
+    '- On confirmation, the server invokes the workflow\'s execute() phase. You receive a final `workflowResult` — summarise the outcome (succeeded / failed / skipped counts, notable per-step notes) for the operator.',
+    '- Do NOT call a tier-4 capability more than once in a single planning-to-execution cycle — the server\'s confirmation gate handles the phase transition. If the operator wants a fresh plan, they\'ll ask again.',
     '',
     `AVAILABLE CAPABILITIES (${registry.CAPABILITIES.length}):`,
     registry.describeManifest(),
@@ -203,40 +211,60 @@ function sseWrite(res, event, data) {
 // dispatch — even confirmed ones — so a phrase-less confirmation
 // cannot smuggle a hard-to-reverse action past the gate.
 function phraseCheck(capability, callId, explicitConfirmations) {
-  if (!capability || capability.tier < 3) return null;
+  if (!capability) return null;
   const required = capability.explicitConfirmation;
-  if (typeof required !== 'string' || !required) {
-    // Registry validator prevents this in normal operation; a manifest
-    // that reached here without a phrase declared is a bug — fail
-    // closed rather than dispatching an unbounded external action.
-    return `capability "${capability.id}" is tier ${capability.tier} but declares no explicitConfirmation phrase`;
+  // Tier 3 REQUIRES a phrase (validator enforces at load); a Tier 3
+  // that reached here without one is a manifest bug → fail closed.
+  if (capability.tier === 3 && (typeof required !== 'string' || !required)) {
+    return `capability "${capability.id}" is tier 3 but declares no explicitConfirmation phrase`;
   }
-  const supplied = explicitConfirmations?.[callId];
-  if (typeof supplied !== 'string' || supplied !== required) {
-    return `tier ${capability.tier} action requires the exact phrase "${required}" typed by the operator (received: ${supplied === undefined ? 'nothing' : JSON.stringify(String(supplied).slice(0, 60))})`;
+  // If the capability declares a phrase (any tier), enforce it. Tier 4
+  // workflows can opt-in for extra ceremony; Tier 2 can too if the
+  // author considers the action high-blast even inside its own tier.
+  if (typeof required === 'string' && required) {
+    const supplied = explicitConfirmations?.[callId];
+    if (typeof supplied !== 'string' || supplied !== required) {
+      return `tier ${capability.tier} action requires the exact phrase "${required}" typed by the operator (received: ${supplied === undefined ? 'nothing' : JSON.stringify(String(supplied).slice(0, 60))})`;
+    }
   }
   return null;
 }
 
-// ── Gate: split assembled tool_calls into dispatch vs confirm-required ─
+// ── Gate: split assembled tool_calls into four dispatch classes ───
 //
-// Tier 0 → always dispatch. Tier ≥ 1 → dispatch only if the call id is
-// in the request's `confirmations` set; otherwise gate. Unknown tools
-// fail closed (treated as maximum-tier gate) — cheaper than dispatching
-// an executor that doesn't exist and leaking the reason via a stack.
+// Standard tools: Tier 0 → toDispatch; Tier ≥ 1 confirmed → toDispatch;
+// Tier ≥ 1 unconfirmed → toGate.
+//
+// Workflow tools (Tier 4, execute.workflow=true): NEVER go through
+// agentTools.dispatch — they need endpoint-level preview/execute
+// handling AND a progress callback for SSE. Unconfirmed workflow
+// tool_calls run their side-effect-free preview() to produce a plan
+// (toWorkflowPreview); confirmed ones run execute() with progress
+// callbacks threaded in (toWorkflowExecute).
+//
+// Unknown tools fail closed (tier 999 → toGate) — cheaper than
+// dispatching an executor that doesn't exist and leaking the reason
+// via a stack trace.
 function splitByGate(toolCalls, confirmationsSet) {
   const toDispatch = [];
   const toGate = [];
+  const toWorkflowPreview = [];
+  const toWorkflowExecute = [];
   for (const call of toolCalls) {
     const cap = registry.capabilityByToolName(call.function.name);
-    const tier = cap ? cap.tier : 999;   // fail closed
-    if (tier === 0 || confirmationsSet.has(call.id)) {
-      toDispatch.push({ call, tier, cap });
-    } else {
-      toGate.push({ call, tier, cap });
+    const tier = cap ? cap.tier : 999;
+    const isWorkflow = cap?.execute?.workflow === true;
+    const confirmed = confirmationsSet.has(call.id);
+
+    if (isWorkflow) {
+      if (confirmed) toWorkflowExecute.push({ call, tier, cap });
+      else           toWorkflowPreview.push({ call, tier, cap });
+      continue;
     }
+    if (tier === 0 || confirmed) toDispatch.push({ call, tier, cap });
+    else                         toGate.push({ call, tier, cap });
   }
-  return { toDispatch, toGate };
+  return { toDispatch, toGate, toWorkflowPreview, toWorkflowExecute };
 }
 
 // ── Confirmation replay ─────────────────────────────────────────────
@@ -283,11 +311,8 @@ async function replayConfirmations({ working, confirmationsSet, explicitConfirma
 
     const cap = registry.capabilityByToolName(call.function?.name);
 
-    // Tier 3+ phrase check on replay — a confirmation missing the
-    // exact phrase still blocks a hard-to-reverse action. Uses the
-    // same phraseCheck helper the in-loop path uses so both sites
-    // stay in sync.
-    if (cap && cap.tier >= 3) {
+    // Phrase check on replay — same rule as the in-loop path.
+    if (cap && (cap.tier === 3 || typeof cap.explicitConfirmation === 'string')) {
       const problem = phraseCheck(cap, call.id, explicitConfirmations);
       if (problem) {
         sseWrite(res, 'tier3-phrase-block', {
@@ -352,12 +377,34 @@ async function replayConfirmations({ working, confirmationsSet, explicitConfirma
       }
     }
 
-    const result = await agentTools.dispatch({
-      toolName: call.function?.name,
-      args,
-      req,
-      context
-    });
+    // Tier 4 workflow replay: don't go through agentTools.dispatch
+    // (workflow capabilities have no `method`). Call executor.execute()
+    // directly with a progress callback so SSE events still stream.
+    let result;
+    if (cap?.execute?.workflow === true) {
+      try {
+        const executor = require(cap.execute.service);
+        if (typeof executor.execute !== 'function') {
+          result = { ok: false, error: `workflow "${cap.id}" executor exports no execute()` };
+        } else {
+          const onProgress = (payload) => {
+            sseWrite(res, 'workflow-progress', {
+              toolCallId: call.id, toolName: call.function.name, ...payload
+            });
+          };
+          result = await executor.execute({ req, args, onProgress });
+        }
+      } catch (err) {
+        result = { ok: false, error: `workflow execute crashed: ${err.message}` };
+      }
+    } else {
+      result = await agentTools.dispatch({
+        toolName: call.function?.name,
+        args,
+        req,
+        context
+      });
+    }
 
     working[toolIdx] = {
       role:         'tool',
@@ -519,8 +566,11 @@ router.post('/chat', async (req, res) => {
 
       // Split by risk tier. Tier 0 dispatches immediately; Tier ≥ 1
       // requires an explicit id in confirmationsSet (populated on the
-      // request AFTER the operator clicks Confirm in the UI).
-      const { toDispatch, toGate } = splitByGate(assembledToolCalls, confirmationsSet);
+      // request AFTER the operator clicks Confirm in the UI). Tier 4
+      // workflow tools split into preview (unconfirmed) or execute
+      // (confirmed) — see the executor's two-phase contract.
+      const { toDispatch, toGate, toWorkflowPreview, toWorkflowExecute } =
+        splitByGate(assembledToolCalls, confirmationsSet);
 
       // Dispatch confirmed / Tier-0 calls. For Tier ≥ 2, spendGuard
       // runs BEFORE dispatch — a confirmed billable action still gets
@@ -539,13 +589,12 @@ router.post('/chat', async (req, res) => {
           args
         });
 
-        // Tier 3+ phrase gate — the operator must have typed the
-        // explicit phrase in the confirmation UI. Runs BEFORE
-        // spendGuard so a phrase-less confirmation can't reach a
-        // billable estimate check (irrelevant here since
-        // publishToMeta is estimateUsd:0, but the ordering matters
-        // for future Tier 3 capabilities that ARE billable).
-        if (tier >= 3 && cap) {
+        // Tier 3 phrase gate — the operator must have typed the
+        // explicit phrase in the confirmation UI. phraseCheck also
+        // enforces per-capability opt-in phrases at any tier when
+        // declared. Runs BEFORE spendGuard so a phrase-less
+        // confirmation can't reach a billable estimate check.
+        if (cap && (cap.tier === 3 || typeof cap.explicitConfirmation === 'string')) {
           const problem = phraseCheck(cap, call.id, explicitConfirmations);
           if (problem) {
             sseWrite(res, 'tier3-phrase-block', {
@@ -664,6 +713,134 @@ router.post('/chat', async (req, res) => {
           content:      JSON.stringify(pendingResult)
         });
         anyGated = true;
+      }
+
+      // Tier 4 preview: run the side-effect-free preview() to produce
+      // a plan, then insert as a pending tool_result (like a proposed-
+      // action but with kind:'plan'). Loop breaks after this iteration
+      // so the LLM's iter-1 text is what the operator sees alongside
+      // the plan card.
+      for (const { call, cap } of toWorkflowPreview) {
+        if (aborted) break;
+        let args = {};
+        try {
+          args = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+        } catch (err) {
+          args = { _parseError: err.message, _raw: call.function.arguments };
+        }
+        sseWrite(res, 'tool-use-complete', { toolCallId: call.id, toolName: call.function.name, args });
+
+        let plan;
+        try {
+          const executor = require(cap.execute.service);
+          if (typeof executor.preview !== 'function') {
+            plan = { ok: false, error: `workflow "${cap.id}" executor exports no preview()` };
+          } else {
+            plan = await executor.preview({ req, args });
+          }
+        } catch (err) {
+          plan = { ok: false, error: `workflow preview crashed: ${err.message}` };
+        }
+
+        sseWrite(res, 'plan-proposed', {
+          toolCallId: call.id,
+          toolName:   call.function.name,
+          plan
+        });
+        sseWrite(res, 'tool-result', { toolCallId: call.id, result: plan });
+        working.push({
+          role:         'tool',
+          tool_call_id: call.id,
+          content:      JSON.stringify(plan)
+        });
+        anyGated = true;
+      }
+
+      // Tier 4 execute: gates already ran? No — the workflow's own
+      // gate is the confirmation itself (operator saw the plan and
+      // confirmed the whole thing). Phrase gate and spend gate DO
+      // still apply if the capability declares them.
+      for (const { call, cap } of toWorkflowExecute) {
+        if (aborted) break;
+        let args = {};
+        try {
+          args = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+        } catch (err) {
+          args = { _parseError: err.message, _raw: call.function.arguments };
+        }
+
+        // Phrase gate — Tier 4 workflows opt-in via explicitConfirmation.
+        if (cap.tier === 3 || typeof cap.explicitConfirmation === 'string') {
+          const problem = phraseCheck(cap, call.id, explicitConfirmations);
+          if (problem) {
+            sseWrite(res, 'tier3-phrase-block', {
+              toolCallId: call.id, toolName: call.function.name,
+              reason: problem, required: cap.explicitConfirmation
+            });
+            const blockedResult = {
+              ok: false, tier3PhraseBlocked: true,
+              reason: problem, required: cap.explicitConfirmation
+            };
+            sseWrite(res, 'tool-result', { toolCallId: call.id, result: blockedResult });
+            working.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(blockedResult) });
+            continue;
+          }
+        }
+
+        // Spend gate — even non-workflow spend caps apply to Tier 4
+        // workflows that estimateUsd > 0 (e.g. lifestyle images).
+        if (cap.tier >= 2) {
+          const guard = await spendGuard.check({
+            advertiserId: req.advertiserId,
+            capability: cap,
+            args
+          });
+          if (!guard.allowed) {
+            sseWrite(res, 'spend-guard-block', {
+              toolCallId: call.id, toolName: call.function.name,
+              reason: guard.reason, dailyCap: guard.dailyCap,
+              spent: guard.spent, estimateUsd: guard.estimateUsd,
+              projected: guard.projected
+            });
+            const blockedResult = {
+              ok: false, spendGuardBlocked: true,
+              reason: guard.reason, dailyCap: guard.dailyCap,
+              spent: guard.spent, estimateUsd: guard.estimateUsd,
+              projected: guard.projected
+            };
+            sseWrite(res, 'tool-result', { toolCallId: call.id, result: blockedResult });
+            working.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(blockedResult) });
+            continue;
+          }
+        }
+
+        // Execute the workflow with a progress callback that emits
+        // SSE events. Callback wraps each per-step outcome; the
+        // workflow never throws — errors are structured.
+        let result;
+        try {
+          const executor = require(cap.execute.service);
+          if (typeof executor.execute !== 'function') {
+            result = { ok: false, error: `workflow "${cap.id}" executor exports no execute()` };
+          } else {
+            const onProgress = (payload) => {
+              sseWrite(res, 'workflow-progress', {
+                toolCallId: call.id,
+                toolName: call.function.name,
+                ...payload
+              });
+            };
+            result = await executor.execute({ req, args, onProgress });
+          }
+        } catch (err) {
+          result = { ok: false, error: `workflow execute crashed: ${err.message}` };
+        }
+        sseWrite(res, 'tool-result', { toolCallId: call.id, result });
+        working.push({
+          role:         'tool',
+          tool_call_id: call.id,
+          content:      JSON.stringify(result)
+        });
       }
 
       if (anyGated) {

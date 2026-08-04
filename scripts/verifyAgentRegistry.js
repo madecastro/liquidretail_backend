@@ -37,6 +37,8 @@ const FILES = [
   'services/capabilityExecutors/brandUpdateTagline.js',
   'services/capabilityExecutors/adRegenerateWithPrompt.js',
   'services/capabilityExecutors/adsPublishToMeta.js',
+  'services/capabilityExecutors/catalogRefreshReviewsForBrand.js',
+  'services/catalogProductReviewRefreshService.js',
   'services/spendGuard.js',
   'routes/agent.js'
 ];
@@ -103,9 +105,20 @@ async function checkTenantGuard() {
   const noScopeReq = { /* no advertiserId */ };
   for (const c of registry.CAPABILITIES) {
     const executor = require(path.join(__dirname, '..', 'services', c.execute.service));
-    const result = await executor.run({ req: noScopeReq, args: {} });
-    assert(result && result.ok === false && /advertiser scope/i.test(result.error || ''),
-      `${c.id}: rejects missing advertiser scope`, result?.error);
+    // Standard executors: single run(). Workflow executors: preview() +
+    // execute() — assert both enforce the guard.
+    if (c.execute.workflow === true) {
+      const p = await executor.preview({ req: noScopeReq, args: {} });
+      assert(p && p.ok === false && /advertiser scope/i.test(p.error || ''),
+        `${c.id}.preview(): rejects missing advertiser scope`, p?.error);
+      const e = await executor.execute({ req: noScopeReq, args: {} });
+      assert(e && e.ok === false && /advertiser scope/i.test(e.error || ''),
+        `${c.id}.execute(): rejects missing advertiser scope`, e?.error);
+    } else {
+      const result = await executor.run({ req: noScopeReq, args: {} });
+      assert(result && result.ok === false && /advertiser scope/i.test(result.error || ''),
+        `${c.id}: rejects missing advertiser scope`, result?.error);
+    }
   }
 }
 
@@ -433,8 +446,8 @@ assert(/explicitConfirmations/.test(agentSrc),
   `routes/agent.js references the explicitConfirmations request field`);
 assert(/phraseCheck/.test(agentSrc),
   `routes/agent.js has a phraseCheck helper`);
-assert(/tier\s*>=\s*3|tier\s*>\s*2/.test(agentSrc),
-  `routes/agent.js gates on tier ≥ 3`);
+assert(/cap\.tier\s*===\s*3|tier\s*===\s*3/.test(agentSrc),
+  `routes/agent.js gates on cap.tier === 3 (Tier 4 opt-in for phrase)`);
 
 // Executor structural guards.
 async function checkTier3Executor() {
@@ -466,8 +479,84 @@ async function checkTier3Executor() {
 // its callers' effect on the source — assert the string checks
 // above already cover the wiring; here we assert the manifest's
 // per-tier requirement.
-assert(registry.CAPABILITIES.filter((c) => c.tier >= 3).every((c) => c.explicitConfirmation),
-  `every Tier ≥ 3 capability declares explicitConfirmation`);
+assert(registry.CAPABILITIES.filter((c) => c.tier === 3).every((c) => c.explicitConfirmation),
+  `every Tier 3 capability declares explicitConfirmation (Tier 4 is opt-in)`);
+
+// ── 12. Tier 4 workflows (PR #6) ──────────────────────────────────
+console.log('\n[12] Tier 4 workflows');
+
+const tier4Cap = registry.capabilityById('catalog.refreshReviewsForBrand');
+assert(tier4Cap, `capability "catalog.refreshReviewsForBrand" registered`);
+if (tier4Cap) {
+  assert(tier4Cap.tier === 4, `catalog.refreshReviewsForBrand: tier === 4`);
+  assert(tier4Cap.execute?.workflow === true,
+    `catalog.refreshReviewsForBrand: execute.workflow === true`);
+  assert(!tier4Cap.execute?.method,
+    `catalog.refreshReviewsForBrand: no execute.method (workflow uses preview/execute)`);
+  assert(typeof tier4Cap.estimateUsd === 'number' && tier4Cap.estimateUsd >= 0,
+    `catalog.refreshReviewsForBrand: estimateUsd declared`);
+}
+
+// validateManifest MUST accept workflow shape (workflow:true, no
+// method) AND reject a standard shape missing method.
+{
+  const shadowWorkflow = [...registry.CAPABILITIES];
+  const problemsWf = registry.validateManifest(shadowWorkflow);
+  assert(problemsWf.length === 0, `manifest incl. tier-4 workflow validates clean`);
+
+  const shadowBad = [...registry.CAPABILITIES, {
+    id: '_test_.workflowWithMethod',
+    title: 'test', describe: 'test',
+    tier: 4, scope: 'brand',
+    estimateUsd: 0,
+    args: { type: 'object', properties: {}, additionalProperties: false },
+    // Contradiction: workflow=true AND method — reject.
+    execute: { kind: 'service', service: './capabilityExecutors/adInspect', workflow: true, method: 'run' }
+  }];
+  const problemsBad = registry.validateManifest(shadowBad);
+  assert(problemsBad.some((p) => /workflow.*must not declare method/i.test(p)),
+    `validateManifest rejects workflow + method contradiction (got: ${problemsBad.join(' / ')})`);
+}
+
+// Executor two-phase contract.
+async function checkTier4Executor() {
+  const exec = require('../services/capabilityExecutors/catalogRefreshReviewsForBrand');
+  assert(typeof exec.preview === 'function',
+    `catalogRefreshReviewsForBrand exports preview()`);
+  assert(typeof exec.execute === 'function',
+    `catalogRefreshReviewsForBrand exports execute()`);
+  // preview + execute with no scope → both reject
+  const p1 = await exec.preview({ req: {}, args: {} });
+  assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+    `preview: no-scope → rejects`);
+  const e1 = await exec.execute({ req: {}, args: {} });
+  assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+    `execute: no-scope → rejects`);
+  // missing brandId
+  const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+  assert(p2.ok === false && /brandId required/i.test(p2.error),
+    `preview: missing brandId → rejects`);
+}
+
+// Endpoint wiring.
+assert(/plan-proposed/.test(agentSrc),
+  `routes/agent.js emits plan-proposed event`);
+assert(/workflow-progress/.test(agentSrc),
+  `routes/agent.js emits workflow-progress event`);
+assert(/toWorkflowPreview/.test(agentSrc),
+  `routes/agent.js has toWorkflowPreview bucket in splitByGate`);
+assert(/toWorkflowExecute/.test(agentSrc),
+  `routes/agent.js has toWorkflowExecute bucket in splitByGate`);
+assert(/executor\.preview/.test(agentSrc),
+  `routes/agent.js calls executor.preview()`);
+assert(/executor\.execute/.test(agentSrc),
+  `routes/agent.js calls executor.execute()`);
+assert(/onProgress/.test(agentSrc),
+  `routes/agent.js threads an onProgress callback into workflow execute()`);
+
+// Every tier-4 capability declares execute.workflow=true.
+assert(registry.CAPABILITIES.filter((c) => c.tier === 4).every((c) => c.execute?.workflow === true),
+  `every Tier 4 capability declares execute.workflow=true`);
 
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
@@ -478,6 +567,7 @@ assert(registry.CAPABILITIES.filter((c) => c.tier >= 3).every((c) => c.explicitC
   await checkSpendGuard();
   await checkTier2Executor();
   await checkTier3Executor();
+  await checkTier4Executor();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
