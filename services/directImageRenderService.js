@@ -42,6 +42,60 @@ const { formatDisplayRating } = require('./ratingDisplay');
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
 const { adStage, noteRenderIssue } = require('./adStage');
 
+/**
+ * REVERTED to the plain variant, owner decision 2026-08-03 — same day the switch
+ * was made, on measured reliability. The `-developer` variant is half price and
+ * schema-identical, but it fails hard far too often:
+ *
+ *     variant      submits   hard `prediction failed`   rate
+ *     -developer     76               13                17.1%
+ *     plain          38                0                 0%
+ *
+ * Three independent runs on the developer model (38 / 20 / 18 submits) failed at
+ * 15.8% / 15.0% / 22.2% — consistent, not a bad afternoon. Each failure is a
+ * BILLED submit that returns `outputs: null` with no error message, which reaches
+ * the operator as a failed ad and bills a failure. Cost per SUCCESSFUL render
+ * still favoured developer ($0.0426 vs $0.0757), so this is deliberately NOT a
+ * cost decision — the owner chose delivered ads over unit price.
+ *
+ * The switch and its reasoning are kept below because the comparison is worth
+ * having on record, and because the developer variant is a legitimate lever if
+ * Atlas ever fixes its reliability. Re-measure before reaching for it again.
+ *
+ * VERIFIED live before switching, because a model id is never taken from memory
+ * (CLAUDE.md §2). Both entries resolve to the same POST
+ * `/api/v1/model/generateImage`; their request schemas are **field-for-field
+ * identical** — same `required` (`model`, `images`, `prompt`), same 14-value `size`
+ * enum, same `quality` low|medium|high, same `moderation` / `output_format` /
+ * `enable_sync_mode` / `enable_base64_output`, and neither exposes
+ * `input_fidelity`. They even share one `readme` URL. So this is a drop-in swap:
+ * nothing in buildParams or the payload below changes.
+ *
+ * Price, MEASURED not read off the catalog (see the pricing note in
+ * atlasImageService — `base_price` is a base and under-reports ~7x):
+ *   openai/gpt-image-2/edit            base 0.010  ->  charged $0.07173
+ *   openai/gpt-image-2-developer/edit  base 0.005  ->  charged $0.03586
+ * Exactly half, dead-consistent across every priced prediction. A 3-surface
+ * meta_static fanout goes ~$0.215 -> ~$0.108 per product.
+ *
+ * NOT VERIFIED: output quality between the two variants. The A/B that prompted this
+ * ran both arms on the developer model, so it compares prompts, not models. The
+ * schemas and readme are identical and 20 developer renders looked clean, but if
+ * output degrades, this is the first thing to put back.
+ *
+ * ⚠️ OPEN — MEASURED RELIABILITY GAP, 38 submits per model on 2026-08-03:
+ *     non-dev    36/38 ok, 0 hard failures (2 poll timeouts, likely completed late)
+ *     developer  32/38 ok, **6 hard `prediction failed`** (15.8%), outputs null,
+ *                no error message, has_nsfw_contents null
+ * Cost per SUCCESSFUL render still favours developer — $0.0426 vs $0.0757, ~44%
+ * cheaper even after paying for the failures — so the money case survives. But a
+ * ~16% hard-failure rate is a PRODUCT problem, not just a cost one: each one is a
+ * charged submit with no asset, which surfaces to the operator as a failed ad and
+ * bills a failure. NOT a controlled comparison (n=38 each, one session, and the two
+ * runs used different prompt text), so treat it as a signal to re-measure, not a
+ * verdict. If static failure rates rise after this ships, revert via
+ * AI_DIRECT_IMAGE_EDIT_MODEL before investigating anything else.
+ */
 const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
 // should never be a text to image fallback period" / "if there is no image
@@ -705,9 +759,11 @@ async function renderDirectImage({
   });
   // A total absence of any product reference is not a degraded input to
   // improvise past — it is unrecoverable, the same way a missing Director
-  // concept is above. buildPrompt's opening paragraph unconditionally instructs
-  // the model to "reproduce this exact item faithfully" from "the supplied
-  // photograph" — true and necessary when refs.length > 0, but if this fired
+  // concept is above. buildPrompt's opening section (`PRODUCT_FIDELITY`, and the
+  // one-sentence legacy paragraph before it) unconditionally calls the supplied
+  // reference photograph "the single source of truth for the product" and
+  // forbids inferring the product from its category or from brand priors —
+  // true and necessary when refs.length > 0, but if this fired
   // with zero references the model would be told a photograph exists when none
   // does, and would have nothing to ground the product's actual appearance in.
   // For a system whose whole purpose is faithfully depicting a real product,

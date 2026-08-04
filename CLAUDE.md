@@ -259,11 +259,29 @@ Video never launches a browser.
 - **Never trust a model id or a price from memory.** `GET
   https://api.atlascloud.ai/api/v1/models` (no auth) is the catalog; each entry
   carries `schema` and `readme` **URLs** — fetch those, they are the operative
-  contract. The price field is **`price.actual.base_price`** (a string), and `actual`
-  is what we pay (`origin` is list). Verified live: **0 of 444** entries have a
-  `pricing` key, **444 of 444** have `price`. 123 have no `base_price` at all — those
-  are per-token LLM entries, which must be treated as "not applicable", never as free.
+  contract. The price field is **`price.actual.base_price`** (a string; `origin` is
+  list). Verified live: **0 of 444** entries have a `pricing` key, **444 of 444** have
+  `price`. 123 have no `base_price` at all — those are per-token LLM entries, which
+  must be treated as "not applicable", never as free.
   Covered by `scripts/verifyImagePricing.js` (9 offline checks, revert-proven).
+- **`base_price` IS NOT THE CHARGE — never quote it as a cost. CORRECTED
+  2026-08-03; this file previously said `actual` "is what we pay", and that was
+  wrong by 7x.** MEASURED over 40 live edits: `openai/gpt-image-2/edit` publishes
+  base_price **0.01** and charged **$0.07173** every single time; the
+  `openai/gpt-image-2-developer/edit` variant publishes **0.005** and charged
+  **$0.03586**. So the 50% discount is real, but a multiplier (~7.17x here) applies
+  on top of both, it is not derivable from the catalog, and it must not be
+  extrapolated to another model or another size/quality. A 3-surface `meta_static`
+  fanout is therefore **~$0.11 per product on the developer model**, not ~$0.015.
+  **Owner rule: always read the actual price back from Atlas after generation.** The
+  authoritative figure is `price` on the **settled prediction**
+  (`GET /model/prediction/:id`), which `scheduleCostReconcile` reads to upgrade the
+  row and clear `costSource:'estimated'`. `buildPriceMap` yields a floor-grade
+  estimate whose only job is to stop a $0.00 row. Any budget, margin or per-ad cost
+  claim must come from **reconciled** rows. Note Atlas usually publishes `price`
+  *after* the image returns — measured **7 of 38** predictions had it at completion —
+  so the reconcile is the normal path, not a rare top-up; its retry budget was
+  widened the same day for exactly that reason.
 - **Ledger spend at the charge point, not the success point.** A billable submit that
   then fails still costs money. `atlasImageService.chargedError` records it and sets
   `err.charged`, which is the flag telling a caller that a direct-provider fallback
@@ -339,7 +357,27 @@ Video never launches a browser.
 - **~1-in-3 static ads** render a competitor-shaped brand mark on the product
   (e.g. tree emblem reading as Timberland on an Allbirds shoe). Prompts already
   ask for fidelity — fix is measure-and-reject, not prompt tuning. Video path
-  not QC'd on this.
+  not QC'd on this. **STILL OPEN after the 2026-08-03 prompt hardening — that
+  hardening is owner-directed work on top of this note, NOT a fix for it, and it
+  has no measured effect on this defect yet.** The static prompt now opens with a
+  long `PRODUCT_FIDELITY` block (`staticAdIntents.js`) covering source-of-truth,
+  category/brand-prior, form, construction, surface, colour, on-item graphics,
+  details and condition — plus carve-outs in `absences` / `textBlock` so the
+  no-added-text rules cannot erase the product's OWN printed label (they read
+  literally as "strip marks from clothing/packaging in the scene", and on this
+  catalog the product often IS the clothing or the packaging). **`adVisionQcService`
+  remains the actual fix.** Reversible without a deploy via
+  `STATIC_PROMPT_FIDELITY_HARDENING=false`, which restores a **byte-identical**
+  pre-hardening prompt — block *and* both carve-out sites revert together, so the
+  A/B control arm really is the arm that was measured. **The cost is real and
+  unmeasured:** the prompt more than doubled (~3.5-4.1k → ~7.8-8.4k chars) and the
+  block sits above `SET EXACTLY THESE STRINGS` on a path whose measured text
+  fidelity is 139/140 strings across 20 renders, and where `quality:high` already
+  measured WORSE than `medium` by losing a string. If the next render sample shows
+  copy defects, suspect this before anything else and flip the flag. Precedent for
+  that outcome: PR #61 hardened the VIDEO prompt and was rolled back in full
+  (§00). Pinned by `scripts/verifyStaticFidelityPrompt.js` (419 checks, both arms,
+  revert-proven on three mutations).
 - **Static geometry — two defects FIXED 2026-08-03; read the diagnostic before
   re-opening.** (A) `staticAdIntents.computeSurface` combined the post-generation
   crop band with the 6% edge margin via `Math.max`, so on every *cropped* surface
