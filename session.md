@@ -1041,6 +1041,69 @@ the asset's own border implies, so white-on-black assets don't invert into a blo
 back to the original asset. **NOT yet visually verified — needs one static render (~$0.01).**
 Video titling was never the source: `brandPill` and `brandLogo` are both off in canonical.
 
+### 0.3005 TYPE EXPERIMENT — OWNER-DIRECTED WORKSTREAM (2026-08-04). READ THIS BEFORE CONTINUING.
+
+**Owner verdict on the 17-ad sample** (artifact 3f801888-f0d0-4d28-af66-1ee62078d894): good EXCEPT
+Pelagic (font style regressed — my styleTheme alias moved it Oswald→Montserrat) and BabyBoo
+(before better). Verbatim directives: *"let's just stick to black or white type only when on a
+dark subject with a dark background, either with a drop shadow. The red lettering and white
+lettering you are choosing is tacky and doesn't look professional"* — measured cause: `textOnLight`
+fell back to brand PRIMARY (`titleSpecService.js` — Pelagic `#4d92b6` blue, BabyBoo `#ba3357`
+red). And: *"look at the GPT2 static ads, those look perfect with regards to font usage, color,
+placement"* — note the static path does NOT prescribe type; it hands typography to gpt-image-2
+("typeface and weight, the scale and colour of every text element", `staticAdIntents.js:747`).
+There is NO downloadable type rulebook in the repo; the constraint must be encoded.
+
+**THE EXPERIMENT (owner-approved, including LLM spend and $0.01 image calls for brands lacking
+statics): three arms over the SAME 30 masters, variety of colour/composition/size, then compare.**
+- **Baseline** = current pre-fix renders. CAPTURE BEFORE URLS FIRST — re-titling overwrites them.
+- **Arm A: disciplined deterministic** = current engine + black/white-only ink + font-order revert.
+  STATE: ink fix EDITED (uncommitted) in `titleSpecService.js` — `textOnLight` default `#16181D`,
+  no primary fallback; explicit curated `textOnLight` still wins (none in prod). REMAINING: font
+  order — a Google-resolvable scanned family (Pelagic "Oswald") must outrank the generic
+  `styleTheme.sansFontFamily` alias ("Montserrat"); `ownFace` (usable custom file, AllBirds "Self
+  Modern") stays top; update `verifyProofBeat` F2 ordering pins to match; suite; commit; deploy.
+- **Arm B: GPT-derived type template** = per-brand: collect 2-3 of the brand's OWN approved
+  gpt-image-2 static `renderUrl`s (for brands with none, generate ONE $0.01 static via the live
+  pipeline first — owner approved); send to a vision LLM with a STRICT JSON schema → type template
+  (ink discipline, casing, weight, tracking, alignment, size feel, NO scrim); map onto a
+  canonical-shaped preset JSON; write to `remotion/presets/` AT RUNTIME on the worker pod
+  (writable but EPHEMERAL — write + retitle in the SAME pod session); drive via the EXISTING
+  tier-0 `presetOverride` / driver `--preset` flag (never persisted).
+  MODEL: verify live before use (CLAUDE.md rule) — `google/gemini-2.5-pro` was probed for vision
+  QC (§0.2, exact-JSON-shape compliant; flash BROKE the shape). LLM calls are billable: ledger
+  them, no auto-retry, `maxRedirects: 0`.
+  **Grok adversarial review of the extractor BEFORE any billable call** (standing rule; it found
+  real defects in every diff this session).
+- **"Test the entire proposed workstream"** (owner, verbatim): after both arms work individually,
+  one end-to-end run — selection → baseline capture → arm A sweep → frames → arm B template
+  extraction → arm B sweep → frames → 3-column artifact (30 rows: baseline / disciplined /
+  template, annotated with each brand's ink+font inputs) — as a single scripted pipeline, not
+  hand-stitched steps, so it can be re-run.
+
+**Selection (30):** variety via stored metrics — `adSuitability.metrics.primarySubjectAreaFraction`
+(composition), overlay-zone band `lum` (colour/lightness), ≥8 brands, all four Meta formats
+(+pmax only with a live brand — three legacy pmax ads failed `brand not found — skip`, correctly).
+
+**BRAND INPUT TABLE (queried live, saves a round-trip):**
+| brand | scanned | theme.sans | primary | customFonts |
+|---|---|---|---|---|
+| Pelagic Gear | Oswald | Montserrat | #4d92b6 | none |
+| BabyBooFashion | Playfair Display | — | #ba3357 | none |
+| AllBirds | Self Modern | DM Sans | #ECE9E2 | Geograph×8, Self Modern, Akkurat Mono |
+| Vuori Clothing | Aktiv Grotesk | — | #333333 | none |
+(`textOnLight` explicitly set: NONE. GymShark 3.3/41000, Vuori 4.58/15545, Pelagic 3.2/22,
+BabyBoo 4.3/17645, Camelback 4.9, Peloton no data.)
+
+**OPS (relearned the hard way, all this session):** render-ssh <900 chars/cmd, rate-limits under
+sleepless loops — back off 60s, ONE call; worker `/tmp` wiped on every pod rotation and a DEPLOY
+ROTATES THE POD (never launch a driver right after deploying); driver stdout goes to its own file,
+NOT `render logs`; verify JSON edits by PARSING; Haiku is fine for mechanical fan-out but verify
+its counts (miscounted twice); the presets round-trip at `indent=2`.
+
+**Tasks #13-#16 track the four workstreams. Owner is compacting the conversation after this
+commit — continue from THIS section.**
+
 ### 0.3004 TITLE PLACEMENT — the bug was TIMING, not geometry. Tested, awaiting rollout call.
 
 Prod `53e26a4`. Suite 46/46, `verifyProofBeat` 53. **Tested on the three ads the owner
