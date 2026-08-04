@@ -274,12 +274,17 @@ Full suite **53 scripts, 0 failing**.
 
 ### Still to do
 
-- **NOT COMMITTED, NOT DEPLOYED.** Working tree on `fix/video-resume-primitives`, which already
-  carried unrelated in-flight work before this change — the fidelity hardening and font work.
-  Touched here: `services/{staticAdIntents,directImageRenderService,aiCreativeDirectorService}.js`,
-  `scripts/{verifyStaticIntents,verifyBrandLedCopy,verifyDirectorPrompt}.js`,
-  `config/defaults.env`, `docs/PIPELINES.md`, `CLAUDE.md`, this file. Use hunk-level staging
-  (`git apply --cached` on a filtered patch) — do NOT `git add` whole files.
+- **SHIPPED TO A PR, NOT MERGED, NOT DEPLOYED — PR #75** on branch
+  `fix/brand-led-static-copy` (base `main`), **two commits**: `7c7acf8` the pre-existing
+  product-fidelity hardening (committed first because the brand-led change builds on it in the
+  same file — `BRAND_LED_COPY` uses `FIDELITY_HARDENING` as patch context), then `4c5bda8` this
+  work. Verified in an isolated worktree at the branch tip: **51/52 green**, the one failure
+  (`verifyFontFallback.js`) also failing at plain `main`.
+  **The font workstream, `atlasModelMap` / `adRegenerateService`, and the
+  `AI_DIRECT_IMAGE_EDIT_MODEL` / `APIFY_ADLIB_*` env vars were deliberately EXCLUDED** and remain
+  uncommitted in the working tree — `directImageRenderService.js`, `brandEnrichmentService.js` and
+  `config/defaults.env` were staged hunk-by-hunk, asserted clean of font markers. If you pick that
+  work up, it still needs its own PR.
 - **No live render yet.** First `meta_static` run must be on a brand with BOTH a `summary` and a
   `tagline`, on a product that **already has** a `CreativeDirectionArtifact` (that proves the
   version bump forced a re-derive). 3 billable submits.
@@ -348,14 +353,17 @@ populate before wiring any new consumer — do not build consumers for fields no
 
 **START HERE — 2026-08-05 pickup.**
 
-0a. **NEWEST AND UNFINISHED: the `ai_brand_led` no-copy fix is in the WORKING TREE, uncommitted
-   and undeployed.** Full write-up in the section directly above this one
-   (*"2026-08-04 (later) — `ai_brand_led` static ads had NO COPY"*). Offline-verified
-   (1882 + 29 + 40 checks, 10 revert-proven mutations, suite 53/53 green) but **never rendered
-   live**. Do this before starting anything new: commit it with hunk-level staging, deploy, then
-   run ONE `meta_static` job on a brand that has both a `summary` and a `tagline` and read the copy
-   off the delivered images. Check **copy fidelity first** — kill switch is
-   `STATIC_BRAND_LED_COPY=false`, no deploy needed.
+0a. **NEWEST: the `ai_brand_led` no-copy fix is OPEN AS PR #75, not merged, never rendered live.**
+   Branch `fix/brand-led-static-copy`, two commits. Full write-up in the two sections directly
+   above this one (*"`ai_brand_led` static ads had NO COPY"* and *"the STARVED SOURCE"*).
+   Offline-verified (1882 + 29 + 40 + 17 checks, 15 revert-proven mutations; 51/52 green in a
+   clean worktree, the one failure pre-existing at `main`). **Next action: review + merge #75,
+   deploy, then run ONE `meta_static` job** on a brand that has both a `summary` and a `tagline`,
+   on a product that already has a `CreativeDirectionArtifact` (proves the
+   `DIRECTOR_SIGNALS_VERSION` bump forced a re-derive), and read the copy off the delivered
+   images. Check **copy fidelity first** — kill switch `STATIC_BRAND_LED_COPY=false`, no deploy
+   needed. Note commit 1 of that PR is the pre-existing fidelity hardening, shipping on its own
+   419-check harness and **not** line-by-line reviewed as part of the PR.
 
 0. **NOTHING OUTSTANDING from the 2026-08-04 incident — it is shipped and verified.**
    PRs #65, #66, #67, #68 all merged; prod is `919f979`; end-to-end run confirmed
