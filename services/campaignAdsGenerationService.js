@@ -1905,13 +1905,23 @@ async function firstCatalogMediaForProduct(productOid) {
 
   // Feed order, with the suitability metric alongside so the guard needs no
   // second query. Bounded: a product's catalog set is small.
+  // NO limit(): a cap here is a silent wrong-seed generator. With limit(24), a
+  // product whose first 24 images are all subject-dominant and whose 25th is the
+  // wide shot would never load the wide shot and would keep the dominant image —
+  // the exact failure this guard exists to prevent, hidden behind a number.
+  // Catalog sets are small and this selects two fields.
+  //
+  // fileType EXCLUDES VIDEO. Unmeasured media counts as acceptable, and a catalog
+  // VIDEO carries no adSuitability, so without this filter skipping a dominant
+  // still could land on a video and silently switch Omni to its image-to-video
+  // seed track. The regenerate path already guards this; this helper did not.
   const candidates = await Media.find({
     source: 'catalog-product',
-    'metadata.catalogProductId': productOid
+    'metadata.catalogProductId': productOid,
+    fileType: { $ne: 'video' }
   })
     .sort({ createdAt: 1 })
     .select('_id adSuitability.metrics.primarySubjectAreaFraction')
-    .limit(24)
     .lean();
 
   if (!candidates.length) return null;

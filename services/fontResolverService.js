@@ -789,24 +789,40 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
   const themeBody    = theme.bodyFontFamily    || theme.sansFontFamily || null;
   const themeQuote   = theme.quoteFontFamily   || theme.serifFontFamily || null;
 
-  // The SCRAPED family (brand.fontFamily, e.g. AllBirds' "Self Modern" from
-  // brandfetch) is now a LAST-RESORT tier instead of being discarded whenever a
-  // human had not marked fontFamily as curated. It stays BELOW websiteUsage so
-  // a brand whose stylesheet names a real family keeps that behaviour unchanged;
-  // it only speaks up when the higher tiers yield nothing usable — which is
-  // precisely the case the `var(--font-sans)` guard above now creates. For
-  // AllBirds this resolves "Self Modern", which IS in customFonts, so the brand's
-  // own typeface renders instead of a tone-guessed substitute.
+  // THE BRAND'S OWN FACE WINS — but only when we actually hold a usable file.
+  //
+  // Enabling the styleTheme aliases above had a consequence adversarial review
+  // caught and production data confirmed: of 34 brands, ZERO set
+  // headingFontFamily (so that tier was always dead) while FOUR set
+  // sansFontFamily, and all four disagree with their scraped family —
+  // AllBirds theme.sans "DM Sans" vs scanned "Self Modern", Pelagic "Montserrat"
+  // vs "Oswald". Left as theme-first, this change would have replaced AllBirds'
+  // real typeface with a generic Google face, which is the opposite of the intent
+  // ("pull the brand's real fonts, match closer").
+  //
+  // So the scraped family outranks the theme ONLY when matchCustomFont finds a
+  // usable ingested file for it — that is what makes it the brand's REAL face
+  // rather than a brandfetch guess. matchCustomFont is reused deliberately: it
+  // already enforces needsLicense holds and the commercial-licence gate, so an
+  // unlicensed face cannot win here and correctly falls through to the theme.
+  const scannedFamily = normalizeFontFamily(scanned);
+  const scannedIsOwnedFace = !!(scannedFamily && matchCustomFont(brand, scannedFamily));
+  const ownFace = scannedIsOwnedFace ? scannedFamily : null;
+
   const sharedFamily = normalizeFontFamily(
     (fontIsCurated ? scanned : null) ||
+    ownFace ||
     tailwind?.fonts?.body || websiteUsage.body ||
     themeBody || themeHeading ||
     scanned || null
   );
 
   const wanted = {
-    heading: normalizeFontFamily(overrides.heading?.family || themeHeading || (fontIsCurated ? scanned : null) || tailwind?.fonts?.heading || websiteUsage.heading || sharedFamily) || DEFAULT_ROLE_FONTS.heading.family,
-    body: normalizeFontFamily(overrides.body?.family || themeBody || (fontIsCurated ? scanned : null) || tailwind?.fonts?.body || websiteUsage.body || sharedFamily) || DEFAULT_ROLE_FONTS.body.family,
+    heading: normalizeFontFamily(overrides.heading?.family || ownFace || themeHeading || (fontIsCurated ? scanned : null) || tailwind?.fonts?.heading || websiteUsage.heading || sharedFamily) || DEFAULT_ROLE_FONTS.heading.family,
+    body: normalizeFontFamily(overrides.body?.family || ownFace || themeBody || (fontIsCurated ? scanned : null) || tailwind?.fonts?.body || websiteUsage.body || sharedFamily) || DEFAULT_ROLE_FONTS.body.family,
+    // Quote keeps theme priority: serifFontFamily is a deliberate pairing choice
+    // (it is why AllBirds' Lora held steady), and a sans brand face must not
+    // silently replace a curated serif quote voice.
     quote: normalizeFontFamily(overrides.quote?.family || themeQuote || websiteUsage.quote || sharedFamily) || DEFAULT_ROLE_FONTS.quote.family,
   };
   const weights = {

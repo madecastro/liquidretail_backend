@@ -299,14 +299,37 @@ async function buildBrandTokens(brand, { layoutInputBrand = null, specFontOverri
   // An explicit brand value always wins — this only replaces the blind default.
   // Same principle as the composited logomark and the text-shadow polarity: pick
   // the ink from the thing it sits on.
+  // PICK THE HIGHER CONTRAST, don't threshold. A single luminance cut-off is the
+  // wrong method and adversarial review broke it with arithmetic: a mid-tone fill
+  // like #5B8C5A has luminance 0.494, so a `> 0.55 ? dark : white` rule chose
+  // WHITE at 1.93:1 — while dark ink on that same fill measures 9.3:1. Every
+  // mid-tone brand colour (mid greens, slate blues, ~#888 greys) hit that hole,
+  // and those are common accents. Computing both ratios and taking the winner has
+  // no such gap and needs no tuned constant.
+  const relLum = (hex) => {
+    const s = String(hex || '').replace(/^#/, '');
+    if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+    // sRGB channel linearisation, per WCAG — a plain 0..1 average overstates the
+    // contrast of saturated fills.
+    const chan = (v) => {
+      const c = parseInt(v, 16) / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * chan(s.slice(0, 2)) + 0.7152 * chan(s.slice(2, 4)) + 0.0722 * chan(s.slice(4, 6));
+  };
+  const contrastRatio = (l1, l2) => {
+    const hi = Math.max(l1, l2), lo = Math.min(l1, l2);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  const INK_DARK = '#16181D';
+  const INK_LIGHT = '#FFFFFF';
   const readableOn = (bgHex, explicit) => {
     if (explicit) return explicit;
-    const s = String(bgHex || '').replace(/^#/, '');
-    if (!/^[0-9a-fA-F]{6}$/.test(s)) return '#FFFFFF';
-    const lum = (0.2126 * parseInt(s.slice(0, 2), 16)
-               + 0.7152 * parseInt(s.slice(2, 4), 16)
-               + 0.0722 * parseInt(s.slice(4, 6), 16)) / 255;
-    return lum > 0.55 ? '#16181D' : '#FFFFFF';
+    const bg = relLum(bgHex);
+    if (bg == null) return INK_LIGHT;
+    return contrastRatio(relLum(INK_DARK), bg) >= contrastRatio(relLum(INK_LIGHT), bg)
+      ? INK_DARK
+      : INK_LIGHT;
   };
 
   const ctaBgResolved   = themeColor(theme, 'ctaBgColor') || themeColor(theme, 'ctaBg') || accent || primary || '#46783E';

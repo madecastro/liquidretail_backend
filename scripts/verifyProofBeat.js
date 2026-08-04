@@ -749,6 +749,29 @@ check('F2 the scraped brand family and both styleTheme spellings are consulted',
   const bareScanned = /\|\|\s*\n?\s*scanned\b/.test(chain) || /\bscanned \|\|/.test(chain);
   assert.ok(curatedOnly && bareScanned,
     'the curated tier must stay AND an uncurated scanned family must appear as a fallback');
+
+  // ORDER IS THE WHOLE POINT, and asserting mere presence missed a regression.
+  // Enabling the sansFontFamily alias made the curated theme outrank the scraped
+  // family — and production data says all four brands that set sansFontFamily
+  // DISAGREE with their scraped face (AllBirds theme "DM Sans" vs real "Self
+  // Modern"). Theme-first would therefore have replaced real brand typefaces with
+  // generic Google ones, the opposite of the intent. The brand's own ingested face
+  // must come FIRST in the heading/body chains.
+  const headingChain = src.slice(src.indexOf('heading: normalizeFontFamily('), src.indexOf('body: normalizeFontFamily('));
+  const ownIdx = headingChain.indexOf('ownFace');
+  const themeIdx = headingChain.indexOf('themeHeading');
+  assert.ok(ownIdx > -1 && themeIdx > -1, 'heading chain must consult both the owned face and the theme');
+  assert.ok(ownIdx < themeIdx, 'the brand\'s own ingested face must outrank a generic curated theme family');
+
+  // ...and it may only outrank the theme when a USABLE file exists, which is what
+  // makes it the real face rather than a brandfetch guess. matchCustomFont is
+  // reused so licence holds still apply.
+  assert.ok(/scannedIsOwnedFace\s*=\s*!!\(\s*scannedFamily\s*&&\s*matchCustomFont\(/.test(src),
+    'the owned-face tier must be gated on matchCustomFont, so licence holds are respected');
+  // Quote must NOT take the owned face — serifFontFamily is a deliberate pairing.
+  const quoteChain = src.slice(src.indexOf('quote: normalizeFontFamily('));
+  assert.ok(!/ownFace/.test(quoteChain.slice(0, quoteChain.indexOf('\n'))),
+    'a sans brand face must not silently replace a curated serif quote voice');
 });
 
 // ── A: a product-tier rating names its product ──────────────────────────

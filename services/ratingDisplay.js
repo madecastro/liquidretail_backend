@@ -14,6 +14,24 @@
 const RATING_STAR_MIN = 4.5;
 
 /**
+ * Longest product label allowed on the rating line. The line sits at ~0.82x body
+ * size beneath the stars, so it has far less room than the product-name slot.
+ */
+const PRODUCT_ATTRIBUTION_CAP = 28;
+
+/** Trim to `cap` on a word boundary. Returns null for anything unusable. */
+function truncateWordSafe(value, cap) {
+  const s = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  if (s.length <= cap) return s;
+  const cut = s.slice(0, cap);
+  const sp = cut.lastIndexOf(' ');
+  // Only fall back to a hard cut when there is no space to break on, so a single
+  // very long word still yields something rather than an empty label.
+  return (sp >= Math.floor(cap * 0.5) ? cut.slice(0, sp) : cut).trim() || null;
+}
+
+/**
  * Product-tier volume exception (owner, verbatim):
  *   "if the count is large (greater than 5000), than stars above 4.19 is allowed"
  *
@@ -254,10 +272,13 @@ function resolveAtomicRatingPair({
     // the brand tier below already does with its domain label.
     let reviewsText = null;
     if (rc != null) {
-      const label = productAttribution && String(productAttribution).trim();
-      reviewsText = label
-        ? `${rc} review${rc === 1 ? '' : 's'} · ${label}`
-        : `${rc} review${rc === 1 ? '' : 's'}`;
+      // CAPPED. The rating line renders at ~0.82x body size and the renderer caps
+      // productName but NOT reviewsText, so an unbounded merchant title
+      // ("Women's Ultra Lightweight Performance Moisture-Wicking Trail Running
+      // Shoe") would overrun the line. Word-safe so it never cuts mid-word.
+      reviewsText = `${rc} review${rc === 1 ? '' : 's'}`;
+      const label = truncateWordSafe(productAttribution, PRODUCT_ATTRIBUTION_CAP);
+      if (label) reviewsText += ` · ${label}`;
     }
     return {
       rating: productDisplay,
