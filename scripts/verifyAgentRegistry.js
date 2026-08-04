@@ -43,6 +43,7 @@ const FILES = [
   'services/capabilityExecutors/runStatus.js',
   'services/capabilityExecutors/adUpdateCta.js',
   'services/capabilityExecutors/platformListFormats.js',
+  'services/capabilityExecutors/adList.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -603,6 +604,19 @@ if (platformCap) {
   assert(platformCap.scope === 'global', `platform.listFormats: scope === 'global'`);
 }
 
+async function checkAdListExecutor() {
+  const exec = require('../services/capabilityExecutors/adList');
+  const r1 = await exec.run({ req: {}, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `adList: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /brandId required/i.test(r2.error),
+    `adList: missing brandId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'not-an-oid' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `adList: invalid brandId → rejects`);
+}
+
 async function checkPlatformListExecutor() {
   const exec = require('../services/capabilityExecutors/platformListFormats');
   // no-scope guard (even a global-scope capability requires auth)
@@ -728,6 +742,7 @@ async function checkSurfaceWideningExecutors() {
   await checkLifestyleExecutor();
   await checkLifestyleUnitService();
   await checkPlatformListExecutor();
+  await checkAdListExecutor();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
