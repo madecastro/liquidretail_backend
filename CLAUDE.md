@@ -259,11 +259,29 @@ Video never launches a browser.
 - **Never trust a model id or a price from memory.** `GET
   https://api.atlascloud.ai/api/v1/models` (no auth) is the catalog; each entry
   carries `schema` and `readme` **URLs** — fetch those, they are the operative
-  contract. The price field is **`price.actual.base_price`** (a string), and `actual`
-  is what we pay (`origin` is list). Verified live: **0 of 444** entries have a
-  `pricing` key, **444 of 444** have `price`. 123 have no `base_price` at all — those
-  are per-token LLM entries, which must be treated as "not applicable", never as free.
+  contract. The price field is **`price.actual.base_price`** (a string; `origin` is
+  list). Verified live: **0 of 444** entries have a `pricing` key, **444 of 444** have
+  `price`. 123 have no `base_price` at all — those are per-token LLM entries, which
+  must be treated as "not applicable", never as free.
   Covered by `scripts/verifyImagePricing.js` (9 offline checks, revert-proven).
+- **`base_price` IS NOT THE CHARGE — never quote it as a cost. CORRECTED
+  2026-08-03; this file previously said `actual` "is what we pay", and that was
+  wrong by 7x.** MEASURED over 40 live edits: `openai/gpt-image-2/edit` publishes
+  base_price **0.01** and charged **$0.07173** every single time; the
+  `openai/gpt-image-2-developer/edit` variant publishes **0.005** and charged
+  **$0.03586**. So the 50% discount is real, but a multiplier (~7.17x here) applies
+  on top of both, it is not derivable from the catalog, and it must not be
+  extrapolated to another model or another size/quality. A 3-surface `meta_static`
+  fanout is therefore **~$0.11 per product on the developer model**, not ~$0.015.
+  **Owner rule: always read the actual price back from Atlas after generation.** The
+  authoritative figure is `price` on the **settled prediction**
+  (`GET /model/prediction/:id`), which `scheduleCostReconcile` reads to upgrade the
+  row and clear `costSource:'estimated'`. `buildPriceMap` yields a floor-grade
+  estimate whose only job is to stop a $0.00 row. Any budget, margin or per-ad cost
+  claim must come from **reconciled** rows. Note Atlas usually publishes `price`
+  *after* the image returns — measured **7 of 38** predictions had it at completion —
+  so the reconcile is the normal path, not a rare top-up; its retry budget was
+  widened the same day for exactly that reason.
 - **Ledger spend at the charge point, not the success point.** A billable submit that
   then fails still costs money. `atlasImageService.chargedError` records it and sets
   `err.charged`, which is the flag telling a caller that a direct-provider fallback

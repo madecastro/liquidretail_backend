@@ -411,6 +411,15 @@ function absences(d, { rendersQuote, rendersRating, rendersBadge }, dropped = []
   if (FIDELITY_HARDENING) {
     out.push('no product name, website, hashtag or small print added anywhere in the scene — wording already printed on the product itself is not an addition and stays exactly as the reference shows it');
     out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo, wordmark or label already printed on the product itself stays exactly as it is, reproduced from the reference rather than redrawn, but nothing new is drawn');
+    /**
+     * Owner-supplied catch-all, 2026-08-03. Deliberately phrased as "invent"
+     * and "not given to you", NOT as a flat ban on the nouns: several of these
+     * ARE supplied on some intents (a rating, a badge), and the conditional
+     * rules above already permit exactly those and fence the rest. A blanket
+     * "no ratings" line here would contradict the supplied rating string and
+     * undo the tuned star-row rule above it.
+     */
+    out.push('no award, laurel, ribbon, seal, guarantee, warranty or money-back claim, QR code, barcode, legal or regulatory small print, or promotional claim of any kind — and nothing else you were not given: if a word, numeral or mark is not in the text above, it does not belong in the image');
   } else {
     out.push('no product name, website, hashtag or small print');
     out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo already printed on the garment itself stays exactly as it is, but nothing new is drawn');
@@ -604,25 +613,30 @@ const LEGACY_PRODUCT_FIDELITY = `The supplied photograph is a PRODUCT REFERENCE 
  * repetitive, and the enumerations are open ("including but not limited to")
  * because the catalog spans apparel, footwear, bottles, devices and jewellery.
  */
-const PRODUCT_FIDELITY = `PRODUCT FIDELITY — HIGHEST PRIORITY. Wherever product accuracy conflicts with a creative or styling instruction below, product accuracy wins. This does not relax the text instructions below, which are absolute in their own right, and it does not override the reserved-corner rule below.
-The supplied reference photograph is the single source of truth for the product; where several are supplied, the first is the primary product reference and the rest are further views of the same item. It is a PRODUCT REFERENCE ONLY — not a composition to copy. Treat every visible characteristic of the item as immutable. This advertisement must feature the exact same physical item that reference shows, as though that same item had been carried into a new photoshoot and photographed again — not recreated from memory. Do not redesign, reinterpret, simplify, modernise, improve, repair, stylise, approximate or substitute any part of it.
-Do not infer the product from its category, and do not infer it from anything you know about the brand. If the reference disagrees with what products of this type usually look like, or with your prior knowledge of this brand, the reference is correct and your prior is wrong.
+const PRODUCT_FIDELITY = `PRODUCT FIDELITY — HIGHEST PRIORITY. Wherever product accuracy conflicts with a creative or styling instruction below, product accuracy wins. This does not relax the text instructions below, which are absolute in their own right, and it does not override the reserved-corner rule or the FORMAT block below.
+The supplied reference photograph is the single source of truth for the product; where several are supplied, the first is the primary product reference and the rest are further views of the same item. It is a PRODUCT REFERENCE ONLY — not a composition to copy. Treat every visible characteristic of the item as immutable. This advertisement must feature the exact same physical item that reference shows, as though that same item had been carried into a new professional photoshoot and photographed again — not recreated from memory. Do not redesign, reinterpret, simplify, modernise, improve, repair, stylise, approximate or substitute any part of it.
+Do not infer the product from its category, and do not infer it from anything you know about the brand. If the reference disagrees with what products of this type usually look like, or with your prior knowledge of this brand, the reference is correct and your prior is wrong. This holds for every category — apparel, footwear, jewellery, bags, accessories, cosmetics, skincare, electronics, furniture, sporting goods, home goods, toys, tools, and packaged or food goods alike.
 
 PRESERVE EXACTLY, as the reference shows it:
-  — Form: shape, proportions, dimensions, silhouette, geometry, profile, contours, edges and curvature. Fit and cut are part of the form and may not be altered, though the item may of course be posed, worn or placed differently.
-  — Construction: seams, stitching, panel layout, assembly, joints, fasteners, hardware, hinges, closures, buttons, buckles, snaps, zips, clasps, laces, straps.
-  — Surface: material, fabric, leather, knit, wood grain, metal and plastic finish, gloss, matte, texture, weave, grain, embossing, engraving, reflectivity, transparency, opacity.
-  — Colour: the item's own colours exactly. Do not shift hue, recolour, bleach, tint, darken, brighten, or invent an alternate colourway. New lighting may fall across those colours; it may not change them.
-  — Graphics already on the item: logos, branding, icons, artwork, patterns, prints, typography, embroidery, embossing, debossing, decals, labels and tags — same wording, same lettering, same placement, same scale. Reproduce them from the reference; never redraw them from imagination, and never add, remove or modify any branding. This preserves marks that are ALREADY on the item; it is never licence to place a brand mark anywhere else in the frame.
-  — Details, including but not limited to: pockets, collars, sleeves, cuffs, necklines, hems, soles, heels, eyelets, handles, bezels, screens, lenses, caps, applicators, gemstones, chain links, watch faces, grips, blades, wheels, buttons, ports, vents and sensors. Every feature visible in the reference must appear unchanged; no feature absent from the reference may be added.
-  — Condition: wrinkles, folds, creases, wear, polish, finish, and the shadows the item casts on itself. Do not “improve” the item, smooth its surfaces, or clean away its natural characteristics.
+  — Form: shape, proportions, overall dimensions, silhouette, geometry, profile, contours, edges, thickness, volume and curvature. Fit and cut are part of the form and may not be altered, though the item may of course be posed, worn or placed differently.
+  — Construction: seams, stitching, panel layout, assembly, joints, fasteners, hardware, hinges, closures, buttons, buckles, snaps, zips, clasps, laces, eyelets, straps, handles.
+  — Materials: fabric, knit, mesh, leather, suede, rubber, plastic, metal, wood, glass, ceramic, gemstone, carbon fibre, foam, paper and packaging material — each rendered as the same material the reference shows, never swapped for a richer or cheaper-looking one.
+  — Surface: texture, weave, grain, gloss, matte, satin, brushed and polished finishes, transparency, opacity, reflectivity.
+  — Colour: the item's own colours exactly. Do not shift hue, recolour, bleach, tint, darken, brighten, saturate, desaturate, or invent an alternate colourway. New lighting may fall across those colours; it may not change them.
+  — Graphics already on the item: logos, branding, icons, artwork, patterns, prints, typography, embroidery, embossing, debossing, engraving, decals, labels and tags — same wording, same lettering, same placement, same scale. Reproduce them from the reference; never redraw them from imagination, and never add, remove or modify any branding. This preserves marks that are ALREADY on the item; it is never licence to place a brand mark anywhere else in the frame.
+  — Details, including but not limited to: pockets, collars, sleeves, cuffs, necklines, hems, soles, heels, eyelets, handles, bezels, displays, screens, lenses, caps, applicators, chains, gemstones, watch faces, grips, blades, wheels, buttons, ports, vents and sensors. Every feature visible in the reference must appear unchanged; no feature absent from the reference may be added.
+  — Condition: wrinkles, folds, creases, wear, polish, finish, surface imperfections, and the shadows the item casts on itself. Do not “improve” the item, smooth its surfaces, or clean away its natural characteristics.
 
 NEVER: substitute a similar-looking version; invent a feature that is absent; remove a visible feature; redesign any component; merge this item with another design; produce a newer, cleaner, alternative or special edition of it; produce a different size, fit or variation; simplify it; stylise it; or hallucinate any detail that is not visible in the reference.
-If part of the item is not visible in the reference, do not invent or redesign the hidden portion. Infer only the minimum geometry a believable photograph needs, fully consistent with the parts you can see — and infer geometry only, never a graphic, a label or a marking.
+If part of the item is not visible in the reference, do not invent or redesign the hidden portion. Infer only the minimum physically plausible geometry a believable photograph needs, fully consistent with the parts you can see — and infer geometry only, never a graphic, a label or a marking.
 
-WHAT MAY CHANGE — everything that is not the item itself, and you should change it: the model or models, pose, hands, how and where the item is worn or placed, environment, background, set, props, styling, lighting, mood, composition, crop, camera, perspective, focal length, depth of field, the colour grading of the scene, and the typographic treatment of the copy specified below. Build an entirely new scene around the item; do not reuse the reference's background, crop or lighting.
+PRODUCT SCALE AND FRAMING. The reference photograph also defines how the product is framed, and that carries over. Give the item approximately the same visual prominence and approximately the same share of the frame as the reference does — within about a tenth either way — from approximately the same camera distance and a similar perspective. Do not zoom in dramatically, zoom out dramatically, or crop substantially tighter or wider than the reference. Compose the advertisement around the item at that size: fit the environment to the product, never the product to the environment, and never rescale the item just to make a layout easier. This governs how large the item sits inside the frame; it does not govern the frame itself — the output's dimensions and aspect are fixed by the FORMAT block at the end, and the safe box and reserved corner still apply.
 
-BEFORE YOU FINISH, check two things. The product: a customer would recognise it as the identical item, your image could pass as another photograph of that same physical item, and no feature of the item has been added, removed, modified, recoloured or reshaped — judged on the item itself, not on where it sits in the new frame. The copy: every string you were given below appears exactly once, spelled exactly as given, and no other text appears anywhere. If either check fails, correct it before finishing the advertisement.`;
+WHAT MAY CHANGE — everything that is not the item itself, and you should change it: the model or models, pose, hands, how and where the item is worn or placed, environment, background, set, props, styling, lighting, shadows, mood, atmosphere, camera angle, focal length, depth of field, the colour grading of the scene, and the typographic treatment of the copy specified below. Build an entirely new scene around the item; do not reuse the reference's background or lighting. Note what is deliberately NOT on that list: the product's size in frame and the camera's distance from it, which the paragraph above holds close to the reference.
+
+ADVERTISING QUALITY. This has to read as work a premium creative agency shipped, not a stock photograph and not a template that was filled in. Make the lighting feel intentional and the typography feel art-directed. Use whitespace deliberately. Keep the product the primary focal point and give it the greatest visual emphasis in the frame. Aim for premium, modern and editorial — and put the inventiveness in the photography, the light and the typography, never in the product and never in the claims.
+
+BEFORE YOU FINISH, check three things. The product: a customer would recognise it as the identical physical item; nothing has been redesigned, added, removed, recoloured or reshaped; and colour, branding, materials and construction all match the reference. The framing: the item occupies roughly the same share of the frame as it does in the reference, and the whole image could pass as another photograph of that same item taken in a new commercial shoot. The copy: every string you were given below appears exactly once, spelled exactly as given, and no other text appears anywhere. If any check fails, correct it before finishing the advertisement.`;
 
 function buildPrompt({ intentKey, data, product, surface }) {
   const policy = SURFACE_POLICY[surface];
@@ -682,7 +696,15 @@ ${kept.map(([role, str]) => `  ${role.toLowerCase()} -> ${str}`).join('\n')}
 Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.${carveOutWithCopy}`
     : `THIS AD CARRIES NO TEXT AT ALL. Render a pure product image: no words, numerals, letterforms, logos or graphic marks of any kind, anywhere in the frame — including on signage, packaging, screens or clothing within the scene.${carveOutNoCopy} The photograph alone has to do the work.`;
 
-  const prompt = `Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
+  /**
+   * Role framing. Owner-supplied 2026-08-03. Gated with the rest of the hardening
+   * so the flag-off arm stays byte-identical to the measured baseline.
+   */
+  const rolePreamble = FIDELITY_HARDENING
+    ? 'You are an expert advertising creative director, commercial product photographer and graphic designer.\n\n'
+    : '';
+
+  const prompt = `${rolePreamble}Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
 
 ${FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY}
 

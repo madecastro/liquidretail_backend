@@ -42,7 +42,31 @@ const { formatDisplayRating } = require('./ratingDisplay');
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
 const { adStage, noteRenderIssue } = require('./adStage');
 
-const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2/edit';
+/**
+ * Owner decision 2026-08-03: the `-developer` variant, not the plain one.
+ *
+ * VERIFIED live before switching, because a model id is never taken from memory
+ * (CLAUDE.md §2). Both entries resolve to the same POST
+ * `/api/v1/model/generateImage`; their request schemas are **field-for-field
+ * identical** — same `required` (`model`, `images`, `prompt`), same 14-value `size`
+ * enum, same `quality` low|medium|high, same `moderation` / `output_format` /
+ * `enable_sync_mode` / `enable_base64_output`, and neither exposes
+ * `input_fidelity`. They even share one `readme` URL. So this is a drop-in swap:
+ * nothing in buildParams or the payload below changes.
+ *
+ * Price, MEASURED not read off the catalog (see the pricing note in
+ * atlasImageService — `base_price` is a base and under-reports ~7x):
+ *   openai/gpt-image-2/edit            base 0.010  ->  charged $0.07173
+ *   openai/gpt-image-2-developer/edit  base 0.005  ->  charged $0.03586
+ * Exactly half, dead-consistent across every priced prediction. A 3-surface
+ * meta_static fanout goes ~$0.215 -> ~$0.108 per product.
+ *
+ * NOT VERIFIED: output quality between the two variants. The A/B that prompted this
+ * ran both arms on the developer model, so it compares prompts, not models. The
+ * schemas and readme are identical and 20 developer renders looked clean, but if
+ * output degrades, this is the first thing to put back.
+ */
+const PLATE_EDIT_MODEL = process.env.AI_DIRECT_IMAGE_EDIT_MODEL || 'openai/gpt-image-2-developer/edit';
 // No AI_DIRECT_IMAGE_MODEL / text-to-image constant. Owner instruction: "there
 // should never be a text to image fallback period" / "if there is no image
 // there is no generation" — the taggedError thrown below when refs.length is 0

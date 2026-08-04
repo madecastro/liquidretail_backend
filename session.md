@@ -152,6 +152,63 @@ it — `adVisionQcService` (measure-and-reject) is still that fix. See CLAUDE.md
 three mutations (hardwire flag off / delete the text-exemption clause / loosen the reference
 anchor); all three fail the harness. Full suite **46/46 green**.
 
+### 0.0a PRICING CORRECTED — `base_price` is not the charge (2026-08-03, MEASURED)
+
+Found by running live renders. **`price.actual.base_price` under-reports the real charge
+by ~7.17x.** CLAUDE.md §2, `docs/ATLAS.md` and the `buildPriceMap` comment all said
+`actual` "is what we pay"; all three are now fixed.
+
+| model | catalog base | **measured charge** |
+|---|---|---|
+| `openai/gpt-image-2/edit` | $0.010 | **$0.07173** |
+| `openai/gpt-image-2-developer/edit` | $0.005 | **$0.03586** |
+
+Dead-consistent across every priced prediction. The multiplier is **not** in the catalog
+and was measured only at `1024x1024` / `quality: medium` — do not hardcode it or carry it
+to another model. `buildPriceMap` is a **floor-grade estimate** whose only job is to stop a
+$0.00 row.
+
+**Owner rule: always read the actual price back from Atlas after generation.** Authoritative
+figure = `price` on the **settled** prediction (`GET /model/prediction/:id`). Atlas usually
+publishes it *after* the image returns — measured **7 of 38** had it at completion — so
+`scheduleCostReconcile` is the normal path, not a rare top-up. Its budget was widened
+`[3s,10s,30s]` → `[3s,10s,30s,60s,120s,300s]`; at the old budget most rows kept a 7x-low
+estimate forever, which is how a static ad appeared to cost $0.01.
+
+### 0.0b STATIC EDIT MODEL → `-developer` variant (owner, 2026-08-03)
+
+`PLATE_EDIT_MODEL` default and `AI_DIRECT_IMAGE_EDIT_MODEL` in `config/defaults.env` both
+now point at `openai/gpt-image-2-developer/edit`. **Halves static spend** — a 3-surface
+`meta_static` fanout goes ~$0.215 → ~$0.108 per product. Submit COUNT is unchanged.
+
+Verified live before switching (never take a model id from memory): both ids resolve to the
+same `POST /model/generateImage` and their request schemas are **field-for-field identical**
+— same `required`, same 14-value `size` enum, same `quality` enum, neither exposes
+`input_fidelity`, and they share one `readme`. Drop-in; `buildParams` unchanged. The
+identical `size` enum is why `verifyStaticSafeBox` still passes — noted in that file.
+
+⚠️ **NOT verified: output quality dev vs non-dev.** The A/B ran both arms on the developer
+model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
+no code deploy.
+
+### 0.0c RENDER SAMPLES — run 1 VOID, run 2 in flight
+
+**Run 1 (40 renders, non-dev model, $2.87) is VOID for product fidelity.** The `PRODUCT:`
+description said *"Triple-strap"* — a miscount, the seed has **two** straps — and it went
+into **both** arms, so every render was told three while shown two. Both arms produced a mix
+of 2 and 3. Do not cite run 1 for strap/product fidelity.
+
+**What run 1 DID establish, and it is the important part:** no copy regression. All 38
+renders in both arms produced the rating, quote, attribution and CTA — so doubling the
+prompt above `SET EXACTLY THESE STRINGS` did not break text fidelity, which was the whole
+risk of this change. The `UNIFORM·SHOE` insole label also survived in both arms, confirming
+the carve-out works.
+
+**Run 2** re-runs on the developer model with a description that is accurate AND deliberately
+**silent on strap count**, so the reference image is the only source for that attribute —
+which is precisely what `PRODUCT_FIDELITY` claims to enforce. Harness:
+`<scratchpad>/render-samples2.js` (not repo code; it re-polls Atlas for real prices).
+
 ⚠️ **ANOTHER SESSION WAS EDITING THIS SAME WORKING TREE CONCURRENTLY.** Mid-task the tree held
 uncommitted `services/ratingDisplay.js` (+431) + `scripts/verifyCoherentSocialProof.js`; those
 landed as **`9b61b02`** ("Tier-coherent social proof") while this work was in progress, and

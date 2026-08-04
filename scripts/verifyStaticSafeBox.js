@@ -25,11 +25,19 @@ const pf = require('../services/platformFormats');
 const intents = require('../services/staticAdIntents');
 const render = require('../services/directImageRenderService');
 
-// ── live size enum for openai/gpt-image-2/edit ──────────────────────────
+// ── live size enum for the gpt-image-2 edit family ──────────────────────
 // Fetched 2026-08-03 from
 //   https://static.atlascloud.ai/model/schema/openai-gpt-image-2-edit.json
 // The schema `size` enum is the operative contract (CLAUDE.md §2); the model
 // README still lists only three legacy sizes and is the stale artefact.
+//
+// STILL VALID after the 2026-08-03 switch of PLATE_EDIT_MODEL to
+// `openai/gpt-image-2-developer/edit`. The two schemas were diffed
+// field-for-field before that change and the `size` enum is IDENTICAL (as is
+// every other request property), so the geometry this file pins is unaffected.
+// If the model is ever pointed at a different family, re-diff the enum first —
+// a size outside it risks silent coercion to the 1024x1024 default, which would
+// square a 4:5 surface and then crop it.
 // A non-enum size risks a 400 from the gateway, or — worse — silent coercion
 // to the 1024x1024 default, which would hand a square frame to a non-square
 // surface and then centre-crop it after the billable call.

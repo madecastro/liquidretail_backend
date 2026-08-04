@@ -350,6 +350,70 @@ function collectPrompts(mod, data) {
   }
 }
 
+// ── F7: the owner-supplied v2 additions (2026-08-03) ────────────────────
+//
+// Second round of owner template changes on top of the original hardening. Each
+// clause is pinned separately so a failure names the sentence that was lost.
+//
+// The two that carry real risk, and why they are checked as PAIRS:
+//   • SCALE AND FRAMING contradicted the prompt as it stood — WHAT MAY CHANGE
+//     handed the model crop/camera/perspective, and an older sentence told it not
+//     to reuse "the reference's background, crop or lighting". Holding framing to
+//     ~10% while also declaring crop free is incoherent, so the free-list must NOT
+//     contain 'crop' and the reuse sentence must NOT say 'crop'. Both are asserted
+//     negatively; if a future edit pastes the old wording back, this fails.
+//   • The framing rule must defer to the FORMAT block, or it reads as licence to
+//     change the delivered aspect — which the geometry harness would then catch as
+//     a size defect with a confusing cause.
+{
+  const mod = loadIntents(undefined);
+  const F = mod.PRODUCT_FIDELITY;
+  const rows = collectPrompts(mod, DATA);
+  check('F7 at least 6 (intent, surface) pairs produced a prompt', rows.length >= 6, `got ${rows.length}`);
+
+  const clauses = [
+    ['role preamble', 'You are an expert advertising creative director'],
+    ['scale/framing rule', 'approximately the same share of the frame'],
+    ['framing tolerance stated', 'within about a tenth either way'],
+    ['no dramatic zoom/crop', 'Do not zoom in dramatically'],
+    ['environment fits product', 'fit the environment to the product, never the product to the environment'],
+    ['framing defers to FORMAT', 'fixed by the FORMAT block'],
+    ['advertising quality', 'ADVERTISING QUALITY'],
+    ['not stock photography', 'not a stock photograph'],
+    ['product is focal point', 'primary focal point'],
+    ['materials list', 'carbon fibre'],
+    ['category-agnostic', 'apparel, footwear, jewellery'],
+    ['final check covers framing', 'roughly the same share of the frame'],
+    ['do-not-invent catch-all', 'if a word, numeral or mark is not in the text above'],
+  ];
+  for (const [name, needle] of clauses) {
+    for (const { intentKey, surface, prompt } of rows) {
+      check(`F7 ${intentKey}/${surface}: ${name}`, prompt.includes(needle));
+    }
+  }
+
+  // Negative pins — the resolved contradictions must STAY resolved.
+  check('F7 WHAT MAY CHANGE no longer lists crop as free',
+    !/WHAT MAY CHANGE[^\n]*\bcrop\b/.test(F),
+    'crop reappeared in the creative-freedom list, contradicting the framing rule');
+  check('F7 the reference-reuse sentence no longer says crop',
+    !F.includes("do not reuse the reference's background, crop or lighting"),
+    'old wording restored; it contradicts holding framing near the reference');
+  check('F7 free-list explicitly excludes product size in frame',
+    F.includes('deliberately NOT on that list'));
+
+  // The v2 additions must revert with the flag, like everything else.
+  const off = loadIntents('false');
+  for (const { intentKey, surface, prompt } of collectPrompts(off, DATA)) {
+    check(`F7 flag off ${intentKey}/${surface}: no role preamble`,
+      !prompt.includes('You are an expert advertising creative director'));
+    check(`F7 flag off ${intentKey}/${surface}: no framing rule`,
+      !prompt.includes('approximately the same share of the frame'));
+    check(`F7 flag off ${intentKey}/${surface}: no do-not-invent catch-all`,
+      !prompt.includes('if a word, numeral or mark is not in the text above'));
+  }
+}
+
 // ── Floor: harness cannot vacuous-pass if buildPrompt always errors ─────
 {
   const mod = loadIntents(undefined);
