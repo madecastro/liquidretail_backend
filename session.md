@@ -213,6 +213,64 @@ identical `size` enum is why `verifyStaticSafeBox` still passes — noted in tha
 model, so it compares prompts, not models. Revert path is `AI_DIRECT_IMAGE_EDIT_MODEL=openai/gpt-image-2/edit`,
 no code deploy.
 
+### 0.0f SHIPPING STATE + THE MEASURED GRID (2026-08-03). READ THIS BEFORE RE-RUNNING ANYTHING.
+
+**SHIPPING STATE: the pre-compression prompt plus ONE sentence.** `WHO WEARS OR HOLDS IT` now
+contains *"Keep the same person — do not replace them with someone else."* replacing the old
+permissive *"You may change who that person is"*. The 2026-08-03 compression, the five-attribute
+identity list, the closure/zip bans, the added-pocket ban and the logo-restyle ban are all
+**REVERTED** — they measured worse. Prompt is 11.8k chars. `gpt-image-2/edit` remains the model.
+
+**SIX 12-RENDER CELLS, ONE SEED (Pelagic Torrent, on-model). Do not re-derive these.**
+
+`openai/gpt-image-2/edit` — text-safe, product-drifty:
+
+| prompt | identity rule | model swaps | text defects |
+|---|---|---|---|
+| long 11.7k | permissive | 5/12 | 0/12 |
+| compressed 9.6k | none | 5/12 | 0/12 |
+| compressed 9.6k | 5-attribute list + closure bans | 7/12 | 0/12 |
+| **long 11.9k (shipping)** | **one simple sentence** | **2/12** | **0/12** |
+
+`openai/gpt-image-1.5/edit` + `input_fidelity: high` — product-perfect, text-broken:
+
+| prompt | identity rule | model swaps | rating defects |
+|---|---|---|---|
+| compressed 9.6k | 5-attribute | **0/12** | 3/12, incl. a FABRICATED count ("438 reviews" for 318) |
+| long 11.9k | simple sentence | **0/12** | ~11/12, incl. a WRONG VALUE (`4.4` for 4.6) |
+
+**FOUR CONCLUSIONS, and three of them contradict what a reasonable person would guess:**
+
+1. **Prompt LENGTH does not drive model swapping.** With the identity rule absent from both cells,
+   long = 5/12 and compressed = 5/12. Identical. The compression was neither the problem nor a fix.
+2. **A SIMPLE identity sentence beats an elaborate one, 2/12 vs 7/12.** Five named attributes plus
+   three specific bans did *worse* than one sentence. Dilution operates at the clause level, not
+   just at prompt scale. **Do not "strengthen" this sentence by adding detail — that was tried and
+   measured worse.**
+3. **Naming closures/zips in a preservation list did not help and plausibly hurt** (5/12 → 7/12
+   when added, confounded with the identity list). Classic negation priming. Note the exposed zip
+   ALSO appeared before that language existed, so the language did not introduce the defect — but
+   nothing about it earned its place.
+4. **Model swap is the mechanism for garment drift, in every cell.** Renders that keep the seed's
+   person are faithful; renders that swap the person gain exposed closures, restyled badges and
+   shifted colour together. Owner's read, confirmed: *"the only ones the shirts changed colors are
+   the images where the person was removed."*
+
+**`input_fidelity` IS THE REAL FIDELITY LEVER, AND IT IS BLOCKED ON TEXT.** `gpt-image-1.5/edit`
+exposes `input_fidelity` (enum low|high, **default high**), documented by Atlas as preserving
+"elements like faces or logos". It gave **0/12 swaps in both cells** — absolute product fidelity —
+and is **62% cheaper** ($0.0289 vs $0.07593 measured). `gpt-image-2/edit` has no such parameter.
+It cannot ship while the model typesets the rating: it invents star rows, and twice produced a
+false number (a fabricated review count, and 4.4 for 4.6). A wrong rating is a false proof claim,
+which is what `quoteProvenance` exists to prevent. **1.5 + high becomes the obvious choice the
+moment the rating stops being model-rendered** — which cuts against the 2026-07-31 removal of SVG
+overlay compositing, so it is a pipeline decision, not a prompt one.
+
+**Across ~170 renders on four seeds, no fidelity WORDING has ever beaten the legacy prompt.** The
+only measured wins are the person rule (product-only renders 3/6 → 0/12) and this identity sentence
+(swaps 5/12 → 2/12). Everything else is unproven. CLAUDE.md §2's standing note — the fix is
+measure-and-reject, not prompt tuning — has held up all day.
+
 ### 0.0e HOLD THE WEARER, AND CUT THE PROMPT DOWN (owner, 2026-08-03)
 
 Two owner instructions, and they fit together — pinning the wearer let several hedges be deleted.
