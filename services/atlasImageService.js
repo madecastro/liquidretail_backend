@@ -23,7 +23,7 @@
 'use strict';
 
 const axios = require('axios');
-const { recordFlatCost, reconcileCost } = require('./costTracker');
+const { recordFlatCost, finalizeFlatCost, reconcileCost } = require('./costTracker');
 const { classify, mayResubmit, retryAfterFrom, isPollTransportFailure } = require('./atlasErrorPolicy');
 const { adStage, formatElapsed } = require('./adStage');
 
@@ -278,6 +278,35 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
       );
     }
   }
+  // ── CHARGE POINT, PART 2: THE LEDGER ROW ─────────────────────────────────
+  // Same reasoning as the receipt above, applied to spend. Every other
+  // recordFlatCost on this path fires INSIDE the poll loop or in chargedError,
+  // so a process death mid-poll — a deploy SIGTERM, an OOM, an autoscale
+  // replacement — writes NOTHING. The money is already gone at this point.
+  //
+  // MEASURED 2026-08-05, which is why this exists: nine gpt-image-2/edit
+  // predictions submitted at 17:01-17:02 were killed mid-poll by a deploy.
+  // Atlas confirms all nine COMPLETED and bills $0.5663 total. CostLog held
+  // ZERO rows for them. Unledgered spend is the direction that can never be
+  // reconciled, because nothing knows to go looking for it.
+  //
+  // atlasVideoService already does exactly this at its own charge point, for
+  // exactly this reason ("previously written only after poll + download +
+  // upload succeeded, so a timeout or a failed upload spent ~$1.00 and
+  // recorded $0"). Images simply never got the same treatment.
+  //
+  // ONE row per billable submit. The success and failure branches below use the
+  // SAME providerRequestId, and recordFlatCost/reconcileCost upsert on it, so
+  // the outcome refines this row rather than adding a second one that would
+  // double-count the charge. costSource stays 'estimated' until the settled
+  // price is read back — per the owner rule, an estimate is never presented as
+  // a confirmed charge.
+  recordFlatCost({
+    ...meta, provider: 'atlas', model, providerRequestId: id,
+    costUsd: await priceFor(model), costSource: 'estimated',
+    durationMs: Date.now() - t0, status: 'submitted'
+  }).catch?.(() => {});
+
   let lastStatus = null;
   let transientPolls = 0;   // backoff counter for throttles seen while polling
   let pollCount = 0;
@@ -402,7 +431,7 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
       // task and never bills a rejection, and we confirmed data.price is null on
       // a failed prediction — so these rows sit at $0 but stay VISIBLE.
       const charged = policy.charged === true;
-      recordFlatCost({
+      finalizeFlatCost({
         ...meta, provider: 'atlas', model, providerRequestId: id,
         costUsd: charged ? await priceFor(model) : 0,
         costSource: charged ? 'estimated' : 'none',
@@ -440,7 +469,7 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
       // follow-up read, rather than block returning a finished image on telemetry.
       const actual = Number(poll.data.data.price);
       const haveActual = Number.isFinite(actual) && actual > 0;
-      recordFlatCost({
+      finalizeFlatCost({
         ...meta, provider: 'atlas', model, providerRequestId: id,
         costUsd: haveActual ? actual : await priceFor(model),
         costSource: haveActual ? 'actual' : 'estimated',
@@ -529,7 +558,7 @@ async function chargedError(message, predictionId, model, meta, t0) {
   // This is the genuinely-charged path, and the catalog estimate understates the
   // real figure by ~6x on this model — so tag it and reconcile, or "paid but got
   // nothing" ends up the most under-reported spend in the ledger.
-  recordFlatCost({
+  finalizeFlatCost({
     ...meta, provider: 'atlas', model, providerRequestId: predictionId,
     costUsd, costSource: 'estimated',
     durationMs: Date.now() - t0, status: 'charged-no-output',

@@ -189,6 +189,57 @@ async function reconcileCost({ providerRequestId, costUsd }) {
   }
 }
 
+/**
+ * Refine the ledger row for a submit that has already been recorded, IN PLACE.
+ *
+ * WHY THIS EXISTS (2026-08-05). Media paths now write a row at the CHARGE POINT —
+ * the moment the provider accepts a billable job — because everything after that
+ * (poll, download, upload) can be lost to a deploy SIGTERM or an OOM, and the money
+ * is already gone. Measured: nine gpt-image-2/edit predictions killed mid-poll,
+ * $0.5663 confirmed billed by Atlas, ZERO CostLog rows.
+ *
+ * But `recordFlatCost` INSERTS (persistCost -> CostLog.create). Calling it again
+ * when the outcome lands would leave TWO rows for one submit and DOUBLE-COUNT the
+ * charge — turning a reporting gap into a reporting lie, which is worse. So the
+ * outcome updates the existing row instead of adding one.
+ *
+ * Keyed on providerRequestId, which is unique per billable submit. A non-empty id
+ * is REQUIRED: upserting on a null key would collapse every id-less call (all the
+ * per-token LLM rows) into a single shared row. When there is no id, the caller
+ * genuinely wants an insert, so this falls back to recordFlatCost.
+ *
+ * Upserts rather than pure-updates so a caller whose charge-point write failed
+ * (it is fire-and-forget) still ends up with a row rather than silently none.
+ */
+async function finalizeFlatCost(meta = {}) {
+  const id = meta.providerRequestId;
+  if (!id) return recordFlatCost(meta);
+  const raw = meta.status || 'ok';
+  const status = CostLog.COST_STATUSES.includes(raw) ? raw : 'error';
+  try {
+    await CostLog.updateOne(
+      { providerRequestId: id },
+      { $set: {
+          status,
+          costUsd:      Number(meta.costUsd) || 0,
+          costSource:   meta.costSource || 'estimated',
+          durationMs:   meta.durationMs ?? null,
+          errorMessage: meta.errorMessage || null
+      } },
+      { upsert: false }
+    ).then(async (res) => {
+      const n = res.matchedCount ?? res.n ?? 0;
+      // No charge-point row (its fire-and-forget write lost a race with the
+      // process, or this is a legacy caller): fall back to an insert so the
+      // spend is recorded rather than dropped.
+      if (!n) await recordFlatCost(meta);
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  costTracker: finalize failed for ${id} (${err.message}) — falling back to insert`);
+    await recordFlatCost(meta).catch(() => {});
+  }
+}
+
 async function persistCost(record) {
   // Normalise the outcome BEFORE validation. An unrecognised status used to fail
   // mongoose validation, and the catch below swallowed it, so the entire cost row
@@ -346,6 +397,7 @@ module.exports = {
   trackLlmCall,
   recordCacheHit,
   recordFlatCost,
+  finalizeFlatCost,
   reconcileCost,
   MODEL_RATES,
   VISION_IMAGE_COST_PER_IMAGE_USD,
