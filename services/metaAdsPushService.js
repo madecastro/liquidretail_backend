@@ -407,5 +407,6 @@ async function listAdsetsForBrand(brandId) {
 module.exports = {
   pushAdsBatch,
   listAdsetsForBrand,
-  mapCtaTextToEnum     // exported for tests / direct use
+  mapCtaTextToEnum,    // exported for tests / direct use
+  resolveMetaAdsCred   // read-only cred+token resolution; metaAdsFontService reuses it
 };

@@ -69,8 +69,14 @@ const brandSchema = new mongoose.Schema({
   fontFamily:     String,
   // Provenance of fontFamily — drives the "(suggested)" UI hint and
   // lets curation distinguish a real brand font from an approximation.
+  // 'tailwind'    — read out of the site's Tailwind config / CSS custom props
   // 'brandfetch'  — pulled from Brandfetch's brand-kit API
   // 'scraped'     — parsed from a Google Fonts <link> on the homepage
+  // 'website'     — promoted from a face brandFontIngestService actually
+  //                 ingested and mirrored (the strongest signal: we hold the
+  //                 file). Set by brandFontPersistenceService.
+  // 'meta-ads'    — identified by a vision model in the brand's own Meta ad
+  //                 creatives (metaAdsFontService). A NAME, not a file.
   // 'suggested'   — GPT-4.1 derived from brand tone/summary (best-effort)
   // 'tone-default'— hardcoded tone→font safety net when GPT also failed
   // 'curated'     — set explicitly by a human via PATCH /api/brand/:id
@@ -79,7 +85,7 @@ const brandSchema = new mongoose.Schema({
   // validation. Mongoose's enum check rejects null even on non-
   // required fields when a default isn't matched, so we explicitly
   // allow it here.
-  fontSource:     { type: String, enum: ['tailwind', 'website', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
+  fontSource:     { type: String, enum: ['tailwind', 'website', 'meta-ads', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
   tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
   hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
   tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')
@@ -406,6 +412,23 @@ const brandSchema = new mongoose.Schema({
   // resolution does not repeatedly crawl the storefront.
   fontIngestedAt: { type: Date, default: null },
   fontIngestError: { type: String, default: null },
+
+  // Typefaces IDENTIFIED (not downloaded) in the brand's own Meta ad creatives
+  // by metaAdsFontService — the second source for brands whose website hides
+  // its font behind a 403ing foundry CDN or a JS-injected stack.
+  // Shape: { heading, body: { family, confidence: 'high'|'medium'|'low',
+  //          closestGoogle } | null,
+  //          evidence: [{ family, role, confidence, closestGoogle, creativeId,
+  //          via: 'campaign-docs'|'connected'|'adlibrary', usableForExact }] }
+  // THIS IS A NAME, NEVER A FILE — a raster creative embeds no font. Only a
+  // 'high'-confidence entry may outrank a curated theme, and then only when the
+  // name resolves to an actual file; see buildFontLadders.
+  metaAdsFontUsage: { type: mongoose.Schema.Types.Mixed, default: null },
+  // Attempted, not necessarily successful — stamped even when no creative was
+  // found, so a coverage backfill does not re-pay the vision call every run.
+  // Mirrors the fontIngestedAt / fontIngestError pair above.
+  metaFontsIngestedAt: { type: Date, default: null },
+  metaFontsIngestError: { type: String, default: null },
 
   // Derived voice — structured profile extracted by
   // brandVoiceDerivationService from the brand's existing Meta/Google

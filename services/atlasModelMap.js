@@ -131,6 +131,14 @@ const MAP = Object.freeze({
   // regeneration for nothing. The ~$0.0094 delta per check is noise against the
   // $0.01–0.17 generation it protects.
   'ad-vision-qc':     { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
+  // Typeface identification from a brand's Meta ad creatives
+  // (metaAdsFontService). Same model and the same reason as 'ad-vision-qc': the
+  // task is fine-grained visual discrimination between similar letterforms, and
+  // the answer must arrive in a fixed JSON shape because a malformed verdict is
+  // consumed as "identified nothing". Kept as its OWN role rather than reusing
+  // 'ad-vision-qc' so either can be repointed without moving the other — the
+  // 'gpt-4.1' entry is shared by 11 services and that is exactly the trap.
+  'font-vision':      { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
   // NO 'quote-snippet' ROLE — deliberately removed, do not re-add it.
   // It mapped to openai/gpt-5-nano, which the benchmark above records as
   // HTTP 400 "router not found": listed in the catalog, not routable. A role

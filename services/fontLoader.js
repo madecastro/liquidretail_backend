@@ -12,17 +12,22 @@
 // @napi-rs/canvas has no woff/woff2 support. The GitHub mirror ships the
 // same TTFs Google indexes, at predictable paths.
 //
-// One-time cost: ~1-2s at first boot on a fresh container; subsequent
-// boots skip already-downloaded files. Non-blocking — server accepts
-// requests immediately; brand-script renders happen seconds-to-minutes
-// later, giving the download time to complete.
+// One-time cost: ~13MB / a few seconds at first boot on a fresh container;
+// subsequent boots skip already-downloaded files. Non-blocking — server
+// accepts requests immediately; brand-script renders happen
+// seconds-to-minutes later, giving the download time to complete.
 //
-// Curated list matches the README's 8 seed families (Inter, Montserrat,
-// GreatVibes, Cormorant, Antonio, Lora, PlayfairDisplay, DMSans) plus
-// the fallback families in brandEnrichmentService.TONE_FONT_MAP (Bebas
-// Neue, Anton, Oswald, IBM Plex Sans, Poppins, Nunito, Quicksand) plus
-// Cormorant Garamond (a distinct Google Fonts specimen the tone map
-// references separately from Cormorant).
+// THIS LIST IS THE CEILING ON MATCH QUALITY. fontResolverService's
+// LIBRARY_SUBSTITUTIONS can only ever answer with a face that exists here, so
+// every family absent from this list is a type class the matcher must
+// approximate with something from another class. That is why it grew 16 → 48.
+//
+// The original 16 were the README's 8 seed families (Inter, Montserrat,
+// GreatVibes, Cormorant, Antonio, Lora, PlayfairDisplay, DMSans) plus the
+// fallback families in brandEnrichmentService.TONE_FONT_MAP (Bebas Neue,
+// Anton, Oswald, IBM Plex Sans, Poppins, Nunito, Quicksand) plus Cormorant
+// Garamond (a distinct Google Fonts specimen the tone map references
+// separately from Cormorant).
 
 const fs    = require('fs').promises;
 const path  = require('path');
@@ -58,7 +63,74 @@ const FONTS = [
   { family: 'IBM Plex Sans',      file: 'IBMPlexSans.ttf',        aliases: ['IBMPlexSans'],                        slug: 'ibmplexsans',        remote: 'IBMPlexSans[wdth,wght].ttf' },
   { family: 'Poppins',            file: 'Poppins.ttf',            aliases: [],                                    slug: 'poppins',            remote: 'Poppins-Regular.ttf' },
   { family: 'Nunito',             file: 'Nunito.ttf',             aliases: [],                                    slug: 'nunito',             remote: 'Nunito[wght].ttf' },
-  { family: 'Quicksand',          file: 'Quicksand.ttf',          aliases: [],                                    slug: 'quicksand',          remote: 'Quicksand[wght].ttf' }
+  { family: 'Quicksand',          file: 'Quicksand.ttf',          aliases: [],                                    slug: 'quicksand',          remote: 'Quicksand[wght].ttf' },
+
+  // ── EXPANSION 16 → 48 (2026-08-04) ────────────────────────────────────
+  // The substitution table can only target faces that live HERE, so with 16
+  // faces a brand's proprietary typeface had at most 16 possible answers and
+  // whole type classes had none: no slab (Rockwell/Archer fell to Lora), no
+  // mono, no true fashion didone, one script. Each entry below closes a class
+  // the matcher could previously only approximate badly.
+  // Every remote below was HTTP-200 + TTF-magic verified against the mirror
+  // before landing — a wrong filename yields an HTML 404 body, which
+  // ensureFont's '<' guard rejects, leaving the face silently absent and every
+  // substitution pointing at it dead at render time.
+
+  // Slab serif — previously NO true slab existed in the library.
+  { family: 'Zilla Slab',         file: 'ZillaSlab.ttf',          aliases: ['ZillaSlab'],                          slug: 'zillaslab',          remote: 'ZillaSlab-Regular.ttf' },
+  { family: 'Arvo',               file: 'Arvo.ttf',               aliases: [],                                    slug: 'arvo',               remote: 'Arvo-Regular.ttf' },
+  { family: 'Josefin Slab',       file: 'JosefinSlab.ttf',        aliases: ['JosefinSlab'],                        slug: 'josefinslab',        remote: 'JosefinSlab[wght].ttf' },
+
+  // Mono / technical — the old /mono/ rule resolved to a SANS (IBM Plex Sans).
+  { family: 'Space Mono',         file: 'SpaceMono.ttf',          aliases: ['SpaceMono'],                          slug: 'spacemono',          remote: 'SpaceMono-Regular.ttf' },
+  { family: 'IBM Plex Mono',      file: 'IBMPlexMono.ttf',        aliases: ['IBMPlexMono'],                        slug: 'ibmplexmono',        remote: 'IBMPlexMono-Regular.ttf' },
+  { family: 'JetBrains Mono',     file: 'JetBrainsMono.ttf',      aliases: ['JetBrainsMono'],                      slug: 'jetbrainsmono',      remote: 'JetBrainsMono[wght].ttf' },
+
+  // Editorial / text serif — Lora was carrying every editorial serif alone.
+  { family: 'Source Serif 4',     file: 'SourceSerif4.ttf',       aliases: ['SourceSerif4'],                       slug: 'sourceserif4',       remote: 'SourceSerif4[opsz,wght].ttf' },
+  { family: 'Merriweather',       file: 'Merriweather.ttf',       aliases: [],                                    slug: 'merriweather',       remote: 'Merriweather[opsz,wdth,wght].ttf' },
+  { family: 'Spectral',           file: 'Spectral.ttf',           aliases: [],                                    slug: 'spectral',           remote: 'Spectral-Regular.ttf' },
+
+  // Geometric sans
+  { family: 'Outfit',             file: 'Outfit.ttf',             aliases: [],                                    slug: 'outfit',             remote: 'Outfit[wght].ttf' },
+  { family: 'Manrope',            file: 'Manrope.ttf',            aliases: [],                                    slug: 'manrope',            remote: 'Manrope[wght].ttf' },
+  { family: 'Space Grotesk',      file: 'SpaceGrotesk.ttf',       aliases: ['SpaceGrotesk'],                       slug: 'spacegrotesk',       remote: 'SpaceGrotesk[wght].ttf' },
+
+  // Neo-grotesk sans — Inter was the single answer for every grotesk.
+  { family: 'Work Sans',          file: 'WorkSans.ttf',           aliases: ['WorkSans'],                           slug: 'worksans',           remote: 'WorkSans[wght].ttf' },
+  { family: 'Archivo',            file: 'Archivo.ttf',            aliases: [],                                    slug: 'archivo',            remote: 'Archivo[wdth,wght].ttf' },
+  { family: 'Public Sans',        file: 'PublicSans.ttf',         aliases: ['PublicSans'],                         slug: 'publicsans',         remote: 'PublicSans[wght].ttf' },
+
+  // Condensed sans
+  { family: 'Barlow Condensed',   file: 'BarlowCondensed.ttf',    aliases: ['BarlowCondensed'],                    slug: 'barlowcondensed',    remote: 'BarlowCondensed-Regular.ttf' },
+  { family: 'Archivo Narrow',     file: 'ArchivoNarrow.ttf',      aliases: ['ArchivoNarrow'],                      slug: 'archivonarrow',      remote: 'ArchivoNarrow[wght].ttf' },
+
+  // Wide / heavy display
+  { family: 'Archivo Black',      file: 'ArchivoBlack.ttf',       aliases: ['ArchivoBlack'],                       slug: 'archivoblack',       remote: 'ArchivoBlack-Regular.ttf' },
+  { family: 'Syne',               file: 'Syne.ttf',               aliases: [],                                    slug: 'syne',               remote: 'Syne[wght].ttf' },
+
+  // Rounded sans
+  { family: 'Baloo 2',            file: 'Baloo2.ttf',             aliases: ['Baloo2'],                             slug: 'baloo2',             remote: 'Baloo2[wght].ttf' },
+  { family: 'Comfortaa',          file: 'Comfortaa.ttf',          aliases: [],                                    slug: 'comfortaa',          remote: 'Comfortaa[wght].ttf' },
+
+  // Script / handwritten — Great Vibes (formal copperplate) was the only script.
+  { family: 'Dancing Script',     file: 'DancingScript.ttf',      aliases: ['DancingScript'],                      slug: 'dancingscript',      remote: 'DancingScript[wght].ttf' },
+  { family: 'Pacifico',           file: 'Pacifico.ttf',           aliases: [],                                    slug: 'pacifico',           remote: 'Pacifico-Regular.ttf' },
+  { family: 'Caveat',             file: 'Caveat.ttf',             aliases: [],                                    slug: 'caveat',             remote: 'Caveat[wght].ttf' },
+
+  // Didone / fashion serif — the DTC premium default, previously all Playfair.
+  { family: 'Prata',              file: 'Prata.ttf',              aliases: [],                                    slug: 'prata',              remote: 'Prata-Regular.ttf' },
+  { family: 'Italiana',           file: 'Italiana.ttf',           aliases: [],                                    slug: 'italiana',           remote: 'Italiana-Regular.ttf' },
+  { family: 'DM Serif Display',   file: 'DMSerifDisplay.ttf',     aliases: ['DMSerifDisplay'],                     slug: 'dmserifdisplay',     remote: 'DMSerifDisplay-Regular.ttf' },
+  { family: 'Marcellus',          file: 'Marcellus.ttf',          aliases: [],                                    slug: 'marcellus',          remote: 'Marcellus-Regular.ttf' },
+
+  // Old-style serif
+  { family: 'EB Garamond',        file: 'EBGaramond.ttf',         aliases: ['EBGaramond'],                         slug: 'ebgaramond',         remote: 'EBGaramond[wght].ttf' },
+  { family: 'Fraunces',           file: 'Fraunces.ttf',           aliases: [],                                    slug: 'fraunces',           remote: 'Fraunces[SOFT,WONK,opsz,wght].ttf' },
+
+  // Luxury / inscriptional display
+  { family: 'Cinzel',             file: 'Cinzel.ttf',             aliases: [],                                    slug: 'cinzel',             remote: 'Cinzel[wght].ttf' },
+  { family: 'Tenor Sans',         file: 'TenorSans.ttf',          aliases: ['TenorSans'],                          slug: 'tenorsans',          remote: 'TenorSans-Regular.ttf' }
 ];
 
 function buildTtfUrl(entry) {

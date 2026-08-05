@@ -47,11 +47,11 @@ const {
 } = require('../services/fontResolverService');
 const { FONTS } = require('../services/fontLoader');
 
-// The 16 curated faces fontLoader ships — every one must be reachable.
-const CURATED_16 = FONTS.map((f) => f.family);
+// The curated faces fontLoader ships — every one must be reachable.
+const CURATED = FONTS.map((f) => f.family);
 
 console.log('\nverifyFontFallback — library-match classification + brand signals\n');
-console.log(`  curated faces = ${CURATED_16.length}\n`);
+console.log(`  curated faces = ${CURATED.length}\n`);
 
 // ── F. Foundry non-regression (role null = no body remap) ─────────────────
 // Fails if (3) is reverted.
@@ -94,7 +94,6 @@ check('S2 Self Modern is stable across roles for the face class (heading)', () =
 const REACH_CASES = [
   ['Helvetica', null, 'heading', 'Inter'],
   ['Self Modern', null, 'heading', 'Playfair Display'],
-  ['Slab Serif', null, 'body', 'Lora'],
   ['Elegant Luxe', null, 'heading', 'Cormorant'],
   ['Garamond', null, 'heading', 'Cormorant Garamond'],
   ['BrandX Proprietary', { brandSafety: { category: 'Athletic' }, tone: ['sport'] }, 'heading', 'Antonio'],
@@ -104,10 +103,61 @@ const REACH_CASES = [
   ['Display Poster Headline', null, 'heading', 'Bebas Neue'],
   ['Impact', null, 'heading', 'Anton'],
   ['DIN Condensed', null, 'heading', 'Oswald'],
-  ['Technical Mono', null, 'body', 'IBM Plex Sans'],
   ['BrandY Face', { tone: ['playful', 'friendly'] }, 'body', 'Poppins'],
   ['BrandZ Face', { brandSafety: { category: 'Food & CPG' }, tags: ['coffee'] }, 'body', 'Nunito'],
   ['Rounded Soft Sans', null, 'body', 'Quicksand'],
+  // Lora and IBM Plex Sans lost their ONLY name-table reach path in the 16 → 48
+  // expansion: 'Slab Serif' now resolves to a real slab and 'Technical Mono' to
+  // a real mono. Both faces are still very much in use — Lora is the serif
+  // body/quote face for most brand-signal categories, IBM Plex Sans owns
+  // plex/technical — so they are re-anchored to the paths that actually reach
+  // them now. Losing a reach case is how a face goes quietly dead.
+  ['House Serif Voice', { tone: ['minimal', 'clean'] }, 'body', 'Lora'],
+  ['Plex Technical UI', null, 'body', 'IBM Plex Sans'],
+
+  // ── The 32 faces added by the library expansion (2026-08-04) ────────────
+  // Every expectation below was resolved against the live table before being
+  // written here, not predicted from the patterns.
+  // Slab
+  ['Rockwell Bold', null, 'heading', 'Zilla Slab'],
+  ['Egyptian Slab', null, 'heading', 'Arvo'],
+  ['Josefin Slab', null, 'heading', 'Josefin Slab'],
+  // Mono
+  ['Space Mono', null, 'heading', 'Space Mono'],
+  ['Technical Mono', null, 'body', 'IBM Plex Mono'],
+  ['JetBrains Mono', null, 'heading', 'JetBrains Mono'],
+  // Editorial / text serif
+  ['Tiempos Text', null, 'body', 'Source Serif 4'],
+  ['Georgia', null, 'body', 'Merriweather'],
+  ['GT Sectra', null, 'heading', 'Spectral'],
+  // Geometric / grotesk sans
+  ['Gilroy', null, 'heading', 'Outfit'],
+  ['Satoshi', null, 'heading', 'Manrope'],
+  ['Clash Grotesk', null, 'heading', 'Space Grotesk'],
+  ['Aktiv Grotesk', null, 'heading', 'Work Sans'],
+  ['Archivo', null, 'heading', 'Archivo'],
+  ['Public Sans', null, 'heading', 'Public Sans'],
+  // Condensed / wide
+  ['Barlow Condensed', null, 'heading', 'Barlow Condensed'],
+  ['Knockout', null, 'heading', 'Archivo Narrow'],
+  ['Archivo Black', null, 'heading', 'Archivo Black'],
+  ['Extended Wide Face', null, 'heading', 'Syne'],
+  // Rounded
+  ['VAG Rounded', null, 'heading', 'Baloo 2'],
+  ['Comfortaa', null, 'heading', 'Comfortaa'],
+  // Script / hand
+  ['Snell Roundhand', null, 'heading', 'Dancing Script'],
+  ['Lobster', null, 'heading', 'Pacifico'],
+  ['Comic Sans', null, 'heading', 'Caveat'],
+  // Didone / fashion / old-style / luxury
+  ['Domaine Display', null, 'heading', 'Prata'],
+  ['Reckless', null, 'heading', 'Italiana'],
+  ['Noe Display', null, 'heading', 'DM Serif Display'],
+  ['Marcellus', null, 'heading', 'Marcellus'],
+  ['EB Garamond', null, 'heading', 'EB Garamond'],
+  ['Recoleta', null, 'heading', 'Fraunces'],
+  ['Trajan Pro', null, 'heading', 'Cinzel'],
+  ['Optima', null, 'heading', 'Tenor Sans'],
 ];
 
 const reached = new Map(); // family → first input label
@@ -126,8 +176,8 @@ for (const [req, brand, role, expect] of REACH_CASES) {
   });
 }
 
-check('R all 16 curated faces reachable', () => {
-  const missing = CURATED_16.filter((f) => !reached.has(f));
+check('R all curated faces reachable', () => {
+  const missing = CURATED.filter((f) => !reached.has(f));
   assert.strictEqual(
     missing.length,
     0,
@@ -135,10 +185,11 @@ check('R all 16 curated faces reachable', () => {
   );
 });
 
-// Extra: FONTS list length pin (if a 17th face is added, reachability must grow).
+// FONTS length pin: adding a face without a REACH case makes it dead weight —
+// the substitution table can name it but no input ever selects it.
 check('R curated list is exactly the fontLoader FONTS set', () => {
-  assert.strictEqual(CURATED_16.length, 16, `expected 16 faces, got ${CURATED_16.length}`);
-  for (const f of CURATED_16) {
+  assert.strictEqual(CURATED.length, 48, `expected 48 faces, got ${CURATED.length}`);
+  for (const f of CURATED) {
     assert.ok(reached.has(f), `face ${f} not produced by REACH_CASES`);
   }
 });
@@ -222,14 +273,61 @@ check('B3 body+Impact remaps away from Anton', () => {
   assert.notStrictEqual(pick.family, 'Anton');
   assert.ok(/body-safe/i.test(pick.matchReason), pick.matchReason);
 });
+// B1 asserts against BODY_UNSAFE_FACES itself, so DELETING a face from that set
+// makes B1 pass trivially — the face is then no longer "unsafe" by definition
+// and ships on paragraph copy. This list is the independent statement of which
+// faces must never be body copy, whatever the set happens to contain.
+const MUST_BE_BODY_UNSAFE = [
+  'Anton', 'Bebas Neue', 'Great Vibes', 'Antonio',
+  'Archivo Black', 'Syne',
+  'Prata', 'Italiana', 'DM Serif Display', 'Marcellus', 'Cinzel',
+  'Dancing Script', 'Pacifico', 'Caveat',
+];
+check('B4 the body-unsafe set contains every display/script face', () => {
+  const missing = MUST_BE_BODY_UNSAFE.filter((f) => !BODY_UNSAFE_FACES.has(f));
+  assert.strictEqual(missing.length, 0, `faces missing from BODY_UNSAFE_FACES: ${missing.join(', ')}`);
+});
+// A body-unsafe SERIF must be replaced by a serif. The remap used to key only on
+// fallbackFor(requestedName): "Domaine Display" carries no serif token, so a
+// deliberate didone pick became a grotesk on body copy.
+const BODY_REMAP_CASES = [
+  ['Domaine Display', 'Lora'],   // didone → serif body face
+  ['Reckless', 'Lora'],          // fashion display serif → serif
+  ['Trajan Pro', 'Lora'],        // inscriptional → serif
+  ['Lobster', 'Lora'],           // script (serif-intent by convention) → serif
+  ['Archivo Black', 'Inter'],    // heavy SANS display → grotesk
+  ['Impact', 'Inter'],           // heavy sans display → grotesk
+];
+for (const [req, expect] of BODY_REMAP_CASES) {
+  check(`B5 body '${req}' remaps to ${expect} (class preserved)`, () => {
+    const pick = pickLibraryFamily(req, { role: 'body' });
+    assert.ok(pick, req);
+    assert.strictEqual(pick.family, expect, `got ${pick.family} (${pick.matchReason})`);
+    assert.ok(/body-safe/i.test(pick.matchReason), `remap must be logged: ${pick.matchReason}`);
+  });
+}
 
 // ── C. Classification vocabulary smoke ────────────────────────────────────
+// These exercise the CLASSIFICATION rows specifically. The REACH cases above
+// mostly enter through named commercial rows, so a classification row can be
+// retargeted to a face from the wrong type class and every REACH case still
+// passes — that gap let a `slab → Lora` regression through unnoticed once.
 const CLASS_CASES = [
   ['Geometric Sans', 'Montserrat'],
   ['Humanist Sans', 'DM Sans'],
   ['Condensed Narrow', 'Oswald'],
-  ['Old-Style Serif', 'Cormorant Garamond'],
+  ['Old-Style Serif', 'EB Garamond'],   // retargeted: we now ship the real EB Garamond
   ['Didone', 'Playfair Display'],
+  // A name saying "slab" must resolve to an actual slab serif, never to a
+  // transitional serif standing in for one.
+  ['House Slab Text', 'Zilla Slab'],
+  // "mono" must resolve to a MONOSPACE face. The single pre-split row sent
+  // every one of these to the proportional IBM Plex Sans.
+  ['Akkurat Mono', 'IBM Plex Mono'],
+  ['Courier Next', 'IBM Plex Mono'],
+  // …while plex/technical without "mono" stays on the proportional sans.
+  ['Technical Grade UI', 'IBM Plex Sans'],
+  ['Extended Wide Face', 'Syne'],
 ];
 for (const [req, expect] of CLASS_CASES) {
   check(`C class '${req}' → ${expect}`, () => {
@@ -265,17 +363,17 @@ check('P3 foundry → commercial → classification block order', () => {
   assert.ok(sohneIdx < modernIdx, 'commercial before classification');
 });
 
-// ── T. Every substitution TARGET is one of the curated 16 ─────────────────
+// ── T. Every substitution TARGET is one of the curated library faces ──────
 // Catches a hallucinated / misspelled library face that would 404 at render.
-check('T1 every LIBRARY_SUBSTITUTIONS.family is in curated 16', () => {
-  const curated = new Set(CURATED_16);
+check('T1 every LIBRARY_SUBSTITUTIONS.family is in the curated library', () => {
+  const curated = new Set(CURATED);
   const bad = [];
   for (const row of LIBRARY_SUBSTITUTIONS) {
     if (!curated.has(row.family)) {
       bad.push(`${row.family} (reason=${row.reason})`);
     }
   }
-  assert.strictEqual(bad.length, 0, `targets outside curated 16: ${bad.join('; ')}`);
+  assert.strictEqual(bad.length, 0, `targets outside the curated library: ${bad.join('; ')}`);
 });
 
 // ── M. Commercial DTC name → sensible library face ───────────────────────
@@ -288,15 +386,15 @@ const COMMERCIAL_CASES = [
   ['GT America', 'Inter'],
   ['Untitled Sans', 'Inter'],
   ['Canela', 'Playfair Display'],
-  ['Tiempos Text', 'Lora'],
+  ['Tiempos Text', 'Source Serif 4'],
   ['Graphik', 'Inter'],
   ['Suisse Int\'l', 'Inter'],
   ['Maison Neue', 'Montserrat'],
   ['Aeonik', 'Montserrat'],
   ['National 2', 'DM Sans'],
   ['Neue Montreal', 'Inter'],
-  ['Recoleta', 'Cormorant'],
-  ['Domaine Display', 'Playfair Display'],
+  ['Recoleta', 'Fraunces'],
+  ['Domaine Display', 'Prata'],
   ['Druk', 'Bebas Neue'],
   ['GT Walsheim', 'Montserrat'],
   ['Whyte', 'Inter'],

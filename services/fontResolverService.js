@@ -1,15 +1,25 @@
 // Resolves the actual font FILES the Remotion titling engine renders with.
 //
-// Resolution order per role (heading/body/quote):
-//   1. explicit Brand.styleTheme.<role>FontFamily override
-//   2. Brand.customFonts — font files ingested from the brand's own website
-//      (brandFontIngestService), mirrored on Cloudinary
-//   3. Brand.fontFamily (the enrichment scan's family) — fetched live from
-//      Google Fonts if it exists there
-//   4. curated defaults (Playfair Display / Inter / Lora)
-// Every fallthrough below step 1 is logged so "brand rendered with default
-// fonts" is visible in ops instead of silently shipping off-brand — the
-// exact failure mode the 16-bundled-TTF canvas engine had.
+// TWO SEPARATE MECHANISMS — do not conflate them:
+//
+//   buildFontLadders() decides WHICH FAMILIES to try, in order, per role. See
+//   its own comment for the tier order and why it is load-bearing. The headline
+//   rule: the brand's REAL face (ingested file, or a family Google actually
+//   serves) outranks a curated theme guess, but only when it resolves EXACTLY —
+//   a tone-matched library substitution is not the brand's typeface and must
+//   never outrank a curated choice.
+//
+//   resolveFamily() resolves ONE family to a file:
+//     1. Brand.customFonts — a file ingested from the brand's own website
+//        (brandFontIngestService), mirrored on Cloudinary. Licence holds
+//        respected via matchCustomFont.
+//     2. Google Fonts, fetched live, if the family exists there.
+//     3. LIBRARY_SUBSTITUTIONS → the closest face in fontLoader's curated
+//        library. Marked `exact: false` — this is an APPROXIMATION, and callers
+//        that require the real face reject it.
+//   Anything reaching step 3 is logged, so "brand rendered with an approximated
+//   face" is visible in ops instead of silently shipping off-brand — the exact
+//   failure mode the bundled-TTF canvas engine had.
 //
 // Fonts are downloaded once into FONT_CACHE_DIR and referenced by LOCAL
 // path; remotionRenderService serves them to the render browser over its
@@ -378,6 +388,19 @@ const LIBRARY_SUBSTITUTIONS = [
   // obfuscation). Every target MUST be one of the 16 curated faces in
   // fontLoader.FONTS — a target outside that list 404s at render. Foundry
   // rows above still win first for overlaps (e.g. Circular → DM Sans).
+  // ── MONO FIRST. A monospace cut must never resolve to a proportional face. ──
+  // Named mono specimens, then a catch-all. This cluster sits ABOVE the rest of
+  // the commercial rows on purpose: AllBirds ingests "Akkurat Mono", and with
+  // the /\bakkurat\b/ row winning it resolved to Inter — a proportional sans
+  // standing in for a monospace face, so tabular copy lost its alignment.
+  // Monospace-ness dominates a foundry's proportional identity.
+  // `\bmono\b` requires the standalone word, so "Monument Grotesk" and
+  // "Monotype" are unaffected.
+  { pattern: /space\s*mono/i, family: 'Space Mono', reason: 'Space Mono → the library specimen itself' },
+  { pattern: /(?:ibm\s*)?plex\s*mono/i, family: 'IBM Plex Mono', reason: 'IBM Plex Mono → the library specimen itself' },
+  { pattern: /jetbrains\s*mono/i, family: 'JetBrains Mono', reason: 'JetBrains Mono → the library specimen itself' },
+  { pattern: /input\s*mono|sf\s*mono|source\s*code/i, family: 'IBM Plex Mono', reason: 'system/dev mono → IBM Plex Mono' },
+  { pattern: /\bmono\b/i, family: 'IBM Plex Mono', reason: 'foundry mono cut → IBM Plex Mono (monospace beats the proportional row)' },
   { pattern: /s[oö]hne|soehne/i, family: 'Inter', reason: 'Söhne → Inter (Klim neo-grotesk)' },
   { pattern: /gt\s*america/i, family: 'Inter', reason: 'GT America → Inter (Grilli American grotesque)' },
   { pattern: /untitled\s*sans/i, family: 'Inter', reason: 'Untitled Sans → Inter (Klim neo-grotesk)' },
@@ -428,11 +451,6 @@ const LIBRARY_SUBSTITUTIONS = [
   { pattern: /rockwell|archer|sentinel|museo\s*slab|clarendon/i, family: 'Zilla Slab', reason: 'Rockwell/Archer/Sentinel → Zilla Slab (true slab)' },
   { pattern: /egyptian\s*slab|\bcandida\b/i, family: 'Arvo', reason: 'Egyptian slab → Arvo' },
   { pattern: /josefin\s*slab/i, family: 'Josefin Slab', reason: 'Josefin Slab → the library specimen itself' },
-  // Mono — named faces before the classification /mono/ row.
-  { pattern: /space\s*mono/i, family: 'Space Mono', reason: 'Space Mono → the library specimen itself' },
-  { pattern: /(?:ibm\s*)?plex\s*mono/i, family: 'IBM Plex Mono', reason: 'IBM Plex Mono → the library specimen itself' },
-  { pattern: /jetbrains\s*mono/i, family: 'JetBrains Mono', reason: 'JetBrains Mono → the library specimen itself' },
-  { pattern: /input\s*mono|sf\s*mono|source\s*code/i, family: 'IBM Plex Mono', reason: 'system/dev mono → IBM Plex Mono' },
   // Editorial / text serif
   { pattern: /\bogg\b/i, family: 'DM Serif Display', reason: 'Ogg → DM Serif Display (Sharp Type display serif)' },
   { pattern: /\breckless\b/i, family: 'Italiana', reason: 'Reckless → Italiana (fashion display serif)' },
@@ -658,7 +676,15 @@ function roleKey(role) {
  */
 function enforceBodyLegibility(family, intent) {
   if (!BODY_UNSAFE_FACES.has(family)) return { family, remapped: false };
-  if (intent === 'serif') {
+  // The CHOSEN face is a better signal than the requested name's serif
+  // heuristic, and it decides the replacement's class. `intent` comes from
+  // fallbackFor(requestedFamily), which reads a *name*: "Domaine Display" has no
+  // serif token, so intent is sans — yet the name table deliberately resolved it
+  // to Prata, a didone. Keying the remap on intent alone swapped a requested
+  // serif voice for a grotesk. Before the library expansion this was invisible
+  // (Domaine → Playfair, which is body-safe, so no remap ran at all); adding
+  // body-unsafe serifs made it reachable.
+  if (intent === 'serif' || LIBRARY_SERIF_FACES.has(family)) {
     return { family: 'Lora', remapped: true };
   }
   // Sans display/script → neutral grotesk (never a second display face).
@@ -927,6 +953,33 @@ function buildFontLadders(brand, { overrides = {}, layoutInputBrand = null } = {
     ? scannedFamily
     : null;
 
+  // FONTS IDENTIFIED IN THE BRAND'S OWN META ADS (metaAdsFontService).
+  //
+  // This is a NAME a vision model read off a raster creative, never a file, so
+  // it enters at two different strengths:
+  //   · HIGH confidence → an exact-only tier just under the scraped face. The
+  //     ads are the brand's own published work, so a confidently-named face we
+  //     can actually serve is the brand's real typeface — the same reasoning
+  //     that promotes the scraped family. Still exact-only: if the name only
+  //     reaches a library substitution it is a guess about a guess and loses to
+  //     a curated theme.
+  //   · ANY confidence → a substitutable tier below website usage, where it is
+  //     better than nothing but cannot displace a curated choice.
+  // Both are subject to the same theme-pairing guard as scannedPromoted: if the
+  // curated theme already names this face, the pairing already accounts for it.
+  const metaUsage = brand?.metaAdsFontUsage || {};
+  const metaFace = (role) => {
+    const face = metaUsage[role] || null;
+    const family = normalizeFontFamily(face?.family);
+    if (!family || themeFamilies.includes(familyKey(family))) return { exactOnly: null, weak: null };
+    // Trust the flag the identification service computed; fall back to reading
+    // the confidence directly for documents written before it existed.
+    const high = face.usableForExact === true || String(face.confidence).toLowerCase() === 'high';
+    return { exactOnly: high ? family : null, weak: family };
+  };
+  const metaHeading = metaFace('heading');
+  const metaBody = metaFace('body');
+
   // AN ORDERED LADDER OF CANDIDATES, NOT ONE PRE-PICKED WINNER.
   //
   // This used to collapse the whole cascade to a single family and then fall
@@ -968,20 +1021,24 @@ function buildFontLadders(brand, { overrides = {}, layoutInputBrand = null } = {
       [overrides.heading?.family, false],
       [ownFace, true],
       [scannedPromoted, true],
+      [metaHeading.exactOnly, true],
       [themeHeading, false],
       [fontIsCurated ? scanned : null, false],
       [tailwind?.fonts?.heading, false],
       [websiteUsage.heading, false],
+      [metaHeading.weak, false],
       [sharedFamily, false],
     ],
     body: [
       [overrides.body?.family, false],
       [ownFace, true],
       [scannedPromoted, true],
+      [metaBody.exactOnly, true],
       [themeBody, false],
       [fontIsCurated ? scanned : null, false],
       [tailwind?.fonts?.body, false],
       [websiteUsage.body, false],
+      [metaBody.weak, false],
       [sharedFamily, false],
     ],
     // Quote keeps theme priority: serifFontFamily is a deliberate pairing choice

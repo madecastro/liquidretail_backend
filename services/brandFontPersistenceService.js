@@ -82,8 +82,32 @@ function applyFontIngestResult(brand, result, { error = null } = {}) {
   return brand;
 }
 
+/**
+ * Persist a metaAdsFontService result. Deliberately NARROWER than
+ * applyFontIngestResult: it writes the observation and the attempt stamp, and
+ * that is all.
+ *
+ * It does NOT touch fontFamily/fontSource. The website path may promote,
+ * because it promotes a family whose FILE we hold. This path only holds a NAME
+ * a vision model read off a JPEG — writing it into fontFamily would put a guess
+ * into the field the whole resolver treats as the brand's scanned face, ahead of
+ * a curated theme. The name reaches resolution through the ladder's exact-only
+ * tier instead, where it must resolve to a real file to win anything.
+ */
+function applyMetaFontsResult(brand, result, { error = null } = {}) {
+  brand.metaAdsFontUsage = result?.usage || brand.metaAdsFontUsage || null;
+  // Stamped even on a miss, so a coverage backfill does not re-pay the vision
+  // call for a brand that genuinely has no ads.
+  brand.metaFontsIngestedAt = new Date();
+  brand.metaFontsIngestError =
+    error || (result?.errors?.length ? result.errors.join('; ').slice(0, 2000) : null);
+  brand.markModified?.('metaAdsFontUsage');
+  return brand;
+}
+
 module.exports = {
   normalizeFamily,
   mergeFontEntries,
+  applyMetaFontsResult,
   applyFontIngestResult
 };

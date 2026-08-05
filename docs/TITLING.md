@@ -55,7 +55,7 @@ Remotion render pipeline (ad.veoVideoUrl → Ad.renderUrl):
 - Return {finalPath, tempDir, timings}; caller uploads and rmdir. Timings include `placementMode`.
 - Stills fast lane: `enqueueStill` (separate tail) for `renderPreview` (scale=0.5, no audio, optional stillTimesSec via renderStill).
 
-Loopback asset server (services/remotionRenderService.js): http on 127.0.0.1, serves /jobs/<jobId>/ (plate/logo) and /fonts/ (from FONT_CACHE_DIR), full Range support, CORS * for fonts.
+Loopback asset server (services/remotionRenderService.js): http on 127.0.0.1, serves /jobs/<jobId>/ (plate/logo), /fonts/ (from FONT_CACHE_DIR — google + custom website faces) and /libfonts/ (from fontLoader FONTS_DIR — the 48 curated library faces); full Range support, CORS * for fonts INCLUDING on the 404 branch. The two font dirs need two routes: a library-match resolves into FONTS_DIR, and mapping only /fonts/ meant every library-match 404'd, which cancelRender turned into a fatal render failure (see scripts/verifyFontServing.js).
 
 ## 2) The Title Style Spec
 
@@ -196,13 +196,100 @@ Colors (first hit):
 - layoutInputBrand.*_color.
 - Hard defaults (primary #0B0F14, accent #F5B70A, etc.). textOnLight/textSecondaryOnLight for plate contrast flips.
 
-Fonts (`services/fontResolverService.js` `resolveBrandFonts`):
-- Ladder per role (heading/body/quote): overrides (from spec.tokenOverrides.fonts) > theme.<role>FontFamily > customFonts > scanned fontFamily (Google) > DEFAULT_ROLE_FONTS.
-- `resolveFamily`: matchCustomFont (brand.customFonts, license !== 'commercial', weight/style sort) → resolveCustomFont (download to FONT_CACHE_DIR).
-- else resolveGoogleFamily (css2, pickLatinFace for U+0000-00FF subset only, CACHE_VER bust, download woff2).
-- else default (Playfair Display/Inter/Lora); logs 🔤 on fallback.
-- Website ingestion: customFonts from brandFontIngestService (Cloudinary raw mirror); remoteUrl kept for frontend @remotion/player.
-- Output: {family, weight, style, url:localPath, remoteUrl, fallback, source}; remotionRenderService rewrites url to asset-server before browser.
+Fonts (`services/fontResolverService.js`) — TWO mechanisms, do not conflate:
+
+**A. `buildFontLadders(brand)` — WHICH families to try, in order. Pure, no network.**
+Per-role ordered list of `[family, requireExact]`. `requireExact` means the tier is
+rejected if the family resolves only to a library SUBSTITUTION — a tone-matched
+lookalike is not the brand's typeface and must not outrank a curated choice.
+
+heading/body: `overrides` > `ownFace`* > `scannedPromoted`* > `metaAds.heading`(high-conf)*
+ > `theme.<role>FontFamily` > curated `fontFamily` > tailwind > websiteUsage
+ > `metaAds.heading`(any conf) > sharedFamily.  (* = exact-only)
+quote: `overrides` > `theme.quoteFontFamily` > websiteUsage.quote > sharedFamily.
+Quote never receives a brand/ad face — serifFontFamily is a deliberate pairing.
+
+TIER ORDER IS LOAD-BEARING. Two cases pin it in `scripts/verifyFontLadder.js`:
+- Pelagic: scanned `Oswald` (real Google family) must beat theme alias `Montserrat`.
+- AllBirds: `Self Modern` is licence-held → nothing to serve → curated `DM Sans` wins.
+Theme-pairing guard: if the curated theme already NAMES the scanned/ad face, no
+promotion happens — the pairing already accounts for it (Camelback: fontFamily
+`Lora` + theme serif `Lora` must not collapse a sans/serif pairing to one serif).
+
+**B. `resolveFamily(family)` — ONE family to a file.**
+1. `matchCustomFont` → `resolveCustomFont` (brand's own ingested face, Cloudinary
+   raw mirror → FONT_CACHE_DIR; `needsLicense` holds and the commercial gate
+   respected). `exact: true`.
+2. `resolveGoogleFamily` (css2, `pickLatinFace` for the U+0000-00FF subset,
+   CACHE_VER bust, download woff2). `exact: true`.
+3. `resolveLibraryMatch` → `LIBRARY_SUBSTITUTIONS` → closest face in the
+   **48-face** `fontLoader.FONTS` library. **`exact: false`** — an approximation.
+   Logged 🔤 unless the caller passed `quiet` (an exact-only tier that will reject
+   it — logging a face that never reached the render is worse than not logging).
+`resolveLadder` walks the ladder with this, returns the first acceptable entry, and
+falls back to the best substitution any tier produced if nothing resolves exactly.
+
+Library (`services/fontLoader.js`): **48 faces**, downloaded at boot from the
+google/fonts GitHub raw mirror (OFL only — `GH_BASE` hardcodes `ofl/`). This list is
+the CEILING on match quality: a substitution can only ever name a face that exists
+here. Grown 16 → 48 on 2026-08-04 to cover classes that previously had no target at
+all (slab, mono, fashion didone, casual script, wide display).
+Guards: `BODY_UNSAFE_FACES` (display/script never on paragraph copy; the remap
+preserves serif-vs-sans by inspecting the CHOSEN face, not the requested name) and
+`LIBRARY_SERIF_FACES` (must stay aligned with `SERIF_HINTS`).
+
+Sources of a family name: website `@font-face` ingest (`brandFontIngestService` →
+`Brand.customFonts`, REAL FILES) and Meta-ad identification (`metaAdsFontService` →
+`Brand.metaAdsFontUsage`, a NAME ONLY — see §Brand fonts from Meta ads below).
+
+Output per role: `{family, weight, style, url:localPath, remoteUrl, fallback,
+source, exact, requestedFamily, resolvedFamily, matchReason}`.
+`remotionRenderService` rewrites `url` to an asset-server URL before the browser.
+
+### Brand fonts from Meta ads (`services/metaAdsFontService.js`)
+
+Second font source for the common premium-DTC case where the website scan cannot
+get the file: the foundry CDN 403s us, or the stack is JS-injected so no
+`@font-face` is in the fetched HTML. The ads still show the typeface.
+
+**It produces a NAME, never a file** — a raster creative embeds no font. The name
+goes through ladder A above, so it is served exactly when we already hold the
+family and substituted otherwise.
+
+Creative gathering, free tiers first: persisted `Campaign.adSets[].ads[].creative
+.imageUrl` → the brand's connected ad account via Graph (`resolveMetaAdsCred`) →
+public Ad Library via Apify (**billable, and blank by default** —
+`APIFY_ADLIB_ACTOR` must be set to enable it; the run is ledgered via
+`recordFlatCost`, which no other Apify path in this repo does).
+Note catalog/DPA ad sets never persist a creative URL (`metaAdsCreativeMatcher`
+skips the creative fetch once a product set resolves), so the Graph tier is the
+normal path for the most product-shaped campaigns, not a rare fallback.
+
+Vision: ONE `chatCompletion` on role `'font-vision'` (→ `google/gemini-2.5-pro`),
+`response_format: json_object` (never `json_schema` — 400s on Anthropic routes),
+`visionImages` set to the real count so the per-image ledger surcharge is right.
+Never called with zero images. A malformed verdict degrades to "identified
+nothing"; it never throws and never fabricates a face.
+
+Only `confidence: 'high'` earns the exact-only ladder tier. Persistence
+(`applyMetaFontsResult`) deliberately does NOT write `fontFamily`/`fontSource` —
+that field is treated repo-wide as the brand's scanned face, and a name read off a
+JPEG is not that. Gated on `Brand.metaFontsIngestedAt`, stamped even on a miss so a
+coverage backfill does not re-pay the vision call.
+
+Config: `META_ADS_FONTS_ENABLED` (default true), `META_ADS_FONTS_MAX_IMAGES` (4),
+`META_ADS_FONTS_MODEL`, `APIFY_ADLIB_ACTOR` (blank), `APIFY_ADLIB_COST_USD`.
+
+### Auditing coverage
+
+`node scripts/backfillBrandFonts.js` — report mode, no writes. Per brand it prints
+the stamps AND what each role actually resolves to, because `fontIngestedAt` records
+an ATTEMPT, not a success: a brand can look fully ingested and still render three
+approximated faces. Verdicts: OK (all roles exact) / APPROX / APPROX-ALL / MISSING /
+ERROR. `--apply` re-runs the free website scan (calling `ingestBrandFonts` directly,
+NOT `enrichBrandFromUrl`, which would fire billable LLM tiers) and, only for brands
+still holding no usable face, the billable meta-ads step. `--matrix` lists healthy
+brands too; `--skip-meta` suppresses all spend; `--force-reingest` re-scans everyone.
 
 ## 4) Placement mode + plate intelligence
 
@@ -243,6 +330,10 @@ Threaded through `renderWithRemotionAndSave` → `renderTitles` / `renderPreview
 - `POST /retitle-videos` (+ `GET /retitle-videos/:jobId`) — batch re-title. Body `{adIds?: string[], dryRun?: boolean=false, concurrency?: number=2}` (concurrency clamped 1..4). Selects brand ads with `kind='video'` and non-null `veoVideoUrl`; optional `adIds` restricts (unknown/foreign ids reported in `errors`, not fatal). `dryRun` stays **synchronous** → `{count, ads:[{id, createdAt, renderUrl, veoVideoUrl}], errors?}`. Live is **async** (Netlify ~26s proxy cap; tens of seconds per ad): POST returns `202 {ok, jobId, status:'pending', count}`; poll `GET /:id/retitle-videos/:jobId` until `status` is `done` or `failed` (404 unknown/expired/wrong-brand; reaped 5 min after finish, same TTL as preview-script). Job transitions: `pending` → `running` with `progress:{done,total}` + accumulating `results`/`errors` → `done` (or `failed` + `error` for a catastrophic runner throw). Pool is concurrency-capped; per-ad try/catch calling `renderBrandScriptAndSave` (one failure never aborts the batch). Done payload fields: `{status, count, progress, results:[{id, ok, renderUrl?, skipped?, error?}], errors?, elapsedMs}`.
 - `POST /title-spec/modify` (+ poll) — natural-language spec editing: LLM (atlasTextService) gets schema + current spec + tokens, returns the full updated spec; validated with one repair retry; NOT persisted — operator previews then saves via `PATCH {titleStyleSpec}` (schema-validated again at write).
 - `POST /ingest-fonts` — website font scan → customFonts (merge by family/weight/style).
+- `POST /ingest-meta-fonts` — vision identification of the typefaces in the brand's own
+  Meta ads → metaAdsFontUsage. BILLABLE every call (an explicit operator request means
+  re-run, so unlike the enrichment tier it does not gate on metaFontsIngestedAt).
+  Body: `{maxImages?}`. Produces a NAME, not a file; never writes fontFamily.
 - Title Studio (frontend monorepo `frontend/app/src/titling/`) — @remotion/player renders the same composition island live in the browser: instant slider edits, AI modify, per-format save; fonts load from gstatic/Cloudinary remoteUrls. Island is a copy — source of truth is this repo's remotion/ (see island/README.md).
 
 ### Per-ad copy override (routes/ads.js)
@@ -262,7 +353,10 @@ Memory sizing: renders are memory-heavy (~1.5-3GB peak with headless Chrome; con
 Remotion licensing: Remotion 4 is commercially licensed for companies >3 people (remotion.pro — company license + per-render seats). Default engine is remotion — confirm license before production use. (`acknowledgeRemotionLicense` flags in code silence the console notice; they are not the license.)
 
 Troubleshooting:
-- Fonts fallback: 🔤 logs in fontResolverService.js (custom not ingested + not Google → default); check license !== 'commercial', latin-subset, CACHE_VER.
+- Fonts fallback: 🔤 logs in fontResolverService.js. A line naming a `library face` means the
+  brand rendered an APPROXIMATION, not its typeface — `source: 'library-match'`, `exact: false`.
+  Check `needsLicense` holds, the commercial gate, latin-subset, CACHE_VER.
+  For a whole-fleet view run `scripts/backfillBrandFonts.js` (report mode, no writes).
 - fps drift: eliminated by @remotion/media-parser probe (vs. canvas 24fps hardcode); safeFps clamped.
 - Stalled downloads: 45s watchdog in downloadToFile (remotionRenderService); 30s in font downloads.
 - Bundle/browser: warmup logs; bundlePromise reset on error; assetServer unref().
