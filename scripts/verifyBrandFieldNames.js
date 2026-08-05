@@ -90,10 +90,13 @@ function lineOf(src, idx) {
  * Do NOT hardcode the field list — the harness must track schema drift.
  * Ignores demographicSchema entirely (starts only at brandSchema).
  */
-function parseBrandSchemaFields(brandFileSrc) {
-  const marker = 'const brandSchema = new mongoose.Schema({';
+// `marker` is parameterised so the SAME parser covers any model — Group E
+// reuses it for catalogProductSchema. The trap being pinned (a `.select()` of
+// a path the schema does not declare, which mongoose resolves to `undefined`
+// in silence) is model-agnostic, so the check should be too.
+function parseBrandSchemaFields(brandFileSrc, marker = 'const brandSchema = new mongoose.Schema({') {
   const start = brandFileSrc.indexOf(marker);
-  if (start < 0) throw new Error('brandSchema declaration not found in models/Brand.js');
+  if (start < 0) throw new Error(`schema declaration not found for marker: ${marker}`);
   const openBrace = start + marker.length - 1;
   if (brandFileSrc[openBrace] !== '{') {
     throw new Error('expected `{` at end of brandSchema Schema( marker');
@@ -312,9 +315,11 @@ function matchParen(src, openIdx) {
  * Find Brand/BrandModel .find*().select('…') projections in a source file.
  * Returns [{ line, paths: string[], selectArg }].
  */
-function findBrandSelects(src) {
+// `modelAlt` is the alternation of model identifiers to scan for, parameterised
+// so Group E can reuse the whole finder for CatalogProduct.
+function findBrandSelects(src, modelAlt = 'Brand|BrandModel') {
   const results = [];
-  const callRe = /\b((?:Brand|BrandModel)\.(?:findById|findOne|find))\s*\(/g;
+  const callRe = new RegExp(`\\b((?:${modelAlt})\\.(?:findById|findOne|find))\\s*\\(`, 'g');
   let m;
   while ((m = callRe.exec(src)) !== null) {
     const openParen = m.index + m[0].length - 1;
@@ -543,6 +548,110 @@ check(
   'D3 aiCanvasSpecService ALLOWED_SLOTS still contains brand.logo',
   /ALLOWED_SLOTS\s*=\s*\[[\s\S]*?'brand\.logo'/.test(specSrc),
   "'brand.logo' is a slot-binding contract path against resolved layoutInput, not a Brand doc read"
+);
+
+// ── E. SAME TRAP, CatalogProduct ─────────────────────────────────────────
+// Group A pinned this for Brand and the identical bug then shipped on
+// CatalogProduct: brandScriptExecutor selected `reviewCount`, which
+// catalogProductSchema does not declare, so `catalogProduct.reviewCount` was
+// permanently `undefined` and every product-tier video ad rendered stars with
+// no review count. The generalised parser + finder above mean this group is the
+// same logic pointed at a second model, not a second copy of it.
+
+const catalogSrc = read('models/CatalogProduct.js');
+const catalogKeys = parseBrandSchemaFields(catalogSrc, 'const catalogProductSchema = new mongoose.Schema({');
+const catalogFieldSet = new Set([...catalogKeys, ...ALLOWED_BUILTINS]);
+
+check(
+  'E0 catalogProductSchema parse found a plausible field set',
+  catalogKeys.length >= 20
+    && catalogKeys.includes('title')
+    && catalogKeys.includes('rating')
+    && catalogKeys.includes('productReviews'),
+  `got ${catalogKeys.length} keys: ${catalogKeys.slice(0, 12).join(', ')}…`
+);
+
+// The specific absence that caused the bug. If someone later ADDS a real
+// top-level `reviewCount` to the schema, this check fails loudly and tells them
+// to revisit the productReviews-first precedence in buildMetaForAd rather than
+// silently ending up with two competing sources for one number.
+check(
+  'E1 catalogProductSchema still has NO top-level reviewCount',
+  !catalogKeys.includes('reviewCount'),
+  'reviewCount lives ONLY inside productReviews; if you add a top-level one, revisit brandScriptExecutor productSnapshot precedence'
+);
+
+// PRE-EXISTING undeclared selects, found by this group the first time it ran.
+// They are ALLOWLISTED, not fixed, and deliberately so: these queries use
+// `.lean()`, and a lean projection of an undeclared path still returns whatever
+// the raw MongoDB document holds. So a legacy row written before the current
+// schema COULD legitimately carry one of these, and deleting the read without
+// querying production would be a silent data loss rather than a cleanup. Each
+// needs its own verified follow-up. Anything NOT on this list still fails, which
+// is the point — the list is closed, and adding to it should feel expensive.
+const CATALOG_SELECT_ALLOWLIST = new Map([
+  ['canonicalUrl', 'catalogProductReviewRefreshService: dead second arm of `productUrl || canonicalUrl`; productUrl (:118) is real and covers it'],
+  ['createdAt',    'routes/catalog.js: schema sets no `timestamps`, so this is only present on rows some other writer stamped'],
+  ['productImages', 'catalogProductLifestyleImageService: no writer anywhere in the repo — almost certainly fully dead'],
+  ['lifestyle_image', 'catalogProductLifestyleImageService: written on layoutInput/spec objects, not on CatalogProduct'],
+  ['size',         'routes/catalog.js: not declared; likely a legacy variant field'],
+]);
+
+const catalogSelectOffenders = [];
+for (const abs of scanFiles) {
+  const rel = path.relative(ROOT, abs);
+  const src = fs.readFileSync(abs, 'utf8');
+  for (const sel of findBrandSelects(src, 'CatalogProduct|CatalogModel')) {
+    for (const p of sel.paths) {
+      if (!catalogFieldSet.has(p) && !CATALOG_SELECT_ALLOWLIST.has(p)) {
+        catalogSelectOffenders.push(`${rel}:${sel.line} selects '${p}' — not a catalogProductSchema field`);
+      }
+    }
+  }
+}
+
+// The allowlist must not rot into a place where a real bug hides: every entry
+// has to still be undeclared. Once a field becomes real, its entry is removed.
+const staleAllowlist = [...CATALOG_SELECT_ALLOWLIST.keys()].filter((k) => catalogFieldSet.has(k));
+check(
+  'E2a the CatalogProduct select allowlist contains no now-real fields',
+  staleAllowlist.length === 0,
+  `these are declared on the schema now — drop them from the allowlist: ${staleAllowlist.join(', ')}`
+);
+check(
+  'E2 every CatalogProduct .select() path is a real catalogProductSchema field',
+  catalogSelectOffenders.length === 0,
+  catalogSelectOffenders.join('\n     ')
+);
+
+// Pin the fixed site directly: the video path must read the atomic pair out of
+// productReviews, and must NOT go back to selecting the phantom field.
+const execSrc = read('services/brandScriptExecutor.js');
+check(
+  'E3 brandScriptExecutor selects productReviews on CatalogProduct',
+  /\.select\('[^']*\bproductReviews\b[^']*'\)/.test(execSrc),
+  'the atomic rating+count pair comes from productReviews'
+);
+check(
+  'E4 brandScriptExecutor no longer selects the phantom top-level reviewCount',
+  !/\.select\('[^']*\breviewCount\b[^']*'\)/.test(execSrc),
+  'reviewCount is not a catalogProductSchema path — selecting it is a silent undefined'
+);
+check(
+  'E5 productSnapshot prefers productReviews over the top-level rating mirror',
+  /prHasRating/.test(execSrc)
+    && execSrc.indexOf('if (prHasRating)') < execSrc.indexOf('} else if (catalogHasRatingOrCount)'),
+  'productReviews is fresher and is the only container carrying a count'
+);
+// The rename is not cosmetic — gating on a RATING rather than on "any number" is
+// what stops a count-only productReviews from erasing a good top-level rating.
+check(
+  'E6 productReviews must carry a usable RATING to win, not merely a count',
+  /const prHasRating = !!pr && typeof pr\.rating === 'number';/.test(execSrc)
+    && !/typeof pr\.reviewCount === 'number'\s*\)?\s*;?\s*$/m.test(
+      (execSrc.match(/const prHasRating[^\n]*\n/) || [''])[0]
+    ),
+  'winning on count alone sets rating:null and erases the top-level rating — a proof regression'
 );
 
 // ── summary ──────────────────────────────────────────────────────────────
