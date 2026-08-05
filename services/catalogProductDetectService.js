@@ -83,7 +83,8 @@ async function enqueueProductDetect(product) {
     const heroMedia = await materializeImage({
       sourceUrl:    product.imageUrl,
       product,
-      imageRole:    'hero'
+      imageRole:    'hero',
+      feedIndex:    0
     });
     if (heroMedia) {
       heroMediaId = String(heroMedia._id);
@@ -99,12 +100,14 @@ async function enqueueProductDetect(product) {
     .filter(u => u && u !== product.imageUrl)
     .slice(0, MAX_ALT_IMAGES);
 
-  for (const altUrl of altUrls) {
+  for (let altPos = 0; altPos < altUrls.length; altPos++) {
+    const altUrl = altUrls[altPos];
     try {
       const altMedia = await materializeImage({
         sourceUrl:    altUrl,
         product,
-        imageRole:    'alt'
+        imageRole:    'alt',
+        feedIndex:    altPos + 1
       });
       if (altMedia) {
         const altMediaId = String(altMedia._id);
@@ -563,14 +566,23 @@ async function createDetectRunIfAbsent(media, product) {
 // (brandId, source, externalId) unique index. Brand-scoped so a
 // different brand's catalog with a coincidentally-matching synthetic
 // id can't collide.
-async function materializeImage({ sourceUrl, product, imageRole }) {
+async function materializeImage({ sourceUrl, product, imageRole, feedIndex = null }) {
   const externalId = `cp_${product._id}_${imageRole}_${hashShort(sourceUrl)}`;
 
   // Fast path — if the Media doc already exists, skip the Cloudinary
   // mirror (expensive) and return it. The mirror is best-effort
   // anyway; a prior successful pass already paid for it.
   const existing = await Media.findOne({ brandId: product.brandId, source: 'catalog-product', externalId });
-  if (existing) return existing;
+  if (existing) {
+    // Backfill feedIndex on a doc materialized before this field existed —
+    // metadata-only, no re-mirror. Leaves an already-stamped doc alone.
+    if (feedIndex != null && existing.metadata?.feedIndex == null) {
+      await Media.updateOne({ _id: existing._id }, { $set: { 'metadata.feedIndex': feedIndex } });
+      existing.metadata = existing.metadata || {};
+      existing.metadata.feedIndex = feedIndex;
+    }
+    return existing;
+  }
 
   let mirroredUrl;
   let uploadResult = null;
@@ -601,6 +613,11 @@ async function materializeImage({ sourceUrl, product, imageRole }) {
       metadata: {
         catalogProductId: product._id,
         imageRole,                              // 'hero' | 'alt'
+        // Position in the merchant feed: 0 = product.imageUrl, 1..N =
+        // additionalImages[0..N-1] in stored order. Owner directive
+        // 2026-08-05: this is the sole ordering signal for catalog seed
+        // selection going forward — imageRole/createdAt/shotType are not.
+        feedIndex:        feedIndex,
         brand:            product.brand || null,
         category:         product.category || null,
         productTitle:     product.title || null
@@ -700,9 +717,28 @@ async function materializeMissingAlts(product) {
   }
   if (!indicesNeedingFill.length) return ids;
 
+  // feedIndex must be the alt's COMPACT position among real (non-empty,
+  // non-hero-duplicate) alts — 1-based, so it continues the hero's 0.
+  //
+  // NOT `i + 1`. `i` is the raw index into additionalImages, and this loop
+  // deliberately skips holes and any entry equal to product.imageUrl, so a
+  // product whose additionalImages[0] duplicates its imageUrl would number
+  // its first real alt 2 here while enqueueProductDetect — which filters
+  // BEFORE enumerating (`:72-77`) — numbers the same image 1. Two writers
+  // disagreeing about the same image's feed position is exactly the kind of
+  // silent ordering corruption feedIndex exists to prevent.
+  const compactAltPos = new Map();
+  let seenRealAlts = 0;
+  for (let i = 0; i < cappedUrls.length; i++) {
+    if (!cappedUrls[i]) continue;
+    if (cappedUrls[i] === product.imageUrl) continue;
+    seenRealAlts++;
+    compactAltPos.set(i, seenRealAlts);   // 1-based
+  }
+
   const results = await Promise.allSettled(
     indicesNeedingFill.map(i =>
-      materializeImage({ sourceUrl: cappedUrls[i], product, imageRole: 'alt' })
+      materializeImage({ sourceUrl: cappedUrls[i], product, imageRole: 'alt', feedIndex: compactAltPos.get(i) ?? null })
         .then(m => ({ i, mediaId: m?._id ? String(m._id) : null }))
         .catch(err => {
           console.warn(`   ⚠️  materializeMissingAlts[${product._id}][${i}]: ${err.message}`);

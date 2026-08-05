@@ -129,6 +129,15 @@
 //     seeded as one. That is an assumption about classification quality, not
 //     something a pure function can assert.
 
+// UPDATED 2026-08-05: promoteFirstCatalogImage's DEFAULT tier 1 changed from
+// metadata.imageRole==='hero' to metadata.feedIndex===0 (owner directive —
+// see scripts/verifyCatalogFeedOrderSeeding.js for the new default-path
+// checks and config/defaults.env CATALOG_FEED_ORDER_SEEDING). This file's
+// checks pin the PRE-2026-08-05 cascade specifically, which the kill switch
+// still guarantees byte-for-byte when off — so force it off here rather than
+// rely on whoever runs this script remembering the env var.
+process.env.CATALOG_FEED_ORDER_SEEDING = 'false';
+
 const fs   = require('fs');
 const path = require('path');
 
@@ -827,7 +836,10 @@ async function main() {
     // ORDER pins, inside buildSeededUniverse only.
     const body = bodyOf(seedSrc, 'async function buildSeededUniverse');
     checkTrue('S4 buildSeededUniverse body extracted', body.length > 500);
-    const callAt   = body.indexOf('promoteFirstCatalogImage(ranked)');
+    // Call shape gained an opts arg on 2026-08-05 (primaryMediaId, for the
+    // feed-primary tier) — match the call by prefix so this pins ORDER of
+    // operations, which is what S4 is actually about, not the arg list.
+    const callAt   = body.indexOf('promoteFirstCatalogImage(ranked');
     const firstCut = body.indexOf('universe.slice(0, topN)');
     const lastCut  = body.lastIndexOf('universe.slice(0, topN)');
     const projAt   = body.lastIndexOf('ranked.map(x => projectEntry(');
