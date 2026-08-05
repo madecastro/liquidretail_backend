@@ -85,8 +85,17 @@ check('C2 [TRAP] a missing providerRequestId falls back to an INSERT rather than
 check('C3 it updates in place, not upsert:true — the fallback is explicit so a '
     + 'missing row is visible rather than silently conjured mid-update',
   /upsert:\s*false/.test(costSrc));
-check('C4 when no row matched it still records the spend rather than dropping it',
-  /if \(!n\) await recordFlatCost\(meta\)/.test(costSrc));
+// C4 REWRITTEN after the first live recovery dry run. It used to assert an
+// unconditional fallback insert. That was wrong: CostLog requires `stage`, and
+// persistCost DROPS a row that fails validation — so a caller passing only
+// { providerRequestId, costUsd } got a SILENT no-op on exactly the rows that
+// predate the charge-point ledger and most need recording. The fallback now
+// refuses loudly instead of attempting a write that is certain to be discarded.
+check('C4 the fallback insert fires for a COMPLETE record, and REFUSES LOUDLY for '
+    + 'an incomplete one rather than attempting a write CostLog will silently drop',
+  /if \(!meta\.stage\)/.test(costSrc)
+  && /NOT ledgered/.test(costSrc)
+  && /await recordFlatCost\(meta\);/.test(costSrc));
 check('C5 an unknown status is coerced against COST_STATUSES before the write, '
     + 'matching persistCost — otherwise validation drops the whole row',
   /COST_STATUSES\.includes\(raw\)/.test(costSrc.slice(costSrc.indexOf('async function finalizeFlatCost'))));
@@ -109,9 +118,20 @@ check('C5 an unknown status is coerced against COST_STATUSES before the write, '
 
     updates = 0; creates = 0;
     CostLog.updateOne = async () => { updates++; return { matchedCount: 0 }; };
-    await costTracker.finalizeFlatCost({ providerRequestId: 'pred_y', costUsd: 0.07, status: 'ok' });
-    check('D3 with an id but NO existing row: falls back to an insert so spend is not lost',
+    await costTracker.finalizeFlatCost({
+      providerRequestId: 'pred_y', stage: 'direct_image', provider: 'atlas',
+      model: 'openai/gpt-image-2/edit', costUsd: 0.07, status: 'ok'
+    });
+    check('D3 with an id, NO existing row, and a COMPLETE record: falls back to an '
+        + 'insert so the spend is not lost',
       updates === 1 && creates === 1, `updates=${updates} creates=${creates}`);
+
+    updates = 0; creates = 0;
+    await costTracker.finalizeFlatCost({ providerRequestId: 'pred_z', costUsd: 0.07, status: 'ok' });
+    check('D3b [SILENT-DROP] an INCOMPLETE record attempts NO insert — CostLog would '
+        + 'reject it on the required `stage` and persistCost would discard it without '
+        + 'the caller ever knowing',
+      updates === 1 && creates === 0, `updates=${updates} creates=${creates}`);
 
     updates = 0; creates = 0;
     await costTracker.finalizeFlatCost({ costUsd: 0.01, status: 'ok', provider: 'atlas', model: 'm' });

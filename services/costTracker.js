@@ -210,6 +210,13 @@ async function reconcileCost({ providerRequestId, costUsd }) {
  *
  * Upserts rather than pure-updates so a caller whose charge-point write failed
  * (it is fire-and-forget) still ends up with a row rather than silently none.
+ *
+ * ⚠️ THE FALLBACK INSERT NEEDS A COMPLETE RECORD. CostLog requires `stage`, and
+ * persistCost DROPS a row that fails validation. So a caller passing only
+ * { providerRequestId, costUsd } gets a silent no-op whenever the update misses —
+ * i.e. precisely on the rows that predate the charge-point ledger and most need
+ * recording. Observed on the first live recovery dry run. The guard below refuses
+ * to attempt an insert that is certain to be dropped, and says so.
  */
 async function finalizeFlatCost(meta = {}) {
   const id = meta.providerRequestId;
@@ -232,7 +239,17 @@ async function finalizeFlatCost(meta = {}) {
       // No charge-point row (its fire-and-forget write lost a race with the
       // process, or this is a legacy caller): fall back to an insert so the
       // spend is recorded rather than dropped.
-      if (!n) await recordFlatCost(meta);
+      if (!n) {
+        if (!meta.stage) {
+          console.error(
+            `   ❌ costTracker: cannot insert a fallback row for ${id} — no \`stage\`, ` +
+            `and CostLog validation would drop it silently. Pass a complete record ` +
+            `(stage/provider/model) to finalizeFlatCost. $${Number(meta.costUsd) || 0} NOT ledgered.`
+          );
+          return;
+        }
+        await recordFlatCost(meta);
+      }
     });
   } catch (err) {
     console.warn(`   ⚠️  costTracker: finalize failed for ${id} (${err.message}) — falling back to insert`);
