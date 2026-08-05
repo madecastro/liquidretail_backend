@@ -51,14 +51,45 @@ easy to miss. Keep that pass mandatory here.
 `enqueueBrandProductDetects` still skips on the bare pointer, so backfilled products wouldn't
 eagerly precompute. Ad time guarantees correctness regardless; precompute is off.
 
-**Owner follow-up, NOT YET BUILT (next PR):** *"For video generation I always want the first,
-second and third catalog images as downloaded from the website or their Shopify feed"* (front /
-side / back, though it varies). **Make the count AND the image type ENV-configurable for both
-default video and default image requests.** Design note: serve these from the backend (the
-frontend already reads `refLimits` from `/api/ads/veo-prompt-scaffold`) so `config/defaults.env`
-stays the single source of truth per the 2026-08-03 secrets-only Render decision — a Netlify
-rebuild must not be required to change a number. `IMAGE_QUEUE_DEFAULT_COUNT` is currently
-hardcoded in the frontend.
+**Owner follow-up — BUILT AND MERGED same day.** PR #83 (backend) + liquidretail #34 (frontend).
+*"For video generation I always want the first, second and third catalog images as downloaded from
+the website or their Shopify feed"* (front / side / back, though it varies), with the count AND the
+type ENV-configurable for both rails. `services/referenceDefaultsService.js`; served via
+`/api/ads/veo-prompt-scaffold` so `config/defaults.env` stays the single source of truth and no
+Netlify rebuild is needed to change a number.
+
+`VIDEO_DEFAULT_REFERENCE_COUNT=3`, `IMAGE_DEFAULT_REFERENCE_COUNT=1` (was hardcoded in the
+frontend), plus `VIDEO_/IMAGE_DEFAULT_REFERENCE_SHOT_TYPES` — **both empty, and empty is a strict
+no-op.** Owner asked directly whether there is a default shot type: **there is not, and there must
+not be.** It is a PREFERENCE (stable reorder), never a filter, because `classification.shotType` is
+written by the deferred detect pass — a filter would empty the stack for exactly the
+freshly-ingested products being generated for. Rails stay independent: deriving static from video
+re-opens the 3-image-static-universe bug (`universeTopN = max(mediaIds.length,
+DIRECTOR_UNIVERSE_TOP_N)`).
+
+Also surfaced `VIDEO_SEED_FEED_ORDER=true` and `VIDEO_SEED_MAX_SUBJECT_FRACTION=0.6` into
+`defaults.env` — both were honoured in code but lived only in `.env.example`, so the sole way to
+change them was the Render dashboard. Written at their existing effective values; **nearly shipped
+0.55 from a misread**, so the fence now pins them against the code defaults. Do that check whenever
+surfacing a code-only knob.
+
+⚠️ **A SOURCE dial (catalog / catalog_then_ugc / any) was drafted and CUT before merge** — it was
+dead in every wired path (picker rows come only from the catalog endpoint; applying it in
+`buildReferenceImages` would have discarded deliberately-chosen lifestyle media). Don't re-add it
+without wiring it. The fence asserts its absence. Same review also caught a second served video
+count that could contradict the cascade, a resolver bound (12) looser than the model ceiling it
+feeds (7), and an unguarded shot-type query that could 500 product detail.
+
+Scope, so it isn't re-derived: the video preference applies to the picker AND
+`buildReferenceImages` auto-assembly, does NOT move the seed at position 0, and never reorders an
+explicit operator pick list. The static policy governs the **picker pre-pick only**; the backend's
+empty-`mediaIds` fallback stays `DIRECTOR_UNIVERSE_TOP_N`. The picker needs per-image shot types or
+the knob is inert (its explicit picks suppress the backend's assembly), so
+`GET /api/catalog/:id` now returns `imageShotType` + `additionalImageShotTypes`, index-aligned and
+hole-preserving.
+
+Fence: `scripts/verifyReferenceDefaults.js` — 43 checks, revert-proven on 9 mutations. Suite 58/0.
+## 2026-08-04 (evening) — "video jobs processed but not appearing": TWO defects, both shipped today
 ## 2026-08-04 (evening) — "video jobs processed but not appearing": TWO defects, both shipped today
 
 Owner: *"video jobs don't seem to be appearing but seem to have been processed?"* Both halves of
