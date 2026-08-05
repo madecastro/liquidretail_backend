@@ -312,6 +312,222 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 1: Campaigns — reach-social lifecycle from chat ─────────
+
+  {
+    id:       'campaign.create',
+    title:    'Create campaign',
+    describe: 'Create a new reach-social campaign under a brand. Kind must be \'brand\', \'product\', or \'promotional\'. Optional productIds[] and mediaIds[] pre-populate the wizard\'s Step 2 selection; ids that don\'t belong to the same brand are silently dropped and reported. Blocked by the ad-readiness gate (every connected integration must have ≥1 completed DetectRun). Only creates reach-social campaigns; platform-synced ones (meta-ads / google-ads) originate on the platform side. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'name', 'kind'],
+      properties: {
+        brandId:    { type: 'string', description: 'Brand ObjectId the campaign belongs to.' },
+        name:       { type: 'string', minLength: 1, maxLength: 200, description: 'Campaign display name.' },
+        kind:       { type: 'string', enum: ['brand', 'product', 'promotional'], description: 'Campaign kind — drives Director + wizard behavior.' },
+        productIds: { type: 'array', items: { type: 'string' }, description: 'Optional CatalogProduct ObjectIds to pre-select (mismatched brand → dropped).' },
+        mediaIds:   { type: 'array', items: { type: 'string' }, description: 'Optional Media ObjectIds to pre-select (mismatched brand → dropped).' },
+        promotionalDetails: {
+          type: 'object',
+          description: 'Only consulted when kind=\'promotional\'. Free-form: { startsAt?, endsAt?, discountType?, discountValue?, discountCode?, giveaway?, headline?, notes? }. Dates as ISO strings.',
+          additionalProperties: true
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignCreate',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.patch',
+    title:    'Edit campaign',
+    describe: 'Edit reach-social campaign fields (name, kind, promotionalDetails, useImageRefAsProduction). Refuses synced campaigns (meta-ads / google-ads) — their state mirrors the platform. Returns prior values as \'prior\' so the operator can revert. Requires operator confirmation.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId'],
+      properties: {
+        campaignId:   { type: 'string', description: 'Campaign ObjectId.' },
+        name:         { type: 'string', minLength: 1, maxLength: 200, description: 'New campaign name.' },
+        campaignKind: { type: 'string', enum: ['brand', 'product', 'promotional', 'collection'], description: 'New campaign kind (mapped to Campaign.kind).' },
+        useImageRefAsProduction: { type: 'boolean', description: 'When true, display the gpt-image polished render as the production ad image.' },
+        promotionalDetails: { type: ['object', 'null'], description: 'Merged over existing promotionalDetails (null clears). Dates as ISO strings.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignPatch',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.delete',
+    title:    'Delete campaign',
+    describe: 'Hard-delete a reach-social campaign and its directly-owned children (Ads, CampaignRun rows, rendered Cloudinary PNGs). Shared artifacts (LayoutInput, AiCanvas, CreativeDirection, etc.) are preserved because they belong to media/brand, not campaign. Refuses synced campaigns. IRREVERSIBLE in the DB — surface the campaign name + rendered-ad count in confirmation before proceeding.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignDelete',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.addProducts',
+    title:    'Add products to campaign',
+    describe: 'Add CatalogProduct ids to Campaign.matchedProductIds via $addToSet (idempotent — dupes are silently ignored). Products that don\'t belong to the campaign\'s brand are dropped and reported in droppedProductIds. Reports the pre-and-post totals so the operator sees exactly what changed. Requires operator confirmation.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId', 'productIds'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' },
+        productIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 200,
+                      description: 'CatalogProduct ObjectIds to add.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignAddProducts',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.removeProduct',
+    title:    'Remove product from campaign',
+    describe: '$pull one CatalogProduct id from Campaign.matchedProductIds. Idempotent — removing an already-absent product is a no-op. Requires operator confirmation.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId', 'productId'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' },
+        productId:  { type: 'string', description: 'CatalogProduct ObjectId to remove.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignRemoveProduct',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.addMedia',
+    title:    'Add media to campaign',
+    describe: 'Add Media ids to Campaign.mediaIds via $addToSet (idempotent). Media that don\'t belong to the campaign\'s brand are dropped and reported. Requires operator confirmation.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId', 'mediaIds'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' },
+        mediaIds:   { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 200,
+                      description: 'Media ObjectIds to add.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignAddMedia',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.removeMedia',
+    title:    'Remove media from campaign',
+    describe: '$pull one Media id from Campaign.mediaIds. Idempotent. Requires operator confirmation.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId', 'mediaId'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' },
+        mediaId:    { type: 'string', description: 'Media ObjectId to remove.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignRemoveMedia',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.removeAd',
+    title:    'Unlink ad from campaign',
+    describe: 'UNLINK an ad from a campaign (sets Ad.campaignId = null). The Ad doc and its rendered asset remain — only the campaign association is dropped. The ad still surfaces in ad.list (as an orphan) but no longer appears in the campaign\'s view. Requires operator confirmation.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId', 'adId'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' },
+        adId:       { type: 'string', description: 'Ad ObjectId to unlink.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignRemoveAd',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.patchBrief',
+    title:    'Edit campaign creative brief',
+    describe: 'Manually override Campaign.creativeBrief. Set to null to clear (a subsequent sync will re-derive automatically); set to an object to override the AI-derived brief. Stamps briefDerivedAt so the auto-refresh on sync treats the override as fresh. Returns priorBrief so the operator can revert. Requires operator confirmation.',
+    tier:     1,
+    scope:    'campaign',
+    args: {
+      type: 'object',
+      required: ['campaignId'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' },
+        brief: {
+          type: ['object', 'null'],
+          description: 'Full brief object or null to clear. Shape: { goal?, pitch?, focus?, audience?, tone?, cta_emphasis?, ... }.',
+          additionalProperties: true
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignPatchBrief',
+      method:  'run'
+    }
+  },
+
   // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
 
   {
@@ -348,6 +564,29 @@ const CAPABILITIES = [
     execute: {
       kind:    'service',
       service: './capabilityExecutors/adRegenerateWithPrompt',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'campaign.deriveBrief',
+    title:    'Derive campaign creative brief',
+    describe: 'Run campaignBriefDerivationService against a campaign — an LLM call that extracts a structured creative brief (goal, pitch, focus, audience, tone, cta_emphasis, evidence) from the campaign\'s targeting, objective, matched products, and ad creatives. Threads into the Director as CAMPAIGN BRIEF context when generation is campaign-scoped. Billable (~$0.02, Sonnet). Respects a 7-day TTL by default; pass force=true to re-derive. Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'campaign',
+    estimateUsd: 0.02,
+    args: {
+      type: 'object',
+      required: ['campaignId'],
+      properties: {
+        campaignId: { type: 'string', description: 'Campaign ObjectId.' },
+        force:      { type: 'boolean', description: 'When true, re-derive even if the brief is younger than 7 days.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/campaignDeriveBrief',
       method:  'run'
     }
   },
