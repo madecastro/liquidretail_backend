@@ -801,6 +801,152 @@ function composeCorrectiveOverride(overrideText, correctiveNote) {
 }
 
 /**
+ * THE POST-MODEL HALF of a static render: delivery crop -> logo composite.
+ *
+ * EXTRACTED 2026-08-05, and the reason is money. Atlas retains a prediction for
+ * 30 days, so a paid generation is never actually lost — only its pointer is. But
+ * a static ad's Atlas output is NOT a deliverable ad: it still needs the centred
+ * extract to the delivery aspect and the logomark that the prompt reserved a
+ * corner for. Until this was callable on its own, a recovered image could only be
+ * located and alerted, never finished, so the only way to "recover" a stranded
+ * render was to buy it again. Measured 2026-08-05: nine gpt-image-2/edit
+ * predictions killed mid-poll by a deploy, all nine still COMPLETED at Atlas,
+ * $0.5663 already billed.
+ *
+ * ⚠️ ONE IMPLEMENTATION, TWO CALLERS. renderDirectImage calls this; so does the
+ * recovery path. Do NOT copy it. Two copies of the delivery crop would drift, and
+ * the failure is silent — a mis-cropped ad still looks plausible while cutting
+ * through typeset copy, which is exactly the failure the genSize mismatch warning
+ * below exists to catch. Keeping one implementation makes byte-identity between
+ * a normal render and a recovered one structural rather than something anyone has
+ * to keep re-proving.
+ *
+ * Takes a BUFFER, not base64, so a recovered image (fetched from the prediction's
+ * output URL) and a fresh render (decoded from the submit response) are the same
+ * input to this function.
+ *
+ * @param {Buffer} rawFrame  exactly what the model returned, undecoded further
+ * @param {object} built     the resolved intent/surface (built.surface is used)
+ * @param {object} dims      delivery { width, height }
+ * @param {string} genSize   requested generation size, for the coercion alarm
+ * @param {string} surface   platformFormat key, for operator-facing messages
+ * @param {string} adId      for noteRenderIssue; may be null for non-ad callers
+ * @param {string|null} logoUrl  brand logomark; absent/failed is a soft skip
+ * @returns {Promise<{buffer: Buffer, logoComposited: boolean}>}
+ */
+async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logoUrl }) {
+  const frame = await sharp(rawFrame).metadata();
+  const box = extractFor(built.surface, frame.width, frame.height);
+  const [reqW, reqH] = String(genSize).split(/[x*]/).map(Number);
+  if (frame.width !== reqW || frame.height !== reqH) {
+    const msg =
+      `model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
+      `cropping the ${built.surface.aspect} centre of what arrived`;
+    console.warn(`   ⚠️  direct-image: ${msg}`);
+    // Surfaced per-ad, not just in logs, because this is the alarm for the one
+    // operational risk the exact-aspect size table takes on: 4:5 generates at
+    // 1088x1360, which is NOT a member of the schema's size enum and is in use on
+    // the strength of a single live probe. If the gateway ever starts coercing an
+    // arbitrary size to its 1024x1024 default, the symptom is precisely this
+    // mismatch — and because extractFor then centre-crops to the surface aspect,
+    // the ad would still LOOK plausible while cropping through typeset copy
+    // exactly as the old stale table did. A console warning on a worker nobody is
+    // tailing is not an alarm; a renderIssue on the Ad is.
+    noteRenderIssue(adId, { message: msg, stage: 'generation-size' });
+  }
+  const rendered = await sharp(rawFrame)
+    .extract(box)
+    .resize(dims.width, dims.height, { fit: 'fill', kernel: sharp.kernel.lanczos3 })
+    .png()
+    .toBuffer();
+
+  // LOGO — the one deliberate exception to "the model renders everything", and
+  // owner-specified: the logomark is the single thing that must NOT be fed to the
+  // image model. Image models redraw wordmarks approximately, which on a logo
+  // reads as a counterfeit rather than a stylisation. So the prompt reserves the
+  // corner (see product.logoCorner above, and the absence line forbidding any
+  // drawn logo) and the real asset is composited into that reserved space here.
+  //
+  // Sized against the SHORTER edge so the mark is the same physical size on every
+  // surface, and placed inside the content rect rather than at a flat offset from
+  // the bottom. The flat offset put it 150px inside Stories' 250px reply-bar
+  // reserve — the brand's logomark, on the one surface where it was invisible.
+  const layers = [];
+  const logo = await optionalImage(logoUrl);
+  if (logo) {
+    try {
+      const boxW = Math.round(0.16 * Math.min(dims.width, dims.height));
+      const logoPng = await sharp(logo)
+        .resize({ width: boxW, height: Math.round(boxW * 0.35), fit: 'inside', withoutEnlargement: true })
+        .png()
+        .toBuffer();
+      // Measure what came out: fit:'inside' preserves aspect, so a tall or a wide
+      // mark occupies less than the box and placing by the box would leave it
+      // floating off the corner it was promised.
+      const lm = await sharp(logoPng).metadata();
+      const place = logoPlacementFor({
+        surface: built.surface,
+        dims,
+        logoW: lm.width,
+        logoH: lm.height
+      });
+      if (place) {
+        // Monochrome the mark against whatever the model actually rendered in
+        // that corner, so it never ships as a white block (owner, 2026-08-03).
+        // Any failure falls back to the original asset — a correctly-placed
+        // logo with an ugly backing beats no logo at all.
+        let toPlace = logoPng;
+        try {
+          const region = await sharp(rendered)
+            .extract({
+              left: Math.max(0, Math.min(place.left, dims.width - 1)),
+              top: Math.max(0, Math.min(place.top, dims.height - 1)),
+              width: Math.max(1, Math.min(lm.width, dims.width - place.left)),
+              height: Math.max(1, Math.min(lm.height, dims.height - place.top)),
+            })
+            .greyscale()
+            .stats();
+          const ink = monochromeInkFor(region.channels[0].mean / 255);
+          if (ink) {
+            const mono = await monochromeLogoBuffer(logoPng, ink);
+            if (mono) {
+              toPlace = mono;
+              console.log(
+                `   🖼️  direct-image: logomark inked ${ink.r ? 'white' : 'black'} ` +
+                `(behind lum=${(region.channels[0].mean / 255).toFixed(2)})`
+              );
+            }
+          }
+        } catch (err) {
+          console.warn(`   ⚠️  direct-image: logo monochrome skipped (${err.message}) — using original asset`);
+        }
+        layers.push({ input: toPlace, top: place.top, left: place.left });
+      } else {
+        const msg = `no room for the logo inside ${surface}'s content rect — ad ships without logo`;
+        console.warn(`   ⚠️  direct-image: ${msg}`);
+        noteRenderIssue(adId, { message: msg, stage: 'logo' });
+      }
+    } catch (err) {
+      const msg = `logo compose failed (${err.message}) — ad ships without logo`;
+      console.warn(`   ⚠️  direct-image: ${msg}`);
+      noteRenderIssue(adId, { message: msg, stage: 'logo' });
+    }
+  } else if (logoUrl) {
+    // URL was present but fetch failed (optionalImage swallowed it).
+    noteRenderIssue(adId, {
+      message: 'logo fetch failed — ad ships without logo',
+      stage: 'logo'
+    });
+  }
+  return {
+    buffer: layers.length
+      ? await sharp(rendered).composite(layers).png().toBuffer()
+      : rendered,
+    logoComposited: layers.length > 0
+  };
+}
+
+/**
  * Map the regenerate API's promptOverride into the single flat prompt the
  * image model accepts.
  *
@@ -1098,116 +1244,18 @@ async function renderDirectImage({
   // — it is a resample and nothing else. The old single `fit:'cover',
   // position:'attention'` call did both jobs at once and got both wrong.
   const rawFrame = Buffer.from(b64, 'base64');
-  const frame = await sharp(rawFrame).metadata();
-  const box = extractFor(built.surface, frame.width, frame.height);
-  const [reqW, reqH] = String(genSize).split(/[x*]/).map(Number);
-  if (frame.width !== reqW || frame.height !== reqH) {
-    const msg =
-      `model returned ${frame.width}x${frame.height} for a ${genSize} request — ` +
-      `cropping the ${built.surface.aspect} centre of what arrived`;
-    console.warn(`   ⚠️  direct-image: ${msg}`);
-    // Surfaced per-ad, not just in logs, because this is the alarm for the one
-    // operational risk the exact-aspect size table takes on: 4:5 generates at
-    // 1088x1360, which is NOT a member of the schema's size enum and is in use on
-    // the strength of a single live probe. If the gateway ever starts coercing an
-    // arbitrary size to its 1024x1024 default, the symptom is precisely this
-    // mismatch — and because extractFor then centre-crops to the surface aspect,
-    // the ad would still LOOK plausible while cropping through typeset copy
-    // exactly as the old stale table did. A console warning on a worker nobody is
-    // tailing is not an alarm; a renderIssue on the Ad is.
-    noteRenderIssue(adId, { message: msg, stage: 'generation-size' });
-  }
-  const rendered = await sharp(rawFrame)
-    .extract(box)
-    .resize(dims.width, dims.height, { fit: 'fill', kernel: sharp.kernel.lanczos3 })
-    .png()
-    .toBuffer();
-
-  // LOGO — the one deliberate exception to "the model renders everything", and
-  // owner-specified: the logomark is the single thing that must NOT be fed to the
-  // image model. Image models redraw wordmarks approximately, which on a logo
-  // reads as a counterfeit rather than a stylisation. So the prompt reserves the
-  // corner (see product.logoCorner above, and the absence line forbidding any
-  // drawn logo) and the real asset is composited into that reserved space here.
-  //
-  // Sized against the SHORTER edge so the mark is the same physical size on every
-  // surface, and placed inside the content rect rather than at a flat offset from
-  // the bottom. The flat offset put it 150px inside Stories' 250px reply-bar
-  // reserve — the brand's logomark, on the one surface where it was invisible.
-  const layers = [];
-  const logo = await optionalImage(resolvedBrand?.logoUrl || effectiveLayout.input?.brand?.logo);
-  if (logo) {
-    try {
-      const boxW = Math.round(0.16 * Math.min(dims.width, dims.height));
-      const logoPng = await sharp(logo)
-        .resize({ width: boxW, height: Math.round(boxW * 0.35), fit: 'inside', withoutEnlargement: true })
-        .png()
-        .toBuffer();
-      // Measure what came out: fit:'inside' preserves aspect, so a tall or a wide
-      // mark occupies less than the box and placing by the box would leave it
-      // floating off the corner it was promised.
-      const lm = await sharp(logoPng).metadata();
-      const place = logoPlacementFor({
-        surface: built.surface,
-        dims,
-        logoW: lm.width,
-        logoH: lm.height
-      });
-      if (place) {
-        // Monochrome the mark against whatever the model actually rendered in
-        // that corner, so it never ships as a white block (owner, 2026-08-03).
-        // Any failure falls back to the original asset — a correctly-placed
-        // logo with an ugly backing beats no logo at all.
-        let toPlace = logoPng;
-        try {
-          const region = await sharp(rendered)
-            .extract({
-              left: Math.max(0, Math.min(place.left, dims.width - 1)),
-              top: Math.max(0, Math.min(place.top, dims.height - 1)),
-              width: Math.max(1, Math.min(lm.width, dims.width - place.left)),
-              height: Math.max(1, Math.min(lm.height, dims.height - place.top)),
-            })
-            .greyscale()
-            .stats();
-          const ink = monochromeInkFor(region.channels[0].mean / 255);
-          if (ink) {
-            const mono = await monochromeLogoBuffer(logoPng, ink);
-            if (mono) {
-              toPlace = mono;
-              console.log(
-                `   🖼️  direct-image: logomark inked ${ink.r ? 'white' : 'black'} ` +
-                `(behind lum=${(region.channels[0].mean / 255).toFixed(2)})`
-              );
-            }
-          }
-        } catch (err) {
-          console.warn(`   ⚠️  direct-image: logo monochrome skipped (${err.message}) — using original asset`);
-        }
-        layers.push({ input: toPlace, top: place.top, left: place.left });
-      } else {
-        const msg = `no room for the logo inside ${surface}'s content rect — ad ships without logo`;
-        console.warn(`   ⚠️  direct-image: ${msg}`);
-        noteRenderIssue(adId, { message: msg, stage: 'logo' });
-      }
-    } catch (err) {
-      const msg = `logo compose failed (${err.message}) — ad ships without logo`;
-      console.warn(`   ⚠️  direct-image: ${msg}`);
-      noteRenderIssue(adId, { message: msg, stage: 'logo' });
-    }
-  } else if (resolvedBrand?.logoUrl || effectiveLayout.input?.brand?.logo) {
-    // URL was present but fetch failed (optionalImage swallowed it).
-    noteRenderIssue(adId, {
-      message: 'logo fetch failed — ad ships without logo',
-      stage: 'logo'
-    });
-  }
-  const buffer = layers.length
-    ? await sharp(rendered).composite(layers).png().toBuffer()
-    : rendered;
+  // Delivery crop + logomark. Extracted so the recovery path can finish an
+  // already-paid Atlas output into a real ad instead of re-buying it — see
+  // finishPlate's header for why there must only ever be one implementation.
+  const plate = await finishPlate({
+    rawFrame, built, dims, genSize, surface, adId,
+    logoUrl: resolvedBrand?.logoUrl || effectiveLayout.input?.brand?.logo
+  });
+  const buffer = plate.buffer;
   console.log(
     `   🖼️  direct-image ready — ${template}/${aspectRatio} surface=${surface} intent=${built.resolved.key}` +
     `${built.resolved.fellBackFrom ? `(fell back from ${built.resolved.fellBackFrom})` : ''} ` +
-    `concept=${adConceptId} refs=${refs.length} logo=${layers.length ? 'composited' : 'none'} ` +
+    `concept=${adConceptId} refs=${refs.length} logo=${plate.logoComposited ? 'composited' : 'none'} ` +
     `text=${built.text.length}${built.dropped.length ? ` dropped=${built.dropped.join('+')}` : ''} ` +
     `model=${PLATE_EDIT_MODEL}`
   );
@@ -1351,6 +1399,9 @@ async function renderDirectImage({
 module.exports = {
   // Exported for the offline harness. renderDirectImage is the only entry point
   // the render path uses.
+  // finishPlate is the exception: the recovery path is a SECOND legitimate caller
+  // (see its header) — it finishes an already-paid Atlas output into a real ad.
+  finishPlate,
   deliveryGeometryFor,
   safeBoxInDeliveredPx,
   extractFor,
