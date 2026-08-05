@@ -528,6 +528,110 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 2: Ad curation — approve/patch/bulk-archive ─────────────
+
+  {
+    id:       'ad.approve',
+    title:    'Approve ad',
+    describe: 'Flip Ad.approved=true. Orthogonal to status (render lifecycle); approval drives the Draft / Approved / Exported grouping on the Product Ads page. Reversible via ad.unapprove. Idempotent — approving an already-approved ad is a no-op. Requires operator confirmation.',
+    tier:     1,
+    scope:    'ad',
+    args: {
+      type: 'object',
+      required: ['adId'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adApprove',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'ad.unapprove',
+    title:    'Un-approve ad',
+    describe: 'Reverse of ad.approve. Clears Ad.approved + approvedAt + approvedBy. Idempotent. Requires operator confirmation.',
+    tier:     1,
+    scope:    'ad',
+    args: {
+      type: 'object',
+      required: ['adId'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adUnapprove',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'ad.patch',
+    title:    'Edit ad copy',
+    describe: 'Edit Ad.copy fields (headline, cta_text, quote, productName, productPrice). Each field ≤300 chars; empty string clears; null clears. Refuses ads already synced to Meta (mutation would drift). The already-rendered PNG/MP4 still shows the OLD text — regenerate to update the pixels. Returns priorCopy so the operator can revert. Requires operator confirmation.',
+    tier:     1,
+    scope:    'ad',
+    args: {
+      type: 'object',
+      required: ['adId', 'copy'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId.' },
+        copy: {
+          type: 'object',
+          description: 'Fields to update. Provide only the keys you want changed. Send null or empty string to clear a field.',
+          properties: {
+            headline:      { type: ['string', 'null'], maxLength: 300 },
+            cta_text:      { type: ['string', 'null'], maxLength: 300 },
+            quote:         { type: ['string', 'null'], maxLength: 300 },
+            productName:   { type: ['string', 'null'], maxLength: 300 },
+            productPrice:  { type: ['string', 'null'], maxLength: 300 }
+          },
+          additionalProperties: false
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adPatch',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'ad.bulkArchive',
+    title:    'Archive many ads at once',
+    describe: 'Archive up to 50 ads in one call. Each row is tenant-checked independently — a single mismatched-brand id doesn\'t abort the batch; it\'s reported in the per-row outcomes. Idempotent per row (alreadyArchived) and reversible per row via ad.restore. Great for cleaning up a batch of failed or draft ads without a per-row confirmation cycle.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['adIds'],
+      properties: {
+        adIds: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 50,
+          description: 'Ad ObjectIds to archive. Max 50 per call.'
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adBulkArchive',
+      method:  'run'
+    }
+  },
+
   // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
 
   {
@@ -592,6 +696,29 @@ const CAPABILITIES = [
   },
 
   // ── Tier 3: external / hard-to-reverse ────────────────────────────
+
+  {
+    id:       'ad.delete',
+    title:    'Permanently delete ad',
+    describe: 'HARD-DELETE an Ad doc + best-effort destroy of the Cloudinary render asset. IRREVERSIBLE — the Cloudinary asset is gone, and the render cannot be reconstituted without re-billing generation (~$0.15-$1.10 depending on kind). Prefer ad.archive for hide-until-later use cases. Refuses ads already synced to Meta (would leave a dangling Meta creative). Requires the explicit phrase "DELETE AD" typed in the confirmation UI.',
+    tier:     3,
+    scope:    'ad',
+    explicitConfirmation: 'DELETE AD',
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['adId'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adDelete',
+      method:  'run'
+    }
+  },
 
   {
     id:       'ads.publishToMeta',

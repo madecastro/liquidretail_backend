@@ -1,6 +1,6 @@
 # Agent capability coverage plan
 
-**Status**: Phase 1 in progress (2026-08-04).
+**Status**: Phases 1 + 2 shipped (2026-08-05). Registry at 30 caps.
 
 ## Purpose
 
