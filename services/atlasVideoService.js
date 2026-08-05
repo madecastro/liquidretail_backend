@@ -1675,6 +1675,39 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: product-only pad unavailable — falling through to generative`);
       }
 
+      // 5c. YOLO-GUIDED CROP → deterministic, $0, no fabrication.
+      //     When Media.refinedProducts carries YOLO subject bboxes AND those
+      //     bboxes fit inside a target-aspect crop window on the source,
+      //     ship the c_crop URL instead of paying nano-banana to invent
+      //     pixels. Kill-switched via REFRAME_STRATEGY=crop-first (default
+      //     off so this is a no-op until enabled).
+      //
+      //     Design point: this fires ONLY when the deterministic crop can
+      //     preserve every YOLO-detected subject with an 8px safety margin.
+      //     Multi-model lifestyle shots where the union spans more of the
+      //     abundant dimension than a target-aspect window has room for
+      //     defer to the outpaint path below (measured on prod:
+      //     4-person catalog frame with 1370px horizontal union going to
+      //     9:16 needs 1135px window → deferred).
+      const { chooseStrategy } = require('./reframeStrategyChooser');
+      const strategy = chooseStrategy({ media, aspectRatio, sourceUrl });
+      if (strategy.action === 'crop') {
+        console.log(
+          `   ✂️  reframe[${aspectKey}]: ${strategy.reason} → $0 crop ` +
+          `(${strategy.rect.w}×${strategy.rect.h} @ ${strategy.rect.x},${strategy.rect.y})`
+        );
+        await persistReframe(media, aspectKey, aspectRatio, strategy.url, strategy.method);
+        return strategy.url;
+      }
+      // Any non-'crop' outcome (skip / defer) falls through. 'skip' is
+      // already handled by the ALREADY-CORRECT guard at step 5, so in
+      // practice we only reach here on 'defer' — logged verbosely so a
+      // spike of deferrals is visible in Render logs before the ledger
+      // shows the outpaint spend.
+      if (strategy.action === 'defer' && strategy.reason !== 'REFRAME_STRATEGY!=crop-first') {
+        console.log(`   ↪️  reframe[${aspectKey}]: crop-first deferred → ${strategy.reason}`);
+      }
+
       // 6. NORMALIZE → OUTPAINT → VALIDATE → PAD. Ported from the LLM
       //    Expander's runSafeZoneReframe (media.ts:1117-1227). `billed` flips
       //    true as soon as the billable POST is away and is NEVER cleared, so
