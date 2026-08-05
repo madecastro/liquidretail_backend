@@ -114,6 +114,31 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
     /CPU\/RAM|memory/i.test(SPEC.VEO_TITLING_CONCURRENCY.why)
     && /NOT a provider 429|not a provider 429/i.test(SPEC.VEO_TITLING_CONCURRENCY.why));
 
+  // ── B6/B7 — THE SHADOWING TRAP, and it bit this very change ──────────────
+  // config/defaults.env is dotenv-loaded into process.env at boot, and
+  // resolveKnob reads process.env FIRST, so a value in that file SHADOWS the SPEC
+  // default. Raising the SPEC default alone is a silent no-op: this change shipped
+  // with SPEC=12 while defaults.env still said 4, and the deployed boot log read
+  // `VEO_CONCURRENCY=4` — the lane never widened. Same class as the
+  // DIRECTOR_SIGNALS_VERSION cache trap: looks right, does nothing.
+  const envFile = fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8');
+  const envNum = (k) => {
+    const m = envFile.match(new RegExp(`^${k}=(\\d+)\\s*$`, 'm'));
+    return m ? Number(m[1]) : null;
+  };
+  check('B6 [TRAP] config/defaults.env declares BOTH knobs — otherwise the SPEC '
+      + 'default is unreachable in prod for one of them, and the operator cannot '
+      + 'retune it without a deploy',
+    envNum('VEO_CONCURRENCY') !== null && envNum('VEO_TITLING_CONCURRENCY') !== null,
+    `defaults.env VEO_CONCURRENCY=${envNum('VEO_CONCURRENCY')} VEO_TITLING_CONCURRENCY=${envNum('VEO_TITLING_CONCURRENCY')}`);
+  check('B7 [TRAP] defaults.env agrees with the SPEC defaults — a SPEC-only change '
+      + 'is silently shadowed by this file and never reaches production',
+    envNum('VEO_CONCURRENCY') === SPEC.VEO_CONCURRENCY.default
+    && envNum('VEO_TITLING_CONCURRENCY') === SPEC.VEO_TITLING_CONCURRENCY.default,
+    `file=${envNum('VEO_CONCURRENCY')}/${envNum('VEO_TITLING_CONCURRENCY')} spec=${SPEC.VEO_CONCURRENCY.default}/${SPEC.VEO_TITLING_CONCURRENCY.default}`);
+  check('B8 the split still holds in the FILE values, which are what actually run',
+    envNum('VEO_CONCURRENCY') > envNum('VEO_TITLING_CONCURRENCY'));
+
   // ── C. Wiring in the veo lane ───────────────────────────────────────────
   check('C1 routes/ads.js builds a titling semaphore from the knob',
     /new Semaphore\(\s*CONC\.VEO_TITLING_CONCURRENCY/.test(adsSrc));
