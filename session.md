@@ -427,7 +427,7 @@ so the outpaint path is unmeasurable. `gpt-image-2/edit` also shows ~10% non-ok 
 - **The 308s wall clock of that run was not image poll-wait** — 3 of the 12 ads were videos
   (Omni p50 117s at `VEO_CONCURRENCY=4`). It says nothing about image latency.
 
-### NEXT: split the veo lane's two halves (owner-approved, not yet built)
+### SHIPPED: veo lane split (PR #87 + #88, live on `3ea9522`)
 
 `VEO_CONCURRENCY=4` is **SELF-IMPOSED**, not provider-imposed — `concurrency.js` says Omni RPS is
 unpublished and **"No Omni 429 was ever recorded"**, and Grok's real 1 RPS is protected
@@ -444,6 +444,27 @@ released before acquiring a low-cap slot for Remotion titling. Contained: no new
 change to status transitions, the reaper, or what operators see. (Rejected for now: routing the
 normal path through `titlingResumeService`'s `titlingResumeState` sweeper — bigger unlock but
 makes the normal path depend on crash-recovery machinery and adds sweep latency.)
+
+**Landed as `services/semaphore.js` + `VEO_TITLING_CONCURRENCY`. Live boot log confirms
+`VEO_CONCURRENCY=12 VEO_TITLING_CONCURRENCY=4`.** Titling stays at 4 on purpose — identical to
+the old combined value, so the split cannot raise memory pressure on its first outing. The
+permit is MODULE-level (a per-run pool would let two runs each open 4 renders) and uses
+`withPermit`, which releases in a `finally` — titling CAN throw, and a release outside the
+finally would shrink the pool on every failure until nothing could ever title again.
+
+⚠️ **#87 SHIPPED A NO-OP AND #88 FIXED IT — read this before changing any knob.** #87 raised the
+`VEO_CONCURRENCY` **SPEC default** 4→12 and production stayed at 4, because `config/defaults.env`
+is dotenv-loaded into `process.env` and `resolveKnob` reads `process.env` FIRST. **The file
+shadows the code default.** Changing a SPEC default alone is invisible in prod. Always change
+`config/defaults.env` — and `scripts/verifyTitlingPermit.js` B6/B7/B8 now fail if the two
+disagree. (No `VEO_*` var exists in either Render dashboard, so the file is authoritative.)
+
+**WHAT TO WATCH on the first full-size video run: memory/RSS on the WEB service, not 429s.**
+`VEO_TITLING_CONCURRENCY` is env-only and reversible with no deploy. Two harness bugs found by
+revert-proving are worth remembering: a fixed-char-window source check kept matching code that
+had been moved OUT of the permit, and a deadlock test HUNG rather than failed (an unsettled
+promise with an empty event loop makes node exit silently with status 0, so the harness
+"passed" while the semaphore was wedged). Timeout-race any concurrency assertion.
 
 ---
 
