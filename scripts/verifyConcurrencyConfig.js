@@ -78,7 +78,17 @@ const fromDefaults = resolveAll();
 check('A defaults.env RENDER_CONCURRENCY is 24', fromDefaults.RENDER_CONCURRENCY, 24);
 check('A RENDER_CONCURRENCY exceeds MAX_CREATIVES_PER_RUN, so a full run fires at once',
   fromDefaults.RENDER_CONCURRENCY >= fromDefaults.MAX_CREATIVES_PER_RUN, true);
-check('A defaults.env VEO_CONCURRENCY is 4', fromDefaults.VEO_CONCURRENCY, 4);
+// VEO_CONCURRENCY 4 -> 12 on 2026-08-05, when the veo lane's two halves were
+// split. It now gates the SUBMIT+POLL half only (remote, idle — an Omni poll is
+// ~2min of waiting, measured p50 117s / p99 247s). The Remotion titling half —
+// headless Chrome + ffmpeg in-process, which is what the old 4 was really
+// protecting — moved behind VEO_TITLING_CONCURRENCY and is deliberately still 4.
+// Kept <= MAX_CREATIVES_PER_RUN unlike RENDER_CONCURRENCY: going non-binding
+// here is a separate, measured decision. See scripts/verifyTitlingPermit.js.
+check('A defaults.env VEO_CONCURRENCY is 12', fromDefaults.VEO_CONCURRENCY, 12);
+check('A defaults.env VEO_TITLING_CONCURRENCY is 4', fromDefaults.VEO_TITLING_CONCURRENCY, 4);
+check('A the veo split holds: submit+poll runs wider than in-process titling',
+  fromDefaults.VEO_CONCURRENCY > fromDefaults.VEO_TITLING_CONCURRENCY, true);
 check('A defaults.env ATLAS_SUBMIT_SPACING_MS is 1200', fromDefaults.ATLAS_SUBMIT_SPACING_MS, 1200);
 check('A defaults.env GROK_MAX_RPS is 1', fromDefaults.GROK_MAX_RPS, 1);
 
