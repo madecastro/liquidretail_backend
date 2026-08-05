@@ -339,13 +339,37 @@ legitimate layoutInput usages still exist**, so an over-eager cleanup fails the 
 Revert-proven on 5 mutations including both directions (restore the bad `.select()` → Group A names
 it; break the layoutInput contract → Group D fails). Full suite **54 scripts, 0 failing**.
 
-### Open question the owner should settle
+### MEASURED 2026-08-04 against production — the gate was NOT the cause
 
-Whether the GPT tier ever ran is an empirical question and **there is no local Mongo URI**, so it is
-unanswered. Check `enrichmentSources` for a `'gpt'` entry across brands; if it is near-absent while
-brands have `websiteUrl`s, none of the derived attributes were ever generated and the gate above is
-the whole story. Then re-run enrichment on a brand and confirm `summary` / `tone` / `demographics`
-populate before wiring any new consumer — do not build consumers for fields nothing writes.
+Queried prod directly (read-only, via the Render API for `MONGODB_URI`). **31 brands, 25 with a
+`websiteUrl`** (only those are enrichable):
+
+| attribute | populated | note |
+|---|---|---|
+| `enrichmentSources` contains `'gpt'` | **21/31** (84% of enrichable) | the tier RAN |
+| `summary` | **21/31** | GPT tier is its only automated writer — tracks the tier exactly |
+| `tone[]` / `hashtags[]` / `tags[]` / `demographics[]` | 21/31 each | same tier |
+| `brandReviews.summary` | **29/31 (94%)** | best-populated derived source on the system |
+| `tagline` | 25/31 | GPT / Brandfetch / curated |
+| `logoUrl` | 25/31 | |
+| `derivedVoice` | **1/31 (3%)** | confirms it is ads-platform-only; not a general option |
+
+`OPENAI_API_KEY` is set on **both** WEB (24 vars) and WORKER (15) — which is why `wantGpt` passed
+and the tier ran. **So the `wantGpt` gate fix is a correct latent-bug fix but is NOT load-bearing
+today**; it only bites if that key is ever removed while Atlas remains. Do not describe it as the
+cause of the empty ads. The earlier hypothesis in this file said it might be "the whole story" —
+that was wrong and is corrected here.
+
+**The real story is better for us: the data EXISTS and the Director was reading the wrong field.**
+21 brands have real `summary` prose and it never reached the brief, because `brand_signal.description`
+read the non-existent `brand.description` instead of `brand.summary`. The fix in PR #75 connects
+21 brands' brand voice to the Director for the first time — it is not merely hygiene.
+
+**Next, and now evidence-backed:** `brandReviews.summary` at 94% is the most-populated derived
+attribute on the system and is already in the Director brief. If ad copy is still thin after #75
+deploys, that is the field to lean on — not `derivedVoice` (3%, effectively unavailable) and not
+the GPT tier (already running). The 4 enrichable brands with no `'gpt'` entry are worth a
+`/refresh-enrichment` to see whether they fail for a separate reason.
 
 ---
 
@@ -354,13 +378,15 @@ populate before wiring any new consumer — do not build consumers for fields no
 **START HERE — 2026-08-05 pickup.**
 
 0a. **NEWEST: the `ai_brand_led` no-copy fix is OPEN AS PR #75, not merged, never rendered live.**
-   Branch `fix/brand-led-static-copy`, two commits. Full write-up in the two sections directly
-   above this one (*"`ai_brand_led` static ads had NO COPY"* and *"the STARVED SOURCE"*).
-   Offline-verified (1882 + 29 + 40 + 17 checks, 15 revert-proven mutations; 51/52 green in a
-   clean worktree, the one failure pre-existing at `main`). **Next action: review + merge #75,
-   deploy, then run ONE `meta_static` job** on a brand that has both a `summary` and a `tagline`,
-   on a product that already has a `CreativeDirectionArtifact` (proves the
-   `DIRECTOR_SIGNALS_VERSION` bump forced a re-derive), and read the copy off the delivered
+   Branch `fix/brand-led-static-copy`, two commits. Full write-up in the three sections directly
+   above this one (*"`ai_brand_led` static ads had NO COPY"*, *"the STARVED SOURCE"*, and
+   *"MEASURED 2026-08-04 against production"*). Offline-verified (1882 + 29 + 40 + 17 checks,
+   15 revert-proven mutations; 51/52 green in a clean worktree, the one failure pre-existing at
+   `main`). **Next action: review + merge #75, deploy, then run ONE `meta_static` job** on any of
+   the **21 brands (of 31) that already have a populated `summary`** — the gate turned out not to
+   be the blocker (`OPENAI_API_KEY` is set on both services), so this is a real, not hypothetical,
+   population to pick from — on a product that already has a `CreativeDirectionArtifact` (proves
+   the `DIRECTOR_SIGNALS_VERSION` bump forced a re-derive), and read the copy off the delivered
    images. Check **copy fidelity first** — kill switch `STATIC_BRAND_LED_COPY=false`, no deploy
    needed. Note commit 1 of that PR is the pre-existing fidelity hardening, shipping on its own
    419-check harness and **not** line-by-line reviewed as part of the PR.
