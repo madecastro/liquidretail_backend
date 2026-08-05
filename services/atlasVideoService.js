@@ -148,6 +148,21 @@ const REFRAME_BORDER_STD_MAX = () => {
 //   reframe-v2 → current: 4k + conservative 'reframe' prompt, product-only $0
 //                pad routing, output ratio validation, solid-preferred pad
 const REFRAME_LADDER_VERSION = 'reframe-v2';
+// Additive prompt hardening. When true, reframePromptForAspect appends
+// SUBJECT IDENTITY, PHYSICAL ACCURACY, and (when the source has YOLO subjects
+// touching a frame edge) SOURCE-EDGE PROTECTION clauses. When false — the
+// DEFAULT — the base sentence is emitted byte-identically to pre-hardening.
+// The revert is a single flag flip; the byte-identity contract is pinned by
+// scripts/verifyReframePromptHardening.js. Never applied to the 'uncrop'
+// style: that prompt is documented as verbatim-from-Expander and shouldn't
+// be modified. See reframePromptForAspect + uncropPromptForAspect below.
+const REFRAME_PROMPT_HARDENING = () =>
+  String(process.env.REFRAME_PROMPT_HARDENING || 'false').toLowerCase() === 'true';
+// Pixels-from-edge tolerance for "subject clipped at frame edge" — accounts
+// for YOLO measurement variance. A bbox within this many px of any source
+// edge is treated as edge-clipped, which triggers SOURCE-EDGE PROTECTION in
+// the hardened prompt.
+const REFRAME_EDGE_CLIP_THRESHOLD_PX = 4;
 // Re-derive cached assets produced by an OLDER ladder on the next video
 // generation, rather than serving them forever. A product whose videos were
 // made under the old resize regime picks up the new one without any manual
@@ -995,16 +1010,93 @@ async function fetchOutpaintOutput(outUrl, attempts = 3) {
 //     waistband crop into an invented whole garment. Product-only shots are
 //     routed to the $0 pad before this is reached, so the clause only applies
 //     to on-model/lifestyle frames — but the risk is why it isn't the default.
-function reframePromptForAspect(aspectRatio) {
-  const [wr, hr] = String(aspectRatio).split(':').map(Number);
-  const orient = wr > hr ? 'horizontal (landscape)' : wr < hr ? 'vertical (portrait)' : 'square';
-  return `Reframe this image into a ${orient} ${wr}:${hr} composition. Keep the ENTIRE subject and all text fully visible and uncropped. Naturally extend the existing background, colors and scene to fill the new areas — do not add new objects, people or text. Seamless, photorealistic, matching the original style, lighting and palette.`;
+// Detect whether any YOLO subject bbox sits within REFRAME_EDGE_CLIP_THRESHOLD_PX
+// of the source frame edges. Pure — no I/O. The b13 fabrication class
+// (nano-banana inventing anatomy above heads that were cut off at y=0, or
+// below feet that ended at y=2007 on a 2018-tall source) is exactly the case
+// this flags: when the model is asked to extend a frame whose subjects were
+// already partially cropped, "continue the scene" becomes "invent the missing
+// body," and Gemini-family editors reliably fabricate.
+function hasEdgeClippedSubjects(media) {
+  const w = Number(media?.width);
+  const h = Number(media?.height);
+  if (!(w > 0 && h > 0)) return false;
+  const refined = Array.isArray(media?.refinedProducts) ? media.refinedProducts : [];
+  const T = REFRAME_EDGE_CLIP_THRESHOLD_PX;
+  return refined.some((r) => (
+    Number.isFinite(r?.x1) && Number.isFinite(r?.y1) &&
+    Number.isFinite(r?.x2) && Number.isFinite(r?.y2) &&
+    (r.x1 <= T || r.y1 <= T || r.x2 >= w - T || r.y2 >= h - T)
+  ));
 }
 
-function reframeOutpaintPrompt(aspectRatio) {
+// The `reframe` prompt has two shapes. Both start with the same base sentence
+// so REFRAME_PROMPT_HARDENING=false is BYTE-IDENTICAL to the pre-hardening
+// output. Hardening only ever APPENDS clauses; it never rewrites the base.
+// This preserves the "measured artifact-free" ladder (uncrop-v1 → reframe-v2)
+// as the fallback when hardening is reverted, and lets the byte-identity
+// verifier prove flag-off produces no drift.
+function reframePromptForAspect(aspectRatio, ctx = {}) {
+  const [wr, hr] = String(aspectRatio).split(':').map(Number);
+  const orient = wr > hr ? 'horizontal (landscape)' : wr < hr ? 'vertical (portrait)' : 'square';
+  // BASE — byte-identical to the pre-hardening prompt. Do not edit this
+  // string without bumping REFRAME_LADDER_VERSION and re-measuring on real
+  // catalogue imagery. Same rule the static prompt hardening carries per
+  // CLAUDE.md §2's flag-off byte-identity contract.
+  const base = `Reframe this image into a ${orient} ${wr}:${hr} composition. Keep the ENTIRE subject and all text fully visible and uncropped. Naturally extend the existing background, colors and scene to fill the new areas — do not add new objects, people or text. Seamless, photorealistic, matching the original style, lighting and palette.`;
+
+  if (!REFRAME_PROMPT_HARDENING()) return base;
+
+  const clauses = [base];
+
+  // (a) SUBJECT IDENTITY — only when we have a product name to plug in.
+  // ctx.productTitle typically comes from Media.metadata.productTitle
+  // (materializeImage in catalogProductDetectService.js:606). When absent
+  // (rare: legacy media, non-catalog sources), we omit rather than emit a
+  // useless "The primary subject is null" line.
+  const title = typeof ctx.productTitle === 'string' && ctx.productTitle.trim()
+    ? ctx.productTitle.trim() : null;
+  if (title) {
+    clauses.push(
+      `SUBJECT IDENTITY: The primary subject is "${title}". Preserve its shape, colors, materials, stitching, label text, and every logo or badge exactly as they appear in the source. Do NOT invent alternate garment styles, invent product text, or add branding that isn't in the source.`
+    );
+  }
+
+  // (b) PHYSICAL ACCURACY — ported from veoPromptBuilder's canonical clause.
+  // Applies to any on-model shot; unconditional under hardening.
+  clauses.push(
+    `PHYSICAL ACCURACY: If people are visible, keep hands anatomically correct (5 fingers per hand), keep faces symmetric with paired eyes, and preserve body proportions. Do NOT invent extra digits, mismatched eyes, warped features, or impossible poses. Do NOT alter the identity, hair, skin tone, or facial features of any person from the source.`
+  );
+
+  // (c) SOURCE-EDGE PROTECTION — the specific hallucination class we
+  // diagnosed on b13: subjects clipped by the source frame at y=0 (r3) and
+  // y=2007 on a 2018-tall source (r4). Extending vertically into new area,
+  // nano-banana invented what "should be" above the head / below the feet.
+  // This clause tells the model NOT to extend the subject — only the
+  // background — in the newly-created regions.
+  if (ctx.hasEdgeClippedSubjects) {
+    clauses.push(
+      `SOURCE-EDGE PROTECTION: The source image already contains subjects clipped by the frame edges. Do NOT invent unseen anatomy above, below, or beside the visible portions of these subjects. Extend the background and setting only into the newly-created regions; leave the subjects' cropped boundaries where the source ends.`
+    );
+  }
+
+  return clauses.join(' ');
+}
+
+// Assemble the ctx object for the hardened prompt from a Media doc.
+// Extracted so both the reframe worker and the verifier can call it —
+// no reason to duplicate the "which fields do we read" contract.
+function reframePromptContext(media) {
+  return {
+    productTitle: media?.metadata?.productTitle || null,
+    hasEdgeClippedSubjects: hasEdgeClippedSubjects(media)
+  };
+}
+
+function reframeOutpaintPrompt(aspectRatio, ctx = {}) {
   return REFRAME_PROMPT_STYLE() === 'uncrop'
     ? uncropPromptForAspect(aspectRatio)
-    : reframePromptForAspect(aspectRatio);
+    : reframePromptForAspect(aspectRatio, ctx);
 }
 
 // Verbatim uncrop prompt from ReachSocialLLMExpander media.ts:uncropPrompt.
@@ -1781,7 +1873,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
           const id = await submitImageGeneration({
             model: REFRAME_OUTPAINT_MODEL(),
             images: [srcNorm.url],
-            prompt: reframeOutpaintPrompt(aspectRatio),
+            prompt: reframeOutpaintPrompt(aspectRatio, reframePromptContext(media)),
             aspectRatio,
             resolution: REFRAME_RESOLUTION()
           });
@@ -3432,6 +3524,12 @@ module.exports = {
   referenceStackBudget,
   pickProductOnlyUrl,
   buildPromptScaffold,
+  // Exported for scripts/verifyReframePromptHardening.js — the prompt
+  // is the load-bearing artifact and the offline harness inspects the
+  // string it emits under both flag values + a fixture matrix.
+  reframeOutpaintPrompt,
+  reframePromptContext,
+  hasEdgeClippedSubjects,
   // Billable-submit replay guard. Exported for scripts/verifySubmitGuard.js —
   // these decide whether a charged POST is repeated, so they are tested directly
   // rather than through a mocked axios.
