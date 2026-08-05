@@ -40,6 +40,7 @@ const CatalogProduct            = require('../models/CatalogProduct');
 const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
 const { recordFlatCost } = require('./costTracker');
+const referenceDefaultsService  = require('./referenceDefaultsService');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
@@ -908,7 +909,11 @@ function resolveReferenceImageCount({ brand = null, product = null } = {}) {
   const chain = [
     ['CatalogProduct.videoSettings.referenceImageCount', product?.videoSettings?.referenceImageCount],
     ['Brand.videoSettings.referenceImageCount',          brand?.videoSettings?.referenceImageCount],
-    ['ATLAS_REFERENCE_IMAGE_COUNT env',                  process.env.ATLAS_REFERENCE_IMAGE_COUNT]
+    ['ATLAS_REFERENCE_IMAGE_COUNT env',                  process.env.ATLAS_REFERENCE_IMAGE_COUNT],
+    // Policy floor, below the legacy env name so an existing
+    // ATLAS_REFERENCE_IMAGE_COUNT deployment keeps winning and this is purely
+    // additive. See services/referenceDefaultsService.js.
+    ['VIDEO_DEFAULT_REFERENCE_COUNT env',               process.env.VIDEO_DEFAULT_REFERENCE_COUNT]
   ];
   for (const [source, raw] of chain) {
     if (raw == null || raw === '') continue;
@@ -2066,7 +2071,25 @@ async function buildReferenceImages({
     }
 
     // Catalog mirrors (hero-first / createdAt asc), skip seed id.
-    for (const cm of (catalogMedias || [])) {
+    //
+    // Reordered by the configured shot-type PREFERENCE first
+    // (VIDEO_DEFAULT_REFERENCE_SHOT_TYPES). Unset by default, in which case this
+    // is a strict no-op and the array keeps pure feed order — the owner's
+    // "first, second, third as downloaded". A pure reorder, never a filter:
+    // shotType is absent until detect runs, so dropping on it would empty the
+    // stack for freshly ingested products.
+    //
+    // The SOURCE dial is deliberately NOT applied here. This branch is the AUTO
+    // assembly, but `catalogMedias` is also where callers deliberately place
+    // operator-chosen lifestyle/social media (the source:'catalog-product'
+    // filter was removed upstream precisely so those picks survive), so
+    // narrowing at this depth could discard media a caller meant to include.
+    // Source scoping stays with the callers and the picker default.
+    const orderedCatalogMedias = referenceDefaultsService.orderByShotTypePreference(
+      catalogMedias || [],
+      referenceDefaultsService.videoReferenceDefaults().shotTypes
+    );
+    for (const cm of orderedCatalogMedias) {
       if (!cm?.fileUrl) continue;
       if (media?._id && String(cm._id) === String(media._id)) continue;
       const mid = cm._id != null ? String(cm._id) : null;
@@ -3236,7 +3259,23 @@ async function buildPromptScaffold({
     // silently drop. defaultReferenceCount is how many get used when the
     // operator picks nothing.
     maxReferenceImages:    caps?.maxReferenceImages || MAX_REFERENCE_IMAGE_COUNT,
-    defaultReferenceCount: resolveReferenceImageCount({ brand, product })
+    defaultReferenceCount: resolveReferenceImageCount({ brand, product }),
+
+    // Default-stack POLICY for both rails, so the Step 2 picker pre-picks what
+    // this backend would pick on its own. Served here because the picker already
+    // calls this endpoint — which keeps config/defaults.env the single source of
+    // truth and means changing a default needs no Netlify rebuild. The static
+    // count in particular was hardcoded in the frontend as
+    // IMAGE_QUEUE_DEFAULT_COUNT before this.
+    //
+    // The video block carries NO count on purpose. `defaultReferenceCount` above
+    // is the one authoritative video count (the full per-product → per-brand →
+    // env cascade); serving a second one invited the picker to advertise a
+    // number generation would not actually use.
+    referenceDefaults: {
+      video: { shotTypes: referenceDefaultsService.videoReferenceDefaults().shotTypes },
+      image: referenceDefaultsService.imageReferenceDefaults()
+    }
   };
 }
 

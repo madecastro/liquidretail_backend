@@ -140,6 +140,56 @@ out captioned "image still processing" for a catalog ingested weeks earlier.
 
 Fence: `scripts/verifyCatalogHeroMaterialize.js` (65 checks, offline).
 
+### Default reference stacks — ENV-configurable (video and static, independently)
+
+`services/referenceDefaultsService.js`. Owner requirement (2026-08-05): video
+defaults to **the first, second and third catalog images as downloaded from the
+site / Shopify feed**, with the count and the type settable outside the Render
+dashboard.
+
+| var | default | effect |
+|---|---|---|
+| `VIDEO_DEFAULT_REFERENCE_COUNT` | `3` | Floor of the video count cascade (product → brand → `ATLAS_REFERENCE_IMAGE_COUNT` → this → 3). Bounded by `MAX_REFERENCE_IMAGE_COUNT` (7). |
+| `IMAGE_DEFAULT_REFERENCE_COUNT` | `1` | Step 2 image-queue pre-pick size. Was hardcoded in the frontend. |
+| `VIDEO_DEFAULT_REFERENCE_SHOT_TYPES` | *(empty)* | Ordered shot-type **preference**. Empty = pure feed order. |
+| `IMAGE_DEFAULT_REFERENCE_SHOT_TYPES` | *(empty)* | Same, static rail. |
+| `VIDEO_SEED_FEED_ORDER` | `true` | Pre-existing; was reachable only via the dashboard. |
+| `VIDEO_SEED_MAX_SUBJECT_FRACTION` | `0.6` | Pre-existing; same. |
+
+**There is no default shot type, by design.** Both preference vars ship empty and
+empty is a strict no-op. The dial is opt-in.
+
+**It is a preference, never a filter.** `classification.shotType` is written by
+the deferred detect pass, so a freshly ingested product has none — a filter would
+empty the stack for exactly the newest products. Matching media sort forward in
+list order; everything else, including all unclassified media, keeps feed order
+behind them, and nothing is dropped. A configured preference is simply inert
+until detect has run.
+
+**Rails are independent.** Separate vars. Deriving the static count from the
+video count is a known past bug — a non-empty `mediaIds` sets
+`universeTopN = max(mediaIds.length, DIRECTOR_UNIVERSE_TOP_N)`, so a 3-seed video
+default silently produced a 3-image static universe where hero-only was intended.
+
+**Scope, stated honestly:**
+- The video preference applies to the picker pre-pick **and** to
+  `buildReferenceImages`' auto-assembly. It does **not** move the seed at
+  position 0, and it never reorders an explicit operator pick list.
+- The static policy governs the **picker pre-pick** (those picks POST as
+  `mediaIds` and drive the run). It does **not** change the backend's
+  empty-`mediaIds` fallback, which remains the shotType-ranked universe trimmed
+  to `DIRECTOR_UNIVERSE_TOP_N`. An API caller sending no `mediaIds` is unaffected.
+- The picker needs per-image shot types to honour a preference at all (its
+  explicit picks suppress the backend's assembly), so `GET /api/catalog/:id`
+  returns `imageShotType` + `additionalImageShotTypes`, index-aligned with
+  `imageUrl` / `additionalImages` and hole-preserving. Best-effort: a failed
+  lookup degrades to nulls rather than 500ing product detail.
+- A **SOURCE** dial (catalog / catalog_then_ugc / any) was drafted and **cut
+  before shipping** — it was dead in every wired path, and a config var that
+  silently does nothing gets trusted later. The fence asserts its absence.
+
+Fence: `scripts/verifyReferenceDefaults.js` (43 checks, offline).
+
 ### Stages (`pipelines/detect.js` → `runCatalogProductPipeline` ~480–640)
 
 Per catalog-product **Media** (source `catalog-product`):

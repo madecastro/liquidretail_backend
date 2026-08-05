@@ -843,8 +843,44 @@ router.get('/:id', async (req, res) => {
       altMediaIds.map(id => id ? loadHeroCrops(id).catch(() => null) : Promise.resolve(null))
     );
 
+    // Per-image shot type, index-aligned with imageUrl / additionalImages.
+    //
+    // The Step 2 picker needs this to honour the configured shot-type
+    // PREFERENCE (VIDEO_/IMAGE_DEFAULT_REFERENCE_SHOT_TYPES). Without it the
+    // knob would be inert in practice: the picker pre-picks explicit ids, and a
+    // non-empty pick list suppresses the backend's own auto-assembly — so the
+    // preference applied there would never be reached on the normal wizard path.
+    //
+    // One batched query. `null` for an unmaterialized image or one detect has
+    // not classified yet, which is the normal state under deferred detect — the
+    // client must treat null as "no opinion" and keep feed order, never as a
+    // reason to exclude.
+    // Best-effort, like the crop loads above: this is decorative metadata that
+    // only tunes an opt-in preference, so a DB blip or a bad id in the $in list
+    // must degrade to "no shot types" and NOT take down product detail — the
+    // outer catch would turn it into a 500 and leave the picker with no imagery
+    // at all for this product.
+    const shotTypeByMediaId = new Map();
+    try {
+      const ids = [product.imageMediaId, ...(product.additionalImageMediaIds || [])]
+        .filter(Boolean).map(String);
+      if (ids.length) {
+        const docs = await Media.find({ _id: { $in: ids } })
+          .select('classification.shotType').lean();
+        for (const d of docs) {
+          shotTypeByMediaId.set(String(d._id), d.classification?.shotType || null);
+        }
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  catalog detail [${product._id}]: shot-type lookup failed: ${err.message}`);
+    }
+
     res.json({
       product: projectDetail(product, category),
+      imageShotType: product.imageMediaId
+        ? (shotTypeByMediaId.get(String(product.imageMediaId)) || null)
+        : null,
+      additionalImageShotTypes: altMediaIds.map(id => (id ? (shotTypeByMediaId.get(id) || null) : null)),
       heroCrops,
       altCrops: altCropsResults,
       variants: (variants || []).map(v => ({
