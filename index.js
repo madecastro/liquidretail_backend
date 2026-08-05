@@ -357,6 +357,36 @@ require('./services/remotionRenderService')
   .warmup()
   .catch(err => console.warn(`🎬 remotion: warmup failed (${err.message}) — first render will retry`));
 
+// Titling resume sweeper — titles masters recovered by bootRecoveryService.
+// WHY WEB, NOT WORKER: Remotion is warmed above; worker.js has no remotion
+// references, so the worker can recover the asset but cannot title it. Fire-
+// and-forget: first tick delayed ~90s so it lands after remotion warmup and
+// Mongo connect (mirrors worker.js's watchdog comment), then on an interval.
+// A sweeper failure must never affect the web process.
+//
+// RE-ENTRANCY GUARD, and it is not cosmetic. A single Remotion titling render
+// measured 76s, and TITLING_RESUME_MAX defaults to 5 ads per pass — so a pass
+// can comfortably outlast the 5-minute interval and the next timer would fire
+// on top of it. Correctness is already safe (the renderStage-guarded claim in
+// titlingResumeService means two passes can never title the SAME ad), but
+// stacking concurrent Remotion renders on the web process is a memory hazard:
+// this same process died on 2026-08-04 when a 24 MB buffer landed mid-render
+// (commit bab129a). One pass at a time; a skipped tick is picked up by the next.
+(() => {
+  const { resumeUntitledMasters } = require('./services/titlingResumeService');
+  const intervalMin = Math.max(1, parseInt(process.env.TITLING_RESUME_INTERVAL_MIN, 10) || 5);
+  let inFlightPass = false;
+  const tick = () => {
+    if (inFlightPass) return;
+    inFlightPass = true;
+    return resumeUntitledMasters()
+      .catch(err => console.warn(`⚠️  titling resume failed: ${err.message}`))
+      .finally(() => { inFlightPass = false; });
+  };
+  setTimeout(tick, 90 * 1000);
+  setInterval(tick, intervalMin * 60 * 1000);
+})();
+
 // Progress reaper — runs left behind by the previous process (in-process
 // setImmediate jobs die on restart) get marked failed instead of showing
 // "running" forever. The worker's periodic reaper covers ongoing sweeps.

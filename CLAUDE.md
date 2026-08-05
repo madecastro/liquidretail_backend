@@ -465,8 +465,49 @@ Video never launches a browser.
   `1024x1024` default, which would square a 4:5 surface and then crop it.
 - **`queued` ads never auto-drain** — still require an explicit `/runs` (or
   equivalent) claim.
-- **`veoPredictionId` is a spend receipt that is never resumed** — process
-  death + re-drain can double-bill Omni for the same ad.
+- ~~**`veoPredictionId` is a spend receipt that is never resumed**~~ — **CLOSED
+  2026-08-04** (PRs #70-#72 + the titling resume). The receipt is now polled for
+  free and the paid master collected: `services/bootRecoveryService.js` sweeps
+  ads stranded in `rendering` that hold a receipt, and every requeue site is
+  receipt-aware via `services/spendReceipt.js`. Do not re-open this as a bug.
+  **What replaced it, and it is a DIFFERENT invariant — see §2 below:** a
+  recovered master must be TITLED, and must never be requeued to get there.
+- **A RECOVERED MASTER MUST NEVER BE REQUEUED — `status:'queued'` costs ~$0.75.**
+  This reads as the obvious way to "finish" a recovered ad and it is a
+  double-charge. `routes/ads.js:1342` declares `veoVideoUrl` **fresh** every
+  render and the path **never reads `ad.veoVideoUrl`**, so `if (!veoVideoUrl)`
+  (`:1367`) is TRUE for an ad that already holds a paid master — it falls
+  straight into `veoGenerateForAd` and submits to Omni a second time. Titling is
+  therefore resumed **titling-only** by `services/titlingResumeService.js`
+  (claim → `renderBrandScriptAndSave`), never by re-entering the render queue.
+  Pinned by `scripts/verifyTitlingResume.js` **T6** (neither service may contain
+  `status: 'queued'`) and **T10** (the sweeper may not even require
+  `atlasVideoService`, so it is structurally incapable of spending).
+- **Titling resume is WEB-ONLY and that is not arbitrary.** Remotion is warmed in
+  `index.js`; `worker.js` has **zero** remotion references. So the worker
+  recovers the asset (`bootRecoveryService`) and the web process titles it
+  (`titlingResumeService`, on an interval with a re-entrancy guard).
+- **The resume state lives on `Ad.titlingResumeState` — NEVER on `renderStage`,
+  and this was got wrong once.** The first design parked the sentinel in
+  `renderStage`, reasoning that reusing an existing field dodges the
+  Mongoose-strict trap where a write to an **undeclared** path is silently
+  dropped (this repo already lost `renderError.predictionId` that way).
+  Adversarial review killed it: **`renderStage` is OWNED by
+  `services/adStage.js`**, which `$set`s it unconditionally (`adStage.js:82-85`)
+  and is called throughout titling (`brandScriptExecutor.js:1200`, `:1306`,
+  `:1332`). The sentinel was therefore clobbered seconds into the render, so an
+  ad whose render crashed could never be re-swept — the exact leak the resume
+  exists to close. The trap is about *undeclared* paths; **declaring** the field
+  (`models/Ad.js`, `enum:['pending','claimed',null]`) removes it. `renderStage`
+  is still written alongside as a human breadcrumb, but nothing queries it.
+  `scripts/verifyTitlingResume.js` **G1/G2** forbid keying any query or claim
+  filter on `renderStage`, and **G3** asserts the schema declaration exists — so
+  neither half of that mistake can come back.
+  **Corollary worth knowing:** the same mid-titling crash leaves the identical
+  orphan on the NORMAL render path today (`routes/ads.js:1437-1460` stamps
+  `draft` + `renderUrl` *before* titling at `:1477`), and no sweeper catches that
+  either, because they all key on `status:'rendering'`. Pre-existing, still open,
+  not introduced here.
 - Meta preview chrome can show placeholder **"Lorem ipsum dolor sit amet"**.
 
 ---
@@ -573,6 +614,35 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `atlasLlmService` (Atlas does not proxy grounded retrieval), so gating that tier
   on its own key is correct. Before "fixing" a key gate, read which client the tier
   actually calls.
+- **A REGEX OVER SOURCE TEXT CANNOT SEE AN UNBOUND IDENTIFIER — and `node --check`
+  cannot either.** This shipped a broken money guard to production with a green
+  harness on 2026-08-04. `services/processAlerts.js` called `receiptFree({...})`
+  and never imported it; `routes/ads.js:23` and `worker.js:59` both did.
+  `verifyReceiptAwareRequeue.js` "checked" the site with
+  `/receiptFree\(/.test(block)` — which proves the call is *written*, not that it
+  *resolves*. A `ReferenceError` is runtime, not syntax, so `node --check` passed
+  too. Because both writes sat in one `Promise.all([...])`, the throw happened
+  while the array was being **evaluated**, so `CampaignRun.updateMany` never even
+  ran: every SIGTERM with ads in flight silently requeued nothing AND left the run
+  unmarked — the exact "silent stall" that function exists to prevent. It hid for
+  three hours because `persistOrphans` returns early when nothing is in flight.
+  **Rule: when a harness asserts a call site uses a helper, it must also assert
+  that file IMPORTS the helper** — and derive the file list by SCANNING, never a
+  hardcoded list, or the next call site is unguarded again. Now `I0-I5`, and the
+  scan is **recursive** (36 files under `services/providers`,
+  `services/capabilityExecutors`, `services/reviewAdapters`, … were previously
+  invisible to `X1` as well).
+- **A merge conflict marker SURVIVES in `.env` — the parser ignores what it cannot
+  understand.** `config/defaults.env` on `main` carried literal `<<<<<<<` /
+  `=======` / `>>>>>>>` at lines 498/535/566 and was deployed. It did **not** break
+  config: dotenv skips any line that is not `KEY=VALUE`, so all 114 keys parsed and
+  both arms' vars were effective (measured, not assumed). But nothing catches it —
+  not `node --check`, and **not the §4a diagnostic**
+  (`grep -oE '^[A-Z_][A-Z0-9_]*='`), because markers do not match that pattern.
+  Resolved 2026-08-04 by keeping **both** arms, since both were already live and
+  dropping either would have been a silent behaviour change; proven a no-op at
+  117 → 117 keys with identical values. **Add a marker scan to any config audit,
+  and never assume a dirty merge would have failed loudly.**
 - **Docs have described commented-out code.** `TITLING.md` documented the disabled
   canvas cascade as live. When you find such a case, fix the doc in the same commit.
 - **Director concept contract (v3 nested under `routing`).** Schema v3 moved

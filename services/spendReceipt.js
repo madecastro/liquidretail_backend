@@ -20,9 +20,19 @@
 // Measured in production: a 411s Omni master completed at 17:27:09 and the
 // shutdown requeue swept its run one second later, at 17:27:10.
 //
-// THE RULE: a requeue may only ever touch RECEIPT-FREE ads. Those were never
-// billed — the process died before or during submit — so re-running them costs
-// the one charge that was always owed. Receipt-HOLDING ads stay in `rendering`,
+// THE RULE: a requeue may only ever touch RECEIPT-FREE ads, so re-running them
+// costs the one charge that was always owed.
+//
+// ONE HONEST GAP, do not paper over it: "receipt-free" means "we hold no receipt",
+// NOT "it was never billed". The receipt is written AFTER the submit POST returns,
+// so an ad whose submit is IN FLIGHT when the process dies is genuinely billed and
+// still receipt-free — it matches RECEIPT_FREE and will be requeued. That window is
+// irreducible without a pre-submit intent record, and it is narrow (one HTTP
+// round-trip) versus the alternative of never requeuing anything. It is also not a
+// silent double-charge: `queued` ads never auto-drain (CLAUDE.md §2), so a human has
+// to re-drain before a second submit can happen. Earlier wording here claimed such
+// ads "were never billed — the process died before or during submit"; the "during
+// submit" half was wrong and is corrected. Receipt-HOLDING ads stay in `rendering`,
 // which is honest (the outcome genuinely is unknown until the receipt is
 // polled), stays visible to ALERT_RENDERING_STALE_MIN, and preserves the receipt
 // so the asset can be recovered for free instead of re-bought.

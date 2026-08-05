@@ -26,6 +26,10 @@
 
 const alerts   = require('./alertService');
 const inFlight = require('./inFlight');
+// Load-bearing: persistOrphans is the only requeue site that runs on every
+// SIGTERM, so losing this import silently disables both the requeue and the
+// run-failure diagnostic (ReferenceError aborts the Promise.all array eval).
+const { receiptFree } = require('./spendReceipt');
 
 const FLUSH_MS = () => Math.max(250, Math.min(parseInt(process.env.ALERT_EXIT_FLUSH_MS || '2500', 10), 10000));
 

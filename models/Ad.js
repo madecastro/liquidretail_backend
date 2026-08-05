@@ -380,6 +380,25 @@ const adSchema = new mongoose.Schema({
   // swallowed. Telemetry must not be able to fail a paid render.
   renderStage:        { type: String, default: null },
   renderStageAt:      { type: Date, default: null },
+  //
+  // TITLING RESUME state — services/titlingResumeService.js. 'pending' = a paid
+  // master was recovered from its spend receipt and still needs titling;
+  // 'claimed' = a web instance is titling it now; null = nothing owed.
+  //
+  // WHY THIS IS ITS OWN DECLARED FIELD AND NOT A renderStage SENTINEL. The first
+  // version of the resume encoded this state in `renderStage`, on the reasoning
+  // that reusing an existing field avoids the Mongoose-strict trap where a write
+  // to an UNDECLARED path is silently dropped (this repo already lost
+  // renderError.predictionId that way). That was wrong: `renderStage` is owned by
+  // services/adStage.js, which `$set`s it unconditionally (adStage.js:82-85) and
+  // is called throughout titling (brandScriptExecutor.js:1200/1306/1332). So the
+  // sentinel was overwritten seconds into the render, and an ad whose render then
+  // crashed could never be re-swept — the exact leak the resume exists to close.
+  // Declaring the field here is what makes the write safe; the silent-drop trap is
+  // about UNdeclared paths, not about new fields. Pinned by
+  // scripts/verifyTitlingResume.js (asserts this declaration exists, so the field
+  // cannot be used without being declared).
+  titlingResumeState: { type: String, enum: ['pending', 'claimed', null], default: null },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },
