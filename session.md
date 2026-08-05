@@ -5,6 +5,61 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-04 — GREYED-OUT "PRIMARY" TILE. Root-caused and fixed. PR #79 (backend) + liquidretail #33 (frontend)
+
+Owner: the **PRIMARY** tile in the ad-generation image picker was greyed out and captioned
+*"image still processing"* on a retailer ingested weeks earlier. **Nothing was processing.**
+
+**Root cause.** The picker greys any tile whose `imageMediaId` is falsy; the thumbnail comes
+from the raw `imageUrl`, hence "greyed but visible". `afbf288` (#7, 2026-07-23) moved
+per-product detect behind `CATALOG_DETECT_PRECOMPUTE=false`, so **no ingest path** materializes
+the hero at sync time — `enqueueBrandProductDetects` returns `deferred` before reaching
+`enqueueProductDetect`. The compensating pull (`ensureDetectForProducts`) runs at
+**ad-generation time, after the picker renders.** Alts escaped only because
+`GET /api/catalog/:id` already lazily backfilled them; there was no hero equivalent.
+
+**The generalisable lesson — `imageMediaId` means "a hero Media EXISTS", NOT "detect RAN".**
+Conflating those two facts produced three separate defects, all fixed here:
+1. `enqueueProductDetect` persisted the pointer from `enqueued.hero` (which additionally
+   requires DetectRun creation, declined by `createDetectRunIfAbsent` on an
+   E11000-with-no-in-flight-run race) → usable Media stamped `null`, made permanent by the
+   skip gate.
+2. `seedsFromProduct` + `expandDeterministicVideo` read only `enqueued.hero` → a
+   materialized-but-unqueued hero became `NO_HERO_MEDIA`, a **silently dropped video ad**.
+3. `ensureDetectForProducts` gated on the bare pointer → would have skipped every
+   backfilled product, shipping **paid ads with no crops or overlay zones**. Now gates on
+   the DetectRun.
+
+**Fix.** `materializeMissingHero` (hero counterpart of `materializeMissingAlts`) on the same
+endpoint, **materialize-only, no DetectRun** — one Cloudinary mirror, no Gemini. The deferral
+is NOT reverted (`CATALOG_DETECT_PRECOMPUTE` stays `false`; the fence asserts it).
+Pointer-only products route to the new `ensureDetectRunsForExistingMedia` (runs only, persists
+nothing) — **never** back through `enqueueProductDetect`, which writes
+`additionalImageMediaIds` **compact** while `materializeMissingAlts` keeps it
+**index-aligned**; the detail response and alt crop galleries zip by index, so rewriting
+mis-pairs every alt when a hero URL is duplicated into `additionalImages` (common feed shape).
+
+**Fence:** `scripts/verifyCatalogHeroMaterialize.js` — 65 offline checks, revert-proven on 13
+mutations. Suite 53 pass / 1 fail, identical to `origin/main` (`verifyFontFallback` fails on
+trunk too).
+
+⚠️ **Two of the three defects, and both regressions in my own drafts, were caught by the
+adversarial review pass — not by reading the diff.** The pointer/run conflation is genuinely
+easy to miss. Keep that pass mandatory here.
+
+**Known limit, dormant:** under `CATALOG_DETECT_PRECOMPUTE=true`,
+`enqueueBrandProductDetects` still skips on the bare pointer, so backfilled products wouldn't
+eagerly precompute. Ad time guarantees correctness regardless; precompute is off.
+
+**Owner follow-up, NOT YET BUILT (next PR):** *"For video generation I always want the first,
+second and third catalog images as downloaded from the website or their Shopify feed"* (front /
+side / back, though it varies). **Make the count AND the image type ENV-configurable for both
+default video and default image requests.** Design note: serve these from the backend (the
+frontend already reads `refLimits` from `/api/ads/veo-prompt-scaffold`) so `config/defaults.env`
+stays the single source of truth per the 2026-08-03 secrets-only Render decision — a Netlify
+rebuild must not be required to change a number. `IMAGE_QUEUE_DEFAULT_COUNT` is currently
+hardcoded in the frontend.
+
 ## 2026-08-03 — OWNER DECISIONS (landed). Read this before the next-session prompt below.
 
 Five owner decisions from 2026-08-03. Items 1–4 shipped in `be5b83f` (on `main`); item 5
