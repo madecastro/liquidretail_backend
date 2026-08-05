@@ -655,30 +655,32 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
         ? { rating: product.rating, reviewCount: null }
       : (liIsProduct ? liPair : null);
 
-    // BRAND NUMBERS ARE DELIBERATELY *NOT* SOURCED FROM `brand.brandReviews` HERE.
+    // BRAND NUMBERS ON A PRODUCT AD, NOW WITH SCOPED COPY.
     //
-    // An adversarial pass caught this as a blocker and it was reproduced: the
-    // resolver returns brand-scoped STRINGS for a brand-tier win
-    // (`reviewsText: "41000 brand reviews"`), but static keeps only the bare
-    // scalars and `staticAdIntents.js:460` renders the hardcoded, UNSCOPED
-    // `${d.rating} ★ (${d.reviewCount} reviews)`. So a brand aggregate — 4.8★
-    // across 41,000 reviews of the BRAND — would print on a product ad as though
-    // 41,000 people reviewed THAT SKU. Misattribution, which is the exact class
-    // this change exists to close.
+    // A prior version of this sourced `brandPair` from `Brand.brandReviews` and
+    // an adversarial pass caught it as a blocker: the resolver returns
+    // brand-scoped STRINGS for a brand-tier win (`reviewsText: "41000 brand
+    // reviews"`), but the RATING/TRUST MARK templates only consumed the bare
+    // scalars, so a brand's 41,000 reviews would have printed on a product ad
+    // reading as 41,000 reviews of THAT SKU. This is the second half of that
+    // fix, not a reopening of the hole — see `d.reviewsText` below, which is now
+    // what the templates actually render. `staticAdIntents.js` no longer builds
+    // its own unscoped `(${d.reviewCount} reviews)` string; it renders whatever
+    // this function hands it, which is scoped at the source.
     //
-    // It would also have been a NEW exposure, not a pre-existing one:
     // `deriveSocialProofNumbers` only falls back to brand numbers for the no-SKU
-    // 'branding' outcome (layoutInputService.js:3430), so a product-scoped static
-    // ad never carried brand aggregates before. Reading the full Brand doc here
-    // would have handed them to every one of them.
-    //
-    // So the only brand-tier numbers static may use are the ones layoutInput
-    // ITSELF stamped `rating_source:'brand'` — precisely the sanctioned
-    // pre-change path. Brand proof on product static ads is a real gap worth
-    // closing, but it must ship WITH scoped copy (feed `reviewsTextShort` into
-    // the RATING/TRUST MARK slot instead of the product-shaped string), not by
-    // widening the number source and leaving the template unscoped.
-    const brandPair = liIsBrand ? liPair : null;
+    // 'branding' outcome (layoutInputService.js:3430), so a product-scoped ad
+    // reading brand aggregates via THIS path (rather than that pre-existing one)
+    // is new reach — deliberately: that is the point of this change, and it is
+    // safe now because the copy names its own scope.
+    const BRAND_PROOF_ON_PRODUCT_ADS =
+      String(process.env.BRAND_PROOF_ON_PRODUCT_ADS ?? 'true').toLowerCase() !== 'false';
+    const brandDocPair = (BRAND_PROOF_ON_PRODUCT_ADS
+        && brand?.brandReviews && typeof brand.brandReviews === 'object'
+        && (typeof brand.brandReviews.rating === 'number' || typeof brand.brandReviews.reviewCount === 'number'))
+      ? { rating: brand.brandReviews.rating ?? null, reviewCount: brand.brandReviews.reviewCount ?? null }
+      : null;
+    const brandPair = brandDocPair || (liIsBrand ? liPair : null);
     // An UNSTAMPED artifact pair still has to reach the ad, or this change would
     // withhold proof from every pre-`rating_source` artifact. There is no tier
     // claim to cohere in that case, so it is only used when no quote prints —
@@ -715,6 +717,14 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
         ? coherent.reviewCount : undefined)
       : (typeof proof.review_count === 'number' && proof.review_count > 0
         ? proof.review_count : undefined),
+    // SCOPED count text — "523 reviews" for product tier, "41000 brand reviews"
+    // for brand tier. This is what closes the misattribution gap: a bare
+    // reviewCount has no scope of its own, so staticAdIntents must render THIS
+    // string, not re-derive an unscoped one from the number. undefined (not
+    // null) when coherence is off or the tier carries no count, so the
+    // `d.reviewsText ? … : …` fallback in staticAdIntents behaves identically to
+    // today whenever there is nothing to disclose.
+    reviewsText: coherent && coherent.reviewsText ? coherent.reviewsText : undefined,
     quote: quoteText || undefined,
     // The reviewer's OWN name or no byline at all. normalizeQuote no longer
     // manufactures one: it used to fall back to the quote's `source` — a site,

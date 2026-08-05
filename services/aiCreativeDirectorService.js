@@ -20,6 +20,7 @@ const JSON5 = require('json5');
 
 const Brand                 = require('../models/Brand');
 const CatalogProduct        = require('../models/CatalogProduct');
+const Category              = require('../models/Category');
 const Media                 = require('../models/Media');
 const ProductMatchArtifact  = require('../models/ProductMatchArtifact');
 const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
@@ -32,6 +33,17 @@ const { conceptField, conceptMediaPicks } = require('./conceptProjection');
 const { chatCompletion } = require('./atlasLlmService');
 const { usableProofCommentsOrNone } = require('./quoteSnippetService');
 const { toPrintableCustomerQuote } = require('./quoteProvenance');
+const { formatBrandReviewsText, formatProductReviewsText } = require('./ratingDisplay');
+
+// Master switch for the proof MENU (category tier + social_proof_signal.
+// proof_options[] + routing.proof_pick). Default OFF: assembleSignals'
+// output is BYTE-IDENTICAL with the flag off — no category_signal key, no
+// proof_options key — so this ships with zero cost and zero behaviour
+// change until deliberately enabled. See DIRECTOR_PROOF_MENU below for why
+// "on" is still nearly free even for the LIVE path.
+function directorProofMenuEnabled() {
+  return String(process.env.DIRECTOR_PROOF_MENU_ENABLED ?? 'false').toLowerCase() === 'true';
+}
 
 /**
  * Pure brand-quote → Director primary_quote shape. brandReviews is the
@@ -59,6 +71,84 @@ function brandQuoteForDirectorSignal(q) {
   };
 }
 
+/**
+ * Build the Director's proof-point menu — one option per tier
+ * (product / category / brand), each carrying its own SCOPED numeric
+ * disclosure so a copy-writing LLM cannot describe a brand/category
+ * aggregate as if it were this product's own number.
+ *
+ * PURE — no Mongoose, no I/O. Exists as its own function specifically so
+ * this truthfulness-sensitive logic can be unit-tested without a database
+ * connection (see scripts/verifyDirectorProofMenu.js).
+ *
+ * A tier is omitted entirely when it has neither a number nor a quote —
+ * `proof_options` only ever lists what is actually usable, matching the
+ * "ABSENT MEANS ABSENT" rule the rest of this file already enforces.
+ *
+ * DISCLOSURE IS DECOUPLED FROM THE DISPLAY STAR FLOOR, ON PURPOSE. An
+ * adversarial review caught a BLOCKER in the first version of this function:
+ * it built `reviews_text` via `resolveCoherentSocialProof`, which is the
+ * right call for what actually RENDERS on an ad (that function's job is
+ * exactly "is this pair good enough to print"), but wrong here — its
+ * rating-only branch nulls the ENTIRE pair, count included, whenever the star
+ * rating alone misses the display floor. That left `review_count: 41000`
+ * with `reviews_text: null` for e.g. a 3.3-star brand — a raw, unscoped
+ * number reaching the Director with no disclosure telling it that number is
+ * brand-wide, not this product's. A review COUNT is a fact independent of
+ * star quality, so this menu always names its scope whenever a count exists,
+ * via `formatBrandReviewsText` / `formatProductReviewsText` directly — the
+ * SAME formatters `resolveCoherentSocialProof` itself calls internally, just
+ * without that function's separate "is the STAR worth printing" gate. The
+ * star-floor rule is fully intact for what actually renders on the ad; it
+ * only no longer silently deletes a fact this menu is allowed to state.
+ *
+ * @param {object} tiers
+ * @param {{rating:number|null, reviewCount:number|null, quotes:Array}} tiers.product
+ * @param {{rating:number|null, reviewCount:number|null, quotes:Array}} tiers.category
+ * @param {{rating:number|null, reviewCount:number|null, quotes:Array}} tiers.brand
+ * @returns {Array<{tier:string, rating:number|null, review_count:number|null, reviews_text:string|null, quotes:Array}>}
+ */
+function buildDirectorProofOptions({ product, category, brand }) {
+  // A SECOND adversarial pass (independent of the one that led to the count
+  // fix above) caught a second, separate gap: this only ever scoped the
+  // COUNT. A rating with NO count at all — a realistic shape, not a corner
+  // case — still fell all the way through to `return null`, so a bare
+  // `rating: 4.8` under `tier: 'brand'` reached the Director with zero
+  // disclosure aid, same failure class as the count bug, different field.
+  // PRODUCT tier deliberately stays unscoped here (`return null`) — that
+  // matches the rendered ad's own convention (a product-tier bare rating
+  // needs no qualifier; it IS the ad's own product) and mirrors how
+  // formatProductReviewsText/formatBrandReviewsText only ever take a count,
+  // never a rating, throughout this codebase.
+  const scopedNumbers = (rating, reviewCount, tier) => {
+    if (reviewCount != null) {
+      if (tier === 'category') {
+        return reviewCount === 1 ? '1 category review' : `${reviewCount} category reviews`;
+      }
+      return tier === 'brand' ? formatBrandReviewsText(reviewCount) : formatProductReviewsText(reviewCount);
+    }
+    if (rating != null && tier === 'category') return 'category-wide rating';
+    if (rating != null && tier === 'brand')    return 'brand-wide rating';
+    return null;
+  };
+  const buildOption = (tier, rating, reviewCount, quotes) => {
+    const safeQuotes = Array.isArray(quotes) ? quotes : [];
+    if (rating == null && reviewCount == null && !safeQuotes.length) return null;
+    return {
+      tier,                                    // 'product' | 'category' | 'brand'
+      rating: rating != null ? Number(rating.toFixed(1)) : null,
+      review_count: reviewCount ?? null,
+      reviews_text: scopedNumbers(rating, reviewCount, tier),  // pre-scoped — use verbatim or paraphrase honestly, never as the product's own
+      quotes: safeQuotes.slice(0, 2).map(q => ({ text: snippetText(q.text, 200), author: q.author || null }))
+    };
+  };
+  return [
+    buildOption('product',  product?.rating,  product?.reviewCount,  product?.quotes),
+    buildOption('category', category?.rating, category?.reviewCount, category?.quotes),
+    buildOption('brand',    brand?.rating,     brand?.reviewCount,    brand?.quotes)
+  ].filter(Boolean);
+}
+
 // ── Tunables ─────────────────────────────────────────────────────────
 
 const MODEL_ID    = 'gpt-4.1';
@@ -70,7 +160,31 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '3.1.0';   // 3.1: brand_signal.description now reads brand.summary (was a permanently-null brand.description), has_logo reads logoUrl, dead badges key dropped; bumps cache so artifacts derived from the starved brief re-derive. Load-bearing: cache-hit test is cached.signalsVersion === DIRECTOR_SIGNALS_VERSION, so without the bump every product with an existing CreativeDirectionArtifact keeps serving concepts built from the starved brief and the fix looks like a no-op. 3.0: nest concept into { routing, copy, art_direction, reasoning } so private rationale cannot fall through into image prompts as art direction (2026-08-01 leak). art_direction is OPTIONAL visual prose only; copy.* are the only letterforms; reasoning.rationale is private. Bumps cache so existing flat v2 artifacts re-derive. 2.4: platform-format-aware (Phase 3). 2.3: PMA-based matchedMediaIds + brand-review fallback. 2.2: file_type_distribution. 2.1: N_CONCEPTS 2 → 4. 2.0: full data projection.
+const DIRECTOR_SIGNALS_VERSION = '3.1.0';   // DELIBERATELY NOT BUMPED for the proof-menu
+// feature, even though assembleSignals' code changed (category_signal +
+// social_proof_signal.proof_options, behind DIRECTOR_PROOF_MENU_ENABLED). With
+// the flag off (default), the SIGNAL SHAPE this produces is genuinely
+// byte-identical to 3.1.0 — no category_signal key, no proof_options key — so
+// there is nothing here for a cached artifact to have gotten wrong.
+// An adversarial pass caught a real cost consequence of bumping now anyway:
+// this constant is the cache-hit key for the SHADOW telemetry path
+// (directConcepts, gated at :N — "cached.signalsVersion === DIRECTOR_SIGNALS_VERSION"),
+// and that shadow call is `await`ed on the LIVE campaign-expansion request path
+// (services/campaignAdsGenerationService.js, runCreativeDirectorShadow inside
+// expandWizardJob) — confirmed by reading that call site, not assumed. Bumping
+// unconditionally would have invalidated every existing shadow-path
+// CreativeDirectionArtifact on deploy and forced a paid gpt-4.1 re-derive for
+// every unique (brand,product,campaignKind,creativeIntent,platformFormat) on
+// its NEXT request — a real, if bounded and self-healing, spend event, for a
+// feature that isn't even turned on yet. The LIVE path (directConceptsRound)
+// is unaffected either way — it has no cache-hit gate on this constant at all,
+// confirmed by reading the code (no comparison exists before its
+// CreativeDirectionArtifact.create()).
+// BUMP THIS when DIRECTOR_PROOF_MENU_ENABLED is actually flipped to true —
+// that is the moment the signal shape genuinely changes for whoever is using
+// it, and pairing the bump with the flag flip means the one-time re-derive
+// cost lands exactly when the feature starts being useful, not before.
+// 3.1: brand_signal.description now reads brand.summary (was a permanently-null brand.description), has_logo reads logoUrl, dead badges key dropped; bumps cache so artifacts derived from the starved brief re-derive. Load-bearing: cache-hit test is cached.signalsVersion === DIRECTOR_SIGNALS_VERSION, so without the bump every product with an existing CreativeDirectionArtifact keeps serving concepts built from the starved brief and the fix looks like a no-op. 3.0: nest concept into { routing, copy, art_direction, reasoning } so private rationale cannot fall through into image prompts as art direction (2026-08-01 leak). art_direction is OPTIONAL visual prose only; copy.* are the only letterforms; reasoning.rationale is private. Bumps cache so existing flat v2 artifacts re-derive. 2.4: platform-format-aware (Phase 3). 2.3: PMA-based matchedMediaIds + brand-review fallback. 2.2: file_type_distribution. 2.1: N_CONCEPTS 2 → 4. 2.0: full data projection.
 
 // Canonical archetype enum (the 8 we've been using, with descriptive
 // names matching the contract). Director picks from these; Generator
@@ -250,6 +364,22 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     productId ? CatalogProduct.findById(productId).lean() : null
   ]);
 
+  // CATEGORY tier — cache-only read, no live fetch. `categoryReviewsService`
+  // is the writer (Gemini grounded search, same pattern as brandReviews); this
+  // reads whatever it already cached on the Category doc, exactly as
+  // layoutInputService does for the video path's tier-2 cascade
+  // (Category.findById(categoryRef).select('categoryReviews').lean()).
+  // Fetching category is deferred to AFTER the Promise.all above because it
+  // needs product.categoryRef, which only exists once `product` resolves.
+  // assembleSignals runs on EVERY live directConceptsRound call (no cache
+  // gate) — a live Gemini call from inside this function would be a new,
+  // unbounded billable path fired on every ad generation. This must stay a
+  // read of an existing field, never a trigger for categoryReviewsService's
+  // own fetchAndCache.
+  const category = (directorProofMenuEnabled() && product?.categoryRef)
+    ? await Category.findById(product.categoryRef).select('categoryReviews breadcrumb name').lean()
+    : null;
+
   // Pull matched media via ProductMatchArtifact (the canonical match
   // store — one row per (mediaId, productId/brand) match). The previous
   // implementation read product.matchedMedia (a denormalized array),
@@ -332,6 +462,17 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
                     campaignKind === 'brand'   ? 'medium' :
                     'medium'
   };
+
+  // ── Category signal — new tier, previously absent from the Director brief
+  // entirely. Only key that ever gets omitted outright (not just null-valued)
+  // when the flag is off, so a byte-identity check against the pre-change
+  // shape can assert the key's absence, not merely null fields.
+  const categorySignal = directorProofMenuEnabled()
+    ? {
+        breadcrumb: category?.breadcrumb || category?.name || null,
+        summary:    snippetText(category?.categoryReviews?.summary, 240)
+      }
+    : null;
 
   // ── UGC signal — aggregate + distributions across matched media ──
   const ugcMedias    = medias.filter(m => m.source === 'instagram' || m.source === 'tiktok');
@@ -418,6 +559,16 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   const brandRatingCount = brand?.brandReviews?.reviewCount || null;
   const brandReviewSource = brand?.brandReviews?.source || null;
 
+  // CATEGORY tier — same quote-sanitization mapper as brand (both are the
+  // llm-web pool, same shape). Never read when the menu is off; `category` is
+  // already null in that case so this collapses to empty arrays / nulls.
+  const categoryReviewQuotes = (Array.isArray(category?.categoryReviews?.quotes) ? category.categoryReviews.quotes : [])
+    .map(brandQuoteForDirectorSignal)
+    .filter(q => q && typeof q.text === 'string' && q.text.trim().length > 30);
+  const categoryRatingValue = typeof category?.categoryReviews?.rating === 'number' && category.categoryReviews.rating > 0
+    ? category.categoryReviews.rating : null;
+  const categoryRatingCount = category?.categoryReviews?.reviewCount || null;
+
   // Effective values — prefer product, fall back to brand ONLY when no
   // product is in scope.
   //
@@ -487,6 +638,54 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     proof_density:    productReviewQuotes.length + (isProductScoped ? 0 : brandReviewQuotes.length) + topComments.length
   };
 
+  // ── PROOF MENU — behind DIRECTOR_PROOF_MENU_ENABLED, additive only. ──
+  //
+  // Every field above this point is UNCHANGED, including the
+  // isProductScoped withholding of brand quotes from `primary_quote` /
+  // `rating` / `strongest_signal`. Those stay the single deterministic
+  // pick they have always been, for the fields nothing downstream can
+  // double-check.
+  //
+  // `proof_options` is deliberately WIDER: it surfaces category and brand
+  // tiers to the Director even on a product-scoped run — that is the
+  // entire point (per owner request: "the director may want different
+  // proof points at different times"). The reason this is safe where the
+  // existing withholding rule says it should not be: every option carrying a
+  // number ships with its own SCOPED disclosure string via
+  // buildDirectorProofOptions (both the review-COUNT and, separately, a bare
+  // RATING with no count — two independent adversarial passes each caught one
+  // half of this and both are now closed; see that function's docstring for
+  // the full history). The Director is a copy-writing LLM, not a template, so
+  // enforcement is instruction-level, not mechanical — the prompt below
+  // states explicitly that any option's number must be described using its
+  // own tier, never as if it belonged to the product. A THIRD adversarial
+  // pass specifically disputed an earlier version of this comment's claim
+  // that this is "the same trust boundary as brand_signal.tagline /
+  // description" — correctly: a tagline is unfalsifiable prose, while a cited
+  // "41,000 reviews" is a checkable claim, so the stakes are not equal.
+  // What DOES make the comparison fair now is that, unlike tagline/
+  // description, every numeric proof_options entry ships with an accurate,
+  // ready-to-quote disclosure phrase — the model has to actively discard
+  // correct scoping to get this wrong, not merely fail to reconstruct it.
+  // That is a real mitigant, not a full mechanical guarantee; a hard
+  // reject-on-mismatch check (parse copy for a proof_options number without
+  // its scope word) was considered and deliberately deferred as separate,
+  // larger scope than this fix.
+  //
+  // NEITHER `proof_options` NOR `routing.proof_pick` (the concept-level
+  // field it feeds) changes which rating or quote is actually BURNED into
+  // an ad's dedicated proof slots — that stays governed, unconditionally,
+  // by resolveCoherentSocialProof at render time (brandScriptExecutor /
+  // directImageRenderService). This menu only tells us what INFORMED the
+  // Director's free-text copy, for consistency and audit.
+  if (directorProofMenuEnabled()) {
+    socialProofSignal.proof_options = buildDirectorProofOptions({
+      product:  { rating: productRatingValue,  reviewCount: productRatingCount,  quotes: productReviewQuotes },
+      category: { rating: categoryRatingValue, reviewCount: categoryRatingCount, quotes: categoryReviewQuotes },
+      brand:    { rating: brandRatingValue,     reviewCount: brandRatingCount,    quotes: brandReviewQuotes }
+    });
+  }
+
   // ── Performance signal — totals + rates + per-media percentiles ──
   const totalLikes    = ugcMedias.reduce((s, m) => s + (m.platformStats?.likes    || 0), 0);
   const totalComments = ugcMedias.reduce((s, m) => s + (m.platformStats?.comments || 0), 0);
@@ -527,6 +726,10 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   return {
     brand_signal:        brandSignal,
     product_signal:      productSignal,
+    // categorySignal is only ever non-null when the flag is on — omitted here
+    // via the spread so the key itself is ABSENT with the flag off, not merely
+    // null-valued, so a byte-identity check can assert its absence.
+    ...(categorySignal ? { category_signal: categorySignal } : {}),
     ugc_signal:          ugcSignal,
     social_proof_signal: socialProofSignal,
     performance_signal:  performanceSignal
@@ -689,6 +892,9 @@ function buildPrompt({ inputSummary, creativeIntent, platformFormat = 'meta_feed
     `- Lead with the STRONGEST signal in the data. If social_proof_signal.primary_quote is present and performance is low, lean into the testimonial — don't pick a stat_led archetype.`,
     `- If a signal is "absent" / null / empty, do not build a concept around it.`,
     `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set social_proof_type="none" on EVERY concept. Do not promise proof the data can't back. In that case, also avoid the stat_led_social_proof and hero_quote_overlay archetypes — there is nothing to surface. Lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself (full_bleed_hero_bottom_panel, vertical_split, diagonal_carve).`,
+    ...(directorProofMenuEnabled() ? [
+      `- PROOF MENU: social_proof_signal.proof_options[] lists every available proof point across product / category / brand tiers, each with its own pre-scoped "reviews_text" disclosure. Use it to find a stronger angle than primary_quote alone. If you write copy from a category or brand option, use that option's own scoping in your words (e.g. "loved across our whole line" / "brand-wide") — NEVER phrase a category or brand number as if it belonged to this specific product. This menu does NOT change which number or quote the ad actually renders in its dedicated proof slots — that is decided separately and always truthfully; it only tells us which signal informed your copy.`
+    ] : []),
     ``,
     formatConstraints,
     ``,
@@ -1010,7 +1216,14 @@ function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbidd
 }
 
 const N_CONCEPTS_ROUND       = 3;
-const ROUND_VERSION          = '3.0.0';   // 3.0: nested {routing,copy,art_direction,reasoning}; bump when the round schema/prompt shape changes
+const ROUND_VERSION          = '3.1.0';   // 3.1: routing.proof_pick (optional, nullable) added to the schema,
+// plus the proof_options[] menu explanation added to the prompt, both behind
+// DIRECTOR_PROOF_MENU_ENABLED. NOT a cache key today — no code path compares
+// this against a stored value before paying for a round (checked: the round
+// system has no cache-hit branch at all, every call regenerates). Bumped
+// anyway per this constant's own documented convention ("bump when the round
+// schema/prompt shape changes"), so it stays truthful as a shape marker even
+// though nothing currently reads it back. 3.0: nested {routing,copy,art_direction,reasoning}; bump when the round schema/prompt shape changes
 const DIRECTOR_ROUND_MODEL   = 'director'; // claude-sonnet-5 — see atlasModelMap
 // Lowered from 0.8. The bake-off's one real defect was a REPEATED primary line
 // across two concepts, and the same prompt produced it on one run and not the
@@ -1355,7 +1568,9 @@ async function directConceptsRound({
   }
 
   const elapsedMs = Date.now() - t0;
-  const warnings = validateConceptsRound(parsed.concepts || [], seededUniverse);
+  const proofOptionsCount = Array.isArray(inputSummary?.social_proof_signal?.proof_options)
+    ? inputSummary.social_proof_signal.proof_options.length : 0;
+  const warnings = validateConceptsRound(parsed.concepts || [], seededUniverse, proofOptionsCount);
 
   console.log(
     `🎭 directorRound[r${roundIndex}/${platformFormat}]: ` +
@@ -1548,6 +1763,9 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `- The ${N_CONCEPTS_ROUND} concepts MUST be meaningfully different — different archetype OR different media-pick combination OR different output_shape OR different copy angle.`,
     `- Lead with the STRONGEST signal in the data.`,
     `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set routing.social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself. Record that choice in reasoning.rationale only — never in art_direction or copy.`,
+    ...(directorProofMenuEnabled() ? [
+      `- PROOF MENU: social_proof_signal.proof_options[] lists every available proof point across product / category / brand tiers, each with its own pre-scoped "reviews_text" disclosure. Set routing.proof_pick to the 0-based index of the option your copy draws from, or null if you used none of them / relied on primary_quote instead. If you write copy from a category or brand option, your words MUST carry that option's own scope (e.g. "loved across our whole line" / "brand-wide") — NEVER phrase a category or brand number as if it belonged to this specific product. routing.proof_pick does NOT change which number or quote actually renders in the ad's dedicated proof slots — that is decided separately, deterministically, and always truthfully; it only tells us which signal informed your copy, for audit.`
+    ] : []),
     // The pick ceiling is derived from the universe actually supplied, not
     // hardcoded. It used to always say "1-4" even when the universe held a
     // single hero — asking for a multi-image composition that cannot be built
@@ -1861,7 +2079,14 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
           }
         }
       },
-      output_shape: outputShapeSchema
+      output_shape: outputShapeSchema,
+      // Optional and nullable, and DELIBERATELY absent from `required` above —
+      // this is a non-strict, hand-rolled validator (see the comment on
+      // routingSchema's transport note), not OpenAI's strict json_schema
+      // mode, so an omitted property here is a warning candidate, not a
+      // parse failure. A Director run from before this shipped, or with the
+      // menu flag off, never emits this key at all; that must keep working.
+      proof_pick: { type: ['integer', 'null'] }
     }
   };
 
@@ -1939,7 +2164,7 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
 //   • output_shape.tile_count != media_picks.length
 //   • all copy fields null (probably an LLM miss)
 // Dual-reads flat v2 and nested v3 so a mixed cache window still diagnoses.
-function validateConceptsRound(concepts, seededUniverse) {
+function validateConceptsRound(concepts, seededUniverse, proofOptionsCount = 0) {
   const warnings = [];
   if (!Array.isArray(concepts) || !concepts.length) {
     warnings.push('no concepts emitted');
@@ -1971,6 +2196,19 @@ function validateConceptsRound(concepts, seededUniverse) {
     const tileCount = shape?.tile_count;
     if (typeof tileCount === 'number' && tileCount !== picks.length) {
       warnings.push(`concept ${c.concept_id}: output_shape.tile_count=${tileCount} != media_picks.length=${picks.length}`);
+    }
+
+    // proof_pick bounds — cross-references social_proof_signal.proof_options,
+    // which the generic schema walker (schemaErrors) cannot do; it only
+    // type-checks the field in isolation. Absence is fine (null / omitted both
+    // mean "used none of the menu"); a present value must be a real index into
+    // the menu THIS round actually saw, or the audit trail points at proof
+    // that either never existed or existed under a different signals version.
+    const proofPick = conceptField(c, 'proof_pick');
+    if (proofPick != null) {
+      if (!Number.isInteger(proofPick) || proofPick < 0 || proofPick >= proofOptionsCount) {
+        warnings.push(`concept ${c.concept_id}: proof_pick=${JSON.stringify(proofPick)} is out of range for ${proofOptionsCount} proof_options`);
+      }
     }
 
     const cp = copyOf(c);
@@ -2072,6 +2310,8 @@ module.exports = {
   validateConceptsRound,
   loadAvoidList,
   brandQuoteForDirectorSignal,
+  buildDirectorProofOptions,
+  directorProofMenuEnabled,
   safeParseDirectorJSON,
   extractFirstBalancedObject
 };

@@ -457,7 +457,16 @@ const INTENTS = {
       kept('CTA BUTTON') ? 'the CTA, unmissable but not shouting' : null
     ].filter(Boolean),
     text: (d) => [
-      ['RATING', d.reviewCount ? `${d.rating} ★ (${d.reviewCount} reviews)` : `${d.rating} ★`],
+      // Prefer the SCOPED string from the coherence chokepoint —
+      // "523 reviews" for product tier, "41000 brand reviews" for brand tier —
+      // over re-deriving an unscoped one from the bare number. A brand
+      // aggregate can win this slot (BRAND_PROOF_ON_PRODUCT_ADS,
+      // directImageRenderService), and printing its count unscoped would read
+      // as that SKU's own review volume. Falls back to the pre-change unscoped
+      // template only when reviewsText is absent (flag off, or a caller that
+      // never ran the coherence gate) so behaviour there is unchanged.
+      ['RATING', d.reviewsText ? `${d.rating} ★ (${d.reviewsText})`
+        : d.reviewCount ? `${d.rating} ★ (${d.reviewCount} reviews)` : `${d.rating} ★`],
       d.quote ? ['CUSTOMER QUOTE', `"${d.quote}"`] : null,
       d.quote && d.attribution ? ['ATTRIBUTION', `— ${d.attribution}`] : null,
       d.badge ? ['BADGE', d.badge] : null,
@@ -488,7 +497,12 @@ const INTENTS = {
     ].filter(Boolean),
     text: (d) => [
       d.headline ? ['BRAND LINE', d.headline] : null,
-      d.rating ? ['TRUST MARK', `${d.rating} ★`] : null,
+      // Same scoped-disclosure preference as the RATING slot in social_proof_led
+      // (see there for the full rationale): a brand aggregate reaching this slot
+      // via BRAND_PROOF_ON_PRODUCT_ADS must never render as a bare, unscoped
+      // '4.8 ★' — this is the FLOOR intent (always eligible), so it is the most
+      // frequent place that widening would otherwise surface unscoped.
+      d.rating ? ['TRUST MARK', d.reviewsText ? `${d.rating} ★ (${d.reviewsText})` : `${d.rating} ★`] : null,
       ['CTA BUTTON', d.cta]
     ].filter(Boolean)
   },
@@ -556,7 +570,11 @@ const INTENTS = {
     text: (d) => [
       d.headline ? ['BRAND LINE', d.headline] : null,
       d.subhead  ? ['SUBHEAD', d.subhead]     : null,
-      d.rating   ? ['TRUST MARK', `${d.rating} ★`] : null,
+      // Same scoped-disclosure preference as social_proof_led's RATING slot and
+      // product_first_lifestyle's TRUST MARK above — a brand aggregate reaching
+      // this slot via BRAND_PROOF_ON_PRODUCT_ADS must never render as a bare,
+      // unscoped '4.8 ★'.
+      d.rating   ? ['TRUST MARK', d.reviewsText ? `${d.rating} ★ (${d.reviewsText})` : `${d.rating} ★`] : null,
       ['CTA BUTTON', d.cta]
     ].filter(Boolean)
   }

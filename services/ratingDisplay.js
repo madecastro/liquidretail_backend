@@ -710,4 +710,13 @@ module.exports = {
   formatCompactCount,
   resolveAtomicRatingPair,
   resolveCoherentSocialProof,
+  // Exported for the Director proof menu (aiCreativeDirectorService.js):
+  // a review COUNT is a fact independent of star quality, so a consumer that
+  // is not rendering the star-graphic pair (i.e. not subject to the "only
+  // show stars over the floor" rule) needs to name a count's scope WITHOUT
+  // going through resolveAtomicRatingPair's star-floor gate, which otherwise
+  // nulls the entire disclosure — count included — whenever the rating alone
+  // fails the bar.
+  formatBrandReviewsText,
+  formatProductReviewsText,
 };
