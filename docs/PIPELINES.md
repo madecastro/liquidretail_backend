@@ -110,6 +110,35 @@ The former “idle worker” cost center: per catalog-product image, run vision 
 | **Eager precompute** | `CATALOG_DETECT_PRECOMPUTE=true` | Same function enqueues hero (+ alt) detects for primaries missing `imageMediaId` |
 | **On-demand (primary)** | Ad generation | `ensureDetectForProducts(ids, { wait })` from `campaignAdsGenerationService.expandWizardJob` (explicit product picks **and** products matched to selected media) |
 | **Pre-warm backstop** | IG post **confirms** a product match | Fire-and-forget in `productMatchService.js` — post-scale, not catalog-scale |
+| **Media-only backfill** | `GET /api/catalog/:id` | `materializeMissingHero` + `materializeMissingAlts` — Cloudinary mirror + `Media` doc, **no DetectRun, no vision spend** |
+
+#### `imageMediaId` means "a hero Media exists", NOT "detect ran"
+
+These are separate facts and the code must not conflate them — doing so caused a
+production bug where the Step 2 picker's **PRIMARY** tile was permanently greyed
+out captioned "image still processing" for a catalog ingested weeks earlier.
+
+- The picker greys any tile whose `imageMediaId` is falsy. With detect deferred,
+  **no ingest path** materializes the hero at sync time, and the on-demand pull
+  runs *after* the picker renders — so the pointer stayed null with nothing
+  queued. Alts escaped only because the detail endpoint already backfilled them.
+- `enqueueProductDetect` persists pointers from **materialize** results
+  (`heroMediaId` / `altMediaIds`), never from `enqueued.hero` — the latter also
+  requires DetectRun creation, which `createDetectRunIfAbsent` declines on an
+  E11000-with-no-in-flight-run race. It persists only what it resolved, so a
+  failure never writes `null` over the detail endpoint's success.
+- `enqueued.hero` still means "a run was queued" and remains the basis of the
+  `heroEnqueued` counter.
+- **`ensureDetectForProducts` gates on the DetectRun, not the pointer.** A
+  pointer-only product (lazy backfill) routes to
+  `ensureDetectRunsForExistingMedia` — runs only, deriving and persisting
+  nothing. Routing it through `enqueueProductDetect` instead would rewrite
+  `additionalImageMediaIds` as a **compact** array, while
+  `materializeMissingAlts` maintains an **index-aligned** one; the detail
+  response, alt crop galleries and operator exclusion pairings all zip by index,
+  so compacting silently mis-pairs every alt.
+
+Fence: `scripts/verifyCatalogHeroMaterialize.js` (65 checks, offline).
 
 ### Stages (`pipelines/detect.js` → `runCatalogProductPipeline` ~480–640)
 

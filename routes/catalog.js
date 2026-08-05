@@ -771,6 +771,23 @@ router.get('/:id', async (req, res) => {
     const product = await CatalogProduct.findOne(filter).lean();
     if (!product) return res.status(404).json({ error: 'product not found' });
 
+    // Lazy backfill, HERO — the picker greys any tile without an
+    // imageMediaId and captions it "image still processing". With detect
+    // deferred (CATALOG_DETECT_PRECOMPUTE=false) no ingest path materializes
+    // the hero at sync time, and the ad-time pull (ensureDetectForProducts)
+    // runs after this screen, so the PRIMARY tile stayed greyed forever on a
+    // fully-ingested catalog. Materialize-only — no detect run, no Gemini
+    // spend. Best-effort: failures don't block the detail response.
+    if (!product.imageMediaId) {
+      try {
+        const { materializeMissingHero } = require('../services/catalogProductDetectService');
+        const heroMediaId = await materializeMissingHero(product);
+        if (heroMediaId) product.imageMediaId = heroMediaId;
+      } catch (err) {
+        console.warn(`   ⚠️  catalog detail [${product._id}]: lazy hero backfill failed: ${err.message}`);
+      }
+    }
+
     // Lazy backfill — when the product has additionalImages URLs without
     // matching additionalImageMediaIds entries (e.g. variants synced
     // before the MAX_ALT_IMAGES bump, or alts the initial detect pass

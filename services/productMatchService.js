@@ -1931,7 +1931,10 @@ async function ensureCatalogProductForMatch(match, ctx) {
       detectSvc.enqueueProductDetect(cp)
         .then(out => {
           if (out?.skipped) return;
-          const heroId = out?.enqueued?.hero?.mediaId || '-';
+          // Media existence first — enqueued.hero is null when the Media
+          // materialized but no DetectRun was created, and logging '-' there
+          // hid exactly the state this diagnostic exists to surface.
+          const heroId = out?.heroMediaId || out?.enqueued?.hero?.mediaId || '-';
           console.log(`   · ensureCatalogProduct[${cp._id}]: catalog-product detect enqueued (heroMedia=${heroId})`);
         })
         .catch(err => {

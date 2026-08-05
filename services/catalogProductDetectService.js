@@ -41,8 +41,21 @@ async function enqueueProductDetect(product) {
 
   // Skip-if-already-attached. Re-runs are an explicit operator
   // action (clear imageMediaId on the CatalogProduct doc).
+  //
+  // This function OWNS pointer derivation, so it must not be reused to "just
+  // add the missing detect run" for a product that already has pointers: its
+  // alt array is built compact (filter + push) while materializeMissingAlts
+  // maintains an INDEX-ALIGNED one, and rewriting would mis-pair alt URLs with
+  // alt media ids. ensureDetectRunsForExistingMedia is that path instead.
   if (product.imageMediaId) {
-    return { skipped: true, reason: 'already detected (imageMediaId set)' };
+    // Report the pointer so callers asking "is there a usable hero Media"
+    // get an answer on the skip path too, instead of reading undefined and
+    // concluding NO_HERO_MEDIA.
+    return {
+      skipped: true,
+      reason: 'already detected (imageMediaId set)',
+      heroMediaId: String(product.imageMediaId)
+    };
   }
 
   console.log(
@@ -52,6 +65,19 @@ async function enqueueProductDetect(product) {
 
   const enqueued = { hero: null, alts: [] };
 
+  // Media EXISTENCE, tracked separately from detect-run creation.
+  //
+  // These two are unrelated concerns and conflating them is what greyed the
+  // "PRIMARY" tile in the Step 2 picker. `enqueued.hero` is only set when a
+  // DetectRun was also created; a Media doc whose run creation returned null
+  // (createDetectRunIfAbsent's E11000-but-no-in-flight-run branch) is still a
+  // perfectly usable picker tile and video reference. Persisting the pointer
+  // from the run instead of from the Media threw that away, and — because the
+  // skip gate above only re-enters when imageMediaId is null — the product
+  // then stayed null on every later pass.
+  let heroMediaId = null;
+  const altMediaIds = [];
+
   // Hero — full path.
   try {
     const heroMedia = await materializeImage({
@@ -60,8 +86,9 @@ async function enqueueProductDetect(product) {
       imageRole:    'hero'
     });
     if (heroMedia) {
+      heroMediaId = String(heroMedia._id);
       const run = await createDetectRunIfAbsent(heroMedia, product);
-      if (run) enqueued.hero = { mediaId: String(heroMedia._id), runId: String(run._id) };
+      if (run) enqueued.hero = { mediaId: heroMediaId, runId: String(run._id) };
     }
   } catch (err) {
     console.warn(`⚠️  catalog-product[${product._id}] hero detect enqueue failed: ${err.message}`);
@@ -80,8 +107,10 @@ async function enqueueProductDetect(product) {
         imageRole:    'alt'
       });
       if (altMedia) {
+        const altMediaId = String(altMedia._id);
+        altMediaIds.push(altMediaId);
         const run = await createDetectRunIfAbsent(altMedia, product);
-        if (run) enqueued.alts.push({ mediaId: String(altMedia._id), runId: String(run._id) });
+        if (run) enqueued.alts.push({ mediaId: altMediaId, runId: String(run._id) });
       }
     } catch (err) {
       console.warn(`⚠️  catalog-product[${product._id}] alt detect enqueue failed: ${err.message}`);
@@ -91,15 +120,94 @@ async function enqueueProductDetect(product) {
   // Stamp the wrapper ids onto the CatalogProduct so future re-syncs
   // skip and so visualCatalogMatchService can fan out across all
   // image variants when matching UGC against this product.
-  await CatalogProduct.updateOne(
-    { _id: product._id },
-    {
-      imageMediaId:            enqueued.hero?.mediaId || null,
-      additionalImageMediaIds: enqueued.alts.map(a => a.mediaId)
-    }
-  );
+  //
+  // Written from the materialize results, NOT from `enqueued` — see the
+  // heroMediaId comment above.
+  //
+  // Persist ONLY what we actually resolved. The old unconditional write set
+  // `imageMediaId: null` / `additionalImageMediaIds: []` whenever materialize
+  // failed, which was survivable while this function was the single writer and
+  // only ran with a null pointer. It no longer is: materializeMissingHero (the
+  // catalog detail endpoint) is a second writer, and `product` here is a
+  // snapshot that can predate it. Writing our failure over its success would
+  // re-grey a tile that had just been fixed, and would wipe the index-aligned
+  // additionalImageMediaIds that materializeMissingAlts maintains.
+  const update = {};
+  if (heroMediaId) update.imageMediaId = heroMediaId;
+  if (altMediaIds.length) update.additionalImageMediaIds = altMediaIds;
+  if (Object.keys(update).length) {
+    await CatalogProduct.updateOne({ _id: product._id }, { $set: update });
+  }
 
-  return { enqueued };
+  // heroMediaId / altMediaIds are the media-existence view; callers that need
+  // "is there a usable hero Media" must read these rather than
+  // `enqueued.hero` (which answers the different question "did we also queue
+  // a detect run"). expandDeterministicVideo's lazy materialize depends on
+  // this distinction — reading enqueued.hero there dropped whole video ads
+  // as NO_HERO_MEDIA.
+  return { enqueued, heroMediaId, altMediaIds };
+}
+
+// Queue detect runs for Media a product ALREADY points at, deriving nothing
+// and persisting nothing.
+//
+// This is the re-entry path for a product whose hero Media exists but was never
+// detected — the state the catalog detail endpoint's lazy hero backfill creates
+// on purpose (it stamps imageMediaId and deliberately queues no run, so merely
+// viewing a product costs no Gemini vision). ensureDetectForProducts needs the
+// run at ad time; it must NOT reuse enqueueProductDetect to get it, because
+// that function re-derives pointers and writes additionalImageMediaIds as a
+// COMPACT array, whereas materializeMissingAlts maintains an INDEX-ALIGNED one
+// (holes where an alt URL duplicates the hero or its mirror failed). Rewriting
+// compacts it and silently mis-pairs every alt URL with the wrong media id —
+// which the detail response, the alt crop galleries and operator exclusion
+// pairings all zip by index.
+//
+// Idempotent: media that already have a DetectRun in ANY status are skipped, so
+// repeat calls create nothing. No materialize, so no Cloudinary traffic and no
+// dependence on the hero URL still resolving.
+async function ensureDetectRunsForExistingMedia(product) {
+  const mediaIds = [
+    product.imageMediaId,
+    ...(Array.isArray(product.additionalImageMediaIds) ? product.additionalImageMediaIds : [])
+  ].filter(Boolean).map(String);
+  if (!mediaIds.length) return { runsCreated: 0, considered: 0 };
+
+  // Scope to this brand's catalog-product media — the ids come off the product
+  // doc, but a stale pointer to another brand's Media must not be detected here.
+  const docs = await Media.find({
+    _id:     { $in: mediaIds },
+    brandId: product.brandId,
+    source:  'catalog-product'
+  }).select('_id').lean();
+  if (!docs.length) return { runsCreated: 0, considered: 0 };
+
+  // One batched query. createDetectRunIfAbsent only de-dupes against IN-FLIGHT
+  // runs (that is all its partial unique index covers), so without this a
+  // completed run would be re-created on every ad generation — an unbounded
+  // detect-run factory on a path that runs per generate.
+  const existing = await DetectRun.find({ mediaId: { $in: docs.map(d => d._id) } })
+    .select('mediaId').lean();
+  const alreadyRun = new Set(existing.map(r => String(r.mediaId)));
+  const needed = docs.filter(d => !alreadyRun.has(String(d._id)));
+  if (!needed.length) return { runsCreated: 0, considered: docs.length };
+
+  let runsCreated = 0;
+  for (const media of needed) {
+    try {
+      const run = await createDetectRunIfAbsent(media, product);
+      if (run) runsCreated++;
+    } catch (err) {
+      console.warn(
+        `⚠️  catalog-product[${product._id}] detect run for existing media ${media._id} failed: ${err.message}`
+      );
+    }
+  }
+  console.log(
+    `   · catalog-product detect runs[${product._id}]: ${runsCreated} created for ` +
+    `${needed.length} undetected media (of ${docs.length} existing)`
+  );
+  return { runsCreated, considered: docs.length };
 }
 
 // Bulk wrapper — fire enqueueProductDetect for the primary variant of
@@ -254,13 +362,43 @@ async function ensureDetectForProducts(catalogProductIds, {
 
   // 1. Materialize + enqueue detect for products without a hero wrapper.
   //    (enqueueProductDetect is the per-product path — NOT gated by
-  //    CATALOG_DETECT_PRECOMPUTE — and no-ops when imageMediaId is set.)
+  //    CATALOG_DETECT_PRECOMPUTE.)
+  //
+  //    GATED ON THE DETECT RUN, NOT ON THE POINTER. `imageMediaId` proves a
+  //    hero Media EXISTS; it does not prove detect ever ran on it. The catalog
+  //    detail endpoint's lazy hero backfill deliberately stamps the pointer
+  //    with no DetectRun (that is its cost fence), so a pointer-only gate here
+  //    would skip exactly those products — and this function is the sole
+  //    guarantee that crops / overlay zones / ad-readiness exist by ad time.
+  //    The result would be a paid ad rendered with no spatial analysis, and
+  //    the "degrades gracefully" path swallowing it silently.
+  //
+  //    One batched query, not one per product. A run in ANY status counts:
+  //    completed runs are what we want to skip, and a failed one matches the
+  //    pre-existing behaviour of not retrying inside a single ad request (the
+  //    wait loop below drops failed/absent rather than stalling on them).
+  const pointerIds = products.map(p => p.imageMediaId).filter(Boolean);
+  const detectedMediaIds = new Set();
+  if (pointerIds.length) {
+    const runs = await DetectRun.find({ mediaId: { $in: pointerIds } })
+      .select('mediaId').lean();
+    for (const r of runs) detectedMediaIds.add(String(r.mediaId));
+  }
+
   let ensured = 0;
   for (const p of products) {
-    if (p.imageMediaId) continue;
+    if (p.imageMediaId && detectedMediaIds.has(String(p.imageMediaId))) continue;
     try {
-      const r = await enqueueProductDetect(p);
-      if (!r.skipped) ensured++;
+      if (p.imageMediaId) {
+        // Pointer already correct (lazy backfill) — ONLY the run is missing.
+        // Runs-only on purpose: enqueueProductDetect would re-derive pointers
+        // and compact the index-aligned additionalImageMediaIds.
+        const r = await ensureDetectRunsForExistingMedia(p);
+        if (r.runsCreated) ensured++;
+      } else {
+        const r = await enqueueProductDetect(p);
+        if (!r.skipped) ensured++;
+      }
     } catch (err) {
       console.warn(`   ⚠️  ensureDetectForProducts[${p._id}]: ${err.message}`);
     }
@@ -482,6 +620,60 @@ async function materializeImage({ sourceUrl, product, imageRole }) {
   }
 }
 
+// Fill in a missing imageMediaId for an existing product — the hero
+// counterpart of materializeMissingAlts below, and for the same reason.
+//
+// Since CATALOG_DETECT_PRECOMPUTE went to false (detect deferral), no ingest
+// path materializes the hero at sync time: enqueueBrandProductDetects returns
+// `deferred` before it ever calls enqueueProductDetect. The pull side
+// (ensureDetectForProducts) runs at AD-GENERATION time, which is strictly
+// after the Step 2 picker has already rendered — so the picker saw
+// imageMediaId:null and greyed the "PRIMARY" tile as "image still
+// processing", forever, on a catalog that had nothing queued at all. Alts
+// escaped this only because the detail endpoint already lazily backfilled
+// them.
+//
+// Deliberately materialize ONLY — no createDetectRunIfAbsent. That keeps the
+// cost profile identical to materializeMissingAlts (one Cloudinary mirror,
+// idempotent via the (brandId, source, externalId) unique index) and does NOT
+// re-introduce the per-product Gemini vision spend that the deferral was
+// written to remove. Crops / overlay zones / ad-readiness still land later at
+// ad time via ensureDetectForProducts.
+//
+// Returns the imageMediaId string, or null when there's nothing to
+// materialize or the mirror failed. Safe to call repeatedly.
+async function materializeMissingHero(product) {
+  if (product.imageMediaId) return String(product.imageMediaId);
+  if (!product.imageUrl) return null;
+
+  const heroMedia = await materializeImage({
+    sourceUrl: product.imageUrl,
+    product,
+    imageRole: 'hero'
+  });
+  if (!heroMedia?._id) return null;
+
+  const heroMediaId = String(heroMedia._id);
+  // Guarded write: only claim the slot if it is still empty, so a concurrent
+  // enqueueProductDetect that already stamped a hero wins instead of being
+  // overwritten. updateOne so we don't fight Mongoose versioning on a lean doc.
+  const res = await CatalogProduct.updateOne(
+    { _id: product._id, $or: [{ imageMediaId: null }, { imageMediaId: { $exists: false } }] },
+    { $set: { imageMediaId: heroMediaId } }
+  );
+  // Lost the race — report what is actually persisted, not what we minted, so
+  // the caller never hands the picker an id the document doesn't carry.
+  // Returning null on a genuinely unpersisted write is deliberate: the tile
+  // stays greyed for this render and the next fetch retries, which is honest.
+  // Handing back a live-looking id that no CatalogProduct references would
+  // make the tile selectable and then silently wrong downstream.
+  if (!res?.modifiedCount) {
+    const fresh = await CatalogProduct.findById(product._id).select('imageMediaId').lean();
+    return fresh?.imageMediaId ? String(fresh.imageMediaId) : null;
+  }
+  return heroMediaId;
+}
+
 // Fill in the gaps in additionalImageMediaIds for an existing product.
 // Materializes a catalog-product Media doc for every additionalImages[i]
 // that doesn't yet have a corresponding entry, in parallel. Used by the
@@ -541,4 +733,4 @@ function hashShort(s) {
   return Math.abs(h).toString(36).slice(0, 8);
 }
 
-module.exports = { enqueueProductDetect, enqueueBrandProductDetects, ensureDetectForProducts, materializeMissingAlts, MAX_ALT_IMAGES };
+module.exports = { enqueueProductDetect, enqueueBrandProductDetects, ensureDetectForProducts, ensureDetectRunsForExistingMedia, materializeMissingHero, materializeMissingAlts, MAX_ALT_IMAGES };
