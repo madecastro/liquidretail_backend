@@ -299,4 +299,39 @@ function retryAfterFrom(res) {
   return null;
 }
 
-module.exports = { classify, mayResubmit, retryAfterFrom, POLICIES, FALLBACK };
+/**
+ * Is this response, seen while POLLING an already-submitted prediction, bare
+ * transport/gateway noise (a Cloudflare 502 HTML page, a stray proxy error)
+ * that carries ZERO information about the task's fate — as opposed to Atlas
+ * actually having replied, even with an error?
+ *
+ * Why this is safe where a submit-time equivalent would not be: polling a
+ * prediction is an idempotent GET, never a resubmit, so there is no
+ * double-charge risk in just trying the SAME GET again. Observed live
+ * 2026-08-05: a real submit (openai/gpt-image-2/edit) died on its first poll,
+ * 3-4s later, on a Cloudflare "Bad gateway" 502 with no JSON body at all —
+ * classify() correctly has no policy for that shape (nothing to match), so it
+ * fell to FALLBACK (non-retryable) and the render was thrown away as failed
+ * even though Atlas was almost certainly still processing it.
+ *
+ * Deliberately narrower than "classify() returned something non-retryable":
+ * a real Atlas verdict (isFailureStatus) or ANY envelope carrying a numeric
+ * `code` or a `data` object is Atlas talking to us — even if classify() can't
+ * name what it means, that stays exactly as terminal as it is today. This
+ * only returns true when there is NO Atlas signal whatsoever — the logical
+ * complement of the two checks atlasImageService's own `isErrorEnvelope`
+ * already uses, not a new heuristic.
+ *
+ * @param {number|null}  httpStatus    transport status code of the poll response
+ * @param {number|null}  envelopeCode  Atlas envelope `code`, if any
+ * @param {boolean}      hasDataObject whether the body had a `data` object at all
+ * @param {boolean}      isFailureStatus whether Atlas gave a definitive failed/etc verdict
+ */
+function isPollTransportFailure({ httpStatus, envelopeCode, hasDataObject, isFailureStatus }) {
+  if (isFailureStatus) return false;                  // a real Atlas verdict always wins
+  if (typeof envelopeCode === 'number') return false;  // Atlas DID reply with a coded envelope
+  if (hasDataObject) return false;                     // an Atlas `data` object is Atlas replying
+  return httpStatus !== 200;                           // non-200 with zero Atlas signal = transport noise
+}
+
+module.exports = { classify, mayResubmit, retryAfterFrom, isPollTransportFailure, POLICIES, FALLBACK };
