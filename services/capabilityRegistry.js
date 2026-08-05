@@ -632,6 +632,129 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 3: Brand config — create/patch/voice/uploadSettings ─────
+
+  {
+    id:       'brand.create',
+    title:    'Create brand',
+    describe: 'Create a Brand under the caller\'s advertiser. Idempotent on (advertiserId, nameNormalized) — returns a brand-exists error when a brand with the same normalized name already exists (returned brand._id so the operator can pivot). If websiteUrl is supplied, fires background enrichment (Brandfetch → scrape → LLM) which populates logo, tagline, summary, tone, hashtags, tags over the next 30-90s. Requires operator confirmation.',
+    tier:     1,
+    scope:    'advertiser',
+    args: {
+      type: 'object',
+      required: ['name'],
+      properties: {
+        name:         { type: 'string', minLength: 1, maxLength: 200, description: 'Brand display name.' },
+        websiteUrl:   { type: 'string', description: 'Brand website — triggers background enrichment when set.' },
+        tagline:      { type: 'string', maxLength: 200, description: 'Optional marketing tagline (locks the field as curated).' },
+        primaryColor: { type: 'string', description: 'Optional hex like \'#ff5533\' (locks the field as curated).' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandCreate',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'brand.patch',
+    title:    'Edit brand fields',
+    describe: 'Partial update for editable brand fields (name, websiteUrl, tagline, summary, logoUrl, primaryColor, secondaryColor, accentColor, fontColor, websiteBackground, fontFamily, tone, hashtags, tags). Any field set here is added to Brand.curatedFields so auto-enrichment leaves it alone. Voice edits go through brand.voice.patch. If websiteUrl changes, enrichment is retriggered in the background. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'updates'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        updates: {
+          type: 'object',
+          description: 'Fields to update. Provide only the keys you want changed. Send null to clear a field.',
+          properties: {
+            name:              { type: ['string', 'null'], maxLength: 500 },
+            websiteUrl:        { type: ['string', 'null'], maxLength: 500 },
+            tagline:           { type: ['string', 'null'], maxLength: 500 },
+            summary:           { type: ['string', 'null'], maxLength: 500 },
+            logoUrl:           { type: ['string', 'null'], maxLength: 500 },
+            primaryColor:      { type: ['string', 'null'], maxLength: 500 },
+            secondaryColor:    { type: ['string', 'null'], maxLength: 500 },
+            accentColor:       { type: ['string', 'null'], maxLength: 500 },
+            fontColor:         { type: ['string', 'null'], maxLength: 500 },
+            websiteBackground: { type: ['string', 'null'], maxLength: 500 },
+            fontFamily:        { type: ['string', 'null'], maxLength: 500 },
+            tone:              { type: ['string', 'null'], maxLength: 500 },
+            hashtags:          { type: ['array', 'null'], items: { type: 'string' }, maxItems: 20 },
+            tags:              { type: ['array', 'null'], items: { type: 'string' }, maxItems: 20 }
+          },
+          additionalProperties: false
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandPatch',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'brand.voice.patch',
+    title:    'Override brand voice',
+    describe: 'Manual override of Brand.derivedVoice. Set to null to clear (auto-refresh will re-derive later); set to an object to override the AI-derived voice profile. Stamps derivedVoiceAt fresh so the sweep treats it as recent. Returns priorVoice so the operator can revert. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        voice: {
+          type: ['object', 'null'],
+          description: 'Voice profile object or null to clear. Shape is free-form ({ tone_descriptors, principles, disallowed_phrases, ... }).',
+          additionalProperties: true
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandVoicePatch',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'brand.uploadSettings.patch',
+    title:    'Edit brand upload settings',
+    describe: 'Update Brand.uploadSettings. Currently only autoCreateFromDetect is supported — when true, confident review-detection matches auto-write draft CatalogProduct rows. Off by default. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'settings'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        settings: {
+          type: 'object',
+          required: [],
+          properties: {
+            autoCreateFromDetect: { type: 'boolean', description: 'When true, confident detect matches auto-write draft CatalogProduct rows.' }
+          },
+          additionalProperties: false
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandUploadSettingsPatch',
+      method:  'run'
+    }
+  },
+
   // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
 
   {
@@ -695,6 +818,73 @@ const CAPABILITIES = [
     }
   },
 
+  {
+    id:       'brand.deriveVoice',
+    title:    'Derive brand voice from ad history',
+    describe: 'Run brandVoiceDerivationService — an LLM call against the brand\'s existing Meta/Google ad creatives to extract a structured voice profile (tone descriptors, voice principles, disallowed phrases). Threads into the Director. Billable (~$0.02, Sonnet). Respects a 7-day TTL by default; pass force=true to re-derive. Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'brand',
+    estimateUsd: 0.02,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        force:   { type: 'boolean', description: 'When true, re-derive even if the voice is younger than 7 days.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandDeriveVoice',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'brand.refreshEnrichment',
+    title:    'Refresh brand enrichment (logo, tone, tagline, tags)',
+    describe: 'Manually re-run the enrichment pipeline: Brandfetch (logo, colors, fonts) → website scrape (background) → LLM enrichment (tagline, summary, tone, hashtags, tags, demographics). Resets enrichmentSources and unlocks empty curated fields so the operator\'s intent to re-populate is respected. Requires brand.websiteUrl. Billable (~$0.15 aggregate). Runs synchronously — the SSE stream stays open ~30-90s. Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'brand',
+    estimateUsd: 0.15,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandRefreshEnrichment',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'brand.ingestFonts',
+    title:    'Ingest brand fonts from website',
+    describe: 'Scan the brand\'s website for its custom typefaces via brandFontIngestService (Brandfetch + scrape). Persists resolved font files into Brand.customFonts and updates Brand.fontFamily. Billable (~$0.05 aggregate). Requires brand.websiteUrl. Runs synchronously. Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'brand',
+    estimateUsd: 0.05,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandIngestFonts',
+      method:  'run'
+    }
+  },
+
   // ── Tier 3: external / hard-to-reverse ────────────────────────────
 
   {
@@ -716,6 +906,30 @@ const CAPABILITIES = [
     execute: {
       kind:    'service',
       service: './capabilityExecutors/adDelete',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'brand.delete',
+    title:    'Permanently delete brand + cascade',
+    describe: 'FULL CASCADE DELETE — removes the brand and every downstream row: Media, CatalogProduct, Ad, Campaign, CampaignRun, IntegrationCredential, LayoutInputArtifact, AiCanvasArtifact, and every other brand-keyed collection. Also destroys Cloudinary assets (best-effort). IRREVERSIBLE and typically hundreds-to-thousands of rows. Requires TWO safety gates: (1) the explicit phrase "DELETE BRAND" typed in the confirmation UI, AND (2) confirmName arg must equal the brand\'s current name exactly.',
+    tier:     3,
+    scope:    'brand',
+    explicitConfirmation: 'DELETE BRAND',
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId', 'confirmName'],
+      properties: {
+        brandId:     { type: 'string', description: 'Brand ObjectId.' },
+        confirmName: { type: 'string', description: 'The brand\'s current name — must match exactly. Belt-and-braces safety gate.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/brandDelete',
       method:  'run'
     }
   },
