@@ -122,7 +122,12 @@ const V3_NESTED = {
     media_picks: [
       { media_id: 'media_hero_1', role: 'hero', notes: null }
     ],
-    output_shape: { format: 'static_single', tile_count: 1 }
+    output_shape: { format: 'static_single', tile_count: 1 },
+    // 0 deliberately — proves the falsy-nested-still-wins rule (R comment
+    // above: "+ falsy nested ('' / 0 / false) wins under != null") extends to
+    // this field too. A real proof_pick of 0 (the FIRST menu option) must
+    // never be treated as absent.
+    proof_pick: 0
   },
   copy: {
     headline: 'WALK ALL DAY',
@@ -152,6 +157,9 @@ const V2_FLAT = {
     { media_id: 'media_flat_9', role: 'hero', notes: 'legacy' }
   ],
   output_shape: { format: 'static_single', tile_count: 1 },
+  // Distinct from V3_NESTED's 0 so a bug that reads the wrong tier can't
+  // coincidentally pass both R checks with the same value.
+  proof_pick: 1,
   copy_picks: {
     headline: 'FLAT HEADLINE',
     subheadline: null,

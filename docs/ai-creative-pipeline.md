@@ -120,6 +120,18 @@ name off a concept without the helper.
 `conceptForRender` projects a strategy-safe flat object and **never** exports
 `rationale` / reasoning into image prompts.
 
+**`routing.proof_pick` (2026-08-05, behind `DIRECTOR_PROOF_MENU_ENABLED`,
+default false) — audit-only, added to `ROUTING_NESTED_FIELDS` and
+`conceptForRender`.** A 0-based index into `social_proof_signal.proof_options[]`
+(product / category / brand tiers, each pre-scoped) naming which signal
+informed the concept's free-text copy. **It does not drive a render.** The
+number/quote actually burned into an ad's dedicated proof slot is decided
+separately and unconditionally by `resolveCoherentSocialProof`
+(`services/ratingDisplay.js`), never by this field. If you build a tool that
+reads `CreativeDirectionArtifact` rows directly, do not mistake `proof_pick`
+for "the number that rendered" — check the Ad's own `renderService` output for
+that instead.
+
 ### Seeded universe default — one image, and it is the first image from the catalog
 
 > **Canonical explanation lives in [docs/PIPELINES.md](PIPELINES.md) §5

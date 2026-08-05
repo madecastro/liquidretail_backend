@@ -44,7 +44,14 @@ const ROUTING_NESTED_FIELDS = Object.freeze([
   'creative_style',
   'recommended_components',
   'media_picks',
-  'output_shape'
+  'output_shape',
+  // Added with the proof-menu feature (DIRECTOR_PROOF_MENU_ENABLED): a 0-based
+  // index into social_proof_signal.proof_options, or null. Audit-only — no
+  // render path materializes pixels from it; it names which signal informed
+  // the Director's free-text copy. Does not change which rating/quote a
+  // dedicated proof slot actually renders (that stays governed elsewhere,
+  // deterministically).
+  'proof_pick'
 ]);
 
 /**
@@ -187,6 +194,7 @@ function conceptForRender(concept) {
     recommended_components: conceptField(concept, 'recommended_components') ?? null,
     media_picks:            conceptMediaPicks(concept),
     output_shape:           conceptField(concept, 'output_shape') ?? null,
+    proof_pick:             conceptField(concept, 'proof_pick') ?? null,
     // Dual-compat: both names are the same projected object.
     copy,
     copy_picks:             copy,

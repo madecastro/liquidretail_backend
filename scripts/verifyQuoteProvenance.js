@@ -34,6 +34,7 @@
  * Run: node scripts/verifyQuoteProvenance.js
  */
 const direct = require('../services/directImageRenderService');
+const intents = require('../services/staticAdIntents');
 const layout = require('../services/layoutInputService');
 const provenance = require('../services/quoteProvenance');
 const {
@@ -253,13 +254,22 @@ for (const [value, expected] of [[0, undefined], [-5, undefined], [12, undefined
 
 // ── P3b: the two holes an adversarial pass found, pinned so they stay shut ──
 
-// BLOCKER that was caught before merge: a brand aggregate must not reach the
-// static number slots on a product-scoped ad. resolveCoherentSocialProof returns
-// brand-SCOPED strings for a brand win ("41000 brand reviews"), but the static
-// RATING slot is the hardcoded, unscoped `${rating} ★ (${count} reviews)`
-// (staticAdIntents.js:460) — so a brand's 41,000 reviews would read as 41,000
-// reviews OF THAT SKU. Until scoped copy is wired into the slot, brand numbers
-// come ONLY from a layoutInput pair that stamped rating_source:'brand'.
+// SUPERSEDED (2026-08-05): brand.brandReviews is now a sanctioned static number
+// source (BRAND_PROOF_ON_PRODUCT_ADS, owner-requested) — the fix landed the
+// OTHER way round from what this check originally required. Reopening the
+// number source was only safe once the RENDERED STRING carries its own scope,
+// so the contract this check must hold is now "the string names its tier",
+// not "brand numbers never arrive". Testing d.rating/d.reviewCount directly
+// (as the original version did) tests the wrong layer — those are correctly
+// unscoped by design; `d.reviewsText` is the disclosure, and staticAdIntents
+// renders THAT, not a re-derived template. See services/staticAdIntents.js
+// social_proof_led.text() — it now prefers d.reviewsText over building
+// `(${d.reviewCount} reviews)` itself.
+// This calls the REAL rendering path (intents.buildPrompt, same as production),
+// not a re-derivation of the ternary — a check that recomputes the string it is
+// supposed to verify cannot fail when the real code regresses. An earlier draft
+// of this check did exactly that and was caught reverting staticAdIntents.js
+// with the check still green.
 {
   const d = direct.buildIntentData({
     concept: {},
@@ -267,24 +277,105 @@ for (const [value, expected] of [[0, undefined], [-5, undefined], [12, undefined
     brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
     cta: 'X'
   });
-  check('P3b brand.brandReviews is NOT a static number source (unscoped-template misattribution)',
-    d.rating === undefined && d.reviewCount === undefined,
-    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)} — a brand aggregate `
-    + 'would print as product reviews through staticAdIntents.js:460');
+  const built = intents.buildPrompt({
+    intentKey: 'social_proof_led', data: d,
+    product: {}, surface: 'meta_feed_1_1'
+  });
+  const prompt = built && built.prompt || '';
+  check('P3b a brand aggregate wins with SCOPED copy — the REAL rendered prompt names "brand"',
+    d.rating === '4.8' && d.reviewCount === 41000 && d.reviewsText === '41000 brand reviews'
+    && prompt.includes('41000 brand reviews') && !prompt.includes('(41000 reviews)'),
+    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)} `
+    + `reviewsText=${JSON.stringify(d.reviewsText)}; prompt contains "41000 brand reviews"=`
+    + `${prompt.includes('41000 brand reviews')} contains unscoped "(41000 reviews)"=`
+    + `${prompt.includes('(41000 reviews)')} — without the scope word this reads as that SKU's own volume`);
 }
-// The sanctioned brand path still works: layoutInput itself stamping 'brand' is
-// how a no-SKU / branding-outcome ad has always carried brand numbers.
+// The flag closes the door completely, for a brand that wants it off.
+{
+  const prev = process.env.BRAND_PROOF_ON_PRODUCT_ADS;
+  process.env.BRAND_PROOF_ON_PRODUCT_ADS = 'false';
+  const d = direct.buildIntentData({
+    concept: {},
+    layoutInput: { social_proof: {} },
+    brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
+    cta: 'X'
+  });
+  check('P3b BRAND_PROOF_ON_PRODUCT_ADS=false withholds the brand aggregate entirely',
+    d.rating === undefined && d.reviewCount === undefined && d.reviewsText === undefined,
+    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)}`);
+  if (prev === undefined) delete process.env.BRAND_PROOF_ON_PRODUCT_ADS;
+  else process.env.BRAND_PROOF_ON_PRODUCT_ADS = prev;
+}
+// The pre-existing sanctioned path (layoutInput itself stamping 'brand', the
+// no-SKU / branding outcome) still works and is still scoped IN THE REAL PROMPT.
 {
   const d = direct.buildIntentData({
     concept: {},
     layoutInput: { social_proof: { rating_value: 4.8, review_count: 41000, rating_source: 'brand' } },
+    brand: {},
+    cta: 'X'
+  });
+  const built = intents.buildPrompt({
+    intentKey: 'social_proof_led', data: d,
+    product: {}, surface: 'meta_feed_1_1'
+  });
+  const prompt = built && built.prompt || '';
+  check('P3b a layoutInput-stamped BRAND pair still prints, scoped, in the real prompt',
+    d.rating === '4.8' && d.reviewCount === 41000 && d.reviewsText === '41000 brand reviews'
+    && prompt.includes('41000 brand reviews'),
+    `got rating=${JSON.stringify(d.rating)} reviewsText=${JSON.stringify(d.reviewsText)}`);
+}
+// The one thing that must NEVER be true regardless of source or flag: a
+// PRODUCT-tier win must never carry the word "brand" in its disclosure string,
+// verified against the real prompt.
+{
+  const d = direct.buildIntentData({
+    concept: {},
+    layoutInput: { social_proof: { rating_value: 4.7, review_count: 523, rating_source: 'product' } },
     brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
     cta: 'X'
   });
-  check('P3b a layoutInput-stamped BRAND pair still prints (the pre-existing sanctioned path)',
-    d.rating === '4.8' && d.reviewCount === 41000,
-    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)}`);
+  const built = intents.buildPrompt({
+    intentKey: 'social_proof_led', data: d,
+    product: {}, surface: 'meta_feed_1_1'
+  });
+  const prompt = built && built.prompt || '';
+  // "brand" legitimately appears elsewhere in this prompt (the shared
+  // PRODUCT_FIDELITY block: "do not infer it from the brand", branding-on-item
+  // carve-outs) — those are unrelated to the rating disclosure, so the real
+  // assertion is scoped to the RATING line itself, not the whole prompt.
+  const ratingLine = prompt.split('\n').find((l) => l.includes('523 reviews'));
+  check('P3b a product-tier win is never mislabelled "brand" on its own rating line',
+    d.reviewsText === '523 reviews' && !!ratingLine && !ratingLine.toLowerCase().includes('brand'),
+    `got reviewsText=${JSON.stringify(d.reviewsText)} ratingLine=${JSON.stringify(ratingLine)}`);
 }
+
+// SECOND BLOCKER an adversarial pass caught, same root cause as #1 above but a
+// different rendered slot: TRUST MARK (product_first_lifestyle — the FLOOR
+// intent, always eligible — and brand_led) rendered a bare, unscoped
+// `${d.rating} ★` with no count at all, so widening the brand number source
+// (BRAND_PROOF_ON_PRODUCT_ADS) made a brand-wide rating print as though it
+// were this product's own star on the MOST FREQUENTLY reached intent in the
+// file. Both TRUST MARK sites now prefer d.reviewsText the same way the
+// RATING slot does. Tested against the REAL rendered prompt via
+// intents.buildPrompt, not a re-derived string — the P3b lesson from earlier
+// in this file (a check that recomputes what it verifies cannot catch a
+// reverted fix).
+for (const intentKey of ['product_first_lifestyle', 'brand_led']) {
+  const d = direct.buildIntentData({
+    concept: { copy: { headline: 'H' } },  // brand_led requires a headline to be eligible
+    layoutInput: { social_proof: {} },
+    brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
+    cta: 'X'
+  });
+  const built = intents.buildPrompt({ intentKey, data: d, product: {}, surface: 'meta_feed_1_1' });
+  const prompt = built && built.prompt || '';
+  const markLine = prompt.split('\n').find((l) => l.includes('TRUST MARK') || l.includes('★'));
+  check(`P3b ${intentKey} TRUST MARK: a brand aggregate is SCOPED, not a bare star`,
+    d.reviewsText === '41000 brand reviews' && !!markLine && markLine.toLowerCase().includes('brand'),
+    `got reviewsText=${JSON.stringify(d.reviewsText)} markLine=${JSON.stringify(markLine)} built.error=${built && built.error}`);
+}
+
 // SERIOUS that was caught before merge: productReviews winning on a COUNT alone
 // would hand back {rating:null, count:N} and erase a good top-level rating.
 {
