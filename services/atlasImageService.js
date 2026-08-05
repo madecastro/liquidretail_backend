@@ -24,7 +24,7 @@
 
 const axios = require('axios');
 const { recordFlatCost, reconcileCost } = require('./costTracker');
-const { classify, mayResubmit, retryAfterFrom } = require('./atlasErrorPolicy');
+const { classify, mayResubmit, retryAfterFrom, isPollTransportFailure } = require('./atlasErrorPolicy');
 const { adStage, formatElapsed } = require('./adStage');
 
 const BASE = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
@@ -229,6 +229,55 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     throw err;                       // no predictionId => wrapper may resubmit
   }
   const id = submit.data.data.id;
+  // ── CHARGE POINT ──────────────────────────────────────────────────────────
+  // The submit returned an id, so Atlas has accepted a BILLABLE job. The money is
+  // committed HERE, whatever happens to the poll, the crop, or the upload — so the
+  // spend receipt is stamped NOW, mirroring atlasVideoService's charge-point write
+  // (`veoPredictionId`, atlasVideoService.js ~3111).
+  //
+  // WHY THIS WAS MISSING AND WHY IT MATTERS (2026-08-05): the image receipt was
+  // only ever written on SUCCESS, by renderService.persistStage from
+  // buildSubmissionRecord. So `services/spendReceipt.js` — which reads exactly this
+  // path to refuse a requeue, and whose header says receipts exist "so the asset can
+  // be recovered for free instead of re-bought" — could never match a FAILED image.
+  // Its image arm was dead for the one case it exists to protect: a timed-out or
+  // crashed render is paid for and unrecoverable, and the ad is eligible for a
+  // requeue that submits (and pays) a second time.
+  //
+  // WHOLE-OBJECT MERGE, not a dotted `imageGeneration.predictionId` $set:
+  // models/Ad.js:341 declares `imageGeneration` as Mixed with `default: null`, and
+  // MongoDB refuses to create a field inside a null element ("Cannot create field
+  // 'predictionId' in element {imageGeneration: null}"), so the dotted form would
+  // throw on the FIRST render of every ad. The aggregation-pipeline `$mergeObjects`
+  // form is atomic in one round-trip and, unlike a read-then-write, cannot clobber a
+  // prior successful render's submission record on a REGENERATE — it merges into
+  // whatever is already there, treating null/missing as {}.
+  //
+  // `receiptOnly` marks this as the partial, pre-completion shape so a reader (e.g.
+  // the generation inspector, routes/ads.js) can tell it apart from the full
+  // submission record that replaces it on success.
+  //
+  // Non-fatal by design: a bookkeeping failure must never fail a generation
+  // POST-payment, or the caller never stores the asset and a retry double-bills.
+  if (meta.adId) {
+    try {
+      const Ad = require('../models/Ad');
+      await Ad.updateOne({ _id: meta.adId }, [
+        { $set: {
+            imageGeneration: { $mergeObjects: [
+              { $cond: [{ $eq: [{ $type: '$imageGeneration' }, 'object'] }, '$imageGeneration', {}] },
+              { predictionId: id, model, submittedAt: new Date().toISOString(), receiptOnly: true }
+            ] },
+            updatedAt: new Date()
+        } }
+      ]);
+    } catch (err) {
+      console.warn(
+        `   ⚠️  atlasImage: could not persist spend receipt predictionId=${id} for ad=${meta.adId} ` +
+        `(${err.message}) — a paid image would be unrecoverable and requeue-eligible`
+      );
+    }
+  }
   let lastStatus = null;
   let transientPolls = 0;   // backoff counter for throttles seen while polling
   let pollCount = 0;
@@ -307,6 +356,43 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
         console.warn(
           `   ⏸  atlasImage: ${policy.name} while polling ${id} — waiting ${waitMs}ms and continuing ` +
           `to poll (NOT resubmitting; the task is already billable)`
+        );
+        await new Promise((r) => setTimeout(r, Math.min(waitMs, Math.max(0, generationTimeoutMs - (Date.now() - t0)))));
+        continue;
+      }
+
+      // A response with ZERO Atlas signal (no numeric envelope code, no data
+      // object — e.g. a bare Cloudflare 502 HTML page) carries no information
+      // about the task's fate, so classify() has nothing to match on BODY
+      // content and falls to the non-retryable FALLBACK above. But this is a
+      // POLL, not a submit — continuing to poll the SAME prediction id is
+      // always free, so treat it like the transient branch above rather than
+      // throwing away a render that Atlas may still be finishing. Reuses the
+      // same backoff/transientPolls machinery.
+      //
+      // `&& !policy.terminal` is load-bearing, not defensive filler:
+      // classify() also matches several policies on `http` ALONE, with no
+      // body required — unauthorized(401)/insufficientBalance(402)/
+      // forbidden(403)/moderationBlocked all resolve correctly (and
+      // terminal:true) even with zero envelope signal. Without this guard, a
+      // bare 401/402/403 (e.g. a WAF block page with no Atlas JSON) would be
+      // wrongly "kept polling" for the full ATLAS_IMAGE_TIMEOUT_MS instead of
+      // failing immediately as auth/billing — still not a double-charge, but
+      // a real regression in speed and in the reported cost status. Every
+      // case classify() DOES recognize with confidence — a real {code,...}
+      // object, a definitive failed verdict, moderation, balance, 429, or an
+      // http-only-matched terminal policy — is untouched and keeps exactly
+      // its current behavior.
+      if (isPollTransportFailure({
+        httpStatus: poll.status,
+        envelopeCode: apiCode,
+        hasDataObject: !!poll.data?.data,
+        isFailureStatus
+      }) && !policy.terminal) {
+        const waitMs = policy.backoffFor(transientPolls++);
+        console.warn(
+          `   ⏸  atlasImage: transport error (HTTP ${poll.status}, non-Atlas response body) while polling ${id} — ` +
+          `waiting ${waitMs}ms and continuing to poll (NOT resubmitting; the task is already billable)`
         );
         await new Promise((r) => setTimeout(r, Math.min(waitMs, Math.max(0, generationTimeoutMs - (Date.now() - t0)))));
         continue;
@@ -663,4 +749,112 @@ async function editImage({
   }
 }
 
-module.exports = { generateImage, editImage, uploadBuffer, isConfigured, buildPriceMap, buildSubmissionRecord };
+/**
+ * PEEK a settled-or-in-flight image prediction. FREE, and structurally incapable of
+ * submitting: the only network call in this function is a GET, and it is the sole
+ * exported read-path primitive that takes a prediction id rather than params.
+ *
+ * Deliberately mirrors atlasVideoService.peekPrediction (~:2423) rather than reusing
+ * the poll loop in submitAndPoll: that loop owns a DEADLINE and a billable submit,
+ * and neither belongs in a recovery read. Asserted no-submit by
+ * scripts/verifyImageResume.js.
+ *
+ * @param {string} predictionId  the spend receipt (Ad.imageGeneration.predictionId)
+ * @returns {Promise<{state:'done'|'processing'|'failed'|'unknown', imageUrl?:string,
+ *                    message?:string, policy?:string}>}
+ */
+async function peekImagePrediction(predictionId) {
+  if (!predictionId) return { state: 'unknown', message: 'no prediction id' };
+  if (!isConfigured()) return { state: 'unknown', message: 'ATLAS_API_KEY not configured' };
+  let res;
+  try {
+    res = await axios.get(`${BASE}/model/prediction/${predictionId}`, {
+      headers: { Authorization: `Bearer ${KEY()}` },
+      timeout: 20_000,
+      validateStatus: () => true
+    });
+  } catch (err) {
+    return { state: 'unknown', message: err.message };
+  }
+  if (res.status !== 200) return { state: 'unknown', message: `HTTP ${res.status}` };
+  const data = res.data?.data || {};
+  const status = String(data.status || '').toLowerCase();
+
+  // ── THE CONFIRMED CHARGE ──────────────────────────────────────────────────
+  // Owner rule (CLAUDE.md §2): a charge may NOT be assumed — the authoritative
+  // figure is `price` on the SETTLED prediction, read back from Atlas. This GET is
+  // exactly that read, so every return below carries it:
+  //
+  //   priceConfirmed:true  + price>0  -> Atlas states a charge. Assert it, and
+  //                                      reconcile the ledger to this real number.
+  //   priceConfirmed:true  + price==0 -> Atlas states no charge (failed tasks are
+  //                                      refunded per the documented policy).
+  //   priceConfirmed:false            -> UNKNOWN. Not "free". Callers must not
+  //                                      collapse this to charged:false — that
+  //                                      understates spend, the one direction the
+  //                                      ledger can never be corrected in.
+  //
+  // Atlas often publishes `price` only AFTER the image returns (measured 7 of 38
+  // at completion), so priceConfirmed:false is common and expected on a fresh
+  // prediction — it means "ask again later", which is what makes this cheap to
+  // re-read. Note base_price from the catalog is NOT this number (it understated
+  // by ~7.17x on gpt-image-2) and must never be substituted for it.
+  const rawPrice = Number(data.price);
+  const priceConfirmed = Number.isFinite(rawPrice);
+  const charge = { price: priceConfirmed ? rawPrice : null, priceConfirmed };
+
+  if (status === 'completed' || status === 'succeeded') {
+    const raw = data.outputs ?? data.output ?? [];
+    const url = Array.isArray(raw) ? raw[0] : raw;
+    // Completed with no output is the genuine "paid for nothing" case; classify it
+    // as such rather than letting it read as still-running forever.
+    return url
+      ? { state: 'done', imageUrl: url, ...charge }
+      : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput', ...charge };
+  }
+  if (status === 'failed' || status === 'error' || status === 'cancelled' || status === 'canceled') {
+    const providerMsg = data.error || status;
+    const policy = classify({
+      predictionStatus: 'failed', msg: providerMsg, nsfw: data.has_nsfw_contents ?? null
+    });
+    return {
+      state: 'failed',
+      message: `${policy.label || 'atlasImage: prediction failed'}: ${providerMsg}`,
+      policy: policy.name,
+      ...charge
+    };
+  }
+  return { state: 'processing', ...charge };
+}
+
+/**
+ * RESUME an image generation from its spend receipt (Ad.imageGeneration.predictionId).
+ * Never submits — see peekImagePrediction.
+ *
+ * ⚠️ RETURNS THE RAW MODEL OUTPUT, WHICH IS *NOT* A DELIVERABLE AD. Unlike the video
+ * path — where the Omni master IS the asset and bootRecoveryService can stamp it
+ * straight onto the Ad — a static ad's Atlas output still needs the delivery crop and
+ * the logo composite that directImageRenderService applies AFTER the model returns
+ * (`crop + logo composite`, directImageRenderService.js ~:1090), plus the Cloudinary
+ * upload. Stamping `imageUrl` onto Ad.renderUrl would ship an uncropped, unbranded
+ * image and would look like a successful render.
+ *
+ * So this is the RECOVERY PRIMITIVE ONLY: it answers "is the image we already paid
+ * for available, and where". Completing it into a deliverable ad requires driving the
+ * post-model half of directImageRenderService, which is not yet extractable — that is
+ * tracked as the remaining piece and is why bootRecoveryService does not yet finish
+ * image ads.
+ */
+async function resumeImageForAd({ ad } = {}) {
+  const predictionId = ad?.imageGeneration?.predictionId || null;
+  if (!predictionId) return { resumed: false, state: 'no-receipt' };
+  const peek = await peekImagePrediction(predictionId);
+  // `resumed` stays FALSE even on state:'done' — the asset is located, not delivered
+  // (see the warning above). Callers must not read 'done' as "the ad is finished".
+  return { resumed: false, predictionId, ...peek };
+}
+
+module.exports = {
+  generateImage, editImage, uploadBuffer, isConfigured, buildPriceMap, buildSubmissionRecord,
+  peekImagePrediction, resumeImageForAd
+};

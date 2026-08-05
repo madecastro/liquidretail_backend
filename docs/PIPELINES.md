@@ -1029,6 +1029,64 @@ No Telegram secrets remain. Alerts stay disabled until `SLACK_BOT_TOKEN` is set.
 
 ---
 
+## 10. Ad recency — "last activity" must read `renderedAt`, never `generatedAt` alone
+
+**The trap (production incident 2026-08-05).** `Ad.generatedAt` (`models/Ad.js`) is stamped **once**
+when the row is created and is **never updated again** — not by a fresh render
+(`services/renderService.js` `persistStage`, which writes `status`/`renderedAt`/`renderUrl`) and not
+by dedupe-reuse (`routes/ads.js` `claimAdsForRun`, which only `$addToSet`s `campaignRunIds` and flips
+status). `renderedAt` **is** written on every real render, including a re-render of a reused row.
+
+So any surface that ranks or badges "recent activity" by `generatedAt` reports **row age, not
+activity**. Measured live: brand "Pelagic Gear" generated 12 ads (10 rendered successfully with real
+Cloudinary URLs) at 17:17–17:21Z; because those rows had been created 2026-07-30 under an earlier run
+and were dedupe-reused, the `/product-ads` page badged the product **"Last Activity ~6 days ago"**
+and ranked it #3-5 — the operator could not find the ads at all and reported "the latest ads there
+are several hours old". Nothing was broken in generation; the data was invisible.
+
+**The rule: read recency through `services/adRecencyService`, never a bare `$generatedAt`.**
+- `AD_RECENCY_EXPR` = `{ $ifNull: ['$renderedAt', '$generatedAt'] }` — for `$group`/`$addFields`.
+- `resolveAdRecency(adLike)` = `adLike.renderedAt || adLike.generatedAt || null` — for plain objects.
+- `generatedAt` keeps its own meaning ("row first existed"). This is a **read-time projection only**;
+  nothing writes either field. Precedent already in-tree: the generation-inspector endpoint
+  (`routes/ads.js`) has long used `ad.renderedAt || ad.generatedAt || ad.createdAt`.
+
+**Four call sites, all fixed 2026-08-05.** `routes/catalog.js` (`buildAdStatsByProduct` `$group`,
+and `/:id/ads-detail`), `routes/campaigns.js` (`/ads-summary` `$group`, and its own `/:id/ads-detail`
+— a near-mirror of catalog's that an adversarial review caught still on the old sort), and
+`routes/ads.js` (`GET /api/ads`).
+
+Two things that look like reasonable shortcuts and are **wrong**:
+1. **A compound `.sort({renderedAt:-1, generatedAt:-1})` on `.find()` is NOT equivalent.** BSON sorts
+   `Date` above `null` unconditionally, so it tiers every ever-rendered ad above every
+   not-yet-rendered one regardless of wall-clock recency. Sorting on a coalesced value requires an
+   aggregation (`$addFields` a `_recencyAt`, then `$sort` it) — which is why those two `.find()`
+   call sites became `Ad.aggregate`.
+2. **A filter object reused between `.find()` and an aggregation `$match` must be cast explicitly.**
+   Mongoose auto-casts `.find()` filters against the schema; the driver's `$match` does **not**. So
+   `brandId`/`campaignId` need `new mongoose.Types.ObjectId(...)` once the query is an aggregation,
+   or the `$match` silently returns nothing. `campaignRunIds` is a plain `[String]`, so a bare
+   equality is a correct contains-match (same convention as `/render-activity`).
+
+**Cost of the aggregation conversion, accepted knowingly:** `$sort` on a computed field cannot use
+`{brandId:1,status:1,generatedAt:-1}` / `{campaignId:1,generatedAt:-1}`, so these sorts are no longer
+index-backed. `allowDiskUse: true` is set on the unbounded ones so a large brand cannot 500 the list
+endpoint on the 100MB in-memory sort limit. **Not yet measured on the largest brand** — if the ads
+list gets slow, this is the first thing to look at.
+
+**Also 2026-08-05: `GET /api/ads` accepts `campaignRunId`** as a real DB-level filter. The Ads page
+previously fetched an unscoped, `generatedAt`-sorted, 120-row-capped page and filtered it
+**client-side** by run, so a fresh batch outside that window vanished. A containment `$match` cannot
+be pushed off a page by a stale sort key; the client filter is retained as a harmless no-op. The
+frontend redirects that feed it (`Step4Generate.tsx`, `Campaigns/index.tsx`) were also missing
+`campaignId` entirely — fixed in the `liquidretail` repo.
+
+**Pinned by `scripts/verifyAdsRecency.js` (21 checks).** Note check 1.11/1.12 are the general form —
+they assert **no** `.sort({generatedAt:-1})` ad query remains in either route file, rather than
+naming sites, because the campaigns mirror is exactly what a named-site-only harness missed.
+
+---
+
 ## Quick map: file → pipeline
 
 | Concern | Primary files |

@@ -30,6 +30,7 @@ const DetectionArtifact     = require('../models/DetectionArtifact');
 const Ad                    = require('../models/Ad');
 const Campaign              = require('../models/Campaign');
 const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../services/adDisplayUrlService');
+const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 void assertMediaInTenant;     // kept for future :id verification helpers
@@ -327,7 +328,9 @@ const TARGET_ADS_PER_PRODUCT = 5;
 
 // Single aggregation grouping ads by productId. Brand-scoped, excludes
 // archived. Returns counts by status + the set of distinct campaign IDs
-// + most recent generatedAt per product.
+// + most recent activity (renderedAt, falling back to generatedAt) per
+// product — see services/adRecencyService for why renderedAt is the
+// signal that must be used here.
 async function buildAdStatsByProduct(brandObjectId) {
   const rows = await Ad.aggregate([
     { $match: { brandId: brandObjectId, status: { $ne: 'archived' } } },
@@ -348,7 +351,7 @@ async function buildAdStatsByProduct(brandObjectId) {
           }
         },
         campaignIds:    { $addToSet: '$campaignId' },
-        lastGeneratedAt:{ $max: '$generatedAt' }
+        lastGeneratedAt:{ $max: AD_RECENCY_EXPR }
     } }
   ]);
   const byProduct = new Map();
@@ -676,11 +679,28 @@ router.get('/:id/ads-detail', async (req, res) => {
       status:    { $ne: 'archived' }
     };
 
-    const ads = await Ad.find(filter)
-      .select('_id campaignId template aspectRatio kind status approved approvedAt renderUrl posterUrl ctaText copy generatedAt metaSyncStatus metaAdId metaAdsetId platformFormat aiCanvasArtifactId mediaId productId variantKind paletteSource sourceFileType regenerating regenerationStage regenerationHistory')
-      .sort({ generatedAt: -1 })
-      .limit(60)
-      .lean();
+    // A plain .find().sort({generatedAt:-1}) can't rank by "true" recency —
+    // generatedAt is a creation-time-only stamp that's never touched by a
+    // re-render or dedupe-reuse (see services/adRecencyService), so a
+    // recently re-rendered ad would sort as if nothing happened. Sorting by
+    // a coalesced {renderedAt, generatedAt} needs an aggregation; a compound
+    // {renderedAt:-1, generatedAt:-1} sort on .find() is NOT equivalent — it
+    // would tier every ever-rendered ad above every not-yet-rendered one
+    // regardless of actual recency.
+    const ads = await Ad.aggregate([
+      { $match: filter },
+      { $addFields: { _recencyAt: AD_RECENCY_EXPR } },
+      { $sort: { _recencyAt: -1 } },
+      { $limit: 60 },
+      { $project: {
+          _id: 1, campaignId: 1, template: 1, aspectRatio: 1, kind: 1, status: 1,
+          approved: 1, approvedAt: 1, renderUrl: 1, posterUrl: 1, ctaText: 1, copy: 1,
+          generatedAt: 1, renderedAt: 1, metaSyncStatus: 1, metaAdId: 1, metaAdsetId: 1,
+          platformFormat: 1, aiCanvasArtifactId: 1, mediaId: 1, productId: 1, variantKind: 1,
+          paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
+          regenerationHistory: 1
+      } }
+    ], { allowDiskUse: true });
 
     // Join the photoreal polish URL + the per-campaign
     // useImageRefAsProduction flag — same shape /api/ads returns so the
@@ -737,7 +757,9 @@ router.get('/:id/ads-detail', async (req, res) => {
       posterUrl:      a.posterUrl || null,
       headline:       a.copy?.headline || null,
       ctaText:        (a.copy && a.copy.cta_text) || a.ctaText || null,
-      generatedAt:    a.generatedAt ? new Date(a.generatedAt).toISOString() : null,
+      generatedAt:    (a.renderedAt || a.generatedAt)
+                        ? new Date(a.renderedAt || a.generatedAt).toISOString()
+                        : null,
       metaSyncStatus: a.metaSyncStatus || null,
       metaAdId:       a.metaAdId || null,
       metaAdsetId:    a.metaAdsetId || null,

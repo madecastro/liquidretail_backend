@@ -99,6 +99,68 @@ the live-verified gateway rates; unknown model ids warn once instead of
 silently logging $0. Image/video calls record flat per-generation costs
 (`recordFlatCost`) with prices read from the live catalog.
 
+### Poll-time transport noise ≠ a task verdict (fixed 2026-08-05)
+
+**Incident:** two static ads failed with
+`Atlas image unknown (HTTP 502, code n/a, status unknown): …Cloudflare error 502: Bad gateway… —
+unrecognised failure shape`. The submit had **succeeded** (real prediction ids,
+`openai/gpt-image-2/edit`); the **first status poll** 3-4s later came back as a bare Cloudflare error
+page. `classify()` correctly has no policy matching that shape — there is nothing in it to match — so
+it fell to `FALLBACK` (`retryable:false`) and `atlasImageService`'s poll loop threw, discarding a
+render Atlas was most likely still working on.
+
+⚠️ **Do NOT read those rows as "free". `FALLBACK.charged` is `null` — UNKNOWN, not false.**
+`renderService.js:1440` writes `charged: err.charged === true`, which collapses that `null` to
+`false`, and `models/Ad.js` declares `renderError.charged` as `{type: Boolean, default: false}`, so
+the schema cannot express "unknown" at all. The two ads that failed this way on 2026-08-05 are
+therefore recorded as costing nothing when the honest answer is **we do not know whether Atlas
+billed them** — and per §4's owner rule a charge may only be asserted from a CONFIRMED price on the
+settled prediction. Understating the ledger is the one direction it can never be corrected in.
+**Open, needs a schema change** (tri-state, or a companion `chargeConfirmed` field); the
+`peekImagePrediction` price read-back below is the mechanism that would populate it truthfully.
+
+**The distinction that matters:** an error seen while **polling** may carry information about the
+task (`data.status:'failed'`, a coded `{code,msg}` envelope) — or **none at all** (a CDN/WAF/proxy
+error page). The second kind says nothing about the prediction, and a poll is an **idempotent GET**,
+never a resubmit — so continuing to poll the same id is free and cannot double-charge. That is
+categorically different from the submit path, where the "never blind-retry a billable POST" rule
+still holds absolutely and is untouched.
+
+`isPollTransportFailure({httpStatus, envelopeCode, hasDataObject, isFailureStatus})` in
+`services/atlasErrorPolicy.js` returns true **only** when there is zero Atlas signal: no numeric
+envelope `code`, no `data` object, non-200, and no definitive verdict. It is deliberately the logical
+complement of `atlasImageService`'s own `isErrorEnvelope` checks, not a new heuristic.
+
+Two guards at the call site are load-bearing:
+- It sits **after** the existing `policy.retryable && !isFailureStatus` branch, so every case
+  `classify()` already recognizes keeps its exact current precedence and behavior.
+- It is gated on **`&& !policy.terminal`**. `classify()` also resolves several policies from `http`
+  **alone**, with no body needed — `unauthorized`(401) / `insufficientBalance`(402) /
+  `forbidden`(403) are all `terminal:true` even with an empty body. Without that gate, a bare 402
+  behind a WAF page would be "kept polling" for the full `ATLAS_IMAGE_TIMEOUT_MS` (180s default) and
+  then ledgered as a **charged timeout**, instead of failing instantly as a billing outage. Found by
+  adversarial review, not by the first draft.
+
+`atlasVideoService`'s poll loop already handled this correctly (bare 5xx → `consecutiveErrors++` and
+continue, up to `MAX_CONSECUTIVE_ERRORS`), so **only the image path changed** — the usual "one
+pipeline got the fix, the other didn't", in the video path's favour for once.
+
+**Operational note:** during a sustained CDN outage, renders now hold their concurrency slot until
+timeout rather than failing fast. Correct for not throwing away paid work; reduces throughput while
+the outage lasts.
+
+Pinned by `scripts/verifyPollTransportRetry.js` (20 checks — a behavioral table, an end-to-end
+`predicate + !policy.terminal` decision table incl. the bare-401/402/403 regression cases, and
+structural checks that the real call site keeps the ordering and the terminal gate).
+
+**Known adjacent gap, NOT fixed:** the poll `axios.get` has no `try/catch`, so a raw network
+exception (`ECONNRESET`, DNS failure) still escapes `submitAndPoll` untagged, losing `.charged` /
+`.policy`. `directImageRenderService` is safe (it passes `allowFallback: !atlasImage.isConfigured()`,
+i.e. false in prod), but `openaiService`, `aiLayoutStudioService`, `personaAvatarService`,
+`geminiImageService` and `aiImageReferenceService` all call with the default `allowFallback:true` and
+would fall through to a direct-provider retry without the double-pay warning firing. Mirror
+`atlasVideoService.pollPrediction`'s catch if this is picked up.
+
 ## 5) Env
 
 - `ATLAS_API_KEY` — primary, everything.

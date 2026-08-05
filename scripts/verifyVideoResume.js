@@ -157,10 +157,29 @@ checkTrue('N4 resumeForAd delegates to peekPrediction rather than its own reques
     /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,200}status: 'draft'/.test(REC));
   checkTrue('O4 the failure write is status-filtered too',
     /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,240}status: 'failed'/.test(REC));
-  // A receipt means we were billed. Recording charged:false would understate
-  // spend, and an understated ledger is the direction that cannot be corrected.
-  checkTrue('O5 a resumed failure is ledgered as CHARGED (a receipt means billed)',
-    /'renderError\.charged':\s*true/.test(REC));
+  // O5 REWRITTEN 2026-08-05, and the reason matters more than the check.
+  //
+  // It used to assert the literal `'renderError.charged': true`, on the rationale
+  // that "a receipt means we were billed". Owner ruling (CLAUDE.md §2): a charge may
+  // NOT be assumed — a receipt proves a SUBMIT, and the authoritative figure is
+  // `price` on the settled prediction. Atlas refunds failed tasks, so receipt-implies-
+  // charged is not sound in general. The IMAGE path now derives the flag from a
+  // confirmed price (scripts/verifyImageResume.js section E).
+  //
+  // VIDEO is deliberately unchanged: atlasVideoService.peekPrediction does not read
+  // `price` back, so there is nothing to confirm against, and some video models bill
+  // on completion rather than submit — changing that is its own reviewed change.
+  //
+  // So this now asserts the INTENT (video still ledgers charged) via the derivation,
+  // which is strictly stronger than the old literal: it pins both that the write uses
+  // the derived flag AND that the non-image branch of that derivation is
+  // unconditionally true. A future edit that made video's charge conditional would
+  // fail here instead of silently changing video billing semantics.
+  checkTrue('O5 a resumed VIDEO failure is still ledgered as CHARGED, via the derived flag',
+    /'renderError\.charged':\s*confirmedCharge/.test(REC)
+    && /const confirmedCharge = isImage/.test(REC)
+    // the `: true` branch is the video side of the ternary
+    && /:\s*true;/.test(REC.slice(REC.indexOf('const confirmedCharge'))));
   checkTrue('O6 the recovered master rests at draft (the reaper-safe money guard)',
     /status: 'draft'/.test(REC));
   // processing/unknown must be left alone — acting on ignorance writes off a

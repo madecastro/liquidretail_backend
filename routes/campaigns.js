@@ -19,6 +19,7 @@ const CatalogProduct = require('../models/CatalogProduct');
 const Media = require('../models/Media');
 const Ad = require('../models/Ad');
 const { tenantFilter } = require('../middleware/tenantHelpers');
+const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 
 // GET /api/campaigns?brandId=X[&platform=meta-ads|google-ads][&status=ACTIVE]
 // Lightweight list for the Campaigns page. Returns a projection that
@@ -145,7 +146,8 @@ router.get('/ads-summary', async (req, res) => {
     }
 
     // Single aggregation over Ad: per-campaign counts + distinct
-    // products with ads + distinct platformFormats + last generatedAt.
+    // products with ads + distinct platformFormats + last activity
+    // (renderedAt, falling back to generatedAt — see adRecencyService).
     const campaignIds = campaigns.map(c => c._id);
     const agg = await Ad.aggregate([
       { $match: {
@@ -169,7 +171,7 @@ router.get('/ads-summary', async (req, res) => {
           },
           productsWithAds: { $addToSet: '$productId' },
           platformFormats: { $addToSet: '$platformFormat' },
-          lastGeneratedAt: { $max: '$generatedAt' }
+          lastGeneratedAt: { $max: AD_RECENCY_EXPR }
       } }
     ]);
     const adStatsByCampaign = new Map();
@@ -315,15 +317,25 @@ router.get('/:id/ads-detail', async (req, res) => {
     if (!campaign) return res.status(404).json({ error: 'campaign not found' });
 
     const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../services/adDisplayUrlService');
-    const ads = await Ad.find({
-      brandId:    brandObjectId,
-      campaignId: campaignObjectId,
-      status:     { $ne: 'archived' }
-    })
-      .select('_id campaignId template aspectRatio kind status approved approvedAt renderUrl posterUrl ctaText copy generatedAt metaSyncStatus metaAdId metaAdsetId platformFormat aiCanvasArtifactId mediaId productId variantKind paletteSource sourceFileType regenerating regenerationStage regenerationHistory')
-      .sort({ generatedAt: -1 })
-      .limit(120)
-      .lean();
+    // Aggregation, not .find(), for the same reason as catalog.js's sibling
+    // /:id/ads-detail: ranking must use "true" recency (renderedAt, falling
+    // back to generatedAt — see adRecencyService), which a plain
+    // .sort({generatedAt:-1}) can't express since generatedAt alone never
+    // updates on a re-render or dedupe-reuse.
+    const ads = await Ad.aggregate([
+      { $match: { brandId: brandObjectId, campaignId: campaignObjectId, status: { $ne: 'archived' } } },
+      { $addFields: { _recencyAt: AD_RECENCY_EXPR } },
+      { $sort: { _recencyAt: -1 } },
+      { $limit: 120 },
+      { $project: {
+          _id: 1, campaignId: 1, template: 1, aspectRatio: 1, kind: 1, status: 1,
+          approved: 1, approvedAt: 1, renderUrl: 1, posterUrl: 1, ctaText: 1, copy: 1,
+          generatedAt: 1, renderedAt: 1, metaSyncStatus: 1, metaAdId: 1, metaAdsetId: 1,
+          platformFormat: 1, aiCanvasArtifactId: 1, mediaId: 1, productId: 1, variantKind: 1,
+          paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
+          regenerationHistory: 1
+      } }
+    ], { allowDiskUse: true });
 
     // Per-product ad-count for the products sidebar (analogous to the
     // campaigns sidebar in /api/catalog/:id/ads-detail).
@@ -377,7 +389,9 @@ router.get('/:id/ads-detail', async (req, res) => {
       posterUrl:      a.posterUrl || null,
       headline:       a.copy?.headline || null,
       ctaText:        (a.copy && a.copy.cta_text) || a.ctaText || null,
-      generatedAt:    a.generatedAt ? new Date(a.generatedAt).toISOString() : null,
+      generatedAt:    (a.renderedAt || a.generatedAt)
+                        ? new Date(a.renderedAt || a.generatedAt).toISOString()
+                        : null,
       metaSyncStatus: a.metaSyncStatus || null,
       metaAdId:       a.metaAdId || null,
       metaAdsetId:    a.metaAdsetId || null,
