@@ -216,12 +216,53 @@ for (const [value, expected, why] of RATINGS) {
     'buildMetaForAd must gate numbers through resolveCoherentSocialProof (which gates via '
     + 'resolveAtomicRatingPair -> formatDisplayRating and adds tier coherence)');
 }
-for (const [value, expected] of [[0, undefined], [-5, undefined], [12, 12], [null, undefined]]) {
+// `12 -> 12` CHANGED TO `12 -> undefined` (2026-08-04), deliberately, when the
+// static path started sharing the video path's coherence chokepoint.
+// resolveCoherentSocialProof withholds a count that has no star rating beside it
+// when no quote prints ("product-count and brand-count both require a coherent
+// quote", plus allowBrandCountWithoutStars:false in its rating-only branch).
+//
+// NO PROOF IS LOST, and that is why this expectation could move: `d.reviewCount`
+// is only ever rendered as a parenthetical NEXT TO the rating
+// (staticAdIntents.js:454,460 — `${d.rating} ★ (${d.reviewCount} reviews)`), so a
+// count with no rating never reached an ad. Its only other effect was at :403,
+// where a truthy count SUPPRESSES the "no review count, and not the words
+// review, reviews, ratings or customers" absence line — so the old behaviour
+// dropped that instruction from the prompt while supplying no count for the
+// model to use, which is the wrong way round. Withholding is strictly safer.
+for (const [value, expected] of [[0, undefined], [-5, undefined], [12, undefined], [null, undefined]]) {
   const d = direct.buildIntentData({
     concept: {}, layoutInput: { social_proof: { review_count: value } }, brand: {}, cta: 'X'
   });
   check(`P3 reviewCount ${JSON.stringify(value)} -> ${JSON.stringify(expected)}`,
     d.reviewCount === expected, `got ${JSON.stringify(d.reviewCount)}`);
+}
+
+// The counterpart that proves the above is coherence and not a blanket drop: a
+// count PAIRED with a qualifying rating from the same tier still comes through.
+{
+  const d = direct.buildIntentData({
+    concept: {},
+    layoutInput: { social_proof: { rating_value: 4.6, review_count: 12, rating_source: 'product' } },
+    brand: {}, cta: 'X'
+  });
+  check('P3 a product-stamped rating+count pair still prints both',
+    d.rating === '4.6' && d.reviewCount === 12,
+    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)}`);
+}
+
+// And the flag restores the pre-change pass-through exactly, so the behaviour
+// change above is revertible without a deploy.
+{
+  const prev = process.env.STATIC_PROOF_COHERENCE;
+  process.env.STATIC_PROOF_COHERENCE = 'false';
+  const d = direct.buildIntentData({
+    concept: {}, layoutInput: { social_proof: { review_count: 12 } }, brand: {}, cta: 'X'
+  });
+  check('P3 STATIC_PROOF_COHERENCE=false restores the bare-count pass-through',
+    d.reviewCount === 12, `got ${JSON.stringify(d.reviewCount)}`);
+  if (prev === undefined) delete process.env.STATIC_PROOF_COHERENCE;
+  else process.env.STATIC_PROOF_COHERENCE = prev;
 }
 
 // ── P5: shortening must not invert the review ───────────────────────────

@@ -766,7 +766,24 @@ async function buildMetaForAd(ad, brand) {
       // titleSpecService.resolveSpec() call renderWithRemotionAndSave makes
       // moments after this function returns, so renderedQuoteText reflects
       // the spec that will actually be resolved for this ad's render.
-      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating reviewCount imageUrl titleStyleSpec categoryRef').lean();
+      // `productReviews` is the container BOTH review writers actually fill —
+      // productReviewsScrapeService (vendor APIs + headless, via
+      // catalogProductReviewRefreshService) and the automatic Gemini gap-fill
+      // (maybeFetchProductReviewsCached, called on catalog sync by
+      // catalogProductEnrichmentService). It holds rating and reviewCount
+      // written TOGETHER, which is exactly the atomic pair this function needs.
+      //
+      // `reviewCount` USED TO BE SELECTED HERE AND IS NOT A SCHEMA PATH.
+      // models/CatalogProduct.js declares top-level `rating` (:161) and NO
+      // top-level `reviewCount` — verified against the live schema. Mongoose
+      // `.select()` of a non-existent path is SILENT, so `catalogProduct
+      // .reviewCount` was permanently `undefined`: every product-tier video ad
+      // rendered stars with NO review count, and because the old
+      // `catalogHasRatingOrCount` then still saw `rating`, the layoutInput
+      // fallback below never ran either, so the count was unreachable from any
+      // source. Same silent-`.select()` class as the Brand `description` bug —
+      // now pinned for CatalogProduct too by scripts/verifyBrandFieldNames.js.
+      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating productReviews imageUrl titleStyleSpec categoryRef').lean();
     } catch { /* optional */ }
   }
 
@@ -927,11 +944,30 @@ async function buildMetaForAd(ad, brand) {
   // instead (or no product pair, if CatalogProduct also has nothing). This
   // does not drop brand-legitimate proof: the BRAND snapshot below is
   // Brand.brandReviews, fetched independently and unaffected by any of this.
-  const catalogHasRatingOrCount = !!catalogProduct
-    && (typeof catalogProduct.rating === 'number' || typeof catalogProduct.reviewCount === 'number');
+  // TIER ORDER within CatalogProduct, and why `productReviews` comes FIRST:
+  // it is the only container either review writer fills, both numbers are
+  // written together in one update, and it is the fresher of the two. Top-level
+  // `rating` is a MIRROR that only catalogProductReviewRefreshService writes
+  // (:108) — the automatic Gemini gap-fill never touches it — and its original
+  // writer was an Immersive product_results import, so it can be stale while
+  // `productReviews` is current. It also cannot carry a count at all (no such
+  // schema path), so it is a rating-only last resort, kept because a product
+  // whose only data is that mirror should still show its stars.
+  //
+  // Both branches still satisfy the R2 rule this block exists for — ONE
+  // document, never two independently-cascaded scalars.
+  const PRODUCT_PROOF_FROM_REVIEWS =
+    String(process.env.PRODUCT_PROOF_FROM_REVIEWS ?? 'true').toLowerCase() !== 'false';
+  const pr = PRODUCT_PROOF_FROM_REVIEWS && catalogProduct && typeof catalogProduct.productReviews === 'object'
+    ? catalogProduct.productReviews : null;
+  const prHasNumbers = !!pr
+    && (typeof pr.rating === 'number' || typeof pr.reviewCount === 'number');
+  const catalogHasRatingOrCount = !!catalogProduct && typeof catalogProduct.rating === 'number';
   let productSnapshot = null;
-  if (catalogHasRatingOrCount) {
-    productSnapshot = { rating: catalogProduct.rating ?? null, reviewCount: catalogProduct.reviewCount ?? null };
+  if (prHasNumbers) {
+    productSnapshot = { rating: pr.rating ?? null, reviewCount: pr.reviewCount ?? null };
+  } else if (catalogHasRatingOrCount) {
+    productSnapshot = { rating: catalogProduct.rating ?? null, reviewCount: null };
   } else {
     const liSocialProof = layoutInput?.input?.social_proof;
     if (liSocialProof && liSocialProof.rating_source === 'product'

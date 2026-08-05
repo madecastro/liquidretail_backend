@@ -492,13 +492,40 @@ async function runEnrichment(brand, brandId, run = null) {
         brandUrl:  brand.websiteUrl,
         brandId                       // cost-ledger linkage (CostLog.brandId)
       });
-      if (brandReviewsResult && Array.isArray(brandReviewsResult.quotes) && brandReviewsResult.quotes.length) {
+      // PERSIST ON QUOTES **OR** NUMBERS. The old predicate was
+      // `quotes.length` alone, which threw the WHOLE snapshot away when the
+      // grounded search found a brand's star rating and review count but no
+      // usable quote — and `geminiSearchProvider` returns `rating` /
+      // `reviewCount` INDEPENDENTLY of `quotes` (:409-411), so that is a real
+      // and common shape (quotes also thin out via stampLlmQuotes/provenance
+      // while the numbers survive). The cost was permanent, not transient:
+      // `wantBrandReviews` gates on `!sourcesAttempted.has('brand-reviews')`,
+      // so the tier is marked attempted and NEVER retried — the brand keeps a
+      // null `brandReviews` forever and `buildMetaForAd`'s brandSnapshot
+      // (brandScriptExecutor.js:947) has nothing, so the ad ships with no
+      // stars even though we successfully looked the numbers up.
+      //
+      // A rating + count is a numeric aggregate, NOT a testimonial, so this
+      // widens only the numbers path — every quote provenance gate
+      // (quoteProvenance / toPrintableCustomerQuote / gateLayoutInputQuotes)
+      // is untouched and a quote-less snapshot simply yields a trust mark.
+      // Verified safe against every consumer: all read `quotes` behind
+      // `Array.isArray(...) ? ... : []` and read rating/count independently.
+      const hasQuotes  = Array.isArray(brandReviewsResult?.quotes) && brandReviewsResult.quotes.length > 0;
+      const hasNumbers = typeof brandReviewsResult?.rating === 'number'
+                      || typeof brandReviewsResult?.reviewCount === 'number';
+      if (brandReviewsResult && (hasQuotes || hasNumbers)) {
         brandReviewsResult.fetchedAt = new Date();
         brand.brandReviews = brandReviewsResult;
+        const quoteBit  = hasQuotes ? `${brandReviewsResult.quotes.length} quote(s)` : 'no quotes';
+        const ratingBit = typeof brandReviewsResult.rating === 'number'
+          ? `, ${brandReviewsResult.rating.toFixed(1)}★` : '';
+        const countBit  = typeof brandReviewsResult.reviewCount === 'number'
+          ? ` (${brandReviewsResult.reviewCount} reviews)` : '';
         overrides.push({
           field: 'brandReviews',
           oldVal: '(none)',
-          newVal: `${brandReviewsResult.quotes.length} quote(s)${brandReviewsResult.rating ? `, ${brandReviewsResult.rating.toFixed(1)}★` : ''}`,
+          newVal: `${quoteBit}${ratingBit}${countBit}`,
           source: 'gemini-search'
         });
       }

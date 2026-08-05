@@ -37,7 +37,7 @@ const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // assembly, so this gate should never fire — it exists because an artifact
 // cached before the producer-side filter landed can still carry one.
 const { toPrintableCustomerQuote } = require('./quoteProvenance');
-const { formatDisplayRating } = require('./ratingDisplay');
+const { formatDisplayRating, resolveCoherentSocialProof, brandAttributionLabel } = require('./ratingDisplay');
 // THE sanctioned concept reader. Direct reads of concept.rationale on this
 // path are how private Director reasoning became art direction on 2026-08-01.
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
@@ -512,7 +512,7 @@ function intentForTemplate(template) {
  *     so rendering it alongside the rating states the same fact twice and the
  *     owner's density rule sacrifices it first anyway.
  */
-function buildIntentData({ concept, layoutInput, brand, cta }) {
+function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
   // Dual-read v3 copy / v2 copy_picks. Never invent a headline from product name.
   const copy = renderableCopy(concept);
   const proof = layoutInput?.social_proof || {};
@@ -538,7 +538,7 @@ function buildIntentData({ concept, layoutInput, brand, cta }) {
   // headline only; subhead undefined). Flag-on: cascade through layoutInput
   // then brand.tagline so ai_brand_led still has a brand line when Director
   // nulls the headline. Do NOT cascade product name/title or description —
-  // resolvedProduct is .select('title imageUrl') so description is not loaded,
+  // resolvedProduct is .select('title imageUrl rating productReviews') so description is not loaded,
   // and the product name is forbidden as ad copy by owner directive and
   // fenced in absences.
   //
@@ -602,14 +602,92 @@ function buildIntentData({ concept, layoutInput, brand, cta }) {
     // subhead stays undefined — pre-change shape
   }
 
+  // ── ONE tier-coherence chokepoint, now shared with the video path ────────
+  // The video path has always routed its numbers through
+  // resolveCoherentSocialProof; STATIC never called it, so a PRODUCT rating
+  // could print beside a BRAND-tier quote on the same ad — precisely the
+  // pairing that function exists to forbid. Its own docstring anticipates this
+  // caller ("the static path feeds verbatim strings to the image model, with no
+  // cascade and no bind list — there it is a statement of fact"), so this is
+  // the wiring it was written for.
+  //
+  // SCOPE: it governs the NUMBERS only. emptyCoherentProof deliberately keeps
+  // the quote and nulls rating/reviewCount, so a quote that cleared provenance
+  // still prints; it just loses stars it cannot vouch for. The quote's own
+  // gate (toPrintableCustomerQuote, above) is untouched.
+  //
+  // renderedQuoteText is the actual string handed to the image model. Static has
+  // no cascade or bind list between meta and pixels, so passing it is a fact,
+  // not ceremony — the video path must resolve its bind chain first instead.
+  const STATIC_PROOF_COHERENCE =
+    String(process.env.STATIC_PROOF_COHERENCE ?? 'true').toLowerCase() !== 'false';
+  let coherent = null;
+  if (STATIC_PROOF_COHERENCE) {
+    // Same productReviews-first precedence as brandScriptExecutor: it is the
+    // only container either review writer fills, carries both numbers written
+    // together, and is fresher than the top-level `rating` mirror (which cannot
+    // carry a count at all — no such schema path).
+    // THREE tiers, and the third is load-bearing: layoutInput.social_proof is
+    // the artifact's OWN derived pair, and for many ads it is the only pair that
+    // exists (no CatalogProduct row loaded, or one with no review data). An
+    // earlier draft of this block used only the two document sources and so
+    // printed NO rating wherever they were absent — a proof REGRESSION, caught
+    // by verifyQuoteProvenance P3. Trust of that third tier follows the same
+    // rule as the video path: only when `rating_source` names the tier, because
+    // an unstamped artifact (~722/738 in production) may hold a mixed pair.
+    const pr = product && typeof product.productReviews === 'object' ? product.productReviews : null;
+    const liIsProduct = proof.rating_source === 'product';
+    const liIsBrand   = proof.rating_source === 'brand';
+    const liPair = (typeof proof.rating_value === 'number' || typeof proof.review_count === 'number')
+      ? { rating: proof.rating_value ?? null, reviewCount: proof.review_count ?? null }
+      : null;
+    const productPair =
+      (pr && (typeof pr.rating === 'number' || typeof pr.reviewCount === 'number'))
+        ? { rating: pr.rating ?? null, reviewCount: pr.reviewCount ?? null }
+      : (typeof product?.rating === 'number')
+        ? { rating: product.rating, reviewCount: null }
+      : (liIsProduct ? liPair : null);
+    const brandPair =
+      (brand?.brandReviews && typeof brand.brandReviews === 'object'
+        && (typeof brand.brandReviews.rating === 'number' || typeof brand.brandReviews.reviewCount === 'number'))
+        ? { rating: brand.brandReviews.rating ?? null, reviewCount: brand.brandReviews.reviewCount ?? null }
+      : (liIsBrand ? liPair : null);
+    // An UNSTAMPED artifact pair still has to reach the ad, or this change would
+    // withhold proof from every pre-`rating_source` artifact. There is no tier
+    // claim to cohere in that case, so it is only used when no quote prints —
+    // exactly the "rating-only social proof is legitimate" branch inside
+    // resolveCoherentSocialProof. With a quote on frame, an unstamped pair stays
+    // withheld, which is the pre-existing fail-closed rule, not a new one.
+    const unstampedFallback = (!proof.rating_source && liPair && !quoteText) ? liPair : null;
+    coherent = resolveCoherentSocialProof({
+      quote: quote || null,
+      product: productPair || unstampedFallback,
+      brand: brandPair,
+      brandAttribution: brandAttributionLabel(brand),
+      renderedQuoteText: quoteText || null,
+    });
+    console.log(
+      `🔒 direct-image proof: source=${coherent.source || 'none'} rating=${coherent.rating || 'none'} ` +
+      `count=${coherent.reviewCount ?? 'none'} quoteTier=${coherent.quoteTier || 'none'}` +
+      `${coherent.reviewsTextShort ? ` slug="${coherent.reviewsTextShort}"` : ''}`
+    );
+  }
+
   return {
     // Owner rule: "we only use stars over 4.5". Gated on the DISPLAYED
     // (one-decimal) value via formatDisplayRating — a raw >4.5 gate let
     // 4.51 print as "4.5". See services/ratingDisplay.js.
-    rating: formatDisplayRating(proof.rating_value),
-    reviewCount: typeof proof.review_count === 'number' && proof.review_count > 0
-      ? proof.review_count
-      : undefined,
+    // Flag-off keeps the exact pre-change expressions below.
+    // `?? undefined` is not cosmetic: resolveCoherentSocialProof returns null
+    // for "withheld", while every downstream absence check on this object tests
+    // for undefined (`!d.rating` in staticAdIntents is fine, but the harness
+    // contract and the JSON handed to the prompt distinguish the two).
+    rating: coherent ? (coherent.rating ?? undefined) : formatDisplayRating(proof.rating_value),
+    reviewCount: coherent
+      ? (typeof coherent.reviewCount === 'number' && coherent.reviewCount > 0
+        ? coherent.reviewCount : undefined)
+      : (typeof proof.review_count === 'number' && proof.review_count > 0
+        ? proof.review_count : undefined),
     quote: quoteText || undefined,
     // The reviewer's OWN name or no byline at all. normalizeQuote no longer
     // manufactures one: it used to fall back to the quote's `source` — a site,
@@ -744,7 +822,7 @@ async function renderDirectImage({
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
     resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
     brandId ? Brand.findById(brandId).lean() : null,
-    productId ? CatalogProduct.findById(productId).select('title imageUrl').lean() : null,
+    productId ? CatalogProduct.findById(productId).select('title imageUrl rating productReviews').lean() : null,
     mediaId ? Media.findById(mediaId).select('fileUrl').lean() : null
   ]);
   // A missing layout artifact is recoverable: everything it supplies has a
@@ -797,7 +875,7 @@ async function renderDirectImage({
       { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
     );
   }
-  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl').lean() : null);
+  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl rating productReviews').lean() : null);
   // Delivery dims are NOT derived here any more: they come from the surface the
   // prompt is built from, a few lines below, so the size Sharp writes and the
   // size the geometry block promised the model cannot disagree.
@@ -887,6 +965,7 @@ async function renderDirectImage({
     concept,
     layoutInput: effectiveLayout.input || {},
     brand: resolvedBrand,
+    product: resolvedProduct,
     cta: effectiveLayout.input?.cta?.text
   });
   const built = intents.buildPrompt({
