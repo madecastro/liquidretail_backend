@@ -33,6 +33,27 @@ const REASON = Object.freeze({
   ERROR:                    'error'
 });
 
+// Non-skip advisory codes. WARNING is explicitly NOT part of REASON because
+// REASON implies skipped:true (normalizePerProductEntry treats any reason as a
+// skip). A product that DID queue but needs an operator signal — e.g. their
+// video picks include no catalog image — stamps `warning` instead. Owner
+// 2026-08-05: signal the gap; still generate from their selection.
+const WARNING = Object.freeze({
+  // A catalog image EXISTS for this product but none of the operator picks
+  // is a catalog mirror for it. Generation still ran from their selection.
+  NO_CATALOG_IN_PICKS: 'no_catalog_in_picks',
+  // The product has NO usable catalog image at all. Generation still ran
+  // from their selection only.
+  NO_CATALOG_IMAGE:    'no_catalog_image'
+});
+
+const HUMAN_WARNING = Object.freeze({
+  [WARNING.NO_CATALOG_IN_PICKS]:
+    'No catalog image among your selected images — generating from your selection only.',
+  [WARNING.NO_CATALOG_IMAGE]:
+    'No catalog image available for this product — generating from your selection only.'
+});
+
 // Full sentences for a single product row (errors[] / perProduct.message).
 const HUMAN_FULL = Object.freeze({
   [REASON.INVALID_PRODUCT_ID]:
@@ -83,6 +104,17 @@ function humanMessageForReason(reason, entry) {
 }
 
 /**
+ * Human clause for a non-skip warning code. Generation still ran — these
+ * sentences make that clear so the operator knows the choice was theirs.
+ * @param {string|null|undefined} code
+ * @returns {string|null}
+ */
+function humanMessageForWarning(code) {
+  if (!code) return null;
+  return HUMAN_WARNING[code] || null;
+}
+
+/**
  * Normalise one raw expansion row into the shape persisted on CampaignRun
  * and returned by GET /runs. Strips full Ad payload objects (they are
  * large and not UI-useful) down to a count.
@@ -124,18 +156,37 @@ function normalizePerProductEntry(raw, nameById = {}) {
       (productId && nameById[productId]) ||
       null;
 
+    let message = skipped
+      ? (humanMessageForReason(reason, raw) || `Skipped (${reason}).`)
+      : (payloadCount > 0
+          ? `Queued ${payloadCount} creative(s).`
+          : 'No creatives queued for this product.');
+
+    // Warning is a SEPARATE channel from reason. When the product skipped,
+    // the skip message wins and raw.warning is ignored entirely. When it
+    // queued, append a human clause so the operator sees both the success
+    // and the advisory (e.g. "Queued 1 creative(s). No catalog image …").
+    // skipped must stay false for a warning-only row — never fold warning
+    // into reason (that would mark the product skipped:true and overwrite
+    // the "Queued N" message).
+    let warning = null;
+    if (!skipped && raw.warning != null && raw.warning !== '') {
+      warning = String(raw.warning);
+      const clause = humanMessageForWarning(warning);
+      if (clause) {
+        message = `${message} ${clause}`;
+      }
+    }
+
     const entry = {
       productId,
       productName: productName ? String(productName) : null,
       reason: reason || null,
-      message: skipped
-        ? (humanMessageForReason(reason, raw) || `Skipped (${reason}).`)
-        : (payloadCount > 0
-            ? `Queued ${payloadCount} creative(s).`
-            : 'No creatives queued for this product.'),
+      message,
       skipped,
       payloads: payloadCount
     };
+    if (warning) entry.warning = warning;
 
     // Actionable ids — only include fields the reason makes relevant so
     // the payload stays small and the UI can deep-link without guessing.
@@ -290,10 +341,13 @@ function summarizeEmptyExpansion(opts = {}) {
 
 module.exports = {
   REASON,
+  WARNING,
   HUMAN_FULL,
   HUMAN_SHORT,
+  HUMAN_WARNING,
   GENERIC_EMPTY_MESSAGE,
   humanMessageForReason,
+  humanMessageForWarning,
   normalizePerProductEntry,
   normalizePerProductList,
   summarizeEmptyExpansion

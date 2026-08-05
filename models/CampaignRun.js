@@ -69,6 +69,10 @@ const campaignRunSchema = new mongoose.Schema({
     message:           String,   // human sentence for this row
     skipped:           Boolean,
     payloads:          Number,
+    // Non-skip advisory (e.g. video operator stack has no catalog image).
+    // MUST stay separate from `reason` — reason implies skipped:true.
+    // Shape owned by services/perProductReasons.js WARNING enum.
+    warning:           String,
     mediaId:           String,
     mediaIds:          [String],
     conceptCount:      Number,
