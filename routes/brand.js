@@ -1424,6 +1424,22 @@ router.post('/:id/ingest-meta-fonts', express.json(), async (req, res) => {
       errors: result.errors,
     });
   } catch (err) {
+    // STAMP ON FAILURE TOO — the same guard brandEnrichmentService has, and for
+    // the same money reason. The vision call above is billable and may well have
+    // SUCCEEDED before this catch ran (applyMetaFontsResult or brand.save() can
+    // throw on their own). Without a stamp, `wantMetaFonts` in the automatic
+    // enrichment tier still sees `!brand.metaFontsIngestedAt` and pays for the
+    // very same brand again. Best-effort and never rethrown: failing to record
+    // the attempt must not also turn a 500 into a crash.
+    try {
+      const BrandModel = require('../models/Brand');
+      await BrandModel.updateOne(
+        { _id: req.params.id },
+        { $set: { metaFontsIngestedAt: new Date(), metaFontsIngestError: String(err.message || err).slice(0, 2000) } }
+      );
+    } catch (stampErr) {
+      console.error(`ingest-meta-fonts: could not stamp attempt (${stampErr.message}) — this brand may re-pay the vision call`);
+    }
     console.error('ingest-meta-fonts failed:', err.message);
     res.status(err.status || 500).json({ error: err.message || 'meta-ads font identification failed' });
   }

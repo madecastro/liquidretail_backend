@@ -382,31 +382,46 @@ async function gatherFromAdLibrary(brand, cap, errors, deps) {
     country: 'US',
   };
 
+  // MONEY: the ledger row is written for BOTH outcomes, and the write happens
+  // BEFORE the items are used.
+  //
+  // Two distinct holes this closes. (a) An early return on a useless item shape
+  // must not skip the row — the run has already billed by the time runSync
+  // returns. (b) A THROW must not skip it either: the common Apify failure is a
+  // client timeout or 5xx AFTER the actor has started, which Apify still bills.
+  // The original code did `catch → return []` with no ledger, so exactly the
+  // failure mode most likely to cost money was the one that recorded nothing.
+  // Apify runs are unledgered everywhere else in this repo; this path does not
+  // inherit that gap in either direction.
+  const ledgerApifyRun = async (status) => {
+    try {
+      await recordCost({
+        provider: 'apify',
+        model: actorId,
+        stage: 'meta_ads_fonts',
+        purposeTag: 'adlibrary_pull',
+        brandId: brand._id || brand.id || null,
+        costUsd: Number(process.env.APIFY_ADLIB_COST_USD || 0.25),
+        costSource: 'estimated',
+        status,
+      });
+    } catch (err) {
+      errors.push(`adlibrary cost ledger failed: ${err.message}`);
+    }
+  };
+
   let items;
   try {
     items = await runSync(actorId, input);
   } catch (err) {
+    // 'error' rather than 'ok': the charge is real but no asset came back, which
+    // is the distinction CostLog.COST_STATUSES exists to record.
+    await ledgerApifyRun('error');
     errors.push(`adlibrary: ${err.message}`);
     return [];
   }
 
-  // MONEY: ledger BEFORE using the items. The run has already billed by the
-  // time it returns, so an early return on a useless item shape must not skip
-  // the row. Apify runs are unledgered everywhere else in this repo; this path
-  // does not inherit that gap.
-  try {
-    await recordCost({
-      provider: 'apify',
-      model: actorId,
-      stage: 'meta_ads_fonts',
-      purposeTag: 'adlibrary_pull',
-      brandId: brand._id || brand.id || null,
-      costUsd: Number(process.env.APIFY_ADLIB_COST_USD || 0.25),
-      costSource: 'estimated',
-    });
-  } catch (err) {
-    errors.push(`adlibrary cost ledger failed: ${err.message}`);
-  }
+  await ledgerApifyRun('ok');
 
   const images = [];
   const seen = new Set();
