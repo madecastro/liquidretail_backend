@@ -154,6 +154,15 @@ const RENDER_CONCURRENCY    = CONC.RENDER_CONCURRENCY;
 const VEO_CONCURRENCY       = CONC.VEO_CONCURRENCY;
 const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 
+// MODULE-LEVEL ON PURPOSE — one permit pool for the whole process, not one per
+// campaign run. A per-run semaphore would let two concurrent runs each open
+// VEO_TITLING_CONCURRENCY Remotion renders, which is precisely the memory
+// blow-up the permit exists to prevent. See services/semaphore.js for why
+// in-process is the correct scope for a memory guard (and the wrong one for a
+// provider rate limit).
+const { Semaphore } = require('../services/semaphore');
+const veoTitlingSemaphore = new Semaphore(CONC.VEO_TITLING_CONCURRENCY, 'veo-titling');
+
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +
 // caps WITHOUT inserting Ad docs. Returns the would-be payload counts
@@ -1470,12 +1479,37 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       if (brandDoc) {
         try {
           const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
-          // Titling names its target aspect: this is the stage that face-crops
-          // the 9:16 master down (basePlateCropService) and composites the
-          // overlay, so "titling 1:1" and "master video generation" being
-          // distinct is what makes a stall attributable.
-          adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '9:16'}`);
-          const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+          // ── THE SECOND PERMIT ────────────────────────────────────────────
+          // Everything above this point was remote and idle: an Omni submit and
+          // a ~2 minute poll. Everything below is Remotion renderMedia —
+          // headless Chrome + an ffmpeg 1080p encode, IN THIS PROCESS.
+          //
+          // The veo lane used to gate both halves on one number, so
+          // VEO_CONCURRENCY had to be small enough for the expensive half, which
+          // throttled the cheap half for nothing. The lane now dispatches wide
+          // (VEO_CONCURRENCY, default 12) and only this section is narrow
+          // (VEO_TITLING_CONCURRENCY, default 4 — deliberately identical to the
+          // old combined value, so the split cannot increase local memory
+          // pressure on its first outing).
+          //
+          // withPermit releases in a `finally`, so the throw handled below
+          // cannot leak a permit and wedge every later titling job. The wait is
+          // OUTSIDE the try's billable concern: the master is already paid for
+          // and already persisted (status:'draft' + veoVideoUrl, stamped above),
+          // so queueing here risks nothing but latency — and an ad waiting for a
+          // titling permit is reaper-safe for exactly that reason.
+          const waitingFor = veoTitlingSemaphore.waiting;
+          if (waitingFor > 0 || veoTitlingSemaphore.available === 0) {
+            adStage(adId, `queued for titling (${waitingFor} ahead)`);
+          }
+          const chromeOut = await veoTitlingSemaphore.withPermit(async () => {
+            // Titling names its target aspect: this is the stage that face-crops
+            // the 9:16 master down (basePlateCropService) and composites the
+            // overlay, so "titling 1:1" and "master video generation" being
+            // distinct is what makes a stall attributable.
+            adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '9:16'}`);
+            return renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+          });
           // no-chrome is intentional success (raw master is the deliverable).
           if (chromeOut?.skipped) {
             adStage(adId, `no titling (${chromeOut.reason || 'no-chrome'}) — shipping master`);

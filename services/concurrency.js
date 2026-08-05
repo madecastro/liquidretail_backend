@@ -32,11 +32,19 @@ const SPEC = Object.freeze({
   },
   VEO_CONCURRENCY: {
     env: 'VEO_CONCURRENCY',
-    default: 4,
+    default: 12,
     min: 1,
     max: 32,
     ceiling: 'SELF-IMPOSED',
-    why: 'In-flight video ads per campaign run. Raised 1→4 (2026-08-02) as a deliberate probe: Omni RPS is unpublished/unmeasured; the old "stay at 1" justification belonged to retired direct-Veo and to Grok\'s real 1 RPS (aspect-fallback only). Re-measure before going higher. NOT 16.'
+    why: 'In-flight video ads per campaign run — now the SUBMIT+POLL half only. Raised 1→4 (2026-08-02) as a probe; 4→12 (2026-08-05) once titling moved behind its own permit (VEO_TITLING_CONCURRENCY). The 4 was never really about Omni: this lane also ran Remotion renderMedia (headless Chrome + ffmpeg, 1080p) IN-PROCESS, so the number was pinned to what local RAM/CPU could take, while being documented against Omni RPS. Splitting them lets the idle half (an Omni poll is ~2min of waiting; measured p50 117s / p99 247s) run wide without touching the memory-bound half. Omni RPS remains unpublished and no Omni 429 has ever been recorded; submit RATE is still governed by pacedModelSubmit + ATLAS_SUBMIT_SPACING_MS, and Grok stays <=1 RPS via GROK_MAX_RPS regardless of this value. Kept under MAX_CREATIVES_PER_RUN=20 deliberately — going non-binding here is a separate, measured decision.'
+  },
+  VEO_TITLING_CONCURRENCY: {
+    env: 'VEO_TITLING_CONCURRENCY',
+    default: 4,
+    min: 1,
+    max: 16,
+    ceiling: 'SELF-IMPOSED',
+    why: 'Simultaneous Remotion titling renders (headless Chrome + ffmpeg) in THIS process. THIS is the knob the old VEO_CONCURRENCY=4 was really protecting, so 4 is deliberately unchanged — the split must not raise local memory pressure on its first outing. Failure mode if raised blind is NOT a provider 429: it is CPU/RAM exhaustion -> Render autoscale (60% CPU+mem) -> process replacement -> a stranded paid Omni master (~$1.00 each), which is the exact leak bootRecoveryService exists to clean up. One measured titling render = 76.2s, and 1080p is 2.25x the pixels of 720p with no measurement behind it. Per-process (Semaphore is in-process), which is the right shape for a MEMORY guard since memory is per-instance. Measure RSS on the web service before raising.'
   },
   MAX_CREATIVES_PER_RUN: {
     env: 'MAX_CREATIVES_PER_RUN',
