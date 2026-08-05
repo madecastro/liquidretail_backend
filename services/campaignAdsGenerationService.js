@@ -1472,7 +1472,10 @@ async function seedsFromProduct(brandId, productId, opts = {}) {
       if (fullProduct?.imageUrl) {
         const detectSvc = require('./catalogProductDetectService');
         const out = await detectSvc.enqueueProductDetect(fullProduct);
-        const heroMediaId = out?.enqueued?.hero?.mediaId;
+        // Media existence, not run creation — see the note at the sibling
+        // call in expandDeterministicVideo. Reading enqueued.hero here left
+        // catalogMedias empty and lost the operator's pick.
+        const heroMediaId = out?.heroMediaId || out?.enqueued?.hero?.mediaId;
         if (heroMediaId) {
           catalogMedias = await Media.find({
             _id: heroMediaId
@@ -2223,7 +2226,13 @@ async function expandDeterministicVideo({
           if (fullProduct?.imageUrl) {
             const detectSvc = require('./catalogProductDetectService');
             const out = await detectSvc.enqueueProductDetect(fullProduct);
-            const heroMediaId = out?.enqueued?.hero?.mediaId;
+            // `heroMediaId` is media EXISTENCE; `enqueued.hero` additionally
+            // requires that a DetectRun was created. Reading only the latter
+            // discarded a perfectly good Media whenever run creation returned
+            // null, and this product then fell through to NO_HERO_MEDIA — a
+            // silently dropped video ad. Keep the old field as the fallback so
+            // a caller on an older service build still resolves.
+            const heroMediaId = out?.heroMediaId || out?.enqueued?.hero?.mediaId;
             if (heroMediaId) {
               hero = await Media.findById(heroMediaId).select('_id').lean();
               console.log(
