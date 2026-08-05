@@ -21,6 +21,7 @@ const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 // Receipt guard — a requeue must never re-submit work we have paid for.
 const { receiptFree } = require('../services/spendReceipt');
+const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const router = express.Router();
 
 const Ad           = require('../models/Ad');
@@ -1880,7 +1881,7 @@ function pickClosestBaseRatio(rect) {
   return best.name;
 }
 
-// GET /api/ads?brandId=X[&campaignId=Y][&status=draft|live|archived][&template=...][&aspectRatio=...][&limit=50]
+// GET /api/ads?brandId=X[&campaignId=Y][&campaignRunId=Z][&status=draft|live|archived][&template=...][&aspectRatio=...][&limit=50]
 router.get('/', async (req, res) => {
   try {
     const brandId = req.query.brandId || req.headers['x-brand-id'];
@@ -1892,9 +1893,21 @@ router.get('/', async (req, res) => {
       throw e;
     }
 
-    const filter = { brandId };
-    if (req.query.campaignId)  filter.campaignId  = req.query.campaignId;
-    if (req.query.status)      filter.status      = req.query.status;
+    // brandId/campaignId are ObjectId-typed on Ad (models/Ad.js:29-30). Cast
+    // explicitly here rather than relying on Mongoose's implicit .find() cast,
+    // because this filter is also used in an aggregation $match below — the
+    // driver's $match does NOT auto-cast against the schema the way .find()
+    // does. brandId is already proven a valid id by assertBrandInTenant above.
+    const filter = { brandId: new mongoose.Types.ObjectId(String(brandId)) };
+    if (req.query.campaignId)    filter.campaignId     = new mongoose.Types.ObjectId(String(req.query.campaignId));
+    // campaignRunIds is a plain [String] (models/Ad.js:39) — a bare equality
+    // match against an array field is a contains-match, same convention
+    // already used at /render-activity (routes/ads.js, `filter.campaignRunIds
+    // = String(req.query.runId)`). This is the hard DB-level scope that a
+    // freshly-generated run needs: unlike sorting, it can never be pushed off
+    // a capped/sorted page by a dedupe-reused ad's stale generatedAt.
+    if (req.query.campaignRunId) filter.campaignRunIds = String(req.query.campaignRunId);
+    if (req.query.status)        filter.status         = req.query.status;
     // ?rendered=true → only ads that have actually been rendered to
     // Cloudinary (status in draft|live|archived). Used by surfaces that
     // shouldn't surface the queue (campaign-detail Ads section, etc.).
@@ -1913,12 +1926,20 @@ router.get('/', async (req, res) => {
     // is itself tenant-scoping (a brand belongs to exactly one
     // advertiser). Belt-and-braces verification at the brand level
     // is a separate hardening step (see backlog).
+    //
+    // Aggregation, not .find(), because ranking must use "true" recency
+    // (renderedAt, falling back to generatedAt — see adRecencyService) —
+    // generatedAt alone is a creation-time-only stamp that a dedupe-reused,
+    // freshly re-rendered ad never updates, so a plain .sort({generatedAt:-1})
+    // can bury today's renders under old rows.
     const [rows, total] = await Promise.all([
-      Ad.find(filter)
-        .sort({ generatedAt: -1 })
-        .skip(offset)
-        .limit(limit)
-        .lean(),
+      Ad.aggregate([
+        { $match: filter },
+        { $addFields: { _recencyAt: AD_RECENCY_EXPR } },
+        { $sort: { _recencyAt: -1 } },
+        { $skip: offset },
+        { $limit: limit }
+      ], { allowDiskUse: true }),
       Ad.countDocuments(filter)
     ]);
 
