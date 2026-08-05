@@ -638,10 +638,20 @@ check(
   'reviewCount is not a catalogProductSchema path — selecting it is a silent undefined'
 );
 check(
-  'E5 productSnapshot prefers productReviews numbers over the top-level rating mirror',
-  /prHasNumbers/.test(execSrc)
-    && execSrc.indexOf('if (prHasNumbers)') < execSrc.indexOf('} else if (catalogHasRatingOrCount)'),
+  'E5 productSnapshot prefers productReviews over the top-level rating mirror',
+  /prHasRating/.test(execSrc)
+    && execSrc.indexOf('if (prHasRating)') < execSrc.indexOf('} else if (catalogHasRatingOrCount)'),
   'productReviews is fresher and is the only container carrying a count'
+);
+// The rename is not cosmetic — gating on a RATING rather than on "any number" is
+// what stops a count-only productReviews from erasing a good top-level rating.
+check(
+  'E6 productReviews must carry a usable RATING to win, not merely a count',
+  /const prHasRating = !!pr && typeof pr\.rating === 'number';/.test(execSrc)
+    && !/typeof pr\.reviewCount === 'number'\s*\)?\s*;?\s*$/m.test(
+      (execSrc.match(/const prHasRating[^\n]*\n/) || [''])[0]
+    ),
+  'winning on count alone sets rating:null and erases the top-level rating — a proof regression'
 );
 
 // ── summary ──────────────────────────────────────────────────────────────

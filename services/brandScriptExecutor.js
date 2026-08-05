@@ -960,12 +960,16 @@ async function buildMetaForAd(ad, brand) {
     String(process.env.PRODUCT_PROOF_FROM_REVIEWS ?? 'true').toLowerCase() !== 'false';
   const pr = PRODUCT_PROOF_FROM_REVIEWS && catalogProduct && typeof catalogProduct.productReviews === 'object'
     ? catalogProduct.productReviews : null;
-  const prHasNumbers = !!pr
-    && (typeof pr.rating === 'number' || typeof pr.reviewCount === 'number');
+  // Must carry a USABLE RATING to win, not merely a count. Winning on count
+  // alone would produce `{rating: null, reviewCount: N}` and erase a good
+  // top-level `rating` — a proof regression. Requiring the rating also keeps the
+  // pair atomic (both numbers from one document), which is the R2 rule above.
+  // Nothing is lost: a count never renders without a rating beside it.
+  const prHasRating = !!pr && typeof pr.rating === 'number';
   const catalogHasRatingOrCount = !!catalogProduct && typeof catalogProduct.rating === 'number';
   let productSnapshot = null;
-  if (prHasNumbers) {
-    productSnapshot = { rating: pr.rating ?? null, reviewCount: pr.reviewCount ?? null };
+  if (prHasRating) {
+    productSnapshot = { rating: pr.rating, reviewCount: pr.reviewCount ?? null };
   } else if (catalogHasRatingOrCount) {
     productSnapshot = { rating: catalogProduct.rating ?? null, reviewCount: null };
   } else {

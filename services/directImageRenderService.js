@@ -641,17 +641,44 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
     const liPair = (typeof proof.rating_value === 'number' || typeof proof.review_count === 'number')
       ? { rating: proof.rating_value ?? null, reviewCount: proof.review_count ?? null }
       : null;
-    const productPair =
-      (pr && (typeof pr.rating === 'number' || typeof pr.reviewCount === 'number'))
-        ? { rating: pr.rating ?? null, reviewCount: pr.reviewCount ?? null }
+    // productReviews must carry a USABLE RATING to win, not merely a count.
+    // Winning on count alone would set `{rating: null, reviewCount: 500}` and
+    // thereby ERASE a perfectly good top-level `rating` — a proof regression, and
+    // the opposite of the point of this change. Requiring the rating also keeps
+    // the pair atomic: both numbers then come from the same document, which is
+    // the R2 rule. A productReviews holding only a count loses nothing, because a
+    // count never renders without a rating beside it (staticAdIntents.js:460).
+    const prHasRating = !!pr && typeof pr.rating === 'number';
+    const productPair = prHasRating
+        ? { rating: pr.rating, reviewCount: pr.reviewCount ?? null }
       : (typeof product?.rating === 'number')
         ? { rating: product.rating, reviewCount: null }
       : (liIsProduct ? liPair : null);
-    const brandPair =
-      (brand?.brandReviews && typeof brand.brandReviews === 'object'
-        && (typeof brand.brandReviews.rating === 'number' || typeof brand.brandReviews.reviewCount === 'number'))
-        ? { rating: brand.brandReviews.rating ?? null, reviewCount: brand.brandReviews.reviewCount ?? null }
-      : (liIsBrand ? liPair : null);
+
+    // BRAND NUMBERS ARE DELIBERATELY *NOT* SOURCED FROM `brand.brandReviews` HERE.
+    //
+    // An adversarial pass caught this as a blocker and it was reproduced: the
+    // resolver returns brand-scoped STRINGS for a brand-tier win
+    // (`reviewsText: "41000 brand reviews"`), but static keeps only the bare
+    // scalars and `staticAdIntents.js:460` renders the hardcoded, UNSCOPED
+    // `${d.rating} ★ (${d.reviewCount} reviews)`. So a brand aggregate — 4.8★
+    // across 41,000 reviews of the BRAND — would print on a product ad as though
+    // 41,000 people reviewed THAT SKU. Misattribution, which is the exact class
+    // this change exists to close.
+    //
+    // It would also have been a NEW exposure, not a pre-existing one:
+    // `deriveSocialProofNumbers` only falls back to brand numbers for the no-SKU
+    // 'branding' outcome (layoutInputService.js:3430), so a product-scoped static
+    // ad never carried brand aggregates before. Reading the full Brand doc here
+    // would have handed them to every one of them.
+    //
+    // So the only brand-tier numbers static may use are the ones layoutInput
+    // ITSELF stamped `rating_source:'brand'` — precisely the sanctioned
+    // pre-change path. Brand proof on product static ads is a real gap worth
+    // closing, but it must ship WITH scoped copy (feed `reviewsTextShort` into
+    // the RATING/TRUST MARK slot instead of the product-shaped string), not by
+    // widening the number source and leaving the template unscoped.
+    const brandPair = liIsBrand ? liPair : null;
     // An UNSTAMPED artifact pair still has to reach the ad, or this change would
     // withhold proof from every pre-`rating_source` artifact. There is no tier
     // claim to cohere in that case, so it is only used when no quote prints —
