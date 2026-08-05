@@ -158,6 +158,29 @@ async function runWatchdog() {
   } catch (err) {
     console.warn(`🔔 watchdog[spend] failed: ${err.message}`);
   }
+
+  // ── 5. Atlas balance health ──
+  // Lives here rather than on its own timer because this sweep already runs every
+  // ALERT_WATCHDOG_INTERVAL_MIN (default 5) and already owns spend alerting, and the
+  // check is a single free GET.
+  //
+  // NOT a plain low-balance alarm. The account auto-refills $30 at a time against
+  // ~$35/day burn (measured 2026-08-05), so `available` crosses any low threshold
+  // roughly daily as NORMAL behaviour — a single-sample alert would be pure noise and
+  // would train everyone to ignore the channel. checkBalance() therefore requires a
+  // streak of consecutive low reads ("the refill stopped") and alerts immediately only
+  // on an unambiguous overdrawn / non-normal credit grant ("the refill is broken").
+  //
+  // Note the trailing-hour spend alarm above is fed by the ESTIMATED CostLog ledger,
+  // which measured 0.40x–2.38x per day against Atlas's real figures. Once the Track A
+  // capture fixes land it is comparing ALERT_HOURLY_SPEND_USD against truer numbers and
+  // may want retuning — deliberately not changed here.
+  try {
+    const { checkBalance } = require('./atlasSpendReconciler');
+    await checkBalance();
+  } catch (err) {
+    console.warn(`🔔 watchdog[atlas-balance] failed: ${err.message}`);
+  }
 }
 
 module.exports = { runWatchdog };

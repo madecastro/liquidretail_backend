@@ -6,6 +6,57 @@ read `session.md`; this file only answers "when did that change, and why".
 
 Newest first.
 
+## 2026-08-05
+
+**Atlas Billing API reconciliation — the cost ledger was wrong in both directions and the total hid it.**
+
+Measured live against production for 2026-07-01 → 08-05: video **$242.93** billed vs **$277.00**
+ledgered (1.14x over), image **$72.44** vs **$33.48** (0.46x under), text **$69.62** vs **$70.68**
+(1.02x). Grand total $384.99 vs $381.15 — **0.99x**. The category errors nearly cancelled, so the
+top line looked healthy while per-day ratios ran **0.40x to 2.38x**. Every per-brand and per-ad cost
+figure in the system was unreliable.
+
+- **Atlas publishes `price` for video, and the estimate was 1.33x–5.33x high.** 6 of 6 recent
+  settled predictions returned **$0.75**; the ledger only ever recorded $1.00 (141 rows) or $4.00
+  (34 rows). `peekPrediction` now reads `price` back (same `{price, priceConfirmed}` contract as the
+  image path — `priceConfirmed:false` means UNKNOWN, never "free"), `pollPrediction` reconciles on
+  completion, and the charge-point row finally carries `providerRequestId`. Previously **all 175
+  `atlas_video_render` rows had no prediction id**, so `reconcileCost` could not match one of them —
+  6.3% coverage across all Atlas rows (212 of 3358). This is the follow-up `bootRecoveryService`
+  explicitly deferred: *"VIDEO IS UNCHANGED ON PURPOSE … its own reviewed change."*
+- The same window implies ~324 billable renders against 175 rows, so early-July video was never
+  ledgered at all. An understatement partly cancelling an overstatement is how 0.99x hid both.
+- **`reframe-outpaint` now records the real price.** `REFRAME_COST_USD` defaults to $0.08 (1k
+  `-developer` tier) while `REFRAME_RESOLUTION` is 4k, which the readme prices at $0.16 — the
+  constant's own comment warned to raise it together and it was not. 261 rows hold $19.56, plausibly
+  ~$22 of the ~$39 image gap. Deliberately not hardcoded to 0.16; the stage reads the settled price
+  and the reconciler will prove the default. Its prediction id is now captured too — there is no
+  `Ad.veoPredictionId` equivalent for reframe, so the 261 existing rows can never be backfilled.
+- **New:** `models/AtlasSpendDay.js` (integer micro-USD, idempotent upsert; note its
+  `pre('validate')` does NOT run on bulkWrite, so writers must pass `key`),
+  `services/atlasBillingClient.js`, `services/atlasSpendReconciler.js`. Registered on the worker
+  hourly; balance is `backlogWatchdog` check 5.
+- **Drift detection is per-category AND rolling.** A daily-only gate would never have caught the
+  real bug: image ran 0.46x under for 35 straight days at ~$1.11/day, below any sane daily dollar
+  floor on every one of them. Both gates require absolute **and** relative floors to trip.
+- **Balance alerting is stateful on purpose.** The account **auto-refills $30 at a time** against
+  ~$35/day burn, so `available` dips under $10 roughly daily as normal behaviour. A single-sample
+  alert would be pure noise; it needs `ATLAS_BALANCE_LOW_STREAK` consecutive low reads ("refill
+  stopped"), while `overdrawn > 0` / non-normal credit grant alerts on the first read. **No "days of
+  runway" is published** — with auto-refill it is meaningless and it already caused one bad read.
+- **Scope is load-bearing.** The account holds three keys; `Reach-Social Testing` and
+  `ReachSocialLLMExpander` are unrelated projects, excluded from reconciliation via
+  `ATLAS_BILLING_KEY_IDS`, but they drain the same prepaid pool (liquidretail = 53% of account
+  spend), so balance/burn is account-wide. `scope=self` is unused — it only covers the
+  authenticating key, so a second liquidretail key would read as ledger drift.
+- **No HTTP route, deliberately.** Account-wide COGS behind the per-Advertiser `requireAuth` chain
+  would be a cross-tenant leak. Inspection is `scripts/verifyAtlasBilling.js --live`.
+- `CostLog` rows are **not** rewritten (owner decision): rewriting historical estimates in place
+  would destroy the evidence of what went wrong. Atlas truth is stored alongside instead.
+- Known gap, not addressed: **8406 of 10676 rows (79%) have no `costSource` field at all**, so
+  `reconcileCost`'s `costSource:'estimated'` filter skips them. Alerts bucket provenance four ways
+  (`actual`/`estimated`/`none`/*missing*) so that population is visible rather than silently absent.
+
 ## 2026-08-03
 
 Prod moved `a80ae0b` → `f96e0a6` after 24 fixes had sat unpushed for a day, so every QC

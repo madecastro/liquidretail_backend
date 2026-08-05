@@ -137,6 +137,26 @@ mongoose.connect(process.env.MONGODB_URI, {
   // variables nothing reads any more.
   console.log(`🔔 alerts: ${alerts.isConfigured() ? 'Slack configured' : 'Slack NOT configured (set SLACK_BOT_TOKEN in Render env; SLACK_ALERT_CHANNEL ships in config/defaults.env)'}; watchdog every ${WATCHDOG_INTERVAL_MIN}m`);
 
+  // Atlas spend reconciliation — pulls Atlas's authoritative daily billing buckets
+  // and diffs them against the CostLog ledger. Same shape as the watchdog above
+  // (delayed first tick, then a fixed interval) and deliberately on its own, much
+  // slower cadence: the billing API only publishes DAILY buckets, so ticking faster
+  // than hourly just re-reads the same partial day.
+  //
+  // WHY IT EXISTS (measured 2026-08-05): the ledger and Atlas agreed to within 1% in
+  // total while disagreeing wildly per category — video 1.14x over, image 0.46x under
+  // — so the errors nearly cancelled and nothing looked wrong. Per-day ratios ran
+  // 0.40x to 2.38x. Worker-side because it is background work and ATLAS_API_KEY is
+  // present on the worker (verified identical to the web service's key).
+  const { runReconcilerTick } = require('./services/atlasSpendReconciler');
+  const SPEND_SYNC_MIN = Math.max(5, parseInt(process.env.ATLAS_SPEND_SYNC_INTERVAL_MIN, 10) || 60);
+  const spendTick = () => runReconcilerTick().catch(err => console.warn(`⚠️  atlas spend reconciler failed: ${err.message}`));
+  // 150s, not 90s: keeps the first tick clear of the watchdog's first sweep so a cold
+  // boot is not doing both at once.
+  setTimeout(spendTick, 150 * 1000);
+  setInterval(spendTick, SPEND_SYNC_MIN * 60 * 1000);
+  console.log(`💲 atlas spend reconciler: every ${SPEND_SYNC_MIN}m`);
+
   for (let i = 1; i <= CONCURRENCY; i++) {
     workerLoop(i).catch(err => console.error(`❌ worker[${i}] crashed:`, err));
   }

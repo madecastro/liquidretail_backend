@@ -161,14 +161,95 @@ i.e. false in prod), but `openaiService`, `aiLayoutStudioService`, `personaAvata
 would fall through to a direct-provider retry without the double-pay warning firing. Mirror
 `atlasVideoService.pollPrediction`'s catch if this is picked up.
 
+## 4b) Billing API reconciliation (built 2026-08-05)
+
+The cost ledger above is an **estimate** and was measurably wrong. Atlas has a separate
+**Billing Public API** at `https://api.atlascloud.ai/public/v1` — a DIFFERENT base from the
+generation API's `/api/v1`, authenticated with **the same `ATLAS_API_KEY`** (no new secret).
+
+**Why it exists.** Measured 2026-08-05 against production for 2026-07-01 → 08-05:
+
+| category | Atlas authoritative | CostLog | ratio |
+|---|---|---|---|
+| video | $242.93 | $277.00 | 1.14x over |
+| image | $72.44 | $33.48 | 0.46x under |
+| text | $69.62 | $70.68 | 1.02x |
+| **total** | **$384.99** | **$381.15** | **0.99x** |
+
+The category errors nearly cancel, so the top line looked healthy while per-day ratios ran
+**0.40x to 2.38x**. Never conclude the ledger is fine from a matching total.
+
+**Endpoints** (all GETs, free, safe to retry): `/balance`, `/model-costs`, `/model-usage`.
+`start_date` inclusive, `end_date` **exclusive**, range **≤180 days** (exactly 180 → 200,
+181 → 400 `invalid_time_range`; both live-verified). Money is a fixed-6-decimal **string**;
+we store integer micro-USD. Buckets carry `partial` + `covered_until` — **only `partial:false`
+is final**, and a partial day always reads as "ledger over".
+
+**`group_by[]` combinations that work:** `model_type`, `model`, `api_key`, `model`+`api_key`.
+`model_type`+`model` and `model_type`+`api_key` both **400 `invalid_group_by`**. This does not
+matter, because a `group_by[]=model` row already carries `model_type` — one query gives both axes,
+which is why there is no stage→category map to maintain (and why `reframe-outpaint`, an IMAGE
+model living in `atlasVideoService.js`, cannot be mis-bucketed).
+
+**Scope is load-bearing.** The billing account (`Reach-Social.io`, team) holds three keys:
+liquidretail's `ak_uLsOnKBB7nBIJ8OnKxoBEh`, plus `Reach-Social Testing` and
+`ReachSocialLLMExpander` — **unrelated projects**. Reconciliation filters to
+`ATLAS_BILLING_KEY_IDS`; balance/burn is account-wide because the prepaid pool is **shared**
+(liquidretail was 53% of account spend). `scope=self` is deliberately unused: it only covers the
+key that authenticated, so a second liquidretail key would silently read as ledger drift.
+`scope=account&api_key_ids[]=…` returns byte-identical totals to `scope=self` ($81.8170 for
+Aug 1–5), so the allowlist is a verified substitute.
+
+**No per-request cost exists in this API** — daily aggregates only. It can audit and calibrate
+`CostLog`; it can never attribute spend to a brand or ad. The per-call figure still comes from
+`price` on the settled prediction.
+
+### `price` IS published for video — and the video estimate was 1.33x–5.33x high
+
+Checked live 2026-08-05 on 6 of 6 recent settled video predictions: every one published
+`price: 0.75`. The ledger only ever recorded **$1.00** (141 rows) or **$4.00** (34 rows). That is
+the mechanism behind the video overage. `atlasVideoService.peekPrediction` now reads `price` back
+(same `{price, priceConfirmed}` contract as the image path, where `priceConfirmed:false` means
+UNKNOWN, never "free"), `pollPrediction` reconciles on completion, and the charge-point row finally
+carries `providerRequestId` — previously all 175 video rows had none, so `reconcileCost` could not
+match a single one.
+
+Also note the same window implies ~324 billable renders against 175 ledger rows: early-July
+renders were never ledgered at all. An understatement partly cancelling an overstatement is exactly
+how the 0.99x total hid both.
+
+### `REFRAME_COST_USD` is very likely half the real 4k price
+
+`REFRAME_COST_USD` defaults to **$0.08** (the 1k `-developer` tier) while `REFRAME_RESOLUTION`
+defaults to **4k**, and the readme prices 1k $0.08 / 2k $0.12 / 4k $0.16. The constant's own comment
+warned "if you raise REFRAME_RESOLUTION raise this too" — it was raised, the price was not.
+261 rows hold $0.08×228 + $0.04×33 = $19.56, plausibly ~$22 of the ~$39 image gap. Deliberately
+**not** hardcoded to 0.16: the stage now reads the settled price per render and the reconciler will
+prove the right default.
+
+Wiring: `services/atlasBillingClient.js` (HTTP), `models/AtlasSpendDay.js` (storage, micro-USD),
+`services/atlasSpendReconciler.js` (sync + daily drift + rolling drift + balance),
+registered on the worker; balance runs inside `backlogWatchdog` check 5.
+Pinned by `scripts/verifyAtlasBilling.js`; `--live` prints the day-by-day table.
+There is deliberately **no HTTP route** — account-wide COGS behind the per-Advertiser
+`requireAuth` chain would be a cross-tenant leak.
+
 ## 5) Env
 
-- `ATLAS_API_KEY` — primary, everything.
+- `ATLAS_API_KEY` — primary, everything (**including the Billing Public API** — same key).
 - `OPENAI_API_KEY` / `GEMINI_API_KEY` — fallbacks + the exceptions above.
 - `ATLAS_TEXT_BASE_URL`, `ATLAS_LLM_MAX_ATTEMPTS/BACKOFF_MS/TIMEOUT_MS`,
   `ATLAS_REASONING_RESERVE_TOKENS`, `ATLAS_MODEL_<ROLE>` overrides,
   `ATLAS_IMAGE_MODEL`, `ATLAS_IMAGE_EDIT_MODEL`, `ATLAS_GEMINI_IMAGE_MODEL`,
   `ATLAS_IMAGE_POLL_MS/TIMEOUT_MS`, plus the pre-existing video vars.
+- Billing reconciliation (all non-secret, all in `config/defaults.env`):
+  `ATLAS_BILLING_ENABLED`, `ATLAS_BILLING_BASE`, `ATLAS_BILLING_KEY_IDS`,
+  `ATLAS_SPEND_SYNC_INTERVAL_MIN`, `ATLAS_SPEND_LOOKBACK_DAYS`,
+  `ATLAS_DRIFT_ABS_USD`, `ATLAS_DRIFT_PCT`, `ATLAS_DRIFT_ROLLING_ABS_USD`,
+  `ATLAS_DRIFT_ROLLING_DAYS`, `ATLAS_ROLLING_MIN_DAYS`,
+  `ATLAS_BALANCE_ALERT_USD`, `ATLAS_BALANCE_LOW_STREAK`.
+  **`ATLAS_BILLING_KEY_IDS` needs updating the moment liquidretail uses a new Atlas key**, or that
+  key's spend reads as ledger drift.
 
 ## 6) Verifying / extending
 

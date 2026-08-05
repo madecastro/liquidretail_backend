@@ -1,5 +1,50 @@
 # session.md — liquidretail_backend
 
+## 2026-08-05 (later) — ATLAS BILLING RECONCILIATION. Branch `feat/atlas-billing-reconciliation`, NOT merged, NOT deployed.
+
+**Read `CHANGELOG.md` 2026-08-05 and `docs/ATLAS.md` §4b for the full write-up. State only, here.**
+
+The cost ledger was wrong in **both directions** and the total hid it. Measured live against
+production 2026-07-01 → 08-05: video $242.93 billed vs $277.00 ledgered (1.14x over), image $72.44
+vs $33.48 (0.46x under), text 1.02x, **grand total 0.99x**. Per-day ratios ran 0.40x–2.38x.
+
+**The two numbers to act on:**
+1. **Atlas charges $0.75 per video render** — verified on 6 of 6 recent settled predictions. The
+   ledger records only $1.00 (141 rows) or $4.00 (34 rows), i.e. 1.33x–5.33x high. Atlas DOES
+   publish `price` on video predictions; nothing had ever read it.
+2. **`REFRAME_COST_USD=0.08` is probably half the real 4k price** ($0.16 per the model readme, and
+   `REFRAME_RESOLUTION=4k`). ~$22 of the ~$39 image gap. Left as-is on purpose — the code now reads
+   the settled price per render so the reconciler proves the right default rather than a guess.
+
+**What is on the branch:** `models/AtlasSpendDay.js`, `services/atlasBillingClient.js`,
+`services/atlasSpendReconciler.js`, `scripts/backfillAtlasSpend.js`,
+`scripts/verifyAtlasBilling.js`; edits to `services/atlasVideoService.js` (video +
+reframe `providerRequestId` and settled-price read-back), `services/backlogWatchdog.js` (balance =
+check 5), `worker.js` (hourly reconciler tick), `config/defaults.env`, `docs/ATLAS.md`, `CHANGELOG.md`.
+
+**Verified:** all 68 `scripts/verify*.js` pass. The reconciler was run end-to-end against a
+**scratch database** (never production) seeded with a copy of prod CostLog rows, and reproduced 11 of
+11 baseline days to the cent; upserts idempotent; a partial day is refused; the balance streak fires
+only on the 3rd consecutive low read. Production Mongo was never written to — confirmed
+`atlasspenddays` does not exist in `liquidRetail`.
+
+**Not done / deliberate:**
+- `ATLAS_BILLING_KEY_IDS=ak_uLsOnKBB7nBIJ8OnKxoBEh` ships in `defaults.env`. **Add to it the moment
+  liquidretail uses a new Atlas key**, or that key's spend reads as ledger drift.
+- **Expect drift alerts immediately on deploy** for image and video. That is the system working, not
+  a bug — the known drift is far past both gates until the capture fixes have run a full day.
+- `ALERT_HOURLY_SPEND_USD=25` (watchdog check 4) is still fed by the estimated ledger. Once video
+  reconciles to $0.75 it is comparing against truer, lower numbers and probably wants retuning.
+  Deliberately not changed blind.
+- The account's other two Atlas keys (`Reach-Social Testing`, `ReachSocialLLMExpander`) are unrelated
+  projects, excluded from reconciliation, but they drain the same prepaid pool.
+- 79% of `CostLog` rows have no `costSource` field, so `reconcileCost` can never touch them. Not
+  backfilled (owner: do not rewrite `CostLog`).
+- `bootRecoveryService`'s video branch still hardcodes `confirmedCharge: true`. Now that
+  `peekPrediction` returns `{price, priceConfirmed}` for video, that could use the image path's real
+  confirmation — left alone because it changes `renderError.charged` semantics and deserves its own
+  review, which is exactly what that file says about video billing changes.
+
 Handoff for the next session. **Rewritten 2026-08-03.** This file had grown to ~760
 lines of chronological accretion; it is now organised by *what is true* rather than
 *what happened when*. History is compressed at the bottom — anything not listed there

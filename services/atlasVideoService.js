@@ -39,7 +39,25 @@ const Campaign                  = require('../models/Campaign');
 const CatalogProduct            = require('../models/CatalogProduct');
 const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
-const { recordFlatCost } = require('./costTracker');
+// reconcileCost upgrades an 'estimated' row to Atlas's own settled `price`.
+// Video was deliberately left out of the 2026-08-04 image fix — bootRecoveryService
+// says so in as many words: "VIDEO IS UNCHANGED ON PURPOSE … Changing video's
+// billing semantics is its own reviewed change, not a side-effect of the image
+// fix." This is that reviewed change. Measured 2026-08-05: atlas_video_render was
+// 175 rows / $277.00 with ZERO prediction ids and ZERO costSource:'actual', so
+// reconcileCost could never match a single video row. Atlas billed $242.93 for the
+// same window — the ledger overstated video by 1.14x, and by 3.07x on 2026-07-28.
+//
+// AND THE ESTIMATE ITSELF IS WRONG. Atlas DOES publish `price` on video
+// predictions — 6 of 6 recent settled renders, checked live 2026-08-05 — and every
+// one of them was **$0.75**. The ledger only ever records $1.00 (141 rows) or
+// $4.00 (34 rows), so the estimate runs 1.33x to 5.33x high. That is the mechanism
+// behind the video overage, and it is why the read-back matters more than the
+// prediction id alone: the id makes a row fixable, this makes it right.
+// (The same window's Atlas video total implies ~324 billable renders against 175
+// ledger rows, so early-July renders were never ledgered at all — an understatement
+// that partly cancelled the overstatement. Hence a 0.99x grand total hiding both.)
+const { recordFlatCost, reconcileCost } = require('./costTracker');
 const referenceDefaultsService  = require('./referenceDefaultsService');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
@@ -1722,6 +1740,14 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
       let billed    = false;
       let resultUrl = null;
       let method    = null;
+      // Hoisted out of the submit try-block below so the cost write at the end of
+      // this function can still see them. The prediction id is the only handle
+      // that makes a reframe row reconcilable, and unlike video there is NO
+      // Ad.veoPredictionId-style receipt persisted anywhere else — so if it is not
+      // captured here it is gone, and the 261 existing rows ($19.56) can never be
+      // backfilled. `settledPrice` is Atlas's own figure when it has published one.
+      let predictionId  = null;
+      let settledPrice  = null;
       // BILLING/CLAIM: identity of this process's lease; only release when we
       // still hold a claim-only entry and did NOT bill (see finally below).
       const claimBy = `${process.pid}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
@@ -1785,6 +1811,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
             aspectRatio,
             resolution: REFRAME_RESOLUTION()
           });
+          predictionId = id;
           // BILLING: Charge point. submitImageGeneration's own contract is "NO
           // retry (POST is charged)", so the money is committed HERE — before
           // the poll, not after it. Setting `billed` at terminal-ok instead
@@ -1874,6 +1901,28 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         // 7. LEDGER: spend EXACTLY ONCE if Atlas billed us — on every path,
         //    success or rejected-then-padded. Best-effort; never blocks the URL.
         if (billed) {
+          // Ask Atlas what it actually charged before writing the row. This is a
+          // free GET on a path that has already made several, and it is the only
+          // way this stage ever records a real number: unlike the video master, the
+          // cost row is written AFTER the poll, so pollPrediction's own reconcile
+          // has no row to update yet.
+          //
+          // WHY THIS MATTERS MORE THAN IT LOOKS: REFRAME_COST_USD defaults to $0.08
+          // — the 1k -developer tier — while REFRAME_RESOLUTION defaults to 4k, and
+          // the model readme prices 1k $0.08 / 2k $0.12 / 4k $0.16 ("4K costs 2x the
+          // standard rate"). The constant's own comment warns "if you raise
+          // REFRAME_RESOLUTION raise this too or the ledger silently under-reports".
+          // It was raised; the price was not. Measured 2026-08-05: 261 rows holding
+          // $0.08x228 + $0.04x33 = $19.56, against an image category that Atlas
+          // billed at 0.46x what the ledger claimed — this stage plausibly accounts
+          // for ~$22 of that ~$39 gap. Rather than hardcode a guessed 0.16, read the
+          // truth per render and let the reconciler prove the right default.
+          if (predictionId) {
+            try {
+              const peek = await peekPrediction(predictionId);
+              if (peek?.priceConfirmed && Number(peek.price) > 0) settledPrice = Number(peek.price);
+            } catch { /* free GET; an estimate is still recorded below */ }
+          }
           try {
             await recordFlatCost({
               stage: 'reframe-outpaint',
@@ -1883,7 +1932,11 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
               mediaId: media?._id || null,
               productId: media?.metadata?.catalogProductId || null,
               purposeTag: `reframe:${aspectRatio}`,
-              costUsd: REFRAME_COST_USD()
+              // Prediction id even when the price is still unpublished, so the row
+              // stays reconcilable later instead of being stranded on an estimate.
+              providerRequestId: predictionId,
+              costUsd: settledPrice != null ? settledPrice : REFRAME_COST_USD(),
+              costSource: settledPrice != null ? 'actual' : 'estimated'
             });
           } catch { /* telemetry only */ }
         }
@@ -2529,14 +2582,30 @@ async function peekPrediction(predictionId) {
   }
   const data = res.data?.data || {};
   const status = String(data.status || '').toLowerCase();
+
+  // Read the settled price back, exactly as atlasImageService.peekPrediction does.
+  // Same three-way semantics, and the middle one is the trap:
+  //   priceConfirmed:true  + price>0  -> Atlas states a charge; reconcile to it.
+  //   priceConfirmed:true  + price==0 -> Atlas states NO charge (failures are refunded).
+  //   priceConfirmed:false            -> UNKNOWN, *not* free. Never collapse this to
+  //                                      "not charged" — that understates spend, the
+  //                                      one direction a ledger cannot be corrected in.
+  // Additive only: existing callers ignore the extra fields, so no behaviour changes.
+  // ATLAS_VIDEO_ESTIMATE (max(3,dur)x$0.13 = $1.04 for an 8s clip) is an estimate;
+  // this is the real number, and never substitute the catalog base_price for it
+  // (it understated image spend by ~7.17x).
+  const rawPrice = Number(data.price);
+  const priceConfirmed = Number.isFinite(rawPrice);
+  const charge = { price: priceConfirmed ? rawPrice : null, priceConfirmed };
+
   if (status === 'completed' || status === 'succeeded') {
     const raw = data.outputs ?? data.output ?? [];
     const url = Array.isArray(raw) ? raw[0] : raw;
     // Completed WITHOUT an output is the genuine "paid for nothing" case and is
     // classified as such rather than silently treated as still-running.
     return url
-      ? { state: 'done', videoUrl: url }
-      : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput' };
+      ? { state: 'done', videoUrl: url, ...charge }
+      : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput', ...charge };
   }
   if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
     const providerMsg = data.error || status;
@@ -2546,10 +2615,11 @@ async function peekPrediction(predictionId) {
     return {
       state: 'failed',
       message: `${policy.label || 'atlasVideo: prediction failed'}: ${providerMsg}`,
-      policy: policy.name
+      policy: policy.name,
+      ...charge
     };
   }
-  return { state: 'processing' };
+  return { state: 'processing', ...charge };
 }
 
 /**
@@ -2660,6 +2730,19 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       if (!url) throw new Error(`atlasVideo: ${status} but no output url (predictionId=${predictionId})`);
       const elapsedSec = Math.round((Date.now() - t0) / 1000);
       console.log(`🎬 atlasVideo: ${predictionId} done after ${elapsedSec}s (${pollCount} polls)`);
+      // Upgrade the charge-point row from its $1.04-style estimate to Atlas's own
+      // settled figure. Fire-and-forget on purpose: reconcileCost is bookkeeping,
+      // and a bookkeeping failure must never fail a generation we have already paid
+      // for (the same rule the charge-point write above follows).
+      //
+      // Atlas often publishes `price` only after the asset returns — measured 7 of 38
+      // for images — so this will frequently be absent here. That is expected, not a
+      // failure: the row stays 'estimated' and queryable, and bootRecoveryService
+      // re-reads the same prediction later. Not treated as free.
+      const settled = Number(data.price);
+      if (Number.isFinite(settled) && settled > 0) {
+        reconcileCost({ providerRequestId: predictionId, costUsd: settled }).catch(() => {});
+      }
       return url;
     }
     if (status === 'failed') {
@@ -3247,7 +3330,14 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
       productId:  ad.productId || null,
       costUsd:    costUsd || 0,
       durationMs: submitMs,
-      status:     'submitted'
+      status:     'submitted',
+      // THE handle that makes this row reconcilable. Without it reconcileCost's
+      // {providerRequestId, costSource:'estimated'} filter can never match, which
+      // is why all 175 atlas_video_render rows were stuck on an estimate. The id
+      // was already being persisted to Ad.veoPredictionId two lines up — whose own
+      // warning says "orphan would be unreconcilable" — it just never reached the
+      // cost row.
+      providerRequestId: predictionId
     });
   } catch (err) {
     console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
