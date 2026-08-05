@@ -1281,7 +1281,7 @@ async function renderDirectImage({
       renderedRoles: built.text.map(([role]) => role),
       droppedRoles: built.dropped,
       generateSize: genSize,
-      logoComposited: layers.length > 0
+      logoComposited: plate.logoComposited
     },
     visionQc: null
   };
