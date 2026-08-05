@@ -28,6 +28,7 @@ const {
 
 const { chatCompletion, isConfigured: atlasLlmConfigured } = require('./atlasLlmService');
 const { inspectTailwindTheme } = require('./tailwindTokenExtractor');
+const { metaAdsFontsEnabled } = require('./metaAdsFontService');
 const MAX_HTML_CHARS = 25000;
 
 const ENRICHMENT_SCHEMA = {
@@ -137,10 +138,15 @@ async function runEnrichment(brand, brandId, run = null) {
                              && !sourcesAttempted.has('gpt');
   const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
   const wantFontIngest   = !brand.fontIngestedAt;
+  // Second font source, for the common premium-DTC case where the website
+  // scan cannot get the file (foundry CDN 403, or a JS-injected stack with no
+  // @font-face in the fetched HTML). Gated on its own stamp so the billable
+  // vision call is paid at most once per brand.
+  const wantMetaFonts    = metaAdsFontsEnabled() && !brand.metaFontsIngestedAt;
   const logoIsCurated    = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('logoUrl');
   const wantLogoIngest   = !logoIsCurated && !brand.logoIngestedAt;
 
-  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest && !wantLogoIngest) {
+  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest && !wantLogoIngest && !wantMetaFonts) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
 
@@ -153,6 +159,7 @@ async function runEnrichment(brand, brandId, run = null) {
   if (wantBrandReviews) planParts.push('brand-reviews');
   if (wantFontIngest)   planParts.push('website-fonts');
   if (wantLogoIngest)   planParts.push('website-logo');
+  if (wantMetaFonts)    planParts.push('meta-ads-fonts');
   console.log(`🌐 brand enrichment: ${brand.websiteUrl} for "${brand.name}" — running ${planParts.join('+')}${sourcesAttempted.size ? ` (already have: ${[...sourcesAttempted].join(', ')})` : ''}`);
 
   // ── Tier 1: Brandfetch ──
@@ -542,6 +549,37 @@ async function runEnrichment(brand, brandId, run = null) {
       brand.fontIngestError = String(err.message || err).slice(0, 2000);
       await brand.save().catch(() => {});
       console.warn(`   ⚠️  website font ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
+
+  // Fonts identified in the brand's OWN Meta ads. Runs after the website scan on
+  // purpose: the website can yield real FILES, and this only yields a NAME, so
+  // there is no point paying for the weaker signal first. It still runs even when
+  // the website scan succeeded — a site commonly serves only its body face while
+  // the ads show the display face.
+  // BILLABLE (~$0.02-0.03). Best-effort: never fail the rest of enrichment.
+  if (wantMetaFonts) {
+    if (run) { await run.checkpoint(); run.stage('meta-ads fonts'); }
+    try {
+      const { identifyBrandAdFonts } = require('./metaAdsFontService');
+      const { applyMetaFontsResult } = require('./brandFontPersistenceService');
+      const maxImages = Number(process.env.META_ADS_FONTS_MAX_IMAGES) || 4;
+      const metaResult = await identifyBrandAdFonts(brand, { maxImages });
+      applyMetaFontsResult(brand, metaResult);
+      await brand.save();
+      console.log(
+        `   · meta-ads fonts: via=${metaResult.via} images=${metaResult.imagesUsed} ` +
+        `heading=${metaResult.usage.heading?.family || 'none'}` +
+        `${metaResult.usage.heading ? `(${metaResult.usage.heading.confidence})` : ''} ` +
+        `body=${metaResult.usage.body?.family || 'none'}`
+      );
+    } catch (err) {
+      // Stamp anyway: without this a brand whose ads cannot be read re-pays the
+      // vision call on every future enrichment run.
+      brand.metaFontsIngestedAt = new Date();
+      brand.metaFontsIngestError = String(err.message || err).slice(0, 2000);
+      await brand.save().catch(() => {});
+      console.warn(`   ⚠️  meta-ads font identification failed for "${brand.name}": ${err.message}`);
     }
   }
 

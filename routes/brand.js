@@ -1384,6 +1384,51 @@ router.post('/:id/ingest-fonts', express.json(), async (req, res) => {
   }
 });
 
+// POST /api/brand/:id/ingest-meta-fonts — identify the typefaces in the brand's
+// OWN Meta ads with a vision model. The second font source, for brands whose
+// website will not give up the file (foundry CDN 403, JS-injected stack).
+//
+// BILLABLE (~$0.02-0.03: one gemini-2.5-pro call + $0.005/image, plus an Apify
+// run only when the brand has no connected Meta account and no persisted
+// creatives). Unlike the enrichment tier this does NOT gate on
+// metaFontsIngestedAt — an operator asking for it explicitly means re-run —
+// so it is a paid call every time it is invoked.
+//
+// Produces a NAME, never a font file, and deliberately does not touch
+// brand.fontFamily; see brandFontPersistenceService.applyMetaFontsResult.
+router.post('/:id/ingest-meta-fonts', express.json(), async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const { identifyBrandAdFonts, metaAdsFontsEnabled } = require('../services/metaAdsFontService');
+    if (!metaAdsFontsEnabled()) {
+      return res.status(409).json({ error: 'meta-ads font identification is disabled (META_ADS_FONTS_ENABLED=false)' });
+    }
+    const maxImages = Number(req.body?.maxImages) || Number(process.env.META_ADS_FONTS_MAX_IMAGES) || 4;
+    const result = await identifyBrandAdFonts(brand, { maxImages });
+    const { applyMetaFontsResult } = require('../services/brandFontPersistenceService');
+    applyMetaFontsResult(brand, result);
+    await brand.save();
+
+    console.log(
+      `🔤 ingest-meta-fonts[${brand.name}]: via=${result.via} images=${result.imagesUsed} ` +
+      `heading=${result.usage.heading?.family || 'none'} body=${result.usage.body?.family || 'none'} ` +
+      `errors=${result.errors.length}`
+    );
+    res.json({
+      ok: true,
+      via: result.via,
+      imagesUsed: result.imagesUsed,
+      usage: result.usage,
+      errors: result.errors,
+    });
+  } catch (err) {
+    console.error('ingest-meta-fonts failed:', err.message);
+    res.status(err.status || 500).json({ error: err.message || 'meta-ads font identification failed' });
+  }
+});
+
 // GET /api/brand/:id/meta-cascades — every meta field the titling
 // engine consumes, with its effective source cascade (brand overrides
 // merged over shipped defaults) and a human label for each field.
