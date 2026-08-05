@@ -1849,8 +1849,23 @@ async function attachProductNames(perProduct, brandId) {
 //
 // KILL SWITCH: VIDEO_SEED_FEED_ORDER, DEFAULT ON. It changes what a billable
 // generation is seeded with, so it must be reversible without a deploy.
+// SUPERSEDED as the primary switch by CATALOG_FEED_ORDER_SEEDING below —
+// this one only still matters when that new switch is turned off.
 function isVideoSeedFeedOrderEnabled() {
   const raw = process.env.VIDEO_SEED_FEED_ORDER;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+// KILL SWITCH: CATALOG_FEED_ORDER_SEEDING, DEFAULT ON. Owner directive
+// 2026-08-05: the video seed (and the static default seed, see
+// seededUniverseService.promoteFirstCatalogImage) should be the merchant
+// feed's actual image order — primary first, then additionalImages in feed
+// order — not a stamp, a shot-type rank, or createdAt. OFF restores the
+// pre-2026-08-05 cascade below byte-for-byte, including VIDEO_SEED_FEED_ORDER
+// and the subject-dominance guard.
+function isCatalogFeedOrderSeedingEnabled() {
+  const raw = process.env.CATALOG_FEED_ORDER_SEEDING;
   if (raw == null || raw === '') return true;
   return !/^(0|false|no|off)$/i.test(String(raw).trim());
 }
@@ -1858,9 +1873,24 @@ function isVideoSeedFeedOrderEnabled() {
 /**
  * The product's first catalog image in feed order.
  *
- * With the flag ON (default) this is purely earliest-createdAt. With it OFF the
- * historical hero-stamp-first cascade is restored verbatim, so flipping the env
- * var reproduces the old seed exactly.
+ * With CATALOG_FEED_ORDER_SEEDING on (default): the merchant feed's primary
+ * image, unconditionally — no shot-type rank, no createdAt tiebreak, no
+ * subject-dominance guard. Owner, 2026-08-05: "the primary image as defined
+ * by the merchant feed is the main image that should be used for ... video
+ * ... The Hero stamp is not relevant."
+ *
+ * Two tiers, both naming the same image: CatalogProduct.imageMediaId (the
+ * live pointer) then metadata.feedIndex===0 (the ingest stamp). See the
+ * inline comments for why the pointer is checked FIRST — a stale stamp
+ * outranking it would seed a billable render from a retired product photo.
+ * Returns null only when neither exists, which is also the only case the
+ * caller's lazy-materialize path can recover (enqueueProductDetect
+ * early-returns whenever imageMediaId is already set).
+ *
+ * With the flag OFF, the pre-2026-08-05 cascade below runs unchanged: with
+ * VIDEO_SEED_FEED_ORDER ON this is purely earliest-createdAt plus the
+ * subject-dominance guard; with it OFF the historical hero-stamp-first
+ * cascade is restored verbatim.
  */
 /**
  * Skip a first image whose subject fills the frame, because the product cannot
@@ -1897,6 +1927,60 @@ const VIDEO_SEED_MAX_SUBJECT_FRACTION = (() => {
 })();
 
 async function firstCatalogMediaForProduct(productOid) {
+  if (isCatalogFeedOrderSeedingEnabled()) {
+    // Merchant feed's primary image, unconditional — no shot-type rank, no
+    // subject-dominance guard, no exceptions (owner directive 2026-08-05).
+    // A tie (should not happen — feedIndex:0 is meant to be unique per
+    // product) breaks on earliest createdAt for determinism.
+    // TIER 1 — CatalogProduct.imageMediaId. This is the LIVE pointer to the
+    // merchant feed's primary image, rewritten by catalogProductDetectService
+    // every time the product is (re-)detected (`:97`).
+    //
+    // IT IS DELIBERATELY CHECKED BEFORE THE feedIndex STAMP, and the order
+    // matters for money. metadata.feedIndex is a DENORMALISED stamp on the
+    // Media doc; nothing clears it when a merchant changes their primary
+    // image. Re-detect (operator clears imageMediaId) materialises a NEW
+    // Media under a new externalId — so the retired image keeps its
+    // feedIndex:0 and a stamp-first cascade would seed a billable Omni
+    // render from a product photo the merchant has REPLACED. imageMediaId
+    // cannot go stale that way: it is a single pointer that is overwritten,
+    // not accumulated. Found in adversarial review before deploy.
+    //
+    // Scoped to source + this product (not just _id) so a corrupted or
+    // hand-edited imageMediaId cannot pull in another product's media, and
+    // fileType-guarded so it can never hand a VIDEO to an image-to-video
+    // seed slot.
+    const product = await CatalogProduct.findById(productOid)
+      .select('imageMediaId')
+      .lean();
+    if (product?.imageMediaId) {
+      const primary = await Media.findOne({
+        _id: product.imageMediaId,
+        source: 'catalog-product',
+        'metadata.catalogProductId': productOid,
+        fileType: { $ne: 'video' }
+      })
+        .select('_id')
+        .lean();
+      if (primary) return primary;
+    }
+
+    // TIER 2 — the ingest-time feedIndex stamp. Reached when imageMediaId is
+    // unset (non-primary variant, or a product whose detect never completed)
+    // or points at something unusable. A tie breaks on earliest createdAt
+    // for determinism; feedIndex:0 is meant to be unique per product, so a
+    // tie already means a stale duplicate is present.
+    return await Media.findOne({
+      source: 'catalog-product',
+      'metadata.catalogProductId': productOid,
+      'metadata.feedIndex': 0,
+      fileType: { $ne: 'video' }
+    })
+      .sort({ createdAt: 1 })
+      .select('_id')
+      .lean();
+  }
+
   if (!isVideoSeedFeedOrderEnabled()) {
     const stamped = await Media.findOne({
       source: 'catalog-product',
@@ -2926,5 +3010,10 @@ module.exports = {
   isMediaEligibleByContentNature,
   // Offline harness + routes re-use the pure reason helpers.
   summarizeEmptyExpansion,
-  PER_PRODUCT_REASON
+  PER_PRODUCT_REASON,
+  // Exported for scripts/verifyCatalogFeedOrderSeeding.js (offline, mocked
+  // Media model — see that harness for how it stubs Media.findOne).
+  firstCatalogMediaForProduct,
+  isCatalogFeedOrderSeedingEnabled,
+  isVideoSeedFeedOrderEnabled
 };

@@ -34,9 +34,11 @@
 // `opts.preferFirstCatalogImage` (default FALSE, so no existing caller
 // changes) is what implements the rule: promoteFirstCatalogImage() hoists
 // the first CATALOG-SOURCED entry to index 0 AFTER ranking and BEFORE the
-// top-N trim, via a cascade — role==='catalog' + imageRole==='hero' (the
-// catalog feed's first image), else the earliest-createdAt catalog entry,
-// else nothing. It is deliberately skipped for operator picks
+// top-N trim. UPDATED 2026-08-05 (owner directive): the cascade now hoists
+// by media.metadata.feedIndex === 0 — the merchant feed's designated primary
+// image, stamped at ingest — not the imageRole:'hero' label. See that
+// function's own doc comment for the full cascade and the kill switch
+// (CATALOG_FEED_ORDER_SEEDING). It is deliberately skipped for operator picks
 // (restrictToMediaIds IS the override) and for brand-only runs (every
 // SKU's catalog media is pooled, so "the catalog's first image" is
 // undefined).
@@ -119,65 +121,83 @@ function rankMergedPool(entries, { wantsVideo = false } = {}) {
   });
 }
 
-// Hoist THE FIRST IMAGE THAT CAME FROM THE CATALOG to the front of an
-// already-ranked pool. PURE: returns a NEW array, never mutates the input.
+// KILL SWITCH: CATALOG_FEED_ORDER_SEEDING, DEFAULT ON. Governs both this
+// function and the deterministic VIDEO seed path (campaignAdsGenerationService.js).
+// OFF restores the pre-2026-08-05 hero-stamp/shotType cascade byte-for-byte.
+function isCatalogFeedOrderSeedingEnabled() {
+  const raw = process.env.CATALOG_FEED_ORDER_SEEDING;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+// Hoist THE MERCHANT FEED'S PRIMARY IMAGE to the front of an already-ranked
+// pool. PURE: returns a NEW array, never mutates the input.
 //
-// Owner rule, 2026-08-03, verbatim: "I actually just want to use the first
-// image that comes from the catalog not the 'hero' image since that may also
-// come from social media or UGC?"
+// Owner rule, 2026-08-05, verbatim: "the primary image as defined by the
+// merchant feed is the main image that should be used for static ... The
+// Hero stamp is not relevant when selecting images for video or static
+// catalog generations." Supersedes the 2026-08-03 rule this function
+// originally implemented (imageRole:'hero' as the selection signal) — the
+// signal is now media.metadata.feedIndex, stamped at ingest by
+// catalogProductDetectService (0 = product.imageUrl, 1..N = additionalImages
+// in stored order — see that file's materializeImage/enqueueProductDetect).
+// feedIndex is authoritative regardless of imageRole, so a legacy row whose
+// imageRole stamp is stale, absent, or (on a UGC doc) simply not ours to
+// control cannot affect this tier — feedIndex only ever exists on media this
+// service itself materialized from the feed.
 //
 // THE CASCADE — first tier that matches wins, and EVERY tier can only ever
 // select an entry whose role is 'catalog':
-//   TIER 1  the first entry with role === 'catalog' AND
-//           media.metadata.imageRole === 'hero'. That stamp is written in
-//           exactly one place: catalogProductDetectService materialises
-//           CatalogProduct.imageUrl — the catalog feed's FIRST image — with
-//           imageRole:'hero' (`:60`), and additionalImages[] with 'alt'
-//           (`:80`, `:513`). So tier 1 IS "the first image from the catalog",
-//           wearing a legacy name.
-//   TIER 2  else, among role === 'catalog' entries, the one with the EARLIEST
-//           media.createdAt. Catalog Media rows are materialised in feed
-//           order, so earliest ≈ first. Ties — equal timestamps, or none
-//           usable — resolve to the earlier entry in the incoming RANKED
-//           order, so the outcome is deterministic and the ranker still
-//           breaks the tie. An entry with a missing / unparseable createdAt
-//           sorts LAST, never first: a legacy row with no timestamp must not
-//           win "earliest" by defaulting to epoch 0.
-//   TIER 3  else there is no catalog entry in the pool at all → an unchanged
+//   TIER 1  the entry whose _id === opts.primaryMediaId, i.e.
+//           CatalogProduct.imageMediaId — the LIVE pointer to the merchant
+//           feed's primary image, rewritten by catalogProductDetectService on
+//           every (re-)detect (`:97`). Unconditional: no shotType, no
+//           imageRole, no createdAt tiebreak.
+//   TIER 2  else the first entry with media.metadata.feedIndex === 0 — the
+//           same image identified by its ingest-time stamp. Reached when
+//           imageMediaId is unset (non-primary variant, detect never
+//           completed) or its media is not in this pool.
+//
+//   WHY TIER 1 IS THE POINTER AND NOT THE STAMP — this order is money-
+//   critical. feedIndex is DENORMALISED onto the Media doc and nothing
+//   clears it when a merchant replaces their primary image: re-detect
+//   materialises a NEW Media under a new externalId, so the RETIRED image
+//   keeps feedIndex:0 forever. A stamp-first cascade would then seed a
+//   billable render from a product photo the merchant has replaced.
+//   imageMediaId cannot go stale that way — it is one pointer that gets
+//   overwritten, not a stamp that accumulates. Tier 2 still matters because
+//   it covers every case where the pointer is absent. Found in adversarial
+//   review before deploy; both orders were implemented, this is the correct
+//   one.
+//   TIER 3  else (no feedIndex stamp AND no usable imageMediaId): the
+//           best-ranked catalog entry, i.e. the first role==='catalog' entry
+//           in the incoming RANKED order. This is the fallback this function
+//           used from 2026-08-04, kept so a product with neither signal
+//           cannot regress to the pre-2026-08-04 Director-starvation bug (a
+//           bare packshot becoming the model's entire universe — measured 10
+//           failures/11 rounds vs 0/51 before that fix).
+//   TIER 4  else there is no catalog entry in the pool at all → an unchanged
 //           copy. There is nothing from the catalog to pin.
 //
-// WHY TIER 2 EXISTS — this is the point of the rule, not a nicety. The pool
-// this runs on is a SINGLE merged pool of catalog media AND product_match UGC
-// (rankMergedPool deliberately does not let source gate order, so a UGC
-// lifestyle post ranks equal to a catalog lifestyle shot). Tier 1 on its own
-// is not enough because the imageRole stamp can be ABSENT — hero
-// materialisation failed, or the row predates the stamp. A tier-1-only helper
-// returned the pool unchanged in that case, and the shotType ranking then
-// decided index 0 out of that merged pool — which is exactly how a UGC post
-// became the default seed of a catalog product ad. The FALLTHROUGH is the
-// failure mode; tier 2 removes it, so an UNSTAMPED catalog set still beats
-// UGC.
-//
 // The `entry.role === 'catalog'` test is LOAD-BEARING IN EVERY TIER, not
-// defensive. It is what makes "can never resolve to UGC" true rather than
-// hopeful: metadata.imageRole lives on UGC docs too (we do not author
-// creator-side metadata and do not control what it says), so a creator post
-// stamped imageRole='hero' must still lose tier 1 to an unstamped catalog
-// image via tier 2, and must never be selectable by tier 2 either.
+// defensive. feedIndex is only ever stamped by catalogProductDetectService on
+// role==='catalog' media, so tier 1 cannot resolve to UGC by construction —
+// but the explicit filter stays because tier 2/3 still walk the same
+// isCatalog() gate and must not regress that guarantee.
 //
 // Stable: every non-promoted entry keeps its relative order, so the
 // shotType ranking still decides positions 1..n (which matter as soon as
 // DIRECTOR_UNIVERSE_TOP_N is raised above 1).
 //
-// MIRRORS the proven cascade on the deterministic VIDEO seed path,
-// campaignAdsGenerationService.js:2085 ("Feed-order hero: imageRole hero →
-// earliest createdAt → lazy materialize") — same tier 1, same tier 2. That
-// rail's third step lazily materialises Media from CatalogProduct.imageUrl,
-// which is a DB write and cannot live in a pure ranking helper; here tier 3
-// is "leave the pool alone".
-function promoteFirstCatalogImage(rankedEntries) {
+// MIRRORS the feedIndex-based cascade on the deterministic VIDEO seed path
+// (campaignAdsGenerationService.js, firstCatalogMediaForProduct) — same tier
+// 1, same isCatalog gate, same kill switch. That rail's own tier 2 lazily
+// materializes Media from CatalogProduct.imageUrl, which is a DB write and
+// cannot live in a pure ranking helper; here tier 3 is "leave the pool alone".
+function promoteFirstCatalogImage(rankedEntries, opts = {}) {
   if (!Array.isArray(rankedEntries)) return [];
   if (rankedEntries.length < 2) return rankedEntries.slice();
+  const primaryMediaId = opts.primaryMediaId ? String(opts.primaryMediaId) : null;
 
   // The only membership test in this function. Nothing that fails this can be
   // selected by any tier.
@@ -186,57 +206,56 @@ function promoteFirstCatalogImage(rankedEntries) {
   // "is an image". Catalog VIDEOS live under that same source: shopifyPublic-
   // IngestService upserts { source:'catalog-product', fileType:'video',
   // metadata:{ imageRole:'video', catalogProductId } } (:513-546), and the pool
-  // query applies no fileType filter. Tier 1 was safe by accident (it demands
-  // imageRole==='hero'), but tier 2 selects on createdAt alone, so a product
-  // whose images are unstamped and whose catalog carries a video could hand a
-  // VIDEO to a STATIC image generation as "the first catalog image".
-  //
-  // Excluding an EXPLICIT video rather than requiring fileType==='image' is
-  // deliberate: a legacy row with a null/absent fileType must still satisfy
-  // tier 2, because the alternative is falling through to tier 3, where the
-  // shotType ranking can hand index 0 to a UGC post — the exact bug this
-  // function exists to prevent. Both signals are checked because either one
-  // alone identifies a video in the data we actually have.
+  // query applies no fileType filter. Excluding an EXPLICIT video rather than
+  // requiring fileType==='image' is deliberate: a legacy row with a null/absent
+  // fileType must still satisfy tier 2, because the alternative is falling
+  // through to tier 3, where the shotType ranking can hand index 0 to a UGC
+  // post — the exact bug this function exists to prevent. Both signals are
+  // checked because either one alone identifies a video in the data we
+  // actually have.
   const isCatalog = (e) =>
     !!e
     && e.role === 'catalog'
     && e.media?.fileType !== 'video'
     && e.media?.metadata?.imageRole !== 'video';
-  // NOTE: tier 2 used to sort on createdAt. It no longer does — see the tier 2
-  // comment below for why feed order starved the Director.
 
-  // TIER 1 — the catalog feed's first image, as stamped at materialisation.
-  let idx = rankedEntries.findIndex(
-    (e) => isCatalog(e) && e.media?.metadata?.imageRole === 'hero'
-  );
+  if (!isCatalogFeedOrderSeedingEnabled()) {
+    // Byte-identical pre-2026-08-05 cascade: hero stamp, else best-ranked
+    // catalog entry, else unchanged. Preserved verbatim behind the flag.
+    let legacyIdx = rankedEntries.findIndex(
+      (e) => isCatalog(e) && e.media?.metadata?.imageRole === 'hero'
+    );
+    if (legacyIdx < 0) legacyIdx = rankedEntries.findIndex(isCatalog);
+    if (legacyIdx <= 0) return rankedEntries.slice();
+    const legacyOut = rankedEntries.slice();
+    const [legacyFirst] = legacyOut.splice(legacyIdx, 1);
+    legacyOut.unshift(legacyFirst);
+    return legacyOut;
+  }
 
-  // TIER 2 — no hero stamp anywhere in the catalog set: the BEST-RANKED
-  // catalog image wins. `rankedEntries` arrives already sorted by
-  // rankMergedPool (shotType first: lifestyle > on_model > flat_lay >
-  // product_only > detail > packaging, with the hero stamp as a within-tier
-  // tiebreak), so the first catalog entry in that order IS the best-ranked
-  // one. No separate sort is needed or wanted.
-  //
-  // WHY THIS CHANGED (2026-08-04, owner-directed). Tier 2 used to take the
-  // earliest-`createdAt` catalog entry — the catalog feed's first image. That
-  // is FEED ORDER, not quality, and it is routinely a bare packshot on white.
-  // With DIRECTOR_UNIVERSE_TOP_N=1 that single packshot became the Director's
-  // ENTIRE universe, and on SKUs whose description and reviews are empty the
-  // brief got thin enough that the model stopped emitting concepts and started
-  // asking clarifying questions instead ("I don't have enough information…").
-  // Measured: 51 concept rounds / 0 failures on 2026-08-03 (before the
-  // catalog-first cascade shipped) vs 10 failures / 11 rounds on 2026-08-04
-  // (after). Ranking within the catalog set fixes the starvation without
-  // giving up either guarantee that matters:
-  //   - still exactly ONE primary seed (owner: keep the single seed);
-  //   - still catalog-ONLY, because `isCatalog` gates every tier, so a UGC or
-  //     social post can never win index 0 — the whole point of the cascade.
-  // Tier 1 (the explicit hero stamp) is untouched and still wins outright.
+  // TIER 1 — CatalogProduct.imageMediaId, the LIVE pointer to the merchant
+  // feed's primary image. Checked BEFORE the feedIndex stamp on purpose —
+  // see the doc comment above for why a stale stamp must not outrank it.
+  let idx = primaryMediaId
+    ? rankedEntries.findIndex(
+      (e) => isCatalog(e) && String(e.media?._id || '') === primaryMediaId
+    )
+    : -1;
+
+  // TIER 2 — the ingest-time feedIndex stamp, when imageMediaId is unset or
+  // its media is not in this pool.
+  if (idx < 0) {
+    idx = rankedEntries.findIndex(
+      (e) => isCatalog(e) && e.media?.metadata?.feedIndex === 0
+    );
+  }
+
+  // TIER 3 — neither signal available, see the function doc comment above.
   if (idx < 0) {
     idx = rankedEntries.findIndex(isCatalog);
   }
 
-  // TIER 3 (idx === -1) — no catalog entry at all. Also covers "already
+  // TIER 4 (idx === -1) — no catalog entry at all. Also covers "already
   // first" (idx === 0), where there is nothing to move.
   if (idx <= 0) return rankedEntries.slice();
   const out = rankedEntries.slice();
@@ -450,8 +469,15 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
   // always fires (brand-scoped UGC is the primary UGC source).
   let tier1Ids = [];
   let tier2Ids = [];
+  // The merchant feed's primary image id, for promoteFirstCatalogImage's
+  // tier-2 fallback on media that predates the feedIndex stamp. Same doc load
+  // that was already happening for matchedMedia — one extra projected field,
+  // no extra query, and it is loaded under exactly the condition
+  // promoteFirstCatalogImage runs under (!isBrandOnly).
+  let primaryMediaId = null;
   if (!isBrandOnly) {
-    const product = await CatalogProduct.findById(productId).select('matchedMedia').lean();
+    const product = await CatalogProduct.findById(productId).select('matchedMedia imageMediaId').lean();
+    primaryMediaId = product?.imageMediaId ? String(product.imageMediaId) : null;
     const mmEntries = Array.isArray(product?.matchedMedia) ? product.matchedMedia : [];
     tier1Ids = mmEntries
       .filter(mm => mm.matchTier === 'product_match')
@@ -533,16 +559,31 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
   // rule outranks that tiebreak. Trade-off is deliberate and pinned by
   // scripts/verifySeededUniverseHeroDefault.js.
   if (preferFirstCatalogImage && !isBrandOnly) {
-    const promoted = promoteFirstCatalogImage(ranked);
+    const promoted = promoteFirstCatalogImage(ranked, { primaryMediaId });
     const head = promoted[0] || null;
     // Post-cascade, head is role==='catalog' whenever the pool held ANY
-    // catalog entry (tier 2 is exhaustive over them), so this doubles as the
-    // tier-3 detector.
+    // catalog entry (tier 3 is exhaustive over them), so this doubles as the
+    // tier-4 detector.
     const headIsCatalog = !!head && head.role === 'catalog';
     if (headIsCatalog && head !== ranked[0]) {
-      const tier = head.media?.metadata?.imageRole === 'hero'
-        ? "tier 1 (imageRole='hero')"
-        : 'tier 2 (best-ranked catalog image)';
+      // Report the tier that ACTUALLY fired. This must branch on the flag:
+      // the cascade itself does, so labelling a flag-OFF promotion with the
+      // feedIndex tier names (or vice versa) would make the log lie about
+      // which rule seeded a billable render — the exact class of confusion
+      // this whole change exists to remove.
+      const headId = String(head.media?._id || '');
+      let tier;
+      if (!isCatalogFeedOrderSeedingEnabled()) {
+        tier = head.media?.metadata?.imageRole === 'hero'
+          ? "tier 1 (imageRole='hero')"
+          : 'tier 2 (best-ranked catalog image)';
+      } else if (primaryMediaId && headId === primaryMediaId) {
+        tier = 'tier 1 (CatalogProduct.imageMediaId, merchant feed primary)';
+      } else if (head.media?.metadata?.feedIndex === 0) {
+        tier = 'tier 2 (feedIndex=0 stamp, merchant feed primary)';
+      } else {
+        tier = 'tier 3 (best-ranked catalog image — feedIndex not yet backfilled)';
+      }
       console.log(
         `🎯 seeded universe — first catalog image ${String(head.media._id)} promoted to index 0 ` +
         `from rank ${ranked.indexOf(head)} of ${ranked.length} via ${tier} ` +

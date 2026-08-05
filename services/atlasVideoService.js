@@ -2061,6 +2061,55 @@ function validateVideoSettings(vs) {
   return null;
 }
 
+// KILL SWITCH: CATALOG_FEED_ORDER_SEEDING, DEFAULT ON. Same flag as
+// seededUniverseService.js / campaignAdsGenerationService.js. Owner directive
+// 2026-08-05: reference images 2/3 (after the seed at position 0) should be
+// "the first and second other images in the feed, as they appear in the
+// feed" — not shot-type or createdAt order.
+function isCatalogFeedOrderSeedingEnabled() {
+  const raw = process.env.CATALOG_FEED_ORDER_SEEDING;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+// Order the product's catalog Media docs for the reference stack that fills
+// positions 1+ in buildReferenceImages (position 0 is the seed, resolved
+// separately by firstCatalogMediaForProduct).
+//
+// ON (default): feedIndex ascending — feedIndex is stamped at ingest by
+// catalogProductDetectService (0 = product.imageUrl, 1..N = additionalImages
+// in stored order), so this is literally feed order. Docs not yet stamped
+// (materialized before this field existed, not yet backfilled — see
+// scripts/backfillMediaFeedIndex.js) sort after every stamped doc, tiebroken
+// by createdAt so the order is still deterministic.
+//
+// OFF: the pre-2026-08-05 sort, byte-for-byte — createdAt ascending. The
+// comment this replaced claimed "hero materializes before alts, so createdAt
+// asc ≈ hero-first" — real production data (Gymshark Campus Crest Zip
+// Through, 2026-08-05) disproved that: the hero doc was created ~1h41m and
+// ~8s AFTER its alts on two separate SKUs, so createdAt order routinely put
+// alts ahead of the hero. That gap is exactly why this function exists now.
+function sortCatalogMediasForReferenceStack(docs) {
+  const list = Array.isArray(docs) ? docs.slice() : [];
+  const byCreatedAtAsc = (a, b) =>
+    (a.createdAt ? new Date(a.createdAt).getTime() : 0) -
+    (b.createdAt ? new Date(b.createdAt).getTime() : 0);
+
+  if (!isCatalogFeedOrderSeedingEnabled()) {
+    return list.sort(byCreatedAtAsc);
+  }
+
+  return list.sort((a, b) => {
+    const fa = a.metadata?.feedIndex;
+    const fb = b.metadata?.feedIndex;
+    const ha = Number.isFinite(fa);
+    const hb = Number.isFinite(fb);
+    if (ha && hb) return fa - fb;
+    if (ha !== hb) return ha ? -1 : 1; // stamped entries sort before unstamped
+    return byCreatedAtAsc(a, b);
+  });
+}
+
 async function buildReferenceImages({
   media, product, catalogMedias = [], aspectRatio, caps = null,
   referenceCount = null, brand = null,
@@ -2103,14 +2152,23 @@ async function buildReferenceImages({
       seenUrls.add(media.fileUrl);
     }
 
-    // Catalog mirrors (hero-first / createdAt asc), skip seed id.
+    // Catalog mirrors, skip seed id.
     //
-    // Reordered by the configured shot-type PREFERENCE first
-    // (VIDEO_DEFAULT_REFERENCE_SHOT_TYPES). Unset by default, in which case this
-    // is a strict no-op and the array keeps pure feed order — the owner's
-    // "first, second, third as downloaded". A pure reorder, never a filter:
-    // shotType is absent until detect runs, so dropping on it would empty the
-    // stack for freshly ingested products.
+    // `catalogMedias` ARRIVES IN MERCHANT FEED ORDER — generateForAd runs it
+    // through sortCatalogMediasForReferenceStack (metadata.feedIndex asc,
+    // unstamped last), per the owner's 2026-08-05 directive that refs 1/2 be
+    // "the first and second other images in the feed, as they appear in the
+    // feed". That replaced the old `.sort({createdAt:1})`, whose own comment
+    // claimed createdAt ≈ hero-first — disproved on real Gymshark data where
+    // the hero materialised AFTER its alts.
+    //
+    // Reordered by the configured shot-type PREFERENCE on top of that
+    // (VIDEO_DEFAULT_REFERENCE_SHOT_TYPES). Unset by default, in which case
+    // this is a strict no-op and the array keeps pure feed order — so the two
+    // mechanisms COMPOSE: feed order is the base, shot-type preference is an
+    // opt-in reorder over it. A pure reorder, never a filter: shotType is
+    // absent until detect runs, so dropping on it would empty the stack for
+    // freshly ingested products.
     //
     // The SOURCE dial is deliberately NOT applied here. This branch is the AUTO
     // assembly, but `catalogMedias` is also where callers deliberately place
@@ -2959,12 +3017,12 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
       ? Media.find({
           source: 'catalog-product',
           'metadata.catalogProductId': ad.productId
-        }).select('_id fileUrl classification adSuitability metadata width height')
-          // Deterministic order for the reference stack: hero materializes
-          // before alts, so createdAt asc ≈ hero-first, alts in stored order.
-          // width/height feed the reframe already-correct skip guard.
-          .sort({ createdAt: 1 })
+        }).select('_id fileUrl classification adSuitability metadata width height createdAt')
+          // width/height feed the reframe already-correct skip guard. Order
+          // is applied below in JS — see sortCatalogMediasForReferenceStack —
+          // because it is conditional on CATALOG_FEED_ORDER_SEEDING.
           .lean()
+          .then(sortCatalogMediasForReferenceStack)
       : []
   ]);
   const categories = product ? await loadCategoryChainForProduct(product) : [];
@@ -3335,6 +3393,8 @@ module.exports = {
   cropImageUrlForAspect,
   buildVideoSegmentUrl,
   buildReferenceImages,
+  // Feed-order reference stack ordering — scripts/verifyCatalogFeedOrderSeeding.js.
+  sortCatalogMediasForReferenceStack,
   // Pure helpers for scripts/verifyPrimaryReferenceRepeat.js (offline).
   isRepeatPrimaryReferenceEnabled,
   appendPrimaryReferenceRepeat,

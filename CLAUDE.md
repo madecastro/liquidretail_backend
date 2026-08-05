@@ -679,6 +679,26 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   menu narrows to `static_single` only
   (`aiCreativeDirectorService.js:feedOutputShapesForUniverse` `:1050-1055`) so
   the model cannot emit a collage declaring one tile.
+- **SUPERSEDED 2026-08-05 — THE DEFAULT SEED IS NOW THE MERCHANT FEED'S
+  PRIMARY IMAGE, resolved `CatalogProduct.imageMediaId` → `metadata.feedIndex
+  === 0` → (static only) best shotType rank.** Owner directive: *"the primary
+  image as defined by the merchant feed is the main image ... The Hero stamp
+  is not relevant when selecting images for video or static catalog
+  generations."* `feedIndex` is stamped at ingest (0 = `product.imageUrl`,
+  1..N = `additionalImages` in feed order). Video reference refs 1/2 are now
+  `feedIndex` 1/2 (`atlasVideoService.sortCatalogMediasForReferenceStack`,
+  which composes UNDER the existing `VIDEO_DEFAULT_REFERENCE_SHOT_TYPES`
+  preference — feed order is the base, that dial is an opt-in reorder over
+  it), and the video subject-dominance guard is gone on that path. Kill
+  switch `CATALOG_FEED_ORDER_SEEDING` (default true) reverts all of it.
+  **The pointer is checked BEFORE the stamp on purpose:** nothing clears
+  `feedIndex` when a merchant replaces their primary image, so a stamp-first
+  cascade would seed a billable render from a retired photo. Scope is the two
+  live default paths only — `adRegenerateService` and `seedsFromProduct` are
+  unchanged. Pinned by `scripts/verifyCatalogFeedOrderSeeding.js`; full
+  write-up in `session.md` (2026-08-05). **The paragraph below is the
+  SUPERSEDED 2026-08-03/08-04 rule, kept because the kill-switch-off path
+  still runs exactly it.**
 - **`TOP_N=1` IS NOT THE DEFAULT-IMAGE-SEED RULE — `preferFirstCatalogImage`
   is, and the rule is "the FIRST IMAGE THAT CAME FROM THE CATALOG", not the
   `imageRole:'hero'` label.** This file, `config/defaults.env`,
