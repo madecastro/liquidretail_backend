@@ -53,6 +53,7 @@ const { aspectRatioForPlatformFormat } = require('./veoPromptBuilder');
 const { rankByShotType }              = require('./shotTypeRank');
 const {
   REASON: PER_PRODUCT_REASON,
+  WARNING: PER_PRODUCT_WARNING,
   normalizePerProductList,
   summarizeEmptyExpansion
 } = require('./perProductReasons');
@@ -1870,6 +1871,24 @@ function isCatalogFeedOrderSeedingEnabled() {
   return !/^(0|false|no|off)$/i.test(String(raw).trim());
 }
 
+// KILL SWITCH: VIDEO_OPERATOR_STACK_ONLY, DEFAULT ON. Owner directive
+// 2026-08-05: when the operator picks non-catalog images for deterministic
+// video, do NOT silently append a catalog anchor they never chose — signal
+// them instead and generate from their selection only. OFF restores the
+// pre-change append behaviour byte-for-byte.
+// MONEY: computeDeterministicVideoDigest hashes referenceMediaIds
+// (order-significant). Dropping the append CHANGES the digest for stacks
+// that previously got one — a re-Generate with the same non-catalog picks
+// will NOT collide with the old [...picks, anchor] ad; it mints a NEW ad
+// and can bill once more. Does NOT double-bill within a single expansion
+// (still one payload per product). Identical post-change stacks still
+// dedupe normally. Correct: a different stack IS a different creative.
+function isVideoOperatorStackOnlyEnabled() {
+  const raw = process.env.VIDEO_OPERATOR_STACK_ONLY;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
 /**
  * The product's first catalog image in feed order.
  *
@@ -2254,6 +2273,9 @@ async function expandDeterministicVideo({
 
     let mediaId = null;
     let referenceMediaIds = [];
+    // Non-skip advisory for the success perProduct row (WARNING enum). Never
+    // a skip reason — the product still queues.
+    let productWarning = null;
     const picks = picksByProduct.get(pidStr) || [];
 
     if (picks.length) {
@@ -2269,10 +2291,25 @@ async function expandDeterministicVideo({
       // pick was silently dropped and the ad fell back to hero+alts. Paying ~$1
       // for a weaker stack than we had before is not a fix.
       //
-      // So: an operator picking a lifestyle shot means "make this the PRIMARY
-      // seed", not "discard the product imagery". If none of the picks is a
-      // catalog mirror for this product, append the catalog hero after them —
-      // position 0 stays theirs, and the model still gets a product anchor.
+      // Pre-2026-08-05 behaviour (VIDEO_OPERATOR_STACK_ONLY off): if none of
+      // the picks is a catalog mirror for this product, append the catalog
+      // hero after them — position 0 stays theirs, model still gets a product
+      // anchor. Owner 2026-08-05, verbatim: "let's also address the extra
+      // image being appended, if it doesn't have a catalog image just signal
+      // the user there is no catalog image and if they choose to override
+      // that is at their discretion." Flag ON (default): NEVER append;
+      // referenceMediaIds stays exactly picks.slice(). Still probe
+      // firstCatalogMediaForProduct — but ONLY to decide WHICH warning to
+      // emit, never to mutate the stack. Product STILL QUEUES.
+      //
+      // MONEY: computeDeterministicVideoDigest hashes referenceMediaIds
+      // (order-significant). Dropping the append CHANGES the digest for any
+      // stack that previously got one — a re-Generate with the same non-
+      // catalog picks will NOT collide with the old [...picks, anchor] ad;
+      // it mints a NEW ad and can bill once more. Does NOT double-bill
+      // within a single expansion (still one payload per product). Identical
+      // post-change stacks still dedupe normally. Correct: different stack
+      // IS a different creative — do not try to "fix" the digest shift.
       const hasCatalogAnchor = picks.some(id => {
         const doc = seedById.get(String(id));
         const direct = doc?.metadata?.catalogProductId;
@@ -2282,7 +2319,26 @@ async function expandDeterministicVideo({
         // Same feed-order rule as the default seed — the anchor is the product's
         // first catalog image, not whatever carries the 'hero' stamp.
         const anchor = await firstCatalogMediaForProduct(productOid);
-        if (anchor?._id && !referenceMediaIds.some(x => String(x) === String(anchor._id))) {
+        if (isVideoOperatorStackOnlyEnabled()) {
+          // Flag ON: stack stays exactly the operator's picks. Probe was only
+          // for the warning code. Do not skip the product.
+          if (anchor?._id) {
+            productWarning = PER_PRODUCT_WARNING.NO_CATALOG_IN_PICKS;
+            console.log(
+              `📦 expandDeterministicVideo[${pidStr}]: picks are all non-catalog — ` +
+              `catalog image ${anchor._id} exists but was NOT appended ` +
+              `(VIDEO_OPERATOR_STACK_ONLY); stack stays ${picks.length} operator pick(s)`
+            );
+          } else {
+            productWarning = PER_PRODUCT_WARNING.NO_CATALOG_IMAGE;
+            console.warn(
+              `📦 expandDeterministicVideo[${pidStr}]: picks are all non-catalog and no ` +
+              `catalog Media exists — stack NOT modified; shipping operator picks only ` +
+              `(VIDEO_OPERATOR_STACK_ONLY)`
+            );
+          }
+        } else if (anchor?._id && !referenceMediaIds.some(x => String(x) === String(anchor._id))) {
+          // Flag OFF: byte-identical pre-change append behaviour.
           referenceMediaIds.push(anchor._id);
           console.log(
             `📦 expandDeterministicVideo[${pidStr}]: picks are all non-catalog — appended ` +
@@ -2396,12 +2452,16 @@ async function expandDeterministicVideo({
       queuedAt:    new Date(),
       generatedAt: new Date()
     });
-    perProduct.push({
+    const successRow = {
       productId: pidStr,
       mediaId: String(mediaId),
       referenceMediaIds: referenceMediaIds.map(String),
       payloads: 1
-    });
+    };
+    // Advisory only — product queued. Do NOT stamp as `reason` (that would
+    // mark skipped:true and overwrite the "Queued N creative(s)." message).
+    if (productWarning) successRow.warning = productWarning;
+    perProduct.push(successRow);
   }
 
   // Normalise before return so routes/CampaignRun never see raw payload
@@ -3015,5 +3075,6 @@ module.exports = {
   // Media model — see that harness for how it stubs Media.findOne).
   firstCatalogMediaForProduct,
   isCatalogFeedOrderSeedingEnabled,
+  isVideoOperatorStackOnlyEnabled,
   isVideoSeedFeedOrderEnabled
 };

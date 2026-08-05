@@ -3114,11 +3114,42 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   });
   if (!imageUrls.length) throw new Error(`atlasVideo[ad=${ad._id}]: no reference images available`);
 
-  const hasProductAnchor = imageUrls.length >= 2;
+  // Does the stack actually contain CATALOG imagery for this product, beyond
+  // just having more than one image?
+  //
+  // WHY THIS IS NOT `imageUrls.length >= 2` ANY MORE (2026-08-05). That count
+  // was a safe proxy only because the operator-pick path GUARANTEED a catalog
+  // image: when none of the picks was a catalog mirror, expandDeterministicVideo
+  // appended one. VIDEO_OPERATOR_STACK_ONLY removed that append at owner
+  // instruction, so an operator can now ship three lifestyle/UGC picks and the
+  // count proxy would still say "product anchor present".
+  //
+  // That matters because hasProductReference gates a prompt sentence asserting
+  // "All supplied images show the exact catalog SKU — the rest are additional
+  // views of the same product" (veoPromptBuilder). On an all-UGC stack that is
+  // simply FALSE, and it is asserted to the model as the source of truth for
+  // shape, colour and label on a billable render. The honest branch (seed-only
+  // fidelity wording) is the correct one there.
+  //
+  // Auto-assembly is unaffected: refs 1..n are catalog mirrors by construction,
+  // so this still resolves true exactly as the count did.
+  const productOidStr = ad.productId ? String(ad.productId) : null;
+  const isCatalogRefFor = (doc) => {
+    const direct = doc?.metadata?.catalogProductId;
+    return productOidStr != null && direct != null && String(direct) === productOidStr;
+  };
+  const stackHasCatalogRef = Array.isArray(orderedReferenceMedia) && orderedReferenceMedia.length
+    // Operator-ordered stack: only what they actually picked is in it.
+    ? orderedReferenceMedia.some(isCatalogRefFor)
+    // Auto assembly: seed + this product's catalog mirrors.
+    : true;
+  const hasProductAnchor = imageUrls.length >= 2 && stackHasCatalogRef;
   if (!hasProductAnchor) {
     console.warn(
       `⚠️  atlasVideo[ad=${ad._id}]: no product reference beyond the seed ` +
-      `(product imageUrl/additionalImages missing, or model caps at 1 ref) — shipping with seed only`
+      `(refs=${imageUrls.length}, catalogRefInStack=${stackHasCatalogRef}; ` +
+      `product imageUrl/additionalImages missing, model caps at 1 ref, or an ` +
+      `operator stack with no catalog image) — shipping seed-only fidelity wording`
     );
   }
   console.log(
