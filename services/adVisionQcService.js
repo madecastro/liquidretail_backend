@@ -36,11 +36,28 @@ const CATEGORIES = Object.freeze([
 const PASS_FLOOR = 7;
 
 // Role name in atlasModelMap. Env ATLAS_MODEL_AD_VISION_QC can re-point.
-// CHOSEN: gemini-2.5-flash — already used for vision identify/match work in
-// this repo (geminiIdentifyService, visualCatalogMatchService), listed in
-// MAP with atlas slug google/gemini-2.5-flash, cheap enough for every static
-// ad. NOT inventing a catalog id. ROUTING MUST BE CONFIRMED LIVE before
-// merge (catalog listing ≠ routable — see gpt-5-nano trap in atlasModelMap).
+//
+// RESOLVES TO google/gemini-2.5-pro (atlasModelMap.js, 'ad-vision-qc').
+// This comment previously claimed "CHOSEN: gemini-2.5-flash", which was WRONG
+// and was the exact doc-drift class this repo keeps getting bitten by: the map
+// has routed this role to PRO, not flash, and CLAUDE.md records why — flash
+// broke the JSON contract on this very task, and a malformed verdict is
+// consumed as a failed one, so it either ships a bad ad or burns the single
+// billable regeneration. Do not "restore" flash on the strength of its price.
+//
+// ROUTABILITY: CONFIRMED LIVE 2026-08-05 against Atlas
+// (POST /v1/chat/completions, google/gemini-2.5-pro → HTTP 200, valid JSON,
+// finish_reason 'stop'). This check is not optional and not satisfied by the
+// catalog listing — see the gpt-5-nano trap in atlasModelMap, where a listed
+// model returned HTTP 400 "router not found". Re-probe if the role is repointed.
+//
+// COST, from the live catalog 2026-08-05 (per 1M tokens): pro in $1.25 / out
+// $10. A check is ~2 images + prompt, so roughly $0.01-0.03 including reasoning
+// tokens — noise against the ~$0.0717 gpt-image-2/edit render it protects.
+// Cheaper gemini tiers exist (3-flash-preview, 3.1-flash-lite) but they are
+// flash-class; note google/gemini-3.5-flash is actually MORE expensive on input
+// than 2.5-pro ($1.50), so it is not even a cost argument. There is no
+// gemini-3.5-pro in the catalog.
 const QC_MODEL_ROLE = 'ad-vision-qc';
 
 function isEnabled() {
@@ -278,7 +295,31 @@ async function judgeRender({
       model,
       messages: [{ role: 'user', content: userContent }],
       temperature: 0.0,
-      max_tokens: 1500,
+      // MONEY — this ceiling must cover REASONING tokens, not just the verdict.
+      // gemini-2.5-pro is a thinking model: probed live 2026-08-05 against Atlas,
+      // a trivial "reply {\"ok\":true}" prompt spent thoughtsTokenCount=147 to
+      // emit 5 content tokens, and the SAME call with max_tokens=20 returned
+      // HTTP 200 with EMPTY content. A real 2-image QC prompt reasons harder.
+      // Empty content is not a soft failure here: it falls through to the
+      // `if (!text)` branch below, which parses to zero-score categories and
+      // therefore FAILS closed — burning the single allowed billable
+      // gpt-image-2/edit regeneration on an infrastructure hiccup rather than a
+      // real defect. Raised 1500 -> 5000 for generous headroom; this is FREE,
+      // because max_tokens is a CEILING and billing is per token actually
+      // GENERATED — an unused ceiling costs nothing. Owner call 2026-08-05:
+      // "even 5k tokens is nothing", i.e. deliberately over-provisioned so a
+      // hard-thinking verdict can never be truncated into a false failure.
+      // Do not lower it without re-probing thoughtsTokenCount on real renders.
+      //
+      // Reasoning is likewise left at the model default ON PURPOSE. Probed
+      // 2026-08-05: reasoning_effort barely moves it (216 -> 180 tokens at
+      // 'minimal'; 'none' gave 191, i.e. no reliable effect) and
+      // thinking_budget:0 is rejected HTTP 400 — 2.5-pro cannot stop thinking.
+      // Even if it could, suppressing reasoning to save ~$0.0004 would trade
+      // away accuracy on a fine-grained visual-discrimination task where a
+      // false FAIL costs a ~$0.0717 regeneration and a false PASS ships the
+      // exact defect this feature exists to catch.
+      max_tokens: 5000,
       // json_object: safe across OpenAI + Gemini Atlas routes. Strict
       // json_schema 400s on Anthropic; validate in parseVerdict.
       response_format: { type: 'json_object' }
@@ -317,6 +358,26 @@ function buildPersistedVerdict({ passed, attempts, finalAttempt, skipped = false
       imageGeneration: a.imageGeneration || null
     }))
   };
+}
+
+/**
+ * Verdict for an ad that SHIPPED WITHOUT being inspected.
+ *
+ * Distinct from `disabled` (the flag was off, so nobody expected QC) and from
+ * a failed verdict (inspected, judged bad). This is "QC was supposed to run and
+ * could not" — the state an operator must be able to tell apart from a pass,
+ * because with the flag on, an absent Ad.visionQc field otherwise reads as
+ * "fine". Every consumer that asks "was this inspected?" should check
+ * `skipped === true`, not merely that visionQc exists.
+ */
+function buildSkippedVerdict(reason) {
+  return buildPersistedVerdict({
+    skipped: true,
+    passed: false,
+    finalAttempt: null,
+    attempts: [],
+    reason: String(reason || 'unknown')
+  });
 }
 
 /**
@@ -520,20 +581,69 @@ async function runPostRenderQc({
  * shape either way. Slack's own size limit (buildMessage) does the final
  * clip; this only bounds a single call from producing a pathological detail
  * block (e.g. thousands of findings).
+ *
+ * Rendered as PLAIN TEXT, not JSON. The model already answers in plain
+ * language ("invented a tree emblem on the midfoot panel") — the prompt asks
+ * for per-category `findings` strings — and a raw JSON.stringify buried that
+ * prose in braces and quotes. An operator triaging a failed ad in Slack wants
+ * to read WHY it failed, not parse it. Every value the JSON form carried is
+ * still here: per-category score, pass/fail, every finding, and each attempt's
+ * kept/discarded render URL.
  */
+function renderCategoryBlock(categories) {
+  const lines = [];
+  for (const key of CATEGORIES) {
+    const c = (categories || {})[key];
+    if (!c) continue;
+    const mark = c.pass ? 'ok  ' : 'FAIL';
+    lines.push(`  ${mark} ${key.padEnd(17)} ${String(c.score ?? '?').padStart(2)}/10`);
+    // findings is normalised to an array by parseVerdict, but this also renders
+    // verdicts read back from Ad.visionQc — a Mixed field, so an older or
+    // hand-edited doc can carry a bare string or a number. Iterating that
+    // directly threw ("number 42 is not iterable") and, because both alert
+    // helpers wrap this in try/catch, the failure mode was a SILENTLY DROPPED
+    // Slack message on exactly the ad someone needed to see.
+    const raw = c.findings;
+    const findings = Array.isArray(raw) ? raw : (raw == null || raw === '' ? [] : [raw]);
+    for (const f of findings) lines.push(`         - ${String(f)}`);
+  }
+  return lines;
+}
+
 function buildQcSlackDetail(visionQc) {
-  return JSON.stringify({
-    passed: !!visionQc?.passed,
-    finalAttempt: visionQc?.finalAttempt ?? null,
-    attempts: (visionQc?.attempts || []).map((a) => ({
-      attempt: a.attempt,
-      pass: a.pass,
-      summary: a.summary,
-      renderUrl: a.renderUrl,
-      discarded: a.discarded,
-      categories: a.categories
-    }))
-  }, null, 2).slice(0, 2500);
+  const attempts = visionQc?.attempts || [];
+  const last = attempts[attempts.length - 1];
+  const out = [];
+
+  out.push(visionQc?.passed ? 'VERDICT: PASS' : 'VERDICT: FAIL');
+  if (last?.summary) out.push(String(last.summary));
+  out.push('');
+
+  // Decisive attempt first — the scores that actually determined the outcome.
+  if (last?.categories) {
+    out.push(`final attempt ${last.attempt ?? '?'} of ${attempts.length}:`);
+    out.push(...renderCategoryBlock(last.categories));
+  }
+
+  // Then the trail, so a regeneration's before/after is visible.
+  if (attempts.length > 1) {
+    out.push('');
+    out.push('attempts:');
+    for (const a of attempts) {
+      out.push(
+        `  ${a.attempt}  ${a.pass ? 'PASS' : 'FAIL'}  ` +
+        `${a.discarded ? 'discarded' : 'kept     '}  ${a.renderUrl || '-'}`
+      );
+      if (!a.pass && a !== last) {
+        for (const line of renderCategoryBlock(a.categories)) out.push(`  ${line}`);
+      }
+    }
+  } else if (last?.renderUrl) {
+    out.push('');
+    out.push(`render: ${last.renderUrl}`);
+  }
+
+  return out.join('\n').slice(0, 2500);
 }
 
 /**

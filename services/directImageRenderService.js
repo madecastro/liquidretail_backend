@@ -1301,8 +1301,32 @@ async function renderDirectImage({
   // a real brand mark (owner requirement: both images in one vision call).
   const originalProductUrl = imageMeta[0]?.sourceUrl || null;
   if (!originalProductUrl) {
-    console.warn('   ⚠️  direct-image: vision QC enabled but no original product URL — shipping without QC');
-    return firstOutput;
+    // SHIPS WITHOUT QC — but never silently. With the flag ON, an operator is
+    // entitled to assume every delivered static ad was inspected; a bare
+    // console.warn on a worker nobody is tailing does not earn that assumption
+    // (same reasoning as the generation-size renderIssue above). So: stamp the
+    // ad, raise it, and make the gap visible in the inspector.
+    //
+    // Deliberately NOT a hard failure: the render is already PAID FOR, and
+    // throwing here would discard billed pixels over a missing reference URL —
+    // strictly worse than shipping an uninspected ad and saying so loudly.
+    const msg = 'vision QC enabled but no original product URL — shipped WITHOUT QC';
+    console.warn(`   ⚠️  direct-image: ${msg}`);
+    noteRenderIssue(adId, { message: msg, stage: 'vision-qc' });
+    adVisionQc.alertQcSkipped({
+      adId,
+      brandId: resolvedBrand?._id || brandId,
+      productId: resolvedProduct?._id || productId,
+      brandName: resolvedBrand?.name,
+      reason: 'no original product URL on the reference stack'
+    });
+    return {
+      ...firstOutput,
+      // Truthful stamp: QC did not run. Anything reading Ad.visionQc can now
+      // distinguish "inspected and passed" from "never inspected", which a
+      // bare absent field could not.
+      visionQc: adVisionQc.buildSkippedVerdict('no original product URL')
+    };
   }
 
   const safeBox = safeBoxInDeliveredPx(built.surface, dims);

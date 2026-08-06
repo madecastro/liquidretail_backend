@@ -1,4 +1,24 @@
 #!/bin/bash
+# ============================================================================
+# DEVELOPER TOOLING — NOT PART OF THE REACH SOCIAL PRODUCT.
+#
+# This file exists ONLY to set up Claude Code sessions that work on this repo.
+# It is not application code, it is not imported by anything the product runs,
+# and it never executes in production:
+#
+#   * NOT on Render (web or worker). Render runs `npm install` + the
+#     package.json "postinstall" from its own build pipeline and never reads
+#     .claude/. Deleting this entire .claude/ directory would change nothing
+#     about how the product builds, deploys, or behaves.
+#   * NOT in the API, the worker, the render queue, or any billable path.
+#   * NOT on a developer's local machine either — the CLAUDE_CODE_REMOTE guard
+#     below makes it a no-op unless the session is a Claude Code web session.
+#
+# If you are auditing what the product does, skip this file. If you are
+# removing Claude tooling from the repo, this file and .claude/settings.json
+# go together and nothing else depends on them.
+# ============================================================================
+#
 # SessionStart hook for Claude Code on the web.
 #
 # Repo trap this closes (CLAUDE.md §4): node_modules is gitignored but a
