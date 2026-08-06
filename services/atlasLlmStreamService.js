@@ -31,6 +31,11 @@ const { resolveModel } = require('./atlasModelMap');
 const ATLAS_CHAT_URL = (process.env.ATLAS_TEXT_BASE_URL || 'https://api.atlascloud.ai/v1') + '/chat/completions';
 const TIMEOUT_MS = Number(process.env.ATLAS_LLM_STREAM_TIMEOUT_MS || 120_000);
 const REASONING_RESERVE_TOKENS = Number(process.env.ATLAS_REASONING_RESERVE_TOKENS || 768);
+// Keep in lockstep with atlasLlmService.ATLAS_MAX_OUTPUT_TOKENS (shared raise
+// 16384 → 30000 so DIRECTOR_ROUND_TOKENS=30000 is not silently cut). Stream
+// path currently tops out far below this (agent ~2048); the constant exists
+// so the two transports cannot drift on the ceiling alone.
+const ATLAS_MAX_OUTPUT_TOKENS = 30_000;
 
 function isConfigured() {
   return !!process.env.ATLAS_API_KEY;
@@ -46,7 +51,8 @@ function buildStreamBody(params, atlasId) {
     body.reasoning_effort = 'low';
   }
   if (body.max_tokens != null) {
-    body.max_tokens = Math.min(16_384, body.max_tokens) + REASONING_RESERVE_TOKENS;
+    // Clamp then ALWAYS add full reserve — see atlasLlmService.buildAtlasBody.
+    body.max_tokens = Math.min(ATLAS_MAX_OUTPUT_TOKENS, body.max_tokens) + REASONING_RESERVE_TOKENS;
   }
   return body;
 }

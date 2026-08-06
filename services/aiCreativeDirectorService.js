@@ -1236,10 +1236,19 @@ const DIRECTOR_ROUND_MODEL   = 'director'; // claude-sonnet-5 — see atlasModel
 // prompt text only, so a lower temperature could in principle make later rounds
 // stickier. Watch round-over-round variety after this lands.
 const DIRECTOR_ROUND_TEMP    = 0.45;
-// Raised from 4000. Sonnet spent 2,683 output tokens on three concepts in the
-// bake-off, so 4000 left almost no headroom and a truncated response is an
-// unparseable one. At $10/M output the extra ceiling costs nothing unless used.
-const DIRECTOR_ROUND_TOKENS  = 8000;
+// Raised 4000 -> 8000 -> 30000 (2026-08-06, owner directive). Measured live
+// 2026-08-06 (6 real round calls, sequential + concurrent): actual usage was
+// 756-904 output tokens — nowhere near even the old 8000 ceiling. This raise
+// is headroom for an unmeasured worst case (a product/brief complex enough to
+// need a long response), not a fix for anything observed: a controlled
+// sequential-vs-concurrent timing test on this same call shape found NO
+// token-limit or truncation involvement in that day's slow/timed-out calls
+// (see session.md 2026-08-06) — this is orthogonal insurance, not a fix.
+// Ceiling verified live against Atlas (POST /v1/chat/completions,
+// anthropic/claude-sonnet-5, max_tokens up to 100000 all returned HTTP 200) —
+// a catalog listing was not trusted; the catalog's own schema URL for this
+// model 404s. Free unless used: billing is per token actually generated.
+const DIRECTOR_ROUND_TOKENS  = 30000;
 const AVOID_LIST_MAX_ROUNDS  = parseInt(process.env.DIRECTOR_AVOID_LIST_ROUNDS || '6', 10);
 const VISION_ATTACHMENT_CAP  = 6;         // first N universe entries get attached as image_url parts
 
@@ -1299,6 +1308,228 @@ const STORYBOARD_EMPHASIS = Object.freeze(['subtle', 'normal', 'bold']);
 const REELS_DURATION_MIN_SEC = 5;
 const REELS_DURATION_MAX_SEC = 8;
 
+// ── Round-artifact insert race (MONEY) ────────────────────────────────
+// Observed live 2026-08-06: three concurrent directConceptsRound calls for
+// the same (brand, product, …) key both paid Claude for concepts, then two
+// lost on CreativeDirectionArtifact.create with E11000 on the 6-field unique
+// index (roundIndex collision). The paid response was thrown away.
+//
+// Fix: after the billable call, retry the INSERT ONLY — never re-call the
+// LLM. Two retryable classes:
+//   (1) roundIndex E11000 → re-derive next free index, re-create
+//   (2) transient Mongo/network insert faults → re-create at the same index
+// Permanent insert failures (validation/schema/auth) still surface promptly.
+//
+// Bound exists so a pathological hot key cannot spin forever. 25 attempts:
+// each retry is one cheap Mongo insert (+ optional re-read on E11000), while
+// the payload being protected is a paid Claude Sonnet 5 response. High
+// fan-in on one brand+product+kind+intent+format key is rare (generationGate
+// keys on productIds only and blocks overlapping product sets across
+// campaigns; platformFormat is part of the unique index so different
+// surfaces of one run cannot collide with each other). 25 is cheap insurance
+// for that residual case, not a claim that multi-racer fan-in is routine.
+const ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS = 25;
+
+/**
+ * True when `err` is a Mongo duplicate-key (E11000) on the roundIndex
+ * unique index. Detects by numeric/string code 11000, then scopes to THIS
+ * index via keyPattern / keyValue / cause — not a bare message substring
+ * for "is this a duplicate" (unrelated 11000s must still surface).
+ */
+function isRoundIndexDuplicateKeyError(err) {
+  if (!err) return false;
+  // Mongoose sometimes wraps the driver error on .cause
+  if (err.cause && err.cause !== err && isRoundIndexDuplicateKeyError(err.cause)) {
+    return true;
+  }
+  const code = err.code;
+  if (code !== 11000 && code !== '11000') return false;
+  if (err.keyPattern && typeof err.keyPattern === 'object') {
+    return Object.prototype.hasOwnProperty.call(err.keyPattern, 'roundIndex');
+  }
+  if (err.keyValue && typeof err.keyValue === 'object') {
+    return Object.prototype.hasOwnProperty.call(err.keyValue, 'roundIndex');
+  }
+  // Production envelope observed without structured keyPattern on some
+  // driver paths: index name + "dup key" both mention roundIndex.
+  if (typeof err.message === 'string' &&
+      /roundIndex/.test(err.message) &&
+      (err.name === 'MongoServerError' || /duplicate key/i.test(err.message))) {
+    return true;
+  }
+  // Bare 11000 with no index signal — do not retry (other unique indexes).
+  return false;
+}
+
+// Node/driver network codes that surface on socket death or pool blips.
+// Allowlist (not denylist): only these + named Mongo network classes +
+// retryable write labels count as "try the same insert again". Permanent
+// application errors (ValidationError, CastError, DocumentValidationFailure,
+// auth, unrelated 11000) must NOT match.
+const TRANSIENT_INSERT_NET_CODES = new Set([
+  'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ECONNREFUSED',
+  'EAI_AGAIN', 'EPIPE', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH'
+]);
+
+/**
+ * True when `err` is a TRANSIENT Mongo/network fault where a pure re-create
+ * of the same payload may succeed. Predicate is an allowlist so permanent
+ * failures (schema validation, cast, auth, DocumentTooLarge, …) surface
+ * on the first attempt rather than being retried pointlessly up to the bound.
+ *
+ * Matches:
+ *   - Node net codes (ECONNRESET / ETIMEDOUT / ECONNREFUSED / …)
+ *   - Driver names MongoNetworkError / MongoTimeoutError /
+ *     MongoServerSelectionError / MongoNetworkTimeoutError
+ *   - Mongo errorLabels TransientTransactionError / RetryableWriteError
+ *   - Write-concern / MaxTimeMS codes 50, 89, 91
+ * Does NOT match: ValidationError, CastError, 11000 (separate path),
+ * 121 DocumentValidationFailure, auth (13/18), bare application Errors.
+ */
+function isTransientInsertError(err) {
+  if (!err) return false;
+  if (err.cause && err.cause !== err && isTransientInsertError(err.cause)) {
+    return true;
+  }
+  const code = err.code;
+  if (typeof code === 'string' && TRANSIENT_INSERT_NET_CODES.has(code)) return true;
+  // Mongo numeric: MaxTimeMSExpired=50, NetworkTimeout=89, ShutdownInProgress=91
+  // (91 is rare mid-insert; still safe to re-try create once the primary is up)
+  if (code === 50 || code === 89 || code === 91) return true;
+
+  const name = err.name || '';
+  if (
+    name === 'MongoNetworkError' ||
+    name === 'MongoTimeoutError' ||
+    name === 'MongoServerSelectionError' ||
+    name === 'MongoNetworkTimeoutError'
+  ) {
+    return true;
+  }
+
+  if (Array.isArray(err.errorLabels)) {
+    if (
+      err.errorLabels.includes('TransientTransactionError') ||
+      err.errorLabels.includes('RetryableWriteError')
+    ) {
+      return true;
+    }
+  }
+  if (typeof err.hasErrorLabel === 'function') {
+    if (
+      err.hasErrorLabel('TransientTransactionError') ||
+      err.hasErrorLabel('RetryableWriteError')
+    ) {
+      return true;
+    }
+  }
+
+  // Driver/axios envelopes that only carry the code in the message.
+  if (typeof err.message === 'string') {
+    if (
+      /\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bECONNABORTED\b|\bEAI_AGAIN\b|\bEPIPE\b|\bsocket hang up\b/i
+        .test(err.message)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Highest V2 roundIndex for the filter, or null if none. Shared by the
+ * initial read-then-write pick and by insert-retry re-derivation.
+ */
+async function findLastRoundIndex(filter) {
+  const last = await CreativeDirectionArtifact.findOne({ ...filter, roundIndex: { $ne: null } })
+    .sort({ roundIndex: -1 })
+    .select('roundIndex')
+    .lean();
+  return (last?.roundIndex == null) ? null : last.roundIndex;
+}
+
+/**
+ * Append-only insert of a paid Director-round artifact. INSERT ONLY — no
+ * LLM re-call. Retryable paths (still bounded by ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS):
+ *   - roundIndex E11000 → re-derive next free index, re-create
+ *   - transient Mongo/network create fault → re-create at the same index
+ * Permanent create failures throw on first encounter.
+ *
+ * @param {object} opts
+ * @param {object} opts.filter   — brandId/productId/campaignKind/creativeIntent/platformFormat
+ * @param {number} opts.roundIndex — initial candidate (may collide)
+ * @param {object} opts.doc      — full create payload EXCEPT roundIndex (set here)
+ * @param {function} [opts.create] — injectable for harness (default Model.create)
+ * @param {function} [opts.findLast] — injectable for harness (default findLastRoundIndex)
+ * @returns {{ artifact: object, roundIndex: number, insertAttempts: number }}
+ */
+async function createRoundArtifactWithRetry({
+  filter,
+  roundIndex,
+  doc,
+  create = (payload) => CreativeDirectionArtifact.create(payload),
+  findLast = (f) => findLastRoundIndex(f)
+}) {
+  let idx = roundIndex;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS; attempt++) {
+    try {
+      const artifact = await create({ ...doc, ...filter, roundIndex: idx });
+      return { artifact, roundIndex: idx, insertAttempts: attempt };
+    } catch (err) {
+      lastErr = err;
+      const isDup = isRoundIndexDuplicateKeyError(err);
+      const isTransient = !isDup && isTransientInsertError(err);
+      // Permanent non-duplicate (validation/schema/auth/other-index 11000):
+      // surface promptly — retrying cannot fix those.
+      if (!isDup && !isTransient) throw err;
+      if (attempt >= ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS) throw err;
+
+      if (isDup) {
+        // Re-derive next free index. max(last+1, idx+1) guarantees progress
+        // even if the re-read is momentarily stale under contention.
+        //
+        // MONEY: the re-read must not cost the paid response. A transient
+        // Mongo read failure here would otherwise propagate out of this
+        // function and destroy the concepts we already paid Claude Sonnet 5
+        // for — reintroducing, on a rarer path, the exact bug this retry
+        // exists to fix. Fall back to a plain bump instead: idx+1 is always a
+        // legal next candidate (Math.max below already relies on that for
+        // forward progress), so a failed re-read costs at most one wasted
+        // insert attempt rather than the whole billable payload.
+        let rederived;
+        try {
+          const last = await findLast(filter);
+          rederived = (last == null) ? 0 : (last + 1);
+        } catch (readErr) {
+          rederived = idx + 1;
+          console.warn(
+            `🎭 directorRound: roundIndex re-read failed (${readErr.message}) — ` +
+            `falling back to r${rederived} rather than dropping a paid response`
+          );
+        }
+        const prev = idx;
+        idx = Math.max(rederived, idx + 1);
+        console.warn(
+          `🎭 directorRound: roundIndex E11000 collision on r${prev}; ` +
+          `re-derived r${idx}, insert-only retry ${attempt}/${ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS} ` +
+          `(paid concepts kept in-memory — no LLM re-call)`
+        );
+      } else {
+        // Transient create fault: same payload, same roundIndex — the insert
+        // never landed, so there is nothing to re-derive.
+        console.warn(
+          `🎭 directorRound: transient insert fault on r${idx} ` +
+          `(${err.code || err.name || err.message}); ` +
+          `insert-only retry ${attempt}/${ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS} ` +
+          `(paid concepts kept in-memory — no LLM re-call)`
+        );
+      }
+    }
+  }
+  throw lastErr || new Error('createRoundArtifactWithRetry: exhausted without result');
+}
+
 // Phase A entry point. Returns the persisted artifact + the parsed
 // concepts. Caller (expandWizardJob via A5) consumes concepts to write
 // Ad rows; the artifact's _id becomes conceptArtifactId on each Ad.
@@ -1335,6 +1566,12 @@ async function directConceptsRound({
   // Compute roundIndex from prior artifact rows for this cache key when
   // the caller didn't supply one. The V1 row (roundIndex=null) is
   // ignored — V2 rounds count from 0 independently.
+  //
+  // This is a read-then-write pick with NO lock — concurrent rounds for
+  // the same key can collide. That is fine for the PROMPT (avoid-list /
+  // round number context). The paid response is protected later by
+  // createRoundArtifactWithRetry (E11000 re-derive + transient insert
+  // retry, bounded) — residual risk documented at the persist call site.
   const filter = {
     brandId,
     productId:      productId,
@@ -1343,11 +1580,8 @@ async function directConceptsRound({
     platformFormat
   };
   if (roundIndex == null) {
-    const last = await CreativeDirectionArtifact.findOne({ ...filter, roundIndex: { $ne: null } })
-      .sort({ roundIndex: -1 })
-      .select('roundIndex')
-      .lean();
-    roundIndex = (last?.roundIndex == null) ? 0 : (last.roundIndex + 1);
+    const last = await findLastRoundIndex(filter);
+    roundIndex = (last == null) ? 0 : (last + 1);
   }
 
   // Build AVOID list from prior rounds (last AVOID_LIST_MAX_ROUNDS).
@@ -1572,37 +1806,57 @@ async function directConceptsRound({
     ? inputSummary.social_proof_signal.proof_options.length : 0;
   const warnings = validateConceptsRound(parsed.concepts || [], seededUniverse, proofOptionsCount);
 
+  // Append-only persistence. We do NOT use findOneAndReplace — every
+  // round writes a NEW artifact. Concurrent callers may share the same
+  // pre-call roundIndex; createRoundArtifactWithRetry re-derives on
+  // E11000 and retries transient insert faults (Mongo insert only —
+  // never re-calls the LLM).
+  //
+  // Guaranteed: as long as create succeeds within
+  // ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS, the already-paid concepts land
+  // under some free roundIndex (in-memory payload is not dropped on a
+  // retryable fault). Residual risk that can still lose the paid
+  // response: bound exhaustion under extreme same-key contention, or a
+  // permanent insert error (validation/schema/auth) — both throw after
+  // the billable call with no further salvage. Do not claim absolute
+  // "never discarded" — that overstates what a bounded retry can honour.
+  //
+  // The prompt's "round N" text is intentionally NOT re-run to match a
+  // re-derived index — the concepts remain valid (see loadAvoidList:
+  // avoid list is prior rounds only and does not depend on this insert's
+  // final index).
+  const { artifact, roundIndex: persistedRoundIndex } = await createRoundArtifactWithRetry({
+    filter,
+    roundIndex,
+    doc: {
+      contractVersion:    '3.0',
+      contractSchemaId:   'creative_direction_round.v3',
+      signalsVersion:     DIRECTOR_SIGNALS_VERSION,
+      seedUniverseHash,
+      inputSummary,
+      availableArchetypes:     [...AVAILABLE_ARCHETYPES],
+      availableComponentRoles: [...ROLES],
+      creativeRules:           { ...CREATIVE_RULES },
+      concepts:                parsed.concepts || [],
+      provider:    'atlas',   // the director role routes to Anthropic via Atlas now
+      modelId:     DIRECTOR_ROUND_MODEL,
+      promptHash,
+      promptSystem: system,
+      promptUser:   user,
+      rawResponse:  raw,
+      validationWarnings: warnings,
+      createdAt:    new Date()
+    }
+  });
+  // Final persisted index — return value, log, and artifact must agree.
+  roundIndex = persistedRoundIndex;
+
   console.log(
     `🎭 directorRound[r${roundIndex}/${platformFormat}]: ` +
     `brand=${brandId} product=${productId || '-'} kind=${campaignKind || '-'} ` +
     `universe=${seededUniverse.length} concepts=${(parsed.concepts || []).length} ` +
     `took=${elapsedMs}ms warnings=${warnings.length}`
   );
-
-  // Append-only persistence. We do NOT use findOneAndReplace — every
-  // round writes a NEW artifact. A5 will deploy the index migration so
-  // append-only inserts don't collide with the legacy unique constraint.
-  const artifact = await CreativeDirectionArtifact.create({
-    ...filter,
-    contractVersion:    '3.0',
-    contractSchemaId:   'creative_direction_round.v3',
-    signalsVersion:     DIRECTOR_SIGNALS_VERSION,
-    roundIndex,
-    seedUniverseHash,
-    inputSummary,
-    availableArchetypes:     [...AVAILABLE_ARCHETYPES],
-    availableComponentRoles: [...ROLES],
-    creativeRules:           { ...CREATIVE_RULES },
-    concepts:                parsed.concepts || [],
-    provider:    'atlas',   // the director role routes to Anthropic via Atlas now
-    modelId:     DIRECTOR_ROUND_MODEL,
-    promptHash,
-    promptSystem: system,
-    promptUser:   user,
-    rawResponse:  raw,
-    validationWarnings: warnings,
-    createdAt:    new Date()
-  });
 
   return {
     artifact:  artifact.toObject ? artifact.toObject() : artifact,
@@ -2304,6 +2558,7 @@ module.exports = {
   MODEL_ID,
   ROUND_VERSION,
   N_CONCEPTS_ROUND,
+  DIRECTOR_ROUND_TOKENS,
   // exposed for testing
   buildPromptRound,
   buildResponseSchemaRound,
@@ -2313,5 +2568,11 @@ module.exports = {
   buildDirectorProofOptions,
   directorProofMenuEnabled,
   safeParseDirectorJSON,
-  extractFirstBalancedObject
+  extractFirstBalancedObject,
+  // money: roundIndex insert-race helpers (verifyDirectorRoundPersist)
+  ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS,
+  isRoundIndexDuplicateKeyError,
+  isTransientInsertError,
+  createRoundArtifactWithRetry,
+  findLastRoundIndex
 };

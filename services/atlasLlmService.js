@@ -46,6 +46,22 @@ const TIMEOUT_MS = Number(process.env.ATLAS_LLM_TIMEOUT_MS || 120_000);
 // Hidden-reasoning headroom added to caller max_tokens on Atlas requests.
 const REASONING_RESERVE_TOKENS = Number(process.env.ATLAS_REASONING_RESERVE_TOKENS || 768);
 
+// Shared output-token ceiling applied to every Atlas chat body.
+//
+// Raised 16384 → 30000 (2026-08-06). SHARED raise (not per-model) because:
+//   1. Math.min(ceiling, requested) leaves every lower caller budget
+//      byte-identical — only a request > ceiling is affected.
+//   2. Highest intentional caller today is DIRECTOR_ROUND_TOKENS=30000
+//      (aiCreativeDirectorService). No other role requests > 16384
+//      (canvas HTML gen tops out at 12000; everything else is lower).
+//   3. Live probe 2026-08-06: anthropic/claude-sonnet-5 accepted
+//      max_tokens up to 100000 via Atlas (HTTP 200); catalog schema URL
+//      404s so the catalog is not the source of truth here.
+// A future caller that requests >> 30000 against a model with a lower
+// real ceiling would still need its own gate — this clamp is a safety
+// rail, not a per-model capability map.
+const ATLAS_MAX_OUTPUT_TOKENS = 30_000;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function isConfigured() {
@@ -82,7 +98,7 @@ function buildAtlasBody(params, atlasId) {
     // Clamp the caller's budget, then ALWAYS add the full reserve on top —
     // a combined clamp could silently swallow the reserve at high caller
     // budgets and reintroduce the mid-JSON truncation it exists to prevent.
-    body.max_tokens = Math.min(16_384, body.max_tokens) + REASONING_RESERVE_TOKENS;
+    body.max_tokens = Math.min(ATLAS_MAX_OUTPUT_TOKENS, body.max_tokens) + REASONING_RESERVE_TOKENS;
   }
   return body;
 }
@@ -159,4 +175,12 @@ async function chatCompletion(meta, params) {
   );
 }
 
-module.exports = { chatCompletion, isConfigured, resolveModel };
+module.exports = {
+  chatCompletion,
+  isConfigured,
+  resolveModel,
+  // exposed for verify harnesses (token ceiling + reserve)
+  buildAtlasBody,
+  REASONING_RESERVE_TOKENS,
+  ATLAS_MAX_OUTPUT_TOKENS
+};
