@@ -439,8 +439,15 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
         errorMessage: apiMsg || null
       }).catch?.(() => {});
 
+      // LEAD WITH THE OPERATOR-FACING LABEL, not the internal policy name. This
+      // string lands on Ad.renderError.message and is what a human reads when an
+      // ad fails — "Model Moderation Error: Input Prompt violates policy" tells
+      // them their prompt was rejected; "Atlas image moderationBlocked (HTTP 200,
+      // code 500…)" reads like an infrastructure fault they should retry.
+      // atlasVideoService already leads with the label; images did not.
+      const heading = policy.label || `Atlas image ${policy.name}`;
       const err = new Error(
-        `Atlas image ${policy.name} (HTTP ${poll.status}, code ${apiCode ?? 'n/a'}, status ${st}): ` +
+        `${heading} (HTTP ${poll.status}, code ${apiCode ?? 'n/a'}, status ${st}): ` +
         `${apiMsg || JSON.stringify(poll.data?.data || poll.data).slice(0, 200)} [prediction ${id}] — ${policy.why}`
       );
       err.charged     = policy.charged;

@@ -108,6 +108,42 @@ check('E4 a dryRun stops before any write — so recovery can be rehearsed again
   /if \(dryRun\)/.test(recSrc)
   && recSrc.indexOf('if (dryRun)') < recSrc.indexOf('uploadBufferToCloudinary('));
 
+// ── F. THE OPERATOR IS TOLD WHY ──────────────────────────────────────────
+// A failure the operator cannot diagnose is barely better than a silent one. The
+// two ads that triggered this work read "Atlas image unknown (HTTP 502 …
+// Cloudflare …)" while the truth, sitting in the settled prediction, was
+// "Input Prompt violates policy" — deterministic, and no retry can fix it.
+// Leaving a known-wrong diagnosis in place sends someone chasing an outage that
+// never happened.
+const imgSrc2 = fs.readFileSync(path.join(ROOT, 'services/atlasImageService.js'), 'utf8');
+const feedSrc = fs.readFileSync(path.join(ROOT, 'services/runFeedService.js'), 'utf8');
+
+check('F1 the render failure message LEADS with the operator-facing label, not the '
+    + 'internal policy name — "Model Moderation Error: …" not "moderationBlocked (HTTP…)"',
+  /const heading = policy\.label \|\| `Atlas image \$\{policy\.name\}`/.test(imgSrc2));
+check('F2 settle CORRECTS a stale reason once the real one is known',
+  /'renderError\.message'\]\s*=|set\['renderError\.message'\]/.test(recSrc));
+check('F3 the correction PRESERVES the original — a correction must not destroy '
+    + 'what was previously recorded',
+  /was recorded as:/.test(recSrc));
+check('F4 it only overwrites when the peek actually named a cause',
+  /if \(peek\.message && ad\.renderError\?\.message/.test(recSrc));
+check('F5 [SLACK] the run summary reports WHY, not just how many — this is the gap '
+    + 'that made "10✓ / 2✗" unactionable',
+  /summariseFailures/.test(feedSrc) && /finishReasons/.test(feedSrc));
+check('F6 [SLACK] the reason lookup is DETACHED, never awaited — runFeed must never '
+    + 'sit on a render path, and a reporting query must not degrade a run',
+  (() => {
+    const i = feedSrc.indexOf('summariseFailures(rid)');
+    if (i === -1) return false;
+    // must be a detached .then(), never `await`ed
+    const near = feedSrc.slice(i, i + 60);
+    return /\.then\(/.test(near) && !/await\s+summariseFailures/.test(feedSrc);
+  })());
+check('F7 [SLACK] reasons are GROUPED with counts — a 20-ad run failing identically '
+    + 'is one fact, not twenty lines',
+  /counts\.set\(reason, \(counts\.get\(reason\) \|\| 0\) \+ 1\)/.test(feedSrc));
+
 // ── Revert-proof (manual, per CLAUDE.md §5) ──────────────────────────────
 // 1. Stamp peek.imageUrl onto renderUrl directly -> B1/B2/B3 fail (the
 //    ships-an-unbranded-image regression).
