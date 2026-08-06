@@ -67,6 +67,16 @@ const FILES = [
   'services/capabilityExecutors/teamInviteAccept.js',
   'services/capabilityExecutors/teamMemberPatch.js',
   'services/capabilityExecutors/teamMemberDelete.js',
+  'services/capabilityExecutors/_integrationsAgentCommon.js',
+  'services/capabilityExecutors/integrationsInstagramConnectUrl.js',
+  'services/capabilityExecutors/integrationsInstagramListCredentials.js',
+  'services/capabilityExecutors/integrationsInstagramDisconnect.js',
+  'services/capabilityExecutors/integrationsMetaAdsConnectUrl.js',
+  'services/capabilityExecutors/integrationsMetaAdsListCredentials.js',
+  'services/capabilityExecutors/integrationsMetaAdsDisconnect.js',
+  'services/capabilityExecutors/integrationsGoogleAdsConnectUrl.js',
+  'services/capabilityExecutors/integrationsGoogleAdsListCredentials.js',
+  'services/capabilityExecutors/integrationsGoogleAdsDisconnect.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -900,6 +910,74 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 22. Phase 8a — integrations OAuth ─────────────────────────────
+console.log('\n[22] Phase 8a integrations OAuth');
+
+const PHASE_8A_IDS = [
+  ['integrations.instagram.listCredentials', 0],
+  ['integrations.metaAds.listCredentials',   0],
+  ['integrations.googleAds.listCredentials', 0],
+  ['integrations.instagram.connectUrl',      1],
+  ['integrations.metaAds.connectUrl',        1],
+  ['integrations.googleAds.connectUrl',      1],
+  ['integrations.instagram.disconnect',      1],
+  ['integrations.metaAds.disconnect',        1],
+  ['integrations.googleAds.disconnect',      1]
+];
+for (const [id, tier] of PHASE_8A_IDS) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+async function checkPhase8aExecutors() {
+  const noScope = {};
+  // Every executor rejects a missing advertiser scope up-front — covers
+  // the tenant-guard rule for both list/connect (brandId scope) and
+  // disconnect (credentialId scope).
+  const files = [
+    'integrationsInstagramConnectUrl', 'integrationsInstagramListCredentials', 'integrationsInstagramDisconnect',
+    'integrationsMetaAdsConnectUrl',   'integrationsMetaAdsListCredentials',   'integrationsMetaAdsDisconnect',
+    'integrationsGoogleAdsConnectUrl', 'integrationsGoogleAdsListCredentials', 'integrationsGoogleAdsDisconnect'
+  ];
+  for (const name of files) {
+    const exec = require(`../services/capabilityExecutors/${name}`);
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+
+  // brandId argument-shape checks — covers the six connect/list caps.
+  for (const name of [
+    'integrationsInstagramConnectUrl', 'integrationsInstagramListCredentials',
+    'integrationsMetaAdsConnectUrl',   'integrationsMetaAdsListCredentials',
+    'integrationsGoogleAdsConnectUrl', 'integrationsGoogleAdsListCredentials'
+  ]) {
+    const exec = require(`../services/capabilityExecutors/${name}`);
+    const r1 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r1.ok === false && /brandId required/i.test(r1.error),
+      `${name}: missing brandId → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(r2.ok === false && /valid ObjectId/i.test(r2.error),
+      `${name}: invalid brandId → rejects`);
+  }
+
+  // credentialId argument-shape checks — covers the three disconnect caps.
+  for (const name of [
+    'integrationsInstagramDisconnect',
+    'integrationsMetaAdsDisconnect',
+    'integrationsGoogleAdsDisconnect'
+  ]) {
+    const exec = require(`../services/capabilityExecutors/${name}`);
+    const r1 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r1.ok === false && /credentialId required/i.test(r1.error),
+      `${name}: missing credentialId → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: { credentialId: 'nope' } });
+    assert(r2.ok === false && /valid ObjectId/i.test(r2.error),
+      `${name}: invalid credentialId → rejects`);
+  }
+}
+
 // ── 21. Phase 7 — team management ─────────────────────────────────
 console.log('\n[21] Phase 7 team capabilities');
 
@@ -1261,6 +1339,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase5Executors();
   await checkPhase6Executors();
   await checkPhase7Executors();
+  await checkPhase8aExecutors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

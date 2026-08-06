@@ -959,6 +959,199 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 8a: Integrations OAuth — T0 list ────────────────────────
+
+  {
+    id:       'integrations.instagram.listCredentials',
+    title:    'List Instagram credentials on a brand',
+    describe: 'Enumerate active + pending Instagram IntegrationCredentials for a brand. Read-only. Returns per-row status, Page name, IG username, catalog id, and connection metadata. Never returns tokens.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsInstagramListCredentials',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'integrations.metaAds.listCredentials',
+    title:    'List Meta Ads credentials on a brand',
+    describe: 'Enumerate active + pending Meta Ads IntegrationCredentials for a brand. Read-only. Returns per-row status + ad account / business / currency / timezone metadata. Never returns tokens.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsMetaAdsListCredentials',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'integrations.googleAds.listCredentials',
+    title:    'List Google Ads credentials on a brand',
+    describe: 'Enumerate active + pending Google Ads IntegrationCredentials for a brand. Read-only. Returns per-row status + customer id / login customer id / connection metadata. Never returns tokens.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsGoogleAdsListCredentials',
+      method:  'run'
+    }
+  },
+
+  // ── Phase 8a: Integrations OAuth — T1 connectUrl + disconnect ─────
+
+  {
+    id:       'integrations.instagram.connectUrl',
+    title:    'Get Instagram connect URL',
+    describe: 'Return a short-lived (15-min) signed OAuth authorize URL for connecting an Instagram account to the brand. Per coverage-plan §D1: the agent cannot complete the redirect flow — the operator opens the URL in a browser to finish handshake + picker in the UI. Refuses if Meta OAuth is not configured on the server. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId — the OAuth state binds the resulting credential to this brand.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsInstagramConnectUrl',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'integrations.metaAds.connectUrl',
+    title:    'Get Meta Ads connect URL',
+    describe: 'Return a short-lived (15-min) signed OAuth authorize URL for connecting a Meta Ads account to the brand. Per coverage-plan §D1: the agent cannot complete the redirect flow — the operator opens the URL in a browser to finish handshake + ad-account picker in the UI. Refuses if Meta Ads OAuth is not configured on the server. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsMetaAdsConnectUrl',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'integrations.googleAds.connectUrl',
+    title:    'Get Google Ads connect URL',
+    describe: 'Return a short-lived (15-min) signed OAuth authorize URL for connecting a Google Ads account to the brand. Per coverage-plan §D1: the agent cannot complete the redirect flow — the operator opens the URL in a browser to finish handshake + customer picker in the UI. Refuses if Google Ads OAuth is not configured on the server. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsGoogleAdsConnectUrl',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'integrations.instagram.disconnect',
+    title:    'Disconnect Instagram credential',
+    describe: 'Soft-revoke one Instagram IntegrationCredential (status:\'active\' → \'revoked\'). Downstream sync services filter on active status, so revoked rows are skipped next tick. Refuses if the credential is already revoked or doesn\'t exist under this advertiser. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['credentialId'],
+      properties: {
+        credentialId: { type: 'string', description: 'IntegrationCredential ObjectId (must be type:\'instagram\', status:\'active\').' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsInstagramDisconnect',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'integrations.metaAds.disconnect',
+    title:    'Disconnect Meta Ads credential',
+    describe: 'Soft-revoke one Meta Ads IntegrationCredential (status:\'active\' → \'revoked\'). Downstream campaign sync stops picking it up on the next tick. Refuses if the credential is already revoked or doesn\'t exist under this advertiser. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['credentialId'],
+      properties: {
+        credentialId: { type: 'string', description: 'IntegrationCredential ObjectId (must be type:\'meta-ads\', status:\'active\').' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsMetaAdsDisconnect',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'integrations.googleAds.disconnect',
+    title:    'Disconnect Google Ads credential',
+    describe: 'Soft-revoke one Google Ads IntegrationCredential (status:\'active\' → \'revoked\'). Downstream campaign sync stops picking it up on the next tick. Refuses if the credential is already revoked or doesn\'t exist under this advertiser. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['credentialId'],
+      properties: {
+        credentialId: { type: 'string', description: 'IntegrationCredential ObjectId (must be type:\'google-ads\', status:\'active\').' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/integrationsGoogleAdsDisconnect',
+      method:  'run'
+    }
+  },
+
   // ── Phase 7: Team — T1 revoke invite / patch member / accept ─────
 
   {
