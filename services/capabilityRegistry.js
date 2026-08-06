@@ -1647,6 +1647,38 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'db.query',
+    title:    'Structured read-only DB query (whitelisted)',
+    describe: 'Read-only structured query against a whitelisted set of collections (Media, CatalogProduct, ProductMatchArtifact, DetectionArtifact, DetectRun). advertiserId is INJECTED server-side — cross-tenant reads are impossible. Filter keys must be in the per-collection allowlist; operators limited to $eq (implicit), $ne, $in, $nin, $exists, $gt, $gte, $lt, $lte (no $regex, $where, $expr, $lookup, $or, $and). Results capped at 20 rows with a per-collection field projection so hidden fields (raw blobs, encrypted tokens, PII) are never returned. Use this for ad-hoc questions like "products with rating > 4 that lack a lifestyle image" without needing a dedicated capability.',
+    tier:     0,
+    scope:    'advertiser',
+    args: {
+      type: 'object',
+      required: ['collection'],
+      properties: {
+        collection: {
+          type: 'string',
+          enum: ['Media', 'CatalogProduct', 'ProductMatchArtifact', 'DetectionArtifact', 'DetectRun'],
+          description: 'Collection to read from.'
+        },
+        filter: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Mongoose-style filter. Keys must be in the per-collection allowlist; operators limited to $eq / $ne / $in / $nin / $exists / $gt / $gte / $lt / $lte. advertiserId is force-set by the server — do not include it here.'
+        },
+        sort:  { type: 'object', additionalProperties: true, description: 'Optional sort object (e.g. { createdAt: -1 }). Keys must be in the per-collection sortable allowlist. Max 2 keys.' },
+        limit: { type: 'integer', minimum: 1, maximum: 20, description: 'Row cap. Defaults to 10, hard max 20.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/dbQuery',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'media.refreshInsights',
     title:    'Refresh IG insights + comments for one media',
     describe: 'Re-pull platformStats (impressions, reach, engagement, saved, views/plays, likes, comments, shares) and top-level comments for one Instagram Media from the Meta Graph API. Same operation the /api/media/:id/refresh-insights route triggers. Refuses non-Instagram Media (other sources have no analytics endpoint). No per-call dollar cost, but Tier 2 gating so a runaway agent can\'t burn the app\'s daily IG token budget. Requires operator confirmation.',

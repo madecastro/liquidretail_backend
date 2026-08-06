@@ -99,6 +99,7 @@ const FILES = [
   'services/capabilityExecutors/catalogInferCategoriesForBrand.js',
   'services/capabilityExecutors/catalogRefreshDetails.js',
   'services/capabilityExecutors/mediaSourceSummary.js',
+  'services/capabilityExecutors/dbQuery.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -960,6 +961,177 @@ async function checkPhase4MediaExecutors() {
   });
   assert(u4.ok === false && /resourceType must be one of/i.test(u4.error),
     `mediaUpload: rejects resourceType outside {image, video}`);
+}
+
+// ── 30. db.query (security-critical structured read) ─────────────
+console.log('\n[30] db.query security invariants');
+
+{
+  const c = registry.capabilityById('db.query');
+  assert(c, `capability "db.query" registered`);
+  if (c) {
+    assert(c.tier === 0, `db.query: tier === 0`);
+    assert(c.scope === 'advertiser', `db.query: scope === 'advertiser'`);
+    // Args schema must enum-restrict the collection — if this
+    // regresses the LLM could pass an arbitrary string and hit an
+    // executor error, but the collection allowlist would still fire.
+    // Still, the enum at the schema layer is defense in depth.
+    const collectionEnum = c.args?.properties?.collection?.enum;
+    assert(Array.isArray(collectionEnum) && collectionEnum.length > 0,
+      `db.query: args.collection has enum allowlist`);
+  }
+}
+
+async function checkDbQueryInvariants() {
+  const noScope = {};
+  const dbQ = require('../services/capabilityExecutors/dbQuery');
+  const advertiserId = '000000000000000000000000';
+
+  // Tenant guard.
+  const r1 = await dbQ.run({ req: noScope, args: { collection: 'Media' } });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `dbQuery: no-scope → rejects`);
+
+  // Missing collection.
+  const r2 = await dbQ.run({ req: { advertiserId }, args: {} });
+  assert(r2.ok === false && /collection required/i.test(r2.error),
+    `dbQuery: missing collection → rejects`);
+
+  // Unknown collection — the allowlist rejects even collections that
+  // technically exist in Mongo (IntegrationCredential, User, etc.).
+  const r3 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'IntegrationCredential' }
+  });
+  assert(r3.ok === false && /not in the allowlist/i.test(r3.error),
+    `dbQuery: IntegrationCredential collection rejected — SECURITY REGRESSION IF THIS FAILS`);
+  const r4 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'User' }
+  });
+  assert(r4.ok === false && /not in the allowlist/i.test(r4.error),
+    `dbQuery: User collection rejected — PII SECURITY REGRESSION IF THIS FAILS`);
+  const r5 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'CostLog' }
+  });
+  assert(r5.ok === false && /not in the allowlist/i.test(r5.error),
+    `dbQuery: CostLog collection rejected`);
+
+  // Root-level $or / $and / $where / $expr rejected.
+  for (const op of ['$or', '$and', '$where', '$expr', '$nor']) {
+    const r = await dbQ.run({
+      req: { advertiserId },
+      args: { collection: 'Media', filter: { [op]: [{ source: 'instagram' }] } }
+    });
+    assert(r.ok === false && /disallowed/i.test(r.error),
+      `dbQuery: root filter operator ${op} rejected — SECURITY REGRESSION IF THIS FAILS`);
+  }
+
+  // Unlisted filter key rejected.
+  const r6 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: { subjects: 'anything' } }
+  });
+  assert(r6.ok === false && /not in the allowlist/i.test(r6.error),
+    `dbQuery: unlisted filter key "subjects" on Media rejected`);
+
+  // Disallowed operator inside a filter clause.
+  const r7 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: { source: { $regex: '.*' } } }
+  });
+  assert(r7.ok === false && /disallowed operator/i.test(r7.error),
+    `dbQuery: $regex operator inside filter clause rejected`);
+
+  // $in / $nin array length cap.
+  const bigIn = Array.from({ length: 100 }, (_, i) => `val-${i}`);
+  const r8 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: { source: { $in: bigIn } } }
+  });
+  assert(r8.ok === false && /array too long/i.test(r8.error),
+    `dbQuery: $in array > 20 rejected`);
+
+  // Too many filter keys.
+  const bigFilter = {};
+  for (let i = 0; i < 10; i++) bigFilter[`unknown_${i}`] = 'x';
+  const r9 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: bigFilter }
+  });
+  assert(r9.ok === false && /too many keys/i.test(r9.error),
+    `dbQuery: >6 filter keys rejected`);
+
+  // Unsortable field rejected.
+  const r10 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', sort: { fileUrl: 1 } }
+  });
+  assert(r10.ok === false && /not sortable/i.test(r10.error),
+    `dbQuery: unsortable field on Media rejected`);
+
+  // limit clamped hard.
+  {
+    const r = await dbQ.run({
+      req: { advertiserId },
+      args: { collection: 'Media', limit: 500 }
+    });
+    // limit=500 is JSON-schema-invalid at the args layer, so
+    // capabilitiesToTools' schema would reject it upstream. Here we
+    // bypass the schema — the executor still clamps to HARD_LIMIT.
+    // The result may fail to hit DB in offline mode, so accept
+    // either ok:false with a plausible reason OR success. We only
+    // care that a huge limit never propagates as-is.
+    if (r.ok) {
+      assert(r.data.rows.length <= 20, `dbQuery: limit clamped to <=20 (got ${r.data.rows.length})`);
+    } else {
+      ok(`dbQuery: limit=500 request errored cleanly (offline DB) — ${r.error?.slice(0, 60) || ''}`);
+    }
+  }
+
+  // Load-bearing regression: tenant filter must be INJECTED even if
+  // the LLM sends its own advertiserId in the filter.
+  for (const [name, spec] of Object.entries(dbQ.COLLECTIONS)) {
+    assert(!spec.filterable.has('advertiserId'),
+      `dbQuery: ${name}.filterable does NOT include advertiserId — server-injected only, LLM cannot spoof`);
+    assert(spec.tenantField === 'advertiserId',
+      `dbQuery: ${name}.tenantField === 'advertiserId'`);
+  }
+  // Source-scan: the executor MUST assign tenantField into the safe
+  // filter before the .find(). If someone removes that line, the
+  // whole capability turns into a cross-tenant read primitive.
+  // Revert-proven — removing this assignment fails the check.
+  {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'capabilityExecutors', 'dbQuery.js'), 'utf8');
+    assert(/safeFilter\[spec\.tenantField\]\s*=\s*new mongoose\.Types\.ObjectId\(req\.advertiserId\)/.test(src),
+      `dbQuery.js: safeFilter[spec.tenantField] = ObjectId(req.advertiserId) present — CROSS-TENANT LEAK IF THIS FAILS`);
+  }
+
+  // Regression: projection must NOT include known-sensitive fields.
+  // If someone extends the projection with these, the harness fails.
+  const FORBIDDEN_FIELDS = [
+    'accessTokenEnc', 'refreshTokenEnc',
+    'passwordHash',
+    'promptSystem', 'promptUser',   // stored on artifacts — LLM prompt IP
+    'rawData',                       // CatalogProduct blob — up to 8KB
+    'specs', 'sellers'               // CatalogProduct SerpAPI blobs
+  ];
+  for (const [name, spec] of Object.entries(dbQ.COLLECTIONS)) {
+    for (const forbidden of FORBIDDEN_FIELDS) {
+      assert(spec.projection[forbidden] !== 1,
+        `dbQuery: ${name}.projection does NOT include ${forbidden} — LEAK REGRESSION IF THIS FAILS`);
+    }
+  }
+
+  // HARD_LIMIT must not silently balloon.
+  assert(dbQ.HARD_LIMIT === 20, `dbQuery: HARD_LIMIT === 20 (LLM must not exfiltrate more per call)`);
+
+  // ALLOWED_OPERATORS must not silently gain $regex / $where / $expr.
+  for (const banned of ['$regex', '$where', '$expr', '$or', '$and', '$lookup', '$function', '$elemMatch']) {
+    assert(!dbQ.ALLOWED_OPERATORS.has(banned),
+      `dbQuery: ALLOWED_OPERATORS does NOT include ${banned}`);
+  }
 }
 
 // ── 29. media.sourceSummary + system-prompt steering ──────────────
@@ -1866,6 +2038,7 @@ async function checkPhase4Tier2Executors() {
   await checkBulkRefreshExecutors();
   await checkCatalogRefreshTrio();
   await checkMediaSourceSummary();
+  await checkDbQueryInvariants();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
