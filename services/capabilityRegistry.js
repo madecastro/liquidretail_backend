@@ -2334,6 +2334,32 @@ function validateManifest(caps = CAPABILITIES) {
   return problems;
 }
 
+// Resolve the executor path recorded on a capability into a form that
+// can be require()'d from ANY file in the tree.
+//
+// PROBLEM this exists to solve: entries store paths like
+//   './capabilityExecutors/catalogRefreshReviewsForBrand'
+// which node's require() resolves relative to the CALLING FILE. That
+// worked when only services/agentTools.js dispatched (same directory)
+// but crashed in prod when routes/agent.js dispatched T4 workflows
+// directly — the './capabilityExecutors/...' path resolved to
+// 'routes/capabilityExecutors/...' and blew up with MODULE_NOT_FOUND.
+//
+// FIX: every dispatch site funnels through this resolver, which
+// anchors relative paths to THIS file's directory (services/) so the
+// resolved absolute path works from anywhere. Absolute paths and npm
+// module names pass through unchanged.
+//
+// The verifier uses this same resolver in [2] so its executor-loads
+// check matches production behavior byte-for-byte.
+const pathMod = require('path');
+function resolveExecutorPath(cap) {
+  const s = cap?.execute?.service;
+  if (!s || typeof s !== 'string') return null;
+  if (s.startsWith('.')) return pathMod.join(__dirname, s);
+  return s;
+}
+
 module.exports = {
   CAPABILITIES,
   capabilitiesToTools,
@@ -2342,6 +2368,7 @@ module.exports = {
   applicableCapabilities,
   describeManifest,
   validateManifest,
+  resolveExecutorPath,
   // exported for the verifier's precondition tests
   __test: { evalClause, describeClause, getPath }
 };

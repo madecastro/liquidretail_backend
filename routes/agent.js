@@ -391,7 +391,11 @@ async function replayConfirmations({ working, confirmationsSet, explicitConfirma
     let result;
     if (cap?.execute?.workflow === true) {
       try {
-        const executor = require(cap.execute.service);
+        // Go through registry.resolveExecutorPath — passing the raw
+        // service string to node's require() resolves the
+        // './capabilityExecutors/...' path relative to THIS file
+        // (routes/) and blows up with MODULE_NOT_FOUND (Aug 6 outage).
+        const executor = require(registry.resolveExecutorPath(cap));
         if (typeof executor.execute !== 'function') {
           result = { ok: false, error: `workflow "${cap.id}" executor exports no execute()` };
         } else {
@@ -753,7 +757,9 @@ router.post('/chat', async (req, res) => {
 
         let plan;
         try {
-          const executor = require(cap.execute.service);
+          // See the T4-execute branch above — must funnel through
+          // registry.resolveExecutorPath, not raw require(service).
+          const executor = require(registry.resolveExecutorPath(cap));
           if (typeof executor.preview !== 'function') {
             plan = { ok: false, error: `workflow "${cap.id}" executor exports no preview()` };
           } else {
@@ -840,7 +846,9 @@ router.post('/chat', async (req, res) => {
         // workflow never throws — errors are structured.
         let result;
         try {
-          const executor = require(cap.execute.service);
+          // Same rule as the other T4 branches — must go through
+          // registry.resolveExecutorPath, not raw require(service).
+          const executor = require(registry.resolveExecutorPath(cap));
           if (typeof executor.execute !== 'function') {
             result = { ok: false, error: `workflow "${cap.id}" executor exports no execute()` };
           } else {

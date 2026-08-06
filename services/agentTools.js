@@ -51,7 +51,12 @@ async function dispatch({ toolName, args = {}, req, context = {} }) {
 
   let executor;
   try {
-    executor = require(capability.execute.service);
+    // Funnel through registry.resolveExecutorPath so every dispatch
+    // site (agentTools + routes/agent.js T4 branches + verifier)
+    // shares one resolver. Do NOT go back to raw require(path) — see
+    // the prod outage caught in transcript "Cannot find module './
+    // capabilityExecutors/catalogRefreshReviewsForBrand'."
+    executor = require(registry.resolveExecutorPath(capability));
   } catch (err) {
     return {
       ok: false,

@@ -120,16 +120,46 @@ assert(Array.isArray(registry.CAPABILITIES) && registry.CAPABILITIES.length > 0,
 const ids = registry.CAPABILITIES.map((c) => c.id);
 assert(new Set(ids).size === ids.length, `capability ids unique`);
 
-// Every execute path resolves to a real file.
+// Every execute path resolves to a real file via the SAME resolver
+// production uses. Previously this check did its own path munging
+// (path.join(__dirname, '..', 'services', rel)) which shipped a T4
+// module-not-found in prod on 2026-08-06 — the raw require path used
+// by routes/agent.js was different from what the verifier tested.
+// Fixed by centralizing on registry.resolveExecutorPath.
+assert(typeof registry.resolveExecutorPath === 'function',
+  `capabilityRegistry exports resolveExecutorPath`);
 for (const c of registry.CAPABILITIES) {
   if (c.execute?.kind !== 'service') continue;
   const rel = c.execute.service;
   try {
-    // require handles resolution incl. ./
-    require(rel.startsWith('.') ? path.join(__dirname, '..', 'services', rel) : rel);
+    const resolved = registry.resolveExecutorPath(c);
+    require(resolved);
     ok(`executor loads: ${c.id} → ${rel}`);
   } catch (err) {
     fail(`executor missing: ${c.id} → ${rel}`, err.message);
+  }
+}
+
+// Regression guard — no dispatch site may raw-require cap.execute.service
+// (that's the 2026-08-06 bug pattern). Every require of an executor path
+// MUST go through registry.resolveExecutorPath so the resolver anchors
+// the './capabilityExecutors/...' path to services/, not to whichever
+// file called require.
+{
+  const filesToScan = ['routes/agent.js', 'services/agentTools.js'];
+  for (const rel of filesToScan) {
+    const abs = path.join(__dirname, '..', rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    // Match any `require(<something>.execute.service)` pattern —
+    // that's the exact shape that shipped the bug.
+    const rawRequire = /require\(\s*[a-zA-Z_$][\w$]*\.execute\.service\s*\)/;
+    assert(!rawRequire.test(src),
+      `${rel}: no raw require(cap.execute.service) — must funnel through registry.resolveExecutorPath (2026-08-06 outage regression)`);
+    // Every dispatch site should mention resolveExecutorPath at least
+    // once — quick belt-and-suspenders that the fix hasn't been
+    // silently reverted.
+    assert(/resolveExecutorPath/.test(src),
+      `${rel}: references resolveExecutorPath (dispatcher funnel)`);
   }
 }
 
