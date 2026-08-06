@@ -1390,6 +1390,23 @@ async function renderDirectImage({
     `   ✅ direct-image vision QC pass — attempt=${qcResult.visionQc.finalAttempt} ` +
     `regens=${qcResult.regenerationCount}`
   );
+  // Slack "accepted" notice. The real flag-off short-circuit already
+  // happened above (`if (!adVisionQc.isEnabled()) return firstOutput`,
+  // before runPostRenderQc is even called) — this call site always passes
+  // `enabled: true`, so qcResult.skipped can never be true here today. The
+  // `!qcResult.skipped` guard is still kept as defense-in-depth: it is the
+  // thing that would stop a future refactor of this call site (e.g. one
+  // that calls runPostRenderQc unconditionally and lets it decide) from
+  // alerting on a verdict that was never produced.
+  if (!qcResult.skipped) {
+    adVisionQc.alertQcAccepted({
+      adId,
+      brandId: resolvedBrand?._id || brandId,
+      productId: resolvedProduct?._id || productId,
+      brandName: resolvedBrand?.name,
+      visionQc: qcResult.visionQc
+    });
+  }
   return {
     ...qcResult.output,
     visionQc: qcResult.visionQc

@@ -401,6 +401,120 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
     assert.notStrictEqual(resolved.atlas, 'openai/gpt-5-nano');
   });
 
+  // ── G. Accept/reject Slack alerts always fire, with the verbose verdict ──
+  // Revert: routing alertQcAccepted through level:'info' fails G1 (info is
+  // below alertService's default ALERT_MIN_LEVEL=warn and would silently
+  // never send — the "make sure a message is sent" requirement this exists
+  // for). Dropping the category breakdown from either detail fails G2/G3.
+  const fakeNotify = (fn) => {
+    const alerts = require('../services/alertService');
+    const original = alerts.notifyAsync;
+    let captured = null;
+    alerts.notifyAsync = (opts) => { captured = opts; };
+    try { fn(); } finally { alerts.notifyAsync = original; }
+    return captured;
+  };
+
+  check('G1 alertQcAccepted fires at a level that survives default ALERT_MIN_LEVEL', () => {
+    const alerts = require('../services/alertService');
+    const verdict = qc.buildPersistedVerdict({
+      passed: true,
+      finalAttempt: 1,
+      attempts: [{ attempt: 1, pass: true, categories: qc.emptyCategories(), summary: 'clean', renderUrl: 'https://cdn.example/r.png' }]
+    });
+    const captured = fakeNotify(() => qc.alertQcAccepted({
+      adId: 'ad1', brandId: 'b1', productId: 'p1', brandName: 'Allbirds', visionQc: verdict
+    }));
+    assert.ok(captured, 'alertQcAccepted did not call alerts.notifyAsync');
+    assert.notStrictEqual(captured.level, 'info', 'info is below default ALERT_MIN_LEVEL=warn — would never send');
+    assert.ok(alerts._LEVELS[captured.level] >= alerts._LEVELS.warn, `level ${captured.level} would be filtered by default min level`);
+  });
+
+  check('G2 alertQcAccepted detail carries the full verbose verdict (per-category scores, not just a summary line)', () => {
+    const verdict = qc.buildPersistedVerdict({
+      passed: true,
+      finalAttempt: 1,
+      attempts: [{
+        attempt: 1,
+        pass: true,
+        categories: {
+          competitor_marks: { score: 9, pass: true, findings: [] },
+          product_fidelity: { score: 9, pass: true, findings: ['minor colour shift'] },
+          text_defects: { score: 10, pass: true, findings: [] },
+          layout_safe_box: { score: 10, pass: true, findings: [] }
+        },
+        summary: 'clean',
+        renderUrl: 'https://cdn.example/r.png'
+      }]
+    });
+    const captured = fakeNotify(() => qc.alertQcAccepted({
+      adId: 'ad1', brandId: 'b1', productId: 'p1', brandName: 'Allbirds', visionQc: verdict
+    }));
+    assert.ok(captured.detail.includes('minor colour shift'), 'verbose finding missing from Slack detail');
+    assert.ok(captured.detail.includes('product_fidelity'), 'category breakdown missing from Slack detail');
+  });
+
+  check('G2b both alerts key on the AD, not a fixed literal (dedupe must not collapse across ads)', () => {
+    // Revert: a shared/fixed key means alertService's 15-min dedupe window
+    // silently swallows every ad's verbose verdict but the first one in
+    // that window — no detail carried into the "+N more (suppressed)" bump.
+    const acceptedVerdict = qc.buildPersistedVerdict({
+      passed: true, finalAttempt: 1,
+      attempts: [{ attempt: 1, pass: true, categories: qc.emptyCategories(), summary: 'clean', renderUrl: 'https://cdn.example/r.png' }]
+    });
+    const capturedA1 = fakeNotify(() => qc.alertQcAccepted({ adId: 'adAAA', brandId: 'b1', productId: 'p1', visionQc: acceptedVerdict }));
+    const capturedA2 = fakeNotify(() => qc.alertQcAccepted({ adId: 'adBBB', brandId: 'b1', productId: 'p1', visionQc: acceptedVerdict }));
+    assert.ok(capturedA1.key.includes('adAAA'), 'accept key must embed the ad id');
+    assert.notStrictEqual(capturedA1.key, capturedA2.key, 'two different ads must not share a dedupe key');
+
+    const failedVerdict = qc.buildPersistedVerdict({
+      passed: false, finalAttempt: 2,
+      attempts: [{ attempt: 2, pass: false, categories: FAIL_VERDICT.categories, findings: FAIL_VERDICT.findings, summary: FAIL_VERDICT.summary, renderUrl: 'https://cdn.example/2.png' }]
+    });
+    const capturedF1 = fakeNotify(() => qc.alertQcFailure({ adId: 'adCCC', brandId: 'b1', productId: 'p1', visionQc: failedVerdict }));
+    const capturedF2 = fakeNotify(() => qc.alertQcFailure({ adId: 'adDDD', brandId: 'b1', productId: 'p1', visionQc: failedVerdict }));
+    assert.ok(capturedF1.key.includes('adCCC'), 'reject key must embed the ad id');
+    assert.notStrictEqual(capturedF1.key, capturedF2.key, 'two different ads must not share a dedupe key');
+  });
+
+  check('G3 alertQcFailure still fires at error level with the full verbose verdict (unchanged contract)', () => {
+    const verdict = qc.buildPersistedVerdict({
+      passed: false,
+      finalAttempt: 2,
+      attempts: [
+        { attempt: 1, pass: false, categories: FAIL_VERDICT.categories, findings: FAIL_VERDICT.findings, summary: FAIL_VERDICT.summary, renderUrl: 'https://cdn.example/1.png', discarded: true },
+        { attempt: 2, pass: false, categories: FAIL_VERDICT.categories, findings: FAIL_VERDICT.findings, summary: FAIL_VERDICT.summary, renderUrl: 'https://cdn.example/2.png' }
+      ]
+    });
+    const captured = fakeNotify(() => qc.alertQcFailure({
+      adId: 'ad1', brandId: 'b1', productId: 'p1', brandName: 'Allbirds', visionQc: verdict
+    }));
+    assert.ok(captured, 'alertQcFailure did not call alerts.notifyAsync');
+    assert.strictEqual(captured.level, 'error');
+    assert.ok(captured.detail.includes('competitor_marks'), 'category breakdown missing from failure alert');
+  });
+
+  // ── H. Wiring: directImageRenderService fires BOTH outcomes ────────
+  // Revert: removing the accepted-alert call site fails H1; calling it
+  // unconditionally (including the skipped/no-QC-ran path, flag off) fails
+  // H2; removing the existing reject call site fails H3.
+  const directImageSrc = () => require('fs').readFileSync(
+    path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8'
+  );
+  check('H1 directImageRenderService calls alertQcAccepted on the pass path', () => {
+    assert.match(directImageSrc(), /adVisionQc\.alertQcAccepted\(/, 'accepted-alert call site missing');
+  });
+  check('H2 the accepted-alert call site is guarded on qcResult.skipped (no alert when QC never ran)', () => {
+    const src = directImageSrc();
+    const idx = src.indexOf('alertQcAccepted(');
+    assert.ok(idx > -1, 'call site not found');
+    const before = src.slice(Math.max(0, idx - 400), idx);
+    assert.match(before, /qcResult\.skipped/, 'accepted-alert must be gated on qcResult.skipped');
+  });
+  check('H3 directImageRenderService still calls alertQcFailure on the reject path', () => {
+    assert.match(directImageSrc(), /adVisionQc\.alertQcFailure\(/, 'reject-alert call site missing');
+  });
+
   // ── report ─────────────────────────────────────────────────────────
   if (failures.length) {
     console.error(`❌ verifyAdVisionQc: ${failures.length} FAILED, ${pass} passed\n`);
