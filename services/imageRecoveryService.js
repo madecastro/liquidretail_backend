@@ -248,10 +248,23 @@ async function settleChargeState({ ad } = {}) {
   // refunded per the documented policy, so this is a real 'not-charged' — the one
   // case where absence of a price is itself the answer.
   if (peek.state === 'failed') {
-    await Ad.updateOne({ _id: ad._id }, { $set: {
-      'renderError.chargeState': 'not-charged', updatedAt: new Date()
-    } });
-    return { state: 'not-charged', price: 0 };
+    // CORRECT THE OPERATOR-FACING REASON TOO. The stored message was written by
+    // whatever the poll loop happened to SEE at the time, which can be wildly
+    // misleading: the two ads that triggered this work still read "Atlas image
+    // unknown (HTTP 502 … Cloudflare …)" when the truth — visible right here in
+    // the settled prediction — is "Input Prompt violates policy", i.e. a
+    // deterministic content rejection that no retry can fix. Leaving a known-wrong
+    // diagnosis in place sends someone chasing an outage that never happened.
+    //
+    // Only overwrite when peek actually named a cause, and keep the original
+    // verbatim so nothing is destroyed by a correction.
+    const set = { 'renderError.chargeState': 'not-charged', updatedAt: new Date() };
+    if (peek.message && ad.renderError?.message && !ad.renderError.message.includes(peek.message)) {
+      set['renderError.message'] = `${peek.message} [settled from prediction ${predictionId}] — was recorded as: ${String(ad.renderError.message).slice(0, 160)}`;
+      set['renderError.stage']   = 'settled';
+    }
+    await Ad.updateOne({ _id: ad._id }, { $set: set });
+    return { state: 'not-charged', price: 0, reason: peek.message || null };
   }
 
   // Still processing, or we could not reach Atlas. Leave it 'unknown' — guessing

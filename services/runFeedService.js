@@ -278,6 +278,11 @@ function buildParentText(state, live) {
   const lines = [head, `    ${countLine}`];
   if (nowLine) lines.push(`    ${nowLine}`);
   if (state.finished && state.finishSummary) lines.push(`    ${state.finishSummary}`);
+  // One line per DISTINCT reason, most common first. Grouped because a
+  // 20-ad run that fails identically 20 times is one fact, not twenty.
+  if (state.finished && Array.isArray(state.finishReasons)) {
+    for (const r of state.finishReasons) lines.push(`    ${r.count}✗ ${r.reason}`);
+  }
   lines.push(foot);
   return clip(lines.join('\n'), SLACK_MAX);
 }
@@ -618,6 +623,30 @@ function finishRun(opts = {}) {
     st.finishSummary = st.cancelled
       ? `stopped — ${ok}✓ / ${fail}✗ / ${skip}⊘ · ${formatElapsed(ms)}`
       : `finished — ${ok}✓ / ${fail}✗ / ${skip}⊘ · ${formatElapsed(ms)}`;
+    // WHY a run failed, not just how many. Until 2026-08-05 this summary said
+    // "10✓ / 2✗" and nothing else, so the only way to learn that two ads were
+    // rejected for CONTENT POLICY — deterministic, and never going to succeed on
+    // a retry — was to ask someone to read the database. Owner did exactly that.
+    // Fire-and-forget like everything else here: a reporting query must never
+    // affect a run, so it is awaited only inside its own try and any failure
+    // leaves the count-only summary intact.
+    // DETACHED, not awaited: finishRun is sync for every caller, and this module's
+    // whole contract is that it never sits on a render path. The lookup resolves a
+    // moment later, sets the reasons and re-flags the parent dirty, and the
+    // existing flush timer repaints the message. If it fails, the count-only
+    // summary stands — a reporting query must never degrade a run.
+    if (fail > 0) {
+      summariseFailures(rid)
+        .then((reasons) => {
+          if (!reasons || !reasons.length) return;
+          st.finishReasons = reasons;
+          st.parentDirty = true;
+          ensureTimer();
+        })
+        .catch((err) => {
+          try { console.warn(`📡 runFeed: failure-reason lookup failed — ${err && err.message}`); } catch { /* ignore */ }
+        });
+    }
     st.ring.push({
       t: _now(),
       stage: st.cancelled
@@ -631,6 +660,41 @@ function finishRun(opts = {}) {
   } catch (err) {
     try { console.warn(`📡 runFeed.finishRun: ${err && err.message}`); } catch { /* ignore */ }
   }
+}
+
+/**
+ * Group this run's failures into distinct, human-readable reasons.
+ *
+ * Reads Ad.renderError.message, which now LEADS with the operator-facing label
+ * (atlasImageService/atlasVideoService both use `policy.label` first), so the
+ * head of the string is already the useful part — "Model Moderation Error",
+ * "Atlas image insufficientBalance", and so on.
+ *
+ * Deliberately truncates at the first ` (`, ` [` or `:` AFTER the label: the tail
+ * is prediction ids and provider JSON, which is what the Render Activity board is
+ * for. Slack gets the headline.
+ */
+async function summariseFailures(runId) {
+  const Ad = require('../models/Ad');
+  const rows = await Ad.find({ campaignRunIds: runId, status: 'failed' })
+    .select('renderError.message renderError.chargeState')
+    .limit(50)
+    .lean();
+  const counts = new Map();
+  for (const r of rows) {
+    const raw = String(r?.renderError?.message || 'unknown failure')
+      .replace(/^direct-image render failed:\s*/i, '')
+      .replace(/^master rendered;\s*/i, '');
+    // Keep the label plus its immediate cause, drop ids/JSON/policy prose.
+    const m = raw.match(/^([^([]{0,80}?)(?:\s*[([]|$)/);
+    let reason = (m ? m[1] : raw).trim();
+    if (reason.length > 90) reason = `${reason.slice(0, 87)}…`;
+    counts.set(reason, (counts.get(reason) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 4);   // a run with 5+ distinct causes is a story for the board
 }
 
 /**
@@ -999,6 +1063,7 @@ module.exports = {
   isConfigured,
   isPollTick,
   // pure helpers (tests + formatting reuse)
+  summariseFailures,
   formatThreadLine,
   buildParentText,
   claimParentTs,
