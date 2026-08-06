@@ -98,6 +98,7 @@ const FILES = [
   'services/capabilityExecutors/catalogRefreshReviewsForProduct.js',
   'services/capabilityExecutors/catalogInferCategoriesForBrand.js',
   'services/capabilityExecutors/catalogRefreshDetails.js',
+  'services/capabilityExecutors/mediaSourceSummary.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -959,6 +960,43 @@ async function checkPhase4MediaExecutors() {
   });
   assert(u4.ok === false && /resourceType must be one of/i.test(u4.error),
     `mediaUpload: rejects resourceType outside {image, video}`);
+}
+
+// ── 29. media.sourceSummary + system-prompt steering ──────────────
+console.log('\n[29] media.sourceSummary');
+
+{
+  const c = registry.capabilityById('media.sourceSummary');
+  assert(c, `capability "media.sourceSummary" registered`);
+  if (c) {
+    assert(c.tier === 0, `media.sourceSummary: tier === 0`);
+    assert(c.scope === 'brand', `media.sourceSummary: scope === 'brand'`);
+  }
+}
+
+async function checkMediaSourceSummary() {
+  const noScope = {};
+  const exec = require('../services/capabilityExecutors/mediaSourceSummary');
+  const r1 = await exec.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `mediaSourceSummary: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /brandId required/i.test(r2.error),
+    `mediaSourceSummary: missing brandId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `mediaSourceSummary: invalid brandId → rejects`);
+}
+
+// System-prompt must include the source-summary steering — if this
+// regresses, the LLM will fall back to the credentials-based
+// inference that shipped the bug in the 2026-08-06 transcript.
+{
+  const agentSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'agent.js'), 'utf8');
+  assert(/media\.sourceSummary/.test(agentSrc),
+    `routes/agent.js system prompt mentions media.sourceSummary`);
+  assert(/AUTHORITATIVE signal/.test(agentSrc),
+    `routes/agent.js system prompt steers away from credentials-based ingestion inference`);
 }
 
 // ── 28. Catalog product refresh trio ──────────────────────────────
@@ -1827,6 +1865,7 @@ async function checkPhase4Tier2Executors() {
   await checkAdRegenerateExecutor();
   await checkBulkRefreshExecutors();
   await checkCatalogRefreshTrio();
+  await checkMediaSourceSummary();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

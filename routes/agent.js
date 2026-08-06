@@ -137,6 +137,11 @@ function buildSystemPrompt(context = {}) {
     '- When a capability fails with an error message that NAMES ANOTHER CAPABILITY as the remedy (e.g. "invoke integrations.instagram.connectUrl", "use catalog.pullFromApify for more"), offer to chain into that capability as your next step — do not just stop at the error. Ask the operator whether to proceed.',
     '- If the error result carries a sourceCounts field (from posts.syncFromInstagram / catalog.syncFromInstagram), it tells you which OTHER ingestion path this brand ALREADY has content from. Steer the operator to the capability matching the dominant source instead of insisting on the OAuth path.',
     '',
+    'DECIDING BETWEEN INGESTION PATHS (media / catalog refresh):',
+    '- The AUTHORITATIVE signal for how existing media / catalog rows were ingested is the `source` field ON THE ROWS THEMSELVES, not the current IntegrationCredential state. Credentials can be revoked AFTER ingest, so a brand may have IG media with source=instagram or source=apify-ig even when integrations.instagram.listCredentials is empty.',
+    '- When the operator asks to refresh media / posts / comments and does not specify OAuth vs Apify, call media.sourceSummary FIRST (Tier 0, cheap). Its response includes `remedyBySource` telling you which refresh capability applies per source.',
+    '- Only fall back to asking the operator when media.sourceSummary is genuinely ambiguous (e.g. equal counts across sources with different remedies).',
+    '',
     'When you finish, produce a concise plain-text answer for the operator. Do not restate the raw JSON — summarise the finding. If a capability failed (ok:false), tell the operator what went wrong and what they can try.'
   ].join('\n');
 }

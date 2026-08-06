@@ -1626,6 +1626,27 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'media.sourceSummary',
+    title:    'Summarise how a brand\'s Media was ingested',
+    describe: 'Cheap read-only lookup — for a brand, aggregate Media count grouped by ingestion source (instagram OAuth vs apify-ig vs manual_upload etc.). Returns a per-source remedy string naming the correct refresh capability. This is the AUTHORITATIVE way to decide which refresh path applies to existing media — DO NOT infer from integrations.instagram.listCredentials (credentials can be revoked AFTER ingest and leave orphan Media rows behind). Skips catalog-product wrappers + soft-deleted rows.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaSourceSummary',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'media.refreshInsights',
     title:    'Refresh IG insights + comments for one media',
     describe: 'Re-pull platformStats (impressions, reach, engagement, saved, views/plays, likes, comments, shares) and top-level comments for one Instagram Media from the Meta Graph API. Same operation the /api/media/:id/refresh-insights route triggers. Refuses non-Instagram Media (other sources have no analytics endpoint). No per-call dollar cost, but Tier 2 gating so a runaway agent can\'t burn the app\'s daily IG token budget. Requires operator confirmation.',
