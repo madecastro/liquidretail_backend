@@ -27,9 +27,20 @@
 const CostLog = require('../models/CostLog');
 const Brand   = require('../models/Brand');
 
+// AGENT_DAILY_CAP_USD semantics:
+//   > 0  →  the daily cap in USD (rolling 24h)
+//   0    →  cap DISABLED (returns null → check() skips the comparison
+//           and always allows). Cost defense falls to per-call
+//           estimateUsd + operator confirmation + CostLog audit.
+//   unset →  0 (default disabled while agent testing is active)
+//
+// Re-enable per env by setting a positive value. The "no estimator"
+// fail-closed rule for Tier ≥ 2 caps stays intact regardless of the
+// cap setting — an uncapped cost is still a code bug.
 function dailyCap() {
   const raw = Number(process.env.AGENT_DAILY_CAP_USD);
-  return Number.isFinite(raw) && raw > 0 ? raw : 10;
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  return raw;
 }
 
 async function estimateFor(capability, args) {
@@ -78,8 +89,15 @@ async function check({ advertiserId, capability, args }) {
   if (est === 0) {
     return { allowed: true, dailyCap: dailyCap(), spent: 0, estimateUsd: 0, projected: 0 };
   }
-  const spent = await spentInLast24h(advertiserId);
   const cap = dailyCap();
+  // Cap disabled (AGENT_DAILY_CAP_USD=0) — skip the spent-vs-cap
+  // comparison entirely. We still return the estimate for logging /
+  // observability, but no query against CostLog fires so the gate is
+  // cheap. Fail-closed for missing estimators still applies above.
+  if (cap == null) {
+    return { allowed: true, dailyCap: null, spent: null, estimateUsd: est, projected: null };
+  }
+  const spent = await spentInLast24h(advertiserId);
   const projected = spent + est;
   if (projected > cap) {
     return {

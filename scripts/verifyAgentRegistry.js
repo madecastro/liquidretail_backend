@@ -457,9 +457,49 @@ async function checkSpendGuard() {
     const g = await guard.check({ advertiserId: '000000000000000000000000', capability: free, args: {} });
     assert(g.allowed === true, `spendGuard: allows zero-estimate capability trivially`);
   }
-  // 4. dailyCap() reads AGENT_DAILY_CAP_USD (or 10 default). Sanity.
-  assert(typeof guard.dailyCap() === 'number' && guard.dailyCap() > 0,
-    `spendGuard.dailyCap() returns a positive number`);
+  // 4. dailyCap() reads AGENT_DAILY_CAP_USD. Semantics: positive → the
+  //    cap; 0 (or unset) → null meaning DISABLED. The verifier tolerates
+  //    either shape but pins the semantics: never NaN, never a negative
+  //    number, never a random object.
+  {
+    const c = guard.dailyCap();
+    assert(c === null || (typeof c === 'number' && c > 0),
+      `spendGuard.dailyCap() returns null (disabled) OR a positive number (enabled) — got ${JSON.stringify(c)}`);
+  }
+  // 5. When AGENT_DAILY_CAP_USD is disabled (0 or unset) and a Tier 2
+  //    capability with a POSITIVE estimateUsd is checked, the guard
+  //    must short-circuit allowed:true without reading CostLog — a
+  //    live Mongoose call from here would time out in the offline
+  //    verifier and fail this check.
+  {
+    const priorEnv = process.env.AGENT_DAILY_CAP_USD;
+    process.env.AGENT_DAILY_CAP_USD = '0';
+    try {
+      const priced = { id: 'test.priced', tier: 2, estimateUsd: 0.15 };
+      const g = await guard.check({
+        advertiserId: '000000000000000000000000',
+        capability: priced,
+        args: {}
+      });
+      assert(g.allowed === true && g.dailyCap === null,
+        `spendGuard: cap disabled → allowed:true, dailyCap:null (short-circuits CostLog read)`);
+    } finally {
+      if (priorEnv === undefined) delete process.env.AGENT_DAILY_CAP_USD;
+      else process.env.AGENT_DAILY_CAP_USD = priorEnv;
+    }
+  }
+  // 6. When AGENT_DAILY_CAP_USD is a positive number, dailyCap()
+  //    returns it verbatim. Guards against silent floor coercion.
+  {
+    const priorEnv = process.env.AGENT_DAILY_CAP_USD;
+    process.env.AGENT_DAILY_CAP_USD = '25.5';
+    try {
+      assert(guard.dailyCap() === 25.5, `spendGuard.dailyCap() returns the env value verbatim`);
+    } finally {
+      if (priorEnv === undefined) delete process.env.AGENT_DAILY_CAP_USD;
+      else process.env.AGENT_DAILY_CAP_USD = priorEnv;
+    }
+  }
 }
 
 // Endpoint plumbing for Tier 2.
