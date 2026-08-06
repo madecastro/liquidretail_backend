@@ -128,10 +128,24 @@ const POLICIES = Object.freeze({
     // here is not cosmetic, it downgrades a retryable failure to give-up and
     // throws away a render that would have succeeded on the second attempt.
     // `blocked` alone is still deliberately not matched, for the same reason.
+    // `violates ... policy` ADDED 2026-08-05. Atlas's live wording for a rejected
+    // prompt is "Input Prompt violates policy" — verified against two real
+    // predictions (35ea54dd…, 4cee5c40…, both `status:"failed"`,
+    // `executionTime: 0`). It matched NONE of the alternatives above, so a
+    // deterministic content rejection classified as `serverError` → action
+    // 'probe', charged:null: we would keep probing a prompt that can never
+    // succeed, and report it to the operator as an unknown server fault rather
+    // than "your prompt was rejected". Same class of miss as the "blocked by
+    // safety REVIEW" wording found on 2026-08-04.
+    //
+    // Still ENUMERATED rather than a broad /polic/: a false positive here marks a
+    // RETRYABLE failure permanently futile and discards a render that would have
+    // succeeded. "violates … policy" is unambiguous moderation language; a bare
+    // "policy" is not, and is deliberately still unmatched.
     match: ({ nsfw, msg }) =>
       nsfw === true
       || (Array.isArray(nsfw) && nsfw.some(Boolean))
-      || /moderation|safety\s+(system|filter|review|check|guidelines?)|content policy|flagged as unsafe/i.test(msg),
+      || /moderation|safety\s+(system|filter|review|check|guidelines?)|content policy|violates?\s+(the\s+)?polic(y|ies)|flagged as unsafe/i.test(msg),
     // Deterministic: the same prompt and reference will be blocked again.
     charged: false, action: 'give-up', maxAttempts: 1,
     label: 'Model Moderation Error',

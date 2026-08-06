@@ -805,7 +805,16 @@ async function peekImagePrediction(predictionId) {
   } catch (err) {
     return { state: 'unknown', message: err.message };
   }
-  if (res.status !== 200) return { state: 'unknown', message: `HTTP ${res.status}` };
+  // A non-200 does NOT mean "no answer". Atlas returns HTTP 500 with a COMPLETE
+  // envelope for a rejected prompt — {code:500, message:"Input Prompt violates
+  // policy", data:{status:"failed", error:…, executionTime:0}} — and returning
+  // early on the status code threw that away, leaving the row 'unknown' forever
+  // when the verdict was right there. Verified against two real predictions on
+  // 2026-08-05. Only bail when there is genuinely nothing to read.
+  const hasEnvelope = !!res.data?.data;
+  if (res.status !== 200 && !hasEnvelope) {
+    return { state: 'unknown', message: `HTTP ${res.status}` };
+  }
   const data = res.data?.data || {};
   const status = String(data.status || '').toLowerCase();
 
@@ -842,7 +851,7 @@ async function peekImagePrediction(predictionId) {
       : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput', ...charge };
   }
   if (status === 'failed' || status === 'error' || status === 'cancelled' || status === 'canceled') {
-    const providerMsg = data.error || status;
+    const providerMsg = data.error || res.data?.message || status;
     const policy = classify({
       predictionStatus: 'failed', msg: providerMsg, nsfw: data.has_nsfw_contents ?? null
     });

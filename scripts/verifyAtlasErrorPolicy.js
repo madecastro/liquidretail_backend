@@ -61,6 +61,22 @@ expect('403 monthly spending limit',
   { name: 'forbidden', action: 'fix-config', terminal: true });
 
 // ── the bug this module was written for ──────────────────────────────────
+// [LIVE 2026-08-05] Atlas's wording for a rejected prompt. It matched none of the
+// original moderation alternatives, so a DETERMINISTIC content rejection came out
+// as serverError/probe: we would keep probing a prompt that can never succeed and
+// report it as an unknown server fault. Verified on two real predictions
+// (35ea54dd…, 4cee5c40…), both status:"failed", executionTime:0.
+expect('[LIVE] "Input Prompt violates policy" is moderation, not a server error',
+  { http: 500, code: 500, predictionStatus: 'failed', msg: 'Input Prompt violates policy' },
+  { name: 'moderationBlocked', action: 'give-up', charged: false, terminal: true });
+
+// THE BOUNDARY. The list is enumerated on purpose: a false positive marks a
+// RETRYABLE failure permanently futile and throws away a render that would have
+// succeeded on a second attempt. A bare "policy" must NOT match.
+expect('a bare "policy" stays retryable — the matcher did not over-broaden',
+  { http: 200, predictionStatus: 'failed', msg: 'policy' },
+  { name: 'predictionFailed', action: 'retry' });
+
 expect('429 rate limit (was terminal, must retry)',
   { http: 429 },
   { name: 'rateLimited', action: 'retry', retryable: true, charged: false, terminal: false });
