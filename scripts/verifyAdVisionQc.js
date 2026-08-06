@@ -790,6 +790,173 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
       'uninspected or failed recovery QC must alert');
   });
 
+  // ── M3–M7. Adversarial-review defects (db47754 follow-up) ──────────
+  // Revert each named production fix → the matching check fails.
+  check('M3 expectedText UNKNOWN is first-class (never []-means-no-text on recovery)', () => {
+    // Prompt distinguishes UNKNOWN from empty-known.
+    const unknown = qc.buildVisionUserContent({
+      originalProductUrl: 'https://cdn.example/o.jpg',
+      renderUrl: 'https://cdn.example/r.png',
+      brandName: 'Allbirds',
+      safeBox: {},
+      deliveryDims: { width: 1080, height: 1350 },
+      expectedTextUnknown: true
+    });
+    const uText = unknown.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
+    assert.match(uText, /UNKNOWN/i);
+    assert.match(uText, /intrinsic/i);
+    assert.ok(!/none — pure product image is legitimate/.test(uText),
+      'UNKNOWN must not render as pure-product empty list');
+
+    const emptyKnown = qc.buildVisionUserContent({
+      originalProductUrl: 'https://cdn.example/o.jpg',
+      renderUrl: 'https://cdn.example/r.png',
+      brandName: 'Allbirds',
+      safeBox: {},
+      deliveryDims: { width: 1080, height: 1350 },
+      expectedText: []
+    });
+    const eText = emptyKnown.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
+    assert.match(eText, /none — pure product image is legitimate/);
+
+    const rec = require('../services/imageRecoveryService');
+    // Submission-audit reconstruction when prompt has role -> text lines.
+    const parsed = rec.extractExpectedTextFromSubmissionPrompt(
+      'SET EXACTLY THESE STRINGS\n  brand line -> Walk in comfort\n  cta button -> Shop Now\n'
+    );
+    assert.deepStrictEqual(parsed, ['Walk in comfort', 'Shop Now']);
+    const unk = rec.resolveExpectedTextForRecovery({ imageGeneration: { prompt: 'no copy block' } });
+    assert.strictEqual(unk.expectedTextUnknown, true);
+    // judgeRender call site must not hard-code expectedText: [].
+    const recSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'imageRecoveryService.js'), 'utf8'
+    );
+    const ji = recSrc.indexOf('judgeRender({');
+    assert.ok(ji > -1);
+    const call = recSrc.slice(ji, recSrc.indexOf('});', ji) + 2);
+    assert.ok(!/expectedText:\s*\[\s*\]/.test(call),
+      'recovery judge must not pass expectedText:[] (false-fails every texted ad)');
+    assert.match(call, /expectedTextUnknown/);
+  });
+
+  check('M4 bootRecovery owns rendering+receipt → recoverImageAd (not log-and-leave)', () => {
+    const bootSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'bootRecoveryService.js'), 'utf8'
+    );
+    assert.match(bootSrc, /recoverImageAd|imageRecoveryService/,
+      'bootRecovery must call recoverImageAd for static receipts');
+    assert.match(bootSrc, /status:\s*['"]rendering['"]/);
+    assert.match(bootSrc, /HAS_RECEIPT/);
+    // Must not only warn and leave paid plates undelivered.
+    assert.ok(!/cannot be delivered yet \(needs crop \+ logo \+ upload\)/.test(bootSrc),
+      'must not leave paid images uncollected with the old log-only branch');
+  });
+
+  check('M5 pre-spend idempotency: re-read before judgeRender in recovery', () => {
+    const recSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'imageRecoveryService.js'), 'utf8'
+    );
+    const fn = recSrc.indexOf('async function maybeQcRecoveredPlate');
+    assert.ok(fn > -1, 'maybeQcRecoveredPlate missing');
+    const body = recSrc.slice(fn, recSrc.indexOf('function surfaceForAd', fn));
+    const reRead = body.indexOf('Ad.findById');
+    const judge = body.indexOf('judgeRender');
+    assert.ok(reRead > -1 && judge > reRead, 'must re-read before judgeRender');
+    assert.match(body.slice(reRead, judge), /visionQc/,
+      'must short-circuit when visionQc already present');
+  });
+
+  check('M6 QC-failed recovery lands status failed (not plain draft)', () => {
+    const recSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'imageRecoveryService.js'), 'utf8'
+    );
+    assert.ok(
+      /qcFailed\s*\?\s*['"]failed['"]\s*:\s*['"]draft['"]/.test(recSrc)
+      || /status:\s*qcFailed\s*\?\s*['"]failed['"]/.test(recSrc),
+      'QC fail must not land as plain draft'
+    );
+    // Paid renderUrl still persisted either way.
+    assert.match(recSrc, /renderUrl/, 'paid pixels must still be written');
+  });
+
+  check('M7 alertQcFailure title reflects regeneration (recovery = no regen)', () => {
+    assert.strictEqual(
+      qc.qcFailureTitle({ finalAttempt: 1, attempts: [{ attempt: 1 }] }),
+      'Static ad failed vision QC (no regeneration)'
+    );
+    assert.strictEqual(
+      qc.qcFailureTitle({ finalAttempt: 2, attempts: [{}, {}] }),
+      'Static ad failed vision QC after one regeneration'
+    );
+    assert.strictEqual(
+      qc.qcFailureTitle({ finalAttempt: 2, attempts: [{}, {}] }, { regenerated: false }),
+      'Static ad failed vision QC (no regeneration)'
+    );
+    const captured = fakeNotify(() => qc.alertQcFailure({
+      adId: 'ad-rec', brandId: 'b1', productId: 'p1', brandName: 'X',
+      visionQc: qc.buildPersistedVerdict({
+        passed: false, finalAttempt: 1,
+        attempts: [{
+          attempt: 1, pass: false, categories: FAIL_VERDICT.categories,
+          findings: FAIL_VERDICT.findings, summary: FAIL_VERDICT.summary,
+          renderUrl: 'https://cdn.example/r.png'
+        }]
+      }),
+      regenerated: false
+    }));
+    assert.ok(captured, 'alert must fire');
+    assert.match(captured.title, /no regeneration/i);
+    assert.ok(!/after one regeneration/i.test(captured.title));
+  });
+
+  check('M8 ads list projection includes visionQc.reason', () => {
+    const adsSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'routes', 'ads.js'), 'utf8'
+    );
+    // List projection block (not only the full inspector).
+    assert.match(adsSrc, /reason:\s*a\.visionQc\.reason/);
+  });
+
+  check('M9 rate-limit drops increment suppressed (both buckets)', () => {
+    const alertSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'alertService.js'), 'utf8'
+    );
+    // Inside the !withinRateLimit branch, suppressed must be incremented.
+    const i = alertSrc.indexOf('if (!withinRateLimit');
+    assert.ok(i > -1);
+    const end = alertSrc.indexOf('return false;', i);
+    assert.ok(end > i);
+    const branch = alertSrc.slice(i, end + 20);
+    assert.match(branch, /suppressed\.set/,
+      'rate-limit deny must count toward +N more (suppressed)');
+    assert.match(branch, /lastSentAt\.delete/,
+      'rate-limit deny still releases the dedupe slot');
+  });
+
+  await checkAsync('M10 flag-off runPostRenderQc does not claim passed:true', async () => {
+    const result = await qc.runPostRenderQc({
+      enabled: false,
+      originalProductUrl: 'https://cdn.example/o.jpg',
+      generate: async () => makeOutput(1)
+    });
+    assert.strictEqual(result.skipped, true);
+    assert.strictEqual(result.visionQc.disabled, true);
+    assert.strictEqual(result.visionQc.passed, false,
+      'uninspected must not claim passed — landmine for .passed-only callers');
+  });
+
+  check('M11 formatThreadLine renders QC summary/attempt (not dead payload)', () => {
+    const runFeed = require('../services/runFeedService');
+    const line = runFeed.formatThreadLine({
+      t: Date.now(),
+      stage: 'vision QC pass',
+      adId: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+      meta: { summary: 'clean product', attempt: 1, template: 'ai_brand_led', aspectRatio: '1:1' }
+    });
+    assert.match(line, /attempt=1/);
+    assert.match(line, /clean product/);
+  });
+
   // ── N. Preview / app deep link helpers ─────────────────────────────
   check('N1 buildAppPreviewUrl uses FRONTEND_URL (no hardcoded domain)', () => {
     const prev = process.env.FRONTEND_URL;

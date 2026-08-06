@@ -216,6 +216,9 @@ function formatThreadLine(ev) {
   }
   if (meta.mediaId) bits.push(`media=…${shortId(meta.mediaId)}`);
   if (ev.adId) bits.push(`ad=…${shortId(ev.adId)}`);
+  // Vision QC meta — only when present (noteQcPass/FailToRunFeed).
+  if (meta.attempt != null && meta.attempt !== '') bits.push(`attempt=${meta.attempt}`);
+  if (meta.summary) bits.push(String(meta.summary).slice(0, 120));
   // Optional preview URL (e.g. Cloudinary render, app deep link). Only when
   // present so every existing caller of noteEvent/onStage is unchanged.
   if (meta.previewUrl) bits.push(String(meta.previewUrl));

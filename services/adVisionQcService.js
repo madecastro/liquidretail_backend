@@ -75,6 +75,14 @@ function resolveQcModel() {
  * Image order is fixed: [0]=ORIGINAL PRODUCT, [1]=GENERATED AD.
  * Follows aiCreativeDirectorService.js:1208-1212 convention
  * ({type:'image_url', image_url:{url}}).
+ *
+ * expectedText contract:
+ *   - string[] (possibly empty) when the copy contract is KNOWN.
+ *     Empty list means pure product image is legitimate (live path).
+ *   - expectedTextUnknown:true when the copy contract cannot be
+ *     reconstructed (recovery). Then text_defects is scored ONLY on
+ *     intrinsic defects — never on "unexpected" copy presence. Do NOT
+ *     pass [] for that case: [] means "no text allowed".
  */
 function buildVisionUserContent({
   originalProductUrl,
@@ -82,7 +90,8 @@ function buildVisionUserContent({
   brandName,
   safeBox,
   deliveryDims,
-  expectedText
+  expectedText,
+  expectedTextUnknown = false
 }) {
   if (!originalProductUrl) throw new Error('adVisionQc: originalProductUrl required');
   if (!renderUrl) throw new Error('adVisionQc: renderUrl required');
@@ -90,9 +99,38 @@ function buildVisionUserContent({
   const brand = brandName || 'the advertiser';
   const box = safeBox || {};
   const dims = deliveryDims || {};
-  const textList = Array.isArray(expectedText) && expectedText.length
-    ? expectedText.map((t) => `  - ${t}`).join('\n')
-    : '  (none — pure product image is legitimate)';
+
+  let expectedTextSection;
+  let textDefectsInstruction;
+  if (expectedTextUnknown) {
+    // Recovery / any path where the exact copy contract is not durable.
+    // MUST NOT render as "(none — pure product…)" — that false-fails every
+    // ad that legitimately carries a brand line / CTA / rating.
+    expectedTextSection =
+      'Expected on-ad text strings: UNKNOWN — the exact copy contract for this ' +
+      'render is not available to the inspector.\n' +
+      '  Score text_defects ONLY on intrinsic defects (misspellings, gibberish ' +
+      'letterforms, mangled or duplicated words, literal role-label leakage ' +
+      'like "RATING:"). Do NOT fail for the mere presence of brand copy, CTAs, ' +
+      'ratings, headlines or other ad text — those may be legitimate. Still ' +
+      'fail for intrinsically mangled letterforms.';
+    textDefectsInstruction =
+      'Misspellings, mangled or duplicated words, gibberish letterforms, and ' +
+      'literal label leakage (e.g. "RATING: 4.8 ★" with the role label visible). ' +
+      'The expected copy list is UNKNOWN — score ONLY these intrinsic defects; ' +
+      'do NOT penalise presence of otherwise-plausible ad copy.';
+  } else {
+    const textList = Array.isArray(expectedText) && expectedText.length
+      ? expectedText.map((t) => `  - ${t}`).join('\n')
+      : '  (none — pure product image is legitimate)';
+    expectedTextSection =
+      'Expected on-ad text strings (if any) — these are the ONLY words that should appear as ad copy:\n' +
+      textList;
+    textDefectsInstruction =
+      'Misspellings, mangled or duplicated words, gibberish letterforms, and ' +
+      'literal label leakage (e.g. "RATING: 4.8 ★" printed with the role label ' +
+      '"RATING" visible). Compare against the expected text list above.';
+  }
 
   const prompt = `You are a post-render quality inspector for direct-response product ads.
 
@@ -104,8 +142,7 @@ Brand name: ${brand}
 Delivery canvas: ${dims.width || '?'}×${dims.height || '?'} px
 Declared SAFE BOX (content must stay inside; coordinates in delivered pixels):
   left=${box.left ?? '?'}, top=${box.top ?? '?'}, right=${box.right ?? '?'}, bottom=${box.bottom ?? '?'}
-Expected on-ad text strings (if any) — these are the ONLY words that should appear as ad copy:
-${textList}
+${expectedTextSection}
 
 Score EACH category 0–10 (integer) and list concrete findings. Return ONLY JSON.
 
@@ -125,9 +162,7 @@ CATEGORIES
    identity drift is not.
 
 3. text_defects
-   Misspellings, mangled or duplicated words, gibberish letterforms, and
-   literal label leakage (e.g. "RATING: 4.8 ★" printed with the role label
-   "RATING" visible). Compare against the expected text list above.
+   ${textDefectsInstruction}
 
 4. layout_safe_box
    Any text, CTA, or logo that breaches the declared safe box numbers above,
@@ -263,6 +298,7 @@ async function judgeRender({
   safeBox,
   deliveryDims,
   expectedText,
+  expectedTextUnknown = false,
   brandId = null,
   productId = null,
   adId = null,
@@ -276,7 +312,8 @@ async function judgeRender({
     brandName,
     safeBox,
     deliveryDims,
-    expectedText
+    expectedText,
+    expectedTextUnknown
   });
 
   // ── MONEY: billable vision LLM call ──────────────────────────────
@@ -447,6 +484,7 @@ async function runPostRenderQc({
   safeBox,
   deliveryDims,
   expectedText,
+  expectedTextUnknown = false,
   brandId = null,
   productId = null,
   adId = null,
@@ -468,6 +506,10 @@ async function runPostRenderQc({
   );
 
   // ── Flag off: one generation, zero vision, zero regeneration ──
+  // Do NOT claim passed:true — nothing was inspected. Callers that only
+  // check `.passed` would otherwise treat an uninspected plate as clean.
+  // Live production short-circuits earlier (isEnabled check in the render
+  // service) so this shape is for harnesses and any future direct caller.
   if (!enabled) {
     const output = await generate({ attempt: 1, correctiveNote: null });
     return {
@@ -475,9 +517,10 @@ async function runPostRenderQc({
       skipped: true,
       output,
       visionQc: buildPersistedVerdict({
-        passed: true,
+        passed: false,
         skipped: true,
         disabled: true,
+        reason: 'AD_VISION_QC_ENABLED=false',
         finalAttempt: 1,
         attempts: []
       }),
@@ -561,6 +604,7 @@ async function runPostRenderQc({
         safeBox,
         deliveryDims,
         expectedText,
+        expectedTextUnknown,
         brandId,
         productId,
         adId,
@@ -736,18 +780,45 @@ function buildQcSlackDetail(visionQc, { appUrl = null } = {}) {
 }
 
 /**
- * Slack + log helper for terminal QC failure ("rejection"). Fire-and-forget.
+ * Title for a terminal QC failure. Reflects whether a billable regeneration
+ * actually ran — recovery never regenerates, so a hard-coded "after one
+ * regeneration" title would lie about ~$0.07 that never spent.
+ *
+ * regenerated: explicit override (recovery passes false).
+ * Otherwise inferred from finalAttempt / attempts length > 1.
  */
-function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl = null }) {
+function qcFailureTitle(visionQc, { regenerated = null } = {}) {
+  const attempts = visionQc?.attempts || [];
+  const finalAttempt = Number(visionQc?.finalAttempt) || attempts.length || 0;
+  const didRegen = regenerated == null
+    ? (finalAttempt > 1 || attempts.length > 1)
+    : !!regenerated;
+  return didRegen
+    ? 'Static ad failed vision QC after one regeneration'
+    : 'Static ad failed vision QC (no regeneration)';
+}
+
+/**
+ * Slack + log helper for terminal QC failure ("rejection"). Fire-and-forget.
+ *
+ * @param {boolean|null} [regenerated] — when known, overrides attempt-count
+ *   inference for the alert title (recovery always passes false).
+ */
+function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl = null, regenerated = null } = {}) {
   try {
     const alerts = require('./alertService');
     const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
     const findings = (last?.findings || []).slice(0, 6).join(' | ')
       || (visionQc?.attempts || []).map((a) => a.summary).filter(Boolean).join(' → ')
       || 'no findings';
+    const attempts = visionQc?.attempts || [];
+    const finalAttempt = Number(visionQc?.finalAttempt) || attempts.length || 0;
+    const didRegen = regenerated == null
+      ? (finalAttempt > 1 || attempts.length > 1)
+      : !!regenerated;
     alerts.notifyAsync({
       level: 'error',
-      title: 'Static ad failed vision QC after one regeneration',
+      title: qcFailureTitle(visionQc, { regenerated }),
       // Keyed per-ad, not a fixed literal: alertService's notify() dedupes
       // by this key within a 15-minute window (ALERT_DEDUPE_WINDOW_MIN) and
       // folds anything suppressed into a generic "+N more (suppressed)"
@@ -761,7 +832,8 @@ function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl 
         ad: String(adId || '-'),
         brand: brandName || String(brandId || '-'),
         product: String(productId || '-'),
-        attempts: String(visionQc?.attempts?.length || 0),
+        attempts: String(attempts.length || 0),
+        regenerated: didRegen ? 'yes' : 'no',
         findings: findings.slice(0, 300)
       },
       detail: buildQcSlackDetail(visionQc, { appUrl })
@@ -868,6 +940,7 @@ function noteQcPassToRunFeed({
       template: template || null,
       aspectRatio: aspectRatio || null,
       platformFormat: platformFormat || null,
+      // summary + attempt are rendered by formatThreadLine (not dead payload).
       summary: String(last?.summary || 'pass').slice(0, 200),
       attempt: visionQc?.finalAttempt || null,
       previewUrl: url
@@ -901,6 +974,7 @@ function noteQcFailToRunFeed({
       template: template || null,
       aspectRatio: aspectRatio || null,
       platformFormat: platformFormat || null,
+      // summary + attempt are rendered by formatThreadLine (not dead payload).
       summary: String(last?.summary || 'fail').slice(0, 200),
       attempt: visionQc?.finalAttempt || null,
       previewUrl: url
@@ -929,6 +1003,7 @@ module.exports = {
   emptyCategories,
   resolveFrontendOrigin,
   buildAppPreviewUrl,
+  qcFailureTitle,
   // I/O
   judgeRender,
   runPostRenderQc,

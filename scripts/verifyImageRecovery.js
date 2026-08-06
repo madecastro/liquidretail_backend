@@ -42,15 +42,46 @@ const dirSrc = fs.readFileSync(path.join(ROOT, 'services/directImageRenderServic
 
 console.log('\nSTATIC IMAGE RECOVERY\n');
 
-// ── A. [MONEY] NO SUBMIT, STRUCTURALLY ───────────────────────────────────
+// ── A. [MONEY] NO IMAGE SUBMIT, STRUCTURALLY ─────────────────────────────
 check('A1 recovery never calls a generate/edit entry point',
   !/\b(generateImage|editImage)\s*\(/.test(recSrc));
 check('A2 recovery issues no HTTP POST of its own',
   !/axios\.post|\.post\(/.test(recSrc));
-check('A3 its only provider read is peekImagePrediction (the free GET)',
-  /peekImagePrediction/.test(recSrc));
+check('A3 free provider read is peekImagePrediction; vision LLM is optional QC only',
+  /peekImagePrediction/.test(recSrc)
+  && /judgeRender|maybeQcRecoveredPlate/.test(recSrc));
 check('A4 it does not import atlasVideoService or a render-submit path',
   !/atlasVideoService|renderCreative|runRenderLoop/.test(recSrc));
+// Pre-spend idempotency: vision call only after re-read confirms recoverability.
+check('A5 [MONEY] maybeQcRecoveredPlate re-reads ad status/visionQc BEFORE judgeRender',
+  (() => {
+    const fn = recSrc.indexOf('async function maybeQcRecoveredPlate');
+    if (fn === -1) return false;
+    const body = recSrc.slice(fn, recSrc.indexOf('\nasync function ', fn + 1) === -1
+      ? recSrc.indexOf('\nfunction surfaceForAd', fn)
+      : recSrc.indexOf('\nasync function ', fn + 1));
+    const reRead = body.indexOf('Ad.findById');
+    const judge = body.indexOf('judgeRender');
+    return reRead > -1 && judge > reRead
+      && /visionQc/.test(body.slice(reRead, judge))
+      && /draft.*live.*archived|live.*archived/.test(body.slice(reRead, judge));
+  })());
+// Expected text: judge call must never hard-code expectedText:[] (that means
+// "pure product" and false-fails brand-line ads). Known-empty via reconstruction
+// is fine; the UNKNOWN flag is required when reconstruction fails.
+check('A6 recovery judge path uses expectedTextUnknown, never hard-coded []',
+  (() => {
+    const i = recSrc.indexOf('judgeRender({');
+    if (i === -1) return false;
+    const call = recSrc.slice(i, recSrc.indexOf('});', i) + 2);
+    return !/expectedText:\s*\[\s*\]/.test(call)
+      && /expectedTextUnknown/.test(call)
+      && /resolveExpectedTextForRecovery/.test(recSrc);
+  })());
+// QC fail → status failed (not plain draft exportable pool).
+check('A7 QC-failed recovery sets status failed (not plain draft)',
+  /qcFailed\s*\?\s*['"]failed['"]\s*:\s*['"]draft['"]/.test(recSrc)
+  || /status:\s*qcFailed\s*\?\s*['"]failed['"]/.test(recSrc));
 
 // ── B. [MONEY] NEVER SHIP THE RAW ATLAS OUTPUT AS THE AD ─────────────────
 check('B1 the persisted renderUrl comes from the Cloudinary upload, never from '

@@ -100,33 +100,33 @@ check('A5 both resume primitives are exported',
   check('C6 it marks the partial shape receiptOnly so a reader can tell it from the full record',
     /receiptOnly/.test(chargePoint));
 
-  // ── D. bootRecoveryService routes by receipt ────────────────────────────
-  check('D1 bootRecovery imports resumeImageForAd', /resumeImageForAd/.test(bootSrc));
-  check('D2 it selects imageGeneration (HAS_RECEIPT matches on it, so selecting only '
-      + 'veoPredictionId is what wrote off every stranded static ad as unknown)',
-    /\.select\(['"][^'"]*imageGeneration/.test(bootSrc));
+  // ── D. bootRecoveryService owns rendering+receipt static recovery ───────
+  // Revert: drop recoverImageAd wiring → D1/D4 fail (paid plates stay stranded).
+  // Stamp raw Atlas URL onto renderUrl → D4 fails (uncropped ship).
+  check('D1 bootRecovery imports recoverImageAd (finishPlate path — zero image submits)',
+    /require\(['"]\.\/imageRecoveryService['"]\)/.test(bootSrc)
+    && /recoverImageAd/.test(bootSrc));
+  check('D2 query uses HAS_RECEIPT so static imageGeneration.predictionId ads are found',
+    /HAS_RECEIPT/.test(bootSrc)
+    && /status:\s*['"]rendering['"]/.test(bootSrc));
   check('D3 it routes on which receipt the ad holds, not on ad.kind',
     /isImageReceipt/.test(bootSrc)
     && /!ad\.veoPredictionId\s*&&\s*!!ad\.imageGeneration\?\.predictionId/.test(bootSrc));
-  check('D4 [MONEY/CORRECTNESS] a located image is NOT stamped onto renderUrl — that would '
-      + 'ship an uncropped, unbranded image as a successful render',
+  check('D4 [MONEY/CORRECTNESS] image branch calls recoverImageAd — never stamps raw '
+      + 'Atlas URL onto renderUrl (that would ship uncropped/unbranded)',
     (() => {
-      const i = bootSrc.indexOf('isImageReceipt && r.state ===');
-      if (i === -1) return false;
-      // Bound the window to THIS branch only — it ends at its `continue;`. A fixed
-      // char window overruns into the video 'done' branch below, which legitimately
-      // DOES stamp renderUrl/status:'draft', and would false-positive forever.
-      const end = bootSrc.indexOf('continue;', i);
-      if (end === -1) return false;
-      const branch = bootSrc.slice(i, end);
-      return !/renderUrl/.test(branch) && !/status:\s*['"]draft['"]/.test(branch);
+      // Image branch must invoke recover (finishPlate + upload), not assign
+      // r.imageUrl / peek.imageUrl to renderUrl.
+      const hasRecover = /recoverImage\s*\(\s*\{\s*ad\s*\}\s*\)|recoverImageAd\s*\(/.test(bootSrc);
+      const stampsRaw = /renderUrl\s*:\s*r\.imageUrl|renderUrl\s*=\s*r\.imageUrl|renderUrl\s*:\s*peek\.imageUrl/.test(bootSrc);
+      return hasRecover && !stampsRaw;
     })());
-  check('D5 the image branch is counted separately and never folded into `recovered`',
-    /recoverableNotCollected/.test(bootSrc)
-    && !/out\.recovered\+\+[\s\S]{0,80}recoverableNotCollected/.test(bootSrc));
-  check('D6 the failure branch records WHICHEVER receipt exists (hardcoding veoPredictionId '
-      + 'wrote null for every static ad, losing the handle to real spend)',
-    /renderError\.predictionId['"]\]?\s*:\s*ad\.veoPredictionId\s*\|\|\s*ad\.imageGeneration\?\.predictionId/.test(bootSrc));
+  check('D5 rendering+receipt population reaches recoverImageAd (not log-and-leave)',
+    /if\s*\(\s*isImageReceipt\s*\)/.test(bootSrc)
+    && /recoverImage\s*\(/.test(bootSrc)
+    && /out\.recovered\+\+/.test(bootSrc));
+  check('D6 image failure stamps imageGeneration.predictionId (not only veo)',
+    /renderError\.predictionId['"]\]?\s*:\s*ad\.imageGeneration\?\.predictionId/.test(bootSrc));
 
   // ── E. A CHARGE IS CONFIRMED, NEVER ASSUMED (owner rule, CLAUDE.md §2) ────
   // A receipt proves a SUBMIT, not a CHARGE: Atlas refunds failed tasks, and the
@@ -155,16 +155,12 @@ check('A5 both resume primitives are exported',
   check('E3 [MONEY] bootRecovery does NOT hardcode charged:true for an image — the charged flag '
       + 'itself must be derived from a confirmed price',
     (() => {
-      // Scope to the confirmedCharge ASSIGNMENT. A bootSrc-wide regex for the
-      // priceConfirmed expression false-passes, because the same expression also
-      // guards the reconcileCost call below — verified: hardcoding the image branch
-      // to `true` left that wide check green. The flag's own derivation is the thing
-      // under test.
+      // Scope to the confirmedCharge ASSIGNMENT on the image failure path.
       const i = bootSrc.indexOf('const confirmedCharge');
       if (i === -1) return false;
       const assignment = bootSrc.slice(i, bootSrc.indexOf(';', i));
       return /priceConfirmed\s*===\s*true/.test(assignment)
-        && /Number\(r\.price\)\s*>\s*0/.test(assignment);
+        && /Number\(\s*(?:ir|r)\.price\s*\)\s*>\s*0/.test(assignment);
     })());
   check('E4 the unconfirmed case is recorded as UNCONFIRMED in the message, not silently as free',
     /charge UNCONFIRMED/.test(bootSrc));
@@ -178,9 +174,8 @@ check('A5 both resume primitives are exported',
   // 1. Delete the charge-point block  -> C1..C6 fail (6).
   // 2. Swap $mergeObjects for a dotted `'imageGeneration.predictionId': id` $set
   //    -> C2 fails (and the code would throw in prod on any ad with null imageGeneration).
-  // 3. Make the bootRecovery image branch stamp renderUrl/status:'draft'
-  //    -> D4 fails (the "ships an unbranded image as success" regression).
-  // 4. Revert bootRecovery's .select() to '_id veoPredictionId' -> D2 fails.
+  // 3. Drop recoverImageAd and log-and-leave again -> D1/D4/D5 fail.
+  // 4. Stamp r.imageUrl onto renderUrl in bootRecovery -> D4 fails.
   // 5. Add an axios.post to the resume region -> A2 fails (the double-charge regression).
   // Each verified by hand before shipping this harness.
 

@@ -377,7 +377,12 @@ async function notify({ level = 'warn', title, detail, fields, key } = {}) {
     if (!withinRateLimit(lvl)) {
       // Rate-limited, not delivered — release the slot so the key isn't
       // silenced for the whole dedupe window by a burst it never joined.
+      // Count the drop the same way dedupe does so "+N more (suppressed)"
+      // reflects BOTH rate-limit and dedupe drops (both buckets share this
+      // map; severity only affects which rate-limit bucket was consulted).
       lastSentAt.delete(dedupeKey);
+      const prev = suppressed.get(dedupeKey) || { count: 0, since: now };
+      suppressed.set(dedupeKey, { count: prev.count + 1, since: prev.since });
       return false;
     }
 

@@ -38,9 +38,10 @@
 const Ad = require('../models/Ad');
 const { HAS_RECEIPT } = require('./spendReceipt');
 const { resumeForAd } = require('./atlasVideoService');
-// Static-image counterpart. Also a free, no-submit GET — see its header for why a
-// located image is not yet a deliverable ad.
-const { resumeImageForAd } = require('./atlasImageService');
+// Static-image counterpart: recoverImageAd peeks (free GET), finishPlate (local
+// crop + logo), Cloudinary upload, optional vision QC. ZERO image submits.
+// See imageRecoveryService header for the money contract.
+const { recoverImageAd } = require('./imageRecoveryService');
 // Upgrades an 'estimated' ledger row to Atlas's own settled `price`. The owner rule
 // is that a charge must be CONFIRMED, never assumed — see the charge block below.
 const { reconcileCost } = require('./costTracker');
@@ -72,13 +73,17 @@ function enabled() {
  * be able to take down the boot it runs inside, which is the exact crash class
  * (an unhandled rejection in fire-and-forget work) that motivated all of this.
  */
-async function resumeInFlightAds({ limit = RESUME_MAX_ADS, staleMinutes = RESUME_STALE_MIN } = {}) {
+async function resumeInFlightAds({
+  limit = RESUME_MAX_ADS,
+  staleMinutes = RESUME_STALE_MIN,
+  // Injectable so the harness can exercise image recovery without network.
+  recoverImage = recoverImageAd
+} = {}) {
   const out = {
     considered: 0, recovered: 0, failed: 0, stillRunning: 0, unknown: 0, skipped: false,
-    // Static images whose paid output EXISTS at Atlas but cannot be delivered yet
-    // (needs the post-model crop + logo + upload). Counted separately and never
-    // folded into `recovered` — reporting these as recovered would claim ads that
-    // are not on the ads page.
+    // Static images whose paid output was located but finishPlate/upload could
+    // not complete this pass (fetch blip, geometry, etc.). Retried next sweep.
+    // NOT "we refuse to collect" — collection is recoverImageAd below.
     recoverableNotCollected: 0
   };
   if (!enabled()) { out.skipped = 'RESUME_IN_FLIGHT_ON_BOOT=false'; return out; }
@@ -86,12 +91,20 @@ async function resumeInFlightAds({ limit = RESUME_MAX_ADS, staleMinutes = RESUME
   let ads;
   try {
     const cutoff = new Date(Date.now() - staleMinutes * 60 * 1000);
+    // OWNER of the status:'rendering' + receipt population.
+    // strandedRunSweeper owns queued/failed-run stranding; this service owns
+    // mid-render / mid-QC crashes left in rendering. The worker reaper
+    // (worker.js) deliberately leaves HAS_RECEIPT ads in rendering and only
+    // requeues receiptFree — so recovery here cannot race a reaper requeue
+    // into a second billable submit. RESUME_STALE_MIN (default 5) is also
+    // lower than REAP_STALE_MIN (15): we collect before the reaper even
+    // considers the row.
     ads = await Ad.find({ status: 'rendering', updatedAt: { $lt: cutoff }, ...HAS_RECEIPT })
       // imageGeneration is selected because HAS_RECEIPT matches on BOTH receipts
       // (veoPredictionId OR imageGeneration.predictionId) — see the routing note in
       // the loop below. Selecting only veoPredictionId is what made every stranded
       // STATIC ad fall through to the video resume and get written off as 'unknown'.
-      .select('_id veoPredictionId imageGeneration kind')
+      // Full lean doc for recoverImageAd (platformFormat, mediaId, brandId, …).
       .sort({ updatedAt: 1 })          // oldest first — most likely already finished
       .limit(limit)
       .lean();
@@ -114,33 +127,82 @@ async function resumeInFlightAds({ limit = RESUME_MAX_ADS, staleMinutes = RESUME
     // Omni master is the expensive one (~$1.00 vs ~$0.07).
     const isImageReceipt = !ad.veoPredictionId && !!ad.imageGeneration?.predictionId;
 
-    let r;
-    try {
-      r = isImageReceipt ? await resumeImageForAd({ ad }) : await resumeForAd({ ad });
-    } catch (err) {
-      // Neither resume is supposed to throw; if one ever does, that must not end
-      // the pass and lose the remaining ads.
-      out.unknown++;
-      console.warn(`   ⚠️  bootRecovery[${ad._id}]: resume threw — ${err.message}`);
+    // ── STATIC IMAGE: finish the already-paid plate (crop + logo + upload) ──
+    // recoverImageAd peeks, fetches, finishPlate, uploads, optional vision QC.
+    // ZERO image submits. Status-filtered write; never stamps raw Atlas URL.
+    if (isImageReceipt) {
+      let ir;
+      try {
+        ir = await recoverImage({ ad });
+      } catch (err) {
+        out.unknown++;
+        console.warn(`   ⚠️  bootRecovery[${ad._id}]: image recover threw — ${err.message}`);
+        continue;
+      }
+      if (ir.state === 'recovered') {
+        out.recovered++;
+        console.log(
+          `   ✅ bootRecovery[${ad._id}]: static plate recovered from receipt ${ir.predictionId}` +
+          `${ir.qcFailed ? ' (vision QC failed — kept paid render, status failed)' : ''} — $0 image submit`
+        );
+        continue;
+      }
+      if (ir.state === 'processing' || ir.state === 'unknown') {
+        out.stillRunning++;
+        continue;
+      }
+      if (ir.state === 'failed') {
+        // Atlas says the prediction failed. Charge is CONFIRMED only when peek
+        // published a positive price (same rule as the video failure path).
+        try {
+          const confirmedCharge = ir.priceConfirmed === true && Number(ir.price) > 0;
+          const chargeNote = ir.priceConfirmed !== true
+            ? ' [charge UNCONFIRMED — Atlas published no price for this prediction; stored as not-charged because the schema cannot express "unknown"]'
+            : '';
+          await Ad.updateOne(
+            { _id: ad._id, status: 'rendering' },
+            { $set: {
+              status: 'failed',
+              updatedAt: new Date(),
+              'renderError.message': (ir.message || 'prediction failed') + chargeNote,
+              'renderError.stage': 'resume',
+              'renderError.at': new Date(),
+              'renderError.predictionId': ad.imageGeneration?.predictionId || null,
+              'renderError.charged': confirmedCharge
+            } }
+          );
+          if (confirmedCharge && ir.predictionId) {
+            reconcileCost({ providerRequestId: ir.predictionId, costUsd: Number(ir.price) })
+              .catch(() => {});
+          }
+          out.failed++;
+        } catch (err) {
+          console.warn(`   ⚠️  bootRecovery[${ad._id}]: could not record image failure — ${err.message}`);
+          out.unknown++;
+        }
+        continue;
+      }
+      if (ir.state === 'no-receipt') {
+        out.unknown++;
+        continue;
+      }
+      // unrecoverable this pass (geometry / upload / already resolved) — leave
+      // in rendering for a later retry, or already-resolved is a no-op.
+      out.recoverableNotCollected++;
+      console.warn(
+        `   ⚠️  bootRecovery[${ad._id}]: image recover ${ir.state} — ${ir.message || 'no detail'}`
+      );
       continue;
     }
 
-    // ── STATIC IMAGE, ASSET LOCATED BUT NOT DELIVERABLE ─────────────────────
-    // A static ad's Atlas output is NOT a finished ad: directImageRenderService
-    // still has to apply the delivery crop and the logo composite (~:1090) and
-    // upload to Cloudinary. Stamping r.imageUrl onto renderUrl would ship an
-    // uncropped, unbranded image AS IF the render had succeeded — the one outcome
-    // worse than not recovering it. So this reports and alerts, and deliberately
-    // does NOT transition the ad. The money is already spent either way; what is
-    // missing is the post-model half of the render, which is not yet callable
-    // standalone. Tracked as the remaining piece of image recovery.
-    if (isImageReceipt && r.state === 'done' && r.imageUrl) {
-      out.recoverableNotCollected++;
-      console.warn(
-        `   💸 bootRecovery[${ad._id}]: PAID image is available at receipt ${r.predictionId} ` +
-        `but cannot be delivered yet (needs crop + logo + upload) — left in 'rendering'. ` +
-        `Atlas output: ${r.imageUrl}`
-      );
+    let r;
+    try {
+      r = await resumeForAd({ ad });
+    } catch (err) {
+      // resume is not supposed to throw; if it does, that must not end
+      // the pass and lose the remaining ads.
+      out.unknown++;
+      console.warn(`   ⚠️  bootRecovery[${ad._id}]: resume threw — ${err.message}`);
       continue;
     }
 
@@ -197,62 +259,37 @@ async function resumeInFlightAds({ limit = RESUME_MAX_ADS, staleMinutes = RESUME
 
     if (r.state === 'failed') {
       try {
+        // VIDEO failure path only (static images are handled above via
+        // recoverImageAd and never reach here). isImage is always false on
+        // this branch — the ternary is kept so the video charge derivation
+        // stays explicit and pinned by verifyVideoResume O5.
+        //
         // ── CHARGE: CONFIRMED, NOT ASSUMED (owner rule, CLAUDE.md §2) ────────
-        // A receipt proves a SUBMIT happened; it does not prove a CHARGE. Atlas
-        // refunds failed tasks, and the authoritative figure is `price` on the
-        // settled prediction — so for images, where peekImagePrediction reads that
-        // price back, the flag comes from Atlas's own answer:
+        // VIDEO IS UNCHANGED ON PURPOSE. atlasVideoService.peekPrediction does
+        // not read `price` back, so there is nothing to confirm against; some
+        // video models also bill on completion rather than submit. Changing
+        // video's billing semantics is its own reviewed change.
         //
-        //   priceConfirmed && price > 0  -> charged (and reconcile to the real
-        //                                   number, which base_price understates
-        //                                   by ~7.17x on gpt-image-2)
-        //   priceConfirmed && price == 0 -> genuinely not charged (refunded)
-        //   !priceConfirmed              -> UNKNOWN. See the honesty gap below.
-        //
-        // ⚠️ HONESTY GAP, deliberately surfaced rather than papered over:
-        // models/Ad.js declares `renderError.charged` as {type: Boolean,
-        // default:false}, so the schema CANNOT represent "unknown" — and
-        // renderService.js:1440 already collapses a null policy.charged to false
-        // via `err.charged === true`. So an unconfirmed charge is stored as
-        // `false`, i.e. as "free", which understates spend — the one direction the
-        // ledger can never be corrected in. Representing it truthfully needs a
-        // schema change (tri-state, or a companion `chargeConfirmed`), which is
-        // NOT bundled here. What this code does instead is refuse to make the
-        // opposite error: it never claims `true` without Atlas saying so, and it
-        // records the uncertainty in the message so the row is not silently wrong.
-        const isImage = isImageReceipt;
+        // ⚠️ HONESTY GAP for images (now handled in the image branch above):
+        // models/Ad.js declares `renderError.charged` as Boolean default false,
+        // so "unknown" cannot be represented. Image path never claims true
+        // without Atlas publishing a positive price.
+        const isImage = false; // static receipts never reach this branch
         const confirmedCharge = isImage
           ? (r.priceConfirmed === true && Number(r.price) > 0)
-          // VIDEO IS UNCHANGED ON PURPOSE. atlasVideoService.peekPrediction does
-          // not read `price` back, so there is nothing to confirm against; some
-          // video models also bill on completion rather than submit. Changing
-          // video's billing semantics is its own reviewed change, not a
-          // side-effect of the image fix.
           : true;
-        const chargeNote = isImage && r.priceConfirmed !== true
-          ? ' [charge UNCONFIRMED — Atlas published no price for this prediction; stored as not-charged because the schema cannot express "unknown"]'
-          : '';
-
         await Ad.updateOne(
           { _id: ad._id, status: 'rendering' },
           { $set: {
             status: 'failed',
             updatedAt: new Date(),
-            'renderError.message':      (r.message || 'prediction failed') + chargeNote,
+            'renderError.message':      r.message || 'prediction failed',
             'renderError.stage':        'resume',
             'renderError.at':           new Date(),
-            // Whichever receipt this ad actually holds — hardcoding veoPredictionId
-            // wrote null for every static ad, losing the only handle to the spend.
             'renderError.predictionId': ad.veoPredictionId || ad.imageGeneration?.predictionId || null,
             'renderError.charged':      confirmedCharge
           } }
         );
-        // Upgrade the ledger to Atlas's real figure when we have it. Non-fatal:
-        // reconcileCost only touches rows still marked costSource:'estimated'.
-        if (isImage && r.priceConfirmed === true && Number(r.price) > 0 && r.predictionId) {
-          reconcileCost({ providerRequestId: r.predictionId, costUsd: Number(r.price) })
-            .catch(() => {});
-        }
         out.failed++;
       } catch (err) {
         console.warn(`   ⚠️  bootRecovery[${ad._id}]: could not record failure — ${err.message}`);
@@ -285,13 +322,13 @@ async function resumeInFlightAds({ limit = RESUME_MAX_ADS, staleMinutes = RESUME
       title: out.recovered > 0
         ? `Recovered ${out.recovered} paid generation(s) after a restart`
         : out.recoverableNotCollected > 0
-          ? `${out.recoverableNotCollected} paid image(s) available at Atlas but not yet deliverable`
+          ? `${out.recoverableNotCollected} paid image(s) located but not finished this pass`
           : `${out.failed} paid generation(s) confirmed failed after a restart`,
       key: 'boot-recovery',
       fields: {
         recovered: out.recovered || undefined,
         failed: out.failed || undefined,
-        'paid but uncollected': out.recoverableNotCollected || undefined,
+        'not finished this pass': out.recoverableNotCollected || undefined,
         'still running': out.stillRunning || undefined,
         unknown: out.unknown || undefined
       }
