@@ -38,7 +38,7 @@
 
 const Ad          = require('../models/Ad');
 const CampaignRun = require('../models/CampaignRun');
-const { recoverImageAd } = require('./imageRecoveryService');
+const { recoverImageAd, settleChargeState } = require('./imageRecoveryService');
 const alerts = require('./alertService');
 
 const truthy = (v, dflt) => {
@@ -92,8 +92,8 @@ async function findStranded() {
  *   which is exactly how the first version of that test silently exercised the
  *   real function against fake prediction ids.
  */
-async function sweepStrandedRuns({ requeue = null, recover = recoverImageAd } = {}) {
-  const out = { considered: 0, recovered: 0, requeued: 0, skipped: false, stillProcessing: 0, unrecoverable: 0 };
+async function sweepStrandedRuns({ requeue = null, recover = recoverImageAd, settle = settleChargeState } = {}) {
+  const out = { considered: 0, recovered: 0, requeued: 0, skipped: false, stillProcessing: 0, unrecoverable: 0, chargesSettled: 0 };
   if (!ENABLED()) { out.skipped = 'STRANDED_SWEEP_ENABLED=false'; return out; }
 
   let ads, runs;
@@ -104,7 +104,9 @@ async function sweepStrandedRuns({ requeue = null, recover = recoverImageAd } = 
     return out;
   }
   out.considered = ads.length;
-  if (!ads.length) return out;
+  // No stranded WORK does not mean no unsettled MONEY — the charge pass is a
+  // separate question and must still run.
+  if (!ads.length) { out.chargesSettled = await settleUnknownCharges({ settle }); logSweep(out); return out; }
 
   console.log(`♻️  strandedSweep: ${ads.length} ad(s) stranded by a restart — recovering paid work first`);
 
@@ -134,12 +136,13 @@ async function sweepStrandedRuns({ requeue = null, recover = recoverImageAd } = 
   }
 
   // ── PASS 2: REQUEUE the genuinely unbilled.
-  if (!stillNeedRender.length) { logSweep(out); return out; }
+  if (!stillNeedRender.length) { out.chargesSettled = await settleUnknownCharges({ settle }); logSweep(out); return out; }
   if (!requeue || !REQUEUE_ON()) {
     console.log(
       `   ⏸  strandedSweep: ${stillNeedRender.length} receipt-free ad(s) need a real render — ` +
       `${requeue ? 'STRANDED_SWEEP_REQUEUE=false' : 'no requeue handler supplied'}; leaving them queued`
     );
+    out.chargesSettled = await settleUnknownCharges({ settle });
     logSweep(out);
     return out;
   }
@@ -163,12 +166,55 @@ async function sweepStrandedRuns({ requeue = null, recover = recoverImageAd } = 
     }
   }
 
+  out.chargesSettled = await settleUnknownCharges({ settle });
   logSweep(out);
   return out;
 }
 
+/**
+ * Resolve ads whose charge state is UNKNOWN, from the provider's own record.
+ *
+ * Separate from the stranded passes above because it is a different question:
+ * those ask "is there work to finish", this asks "did we actually pay". It rides
+ * the same interval rather than adding a timer, and it is FREE — one GET per ad,
+ * no submit, and it can only ever replace "we do not know" with a confirmed
+ * figure. Understating the ledger is the direction that can never be corrected,
+ * so leaving these unresolved is not neutral.
+ */
+async function settleUnknownCharges({ settle = settleChargeState } = {}) {
+  let settled = 0;
+  let ads;
+  try {
+    ads = await Ad.find({
+      'renderError.chargeState': 'unknown',
+      'renderError.predictionId': { $nin: [null, ''] },
+      updatedAt: { $gte: new Date(Date.now() - MAX_AGE_H * 3600 * 1000) }
+    }).limit(MAX_ADS).lean();
+  } catch (err) {
+    console.warn(`⚠️  strandedSweep: unknown-charge query failed — ${err.message}`);
+    return 0;
+  }
+  if (!ads.length) return 0;
+
+  for (const ad of ads) {
+    try {
+      const r = await settle({ ad });
+      if (r.state === 'charged' || r.state === 'not-charged') {
+        settled++;
+        console.log(
+          `   💲 strandedSweep[${ad._id}]: charge settled -> ${r.state}` +
+          `${r.price ? ` ($${Number(r.price).toFixed(5)})` : ''}`
+        );
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  strandedSweep[${ad._id}]: charge settle threw — ${err.message}`);
+    }
+  }
+  return settled;
+}
+
 function logSweep(out) {
-  const touched = out.recovered + out.requeued;
+  const touched = out.recovered + out.requeued + out.chargesSettled;
   if (!touched && !out.unrecoverable) return;
   console.log(
     `♻️  strandedSweep: ${out.recovered} recovered ($0) · ${out.requeued} requeued · ` +
@@ -192,6 +238,7 @@ function logSweep(out) {
 module.exports = {
   sweepStrandedRuns,
   findStranded,
+  settleUnknownCharges,
   ENABLED,
   REQUEUE_ON,
   MAX_AGE_H,
