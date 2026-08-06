@@ -2198,6 +2198,177 @@ async function checkPhase4Tier2Executors() {
     `routes/media.js filters deletedAt=null in the list query`);
 }
 
+// ── 32. T0 smoke suite (catches ReferenceError / TypeError on happy path) ─
+//
+// The 2026-08-06 outage on agent.searchAcrossBrands (advOid-not-defined)
+// shipped because every offline check stopped at argument-shape rejects
+// — no test reached the executor body. This suite closes that gap for
+// every Tier-0 (read-only, autonomous) capability by stubbing every
+// Mongoose model with empty-chain returns, invoking run() with valid-
+// shape args, and asserting that (a) no throw fires and (b) the result
+// is a shaped {ok:bool, ...} object.
+//
+// We don't test business logic — that requires live data. We only test
+// that the code PATH runs to a shaped return.
+
+// Chainable stub matching Mongoose's Query interface. Every method
+// returns `this` until .lean() / .exec() / await resolves to the
+// pre-canned result. Handles find / findOne / findById / aggregate
+// / findOneAndUpdate call shapes the executors use.
+function makeMongooseChainableStub(result) {
+  const c = {
+    limit:    () => c,
+    select:   () => c,
+    sort:     () => c,
+    skip:     () => c,
+    populate: () => c,
+    where:    () => c,
+    lean:     async () => result,
+    exec:     async () => result,
+    then:     (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+    catch:    (rej) => Promise.resolve(result).catch(rej)
+  };
+  return c;
+}
+
+// Stub every relevant Mongoose model. Returns a restore() that
+// undoes the patches. Individual smoke tests can opt into "populated
+// tenant lookup" (Brand.findOne returns a valid brand doc) via the
+// `singleResults` map.
+function stubMongooseModels(models, singleResults = {}) {
+  const origs = new Map();
+  for (const m of models) {
+    origs.set(m, {
+      find:              m.find,
+      findOne:           m.findOne,
+      findById:          m.findById,
+      countDocuments:    m.countDocuments,
+      distinct:          m.distinct,
+      aggregate:         m.aggregate,
+      updateOne:         m.updateOne,
+      updateMany:        m.updateMany,
+      findOneAndUpdate:  m.findOneAndUpdate,
+      create:            m.create
+    });
+    const single = singleResults[m.modelName] || null;
+    m.find              = () => makeMongooseChainableStub([]);
+    m.findOne           = () => makeMongooseChainableStub(single);
+    m.findById          = () => makeMongooseChainableStub(single);
+    m.countDocuments    = () => makeMongooseChainableStub(0);
+    m.distinct          = () => makeMongooseChainableStub([]);
+    m.aggregate         = () => makeMongooseChainableStub([]);
+    m.updateOne         = async () => ({ modifiedCount: 0, upsertedCount: 0, acknowledged: true });
+    m.updateMany        = async () => ({ modifiedCount: 0, acknowledged: true });
+    m.findOneAndUpdate  = () => makeMongooseChainableStub(single);
+    m.create            = async (doc) => (Array.isArray(doc)
+      ? doc.map((d, i) => ({ ...d, _id: new (require('mongoose')).Types.ObjectId() }))
+      : { ...doc, _id: new (require('mongoose')).Types.ObjectId(), toObject: () => doc });
+  }
+  return () => {
+    for (const [m, saved] of origs) Object.assign(m, saved);
+  };
+}
+
+async function checkT0SmokeSuite() {
+  console.log('\n[32] T0 executor smoke suite (post-validation happy-path)');
+
+  const mongoose = require('mongoose');
+  const OID_ZERO = '000000000000000000000000';
+  const mkOid    = (s) => new mongoose.Types.ObjectId(s);
+
+  // Import every model the T0 executors touch.
+  const models = [
+    require('../models/Advertiser'),
+    require('../models/Brand'),
+    require('../models/CatalogProduct'),
+    require('../models/Media'),
+    require('../models/Ad'),
+    require('../models/Campaign'),
+    require('../models/CampaignRun'),
+    require('../models/DetectRun'),
+    require('../models/DetectionArtifact'),
+    require('../models/ProductMatchArtifact'),
+    require('../models/IntegrationCredential'),
+    require('../models/CostLog'),
+    require('../models/AiLayoutSession')
+  ];
+
+  // Populated stubs so tenant lookups (Brand.findOne, Advertiser.findById)
+  // reach past the early "not found" returns and exercise the deeper
+  // executor logic.
+  const populated = {
+    Brand:      { _id: mkOid(OID_ZERO), name: 'stub-brand',      advertiserId: mkOid(OID_ZERO), apifyDemo: {} },
+    Advertiser: { _id: mkOid(OID_ZERO), name: 'stub-advertiser', slug: 'stub', status: 'active', plan: 'free' },
+    Ad:         { _id: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), kind: 'image', status: 'draft' },
+    CampaignRun:{ _id: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), status: 'ok' },
+    AiLayoutSession: { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), variants: [], aspectRatios: [], references: [], status: 'queued' },
+    Media:      { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), source: 'instagram', fileType: 'image' },
+    DetectRun:  { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), mediaId: mkOid(OID_ZERO), status: 'completed' },
+    CatalogProduct: { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), title: 'stub' }
+  };
+
+  // T0 caps + valid-arg shapes. platform.listFormats has no DB deps
+  // (already covered by checkPlatformListExecutor) — skipping.
+  // agent.searchAcrossBrands has its own bespoke smoke (post-fix in
+  // this repo) — skipping.
+  const T0_CAPS = [
+    { id: 'catalog.listProducts',                     args: { brandId: OID_ZERO } },
+    { id: 'ad.list',                                  args: { brandId: OID_ZERO } },
+    { id: 'ad.inspect',                               args: { adId: OID_ZERO } },
+    { id: 'campaign.list',                            args: { brandId: OID_ZERO } },
+    { id: 'run.status',                               args: { runId: OID_ZERO } },
+    { id: 'spend.today',                              args: {} },
+    { id: 'aiLayouts.getSession',                     args: { sessionId: OID_ZERO } },
+    { id: 'agent.getContext',                         args: {} },
+    { id: 'integrations.instagram.listCredentials',   args: { brandId: OID_ZERO } },
+    { id: 'integrations.metaAds.listCredentials',     args: { brandId: OID_ZERO } },
+    { id: 'integrations.googleAds.listCredentials',   args: { brandId: OID_ZERO } },
+    { id: 'media.sourceSummary',                      args: { brandId: OID_ZERO } },
+    { id: 'catalog.listProductsWithoutAds',           args: { brandId: OID_ZERO } },
+    { id: 'db.query',                                 args: { collection: 'Media' } },
+    { id: 'db.query',                                 args: { collection: 'CatalogProduct' } },
+    { id: 'db.query',                                 args: { collection: 'ProductMatchArtifact' } },
+    { id: 'db.query',                                 args: { collection: 'DetectionArtifact' } },
+    { id: 'db.query',                                 args: { collection: 'DetectRun' } },
+    { id: 'db.query',                                 args: { collection: 'Ad' } }   // via-brand tenant path
+  ];
+
+  const req = {
+    advertiserId: OID_ZERO,
+    user: { userId: OID_ZERO, email: 'stub@example.invalid', name: 'Stub User' }
+  };
+
+  const restore = stubMongooseModels(models, populated);
+  try {
+    for (const { id, args } of T0_CAPS) {
+      const cap = registry.capabilityById(id);
+      if (!cap) { fail(`T0 smoke ${id}: capability not registered`); continue; }
+      const executor = require(registry.resolveExecutorPath(cap));
+      const method = cap.execute.method || 'run';
+      const fn = executor[method];
+      if (typeof fn !== 'function') {
+        fail(`T0 smoke ${id}: executor.${method} not a function`); continue;
+      }
+      const label = `${id}${args.collection ? ` (${args.collection})` : ''}`;
+      let result;
+      try {
+        result = await fn({ req, args });
+      } catch (err) {
+        result = { _threw: true, _errMsg: err.message, _stack: (err.stack || '').split('\n')[1] || '' };
+      }
+      if (result?._threw) {
+        fail(`T0 smoke ${label}: threw`, `${result._errMsg} — ${result._stack.trim()}`);
+      } else if (!result || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+        fail(`T0 smoke ${label}: returned malformed result`, JSON.stringify(result).slice(0, 200));
+      } else {
+        ok(`T0 smoke ${label}: shaped result (ok:${result.ok})`);
+      }
+    }
+  } finally {
+    restore();
+  }
+}
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
@@ -2230,6 +2401,7 @@ async function checkPhase4Tier2Executors() {
   await checkMediaSourceSummary();
   await checkDbQueryInvariants();
   await checkProductsWithoutAds();
+  await checkT0SmokeSuite();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
