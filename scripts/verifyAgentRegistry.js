@@ -92,6 +92,7 @@ const FILES = [
   'services/capabilityExecutors/catalogSyncFromInstagram.js',
   'services/capabilityExecutors/postsSyncFromInstagram.js',
   'services/capabilityExecutors/catalogSyncFromGenericSitemap.js',
+  'services/capabilityExecutors/adRegenerate.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -925,6 +926,74 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 26. ad.regenerate + AGENT_MAX_MESSAGES opt-in cap ─────────────
+console.log('\n[26] ad.regenerate + messages cap');
+
+{
+  const c = registry.capabilityById('ad.regenerate');
+  assert(c, `capability "ad.regenerate" registered`);
+  if (c) {
+    assert(c.tier === 2, `ad.regenerate: tier === 2`);
+    assert(c.scope === 'ad', `ad.regenerate: scope === 'ad'`);
+    // Dynamic estimator — a function, not a number.
+    assert(typeof c.estimateUsd === 'function',
+      `ad.regenerate: estimateUsd is a function (per-kind resolver)`);
+  }
+}
+
+async function checkAdRegenerateExecutor() {
+  const noScope = {};
+  const exec = require('../services/capabilityExecutors/adRegenerate');
+  assert(typeof exec.estimateUsd === 'function',
+    `adRegenerate.estimateUsd exported`);
+  // Estimator is fail-closed — a missing/invalid adId returns the
+  // upper bound so we never under-reserve.
+  const upper = await exec.estimateUsd({ adId: 'nope' });
+  assert(upper === 3.00,
+    `adRegenerate.estimateUsd: invalid adId → upper bound $3.00 (fail-closed)`);
+  const missing = await exec.estimateUsd({});
+  assert(missing === 3.00,
+    `adRegenerate.estimateUsd: missing adId → upper bound $3.00`);
+
+  // Argument-shape guards — reachable without DB.
+  const r1 = await exec.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `adRegenerate: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /adId required/i.test(r2.error),
+    `adRegenerate: missing adId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { adId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `adRegenerate: invalid adId → rejects`);
+  const r4 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000', mode: 'bogus' }
+  });
+  assert(r4.ok === false && /mode must be one of/i.test(r4.error),
+    `adRegenerate: bogus mode rejected before DB`);
+  const r5 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000', note: 'x'.repeat(4001) }
+  });
+  assert(r5.ok === false && /note too long/i.test(r5.error),
+    `adRegenerate: 4001-char note rejected`);
+}
+
+// AGENT_MAX_MESSAGES cap is opt-in — 0 disables. Confirm the route
+// only enforces the cap when it's a positive integer, so an over-
+// zealous default doesn't silently block long histories.
+{
+  const agentSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'agent.js'), 'utf8');
+  assert(/MAX_MESSAGES\s*>\s*0/.test(agentSrc),
+    `routes/agent.js gates the messages cap on MAX_MESSAGES > 0`);
+  // The defaults.env value should be 0 while the drawer catches up
+  // with client-side compaction. A committed non-zero default would
+  // silently reintroduce the trip we just diagnosed.
+  const defaultsSrc = fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8');
+  assert(/^AGENT_MAX_MESSAGES\s*=\s*0\s*$/m.test(defaultsSrc),
+    `config/defaults.env has AGENT_MAX_MESSAGES=0 (disabled)`);
+}
+
 // ── 25. Ingestion coverage — P1-P4 ────────────────────────────────
 console.log('\n[25] Ingestion coverage P1-P4');
 
@@ -1609,6 +1678,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase9Executors();
   await checkPhase10Executors();
   await checkIngestionCoverageExecutors();
+  await checkAdRegenerateExecutor();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

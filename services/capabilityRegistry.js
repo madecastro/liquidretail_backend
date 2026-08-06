@@ -1444,6 +1444,33 @@ const CAPABILITIES = [
   // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
 
   {
+    id:       'ad.regenerate',
+    title:    'Regenerate a failed or unsatisfactory ad',
+    describe: 'Retry a rendered ad AS-IS — no new prompt, no model swap. Kicks the same adRegenerateService the POST /api/ads/:id/regenerate route uses. Works for BOTH image (~$0.15) and video (~$3.00) ads; cost varies by kind at gate time. Billable per generation. Optional note carries a short refinement hint the renderer surfaces in prompts. Modes: full (default), video-only (skip static crops), title-only (chrome retitle only, uses cached master). Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'ad',
+    // Function estimator — resolves ad.kind to price image vs video
+    // accurately. See executor comment for the money-invariant
+    // reasoning (over-reserve is safe, under-reserve is a bug).
+    estimateUsd: require('./capabilityExecutors/adRegenerate').estimateUsd,
+    args: {
+      type: 'object',
+      required: ['adId'],
+      properties: {
+        adId: { type: 'string', description: 'Ad ObjectId.' },
+        note: { type: 'string', maxLength: 4000, description: 'Optional short refinement note surfaced to the renderer prompts.' },
+        mode: { type: 'string', enum: ['full', 'video-only', 'title-only'], description: 'Render scope. Default full. Use title-only to retitle a video without re-billing the master.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/adRegenerate',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'ad.regenerateWithPrompt',
     title:    'Regenerate image ad with edited prompt',
     describe: 'Re-run the gpt-image-2/edit render for one image ad using a verbatim prompt override the operator supplied. Billable (~$0.15 per call). Regeneration happens asynchronously (30-90s) — this capability kicks it off and returns immediately; poll ad.inspect for status. Image ads only; refuses ads that have been synced to Meta. Requires operator confirmation AND advertiser daily spend cap headroom.',

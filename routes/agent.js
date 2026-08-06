@@ -68,7 +68,13 @@ const { streamChatCompletion } = require('../services/atlasLlmStreamService');
 
 const AGENT_MODEL = process.env.AGENT_MODEL || 'gemini-2.5-flash';
 const MAX_ITERATIONS = Math.max(1, Number(process.env.AGENT_MAX_ITERATIONS || 8));
-const MAX_MESSAGES = Math.max(2, Number(process.env.AGENT_MAX_MESSAGES || 40));
+// AGENT_MAX_MESSAGES=0 (or unset with default 0) disables the cap.
+// Any positive value enables it. When disabled, an unbounded history
+// is legal — cost defense falls entirely on AGENT_DAILY_CAP_USD /
+// spendGuard and AGENT_MAX_TOKENS per LLM call. Re-enable with a
+// numeric env override (e.g. 40) once client-side history compaction
+// exists in the chat drawer.
+const MAX_MESSAGES = Number(process.env.AGENT_MAX_MESSAGES || 0);
 const MAX_TOKENS_PER_CALL = Math.max(256, Number(process.env.AGENT_MAX_TOKENS || 2048));
 const TEMPERATURE = Number.isFinite(Number(process.env.AGENT_TEMPERATURE))
   ? Number(process.env.AGENT_TEMPERATURE)
@@ -137,7 +143,9 @@ function validateBody(body) {
   if (!body || typeof body !== 'object') return 'body must be a JSON object';
   if (!Array.isArray(body.messages)) return 'messages[] required';
   if (body.messages.length === 0) return 'messages[] cannot be empty';
-  if (body.messages.length > MAX_MESSAGES) return `messages[] exceeds cap ${MAX_MESSAGES}`;
+  if (MAX_MESSAGES > 0 && body.messages.length > MAX_MESSAGES) {
+    return `messages[] exceeds cap ${MAX_MESSAGES}`;
+  }
   for (const [i, m] of body.messages.entries()) {
     if (!m || typeof m !== 'object') return `messages[${i}] not an object`;
     if (!['user', 'assistant', 'tool', 'system'].includes(m.role)) {
