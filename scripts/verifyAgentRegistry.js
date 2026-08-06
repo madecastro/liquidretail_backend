@@ -95,6 +95,9 @@ const FILES = [
   'services/capabilityExecutors/adRegenerate.js',
   'services/capabilityExecutors/mediaRefreshInsightsForBrand.js',
   'services/capabilityExecutors/mediaRefreshCommentsFromApify.js',
+  'services/capabilityExecutors/catalogRefreshReviewsForProduct.js',
+  'services/capabilityExecutors/catalogInferCategoriesForBrand.js',
+  'services/capabilityExecutors/catalogRefreshDetails.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -958,6 +961,66 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 28. Catalog product refresh trio ──────────────────────────────
+console.log('\n[28] Catalog product refresh trio');
+
+for (const [id, tier, wantWorkflow] of [
+  ['catalog.refreshReviewsForProduct', 2, false],
+  ['catalog.inferCategoriesForBrand',  4, true],
+  ['catalog.refreshDetails',           4, true]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === tier, `${id}: tier === ${tier}`);
+    if (wantWorkflow) {
+      assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+      assert(!c.execute?.method, `${id}: no execute.method (workflow)`);
+    }
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared`);
+  }
+}
+
+async function checkCatalogRefreshTrio() {
+  const noScope = {};
+  const single   = require('../services/capabilityExecutors/catalogRefreshReviewsForProduct');
+  const bulkCat  = require('../services/capabilityExecutors/catalogInferCategoriesForBrand');
+  const details  = require('../services/capabilityExecutors/catalogRefreshDetails');
+
+  // Single-product exec — run() only.
+  const s1 = await single.run({ req: noScope, args: {} });
+  assert(s1.ok === false && /advertiser scope/i.test(s1.error),
+    `catalogRefreshReviewsForProduct: no-scope → rejects`);
+  const s2 = await single.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(s2.ok === false && /productId required/i.test(s2.error),
+    `catalogRefreshReviewsForProduct: missing productId → rejects`);
+  const s3 = await single.run({ req: { advertiserId: 'x' }, args: { productId: 'nope' } });
+  assert(s3.ok === false && /valid ObjectId/i.test(s3.error),
+    `catalogRefreshReviewsForProduct: invalid productId → rejects`);
+
+  // Bulk category + details — preview/execute.
+  for (const [name, exec] of [
+    ['catalogInferCategoriesForBrand', bulkCat],
+    ['catalogRefreshDetails',          details]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p1 = await exec.preview({ req: noScope, args: {} });
+    assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+      `${name}.preview: no-scope → rejects`);
+    const e1 = await exec.execute({ req: noScope, args: {} });
+    assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+      `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error),
+      `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+      `${name}.preview: invalid brandId → rejects`);
+  }
+}
+
 // ── 27. Bulk refresh + Apify comments ─────────────────────────────
 console.log('\n[27] Bulk refresh + Apify comments');
 
@@ -1763,6 +1826,7 @@ async function checkPhase4Tier2Executors() {
   await checkIngestionCoverageExecutors();
   await checkAdRegenerateExecutor();
   await checkBulkRefreshExecutors();
+  await checkCatalogRefreshTrio();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

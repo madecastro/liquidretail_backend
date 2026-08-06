@@ -1603,6 +1603,29 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'catalog.refreshReviewsForProduct',
+    title:    'Refresh on-site reviews for ONE catalog product',
+    describe: 'Single-product analog of catalog.refreshReviewsForBrand. Runs the 3-tier scraper (JSON-LD → vendor API → optional headless) for one CatalogProduct — HTTP-only, no LLM cost. Refuses products without a productUrl. Tier 2 gates only as a rate limiter (spendGuard $0 estimate) so a runaway agent cannot loop refresh-one on the same row. Reviews upsert in place; LayoutInputArtifact + CreativeDirectionArtifact cache keys are invalidated so downstream regenerations see the new signal.',
+    tier:     2,
+    scope:    'product',
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['productId'],
+      properties: {
+        productId:     { type: 'string', description: 'CatalogProduct ObjectId. Must have productUrl set.' },
+        allowHeadless: { type: 'boolean', description: 'When true, allow the tier-3 headless-browser fallback (~10-25s). Off by default because it costs a browser per call.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogRefreshReviewsForProduct',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'media.refreshInsights',
     title:    'Refresh IG insights + comments for one media',
     describe: 'Re-pull platformStats (impressions, reach, engagement, saved, views/plays, likes, comments, shares) and top-level comments for one Instagram Media from the Meta Graph API. Same operation the /api/media/:id/refresh-insights route triggers. Refuses non-Instagram Media (other sources have no analytics endpoint). No per-call dollar cost, but Tier 2 gating so a runaway agent can\'t burn the app\'s daily IG token budget. Requires operator confirmation.',
@@ -1910,6 +1933,51 @@ const CAPABILITIES = [
   },
 
   // ── Tier 4: multi-step workflows (plan-preview + confirm-then-execute) ─
+
+  {
+    id:       'catalog.inferCategoriesForBrand',
+    title:    'Bulk-infer categories across a brand',
+    describe: 'Bulk analog of catalog.inferCategories. Fans out JSON-LD BreadcrumbList → LLM-fallback category inference across every product with a productUrl in the brand. Respects the 14-day TTL unless force=true. Free on JSON-LD hits; ~$0.02/product on the LLM fallback. Reserve is upper bound (100% LLM fallback × MAX_STEPS_PER_RUN=100 = $2). Streams onProgress ticks.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogInferCategoriesForBrand',
+      workflow: true
+    },
+    estimateUsd: 2.00,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        force:   { type: 'boolean', description: 'When true, bypass the 14-day inference TTL and re-scrape every product with a productUrl.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'catalog.refreshDetails',
+    title:    'Refresh product details (specs / cross-seller / reviews) for a brand',
+    describe: 'Full-catalog enrichment for any brand (not restricted to Sales Demos). Runs catalogProductEnrichmentService.enrichBrandDetails: SerpAPI cross-seller price table + Gemini web-wide review synthesis + Immersive specs per product. Paid path (~$0.05-0.10/product). Protected by an atomic claim on Brand.apifyDemo.enrichInFlight so a concurrent run fails at preview rather than double-billing — same lock sales.brand.enrich uses.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogRefreshDetails',
+      workflow: true
+    },
+    estimateUsd: 10.00,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have at least one CatalogProduct row.' }
+      },
+      additionalProperties: false
+    }
+  },
 
   {
     id:       'catalog.refreshReviewsForBrand',
