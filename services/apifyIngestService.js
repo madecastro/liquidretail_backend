@@ -377,10 +377,127 @@ async function syncBrandShopify(brand, run = null) {
   return summary;
 }
 
+// ── Apify comment ingest ─────────────────────────────────────────────
+// Comment refresh for apify-ig Media rows. Reuses apify/instagram-
+// scraper with resultsType='comments'; upserts Comment docs by
+// (mediaId, externalId) — same idempotency shape mediaInsightsService
+// uses for OAuth-sourced Media. Runs one Apify sync-run per post so
+// per-post progress is checkpointable; concurrency capped modest
+// because each run is billed separately.
+//
+// PROVENANCE: sets Comment.source = 'instagram' (the platform),
+// distinct from Media.source = 'apify-ig' (the ingest path). Comments
+// don't carry an "ingest path" field — the mediaId reference identifies
+// where the parent came from if a consumer needs it.
+async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}) {
+  const Comment = require('../models/Comment');
+  const { pullInstagramComments } = require('./apifyPullService');
+
+  const brand = await Brand.findById(brandId).select('_id name advertiserId').lean();
+  if (!brand) {
+    const e = new Error(`Brand ${brandId} not found`);
+    e.status = 404;
+    throw e;
+  }
+
+  // Target: every apify-ig Media on the brand with a permalink we can
+  // hand to Apify. Skip catalog-product wrappers + soft-deleted.
+  const targets = await Media.find({
+    brandId: brand._id,
+    source: 'apify-ig',
+    deletedAt: null,
+    'metadata.permalink': { $exists: true, $ne: null }
+  })
+    .select('_id metadata.permalink externalId')
+    .lean();
+
+  if (!targets.length) {
+    return { ok: true, brandId: String(brand._id), total: 0, note: 'no apify-ig media with a permalink' };
+  }
+
+  const perStep = [];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < targets.length) {
+      const idx = cursor++;
+      const media = targets[idx];
+      const t0 = Date.now();
+      try {
+        const comments = await pullInstagramComments(media.metadata.permalink, {});
+        let upserted = 0;
+        for (const c of comments) {
+          const res = await Comment.updateOne(
+            { mediaId: media._id, externalId: c.externalId },
+            {
+              $set: {
+                text:             c.text,
+                authorUsername:   c.authorUsername,
+                authorId:         c.authorId,
+                likeCount:        c.likeCount,
+                replyCount:       c.replyCount,
+                postedAt:         c.postedAt,
+                parentExternalId: c.parentExternalId,
+                fetchedAt:        new Date()
+              },
+              $setOnInsert: {
+                mediaId:      media._id,
+                brandId:      brand._id,
+                advertiserId: brand.advertiserId,
+                source:       'instagram',
+                externalId:   c.externalId
+              }
+            },
+            { upsert: true }
+          );
+          if (res.upsertedCount || res.modifiedCount) upserted++;
+        }
+        perStep.push({
+          ok: true,
+          mediaId: String(media._id),
+          fetched: comments.length,
+          upserted,
+          tookMs: Date.now() - t0
+        });
+      } catch (err) {
+        perStep.push({
+          ok: false,
+          mediaId: String(media._id),
+          reason: err.message,
+          tookMs: Date.now() - t0
+        });
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, targets.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  const succeeded = perStep.filter((r) => r.ok).length;
+  const failed    = perStep.filter((r) => !r.ok).length;
+  const totalFetched  = perStep.reduce((s, r) => s + (r.fetched  || 0), 0);
+  const totalUpserted = perStep.reduce((s, r) => s + (r.upserted || 0), 0);
+
+  return {
+    ok: true,
+    brandId: String(brand._id),
+    total: targets.length,
+    succeeded,
+    failed,
+    fetched: totalFetched,
+    upserted: totalUpserted,
+    perStep
+  };
+}
+
 module.exports = {
   syncBrandApify,
   syncDemoBrand: syncBrandApify, // alias — method-aware orchestrator
   syncBrandInstagram,
+  syncBrandInstagramCommentsApify,
   syncBrandShopify,
   isBrandAborted
 };

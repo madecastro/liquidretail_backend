@@ -30,7 +30,20 @@ async function run({ req, args }) {
     .lean();
   if (!media) return { ok: false, error: `media ${rawMediaId} not found` };
   if (media.source !== 'instagram') {
-    return { ok: false, error: `media source is "${media.source}" — refresh only supports Instagram-sourced Media` };
+    // Steer the LLM to the right refresh path for this source. The
+    // agent should NOT keep trying media.refreshInsights on non-OAuth
+    // media — mediaInsightsService only knows the Meta Graph API,
+    // which requires source='instagram'.
+    const remedy = media.source === 'apify-ig'
+      ? ' This Media was pulled via Apify — invoke media.refreshCommentsFromApify (T4, brand-wide) to refresh comments for apify-ig posts. Post-metadata / insights refresh is OAuth-only; there is no direct equivalent for the Apify pipeline.'
+      : media.source === 'manual_upload'
+        ? ' Hand-uploaded Media has no external platform to refresh against — the stats you have are the stats you have.'
+        : ` The ${media.source} ingestion path has no comment-refresh service today.`;
+    return {
+      ok: false,
+      error: `media source is "${media.source}" — media.refreshInsights only supports source='instagram' (Meta Graph OAuth).${remedy}`,
+      mediaSource: media.source
+    };
   }
   if (!media.externalId) {
     return { ok: false, error: 'media has no externalId — cannot address Meta Graph without it' };

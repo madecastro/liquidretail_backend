@@ -93,6 +93,8 @@ const FILES = [
   'services/capabilityExecutors/postsSyncFromInstagram.js',
   'services/capabilityExecutors/catalogSyncFromGenericSitemap.js',
   'services/capabilityExecutors/adRegenerate.js',
+  'services/capabilityExecutors/mediaRefreshInsightsForBrand.js',
+  'services/capabilityExecutors/mediaRefreshCommentsFromApify.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -956,6 +958,57 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 27. Bulk refresh + Apify comments ─────────────────────────────
+console.log('\n[27] Bulk refresh + Apify comments');
+
+for (const id of ['media.refreshInsightsForBrand', 'media.refreshCommentsFromApify']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === 4, `${id}: tier === 4`);
+    assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared`);
+  }
+}
+
+async function checkBulkRefreshExecutors() {
+  const noScope = {};
+  const oauthBulk = require('../services/capabilityExecutors/mediaRefreshInsightsForBrand');
+  const apifyBulk = require('../services/capabilityExecutors/mediaRefreshCommentsFromApify');
+
+  for (const [name, exec] of [
+    ['mediaRefreshInsightsForBrand', oauthBulk],
+    ['mediaRefreshCommentsFromApify', apifyBulk]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p1 = await exec.preview({ req: noScope, args: {} });
+    assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+      `${name}.preview: no-scope → rejects`);
+    const e1 = await exec.execute({ req: noScope, args: {} });
+    assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+      `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error),
+      `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+      `${name}.preview: invalid brandId → rejects`);
+  }
+}
+
+// Apify service export sanity — the ingest wrapper the T4 executor
+// calls must exist. Cheap import check.
+{
+  const apifyIngest = require('../services/apifyIngestService');
+  assert(typeof apifyIngest.syncBrandInstagramCommentsApify === 'function',
+    `apifyIngestService.syncBrandInstagramCommentsApify exported`);
+  const apifyPull = require('../services/apifyPullService');
+  assert(typeof apifyPull.pullInstagramComments === 'function',
+    `apifyPullService.pullInstagramComments exported`);
+}
+
 // ── 26. ad.regenerate + AGENT_MAX_MESSAGES opt-in cap ─────────────
 console.log('\n[26] ad.regenerate + messages cap');
 
@@ -1709,6 +1762,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase10Executors();
   await checkIngestionCoverageExecutors();
   await checkAdRegenerateExecutor();
+  await checkBulkRefreshExecutors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

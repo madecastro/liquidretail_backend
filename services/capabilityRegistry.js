@@ -1627,6 +1627,55 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Media comment refresh — bulk workflows ────────────────────────
+
+  {
+    id:       'media.refreshInsightsForBrand',
+    title:    'Bulk refresh IG insights + comments across a brand',
+    describe: 'Fan-out of media.refreshInsights over every OAuth-sourced (source=\'instagram\') Media on a brand. Cap of 100 per run at concurrency 3. Zero direct USD (Meta Graph is free) but Tier-4 gating so the operator sees the target count + wall time first. DOES NOT handle apify-ig Media — the Meta Graph API refuses non-OAuth external ids. For Apify-scraped IG posts, use media.refreshCommentsFromApify instead.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaRefreshInsightsForBrand',
+      workflow: true
+    },
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have at least one source=\'instagram\' Media row.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'media.refreshCommentsFromApify',
+    title:    'Refresh IG comments for Apify-scraped media',
+    describe: 'Fan-out over every apify-ig Media on a brand, re-pulling comments via the SAME apify/instagram-scraper actor (resultsType=\'comments\') used at ingest. Upserts Comment docs by (mediaId, externalId). Runs one Apify sync-run per post — hence per-run cost. Cap of 100 per run. This is the parallel path to media.refreshInsightsForBrand for the Apify pipeline; post metadata itself is NOT touched (that lives on the Media row and is only refreshed at re-ingest).',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaRefreshCommentsFromApify',
+      workflow: true
+    },
+    // Per-unit ~$0.02 × 100-cap = $2 upper bound. Env-overridable
+    // via APIFY_COMMENTS_PER_UNIT_USD if the operator has a different
+    // Apify pricing tier.
+    estimateUsd: 2.00,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have at least one source=\'apify-ig\' Media row with a metadata.permalink.' }
+      },
+      additionalProperties: false
+    }
+  },
+
   // ── Phase 6: Detection + layouts — T2 billable ──────────────────
 
   {
