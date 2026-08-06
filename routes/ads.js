@@ -3076,6 +3076,18 @@ function projectAd(ad, full = false, extras = {}) {
     ctaUrl:             ad.ctaUrl,
     ctaUrlParams:       ad.ctaUrlParams,
     status:             ad.status,
+    // Fire-and-forget progress telemetry (services/adStage.js), already read
+    // off the doc for the render-activity board — exposed here too so a video
+    // ad sitting at status:'draft' can be told apart from one that's actually
+    // finished. 'draft' is stamped the instant the paid master lands, BEFORE
+    // titling starts (routes/ads.js §00 money-guard comment: it must not sit
+    // in 'rendering', or the reaper re-submits and double-bills), so 'draft'
+    // alone covers both "still titling" and "fully done." The pipeline's own
+    // last step stamps renderStage:'done' right after the real completion
+    // write and never on the failure path (status flips to 'failed' there
+    // instead) — so `renderStage && renderStage !== 'done'` is the exact
+    // "still actively processing" signal, with no extra timestamp needed.
+    renderStage:        ad.renderStage || null,
     queuedAt:           ad.queuedAt,
     renderedAt:         ad.renderedAt,
     generatedAt:        ad.generatedAt,
