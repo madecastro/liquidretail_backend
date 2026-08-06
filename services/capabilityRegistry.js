@@ -755,6 +755,99 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 4: Catalog & media — T1 patches ─────────────────────────
+
+  {
+    id:       'catalog.patchProduct',
+    title:    'Edit catalog product',
+    describe: 'Partial update for editable CatalogProduct fields (title, brand, category, price, currency, productUrl, imageUrl, description, draft). Send null or empty string to clear a text field. Setting draft=false on a previously-draft row promotes it — retroactively linking any unlinked ProductMatchArtifact evidence and collapsing detect-identified twins. LayoutInputArtifact caches carry the OLD values until re-derive; regenerate affected ads to see the change in rendered pixels. Requires operator confirmation.',
+    tier:     1,
+    scope:    'product',
+    args: {
+      type: 'object',
+      required: ['productId', 'updates'],
+      properties: {
+        productId: { type: 'string', description: 'CatalogProduct ObjectId.' },
+        updates: {
+          type: 'object',
+          description: 'Fields to update. Provide only the keys you want changed. Send null or empty string to clear a text field.',
+          properties: {
+            title:       { type: ['string', 'null'], maxLength: 2000 },
+            brand:       { type: ['string', 'null'], maxLength: 2000 },
+            category:    { type: ['string', 'null'], maxLength: 2000 },
+            price:       { type: ['number', 'null'] },
+            currency:    { type: ['string', 'null'], maxLength: 2000 },
+            productUrl:  { type: ['string', 'null'], maxLength: 2000 },
+            imageUrl:    { type: ['string', 'null'], maxLength: 2000 },
+            description: { type: ['string', 'null'], maxLength: 2000 },
+            draft:       { type: 'boolean', description: 'Flip false to promote a review-queue draft into the main catalog (retroactive match-link fires).' }
+          },
+          additionalProperties: false
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogPatchProduct',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'catalog.patchCategories',
+    title:    'Edit category-level video / titling overrides',
+    describe: 'Set per-category videoSettings (model slugs + reference count + promptGuidance) and/or titleStyleSpec on a Category row. Cascades to every CatalogProduct under the category on the NEXT ad generation — already-rendered ads are unaffected until they regenerate. videoSettings shallow-merges with any existing values so multiple partial patches do not clobber sibling keys; send null on a specific key to clear. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['categoryId', 'updates'],
+      properties: {
+        categoryId: { type: 'string', description: 'Category ObjectId.' },
+        updates: {
+          type: 'object',
+          description: 'Fields to update. Provide only the keys you want changed. Send null to clear a field entirely.',
+          properties: {
+            videoSettings:  { type: ['object', 'null'], additionalProperties: true, description: 'videoSettings object ({ model?, modelByCanvas?, referenceImageCount?, promptGuidance? }). Shallow-merged with any existing value.' },
+            titleStyleSpec: { type: ['object', 'null'], additionalProperties: true, description: 'titleStyleSpec object ({ vertical?, feed?, landscape? }). Replace semantics (not merged).' }
+          },
+          additionalProperties: false
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogPatchCategories',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'media.patchRights',
+    title:    'Toggle media creator-rights approval',
+    describe: 'Set Media.rights.approved (boolean). The layout generator refuses to ship ugc.rights_approved=true on creative inputs unless this is true. approvedBy defaults to the caller when omitted; approvedAt is stamped server-side on approve and cleared on unapprove. Ads that already assembled a LayoutInputArtifact carry the OLD rights state until they re-derive. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId', 'approved'],
+      properties: {
+        mediaId:    { type: 'string', description: 'Media ObjectId.' },
+        approved:   { type: 'boolean', description: 'true → mark rights approved; false → clear approval.' },
+        approvedBy: { type: ['string', 'null'], maxLength: 200, description: 'Optional approver identifier (email / license source). Defaults to the caller.' },
+        notes:      { type: ['string', 'null'], maxLength: 2000, description: 'Optional free-text context (license source, negotiation notes).' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaPatchRights',
+      method:  'run'
+    }
+  },
+
   // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
 
   {

@@ -44,6 +44,9 @@ const FILES = [
   'services/capabilityExecutors/adUpdateCta.js',
   'services/capabilityExecutors/platformListFormats.js',
   'services/capabilityExecutors/adList.js',
+  'services/capabilityExecutors/catalogPatchProduct.js',
+  'services/capabilityExecutors/catalogPatchCategories.js',
+  'services/capabilityExecutors/mediaPatchRights.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -728,6 +731,103 @@ async function checkSurfaceWideningExecutors() {
     `adUpdateCta: 61-char ctaText rejected`);
 }
 
+// ── 15. Phase 4 — catalog & media patch executors ─────────────────
+console.log('\n[15] Phase 4 patch executors');
+
+for (const id of ['catalog.patchProduct', 'catalog.patchCategories', 'media.patchRights']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 1, `${id}: tier === 1`);
+}
+assert(registry.capabilityById('catalog.patchProduct')?.scope === 'product',
+  `catalog.patchProduct: scope === 'product'`);
+assert(registry.capabilityById('catalog.patchCategories')?.scope === 'brand',
+  `catalog.patchCategories: scope === 'brand'`);
+assert(registry.capabilityById('media.patchRights')?.scope === 'brand',
+  `media.patchRights: scope === 'brand'`);
+
+async function checkPhase4PatchExecutors() {
+  const noScope = {};
+  const catalogPatchProduct    = require('../services/capabilityExecutors/catalogPatchProduct');
+  const catalogPatchCategories = require('../services/capabilityExecutors/catalogPatchCategories');
+  const mediaPatchRights       = require('../services/capabilityExecutors/mediaPatchRights');
+
+  // Tenant-guard — covered by checkTenantGuard loop, but assert the
+  // specific message so a future refactor can't silently swap in a
+  // generic 500-shaped fallback.
+  const p1 = await catalogPatchProduct.run({ req: noScope, args: {} });
+  assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+    `catalogPatchProduct: no-scope → rejects`);
+  const p2 = await catalogPatchProduct.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(p2.ok === false && /productId required/i.test(p2.error),
+    `catalogPatchProduct: missing productId → rejects`);
+  const p3 = await catalogPatchProduct.run({ req: { advertiserId: 'x' }, args: { productId: 'nope' } });
+  assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+    `catalogPatchProduct: invalid productId → rejects`);
+  const p4 = await catalogPatchProduct.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { productId: '000000000000000000000000' }
+  });
+  assert(p4.ok === false && /updates required/i.test(p4.error),
+    `catalogPatchProduct: missing updates → rejects`);
+  const p5 = await catalogPatchProduct.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { productId: '000000000000000000000000', updates: { hackField: 'evil' } }
+  });
+  assert(p5.ok === false && /unknown field/i.test(p5.error),
+    `catalogPatchProduct: unknown update key rejected (agent can't sneak in videoSettings)`);
+  const p6 = await catalogPatchProduct.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { productId: '000000000000000000000000', updates: { price: 'not-a-number' } }
+  });
+  assert(p6.ok === false && /price/i.test(p6.error),
+    `catalogPatchProduct: non-numeric price rejected`);
+
+  const c1 = await catalogPatchCategories.run({ req: noScope, args: {} });
+  assert(c1.ok === false && /advertiser scope/i.test(c1.error),
+    `catalogPatchCategories: no-scope → rejects`);
+  const c2 = await catalogPatchCategories.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(c2.ok === false && /categoryId required/i.test(c2.error),
+    `catalogPatchCategories: missing categoryId → rejects`);
+  const c3 = await catalogPatchCategories.run({ req: { advertiserId: 'x' }, args: { categoryId: 'nope' } });
+  assert(c3.ok === false && /valid ObjectId/i.test(c3.error),
+    `catalogPatchCategories: invalid categoryId → rejects`);
+  const c4 = await catalogPatchCategories.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { categoryId: '000000000000000000000000', updates: { hack: true } }
+  });
+  assert(c4.ok === false && /unknown field/i.test(c4.error),
+    `catalogPatchCategories: unknown update key rejected`);
+
+  const m1 = await mediaPatchRights.run({ req: noScope, args: {} });
+  assert(m1.ok === false && /advertiser scope/i.test(m1.error),
+    `mediaPatchRights: no-scope → rejects`);
+  const m2 = await mediaPatchRights.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(m2.ok === false && /mediaId required/i.test(m2.error),
+    `mediaPatchRights: missing mediaId → rejects`);
+  const m3 = await mediaPatchRights.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(m3.ok === false && /valid ObjectId/i.test(m3.error),
+    `mediaPatchRights: invalid mediaId → rejects`);
+  const m4 = await mediaPatchRights.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000' }
+  });
+  assert(m4.ok === false && /approved.*boolean.*required/i.test(m4.error),
+    `mediaPatchRights: missing approved → rejects`);
+  const m5 = await mediaPatchRights.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', approved: 'yes' }
+  });
+  assert(m5.ok === false && /approved.*boolean/i.test(m5.error),
+    `mediaPatchRights: non-boolean approved rejected`);
+  const m6 = await mediaPatchRights.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', approved: true, notes: 'x'.repeat(2001) }
+  });
+  assert(m6.ok === false && /notes too long/i.test(m6.error),
+    `mediaPatchRights: 2001-char notes rejected`);
+}
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
@@ -743,6 +843,7 @@ async function checkSurfaceWideningExecutors() {
   await checkLifestyleUnitService();
   await checkPlatformListExecutor();
   await checkAdListExecutor();
+  await checkPhase4PatchExecutors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
