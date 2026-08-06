@@ -3107,6 +3107,18 @@ function projectAd(ad, full = false, extras = {}) {
         }))
       : []
   };
+  // A failed ad in the LIST needs to say WHY. renderError itself stays behind
+  // `full` (it carries the prediction id and other internals), so surface just
+  // the operator-facing headline — which since 2026-08-05 leads with the policy
+  // label, e.g. "Model Moderation Error: Input Prompt violates policy". Without
+  // this the ads page can only render a bare "Render failed" tile, which is what
+  // sent someone to the database to find out that a prompt had been rejected.
+  // Only on failure, so the common payload is unchanged.
+  if (ad.status === 'failed' && ad.renderError?.message) {
+    base.renderErrorMessage = String(ad.renderError.message);
+    base.chargeState        = ad.renderError.chargeState || null;
+  }
+
   if (full) {
     base.layoutInputArtifactId = ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null;
     base.cloudinaryPublicId    = ad.cloudinaryPublicId;
