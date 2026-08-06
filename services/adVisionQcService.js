@@ -513,7 +513,31 @@ async function runPostRenderQc({
 }
 
 /**
- * Slack + log helper for terminal QC failure. Fire-and-forget.
+ * Full per-attempt breakdown (all four category scores + findings + the
+ * discarded/kept render URL for every attempt) — this IS "the verbose LLM
+ * response": every category the model scored, not just the failing ones.
+ * Shared by both the accept and reject alerts so an operator sees the same
+ * shape either way. Slack's own size limit (buildMessage) does the final
+ * clip; this only bounds a single call from producing a pathological detail
+ * block (e.g. thousands of findings).
+ */
+function buildQcSlackDetail(visionQc) {
+  return JSON.stringify({
+    passed: !!visionQc?.passed,
+    finalAttempt: visionQc?.finalAttempt ?? null,
+    attempts: (visionQc?.attempts || []).map((a) => ({
+      attempt: a.attempt,
+      pass: a.pass,
+      summary: a.summary,
+      renderUrl: a.renderUrl,
+      discarded: a.discarded,
+      categories: a.categories
+    }))
+  }, null, 2).slice(0, 2500);
+}
+
+/**
+ * Slack + log helper for terminal QC failure ("rejection"). Fire-and-forget.
  */
 function alertQcFailure({ adId, brandId, productId, visionQc, brandName }) {
   try {
@@ -525,7 +549,15 @@ function alertQcFailure({ adId, brandId, productId, visionQc, brandName }) {
     alerts.notifyAsync({
       level: 'error',
       title: 'Static ad failed vision QC after one regeneration',
-      key: 'vision-qc:failed-after-retry',
+      // Keyed per-ad, not a fixed literal: alertService's notify() dedupes
+      // by this key within a 15-minute window (ALERT_DEDUPE_WINDOW_MIN) and
+      // folds anything suppressed into a generic "+N more (suppressed)"
+      // bump on the NEXT delivery — with no verbose detail carried over.
+      // A shared key across every ad would mean only the first rejection
+      // in any 15-minute window actually reaches Slack with its findings;
+      // every other ad's failure that window is silently swallowed. Per-ad
+      // still collapses a genuine double-fire of the SAME ad's alert.
+      key: `vision-qc:failed-after-retry:${adId || 'unknown'}`,
       fields: {
         ad: String(adId || '-'),
         brand: brandName || String(brandId || '-'),
@@ -533,19 +565,51 @@ function alertQcFailure({ adId, brandId, productId, visionQc, brandName }) {
         attempts: String(visionQc?.attempts?.length || 0),
         findings: findings.slice(0, 300)
       },
-      detail: JSON.stringify({
-        attempts: (visionQc?.attempts || []).map((a) => ({
-          attempt: a.attempt,
-          pass: a.pass,
-          summary: a.summary,
-          renderUrl: a.renderUrl,
-          discarded: a.discarded,
-          categories: a.categories
-        }))
-      }, null, 2).slice(0, 2500)
+      detail: buildQcSlackDetail(visionQc)
     });
   } catch (err) {
     console.warn(`   ⚠️  adVisionQc: alert failed: ${err.message}`);
+  }
+}
+
+/**
+ * Slack + log helper for a QC "acceptance" (the render shipped — either
+ * clean on attempt 1, or clean after the single allowed regeneration).
+ * Fire-and-forget, same contract as alertQcFailure.
+ *
+ * level:'warn', not 'info' — deliberately. alertService's default
+ * ALERT_MIN_LEVEL is 'warn', so an 'info' alert here would silently never
+ * be delivered under default config, which fails the "make sure a message
+ * is sent" requirement this exists for. Do not soften this to 'info'.
+ *
+ * Caller MUST gate this on the QC having actually run (qcResult.skipped
+ * false) — see directImageRenderService.js. Calling it when the flag is
+ * off would alert on a verdict that was never produced.
+ */
+function alertQcAccepted({ adId, brandId, productId, visionQc, brandName }) {
+  try {
+    const alerts = require('./alertService');
+    const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
+    alerts.notifyAsync({
+      level: 'warn',
+      title: visionQc?.finalAttempt > 1
+        ? 'Static ad passed vision QC after one regeneration'
+        : 'Static ad passed vision QC',
+      // Per-ad key — see the comment on alertQcFailure's key above; the
+      // same dedupe-collapse risk applies here and matters more, since
+      // acceptance is the common case and will hit far higher volume.
+      key: `vision-qc:accepted:${adId || 'unknown'}`,
+      fields: {
+        ad: String(adId || '-'),
+        brand: brandName || String(brandId || '-'),
+        product: String(productId || '-'),
+        attempts: String(visionQc?.attempts?.length || 0),
+        summary: String(last?.summary || 'pass').slice(0, 300)
+      },
+      detail: buildQcSlackDetail(visionQc)
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  adVisionQc: accept alert failed: ${err.message}`);
   }
 }
 
@@ -568,5 +632,7 @@ module.exports = {
   // I/O
   judgeRender,
   runPostRenderQc,
-  alertQcFailure
+  alertQcFailure,
+  alertQcAccepted,
+  buildQcSlackDetail
 };
