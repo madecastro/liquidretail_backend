@@ -29,6 +29,61 @@ function escapeRegex(s) {
   return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Naive English plural / -es / -ies stripping. Not linguistically
+// correct, but catches the common cases that break substring search:
+//   couches → couch    (Couch matches ✓)
+//   shirts  → shirt    (Shirt matches ✓)
+//   boxes   → box      (Box matches ✓)
+//   category → category (unchanged — trailing y kept)
+//   Harper  → Harper   (unchanged — no strip)
+// Applied per-token before regex construction so multi-word queries
+// stay AND-joined; a token that stems to something too short (< 2
+// chars) falls back to the original.
+function tokenRoot(t) {
+  const s = String(t || '').toLowerCase();
+  if (s.length < 3) return s;
+  if (s.endsWith('ies') && s.length > 4) {
+    const stripped = s.slice(0, -3);
+    return stripped.length >= 2 ? stripped : s;
+  }
+  if (s.endsWith('es') && s.length > 4) {
+    const stripped = s.slice(0, -2);
+    return stripped.length >= 2 ? stripped : s;
+  }
+  if (s.endsWith('s') && s.length > 3) {
+    const stripped = s.slice(0, -1);
+    return stripped.length >= 2 ? stripped : s;
+  }
+  return s;
+}
+
+// Tokenize a query into ≥ 2-char words. Punctuation + whitespace split.
+// Filters trivial connective words ("the", "and", "of", "for") that
+// otherwise force an AND-clause the operator didn't mean.
+const NOISE_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'of', 'for', 'to', 'in', 'with',
+  'my', 'your', 'from', 'by', 'on', 'as', 'is', 'are'
+]);
+function tokenize(query) {
+  return String(query || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 2 && !NOISE_WORDS.has(t))
+    .map(tokenRoot);
+}
+
+// Build an $and clause with one regex per token, each token matched
+// against any of the provided candidate fields via $or. Callers pass
+// the raw field list; the returned object is Mongoose-ready.
+function buildTokenizedFilter(tokens, fields) {
+  if (!tokens.length) return null;
+  return {
+    $and: tokens.map((tok) => ({
+      $or: fields.map((f) => ({ [f]: new RegExp(escapeRegex(tok), 'i') }))
+    }))
+  };
+}
+
 async function run({ req, args }) {
   if (!req?.advertiserId) {
     return { ok: false, error: 'no advertiser scope on request — auth middleware did not run' };
@@ -80,7 +135,17 @@ async function run({ req, args }) {
     brandIdFilter = brand._id;
   }
 
-  const rx = new RegExp(escapeRegex(rawQuery), 'i');
+  // Tokenized + plural-stripped matching. Fixes "Harper couches"
+  // vs "Harper Foam Sectional Couch" and similar plural / word-order
+  // failures the single-regex substring match had.
+  const tokens = tokenize(rawQuery);
+  if (!tokens.length) {
+    return { ok: false, error: `query has no searchable tokens after removing noise words — try adding a distinctive keyword` };
+  }
+  const brandFilter    = buildTokenizedFilter(tokens, ['name']);
+  const productFilter  = buildTokenizedFilter(tokens, ['title', 'externalId']);
+  const campaignFilter = buildTokenizedFilter(tokens, ['name']);
+  const adFilter       = buildTokenizedFilter(tokens, ['title', 'copy.headline', 'copy.cta_text']);
 
   // Parallel per-resource fetches. Everything is advertiser-scoped;
   // Ad resolves via a brand lookup upstream so we never cross tenants.
@@ -99,7 +164,7 @@ async function run({ req, args }) {
     // Brand-name search is only meaningful when NOT narrowed to one
     // brand (a per-brand search doesn't need to search brand names).
     (wants.has('brand') && !brandIdFilter)
-      ? Brand.find({ advertiserId: advOid, name: rx })
+      ? Brand.find({ advertiserId: advOid, ...brandFilter })
           .limit(PER_TYPE_CAP)
           .select('_id name nameNormalized websiteUrl status')
           .lean()
@@ -108,10 +173,7 @@ async function run({ req, args }) {
       ? CatalogProduct.find({
           advertiserId: advOid,
           ...(brandIdFilter ? { brandId: brandIdFilter } : {}),
-          $or: [
-            { title: rx },
-            { externalId: rx }
-          ]
+          ...productFilter
         })
           .limit(PER_TYPE_CAP)
           .select('_id brandId title externalId imageUrl price currency rating productReviews.reviewCount')
@@ -121,7 +183,7 @@ async function run({ req, args }) {
       ? Campaign.find({
           advertiserId: advOid,
           ...(brandIdFilter ? { brandId: brandIdFilter } : {}),
-          name: rx
+          ...campaignFilter
         })
           .limit(PER_TYPE_CAP)
           .select('_id brandId name status kind updatedAt')
@@ -137,11 +199,7 @@ async function run({ req, args }) {
     const brandOids = brandIdList.map((b) => b._id);
     ads = await Ad.find({
       brandId: { $in: brandOids },
-      $or: [
-        { title: rx },
-        { 'copy.headline': rx },
-        { 'copy.cta_text': rx }
-      ]
+      ...adFilter
     })
       .limit(PER_TYPE_CAP)
       .select('_id brandId title copy status kind renderUrl updatedAt')
@@ -199,11 +257,12 @@ async function run({ req, args }) {
     kind: 'searchResults',
     data: {
       query: rawQuery,
+      queryTokens: tokens,
       resourceTypes,
       counts,
       truncated,
       results: legs,
-      note: 'Every result row is scoped to your advertiser. Cross-advertiser discovery is never exposed. Rows capped at 20 per resource type — narrow the query if truncated.'
+      note: `Tokenized query with plural stripping — searched roots [${tokens.join(', ')}] as AND-joined substring matches (case-insensitive). Every row is scoped to your advertiser. Rows capped at 20 per resource type — narrow the query if truncated. If a leg returned 0, try fewer / more distinctive keywords.`
     }
   };
 }

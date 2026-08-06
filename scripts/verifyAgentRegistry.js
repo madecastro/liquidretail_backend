@@ -1765,6 +1765,13 @@ async function checkPhase9Executors() {
       }
       assert(rHappy.ok === true,
         `agentSearchAcrossBrands: happy-path smoke completes without throwing — REFERENCE-ERROR REGRESSION IF THIS FAILS (got ${rHappy.error || 'unknown'})`);
+      // Tokenization contract — response must expose queryTokens so
+      // the LLM and operator can see what was actually searched. If
+      // this regresses the "Harper couches" plural bug returns.
+      assert(rHappy.ok && Array.isArray(rHappy.data?.queryTokens),
+        `agentSearchAcrossBrands: response carries queryTokens array (tokenization visible)`);
+      assert(rHappy.ok && rHappy.data.queryTokens.length === 1 && rHappy.data.queryTokens[0] === 'sectional',
+        `agentSearchAcrossBrands: "sectional" tokenizes to ['sectional'] (single term, no stemming needed)`);
       // brandId-narrowing path. Second failure mode — the brand-check
       // block runs BEFORE the advOid assignment if we goof the order
       // again.
@@ -1781,6 +1788,35 @@ async function checkPhase9Executors() {
       // not found" — that's the expected reject shape offline.
       assert(rBrand.ok === false && /not found/i.test(rBrand.error || ''),
         `agentSearchAcrossBrands: brandId-narrow path rejects unknown brand cleanly (no ReferenceError; got ${rBrand.error || 'unknown'})`);
+      // Plural-stripping contract — "couches" must tokenize to root
+      // "couch" so title="Couch" would match. If tokenRoot regresses,
+      // the Aug 6 "Harper couches → 0 results" bug returns.
+      let rPlural;
+      try {
+        rPlural = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'Harper couches' }
+        });
+      } catch (err) {
+        rPlural = { ok: false, error: `threw: ${err.message}` };
+      }
+      assert(rPlural.ok === true && Array.isArray(rPlural.data?.queryTokens)
+        && rPlural.data.queryTokens.includes('harper') && rPlural.data.queryTokens.includes('couch'),
+        `agentSearchAcrossBrands: "Harper couches" tokenizes to include 'couch' (plural stripped) — PLURAL REGRESSION IF THIS FAILS (got ${JSON.stringify(rPlural.data?.queryTokens)})`);
+      // Noise-only query rejection — if the LLM sends "the of and",
+      // filtering strips everything and the search would return
+      // every row. Executor must reject.
+      let rNoise;
+      try {
+        rNoise = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'the of and my' }
+        });
+      } catch (err) {
+        rNoise = { ok: false, error: `threw: ${err.message}` };
+      }
+      assert(rNoise.ok === false && /no searchable tokens/i.test(rNoise.error || ''),
+        `agentSearchAcrossBrands: noise-only query rejected (would else match every row)`);
     } finally {
       Brand.find          = orig.brandFind;
       Brand.findOne       = orig.brandFindOne;
