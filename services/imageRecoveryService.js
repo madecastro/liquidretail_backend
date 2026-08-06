@@ -29,11 +29,12 @@
 
 const Ad    = require('../models/Ad');
 const Brand = require('../models/Brand');
+const Media = require('../models/Media');
+const CatalogProduct = require('../models/CatalogProduct');
 const { peekImagePrediction } = require('./atlasImageService');
-const { finishPlate } = require('./directImageRenderService');
+const { finishPlate, safeBoxInDeliveredPx, deliveryGeometryFor } = require('./directImageRenderService');
 const { finalizeFlatCost } = require('./costTracker');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
-const { deliveryGeometryFor } = require('./directImageRenderService');
 
 /**
  * Recover ONE static ad from its spend receipt.
@@ -103,7 +104,7 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
   }
 
   const brand = ad.brandId
-    ? await Brand.findById(ad.brandId).select('logoUrl').lean()
+    ? await Brand.findById(ad.brandId).select('logoUrl name').lean()
     : null;
 
   let plate;
@@ -141,28 +142,193 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
   const renderUrl = upload?.secure_url || upload?.url || null;
   if (!renderUrl) return { state: 'unrecoverable', predictionId, message: 'upload returned no url' };
 
+  // ── Vision QC on recovered plate (vision call ONLY — zero image submits) ──
+  // A restart mid-QC would otherwise stamp draft with no verdict and ship
+  // uninspected while AD_VISION_QC_ENABLED claims every static ad is checked.
+  // Prefer judge once (cheap ~$0.01). NEVER regenerate here — the plate is
+  // already paid; recovery must stay free of new image submits (money).
+  // Fail → stamp + alert, still KEEP the recovered asset.
+  const visionQc = await maybeQcRecoveredPlate({
+    ad, brand, surface, dims, renderUrl
+  });
+
   // `status: { $ne: 'draft' }` in the FILTER makes this idempotent without a
   // lease: if another pass (or the original render, finishing late) already
   // landed this ad, the write becomes a no-op instead of clobbering it.
+  const setFields = {
+    status:      'draft',
+    renderUrl,
+    kind:        'image',
+    width:       dims.width,
+    height:      dims.height,
+    bytes:       plate.buffer.length,
+    renderedAt:  new Date(),
+    updatedAt:   new Date(),
+    cloudinaryPublicId: upload?.public_id || null,
+    renderStage: `recovered from receipt ${predictionId}`
+  };
+  if (visionQc) setFields.visionQc = visionQc;
+
   const res = await Ad.updateOne(
     { _id: ad._id, status: { $nin: ['draft', 'live', 'archived'] } },
-    { $set: {
-        status:      'draft',
-        renderUrl,
-        kind:        'image',
-        width:       dims.width,
-        height:      dims.height,
-        bytes:       plate.buffer.length,
-        renderedAt:  new Date(),
-        updatedAt:   new Date(),
-        cloudinaryPublicId: upload?.public_id || null,
-        renderStage: `recovered from receipt ${predictionId}`
-    } }
+    { $set: setFields }
   );
   if (!res.modifiedCount) {
     return { state: 'unrecoverable', predictionId, message: 'ad already resolved by another pass' };
   }
-  return { state: 'recovered', predictionId, renderUrl, logoComposited: plate.logoComposited };
+  return {
+    state: 'recovered',
+    predictionId,
+    renderUrl,
+    logoComposited: plate.logoComposited,
+    visionQc: visionQc || null
+  };
+}
+
+/**
+ * Resolve the ORIGINAL product photo for a recovered ad so judgeRender can
+ * compare product vs finished plate. Preference order mirrors the live path's
+ * first reference:
+ *   1. imageGeneration.images[0].sourceUrl (submission audit — best)
+ *   2. Media.fileUrl for ad.mediaId
+ *   3. CatalogProduct.imageUrl for ad.productId
+ * Returns null when nothing is recoverable → caller stamps skipped.
+ */
+async function resolveOriginalProductUrl(ad) {
+  const fromSubmission = ad?.imageGeneration?.images?.[0]?.sourceUrl;
+  if (fromSubmission && /^https?:\/\//i.test(String(fromSubmission))) {
+    return String(fromSubmission);
+  }
+  if (ad?.mediaId) {
+    try {
+      const m = await Media.findById(ad.mediaId).select('fileUrl').lean();
+      if (m?.fileUrl) return m.fileUrl;
+    } catch { /* ignore — fall through */ }
+  }
+  if (ad?.productId) {
+    try {
+      const p = await CatalogProduct.findById(ad.productId).select('imageUrl').lean();
+      if (p?.imageUrl) return p.imageUrl;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+/**
+ * When AD_VISION_QC_ENABLED, inspect the recovered plate once (vision LLM only).
+ * MONEY: no editImage / generateImage. Never discards paid pixels.
+ * Returns a persisted-verdict shape, or null when QC is disabled.
+ */
+async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
+  let adVisionQc;
+  try {
+    adVisionQc = require('./adVisionQcService');
+  } catch (err) {
+    console.warn(`   ⚠️  imageRecovery: adVisionQc load failed: ${err.message}`);
+    return null;
+  }
+  if (!adVisionQc.isEnabled()) return null;
+
+  const adId = ad?._id ? String(ad._id) : null;
+  const brandId = ad?.brandId || null;
+  const productId = ad?.productId || null;
+  const brandName = brand?.name || null;
+  const runId = Array.isArray(ad?.campaignRunIds) && ad.campaignRunIds.length
+    ? ad.campaignRunIds[0]
+    : null;
+  const appUrl = adVisionQc.buildAppPreviewUrl({
+    campaignRunId: runId,
+    campaignId: ad?.campaignId || null,
+    brandId
+  });
+
+  const originalProductUrl = await resolveOriginalProductUrl(ad);
+  if (!originalProductUrl || !renderUrl) {
+    // Original not recoverable cleanly — stamp skipped rather than pretending
+    // inspected, still KEEP the recovered asset.
+    const reason = 'recovered without QC';
+    const verdict = adVisionQc.buildSkippedVerdict(reason);
+    adVisionQc.alertQcSkipped({
+      adId, brandId, productId, brandName, reason
+    });
+    return verdict;
+  }
+
+  let safeBox;
+  try {
+    safeBox = safeBoxInDeliveredPx(surface, dims);
+  } catch {
+    safeBox = {};
+  }
+
+  try {
+    // VISION ONLY — one free-of-image-submit call. No regenerate path here.
+    const raw = await adVisionQc.judgeRender({
+      originalProductUrl,
+      renderUrl,
+      brandName,
+      safeBox,
+      deliveryDims: dims,
+      // Recovery does not re-derive expected copy; empty list is valid
+      // (prompt treats it as pure product image — still scores the other 3 cats).
+      expectedText: [],
+      brandId,
+      productId,
+      adId,
+      campaignId: ad?.campaignId || null
+    });
+    const verdict = adVisionQc.buildPersistedVerdict({
+      passed: !!raw.pass,
+      finalAttempt: 1,
+      attempts: [{
+        attempt: 1,
+        pass: !!raw.pass,
+        categories: raw.categories,
+        findings: raw.findings || [],
+        summary: raw.summary || null,
+        renderUrl,
+        discarded: false
+      }]
+    });
+    if (!raw.pass) {
+      // Fail closed on scores — stamp + alert, KEEP recovered asset.
+      adVisionQc.alertQcFailure({
+        adId, brandId, productId, brandName, visionQc: verdict, appUrl
+      });
+      adVisionQc.noteQcFailToRunFeed({
+        campaignRunId: runId,
+        adId,
+        template: ad?.template || null,
+        aspectRatio: ad?.aspectRatio || null,
+        platformFormat: ad?.platformFormat || null,
+        visionQc: verdict,
+        previewUrl: renderUrl,
+        appUrl
+      });
+    } else {
+      adVisionQc.noteQcPassToRunFeed({
+        campaignRunId: runId,
+        adId,
+        template: ad?.template || null,
+        aspectRatio: ad?.aspectRatio || null,
+        platformFormat: ad?.platformFormat || null,
+        visionQc: verdict,
+        previewUrl: renderUrl,
+        appUrl
+      });
+    }
+    return verdict;
+  } catch (err) {
+    // Vision infrastructure throw — same as live path: ship uninspected + alert.
+    // Do NOT treat as image failure (would not regenerate on recovery anyway).
+    const reason = `recovery vision call failed: ${err.message || err}`;
+    console.warn(`   ⚠️  imageRecovery: ${reason}`);
+    const verdict = adVisionQc.buildSkippedVerdict(reason);
+    adVisionQc.alertQcSkipped({
+      adId, brandId, productId, brandName, reason
+    });
+    return verdict;
+  }
 }
 
 /**
@@ -272,4 +438,11 @@ async function settleChargeState({ ad } = {}) {
   return { state: 'unknown', message: peek.message || peek.state };
 }
 
-module.exports = { recoverImageAd, surfaceForAd, settleChargeState };
+module.exports = {
+  recoverImageAd,
+  surfaceForAd,
+  settleChargeState,
+  // Exported for harness / recovery tooling (pure-ish helpers).
+  resolveOriginalProductUrl,
+  maybeQcRecoveredPlate
+};

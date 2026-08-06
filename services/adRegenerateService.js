@@ -769,6 +769,13 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
       mediaId:               ad.mediaId,
       productId:             ad.productId || null,
       brandId:               ad.brandId || null,
+      adId:                  adId || null,
+      // Prefer last run id on the ad for run-feed QC notices (regen has no
+      // live CampaignRun parameter).
+      campaignRunId:         Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+        : null,
+      campaignId:            ad.campaignId || null,
       adConceptArtifactId:   ad.conceptArtifactId || null,
       adConceptId:           ad.conceptId || null,
       template:              ad.template,

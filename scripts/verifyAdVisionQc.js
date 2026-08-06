@@ -494,25 +494,333 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
     assert.ok(captured.detail.includes('competitor_marks'), 'category breakdown missing from failure alert');
   });
 
-  // ── H. Wiring: directImageRenderService fires BOTH outcomes ────────
-  // Revert: removing the accepted-alert call site fails H1; calling it
-  // unconditionally (including the skipped/no-QC-ran path, flag off) fails
-  // H2; removing the existing reject call site fails H3.
+  // ── H. Wiring: pass → run feed; fail → alertService (+ run feed) ───
+  // Revert: pass path calling alertQcAccepted / alertService fails H1/H1b;
+  // removing fail alert fails H3; removing run-feed pass note fails H1.
   const directImageSrc = () => require('fs').readFileSync(
     path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8'
   );
-  check('H1 directImageRenderService calls alertQcAccepted on the pass path', () => {
-    assert.match(directImageSrc(), /adVisionQc\.alertQcAccepted\(/, 'accepted-alert call site missing');
-  });
-  check('H2 the accepted-alert call site is guarded on qcResult.skipped (no alert when QC never ran)', () => {
+  const fs = require('fs');
+  check('H1 directImageRenderService pass path uses noteQcPassToRunFeed (not alert channel)', () => {
     const src = directImageSrc();
-    const idx = src.indexOf('alertQcAccepted(');
-    assert.ok(idx > -1, 'call site not found');
-    const before = src.slice(Math.max(0, idx - 400), idx);
-    assert.match(before, /qcResult\.skipped/, 'accepted-alert must be gated on qcResult.skipped');
+    assert.match(src, /adVisionQc\.noteQcPassToRunFeed\(/, 'run-feed pass note call site missing');
+    // Must NOT call alertQcAccepted on the live pass path (exported helper
+    // may still appear in comments; the call form is what matters).
+    assert.ok(
+      !/adVisionQc\.alertQcAccepted\s*\(/.test(src),
+      'pass path must not call alertQcAccepted — that exhausts alert rate limit at scale'
+    );
+  });
+  check('H1b pass path does not require alertService for accepts', () => {
+    // Structural: noteQcPassToRunFeed body must not call alertService.
+    const qcSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'adVisionQcService.js'), 'utf8'
+    );
+    const m = qcSrc.match(/function noteQcPassToRunFeed\([\s\S]*?\n\}/);
+    assert.ok(m, 'noteQcPassToRunFeed not found');
+    assert.ok(!/alertService|notifyAsync|alertQcAccepted/.test(m[0]),
+      'noteQcPassToRunFeed must not touch alertService');
+  });
+  check('H2 skipped path calls alertQcSkipped (uninspected is an error, not silence)', () => {
+    assert.match(directImageSrc(), /adVisionQc\.alertQcSkipped\(/, 'alertQcSkipped call site missing');
   });
   check('H3 directImageRenderService still calls alertQcFailure on the reject path', () => {
     assert.match(directImageSrc(), /adVisionQc\.alertQcFailure\(/, 'reject-alert call site missing');
+  });
+  check('H4 fail path ALSO posts a run-feed event', () => {
+    assert.match(directImageSrc(), /adVisionQc\.noteQcFailToRunFeed\(/, 'run-feed fail note missing');
+  });
+
+  // ── I. Judge throw does NOT consume regeneration budget ────────────
+  // Revert: treating a throw like a fail verdict (regen) fails I1/I2;
+  // rethrowing out of runPostRenderQc fails I3.
+  await checkAsync('I1 judge throw → exactly ONE generate, ZERO regenerations', async () => {
+    let genCalls = 0;
+    let visionCalls = 0;
+    const result = await qc.runPostRenderQc({
+      enabled: true,
+      originalProductUrl: 'https://cdn.example/o.jpg',
+      brandName: 'Allbirds',
+      safeBox: { left: 0, top: 0, right: 100, bottom: 100 },
+      deliveryDims: { width: 100, height: 100 },
+      generate: async ({ attempt }) => {
+        genCalls += 1;
+        if (genCalls > 1) throw new Error('regeneration after judge throw — money bug');
+        return makeOutput(attempt);
+      },
+      uploadAttempt: async ({ attempt }) => `https://cdn.example/throw-${attempt}.png`,
+      judgeFn: async () => {
+        visionCalls += 1;
+        throw new Error('atlas vision timeout');
+      }
+    });
+    assert.strictEqual(genCalls, 1, `expected 1 generate, got ${genCalls}`);
+    assert.strictEqual(result.generationCount, 1);
+    assert.strictEqual(result.regenerationCount, 0);
+    assert.strictEqual(result.ok, true, 'paid plate must still ship');
+    assert.strictEqual(result.skipped, true);
+    assert.strictEqual(result.uninspected, true);
+    assert.ok(result.output, 'output must be kept');
+    assert.strictEqual(result.visionQc.skipped, true);
+    assert.match(String(result.visionQc.reason || ''), /atlas vision timeout/);
+    // visionCallCount is only incremented on a completed judge — throw = 0.
+    assert.strictEqual(result.visionCallCount, 0);
+  });
+
+  await checkAsync('I2 judge throw after a real fail does not produce a 3rd image submit', async () => {
+    // Attempt 1: real fail verdict → regen. Attempt 2: judge throws.
+    // Must stop at 2 generates (never a 3rd).
+    let genCalls = 0;
+    let visionCalls = 0;
+    const result = await qc.runPostRenderQc({
+      enabled: true,
+      originalProductUrl: 'https://cdn.example/o.jpg',
+      brandName: 'Allbirds',
+      safeBox: { left: 0, top: 0, right: 100, bottom: 100 },
+      deliveryDims: { width: 100, height: 100 },
+      generate: async ({ attempt }) => {
+        genCalls += 1;
+        if (genCalls > 2) throw new Error('THIRD generation after judge throw — money invariant broken');
+        return makeOutput(attempt);
+      },
+      uploadAttempt: async ({ attempt }) => `https://cdn.example/mix-${attempt}.png`,
+      judgeFn: async () => {
+        visionCalls += 1;
+        if (visionCalls === 1) return FAIL_VERDICT;
+        throw new Error('vision down on attempt 2');
+      }
+    });
+    assert.strictEqual(genCalls, 2);
+    assert.strictEqual(result.generationCount, 2);
+    assert.strictEqual(result.regenerationCount, 1);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.skipped, true);
+    assert.strictEqual(result.visionQc.skipped, true);
+  });
+
+  // ── J. Skipped verdict is distinguishable from a pass ──────────────
+  // Revert: dropped `reason` field or skipped:false on buildSkippedVerdict fails J1.
+  check('J1 buildSkippedVerdict has skipped:true, passed:false, reason set', () => {
+    const v = qc.buildSkippedVerdict('no original product URL');
+    assert.strictEqual(v.skipped, true);
+    assert.strictEqual(v.passed, false);
+    assert.strictEqual(v.disabled, false);
+    assert.strictEqual(v.reason, 'no original product URL');
+    assert.ok(Array.isArray(v.attempts));
+    assert.strictEqual(v.attempts.length, 0);
+  });
+  check('J2 buildPersistedVerdict pass does not look skipped', () => {
+    const v = qc.buildPersistedVerdict({
+      passed: true, finalAttempt: 1,
+      attempts: [{ attempt: 1, pass: true, categories: qc.emptyCategories(), summary: 'clean' }]
+    });
+    assert.strictEqual(v.skipped, false);
+    assert.strictEqual(v.passed, true);
+    assert.strictEqual(v.reason, null);
+  });
+  check('J3 alertQcSkipped is exported and keys per-ad at error level', () => {
+    assert.strictEqual(typeof qc.alertQcSkipped, 'function');
+    const captured = fakeNotify(() => qc.alertQcSkipped({
+      adId: 'adSKIP1', brandId: 'b1', productId: 'p1', brandName: 'X', reason: 'test skip'
+    }));
+    assert.ok(captured, 'alertQcSkipped did not call notifyAsync');
+    assert.strictEqual(captured.level, 'error');
+    assert.ok(captured.key.includes('adSKIP1'), 'skipped key must embed ad id');
+    assert.match(captured.key, /vision-qc:skipped:/);
+  });
+  check('J3b two skipped ads do not share a dedupe key', () => {
+    const a = fakeNotify(() => qc.alertQcSkipped({ adId: 'adS1', reason: 'r' }));
+    const b = fakeNotify(() => qc.alertQcSkipped({ adId: 'adS2', reason: 'r' }));
+    assert.notStrictEqual(a.key, b.key);
+  });
+
+  // ── K. formatThreadLine previewUrl ─────────────────────────────────
+  // Revert: dropping meta.previewUrl render fails K1; always appending a
+  // placeholder when absent fails K2 (would change every existing caller).
+  check('K1 formatThreadLine renders meta.previewUrl when present', () => {
+    const runFeed = require('../services/runFeedService');
+    const line = runFeed.formatThreadLine({
+      t: Date.now(),
+      stage: 'vision QC pass',
+      adId: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+      meta: {
+        template: 'ai_brand_led',
+        aspectRatio: '1:1',
+        previewUrl: 'https://res.cloudinary.com/x/image/upload/v1/ads/r.png'
+      }
+    });
+    assert.match(line, /https:\/\/res\.cloudinary\.com\/x\/image\/upload\/v1\/ads\/r\.png/);
+  });
+  check('K2 formatThreadLine unchanged when previewUrl absent (no placeholder)', () => {
+    const runFeed = require('../services/runFeedService');
+    const line = runFeed.formatThreadLine({
+      t: Date.now(),
+      stage: 'static image generation',
+      adId: 'bbbbbbbbbbbbbbbbbbbbbbbb',
+      meta: { template: 'ai_brand_led', aspectRatio: '1:1', mediaId: 'cccccccccccccccccccccccc' }
+    });
+    assert.ok(!/preview/i.test(line), 'must not invent a preview token when absent');
+    assert.ok(!/https?:\/\//.test(line), 'must not invent a URL when previewUrl absent');
+  });
+
+  // ── L. Severity-aware alert rate limiter ───────────────────────────
+  // Revert: a single shared counter that blocks error/fatal after low-
+  // severity exhaustion fails L1. Unbounded error exemption fails L2.
+  await checkAsync('L1 error/fatal still deliver after low-severity cap is exhausted', async () => {
+    const alerts = require('../services/alertService');
+    const prev = {
+      ALERT_RATE_LIMIT_MAX: process.env.ALERT_RATE_LIMIT_MAX,
+      ALERT_RATE_LIMIT_ERROR_MAX: process.env.ALERT_RATE_LIMIT_ERROR_MAX,
+      ALERT_DEDUPE_WINDOW_MIN: process.env.ALERT_DEDUPE_WINDOW_MIN,
+      SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
+      SLACK_ALERT_CHANNEL: process.env.SLACK_ALERT_CHANNEL,
+      ALERTS_ENABLED: process.env.ALERTS_ENABLED,
+      ALERT_MIN_LEVEL: process.env.ALERT_MIN_LEVEL
+    };
+    process.env.ALERT_RATE_LIMIT_MAX = '2';
+    process.env.ALERT_RATE_LIMIT_ERROR_MAX = '5';
+    process.env.ALERT_DEDUPE_WINDOW_MIN = '0';
+    process.env.SLACK_BOT_TOKEN = 'xoxb-test-token-for-verify';
+    process.env.SLACK_ALERT_CHANNEL = 'C00000000';
+    process.env.ALERTS_ENABLED = 'true';
+    process.env.ALERT_MIN_LEVEL = 'info';
+    alerts._resetState();
+    const origFetch = global.fetch;
+    let fetches = 0;
+    global.fetch = async () => {
+      fetches += 1;
+      return {
+        ok: true, status: 200,
+        headers: { get: () => null },
+        json: async () => ({ ok: true }),
+        text: async () => '{"ok":true}'
+      };
+    };
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      // Exhaust low-severity bucket (2).
+      const w1 = await alerts.notify({ level: 'warn', title: 'w1', key: 'low-1' });
+      const w2 = await alerts.notify({ level: 'warn', title: 'w2', key: 'low-2' });
+      const w3 = await alerts.notify({ level: 'warn', title: 'w3', key: 'low-3' });
+      assert.strictEqual(w1, true);
+      assert.strictEqual(w2, true);
+      assert.strictEqual(w3, false, '3rd warn must be rate-limited');
+      // High severity must still go through.
+      const e1 = await alerts.notify({ level: 'error', title: 'e1', key: 'hi-1' });
+      const f1 = await alerts.notify({ level: 'fatal', title: 'f1', key: 'hi-2' });
+      assert.strictEqual(e1, true, 'error must deliver after low-severity cap exhausted');
+      assert.strictEqual(f1, true, 'fatal must deliver after low-severity cap exhausted');
+      assert.ok(fetches >= 4, `expected >=4 slack posts, got ${fetches}`);
+    } finally {
+      console.warn = origWarn;
+      global.fetch = origFetch;
+      for (const [k, v] of Object.entries(prev)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      alerts._resetState();
+    }
+  });
+
+  await checkAsync('L2 error/fatal still have a hard bound (not unbounded exemption)', async () => {
+    const alerts = require('../services/alertService');
+    const prev = {
+      ALERT_RATE_LIMIT_MAX: process.env.ALERT_RATE_LIMIT_MAX,
+      ALERT_RATE_LIMIT_ERROR_MAX: process.env.ALERT_RATE_LIMIT_ERROR_MAX,
+      ALERT_DEDUPE_WINDOW_MIN: process.env.ALERT_DEDUPE_WINDOW_MIN,
+      SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
+      SLACK_ALERT_CHANNEL: process.env.SLACK_ALERT_CHANNEL,
+      ALERTS_ENABLED: process.env.ALERTS_ENABLED,
+      ALERT_MIN_LEVEL: process.env.ALERT_MIN_LEVEL
+    };
+    process.env.ALERT_RATE_LIMIT_MAX = '20';
+    process.env.ALERT_RATE_LIMIT_ERROR_MAX = '3';
+    process.env.ALERT_DEDUPE_WINDOW_MIN = '0';
+    process.env.SLACK_BOT_TOKEN = 'xoxb-test-token-for-verify';
+    process.env.SLACK_ALERT_CHANNEL = 'C00000000';
+    process.env.ALERTS_ENABLED = 'true';
+    process.env.ALERT_MIN_LEVEL = 'info';
+    alerts._resetState();
+    const origFetch = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      headers: { get: () => null },
+      json: async () => ({ ok: true }),
+      text: async () => '{"ok":true}'
+    });
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const results = [];
+      for (let i = 0; i < 5; i++) {
+        results.push(await alerts.notify({ level: 'error', title: `err-${i}`, key: `err-key-${i}` }));
+      }
+      const delivered = results.filter(Boolean).length;
+      assert.strictEqual(delivered, 3, `expected 3 of 5 errors delivered, got ${delivered}`);
+    } finally {
+      console.warn = origWarn;
+      global.fetch = origFetch;
+      for (const [k, v] of Object.entries(prev)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      alerts._resetState();
+    }
+  });
+
+  // ── M. Recovery path: vision only, no image submit ─────────────────
+  // Revert: calling editImage/generateImage from recovery fails M1;
+  // shipping recovered plate with no visionQc stamp when flag on fails M2.
+  check('M1 imageRecoveryService never calls editImage/generateImage (vision QC only)', () => {
+    const recSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'imageRecoveryService.js'), 'utf8'
+    );
+    assert.ok(!/\b(generateImage|editImage)\s*\(/.test(recSrc),
+      'recovery must not submit a new image — money');
+    assert.match(recSrc, /judgeRender|maybeQcRecoveredPlate|buildSkippedVerdict/,
+      'recovery must QC or stamp skipped when flag on');
+  });
+  check('M2 recovery path stamps visionQc when QC enabled (judge or skipped)', () => {
+    const recSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'imageRecoveryService.js'), 'utf8'
+    );
+    assert.match(recSrc, /visionQc/, 'recovered ad must persist visionQc');
+    assert.match(recSrc, /alertQcSkipped|alertQcFailure/,
+      'uninspected or failed recovery QC must alert');
+  });
+
+  // ── N. Preview / app deep link helpers ─────────────────────────────
+  check('N1 buildAppPreviewUrl uses FRONTEND_URL (no hardcoded domain)', () => {
+    const prev = process.env.FRONTEND_URL;
+    process.env.FRONTEND_URL = 'https://staging.example.test';
+    try {
+      const url = qc.buildAppPreviewUrl({
+        campaignRunId: 'run-abc',
+        campaignId: 'camp-1',
+        brandId: 'brand-9'
+      });
+      assert.ok(url);
+      assert.match(url, /^https:\/\/staging\.example\.test\/ads\?/);
+      assert.match(url, /campaignRunId=run-abc/);
+      assert.match(url, /campaignId=camp-1/);
+      assert.match(url, /runBrandId=brand-9/);
+      assert.ok(!/reach-social|netlify\.app|liquidretail/.test(url) || /staging\.example\.test/.test(url));
+    } finally {
+      if (prev === undefined) delete process.env.FRONTEND_URL;
+      else process.env.FRONTEND_URL = prev;
+    }
+  });
+  check('N2 buildQcSlackDetail surfaces preview render URL', () => {
+    const detail = qc.buildQcSlackDetail(qc.buildPersistedVerdict({
+      passed: true, finalAttempt: 1,
+      attempts: [{
+        attempt: 1, pass: true, categories: qc.emptyCategories(),
+        summary: 'clean', renderUrl: 'https://cdn.example/ship.png'
+      }]
+    }), { appUrl: 'https://app.example/ads?campaignRunId=r1' });
+    assert.match(detail, /https:\/\/cdn\.example\/ship\.png/);
+    assert.match(detail, /https:\/\/app\.example\/ads\?campaignRunId=r1/);
   });
 
   // ── report ─────────────────────────────────────────────────────────

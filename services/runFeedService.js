@@ -216,6 +216,9 @@ function formatThreadLine(ev) {
   }
   if (meta.mediaId) bits.push(`media=…${shortId(meta.mediaId)}`);
   if (ev.adId) bits.push(`ad=…${shortId(ev.adId)}`);
+  // Optional preview URL (e.g. Cloudinary render, app deep link). Only when
+  // present so every existing caller of noteEvent/onStage is unchanged.
+  if (meta.previewUrl) bits.push(String(meta.previewUrl));
   return bits.join('  ');
 }
 
