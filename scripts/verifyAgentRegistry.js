@@ -100,6 +100,7 @@ const FILES = [
   'services/capabilityExecutors/catalogRefreshDetails.js',
   'services/capabilityExecutors/mediaSourceSummary.js',
   'services/capabilityExecutors/dbQuery.js',
+  'services/capabilityExecutors/catalogListProductsWithoutAds.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -1001,6 +1002,44 @@ async function checkPhase4MediaExecutors() {
   });
   assert(u4.ok === false && /resourceType must be one of/i.test(u4.error),
     `mediaUpload: rejects resourceType outside {image, video}`);
+}
+
+// ── 31. catalog.listProductsWithoutAds ────────────────────────────
+console.log('\n[31] catalog.listProductsWithoutAds');
+
+{
+  const c = registry.capabilityById('catalog.listProductsWithoutAds');
+  assert(c, `capability "catalog.listProductsWithoutAds" registered`);
+  if (c) {
+    assert(c.tier === 0, `catalog.listProductsWithoutAds: tier === 0`);
+    assert(c.scope === 'brand', `catalog.listProductsWithoutAds: scope === 'brand'`);
+  }
+}
+
+async function checkProductsWithoutAds() {
+  const exec = require('../services/capabilityExecutors/catalogListProductsWithoutAds');
+  const noScope = {};
+  const r1 = await exec.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `catalogListProductsWithoutAds: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /brandId required/i.test(r2.error),
+    `catalogListProductsWithoutAds: missing brandId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `catalogListProductsWithoutAds: invalid brandId → rejects`);
+  const r4 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', kind: 'audio' }
+  });
+  assert(r4.ok === false && /kind must be/i.test(r4.error),
+    `catalogListProductsWithoutAds: rejects kind outside {image, video}`);
+  const r5 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', statuses: [] }
+  });
+  assert(r5.ok === false && /statuses must be a non-empty array/i.test(r5.error),
+    `catalogListProductsWithoutAds: empty statuses array rejected`);
 }
 
 // ── 30. db.query (security-critical structured read) ─────────────
@@ -2119,6 +2158,7 @@ async function checkPhase4Tier2Executors() {
   await checkCatalogRefreshTrio();
   await checkMediaSourceSummary();
   await checkDbQueryInvariants();
+  await checkProductsWithoutAds();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

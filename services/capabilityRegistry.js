@@ -1647,6 +1647,31 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'catalog.listProductsWithoutAds',
+    title:    'List products lacking an ad (optionally by kind / aspect)',
+    describe: 'Cross-reference a brand\'s catalog against its ads and return the products that have NO counted ad matching the shape filter. Server-side aggregation — one call answers "which products need a 9:16 reels ad?" without needing 25+ paginated db.query invocations. Optional filters: kind (image | video), aspectRatio (e.g. "9:16", "1:1", "4:5"), statuses (defaults to the "counted as real" set: ok / draft / queued / rendering — failed and archived are ignored). Bounded: enumerates up to 500 catalog products, returns up to 100 missing.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:     { type: 'string', description: 'Brand ObjectId.' },
+        kind:        { type: 'string', enum: ['image', 'video'], description: 'Optional — only look for ads of this kind. Omit to match any kind.' },
+        aspectRatio: { type: 'string', description: 'Optional aspect ratio (e.g. "9:16"). Omit to match any.' },
+        statuses:    { type: 'array', items: { type: 'string' }, maxItems: 8, description: 'Ad statuses that count as "real" for coverage. Default: ["ok","draft","queued","rendering"].' },
+        limit:       { type: 'integer', minimum: 1, maximum: 100, description: 'Cap on missing-products rows in the response (default 20).' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogListProductsWithoutAds',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'db.query',
     title:    'Structured read-only DB query (whitelisted)',
     describe: 'Read-only structured query against a whitelisted set of collections (Media, CatalogProduct, ProductMatchArtifact, DetectionArtifact, DetectRun, Ad). Tenant scope is INJECTED server-side (advertiserId directly, or via-brand clamp for Ad) — cross-tenant reads are impossible. Filter keys must be in the per-collection allowlist; operators limited to $eq (implicit), $ne, $in, $nin, $exists, $gt, $gte, $lt, $lte (no $regex, $where, $expr, $lookup, $or, $and). Results capped at 20 rows with a per-collection field projection so hidden fields (raw blobs, encrypted tokens, PII, prompt IP) are never returned. Use this for ad-hoc questions like "most popular products by rating" or "products without a 9:16 reels ad" (two calls: list products + list ads filtered by aspectRatio/kind, then cross-reference by productId).',
