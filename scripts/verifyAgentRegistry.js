@@ -55,6 +55,8 @@ const FILES = [
   'services/capabilityExecutors/catalogDetectProductsFromMedia.js',
   'services/capabilityExecutors/catalogSyncFromShopifyPublic.js',
   'services/capabilityExecutors/catalogPullFromApify.js',
+  'services/capabilityExecutors/onboardingDispatchSyncs.js',
+  'services/capabilityExecutors/onboardingCreateBrandFromUrl.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -888,6 +890,67 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 19. Phase 5 — onboarding.dispatchSyncs + createBrandFromUrl ───
+console.log('\n[19] Phase 5 onboarding capabilities');
+
+{
+  const dispatch = registry.capabilityById('onboarding.dispatchSyncs');
+  assert(dispatch, `capability "onboarding.dispatchSyncs" registered`);
+  if (dispatch) {
+    assert(dispatch.tier === 1, `onboarding.dispatchSyncs: tier === 1`);
+    assert(dispatch.scope === 'brand', `onboarding.dispatchSyncs: scope === 'brand'`);
+  }
+  const createFromUrl = registry.capabilityById('onboarding.createBrandFromUrl');
+  assert(createFromUrl, `capability "onboarding.createBrandFromUrl" registered`);
+  if (createFromUrl) {
+    assert(createFromUrl.tier === 4, `onboarding.createBrandFromUrl: tier === 4`);
+    assert(createFromUrl.execute?.workflow === true,
+      `onboarding.createBrandFromUrl: execute.workflow === true`);
+    assert(typeof createFromUrl.estimateUsd === 'number' && createFromUrl.estimateUsd > 0,
+      `onboarding.createBrandFromUrl: estimateUsd > 0 (billable enrichment step)`);
+  }
+}
+
+async function checkPhase5Executors() {
+  const noScope = {};
+  const dispatch = require('../services/capabilityExecutors/onboardingDispatchSyncs');
+  const createFromUrl = require('../services/capabilityExecutors/onboardingCreateBrandFromUrl');
+
+  const d1 = await dispatch.run({ req: noScope, args: {} });
+  assert(d1.ok === false && /advertiser scope/i.test(d1.error),
+    `onboardingDispatchSyncs: no-scope → rejects`);
+  const d2 = await dispatch.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(d2.ok === false && /brandId required/i.test(d2.error),
+    `onboardingDispatchSyncs: missing brandId → rejects`);
+  const d3 = await dispatch.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(d3.ok === false && /valid ObjectId/i.test(d3.error),
+    `onboardingDispatchSyncs: invalid brandId → rejects`);
+
+  assert(typeof createFromUrl.preview === 'function',
+    `onboardingCreateBrandFromUrl exports preview()`);
+  assert(typeof createFromUrl.execute === 'function',
+    `onboardingCreateBrandFromUrl exports execute()`);
+  const p1 = await createFromUrl.preview({ req: noScope, args: {} });
+  assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+    `createBrandFromUrl.preview: no-scope → rejects`);
+  const e1 = await createFromUrl.execute({ req: noScope, args: {} });
+  assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+    `createBrandFromUrl.execute: no-scope → rejects`);
+  const p2 = await createFromUrl.preview({ req: { advertiserId: 'x' }, args: {} });
+  assert(p2.ok === false && /name required/i.test(p2.error),
+    `createBrandFromUrl.preview: missing name → rejects`);
+  const p3 = await createFromUrl.preview({
+    req: { advertiserId: 'x' }, args: { name: 'Test' }
+  });
+  assert(p3.ok === false && /websiteUrl required/i.test(p3.error),
+    `createBrandFromUrl.preview: missing websiteUrl → rejects`);
+  const p4 = await createFromUrl.preview({
+    req: { advertiserId: 'x' }, args: { name: 'Test', websiteUrl: 'ftp://bad.example' }
+  });
+  assert(p4.ok === false && /http/i.test(p4.error),
+    `createBrandFromUrl.preview: non-http websiteUrl rejected`);
+}
+
 // ── 18. Phase 4 — T4 detect / shopify / apify workflows ───────────
 console.log('\n[18] Phase 4 T4 workflows');
 
@@ -1021,6 +1084,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase4MediaExecutors();
   await checkPhase4Tier2Executors();
   await checkPhase4Tier4Executors();
+  await checkPhase5Executors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

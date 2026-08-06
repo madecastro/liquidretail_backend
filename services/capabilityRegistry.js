@@ -913,6 +913,29 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 5: Onboarding — dispatch syncs ──────────────────────────
+
+  {
+    id:       'onboarding.dispatchSyncs',
+    title:    'Dispatch post-connect sync fan-out',
+    describe: 'Fire the same sync fan-out that POST /api/onboarding/dispatch-syncs runs after an operator completes the connect step: IG catalog + posts (if an Instagram credential exists), Meta Ads campaigns, Google Ads campaigns. Each dispatched via setImmediate so it survives client navigation. Debounces catalog + posts syncs when the last run is within 5 minutes so it does not double-fire the IG picker\'s auto-run. Returns which kinds were dispatched vs skipped. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId — must have at least one connected IntegrationCredential to produce a non-empty dispatch list.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/onboardingDispatchSyncs',
+      method:  'run'
+    }
+  },
+
   // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
 
   {
@@ -1284,6 +1307,32 @@ const CAPABILITIES = [
       required: ['brandId'],
       properties: {
         brandId: { type: 'string', description: 'Brand ObjectId. Must have shopifyUrl or websiteUrl set.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'onboarding.createBrandFromUrl',
+    title:    'Onboard a brand from a URL (create → enrich → sync → reviews)',
+    describe: 'The money workflow. Chains Phase 3/4 primitives into a single confirm-and-go flow: (1) create Brand with source=\'curated\' and websiteUrl set; (2) run brand enrichment (Brandfetch → scrape → LLM) inline; (3) pull the public Shopify catalog via shopifyPublicIngestService (downstream detect + enrichment enqueue is fire-and-forget inside the service); (4) refresh on-site reviews for up to 25 products via the 3-tier scraper. Idempotent on brand existence — a matching brand under this advertiser is reused rather than duplicated. Heavy workflow (typically 2-5 min, SSE stream stays open). Each step\'s outcome surfaces in the final result; a step failing does NOT abort later steps.',
+    tier:     4,
+    scope:    'advertiser',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/onboardingCreateBrandFromUrl',
+      workflow: true
+    },
+    // Reserves against advertiser cap; step 3\'s downstream detect
+    // enqueue lands on OTHER spendGuard rows (per-image detect), not
+    // this workflow\'s.
+    estimateUsd: 2.00,
+    args: {
+      type: 'object',
+      required: ['name', 'websiteUrl'],
+      properties: {
+        name:       { type: 'string', minLength: 1, maxLength: 200, description: 'Brand display name.' },
+        websiteUrl: { type: 'string', description: 'Brand website — must start with http:// or https://.' }
       },
       additionalProperties: false
     }

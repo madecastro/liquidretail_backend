@@ -1,9 +1,15 @@
 # Agent capability coverage plan
 
-**Status**: Phases 1 + 2 + 3 + 4 shipped (2026-08-06). Registry at 49 caps.
-Phase 4 shipped 11 of 12 planned caps — `catalog.pollApifyRun` deferred
-(no async Apify pattern in this repo today; all sync via
-`run-sync-get-dataset-items`).
+**Status**: Phases 1 + 2 + 3 + 4 + 5 shipped (2026-08-06). Registry at 51 caps.
+
+- Phase 4 shipped 11 of 12 planned caps — `catalog.pollApifyRun` deferred
+  (no async Apify pattern in this repo today; all sync via
+  `run-sync-get-dataset-items`).
+- Phase 5 shipped 2 of 4 planned caps —
+  `onboarding.createAdvertiser` deferred (chicken-and-egg with agent
+  auth: `requireAuth` presupposes an advertiserId, so the caller already
+  has one and the route\'s 409 fires immediately); `onboarding.createBrand`
+  deferred as a duplicate of `brand.create` (Phase 3).
 
 ## Purpose
 
@@ -74,7 +80,7 @@ lands. Tracked in the Phase 8b backlog row.
 | 2 | Ad curation | 5 | T1 × 5 | ✅ shipped | — |
 | 3 | Brand config | 8 | T1 × 5, T2 × 3 | ✅ shipped | — |
 | 4 | Catalog & media | 11 (of 12) | T1 × 6, T2 × 2, T4 × 3 | ✅ shipped | — |
-| 5 | Onboarding | 4 | T1 × 3, T4 × 1 | High | ✅ deps met |
+| 5 | Onboarding | 2 (of 4) | T1 × 1, T4 × 1 | ✅ shipped | — |
 | 6 | Detection & layouts | 5 | T1 × 3, T2 × 2 | Medium | Phase 4 (media.*) |
 | 7 | Team | 5 | T1 × 3, T3 × 2 | Medium | — |
 | 8a | Integrations OAuth | ~10 | T1 × 10 | Medium | — |
