@@ -36,11 +36,28 @@ const CATEGORIES = Object.freeze([
 const PASS_FLOOR = 7;
 
 // Role name in atlasModelMap. Env ATLAS_MODEL_AD_VISION_QC can re-point.
-// CHOSEN: gemini-2.5-flash — already used for vision identify/match work in
-// this repo (geminiIdentifyService, visualCatalogMatchService), listed in
-// MAP with atlas slug google/gemini-2.5-flash, cheap enough for every static
-// ad. NOT inventing a catalog id. ROUTING MUST BE CONFIRMED LIVE before
-// merge (catalog listing ≠ routable — see gpt-5-nano trap in atlasModelMap).
+//
+// RESOLVES TO google/gemini-2.5-pro (atlasModelMap.js, 'ad-vision-qc').
+// This comment previously claimed "CHOSEN: gemini-2.5-flash", which was WRONG
+// and was the exact doc-drift class this repo keeps getting bitten by: the map
+// has routed this role to PRO, not flash, and CLAUDE.md records why — flash
+// broke the JSON contract on this very task, and a malformed verdict is
+// consumed as a failed one, so it either ships a bad ad or burns the single
+// billable regeneration. Do not "restore" flash on the strength of its price.
+//
+// ROUTABILITY: CONFIRMED LIVE 2026-08-05 against Atlas
+// (POST /v1/chat/completions, google/gemini-2.5-pro → HTTP 200, valid JSON,
+// finish_reason 'stop'). This check is not optional and not satisfied by the
+// catalog listing — see the gpt-5-nano trap in atlasModelMap, where a listed
+// model returned HTTP 400 "router not found". Re-probe if the role is repointed.
+//
+// COST, from the live catalog 2026-08-05 (per 1M tokens): pro in $1.25 / out
+// $10. A check is ~2 images + prompt, so roughly $0.01-0.03 including reasoning
+// tokens — noise against the ~$0.0717 gpt-image-2/edit render it protects.
+// Cheaper gemini tiers exist (3-flash-preview, 3.1-flash-lite) but they are
+// flash-class; note google/gemini-3.5-flash is actually MORE expensive on input
+// than 2.5-pro ($1.50), so it is not even a cost argument. There is no
+// gemini-3.5-pro in the catalog.
 const QC_MODEL_ROLE = 'ad-vision-qc';
 
 function isEnabled() {
@@ -58,6 +75,14 @@ function resolveQcModel() {
  * Image order is fixed: [0]=ORIGINAL PRODUCT, [1]=GENERATED AD.
  * Follows aiCreativeDirectorService.js:1208-1212 convention
  * ({type:'image_url', image_url:{url}}).
+ *
+ * expectedText contract:
+ *   - string[] (possibly empty) when the copy contract is KNOWN.
+ *     Empty list means pure product image is legitimate (live path).
+ *   - expectedTextUnknown:true when the copy contract cannot be
+ *     reconstructed (recovery). Then text_defects is scored ONLY on
+ *     intrinsic defects — never on "unexpected" copy presence. Do NOT
+ *     pass [] for that case: [] means "no text allowed".
  */
 function buildVisionUserContent({
   originalProductUrl,
@@ -65,7 +90,8 @@ function buildVisionUserContent({
   brandName,
   safeBox,
   deliveryDims,
-  expectedText
+  expectedText,
+  expectedTextUnknown = false
 }) {
   if (!originalProductUrl) throw new Error('adVisionQc: originalProductUrl required');
   if (!renderUrl) throw new Error('adVisionQc: renderUrl required');
@@ -73,9 +99,38 @@ function buildVisionUserContent({
   const brand = brandName || 'the advertiser';
   const box = safeBox || {};
   const dims = deliveryDims || {};
-  const textList = Array.isArray(expectedText) && expectedText.length
-    ? expectedText.map((t) => `  - ${t}`).join('\n')
-    : '  (none — pure product image is legitimate)';
+
+  let expectedTextSection;
+  let textDefectsInstruction;
+  if (expectedTextUnknown) {
+    // Recovery / any path where the exact copy contract is not durable.
+    // MUST NOT render as "(none — pure product…)" — that false-fails every
+    // ad that legitimately carries a brand line / CTA / rating.
+    expectedTextSection =
+      'Expected on-ad text strings: UNKNOWN — the exact copy contract for this ' +
+      'render is not available to the inspector.\n' +
+      '  Score text_defects ONLY on intrinsic defects (misspellings, gibberish ' +
+      'letterforms, mangled or duplicated words, literal role-label leakage ' +
+      'like "RATING:"). Do NOT fail for the mere presence of brand copy, CTAs, ' +
+      'ratings, headlines or other ad text — those may be legitimate. Still ' +
+      'fail for intrinsically mangled letterforms.';
+    textDefectsInstruction =
+      'Misspellings, mangled or duplicated words, gibberish letterforms, and ' +
+      'literal label leakage (e.g. "RATING: 4.8 ★" with the role label visible). ' +
+      'The expected copy list is UNKNOWN — score ONLY these intrinsic defects; ' +
+      'do NOT penalise presence of otherwise-plausible ad copy.';
+  } else {
+    const textList = Array.isArray(expectedText) && expectedText.length
+      ? expectedText.map((t) => `  - ${t}`).join('\n')
+      : '  (none — pure product image is legitimate)';
+    expectedTextSection =
+      'Expected on-ad text strings (if any) — these are the ONLY words that should appear as ad copy:\n' +
+      textList;
+    textDefectsInstruction =
+      'Misspellings, mangled or duplicated words, gibberish letterforms, and ' +
+      'literal label leakage (e.g. "RATING: 4.8 ★" printed with the role label ' +
+      '"RATING" visible). Compare against the expected text list above.';
+  }
 
   const prompt = `You are a post-render quality inspector for direct-response product ads.
 
@@ -87,8 +142,7 @@ Brand name: ${brand}
 Delivery canvas: ${dims.width || '?'}×${dims.height || '?'} px
 Declared SAFE BOX (content must stay inside; coordinates in delivered pixels):
   left=${box.left ?? '?'}, top=${box.top ?? '?'}, right=${box.right ?? '?'}, bottom=${box.bottom ?? '?'}
-Expected on-ad text strings (if any) — these are the ONLY words that should appear as ad copy:
-${textList}
+${expectedTextSection}
 
 Score EACH category 0–10 (integer) and list concrete findings. Return ONLY JSON.
 
@@ -108,9 +162,7 @@ CATEGORIES
    identity drift is not.
 
 3. text_defects
-   Misspellings, mangled or duplicated words, gibberish letterforms, and
-   literal label leakage (e.g. "RATING: 4.8 ★" printed with the role label
-   "RATING" visible). Compare against the expected text list above.
+   ${textDefectsInstruction}
 
 4. layout_safe_box
    Any text, CTA, or logo that breaches the declared safe box numbers above,
@@ -246,6 +298,7 @@ async function judgeRender({
   safeBox,
   deliveryDims,
   expectedText,
+  expectedTextUnknown = false,
   brandId = null,
   productId = null,
   adId = null,
@@ -259,7 +312,8 @@ async function judgeRender({
     brandName,
     safeBox,
     deliveryDims,
-    expectedText
+    expectedText,
+    expectedTextUnknown
   });
 
   // ── MONEY: billable vision LLM call ──────────────────────────────
@@ -278,7 +332,31 @@ async function judgeRender({
       model,
       messages: [{ role: 'user', content: userContent }],
       temperature: 0.0,
-      max_tokens: 1500,
+      // MONEY — this ceiling must cover REASONING tokens, not just the verdict.
+      // gemini-2.5-pro is a thinking model: probed live 2026-08-05 against Atlas,
+      // a trivial "reply {\"ok\":true}" prompt spent thoughtsTokenCount=147 to
+      // emit 5 content tokens, and the SAME call with max_tokens=20 returned
+      // HTTP 200 with EMPTY content. A real 2-image QC prompt reasons harder.
+      // Empty content is not a soft failure here: it falls through to the
+      // `if (!text)` branch below, which parses to zero-score categories and
+      // therefore FAILS closed — burning the single allowed billable
+      // gpt-image-2/edit regeneration on an infrastructure hiccup rather than a
+      // real defect. Raised 1500 -> 5000 for generous headroom; this is FREE,
+      // because max_tokens is a CEILING and billing is per token actually
+      // GENERATED — an unused ceiling costs nothing. Owner call 2026-08-05:
+      // "even 5k tokens is nothing", i.e. deliberately over-provisioned so a
+      // hard-thinking verdict can never be truncated into a false failure.
+      // Do not lower it without re-probing thoughtsTokenCount on real renders.
+      //
+      // Reasoning is likewise left at the model default ON PURPOSE. Probed
+      // 2026-08-05: reasoning_effort barely moves it (216 -> 180 tokens at
+      // 'minimal'; 'none' gave 191, i.e. no reliable effect) and
+      // thinking_budget:0 is rejected HTTP 400 — 2.5-pro cannot stop thinking.
+      // Even if it could, suppressing reasoning to save ~$0.0004 would trade
+      // away accuracy on a fine-grained visual-discrimination task where a
+      // false FAIL costs a ~$0.0717 regeneration and a false PASS ships the
+      // exact defect this feature exists to catch.
+      max_tokens: 5000,
       // json_object: safe across OpenAI + Gemini Atlas routes. Strict
       // json_schema 400s on Anthropic; validate in parseVerdict.
       response_format: { type: 'json_object' }
@@ -295,13 +373,26 @@ async function judgeRender({
 /**
  * Shape persisted on Ad.visionQc (Mixed). Per-attempt: pass/fail, scores,
  * findings, discarded render URL, attempt number.
+ *
+ * `reason` is set when QC did not run (skipped) so operators can tell WHY —
+ * e.g. "no original product URL", "vision call failed: …", "recovered without QC".
+ * Null on real inspect-and-pass / inspect-and-fail verdicts.
  */
-function buildPersistedVerdict({ passed, attempts, finalAttempt, skipped = false, disabled = false }) {
+function buildPersistedVerdict({
+  passed,
+  attempts,
+  finalAttempt,
+  skipped = false,
+  disabled = false,
+  reason = null
+}) {
   return {
     schemaVersion: 1,
     skipped: !!skipped,
     disabled: !!disabled,
     passed: !!passed,
+    // WHY QC did not inspect (only meaningful when skipped). string|null.
+    reason: reason == null ? null : String(reason).slice(0, 500),
     finalAttempt: finalAttempt || null,
     maxRegenerations: MAX_QC_REGENERATIONS,
     attempts: (attempts || []).map((a) => ({
@@ -317,6 +408,56 @@ function buildPersistedVerdict({ passed, attempts, finalAttempt, skipped = false
       imageGeneration: a.imageGeneration || null
     }))
   };
+}
+
+/**
+ * Verdict for an ad that SHIPPED WITHOUT being inspected.
+ *
+ * Distinct from `disabled` (the flag was off, so nobody expected QC) and from
+ * a failed verdict (inspected, judged bad). This is "QC was supposed to run and
+ * could not" — the state an operator must be able to tell apart from a pass,
+ * because with the flag on, an absent Ad.visionQc field otherwise reads as
+ * "fine". Every consumer that asks "was this inspected?" should check
+ * `skipped === true`, not merely that visionQc exists.
+ */
+function buildSkippedVerdict(reason) {
+  return buildPersistedVerdict({
+    skipped: true,
+    passed: false,
+    finalAttempt: null,
+    attempts: [],
+    reason: String(reason || 'unknown')
+  });
+}
+
+/**
+ * Frontend origin for deep links — SAME resolution as renderService.js
+ * (FRONTEND_URL, else first of FRONTEND_URLS). No new env var, no hardcoded domain.
+ */
+function resolveFrontendOrigin() {
+  const single = (process.env.FRONTEND_URL || '').trim();
+  if (single) return single.replace(/\/$/, '');
+  const first = (process.env.FRONTEND_URLS || '').split(',').map((s) => s.trim()).filter(Boolean)[0];
+  return first ? first.replace(/\/$/, '') : null;
+}
+
+/**
+ * App deep link into the ads list filtered to this run/brand, when origin is known.
+ * Frontend /ads accepts campaignRunId, campaignId, runBrandId.
+ */
+function buildAppPreviewUrl({ campaignRunId = null, campaignId = null, brandId = null } = {}) {
+  const origin = resolveFrontendOrigin();
+  if (!origin) return null;
+  if (!campaignRunId && !campaignId && !brandId) return null;
+  try {
+    const u = new URL(`${origin}/ads`);
+    if (campaignRunId) u.searchParams.set('campaignRunId', String(campaignRunId));
+    if (campaignId) u.searchParams.set('campaignId', String(campaignId));
+    if (brandId) u.searchParams.set('runBrandId', String(brandId));
+    return u.toString();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -343,6 +484,7 @@ async function runPostRenderQc({
   safeBox,
   deliveryDims,
   expectedText,
+  expectedTextUnknown = false,
   brandId = null,
   productId = null,
   adId = null,
@@ -364,6 +506,10 @@ async function runPostRenderQc({
   );
 
   // ── Flag off: one generation, zero vision, zero regeneration ──
+  // Do NOT claim passed:true — nothing was inspected. Callers that only
+  // check `.passed` would otherwise treat an uninspected plate as clean.
+  // Live production short-circuits earlier (isEnabled check in the render
+  // service) so this shape is for harnesses and any future direct caller.
   if (!enabled) {
     const output = await generate({ attempt: 1, correctiveNote: null });
     return {
@@ -371,9 +517,10 @@ async function runPostRenderQc({
       skipped: true,
       output,
       visionQc: buildPersistedVerdict({
-        passed: true,
+        passed: false,
         skipped: true,
         disabled: true,
+        reason: 'AD_VISION_QC_ENABLED=false',
         finalAttempt: 1,
         attempts: []
       }),
@@ -435,18 +582,53 @@ async function runPostRenderQc({
 
     const visionRenderUrl = persistedUrl || renderUrl;
     // ── MONEY: billable vision LLM call ────────────────────────────
-    const verdict = await judge({
-      originalProductUrl,
-      renderUrl: visionRenderUrl,
-      brandName,
-      safeBox,
-      deliveryDims,
-      expectedText,
-      brandId,
-      productId,
-      adId,
-      campaignId
-    });
+    //
+    // THROW vs GARBLED VERDICT — deliberate distinction (money + fidelity):
+    //   • A returned-but-garbled / empty / non-JSON verdict is still a
+    //     "the model looked" outcome. parseVerdict fails CLOSED (zero scores)
+    //     and that DOES consume the single allowed regeneration — the image
+    //     may be bad and we get one corrective retry.
+    //   • A THROW (Atlas hiccup, timeout, network) means the model never
+    //     looked. That is infrastructure failure, NOT evidence the plate is
+    //     bad. Burning a ~$0.07 regeneration on it would be a pure waste, and
+    //     throwing out of this function would abort the render so the already-
+    //     paid plate is later recovered with no verdict at all. Convert the
+    //     throw into a skipped/uninspected outcome, keep the paid output, and
+    //     do NOT regenerate.
+    let verdict;
+    try {
+      verdict = await judge({
+        originalProductUrl,
+        renderUrl: visionRenderUrl,
+        brandName,
+        safeBox,
+        deliveryDims,
+        expectedText,
+        expectedTextUnknown,
+        brandId,
+        productId,
+        adId,
+        campaignId
+      });
+    } catch (err) {
+      const msg = (err && err.message) ? err.message : String(err || 'unknown');
+      console.warn(
+        `   ⚠️  adVisionQc: vision call threw on attempt ${attempt} — ` +
+        `shipping paid plate uninspected (no regeneration): ${msg}`
+      );
+      // Do NOT increment visionCallCount — the call did not complete.
+      // Do NOT call generate() again — regeneration budget is for bad images.
+      return {
+        ok: true,
+        skipped: true,
+        uninspected: true,
+        output: { ...output, renderUrl: persistedUrl || output.renderUrl || null },
+        visionQc: buildSkippedVerdict(`vision call failed: ${msg}`),
+        generationCount,
+        regenerationCount,
+        visionCallCount
+      };
+    }
     visionCallCount += 1;
 
     attempts.push({
@@ -513,39 +695,292 @@ async function runPostRenderQc({
 }
 
 /**
- * Slack + log helper for terminal QC failure. Fire-and-forget.
+ * Full per-attempt breakdown (all four category scores + findings + the
+ * discarded/kept render URL for every attempt) — this IS "the verbose LLM
+ * response": every category the model scored, not just the failing ones.
+ * Shared by both the accept and reject alerts so an operator sees the same
+ * shape either way. Slack's own size limit (buildMessage) does the final
+ * clip; this only bounds a single call from producing a pathological detail
+ * block (e.g. thousands of findings).
+ *
+ * Rendered as PLAIN TEXT, not JSON. The model already answers in plain
+ * language ("invented a tree emblem on the midfoot panel") — the prompt asks
+ * for per-category `findings` strings — and a raw JSON.stringify buried that
+ * prose in braces and quotes. An operator triaging a failed ad in Slack wants
+ * to read WHY it failed, not parse it. Every value the JSON form carried is
+ * still here: per-category score, pass/fail, every finding, and each attempt's
+ * kept/discarded render URL.
  */
-function alertQcFailure({ adId, brandId, productId, visionQc, brandName }) {
+function renderCategoryBlock(categories) {
+  const lines = [];
+  for (const key of CATEGORIES) {
+    const c = (categories || {})[key];
+    if (!c) continue;
+    const mark = c.pass ? 'ok  ' : 'FAIL';
+    lines.push(`  ${mark} ${key.padEnd(17)} ${String(c.score ?? '?').padStart(2)}/10`);
+    // findings is normalised to an array by parseVerdict, but this also renders
+    // verdicts read back from Ad.visionQc — a Mixed field, so an older or
+    // hand-edited doc can carry a bare string or a number. Iterating that
+    // directly threw ("number 42 is not iterable") and, because both alert
+    // helpers wrap this in try/catch, the failure mode was a SILENTLY DROPPED
+    // Slack message on exactly the ad someone needed to see.
+    const raw = c.findings;
+    const findings = Array.isArray(raw) ? raw : (raw == null || raw === '' ? [] : [raw]);
+    for (const f of findings) lines.push(`         - ${String(f)}`);
+  }
+  return lines;
+}
+
+function buildQcSlackDetail(visionQc, { appUrl = null } = {}) {
+  const attempts = visionQc?.attempts || [];
+  const last = attempts[attempts.length - 1];
+  const out = [];
+
+  if (visionQc?.skipped) {
+    out.push('VERDICT: SKIPPED (uninspected)');
+    if (visionQc.reason) out.push(`reason: ${visionQc.reason}`);
+  } else {
+    out.push(visionQc?.passed ? 'VERDICT: PASS' : 'VERDICT: FAIL');
+  }
+  if (last?.summary) out.push(String(last.summary));
+  out.push('');
+
+  // Decisive attempt first — the scores that actually determined the outcome.
+  if (last?.categories) {
+    out.push(`final attempt ${last.attempt ?? '?'} of ${attempts.length}:`);
+    out.push(...renderCategoryBlock(last.categories));
+  }
+
+  // Then the trail, so a regeneration's before/after is visible.
+  if (attempts.length > 1) {
+    out.push('');
+    out.push('attempts:');
+    for (const a of attempts) {
+      out.push(
+        `  ${a.attempt}  ${a.pass ? 'PASS' : 'FAIL'}  ` +
+        `${a.discarded ? 'discarded' : 'kept     '}  ${a.renderUrl || '-'}`
+      );
+      if (!a.pass && a !== last) {
+        for (const line of renderCategoryBlock(a.categories)) out.push(`  ${line}`);
+      }
+    }
+  } else if (last?.renderUrl) {
+    out.push('');
+    // Cloudinary (or durable host) URL — Slack unfurls this inline.
+    out.push(`preview: ${last.renderUrl}`);
+  }
+
+  // App deep link when the caller resolved one (FRONTEND_URL / FRONTEND_URLS).
+  const deep = appUrl || visionQc?.appUrl || null;
+  if (deep) {
+    out.push(`app: ${deep}`);
+  }
+
+  return out.join('\n').slice(0, 2500);
+}
+
+/**
+ * Title for a terminal QC failure. Reflects whether a billable regeneration
+ * actually ran — recovery never regenerates, so a hard-coded "after one
+ * regeneration" title would lie about ~$0.07 that never spent.
+ *
+ * regenerated: explicit override (recovery passes false).
+ * Otherwise inferred from finalAttempt / attempts length > 1.
+ */
+function qcFailureTitle(visionQc, { regenerated = null } = {}) {
+  const attempts = visionQc?.attempts || [];
+  const finalAttempt = Number(visionQc?.finalAttempt) || attempts.length || 0;
+  const didRegen = regenerated == null
+    ? (finalAttempt > 1 || attempts.length > 1)
+    : !!regenerated;
+  return didRegen
+    ? 'Static ad failed vision QC after one regeneration'
+    : 'Static ad failed vision QC (no regeneration)';
+}
+
+/**
+ * Slack + log helper for terminal QC failure ("rejection"). Fire-and-forget.
+ *
+ * @param {boolean|null} [regenerated] — when known, overrides attempt-count
+ *   inference for the alert title (recovery always passes false).
+ */
+function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl = null, regenerated = null } = {}) {
   try {
     const alerts = require('./alertService');
     const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
     const findings = (last?.findings || []).slice(0, 6).join(' | ')
       || (visionQc?.attempts || []).map((a) => a.summary).filter(Boolean).join(' → ')
       || 'no findings';
+    const attempts = visionQc?.attempts || [];
+    const finalAttempt = Number(visionQc?.finalAttempt) || attempts.length || 0;
+    const didRegen = regenerated == null
+      ? (finalAttempt > 1 || attempts.length > 1)
+      : !!regenerated;
     alerts.notifyAsync({
       level: 'error',
-      title: 'Static ad failed vision QC after one regeneration',
-      key: 'vision-qc:failed-after-retry',
+      title: qcFailureTitle(visionQc, { regenerated }),
+      // Keyed per-ad, not a fixed literal: alertService's notify() dedupes
+      // by this key within a 15-minute window (ALERT_DEDUPE_WINDOW_MIN) and
+      // folds anything suppressed into a generic "+N more (suppressed)"
+      // bump on the NEXT delivery — with no verbose detail carried over.
+      // A shared key across every ad would mean only the first rejection
+      // in any 15-minute window actually reaches Slack with its findings;
+      // every other ad's failure that window is silently swallowed. Per-ad
+      // still collapses a genuine double-fire of the SAME ad's alert.
+      key: `vision-qc:failed-after-retry:${adId || 'unknown'}`,
+      fields: {
+        ad: String(adId || '-'),
+        brand: brandName || String(brandId || '-'),
+        product: String(productId || '-'),
+        attempts: String(attempts.length || 0),
+        regenerated: didRegen ? 'yes' : 'no',
+        findings: findings.slice(0, 300)
+      },
+      detail: buildQcSlackDetail(visionQc, { appUrl })
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  adVisionQc: alert failed: ${err.message}`);
+  }
+}
+
+/**
+ * Slack + log helper for a QC "acceptance" (the render shipped — either
+ * clean on attempt 1, or clean after the single allowed regeneration).
+ * Fire-and-forget, same contract as alertQcFailure.
+ *
+ * RETAINED for harness / manual callers. The LIVE per-ad pass path no longer
+ * routes through alertService (see noteQcPassToRunFeed) — at real scale
+ * (~900 static surfaces per multi-product run) warn-level accept alerts would
+ * exhaust ALERT_RATE_LIMIT_MAX and silently drop genuine error/fatal alerts.
+ *
+ * level:'warn', not 'info' — deliberately. alertService's default
+ * ALERT_MIN_LEVEL is 'warn', so an 'info' alert here would silently never
+ * be delivered under default config.
+ */
+function alertQcAccepted({ adId, brandId, productId, visionQc, brandName, appUrl = null }) {
+  try {
+    const alerts = require('./alertService');
+    const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
+    alerts.notifyAsync({
+      level: 'warn',
+      title: visionQc?.finalAttempt > 1
+        ? 'Static ad passed vision QC after one regeneration'
+        : 'Static ad passed vision QC',
+      // Per-ad key — see the comment on alertQcFailure's key above; the
+      // same dedupe-collapse risk applies here and matters more, since
+      // acceptance is the common case and will hit far higher volume.
+      key: `vision-qc:accepted:${adId || 'unknown'}`,
       fields: {
         ad: String(adId || '-'),
         brand: brandName || String(brandId || '-'),
         product: String(productId || '-'),
         attempts: String(visionQc?.attempts?.length || 0),
-        findings: findings.slice(0, 300)
+        summary: String(last?.summary || 'pass').slice(0, 300)
       },
-      detail: JSON.stringify({
-        attempts: (visionQc?.attempts || []).map((a) => ({
-          attempt: a.attempt,
-          pass: a.pass,
-          summary: a.summary,
-          renderUrl: a.renderUrl,
-          discarded: a.discarded,
-          categories: a.categories
-        }))
-      }, null, 2).slice(0, 2500)
+      detail: buildQcSlackDetail(visionQc, { appUrl })
     });
   } catch (err) {
-    console.warn(`   ⚠️  adVisionQc: alert failed: ${err.message}`);
+    console.warn(`   ⚠️  adVisionQc: accept alert failed: ${err.message}`);
+  }
+}
+
+/**
+ * Slack + log helper when QC was supposed to run and did not.
+ * level:'error' — shipping uninspected while the flag claims inspection is a
+ * real defect, not routine. Fire-and-forget; never throws into the render path.
+ *
+ * Keyed PER AD — a fixed key would let alertService's 15-min dedupe swallow
+ * every ad but the first (same trap as alertQcFailure).
+ */
+function alertQcSkipped({ adId, brandId, productId, brandName, reason }) {
+  try {
+    const alerts = require('./alertService');
+    alerts.notifyAsync({
+      level: 'error',
+      title: 'Static ad shipped WITHOUT vision QC',
+      key: `vision-qc:skipped:${adId || 'unknown'}`,
+      fields: {
+        ad: String(adId || '-'),
+        brand: brandName || String(brandId || '-'),
+        product: String(productId || '-'),
+        reason: String(reason || 'unknown').slice(0, 300)
+      },
+      detail: buildQcSlackDetail(buildSkippedVerdict(reason))
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  adVisionQc: skipped alert failed: ${err.message}`);
+  }
+}
+
+/**
+ * Per-ad QC pass notice → run feed thread (NOT the alert channel).
+ * Fire-and-forget. Silence is correct when runFeed is unconfigured or
+ * there is no runId — must NOT fall back to alertService (scale: hundreds
+ * of products × 3 surfaces would trip ALERT_RATE_LIMIT_MAX and starve
+ * real error/fatal alerts).
+ */
+function noteQcPassToRunFeed({
+  campaignRunId,
+  adId,
+  template = null,
+  aspectRatio = null,
+  platformFormat = null,
+  visionQc = null,
+  previewUrl = null,
+  appUrl = null
+} = {}) {
+  try {
+    if (!campaignRunId) return;
+    const runFeed = require('./runFeedService');
+    const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
+    // Prefer Cloudinary (unfurls in Slack); fall back to app deep link.
+    const url = previewUrl || last?.renderUrl || appUrl || null;
+    runFeed.noteEvent(campaignRunId, 'vision QC pass', {
+      adId: adId || null,
+      template: template || null,
+      aspectRatio: aspectRatio || null,
+      platformFormat: platformFormat || null,
+      // summary + attempt are rendered by formatThreadLine (not dead payload).
+      summary: String(last?.summary || 'pass').slice(0, 200),
+      attempt: visionQc?.finalAttempt || null,
+      previewUrl: url
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  adVisionQc: run-feed pass note failed: ${err.message}`);
+  }
+}
+
+/**
+ * Per-ad QC fail notice → run feed thread (in addition to alertQcFailure).
+ * Fire-and-forget.
+ */
+function noteQcFailToRunFeed({
+  campaignRunId,
+  adId,
+  template = null,
+  aspectRatio = null,
+  platformFormat = null,
+  visionQc = null,
+  previewUrl = null,
+  appUrl = null
+} = {}) {
+  try {
+    if (!campaignRunId) return;
+    const runFeed = require('./runFeedService');
+    const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
+    const url = previewUrl || last?.renderUrl || appUrl || null;
+    runFeed.noteEvent(campaignRunId, 'vision QC fail', {
+      adId: adId || null,
+      template: template || null,
+      aspectRatio: aspectRatio || null,
+      platformFormat: platformFormat || null,
+      // summary + attempt are rendered by formatThreadLine (not dead payload).
+      summary: String(last?.summary || 'fail').slice(0, 200),
+      attempt: visionQc?.finalAttempt || null,
+      previewUrl: url
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  adVisionQc: run-feed fail note failed: ${err.message}`);
   }
 }
 
@@ -563,10 +998,19 @@ module.exports = {
   parseVerdict,
   buildCorrectiveNote,
   buildPersistedVerdict,
+  buildSkippedVerdict,
   bufferToDataUrl,
   emptyCategories,
+  resolveFrontendOrigin,
+  buildAppPreviewUrl,
+  qcFailureTitle,
   // I/O
   judgeRender,
   runPostRenderQc,
-  alertQcFailure
+  alertQcFailure,
+  alertQcAccepted,
+  alertQcSkipped,
+  noteQcPassToRunFeed,
+  noteQcFailToRunFeed,
+  buildQcSlackDetail
 };

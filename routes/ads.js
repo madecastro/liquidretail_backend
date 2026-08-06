@@ -2151,6 +2151,9 @@ router.get('/render-activity', async (req, res) => {
         visionQc:      a.visionQc
           ? { passed: a.visionQc.passed, finalAttempt: a.visionQc.finalAttempt,
               skipped: !!a.visionQc.skipped, disabled: !!a.visionQc.disabled,
+              // reason explains uninspected ships (skipped:true) — without it
+              // the list reads like a benign skip with no cause.
+              reason: a.visionQc.reason || null,
               attempts: (a.visionQc.attempts || []).map(t => ({
                 attempt: t.attempt, pass: t.pass, summary: t.summary,
                 discarded: !!t.discarded, renderUrl: t.renderUrl || null,

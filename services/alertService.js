@@ -65,7 +65,19 @@ const DEDUPE_WINDOW_MS = () =>
 // Absolute ceiling on outbound messages, independent of dedupe — protects
 // the channel (and Slack's own rate limits) if something goes wrong
 // in a tight loop with varying keys.
+//
+// Severity-aware: info/warn share RATE_LIMIT_MAX (default 20/min). error/fatal
+// use a SEPARATE, higher allowance so a burst of low-severity traffic (e.g.
+// residual warn-level accepts, status noise) can never starve a crash or a
+// money alert. Bound still exists — a genuine error storm must not infinitely
+// spam Slack. Default high cap = max(60, 3× low cap): enough headroom for a
+// multi-surface QC-failure wave without letting a tight loop run unbounded.
 const RATE_LIMIT_MAX     = () => Math.max(1, parseInt(process.env.ALERT_RATE_LIMIT_MAX || '20', 10));
+const RATE_LIMIT_ERROR_MAX = () => {
+  const explicit = parseInt(process.env.ALERT_RATE_LIMIT_ERROR_MAX || '', 10);
+  if (Number.isFinite(explicit) && explicit >= 1) return explicit;
+  return Math.max(60, RATE_LIMIT_MAX() * 3);
+};
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 // Shown in every message so staging and prod are distinguishable, and so
@@ -98,20 +110,49 @@ const ICON = { info: 'ℹ️', warn: '⚠️', error: '❌', fatal: '🔥' };
 const lastSentAt   = new Map(); // key → epoch ms of last delivery
 const suppressed   = new Map(); // key → { count, since }
 let   windowStart  = 0;
-let   windowCount  = 0;
+let   windowCount  = 0;       // low-severity (info/warn) deliveries this window
+let   highWindowCount = 0;    // high-severity (error/fatal) deliveries this window
 let   rateLimitedNoted = false;
+let   highRateLimitedNoted = false;
 
-function withinRateLimit() {
+/**
+ * Severity-aware rate limit. `level` is the alert level string.
+ *
+ * Low (info/warn) and high (error/fatal) buckets are independent: exhausting
+ * the low bucket must NOT suppress error/fatal. Each bucket still has a hard
+ * ceiling (see RATE_LIMIT_MAX / RATE_LIMIT_ERROR_MAX comments above).
+ */
+function withinRateLimit(level = 'warn') {
   const now = Date.now();
   if (now - windowStart >= RATE_LIMIT_WINDOW_MS) {
     windowStart = now;
     windowCount = 0;
+    highWindowCount = 0;
     rateLimitedNoted = false;
+    highRateLimitedNoted = false;
+  }
+  const isHigh = level === 'error' || level === 'fatal';
+  if (isHigh) {
+    if (highWindowCount >= RATE_LIMIT_ERROR_MAX()) {
+      if (!highRateLimitedNoted) {
+        highRateLimitedNoted = true;
+        console.warn(
+          `🔔 alert: high-severity rate limit hit (${RATE_LIMIT_ERROR_MAX()}/min error+fatal) — ` +
+          `suppressing further error/fatal this minute`
+        );
+      }
+      return false;
+    }
+    highWindowCount++;
+    return true;
   }
   if (windowCount >= RATE_LIMIT_MAX()) {
     if (!rateLimitedNoted) {
       rateLimitedNoted = true;
-      console.warn(`🔔 alert: rate limit hit (${RATE_LIMIT_MAX()}/min) — suppressing further alerts this minute`);
+      console.warn(
+        `🔔 alert: rate limit hit (${RATE_LIMIT_MAX()}/min info+warn) — ` +
+        `suppressing further low-severity alerts this minute (error/fatal still delivered)`
+      );
     }
     return false;
   }
@@ -333,10 +374,15 @@ async function notify({ level = 'warn', title, detail, fields, key } = {}) {
     // first await. Two callers racing on the same key must not both send.
     lastSentAt.set(dedupeKey, now);
 
-    if (!withinRateLimit()) {
+    if (!withinRateLimit(lvl)) {
       // Rate-limited, not delivered — release the slot so the key isn't
       // silenced for the whole dedupe window by a burst it never joined.
+      // Count the drop the same way dedupe does so "+N more (suppressed)"
+      // reflects BOTH rate-limit and dedupe drops (both buckets share this
+      // map; severity only affects which rate-limit bucket was consulted).
       lastSentAt.delete(dedupeKey);
+      const prev = suppressed.get(dedupeKey) || { count: 0, since: now };
+      suppressed.set(dedupeKey, { count: prev.count + 1, since: prev.since });
       return false;
     }
 
@@ -383,7 +429,9 @@ function _resetState() {
   suppressed.clear();
   windowStart = 0;
   windowCount = 0;
+  highWindowCount = 0;
   rateLimitedNoted = false;
+  highRateLimitedNoted = false;
   delete notify._warnedUnconfigured;
 }
 
@@ -394,6 +442,15 @@ module.exports = {
   _esc: esc, _clip: clip, _safeEsc: safeEsc, _redact: redact,
   _buildMessage: buildMessage, _resetState, _LEVELS: LEVELS,
   _stateSize: () => ({ lastSentAt: lastSentAt.size, suppressed: suppressed.size }),
-  _resetRateWindow: () => { windowStart = 0; windowCount = 0; rateLimitedNoted = false; },
+  _resetRateWindow: () => {
+    windowStart = 0;
+    windowCount = 0;
+    highWindowCount = 0;
+    rateLimitedNoted = false;
+    highRateLimitedNoted = false;
+  },
+  _withinRateLimit: withinRateLimit,
+  _RATE_LIMIT_MAX: RATE_LIMIT_MAX,
+  _RATE_LIMIT_ERROR_MAX: RATE_LIMIT_ERROR_MAX,
   _SLACK_MAX: SLACK_MAX
 };

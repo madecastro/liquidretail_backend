@@ -22,18 +22,26 @@
 // would ship an uncropped, unbranded image AS a successful render, which is worse
 // than not recovering it.
 //
-// ── NO SUBMIT, STRUCTURALLY ────────────────────────────────────────────────
-// The only provider call here is peekImagePrediction, a free GET. This module
-// must never import or reach a generate/edit path. Asserted on the source by
-// scripts/verifyImageRecovery.js — that assertion is the money guarantee.
+// ── NO IMAGE SUBMIT, STRUCTURALLY ──────────────────────────────────────────
+// This module must never import or reach a generate/edit path. Asserted on the
+// source by scripts/verifyImageRecovery.js — that assertion is the money
+// guarantee for image submits.
+//
+// Provider / LLM calls that ARE allowed (never image generation):
+//   · peekImagePrediction — free GET of an already-paid prediction
+//   · judgeRender (adVisionQcService) — billable vision LLM (~$0.01–0.03) when
+//     AD_VISION_QC_ENABLED; zero gpt-image-2/edit submits. The spend is
+//     short-circuited before the call when the ad already holds a visionQc
+//     verdict or is no longer recoverable (see maybeQcRecoveredPlate).
 
 const Ad    = require('../models/Ad');
 const Brand = require('../models/Brand');
+const Media = require('../models/Media');
+const CatalogProduct = require('../models/CatalogProduct');
 const { peekImagePrediction } = require('./atlasImageService');
-const { finishPlate } = require('./directImageRenderService');
+const { finishPlate, safeBoxInDeliveredPx, deliveryGeometryFor } = require('./directImageRenderService');
 const { finalizeFlatCost } = require('./costTracker');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
-const { deliveryGeometryFor } = require('./directImageRenderService');
 
 /**
  * Recover ONE static ad from its spend receipt.
@@ -54,7 +62,14 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
   if (peek.state !== 'done' || !peek.imageUrl) {
     // 'processing' and 'unknown' are deliberately NOT written off. Acting on
     // ignorance is how a paid asset gets discarded; the next pass retries.
-    return { state: peek.state, message: peek.message || null, predictionId };
+    // 'failed' includes charge evidence so the boot path can stamp honestly.
+    return {
+      state: peek.state,
+      message: peek.message || null,
+      predictionId,
+      price: peek.price,
+      priceConfirmed: peek.priceConfirmed
+    };
   }
 
   // The charge is CONFIRMED here, not assumed (owner rule): peek read `price`
@@ -103,7 +118,7 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
   }
 
   const brand = ad.brandId
-    ? await Brand.findById(ad.brandId).select('logoUrl').lean()
+    ? await Brand.findById(ad.brandId).select('logoUrl name').lean()
     : null;
 
   let plate;
@@ -141,28 +156,298 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
   const renderUrl = upload?.secure_url || upload?.url || null;
   if (!renderUrl) return { state: 'unrecoverable', predictionId, message: 'upload returned no url' };
 
-  // `status: { $ne: 'draft' }` in the FILTER makes this idempotent without a
-  // lease: if another pass (or the original render, finishing late) already
-  // landed this ad, the write becomes a no-op instead of clobbering it.
+  // ── Vision QC on recovered plate (vision LLM ONLY — zero image submits) ──
+  // A restart mid-QC would otherwise stamp draft with no verdict and ship
+  // uninspected while AD_VISION_QC_ENABLED claims every static ad is checked.
+  // Prefer judge once (cheap ~$0.01–0.03). NEVER regenerate here — the plate
+  // is already paid; recovery must stay free of new image submits (money).
+  // Fail closed on a bad verdict → status:'failed' (not draft/exportable),
+  // still KEEP the recovered asset (invariant 4).
+  const visionQc = await maybeQcRecoveredPlate({
+    ad, brand, surface, dims, renderUrl
+  });
+
+  // QC fail closed mirrors the live path (routes/ads failure → status failed
+  // with paid render kept). A plain draft would put competitor-mark ads into
+  // the ready-to-export pool. Skipped/uninspected still lands draft — same as
+  // live shipping with a skipped stamp.
+  const qcFailed = !!(
+    visionQc
+    && visionQc.passed === false
+    && !visionQc.skipped
+    && !visionQc.disabled
+    && Array.isArray(visionQc.attempts)
+    && visionQc.attempts.length > 0
+  );
+
+  const setFields = {
+    status:      qcFailed ? 'failed' : 'draft',
+    renderUrl,
+    kind:        'image',
+    width:       dims.width,
+    height:      dims.height,
+    bytes:       plate.buffer.length,
+    renderedAt:  new Date(),
+    updatedAt:   new Date(),
+    cloudinaryPublicId: upload?.public_id || null,
+    renderStage: qcFailed
+      ? `recovered from receipt ${predictionId}; vision QC failed`
+      : `recovered from receipt ${predictionId}`
+  };
+  if (visionQc) setFields.visionQc = visionQc;
+  if (qcFailed) {
+    const lastSummary = (visionQc.attempts || []).slice(-1)[0]?.summary || 'vision QC fail';
+    setFields.renderError = {
+      message: `vision QC failed on recovered plate (no regeneration): ${lastSummary}`,
+      stage: 'vision-qc-recovery',
+      at: new Date(),
+      predictionId,
+      charged: true
+    };
+  }
+
+  // WRITE idempotency only — the filter makes concurrent recoveries /
+  // late-finishing live renders a no-op on the loser. The VISION spend is
+  // guarded earlier inside maybeQcRecoveredPlate (re-read status + existing
+  // visionQc before any billable judge call). Do not treat this filter as a
+  // money guard; it is not.
   const res = await Ad.updateOne(
     { _id: ad._id, status: { $nin: ['draft', 'live', 'archived'] } },
-    { $set: {
-        status:      'draft',
-        renderUrl,
-        kind:        'image',
-        width:       dims.width,
-        height:      dims.height,
-        bytes:       plate.buffer.length,
-        renderedAt:  new Date(),
-        updatedAt:   new Date(),
-        cloudinaryPublicId: upload?.public_id || null,
-        renderStage: `recovered from receipt ${predictionId}`
-    } }
+    { $set: setFields }
   );
   if (!res.modifiedCount) {
     return { state: 'unrecoverable', predictionId, message: 'ad already resolved by another pass' };
   }
-  return { state: 'recovered', predictionId, renderUrl, logoComposited: plate.logoComposited };
+  return {
+    state: 'recovered',
+    predictionId,
+    renderUrl,
+    logoComposited: plate.logoComposited,
+    visionQc: visionQc || null,
+    qcFailed
+  };
+}
+
+/**
+ * Resolve the ORIGINAL product photo for a recovered ad so judgeRender can
+ * compare product vs finished plate. Preference order mirrors the live path's
+ * first reference:
+ *   1. imageGeneration.images[0].sourceUrl (submission audit — best)
+ *   2. Media.fileUrl for ad.mediaId
+ *   3. CatalogProduct.imageUrl for ad.productId
+ * Returns null when nothing is recoverable → caller stamps skipped.
+ */
+async function resolveOriginalProductUrl(ad) {
+  const fromSubmission = ad?.imageGeneration?.images?.[0]?.sourceUrl;
+  if (fromSubmission && /^https?:\/\//i.test(String(fromSubmission))) {
+    return String(fromSubmission);
+  }
+  if (ad?.mediaId) {
+    try {
+      const m = await Media.findById(ad.mediaId).select('fileUrl').lean();
+      if (m?.fileUrl) return m.fileUrl;
+    } catch { /* ignore — fall through */ }
+  }
+  if (ad?.productId) {
+    try {
+      const p = await CatalogProduct.findById(ad.productId).select('imageUrl').lean();
+      if (p?.imageUrl) return p.imageUrl;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+/**
+ * Reconstruct expected on-ad text for recovery QC.
+ *
+ * Preference:
+ *   1. Parse the submission audit (Ad.imageGeneration.prompt) — the exact
+ *      strings handed to the image model ("role -> text" lines). Faithful.
+ *   2. Otherwise UNKNOWN — do NOT invent [] (that means "pure product, no
+ *      text allowed" and false-fails every brand-line/CTA/rating ad).
+ *
+ * Full live rebuild (buildIntentData + buildPrompt) is deliberately NOT used:
+ * it needs concept + layout + brand/product proof that may have drifted since
+ * submit, and can produce a different list than the pixels already paid for.
+ *
+ * @returns {{ expectedText: string[]|null, expectedTextUnknown: boolean }}
+ */
+function resolveExpectedTextForRecovery(ad) {
+  const fromPrompt = extractExpectedTextFromSubmissionPrompt(ad?.imageGeneration?.prompt);
+  if (fromPrompt && fromPrompt.length) {
+    return { expectedText: fromPrompt, expectedTextUnknown: false };
+  }
+  // Prompt says "THIS AD CARRIES NO TEXT AT ALL" → known empty list.
+  if (typeof ad?.imageGeneration?.prompt === 'string'
+      && /THIS AD CARRIES NO TEXT AT ALL/i.test(ad.imageGeneration.prompt)) {
+    return { expectedText: [], expectedTextUnknown: false };
+  }
+  return { expectedText: null, expectedTextUnknown: true };
+}
+
+/**
+ * Parse "  brand line -> Actual copy" lines from the static prompt's
+ * SET EXACTLY THESE STRINGS block (staticAdIntents.js textBlock).
+ * Returns null when nothing parseable (caller falls to UNKNOWN).
+ */
+function extractExpectedTextFromSubmissionPrompt(prompt) {
+  if (typeof prompt !== 'string' || !prompt) return null;
+  // Lines look like: "  brand line -> Shop the wool runner"
+  // Role is left of arrow (lowercased in the prompt); text is right.
+  const out = [];
+  const re = /^\s+[a-z][a-z0-9 /_-]*\s*->\s*(.+?)\s*$/gim;
+  let m;
+  while ((m = re.exec(prompt)) !== null) {
+    const str = String(m[1] || '').trim();
+    if (str) out.push(str);
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * When AD_VISION_QC_ENABLED, inspect the recovered plate once (vision LLM only).
+ * MONEY: no editImage / generateImage. Never discards paid pixels.
+ * Returns a persisted-verdict shape, or null when QC is disabled.
+ *
+ * PRE-SPEND IDEMPOTENCY: re-reads the ad and short-circuits BEFORE the
+ * billable judgeRender when (a) a visionQc verdict already exists, or
+ * (b) the ad is no longer in a recoverable status. Paying then losing the
+ * write is the a84437d-class hole this closes.
+ */
+async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
+  let adVisionQc;
+  try {
+    adVisionQc = require('./adVisionQcService');
+  } catch (err) {
+    console.warn(`   ⚠️  imageRecovery: adVisionQc load failed: ${err.message}`);
+    return null;
+  }
+  if (!adVisionQc.isEnabled()) return null;
+
+  const adId = ad?._id ? String(ad._id) : null;
+  const brandId = ad?.brandId || null;
+  const productId = ad?.productId || null;
+  const brandName = brand?.name || null;
+  const runId = Array.isArray(ad?.campaignRunIds) && ad.campaignRunIds.length
+    ? ad.campaignRunIds[0]
+    : null;
+  const appUrl = adVisionQc.buildAppPreviewUrl({
+    campaignRunId: runId,
+    campaignId: ad?.campaignId || null,
+    brandId
+  });
+
+  // ── PRE-SPEND short-circuit (money) ──────────────────────────────────
+  // Two overlapping recovery passes must not both pay the vision LLM.
+  // Re-read immediately before any billable call.
+  try {
+    const fresh = await Ad.findById(ad._id).select('status visionQc').lean();
+    if (!fresh) return null;
+    // Already resolved by another pass / late-finishing live render — do not spend.
+    if (['draft', 'live', 'archived'].includes(fresh.status)) {
+      return fresh.visionQc || null;
+    }
+    // Already inspected (or already stamped skipped/disabled) — do not re-pay.
+    if (fresh.visionQc != null && typeof fresh.visionQc === 'object') {
+      return fresh.visionQc;
+    }
+  } catch (err) {
+    console.warn(`   ⚠️  imageRecovery: pre-QC re-read failed: ${err.message}`);
+    // Fail closed on spend: if we cannot confirm recoverability, do not bill.
+    return adVisionQc.buildSkippedVerdict(`recovery pre-QC re-read failed: ${err.message}`);
+  }
+
+  const originalProductUrl = await resolveOriginalProductUrl(ad);
+  if (!originalProductUrl || !renderUrl) {
+    // Original not recoverable cleanly — stamp skipped rather than pretending
+    // inspected, still KEEP the recovered asset.
+    const reason = 'recovered without QC';
+    const verdict = adVisionQc.buildSkippedVerdict(reason);
+    adVisionQc.alertQcSkipped({
+      adId, brandId, productId, brandName, reason
+    });
+    return verdict;
+  }
+
+  let safeBox;
+  try {
+    safeBox = safeBoxInDeliveredPx(surface, dims);
+  } catch {
+    safeBox = {};
+  }
+
+  const { expectedText, expectedTextUnknown } = resolveExpectedTextForRecovery(ad);
+
+  try {
+    // VISION ONLY — one free-of-image-submit call. No regenerate path here.
+    const raw = await adVisionQc.judgeRender({
+      originalProductUrl,
+      renderUrl,
+      brandName,
+      safeBox,
+      deliveryDims: dims,
+      expectedText: expectedTextUnknown ? null : expectedText,
+      expectedTextUnknown: !!expectedTextUnknown,
+      brandId,
+      productId,
+      adId,
+      campaignId: ad?.campaignId || null
+    });
+    const verdict = adVisionQc.buildPersistedVerdict({
+      passed: !!raw.pass,
+      finalAttempt: 1,
+      attempts: [{
+        attempt: 1,
+        pass: !!raw.pass,
+        categories: raw.categories,
+        findings: raw.findings || [],
+        summary: raw.summary || null,
+        renderUrl,
+        discarded: false
+      }]
+    });
+    if (!raw.pass) {
+      // Fail closed on scores — stamp + alert, KEEP recovered asset.
+      // regenerated:false — recovery never burns a second image submit.
+      adVisionQc.alertQcFailure({
+        adId, brandId, productId, brandName, visionQc: verdict, appUrl,
+        regenerated: false
+      });
+      adVisionQc.noteQcFailToRunFeed({
+        campaignRunId: runId,
+        adId,
+        template: ad?.template || null,
+        aspectRatio: ad?.aspectRatio || null,
+        platformFormat: ad?.platformFormat || null,
+        visionQc: verdict,
+        previewUrl: renderUrl,
+        appUrl
+      });
+    } else {
+      adVisionQc.noteQcPassToRunFeed({
+        campaignRunId: runId,
+        adId,
+        template: ad?.template || null,
+        aspectRatio: ad?.aspectRatio || null,
+        platformFormat: ad?.platformFormat || null,
+        visionQc: verdict,
+        previewUrl: renderUrl,
+        appUrl
+      });
+    }
+    return verdict;
+  } catch (err) {
+    // Vision infrastructure throw — same as live path: ship uninspected + alert.
+    // Do NOT treat as image failure (must NOT consume regeneration budget;
+    // recovery has no regen path either).
+    const reason = `recovery vision call failed: ${err.message || err}`;
+    console.warn(`   ⚠️  imageRecovery: ${reason}`);
+    const verdict = adVisionQc.buildSkippedVerdict(reason);
+    adVisionQc.alertQcSkipped({
+      adId, brandId, productId, brandName, reason
+    });
+    return verdict;
+  }
 }
 
 /**
@@ -272,4 +557,13 @@ async function settleChargeState({ ad } = {}) {
   return { state: 'unknown', message: peek.message || peek.state };
 }
 
-module.exports = { recoverImageAd, surfaceForAd, settleChargeState };
+module.exports = {
+  recoverImageAd,
+  surfaceForAd,
+  settleChargeState,
+  // Exported for harness / recovery tooling (pure-ish helpers).
+  resolveOriginalProductUrl,
+  maybeQcRecoveredPlate,
+  resolveExpectedTextForRecovery,
+  extractExpectedTextFromSubmissionPrompt
+};

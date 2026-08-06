@@ -172,8 +172,10 @@ async function renderCreative(req) {
       platformFormat: req.platformFormat || 'meta_feed_1_1',
       productId:    req.creative.productId || null,
       // Phase 6.5 — campaign run id mixed into pickConceptForCell's
-      // hash downstream so concept rotates batch-over-batch.
+      // hash downstream so concept rotates batch-over-batch. Also threaded
+      // into renderDirectImage for vision-QC run-feed notices + app deep links.
       campaignRunId: req.campaignRunId || null,
+      campaignId:    req.campaignId || null,
       // Phase A5b — concept-driven Ad routing. When the Ad row was
       // queued by the V2 (AI_CONCEPT_DRIVEN) path, these point at the
       // specific Director round + concept the Judge ranked. ensure-

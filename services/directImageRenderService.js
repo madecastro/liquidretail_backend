@@ -973,6 +973,10 @@ function resolveImagePromptOverride(rawPromptOverride) {
 async function renderDirectImage({
   layoutInputArtifactId, aspectRatio, mediaId, productId, brandId,
   adId = null,
+  // Campaign run + campaign ids for run-feed QC notices and app deep links.
+  // Prefer a real parameter from renderService over reading Ad.campaignRunIds.
+  campaignRunId = null,
+  campaignId = null,
   adConceptArtifactId, adConceptId, template, referenceMediaIds = [],
   // Where referenceMediaIds came from, purely so the per-reference role labels
   // and the inspector tell the truth. 'operator' = an explicit wizard stack;
@@ -1296,13 +1300,47 @@ async function renderDirectImage({
     return firstOutput;
   }
 
+  const qcBrandId = resolvedBrand?._id || brandId || null;
+  const qcProductId = resolvedProduct?._id || productId || null;
+  const qcBrandName = resolvedBrand?.name || null;
+  const appUrl = adVisionQc.buildAppPreviewUrl({
+    campaignRunId,
+    campaignId,
+    brandId: qcBrandId
+  });
+
   // ORIGINAL product photo — the first reference we actually sent. A check
   // that only sees the render cannot tell an invented Timberland emblem from
   // a real brand mark (owner requirement: both images in one vision call).
   const originalProductUrl = imageMeta[0]?.sourceUrl || null;
   if (!originalProductUrl) {
-    console.warn('   ⚠️  direct-image: vision QC enabled but no original product URL — shipping without QC');
-    return firstOutput;
+    // SHIPS WITHOUT QC — but never silently. With the flag ON, an operator is
+    // entitled to assume every delivered static ad was inspected; a bare
+    // console.warn on a worker nobody is tailing does not earn that assumption
+    // (same reasoning as the generation-size renderIssue above). So: stamp the
+    // ad, raise it, and make the gap visible in the inspector.
+    //
+    // Deliberately NOT a hard failure: the render is already PAID FOR, and
+    // throwing here would discard billed pixels over a missing reference URL —
+    // strictly worse than shipping an uninspected ad and saying so loudly.
+    const reason = 'no original product URL on the reference stack';
+    const msg = 'vision QC enabled but no original product URL — shipped WITHOUT QC';
+    console.warn(`   ⚠️  direct-image: ${msg}`);
+    noteRenderIssue(adId, { message: msg, stage: 'vision-qc' });
+    adVisionQc.alertQcSkipped({
+      adId,
+      brandId: qcBrandId,
+      productId: qcProductId,
+      brandName: qcBrandName,
+      reason
+    });
+    return {
+      ...firstOutput,
+      // Truthful stamp: QC did not run. Anything reading Ad.visionQc can now
+      // distinguish "inspected and passed" from "never inspected", which a
+      // bare absent field could not.
+      visionQc: adVisionQc.buildSkippedVerdict('no original product URL')
+    };
   }
 
   const safeBox = safeBoxInDeliveredPx(built.surface, dims);
@@ -1312,12 +1350,12 @@ async function renderDirectImage({
   const qcResult = await adVisionQc.runPostRenderQc({
     enabled: true,
     originalProductUrl,
-    brandName: resolvedBrand?.name || null,
+    brandName: qcBrandName,
     safeBox,
     deliveryDims: dims,
     expectedText,
-    brandId: resolvedBrand?._id || brandId || null,
-    productId: resolvedProduct?._id || productId || null,
+    brandId: qcBrandId,
+    productId: qcProductId,
     adId: adId || null,
     // MONEY: generate() attempt 1 returns the already-paid firstOutput.
     // attempt 2 (at most once) re-enters renderDirectImage with a corrective
@@ -1332,6 +1370,8 @@ async function renderDirectImage({
         productId,
         brandId,
         adId,
+        campaignRunId,
+        campaignId,
         adConceptArtifactId,
         adConceptId,
         template,
@@ -1366,13 +1406,44 @@ async function renderDirectImage({
     }
   });
 
+  // Vision infrastructure failure (judge threw) or similar: ship paid plate
+  // with a skipped stamp. Caller alerts — do NOT treat as image-QC failure.
+  if (qcResult.skipped || qcResult.uninspected) {
+    const reason = qcResult.visionQc?.reason || 'vision QC did not inspect this render';
+    console.warn(`   ⚠️  direct-image: vision QC skipped — ${reason}`);
+    noteRenderIssue(adId, { message: `vision QC skipped: ${reason}`, stage: 'vision-qc' });
+    adVisionQc.alertQcSkipped({
+      adId,
+      brandId: qcBrandId,
+      productId: qcProductId,
+      brandName: qcBrandName,
+      reason
+    });
+    return {
+      ...qcResult.output,
+      visionQc: qcResult.visionQc
+    };
+  }
+
   if (!qcResult.ok) {
+    // Fail path: low-volume actionable alert channel AND run-feed thread line.
     adVisionQc.alertQcFailure({
       adId,
-      brandId: resolvedBrand?._id || brandId,
-      productId: resolvedProduct?._id || productId,
-      brandName: resolvedBrand?.name,
-      visionQc: qcResult.visionQc
+      brandId: qcBrandId,
+      productId: qcProductId,
+      brandName: qcBrandName,
+      visionQc: qcResult.visionQc,
+      appUrl
+    });
+    adVisionQc.noteQcFailToRunFeed({
+      campaignRunId,
+      adId,
+      template,
+      aspectRatio,
+      platformFormat: surface,
+      visionQc: qcResult.visionQc,
+      previewUrl: (qcResult.visionQc?.attempts || []).slice(-1)[0]?.renderUrl || null,
+      appUrl
     });
     const lastSummary = (qcResult.visionQc?.attempts || []).slice(-1)[0]?.summary || 'fail';
     const err = taggedError(
@@ -1390,6 +1461,23 @@ async function renderDirectImage({
     `   ✅ direct-image vision QC pass — attempt=${qcResult.visionQc.finalAttempt} ` +
     `regens=${qcResult.regenerationCount}`
   );
+  // PASS path → run feed only (NOT alertService). At real scale, per-ad
+  // accept alerts would exhaust the process-global rate limiter and silently
+  // drop genuine error/fatal alerts. Silence is correct when runFeed is
+  // unconfigured or there is no runId — never fall back to the alert channel.
+  // alertQcAccepted remains exported for harness / manual use.
+  adVisionQc.noteQcPassToRunFeed({
+    campaignRunId,
+    adId,
+    template,
+    aspectRatio,
+    platformFormat: surface,
+    visionQc: qcResult.visionQc,
+    previewUrl: (qcResult.visionQc?.attempts || []).slice(-1)[0]?.renderUrl
+      || qcResult.output?.renderUrl
+      || null,
+    appUrl
+  });
   return {
     ...qcResult.output,
     visionQc: qcResult.visionQc
