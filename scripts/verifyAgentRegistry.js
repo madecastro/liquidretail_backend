@@ -77,6 +77,8 @@ const FILES = [
   'services/capabilityExecutors/integrationsGoogleAdsConnectUrl.js',
   'services/capabilityExecutors/integrationsGoogleAdsListCredentials.js',
   'services/capabilityExecutors/integrationsGoogleAdsDisconnect.js',
+  'services/capabilityExecutors/agentGetContext.js',
+  'services/capabilityExecutors/agentSearchAcrossBrands.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -910,6 +912,59 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 23. Phase 9 — getContext + searchAcrossBrands ─────────────────
+console.log('\n[23] Phase 9 context capabilities');
+
+for (const id of ['agent.getContext', 'agent.searchAcrossBrands']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 0, `${id}: tier === 0`);
+  if (c) assert(c.scope === 'advertiser', `${id}: scope === 'advertiser'`);
+}
+
+async function checkPhase9Executors() {
+  const noScope = {};
+  const getCtx = require('../services/capabilityExecutors/agentGetContext');
+  const search = require('../services/capabilityExecutors/agentSearchAcrossBrands');
+
+  // getContext takes no args other than the auth context.
+  const g1 = await getCtx.run({ req: noScope, args: {} });
+  assert(g1.ok === false && /advertiser scope/i.test(g1.error),
+    `agentGetContext: no-scope → rejects`);
+
+  // Search argument-shape guards.
+  const s1 = await search.run({ req: noScope, args: {} });
+  assert(s1.ok === false && /advertiser scope/i.test(s1.error),
+    `agentSearchAcrossBrands: no-scope → rejects`);
+  const s2 = await search.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(s2.ok === false && /query required/i.test(s2.error),
+    `agentSearchAcrossBrands: missing query → rejects`);
+  const s3 = await search.run({ req: { advertiserId: 'x' }, args: { query: 'a' } });
+  assert(s3.ok === false && /query too short/i.test(s3.error),
+    `agentSearchAcrossBrands: single-char query rejected`);
+  const s4 = await search.run({ req: { advertiserId: 'x' }, args: { query: 'x'.repeat(201) } });
+  assert(s4.ok === false && /query too long/i.test(s4.error),
+    `agentSearchAcrossBrands: 201-char query rejected`);
+  const s5 = await search.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { query: 'hello', resourceTypes: ['bogus'] }
+  });
+  assert(s5.ok === false && /resourceType.*invalid/i.test(s5.error),
+    `agentSearchAcrossBrands: unknown resourceType rejected`);
+  const s6 = await search.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { query: 'hello', resourceTypes: 'not-array' }
+  });
+  assert(s6.ok === false && /must be an array/i.test(s6.error),
+    `agentSearchAcrossBrands: non-array resourceTypes rejected`);
+  const s7 = await search.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { query: 'hello', resourceTypes: [] }
+  });
+  assert(s7.ok === false && /at least one type/i.test(s7.error),
+    `agentSearchAcrossBrands: empty resourceTypes rejected`);
+}
+
 // ── 22. Phase 8a — integrations OAuth ─────────────────────────────
 console.log('\n[22] Phase 8a integrations OAuth');
 
@@ -1340,6 +1395,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase6Executors();
   await checkPhase7Executors();
   await checkPhase8aExecutors();
+  await checkPhase9Executors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

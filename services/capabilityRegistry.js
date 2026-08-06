@@ -959,6 +959,53 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 9: getContext + cross-brand search ─────────────────────
+
+  {
+    id:       'agent.getContext',
+    title:    'Snapshot the caller\'s advertiser context',
+    describe: 'Read-only snapshot: caller\'s advertiser (id, name, status, plan), all brands under it (id, name, slug, websiteUrl, source, per-brand integrations + campaign counts), rolling 24h spend + daily cap. Meant to be called at the start of a chat turn to answer "which of my brands …" without pre-selection. Every leg is advertiser-scoped — cross-advertiser discovery is a permanent non-goal. Cheap enough to call repeatedly (covering-projection queries only).',
+    tier:     0,
+    scope:    'advertiser',
+    args: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/agentGetContext',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'agent.searchAcrossBrands',
+    title:    'Search across every brand under the caller\'s advertiser',
+    describe: 'Case-insensitive substring search across the caller\'s advertiser\'s brands + products + campaigns + ads. Every leg is advertiser-scoped or resolves through advertiser-scoped parents; cross-advertiser discovery is impossible from this capability. Results capped at 20 rows per resource type to keep the tool_result under the LLM\'s 12KB payload budget — narrow the query when a leg reports truncated:true.',
+    tier:     0,
+    scope:    'advertiser',
+    args: {
+      type: 'object',
+      required: ['query'],
+      properties: {
+        query: { type: 'string', minLength: 2, maxLength: 200, description: 'Substring to match (case-insensitive). Escaped for regex safety server-side.' },
+        resourceTypes: {
+          type: 'array',
+          items: { type: 'string', enum: ['brand', 'product', 'campaign', 'ad'] },
+          maxItems: 4,
+          description: 'Optional subset of resource types to search. Defaults to all four.'
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/agentSearchAcrossBrands',
+      method:  'run'
+    }
+  },
+
   // ── Phase 8a: Integrations OAuth — T0 list ────────────────────────
 
   {
