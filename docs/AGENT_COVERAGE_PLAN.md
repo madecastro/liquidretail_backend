@@ -1,6 +1,6 @@
 # Agent capability coverage plan
 
-**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 shipped (2026-08-06). Registry at 56 caps.
+**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 + 7 shipped (2026-08-06). Registry at 61 caps.
 
 - Phase 4 shipped 11 of 12 planned caps — `catalog.pollApifyRun` deferred
   (no async Apify pattern in this repo today; all sync via
@@ -88,7 +88,7 @@ lands. Tracked in the Phase 8b backlog row.
 | 4 | Catalog & media | 11 (of 12) | T1 × 6, T2 × 2, T4 × 3 | ✅ shipped | — |
 | 5 | Onboarding | 2 (of 4) | T1 × 1, T4 × 1 | ✅ shipped | — |
 | 6 | Detection & layouts | 5 (of 5, subs) | T0 × 1, T1 × 1, T2 × 3 | ✅ shipped | — |
-| 7 | Team | 5 | T1 × 3, T3 × 2 | Medium | — |
+| 7 | Team | 5 (of 5) | T1 × 3, T3 × 2 | ✅ shipped | — |
 | 8a | Integrations OAuth | ~10 | T1 × 10 | Medium | — |
 | 8b | External writes | ~5 | T3 × 5 | Medium | 8a + `shopifyProductMediaService` build |
 | 9 | `getContext` + cross-brand | 2 | T0 × 2 | Medium | — |

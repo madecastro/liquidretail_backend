@@ -62,6 +62,11 @@ const FILES = [
   'services/capabilityExecutors/aiCanvasTestSpec.js',
   'services/capabilityExecutors/aiLayoutsGenerate.js',
   'services/capabilityExecutors/aiLayoutsGetSession.js',
+  'services/capabilityExecutors/teamInviteCreate.js',
+  'services/capabilityExecutors/teamInviteDelete.js',
+  'services/capabilityExecutors/teamInviteAccept.js',
+  'services/capabilityExecutors/teamMemberPatch.js',
+  'services/capabilityExecutors/teamMemberDelete.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -895,6 +900,104 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 21. Phase 7 — team management ─────────────────────────────────
+console.log('\n[21] Phase 7 team capabilities');
+
+for (const [id, tier] of [
+  ['team.invite.create', 3],
+  ['team.invite.delete', 1],
+  ['team.member.patch',  1],
+  ['team.member.delete', 3],
+  ['team.invite.accept', 1]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+// Tier 3 caps must declare explicitConfirmation.
+{
+  const inviteCreate = registry.capabilityById('team.invite.create');
+  const memberDelete = registry.capabilityById('team.member.delete');
+  assert(inviteCreate?.explicitConfirmation === 'INVITE MEMBER',
+    `team.invite.create: explicitConfirmation === 'INVITE MEMBER'`);
+  assert(memberDelete?.explicitConfirmation === 'REMOVE MEMBER',
+    `team.member.delete: explicitConfirmation === 'REMOVE MEMBER'`);
+}
+
+async function checkPhase7Executors() {
+  const noScope = {};
+  const inviteCreate = require('../services/capabilityExecutors/teamInviteCreate');
+  const inviteDelete = require('../services/capabilityExecutors/teamInviteDelete');
+  const inviteAccept = require('../services/capabilityExecutors/teamInviteAccept');
+  const memberPatch  = require('../services/capabilityExecutors/teamMemberPatch');
+  const memberDelete = require('../services/capabilityExecutors/teamMemberDelete');
+
+  // Every executor rejects a missing advertiser scope up-front.
+  for (const [name, exec] of [
+    ['teamInviteCreate', inviteCreate],
+    ['teamInviteDelete', inviteDelete],
+    ['teamInviteAccept', inviteAccept],
+    ['teamMemberPatch',  memberPatch],
+    ['teamMemberDelete', memberDelete]
+  ]) {
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+
+  // Field validation — reachable without DB.
+  const ic1 = await inviteCreate.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(ic1.ok === false && /valid email required/i.test(ic1.error),
+    `teamInviteCreate: missing email → rejects`);
+  const ic2 = await inviteCreate.run({ req: { advertiserId: 'x' }, args: { email: 'bogus' } });
+  assert(ic2.ok === false && /valid email/i.test(ic2.error),
+    `teamInviteCreate: email without @ rejected`);
+  const ic3 = await inviteCreate.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { email: 'a@b.co', role: 'owner' }
+  });
+  assert(ic3.ok === false && /role must be one of/i.test(ic3.error),
+    `teamInviteCreate: role='owner' rejected (owner cannot be invited)`);
+
+  const id1 = await inviteDelete.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(id1.ok === false && /invitationId required/i.test(id1.error),
+    `teamInviteDelete: missing invitationId → rejects`);
+  const id2 = await inviteDelete.run({ req: { advertiserId: 'x' }, args: { invitationId: 'nope' } });
+  assert(id2.ok === false && /valid ObjectId/i.test(id2.error),
+    `teamInviteDelete: invalid invitationId → rejects`);
+
+  const ia1 = await inviteAccept.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(ia1.ok === false && /user context/i.test(ia1.error),
+    `teamInviteAccept: no user context → rejects`);
+  const ia2 = await inviteAccept.run({
+    req: { advertiserId: 'x', user: { userId: 'u', email: 'a@b.co' } },
+    args: {}
+  });
+  assert(ia2.ok === false && /token required/i.test(ia2.error),
+    `teamInviteAccept: missing token → rejects`);
+
+  const mp1 = await memberPatch.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(mp1.ok === false && /userId required/i.test(mp1.error),
+    `teamMemberPatch: missing userId → rejects`);
+  const mp2 = await memberPatch.run({ req: { advertiserId: 'x' }, args: { userId: 'nope' } });
+  assert(mp2.ok === false && /valid ObjectId/i.test(mp2.error),
+    `teamMemberPatch: invalid userId → rejects`);
+  const mp3 = await memberPatch.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { userId: '000000000000000000000000', role: 'god' }
+  });
+  assert(mp3.ok === false && /role must be one of/i.test(mp3.error),
+    `teamMemberPatch: bogus role rejected`);
+
+  const md1 = await memberDelete.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(md1.ok === false && /userId required/i.test(md1.error),
+    `teamMemberDelete: missing userId → rejects`);
+  const md2 = await memberDelete.run({ req: { advertiserId: 'x' }, args: { userId: 'nope' } });
+  assert(md2.ok === false && /valid ObjectId/i.test(md2.error),
+    `teamMemberDelete: invalid userId → rejects`);
+}
+
 // ── 20. Phase 6 — detection + layouts ─────────────────────────────
 console.log('\n[20] Phase 6 detection + layouts');
 
@@ -1157,6 +1260,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase4Tier4Executors();
   await checkPhase5Executors();
   await checkPhase6Executors();
+  await checkPhase7Executors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

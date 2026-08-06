@@ -959,6 +959,72 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 7: Team — T1 revoke invite / patch member / accept ─────
+
+  {
+    id:       'team.invite.delete',
+    title:    'Revoke pending invitation',
+    describe: 'Revoke a pending AdvertiserMembership invitation (status:\'pending\' → \'revoked\'). Idempotent: refuses non-pending rows with a "not found" error rather than a stateful re-revoke. Requires operator confirmation.',
+    tier:     1,
+    scope:    'advertiser',
+    args: {
+      type: 'object',
+      required: ['invitationId'],
+      properties: {
+        invitationId: { type: 'string', description: 'AdvertiserMembership ObjectId (must be status:\'pending\').' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/teamInviteDelete',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'team.member.patch',
+    title:    'Change member role',
+    describe: 'Change a member\'s role (owner | admin | editor | viewer). Refuses to demote the ONLY owner — every advertiser must retain at least one owner. Returns priorRole so the operator can revert. Requires operator confirmation.',
+    tier:     1,
+    scope:    'advertiser',
+    args: {
+      type: 'object',
+      required: ['userId', 'role'],
+      properties: {
+        userId: { type: 'string', description: 'User ObjectId whose active membership will be changed.' },
+        role:   { type: 'string', enum: ['owner', 'admin', 'editor', 'viewer'], description: 'New role.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/teamMemberPatch',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'team.invite.accept',
+    title:    'Accept an invitation by token',
+    describe: 'Accept a pending invitation. The caller\'s email (from auth) must match the invitation\'s email exactly. Flips status to active + binds userId + stamps acceptedAt. This can grant the caller a membership on an advertiser OTHER than their current req.advertiserId — invites are advertiser-agnostic by design. Requires operator confirmation.',
+    tier:     1,
+    scope:    'advertiser',
+    args: {
+      type: 'object',
+      required: ['token'],
+      properties: {
+        token: { type: 'string', description: 'AdvertiserMembership.inviteToken from the invite URL / share link.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/teamInviteAccept',
+      method:  'run'
+    }
+  },
+
   // ── Phase 5: Onboarding — dispatch syncs ──────────────────────────
 
   {
@@ -1234,6 +1300,55 @@ const CAPABILITIES = [
     execute: {
       kind:    'service',
       service: './capabilityExecutors/brandIngestFonts',
+      method:  'run'
+    }
+  },
+
+  // ── Phase 7: Team — T3 invite / remove ───────────────────────────
+
+  {
+    id:       'team.invite.create',
+    title:    'Invite a teammate',
+    describe: 'Create a pending AdvertiserMembership invitation. Idempotent on (advertiserId, email, status:\'pending\') — a fresh call with the same email returns the existing invitation verbatim instead of creating a duplicate. Refuses when the email already has an ACTIVE membership. Returns the inviteToken the operator shares with the invitee. Requires operator confirmation AND the explicit phrase "INVITE MEMBER" typed in the confirmation UI.',
+    tier:     3,
+    scope:    'advertiser',
+    explicitConfirmation: 'INVITE MEMBER',
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['email'],
+      properties: {
+        email: { type: 'string', maxLength: 200, description: 'Invitee email address.' },
+        role:  { type: 'string', enum: ['admin', 'editor', 'viewer'], description: 'Role granted on accept. Defaults to editor. Owner cannot be invited (only the workspace creator).' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/teamInviteCreate',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'team.member.delete',
+    title:    'Remove a team member',
+    describe: 'Soft-revoke an active membership (status:\'revoked\' + revokedAt/By). Refuses to remove the only owner. The user loses access to this advertiser immediately; re-inviting is a full round-trip. Requires operator confirmation AND the explicit phrase "REMOVE MEMBER" typed in the confirmation UI.',
+    tier:     3,
+    scope:    'advertiser',
+    explicitConfirmation: 'REMOVE MEMBER',
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['userId'],
+      properties: {
+        userId: { type: 'string', description: 'User ObjectId of the member to remove.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/teamMemberDelete',
       method:  'run'
     }
   },
