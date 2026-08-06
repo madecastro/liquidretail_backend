@@ -3142,7 +3142,19 @@ async function requeueStrandedAds({ ads, run }) {
   const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const selectedIds = ads.map((a) => String(a._id));
 
-  const claim = await claimAdsForRun(ads, { selectedIds, runId });
+  // claimAdsForRun takes a MODEL ADAPTER, not an array — the indirection is what
+  // lets scripts/verifyRunsClaim.js drive the real claim with an in-memory fake.
+  // Passing the ad array made it throw `ads.updateMany is not a function` on the
+  // first live sweep. It failed SAFELY (the throw is before any submit, so
+  // nothing was billed), but it stranded the ads for another cycle. Use the
+  // identical adapter POST /runs passes, so there is one claim path, not two.
+  const claim = await claimAdsForRun(
+    {
+      updateMany: (filter, update) => Ad.updateMany(filter, update),
+      find:       (filter) => Ad.find(filter).select('_id').lean()
+    },
+    { selectedIds, runId }
+  );
   if (!claim?.renderIds?.length) return 0;
 
   const renderToken = jwt.sign(
