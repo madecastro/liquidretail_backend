@@ -1022,6 +1022,57 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'catalog.inferCategories',
+    title:    'Infer product categories from JSON-LD / page',
+    describe: 'Run productCategoryInferenceService for one CatalogProduct — walks the product\'s public page (JSON-LD BreadcrumbList first; falls back to Gemini page-walk), resolves a Category leaf via findOrCreateCategoryTree, and stamps CatalogProduct.categoryRef + inferredBreadcrumb. Respects a 14-day TTL unless force=true. Requires product.productUrl. Billable (~$0.02 when the LLM fallback fires; free on JSON-LD hits). Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'product',
+    // Bounded per-call — even the JSON-LD-miss LLM fallback caps around
+    // $0.02 (short prompt, structured output). Overestimates rather
+    // than underestimates for the spendGuard bookkeeping.
+    estimateUsd: 0.02,
+    args: {
+      type: 'object',
+      required: ['productId'],
+      properties: {
+        productId: { type: 'string', description: 'CatalogProduct ObjectId. Must have productUrl set.' },
+        force:     { type: 'boolean', description: 'When true, bypass the 14-day inference TTL and re-scrape.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogInferCategories',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'media.refreshInsights',
+    title:    'Refresh IG insights + comments for one media',
+    describe: 'Re-pull platformStats (impressions, reach, engagement, saved, views/plays, likes, comments, shares) and top-level comments for one Instagram Media from the Meta Graph API. Same operation the /api/media/:id/refresh-insights route triggers. Refuses non-Instagram Media (other sources have no analytics endpoint). No per-call dollar cost, but Tier 2 gating so a runaway agent can\'t burn the app\'s daily IG token budget. Requires operator confirmation.',
+    tier:     2,
+    scope:    'brand',
+    // Zero direct USD — Meta Graph API is free at reasonable volumes.
+    // spendGuard still applies as a rate-limiter (agent can't call
+    // this indefinitely against the advertiser's cap even at $0).
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId. Must be source=\'instagram\' with an externalId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaRefreshInsights',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'brand.ingestFonts',
     title:    'Ingest brand fonts from website',
     describe: 'Scan the brand\'s website for its custom typefaces via brandFontIngestService (Brandfetch + scrape). Persists resolved font files into Brand.customFonts and updates Brand.fontFamily. Billable (~$0.05 aggregate). Requires brand.websiteUrl. Runs synchronously. Requires operator confirmation AND advertiser daily spend cap headroom.',

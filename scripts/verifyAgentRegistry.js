@@ -50,6 +50,8 @@ const FILES = [
   'services/capabilityExecutors/mediaDraftProduct.js',
   'services/capabilityExecutors/mediaDelete.js',
   'services/capabilityExecutors/mediaUpload.js',
+  'services/capabilityExecutors/catalogInferCategories.js',
+  'services/capabilityExecutors/mediaRefreshInsights.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -883,6 +885,49 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 17. Phase 4 — T2 inferCategories + refreshInsights ────────────
+console.log('\n[17] Phase 4 T2 executors');
+
+for (const id of ['catalog.inferCategories', 'media.refreshInsights']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 2, `${id}: tier === 2`);
+}
+{
+  const inferCap = registry.capabilityById('catalog.inferCategories');
+  assert(typeof inferCap?.estimateUsd === 'number' && inferCap.estimateUsd > 0,
+    `catalog.inferCategories: estimateUsd > 0 (billable LLM fallback)`);
+  const insightsCap = registry.capabilityById('media.refreshInsights');
+  assert(insightsCap?.estimateUsd === 0,
+    `media.refreshInsights: estimateUsd === 0 (Meta Graph is free)`);
+}
+
+async function checkPhase4Tier2Executors() {
+  const noScope = {};
+  const infer   = require('../services/capabilityExecutors/catalogInferCategories');
+  const refresh = require('../services/capabilityExecutors/mediaRefreshInsights');
+
+  const i1 = await infer.run({ req: noScope, args: {} });
+  assert(i1.ok === false && /advertiser scope/i.test(i1.error),
+    `catalogInferCategories: no-scope → rejects`);
+  const i2 = await infer.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(i2.ok === false && /productId required/i.test(i2.error),
+    `catalogInferCategories: missing productId → rejects`);
+  const i3 = await infer.run({ req: { advertiserId: 'x' }, args: { productId: 'nope' } });
+  assert(i3.ok === false && /valid ObjectId/i.test(i3.error),
+    `catalogInferCategories: invalid productId → rejects`);
+
+  const r1 = await refresh.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `mediaRefreshInsights: no-scope → rejects`);
+  const r2 = await refresh.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /mediaId required/i.test(r2.error),
+    `mediaRefreshInsights: missing mediaId → rejects`);
+  const r3 = await refresh.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `mediaRefreshInsights: invalid mediaId → rejects`);
+}
+
 // Media schema regression — the soft-delete field must be declared.
 // Mongoose silently drops $set to undeclared paths (§4 trap), so if
 // this field ever disappears the delete capability turns into a no-op.
@@ -922,6 +967,7 @@ async function checkPhase4MediaExecutors() {
   await checkAdListExecutor();
   await checkPhase4PatchExecutors();
   await checkPhase4MediaExecutors();
+  await checkPhase4Tier2Executors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
