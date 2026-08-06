@@ -1131,12 +1131,19 @@ async function checkDbQueryInvariants() {
   }
 
   // Load-bearing regression: tenant filter must be INJECTED even if
-  // the LLM sends its own advertiserId in the filter.
+  // the LLM sends its own advertiserId in the filter. Every
+  // collection is either tenantField='advertiserId' OR
+  // tenantMode='via-brand'. Neither shape allows filtering by
+  // advertiserId directly.
   for (const [name, spec] of Object.entries(dbQ.COLLECTIONS)) {
     assert(!spec.filterable.has('advertiserId'),
       `dbQuery: ${name}.filterable does NOT include advertiserId — server-injected only, LLM cannot spoof`);
-    assert(spec.tenantField === 'advertiserId',
-      `dbQuery: ${name}.tenantField === 'advertiserId'`);
+    const hasField = spec.tenantField === 'advertiserId';
+    const hasMode  = spec.tenantMode === 'via-brand';
+    assert(hasField || hasMode,
+      `dbQuery: ${name} must declare either tenantField='advertiserId' OR tenantMode='via-brand'`);
+    assert(!(hasField && hasMode),
+      `dbQuery: ${name} must NOT declare both tenantField and tenantMode`);
   }
   // Source-scan: the executor MUST assign tenantField into the safe
   // filter before the .find(). If someone removes that line, the
@@ -1146,6 +1153,39 @@ async function checkDbQueryInvariants() {
     const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'capabilityExecutors', 'dbQuery.js'), 'utf8');
     assert(/safeFilter\[spec\.tenantField\]\s*=\s*new mongoose\.Types\.ObjectId\(req\.advertiserId\)/.test(src),
       `dbQuery.js: safeFilter[spec.tenantField] = ObjectId(req.advertiserId) present — CROSS-TENANT LEAK IF THIS FAILS`);
+    // via-brand collections require the brand-set clamp that
+    // OVERWRITES whatever brandId the LLM sent. Assert the executor
+    // has that assignment line — a regression here allows foreign-
+    // brandId leakage on Ad and any future via-brand collection.
+    assert(/safeFilter\.brandId\s*=\s*\{\s*\$in:\s*injected\s*\}/.test(src),
+      `dbQuery.js: safeFilter.brandId = { $in: injected } present for via-brand path — CROSS-TENANT LEAK IF THIS FAILS`);
+    // Every via-brand collection MUST NOT declare tenantField —
+    // that would be a semantic contradiction and could confuse a
+    // future refactor into filtering by advertiserId on a doc
+    // without the field.
+    for (const [name, spec] of Object.entries(dbQ.COLLECTIONS)) {
+      if (spec.tenantMode === 'via-brand') {
+        assert(!spec.tenantField,
+          `dbQuery: ${name}.tenantField must be unset when tenantMode='via-brand'`);
+        assert(spec.filterable.has('brandId'),
+          `dbQuery: ${name}.filterable must include brandId (server enforces the $in clamp on it)`);
+      }
+    }
+  }
+
+  // Foreign-brandId rejection — the load-bearing invariant on the
+  // via-brand path. If the LLM passes a brandId not under the
+  // caller's advertiser, the executor MUST reject BEFORE hitting Ad.
+  // Offline this requires a real Brand lookup — the empty advertiser
+  // (000...0) has zero brands, so the executor returns an empty
+  // result set rather than a rejection. Instead assert the code
+  // path exists via source-scan.
+  {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'capabilityExecutors', 'dbQuery.js'), 'utf8');
+    assert(/not under this advertiser/.test(src),
+      `dbQuery.js: rejects foreign brandId in the via-brand branch`);
+    assert(/ownBrandIds/.test(src),
+      `dbQuery.js: via-brand branch pre-resolves ownBrandIds`);
   }
 
   // Regression: projection must NOT include known-sensitive fields.

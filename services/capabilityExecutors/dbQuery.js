@@ -28,6 +28,8 @@ const CatalogProduct       = require('../../models/CatalogProduct');
 const ProductMatchArtifact = require('../../models/ProductMatchArtifact');
 const DetectionArtifact    = require('../../models/DetectionArtifact');
 const DetectRun            = require('../../models/DetectRun');
+const Ad                   = require('../../models/Ad');
+const Brand                = require('../../models/Brand');
 
 const HARD_LIMIT       = 20;
 const DEFAULT_LIMIT    = 10;
@@ -91,6 +93,15 @@ const COLLECTIONS = {
       'isPrimaryVariant', 'itemGroupId', 'primaryProductId',
       'gtin', 'mpn', 'category', 'categoryRef', 'currency',
       'availability',
+      'price',
+      // Popularity signals — Immersive gives rating (0-5) + review count;
+      // gemini-search fallback gives productReviews.rating +
+      // productReviews.reviewCount. Filterable + sortable so the LLM
+      // can answer "most popular products" / "highly-rated products".
+      'rating',
+      'productReviews.rating',
+      'productReviews.reviewCount',
+      'productReviews.source',
       'inferredCategoryAt',
       'firstSeenAt', 'lastSyncedAt', 'detailsRefreshedAt'
     ]),
@@ -115,7 +126,11 @@ const COLLECTIONS = {
       detailsRefreshedAt: 1,
       firstSeenAt: 1, lastSyncedAt: 1
     },
-    sortable: new Set(['createdAt', 'lastSyncedAt', 'firstSeenAt', '_id', 'price', 'title'])
+    sortable: new Set([
+      'createdAt', 'lastSyncedAt', 'firstSeenAt', '_id',
+      'price', 'title',
+      'rating', 'productReviews.rating', 'productReviews.reviewCount'
+    ])
   },
 
   ProductMatchArtifact: {
@@ -176,6 +191,45 @@ const COLLECTIONS = {
       error: 1, errorStage: 1,
       flags: 1,
       startedAt: 1, endedAt: 1, createdAt: 1, updatedAt: 1
+    },
+    sortable: new Set(['createdAt', 'updatedAt', '_id'])
+  },
+
+  // Ad has no advertiserId denorm — tenant scope resolves via Brand.
+  // The executor's via-brand branch pre-computes the caller's brand
+  // set and clamps filter.brandId to that set. Load-bearing: any LLM
+  // filter that names a foreign brandId is rejected, and if the LLM
+  // omits brandId the server injects $in: [own brand set]. Verifier
+  // pins both the schema check (no advertiserId here) and the
+  // executor's brand-set clamp.
+  Ad: {
+    model: Ad,
+    tenantMode: 'via-brand',   // NOT tenantField='advertiserId' — see the executor branch
+    filterable: new Set([
+      '_id', 'brandId', 'productId', 'mediaId', 'campaignId',
+      'kind', 'aspectRatio', 'template', 'variantKind', 'renderRoute',
+      'status', 'approved', 'metaSyncStatus', 'regenerating',
+      'createdAt', 'updatedAt'
+    ]),
+    projection: {
+      _id: 1, brandId: 1,
+      productId: 1, mediaId: 1, campaignId: 1, campaignRunIds: 1,
+      mediaIds: 1,
+      template: 1, aspectRatio: 1, kind: 1, variantKind: 1,
+      renderRoute: 1,
+      status: 1,
+      approved: 1, approvedAt: 1, approvedBy: 1,
+      regenerating: 1,
+      renderUrl: 1, thumbnailUrl: 1,
+      copy: 1,
+      ctaText: 1, ctaUrl: 1, ctaUrlParams: 1,
+      metaSyncStatus: 1, metaSyncError: 1, metaSyncedAt: 1,
+      renderError: 1,
+      createdAt: 1, updatedAt: 1
+      // Deliberately NOT projected: promptSystem, promptUser (prompt
+      // IP), veoPredictionId + veoVideoUrl (billable receipts — not
+      // sensitive but useless to LLM). If future callers need any of
+      // these, add via a dedicated capability with a tighter contract.
     },
     sortable: new Set(['createdAt', 'updatedAt', '_id'])
   }
@@ -294,12 +348,71 @@ async function run({ req, args }) {
     safeFilter[key] = coerceObjectIds(key, sanitized.value);
   }
 
-  // TENANCY: force the advertiserId filter regardless of what the LLM
-  // sent. Even if the LLM tries to include advertiserId in its args,
-  // sanitized value gets clobbered by this line. Load-bearing —
-  // verifier pins the pattern via a source-scan (checkDbQueryInvariants
-  // in scripts/verifyAgentRegistry.js).
-  safeFilter[spec.tenantField] = new mongoose.Types.ObjectId(req.advertiserId);
+  // TENANCY. Two shapes:
+  //   1. tenantField='advertiserId' (Media, CatalogProduct, artifacts,
+  //      DetectRun). Server-injects the caller's advertiserId LAST so
+  //      anything the LLM sent gets clobbered. Load-bearing — verifier
+  //      source-scans this exact line.
+  //   2. tenantMode='via-brand' (Ad). Pre-resolves the caller's brand
+  //      set and clamps filter.brandId to $in: [own brands]. If the
+  //      LLM sent a specific brandId, verify it's in the set. If it
+  //      sent $in: [...], intersect. Server-computed brandId always
+  //      overwrites LLM's — verifier source-scans this too.
+  if (spec.tenantMode === 'via-brand') {
+    const ownBrandIds = await Brand.find({ advertiserId: req.advertiserId })
+      .select('_id').lean().then((rs) => rs.map((r) => r._id));
+    if (!ownBrandIds.length) {
+      return {
+        ok: true,
+        kind: 'dbQueryResult',
+        data: { collection, count: 0, truncated: false, rows: [], note: 'advertiser has no brands' }
+      };
+    }
+    const ownSet = new Set(ownBrandIds.map((id) => String(id)));
+
+    let injected;
+    const llmBrandFilter = safeFilter.brandId;
+    if (llmBrandFilter == null) {
+      // No LLM constraint — inject full set.
+      injected = ownBrandIds.map((id) => new mongoose.Types.ObjectId(id));
+    } else if (llmBrandFilter instanceof mongoose.Types.ObjectId || typeof llmBrandFilter === 'string') {
+      // Scalar — must be one of caller's brands.
+      const asStr = String(llmBrandFilter);
+      if (!ownSet.has(asStr)) {
+        return { ok: false, error: `brandId "${asStr}" is not under this advertiser` };
+      }
+      injected = [new mongoose.Types.ObjectId(asStr)];
+    } else if (typeof llmBrandFilter === 'object' && !Array.isArray(llmBrandFilter)) {
+      // Operator object — clamp $in / $eq to own set; reject other ops
+      // for the brandId field specifically. The general operator
+      // allowlist ran already; we're just narrowing to what makes
+      // sense for a tenant boundary.
+      const opKeys = Object.keys(llmBrandFilter);
+      if (opKeys.length !== 1 || (opKeys[0] !== '$in' && opKeys[0] !== '$eq')) {
+        return { ok: false, error: 'brandId filter must be a scalar, $eq, or $in for via-brand collections' };
+      }
+      if (opKeys[0] === '$eq') {
+        const asStr = String(llmBrandFilter.$eq);
+        if (!ownSet.has(asStr)) {
+          return { ok: false, error: `brandId "${asStr}" is not under this advertiser` };
+        }
+        injected = [new mongoose.Types.ObjectId(asStr)];
+      } else {
+        // $in — intersect with own set.
+        const filtered = llmBrandFilter.$in.filter((id) => ownSet.has(String(id)));
+        if (!filtered.length) {
+          return { ok: false, error: 'no brandIds in $in are under this advertiser' };
+        }
+        injected = filtered.map((id) => new mongoose.Types.ObjectId(id));
+      }
+    } else {
+      return { ok: false, error: 'brandId filter must be a scalar, $eq, or $in for via-brand collections' };
+    }
+    safeFilter.brandId = { $in: injected };
+  } else {
+    // Standard advertiserId-denorm path.
+    safeFilter[spec.tenantField] = new mongoose.Types.ObjectId(req.advertiserId);
+  }
 
   const limit = Math.min(Math.max(parseInt(args?.limit, 10) || DEFAULT_LIMIT, 1), HARD_LIMIT);
 

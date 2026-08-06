@@ -1649,7 +1649,7 @@ const CAPABILITIES = [
   {
     id:       'db.query',
     title:    'Structured read-only DB query (whitelisted)',
-    describe: 'Read-only structured query against a whitelisted set of collections (Media, CatalogProduct, ProductMatchArtifact, DetectionArtifact, DetectRun). advertiserId is INJECTED server-side — cross-tenant reads are impossible. Filter keys must be in the per-collection allowlist; operators limited to $eq (implicit), $ne, $in, $nin, $exists, $gt, $gte, $lt, $lte (no $regex, $where, $expr, $lookup, $or, $and). Results capped at 20 rows with a per-collection field projection so hidden fields (raw blobs, encrypted tokens, PII) are never returned. Use this for ad-hoc questions like "products with rating > 4 that lack a lifestyle image" without needing a dedicated capability.',
+    describe: 'Read-only structured query against a whitelisted set of collections (Media, CatalogProduct, ProductMatchArtifact, DetectionArtifact, DetectRun, Ad). Tenant scope is INJECTED server-side (advertiserId directly, or via-brand clamp for Ad) — cross-tenant reads are impossible. Filter keys must be in the per-collection allowlist; operators limited to $eq (implicit), $ne, $in, $nin, $exists, $gt, $gte, $lt, $lte (no $regex, $where, $expr, $lookup, $or, $and). Results capped at 20 rows with a per-collection field projection so hidden fields (raw blobs, encrypted tokens, PII, prompt IP) are never returned. Use this for ad-hoc questions like "most popular products by rating" or "products without a 9:16 reels ad" (two calls: list products + list ads filtered by aspectRatio/kind, then cross-reference by productId).',
     tier:     0,
     scope:    'advertiser',
     args: {
@@ -1658,7 +1658,7 @@ const CAPABILITIES = [
       properties: {
         collection: {
           type: 'string',
-          enum: ['Media', 'CatalogProduct', 'ProductMatchArtifact', 'DetectionArtifact', 'DetectRun'],
+          enum: ['Media', 'CatalogProduct', 'ProductMatchArtifact', 'DetectionArtifact', 'DetectRun', 'Ad'],
           description: 'Collection to read from.'
         },
         filter: {
