@@ -240,7 +240,15 @@ const mediaSchema = new mongoose.Schema({
   },
 
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+  updatedAt: { type: Date, default: Date.now },
+
+  // Soft-delete stamp — set when the operator asks the home-page
+  // agent to delete a Media row. Filtered at the Media Library LIST
+  // surface only (routes/media.js GET /api/media). Direct-id lookups
+  // still resolve, so ads and finalized campaigns that reference a
+  // deleted Media keep rendering; only new discovery from the picker
+  // hides it. A full-cascade migration is future work.
+  deletedAt: { type: Date, default: null, index: true }
 });
 
 // Tenant-scoped uniqueness. Previously this was a GLOBAL unique on

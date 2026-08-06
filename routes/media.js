@@ -40,6 +40,12 @@ router.get('/', async (req, res) => {
     // in the Uploaded Media list confuses operators (they show up as
     // "248 items" alongside 25 real IG posts).
     filterExtras.source = { $ne: 'catalog-product' };
+    // Hide soft-deleted rows from the Library list. Stamped by
+    // media.patchRights's sibling capability media.delete via the
+    // home-page agent. Downstream lookups by id still resolve so
+    // existing ads / campaigns that reference a deleted Media
+    // continue to render.
+    filterExtras.deletedAt = null;
     // ?ids=a,b,c — explicit-id batch lookup. Lets the Generate Ads
     // wizard hydrate pre-selected media that aren't in the first page.
     // Bypasses pagination (returns up to 100 in one call) but still

@@ -848,6 +848,71 @@ const CAPABILITIES = [
     }
   },
 
+  {
+    id:       'media.draftProduct',
+    title:    'Save media match as draft catalog product',
+    describe: 'Forces a draft CatalogProduct write from the media\'s latest ProductMatchArtifact — the manual escape hatch when the automatic path is off or the match was below the confidence floor. Requires an existing ProductMatchArtifact (run detect first). Bypasses the brand\'s autoCreateFromDetect flag and the certainty threshold. Draft rows surface in the catalog browser\'s drafts queue for the operator to fill in price + productUrl before they become matchable. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId — must have at least one ProductMatchArtifact.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaDraftProduct',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'media.delete',
+    title:    'Soft-delete media',
+    describe: 'Soft-delete a Media row — stamps Media.deletedAt so the row disappears from the Media Library list and the campaign wizard picker. Direct-id lookups still resolve, so any Ad or Campaign that already references this Media keeps rendering with the original asset (no orphaned renders). The Cloudinary asset is intentionally NOT destroyed — hard-delete + cascade lives on the REST DELETE /api/media/:id route and stays out of chat. Idempotent (alreadyDeleted:true if run twice). Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId to soft-delete.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaDelete',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'media.upload',
+    title:    'Get signed Cloudinary upload credential',
+    describe: 'Issue a short-lived signed Cloudinary direct-upload payload the frontend uses to POST a file straight to Cloudinary. The chat drawer renders an upload card from the returned endpoint + formFields; on success the frontend posts the resulting secure_url back through the media finalization endpoint to create the Media row. This capability itself creates NO Media doc — it only issues the credential. Signature expires in 10 min by default; folder is scoped to advertiser + brand so a leaked credential cannot upload into another tenant. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:      { type: 'string', description: 'Brand ObjectId — folder scope for the upload.' },
+        resourceType: { type: 'string', enum: ['image', 'video'], description: 'Cloudinary resource type. Defaults to image.' },
+        ttlSec:       { type: 'integer', minimum: 60, maximum: 3600, description: 'Signature TTL in seconds (60-3600). Default 600.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaUpload',
+      method:  'run'
+    }
+  },
+
   // ── Tier 2: billable writes — confirmation + spend-guard both apply ─
 
   {

@@ -47,6 +47,9 @@ const FILES = [
   'services/capabilityExecutors/catalogPatchProduct.js',
   'services/capabilityExecutors/catalogPatchCategories.js',
   'services/capabilityExecutors/mediaPatchRights.js',
+  'services/capabilityExecutors/mediaDraftProduct.js',
+  'services/capabilityExecutors/mediaDelete.js',
+  'services/capabilityExecutors/mediaUpload.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -828,6 +831,80 @@ async function checkPhase4PatchExecutors() {
     `mediaPatchRights: 2001-char notes rejected`);
 }
 
+// ── 16. Phase 4 — media draftProduct / delete / upload ────────────
+console.log('\n[16] Phase 4 media draftProduct / delete / upload');
+
+for (const id of ['media.draftProduct', 'media.delete', 'media.upload']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 1, `${id}: tier === 1`);
+}
+
+async function checkPhase4MediaExecutors() {
+  const noScope = {};
+  const draftProduct = require('../services/capabilityExecutors/mediaDraftProduct');
+  const del          = require('../services/capabilityExecutors/mediaDelete');
+  const upload       = require('../services/capabilityExecutors/mediaUpload');
+
+  const d1 = await draftProduct.run({ req: noScope, args: {} });
+  assert(d1.ok === false && /advertiser scope/i.test(d1.error),
+    `mediaDraftProduct: no-scope → rejects`);
+  const d2 = await draftProduct.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(d2.ok === false && /mediaId required/i.test(d2.error),
+    `mediaDraftProduct: missing mediaId → rejects`);
+  const d3 = await draftProduct.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(d3.ok === false && /valid ObjectId/i.test(d3.error),
+    `mediaDraftProduct: invalid mediaId → rejects`);
+
+  const dl1 = await del.run({ req: noScope, args: {} });
+  assert(dl1.ok === false && /advertiser scope/i.test(dl1.error),
+    `mediaDelete: no-scope → rejects`);
+  const dl2 = await del.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(dl2.ok === false && /mediaId required/i.test(dl2.error),
+    `mediaDelete: missing mediaId → rejects`);
+  const dl3 = await del.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(dl3.ok === false && /valid ObjectId/i.test(dl3.error),
+    `mediaDelete: invalid mediaId → rejects`);
+
+  const u1 = await upload.run({ req: noScope, args: {} });
+  assert(u1.ok === false && /advertiser scope/i.test(u1.error),
+    `mediaUpload: no-scope → rejects`);
+  const u2 = await upload.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(u2.ok === false && /brandId required/i.test(u2.error),
+    `mediaUpload: missing brandId → rejects`);
+  const u3 = await upload.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(u3.ok === false && /valid ObjectId/i.test(u3.error),
+    `mediaUpload: invalid brandId → rejects`);
+  const u4 = await upload.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', resourceType: 'audio' }
+  });
+  assert(u4.ok === false && /resourceType must be one of/i.test(u4.error),
+    `mediaUpload: rejects resourceType outside {image, video}`);
+}
+
+// Media schema regression — the soft-delete field must be declared.
+// Mongoose silently drops $set to undeclared paths (§4 trap), so if
+// this field ever disappears the delete capability turns into a no-op.
+{
+  const MediaModel = require('../models/Media');
+  const declared = Object.keys(MediaModel.schema.paths || {});
+  assert(declared.includes('deletedAt'),
+    `Media schema declares deletedAt (soft-delete field for media.delete)`);
+}
+
+// Media list endpoint must filter soft-deleted rows. A regression here
+// would leak deleted media back into the picker even though the
+// capability succeeded.
+{
+  const mediaRouteSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'media.js'), 'utf8');
+  // Accept either `deletedAt: null` (object literal) or
+  // `.deletedAt = null` (assignment) — both are load-bearing writes
+  // into the list-filter object, and the regression matters equally.
+  assert(/deletedAt\s*[:=]\s*null/.test(mediaRouteSrc),
+    `routes/media.js filters deletedAt=null in the list query`);
+}
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
@@ -844,6 +921,7 @@ async function checkPhase4PatchExecutors() {
   await checkPlatformListExecutor();
   await checkAdListExecutor();
   await checkPhase4PatchExecutors();
+  await checkPhase4MediaExecutors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
