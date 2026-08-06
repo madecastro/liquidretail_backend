@@ -187,4 +187,76 @@ function surfaceForAd(ad) {
   return { surface, dims: { width: w, height: h } };
 }
 
-module.exports = { recoverImageAd, surfaceForAd };
+/**
+ * SETTLE an ad whose charge state is UNKNOWN, from the provider's own record.
+ *
+ * WHY THIS BEATS MERELY RECORDING "unknown" (2026-08-05). atlasErrorPolicy's
+ * FALLBACK carries `charged: null` for any failure shape it cannot classify — a
+ * bare Cloudflare 502 mid-poll is exactly that — and renderService used to
+ * collapse it to `false`, i.e. to "free". But the answer is KNOWABLE: Atlas
+ * publishes `price` on the settled prediction and keeps it 30 days, and reading
+ * it is a free GET. So 'unknown' is a to-do, not a resting state.
+ *
+ * Money direction that matters: this can only ever move a row from "we do not
+ * know" to a CONFIRMED figure. It never invents a charge, and it never marks
+ * something not-charged on a guess — if the price has not been published yet,
+ * the row stays 'unknown' and the next pass retries.
+ *
+ * NEVER SUBMITS: the only provider call is peekImagePrediction.
+ *
+ * @returns {Promise<{state:'charged'|'not-charged'|'unknown'|'no-receipt', price?:number}>}
+ */
+async function settleChargeState({ ad } = {}) {
+  const predictionId = ad?.renderError?.predictionId
+    || ad?.imageGeneration?.predictionId
+    || null;
+  if (!predictionId) return { state: 'no-receipt' };
+
+  const peek = await peekImagePrediction(predictionId);
+
+  // A price we can read is the authoritative answer either way.
+  if (peek.priceConfirmed) {
+    const price = Number(peek.price) || 0;
+    const state = price > 0 ? 'charged' : 'not-charged';
+    await Ad.updateOne({ _id: ad._id }, { $set: {
+      'renderError.chargeState': state,
+      // `charged` still means "we KNOW it was billed", so it only ever goes true.
+      ...(state === 'charged' ? { 'renderError.charged': true } : {}),
+      updatedAt: new Date()
+    } });
+    if (price > 0) {
+      // Ledger the real figure. A COMPLETE record: finalizeFlatCost falls back to
+      // an insert when no charge-point row exists (true for anything predating
+      // #91), and CostLog silently drops a row without `stage`.
+      finalizeFlatCost({
+        providerRequestId: predictionId,
+        stage:      'direct_image_settled',
+        provider:   'atlas',
+        model:      ad.imageGeneration?.model || 'unknown',
+        brandId:    ad.brandId || null,
+        campaignId: ad.campaignId || null,
+        adId:       String(ad._id),
+        costUsd:    price,
+        costSource: 'actual',
+        status:     'charged-no-output'
+      }).catch(() => {});
+    }
+    return { state, price };
+  }
+
+  // Atlas reported a definitive FAILURE and published no price. Failed tasks are
+  // refunded per the documented policy, so this is a real 'not-charged' — the one
+  // case where absence of a price is itself the answer.
+  if (peek.state === 'failed') {
+    await Ad.updateOne({ _id: ad._id }, { $set: {
+      'renderError.chargeState': 'not-charged', updatedAt: new Date()
+    } });
+    return { state: 'not-charged', price: 0 };
+  }
+
+  // Still processing, or we could not reach Atlas. Leave it 'unknown' — guessing
+  // here is how spend goes unrecorded.
+  return { state: 'unknown', message: peek.message || peek.state };
+}
+
+module.exports = { recoverImageAd, surfaceForAd, settleChargeState };

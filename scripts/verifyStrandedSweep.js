@@ -155,8 +155,13 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
     };
 
     let requeuedIds = null;
+    // `settle` MUST be injected too. It defaults to the real settleChargeState,
+    // which would issue live Atlas GETs against the fake prediction ids in this
+    // fixture — the same silently-hits-the-network trap that made the first
+    // version of this test exercise the real recoverImageAd.
+    const settle = async () => ({ state: 'unknown' });
     const out = await sweeper.sweepStrandedRuns({
-      recover,
+      recover, settle,
       requeue: async ({ ads }) => { requeuedIds = ads.map(a => a._id); return ads.length; }
     });
 
@@ -169,13 +174,44 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
 
     // Recovery-only mode must never requeue.
     requeuedIds = null;
-    const out2 = await sweeper.sweepStrandedRuns({ recover });
+    const out2 = await sweeper.sweepStrandedRuns({ recover, settle });
     check('E4 with no requeue handler: recovery still happens, nothing is requeued',
       out2.recovered === 1 && out2.requeued === 0 && requeuedIds === null);
   } finally {
     CampaignRun.find = origRunFind;
     Ad.find = origAdFind;
   }
+
+    // ── F. [MONEY] CHARGE STATE IS RESOLVED, NOT GUESSED ─────────────────
+    let settleCalls = 0;
+    const settledAds = [
+      { _id: 'unk1', renderError: { chargeState: 'unknown', predictionId: 'q1' } }
+    ];
+    Ad.find = () => ({ limit: () => ({ lean: async () => settledAds }) });
+    CampaignRun.find = () => ({ select: () => ({ lean: async () => [] }) });
+    const n = await sweeper.settleUnknownCharges({
+      settle: async () => { settleCalls++; return { state: 'charged', price: 0.07173 }; }
+    });
+    check('F1 unknown-charge ads are settled from the provider record', n === 1 && settleCalls === 1,
+      `settled=${n} calls=${settleCalls}`);
+
+    const n2 = await sweeper.settleUnknownCharges({
+      settle: async () => ({ state: 'unknown' })
+    });
+    check('F2 [MONEY] a charge that CANNOT be confirmed stays unknown — never '
+        + 'guessed to not-charged, which would understate the ledger permanently',
+      n2 === 0, `settled=${n2}`);
+
+    // Even with no stranded WORK, the money question must still be asked.
+    CampaignRun.find = () => ({ select: () => ({ lean: async () => [] }) });
+    let asked = 0;
+    const out3 = await sweeper.sweepStrandedRuns({
+      recover: async () => ({ state: 'no-receipt' }),
+      settle:  async () => { asked++; return { state: 'charged', price: 0.07 }; }
+    });
+    check('F3 the charge pass runs even when there is no stranded work — "no ads to '
+        + 'finish" does not mean "no money unaccounted"',
+      asked > 0 && out3.chargesSettled > 0, `asked=${asked} settled=${out3.chargesSettled}`);
 
   // ── Revert-proof (manual, per CLAUDE.md §5) ────────────────────────────
   // 1. Push every ad to stillNeedRender regardless of receipt -> B2/E2 fail (the

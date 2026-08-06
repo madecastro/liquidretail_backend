@@ -1437,7 +1437,19 @@ function failed(jobId, stage, err) {
       // unreachable and the retry pays a second time for the same picture.
       predictionId: err.predictionId || null,
       atlasCode:    err.atlasCode ?? null,
+      // `charged` stays strictly "we KNOW it was billed" for every existing
+      // reader. It is deliberately NOT widened.
       charged:      err.charged === true,
+      // ...but `err.charged` is TRI-STATE: atlasErrorPolicy's FALLBACK sets it
+      // to null (UNKNOWN) for any shape it cannot classify — a bare Cloudflare
+      // 502 mid-poll, say. Collapsing that to `false` recorded "this cost
+      // nothing" about a render Atlas may have billed, which is the direction
+      // the ledger can never be corrected in. Record the real answer instead;
+      // imageRecoveryService.settleChargeState resolves 'unknown' from the
+      // settled prediction later, for free.
+      chargeState:  err.charged === true ? 'charged'
+                  : err.charged === false ? 'not-charged'
+                  : 'unknown',
       // Post-render vision QC verdict (incl. discarded paid render URLs).
       visionQc:     err.visionQc || err.cause?.visionQc || null
     }

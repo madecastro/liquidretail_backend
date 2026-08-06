@@ -425,7 +425,27 @@ const adSchema = new mongoose.Schema({
     predictionId: { type: String, default: null },
     // Whether the provider had already billed when this failed. Drives the
     // double-spend warning and the reclaim sweep.
+    //
+    // ⚠️ TWO-STATE, AND THAT IS THE POINT: `true` means WE KNOW it was charged.
+    // It does NOT mean `false` is "free" — see chargeState below.
     charged:      { type: Boolean, default: false },
+    // The HONEST answer, added 2026-08-05, because `charged` alone could not
+    // tell "definitely not billed" from "we have no idea".
+    //
+    // atlasErrorPolicy's FALLBACK carries `charged: null` — UNKNOWN — for any
+    // failure shape it cannot classify, which is exactly what a bare Cloudflare
+    // 502 mid-poll looks like. renderService then wrote `err.charged === true`,
+    // collapsing that null to FALSE. So two ads that failed that way on
+    // 2026-08-05 are on record as costing nothing when Atlas may well have
+    // billed them — and understating the ledger is the one direction it can
+    // never be corrected in, because nothing knows to go looking.
+    //
+    // 'unknown' is not a resting state: services/imageRecoveryService
+    // settleChargeState() reads `price` back off the settled prediction (a free
+    // GET, and Atlas keeps predictions 30 days) and moves it to 'charged' or
+    // 'not-charged' with the real figure. Null on rows written before this
+    // existed — absence means "never assessed", not "not charged".
+    chargeState:  { type: String, enum: ['charged', 'not-charged', 'unknown', null], default: null },
     // Provider's own error code (Atlas envelope `code`), e.g. 402 insufficient
     // balance — kept so a billing rejection is distinguishable from a timeout.
     atlasCode:    { type: Number, default: null }
