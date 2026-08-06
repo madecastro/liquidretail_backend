@@ -35,18 +35,53 @@ async function preview({ req, args }) {
   if (!scope.ok) return scope;
   const { brand } = scope;
 
-  const [creds, existing] = await Promise.all([
+  const [creds, existing, sourceBreakdown] = await Promise.all([
     IntegrationCredential.find({
       brandId: brand._id,
       type: 'instagram',
       status: 'active',
       catalogId: { $exists: true, $ne: null }
     }).select('_id igUsername catalogId lastCatalogSyncAt').lean(),
-    CatalogProduct.countDocuments({ brandId: brand._id, source: 'ig-catalog' })
+    CatalogProduct.countDocuments({ brandId: brand._id, source: 'ig-catalog' }),
+    // Same steer-the-LLM pattern posts.syncFromInstagram uses — when
+    // the Meta Catalog OAuth path has no cred, the brand may still
+    // have products from apify-shopify / shopify-direct / sitemap-
+    // jsonld / manual-upload. Report the mix so the LLM can chain to
+    // the right capability.
+    CatalogProduct.aggregate([
+      { $match: { brandId: new mongoose.Types.ObjectId(brand._id) } },
+      { $group: { _id: '$source', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ])
   ]);
 
+  const sourceCounts = Object.fromEntries((sourceBreakdown || []).map((r) => [r._id, r.count]));
+
   if (!creds.length) {
-    return { ok: false, error: 'no active Instagram credential with a catalogId for this brand — connect Instagram first via integrations.instagram.connectUrl' };
+    const alt = [];
+    if (sourceCounts['apify-shopify']) {
+      alt.push(`${sourceCounts['apify-shopify']} rows from source=apify-shopify (invoke catalog.pullFromApify or sales.brand.sync for more)`);
+    }
+    if (sourceCounts['shopify-direct']) {
+      alt.push(`${sourceCounts['shopify-direct']} rows from source=shopify-direct (invoke catalog.syncFromShopifyPublic for more)`);
+    }
+    if (sourceCounts['sitemap-jsonld']) {
+      alt.push(`${sourceCounts['sitemap-jsonld']} rows from source=sitemap-jsonld (invoke catalog.syncFromGenericSitemap for more)`);
+    }
+    if (sourceCounts['manual-upload']) {
+      alt.push(`${sourceCounts['manual-upload']} rows from source=manual-upload (invoke catalog.createProduct for more)`);
+    }
+    if (sourceCounts['ig-catalog']) {
+      alt.push(`${sourceCounts['ig-catalog']} rows from source=ig-catalog (the OAuth credential this workflow needs was disconnected — invoke integrations.instagram.connectUrl to reconnect)`);
+    }
+    const suffix = alt.length
+      ? ` This brand DOES have products from other ingestion paths: ${alt.join('; ')}.`
+      : ' This brand has no existing products from any ingestion path.';
+    return {
+      ok: false,
+      error: `no active Instagram credential with a catalogId for this brand — catalog.syncFromInstagram uses the Meta Catalog OAuth path.${suffix} If the operator wants to re-pull via the SAME path that already has products, use the capability named above rather than this one. To connect a new OAuth credential, invoke integrations.instagram.connectUrl.`,
+      sourceCounts
+    };
   }
 
   return {

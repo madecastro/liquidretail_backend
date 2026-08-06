@@ -34,18 +34,57 @@ async function preview({ req, args }) {
   if (!scope.ok) return scope;
   const { brand } = scope;
 
-  const [creds, existing] = await Promise.all([
+  const [creds, existing, sourceBreakdown] = await Promise.all([
     IntegrationCredential.find({
       brandId: brand._id,
       type: 'instagram',
       status: 'active',
       igUserId: { $exists: true, $ne: null }
     }).select('_id igUsername igUserId lastPostsSyncAt').lean(),
-    Media.countDocuments({ brandId: brand._id, source: 'instagram' })
+    Media.countDocuments({ brandId: brand._id, source: 'instagram' }),
+    // Ingestion-source distribution across the brand's non-catalog-
+    // wrapper media. When the OAuth path has no cred but the brand
+    // DOES have Media from apify-ig / manual_upload / etc., the LLM
+    // needs to know so it can steer the operator to the right
+    // capability (catalog.pullFromApify for demo brands, media.upload
+    // for hand-loaded, etc.).
+    Media.aggregate([
+      { $match: {
+          brandId: new mongoose.Types.ObjectId(brand._id),
+          source: { $ne: 'catalog-product' },
+          deletedAt: null
+        }
+      },
+      { $group: { _id: '$source', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ])
   ]);
 
+  const sourceCounts = Object.fromEntries((sourceBreakdown || []).map((r) => [r._id, r.count]));
+
   if (!creds.length) {
-    return { ok: false, error: 'no active Instagram credential with an igUserId for this brand — connect Instagram + select an IG account first' };
+    // Steer the LLM: report which OTHER ingestion paths this brand
+    // already has content from, and name the capability to reach for
+    // each. The dispatcher's error field is what the LLM sees back;
+    // making it capability-explicit is what unlocks the chain.
+    const alt = [];
+    if (sourceCounts['apify-ig']) {
+      alt.push(`${sourceCounts['apify-ig']} rows from source=apify-ig (Apify IG scraper — for demo brands, invoke catalog.pullFromApify or sales.brand.sync)`);
+    }
+    if (sourceCounts['manual_upload']) {
+      alt.push(`${sourceCounts['manual_upload']} rows from source=manual_upload (hand-uploaded — invoke media.upload + media.finalizeUpload for more)`);
+    }
+    if (sourceCounts['instagram']) {
+      alt.push(`${sourceCounts['instagram']} rows from source=instagram (OAuth path — the credential this workflow needs was disconnected or was never fully picker-completed; invoke integrations.instagram.connectUrl to reconnect)`);
+    }
+    const suffix = alt.length
+      ? ` This brand DOES have media from other ingestion paths: ${alt.join('; ')}.`
+      : ' This brand has no existing media from any IG ingestion path.';
+    return {
+      ok: false,
+      error: `no active Instagram credential with an igUserId for this brand — the posts.syncFromInstagram workflow uses the Meta Graph OAuth path.${suffix} If the operator wants to re-pull via the SAME path that already has media, use the capability named above rather than this one. To connect a new OAuth credential, invoke integrations.instagram.connectUrl.`,
+      sourceCounts
+    };
   }
 
   return {

@@ -133,6 +133,10 @@ function buildSystemPrompt(context = {}) {
       ? `CURRENT UI CONTEXT (the operator has these selected — capabilities that need one of these IDs will use it as a default):\n${contextLines}`
       : 'CURRENT UI CONTEXT: nothing selected.',
     '',
+    'ERROR RECOVERY:',
+    '- When a capability fails with an error message that NAMES ANOTHER CAPABILITY as the remedy (e.g. "invoke integrations.instagram.connectUrl", "use catalog.pullFromApify for more"), offer to chain into that capability as your next step — do not just stop at the error. Ask the operator whether to proceed.',
+    '- If the error result carries a sourceCounts field (from posts.syncFromInstagram / catalog.syncFromInstagram), it tells you which OTHER ingestion path this brand ALREADY has content from. Steer the operator to the capability matching the dominant source instead of insisting on the OAuth path.',
+    '',
     'When you finish, produce a concise plain-text answer for the operator. Do not restate the raw JSON — summarise the finding. If a capability failed (ok:false), tell the operator what went wrong and what they can try.'
   ].join('\n');
 }
