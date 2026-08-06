@@ -1,6 +1,9 @@
 # Agent capability coverage plan
 
-**Status**: Phases 1 + 2 + 3 shipped (2026-08-05). Registry at 38 caps.
+**Status**: Phases 1 + 2 + 3 + 4 shipped (2026-08-06). Registry at 49 caps.
+Phase 4 shipped 11 of 12 planned caps — `catalog.pollApifyRun` deferred
+(no async Apify pattern in this repo today; all sync via
+`run-sync-get-dataset-items`).
 
 ## Purpose
 
@@ -67,11 +70,11 @@ lands. Tracked in the Phase 8b backlog row.
 
 | # | Phase | Caps | Tier mix | Rank | Depends on |
 |---|-------|------|----------|------|------------|
-| 1 | Campaigns | 10 | T1 × 8, T2 × 2 | High | — |
-| 2 | Ad curation | 5 | T1 × 5 | High | — |
-| 3 | Brand config | 8 | T1 × 5, T2 × 3 | High | — |
-| 4 | Catalog & media | 12 | T1 × 6, T2 × 2, T4 × 4 | High | — |
-| 5 | Onboarding | 4 | T1 × 3, T4 × 1 | High | Phase 3 (brand.*), Phase 4 (catalog.*) |
+| 1 | Campaigns | 10 | T1 × 8, T2 × 2 | ✅ shipped | — |
+| 2 | Ad curation | 5 | T1 × 5 | ✅ shipped | — |
+| 3 | Brand config | 8 | T1 × 5, T2 × 3 | ✅ shipped | — |
+| 4 | Catalog & media | 11 (of 12) | T1 × 6, T2 × 2, T4 × 3 | ✅ shipped | — |
+| 5 | Onboarding | 4 | T1 × 3, T4 × 1 | High | ✅ deps met |
 | 6 | Detection & layouts | 5 | T1 × 3, T2 × 2 | Medium | Phase 4 (media.*) |
 | 7 | Team | 5 | T1 × 3, T3 × 2 | Medium | — |
 | 8a | Integrations OAuth | ~10 | T1 × 10 | Medium | — |
