@@ -959,6 +959,102 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 10: Sales demos — T1 CRUD + abort ───────────────────────
+
+  {
+    id:       'sales.bootstrap',
+    title:    'Bootstrap Sales Demos advertiser + membership',
+    describe: 'Seed the Sales Demos advertiser row (idempotent) and grant the caller an active owner membership. Only callers whose email is on the SALES_DEMOS_ADMINS allowlist may invoke this. Runs even when the caller\'s current advertiser is NOT sales-demos — this is the way IN, so the standard scope guard is skipped. Requires operator confirmation.',
+    tier:     1,
+    scope:    'global',
+    args: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/salesBootstrap',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'sales.brand.create',
+    title:    'Create demo brand',
+    describe: 'Create a new demo Brand under the Sales Demos advertiser. Sets isDemo=true + Brand.apifyDemo config (igHandle, shopifyUrl, method). Caller must be scoped to Sales Demos (use sales.bootstrap first if needed). Requires operator confirmation.',
+    tier:     1,
+    scope:    'global',
+    args: {
+      type: 'object',
+      required: ['name'],
+      properties: {
+        name:       { type: 'string', minLength: 1, maxLength: 200, description: 'Brand display name.' },
+        igHandle:   { type: ['string', 'null'], maxLength: 200, description: 'Optional Instagram handle (with or without @).' },
+        shopifyUrl: { type: ['string', 'null'], maxLength: 500, description: 'Optional Shopify storefront URL.' },
+        method:     { type: 'string', enum: ['shopify-direct', 'apify', 'generic-sitemap'], description: 'Catalog pull method. Defaults to shopify-direct when shopifyUrl is set.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/salesBrandCreate',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'sales.brand.patch',
+    title:    'Patch demo brand Apify config',
+    describe: 'Update the Apify config (igHandle, shopifyUrl, method) on an existing demo brand. Only these three fields are editable via this capability — use brand.patch (Phase 3) for the general brand surface. Requires operator confirmation.',
+    tier:     1,
+    scope:    'global',
+    args: {
+      type: 'object',
+      required: ['brandId', 'updates'],
+      properties: {
+        brandId: { type: 'string', description: 'Demo Brand ObjectId.' },
+        updates: {
+          type: 'object',
+          description: 'Apify-config fields to update.',
+          properties: {
+            igHandle:   { type: ['string', 'null'] },
+            shopifyUrl: { type: ['string', 'null'] },
+            method:     { type: 'string', enum: ['shopify-direct', 'apify', 'generic-sitemap'] }
+          },
+          additionalProperties: false
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/salesBrandPatch',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'sales.brand.abort',
+    title:    'Abort in-flight demo brand pipeline',
+    describe: 'Cooperative cancellation — sets Brand.apifyDemo.aborted=true. The in-flight ingest loop reads this flag between records and bails on next check. Already-ingested Media + CatalogProduct rows are preserved. Requires operator confirmation.',
+    tier:     1,
+    scope:    'global',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Demo Brand ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/salesBrandAbort',
+      method:  'run'
+    }
+  },
+
   // ── Phase 9: getContext + cross-brand search ─────────────────────
 
   {
@@ -1809,6 +1905,81 @@ const CAPABILITIES = [
       properties: {
         name:       { type: 'string', minLength: 1, maxLength: 200, description: 'Brand display name.' },
         websiteUrl: { type: 'string', description: 'Brand website — must start with http:// or https://.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  // ── Phase 10: Sales demos — T4 workflows ─────────────────────────
+
+  {
+    id:       'sales.brand.sync',
+    title:    'Sync demo brand via Apify (Sales Demos scope)',
+    describe: 'Two-phase workflow that runs apifyIngestService.syncBrandApify for a demo brand under the Sales Demos advertiser. Same underlying service as catalog.pullFromApify, scoped strictly to callers who are IN Sales Demos. Cancel mid-flight via sales.brand.abort. Heavy (typically 1-3 min).',
+    tier:     4,
+    scope:    'global',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/salesBrandSync',
+      workflow: true
+    },
+    estimateUsd: 1.00,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Demo Brand ObjectId.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'sales.brand.enrich',
+    title:    'Full-catalog enrichment for demo brand',
+    describe: 'Two-phase workflow — full-catalog enrichment via catalogProductEnrichmentService.enrichBrandDetails: SerpAPI cross-seller price table + Gemini web-wide review synthesis + Immersive specs per product. PAID path. Protected by apifyDemo.enrichInFlight — a concurrent call fails at preview() rather than double-billing. Heavy (typically 5-10 min).',
+    tier:     4,
+    scope:    'global',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/salesBrandEnrich',
+      workflow: true
+    },
+    // Cost scales with product count; $10 reserves a bounded upper for
+    // brands with ~100 products at ~$0.05-0.10 each.
+    estimateUsd: 10.00,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Demo Brand ObjectId.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'sales.brand.syncReviews',
+    title:    'Sync demo brand product reviews',
+    describe: 'Two-phase workflow — re-scrape product reviews + ratings via the 3-tier engine (schema.org rich snippets → vendor-widget API → optional headless). HTTP tiers are free; headless is opt-in per run because it costs a browser per product. Mirrors POST /api/sales-demos/brands/:id/sync-reviews.',
+    tier:     4,
+    scope:    'global',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/salesBrandSyncReviews',
+      workflow: true
+    },
+    // Free by default (HTTP-only). Headless can add up but stays under
+    // the T4 gate for the operator to accept.
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:     { type: 'string', description: 'Demo Brand ObjectId.' },
+        force:       { type: 'boolean', description: 'When true, ignore the 30-day TTL and re-scrape everything.' },
+        useHeadless: { type: 'boolean', description: 'When true, allow the tier-3 headless browser fallback per product. Expensive.' },
+        pages:       { type: 'integer', minimum: 1, maximum: 50, description: 'Optional per-product page cap for the vendor-widget tier.' }
       },
       additionalProperties: false
     }

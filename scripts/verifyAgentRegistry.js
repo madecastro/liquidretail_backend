@@ -79,6 +79,14 @@ const FILES = [
   'services/capabilityExecutors/integrationsGoogleAdsDisconnect.js',
   'services/capabilityExecutors/agentGetContext.js',
   'services/capabilityExecutors/agentSearchAcrossBrands.js',
+  'services/capabilityExecutors/_salesDemosCommon.js',
+  'services/capabilityExecutors/salesBootstrap.js',
+  'services/capabilityExecutors/salesBrandCreate.js',
+  'services/capabilityExecutors/salesBrandPatch.js',
+  'services/capabilityExecutors/salesBrandAbort.js',
+  'services/capabilityExecutors/salesBrandSync.js',
+  'services/capabilityExecutors/salesBrandEnrich.js',
+  'services/capabilityExecutors/salesBrandSyncReviews.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -912,6 +920,91 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 24. Phase 10 — sales demos ────────────────────────────────────
+console.log('\n[24] Phase 10 sales-demo capabilities');
+
+for (const [id, tier] of [
+  ['sales.bootstrap',        1],
+  ['sales.brand.create',     1],
+  ['sales.brand.patch',      1],
+  ['sales.brand.abort',      1],
+  ['sales.brand.sync',       4],
+  ['sales.brand.enrich',     4],
+  ['sales.brand.syncReviews', 4]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+  if (c) assert(c.scope === 'global', `${id}: scope === 'global'`);
+}
+// T4 caps must be workflow-shaped.
+for (const id of ['sales.brand.sync', 'sales.brand.enrich', 'sales.brand.syncReviews']) {
+  const c = registry.capabilityById(id);
+  if (c) {
+    assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+    assert(!c.execute?.method, `${id}: no execute.method (workflow)`);
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared`);
+  }
+}
+
+async function checkPhase10Executors() {
+  const noScope = {};
+  const bootstrap  = require('../services/capabilityExecutors/salesBootstrap');
+  const create     = require('../services/capabilityExecutors/salesBrandCreate');
+  const patch      = require('../services/capabilityExecutors/salesBrandPatch');
+  const abort      = require('../services/capabilityExecutors/salesBrandAbort');
+  const syncWf     = require('../services/capabilityExecutors/salesBrandSync');
+  const enrichWf   = require('../services/capabilityExecutors/salesBrandEnrich');
+  const reviewsWf  = require('../services/capabilityExecutors/salesBrandSyncReviews');
+
+  // Tenant guards.
+  for (const [name, exec] of [
+    ['salesBootstrap',      bootstrap],
+    ['salesBrandCreate',    create],
+    ['salesBrandPatch',     patch],
+    ['salesBrandAbort',     abort]
+  ]) {
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+  for (const [name, exec] of [
+    ['salesBrandSync',       syncWf],
+    ['salesBrandEnrich',     enrichWf],
+    ['salesBrandSyncReviews', reviewsWf]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p = await exec.preview({ req: noScope, args: {} });
+    assert(p.ok === false && /advertiser scope/i.test(p.error),
+      `${name}.preview: no-scope → rejects`);
+    const e = await exec.execute({ req: noScope, args: {} });
+    assert(e.ok === false && /advertiser scope/i.test(e.error),
+      `${name}.execute: no-scope → rejects`);
+  }
+
+  // bootstrap: allowlist check reachable without DB when advertiserId
+  // is provided but the caller's email is unset.
+  const b1 = await bootstrap.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: {}
+  });
+  assert(b1.ok === false && /user context/i.test(b1.error),
+    `salesBootstrap: no user context → rejects`);
+  const b2 = await bootstrap.run({
+    req: { advertiserId: '000000000000000000000000', user: { userId: 'u', email: 'stranger@example.invalid' } },
+    args: {}
+  });
+  assert(b2.ok === false && /allowlist/i.test(b2.error),
+    `salesBootstrap: non-allowlisted email rejected`);
+
+  // Scope-check downstream of the tenant guard requires
+  // ensureSalesDemosAdvertiser which hits Mongo — the tenant guard
+  // above is the offline-reachable regression this suite catches.
+  // Live sales-demos-scope enforcement is exercised end-to-end.
+}
+
 // ── 23. Phase 9 — getContext + searchAcrossBrands ─────────────────
 console.log('\n[23] Phase 9 context capabilities');
 
@@ -1396,6 +1489,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase7Executors();
   await checkPhase8aExecutors();
   await checkPhase9Executors();
+  await checkPhase10Executors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

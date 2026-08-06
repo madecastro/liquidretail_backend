@@ -1,7 +1,7 @@
 # Agent capability coverage plan
 
-**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8a + 9 shipped (2026-08-06).
-Registry at 72 caps. Phase 8b BLOCKED — none of the five mutation
+**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8a + 9 + 10 shipped (2026-08-06).
+Registry at 79 caps. Phase 8b BLOCKED — none of the five mutation
 targets have backing services (shopifyProductMediaService missing;
 Meta / Google campaign services are read-only; instagram reply is
 automation-only). Full external-write pass needs new service builds.
@@ -96,7 +96,7 @@ lands. Tracked in the Phase 8b backlog row.
 | 8a | Integrations OAuth | 9 (of ~10) | T0 × 3, T1 × 6 | ✅ shipped | — |
 | 8b | External writes | 0 (of ~5) | T3 × 5 | ⛔ blocked | needs new service builds for all 5 mutation targets |
 | 9 | `getContext` + cross-brand | 2 (of 2) | T0 × 2 | ✅ shipped | — |
-| 10 | Sales demos | 7 | T1 × 4, T4 × 3 | Low | Phase 4, 5 |
+| 10 | Sales demos | 7 (of 7) | T1 × 4, T4 × 3 | ✅ shipped | — |
 
 ## Per-phase risk notes
 
