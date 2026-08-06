@@ -1238,6 +1238,80 @@ const CAPABILITIES = [
       },
       additionalProperties: false
     }
+  },
+
+  {
+    id:       'catalog.detectProductsFromMedia',
+    title:    'Enqueue detect on a brand\'s undetected media',
+    describe: 'Fan-out: for every Media under the brand that lacks a strong product match (no product_match / product_category outcome), enqueue a DetectRun with trigger=\'manual-rematch\' priority:1. The worker picks them up. Returns immediately with the runIds; actual pipeline execution (YOLO + Gemini identify + matching) happens in the worker. Skips catalog-product wrappers and soft-deleted rows. Capped at 50 media per run. Billable (~$0.05 per image); an operator receives a PLAN with target count + estimated cost before confirming.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogDetectProductsFromMedia',
+      workflow: true
+    },
+    // MAX_STEPS_PER_RUN=50 * PER_UNIT_ESTIMATE_USD=$0.05 = $2.50 ceiling.
+    estimateUsd: 2.50,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:  { type: 'string', description: 'Brand ObjectId.' },
+        fileType: { type: 'string', enum: ['image', 'video'], description: 'Optional filter — restrict enqueue to one fileType. Omit for both.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'catalog.syncFromShopifyPublic',
+    title:    'Pull public Shopify catalog',
+    describe: 'Fan-out: run shopifyPublicIngestService.syncBrandShopifyDirect against the brand\'s public storefront (Brand.shopifyUrl OR Brand.websiteUrl). Tries the resolver ladder — products.json → Storefront GraphQL → sitemap fallback — and upserts CatalogProduct rows by (brandId, externalId). Downstream detect + enrichment enqueue is fire-and-forget inside the service. Cap: SHOPIFY_DIRECT_LIMIT (default 200). Heavy sync (potentially minutes); the SSE stream stays open for the whole run. Non-billable at the API layer (downstream detect + LLM enrichment costs are separate).',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogSyncFromShopifyPublic',
+      workflow: true
+    },
+    // Shopify products.json is free. Downstream detect ($0.05/image) +
+    // enrichment (~$0.05/product) fire from separate workers under
+    // separate spend gates.
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have shopifyUrl or websiteUrl set.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'catalog.pullFromApify',
+    title:    'Pull demo-brand data via Apify',
+    describe: 'Fan-out: run apifyIngestService.syncBrandApify for a DEMO BRAND (Brand.isDemo=true). Pulls IG posts (source=apify-ig → Media + DetectRun) and Shopify catalog (source=apify-shopify → CatalogProduct) per Brand.apifyDemo config. Actor selection is server-controlled by apifyDemo.method (shopify-direct | apify | generic-sitemap); the agent cannot pick arbitrary Apify actors. Rejects non-demo brands (Sales Demos advertiser bucket only). Billable — Apify actors + downstream enrichment. Heavy sync (usually 1-3 min).',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogPullFromApify',
+      workflow: true
+    },
+    // Upper-bound estimate: IG pull ~$0.20 + Shopify pull ~$0.15 +
+    // downstream enrichment can run $0.50+ on a fresh 200-product
+    // catalog. $1.00 leaves headroom for the enrichment tail.
+    estimateUsd: 1.00,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have isDemo=true and apifyDemo config set.' }
+      },
+      additionalProperties: false
+    }
   }
 ];
 

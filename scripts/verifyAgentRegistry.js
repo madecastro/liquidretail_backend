@@ -52,6 +52,9 @@ const FILES = [
   'services/capabilityExecutors/mediaUpload.js',
   'services/capabilityExecutors/catalogInferCategories.js',
   'services/capabilityExecutors/mediaRefreshInsights.js',
+  'services/capabilityExecutors/catalogDetectProductsFromMedia.js',
+  'services/capabilityExecutors/catalogSyncFromShopifyPublic.js',
+  'services/capabilityExecutors/catalogPullFromApify.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -885,6 +888,55 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 18. Phase 4 — T4 detect / shopify / apify workflows ───────────
+console.log('\n[18] Phase 4 T4 workflows');
+
+for (const id of ['catalog.detectProductsFromMedia', 'catalog.syncFromShopifyPublic', 'catalog.pullFromApify']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === 4, `${id}: tier === 4`);
+    assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+    assert(!c.execute?.method, `${id}: no execute.method (uses preview/execute)`);
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared (got ${JSON.stringify(c.estimateUsd)})`);
+  }
+}
+
+async function checkPhase4Tier4Executors() {
+  const noScope = {};
+  const detect  = require('../services/capabilityExecutors/catalogDetectProductsFromMedia');
+  const shopify = require('../services/capabilityExecutors/catalogSyncFromShopifyPublic');
+  const apify   = require('../services/capabilityExecutors/catalogPullFromApify');
+
+  for (const [name, exec] of [['detect', detect], ['shopify', shopify], ['apify', apify]]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p1 = await exec.preview({ req: noScope, args: {} });
+    assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+      `${name}.preview: no-scope → rejects`);
+    const e1 = await exec.execute({ req: noScope, args: {} });
+    assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+      `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error),
+      `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+      `${name}.preview: invalid brandId → rejects`);
+  }
+
+  // detect: fileType enum guard runs BEFORE the brand lookup (arg
+  // validation should never require DB access), so this check is
+  // reachable with a bogus brandId.
+  const bad = await detect.preview({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', fileType: 'audio' }
+  });
+  assert(bad.ok === false && /fileType.*image.*video/i.test(bad.error),
+    `detect.preview: fileType outside {image, video} rejected before brand lookup`);
+}
+
 // ── 17. Phase 4 — T2 inferCategories + refreshInsights ────────────
 console.log('\n[17] Phase 4 T2 executors');
 
@@ -968,6 +1020,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase4PatchExecutors();
   await checkPhase4MediaExecutors();
   await checkPhase4Tier2Executors();
+  await checkPhase4Tier4Executors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
