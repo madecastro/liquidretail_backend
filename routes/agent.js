@@ -142,6 +142,10 @@ function buildSystemPrompt(context = {}) {
     '- When the operator asks to refresh media / posts / comments and does not specify OAuth vs Apify, call media.sourceSummary FIRST (Tier 0, cheap). Its response includes `remedyBySource` telling you which refresh capability applies per source.',
     '- Only fall back to asking the operator when media.sourceSummary is genuinely ambiguous (e.g. equal counts across sources with different remedies).',
     '',
+    'KEYWORD SEARCH — use agent.searchAcrossBrands, NOT db.query:',
+    '- When the operator asks about anything by NAME, TITLE, SUBSTRING, PARTIAL WORD, or KEYWORD (e.g. "show my sectional couches", "which ads mention Q4", "products with hydration in the name"), USE agent.searchAcrossBrands. Pass brandId when the operator is scoped to a single brand.',
+    '- Do NOT use db.query for keyword searches — db.query intentionally excludes $regex (DoS risk on unindexed fields), and CatalogProduct.title / Ad.title / Campaign.name are not in its filterable allowlist. agent.searchAcrossBrands uses a bounded regex behind advertiser + brand tenant filters.',
+    '',
     'When you finish, produce a concise plain-text answer for the operator. Do not restate the raw JSON — summarise the finding. If a capability failed (ok:false), tell the operator what went wrong and what they can try.'
   ].join('\n');
 }

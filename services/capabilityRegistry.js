@@ -1134,8 +1134,8 @@ const CAPABILITIES = [
 
   {
     id:       'agent.searchAcrossBrands',
-    title:    'Search across every brand under the caller\'s advertiser',
-    describe: 'Case-insensitive substring search across the caller\'s advertiser\'s brands + products + campaigns + ads. Every leg is advertiser-scoped or resolves through advertiser-scoped parents; cross-advertiser discovery is impossible from this capability. Results capped at 20 rows per resource type to keep the tool_result under the LLM\'s 12KB payload budget — narrow the query when a leg reports truncated:true.',
+    title:    'Keyword search across brands / products / campaigns / ads',
+    describe: 'THE keyword-search capability. Case-insensitive substring match across the caller\'s advertiser\'s brands, product titles / externalIds, campaign names, and ad titles / copy. Reach for this whenever the operator asks about products (or anything) by name / substring / partial title — e.g. "show my sectional couches", "list ads about hydration", "which campaigns mention Q4". Do NOT try to answer keyword questions with db.query — db.query intentionally excludes $regex (DoS risk on unindexed fields); this cap uses a bounded regex behind advertiserId + brandId filters. Optional brandId narrows the search to one brand under the caller\'s advertiser (still tenant-checked). Results capped at 20 rows per resource type to keep the tool_result under the LLM\'s 12KB payload budget — narrow the query or supply brandId when a leg reports truncated:true.',
     tier:     0,
     scope:    'advertiser',
     args: {
@@ -1143,11 +1143,12 @@ const CAPABILITIES = [
       required: ['query'],
       properties: {
         query: { type: 'string', minLength: 2, maxLength: 200, description: 'Substring to match (case-insensitive). Escaped for regex safety server-side.' },
+        brandId: { type: 'string', description: 'Optional Brand ObjectId — narrows every leg (products / campaigns / ads) to this one brand. Omit to search advertiser-wide. Foreign brandId is rejected.' },
         resourceTypes: {
           type: 'array',
           items: { type: 'string', enum: ['brand', 'product', 'campaign', 'ad'] },
           maxItems: 4,
-          description: 'Optional subset of resource types to search. Defaults to all four.'
+          description: 'Optional subset of resource types to search. Defaults to all four. When brandId is set, the "brand" leg is auto-skipped (a per-brand search doesn\'t need to search brand names).'
         }
       },
       additionalProperties: false

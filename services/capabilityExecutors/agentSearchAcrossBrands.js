@@ -59,8 +59,26 @@ async function run({ req, args }) {
     return { ok: false, error: 'resourceTypes must include at least one type' };
   }
 
+  // Optional brandId narrowing — when set, every leg that has a
+  // brandId column filters on it. brand-scope search is a common case
+  // and the LLM was reaching for db.query (which lacks $regex) when
+  // it should reach here.
+  const rawBrandId = args?.brandId;
+  let brandIdFilter = null;
+  if (rawBrandId != null) {
+    if (!mongoose.isValidObjectId(rawBrandId)) {
+      return { ok: false, error: `brandId "${rawBrandId}" is not a valid ObjectId` };
+    }
+    // Tenant guard on the brand itself — must belong to the caller's
+    // advertiser. Prevents a foreign brandId from narrowing an
+    // otherwise cross-brand search.
+    const brand = await Brand.findOne({ _id: rawBrandId, advertiserId: advOid })
+      .select('_id').lean();
+    if (!brand) return { ok: false, error: `brand ${rawBrandId} not found under this advertiser` };
+    brandIdFilter = brand._id;
+  }
+
   const rx = new RegExp(escapeRegex(rawQuery), 'i');
-  const advOid = new mongoose.Types.ObjectId(advertiserId);
 
   // Parallel per-resource fetches. Everything is advertiser-scoped;
   // Ad resolves via a brand lookup upstream so we never cross tenants.
@@ -70,11 +88,15 @@ async function run({ req, args }) {
 
   const wants = new Set(resourceTypes);
   const brandIdListPromise = wants.has('ad')
-    ? Brand.find({ advertiserId: advOid }).select('_id').lean()
+    ? (brandIdFilter
+        ? Promise.resolve([{ _id: brandIdFilter }])
+        : Brand.find({ advertiserId: advOid }).select('_id').lean())
     : Promise.resolve([]);
 
   const [brands, products, campaigns, brandIdList] = await Promise.all([
-    wants.has('brand')
+    // Brand-name search is only meaningful when NOT narrowed to one
+    // brand (a per-brand search doesn't need to search brand names).
+    (wants.has('brand') && !brandIdFilter)
       ? Brand.find({ advertiserId: advOid, name: rx })
           .limit(PER_TYPE_CAP)
           .select('_id name nameNormalized websiteUrl status')
@@ -83,18 +105,20 @@ async function run({ req, args }) {
     wants.has('product')
       ? CatalogProduct.find({
           advertiserId: advOid,
+          ...(brandIdFilter ? { brandId: brandIdFilter } : {}),
           $or: [
             { title: rx },
             { externalId: rx }
           ]
         })
           .limit(PER_TYPE_CAP)
-          .select('_id brandId title externalId imageUrl price currency')
+          .select('_id brandId title externalId imageUrl price currency rating productReviews.reviewCount')
           .lean()
       : null,
     wants.has('campaign')
       ? Campaign.find({
           advertiserId: advOid,
+          ...(brandIdFilter ? { brandId: brandIdFilter } : {}),
           name: rx
         })
           .limit(PER_TYPE_CAP)
