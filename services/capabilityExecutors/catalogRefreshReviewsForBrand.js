@@ -41,7 +41,7 @@ async function selectTargets({ brandId }) {
   })
     .sort({ lastSyncedAt: -1, firstSeenAt: -1 })
     .limit(MAX_STEPS_PER_RUN)
-    .select('_id title productUrl canonicalUrl')
+    .select('_id title productUrl canonicalUrl source')
     .lean();
 }
 
@@ -70,6 +70,42 @@ async function preview({ req, args }) {
   const targets = await selectTargets({ brandId: brand._id });
   const withUrl = targets.filter((t) => t.productUrl || t.canonicalUrl);
   const noUrl = targets.filter((t) => !(t.productUrl || t.canonicalUrl));
+
+  // When every candidate is skipped (no URL to scrape), refuse the
+  // preview and steer to the right remedy per source. The 3-tier
+  // scraper needs a product page — if the catalog was seeded from
+  // sources that don't carry a productUrl (detect-identified drafts
+  // from IG posts, sparse manual uploads), scraping is impossible;
+  // enrichment via SerpAPI + Gemini (catalog.refreshDetails) is the
+  // path that identifies the product page from external signals.
+  if (targets.length > 0 && withUrl.length === 0) {
+    const sourceCounts = {};
+    for (const t of noUrl) {
+      const src = t.source || 'unknown';
+      sourceCounts[src] = (sourceCounts[src] || 0) + 1;
+    }
+    const remedy = [];
+    if (sourceCounts['detect-identified']) {
+      remedy.push(`${sourceCounts['detect-identified']} products came from detect-identified (auto-created from IG posts — no product page was scraped at ingest). Backfill productUrl via catalog.patchProduct per row, OR run catalog.refreshDetails to enrich via SerpAPI + Gemini (which identifies product pages from title + brand + image signals rather than a pre-set URL).`);
+    }
+    if (sourceCounts['manual-upload']) {
+      remedy.push(`${sourceCounts['manual-upload']} products came from manual-upload without a productUrl. Backfill via catalog.patchProduct.`);
+    }
+    if (sourceCounts['apify-shopify'] || sourceCounts['apify-ig']) {
+      remedy.push(`${(sourceCounts['apify-shopify'] || 0) + (sourceCounts['apify-ig'] || 0)} products came from Apify but lack productUrl — the actor may have failed to capture it. Re-run catalog.pullFromApify to retry the ingest.`);
+    }
+    if (sourceCounts['shopify-direct']) {
+      remedy.push(`${sourceCounts['shopify-direct']} products came from shopify-direct without productUrl — unusual, since products.json normally includes it. Re-run catalog.syncFromShopifyPublic.`);
+    }
+    if (sourceCounts['sitemap-jsonld']) {
+      remedy.push(`${sourceCounts['sitemap-jsonld']} products came from sitemap-jsonld without productUrl — the sitemap entry may have been malformed. Re-run catalog.syncFromGenericSitemap.`);
+    }
+    return {
+      ok: false,
+      error: `no products under ${brand.name} have a productUrl to scrape. ${targets.length} candidate products checked; all skipped. Source breakdown: ${JSON.stringify(sourceCounts)}. Recommended actions: ${remedy.join(' ')} `,
+      sourceCounts
+    };
+  }
 
   // Rough wall-time estimate: Tier 1 is ~4s per product (single HTTP
   // GET + parse). Tier 2 fallback adds ~2s where used. At concurrency
