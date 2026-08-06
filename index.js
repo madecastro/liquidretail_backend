@@ -387,6 +387,47 @@ require('./services/remotionRenderService')
   setInterval(tick, intervalMin * 60 * 1000);
 })();
 
+// STRANDED-RUN SWEEP — finish what a restart abandoned.
+//
+// processAlerts requeues receipt-free `rendering` ads to `queued` on every
+// SIGTERM (so, every deploy) and marks the run failed; nothing then drained
+// `queued`, and bootRecoveryService only handles `rendering` + receipt. The work
+// simply sat there until a human noticed.
+//
+// RECOVERY RUNS FIRST and is free — a stranded ad holding a spend receipt is
+// already paid for and Atlas keeps it 30 days, so requeuing it would buy the same
+// image twice. Only genuinely receipt-free ads reach requeueStrandedAds.
+//
+// WEB process, not the worker: the requeue half needs runRenderLoop, which lives
+// in routes/ads.js. Single-flight for the same reason as the titling sweeper
+// above — a pass can outlast its interval, and stacking renders on this process
+// is a memory hazard. Concurrency across INSTANCES is safe without a lease
+// because the requeue goes through the same atomic `status:'queued'` claim POST
+// /runs uses: the first claimer wins, the rest no-op.
+//
+// The first tick is deliberately late (2 min): on a deploy this process is the
+// one that JUST replaced the process whose SIGTERM stranded the ads, so an
+// immediate sweep would race the shutdown handler's own requeue write.
+(() => {
+  const { sweepStrandedRuns, ENABLED } = require('./services/strandedRunSweeper');
+  if (!ENABLED()) {
+    console.log('♻️  stranded sweep: disabled (STRANDED_SWEEP_ENABLED=false)');
+    return;
+  }
+  const { requeueStrandedAds } = require('./routes/ads');
+  const intervalMin = Math.max(1, parseInt(process.env.STRANDED_SWEEP_INTERVAL_MIN, 10) || 10);
+  let inFlightPass = false;
+  const tick = () => {
+    if (inFlightPass) return;
+    inFlightPass = true;
+    return sweepStrandedRuns({ requeue: requeueStrandedAds })
+      .catch(err => console.warn(`⚠️  stranded sweep failed: ${err.message}`))
+      .finally(() => { inFlightPass = false; });
+  };
+  setTimeout(tick, 120 * 1000);
+  setInterval(tick, intervalMin * 60 * 1000);
+})();
+
 // Progress reaper — runs left behind by the previous process (in-process
 // setImmediate jobs die on restart) get marked failed instead of showing
 // "running" forever. The worker's periodic reaper covers ongoing sweeps.
