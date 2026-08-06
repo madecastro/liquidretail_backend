@@ -3117,6 +3117,77 @@ function projectAd(ad, full = false, extras = {}) {
   return base;
 }
 
+// ── STRANDED-RUN REQUEUE (2026-08-05) ────────────────────────────────────────
+// The render half of services/strandedRunSweeper. It lives HERE, not in that
+// module, for one reason: runRenderLoop and claimAdsForRun are defined in this
+// file, and having the sweeper require this router would create a cycle through
+// half the service graph — a boot-time landmine. The sweeper calls in instead.
+//
+// ⚠️ THIS SPENDS MONEY. Every guard below is load-bearing:
+//   · claimAdsForRun is the SAME atomic claim POST /runs uses. Its
+//     `status:'queued'` filter is what makes concurrent sweeps (Render runs up
+//     to 3 web instances, each with its own interval) safe: the first claim wins
+//     and the losers see modifiedCount 0 rather than rendering the same ad twice.
+//   · The caller has ALREADY tried recovery on every ad and passes only the
+//     receipt-free ones. Never call this with an unfiltered list.
+//   · renderIds comes from the claim result, never from the pre-claim selection —
+//     aliasing those is a known double-charge regression the harness fails on.
+//
+// renderToken: the sweeper has no requesting user, so this mints a system token.
+// It is only ever consumed by renderViaSpec (the dead HTML path); every ai_*
+// static ad returns from renderDirectImage long before that, and video never
+// reaches it. So a null-identity token cannot change what a live render does.
+async function requeueStrandedAds({ ads, run }) {
+  if (!ads?.length || !run) return 0;
+  const runId = `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const selectedIds = ads.map((a) => String(a._id));
+
+  const claim = await claimAdsForRun(ads, { selectedIds, runId });
+  if (!claim?.renderIds?.length) return 0;
+
+  const renderToken = jwt.sign(
+    { id: null, userId: null, email: 'system@stranded-sweep', name: 'stranded-sweep' },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+
+  const newRun = await CampaignRun.create({
+    runId,
+    brandId:      String(run.brandId),
+    campaignId:   String(run.campaignId),
+    campaignKind: run.campaignKind || 'promotional',
+    total:        claim.total,
+    status:       'running',
+    requestedBy:  null,
+    startedAt:    new Date(),
+    // Scope stamped from the CLAIMED ads, matching /runs. generationGate reads
+    // this and fails closed on an unreadable scope, so a partial list would be
+    // worse than an empty one.
+    requestedProductIds: [...new Set(
+      claim.renderIds
+        .map((id) => ads.find((a) => String(a._id) === String(id))?.productId)
+        .filter(Boolean)
+        .map(String)
+    )]
+  });
+
+  const job = {
+    brandId:      String(run.brandId),
+    campaignId:   String(run.campaignId),
+    campaignKind: run.campaignKind || 'promotional'
+  };
+  console.log(`♻️  strandedSweep: requeued ${claim.renderIds.length} ad(s) as ${runId}`);
+  setImmediate(() => {
+    runRenderLoop(newRun, job, claim.renderIds, renderToken).catch((err) => {
+      console.error(`❌ stranded requeue ${runId} crashed:`, err.message || err);
+      inFlight.untrack(runId);
+    });
+  });
+  return claim.renderIds.length;
+}
+
 module.exports = router;
 // Live claim function — offline harness drives THIS (scripts/verifyRunsClaim.js).
 module.exports.claimAdsForRun = claimAdsForRun;
+// Consumed by services/strandedRunSweeper via index.js — see requeueStrandedAds.
+module.exports.requeueStrandedAds = requeueStrandedAds;
