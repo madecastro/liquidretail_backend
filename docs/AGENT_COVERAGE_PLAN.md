@@ -1,6 +1,6 @@
 # Agent capability coverage plan
 
-**Status**: Phases 1 + 2 + 3 + 4 + 5 shipped (2026-08-06). Registry at 51 caps.
+**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 shipped (2026-08-06). Registry at 56 caps.
 
 - Phase 4 shipped 11 of 12 planned caps — `catalog.pollApifyRun` deferred
   (no async Apify pattern in this repo today; all sync via
@@ -8,8 +8,14 @@
 - Phase 5 shipped 2 of 4 planned caps —
   `onboarding.createAdvertiser` deferred (chicken-and-egg with agent
   auth: `requireAuth` presupposes an advertiserId, so the caller already
-  has one and the route\'s 409 fires immediately); `onboarding.createBrand`
+  has one and the route's 409 fires immediately); `onboarding.createBrand`
   deferred as a duplicate of `brand.create` (Phase 3).
+- Phase 6 shipped 5 caps — `layout.create` deferred (no Layout CRUD in
+  the codebase; layouts are derived-per-media via `LayoutInputArtifact`).
+  Reclassed `aiCanvas.testSpec` from T0 to T2 (the underlying
+  `getOrGenerate` fires a Sonnet call; not read-only). Added
+  `aiLayouts.getSession` (T0) as the polling companion to
+  `aiLayouts.generate`.
 
 ## Purpose
 
@@ -81,7 +87,7 @@ lands. Tracked in the Phase 8b backlog row.
 | 3 | Brand config | 8 | T1 × 5, T2 × 3 | ✅ shipped | — |
 | 4 | Catalog & media | 11 (of 12) | T1 × 6, T2 × 2, T4 × 3 | ✅ shipped | — |
 | 5 | Onboarding | 2 (of 4) | T1 × 1, T4 × 1 | ✅ shipped | — |
-| 6 | Detection & layouts | 5 | T1 × 3, T2 × 2 | Medium | Phase 4 (media.*) |
+| 6 | Detection & layouts | 5 (of 5, subs) | T0 × 1, T1 × 1, T2 × 3 | ✅ shipped | — |
 | 7 | Team | 5 | T1 × 3, T3 × 2 | Medium | — |
 | 8a | Integrations OAuth | ~10 | T1 × 10 | Medium | — |
 | 8b | External writes | ~5 | T3 × 5 | Medium | 8a + `shopifyProductMediaService` build |

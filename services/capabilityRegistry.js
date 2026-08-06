@@ -913,6 +913,52 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Phase 6: Detection + layouts — T0 read ───────────────────────
+
+  {
+    id:       'aiLayouts.getSession',
+    title:    'Poll AI layout session status',
+    describe: 'Read-only poll of an AiLayoutSession — companion to aiLayouts.generate. Returns status, totalCombos, and up to 20 references (completed layout reference images). Once status is \'completed\' or \'failed\', no further changes will happen. Tenant-scoped via advertiserId on the session.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['sessionId'],
+      properties: {
+        sessionId: { type: 'string', description: 'AiLayoutSession ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/aiLayoutsGetSession',
+      method:  'run'
+    }
+  },
+
+  // ── Phase 6: Detection + layouts — T1 rematch ────────────────────
+
+  {
+    id:       'detect.rematch',
+    title:    'Rematch detect on one media',
+    describe: 'Create a new DetectRun with trigger=\'manual-rematch\' priority:1 for one Media — jumps ahead of routine catalog / IG-sync runs. Meant for the "the previous outcome was wrong, try again" flow. Refuses catalog-product wrapper Media and soft-deleted rows. Requires operator confirmation. Kept Tier 1 by design — the operator\'s explicit rematch intent implies acceptance of a potential cost hit, and per-image detect billing lands on separate spendGuard rows.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/detectRematch',
+      method:  'run'
+    }
+  },
+
   // ── Phase 5: Onboarding — dispatch syncs ──────────────────────────
 
   {
@@ -1091,6 +1137,81 @@ const CAPABILITIES = [
     execute: {
       kind:    'service',
       service: './capabilityExecutors/mediaRefreshInsights',
+      method:  'run'
+    }
+  },
+
+  // ── Phase 6: Detection + layouts — T2 billable ──────────────────
+
+  {
+    id:       'detect.process',
+    title:    'Run detect on one media',
+    describe: 'Enqueue a fresh DetectRun with trigger=\'manual\' for one Media. Worker runs YOLO → subjects/text → smart-crops → product-match → overlay zones. Refuses catalog-product wrapper Media (pipeline-internal) and soft-deleted rows. Billable (~$0.05 per image via YOLO microservice + Gemini identify). Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'brand',
+    estimateUsd: 0.05,
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/detectProcess',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'aiCanvas.testSpec',
+    title:    'Generate + cache AI canvas spec',
+    describe: 'Generate an AI canvas spec (layout composition) for one Media at a given aspect ratio + creative style. Mirrors POST /api/ai-layouts/spec/test — the underlying LLM call is Sonnet. Idempotent on the (mediaId, template, aspectRatio, productId, variantKind, paletteSource) partition: a cached artifact returns cached:true; pass refresh=true to force a re-derive. Billable (~$0.02, Sonnet). Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'brand',
+    estimateUsd: 0.02,
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId:       { type: 'string', description: 'Media ObjectId.' },
+        creativeStyle: { type: 'string', enum: ['brand_led', 'ugc_led', 'editorial'], description: 'Creative style. Defaults to brand_led.' },
+        aspectRatio:   { type: 'string', enum: ['1:1', '4:5', '9:16'], description: 'Target aspect. Defaults to 1:1.' },
+        productId:     { type: 'string', description: 'Optional CatalogProduct ObjectId — seeds product_image variants.' },
+        refresh:       { type: 'boolean', description: 'When true, invalidate the cache + regenerate.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/aiCanvasTestSpec',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'aiLayouts.generate',
+    title:    'Kick off AI layout studio session',
+    describe: 'Create an AiLayoutSession — an async LLM + gpt-image-1 pass across N variants × M aspect ratios. Returns sessionId immediately; the worker runs the combos and writes back references[] as they complete. Poll aiLayouts.getSession for status. Cost scales with (variants × aspectRatios × quality) — low ~$0.02/combo, medium ~$0.05, high ~$0.15. estimateUsd sizes for the upper bound at default 3 × 3 × low ~= $1.00. Requires operator confirmation AND advertiser daily spend cap headroom.',
+    tier:     2,
+    scope:    'brand',
+    estimateUsd: 1.00,
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId:      { type: 'string', description: 'Media ObjectId — the source Media for the layout studio pass.' },
+        variants:     { type: 'array', items: { type: 'string' }, maxItems: 6, description: 'Optional list of variant names. Defaults to the studio\'s DEFAULT_VARIANTS.' },
+        aspectRatios: { type: 'array', items: { type: 'string' }, maxItems: 6, description: 'Optional list of aspect ratios. Defaults to the studio\'s DEFAULT_ASPECT_RATIOS.' },
+        quality:      { type: 'string', enum: ['low', 'medium', 'high'], description: 'gpt-image-1 quality. Default low.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/aiLayoutsGenerate',
       method:  'run'
     }
   },

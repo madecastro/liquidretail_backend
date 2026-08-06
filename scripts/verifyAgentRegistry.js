@@ -57,6 +57,11 @@ const FILES = [
   'services/capabilityExecutors/catalogPullFromApify.js',
   'services/capabilityExecutors/onboardingDispatchSyncs.js',
   'services/capabilityExecutors/onboardingCreateBrandFromUrl.js',
+  'services/capabilityExecutors/detectProcess.js',
+  'services/capabilityExecutors/detectRematch.js',
+  'services/capabilityExecutors/aiCanvasTestSpec.js',
+  'services/capabilityExecutors/aiLayoutsGenerate.js',
+  'services/capabilityExecutors/aiLayoutsGetSession.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -890,6 +895,72 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 20. Phase 6 — detection + layouts ─────────────────────────────
+console.log('\n[20] Phase 6 detection + layouts');
+
+for (const [id, tier] of [
+  ['detect.process',       2],
+  ['detect.rematch',       1],
+  ['aiCanvas.testSpec',    2],
+  ['aiLayouts.generate',   2],
+  ['aiLayouts.getSession', 0]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+async function checkPhase6Executors() {
+  const noScope = {};
+  const process       = require('../services/capabilityExecutors/detectProcess');
+  const rematch       = require('../services/capabilityExecutors/detectRematch');
+  const canvasTest    = require('../services/capabilityExecutors/aiCanvasTestSpec');
+  const layoutsGen    = require('../services/capabilityExecutors/aiLayoutsGenerate');
+  const layoutsSess   = require('../services/capabilityExecutors/aiLayoutsGetSession');
+
+  for (const [name, exec, missingArg] of [
+    ['detectProcess',       process,     'mediaId'],
+    ['detectRematch',       rematch,     'mediaId'],
+    ['aiCanvasTestSpec',    canvasTest,  'mediaId'],
+    ['aiLayoutsGenerate',   layoutsGen,  'mediaId'],
+    ['aiLayoutsGetSession', layoutsSess, 'sessionId']
+  ]) {
+    const r1 = await exec.run({ req: noScope, args: {} });
+    assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+      `${name}: no-scope → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r2.ok === false && new RegExp(`${missingArg} required`, 'i').test(r2.error),
+      `${name}: missing ${missingArg} → rejects`);
+    const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { [missingArg]: 'nope' } });
+    assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+      `${name}: invalid ${missingArg} → rejects`);
+  }
+
+  // aiCanvas.testSpec: creativeStyle enum guard runs BEFORE DB lookup.
+  const badStyle = await canvasTest.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', creativeStyle: 'not-a-style' }
+  });
+  assert(badStyle.ok === false && /creativeStyle must be one of/i.test(badStyle.error),
+    `aiCanvasTestSpec: bogus creativeStyle rejected before DB lookup`);
+
+  // aiCanvas.testSpec: aspectRatio enum guard runs BEFORE DB lookup.
+  const badAspect = await canvasTest.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', aspectRatio: '16:9' }
+  });
+  assert(badAspect.ok === false && /aspectRatio must be one of/i.test(badAspect.error),
+    `aiCanvasTestSpec: bogus aspectRatio rejected before DB lookup`);
+
+  // aiLayouts.generate: quality enum guard runs BEFORE DB lookup.
+  const badQuality = await layoutsGen.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', quality: 'ultra' }
+  });
+  assert(badQuality.ok === false && /quality must be one of/i.test(badQuality.error),
+    `aiLayoutsGenerate: bogus quality rejected before DB lookup`);
+}
+
 // ── 19. Phase 5 — onboarding.dispatchSyncs + createBrandFromUrl ───
 console.log('\n[19] Phase 5 onboarding capabilities');
 
@@ -1085,6 +1156,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase4Tier2Executors();
   await checkPhase4Tier4Executors();
   await checkPhase5Executors();
+  await checkPhase6Executors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
