@@ -59,6 +59,8 @@ async function run({ req, args }) {
     return { ok: false, error: 'resourceTypes must include at least one type' };
   }
 
+  const advOid = new mongoose.Types.ObjectId(advertiserId);
+
   // Optional brandId narrowing — when set, every leg that has a
   // brandId column filters on it. brand-scope search is a common case
   // and the LLM was reaching for db.query (which lacks $regex) when

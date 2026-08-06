@@ -1718,6 +1718,77 @@ async function checkPhase9Executors() {
   });
   assert(s7.ok === false && /at least one type/i.test(s7.error),
     `agentSearchAcrossBrands: empty resourceTypes rejected`);
+
+  // HAPPY-PATH SMOKE — monkey-patch the models so the executor runs
+  // to completion offline. Catches load-bearing bugs that arg-guards
+  // miss (e.g. an undefined variable used only after the DB lookup).
+  // The 2026-08-06 outage on advOid-not-defined shipped because no
+  // check reached this code path.
+  {
+    const Brand = require('../models/Brand');
+    const CatalogProduct = require('../models/CatalogProduct');
+    const Campaign = require('../models/Campaign');
+    const Ad = require('../models/Ad');
+    const orig = {
+      brandFind: Brand.find, brandFindOne: Brand.findOne,
+      productFind: CatalogProduct.find, campaignFind: Campaign.find, adFind: Ad.find
+    };
+    // Chainable stub — every method returns `this` until .lean(),
+    // which resolves to []. Matches the shape the executor uses
+    // (find().limit(N).select(fields).lean() or find().select().lean()).
+    const emptyChain = () => {
+      const c = {};
+      c.limit  = () => c;
+      c.select = () => c;
+      c.sort   = () => c;
+      c.lean   = async () => [];
+      return c;
+    };
+    Brand.find          = () => emptyChain();
+    Brand.findOne       = () => ({ select: () => ({ lean: async () => null }) });
+    CatalogProduct.find = () => emptyChain();
+    Campaign.find       = () => emptyChain();
+    Ad.find             = () => emptyChain();
+    try {
+      // No brandId → advertiser-wide path. Wrap in try/catch so a
+      // ReferenceError manifests as a failed assertion instead of
+      // crashing the whole harness — the 2026-08-06 advOid outage
+      // shipped because the executor threw synchronously here.
+      let rHappy;
+      try {
+        rHappy = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'sectional' }
+        });
+      } catch (err) {
+        rHappy = { ok: false, error: `threw: ${err.message}` };
+      }
+      assert(rHappy.ok === true,
+        `agentSearchAcrossBrands: happy-path smoke completes without throwing — REFERENCE-ERROR REGRESSION IF THIS FAILS (got ${rHappy.error || 'unknown'})`);
+      // brandId-narrowing path. Second failure mode — the brand-check
+      // block runs BEFORE the advOid assignment if we goof the order
+      // again.
+      let rBrand;
+      try {
+        rBrand = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'sectional', brandId: '000000000000000000000000' }
+        });
+      } catch (err) {
+        rBrand = { ok: false, error: `threw: ${err.message}` };
+      }
+      // Brand.findOne stub returns null → executor returns "brand
+      // not found" — that's the expected reject shape offline.
+      assert(rBrand.ok === false && /not found/i.test(rBrand.error || ''),
+        `agentSearchAcrossBrands: brandId-narrow path rejects unknown brand cleanly (no ReferenceError; got ${rBrand.error || 'unknown'})`);
+    } finally {
+      Brand.find          = orig.brandFind;
+      Brand.findOne       = orig.brandFindOne;
+      CatalogProduct.find = orig.productFind;
+      Campaign.find       = orig.campaignFind;
+      Ad.find             = orig.adFind;
+    }
+  }
 }
 
 // ── 22. Phase 8a — integrations OAuth ─────────────────────────────
