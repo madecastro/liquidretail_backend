@@ -913,6 +913,63 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Ingestion coverage: P1 finalize + P3 URL-based product create ──
+
+  {
+    id:       'media.finalizeUpload',
+    title:    'Finalize a signed Cloudinary upload into a Media row',
+    describe: 'Pair with media.upload — once the frontend has POSTed the file to Cloudinary using the signed credential media.upload issued, hand the resulting secure_url back here to create the Media doc. Refuses secureUrls that are not under this deployment\'s Cloudinary cloud (CLOUDINARY_CLOUD_NAME) so an operator cannot smuggle an arbitrary external URL into the Media collection. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'secureUrl'],
+      properties: {
+        brandId:   { type: 'string', description: 'Brand ObjectId — Media inherits its tenant scope from this.' },
+        secureUrl: { type: 'string', description: 'Cloudinary secure_url returned by the direct-upload POST. Must be under our own cloud name.' },
+        fileType:  { type: 'string', enum: ['image', 'video'], description: 'Defaults to image.' },
+        fileName:  { type: 'string', maxLength: 300, description: 'Optional original filename.' },
+        metadata:  { type: 'object', additionalProperties: true, description: 'Optional metadata object (caption, hashtags, etc.).' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaFinalizeUpload',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'catalog.createProduct',
+    title:    'Create a catalog product from an image URL',
+    describe: 'URL-based single-product create — Cloudinary mirrors the imageUrl into our own CDN and upserts a CatalogProduct row with source=\'manual-upload\'. Idempotent on (brandId, externalId) where externalId=\'manual:<title-slug>\'. draft=true unless BOTH price AND productUrl are supplied. Mirrors POST /api/upload/product but without the multipart file — pass any http/https imageUrl (Meta CDN, IG display_url, etc.) and Cloudinary pulls it. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'title', 'imageUrl'],
+      properties: {
+        brandId:    { type: 'string', description: 'Brand ObjectId.' },
+        title:      { type: 'string', minLength: 1, maxLength: 500, description: 'Product title.' },
+        imageUrl:   { type: 'string', maxLength: 2000, description: 'Remote image URL — must be http:// or https://. Cloudinary mirrors it into our CDN.' },
+        price:      { type: ['number', 'null'], description: 'Optional non-negative number.' },
+        currency:   { type: ['string', 'null'], maxLength: 3, description: 'Optional 3-letter ISO code (USD, EUR, ...).' },
+        productUrl: { type: ['string', 'null'], maxLength: 2000, description: 'Optional http/https product page URL.' },
+        gtin:       { type: ['string', 'null'], maxLength: 20, description: 'Optional GTIN (8/12/13/14-digit barcode); non-digits are stripped.' },
+        mpn:        { type: ['string', 'null'], maxLength: 200, description: 'Optional manufacturer part number.' },
+        category:   { type: ['string', 'null'], maxLength: 500 },
+        description: { type: ['string', 'null'], maxLength: 4000 }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogCreateProduct',
+      method:  'run'
+    }
+  },
+
   // ── Phase 6: Detection + layouts — T0 read ───────────────────────
 
   {
@@ -1905,6 +1962,74 @@ const CAPABILITIES = [
       properties: {
         name:       { type: 'string', minLength: 1, maxLength: 200, description: 'Brand display name.' },
         websiteUrl: { type: 'string', description: 'Brand website — must start with http:// or https://.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  // ── Ingestion coverage: P2/P4 standalone sync workflows ──────────
+
+  {
+    id:       'catalog.syncFromInstagram',
+    title:    'Sync Meta Catalog for a brand',
+    describe: 'Two-phase workflow — pull the brand\'s Meta Catalog products via the IG Commerce OAuth path (catalogSyncService.syncCatalog). Same service /api/integrations/instagram/sync-catalog + onboarding.dispatchSyncs invoke; standalone so the operator can trigger just the catalog leg. Requires an active IG IntegrationCredential with a catalogId. No LLM cost.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogSyncFromInstagram',
+      workflow: true
+    },
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have at least one active IG credential with a catalogId set.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'posts.syncFromInstagram',
+    title:    'Sync Instagram posts for a brand',
+    describe: 'Two-phase workflow — pull IG posts (feed + reels) via postSyncService.syncPosts. Same service /api/integrations/instagram/sync-posts + onboarding.dispatchSyncs invoke; standalone so the operator can trigger just the posts leg. Upserts Media rows and enqueues DetectRuns for new posts. Requires an active IG IntegrationCredential with an igUserId. No LLM cost.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/postsSyncFromInstagram',
+      workflow: true
+    },
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have at least one active IG credential with an igUserId set.' }
+      },
+      additionalProperties: false
+    }
+  },
+
+  {
+    id:       'catalog.syncFromGenericSitemap',
+    title:    'Pull public catalog via XML sitemap + JSON-LD',
+    describe: 'Two-phase workflow — pull the brand\'s catalog via genericCatalogIngestService (XML sitemap + schema.org JSON-LD). Fallback for non-Shopify stores where Shopify products.json returns nothing. Requires Brand.websiteUrl or Brand.shopifyUrl. Refuses when GENERIC_CATALOG_ENABLED=false. No LLM cost.',
+    tier:     4,
+    scope:    'brand',
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogSyncFromGenericSitemap',
+      workflow: true
+    },
+    estimateUsd: 0,
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId. Must have websiteUrl or shopifyUrl set.' }
       },
       additionalProperties: false
     }

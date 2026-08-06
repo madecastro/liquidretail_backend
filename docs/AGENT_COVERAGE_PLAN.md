@@ -1,10 +1,21 @@
 # Agent capability coverage plan
 
-**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8a + 9 + 10 shipped (2026-08-06).
-Registry at 79 caps. Phase 8b BLOCKED — none of the five mutation
+**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8a + 9 + 10 + ingestion-coverage shipped (2026-08-06).
+Registry at 84 caps. Phase 8b BLOCKED — none of the five mutation
 targets have backing services (shopifyProductMediaService missing;
 Meta / Google campaign services are read-only; instagram reply is
 automation-only). Full external-write pass needs new service builds.
+
+**Ingestion-coverage pass** (audit follow-up, 5 caps):
+- `media.finalizeUpload` (T1) — closes the media.upload dead-end.
+- `catalog.createProduct` (T1) — URL-based single-product create.
+- `catalog.syncFromInstagram` (T4) — standalone Meta Catalog pull.
+- `posts.syncFromInstagram` (T4) — standalone IG post pull.
+- `catalog.syncFromGenericSitemap` (T4) — standalone sitemap fallback.
+
+Every `Media.source` and `CatalogProduct.source` writer now has an
+agent capability driving it (except system-only paths — webhook,
+scheduled sweep, catalog-product internal wrappers).
 
 - Phase 4 shipped 11 of 12 planned caps — `catalog.pollApifyRun` deferred
   (no async Apify pattern in this repo today; all sync via

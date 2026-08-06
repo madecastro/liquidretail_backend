@@ -87,6 +87,11 @@ const FILES = [
   'services/capabilityExecutors/salesBrandSync.js',
   'services/capabilityExecutors/salesBrandEnrich.js',
   'services/capabilityExecutors/salesBrandSyncReviews.js',
+  'services/capabilityExecutors/mediaFinalizeUpload.js',
+  'services/capabilityExecutors/catalogCreateProduct.js',
+  'services/capabilityExecutors/catalogSyncFromInstagram.js',
+  'services/capabilityExecutors/postsSyncFromInstagram.js',
+  'services/capabilityExecutors/catalogSyncFromGenericSitemap.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -920,6 +925,119 @@ async function checkPhase4MediaExecutors() {
     `mediaUpload: rejects resourceType outside {image, video}`);
 }
 
+// ── 25. Ingestion coverage — P1-P4 ────────────────────────────────
+console.log('\n[25] Ingestion coverage P1-P4');
+
+for (const [id, tier, isWorkflow] of [
+  ['media.finalizeUpload',              1, false],
+  ['catalog.createProduct',             1, false],
+  ['catalog.syncFromInstagram',         4, true],
+  ['posts.syncFromInstagram',           4, true],
+  ['catalog.syncFromGenericSitemap',    4, true]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === tier, `${id}: tier === ${tier}`);
+    if (isWorkflow) {
+      assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+      assert(!c.execute?.method, `${id}: no execute.method (workflow)`);
+    }
+  }
+}
+
+async function checkIngestionCoverageExecutors() {
+  const noScope = {};
+  const finalize   = require('../services/capabilityExecutors/mediaFinalizeUpload');
+  const create     = require('../services/capabilityExecutors/catalogCreateProduct');
+  const igCat      = require('../services/capabilityExecutors/catalogSyncFromInstagram');
+  const igPosts    = require('../services/capabilityExecutors/postsSyncFromInstagram');
+  const sitemap    = require('../services/capabilityExecutors/catalogSyncFromGenericSitemap');
+
+  // Tenant guards.
+  for (const [name, exec] of [['mediaFinalizeUpload', finalize], ['catalogCreateProduct', create]]) {
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+  for (const [name, exec] of [
+    ['catalogSyncFromInstagram',      igCat],
+    ['postsSyncFromInstagram',        igPosts],
+    ['catalogSyncFromGenericSitemap', sitemap]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p = await exec.preview({ req: noScope, args: {} });
+    assert(p.ok === false && /advertiser scope/i.test(p.error), `${name}.preview: no-scope → rejects`);
+    const e = await exec.execute({ req: noScope, args: {} });
+    assert(e.ok === false && /advertiser scope/i.test(e.error), `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error), `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error), `${name}.preview: invalid brandId → rejects`);
+  }
+
+  // finalizeUpload argument shape.
+  const f1 = await finalize.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(f1.ok === false && /brandId required/i.test(f1.error),
+    `mediaFinalizeUpload: missing brandId → rejects`);
+  const f2 = await finalize.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(f2.ok === false && /valid ObjectId/i.test(f2.error),
+    `mediaFinalizeUpload: invalid brandId → rejects`);
+  const f3 = await finalize.run({ req: { advertiserId: 'x' }, args: { brandId: '000000000000000000000000' } });
+  assert(f3.ok === false && /secureUrl required/i.test(f3.error),
+    `mediaFinalizeUpload: missing secureUrl → rejects`);
+  const f4 = await finalize.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', secureUrl: 'https://evil.example.com/hack.jpg' }
+  });
+  assert(f4.ok === false && /Cloudinary URL/i.test(f4.error),
+    `mediaFinalizeUpload: non-Cloudinary URL rejected — SECURITY REGRESSION IF THIS FAILS`);
+  // fileType enum guard runs AFTER the Cloudinary-URL check, which
+  // needs CLOUDINARY_CLOUD_NAME set to pass. Seed it locally for this
+  // one assertion and restore afterward so we don\'t leak env into
+  // later checks.
+  {
+    const prior = process.env.CLOUDINARY_CLOUD_NAME;
+    process.env.CLOUDINARY_CLOUD_NAME = 'testcloud';
+    const f5 = await finalize.run({
+      req: { advertiserId: '000000000000000000000000' },
+      args: {
+        brandId: '000000000000000000000000',
+        secureUrl: 'https://res.cloudinary.com/testcloud/image/upload/foo.jpg',
+        fileType: 'audio'
+      }
+    });
+    if (prior === undefined) delete process.env.CLOUDINARY_CLOUD_NAME;
+    else process.env.CLOUDINARY_CLOUD_NAME = prior;
+    assert(f5.ok === false && /fileType/i.test(f5.error),
+      `mediaFinalizeUpload: rejects fileType outside {image, video}`);
+  }
+
+  // catalog.createProduct argument shape.
+  const c1 = await create.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(c1.ok === false && /brandId required/i.test(c1.error),
+    `catalogCreateProduct: missing brandId → rejects`);
+  const c2 = await create.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(c2.ok === false && /valid ObjectId/i.test(c2.error),
+    `catalogCreateProduct: invalid brandId → rejects`);
+  const c3 = await create.run({ req: { advertiserId: 'x' }, args: { brandId: '000000000000000000000000' } });
+  assert(c3.ok === false && /title required/i.test(c3.error),
+    `catalogCreateProduct: missing title → rejects`);
+  const c4 = await create.run({
+    req: { advertiserId: 'x' },
+    args: { brandId: '000000000000000000000000', title: 'T' }
+  });
+  assert(c4.ok === false && /imageUrl required/i.test(c4.error),
+    `catalogCreateProduct: missing imageUrl → rejects`);
+  const c5 = await create.run({
+    req: { advertiserId: 'x' },
+    args: { brandId: '000000000000000000000000', title: 'T', imageUrl: 'ftp://bad.example' }
+  });
+  assert(c5.ok === false && /http/i.test(c5.error),
+    `catalogCreateProduct: non-http imageUrl rejected`);
+}
+
 // ── 24. Phase 10 — sales demos ────────────────────────────────────
 console.log('\n[24] Phase 10 sales-demo capabilities');
 
@@ -1490,6 +1608,7 @@ async function checkPhase4Tier2Executors() {
   await checkPhase8aExecutors();
   await checkPhase9Executors();
   await checkPhase10Executors();
+  await checkIngestionCoverageExecutors();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
