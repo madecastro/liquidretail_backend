@@ -83,10 +83,25 @@ check('B5 with no requeue handler supplied it degrades to recovery-only rather '
   /if \(!requeue \|\| !REQUEUE_ON\(\)\)/.test(sweepSrc));
 
 // ── C. The requeue half reuses the ATOMIC claim ──────────────────────────
-check('C1 [DOUBLE-CHARGE] requeue goes through claimAdsForRun — the same atomic '
-    + "`status:'queued'` claim POST /runs uses, which is what makes concurrent "
-    + 'sweeps across Render instances safe without a lease',
-  /await claimAdsForRun\(ads, \{ selectedIds, runId \}\)/.test(adsSrc));
+// C1 STRENGTHENED after the first live sweep. It used to match the call
+// TEXTUALLY — `claimAdsForRun(ads, {...})` — and passed while the call was wrong:
+// claimAdsForRun takes a MODEL ADAPTER, not an array, so the real sweep threw
+// `ads.updateMany is not a function`. A check that confirms a function is called
+// but not that it is called CORRECTLY is barely a check.
+check('C1 [DOUBLE-CHARGE] requeue goes through claimAdsForRun with the MODEL '
+    + "ADAPTER (not the ad array) — the same atomic `status:'queued'` claim POST "
+    + '/runs uses, which is what makes concurrent sweeps across Render instances '
+    + 'safe without a lease',
+  (() => {
+    const i = adsSrc.indexOf('async function requeueStrandedAds');
+    if (i === -1) return false;
+    const fn = adsSrc.slice(i, i + 2600);
+    const call = fn.indexOf('await claimAdsForRun(');
+    if (call === -1) return false;
+    const args = fn.slice(call, call + 420);
+    return /updateMany:/.test(args) && /find:/.test(args)
+      && !/claimAdsForRun\(\s*ads\s*,/.test(args);
+  })());
 check('C2 [DOUBLE-CHARGE] it renders claim.renderIds, never the pre-claim '
     + 'selection — aliasing those is a known double-charge regression',
   (() => {
