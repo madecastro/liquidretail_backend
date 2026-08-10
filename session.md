@@ -324,7 +324,7 @@ byte-identical prior path. Harness `scripts/verifySiteFingerprint.js` 29/29;
 full gate was **78 pass / 0 fail** (now 79 with browser-session harness). Live
 PB5Star / Living Spaces re-runs NOT done here — reviewer should sync those brands.
 
-## 2026-08-10 — `ai_social_proof_led` had all but vanished. TWO causes, both fixed. UNCOMMITTED→branch `fix/restore-social-proof-led`
+## 2026-08-10 — `ai_social_proof_led` had all but vanished. TWO causes, both fixed. MERGED + DEPLOYED + VERIFIED LIVE (PR #110, main `00c991d4`)
 
 Owner: *"I am not seeing AI social proof led static ads being generated, why is that? I was
 seeing them before."* Correct, and **measured** rather than inferred — Render logs
@@ -445,15 +445,71 @@ main, not mine.** It correctly flags
 field, so that read is permanently `undefined` (the silent-`.select()` trap, CLAUDE.md §4).
 Verbatim on `origin/main`; spun out as its own task.
 
+### DEPLOYED AND VERIFIED LIVE — 2026-08-10 (PR #110, main `00c991d4`)
+
+Merged and deployed; web + worker both `live` on `00c991d4` (`dep-d9t1k63l550s73eocn4g`, 18:37:37Z).
+End-to-end run driven through the real wizard on staging (Vuori Clothing → *Tech Waffle Shirt
+Jacket | Dark Salt*, `productId=6a6625155f5af85a46562ec5`, 1:1 image-only, 3 submits ≈ $0.22).
+Run `run_1786388743942_0938c664`.
+
+**RESULT — the headline defect is fixed:**
+
+```
+19:12:04  ai_promotional/1:1       intent=objection_resolved        concept=performance_knit_claim
+19:12:11  ai_editorial/1:1         intent=product_first_lifestyle   concept=versatile_layer_editorial
+19:12:12  ai_social_proof_led/1:1  intent=social_proof_led          concept=brandwide_rating_trust
+FELL BACK count: 0 / 3
+```
+
+Three **distinct** creative styles, **no `ai_brand_led` at all** (it was 200+ vs 18 before), and the
+social-proof ad resolved to `intent=social_proof_led` with **no `fell back from`**. Delivered image
+reads **`4.6 ★ · (15545 BRAND REVIEWS) · "feel like second skin"`** — the scope label rendered
+on-frame by gpt-image-2, verified by eye at full res.
+
+**The MECHANISM is confirmed, not just the outcome.** The product has no rating of its own, and
+`🔒 director scope — 6 brand review(s) withheld from a product concept` fired, so
+`social_proof_signal.rating` was null. `hasUsableProof` therefore could only have been satisfied by
+`optionHasRating` — i.e. **the proof-menu flip is what supplied the proof**, and the reserved slot is
+what consumed it. The Director even named the concept `brandwide_rating_trust`, using the
+brand-scoped framing the menu instructs rather than claiming the number as the SKU's own.
+
+**⚠️ CHANGE C WAS NOT EXERCISED — do not record it as live-proven.** The quote resolved to BRAND
+tier (`quote pool: product=0 category=0 brand=6 comment=0 → winner=brand`,
+`quoteTier=brand`), which pairs with brand numbers through the **pre-existing** coherent path, not
+through the new exception. The exception needs a **comment/product-tier** quote. It remains covered
+by `verifySocialProofRestoration.js` (35 checks) and direct probes only.
+
+**And no brand in this workspace can currently exercise it:** the exception needs a brand rating over
+the 4.39 floor AND a comment-tier quote. GymShark 3.3, Pelagic 3.2, BabyBoo 4.3 are all under the
+floor; Vuori clears it (4.58/15,545) but has only **2** UGC-matched products and both carry their own
+product ratings, so product numbers win. Ubeauty (4.8) has zero catalog products. That is an argument
+for the `brandReviews` backfill already queued elsewhere in this file.
+
 ### Still to do
 
-1. **No live render yet.** Nothing here has produced a real ad.
-2. **Size the re-derive** before deploying (count `CreativeDirectionArtifact` rows).
-3. **First live check:** one `meta_static` run on a brand whose `brandReviews.rating` clears
-   4.39, on a product with **no** product rating but a comment-tier quote — the exact shape
-   that failed. Expect `intent=social_proof_led` with **no** `fell back from`, and stars
-   labelled "brand reviews" beside the quote. 3 billable submits (~$0.22).
-4. Re-run the template-mix log query afterwards to confirm the ratio actually moves.
+1. **Size the re-derive** — still not measured (counting `CreativeDirectionArtifact` rows needs prod
+   DB access). Lower risk than first written: the shadow re-derive is **lazy**, one extra call the
+   first time each product is generated after deploy, not a deploy-time bulk charge.
+2. **Exercise Change C for real** once a brand has both a >4.39 brand rating and comment-tier quotes.
+3. **Re-run the template-mix log query** over a few days to confirm the ratio moves in aggregate —
+   one run with 3 distinct styles is consistent with the fix but is not statistics.
+
+### FOUND WHILE VERIFYING — the Slack run feed is dead on WEB, silently
+
+Owner: *"I am not seeing anything running in slack?"* Correct, and **unrelated to this change**.
+The WORKER logs `🔔 alerts: Slack configured; watchdog every 5m` on every boot (16:21, 16:58, 17:01,
+18:12, 18:37Z on 08-10). **The WEB service never logs it** — while it does log every other credential
+it holds (Gemini key, SerpAPI key, `RENDER_AUTH_TOKEN`). The per-run feed posts from the **web**
+process (`🚀 [campaignRun …] start` is a WEB line, `services/runFeedService.js`), and that path is
+deliberately fire-and-forget so it never sits on a render — so a missing `SLACK_BOT_TOKEN` fails with
+**no error line at all**. A fully healthy run produced zero Slack messages.
+Same class as the 2026-08-04 WORKER-missing-`ATLAS_API_KEY` gap: a config gap, not a design choice.
+**Worth hardening:** log a positive "Slack NOT configured" line at boot so this cannot hide again
+(CLAUDE.md already warns `res.ok` is not delivery).
+
+Also re-observed in the same WEB boot log, both already known-open above and neither addressed here:
+`RENDER_AUTH_TOKEN` is **EXPIRED** (`exp=2026-05-07`), and `FRONTEND_URL` still points at
+`https://liquidretail.netlify.app`, the **stale** pre-transfer Netlify site.
 
 ### Also corrected here — the `wantGpt` hypothesis (carried over from `fix/brand-led-static-copy`)
 
