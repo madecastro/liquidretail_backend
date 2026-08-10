@@ -2234,6 +2234,22 @@ async function checkPhase4Tier2Executors() {
     `routes/media.js filters deletedAt=null in the list query`);
 }
 
+// ── 33. YOLO_SERVICE_URL env override pinned ──────────────────────
+//
+// The 2026-08-10 prod-staging split introduced two backend envs that
+// each need to hit their own YOLO Docker service. yoloService.js
+// previously hard-coded the URL — if that regression re-lands, prod
+// cross-hits staging YOLO and every detect is wrong. Source-scan
+// asserts the env-override pattern is intact.
+{
+  const yoloSrc = fs.readFileSync(path.join(__dirname, '..', 'services', 'yoloService.js'), 'utf8');
+  assert(/process\.env\.YOLO_SERVICE_URL/.test(yoloSrc),
+    `yoloService.js reads YOLO_SERVICE_URL from env — CROSS-ENV YOLO REGRESSION IF THIS FAILS`);
+  // Should still have a fallback so single-env deploys keep working.
+  assert(/yolo-microservice\.onrender\.com/.test(yoloSrc),
+    `yoloService.js retains the legacy YOLO URL as env-unset fallback`);
+}
+
 // ── 32. T0 smoke suite (catches ReferenceError / TypeError on happy path) ─
 //
 // The 2026-08-06 outage on agent.searchAcrossBrands (advOid-not-defined)

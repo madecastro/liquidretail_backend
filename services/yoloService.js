@@ -1,7 +1,11 @@
 const axios = require('axios');
 const FormData = require('form-data');
 
-const YOLO_URL = 'https://yolo-microservice.onrender.com';
+// Env-driven so prod + staging can each target their own YOLO Docker
+// service. Fallback matches the pre-2026-08-10-split hard-coded URL
+// so an env that never sets YOLO_SERVICE_URL (local dev, one-service
+// legacy) still works.
+const YOLO_URL = process.env.YOLO_SERVICE_URL || 'https://yolo-microservice.onrender.com';
 
 async function detectMultipleProducts(imageBuffer) {
   const form = new FormData();
