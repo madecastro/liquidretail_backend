@@ -688,12 +688,22 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
     // resolveCoherentSocialProof. With a quote on frame, an unstamped pair stays
     // withheld, which is the pre-existing fail-closed rule, not a new one.
     const unstampedFallback = (!proof.rating_source && liPair && !quoteText) ? liPair : null;
+    // STATIC ONLY — owner directive 2026-08-07. Lets a comment/product-tier quote
+    // keep printing AND still show scope-labelled brand stars ("4.6 ★ · 15000
+    // brand reviews") instead of the quote hard-nulling the numbers and dropping
+    // social_proof_led to objection_resolved (7 of 18 renders did exactly that).
+    // Passed ONLY here: resolveCoherentSocialProof defaults it false, so the
+    // video path through buildMetaForAd is unchanged by construction.
+    // Kill switch, no deploy needed to revert.
+    const STATIC_BRAND_STARS_WITH_QUOTE =
+      String(process.env.STATIC_BRAND_STARS_WITH_QUOTE ?? 'true').toLowerCase() !== 'false';
     coherent = resolveCoherentSocialProof({
       quote: quote || null,
       product: productPair || unstampedFallback,
       brand: brandPair,
       brandAttribution: brandAttributionLabel(brand),
       renderedQuoteText: quoteText || null,
+      allowLabeledBrandNumbers: STATIC_BRAND_STARS_WITH_QUOTE,
     });
     console.log(
       `🔒 direct-image proof: source=${coherent.source || 'none'} rating=${coherent.rating || 'none'} ` +

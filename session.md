@@ -5,6 +5,150 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-10 — `ai_social_proof_led` had all but vanished. TWO causes, both fixed. UNCOMMITTED→branch `fix/restore-social-proof-led`
+
+Owner: *"I am not seeing AI social proof led static ads being generated, why is that? I was
+seeing them before."* Correct, and **measured** rather than inferred — Render logs
+2026-07-30..08-06, successful `direct-image ready` events by template:
+
+| template | renders |
+|---|---|
+| `ai_brand_led` | 200+ (hit the query cap) |
+| `ai_editorial` | 111 |
+| `ai_promotional` | 38 |
+| **`ai_social_proof_led`** | **18** |
+| `ai_ugc_led` | 2 |
+
+…and **7 of those 18** logged `intent=objection_resolved(fell back from social_proof_led)`,
+so even the ones that minted often didn't *look* like social proof.
+
+**TWO INDEPENDENT CAUSES. Neither is the one I first reported — read the correction.**
+
+**Cause 1 — the Director had no criteria for picking the style.** `Ad.template` comes from
+`routing.creative_style` via `CREATIVE_STYLE_TO_TEMPLATE[style] || 'ai_brand_led'`, and the
+live round prompt's entire guidance was one bare enum line. The string `social_proof_led`
+appeared **exactly once** in `aiCreativeDirectorService.js` — in the enum — and in **zero**
+guidance. Unrecognised/absent → silently `ai_brand_led`. That default plus no criteria is
+the 11:1 skew.
+**CORRECTION, do not re-chase:** I first blamed the HONESTY RULE for suppressing the style.
+**Wrong.** That rule constrains `social_proof_type` and two *archetypes*
+(`stat_led_social_proof`, `hero_quote_overlay`) and **never mentions `creative_style`**. The
+2026-07-30 `isProductScoped` brand-proof withholding still contributes, but only
+*indirectly* — it empties `social_proof_signal` so nothing suggests the style.
+
+**Cause 2 — tier coherence hard-nulled usable brand stars.** No product rating + a
+comment-tier quote on frame → `resolveCoherentSocialProof` withheld brand numbers
+(invariant #4) → `d.rating` undefined → `INTENTS.social_proof_led.eligible` fails (its
+`core` **is** `RATING`) → `FALLBACK_ORDER` → `objection_resolved`. Quote precedence is
+product → category → comment → brand, so comment-tier quotes are the *common* case. **The
+4.39 star floor was NOT the blocker** — a 4.6/15,000 brand rating clears it easily; it was
+withheld by tier, not by the gate.
+
+### What shipped (3 changes, 1 new harness)
+
+- **A. `buildPromptRound`** — real per-style selection criteria (with `brand_led` named the
+  *default of last resort*), `creative_style` added to the diversity axes, and a **reserved
+  slot**: when proof exists, ≥1 of 3 concepts must be `social_proof_led`. Gated on
+  `hasUsableProof`, computed in JS as the **exact inverse** of the honesty rule's condition
+  — they must never both fire, else the prompt demands proof and forbids it in the same
+  breath (the PR #61 self-contradiction class).
+- **B. `DIRECTOR_PROOF_MENU_ENABLED=true`** + **`DIRECTOR_SIGNALS_VERSION` 3.1.0 → 3.2.0**.
+  The bump is mandatory, not cosmetic (cache-hit key; without it every cached artifact keeps
+  the narrower brief and the flip is a silent no-op). Honesty rule amended **under the same
+  flag** so it can't forbid proof the menu offers. **Flag-off restores the prompt
+  byte-for-byte, original honesty string included — verified by structured diff across 5
+  proof shapes × 4 formats.**
+  ⚠️ **ONE-TIME SPEND, accepted:** the constant gates the *shadow* `directConcepts` path,
+  which is `await`ed on live expansion → one paid re-derive per unique
+  (brand,product,campaignKind,creativeIntent,platformFormat) on next request. Bounded,
+  self-healing. **NOT yet sized against prod — do that before deploy.**
+- **C. Owner override of invariant #4** (opt-in `allowLabeledBrandNumbers`, **default
+  false**): a labelled brand rating may now sit beside a product/comment-tier quote on
+  **static only**. Owner: *"We can have both and clearly demarcate brand level stars… The
+  positive comment is different and better social proof than brand level stars"* / *"include
+  a 'Brand Reviews' next to the stars."* Video is unchanged **by construction** — the
+  default is false and only `directImageRenderService` passes true. The exception sits
+  **after** both product attempts (product numbers always win; it can only ADD proof), and
+  returns `source:'brand'` so `packCoherentProof` always attaches `BRAND_SCOPE_LABEL` —
+  the count cannot reach a surface unscoped. Kill switch
+  **`STATIC_BRAND_STARS_WITH_QUOTE=false`**, no deploy.
+- **NEW `scripts/verifySocialProofRestoration.js` — 35 checks, revert-proven on 13
+  mutations.** Runs standalone (no `NODE_PATH` crutch needed — verified, not assumed).
+
+### THE ADVERSARIAL PASSES EARNED THEIR KEEP — read this before touching the exception
+
+Two independent high-effort Grok passes on the finished diff. **28 green checks, a full
+suite, and my own line-by-line read had all missed three real defects**, two HIGH. Every
+finding below was reproduced by direct probe before being fixed, and each fix is
+revert-proven:
+
+1. **HIGH — an UNSCOPED rating could print.** `packCoherentProof` derives `reviewsText` from
+   the review COUNT, so a stars-only brand pair (`{rating:4.7, reviewCount:null}`) returned
+   `source:'brand'` with `reviewsText:null`, and `staticAdIntents`' RATING line fell through
+   to a bare **`4.7 ★`** sitting beside a product/comment testimonial — no "brand reviews"
+   qualifier at all. That is precisely the misattribution the owner's instruction exists to
+   prevent, **and the code's own comment asserted it was structurally impossible.** Fix: a
+   normalized brand count is now REQUIRED (no count → no label vehicle → refuse).
+2. **HIGH — the harness could never have caught #1.** The original C3 only ever fixtured a
+   brand pair WITH a count. A check that cannot fail is not a check (CLAUDE.md §5).
+3. **MED — the reserved slot would have AMPLIFIED the bug.** It counted a quote or comment
+   alone as "usable proof" and forced `creative_style="social_proof_led"`, but render
+   eligibility is **rating-only** — so quote-only products would mint `ai_social_proof_led`
+   and then fall straight back to `objection_resolved`. Fix: the slot is gated on a RATING
+   being reachable.
+
+Also fixed from the same passes: the opt-in gate was truthy so the literal string `"false"`
+opted **in**; `allowBrandCountWithoutStars:true` printed a brand volume claim beside a
+product testimonial while still leaving the intent ineligible (all risk, no benefit);
+`hasUsableProof` counted `proof_options` ungated by the menu flag, so a stale summary could
+fire the reserved slot while the unamended honesty rule demanded `"none"`; the kill switch
+was documented but **not committed** to `defaults.env`; and two stale absolutes
+(`"No brand fallback (R1)"`, and a JSDoc claiming product/comment quotes can never reach
+brand numbers) sat directly above the branch that now contradicts them.
+
+**A FACTUAL ERROR I WROTE, corrected here so nobody re-derives it:** I claimed that without
+the `DIRECTOR_SIGNALS_VERSION` bump the proof-menu flip would be "a silent no-op". **Wrong.**
+The LIVE path `directConceptsRound` has **no** `signalsVersion` cache gate and re-assembles
+every round — the menu goes live the moment the flag flips. The only gate is
+`aiCreativeDirectorService.js:262`, in the **shadow** `directConcepts` path. The bump buys
+shadow correctness and costs one re-derive per shadow key; it is not what makes the flip work.
+
+**Known accepted residual (pinned by C7e, not a bug):** a product pair with a sub-floor
+rating but a non-zero count returns `product-count`, short-circuiting the exception, so that
+shape still falls back. Fixing it means brand numbers displacing a product-tier number — a
+second override nobody has approved. Most products have no product rating at all, so the
+dominant case IS fixed.
+
+**Suite: 73 scripts, 1 failing — `verifyBrandFieldNames.js`, and it is PRE-EXISTING on
+main, not mine.** It correctly flags
+`services/capabilityExecutors/catalogSyncFromGenericSitemap.js:28`
+`.select('_id name websiteUrl shopifyUrl')` — `shopifyUrl` is not a top-level `brandSchema`
+field, so that read is permanently `undefined` (the silent-`.select()` trap, CLAUDE.md §4).
+Verbatim on `origin/main`; spun out as its own task.
+
+### Still to do
+
+1. **No live render yet.** Nothing here has produced a real ad.
+2. **Size the re-derive** before deploying (count `CreativeDirectionArtifact` rows).
+3. **First live check:** one `meta_static` run on a brand whose `brandReviews.rating` clears
+   4.39, on a product with **no** product rating but a comment-tier quote — the exact shape
+   that failed. Expect `intent=social_proof_led` with **no** `fell back from`, and stars
+   labelled "brand reviews" beside the quote. 3 billable submits (~$0.22).
+4. Re-run the template-mix log query afterwards to confirm the ratio actually moves.
+
+### Also corrected here — the `wantGpt` hypothesis (carried over from `fix/brand-led-static-copy`)
+
+That branch's only unmerged commit (`de4a31ae`) was a session.md-only correction; its code
+(`7c7acf86`, `4c5bda87`) has been on main since `fc42bbcd` (2026-08-04). Folding the
+correction in so it isn't lost with the branch: **the `wantGpt`/`OPENAI_API_KEY` gate fix is
+a correct latent-bug fix but was NOT the cause of the empty `ai_brand_led` ads.** Measured
+against prod: `enrichmentSources` contains `'gpt'` for **21/31 brands** and `summary` is
+populated for the same 21 — the tier *ran*. `OPENAI_API_KEY` is set on both web and worker,
+so the gate passed. The real story was the Director reading `brand.description` (a
+non-existent field) instead of `brand.summary`. Do not describe the gate as the cause.
+
+---
+
 ## 2026-08-10 — STATIC ADS 100% DEAD: Atlas started refusing `temperature` on Claude 5. PR #108, live `cb5150ca`
 
 Owner: *"I am not seeing any static ads being generated."* Every concept-driven expansion

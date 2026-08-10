@@ -483,17 +483,54 @@ function packCoherentProof({ quote, quoteTier, rating, reviewCount, source, bran
  *
  * 4. NEVER:
  *    - product/comment quote + brand numbers (stars or count)
+ *      ⚠️ OWNER-APPROVED EXCEPTION, 2026-08-07 — opt-in ONLY via
+ *      `allowLabeledBrandNumbers` (default false), used only by the static
+ *      social-proof path. See "THE ONE EXCEPTION" below. Every other caller,
+ *      including all of video, still gets this bullet enforced absolutely.
  *    - brand/category quote + product numbers
  *    - rating from tier A + count from tier B
  *    - brand-count / product-count without a coherent quote on frame
  *    - brand stars earned via the volume exception (product-only; see
  *      BRAND_VOLUME_EXCEPTION_ENABLED for the one-line overrule)
  *
+ * THE ONE EXCEPTION — `allowLabeledBrandNumbers` (owner directive 2026-08-07).
+ *
+ * The original rule exists because a brand-wide review count sitting next to one
+ * product's testimonial reads as THAT product's review volume. That reasoning is
+ * still correct and is why this stays opt-in and default-off.
+ *
+ * What the owner decided, verbatim: *"I don't want brand level stars to block a
+ * comment tier quote. We can have both and clearly demarcate brand level stars…
+ * The positive comment is different and better social proof than brand level
+ * stars"* and *"include the comment and then use brand level stars and include a
+ * 'Brand Reviews' next to the stars."*
+ *
+ * Why it is safe ENOUGH here, and what actually carries that safety: the
+ * misattribution risk is a LABELLING problem, and the label is mechanical, not
+ * advisory. Returning source:'brand'/'brand-count' makes packCoherentProof emit
+ * reviewsText through formatBrandReviewsText, which always appends
+ * BRAND_SCOPE_LABEL ("brand reviews") — so the count cannot reach a surface
+ * unscoped. INTENTS.social_proof_led prefers that scoped string over any
+ * re-derived unscoped one (staticAdIntents.js), which is what closes the loop.
+ *
+ * WHY THIS WAS WORTH DOING: measured in production, 7 of 18 ai_social_proof_led
+ * renders fell back to objection_resolved because a comment-tier quote had
+ * hard-nulled otherwise-usable brand stars, leaving the intent with no rating —
+ * and the whole point of that intent is the rating.
+ *
+ * DO NOT "restore the invariant" by deleting the exception. It is deliberate and
+ * owner-confirmed; this repo has precedent (CLAUDE.md §00, the PR #61 rollback)
+ * of a later session helpfully undoing an intentional decision. Flip
+ * STATIC_BRAND_STARS_WITH_QUOTE=false instead — no deploy needed.
+ *
  * HOW R1 closes without changing resolveAtomicRatingPair's contract: this
  * function WITHHOLDS the ineligible side's inputs entirely before delegating
- * to resolveAtomicRatingPair, so a product/comment quote can never reach
- * brand numbers and vice versa. The pair resolver still prefers product then
- * brand when both sides are present (rating-only ads).
+ * to resolveAtomicRatingPair, so a brand/category quote can never reach product
+ * numbers, and a product/comment quote can never reach brand numbers UNLESS the
+ * caller passes `allowLabeledBrandNumbers` (default false — see "THE ONE
+ * EXCEPTION"), in which case it may reach SCOPE-LABELLED brand STARS only, and
+ * only after both product attempts have failed. The pair resolver still prefers
+ * product then brand when both sides are present (rating-only ads).
  *
  * Inputs are PRE-BUNDLED pairs (product snapshot, brand snapshot) — never two
  * independently-sourced scalars. That is the R2 hole.
@@ -541,6 +578,11 @@ function resolveCoherentSocialProof({
   brand = null,
   brandAttribution = null,
   renderedQuoteText = null,
+  // OPT-IN, DEFAULT FALSE — see "THE ONE EXCEPTION" in the JSDoc above.
+  // Defaulting to false is what makes every existing caller (all of video via
+  // buildMetaForAd, and every harness) byte-identical BY CONSTRUCTION rather
+  // than by assertion. Only the static social-proof path passes true.
+  allowLabeledBrandNumbers = false,
 } = {}) {
   const productPair = product && typeof product === 'object' ? product : null;
   const brandPair = brand && typeof brand === 'object' ? brand : null;
@@ -578,7 +620,12 @@ function resolveCoherentSocialProof({
   // ── Quote on frame: tier locks the number side; withhold the other ──
   if (onFrame && quoteTier) {
     if (side === 'product') {
-      // Product/comment quote → product numbers ONLY. No brand fallback (R1).
+      // Product/comment quote → product numbers first, and product numbers are
+      // the ONLY ones that can win here unless the caller passed the opt-in
+      // (see "THE ONE EXCEPTION" below, default off). Was "No brand fallback
+      // (R1)" — that absolute is no longer true and a stale absolute sitting
+      // directly above the branch that contradicts it is how this file gets
+      // misread.
       const productRating = productPair ? productPair.rating : null;
       const productReviewCount = productPair ? productPair.reviewCount : null;
       const productStarMin = productStarFloorForCount(productReviewCount);
@@ -627,6 +674,72 @@ function resolveCoherentSocialProof({
           brandAttribution: null,
         });
       }
+
+      // ── THE ONE EXCEPTION (owner 2026-08-07, opt-in) ───────────────────
+      // Product side yielded nothing at all: no product stars, no product
+      // count. Rather than withhold every number and let the intent collapse
+      // to objection_resolved, fall back to BRAND STARS — but only when the
+      // caller explicitly opted in, and only ever scope-LABELLED.
+      //
+      // Ordering is load-bearing: this sits AFTER both product attempts, so a
+      // product-tier number always wins when one exists. The exception can only
+      // ever ADD proof where there was none — it can never displace product
+      // numbers with brand ones.
+      //
+      // THREE CONSTRAINTS, each closing a hole two independent adversarial
+      // passes found in the first draft of this block. Do not relax any of them
+      // without re-reading those findings:
+      //
+      //   (a) `=== true`, not truthiness. The first draft used `if (flag)`, so a
+      //       caller forwarding a raw env STRING opted in on the literal
+      //       "false" (probed: it returned brand stars). The static caller
+      //       coerces correctly today, but the chokepoint must not depend on
+      //       every future caller being careful.
+      //
+      //   (b) A normalized brand COUNT is REQUIRED. The scope label is only
+      //       mechanical because packCoherentProof derives reviewsText from the
+      //       count via formatBrandReviewsText — and that returns null for a
+      //       null count. So a stars-only brand pair (rating 4.7, count null)
+      //       produced source:'brand' with reviewsText:null, and
+      //       staticAdIntents' RATING line then fell through to a bare
+      //       "4.7 ★" sitting beside a product/comment testimonial with NO
+      //       "brand reviews" qualifier — exactly the misattribution the owner's
+      //       "Brand Reviews next to the stars" instruction exists to prevent,
+      //       and exactly what this exception's own docs wrongly claimed was
+      //       impossible. No count → no label vehicle → refuse outright.
+      //
+      //   (c) allowBrandCountWithoutStars STAYS FALSE here. resolveAtomicRating-
+      //       Pair's own contract says to set it true ONLY when the accompanying
+      //       quote is brand-tier; this quote is product/comment-tier. It also
+      //       buys nothing: a count with rating:null still fails
+      //       INTENTS.social_proof_led.eligible (whose core IS the rating), so
+      //       it would print a brand volume claim beside a product testimonial
+      //       while still collapsing the intent. Stars-only is both safer and
+      //       the only shape that actually fixes the reported bug.
+      const exBrandCount = brandPair ? normalizeReviewCount(brandPair.reviewCount) : null;
+      if (allowLabeledBrandNumbers === true && exBrandCount != null) {
+        const exPair = resolveAtomicRatingPair({
+          productRating: null,
+          productReviewCount: null,
+          brandRating: brandPair ? brandPair.rating : null,
+          brandReviewCount: exBrandCount,
+          brandAttribution,
+          allowBrandCountWithoutStars: false,
+          brandStarMin: brandStarFloorForCount(exBrandCount),
+        });
+        // Stars only. 'brand-count' is deliberately NOT accepted — see (c).
+        if (exPair.source === 'brand' && exPair.rating) {
+          return packCoherentProof({
+            quote,
+            quoteTier,
+            rating: exPair.rating,
+            reviewCount: exPair.reviewCount,
+            source: 'brand',
+            brandAttribution,
+          });
+        }
+      }
+
       return emptyCoherentProof(quote, quoteTier);
     }
 

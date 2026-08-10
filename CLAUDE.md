@@ -114,6 +114,46 @@ cascades + SUBHEAD role revert together). `ai_ugc_led` / `ai_editorial` still
 fall to `product_first_lifestyle` (unmapped). Full write-up:
 `docs/PIPELINES.md` §5 *Brand-led intent + copy cascade*.
 
+**WHICH TEMPLATE an ad becomes is the DIRECTOR's choice, not the operator's —
+and the wizard no longer offers a template picker at all.** The frontend hardcodes
+all five `ai_*` ids into every request (`GenerateAds/index.tsx`
+`DEFAULT_TEMPLATE_IDS`; the Settings step was dropped 2026-06-12, `52cf33c`), and
+under `AI_CONCEPT_DRIVEN=true` the *actual* template comes from the Director's
+`routing.creative_style` via
+`CREATIVE_STYLE_TO_TEMPLATE[style] || 'ai_brand_led'`
+(`campaignAdsGenerationService.js`) — so an unrecognised or absent style silently
+becomes **`ai_brand_led`**. That default, plus a round prompt whose entire
+creative_style guidance was one bare enum line, is why production measured
+**`ai_brand_led` 200+ renders vs `ai_social_proof_led` 18** over
+2026-07-30..08-06. The string `social_proof_led` appeared exactly **once** in
+`aiCreativeDirectorService.js` (the enum) and in **zero** prompt guidance.
+Fixed 2026-08-10: `buildPromptRound` now carries per-style selection criteria
+(with `brand_led` explicitly named the *default of last resort*),
+`creative_style` is a listed concept-diversity axis, and when proof data exists
+a **reserved slot** requires ≥1 of the 3 concepts to be `social_proof_led`.
+**The reserved slot fires only on a RATING being reachable, not on any proof** —
+`INTENTS.social_proof_led.eligible` is rating-only, so reserving a slot on the
+strength of a quote or comment alone would mint `ai_social_proof_led` on products
+that then fall back at render, *amplifying* the collapse this fixes (adversarial
+finding; pinned by A5b). That condition is a strict subset of "the HONESTY RULE
+does not fire" — **the two must never both be active**, or the prompt demands a
+proof concept while forbidding proof (the self-contradictory-prompt class that
+forced the §00 PR #61 rollback). The `proof_options` term is gated on the **same
+flag** as the honesty rule's `proof_options` clause, so a stale or injected
+summary cannot desynchronise them (pinned by A6b).
+`DIRECTOR_PROOF_MENU_ENABLED` is now **true** (`config/defaults.env`), which is
+what lets a product-scoped run ground a proof concept on scope-labelled brand
+numbers; flipping it back off restores the pre-change prompt byte-for-byte,
+**including** the original honesty-rule string. Paired with
+**`DIRECTOR_SIGNALS_VERSION` 3.1.0 → 3.2.0**. ⚠️ **Scope of that bump, stated
+correctly because an earlier version of this note got it wrong:** the LIVE path
+`directConceptsRound` has **no** `signalsVersion` cache gate and re-assembles
+every round, so the menu takes effect with or without the bump. The only gate is
+at `aiCreativeDirectorService.js:262` in the **shadow** `directConcepts` path —
+so the bump buys shadow correctness and costs one paid re-derive per shadow cache
+key, and is **not** what makes the flip work. Pinned by
+`scripts/verifySocialProofRestoration.js` groups A/B.
+
 ### The overlay is PREVIEW ONLY — and it is not the titling
 
 Two different things, repeatedly confused, so state both:
@@ -760,6 +800,54 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   onto the Ad** — the derived stack is render-call-only, so the kill switch
   (`REGEN_RESEED_CATALOG_FIRST=false`) stays effective on the next regen.
   Pinned by `scripts/verifyRegeneration.js` (R3 / R3b / R3c).
+- **A LABELLED brand rating MAY now sit beside a product/comment-tier quote on
+  STATIC — owner override of tier-coherence invariant #4, 2026-08-07. Do NOT
+  "restore the invariant".** `resolveCoherentSocialProof`
+  (`services/ratingDisplay.js`) used to hard-null brand numbers whenever a
+  product/comment-tier quote was on frame, because a brand-wide count beside one
+  SKU's testimonial reads as that SKU's volume. **Measured cost of that rule:
+  7 of 18 `ai_social_proof_led` renders (2026-07-30..08-06) fell back to
+  `objection_resolved`** — the comment-tier quote nulled otherwise-usable brand
+  stars, and `INTENTS.social_proof_led`'s `core` **is** the rating, so the ad
+  lost the very thing it exists to show. Owner, verbatim: *"I don't want brand
+  level stars to block a comment tier quote. We can have both and clearly
+  demarcate brand level stars … The positive comment is different and better
+  social proof than brand level stars"* / *"include the comment and then use
+  brand level stars and include a 'Brand Reviews' next to the stars."*
+  **How it is contained — all three matter:** (1) the behaviour is an **opt-in
+  parameter** `allowLabeledBrandNumbers`, **default `false`**, so every other
+  caller — *including the whole video path via
+  `brandScriptExecutor.buildMetaForAd`* — is unchanged **by construction, not by
+  assertion**; only `directImageRenderService.buildIntentData` passes `true`.
+  (2) The exception sits **after** both product attempts, so a product-tier
+  number always wins and the exception can only ever ADD proof where there was
+  none, never displace product numbers with brand ones. (3) It returns
+  `source:'brand'` — **stars only** — which makes `packCoherentProof` derive
+  `reviewsText` via `formatBrandReviewsText`, always carrying
+  `BRAND_SCOPE_LABEL` (`"brand reviews"`), and `INTENTS.social_proof_led`
+  prefers that scoped string over any re-derived unscoped one.
+  **THREE CONSTRAINTS THAT LOOK OPTIONAL AND ARE NOT** — each closes a hole two
+  independent adversarial passes found in the first draft, all three
+  revert-proven: (a) the gate is **`=== true`**, not truthiness — a caller
+  forwarding a raw env string opted in on the literal `"false"`; (b) a
+  normalized brand **count is REQUIRED**, because `reviewsText` is derived from
+  the count, so a stars-only brand pair (rating, `reviewCount: null`) produced
+  `reviewsText: null` and `staticAdIntents` then rendered a **bare `4.7 ★`**
+  beside a product/comment testimonial with no qualifier — no count means no
+  label vehicle, so it refuses; (c) **`allowBrandCountWithoutStars` stays
+  false** — a brand count with `rating: null` still fails
+  `social_proof_led.eligible`, so it would print a brand volume claim beside a
+  product testimonial *and* still collapse the intent. The fail-closed
+  `renderedQuoteText` guard is untouched. **Known accepted residual:** a product
+  pair with a sub-floor rating but a non-zero count returns `product-count` and
+  short-circuits the exception, so that shape still falls back — fixing it would
+  mean brand numbers displacing a product-tier number, a second override nobody
+  has approved. Pinned (including that residual) by
+  `scripts/verifySocialProofRestoration.js` groups C/D — **35 checks,
+  revert-proven on 13 mutations**. Kill switch
+  **`STATIC_BRAND_STARS_WITH_QUOTE=false`** (committed in `config/defaults.env`)
+  reverts with no deploy. Precedent for why this note exists at all: §00's
+  PR #61 rollback, where a later session "fixed" a deliberate decision.
 - **Customer quotes: `llm-web` is PRINTABLE; attribution is stripped.**
   Prior denylist / "llm-web never prints" claims were **false**.
   `services/providers/geminiSearchProvider.js:254,399` use
