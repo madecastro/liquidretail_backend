@@ -28,7 +28,7 @@
 
 const axios = require('axios');
 const { trackLlmCall } = require('./costTracker');
-const { resolveModel } = require('./atlasModelMap');
+const { resolveModel, rejectsSamplingParams, stripSamplingParams } = require('./atlasModelMap');
 
 const ATLAS_CHAT_URL = (process.env.ATLAS_TEXT_BASE_URL || 'https://api.atlascloud.ai/v1') + '/chat/completions';
 const DIRECT_URLS = {
@@ -94,6 +94,11 @@ function buildAtlasBody(params, atlasId) {
   if (/^openai\//.test(atlasId) && body.reasoning_effort === undefined) {
     body.reasoning_effort = 'low';
   }
+  // Claude 5 rejects temperature/top_p/top_k with a bare 400 — see
+  // atlasModelMap.rejectsSamplingParams for the live probe and the outage
+  // it caused. Stripped in the transport so every caller is covered,
+  // including any future role repointed at a Claude 5 model.
+  if (rejectsSamplingParams(atlasId)) stripSamplingParams(body);
   if (body.max_tokens != null) {
     // Clamp the caller's budget, then ALWAYS add the full reserve on top —
     // a combined clamp could silently swallow the reserve at high caller
