@@ -393,6 +393,38 @@ function buildFanaticsCorpus() {
   checkEq('J1 maxOptions=15 caps list length', capped.length, 15);
 }
 
+// ── L. Label humanisation — acronyms, and `key` stays exact ───────────
+// Presentation only, but a mangled "Nfl" is what an internal operator reads
+// when picking categories. `key` must NEVER be reshaped — it is the matcher.
+{
+  const segs = ['nfl', 'mlb', 'nhl', 'nba', 'wwe', 'mls', 'wnba', 'milb',
+    'nascar', 'college', 'pop-culture', 'soccer-national-teams'];
+  const urls = [];
+  for (const s of segs) {
+    for (let i = 0; i < 30; i += 1) {
+      urls.push(`https://www.fanatics.com/${s}/team-${i}/thing-${i}/o-1+p-${i}00000`);
+    }
+  }
+  const byKey = new Map(
+    deriveCategoryOptions(urls, { minCount: 5, maxOptions: 40 })
+      .filter(o => o.depth === 1)
+      .map(o => [o.key, o.label])
+  );
+  const want = {
+    nfl: 'NFL', mlb: 'MLB', nhl: 'NHL', nba: 'NBA', wwe: 'WWE', mls: 'MLS',
+    wnba: 'WNBA', milb: 'MiLB', nascar: 'NASCAR',
+    college: 'College',
+    'pop-culture': 'Pop Culture',
+    'soccer-national-teams': 'Soccer National Teams'
+  };
+  for (const [k, label] of Object.entries(want)) {
+    checkEq(`L label for "${k}"`, byKey.get(k), label);
+  }
+  // The matchable key must remain byte-exact lowercase — never humanised.
+  check('L keys stay exact (never humanised)',
+    [...byKey.keys()].every(k => k === k.toLowerCase() && !k.includes(' ')));
+}
+
 // ── Summary ───────────────────────────────────────────────────────────
 
 console.log('');

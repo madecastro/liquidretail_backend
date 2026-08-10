@@ -104,9 +104,22 @@ function categoryPathSegs(url) {
   return segs.length ? segs : null;
 }
 
+// PRESENTATION ONLY — `key` stays byte-exact for matching; this list just stops
+// labels reading "Nfl"/"Mlb". Naive title-casing mangles acronyms, and no generic
+// rule catches them (a no-vowel test gets NFL/MLB/NHL right but misses NBA, WWE,
+// WNBA). So: a small curated set, extensible, with title-case as the fallback.
+// Mixed-case entries are emitted verbatim (MiLB, NASCAR).
+const LABEL_ACRONYMS = new Map(
+  [
+    'NFL', 'MLB', 'NHL', 'NBA', 'MLS', 'WWE', 'WNBA', 'MiLB', 'NCAA', 'UFC',
+    'NASCAR', 'F1', 'EPL', 'PGA', 'ATP', 'WTA', 'UK', 'US', 'USA', 'TV', 'DIY'
+  ].map(a => [a.toLowerCase(), a])
+);
+
 /**
- * Humanise a raw key: hyphens → spaces, title-case each word. Depth-2
- * keys (`a/b`) join with " / " so the UI can show "Car / Ty Gibbs".
+ * Humanise a raw key: hyphens → spaces, title-case each word, with known
+ * acronyms uppercased. Depth-2 keys (`a/b`) join with " / " so an operator
+ * sees "Car / Ty Gibbs".
  */
 function humanizeKey(key) {
   return String(key)
@@ -115,7 +128,11 @@ function humanizeKey(key) {
       part
         .split('-')
         .filter(Boolean)
-        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .map(w => {
+          const acronym = LABEL_ACRONYMS.get(w.toLowerCase());
+          if (acronym) return acronym;
+          return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+        })
         .join(' ')
     )
     .join(' / ');
