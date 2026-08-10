@@ -27,7 +27,24 @@ const {
   shouldApplyStoredShot
 } = require('./ingestShotClassifyService');
 
-const MAX_ALT_IMAGES = 12;
+// MATERIALISATION cost gate — how many alts get mirrored to Cloudinary +
+// a Media row. SEPARATE knob from CATALOG_MAX_ADDITIONAL_IMAGES (storage,
+// free strings); the two must stay independently tunable so raising one
+// never silently moves the other.
+//
+// Raised 12 → 20 on 2026-08-10 by owner directive: "I don't mind spending
+// the money to mirror images in order to ensure there is stability."
+// Mirroring is what makes a catalog image durable — an un-mirrored
+// merchant URL breaks when the store rotates its CDN or unpublishes the
+// asset. The marginal cost here is Cloudinary storage/bandwidth, NOT AI
+// spend: detect itself is still deferred (CATALOG_DETECT_PRECOMPUTE=false),
+// so extra alts do not each trigger a paid detect run.
+//
+// Invariant: never mirror more than we store — see verifyCatalogImageCap G.
+const MAX_ALT_IMAGES = Math.max(
+  0,
+  parseInt(process.env.CATALOG_MAX_ALT_IMAGES, 10) || 20
+);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function toOid(id) {

@@ -200,8 +200,11 @@ check('mapJsonLdProduct: image string vs array; protocol-relative absolutized', 
     offers: { price: '1.00' }
   }, 'https://example.com/p/2');
   assert.equal(many.imageUrl, 'https://cdn.example.com/1.jpg');
-  assert.equal(many.additionalImages.length, 4);
+  // 6 images → hero + 5 alts under CATALOG_MAX_ADDITIONAL_IMAGES (default 20).
+  // Was hard-capped at 4 alts (slice(1,5)) before the storage-cap unify.
+  assert.equal(many.additionalImages.length, 5);
   assert.equal(many.additionalImages[3], 'https://cdn.example.com/5.jpg');
+  assert.equal(many.additionalImages[4], 'https://cdn.example.com/6.jpg');
 });
 
 check('mapJsonLdProduct: availability URL variants', () => {
