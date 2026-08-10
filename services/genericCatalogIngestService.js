@@ -7,8 +7,10 @@
 // Mirrors services/shopifyPublicIngestService.syncBrandShopifyDirect
 // (progress/abort, CatalogProduct upsert shape, end-of-run detect /
 // enrichment / category-inference trio) but sources the catalog from
-// genericCatalogResolver (mode 'sitemap-jsonld') instead of Shopify
-// storefront endpoints.
+// genericCatalogResolver. Mode is usually 'sitemap-jsonld'; when
+// GENERIC_CATALOG_AUTODETECT senses Shopify the resolver climbs the
+// shopifyAccessResolver ladder and returns source:'shopify-direct'
+// (full image gallery via products.json — see siteFingerprintService).
 //
 // Origin comes from resolveStoreOrigin(brand) — typically
 // brand.apifyDemo.shopifyUrl (reused as "catalog URL" for non-Shopify
@@ -113,6 +115,18 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
 
   const products = (access.products || []).slice(0, CAP);
   const stats = access.stats || {};
+  // CatalogProduct.source is a closed enum. Prefer the resolver's honest
+  // stamp (Shopify ladder → 'shopify-direct'; JSON-LD walk → 'sitemap-jsonld').
+  // Never invent a value outside models/CatalogProduct.js enum.
+  const catalogSource = (() => {
+    if (access.source === 'shopify-direct' || access.source === 'sitemap-jsonld') {
+      return access.source;
+    }
+    // Shopify ladder modes from auto-detect success (mode ≠ sitemap-jsonld)
+    const shopifyModes = new Set(['products-json', 'storefront-graphql', 'sitemap']);
+    if (shopifyModes.has(access.mode)) return 'shopify-direct';
+    return 'sitemap-jsonld';
+  })();
   // Trust the resolver's own cancel signal — do NOT re-poll boundAbort()
   // here: the resolver's first checkpoint() already closed the run handle,
   // after which isBrandAborted can no longer observe the cancel and would
@@ -129,7 +143,8 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
 
   console.log(
     `${LOG}  resolved ${products.length} products via ${access.mode || 'sitemap-jsonld'} ` +
-    `(origin=${access.origin || origin}` +
+    `(source=${catalogSource} origin=${access.origin || origin}` +
+    ` platform=${stats.platform ?? '—'} conf=${stats.confidence ?? '—'}` +
     ` scanned=${stats.urlsScanned ?? '?'} jsonLd=${stats.jsonLdProductsFound ?? '?'}` +
     ` og=${stats.ogFallbackUsed ?? '?'} invalid=${stats.validationFailures ?? '?'}` +
     ` cf=${stats.cfChallenges ?? '?'})` +
@@ -170,7 +185,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
   }
 
   const totalPlanned = products.length || CAP;
-  run?.tick?.(0, totalPlanned, `resolved ${products.length} products via sitemap-jsonld`);
+  run?.tick?.(0, totalPlanned, `resolved ${products.length} products via ${access.mode || catalogSource}`);
   run?.stage?.('saving products to catalog');
 
   // ── Upsert each flat product ─────────────────────────────────────
@@ -243,7 +258,9 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
       const set = {
         advertiserId:     brand.advertiserId,
         brandId:          brand._id,
-        source:           'sitemap-jsonld',
+        // Honest stamp of the rung that produced this product — see
+        // catalogSource above. Must be a CatalogProduct.source enum value.
+        source:           catalogSource,
         externalId,
         itemGroupId:      externalId,
         title:            p.title || '(untitled)',

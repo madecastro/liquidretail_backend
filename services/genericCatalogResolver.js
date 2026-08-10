@@ -58,9 +58,20 @@ const {
 // Distinct from abort (user cancel) and from progressService.MAX_RUN_MS
 // (dead-process safety net for the heartbeat only).
 const { createBudget } = require('./genericCatalogDiscovery/budget');
+// Platform fingerprint (pure) — senses Shopify etc. from pre-fetched
+// homepage + robots so the generic path can climb the right ladder.
+const { fingerprintSite } = require('./siteFingerprintService');
 
 // ── constants ──────────────────────────────────────────────────────
 const LOG = '🗺';
+// Auto-detect Shopify (and other platforms for telemetry) before the
+// sitemap+JSON-LD walk. Default ON: brands on method=generic-sitemap that
+// are actually Shopify were storing ZERO alt images (Shopify JSON-LD only
+// ships the featured image; products.json has the full gallery — measured
+// on pb5star.com 2026-08-10: 100 products, 0 alts via JSON-LD; products.json
+// mean 7.91 images). Flag-off restores byte-identical prior behaviour:
+// no homepage fetch, no fingerprint, no new result keys.
+const AUTODETECT_ENABLED = process.env.GENERIC_CATALOG_AUTODETECT !== 'false';
 // Full-catalog by default — do NOT cap at a small demo number. 10k covers
 // essentially any real catalog; override via GENERIC_CATALOG_LIMIT.
 // NOTE: crawl throughput is ~1 page / HTTP_SCRAPE_MIN_GAP_MS (≈4/s at the
@@ -791,6 +802,9 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
   let crawlDelayMs = 0;
   let cfChallenges = 0;
   let rateLimited = false;
+  // robots body is free once fetched — hand to fingerprintSite so
+  // Shopify's canonical robots signature can fire without a re-fetch.
+  let robotsText = null;
 
   // 1. robots.txt
   try {
@@ -799,6 +813,7 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
     if (res.cfChallenged) cfChallenges += 1;
     if (res.rateLimited) rateLimited = true;
     if (res.ok && res.text) {
+      robotsText = res.text;
       const parsed = parseRobotsForSitemaps(res.text, '*');
       crawlDelayMs = parsed.crawlDelayMs || 0;
       for (const u of parsed.sitemaps) add(u);
@@ -823,7 +838,7 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
     }
   }
 
-  return { sitemaps: discovered, crawlDelayMs, cfChallenges, rateLimited };
+  return { sitemaps: discovered, crawlDelayMs, cfChallenges, rateLimited, robotsText };
 }
 
 /**
@@ -956,8 +971,12 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }
 
 /**
  * resolveGenericCatalog(brand, { run, abortCheck, cap, discoverOnly, categories })
- * → { ok, mode:'sitemap-jsonld', origin, products:[flat], stats, rateLimited?, reason?, warnings?,
+ * → { ok, mode, source?, origin, products:[flat], stats, rateLimited?, reason?, warnings?,
  *     categoryOptions?, categoryPromptSuggested?, discoverOnly?, totalCandidates? }
+ *
+ * mode: 'sitemap-jsonld' | shopify ladder mode ('products-json'|'storefront-graphql'|'sitemap')
+ * source: CatalogProduct.source enum value when AUTODETECT ran
+ *   ('shopify-direct' | 'sitemap-jsonld'). Flag-off omits it (byte-identical).
  *
  * discoverOnly:true — walk sitemaps, derive category options, return WITHOUT
  *   scanning a single PDP (products:[]). Used by the capability preview so an
@@ -966,6 +985,12 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }
  *   matchesAnyCategory BEFORE the PDP scan. Segment-exact match only.
  * Both are gated on GENERIC_CATALOG_CATEGORY_OPTIONS (default true); when
  * false the result is byte-identical to the pre-feature shape (no new keys).
+ *
+ * AUTODETECT (GENERIC_CATALOG_AUTODETECT, default true): after robots/sitemap
+ * discovery, fingerprint the homepage. Shopify high/medium → climb the
+ * existing shopifyAccessResolver ladder (products.json first). Zero products
+ * (e.g. CF-blocked) falls through to sitemap+JSON-LD so coverage is never
+ * lost. Living Spaces (non-Shopify) stays on the JSON-LD path.
  */
 async function resolveGenericCatalog(brand, {
   run = null,
@@ -1028,10 +1053,146 @@ async function resolveGenericCatalog(brand, {
   const crawlDelayMs = disc.crawlDelayMs || 0;
   const pdpGapMs = Math.max(crawlDelayMs - 250, 0);
 
+  // ── Platform auto-detect (Shopify → access ladder) ───────────────
+  // One homepage fetch + pure fingerprint on already-fetched robots.
+  // Flag-off: skip entirely (no new stats keys, no homepage fetch).
+  // discoverOnly: skip delegation — category options still need the
+  // sitemap walk; fingerprint alone is not useful without product import.
+  if (AUTODETECT_ENABLED && !discoverOnly && !(await abortCheck()) && !budget.expired()) {
+    let homepageHtml = null;
+    let homepageHeaders = null;
+    try {
+      run?.stage?.('fingerprinting store platform');
+      const homeRes = await http.fetchText(`${origin}/`, { timeoutMs: 15000, maxBytes: 2_000_000 });
+      if (homeRes.cfChallenged) stats.cfChallenges += 1;
+      if (homeRes.rateLimited) rateLimited = true;
+      if (homeRes.ok && homeRes.text) {
+        homepageHtml = homeRes.text;
+        homepageHeaders = homeRes.headers || null;
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  ${LOG}  homepage fetch for fingerprint: ${err.message}`);
+    }
+
+    const fp = fingerprintSite({
+      homepageHtml,
+      homepageHeaders,
+      robotsText: disc.robotsText || null
+    });
+    stats.platform = fp.platform;
+    stats.confidence = fp.confidence;
+    stats.fingerprintSignals = fp.signals;
+
+    console.log(
+      `   · ${LOG}  fingerprint: platform=${fp.platform} confidence=${fp.confidence}` +
+      (fp.signals.length ? ` signals=[${fp.signals.join(', ')}]` : '')
+    );
+    try { run?.note?.(`platform=${fp.platform} (${fp.confidence})`); } catch { /* optional */ }
+
+    const shopifyEligible =
+      fp.platform === 'shopify' &&
+      (fp.confidence === 'high' || fp.confidence === 'medium');
+
+    if (shopifyEligible && !(await abortCheck()) && !budget.expired()) {
+      stats.shopifyAttempted = true;
+      run?.stage?.('shopify access ladder (auto-detect)');
+      console.log(`   · ${LOG}  Shopify detected — delegating to shopifyAccessResolver`);
+
+      let shopifyAccess = null;
+      try {
+        const { resolveShopifyAccess } = require('./shopifyAccessResolver');
+        // Honour budget via abort wrapper: when the wall-clock expires the
+        // ladder stops climbing; partials already collected are still used.
+        const shopifyAbort = async () => {
+          if (await abortCheck()) return true;
+          if (budget.expired()) {
+            budgetExpired = true;
+            return true;
+          }
+          return false;
+        };
+        shopifyAccess = await resolveShopifyAccess(brand, {
+          run,
+          abortCheck: shopifyAbort,
+          cap: effectiveCap
+        });
+      } catch (err) {
+        console.warn(`   ⚠️  ${LOG}  shopifyAccessResolver threw: ${err.message}`);
+        stats.shopifyError = err.message;
+        shopifyAccess = null;
+      }
+
+      if (shopifyAccess) {
+        if (shopifyAccess.rateLimited) rateLimited = true;
+        stats.shopifyMode = shopifyAccess.mode || null;
+        stats.shopifyProductCount = (shopifyAccess.products || []).length;
+        if (shopifyAccess.discoveredMyshopify) {
+          stats.discoveredMyshopify = shopifyAccess.discoveredMyshopify;
+        }
+        if (shopifyAccess.reason) stats.shopifyReason = shopifyAccess.reason;
+
+        const rawProducts = Array.isArray(shopifyAccess.products)
+          ? shopifyAccess.products.slice(0, effectiveCap)
+          : [];
+
+        if (rawProducts.length) {
+          // Adapt products.json shape → flat generic fields via the SHARED
+          // mapper (mapShopifyNormalizedToFlat) — never a second copy.
+          const mapFlat = ingestHelpers.mapShopifyNormalizedToFlat;
+          const effectiveOrigin = shopifyAccess.origin || origin;
+          const flat = [];
+          for (const p of rawProducts) {
+            try {
+              const m = mapFlat(p, effectiveOrigin, brand);
+              if (m && m.externalId) flat.push(m);
+            } catch (err) {
+              warnings.push(`shopify map failed for ${p && p.id}: ${err.message}`);
+            }
+          }
+
+          if (flat.length) {
+            console.log(
+              `${LOG}  resolveGenericCatalog ok via Shopify auto-detect: ` +
+              `n=${flat.length} mode=${shopifyAccess.mode} origin=${effectiveOrigin}`
+            );
+            const out = {
+              ok: true,
+              mode: shopifyAccess.mode || 'products-json',
+              // CatalogProduct.source enum — honest stamp of the ladder used.
+              source: 'shopify-direct',
+              origin: effectiveOrigin,
+              products: flat,
+              stats,
+              rateLimited
+            };
+            if (warnings.length) out.warnings = warnings;
+            if (budgetExpired) {
+              out.budgetExpired = true;
+              out.partial = true;
+              out.partialReason = 'budget-exceeded';
+              out.reason = budgetReason(`kept ${flat.length} product(s) via Shopify ladder`);
+            }
+            return out;
+          }
+        }
+
+        // Zero products (or all unmappable) — fall through to sitemap+JSON-LD.
+        // Never let the new branch lose coverage the old path had
+        // (e.g. ubeauty.com CF-blocked on every Shopify rung).
+        const fallReason = shopifyAccess.reason ||
+          `Shopify ladder returned 0 products (mode=${shopifyAccess.mode || 'none'})`;
+        stats.shopifyFallthrough = true;
+        stats.shopifyFallthroughReason = fallReason;
+        warnings.push(`Shopify auto-detect fell through: ${fallReason}`);
+        console.log(`   · ${LOG}  Shopify ladder empty — falling through to sitemap+JSON-LD`);
+      }
+    }
+  }
+
   if (!disc.sitemaps.length) {
     const reason = `no sitemaps found at ${origin} — site does not expose XML sitemaps`;
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
-    return {
+    const emptyOut = {
       ok: false,
       mode: 'sitemap-jsonld',
       origin,
@@ -1040,12 +1201,15 @@ async function resolveGenericCatalog(brand, {
       rateLimited,
       reason
     };
+    if (AUTODETECT_ENABLED) emptyOut.source = 'sitemap-jsonld';
+    if (warnings.length) emptyOut.warnings = warnings;
+    return emptyOut;
   }
 
   console.log(`   · ${LOG}  discovered ${disc.sitemaps.length} sitemap(s), crawlDelayMs=${crawlDelayMs}`);
 
   if (await abortCheck()) {
-    return {
+    const abortOut = {
       ok: false,
       mode: 'sitemap-jsonld',
       origin,
@@ -1054,9 +1218,11 @@ async function resolveGenericCatalog(brand, {
       reason: 'aborted during sitemap discovery',
       cancelled: true
     };
+    if (AUTODETECT_ENABLED) abortOut.source = 'sitemap-jsonld';
+    return abortOut;
   }
   if (budget.expired()) {
-    return {
+    const budOut = {
       ok: false,
       mode: 'sitemap-jsonld',
       origin,
@@ -1068,6 +1234,8 @@ async function resolveGenericCatalog(brand, {
       partialReason: 'budget-exceeded',
       reason: budgetReason('timed out during sitemap discovery')
     };
+    if (AUTODETECT_ENABLED) budOut.source = 'sitemap-jsonld';
+    return budOut;
   }
 
   // ── Walk sitemaps → ranked page URLs ─────────────────────────────
@@ -1173,7 +1341,7 @@ async function resolveGenericCatalog(brand, {
       `${(categoryOptions || []).length} category option(s) — no PDP scan`
     );
     run?.stage?.('category options ready');
-    return {
+    const discOut = {
       ok: true,
       mode: 'sitemap-jsonld',
       origin,
@@ -1184,6 +1352,10 @@ async function resolveGenericCatalog(brand, {
       stats,
       rateLimited
     };
+    // discoverOnly skips Shopify delegation; stamp stays sitemap-jsonld
+    // when auto-detect is on (flag-off: no new key).
+    if (AUTODETECT_ENABLED) discOut.source = 'sitemap-jsonld';
+    return discOut;
   }
 
   // Selective import: filter candidates by operator-chosen category keys
@@ -1379,7 +1551,11 @@ async function resolveGenericCatalog(brand, {
 
   // Attach category fields only when the feature flag is on AND we have
   // something to say — keeps flag-off results byte-identical (no new keys).
+  // source is similarly gated on AUTODETECT (flag-off = no new key).
   const attachCategoryFields = (out) => {
+    if (AUTODETECT_ENABLED && out.source == null) {
+      out.source = 'sitemap-jsonld';
+    }
     if (!CATEGORY_OPTIONS_ENABLED) return out;
     if (categoryOptions && categoryOptions.length) {
       out.categoryOptions = categoryOptions;
@@ -1530,5 +1706,6 @@ module.exports = {
   deriveCategoryOptions,
   matchesAnyCategory,
   DEFAULT_CAP,
-  MAX_SITEMAP_URLS
+  MAX_SITEMAP_URLS,
+  AUTODETECT_ENABLED
 };

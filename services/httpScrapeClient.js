@@ -334,12 +334,41 @@ function _headerPick(h, name) {
   return v == null || v === '' ? null : String(v);
 }
 
+// Full lowercase header map for platform fingerprinting (siteFingerprintService).
+// The projection fields below stay for existing callers; `raw` is additive.
+function _rawHeaderMap(h) {
+  const out = Object.create(null);
+  if (!h) return out;
+  try {
+    if (typeof h.forEach === 'function') {
+      h.forEach((value, key) => {
+        if (key == null) return;
+        out[String(key).toLowerCase()] = value == null ? '' : String(value);
+      });
+      return out;
+    }
+  } catch { /* fall through */ }
+  try {
+    if (typeof h === 'object') {
+      for (const k of Object.keys(h)) {
+        const v = h[k];
+        if (v == null || typeof v === 'object') continue;
+        out[String(k).toLowerCase()] = String(v);
+      }
+    }
+  } catch { /* empty */ }
+  return out;
+}
+
 function _resultHeaders(h) {
   return {
     etag: _headerPick(h, 'etag'),
     lastModified: _headerPick(h, 'last-modified'),
     retryAfter: _parseRetryAfter(h),
-    contentType: _headerPick(h, 'content-type')
+    contentType: _headerPick(h, 'content-type'),
+    // Additive: full map so generic-catalog auto-detect can read
+    // powered-by / x-shopid / x-shopify-stage without a second request.
+    raw: _rawHeaderMap(h)
   };
 }
 

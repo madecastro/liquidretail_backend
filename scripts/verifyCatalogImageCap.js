@@ -242,6 +242,53 @@ checkTrue(
   /CATALOG_MAX_ADDITIONAL_IMAGES/.test(genericCode)
 );
 
+// ── R. rawData storage cap on the Shopify→flat mapper ─────────────────
+// A products.json entry MEASURES ~14.7KB (pb5star.com, 2026-08-10) — 1.8x the
+// 8KB cap. The generic path capped rawData long before Shopify auto-detect
+// existed, so an un-capped Shopify branch silently inflates every doc on that
+// path (~147MB extra at a 10k-product catalog).
+{
+  const {
+    mapShopifyNormalizedToFlat: mapFlatR,
+    RAW_DATA_CAP_BYTES: SHOPIFY_RAW_CAP
+  } = require('../services/shopifyPublicIngestService');
+
+  // The two copies of the constant MUST agree — duplicated only to avoid a
+  // circular require (genericCatalogResolver already requires this module).
+  const resolverSrcR = fs.readFileSync(
+    path.join(root, 'services/genericCatalogResolver.js'),
+    'utf8'
+  );
+  const mR = resolverSrcR.match(/RAW_DATA_CAP_BYTES\s*=\s*(\d+)/);
+  checkTrue('R resolver declares RAW_DATA_CAP_BYTES', !!mR);
+  check('R the two rawData caps agree', SHOPIFY_RAW_CAP, mR ? Number(mR[1]) : -1);
+
+  // Small payload passes through untouched (structured access preserved).
+  const smallR = mapFlatR(
+    { id: 1, handle: 'h', title: 'T', images: [{ src: 'https://x/a.jpg' }], variants: [] },
+    'https://x'
+  );
+  checkTrue('R small rawData kept structured', !!(smallR.rawData && smallR.rawData.id === 1));
+
+  // Oversized payload is truncated, not stored whole.
+  const fatR = {
+    id: 2, handle: 'h', title: 'T', images: [], variants: [], blob: 'z'.repeat(20000)
+  };
+  const cappedR = mapFlatR(fatR, 'https://x');
+  checkTrue('R oversized rawData is truncated',
+    !!(cappedR.rawData && typeof cappedR.rawData._truncated === 'string'));
+  // The contract is on the SLICED STRING, not the re-serialised doc: JSON
+  // escaping can push the serialised length past the cap (measured 8654 for a
+  // real pb5star entry, because ~640 chars needed escaping). Assert the thing
+  // that is actually guaranteed, matching the resolver's capRawData semantics —
+  // an assertion on the serialised length would pass only for escape-free
+  // fixtures like the one above and quietly mislead on real data.
+  checkTrue('R truncated slice respects the cap',
+    cappedR.rawData._truncated.length <= SHOPIFY_RAW_CAP);
+  checkTrue('R oversized rawData drops the raw blob',
+    !(cappedR.rawData && cappedR.rawData.blob));
+}
+
 // ── summary ───────────────────────────────────────────────────────────
 const total = pass + failures.length;
 if (failures.length) {
