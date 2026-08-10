@@ -5,6 +5,74 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-10 — Apify comment-refresh cost: preview was 5.75x low, real spend was never read. Branch `fix/apify-comment-cost`
+
+Two money-facing fixes to `media.refreshCommentsFromApify` (Tier 4). Full write-up:
+**`docs/PIPELINES.md` §11** — that section is canonical, this is the handoff summary.
+
+**Verified live 2026-08-10, re-verify before relying on it.** `apify/instagram-scraper`
+is **PAY_PER_EVENT with exactly ONE charge event** (`result` = one dataset row) and
+**NO per-run charge**. $/result is tiered by *Apify plan*: FREE 0.0027 · BRONZE 0.0023 ·
+SILVER 0.0019 · GOLD 0.0015 · PLATINUM 0.0009 · DIAMOND 0.0005. This account is
+**BRONZE** (`GET /v2/users/me` → `plan.id 'STARTER'`, `plan.tier 'BRONZE'`). Cross-checked
+against a settled run: `chargedEventCounts {result:10}` ↔ `usageTotalUsd $0.023`.
+
+**Fix 1 — the estimate.** It was `posts × $0.02` flat, under a comment claiming the actor
+"bills per run + per record" (false on both halves). It never read
+`APIFY_IG_COMMENTS_LIMIT`, so the approval number was *identical* at 50 or 100 comments:
+100 posts × 50 showed **$2.00** against a real **~$11.50**; at 100 comments, still $2.00
+against ~$23. Now `posts × commentLimit × perResultUsd`, with `commentLimit` /
+`perResultUsd` / `estimateBasis` surfaced next to `estimateUsd`. The registry's
+`estimateUsd` (the spend-guard input, also frozen at $2.00) is now a **function** of the
+same env. `APIFY_COMMENTS_PER_UNIT_USD` still honoured if set — limit-blind, and labelled
+`estimateBasis: 'per-post-override'`.
+
+**Fix 2 — measured cost.** `run-sync-get-dataset-items` returns dataset items only, so
+spend was never observed. **Both obvious alternatives are dead ends** (checked against
+Apify's OpenAPI spec — do not re-try them): that endpoint documents only
+`X-Apify-Pagination-*` headers (no run id anywhere), and `run-sync` returns the **OUTPUT
+key-value-store record**, not the run object. So: async `POST /acts/{id}/runs` (the one
+billable call, `maxRedirects: 0`) → long-poll `GET /actor-runs/{id}?waitForFinish=60`
+(60s is Apify's hard ceiling) → dataset items. `usageTotalUsd` + `chargedEventCounts` are
+summed and persisted to **`OperationRun.meta`** via `progressService` — no new collection.
+
+**Two adjacent holes closed in the same pass (both found by adversarial review, neither
+in the original brief):**
+- **The fan-out was uncapped.** Preview quoted `totalSteps: min(targets, 100)` +
+  `capped: true`, but `syncBrandInstagramCommentsApify` ran `Media.find()` with no
+  `.limit()` — a 500-post brand was approved for 100 posts and billed for 500.
+- **`Number(null) === 0`** would have recorded an unsettled run as a **measured $0.00**
+  and skipped the settle-lag re-read. `usd()` could also round a real sub-cent cost to
+  $0.00, which `spendGuard` treats as "declared free" and waves through with no cap check.
+
+**Kill switches, both default ON:** `APIFY_COST_ESTIMATE_V2=false` restores the old cost
+fields exactly; `APIFY_COST_READBACK=false` restores the legacy single sync call.
+`APIFY_IG_COMMENTS_LIMIT` default **unchanged at 50** — raising it is a separate product
+call, and note it buys **recency only** (the actor input schema has no sort parameter;
+newest-first, free usage caps at 15). Ranking by engagement needs local sorting on
+`Comment.likeCount`.
+
+**Test gate:** `scripts/verifyApifyCommentCost.js` — 57 checks, pure `node:assert`,
+revert-proven against **14** mutations. **Lesson worth keeping:** the first cut of the
+`Number(null)` check (K9) was *source-shape only* — it asserted a `numeric()` helper
+existed and no bare `Number(...)` appeared. Adversarial review proved it vacuous: a
+reimplementation named `numeric` that still returned 0 for null passed it. The checks
+that matter now **call** the code (`numeric`, `recordRunCost`, `coerceDatasetItems`,
+`resolveCommentFanoutCap` are exported for exactly that). Prefer behavioural over
+grep-the-source whenever the defect lives in a value, not a name. Suite is now **74** scripts;
+`scripts/verifyBrandFieldNames.js` fails **on pristine `origin/main` too** (2 × `shopifyUrl`
+not on `brandSchema`, in the Shopify sync executors) — pre-existing, untouched here.
+
+**Known follow-ups, deliberately not done:**
+- The legacy transport branch still lacks `maxRedirects: 0`; left byte-identical so the
+  kill switch is a true revert.
+- Apify's run-start accepts **`maxTotalChargeUsd`** — a real per-run hard cost cap we do
+  not use anywhere. Worth wiring as a belt-and-braces money guard.
+- `pullInstagramPosts` / `pullShopifyProducts` now use the measured transport but pass no
+  `costMeta`, so their spend is still unobserved.
+
+---
+
 ## 2026-08-10 — `ai_social_proof_led` had all but vanished. TWO causes, both fixed. UNCOMMITTED→branch `fix/restore-social-proof-led`
 
 Owner: *"I am not seeing AI social proof led static ads being generated, why is that? I was

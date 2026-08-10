@@ -389,9 +389,36 @@ async function syncBrandShopify(brand, run = null) {
 // distinct from Media.source = 'apify-ig' (the ingest path). Comments
 // don't carry an "ingest path" field — the mediaId reference identifies
 // where the parent came from if a consumer needs it.
-async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}) {
+// Resolve the comment fan-out cap. Only an ABSENT limit means uncapped: a
+// supplied-but-invalid one throws rather than silently meaning "no cap",
+// because on a spend path `limit: 0` quietly fanning out over every post is
+// the wrong way to be lenient. Exported so the harness can exercise the
+// polarity without a DB connection.
+function resolveCommentFanoutCap(limit) {
+  if (limit === null || limit === undefined) return null;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n < 1) {
+    throw new Error(
+      `syncBrandInstagramCommentsApify: limit must be a positive number (got ${JSON.stringify(limit)})`
+    );
+  }
+  return Math.floor(n);
+}
+
+// `limit` caps the fan-out. NOT cosmetic: the Tier-4 preview an operator
+// approves has always quoted `totalSteps: Math.min(targets, 100)` and a
+// `capped: true` flag, but this query had no limit, so a brand with 500
+// eligible posts was approved at 100 posts' worth of spend and then billed
+// for 500. Passing the same cap the preview quoted makes the approved plan
+// and the executed plan the same plan. Default stays uncapped so other
+// callers are unaffected.
+async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2, limit = null } = {}) {
   const Comment = require('../models/Comment');
   const { pullInstagramComments } = require('./apifyPullService');
+
+  // Validate the spend cap BEFORE touching the DB — fail fast on a bad
+  // argument, and keep this reachable without a live connection.
+  const cap = resolveCommentFanoutCap(limit);
 
   const brand = await Brand.findById(brandId).select('_id name advertiserId').lean();
   if (!brand) {
@@ -402,14 +429,20 @@ async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}
 
   // Target: every apify-ig Media on the brand with a permalink we can
   // hand to Apify. Skip catalog-product wrappers + soft-deleted.
-  const targets = await Media.find({
+  // Sort is required, not tidiness: a bare .limit() on an unsorted query
+  // takes an arbitrary slice, so which posts get refreshed (and which get
+  // paid for) would vary run to run. _id descending = newest first, and
+  // _id is always present and always indexed.
+  let q = Media.find({
     brandId: brand._id,
     source: 'apify-ig',
     deletedAt: null,
     'metadata.permalink': { $exists: true, $ne: null }
   })
     .select('_id metadata.permalink externalId')
-    .lean();
+    .sort({ _id: -1 });
+  if (cap) q = q.limit(cap);
+  const targets = await q.lean();
 
   if (!targets.length) {
     return { ok: true, brandId: String(brand._id), total: 0, note: 'no apify-ig media with a permalink' };
@@ -423,8 +456,11 @@ async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}
       const idx = cursor++;
       const media = targets[idx];
       const t0 = Date.now();
+      // Out-param for the run's MEASURED cost. Populated even when the
+      // run ends FAILED — a failed Apify run is still a charged one.
+      const costMeta = {};
       try {
-        const comments = await pullInstagramComments(media.metadata.permalink, {});
+        const comments = await pullInstagramComments(media.metadata.permalink, { costMeta });
         let upserted = 0;
         for (const c of comments) {
           const res = await Comment.updateOne(
@@ -457,14 +493,20 @@ async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}
           mediaId: String(media._id),
           fetched: comments.length,
           upserted,
-          tookMs: Date.now() - t0
+          tookMs: Date.now() - t0,
+          runId:          costMeta.runId          ?? null,
+          usageTotalUsd:  costMeta.usageTotalUsd  ?? null,
+          chargedResults: costMeta.chargedResults ?? null
         });
       } catch (err) {
         perStep.push({
           ok: false,
           mediaId: String(media._id),
           reason: err.message,
-          tookMs: Date.now() - t0
+          tookMs: Date.now() - t0,
+          runId:          costMeta.runId          ?? null,
+          usageTotalUsd:  costMeta.usageTotalUsd  ?? null,
+          chargedResults: costMeta.chargedResults ?? null
         });
       }
     }
@@ -481,6 +523,23 @@ async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}
   const totalFetched  = perStep.reduce((s, r) => s + (r.fetched  || 0), 0);
   const totalUpserted = perStep.reduce((s, r) => s + (r.upserted || 0), 0);
 
+  // MEASURED spend — summed from each run's own usageTotalUsd, never
+  // derived from a rate card (CLAUDE.md §2: read the actual price back).
+  // `costMeasuredSteps` is what makes the total honest: if it is short of
+  // `total`, usageTotalUsd covers only the steps Apify reported, so the
+  // real spend is HIGHER than the number shown.
+  const measuredSteps = perStep.filter((r) => Number.isFinite(r.usageTotalUsd));
+  const usageTotalUsd = measuredSteps.length
+    ? Math.round(measuredSteps.reduce((s, r) => s + r.usageTotalUsd, 0) * 1e6) / 1e6
+    : null;
+  // NB: `costMeasuredSteps` qualifies usageTotalUsd ONLY. chargedResults
+  // counts every step that reported an event count, including steps whose
+  // USD figure was still unsettled — so it can legitimately cover more
+  // steps than the dollar total does.
+  const chargedResults = perStep.reduce(
+    (s, r) => s + (Number.isFinite(r.chargedResults) ? r.chargedResults : 0), 0
+  );
+
   return {
     ok: true,
     brandId: String(brand._id),
@@ -489,6 +548,9 @@ async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}
     failed,
     fetched: totalFetched,
     upserted: totalUpserted,
+    usageTotalUsd,
+    chargedResults: chargedResults || null,
+    costMeasuredSteps: measuredSteps.length,
     perStep
   };
 }
@@ -498,6 +560,7 @@ module.exports = {
   syncDemoBrand: syncBrandApify, // alias — method-aware orchestrator
   syncBrandInstagram,
   syncBrandInstagramCommentsApify,
+  resolveCommentFanoutCap,
   syncBrandShopify,
   isBrandAborted
 };

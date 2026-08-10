@@ -4,9 +4,14 @@
 //
 // One shared token (APIFY_TOKEN) authenticates every call. Actor IDs
 // and per-source result limits are env-configurable so the Sales team
-// can tune limits without a deploy. Uses Apify's synchronous
-// `run-sync-get-dataset-items` endpoint — blocks until the actor
-// finishes and returns dataset items in one call, no polling.
+// can tune limits without a deploy.
+//
+// TRANSPORT — measured (default) vs legacy sync. See runActorSync.
+// The legacy `run-sync-get-dataset-items` endpoint returns ONLY dataset
+// items, so the run's real cost was never observable. The measured path
+// starts the run asynchronously, waits on the run object, and reads
+// `usageTotalUsd` / `chargedEventCounts` back off it. Kill switch:
+// APIFY_COST_READBACK=false restores the single legacy call.
 //
 // Contract: each puller returns a plain array of normalized records.
 // Shape normalization stays intentionally shallow — downstream ingest
@@ -65,13 +70,35 @@ function proxyConfig() {
 // axios timeout, when Apify itself is slow.
 const APIFY_HTTP_TIMEOUT_MS = 5 * 60 * 1000 + 15_000;
 
+// Kill switch for the measured transport. Default ON. Set
+// APIFY_COST_READBACK=false to fall back to the single legacy
+// `run-sync-get-dataset-items` call (no cost readback).
+const COST_READBACK =
+  String(process.env.APIFY_COST_READBACK ?? 'true').trim().toLowerCase() !== 'false';
+
+// Apify caps `waitForFinish` at 60s on BOTH the run-start POST and the
+// run GET (spec: MAX_ACTOR_JOB_ASYNC_WAIT_SECS). So the measured path
+// long-polls in 60s hops until the run is terminal or our own budget
+// (APIFY_HTTP_TIMEOUT_MS, matching the legacy 5min sync window) runs out.
+const APIFY_WAIT_FOR_FINISH_SECS = 60;
+// Terminal only. ABORTING / TIMING-OUT are transitional — treating them as
+// terminal would read the cost back before Apify has settled the charge.
+const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT']);
+// Floor between poll hops. waitForFinish normally holds the connection for
+// the full 60s, but a server that answers early must not turn the loop into
+// a request flood inside the 5min budget.
+const APIFY_POLL_FLOOR_MS = 1000;
+
 function getToken() {
   const t = process.env.APIFY_TOKEN;
   if (!t) throw new Error('APIFY_TOKEN is not set — cannot invoke Apify actors');
   return t;
 }
 
-async function runActorSync(actorId, input) {
+// LEGACY transport — one call, dataset items only, cost unobservable.
+// Kept byte-identical to the pre-readback implementation so
+// APIFY_COST_READBACK=false is a true revert, not a rewrite.
+async function runActorLegacySync(actorId, input) {
   const token = getToken();
   const url = `${APIFY_API_ROOT}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items`;
   const res = await axios.post(url, input, {
@@ -80,6 +107,173 @@ async function runActorSync(actorId, input) {
     headers: { 'content-type': 'application/json' }
   });
   return Array.isArray(res.data) ? res.data : [];
+}
+
+// MEASURED transport. Three steps, one of them billable:
+//   1. POST /acts/{id}/runs?waitForFinish=60   → the Run object (BILLABLE)
+//   2. GET  /actor-runs/{runId}?waitForFinish=60 (repeat) → settled run
+//   3. GET  /datasets/{datasetId}/items        → the same array step 1
+//                                                of the legacy call returned
+//
+// Why not the endpoints the obvious reading suggests — both were checked
+// against Apify's published OpenAPI spec on 2026-08-10 and neither works:
+//   • `run-sync-get-dataset-items` documents only X-Apify-Pagination-*
+//     response headers. There is NO run id anywhere in the response, so
+//     the run can't be looked up afterwards.
+//   • `run-sync` does NOT return the run object. It returns the record
+//     stored under the OUTPUT key of the run's key-value store (the spec
+//     calls it "a legacy approach"). No usage figures on it either.
+// Starting the run async is therefore the only transport that yields a
+// run id, and the run id is the only thing that yields a MEASURED cost.
+//
+// `maxRedirects: 0` on the billable POST per CLAUDE.md §2 — axios defaults
+// to 21 and re-sends the body on 307/308, which is a silent double charge.
+// (The legacy branch above lacks this; it is left as-is on purpose so the
+// kill switch reverts cleanly. Fix it there separately if it ever matters.)
+async function runActorMeasured(actorId, input, costMeta) {
+  const token = getToken();
+  const deadline = Date.now() + APIFY_HTTP_TIMEOUT_MS;
+
+  const startUrl = `${APIFY_API_ROOT}/acts/${encodeURIComponent(actorId)}/runs`;
+  const started = await axios.post(startUrl, input, {
+    params:       { token, waitForFinish: APIFY_WAIT_FOR_FINISH_SECS },
+    timeout:      APIFY_HTTP_TIMEOUT_MS,
+    maxRedirects: 0,
+    headers:      { 'content-type': 'application/json' }
+  });
+
+  let run = started.data?.data;
+  if (!run?.id) {
+    // 2xx with no run object. The run may nonetheless be RUNNING and
+    // charging, and we have no id to look it up with — so say so rather
+    // than let a caller read this as "nothing happened, safe to retry".
+    throw new Error(
+      `Apify run start for ${actorId} returned 2xx with no run id — a run may be ` +
+      `in flight and billing; check the Apify dashboard before re-running`
+    );
+  }
+
+  // Long-poll to terminal. Each hop is a free GET.
+  while (!TERMINAL_RUN_STATUSES.has(run.status) && Date.now() < deadline) {
+    const hopStart = Date.now();
+    run = (await getRun(token, run.id)) || run;
+    const elapsed = Date.now() - hopStart;
+    if (!TERMINAL_RUN_STATUSES.has(run.status) && elapsed < APIFY_POLL_FLOOR_MS) {
+      await new Promise((r) => setTimeout(r, APIFY_POLL_FLOOR_MS - elapsed));
+    }
+  }
+
+  // Apify can settle `usageTotalUsd` a beat after the run goes terminal —
+  // same lag the Atlas price reconcile exists for (CLAUDE.md §2). One free
+  // re-read rather than reporting a measured cost of "unknown".
+  if (TERMINAL_RUN_STATUSES.has(run.status) && numeric(run.usageTotalUsd) === null) {
+    run = (await getRun(token, run.id)) || run;
+  }
+
+  // Record what we know BEFORE the success check — a FAILED run is still
+  // a charged run, and the operator needs that number more, not less.
+  recordRunCost(costMeta, run);
+
+  if (run.status !== 'SUCCEEDED') {
+    // Distinguish "the actor failed" from "we stopped waiting" — the second
+    // means the run is STILL GOING and still billing, and re-running the
+    // step would pay for the same work twice.
+    const abandoned = !TERMINAL_RUN_STATUSES.has(run.status);
+    throw new Error(
+      abandoned
+        ? `Apify run ${run.id} for ${actorId} was still ${run.status || 'UNKNOWN'} after ` +
+          `${Math.round(APIFY_HTTP_TIMEOUT_MS / 1000)}s — abandoned the wait; the run may ` +
+          `still be executing and billing`
+        : `Apify run ${run.id} for ${actorId} ended ${run.status}`
+    );
+  }
+
+  const datasetId = run.defaultDatasetId;
+  if (!datasetId) {
+    // A SUCCEEDED run always carries a defaultDatasetId. Returning [] here
+    // would report "success, no data" for a run we PAID for — silent loss
+    // wearing the same shape as a post that genuinely has no comments.
+    throw new Error(
+      `Apify run ${run.id} for ${actorId} SUCCEEDED with no defaultDatasetId — ` +
+      `results unreachable despite a charged run`
+    );
+  }
+  const items = await axios.get(
+    `${APIFY_API_ROOT}/datasets/${encodeURIComponent(datasetId)}/items`,
+    { params: { token }, timeout: APIFY_HTTP_TIMEOUT_MS }
+  );
+  return coerceDatasetItems(items.data, datasetId, run.id);
+}
+
+// The default `format=json` always yields an array (and `limit` defaults to
+// no limit, so there is no silent truncation). Anything else is an anomaly
+// on a run we have ALREADY PAID FOR — the legacy transport could only shrug
+// and return [], but here we know it was charged, and "[]" is
+// indistinguishable from a post that genuinely has no comments.
+// Split out so the harness can exercise it without mocking axios.
+function coerceDatasetItems(data, datasetId, runId) {
+  if (!Array.isArray(data)) {
+    throw new Error(
+      `Apify dataset ${datasetId} (run ${runId}) returned ${typeof data}, not an ` +
+      `array — results unusable despite a charged run`
+    );
+  }
+  return data;
+}
+
+// One run read. Returns null (never throws) so a transient GET failure
+// costs us a poll hop, not the whole already-paid-for run.
+async function getRun(token, runId) {
+  try {
+    const res = await axios.get(`${APIFY_API_ROOT}/actor-runs/${encodeURIComponent(runId)}`, {
+      params:  { token, waitForFinish: APIFY_WAIT_FOR_FINISH_SECS },
+      timeout: APIFY_HTTP_TIMEOUT_MS
+    });
+    return res.data?.data || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Strict numeric coercion: null → null, NOT 0.
+//
+// This is load-bearing and was a real bug on the first cut. `Number(null)`
+// is 0 and `Number.isFinite(0)` is true, so a run that reports
+// `usageTotalUsd: null` — which is exactly what an unsettled run reports —
+// was being recorded as a MEASURED cost of $0.00. That is the worst
+// possible failure for this feature: it does not merely lose the number,
+// it asserts the run was free, and it also skipped the settle-lag re-read
+// that would have fetched the real figure.
+function numeric(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Copy the measured figures onto the caller's out-param. Never throws —
+// a cost-readback problem must not break the data path.
+function recordRunCost(costMeta, run) {
+  if (!costMeta || typeof costMeta !== 'object' || !run) return;
+  try {
+    const usage = numeric(run.usageTotalUsd);
+    // PAY_PER_EVENT actors report per-event counts; apify/instagram-scraper
+    // has exactly one event ('result'), so this is the billable item count.
+    const counts = run.chargedEventCounts || {};
+    const charged = Object.values(counts).reduce((s, n) => s + (numeric(n) ?? 0), 0);
+    costMeta.runId          = run.id || null;
+    costMeta.status         = run.status || null;
+    costMeta.datasetId      = run.defaultDatasetId || null;
+    costMeta.usageTotalUsd  = usage;
+    costMeta.chargedResults = Object.keys(counts).length ? charged : null;
+    costMeta.measured       = usage !== null;
+  } catch (_) { /* cost telemetry is never load-bearing */ }
+}
+
+// `costMeta`, when supplied, is an out-param populated with the run's
+// MEASURED cost. Callers that don't care pass nothing and are unaffected.
+async function runActorSync(actorId, input, costMeta = null) {
+  if (!COST_READBACK) return runActorLegacySync(actorId, input);
+  return runActorMeasured(actorId, input, costMeta);
 }
 
 // Pull recent public posts for an IG handle. Returns normalized
@@ -129,7 +323,11 @@ const IG_COMMENTS_LIMIT = Math.max(1, parseInt(process.env.APIFY_IG_COMMENTS_LIM
 // URL or shortcode-derived permalink. Returns normalized comment
 // records shaped for Comment doc upsert (mediaId is filled in by
 // the ingest wrapper — this puller doesn't know about DB ids).
-async function pullInstagramComments(postUrl, { limit } = {}) {
+// `costMeta` is an optional out-param — pass an object to have the run's
+// MEASURED cost written onto it ({runId, usageTotalUsd, chargedResults,
+// measured}). The comment fan-out is the one caller that reads it, because
+// it is the one an operator approves on a dollar figure.
+async function pullInstagramComments(postUrl, { limit, costMeta = null } = {}) {
   if (!postUrl) throw new Error('post URL is required');
   const cleanUrl = String(postUrl).trim();
   if (!/^https?:\/\/(www\.)?instagram\.com\/(p|reel)\//i.test(cleanUrl)) {
@@ -144,7 +342,7 @@ async function pullInstagramComments(postUrl, { limit } = {}) {
     addParentData:      false,
     proxyConfiguration: proxyConfig()
   };
-  const items = await runActorSync(IG_ACTOR, input);
+  const items = await runActorSync(IG_ACTOR, input, costMeta);
   return items.map(normalizeIgComment).filter(Boolean);
 }
 
@@ -239,5 +437,12 @@ module.exports = {
   pullShopifyProducts,
   IG_LIMIT,
   IG_COMMENTS_LIMIT,
-  SHOPIFY_LIMIT
+  SHOPIFY_LIMIT,
+  // Exported for scripts/verifyApifyCommentCost.js. A source-shape check
+  // cannot tell `numeric` from a reimplementation that still returns 0 for
+  // null, so the harness has to CALL these.
+  numeric,
+  recordRunCost,
+  coerceDatasetItems,
+  TERMINAL_RUN_STATUSES
 };

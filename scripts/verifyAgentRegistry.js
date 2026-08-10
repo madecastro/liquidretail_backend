@@ -1359,8 +1359,18 @@ for (const id of ['media.refreshInsightsForBrand', 'media.refreshCommentsFromApi
   if (c) {
     assert(c.tier === 4, `${id}: tier === 4`);
     assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
-    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
-      `${id}: estimateUsd declared`);
+    // Widened 2026-08-10 from number-only. media.refreshCommentsFromApify's
+    // bound is env-driven (posts × APIFY_IG_COMMENTS_LIMIT × $/result), and
+    // a frozen number is precisely how it came to declare $2.00 against a
+    // real ~$11.50. spendGuard.estimateFor and validateManifest both accept
+    // a function. This is STRICTER than the old check, not looser: the
+    // estimator must also RESOLVE to a finite, non-negative dollar figure.
+    const e = c.estimateUsd;
+    assert(typeof e === 'number' || typeof e === 'function',
+      `${id}: estimateUsd declared (number or function, got ${typeof e})`);
+    const resolved = typeof e === 'function' ? e({}) : e;
+    assert(typeof resolved === 'number' && Number.isFinite(resolved) && resolved >= 0,
+      `${id}: estimateUsd resolves to a finite number >= 0 (got ${JSON.stringify(resolved)})`);
   }
 }
 

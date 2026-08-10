@@ -1756,7 +1756,7 @@ const CAPABILITIES = [
   {
     id:       'media.refreshCommentsFromApify',
     title:    'Refresh IG comments for Apify-scraped media',
-    describe: 'Fan-out over every apify-ig Media on a brand, re-pulling comments via the SAME apify/instagram-scraper actor (resultsType=\'comments\') used at ingest. Upserts Comment docs by (mediaId, externalId). Runs one Apify sync-run per post — hence per-run cost. Cap of 100 per run. This is the parallel path to media.refreshInsightsForBrand for the Apify pipeline; post metadata itself is NOT touched (that lives on the Media row and is only refreshed at re-ingest).',
+    describe: 'Fan-out over every apify-ig Media on a brand, re-pulling comments via the SAME apify/instagram-scraper actor (resultsType=\'comments\') used at ingest. Upserts Comment docs by (mediaId, externalId). One Apify run per post. The actor is PAY_PER_EVENT with a single \'result\' event and NO per-run fee, so cost scales with posts × APIFY_IG_COMMENTS_LIMIT (comments per post), not with the number of runs. Cap of 100 posts per run. This is the parallel path to media.refreshInsightsForBrand for the Apify pipeline; post metadata itself is NOT touched (that lives on the Media row and is only refreshed at re-ingest).',
     tier:     4,
     scope:    'brand',
     execute: {
@@ -1764,10 +1764,23 @@ const CAPABILITIES = [
       service: './capabilityExecutors/mediaRefreshCommentsFromApify',
       workflow: true
     },
-    // Per-unit ~$0.02 × 100-cap = $2 upper bound. Env-overridable
-    // via APIFY_COMMENTS_PER_UNIT_USD if the operator has a different
-    // Apify pricing tier.
-    estimateUsd: 2.00,
+    // Upper bound for the spend guard: MAX_POSTS_PER_RUN (100) ×
+    // APIFY_IG_COMMENTS_LIMIT (50) × $/result (BRONZE 0.0023) = $11.50.
+    // A FUNCTION, not a constant, because two of those three are env
+    // vars — a static number went stale the moment the comment limit
+    // moved, which is exactly the bug this replaced ($2.00 declared
+    // against a real ~$11.50). spendGuard.estimateFor awaits functions.
+    // Lazy require: capabilityRegistry loads at boot and apifyCostModel
+    // must stay a leaf (no axios/mongoose) for the offline harness.
+    estimateUsd: () => {
+      const m = require('./apifyCostModel');
+      return m.estimateCommentPullUsd({
+        posts:              m.MAX_POSTS_PER_RUN,
+        commentLimit:       m.resolveCommentLimit(),
+        perResultUsd:       m.resolvePerResultUsd(),
+        perPostOverrideUsd: m.resolvePerPostOverrideUsd()
+      }).estimateUsd;
+    },
     args: {
       type: 'object',
       required: ['brandId'],

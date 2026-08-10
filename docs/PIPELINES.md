@@ -1042,6 +1042,7 @@ Versioned with the repo. Feature flags, tuning knobs, public IDs/URLs, Slack cha
 | Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8` (**live since 2026-08-03** — see above), `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |
 | Slack alert channels (non-secret) | `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, `SLACK_ALERT_CHANNEL_STATUS` (per-run live feed via `runFeedService`) |
 | Ingest tuning | `APIFY_*`, `POST_FETCH_LIMIT`, `CATALOG_SYNC_MAX_ITEMS`, `CATALOG_VISUAL_MATCH_MAX_IMAGES` |
+| Apify cost model | `APIFY_IG_COMMENTS_LIMIT=50`, `APIFY_PER_RESULT_USD=0.0023`, `APIFY_COST_ESTIMATE_V2=true`, `APIFY_COST_READBACK=true` — see §11 |
 | Generic catalog scraper | `GENERIC_CATALOG_*`, `HTTP_SCRAPE_MIN_GAP_MS` |
 | Catalog detect / enrichment | `CATALOG_DETECT_PRECOMPUTE`, `CATALOG_ENRICHMENT_*` |
 | Public IDs / URLs | Cloudinary cloud name, frontend URLs, Google/Meta client IDs & redirect URIs, Jira base/email, sales-demo admins, Shopify store domain |
@@ -1141,6 +1142,98 @@ frontend redirects that feed it (`Step4Generate.tsx`, `Campaigns/index.tsx`) wer
 **Pinned by `scripts/verifyAdsRecency.js` (21 checks).** Note check 1.11/1.12 are the general form —
 they assert **no** `.sort({generatedAt:-1})` ad query remains in either route file, rather than
 naming sites, because the campaigns mirror is exactly what a named-site-only harness missed.
+
+---
+
+## 11. Apify cost — what the actor actually charges, and what we measure
+
+Owner-facing summary of the 2026-08-10 fix. Source of truth for the
+arithmetic is `services/apifyCostModel.js`; it carries the receipts.
+
+**The pricing model.** `apify/instagram-scraper` is **PAY_PER_EVENT with
+exactly ONE charge event** — `result`, "each result written to the
+dataset". **There is NO per-run charge.** Starting a run is free; every
+dataset row costs one event. Verified live off the actor's own pricing
+entry, and confirmed against a settled run on this account
+(`chargedEventCounts {result: 10}` ↔ `usageTotalUsd $0.023` = 10 × $0.0023
+with nothing added for the run).
+
+$/result is tiered by **Apify plan**, not by actor:
+
+| FREE | BRONZE | SILVER | GOLD | PLATINUM | DIAMOND |
+|---|---|---|---|---|---|
+| 0.0027 | 0.0023 | 0.0019 | 0.0015 | 0.0009 | 0.0005 |
+
+This account is **BRONZE** (`GET /v2/users/me` → `plan.id 'STARTER'`,
+`plan.tier 'BRONZE'`). Re-check `plan.tier` after any billing change —
+`APIFY_PER_RESULT_USD` is the no-deploy lever.
+
+**What was wrong.** `media.refreshCommentsFromApify` estimated
+`posts × $0.02` flat, above a comment claiming the actor "bills per run +
+per record". Both halves were false, and the estimate never referenced
+`APIFY_IG_COMMENTS_LIMIT` — so the Tier-4 approval number was **identical
+whether each run pulled 50 comments or 100**. At 100 posts × 50 comments
+the operator saw **$2.00** against a real **~$11.50** (5.75×); at 100
+comments, still $2.00 against **~$23** (11.5×). The registry's
+`estimateUsd` — the spend-guard input — was frozen at the same $2.00.
+
+**What it is now.** `posts × commentLimit × perResultUsd`, with
+`commentLimit`, `perResultUsd` and `estimateBasis` surfaced next to
+`estimateUsd` in the preview so the operator can see what drove it. The
+registry bound is a **function** of the same env, so a comment-limit change
+can no longer leave the spend guard behind. `APIFY_COMMENTS_PER_UNIT_USD`
+still pins a flat $/post if set (`estimateBasis: 'per-post-override'`) —
+that path is limit-blind by construction and says so.
+
+**Two adjacent money holes closed in the same pass:**
+
+- **The fan-out was uncapped.** Preview quoted `totalSteps: min(targets,
+  100)` and `capped: true`, but `syncBrandInstagramCommentsApify` ran
+  `Media.find()` with no `.limit()`. A brand with 500 eligible posts was
+  approved for 100 posts of spend and billed for 500. The executor now
+  passes the same cap it previewed, over an `_id`-descending sort so the
+  slice is deterministic.
+- **A real cost could round to $0.00**, and `spendGuard` treats an
+  estimate of exactly 0 as "declared free" and skips the cap check. `usd()`
+  floors a positive cost at one cent.
+
+**Measured cost readback.** `runActorSync` used to POST
+`run-sync-get-dataset-items`, which returns **dataset items only** — so
+nothing in the Apify path ever observed real spend. Same trap §2 of
+`CLAUDE.md` documents for Atlas. Neither obvious alternative works, both
+checked against Apify's OpenAPI spec:
+
+- `run-sync-get-dataset-items` documents only `X-Apify-Pagination-*`
+  response headers — **no run id anywhere**.
+- `run-sync` returns the **OUTPUT key-value-store record**, not the run
+  object (the spec calls it "a legacy approach").
+
+So the measured transport starts the run async (`POST /acts/{id}/runs`,
+the one billable call, `maxRedirects: 0`), long-polls
+`GET /actor-runs/{runId}?waitForFinish=60` to terminal — 60s is Apify's
+hard ceiling on `waitForFinish` — then fetches dataset items. The settled
+run yields `usageTotalUsd` + `chargedEventCounts`, summed across the
+fan-out and persisted to **`OperationRun.meta`** (Mixed; the established
+home for a per-run summary — no new collection). `costMeasuredSteps` is
+reported alongside: if it is short of `total`, the figure covers only the
+steps Apify reported and real spend is **higher**.
+
+Cost is recorded **before** the success check — a FAILED run is still a
+charged run. An unmeasured run reports `costSource: 'unavailable'`, never
+`$0`; `null` is not coerced through `Number()` (`Number(null) === 0` would
+assert a run was free).
+
+**Kill switches**, both default ON: `APIFY_COST_ESTIMATE_V2=false`
+restores the old flat cost fields exactly; `APIFY_COST_READBACK=false`
+restores the single legacy sync call (and measures nothing). Pinned by
+`scripts/verifyApifyCommentCost.js` (50 checks, revert-proven against 8
+mutations).
+
+**Raising `APIFY_IG_COMMENTS_LIMIT` buys RECENCY, not better quotes.** The
+actor's input schema has exactly 8 properties and **no sort/order
+parameter**; comments come back newest-first and free usage silently caps
+at the top 15 regardless of `resultsLimit`. Ranking by engagement means
+over-fetching and sorting locally on the stored `Comment.likeCount`.
 
 ---
 
