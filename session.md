@@ -494,18 +494,41 @@ for the `brandReviews` backfill already queued elsewhere in this file.
 3. **Re-run the template-mix log query** over a few days to confirm the ratio moves in aggregate —
    one run with 3 distinct styles is consistent with the fix but is not statistics.
 
-### FOUND WHILE VERIFYING — the Slack run feed is dead on WEB, silently
+### "Nothing running in Slack" — INVESTIGATED, and the first two diagnoses were WRONG
 
-Owner: *"I am not seeing anything running in slack?"* Correct, and **unrelated to this change**.
-The WORKER logs `🔔 alerts: Slack configured; watchdog every 5m` on every boot (16:21, 16:58, 17:01,
-18:12, 18:37Z on 08-10). **The WEB service never logs it** — while it does log every other credential
-it holds (Gemini key, SerpAPI key, `RENDER_AUTH_TOKEN`). The per-run feed posts from the **web**
-process (`🚀 [campaignRun …] start` is a WEB line, `services/runFeedService.js`), and that path is
-deliberately fire-and-forget so it never sits on a render — so a missing `SLACK_BOT_TOKEN` fails with
-**no error line at all**. A fully healthy run produced zero Slack messages.
-Same class as the 2026-08-04 WORKER-missing-`ATLAS_API_KEY` gap: a config gap, not a design choice.
-**Worth hardening:** log a positive "Slack NOT configured" line at boot so this cannot hide again
-(CLAUDE.md already warns `res.ok` is not delivery).
+Owner, during the live run: *"I am not seeing anything running in slack?"* Unrelated to this change
+either way. **Two hypotheses were raised and both are refuted — recorded so nobody re-chases them:**
+
+- ❌ *"WEB boot never logs `🔔 alerts: Slack configured`, so the token is missing."* **Invalid
+  evidence.** That line is emitted **only** by `worker.js:138`. `index.js` never logs it at all, so
+  its absence on WEB says nothing about `SLACK_BOT_TOKEN`. The apparent web/worker asymmetry is an
+  artifact of which file logs, not of configuration.
+- ❌ *"runFeedService fails silently, so a missing token leaves no trace."* **False.**
+  `runFeedService.slackApi` (`:286-335`) logs **every** failure mode with a `📡 runFeed:` prefix —
+  429 + Retry-After, non-2xx, exception/timeout, and the HTTP-200-plus-`{ok:false}` trap CLAUDE.md
+  warns about. `warnUnconfiguredOnce` (`:145`) additionally logs once per process when unconfigured.
+
+**What is actually established.** Both non-secret gates are committed and correct:
+`RUN_FEED_ENABLED=true` (`config/defaults.env:325`) and
+`SLACK_ALERT_CHANNEL_STATUS=C0BMMD5AN84` (`:316`). `isConfigured()` is
+`ENABLED && BOT_TOKEN && CHANNEL`, so the only unverified term is the dashboard secret
+`SLACK_BOT_TOKEN` — **not read** (that env read is blocked; never print it).
+
+**RESOLVED — THERE WAS NO DEFECT. The feed is working; the owner confirmed receiving the status feed.**
+The decisive observation was **zero `📡 runFeed:` lines of any kind on WEB since the 18:37:30
+restart** — no "feed disabled", no 429, no `ok=false`, no `not_in_channel`. A **successful** post logs
+nothing (only failures do), so that silence was evidence *for* the feed working, not against it.
+`SLACK_BOT_TOKEN` on WEB is fine and needs no change.
+
+**METHOD NOTE worth keeping, because this cost real time.** Absence-of-a-log is only evidence if you
+have first confirmed that the code emits that log on the path you are testing. Both wrong hypotheses
+came from skipping that step: one assumed `index.js` logs a line only `worker.js` contains, the other
+assumed silence meant swallowed errors when the code logs every failure and stays quiet on success.
+Grep the emitter before drawing a conclusion from a missing line.
+
+Still fair as a small hardening idea, independent of all the above: have the WEB process log its Slack
+configuration state at boot the way `worker.js:138` does, so this is answerable from a boot log
+instead of by inference.
 
 Also re-observed in the same WEB boot log, both already known-open above and neither addressed here:
 `RENDER_AUTH_TOKEN` is **EXPIRED** (`exp=2026-05-07`), and `FRONTEND_URL` still points at
