@@ -48,7 +48,8 @@ const { adStage } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 const {
-  generationGateDecision, normalizeProductIdList, pickSupersedingRun
+  generationGateDecision, normalizeProductIdList, pickSupersedingRun,
+  computeRequestFingerprint, renderClaimFingerprint
 } = require('../services/generationGate');
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
@@ -286,7 +287,15 @@ router.post('/generate', async (req, res) => {
       // just platformFormat. EACH SIZE IS A SEPARATE BILLABLE GENERATION.
       // Default false: existing callers get exactly prior behavior.
       // Ignored for named presets (meta_static / meta_all already fan out).
-      expandStaticFormats = false
+      expandStaticFormats = false,
+      // DUPLICATE OVERRIDE — owner 2026-08-10: an identical request is refused,
+      // but *"allow them if the user wants"*. The client re-POSTs the same body
+      // with confirmDuplicate:true plus the acknowledgedRunId it was handed in
+      // the 409. Both are required: the runId is what makes the override
+      // single-use, so a stray second click on "Generate anyway" is refused
+      // against the run the first click just minted instead of billing again.
+      confirmDuplicate = false,
+      acknowledgedRunId = null
     } = req.body || {};
 
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
@@ -343,11 +352,12 @@ router.post('/generate', async (req, res) => {
     //      the run to status='running' with total set and start the render
     //      loop. Errors land the run as status='failed' with a single
     //      error entry so the UI can surface them.
-    // CONCURRENT GENERATIONS: allowed when their product sets are DISJOINT,
-    // blocked when they overlap. Checked in the DATABASE, not in memory:
-    // services/inFlight.js is per-process and this web service autoscales across
-    // several Render instances, so two clicks can land on two processes that
-    // cannot see each other.
+    // CONCURRENT GENERATIONS: allowed unless the request is IDENTICAL to one
+    // already in flight (or to one that recently finished, which is refused once
+    // and then allowed on explicit confirmation). Checked in the DATABASE, not
+    // in memory: services/inFlight.js is per-process and this web service
+    // autoscales across several Render instances, so two clicks can land on two
+    // processes that cannot see each other.
     //
     // This guard is load-bearing as of 2026-08-01. Until the identityDigest was
     // scoped to the run, a double-click was silently free — the second run's ads
@@ -359,36 +369,110 @@ router.post('/generate', async (req, res) => {
     // this case — each run claims the ads it just minted, so there is no race to
     // lose. Every generation POST is charged on submit (CLAUDE.md §2).
     //
-    // It was ONE run per campaign until 2026-08-03, which also blocked a second
-    // batch of different products — a parallel run the team legitimately wants.
-    // The overlap rule (services/generationGate.js) keeps the double-click
-    // protection exactly where the money is and nowhere else; that module owns
-    // the reasoning, including why format/preset is deliberately not part of it.
+    // It was ONE run per campaign until 2026-08-03, then PRODUCT OVERLAP until
+    // 2026-08-10. Both blocked runs the team legitimately wants: overlap refused
+    // a second, different request over the same product, and — because it failed
+    // CLOSED on an unreadable product scope — it refused MEDIA-LIBRARY runs
+    // outright, since those legitimately carry productIds:[]. The key is now the
+    // REQUEST FINGERPRINT. services/generationGate.js owns the reasoning,
+    // including the digest evidence that video cannot double-bill across runs at
+    // all (its identity digest is run-independent, so the unique index catches
+    // it) and that duplicate STATIC sets are owner-sanctioned creative rather
+    // than a double charge.
     //
     // Stale runs are not allowed to lock a campaign forever: a 'preparing' or
     // 'running' row older than the render ceiling is treated as dead. That bound
     // is REAP_STALE_MIN, the same one worker.js uses to reclaim stuck ads, so the
     // two cannot drift into disagreeing about what "stale" means.
     const staleMin = Number(process.env.REAP_STALE_MIN || 15);
+
+    // The fingerprint is built from the PARSED values, not raw req.body, so the
+    // hash sees exactly what the expansion will (parsedVideoDurationSec, the
+    // validated phase3 fields). Anything the handler does not read must stay out
+    // — see the trap note in services/generationGate.js.
+    const requestFingerprint = computeRequestFingerprint({
+      campaignId,
+      productIds,
+      mediaIds,
+      templateIds,
+      preset,
+      platformFormat,
+      kinds,
+      expandStaticFormats,
+      includeCategoryMatched,
+      includeBrandMatched,
+      excludePairings,
+      cta,
+      urlParams,
+      videoDurationSec: parsedVideoDurationSec,
+      directorVariants:     phase3.fields.directorVariants,
+      seedPicks:            phase3.fields.seedPicks,
+      seedMediaIds:         phase3.fields.seedMediaIds,
+      videoPromptGuidance:  phase3.fields.videoPromptGuidance,
+      videoPromptRaw:       phase3.fields.videoPromptRaw
+      // `refresh` is intentionally not passed — it never reaches expandWizardJob,
+      // so it cannot change the output. computeRequestFingerprint documents why
+      // hashing a dead field would be a money bug, not a harmless extra.
+    });
+    const ackRunId = confirmDuplicate && acknowledgedRunId ? String(acknowledgedRunId) : null;
+
     const activeRuns = await CampaignRun.find({
       campaignId,
       status: { $in: ['preparing', 'running'] },
       createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
-    }).select('runId status createdAt requestedProductIds').lean();
-    const gate = generationGateDecision({ activeRuns, requestedProductIds: productIds });
+    }).select('runId status createdAt requestedProductIds requestFingerprint').lean();
+
+    // The most recent FINISHED run making this exact request, for the
+    // "you already ran this" notice. Bounded by DUPLICATE_LOOKBACK_MIN (default
+    // 24h) so the lookup stays indexed and a month-old run does not nag forever.
+    // Skipped entirely once the user has confirmed — no point querying for a
+    // conflict we have already been told to ignore.
+    //
+    // `total: { $gt: 0 }` is load-bearing, not a tidy-up. The notice exists to say
+    // "this already produced ads and cost money", so a run that minted nothing
+    // must not raise it. Two kinds of row would otherwise do exactly that, and
+    // both are rows THIS handler writes: the mint-then-verify loser (marked
+    // 'failed' at stage 'gate', total 0, nothing generated or charged) and a run
+    // that failed during expansion. Without this filter, losing a harmless
+    // double-click race would make the operator's next honest attempt demand a
+    // confirmation for work that never happened.
+    const dupLookbackMin = Number(process.env.DUPLICATE_LOOKBACK_MIN || 1440);
+    const priorRun = ackRunId ? null : await CampaignRun.findOne({
+      campaignId,
+      requestFingerprint,
+      status: { $in: ['done', 'failed'] },
+      total: { $gt: 0 },
+      createdAt: { $gte: new Date(Date.now() - dupLookbackMin * 60 * 1000) }
+    }).select('runId status createdAt requestFingerprint total').sort({ createdAt: -1 }).lean();
+
+    const gate = generationGateDecision({
+      activeRuns,
+      priorRun,
+      fingerprint: requestFingerprint,
+      requestedProductIds: productIds,
+      acknowledgedRunId: ackRunId
+    });
     if (gate.blocked) {
-      const conflict = activeRuns.find(r => String(r.runId) === String(gate.conflictRunId)) || activeRuns[0];
-      const error = gate.reason === 'product-overlap'
-        ? `A generation is already running for ${gate.overlap.length} of the selected product(s). ` +
-          'Wait for it to finish, or start a run for different products — those run in parallel.'
-        : 'A generation is already running for this campaign. Wait for it to finish, or reload to see its progress.';
+      const conflict =
+        activeRuns.find(r => String(r.runId) === String(gate.conflictRunId)) ||
+        (priorRun && String(priorRun.runId) === String(gate.conflictRunId) ? priorRun : null);
+      const error = gate.reason === 'duplicate-of-previous'
+        ? 'You already ran this exact request. Generating again will produce new creative ' +
+          'and will be billed again — confirm to run it anyway.'
+        : 'This exact request is already generating. Wait for it to finish, or confirm to ' +
+          'run it a second time — that produces new creative and is billed again.';
       return res.status(409).json({
         error,
         code: 'generation-already-running',
         reason: gate.reason,
-        runId: conflict?.runId,
-        startedAt: conflict?.createdAt,
-        overlappingProductIds: gate.overlap || []
+        // The client re-POSTs the same body with confirmDuplicate:true and this
+        // value as acknowledgedRunId to proceed. Single-use by construction: it
+        // names the run the user was shown, so a second stray confirm collides
+        // with the newly minted run instead and is refused again.
+        confirmable: gate.confirmable === true,
+        acknowledgeRunId: gate.acknowledgeRunId || null,
+        runId: conflict?.runId || gate.conflictRunId || null,
+        startedAt: conflict?.createdAt || null
       });
     }
 
@@ -427,34 +511,47 @@ router.post('/generate', async (req, res) => {
       startedAt:    new Date(),
       // Scope for the concurrency gate above. MUST be written here, at mint
       // time: the gate runs while sibling runs are still 'preparing', long
-      // before the expansion fills perProduct. An unstamped run reads as
-      // "scope unknown" and blocks every concurrent Generate on the campaign.
-      requestedProductIds: normalizeProductIdList(productIds)
+      // before the expansion fills perProduct.
+      requestedProductIds: normalizeProductIdList(productIds),
+      // What the gate actually compares now. MUST be written at mint time for
+      // the same reason, and an unstamped run is no longer safe-by-default in the
+      // other direction: a run with no fingerprint cannot be proven identical to
+      // anything, so it will NOT block a sibling (deliberate — see the fail-open
+      // note in services/generationGate.js). Dropping this write would silently
+      // disable double-click protection rather than over-block.
+      requestFingerprint
     });
 
     // MINT-THEN-VERIFY — closes the read-then-write race in the gate above.
     // Two clicks can both read activeRuns before either row exists, both see an
     // idle campaign, and both go on to expand and bill. Now that our own run IS
-    // inserted, re-read: if an EARLIER in-flight run already claimed any of these
-    // products, we are the loser and abort here — before expandWizardJob, so
+    // inserted, re-read: if an EARLIER in-flight run already made this exact
+    // request, we are the loser and abort here — before expandWizardJob, so
     // nothing has been minted or charged. services/generationGate.js owns the
     // ordering rule; both racers compute the same winner, so exactly one aborts.
+    //
+    // This is also what keeps the duplicate OVERRIDE from being a hole: two
+    // simultaneous "Generate anyway" clicks both carry the same
+    // acknowledgedRunId, so neither is excused from the other, and the later one
+    // still aborts here.
     const superseding = pickSupersedingRun({
       selfRun: { runId, createdAt: run.createdAt },
       activeRuns: await CampaignRun.find({
         campaignId,
         status: { $in: ['preparing', 'running'] },
         createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
-      }).select('runId status createdAt requestedProductIds').lean(),
-      requestedProductIds: productIds
+      }).select('runId status createdAt requestedProductIds requestFingerprint').lean(),
+      fingerprint: requestFingerprint,
+      requestedProductIds: productIds,
+      acknowledgedRunId: ackRunId
     });
     if (superseding) {
       console.warn(
         `⚠️  [campaignRun ${runId}] superseded by concurrent run ${superseding.runId} ` +
-        `on ${superseding.overlap.length || 'unscoped'} overlapping product(s) — aborting before expand`
+        `making the identical request — aborting before expand`
       );
       // Do NOT swallow this write. A loser left in 'preparing' is a zombie that
-      // blocks its own products for the whole stale window — the exact
+      // blocks its own request for the whole stale window — the exact
       // false-block this change exists to remove. If the update fails, drop the
       // row instead: it describes work that never happened, so there is nothing
       // worth keeping, and a lingering lock is the more expensive outcome.
@@ -472,16 +569,19 @@ router.post('/generate', async (req, res) => {
         );
         await CampaignRun.deleteOne({ _id: run._id }).catch(e =>
           console.error(`❌ [campaignRun ${runId}] delete also failed: ${e.message} — ` +
-            `row may block overlapping products until the stale window expires`));
+            `row may block an identical request until the stale window expires`));
       }
       return res.status(409).json({
-        error: 'Another generation for these products started at the same moment. ' +
-               'Nothing was generated or charged for this request — watch the other run.',
+        error: 'An identical generation started at the same moment. Nothing was generated ' +
+               'or charged for this request — watch the other run.',
         code: 'generation-already-running',
         reason: 'raced-concurrent-run',
+        // Deliberately NOT confirmable. The user already confirmed if they got
+        // here via the override; re-offering it on a photo-finish race would just
+        // invite the double-spend the race check exists to stop.
+        confirmable: false,
         runId: superseding.runId,
-        startedAt: superseding.createdAt,
-        overlappingProductIds: superseding.overlap || []
+        startedAt: superseding.createdAt
       });
     }
 
@@ -492,7 +592,12 @@ router.post('/generate', async (req, res) => {
       campaignKind:  campaignDoc.kind || 'product',
       total:         0,
       queuedRemaining: 0,
-      status:        'preparing'
+      status:        'preparing',
+      // Non-blocking information, not a verdict. Set when a DIFFERENT request is
+      // already running over some of the same products — allowed by owner
+      // direction, but the operator should still see that both will be billed.
+      // null on the common path.
+      notice: gate.notice || null
     });
 
     setImmediate(async () => {
@@ -965,7 +1070,13 @@ router.post('/runs', express.json(), async (req, res) => {
       status:       'running',
       requestedBy:  req.user?.userId || null,
       startedAt:    new Date(),
-      requestedProductIds: claimedProductIds
+      requestedProductIds: claimedProductIds,
+      // A render claim is not a generation request — it mints no ads and bills no
+      // expansion, so it must never be mistaken for "the same request" as a
+      // /generate and block one. Namespaced + unique per run, which is what makes
+      // that true; leaving it null would fall into the product-set compat
+      // comparison and refuse legitimate generates indefinitely.
+      requestFingerprint: renderClaimFingerprint(runId)
     });
 
     res.status(202).json({
