@@ -26,7 +26,7 @@
 
 const axios = require('axios');
 const { recordFlatCost, MODEL_RATES } = require('./costTracker');
-const { resolveModel } = require('./atlasModelMap');
+const { resolveModel, rejectsSamplingParams, stripSamplingParams } = require('./atlasModelMap');
 
 const ATLAS_CHAT_URL = (process.env.ATLAS_TEXT_BASE_URL || 'https://api.atlascloud.ai/v1') + '/chat/completions';
 const TIMEOUT_MS = Number(process.env.ATLAS_LLM_STREAM_TIMEOUT_MS || 120_000);
@@ -50,6 +50,10 @@ function buildStreamBody(params, atlasId) {
   if (/^openai\//.test(atlasId) && body.reasoning_effort === undefined) {
     body.reasoning_effort = 'low';
   }
+  // Same Claude 5 sampling-param refusal as the non-stream transport —
+  // see atlasModelMap.rejectsSamplingParams. Shared predicate, not a copy,
+  // so this cannot drift from atlasLlmService.
+  if (rejectsSamplingParams(atlasId)) stripSamplingParams(body);
   if (body.max_tokens != null) {
     // Clamp then ALWAYS add full reserve — see atlasLlmService.buildAtlasBody.
     body.max_tokens = Math.min(ATLAS_MAX_OUTPUT_TOKENS, body.max_tokens) + REASONING_RESERVE_TOKENS;
@@ -212,4 +216,10 @@ function estimateCost(atlasSlug, usage) {
   return (inTokens * rates.input + outTokens * rates.output) / 1_000_000;
 }
 
-module.exports = { streamChatCompletion, isConfigured };
+module.exports = {
+  streamChatCompletion,
+  isConfigured,
+  // exposed for verify harnesses (param shaping + token ceiling), mirroring
+  // atlasLlmService.buildAtlasBody
+  buildStreamBody,
+};

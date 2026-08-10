@@ -352,3 +352,70 @@ gives us: `submitRetryDecision` (submit-once), `pacedModelSubmit`, `maxRedirects
 the prediction-poll machinery, and the cost ledger. `aiVideoReferenceService` is the
 existing direct-Google path and `ARCHITECTURE_REVIEW.md`'s divergence table rates it
 weaker on every axis — harden it before putting money through it.
+
+## 9) Claude 5 refuses the sampling knobs (live-verified 2026-08-10)
+
+Atlas rejects `temperature` (≠ 1), `top_p` and `top_k` on the **Claude 5 family**
+with a bare, field-less `HTTP 400 {"code":400,"msg":"bad request"}`. This is the
+Anthropic extended-thinking constraint — with thinking on, sampling is not the
+caller's to set — now enforced at the gateway.
+
+Probed live against the production key:
+
+| Request to `anthropic/claude-sonnet-5` | Result |
+|---|---|
+| bare (model + messages) | 200 |
+| `max_tokens: 30768` | 200 |
+| `response_format: {type:'json_object'}` | 200 |
+| `stop`, `seed`, `frequency_penalty`, `presence_penalty` | 200 |
+| `temperature: 1` | 200 |
+| **`temperature: 0` / `0.45` / `0.7`** | **400** |
+| **`top_p: 0.9`** | **400** |
+| **`top_k: 40`** | **400** |
+
+`anthropic/claude-opus-5` behaves identically. `claude-opus-4.8`,
+`claude-sonnet-4.6`, `claude-sonnet-4.5-*` and every `openai/*` and `google/*`
+slug still accept `temperature`.
+
+### What it cost us
+
+Role `director` is the only Anthropic entry in `atlasModelMap`, and
+`aiCreativeDirectorService.directConceptsRound` sent `temperature: 0.45`. Every
+concept-driven expansion therefore threw before creating a single static `Ad`
+row — **static ad generation ran at a 100% failure rate**, while video was
+untouched because every other role maps to `openai/*` or `google/*`:
+
+```
+conceptDriven[product=…]: failed (Atlas 400: {"code":400,"msg":"bad request"})
+[campaignRun run_…] start — 4 ad(s) concurrency=veo:12(4) image:24(0)
+                                                          ^ zero static ads
+```
+
+Last good Director round **2026-08-07 21:20 UTC**; first failure **2026-08-10
+15:17 UTC**; **no deploy in between** — the running commit was `f3cd56c9` the
+whole time. This was an Atlas-side change, not a regression of ours. Worth
+remembering when triaging the next one: a 100%-failure onset with no deploy is
+evidence *against* a code cause, and the deploy history is the fastest way to
+prove it.
+
+### The guard
+
+`atlasModelMap.rejectsSamplingParams(atlasId)` + `stripSamplingParams(body)`.
+Applied by all **three** transports that POST to `/v1/chat/completions`:
+
+- `atlasLlmService.buildAtlasBody`
+- `atlasLlmStreamService.buildStreamBody`
+- `atlasTextService.buildTextBody` — posts its body inline rather than through
+  the other two, so it carries the guard itself. Its `DEFAULT_MODEL` is a 4.x
+  slug today, but `ATLAS_TEXT_MODEL_ID` exists to repoint it.
+
+Params are **stripped, not pinned to 1**: 1 is already the model default, and an
+explicit 1 would imply we still control a knob we do not. The practical
+consequence is that `DIRECTOR_ROUND_TEMP = 0.45` is now **inert** on Claude 5 —
+the Director samples at the default, so expect more run-to-run variety. To get a
+tunable temperature back, repoint `director` at `anthropic/claude-sonnet-4.6`.
+
+Covered by `scripts/verifyClaude5SamplingParams.js` (offline, revert-proven).
+**Before changing the `director` model or adding a second Anthropic role,
+re-probe** — check `B2`, which fails deliberately when a new Anthropic role
+appears so its gateway behaviour gets confirmed rather than assumed.

@@ -8,6 +8,7 @@
 // Base:  ATLAS_BASE_URL (defaults to https://api.atlascloud.ai/api/v1).
 
 const axios = require('axios');
+const { rejectsSamplingParams, stripSamplingParams } = require('./atlasModelMap');
 
 // Text uses /v1 (no /api prefix). Video endpoints live under /api/v1,
 // so ATLAS_BASE_URL (which the video service uses) is wrong for chat
@@ -19,6 +20,19 @@ const BASE_URL = process.env.ATLAS_TEXT_BASE_URL || 'https://api.atlascloud.ai/v
 const DEFAULT_MODEL = process.env.ATLAS_TEXT_MODEL_ID || 'anthropic/claude-sonnet-4.6';
 
 const HTTP_TIMEOUT_MS = 5 * 60 * 1000; // Claude script gen can run 30-90s.
+
+// This service posts to Atlas directly rather than through
+// atlasLlmService.buildAtlasBody, so it needs its own copy of the Claude 5
+// sampling-param guard — see atlasModelMap.rejectsSamplingParams for the live
+// probe and the static-ad outage a missing strip caused. DEFAULT_MODEL is a
+// 4.x slug today (temperature accepted), but this service exists to be
+// repointed via ATLAS_TEXT_MODEL_ID, and a Claude 5 value there would 400
+// every call. Exported for the verify harness.
+function buildTextBody({ model, messages, temperature, maxTokens }) {
+  const body = { model, messages, temperature, max_tokens: maxTokens };
+  if (rejectsSamplingParams(model)) stripSamplingParams(body);
+  return body;
+}
 
 function apiKey() {
   const k = process.env.ATLAS_API_KEY;
@@ -73,7 +87,7 @@ async function generate({
     try {
       res = await axios.post(
         url,
-        { model, messages, temperature, max_tokens: maxTokens },
+        buildTextBody({ model, messages, temperature, maxTokens }),
         {
           headers: {
             Authorization: `Bearer ${apiKey()}`,
@@ -121,4 +135,5 @@ async function generate({
   };
 }
 
-module.exports = { generate, DEFAULT_MODEL };
+// buildTextBody exposed for the verify harness (Claude 5 sampling strip).
+module.exports = { generate, DEFAULT_MODEL, buildTextBody };
