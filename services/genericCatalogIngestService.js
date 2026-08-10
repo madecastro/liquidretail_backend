@@ -33,8 +33,13 @@ const { concurrency: CONC } = require('./concurrency');
 // Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
 // Bounded session per sync — never fails the upsert.
 const ingestShotClassify = require('./ingestShotClassifyService');
+// Upsert loop gets its OWN wall-clock budget (DB-bound) — must not share
+// the network scan budget's clock, or a slow scan would leave no time to
+// persist products already paid for in network cost.
+const { createBudget } = require('./genericCatalogDiscovery/budget');
 
 const LOG = '🗺';
+const UPSERT_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_UPSERT_BUDGET_MS, 10);
 
 /**
  * syncBrandGenericCatalog(brand, run, { isBrandAborted })
@@ -141,7 +146,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
   // Unscrapeable / empty decisive failure (NOT a cancel) — surface reason
   // to the Sales UI instead of a silent empty catalog.
   if (!access.ok && !products.length) {
-    return {
+    const emptyOut = {
       productsUpserted: 0,
       videosIngested: 0,
       reviewsCaptured: 0,
@@ -150,6 +155,12 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
       reason: access.reason || 'generic catalog resolution failed',
       durationMs: Date.now() - t0
     };
+    if (access.partial) {
+      emptyOut.partial = true;
+      emptyOut.partialReason = access.partialReason || 'budget-exceeded';
+    }
+    if (access.budgetExpired) emptyOut.budgetExpired = true;
+    return emptyOut;
   }
 
   const totalPlanned = products.length || CAP;
@@ -166,8 +177,12 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
   // Collect work; post-loop pass classifies. Hung DNS cannot truncate.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  // Upsert budget is a SEPARATE clock from the scan (DB-bound work).
+  const upsertBudget = createBudget({ totalMs: UPSERT_BUDGET_MS });
   let idx = 0;
   let cancelled = resolverCancelled;
+  let partial = !!access.partial;
+  let partialReason = access.partialReason || null;
   try {
   for (const p of products) {
     idx += 1;
@@ -185,6 +200,14 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
         cancelled = true;
         break;
       }
+    }
+    // Wall-clock stop: keep everything already written, report partial.
+    // Distinct from cancel — do not set cancelled / do not discard rows.
+    if (upsertBudget.expired()) {
+      console.log(`   · ${LOG}  upsert budget expired for brand=${brand._id} (kept ${productsUpserted})`);
+      partial = true;
+      partialReason = partialReason || 'budget-exceeded';
+      break;
     }
 
     try {
@@ -407,6 +430,15 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
     durationMs
   };
   if (cancelled) out.cancelled = true;
+  if (partial) {
+    out.partial = true;
+    out.partialReason = partialReason || 'budget-exceeded';
+  }
+  // Propagate resolver budget reason so the Sales UI / OperationRun can
+  // show "stopped after Xs (budget)" instead of a silent partial.
+  if (access.budgetExpired && access.reason) {
+    out.reason = out.reason || access.reason;
+  }
   if (access.rateLimited && !productsUpserted) {
     out.ok = false;
     out.reason = access.reason || `rate-limited while scanning ${origin}`;

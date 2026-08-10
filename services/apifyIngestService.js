@@ -127,8 +127,44 @@ async function syncBrandApify(brandId) {
   out.durationMs = Date.now() - t0;
   out.aborted    = stillAborted || (await isBrandAborted(brand._id, run));
   delete out._run;
-  if (out.aborted) await run.markCancelled('Aborted — partial ingest kept');
-  else await run.succeed({ ig: out.ig?.ingested ?? null, shopify: out.shopify?.added ?? null });
+  const summary = { ig: out.ig?.ingested ?? null, shopify: out.shopify?.added ?? null };
+  // GENERIC_CATALOG_FAIL_ON_ZERO=false restores the prior two-line
+  // if/else byte-identically (always succeed unless aborted). Default
+  // true: a run that attempted sources and ingested nothing must not
+  // report success — OperationRun.status is what every poller keys off.
+  if (process.env.GENERIC_CATALOG_FAIL_ON_ZERO === 'false') {
+    if (out.aborted) await run.markCancelled('Aborted — partial ingest kept');
+    else await run.succeed(summary);
+  } else {
+    const { computeSyncOutcome } = require('./apifySyncOutcome');
+    // Explicit zero predicates — null vs 0 vs undefined all count as zero.
+    // shopify uses `added`; IG uses `ingested`. ok:false is decisive zero
+    // even when a count field is missing.
+    const shopifyAttempted = out.shopify != null;
+    const igAttempted = out.ig != null;
+    const shopifyZero = !out.shopify
+      || out.shopify.ok === false
+      || (out.shopify.added ?? 0) === 0;
+    const igZero = !out.ig
+      || out.ig.ok === false
+      || (out.ig.ingested ?? 0) === 0;
+    const outcome = computeSyncOutcome({
+      shopifyAttempted,
+      shopifyZero,
+      igAttempted,
+      igZero,
+      aborted: out.aborted
+    });
+    if (outcome.status === 'cancelled') {
+      await run.markCancelled('Aborted — partial ingest kept');
+    } else if (outcome.status === 'failed') {
+      // fail(err, meta) so a failed run still carries the per-source counts
+      // — the case where an operator most needs diagnostics.
+      await run.fail(new Error(outcome.reason || 'sync ingested nothing'), summary);
+    } else {
+      await run.succeed(summary);
+    }
+  }
   return out;
 }
 

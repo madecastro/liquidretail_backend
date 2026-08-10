@@ -47,6 +47,11 @@ const { extractBreadcrumb } = require('./breadcrumbParser');
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 // Scored product-URL heuristic — ranking only (non-matches still scanned later).
 const { scoreProductish, isProductish } = require('./genericCatalogDiscovery/productish');
+// Wall-clock budget — pure, clock-injectable. Bounds the scan so a large
+// or hostile site cannot grind for ~83 min while the UI shows a dead run.
+// Distinct from abort (user cancel) and from progressService.MAX_RUN_MS
+// (dead-process safety net for the heartbeat only).
+const { createBudget } = require('./genericCatalogDiscovery/budget');
 
 // ── constants ──────────────────────────────────────────────────────
 const LOG = '🗺';
@@ -69,6 +74,9 @@ const MAX_SITEMAP_FETCHES = Math.max(
   10,
   parseInt(process.env.GENERIC_CATALOG_MAX_SITEMAP_FETCHES, 10) || 200
 );
+// Wall-clock budgets (ms). Non-finite / ≤0 → unbounded (createBudget safety).
+const TOTAL_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_TOTAL_BUDGET_MS, 10);
+const SITEMAP_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_SITEMAP_BUDGET_MS, 10);
 const GZIP_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;  // decompressed sitemap cap
 const MAX_ROBOTS_SITEMAPS = 50;                  // cap root sitemaps from robots.txt
 const RAW_DATA_CAP_BYTES = 8000;
@@ -799,9 +807,13 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
 /**
  * Walk sitemap indexes → urlsets (depth ≤ 2). Streams product-page
  * candidates ranked product-ish first, lastmod desc.
- * Returns { pageEntries:[{loc,lastmod}], sitemapsWalked, cfChallenges, rateLimited }.
+ * Returns { pageEntries:[{loc,lastmod}], sitemapsWalked, cfChallenges,
+ *   rateLimited, aborted, budgetExpired }.
+ * `budget` is an optional RungBudget from createBudget().enterRung — checked
+ * alongside abortCheck so a large index cannot burn the whole wall-clock
+ * allotment before any PDP is scanned.
  */
-async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
+async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }) {
   const pageEntries = [];
   const seenLoc = new Set();
   const seenSitemaps = new Set();   // dedup index/sub-sitemap URLs (loop + DoS guard)
@@ -810,6 +822,7 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
   let cfChallenges = 0;
   let rateLimited = false;
   let aborted = false;
+  let budgetExpired = false;
 
   // Fetch a sitemap document at most once, bounded by MAX_SITEMAP_FETCHES.
   // Prevents a self-referential / diamond index graph from forcing an
@@ -834,6 +847,7 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
   // Pass 1: expand indexes, rank sub-sitemaps
   while (queue.length) {
     if (await abortCheck()) { aborted = true; break; }
+    if (budget && budget.expired()) { budgetExpired = true; break; }
     if (sitemapFetches >= MAX_SITEMAP_FETCHES) break;
     const { url, depth } = queue.shift();
     if (!url || depth > MAX_SITEMAP_DEPTH) continue;
@@ -877,6 +891,7 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
     if (pageEntries.length >= maxUrls) break;
     if (sitemapFetches >= MAX_SITEMAP_FETCHES) break;
     if (await abortCheck()) { aborted = true; break; }
+    if (budget && budget.expired()) { budgetExpired = true; break; }
     if (item.depth > MAX_SITEMAP_DEPTH) continue;
 
     const got = await fetchSitemapOnce(item.url);
@@ -912,7 +927,7 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
     return lastmodMs(b.lastmod) - lastmodMs(a.lastmod);
   });
 
-  return { pageEntries, sitemapsWalked, cfChallenges, rateLimited, aborted };
+  return { pageEntries, sitemapsWalked, cfChallenges, rateLimited, aborted, budgetExpired };
 }
 
 // ── main resolve ───────────────────────────────────────────────────
@@ -936,6 +951,17 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
   const products = [];
   const seenIds = new Set();
   let rateLimited = false;
+  // budgetExpired is its OWN flag — do not overload aborted/cancelled.
+  // aborted drives run.markCancelled(...); a timeout is not a cancellation.
+  let budgetExpired = false;
+
+  // Wall-clock budget for the whole resolve (discovery + walk + PDP scan).
+  // Unset / non-positive env → unbounded (createBudget safety property).
+  const budget = createBudget({ totalMs: TOTAL_BUDGET_MS });
+  const budgetReason = (detail) => {
+    const sec = Math.round(budget.spentMs() / 1000);
+    return `stopped after ${sec}s (budget)${detail ? ` — ${detail}` : ''}`;
+  };
 
   const origin = ingestHelpers.resolveStoreOrigin(brand);
   if (!origin) {
@@ -955,6 +981,9 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
   run?.note?.(`generic catalog discovery @ ${origin}`);
 
   // ── Discover sitemaps ────────────────────────────────────────────
+  // Counts against the TOTAL budget (sitemap rung opens after discovery
+  // so a slow robots.txt cannot starve the walk allotment entirely —
+  // discovery is a handful of requests; the walk is the expensive part).
   const disc = await discoverSitemapUrls(origin, abortCheck);
   stats.sitemapsDiscovered = disc.sitemaps.length;
   stats.cfChallenges += disc.cfChallenges || 0;
@@ -989,17 +1018,40 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       cancelled: true
     };
   }
+  if (budget.expired()) {
+    return {
+      ok: false,
+      mode: 'sitemap-jsonld',
+      origin,
+      products: [],
+      stats,
+      rateLimited,
+      budgetExpired: true,
+      partial: true,
+      partialReason: 'budget-exceeded',
+      reason: budgetReason('timed out during sitemap discovery')
+    };
+  }
 
   // ── Walk sitemaps → ranked page URLs ─────────────────────────────
+  // Sitemap rung: clamped to min(SITEMAP_BUDGET_MS, total remaining).
+  const sitemapBudget = budget.enterRung('sitemap', SITEMAP_BUDGET_MS);
   const walked = await walkSitemaps(disc.sitemaps, {
     abortCheck,
-    maxUrls: MAX_SITEMAP_URLS
+    maxUrls: MAX_SITEMAP_URLS,
+    budget: sitemapBudget
   });
   stats.sitemapsWalked = walked.sitemapsWalked;
   stats.cfChallenges += walked.cfChallenges || 0;
   if (walked.rateLimited) rateLimited = true;
+  if (walked.budgetExpired) budgetExpired = true;
 
   // Cancel during the walk must read as cancelled, not "no product URLs".
+  // User-cancel DISCARDS the partial URL list: the operator said stop, so
+  // we refuse further network spend on PDPs. Budget expiry is different —
+  // the discovery clock ran out, but URLs already collected are free to
+  // scan under whatever TOTAL budget remains (PDP rung). Keeping them
+  // maximises products recovered from sitemap-fetch time already spent.
   if (walked.aborted) {
     return {
       ok: false,
@@ -1015,6 +1067,24 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
 
   const pageEntries = walked.pageEntries || [];
   if (!pageEntries.length) {
+    // Prefer a budget reason over the generic "no product URLs" message
+    // when the walk was cut short before any locs landed.
+    if (budgetExpired) {
+      const reason = budgetReason('no product URLs collected before the wall-clock limit');
+      console.warn(`   ⚠️  ${LOG}  ${reason}`);
+      return {
+        ok: false,
+        mode: 'sitemap-jsonld',
+        origin,
+        products: [],
+        stats,
+        rateLimited,
+        budgetExpired: true,
+        partial: true,
+        partialReason: 'budget-exceeded',
+        reason
+      };
+    }
     const reason = 'sitemaps found but contained no product page URLs';
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
     return {
@@ -1127,10 +1197,15 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
 
   let aborted = false;
   let stop = false;
+  // PDP rung gets whatever TOTAL budget remains after the sitemap walk.
+  // Separate from the sitemap rung so a slow walk cannot silently steal
+  // the whole allotment without the operator seeing a budget reason.
+  const pdpBudget = budget.enterRung('pdp', budget.remainingMs());
   for (let i = 0; i < pageEntries.length && !stop; i += pdpConcurrency) {
     if (products.length >= effectiveCap) break;
     if (stats.urlsScanned >= MAX_SITEMAP_URLS) break;
     if (await abortCheck()) { aborted = true; break; }
+    if (pdpBudget.expired() || budget.expired()) { budgetExpired = true; break; }
     // Respect a site-declared crawl-delay between (serial) chunks.
     if (i > 0 && pdpGapMs > 0) await sleep(pdpGapMs);
 
@@ -1179,6 +1254,51 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       cancelled: true,
       reason: 'aborted during product scan'
     };
+  }
+
+  // Budget expiry mid-scan — keep products already collected (same partial-
+  // keeping contract as abort-mid-scan) but flag budgetExpired, NOT cancelled.
+  if (budgetExpired) {
+    if (!products.length) {
+      const reason = budgetReason(
+        `scanned ${stats.urlsScanned} pages but no products extracted before the wall-clock limit`
+      );
+      console.warn(`   ⚠️  ${LOG}  ${reason}`);
+      return {
+        ok: false,
+        mode: 'sitemap-jsonld',
+        origin,
+        products: [],
+        stats,
+        rateLimited,
+        budgetExpired: true,
+        partial: true,
+        partialReason: 'budget-exceeded',
+        reason
+      };
+    }
+    if (stats.validationFailures > 0) {
+      warnings.push(`${stats.validationFailures} product pages failed validation (skipped)`);
+    }
+    if (stats.cfChallenges > 0) {
+      warnings.push(`${stats.cfChallenges} Cloudflare challenge(s) encountered`);
+    }
+    const reason = budgetReason(`kept ${products.length} product(s)`);
+    console.log(`${LOG}  resolveGenericCatalog partial (budget): n=${products.length} ${reason}`);
+    const out = {
+      ok: true,
+      mode: 'sitemap-jsonld',
+      origin,
+      products,
+      stats,
+      rateLimited,
+      budgetExpired: true,
+      partial: true,
+      partialReason: 'budget-exceeded',
+      reason
+    };
+    if (warnings.length) out.warnings = warnings;
+    return out;
   }
 
   // ── Decisive unscrapeable / partial outcomes ─────────────────────
