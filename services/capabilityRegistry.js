@@ -1648,6 +1648,74 @@ const CAPABILITIES = [
   },
 
   {
+    id:       'media.listAssignments',
+    title:    'List attachments on a UGC Media',
+    describe: 'Read-only enumeration of every attachment on a Media (products, categories, branding, promotional) — both DETECT-derived (auto) and OPERATOR-added entries. Each attachment row carries a `source: "detect" | "operator"` field so the UI can render auto-match vs. operator-attached distinction. Foundation for the UGC-ads wizard (Phase 2) and the UGC Ads page.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaListAssignments',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'media.attachTo',
+    title:    'Attach a UGC Media to a product / category / branding / promotional target',
+    describe: 'Attach one Media to one target so downstream UGC-ads generation seeds from it. Writes source:"operator" so detect re-runs cannot clobber the attachment. targetType controls the shape: product / category require a targetId (CatalogProduct / Category ObjectId); branding requires no target; promotional accepts an optional productIds[] for callout products. Idempotent — attaching the same Media to the same target twice refreshes the timestamps rather than duplicating. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId', 'targetType'],
+      properties: {
+        mediaId:    { type: 'string', description: 'Media ObjectId.' },
+        targetType: { type: 'string', enum: ['product', 'category', 'branding', 'promotional'], description: 'Attachment kind.' },
+        targetId:   { type: 'string', description: 'CatalogProduct or Category ObjectId — required when targetType is product or category.' },
+        productIds: { type: 'array', items: { type: 'string' }, maxItems: 50, description: 'Optional product callouts when targetType=promotional.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaAttachTo',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'media.detachFrom',
+    title:    'Remove an operator attachment from a UGC Media',
+    describe: 'Delete an operator-added attachment from a Media. Only touches source:"operator" entries — detect-derived matches for the same target still stand. Same targetType/targetId shape as media.attachTo. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId', 'targetType'],
+      properties: {
+        mediaId:    { type: 'string', description: 'Media ObjectId.' },
+        targetType: { type: 'string', enum: ['product', 'category', 'branding', 'promotional'] },
+        targetId:   { type: 'string', description: 'Required for product / category detaches.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaDetachFrom',
+      method:  'run'
+    }
+  },
+
+  {
     id:       'catalog.listProductsWithoutAds',
     title:    'List products lacking an ad (optionally by kind / aspect)',
     describe: 'Cross-reference a brand\'s catalog against its ads and return the products that have NO counted ad matching the shape filter. Server-side aggregation — one call answers "which products need a 9:16 reels ad?" without needing 25+ paginated db.query invocations. Optional filters: kind (image | video), aspectRatio (e.g. "9:16", "1:1", "4:5"), statuses (defaults to the "counted as real" set: ok / draft / queued / rendering — failed and archived are ignored). Bounded: enumerates up to 500 catalog products, returns up to 100 missing.',

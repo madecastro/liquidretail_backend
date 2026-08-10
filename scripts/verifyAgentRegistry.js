@@ -101,6 +101,10 @@ const FILES = [
   'services/capabilityExecutors/mediaSourceSummary.js',
   'services/capabilityExecutors/dbQuery.js',
   'services/capabilityExecutors/catalogListProductsWithoutAds.js',
+  'services/capabilityExecutors/mediaAttachTo.js',
+  'services/capabilityExecutors/mediaDetachFrom.js',
+  'services/capabilityExecutors/mediaListAssignments.js',
+  'services/mediaAssignmentService.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -1040,6 +1044,84 @@ async function checkProductsWithoutAds() {
   });
   assert(r5.ok === false && /statuses must be a non-empty array/i.test(r5.error),
     `catalogListProductsWithoutAds: empty statuses array rejected`);
+}
+
+// ── 35. UGC-ads Phase 1: media.attachTo / detachFrom / listAssignments ──
+console.log('\n[35] Media assignment executors');
+
+for (const [id, tier] of [
+  ['media.listAssignments', 0],
+  ['media.attachTo',        1],
+  ['media.detachFrom',      1]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+async function checkMediaAssignmentExecutors() {
+  const noScope = {};
+  const attach   = require('../services/capabilityExecutors/mediaAttachTo');
+  const detach   = require('../services/capabilityExecutors/mediaDetachFrom');
+  const listCap  = require('../services/capabilityExecutors/mediaListAssignments');
+
+  // Tenant + args guards (all before DB).
+  for (const [name, exec] of [
+    ['mediaAttachTo',        attach],
+    ['mediaDetachFrom',      detach],
+    ['mediaListAssignments', listCap]
+  ]) {
+    const r1 = await exec.run({ req: noScope, args: {} });
+    assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+      `${name}: no-scope → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r2.ok === false && /mediaId required/i.test(r2.error),
+      `${name}: missing mediaId → rejects`);
+    const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+    assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+      `${name}: invalid mediaId → rejects`);
+  }
+
+  // attachTo: targetType enum + targetId dependency (reachable pre-DB).
+  const OID = '000000000000000000000000';
+  const a1 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID }
+  });
+  assert(a1.ok === false && /targetType must be one of/i.test(a1.error),
+    `mediaAttachTo: missing targetType → rejects`);
+  const a2 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'bogus' }
+  });
+  assert(a2.ok === false && /targetType must be one of/i.test(a2.error),
+    `mediaAttachTo: bogus targetType rejected`);
+  const a3 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'product' }
+  });
+  assert(a3.ok === false && /targetId required/i.test(a3.error),
+    `mediaAttachTo: targetType=product without targetId → rejects`);
+  const a4 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'product', targetId: 'nope' }
+  });
+  assert(a4.ok === false && /valid ObjectId/i.test(a4.error),
+    `mediaAttachTo: invalid targetId → rejects`);
+  const a5 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'promotional', productIds: new Array(51).fill(OID) }
+  });
+  assert(a5.ok === false && /50 product callouts/i.test(a5.error),
+    `mediaAttachTo: >50 promotional productIds rejected`);
+
+  // detachFrom: same shape.
+  const d1 = await detach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'product' }
+  });
+  assert(d1.ok === false && /targetId required/i.test(d1.error),
+    `mediaDetachFrom: targetType=product without targetId → rejects`);
 }
 
 // ── 30. db.query (security-critical structured read) ─────────────
@@ -2234,6 +2316,49 @@ async function checkPhase4Tier2Executors() {
     `routes/media.js filters deletedAt=null in the list query`);
 }
 
+// ── 34. UGC-ads Phase 1: detect writes must NOT clobber operator entries ──
+//
+// Every $pull site that rewrites matched*/matchedMedia entries MUST
+// filter on source:'detect'. Otherwise operator-added attachments
+// (source:'operator') get wiped on every detect / brand-promote /
+// retro-link sweep — silently, without any test firing.
+//
+// This scan pins the invariant across all four write sites we know
+// about. New sites that rebuild these arrays must add themselves to
+// the list AND include the source filter.
+{
+  const FILES_TO_SCAN = [
+    'pipelines/detect.js',                              // Media matched* + CatalogProduct.matchedMedia mirror
+    'services/catalogProductPromoteService.js',         // matchedMedia rebuild on draft-promotion
+    'services/catalogRetroLinkService.js'               // matchedMedia rebuild on brand-wide retro link
+  ];
+  for (const rel of FILES_TO_SCAN) {
+    const abs = path.join(__dirname, '..', rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    // Every $pull that mentions the target arrays MUST include the
+    // source-filter constraint. Two acceptable shapes:
+    //   $pull: { matchedMedia: { source: 'detect' } }
+    //   $pull: { matchedMedia: { mediaId, source: 'detect' } }
+    // Reject any $pull on matched* / matchedMedia that lacks source.
+    // Regex: find `$pull: { <arr>: { ... } }` and require /source/ inside.
+    const pullBlockRe = /\$pull:\s*\{\s*(matchedProducts|matchedCategories|matchedMedia)\s*:\s*\{([^}]*)\}/g;
+    let m;
+    while ((m = pullBlockRe.exec(src)) !== null) {
+      const arr  = m[1];
+      const body = m[2];
+      assert(/source\s*:/.test(body),
+        `${rel}: $pull on ${arr} missing source filter — UGC-ADS PHASE 1 REGRESSION (operator attachments would be wiped on detect re-run). Match at "${body.trim().slice(0, 80)}"`);
+    }
+    // Belt-and-braces: no $set: { matched* / matchedMedia: X } shape
+    // anywhere. Wholesale-replace is what breaks operator entries.
+    // If a $set is needed for a NEW field (not matched*), the regex
+    // won't match — this is specifically the array-clobber pattern.
+    const setBlockRe = /\$set:\s*\{[^}]*(matchedMedia|matchedProducts|matchedCategories)\s*:\s*(?!\{|\$)/g;
+    assert(!setBlockRe.test(src),
+      `${rel}: contains $set: { matched* } wholesale replace — must be $pull(source:'detect') + $push instead`);
+  }
+}
+
 // ── 33. YOLO_SERVICE_URL env override pinned ──────────────────────
 //
 // The 2026-08-10 prod-staging split introduced two backend envs that
@@ -2376,6 +2501,7 @@ async function checkT0SmokeSuite() {
     { id: 'integrations.metaAds.listCredentials',     args: { brandId: OID_ZERO } },
     { id: 'integrations.googleAds.listCredentials',   args: { brandId: OID_ZERO } },
     { id: 'media.sourceSummary',                      args: { brandId: OID_ZERO } },
+    { id: 'media.listAssignments',                    args: { mediaId: OID_ZERO } },
     { id: 'catalog.listProductsWithoutAds',           args: { brandId: OID_ZERO } },
     { id: 'db.query',                                 args: { collection: 'Media' } },
     { id: 'db.query',                                 args: { collection: 'CatalogProduct' } },
@@ -2453,6 +2579,7 @@ async function checkT0SmokeSuite() {
   await checkMediaSourceSummary();
   await checkDbQueryInvariants();
   await checkProductsWithoutAds();
+  await checkMediaAssignmentExecutors();
   await checkT0SmokeSuite();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);

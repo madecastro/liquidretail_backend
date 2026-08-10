@@ -436,4 +436,97 @@ router.post('/:mediaId/refresh-insights', async (req, res) => {
   }
 });
 
+// ── UGC-ads Phase 1 — operator-driven attachments ────────────────────
+//
+// Attach a UGC Media to a product / category / branding / promotional
+// target. Every write goes through mediaAssignmentService which stamps
+// source:'operator' so detect re-runs can't clobber the entry.
+
+const mediaAssignmentService = require('../services/mediaAssignmentService');
+
+// POST /api/media/:mediaId/assign
+// Body: { targetType: 'product'|'category'|'branding'|'promotional',
+//         targetId?: ObjectId, productIds?: [ObjectId] }
+router.post('/:mediaId/assign', express.json(), async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const { targetType } = req.body || {};
+    const assignedBy = req.user?.email || req.user?.userId || null;
+    if (!['product', 'category', 'branding', 'promotional'].includes(targetType)) {
+      return res.status(400).json({ error: `targetType must be one of: product, category, branding, promotional` });
+    }
+
+    let result;
+    if (targetType === 'product') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for product attachment' });
+      result = await mediaAssignmentService.attachProduct({
+        mediaId, productId: req.body.targetId, advertiserId: req.advertiserId, assignedBy
+      });
+    } else if (targetType === 'category') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for category attachment' });
+      result = await mediaAssignmentService.attachCategory({
+        mediaId, categoryId: req.body.targetId, advertiserId: req.advertiserId, assignedBy
+      });
+    } else if (targetType === 'branding') {
+      result = await mediaAssignmentService.attachBranding({
+        mediaId, advertiserId: req.advertiserId, assignedBy
+      });
+    } else {
+      result = await mediaAssignmentService.attachPromotional({
+        mediaId, productIds: req.body?.productIds || [], advertiserId: req.advertiserId, assignedBy
+      });
+    }
+
+    if (!result.ok) return res.status(result.code === 'MEDIA_NOT_FOUND' ? 404 : 400).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'assign failed' });
+  }
+});
+
+// DELETE /api/media/:mediaId/assign
+// Body: { targetType, targetId? }
+router.delete('/:mediaId/assign', express.json(), async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const { targetType } = req.body || {};
+    if (!['product', 'category', 'branding', 'promotional'].includes(targetType)) {
+      return res.status(400).json({ error: `targetType must be one of: product, category, branding, promotional` });
+    }
+
+    let result;
+    if (targetType === 'product') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for product detach' });
+      result = await mediaAssignmentService.detachProduct({ mediaId, productId: req.body.targetId, advertiserId: req.advertiserId });
+    } else if (targetType === 'category') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for category detach' });
+      result = await mediaAssignmentService.detachCategory({ mediaId, categoryId: req.body.targetId, advertiserId: req.advertiserId });
+    } else if (targetType === 'branding') {
+      result = await mediaAssignmentService.detachBranding({ mediaId, advertiserId: req.advertiserId });
+    } else {
+      result = await mediaAssignmentService.detachPromotional({ mediaId, advertiserId: req.advertiserId });
+    }
+
+    if (!result.ok) return res.status(result.code === 'MEDIA_NOT_FOUND' ? 404 : 400).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'detach failed' });
+  }
+});
+
+// GET /api/media/:mediaId/assignments — enumerate all attachments
+// (both detect + operator provenance).
+router.get('/:mediaId/assignments', async (req, res) => {
+  try {
+    const result = await mediaAssignmentService.listAssignments({
+      mediaId: req.params.mediaId,
+      advertiserId: req.advertiserId
+    });
+    if (!result.ok) return res.status(result.code === 'MEDIA_NOT_FOUND' ? 404 : 400).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'assignments fetch failed' });
+  }
+});
+
 module.exports = router;

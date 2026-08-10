@@ -195,6 +195,14 @@ const catalogProductSchema = new mongoose.Schema({
   // Idempotency: dedup on (mediaId, matchEvidenceArtifactId) at write time
   // via $pull + $addToSet, so re-running detect for the same media replaces
   // the prior entry rather than accumulating duplicates.
+  // The `source` field on every subdoc distinguishes DETECT-derived
+  // entries from OPERATOR-added attachments (Phase 1 of UGC-ads flow,
+  // 2026-08-10). Default 'detect' so back-compat writes keep working.
+  // Every $pull site that rewrites detect matches MUST filter on
+  // source:'detect' — otherwise operator entries get wiped every
+  // detect run / brand-promote / retro-link sweep. See
+  // pipelines/detect.js:mirrorMatchesToCatalogProducts,
+  // catalogProductPromoteService, and catalogRetroLinkService.
   matchedMedia: [{
     mediaId:                 { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },
     matchTier:               String,   // 'product_match' | 'product_category'
@@ -202,6 +210,9 @@ const catalogProductSchema = new mongoose.Schema({
     refinedProductId:        String,
     matchEvidenceArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
     matchedAt:               Date,
+    source:                  { type: String, enum: ['detect', 'operator'], default: 'detect' },
+    assignedAt:              { type: Date, default: null },
+    assignedBy:              { type: String, default: null },
     _id: false
   }],
 

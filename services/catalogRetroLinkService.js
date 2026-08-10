@@ -193,13 +193,22 @@ async function rebuildMatchedMedia(catalogProductId) {
       confidence:              a.catalogCombinedScore ?? a.identification?.certainty ?? 0,
       refinedProductId:        a.productIndex || null,
       matchEvidenceArtifactId: a._id,
-      matchedAt:               new Date()
+      matchedAt:               new Date(),
+      source:                  'detect'   // required — must not $set-clobber operator entries
     });
   }
+  // Was $set: matchedMedia — same UGC-ads Phase 1 fix as catalog-
+  // ProductPromoteService. Operator entries survive.
   await CatalogProduct.updateOne(
     { _id: catalogProductId },
-    { $set: { matchedMedia: entries } }
+    { $pull: { matchedMedia: { source: 'detect' } } }
   );
+  if (entries.length) {
+    await CatalogProduct.updateOne(
+      { _id: catalogProductId },
+      { $push: { matchedMedia: { $each: entries } } }
+    );
+  }
 }
 
 module.exports = { runBrandWide };

@@ -971,6 +971,11 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
       });
     }
   });
+  // Stamp source='detect' on every entry so operator-added entries
+  // (source='operator') can be distinguished + preserved on re-run.
+  // Load-bearing — see the Media schema comment + verifier §34.
+  for (const mp of matchedProducts)   mp.source = 'detect';
+  for (const mc of matchedCategories) mc.source = 'detect';
   media.matchedProducts   = matchedProducts;
   media.matchedCategories = matchedCategories;
 
@@ -979,21 +984,35 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
     media.classification = media.classification || {};
     media.classification.detectSummary = productMatches.detectSummary;
   }
-  // updateOne, not save() — Mongoose's dirty-field tracker still has
-  // the earlier denorm assignments (subjects/text/refinedProducts)
-  // flagged as modified, so a save() here would re-run those with a
-  // stale __v and trip "No matching document found". updateOne writes
-  // exactly the match-denorm fields and skips the version check.
+  // Update pattern (2026-08-10, UGC-ads Phase 1): $pull existing
+  // detect entries → $push fresh ones. Operator entries survive
+  // because $pull filters on source:'detect'. Prior code was
+  // $set: matchedProducts (wholesale overwrite) — that would wipe
+  // every operator attachment on every detect re-run. If a future
+  // refactor goes back to $set, the verifier's UGC-attachment
+  // regression guard fires.
   try {
+    // Two-step: pull all detect entries, then push the new set.
+    // Can't merge into one updateOne — $pull and $push on the same
+    // path in the same command are ambiguous and Mongo rejects.
     await Media.updateOne(
       { _id: media._id },
-      { $set: {
-          matchedProducts,
-          matchedCategories,
-          ...(productMatches?.detectSummary
-              ? { 'classification.detectSummary': productMatches.detectSummary }
-              : {})
+      { $pull: {
+          matchedProducts:   { source: 'detect' },
+          matchedCategories: { source: 'detect' }
       } }
+    );
+    await Media.updateOne(
+      { _id: media._id },
+      {
+        $push: {
+          matchedProducts:   { $each: matchedProducts },
+          matchedCategories: { $each: matchedCategories }
+        },
+        ...(productMatches?.detectSummary
+            ? { $set: { 'classification.detectSummary': productMatches.detectSummary } }
+            : {})
+      }
     );
   } catch (err) {
     console.warn(`   ⚠️  failed to persist Media match denormalization: ${err.message}`);
@@ -1025,7 +1044,8 @@ async function mirrorMatchesToCatalogProducts(mediaId, matchedProducts) {
       confidence:              mp.confidence,
       refinedProductId:        mp.refinedProductId,
       matchEvidenceArtifactId: mp.matchEvidenceArtifactId,
-      matchedAt:               new Date()
+      matchedAt:               new Date(),
+      source:                  'detect'   // required — must not $pull operator entries
     };
     if (!byCatalogProduct.has(cpId)) byCatalogProduct.set(cpId, []);
     byCatalogProduct.get(cpId).push(entry);
@@ -1055,10 +1075,13 @@ async function mirrorMatchesToCatalogProducts(mediaId, matchedProducts) {
     // pull+push so re-runs replace rather than duplicate the entry.
     const targetIds = [cpId, ...(variantsByPrimary.get(String(cpId)) || []).map(String)];
     for (const targetId of targetIds) {
+      // Only $pull DETECT entries for this media — operator-added
+      // matchedMedia entries survive detect re-runs. Load-bearing
+      // for the UGC-ads Phase 1 attachment preservation invariant.
       bulkOps.push({
         updateOne: {
           filter: { _id: targetId },
-          update: { $pull: { matchedMedia: { mediaId } } }
+          update: { $pull: { matchedMedia: { mediaId, source: 'detect' } } }
         }
       });
       bulkOps.push({
