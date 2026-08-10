@@ -61,6 +61,10 @@ const { createBudget } = require('./genericCatalogDiscovery/budget');
 // Platform fingerprint (pure) — senses Shopify etc. from pre-fetched
 // homepage + robots so the generic path can climb the right ladder.
 const { fingerprintSite } = require('./siteFingerprintService');
+// Per-host browser-cleared session cache (Cookie + pinned UA). Used only
+// after the cheap path fails a browser-fixable block — most syncs never
+// touch Chrome. See scrapeSession.js for host keying (not eTLD+1).
+const scrapeSession = require('./scrapeSession');
 
 // ── constants ──────────────────────────────────────────────────────
 const LOG = '🗺';
@@ -72,6 +76,17 @@ const LOG = '🗺';
 // mean 7.91 images). Flag-off restores byte-identical prior behaviour:
 // no homepage fetch, no fingerprint, no new result keys.
 const AUTODETECT_ENABLED = process.env.GENERIC_CATALOG_AUTODETECT !== 'false';
+// Last-rung browser + session reuse. Default ON, but Chrome launches ONLY
+// when the cheap HTTP path already failed for a reason a browser can fix
+// (CF / PX / DataDome browser-session remedy, Shopify ladder fallthrough,
+// or zero sitemap candidates while robots was reachable). WHY (measured
+// 2026-08-10): ubeauty.com yields 0 products — Shopify behind Cloudflare
+// managed challenge; /products.json + sitemaps all 403 with
+// cf-mitigated:challenge; a real browser clears the interstitial and an
+// in-page same-origin fetch('/products.json?limit=250') returns all 103
+// products. Flag-off = no browser launch, no session replay.
+const RENDER_GENERIC_ENABLED =
+  String(process.env.RENDER_GENERIC_ENABLED || 'true').toLowerCase() !== 'false';
 // Full-catalog by default — do NOT cap at a small demo number. 10k covers
 // essentially any real catalog; override via GENERIC_CATALOG_LIMIT.
 // NOTE: crawl throughput is ~1 page / HTTP_SCRAPE_MIN_GAP_MS (≈4/s at the
@@ -117,6 +132,22 @@ const CATEGORY_MAX_OPTIONS = Math.max(
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+/** True when classifyBlock says a browser-cleared session can help. */
+function isBrowserSessionRemedy(block) {
+  if (!block || block.remedy == null) return false;
+  return String(block.remedy).startsWith('browser-session');
+}
+
+/** Record vendor/remedy on stats; flip browserSessionBlockSeen when applicable. */
+function noteBlock(stats, block) {
+  if (!stats || !block) return;
+  stats.lastBlockVendor = block.vendor || stats.lastBlockVendor || null;
+  stats.lastBlockRemedy = block.remedy || stats.lastBlockRemedy || null;
+  if (isBrowserSessionRemedy(block)) {
+    stats.browserSessionBlockSeen = true;
+  }
 }
 
 // ── robots.txt (Sitemap: + Crawl-delay — httpScrapeClient ignores both) ─
@@ -767,35 +798,66 @@ function validateProduct(p) {
 
 // ── sitemap fetch helpers ──────────────────────────────────────────
 
-async function fetchXmlText(url) {
+async function fetchXmlText(url, { session = null } = {}) {
   const isGz = /\.gz($|\?)/i.test(url);
   if (isGz) {
-    const res = await http.fetchBuffer(url, { maxBytes: 20_000_000 });
-    if (res.cfChallenged) return { ok: false, cfChallenged: true, rateLimited: false, text: null };
-    if (res.rateLimited) return { ok: false, cfChallenged: false, rateLimited: true, text: null };
+    const res = await http.fetchBuffer(url, { maxBytes: 20_000_000, session });
+    const block = res.block || null;
+    if (res.cfChallenged) {
+      return { ok: false, cfChallenged: true, rateLimited: false, text: null, block };
+    }
+    if (res.rateLimited) {
+      return { ok: false, cfChallenged: false, rateLimited: true, text: null, block };
+    }
     if (!res.ok || !res.buffer) {
-      return { ok: false, cfChallenged: false, rateLimited: false, text: null, error: res.error };
+      return {
+        ok: false,
+        cfChallenged: false,
+        rateLimited: false,
+        text: null,
+        error: res.error,
+        block
+      };
     }
     try {
       // Cap DECOMPRESSED size (gzip-bomb guard): a small .gz can inflate to
       // GBs. maxOutputLength makes gunzipSync throw once the cap is hit.
       const text = zlib.gunzipSync(res.buffer, { maxOutputLength: GZIP_MAX_OUTPUT_BYTES }).toString('utf8');
-      return { ok: true, text, cfChallenged: false, rateLimited: false };
+      return { ok: true, text, cfChallenged: false, rateLimited: false, block: null };
     } catch (err) {
-      return { ok: false, cfChallenged: false, rateLimited: false, text: null, error: err.message };
+      return {
+        ok: false,
+        cfChallenged: false,
+        rateLimited: false,
+        text: null,
+        error: err.message,
+        block: null
+      };
     }
   }
 
-  const res = await http.fetchText(url, { maxBytes: 8_000_000 });
-  if (res.cfChallenged) return { ok: false, cfChallenged: true, rateLimited: false, text: null };
-  if (res.rateLimited) return { ok: false, cfChallenged: false, rateLimited: true, text: null };
-  if (!res.ok || !res.text) {
-    return { ok: false, cfChallenged: false, rateLimited: false, text: null, error: res.error };
+  const res = await http.fetchText(url, { maxBytes: 8_000_000, session });
+  const block = res.block || null;
+  if (res.cfChallenged) {
+    return { ok: false, cfChallenged: true, rateLimited: false, text: null, block };
   }
-  return { ok: true, text: res.text, cfChallenged: false, rateLimited: false };
+  if (res.rateLimited) {
+    return { ok: false, cfChallenged: false, rateLimited: true, text: null, block };
+  }
+  if (!res.ok || !res.text) {
+    return {
+      ok: false,
+      cfChallenged: false,
+      rateLimited: false,
+      text: null,
+      error: res.error,
+      block
+    };
+  }
+  return { ok: true, text: res.text, cfChallenged: false, rateLimited: false, block: null };
 }
 
-async function discoverSitemapUrls(origin, abortCheck = async () => false) {
+async function discoverSitemapUrls(origin, abortCheck = async () => false, { session = null, stats = null } = {}) {
   const discovered = [];
   const seen = new Set();               // O(1) dedup (not .includes O(n^2))
   const add = (u) => { if (u && !seen.has(u)) { seen.add(u); discovered.push(u); } };
@@ -805,18 +867,23 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
   // robots body is free once fetched — hand to fingerprintSite so
   // Shopify's canonical robots signature can fire without a re-fetch.
   let robotsText = null;
+  let robotsReachable = false;
 
   // 1. robots.txt
   try {
     const robotsUrl = `${origin}/robots.txt`;
-    const res = await http.fetchText(robotsUrl, { timeoutMs: 15000 });
+    const res = await http.fetchText(robotsUrl, { timeoutMs: 15000, session });
     if (res.cfChallenged) cfChallenges += 1;
     if (res.rateLimited) rateLimited = true;
+    if (res.block) noteBlock(stats, res.block);
     if (res.ok && res.text) {
       robotsText = res.text;
+      robotsReachable = true;
       const parsed = parseRobotsForSitemaps(res.text, '*');
       crawlDelayMs = parsed.crawlDelayMs || 0;
       for (const u of parsed.sitemaps) add(u);
+    } else if (res.ok) {
+      robotsReachable = true;
     }
   } catch (err) {
     console.warn(`   ⚠️  ${LOG}  robots.txt fetch error: ${err.message}`);
@@ -828,9 +895,10 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
       if (await abortCheck()) break;
       const url = `${origin}${path}`;
       try {
-        const got = await fetchXmlText(url);
+        const got = await fetchXmlText(url, { session });
         if (got.cfChallenged) cfChallenges += 1;
         if (got.rateLimited) rateLimited = true;
+        if (got.block) noteBlock(stats, got.block);
         if (got.ok && got.text && /<loc[\s>]/i.test(got.text)) add(url);
       } catch (err) {
         console.warn(`   ⚠️  ${LOG}  fallback sitemap ${url}: ${err.message}`);
@@ -838,7 +906,14 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
     }
   }
 
-  return { sitemaps: discovered, crawlDelayMs, cfChallenges, rateLimited, robotsText };
+  return {
+    sitemaps: discovered,
+    crawlDelayMs,
+    cfChallenges,
+    rateLimited,
+    robotsText,
+    robotsReachable
+  };
 }
 
 /**
@@ -850,7 +925,13 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
  * alongside abortCheck so a large index cannot burn the whole wall-clock
  * allotment before any PDP is scanned.
  */
-async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }) {
+async function walkSitemaps(rootSitemaps, {
+  abortCheck,
+  maxUrls,
+  budget = null,
+  session = null,
+  stats = null
+} = {}) {
   const pageEntries = [];
   const seenLoc = new Set();
   const seenSitemaps = new Set();   // dedup index/sub-sitemap URLs (loop + DoS guard)
@@ -870,7 +951,9 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }
     seenSitemaps.add(url);
     sitemapFetches += 1;
     try {
-      return await fetchXmlText(url);
+      const got = await fetchXmlText(url, { session });
+      if (got && got.block) noteBlock(stats, got.block);
+      return got;
     } catch (err) {
       console.warn(`   ⚠️  ${LOG}  sitemap fetch ${url}: ${err.message}`);
       return null;
@@ -967,6 +1050,438 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }
   return { pageEntries, sitemapsWalked, cfChallenges, rateLimited, aborted, budgetExpired };
 }
 
+// ── browser session last rung ──────────────────────────────────────
+
+/**
+ * Should we launch Chrome? Only when the cheap path already failed for a
+ * reason a browser can fix, products are still empty, and budget remains.
+ * Most syncs never enter this function's body past the gate.
+ */
+function shouldAttemptBrowserRung({ stats, disc, pageEntries, budget }) {
+  if (!RENDER_GENERIC_ENABLED) return false;
+  if (stats && stats.browserAttempted) return false; // once per resolve
+  if (budget && typeof budget.expired === 'function' && budget.expired()) return false;
+
+  const browserBlock = !!(stats && stats.browserSessionBlockSeen);
+  const shopifyFall = !!(stats && stats.shopifyFallthrough);
+  // Zero candidates while robots was reachable (ubeauty: robots 200,
+  // every sitemap/products.json 403 with cf-mitigated:challenge).
+  const robotsOk = !!(disc && (disc.robotsReachable || disc.robotsText));
+  const zeroCandidates = !pageEntries || pageEntries.length === 0;
+  const zeroUrlsWithRobots = robotsOk && zeroCandidates;
+
+  return browserBlock || shopifyFall || zeroUrlsWithRobots;
+}
+
+/**
+ * tryBrowserSessionRung(...) → success result object | null
+ *
+ * null = did not run, or ran and still has zero products (caller emits
+ * the existing honest failure). On success returns a full resolveGenericCatalog
+ * result with source 'shopify-direct' | 'sitemap-jsonld'.
+ *
+ * Order once Chrome is up:
+ *   1. gotoWithCf(origin) + harvestSession (HttpOnly cookies via page.cookies)
+ *   2. if Shopify: in-page paginated products.json
+ *   3. else/additionally: re-run cheap rungs with the harvested session
+ *   4. still nothing → null (honest failure with vendor named)
+ */
+// Hard ceiling on the WHOLE browser rung, mirroring the protection the older
+// headless path already has (headlessScrapeService SHOPIFY_HEADLESS_TIMEOUT_MS +
+// its Promise.race). Env-tunable.
+//
+// WHY A RACE AND NOT JUST THE BUDGET: the wall-clock budget is CHECKED BETWEEN
+// steps — it cannot interrupt an in-flight await. Measured 2026-08-10 against
+// ubeauty.com, a wedged Chrome launch outlived a 300s total budget by more than
+// 300s and the resolver never returned. Per-step timeouts (45s goto, 15s
+// challenge wait) do not cover launch, page teardown, or an in-page evaluate
+// that never settles. This is the same defect class Phase 1 fixed for the HTTP
+// path, so the new rung gets the same guarantee.
+//
+// Note the race does not CANCEL the inner work (Promise.race cannot) — it lets
+// the resolver return honestly while the orphaned attempt unwinds. That matches
+// the existing headless path's semantics; the singleton browser is reused or
+// closed on shutdown rather than leaked per-run.
+const BROWSER_RUNG_TIMEOUT_MS = Math.max(
+  10000,
+  parseInt(process.env.HEADLESS_RUNG_TIMEOUT_MS, 10) || 120000
+);
+
+async function tryBrowserSessionRung(args) {
+  const { stats, warnings, budget } = args;
+  // Never allow the rung more time than the run has left.
+  const remaining = budget && typeof budget.remainingMs === 'function'
+    ? budget.remainingMs()
+    : Infinity;
+  const capMs = Math.max(1000, Math.min(BROWSER_RUNG_TIMEOUT_MS, remaining));
+
+  let timer = null;
+  const TIMED_OUT = Symbol('browser-rung-timeout');
+  try {
+    const result = await Promise.race([
+      tryBrowserSessionRungInner(args),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), capMs);
+      })
+    ]);
+    if (result === TIMED_OUT) {
+      const msg = `browser rung timed out after ${capMs}ms`;
+      console.warn(`   ⚠️  ${LOG}  ${msg}`);
+      if (stats) {
+        stats.browserTimedOut = true;
+        stats.browserTimeoutMs = capMs;
+      }
+      if (warnings) warnings.push(msg);
+      return null;   // fall through honestly rather than hang the run
+    }
+    return result;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function tryBrowserSessionRungInner({
+  brand,
+  origin,
+  stats,
+  warnings,
+  effectiveCap,
+  budget,
+  abortCheck,
+  run,
+  isShopify,
+  pageEntries,
+  disc,
+  getRateLimited,
+  setRateLimited,
+  getBudgetExpired,
+  setBudgetExpired,
+  activeSessionRef,
+  rescanWithSession = true,
+  attachCategoryFields = (o) => o
+}) {
+  if (!shouldAttemptBrowserRung({ stats, disc, pageEntries, budget })) {
+    return null;
+  }
+  if (await abortCheck()) return null;
+
+  stats.browserAttempted = true;
+  stats.browserMode = null;
+  stats.sessionHarvested = false;
+  stats.sessionReused = false;
+  stats.browserProductCount = 0;
+
+  let headless;
+  try {
+    headless = require('./headlessScrapeService');
+  } catch (err) {
+    warnings.push(`browser rung unavailable: ${err.message}`);
+    stats.browserError = err.message;
+    return null;
+  }
+  if (typeof headless.clearChallengeAndHarvest !== 'function') {
+    warnings.push('browser rung unavailable: clearChallengeAndHarvest missing');
+    return null;
+  }
+
+  console.log(
+    `   · ${LOG}  browser session rung — ` +
+    `shopify=${!!isShopify} blockSeen=${!!stats.browserSessionBlockSeen} ` +
+    `fallthrough=${!!stats.shopifyFallthrough}`
+  );
+  try { run?.stage?.('browser session (challenge clear)'); } catch { /* */ }
+  try {
+    run?.note?.(
+      `launching headless Chrome to clear bot challenge @ ${origin}`
+    );
+  } catch { /* */ }
+
+  const wrappedAbort = async () => {
+    try {
+      if (await abortCheck()) return true;
+    } catch { /* */ }
+    if (budget && typeof budget.expired === 'function' && budget.expired()) {
+      if (typeof setBudgetExpired === 'function') setBudgetExpired(true);
+      return true;
+    }
+    return false;
+  };
+
+  let harvest;
+  try {
+    harvest = await headless.clearChallengeAndHarvest(origin, {
+      abortCheck: wrappedAbort,
+      run,
+      tryProductsJson: !!isShopify,
+      cap: effectiveCap
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  ${LOG}  browser harvest threw: ${err.message}`);
+    stats.browserError = err.message;
+    warnings.push(`browser harvest failed: ${err.message}`);
+    return null;
+  }
+
+  if (!harvest || !harvest.ok || !harvest.session) {
+    const why = (harvest && harvest.reason) || 'challenge not cleared';
+    stats.browserError = why;
+    warnings.push(`browser session failed: ${why}`);
+    console.log(`   · ${LOG}  browser harvest failed: ${why}`);
+    return null;
+  }
+
+  // Cache only if clearance cookies are present (document.cookie trap).
+  const cached = scrapeSession.putSession({
+    origin,
+    cookieHeader: harvest.session.cookieHeader,
+    userAgent: harvest.session.userAgent,
+    acceptLanguage: harvest.session.acceptLanguage,
+    vendor: harvest.session.vendor || 'cloudflare'
+  });
+  stats.sessionHarvested = !!cached;
+  if (cached && activeSessionRef) activeSessionRef.set(cached);
+  if (!cached) {
+    // Harvest returned cookies but they failed the clearance gate —
+    // still usable for in-page products already collected; HTTP reuse no.
+    warnings.push(
+      'browser harvest missing cf_clearance/__cf_bm — session not cached for HTTP reuse'
+    );
+  }
+
+  // ── 2. Shopify in-page products.json ─────────────────────────────
+  const rawProducts = Array.isArray(harvest.products) ? harvest.products : [];
+  if (rawProducts.length) {
+    stats.browserMode = 'products-json';
+    stats.browserProductCount = rawProducts.length;
+    const mapFlat = ingestHelpers.mapShopifyNormalizedToFlat;
+    const flat = [];
+    for (const p of rawProducts) {
+      try {
+        const m = mapFlat(p, origin, brand);
+        if (m && m.externalId) flat.push(m);
+      } catch (err) {
+        warnings.push(`browser shopify map failed for ${p && p.id}: ${err.message}`);
+      }
+    }
+    if (flat.length) {
+      console.log(
+        `${LOG}  resolveGenericCatalog ok via browser products.json: n=${flat.length}`
+      );
+      const out = {
+        ok: true,
+        mode: 'products-json',
+        // CatalogProduct.source enum — must stay a valid member.
+        source: 'shopify-direct',
+        origin,
+        products: flat.slice(0, effectiveCap),
+        stats,
+        rateLimited: typeof getRateLimited === 'function' ? getRateLimited() : false
+      };
+      if (warnings.length) out.warnings = warnings;
+      if (typeof getBudgetExpired === 'function' && getBudgetExpired()) {
+        out.budgetExpired = true;
+        out.partial = true;
+        out.partialReason = 'budget-exceeded';
+      }
+      return attachCategoryFields(out);
+    }
+  }
+
+  // ── 3. Re-run cheap rungs with harvested session ─────────────────
+  const session = cached || (activeSessionRef && activeSessionRef.get());
+  if (!rescanWithSession || !session || !session.isValid()) {
+    return null;
+  }
+
+  stats.sessionReused = true;
+  stats.browserMode = stats.browserMode || 'session-http';
+  try { run?.stage?.('re-scan with browser session'); } catch { /* */ }
+  try {
+    run?.note?.('replaying cleared session on HTTP path (sitemap + PDPs)');
+  } catch { /* */ }
+
+  // Re-discover + walk with session (sitemaps may have been CF-blocked).
+  let sessionEntries = Array.isArray(pageEntries) ? pageEntries.slice() : [];
+  if (!sessionEntries.length) {
+    try {
+      const disc2 = await discoverSitemapUrls(origin, abortCheck, {
+        session,
+        stats
+      });
+      if (disc2.rateLimited && typeof setRateLimited === 'function') {
+        setRateLimited(true);
+      }
+      stats.cfChallenges += disc2.cfChallenges || 0;
+      if (disc2.sitemaps && disc2.sitemaps.length) {
+        const walked2 = await walkSitemaps(disc2.sitemaps, {
+          abortCheck: wrappedAbort,
+          maxUrls: MAX_SITEMAP_URLS,
+          budget:
+            budget && typeof budget.enterRung === 'function'
+              ? budget.enterRung('sitemap-session', budget.remainingMs())
+              : null,
+          session,
+          stats
+        });
+        stats.sitemapsWalked += walked2.sitemapsWalked || 0;
+        stats.cfChallenges += walked2.cfChallenges || 0;
+        if (walked2.rateLimited && typeof setRateLimited === 'function') {
+          setRateLimited(true);
+        }
+        if (walked2.budgetExpired && typeof setBudgetExpired === 'function') {
+          setBudgetExpired(true);
+        }
+        sessionEntries = walked2.pageEntries || [];
+      }
+    } catch (err) {
+      warnings.push(`session re-discover failed: ${err.message}`);
+    }
+  }
+
+  if (!sessionEntries.length) {
+    // Optional: renderKnownUrls is available but we have no URLs — done.
+    return null;
+  }
+
+  // Bounded PDP re-scan with session (same validation as the main loop).
+  const sessionProducts = [];
+  const seenIds = new Set();
+  const pdpBudget =
+    budget && typeof budget.enterRung === 'function'
+      ? budget.enterRung('pdp-session', budget.remainingMs())
+      : null;
+  const scanCap = Math.min(sessionEntries.length, MAX_SITEMAP_URLS);
+
+  for (let i = 0; i < scanCap && sessionProducts.length < effectiveCap; i++) {
+    if (await abortCheck()) break;
+    if (pdpBudget && pdpBudget.expired()) {
+      if (typeof setBudgetExpired === 'function') setBudgetExpired(true);
+      break;
+    }
+    if (budget && budget.expired()) {
+      if (typeof setBudgetExpired === 'function') setBudgetExpired(true);
+      break;
+    }
+
+    const entry = sessionEntries[i];
+    const loc = entry && entry.loc;
+    if (!loc) continue;
+
+    let html = null;
+    try {
+      const res = await http.fetchText(loc, {
+        timeoutMs: 15000,
+        maxBytes: 4_000_000,
+        session
+      });
+      if (res.block) noteBlock(stats, res.block);
+      if (res.cfChallenged) {
+        stats.cfChallenges += 1;
+        continue;
+      }
+      if (res.rateLimited) {
+        if (typeof setRateLimited === 'function') setRateLimited(true);
+        break;
+      }
+      if (!res.ok || !res.text) continue;
+      html = res.text;
+    } catch {
+      continue;
+    }
+
+    stats.urlsScanned += 1;
+    let mapped = null;
+    try {
+      const nodes = extractJsonLdProducts(html);
+      if (nodes.length) {
+        stats.jsonLdProductsFound += 1;
+        for (const node of nodes) {
+          mapped = mapJsonLdProduct(node, loc);
+          if (mapped) break;
+        }
+        if (!mapped) {
+          const htmlId = extractProductIdFromHtml(html);
+          if (htmlId) {
+            for (const node of nodes) {
+              mapped = mapJsonLdProduct(node, loc, htmlId);
+              if (mapped) break;
+            }
+          }
+        }
+      }
+      if (!mapped) {
+        mapped = mapOgProduct(html, loc);
+        if (mapped) stats.ogFallbackUsed += 1;
+      }
+    } catch {
+      continue;
+    }
+    if (!mapped) continue;
+
+    if (entry.lastmod) mapped._lastmod = entry.lastmod;
+    try {
+      const bc = extractBreadcrumb(html);
+      if (bc && Array.isArray(bc.breadcrumb) && bc.breadcrumb.length) {
+        mapped.breadcrumb = bc.breadcrumb;
+        mapped.breadcrumbSource = bc.source;
+      }
+    } catch { /* best-effort */ }
+    if (mapped.rating == null || !mapped.productReviews) {
+      try {
+        const rev = reviewsEngine.extractOnPageReviews(html);
+        if (rev.rating != null && mapped.rating == null) mapped.rating = rev.rating;
+        if (!mapped.productReviews) {
+          mapped.productReviews = reviewsEngine.buildProductReviews(rev);
+        } else if (rev.platform && !mapped.productReviews.platform) {
+          mapped.productReviews.platform = rev.platform;
+        }
+      } catch { /* best-effort */ }
+    }
+
+    if (!validateProduct(mapped).valid) {
+      stats.validationFailures += 1;
+      continue;
+    }
+    const idKey = String(mapped.externalId);
+    if (seenIds.has(idKey)) {
+      stats.duplicatesSkipped += 1;
+      continue;
+    }
+    seenIds.add(idKey);
+    sessionProducts.push(mapped);
+    try {
+      run?.tick?.(
+        sessionProducts.length,
+        effectiveCap,
+        `session scan ${sessionProducts.length}/${effectiveCap}`
+      );
+    } catch { /* */ }
+  }
+
+  stats.browserProductCount = sessionProducts.length;
+  if (!sessionProducts.length) return null;
+
+  console.log(
+    `${LOG}  resolveGenericCatalog ok via browser session HTTP: n=${sessionProducts.length}`
+  );
+  const out = {
+    ok: true,
+    mode: 'sitemap-jsonld',
+    source: 'sitemap-jsonld',
+    origin,
+    products: sessionProducts.slice(0, effectiveCap),
+    stats,
+    rateLimited: typeof getRateLimited === 'function' ? getRateLimited() : false
+  };
+  if (warnings.length) out.warnings = warnings;
+  if (typeof getBudgetExpired === 'function' && getBudgetExpired()) {
+    out.budgetExpired = true;
+    out.partial = true;
+    out.partialReason = 'budget-exceeded';
+  }
+  return attachCategoryFields(out);
+}
+
 // ── main resolve ───────────────────────────────────────────────────
 
 /**
@@ -991,6 +1506,13 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }
  * existing shopifyAccessResolver ladder (products.json first). Zero products
  * (e.g. CF-blocked) falls through to sitemap+JSON-LD so coverage is never
  * lost. Living Spaces (non-Shopify) stays on the JSON-LD path.
+ *
+ * BROWSER SESSION (RENDER_GENERIC_ENABLED, default true): last rung only —
+ * launches Chrome when a browser-session block was seen, the Shopify ladder
+ * fell through, or sitemaps yielded zero URLs while robots was reachable.
+ * Harvests HttpOnly cookies (page.cookies — NEVER document.cookie), then
+ * either pulls products.json in-page (Shopify) or re-runs cheap HTTP rungs
+ * with the pinned session. Most syncs never start a browser.
  */
 async function resolveGenericCatalog(brand, {
   run = null,
@@ -1046,7 +1568,10 @@ async function resolveGenericCatalog(brand, {
   // Counts against the TOTAL budget (sitemap rung opens after discovery
   // so a slow robots.txt cannot starve the walk allotment entirely —
   // discovery is a handful of requests; the walk is the expensive part).
-  const disc = await discoverSitemapUrls(origin, abortCheck);
+  // `activeSession` is null until the browser rung harvests one; cheap
+  // path first, always.
+  let activeSession = null;
+  const disc = await discoverSitemapUrls(origin, abortCheck, { stats });
   stats.sitemapsDiscovered = disc.sitemaps.length;
   stats.cfChallenges += disc.cfChallenges || 0;
   if (disc.rateLimited) rateLimited = true;
@@ -1066,6 +1591,7 @@ async function resolveGenericCatalog(brand, {
       const homeRes = await http.fetchText(`${origin}/`, { timeoutMs: 15000, maxBytes: 2_000_000 });
       if (homeRes.cfChallenged) stats.cfChallenges += 1;
       if (homeRes.rateLimited) rateLimited = true;
+      if (homeRes.block) noteBlock(stats, homeRes.block);
       if (homeRes.ok && homeRes.text) {
         homepageHtml = homeRes.text;
         homepageHeaders = homeRes.headers || null;
@@ -1189,8 +1715,40 @@ async function resolveGenericCatalog(brand, {
     }
   }
 
+  // Track Shopify eligibility for the browser rung (products.json in-page).
+  let shopifyEligibleForBrowser = stats.platform === 'shopify' &&
+    (stats.confidence === 'high' || stats.confidence === 'medium');
+
   if (!disc.sitemaps.length) {
-    const reason = `no sitemaps found at ${origin} — site does not expose XML sitemaps`;
+    // Last rung: browser may still recover Shopify products.json (ubeauty)
+    // even when no Sitemap: lines / fallbacks are reachable over HTTP.
+    // Never launch Chrome on discoverOnly (category-options preview).
+    if (!discoverOnly) {
+      const browserEarly = await tryBrowserSessionRung({
+        brand,
+        origin,
+        stats,
+        warnings,
+        effectiveCap,
+        budget,
+        abortCheck,
+        run,
+        isShopify: shopifyEligibleForBrowser || !!stats.shopifyFallthrough,
+        pageEntries: [],
+        disc,
+        getRateLimited: () => rateLimited,
+        setRateLimited: (v) => { rateLimited = v; },
+        getBudgetExpired: () => budgetExpired,
+        setBudgetExpired: (v) => { budgetExpired = v; },
+        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } }
+      });
+      if (browserEarly) return browserEarly;
+    }
+
+    const reason = stats.lastBlockVendor
+      ? `no sitemaps found at ${origin} — blocked by ${stats.lastBlockVendor}` +
+        (stats.browserAttempted ? ' (browser session also failed)' : '')
+      : `no sitemaps found at ${origin} — site does not expose XML sitemaps`;
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
     const emptyOut = {
       ok: false,
@@ -1244,7 +1802,9 @@ async function resolveGenericCatalog(brand, {
   const walked = await walkSitemaps(disc.sitemaps, {
     abortCheck,
     maxUrls: MAX_SITEMAP_URLS,
-    budget: sitemapBudget
+    budget: sitemapBudget,
+    session: activeSession,
+    stats
   });
   stats.sitemapsWalked = walked.sitemapsWalked;
   stats.cfChallenges += walked.cfChallenges || 0;
@@ -1291,7 +1851,36 @@ async function resolveGenericCatalog(brand, {
         reason
       };
     }
-    const reason = 'sitemaps found but contained no product page URLs';
+
+    // ubeauty-class: robots + Sitemap: lines present, every sitemap doc
+    // CF-blocked → zero candidates. Browser clears + products.json.
+    // Skip on discoverOnly — preview must stay network-cheap.
+    if (!discoverOnly) {
+      const browserNoUrls = await tryBrowserSessionRung({
+        brand,
+        origin,
+        stats,
+        warnings,
+        effectiveCap,
+        budget,
+        abortCheck,
+        run,
+        isShopify: shopifyEligibleForBrowser || !!stats.shopifyFallthrough,
+        pageEntries: [],
+        disc,
+        getRateLimited: () => rateLimited,
+        setRateLimited: (v) => { rateLimited = v; },
+        getBudgetExpired: () => budgetExpired,
+        setBudgetExpired: (v) => { budgetExpired = v; },
+        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } }
+      });
+      if (browserNoUrls) return browserNoUrls;
+    }
+
+    const reason = stats.lastBlockVendor
+      ? `sitemaps found but blocked by ${stats.lastBlockVendor}` +
+        (stats.browserAttempted ? ' (browser session also failed)' : '')
+      : 'sitemaps found but contained no product page URLs';
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
     return {
       ok: false,
@@ -1426,6 +2015,7 @@ async function resolveGenericCatalog(brand, {
 
   // Fetch + parse ONE page. Pure w.r.t. scan state — returns an outcome
   // the reduce step applies; never touches stats/products/seenIds.
+  // `activeSession` (when harvested) pins Cookie + UA on every PDP.
   const scanOnePdp = async ({ loc, lastmod }) => {
     let allowed = true;
     try { allowed = await http.isAllowedByRobots(loc); } catch { allowed = true; }
@@ -1436,8 +2026,13 @@ async function resolveGenericCatalog(brand, {
 
     let html = null;
     try {
-      const res = await http.fetchText(loc, { timeoutMs: 15000, maxBytes: 4_000_000 });
-      if (res.cfChallenged) return { cfChallenged: true };
+      const res = await http.fetchText(loc, {
+        timeoutMs: 15000,
+        maxBytes: 4_000_000,
+        session: activeSession
+      });
+      if (res.block) noteBlock(stats, res.block);
+      if (res.cfChallenged) return { cfChallenged: true, block: res.block || null };
       if (res.rateLimited)  return { rateLimited: true, loc };
       if (!res.ok || !res.text) return { skipped: true };
       html = res.text;
@@ -1628,9 +2223,37 @@ async function resolveGenericCatalog(brand, {
 
   // ── Decisive unscrapeable / partial outcomes ─────────────────────
   if (!products.length) {
+    // Last rung: cheap path scanned (or blocked) to zero products.
+    const browserFinal = await tryBrowserSessionRung({
+      brand,
+      origin,
+      stats,
+      warnings,
+      effectiveCap,
+      budget,
+      abortCheck,
+      run,
+      isShopify: shopifyEligibleForBrowser || !!stats.shopifyFallthrough,
+      pageEntries,
+      disc,
+      getRateLimited: () => rateLimited,
+      setRateLimited: (v) => { rateLimited = v; },
+      getBudgetExpired: () => budgetExpired,
+      setBudgetExpired: (v) => { budgetExpired = v; },
+      activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } },
+      // Re-scan PDP list with harvested session when products.json empty.
+      rescanWithSession: true,
+      attachCategoryFields
+    });
+    if (browserFinal) return browserFinal;
+
     let reason;
     if (stats.cfChallenges > 0 && stats.jsonLdProductsFound === 0 && stats.ogFallbackUsed === 0) {
       reason = `blocked by Cloudflare challenge on ${origin}`;
+      if (stats.lastBlockVendor && stats.lastBlockVendor !== 'cloudflare') {
+        reason = `blocked by ${stats.lastBlockVendor} on ${origin}`;
+      }
+      if (stats.browserAttempted) reason += ' (browser session also failed)';
     } else if (stats.jsonLdProductsFound === 0 && stats.ogFallbackUsed === 0) {
       // No product structured data found on any scanned page.
       reason =

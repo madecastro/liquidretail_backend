@@ -7,6 +7,14 @@
 // consolidation of shopifyPublicIngestService /
 // productCategoryInferenceService).
 //
+// Optional `session` (scrapeSession.ScrapeSession): when valid and
+// SCRAPE_SESSION_REUSE_ENABLED (default true), merges Cookie +
+// Accept-Language and pins User-Agent to the UA that cleared the
+// challenge — Cloudflare partly binds clearance to UA, so rotation
+// MUST be suppressed for sessioned requests. This file stays
+// Puppeteer-free; it only REPORTS res.block. The caller decides
+// whether to session.refresh(harvestFn).
+//
 // Node 18+ global fetch — no extra deps.
 //
 // Assumptions:
@@ -17,6 +25,11 @@
 'use strict';
 
 const { classifyBlock, CF_BODY_RE } = require('./blockClassifier');
+
+function sessionReuseEnabled() {
+  // Default ON. Flag-off → session never applied (byte-identical prior path).
+  return String(process.env.SCRAPE_SESSION_REUSE_ENABLED || 'true').toLowerCase() !== 'false';
+}
 
 const FROM_HEADER = 'crawler@reach-social.io';
 
@@ -435,7 +448,8 @@ async function _doFetch(url, {
   maxBytes,
   asBuffer,
   method = 'GET',
-  body = null
+  body = null,
+  session = null
 }) {
   let parsed;
   try {
@@ -446,7 +460,26 @@ async function _doFetch(url, {
   // silence unused in non-throw path
   void parsed;
 
-  const ua = headers['User-Agent'] || headers['user-agent'] || pickUA();
+  // Session pin: when reuse is on and the session is valid, Cookie +
+  // Accept-Language come from the harvest and User-Agent is the EXACT
+  // string that cleared the challenge (no pickUA rotation). Flag-off or
+  // invalid session → prior behaviour, byte-identical request shape.
+  const useSession =
+    sessionReuseEnabled() &&
+    session &&
+    typeof session.isValid === 'function' &&
+    session.isValid();
+
+  let ua;
+  let sessionHeaders = null;
+  if (useSession) {
+    ua = session.userAgent;
+    sessionHeaders =
+      typeof session.toHeaders === 'function' ? session.toHeaders() : null;
+  } else {
+    ua = headers['User-Agent'] || headers['user-agent'] || pickUA();
+  }
+
   const reqHeaders = {
     Accept: asBuffer
       ? '*/*'
@@ -454,6 +487,9 @@ async function _doFetch(url, {
     'Accept-Language': 'en-US,en;q=0.9',
     From: FROM_HEADER,
     ...headers,
+    // session headers (Cookie, Accept-Language) win over defaults/caller
+    // so a harvested clearance is not clobbered by a stale Cookie.
+    ...(sessionHeaders || {}),
     'User-Agent': ua
   };
 
@@ -653,7 +689,8 @@ async function fetchText(url, {
   lastModified = null,
   maxBytes = 4_000_000,
   method = 'GET',
-  body = null
+  body = null,
+  session = null
 } = {}) {
   const maxAttempts = 3; // 1 initial + 2 retries
   let attempt = 0;
@@ -668,7 +705,8 @@ async function fetchText(url, {
       maxBytes,
       asBuffer: false,
       method,
-      body
+      body,
+      session
     });
 
     if (!last.rateLimited) return last;
@@ -697,7 +735,8 @@ async function fetchJson(url, opts = {}) {
       headers: r.headers,
       notModified: true,
       cfChallenged: false,
-      rateLimited: false
+      rateLimited: false,
+      block: r.block || null
     };
   }
   if (!r.ok) {
@@ -709,6 +748,7 @@ async function fetchJson(url, opts = {}) {
       notModified: false,
       cfChallenged: r.cfChallenged,
       rateLimited: r.rateLimited,
+      block: r.block || null,
       error: r.error
     };
   }
@@ -721,7 +761,8 @@ async function fetchJson(url, opts = {}) {
       headers: r.headers,
       notModified: false,
       cfChallenged: false,
-      rateLimited: false
+      rateLimited: false,
+      block: r.block || null
     };
   } catch (err) {
     return {
@@ -732,6 +773,7 @@ async function fetchJson(url, opts = {}) {
       notModified: false,
       cfChallenged: false,
       rateLimited: false,
+      block: r.block || null,
       error: err && err.message ? err.message : 'JSON parse failed'
     };
   }
@@ -740,7 +782,8 @@ async function fetchJson(url, opts = {}) {
 async function fetchBuffer(url, {
   timeoutMs = 20000,
   maxBytes = 20_000_000,
-  headers = {}
+  headers = {},
+  session = null
 } = {}) {
   // No auto-retry for buffers.
   const r = await _doFetch(url, {
@@ -749,7 +792,8 @@ async function fetchBuffer(url, {
     etag: null,
     lastModified: null,
     maxBytes,
-    asBuffer: true
+    asBuffer: true,
+    session
   });
 
   return {
@@ -759,6 +803,7 @@ async function fetchBuffer(url, {
     tooLarge: !!r.tooLarge,
     cfChallenged: !!r.cfChallenged,
     rateLimited: !!r.rateLimited,
+    block: r.block || null,
     ...(r.error ? { error: r.error } : {})
   };
 }
@@ -770,5 +815,6 @@ module.exports = {
   fetchJson,
   fetchBuffer,
   isAllowedByRobots,
-  respectsRobots
+  respectsRobots,
+  sessionReuseEnabled
 };
