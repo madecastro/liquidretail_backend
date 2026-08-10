@@ -250,10 +250,17 @@ async function syncPostsForCred(cred, options = {}) {
   // forceDetect — is allowed to queue a fresh DetectRun for media that already
   // had one.
   //
-  // BILLABLE, so it stays opt-in and stays capped: each re-queued DetectRun is a
-  // real vision/LLM run. force does NOT bypass the daily cap — `enqueueRun`
-  // below is still resolved from runsRemaining first, so a forced re-scan can
-  // re-ingest and refresh stats but cannot exceed the day's run budget.
+  // BILLABLE — each re-queued DetectRun is a real vision/LLM run — so it stays
+  // opt-in. force never OUTRANKS a cap: `enqueueRun` below is resolved from
+  // runsRemaining first, so any caller that supplies a cap keeps it.
+  //
+  // ⚠️ BUT THE MANUAL ROUTE SUPPLIES NO CAP, so do not read the above as "a
+  // forced re-scan is capped". `dailyDetectRunCap` reaches syncPosts from
+  // scheduledSyncService ONLY; POST /instagram/sync-posts passes {limit, force,
+  // credentialId}, so runsRemaining is null and enqueueRun is unconditionally
+  // true there. The real bound on one manual call is `limit` (≤50); repeated
+  // clicks are bounded by nothing server-side. Same for the pre-existing
+  // "Sync Now" — not introduced by force. Pinned by verifyIgRescanGuards 5f.
   const force = !!options.force;
 
   const summary = {

@@ -9,12 +9,30 @@
 // run is a billable vision/LLM run, so on a 50-post re-scan the difference
 // between "capped" and "uncapped" is 50 paid runs the operator did not ask for.
 //
+// ⚠️ READ THIS BEFORE TRUSTING THE WORD "CAPPED" ANYWHERE NEAR THIS FEATURE.
+// The manual route does NOT apply a daily detect cap, and an earlier version of
+// this header (and of CLAUDE.md §2) wrongly said it did. Verified in source:
+// `dailyDetectRunCap` is passed into syncPosts by ONE caller only —
+// services/scheduledSyncService.js — plus a separate cap read in
+// instagramWebhookService. POST /instagram/sync-posts passes `{limit, force,
+// credentialId}` and nothing else, so `options.dailyDetectRunCap` is undefined,
+// `dailyCap`/`runsRemaining` stay null, `enqueueRun` is unconditionally true, and
+// `capSkipped` can never fire on this path. That is ALSO true of the
+// pre-existing "Sync Now" — it is not something the re-scan introduced.
+//
+// So the real bound on one forced re-scan is `limit` (25 default, 50 max), and
+// repeated clicks are bounded by nothing server-side. Section 5 pins that as the
+// actual guarantee. Whether the manual route SHOULD carry a cap is an open
+// decision for the owner, not something to assert here.
+//
 // Three invariants, each of which is a real bill if it breaks:
 //
-//   1. force does NOT bypass the daily detect cap. In ingestPost the
-//      `if (!enqueueRun) return` early-return must stay ABOVE the forceDetect
-//      bypass, because enqueueRun is what carries runsRemaining. Reorder those
-//      two and a re-scan spends straight past the day's budget.
+//   1. force must not be able to OUTRANK a cap wherever one is supplied. In
+//      ingestPost the `if (!enqueueRun) return` early-return must stay ABOVE the
+//      forceDetect bypass, because enqueueRun is what carries runsRemaining.
+//      Reorder those two and every capped caller — the scheduled cadence job
+//      today, the manual route if it is ever wired up — spends past its budget.
+//      Pinned now so the ordering is already correct if that wiring lands.
 //
 //   2. forceDetect is only handed to posts that ALREADY EXIST. A new post has no
 //      DetectRun to skip, so passing force there would widen the bypass for no
@@ -111,6 +129,27 @@ check('5c route still clamps limit to 50',
 check('5d route documents that force is billable',
   /BILLABLE/.test(route) && /RE-SCAN/.test(route),
   'the next reader must not discover the cost by getting the bill');
+
+// 5e/5f — pin the ACTUAL bound, and pin the absence of the one we do not have.
+// These exist because the false claim ("the daily cap still applies") was written
+// down first and believed. If someone wires dailyDetectRunCap into this route
+// later, 5f fails and forces them to update the docs in the same commit — which
+// is the outcome we want, not a silent divergence in the other direction.
+{
+  const syncPostsCallIdx = route.indexOf('const result = await syncPosts(brandId, {');
+  const syncPostsCallEnd = syncPostsCallIdx > 0 ? route.indexOf('});', syncPostsCallIdx) : -1;
+  const callBlock = syncPostsCallIdx > 0 ? route.slice(syncPostsCallIdx, syncPostsCallEnd) : '';
+  check('5e the manual sync-posts call block was located', !!callBlock);
+  check('5f manual sync-posts passes NO dailyDetectRunCap — `limit` is the only bound',
+    !!callBlock && !/dailyDetectRunCap/.test(callBlock),
+    'if this now fails, a cap was wired in: update CLAUDE.md §2 and this header, ' +
+    'both of which currently state that the manual path is UNCAPPED');
+  check('5g only the scheduled cadence job supplies a cap today',
+    /dailyDetectRunCap:\s*settings\.dailyDetectRunCap/.test(
+      fs.readFileSync(path.join(__dirname, '..', 'services', 'scheduledSyncService.js'), 'utf8')),
+    'the ordering invariant in section 1 protects that caller; if it stops passing a cap, ' +
+    'section 1 is guarding nothing');
+}
 
 // ── 6. The 409 on account rebind stays ACTIONABLE ────────────────────
 //

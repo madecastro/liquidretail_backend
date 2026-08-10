@@ -1396,7 +1396,21 @@ to that entry's index instead of a parallel single-tile hack. `tsc -b --noEmit` 
       double-click Generate and confirm you get the duplicate dialog, then "Generate anyway" and
       confirm exactly ONE extra run appears; (iii) click "Generate anyway" twice fast and confirm the
       second is refused.
-   2. **Two KNOWN-OPEN items, deliberately not fixed — decide, don't discover:**
+   2. **THE MANUAL IG SYNC ROUTE HAS NO DAILY DETECT CAP — and this file plus CLAUDE.md §2
+      briefly claimed it did.** Caught by an adversarial pass over the frontend work, verified in
+      source, corrected in the same branch. `dailyDetectRunCap` reaches `syncPosts` from
+      **`services/scheduledSyncService.js` only** (plus a separate read in
+      `instagramWebhookService`). `POST /instagram/sync-posts` passes `{limit, force,
+      credentialId}`, so `dailyCap`/`runsRemaining` stay null, `enqueueRun` is unconditionally
+      true, and `capSkipped` can never fire there. **The only bound on one call is `limit`
+      (25 default, 50 max); repeated clicks are bounded by nothing server-side.** Equally true of
+      the pre-existing "Sync Now" — the re-scan did not introduce it — but the re-scan is the
+      expensive one. The ordering guard in `ingestPost` is still real and still worth having: it
+      protects every caller that DOES supply a cap, and means the wiring is already correct if
+      this route ever gets one. `verifyIgRescanGuards` 5f now asserts the cap's ABSENCE, so
+      wiring one in fails the harness and forces the docs to be updated in the same commit.
+      **Owner decision: should a manual/forced re-scan carry a server-side daily ceiling?**
+   3. **Two KNOWN-OPEN items, deliberately not fixed — decide, don't discover:**
       - **Readiness can report ready off the OLD Instagram account.** `adReadinessService` defines
         social presence as *any* `Media` with `source ∈ ['instagram','apify-ig']` and never reads
         `igUserId`, so after changing the IG account the gate stays green on the previous account's
@@ -1404,7 +1418,7 @@ to that entry's index instead of a parallel single-tile hack. `tsc -b --noEmit` 
         opposite of the request above. Owner call.
       - **Old account's posts stay in the media library** after a rebind. No disconnect cascade
         exists; a forced re-scan pulls the new account but does not retire the old media.
-   3. `REAP_STALE_MIN` (15) still bounds the in-flight window, and a wedged `preparing` row is still
+   4. `REAP_STALE_MIN` (15) still bounds the in-flight window, and a wedged `preparing` row is still
       not reaped by the worker (it filters `running` only) — unchanged by this work, still a
       documented double-bill edge.
 

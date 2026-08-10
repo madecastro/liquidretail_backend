@@ -428,17 +428,30 @@ Video never launches a browser.
     each attempt for the same situation. Pinned by `scripts/verifyGenerationGate.js`
     (**194 checks**, revert-proven against ten mutations including the stale-confirm
     money hole, the `kinds` collapse, and re-blocking media-only requests).
-- **A forced Instagram RE-SCAN is billable.** `POST /instagram/sync-posts` with
-  `force:true` re-enters already-ingested posts and re-queues detect on media that
-  already had a run — each one a paid vision/LLM run. Guards, all pinned by
-  `scripts/verifyIgRescanGuards.js` (20 checks, five revert-proven): the
-  `if (!enqueueRun) return` daily-cap return must stay **above** the `forceDetect`
-  bypass in `ingestPost` (reordering spends past the day's budget); `forceDetect`
-  is `force && !!existing` so the bypass cannot widen to new posts; the route
-  parses `force === true` **strictly**, because a truthy check would let the
-  string `"false"` trigger a paid re-analysis of 50 posts; and `reIngested` is
-  counted separately from `ingested` so a re-scan is never reported as having
-  found new content.
+- **A forced Instagram RE-SCAN is billable, and the manual route is UNCAPPED.**
+  `POST /instagram/sync-posts` with `force:true` re-enters already-ingested posts
+  and re-queues detect on media that already had a run — each one a paid
+  vision/LLM run. ⚠️ **An earlier version of this bullet claimed "the daily detect
+  cap still applies". That was WRONG** — `dailyDetectRunCap` reaches `syncPosts`
+  from **`scheduledSyncService` only** (plus a separate read in
+  `instagramWebhookService`); the manual route passes `{limit, force,
+  credentialId}`, so `runsRemaining` is null, `enqueueRun` is unconditionally
+  true, and `capSkipped` can never fire there. **The only bound on one call is
+  `limit` (25 default, 50 max); repeated clicks are bounded by nothing
+  server-side.** This is equally true of the pre-existing "Sync Now" and is not
+  something the re-scan introduced — but the re-scan is the expensive one, so
+  whether to wire a cap into this route is an **open decision**, not a solved
+  problem. Guards actually in force, all pinned by
+  `scripts/verifyIgRescanGuards.js` (**23 checks**, five revert-proven): the
+  `if (!enqueueRun) return` return must stay **above** the `forceDetect` bypass in
+  `ingestPost` so force can never outrank a cap *where one is supplied* (the
+  scheduled job today, this route if it is ever wired up); `forceDetect` is
+  `force && !!existing` so the bypass cannot widen to new posts; the route parses
+  `force === true` **strictly**, because a truthy check would let the string
+  `"false"` trigger a paid re-analysis of 50 posts; `reIngested` is counted
+  separately from `ingested` so a re-scan is never reported as having found new
+  content; and **5f asserts the absence of the cap**, so wiring one in fails the
+  harness and forces this bullet to be updated in the same commit.
 - **Never leave a paid Omni master in `status:'rendering'`.** Stamp `draft`
   with `veoVideoUrl` before titling (`routes/ads.js:1258-1294`). Titling failure
   → `failed` + keep master; success/no-chrome → finished. Counting an untitled
