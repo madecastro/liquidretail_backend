@@ -1346,9 +1346,69 @@ to that entry's index instead of a parallel single-tile hack. `tsc -b --noEmit` 
 
 ## Next-session prompt
 
-**START HERE — 2026-08-05 pickup.**
+**START HERE — 2026-08-10 pickup.**
 
-0a. **NEWEST: the `ai_brand_led` no-copy fix is OPEN AS PR #75, not merged, never rendered live.**
+0aa. **NEWEST — 2026-08-10: the `/generate` gate is now REQUEST-FINGERPRINT keyed, and IG
+   re-scan/rebind is unblocked. PUSHED as `feat/generate-gate-fingerprint-ig-rescan`, NOT merged,
+   NOT deployed, NOT exercised against a real run.**
+   Owner asks, verbatim: *"make sure the user is able to generate an ad from the media library or
+   the product image library, don't block ads that are concurrent based on the product alone, but
+   based on the actual request. So block identical requests and note requests that are identical to
+   previous requests but allow them if the user wants."* and *"also while we are doing this, let's
+   allow the user to re-scan and change the instagram ID also"*.
+
+   **The media-library bug was the gate failing CLOSED.** A media-library run legitimately posts
+   `productIds: []` (its seed is media, not a SKU), which `normalizeProductIdList` collapsed to `[]`
+   = "scope unknown", so it was refused whenever ANY sibling run was in flight — and while it was in
+   flight it blocked every product run too. Both directions are fixed.
+
+   Changed: `services/generationGate.js` (rewritten — `computeRequestFingerprint`,
+   `renderClaimFingerprint`, `buildOverlapNotice`, confirm-containment), `routes/ads.js` (both gate
+   consults + both CampaignRun stamps + the 202 `notice`), `models/CampaignRun.js`
+   (`requestFingerprint` + `{campaignId, requestFingerprint, createdAt}` index),
+   `services/postSyncService.js` + `routes/integrations.js` (`force` re-scan; structured rebind 409).
+   Frontend (separate repo, branch `feat/ig-rescan-and-duplicate-confirm`):
+   `auth/apiFetch.ts` (`ApiError` carries `.status`/`.body`), `GenerateAds/Step4Generate.tsx`
+   (duplicate-confirm dialog), `Brand/IGPickerModal.tsx` + `Brand/IntegrationsCard.tsx` (IG
+   change-account + re-scan). New harness `scripts/verifyIgRescanGuards.js` (20 checks, five
+   revert-proven); `scripts/verifyGenerationGate.js` rewritten for the new key (**194 checks**,
+   revert-proven on ten mutations).
+
+   **Read CLAUDE.md §2 before touching any of it** — it now carries the digest evidence for why
+   dropping product-overlap is not a money regression (video is protected by the
+   `(campaignId, identityDigest)` unique index because its digest is run-independent; duplicate
+   static sets are owner-sanctioned), the fail-OPEN rationale, and the single-use override rule.
+
+   **A REAL DEFECT was caught by the harness, not by review.** `kinds` arrives from the route as a
+   bare SCALAR (`'image'|'video'|'both'|null`), and the first draft canonicalised it with an
+   array-only helper, so EVERY value collapsed to `''`. A static-only run and a video-only run over
+   the same product hashed **identically**, and the second was refused as a duplicate — a false
+   block on the most likely real sequence, "generate the statics, then generate the video". Fixed
+   via `canonicalScalarOrList`; both shapes pinned. The general rule the module now documents at
+   length: the fingerprint must cover **exactly** the fields the handler reads. A field left out
+   causes a false BLOCK; a dead field included causes a false ALLOW (a missed double-click).
+   `refresh` and `expandVideoFormats` are both dead — destructured/sent but never forwarded to
+   `expandWizardJob` — and are pinned as anti-trap cases in both directions.
+
+   **Next actions, in order:**
+   1. **Exercise it live.** Nothing here has run against a real campaign. Specifically: (i) generate
+      from the Media Library while a product run is in flight — the case that was broken; (ii)
+      double-click Generate and confirm you get the duplicate dialog, then "Generate anyway" and
+      confirm exactly ONE extra run appears; (iii) click "Generate anyway" twice fast and confirm the
+      second is refused.
+   2. **Two KNOWN-OPEN items, deliberately not fixed — decide, don't discover:**
+      - **Readiness can report ready off the OLD Instagram account.** `adReadinessService` defines
+        social presence as *any* `Media` with `source ∈ ['instagram','apify-ig']` and never reads
+        `igUserId`, so after changing the IG account the gate stays green on the previous account's
+        posts. Left alone ON PURPOSE: making it go not-ready would BLOCK generation, which is the
+        opposite of the request above. Owner call.
+      - **Old account's posts stay in the media library** after a rebind. No disconnect cascade
+        exists; a forced re-scan pulls the new account but does not retire the old media.
+   3. `REAP_STALE_MIN` (15) still bounds the in-flight window, and a wedged `preparing` row is still
+      not reaped by the worker (it filters `running` only) — unchanged by this work, still a
+      documented double-bill edge.
+
+0a. **the `ai_brand_led` no-copy fix is OPEN AS PR #75, not merged, never rendered live.**
    Branch `fix/brand-led-static-copy`, two commits. Full write-up in the two sections directly
    above this one (*"`ai_brand_led` static ads had NO COPY"* and *"the STARVED SOURCE"*).
    Offline-verified (1882 + 29 + 40 + 17 checks, 15 revert-proven mutations; 51/52 green in a

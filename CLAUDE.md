@@ -360,25 +360,85 @@ Video never launches a browser.
   re-read (`campaignRunIds` + `rendering`), `modifiedCount` cross-check, and
   post-claim requeue on throw (`routes/ads.js:645-750`, `:882-902`). Covered by
   `scripts/verifyRunsClaim.js` (67 checks). Do not inline a second claim path.
-- **The `/generate` concurrency gate is the ONLY double-click protection, and the
-  atomic claim does NOT back it up.** Each expansion mints its OWN ads
-  (`identityDigest` scoped via `generationRunId`), so two runs on the same product
-  never race for a row — they each claim what they just created and both bill.
-  Since 2026-08-03 the gate allows CONCURRENT runs whose product sets are
-  **disjoint** and blocks overlap (`services/generationGate.js`,
-  `scripts/verifyGenerationGate.js` — 65 checks, four revert-proven). Rules that
-  are load-bearing, not stylistic: (a) keyed on `productIds` **only** — never on
-  format/preset, because presets fan out (`meta_all` ⊃ `meta_static` surfaces) so
-  two same-product runs with different presets CAN expand the same
-  (product, template, aspect) into two differently-digested ads = one creative,
-  two charges; (b) **fail-closed** — any run or request whose scope is unreadable
-  blocks, which is why `CampaignRun.requestedProductIds` must be stamped at mint
-  time by EVERY creator (`/generate` from the body, `/runs` from the claimed ads,
-  and `[]` — not a partial list — when any claimed ad lacks a `productId`);
-  (c) **mint-then-verify** after `CampaignRun.create` closes the read-then-write
-  race where two clicks both read an idle campaign; both racers compute the same
-  winner via (`createdAt`, `runId`) and the loser aborts before expanding, so a
-  false abort costs a 409 and nothing else.
+- **The `/generate` gate is keyed on the REQUEST FINGERPRINT, not on products
+  (owner directive 2026-08-10). It is the ONLY double-click protection for
+  STATIC, and the atomic claim does NOT back it up.** Each static expansion mints
+  its OWN ads (`identityDigest` scoped via `generationRunId`), so two runs on the
+  same product never race for a row — they each claim what they just created and
+  both bill. Owner: *"don't block ads that are concurrent based on the product
+  alone, but based on the actual request. So block identical requests and note
+  requests that are identical to previous requests but allow them if the user
+  wants."* History: one-run-per-campaign → product-overlap (2026-08-03) →
+  fingerprint (2026-08-10). Rules that are load-bearing, not stylistic:
+  - **(a) The key is `computeRequestFingerprint`** — a hash over exactly the body
+    fields that change what gets generated. **A field the handler does not read
+    must stay OUT**: the wizard posts `expandVideoFormats` and `routes/ads.js`
+    never destructures it, so including it would make two runs that produce
+    identical creative hash differently and let a real double-click through. The
+    inverse (omitting a field that DOES affect output) causes a false block. Order
+    matters per field: `productIds`/`templateIds` sorted, `mediaIds`/`seedPicks`/
+    `seedMediaIds` order-preserved (a different pick order is a different ad).
+  - **(b) Why dropping product-overlap is not a money regression.** VIDEO cannot
+    double-bill across runs at all — `computeV2IdentityDigest` omits
+    `generationRunId` when `kind==='video'` (`:1715`) and
+    `computeDeterministicVideoDigest` never includes it (`:1731`), so a duplicate
+    video ad collides on the `(campaignId, identityDigest)` unique index and the
+    second inserts nothing. **The index protects video, not this gate.** And
+    duplicate STATIC sets are owner-sanctioned creative (`:266-269`), so the
+    retired "never key on format/preset" rule was guarding a `meta_all` ⊃
+    `meta_static` pair that the owner's own digest instruction calls two
+    intentional creatives. What is left to catch is the ACCIDENT, and an accident
+    is always a repeat of the *same* request.
+  - **(c) FAIL-OPEN, and only here.** The old gate failed closed on an unreadable
+    product scope, which is what **broke generation from the MEDIA LIBRARY** —
+    those runs legitimately carry `productIds: []`, so they read as "scope
+    unknown" and were refused whenever any sibling run was in flight (and while
+    in flight they blocked every product run too). Blocking now requires
+    *provable* identity, and you cannot prove identity against an unknown. So
+    `CampaignRun.requestFingerprint` **must** be stamped at mint time by every
+    creator: losing that write silently DISABLES double-click protection rather
+    than over-blocking. `/api/ads/runs` stamps `renderClaimFingerprint(runId)` —
+    namespaced and unique — because a render claim mints no ads and must never be
+    mistaken for the same request as a `/generate`.
+  - **(d) The override is single-use by construction.** An identical request is
+    refused with `confirmable:true` + `acknowledgeRunId`; the client re-POSTs with
+    `confirmDuplicate:true` + `acknowledgedRunId`. Every identical in-flight run
+    must be the acknowledged one, so a stray second "Generate anyway" collides
+    with the run the first click just minted and is refused with a fresh id. **A
+    bare boolean confirm would have re-opened the exact double-click the gate
+    exists to stop.**
+  - **(e) mint-then-verify** after `CampaignRun.create` still closes the
+    read-then-write race where two clicks both read an idle campaign; both racers
+    compute the same winner via (`createdAt`, `runId`) and the loser aborts before
+    expanding, so a false abort costs a 409 and nothing else. Now keyed on the
+    fingerprint too, and it is what keeps two simultaneous confirms from both
+    billing.
+  - **(f) `kinds` arrives as a bare SCALAR** (`'image'|'video'|'both'|null`), not
+    an array. Canonicalising it with an array-only helper collapsed every value to
+    `''`, so a static-only run and a video-only run over the same product hashed
+    **identically** and the second was refused as a duplicate — a false block on
+    the most likely real sequence ("generate the statics, then the video"). Fixed
+    by `canonicalScalarOrList`; both shapes are pinned, and scalar `'video'` must
+    equal array `['video']`.
+  - Product overlap is still computed but is **reporting only** — a non-blocking
+    `notice` on the 202 (`concurrent-run-shares-products`) so the operator sees
+    that both runs will bill. It names the **earliest** overlapping run by the same
+    (`createdAt`, `runId`) order the blocking path uses — the `activeRuns` query
+    applies no sort, so picking by list position would surface a different runId on
+    each attempt for the same situation. Pinned by `scripts/verifyGenerationGate.js`
+    (**194 checks**, revert-proven against ten mutations including the stale-confirm
+    money hole, the `kinds` collapse, and re-blocking media-only requests).
+- **A forced Instagram RE-SCAN is billable.** `POST /instagram/sync-posts` with
+  `force:true` re-enters already-ingested posts and re-queues detect on media that
+  already had a run — each one a paid vision/LLM run. Guards, all pinned by
+  `scripts/verifyIgRescanGuards.js` (20 checks, five revert-proven): the
+  `if (!enqueueRun) return` daily-cap return must stay **above** the `forceDetect`
+  bypass in `ingestPost` (reordering spends past the day's budget); `forceDetect`
+  is `force && !!existing` so the bypass cannot widen to new posts; the route
+  parses `force === true` **strictly**, because a truthy check would let the
+  string `"false"` trigger a paid re-analysis of 50 posts; and `reIngested` is
+  counted separately from `ingested` so a re-scan is never reported as having
+  found new content.
 - **Never leave a paid Omni master in `status:'rendering'`.** Stamp `draft`
   with `veoVideoUrl` before titling (`routes/ads.js:1258-1294`). Titling failure
   → `failed` + keep master; success/no-chrome → finished. Counting an untitled
