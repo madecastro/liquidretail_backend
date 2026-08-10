@@ -42,18 +42,21 @@ const LOG = '🗺';
 const UPSERT_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_UPSERT_BUDGET_MS, 10);
 
 /**
- * syncBrandGenericCatalog(brand, run, { isBrandAborted })
+ * syncBrandGenericCatalog(brand, run, { isBrandAborted, categories })
  *
  * brand  – hydrated Brand doc (_id, advertiserId, name, catalog URL fields)
  * run    – progressService run handle (stage/tick/checkpoint)
  * opts.isBrandAborted(brandId, run) – cooperative-cancel helper
+ * opts.categories – optional category keys (from sitemap derivation) that
+ *   filter candidate URLs before the PDP scan. Segment-exact match.
  *
  * Returns {
  *   productsUpserted, videosIngested:0, reviewsCaptured, errors:[],
- *   durationMs, ok?, reason?, cancelled?
+ *   durationMs, ok?, reason?, cancelled?,
+ *   categoryOptions?, categoryPromptSuggested?
  * }
  */
-async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
+async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories } = {}) {
   const t0 = Date.now();
   const errors = [];
   let productsUpserted = 0;
@@ -91,7 +94,10 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
     access = await resolveGenericCatalog(brand, {
       run,
       abortCheck: boundAbort,
-      cap: CAP
+      cap: CAP,
+      // Operator-selected category keys (from a prior discoverOnly preview).
+      // Resolver no-ops the filter when the feature flag is off.
+      categories: Array.isArray(categories) ? categories : undefined
     });
   } catch (err) {
     errors.push(`generic catalog resolver: ${err.message}`);
@@ -442,6 +448,15 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
   if (access.rateLimited && !productsUpserted) {
     out.ok = false;
     out.reason = access.reason || `rate-limited while scanning ${origin}`;
+  }
+  // Category options / "this catalog is large" prompt — only present when
+  // the resolver attached them (flag on). apifyIngestService forwards
+  // these onto out.shopify for the Sales UI.
+  if (Array.isArray(access.categoryOptions) && access.categoryOptions.length) {
+    out.categoryOptions = access.categoryOptions;
+  }
+  if (access.categoryPromptSuggested) {
+    out.categoryPromptSuggested = true;
   }
   return out;
   } catch (err) {

@@ -89,7 +89,12 @@ async function syncBrandApify(brandId) {
             // Surface a resolver-level failure reason (e.g. "site does not
             // expose XML sitemaps") so the Sales UI shows WHY nothing came
             // back, instead of a silent empty catalog.
-            ...(r.ok === false ? { ok: false, reason: r.reason } : {})
+            ...(r.ok === false ? { ok: false, reason: r.reason } : {}),
+            // Category options from the sitemap walk (no PDP cost) so the
+            // Sales UI can offer selective import on large catalogs.
+            ...(Array.isArray(r.categoryOptions) && r.categoryOptions.length
+              ? { categoryOptions: r.categoryOptions } : {}),
+            ...(r.categoryPromptSuggested ? { categoryPromptSuggested: true } : {})
           };
           if (r.cancelled) stillAborted = true;
         }

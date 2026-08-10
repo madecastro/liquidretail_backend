@@ -7,6 +7,11 @@
 // today via catalog.pullFromApify with method='generic-sitemap'; this
 // capability exposes it standalone for any brand with a websiteUrl.
 //
+// Preview is discover-only: walk sitemaps, derive category options from
+// URL path segments, return WITHOUT scanning a single PDP so the operator
+// can pick categories before spending wall-clock. Execute accepts an
+// optional `categories` arg and passes it through to the ingest filter.
+//
 // GENERIC_CATALOG_ENABLED must be true (default). GENERIC_CATALOG_LIMIT
 // caps the per-run product count (default 200).
 
@@ -39,6 +44,13 @@ async function resolveScope({ req, args }) {
   return { ok: true, brand };
 }
 
+/** Normalise operator-supplied category keys to a clean string array. */
+function normalizeCategories(raw) {
+  if (!Array.isArray(raw)) return undefined;
+  const keys = raw.map(k => String(k || '').trim()).filter(Boolean);
+  return keys.length ? keys : undefined;
+}
+
 async function preview({ req, args }) {
   const scope = await resolveScope({ req, args });
   if (!scope.ok) return scope;
@@ -58,20 +70,58 @@ async function preview({ req, args }) {
   const existing = await CatalogProduct.countDocuments({ brandId: brand._id, source: 'sitemap-jsonld' });
   const cap = Math.max(1, parseInt(process.env.GENERIC_CATALOG_LIMIT, 10) || 200);
 
+  // Discover-only: walk sitemaps + derive category options, zero PDP fetches.
+  // Failure is non-fatal for the plan shape — we still return the static plan
+  // fields so the operator can proceed without category narrowing.
+  let categoryOptions = null;
+  let totalCandidates = null;
+  let discoverReason = null;
+  if (process.env.GENERIC_CATALOG_CATEGORY_OPTIONS !== 'false') {
+    try {
+      const { resolveGenericCatalog } = require('../genericCatalogResolver');
+      const disc = await resolveGenericCatalog(brand, {
+        discoverOnly: true,
+        abortCheck: async () => false
+      });
+      if (disc && disc.ok) {
+        categoryOptions = Array.isArray(disc.categoryOptions) ? disc.categoryOptions : [];
+        totalCandidates = disc.totalCandidates != null ? disc.totalCandidates : null;
+      } else {
+        discoverReason = disc?.reason || 'discover-only walk returned no candidates';
+      }
+    } catch (err) {
+      discoverReason = `discover-only walk failed: ${err.message}`;
+    }
+  }
+
+  const data = {
+    workflowId: 'catalog.syncFromGenericSitemap',
+    brand: { _id: String(brand._id), name: brand.name, origin },
+    existingProductCount: existing,
+    productCap:           cap,
+    summary: `Pull the public catalog from ${origin} via XML sitemap + schema.org JSON-LD (up to ${cap} products). Fallback path when Shopify products.json returns nothing (non-Shopify stores).`,
+    estimateUsd:    0,
+    estimateWallMs: Math.min(cap, 200) * 1500,
+    reversible:     false,
+    note: 'HTTP-only. Downstream detect + enrichment enqueue is fire-and-forget inside the service.'
+  };
+  if (totalCandidates != null) data.totalCandidates = totalCandidates;
+  if (categoryOptions) {
+    data.categoryOptions = categoryOptions;
+    data.categoryOptionCount = categoryOptions.length;
+    if (categoryOptions.length) {
+      data.note =
+        `Sitemap walk found ${totalCandidates ?? '?'} candidate URLs and ` +
+        `${categoryOptions.length} category option(s). Pass categories:[…] on execute ` +
+        `to limit the import (no PDP fetches until execute).`;
+    }
+  }
+  if (discoverReason) data.discoverNote = discoverReason;
+
   return {
     ok: true,
     kind: 'plan',
-    data: {
-      workflowId: 'catalog.syncFromGenericSitemap',
-      brand: { _id: String(brand._id), name: brand.name, origin },
-      existingProductCount: existing,
-      productCap:           cap,
-      summary: `Pull the public catalog from ${origin} via XML sitemap + schema.org JSON-LD (up to ${cap} products). Fallback path when Shopify products.json returns nothing (non-Shopify stores).`,
-      estimateUsd:    0,
-      estimateWallMs: Math.min(cap, 200) * 1500,
-      reversible:     false,
-      note: 'HTTP-only. Downstream detect + enrichment enqueue is fire-and-forget inside the service.'
-    }
+    data
   };
 }
 
@@ -109,10 +159,15 @@ async function execute({ req, args, onProgress }) {
     }
   };
 
+  const categories = normalizeCategories(args?.categories);
+
   const { syncBrandGenericCatalog } = require('../genericCatalogIngestService');
   let result;
   try {
-    result = await syncBrandGenericCatalog(brand, stubRun, { isBrandAborted: () => false });
+    result = await syncBrandGenericCatalog(brand, stubRun, {
+      isBrandAborted: () => false,
+      categories
+    });
   } catch (err) {
     return {
       ok: false,
@@ -122,20 +177,29 @@ async function execute({ req, args, onProgress }) {
     };
   }
 
+  const data = {
+    workflowId: 'catalog.syncFromGenericSitemap',
+    brand: { _id: String(brand._id), name: brand.name },
+    productsUpserted: result?.productsUpserted || 0,
+    videosIngested:   result?.videosIngested   || 0,
+    reviewsCaptured:  result?.reviewsCaptured  || 0,
+    errors:           result?.errors           || [],
+    reason:           result?.reason           || null,
+    durationMs:       Date.now() - started,
+    note: 'Sitemap-JSONLD upsert complete. Downstream detect + enrichment runs in the worker over the next few minutes.'
+  };
+  if (categories) data.categories = categories;
+  if (Array.isArray(result?.categoryOptions) && result.categoryOptions.length) {
+    data.categoryOptions = result.categoryOptions;
+  }
+  if (result?.categoryPromptSuggested) {
+    data.categoryPromptSuggested = true;
+  }
+
   return {
     ok: (result?.ok !== false),
     kind: 'workflowResult',
-    data: {
-      workflowId: 'catalog.syncFromGenericSitemap',
-      brand: { _id: String(brand._id), name: brand.name },
-      productsUpserted: result?.productsUpserted || 0,
-      videosIngested:   result?.videosIngested   || 0,
-      reviewsCaptured:  result?.reviewsCaptured  || 0,
-      errors:           result?.errors           || [],
-      reason:           result?.reason           || null,
-      durationMs:       Date.now() - started,
-      note: 'Sitemap-JSONLD upsert complete. Downstream detect + enrichment runs in the worker over the next few minutes.'
-    }
+    data
   };
 }
 

@@ -47,6 +47,12 @@ const { extractBreadcrumb } = require('./breadcrumbParser');
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 // Scored product-URL heuristic — ranking only (non-matches still scanned later).
 const { scoreProductish, isProductish } = require('./genericCatalogDiscovery/productish');
+// Category options from sitemap URL path segments — pure, no PDP fetches.
+// Used for discover-only previews and selective import filters on large catalogs.
+const {
+  deriveCategoryOptions,
+  matchesAnyCategory
+} = require('./genericCatalogDiscovery/categoryOptions');
 // Wall-clock budget — pure, clock-injectable. Bounds the scan so a large
 // or hostile site cannot grind for ~83 min while the UI shows a dead run.
 // Distinct from abort (user cancel) and from progressService.MAX_RUN_MS
@@ -81,6 +87,22 @@ const GZIP_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;  // decompressed sitemap cap
 const MAX_ROBOTS_SITEMAPS = 50;                  // cap root sitemaps from robots.txt
 const RAW_DATA_CAP_BYTES = 8000;
 const FALLBACK_SITEMAP_PATHS = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'];
+// Category options from sitemap URLs (no PDP fetches). Flag-off restores a
+// byte-identical resolver result (no new keys). Defaults match owner request
+// for selective import of large catalogs (fanatics-scale ~800k products).
+const CATEGORY_OPTIONS_ENABLED = process.env.GENERIC_CATALOG_CATEGORY_OPTIONS !== 'false';
+const CATEGORY_PROMPT_MIN = Math.max(
+  1,
+  parseInt(process.env.GENERIC_CATALOG_CATEGORY_PROMPT_MIN, 10) || 500
+);
+const CATEGORY_MIN_COUNT = Math.max(
+  1,
+  parseInt(process.env.GENERIC_CATALOG_CATEGORY_MIN_COUNT, 10) || 25
+);
+const CATEGORY_MAX_OPTIONS = Math.max(
+  1,
+  parseInt(process.env.GENERIC_CATALOG_CATEGORY_MAX_OPTIONS, 10) || 40
+);
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -933,10 +955,25 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls, budget = null }
 // ── main resolve ───────────────────────────────────────────────────
 
 /**
- * resolveGenericCatalog(brand, { run, abortCheck, cap })
- * → { ok, mode:'sitemap-jsonld', origin, products:[flat], stats, rateLimited?, reason?, warnings? }
+ * resolveGenericCatalog(brand, { run, abortCheck, cap, discoverOnly, categories })
+ * → { ok, mode:'sitemap-jsonld', origin, products:[flat], stats, rateLimited?, reason?, warnings?,
+ *     categoryOptions?, categoryPromptSuggested?, discoverOnly?, totalCandidates? }
+ *
+ * discoverOnly:true — walk sitemaps, derive category options, return WITHOUT
+ *   scanning a single PDP (products:[]). Used by the capability preview so an
+ *   operator can pick categories before spending wall-clock on pages.
+ * categories:['buffalo-bills',…] — filter pageEntries through
+ *   matchesAnyCategory BEFORE the PDP scan. Segment-exact match only.
+ * Both are gated on GENERIC_CATALOG_CATEGORY_OPTIONS (default true); when
+ * false the result is byte-identical to the pre-feature shape (no new keys).
  */
-async function resolveGenericCatalog(brand, { run = null, abortCheck = async () => false, cap = DEFAULT_CAP } = {}) {
+async function resolveGenericCatalog(brand, {
+  run = null,
+  abortCheck = async () => false,
+  cap = DEFAULT_CAP,
+  discoverOnly = false,
+  categories = null
+} = {}) {
   const stats = {
     sitemapsDiscovered: 0,
     sitemapsWalked: 0,
@@ -1065,7 +1102,8 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
     };
   }
 
-  const pageEntries = walked.pageEntries || [];
+  // let — may be reassigned by the category filter below (selective import).
+  let pageEntries = walked.pageEntries || [];
   if (!pageEntries.length) {
     // Prefer a budget reason over the generic "no product URLs" message
     // when the walk was cut short before any locs landed.
@@ -1096,6 +1134,104 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       rateLimited,
       reason
     };
+  }
+
+  // ── Category options (pure string work on already-collected locs) ──
+  // Zero extra network. Gated so flag-off is byte-identical (no new keys).
+  // Cheap on MAX_SITEMAP_URLS (default 20k); still skip if the total budget
+  // already expired so derivation cannot become a hang after a slow walk.
+  let categoryOptions = null;
+  let categoryPromptSuggested = false;
+  const categoryKeys = CATEGORY_OPTIONS_ENABLED && Array.isArray(categories)
+    ? categories.map(k => String(k || '').trim()).filter(Boolean)
+    : [];
+  const wantCategoryWork = CATEGORY_OPTIONS_ENABLED && (
+    discoverOnly ||
+    categoryKeys.length > 0 ||
+    pageEntries.length >= CATEGORY_PROMPT_MIN
+  );
+
+  if (wantCategoryWork && !budget.expired()) {
+    try {
+      const urls = pageEntries.map(e => e && e.loc).filter(Boolean);
+      categoryOptions = deriveCategoryOptions(urls, {
+        minCount: CATEGORY_MIN_COUNT,
+        maxOptions: CATEGORY_MAX_OPTIONS,
+        maxDepth: 2
+      });
+    } catch (err) {
+      console.warn(`   ⚠️  ${LOG}  category option derivation failed: ${err.message}`);
+      categoryOptions = [];
+    }
+  }
+
+  // Discover-only: return the options without spending a single PDP fetch.
+  if (CATEGORY_OPTIONS_ENABLED && discoverOnly) {
+    const totalCandidates = pageEntries.length;
+    console.log(
+      `   · ${LOG}  discoverOnly: ${totalCandidates} candidates, ` +
+      `${(categoryOptions || []).length} category option(s) — no PDP scan`
+    );
+    run?.stage?.('category options ready');
+    return {
+      ok: true,
+      mode: 'sitemap-jsonld',
+      origin,
+      discoverOnly: true,
+      totalCandidates,
+      categoryOptions: categoryOptions || [],
+      products: [],
+      stats,
+      rateLimited
+    };
+  }
+
+  // Selective import: filter candidates by operator-chosen category keys
+  // BEFORE the PDP scan (segment-exact match — see matchesAnyCategory).
+  // Reassign pageEntries in place so the PDP loop shape
+  // (`for (…; i < pageEntries.length; …)`) stays intact for the budget
+  // harness and for readers of the scan.
+  if (categoryKeys.length) {
+    const before = pageEntries.length;
+    pageEntries = pageEntries.filter(e => e && matchesAnyCategory(e.loc, categoryKeys));
+    stats.candidatesFilteredByCategory = before - pageEntries.length;
+    console.log(
+      `   · ${LOG}  category filter: ${pageEntries.length}/${before} candidates kept ` +
+      `(keys=${categoryKeys.length}, dropped=${stats.candidatesFilteredByCategory})`
+    );
+    if (!pageEntries.length) {
+      const reason =
+        `category filter matched 0 of ${before} candidate URLs ` +
+        `(keys: ${categoryKeys.slice(0, 8).join(', ')}${categoryKeys.length > 8 ? '…' : ''})`;
+      console.warn(`   ⚠️  ${LOG}  ${reason}`);
+      const emptyOut = {
+        ok: false,
+        mode: 'sitemap-jsonld',
+        origin,
+        products: [],
+        stats,
+        rateLimited,
+        reason
+      };
+      if (categoryOptions) emptyOut.categoryOptions = categoryOptions;
+      return emptyOut;
+    }
+  }
+
+  // Large catalog, no categories supplied — still run normally (do NOT
+  // refuse), but surface options so the caller can suggest narrowing.
+  // Use pre-filter size via stats when filtered; otherwise pageEntries.
+  const candidateCountForPrompt = categoryKeys.length
+    ? (pageEntries.length + (stats.candidatesFilteredByCategory || 0))
+    : pageEntries.length;
+  if (
+    CATEGORY_OPTIONS_ENABLED &&
+    !categoryKeys.length &&
+    candidateCountForPrompt >= CATEGORY_PROMPT_MIN &&
+    categoryOptions &&
+    categoryOptions.length
+  ) {
+    categoryPromptSuggested = true;
   }
 
   console.log(`   · ${LOG}  ${pageEntries.length} candidate URLs (scanning up to cap=${effectiveCap})`);
@@ -1241,10 +1377,23 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
     }
   }
 
+  // Attach category fields only when the feature flag is on AND we have
+  // something to say — keeps flag-off results byte-identical (no new keys).
+  const attachCategoryFields = (out) => {
+    if (!CATEGORY_OPTIONS_ENABLED) return out;
+    if (categoryOptions && categoryOptions.length) {
+      out.categoryOptions = categoryOptions;
+    }
+    if (categoryPromptSuggested) {
+      out.categoryPromptSuggested = true;
+    }
+    return out;
+  };
+
   // Aborted mid-scan — return truthfully as cancelled (keeping any
   // partials) rather than misclassifying it as an unscrapeable site.
   if (aborted) {
-    return {
+    return attachCategoryFields({
       ok: products.length > 0,
       mode: 'sitemap-jsonld',
       origin,
@@ -1253,7 +1402,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       rateLimited,
       cancelled: true,
       reason: 'aborted during product scan'
-    };
+    });
   }
 
   // Budget expiry mid-scan — keep products already collected (same partial-
@@ -1264,7 +1413,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
         `scanned ${stats.urlsScanned} pages but no products extracted before the wall-clock limit`
       );
       console.warn(`   ⚠️  ${LOG}  ${reason}`);
-      return {
+      return attachCategoryFields({
         ok: false,
         mode: 'sitemap-jsonld',
         origin,
@@ -1275,7 +1424,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
         partial: true,
         partialReason: 'budget-exceeded',
         reason
-      };
+      });
     }
     if (stats.validationFailures > 0) {
       warnings.push(`${stats.validationFailures} product pages failed validation (skipped)`);
@@ -1298,7 +1447,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       reason
     };
     if (warnings.length) out.warnings = warnings;
-    return out;
+    return attachCategoryFields(out);
   }
 
   // ── Decisive unscrapeable / partial outcomes ─────────────────────
@@ -1325,7 +1474,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
         `via the sitemap+JSON-LD method`;
     }
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
-    return {
+    return attachCategoryFields({
       ok: false,
       mode: 'sitemap-jsonld',
       origin,
@@ -1333,7 +1482,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       stats,
       rateLimited,
       reason
-    };
+    });
   }
 
   if (stats.validationFailures > 0) {
@@ -1358,7 +1507,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
     rateLimited
   };
   if (warnings.length) out.warnings = warnings;
-  return out;
+  return attachCategoryFields(out);
 }
 
 module.exports = {
@@ -1377,6 +1526,9 @@ module.exports = {
   rankLoc,
   isProductish,
   scoreProductish,
+  imagesFromNode,
+  deriveCategoryOptions,
+  matchesAnyCategory,
   DEFAULT_CAP,
   MAX_SITEMAP_URLS
 };
