@@ -417,6 +417,63 @@ there is no lexical fallback. Full rationale, failure policy and consumer list:
 
 Director schema **v3** nests strategy fields under `concept.routing` (`media_picks`, `creative_style`, `output_shape`, …). The producer dual-read both shapes and logged `warnings=0` while **every consumer that still read flat v2 discarded the concepts** → `payloads=0` (zero ads, paid Director rounds wasted). **One helper only:** `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`. Consumers include `campaignAdsGenerationService`, `aiJudgeService`, `aiCanvasHtmlGeneratorService`, `veoStoryboardService`. `scripts/verifyConceptContract.js` (125 checks) **fails the suite** if any `services/` or `routes/` file reads a `ROUTING_NESTED_FIELDS` name off a concept without the helper. Verified live after fix: `concepts=3 payloads=3` where it was `payloads=0`.
 
+### Which template an ad becomes — the Director picks it, and social proof had collapsed
+
+**The wizard has no template picker.** The frontend hardcodes all five `ai_*` ids into every request (`GenerateAds/index.tsx` `DEFAULT_TEMPLATE_IDS`; the Settings step was removed 2026-06-12, `52cf33c`). Under `AI_CONCEPT_DRIVEN=true` the template is derived from the Director's `routing.creative_style`:
+
+```js
+const creativeStyle = conceptField(concept, 'creative_style');
+const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || 'ai_brand_led';
+```
+
+so an absent or unrecognised style silently becomes **`ai_brand_led`**. Combined with a round prompt whose *entire* creative_style guidance was one bare enum line, production measured (Render logs, 2026-07-30..08-06):
+
+| template | successful renders |
+|---|---|
+| `ai_brand_led` | 200+ (query cap) |
+| `ai_editorial` | 111 |
+| `ai_promotional` | 38 |
+| **`ai_social_proof_led`** | **18** |
+| `ai_ugc_led` | 2 |
+
+The string `social_proof_led` appeared **once** in `aiCreativeDirectorService.js` — in the enum — and in **zero** guidance. Note the HONESTY RULE was *not* the cause: it constrains `social_proof_type` and two archetypes, never `creative_style`.
+
+**Fixed 2026-08-10 (three parts):**
+
+1. **Selection criteria.** `buildPromptRound` now describes when each style applies, and names `brand_led` the *default of last resort* — the direct counterweight to the `|| 'ai_brand_led'` fallback. `creative_style` is also now a listed concept-diversity axis.
+2. **Reserved slot.** When a **RATING** is reachable, ≥1 of the 3 concepts must be `social_proof_led`. **Rating-bearing, not "any proof"** — `INTENTS.social_proof_led.eligible` is rating-only, so reserving a slot on a quote or comment alone would mint `ai_social_proof_led` on products that then fall back at render, *amplifying* the collapse this fixes (adversarial finding, pinned by A5b). The condition is a strict subset of "the HONESTY RULE does not fire"; **the two must never both be active**, or the prompt demands a proof concept while forbidding proof — the self-contradictory-prompt class that forced the PR #61 video rollback (§6 / CLAUDE.md §00). Deliberately instruction-level, not a post-parse rejection: a thin-data product should degrade to an honest non-proof concept rather than ship a hollow proof ad.
+3. **`DIRECTOR_PROOF_MENU_ENABLED=true`** (`config/defaults.env`). Product-scoped runs withhold brand quotes/ratings from `primary_quote`/`rating` (cross-product copy guard) but now see them in `proof_options[]`, each with its own pre-scoped disclosure string. The honesty rule is amended **under the same flag**, and the reserved slot's `proof_options` term is gated on that **same flag**, so a stale or injected summary cannot desynchronise them (pinned by A6b). Flag-off restores the pre-change prompt byte-for-byte, original honesty-rule string included.
+
+**Paired with `DIRECTOR_SIGNALS_VERSION` 3.1.0 → 3.2.0.** ⚠️ **Scope, stated correctly — an earlier revision of this section overstated it:** the LIVE path `directConceptsRound` has **no** `signalsVersion` cache gate and calls `assembleSignals` every round, so the menu takes effect with or without the bump. The only cache-hit gate is `aiCreativeDirectorService.js:262`, inside the **shadow** `directConcepts` path. So the bump buys *shadow* correctness (artifacts built from the narrower shape stop being served as current) and is **not** what makes the flip work. **Accepted one-time cost:** that shadow call is `await`ed on live campaign expansion, so the bump forces one paid re-derive per unique (brand, product, campaignKind, creativeIntent, platformFormat) on next request. Bounded and self-healing. Pinned by `scripts/verifySocialProofRestoration.js` groups A/B.
+
+### Proof coherence — a LABELLED brand rating may sit beside a product/comment quote (static only)
+
+`resolveCoherentSocialProof` (`services/ratingDisplay.js`) is the single chokepoint pairing quote tier ↔ number tier, shared by static (`buildIntentData`) **and video** (`brandScriptExecutor.buildMetaForAd`). Its invariant #4 forbade *product/comment quote + brand numbers*, because a brand-wide count beside one SKU's testimonial reads as that SKU's volume.
+
+**Measured cost:** 7 of the 18 `ai_social_proof_led` renders logged `intent=objection_resolved(fell back from social_proof_led)`. Mechanism: no product-level rating + a comment-tier quote on frame → brand stars hard-nulled → `d.rating` undefined → `INTENTS.social_proof_led.eligible` fails (its `core` **is** `RATING`) → `FALLBACK_ORDER`. Quote precedence is product → category → comment → brand (`layoutInputService.js`), so comment-tier quotes are common, making this the normal case, not an edge one. The 4.39 star floor was **not** the blocker.
+
+**Owner override, 2026-08-07**, verbatim: *"I don't want brand level stars to block a comment tier quote. We can have both and clearly demarcate brand level stars … The positive comment is different and better social proof than brand level stars"* / *"include the comment and then use brand level stars and include a 'Brand Reviews' next to the stars."*
+
+Implemented as opt-in `allowLabeledBrandNumbers`, **default `false`**:
+
+| guarantee | how |
+|---|---|
+| video + every other caller unchanged | parameter defaults false; **only** `directImageRenderService` passes true — byte-identical *by construction*, pinned by D3 (recursive over `services/` **and** `routes/`) / D4 |
+| product numbers always win | the exception sits **after** both product attempts; it can only ADD proof, never displace product with brand (C4 / C7e) |
+| a rating can never print unscoped | **stars only**, and a normalized brand **count is required** so `formatBrandReviewsText` can produce the `BRAND_SCOPE_LABEL` — no count → refuse (C7b/C7c) |
+| no brand volume claim beside a product quote | `allowBrandCountWithoutStars` stays **false**; `'brand-count'` is rejected (C7) |
+| a raw env string cannot opt in | gate is **`=== true`**, not truthiness (C7d) |
+| substituted quotes still earn nothing | the fail-closed `renderedQuoteText` guard is untouched (C8) |
+
+**Three constraints above exist because two independent adversarial passes broke the first draft**, and all three are revert-proven — do not "simplify" them:
+- Truthy gate → the literal string `"false"` opted **in**.
+- No count requirement → a stars-only brand pair rendered a **bare `4.7 ★`** beside a product/comment testimonial with no qualifier, which the code's own comment claimed was impossible.
+- `allowBrandCountWithoutStars: true` → printed a brand volume claim next to a product testimonial *and* still left the intent ineligible (eligibility is rating-only), i.e. all risk, no benefit.
+
+**Known accepted residual:** a product pair with a *sub-floor rating but a non-zero count* returns `product-count` and short-circuits the exception, so that shape still falls back. Fixing it would mean brand numbers displacing a product-tier number — a second override nobody approved. Pinned as a decision by C7e.
+
+Kill switch **`STATIC_BRAND_STARS_WITH_QUOTE=false`**, committed in `config/defaults.env` — reverts with no deploy. **Do not "restore invariant #4"**; it is an owner decision, and this repo has precedent (PR #61) of a later session undoing one. Pinned by `scripts/verifySocialProofRestoration.js` groups C/D — **35 checks, revert-proven on 13 mutations**.
+
 ### Seed selection — image vs video (the first-catalog-image rule)
 
 > **Was falsely documented (corrected 2026-08-03):** this section used to be titled *"Hero-image default"* and presented `DIRECTOR_UNIVERSE_TOP_N=1` as delivering the owner's rule. **TOP_N=1 is a COUNT, not a choice of image.** It trims a shotType-ranked pool to one entry; which entry survived was decided by shot type, and catalog media routinely lost.
