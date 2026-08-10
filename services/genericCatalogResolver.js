@@ -45,6 +45,8 @@ const { extractBreadcrumb } = require('./breadcrumbParser');
 // a local binding so the JSON-LD mapper's slice stays readable; the
 // constant itself is owned (and env-resolved) in that module only.
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+// Scored product-URL heuristic — ranking only (non-matches still scanned later).
+const { scoreProductish, isProductish } = require('./genericCatalogDiscovery/productish');
 
 // ── constants ──────────────────────────────────────────────────────
 const LOG = '🗺';
@@ -70,7 +72,6 @@ const MAX_SITEMAP_FETCHES = Math.max(
 const GZIP_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;  // decompressed sitemap cap
 const MAX_ROBOTS_SITEMAPS = 50;                  // cap root sitemaps from robots.txt
 const RAW_DATA_CAP_BYTES = 8000;
-const PRODUCTISH_RE = /product|pdp|item|catalog|\/p\d/i;
 const FALLBACK_SITEMAP_PATHS = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'];
 
 function sleep(ms) {
@@ -194,12 +195,9 @@ function parseSitemapXml(xml) {
   return { type, entries };
 }
 
-function isProductish(loc) {
-  return PRODUCTISH_RE.test(String(loc || ''));
-}
-
+// Lower rank sorts first — negate score so product-ish (high score) leads.
 function rankLoc(loc) {
-  return isProductish(loc) ? 0 : 1;
+  return -scoreProductish(loc);
 }
 
 function lastmodMs(lastmod) {
@@ -853,7 +851,8 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
       const entries = parsed.entries.slice().sort((a, b) => rankLoc(a.loc) - rankLoc(b.loc));
       for (const e of entries) {
         if (!e.loc || seenSitemaps.has(e.loc)) continue;
-        if (rankLoc(e.loc) === 0) rankedSubs.push({ url: e.loc, depth: depth + 1 });
+        // Product-ish first (rankLoc < 0 ⇔ scoreProductish > 0).
+        if (rankLoc(e.loc) < 0) rankedSubs.push({ url: e.loc, depth: depth + 1 });
         else otherSubs.push({ url: e.loc, depth: depth + 1 });
       }
     } else {
@@ -1255,6 +1254,9 @@ module.exports = {
   looksLikeSlug,
   extractProductIdFromHtml,
   parseMajorPrice,
+  rankLoc,
+  isProductish,
+  scoreProductish,
   DEFAULT_CAP,
   MAX_SITEMAP_URLS
 };

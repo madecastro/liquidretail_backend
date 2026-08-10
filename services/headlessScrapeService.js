@@ -21,6 +21,7 @@ const puppeteer = require('puppeteer');
 // encoded (a <script> is a raw-text element) — decode human-readable
 // fields so `74&quot;` lands as `74"`.
 const { cleanScrapedText } = require('../utils/htmlEntities');
+const { classifyBlock } = require('./blockClassifier');
 
 // ── constants ──────────────────────────────────────────────────────
 const DEFAULT_CAP     = 200;
@@ -31,7 +32,10 @@ const LOG             = '🕷';
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-const CF_RE = /just a moment|checking your browser|attention required/i;
+// Headless-only interstitial phrase historically matched by CF_RE but
+// not in the shared CF_BODY_RE — keep it so detectCfChallenge stays
+// at least as sensitive as before.
+const CF_HEADLESS_EXTRA_RE = /checking your browser/i;
 
 // ── flag gate ──────────────────────────────────────────────────────
 
@@ -529,7 +533,11 @@ async function detectCfChallenge(page) {
       return { title, body };
     });
     const blob = `${info.title}\n${info.body}`;
-    return CF_RE.test(blob);
+    // Boolean contract preserved: true when shared CF markers fire (via
+    // classifier at status 403) OR the headless-only interstitial phrase.
+    const block = classifyBlock({ status: 403, bodyText: blob });
+    if (block && block.vendor === 'cloudflare') return true;
+    return CF_HEADLESS_EXTRA_RE.test(blob);
   } catch {
     return false;
   }

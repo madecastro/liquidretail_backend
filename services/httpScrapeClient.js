@@ -16,6 +16,8 @@
 
 'use strict';
 
+const { classifyBlock, CF_BODY_RE } = require('./blockClassifier');
+
 const FROM_HEADER = 'crawler@reach-social.io';
 
 const DOMAIN_CONCURRENCY = Math.max(
@@ -284,14 +286,32 @@ async function isAllowedByRobots(url, { userAgent = '*' } = {}) {
 }
 
 // ── CF / rate-limit helpers ──────────────────────────────────────────
-
-const CF_BODY_RE =
-  /just a moment|__cf_chl|cdn-cgi\/challenge|cf-browser-verification|Attention Required/i;
+// CF_BODY_RE lives in blockClassifier (single source of truth).
+// cfChallenged back-compat: status 403/503 + body markers ONLY — header/
+// cookie CF signals are exposed on `block` but must not flip cfChallenged.
 
 function _isCfChallenged(status, bodyText) {
   if (status !== 403 && status !== 503) return false;
   if (!bodyText) return false;
   return CF_BODY_RE.test(bodyText);
+}
+
+function _setCookieList(headers) {
+  if (!headers) return undefined;
+  try {
+    if (typeof headers.getSetCookie === 'function') {
+      const list = headers.getSetCookie();
+      return Array.isArray(list) && list.length ? list : undefined;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const raw = headers.get ? headers.get('set-cookie') : headers['set-cookie'];
+    return raw == null || raw === '' ? undefined : raw;
+  } catch {
+    return undefined;
+  }
 }
 
 function _parseRetryAfter(h) {
@@ -446,12 +466,14 @@ async function _doFetch(url, {
         cfChallenged: false,
         rateLimited: false,
         tooLarge: false,
+        block: null,
         error: msg
       };
     }
 
     const status = res.status;
     const outHeaders = _resultHeaders(res.headers);
+    const setCookies = _setCookieList(res.headers);
 
     // 304 conditional GET
     if (status === 304) {
@@ -464,7 +486,8 @@ async function _doFetch(url, {
         notModified: true,
         cfChallenged: false,
         rateLimited: false,
-        tooLarge: false
+        tooLarge: false,
+        block: null
       };
     }
 
@@ -475,6 +498,12 @@ async function _doFetch(url, {
       if (Number.isFinite(cl) && cl > maxBytes) {
         // Consume/cancel body so the socket can close.
         try { res.body && res.body.cancel && res.body.cancel(); } catch { /* ignore */ }
+        const block = classifyBlock({
+          status,
+          headers: res.headers,
+          bodyText: '',
+          cookies: setCookies
+        });
         return {
           status,
           ok: false,
@@ -485,6 +514,7 @@ async function _doFetch(url, {
           cfChallenged: false,
           rateLimited: false,
           tooLarge: true,
+          block,
           error: `content-length ${cl} exceeds maxBytes ${maxBytes}`
         };
       }
@@ -496,6 +526,12 @@ async function _doFetch(url, {
     try {
       const capped = await _readBodyCapped(res, maxBytes, ac);
       if (capped.tooLarge) {
+        const block = classifyBlock({
+          status,
+          headers: res.headers,
+          bodyText: '',
+          cookies: setCookies
+        });
         return {
           status,
           ok: false,
@@ -506,6 +542,7 @@ async function _doFetch(url, {
           cfChallenged: false,
           rateLimited: false,
           tooLarge: true,
+          block,
           error: `body exceeds maxBytes ${maxBytes}`
         };
       }
@@ -521,11 +558,23 @@ async function _doFetch(url, {
         cfChallenged: false,
         rateLimited: false,
         tooLarge: false,
+        block: null,
         error: err && err.message ? err.message : String(err)
       };
     }
 
     const text = bodyBuf.toString('utf8');
+    // Full vendor classification (CF header/cookies, Akamai, PX, …).
+    // Pass raw res.headers so cf-mitigated / x-akamai-* / server are visible
+    // — outHeaders is the reduced etag/retryAfter projection only.
+    const block = classifyBlock({
+      status,
+      headers: res.headers,
+      bodyText: text,
+      cookies: setCookies
+    });
+    // Back-compat: cfChallenged === old _isCfChallenged (body+403/503 only).
+    // Header/cookie CF signals surface on `block` but do not flip this flag.
     const cfChallenged = _isCfChallenged(status, text);
     const rateLimited =
       status === 429 ||
@@ -543,6 +592,7 @@ async function _doFetch(url, {
         cfChallenged,
         rateLimited,
         tooLarge: false,
+        block,
         ...(ok ? {} : { error: cfChallenged ? 'cloudflare challenge' : `HTTP ${status}` })
       };
     }
@@ -556,6 +606,7 @@ async function _doFetch(url, {
       cfChallenged,
       rateLimited,
       tooLarge: false,
+      block,
       ...(ok ? {} : { error: cfChallenged ? 'cloudflare challenge' : `HTTP ${status}` })
     };
   } finally {
