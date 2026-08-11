@@ -1146,6 +1146,19 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
       }
       preserve = false;
       aspectTreatment = null;
+    } else {
+      // Positive trace for the LIVE path. Without this the only observable
+      // signal was the skip case above, so a paid render that preserved the
+      // scene left no evidence it had done so — and "did preserve fire?" is
+      // the first question anyone debugging a lifestyle ad will ask.
+      // Logs the trigger (lifestyle seed vs ugc variant) because they are
+      // deliberately independent branches, and the seed aspect because a
+      // null one silently means 'extend'.
+      console.log(
+        `🖼️  SCENE_PRESERVE applied: surface=${surface} treatment=${aspectTreatment} ` +
+        `trigger=${variantKind === 'ugc' ? 'ugc-variant' : 'lifestyle-seed'} ` +
+        `seedStyle=${seedStyle || 'null'} seedAspect=${seedAspect || 'null (→extend)'}`
+      );
     }
   }
 
