@@ -101,6 +101,90 @@ async function enrichBrandFromUrl(brandId) {
   }
 }
 
+/**
+ * preserveBrandReviewNumbers(fresh, prior) — mutates `fresh` in place, returns it.
+ *
+ * FRESH QUOTES, BUT NEVER DOWNGRADE THE NUMBERS.
+ *
+ * The persist predicate at the call site was widened so a numbers-only result still
+ * saves. The assignment stayed a WHOLESALE REPLACE, which leaves the mirror-image
+ * hole: a result with good quotes but `rating: null` wipes a previously-good rating.
+ * Observed live — Pelagic Gear held 3.2★ / 22 reviews, one refresh returned 2 quotes
+ * with null rating AND null reviewCount, and the brand came back with no numbers at
+ * all. Measured on BOTH the old and the new retrieval prompt (the
+ * `✓ brand-reviews: N quote(s)` log line omits its `· X★ · N reviews` suffix in
+ * both), so the null is grounded-search drift, not a prompt regression. The data
+ * loss is ours either way.
+ *
+ * Why it matters beyond a cosmetic card: `INTENTS.social_proof_led`'s `core` IS the
+ * rating, so a wiped rating removes a brand's ability to render social-proof ads —
+ * the exact failure this workstream just fixed. (Pelagic's own 3.2 sits under
+ * RATING_STAR_MIN 4.39 and never printed stars, so THAT brand lost stored data
+ * rather than a live ad format; the eligibility loss is what the same wipe does to
+ * any brand at or above the floor.)
+ *
+ * THE PAIR IS ONE ATOM — the part that is easy to get wrong. A per-field carry
+ * silently manufactures a cross-snapshot pair: prior `{3.2, 22}` + fresh
+ * `{null, 6000}` would store `{4.3, 6000}`-shaped data whose rating was measured on
+ * a different, far smaller sample. That is not academic: `brandStarFloorForCount`
+ * (ratingDisplay.js) LOWERS the star floor from 4.39 to 4.19 once the count clears
+ * 5000, so a stale rating paired with a fresh high count can print stars that the
+ * real snapshot never earned. `resolveAtomicRatingPair` exists to stop exactly this,
+ * and a merge here must not defeat it. So rating and reviewCount are carried
+ * TOGETHER, and only when the fresh fetch supplies neither.
+ *
+ * `summary` is carried on its own because it is prose about the reviews, not a term
+ * in the pair — it is never typeset as a customer quote and no display gate keys a
+ * number off it.
+ *
+ * QUOTES ARE STILL REPLACED WHOLESALE, ON PURPOSE: a refresh SHOULD adopt the
+ * newly-filtered pool, and carrying stale quotes forward would defeat the retrieval
+ * change. A fresh number always wins over a stored one, INCLUDING when it is lower —
+ * this preserves data, it does not flatter it.
+ *
+ * `numbersFetchedAt` records when the numbers now stored were actually measured,
+ * which `fetchedAt` cannot: that stamps the quote fetch. Nothing reads it yet; it
+ * exists so a carried aggregate is not indistinguishable from a fresh one. (Known
+ * follow-up: `productMatchService`'s 30-day TTL keys off `fetchedAt`, so carried
+ * numbers can ride along un-refetched. Bounding that needs an owner call on how
+ * stale an aggregate may get.)
+ *
+ * Exported so the harness exercises the shipped function instead of a copy.
+ */
+function preserveBrandReviewNumbers(fresh, prior) {
+  if (!fresh || typeof fresh !== 'object') return fresh;
+  if (!prior || typeof prior !== 'object') return fresh;
+  // `typeof NaN === 'number'`, and a NaN rating would survive every naive check and
+  // then compare false against every star floor. Only finite numbers count as data.
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+  const freshRating = num(fresh.rating);
+  const freshCount  = num(fresh.reviewCount);
+  const priorRating = num(prior.rating);
+  const priorCount  = num(prior.reviewCount);
+
+  if (freshRating == null && freshCount == null && (priorRating != null || priorCount != null)) {
+    fresh.rating      = priorRating;
+    fresh.reviewCount = priorCount;
+    fresh.numbersFetchedAt = prior.numbersFetchedAt || prior.fetchedAt || null;
+    const countBit = priorCount != null ? ` / ${priorCount} reviews` : '';
+    console.log(`   · brand-reviews: fetch returned no numbers — preserving stored ${priorRating != null ? `${priorRating}★` : 'count'}${countBit}`);
+  } else {
+    // At least one fresh number: keep the fresh snapshot EXACTLY as measured, half
+    // of it null if that is what came back. Filling the gap from `prior` is the
+    // cross-snapshot pair this function exists to prevent.
+    fresh.rating      = freshRating;
+    fresh.reviewCount = freshCount;
+    fresh.numbersFetchedAt = (freshRating != null || freshCount != null)
+      ? (fresh.fetchedAt || new Date())
+      : (fresh.numbersFetchedAt || null);
+  }
+
+  if (fresh.summary == null || fresh.summary === '') {
+    fresh.summary = (prior.summary == null || prior.summary === '') ? null : prior.summary;
+  }
+  return fresh;
+}
+
 async function runEnrichment(brand, brandId, run = null) {
 
   // Per-field protection (curatedFields) replaces the old wholesale
@@ -523,6 +607,7 @@ async function runEnrichment(brand, brandId, run = null) {
                       || typeof brandReviewsResult?.reviewCount === 'number';
       if (brandReviewsResult && (hasQuotes || hasNumbers)) {
         brandReviewsResult.fetchedAt = new Date();
+        preserveBrandReviewNumbers(brandReviewsResult, brand.brandReviews);
         brand.brandReviews = brandReviewsResult;
         const quoteBit  = hasQuotes ? `${brandReviewsResult.quotes.length} quote(s)` : 'no quotes';
         const ratingBit = typeof brandReviewsResult.rating === 'number'
@@ -810,6 +895,7 @@ function dedupe(arr) {
 
 module.exports = {
   enrichBrandFromUrl,
+  preserveBrandReviewNumbers,
   // Re-exported so callers can `require('./brandEnrichmentService').websiteBackgroundHex`
   // without knowing the util path; transform services import the util directly.
   websiteBackgroundHex,

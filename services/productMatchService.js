@@ -1530,7 +1530,18 @@ async function fetchBrandReviewsCachedOrFresh({ brand: brandName, brandUrl, adve
   // Write back to the catalog if we have a row to write to.
   if (brandDoc) {
     try {
-      brandDoc.brandReviews = Object.assign({}, fresh, { fetchedAt: new Date() });
+      // SAME DATA-LOSS BUG AS THE ENRICHMENT PERSIST SITE, second write path.
+      // This runs whenever a match resolves brand reviews with no Brand row cached
+      // yet or a stale one, and `fresh` reaching here is guaranteed to have quotes
+      // (the early return above) but NOT numbers — grounded search returns the
+      // aggregates independently. A wholesale replace therefore wipes a stored
+      // rating/count exactly the way the enrichment path did. Reuse the one helper
+      // rather than a second merge that can drift from it; required lazily because
+      // brandEnrichmentService is a heavy module and this is the only use of it here.
+      const { preserveBrandReviewNumbers } = require('./brandEnrichmentService');
+      const merged = Object.assign({}, fresh, { fetchedAt: new Date() });
+      preserveBrandReviewNumbers(merged, brandDoc.brandReviews);
+      brandDoc.brandReviews = merged;
       // Keep enrichmentSources in sync so /refresh-enrichment can
       // detect 'brand-reviews' was attempted.
       const sources = new Set(brandDoc.enrichmentSources || []);

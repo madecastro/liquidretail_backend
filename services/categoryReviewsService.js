@@ -24,7 +24,11 @@ const { breadcrumbToKey } = require('../models/Category');
 // The ad-usable quote directive and pool cap live in ONE place
 // (providers/geminiSearchProvider) so the brand, product and category retrieval
 // prompts cannot drift apart. Imported, never restated.
-const { AD_USABLE_QUOTE_DIRECTIVE, LLM_QUOTE_CAP } = require('./providers/geminiSearchProvider');
+const {
+  AD_USABLE_QUOTE_DIRECTIVE,
+  LLM_QUOTE_CAP,
+  keepVerbatimQuotes
+} = require('./providers/geminiSearchProvider');
 
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
 const ENDPOINT     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -279,18 +283,17 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     return { quotes: [], rating: null, reviewCount: null, summary: firstSentences(narrative, 2), sources: sourceDomains };
   }
 
-  // Substring-validate quotes against the narrative — drop anything the
-  // model fabricated by chopping the summary into clauses (the failure mode
-  // we hit on the first smoke test). Match is whitespace-insensitive.
-  const narrNorm = narrative.toLowerCase().replace(/\s+/g, ' ').trim();
-  const validatedQuotes = (Array.isArray(parsed.quotes) ? parsed.quotes : [])
-    .filter(q => q?.text && typeof q.text === 'string')
-    .filter(q => {
-      const qNorm = q.text.toLowerCase().replace(/\s+/g, ' ').trim();
-      // Require both substring presence AND minimum length so 1-2 word
-      // clause-fragments ("comfort", "sun protection") get filtered out.
-      return qNorm.length >= 15 && narrNorm.includes(qNorm);
-    })
+  // Substring-validate quotes against the narrative — drop anything the model
+  // fabricated by chopping the summary into clauses (the failure mode we hit on the
+  // first smoke test). Match is whitespace-insensitive.
+  //
+  // ONE implementation, shared with the brand and product lookups: substring
+  // validation against the narrative (≥15 chars, so 1-2 word clause-fragments like
+  // "comfort" or "sun protection" are filtered out) AND the sentence-completeness
+  // guard. This path previously carried its own copy of the substring check and
+  // therefore had none of the completeness protection — the same mid-clause quote
+  // that shipped on the brand path ("...keeping me cool in my") could ship here.
+  const validatedQuotes = keepVerbatimQuotes(parsed.quotes, narrative, `categoryReviews "${breadcrumb}"`)
     .slice(0, LLM_QUOTE_CAP)
     // PROVENANCE. These clear the substring check above, so the text is a
     // verbatim slice of the narrative — but the NARRATIVE is LLM-written from
