@@ -43,6 +43,9 @@ const veoService            = require('./videoRouter');
 const brandScriptExecutor   = require('./brandScriptExecutor');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const directImage           = require('./directImageRenderService');
+// THE shared derive-only gate (money). Imported, never re-implemented —
+// see its doc comment in campaignAdsGenerationService.
+const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
@@ -448,6 +451,25 @@ async function deriveFirstCatalogMediaId({ productId, brandId }) {
 async function preflight(adId, brandId) {
   const ad = await Ad.findOne({ _id: adId, brandId }).lean();
   if (!ad) { const e = new Error('Ad not found');                         e.status = 404; throw e; }
+  // ⚠️ MONEY — DERIVE-ONLY ADS MUST NEVER REGENERATE.
+  // A derive-only surface (Google PMax 1:1) holds a CROP of its sibling
+  // 9:16 master's already-paid plate; it has no generation of its own.
+  // runVideoFull() calls veoService.generateForAd unconditionally, so
+  // without this gate a Regenerate press bills a brand-new Omni video
+  // ($1.20 at the pinned 10s, up to $5.00 if the square routes to the
+  // per-second aspect-fallback model) — up to DAILY_CAP presses per ad,
+  // on the one surface the product sells as free derivation. Refuse here,
+  // in preflight, so it fails before the 202 and before any provider call
+  // is scheduled. The right way to refresh this ad is to regenerate its
+  // MASTER and let the derive re-run. Uses the SHARED gate so this cannot
+  // drift from the render loop's copy.
+  if (resolveDeriveFromMaster(ad)) {
+    const e = new Error(
+      'This ad is derived from its 9:16 master (no generation of its own) — '
+      + 'regenerate the master instead.'
+    );
+    e.status = 409; throw e;
+  }
   if (ad.metaSyncStatus === 'synced') {
     const e = new Error('Ad has been exported to Meta — regeneration disabled (the synced version is canonical).');
     e.status = 409; throw e;

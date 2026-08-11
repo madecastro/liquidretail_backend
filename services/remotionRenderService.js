@@ -380,7 +380,7 @@ async function warmup() {
  * contract: returns { finalPath, tempDir, timings } — the caller uploads
  * finalPath and removes tempDir.
  */
-async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, placementMode = null, brand = null, faceKeepOut = null }) {
+async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, placementMode = null, brand = null, faceKeepOut = null, platformFormat = null, safeZoneKey = null }) {
   if (!videoUrl) throw new Error('renderTitles: videoUrl required');
   if (!spec) throw new Error('renderTitles: spec required');
   const compositionId = COMPOSITION_BY_FORMAT[format];
@@ -455,7 +455,15 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
         }
       }
       timings.plateScanMs = Date.now() - t;
-      console.log(`🎬 remotion[ad=${adId || '?'}]: placement=${placement} format=${format}`);
+      // Safe-zone selection is independent of composition id (`format`).
+      // PMax VIDEO platformFormats → YT keys (resolved in Canonical via
+      // resolveSafeZoneKey); Meta / absent / unknown → canvas format zones.
+      // Pass both so a pre-resolved key OR a raw platformFormat works.
+      console.log(
+        `🎬 remotion[ad=${adId || '?'}]: placement=${placement} format=${format}` +
+        (platformFormat ? ` platformFormat=${platformFormat}` : '') +
+        (safeZoneKey ? ` safeZone=${safeZoneKey}` : '')
+      );
 
       // Brand logo: served to the render browser from the asset server
       // (the browser has no external egress).
@@ -486,6 +494,9 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
 
       const inputProps = {
         format,
+        // YT safe-zone selection (PMax video). Composition id stays `format`.
+        safeZoneKey: safeZoneKey || null,
+        platformFormat: platformFormat || null,
         fps,
         durationInFrames,
         plate: { videoUrl: `${base}/jobs/${jobId}/plate.mp4` },
@@ -550,7 +561,7 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
  * plateHints, fps, durationSec } to preserve the existing preview contract,
  * and optionally still frames.
  */
-async function renderPreview({ meta, spec, tokens, format, plateImagePath = null, plateVideoPath = null, plateColor = '#3D3D3D', scale = 0.5, durationSec = 8, stillTimesSec = null, includeVideo = true, placementMode = null, brand = null }) {
+async function renderPreview({ meta, spec, tokens, format, plateImagePath = null, plateVideoPath = null, plateColor = '#3D3D3D', scale = 0.5, durationSec = 8, stillTimesSec = null, includeVideo = true, placementMode = null, brand = null, platformFormat = null, safeZoneKey = null }) {
   const compositionId = COMPOSITION_BY_FORMAT[format];
   if (!compositionId) throw new Error(`renderPreview: unknown format '${format}'`);
 
@@ -629,6 +640,8 @@ async function renderPreview({ meta, spec, tokens, format, plateImagePath = null
 
       const inputProps = {
         format,
+        safeZoneKey: safeZoneKey || null,
+        platformFormat: platformFormat || null,
         fps,
         durationInFrames,
         plate,

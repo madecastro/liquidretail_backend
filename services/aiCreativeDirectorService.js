@@ -160,7 +160,12 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '3.2.0';   // BUMPED 2026-08-10 with the proof-menu flip.
+const DIRECTOR_SIGNALS_VERSION = '3.3.0';   // BUMPED 2026-08-10: PMax funnel-spread + social-proof hierarchy in round brief.
+// 3.3: PMax-only round brief adds FUNNEL SPREAD (one concept each of awareness /
+// consideration / conversion via routing.funnel_stage) and SOCIAL-PROOF HIERARCHY
+// (one dominant proof element; env-backed rating/count thresholds). Meta prompts
+// stay byte-identical. Live path re-assembles every round so this is live without
+// the bump; the bump is for the SHADOW directConcepts cache-hit gate.
 // The predecessor comment held this at 3.1.0 on purpose and said to bump it at
 // exactly the moment DIRECTOR_PROOF_MENU_ENABLED was flipped on. That flip is
 // this commit (config/defaults.env DIRECTOR_PROOF_MENU_ENABLED=true), so the
@@ -814,8 +819,145 @@ const ARCHETYPE_WEIGHTING = {
     `    PREFER  typographic_dominant (landscape gives headlines room to breathe — works well as a YouTube pre-roll)`,
     `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on YouTube/Display)`,
     `    AVOID        product_card_grid (multi-card layouts get clipped on small Display banner placements)`
+  ].join('\n'),
+  // Phase A live PMax video surfaces — scaffolded from pmax_16_9. Richer
+  // per-surface creative direction is Phase B; these keep reserved-chrome
+  // surfaces out of the "no weighting → square Feed defaults" hole.
+  pmax_video_16_9: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  magazine_editorial (clean editorial spread reads as commercial/professional on landscape)`,
+    `    PREFER  typographic_dominant (landscape gives headlines room to breathe — works well as a YouTube pre-roll)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on YouTube/Display)`,
+    `    AVOID        product_card_grid (multi-card layouts get clipped on small Display banner placements)`
+  ].join('\n'),
+  pmax_video_1_1: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  magazine_editorial (clean editorial reads commercial on square Discovery / PMax placements)`,
+    `    PREFER  typographic_dominant (square gives headlines room without vertical chrome pressure)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on Google surfaces)`,
+    `    AVOID        product_card_grid (multi-card layouts get cramped on 1:1 with reserved bands)`
+  ].join('\n'),
+  pmax_video_9_16: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  full_bleed_hero_bottom_panel (panel lands in the safe middle band, not Shorts chrome)`,
+    `    PREFER  magazine_editorial (clean commercial read on YouTube Shorts / PMax vertical)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy fights Shorts UI chrome)`,
+    `    AVOID        product_card_grid (multi-card layouts feel cramped on tall vertical)`
+  ].join('\n'),
+  // Phase A live PMax STATIC surfaces. The 1.91:1 landscape is a short, wide
+  // banner-like canvas where dense multi-element layouts fail; square and 4:5
+  // have more room. Modeled on the existing pmax_* entries — do not change Meta.
+  pmax_landscape_1_91_1: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  typographic_dominant (1.91:1 is a SHORT, WIDE banner-like canvas — bold headline + one product beat is all that fits)`,
+    `    PREFER  magazine_editorial (clean commercial spread; landscape Display placements reward restraint)`,
+    `    DEPRIORITIZE hero_quote_overlay (quote cards need vertical room this canvas does not have)`,
+    `    AVOID        product_card_grid (dense multi-element / multi-card layouts fail on a short wide banner)`,
+    `    AVOID        full_bleed_hero_bottom_panel (bottom panel + reserved chrome leaves almost no content height on a short canvas)`
+  ].join('\n'),
+  pmax_square_1_1: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  magazine_editorial (clean editorial reads commercial on square Discovery / PMax placements)`,
+    `    PREFER  typographic_dominant (square gives headlines room without vertical chrome pressure)`,
+    `    PREFER  full_bleed_hero_bottom_panel (square has enough height for a panel without crowding)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on Google surfaces)`,
+    `    AVOID        product_card_grid (multi-card layouts get cramped on 1:1 with reserved bands)`
+  ].join('\n'),
+  pmax_portrait_4_5: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  full_bleed_hero_bottom_panel (4:5 has room for a panel without Meta-style chrome pressure)`,
+    `    PREFER  magazine_editorial (clean commercial read on portrait PMax placements)`,
+    `    PREFER  typographic_dominant (portrait height gives type room to breathe)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on Google surfaces)`,
+    `    AVOID        product_card_grid (multi-card layouts still feel busy on portrait Display)`
   ].join('\n')
 };
+
+// ── PMax-only round brief (gated on platformFormat) ──────────────────
+//
+// Google PMax delivers ALL creative for a product into ONE asset group and
+// picks per impression by viewer intent — so the asset SET must SPAN the
+// funnel and concepts must be meaningfully different (not cosmetic variants).
+// Meta rounds must stay completely unaffected: every helper below is gated
+// on isPmaxPlatformFormat and never spliced into a Meta prompt or schema.
+// Thresholds are env-backed and INTERPOLATED into the prompt so the prose
+// and config/defaults.env can never disagree.
+
+const PMAX_FUNNEL_STAGES = Object.freeze(['awareness', 'consideration', 'conversion']);
+
+function isPmaxPlatformFormat(platformFormat) {
+  return typeof platformFormat === 'string' && platformFormat.startsWith('pmax_');
+}
+
+/**
+ * Read a numeric threshold from the environment, falling back to the default
+ * when it is unset, blank, or unparseable.
+ *
+ * ⚠️ `Number('')` and `Number('   ')` are **0**, not NaN — so a plain
+ * `Number.isFinite` guard treats a var that is present-but-empty (exactly what
+ * an operator leaves behind after clearing a value in the Render dashboard, and
+ * what `FOO=` in an env file produces) as a deliberate **zero**. That would put
+ * "strong rating ≥ 0" and "substantial count ≥ 0" into the prompt, which
+ * inverts the entire hierarchy: every SKU would qualify as RATING-FIRST and the
+ * weak-count suppression rule could never fire.
+ */
+function pmaxProofThreshold(varName, fallback) {
+  const raw = process.env[varName];
+  if (typeof raw !== 'string' || raw.trim() === '') return fallback;
+  const n = Number(raw.trim());
+  // Negative is as meaningless as blank here — both mean "misconfigured".
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** Strong-rating floor for RATING-FIRST / popularity-framing (default 4.5). */
+function pmaxProofStrongRating() {
+  return pmaxProofThreshold('PMAX_PROOF_STRONG_RATING', 4.5);
+}
+
+/** Minimum review count treated as "substantial" (default 100). */
+function pmaxProofMinReviewCount() {
+  return pmaxProofThreshold('PMAX_PROOF_MIN_REVIEW_COUNT', 100);
+}
+
+function buildPmaxFunnelSpreadBlock() {
+  return [
+    `PMAX FUNNEL SPREAD (absolute for this Google Performance Max round):`,
+    `Google delivers ALL creative for a product into ONE asset group and picks per impression using the viewer's intent signals. Do NOT treat every concept as the same funnel stage — the asset SET must SPAN the funnel. Your ${N_CONCEPTS_ROUND} concepts MUST cover one of each:`,
+    `  awareness     — brand story / lifestyle context / emotional hook; no hard sell; no offer language. Set routing.funnel_stage="awareness".`,
+    `  consideration — benefit + proof (reviews, ratings, differentiators, objection handling). Set routing.funnel_stage="consideration".`,
+    `  conversion    — offer / urgency / explicit action; product hero and clean. Set routing.funnel_stage="conversion".`,
+    `Each concept MUST declare routing.funnel_stage as one of ${PMAX_FUNNEL_STAGES.join('|')}. Across the round, the three stages must each appear exactly once so Google has distinct approaches to test — not cosmetic variations of one ad.`
+  ].join('\n');
+}
+
+function buildPmaxSocialProofHierarchyBlock() {
+  // Interpolate env-backed thresholds — never hardcode the same numbers as
+  // prose literals, or the prompt and config/defaults.env can drift apart.
+  const strongRating = pmaxProofStrongRating();
+  const minCount = pmaxProofMinReviewCount();
+  return [
+    `PMAX SOCIAL-PROOF HIERARCHY (owner creative guidelines — absolute for this round):`,
+    // PRECEDENCE SENTENCE — load-bearing, do not drop. The shared DR block
+    // earlier in this prompt states a different review-count threshold
+    // ("≥4.5 from ≥50") for when a rating is credible to cite. That text is
+    // Meta-tuned and stays untouched, so on a PMax round the model sees two
+    // numbers for a similar-looking decision. Naming which one wins removes
+    // the ambiguity without editing the shared text (which would change the
+    // Meta prompt and break its byte-identity guarantee).
+    `Where this hierarchy and any earlier proof guidance in this prompt disagree — including review-count thresholds — THIS block wins for this destination.`,
+    `One dominant social-proof element per creative. Supporting proof may appear but must stay visually secondary. Never give quote, rating, review count, price, product name and CTA equal weight.`,
+    ``,
+    `Per-SKU decision logic — apply using social_proof_signal values already in the brief:`,
+    `  - Strong rating (≥${strongRating}) AND substantial review count (≥${minCount}) → RATING-FIRST: the star rating dominant, review count supporting, NO quote.`,
+    `  - A short, specific, compelling customer quote → TESTIMONIAL-FIRST: quote is the hero; stars optional and SMALL; usually no count.`,
+    `  - Both strong AND a large canvas (1:1 or 4:5) → COMBINATION allowed, but one must still dominate.`,
+    `  - Weak review volume (count missing or <${minCount}) → do NOT print the count at all (a small number reads as a negative). Use the rating alone, or a quote.`,
+    `  - Rating below ${strongRating} with high volume (≥${minCount}) → prefer POPULARITY framing over the numeric rating (e.g. "Loved by thousands", "18,000+ reviews").`,
+    `  - Strong product photography / premium positioning → PRODUCT-FIRST: minimal or no social proof at all. This is a legitimate concept, not a failure.`,
+    ``,
+    `Concept diversity on the PROOF AXIS: across the round's ${N_CONCEPTS_ROUND} concepts, the DOMINANT proof element must differ — do not return three concepts that all lead with the rating. The proof axis (rating / testimonial / product-hero / offer) is a primary axis of variation, alongside the funnel stage.`
+  ].join('\n');
+}
 
 // ── the objective ────────────────────────────────────────────────────
 //
@@ -2041,6 +2183,12 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
   const signalHasRating = !!(proofSignal.rating && typeof proofSignal.rating.value === 'number');
   const hasUsableProof  = signalHasRating || optionHasRating;
 
+  // PMax-only objective blocks. Computed once so Meta rounds never even
+  // construct the strings (and cannot accidentally pick up a threshold
+  // interpolation). Gate is platformFormat.startsWith('pmax_') — Meta keys
+  // never match, so Meta system/user prompts stay byte-identical.
+  const isPmax = isPmaxPlatformFormat(platformFormat);
+
   const system = [
     `You are a senior creative director planning social-media ad creative.`,
     ``,
@@ -2050,6 +2198,16 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     ``,
     OBJECTIVE_BLOCK,
     ``,
+    // PMax only — funnel span + social-proof hierarchy. Spread into the array
+    // (not concatenated as a single multi-line string) so the join('\n') below
+    // produces the same blank-line rhythm as neighbouring blocks. Empty when
+    // Meta so this splice contributes ZERO characters to the Meta prompt.
+    ...(isPmax ? [
+      buildPmaxFunnelSpreadBlock(),
+      ``,
+      buildPmaxSocialProofHierarchyBlock(),
+      ``
+    ] : []),
     `STRUCTURAL RULES (absolute — violating these ships broken ads):`,
     `- copy.headline / copy.subheadline / copy.eyebrow / copy.cta are the ONLY strings that may appear as letterforms in the ad. Write them as final, shippable copy — not notes, not strategy.`,
     `- art_direction is OPTIONAL visual prose only: mood, light, material, type energy, palette feel. It MUST be null when you have no visual brief. NEVER put honesty-rule notes, "because", "no proof", "leans on", objection analysis, or any "why I chose this" text in art_direction. Those belong exclusively in reasoning.rationale.`,
@@ -2175,6 +2333,12 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     platformFormat === 'meta_reels_9_16'
       ? `    output_shape      — { format: 'reels_storyboard', duration_sec, storyboard_beats: [{t_start, t_end, role, position, emphasis}] }`
       : `    output_shape      — { format, tile_count }`,
+    // PMax only — funnel_stage is not a Meta field. Declaring it here on a
+    // Meta prompt would break Meta byte-identity; the schema addition below
+    // is gated the same way.
+    ...(isPmax ? [
+      `    funnel_stage     — awareness | consideration | conversion (declare which stage this concept serves; one of each across the round)`
+    ] : []),
     `  copy                — { headline, subheadline, eyebrow, cta } final strings (nullable per role) — ONLY letterforms`,
     `  art_direction       — null OR { look, palette_hint, typography_hint } visual prose only; null if no visual brief`,
     `  reasoning           — { rationale } PRIVATE: which objection + which signal. Never visual notes.`,
@@ -2366,6 +2530,12 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
   // render path that only reads art_direction / copy cannot reach it. Transport
   // is still response_format json_object (Atlas 400s on strict json_schema for
   // Anthropic); this schema is for the hand-rolled non-fatal validator only.
+  //
+  // funnel_stage is PMax-only (gated below). It lives under routing per the v3
+  // convention; consumers read it via conceptField() (conceptProjection dual-
+  // reads any name — listing it in ROUTING_NESTED_FIELDS is documentation-only
+  // for that module and is out of scope for this change).
+  const isPmax = isPmaxPlatformFormat(platformFormat);
   const routingSchema = {
     type: 'object',
     additionalProperties: false,
@@ -2416,7 +2586,13 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
       // mode, so an omitted property here is a warning candidate, not a
       // parse failure. A Director run from before this shipped, or with the
       // menu flag off, never emits this key at all; that must keep working.
-      proof_pick: { type: ['integer', 'null'] }
+      proof_pick: { type: ['integer', 'null'] },
+      // PMax only — nullable, not required (same soft-validator posture as
+      // proof_pick). Meta schemas omit this key entirely so Meta stays
+      // byte-identical on the schema side too.
+      ...(isPmax ? {
+        funnel_stage: { type: ['string', 'null'], enum: [...PMAX_FUNNEL_STAGES, null] }
+      } : {})
     }
   };
 

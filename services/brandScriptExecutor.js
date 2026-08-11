@@ -56,14 +56,18 @@ function isVerticalFormat(ad) {
 
 function isLandscapeFormat(ad) {
   const pf = String(ad?.platformFormat || '').toLowerCase();
-  if (/pmax|preroll|youtube|16_9/.test(pf)) return true;
+  // Bare `pmax` used to be enough when the only Google key was pmax_16_9.
+  // Square/portrait PMax keys now exist — match landscape by 16_9 (and the
+  // explicit landscape slug), not every pmax_* id. preroll/youtube kept.
+  if (/pmax_landscape|preroll|youtube|16_9/.test(pf)) return true;
   if (String(ad?.aspectRatio || '') === '16:9') return true;
   return false;
 }
 
-// 1:1 (Meta Feed square). Anchored to the `_1_1` SUFFIX rather than a loose /1_1/
-// so it cannot collide with another format id that merely contains those digits.
-// Checked against the real ids: meta_feed_1_1 matches; meta_feed_4_5,
+// 1:1 (Meta Feed square, PMax square image/video). Anchored to the `_1_1`
+// SUFFIX rather than a loose /1_1/ so it cannot collide with another format id
+// that merely contains those digits. Checked against the real ids:
+// meta_feed_1_1 / pmax_square_1_1 / pmax_video_1_1 match; meta_feed_4_5,
 // meta_reels_9_16, meta_stories_9_16 and pmax_16_9 do not.
 function isSquareFormat(ad) {
   const pf = String(ad?.platformFormat || '').toLowerCase();
@@ -79,12 +83,13 @@ function isSquareFormat(ad) {
 // aspectRatio '1:1'. meta_feed_1_1 declares kinds ['image','video'] and AI_VEO_FEED
 // is true, so this was reachable, not theoretical.
 //
-// Order matters: vertical and landscape are matched first because their patterns are
-// the more specific ones; square must precede the 'feed' fallthrough.
+// Order matters: vertical first (9_16 is specific); square BEFORE landscape so
+// pmax_video_1_1 / pmax_square_1_1 are not swallowed by a landscape rule that
+// once matched every `pmax_*` id; pmax_portrait_4_5 then falls through to feed.
 function classifyFormat(ad) {
   if (isVerticalFormat(ad))  return 'vertical';
-  if (isLandscapeFormat(ad)) return 'landscape';
   if (isSquareFormat(ad))    return 'square';
+  if (isLandscapeFormat(ad)) return 'landscape';
   return 'feed';
 }
 
@@ -700,7 +705,13 @@ function cleanProductNameForDisplay(name) {
 // LayoutInputArtifact bundle if present. Called by both the initial
 // pipeline (routes/ads.js Veo path) and the manual trigger endpoint
 // (routes/brand.js) so meta shape stays consistent.
-async function buildMetaForAd(ad, brand) {
+//
+// opts.presetOverride — MUST match the preset resolveSpec will use for
+// the actual Remotion render. Funnel-variant ads pass the same value
+// from renderWithRemotionAndSave so the quote-slot bind list cannot
+// desync from the composition. When omitted, derived from ad.funnelStage
+// (PMax video only) so callers that only pass {ad, brand} still agree.
+async function buildMetaForAd(ad, brand, opts = {}) {
   // Load raw context docs. Every non-derived meta field is resolved
   // downstream by the cascade engine (services/metaCascadeResolver.js)
   // against these docs + any Brand.metaCascades overrides. Brands
@@ -886,11 +897,20 @@ async function buildMetaForAd(ad, brand) {
           categoriesForSpec = await loadCategoryChainForProduct(catalogProduct);
         } catch { /* spec still resolves via the preset/canonical tiers */ }
       }
-      // No presetOverride here — neither live caller of buildMetaForAd
-      // (renderWithRemotionAndSave, or the dead canvas branch below it)
-      // ever passes one through to this function.
+      // SAME preset the render path will use. renderWithRemotionAndSave
+      // passes its resolved override in opts; when absent we re-derive
+      // from ad.funnelStage so a solo buildMetaForAd call still matches.
+      let presetOverride = opts.presetOverride;
+      if (presetOverride === undefined) {
+        try {
+          const { resolveFunnelPresetOverride } = require('./campaignAdsGenerationService');
+          presetOverride = resolveFunnelPresetOverride(ad);
+        } catch {
+          presetOverride = null;
+        }
+      }
       const { spec: resolvedTitleSpec } = resolveSpec({
-        brand, product: catalogProduct, ad, format, categories: categoriesForSpec, presetOverride: null,
+        brand, product: catalogProduct, ad, format, categories: categoriesForSpec, presetOverride,
       });
       const quoteSlot = resolvedTitleSpec?.slots?.find((s) => s.key === 'quote') || null;
       if (quoteSlot) {
@@ -1298,7 +1318,22 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
   const { resolveSpec, buildBrandTokens } = require('./titleSpecService');
   const { renderTitles } = require('./remotionRenderService');
 
-  const meta = await buildMetaForAd(ad, brand);
+  // Resolve the funnel preset ONCE and thread it into BOTH consumers:
+  // buildMetaForAd (quote-slot bind / social-proof gate) and resolveSpec
+  // (actual composition). If only the render path got the override the
+  // bind list would desync from the titled output. Explicit arg wins;
+  // else ad.funnelStage → canonical-<stage>-pmax10 for PMax video.
+  let resolvedPreset = presetOverride;
+  if (resolvedPreset == null) {
+    try {
+      const { resolveFunnelPresetOverride } = require('./campaignAdsGenerationService');
+      resolvedPreset = resolveFunnelPresetOverride(ad);
+    } catch {
+      resolvedPreset = null;
+    }
+  }
+
+  const meta = await buildMetaForAd(ad, brand, { presetOverride: resolvedPreset });
   // Resolve the spec for RENDER. With TITLE_SPEC_IGNORE_PERSISTED=true
   // (default), tier-1 persisted titleStyleSpec docs (ad/product/category/
   // brand) are skipped — only brand.titleStylePreset (curated file) or
@@ -1319,8 +1354,9 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
     } catch { /* non-fatal — falls back to brand/canonical */ }
   }
   // No honourPersistedOverrides — render path must not use stored brand specs.
+  // SAME resolvedPreset that buildMetaForAd used for the quote gate.
   const { spec, source } = resolveSpec({
-    brand, product: productForSpec, ad, format, categories, presetOverride,
+    brand, product: productForSpec, ad, format, categories, presetOverride: resolvedPreset,
   });
   // Same LayoutInputArtifact tier buildMetaForAd uses — brands without
   // explicit color/font fields still inherit the creative director's
@@ -1367,6 +1403,11 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
     console.warn(`   ⚠️  brandScript[ad=${ad._id}]: face keep-out resolve failed (${err.message})`);
   }
 
+  // platformFormat drives YT safe-zone selection for PMax video only
+  // (verticalYt/landscapeYt/squareYt). Canvas `format` stays the composition
+  // id + titleStyleSpec key. Absent/unknown platformFormat → Meta zones.
+  const platformFormat = ad?.platformFormat || null;
+
   let result;
   try {
     adStage(ad._id, `titling ${ad.aspectRatio || format}`);
@@ -1376,6 +1417,7 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       spec,
       tokens,
       format,
+      platformFormat,
       brandName: brand?.name,
       adId:      String(ad._id),
       brand,
@@ -1400,6 +1442,7 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       result = await renderTitles({
         videoUrl:  ad.veoVideoUrl,
         meta, spec, tokens, format,
+        platformFormat,
         brandName: brand?.name,
         adId:      String(ad._id),
         brand,
@@ -1490,6 +1533,15 @@ module.exports = {
   renderBrandScript,
   renderBrandScriptAndSave,
   buildMetaForAd,
+  // Re-export for harnesses that pin funnel-preset threading without
+  // pulling the whole generation service.
+  resolveFunnelPresetOverride: (ad) => {
+    try {
+      return require('./campaignAdsGenerationService').resolveFunnelPresetOverride(ad);
+    } catch {
+      return null;
+    }
+  },
   cleanProductNameForDisplay,
   gateLayoutInputQuotes,
   previewBrandScript,

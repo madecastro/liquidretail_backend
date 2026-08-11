@@ -223,16 +223,23 @@ async function finalizeFlatCost(meta = {}) {
   if (!id) return recordFlatCost(meta);
   const raw = meta.status || 'ok';
   const status = CostLog.COST_STATUSES.includes(raw) ? raw : 'error';
+  // durationMs is set ONLY when the caller supplies one. It used to be written
+  // unconditionally as `meta.durationMs ?? null`, which meant any caller that
+  // finalizes a row for a different reason — the video cost reconcile, which
+  // knows the settled price but nothing about how long the submit took —
+  // silently ERASED the duration the charge-point write had already recorded.
+  // Absent must mean "leave what is there", not "null it".
+  const set = {
+    status,
+    costUsd:      Number(meta.costUsd) || 0,
+    costSource:   meta.costSource || 'estimated',
+    errorMessage: meta.errorMessage || null
+  };
+  if (meta.durationMs !== undefined) set.durationMs = meta.durationMs;
   try {
     await CostLog.updateOne(
       { providerRequestId: id },
-      { $set: {
-          status,
-          costUsd:      Number(meta.costUsd) || 0,
-          costSource:   meta.costSource || 'estimated',
-          durationMs:   meta.durationMs ?? null,
-          errorMessage: meta.errorMessage || null
-      } },
+      { $set: set },
       { upsert: false }
     ).then(async (res) => {
       const n = res.matchedCount ?? res.n ?? 0;

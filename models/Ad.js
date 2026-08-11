@@ -66,7 +66,12 @@ const adSchema = new mongoose.Schema({
   // enum + future values.
   platformFormat: {
     type:    String,
-    enum:    ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16', 'meta_stories_9_16', 'pmax_16_9'],
+    enum:    [
+      'meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16', 'meta_stories_9_16', 'pmax_16_9',
+      // Phase A live PMax surfaces (mirror services/platformFormats.js status:'live')
+      'pmax_landscape_1_91_1', 'pmax_square_1_1', 'pmax_portrait_4_5',
+      'pmax_video_16_9', 'pmax_video_1_1', 'pmax_video_9_16'
+    ],
     default: 'meta_feed_1_1',
     index:   true
   },
@@ -241,6 +246,27 @@ const adSchema = new mongoose.Schema({
   // base came from a Cloudinary segment extract (no model ran) and for
   // ads rendered before this field existed.
   veoModel:           { type: String, default: null },
+  // DERIVE-ONLY marker (Google PMax Phase A). When set, this ad's base
+  // plate is CROPPED FROM the sibling master ad of that platformFormat —
+  // it is NOT its own Omni generation and must never reach a billable
+  // submit (routes/ads.js `renderDeriveOnlyVideoAd`). Today:
+  //   - `pmax_video_1_1` (source `pmax_video_9_16`)
+  //   - funnel-variant ads (source = the paid master of the same surface)
+  // MONEY: the render gate ALSO fail-closes on
+  // `platformFormat === 'pmax_video_1_1'` and on `funnelStage` set, so a
+  // dropped/absent value here can never turn a free derivation into a
+  // paid master. Declared so Mongoose strict mode persists the marker.
+  deriveFromMaster:   { type: String, default: null },
+  // Funnel-stage retitle (Google PMax). When set, this Ad is a FREE
+  // Remotion re-title of an already-paid master plate (or of the free
+  // 1:1 derive plate) using remotion/presets/canonical-<stage>-pmax10.json.
+  // Absent/null = today's single-title behaviour. NEVER billable on its
+  // own — routes via resolveDeriveFromMaster → renderDeriveOnlyVideoAd.
+  funnelStage: {
+    type:    String,
+    enum:    ['awareness', 'consideration', 'conversion', null],
+    default: null
+  },
   // Aspect ratio the model actually rendered (may differ from
   // ad.aspectRatio when the model didn't support the canvas aspect
   // natively and we had to remap). Composite skips its saliency-crop

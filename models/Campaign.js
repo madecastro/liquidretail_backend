@@ -221,7 +221,12 @@ const campaignSchema = new mongoose.Schema({
   // canvases with no safe-area constraints).
   platformFormat: {
     type:    String,
-    enum:    ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16', 'meta_stories_9_16', 'pmax_16_9'],
+    enum:    [
+      'meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16', 'meta_stories_9_16', 'pmax_16_9',
+      // Phase A live PMax surfaces (mirror services/platformFormats.js status:'live')
+      'pmax_landscape_1_91_1', 'pmax_square_1_1', 'pmax_portrait_4_5',
+      'pmax_video_16_9', 'pmax_video_1_1', 'pmax_video_9_16'
+    ],
     default: 'meta_feed_1_1',
     index:   true
   },

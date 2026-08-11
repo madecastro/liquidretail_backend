@@ -64,10 +64,15 @@ for (const [format, target] of Object.entries(TARGET_BY_FORMAT)) {
       `${target} != ${comp.width}x${comp.height} — a crop to ${target} would be RE-CROPPED by objectFit:'cover'`);
   });
 }
-// Live surfaces only — coming_soon formats are never base-plated (never generated).
+// Live VIDEO-capable surfaces only — base-plate crop is a titling-path step.
+// Static-only live keys (e.g. pmax_landscape_1_91_1 at 1.91:1) never reach
+// brandScriptExecutor / basePlateCropService; their deliveryDims need not
+// match a Remotion crop target. Do NOT unscope this to every live format.
+// coming_soon formats are never base-plated (never generated).
 for (const [pfId, pf] of Object.entries(PLATFORM_FORMATS)) {
   if (pf.status === 'coming_soon') continue;
-  check(`T3 ${pfId}: classifyFormat's target matches deliveryDims aspect`, () => {
+  if (!Array.isArray(pf.kinds) || !pf.kinds.includes('video')) continue;
+  check(`T3 ${pfId}: classifyFormat's target matches deliveryDims aspect (video-capable)`, () => {
     const format = classifyFormat({ platformFormat: pfId, aspectRatio: pf.aspectRatio });
     const target = TARGET_BY_FORMAT[format];
     const a = parseAspect(target);
@@ -90,13 +95,35 @@ check('G2 an unknown/legacy platformFormat cannot reach the crop', () => {
   assert.strictEqual(d.action, 'skip');
   assert.ok(d.reason.startsWith('aspect-mismatch'), d.reason);
 });
-check('G3 every REAL (platformFormat, aspect) pair passes the guard for its own format', () => {
+// Video-capable live formats only — same scope as T3. Static-only keys do not
+// enter the crop path, and a 1.91:1 static would correctly fail the 16:9 target
+// guard if forced through it.
+check('G3 every REAL video-capable (platformFormat, aspect) pair passes the guard for its own format', () => {
   for (const [pfId, pf] of Object.entries(PLATFORM_FORMATS)) {
     if (pf.status === 'coming_soon') continue;
+    if (!Array.isArray(pf.kinds) || !pf.kinds.includes('video')) continue;
     const format = classifyFormat({ platformFormat: pfId, aspectRatio: pf.aspectRatio });
     const pre = preGateBasePlateCrop({ format, platformFormat: pfId, sourceUrl: SRC });
     assert.strictEqual(pre.action, 'proceed', `${pfId} -> ${format}: ${pre.reason}`);
   }
+});
+// Derive-only path core: pmax_video_1_1 (1:1) is cropped free from a settled
+// 9:16 master — the guard must PROCEED for that (platformFormat, format) pair,
+// and a 9:16 source plate must produce a real crop, not a skip/refusal.
+check('G3b pmax_video_1_1 preGate proceeds (derive-only 1:1 from 9:16 master)', () => {
+  const format = classifyFormat({ platformFormat: 'pmax_video_1_1', aspectRatio: '1:1' });
+  assert.strictEqual(format, 'square');
+  const pre = preGateBasePlateCrop({ format, platformFormat: 'pmax_video_1_1', sourceUrl: SRC });
+  assert.strictEqual(pre.action, 'proceed', `preGate refused derive-only 1:1: ${pre.reason}`);
+});
+check('G3b pmax_video_1_1 crops a 9:16 master into 1:1 (not skip/refuse)', () => {
+  const format = classifyFormat({ platformFormat: 'pmax_video_1_1', aspectRatio: '1:1' });
+  const d = decideBasePlateCrop(base({
+    format, platformFormat: 'pmax_video_1_1', sourceW: 1080, sourceH: 1920,
+  }));
+  assert.strictEqual(d.action, 'crop', `expected crop from 9:16 master, got ${d.action}: ${d.reason}`);
+  assert.ok(d.rect && d.rect.cw === 1080 && d.rect.ch === 1080,
+    `expected 1080x1080 crop window, got ${JSON.stringify(d.rect)}`);
 });
 
 // ── F. face gating (the anchorY-'center'-is-not-today's-output P0) ─────────

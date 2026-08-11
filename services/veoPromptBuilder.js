@@ -14,14 +14,17 @@
 // zoom-out reveal). The GPT storyboard (veoStoryboardService) is
 // retired on the Atlas path: camera is fully specified below and audio
 // uses a fixed default.
-// Two labeled default-prompt profiles (PROMPT_PROFILES) keep each
-// model family's static directives independently tunable:
+// Labeled default-prompt profiles (PROMPT_PROFILES):
 //   • gemini-omni — verbose; optimized for google/gemini-omni-flash/*
-//     (20,000-byte cap)
+//     (20,000-byte cap). FROZEN for Meta — owner PR #61 full rollback;
+//     B14 asserts byte-identity to the pre-#61 prompt. Do NOT reword.
 //   • grok — compact re-authoring of the same rules; optimized for
 //     xai/grok-imagine-video* (4,096-byte cap); also serves veo/generic
-// promptProfileFor(caps) selects the profile from caps.paramShape.
-// The prompt-size cap is per-model (caps.promptByteCap).
+//   • pmax — Google PMax video only (hook-first + centre-safe + aspect
+//     framing). Selected when platformFormat is a pmax_video_* destination
+//     AND PMAX_VIDEO_DIRECTIVES is on (default). Meta path is untouched.
+// promptProfileFor(caps, opts) selects the profile from destination first,
+// then caps.paramShape. The prompt-size cap is per-model (caps.promptByteCap).
 
 
 // Aspect-ratio resolution lives in services/platformFormats.js — the
@@ -35,11 +38,12 @@ const PLATFORM_FORMAT_ASPECT = Object.fromEntries(
   Object.entries(PLATFORM_FORMATS).map(([k, v]) => [k, v.aspectRatio])
 );
 
-// Per-model-family default-prompt profiles. Static Ken Burns directives
-// are authored once per profile so Omni (20k headroom) and Grok (4,096)
-// can be tuned independently; shared dynamic lines (operator lead,
-// duration-scaled Timeline/Output, PRODUCT FIDELITY, compositing,
-// seedHasText) stay in buildVeoPrompt.
+// Per-model-family / per-destination default-prompt profiles. Static Ken
+// Burns directives are authored once per profile so Omni (20k headroom),
+// Grok (4,096), and PMax (destination overlay on Omni) can be tuned
+// independently; shared dynamic lines (operator lead, duration-scaled
+// Timeline/Output, PRODUCT FIDELITY, compositing, seedHasText) stay in
+// buildVeoPrompt. PMax also adds aspect-aware Frame lines there.
 const PROMPT_PROFILES = {
   'gemini-omni': {
     label: 'Gemini Omni default prompt',
@@ -56,12 +60,48 @@ const PROMPT_PROFILES = {
       'xai/grok-imagine-video/reference-to-video'
     ],
     promptByteBudget: 4096
+  },
+  'pmax': {
+    label: 'Google PMax video prompt',
+    optimizedFor: [
+      'pmax_video_9_16',
+      'pmax_video_16_9',
+      'pmax_video_1_1'
+    ],
+    // Renders on Omni under the hood — same 20k byte budget.
+    promptByteBudget: 20000
   }
 };
 
-// paramShape starting with 'gemini-omni' → gemini-omni; 'grok' → grok;
-// anything else (veo/generic) → grok (compact variant; shared 4,096 cap).
-function promptProfileFor(caps) {
+// True for Google PMax video platformFormat keys (masters + derive-only).
+// Destination is passed in — never sniffed from globals.
+function isPmaxVideoDestination(platformFormat) {
+  const f = String(platformFormat || '');
+  return f.startsWith('pmax_video_');
+}
+
+// Kill switch PMAX_VIDEO_DIRECTIVES (default TRUE). Off → PMax destinations
+// fall through to the Omni/Grok profile selection (Phase A behaviour).
+function isPmaxVideoDirectivesEnabled() {
+  return String(process.env.PMAX_VIDEO_DIRECTIVES ?? 'true').toLowerCase() !== 'false';
+}
+
+// Select the default-prompt profile.
+//   1. Explicit opts.promptProfile wins (harness / override).
+//   2. PMax video destination + kill switch on → 'pmax'.
+//   3. Else paramShape starting with 'gemini-omni' → gemini-omni;
+//      'grok' → grok; anything else (veo/generic) → grok.
+// Second arg is optional: absent opts preserves pre-PMax behaviour exactly
+// (Meta / scaffold / B14 paths that only pass caps).
+function promptProfileFor(caps, opts = null) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  if (typeof o.promptProfile === 'string' && o.promptProfile.trim()) {
+    return o.promptProfile.trim();
+  }
+  const dest = o.platformFormat || o.destination || null;
+  if (isPmaxVideoDestination(dest) && isPmaxVideoDirectivesEnabled()) {
+    return 'pmax';
+  }
   const shape = String(caps?.paramShape || '');
   if (shape.startsWith('gemini-omni')) return 'gemini-omni';
   if (shape.startsWith('grok')) return 'grok';
@@ -252,6 +292,50 @@ const GROK_DIRECTIVES = {
     `No fantasy motion — no sparkles, particles, flares, floating props, morphing, or dissolves.`
 };
 
+// ── GOOGLE PMAX video prompt — destination profile for pmax_video_* only ──
+// Starts from OMNI_DIRECTIVES (proven Meta text). Changes ONLY what the
+// destination requires: hook-first objective, centre-safe camera. Fidelity
+// / noText / physicalAccuracy / productPreservation are referenced from
+// OMNI so they cannot drift. Timeline + aspect Frame lines are assembled
+// in buildVeoPrompt when profile === 'pmax'. Kill switch:
+// PMAX_VIDEO_DIRECTIVES=false restores the Omni/Grok path for PMax too.
+// DO NOT import PR #61 rollback text. DO NOT touch OMNI_DIRECTIVES.
+const PMAX_DIRECTIVES = {
+  role:
+    `Role: Professional product commercial editor. Animate the supplied product photos with virtual camera movement only — ` +
+    `do NOT generate, recreate, or alter imagery. The supplied images are the source of truth.`,
+  objective:
+    `Objective: Create a premium product commercial using subtle Ken Burns camera moves. ` +
+    // Aspect-neutral by design: this one profile serves both the landscape
+    // and vertical PMax masters, and the aspect-specific direction is the
+    // Frame line assembled in buildVeoPrompt. Naming one aspect here (an
+    // earlier draft said "swipe-away vertical") is simply false on the
+    // other master and gives the model a contradictory cue.
+    `HOOK-FIRST: this surface is skipped or scrolled past in seconds — the product must be identifiable within the first 2 seconds; the opening frames carry the whole ad. ` +
+    `Must feel luxury while keeping 100% fidelity to the original product.`,
+  // Shared fidelity block — reference, do not re-author (drift guard).
+  sourceImages: OMNI_DIRECTIVES.sourceImages,
+  productPreservation: OMNI_DIRECTIVES.productPreservation,
+  transitions: OMNI_DIRECTIVES.transitions,
+  cameraStyle:
+    `Camera style: Luxury, slow, elegant, stable. Ease in/out. ` +
+    `Centre-safe composition: keep the product and any focal detail within the central region of the frame — ` +
+    `away from the top and bottom bands and the outer side margins, where the platform overlays UI. ` +
+    `No shake, handheld, parallax, simulated 3D, orbit, or object movement. The product stays completely static.`,
+  background: OMNI_DIRECTIVES.background,
+  visualStyle: OMNI_DIRECTIVES.visualStyle,
+  audio: OMNI_DIRECTIVES.audio,
+  noText: OMNI_DIRECTIVES.noText,
+  physicalAccuracy: OMNI_DIRECTIVES.physicalAccuracy,
+  doNot: OMNI_DIRECTIVES.doNot
+};
+
+function directivesForProfile(profile) {
+  if (profile === 'pmax') return PMAX_DIRECTIVES;
+  if (profile === 'gemini-omni') return OMNI_DIRECTIVES;
+  return GROK_DIRECTIVES;
+}
+
 // Main export. Builds the camera-only "Ken Burns" video prompt for the
 // AI model. All text choreography is handled by the chrome compositor
 // downstream — the prompt MUST NOT contain any "render this text"
@@ -267,24 +351,39 @@ const GROK_DIRECTIVES = {
 // the Ken Burns spec fully defines camera + timeline, and audio uses a
 // fixed default. caps is the resolved model's MODEL_CAPS entry;
 // caps.promptByteCap drives the size cap (4096 when absent).
-// Static directive phrasing comes from OMNI_DIRECTIVES or GROK_DIRECTIVES
-// via promptProfileFor(caps); shared dynamic lines stay below.
+// Static directive phrasing comes from OMNI / GROK / PMAX via
+// promptProfileFor(caps, { platformFormat }); shared dynamic lines stay
+// below. aspectRatio is used ONLY on the pmax profile (Frame line).
+// platformFormat / destination / promptProfile select the profile;
+// absent → today's Meta/Omni/Grok behaviour exactly.
 function buildVeoPrompt({
   brand,          // eslint-disable-line no-unused-vars — kept for call-site stability
   product,
   media,
   layoutInput = null,     // eslint-disable-line no-unused-vars
   sourceMedia = null,     // eslint-disable-line no-unused-vars
-  aspectRatio = '1:1',    // eslint-disable-line no-unused-vars
+  aspectRatio = '1:1',
   seedHasText = false,
   hasProductReference = false,
   operatorPrompt = null,
   storyboard = null,      // eslint-disable-line no-unused-vars
   caps = null,
-  durationSec = 8         // per-ad render length (wizard format-selection stage)
+  durationSec = 8,        // per-ad render length (wizard format-selection stage)
+  platformFormat = null,  // Ad.platformFormat — PMax destination selector
+  destination = null,     // alias for platformFormat
+  promptProfile = null    // explicit profile override (harness / opt-in)
 }) {
   const lines = [];
-  const d = promptProfileFor(caps) === 'gemini-omni' ? OMNI_DIRECTIVES : GROK_DIRECTIVES;
+  const profile = promptProfileFor(caps, {
+    platformFormat: platformFormat || destination || null,
+    destination: destination || null,
+    promptProfile
+  });
+  const d = directivesForProfile(profile);
+  const isPmax = profile === 'pmax';
+  // Used by the PMax timeline only. Meta's timeline is frozen and must not
+  // become aspect-aware (see the PR #61 rollback note above).
+  const isVerticalAspect = String(aspectRatio || '') === '9:16';
 
   // Operator refinement (regeneration only). Leads the prompt so the
   // video model sees the requested change before the fixed spec below.
@@ -312,19 +411,60 @@ function buildVeoPrompt({
   // downstream (removed deliberately; endcards, when desired, are
   // prompted in a custom titling script instead).
   // Scene marks scale proportionally with the requested duration so a
-  // 4s or 15s render keeps the same pan → logo zoom → reveal arc
+  // 4s, 10s, or 15s render keeps the same pan → logo zoom → reveal arc
   // (canonical 8.0s beats were 2.66 / 5.12 — ratios 1/3 and 0.64).
+  // Meta branch is FROZEN — do not reword (B14 byte-identity).
+  // PMax branch is hook-first: product legible from frame 1; establishing
+  // move happens WITH the product already reading, not before it.
   const dur = Number(durationSec || 8);
   const t1  = (dur / 3).toFixed(2);
   const t2  = (dur * 0.64).toFixed(2);
-  lines.push(
-    `Timeline (${dur.toFixed(1)}s): ` +
-    `Scene 1 (0.0–${t1}s): slow horizontal pan left→right, ~10–15% movement. No zoom, rotation, or perspective shift. ` +
-    `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
-    `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain center framing.`
-  );
+  if (isPmax) {
+    lines.push(
+      `Timeline (${dur.toFixed(1)}s): ` +
+      `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame; ` +
+      `the establishing camera move happens WITH the product already reading as the subject, not before it. ` +
+      // Scene 1's move must match the aspect. A left→right pan is right for a
+      // WIDE frame, but on 9:16 it walks the subject toward the side margins —
+      // where the platform's engagement rail sits — directly contradicting the
+      // centre-safe rule stated in cameraStyle two lines later. The Frame line
+      // is already aspect-aware; the timeline has to be too, or the two halves
+      // of the same prompt disagree.
+      (isVerticalAspect
+        ? `Very slow push-in toward the product, ~8–12% movement, product held on the vertical centre line. No lateral drift toward either side margin. No rotation or perspective shift. `
+        : `Slow horizontal pan left→right across the product, ~10–15% movement. No zoom, rotation, or perspective shift. `) +
+      `The product must be unmistakable within the first 2.0s. ` +
+      `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
+      `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain centre-safe framing.`
+    );
+  } else {
+    lines.push(
+      `Timeline (${dur.toFixed(1)}s): ` +
+      `Scene 1 (0.0–${t1}s): slow horizontal pan left→right, ~10–15% movement. No zoom, rotation, or perspective shift. ` +
+      `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
+      `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain center framing.`
+    );
+  }
   lines.push(d.transitions);
   lines.push(d.cameraStyle);
+
+  // Aspect-aware framing — PMax profile only. Meta never emits Frame lines
+  // (aspectRatio was previously accepted and unused on that path).
+  if (isPmax) {
+    const ar = String(aspectRatio || '');
+    if (ar === '16:9') {
+      lines.push(
+        `Frame (16:9 landscape): use wider establishing framing; prefer horizontal camera travel rather than vertical. ` +
+        `Hold the product in the central band of the wide frame with generous headroom above and below the product.`
+      );
+    } else if (ar === '9:16') {
+      lines.push(
+        `Frame (9:16 vertical): vertical-appropriate framing with the product readable upright in portrait. ` +
+        `Keep the product in the central region, clear of the top and bottom bands and the right edge where the platform overlays UI.`
+      );
+    }
+  }
+
   lines.push(d.background);
   lines.push(d.visualStyle);
 
@@ -379,6 +519,7 @@ function buildVeoPrompt({
   // 4,096). When over budget, drop optional context lines in defined
   // priority order. Directive blocks (preservation / fidelity / no-text
   // / timeline) are never dropped — they're the load-bearing part.
+  // Applies to every profile including pmax.
   return enforceByteCap(lines, caps);
 }
 
@@ -448,8 +589,13 @@ module.exports = {
   promptProfileFor,
   PROMPT_PROFILES,
   enforceRawByteCap,
+  enforceByteCap,
+  isPmaxVideoDestination,
+  isPmaxVideoDirectivesEnabled,
+  directivesForProfile,
   // Exported for offline verify harnesses (directive continuity / policy).
   OMNI_DIRECTIVES,
   GROK_DIRECTIVES,
+  PMAX_DIRECTIVES,
 };
 

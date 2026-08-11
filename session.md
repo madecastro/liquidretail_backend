@@ -1409,7 +1409,17 @@ to that entry's index instead of a parallel single-tile hack. `tsc -b --noEmit` 
 
 ## Next-session prompt
 
-**START HERE — 2026-08-10 pickup.**
+**START HERE — 2026-08-11 post-Phase-B addendum on branch
+`feat/pmax-surfaces-phase-a2`.** Phase A (surfaces/money shape) + Phase B
+(creative prompts / Yt zones / Director funnel) are documented; this block is
+the handoff **after** adversarial review + video cost reconcile. Full write-up:
+`docs/PIPELINES.md` §5 *Static PMax prompt overlay* + *Measured PMax unit
+costs* + §6 *YouTube safe zones* / *PMax video directives* / *Director funnel*
+/ *Phase B adversarial corrections* / *Video cost reconciliation*; money in
+`CLAUDE.md` §2; traps (shared funnel presets, `ROUTING_NESTED_FIELDS`, blank
+`PMAX_PROOF_*`, precedence sentence, `classifyFormat`) in §4.
+
+### Production status carried forward from `main` (do not lose this)
 
 0aa. **NEWEST — 2026-08-10: the `/generate` gate is now REQUEST-FINGERPRINT keyed, and IG
    re-scan/rebind is unblocked. MERGED AND LIVE IN PRODUCTION — but NOT exercised against a
@@ -1433,113 +1443,118 @@ to that entry's index instead of a parallel single-tile hack. `tsc -b --noEmit` 
    previous requests but allow them if the user wants."* and *"also while we are doing this, let's
    allow the user to re-scan and change the instagram ID also"*.
 
-   **The media-library bug was the gate failing CLOSED.** A media-library run legitimately posts
-   `productIds: []` (its seed is media, not a SKU), which `normalizeProductIdList` collapsed to `[]`
-   = "scope unknown", so it was refused whenever ANY sibling run was in flight — and while it was in
-   flight it blocked every product run too. Both directions are fixed.
+---
 
-   Changed: `services/generationGate.js` (rewritten — `computeRequestFingerprint`,
-   `renderClaimFingerprint`, `buildOverlapNotice`, confirm-containment), `routes/ads.js` (both gate
-   consults + both CampaignRun stamps + the 202 `notice`), `models/CampaignRun.js`
-   (`requestFingerprint` + `{campaignId, requestFingerprint, createdAt}` index),
-   `services/postSyncService.js` + `routes/integrations.js` (`force` re-scan; structured rebind 409).
-   Frontend (separate repo, branch `feat/ig-rescan-and-duplicate-confirm`):
-   `auth/apiFetch.ts` (`ApiError` carries `.status`/`.body`), `GenerateAds/Step4Generate.tsx`
-   (duplicate-confirm dialog), `Brand/IGPickerModal.tsx` + `Brand/IntegrationsCard.tsx` (IG
-   change-account + re-scan). New harness `scripts/verifyIgRescanGuards.js` (20 checks, five
-   revert-proven); `scripts/verifyGenerationGate.js` rewritten for the new key (**194 checks**,
-   revert-proven on ten mutations).
+### What shipped — offline suite **85/85 green** (merged with main)
 
-   **Read CLAUDE.md §2 before touching any of it** — it now carries the digest evidence for why
-   dropping product-overlap is not a money regression (video is protected by the
-   `(campaignId, identityDigest)` unique index because its digest is run-independent; duplicate
-   static sets are owner-sanctioned), the fail-OPEN rationale, and the single-use override rule.
+**Phase B (unchanged substance):** static `PLATFORM_NOTES` + intent-aware CTA;
+`PMAX_DIRECTIVES` (hook-first, centre-safe, aspect-aware Frame); Director
+funnel span + social-proof hierarchy + `DIRECTOR_SIGNALS_VERSION` 3.3.0;
+YouTube safe zones wired; `verifyPmaxPromptOverlay.js` (314 checks). Meta
+byte-identity held. Phase A money shape still true (3 static + 2 masters + 1
+free derive 1:1).
 
-   **A REAL DEFECT was caught by the harness, not by review.** `kinds` arrives from the route as a
-   bare SCALAR (`'image'|'video'|'both'|null`), and the first draft canonicalised it with an
-   array-only helper, so EVERY value collapsed to `''`. A static-only run and a video-only run over
-   the same product hashed **identically**, and the second was refused as a duplicate — a false
-   block on the most likely real sequence, "generate the statics, then generate the video". Fixed
-   via `canonicalScalarOrList`; both shapes pinned. The general rule the module now documents at
-   length: the fingerprint must cover **exactly** the fields the handler reads. A field left out
-   causes a false BLOCK; a dead field included causes a false ALLOW (a missed double-click).
-   `refresh` and `expandVideoFormats` are both dead — destructured/sent but never forwarded to
-   `expandWizardJob` — and are pinned as anti-trap cases in both directions.
+**Post-Phase-B addendum (record — do not re-do):**
 
-   **Next actions, in order:**
-   1. **Exercise it live.** Nothing here has run against a real campaign. Specifically: (i) generate
-      from the Media Library while a product run is in flight — the case that was broken; (ii)
-      double-click Generate and confirm you get the duplicate dialog, then "Generate anyway" and
-      confirm exactly ONE extra run appears; (iii) click "Generate anyway" twice fast and confirm the
-      second is refused.
-   2. **THE MANUAL IG SYNC ROUTE HAS NO DAILY DETECT CAP — and this file plus CLAUDE.md §2
-      briefly claimed it did.** Caught by an adversarial pass over the frontend work, verified in
-      source, corrected in the same branch. `dailyDetectRunCap` reaches `syncPosts` from
-      **`services/scheduledSyncService.js` only** (plus a separate read in
-      `instagramWebhookService`). `POST /instagram/sync-posts` passes `{limit, force,
-      credentialId}`, so `dailyCap`/`runsRemaining` stay null, `enqueueRun` is unconditionally
-      true, and `capSkipped` can never fire there. **The only bound on one call is `limit`
-      (25 default, 50 max); repeated clicks are bounded by nothing server-side.** Equally true of
-      the pre-existing "Sync Now" — the re-scan did not introduce it — but the re-scan is the
-      expensive one. The ordering guard in `ingestPost` is still real and still worth having: it
-      protects every caller that DOES supply a cap, and means the wiring is already correct if
-      this route ever gets one. `verifyIgRescanGuards` 5f now asserts the cap's ABSENCE, so
-      wiring one in fails the harness and forces the docs to be updated in the same commit.
-      **Owner decision: should a manual/forced re-scan carry a server-side daily ceiling?**
-   3. **Two KNOWN-OPEN items, deliberately not fixed — decide, don't discover:**
-      - **Readiness can report ready off the OLD Instagram account.** `adReadinessService` defines
-        social presence as *any* `Media` with `source ∈ ['instagram','apify-ig']` and never reads
-        `igUserId`, so after changing the IG account the gate stays green on the previous account's
-        posts. Left alone ON PURPOSE: making it go not-ready would BLOCK generation, which is the
-        opposite of the request above. Owner call.
-      - **Old account's posts stay in the media library** after a rebind. No disconnect cascade
-        exists; a forced re-scan pulls the new account but does not retire the old media.
-   4. `REAP_STALE_MIN` (15) still bounds the in-flight window, and a wedged `preparing` row is still
-      not reaped by the worker (it filters `running` only) — unchanged by this work, still a
-      documented double-bill edge.
+1. **Video cost reconciliation** (`atlasVideoService.js`) — owner "read settled
+   price" rule was **images-only**; every video ledger row stayed the formula
+   estimate forever (~33% over-report on developer 10s: $1.20 formula vs
+   **$0.90** settled — over-REPORTING, not overspending). Now:
+   `pollPrediction` → `{url,price}`; fire-and-forget
+   `reconcileVideoCostFromTerminal` (immediate when terminal carries price —
+   normal for video); `scheduleVideoCostReconcile` fallback (same backoff as
+   images); `parseAtlasSettledPrice` rejects non-positive. Estimate /
+   `MODEL_CAPS` deliberately unchanged. **NEW**
+   `scripts/verifyVideoCostReconcile.js`. A remaining `costSource:'estimated'`
+   video row means price never published, not "trust the formula."
 
-0a. **the `ai_brand_led` no-copy fix is OPEN AS PR #75, not merged, never rendered live.**
-   Branch `fix/brand-led-static-copy`, two commits. Full write-up in the two sections directly
-   above this one (*"`ai_brand_led` static ads had NO COPY"* and *"the STARVED SOURCE"*).
-   Offline-verified (1882 + 29 + 40 + 17 checks, 15 revert-proven mutations; 51/52 green in a
-   clean worktree, the one failure pre-existing at `main`). **Next action: review + merge #75,
-   deploy, then run ONE `meta_static` job** on a brand that has both a `summary` and a `tagline`,
-   on a product that already has a `CreativeDirectionArtifact` (proves the
-   `DIRECTOR_SIGNALS_VERSION` bump forced a re-derive), and read the copy off the delivered
-   images. Check **copy fidelity first** — kill switch `STATIC_BRAND_LED_COPY=false`, no deploy
-   needed. Note commit 1 of that PR is the pre-existing fidelity hardening, shipping on its own
-   419-check harness and **not** line-by-line reviewed as part of the PR.
+2. **Adversarial corrections to Phase B:**
+   - (a) Funnel presets 10s re-time **REVERTED** — they are generic
+     (`titleStylePreset` / `retitleDriver`), not PMax-scoped; re-timing dropped
+     `specTimeScale` 1.0→0.8 on every brand's 8s renders. Stay at **8s**.
+     PMax 10s pacing = separate presets + per-run selection.
+   - (b) `PLATFORM_NOTES` no longer puts the *product* inside the safe box
+     (contradicted `geometryBlock()` photograph exemption).
+   - (c) PMax Scene 1 aspect-aware (was hard-coded horizontal pan on 9:16).
+   - (d) `PMAX_PROOF_*` blank env no longer parses as 0.
+   - (e) `funnel_stage` registered in `ROUTING_NESTED_FIELDS` + **R0b** pins
+     load-bearing names stay registered.
+   - (f) 1.91:1 density (`maxTextElements:3`) drops supporting copy before CTA
+     on `brand_led` — documented, not changed.
 
-0. **NOTHING OUTSTANDING from the 2026-08-04 incident — it is shipped and verified.**
-   PRs #65, #66, #67, #68 all merged; prod is `919f979`; end-to-end run confirmed
-   `payloads=3` → `3 succeeded · 0 failed`. Two things to WATCH rather than do:
-   - **429 backoff** on the first full-size (15-20 ad) static run, now that
-     RENDER_CONCURRENCY is 24 and unmeasured above 8. Drop back if they appear.
-   - **`Model Moderation Error`** reaching `Ad.renderError.message` on the video path —
-     classifier and throw site are verified, the end-to-end surfacing is not (needs a real
-     safety-blocked render; do not manufacture one).
+### Measured costs (Phase B live Atlas submits — prompt-only, no DB/Ad rows)
 
-   One loose end: the **CLAUDE.md** doc edit for §§C-E is **uncommitted**, because that file
-   carries in-flight `feat/brand-font-coverage` work that must not be swept into these
-   commits. `docs/PIPELINES.md` and `services/atlasModelMap.js` were landed via
-   hunk-level staging (`git apply --cached` on a filtered patch) — reuse that technique.
+| item | settled price |
+|---|---|
+| static 1:1 @1024×1024 | **$0.071728** |
+| static 1.91:1 @2048×1152 | **$0.061440** |
+| static 4:5 @1088×1360 | **$0.066660** |
+| video 10s 16:9 @1080p Omni **developer** | **$0.90** |
 
-Then the pre-existing queue. The 2026-08-04 session rewrote this block because three
-of its four claims were wrong. Read §0 CORRECTIONS before anything else.
+- 3-size static fan-out ≈ **$0.199**/concept. Two masters = **$1.80**. Full
+  kit ≈ **$2.40** standalone / ≈ **$1.50** marginal beside Meta. Do not quote
+  $1.20 for developer. Delivered video: 1920×1080, 10.000s, 240 frames.
+- Live A/B (unbranded seed, n=1): static overlay ON strips burned CTA + keeps
+  copy safe; OFF shows SHOP NOW near top. Video: PMax profile stayed legible
+  mid-clip; canonical zoomed to unidentifiable lace close-up. Harness lesson:
+  fixtures must pass `rating` as the **string** from `formatDisplayRating()`,
+  not an object (`[object Object] ★`).
 
-1. **LAND `fix/remotion-font-fatal-load`** (branch exists, working tree, NOT committed —
-   commit was not authorised). It fixes the fatal video bug. 30/30 verify green including a
-   new `scripts/verifyFontServing.js`. Two adversarial passes were run — read their findings
-   in §0 before committing.
+### What is NOT done
 
-2. **THEN apply the post-render vision QC patch** — drafted, reviewed, NOT applied. It lives
-   at **`.drafts/ad-vision-qc/`** (gitignored; `ad-vision-qc.patch` + `APPLY.sh` +
-   `DESIGN-NOTES.md`). 1288 lines across 8 files, touches billable paths, so it needs its own
-   focused pass with two adversarial reviews. **One change required before applying: the draft
-   picks `google/gemini-2.5-flash`; use `google/gemini-2.5-pro` instead** — see §0.
+- **Per-run funnel preset SELECTION** — render path accepts `presetOverride`
+  (TIER 0) but no live caller supplies one; no Ad/run field carries funnel
+  stage; `buildMetaForAd` hardcodes `presetOverride: null` and **must** get
+  the same value as the render path or the social-proof quote gate desyncs.
+  Only brand-level `titleStylePreset` works today. **If/when building PMax 10s
+  pacing, ship separate preset files here — do not re-time the shared 8s ones.**
+- **No full end-to-end PMax kit through the app** — only prompt-only live
+  submits. No Ad rows, no wizard run, no delivery.
+- **No delivery path:** Google Ads upload does not exist (integration is
+  read/sync only); PMax video must be YouTube-hosted. v1 is an **export bundle**.
+- **Text assets deliberately OUT OF SCOPE** (owner): clients already run PMax
+  and their existing headlines/descriptions serve; we supply the visual layer.
+  Copy burned INTO the creative stays ours.
 
-3. **THEN the video canonical prompt.** This is now the biggest *creative* defect and it is
-   NOT a titling problem — titling works. See §0.
+### Next actions (in order)
+
+1. **First live app run** — ONE product, brand with populated `summary`,
+   `google_all`. Expect 3 statics + 2 masters + 1 derived 1:1. Budget ≈
+   **$2.40** (read settled `price` / reconciled CostLog, never catalog
+   `base_price` or the video formula). Verify: 1:1 never Omni (`veoModel`
+   starts `derive-from:`); both masters titled with **Yt** zones; statics show
+   PLATFORM CONTEXT notes + CTA only on conversion intent; video CostLog rows
+   flip to `costSource:'actual'` at ~$0.90; no Meta digest re-mint if a Meta
+   campaign regenerates on the same deploy.
+2. **Per-run funnel preset selection** — stamp funnel stage on Ad (or run),
+   pass the **same** `presetOverride` into render *and* `buildMetaForAd`. Pair
+   with **separate** 10s PMax presets if 10s pacing is required.
+3. Delivery / YouTube host / export-bundle productisation — only after (1)
+   looks right creatively.
+4. Do **not** "harmonise" shared DR "≥4.5 from ≥50" with PMax hierarchy
+   thresholds — that changes Meta. Do **not** re-time shared funnel presets.
+
+### Prior open work (still open — do not lose)
+
+The items below predate Phase B. Detail lives in the history sections of this
+file and in `CLAUDE.md`; this is the short index only.
+
+- **`/generate` request-fingerprint gate + IG re-scan** — pushed as
+  `feat/generate-gate-fingerprint-ig-rescan`, NOT merged/deployed/exercised.
+  Exercise live (media-library while a product run is in flight; double-click
+  confirm; double "Generate anyway"). Manual IG sync route has **no** daily
+  detect cap — owner decision still open. Read `CLAUDE.md` §2.
+- **`ai_brand_led` no-copy fix** — PR #75 / branch `fix/brand-led-static-copy`,
+  not merged, never rendered live. Kill switch `STATIC_BRAND_LED_COPY=false`.
+- **Remotion font fatal load** — branch `fix/remotion-font-fatal-load`, not
+  committed. 30/30 verify green. See history §0.
+- **Post-render vision QC** — drafted at `.drafts/ad-vision-qc/` (gitignored).
+  Use `google/gemini-2.5-pro`, not the draft's flash pick.
+- **Video canonical prompt tuning** (Meta path) — biggest remaining *creative*
+  defect; archetype-driven video still deferred. PMax profile is separate and
+  must not be back-ported into Meta without an explicit A/B.
+- **Manual IG re-scan daily ceiling** — open owner decision (`verifyIgRescanGuards`
+  5f asserts the cap's absence).
 
 **Do NOT start by merging PR #32.** That instruction was wrong; see §0.
 
