@@ -8,8 +8,9 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 **Read `session.md` for live state. Read `ARCHITECTURE_REVIEW.md` before touching
 security, money, or the render queue** — it carries verified P0s with `path:line`.
 
-Live prod (2026-08-03) = `13cf679` (both services). Offline verify suite = **42
-scripts, all green** (re-run 2026-08-03 with
+Live prod (2026-08-03) = `13cf679` (both services). Offline verify suite = **78
+scripts, all green** on branch `feat/pmax-surfaces-phase-a2` (was 77 after
+Phase B PMax, 76 after Phase A, 42 as of 2026-08-03; re-run with
 `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
 no aggregate runner and no `npm test`). Claims written against pre-deploy
 binaries are suspect.
@@ -24,20 +25,23 @@ one.** Owner, verbatim: *"We are no longer using ANY other generation pathways
 for video or static ads … we are not using any other generation pathways for
 catalog based product ads."*
 
-**VIDEO** — one billable generation (9:16 master); other Meta surfaces are
-free crop/retitle **intent** (Phase 3 queue fan-out not live — see step 3):
+**VIDEO (Meta)** — one billable generation (9:16 master); other Meta surfaces are
+free crop/retitle **intent** (Phase 3 queue fan-out not live — see step 3).
+**VIDEO (Google PMax, Phase A)** — **two** billable Omni masters (9:16 + 16:9)
+plus one free derive-only 1:1 crop of the 9:16 master — see §2 and
+`docs/PIPELINES.md` §6. Do not apply the Meta one-master rule to `google_video`.
 
 1. Resize the hero image to **9:16** with the **current** resizing system.
 2. **Omni** image-to-video → the 9:16 **master**. `google/gemini-omni-flash/
-   image-to-video-developer`. ONE billable submit per product on live presets
-   (`meta_video` / `meta_all` queue `videoFormats: [META_VIDEO_MASTER]` only —
-   `platformFormats.js:586-593`, `campaignAdsGenerationService.js:592-596`).
-   See §2 — everything named `veo*` is this Omni pipeline under a legacy name.
+   image-to-video-developer`. ONE billable submit per product on live **Meta**
+   presets (`meta_video` / `meta_all` queue `videoFormats: [META_VIDEO_MASTER]`
+   only). See §2 — everything named `veo*` is this Omni pipeline under a legacy
+   name.
 3. **Crop** for non-9:16 targets via `videoCropUrl` + `basePlateCropService`
    (face-anchored) at titling time — never a second Omni submit. **Phase 3
    multi-surface fan-out is not the queue path yet:** `META_VIDEO_FANOUT`
    (Reels retitle + feed 1:1 + 4:5) is documented as free derivation intent
-   (`platformFormats.js:406-422`); `resolvePreset('meta_video')` still returns
+   (`platformFormats.js`); `resolvePreset('meta_video')` still returns
    the master only. Do not reintroduce four video Ads = four submits.
 4. **Title each surface appropriately** — burned into the delivered file, using
    that surface's own safe zone. Reels (204) and Stories (250) differ and must
@@ -324,13 +328,25 @@ Video never launches a browser.
   fanout is therefore **~$0.11 per product on the developer model**, not ~$0.015.
   **Owner rule: always read the actual price back from Atlas after generation.** The
   authoritative figure is `price` on the **settled prediction**
-  (`GET /model/prediction/:id`), which `scheduleCostReconcile` reads to upgrade the
-  row and clear `costSource:'estimated'`. `buildPriceMap` yields a floor-grade
-  estimate whose only job is to stop a $0.00 row. Any budget, margin or per-ad cost
-  claim must come from **reconciled** rows. Note Atlas usually publishes `price`
-  *after* the image returns — measured **7 of 38** predictions had it at completion —
-  so the reconcile is the normal path, not a rare top-up; its retry budget was
-  widened the same day for exactly that reason.
+  (`GET /model/prediction/:id`). **Images:** `scheduleCostReconcile`
+  (`atlasImageService`) upgrades the row and clears `costSource:'estimated'`.
+  Atlas usually publishes `price` *after* the image returns — measured **7 of 38**
+  predictions had it at completion — so the scheduled re-poll is the normal path
+  for images; its retry budget was widened the same day for exactly that reason.
+  **Video (post-Phase-B):** the same rule is now implemented in
+  `atlasVideoService` — `reconcileVideoCostFromTerminal` (fire-and-forget after the
+  master lands) + `scheduleVideoCostReconcile` fallback. **Before this, every video
+  row stayed the `estimateRenderCostUsd` formula forever** (~33% over-report on the
+  developer model at 10s: formula $1.20 vs measured settled **$0.90** — over-
+  REPORTING, not overspending). Video **does** publish `price` at completion
+  (measured), so the immediate path is the normal one and the re-poll is the
+  exception. `MODEL_CAPS` / the estimate function are deliberately unchanged (pre-
+  settlement floor). Pinned by `scripts/verifyVideoCostReconcile.js`.
+  **Consequence:** a video row still on `costSource:'estimated'` means the price
+  was **never published**, not that the formula is authoritative. Do not quote
+  `base + per-second` as spend for the developer model. `buildPriceMap` yields a
+  floor-grade estimate whose only job is to stop a $0.00 row. Any budget, margin
+  or per-ad cost claim must come from **reconciled** rows.
 - **Ledger spend at the charge point, not the success point.** A billable submit that
   then fails still costs money. `atlasImageService.chargedError` records it and sets
   `err.charged`, which is the flag telling a caller that a direct-provider fallback
@@ -343,18 +359,73 @@ Video never launches a browser.
   `resolvePreset('meta_static')` / `META_STATIC_FANOUT` = three Meta sizes =
   three image submits (`platformFormats.js:405`, `:576-583`). Cannot crop one
   static plate cheaply — text is burned in-model (`:400-403`).
-- **Video: ONE Omni 9:16 master per product on the live presets — not one per
-  aspect.** `resolvePreset('meta_video'|'meta_all')` returns
-  `videoFormats: [META_VIDEO_MASTER]` only (`platformFormats.js:586-593`);
-  `expandDeterministicVideo` queues one Ad per product
-  (`campaignAdsGenerationService.js:592-596`). Non-9:16 *Ads* (if any) still
-  generate at Omni 9:16 then face-crop at titling (`basePlateCropService`);
+- **Video (Meta): ONE Omni 9:16 master per product on the live presets — not
+  one per aspect.** `resolvePreset('meta_video'|'meta_all')` returns
+  `videoFormats: [META_VIDEO_MASTER]` only (`platformFormats.js`);
+  `expandDeterministicVideo` queues one Ad per product. Non-9:16 *Ads* (if any)
+  still generate at Omni 9:16 then face-crop at titling (`basePlateCropService`);
   free multi-surface derivation from one master is **Phase 3 intent**, not a
-  second billable submit (`platformFormats.js:406-422`). **The older claim in
-  this file — that `identityDigest` made 1:1 + 4:5 + 9:16 = three separate
-  video submits — was true for non-preset multi-aspect video queues (measured
-  in prod 2026-08-01) and is a money bug if reintroduced; it is not the
-  `meta_video` path.**
+  second billable submit (`platformFormats.js` `META_VIDEO_FANOUT`). **The older
+  claim in this file — that `identityDigest` made 1:1 + 4:5 + 9:16 = three
+  separate video submits — was true for non-preset multi-aspect video queues
+  (measured in prod 2026-08-01) and is a money bug if reintroduced; it is not
+  the `meta_video` path.**
+- **Video (Google PMax, Phase A 2026-08-10): TWO billable Omni masters per
+  product — 9:16 + 16:9 — not one, and not three.**
+  `resolvePreset('google_video'|'google_all')` returns
+  `videoFormats: GOOGLE_VIDEO_MASTERS` only (`['pmax_video_9_16','pmax_video_16_9']`);
+  do **not** return the full `GOOGLE_VIDEO_FANOUT`. `pmax_video_1_1` is
+  **derive-only**: face-safe crop of the settled 9:16 master's already-paid
+  plate + its own Remotion titling — **never** an Omni submit. One extra Ad is
+  minted with `deriveFromMaster: 'pmax_video_9_16'`. Full write-up:
+  `docs/PIPELINES.md` §6 *Google Performance Max video*.
+- **`pmax_video_1_1` must never reach a billable submit.** Gate is
+  `resolveDeriveFromMaster(ad)` in `services/campaignAdsGenerationService.js` —
+  **one definition, imported** by `routes/ads.js` (render) and
+  `adRegenerateService.js` (regenerate preflight → 409). Fail-closed on
+  `platformFormat === 'pmax_video_1_1'` so a dropped `deriveFromMaster` field
+  cannot re-open spend. Master failed/absent → honest failure, never Omni
+  fallback. Wait in-render for the plate (`DERIVE_MASTER_WAIT_MS` /
+  `DERIVE_MASTER_POLL_MS`); do not requeue (stranded `queued` never auto-drains
+  and a second Generate short-circuits as "Nothing to render"). Pinned by
+  `scripts/verifyPmaxVideoExpansion.js` (54 checks).
+- **Duration on the video identity digest is Google-only.**
+  `computeDeterministicVideoDigest` keeps prefix `det-video:v1` and appends
+  `videoDurationSec` **only** for Google PMax video formats (zero history). An
+  earlier draft appended duration unconditionally and bumped `v1`→`v2` —
+  MEASURED that changed every pre-existing Meta video digest; because the
+  digest deliberately omits `generationRunId`, the `(campaignId, identityDigest)`
+  unique index is the only guard against a repeat Generate re-billing Omni, so
+  the next Generate on any existing campaign would have paid ~$1.00–1.20 per
+  product again. Pre-existing Meta digests stay byte-identical. **Meta 8s→10s
+  duration identity is a deliberate one-time re-mint that must be costed and
+  flagged, never folded in silently.**
+- **Static (Google): `google_static` = 3 billable image submits**
+  (`GOOGLE_STATIC_FANOUT` — landscape 1.91:1, square, portrait 4:5). Demand Gen
+  + Shorts keys stay `coming_soon` (identical `deliveryDims` to live PMax —
+  generating both would double-spend).
+- **MEASURED settled prices (Phase B 2026-08-10/11, prompt-only Atlas submits
+  — no DB/Ad rows). These supersede planning estimates:**
+  | item | settled `price` |
+  |---|---|
+  | static 1:1 @1024×1024 `gpt-image-2/edit` | **$0.071728** |
+  | static 1.91:1 @2048×1152 | **$0.061440** |
+  | static 4:5 @1088×1360 | **$0.066660** |
+  | video 10s 16:9 @1080p Omni **developer** | **$0.90** |
+  3-size PMax static fan-out ≈ **$0.199**/concept (was ~$0.22). Two masters =
+  **$1.80**. Full kit (3 concepts × 3 statics + 2 masters) ≈ **$2.40**
+  standalone / ≈ **$1.50** marginal beside a Meta run that already paid for
+  9:16. Earlier ≈**$2.6** planning figure is **wrong**.
+- **Omni developer 10s is $0.90, not $1.20.** The `MODEL_CAPS` formula
+  (`base 0.20 + 0.10/s` → $1.20 @ 10s) **overstates the developer variant by
+  ~33%**. Production default is
+  `google/gemini-omni-flash/image-to-video-developer`
+  (`BUILT_IN_DEFAULT_MODEL`). Do not quote $1.20 for it.
+- **Image `size` enum is the `1024x1024` form** (underscore style). A
+  `1024*1024` submit is rejected 400 "invalid size". `2048x1152` **is** an
+  enum member (Phase A `GEN_SIZES` needed no probe). Omni i2v
+  `aspect_ratio` enum exactly `['16:9','9:16']`; `duration` enum
+  `[4,6,8,10]`. Delivered 16:9: **1920×1080, 10.000s, 240 frames**.
 - **`POST /api/ads/runs` must claim atomically** — same money shape as
   `/generate`. Use `claimAdsForRun()` only: `status:'queued'` filter, ownership
   re-read (`campaignRunIds` + `rendering`), `modifiedCount` cross-check, and
@@ -476,6 +547,23 @@ Video never launches a browser.
 
 ### Known open (do not claim fixed)
 
+- ~~**PMax YouTube safe zones are DECLARED but NOT WIRED**~~ — **CLOSED Phase B
+  (2026-08-11).** Zones resolve per `platformFormat`
+  (`pmax_video_9_16`→`verticalYt`, `pmax_video_16_9`→`landscapeYt`,
+  `pmax_video_1_1`→`squareYt`) and are threaded to the composition.
+  `classifyFormat` still returns only the four **canvas** formats (see §4 trap)
+  — zone selection is a separate concern. **Funnel preset 10s re-time was
+  REVERTED** (shared generic presets; silently re-timed every brand's 8s
+  renders — see §4 trap). Presets remain at **8s** extent. **Still open:**
+  per-run funnel preset *selection* — `presetOverride` exists on the render
+  path but no live caller supplies one; `buildMetaForAd` hardcodes `null`.
+  PMax 10s pacing needs **separate** preset files selected with that path.
+  See `docs/PIPELINES.md` §6.
+- **No full end-to-end PMax kit has run through the app.** Offline suite
+  **78/78** plus prompt-only live Atlas submits (measured unit costs above).
+  First live app recipe: ONE product, brand with populated `summary`,
+  `google_all` → 3 statics + 2 video masters + 1 derived 1:1 ≈ **$2.40**
+  (3 concepts × statics + 2 masters; was planned ~$2.6). See `session.md`.
 - **~1-in-3 static ads** render a competitor-shaped brand mark on the product
   (e.g. tree emblem reading as Timberland on an Allbirds shoe). Prompts already
   ask for fidelity — fix is measure-and-reject, not prompt tuning. Video path
@@ -563,8 +651,12 @@ Video never launches a browser.
   shipped **flush to the delivered frame edge** on Stories and 4:5 — inspectable
   in any ad delivered before the fix. (B) `GEN_SIZES` was stale (three sizes;
   the live schema enum has 14), so 9:16 generated at `1024x1536` and lost 80px per
-  side. All live static surfaces now generate at their exact delivery aspect —
-  zero crop. Pinned by `scripts/verifyStaticSafeBox.js`.
+  side. All **Meta** live static surfaces generate at exact delivery aspect —
+  zero crop. **Phase A amendment (2026-08-10):** `GEN_SIZES` gained schema-enum
+  `2048x1152` — frozen `pmax_16_9` now zero-crops (was 1536x1024 / 15.6% crop);
+  live `pmax_landscape_1_91_1` crops ~6.9% from that plate (no exact 1.91:1 enum
+  twin). Live PMax statics use **10%** edge margin via `SURFACE_EDGE_MARGIN_PCT`;
+  Meta + frozen `pmax_16_9` stay 6%. Pinned by `scripts/verifyStaticSafeBox.js`.
   **DIAGNOSTIC, and it matters:** `meta_feed_1_1` was immune to *both* defects
   (zero crop, full 61px margin) and it is the **default** surface
   (`directImageRenderService.js:508,516`). So truncated copy on a **square** ad is
@@ -576,6 +668,7 @@ Video never launches a browser.
   carries an unpublished pixel/edge-limit caveat. `1088x1360` (4:5) is in use only
   because it was probed; the risk being guarded is silent coercion to the
   `1024x1024` default, which would square a 4:5 surface and then crop it.
+  `2048x1152` needed no probe — it is an enum member.
 - **`queued` ads never auto-drain** — still require an explicit `/runs` (or
   equivalent) claim.
 - ~~**`veoPredictionId` is a spend receipt that is never resumed**~~ — **CLOSED
@@ -663,6 +756,16 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `npm install --no-save https-proxy-agent@5.0.1`, then
   `git checkout -- node_modules/.package-lock.json` so the tracked file is not
   committed. Stage explicit paths, never `git add -A`.
+- **`resolveDeriveFromMaster` is defined ONCE and imported — never re-implemented
+  per caller.** Lives in `services/campaignAdsGenerationService.js`; both
+  `routes/ads.js` (render loop, before any Omni submit) and
+  `services/adRegenerateService.js` (preflight → 409) import it. A per-caller
+  copy is **exactly** how the regenerate hole opened in Phase A: regenerate
+  called `veoService.generateForAd` unconditionally on a PMax 1:1 and billed a
+  full Omni generation on the free surface. Fail-closed on
+  `platformFormat === 'pmax_video_1_1'` so a dropped `deriveFromMaster` field
+  cannot re-open spend. Pinned by `scripts/verifyPmaxVideoExpansion.js` (gate
+  defined once; zero billable submit calls inside `renderDeriveOnlyVideoAd`).
 - **`config/defaults.env` is committed** and `dotenv`-loaded at boot. It is the real
   source of non-secret defaults — `.env.example` is documentation only and several
   vars there are blank while `defaults.env` sets them. **Secrets stay in the
@@ -681,9 +784,41 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   (`aiCreativeDirectorService.js:149`). A code fix that feeds better brand /
   product signal **without** bumping the version leaves every product that
   already has a `CreativeDirectionArtifact` serving concepts built from the old
-  brief — the fix looks deployed and is a no-op. Current value `3.1.0` (`:73`)
-  was the starved-brief repair (`summary` / `logoUrl`); any future signal-shape
-  change needs the same bump.
+  brief — the fix looks deployed and is a no-op. Current value **`3.3.0`**
+  (Phase B PMax funnel + proof hierarchy). Prior bumps: `3.0.0→3.1.0`
+  starved-brief (`summary` / `logoUrl`); `3.1.0→3.2.0` social-proof menu.
+  Any future signal-shape change needs the same bump.
+- **PMax Director hierarchy PRECEDENCE SENTENCE — do not delete or "harmonise".**
+  The shared DR block still says "≥4.5 from ≥50" (Meta-tuned, deliberately
+  untouched). The PMax-only social-proof hierarchy block uses env-interpolated
+  thresholds (`PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100`)
+  and states explicitly that **it wins for this destination on any disagreement
+  including thresholds**. Deleting that sentence, or editing the shared DR text
+  to match, either re-opens dual-threshold confusion or **changes the Meta
+  prompt**. Measured: Meta round prompt is byte-identical. See
+  `docs/PIPELINES.md` §6 *Director: funnel spread*.
+- **`classifyFormat` must keep returning canvas formats only**
+  (`vertical|square|landscape|feed`). That string is also the **composition id**
+  and the **`titleStyleSpec` cascade key**. Returning a YouTube zone name from
+  it would break the render and silently change every spec lookup. Zone
+  selection is a separate platformFormat-aware path (Phase B wired).
+- **Do not re-time a SHARED funnel preset for PMax.** `canonical-awareness` /
+  `consideration` / `conversion` are generic (`brand.titleStylePreset` Tier 2 +
+  `retitleDriver --preset=`). Phase B re-authored them for 10s plates; because
+  `specTimeScale` only compresses, every existing **8s** render using those
+  presets dropped 1.0 → **0.8** with no crash and no failing test. **Reverted
+  to 8s extent.** PMax 10s pacing must be **separate preset files** selected
+  with per-run `presetOverride` (still open). See `docs/PIPELINES.md` §6.
+- **`ROUTING_NESTED_FIELDS` registration is the scanner's coverage list, not a
+  free-form enum.** `verifyConceptContract.js` only flags flat reads of
+  *registered* names. Phase B added `routing.funnel_stage` without registering
+  it → the new field silently lacked the guardrail that exists because reading
+  these flat once produced zero ads. Registered + **R0b** pins load-bearing
+  names (`media_picks`, `creative_style`, `output_shape`, `funnel_stage`) stay
+  on the list — removing a name previously failed nothing (shorter iterate).
+- **`PMAX_PROOF_*` blank env is 0, not NaN.** `Number('') === 0`. A cleared
+  Render dashboard value would inject "strong rating ≥ 0" into the Director
+  hierarchy and invert it. Parser falls back on blank/whitespace/negative.
 - **`brand.logo` IS CORRECT on a `layoutInput.brand` object and WRONG on a Mongoose
   Brand doc. Check which object you are holding before "fixing" either.** The two
   are different shapes with overlapping names, which is how the Director bug hid.
@@ -779,14 +914,17 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
 - **Docs have described commented-out code.** `TITLING.md` documented the disabled
   canvas cascade as live. When you find such a case, fix the doc in the same commit.
 - **Director concept contract (v3 nested under `routing`).** Schema v3 moved
-  strategy fields (`media_picks`, `creative_style`, `output_shape`, …) under
-  `concept.routing`. Reading `concept.media_picks` flat silently zeros ads while
-  the producer's dual-read validator logs `warnings=0`. **Every consumer must use
-  `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`.**
-  `scripts/verifyConceptContract.js` (125 checks) exhaustively scans `services/` +
-  `routes/` and fails if any file reads a `ROUTING_NESTED_FIELDS` name off a concept
-  without the helper. Zero-ads root cause fixed 2026-08-03 (live:
-  `concepts=3 payloads=3` where it was `payloads=0`).
+  strategy fields (`media_picks`, `creative_style`, `output_shape`,
+  `funnel_stage`, …) under `concept.routing`. Reading `concept.media_picks` flat
+  silently zeros ads while the producer's dual-read validator logs `warnings=0`.
+  **Every consumer must use `services/conceptProjection.js` —
+  `conceptField()` / `conceptMediaPicks()`.** `scripts/verifyConceptContract.js`
+  exhaustively scans `services/` + `routes/` and fails if any file reads a
+  `ROUTING_NESTED_FIELDS` name off a concept without the helper. Zero-ads root
+  cause fixed 2026-08-03 (live: `concepts=3 payloads=3` where it was
+  `payloads=0`). New fields must be **registered** in that list or the scanner
+  is blind to them (Phase B `funnel_stage` lesson; **R0b** pins the load-bearing
+  set).
 - **`mongoose.isValidObjectId` accepts any 12-byte string.**
   Verified: `mongoose.isValidObjectId('video-models') === true` (12 chars);
   `'formats'` is false (7). So `router.param('id'|'adId', …)` 404 guards
@@ -1041,9 +1179,10 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**42 scripts** as of 2026-08-03). Add a
-  harness for money/security-critical logic, and **revert-prove it** — back the
-  fix out and confirm the test fails. A test that cannot fail is not a test.
+  relevant `scripts/verify*.js` harness (**78 scripts** as of post-Phase-B
+  addendum — video cost reconcile + adversarial corrections). Add a harness for
+  money/security-critical logic, and **revert-prove it** — back the fix out and
+  confirm the test fails. A test that cannot fail is not a test.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
   change (bugs, bypasses, money holes) before committing. It caught two real regex
   bugs in the submit guard that review-by-reading missed.
