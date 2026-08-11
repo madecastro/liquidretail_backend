@@ -1005,9 +1005,41 @@ function storedStyleForUrl(entries, url) {
 }
 
 /**
+ * Bound a classifyShotStyle metrics object for persistence: numeric signals
+ * + small flags only — no Buffers, no nested objects, no unbounded blobs.
+ * Returns null when nothing usable remains.
+ */
+function leanShotMetrics(metrics) {
+  if (!metrics || typeof metrics !== 'object' || Array.isArray(metrics)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(metrics)) {
+    if (typeof k !== 'string' || !k) continue;
+    if (v == null) {
+      out[k] = null;
+      continue;
+    }
+    const t = typeof v;
+    if (t === 'number') {
+      if (Number.isFinite(v)) out[k] = v;
+      continue;
+    }
+    if (t === 'boolean') {
+      out[k] = v;
+      continue;
+    }
+    // Reject Buffer / typed arrays / nested objects / functions / strings.
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
  * Build Media.technicalInsights fields from a CatalogProduct-stored entry.
  * Used by materializeImage so Media consumers get the signal without a
  * re-fetch / re-sharp. Returns null when nothing to copy.
+ *
+ * shotStyleMetrics carries the numeric signals already computed at ingest
+ * (no second sharp pass) plus source/at provenance so ingest-derived and
+ * detect-derived rows stay distinguishable for calibrateShotHeuristic.
  */
 function technicalInsightsFromStored(entry) {
   if (!entry || !entry.style) return null;
@@ -1015,12 +1047,17 @@ function technicalInsightsFromStored(entry) {
     return null;
   }
   const at = entry.at ? new Date(entry.at) : new Date();
+  const signals = leanShotMetrics(entry.metrics);
   return {
     shotStyle: entry.style,
     shotStyleConfidence: typeof entry.confidence === 'number' ? entry.confidence : null,
-    // Lean marker — full metrics live on detect-time recompute only when
-    // needed. source:'ingest' lets calibration / debug tell arms apart.
-    shotStyleMetrics: { source: 'ingest', at: at.toISOString() },
+    // Numeric signals (when present) + provenance. source:'ingest' is load-
+    // bearing for calibration / debug arms; at is ISO for stable JSON.
+    shotStyleMetrics: {
+      ...(signals || {}),
+      source: 'ingest',
+      at: at.toISOString()
+    },
     updatedAt: at
   };
 }
@@ -1687,11 +1724,15 @@ function createSession(opts = {}) {
       const classified = guarded && guarded.result;
       if (!classified || !classified.style) return null;
 
+      // Persist the metrics classifyShotStyle already computed — do NOT
+      // recompute / second sharp pass. leanShotMetrics strips buffers.
+      const metrics = leanShotMetrics(classified.metrics);
       return {
         url,
         style: classified.style,
         confidence: classified.confidence,
-        at: new Date(now())
+        at: new Date(now()),
+        ...(metrics ? { metrics } : {})
       };
     }
 
@@ -1928,6 +1969,7 @@ module.exports = {
   shouldApplyStoredShot,
   mergeStyleEntries,
   collectProductImageUrls,
+  leanShotMetrics,
   // SSRF surface (exported for harness + reuse)
   isBlockedIp,
   assertUrlSafeForFetch,

@@ -21,15 +21,17 @@
  *
  *   node scripts/verifyIngestShotClassify.js
  *
- * Revert-prove (each independently — see table at end of run when using
- * VERIFY_REVERT_PROVE=1, or run the mutations manually):
+ * Revert-prove (each independently — harness runs several via loadMutatedIngest):
  *   (a) mergeStyleEntries / storedStyleForUrl becomes index-based → A* fails
  *   (b) idempotency skip removed → B* fails
+ *   (b1) seed-session-cache loop in classifyPendingProducts deleted → B5 fails
+ *        (B1 alone stays green — it only exercises classifyUrls+existingEntries)
  *   (c) concurrency left unbounded → C* fails
  *   (d) budget skip silent / not counted → D* fails
  *   (d1) budget starts at createSession again → D_REGRESSION (Blocker 1) fails
  *   (e) fetch failure throws out of classifyUrls → E* fails
  *   (f) technicalInsightsFromStored removed from materializeImage → F* fails
+ *   (f1) technicalInsightsFromStored drops numeric signals → F2b fails
  *   (g) resolveSeedStyle product form ignores LLM on media → G* fails
  *   (h) detect always recomputes → H* fails
  *   (i) post-DNS private-address check replaced with hostname string match
@@ -38,6 +40,7 @@
  *   (k) connection not pinned (hostname re-resolve) → S_PIN fails
  *   (l) abandonPending removed → L* fails (Blocker 2)
  *   (m) cpu guard removed → M* fails (Blocker 3)
+ *   (n) per-URL timer re-armed each redirect hop → J4 fails
  */
 
 const fs = require('fs');
@@ -234,6 +237,124 @@ async function main() {
     check('B4 new URL classified',
       ingest.storedStyleForUrl(r.entries, 'https://cdn.example/new.jpg')?.style === 'packshot');
     session.dispose();
+  }
+
+  // ── B5. BATCH entry point idempotency (classifyPendingProducts seed loop) ─
+  // Production re-sync uses classifyPendingProducts → classifyUrls(allUrls, [])
+  // and depends on the existingStyles → sessionUrlCache seed loop. B1 only
+  // exercises classifyUrls WITH existingEntries, so deleting the seed loop
+  // keeps B1 green while every re-sync re-downloads every image.
+  {
+    let fetchCalls = 0;
+    const mkSession = () => ingest.createSession({
+      lookup: publicLookupOk,
+      fetchBuffer: async () => {
+        fetchCalls++;
+        return { ok: true, buffer: whiteBuf, tooLarge: false };
+      },
+      classifyShotStyle: async () => ({
+        style: 'packshot',
+        confidence: 0.9,
+        metrics: { borderStdev: 2.1, packshotScore: 0.88 }
+      }),
+      concurrency: 2,
+      budgetMs: 60_000
+    });
+
+    const products = [
+      {
+        productId: 'p1',
+        imageUrl: 'https://cdn.example/resync-a.jpg',
+        additionalImages: ['https://cdn.example/resync-b.jpg'],
+        existingStyles: []
+      },
+      {
+        productId: 'p2',
+        imageUrl: 'https://cdn.example/resync-c.jpg',
+        additionalImages: [],
+        existingStyles: []
+      }
+    ];
+
+    // Pass 1 — cold: every URL must be fetched.
+    const s1 = mkSession();
+    s1.beginClassifyPhase();
+    const pass1 = await s1.classifyPendingProducts(products);
+    const pass1Fetches = fetchCalls;
+    check('B5a cold classifyPendingProducts fetches each unique URL',
+      pass1Fetches === 3 && pass1.results.length === 2,
+      `fetchCalls=${pass1Fetches}`);
+    // Collect what a real writer would persist (imageShotStyles).
+    const storedByProduct = pass1.results.map((r) => ({
+      productId: r.item.productId,
+      imageUrl: r.item.imageUrl,
+      additionalImages: r.item.additionalImages,
+      existingStyles: r.entries
+    }));
+    s1.dispose();
+
+    // Pass 2 — re-sync: NEW session, same products with stored styles.
+    // Seed loop must populate session cache so classifyUrls(allUrls, [])
+    // performs ZERO fetches.
+    fetchCalls = 0;
+    const s2 = mkSession();
+    s2.beginClassifyPhase();
+    const pass2 = await s2.classifyPendingProducts(storedByProduct);
+    const pass2Fetches = fetchCalls;
+    const pass2Totals = s2.getTotals();
+    check('B5b re-sync classifyPendingProducts performs ZERO fetches',
+      pass2Fetches === 0,
+      `fetchCalls=${pass2Fetches} totals=${JSON.stringify(pass2Totals)}`);
+    check('B5c re-sync preserves styles via session-cache seed (not existingEntries)',
+      pass2.results.every((r) =>
+        (r.entries || []).length >= 1 &&
+        r.entries.every((e) => e && e.style === 'packshot')
+      ),
+      JSON.stringify(pass2.results.map((r) => r.entries)));
+    s2.dispose();
+
+    // REVERT-PROVE: delete the seed loop → B5b must fail (re-downloads).
+    {
+      let tmpPath = null;
+      try {
+        const seedNeedle =
+          'for (const item of list) {\n' +
+          '      const existing = Array.isArray(item.existingStyles) ? item.existingStyles : [];\n' +
+          '      for (const e of existing) {\n' +
+          '        if (e && e.url && e.style && !sessionUrlCache.has(e.url)) {\n' +
+          '          sessionUrlCache.set(e.url, e);\n' +
+          '        }\n' +
+          '      }\n' +
+          '    }';
+        const { mod: mutated, tmp } = loadMutatedIngest((src) => {
+          assert.ok(src.includes(seedNeedle), 'seed loop needle missing');
+          return src.replace(seedNeedle, '/* REVERTED: seed loop removed */');
+        });
+        tmpPath = tmp;
+        let mFetch = 0;
+        const ms = mutated.createSession({
+          lookup: publicLookupOk,
+          fetchBuffer: async () => {
+            mFetch++;
+            return { ok: true, buffer: whiteBuf, tooLarge: false };
+          },
+          classifyShotStyle: async () => ({ style: 'packshot', confidence: 0.9, metrics: {} }),
+          concurrency: 2,
+          budgetMs: 60_000
+        });
+        ms.beginClassifyPhase();
+        await ms.classifyPendingProducts(storedByProduct);
+        ms.dispose();
+        check('B5d REVERT-PROVE: without seed loop, re-sync re-fetches (B5b would fail)',
+          mFetch > 0,
+          `mutatedFetchCalls=${mFetch} (expected >0 when seed loop deleted)`);
+      } catch (e) {
+        check('B5d REVERT-PROVE: without seed loop, re-sync re-fetches (B5b would fail)',
+          false, e.message);
+      } finally {
+        if (tmpPath) unloadTmp(tmpPath);
+      }
+    }
   }
 
   // ── C. Concurrency cap ───────────────────────────────────────────────────
@@ -579,13 +700,111 @@ async function main() {
 
   // ── F. materializeImage hand-forward — EXECUTE real function (stub Mongo) ─
   {
-    // Pure helper — real execution
+    // Pure helper — real execution (legacy entry without metrics still works)
     const entry = { url: 'https://cdn.example/h.jpg', style: 'lifestyle', confidence: 0.77, at: new Date('2026-08-01') };
     const ti = ingest.technicalInsightsFromStored(entry);
     check('F1 technicalInsightsFromStored maps style+confidence',
       ti && ti.shotStyle === 'lifestyle' && ti.shotStyleConfidence === 0.77);
-    check('F2 metrics.source is ingest (no full metrics blob)',
-      ti.shotStyleMetrics && ti.shotStyleMetrics.source === 'ingest');
+    check('F2 metrics.source is ingest + provenance at',
+      ti.shotStyleMetrics &&
+      ti.shotStyleMetrics.source === 'ingest' &&
+      typeof ti.shotStyleMetrics.at === 'string');
+
+    // F2b: when the CatalogProduct entry carries classifyShotStyle signals,
+    // they must land on Media.technicalInsights.shotStyleMetrics (calibration
+    // data). Provenance-only lean markers starve calibrateShotHeuristic.
+    {
+      const rich = {
+        url: 'https://cdn.example/h.jpg',
+        style: 'packshot',
+        confidence: 0.91,
+        at: new Date('2026-08-01T00:00:00.000Z'),
+        metrics: {
+          borderMean: 240.5,
+          borderStdev: 3.2,
+          packshotScore: 0.87,
+          entropyAvailable: true,
+          // Buffer must be stripped (bounded payload).
+          _buf: Buffer.from('nope')
+        }
+      };
+      const tiRich = ingest.technicalInsightsFromStored(rich);
+      check('F2b stored metrics contain numeric signals + source (not provenance-only)',
+        !!tiRich &&
+        tiRich.shotStyleMetrics &&
+        tiRich.shotStyleMetrics.source === 'ingest' &&
+        tiRich.shotStyleMetrics.borderStdev === 3.2 &&
+        tiRich.shotStyleMetrics.packshotScore === 0.87 &&
+        tiRich.shotStyleMetrics.borderMean === 240.5 &&
+        tiRich.shotStyleMetrics.entropyAvailable === true &&
+        tiRich.shotStyleMetrics._buf === undefined,
+        JSON.stringify(tiRich && tiRich.shotStyleMetrics));
+    }
+
+    // F2c: classifyOne (via session) persists metrics on the entry, and the
+    // hand-forward carries them — end-to-end success path, no second sharp.
+    {
+      let fetchCalls = 0;
+      const session = ingest.createSession({
+        lookup: publicLookupOk,
+        fetchBuffer: async () => {
+          fetchCalls++;
+          return { ok: true, buffer: whiteBuf, tooLarge: false };
+        },
+        // Real-shaped metrics (what classifyShotStyle returns).
+        classifyShotStyle: async () => ({
+          style: 'packshot',
+          confidence: 0.93,
+          metrics: {
+            borderMean: 250,
+            borderStdev: 1.5,
+            centreMean: 80,
+            centreStdev: 40,
+            centreBorderRatio: 26.6,
+            entropy: 4.2,
+            entropyAvailable: true,
+            borderUniform: 0.95,
+            entropyPack: 0.8,
+            ratioPack: 1,
+            packshotScore: 0.92,
+            brightBoostApplied: true,
+            workWidth: 64,
+            workHeight: 64,
+            borderPx: 3,
+            borderSampleCount: 100,
+            centreSampleCount: 200
+          }
+        }),
+        concurrency: 1,
+        budgetMs: 60_000
+      });
+      session.beginClassifyPhase();
+      const r = await session.classifyUrls(['https://cdn.example/metrics.jpg'], []);
+      const stored = ingest.storedStyleForUrl(r.entries, 'https://cdn.example/metrics.jpg');
+      check('F2c classifyUrls entry carries lean numeric metrics',
+        !!stored &&
+        stored.metrics &&
+        stored.metrics.packshotScore === 0.92 &&
+        stored.metrics.borderStdev === 1.5 &&
+        !Buffer.isBuffer(stored.metrics),
+        JSON.stringify(stored));
+      const tiFromEntry = ingest.technicalInsightsFromStored(stored);
+      check('F2d technicalInsightsFromStored preserves signals for Media',
+        !!tiFromEntry &&
+        tiFromEntry.shotStyleMetrics.packshotScore === 0.92 &&
+        tiFromEntry.shotStyleMetrics.source === 'ingest' &&
+        typeof tiFromEntry.shotStyleMetrics.at === 'string',
+        JSON.stringify(tiFromEntry && tiFromEntry.shotStyleMetrics));
+      session.dispose();
+    }
+
+    // Schema declares metrics on imageShotStyles (silent-drop trap).
+    {
+      const cpSrc = read('models/CatalogProduct.js');
+      const block = cpSrc.match(/imageShotStyles:\s*\[\{([\s\S]*?)\}\]/);
+      check('F2e CatalogProduct.imageShotStyles declares metrics field',
+        !!block && /metrics\s*:/.test(block[1]));
+    }
 
     const detectSrc = read('services/catalogProductDetectService.js');
     check('F3b materializeImage imports storedStyleForUrl + technicalInsightsFromStored',
@@ -921,106 +1140,437 @@ async function main() {
     }
   }
 
-  // ── I. Writers: post-loop classify architecture ──────────────────────────
-  // I3 is BEHAVIOURAL (not source-regex): hung classify must not truncate
-  // the upsert set. Writer source checks still pin the batch wiring.
+  // ── I. Writers: REAL exported functions (Mongo/network stubbed) ─────────
+  // Source-regex order checks shipped a writer ordering bug in round 3.
+  // Drive each real writer and assert: (a) every product is upserted BEFORE
+  // any classify fetch; (b) beginClassifyPhase fires only after the upsert
+  // loop. Session-level batch/cancel/cache checks stay below.
   {
-    const writers = {
-      generic: read('services/genericCatalogIngestService.js'),
-      shopify: read('services/shopifyPublicIngestService.js'),
-      meta: read('services/catalogSyncService.js'),
-      apify: read('services/apifyIngestService.js')
-    };
-    for (const [name, src] of Object.entries(writers)) {
-      check(`I1 ${name} requires ingestShotClassifyService`,
-        /ingestShotClassifyService/.test(src) || /ingestShotClassify/.test(src));
-      check(`I2 ${name} createSession + pendingClassify post-loop architecture`,
-        /createSession\s*\(/.test(src) &&
-        /pendingClassify/.test(src) &&
-        /classifyPendingProducts/.test(src));
-      // Push during upsert; classifyPendingProducts ONLY after the product
-      // loop (source order: last pendingClassify.push before classifyPendingProducts).
-      {
-        const lastPush = src.lastIndexOf('pendingClassify.push');
-        const batchCall = src.indexOf('classifyPendingProducts');
-        // Also: no await classifyProductImages / classifyPendingProducts
-        // between the product for-loop body and the push — the batch call
-        // must come after every push site.
-        check(`I3 ${name} classifyPendingProducts AFTER pendingClassify.push (ordering)`,
-          lastPush !== -1 && batchCall !== -1 && lastPush < batchCall,
-          `lastPush=${lastPush} batchCall=${batchCall}`);
-      }
-      check(`I3b ${name} cancel-aware classify (isCancelled wired)`,
-        /isCancelled\s*:/.test(src) && /classifyPendingProducts/.test(src));
-      check(`I4 ${name} try\/finally logSummary (unconditional summary)`,
-        /finally\s*\{[\s\S]*logSummary/.test(src) ||
-        /finally\s*\{[^}]*logSummary/.test(src.replace(/\n/g, ' ')));
-      check(`I5 ${name} $set imageShotStyles on classify pass`,
-        /imageShotStyles/.test(src));
-      check(`I5b ${name} calls beginClassifyPhase before post-loop classify`,
-        /beginClassifyPhase\s*\(/.test(src));
-      check(`I5c ${name} abandonPending on skipped classify phase`,
-        /abandonPending\s*\(/.test(src) && /hasClassifyPhaseStarted\s*\(/.test(src));
+    const CatalogProduct = require('../models/CatalogProduct');
+    const Category = require('../models/Category');
+    const Brand = require('../models/Brand');
+    const IntegrationCredential = require('../models/IntegrationCredential');
+    const cryptoSvc = require('../services/integrationCryptoService');
+    const axios = require('axios');
+    const genericResolver = require('../services/genericCatalogResolver');
+    const shopifyAccess = require('../services/shopifyAccessResolver');
+    const apifyPull = require('../services/apifyPullService');
+    const detectSvc = require('../services/catalogProductDetectService');
+    const catClassify = require('../services/categoryClassifier');
+    // Writers that destructure deps at module load (generic, apify) must be
+    // re-required AFTER the dep is patched, or they keep the original binding.
+    function reloadModule(relPath) {
+      const abs = require.resolve(relPath);
+      delete require.cache[abs];
+      return require(abs);
     }
 
-    // I3 BEHAVIOURAL: hung classify cannot truncate upserts. The original
-    // data-loss bug was await-classify inside the product loop — a hung
-    // CDN left later SKUs unsaved. Prove all upserts finish before classify.
-    {
-      const upserted = [];
-      const products = Array.from({ length: 5 }, (_, i) => ({
-        id: `sku-${i}`,
-        imageUrl: `https://cdn.example/p${i}.jpg`
-      }));
-      let classifyStartedAt = null;
-      let lastUpsertAt = null;
-      let t = 0;
+    const brandId = '00000000000000000000b0a1';
+    const advertiserId = '00000000000000000000a0a1';
 
-      // Writer contract under test:
-      const session = ingest.createSession({
-        lookup: publicLookupOk,
-        concurrency: 2,
-        budgetMs: 60_000,
-        fetchBuffer: async () => {
-          if (classifyStartedAt == null) classifyStartedAt = t;
-          // Hang long enough that in-loop classify would block upserts.
-          await new Promise((r) => setTimeout(r, 30));
-          return { ok: true, buffer: whiteBuf, tooLarge: false };
-        },
-        classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} }),
-        now: () => t
-      });
+    async function withWriterStubs(runFn) {
+      const upsertOrder = [];
+      const beginOrder = [];
+      const fetchOrder = [];
+      let upsertSeq = 0;
+      let eventSeq = 0;
 
-      // Upsert loop FIRST — never await classify here.
-      const pending = [];
-      for (const p of products) {
-        upserted.push(p.id);
-        lastUpsertAt = t;
-        t += 1;
-        pending.push({
-          productId: p.id,
-          imageUrl: p.imageUrl,
-          additionalImages: [],
-          existingStyles: []
+      const orig = {
+        createSession: ingest.createSession,
+        findOneAndUpdate: CatalogProduct.findOneAndUpdate,
+        updateOne: CatalogProduct.updateOne,
+        countDocuments: CatalogProduct.countDocuments,
+        find: CatalogProduct.find,
+        findOne: CatalogProduct.findOne,
+        catFindOrCreate: Category.findOrCreateCategoryTree,
+        brandFindById: Brand.findById,
+        brandFindOne: Brand.findOne,
+        resolveGeneric: genericResolver.resolveGenericCatalog,
+        resolveShopify: shopifyAccess.resolveShopifyAccess,
+        pullShopify: apifyPull.pullShopifyProducts,
+        credFind: IntegrationCredential.find,
+        decrypt: cryptoSvc.decrypt,
+        axiosGet: axios.get,
+        enqueueDetect: detectSvc.enqueueBrandProductDetects,
+        inferCoarse: catClassify.inferCoarseEnum,
+        resolveCoarse: catClassify.resolveCoarseCategoryRef
+      };
+
+      // Inject offline session: counting fetch + instrumented beginClassifyPhase.
+      ingest.createSession = (opts = {}) => {
+        const session = orig.createSession({
+          ...opts,
+          lookup: publicLookupOk,
+          fetchBuffer: async () => {
+            fetchOrder.push({ seq: ++eventSeq, upsertsSoFar: upsertOrder.length });
+            // Small delay so an in-loop await would reorder against upserts.
+            await new Promise((r) => setTimeout(r, 15));
+            return { ok: true, buffer: whiteBuf, tooLarge: false };
+          },
+          classifyShotStyle: async () => ({
+            style: 'packshot',
+            confidence: 0.9,
+            metrics: { packshotScore: 0.9, borderStdev: 2 }
+          }),
+          concurrency: 2,
+          budgetMs: 60_000,
+          timeoutMs: 2_000
         });
-      }
-      check('I3_BEHAV upsert loop finished all products before classify',
-        upserted.length === 5 && classifyStartedAt == null,
-        `upserted=${upserted.length} classifyStartedAt=${classifyStartedAt}`);
+        const realBegin = session.beginClassifyPhase.bind(session);
+        session.beginClassifyPhase = () => {
+          beginOrder.push({ seq: ++eventSeq, upsertsSoFar: upsertOrder.length });
+          return realBegin();
+        };
+        return session;
+      };
 
-      session.beginClassifyPhase();
-      await session.classifyPendingProducts(pending, {
-        onProduct: async () => { /* persist noop */ }
-      });
-      check('I3_BEHAV classify ran only after every upsert',
-        classifyStartedAt != null && lastUpsertAt != null && classifyStartedAt >= lastUpsertAt,
-        `classifyStartedAt=${classifyStartedAt} lastUpsertAt=${lastUpsertAt}`);
-      check('I3_BEHAV all 5 products still in upsert set after hung-ish classify',
-        upserted.join(',') === 'sku-0,sku-1,sku-2,sku-3,sku-4');
-      session.dispose();
+      CatalogProduct.findOneAndUpdate = async (filter, update) => {
+        const set = (update && update.$set) || {};
+        const externalId = set.externalId || (filter && filter.externalId) || `x-${++upsertSeq}`;
+        const doc = {
+          _id: `0000000000000000000u${String(++upsertSeq).padStart(3, '0')}`,
+          brandId: (filter && filter.brandId) || brandId,
+          externalId: String(externalId),
+          imageUrl: set.imageUrl || null,
+          additionalImages: Array.isArray(set.additionalImages) ? set.additionalImages : [],
+          imageShotStyles: [],
+          categoryRef: null,
+          ...set
+        };
+        upsertOrder.push({
+          seq: ++eventSeq,
+          externalId: String(externalId),
+          fetchesSoFar: fetchOrder.length,
+          beginsSoFar: beginOrder.length
+        });
+        // Meta writer uses rawResult:true and reads result.value / lastErrorObject.
+        return {
+          value: doc,
+          lastErrorObject: { updatedExisting: false },
+          // Also act as the doc for writers that expect the doc directly.
+          ...doc,
+          _id: doc._id
+        };
+      };
+      CatalogProduct.updateOne = async () => ({ acknowledged: true, modifiedCount: 1 });
+      CatalogProduct.countDocuments = async () => upsertOrder.length;
+      // Chainable query stubs (find/findOne used by post-sync stages).
+      const emptyQuery = () => {
+        const q = {
+          select: () => q,
+          sort: () => q,
+          lean: async () => null,
+          then: (resolve) => resolve(null)
+        };
+        return q;
+      };
+      CatalogProduct.find = () => {
+        const q = {
+          select: () => q,
+          sort: () => q,
+          lean: async () => [],
+          then: (resolve) => resolve([])
+        };
+        return q;
+      };
+      CatalogProduct.findOne = () => emptyQuery();
+      Category.findOrCreateCategoryTree = async () => '00000000000000000000c001';
+      // apify isBrandAborted → Brand.findById().select().lean() — must not hit Mongo.
+      const brandNotAborted = () => {
+        const q = {
+          select: () => q,
+          lean: async () => ({ apifyDemo: { aborted: false } }),
+          then: (resolve) => resolve({ apifyDemo: { aborted: false } })
+        };
+        return q;
+      };
+      Brand.findById = () => brandNotAborted();
+      Brand.findOne = () => brandNotAborted();
+      catClassify.inferCoarseEnum = () => null;
+      catClassify.resolveCoarseCategoryRef = async () => null;
+      detectSvc.enqueueBrandProductDetects = async () => ({ enqueued: 0 });
+
+      // Enrichment / category-inference are fire-and-forget via setImmediate.
+      // Stub them and DRAIN the queue before restoring real methods, or a
+      // later harness pays 10s Mongo buffering timeouts per pending tick.
+      let enrichMod = null;
+      let inferenceMod = null;
+      try {
+        enrichMod = require('../services/catalogProductEnrichmentService');
+      } catch (_) { /* optional */ }
+      try {
+        inferenceMod = require('../services/productCategoryInferenceService');
+      } catch (_) { /* optional */ }
+      const origEnrich = enrichMod && enrichMod.enqueueBrandProductEnrichment;
+      const origInferBatch = inferenceMod && inferenceMod.inferBatch;
+      if (enrichMod) {
+        enrichMod.enqueueBrandProductEnrichment = async () => ({ ok: true });
+      }
+      if (inferenceMod) {
+        inferenceMod.inferBatch = async () => ({ ok: 0, skipped: 0, failed: 0 });
+      }
+
+      try {
+        await runFn({
+          upsertOrder,
+          beginOrder,
+          fetchOrder,
+          brandId,
+          advertiserId,
+          orig,
+          reloadModule
+        });
+        // Drain setImmediate post-sync work while stubs still apply.
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+      } finally {
+        ingest.createSession = orig.createSession;
+        CatalogProduct.findOneAndUpdate = orig.findOneAndUpdate;
+        CatalogProduct.updateOne = orig.updateOne;
+        CatalogProduct.countDocuments = orig.countDocuments;
+        CatalogProduct.find = orig.find;
+        CatalogProduct.findOne = orig.findOne;
+        Category.findOrCreateCategoryTree = orig.catFindOrCreate;
+        Brand.findById = orig.brandFindById;
+        Brand.findOne = orig.brandFindOne;
+        genericResolver.resolveGenericCatalog = orig.resolveGeneric;
+        shopifyAccess.resolveShopifyAccess = orig.resolveShopify;
+        apifyPull.pullShopifyProducts = orig.pullShopify;
+        IntegrationCredential.find = orig.credFind;
+        cryptoSvc.decrypt = orig.decrypt;
+        axios.get = orig.axiosGet;
+        detectSvc.enqueueBrandProductDetects = orig.enqueueDetect;
+        catClassify.inferCoarseEnum = orig.inferCoarse;
+        catClassify.resolveCoarseCategoryRef = orig.resolveCoarse;
+        if (enrichMod && origEnrich) {
+          enrichMod.enqueueBrandProductEnrichment = origEnrich;
+        }
+        if (inferenceMod && origInferBatch) {
+          inferenceMod.inferBatch = origInferBatch;
+        }
+        // Drop reloaded writer modules so later tests don't keep stub bindings.
+        try {
+          delete require.cache[require.resolve('../services/genericCatalogIngestService')];
+        } catch (_) { /* ignore */ }
+        try {
+          delete require.cache[require.resolve('../services/apifyIngestService')];
+        } catch (_) { /* ignore */ }
+      }
     }
 
-    // Behavioral: budget clock + batch after pre-phase burn.
+    function assertWriterOrdering(name, { upsertOrder, beginOrder, fetchOrder }, expectedUpserts) {
+      check(`I1 ${name} real writer upserted all products`,
+        upsertOrder.length === expectedUpserts,
+        `upserts=${upsertOrder.length} expected=${expectedUpserts}`);
+      // (a) every upsert completed with zero classify fetches so far
+      const upsertsBeforeAnyFetch = upsertOrder.every((u) => u.fetchesSoFar === 0);
+      check(`I2 ${name} all upserts before any classify fetch`,
+        upsertsBeforeAnyFetch && (fetchOrder.length === 0 || fetchOrder[0].upsertsSoFar >= expectedUpserts),
+        JSON.stringify({
+          upsertFetches: upsertOrder.map((u) => u.fetchesSoFar),
+          firstFetchUpserts: fetchOrder[0] && fetchOrder[0].upsertsSoFar
+        }));
+      // (b) beginClassifyPhase after upsert loop
+      check(`I3 ${name} beginClassifyPhase after every upsert`,
+        beginOrder.length >= 1 &&
+        beginOrder.every((b) => b.upsertsSoFar >= expectedUpserts) &&
+        upsertOrder.every((u) => u.beginsSoFar === 0),
+        JSON.stringify({ beginOrder, upsertBegins: upsertOrder.map((u) => u.beginsSoFar) }));
+      // Classify did run (not skipped)
+      check(`I3b ${name} classify phase performed fetches`,
+        fetchOrder.length >= 1,
+        `fetchOrder=${fetchOrder.length}`);
+    }
+
+    // ── generic: syncBrandGenericCatalog ────────────────────────────────
+    // Dep is destructured at module load — patch then reload the writer.
+    await withWriterStubs(async (ctx) => {
+      genericResolver.resolveGenericCatalog = async () => ({
+        ok: true,
+        mode: 'sitemap-jsonld',
+        origin: 'https://store.example',
+        products: [
+          {
+            externalId: 'g1',
+            title: 'Generic One',
+            imageUrl: 'https://cdn.example/g1.jpg',
+            additionalImages: [],
+            productUrl: 'https://store.example/p/g1'
+          },
+          {
+            externalId: 'g2',
+            title: 'Generic Two',
+            imageUrl: 'https://cdn.example/g2.jpg',
+            additionalImages: ['https://cdn.example/g2b.jpg'],
+            productUrl: 'https://store.example/p/g2'
+          },
+          {
+            externalId: 'g3',
+            title: 'Generic Three',
+            imageUrl: 'https://cdn.example/g3.jpg',
+            additionalImages: [],
+            productUrl: 'https://store.example/p/g3'
+          }
+        ],
+        stats: {},
+        cancelled: false
+      });
+      const genericWriter = ctx.reloadModule('../services/genericCatalogIngestService');
+      const brand = {
+        _id: brandId,
+        advertiserId,
+        name: 'TestBrand',
+        websiteUrl: 'https://store.example',
+        apifyDemo: { shopifyUrl: 'https://store.example' }
+      };
+      await genericWriter.syncBrandGenericCatalog(brand, null, {
+        isBrandAborted: async () => false
+      });
+      assertWriterOrdering('generic', ctx, 3);
+    });
+
+    // ── shopify-direct: syncBrandShopifyDirect ──────────────────────────
+    // resolveShopifyAccess is required INSIDE the function → module patch works.
+    // Omit `handle` so the post-classify media stage skips real HTTP.
+    await withWriterStubs(async (ctx) => {
+      shopifyAccess.resolveShopifyAccess = async () => ({
+        ok: true,
+        mode: 'products.json',
+        origin: 'https://shop.example',
+        products: [
+          {
+            id: 101,
+            title: 'Shoe',
+            // no handle → media/video stage continues without network
+            body_html: '<p>hi</p>',
+            vendor: 'Brand',
+            product_type: 'Shoes',
+            variants: [{ price: '10.00', available: true, barcode: null, sku: 'S1' }],
+            images: [{ src: 'https://cdn.example/s1.jpg' }, { src: 'https://cdn.example/s1b.jpg' }]
+          },
+          {
+            id: 102,
+            title: 'Hat',
+            body_html: '',
+            vendor: 'Brand',
+            product_type: 'Hats',
+            variants: [{ price: '5.00', available: true, barcode: null, sku: 'H1' }],
+            images: [{ src: 'https://cdn.example/s2.jpg' }]
+          }
+        ]
+      });
+      const shopifyWriter = require('../services/shopifyPublicIngestService');
+      const brand = {
+        _id: brandId,
+        advertiserId,
+        name: 'ShopifyBrand',
+        apifyDemo: { shopifyUrl: 'https://shop.example' }
+      };
+      await shopifyWriter.syncBrandShopifyDirect(brand, null, {
+        isBrandAborted: async () => false
+      });
+      assertWriterOrdering('shopify', ctx, 2);
+    });
+
+    // ── apify-shopify: syncBrandShopify ─────────────────────────────────
+    // pullShopifyProducts is destructured at load — patch then reload.
+    await withWriterStubs(async (ctx) => {
+      apifyPull.pullShopifyProducts = async () => ([
+        {
+          externalId: 'ap1',
+          title: 'Apify One',
+          imageUrl: 'https://cdn.example/ap1.jpg',
+          additionalImageUrls: [],
+          price: 12,
+          currency: 'USD',
+          availability: 'in stock',
+          productUrl: 'https://shop.example/products/ap1'
+        },
+        {
+          externalId: 'ap2',
+          title: 'Apify Two',
+          imageUrl: 'https://cdn.example/ap2.jpg',
+          additionalImageUrls: ['https://cdn.example/ap2b.jpg'],
+          price: 20,
+          currency: 'USD',
+          availability: 'in stock',
+          productUrl: 'https://shop.example/products/ap2'
+        }
+      ]);
+      const apifyWriter = ctx.reloadModule('../services/apifyIngestService');
+      const brand = {
+        _id: brandId,
+        advertiserId,
+        name: 'ApifyBrand',
+        apifyDemo: { shopifyUrl: 'https://shop.example' }
+      };
+      await apifyWriter.syncBrandShopify(brand, null);
+      assertWriterOrdering('apify', ctx, 2);
+    });
+
+    // ── meta: syncCatalog (exported) → syncCatalogForCred ───────────────
+    await withWriterStubs(async (ctx) => {
+      IntegrationCredential.find = async () => ([
+        {
+          _id: '00000000000000000000c001',
+          brandId,
+          advertiserId,
+          type: 'instagram',
+          status: 'active',
+          catalogId: 'cat_1',
+          accessTokenEnc: 'enc',
+          igUsername: 'test',
+          lastUsedAt: null,
+          lastCatalogSyncAt: null,
+          save: async function save() { return this; }
+        }
+      ]);
+      cryptoSvc.decrypt = () => 'fake-token';
+      axios.get = async (url) => {
+        // Single page of Meta catalog products; no paging.next.
+        if (String(url).includes('/products') || String(url).includes('graph.facebook.com')) {
+          return {
+            data: {
+              data: [
+                {
+                  id: 'm1',
+                  name: 'Meta One',
+                  image_url: 'https://cdn.example/m1.jpg',
+                  additional_image_urls: [],
+                  price: '10.00 USD',
+                  availability: 'in stock',
+                  url: 'https://shop.example/m1'
+                },
+                {
+                  id: 'm2',
+                  name: 'Meta Two',
+                  image_url: 'https://cdn.example/m2.jpg',
+                  additional_image_urls: ['https://cdn.example/m2b.jpg'],
+                  price: '12.00 USD',
+                  availability: 'in stock',
+                  url: 'https://shop.example/m2'
+                }
+              ],
+              paging: {}
+            }
+          };
+        }
+        return { data: {} };
+      };
+      // Supply our own run handle so startRun (Mongo) is never called.
+      const run = {
+        stage: () => {},
+        tick: () => {},
+        checkpoint: async () => true,
+        succeed: async () => {},
+        fail: async () => {}
+      };
+      const metaWriter = require('../services/catalogSyncService');
+      await metaWriter.syncCatalog(brandId, { run, credentialId: '00000000000000000000c001' });
+      assertWriterOrdering('meta', ctx, 2);
+    });
+
+    // Keep session-level behavioural pins (not writer-specific).
     {
       let t = 0;
       const upserted = [];
@@ -1149,8 +1699,6 @@ async function main() {
       });
       session.beginClassifyPhase();
       await session.classifyPendingProducts(pending);
-      // First product fetches once; subsequent products hit sessionFailedUrls.
-      // With batch flattening, the URL appears once in allUrls → one fetch.
       check('I11 failed URL fetched at most once per session (not per product)',
         fetchCalls === 1,
         `fetchCalls=${fetchCalls}`);
@@ -1159,7 +1707,6 @@ async function main() {
 
     // I12: mid-phase cancel → remaining abandoned with reason.
     {
-      let calls = 0;
       const pending = Array.from({ length: 4 }, (_, i) => ({
         productId: `p${i}`,
         imageUrl: `https://cdn.example/c${i}.jpg`,
@@ -1171,16 +1718,14 @@ async function main() {
         concurrency: 1,
         budgetMs: 60_000,
         fetchBuffer: async () => {
-          calls++;
           return { ok: true, buffer: whiteBuf, tooLarge: false };
         },
         classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
       });
       session.beginClassifyPhase();
-      let cancelAfter = 1;
+      const cancelAfter = 1;
       const { cancelled } = await session.classifyPendingProducts(pending, {
         isCancelled: async () => {
-          // Cancel after first URL has been considered/claimed.
           return session.getTotals().classified + session.getTotals().failed +
             session.getTotals().fetchFailed + session.getTotals().cpuTimedOut >= cancelAfter ||
             session.getTotals().classified >= cancelAfter;
@@ -1215,11 +1760,163 @@ async function main() {
       !/require\(['"]\.\/httpScrapeClient['"]\)/.test(src));
     check('J3b notes httpScrapeClient SSRF gap as separate follow-up',
       /httpScrapeClient/.test(src) && /follow-up|separate/i.test(src));
-    check('J4 single per-URL AbortController (not per-hop timer)',
-      /ONE (AbortController|controller|deadline)/i.test(src) ||
-      /one controller for the whole URL/i.test(src));
     check('J5 connection pin via custom lookup / makePinnedLookup',
       /makePinnedLookup/.test(src) && /lookup:\s*pinnedLookup/.test(src));
+  }
+
+  // ── J4. BEHAVIOURAL: single per-URL deadline across redirect hops ───────
+  // Replaces the comment-prose regex. Each hop burns part of the timeout;
+  // total wall clock must be one timeoutMs, not hops × timeoutMs.
+  {
+    const { safeFetchBuffer } = ingest;
+    const TIMEOUT_MS = 200;
+    const HOP_MS = 80;
+    const HOPS_BEFORE_BODY = 3; // 3 redirects + final body = 4 sleeps if no abort
+
+    async function multiHopFetch(fetchImplFactory) {
+      let hop = 0;
+      const fetchImpl = fetchImplFactory(() => hop, (n) => { hop = n; });
+      const t0 = Date.now();
+      const r = await safeFetchBuffer('https://cdn.example/start.jpg', {
+        lookup: publicLookupOk,
+        fetchImpl,
+        timeoutMs: TIMEOUT_MS,
+        maxRedirects: 6
+      });
+      return { r, hop, elapsed: Date.now() - t0 };
+    }
+
+    function defaultHopImpl(getHop, setHop) {
+      return async (url, init) => {
+        const n = getHop() + 1;
+        setHop(n);
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(resolve, HOP_MS);
+          if (init && init.signal) {
+            if (init.signal.aborted) {
+              clearTimeout(t);
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+              return;
+            }
+            init.signal.addEventListener('abort', () => {
+              clearTimeout(t);
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+            }, { once: true });
+          }
+        });
+        // Keep redirecting — single deadline must abort before final 200.
+        return {
+          status: 302,
+          headers: {
+            get: (h) => (String(h).toLowerCase() === 'location'
+              ? `https://cdn.example/h${n}.jpg`
+              : null)
+          },
+          body: { cancel: async () => {} }
+        };
+      };
+    }
+
+    const live = await multiHopFetch(defaultHopImpl);
+    check('J4a multi-hop chain aborts under ONE timeoutMs (not hops×timeoutMs)',
+      live.r.ok === false && /timeout/i.test(live.r.error || ''),
+      JSON.stringify({ ok: live.r.ok, err: live.r.error, hop: live.hop, elapsed: live.elapsed }));
+    // With TIMEOUT=200 and HOP=80, hop×timeout would be ≥600ms+; single deadline ~200ms.
+    check('J4b elapsed tracks one deadline, not hops×deadline',
+      live.elapsed < TIMEOUT_MS * 2.5 && live.elapsed < HOPS_BEFORE_BODY * TIMEOUT_MS,
+      `elapsed=${live.elapsed} timeoutMs=${TIMEOUT_MS} hopsSeen=${live.hop}`);
+
+    // REVERT-PROVE: re-arm the timer per hop → chain can outlive one timeoutMs.
+    {
+      let tmpPath = null;
+      try {
+        const { mod: mutated, tmp } = loadMutatedIngest((src) => {
+          // Make the per-URL timer re-armable and reset it on every hop.
+          let m = src.replace(
+            'const ac = new AbortController();\n' +
+            '  const timer = setTimeout(() => {\n' +
+            '    try { ac.abort(); } catch { /* ignore */ }\n' +
+            '  }, timeoutMs);',
+            'const ac = new AbortController();\n' +
+            '  let timer = setTimeout(() => {\n' +
+            '    try { ac.abort(); } catch { /* ignore */ }\n' +
+            '  }, timeoutMs);\n' +
+            '  const __rearmDeadline = () => {\n' +
+            '    clearTimeout(timer);\n' +
+            '    timer = setTimeout(() => {\n' +
+            '      try { ac.abort(); } catch { /* ignore */ }\n' +
+            '    }, timeoutMs);\n' +
+            '  };'
+          );
+          assert.notStrictEqual(m, src, 'timer mutation must change source');
+          // Re-arm at the top of each hop iteration.
+          m = m.replace(
+            'for (let hop = 0; hop <= maxRedirects; hop++) {\n' +
+            '      // Resolve + validate ONCE per hop; reuse addresses for the pin.',
+            'for (let hop = 0; hop <= maxRedirects; hop++) {\n' +
+            '      if (hop > 0 && typeof __rearmDeadline === \'function\') __rearmDeadline();\n' +
+            '      // Resolve + validate ONCE per hop; reuse addresses for the pin.'
+          );
+          assert.ok(m.includes('__rearmDeadline'), 're-arm hook not injected');
+          return m;
+        });
+        tmpPath = tmp;
+
+        let hop = 0;
+        const t0 = Date.now();
+        const r = await mutated.safeFetchBuffer('https://cdn.example/start.jpg', {
+          lookup: publicLookupOk,
+          timeoutMs: TIMEOUT_MS,
+          maxRedirects: 6,
+          fetchImpl: async (url, init) => {
+            hop++;
+            await new Promise((resolve, reject) => {
+              const t = setTimeout(resolve, HOP_MS);
+              if (init && init.signal) {
+                if (init.signal.aborted) {
+                  clearTimeout(t);
+                  reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+                  return;
+                }
+                init.signal.addEventListener('abort', () => {
+                  clearTimeout(t);
+                  reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+                }, { once: true });
+              }
+            });
+            if (hop < 4) {
+              return {
+                status: 302,
+                headers: {
+                  get: (h) => (String(h).toLowerCase() === 'location'
+                    ? `https://cdn.example/rh${hop}.jpg`
+                    : null)
+                },
+                body: { cancel: async () => {} }
+              };
+            }
+            return {
+              status: 200,
+              headers: { get: () => null },
+              arrayBuffer: async () => whiteBuf.buffer.slice(
+                whiteBuf.byteOffset,
+                whiteBuf.byteOffset + whiteBuf.byteLength
+              )
+            };
+          }
+        });
+        const elapsed = Date.now() - t0;
+        // Per-hop re-arm lets 4×80ms complete under a 200ms "deadline".
+        check('J4c REVERT-PROVE: re-arming timer per hop lets chain exceed one timeoutMs',
+          r.ok === true && elapsed > TIMEOUT_MS,
+          JSON.stringify({ ok: r.ok, err: r.error, hop, elapsed, TIMEOUT_MS }));
+      } catch (e) {
+        check('J4c REVERT-PROVE: re-arming timer per hop lets chain exceed one timeoutMs',
+          false, e.message);
+      } finally {
+        if (tmpPath) unloadTmp(tmpPath);
+      }
+    }
   }
 
   // ── K. BLOCKER 1 regression: hung DNS must not stall past deadline ───────

@@ -117,6 +117,10 @@ const catalogProductSchema = new mongoose.Schema({
     style:      { type: String, enum: ['packshot', 'lifestyle', 'ambiguous'], required: true },
     confidence: Number,
     at:         { type: Date, default: Date.now },
+    // Numeric signals from classifyShotStyle (borderStdev, packshotScore, …).
+    // MUST be declared — nested subdocs are strict; an undeclared path is
+    // silently dropped and calibrateShotHeuristic never sees ingest metrics.
+    metrics:    mongoose.Schema.Types.Mixed,
     _id: false
   }],
 
