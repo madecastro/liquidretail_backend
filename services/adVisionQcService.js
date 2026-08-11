@@ -12,7 +12,12 @@
 //   - Second failure → fail the ad (never a third generation). MONEY INVARIANT.
 //   - Discarded (already-paid) renders keep their URL on the persisted verdict.
 //
-// Feature flag: AD_VISION_QC_ENABLED (default false — see defaults.env).
+// Feature flag resolution (most specific first):
+//   1. SystemConfig.adVisionQcEnabled when a real boolean (DB, live-flippable)
+//   2. process.env.AD_VISION_QC_ENABLED === 'true' after toLowerCase (env)
+//   3. default false
+// Default stays OFF. DB override is the no-redeploy lever — env alone would
+// force a Render restart. See resolveEnabled() / isEnabled() below.
 // Model role: 'ad-vision-qc' in atlasModelMap (routing MUST be probed live).
 
 'use strict';
@@ -60,8 +65,78 @@ const PASS_FLOOR = 7;
 // gemini-3.5-pro in the catalog.
 const QC_MODEL_ROLE = 'ad-vision-qc';
 
-function isEnabled() {
+// Log-once guard for a SystemConfig read failure. A config lookup must
+// never be able to break a render; we fall back to env/default and warn.
+let _systemConfigReadFailedLogged = false;
+
+/**
+ * Env-only gate. Matches the historical isEnabled() contract:
+ *   String(env || '').toLowerCase() === 'true'
+ * so "TRUE" enables, "false" / "TRUE " / "1" do not.
+ */
+function envEnabled() {
   return String(process.env.AD_VISION_QC_ENABLED || '').toLowerCase() === 'true';
+}
+
+/**
+ * Async resolver — preferred for any path that can await.
+ *
+ * Precedence (most specific first):
+ *   1. SystemConfig.adVisionQcEnabled when typeof === 'boolean'
+ *   2. env AD_VISION_QC_ENABLED (via envEnabled)
+ *   3. default false
+ *
+ * Fail-safe: a throwing Mongo/config read falls through to env/default and
+ * NEVER rejects. deps.getAdVisionQcEnabled is injectable for the harness.
+ */
+async function resolveEnabled(deps = {}) {
+  try {
+    const getCfg = deps.getAdVisionQcEnabled
+      || require('./systemConfigService').getAdVisionQcEnabled;
+    const dbVal = await getCfg();
+    if (typeof dbVal === 'boolean') return dbVal;
+  } catch (err) {
+    if (!_systemConfigReadFailedLogged) {
+      _systemConfigReadFailedLogged = true;
+      const msg = (err && err.message) ? err.message : String(err || 'unknown');
+      console.warn(
+        `   ⚠️  adVisionQc: SystemConfig read failed — falling back to env/default: ${msg}`
+      );
+    }
+  }
+  return envEnabled();
+}
+
+/**
+ * Synchronous gate kept for existing callers
+ * (directImageRenderService, imageRecoveryService, harnesses).
+ *
+ * Reads the systemConfigService TTL cache when a fresh boolean is available
+ * (so a live DB flip is visible without a restart, within ~TTL seconds).
+ * On cache miss/expiry, kicks a fire-and-forget refresh and answers from
+ * env. Never throws.
+ */
+function isEnabled() {
+  try {
+    const cfg = require('./systemConfigService');
+    if (typeof cfg.refreshAdVisionQcEnabledCache === 'function') {
+      cfg.refreshAdVisionQcEnabledCache();
+    }
+    if (typeof cfg.peekAdVisionQcEnabled === 'function') {
+      const peeked = cfg.peekAdVisionQcEnabled();
+      // Only a real boolean overrides env. null = "not set" → env.
+      // undefined = cache miss → env.
+      if (typeof peeked === 'boolean') return peeked;
+    }
+  } catch (_) {
+    // never break a render over a config module hiccup
+  }
+  return envEnabled();
+}
+
+/** Test hook: allow the harness to re-arm the one-shot failure log. */
+function _resetSystemConfigFailLogForTests() {
+  _systemConfigReadFailedLogged = false;
 }
 
 function resolveQcModel() {
@@ -461,6 +536,102 @@ function buildAppPreviewUrl({ campaignRunId = null, campaignId = null, brandId =
 }
 
 /**
+ * Verbose per-decision log + fire-and-forget Slack echo on FAIL only.
+ *
+ * Owner asked for reporting that is "verbose and echoed to Slack." Verbose
+ * lives in the console logs (every verdict, full per-category breakdown) —
+ * free and unbounded. Slack is reserved for ACTIONABLE volume:
+ *   - FAIL → per-ad warn via notifyAsync (rare; keep per-ad key so individual
+ *     failures are not collapsed by alertService's 15-min dedupe)
+ *   - PASS → NO individual Slack message. The live pass path already posts
+ *     detail to the run feed (noteQcPassToRunFeed) which is built for that
+ *     volume. Echoing every pass at warn would re-flood ALERT_RATE_LIMIT_MAX
+ *     and starve other warn alerts — the exact scale reason the pre-existing
+ *     code moved accepts off alertService.
+ *
+ * MONEY PATH: never await the Slack call; never let it throw into render.
+ * Uses notifyAsync (not notify) for exactly that reason — a paid image
+ * generation has already been billed by the time we are here.
+ *
+ * Run-level aggregate Slack summary (one message per generation run) is the
+ * right place for pass counts — but this module has no clean run-completion
+ * hook. That belongs at runFeed.finishRun / routes/ads.js when the
+ * CampaignRun settles. Do not invent a hook from here.
+ */
+function reportQcVerdict({
+  adId = null,
+  attempt = null,
+  verdict = null,
+  willRegenerate = false,
+  terminal = false
+} = {}) {
+  const pass = !!verdict?.pass;
+  const cats = verdict?.categories || {};
+  const scoreParts = CATEGORIES.map((k) => {
+    const c = cats[k];
+    return `${k}=${c ? c.score : '?'}${c && !c.pass ? '!' : ''}`;
+  });
+  const failing = CATEGORIES
+    .filter((k) => cats[k] && !cats[k].pass)
+    .map((k) => {
+      const c = cats[k];
+      const why = (c.findings && c.findings.length) ? c.findings.join('; ') : 'low score';
+      return `${k}(${c.score}): ${why}`;
+    });
+
+  const regenNote = willRegenerate
+    ? ' → regenerating once'
+    : (terminal && !pass ? ' → terminal fail (no further regen)' : '');
+
+  // VERBOSE on every verdict (pass AND fail) — this is where "verbose"
+  // genuinely lives. Console is free; Slack is not.
+  console.log(
+    `   🔍 adVisionQc: ad=${adId || '-'} attempt=${attempt ?? '?'} ` +
+    `${pass ? 'PASS' : 'FAIL'} floor=${PASS_FLOOR} ` +
+    `[${scoreParts.join(' ')}]${regenNote}` +
+    (verdict?.summary ? ` summary=${verdict.summary}` : '')
+  );
+  if (failing.length) {
+    console.log(`   🔍 adVisionQc: failing → ${failing.join(' | ')}`);
+  }
+
+  // Slack per-ad on FAIL only. Passes stay off alertService (run feed only).
+  if (pass) return;
+
+  try {
+    const alerts = require('./alertService');
+    // notifyAsync — DO NOT await. Paid path; Slack latency/failure must not
+    // block or fail the render.
+    alerts.notifyAsync({
+      // warn (not info): default ALERT_MIN_LEVEL is warn, so info never
+      // delivers. warn (not fatal/error here): creative defect is verbose
+      // telemetry, not a crash — terminal fail still escalates via
+      // alertQcFailure (error) on the caller path.
+      level: 'warn',
+      title: willRegenerate
+        ? 'Vision QC fail — regenerating once'
+        : 'Vision QC fail',
+      // Per-ad key so individual failures are not deduped away across ads.
+      key: `ad-vision-qc:verdict:${adId || 'unknown'}`,
+      fields: {
+        ad: String(adId || '-'),
+        attempt: String(attempt ?? '-'),
+        pass: 'no',
+        regenerate: willRegenerate ? 'yes' : 'no',
+        terminal: terminal ? 'yes' : 'no',
+        scores: scoreParts.join(' ').slice(0, 200),
+        failing: (failing.join(' | ') || '-').slice(0, 200)
+      },
+      detail: failing.length
+        ? failing.join('\n').slice(0, 1500)
+        : (verdict?.summary || 'fail')
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  adVisionQc: verdict Slack echo failed: ${err && err.message}`);
+  }
+}
+
+/**
  * MONEY-CRITICAL control flow.
  *
  * generate({ attempt, correctiveNote }) → {
@@ -476,9 +647,13 @@ function buildAppPreviewUrl({ campaignRunId = null, campaignId = null, brandId =
  *
  * HARD BOUND: regenerations never exceed MAX_QC_REGENERATIONS (1).
  * A second QC failure does NOT call generate a third time.
+ *
+ * `enabled`:
+ *   - boolean → used as-is (callers that already resolved the flag)
+ *   - undefined → await resolveEnabled() (SystemConfig → env → false)
  */
 async function runPostRenderQc({
-  enabled = isEnabled(),
+  enabled,
   originalProductUrl,
   brandName,
   safeBox,
@@ -499,6 +674,12 @@ async function runPostRenderQc({
     throw new Error('adVisionQc.runPostRenderQc: generate() required');
   }
 
+  // Resolve the gate once per run. Explicit boolean wins; otherwise the
+  // async SystemConfig → env → false cascade. Never throws.
+  const qcEnabled = (typeof enabled === 'boolean')
+    ? enabled
+    : await resolveEnabled();
+
   // ── MONEY: clamp any attempt to raise the retry bound ────────────
   const maxRegen = Math.min(
     MAX_QC_REGENERATIONS,
@@ -510,7 +691,10 @@ async function runPostRenderQc({
   // check `.passed` would otherwise treat an uninspected plate as clean.
   // Live production short-circuits earlier (isEnabled check in the render
   // service) so this shape is for harnesses and any future direct caller.
-  if (!enabled) {
+  if (!qcEnabled) {
+    console.log(
+      `   🔍 adVisionQc: ad=${adId || '-'} gate=OFF — skip vision, one generation, zero regen`
+    );
     const output = await generate({ attempt: 1, correctiveNote: null });
     return {
       ok: true,
@@ -647,6 +831,13 @@ async function runPostRenderQc({
       for (let i = 0; i < attempts.length - 1; i++) {
         attempts[i].discarded = true;
       }
+      reportQcVerdict({
+        adId,
+        attempt,
+        verdict,
+        willRegenerate: false,
+        terminal: true
+      });
       return {
         ok: true,
         skipped: false,
@@ -665,12 +856,26 @@ async function runPostRenderQc({
     // Failed this attempt.
     if (attempt >= maxAttempts) {
       // Second failure (or first if maxRegen=0): STOP. No further generate().
+      reportQcVerdict({
+        adId,
+        attempt,
+        verdict,
+        willRegenerate: false,
+        terminal: true
+      });
       break;
     }
 
     // Prepare the single allowed regeneration.
     correctiveNote = buildCorrectiveNote(verdict);
     attempts[attempts.length - 1].discarded = true;
+    reportQcVerdict({
+      adId,
+      attempt,
+      verdict,
+      willRegenerate: true,
+      terminal: false
+    });
     console.warn(
       `   ⚠️  adVisionQc: attempt ${attempt} FAILED — ` +
       `regenerating once (${regenerationCount + 1}/${maxRegen}). ` +
@@ -992,6 +1197,8 @@ module.exports = {
   QC_MODEL_ROLE,
   // Flag / model
   isEnabled,
+  envEnabled,
+  resolveEnabled,
   resolveQcModel,
   // Pure helpers
   buildVisionUserContent,
@@ -1004,6 +1211,7 @@ module.exports = {
   resolveFrontendOrigin,
   buildAppPreviewUrl,
   qcFailureTitle,
+  reportQcVerdict,
   // I/O
   judgeRender,
   runPostRenderQc,
@@ -1012,5 +1220,7 @@ module.exports = {
   alertQcSkipped,
   noteQcPassToRunFeed,
   noteQcFailToRunFeed,
-  buildQcSlackDetail
+  buildQcSlackDetail,
+  // Test hooks
+  _resetSystemConfigFailLogForTests
 };

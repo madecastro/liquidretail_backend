@@ -38,6 +38,9 @@ const { cleanScrapedText, decodeHtmlEntities, tidyText } = require('../utils/htm
 // extraction for every ingest path; this service keeps its own polite
 // fetch loop and hands the HTML over.
 const reviewsEngine = require('./productReviewsScrapeService');
+// Zero-dep shared alt-image cap. Safe at top level — no cycle with the
+// resolver (that cycle only existed when the constant lived there).
+const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 
 // ── constants ──────────────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -322,7 +325,13 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         ? 'in stock'
         : 'out of stock';
       const imageUrl = images[0]?.src || null;
-      const additionalImages = images.slice(1, 9).map(i => i.src).filter(Boolean);
+      // index 0 is the hero (imageUrl); slice starts at 1 so the hero is
+      // never also stored as an alt. Cap = MAX_ADDITIONAL_IMAGES alts
+      // (end exclusive → 1 + N). Shared const from catalogImageLimits.
+      const additionalImages = images
+        .slice(1, 1 + MAX_ADDITIONAL_IMAGES)
+        .map(i => i.src)
+        .filter(Boolean);
       const productUrl = `${origin}/products/${p.handle}`;
       const description = stripHtml(p.body_html, 2000);
 
