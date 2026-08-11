@@ -72,6 +72,11 @@ const { hydrateMatch }       = require('./productMatchHydration');
 const { computeSlotBudgets } = require('./slotBudget');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
 const { extractSnippet, PROOF_LINE_MAX_CHARS } = require('./quoteSnippetService');
+// Video-headline SELECTION for fallbackDerivation — reuses an EXISTING
+// CreativeDirectionArtifact round (never calls the Director LLM) and picks
+// the best-fitting copy string instead of a templated headline. See
+// services/videoHeadlineService.js for the full design rationale.
+const { resolveVideoHeadline } = require('./videoHeadlineService');
 
 // Atlas gateway (Gemini served OpenAI-compatible; Google's OpenAI-compat
 // endpoint as the direct fallback inside the transport).
@@ -838,7 +843,7 @@ function productReviewsOf(match) {
 //  Derivation LLM
 // ──────────────────────────────────────────────────────────────
 async function runDerivation(ctx, template, aspectRatio, options) {
-  if (!atlasConfigured() && !process.env.GEMINI_API_KEY) return fallbackDerivation(ctx);
+  if (!atlasConfigured() && !process.env.GEMINI_API_KEY) return fallbackDerivation(ctx, aspectRatio, options);
 
   const prompt = buildDerivationPrompt(ctx, template, aspectRatio, options);
 
@@ -860,12 +865,12 @@ async function runDerivation(ctx, template, aspectRatio, options) {
     const text = res.choices?.[0]?.message?.content;
     if (!text) {
       console.warn(`   ⚠️  layout-derivation: empty response (finishReason=${res.choices?.[0]?.finish_reason})`);
-      return fallbackDerivation(ctx);
+      return fallbackDerivation(ctx, aspectRatio, options);
     }
     return JSON.parse(text);
   } catch (err) {
     console.warn(`   ⚠️  layout-derivation failed: ${err.response?.data?.error?.message || err.message}`);
-    return fallbackDerivation(ctx);
+    return fallbackDerivation(ctx, aspectRatio, options);
   }
 }
 
@@ -1938,14 +1943,45 @@ function defaultBadgesFromSignal(details) {
   return out;
 }
 
-function fallbackDerivation(ctx) {
+// headline is NEVER a template. It used to be a "Meet <productName>" /
+// "See why customers love it" literal — banned by
+// owner directive: "I don't want any templated video headlines, they
+// should all be on brand and sound natural" + "Let's let the director make
+// the call, it knows what the goal is and what the intent is and it has a
+// lot to choose from." headline now comes from resolveVideoHeadline
+// (services/videoHeadlineService.js): a SELECTION among copy an EXISTING
+// CreativeDirectionArtifact round already wrote for this (brand, product,
+// campaignKind), picked for fit against this video's per-format character
+// budget. It is read-only — it never calls the Director LLM, so a
+// video-only run with no prior round costs nothing extra here — and it
+// resolves to null when no round exists or nothing fits, on any lookup
+// failure, and on any unexpected error (resolveVideoHeadline never
+// throws).
+//
+// A null copy.headline here is NOT the end of the line: assembleInput's
+// `stripEmpty` drops the empty key from input.copy, and
+// metaCascadeConfig's `headline` cascade (services/metaCascadeConfig.js
+// ~44-48) falls through ad.copy.headline -> input.copy.headline ->
+// Brand.tagline before the slot has nothing left to bind — Brand.tagline
+// is a real, on-brand string, not a template. Only when that is ALSO
+// unset does the headline slot resolve to no content, which
+// remotion/lib/slotContent.js + remotion/compositions/Canonical.jsx render
+// as an omitted slot (see this lane's report for the confirmed-safe
+// null-path trace through Canonical.jsx).
+async function fallbackDerivation(ctx, aspectRatio, options = {}) {
   const ident = ctx.match?.identification || {};
+  const headline = await resolveVideoHeadline({
+    brandId:      ctx.media?.brandId || null,
+    productId:    options?.productId    || null,
+    campaignKind: options?.campaignKind || null,
+    aspectRatio
+  });
   return {
     quotes: [],
     short_benefits: [],
     badges: [],
     copy: {
-      headline:       ident.productName ? `Meet ${ident.productName}` : 'See why customers love it',
+      headline,
       subheadline:    '',
       eyebrow:        ident.brand || '',
       highlight_text: ''

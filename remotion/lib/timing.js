@@ -10,9 +10,12 @@ const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
  * Compute the animation state of a slot at `frame`.
  * timing: { enterAtSec, exitAtSec|null, enterDurationSec, exitDurationSec }
  * transition: { type, direction, spring }
- * timeScale compresses spec-authored times onto shorter real plates
- * (specs are authored for a nominal 8s clip; a 6s Cloudinary segment gets
- * timeScale 0.75 so the choreography — including the CTA — still lands).
+ * timeScale rescales spec-authored times onto the real plate length, in
+ * either direction (see specTimeScale below for why it must be symmetric):
+ * specs are authored for a nominal 8s clip; a 6s Cloudinary segment gets
+ * timeScale 0.75 so the choreography — including the CTA — still lands,
+ * and a 10s segment gets timeScale 1.25 so authored beats keep landing on
+ * the camera cuts instead of freezing at the 8s-grid seconds.
  * Entrances are additionally clamped inside the clip so no slot can be
  * scheduled past the last frame; durations stay absolute so motion feel
  * doesn't change with plate length.
@@ -109,12 +112,34 @@ export function slotProgress({ frame, fps, timing, durationInFrames, timeScale =
 }
 
 /**
- * Compression factor mapping spec-authored seconds onto the real clip.
- * Only compresses (short plate); longer plates keep the authored pacing
- * and hold-to-end slots simply hold longer.
+ * Scale factor mapping spec-authored seconds onto the real clip length.
+ *
+ * Symmetric by design: stretches on longer plates as well as compressing on
+ * shorter ones. Presets are authored on a nominal grid (e.g. 8s) with text
+ * cuts placed deliberately ON the Omni camera-beat marks — the camera prompt
+ * (services/veoPromptBuilder.js) places its own cuts at dur/3 and 0.64*dur,
+ * which SCALE WITH THE ACTUAL CLIP LENGTH. If text timing only ever
+ * compressed, a longer plate (e.g. an 8s-authored preset rendered at 10s)
+ * would leave text cuts frozen at the 8s marks while the camera cuts moved
+ * out to dur/3 and 0.64*dur — the cut points would no longer line up and the
+ * choreography would visibly desync from the shot. Scaling proportionally in
+ * both directions keeps every authored beat at the same extent-relative
+ * position (cutSec/extent) of the plate at any length — so a preset authored
+ * to land its cuts near dur/3 and 0.64*dur at its nominal extent (see
+ * remotion/presets/canonical.json, whose 2.7s/5.1s cuts approximate dur/3
+ * and 0.64*dur for its 8s extent) keeps tracking veoPromptBuilder's camera
+ * beats at ANY clip length, not just the authored one.
+ *
+ * Guarded against degenerate inputs: extent<=0, no phases, or fps<=0 all
+ * fall back to scale 1 rather than producing NaN/Infinity. An exact match
+ * (clipSec === extent) always returns precisely 1 so already-aligned configs
+ * (current Meta 8s-on-8s-preset, current PMax 10s-on-10s-preset) stay
+ * byte-identical.
  */
 export function specTimeScale(spec, durationInFrames, fps) {
-  const extent = Math.max(1, ...(spec?.phases || []).map((p) => p.endSec || 0));
+  const extent = Math.max(0, ...(spec?.phases || []).map((p) => p.endSec || 0));
+  if (!(extent > 0) || !(fps > 0)) return 1;
   const clipSec = durationInFrames / fps;
-  return clipSec < extent ? clipSec / extent : 1;
+  if (clipSec === extent) return 1;
+  return clipSec / extent;
 }
