@@ -1402,11 +1402,22 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
       catch (err) { console.warn(`   ⚠️  focus derivation failed: ${err.message}`); }
     }
 
-    // 1b. Packshot/lifestyle heuristic — same buffer, zero-cost sharp only.
+    // 1b. Packshot/lifestyle heuristic — zero-cost sharp only.
     //     Independent of classification.shotType (LLM). Best-effort: a null
     //     or throw never fails the DetectRun (mirrors computeFocus).
+    //
+    //     Skip recompute when materializeImage already copied an ingest-time
+    //     style onto technicalInsights (CatalogProduct.imageShotStyles →
+    //     Media). Detect remains the fallback for anything ingest missed.
     let shotStyle = null;
-    if (sourceBuffer && isShotHeuristicEnabled()) {
+    const carried = media?.technicalInsights?.shotStyle;
+    if (carried === 'packshot' || carried === 'lifestyle' || carried === 'ambiguous') {
+      shotStyle = {
+        style: carried,
+        confidence: media.technicalInsights.shotStyleConfidence ?? null,
+        metrics: media.technicalInsights.shotStyleMetrics ?? null
+      };
+    } else if (sourceBuffer && isShotHeuristicEnabled()) {
       try { shotStyle = await classifyShotStyle(sourceBuffer); }
       catch (err) { console.warn(`   ⚠️  shot-style heuristic failed: ${err.message}`); }
     }
@@ -1569,4 +1580,9 @@ async function updateMediaLatestArtifacts(media, ids) {
   await Media.updateOne({ _id: media._id }, { $set: { latestArtifacts } });
 }
 
-module.exports = { processDetectRun };
+module.exports = {
+  processDetectRun,
+  // Exported for offline harnesses (verifyIngestShotClassify H3/H4) that
+  // must exercise the carried-style branch for real — not re-implement it.
+  applyMediaLibraryDerivations
+};

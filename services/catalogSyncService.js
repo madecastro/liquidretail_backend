@@ -23,6 +23,11 @@ const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 // Meta catalog sync has nothing to do with web scraping and must not
 // pull the scraper stack just to read an integer. See catalogImageLimits.
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+// Free packshot/lifestyle classify at ingest. URL-keyed on CatalogProduct;
+// fetch path is the local safeFetchBuffer in ingestShotClassifyService
+// (image CDNs, not the Meta Graph) — deliberately NOT httpScrapeClient
+// (that client follows redirects with no hop validation / SSRF pin).
+const ingestShotClassify = require('./ingestShotClassifyService');
 
 // Hard cap so a runaway catalog doesn't spin forever inside an HTTP
 // request. Brands with > 500 SKUs need V2 background sync; typical
@@ -169,6 +174,13 @@ async function syncCatalogForCred(cred, run = null) {
   let url = `${META_GRAPH_ROOT}/${cred.catalogId}/products`;
   let params = { fields: FIELDS, limit: PAGE_SIZE, access_token: token };
   let added = 0, updated = 0, errors = 0, fetched = 0;
+  // ARCHITECTURE: upsert NEVER awaits image classify. Collect work during
+  // the page loop; run a post-loop pass so hung DNS cannot truncate the
+  // catalog. try/finally guarantees logSummary on every exit (incl. fatal
+  // Graph errors that return early).
+  const shotSession = ingestShotClassify.createSession();
+  const pendingClassify = [];
+  try {
 
   while (url && fetched < MAX_ITEMS) {
     // Cooperative cancel boundary: between pages (and every 25 items
@@ -184,6 +196,7 @@ async function syncCatalogForCred(cred, run = null) {
       // Auth / catalog-not-found is fatal; transient is recoverable.
       const code = err.response?.data?.error?.code;
       if (code === 190 || code === 200 || code === 100) {
+        // finally still runs logSummary — no silent truncation.
         return { ok: false, reason: `Meta error: ${detail}`, added, updated, errors, fetched };
       }
       errors++;
@@ -231,6 +244,7 @@ async function syncCatalogForCred(cred, run = null) {
       };
 
       try {
+        // Upsert only — no await on classify (image network work).
         const result = await CatalogProduct.findOneAndUpdate(
           { brandId: cred.brandId, externalId },
           { $set: update, $setOnInsert: { firstSeenAt: new Date() } },
@@ -269,6 +283,15 @@ async function syncCatalogForCred(cred, run = null) {
             console.warn(`   ⚠️  coarse-category stamp failed for ${externalId}: ${err.message}`);
           }
         }
+        // Defer classify to post-loop pass — never block remaining upserts.
+        if (row && ingestShotClassify.isEnabled()) {
+          pendingClassify.push({
+            productId: row._id,
+            imageUrl: row.imageUrl,
+            additionalImages: row.additionalImages,
+            existingStyles: row.imageShotStyles
+          });
+        }
       } catch (err) {
         console.warn(`   ⚠️  upsert failed for ${externalId}: ${err.message}`);
         errors++;
@@ -288,6 +311,27 @@ async function syncCatalogForCred(cred, run = null) {
       params = null;
     } else {
       url = null;
+    }
+  }
+
+  // Post-loop classify pass — every product row is already persisted.
+  if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    for (const item of pendingClassify) {
+      try {
+        const { entries, changed } = await shotSession.classifyProductImages({
+          imageUrl: item.imageUrl,
+          additionalImages: item.additionalImages,
+          existingStyles: item.existingStyles
+        });
+        if (changed) {
+          await CatalogProduct.updateOne(
+            { _id: item.productId },
+            { $set: { imageShotStyles: entries } }
+          );
+        }
+      } catch (shotErr) {
+        console.warn(`   ⚠️  shot-classify failed for ${item.productId}: ${shotErr.message}`);
+      }
     }
   }
 
@@ -369,6 +413,12 @@ async function syncCatalogForCred(cred, run = null) {
     cappedAt: fetched >= MAX_ITEMS ? MAX_ITEMS : null,
     durationMs: Date.now() - t0
   };
+  } finally {
+    // Unconditional summary — fatal Graph early-return, cancel throw, and
+    // success all report budget truncation (never silent partial classify).
+    try { shotSession.logSummary('📦 shot-classify'); } catch (_) { /* ignore */ }
+    try { shotSession.dispose(); } catch (_) { /* ignore */ }
+  }
 }
 
 // Quick stats endpoint for the brand page header.

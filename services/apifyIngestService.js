@@ -20,6 +20,8 @@ const { uploadUrlToCloudinary } = require('./cloudinaryService');
 // a top-level require (module has no deps) so this path never hard-codes
 // a lower truncating ceiling than detect's MAX_ALT_IMAGES.
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+// Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
+const ingestShotClassify = require('./ingestShotClassifyService');
 
 const APIFY_TRIGGER = 'apify-sync';
 
@@ -307,7 +309,10 @@ async function syncBrandShopify(brand, run = null) {
   const products = await pullShopifyProducts(shopifyUrl);
 
   const summary = { ok: true, fetched: products.length, added: 0, updated: 0, errors: 0, aborted: false };
-
+  // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
+  const shotSession = ingestShotClassify.createSession();
+  const pendingClassify = [];
+  try {
   for (const p of products) {
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
@@ -315,6 +320,7 @@ async function syncBrandShopify(brand, run = null) {
       break;
     }
     try {
+      // Upsert only — no await on classify (image network work).
       const result = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId: p.externalId },
         {
@@ -348,9 +354,40 @@ async function syncBrandShopify(brand, run = null) {
       );
       if (result?.lastErrorObject?.updatedExisting) summary.updated++;
       else                                           summary.added++;
+      // Defer classify to post-loop pass — never block remaining upserts.
+      const row = result?.value || result;
+      if (row && ingestShotClassify.isEnabled()) {
+        pendingClassify.push({
+          productId: row._id,
+          imageUrl: row.imageUrl,
+          additionalImages: row.additionalImages,
+          existingStyles: row.imageShotStyles
+        });
+      }
     } catch (err) {
       console.warn(`   ⚠️  Apify Shopify upsert failed for ${p.externalId}: ${err.message}`);
       summary.errors++;
+    }
+  }
+
+  // Post-loop classify pass — products already persisted.
+  if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    for (const item of pendingClassify) {
+      try {
+        const { entries, changed } = await shotSession.classifyProductImages({
+          imageUrl: item.imageUrl,
+          additionalImages: item.additionalImages,
+          existingStyles: item.existingStyles
+        });
+        if (changed) {
+          await CatalogProduct.updateOne(
+            { _id: item.productId },
+            { $set: { imageShotStyles: entries } }
+          );
+        }
+      } catch (shotErr) {
+        console.warn(`   ⚠️  Apify shot-classify failed for ${item.productId}: ${shotErr.message}`);
+      }
     }
   }
 
@@ -386,6 +423,11 @@ async function syncBrandShopify(brand, run = null) {
   summary.durationMs = Date.now() - t0;
   console.log(`🛍  Apify Shopify sync done: brand=${brand._id} fetched=${summary.fetched} added=${summary.added} updated=${summary.updated} errors=${summary.errors} in ${summary.durationMs}ms`);
   return summary;
+  } finally {
+    // Unconditional summary — abort, throw, and success all report.
+    try { shotSession.logSummary('🛍 apify shot-classify'); } catch (_) { /* ignore */ }
+    try { shotSession.dispose(); } catch (_) { /* ignore */ }
+  }
 }
 
 // ── Apify comment ingest ─────────────────────────────────────────────
