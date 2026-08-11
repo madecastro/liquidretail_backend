@@ -16,7 +16,7 @@
 
 const axios = require('axios');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_OAUTH_ROOT  = `https://www.facebook.com/${META_API_VERSION}/dialog/oauth`;
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 

@@ -37,7 +37,7 @@ const { resolveMetaAdsCred } = require('./metaAdsPushService');
 const { chatCompletion } = require('./atlasLlmService');
 const { recordFlatCost } = require('./costTracker');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT = `https://graph.facebook.com/${META_API_VERSION}`;
 const APIFY_API_ROOT = 'https://api.apify.com/v2';
 

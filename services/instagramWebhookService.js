@@ -21,7 +21,7 @@ const Media = require('../models/Media');
 const { decrypt } = require('./integrationCryptoService');
 const { ingestPost, capRemaining } = require('./postSyncService');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 const POST_FIELDS = [
   'id', 'media_type', 'media_url', 'thumbnail_url', 'permalink',
