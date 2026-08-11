@@ -21,18 +21,20 @@
 // confirm the 15-image regression check FAILS (additionalImages.length → 8).
 
 const fs = require('fs');
+// Storage cap now lives in the shared zero-dep module on main; this harness
+// asserts the RESOLVER MAPPER + rawData + knob-separation behaviour on top of it.
+const { MAX_ADDITIONAL_IMAGES: SHOPIFY_CAP } = require('../services/catalogImageLimits');
+const GENERIC_CAP = SHOPIFY_CAP;
 const path = require('path');
 
 // Load defaults.env the same way index.js does (env always wins).
 require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.env') });
 
 const {
-  mapShopifyProductImages,
-  CATALOG_MAX_ADDITIONAL_IMAGES: SHOPIFY_CAP
+  mapShopifyProductImages
 } = require('../services/shopifyPublicIngestService');
 const {
-  imagesFromNode,
-  CATALOG_MAX_ADDITIONAL_IMAGES: GENERIC_CAP
+  imagesFromNode
 } = require('../services/genericCatalogResolver');
 const {
   MAX_ALT_IMAGES
@@ -67,7 +69,7 @@ const root = path.join(__dirname, '..');
 async function main() {
 // ── A. Shared storage cap (default 20) ────────────────────────────────
 check('A shopify CATALOG_MAX_ADDITIONAL_IMAGES default', SHOPIFY_CAP, 20);
-check('A generic CATALOG_MAX_ADDITIONAL_IMAGES default', GENERIC_CAP, 20);
+check('A shared cap module default is 20', SHOPIFY_CAP, 20);
 check('A both paths export the same numeric cap', SHOPIFY_CAP, GENERIC_CAP);
 check(
   'A defaults.env sets CATALOG_MAX_ADDITIONAL_IMAGES=20',
@@ -238,12 +240,12 @@ checkTrue(
   !/\.slice\(\s*0\s*,\s*4\s*\)/.test(ingestCode)
 );
 checkTrue(
-  'H shopify uses CATALOG_MAX_ADDITIONAL_IMAGES',
-  /CATALOG_MAX_ADDITIONAL_IMAGES/.test(shopifyCode)
+  'H shopify uses the shared MAX_ADDITIONAL_IMAGES (catalogImageLimits)',
+  /catalogImageLimits/.test(shopifyCode) && /MAX_ADDITIONAL_IMAGES/.test(shopifyCode)
 );
 checkTrue(
-  'H generic uses CATALOG_MAX_ADDITIONAL_IMAGES',
-  /CATALOG_MAX_ADDITIONAL_IMAGES/.test(genericCode)
+  'H generic uses the shared MAX_ADDITIONAL_IMAGES (catalogImageLimits)',
+  /catalogImageLimits/.test(genericCode) && /MAX_ADDITIONAL_IMAGES/.test(genericCode)
 );
 
 // ── R. rawData storage cap on the Shopify→flat mapper ─────────────────

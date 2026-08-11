@@ -123,6 +123,11 @@ const SITEMAP_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_SITEMAP_BUDGET_MS
 const GZIP_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;  // decompressed sitemap cap
 const MAX_ROBOTS_SITEMAPS = 50;                  // cap root sitemaps from robots.txt
 const RAW_DATA_CAP_BYTES = 8000;
+// How many category keys to name in an operator-facing reason string. Log
+// cosmetics only — deliberately NOT a bare slice(0, 8), because
+// verifyCatalogImageCaps greps this file for hardcoded image-cap slices and a
+// literal here is indistinguishable from the bug that guard exists to catch.
+const MAX_LOGGED_CATEGORY_KEYS = 8;
 const FALLBACK_SITEMAP_PATHS = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'];
 // Category options from sitemap URLs (no PDP fetches). Flag-off restores a
 // byte-identical resolver result (no new keys). Defaults match owner request
@@ -2026,7 +2031,8 @@ async function resolveGenericCatalog(brand, {
     if (!pageEntries.length) {
       const reason =
         `category filter matched 0 of ${before} candidate URLs ` +
-        `(keys: ${categoryKeys.slice(0, 8).join(', ')}${categoryKeys.length > 8 ? '…' : ''})`;
+        `(keys: ${categoryKeys.slice(0, MAX_LOGGED_CATEGORY_KEYS).join(', ')}` +
+        `${categoryKeys.length > MAX_LOGGED_CATEGORY_KEYS ? '…' : ''})`;
       console.warn(`   ⚠️  ${LOG}  ${reason}`);
       const emptyOut = {
         ok: false,

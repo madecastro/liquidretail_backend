@@ -26,8 +26,9 @@ const {
 const {
   mapShopifyNormalizedToFlat,
   mapShopifyProductImages,
-  CATALOG_MAX_ADDITIONAL_IMAGES
 } = require('../services/shopifyPublicIngestService');
+// Storage cap is owned by the shared zero-dep module on main.
+const { MAX_ADDITIONAL_IMAGES: CATALOG_MAX_ADDITIONAL_IMAGES } = require('../services/catalogImageLimits');
 
 let pass = 0;
 let fail = 0;
