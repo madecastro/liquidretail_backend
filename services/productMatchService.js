@@ -959,9 +959,23 @@ async function enrichOneMatchInPlace(match, ctx) {
       // purposes.
       if (match.catalogProductId && match.categoryId) {
         const breadcrumb = match.brandCategory?.breadcrumb || null;
+        // Owner rule 2026-08-11 (FEED_TRUTH_CATEGORIES): the feed's
+        // categoryRef, if catalogSyncService stamped one, is
+        // authoritative. This GPT-4.1 upgrade path used to overwrite
+        // unconditionally; now it only stamps categoryRef when the
+        // row lacks one. The brand-nav breadcrumb is still written to
+        // CatalogProduct.category (a display string, not the filter
+        // key) so CTA URLs + downstream copy still get the fine leaf.
+        // Flag OFF restores the pre-change unconditional overwrite.
+        const { isFeedTruthCategoriesEnabled } = require('./categoryClassifier');
+        const existing = await CatalogProduct.findById(match.catalogProductId).select('categoryRef').lean();
+        const shouldOverwriteRef = !isFeedTruthCategoriesEnabled() || !existing?.categoryRef;
         await CatalogProduct.updateOne(
           { _id: match.catalogProductId },
-          { $set: { categoryRef: match.categoryId, ...(breadcrumb ? { category: breadcrumb } : {}) } }
+          { $set: {
+              ...(shouldOverwriteRef ? { categoryRef: match.categoryId } : {}),
+              ...(breadcrumb ? { category: breadcrumb } : {})
+          } }
         );
         await Category.updateOne(
           { _id: match.categoryId },

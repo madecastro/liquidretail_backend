@@ -140,6 +140,49 @@ async function resolveCoarseCategoryRef({ brandId, advertiserId = null, enumCate
   return await findOrCreateCategoryTree({ brandId, advertiserId, breadcrumb });
 }
 
+// FEED_TRUTH_CATEGORIES kill switch. DEFAULT ON. When on, catalogSync-
+// Service uses resolveFeedCategoryRef below as its primary categoryRef
+// source and downstream inferred paths (JSON-LD scrape, GPT-4.1 brand-
+// nav) only fill in when categoryRef is still null. OFF restores the
+// pre-change behaviour: coarse enum at sync + inferred overwrite at
+// match time. Same fail-open shape as the other UGC-ads switches.
+function isFeedTruthCategoriesEnabled() {
+  const raw = process.env.FEED_TRUTH_CATEGORIES;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+// Resolve the brand's Category leaf directly from the merchant feed's
+// category string, WITHOUT going through the 9-bucket coarse enum. This
+// is the "feed truth as default" path — whatever the merchant published
+// (Google Product Taxonomy breadcrumbs, Shopify product_type singles,
+// or hand-authored strings) becomes the leaf.
+//
+// Two shapes supported:
+//   • Rich breadcrumb: "Apparel & Accessories > Clothing > Shirts" →
+//     multi-level tree via findOrCreateCategoryTree (segments split on
+//     '>'). Common for Meta feeds populated from google_product_category.
+//   • Single term: "Shirts" → depth-0 leaf. Common for Shopify
+//     product_type. Still preserves the merchant's own naming — a
+//     brand-scoped "Shirts" leaf is more useful than a 9-bucket
+//     "Apparel" bucket that flattens everything.
+//
+// Returns { categoryId, source } or null when feedCategory is empty
+// (caller falls through to the coarse-enum path).
+async function resolveFeedCategoryRef({ brandId, advertiserId = null, feedCategory }) {
+  if (!brandId) return null;
+  const cleaned = String(feedCategory || '').trim();
+  if (!cleaned) return null;
+  const categoryId = await findOrCreateCategoryTree({
+    brandId,
+    advertiserId,
+    breadcrumb: cleaned
+  });
+  if (!categoryId) return null;
+  const source = cleaned.includes('>') ? 'feed-breadcrumb' : 'feed-single';
+  return { categoryId, source };
+}
+
 // Return the coarse breadcrumb name for an enum (e.g. 'food_beverage'
 // → 'Food & Beverage'), or null when the enum is unmapped. Used by
 // productMatchService to prefix fine breadcrumbs.
@@ -174,6 +217,8 @@ module.exports = {
   ENUM_TO_COARSE_BREADCRUMB,
   inferCoarseEnum,
   resolveCoarseCategoryRef,
+  resolveFeedCategoryRef,
+  isFeedTruthCategoriesEnabled,
   getCoarseBreadcrumb,
   getCoarseSubtreeIds
 };

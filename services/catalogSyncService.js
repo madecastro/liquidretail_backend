@@ -12,7 +12,7 @@ const axios = require('axios');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const CatalogProduct = require('../models/CatalogProduct');
 const { decrypt } = require('./integrationCryptoService');
-const { inferCoarseEnum, resolveCoarseCategoryRef } = require('./categoryClassifier');
+const { inferCoarseEnum, resolveCoarseCategoryRef, resolveFeedCategoryRef, isFeedTruthCategoriesEnabled } = require('./categoryClassifier');
 const { startRun, CancelledError } = require('./progressService');
 const { concurrency: CONC } = require('./concurrency');
 
@@ -259,33 +259,58 @@ async function syncCatalogForCred(cred, run = null) {
         if (result?.lastErrorObject?.updatedExisting) updated++;
         else                                          added++;
 
-        // Stamp a COARSE Category leaf on rows that don't already have
-        // a fine-grained categoryRef. Heuristic on Meta's category +
-        // title — best-effort; nothing breaks if it can't classify.
-        // This is what makes findCatalogMatchByText's pre-match filter
-        // hit on freshly-synced rows. Match-time productCategoryService
-        // later upgrades this to a fine-grained descendant leaf when
-        // the row wins a real match.
+        // Stamp a Category leaf on rows that don't already have a
+        // categoryRef. Owner rule 2026-08-11: FEED TRUTH is the default.
+        // Try the raw feed string first (rich breadcrumb → tree, single
+        // term → depth-0 leaf), so the merchant's own taxonomy becomes
+        // the leaf. Only if feed category is missing/empty do we fall
+        // back to the 9-bucket coarse-enum heuristic. Downstream inferred
+        // paths (JSON-LD scrape, GPT-4.1 brand-nav) now guard on
+        // categoryRef=null so this feed stamp stays authoritative.
+        // Gated by FEED_TRUTH_CATEGORIES — OFF restores the pre-change
+        // path (inferCoarseEnum first, no feed-truth attempt).
         const row = result.value || result;
         if (row && !row.categoryRef) {
           try {
-            const enumCategory = inferCoarseEnum(item.category, item.name);
-            if (enumCategory) {
-              const coarseRef = await resolveCoarseCategoryRef({
+            let stampedRef = null;
+            let stampedSource = null;
+            if (isFeedTruthCategoriesEnabled()) {
+              const feedRef = await resolveFeedCategoryRef({
                 brandId:      cred.brandId,
                 advertiserId: cred.advertiserId,
-                enumCategory
+                feedCategory: item.category
               });
-              if (coarseRef) {
-                await CatalogProduct.updateOne(
-                  { _id: row._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
-                  { $set: { categoryRef: coarseRef } }
-                );
+              if (feedRef) {
+                stampedRef    = feedRef.categoryId;
+                stampedSource = feedRef.source;
+              }
+            }
+            if (!stampedRef) {
+              const enumCategory = inferCoarseEnum(item.category, item.name);
+              if (enumCategory) {
+                const coarseRef = await resolveCoarseCategoryRef({
+                  brandId:      cred.brandId,
+                  advertiserId: cred.advertiserId,
+                  enumCategory
+                });
+                if (coarseRef) {
+                  stampedRef    = coarseRef;
+                  stampedSource = 'coarse-enum';
+                }
+              }
+            }
+            if (stampedRef) {
+              await CatalogProduct.updateOne(
+                { _id: row._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+                { $set: { categoryRef: stampedRef } }
+              );
+              if (stampedSource !== 'coarse-enum') {
+                console.log(`   ✓ feed-truth category stamped for ${externalId} (${stampedSource})`);
               }
             }
           } catch (err) {
             // Best-effort — never let category stamping break a sync.
-            console.warn(`   ⚠️  coarse-category stamp failed for ${externalId}: ${err.message}`);
+            console.warn(`   ⚠️  category stamp failed for ${externalId}: ${err.message}`);
           }
         }
         // Defer classify to post-loop pass — never block remaining upserts.

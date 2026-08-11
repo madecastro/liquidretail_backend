@@ -217,9 +217,17 @@ async function inferFromProductUrl(productUrl) {
 
 // Per-product: infer, build Category tree, stamp CatalogProduct.
 // Returns { ok, breadcrumb, categoryId } on success, { skipped, reason }
-// otherwise. The categoryRef on CatalogProduct is updated to point at
-// the inferred leaf — replacing any prior coarse heuristic-mapped ref.
+// otherwise.
+//
+// Owner rule 2026-08-11 (FEED_TRUTH_CATEGORIES): the categoryRef on
+// CatalogProduct is only stamped when it's currently null — i.e. the
+// feed didn't provide a category. If catalogSyncService already stamped
+// a feed-derived categoryRef (via resolveFeedCategoryRef), this
+// service still writes inferredBreadcrumb + inferredCategoryAt for
+// diagnostics + TTL bookkeeping, but leaves the authoritative
+// categoryRef alone. Flag OFF restores the pre-change overwrite.
 async function inferAndStamp(productId, { force = false } = {}) {
+  const { isFeedTruthCategoriesEnabled } = require('./categoryClassifier');
   const product = await CatalogProduct.findById(productId)
     .select('_id brandId advertiserId productUrl categoryRef inferredCategoryAt')
     .lean();
@@ -261,18 +269,22 @@ async function inferAndStamp(productId, { force = false } = {}) {
     firstSeenMediaId: null
   });
 
+  // Feed-truth default: only stamp categoryRef when the feed didn't
+  // already supply one (product.categoryRef null at read time above).
+  // Flag OFF restores the pre-change unconditional overwrite.
+  const shouldOverwriteRef = !isFeedTruthCategoriesEnabled() || !product.categoryRef;
   await CatalogProduct.updateOne(
     { _id: productId },
     {
       $set: {
         inferredBreadcrumb: breadcrumb,
         inferredCategoryAt: new Date(),
-        ...(categoryId ? { categoryRef: categoryId } : {})
+        ...(categoryId && shouldOverwriteRef ? { categoryRef: categoryId } : {})
       }
     }
   );
 
-  return { ok: true, breadcrumb, source: r.source, categoryId };
+  return { ok: true, breadcrumb, source: r.source, categoryId, stampedRef: shouldOverwriteRef };
 }
 
 // Batch — runs N products with global concurrency cap. The per-domain
