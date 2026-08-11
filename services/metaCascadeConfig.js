@@ -112,9 +112,21 @@ const DEFAULT_META_CASCADES = {
     { type: 'doc', doc: 'layoutInput',    path: 'input.product.price' },
     { type: 'doc', doc: 'ad',             path: 'copy.productPrice' },
   ],
+  // REMOVED 2026-08-11 (owner: "The bestseller badge should be removed").
+  //
+  // This literal printed "Bestseller" on any ad whose product had no real
+  // badge — i.e. it fired precisely when there was NO evidence for the claim.
+  // Unlike a CTA label ("Shop Now") or a proof format ("4.8 ★"), "Bestseller"
+  // is a factual superlative about commercial performance: unearned, it is a
+  // false advertising claim, and it was the highest-frequency templated string
+  // still reaching video creative.
+  //
+  // No replacement literal. An absent badge resolves to nothing and the slot
+  // renders nothing, the same doctrine now applied to headlines and quotes:
+  // on-brand and true, or absent. If a "bestseller" badge is ever wanted it
+  // must come from real data on input.product.badges, earned per product.
   badgeText: [
     { type: 'doc', doc: 'layoutInput', path: 'input.product.badges[0]' },
-    { type: 'literal', value: 'Bestseller' },
   ],
   badges: [
     { type: 'doc', doc: 'layoutInput', path: 'input.product.badges' },
