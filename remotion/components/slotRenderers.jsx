@@ -697,9 +697,25 @@ export const ReviewCountSlot = ({ slot, content, tokens, dims, format }) => {
   const font = tokenFont(tokens, t.fontRole);
   const raw = String(content);
   const asNum = Number(raw.replace(/[,_\s]/g, ''));
-  const label = Number.isFinite(asNum) && asNum > 0
-    ? `${asNum.toLocaleString('en-US')} review${asNum === 1 ? '' : 's'}`
-    : raw;
+  // NO UNSCOPED FABRICATION FROM A BARE NUMBER. A prewrapped string
+  // ("15545 brand reviews", "523 reviews") passes straight through — that is the
+  // normal path, and services/ratingDisplay.js has already attached the tier
+  // qualifier. What was wrong was formatting a RAW NUMBER into "15,545 reviews":
+  // on a product ad whose count is a brand aggregate that asserts a catalog-wide
+  // total as this SKU's own volume, which is the misattribution the qualifier
+  // exists to prevent — and it silently DROPPED the word "brand" that made the
+  // upstream string honest.
+  //
+  // Found by adversarial review of the slotContent fix: closing the rating
+  // composite path there left this sibling open, so the claim "no unscoped count
+  // can reach a frame" was overstated. Reachable via an operator/LLM titleStyleSpec
+  // enabling the reviewCount slot (no shipped preset does today).
+  //
+  // Fail closed: render a bare number as nothing rather than as an unscoped claim.
+  const isPrewrapped = /[a-z]/i.test(raw);
+  const label = isPrewrapped
+    ? raw
+    : (Number.isFinite(asNum) && asNum > 0 ? '' : raw);
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-block' }}>
       <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
