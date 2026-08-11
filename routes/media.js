@@ -46,6 +46,29 @@ router.get('/', async (req, res) => {
     // existing ads / campaigns that reference a deleted Media
     // continue to render.
     filterExtras.deletedAt = null;
+
+    // UGC-ads Phase 6 — surface Media that source any variantKind='ugc'
+    // ad (~777 legacy rows historically). These predate the Phase 1
+    // attach API so they have no operator assignment and would otherwise
+    // fail every clause of the ?ugc=true OR-filter below. Fold their ids
+    // into filterExtras._id via a pre-fetch aggregate so the same
+    // pagination + tenant-filter path handles them. Also drop the
+    // deletedAt=null gate for these ids specifically (W2 — the ad IS the
+    // artifact, so a soft-deleted source Media still shows up in the
+    // Legacy bucket). Only when ?ugc=true is set — the general Media
+    // Library list stays deletedAt-scoped.
+    let legacyUgcMediaIds = [];
+    if (req.query.ugc === 'true' && brandId) {
+      const Ad = require('../models/Ad');
+      const mongoose = require('mongoose');
+      if (mongoose.isValidObjectId(String(brandId))) {
+        legacyUgcMediaIds = await Ad.distinct('mediaId', {
+          brandId:     new mongoose.Types.ObjectId(String(brandId)),
+          variantKind: 'ugc',
+          mediaId:     { $ne: null }
+        });
+      }
+    }
     // ?ids=a,b,c — explicit-id batch lookup. Lets the Generate Ads
     // wizard hydrate pre-selected media that aren't in the first page.
     // Bypasses pagination (returns up to 100 in one call) but still
@@ -66,13 +89,31 @@ router.get('/', async (req, res) => {
     // is centered on operator-visible UGC-ish inventory, not just on
     // the ingestion channel.
     if (req.query.ugc === 'true') {
-      filterExtras.$or = [
+      const orClauses = [
         { source: { $in: ['instagram', 'apify-ig'] } },
         { 'matchedProducts.source': 'operator' },
         { 'matchedCategories.source': 'operator' },
         { 'brandingAssignment.assignedAt': { $exists: true, $ne: null } },
         { 'promotionalAssignment.assignedAt': { $exists: true, $ne: null } }
       ];
+      // Phase 6 — legacy variantKind='ugc' ad sources. AND the deletedAt
+      // relaxation here (W2): a Media surfaced ONLY because it sources a
+      // legacy UGC ad may be soft-deleted; the ad is still real. Other
+      // clauses continue to honour the deletedAt=null gate above.
+      if (legacyUgcMediaIds.length) {
+        orClauses.push({ _id: { $in: legacyUgcMediaIds } });
+        // Convert the deletedAt=null equality into a $ne to a sentinel so
+        // legacy-only rows can slip through. Non-legacy rows still need
+        // deletedAt to be null; enforce that via a per-clause guard below.
+        delete filterExtras.deletedAt;
+        filterExtras.$and = [{
+          $or: [
+            { deletedAt: null },
+            { _id: { $in: legacyUgcMediaIds } }
+          ]
+        }];
+      }
+      filterExtras.$or = orClauses;
       // The catalog-product-wrapper exclusion above was written as a top-
       // level $ne. Combined with a top-level $or Mongo would AND them,
       // which is what we want (still exclude wrappers even inside the
@@ -82,13 +123,16 @@ router.get('/', async (req, res) => {
 
     const [docs, total] = await Promise.all([
       Media.find(filter)
-        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt matchedProducts matchedCategories brandingAssignment promotionalAssignment primarySubjectLabel adSuitability classification width height')
+        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt matchedProducts matchedCategories brandingAssignment promotionalAssignment primarySubjectLabel adSuitability classification width height deletedAt')
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit)
         .lean(),
       Media.countDocuments(filter)
     ]);
+    // Set membership check for the legacy-ugc row hint below — O(1) per
+    // row, populated only when the ?ugc=true query path built the list.
+    const legacyUgcIdSet = new Set(legacyUgcMediaIds.map(id => String(id)));
 
     const media = docs.map(d => {
       // Phase A-1 — derive match-level pill from the primary matched
@@ -142,7 +186,14 @@ router.get('/', async (req, res) => {
           detectCategories:   (d.matchedCategories || []).filter(mc => mc.source !== 'operator').length,
           branding:           !!d.brandingAssignment?.assignedAt,
           promotional:        !!d.promotionalAssignment?.assignedAt
-        }
+        },
+        // UGC-ads Phase 6 — legacy-UGC signal + soft-delete surfacing.
+        // hasLegacyUgc lets the client render a "Legacy" pill on the row
+        // header without a follow-up ads query; deletedAt makes the W2
+        // "still show soft-deleted rows" case explicit so the client can
+        // annotate "(deleted)" instead of just showing a stale thumbnail.
+        hasLegacyUgc:   legacyUgcIdSet.has(String(d._id)),
+        deletedAt:      d.deletedAt || null
       };
     });
 
