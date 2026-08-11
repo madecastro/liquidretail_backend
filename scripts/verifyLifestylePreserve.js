@@ -1348,6 +1348,493 @@ console.log('\n=== BLOCKER 3: variantKind on all renderDirectImage callers ===\n
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// BLOCKER 1 (R4) — 'native' reachable via REAL production path
+// Production computes seedAspect from Media.width/height inside
+// renderDirectImage — not a hand-passed seedAspect:'1:1' harness arg.
+// ═══════════════════════════════════════════════════════════════════════
+console.log('\n=== BLOCKER 1 R4: seedAspect production path (native arm live) ===\n');
+{
+  const mod = loadIntents({ preserve: 'true', hardening: 'true', pmaxNotes: 'false' });
+  const directSrc = fs.readFileSync(
+    path.join(REPO, 'services/directImageRenderService.js'), 'utf8'
+  );
+
+  // Source: Media select loads width + height
+  check(
+    'B1 Media.select includes width and height',
+    /\.select\(\s*['`][^'`]*\bwidth\b[^'`]*\bheight\b[^'`]*['`]/.test(directSrc)
+    || /\.select\(\s*['`][^'`]*\bheight\b[^'`]*\bwidth\b[^'`]*['`]/.test(directSrc),
+    'Media.findById().select must include width and height'
+  );
+  // Source: seedAspectFromDims called from media dims
+  check(
+    'B1 production calls seedAspectFromDims(media?.width, media?.height)',
+    /seedAspectFromDims\s*\(\s*media\s*\?\.\s*width\s*,\s*media\s*\?\.\s*height\s*\)/.test(directSrc)
+  );
+  // Source: seedAspect threaded into buildPrompt
+  check(
+    'B1 production threads seedAspect into intents.buildPrompt',
+    /intents\.buildPrompt\s*\(\s*\{[\s\S]{0,800}\bseedAspect\b/.test(directSrc)
+  );
+  check(
+    'B1 seedAspectFromDims is exported',
+    typeof mod.seedAspectFromDims === 'function'
+  );
+
+  // Behavioural: production-path helper → dims → seedAspect → buildPrompt
+  // (NOT hand-passing seedAspect:'1:1' — that was the dead-path harness)
+  {
+    const seedAspect = mod.seedAspectFromDims(1080, 1080); // Media 1:1 → meta_feed_1_1
+    check('B1 seedAspectFromDims(1080,1080) returns parseable aspect',
+      seedAspect != null && mod.parseAspectValue(seedAspect) != null,
+      `got=${JSON.stringify(seedAspect)}`);
+    const r = mod.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface: 'meta_feed_1_1',
+      seedStyle: 'lifestyle',
+      seedAspect // production-derived, not a surface-ratio string
+    });
+    check('B1 REAL path: matching dims → aspectTreatment=native',
+      r.aspectTreatment === 'native' && r.preserveScene === true,
+      `treatment=${r.aspectTreatment} preserve=${r.preserveScene}`);
+    check('B1 REAL path: matching dims → NO EDGE EXTENSION sentence',
+      !r.prompt.includes('EDGE EXTENSION') &&
+      !/Edge extension to fit the surface aspect IS permitted/i.test(r.prompt));
+    check('B1 REAL path: matching dims still has SCENE PRESERVE',
+      r.prompt.includes('SCENE PRESERVE — HIGHEST PRIORITY'));
+  }
+
+  // 4:5 media into 4:5 surface via dims
+  {
+    const seedAspect = mod.seedAspectFromDims(1080, 1350);
+    const r = mod.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface: 'meta_feed_4_5',
+      seedStyle: 'lifestyle',
+      seedAspect
+    });
+    check('B1 REAL path: 1080x1350 → meta_feed_4_5 → native, no EDGE EXTENSION',
+      r.aspectTreatment === 'native' && !r.prompt.includes('EDGE EXTENSION'));
+  }
+
+  // Mismatched dims → extend
+  {
+    const seedAspect = mod.seedAspectFromDims(1080, 1350); // 4:5 into 1:1
+    const r = mod.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface: 'meta_feed_1_1',
+      seedStyle: 'lifestyle',
+      seedAspect
+    });
+    check('B1 REAL path: mismatched dims → extend + EDGE EXTENSION',
+      r.aspectTreatment === 'extend' && r.prompt.includes('EDGE EXTENSION'));
+  }
+
+  // Missing / zero / unparseable dims → null → extend (never throw)
+  {
+    const cases = [
+      [null, null, 'null,null'],
+      [undefined, undefined, 'undefined,undefined'],
+      [0, 1080, 'zero width'],
+      [1080, 0, 'zero height'],
+      [-1, 100, 'negative'],
+      ['x', 'y', 'unparseable'],
+      [NaN, 1080, 'NaN width']
+    ];
+    for (const [w, h, label] of cases) {
+      let threw = false;
+      let sa = null;
+      try {
+        sa = mod.seedAspectFromDims(w, h);
+      } catch (e) {
+        threw = true;
+      }
+      check(`B1 missing/bad dims (${label}) → null, never throw`,
+        !threw && sa === null, `sa=${sa} threw=${threw}`);
+      const r = mod.buildPrompt({
+        intentKey: 'product_first_lifestyle',
+        data: DATA, product: PRODUCT,
+        surface: 'meta_feed_1_1',
+        seedStyle: 'lifestyle',
+        seedAspect: sa
+      });
+      check(`B1 missing/bad dims (${label}) → extend fallback`,
+        r.aspectTreatment === 'extend' && r.prompt.includes('EDGE EXTENSION'));
+    }
+  }
+
+  // REVERT-PROVE: without seedAspect (simulating pre-fix production), native is dead
+  {
+    const r = mod.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface: 'meta_feed_1_1',
+      seedStyle: 'lifestyle'
+      // no seedAspect — production before this fix
+    });
+    check('B1 REVERT-PROVE: no seedAspect → extend (native arm dead without dims)',
+      r.aspectTreatment === 'extend');
+  }
+
+  // Source REVERT-PROVE: synthetic source without width fails select pattern
+  {
+    const fake = "Media.findById(mediaId).select('fileUrl classification technicalInsights').lean()";
+    const pattern = /\.select\(\s*['`][^'`]*\bwidth\b[^'`]*\bheight\b[^'`]*['`]/;
+    check('B1 REVERT-PROVE: select without width/height fails pattern',
+      !pattern.test(fake));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOCKER 2 (R4) — PMax PLATFORM_NOTES preserve-aware
+// Notes apply to ALL pmax_* (incl. square/portrait where preserve IS live).
+// ═══════════════════════════════════════════════════════════════════════
+console.log('\n=== BLOCKER 2 R4: PMax notes vs SCENE_PRESERVE ===\n');
+{
+  const on = loadIntents({ preserve: 'true', hardening: 'true', pmaxNotes: 'true' });
+  const offPreserve = loadIntents({ preserve: 'false', hardening: 'true', pmaxNotes: 'true' });
+
+  // Prove coexistence is real: square + portrait CAN be preserve-ON
+  for (const surface of ['pmax_square_1_1', 'pmax_portrait_4_5']) {
+    const r = on.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface, seedStyle: 'lifestyle'
+    });
+    check(`B2 ${surface} lifestyle → preserve ON (coexistence possible)`,
+      r.preserveScene === true,
+      `preserve=${r.preserveScene} treatment=${r.aspectTreatment}`);
+    check(`B2 ${surface} preserve-ON still has PLATFORM CONTEXT`,
+      /PLATFORM CONTEXT/.test(r.prompt || ''));
+    // Recompose clauses from scene-build notes must be ABSENT
+    const bannedNoteCues = [
+      'compose it so the product reads as complete',
+      'keep the product away from the extreme edges',
+      'never let a crop slice through it',
+      'one dominant subject',
+      'Keep the whole composition legible when the frame is cropped toward its centre'
+    ];
+    for (const cue of bannedNoteCues) {
+      check(`B2 ${surface} preserve-ON notes lack recompose: "${cue.slice(0, 40)}…"`,
+        !r.prompt.includes(cue));
+    }
+    // Preserve arm still forbids recomposing the plate for crop survival
+    check(`B2 ${surface} preserve-ON notes forbid restaging for crop`,
+      /Do not recompose, restage|do not move or restage the product/i.test(r.prompt));
+  }
+
+  // 16:9 not-supported: preserve OFF, scene-build notes still OK (no SCENE_PRESERVE)
+  {
+    const r = on.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface: 'pmax_16_9', seedStyle: 'lifestyle'
+    });
+    check('B2 pmax_16_9 lifestyle → preserve OFF (not-supported)',
+      r.preserveScene === false);
+    check('B2 pmax_16_9 still has scene-build PLATFORM CONTEXT (no preserve conflict)',
+      /PLATFORM CONTEXT/.test(r.prompt || '') &&
+      r.prompt.includes('compose it so the product reads as complete'));
+  }
+
+  // Flag-off / preserve-off: original notes byte-identical
+  {
+    const rOff = offPreserve.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface: 'pmax_square_1_1', seedStyle: 'lifestyle'
+    });
+    const rOnScene = on.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT,
+      surface: 'pmax_square_1_1', seedStyle: 'packshot' // packshot → no preserve
+    });
+    check('B2 preserve-OFF (packshot) keeps original recompose centre-crop clause',
+      rOnScene.prompt.includes('compose it so the product reads as complete') &&
+      rOnScene.prompt.includes('one dominant subject'));
+    check('B2 resolvePlatformNotes exported',
+      typeof on.resolvePlatformNotes === 'function');
+    check('B2 PLATFORM_NOTES.pmax is still the scene-build string (export pin)',
+      on.PLATFORM_NOTES.pmax === on.PLATFORM_NOTES_PMAX_SCENE_BUILD &&
+      on.PLATFORM_NOTES.pmax.includes('compose it so the product reads as complete'));
+    // Preserve-off lifestyle with flag-off preserve: same notes as packshot path
+    check('B2 preserve-flag-off lifestyle uses scene-build notes',
+      rOff.prompt.includes('compose it so the product reads as complete'));
+  }
+
+  // REVERT-PROVE: if resolvePlatformNotes ignored preserve, square would get scene-build
+  {
+    const sceneBuild = on.PLATFORM_NOTES_PMAX_SCENE_BUILD || on.PLATFORM_NOTES.pmax;
+    const preserveNotes = on.PLATFORM_NOTES_PMAX_PRESERVE;
+    check('B2 REVERT-PROVE: preserve notes ≠ scene-build notes',
+      !!preserveNotes && preserveNotes !== sceneBuild);
+    const resolvedPreserve = on.resolvePlatformNotes('pmax_square_1_1', { preserve: true });
+    const resolvedOff = on.resolvePlatformNotes('pmax_square_1_1', { preserve: false });
+    check('B2 REVERT-PROVE: resolvePlatformNotes(preserve:true) ≠ (preserve:false)',
+      resolvedPreserve === preserveNotes && resolvedOff === sceneBuild);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOCKER 3 (R4) — intent × field recompose sweep under preserve
+// Fields that reach the prompt: goal, emphasis, (text is byte-identical),
+// decideBlock, fidelity/SCENE_PRESERVE, platformNotes.
+// ownerBrief is doc-only — checked present, never in prompt.
+// ═══════════════════════════════════════════════════════════════════════
+console.log('\n=== BLOCKER 3 R4: intent × field recompose matrix ===\n');
+{
+  const on = loadIntents({ preserve: 'true', hardening: 'true', pmaxNotes: 'true' });
+  const off = loadIntents({ preserve: 'false', hardening: 'true', pmaxNotes: 'true' });
+
+  // Cues that must never appear in a preserve-ON prompt (any field that reaches it)
+  const RECOMPOSE_CUES = [
+    'dominating the frame',
+    'shown large and desirable',
+    'loudest thing in the frame',
+    'scene someone wants to be in',
+    'clearly present but supporting',
+    'product supporting rather than leading',
+    'supporting position (small card or inset)', // ownerBrief only — must not leak
+    'compose it so the product reads as complete',
+    'keep the product away from the extreme edges',
+    'one dominant subject',
+    'YOU DECIDE EVERYTHING ELSE: composition and crop'
+  ];
+
+  // Field extractors for the matrix
+  function fieldBlobs(built, intentKey, mod) {
+    const spec = mod.INTENTS[intentKey];
+    const keptRoles = new Set((built.text || []).map(([r]) => r));
+    const kept_ = (role) => keptRoles.has(role);
+    const goal = typeof spec.goal === 'function'
+      ? spec.goal(kept_, { preserve: built.preserveScene })
+      : spec.goal;
+    const goalOff = typeof spec.goal === 'function'
+      ? spec.goal(kept_, { preserve: false })
+      : spec.goal;
+    const emphasis = (built.emphasis || []).join(' | ');
+    const text = JSON.stringify(built.text || []);
+    const ownerBrief = spec.ownerBrief || '';
+    // Slice prompt regions
+    const prompt = built.prompt || '';
+    const goalInPrompt = (prompt.match(/WHAT THIS AD HAS TO DO: ([^\n]+)/) || [])[1] || '';
+    return { goal, goalOff, emphasis, text, ownerBrief, goalInPrompt, prompt };
+  }
+
+  const matrix = []; // { intent, field, status, changed }
+
+  for (const intentKey of FOUR_INTENTS) {
+    const rOn = on.buildPrompt({
+      intentKey, data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'lifestyle'
+    });
+    const rOff = off.buildPrompt({
+      intentKey, data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'lifestyle'
+    });
+    check(`B3 ${intentKey} preserve-ON`, rOn.preserveScene === true);
+
+    const fOn = fieldBlobs(rOn, intentKey, on);
+    const fOff = fieldBlobs(rOff, intentKey, off);
+
+    // goal
+    {
+      let cueHit = null;
+      for (const cue of RECOMPOSE_CUES) {
+        if (fOn.goal && fOn.goal.includes(cue)) { cueHit = cue; break; }
+      }
+      check(`B3 ${intentKey}/goal preserve-ON no recompose cue`,
+        cueHit == null, cueHit ? `found "${cueHit}"` : '');
+      // goalInPrompt must match computed goal
+      check(`B3 ${intentKey}/goal reaches prompt`,
+        fOn.goalInPrompt === fOn.goal || (fOn.prompt.includes(fOn.goal)));
+      const goalChanged = fOn.goal !== fOff.goal;
+      matrix.push({
+        intent: intentKey, field: 'goal',
+        status: cueHit ? 'FAIL' : 'clean',
+        changed: goalChanged ? 'preserve-aware' : 'unchanged (no recompose needed)'
+      });
+      // brand_led specifically: goal MUST change under preserve (the bug)
+      if (intentKey === 'brand_led') {
+        check('B3 brand_led/goal is preserve-aware (differs from flag-off)',
+          goalChanged);
+        check('B3 brand_led/goal flag-off still has "supporting rather than leading"',
+          fOff.goal.includes('product supporting rather than leading'));
+        check('B3 brand_led/goal preserve-ON lacks "supporting rather than leading"',
+          !fOn.goal.includes('product supporting rather than leading'));
+      }
+    }
+
+    // emphasis
+    {
+      let cueHit = null;
+      for (const cue of RECOMPOSE_CUES) {
+        if (fOn.emphasis.includes(cue)) { cueHit = cue; break; }
+      }
+      check(`B3 ${intentKey}/emphasis preserve-ON no recompose cue`,
+        cueHit == null, cueHit ? `found "${cueHit}"` : '');
+      matrix.push({
+        intent: intentKey, field: 'emphasis',
+        status: cueHit ? 'FAIL' : 'clean',
+        changed: JSON.stringify(rOn.emphasis) !== JSON.stringify(rOff.emphasis)
+          ? 'preserve-aware' : 'unchanged'
+      });
+    }
+
+    // text — MUST be byte-identical (owner requirement)
+    {
+      const identical = fOn.text === fOff.text;
+      check(`B3 ${intentKey}/text byte-identical preserve-on vs off`,
+        identical);
+      matrix.push({
+        intent: intentKey, field: 'text',
+        status: identical ? 'byte-identical' : 'FAIL',
+        changed: 'must never change'
+      });
+    }
+
+    // ownerBrief — doc only, must NOT appear in prompt
+    {
+      const leaks = fOn.ownerBrief && fOn.ownerBrief.length > 20
+        && fOn.prompt.includes(fOn.ownerBrief.slice(0, 40));
+      check(`B3 ${intentKey}/ownerBrief does NOT reach prompt`,
+        !leaks);
+      matrix.push({
+        intent: intentKey, field: 'ownerBrief',
+        status: 'doc-only (not in prompt)',
+        changed: 'n/a'
+      });
+    }
+
+    // Full prompt sweep for remaining cues (decideBlock, notes, etc.)
+    // Exclude SCENE_PRESERVE's own "Do not recompose" prohibitions — those
+    // are bans, not invitations. Match invitation-style cues only.
+    {
+      let cueHit = null;
+      for (const cue of RECOMPOSE_CUES) {
+        if (fOn.prompt.includes(cue)) { cueHit = cue; break; }
+      }
+      check(`B3 ${intentKey}/prompt (all fields) no recompose invitation`,
+        cueHit == null, cueHit ? `found "${cueHit}"` : '');
+    }
+  }
+
+  // Flag-off strings stay byte-identical for goal+emphasis originals we care about
+  {
+    const rOff = off.buildPrompt({
+      intentKey: 'brand_led', data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'lifestyle'
+    });
+    check('B3 flag-OFF brand_led goal byte-identical to pre-change',
+      /product supporting rather than leading/.test(
+        (rOff.prompt.match(/WHAT THIS AD HAS TO DO: ([^\n]+)/) || [])[1] || ''
+      ));
+  }
+
+  // Print matrix for the finish report
+  console.log('\n  Intent × field matrix:');
+  console.log('  ' + 'intent'.padEnd(26) + 'field'.padEnd(14) + 'status'.padEnd(28) + 'note');
+  console.log('  ' + '-'.repeat(90));
+  for (const row of matrix) {
+    console.log(
+      '  ' + row.intent.padEnd(26) + row.field.padEnd(14) + row.status.padEnd(28) + row.changed
+    );
+  }
+
+  // REVERT-PROVE brand_led goal: if someone reverts goal to non-preserve-aware
+  {
+    const fakeGoal = (kept) => 'A stranger scrolling past should recognise the brand first — its colours, its voice, its mark — with the product supporting rather than leading. '
+      + (kept('BRAND LINE') ? 'The brand line carries the voice.' : 'Here the brand identity has to do the work without a line.');
+    const g = fakeGoal(() => true);
+    check('B3 REVERT-PROVE: non-preserve-aware brand_led goal still has recompose cue',
+      g.includes('product supporting rather than leading'));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// buildPrompt CALLER ENUMERATION (complete list)
+// ═══════════════════════════════════════════════════════════════════════
+console.log('\n=== buildPrompt caller enumeration (staticAdIntents) ===\n');
+{
+  // Production services that call intents.buildPrompt / staticAdIntents.buildPrompt
+  const callers = [];
+  const servicesDir = path.join(REPO, 'services');
+  const scriptsDir = path.join(REPO, 'scripts');
+
+  function scanDir(dir, label) {
+    let files = [];
+    try {
+      files = fs.readdirSync(dir).filter((f) => f.endsWith('.js'));
+    } catch (_) { return; }
+    for (const f of files) {
+      const full = path.join(dir, f);
+      let src;
+      try { src = fs.readFileSync(full, 'utf8'); } catch (_) { continue; }
+      if (f === 'staticAdIntents.js') {
+        callers.push({
+          file: `${label}/${f}`,
+          role: 'definition',
+          threadsSeedAspect: true,
+          production: false
+        });
+        continue;
+      }
+      // Match staticAdIntents require by path string OR variable path containing the name
+      const isIntentsRequire =
+        /staticAdIntents/.test(src) &&
+        (/require\s*\(/.test(src) || /require\.resolve\s*\(/.test(src));
+      if (!isIntentsRequire && f !== 'directImageRenderService.js') continue;
+      // Call of staticAdIntents.buildPrompt under any local name (intents/mod/on/off/…)
+      // Exclude local buildPrompt definitions in unrelated services.
+      const hasBuildPromptCall =
+        /\.buildPrompt\s*\(/.test(src) ||
+        (label === 'scripts' && /(?:^|[^\w.])buildPrompt\s*\(/.test(src) && /staticAdIntents/.test(src));
+      // services/directImageRenderService is the production chokepoint
+      const isProd = f === 'directImageRenderService.js' && /intents\.buildPrompt\s*\(/.test(src);
+      if (!hasBuildPromptCall && !isProd) continue;
+      // Skip pure re-export / require-only files that never call buildPrompt
+      if (!hasBuildPromptCall) continue;
+
+      const threadsSeedAspect = /seedAspect\s*:/.test(src) || /seedAspectFromDims/.test(src);
+      callers.push({
+        file: `${label}/${f}`,
+        role: isProd ? 'production-call' : 'harness/test',
+        threadsSeedAspect: isProd
+          ? threadsSeedAspect
+          : (threadsSeedAspect ? 'yes (harness may pass)' : 'optional'),
+        production: isProd
+      });
+    }
+  }
+  scanDir(servicesDir, 'services');
+  scanDir(scriptsDir, 'scripts');
+
+  // Hard pin: the ONLY production caller must be directImageRenderService
+  const prodCallers = callers.filter((c) => c.production);
+  check('CALLERS only production buildPrompt site is directImageRenderService',
+    prodCallers.length === 1 && /directImageRenderService/.test(prodCallers[0].file),
+    `prod=${JSON.stringify(prodCallers.map((c) => c.file))}`);
+  check('CALLERS production site threads seedAspect',
+    prodCallers[0] && prodCallers[0].threadsSeedAspect === true);
+
+  console.log('  Complete staticAdIntents.buildPrompt callers:');
+  for (const c of callers) {
+    console.log(
+      `  · ${c.file.padEnd(48)} role=${c.role.padEnd(16)} seedAspect=${c.threadsSeedAspect}`
+    );
+  }
+  // Also list renderDirectImage entry points (the real production fan-in)
+  console.log('\n  Production fan-in to renderDirectImage (computes seedAspect once):');
+  console.log('  · services/renderService.js          first render (Ad.variantKind thread; Media dims loaded inside renderDirectImage)');
+  console.log('  · services/adRegenerateService.js    paid regen via buildDirectImageArgsFromAd');
+  console.log('  · services/directImageRenderService  vision-QC re-entry via buildQcRetryArgs spread');
+  console.log('  All three re-enter renderDirectImage → Media width/height → seedAspectFromDims → buildPrompt.');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // REVERT-PROVE (document which check catches which mutation)
 // ═══════════════════════════════════════════════════════════════════════
 console.log('\n=== REVERT-PROVE map (documented) ===');
@@ -1387,6 +1874,12 @@ const REVERT_MAP = [
   ['Drop variantKind from Ad.select in renderService', 'C1 renderService selects variantKind from Ad'],
   ['Drop variantKind on regen args', 'C2 REVERT-PROVE: dropped variantKind → no preserve'],
   ['Drop variantKind on QC retry (hand-list fields)', 'C3 REVERT-PROVE: missing variantKind on QC retry'],
+  ['Drop Media width/height from select', 'B1 Media.select includes width and height'],
+  ['Drop seedAspectFromDims call / seedAspect thread', 'B1 production threads seedAspect / B1 REAL path native'],
+  ['Hand-pass only seedAspect:\'1:1\' without dims path', 'B1 REAL path uses seedAspectFromDims'],
+  ['Missing dims throw instead of extend', 'B1 missing/bad dims → null, never throw'],
+  ['PMax notes ignore preserve (scene-build under preserve)', 'B2 pmax_square preserve-ON notes lack recompose'],
+  ['brand_led goal still says supporting rather than leading under preserve', 'B3 brand_led/goal preserve-ON lacks "supporting rather than leading"'],
   ['Guidance >600 chars', 'V7 * ≤600 chars'],
   ['Guidance says Shop Now', 'V7 * no copy/offer/text instruction']
 ];

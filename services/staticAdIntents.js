@@ -429,22 +429,40 @@ function destinationForSurface(surfaceKey) {
  *
  * Only 'pmax' has a block today. Meta has none — an empty/missing entry is what
  * keeps Meta prompts byte-identical when the flag is on.
+ *
+ * SCENE-BUILD arm (default / preserve OFF) keeps the original recompose-friendly
+ * centre-crop language. Under SCENE_PRESERVE the same delivery facts still
+ * matter (crop risk, no accompanying text, thumbnail), but the notes must NOT
+ * invite restaging the photograph — pmax_square_1_1 and pmax_portrait_4_5 can
+ * carry preserve-ON + these notes together (only 16:9 landscape is
+ * not-supported). resolvePlatformNotes(surface, {preserve}) selects the arm.
  */
+const PLATFORM_NOTES_PMAX_SCENE_BUILD = [
+  // ⚠️ Do NOT put the product back in the "must fit inside the box" list.
+  // geometryBlock() says, two lines earlier: "EVERY element you render other
+  // than the photograph itself must sit inside the box … The photograph
+  // should still fill the whole frame edge to edge." Naming the product here
+  // revokes that exemption and tells the model to shrink the subject into the
+  // text box — wasting the frame on the exact surface where a small,
+  // thumbnail-legible subject matters most. The box governs RENDERED
+  // elements; the product only needs to survive a centre crop.
+  'PLATFORM CONTEXT. The platform may crop the outer edges of this image on some placements. Every element you render — logo, and any text — must sit inside the safe box already specified above; nothing rendered in the outer margin. The photograph itself still fills the frame edge to edge, but compose it so the product reads as complete and uncut when the frame is cropped toward its centre: keep the product away from the extreme edges and never let a crop slice through it.',
+  'This image may be shown WITHOUT any accompanying text. It has to communicate the product and the brand on its own.',
+  'It may also be shown small, in a feed of unrelated content: one dominant subject, strong figure/ground contrast, no fine detail that dies at thumbnail size, no clutter.',
+  'Keep the whole composition legible when the frame is cropped toward its centre.'
+].join(' ');
+
+/** Preserve-aware PMax notes — same delivery facts, no recompose of the plate. */
+const PLATFORM_NOTES_PMAX_PRESERVE = [
+  'PLATFORM CONTEXT. The platform may crop the outer edges of this image on some placements. Every element you render — logo, and any text — must sit inside the safe box already specified above; nothing rendered in the outer margin. The photograph itself still fills the frame edge to edge. Do not recompose, restage, or move the product to survive a centre crop — typeset chrome so it remains inside the safe box after that crop; the plate itself stays as the reference shows it.',
+  'This image may be shown WITHOUT any accompanying text. It has to communicate the product and the brand on its own.',
+  'It may also be shown small, in a feed of unrelated content: rely on the figure/ground contrast already present in the photograph; no fine type detail that dies at thumbnail size; no clutter in the chrome.',
+  'Keep rendered chrome legible when the frame is cropped toward its centre; do not move or restage the product to achieve this.'
+].join(' ');
+
 const PLATFORM_NOTES = {
-  pmax: [
-    // ⚠️ Do NOT put the product back in the "must fit inside the box" list.
-    // geometryBlock() says, two lines earlier: "EVERY element you render other
-    // than the photograph itself must sit inside the box … The photograph
-    // should still fill the whole frame edge to edge." Naming the product here
-    // revokes that exemption and tells the model to shrink the subject into the
-    // text box — wasting the frame on the exact surface where a small,
-    // thumbnail-legible subject matters most. The box governs RENDERED
-    // elements; the product only needs to survive a centre crop.
-    'PLATFORM CONTEXT. The platform may crop the outer edges of this image on some placements. Every element you render — logo, and any text — must sit inside the safe box already specified above; nothing rendered in the outer margin. The photograph itself still fills the frame edge to edge, but compose it so the product reads as complete and uncut when the frame is cropped toward its centre: keep the product away from the extreme edges and never let a crop slice through it.',
-    'This image may be shown WITHOUT any accompanying text. It has to communicate the product and the brand on its own.',
-    'It may also be shown small, in a feed of unrelated content: one dominant subject, strong figure/ground contrast, no fine detail that dies at thumbnail size, no clutter.',
-    'Keep the whole composition legible when the frame is cropped toward its centre.'
-  ].join(' ')
+  // Default export = scene-build arm (flag-on non-preserve + harness pin).
+  pmax: PLATFORM_NOTES_PMAX_SCENE_BUILD
 };
 
 /**
@@ -457,6 +475,18 @@ const PLATFORM_NOTES = {
  * allowed to diverge.
  */
 const PMAX_STATIC_PLATFORM_NOTES = process.env.PMAX_STATIC_PLATFORM_NOTES !== 'false';
+
+/**
+ * Resolve platform notes for a surface. Preserve-ON on pmax square/portrait
+ * uses the preserve-aware arm so recompose clauses never co-exist with
+ * SCENE_PRESERVE. Preserve-OFF (incl. 16:9 not-supported fallthrough) keeps
+ * the original scene-build string byte-identical.
+ */
+function resolvePlatformNotes(surfaceKey, { preserve = false } = {}) {
+  if (!PMAX_STATIC_PLATFORM_NOTES) return null;
+  if (destinationForSurface(surfaceKey) !== 'pmax') return null;
+  return preserve ? PLATFORM_NOTES_PMAX_PRESERVE : PLATFORM_NOTES.pmax;
+}
 
 /**
  * Effective drawCta for a surface + resolved intent.
@@ -685,8 +715,14 @@ const INTENTS = {
     /**
      * Goal is a function of what survives: never promise an element the text
      * block may not carry (see product_first_lifestyle).
+     * Third arg `ctx` optional so flag-off / non-preserve callers stay
+     * byte-identical. Preserve arm drops "product supporting rather than
+     * leading" (re-composition) — brand recognition comes from type/chrome
+     * treatment over the existing plate.
      */
-    goal: (kept) => 'A stranger scrolling past should recognise the brand first — its colours, its voice, its mark — with the product supporting rather than leading. '
+    goal: (kept, ctx = {}) => (ctx.preserve
+      ? 'A stranger scrolling past should recognise the brand first — its colours, its voice, its mark — from brand treatment and type hierarchy over the existing photograph. '
+      : 'A stranger scrolling past should recognise the brand first — its colours, its voice, its mark — with the product supporting rather than leading. ')
       + (kept('BRAND LINE')
         ? 'The brand line carries the voice.'
         : 'Here the brand identity has to do the work without a line.'),
@@ -995,6 +1031,21 @@ function parseAspectValue(seedAspect) {
 }
 
 /**
+ * Derive seedAspect from Media.width / Media.height for resolveAspectTreatment.
+ * Production MUST load both fields on the Media query and call this — without
+ * it the 'native' arm is dead (every preserve submit falls to 'extend').
+ *
+ * Missing / zero / unparseable / non-finite dims → null (degrades to 'extend',
+ * never throws). Same contract as parseAspectValue on bad input.
+ */
+function seedAspectFromDims(width, height) {
+  const w = Number(width);
+  const h = Number(height);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  return `${w}x${h}`;
+}
+
+/**
  * Named resolver seam: aspect treatment for lifestyle/UGC preserve, per
  * (surface × seed kind). Owner 2026-08:
  *
@@ -1126,8 +1177,11 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
 
   const keptRoles = new Set(kept.map(([r]) => r));
   const kept_ = (role) => keptRoles.has(role);
-  // Pass preserve into emphasis so product_first_lifestyle can use a
-  // preserve-aware scene line without touching text() copy roles/order.
+  // Pass preserve into emphasis + goal so intents can use preserve-aware
+  // scene language without touching text() copy roles/order. ownerBrief is
+  // documentation-only and never reaches the prompt.
+  const goalCtx = { preserve };
+  const goalText = typeof spec.goal === 'function' ? spec.goal(kept_, goalCtx) : spec.goal;
   const emphasis = spec.emphasis(data, kept_, { preserve });
   const absent = absences(data, spec.renders, dropped, effectivePolicy);
   const s = computeSurface(surface);
@@ -1207,11 +1261,13 @@ Set no other words, numerals or letterforms anywhere in the image — including 
    * Platform delivery context — AFTER geometry, because the notes refer to the
    * safe box the geometry block just established. Flag off → empty for every
    * surface (byte-identity). Flag on → pmax only; Meta has no PLATFORM_NOTES
-   * entry so its prompt stays byte-identical.
+   * entry so its prompt stays byte-identical. Preserve-ON uses the
+   * recompose-free arm (resolvePlatformNotes) so PMax square/portrait notes
+   * never contradict SCENE_PRESERVE.
    */
   let platformNotesBlock = '';
-  if (PMAX_STATIC_PLATFORM_NOTES) {
-    const notes = PLATFORM_NOTES[destinationForSurface(surface)];
+  {
+    const notes = resolvePlatformNotes(surface, { preserve });
     if (notes) platformNotesBlock = `\n\n${notes}`;
   }
 
@@ -1238,7 +1294,7 @@ ${fidelityBlock}
 
 PRODUCT: ${product.desc}
 
-WHAT THIS AD HAS TO DO: ${typeof spec.goal === 'function' ? spec.goal(kept_) : spec.goal}
+WHAT THIS AD HAS TO DO: ${goalText}
 
 WHAT SHOULD WIN ATTENTION, in this order:
 ${emphasis.map((e, i) => `  ${i + 1}. ${e}`).join('\n')}
@@ -1296,6 +1352,12 @@ module.exports = {
   // Phase B PMax static overlay — harnesses call these directly.
   PMAX_STATIC_PLATFORM_NOTES,
   PLATFORM_NOTES,
+  PLATFORM_NOTES_PMAX_PRESERVE,
+  PLATFORM_NOTES_PMAX_SCENE_BUILD,
+  resolvePlatformNotes,
   destinationForSurface,
-  resolveDrawCta
+  resolveDrawCta,
+  // Seed aspect from Media.width/height — production path for 'native' arm.
+  seedAspectFromDims,
+  parseAspectValue
 };
