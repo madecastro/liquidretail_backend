@@ -105,8 +105,28 @@ const POLICIES = Object.freeze({
       ['failed', 'error', 'cancelled', 'canceled', 'rejected'].includes(predictionStatus),
     // Refunded per documented policy, and confirmed live: data.price was null on
     // the failed prediction. Ledger it at $0 so the attempt stays visible.
-    charged: false, action: 'retry', maxAttempts: 2,
-    backoffMs: () => 1000,
+    charged: false, action: 'retry', maxAttempts: 3,
+    // 15s, then 45s (n is 0-based — see backoffFor). NOT the 1s this used to be.
+    //
+    // Measured 2026-08-10/11 on Render web logs: 8 generation_failed across 34
+    // submits (23.5%), all on gemini-omni-flash. The retry gate fired on 3 of 3
+    // eligible failures and rescued 0 of 3 — every retry reproduced the same
+    // error. A one-second gap resubmits an identical payload to a model that is
+    // still in whatever state just failed it, so the second attempt was never a
+    // meaningfully different roll.
+    //
+    // SHARED POLICY — this governs the static-image path too
+    // (atlasImageService.submitAndPollWithRetry), which is gated by mayResubmit
+    // rather than confirmedCharge. Both gates are unchanged; both paths now get
+    // 3 attempts and the same curve. That widening is deliberate: images fail on
+    // the same provider class, and PR #108 is precedent for Atlas-side faults
+    // taking static generation fully down.
+    //
+    // Nothing here spends money on either path: a resubmit still requires the
+    // previous attempt to be proven unbilled. Extra attempts cost wall-clock,
+    // not dollars — a failed generation returns fast (executionTime 0), so the
+    // added latency is the backoff, not a poll.
+    backoffMs: (n) => Math.min(120_000, 15_000 * Math.pow(3, Math.max(0, n))),
     alertLevel: 'warn', alertKey: 'atlas:prediction-failed',
     why: 'Atlas ran and failed; reservation refunded, so a reattempt costs nothing extra'
   },

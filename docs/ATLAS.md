@@ -451,8 +451,9 @@ reservation on a failed task and never bills a rejection."* A full video is
 ### Three defects this exposed, all fixed
 
 1. **No retry.** `predictionFailed` has always said `action:'retry'`,
-   `maxAttempts:2`, `charged:false` — the video path never read it, so every
-   provider hiccup became a dead ad.
+   `charged:false` — the video path never read it, so every provider hiccup
+   became a dead ad. (The retry it then gained still rescued nothing until the
+   backoff fix below.)
 2. **A terminal verdict was retried as a transport blip.** The poll's
    `axios.get` had no `validateStatus`, so a 500 threw into the generic 5xx
    branch: prediction `cec47abe…` was polled **12 times over 3 minutes** after
@@ -488,5 +489,62 @@ Nothing in the current data suggests that (5/5 failed rows never gained a price
 on repeated reads), and closing it would need a delayed second peek or a refund
 API. Revisit if the video bill ever exceeds delivered videos.
 
-Pinned by `scripts/verifyVideoRetryOnUnbilledFailure.js` (23 checks, offline,
-revert-proven on the gate, both poll paths, and the ledger key).
+### The retry was firing and rescuing nothing (fixed 2026-08-11)
+
+The gate above worked. The retry it guarded did not. Measured over ~30h of
+Render web logs (2026-08-10T11:32Z → 2026-08-11T17:32Z):
+
+| | |
+|---|---|
+| video submits | 34 |
+| `generation_failed` | 8 (**23.5%**) |
+| moderation blocks | 3 (correctly never retried) |
+| retry fired when eligible | **3 of 3** |
+| retry rescued an ad | **0 of 3** |
+
+Two causes, both in the wait between attempts:
+
+1. `predictionFailed.backoffMs` was `() => 1000` — and it was **dead code**.
+   The retry site hardcoded its own `const backoffMs = 1000 * attempt`, so the
+   policy's value was never read.
+2. So every retry resubmitted an **identical payload to the same model one
+   second after it failed** — never a meaningfully different roll.
+
+Now: `pollPrediction` stamps `err.policyBackoffFor`, the retry site calls it,
+and `predictionFailed` is `maxAttempts: 3` with a 15s → 45s curve (capped
+120s). The money gate is untouched — extra attempts cost wall-clock, not
+dollars, because a resubmit still requires `charged === false` from Atlas's own
+settled price.
+
+⚠️ **`backoffFor(n)` is 0-BASED, and the two call sites disagree about `n`.**
+`atlasImageService.submitAndPollWithRetry` counts from 0 and passes `attempt`
+raw; `atlasVideoService.generateForAd` counts from **1** and must pass
+`attempt - 1`. Get that wrong and the first wait silently becomes the curve's
+second step. Pinned by C1c.
+
+⚠️ **`predictionFailed` is a SHARED policy — this also changed static images.**
+`atlasImageService` reads the same `maxAttempts` and `backoffFor`, so the image
+path went from 2 attempts at ~1s to 3 at 15s/45s. Deliberate: images fail on the
+same provider class, and PR #108 is precedent for an Atlas-side fault taking
+static generation 100% down. The gates stay different and both are intact —
+video asks `confirmedCharge() === false` ("did we pay?"), images ask
+`mayResubmit()` ("was a billable task ever created?"). Pinned by F3. Anyone
+retuning this policy for one path is retuning both.
+
+**Cost of the extra attempt, stated plainly:** worst case adds 60s of wall-clock
+per retried ad and holds a `VEO_CONCURRENCY` slot for that time, which can
+stretch a batch and slightly widen the SIGTERM-strand window on deploy. Accepted
+against a 23.5% failure rate. Note the last attempt's estimate row is not zeroed
+when a retry is exhausted (it throws before `finalizeFlatCost`) — pre-existing
+since PR #113, now one row larger on a fully-failed ad.
+
+**This is a mitigation, not a cure.** The 23.5% is provider-side: `git log`
+confirms no commit landed on `main` in the 24h before the first failure
+(2026-08-10T15:56:10Z), and every failure was `gemini-omni-flash` at 9:16. If
+the rescue rate stays at zero with real backoff, the next lever is a
+cross-model fallback to `ASPECT_FALLBACK_MODEL` — deliberately not done here,
+since it changes cost and the visual character of delivered ads.
+
+Pinned by `scripts/verifyVideoRetryOnUnbilledFailure.js` (27 checks, offline,
+revert-proven on the gate, both poll paths, the ledger key, the backoff curve,
+and the retry site's use of it).
