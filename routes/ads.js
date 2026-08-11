@@ -2524,6 +2524,21 @@ router.get('/', async (req, res) => {
     // a capped/sorted page by a dedupe-reused ad's stale generatedAt.
     if (req.query.campaignRunId) filter.campaignRunIds = String(req.query.campaignRunId);
     if (req.query.status)        filter.status         = req.query.status;
+    // UGC-ads Phase 4 — ?mediaId=X returns the ads generated FROM this
+    // source Media (used by the UGC Ads page to render per-row "ads
+    // generated" groups + by the Product Ads UGC-badge deep-link).
+    // Ad.mediaId is ObjectId-typed; cast explicitly for the same reason
+    // brandId/campaignId are cast above ($match won't auto-cast).
+    if (req.query.mediaId) {
+      if (!mongoose.isValidObjectId(String(req.query.mediaId))) {
+        return res.status(400).json({ error: 'mediaId is not a valid ObjectId' });
+      }
+      filter.mediaId = new mongoose.Types.ObjectId(String(req.query.mediaId));
+    }
+    // UGC-ads Phase 4 — ?variantKind=ugc|product_image splits the Product
+    // Ads page into UGC vs product-shot buckets. Column typed as a string
+    // on Ad; direct equality is fine.
+    if (req.query.variantKind) filter.variantKind = String(req.query.variantKind);
     // ?rendered=true → only ads that have actually been rendered to
     // Cloudinary (status in draft|live|archived). Used by surfaces that
     // shouldn't surface the queue (campaign-detail Ads section, etc.).

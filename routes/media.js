@@ -52,11 +52,37 @@ router.get('/', async (req, res) => {
     // applies tenant + brand scoping so it's safe.
     const idsParam = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
     if (idsParam.length) filterExtras._id = { $in: idsParam.slice(0, 100) };
+
+    // UGC-ads Phase 4 — ?ugc=true scopes to Media that is UGC-eligible:
+    // (a) source is a social ingestion channel (instagram / apify-ig), OR
+    // (b) has ANY operator-added attachment (product / category /
+    //     branding / promotional). Matches the Phase 1 attach schema:
+    //     matched* subdocs stamp source:'operator', and branding/
+    //     promotional live under top-level *.assignedAt.
+    //
+    // OR-composed at the top level because the natural set includes
+    // both social posts an operator hasn't touched yet AND manual
+    // uploads the operator has explicitly attached — the UGC Ads page
+    // is centered on operator-visible UGC-ish inventory, not just on
+    // the ingestion channel.
+    if (req.query.ugc === 'true') {
+      filterExtras.$or = [
+        { source: { $in: ['instagram', 'apify-ig'] } },
+        { 'matchedProducts.source': 'operator' },
+        { 'matchedCategories.source': 'operator' },
+        { 'brandingAssignment.assignedAt': { $exists: true, $ne: null } },
+        { 'promotionalAssignment.assignedAt': { $exists: true, $ne: null } }
+      ];
+      // The catalog-product-wrapper exclusion above was written as a top-
+      // level $ne. Combined with a top-level $or Mongo would AND them,
+      // which is what we want (still exclude wrappers even inside the
+      // UGC-or filter), so no further composition is needed.
+    }
     const filter = tenantFilter(req, filterExtras);
 
     const [docs, total] = await Promise.all([
       Media.find(filter)
-        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt matchedProducts primarySubjectLabel adSuitability classification width height')
+        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt matchedProducts matchedCategories brandingAssignment promotionalAssignment primarySubjectLabel adSuitability classification width height')
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit)
@@ -101,7 +127,22 @@ router.get('/', async (req, res) => {
         primarySubjectLabel: d.primarySubjectLabel || null,
         matchLevel,
         detectOutcome:  d.classification?.detectSummary?.outcome || null,
-        adReadiness:    typeof d.adSuitability?.score === 'number' ? d.adSuitability.score : null
+        adReadiness:    typeof d.adSuitability?.score === 'number' ? d.adSuitability.score : null,
+        // UGC-ads Phase 4 — compact attachment summary. Lets the UGC Ads
+        // list drive its filter chips (product / category / branding /
+        // promotional / none) client-side without a follow-up call per row.
+        // socialPostType surfaced too so the spec's socialPostType='ugc'
+        // filter has a client-side signal even though the ?ugc= query above
+        // uses the broader source-plus-assignments net.
+        socialPostType: d.classification?.socialPostType || null,
+        assignmentSummary: {
+          operatorProducts:   (d.matchedProducts   || []).filter(mp => mp.source === 'operator').length,
+          detectProducts:     (d.matchedProducts   || []).filter(mp => mp.source !== 'operator').length,
+          operatorCategories: (d.matchedCategories || []).filter(mc => mc.source === 'operator').length,
+          detectCategories:   (d.matchedCategories || []).filter(mc => mc.source !== 'operator').length,
+          branding:           !!d.brandingAssignment?.assignedAt,
+          promotional:        !!d.promotionalAssignment?.assignedAt
+        }
       };
     });
 
