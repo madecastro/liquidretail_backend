@@ -40,23 +40,99 @@ router.get('/', async (req, res) => {
     // in the Uploaded Media list confuses operators (they show up as
     // "248 items" alongside 25 real IG posts).
     filterExtras.source = { $ne: 'catalog-product' };
+    // Hide soft-deleted rows from the Library list. Stamped by
+    // media.patchRights's sibling capability media.delete via the
+    // home-page agent. Downstream lookups by id still resolve so
+    // existing ads / campaigns that reference a deleted Media
+    // continue to render.
+    filterExtras.deletedAt = null;
+
+    // UGC-ads Phase 6 — surface Media that source any variantKind='ugc'
+    // ad (~777 legacy rows historically). These predate the Phase 1
+    // attach API so they have no operator assignment and would otherwise
+    // fail every clause of the ?ugc=true OR-filter below. Fold their ids
+    // into filterExtras._id via a pre-fetch aggregate so the same
+    // pagination + tenant-filter path handles them. Also drop the
+    // deletedAt=null gate for these ids specifically (W2 — the ad IS the
+    // artifact, so a soft-deleted source Media still shows up in the
+    // Legacy bucket). Only when ?ugc=true is set — the general Media
+    // Library list stays deletedAt-scoped.
+    let legacyUgcMediaIds = [];
+    if (req.query.ugc === 'true' && brandId) {
+      const Ad = require('../models/Ad');
+      const mongoose = require('mongoose');
+      if (mongoose.isValidObjectId(String(brandId))) {
+        legacyUgcMediaIds = await Ad.distinct('mediaId', {
+          brandId:     new mongoose.Types.ObjectId(String(brandId)),
+          variantKind: 'ugc',
+          mediaId:     { $ne: null }
+        });
+      }
+    }
     // ?ids=a,b,c — explicit-id batch lookup. Lets the Generate Ads
     // wizard hydrate pre-selected media that aren't in the first page.
     // Bypasses pagination (returns up to 100 in one call) but still
     // applies tenant + brand scoping so it's safe.
     const idsParam = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
     if (idsParam.length) filterExtras._id = { $in: idsParam.slice(0, 100) };
+
+    // UGC-ads Phase 4 — ?ugc=true scopes to Media that is UGC-eligible:
+    // (a) source is a social ingestion channel (instagram / apify-ig), OR
+    // (b) has ANY operator-added attachment (product / category /
+    //     branding / promotional). Matches the Phase 1 attach schema:
+    //     matched* subdocs stamp source:'operator', and branding/
+    //     promotional live under top-level *.assignedAt.
+    //
+    // OR-composed at the top level because the natural set includes
+    // both social posts an operator hasn't touched yet AND manual
+    // uploads the operator has explicitly attached — the UGC Ads page
+    // is centered on operator-visible UGC-ish inventory, not just on
+    // the ingestion channel.
+    if (req.query.ugc === 'true') {
+      const orClauses = [
+        { source: { $in: ['instagram', 'apify-ig'] } },
+        { 'matchedProducts.source': 'operator' },
+        { 'matchedCategories.source': 'operator' },
+        { 'brandingAssignment.assignedAt': { $exists: true, $ne: null } },
+        { 'promotionalAssignment.assignedAt': { $exists: true, $ne: null } }
+      ];
+      // Phase 6 — legacy variantKind='ugc' ad sources. AND the deletedAt
+      // relaxation here (W2): a Media surfaced ONLY because it sources a
+      // legacy UGC ad may be soft-deleted; the ad is still real. Other
+      // clauses continue to honour the deletedAt=null gate above.
+      if (legacyUgcMediaIds.length) {
+        orClauses.push({ _id: { $in: legacyUgcMediaIds } });
+        // Convert the deletedAt=null equality into a $ne to a sentinel so
+        // legacy-only rows can slip through. Non-legacy rows still need
+        // deletedAt to be null; enforce that via a per-clause guard below.
+        delete filterExtras.deletedAt;
+        filterExtras.$and = [{
+          $or: [
+            { deletedAt: null },
+            { _id: { $in: legacyUgcMediaIds } }
+          ]
+        }];
+      }
+      filterExtras.$or = orClauses;
+      // The catalog-product-wrapper exclusion above was written as a top-
+      // level $ne. Combined with a top-level $or Mongo would AND them,
+      // which is what we want (still exclude wrappers even inside the
+      // UGC-or filter), so no further composition is needed.
+    }
     const filter = tenantFilter(req, filterExtras);
 
     const [docs, total] = await Promise.all([
       Media.find(filter)
-        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt matchedProducts primarySubjectLabel adSuitability classification width height')
+        .select('externalId source fileType fileUrl fileName metadata rights latestArtifacts createdAt matchedProducts matchedCategories brandingAssignment promotionalAssignment primarySubjectLabel adSuitability classification width height deletedAt')
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit)
         .lean(),
       Media.countDocuments(filter)
     ]);
+    // Set membership check for the legacy-ugc row hint below — O(1) per
+    // row, populated only when the ?ugc=true query path built the list.
+    const legacyUgcIdSet = new Set(legacyUgcMediaIds.map(id => String(id)));
 
     const media = docs.map(d => {
       // Phase A-1 — derive match-level pill from the primary matched
@@ -95,7 +171,29 @@ router.get('/', async (req, res) => {
         primarySubjectLabel: d.primarySubjectLabel || null,
         matchLevel,
         detectOutcome:  d.classification?.detectSummary?.outcome || null,
-        adReadiness:    typeof d.adSuitability?.score === 'number' ? d.adSuitability.score : null
+        adReadiness:    typeof d.adSuitability?.score === 'number' ? d.adSuitability.score : null,
+        // UGC-ads Phase 4 — compact attachment summary. Lets the UGC Ads
+        // list drive its filter chips (product / category / branding /
+        // promotional / none) client-side without a follow-up call per row.
+        // socialPostType surfaced too so the spec's socialPostType='ugc'
+        // filter has a client-side signal even though the ?ugc= query above
+        // uses the broader source-plus-assignments net.
+        socialPostType: d.classification?.socialPostType || null,
+        assignmentSummary: {
+          operatorProducts:   (d.matchedProducts   || []).filter(mp => mp.source === 'operator').length,
+          detectProducts:     (d.matchedProducts   || []).filter(mp => mp.source !== 'operator').length,
+          operatorCategories: (d.matchedCategories || []).filter(mc => mc.source === 'operator').length,
+          detectCategories:   (d.matchedCategories || []).filter(mc => mc.source !== 'operator').length,
+          branding:           !!d.brandingAssignment?.assignedAt,
+          promotional:        !!d.promotionalAssignment?.assignedAt
+        },
+        // UGC-ads Phase 6 — legacy-UGC signal + soft-delete surfacing.
+        // hasLegacyUgc lets the client render a "Legacy" pill on the row
+        // header without a follow-up ads query; deletedAt makes the W2
+        // "still show soft-deleted rows" case explicit so the client can
+        // annotate "(deleted)" instead of just showing a stale thumbnail.
+        hasLegacyUgc:   legacyUgcIdSet.has(String(d._id)),
+        deletedAt:      d.deletedAt || null
       };
     });
 
@@ -427,6 +525,99 @@ router.post('/:mediaId/refresh-insights', async (req, res) => {
     });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || 'refresh failed' });
+  }
+});
+
+// ── UGC-ads Phase 1 — operator-driven attachments ────────────────────
+//
+// Attach a UGC Media to a product / category / branding / promotional
+// target. Every write goes through mediaAssignmentService which stamps
+// source:'operator' so detect re-runs can't clobber the entry.
+
+const mediaAssignmentService = require('../services/mediaAssignmentService');
+
+// POST /api/media/:mediaId/assign
+// Body: { targetType: 'product'|'category'|'branding'|'promotional',
+//         targetId?: ObjectId, productIds?: [ObjectId] }
+router.post('/:mediaId/assign', express.json(), async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const { targetType } = req.body || {};
+    const assignedBy = req.user?.email || req.user?.userId || null;
+    if (!['product', 'category', 'branding', 'promotional'].includes(targetType)) {
+      return res.status(400).json({ error: `targetType must be one of: product, category, branding, promotional` });
+    }
+
+    let result;
+    if (targetType === 'product') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for product attachment' });
+      result = await mediaAssignmentService.attachProduct({
+        mediaId, productId: req.body.targetId, advertiserId: req.advertiserId, assignedBy
+      });
+    } else if (targetType === 'category') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for category attachment' });
+      result = await mediaAssignmentService.attachCategory({
+        mediaId, categoryId: req.body.targetId, advertiserId: req.advertiserId, assignedBy
+      });
+    } else if (targetType === 'branding') {
+      result = await mediaAssignmentService.attachBranding({
+        mediaId, advertiserId: req.advertiserId, assignedBy
+      });
+    } else {
+      result = await mediaAssignmentService.attachPromotional({
+        mediaId, productIds: req.body?.productIds || [], advertiserId: req.advertiserId, assignedBy
+      });
+    }
+
+    if (!result.ok) return res.status(result.code === 'MEDIA_NOT_FOUND' ? 404 : 400).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'assign failed' });
+  }
+});
+
+// DELETE /api/media/:mediaId/assign
+// Body: { targetType, targetId? }
+router.delete('/:mediaId/assign', express.json(), async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const { targetType } = req.body || {};
+    if (!['product', 'category', 'branding', 'promotional'].includes(targetType)) {
+      return res.status(400).json({ error: `targetType must be one of: product, category, branding, promotional` });
+    }
+
+    let result;
+    if (targetType === 'product') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for product detach' });
+      result = await mediaAssignmentService.detachProduct({ mediaId, productId: req.body.targetId, advertiserId: req.advertiserId });
+    } else if (targetType === 'category') {
+      if (!req.body?.targetId) return res.status(400).json({ error: 'targetId required for category detach' });
+      result = await mediaAssignmentService.detachCategory({ mediaId, categoryId: req.body.targetId, advertiserId: req.advertiserId });
+    } else if (targetType === 'branding') {
+      result = await mediaAssignmentService.detachBranding({ mediaId, advertiserId: req.advertiserId });
+    } else {
+      result = await mediaAssignmentService.detachPromotional({ mediaId, advertiserId: req.advertiserId });
+    }
+
+    if (!result.ok) return res.status(result.code === 'MEDIA_NOT_FOUND' ? 404 : 400).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'detach failed' });
+  }
+});
+
+// GET /api/media/:mediaId/assignments — enumerate all attachments
+// (both detect + operator provenance).
+router.get('/:mediaId/assignments', async (req, res) => {
+  try {
+    const result = await mediaAssignmentService.listAssignments({
+      mediaId: req.params.mediaId,
+      advertiserId: req.advertiserId
+    });
+    if (!result.ok) return res.status(result.code === 'MEDIA_NOT_FOUND' ? 404 : 400).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'assignments fetch failed' });
   }
 });
 

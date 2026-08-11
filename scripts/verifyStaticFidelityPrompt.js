@@ -25,7 +25,8 @@
  *   F4  The pre-existing text contract is undamaged under flag-on. The
  *       hardening block was inserted ABOVE it; these fail loudly if a future
  *       edit displaces or truncates SET EXACTLY THESE STRINGS / the geometry
- *       block (still last, starts with FORMAT).
+ *       block. Meta: FORMAT is still last. PMax (Phase B): PLATFORM CONTEXT
+ *       is last and FORMAT is the second-to-last section.
  *   F5  Both textBlock branches (with-copy and no-copy) carry the carve-out,
  *       anchored to the REFERENCE photograph not to "the product". The looser
  *       "already on the product" phrasing is a justification handle for
@@ -209,8 +210,14 @@ function collectPrompts(mod, data) {
 
 // ── F4 — PRE-EXISTING TEXT CONTRACT UNDAMAGED, flag ON ──────────────────
 // WHY: the hardening block was inserted ABOVE the text contract; these checks
-// fail loudly if a future edit displaces or truncates it. Geometry stays last
-// (final section starts with FORMAT — same assertion style as verifyStaticIntents).
+// fail loudly if a future edit displaces or truncates it.
+//
+// Geometry / terminal-section invariant (Phase B, 2026-08-10):
+//   • Meta surfaces: FORMAT is still the LAST section (platform notes never
+//     attach to Meta — a real invariant; keep it strict).
+//   • pmax_* surfaces: PLATFORM CONTEXT is appended AFTER geometry, so the
+//     last section starts with PLATFORM CONTEXT and the second-to-last still
+//     starts with FORMAT (geometry block is present, not deleted).
 {
   const mod = loadIntents('true');
   const rows = collectPrompts(mod, DATA);
@@ -232,11 +239,27 @@ function collectPrompts(mod, data) {
         prompt.includes('Set no other words, numerals or letterforms'));
     }
 
-    // Geometry block is still last — final non-empty section starts with FORMAT.
-    const lastSection = prompt.trim().split(/\n\n+/).pop() || '';
-    check(`F4 ${tag}: geometry starts with FORMAT`,
-      /^FORMAT:/.test(lastSection.trim()),
-      `last section starts: ${JSON.stringify(lastSection.slice(0, 40))}`);
+    const sections = prompt.trim().split(/\n\n+/).filter((s) => s.trim().length);
+    const lastSection = sections[sections.length - 1] || '';
+    const prevSection = sections[sections.length - 2] || '';
+    const isPmax = String(surface).startsWith('pmax_');
+
+    if (isPmax) {
+      // Phase B: platform notes ride after geometry.
+      check(`F4 ${tag}: last section is PLATFORM CONTEXT`,
+        /^PLATFORM CONTEXT\b/.test(lastSection.trim()),
+        `last section starts: ${JSON.stringify(lastSection.slice(0, 40))}`);
+      check(`F4 ${tag}: second-to-last section is FORMAT (geometry intact)`,
+        /^FORMAT:/.test(prevSection.trim()),
+        `second-to-last starts: ${JSON.stringify(prevSection.slice(0, 40))}`);
+    } else {
+      // Meta invariant: geometry stays last — never PLATFORM CONTEXT.
+      check(`F4 ${tag}: geometry starts with FORMAT (Meta last section)`,
+        /^FORMAT:/.test(lastSection.trim()),
+        `last section starts: ${JSON.stringify(lastSection.slice(0, 40))}`);
+      check(`F4 ${tag}: Meta last section is NOT platform notes`,
+        !/^PLATFORM CONTEXT\b/.test(lastSection.trim()));
+    }
   }
   check('F4 at least one with-copy prompt exercised the text contract',
     withText >= 1, `withText=${withText}`);

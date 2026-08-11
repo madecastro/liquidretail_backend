@@ -160,30 +160,41 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '3.1.0';   // DELIBERATELY NOT BUMPED for the proof-menu
-// feature, even though assembleSignals' code changed (category_signal +
-// social_proof_signal.proof_options, behind DIRECTOR_PROOF_MENU_ENABLED). With
-// the flag off (default), the SIGNAL SHAPE this produces is genuinely
-// byte-identical to 3.1.0 — no category_signal key, no proof_options key — so
-// there is nothing here for a cached artifact to have gotten wrong.
-// An adversarial pass caught a real cost consequence of bumping now anyway:
-// this constant is the cache-hit key for the SHADOW telemetry path
-// (directConcepts, gated at :N — "cached.signalsVersion === DIRECTOR_SIGNALS_VERSION"),
-// and that shadow call is `await`ed on the LIVE campaign-expansion request path
-// (services/campaignAdsGenerationService.js, runCreativeDirectorShadow inside
-// expandWizardJob) — confirmed by reading that call site, not assumed. Bumping
-// unconditionally would have invalidated every existing shadow-path
-// CreativeDirectionArtifact on deploy and forced a paid gpt-4.1 re-derive for
-// every unique (brand,product,campaignKind,creativeIntent,platformFormat) on
-// its NEXT request — a real, if bounded and self-healing, spend event, for a
-// feature that isn't even turned on yet. The LIVE path (directConceptsRound)
-// is unaffected either way — it has no cache-hit gate on this constant at all,
-// confirmed by reading the code (no comparison exists before its
-// CreativeDirectionArtifact.create()).
-// BUMP THIS when DIRECTOR_PROOF_MENU_ENABLED is actually flipped to true —
-// that is the moment the signal shape genuinely changes for whoever is using
-// it, and pairing the bump with the flag flip means the one-time re-derive
-// cost lands exactly when the feature starts being useful, not before.
+const DIRECTOR_SIGNALS_VERSION = '3.3.0';   // BUMPED 2026-08-10: PMax funnel-spread + social-proof hierarchy in round brief.
+// 3.3: PMax-only round brief adds FUNNEL SPREAD (one concept each of awareness /
+// consideration / conversion via routing.funnel_stage) and SOCIAL-PROOF HIERARCHY
+// (one dominant proof element; env-backed rating/count thresholds). Meta prompts
+// stay byte-identical. Live path re-assembles every round so this is live without
+// the bump; the bump is for the SHADOW directConcepts cache-hit gate.
+// The predecessor comment held this at 3.1.0 on purpose and said to bump it at
+// exactly the moment DIRECTOR_PROOF_MENU_ENABLED was flipped on. That flip is
+// this commit (config/defaults.env DIRECTOR_PROOF_MENU_ENABLED=true), so the
+// bump is now due: with the menu on, assembleSignals emits a different signal
+// SHAPE (category_signal + social_proof_signal.proof_options), and the shadow
+// path's cached artifacts are keyed on this constant.
+// SCOPE CORRECTION (adversarial review caught this in an earlier draft of this
+// very comment, which claimed the flip would be a "silent no-op" without the
+// bump — that was WRONG and is worth stating plainly so nobody re-derives it):
+// the LIVE path is `directConceptsRound`, and it has NO signalsVersion cache
+// gate at all — it calls assembleSignals every round, so the proof menu goes
+// live the moment the flag flips, bump or no bump. The ONLY cache-hit gate on
+// this constant is at :262 inside the SHADOW/V1 `directConcepts` path. So the
+// bump buys shadow-path correctness (stale artifacts built from the narrower
+// shape stop being served as current), not live-path correctness.
+// KNOWN, ACCEPTED, ONE-TIME COST — do not treat as a defect: this constant is
+// the cache-hit key for the SHADOW telemetry path (directConcepts,
+// "cached.signalsVersion === DIRECTOR_SIGNALS_VERSION"), and that shadow call is
+// `await`ed on the LIVE campaign-expansion request path
+// (campaignAdsGenerationService, runCreativeDirectorShadow inside
+// expandWizardJob). So this bump forces one paid re-derive per unique
+// (brand,product,campaignKind,creativeIntent,platformFormat) on its NEXT
+// request. Bounded and self-healing. The LIVE path (directConceptsRound) is
+// unaffected either way — it has no cache-hit gate on this constant at all.
+// 3.2: DIRECTOR_PROOF_MENU_ENABLED flipped on, so category_signal +
+// social_proof_signal.proof_options are now genuinely present in the signal;
+// paired with real routing.creative_style selection criteria and a reserved
+// proof-led concept slot in buildPromptRound (social-proof static ads had
+// collapsed to 18 renders vs brand_led's 200+ over 2026-07-30..08-06).
 // 3.1: brand_signal.description now reads brand.summary (was a permanently-null brand.description), has_logo reads logoUrl, dead badges key dropped; bumps cache so artifacts derived from the starved brief re-derive. Load-bearing: cache-hit test is cached.signalsVersion === DIRECTOR_SIGNALS_VERSION, so without the bump every product with an existing CreativeDirectionArtifact keeps serving concepts built from the starved brief and the fix looks like a no-op. 3.0: nest concept into { routing, copy, art_direction, reasoning } so private rationale cannot fall through into image prompts as art direction (2026-08-01 leak). art_direction is OPTIONAL visual prose only; copy.* are the only letterforms; reasoning.rationale is private. Bumps cache so existing flat v2 artifacts re-derive. 2.4: platform-format-aware (Phase 3). 2.3: PMA-based matchedMediaIds + brand-review fallback. 2.2: file_type_distribution. 2.1: N_CONCEPTS 2 → 4. 2.0: full data projection.
 
 // Canonical archetype enum (the 8 we've been using, with descriptive
@@ -808,8 +819,145 @@ const ARCHETYPE_WEIGHTING = {
     `    PREFER  typographic_dominant (landscape gives headlines room to breathe — works well as a YouTube pre-roll)`,
     `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on YouTube/Display)`,
     `    AVOID        product_card_grid (multi-card layouts get clipped on small Display banner placements)`
+  ].join('\n'),
+  // Phase A live PMax video surfaces — scaffolded from pmax_16_9. Richer
+  // per-surface creative direction is Phase B; these keep reserved-chrome
+  // surfaces out of the "no weighting → square Feed defaults" hole.
+  pmax_video_16_9: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  magazine_editorial (clean editorial spread reads as commercial/professional on landscape)`,
+    `    PREFER  typographic_dominant (landscape gives headlines room to breathe — works well as a YouTube pre-roll)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on YouTube/Display)`,
+    `    AVOID        product_card_grid (multi-card layouts get clipped on small Display banner placements)`
+  ].join('\n'),
+  pmax_video_1_1: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  magazine_editorial (clean editorial reads commercial on square Discovery / PMax placements)`,
+    `    PREFER  typographic_dominant (square gives headlines room without vertical chrome pressure)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on Google surfaces)`,
+    `    AVOID        product_card_grid (multi-card layouts get cramped on 1:1 with reserved bands)`
+  ].join('\n'),
+  pmax_video_9_16: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  full_bleed_hero_bottom_panel (panel lands in the safe middle band, not Shorts chrome)`,
+    `    PREFER  magazine_editorial (clean commercial read on YouTube Shorts / PMax vertical)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy fights Shorts UI chrome)`,
+    `    AVOID        product_card_grid (multi-card layouts feel cramped on tall vertical)`
+  ].join('\n'),
+  // Phase A live PMax STATIC surfaces. The 1.91:1 landscape is a short, wide
+  // banner-like canvas where dense multi-element layouts fail; square and 4:5
+  // have more room. Modeled on the existing pmax_* entries — do not change Meta.
+  pmax_landscape_1_91_1: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  typographic_dominant (1.91:1 is a SHORT, WIDE banner-like canvas — bold headline + one product beat is all that fits)`,
+    `    PREFER  magazine_editorial (clean commercial spread; landscape Display placements reward restraint)`,
+    `    DEPRIORITIZE hero_quote_overlay (quote cards need vertical room this canvas does not have)`,
+    `    AVOID        product_card_grid (dense multi-element / multi-card layouts fail on a short wide banner)`,
+    `    AVOID        full_bleed_hero_bottom_panel (bottom panel + reserved chrome leaves almost no content height on a short canvas)`
+  ].join('\n'),
+  pmax_square_1_1: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  magazine_editorial (clean editorial reads commercial on square Discovery / PMax placements)`,
+    `    PREFER  typographic_dominant (square gives headlines room without vertical chrome pressure)`,
+    `    PREFER  full_bleed_hero_bottom_panel (square has enough height for a panel without crowding)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on Google surfaces)`,
+    `    AVOID        product_card_grid (multi-card layouts get cramped on 1:1 with reserved bands)`
+  ].join('\n'),
+  pmax_portrait_4_5: [
+    `  ARCHETYPE WEIGHTING:`,
+    `    PREFER  full_bleed_hero_bottom_panel (4:5 has room for a panel without Meta-style chrome pressure)`,
+    `    PREFER  magazine_editorial (clean commercial read on portrait PMax placements)`,
+    `    PREFER  typographic_dominant (portrait height gives type room to breathe)`,
+    `    DEPRIORITIZE hero_quote_overlay (creator-quote energy reads as "Instagram ad" on Google surfaces)`,
+    `    AVOID        product_card_grid (multi-card layouts still feel busy on portrait Display)`
   ].join('\n')
 };
+
+// ── PMax-only round brief (gated on platformFormat) ──────────────────
+//
+// Google PMax delivers ALL creative for a product into ONE asset group and
+// picks per impression by viewer intent — so the asset SET must SPAN the
+// funnel and concepts must be meaningfully different (not cosmetic variants).
+// Meta rounds must stay completely unaffected: every helper below is gated
+// on isPmaxPlatformFormat and never spliced into a Meta prompt or schema.
+// Thresholds are env-backed and INTERPOLATED into the prompt so the prose
+// and config/defaults.env can never disagree.
+
+const PMAX_FUNNEL_STAGES = Object.freeze(['awareness', 'consideration', 'conversion']);
+
+function isPmaxPlatformFormat(platformFormat) {
+  return typeof platformFormat === 'string' && platformFormat.startsWith('pmax_');
+}
+
+/**
+ * Read a numeric threshold from the environment, falling back to the default
+ * when it is unset, blank, or unparseable.
+ *
+ * ⚠️ `Number('')` and `Number('   ')` are **0**, not NaN — so a plain
+ * `Number.isFinite` guard treats a var that is present-but-empty (exactly what
+ * an operator leaves behind after clearing a value in the Render dashboard, and
+ * what `FOO=` in an env file produces) as a deliberate **zero**. That would put
+ * "strong rating ≥ 0" and "substantial count ≥ 0" into the prompt, which
+ * inverts the entire hierarchy: every SKU would qualify as RATING-FIRST and the
+ * weak-count suppression rule could never fire.
+ */
+function pmaxProofThreshold(varName, fallback) {
+  const raw = process.env[varName];
+  if (typeof raw !== 'string' || raw.trim() === '') return fallback;
+  const n = Number(raw.trim());
+  // Negative is as meaningless as blank here — both mean "misconfigured".
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** Strong-rating floor for RATING-FIRST / popularity-framing (default 4.5). */
+function pmaxProofStrongRating() {
+  return pmaxProofThreshold('PMAX_PROOF_STRONG_RATING', 4.5);
+}
+
+/** Minimum review count treated as "substantial" (default 100). */
+function pmaxProofMinReviewCount() {
+  return pmaxProofThreshold('PMAX_PROOF_MIN_REVIEW_COUNT', 100);
+}
+
+function buildPmaxFunnelSpreadBlock() {
+  return [
+    `PMAX FUNNEL SPREAD (absolute for this Google Performance Max round):`,
+    `Google delivers ALL creative for a product into ONE asset group and picks per impression using the viewer's intent signals. Do NOT treat every concept as the same funnel stage — the asset SET must SPAN the funnel. Your ${N_CONCEPTS_ROUND} concepts MUST cover one of each:`,
+    `  awareness     — brand story / lifestyle context / emotional hook; no hard sell; no offer language. Set routing.funnel_stage="awareness".`,
+    `  consideration — benefit + proof (reviews, ratings, differentiators, objection handling). Set routing.funnel_stage="consideration".`,
+    `  conversion    — offer / urgency / explicit action; product hero and clean. Set routing.funnel_stage="conversion".`,
+    `Each concept MUST declare routing.funnel_stage as one of ${PMAX_FUNNEL_STAGES.join('|')}. Across the round, the three stages must each appear exactly once so Google has distinct approaches to test — not cosmetic variations of one ad.`
+  ].join('\n');
+}
+
+function buildPmaxSocialProofHierarchyBlock() {
+  // Interpolate env-backed thresholds — never hardcode the same numbers as
+  // prose literals, or the prompt and config/defaults.env can drift apart.
+  const strongRating = pmaxProofStrongRating();
+  const minCount = pmaxProofMinReviewCount();
+  return [
+    `PMAX SOCIAL-PROOF HIERARCHY (owner creative guidelines — absolute for this round):`,
+    // PRECEDENCE SENTENCE — load-bearing, do not drop. The shared DR block
+    // earlier in this prompt states a different review-count threshold
+    // ("≥4.5 from ≥50") for when a rating is credible to cite. That text is
+    // Meta-tuned and stays untouched, so on a PMax round the model sees two
+    // numbers for a similar-looking decision. Naming which one wins removes
+    // the ambiguity without editing the shared text (which would change the
+    // Meta prompt and break its byte-identity guarantee).
+    `Where this hierarchy and any earlier proof guidance in this prompt disagree — including review-count thresholds — THIS block wins for this destination.`,
+    `One dominant social-proof element per creative. Supporting proof may appear but must stay visually secondary. Never give quote, rating, review count, price, product name and CTA equal weight.`,
+    ``,
+    `Per-SKU decision logic — apply using social_proof_signal values already in the brief:`,
+    `  - Strong rating (≥${strongRating}) AND substantial review count (≥${minCount}) → RATING-FIRST: the star rating dominant, review count supporting, NO quote.`,
+    `  - A short, specific, compelling customer quote → TESTIMONIAL-FIRST: quote is the hero; stars optional and SMALL; usually no count.`,
+    `  - Both strong AND a large canvas (1:1 or 4:5) → COMBINATION allowed, but one must still dominate.`,
+    `  - Weak review volume (count missing or <${minCount}) → do NOT print the count at all (a small number reads as a negative). Use the rating alone, or a quote.`,
+    `  - Rating below ${strongRating} with high volume (≥${minCount}) → prefer POPULARITY framing over the numeric rating (e.g. "Loved by thousands", "18,000+ reviews").`,
+    `  - Strong product photography / premium positioning → PRODUCT-FIRST: minimal or no social proof at all. This is a legitimate concept, not a failure.`,
+    ``,
+    `Concept diversity on the PROOF AXIS: across the round's ${N_CONCEPTS_ROUND} concepts, the DOMINANT proof element must differ — do not return three concepts that all lead with the rating. The proof axis (rating / testimonial / product-hero / offer) is a primary axis of variation, alongside the funnel stage.`
+  ].join('\n');
+}
 
 // ── the objective ────────────────────────────────────────────────────
 //
@@ -1997,6 +2145,50 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       ].join('\n')
     : `AVOID — no prior rounds for this product. You're on round 0; lead with the strongest signal.`;
 
+  // PROOF PRESENCE — computed here in JS rather than left to the model, because
+  // the reserved proof-led slot below must fire on exactly the INVERSE of the
+  // HONESTY RULE's condition. If the two ever both fired, the prompt would
+  // simultaneously demand a proof-led concept and forbid surfacing proof —
+  // the self-contradictory-prompt failure class that cost a full rollback on
+  // the video side (CLAUDE.md §00, PR #61). Reading the same fields the
+  // honesty rule reads is what keeps them mutually exclusive.
+  //
+  // proof_options is included deliberately: when DIRECTOR_PROOF_MENU_ENABLED is
+  // on, a product-scoped run has its brand/category proof withheld from
+  // primary_quote / rating (cross-product copy guard, assembleSignals) yet still
+  // carries usable, SCOPE-LABELLED proof in proof_options. That is precisely the
+  // case this change exists to serve, so it must count as proof here — and the
+  // honesty rule below is amended, under the same flag, to agree.
+  //
+  // TWO CORRECTIONS from adversarial review — both were real, do not undo:
+  //
+  //  1. RATING-BEARING, not merely "any proof". Reserving a slot on the strength
+  //     of a quote or a comment ALONE would actively make things worse:
+  //     INTENTS.social_proof_led.eligible is rating-only (staticAdIntents.js —
+  //     its `core` IS the rating), so a quote-only product would mint
+  //     ai_social_proof_led and then fall straight back to objection_resolved at
+  //     render. That is the exact collapse this change exists to stop, and the
+  //     reserved slot would have amplified it. So the slot is gated on a rating
+  //     actually being reachable.
+  //  2. The proof_options term is gated on the SAME flag as the honesty rule's
+  //     proof_options clause. Ungated, an injected/stale summary carrying
+  //     proof_options while the menu is OFF would fire the reserved slot while
+  //     the (unamended) honesty rule still demanded social_proof_type="none" —
+  //     a self-contradictory prompt, the PR #61 class. Gating both on one flag
+  //     is what makes "exact inverse" true rather than merely intended.
+  const proofSignal   = inputSummary?.social_proof_signal || {};
+  const proofOptions  = (directorProofMenuEnabled() && Array.isArray(proofSignal.proof_options))
+    ? proofSignal.proof_options : [];
+  const optionHasRating = proofOptions.some(o => o && typeof o.rating === 'number' && o.rating > 0);
+  const signalHasRating = !!(proofSignal.rating && typeof proofSignal.rating.value === 'number');
+  const hasUsableProof  = signalHasRating || optionHasRating;
+
+  // PMax-only objective blocks. Computed once so Meta rounds never even
+  // construct the strings (and cannot accidentally pick up a threshold
+  // interpolation). Gate is platformFormat.startsWith('pmax_') — Meta keys
+  // never match, so Meta system/user prompts stay byte-identical.
+  const isPmax = isPmaxPlatformFormat(platformFormat);
+
   const system = [
     `You are a senior creative director planning social-media ad creative.`,
     ``,
@@ -2006,6 +2198,16 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     ``,
     OBJECTIVE_BLOCK,
     ``,
+    // PMax only — funnel span + social-proof hierarchy. Spread into the array
+    // (not concatenated as a single multi-line string) so the join('\n') below
+    // produces the same blank-line rhythm as neighbouring blocks. Empty when
+    // Meta so this splice contributes ZERO characters to the Meta prompt.
+    ...(isPmax ? [
+      buildPmaxFunnelSpreadBlock(),
+      ``,
+      buildPmaxSocialProofHierarchyBlock(),
+      ``
+    ] : []),
     `STRUCTURAL RULES (absolute — violating these ships broken ads):`,
     `- copy.headline / copy.subheadline / copy.eyebrow / copy.cta are the ONLY strings that may appear as letterforms in the ad. Write them as final, shippable copy — not notes, not strategy.`,
     `- art_direction is OPTIONAL visual prose only: mood, light, material, type energy, palette feel. It MUST be null when you have no visual brief. NEVER put honesty-rule notes, "because", "no proof", "leans on", objection analysis, or any "why I chose this" text in art_direction. Those belong exclusively in reasoning.rationale.`,
@@ -2014,11 +2216,29 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     ``,
     `RULES:`,
     `- DO NOT generate coordinates, rects, or pixel positions. The Layout stage materializes pixels from your strategy + media_picks + output_shape declaration.`,
-    `- The ${N_CONCEPTS_ROUND} concepts MUST be meaningfully different — different archetype OR different media-pick combination OR different output_shape OR different copy angle.`,
+    `- The ${N_CONCEPTS_ROUND} concepts MUST be meaningfully different — different archetype OR different creative_style OR different media-pick combination OR different output_shape OR different copy angle.`,
     `- Lead with the STRONGEST signal in the data.`,
-    `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set routing.social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself. Record that choice in reasoning.rationale only — never in art_direction or copy.`,
+    // HONESTY RULE. The flag-ON variant adds the proof_options clause so the rule
+    // cannot fire while the PROOF MENU is simultaneously offering usable,
+    // scope-labelled brand/category proof — see the hasUsableProof comment above.
+    // The flag-OFF string is byte-identical to the pre-change text on purpose:
+    // DIRECTOR_PROOF_MENU_ENABLED=false must restore the old prompt exactly.
+    directorProofMenuEnabled()
+      ? `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null AND social_proof_signal.proof_options is empty, you MUST set routing.social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself. Record that choice in reasoning.rationale only — never in art_direction or copy. When proof_options IS non-empty, proof CAN be backed — but only in that option's own scope, so surface it with its scope wording (see PROOF MENU below), never as this product's own number.`
+      : `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set routing.social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself. Record that choice in reasoning.rationale only — never in art_direction or copy.`,
     ...(directorProofMenuEnabled() ? [
       `- PROOF MENU: social_proof_signal.proof_options[] lists every available proof point across product / category / brand tiers, each with its own pre-scoped "reviews_text" disclosure. Set routing.proof_pick to the 0-based index of the option your copy draws from, or null if you used none of them / relied on primary_quote instead. If you write copy from a category or brand option, your words MUST carry that option's own scope (e.g. "loved across our whole line" / "brand-wide") — NEVER phrase a category or brand number as if it belonged to this specific product. routing.proof_pick does NOT change which number or quote actually renders in the ad's dedicated proof slots — that is decided separately, deterministically, and always truthfully; it only tells us which signal informed your copy, for audit.`
+    ] : []),
+    // RESERVED PROOF-LED SLOT — owner directive 2026-08-07, after social-proof
+    // static ads all but disappeared from production. Emitted ONLY when a RATING
+    // is reachable (see hasUsableProof above), which is both a strict subset of
+    // "honesty rule does not fire" — so the two can never contradict — and the
+    // condition the render-side intent actually requires. Deliberately not a
+    // mechanical post-parse rejection: a thin-data product should degrade to an
+    // honest non-proof concept rather than have a hollow proof ad forced on it,
+    // which is the same reasoning behind INTENTS.social_proof_led's `core`.
+    ...(hasUsableProof ? [
+      `- PROOF-LED COVERAGE: this product has a usable RATING, so at least ONE of your ${N_CONCEPTS_ROUND} concepts MUST set routing.creative_style="social_proof_led" and anchor its composition on that rating (a quote or comment may support it, but the rating is what makes the ad renderable). The other concepts stay free. If you truly cannot ground a proof-led concept on this data, explain why in that concept's reasoning.rationale — do not silently skip it.`
     ] : []),
     // The pick ceiling is derived from the universe actually supplied, not
     // hardcoded. It used to always say "1-4" even when the universe held a
@@ -2061,7 +2281,21 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
         })(),
     `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, and social_proof_signal.primary_quote when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`,
     `- ONE PRODUCT ONLY: every string you write describes product_signal.name and nothing else. brand_signal.* and brand_reviews_summary cover the WHOLE catalog — they are there for voice and tone, never for product facts. Never name, describe, or borrow the attributes of another item (a different garment, cut, fabric, or use case) even when the brand material talks about it. If the brand voice material is about a different product, take only its register and write fresh copy about THIS one. Concretely: a t-shirt ad never mentions leggings, joggers, or their fit.`,
-    `- CREATIVE STYLE: pick one of ${CREATIVE_STYLES_ENUM.join(' | ')} into routing.creative_style.`,
+    // CREATIVE STYLE. This was a bare enum listing with no selection criteria,
+    // and routing.creative_style is what mints Ad.template downstream
+    // (CREATIVE_STYLE_TO_TEMPLATE, campaignAdsGenerationService) where anything
+    // unrecognised falls to 'ai_brand_led'. Measured consequence in production
+    // over 2026-07-30..08-06: brand_led 200+ renders vs social_proof_led 18.
+    // The string "social_proof_led" appeared exactly once in this entire file —
+    // in the enum — and in ZERO guidance, so the model had nothing telling it
+    // when proof is the right angle. Naming brand_led as the last resort is the
+    // deliberate counterweight to that silent default.
+    `- CREATIVE STYLE: set routing.creative_style to the ONE style the concept is actually built on. Choose by what the DATA supports, not by variety alone:`,
+    `    social_proof_led — the visual anchor IS proof: a star rating, a review count, a customer quote, or a creator comment. Pick this whenever social_proof_signal carries a usable rating, primary_quote, or top_comment${directorProofMenuEnabled() ? ' (or any proof_options entry)' : ''}. Proof is the highest-converting angle available and is currently the most under-used style — reach for it when the data is there.`,
+    `    ugc_led — a creator/UGC image is the hero and the concept leans on its authenticity rather than on a claim.`,
+    `    editorial — magazine-style art direction; composition and typography carry the ad, with no proof or offer as the anchor.`,
+    `    promotional — an offer, price, urgency, or a specific objection being dissolved is the headline.`,
+    `    brand_led — brand voice / tagline / positioning carries it. This is the DEFAULT OF LAST RESORT: pick it only when there is no usable proof, no UGC hero, no offer, and no editorial angle. Do not pick it out of habit.`,
     ``,
     formatConstraints,
     ``,
@@ -2099,6 +2333,12 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     platformFormat === 'meta_reels_9_16'
       ? `    output_shape      — { format: 'reels_storyboard', duration_sec, storyboard_beats: [{t_start, t_end, role, position, emphasis}] }`
       : `    output_shape      — { format, tile_count }`,
+    // PMax only — funnel_stage is not a Meta field. Declaring it here on a
+    // Meta prompt would break Meta byte-identity; the schema addition below
+    // is gated the same way.
+    ...(isPmax ? [
+      `    funnel_stage     — awareness | consideration | conversion (declare which stage this concept serves; one of each across the round)`
+    ] : []),
     `  copy                — { headline, subheadline, eyebrow, cta } final strings (nullable per role) — ONLY letterforms`,
     `  art_direction       — null OR { look, palette_hint, typography_hint } visual prose only; null if no visual brief`,
     `  reasoning           — { rationale } PRIVATE: which objection + which signal. Never visual notes.`,
@@ -2290,6 +2530,12 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
   // render path that only reads art_direction / copy cannot reach it. Transport
   // is still response_format json_object (Atlas 400s on strict json_schema for
   // Anthropic); this schema is for the hand-rolled non-fatal validator only.
+  //
+  // funnel_stage is PMax-only (gated below). It lives under routing per the v3
+  // convention; consumers read it via conceptField() (conceptProjection dual-
+  // reads any name — listing it in ROUTING_NESTED_FIELDS is documentation-only
+  // for that module and is out of scope for this change).
+  const isPmax = isPmaxPlatformFormat(platformFormat);
   const routingSchema = {
     type: 'object',
     additionalProperties: false,
@@ -2340,7 +2586,13 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
       // mode, so an omitted property here is a warning candidate, not a
       // parse failure. A Director run from before this shipped, or with the
       // menu flag off, never emits this key at all; that must keep working.
-      proof_pick: { type: ['integer', 'null'] }
+      proof_pick: { type: ['integer', 'null'] },
+      // PMax only — nullable, not required (same soft-validator posture as
+      // proof_pick). Meta schemas omit this key entirely so Meta stays
+      // byte-identical on the schema side too.
+      ...(isPmax ? {
+        funnel_stage: { type: ['string', 'null'], enum: [...PMAX_FUNNEL_STAGES, null] }
+      } : {})
     }
   };
 

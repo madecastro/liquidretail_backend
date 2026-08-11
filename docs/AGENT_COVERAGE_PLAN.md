@@ -1,6 +1,36 @@
 # Agent capability coverage plan
 
-**Status**: Phases 1 + 2 + 3 shipped (2026-08-05). Registry at 38 caps.
+**Status**: Phases 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8a + 9 + 10 + ingestion-coverage shipped (2026-08-06).
+Registry at 84 caps. Phase 8b BLOCKED — none of the five mutation
+targets have backing services (shopifyProductMediaService missing;
+Meta / Google campaign services are read-only; instagram reply is
+automation-only). Full external-write pass needs new service builds.
+
+**Ingestion-coverage pass** (audit follow-up, 5 caps):
+- `media.finalizeUpload` (T1) — closes the media.upload dead-end.
+- `catalog.createProduct` (T1) — URL-based single-product create.
+- `catalog.syncFromInstagram` (T4) — standalone Meta Catalog pull.
+- `posts.syncFromInstagram` (T4) — standalone IG post pull.
+- `catalog.syncFromGenericSitemap` (T4) — standalone sitemap fallback.
+
+Every `Media.source` and `CatalogProduct.source` writer now has an
+agent capability driving it (except system-only paths — webhook,
+scheduled sweep, catalog-product internal wrappers).
+
+- Phase 4 shipped 11 of 12 planned caps — `catalog.pollApifyRun` deferred
+  (no async Apify pattern in this repo today; all sync via
+  `run-sync-get-dataset-items`).
+- Phase 5 shipped 2 of 4 planned caps —
+  `onboarding.createAdvertiser` deferred (chicken-and-egg with agent
+  auth: `requireAuth` presupposes an advertiserId, so the caller already
+  has one and the route's 409 fires immediately); `onboarding.createBrand`
+  deferred as a duplicate of `brand.create` (Phase 3).
+- Phase 6 shipped 5 caps — `layout.create` deferred (no Layout CRUD in
+  the codebase; layouts are derived-per-media via `LayoutInputArtifact`).
+  Reclassed `aiCanvas.testSpec` from T0 to T2 (the underlying
+  `getOrGenerate` fires a Sonnet call; not read-only). Added
+  `aiLayouts.getSession` (T0) as the polling companion to
+  `aiLayouts.generate`.
 
 ## Purpose
 
@@ -67,17 +97,17 @@ lands. Tracked in the Phase 8b backlog row.
 
 | # | Phase | Caps | Tier mix | Rank | Depends on |
 |---|-------|------|----------|------|------------|
-| 1 | Campaigns | 10 | T1 × 8, T2 × 2 | High | — |
-| 2 | Ad curation | 5 | T1 × 5 | High | — |
-| 3 | Brand config | 8 | T1 × 5, T2 × 3 | High | — |
-| 4 | Catalog & media | 12 | T1 × 6, T2 × 2, T4 × 4 | High | — |
-| 5 | Onboarding | 4 | T1 × 3, T4 × 1 | High | Phase 3 (brand.*), Phase 4 (catalog.*) |
-| 6 | Detection & layouts | 5 | T1 × 3, T2 × 2 | Medium | Phase 4 (media.*) |
-| 7 | Team | 5 | T1 × 3, T3 × 2 | Medium | — |
-| 8a | Integrations OAuth | ~10 | T1 × 10 | Medium | — |
-| 8b | External writes | ~5 | T3 × 5 | Medium | 8a + `shopifyProductMediaService` build |
-| 9 | `getContext` + cross-brand | 2 | T0 × 2 | Medium | — |
-| 10 | Sales demos | 7 | T1 × 4, T4 × 3 | Low | Phase 4, 5 |
+| 1 | Campaigns | 10 | T1 × 8, T2 × 2 | ✅ shipped | — |
+| 2 | Ad curation | 5 | T1 × 5 | ✅ shipped | — |
+| 3 | Brand config | 8 | T1 × 5, T2 × 3 | ✅ shipped | — |
+| 4 | Catalog & media | 11 (of 12) | T1 × 6, T2 × 2, T4 × 3 | ✅ shipped | — |
+| 5 | Onboarding | 2 (of 4) | T1 × 1, T4 × 1 | ✅ shipped | — |
+| 6 | Detection & layouts | 5 (of 5, subs) | T0 × 1, T1 × 1, T2 × 3 | ✅ shipped | — |
+| 7 | Team | 5 (of 5) | T1 × 3, T3 × 2 | ✅ shipped | — |
+| 8a | Integrations OAuth | 9 (of ~10) | T0 × 3, T1 × 6 | ✅ shipped | — |
+| 8b | External writes | 0 (of ~5) | T3 × 5 | ⛔ blocked | needs new service builds for all 5 mutation targets |
+| 9 | `getContext` + cross-brand | 2 (of 2) | T0 × 2 | ✅ shipped | — |
+| 10 | Sales demos | 7 (of 7) | T1 × 4, T4 × 3 | ✅ shipped | — |
 
 ## Per-phase risk notes
 

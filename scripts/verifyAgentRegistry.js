@@ -44,6 +44,67 @@ const FILES = [
   'services/capabilityExecutors/adUpdateCta.js',
   'services/capabilityExecutors/platformListFormats.js',
   'services/capabilityExecutors/adList.js',
+  'services/capabilityExecutors/catalogPatchProduct.js',
+  'services/capabilityExecutors/catalogPatchCategories.js',
+  'services/capabilityExecutors/mediaPatchRights.js',
+  'services/capabilityExecutors/mediaDraftProduct.js',
+  'services/capabilityExecutors/mediaDelete.js',
+  'services/capabilityExecutors/mediaUpload.js',
+  'services/capabilityExecutors/catalogInferCategories.js',
+  'services/capabilityExecutors/mediaRefreshInsights.js',
+  'services/capabilityExecutors/catalogDetectProductsFromMedia.js',
+  'services/capabilityExecutors/catalogSyncFromShopifyPublic.js',
+  'services/capabilityExecutors/catalogPullFromApify.js',
+  'services/capabilityExecutors/onboardingDispatchSyncs.js',
+  'services/capabilityExecutors/onboardingCreateBrandFromUrl.js',
+  'services/capabilityExecutors/detectProcess.js',
+  'services/capabilityExecutors/detectRematch.js',
+  'services/capabilityExecutors/aiCanvasTestSpec.js',
+  'services/capabilityExecutors/aiLayoutsGenerate.js',
+  'services/capabilityExecutors/aiLayoutsGetSession.js',
+  'services/capabilityExecutors/teamInviteCreate.js',
+  'services/capabilityExecutors/teamInviteDelete.js',
+  'services/capabilityExecutors/teamInviteAccept.js',
+  'services/capabilityExecutors/teamMemberPatch.js',
+  'services/capabilityExecutors/teamMemberDelete.js',
+  'services/capabilityExecutors/_integrationsAgentCommon.js',
+  'services/capabilityExecutors/integrationsInstagramConnectUrl.js',
+  'services/capabilityExecutors/integrationsInstagramListCredentials.js',
+  'services/capabilityExecutors/integrationsInstagramDisconnect.js',
+  'services/capabilityExecutors/integrationsMetaAdsConnectUrl.js',
+  'services/capabilityExecutors/integrationsMetaAdsListCredentials.js',
+  'services/capabilityExecutors/integrationsMetaAdsDisconnect.js',
+  'services/capabilityExecutors/integrationsGoogleAdsConnectUrl.js',
+  'services/capabilityExecutors/integrationsGoogleAdsListCredentials.js',
+  'services/capabilityExecutors/integrationsGoogleAdsDisconnect.js',
+  'services/capabilityExecutors/agentGetContext.js',
+  'services/capabilityExecutors/agentSearchAcrossBrands.js',
+  'services/capabilityExecutors/_salesDemosCommon.js',
+  'services/capabilityExecutors/salesBootstrap.js',
+  'services/capabilityExecutors/salesBrandCreate.js',
+  'services/capabilityExecutors/salesBrandPatch.js',
+  'services/capabilityExecutors/salesBrandAbort.js',
+  'services/capabilityExecutors/salesBrandSync.js',
+  'services/capabilityExecutors/salesBrandEnrich.js',
+  'services/capabilityExecutors/salesBrandSyncReviews.js',
+  'services/capabilityExecutors/mediaFinalizeUpload.js',
+  'services/capabilityExecutors/catalogCreateProduct.js',
+  'services/capabilityExecutors/catalogSyncFromInstagram.js',
+  'services/capabilityExecutors/postsSyncFromInstagram.js',
+  'services/capabilityExecutors/catalogSyncFromGenericSitemap.js',
+  'services/capabilityExecutors/adRegenerate.js',
+  'services/capabilityExecutors/mediaRefreshInsightsForBrand.js',
+  'services/capabilityExecutors/mediaRefreshCommentsFromApify.js',
+  'services/capabilityExecutors/catalogRefreshReviewsForProduct.js',
+  'services/capabilityExecutors/catalogInferCategoriesForBrand.js',
+  'services/capabilityExecutors/catalogRefreshDetails.js',
+  'services/capabilityExecutors/mediaSourceSummary.js',
+  'services/capabilityExecutors/dbQuery.js',
+  'services/capabilityExecutors/catalogListProductsWithoutAds.js',
+  'services/capabilityExecutors/mediaAttachTo.js',
+  'services/capabilityExecutors/mediaDetachFrom.js',
+  'services/capabilityExecutors/mediaListAssignments.js',
+  'services/mediaAssignmentService.js',
   'services/catalogProductReviewRefreshService.js',
   'services/catalogProductLifestyleImageService.js',
   'services/spendGuard.js',
@@ -71,16 +132,46 @@ assert(Array.isArray(registry.CAPABILITIES) && registry.CAPABILITIES.length > 0,
 const ids = registry.CAPABILITIES.map((c) => c.id);
 assert(new Set(ids).size === ids.length, `capability ids unique`);
 
-// Every execute path resolves to a real file.
+// Every execute path resolves to a real file via the SAME resolver
+// production uses. Previously this check did its own path munging
+// (path.join(__dirname, '..', 'services', rel)) which shipped a T4
+// module-not-found in prod on 2026-08-06 — the raw require path used
+// by routes/agent.js was different from what the verifier tested.
+// Fixed by centralizing on registry.resolveExecutorPath.
+assert(typeof registry.resolveExecutorPath === 'function',
+  `capabilityRegistry exports resolveExecutorPath`);
 for (const c of registry.CAPABILITIES) {
   if (c.execute?.kind !== 'service') continue;
   const rel = c.execute.service;
   try {
-    // require handles resolution incl. ./
-    require(rel.startsWith('.') ? path.join(__dirname, '..', 'services', rel) : rel);
+    const resolved = registry.resolveExecutorPath(c);
+    require(resolved);
     ok(`executor loads: ${c.id} → ${rel}`);
   } catch (err) {
     fail(`executor missing: ${c.id} → ${rel}`, err.message);
+  }
+}
+
+// Regression guard — no dispatch site may raw-require cap.execute.service
+// (that's the 2026-08-06 bug pattern). Every require of an executor path
+// MUST go through registry.resolveExecutorPath so the resolver anchors
+// the './capabilityExecutors/...' path to services/, not to whichever
+// file called require.
+{
+  const filesToScan = ['routes/agent.js', 'services/agentTools.js'];
+  for (const rel of filesToScan) {
+    const abs = path.join(__dirname, '..', rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    // Match any `require(<something>.execute.service)` pattern —
+    // that's the exact shape that shipped the bug.
+    const rawRequire = /require\(\s*[a-zA-Z_$][\w$]*\.execute\.service\s*\)/;
+    assert(!rawRequire.test(src),
+      `${rel}: no raw require(cap.execute.service) — must funnel through registry.resolveExecutorPath (2026-08-06 outage regression)`);
+    // Every dispatch site should mention resolveExecutorPath at least
+    // once — quick belt-and-suspenders that the fix hasn't been
+    // silently reverted.
+    assert(/resolveExecutorPath/.test(src),
+      `${rel}: references resolveExecutorPath (dispatcher funnel)`);
   }
 }
 
@@ -371,9 +462,49 @@ async function checkSpendGuard() {
     const g = await guard.check({ advertiserId: '000000000000000000000000', capability: free, args: {} });
     assert(g.allowed === true, `spendGuard: allows zero-estimate capability trivially`);
   }
-  // 4. dailyCap() reads AGENT_DAILY_CAP_USD (or 10 default). Sanity.
-  assert(typeof guard.dailyCap() === 'number' && guard.dailyCap() > 0,
-    `spendGuard.dailyCap() returns a positive number`);
+  // 4. dailyCap() reads AGENT_DAILY_CAP_USD. Semantics: positive → the
+  //    cap; 0 (or unset) → null meaning DISABLED. The verifier tolerates
+  //    either shape but pins the semantics: never NaN, never a negative
+  //    number, never a random object.
+  {
+    const c = guard.dailyCap();
+    assert(c === null || (typeof c === 'number' && c > 0),
+      `spendGuard.dailyCap() returns null (disabled) OR a positive number (enabled) — got ${JSON.stringify(c)}`);
+  }
+  // 5. When AGENT_DAILY_CAP_USD is disabled (0 or unset) and a Tier 2
+  //    capability with a POSITIVE estimateUsd is checked, the guard
+  //    must short-circuit allowed:true without reading CostLog — a
+  //    live Mongoose call from here would time out in the offline
+  //    verifier and fail this check.
+  {
+    const priorEnv = process.env.AGENT_DAILY_CAP_USD;
+    process.env.AGENT_DAILY_CAP_USD = '0';
+    try {
+      const priced = { id: 'test.priced', tier: 2, estimateUsd: 0.15 };
+      const g = await guard.check({
+        advertiserId: '000000000000000000000000',
+        capability: priced,
+        args: {}
+      });
+      assert(g.allowed === true && g.dailyCap === null,
+        `spendGuard: cap disabled → allowed:true, dailyCap:null (short-circuits CostLog read)`);
+    } finally {
+      if (priorEnv === undefined) delete process.env.AGENT_DAILY_CAP_USD;
+      else process.env.AGENT_DAILY_CAP_USD = priorEnv;
+    }
+  }
+  // 6. When AGENT_DAILY_CAP_USD is a positive number, dailyCap()
+  //    returns it verbatim. Guards against silent floor coercion.
+  {
+    const priorEnv = process.env.AGENT_DAILY_CAP_USD;
+    process.env.AGENT_DAILY_CAP_USD = '25.5';
+    try {
+      assert(guard.dailyCap() === 25.5, `spendGuard.dailyCap() returns the env value verbatim`);
+    } finally {
+      if (priorEnv === undefined) delete process.env.AGENT_DAILY_CAP_USD;
+      else process.env.AGENT_DAILY_CAP_USD = priorEnv;
+    }
+  }
 }
 
 // Endpoint plumbing for Tier 2.
@@ -728,6 +859,1694 @@ async function checkSurfaceWideningExecutors() {
     `adUpdateCta: 61-char ctaText rejected`);
 }
 
+// ── 15. Phase 4 — catalog & media patch executors ─────────────────
+console.log('\n[15] Phase 4 patch executors');
+
+for (const id of ['catalog.patchProduct', 'catalog.patchCategories', 'media.patchRights']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 1, `${id}: tier === 1`);
+}
+assert(registry.capabilityById('catalog.patchProduct')?.scope === 'product',
+  `catalog.patchProduct: scope === 'product'`);
+assert(registry.capabilityById('catalog.patchCategories')?.scope === 'brand',
+  `catalog.patchCategories: scope === 'brand'`);
+assert(registry.capabilityById('media.patchRights')?.scope === 'brand',
+  `media.patchRights: scope === 'brand'`);
+
+async function checkPhase4PatchExecutors() {
+  const noScope = {};
+  const catalogPatchProduct    = require('../services/capabilityExecutors/catalogPatchProduct');
+  const catalogPatchCategories = require('../services/capabilityExecutors/catalogPatchCategories');
+  const mediaPatchRights       = require('../services/capabilityExecutors/mediaPatchRights');
+
+  // Tenant-guard — covered by checkTenantGuard loop, but assert the
+  // specific message so a future refactor can't silently swap in a
+  // generic 500-shaped fallback.
+  const p1 = await catalogPatchProduct.run({ req: noScope, args: {} });
+  assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+    `catalogPatchProduct: no-scope → rejects`);
+  const p2 = await catalogPatchProduct.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(p2.ok === false && /productId required/i.test(p2.error),
+    `catalogPatchProduct: missing productId → rejects`);
+  const p3 = await catalogPatchProduct.run({ req: { advertiserId: 'x' }, args: { productId: 'nope' } });
+  assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+    `catalogPatchProduct: invalid productId → rejects`);
+  const p4 = await catalogPatchProduct.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { productId: '000000000000000000000000' }
+  });
+  assert(p4.ok === false && /updates required/i.test(p4.error),
+    `catalogPatchProduct: missing updates → rejects`);
+  const p5 = await catalogPatchProduct.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { productId: '000000000000000000000000', updates: { hackField: 'evil' } }
+  });
+  assert(p5.ok === false && /unknown field/i.test(p5.error),
+    `catalogPatchProduct: unknown update key rejected (agent can't sneak in videoSettings)`);
+  const p6 = await catalogPatchProduct.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { productId: '000000000000000000000000', updates: { price: 'not-a-number' } }
+  });
+  assert(p6.ok === false && /price/i.test(p6.error),
+    `catalogPatchProduct: non-numeric price rejected`);
+
+  const c1 = await catalogPatchCategories.run({ req: noScope, args: {} });
+  assert(c1.ok === false && /advertiser scope/i.test(c1.error),
+    `catalogPatchCategories: no-scope → rejects`);
+  const c2 = await catalogPatchCategories.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(c2.ok === false && /categoryId required/i.test(c2.error),
+    `catalogPatchCategories: missing categoryId → rejects`);
+  const c3 = await catalogPatchCategories.run({ req: { advertiserId: 'x' }, args: { categoryId: 'nope' } });
+  assert(c3.ok === false && /valid ObjectId/i.test(c3.error),
+    `catalogPatchCategories: invalid categoryId → rejects`);
+  const c4 = await catalogPatchCategories.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { categoryId: '000000000000000000000000', updates: { hack: true } }
+  });
+  assert(c4.ok === false && /unknown field/i.test(c4.error),
+    `catalogPatchCategories: unknown update key rejected`);
+
+  const m1 = await mediaPatchRights.run({ req: noScope, args: {} });
+  assert(m1.ok === false && /advertiser scope/i.test(m1.error),
+    `mediaPatchRights: no-scope → rejects`);
+  const m2 = await mediaPatchRights.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(m2.ok === false && /mediaId required/i.test(m2.error),
+    `mediaPatchRights: missing mediaId → rejects`);
+  const m3 = await mediaPatchRights.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(m3.ok === false && /valid ObjectId/i.test(m3.error),
+    `mediaPatchRights: invalid mediaId → rejects`);
+  const m4 = await mediaPatchRights.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000' }
+  });
+  assert(m4.ok === false && /approved.*boolean.*required/i.test(m4.error),
+    `mediaPatchRights: missing approved → rejects`);
+  const m5 = await mediaPatchRights.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', approved: 'yes' }
+  });
+  assert(m5.ok === false && /approved.*boolean/i.test(m5.error),
+    `mediaPatchRights: non-boolean approved rejected`);
+  const m6 = await mediaPatchRights.run({
+    req:  { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', approved: true, notes: 'x'.repeat(2001) }
+  });
+  assert(m6.ok === false && /notes too long/i.test(m6.error),
+    `mediaPatchRights: 2001-char notes rejected`);
+}
+
+// ── 16. Phase 4 — media draftProduct / delete / upload ────────────
+console.log('\n[16] Phase 4 media draftProduct / delete / upload');
+
+for (const id of ['media.draftProduct', 'media.delete', 'media.upload']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 1, `${id}: tier === 1`);
+}
+
+async function checkPhase4MediaExecutors() {
+  const noScope = {};
+  const draftProduct = require('../services/capabilityExecutors/mediaDraftProduct');
+  const del          = require('../services/capabilityExecutors/mediaDelete');
+  const upload       = require('../services/capabilityExecutors/mediaUpload');
+
+  const d1 = await draftProduct.run({ req: noScope, args: {} });
+  assert(d1.ok === false && /advertiser scope/i.test(d1.error),
+    `mediaDraftProduct: no-scope → rejects`);
+  const d2 = await draftProduct.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(d2.ok === false && /mediaId required/i.test(d2.error),
+    `mediaDraftProduct: missing mediaId → rejects`);
+  const d3 = await draftProduct.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(d3.ok === false && /valid ObjectId/i.test(d3.error),
+    `mediaDraftProduct: invalid mediaId → rejects`);
+
+  const dl1 = await del.run({ req: noScope, args: {} });
+  assert(dl1.ok === false && /advertiser scope/i.test(dl1.error),
+    `mediaDelete: no-scope → rejects`);
+  const dl2 = await del.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(dl2.ok === false && /mediaId required/i.test(dl2.error),
+    `mediaDelete: missing mediaId → rejects`);
+  const dl3 = await del.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(dl3.ok === false && /valid ObjectId/i.test(dl3.error),
+    `mediaDelete: invalid mediaId → rejects`);
+
+  const u1 = await upload.run({ req: noScope, args: {} });
+  assert(u1.ok === false && /advertiser scope/i.test(u1.error),
+    `mediaUpload: no-scope → rejects`);
+  const u2 = await upload.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(u2.ok === false && /brandId required/i.test(u2.error),
+    `mediaUpload: missing brandId → rejects`);
+  const u3 = await upload.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(u3.ok === false && /valid ObjectId/i.test(u3.error),
+    `mediaUpload: invalid brandId → rejects`);
+  const u4 = await upload.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', resourceType: 'audio' }
+  });
+  assert(u4.ok === false && /resourceType must be one of/i.test(u4.error),
+    `mediaUpload: rejects resourceType outside {image, video}`);
+}
+
+// ── 31. catalog.listProductsWithoutAds ────────────────────────────
+console.log('\n[31] catalog.listProductsWithoutAds');
+
+{
+  const c = registry.capabilityById('catalog.listProductsWithoutAds');
+  assert(c, `capability "catalog.listProductsWithoutAds" registered`);
+  if (c) {
+    assert(c.tier === 0, `catalog.listProductsWithoutAds: tier === 0`);
+    assert(c.scope === 'brand', `catalog.listProductsWithoutAds: scope === 'brand'`);
+  }
+}
+
+async function checkProductsWithoutAds() {
+  const exec = require('../services/capabilityExecutors/catalogListProductsWithoutAds');
+  const noScope = {};
+  const r1 = await exec.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `catalogListProductsWithoutAds: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /brandId required/i.test(r2.error),
+    `catalogListProductsWithoutAds: missing brandId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `catalogListProductsWithoutAds: invalid brandId → rejects`);
+  const r4 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', kind: 'audio' }
+  });
+  assert(r4.ok === false && /kind must be/i.test(r4.error),
+    `catalogListProductsWithoutAds: rejects kind outside {image, video}`);
+  const r5 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', statuses: [] }
+  });
+  assert(r5.ok === false && /statuses must be a non-empty array/i.test(r5.error),
+    `catalogListProductsWithoutAds: empty statuses array rejected`);
+}
+
+// ── 35. UGC-ads Phase 1: media.attachTo / detachFrom / listAssignments ──
+console.log('\n[35] Media assignment executors');
+
+for (const [id, tier] of [
+  ['media.listAssignments', 0],
+  ['media.attachTo',        1],
+  ['media.detachFrom',      1]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+async function checkMediaAssignmentExecutors() {
+  const noScope = {};
+  const attach   = require('../services/capabilityExecutors/mediaAttachTo');
+  const detach   = require('../services/capabilityExecutors/mediaDetachFrom');
+  const listCap  = require('../services/capabilityExecutors/mediaListAssignments');
+
+  // Tenant + args guards (all before DB).
+  for (const [name, exec] of [
+    ['mediaAttachTo',        attach],
+    ['mediaDetachFrom',      detach],
+    ['mediaListAssignments', listCap]
+  ]) {
+    const r1 = await exec.run({ req: noScope, args: {} });
+    assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+      `${name}: no-scope → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r2.ok === false && /mediaId required/i.test(r2.error),
+      `${name}: missing mediaId → rejects`);
+    const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+    assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+      `${name}: invalid mediaId → rejects`);
+  }
+
+  // attachTo: targetType enum + targetId dependency (reachable pre-DB).
+  const OID = '000000000000000000000000';
+  const a1 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID }
+  });
+  assert(a1.ok === false && /targetType must be one of/i.test(a1.error),
+    `mediaAttachTo: missing targetType → rejects`);
+  const a2 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'bogus' }
+  });
+  assert(a2.ok === false && /targetType must be one of/i.test(a2.error),
+    `mediaAttachTo: bogus targetType rejected`);
+  const a3 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'product' }
+  });
+  assert(a3.ok === false && /targetId required/i.test(a3.error),
+    `mediaAttachTo: targetType=product without targetId → rejects`);
+  const a4 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'product', targetId: 'nope' }
+  });
+  assert(a4.ok === false && /valid ObjectId/i.test(a4.error),
+    `mediaAttachTo: invalid targetId → rejects`);
+  const a5 = await attach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'promotional', productIds: new Array(51).fill(OID) }
+  });
+  assert(a5.ok === false && /50 product callouts/i.test(a5.error),
+    `mediaAttachTo: >50 promotional productIds rejected`);
+
+  // detachFrom: same shape.
+  const d1 = await detach.run({
+    req: { advertiserId: OID },
+    args: { mediaId: OID, targetType: 'product' }
+  });
+  assert(d1.ok === false && /targetId required/i.test(d1.error),
+    `mediaDetachFrom: targetType=product without targetId → rejects`);
+}
+
+// ── 30. db.query (security-critical structured read) ─────────────
+console.log('\n[30] db.query security invariants');
+
+{
+  const c = registry.capabilityById('db.query');
+  assert(c, `capability "db.query" registered`);
+  if (c) {
+    assert(c.tier === 0, `db.query: tier === 0`);
+    assert(c.scope === 'advertiser', `db.query: scope === 'advertiser'`);
+    // Args schema must enum-restrict the collection — if this
+    // regresses the LLM could pass an arbitrary string and hit an
+    // executor error, but the collection allowlist would still fire.
+    // Still, the enum at the schema layer is defense in depth.
+    const collectionEnum = c.args?.properties?.collection?.enum;
+    assert(Array.isArray(collectionEnum) && collectionEnum.length > 0,
+      `db.query: args.collection has enum allowlist`);
+  }
+}
+
+async function checkDbQueryInvariants() {
+  const noScope = {};
+  const dbQ = require('../services/capabilityExecutors/dbQuery');
+  const advertiserId = '000000000000000000000000';
+
+  // Tenant guard.
+  const r1 = await dbQ.run({ req: noScope, args: { collection: 'Media' } });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `dbQuery: no-scope → rejects`);
+
+  // Missing collection.
+  const r2 = await dbQ.run({ req: { advertiserId }, args: {} });
+  assert(r2.ok === false && /collection required/i.test(r2.error),
+    `dbQuery: missing collection → rejects`);
+
+  // Unknown collection — the allowlist rejects even collections that
+  // technically exist in Mongo (IntegrationCredential, User, etc.).
+  const r3 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'IntegrationCredential' }
+  });
+  assert(r3.ok === false && /not in the allowlist/i.test(r3.error),
+    `dbQuery: IntegrationCredential collection rejected — SECURITY REGRESSION IF THIS FAILS`);
+  const r4 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'User' }
+  });
+  assert(r4.ok === false && /not in the allowlist/i.test(r4.error),
+    `dbQuery: User collection rejected — PII SECURITY REGRESSION IF THIS FAILS`);
+  const r5 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'CostLog' }
+  });
+  assert(r5.ok === false && /not in the allowlist/i.test(r5.error),
+    `dbQuery: CostLog collection rejected`);
+
+  // Root-level $or / $and / $where / $expr rejected.
+  for (const op of ['$or', '$and', '$where', '$expr', '$nor']) {
+    const r = await dbQ.run({
+      req: { advertiserId },
+      args: { collection: 'Media', filter: { [op]: [{ source: 'instagram' }] } }
+    });
+    assert(r.ok === false && /disallowed/i.test(r.error),
+      `dbQuery: root filter operator ${op} rejected — SECURITY REGRESSION IF THIS FAILS`);
+  }
+
+  // Unlisted filter key rejected.
+  const r6 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: { subjects: 'anything' } }
+  });
+  assert(r6.ok === false && /not in the allowlist/i.test(r6.error),
+    `dbQuery: unlisted filter key "subjects" on Media rejected`);
+
+  // Disallowed operator inside a filter clause.
+  const r7 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: { source: { $regex: '.*' } } }
+  });
+  assert(r7.ok === false && /disallowed operator/i.test(r7.error),
+    `dbQuery: $regex operator inside filter clause rejected`);
+
+  // $in / $nin array length cap.
+  const bigIn = Array.from({ length: 100 }, (_, i) => `val-${i}`);
+  const r8 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: { source: { $in: bigIn } } }
+  });
+  assert(r8.ok === false && /array too long/i.test(r8.error),
+    `dbQuery: $in array > 20 rejected`);
+
+  // Too many filter keys.
+  const bigFilter = {};
+  for (let i = 0; i < 10; i++) bigFilter[`unknown_${i}`] = 'x';
+  const r9 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', filter: bigFilter }
+  });
+  assert(r9.ok === false && /too many keys/i.test(r9.error),
+    `dbQuery: >6 filter keys rejected`);
+
+  // Unsortable field rejected.
+  const r10 = await dbQ.run({
+    req: { advertiserId },
+    args: { collection: 'Media', sort: { fileUrl: 1 } }
+  });
+  assert(r10.ok === false && /not sortable/i.test(r10.error),
+    `dbQuery: unsortable field on Media rejected`);
+
+  // limit clamped hard.
+  {
+    const r = await dbQ.run({
+      req: { advertiserId },
+      args: { collection: 'Media', limit: 500 }
+    });
+    // limit=500 is JSON-schema-invalid at the args layer, so
+    // capabilitiesToTools' schema would reject it upstream. Here we
+    // bypass the schema — the executor still clamps to HARD_LIMIT.
+    // The result may fail to hit DB in offline mode, so accept
+    // either ok:false with a plausible reason OR success. We only
+    // care that a huge limit never propagates as-is.
+    if (r.ok) {
+      assert(r.data.rows.length <= 20, `dbQuery: limit clamped to <=20 (got ${r.data.rows.length})`);
+    } else {
+      ok(`dbQuery: limit=500 request errored cleanly (offline DB) — ${r.error?.slice(0, 60) || ''}`);
+    }
+  }
+
+  // Load-bearing regression: tenant filter must be INJECTED even if
+  // the LLM sends its own advertiserId in the filter. Every
+  // collection is either tenantField='advertiserId' OR
+  // tenantMode='via-brand'. Neither shape allows filtering by
+  // advertiserId directly.
+  for (const [name, spec] of Object.entries(dbQ.COLLECTIONS)) {
+    assert(!spec.filterable.has('advertiserId'),
+      `dbQuery: ${name}.filterable does NOT include advertiserId — server-injected only, LLM cannot spoof`);
+    const hasField = spec.tenantField === 'advertiserId';
+    const hasMode  = spec.tenantMode === 'via-brand';
+    assert(hasField || hasMode,
+      `dbQuery: ${name} must declare either tenantField='advertiserId' OR tenantMode='via-brand'`);
+    assert(!(hasField && hasMode),
+      `dbQuery: ${name} must NOT declare both tenantField and tenantMode`);
+  }
+  // Source-scan: the executor MUST assign tenantField into the safe
+  // filter before the .find(). If someone removes that line, the
+  // whole capability turns into a cross-tenant read primitive.
+  // Revert-proven — removing this assignment fails the check.
+  {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'capabilityExecutors', 'dbQuery.js'), 'utf8');
+    assert(/safeFilter\[spec\.tenantField\]\s*=\s*new mongoose\.Types\.ObjectId\(req\.advertiserId\)/.test(src),
+      `dbQuery.js: safeFilter[spec.tenantField] = ObjectId(req.advertiserId) present — CROSS-TENANT LEAK IF THIS FAILS`);
+    // via-brand collections require the brand-set clamp that
+    // OVERWRITES whatever brandId the LLM sent. Assert the executor
+    // has that assignment line — a regression here allows foreign-
+    // brandId leakage on Ad and any future via-brand collection.
+    assert(/safeFilter\.brandId\s*=\s*\{\s*\$in:\s*injected\s*\}/.test(src),
+      `dbQuery.js: safeFilter.brandId = { $in: injected } present for via-brand path — CROSS-TENANT LEAK IF THIS FAILS`);
+    // Every via-brand collection MUST NOT declare tenantField —
+    // that would be a semantic contradiction and could confuse a
+    // future refactor into filtering by advertiserId on a doc
+    // without the field.
+    for (const [name, spec] of Object.entries(dbQ.COLLECTIONS)) {
+      if (spec.tenantMode === 'via-brand') {
+        assert(!spec.tenantField,
+          `dbQuery: ${name}.tenantField must be unset when tenantMode='via-brand'`);
+        assert(spec.filterable.has('brandId'),
+          `dbQuery: ${name}.filterable must include brandId (server enforces the $in clamp on it)`);
+      }
+    }
+  }
+
+  // Foreign-brandId rejection — the load-bearing invariant on the
+  // via-brand path. If the LLM passes a brandId not under the
+  // caller's advertiser, the executor MUST reject BEFORE hitting Ad.
+  // Offline this requires a real Brand lookup — the empty advertiser
+  // (000...0) has zero brands, so the executor returns an empty
+  // result set rather than a rejection. Instead assert the code
+  // path exists via source-scan.
+  {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'capabilityExecutors', 'dbQuery.js'), 'utf8');
+    assert(/not under this advertiser/.test(src),
+      `dbQuery.js: rejects foreign brandId in the via-brand branch`);
+    assert(/ownBrandIds/.test(src),
+      `dbQuery.js: via-brand branch pre-resolves ownBrandIds`);
+  }
+
+  // Regression: projection must NOT include known-sensitive fields.
+  // If someone extends the projection with these, the harness fails.
+  const FORBIDDEN_FIELDS = [
+    'accessTokenEnc', 'refreshTokenEnc',
+    'passwordHash',
+    'promptSystem', 'promptUser',   // stored on artifacts — LLM prompt IP
+    'rawData',                       // CatalogProduct blob — up to 8KB
+    'specs', 'sellers'               // CatalogProduct SerpAPI blobs
+  ];
+  for (const [name, spec] of Object.entries(dbQ.COLLECTIONS)) {
+    for (const forbidden of FORBIDDEN_FIELDS) {
+      assert(spec.projection[forbidden] !== 1,
+        `dbQuery: ${name}.projection does NOT include ${forbidden} — LEAK REGRESSION IF THIS FAILS`);
+    }
+  }
+
+  // HARD_LIMIT must not silently balloon.
+  assert(dbQ.HARD_LIMIT === 20, `dbQuery: HARD_LIMIT === 20 (LLM must not exfiltrate more per call)`);
+
+  // ALLOWED_OPERATORS must not silently gain $regex / $where / $expr.
+  for (const banned of ['$regex', '$where', '$expr', '$or', '$and', '$lookup', '$function', '$elemMatch']) {
+    assert(!dbQ.ALLOWED_OPERATORS.has(banned),
+      `dbQuery: ALLOWED_OPERATORS does NOT include ${banned}`);
+  }
+}
+
+// ── 29. media.sourceSummary + system-prompt steering ──────────────
+console.log('\n[29] media.sourceSummary');
+
+{
+  const c = registry.capabilityById('media.sourceSummary');
+  assert(c, `capability "media.sourceSummary" registered`);
+  if (c) {
+    assert(c.tier === 0, `media.sourceSummary: tier === 0`);
+    assert(c.scope === 'brand', `media.sourceSummary: scope === 'brand'`);
+  }
+}
+
+async function checkMediaSourceSummary() {
+  const noScope = {};
+  const exec = require('../services/capabilityExecutors/mediaSourceSummary');
+  const r1 = await exec.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `mediaSourceSummary: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /brandId required/i.test(r2.error),
+    `mediaSourceSummary: missing brandId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `mediaSourceSummary: invalid brandId → rejects`);
+}
+
+// System-prompt must include the source-summary steering — if this
+// regresses, the LLM will fall back to the credentials-based
+// inference that shipped the bug in the 2026-08-06 transcript.
+{
+  const agentSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'agent.js'), 'utf8');
+  assert(/media\.sourceSummary/.test(agentSrc),
+    `routes/agent.js system prompt mentions media.sourceSummary`);
+  assert(/AUTHORITATIVE signal/.test(agentSrc),
+    `routes/agent.js system prompt steers away from credentials-based ingestion inference`);
+}
+
+// ── 28. Catalog product refresh trio ──────────────────────────────
+console.log('\n[28] Catalog product refresh trio');
+
+for (const [id, tier, wantWorkflow] of [
+  ['catalog.refreshReviewsForProduct', 2, false],
+  ['catalog.inferCategoriesForBrand',  4, true],
+  ['catalog.refreshDetails',           4, true]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === tier, `${id}: tier === ${tier}`);
+    if (wantWorkflow) {
+      assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+      assert(!c.execute?.method, `${id}: no execute.method (workflow)`);
+    }
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared`);
+  }
+}
+
+async function checkCatalogRefreshTrio() {
+  const noScope = {};
+  const single   = require('../services/capabilityExecutors/catalogRefreshReviewsForProduct');
+  const bulkCat  = require('../services/capabilityExecutors/catalogInferCategoriesForBrand');
+  const details  = require('../services/capabilityExecutors/catalogRefreshDetails');
+
+  // Single-product exec — run() only.
+  const s1 = await single.run({ req: noScope, args: {} });
+  assert(s1.ok === false && /advertiser scope/i.test(s1.error),
+    `catalogRefreshReviewsForProduct: no-scope → rejects`);
+  const s2 = await single.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(s2.ok === false && /productId required/i.test(s2.error),
+    `catalogRefreshReviewsForProduct: missing productId → rejects`);
+  const s3 = await single.run({ req: { advertiserId: 'x' }, args: { productId: 'nope' } });
+  assert(s3.ok === false && /valid ObjectId/i.test(s3.error),
+    `catalogRefreshReviewsForProduct: invalid productId → rejects`);
+
+  // Bulk category + details — preview/execute.
+  for (const [name, exec] of [
+    ['catalogInferCategoriesForBrand', bulkCat],
+    ['catalogRefreshDetails',          details]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p1 = await exec.preview({ req: noScope, args: {} });
+    assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+      `${name}.preview: no-scope → rejects`);
+    const e1 = await exec.execute({ req: noScope, args: {} });
+    assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+      `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error),
+      `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+      `${name}.preview: invalid brandId → rejects`);
+  }
+}
+
+// ── 27. Bulk refresh + Apify comments ─────────────────────────────
+console.log('\n[27] Bulk refresh + Apify comments');
+
+for (const id of ['media.refreshInsightsForBrand', 'media.refreshCommentsFromApify']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === 4, `${id}: tier === 4`);
+    assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared`);
+  }
+}
+
+async function checkBulkRefreshExecutors() {
+  const noScope = {};
+  const oauthBulk = require('../services/capabilityExecutors/mediaRefreshInsightsForBrand');
+  const apifyBulk = require('../services/capabilityExecutors/mediaRefreshCommentsFromApify');
+
+  for (const [name, exec] of [
+    ['mediaRefreshInsightsForBrand', oauthBulk],
+    ['mediaRefreshCommentsFromApify', apifyBulk]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p1 = await exec.preview({ req: noScope, args: {} });
+    assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+      `${name}.preview: no-scope → rejects`);
+    const e1 = await exec.execute({ req: noScope, args: {} });
+    assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+      `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error),
+      `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+      `${name}.preview: invalid brandId → rejects`);
+  }
+}
+
+// Apify service export sanity — the ingest wrapper the T4 executor
+// calls must exist. Cheap import check.
+{
+  const apifyIngest = require('../services/apifyIngestService');
+  assert(typeof apifyIngest.syncBrandInstagramCommentsApify === 'function',
+    `apifyIngestService.syncBrandInstagramCommentsApify exported`);
+  const apifyPull = require('../services/apifyPullService');
+  assert(typeof apifyPull.pullInstagramComments === 'function',
+    `apifyPullService.pullInstagramComments exported`);
+}
+
+// ── 26. ad.regenerate + AGENT_MAX_MESSAGES opt-in cap ─────────────
+console.log('\n[26] ad.regenerate + messages cap');
+
+{
+  const c = registry.capabilityById('ad.regenerate');
+  assert(c, `capability "ad.regenerate" registered`);
+  if (c) {
+    assert(c.tier === 2, `ad.regenerate: tier === 2`);
+    assert(c.scope === 'ad', `ad.regenerate: scope === 'ad'`);
+    // Dynamic estimator — a function, not a number.
+    assert(typeof c.estimateUsd === 'function',
+      `ad.regenerate: estimateUsd is a function (per-kind resolver)`);
+  }
+}
+
+async function checkAdRegenerateExecutor() {
+  const noScope = {};
+  const exec = require('../services/capabilityExecutors/adRegenerate');
+  assert(typeof exec.estimateUsd === 'function',
+    `adRegenerate.estimateUsd exported`);
+  // Estimator is fail-closed — a missing/invalid adId returns the
+  // upper bound so we never under-reserve.
+  const upper = await exec.estimateUsd({ adId: 'nope' });
+  assert(upper === 3.00,
+    `adRegenerate.estimateUsd: invalid adId → upper bound $3.00 (fail-closed)`);
+  const missing = await exec.estimateUsd({});
+  assert(missing === 3.00,
+    `adRegenerate.estimateUsd: missing adId → upper bound $3.00`);
+
+  // Argument-shape guards — reachable without DB.
+  const r1 = await exec.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `adRegenerate: no-scope → rejects`);
+  const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /adId required/i.test(r2.error),
+    `adRegenerate: missing adId → rejects`);
+  const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { adId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `adRegenerate: invalid adId → rejects`);
+  const r4 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000', mode: 'bogus' }
+  });
+  assert(r4.ok === false && /mode must be one of/i.test(r4.error),
+    `adRegenerate: bogus mode rejected before DB`);
+  const r5 = await exec.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { adId: '000000000000000000000000', note: 'x'.repeat(4001) }
+  });
+  assert(r5.ok === false && /note too long/i.test(r5.error),
+    `adRegenerate: 4001-char note rejected`);
+}
+
+// AGENT_MAX_MESSAGES cap is opt-in — 0 disables. Confirm the route
+// only enforces the cap when it's a positive integer, so an over-
+// zealous default doesn't silently block long histories.
+{
+  const agentSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'agent.js'), 'utf8');
+  assert(/MAX_MESSAGES\s*>\s*0/.test(agentSrc),
+    `routes/agent.js gates the messages cap on MAX_MESSAGES > 0`);
+  // The defaults.env value should be 0 while the drawer catches up
+  // with client-side compaction. A committed non-zero default would
+  // silently reintroduce the trip we just diagnosed.
+  const defaultsSrc = fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8');
+  assert(/^AGENT_MAX_MESSAGES\s*=\s*0\s*$/m.test(defaultsSrc),
+    `config/defaults.env has AGENT_MAX_MESSAGES=0 (disabled)`);
+}
+
+// ── 25. Ingestion coverage — P1-P4 ────────────────────────────────
+console.log('\n[25] Ingestion coverage P1-P4');
+
+for (const [id, tier, isWorkflow] of [
+  ['media.finalizeUpload',              1, false],
+  ['catalog.createProduct',             1, false],
+  ['catalog.syncFromInstagram',         4, true],
+  ['posts.syncFromInstagram',           4, true],
+  ['catalog.syncFromGenericSitemap',    4, true]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === tier, `${id}: tier === ${tier}`);
+    if (isWorkflow) {
+      assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+      assert(!c.execute?.method, `${id}: no execute.method (workflow)`);
+    }
+  }
+}
+
+async function checkIngestionCoverageExecutors() {
+  const noScope = {};
+  const finalize   = require('../services/capabilityExecutors/mediaFinalizeUpload');
+  const create     = require('../services/capabilityExecutors/catalogCreateProduct');
+  const igCat      = require('../services/capabilityExecutors/catalogSyncFromInstagram');
+  const igPosts    = require('../services/capabilityExecutors/postsSyncFromInstagram');
+  const sitemap    = require('../services/capabilityExecutors/catalogSyncFromGenericSitemap');
+
+  // Tenant guards.
+  for (const [name, exec] of [['mediaFinalizeUpload', finalize], ['catalogCreateProduct', create]]) {
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+  for (const [name, exec] of [
+    ['catalogSyncFromInstagram',      igCat],
+    ['postsSyncFromInstagram',        igPosts],
+    ['catalogSyncFromGenericSitemap', sitemap]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p = await exec.preview({ req: noScope, args: {} });
+    assert(p.ok === false && /advertiser scope/i.test(p.error), `${name}.preview: no-scope → rejects`);
+    const e = await exec.execute({ req: noScope, args: {} });
+    assert(e.ok === false && /advertiser scope/i.test(e.error), `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error), `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error), `${name}.preview: invalid brandId → rejects`);
+  }
+
+  // finalizeUpload argument shape.
+  const f1 = await finalize.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(f1.ok === false && /brandId required/i.test(f1.error),
+    `mediaFinalizeUpload: missing brandId → rejects`);
+  const f2 = await finalize.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(f2.ok === false && /valid ObjectId/i.test(f2.error),
+    `mediaFinalizeUpload: invalid brandId → rejects`);
+  const f3 = await finalize.run({ req: { advertiserId: 'x' }, args: { brandId: '000000000000000000000000' } });
+  assert(f3.ok === false && /secureUrl required/i.test(f3.error),
+    `mediaFinalizeUpload: missing secureUrl → rejects`);
+  const f4 = await finalize.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', secureUrl: 'https://evil.example.com/hack.jpg' }
+  });
+  assert(f4.ok === false && /Cloudinary URL/i.test(f4.error),
+    `mediaFinalizeUpload: non-Cloudinary URL rejected — SECURITY REGRESSION IF THIS FAILS`);
+  // fileType enum guard runs AFTER the Cloudinary-URL check, which
+  // needs CLOUDINARY_CLOUD_NAME set to pass. Seed it locally for this
+  // one assertion and restore afterward so we don\'t leak env into
+  // later checks.
+  {
+    const prior = process.env.CLOUDINARY_CLOUD_NAME;
+    process.env.CLOUDINARY_CLOUD_NAME = 'testcloud';
+    const f5 = await finalize.run({
+      req: { advertiserId: '000000000000000000000000' },
+      args: {
+        brandId: '000000000000000000000000',
+        secureUrl: 'https://res.cloudinary.com/testcloud/image/upload/foo.jpg',
+        fileType: 'audio'
+      }
+    });
+    if (prior === undefined) delete process.env.CLOUDINARY_CLOUD_NAME;
+    else process.env.CLOUDINARY_CLOUD_NAME = prior;
+    assert(f5.ok === false && /fileType/i.test(f5.error),
+      `mediaFinalizeUpload: rejects fileType outside {image, video}`);
+  }
+
+  // catalog.createProduct argument shape.
+  const c1 = await create.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(c1.ok === false && /brandId required/i.test(c1.error),
+    `catalogCreateProduct: missing brandId → rejects`);
+  const c2 = await create.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(c2.ok === false && /valid ObjectId/i.test(c2.error),
+    `catalogCreateProduct: invalid brandId → rejects`);
+  const c3 = await create.run({ req: { advertiserId: 'x' }, args: { brandId: '000000000000000000000000' } });
+  assert(c3.ok === false && /title required/i.test(c3.error),
+    `catalogCreateProduct: missing title → rejects`);
+  const c4 = await create.run({
+    req: { advertiserId: 'x' },
+    args: { brandId: '000000000000000000000000', title: 'T' }
+  });
+  assert(c4.ok === false && /imageUrl required/i.test(c4.error),
+    `catalogCreateProduct: missing imageUrl → rejects`);
+  const c5 = await create.run({
+    req: { advertiserId: 'x' },
+    args: { brandId: '000000000000000000000000', title: 'T', imageUrl: 'ftp://bad.example' }
+  });
+  assert(c5.ok === false && /http/i.test(c5.error),
+    `catalogCreateProduct: non-http imageUrl rejected`);
+}
+
+// ── 24. Phase 10 — sales demos ────────────────────────────────────
+console.log('\n[24] Phase 10 sales-demo capabilities');
+
+for (const [id, tier] of [
+  ['sales.bootstrap',        1],
+  ['sales.brand.create',     1],
+  ['sales.brand.patch',      1],
+  ['sales.brand.abort',      1],
+  ['sales.brand.sync',       4],
+  ['sales.brand.enrich',     4],
+  ['sales.brand.syncReviews', 4]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+  if (c) assert(c.scope === 'global', `${id}: scope === 'global'`);
+}
+// T4 caps must be workflow-shaped.
+for (const id of ['sales.brand.sync', 'sales.brand.enrich', 'sales.brand.syncReviews']) {
+  const c = registry.capabilityById(id);
+  if (c) {
+    assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+    assert(!c.execute?.method, `${id}: no execute.method (workflow)`);
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared`);
+  }
+}
+
+async function checkPhase10Executors() {
+  const noScope = {};
+  const bootstrap  = require('../services/capabilityExecutors/salesBootstrap');
+  const create     = require('../services/capabilityExecutors/salesBrandCreate');
+  const patch      = require('../services/capabilityExecutors/salesBrandPatch');
+  const abort      = require('../services/capabilityExecutors/salesBrandAbort');
+  const syncWf     = require('../services/capabilityExecutors/salesBrandSync');
+  const enrichWf   = require('../services/capabilityExecutors/salesBrandEnrich');
+  const reviewsWf  = require('../services/capabilityExecutors/salesBrandSyncReviews');
+
+  // Tenant guards.
+  for (const [name, exec] of [
+    ['salesBootstrap',      bootstrap],
+    ['salesBrandCreate',    create],
+    ['salesBrandPatch',     patch],
+    ['salesBrandAbort',     abort]
+  ]) {
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+  for (const [name, exec] of [
+    ['salesBrandSync',       syncWf],
+    ['salesBrandEnrich',     enrichWf],
+    ['salesBrandSyncReviews', reviewsWf]
+  ]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p = await exec.preview({ req: noScope, args: {} });
+    assert(p.ok === false && /advertiser scope/i.test(p.error),
+      `${name}.preview: no-scope → rejects`);
+    const e = await exec.execute({ req: noScope, args: {} });
+    assert(e.ok === false && /advertiser scope/i.test(e.error),
+      `${name}.execute: no-scope → rejects`);
+  }
+
+  // bootstrap: allowlist check reachable without DB when advertiserId
+  // is provided but the caller's email is unset.
+  const b1 = await bootstrap.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: {}
+  });
+  assert(b1.ok === false && /user context/i.test(b1.error),
+    `salesBootstrap: no user context → rejects`);
+  const b2 = await bootstrap.run({
+    req: { advertiserId: '000000000000000000000000', user: { userId: 'u', email: 'stranger@example.invalid' } },
+    args: {}
+  });
+  assert(b2.ok === false && /allowlist/i.test(b2.error),
+    `salesBootstrap: non-allowlisted email rejected`);
+
+  // Scope-check downstream of the tenant guard requires
+  // ensureSalesDemosAdvertiser which hits Mongo — the tenant guard
+  // above is the offline-reachable regression this suite catches.
+  // Live sales-demos-scope enforcement is exercised end-to-end.
+}
+
+// ── 23. Phase 9 — getContext + searchAcrossBrands ─────────────────
+console.log('\n[23] Phase 9 context capabilities');
+
+for (const id of ['agent.getContext', 'agent.searchAcrossBrands']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 0, `${id}: tier === 0`);
+  if (c) assert(c.scope === 'advertiser', `${id}: scope === 'advertiser'`);
+}
+
+async function checkPhase9Executors() {
+  const noScope = {};
+  const getCtx = require('../services/capabilityExecutors/agentGetContext');
+  const search = require('../services/capabilityExecutors/agentSearchAcrossBrands');
+
+  // getContext takes no args other than the auth context.
+  const g1 = await getCtx.run({ req: noScope, args: {} });
+  assert(g1.ok === false && /advertiser scope/i.test(g1.error),
+    `agentGetContext: no-scope → rejects`);
+
+  // Search argument-shape guards.
+  const s1 = await search.run({ req: noScope, args: {} });
+  assert(s1.ok === false && /advertiser scope/i.test(s1.error),
+    `agentSearchAcrossBrands: no-scope → rejects`);
+  const s2 = await search.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(s2.ok === false && /query required/i.test(s2.error),
+    `agentSearchAcrossBrands: missing query → rejects`);
+  const s3 = await search.run({ req: { advertiserId: 'x' }, args: { query: 'a' } });
+  assert(s3.ok === false && /query too short/i.test(s3.error),
+    `agentSearchAcrossBrands: single-char query rejected`);
+  const s4 = await search.run({ req: { advertiserId: 'x' }, args: { query: 'x'.repeat(201) } });
+  assert(s4.ok === false && /query too long/i.test(s4.error),
+    `agentSearchAcrossBrands: 201-char query rejected`);
+  const s5 = await search.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { query: 'hello', resourceTypes: ['bogus'] }
+  });
+  assert(s5.ok === false && /resourceType.*invalid/i.test(s5.error),
+    `agentSearchAcrossBrands: unknown resourceType rejected`);
+  const s6 = await search.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { query: 'hello', resourceTypes: 'not-array' }
+  });
+  assert(s6.ok === false && /must be an array/i.test(s6.error),
+    `agentSearchAcrossBrands: non-array resourceTypes rejected`);
+  const s7 = await search.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { query: 'hello', resourceTypes: [] }
+  });
+  assert(s7.ok === false && /at least one type/i.test(s7.error),
+    `agentSearchAcrossBrands: empty resourceTypes rejected`);
+
+  // HAPPY-PATH SMOKE — monkey-patch the models so the executor runs
+  // to completion offline. Catches load-bearing bugs that arg-guards
+  // miss (e.g. an undefined variable used only after the DB lookup).
+  // The 2026-08-06 outage on advOid-not-defined shipped because no
+  // check reached this code path.
+  {
+    const Brand = require('../models/Brand');
+    const CatalogProduct = require('../models/CatalogProduct');
+    const Campaign = require('../models/Campaign');
+    const Ad = require('../models/Ad');
+    const orig = {
+      brandFind: Brand.find, brandFindOne: Brand.findOne,
+      productFind: CatalogProduct.find, campaignFind: Campaign.find, adFind: Ad.find
+    };
+    // Chainable stub — every method returns `this` until .lean(),
+    // which resolves to []. Matches the shape the executor uses
+    // (find().limit(N).select(fields).lean() or find().select().lean()).
+    const emptyChain = () => {
+      const c = {};
+      c.limit  = () => c;
+      c.select = () => c;
+      c.sort   = () => c;
+      c.lean   = async () => [];
+      return c;
+    };
+    Brand.find          = () => emptyChain();
+    Brand.findOne       = () => ({ select: () => ({ lean: async () => null }) });
+    CatalogProduct.find = () => emptyChain();
+    Campaign.find       = () => emptyChain();
+    Ad.find             = () => emptyChain();
+    try {
+      // No brandId → advertiser-wide path. Wrap in try/catch so a
+      // ReferenceError manifests as a failed assertion instead of
+      // crashing the whole harness — the 2026-08-06 advOid outage
+      // shipped because the executor threw synchronously here.
+      let rHappy;
+      try {
+        rHappy = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'sectional' }
+        });
+      } catch (err) {
+        rHappy = { ok: false, error: `threw: ${err.message}` };
+      }
+      assert(rHappy.ok === true,
+        `agentSearchAcrossBrands: happy-path smoke completes without throwing — REFERENCE-ERROR REGRESSION IF THIS FAILS (got ${rHappy.error || 'unknown'})`);
+      // Tokenization contract — response must expose queryTokens so
+      // the LLM and operator can see what was actually searched. If
+      // this regresses the "Harper couches" plural bug returns.
+      assert(rHappy.ok && Array.isArray(rHappy.data?.queryTokens),
+        `agentSearchAcrossBrands: response carries queryTokens array (tokenization visible)`);
+      assert(rHappy.ok && rHappy.data.queryTokens.length === 1 && rHappy.data.queryTokens[0] === 'sectional',
+        `agentSearchAcrossBrands: "sectional" tokenizes to ['sectional'] (single term, no stemming needed)`);
+      // brandId-narrowing path. Second failure mode — the brand-check
+      // block runs BEFORE the advOid assignment if we goof the order
+      // again.
+      let rBrand;
+      try {
+        rBrand = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'sectional', brandId: '000000000000000000000000' }
+        });
+      } catch (err) {
+        rBrand = { ok: false, error: `threw: ${err.message}` };
+      }
+      // Brand.findOne stub returns null → executor returns "brand
+      // not found" — that's the expected reject shape offline.
+      assert(rBrand.ok === false && /not found/i.test(rBrand.error || ''),
+        `agentSearchAcrossBrands: brandId-narrow path rejects unknown brand cleanly (no ReferenceError; got ${rBrand.error || 'unknown'})`);
+      // Plural-stripping contract — "couches" must tokenize to root
+      // "couch" so title="Couch" would match. If tokenRoot regresses,
+      // the Aug 6 "Harper couches → 0 results" bug returns.
+      let rPlural;
+      try {
+        rPlural = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'Harper couches' }
+        });
+      } catch (err) {
+        rPlural = { ok: false, error: `threw: ${err.message}` };
+      }
+      assert(rPlural.ok === true && Array.isArray(rPlural.data?.queryTokens)
+        && rPlural.data.queryTokens.includes('harper') && rPlural.data.queryTokens.includes('couch'),
+        `agentSearchAcrossBrands: "Harper couches" tokenizes to include 'couch' (plural stripped) — PLURAL REGRESSION IF THIS FAILS (got ${JSON.stringify(rPlural.data?.queryTokens)})`);
+      // Noise-only query rejection — if the LLM sends "the of and",
+      // filtering strips everything and the search would return
+      // every row. Executor must reject.
+      let rNoise;
+      try {
+        rNoise = await search.run({
+          req: { advertiserId: '000000000000000000000000' },
+          args: { query: 'the of and my' }
+        });
+      } catch (err) {
+        rNoise = { ok: false, error: `threw: ${err.message}` };
+      }
+      assert(rNoise.ok === false && /no searchable tokens/i.test(rNoise.error || ''),
+        `agentSearchAcrossBrands: noise-only query rejected (would else match every row)`);
+    } finally {
+      Brand.find          = orig.brandFind;
+      Brand.findOne       = orig.brandFindOne;
+      CatalogProduct.find = orig.productFind;
+      Campaign.find       = orig.campaignFind;
+      Ad.find             = orig.adFind;
+    }
+  }
+}
+
+// ── 22. Phase 8a — integrations OAuth ─────────────────────────────
+console.log('\n[22] Phase 8a integrations OAuth');
+
+const PHASE_8A_IDS = [
+  ['integrations.instagram.listCredentials', 0],
+  ['integrations.metaAds.listCredentials',   0],
+  ['integrations.googleAds.listCredentials', 0],
+  ['integrations.instagram.connectUrl',      1],
+  ['integrations.metaAds.connectUrl',        1],
+  ['integrations.googleAds.connectUrl',      1],
+  ['integrations.instagram.disconnect',      1],
+  ['integrations.metaAds.disconnect',        1],
+  ['integrations.googleAds.disconnect',      1]
+];
+for (const [id, tier] of PHASE_8A_IDS) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+async function checkPhase8aExecutors() {
+  const noScope = {};
+  // Every executor rejects a missing advertiser scope up-front — covers
+  // the tenant-guard rule for both list/connect (brandId scope) and
+  // disconnect (credentialId scope).
+  const files = [
+    'integrationsInstagramConnectUrl', 'integrationsInstagramListCredentials', 'integrationsInstagramDisconnect',
+    'integrationsMetaAdsConnectUrl',   'integrationsMetaAdsListCredentials',   'integrationsMetaAdsDisconnect',
+    'integrationsGoogleAdsConnectUrl', 'integrationsGoogleAdsListCredentials', 'integrationsGoogleAdsDisconnect'
+  ];
+  for (const name of files) {
+    const exec = require(`../services/capabilityExecutors/${name}`);
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+
+  // brandId argument-shape checks — covers the six connect/list caps.
+  for (const name of [
+    'integrationsInstagramConnectUrl', 'integrationsInstagramListCredentials',
+    'integrationsMetaAdsConnectUrl',   'integrationsMetaAdsListCredentials',
+    'integrationsGoogleAdsConnectUrl', 'integrationsGoogleAdsListCredentials'
+  ]) {
+    const exec = require(`../services/capabilityExecutors/${name}`);
+    const r1 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r1.ok === false && /brandId required/i.test(r1.error),
+      `${name}: missing brandId → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(r2.ok === false && /valid ObjectId/i.test(r2.error),
+      `${name}: invalid brandId → rejects`);
+  }
+
+  // credentialId argument-shape checks — covers the three disconnect caps.
+  for (const name of [
+    'integrationsInstagramDisconnect',
+    'integrationsMetaAdsDisconnect',
+    'integrationsGoogleAdsDisconnect'
+  ]) {
+    const exec = require(`../services/capabilityExecutors/${name}`);
+    const r1 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r1.ok === false && /credentialId required/i.test(r1.error),
+      `${name}: missing credentialId → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: { credentialId: 'nope' } });
+    assert(r2.ok === false && /valid ObjectId/i.test(r2.error),
+      `${name}: invalid credentialId → rejects`);
+  }
+}
+
+// ── 21. Phase 7 — team management ─────────────────────────────────
+console.log('\n[21] Phase 7 team capabilities');
+
+for (const [id, tier] of [
+  ['team.invite.create', 3],
+  ['team.invite.delete', 1],
+  ['team.member.patch',  1],
+  ['team.member.delete', 3],
+  ['team.invite.accept', 1]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+// Tier 3 caps must declare explicitConfirmation.
+{
+  const inviteCreate = registry.capabilityById('team.invite.create');
+  const memberDelete = registry.capabilityById('team.member.delete');
+  assert(inviteCreate?.explicitConfirmation === 'INVITE MEMBER',
+    `team.invite.create: explicitConfirmation === 'INVITE MEMBER'`);
+  assert(memberDelete?.explicitConfirmation === 'REMOVE MEMBER',
+    `team.member.delete: explicitConfirmation === 'REMOVE MEMBER'`);
+}
+
+async function checkPhase7Executors() {
+  const noScope = {};
+  const inviteCreate = require('../services/capabilityExecutors/teamInviteCreate');
+  const inviteDelete = require('../services/capabilityExecutors/teamInviteDelete');
+  const inviteAccept = require('../services/capabilityExecutors/teamInviteAccept');
+  const memberPatch  = require('../services/capabilityExecutors/teamMemberPatch');
+  const memberDelete = require('../services/capabilityExecutors/teamMemberDelete');
+
+  // Every executor rejects a missing advertiser scope up-front.
+  for (const [name, exec] of [
+    ['teamInviteCreate', inviteCreate],
+    ['teamInviteDelete', inviteDelete],
+    ['teamInviteAccept', inviteAccept],
+    ['teamMemberPatch',  memberPatch],
+    ['teamMemberDelete', memberDelete]
+  ]) {
+    const r = await exec.run({ req: noScope, args: {} });
+    assert(r.ok === false && /advertiser scope/i.test(r.error),
+      `${name}: no-scope → rejects`);
+  }
+
+  // Field validation — reachable without DB.
+  const ic1 = await inviteCreate.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(ic1.ok === false && /valid email required/i.test(ic1.error),
+    `teamInviteCreate: missing email → rejects`);
+  const ic2 = await inviteCreate.run({ req: { advertiserId: 'x' }, args: { email: 'bogus' } });
+  assert(ic2.ok === false && /valid email/i.test(ic2.error),
+    `teamInviteCreate: email without @ rejected`);
+  const ic3 = await inviteCreate.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { email: 'a@b.co', role: 'owner' }
+  });
+  assert(ic3.ok === false && /role must be one of/i.test(ic3.error),
+    `teamInviteCreate: role='owner' rejected (owner cannot be invited)`);
+
+  const id1 = await inviteDelete.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(id1.ok === false && /invitationId required/i.test(id1.error),
+    `teamInviteDelete: missing invitationId → rejects`);
+  const id2 = await inviteDelete.run({ req: { advertiserId: 'x' }, args: { invitationId: 'nope' } });
+  assert(id2.ok === false && /valid ObjectId/i.test(id2.error),
+    `teamInviteDelete: invalid invitationId → rejects`);
+
+  const ia1 = await inviteAccept.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(ia1.ok === false && /user context/i.test(ia1.error),
+    `teamInviteAccept: no user context → rejects`);
+  const ia2 = await inviteAccept.run({
+    req: { advertiserId: 'x', user: { userId: 'u', email: 'a@b.co' } },
+    args: {}
+  });
+  assert(ia2.ok === false && /token required/i.test(ia2.error),
+    `teamInviteAccept: missing token → rejects`);
+
+  const mp1 = await memberPatch.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(mp1.ok === false && /userId required/i.test(mp1.error),
+    `teamMemberPatch: missing userId → rejects`);
+  const mp2 = await memberPatch.run({ req: { advertiserId: 'x' }, args: { userId: 'nope' } });
+  assert(mp2.ok === false && /valid ObjectId/i.test(mp2.error),
+    `teamMemberPatch: invalid userId → rejects`);
+  const mp3 = await memberPatch.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { userId: '000000000000000000000000', role: 'god' }
+  });
+  assert(mp3.ok === false && /role must be one of/i.test(mp3.error),
+    `teamMemberPatch: bogus role rejected`);
+
+  const md1 = await memberDelete.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(md1.ok === false && /userId required/i.test(md1.error),
+    `teamMemberDelete: missing userId → rejects`);
+  const md2 = await memberDelete.run({ req: { advertiserId: 'x' }, args: { userId: 'nope' } });
+  assert(md2.ok === false && /valid ObjectId/i.test(md2.error),
+    `teamMemberDelete: invalid userId → rejects`);
+}
+
+// ── 20. Phase 6 — detection + layouts ─────────────────────────────
+console.log('\n[20] Phase 6 detection + layouts');
+
+for (const [id, tier] of [
+  ['detect.process',       2],
+  ['detect.rematch',       1],
+  ['aiCanvas.testSpec',    2],
+  ['aiLayouts.generate',   2],
+  ['aiLayouts.getSession', 0]
+]) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === tier, `${id}: tier === ${tier}`);
+}
+
+async function checkPhase6Executors() {
+  const noScope = {};
+  const process       = require('../services/capabilityExecutors/detectProcess');
+  const rematch       = require('../services/capabilityExecutors/detectRematch');
+  const canvasTest    = require('../services/capabilityExecutors/aiCanvasTestSpec');
+  const layoutsGen    = require('../services/capabilityExecutors/aiLayoutsGenerate');
+  const layoutsSess   = require('../services/capabilityExecutors/aiLayoutsGetSession');
+
+  for (const [name, exec, missingArg] of [
+    ['detectProcess',       process,     'mediaId'],
+    ['detectRematch',       rematch,     'mediaId'],
+    ['aiCanvasTestSpec',    canvasTest,  'mediaId'],
+    ['aiLayoutsGenerate',   layoutsGen,  'mediaId'],
+    ['aiLayoutsGetSession', layoutsSess, 'sessionId']
+  ]) {
+    const r1 = await exec.run({ req: noScope, args: {} });
+    assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+      `${name}: no-scope → rejects`);
+    const r2 = await exec.run({ req: { advertiserId: 'x' }, args: {} });
+    assert(r2.ok === false && new RegExp(`${missingArg} required`, 'i').test(r2.error),
+      `${name}: missing ${missingArg} → rejects`);
+    const r3 = await exec.run({ req: { advertiserId: 'x' }, args: { [missingArg]: 'nope' } });
+    assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+      `${name}: invalid ${missingArg} → rejects`);
+  }
+
+  // aiCanvas.testSpec: creativeStyle enum guard runs BEFORE DB lookup.
+  const badStyle = await canvasTest.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', creativeStyle: 'not-a-style' }
+  });
+  assert(badStyle.ok === false && /creativeStyle must be one of/i.test(badStyle.error),
+    `aiCanvasTestSpec: bogus creativeStyle rejected before DB lookup`);
+
+  // aiCanvas.testSpec: aspectRatio enum guard runs BEFORE DB lookup.
+  const badAspect = await canvasTest.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', aspectRatio: '16:9' }
+  });
+  assert(badAspect.ok === false && /aspectRatio must be one of/i.test(badAspect.error),
+    `aiCanvasTestSpec: bogus aspectRatio rejected before DB lookup`);
+
+  // aiLayouts.generate: quality enum guard runs BEFORE DB lookup.
+  const badQuality = await layoutsGen.run({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { mediaId: '000000000000000000000000', quality: 'ultra' }
+  });
+  assert(badQuality.ok === false && /quality must be one of/i.test(badQuality.error),
+    `aiLayoutsGenerate: bogus quality rejected before DB lookup`);
+}
+
+// ── 19. Phase 5 — onboarding.dispatchSyncs + createBrandFromUrl ───
+console.log('\n[19] Phase 5 onboarding capabilities');
+
+{
+  const dispatch = registry.capabilityById('onboarding.dispatchSyncs');
+  assert(dispatch, `capability "onboarding.dispatchSyncs" registered`);
+  if (dispatch) {
+    assert(dispatch.tier === 1, `onboarding.dispatchSyncs: tier === 1`);
+    assert(dispatch.scope === 'brand', `onboarding.dispatchSyncs: scope === 'brand'`);
+  }
+  const createFromUrl = registry.capabilityById('onboarding.createBrandFromUrl');
+  assert(createFromUrl, `capability "onboarding.createBrandFromUrl" registered`);
+  if (createFromUrl) {
+    assert(createFromUrl.tier === 4, `onboarding.createBrandFromUrl: tier === 4`);
+    assert(createFromUrl.execute?.workflow === true,
+      `onboarding.createBrandFromUrl: execute.workflow === true`);
+    assert(typeof createFromUrl.estimateUsd === 'number' && createFromUrl.estimateUsd > 0,
+      `onboarding.createBrandFromUrl: estimateUsd > 0 (billable enrichment step)`);
+  }
+}
+
+async function checkPhase5Executors() {
+  const noScope = {};
+  const dispatch = require('../services/capabilityExecutors/onboardingDispatchSyncs');
+  const createFromUrl = require('../services/capabilityExecutors/onboardingCreateBrandFromUrl');
+
+  const d1 = await dispatch.run({ req: noScope, args: {} });
+  assert(d1.ok === false && /advertiser scope/i.test(d1.error),
+    `onboardingDispatchSyncs: no-scope → rejects`);
+  const d2 = await dispatch.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(d2.ok === false && /brandId required/i.test(d2.error),
+    `onboardingDispatchSyncs: missing brandId → rejects`);
+  const d3 = await dispatch.run({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+  assert(d3.ok === false && /valid ObjectId/i.test(d3.error),
+    `onboardingDispatchSyncs: invalid brandId → rejects`);
+
+  assert(typeof createFromUrl.preview === 'function',
+    `onboardingCreateBrandFromUrl exports preview()`);
+  assert(typeof createFromUrl.execute === 'function',
+    `onboardingCreateBrandFromUrl exports execute()`);
+  const p1 = await createFromUrl.preview({ req: noScope, args: {} });
+  assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+    `createBrandFromUrl.preview: no-scope → rejects`);
+  const e1 = await createFromUrl.execute({ req: noScope, args: {} });
+  assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+    `createBrandFromUrl.execute: no-scope → rejects`);
+  const p2 = await createFromUrl.preview({ req: { advertiserId: 'x' }, args: {} });
+  assert(p2.ok === false && /name required/i.test(p2.error),
+    `createBrandFromUrl.preview: missing name → rejects`);
+  const p3 = await createFromUrl.preview({
+    req: { advertiserId: 'x' }, args: { name: 'Test' }
+  });
+  assert(p3.ok === false && /websiteUrl required/i.test(p3.error),
+    `createBrandFromUrl.preview: missing websiteUrl → rejects`);
+  const p4 = await createFromUrl.preview({
+    req: { advertiserId: 'x' }, args: { name: 'Test', websiteUrl: 'ftp://bad.example' }
+  });
+  assert(p4.ok === false && /http/i.test(p4.error),
+    `createBrandFromUrl.preview: non-http websiteUrl rejected`);
+}
+
+// ── 18. Phase 4 — T4 detect / shopify / apify workflows ───────────
+console.log('\n[18] Phase 4 T4 workflows');
+
+for (const id of ['catalog.detectProductsFromMedia', 'catalog.syncFromShopifyPublic', 'catalog.pullFromApify']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) {
+    assert(c.tier === 4, `${id}: tier === 4`);
+    assert(c.execute?.workflow === true, `${id}: execute.workflow === true`);
+    assert(!c.execute?.method, `${id}: no execute.method (uses preview/execute)`);
+    assert(typeof c.estimateUsd === 'number' && c.estimateUsd >= 0,
+      `${id}: estimateUsd declared (got ${JSON.stringify(c.estimateUsd)})`);
+  }
+}
+
+async function checkPhase4Tier4Executors() {
+  const noScope = {};
+  const detect  = require('../services/capabilityExecutors/catalogDetectProductsFromMedia');
+  const shopify = require('../services/capabilityExecutors/catalogSyncFromShopifyPublic');
+  const apify   = require('../services/capabilityExecutors/catalogPullFromApify');
+
+  for (const [name, exec] of [['detect', detect], ['shopify', shopify], ['apify', apify]]) {
+    assert(typeof exec.preview === 'function', `${name}: exports preview()`);
+    assert(typeof exec.execute === 'function', `${name}: exports execute()`);
+    const p1 = await exec.preview({ req: noScope, args: {} });
+    assert(p1.ok === false && /advertiser scope/i.test(p1.error),
+      `${name}.preview: no-scope → rejects`);
+    const e1 = await exec.execute({ req: noScope, args: {} });
+    assert(e1.ok === false && /advertiser scope/i.test(e1.error),
+      `${name}.execute: no-scope → rejects`);
+    const p2 = await exec.preview({ req: { advertiserId: 'x' }, args: {} });
+    assert(p2.ok === false && /brandId required/i.test(p2.error),
+      `${name}.preview: missing brandId → rejects`);
+    const p3 = await exec.preview({ req: { advertiserId: 'x' }, args: { brandId: 'nope' } });
+    assert(p3.ok === false && /valid ObjectId/i.test(p3.error),
+      `${name}.preview: invalid brandId → rejects`);
+  }
+
+  // detect: fileType enum guard runs BEFORE the brand lookup (arg
+  // validation should never require DB access), so this check is
+  // reachable with a bogus brandId.
+  const bad = await detect.preview({
+    req: { advertiserId: '000000000000000000000000' },
+    args: { brandId: '000000000000000000000000', fileType: 'audio' }
+  });
+  assert(bad.ok === false && /fileType.*image.*video/i.test(bad.error),
+    `detect.preview: fileType outside {image, video} rejected before brand lookup`);
+}
+
+// ── 17. Phase 4 — T2 inferCategories + refreshInsights ────────────
+console.log('\n[17] Phase 4 T2 executors');
+
+for (const id of ['catalog.inferCategories', 'media.refreshInsights']) {
+  const c = registry.capabilityById(id);
+  assert(c, `capability "${id}" registered`);
+  if (c) assert(c.tier === 2, `${id}: tier === 2`);
+}
+{
+  const inferCap = registry.capabilityById('catalog.inferCategories');
+  assert(typeof inferCap?.estimateUsd === 'number' && inferCap.estimateUsd > 0,
+    `catalog.inferCategories: estimateUsd > 0 (billable LLM fallback)`);
+  const insightsCap = registry.capabilityById('media.refreshInsights');
+  assert(insightsCap?.estimateUsd === 0,
+    `media.refreshInsights: estimateUsd === 0 (Meta Graph is free)`);
+}
+
+async function checkPhase4Tier2Executors() {
+  const noScope = {};
+  const infer   = require('../services/capabilityExecutors/catalogInferCategories');
+  const refresh = require('../services/capabilityExecutors/mediaRefreshInsights');
+
+  const i1 = await infer.run({ req: noScope, args: {} });
+  assert(i1.ok === false && /advertiser scope/i.test(i1.error),
+    `catalogInferCategories: no-scope → rejects`);
+  const i2 = await infer.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(i2.ok === false && /productId required/i.test(i2.error),
+    `catalogInferCategories: missing productId → rejects`);
+  const i3 = await infer.run({ req: { advertiserId: 'x' }, args: { productId: 'nope' } });
+  assert(i3.ok === false && /valid ObjectId/i.test(i3.error),
+    `catalogInferCategories: invalid productId → rejects`);
+
+  const r1 = await refresh.run({ req: noScope, args: {} });
+  assert(r1.ok === false && /advertiser scope/i.test(r1.error),
+    `mediaRefreshInsights: no-scope → rejects`);
+  const r2 = await refresh.run({ req: { advertiserId: 'x' }, args: {} });
+  assert(r2.ok === false && /mediaId required/i.test(r2.error),
+    `mediaRefreshInsights: missing mediaId → rejects`);
+  const r3 = await refresh.run({ req: { advertiserId: 'x' }, args: { mediaId: 'nope' } });
+  assert(r3.ok === false && /valid ObjectId/i.test(r3.error),
+    `mediaRefreshInsights: invalid mediaId → rejects`);
+}
+
+// Media schema regression — the soft-delete field must be declared.
+// Mongoose silently drops $set to undeclared paths (§4 trap), so if
+// this field ever disappears the delete capability turns into a no-op.
+{
+  const MediaModel = require('../models/Media');
+  const declared = Object.keys(MediaModel.schema.paths || {});
+  assert(declared.includes('deletedAt'),
+    `Media schema declares deletedAt (soft-delete field for media.delete)`);
+}
+
+// Media list endpoint must filter soft-deleted rows. A regression here
+// would leak deleted media back into the picker even though the
+// capability succeeded.
+{
+  const mediaRouteSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'media.js'), 'utf8');
+  // Accept either `deletedAt: null` (object literal) or
+  // `.deletedAt = null` (assignment) — both are load-bearing writes
+  // into the list-filter object, and the regression matters equally.
+  assert(/deletedAt\s*[:=]\s*null/.test(mediaRouteSrc),
+    `routes/media.js filters deletedAt=null in the list query`);
+}
+
+// ── 34. UGC-ads Phase 1: detect writes must NOT clobber operator entries ──
+//
+// Every $pull site that rewrites matched*/matchedMedia entries MUST
+// filter on source:'detect'. Otherwise operator-added attachments
+// (source:'operator') get wiped on every detect / brand-promote /
+// retro-link sweep — silently, without any test firing.
+//
+// This scan pins the invariant across all four write sites we know
+// about. New sites that rebuild these arrays must add themselves to
+// the list AND include the source filter.
+{
+  const FILES_TO_SCAN = [
+    'pipelines/detect.js',                              // Media matched* + CatalogProduct.matchedMedia mirror
+    'services/catalogProductPromoteService.js',         // matchedMedia rebuild on draft-promotion
+    'services/catalogRetroLinkService.js'               // matchedMedia rebuild on brand-wide retro link
+  ];
+  for (const rel of FILES_TO_SCAN) {
+    const abs = path.join(__dirname, '..', rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    // Every $pull that mentions the target arrays MUST include the
+    // source-filter constraint. Two acceptable shapes:
+    //   $pull: { matchedMedia: { source: 'detect' } }
+    //   $pull: { matchedMedia: { mediaId, source: 'detect' } }
+    // Reject any $pull on matched* / matchedMedia that lacks source.
+    // Regex: find `$pull: { <arr>: { ... } }` and require /source/ inside.
+    const pullBlockRe = /\$pull:\s*\{\s*(matchedProducts|matchedCategories|matchedMedia)\s*:\s*\{([^}]*)\}/g;
+    let m;
+    while ((m = pullBlockRe.exec(src)) !== null) {
+      const arr  = m[1];
+      const body = m[2];
+      assert(/source\s*:/.test(body),
+        `${rel}: $pull on ${arr} missing source filter — UGC-ADS PHASE 1 REGRESSION (operator attachments would be wiped on detect re-run). Match at "${body.trim().slice(0, 80)}"`);
+    }
+    // Belt-and-braces: no $set: { matched* / matchedMedia: X } shape
+    // anywhere. Wholesale-replace is what breaks operator entries.
+    // If a $set is needed for a NEW field (not matched*), the regex
+    // won't match — this is specifically the array-clobber pattern.
+    const setBlockRe = /\$set:\s*\{[^}]*(matchedMedia|matchedProducts|matchedCategories)\s*:\s*(?!\{|\$)/g;
+    assert(!setBlockRe.test(src),
+      `${rel}: contains $set: { matched* } wholesale replace — must be $pull(source:'detect') + $push instead`);
+  }
+}
+
+// ── 33. YOLO_SERVICE_URL env override pinned ──────────────────────
+//
+// The 2026-08-10 prod-staging split introduced two backend envs that
+// each need to hit their own YOLO Docker service. yoloService.js
+// previously hard-coded the URL — if that regression re-lands, prod
+// cross-hits staging YOLO and every detect is wrong. Source-scan
+// asserts the env-override pattern is intact.
+{
+  const yoloSrc = fs.readFileSync(path.join(__dirname, '..', 'services', 'yoloService.js'), 'utf8');
+  assert(/process\.env\.YOLO_SERVICE_URL/.test(yoloSrc),
+    `yoloService.js reads YOLO_SERVICE_URL from env — CROSS-ENV YOLO REGRESSION IF THIS FAILS`);
+  // Should still have a fallback so single-env deploys keep working.
+  assert(/yolo-microservice\.onrender\.com/.test(yoloSrc),
+    `yoloService.js retains the legacy YOLO URL as env-unset fallback`);
+}
+
+// ── 32. T0 smoke suite (catches ReferenceError / TypeError on happy path) ─
+//
+// The 2026-08-06 outage on agent.searchAcrossBrands (advOid-not-defined)
+// shipped because every offline check stopped at argument-shape rejects
+// — no test reached the executor body. This suite closes that gap for
+// every Tier-0 (read-only, autonomous) capability by stubbing every
+// Mongoose model with empty-chain returns, invoking run() with valid-
+// shape args, and asserting that (a) no throw fires and (b) the result
+// is a shaped {ok:bool, ...} object.
+//
+// We don't test business logic — that requires live data. We only test
+// that the code PATH runs to a shaped return.
+
+// Chainable stub matching Mongoose's Query interface. Every method
+// returns `this` until .lean() / .exec() / await resolves to the
+// pre-canned result. Handles find / findOne / findById / aggregate
+// / findOneAndUpdate call shapes the executors use.
+function makeMongooseChainableStub(result) {
+  const c = {
+    limit:    () => c,
+    select:   () => c,
+    sort:     () => c,
+    skip:     () => c,
+    populate: () => c,
+    where:    () => c,
+    lean:     async () => result,
+    exec:     async () => result,
+    then:     (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+    catch:    (rej) => Promise.resolve(result).catch(rej)
+  };
+  return c;
+}
+
+// Stub every relevant Mongoose model. Returns a restore() that
+// undoes the patches. Individual smoke tests can opt into "populated
+// tenant lookup" (Brand.findOne returns a valid brand doc) via the
+// `singleResults` map.
+function stubMongooseModels(models, singleResults = {}) {
+  const origs = new Map();
+  for (const m of models) {
+    origs.set(m, {
+      find:              m.find,
+      findOne:           m.findOne,
+      findById:          m.findById,
+      countDocuments:    m.countDocuments,
+      distinct:          m.distinct,
+      aggregate:         m.aggregate,
+      updateOne:         m.updateOne,
+      updateMany:        m.updateMany,
+      findOneAndUpdate:  m.findOneAndUpdate,
+      create:            m.create
+    });
+    const single = singleResults[m.modelName] || null;
+    m.find              = () => makeMongooseChainableStub([]);
+    m.findOne           = () => makeMongooseChainableStub(single);
+    m.findById          = () => makeMongooseChainableStub(single);
+    m.countDocuments    = () => makeMongooseChainableStub(0);
+    m.distinct          = () => makeMongooseChainableStub([]);
+    m.aggregate         = () => makeMongooseChainableStub([]);
+    m.updateOne         = async () => ({ modifiedCount: 0, upsertedCount: 0, acknowledged: true });
+    m.updateMany        = async () => ({ modifiedCount: 0, acknowledged: true });
+    m.findOneAndUpdate  = () => makeMongooseChainableStub(single);
+    m.create            = async (doc) => (Array.isArray(doc)
+      ? doc.map((d, i) => ({ ...d, _id: new (require('mongoose')).Types.ObjectId() }))
+      : { ...doc, _id: new (require('mongoose')).Types.ObjectId(), toObject: () => doc });
+  }
+  return () => {
+    for (const [m, saved] of origs) Object.assign(m, saved);
+  };
+}
+
+async function checkT0SmokeSuite() {
+  console.log('\n[32] T0 executor smoke suite (post-validation happy-path)');
+
+  const mongoose = require('mongoose');
+  const OID_ZERO = '000000000000000000000000';
+  const mkOid    = (s) => new mongoose.Types.ObjectId(s);
+
+  // Import every model the T0 executors touch.
+  const models = [
+    require('../models/Advertiser'),
+    require('../models/Brand'),
+    require('../models/CatalogProduct'),
+    require('../models/Media'),
+    require('../models/Ad'),
+    require('../models/Campaign'),
+    require('../models/CampaignRun'),
+    require('../models/DetectRun'),
+    require('../models/DetectionArtifact'),
+    require('../models/ProductMatchArtifact'),
+    require('../models/IntegrationCredential'),
+    require('../models/CostLog'),
+    require('../models/AiLayoutSession')
+  ];
+
+  // Populated stubs so tenant lookups (Brand.findOne, Advertiser.findById)
+  // reach past the early "not found" returns and exercise the deeper
+  // executor logic.
+  const populated = {
+    Brand:      { _id: mkOid(OID_ZERO), name: 'stub-brand',      advertiserId: mkOid(OID_ZERO), apifyDemo: {} },
+    Advertiser: { _id: mkOid(OID_ZERO), name: 'stub-advertiser', slug: 'stub', status: 'active', plan: 'free' },
+    Ad:         { _id: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), kind: 'image', status: 'draft' },
+    CampaignRun:{ _id: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), status: 'ok' },
+    AiLayoutSession: { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), variants: [], aspectRatios: [], references: [], status: 'queued' },
+    Media:      { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), source: 'instagram', fileType: 'image' },
+    DetectRun:  { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), mediaId: mkOid(OID_ZERO), status: 'completed' },
+    CatalogProduct: { _id: mkOid(OID_ZERO), advertiserId: mkOid(OID_ZERO), brandId: mkOid(OID_ZERO), title: 'stub' }
+  };
+
+  // T0 caps + valid-arg shapes. platform.listFormats has no DB deps
+  // (already covered by checkPlatformListExecutor) — skipping.
+  // agent.searchAcrossBrands has its own bespoke smoke (post-fix in
+  // this repo) — skipping.
+  const T0_CAPS = [
+    { id: 'catalog.listProducts',                     args: { brandId: OID_ZERO } },
+    { id: 'ad.list',                                  args: { brandId: OID_ZERO } },
+    { id: 'ad.inspect',                               args: { adId: OID_ZERO } },
+    { id: 'campaign.list',                            args: { brandId: OID_ZERO } },
+    { id: 'run.status',                               args: { runId: OID_ZERO } },
+    { id: 'spend.today',                              args: {} },
+    { id: 'aiLayouts.getSession',                     args: { sessionId: OID_ZERO } },
+    { id: 'agent.getContext',                         args: {} },
+    { id: 'integrations.instagram.listCredentials',   args: { brandId: OID_ZERO } },
+    { id: 'integrations.metaAds.listCredentials',     args: { brandId: OID_ZERO } },
+    { id: 'integrations.googleAds.listCredentials',   args: { brandId: OID_ZERO } },
+    { id: 'media.sourceSummary',                      args: { brandId: OID_ZERO } },
+    { id: 'media.listAssignments',                    args: { mediaId: OID_ZERO } },
+    { id: 'catalog.listProductsWithoutAds',           args: { brandId: OID_ZERO } },
+    { id: 'db.query',                                 args: { collection: 'Media' } },
+    { id: 'db.query',                                 args: { collection: 'CatalogProduct' } },
+    { id: 'db.query',                                 args: { collection: 'ProductMatchArtifact' } },
+    { id: 'db.query',                                 args: { collection: 'DetectionArtifact' } },
+    { id: 'db.query',                                 args: { collection: 'DetectRun' } },
+    { id: 'db.query',                                 args: { collection: 'Ad' } }   // via-brand tenant path
+  ];
+
+  const req = {
+    advertiserId: OID_ZERO,
+    user: { userId: OID_ZERO, email: 'stub@example.invalid', name: 'Stub User' }
+  };
+
+  const restore = stubMongooseModels(models, populated);
+  try {
+    for (const { id, args } of T0_CAPS) {
+      const cap = registry.capabilityById(id);
+      if (!cap) { fail(`T0 smoke ${id}: capability not registered`); continue; }
+      const executor = require(registry.resolveExecutorPath(cap));
+      const method = cap.execute.method || 'run';
+      const fn = executor[method];
+      if (typeof fn !== 'function') {
+        fail(`T0 smoke ${id}: executor.${method} not a function`); continue;
+      }
+      const label = `${id}${args.collection ? ` (${args.collection})` : ''}`;
+      let result;
+      try {
+        result = await fn({ req, args });
+      } catch (err) {
+        result = { _threw: true, _errMsg: err.message, _stack: (err.stack || '').split('\n')[1] || '' };
+      }
+      if (result?._threw) {
+        fail(`T0 smoke ${label}: threw`, `${result._errMsg} — ${result._stack.trim()}`);
+      } else if (!result || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+        fail(`T0 smoke ${label}: returned malformed result`, JSON.stringify(result).slice(0, 200));
+      } else {
+        ok(`T0 smoke ${label}: shaped result (ok:${result.ok})`);
+      }
+    }
+  } finally {
+    restore();
+  }
+}
+
 // ── Final ─────────────────────────────────────────────────────────
 (async () => {
   await checkTenantGuard();
@@ -743,6 +2562,25 @@ async function checkSurfaceWideningExecutors() {
   await checkLifestyleUnitService();
   await checkPlatformListExecutor();
   await checkAdListExecutor();
+  await checkPhase4PatchExecutors();
+  await checkPhase4MediaExecutors();
+  await checkPhase4Tier2Executors();
+  await checkPhase4Tier4Executors();
+  await checkPhase5Executors();
+  await checkPhase6Executors();
+  await checkPhase7Executors();
+  await checkPhase8aExecutors();
+  await checkPhase9Executors();
+  await checkPhase10Executors();
+  await checkIngestionCoverageExecutors();
+  await checkAdRegenerateExecutor();
+  await checkBulkRefreshExecutors();
+  await checkCatalogRefreshTrio();
+  await checkMediaSourceSummary();
+  await checkDbQueryInvariants();
+  await checkProductsWithoutAds();
+  await checkMediaAssignmentExecutors();
+  await checkT0SmokeSuite();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

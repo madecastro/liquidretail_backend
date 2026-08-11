@@ -76,11 +76,15 @@ const SENDABLE = new Set([...GPT_IMAGE_2_EDIT_SIZE_ENUM, ...Object.keys(PROVEN_N
 
 // Post-fix GEN_SIZES order is load-bearing: chooseGenSize uses strict `<`
 // so equal-loss ties keep the earlier table entry. Do not reorder casually.
+// Phase A added 2048x1152 (enum exact 16:9) so landscape/pmax surfaces go
+// zero-crop instead of 1536x1024 (3:2, 15.6% T/B). Placed after the 9:16 twin
+// and before the probed 4:5 so equal-loss ties cannot flip Meta winners.
 const EXPECTED_GEN_SIZE_TABLE = [
   '1024x1024',
   '1024x1536',
   '1536x1024',
   '1152x2048',
+  '2048x1152',
   '1088x1360'
 ];
 
@@ -95,11 +99,19 @@ const FEED_4_5_CROP_TOP_BOTTOM = 0;
 const FEED_4_5_LOSS_PCT = 0;
 const FEED_4_5_GENERATE = '1088x1360';
 
-// Our edge-margin convention, restated here rather than imported. S2b's whole
-// value is that it recomputes the box independently; reading the constant off
-// the module under test would let a changed convention pass unnoticed. If this
-// intentionally changes, change it here in the same commit and say why.
+// Default edge-margin convention (percent of kept short side). Restated here
+// as the expected DEFAULT so a silent change to EDGE_MARGIN_PCT fails S2d;
+// S2b's per-surface recompute imports SURFACE_EDGE_MARGIN_PCT and falls back
+// to EDGE_MARGIN_PCT so it tracks the same map the code uses without copying
+// the emitted box.
 const EXPECTED_EDGE_MARGIN_PCT = 6;
+// Phase A PMax statics only — every other surface must stay at 6%.
+const EXPECTED_PMAX_EDGE_MARGIN_PCT = 10;
+const PMAX_STATIC_SURFACE_KEYS = [
+  'pmax_landscape_1_91_1',
+  'pmax_square_1_1',
+  'pmax_portrait_4_5'
+];
 
 // Production logo geometry — mirrors directImageRenderService compositing.
 const LOGO_W_FRAC = 0.16;
@@ -314,8 +326,17 @@ function logoPlace(surface, dims, logoW, logoH) {
 // Deliberate duplication: this arithmetic restates computeSurface rather than
 // calling it. An independent recomputation is the whole point — a harness that
 // asks the implementation what it thinks the answer is pins nothing.
+//
+// Per-surface margin: use the SAME map the code uses (SURFACE_EDGE_MARGIN_PCT
+// → EDGE_MARGIN_PCT fallback). That keeps the recompute independent of the
+// *emitted box* while tracking Phase A's 10% PMax static override. S2d pins
+// that the map itself is only those three keys at 10% and everything else is 6.
 {
   const TOL_PCT = 0.1; // one emitted decimal place
+  const surfaceMarginMap = intents.SURFACE_EDGE_MARGIN_PCT || {};
+  const defaultMarginPct = typeof intents.EDGE_MARGIN_PCT === 'number'
+    ? intents.EDGE_MARGIN_PCT
+    : EXPECTED_EDGE_MARGIN_PCT;
 
   for (const key of pf.PLATFORM_FORMAT_KEYS) {
     const s = intents.computeSurface(key);
@@ -330,17 +351,32 @@ function logoPlace(surface, dims, logoW, logoH) {
     const botReserve = ((safe.bottom || 0) / canvas.height) * keptH;
 
     // The margin basis is KEPT, not generated. On a surface cropped along its
-    // short axis these differ (pmax 16:9: kept short side 864 vs generated
-    // 1024, i.e. 51.84px vs 61.44px), which is the only place a gen-frame basis
-    // is observable at all — so this loop must run over every declared key, not
-    // just the live image ones.
-    const margin = (EXPECTED_EDGE_MARGIN_PCT / 100) * Math.min(keptW, keptH);
+    // short axis these differ (pmax 16:9 historically: kept short side 864 vs
+    // generated 1024), which is the only place a gen-frame basis is observable
+    // at all — so this loop must run over every declared key, not just the
+    // live image ones. Per-surface % comes from the same map the code uses.
+    const hasOverride = Object.prototype.hasOwnProperty.call(surfaceMarginMap, key);
+    const marginPct = hasOverride ? surfaceMarginMap[key] : defaultMarginPct;
+
+    // Two different rules, deliberately. Short-side (a uniform pixel border) for
+    // every surface that inherits the default; PER-AXIS for the surfaces that
+    // carry an explicit override, because Google states its safe area per
+    // dimension — central 80% of width AND of height. On 1200x628 the short-side
+    // rule yielded only 5.2% of the width, which is what put real ad copy in
+    // Google's crop band. S2e pins the resulting boxes directly.
+    const marginX = hasOverride
+      ? (marginPct / 100) * keptW
+      : (marginPct / 100) * Math.min(keptW, keptH);
+    const marginY = hasOverride
+      ? (marginPct / 100) * keptH
+      : (marginPct / 100) * Math.min(keptW, keptH);
+    const margin = Math.min(marginX, marginY); // for the degenerate-inversion report below
 
     const exact = {
-      left:   s.cropPx.left + margin,
-      right:  s.cropPx.left + keptW - margin,
-      top:    s.cropPx.top + topReserve + margin,
-      bottom: s.cropPx.top + keptH - botReserve - margin
+      left:   s.cropPx.left + marginX,
+      right:  s.cropPx.left + keptW - marginX,
+      top:    s.cropPx.top + topReserve + marginY,
+      bottom: s.cropPx.top + keptH - botReserve - marginY
     };
 
     // Skip the degenerate-fallback surfaces: when margin would invert the box
@@ -368,10 +404,13 @@ function logoPlace(surface, dims, logoW, logoH) {
         `(crop=${JSON.stringify(s.cropPx)} kept=${keptW}x${keptH} margin=${margin.toFixed(2)})`
       );
       // And the rounding must go INWARD off that exact value, never outward.
+      // 1e-9 absorbs IEEE754 dust on exact tenths (e.g. 10% of 1088 = 108.8)
+      // without admitting a real outward step (one emitted tenth ≈ total/1000).
       const emittedPx = (emitted / 100) * total;
+      const EPS_PX = 1e-9;
       check(
         `S2b ${key} box.${edge} rounds inward, not outward`,
-        side === 'lo' ? emittedPx >= exact[edge] : emittedPx <= exact[edge],
+        side === 'lo' ? emittedPx + EPS_PX >= exact[edge] : emittedPx - EPS_PX <= exact[edge],
         `emittedPx=${emittedPx.toFixed(3)} exactPx=${exact[edge].toFixed(3)} side=${side}`
       );
       // Float-dust pin. When the exact percentage IS a whole tenth, inward
@@ -391,6 +430,42 @@ function logoPlace(surface, dims, logoW, logoH) {
         );
       }
     }
+  }
+}
+
+// ── S2d: per-surface margin map is scoped — 10% only on the three PMax statics ─
+// A future accidental widening of SURFACE_EDGE_MARGIN_PCT to a Meta surface
+// (or dropping a PMax static back to 6%) must fail here, not silently ship.
+{
+  const map = intents.SURFACE_EDGE_MARGIN_PCT || {};
+  check(
+    'S2d EDGE_MARGIN_PCT default is still 6',
+    intents.EDGE_MARGIN_PCT === EXPECTED_EDGE_MARGIN_PCT,
+    `EDGE_MARGIN_PCT=${intents.EDGE_MARGIN_PCT}`
+  );
+  for (const key of PMAX_STATIC_SURFACE_KEYS) {
+    check(
+      `S2d ${key} uses ${EXPECTED_PMAX_EDGE_MARGIN_PCT}% edge margin`,
+      map[key] === EXPECTED_PMAX_EDGE_MARGIN_PCT,
+      `SURFACE_EDGE_MARGIN_PCT[${key}]=${map[key]}`
+    );
+  }
+  const mapKeys = Object.keys(map);
+  check(
+    'S2d SURFACE_EDGE_MARGIN_PCT keys are exactly the three Phase A PMax statics',
+    mapKeys.length === PMAX_STATIC_SURFACE_KEYS.length &&
+      PMAX_STATIC_SURFACE_KEYS.every((k) => mapKeys.includes(k)) &&
+      mapKeys.every((k) => PMAX_STATIC_SURFACE_KEYS.includes(k)),
+    `map keys=${mapKeys.join(',')}`
+  );
+  // Every OTHER declared platform format resolves to the 6% default (no map entry).
+  for (const key of pf.PLATFORM_FORMAT_KEYS) {
+    if (PMAX_STATIC_SURFACE_KEYS.includes(key)) continue;
+    check(
+      `S2d ${key} stays at default ${EXPECTED_EDGE_MARGIN_PCT}% (not in 10% map)`,
+      !Object.prototype.hasOwnProperty.call(map, key),
+      `SURFACE_EDGE_MARGIN_PCT unexpectedly has ${key}=${map[key]}`
+    );
   }
 }
 
@@ -580,14 +655,14 @@ function logoPlace(surface, dims, logoW, logoH) {
       typeof s === 'string' ? s : `${s.w}x${s.h}`
     );
     check(
-      'S4 exported GEN_SIZES matches the expected five-entry post-fix table (set equality)',
+      'S4 exported GEN_SIZES matches the expected six-entry post-Phase-A table (set equality)',
       exported.length === EXPECTED_GEN_SIZE_TABLE.length &&
         EXPECTED_GEN_SIZE_TABLE.every((s) => exported.includes(s)) &&
         exported.every((s) => EXPECTED_GEN_SIZE_TABLE.includes(s)),
       `exported=${exported.join(',')} expected=${EXPECTED_GEN_SIZE_TABLE.join(',')}`
     );
-    // Order pin: first three legacy, then 1152x2048 last (or at least after
-    // the three) so equal-loss ties still prefer the legacy entry.
+    // Order pin: first three legacy, then 1152x2048 / 2048x1152, then probed
+    // 4:5 — equal-loss ties still prefer the earlier (legacy) entry.
     check(
       'S4 GEN_SIZES table order keeps 1024x1024 before any equal-loss alternative',
       exported.indexOf('1024x1024') === 0,
@@ -633,9 +708,17 @@ function logoPlace(surface, dims, logoW, logoH) {
   }
 }
 
-// ── S6: adding 1152x2048 did not displace winners for other aspects ─────
-// 1:1 → 1024x1024, 4:5 → 1024x1536, 16:9 → 1536x1024. Least-crop with `<`
-// tie-break makes TABLE ORDER load-bearing — pin the winners, not just loss.
+// ── S6: adding 1152x2048 / 2048x1152 did not displace Meta winners ──────
+// 1:1 → 1024x1024, 4:5 → 1088x1360. Least-crop with `<` tie-break makes
+// TABLE ORDER load-bearing — pin the winners, not just loss.
+//
+// Phase A: 2048x1152 (schema-enum exact 16:9) is now in GEN_SIZES so true
+// 16:9 surfaces (incl. frozen pmax_16_9, still reachable via
+// adRegenerateService) generate zero-crop. Earlier this harness pinned
+// 1536x1024 + 80px T/B (3:2 loss 15.6%) and deliberately did NOT add the
+// enum 16:9 member because pmax was frozen — that freeze no longer applies
+// to generation geometry once live PMax landscape (1.91:1) needs a near-
+// landscape plate; the enum member is the right answer for exact 16:9.
 {
   const feed11 = intents.computeSurface('meta_feed_1_1');
   check(
@@ -660,37 +743,62 @@ function logoPlace(surface, dims, logoW, logoH) {
     `generate=${feed45.generate}`
   );
 
-  // 16:9 — pmax_16_9 is frozen/coming_soon but describeSurfaces walks it,
-  // and adRegenerateService can still hit it for 45 existing Ads.
-  const pmaxKey = pf.PLATFORM_FORMAT_KEYS.find((k) => {
-    const a = pf.PLATFORM_FORMATS[k] && pf.PLATFORM_FORMATS[k].aspectRatio;
-    return a === '16:9';
-  });
-  check('S6 a 16:9 platform format key exists', !!pmaxKey, 'no 16:9 key in PLATFORM_FORMATS');
-  if (pmaxKey) {
-    const pmax = intents.computeSurface(pmaxKey);
-    check(
-      `S6 ${pmaxKey} still generates 1536x1024 (not displaced by 1152x2048)`,
-      pmax.generate === '1536x1024',
-      `generate=${pmax.generate}`
-    );
-    // NOT zero-loss, and an earlier draft of this harness asserted that it was.
-    // 1536x1024 is 3:2 (1.5), not 16:9 (1.7778), so this surface crops 80px off
-    // the top and bottom for a 15.6% loss — the same defect class as 4:5, and the
-    // enum's exact-16:9 member (2048x1152) is NOT added here because pmax is
-    // frozen/coming_soon and adding it would be an unrequested cost change on a
-    // path nobody generates to. What matters for THIS change is only that the
-    // winner is unchanged; the crop is pinned so a future edit has to be
-    // deliberate. pmax is still reachable via adRegenerateService, which passes
-    // ad.platformFormat with no live-format gate, so it is not dead geometry.
-    check(
-      `S6 ${pmaxKey} crop unchanged by adding 1152x2048 (80px T/B, 15.6% — 1536x1024 is 3:2, never was zero-loss)`,
-      pmax.cropPx.left === 0 &&
-        pmax.cropPx.top === 80 &&
-        pmax.lossPct === 15.6,
-      `cropPx=${JSON.stringify(pmax.cropPx)} lossPct=${pmax.lossPct}`
-    );
-  }
+  // Frozen pmax_16_9 — pin by key (not "first 16:9") so live pmax_video_16_9
+  // cannot steal this pin. Phase A: exact-16:9 enum member → zero crop.
+  const pmax = intents.computeSurface('pmax_16_9');
+  check(
+    'S6 pmax_16_9 generates 2048x1152 (Phase A enum exact 16:9; was 1536x1024 / 15.6% T/B crop)',
+    pmax.generate === '2048x1152',
+    `generate=${pmax.generate}`
+  );
+  check(
+    'S6 pmax_16_9 is now zero-crop / zero-loss at 2048x1152 (exact 16:9 enum member)',
+    pmax.cropPx.left === 0 &&
+      pmax.cropPx.right === 0 &&
+      pmax.cropPx.top === 0 &&
+      pmax.cropPx.bottom === 0 &&
+      pmax.lossPct === 0,
+    `cropPx=${JSON.stringify(pmax.cropPx)} lossPct=${pmax.lossPct}`
+  );
+
+  // Phase A live PMax statics — generate size + crop pinned explicitly.
+  // 1.91:1 is NOT exact 16:9 (1.777…): 2048x1152 wins least-crop and still
+  // centre-crops 40px T/B (6.9% loss). Square and portrait are exact-aspect.
+  const pmaxLand = intents.computeSurface('pmax_landscape_1_91_1');
+  check(
+    'S6 pmax_landscape_1_91_1 generates 2048x1152 (nearest enum landscape; 1.91:1 ≠ 16:9)',
+    pmaxLand.generate === '2048x1152',
+    `generate=${pmaxLand.generate}`
+  );
+  check(
+    'S6 pmax_landscape_1_91_1 crop is 40px T/B (6.9% — 1.91:1 on 16:9 plate)',
+    pmaxLand.cropPx.left === 0 &&
+      pmaxLand.cropPx.right === 0 &&
+      pmaxLand.cropPx.top === 40 &&
+      pmaxLand.cropPx.bottom === 40 &&
+      pmaxLand.lossPct === 6.9,
+    `cropPx=${JSON.stringify(pmaxLand.cropPx)} lossPct=${pmaxLand.lossPct}`
+  );
+
+  const pmaxSq = intents.computeSurface('pmax_square_1_1');
+  check(
+    'S6 pmax_square_1_1 generates 1024x1024 (exact 1:1, zero crop)',
+    pmaxSq.generate === '1024x1024' &&
+      pmaxSq.cropPx.left === 0 &&
+      pmaxSq.cropPx.top === 0 &&
+      pmaxSq.lossPct === 0,
+    `generate=${pmaxSq.generate} cropPx=${JSON.stringify(pmaxSq.cropPx)} lossPct=${pmaxSq.lossPct}`
+  );
+
+  const pmaxPort = intents.computeSurface('pmax_portrait_4_5');
+  check(
+    'S6 pmax_portrait_4_5 generates 1088x1360 (exact 4:5, zero crop)',
+    pmaxPort.generate === '1088x1360' &&
+      pmaxPort.cropPx.left === 0 &&
+      pmaxPort.cropPx.top === 0 &&
+      pmaxPort.lossPct === 0,
+    `generate=${pmaxPort.generate} cropPx=${JSON.stringify(pmaxPort.cropPx)} lossPct=${pmaxPort.lossPct}`
+  );
 }
 
 // ── S7: 4:5 remaining crop is a known deliberate remainder ──────────────
@@ -721,6 +829,32 @@ function logoPlace(surface, dims, logoW, logoH) {
 }
 
 // ── summary ─────────────────────────────────────────────────────────────
+// ── S2e. Google's central-80% rule, in the units Google writes it in ────
+//
+// The three live PMax statics must keep the safe box inside the central 80%
+// of BOTH axes. This is the check that would have caught the 1200x628 box
+// emitting x 5..95: a short-side margin looks correct in pixels and is wrong
+// in the only units the policy is stated in, so real ad copy landed in the
+// band Google crops. Verified against a delivered render — ink began at x=60px
+// against a box edge of 62.8px, i.e. the model obeyed a box that was itself wrong.
+//
+// Asserted on the EMITTED box, so it is independent of how the margin is
+// computed: any future refactor that reintroduces a uniform-pixel border on
+// these surfaces fails here whatever its internal arithmetic looks like.
+{
+  const PMAX_STATICS = ['pmax_landscape_1_91_1', 'pmax_square_1_1', 'pmax_portrait_4_5'];
+  const LO = EXPECTED_PMAX_EDGE_MARGIN_PCT;
+  const HI = 100 - EXPECTED_PMAX_EDGE_MARGIN_PCT;
+  const EPS = 0.01;
+  for (const key of PMAX_STATICS) {
+    const b = intents.computeSurface(key).box;
+    check(`S2e ${key} box.left inside central 80%`,   b.left   >= LO - EPS, `left=${b.left}% must be >= ${LO}%`);
+    check(`S2e ${key} box.right inside central 80%`,  b.right  <= HI + EPS, `right=${b.right}% must be <= ${HI}%`);
+    check(`S2e ${key} box.top inside central 80%`,    b.top    >= LO - EPS, `top=${b.top}% must be >= ${LO}%`);
+    check(`S2e ${key} box.bottom inside central 80%`, b.bottom <= HI + EPS, `bottom=${b.bottom}% must be <= ${HI}%`);
+  }
+}
+
 const liveKeys = liveImageSurfaces();
 const scope = [
   `${liveKeys.length} live image surfaces`,

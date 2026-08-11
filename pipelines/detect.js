@@ -40,6 +40,10 @@ const { extractEntities } = require('../services/nerService');
 const { findProductMatches, findPerProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { computeFocus } = require('../services/imageQualityService');
+const {
+  classifyShotStyle,
+  isEnabled: isShotHeuristicEnabled
+} = require('../services/imageShotHeuristicService');
 const { scoreMedia } = require('../services/adSuitabilityService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
 const { identifyYoloDetectionsGemini, isEnabled: isGeminiIdentifyEnabled } = require('../services/geminiIdentifyService');
@@ -971,6 +975,11 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
       });
     }
   });
+  // Stamp source='detect' on every entry so operator-added entries
+  // (source='operator') can be distinguished + preserved on re-run.
+  // Load-bearing — see the Media schema comment + verifier §34.
+  for (const mp of matchedProducts)   mp.source = 'detect';
+  for (const mc of matchedCategories) mc.source = 'detect';
   media.matchedProducts   = matchedProducts;
   media.matchedCategories = matchedCategories;
 
@@ -979,21 +988,35 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
     media.classification = media.classification || {};
     media.classification.detectSummary = productMatches.detectSummary;
   }
-  // updateOne, not save() — Mongoose's dirty-field tracker still has
-  // the earlier denorm assignments (subjects/text/refinedProducts)
-  // flagged as modified, so a save() here would re-run those with a
-  // stale __v and trip "No matching document found". updateOne writes
-  // exactly the match-denorm fields and skips the version check.
+  // Update pattern (2026-08-10, UGC-ads Phase 1): $pull existing
+  // detect entries → $push fresh ones. Operator entries survive
+  // because $pull filters on source:'detect'. Prior code was
+  // $set: matchedProducts (wholesale overwrite) — that would wipe
+  // every operator attachment on every detect re-run. If a future
+  // refactor goes back to $set, the verifier's UGC-attachment
+  // regression guard fires.
   try {
+    // Two-step: pull all detect entries, then push the new set.
+    // Can't merge into one updateOne — $pull and $push on the same
+    // path in the same command are ambiguous and Mongo rejects.
     await Media.updateOne(
       { _id: media._id },
-      { $set: {
-          matchedProducts,
-          matchedCategories,
-          ...(productMatches?.detectSummary
-              ? { 'classification.detectSummary': productMatches.detectSummary }
-              : {})
+      { $pull: {
+          matchedProducts:   { source: 'detect' },
+          matchedCategories: { source: 'detect' }
       } }
+    );
+    await Media.updateOne(
+      { _id: media._id },
+      {
+        $push: {
+          matchedProducts:   { $each: matchedProducts },
+          matchedCategories: { $each: matchedCategories }
+        },
+        ...(productMatches?.detectSummary
+            ? { $set: { 'classification.detectSummary': productMatches.detectSummary } }
+            : {})
+      }
     );
   } catch (err) {
     console.warn(`   ⚠️  failed to persist Media match denormalization: ${err.message}`);
@@ -1025,7 +1048,8 @@ async function mirrorMatchesToCatalogProducts(mediaId, matchedProducts) {
       confidence:              mp.confidence,
       refinedProductId:        mp.refinedProductId,
       matchEvidenceArtifactId: mp.matchEvidenceArtifactId,
-      matchedAt:               new Date()
+      matchedAt:               new Date(),
+      source:                  'detect'   // required — must not $pull operator entries
     };
     if (!byCatalogProduct.has(cpId)) byCatalogProduct.set(cpId, []);
     byCatalogProduct.get(cpId).push(entry);
@@ -1055,10 +1079,13 @@ async function mirrorMatchesToCatalogProducts(mediaId, matchedProducts) {
     // pull+push so re-runs replace rather than duplicate the entry.
     const targetIds = [cpId, ...(variantsByPrimary.get(String(cpId)) || []).map(String)];
     for (const targetId of targetIds) {
+      // Only $pull DETECT entries for this media — operator-added
+      // matchedMedia entries survive detect re-runs. Load-bearing
+      // for the UGC-ads Phase 1 attachment preservation invariant.
       bulkOps.push({
         updateOne: {
           filter: { _id: targetId },
-          update: { $pull: { matchedMedia: { mediaId } } }
+          update: { $pull: { matchedMedia: { mediaId, source: 'detect' } } }
         }
       });
       bulkOps.push({
@@ -1356,13 +1383,16 @@ function resolvePrimarySubjectDesc(subjects, judge) {
 }
 
 // Phase A-0 — finalize-stage Media Library derivations. Cheap, runs at
-// detect end. Pulls focus from the source-image buffer (when available),
-// pulls brightness/density averages from the overlay-zone grids,
-// composites the ad-readiness score + bullets via adSuitabilityService,
-// and writes everything onto Media.{technicalInsights, adSuitability}.
+// detect end. Pulls focus + packshot/lifestyle heuristic from the source-
+// image buffer (when available), pulls brightness/density averages from
+// the overlay-zone grids, composites the ad-readiness score + bullets
+// via adSuitabilityService, and writes everything onto
+// Media.{technicalInsights, adSuitability}. The shot-style heuristic
+// never writes classification.shotType (LLM owns that field).
 //
-// All sub-steps are best-effort — a missing buffer or missing overlay
-// artifact only suppresses the dependent metric, never fails the run.
+// All sub-steps are best-effort — a missing buffer, missing overlay
+// artifact, or heuristic failure only suppresses the dependent metric,
+// never fails the run.
 async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, productMatches) {
   try {
     // 1. Focus — Laplacian variance on the source buffer
@@ -1370,6 +1400,26 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
     if (sourceBuffer) {
       try { focus = await computeFocus(sourceBuffer); }
       catch (err) { console.warn(`   ⚠️  focus derivation failed: ${err.message}`); }
+    }
+
+    // 1b. Packshot/lifestyle heuristic — zero-cost sharp only.
+    //     Independent of classification.shotType (LLM). Best-effort: a null
+    //     or throw never fails the DetectRun (mirrors computeFocus).
+    //
+    //     Skip recompute when materializeImage already copied an ingest-time
+    //     style onto technicalInsights (CatalogProduct.imageShotStyles →
+    //     Media). Detect remains the fallback for anything ingest missed.
+    let shotStyle = null;
+    const carried = media?.technicalInsights?.shotStyle;
+    if (carried === 'packshot' || carried === 'lifestyle' || carried === 'ambiguous') {
+      shotStyle = {
+        style: carried,
+        confidence: media.technicalInsights.shotStyleConfidence ?? null,
+        metrics: media.technicalInsights.shotStyleMetrics ?? null
+      };
+    } else if (sourceBuffer && isShotHeuristicEnabled()) {
+      try { shotStyle = await classifyShotStyle(sourceBuffer); }
+      catch (err) { console.warn(`   ⚠️  shot-style heuristic failed: ${err.message}`); }
     }
 
     // 2. Brightness + density averages — from the OverlayZoneArtifact's
@@ -1381,11 +1431,16 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
     const densityAvg    = averageGrid(overlayZones?.densityGrid);
 
     const technicalInsights = {
-      brightnessAvg: brightnessAvg ?? null,
-      densityAvg:    densityAvg    ?? null,
-      focusScore:    focus?.focusScore ?? null,
-      focusBucket:   focus?.focusBucket || null,
-      updatedAt:     new Date()
+      brightnessAvg:        brightnessAvg ?? null,
+      densityAvg:           densityAvg    ?? null,
+      focusScore:           focus?.focusScore ?? null,
+      focusBucket:          focus?.focusBucket || null,
+      // Dot-notation-ready fields under technicalInsights — declared on
+      // Media schema. Do NOT write classification.shotType here.
+      shotStyle:            shotStyle?.style ?? null,
+      shotStyleConfidence:  shotStyle?.confidence ?? null,
+      shotStyleMetrics:     shotStyle?.metrics ?? null,
+      updatedAt:            new Date()
     };
     media.technicalInsights = technicalInsights;
 
@@ -1525,4 +1580,9 @@ async function updateMediaLatestArtifacts(media, ids) {
   await Media.updateOne({ _id: media._id }, { $set: { latestArtifacts } });
 }
 
-module.exports = { processDetectRun };
+module.exports = {
+  processDetectRun,
+  // Exported for offline harnesses (verifyIngestShotClassify H3/H4) that
+  // must exercise the carried-style branch for real — not re-implement it.
+  applyMediaLibraryDerivations
+};

@@ -34,7 +34,9 @@ const {
   INTENTS,
   resolveIntent,
   describeSurfaces,
-  BRAND_LED_COPY
+  BRAND_LED_COPY,
+  resolveDrawCta,
+  PMAX_STATIC_PLATFORM_NOTES
 } = require('../services/staticAdIntents');
 
 const PRODUCT = {
@@ -215,8 +217,24 @@ for (const intentKey of intents) {
 
       // CTA must not be SET as text where the platform supplies it. The absence
       // list legitimately names it in order to forbid it, so check the text block.
+      //
+      // Phase B (PMAX_STATIC_PLATFORM_NOTES default ON): effective drawCta is
+      // intent-aware on pmax_* — suppressed for every resolved intent EXCEPT
+      // objection_resolved. Meta still uses SURFACE_POLICY.drawCta only.
+      // Never key on the raw SURFACE_POLICY boolean for pmax: brand_led /
+      // social_proof_led / product_first_lifestyle all suppress CTA there.
+      // Use the RESOLVED intent (r.resolved.key), not the requested one —
+      // a fallback off objection_resolved must suppress CTA too.
       const textBlock = p.split('SET EXACTLY THESE STRINGS')[1]?.split('Set no other words')[0] || '';
-      if (!policy.drawCta) {
+      const effectiveDrawCta = resolveDrawCta({
+        surfaceKey: surface,
+        policy,
+        intentKey: r.resolved.key
+      });
+      // Cross-check: buildPrompt returns the same effective policy.
+      check(`${label} r.policy.drawCta matches resolveDrawCta`,
+        r.policy.drawCta, effectiveDrawCta);
+      if (!effectiveDrawCta) {
         falsy(`${label} no CTA text on this surface`, CTA_RE.test(textBlock));
         truthy(`${label} CTA explicitly forbidden`, /no CTA button/.test(p));
       } else {
@@ -389,18 +407,24 @@ const countEmittedStrings = (prompt) => {
 }
 
 // E5 slot counts with full brand_led data
+// Phase A expected pmax_16_9 to emit 4 (CTA drawn). Phase B with
+// PMAX_STATIC_PLATFORM_NOTES ON suppresses CTA for brand_led on every
+// pmax_* surface — same 3-string shape as Stories (headline + subhead +
+// trust mark). Meta feed surfaces still emit 4.
 {
   const full = { headline: 'Built for salt', subhead: 'Every tide.', rating: '4.8', cta: 'SHOP NOW' };
-  const fourSurfaces = ['meta_feed_1_1', 'meta_feed_4_5', 'pmax_16_9'];
-  for (const surface of fourSurfaces) {
+  const fourStringSurfaces = ['meta_feed_1_1', 'meta_feed_4_5'];
+  for (const surface of fourStringSurfaces) {
     const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface });
     const n = countEmittedStrings(r.prompt);
     check(`E5 brand_led/${surface} emits 4 strings`, n, 4);
     check(`E5 brand_led/${surface} count <= maxTextElements`,
       n <= SURFACE_POLICY[surface].maxTextElements, true);
   }
-  {
-    const surface = 'meta_stories_9_16';
+  // Stories: SURFACE_POLICY.drawCta false. PMax: Phase B intent-aware
+  // suppress for brand_led. Both emit 3 (CTA stripped).
+  const threeStringSurfaces = ['meta_stories_9_16', 'pmax_16_9'];
+  for (const surface of threeStringSurfaces) {
     const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface });
     const n = countEmittedStrings(r.prompt);
     check(`E5 brand_led/${surface} emits 3 strings (CTA stripped)`, n, 3);
@@ -439,6 +463,111 @@ const countEmittedStrings = (prompt) => {
 // E8 kill-switch export
 {
   check('E8 BRAND_LED_COPY is exported boolean', typeof BRAND_LED_COPY, 'boolean');
+}
+
+// ── F. Phase B resolveDrawCta truth table + flag-off pmax Phase A restore ──
+// F1: surface family × resolved intent → drawCta (flag ON, default).
+// F2: with PMAX_STATIC_PLATFORM_NOTES=false, every pmax surface reverts to
+//     SURFACE_POLICY.drawCta (true) for all intents — Phase A behaviour.
+console.log('\nF. resolveDrawCta truth table (Phase B) + flag-off Phase A restore');
+
+{
+  check('F0 PMAX_STATIC_PLATFORM_NOTES export is boolean',
+    typeof PMAX_STATIC_PLATFORM_NOTES, 'boolean');
+  check('F0 resolveDrawCta is exported function',
+    typeof resolveDrawCta, 'function');
+  // Default arm is ON (env unset or not the string "false").
+  truthy('F0 PMAX_STATIC_PLATFORM_NOTES default ON in this process',
+    PMAX_STATIC_PLATFORM_NOTES === true);
+}
+
+// F1 — truth table, flag ON (current module load).
+// Meta: always SURFACE_POLICY.drawCta (Stories false; feed true).
+// PMax: true IFF resolved intent === 'objection_resolved'.
+{
+  const intentKeys = Object.keys(INTENTS);
+  const metaSurfaces = surfaces.filter((s) => !String(s).startsWith('pmax_'));
+  const pmaxSurfaces = surfaces.filter((s) => String(s).startsWith('pmax_'));
+
+  for (const surface of metaSurfaces) {
+    const policy = SURFACE_POLICY[surface];
+    if (!policy || !policy.static) continue;
+    for (const intentKey of intentKeys) {
+      const got = resolveDrawCta({ surfaceKey: surface, policy, intentKey });
+      check(`F1 meta ${surface}/${intentKey} drawCta === policy.drawCta`,
+        got, policy.drawCta);
+    }
+  }
+  for (const surface of pmaxSurfaces) {
+    const policy = SURFACE_POLICY[surface];
+    if (!policy || !policy.static) continue;
+    for (const intentKey of intentKeys) {
+      const expected = intentKey === 'objection_resolved';
+      const got = resolveDrawCta({ surfaceKey: surface, policy, intentKey });
+      check(`F1 pmax ${surface}/${intentKey} drawCta === ${expected}`,
+        got, expected);
+    }
+  }
+}
+
+// F2 — flag OFF restores Phase A: every pmax surface drawCta true for all
+// intents, and buildPrompt emits CTA on pmax for non-Stories-style paths.
+// Invalidate BOTH staticAdIntents and platformFormats (documented trap:
+// invalidating only one can silently pin the wrong build).
+{
+  const intentsKey = require.resolve('../services/staticAdIntents');
+  const pfKey = require.resolve('../services/platformFormats');
+  const prev = process.env.PMAX_STATIC_PLATFORM_NOTES;
+  delete require.cache[intentsKey];
+  delete require.cache[pfKey];
+  process.env.PMAX_STATIC_PLATFORM_NOTES = 'false';
+  let offMod;
+  try {
+    offMod = require('../services/staticAdIntents');
+  } finally {
+    // Restore env for any later require; re-load default arm below.
+    if (prev === undefined) delete process.env.PMAX_STATIC_PLATFORM_NOTES;
+    else process.env.PMAX_STATIC_PLATFORM_NOTES = prev;
+  }
+
+  check('F2 flag-off: PMAX_STATIC_PLATFORM_NOTES is false',
+    offMod.PMAX_STATIC_PLATFORM_NOTES, false);
+
+  const intentKeys = Object.keys(offMod.INTENTS);
+  const pmaxSurfaces = Object.keys(offMod.SURFACE_POLICY)
+    .filter((s) => String(s).startsWith('pmax_'));
+  for (const surface of pmaxSurfaces) {
+    const policy = offMod.SURFACE_POLICY[surface];
+    if (!policy || !policy.static) continue;
+    for (const intentKey of intentKeys) {
+      const got = offMod.resolveDrawCta({ surfaceKey: surface, policy, intentKey });
+      check(`F2 flag-off resolveDrawCta ${surface}/${intentKey} === policy.drawCta`,
+        got, policy.drawCta);
+      // Phase A: all live/frozen pmax static surfaces stamp drawCta:true.
+      check(`F2 flag-off ${surface}/${intentKey} policy.drawCta is true (Phase A)`,
+        policy.drawCta, true);
+    }
+  }
+
+  // Prompt-level pin: brand_led on pmax_16_9 emits CTA again (4 strings).
+  {
+    const full = { headline: 'Built for salt', subhead: 'Every tide.', rating: '4.8', cta: 'SHOP NOW' };
+    const r = offMod.buildPrompt({
+      intentKey: 'brand_led', data: full, product: PRODUCT, surface: 'pmax_16_9'
+    });
+    const textBlock = (r.prompt || '').split('SET EXACTLY THESE STRINGS')[1]
+      ?.split('Set no other words')[0] || '';
+    truthy('F2 flag-off brand_led/pmax_16_9 CTA present in text block',
+      CTA_RE.test(textBlock));
+    check('F2 flag-off brand_led/pmax_16_9 emits 4 strings (Phase A)',
+      countEmittedStrings(r.prompt), 4);
+  }
+
+  // Drop the flag-off module so a later require reloads the default arm.
+  delete require.cache[intentsKey];
+  delete require.cache[pfKey];
+  if (prev === undefined) delete process.env.PMAX_STATIC_PLATFORM_NOTES;
+  else process.env.PMAX_STATIC_PLATFORM_NOTES = prev;
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} verifyStaticIntents: ${pass}/${pass + fail} checks passed\n`);

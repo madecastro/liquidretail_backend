@@ -99,6 +99,13 @@ const mediaSchema = new mongoose.Schema({
   //   confident outcome (product_match or product_category). Catalog
   //   winners include the catalogProductId FK; competitor matches and
   //   no-match-no-category outcomes are omitted from this array.
+  // The `source` field on every subdoc distinguishes DETECT-derived
+  // entries from OPERATOR-added attachments (Phase 1 of UGC-ads flow,
+  // 2026-08-10). Default 'detect' so back-compat writes keep working
+  // without touching every caller. Detect write-path MUST filter on
+  // source:'detect' when it $pull's — otherwise operator entries get
+  // wiped every detect run. See pipelines/detect.js's Media matched*
+  // updateOne + mirrorMatchesToCatalogProducts bulkWrite.
   matchedProducts: [{
     refinedProductId:        String,                                                           // 'r1', 'r2', ...
     catalogProductId:        { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct' },  // null when match was inferred but ensure-skipped (competitor) or below floor
@@ -106,6 +113,9 @@ const mediaSchema = new mongoose.Schema({
     outcome:                 String,                                                           // 'product_match' | 'product_category'
     confidence:              Number,                                                           // catalogCombinedScore || identification.certainty
     matchEvidenceArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
+    source:                  { type: String, enum: ['detect', 'operator'], default: 'detect' },
+    assignedAt:              { type: Date, default: null },   // stamped on operator writes; null for detect
+    assignedBy:              { type: String, default: null }, // operator user id / email; null for detect
     _id: false
   }],
   // matchedCategories[] — one entry per refined product that resolved a
@@ -117,8 +127,30 @@ const mediaSchema = new mongoose.Schema({
     refinedProductId:        String,
     confidence:              Number,
     matchEvidenceArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
+    source:                  { type: String, enum: ['detect', 'operator'], default: 'detect' },
+    assignedAt:              { type: Date, default: null },
+    assignedBy:              { type: String, default: null },
     _id: false
   }],
+
+  // Operator-driven UGC-ads attachments for the two "no target"
+  // campaign kinds — see server/docs/UGC_ADS_DESIGN.md (Phase 1).
+  // Presence of either field means the operator explicitly attached
+  // this Media as a branding / promotional seed. detect never writes
+  // these. Detach = unset both (Mongoose $unset).
+  //
+  // promotionalAssignment carries an optional productIds[] — a
+  // promotional UGC can OPTIONALLY have product callouts ("15% off
+  // Harper Sectional"). Empty array = pure promo, no callouts.
+  brandingAssignment: {
+    assignedAt: { type: Date,   default: null },
+    assignedBy: { type: String, default: null }
+  },
+  promotionalAssignment: {
+    assignedAt: { type: Date,   default: null },
+    assignedBy: { type: String, default: null },
+    productIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct' }]
+  },
 
   // Phase A-0 — concise derived display fields used by the Media Library
   // page so the UI doesn't have to recompute them from artifacts on every
@@ -132,6 +164,15 @@ const mediaSchema = new mongoose.Schema({
     densityAvg:     Number,                                                    // 0..1, mean of overlay-zone density grid
     focusScore:     Number,                                                    // raw Laplacian variance
     focusBucket:    String,                                                    // 'Soft' | 'Acceptable' | 'Sharp'
+    // Zero-cost sharp heuristic (services/imageShotHeuristicService) —
+    // packshot vs lifestyle vs ambiguous. Independent of
+    // classification.shotType (LLM-written by subjectTextService). MUST
+    // stay declared: Mongoose strict mode silently drops $set writes to
+    // undeclared technicalInsights.* paths (same trap as the
+    // classification.* warning below).
+    shotStyle:           { type: String, enum: ['packshot', 'lifestyle', 'ambiguous'], default: undefined },
+    shotStyleConfidence: Number,                                               // 0..1
+    shotStyleMetrics:    mongoose.Schema.Types.Mixed,                          // raw numbers for threshold tuning
     updatedAt:      Date
   },
 
@@ -240,7 +281,15 @@ const mediaSchema = new mongoose.Schema({
   },
 
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+  updatedAt: { type: Date, default: Date.now },
+
+  // Soft-delete stamp — set when the operator asks the home-page
+  // agent to delete a Media row. Filtered at the Media Library LIST
+  // surface only (routes/media.js GET /api/media). Direct-id lookups
+  // still resolve, so ads and finalized campaigns that reference a
+  // deleted Media keep rendering; only new discovery from the picker
+  // hides it. A full-cascade migration is future work.
+  deletedAt: { type: Date, default: null, index: true }
 });
 
 // Tenant-scoped uniqueness. Previously this was a GLOBAL unique on

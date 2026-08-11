@@ -100,10 +100,29 @@ const catalogProductSchema = new mongoose.Schema({
 
   // Imagery
   imageUrl:        String,    // primary image (hero)
-  additionalImages: [String], // alt views — capped at 4 by the
-                              // product-path detect trigger so a
-                              // long-tail of look-alike alts doesn't
-                              // multiply pipeline cost without value.
+  additionalImages: [String], // alt views — capped by MAX_ADDITIONAL_IMAGES
+                              // (services/catalogImageLimits); detect
+                              // materializes up to MAX_ALT_IMAGES.
+
+  // Zero-cost packshot/lifestyle styles from ingest-time sharp heuristic
+  // (services/ingestShotClassifyService). KEYED BY URL, not array index —
+  // additionalImages can be reordered or re-capped by a later sync, and
+  // an index-keyed store would silently mislabel images. Media rows do
+  // not exist at ingest, so this is the pre-Media home for the signal;
+  // materializeImage copies matching entries onto
+  // Media.technicalInsights.shotStyle* without re-fetching. MUST stay
+  // declared — Mongoose strict mode silently drops undeclared $set paths.
+  imageShotStyles: [{
+    url:        { type: String, required: true },
+    style:      { type: String, enum: ['packshot', 'lifestyle', 'ambiguous'], required: true },
+    confidence: Number,
+    at:         { type: Date, default: Date.now },
+    // Numeric signals from classifyShotStyle (borderStdev, packshotScore, …).
+    // MUST be declared — nested subdocs are strict; an undeclared path is
+    // silently dropped and calibrateShotHeuristic never sees ingest metrics.
+    metrics:    mongoose.Schema.Types.Mixed,
+    _id: false
+  }],
 
   // Wrapper Media docs created by catalogProductDetectService when
   // the catalog sync triggers the product-path detect pipeline.
@@ -195,6 +214,14 @@ const catalogProductSchema = new mongoose.Schema({
   // Idempotency: dedup on (mediaId, matchEvidenceArtifactId) at write time
   // via $pull + $addToSet, so re-running detect for the same media replaces
   // the prior entry rather than accumulating duplicates.
+  // The `source` field on every subdoc distinguishes DETECT-derived
+  // entries from OPERATOR-added attachments (Phase 1 of UGC-ads flow,
+  // 2026-08-10). Default 'detect' so back-compat writes keep working.
+  // Every $pull site that rewrites detect matches MUST filter on
+  // source:'detect' — otherwise operator entries get wiped every
+  // detect run / brand-promote / retro-link sweep. See
+  // pipelines/detect.js:mirrorMatchesToCatalogProducts,
+  // catalogProductPromoteService, and catalogRetroLinkService.
   matchedMedia: [{
     mediaId:                 { type: mongoose.Schema.Types.ObjectId, ref: 'Media' },
     matchTier:               String,   // 'product_match' | 'product_category'
@@ -202,6 +229,9 @@ const catalogProductSchema = new mongoose.Schema({
     refinedProductId:        String,
     matchEvidenceArtifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductMatchArtifact' },
     matchedAt:               Date,
+    source:                  { type: String, enum: ['detect', 'operator'], default: 'detect' },
+    assignedAt:              { type: Date, default: null },
+    assignedBy:              { type: String, default: null },
     _id: false
   }],
 

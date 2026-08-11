@@ -21,6 +21,11 @@ const CatalogProduct = require('../models/CatalogProduct');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
 const { normalizeBrandName } = require('../models/Brand');
 const progressService = require('./progressService');
+const {
+  storedStyleForUrl,
+  technicalInsightsFromStored,
+  shouldApplyStoredShot
+} = require('./ingestShotClassifyService');
 
 const MAX_ALT_IMAGES = 12;
 
@@ -569,17 +574,43 @@ async function createDetectRunIfAbsent(media, product) {
 async function materializeImage({ sourceUrl, product, imageRole, feedIndex = null }) {
   const externalId = `cp_${product._id}_${imageRole}_${hashShort(sourceUrl)}`;
 
+  // Ingest-time shot style (CatalogProduct.imageShotStyles, URL-keyed).
+  // Copy onto Media.technicalInsights without re-fetch / re-sharp so
+  // Media consumers see the signal immediately. Declared paths only —
+  // Mongoose strict mode silently drops undeclared technicalInsights.*.
+  const storedShot = technicalInsightsFromStored(
+    storedStyleForUrl(product?.imageShotStyles, sourceUrl)
+  );
+
   // Fast path — if the Media doc already exists, skip the Cloudinary
   // mirror (expensive) and return it. The mirror is best-effort
   // anyway; a prior successful pass already paid for it.
   const existing = await Media.findOne({ brandId: product.brandId, source: 'catalog-product', externalId });
   if (existing) {
+    const patch = {};
     // Backfill feedIndex on a doc materialized before this field existed —
     // metadata-only, no re-mirror. Leaves an already-stamped doc alone.
     if (feedIndex != null && existing.metadata?.feedIndex == null) {
-      await Media.updateOne({ _id: existing._id }, { $set: { 'metadata.feedIndex': feedIndex } });
+      patch['metadata.feedIndex'] = feedIndex;
       existing.metadata = existing.metadata || {};
       existing.metadata.feedIndex = feedIndex;
+    }
+    // First-write backfill of ingest shot style. Applies only when Media
+    // has no shotStyle yet — re-classify is not reachable for already-
+    // stored product URLs, so a "newer-wins / threshold retune" branch
+    // would be dead code (see shouldApplyStoredShot).
+    if (shouldApplyStoredShot(existing.technicalInsights, storedShot)) {
+      patch['technicalInsights.shotStyle'] = storedShot.shotStyle;
+      patch['technicalInsights.shotStyleConfidence'] = storedShot.shotStyleConfidence;
+      patch['technicalInsights.shotStyleMetrics'] = storedShot.shotStyleMetrics;
+      patch['technicalInsights.updatedAt'] = storedShot.updatedAt;
+      existing.technicalInsights = {
+        ...(existing.technicalInsights || {}),
+        ...storedShot
+      };
+    }
+    if (Object.keys(patch).length) {
+      await Media.updateOne({ _id: existing._id }, { $set: patch });
     }
     return existing;
   }
@@ -626,12 +657,32 @@ async function materializeImage({ sourceUrl, product, imageRole, feedIndex = nul
     // Only set when present — mirror fallback path may not have dims.
     if (typeof uploadResult?.width === 'number' && uploadResult.width > 0) doc.width = uploadResult.width;
     if (typeof uploadResult?.height === 'number' && uploadResult.height > 0) doc.height = uploadResult.height;
+    // Free hand-forward of ingest classification — no sharp, no fetch.
+    if (storedShot) doc.technicalInsights = storedShot;
     return await Media.create(doc);
   } catch (err) {
     // Lost the race to a concurrent caller — the Media doc was
-    // inserted between our findOne and create. Re-fetch and return.
+    // inserted between our findOne and create. Re-fetch and apply the
+    // same storedShot backfill the normal existing-doc path applies,
+    // otherwise a concurrent materialize can leave Media with no
+    // shotStyle even though the product had one.
     if (err.code === 11000) {
-      return await Media.findOne({ brandId: product.brandId, source: 'catalog-product', externalId });
+      const raced = await Media.findOne({ brandId: product.brandId, source: 'catalog-product', externalId });
+      if (!raced) return raced;
+      if (shouldApplyStoredShot(raced.technicalInsights, storedShot)) {
+        const patch = {
+          'technicalInsights.shotStyle': storedShot.shotStyle,
+          'technicalInsights.shotStyleConfidence': storedShot.shotStyleConfidence,
+          'technicalInsights.shotStyleMetrics': storedShot.shotStyleMetrics,
+          'technicalInsights.updatedAt': storedShot.updatedAt
+        };
+        await Media.updateOne({ _id: raced._id }, { $set: patch });
+        raced.technicalInsights = {
+          ...(raced.technicalInsights || {}),
+          ...storedShot
+        };
+      }
+      return raced;
     }
     throw err;
   }
@@ -769,4 +820,15 @@ function hashShort(s) {
   return Math.abs(h).toString(36).slice(0, 8);
 }
 
-module.exports = { enqueueProductDetect, enqueueBrandProductDetects, ensureDetectForProducts, ensureDetectRunsForExistingMedia, materializeMissingHero, materializeMissingAlts, MAX_ALT_IMAGES };
+module.exports = {
+  enqueueProductDetect,
+  enqueueBrandProductDetects,
+  ensureDetectForProducts,
+  ensureDetectRunsForExistingMedia,
+  materializeMissingHero,
+  materializeMissingAlts,
+  // Exported for offline harnesses (verifyIngestShotClassify) — not a
+  // new public product API.
+  materializeImage,
+  MAX_ALT_IMAGES
+};

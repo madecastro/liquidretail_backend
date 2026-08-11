@@ -440,8 +440,11 @@ function testIngestStamping() {
   // that deleting the line fails here even though the param still exists.
   checkTrue('I5 feedIndex is written into the created Media doc metadata',
     /^\s*feedIndex:\s+feedIndex,?\s*$/m.test(src));
+  // Backfill uses a patch object (`patch['metadata.feedIndex'] = feedIndex`)
+  // then Media.updateOne({ $set: patch }) — not an inline $set literal.
   checkTrue('I6 an already-materialised doc gets feedIndex backfilled in place',
-    /\$set:\s*\{\s*'metadata\.feedIndex':\s*feedIndex\s*\}/.test(src));
+    /patch\[['\"]metadata\.feedIndex['\"]\]\s*=\s*feedIndex/.test(src) &&
+    /Media\.updateOne\(\s*\{\s*_id:\s*existing\._id\s*\}\s*,\s*\{\s*\$set:\s*patch\s*\}/.test(src));
 }
 
 (async function main() {

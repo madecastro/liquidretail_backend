@@ -705,6 +705,25 @@ router.get('/:id/ads-detail', async (req, res) => {
     // Join the photoreal polish URL + the per-campaign
     // useImageRefAsProduction flag — same shape /api/ads returns so the
     // expansion thumbnails render identically to the flat ads list.
+    //
+    // UGC-ads Phase 4 — also join source-Media thumbnails for
+    // variantKind='ugc' rows. One extra bulk lookup, not per-ad, so this
+    // is O(distinct-mediaIds) reads regardless of ads.length. Thumbnail
+    // powers the Product Ads UGC-badge hover per the Phase 4 spec.
+    const ugcMediaIds = Array.from(new Set(
+      ads
+        .filter(a => a.variantKind === 'ugc' && a.mediaId)
+        .map(a => String(a.mediaId))
+    ));
+    const sourceMediaMap = new Map();
+    if (ugcMediaIds.length) {
+      const mediaDocs = await Media.find({ _id: { $in: ugcMediaIds } })
+        .select('_id fileUrl fileType')
+        .lean();
+      for (const m of mediaDocs) {
+        sourceMediaMap.set(String(m._id), { fileUrl: m.fileUrl || null, fileType: m.fileType || null });
+      }
+    }
     const [photorealMap, useImageRefMap] = await Promise.all([
       loadPhotorealUrlMap(ads),
       loadUseImageRefMap(ads)
@@ -775,7 +794,18 @@ router.get('/:id/ads-detail', async (req, res) => {
             error:       h.error || null,
             durationMs:  h.durationMs || null
           }))
-        : []
+        : [],
+      // UGC-ads Phase 4 — surface the Ad.variantKind + Ad.mediaId so the
+      // frontend can badge variantKind='ugc' rows, add the UGC filter chip,
+      // and deep-link the badge click to /ugc-ads?mediaId=<id>. sourceMedia
+      // is the joined source-Media thumb + fileType from ugcMediaIds above;
+      // null for non-UGC ads and for UGC ads whose source Media was
+      // hard-deleted (defensive — a hover thumbnail can't 404).
+      variantKind:  a.variantKind || null,
+      mediaId:      a.mediaId ? String(a.mediaId) : null,
+      sourceMedia:  (a.variantKind === 'ugc' && a.mediaId)
+        ? (sourceMediaMap.get(String(a.mediaId)) || null)
+        : null
     }));
 
     res.json({ campaigns, ads: adRows });

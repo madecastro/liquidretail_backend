@@ -161,13 +161,25 @@ async function rebuildMatchedMedia(catalogProductId) {
       confidence:              a.catalogCombinedScore ?? a.identification?.certainty ?? 0,
       refinedProductId:        a.productIndex || null,
       matchEvidenceArtifactId: a._id,
-      matchedAt:               new Date()
+      matchedAt:               new Date(),
+      source:                  'detect'   // required — must not $set-clobber operator entries
     });
   }
+  // Was $set: matchedMedia (wholesale replace) — but that wiped
+  // operator-added attachments on every brand-promote sweep. Change
+  // (2026-08-10, UGC-ads Phase 1): $pull only detect entries, then
+  // $push the new detect set. Operator entries survive. Verifier
+  // pins this via a source-scan in scripts/verifyAgentRegistry.js.
   await CatalogProduct.updateOne(
     { _id: catalogProductId },
-    { $set: { matchedMedia: entries } }
+    { $pull: { matchedMedia: { source: 'detect' } } }
   );
+  if (entries.length) {
+    await CatalogProduct.updateOne(
+      { _id: catalogProductId },
+      { $push: { matchedMedia: { $each: entries } } }
+    );
+  }
 }
 
 module.exports = { onPromote };

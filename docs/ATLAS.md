@@ -352,3 +352,141 @@ gives us: `submitRetryDecision` (submit-once), `pacedModelSubmit`, `maxRedirects
 the prediction-poll machinery, and the cost ledger. `aiVideoReferenceService` is the
 existing direct-Google path and `ARCHITECTURE_REVIEW.md`'s divergence table rates it
 weaker on every axis — harden it before putting money through it.
+
+## 9) Claude 5 refuses the sampling knobs (live-verified 2026-08-10)
+
+Atlas rejects `temperature` (≠ 1), `top_p` and `top_k` on the **Claude 5 family**
+with a bare, field-less `HTTP 400 {"code":400,"msg":"bad request"}`. This is the
+Anthropic extended-thinking constraint — with thinking on, sampling is not the
+caller's to set — now enforced at the gateway.
+
+Probed live against the production key:
+
+| Request to `anthropic/claude-sonnet-5` | Result |
+|---|---|
+| bare (model + messages) | 200 |
+| `max_tokens: 30768` | 200 |
+| `response_format: {type:'json_object'}` | 200 |
+| `stop`, `seed`, `frequency_penalty`, `presence_penalty` | 200 |
+| `temperature: 1` | 200 |
+| **`temperature: 0` / `0.45` / `0.7`** | **400** |
+| **`top_p: 0.9`** | **400** |
+| **`top_k: 40`** | **400** |
+
+`anthropic/claude-opus-5` behaves identically. `claude-opus-4.8`,
+`claude-sonnet-4.6`, `claude-sonnet-4.5-*` and every `openai/*` and `google/*`
+slug still accept `temperature`.
+
+### What it cost us
+
+Role `director` is the only Anthropic entry in `atlasModelMap`, and
+`aiCreativeDirectorService.directConceptsRound` sent `temperature: 0.45`. Every
+concept-driven expansion therefore threw before creating a single static `Ad`
+row — **static ad generation ran at a 100% failure rate**, while video was
+untouched because every other role maps to `openai/*` or `google/*`:
+
+```
+conceptDriven[product=…]: failed (Atlas 400: {"code":400,"msg":"bad request"})
+[campaignRun run_…] start — 4 ad(s) concurrency=veo:12(4) image:24(0)
+                                                          ^ zero static ads
+```
+
+Last good Director round **2026-08-07 21:20 UTC**; first failure **2026-08-10
+15:17 UTC**; **no deploy in between** — the running commit was `f3cd56c9` the
+whole time. This was an Atlas-side change, not a regression of ours. Worth
+remembering when triaging the next one: a 100%-failure onset with no deploy is
+evidence *against* a code cause, and the deploy history is the fastest way to
+prove it.
+
+### The guard
+
+`atlasModelMap.rejectsSamplingParams(atlasId)` + `stripSamplingParams(body)`.
+Applied by all **three** transports that POST to `/v1/chat/completions`:
+
+- `atlasLlmService.buildAtlasBody`
+- `atlasLlmStreamService.buildStreamBody`
+- `atlasTextService.buildTextBody` — posts its body inline rather than through
+  the other two, so it carries the guard itself. Its `DEFAULT_MODEL` is a 4.x
+  slug today, but `ATLAS_TEXT_MODEL_ID` exists to repoint it.
+
+Params are **stripped, not pinned to 1**: 1 is already the model default, and an
+explicit 1 would imply we still control a knob we do not. The practical
+consequence is that `DIRECTOR_ROUND_TEMP = 0.45` is now **inert** on Claude 5 —
+the Director samples at the default, so expect more run-to-run variety. To get a
+tunable temperature back, repoint `director` at `anthropic/claude-sonnet-4.6`.
+
+Covered by `scripts/verifyClaude5SamplingParams.js` (offline, revert-proven).
+**Before changing the `director` model or adding a second Anthropic role,
+re-probe** — check `B2`, which fails deliberately when a new Anthropic role
+appears so its gateway behaviour gets confirmed rather than assumed.
+
+## 10) Video: a terminal verdict arrives inside an HTTP 500 (live-verified 2026-08-10)
+
+Atlas serves a **failed** video prediction as **HTTP 500 with a complete body**:
+
+```
+HTTP 500  { code: 500, message: "Generation failed: task processing failed
+            (code: generation_failed)",
+            data: { status: "failed", outputs: null, executionTime: 0,
+                    timings: { inference: 0 } } }      ← no `price` key at all
+```
+
+`executionTime: 0` / `inference: 0` means the model accepted the job and died
+before rendering a frame. Measured 2026-08-10: **6 failures across ~23 submits
+in one day (~26%)**. The status code is **not** a reliable discriminator — the
+same prediction was observed returning 200 earlier in its life and 500 later,
+which is why some failures were caught instantly and others were not.
+
+### Billing: `data.price` is the authority
+
+| | `data.price` | |
+|---|---|---|
+| succeeded | `"0.75"` (full length) / `"0.08"` (short) — 5 of 5 | real charge |
+| failed | **absent entirely** — 5 of 5 | no charge |
+
+This matches the note already in `atlasImageService`: *"Atlas refunds the
+reservation on a failed task and never bills a rejection."* A full video is
+**$0.75**, so each of those failures was $0.75 of value lost, not spent.
+
+### Three defects this exposed, all fixed
+
+1. **No retry.** `predictionFailed` has always said `action:'retry'`,
+   `maxAttempts:2`, `charged:false` — the video path never read it, so every
+   provider hiccup became a dead ad.
+2. **A terminal verdict was retried as a transport blip.** The poll's
+   `axios.get` had no `validateStatus`, so a 500 threw into the generic 5xx
+   branch: prediction `cec47abe…` was polled **12 times over 3 minutes** after
+   it had already failed, then reported as "12 consecutive poll failures" —
+   which reads like an Atlas outage and discards the classification, so a
+   moderation block arriving as a 500 would never be named.
+3. **Recovery could never settle them.** `peekPrediction` bailed on
+   `res.status !== 200` *before* reading the body, so a confirmed-failed video
+   came back `unknown` and its charge state never resolved. `unknown` must mean
+   "we could not tell", not "we did not look".
+
+### The money gate
+
+`mayRetryAfterFailure()` allows a resubmit only when **all three** hold:
+policy-retryable (excludes `moderationBlocked`, which would re-block), the
+attempt is under the policy ceiling, and `confirmedCharge()` reports
+**`charged === false`** read from `data.price`.
+
+**`charged: null` (unknown) does NOT retry.** §4's rule is that a charge may
+only be asserted from a confirmed price; the converse binds equally — a
+NON-charge may only be asserted from a confirmed price, so unknown is treated
+as charged.
+
+⚠️ **The charge-point `recordFlatCost` MUST stamp `providerRequestId`.**
+`finalizeFlatCost` keys on it to zero the unbilled attempt in place. Without the
+stamp the update matches nothing, falls back to an insert, and the failed
+attempt's estimate survives beside the retry's — **$1.50 booked for one
+delivered video**. Missed in the first draft; caught by adversarial review.
+
+**Residual risk, accepted:** if Atlas ever bills at accept and attaches `price`
+to a failed body only later, a "no price" read would retry a real charge.
+Nothing in the current data suggests that (5/5 failed rows never gained a price
+on repeated reads), and closing it would need a delayed second peek or a refund
+API. Revisit if the video bill ever exceeds delivered videos.
+
+Pinned by `scripts/verifyVideoRetryOnUnbilledFailure.js` (23 checks, offline,
+revert-proven on the gate, both poll paths, and the ledger key).

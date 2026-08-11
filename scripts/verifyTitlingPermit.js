@@ -155,38 +155,75 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
   check('C3 titling goes through withPermit (release-in-finally), not a bare acquire',
     /veoTitlingSemaphore\.withPermit\(/.test(adsSrc)
     && !/veoTitlingSemaphore\.acquire\(/.test(adsSrc));
-  // Extract the withPermit CLOSURE by brace-matching, not a char window. A fixed
-  // window overruns the closure and keeps matching code that has been moved OUT of
-  // the permit — verified: relocating renderBrandScriptAndSave to just after the
-  // block left the old window-based check green, i.e. it could not fail on the one
-  // regression it exists to catch.
-  const permitBody = (() => {
-    const call = adsSrc.indexOf('veoTitlingSemaphore.withPermit(');
-    if (call === -1) return null;
-    const open = adsSrc.indexOf('{', call);
-    if (open === -1) return null;
-    let depth = 0;
-    for (let i = open; i < adsSrc.length; i++) {
-      const ch = adsSrc[i];
-      if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) return adsSrc.slice(open, i + 1);
+  // Extract EVERY withPermit CLOSURE by brace-matching, not a char window and
+  // not only the first site. Phase A added renderDeriveOnlyVideoAd which also
+  // titles under withPermit and appears EARLIER in the file than the Omni
+  // path — indexOf(first) alone made C5 false-fail (and would miss a future
+  // site that re-introduces a billable submit inside a permit).
+  function extractAllPermitBodies(src) {
+    const bodies = [];
+    const needle = 'veoTitlingSemaphore.withPermit(';
+    let from = 0;
+    while (from < src.length) {
+      const call = src.indexOf(needle, from);
+      if (call === -1) break;
+      const open = src.indexOf('{', call);
+      if (open === -1) break;
+      let depth = 0;
+      let end = -1;
+      for (let i = open; i < src.length; i++) {
+        const ch = src[i];
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) { end = i; break; }
+        }
       }
+      if (end === -1) break;
+      bodies.push({ call, body: src.slice(open, end + 1) });
+      from = end + 1;
     }
-    return null;
-  })();
-
-  check('C4 [THE POINT] renderBrandScriptAndSave is INSIDE the permit closure',
-    !!permitBody && /renderBrandScriptAndSave\(/.test(permitBody));
-  check('C5 [THE POINT] the Omni submit/poll is OUTSIDE the permit — gating it too '
-      + 'would rebuild the single-knob bottleneck this removes',
+    return bodies;
+  }
+  const permitSites = extractAllPermitBodies(adsSrc);
+  check('C4a at least one veoTitlingSemaphore.withPermit site exists',
+    permitSites.length >= 1, `sites=${permitSites.length}`);
+  check('C4 [THE POINT] EVERY permit site titles via renderBrandScriptAndSave',
+    permitSites.length > 0 &&
+    permitSites.every(({ body }) => /renderBrandScriptAndSave\(/.test(body)),
+    `sites=${permitSites.length}; missing save in one or more permit bodies`);
+  // True invariant across ALL permit sites (strictly stronger than the old
+  // single-site check):
+  //   (a) no permit body contains a billable Omni submit
+  //   (b) at least one Omni submit exists OUTSIDE every permit body
+  // Derive-only paths title under a permit with NO Omni call — that is fine;
+  // the Omni path must still submit outside its permit.
+  check('C5 [THE POINT] NO permit body contains veoGenerateForAd/generateForAd — '
+      + 'gating the Omni submit would rebuild the single-knob bottleneck',
+    permitSites.length > 0 &&
+    permitSites.every(({ body }) => !/veoGenerateForAd\(|generateForAd\(/.test(body)));
+  check('C5b [THE POINT] at least one veoGenerateForAd( call exists OUTSIDE every permit body',
     (() => {
-      const call = adsSrc.indexOf('veoTitlingSemaphore.withPermit(');
-      if (call === -1 || !permitBody) return false;
-      const before = adsSrc.slice(0, call);
-      return /veoGenerateForAd\(|generateForAd\(/.test(before)
-        && !/veoGenerateForAd\(|generateForAd\(/.test(permitBody);
+      if (permitSites.length === 0) return false;
+      // Build the source with every permit body zeroed so a call that only
+      // lives inside a permit cannot satisfy the "outside" check.
+      let outside = adsSrc;
+      // Replace from the end so earlier indices stay valid.
+      const ranges = permitSites
+        .map(({ call, body }) => ({ start: call, end: call + ('veoTitlingSemaphore.withPermit(').length + body.length }))
+        .sort((a, b) => b.start - a.start);
+      // More precise: zero each extracted body span in the original source.
+      const spans = permitSites
+        .map(({ body }) => {
+          const i = adsSrc.indexOf(body);
+          return i === -1 ? null : { start: i, end: i + body.length };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.start - a.start);
+      for (const { start, end } of spans) {
+        outside = outside.slice(0, start) + ' '.repeat(end - start) + outside.slice(end);
+      }
+      return /veoGenerateForAd\(/.test(outside);
     })());
 
   // ── Revert-proof (manual, per CLAUDE.md §5) ──────────────────────────────

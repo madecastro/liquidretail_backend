@@ -239,8 +239,15 @@ await checkAsync('C7 a failed call writes a row, and ledgers $0 — a KNOWN, del
 
 // ── D. End to end through the real provider functions. ──────────────────────
 const NARRATIVE = 'Customers consistently praise the fit and the fabric weight. '.repeat(4);
+// The quote text MUST be a literal substring of NARRATIVE above. This harness
+// tests COST LEDGERING, not provenance, so the two were originally unrelated —
+// 'The athletic fit is perfect.' appears nowhere in NARRATIVE. Since
+// geminiSearchProvider.keepVerbatimQuotes now drops any quote the grounded
+// narrative does not contain (the anti-fabrication guarantee), that fixture was
+// modelling a FABRICATED quote and the provider correctly returned zero. Fixed by
+// making the fixture honest rather than by relaxing the check.
 const STRUCTURED = JSON.stringify({
-  quotes: [{ text: 'The athletic fit is perfect.', author: 'Alex R.', source: 'trustpilot.com' }],
+  quotes: [{ text: 'Customers consistently praise the fit and the fabric weight.', author: 'Alex R.', source: 'trustpilot.com' }],
   rating: 4.6, reviewCount: 1200, summary: 'Broadly positive.'
 });
 const PASS1_USAGE = { promptTokenCount: 1000, toolUsePromptTokenCount: 500, candidatesTokenCount: 800, thoughtsTokenCount: 200 };

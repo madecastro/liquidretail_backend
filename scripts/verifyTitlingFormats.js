@@ -98,19 +98,24 @@ for (const f of FORMATS) {
   });
 }
 
-// Every real platform format must classify to a declared titling format, and its
-// deliveryDims must match the composition it will actually be rendered in. THIS is
-// the check that catches the original bug.
-// Only live (generatable) surfaces must round-trip through titling. coming_soon
-// entries are UI-only until they go live; they may declare Google sizes that
-// have no Remotion composition yet (e.g. Demand Gen 1.91:1).
+// Every live platform format must classify to a declared titling format.
+// DeliveryDims↔composition is only meaningful for formats that can be TITLED
+// (kinds includes 'video'): brandScriptExecutor/Remotion never run for
+// static-only surfaces. Static-only live keys (e.g. pmax_landscape_1_91_1 at
+// 1.91:1) legitimately have deliveryDims that do not match a Remotion canvas
+// — they never enter the titling path. Do NOT "restore" an unscoped B3 that
+// requires every live format to match a composition; that re-fails Phase A.
+// Only live (generatable) surfaces are checked; coming_soon entries are
+// UI-only until they go live.
 for (const [pfId, pf] of Object.entries(PLATFORM_FORMATS)) {
   if (pf.status === 'coming_soon') continue;
   check(`B2 platformFormat ${pfId} (${pf.aspectRatio}) classifies to a known format`, () => {
     const f = classifyFormat({ platformFormat: pfId, aspectRatio: pf.aspectRatio });
     assert.ok(FORMATS.includes(f), `classified to '${f}', which is not in FORMATS`);
   });
-  check(`B3 ${pfId} deliveryDims match its composition`, () => {
+  const isVideoCapable = Array.isArray(pf.kinds) && pf.kinds.includes('video');
+  if (!isVideoCapable) continue;
+  check(`B3 ${pfId} deliveryDims match its composition (video-capable only)`, () => {
     const f = classifyFormat({ platformFormat: pfId, aspectRatio: pf.aspectRatio });
     const comp = compositions[COMPOSITION_BY_FORMAT[f]];
     assert.ok(comp, `no composition for '${f}'`);
@@ -123,6 +128,29 @@ for (const [pfId, pf] of Object.entries(PLATFORM_FORMATS)) {
       `the ad would be delivered at the wrong aspect`);
   });
 }
+// Explicit pin: the three live PMax video masters/derive surfaces each map to
+// the composition whose aspect matches their deliveryDims.
+check('B3b pmax_video_9_16 → CanonicalVertical 1080x1920', () => {
+  const f = classifyFormat({ platformFormat: 'pmax_video_9_16', aspectRatio: '9:16' });
+  assert.strictEqual(f, 'vertical');
+  assert.strictEqual(COMPOSITION_BY_FORMAT[f], 'CanonicalVertical');
+  const comp = compositions.CanonicalVertical;
+  assert.deepStrictEqual({ w: comp.width, h: comp.height }, { w: 1080, h: 1920 });
+});
+check('B3b pmax_video_1_1 → CanonicalSquare 1080x1080', () => {
+  const f = classifyFormat({ platformFormat: 'pmax_video_1_1', aspectRatio: '1:1' });
+  assert.strictEqual(f, 'square');
+  assert.strictEqual(COMPOSITION_BY_FORMAT[f], 'CanonicalSquare');
+  const comp = compositions.CanonicalSquare;
+  assert.deepStrictEqual({ w: comp.width, h: comp.height }, { w: 1080, h: 1080 });
+});
+check('B3b pmax_video_16_9 → CanonicalLandscape 1920x1080', () => {
+  const f = classifyFormat({ platformFormat: 'pmax_video_16_9', aspectRatio: '16:9' });
+  assert.strictEqual(f, 'landscape');
+  assert.strictEqual(COMPOSITION_BY_FORMAT[f], 'CanonicalLandscape');
+  const comp = compositions.CanonicalLandscape;
+  assert.deepStrictEqual({ w: comp.width, h: comp.height }, { w: 1920, h: 1080 });
+});
 
 // ── C. The specific regression, pinned ──────────────────────────────────────
 check('C1 1:1 does NOT classify as feed (the original bug)', () => {

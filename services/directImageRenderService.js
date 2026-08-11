@@ -321,13 +321,61 @@ function monochromeInkFor(meanLum) {
  *     and white-artwork-on-black both resolve correctly instead of one of them
  *     inverting into a solid block.
  */
+/**
+ * Does this asset's alpha channel actually encode the mark's coverage?
+ *
+ * True only when a meaningful share of pixels is essentially fully transparent
+ * — the signature of a real cut-out. An asset whose alpha is uniformly (or
+ * nearly uniformly) opaque carries no shape information there, and using it as
+ * coverage fills the whole logo box with ink.
+ *
+ * Threshold rationale: 2% of pixels below alpha 16. A cut-out logo is mostly
+ * empty space (the measured Vuori asset yields 58% transparent once read via
+ * luminance), so a real one clears this by an order of magnitude, while the
+ * broken case measured 0%. Deliberately generous — a false "discriminates"
+ * merely keeps today's behaviour, whereas a false negative would send a
+ * correctly-cut-out logo down the luminance path.
+ *
+ * Exported for scripts/verifyLogoSilhouette.js.
+ */
+async function alphaChannelDiscriminates(logoPng) {
+  try {
+    const alpha = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
+    if (!alpha || !alpha.length) return false;
+    let transparent = 0;
+    for (let i = 0; i < alpha.length; i++) if (alpha[i] <= 16) transparent++;
+    return (transparent / alpha.length) >= 0.02;
+  } catch {
+    // Unreadable alpha → fall back to luminance, which needs no alpha at all.
+    return false;
+  }
+}
+
 async function monochromeLogoBuffer(logoPng, ink) {
   const meta = await sharp(logoPng).metadata();
   const w = meta.width, h = meta.height;
   if (!(w > 0 && h > 0)) return null;
 
   let coverage;
-  if (meta.hasAlpha) {
+  // ⚠️ `hasAlpha` is NOT the same question as "does the alpha channel encode the
+  // mark". MEASURED on a live brand logo (Vuori, 1108x179 RGBA): the asset has
+  // an alpha channel in which **100% of pixels sit in the 204-254 band** — its
+  // "transparent" background is ~80-100% opaque. Trusting `hasAlpha` therefore
+  // took the alpha branch, produced coverage that was opaque EVERYWHERE, and
+  // painted a SOLID INK RECTANGLE over the artwork — reproduced exactly against
+  // the real asset, and visible on delivered ads as a black bar on light plates
+  // and a white bar on dark ones.
+  //
+  // So require the channel to actually DISCRIMINATE before believing it: a real
+  // cut-out logo has a substantial fully-transparent region around the mark. A
+  // solid-shape logo on a genuine transparent background still passes, because
+  // the area OUTSIDE the shape is alpha 0. When it does not discriminate the
+  // asset is effectively opaque, and luminance — the branch below, which renders
+  // this same logo's wordmark correctly — is the right reader.
+  const alphaDiscriminates = meta.hasAlpha
+    ? await alphaChannelDiscriminates(logoPng)
+    : false;
+  if (alphaDiscriminates) {
     coverage = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
   } else {
     // Sample the outer border to learn the asset's own background polarity.
@@ -395,6 +443,86 @@ async function normalizeReference(buf) {
     console.warn(`   ⚠️  direct-image: reference normalise failed (${err.message}) — dropping this reference`);
     return null;
   }
+}
+
+/**
+ * STATIC quote-length policy. Exported so the harness can execute the SHIPPED
+ * logic rather than a mirror of it (both adversarial passes flagged that seam).
+ *
+ * Default 140, not 200: measured static text fidelity is 139/140 strings across
+ * 20 renders, so that is the band this surface is known to typeset reliably.
+ *
+ * VALIDATED, not bare-coerced. `Number(env || 140)` turns "abc" into NaN, and
+ * `len <= NaN` is false, so a single dashboard typo would silently send every ad
+ * back to the 50-char video snippet — the exact defect this change exists to fix,
+ * wearing a config disguise and raising no error. "0"/"-5" fail the same way, and
+ * "Infinity" fails the opposite way (no cap at all). Anything that is not a
+ * finite positive number falls back to the default and says so.
+ * @returns {number}
+ */
+function resolveStaticQuoteCap(rawEnv) {
+  const parsed = Number(rawEnv);
+  const supplied = rawEnv != null && rawEnv !== '';
+  if (supplied && Number.isFinite(parsed) && parsed > 0) return parsed;
+  if (supplied) {
+    console.warn(`   ⚠️  STATIC_QUOTE_MAX_CHARS="${rawEnv}" is not a positive number — using 140`);
+  }
+  return 140;
+}
+
+/**
+ * Pick the quote string a STATIC ad typesets.
+ *
+ * `quote.snippet` is a <=50-char extraction whose own service header states its
+ * purpose outright: "suitable for a 3-second video overlay" (quoteSnippetService,
+ * MAX_CHARS = 50, prompt asks for "4-8 words"). That video-shaped cap was applied
+ * to static too, and at 50 chars the extractor drops the subject: "The quality is
+ * amazing and the pair I have feel like second skin" became "feel like second
+ * skin" — a subjectless fragment with a stranded plural verb, which is what the
+ * owner flagged on a delivered Vuori ad ("sounds idiomatically incorrect").
+ *
+ * A static feed ad has far more room than a 3s overlay, so prefer the FULL
+ * sentence when it fits. The original concern is preserved rather than discarded:
+ * a 200-character quote at testimonial size IS unreadable at feed scale, and the
+ * cap is what enforces that. What was wrong for this surface was the 50, not the
+ * existence of a cap.
+ *
+ * OVERFLOW IS BOUNDED. An earlier draft fell back to `snippet || full`, which
+ * meant a 500-char review with no snippet (snippet job failed, legacy artifact)
+ * shipped in full — the cap silently not applying on the one path that needed it
+ * most. An adversarial pass caught it, and worse, the harness had pinned that
+ * behaviour as required. Now: snippet if present, else a word-boundary truncation
+ * to the cap, reusing quoteSnippetService.truncateAtWordBoundary rather than a
+ * second slicing implementation that could drift from it.
+ *
+ * @param {null|{text?:string,snippet?:string}} quote
+ * @param {{fullQuoteEnabled?:boolean, cap?:number}} [opts]
+ * @returns {string}
+ */
+function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = 140 } = {}) {
+  // Flag-off restores the exact pre-change expression, byte for byte.
+  if (!fullQuoteEnabled) {
+    return quote ? String(quote.snippet || quote.text || '').trim() : '';
+  }
+  const full = quote ? String(quote.text || '').trim() : '';
+  const snippet = quote ? String(quote.snippet || '').trim() : '';
+  if (full && full.length <= cap) return full;
+  if (snippet) return snippet;
+  if (!full) return '';
+  // No snippet and over the cap: shorten rather than ship unbounded text.
+  //
+  // truncateAtWordBoundary is reused (one shortening implementation, not two
+  // that can drift), but its contract is NOT ours and the difference is
+  // load-bearing: for a single unbroken token longer than the budget it returns
+  // the token WHOLE by design — "oversized beats unreadable" — which is right
+  // for a 3s video overlay and wrong here, where the cap is the whole point.
+  // Measured: a 400-char spaceless token came back 401 chars. Real prose always
+  // has spaces so this is a pathological input (a long URL, a pasted blob), but
+  // "bounded" has to actually be bounded, so clamp after truncating.
+  const { truncateAtWordBoundary } = require('./quoteSnippetService');
+  const shortened = truncateAtWordBoundary(full, cap) || '';
+  if (shortened && shortened.length <= cap) return shortened;
+  return `${full.slice(0, Math.max(1, cap - 1)).trimEnd()}…`;
 }
 
 /** The product sentence the prompt opens with. */
@@ -529,10 +657,37 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
     );
   }
 
-  // `snippet` is the <=50-char word-safe shortening of the SAME sentence. It is
-  // preferred because the model has to typeset this, and a 200-character quote
-  // set at testimonial size is unreadable at feed scale.
-  const quoteText = quote ? String(quote.snippet || quote.text || '').trim() : '';
+  // QUOTE LENGTH IS PER-SURFACE (owner, 2026-08-10).
+  //
+  // `snippet` is a <=50-char extraction whose own service header states its
+  // purpose outright: "suitable for a 3-second video overlay"
+  // (quoteSnippetService, MAX_CHARS = 50, prompt asks for "4–8 words"). That
+  // video-shaped cap was being applied to STATIC as well, and at 50 chars the
+  // extractor drops the subject: "The quality is amazing and the pair I have
+  // feel like second skin" became "feel like second skin" — a subjectless
+  // fragment with a stranded plural verb. Owner flagged exactly that on a
+  // delivered Vuori ad ("sounds idiomatically incorrect").
+  //
+  // A static feed ad has far more room than a 3s overlay, so prefer the FULL
+  // sentence when it fits, and fall back to the snippet only when the full text
+  // is genuinely too long to typeset. The original concern below is preserved,
+  // not discarded: a 200-character quote at testimonial size IS unreadable at
+  // feed scale, and STATIC_QUOTE_MAX_CHARS is what enforces that. What was
+  // wrong for this surface was the 50, not the existence of a cap.
+  //
+  // Ordering note: when the full text overflows we keep `snippet || full`, which
+  // is the pre-change precedence, so a long quote with no snippet still prints
+  // rather than vanishing.
+  // The selection itself lives in selectStaticQuoteText / resolveStaticQuoteCap
+  // at module scope, EXPORTED so scripts/verifyQuoteSurfaceLength.js exercises
+  // the shipped function instead of a copy of it. Two independent adversarial
+  // passes flagged that seam: the harness's behavioural checks were running a
+  // local mirror, so a mutation to the real expression could leave the suite
+  // green. Same failure class as CLAUDE.md's "revert-prove behaviourally" note.
+  const quoteText = selectStaticQuoteText(quote, {
+    fullQuoteEnabled: String(process.env.STATIC_FULL_QUOTE ?? 'true').toLowerCase() !== 'false',
+    cap: resolveStaticQuoteCap(process.env.STATIC_QUOTE_MAX_CHARS),
+  });
 
   // Headline / subhead. Flag-off: exact pre-change expression (Director
   // headline only; subhead undefined). Flag-on: cascade through layoutInput
@@ -688,12 +843,22 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
     // resolveCoherentSocialProof. With a quote on frame, an unstamped pair stays
     // withheld, which is the pre-existing fail-closed rule, not a new one.
     const unstampedFallback = (!proof.rating_source && liPair && !quoteText) ? liPair : null;
+    // STATIC ONLY — owner directive 2026-08-07. Lets a comment/product-tier quote
+    // keep printing AND still show scope-labelled brand stars ("4.6 ★ · 15000
+    // brand reviews") instead of the quote hard-nulling the numbers and dropping
+    // social_proof_led to objection_resolved (7 of 18 renders did exactly that).
+    // Passed ONLY here: resolveCoherentSocialProof defaults it false, so the
+    // video path through buildMetaForAd is unchanged by construction.
+    // Kill switch, no deploy needed to revert.
+    const STATIC_BRAND_STARS_WITH_QUOTE =
+      String(process.env.STATIC_BRAND_STARS_WITH_QUOTE ?? 'true').toLowerCase() !== 'false';
     coherent = resolveCoherentSocialProof({
       quote: quote || null,
       product: productPair || unstampedFallback,
       brand: brandPair,
       brandAttribution: brandAttributionLabel(brand),
       renderedQuoteText: quoteText || null,
+      allowLabeledBrandNumbers: STATIC_BRAND_STARS_WITH_QUOTE,
     });
     console.log(
       `🔒 direct-image proof: source=${coherent.source || 'none'} rating=${coherent.rating || 'none'} ` +
@@ -1490,12 +1655,19 @@ module.exports = {
   // finishPlate is the exception: the recovery path is a SECOND legitimate caller
   // (see its header) — it finishes an already-paid Atlas output into a real ad.
   finishPlate,
+  // Exported so scripts/verifyQuoteSurfaceLength.js executes the SHIPPED quote
+  // selection instead of a local copy — two adversarial passes flagged that the
+  // harness's behavioural checks were running a mirror, which is a check that
+  // cannot fail for the mutation it was written to catch.
+  selectStaticQuoteText,
+  resolveStaticQuoteCap,
   deliveryGeometryFor,
   safeBoxInDeliveredPx,
   extractFor,
   logoPlacementFor,
   monochromeInkFor,
   monochromeLogoBuffer,
+  alphaChannelDiscriminates,
   intentForTemplate,
   buildIntentData,
   describeProductForPrompt,

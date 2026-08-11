@@ -17,7 +17,7 @@ const axios = require('axios');
 const CatalogProduct = require('../models/CatalogProduct');
 const core = require('./creativeMatcherCore');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 // ── Public entry ─────────────────────────────────────────────────────

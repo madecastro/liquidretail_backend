@@ -155,6 +155,51 @@ function envKeyFor(role) {
   return 'ATLAS_MODEL_' + role.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
 }
 
+// The Claude 5 family refuses the sampling knobs through Atlas: a request
+// carrying temperature (!= 1), top_p or top_k comes back as a bare
+// HTTP 400 {"code":400,"msg":"bad request"} with no field named. That is the
+// Anthropic extended-thinking constraint — with thinking on, sampling is not
+// the caller's to set — now enforced at the gateway.
+//
+// Probed live 2026-08-10 against the production key:
+//   anthropic/claude-sonnet-5  temperature 0 / 0.45 / 0.7 → 400
+//                              top_p 0.9 → 400, top_k 40 → 400
+//                              temperature 1, or omitted  → 200
+//   anthropic/claude-opus-5    temperature 0.45 → 400, omitted → 200
+//   claude-opus-4.8 / sonnet-4.6 / sonnet-4.5 → temperature accepted
+//   every openai/* and google/* slug          → temperature accepted
+// max_tokens, response_format, stop, seed, frequency_penalty and
+// presence_penalty were all accepted and are deliberately NOT stripped.
+//
+// This ran static ad generation at a 100% failure rate: role 'director' is the
+// only Anthropic entry in MAP, and it sends temperature 0.45, so every
+// concept-driven expansion threw and no static Ad row was ever created. Last
+// good Director round 2026-08-07 21:20 UTC, first failure 2026-08-10 15:17 UTC,
+// with NO deploy in between — the change was Atlas-side, not ours.
+//
+// Stripping (rather than pinning to 1) is deliberate: 1 is already the model's
+// default, and an explicit 1 would imply we still control a knob we do not.
+const CLAUDE_5_FAMILY = /^anthropic\/claude-(?:opus|sonnet|haiku)-5(?:$|[-.])/;
+
+/**
+ * True when the resolved Atlas slug rejects temperature/top_p/top_k.
+ * Lives here, not in a transport, because it is a fact about the MODEL —
+ * both atlasLlmService and atlasLlmStreamService consume it so the two
+ * transports cannot drift on it.
+ */
+function rejectsSamplingParams(atlasId) {
+  return CLAUDE_5_FAMILY.test(String(atlasId || ''));
+}
+
+// Params the Claude 5 family refuses. Exported so a harness can assert the
+// transports strip exactly this set and nothing more.
+const SAMPLING_PARAMS = Object.freeze(['temperature', 'top_p', 'top_k']);
+
+function stripSamplingParams(body) {
+  for (const k of SAMPLING_PARAMS) delete body[k];
+  return body;
+}
+
 /**
  * Resolve a legacy model id (or an already-prefixed Atlas slug) to
  * { atlas, direct }. Unknown ids pass through unchanged as the atlas id
@@ -170,4 +215,10 @@ function resolveModel(id) {
   return { atlas: id, direct: id ? { provider: 'openai', model: id } : null };
 }
 
-module.exports = { resolveModel, MAP };
+module.exports = {
+  resolveModel,
+  MAP,
+  rejectsSamplingParams,
+  stripSamplingParams,
+  SAMPLING_PARAMS,
+};

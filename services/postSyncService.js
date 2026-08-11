@@ -24,7 +24,7 @@ const DetectRun = require('../models/DetectRun');
 const { decrypt } = require('./integrationCryptoService');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 // Default page size + cap. IG Business returns ~25 by default; we ask
@@ -128,7 +128,7 @@ async function syncPosts(brandId, options = {}) {
   try {
   // Multi-credential path.
   if (creds.length > 1 && !options.credentialId) {
-    const aggregated = { ok: true, fetched: 0, ingested: 0, skipped: 0, capSkipped: 0, errors: 0, queuedRunIds: [], perCredential: [] };
+    const aggregated = { ok: true, fetched: 0, ingested: 0, reIngested: 0, skipped: 0, capSkipped: 0, errors: 0, queuedRunIds: [], perCredential: [] };
     // Pre-compute brand-wide remaining cap once. Each per-cred run
     // updates a shared remaining counter passed via options so the
     // cap doesn't double-count.
@@ -143,6 +143,7 @@ async function syncPosts(brandId, options = {}) {
       if (r.ok) {
         aggregated.fetched     += r.fetched     || 0;
         aggregated.ingested    += r.ingested    || 0;
+        aggregated.reIngested  += r.reIngested  || 0;
         aggregated.skipped     += r.skipped     || 0;
         aggregated.capSkipped  += r.capSkipped  || 0;
         aggregated.errors      += r.errors      || 0;
@@ -241,10 +242,34 @@ async function syncPostsForCred(cred, options = {}) {
     console.log(`   · IG post sync cap check: ${dailyCap - runsRemaining}/${dailyCap} runs today; ${runsRemaining} remaining`);
   }
 
+  // FORCE / RE-SCAN. Normally an already-ingested post is skipped outright, so
+  // "Sync Now" on an account whose posts are all known is a silent no-op — which
+  // is what made a re-scan impossible to ask for. With force we re-enter
+  // ingestPost for known posts too: it upserts (so nothing is duplicated and
+  // $setOnInsert protects existing fields), refreshes platformStats, and — via
+  // forceDetect — is allowed to queue a fresh DetectRun for media that already
+  // had one.
+  //
+  // BILLABLE — each re-queued DetectRun is a real vision/LLM run — so it stays
+  // opt-in. force never OUTRANKS a cap: `enqueueRun` below is resolved from
+  // runsRemaining first, so any caller that supplies a cap keeps it.
+  //
+  // ⚠️ BUT THE MANUAL ROUTE SUPPLIES NO CAP, so do not read the above as "a
+  // forced re-scan is capped". `dailyDetectRunCap` reaches syncPosts from
+  // scheduledSyncService ONLY; POST /instagram/sync-posts passes {limit, force,
+  // credentialId}, so runsRemaining is null and enqueueRun is unconditionally
+  // true there. The real bound on one manual call is `limit` (≤50); repeated
+  // clicks are bounded by nothing server-side. Same for the pre-existing
+  // "Sync Now" — not introduced by force. Pinned by verifyIgRescanGuards 5f.
+  const force = !!options.force;
+
   const summary = {
     fetched:  posts.length,
     ingested: 0,
     skipped:  0,
+    // Known posts re-entered because force was set. Reported separately from
+    // `ingested` so a re-scan cannot be mistaken for having found new content.
+    reIngested: 0,
     capSkipped: 0,
     errors:   0,
     queuedRunIds: []
@@ -262,8 +287,9 @@ async function syncPostsForCred(cred, options = {}) {
 
     // Idempotent skip: already ingested for THIS brand. Other brands'
     // copies of the same IG post id are intentionally not deduped here.
+    // Suppressed under force — that is the whole point of a re-scan.
     const existing = await Media.findOne({ brandId, source: 'instagram', externalId }).select('_id').lean();
-    if (existing) { summary.skipped++; continue; }
+    if (existing && !force) { summary.skipped++; continue; }
 
     // Cap check — when out of remaining runs, still ingest the Media
     // (cheap, idempotent) but don't enqueue a DetectRun. Tomorrow's
@@ -272,10 +298,15 @@ async function syncPostsForCred(cred, options = {}) {
 
     try {
       const ingested = await ingestPost({
-        post, cred, brandName, brandUrl, token, enqueueRun, trigger
+        post, cred, brandName, brandUrl, token, enqueueRun, trigger,
+        // Only a KNOWN post gets the re-detect bypass. A post that is new to us
+        // has no DetectRun to skip, so passing force there would be meaningless
+        // — and scoping it this way keeps the bypass provably limited to the
+        // re-scan case.
+        forceDetect: force && !!existing
       });
       if (ingested?.mediaId) {
-        summary.ingested++;
+        if (existing) summary.reIngested++; else summary.ingested++;
         if (ingested.runId) {
           summary.queuedRunIds.push(String(ingested.runId));
           if (runsRemaining != null) runsRemaining--;
@@ -295,7 +326,11 @@ async function syncPostsForCred(cred, options = {}) {
   cred.lastPostsSyncAt = new Date();
   await cred.save();
 
-  console.log(`📸 IG post sync done: brand=${brandId} fetched=${summary.fetched} ingested=${summary.ingested} skipped=${summary.skipped} errors=${summary.errors} in ${Date.now() - t0}ms`);
+  console.log(
+    `📸 IG post sync done: brand=${brandId} fetched=${summary.fetched} ingested=${summary.ingested} ` +
+    `${force ? `re-ingested=${summary.reIngested} requeuedDetect=${summary.queuedRunIds.length} ` : ''}` +
+    `skipped=${summary.skipped} errors=${summary.errors} in ${Date.now() - t0}ms`
+  );
 
   return {
     ok: true,
@@ -306,7 +341,7 @@ async function syncPostsForCred(cred, options = {}) {
 
 // Ingest a single post: resolve its primary media URL (handles carousels),
 // mirror to Cloudinary, create Media + DetectRun.
-async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun = true, trigger = 'instagram-sync' }) {
+async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun = true, trigger = 'instagram-sync', forceDetect = false }) {
   const externalId = String(post.id);
   const mediaType = post.media_type;       // IMAGE | VIDEO | CAROUSEL_ALBUM
   const permalink = post.permalink || null;
@@ -420,10 +455,17 @@ async function ingestPost({ post, cred, brandName, brandUrl, token, enqueueRun =
   // Only enqueue a DetectRun for FRESH inserts. If this Media existed
   // before this sync, we already queued a run for it. The check below
   // is the cheapest way to discriminate: count runs for this media.
+  //
+  // forceDetect is the operator-requested re-scan overriding exactly this skip.
+  // It sits BELOW the `enqueueRun` return above on purpose: the daily cap stays
+  // authoritative, so a re-scan can never spend past the day's run budget.
   const existingRunCount = await DetectRun.countDocuments({ mediaId: media._id });
-  if (existingRunCount > 0) {
+  if (existingRunCount > 0 && !forceDetect) {
     console.log(`   · post ${externalId} already had ${existingRunCount} DetectRun(s) — skipping enqueue`);
     return { runId: null, mediaId: media._id };
+  }
+  if (existingRunCount > 0 && forceDetect) {
+    console.log(`   · post ${externalId} had ${existingRunCount} DetectRun(s) — re-queueing (forced re-scan, billable)`);
   }
 
   let run;

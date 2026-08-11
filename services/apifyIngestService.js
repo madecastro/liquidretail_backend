@@ -16,6 +16,12 @@ const CatalogProduct = require('../models/CatalogProduct');
 
 const { pullInstagramPosts, pullShopifyProducts } = require('./apifyPullService');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
+// Zero-dep shared cap — see services/catalogImageLimits.js. Kept here as
+// a top-level require (module has no deps) so this path never hard-codes
+// a lower truncating ceiling than detect's MAX_ALT_IMAGES.
+const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+// Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
+const ingestShotClassify = require('./ingestShotClassifyService');
 
 const APIFY_TRIGGER = 'apify-sync';
 
@@ -303,7 +309,10 @@ async function syncBrandShopify(brand, run = null) {
   const products = await pullShopifyProducts(shopifyUrl);
 
   const summary = { ok: true, fetched: products.length, added: 0, updated: 0, errors: 0, aborted: false };
-
+  // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
+  const shotSession = ingestShotClassify.createSession();
+  const pendingClassify = [];
+  try {
   for (const p of products) {
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
@@ -311,6 +320,7 @@ async function syncBrandShopify(brand, run = null) {
       break;
     }
     try {
+      // Upsert only — no await on classify (image network work).
       const result = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId: p.externalId },
         {
@@ -326,7 +336,14 @@ async function syncBrandShopify(brand, run = null) {
             currency:        p.currency,
             availability:    p.availability,
             imageUrl:        p.imageUrl || null,
-            additionalImages: Array.isArray(p.additionalImageUrls) ? p.additionalImageUrls.slice(0, 8) : [],
+            // p.additionalImageUrls is ALREADY the alt list (hero is
+            // p.imageUrl), so slice from 0 — not the hero-offset form used
+            // on Shopify/JSON-LD combined arrays. Cap = MAX_ADDITIONAL_IMAGES
+            // (shared; see catalogImageLimits). Upstream apifyPullService
+            // returns images.slice(1) uncapped; this writer is the bound.
+            additionalImages: Array.isArray(p.additionalImageUrls)
+              ? p.additionalImageUrls.slice(0, MAX_ADDITIONAL_IMAGES)
+              : [],
             productUrl:      p.productUrl || null,
             rawData:         p,
             lastSyncedAt:    new Date()
@@ -337,10 +354,46 @@ async function syncBrandShopify(brand, run = null) {
       );
       if (result?.lastErrorObject?.updatedExisting) summary.updated++;
       else                                           summary.added++;
+      // Defer classify to post-loop pass — never block remaining upserts.
+      const row = result?.value || result;
+      if (row && ingestShotClassify.isEnabled()) {
+        pendingClassify.push({
+          productId: row._id,
+          imageUrl: row.imageUrl,
+          additionalImages: row.additionalImages,
+          existingStyles: row.imageShotStyles
+        });
+      }
     } catch (err) {
       console.warn(`   ⚠️  Apify Shopify upsert failed for ${p.externalId}: ${err.message}`);
       summary.errors++;
     }
+  }
+
+  // Post-loop classify pass — products already persisted.
+  // Budget clock starts here (beginClassifyPhase), not at createSession.
+  // Batched across products so the concurrency cap is used; cooperative
+  // cancel (same isBrandAborted as the upsert loop) stops promptly and
+  // records outstanding URLs as skippedAbandoned.
+  if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        if (summary.aborted) return true;
+        try { return !!(await isBrandAborted(brand._id, run)); } catch (_) { return false; }
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
+      }
+    }).then((r) => {
+      if (r && r.cancelled) summary.aborted = true;
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  Apify shot-classify batch failed: ${shotErr.message}`);
+    });
   }
 
   // Fire product-path detect for any newly imported products with images.
@@ -375,12 +428,145 @@ async function syncBrandShopify(brand, run = null) {
   summary.durationMs = Date.now() - t0;
   console.log(`🛍  Apify Shopify sync done: brand=${brand._id} fetched=${summary.fetched} added=${summary.added} updated=${summary.updated} errors=${summary.errors} in ${summary.durationMs}ms`);
   return summary;
+  } catch (err) {
+    throw err;
+  } finally {
+    // Unconditional summary — abort, throw, and success all report.
+    // Outstanding pending when classify never ran → abandoned (not considered=0).
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          summary.aborted ? 'cancelled' : 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
+    try { shotSession.logSummary('🛍 apify shot-classify'); } catch (_) { /* ignore */ }
+    try { shotSession.dispose(); } catch (_) { /* ignore */ }
+  }
+}
+
+// ── Apify comment ingest ─────────────────────────────────────────────
+// Comment refresh for apify-ig Media rows. Reuses apify/instagram-
+// scraper with resultsType='comments'; upserts Comment docs by
+// (mediaId, externalId) — same idempotency shape mediaInsightsService
+// uses for OAuth-sourced Media. Runs one Apify sync-run per post so
+// per-post progress is checkpointable; concurrency capped modest
+// because each run is billed separately.
+//
+// PROVENANCE: sets Comment.source = 'instagram' (the platform),
+// distinct from Media.source = 'apify-ig' (the ingest path). Comments
+// don't carry an "ingest path" field — the mediaId reference identifies
+// where the parent came from if a consumer needs it.
+async function syncBrandInstagramCommentsApify(brandId, { concurrency = 2 } = {}) {
+  const Comment = require('../models/Comment');
+  const { pullInstagramComments } = require('./apifyPullService');
+
+  const brand = await Brand.findById(brandId).select('_id name advertiserId').lean();
+  if (!brand) {
+    const e = new Error(`Brand ${brandId} not found`);
+    e.status = 404;
+    throw e;
+  }
+
+  // Target: every apify-ig Media on the brand with a permalink we can
+  // hand to Apify. Skip catalog-product wrappers + soft-deleted.
+  const targets = await Media.find({
+    brandId: brand._id,
+    source: 'apify-ig',
+    deletedAt: null,
+    'metadata.permalink': { $exists: true, $ne: null }
+  })
+    .select('_id metadata.permalink externalId')
+    .lean();
+
+  if (!targets.length) {
+    return { ok: true, brandId: String(brand._id), total: 0, note: 'no apify-ig media with a permalink' };
+  }
+
+  const perStep = [];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < targets.length) {
+      const idx = cursor++;
+      const media = targets[idx];
+      const t0 = Date.now();
+      try {
+        const comments = await pullInstagramComments(media.metadata.permalink, {});
+        let upserted = 0;
+        for (const c of comments) {
+          const res = await Comment.updateOne(
+            { mediaId: media._id, externalId: c.externalId },
+            {
+              $set: {
+                text:             c.text,
+                authorUsername:   c.authorUsername,
+                authorId:         c.authorId,
+                likeCount:        c.likeCount,
+                replyCount:       c.replyCount,
+                postedAt:         c.postedAt,
+                parentExternalId: c.parentExternalId,
+                fetchedAt:        new Date()
+              },
+              $setOnInsert: {
+                mediaId:      media._id,
+                brandId:      brand._id,
+                advertiserId: brand.advertiserId,
+                source:       'instagram',
+                externalId:   c.externalId
+              }
+            },
+            { upsert: true }
+          );
+          if (res.upsertedCount || res.modifiedCount) upserted++;
+        }
+        perStep.push({
+          ok: true,
+          mediaId: String(media._id),
+          fetched: comments.length,
+          upserted,
+          tookMs: Date.now() - t0
+        });
+      } catch (err) {
+        perStep.push({
+          ok: false,
+          mediaId: String(media._id),
+          reason: err.message,
+          tookMs: Date.now() - t0
+        });
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, targets.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  const succeeded = perStep.filter((r) => r.ok).length;
+  const failed    = perStep.filter((r) => !r.ok).length;
+  const totalFetched  = perStep.reduce((s, r) => s + (r.fetched  || 0), 0);
+  const totalUpserted = perStep.reduce((s, r) => s + (r.upserted || 0), 0);
+
+  return {
+    ok: true,
+    brandId: String(brand._id),
+    total: targets.length,
+    succeeded,
+    failed,
+    fetched: totalFetched,
+    upserted: totalUpserted,
+    perStep
+  };
 }
 
 module.exports = {
   syncBrandApify,
   syncDemoBrand: syncBrandApify, // alias — method-aware orchestrator
   syncBrandInstagram,
+  syncBrandInstagramCommentsApify,
   syncBrandShopify,
   isBrandAborted
 };

@@ -16,13 +16,13 @@ import { BasePlate } from '../components/BasePlate.jsx';
 import { useBrandFonts } from '../components/FontLoader.jsx';
 import { SLOT_RENDERERS } from '../components/slotRenderers.jsx';
 import { slotEnvelope, slotProgress, specTimeScale } from '../lib/timing.js';
-import { stackContainerStyle, SAFE_ZONES } from '../lib/safeZones.js';
+import { stackContainerStyle, resolveSafeZone, resolveSafeZoneKey } from '../lib/safeZones.js';
 import { contrastToken } from '../lib/tokens.js';
 import { resolveSlotContent } from '../lib/slotContent.js';
-import { decideInkOnLight } from '../lib/plateHints.js';
+import { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
 // Re-export pure resolver for offline harnesses (same decision as render).
 export { resolveSlotContent, resolveSlotContentCore, truncateWordSafe } from '../lib/slotContent.js';
-export { decideInkOnLight } from '../lib/plateHints.js';
+export { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
 
 const BAND_FOR_ANCHOR = { top: 'top', upperThird: 'top', center: 'middle', lowerThird: 'bottom', bottom: 'bottom' };
 
@@ -272,10 +272,16 @@ function foldRows(items) {
 
 const ALIGN_TO_FLEX = { left: 'flex-start', center: 'center', right: 'flex-end' };
 
-export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec, plateHints = null, debugLayout = false }) => {
+export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat = null, plate, meta = {}, tokens = {}, spec, plateHints = null, debugLayout = false }) => {
   const frame = useCurrentFrame();
   const { width, height, fps, durationInFrames } = useVideoConfig();
   useBrandFonts(tokens?.fonts);
+  // Canvas format stays the composition id; YT zones only via safeZoneKey /
+  // platformFormat (PMax video). Resolved once so every group + overlay agree.
+  const zoneKey = safeZoneKey || resolveSafeZoneKey({ format, platformFormat });
+  // Worst-case ink applies to the Google video surfaces only. Meta keeps the
+  // single-instant reading, so its rendered output is unchanged.
+  const isPmaxSurface = usesWorstCaseInk(platformFormat);
 
   // Spec color overrides win over resolved brand tokens (font overrides are
   // resolved server-side because they may need new font files).
@@ -325,7 +331,16 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
         // Ink for THIS group, from the band it actually occupies after keep-out.
         const groupAtSec = first.timing.enterAtSec * timeScale + 0.5;
         const bandLum = bandStateFor(plateHints, effectiveAnchor, groupAtSec).lum;
-        const bandInk = inkForBand(bandLum);
+        // PMax: score the ink against every sample of this band, not just the
+        // one nearest the group's enter time. A 10s clip whose shot changes
+        // under a title otherwise picks ink for the instant the text arrives
+        // and keeps it while the plate turns dark — measured as dark-on-black
+        // on a delivered ad that had logged 9.77:1. Meta keeps the instant
+        // reading, so its output is byte-identical.
+        const bandInk =
+          (isPmaxSurface
+            ? worstCaseInkForBand(plateHints, BAND_FOR_ANCHOR[effectiveAnchor] || 'middle', INK_DARK_LUM, INK_LIGHT_LUM)
+            : null) || inkForBand(bandLum);
         const inkOnLight = bandInk ? bandInk.onLight : inkOnLightGlobal;
         // Even the better ink is below AA on this band: placement cannot carry it,
         // so the strongest authored shadow does. 'layered' is an existing validated
@@ -340,6 +355,7 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
         );
         const container = stackContainerStyle({
           format,
+          safeZoneKey: zoneKey,
           anchor: effectiveAnchor,
           offsetX: first.position.offsetX,
           offsetY: first.position.offsetY,
@@ -415,13 +431,13 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
           </div>
         );
       })}
-      {debugLayout ? <SafeZoneOverlay format={format} width={width} height={height} /> : null}
+      {debugLayout ? <SafeZoneOverlay safeZoneKey={zoneKey} width={width} height={height} /> : null}
     </AbsoluteFill>
   );
 };
 
-const SafeZoneOverlay = ({ format, width, height }) => {
-  const safe = SAFE_ZONES[format] || SAFE_ZONES.feed;
+const SafeZoneOverlay = ({ safeZoneKey, width, height }) => {
+  const safe = resolveSafeZone({ safeZoneKey });
   return (
     <div
       style={{

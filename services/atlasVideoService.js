@@ -39,7 +39,7 @@ const Campaign                  = require('../models/Campaign');
 const CatalogProduct            = require('../models/CatalogProduct');
 const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
-const { recordFlatCost } = require('./costTracker');
+const { recordFlatCost, finalizeFlatCost, reconcileCost } = require('./costTracker');
 const referenceDefaultsService  = require('./referenceDefaultsService');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
@@ -1887,7 +1887,10 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
           // neither. NEVER cleared once true.
           billed = true;
 
-          const outUrl = await pollPrediction(id);
+          const pollOut = await pollPrediction(id);
+          // pollPrediction returns { url, price } (price is for video-master
+          // cost reconcile; reframe ledgers its own flat estimate and ignores it).
+          const outUrl = pollOut && typeof pollOut === 'object' ? pollOut.url : pollOut;
 
           // Retried (free, idempotent) — see fetchOutpaintOutput. A single blip
           // here used to discard a generation we had already paid for.
@@ -2181,25 +2184,46 @@ function isCatalogFeedOrderSeedingEnabled() {
 // Through, 2026-08-05) disproved that: the hero doc was created ~1h41m and
 // ~8s AFTER its alts on two separate SKUs, so createdAt order routinely put
 // alts ahead of the hero. That gap is exactly why this function exists now.
-function sortCatalogMediasForReferenceStack(docs) {
+// opts.preferUgcMediaId — UGC-ads Phase 3. When set (and the UGC-first kill
+// switch is on), hoists the given Media id to index 0 of the sorted stack
+// AFTER the existing feedIndex-first cascade runs on the rest. For the video
+// rail this is largely defensive: `generateForAd` already places `Ad.mediaId`
+// at reference position 0 directly, and this sort feeds positions 1..N off
+// catalog-only docs. But when the UGC-ads wizard eventually opts a UGC into
+// the catalog-scoped stack (or a follow-up call composes catalog+UGC docs
+// before sort), the same rule applies: operator-picked UGC owns index 0.
+// Unset / no-match / flag-off → byte-identical to the pre-Phase-3 sort.
+function sortCatalogMediasForReferenceStack(docs, opts = {}) {
   const list = Array.isArray(docs) ? docs.slice() : [];
   const byCreatedAtAsc = (a, b) =>
     (a.createdAt ? new Date(a.createdAt).getTime() : 0) -
     (b.createdAt ? new Date(b.createdAt).getTime() : 0);
 
-  if (!isCatalogFeedOrderSeedingEnabled()) {
-    return list.sort(byCreatedAtAsc);
-  }
+  const sorted = !isCatalogFeedOrderSeedingEnabled()
+    ? list.sort(byCreatedAtAsc)
+    : list.sort((a, b) => {
+        const fa = a.metadata?.feedIndex;
+        const fb = b.metadata?.feedIndex;
+        const ha = Number.isFinite(fa);
+        const hb = Number.isFinite(fb);
+        if (ha && hb) return fa - fb;
+        if (ha !== hb) return ha ? -1 : 1; // stamped entries sort before unstamped
+        return byCreatedAtAsc(a, b);
+      });
 
-  return list.sort((a, b) => {
-    const fa = a.metadata?.feedIndex;
-    const fb = b.metadata?.feedIndex;
-    const ha = Number.isFinite(fa);
-    const hb = Number.isFinite(fb);
-    if (ha && hb) return fa - fb;
-    if (ha !== hb) return ha ? -1 : 1; // stamped entries sort before unstamped
-    return byCreatedAtAsc(a, b);
-  });
+  // Deliberately imported lazily inside the function body — atlasVideoService
+  // and seededUniverseService both live in services/ but neither requires the
+  // other today, and forcing a top-of-file require would create a cycle-risk
+  // window during startup. The lookup happens once per sort call, and the
+  // require cache means it is free after the first hit.
+  const { promoteUgcFirst, isUgcFirstSeedingEnabled } = require('./seededUniverseService');
+  if (!opts.preferUgcMediaId || !isUgcFirstSeedingEnabled()) return sorted;
+  // promoteUgcFirst expects entries wrapped { media }; sortCatalogMedias-
+  // ForReferenceStack works on bare docs. Wrap+unwrap so the helper stays a
+  // single source of truth for the "hoist by id, no-op if missing" contract.
+  const wrapped = sorted.map(m => ({ media: m }));
+  const promoted = promoteUgcFirst(wrapped, opts.preferUgcMediaId);
+  return promoted.map(w => w.media);
 }
 
 async function buildReferenceImages({
@@ -2402,6 +2426,38 @@ async function buildReferenceImages({
 // POLL_INTERVAL=5s, cap of 12 gives ~60s of leeway for other
 // transients before surfacing the error.
 const MAX_CONSECUTIVE_ERRORS = parseInt(process.env.ATLAS_MAX_CONSECUTIVE_ERRORS, 10) || 12;
+
+// Prediction states that are SETTLED — the task is over and the body is a
+// verdict, not noise. Used to tell "this response tells us the outcome" from
+// "this response tells us nothing", INDEPENDENTLY of the HTTP status code.
+//
+// Atlas delivers a settled verdict inside an HTTP 500 for a failed generation:
+//   HTTP 500  { code: 500, message: "Generation failed: task processing failed
+//               (code: generation_failed)",
+//               data: { status: "failed", outputs: null, executionTime: 0, … } }
+// Verified live 2026-08-10 against five real failed predictions — every one
+// returned HTTP 500 with a complete `data.status:'failed'`. The same prediction
+// was observed returning HTTP 200 earlier in its life, so the status code is
+// NOT a reliable discriminator and only the body is.
+//
+// docs/ATLAS.md §4 already draws exactly this line: a poll error "may carry
+// information about the task (`data.status:'failed'`, a coded {code,msg}
+// envelope) — or none at all (a CDN/WAF/proxy error page)". The bare-5xx
+// handling below is for the second kind and is deliberately unchanged.
+// The terminal FAILURE states. Kept identical to `predictionFailed.match` in
+// atlasErrorPolicy so classification and poll/peek termination cannot disagree:
+// a status the policy calls a failure but the poll does not recognise would be
+// logged as "still running" and burn the whole MAX_POLL_MS budget before timing
+// out — and a timeout carries no policy metadata, so it would never reach the
+// retry gate either.
+const TERMINAL_FAILURE_STATUSES = new Set([
+  'failed', 'error', 'cancelled', 'canceled', 'rejected'
+]);
+const TERMINAL_OK_STATUSES = new Set(['completed', 'succeeded']);
+
+const SETTLED_POLL_STATUSES = new Set([
+  ...TERMINAL_OK_STATUSES, ...TERMINAL_FAILURE_STATUSES
+]);
 
 // Rate-limit backoff schedule (ms). Applied on each consecutive rate-limit
 // hit — resets on the next non-rate-limit response. Caps at the last value.
@@ -2616,12 +2672,19 @@ async function peekPrediction(predictionId) {
   } catch (err) {
     return { state: 'unknown', message: err.message };
   }
-  if (res.status !== 200) {
-    return { state: 'unknown', message: `HTTP ${res.status}` };
-  }
   const data = res.data?.data || {};
   const status = String(data.status || '').toLowerCase();
-  if (status === 'completed' || status === 'succeeded') {
+  // Bail on a non-2xx ONLY when it carries no verdict. A failed Atlas video
+  // prediction is served as HTTP 500 with a complete `data.status:'failed'`
+  // body (verified live 2026-08-10, 5/5 failed predictions), and the old
+  // status-first guard returned 'unknown' for every one of them — so recovery
+  // could never settle a confirmed-failed video and its charge state stayed
+  // permanently unresolved. 'unknown' must mean "we could not tell", not "we
+  // did not look".
+  if (res.status !== 200 && !SETTLED_POLL_STATUSES.has(status)) {
+    return { state: 'unknown', message: `HTTP ${res.status}` };
+  }
+  if (TERMINAL_OK_STATUSES.has(status)) {
     const raw = data.outputs ?? data.output ?? [];
     const url = Array.isArray(raw) ? raw[0] : raw;
     // Completed WITHOUT an output is the genuine "paid for nothing" case and is
@@ -2630,7 +2693,7 @@ async function peekPrediction(predictionId) {
       ? { state: 'done', videoUrl: url }
       : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput' };
   }
-  if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
+  if (TERMINAL_FAILURE_STATUSES.has(status)) {
     const providerMsg = data.error || status;
     const policy = classify({
       predictionStatus: 'failed', msg: providerMsg, nsfw: data.has_nsfw_contents ?? null
@@ -2638,10 +2701,190 @@ async function peekPrediction(predictionId) {
     return {
       state: 'failed',
       message: `${policy.label || 'atlasVideo: prediction failed'}: ${providerMsg}`,
-      policy: policy.name
+      policy: policy.name,
+      ...confirmedCharge(data)
     };
   }
   return { state: 'processing' };
+}
+
+/**
+ * The CONFIRMED charge for a settled prediction, read from Atlas's own record.
+ *
+ * `data.price` is the authority — costTracker/atlasImageService already treat it
+ * that way, and §4's owner rule is that a charge may only be asserted from a
+ * CONFIRMED price on the settled prediction. Measured live 2026-08-10 on ten
+ * real video predictions:
+ *
+ *   succeeded → price "0.75" (full-length) / "0.08" (short)   5 of 5
+ *   failed    → price ABSENT ENTIRELY                          5 of 5
+ *
+ * which matches Atlas's documented behaviour and the note already in
+ * atlasImageService: "Atlas refunds the reservation on a failed task and never
+ * bills a rejection".
+ *
+ * Returns the TRI-STATE, never a guess:
+ *   charged:true  — a positive price is present. Real money. Never retry.
+ *   charged:false — the prediction is settled AND carries no price. Safe to retry.
+ *   charged:null  — we could not read a settled record. UNKNOWN; treat as charged
+ *                   for any spend decision. Absence of evidence is not evidence.
+ */
+/**
+ * MAY WE SPEND AGAIN? Isolated from the render flow so every combination can be
+ * exercised offline — this one boolean is the difference between recovering a
+ * lost video and double-billing for it.
+ *
+ * ALL THREE must hold:
+ *   policyRetryable === true   the failure class is non-deterministic. Excludes
+ *                              moderationBlocked (action:'give-up'), which would
+ *                              be blocked identically on a resubmit.
+ *   chargeConfirmed === false  Atlas's settled record confirms NO price. Strict
+ *                              `=== false`: `null` means we could not read the
+ *                              record, and unknown is treated as CHARGED.
+ *   attempt < maxAttempts      the policy's own ceiling (predictionFailed: 2).
+ */
+function mayRetryAfterFailure({ policyRetryable, chargeConfirmed, attempt, maxAttempts }) {
+  return policyRetryable === true
+    && chargeConfirmed === false
+    && Number(attempt) < Number(maxAttempts || 1);
+}
+
+function confirmedCharge(data) {
+  const status = String(data?.status || '').toLowerCase();
+  if (!SETTLED_POLL_STATUSES.has(status)) return { charged: null, priceUsd: null };
+  const raw = data.price;
+  if (raw === undefined || raw === null || raw === '') return { charged: false, priceUsd: 0 };
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return { charged: null, priceUsd: null };
+  return { charged: n > 0, priceUsd: n };
+}
+
+/**
+ * Defensive parse of Atlas's settled prediction `price`.
+ *
+ * Atlas returns the figure as a STRING (measured: `"0.9"`, `"0.75"`). A bad
+ * value must NEVER overwrite a ledger estimate with 0 — an unusable price
+ * leaves the estimate in place for a later re-poll (or forever).
+ *
+ * Returns a finite positive number, or null when the value is unusable.
+ * Exported for scripts/verifyVideoCostReconcile.js.
+ */
+function parseAtlasSettledPrice(raw) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+/**
+ * Re-poll a settled prediction and upgrade its CostLog row from estimate →
+ * actual. Fire-and-forget: a finished video must never wait on telemetry.
+ *
+ * Mirrors atlasImageService.scheduleCostReconcile. Same delay budget — the
+ * GET is free, unref'd, and cannot delay or fail a render. Image path needs
+ * this often (price usually lands after the image returns); video path
+ * usually has the price on the terminal poll (measured 2026-08-11 on Omni
+ * developer) and only falls through here when that value is absent.
+ *
+ * Uses reconcileCost (not finalizeFlatCost) so a late/duplicate call cannot
+ * overwrite a row already marked actual, and a missing row is left missing
+ * rather than inventing spend.
+ */
+function scheduleVideoCostReconcile(predictionId, attempt = 0) {
+  if (!predictionId) return;
+  const delays = [3000, 10_000, 30_000, 60_000, 120_000, 300_000];
+  if (attempt >= delays.length) {
+    console.warn(
+      `   ⚠️  atlasVideo: cost for ${predictionId} never published after ${delays.length} reads — ` +
+      `row stays estimated (MODEL_CAPS formula; Omni developer 10s is ~33% HIGH vs settled $0.90 — do not treat as spend)`
+    );
+    return;
+  }
+  setTimeout(async () => {
+    try {
+      const res = await axios.get(`${BASE_URL}/model/prediction/${predictionId}`, {
+        headers: { Authorization: `Bearer ${apiKey()}` },
+        timeout: 15_000,
+        validateStatus: () => true
+      });
+      const price = parseAtlasSettledPrice(res.data?.data?.price);
+      if (price != null) {
+        await reconcileCost({ providerRequestId: predictionId, costUsd: price });
+        return;
+      }
+      scheduleVideoCostReconcile(predictionId, attempt + 1);
+    } catch (err) {
+      console.warn(`   ⚠️  atlasVideo: cost reconcile read failed for ${predictionId}: ${err.message}`);
+      scheduleVideoCostReconcile(predictionId, attempt + 1);
+    }
+  }, delays[attempt]).unref?.();
+}
+
+/**
+ * Upgrade the charge-point CostLog row to Atlas's settled price once the
+ * prediction is terminal-ok.
+ *
+ * IMPORTANT MEASURED DIFFERENCE vs images (2026-08-11): for VIDEO the price
+ * appears to be published AT completion — both live 10s 1080p 16:9 Omni
+ * developer predictions carried `price:"0.9"` on the terminal poll. Images
+ * usually publish later (7/38 had price at completion). So: if the terminal
+ * payload already carries a usable price, finalize IMMEDIATELY and do not
+ * schedule a re-poll. Only fall back to scheduleVideoCostReconcile when the
+ * terminal response has no usable price.
+ *
+ * Fire-and-forget by contract: callers MUST NOT await this. The helper never
+ * throws into the render path (finalize failures are swallowed).
+ *
+ * Uses finalizeFlatCost keyed on providerRequestId so the charge-point row is
+ * UPDATED in place — a second recordFlatCost would double-count spend.
+ * costSource:'actual' matches the image path's settled-price marking.
+ *
+ * deps is for offline harness injection only (no DB/network).
+ *
+ * Returns a small decision object for harnesses:
+ *   { action: 'immediate', costUsd, scheduled: false }
+ *   { action: 'scheduled', costUsd: null, scheduled: true }
+ */
+function reconcileVideoCostFromTerminal(predictionId, terminalData = {}, deps = {}) {
+  if (!predictionId) return { action: 'noop', costUsd: null, scheduled: false };
+  const costUsd = parseAtlasSettledPrice(terminalData?.price);
+  if (costUsd != null) {
+    // Immediate path — terminal poll already has the settled figure.
+    const finalize = deps.finalizeFlatCost || finalizeFlatCost;
+    try {
+      const ret = finalize({
+        providerRequestId: predictionId,
+        costUsd,
+        costSource: 'actual',
+        // Charge-point wrote status:'submitted'; a successful delivery is 'ok'
+        // (matches atlasImageService's completed branch).
+        status: deps.status || 'ok',
+      });
+      if (ret && typeof ret.then === 'function') {
+        ret.catch((err) => {
+          console.warn(
+            `   ⚠️  atlasVideo: cost finalize failed for ${predictionId}: ${err?.message || err}`
+          );
+        });
+      }
+    } catch (err) {
+      console.warn(
+        `   ⚠️  atlasVideo: cost finalize threw for ${predictionId}: ${err?.message || err}`
+      );
+    }
+    return { action: 'immediate', costUsd, scheduled: false };
+  }
+  // No usable price on the terminal payload — schedule the image-shaped
+  // re-poll. Leave the estimate untouched until a real figure lands.
+  const schedule = deps.schedule || scheduleVideoCostReconcile;
+  try {
+    schedule(predictionId);
+  } catch (err) {
+    console.warn(
+      `   ⚠️  atlasVideo: could not schedule cost reconcile for ${predictionId}: ${err?.message || err}`
+    );
+  }
+  return { action: 'scheduled', costUsd: null, scheduled: true };
 }
 
 /**
@@ -2720,30 +2963,55 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
         continue;
       }
 
-      // 4xx (non-429) is a hard failure — bad predictionId / bad auth / etc.
-      // Retrying won't help, and the body has the real diagnosis.
-      if (status && status >= 400 && status < 500) {
-        throw new Error(`atlasVideo: poll returned ${status} (id=${predictionId}): ${summary.body || summary.message}`);
-      }
+      // A non-2xx that CARRIES A SETTLED VERDICT is the task's outcome, not a
+      // transport blip. Promote the error response onto the normal path so the
+      // completed/failed branches below classify it exactly as they would a 200.
+      //
+      // Without this, Atlas's HTTP-500-with-`data.status:'failed'` fell into the
+      // generic branch below and was retried MAX_CONSECUTIVE_ERRORS times —
+      // observed in production 2026-08-10, prediction cec47abe…: 12 polls over
+      // 3 minutes against a prediction that had already failed, then a
+      // "12 consecutive poll failures" error that reads like an Atlas outage
+      // instead of naming the real failure class. It also discarded the
+      // classification, so a moderation block arriving in a 500 would never be
+      // named and would be pointlessly retried.
+      const settled = err.response?.data?.data;
+      const settledStatus = String(settled?.status || '').toLowerCase();
+      if (!SETTLED_POLL_STATUSES.has(settledStatus)) {
+        // 4xx (non-429) is a hard failure — bad predictionId / bad auth / etc.
+        // Retrying won't help, and the body has the real diagnosis.
+        if (status && status >= 400 && status < 500) {
+          throw new Error(`atlasVideo: poll returned ${status} (id=${predictionId}): ${summary.body || summary.message}`);
+        }
 
-      consecutiveErrors++;
-      consecutiveRateLimits = 0;
-      console.warn(
-        `   ⚠️  atlasVideo: poll #${pollCount} error ${status || 'network'} ` +
-        `(${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS} consecutive): ${summary.body || summary.message}`
-      );
-
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        throw new Error(
-          `atlasVideo: ${MAX_CONSECUTIVE_ERRORS} consecutive poll failures (id=${predictionId}). ` +
-          `Last error: ${status || 'network'} ${summary.body || summary.message}`
+        consecutiveErrors++;
+        consecutiveRateLimits = 0;
+        console.warn(
+          `   ⚠️  atlasVideo: poll #${pollCount} error ${status || 'network'} ` +
+          `(${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS} consecutive): ${summary.body || summary.message}`
         );
+
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          throw new Error(
+            `atlasVideo: ${MAX_CONSECUTIVE_ERRORS} consecutive poll failures (id=${predictionId}). ` +
+            `Last error: ${status || 'network'} ${summary.body || summary.message}`
+          );
+        }
+        continue;
       }
-      continue;
+
+      console.warn(
+        `   ↳ atlasVideo: poll #${pollCount} HTTP ${status} carries a settled verdict ` +
+        `(status=${settledStatus}) — reading it as the outcome, not a transport blip`
+      );
+      res = err.response;
+      consecutiveErrors = 0;
+      consecutiveRateLimits = 0;
+      lastError = null;
     }
     const data = res.data?.data || {};
     const status = data.status;
-    if (status === 'completed' || status === 'succeeded') {
+    if (TERMINAL_OK_STATUSES.has(status)) {
       // Providers vary the result field: `outputs` (array) is the
       // common case, but some return `output` as a string or array —
       // accept both (mirrors Atlas's own reference client).
@@ -2752,9 +3020,14 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       if (!url) throw new Error(`atlasVideo: ${status} but no output url (predictionId=${predictionId})`);
       const elapsedSec = Math.round((Date.now() - t0) / 1000);
       console.log(`🎬 atlasVideo: ${predictionId} done after ${elapsedSec}s (${pollCount} polls)`);
-      return url;
+      // Return the settled `price` alongside the URL so the caller can
+      // reconcile the charge-point CostLog row WITHOUT a second GET when
+      // Atlas already published the figure (the common video case —
+      // measured 2026-08-11). Shape is { url, price }; price may be
+      // absent/null — reconcileVideoCostFromTerminal handles that.
+      return { url, price: data.price ?? null };
     }
-    if (status === 'failed') {
+    if (TERMINAL_FAILURE_STATUSES.has(status)) {
       // Classify before throwing. The image path has routed failures through
       // atlasErrorPolicy since it was written; this one never did, so a safety
       // rejection surfaced to the operator as a bare "prediction failed" and
@@ -2774,6 +3047,18 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       const err = new Error(`${heading}: ${providerMsg} (id=${predictionId})`);
       err.atlasPolicy = policy.name;
       err.terminal    = policy.terminal;
+      // Carry the retry decision to the caller. A retry means a NEW billable
+      // submit, so it cannot be decided here (this function only polls) — but
+      // everything needed to decide it is known here and nowhere else.
+      // `chargeConfirmed` is read from Atlas's own settled record, not inferred
+      // from the policy: the policy says what SHOULD happen, the price says what
+      // DID. generateForAd requires both to agree before it spends again.
+      err.predictionId    = predictionId;
+      err.policyRetryable = policy.retryable === true;
+      err.policyMaxAttempts = policy.maxAttempts || 1;
+      const charge = confirmedCharge(data);
+      err.chargeConfirmed = charge.charged;   // true | false | null(unknown)
+      err.chargePriceUsd  = charge.priceUsd;
       throw err;
     }
     const elapsedSec   = Math.round((Date.now() - t0) / 1000);
@@ -3264,7 +3549,10 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     hasProductReference: hasProductAnchor,
     storyboard,
     caps,
-    durationSec
+    durationSec,
+    // Destination for prompt-profile selection (PMax → PMAX_DIRECTIVES).
+    // Meta / absent → Omni/Grok path unchanged (byte-identical).
+    platformFormat: ad.platformFormat || null
   };
   // Whitespace-only operatorPrompt must NOT count as an override — trim-gate
   // branch 1 so it falls through to raw/guidance like an empty refinement.
@@ -3295,61 +3583,171 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   const costUsd = estimateRenderCostUsd({ model, durationSec, resolution: renderResolution });
 
   const t0 = Date.now();
-  // Fire-and-forget stage: never awaited on this billable path.
-  adStage(ad._id, `master video submit (${aspectRatio})`);
-  const predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
-  const submitMs = Date.now() - t0;
-  console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
-
-  // ── CHARGE POINT ──────────────────────────────────────────────────────────
-  // The submit returned an id, so the provider has accepted a billable job. Money is
-  // committed HERE, whatever happens to the poll, the download, or the Cloudinary
-  // mirror. Both writes below therefore happen now rather than at the end:
-  //
-  //   1. veoPredictionId — the spend receipt. Without it a crash mid-poll loses the
-  //      only handle to work we have paid for, and the reaper re-queues the ad into a
-  //      second submit. See models/Ad.js for the full reasoning.
-  //   2. the CostLog row — previously written only after poll + download + upload
-  //      succeeded, so a timeout or a failed upload spent ~$1.00 and recorded $0.
-  //
-  // ONE row per billable submit, deliberately. Outcome lives on the Ad (status,
-  // renderUrl); CostLog records SPEND, and spend happened. The trade-off is that
-  // durationMs here is submit latency rather than end-to-end render time — the full
-  // elapsed time is logged on completion below instead of creating a second row that
-  // would double-count the charge.
-  //
-  // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
-  // generation post-payment, because the caller would then never store videoUrl and a
-  // retry would double-bill.
-  try {
-    await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
-  } catch (err) {
-    console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
-  }
-  try {
-    await recordFlatCost({
-      stage:      'atlas_video_render',
-      provider:   'atlas',
-      model,
-      purposeTag: caps.paramShape,
-      brandId:    media.brandId || null,
-      campaignId: ad.campaignId || null,
-      adId:       ad._id || null,
-      mediaId:    media._id || null,
-      productId:  ad.productId || null,
-      costUsd:    costUsd || 0,
-      durationMs: submitMs,
-      status:     'submitted'
-    });
-  } catch (err) {
-    console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
-  }
-
   const stagePrefix = `master video generation (${aspectRatio})`;
-  const remoteVideoUrl = await pollPrediction(predictionId, {
-    adId: ad._id,
-    stagePrefix
-  });
+  let predictionId;
+  let remoteVideoUrl;
+  // Settled Atlas price from the terminal poll (string or null). Used to
+  // upgrade the charge-point estimate → actual without a re-poll when present.
+  let terminalSettledPrice = null;
+
+  // ── PROVIDER-FAULT RETRY ──────────────────────────────────────────────────
+  // Atlas's video model intermittently accepts a job and then fails it without
+  // rendering a frame: `generation_failed`, `executionTime: 0`, `outputs: null`.
+  // Measured 2026-08-10 — 6 failures across ~23 submits in one day, ~26%.
+  //
+  // The `predictionFailed` policy has ALWAYS said `action:'retry'`,
+  // `maxAttempts:2`, `charged:false` ("reservation refunded, so a reattempt
+  // costs nothing extra"). Nothing on the video path ever read it — the poll
+  // classified the failure and threw — so each of those became a dead ad and
+  // ~$0.75 of value the operator asked for and never got.
+  //
+  // THE MONEY GATE. A retry is a NEW BILLABLE SUBMIT, so it is allowed only when
+  // Atlas's OWN SETTLED RECORD confirms the failed attempt carried no price
+  // (`chargeConfirmed === false`, read from `data.price` — see confirmedCharge).
+  // Verified live 2026-08-10: failed predictions carry NO price field (5/5),
+  // succeeded ones carry "0.75"/"0.08" (5/5).
+  //
+  // `chargeConfirmed === null` (we could not read a settled record) does NOT
+  // retry. §4's owner rule is that a charge may only be asserted from a
+  // confirmed price; the converse binds equally — a NON-charge may only be
+  // asserted from a confirmed price, so unknown is treated as charged. The
+  // policy says what SHOULD happen, the price says what DID, and both must
+  // agree before this spends again.
+  //
+  // Deterministic failures are excluded even though they are also unbilled:
+  // moderationBlocked is `action:'give-up'`, so `policyRetryable` is false and
+  // the same prompt is never resubmitted to be blocked a second time.
+  for (let attempt = 1; ; attempt++) {
+    const submitT0 = Date.now();
+    // Fire-and-forget stage: never awaited on this billable path.
+    adStage(ad._id, `master video submit (${aspectRatio})${attempt > 1 ? ` — retry ${attempt - 1}` : ''}`);
+    predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
+    const submitMs = Date.now() - submitT0;
+    console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
+
+    // ── CHARGE POINT ──────────────────────────────────────────────────────────
+    // The submit returned an id, so the provider has accepted a billable job. Money is
+    // committed HERE, whatever happens to the poll, the download, or the Cloudinary
+    // mirror. Both writes below therefore happen now rather than at the end:
+    //
+    //   1. veoPredictionId — the spend receipt. Without it a crash mid-poll loses the
+    //      only handle to work we have paid for, and the reaper re-queues the ad into a
+    //      second submit. See models/Ad.js for the full reasoning.
+    //   2. the CostLog row — previously written only after poll + download + upload
+    //      succeeded, so a timeout or a failed upload spent ~$1.00 and recorded $0.
+    //
+    // ONE row per billable submit, deliberately. Outcome lives on the Ad (status,
+    // renderUrl); CostLog records SPEND, and spend happened. The trade-off is that
+    // durationMs here is submit latency rather than end-to-end render time — the full
+    // elapsed time is logged on completion below instead of creating a second row that
+    // would double-count the charge.
+    //
+    // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
+    // generation post-payment, because the caller would then never store videoUrl and a
+    // retry would double-bill.
+    try {
+      await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
+    } catch (err) {
+      console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
+    }
+    try {
+      await recordFlatCost({
+        stage:      'atlas_video_render',
+        provider:   'atlas',
+        model,
+        // THE KEY THAT MAKES THIS ROW CORRECTABLE. Without it, the retry path's
+        // finalizeFlatCost({providerRequestId}) matches nothing, falls back to
+        // an INSERT, and the failed attempt's ~$0.75 estimate survives beside
+        // the retry's — $1.50 booked for one delivered video. It also lets
+        // reconcileCost swap the estimate for Atlas's confirmed price later.
+        providerRequestId: predictionId,
+        purposeTag: caps.paramShape,
+        brandId:    media.brandId || null,
+        campaignId: ad.campaignId || null,
+        adId:       ad._id || null,
+        mediaId:    media._id || null,
+        productId:  ad.productId || null,
+        costUsd:    costUsd || 0,
+        durationMs: submitMs,
+        status:     'submitted'
+      });
+    } catch (err) {
+      console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
+    }
+
+    try {
+      const pollOut = await pollPrediction(predictionId, {
+        adId: ad._id,
+        stagePrefix
+      });
+      // pollPrediction returns { url, price } so we can reconcile from the
+      // terminal payload when Atlas already published the settled figure.
+      remoteVideoUrl = pollOut && typeof pollOut === 'object' ? pollOut.url : pollOut;
+      terminalSettledPrice = pollOut && typeof pollOut === 'object' ? pollOut.price : null;
+      break;
+    } catch (err) {
+      const maxAttempts = err.policyMaxAttempts || 1;
+      const mayRetry = mayRetryAfterFailure({
+        policyRetryable: err.policyRetryable,
+        chargeConfirmed: err.chargeConfirmed,
+        attempt,
+        maxAttempts
+      });
+
+      if (!mayRetry) {
+        // Say WHY, in the operator's terms. "Failed" without the reason is how
+        // the last two incidents stayed invisible for days.
+        const because =
+          err.policyRetryable !== true ? `policy ${err.atlasPolicy || 'unknown'} is not retryable`
+          : err.chargeConfirmed === true ? `attempt was CHARGED $${err.chargePriceUsd} — not resubmitting`
+          : err.chargeConfirmed == null  ? 'charge state UNKNOWN — treating as charged, not resubmitting'
+          : `exhausted ${maxAttempts} attempt(s)`;
+        console.warn(`   ⛔ atlasVideo[ad=${ad._id}]: not retrying — ${because}`);
+        throw err;
+      }
+
+      // Correct the ledger BEFORE spending again. The charge-point row above was
+      // written from an ESTIMATE at submit; Atlas has now confirmed this
+      // prediction carried no price, so the row is overstated. Leaving it and
+      // adding a second submit row would book ~$1.50 for one delivered video.
+      // Keyed on providerRequestId, so it updates this attempt's row in place and
+      // the retry's own charge-point row is a separate, correct one.
+      await finalizeFlatCost({
+        stage:      'atlas_video_render',
+        provider:   'atlas',
+        model,
+        providerRequestId: predictionId,
+        costUsd:    0,
+        // 'none' — not 'actual'/'estimated'. Atlas confirmed there is no price
+        // to record. Mirrors atlasImageService's `charged ? 'estimated' : 'none'`
+        // and is one of CostLog's three legal costSource values; update
+        // validators are OFF by default, so an invented value would have been
+        // written straight past the enum.
+        costSource: 'none',
+        status:     'failed',
+        errorMessage: err.message || null
+      }).catch((e) => console.warn(`   ⚠️  atlasVideo: could not zero the unbilled cost row for ${predictionId} — ${e.message}`));
+
+      const backoffMs = 1000 * attempt;
+      console.warn(
+        `   ↻ atlasVideo[ad=${ad._id}]: ${err.atlasPolicy} on ${predictionId} and Atlas confirms NO charge ` +
+        `— resubmitting (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms`
+      );
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  }
+
+  // ── COST RECONCILE (fire-and-forget) ────────────────────────────────────
+  // Charge-point wrote an ESTIMATE from MODEL_CAPS (Omni developer 10s →
+  // $1.20). Measured settled price on that model is $0.90 — the estimate is
+  // ~33% HIGH, so every unreconciled video row over-reports spend.
+  //
+  // NEVER await. Telemetry must not delay download/upload or fail a render
+  // after payment. When the terminal poll already carries a usable price
+  // (common for video; measured 2026-08-11), finalize immediately; otherwise
+  // schedule a re-poll. See reconcileVideoCostFromTerminal.
+  reconcileVideoCostFromTerminal(predictionId, { price: terminalSettledPrice });
+
   adStage(ad._id, `downloading master video (${aspectRatio})`);
   const videoBuffer = await downloadToBuffer(remoteVideoUrl);
 
@@ -3458,7 +3856,10 @@ async function buildPromptScaffold({
     hasProductReference: true,
     operatorPrompt: null,
     caps,
-    durationSec: resolvedDuration
+    durationSec: resolvedDuration,
+    // Same destination selector as generateForAd — scaffold for a PMax
+    // format must preview the PMax profile, not the Meta/Omni default.
+    platformFormat: platformFormat || null
   });
   return {
     prompt,
@@ -3495,6 +3896,12 @@ async function buildPromptScaffold({
 
 module.exports = {
   generateForAd,
+  // exposed for verify harnesses (Claude-5-era provider-fault retry gate)
+  mayRetryAfterFailure,
+  confirmedCharge,
+  SETTLED_POLL_STATUSES,
+  TERMINAL_FAILURE_STATUSES,
+
   prepareStoryboard,
   enabled,
   MODEL_CAPS,
@@ -3510,6 +3917,10 @@ module.exports = {
   resolveReferenceImageCount,
   resolveDurationSec,
   estimateRenderCostUsd,
+  // Cost reconcile — scripts/verifyVideoCostReconcile.js (offline).
+  parseAtlasSettledPrice,
+  reconcileVideoCostFromTerminal,
+  scheduleVideoCostReconcile,
   validateVideoSettings,
   buildSubmissionBody,
   imageDimsForAspect,

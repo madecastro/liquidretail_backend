@@ -27,11 +27,38 @@ const campaignRunSchema = new mongoose.Schema({
   // in POST /generate has to make its decision while this run is still
   // 'preparing' and `perProduct` is necessarily empty).
   //
-  // Load-bearing for money: services/generationGate.js allows a second
-  // concurrent run only when its product set is DISJOINT from every in-flight
-  // run's. An empty/absent array here means "scope unknown" and blocks — so do
-  // not stop writing it, and do not backfill it with a guess.
+  // Still stamped, but since 2026-08-10 it is NO LONGER what the concurrency
+  // gate decides on — see requestFingerprint below. It remains the product scope
+  // of record for reporting, for the rollout-compat comparison in
+  // services/generationGate.js, and for the non-blocking "another run shares
+  // these products" notice. An empty array is now a legitimate value (a
+  // media-library run seeds from media, not a SKU) and no longer blocks anything.
   requestedProductIds: { type: [String], default: [] },
+
+  // WHAT THE CONCURRENCY GATE ACTUALLY COMPARES. A stable hash over the fields
+  // of POST /api/ads/generate that determine what gets generated
+  // (services/generationGate.js computeRequestFingerprint). Stamped at mint time
+  // because the gate has to decide while this run is still 'preparing'.
+  //
+  // Load-bearing for money: an identical fingerprint on an in-flight run is the
+  // double-click, and it is the only thing now refused by default. Note the
+  // failure direction is fail-OPEN — a run with no fingerprint cannot be proven
+  // identical to anything, so it will not block a sibling. That is deliberate
+  // (blocking on an unknown is what stopped the media library from generating at
+  // all), which is exactly why this write must never be dropped: losing it
+  // silently disables double-click protection instead of over-blocking.
+  requestFingerprint: { type: String, default: null, index: true },
+
+  // UGC-ads Phase 3 — operator-picked UGCs the run was seeded with. Populated
+  // by /api/ads/generate when preferUgcMediaId is present. adRegenerateService
+  // reads this so regenerate re-applies the same UGC at ref 1 — without
+  // persistence the regen path can only replay Ad.mediaIds, which points at
+  // the wizard's UGC but does not distinguish "operator-picked seed" from
+  // "director-picked supporting media" for the catalog-first reseed rule
+  // (§ REGEN_RESEED_CATALOG_FIRST). Array (not scalar) because Phase 7's
+  // batch wizard will dispatch one CampaignRun with multiple UGCs, one per
+  // expanded product.
+  seedUgcIds:          { type: [String], default: [] },
 
   total:        { type: Number, default: 0 },
   succeeded:    { type: Number, default: 0 },
@@ -117,5 +144,9 @@ campaignRunSchema.index({ brandId: 1, createdAt: -1 });
 // window. Separate campaignId/status indexes make it a scan over the campaign's
 // whole run history, and this query sits in front of every generation.
 campaignRunSchema.index({ campaignId: 1, status: 1, createdAt: -1 });
+// The "you already ran this exact request" lookup: newest FINISHED run on this
+// campaign with a given fingerprint, inside DUPLICATE_LOOKBACK_MIN. Without this
+// the duplicate check scans the campaign's whole run history on every generate.
+campaignRunSchema.index({ campaignId: 1, requestFingerprint: 1, createdAt: -1 });
 
 module.exports = mongoose.model('CampaignRun', campaignRunSchema);

@@ -130,6 +130,53 @@ function isCatalogFeedOrderSeedingEnabled() {
   return !/^(0|false|no|off)$/i.test(String(raw).trim());
 }
 
+// KILL SWITCH: UGC_FIRST_SEEDING, DEFAULT ON. Governs the UGC-ads Phase 3
+// preferUgcMediaId cascade — see promoteUgcFirst below. OFF means the option
+// is IGNORED and buildSeededUniverse behaves byte-identically to today, which
+// is what makes Phase 2's wizard safe to ship ahead of Phase 3 (the wizard
+// passes preferUgcMediaId, backend just doesn't act on it yet).
+function isUgcFirstSeedingEnabled() {
+  const raw = process.env.UGC_FIRST_SEEDING;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+// Hoist the operator-picked UGC to index 0. PURE — returns a new array.
+//
+// The UGC-ads wizard (Phase 2) attaches a UGC to a product, then generates:
+// the resulting ad must seed FROM that UGC, not from a catalog hero. This
+// runs AFTER promoteFirstCatalogImage so that the catalog-first cascade
+// applies to positions 1..n while the UGC owns position 0.
+//
+// NO-OP CONDITIONS — all four preserve byte-identity to the pre-Phase-3
+// behaviour, which is the whole point of the kill switch:
+//   • preferUgcMediaId falsy → wizard didn't ask, no promotion.
+//   • UGC_FIRST_SEEDING off  → operator flipped the kill switch, no promotion.
+//   • entries missing/short  → nothing to reorder.
+//   • target already at 0    → the picked UGC ranked to the top on its own
+//     (rare — needs a lifestyle-tagged UGC beating every catalog+UGC peer),
+//     but when it happens the result would be a slice of an already-correct
+//     array and we skip the copy.
+//
+// TARGET-NOT-IN-POOL is a possibility that we log but do NOT synthesize past:
+// the Phase 1 attachment API stamps source:'operator' in matchedProducts, so
+// buildSeededUniverse's tier-1 loader is expected to pick it up. If it did
+// not — attachment race, cross-brand pick that got scoped out at the tenant
+// filter above, or the pool being a restrictToMediaIds override that
+// explicitly excludes it — quietly falling back is safer than fabricating a
+// pool entry we can't project cleanly (no role, no fileUrl guaranteed).
+function promoteUgcFirst(rankedEntries, mediaId) {
+  if (!Array.isArray(rankedEntries) || rankedEntries.length < 2) return Array.isArray(rankedEntries) ? rankedEntries.slice() : [];
+  if (!mediaId) return rankedEntries.slice();
+  const target = String(mediaId);
+  const idx = rankedEntries.findIndex(e => String(e?.media?._id || '') === target);
+  if (idx <= 0) return rankedEntries.slice();
+  const out = rankedEntries.slice();
+  const [picked] = out.splice(idx, 1);
+  out.unshift(picked);
+  return out;
+}
+
 // Hoist THE MERCHANT FEED'S PRIMARY IMAGE to the front of an already-ranked
 // pool. PURE: returns a NEW array, never mutates the input.
 //
@@ -365,6 +412,15 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
   // Only the concept-driven IMAGE path opts in
   // (campaignAdsGenerationService.runConceptDrivenExpansion).
   const preferFirstCatalogImage = opts.preferFirstCatalogImage === true;
+  // preferUgcMediaId — UGC-ads Phase 3. When set (string mediaId), hoists
+  // that Media to index 0 of the ranked pool after all other cascades. Only
+  // effective when UGC_FIRST_SEEDING is on; the flag OFF makes this option a
+  // no-op, which lets the Phase 2 wizard ship ahead of Phase 3 without
+  // exposing a partially wired path in prod. Coerced to string once here so
+  // the promoteUgcFirst helper stays a pure string-compare.
+  const preferUgcMediaId = opts.preferUgcMediaId && isUgcFirstSeedingEnabled()
+    ? String(opts.preferUgcMediaId)
+    : null;
 
   const counts = {
     catalog: 0,
@@ -439,7 +495,20 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
       return { media: m, role };
     });
 
-    const ranked = rankMergedPool(pool, { wantsVideo });
+    let ranked = rankMergedPool(pool, { wantsVideo });
+    // UGC-ads Phase 3 — wizard-picked UGC gets index 0. In the operator-picked
+    // branch the "explicit pick overrides ranking" rationale that skips
+    // preferFirstCatalogImage does NOT apply: the UGC is itself an operator
+    // pick from the wizard, so promoting it aligns with the same rule.
+    if (preferUgcMediaId) {
+      const promoted = promoteUgcFirst(ranked, preferUgcMediaId);
+      if (promoted[0] !== ranked[0]) {
+        console.log(`🎯 seeded universe (op-picked) — UGC ${preferUgcMediaId} promoted to index 0`);
+      } else if (!ranked.some(e => String(e?.media?._id || '') === preferUgcMediaId)) {
+        console.log(`🎯 seeded universe (op-picked) — preferUgcMediaId ${preferUgcMediaId} not in pool, no promotion`);
+      }
+      ranked = promoted;
+    }
     const universe = ranked.map(x => projectEntry(x.media, x.role));
     const trimmed = universe.slice(0, topN);
     const seedUniverseHash = computeSeedUniverseHash(trimmed, 5);
@@ -598,6 +667,36 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
     ranked = promoted;
   }
 
+  // UGC-ads Phase 3 — hoist the operator-picked UGC to index 0. Runs LAST so
+  // that when preferFirstCatalogImage also fires the catalog first-image lands
+  // at position 1 (the UGC takes 0, catalog shifts down one). Order reversed
+  // — catalog-first after UGC-first — would let the catalog cascade displace
+  // the UGC, which is exactly the outcome the Phase 2 wizard exists to avoid.
+  // Applies in both brand and product mode: a brand-mode campaign with an
+  // operator-picked UGC still wants that UGC at seed 0.
+  if (preferUgcMediaId) {
+    const promoted = promoteUgcFirst(ranked, preferUgcMediaId);
+    if (promoted[0] !== ranked[0]) {
+      const wasAt = ranked.findIndex(e => String(e?.media?._id || '') === preferUgcMediaId);
+      console.log(
+        `🎯 seeded universe — UGC ${preferUgcMediaId} promoted to index 0 ` +
+        `from rank ${wasAt} of ${ranked.length} (product ${productId ?? '(brand-only)'}, topN=${topN})`
+      );
+    } else if (!ranked.some(e => String(e?.media?._id || '') === preferUgcMediaId)) {
+      // Diagnostic — expected to be RARE. The Phase 1 attach API stamps
+      // source:'operator' in matchedProducts so tier 1 loads the UGC; a
+      // missing pool entry means one of: attachment lost by a re-detect
+      // (should be impossible per the Phase 1 $pull-source guard), brand
+      // mismatch scoped it out of the tier-3 brand pool, or a stale wizard
+      // deep-link is dispatching an unrelated UGC.
+      console.log(
+        `🎯 seeded universe — preferUgcMediaId ${preferUgcMediaId} not in pool ` +
+        `for ${isBrandOnly ? 'brand ' + brandId : 'product ' + productId} (pool=${ranked.length})`
+      );
+    }
+    ranked = promoted;
+  }
+
   const universe = ranked.map(x => projectEntry(x.media, x.role));
 
   const trimmed = universe.slice(0, topN);
@@ -612,5 +711,7 @@ module.exports = {
   // Exposed for testing / reuse by adjacent services.
   rankMergedPool,
   promoteFirstCatalogImage,
+  promoteUgcFirst,
+  isUgcFirstSeedingEnabled,
   isContentNatureEligible
 };

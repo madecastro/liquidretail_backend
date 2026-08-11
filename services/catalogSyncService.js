@@ -16,8 +16,18 @@ const { inferCoarseEnum, resolveCoarseCategoryRef } = require('./categoryClassif
 const { startRun, CancelledError } = require('./progressService');
 const { concurrency: CONC } = require('./concurrency');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
+
+// Shared per-product alt-image cap (hero is separate). Zero-dep module —
+// Meta catalog sync has nothing to do with web scraping and must not
+// pull the scraper stack just to read an integer. See catalogImageLimits.
+const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+// Free packshot/lifestyle classify at ingest. URL-keyed on CatalogProduct;
+// fetch path is the local safeFetchBuffer in ingestShotClassifyService
+// (image CDNs, not the Meta Graph) — deliberately NOT httpScrapeClient
+// (that client follows redirects with no hop validation / SSRF pin).
+const ingestShotClassify = require('./ingestShotClassifyService');
 
 // Hard cap so a runaway catalog doesn't spin forever inside an HTTP
 // request. Brands with > 500 SKUs need V2 background sync; typical
@@ -164,6 +174,17 @@ async function syncCatalogForCred(cred, run = null) {
   let url = `${META_GRAPH_ROOT}/${cred.catalogId}/products`;
   let params = { fields: FIELDS, limit: PAGE_SIZE, access_token: token };
   let added = 0, updated = 0, errors = 0, fetched = 0;
+  // ARCHITECTURE: upsert NEVER awaits image classify. Collect work during
+  // the page loop; run a post-loop pass so hung DNS cannot truncate the
+  // catalog. try/finally guarantees logSummary on every exit (incl. fatal
+  // Graph errors that return early).
+  const shotSession = ingestShotClassify.createSession();
+  const pendingClassify = [];
+  // Reason for abandonPending when the post-loop classify never runs
+  // (Meta fatal early-return or CancelledError). Distinct from
+  // skipBudget (phase ran, ceiling hit).
+  let classifyAbandonReason = null;
+  try {
 
   while (url && fetched < MAX_ITEMS) {
     // Cooperative cancel boundary: between pages (and every 25 items
@@ -179,6 +200,8 @@ async function syncCatalogForCred(cred, run = null) {
       // Auth / catalog-not-found is fatal; transient is recoverable.
       const code = err.response?.data?.error?.code;
       if (code === 190 || code === 200 || code === 100) {
+        // finally still runs abandonPending + logSummary — no silent truncation.
+        classifyAbandonReason = 'meta_fatal';
         return { ok: false, reason: `Meta error: ${detail}`, added, updated, errors, fetched };
       }
       errors++;
@@ -213,14 +236,20 @@ async function syncCatalogForCred(cred, run = null) {
         currency:        parseCurrency(item.price, item.currency),
         availability:    item.availability || null,
         imageUrl:        item.image_url || null,
+        // Meta's additional_image_urls is ALREADY the alt list (hero is
+        // image_url), so slice from 0 — not the hero-offset form used on
+        // Shopify/JSON-LD combined arrays. Cap = MAX_ADDITIONAL_IMAGES
+        // (shared; see catalogImageLimits).
         additionalImages: Array.isArray(item.additional_image_urls)
-                          ? item.additional_image_urls.slice(0, 8) : [],
+                          ? item.additional_image_urls.slice(0, MAX_ADDITIONAL_IMAGES)
+                          : [],
         productUrl:      item.url || null,
         rawData:         item,
         lastSyncedAt:    new Date()
       };
 
       try {
+        // Upsert only — no await on classify (image network work).
         const result = await CatalogProduct.findOneAndUpdate(
           { brandId: cred.brandId, externalId },
           { $set: update, $setOnInsert: { firstSeenAt: new Date() } },
@@ -259,6 +288,15 @@ async function syncCatalogForCred(cred, run = null) {
             console.warn(`   ⚠️  coarse-category stamp failed for ${externalId}: ${err.message}`);
           }
         }
+        // Defer classify to post-loop pass — never block remaining upserts.
+        if (row && ingestShotClassify.isEnabled()) {
+          pendingClassify.push({
+            productId: row._id,
+            imageUrl: row.imageUrl,
+            additionalImages: row.additionalImages,
+            existingStyles: row.imageShotStyles
+          });
+        }
       } catch (err) {
         console.warn(`   ⚠️  upsert failed for ${externalId}: ${err.message}`);
         errors++;
@@ -279,6 +317,43 @@ async function syncCatalogForCred(cred, run = null) {
     } else {
       url = null;
     }
+  }
+
+  // Post-loop classify pass — every product row is already persisted.
+  // beginClassifyPhase arms the budget clock HERE (not at createSession)
+  // so Graph pagination / upserts above cannot burn the ceiling.
+  // Batched across products so the concurrency cap is used; cooperative
+  // cancel via progress.checkpoint (same signal as the page loop) stops
+  // promptly and records outstanding URLs as skippedAbandoned.
+  if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        try {
+          await progress.checkpoint();
+          return false;
+        } catch (err) {
+          // CancelledError (or any checkpoint throw) → stop classify.
+          if (!classifyAbandonReason) {
+            const name = err && (err.name || (err.constructor && err.constructor.name));
+            classifyAbandonReason =
+              name === 'CancelledError' || (err && err.constructor === CancelledError)
+                ? 'cancelled'
+                : 'error';
+          }
+          return true;
+        }
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
+      }
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  shot-classify batch failed: ${shotErr.message}`);
+    });
   }
 
   // Update credential last-used + last-catalog-sync so the scheduler
@@ -359,6 +434,33 @@ async function syncCatalogForCred(cred, run = null) {
     cappedAt: fetched >= MAX_ITEMS ? MAX_ITEMS : null,
     durationMs: Date.now() - t0
   };
+  } catch (err) {
+    // CancelledError (and any other throw) skips the post-loop pass —
+    // mark so finally can count outstanding pending as abandoned.
+    if (!classifyAbandonReason) {
+      const name = err && (err.name || (err.constructor && err.constructor.name));
+      classifyAbandonReason =
+        name === 'CancelledError' || (err && err.constructor === CancelledError)
+          ? 'cancelled'
+          : 'error';
+    }
+    throw err;
+  } finally {
+    // Unconditional summary — fatal Graph early-return, cancel throw, and
+    // success all report budget truncation (never silent partial classify).
+    // If the classify phase never started, outstanding pendingClassify
+    // URLs are abandoned (not considered=0 "nothing to do").
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          classifyAbandonReason || 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
+    try { shotSession.logSummary('📦 shot-classify'); } catch (_) { /* ignore */ }
+    try { shotSession.dispose(); } catch (_) { /* ignore */ }
+  }
 }
 
 // Quick stats endpoint for the brand page header.

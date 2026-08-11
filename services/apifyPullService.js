@@ -119,6 +119,59 @@ function normalizeIgPost(raw) {
   };
 }
 
+// Cap on comments per post via the Apify scraper. Env-overridable so
+// operators can push it higher for brands where deep comment volume
+// matters. Kept low by default because comments cost per-record.
+const IG_COMMENTS_LIMIT = Math.max(1, parseInt(process.env.APIFY_IG_COMMENTS_LIMIT, 10) || 50);
+
+// Pull comments for one IG post via the SAME apify/instagram-scraper
+// actor but with resultsType='comments'. Input is the post's public
+// URL or shortcode-derived permalink. Returns normalized comment
+// records shaped for Comment doc upsert (mediaId is filled in by
+// the ingest wrapper — this puller doesn't know about DB ids).
+async function pullInstagramComments(postUrl, { limit } = {}) {
+  if (!postUrl) throw new Error('post URL is required');
+  const cleanUrl = String(postUrl).trim();
+  if (!/^https?:\/\/(www\.)?instagram\.com\/(p|reel)\//i.test(cleanUrl)) {
+    throw new Error(`postUrl must be an instagram.com /p/ or /reel/ permalink (got "${cleanUrl}")`);
+  }
+  const resultsLimit = Math.max(1, Math.min(parseInt(limit, 10) || IG_COMMENTS_LIMIT, IG_COMMENTS_LIMIT));
+
+  const input = {
+    directUrls:         [cleanUrl],
+    resultsType:        'comments',
+    resultsLimit,
+    addParentData:      false,
+    proxyConfiguration: proxyConfig()
+  };
+  const items = await runActorSync(IG_ACTOR, input);
+  return items.map(normalizeIgComment).filter(Boolean);
+}
+
+function normalizeIgComment(raw) {
+  if (!raw || !raw.id) return null;
+  // Apify's IG scraper emits comments with a mix of camelCase field
+  // names — some builds use `ownerUsername`, others `username`, and
+  // `likesCount` vs `likeCount`. Tolerant to both.
+  return {
+    externalId:     String(raw.id),
+    text:           raw.text || '',
+    authorUsername: raw.ownerUsername || raw.username || null,
+    authorId:       raw.ownerId || raw.userId || null,
+    likeCount:      Number.isFinite(raw.likesCount) ? raw.likesCount
+                    : Number.isFinite(raw.likeCount) ? raw.likeCount
+                    : 0,
+    replyCount:     Number.isFinite(raw.repliesCount) ? raw.repliesCount
+                    : Number.isFinite(raw.replyCount) ? raw.replyCount
+                    : 0,
+    postedAt:       raw.timestamp ? new Date(raw.timestamp) : null,
+    // Apify comment scraper sometimes returns replies with an
+    // `answersTo` field pointing at the parent id. Match the existing
+    // Comment.parentExternalId shape.
+    parentExternalId: raw.answersTo || raw.parentCommentId || null
+  };
+}
+
 // Pull recent products from a public Shopify storefront. Returns
 // normalized items shaped for CatalogProduct upsert.
 async function pullShopifyProducts(shopUrl, { limit } = {}) {
@@ -182,7 +235,9 @@ function normalizeShopifyProduct(raw) {
 
 module.exports = {
   pullInstagramPosts,
+  pullInstagramComments,
   pullShopifyProducts,
   IG_LIMIT,
+  IG_COMMENTS_LIMIT,
   SHOPIFY_LIMIT
 };

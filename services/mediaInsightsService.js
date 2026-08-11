@@ -24,7 +24,7 @@ const IntegrationCredential = require('../models/IntegrationCredential');
 const { decrypt } = require('./integrationCryptoService');
 const { ensureCommentsJudged } = require('./quoteSnippetService');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 const POST_BASIC_FIELDS = ['id', 'media_type', 'like_count', 'comments_count', 'timestamp'].join(',');

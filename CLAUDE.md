@@ -8,11 +8,15 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 **Read `session.md` for live state. Read `ARCHITECTURE_REVIEW.md` before touching
 security, money, or the render queue** — it carries verified P0s with `path:line`.
 
-Live prod (2026-08-03) = `13cf679` (both services). Offline verify suite = **42
-scripts, all green** (re-run 2026-08-03 with
+Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
+`srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
+suite = **85 scripts, all green** (75 on `main` + the Google PMax
+harnesses; re-run with
 `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
 no aggregate runner and no `npm test`). Claims written against pre-deploy
-binaries are suspect.
+binaries are suspect. **A red harness in a local checkout is not necessarily red
+on `main`** — this tree carries other sessions' uncommitted work, so confirm
+against a clean worktree off `origin/main` before believing a failure (or a pass).
 
 ---
 
@@ -24,20 +28,23 @@ one.** Owner, verbatim: *"We are no longer using ANY other generation pathways
 for video or static ads … we are not using any other generation pathways for
 catalog based product ads."*
 
-**VIDEO** — one billable generation (9:16 master); other Meta surfaces are
-free crop/retitle **intent** (Phase 3 queue fan-out not live — see step 3):
+**VIDEO (Meta)** — one billable generation (9:16 master); other Meta surfaces are
+free crop/retitle **intent** (Phase 3 queue fan-out not live — see step 3).
+**VIDEO (Google PMax, Phase A)** — **two** billable Omni masters (9:16 + 16:9)
+plus one free derive-only 1:1 crop of the 9:16 master — see §2 and
+`docs/PIPELINES.md` §6. Do not apply the Meta one-master rule to `google_video`.
 
 1. Resize the hero image to **9:16** with the **current** resizing system.
 2. **Omni** image-to-video → the 9:16 **master**. `google/gemini-omni-flash/
-   image-to-video-developer`. ONE billable submit per product on live presets
-   (`meta_video` / `meta_all` queue `videoFormats: [META_VIDEO_MASTER]` only —
-   `platformFormats.js:586-593`, `campaignAdsGenerationService.js:592-596`).
-   See §2 — everything named `veo*` is this Omni pipeline under a legacy name.
+   image-to-video-developer`. ONE billable submit per product on live **Meta**
+   presets (`meta_video` / `meta_all` queue `videoFormats: [META_VIDEO_MASTER]`
+   only). See §2 — everything named `veo*` is this Omni pipeline under a legacy
+   name.
 3. **Crop** for non-9:16 targets via `videoCropUrl` + `basePlateCropService`
    (face-anchored) at titling time — never a second Omni submit. **Phase 3
    multi-surface fan-out is not the queue path yet:** `META_VIDEO_FANOUT`
    (Reels retitle + feed 1:1 + 4:5) is documented as free derivation intent
-   (`platformFormats.js:406-422`); `resolvePreset('meta_video')` still returns
+   (`platformFormats.js`); `resolvePreset('meta_video')` still returns
    the master only. Do not reintroduce four video Ads = four submits.
 4. **Title each surface appropriately** — burned into the delivered file, using
    that surface's own safe zone. Reels (204) and Stories (250) differ and must
@@ -113,6 +120,46 @@ restores a **byte-identical** pre-change prompt (`TEMPLATE_INTENT` entry + both
 cascades + SUBHEAD role revert together). `ai_ugc_led` / `ai_editorial` still
 fall to `product_first_lifestyle` (unmapped). Full write-up:
 `docs/PIPELINES.md` §5 *Brand-led intent + copy cascade*.
+
+**WHICH TEMPLATE an ad becomes is the DIRECTOR's choice, not the operator's —
+and the wizard no longer offers a template picker at all.** The frontend hardcodes
+all five `ai_*` ids into every request (`GenerateAds/index.tsx`
+`DEFAULT_TEMPLATE_IDS`; the Settings step was dropped 2026-06-12, `52cf33c`), and
+under `AI_CONCEPT_DRIVEN=true` the *actual* template comes from the Director's
+`routing.creative_style` via
+`CREATIVE_STYLE_TO_TEMPLATE[style] || 'ai_brand_led'`
+(`campaignAdsGenerationService.js`) — so an unrecognised or absent style silently
+becomes **`ai_brand_led`**. That default, plus a round prompt whose entire
+creative_style guidance was one bare enum line, is why production measured
+**`ai_brand_led` 200+ renders vs `ai_social_proof_led` 18** over
+2026-07-30..08-06. The string `social_proof_led` appeared exactly **once** in
+`aiCreativeDirectorService.js` (the enum) and in **zero** prompt guidance.
+Fixed 2026-08-10: `buildPromptRound` now carries per-style selection criteria
+(with `brand_led` explicitly named the *default of last resort*),
+`creative_style` is a listed concept-diversity axis, and when proof data exists
+a **reserved slot** requires ≥1 of the 3 concepts to be `social_proof_led`.
+**The reserved slot fires only on a RATING being reachable, not on any proof** —
+`INTENTS.social_proof_led.eligible` is rating-only, so reserving a slot on the
+strength of a quote or comment alone would mint `ai_social_proof_led` on products
+that then fall back at render, *amplifying* the collapse this fixes (adversarial
+finding; pinned by A5b). That condition is a strict subset of "the HONESTY RULE
+does not fire" — **the two must never both be active**, or the prompt demands a
+proof concept while forbidding proof (the self-contradictory-prompt class that
+forced the §00 PR #61 rollback). The `proof_options` term is gated on the **same
+flag** as the honesty rule's `proof_options` clause, so a stale or injected
+summary cannot desynchronise them (pinned by A6b).
+`DIRECTOR_PROOF_MENU_ENABLED` is now **true** (`config/defaults.env`), which is
+what lets a product-scoped run ground a proof concept on scope-labelled brand
+numbers; flipping it back off restores the pre-change prompt byte-for-byte,
+**including** the original honesty-rule string. Paired with
+**`DIRECTOR_SIGNALS_VERSION` 3.1.0 → 3.2.0**. ⚠️ **Scope of that bump, stated
+correctly because an earlier version of this note got it wrong:** the LIVE path
+`directConceptsRound` has **no** `signalsVersion` cache gate and re-assembles
+every round, so the menu takes effect with or without the bump. The only gate is
+at `aiCreativeDirectorService.js:262` in the **shadow** `directConcepts` path —
+so the bump buys shadow correctness and costs one paid re-derive per shadow cache
+key, and is **not** what makes the flip work. Pinned by
+`scripts/verifySocialProofRestoration.js` groups A/B.
 
 ### The overlay is PREVIEW ONLY — and it is not the titling
 
@@ -284,13 +331,25 @@ Video never launches a browser.
   fanout is therefore **~$0.11 per product on the developer model**, not ~$0.015.
   **Owner rule: always read the actual price back from Atlas after generation.** The
   authoritative figure is `price` on the **settled prediction**
-  (`GET /model/prediction/:id`), which `scheduleCostReconcile` reads to upgrade the
-  row and clear `costSource:'estimated'`. `buildPriceMap` yields a floor-grade
-  estimate whose only job is to stop a $0.00 row. Any budget, margin or per-ad cost
-  claim must come from **reconciled** rows. Note Atlas usually publishes `price`
-  *after* the image returns — measured **7 of 38** predictions had it at completion —
-  so the reconcile is the normal path, not a rare top-up; its retry budget was
-  widened the same day for exactly that reason.
+  (`GET /model/prediction/:id`). **Images:** `scheduleCostReconcile`
+  (`atlasImageService`) upgrades the row and clears `costSource:'estimated'`.
+  Atlas usually publishes `price` *after* the image returns — measured **7 of 38**
+  predictions had it at completion — so the scheduled re-poll is the normal path
+  for images; its retry budget was widened the same day for exactly that reason.
+  **Video (post-Phase-B):** the same rule is now implemented in
+  `atlasVideoService` — `reconcileVideoCostFromTerminal` (fire-and-forget after the
+  master lands) + `scheduleVideoCostReconcile` fallback. **Before this, every video
+  row stayed the `estimateRenderCostUsd` formula forever** (~33% over-report on the
+  developer model at 10s: formula $1.20 vs measured settled **$0.90** — over-
+  REPORTING, not overspending). Video **does** publish `price` at completion
+  (measured), so the immediate path is the normal one and the re-poll is the
+  exception. `MODEL_CAPS` / the estimate function are deliberately unchanged (pre-
+  settlement floor). Pinned by `scripts/verifyVideoCostReconcile.js`.
+  **Consequence:** a video row still on `costSource:'estimated'` means the price
+  was **never published**, not that the formula is authoritative. Do not quote
+  `base + per-second` as spend for the developer model. `buildPriceMap` yields a
+  floor-grade estimate whose only job is to stop a $0.00 row. Any budget, margin
+  or per-ad cost claim must come from **reconciled** rows.
 - **Ledger spend at the charge point, not the success point.** A billable submit that
   then fails still costs money. `atlasImageService.chargedError` records it and sets
   `err.charged`, which is the flag telling a caller that a direct-provider fallback
@@ -303,42 +362,170 @@ Video never launches a browser.
   `resolvePreset('meta_static')` / `META_STATIC_FANOUT` = three Meta sizes =
   three image submits (`platformFormats.js:405`, `:576-583`). Cannot crop one
   static plate cheaply — text is burned in-model (`:400-403`).
-- **Video: ONE Omni 9:16 master per product on the live presets — not one per
-  aspect.** `resolvePreset('meta_video'|'meta_all')` returns
-  `videoFormats: [META_VIDEO_MASTER]` only (`platformFormats.js:586-593`);
-  `expandDeterministicVideo` queues one Ad per product
-  (`campaignAdsGenerationService.js:592-596`). Non-9:16 *Ads* (if any) still
-  generate at Omni 9:16 then face-crop at titling (`basePlateCropService`);
+- **Video (Meta): ONE Omni 9:16 master per product on the live presets — not
+  one per aspect.** `resolvePreset('meta_video'|'meta_all')` returns
+  `videoFormats: [META_VIDEO_MASTER]` only (`platformFormats.js`);
+  `expandDeterministicVideo` queues one Ad per product. Non-9:16 *Ads* (if any)
+  still generate at Omni 9:16 then face-crop at titling (`basePlateCropService`);
   free multi-surface derivation from one master is **Phase 3 intent**, not a
-  second billable submit (`platformFormats.js:406-422`). **The older claim in
-  this file — that `identityDigest` made 1:1 + 4:5 + 9:16 = three separate
-  video submits — was true for non-preset multi-aspect video queues (measured
-  in prod 2026-08-01) and is a money bug if reintroduced; it is not the
-  `meta_video` path.**
+  second billable submit (`platformFormats.js` `META_VIDEO_FANOUT`). **The older
+  claim in this file — that `identityDigest` made 1:1 + 4:5 + 9:16 = three
+  separate video submits — was true for non-preset multi-aspect video queues
+  (measured in prod 2026-08-01) and is a money bug if reintroduced; it is not
+  the `meta_video` path.**
+- **Video (Google PMax, Phase A 2026-08-10): TWO billable Omni masters per
+  product — 9:16 + 16:9 — not one, and not three.**
+  `resolvePreset('google_video'|'google_all')` returns
+  `videoFormats: GOOGLE_VIDEO_MASTERS` only (`['pmax_video_9_16','pmax_video_16_9']`);
+  do **not** return the full `GOOGLE_VIDEO_FANOUT`. `pmax_video_1_1` is
+  **derive-only**: face-safe crop of the settled 9:16 master's already-paid
+  plate + its own Remotion titling — **never** an Omni submit. One extra Ad is
+  minted with `deriveFromMaster: 'pmax_video_9_16'`. Full write-up:
+  `docs/PIPELINES.md` §6 *Google Performance Max video*.
+- **`pmax_video_1_1` must never reach a billable submit.** Gate is
+  `resolveDeriveFromMaster(ad)` in `services/campaignAdsGenerationService.js` —
+  **one definition, imported** by `routes/ads.js` (render) and
+  `adRegenerateService.js` (regenerate preflight → 409). Fail-closed on
+  `platformFormat === 'pmax_video_1_1'` so a dropped `deriveFromMaster` field
+  cannot re-open spend. Master failed/absent → honest failure, never Omni
+  fallback. Wait in-render for the plate (`DERIVE_MASTER_WAIT_MS` /
+  `DERIVE_MASTER_POLL_MS`); do not requeue (stranded `queued` never auto-drains
+  and a second Generate short-circuits as "Nothing to render"). Pinned by
+  `scripts/verifyPmaxVideoExpansion.js` (54 checks).
+- **Duration on the video identity digest is Google-only.**
+  `computeDeterministicVideoDigest` keeps prefix `det-video:v1` and appends
+  `videoDurationSec` **only** for Google PMax video formats (zero history). An
+  earlier draft appended duration unconditionally and bumped `v1`→`v2` —
+  MEASURED that changed every pre-existing Meta video digest; because the
+  digest deliberately omits `generationRunId`, the `(campaignId, identityDigest)`
+  unique index is the only guard against a repeat Generate re-billing Omni, so
+  the next Generate on any existing campaign would have paid ~$1.00–1.20 per
+  product again. Pre-existing Meta digests stay byte-identical. **Meta 8s→10s
+  duration identity is a deliberate one-time re-mint that must be costed and
+  flagged, never folded in silently.**
+- **Static (Google): `google_static` = 3 billable image submits**
+  (`GOOGLE_STATIC_FANOUT` — landscape 1.91:1, square, portrait 4:5). Demand Gen
+  + Shorts keys stay `coming_soon` (identical `deliveryDims` to live PMax —
+  generating both would double-spend).
+- **MEASURED settled prices (Phase B 2026-08-10/11, prompt-only Atlas submits
+  — no DB/Ad rows). These supersede planning estimates:**
+  | item | settled `price` |
+  |---|---|
+  | static 1:1 @1024×1024 `gpt-image-2/edit` | **$0.071728** |
+  | static 1.91:1 @2048×1152 | **$0.061440** |
+  | static 4:5 @1088×1360 | **$0.066660** |
+  | video 10s 16:9 @1080p Omni **developer** | **$0.90** |
+  3-size PMax static fan-out ≈ **$0.199**/concept (was ~$0.22). Two masters =
+  **$1.80**. Full kit (3 concepts × 3 statics + 2 masters) ≈ **$2.40**
+  standalone / ≈ **$1.50** marginal beside a Meta run that already paid for
+  9:16. Earlier ≈**$2.6** planning figure is **wrong**.
+- **Omni developer 10s is $0.90, not $1.20.** The `MODEL_CAPS` formula
+  (`base 0.20 + 0.10/s` → $1.20 @ 10s) **overstates the developer variant by
+  ~33%**. Production default is
+  `google/gemini-omni-flash/image-to-video-developer`
+  (`BUILT_IN_DEFAULT_MODEL`). Do not quote $1.20 for it.
+- **Image `size` enum is the `1024x1024` form** (underscore style). A
+  `1024*1024` submit is rejected 400 "invalid size". `2048x1152` **is** an
+  enum member (Phase A `GEN_SIZES` needed no probe). Omni i2v
+  `aspect_ratio` enum exactly `['16:9','9:16']`; `duration` enum
+  `[4,6,8,10]`. Delivered 16:9: **1920×1080, 10.000s, 240 frames**.
 - **`POST /api/ads/runs` must claim atomically** — same money shape as
   `/generate`. Use `claimAdsForRun()` only: `status:'queued'` filter, ownership
   re-read (`campaignRunIds` + `rendering`), `modifiedCount` cross-check, and
   post-claim requeue on throw (`routes/ads.js:645-750`, `:882-902`). Covered by
   `scripts/verifyRunsClaim.js` (67 checks). Do not inline a second claim path.
-- **The `/generate` concurrency gate is the ONLY double-click protection, and the
-  atomic claim does NOT back it up.** Each expansion mints its OWN ads
-  (`identityDigest` scoped via `generationRunId`), so two runs on the same product
-  never race for a row — they each claim what they just created and both bill.
-  Since 2026-08-03 the gate allows CONCURRENT runs whose product sets are
-  **disjoint** and blocks overlap (`services/generationGate.js`,
-  `scripts/verifyGenerationGate.js` — 65 checks, four revert-proven). Rules that
-  are load-bearing, not stylistic: (a) keyed on `productIds` **only** — never on
-  format/preset, because presets fan out (`meta_all` ⊃ `meta_static` surfaces) so
-  two same-product runs with different presets CAN expand the same
-  (product, template, aspect) into two differently-digested ads = one creative,
-  two charges; (b) **fail-closed** — any run or request whose scope is unreadable
-  blocks, which is why `CampaignRun.requestedProductIds` must be stamped at mint
-  time by EVERY creator (`/generate` from the body, `/runs` from the claimed ads,
-  and `[]` — not a partial list — when any claimed ad lacks a `productId`);
-  (c) **mint-then-verify** after `CampaignRun.create` closes the read-then-write
-  race where two clicks both read an idle campaign; both racers compute the same
-  winner via (`createdAt`, `runId`) and the loser aborts before expanding, so a
-  false abort costs a 409 and nothing else.
+- **The `/generate` gate is keyed on the REQUEST FINGERPRINT, not on products
+  (owner directive 2026-08-10). It is the ONLY double-click protection for
+  STATIC, and the atomic claim does NOT back it up.** Each static expansion mints
+  its OWN ads (`identityDigest` scoped via `generationRunId`), so two runs on the
+  same product never race for a row — they each claim what they just created and
+  both bill. Owner: *"don't block ads that are concurrent based on the product
+  alone, but based on the actual request. So block identical requests and note
+  requests that are identical to previous requests but allow them if the user
+  wants."* History: one-run-per-campaign → product-overlap (2026-08-03) →
+  fingerprint (2026-08-10). Rules that are load-bearing, not stylistic:
+  - **(a) The key is `computeRequestFingerprint`** — a hash over exactly the body
+    fields that change what gets generated. **A field the handler does not read
+    must stay OUT**: the wizard posts `expandVideoFormats` and `routes/ads.js`
+    never destructures it, so including it would make two runs that produce
+    identical creative hash differently and let a real double-click through. The
+    inverse (omitting a field that DOES affect output) causes a false block. Order
+    matters per field: `productIds`/`templateIds` sorted, `mediaIds`/`seedPicks`/
+    `seedMediaIds` order-preserved (a different pick order is a different ad).
+  - **(b) Why dropping product-overlap is not a money regression.** VIDEO cannot
+    double-bill across runs at all — `computeV2IdentityDigest` omits
+    `generationRunId` when `kind==='video'` (`:1715`) and
+    `computeDeterministicVideoDigest` never includes it (`:1731`), so a duplicate
+    video ad collides on the `(campaignId, identityDigest)` unique index and the
+    second inserts nothing. **The index protects video, not this gate.** And
+    duplicate STATIC sets are owner-sanctioned creative (`:266-269`), so the
+    retired "never key on format/preset" rule was guarding a `meta_all` ⊃
+    `meta_static` pair that the owner's own digest instruction calls two
+    intentional creatives. What is left to catch is the ACCIDENT, and an accident
+    is always a repeat of the *same* request.
+  - **(c) FAIL-OPEN, and only here.** The old gate failed closed on an unreadable
+    product scope, which is what **broke generation from the MEDIA LIBRARY** —
+    those runs legitimately carry `productIds: []`, so they read as "scope
+    unknown" and were refused whenever any sibling run was in flight (and while
+    in flight they blocked every product run too). Blocking now requires
+    *provable* identity, and you cannot prove identity against an unknown. So
+    `CampaignRun.requestFingerprint` **must** be stamped at mint time by every
+    creator: losing that write silently DISABLES double-click protection rather
+    than over-blocking. `/api/ads/runs` stamps `renderClaimFingerprint(runId)` —
+    namespaced and unique — because a render claim mints no ads and must never be
+    mistaken for the same request as a `/generate`.
+  - **(d) The override is single-use by construction.** An identical request is
+    refused with `confirmable:true` + `acknowledgeRunId`; the client re-POSTs with
+    `confirmDuplicate:true` + `acknowledgedRunId`. Every identical in-flight run
+    must be the acknowledged one, so a stray second "Generate anyway" collides
+    with the run the first click just minted and is refused with a fresh id. **A
+    bare boolean confirm would have re-opened the exact double-click the gate
+    exists to stop.**
+  - **(e) mint-then-verify** after `CampaignRun.create` still closes the
+    read-then-write race where two clicks both read an idle campaign; both racers
+    compute the same winner via (`createdAt`, `runId`) and the loser aborts before
+    expanding, so a false abort costs a 409 and nothing else. Now keyed on the
+    fingerprint too, and it is what keeps two simultaneous confirms from both
+    billing.
+  - **(f) `kinds` arrives as a bare SCALAR** (`'image'|'video'|'both'|null`), not
+    an array. Canonicalising it with an array-only helper collapsed every value to
+    `''`, so a static-only run and a video-only run over the same product hashed
+    **identically** and the second was refused as a duplicate — a false block on
+    the most likely real sequence ("generate the statics, then the video"). Fixed
+    by `canonicalScalarOrList`; both shapes are pinned, and scalar `'video'` must
+    equal array `['video']`.
+  - Product overlap is still computed but is **reporting only** — a non-blocking
+    `notice` on the 202 (`concurrent-run-shares-products`) so the operator sees
+    that both runs will bill. It names the **earliest** overlapping run by the same
+    (`createdAt`, `runId`) order the blocking path uses — the `activeRuns` query
+    applies no sort, so picking by list position would surface a different runId on
+    each attempt for the same situation. Pinned by `scripts/verifyGenerationGate.js`
+    (**194 checks**, revert-proven against ten mutations including the stale-confirm
+    money hole, the `kinds` collapse, and re-blocking media-only requests).
+- **A forced Instagram RE-SCAN is billable, and the manual route is UNCAPPED.**
+  `POST /instagram/sync-posts` with `force:true` re-enters already-ingested posts
+  and re-queues detect on media that already had a run — each one a paid
+  vision/LLM run. ⚠️ **An earlier version of this bullet claimed "the daily detect
+  cap still applies". That was WRONG** — `dailyDetectRunCap` reaches `syncPosts`
+  from **`scheduledSyncService` only** (plus a separate read in
+  `instagramWebhookService`); the manual route passes `{limit, force,
+  credentialId}`, so `runsRemaining` is null, `enqueueRun` is unconditionally
+  true, and `capSkipped` can never fire there. **The only bound on one call is
+  `limit` (25 default, 50 max); repeated clicks are bounded by nothing
+  server-side.** This is equally true of the pre-existing "Sync Now" and is not
+  something the re-scan introduced — but the re-scan is the expensive one, so
+  whether to wire a cap into this route is an **open decision**, not a solved
+  problem. Guards actually in force, all pinned by
+  `scripts/verifyIgRescanGuards.js` (**23 checks**, five revert-proven): the
+  `if (!enqueueRun) return` return must stay **above** the `forceDetect` bypass in
+  `ingestPost` so force can never outrank a cap *where one is supplied* (the
+  scheduled job today, this route if it is ever wired up); `forceDetect` is
+  `force && !!existing` so the bypass cannot widen to new posts; the route parses
+  `force === true` **strictly**, because a truthy check would let the string
+  `"false"` trigger a paid re-analysis of 50 posts; `reIngested` is counted
+  separately from `ingested` so a re-scan is never reported as having found new
+  content; and **5f asserts the absence of the cap**, so wiring one in fails the
+  harness and forces this bullet to be updated in the same commit.
 - **Never leave a paid Omni master in `status:'rendering'`.** Stamp `draft`
   with `veoVideoUrl` before titling (`routes/ads.js:1258-1294`). Titling failure
   → `failed` + keep master; success/no-chrome → finished. Counting an untitled
@@ -363,6 +550,23 @@ Video never launches a browser.
 
 ### Known open (do not claim fixed)
 
+- ~~**PMax YouTube safe zones are DECLARED but NOT WIRED**~~ — **CLOSED Phase B
+  (2026-08-11).** Zones resolve per `platformFormat`
+  (`pmax_video_9_16`→`verticalYt`, `pmax_video_16_9`→`landscapeYt`,
+  `pmax_video_1_1`→`squareYt`) and are threaded to the composition.
+  `classifyFormat` still returns only the four **canvas** formats (see §4 trap)
+  — zone selection is a separate concern. **Funnel preset 10s re-time was
+  REVERTED** (shared generic presets; silently re-timed every brand's 8s
+  renders — see §4 trap). Presets remain at **8s** extent. **Still open:**
+  per-run funnel preset *selection* — `presetOverride` exists on the render
+  path but no live caller supplies one; `buildMetaForAd` hardcodes `null`.
+  PMax 10s pacing needs **separate** preset files selected with that path.
+  See `docs/PIPELINES.md` §6.
+- **No full end-to-end PMax kit has run through the app.** Offline suite
+  **78/78** plus prompt-only live Atlas submits (measured unit costs above).
+  First live app recipe: ONE product, brand with populated `summary`,
+  `google_all` → 3 statics + 2 video masters + 1 derived 1:1 ≈ **$2.40**
+  (3 concepts × statics + 2 masters; was planned ~$2.6). See `session.md`.
 - **~1-in-3 static ads** render a competitor-shaped brand mark on the product
   (e.g. tree emblem reading as Timberland on an Allbirds shoe). Prompts already
   ask for fidelity — fix is measure-and-reject, not prompt tuning. Video path
@@ -450,8 +654,12 @@ Video never launches a browser.
   shipped **flush to the delivered frame edge** on Stories and 4:5 — inspectable
   in any ad delivered before the fix. (B) `GEN_SIZES` was stale (three sizes;
   the live schema enum has 14), so 9:16 generated at `1024x1536` and lost 80px per
-  side. All live static surfaces now generate at their exact delivery aspect —
-  zero crop. Pinned by `scripts/verifyStaticSafeBox.js`.
+  side. All **Meta** live static surfaces generate at exact delivery aspect —
+  zero crop. **Phase A amendment (2026-08-10):** `GEN_SIZES` gained schema-enum
+  `2048x1152` — frozen `pmax_16_9` now zero-crops (was 1536x1024 / 15.6% crop);
+  live `pmax_landscape_1_91_1` crops ~6.9% from that plate (no exact 1.91:1 enum
+  twin). Live PMax statics use **10%** edge margin via `SURFACE_EDGE_MARGIN_PCT`;
+  Meta + frozen `pmax_16_9` stay 6%. Pinned by `scripts/verifyStaticSafeBox.js`.
   **DIAGNOSTIC, and it matters:** `meta_feed_1_1` was immune to *both* defects
   (zero crop, full 61px margin) and it is the **default** surface
   (`directImageRenderService.js:508,516`). So truncated copy on a **square** ad is
@@ -463,6 +671,7 @@ Video never launches a browser.
   carries an unpublished pixel/edge-limit caveat. `1088x1360` (4:5) is in use only
   because it was probed; the risk being guarded is silent coercion to the
   `1024x1024` default, which would square a 4:5 surface and then crop it.
+  `2048x1152` needed no probe — it is an enum member.
 - **`queued` ads never auto-drain** — still require an explicit `/runs` (or
   equivalent) claim.
 - ~~**`veoPredictionId` is a spend receipt that is never resumed**~~ — **CLOSED
@@ -550,6 +759,16 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `npm install --no-save https-proxy-agent@5.0.1`, then
   `git checkout -- node_modules/.package-lock.json` so the tracked file is not
   committed. Stage explicit paths, never `git add -A`.
+- **`resolveDeriveFromMaster` is defined ONCE and imported — never re-implemented
+  per caller.** Lives in `services/campaignAdsGenerationService.js`; both
+  `routes/ads.js` (render loop, before any Omni submit) and
+  `services/adRegenerateService.js` (preflight → 409) import it. A per-caller
+  copy is **exactly** how the regenerate hole opened in Phase A: regenerate
+  called `veoService.generateForAd` unconditionally on a PMax 1:1 and billed a
+  full Omni generation on the free surface. Fail-closed on
+  `platformFormat === 'pmax_video_1_1'` so a dropped `deriveFromMaster` field
+  cannot re-open spend. Pinned by `scripts/verifyPmaxVideoExpansion.js` (gate
+  defined once; zero billable submit calls inside `renderDeriveOnlyVideoAd`).
 - **`config/defaults.env` is committed** and `dotenv`-loaded at boot. It is the real
   source of non-secret defaults — `.env.example` is documentation only and several
   vars there are blank while `defaults.env` sets them. **Secrets stay in the
@@ -568,9 +787,41 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   (`aiCreativeDirectorService.js:149`). A code fix that feeds better brand /
   product signal **without** bumping the version leaves every product that
   already has a `CreativeDirectionArtifact` serving concepts built from the old
-  brief — the fix looks deployed and is a no-op. Current value `3.1.0` (`:73`)
-  was the starved-brief repair (`summary` / `logoUrl`); any future signal-shape
-  change needs the same bump.
+  brief — the fix looks deployed and is a no-op. Current value **`3.3.0`**
+  (Phase B PMax funnel + proof hierarchy). Prior bumps: `3.0.0→3.1.0`
+  starved-brief (`summary` / `logoUrl`); `3.1.0→3.2.0` social-proof menu.
+  Any future signal-shape change needs the same bump.
+- **PMax Director hierarchy PRECEDENCE SENTENCE — do not delete or "harmonise".**
+  The shared DR block still says "≥4.5 from ≥50" (Meta-tuned, deliberately
+  untouched). The PMax-only social-proof hierarchy block uses env-interpolated
+  thresholds (`PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100`)
+  and states explicitly that **it wins for this destination on any disagreement
+  including thresholds**. Deleting that sentence, or editing the shared DR text
+  to match, either re-opens dual-threshold confusion or **changes the Meta
+  prompt**. Measured: Meta round prompt is byte-identical. See
+  `docs/PIPELINES.md` §6 *Director: funnel spread*.
+- **`classifyFormat` must keep returning canvas formats only**
+  (`vertical|square|landscape|feed`). That string is also the **composition id**
+  and the **`titleStyleSpec` cascade key**. Returning a YouTube zone name from
+  it would break the render and silently change every spec lookup. Zone
+  selection is a separate platformFormat-aware path (Phase B wired).
+- **Do not re-time a SHARED funnel preset for PMax.** `canonical-awareness` /
+  `consideration` / `conversion` are generic (`brand.titleStylePreset` Tier 2 +
+  `retitleDriver --preset=`). Phase B re-authored them for 10s plates; because
+  `specTimeScale` only compresses, every existing **8s** render using those
+  presets dropped 1.0 → **0.8** with no crash and no failing test. **Reverted
+  to 8s extent.** PMax 10s pacing must be **separate preset files** selected
+  with per-run `presetOverride` (still open). See `docs/PIPELINES.md` §6.
+- **`ROUTING_NESTED_FIELDS` registration is the scanner's coverage list, not a
+  free-form enum.** `verifyConceptContract.js` only flags flat reads of
+  *registered* names. Phase B added `routing.funnel_stage` without registering
+  it → the new field silently lacked the guardrail that exists because reading
+  these flat once produced zero ads. Registered + **R0b** pins load-bearing
+  names (`media_picks`, `creative_style`, `output_shape`, `funnel_stage`) stay
+  on the list — removing a name previously failed nothing (shorter iterate).
+- **`PMAX_PROOF_*` blank env is 0, not NaN.** `Number('') === 0`. A cleared
+  Render dashboard value would inject "strong rating ≥ 0" into the Director
+  hierarchy and invert it. Parser falls back on blank/whitespace/negative.
 - **`brand.logo` IS CORRECT on a `layoutInput.brand` object and WRONG on a Mongoose
   Brand doc. Check which object you are holding before "fixing" either.** The two
   are different shapes with overlapping names, which is how the Director bug hid.
@@ -599,6 +850,26 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `models/Brand.js` (58 today) and asserts every `Brand.find*().select(…)` path in
   `services/` + `routes/` is one of them — it is the general form of this trap, so
   prefer extending it over adding a one-off string check.
+  **SECOND LIVE INSTANCE, caught by Group A and fixed 2026-08-10 — the harness
+  paid for itself.** `catalogSyncFromShopifyPublic` and
+  `catalogSyncFromGenericSitemap` both did `.select('… shopifyUrl')`. **There is
+  no top-level `shopifyUrl` on brandSchema** — it exists only as
+  `apifyDemo.shopifyUrl`, and it is a *separate field from `websiteUrl`* exactly
+  because a brand's catalog can live on a different host from its marketing site.
+  Two compounding faults: the projection named a nonexistent path AND never
+  selected `apifyDemo`, and that projected doc is handed straight to
+  `syncBrandShopifyDirect` / `syncBrandGenericCatalog` — whose own
+  `resolveStoreOrigin(brand)` (`brand?.apifyDemo?.shopifyUrl || …`) then fell
+  through to `websiteUrl`. **So the bad projection propagated past the executor
+  into the real scrape: the wrong host was pulled, silently.** Both executors also
+  re-implemented the cascade locally as `brand.shopifyUrl || brand.websiteUrl`
+  (two tiers, missing the one that matters); they now call the shared
+  `resolveStoreOrigin`, so a preview cannot advertise one store and scrape
+  another. A brand with a catalog URL but no `websiteUrl` was also falsely
+  refused. **Lesson generalised: when an executor projects a doc it then PASSES
+  DOWN, the projection must satisfy the callee's field reads, not just its own** —
+  and prefer the shared resolver over a re-implemented cascade. The stale header
+  claiming "Requires Brand.shopifyUrl" is why this looked right to three readers.
 - **Gate a provider tier on the PRIMARY key, never the fallback.** `wantGpt`
   (`brandEnrichmentService.js`) gated on `OPENAI_API_KEY` while the call itself goes
   through `atlasLlmService.chatCompletion`, whose primary is Atlas and whose direct
@@ -646,14 +917,17 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
 - **Docs have described commented-out code.** `TITLING.md` documented the disabled
   canvas cascade as live. When you find such a case, fix the doc in the same commit.
 - **Director concept contract (v3 nested under `routing`).** Schema v3 moved
-  strategy fields (`media_picks`, `creative_style`, `output_shape`, …) under
-  `concept.routing`. Reading `concept.media_picks` flat silently zeros ads while
-  the producer's dual-read validator logs `warnings=0`. **Every consumer must use
-  `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`.**
-  `scripts/verifyConceptContract.js` (125 checks) exhaustively scans `services/` +
-  `routes/` and fails if any file reads a `ROUTING_NESTED_FIELDS` name off a concept
-  without the helper. Zero-ads root cause fixed 2026-08-03 (live:
-  `concepts=3 payloads=3` where it was `payloads=0`).
+  strategy fields (`media_picks`, `creative_style`, `output_shape`,
+  `funnel_stage`, …) under `concept.routing`. Reading `concept.media_picks` flat
+  silently zeros ads while the producer's dual-read validator logs `warnings=0`.
+  **Every consumer must use `services/conceptProjection.js` —
+  `conceptField()` / `conceptMediaPicks()`.** `scripts/verifyConceptContract.js`
+  exhaustively scans `services/` + `routes/` and fails if any file reads a
+  `ROUTING_NESTED_FIELDS` name off a concept without the helper. Zero-ads root
+  cause fixed 2026-08-03 (live: `concepts=3 payloads=3` where it was
+  `payloads=0`). New fields must be **registered** in that list or the scanner
+  is blind to them (Phase B `funnel_stage` lesson; **R0b** pins the load-bearing
+  set).
 - **`mongoose.isValidObjectId` accepts any 12-byte string.**
   Verified: `mongoose.isValidObjectId('video-models') === true` (12 chars);
   `'formats'` is false (7). So `router.param('id'|'adId', …)` 404 guards
@@ -760,6 +1034,54 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   onto the Ad** — the derived stack is render-call-only, so the kill switch
   (`REGEN_RESEED_CATALOG_FIRST=false`) stays effective on the next regen.
   Pinned by `scripts/verifyRegeneration.js` (R3 / R3b / R3c).
+- **A LABELLED brand rating MAY now sit beside a product/comment-tier quote on
+  STATIC — owner override of tier-coherence invariant #4, 2026-08-07. Do NOT
+  "restore the invariant".** `resolveCoherentSocialProof`
+  (`services/ratingDisplay.js`) used to hard-null brand numbers whenever a
+  product/comment-tier quote was on frame, because a brand-wide count beside one
+  SKU's testimonial reads as that SKU's volume. **Measured cost of that rule:
+  7 of 18 `ai_social_proof_led` renders (2026-07-30..08-06) fell back to
+  `objection_resolved`** — the comment-tier quote nulled otherwise-usable brand
+  stars, and `INTENTS.social_proof_led`'s `core` **is** the rating, so the ad
+  lost the very thing it exists to show. Owner, verbatim: *"I don't want brand
+  level stars to block a comment tier quote. We can have both and clearly
+  demarcate brand level stars … The positive comment is different and better
+  social proof than brand level stars"* / *"include the comment and then use
+  brand level stars and include a 'Brand Reviews' next to the stars."*
+  **How it is contained — all three matter:** (1) the behaviour is an **opt-in
+  parameter** `allowLabeledBrandNumbers`, **default `false`**, so every other
+  caller — *including the whole video path via
+  `brandScriptExecutor.buildMetaForAd`* — is unchanged **by construction, not by
+  assertion**; only `directImageRenderService.buildIntentData` passes `true`.
+  (2) The exception sits **after** both product attempts, so a product-tier
+  number always wins and the exception can only ever ADD proof where there was
+  none, never displace product numbers with brand ones. (3) It returns
+  `source:'brand'` — **stars only** — which makes `packCoherentProof` derive
+  `reviewsText` via `formatBrandReviewsText`, always carrying
+  `BRAND_SCOPE_LABEL` (`"brand reviews"`), and `INTENTS.social_proof_led`
+  prefers that scoped string over any re-derived unscoped one.
+  **THREE CONSTRAINTS THAT LOOK OPTIONAL AND ARE NOT** — each closes a hole two
+  independent adversarial passes found in the first draft, all three
+  revert-proven: (a) the gate is **`=== true`**, not truthiness — a caller
+  forwarding a raw env string opted in on the literal `"false"`; (b) a
+  normalized brand **count is REQUIRED**, because `reviewsText` is derived from
+  the count, so a stars-only brand pair (rating, `reviewCount: null`) produced
+  `reviewsText: null` and `staticAdIntents` then rendered a **bare `4.7 ★`**
+  beside a product/comment testimonial with no qualifier — no count means no
+  label vehicle, so it refuses; (c) **`allowBrandCountWithoutStars` stays
+  false** — a brand count with `rating: null` still fails
+  `social_proof_led.eligible`, so it would print a brand volume claim beside a
+  product testimonial *and* still collapse the intent. The fail-closed
+  `renderedQuoteText` guard is untouched. **Known accepted residual:** a product
+  pair with a sub-floor rating but a non-zero count returns `product-count` and
+  short-circuits the exception, so that shape still falls back — fixing it would
+  mean brand numbers displacing a product-tier number, a second override nobody
+  has approved. Pinned (including that residual) by
+  `scripts/verifySocialProofRestoration.js` groups C/D — **35 checks,
+  revert-proven on 13 mutations**. Kill switch
+  **`STATIC_BRAND_STARS_WITH_QUOTE=false`** (committed in `config/defaults.env`)
+  reverts with no deploy. Precedent for why this note exists at all: §00's
+  PR #61 rollback, where a later session "fixed" a deliberate decision.
 - **Customer quotes: `llm-web` is PRINTABLE; attribution is stripped.**
   Prior denylist / "llm-web never prints" claims were **false**.
   `services/providers/geminiSearchProvider.js:254,399` use
@@ -860,9 +1182,10 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**42 scripts** as of 2026-08-03). Add a
-  harness for money/security-critical logic, and **revert-prove it** — back the
-  fix out and confirm the test fails. A test that cannot fail is not a test.
+  relevant `scripts/verify*.js` harness (**85 scripts** as of the Google
+  PMax merge). Add a harness for money/security-critical logic, and
+  **revert-prove it** — back the fix out and confirm the test fails. A test that
+  cannot fail is not a test.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
   change (bugs, bypasses, money holes) before committing. It caught two real regex
   bugs in the submit guard that review-by-reading missed.

@@ -1,6 +1,6 @@
 # LiquidRetail Backend — Background & Creative Pipelines
 
-This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`; verify suite 29 scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
+This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`) with **Phase A + Phase B PMax (2026-08-10/11)** documented against branch `feat/pmax-surfaces-phase-a2`, plus a **post-Phase-B addendum** (video cost reconciliation + adversarial corrections; offline suite **78** scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
 
 > **Cost hot-spots (read first)**
 >
@@ -9,7 +9,7 @@ This is the engineer reference for every background and creative pipeline in the
 > | **Overlay zones** (`overlayZoneService.analyzeOverlayZones`, Gemini-2.5 vision) | Per catalog-product image after detect | ~**13–26s / image** Gemini vision | **Deferred** to ad time (`CATALOG_DETECT_PRECOMPUTE=false`); only products a campaign will use |
 > | **User-actuated product enrichment** (SerpAPI shopping + immersive + Gemini grounded-search) | Sales Demos **Enrich** button | ~**$0.05–0.12 / product** | Opt-in only; auto path is reviews gap-fill |
 > | **Static ad plate** (`openai/gpt-image-2/edit` via `directImageRenderService`) | Every static `ai_*` ad (default pipeline) | Dominant static-ad $ | One billable edit submit per ad; stages on poll ticks (`ATLAS_IMAGE_POLL_MS` 3s). **Was falsely documented** as "GPT-4.1 HTML → Puppeteer → gpt-image-2 photoreal polish" — that chain is **not** the live default |
-> | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | ~$1.00 / 8s @ 1080p (720p same list price) | `VEO_CONCURRENCY=4` (self-imposed probe 2026-08-02; Omni RPS unpublished). **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. Re-measure before raising past 4 |
+> | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | **MEASURED** 10s @ 1080p on the **developer** model (`google/gemini-omni-flash/image-to-video-developer`, production default): **$0.90** settled. The `MODEL_CAPS` formula (`base 0.20 + 0.10/s` → $1.20 @ 10s) **overstates** the developer variant by ~33% — do not quote $1.20 for it. Ledger now **reconciles** settled price (was estimate-forever — see [*Video cost reconciliation*](#video-cost-reconciliation-post-phase-b)). 720p same list tier as 1080p. | `VEO_CONCURRENCY=4` (self-imposed probe 2026-08-02; Omni RPS unpublished). **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. Re-measure before raising past 4 |
 > | **Catalog scan (sitemap + JSON-LD)** | Demo / catalog sync | Deterministic HTTP only — **no LLM** | Caps + per-host min-gap; bounded PDP concurrency |
 
 Non-secret defaults live in `config/defaults.env` (versioned). The Render dashboard holds **secrets only** (plus one deliberate non-secret exception, `JIRA_PROJECT_KEY`) — migration complete 2026-08-03; see [§9](#9-configuration--secrets) and CLAUDE.md §4a.
@@ -415,7 +415,68 @@ there is no lexical fallback. Full rationale, failure policy and consumer list:
 
 ### Concept contract (load-bearing — zero-ads root cause, fixed 2026-08-02)
 
-Director schema **v3** nests strategy fields under `concept.routing` (`media_picks`, `creative_style`, `output_shape`, …). The producer dual-read both shapes and logged `warnings=0` while **every consumer that still read flat v2 discarded the concepts** → `payloads=0` (zero ads, paid Director rounds wasted). **One helper only:** `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`. Consumers include `campaignAdsGenerationService`, `aiJudgeService`, `aiCanvasHtmlGeneratorService`, `veoStoryboardService`. `scripts/verifyConceptContract.js` (125 checks) **fails the suite** if any `services/` or `routes/` file reads a `ROUTING_NESTED_FIELDS` name off a concept without the helper. Verified live after fix: `concepts=3 payloads=3` where it was `payloads=0`.
+Director schema **v3** nests strategy fields under `concept.routing` (`media_picks`, `creative_style`, `output_shape`, `funnel_stage`, …). The producer dual-read both shapes and logged `warnings=0` while **every consumer that still read flat v2 discarded the concepts** → `payloads=0` (zero ads, paid Director rounds wasted). **One helper only:** `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()`. Consumers include `campaignAdsGenerationService`, `aiJudgeService`, `aiCanvasHtmlGeneratorService`, `veoStoryboardService`. `scripts/verifyConceptContract.js` **fails the suite** if any `services/` or `routes/` file reads a `ROUTING_NESTED_FIELDS` name off a concept without the helper. Verified live after fix: `concepts=3 payloads=3` where it was `payloads=0`.
+
+**Post-Phase-B registration trap:** `routing.funnel_stage` was added to the PMax Director schema but **not** registered in `ROUTING_NESTED_FIELDS`, so the flat-read scanner never covered it. Registered now. Follow-on: removing a name from that list previously failed **nothing** (the check just iterates a shorter list) — **R0b** now pins the load-bearing names (`media_picks`, `creative_style`, `output_shape`, `funnel_stage`) stay registered.
+
+### Which template an ad becomes — the Director picks it, and social proof had collapsed
+
+**The wizard has no template picker.** The frontend hardcodes all five `ai_*` ids into every request (`GenerateAds/index.tsx` `DEFAULT_TEMPLATE_IDS`; the Settings step was removed 2026-06-12, `52cf33c`). Under `AI_CONCEPT_DRIVEN=true` the template is derived from the Director's `routing.creative_style`:
+
+```js
+const creativeStyle = conceptField(concept, 'creative_style');
+const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || 'ai_brand_led';
+```
+
+so an absent or unrecognised style silently becomes **`ai_brand_led`**. Combined with a round prompt whose *entire* creative_style guidance was one bare enum line, production measured (Render logs, 2026-07-30..08-06):
+
+| template | successful renders |
+|---|---|
+| `ai_brand_led` | 200+ (query cap) |
+| `ai_editorial` | 111 |
+| `ai_promotional` | 38 |
+| **`ai_social_proof_led`** | **18** |
+| `ai_ugc_led` | 2 |
+
+The string `social_proof_led` appeared **once** in `aiCreativeDirectorService.js` — in the enum — and in **zero** guidance. Note the HONESTY RULE was *not* the cause: it constrains `social_proof_type` and two archetypes, never `creative_style`.
+
+**Fixed 2026-08-10 (three parts):**
+
+1. **Selection criteria.** `buildPromptRound` now describes when each style applies, and names `brand_led` the *default of last resort* — the direct counterweight to the `|| 'ai_brand_led'` fallback. `creative_style` is also now a listed concept-diversity axis.
+2. **Reserved slot.** When a **RATING** is reachable, ≥1 of the 3 concepts must be `social_proof_led`. **Rating-bearing, not "any proof"** — `INTENTS.social_proof_led.eligible` is rating-only, so reserving a slot on a quote or comment alone would mint `ai_social_proof_led` on products that then fall back at render, *amplifying* the collapse this fixes (adversarial finding, pinned by A5b). The condition is a strict subset of "the HONESTY RULE does not fire"; **the two must never both be active**, or the prompt demands a proof concept while forbidding proof — the self-contradictory-prompt class that forced the PR #61 video rollback (§6 / CLAUDE.md §00). Deliberately instruction-level, not a post-parse rejection: a thin-data product should degrade to an honest non-proof concept rather than ship a hollow proof ad.
+3. **`DIRECTOR_PROOF_MENU_ENABLED=true`** (`config/defaults.env`). Product-scoped runs withhold brand quotes/ratings from `primary_quote`/`rating` (cross-product copy guard) but now see them in `proof_options[]`, each with its own pre-scoped disclosure string. The honesty rule is amended **under the same flag**, and the reserved slot's `proof_options` term is gated on that **same flag**, so a stale or injected summary cannot desynchronise them (pinned by A6b). Flag-off restores the pre-change prompt byte-for-byte, original honesty-rule string included.
+
+**Paired with `DIRECTOR_SIGNALS_VERSION` 3.1.0 → 3.2.0.** ⚠️ **Scope, stated correctly — an earlier revision of this section overstated it:** the LIVE path `directConceptsRound` has **no** `signalsVersion` cache gate and calls `assembleSignals` every round, so the menu takes effect with or without the bump. The only cache-hit gate is `aiCreativeDirectorService.js:262`, inside the **shadow** `directConcepts` path. So the bump buys *shadow* correctness (artifacts built from the narrower shape stop being served as current) and is **not** what makes the flip work. **Accepted one-time cost:** that shadow call is `await`ed on live campaign expansion, so the bump forces one paid re-derive per unique (brand, product, campaignKind, creativeIntent, platformFormat) on next request. Bounded and self-healing. Pinned by `scripts/verifySocialProofRestoration.js` groups A/B.
+
+**Later bump (Phase B PMax, 2026-08-11): `3.2.0` → `3.3.0`.** Required for the PMax-only funnel-spread + social-proof hierarchy brief — without it every product that already has a `CreativeDirectionArtifact` keeps serving the pre-hierarchy brief. Meta round prompt stays byte-identical. Full write-up: [§6 *Director: funnel spread + social-proof hierarchy*](#director-funnel-spread--social-proof-hierarchy-phase-b).
+
+### Proof coherence — a LABELLED brand rating may sit beside a product/comment quote (static only)
+
+`resolveCoherentSocialProof` (`services/ratingDisplay.js`) is the single chokepoint pairing quote tier ↔ number tier, shared by static (`buildIntentData`) **and video** (`brandScriptExecutor.buildMetaForAd`). Its invariant #4 forbade *product/comment quote + brand numbers*, because a brand-wide count beside one SKU's testimonial reads as that SKU's volume.
+
+**Measured cost:** 7 of the 18 `ai_social_proof_led` renders logged `intent=objection_resolved(fell back from social_proof_led)`. Mechanism: no product-level rating + a comment-tier quote on frame → brand stars hard-nulled → `d.rating` undefined → `INTENTS.social_proof_led.eligible` fails (its `core` **is** `RATING`) → `FALLBACK_ORDER`. Quote precedence is product → category → comment → brand (`layoutInputService.js`), so comment-tier quotes are common, making this the normal case, not an edge one. The 4.39 star floor was **not** the blocker.
+
+**Owner override, 2026-08-07**, verbatim: *"I don't want brand level stars to block a comment tier quote. We can have both and clearly demarcate brand level stars … The positive comment is different and better social proof than brand level stars"* / *"include the comment and then use brand level stars and include a 'Brand Reviews' next to the stars."*
+
+Implemented as opt-in `allowLabeledBrandNumbers`, **default `false`**:
+
+| guarantee | how |
+|---|---|
+| video + every other caller unchanged | parameter defaults false; **only** `directImageRenderService` passes true — byte-identical *by construction*, pinned by D3 (recursive over `services/` **and** `routes/`) / D4 |
+| product numbers always win | the exception sits **after** both product attempts; it can only ADD proof, never displace product with brand (C4 / C7e) |
+| a rating can never print unscoped | **stars only**, and a normalized brand **count is required** so `formatBrandReviewsText` can produce the `BRAND_SCOPE_LABEL` — no count → refuse (C7b/C7c) |
+| no brand volume claim beside a product quote | `allowBrandCountWithoutStars` stays **false**; `'brand-count'` is rejected (C7) |
+| a raw env string cannot opt in | gate is **`=== true`**, not truthiness (C7d) |
+| substituted quotes still earn nothing | the fail-closed `renderedQuoteText` guard is untouched (C8) |
+
+**Three constraints above exist because two independent adversarial passes broke the first draft**, and all three are revert-proven — do not "simplify" them:
+- Truthy gate → the literal string `"false"` opted **in**.
+- No count requirement → a stars-only brand pair rendered a **bare `4.7 ★`** beside a product/comment testimonial with no qualifier, which the code's own comment claimed was impossible.
+- `allowBrandCountWithoutStars: true` → printed a brand volume claim next to a product testimonial *and* still left the intent ineligible (eligibility is rating-only), i.e. all risk, no benefit.
+
+**Known accepted residual:** a product pair with a *sub-floor rating but a non-zero count* returns `product-count` and short-circuits the exception, so that shape still falls back. Fixing it would mean brand numbers displacing a product-tier number — a second override nobody approved. Pinned as a decision by C7e.
+
+Kill switch **`STATIC_BRAND_STARS_WITH_QUOTE=false`**, committed in `config/defaults.env` — reverts with no deploy. **Do not "restore invariant #4"**; it is an owner decision, and this repo has precedent (PR #61) of a later session undoing one. Pinned by `scripts/verifySocialProofRestoration.js` groups C/D — **35 checks, revert-proven on 13 mutations**.
 
 ### Seed selection — image vs video (the first-catalog-image rule)
 
@@ -539,6 +600,7 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 | `ATLAS_IMAGE_POLL_MS` | `3000` (code default) | Image prediction poll; also drives stage piggyback |
 | `AD_STAGE_MIN_MS` | `3000` (code default; **not** in `defaults.env`) | Stage write floor for same phase |
 | `RENDER_CONCURRENCY` | **`8`** | Parallel static ads in `runRenderLoop`. File raised 4→8 on 2026-08-02; **live in prod 2026-08-03** when the dashboard pin of 4 was deleted (see §9 / CLAUDE.md §4a) |
+| `PMAX_STATIC_PLATFORM_NOTES` | **`true`** | Phase B: inject `PLATFORM_NOTES` + intent-aware CTA on `pmax_*` statics only. Meta prompts byte-identical both arms. `false` → pre-Phase-B prompt for every surface including pmax. See [*Static PMax prompt overlay*](#static-pmax-prompt-overlay--cta-policy-phase-b-2026-08-11) |
 | `AI_HTML_LAYOUT_ENABLED` / `RENDER_USE_HTML` | `true` | Still used by the **legacy** HTML arm only |
 | `AI_IMAGE_REFERENCE_*` | `false` / inert | **Not read by the live render path** — was falsely documented as prod-on polish |
 
@@ -562,20 +624,50 @@ Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image
 calls, one per surface, because the model typesets headline / CTA / price **into
 the pixels**. `platformFormats.js:394-403` explains why one master cannot be
 cropped into three aspects: the crop would slice through that typeset copy.
+Same shape for Google: `GOOGLE_STATIC_FANOUT` = three PMax marketing images =
+three billable submits (`platformFormats.js` `GOOGLE_STATIC_FANOUT` /
+`resolvePreset('google_static')`).
 
-**Every live static surface now generates at its EXACT delivery aspect**, so
-nothing is destroyed after the billable call:
+**Every Meta live static surface generates at its EXACT delivery aspect.**
+Google landscape is the remaining crop case (1.91:1 has no exact enum twin):
 
-| surface | aspect | generate | deliver | scale | post-gen crop |
-|---|---|---|---|---|---|
-| `meta_feed_1_1` | 1:1 | `1024x1024` | 1080x1080 | 1.0547 | none |
-| `meta_feed_4_5` | 4:5 | `1088x1360` | 1080x1350 | 0.9926 | none |
-| `meta_stories_9_16` | 9:16 | `1152x2048` | 1080x1920 | 0.9375 | none |
-| `pmax_16_9` *(frozen)* | 16:9 | `1536x1024` | 1920x1080 | 1.25 | 80px top+bottom (15.6%) |
+| surface | aspect | generate | deliver | scale | post-gen crop | edge margin |
+|---|---|---|---|---|---|---|
+| `meta_feed_1_1` | 1:1 | `1024x1024` | 1080x1080 | 1.0547 | none | 6% |
+| `meta_feed_4_5` | 4:5 | `1088x1360` | 1080x1350 | 0.9926 | none | 6% |
+| `meta_stories_9_16` | 9:16 | `1152x2048` | 1080x1920 | 0.9375 | none | 6% |
+| `pmax_square_1_1` | 1:1 | `1024x1024` | 1200x1200 | 1.1719 | none | **10%** |
+| `pmax_portrait_4_5` | 4:5 | `1088x1360` | 960x1200 | 0.8824 | none | **10%** |
+| `pmax_landscape_1_91_1` | 1.91:1 | `2048x1152` | 1200x628 | ~0.586 | ~80px H (~6.9%) | **10%** |
+| `pmax_16_9` *(frozen)* | 16:9 | `2048x1152` | 1920x1080 | 0.9375 | **none** | 6% |
+
+**Was false (corrected Phase A 2026-08-10):** this table previously listed
+`pmax_16_9` as `1536x1024` with an 80px top+bottom (15.6%) crop. `GEN_SIZES`
+gained the schema enum's exact 16:9 member `2048x1152` (`staticAdIntents.js:101-108`)
+— no live probe needed, it is **in** `GPT_IMAGE_2_EDIT_SIZE_ENUM`. Consequence:
+frozen `pmax_16_9` now zero-crops at 2048x1152, and `pmax_landscape_1_91_1`
+crops ~6.9% instead of ~21.5% from the old 3:2 plate. **MEASURED: no Meta
+surface's `chooseGenSize` winner changes** (table order + strict lower-loss
+still pin 1:1 / 4:5 / 9:16).
 
 Selection stays least-crop over `staticAdIntents.GEN_SIZES` — no per-surface
 hardcoding. **Table order is load-bearing:** `chooseGenSize` uses strict
 `loss < best.loss`, so an equal-loss tie keeps the earlier entry.
+
+**Per-surface edge margin.** Default `EDGE_MARGIN_PCT = 6`. Override map
+`SURFACE_EDGE_MARGIN_PCT` gives the three live PMax statics **10%**
+(`pmax_landscape_1_91_1`, `pmax_square_1_1`, `pmax_portrait_4_5`) — Google may
+crop ~20% of outer edges on responsive placements, and the image may be shown
+with no accompanying text. Every other surface — **including frozen
+`pmax_16_9`** — keeps 6% so existing geometry stays byte-identical.
+`SURFACE_POLICY` rows for the three new statics: landscape maxTextElements **3**
+(dense text hurts on that canvas); square/portrait **4**. **Documented
+consequence (not changed):** on the narrow 1.91:1 canvas, density ordering
+sacrifices supporting copy **before** the CTA on `brand_led` — that matches
+the intent contract (`core` keeps CTA; supporting roles yield first). Do not
+"fix" by reordering sacrifice without an owner decision. **Per-intent CTA
+policy for PMax is Phase B and is live** — see [*Static PMax prompt overlay +
+CTA policy*](#static-pmax-prompt-overlay--cta-policy-phase-b-2026-08-11) below.
 
 **Size legality is a two-tier rule.** The schema `size` enum has 14 values and is
 the operative contract; the model README still lists three and is stale. The
@@ -584,27 +676,28 @@ but that text is spliced from OpenAI's own docs and carries an unpublished "must
 satisfy the model's current pixel and edge limits" — so **prose is not warrant to
 send a size.** A non-enum size is only allowed once a live probe proves it, and
 `scripts/verifyStaticSafeBox.js` S4 enforces that with the prediction id
-recorded. `1152x2048` is an enum member. `1088x1360` is not, and was probed
-(2026-08-03, one submit, returned exactly 1088x1360, aspect 0.800000). The
-failure mode that rule guards against is not a 400 — it is a silent coercion to
-the `1024x1024` default, which would hand a square frame to a 4:5 surface and
+recorded. `1152x2048` and `2048x1152` are enum members. `1088x1360` is not, and
+was probed (2026-08-03, one submit, returned exactly 1088x1360, aspect 0.800000).
+The failure mode that rule guards against is not a 400 — it is a silent coercion
+to the `1024x1024` default, which would hand a square frame to a 4:5 surface and
 then centre-crop it.
 
 **The safe box is inset from the KEPT region, additively.** Order is crop →
-platform UI reserve → our 6% edge margin, with the margin measured on the *kept*
-short side. The previous code used `Math.max(cropBand, marginPx)`, which treated
-crop and margin as alternatives: the margin was 61.44px and the crop band was
-always larger, so on every cropped surface the margin collapsed to **zero** and
-the box handed to the model *was* the crop line. The tell needed no model
-compliance — `logoPlacementFor` composites the logomark from that same box, and
-it shipped flush to the delivered frame edge (0px gap) on Stories and 4:5.
-Emitted percentages are rounded **inward** (ceil low edge, floor high edge) so
-one-decimal rounding cannot walk an edge back into a destroyed band.
+platform UI reserve → our edge margin (6% default / 10% on live PMax statics),
+with the margin measured on the *kept* short side. The previous code used
+`Math.max(cropBand, marginPx)`, which treated crop and margin as alternatives:
+the margin was 61.44px and the crop band was always larger, so on every cropped
+surface the margin collapsed to **zero** and the box handed to the model *was*
+the crop line. The tell needed no model compliance — `logoPlacementFor`
+composites the logomark from that same box, and it shipped flush to the delivered
+frame edge (0px gap) on Stories and 4:5. Emitted percentages are rounded
+**inward** (ceil low edge, floor high edge) so one-decimal rounding cannot walk
+an edge back into a destroyed band.
 
 **Crop machinery is retained deliberately.** `cropPx` / `extractFor` /
-`deliveryGeometryFor` are now no-ops on the live surfaces, but they still serve
-the frozen 16:9 surface and still centre-crop a model response that comes back
-off-size instead of stretching it. `deliveryGeometryFor` throws unless the kept
+`deliveryGeometryFor` are no-ops on the exact-aspect Meta surfaces, but they
+still serve `pmax_landscape_1_91_1` (and any off-size model response) and still
+centre-crop rather than stretch. `deliveryGeometryFor` throws unless the kept
 region scales uniformly to `deliveryDims` within 0.5%.
 
 **Cost, stated honestly.** The catalog `base_price` is a flat `$0.01`, but real
@@ -617,9 +710,146 @@ argument alone gets the direction wrong. Reported spend does not move either way
 the ledger books the flat catalog estimate, which `atlasImageService` already
 notes understates this model ~6×.
 
-Offline check: `scripts/verifyStaticSafeBox.js` (329 checks, revert-proven six
-ways). `describeSurfaces()` dumps every declared surface including frozen and
-`coming_soon` entries.
+Offline check: `scripts/verifyStaticSafeBox.js` (per-surface margin recompute +
+new generate/crop pins; revert-proven). `describeSurfaces()` dumps every declared
+surface including frozen and `coming_soon` entries.
+
+### Google Performance Max statics (Phase A, 2026-08-10)
+
+Six PMax formats flipped `coming_soon` → `live` in `services/platformFormats.js`
+— three static (this subsection) and three video ([§6 *Google PMax video*](#google-performance-max-video-phase-a-2026-08-10)).
+
+| key | deliveryDims | status notes |
+|---|---|---|
+| `pmax_landscape_1_91_1` | 1200×628 | live static |
+| `pmax_square_1_1` | 1200×1200 | live static |
+| `pmax_portrait_4_5` | 960×1200 | live static |
+| `pmax_16_9` | 1920×1080 | **FROZEN** / `coming_soon` (legacy dual-kind key; existing Ads keep the id) |
+
+**Money shape:** `resolvePreset('google_static')` → 3 billable image submits per
+concept; `google_all` adds the video masters (see §6). Demand Gen keys +
+`google_shorts_9_16` stay `coming_soon`: their `deliveryDims` are **identical**
+to live PMax sizes, so the same generated files serve them — generating both
+would be double spend. They were **removed from** `GOOGLE_STATIC_FANOUT` /
+`GOOGLE_VIDEO_FANOUT` for that reason.
+
+**Enums are mandatory.** `Ad.platformFormat` and `Campaign.platformFormat` both
+list the six live keys — without the schema extension every write of a new format
+throws a Mongoose `ValidationError`.
+
+**Text assets are deliberately OUT OF SCOPE** (owner decision): clients already
+run PMax and their existing headlines/descriptions serve; we supply the visual
+layer. Copy burned INTO the creative stays ours. No Google Ads upload path yet
+(integration is read/sync only) — v1 is an export bundle.
+
+**No full end-to-end PMax kit has run through the app yet.** Phase B did run
+prompt-only live Atlas submits (no DB / no Ad rows) and measured settled prices
+— see [*Measured PMax unit costs*](#measured-pmax-unit-costs-phase-b-live-submits-2026-08-1011)
+and `session.md` *Next-session prompt*.
+
+### Static PMax prompt overlay + CTA policy (Phase B, 2026-08-11)
+
+All of this lives in `services/staticAdIntents.js`. Kill switch
+**`PMAX_STATIC_PLATFORM_NOTES`** (default **true**, `config/defaults.env`).
+
+**`PLATFORM_NOTES` block** — injected **only** for `pmax_*` surfaces, **after**
+the geometry block (so the notes can refer to the safe box already specified).
+Content, in substance: the platform may crop the outer edges, so **rendered**
+elements (copy, marks, badges — not the photograph itself) must sit inside the
+safe box; the product only has to survive a centre crop uncut; the image may be
+shown with **no** accompanying text and must communicate product + brand alone;
+it may be shown small in a feed, so one dominant subject / strong contrast / no
+thumbnail-fragile detail.
+
+**Correction (adversarial review of Phase B):** an earlier draft of the notes
+told the model the *product* must sit inside the safe box, two lines after
+`geometryBlock()` says "EVERY element you render other than the photograph
+itself must sit inside the box … The photograph should still fill the whole
+frame edge to edge." That revoked the photograph exemption and would have
+shrunk the subject on the surface where thumbnail legibility matters most.
+Reworded as above.
+
+**Destination + CTA.** `destinationForSurface()` maps `pmax_*` → `'pmax'`,
+else `'meta'`. `resolveDrawCta({surfaceKey, policy, intentKey})` applies the
+intent-aware CTA policy:
+
+| surface class | flag | intent | `drawCta` |
+|---|---|---|---|
+| Meta (any) | on **or** off | any | unchanged from pre-Phase-B `SURFACE_POLICY` |
+| `pmax_*` | **off** | any | pre-Phase-B `SURFACE_POLICY` boolean (byte-identical prompt) |
+| `pmax_*` | **on** | `objection_resolved` (conversion; `ai_promotional` maps here) | **true** — burned CTA stays |
+| `pmax_*` | **on** | every other intent | **false** — CTA suppressed |
+
+Rationale: Google renders its own CTA button on most placements; a burned-in
+CTA is redundant except on an offer/conversion creative. Suppression reuses
+the **same path Stories already used** (`drawCta:false` → CTA stripped before
+`applyDensity`, absence line via `ctaNote`) — not a second mechanism.
+
+**Meta byte-identity guarantee (MEASURED, both arms):** every Meta surface ×
+every intent is **byte-identical** to pre-Phase-B with the flag **ON** *and*
+**OFF**. Only `pmax_*` prompts change, and only when the flag is on. Flag-off
+restores a byte-identical pre-Phase-B prompt for every surface including
+`pmax_*` (no notes block; pmax `drawCta` stays the per-surface
+`SURFACE_POLICY` boolean).
+
+Pinned by `scripts/verifyPmaxPromptOverlay.js` (**314 checks**; Meta
+byte-identity in both flag arms with require-cache invalidation of both
+`staticAdIntents` and `platformFormats`; flag-off ⇒ no platform notes
+anywhere; flag-on ⇒ notes present on every live pmax static **after** the
+geometry block and never on Meta; `resolveDrawCta` truth table both arms).
+`verifyStaticIntents.js` and `verifyStaticFidelityPrompt.js` are **re-pinned**
+(not weakened): pmax CTA suppression truth table; for pmax the last prompt
+section is now `PLATFORM CONTEXT` with `FORMAT` immediately before it; for
+Meta `FORMAT` must still be last.
+
+### Measured PMax unit costs (Phase B live submits, 2026-08-10/11)
+
+Prompt-only Atlas submits — **no DB, no Ad rows**. Settled prices read back
+from each prediction (the authority; never quote catalog `base_price` as the
+charge — CLAUDE.md §2). These **correct** the planning estimates:
+
+| item | model | settled price |
+|---|---|---|
+| static 1:1 @1024×1024 | `openai/gpt-image-2/edit` | **$0.071728** |
+| static 1.91:1 @2048×1152 | same | **$0.061440** |
+| static 4:5 @1088×1360 | same | **$0.066660** |
+| video 10s 16:9 @1080p | `google/gemini-omni-flash/image-to-video-developer` | **$0.90** |
+
+Derived kit costs:
+
+- **3-size PMax static fan-out ≈ $0.199/concept** (was estimated ~$0.22).
+- **One 10s Omni master on the developer model = $0.90**, not the **$1.20**
+  implied by the `MODEL_CAPS` `base 0.20 + 0.10/s` formula — that formula
+  **overstates the developer variant by ~33%**. The developer model **is**
+  the production default (`BUILT_IN_DEFAULT_MODEL`). Do not quote $1.20 for it.
+- **Two masters = $1.80.** Full PMax kit (3 concepts × 3 statics + 2 masters)
+  ≈ **$2.40 standalone**, ≈ **$1.50 marginal** alongside a Meta run that
+  already pays for the 9:16 master. (Derive-only 1:1 is free crop+retitle.)
+
+**Live schema facts confirmed the same day:** image `size` enum uses the
+`1024x1024` form (a `1024*1024` submit is rejected 400 "invalid size");
+`2048x1152` **is** an enum member (Phase A `GEN_SIZES` addition needed no
+probe); Omni i2v `aspect_ratio` enum is exactly `['16:9','9:16']` and
+`duration` enum `[4,6,8,10]`. Delivered 16:9 video: exactly **1920×1080,
+10.000s, 240 frames**.
+
+**Creative signal (n=1 per arm — signal, not verdict):** 16:9 A/B with a
+deliberately unbranded seed — canonical profile mid-clip zoomed to an extreme
+lace close-up where the product was no longer identifiable; PMax profile kept
+the product legible across the whole clip. Neither arm invented a competitor
+mark on that seed. Both delivered files exactly **1920×1080, 10.000s, 240
+frames**.
+
+**Static A/B (prompt-only, same unbranded seed):** on `pmax_square_1_1` and
+`pmax_landscape_1_91_1`, overlay ON → burned-in CTA correctly gone and copy
+inside the safe area; OFF → SHOP NOW button with text near the top edge. No
+hallucinated marks in either arm.
+
+**Harness lesson:** the first static run typeset `[object Object] ★` because
+the test fixture passed `rating` as an object. Real `data.rating` is a
+formatted **string** from `formatDisplayRating()`, with the scoped count in
+`reviewsText`. A test that bypasses `buildIntentData` must mirror that exact
+output shape.
 
 ### Consumers
 
@@ -630,7 +860,7 @@ ways). `describeSurfaces()` dumps every declared surface including frozen and
 
 ## 6. Video generation (Veo / Atlas) — deterministic-first
 
-> **Default path:** product campaigns queue **one deterministic video ad per product** (hero seed or operator-ordered catalog stack). The Creative Director no longer drives video by default — it serves **static image ads** and **opt-in video variants** only (backend PRs #11/#12/#13; wizard controls frontend PR #10).
+> **Default path (Meta):** product campaigns queue **one deterministic video ad per product** (hero seed or operator-ordered catalog stack) — `resolvePreset('meta_video'|'meta_all')` returns `videoFormats: [META_VIDEO_MASTER]` only. **Google PMax is different:** `google_video` / `google_all` queue **two billable Omni masters** (9:16 + 16:9) plus one **free derive-only** 1:1 crop of the 9:16 master — see [*Google Performance Max video*](#google-performance-max-video-phase-a-2026-08-10) below. The Creative Director no longer drives video by default — it serves **static image ads** and **opt-in video variants** only (backend PRs #11/#12/#13; wizard controls frontend PR #10).
 >
 > **Owner position (2026-08-03):** *"we disabled the director for the video path for now"* / *"we were using a canonical prompt"* / more archetypes may come later — **right now get the canonical prompt right.** Archetype-driven video is **deferred, not missing.** Camera prompt is generic **by design** (titling burns text downstream); levers are `videoPromptGuidance` + canonical directives in `buildVeoPrompt`, **not** concept fields. **PR #61's three camera-prompt changes are fully rolled back** (see *Full PR #61 camera-prompt rollback* below) — tune the restored canonical text, do not re-land those three.
 
@@ -656,15 +886,302 @@ Results from deterministic + concept expanders are combined with **`mergeExpansi
 
 #### Deterministic video (`expandDeterministicVideo`)
 
-- **Exactly one ad per product** that has a resolvable seed — **no** `VEO_ADS_PER_PRODUCT_CAP` (that cap applies only to concept/legacy video).
+- **Per-product count depends on platform.** Meta (`meta_video` / `meta_all`): **exactly one** billable video Ad per product (the master). Google (`google_video` / `google_all`): **two** billable masters + **one** free derive-only 1:1 — see [Google PMax video](#google-performance-max-video-phase-a-2026-08-10). **No** `VEO_ADS_PER_PRODUCT_CAP` on this rail (that cap applies only to concept/legacy video).
 - **Seed selection**
   - If the operator passes ordered catalog-product `seedMediaIds`: grouped by `metadata.catalogProductId`, order preserved; **position 0 = primary seed** (`mediaId` + `referenceMediaIds` stack).
   - Else: feed-order **hero** (`imageRole: 'hero'` → earliest `createdAt` → lazy materialize from `product.imageUrl`); empty `referenceMediaIds` so render derives hero + alts.
   - **This rail's default is a literal query cascade, not a ranking** — `Media.findOne({ source:'catalog-product', 'metadata.catalogProductId': productOid, 'metadata.imageRole':'hero' })`, else `.sort({ createdAt: 1 })` over the same catalog scope, else lazy materialize (`campaignAdsGenerationService.js:2074-2118`, same query for the catalog-anchor append). Shot type is never consulted and the scope is `source:'catalog-product'`, so it could never resolve to UGC and nothing here needed the §5 `preferFirstCatalogImage` fix — §5's cascade was written to **mirror this one**. Contrast with the static rail, whose seed comes out of a shotType-ranked merged pool → [§5 *Seed selection — image vs video*](#seed-selection--image-vs-video-the-first-catalog-image-rule).
 - **Reference stack (what the model actually receives)** — `buildReferenceImages` (`atlasVideoService.js:1917`) sends the first **3 DISTINCT** views: primary seed at position 0, then catalog mirrors in the order the caller supplied (`buildReferenceImages` does not sort — it trusts the arrival order of `catalogMedias`). Count comes from `DEFAULT_REFERENCE_IMAGE_COUNT = 3` (`:800`), overridable per brand/product via `videoSettings.referenceImageCount` up to `MAX_REFERENCE_IMAGE_COUNT = 7`, and always clamped to the resolved model's `maxReferenceImages`. An explicit operator pick list defines its own count (picking 5 means 5, not "5 truncated to 3") but is still clamped to the stack budget, with a warn.
   - **`REPEAT_PRIMARY_REFERENCE` is OFF** — env `false` (`config/defaults.env:126`) **and** the code default is now `false` when the var is unset/blank (`isRepeatPrimaryReferenceEnabled`, `atlasVideoService.js:829-833`). Owner 2026-08-03: the repeated primary **increased** hallucination and the pre-repeat output was better, so the closing-repeat and its matching return-to-primary prompt text were both reverted (part of the full PR #61 rollback below). Kept as a flag for a future A/B, not deleted. **When set true** it becomes 3 distinct + the primary appended again = **4 total** (`referenceStackBudget` `:865` → `distinctCap 3` / `totalCap 4` from `REPEAT_PRIMARY_TOTAL_CAP = 4` `:808`); the duplicate is appended **after** final-URL dedupe so it survives, and it never evicts a real view — it only appends while `length < totalCap`. Anything above that hallucinated in pilot, so do not raise the cap. **`REPEAT_PRIMARY_TOTAL_CAP` applies only to the flag-on path.** On the default (flag-off) branch the hard ceiling is **`MAX_DISTINCT_REFERENCES = 5`** (`atlasVideoService.js:813`) — owner-set 2026-08-03 because turning the repeat off removed the only clamp, which would have let `videoSettings.referenceImageCount=7` ship seven refs against the owner's "too many images hallucinated" finding.
-- **Ad shape:** `renderRoute: 'veo'`, `kind: 'video'`, `template: 'ai_brand_led'`, `conceptId` / `judgeRank` null, `variantKind: 'product_image'`, run-level `videoPromptGuidance` / `videoPromptRaw` stamped when provided.
-- **Identity digest:** namespaced **`det-video:v1`** via `computeDeterministicVideoDigest` (campaign, product, ordered ref key or mediaId, platformFormat, CTA fields, guidance/raw). Does not collide with V1 JSON or V2 concept digests.
+- **Ad shape:** `renderRoute: 'veo'`, `kind: 'video'`, `template: 'ai_brand_led'`, `conceptId` / `judgeRank` null, `variantKind: 'product_image'`, run-level `videoPromptGuidance` / `videoPromptRaw` stamped when provided. Derive-only Ads also stamp `deriveFromMaster: 'pmax_video_9_16'` and `veoModel: 'derive-from:pmax_video_9_16'`.
+- **Identity digest:** namespaced **`det-video:v1`** via `computeDeterministicVideoDigest` (campaign, product, ordered ref key or mediaId, platformFormat, CTA fields, guidance/raw). Does not collide with V1 JSON or V2 concept digests. **Duration joins the key ONLY for Google PMax video formats** — see the digest-scoping money note under [Google PMax video](#google-performance-max-video-phase-a-2026-08-10); pre-existing Meta digests stay byte-identical.
+
+### Google Performance Max video (Phase A, 2026-08-10)
+
+> **Load-bearing money shape.** `google_video` → **2 billable Omni masters per product** (9:16 + 16:9). `pmax_video_1_1` is **derive-only** — never an Omni submit. Mirrors how `meta_video` returns only `META_VIDEO_MASTER`; `resolvePreset('google_video'|'google_all')` returns **only** `GOOGLE_VIDEO_MASTERS`, never the full fan-out.
+
+#### Formats
+
+| key | deliveryDims | role |
+|---|---|---|
+| `pmax_video_9_16` | 1080×1920 | **billable Omni master** (also the 1:1 crop source) |
+| `pmax_video_16_9` | 1920×1080 | **billable Omni master** |
+| `pmax_video_1_1` | 1080×1080 | **derive-only** — face-safe crop of the settled 9:16 plate + its own Remotion titling |
+
+Export: `GOOGLE_VIDEO_MASTERS = ['pmax_video_9_16','pmax_video_16_9']` (`platformFormats.js`).
+Video `safeArea` (canvas px, width-normalized at 1000): 9:16 `{top:249, bottom:622}`, 16:9 `{top:56, bottom:113}`, 1:1 `{top:100, bottom:100}`. Statics keep 0/0 and use the edge-margin mechanism instead ([§5](#surface-geometry--generation-size-and-the-safe-box)).
+
+Duration pin: Google PMax video floors to **10s** when the wizard leaves duration unset (`GOOGLE_PMAX_VIDEO_DURATION_SEC = 10`, `resolveVideoDurationForFormat`). Meta stays provider-default (Omni ~8s) — an 8s→10s Meta standardization is a **separate, costed** change, never folded in silently.
+
+#### Derive-only surface + the shared gate
+
+`pmax_video_1_1` is **never** an Omni submit. On Google master runs, expansion mints one extra Ad per product with `deriveFromMaster: 'pmax_video_9_16'` (`Ad.deriveFromMaster` schema field, default null).
+
+**THE SHARED GATE:** `resolveDeriveFromMaster(ad)` lives in `services/campaignAdsGenerationService.js` and is **imported** by both `routes/ads.js` (render loop) and `services/adRegenerateService.js` (regenerate). It is **fail-closed on platformFormat** — `pmax_video_1_1` alone is sufficient, so a dropped/absent `deriveFromMaster` field can never turn a free surface into a paid one. **Do not re-implement it per caller** — a per-caller copy is exactly how the regenerate hole (below, defect 2) opened.
+
+**Render path:** `renderDeriveOnlyVideoAd` in `routes/ads.js`. The gate is evaluated **before** the first Omni submit and returns. It **waits in-render** for the master's plate (`DERIVE_MASTER_WAIT_MS` default 12 min, poll `DERIVE_MASTER_POLL_MS` default 10s) rather than requeueing, then crops + titles. Master failed/absent → honest failure, **never** an Omni fallback. Same draft → titling → done money discipline as the master path (untitled is not success).
+
+**Why wait-in-render (not requeue):** the whole run dispatches in one wave (`VEO_CONCURRENCY`), so the master is almost always still `rendering` when the derive Ad starts. Immediate requeue left the free 1:1 stranded in `queued` forever — reaper + stranded sweeper only look at `rendering` ads / failed runs, and a second Generate short-circuits with "Nothing to render" because the deterministic video digest is run-independent by design. Both operator work-arounds cost money.
+
+**Mint only when the crop source is in the run.** `isGoogleVideoMasterRun` requires every entry to be a Google master **and** `PMAX_VIDEO_DERIVE_SOURCE` (`pmax_video_9_16`) to be among them — a single-format run of only `pmax_video_16_9` must not mint a 1:1 whose source was never generated.
+
+**Fallback must strip derive-only.** `single` + `platformFormat: pmax_video_1_1` resolves `videoFormats` to `['pmax_video_1_1']`; the master resolver strips it (empty list); the bare `[videoPlatformFormat]` fallback used to put it straight back as a **paid** Omni submit. Live path **and** dry-run estimate both apply the same strip.
+
+**DELETE must not destroy the master's asset.** Until the derive Ad uploads its own titled file, its `renderUrl` **is** the master's plate URL. DELETE skips Cloudinary destroy while the plate is still inherited (`veoModel` stamped `derive-from:<fmt>` **and** `renderUrl === veoVideoUrl`).
+
+#### Digest scoping (money — caught pre-merge)
+
+An earlier draft appended `videoDurationSec` to the video identity digests **unconditionally** and bumped the namespace `det-video:v1` → `v2`. **MEASURED:** that changed the digest for **every** pre-existing Meta video ad. Because `computeDeterministicVideoDigest` deliberately omits `generationRunId`, the `(campaignId, identityDigest)` unique index is the **only** guard against a repeat Generate re-billing an Omni master — so the next Generate on any existing campaign would have minted fresh ads and paid ~$1.00–1.20 per product again.
+
+**FIX:** duration joins the key **only** for the Google PMax video formats (zero history → cannot collide), and the prefix stays **`det-video:v1`**. Pre-existing Meta digests are provably byte-identical. **If the Meta 8s→10s standardization later wants duration identity for Meta, that is a deliberate one-time re-mint that must be costed and flagged, never folded in silently.**
+
+#### Defects found by adversarial review and fixed in the same change
+
+Record these — they are the expensive lessons. Pinned by `scripts/verifyPmaxVideoExpansion.js` section F (54 checks total; revert-proven against 9 mutations):
+
+1. **Digest re-mint (money, caught pre-merge)** — see above.
+2. **Regenerate billed a derive-only ad (CRITICAL).** `adRegenerateService.runVideoFull` called `veoService.generateForAd` unconditionally; nothing in the regenerate route/preflight looked at platformFormat — so Regenerate on a PMax 1:1 billed a brand-new Omni generation (**planning figure was $1.20** at the pinned 10s from the `MODEL_CAPS` formula; **MEASURED Phase B: $0.90** on the developer model — see [*Measured PMax unit costs*](#measured-pmax-unit-costs-phase-b-live-submits-2026-08-1011); up to $5.00 if the square routes to the per-second aspect-fallback model), up to the daily cap per ad. **FIX:** `preflight()` refuses derive-only ads with a **409** (before the 202 and before any provider call), using the **shared** gate.
+3. **Derive mint without its source master** — `isGoogleVideoMasterRun` fixed (above).
+4. **Fallback reinstate of derive-only as billable** — strip on live + dry-run (above).
+5. **Free 1:1 stranded on every first run** — wait-in-render (above).
+6. **DELETE destroyed the master's asset** — inherited-plate guard (above).
+
+#### Titling + composition mapping
+
+`classifyFormat` (`brandScriptExecutor.js:89-94`) now checks **SQUARE BEFORE LANDSCAPE**, and `isLandscapeFormat` matches `/pmax_landscape|preroll|youtube|16_9/` instead of bare `/pmax/`. Without this, `pmax_video_1_1` and `pmax_square_1_1` were swallowed by a landscape rule that matched every `pmax_*` id and would have titled on the 1920×1080 composition. Verified mapping: 9:16 → `CanonicalVertical` 1080×1920, 1:1 → `CanonicalSquare` 1080×1080, 16:9 → `CanonicalLandscape` 1920×1080.
+
+**`classifyFormat` MUST keep returning the four CANVAS formats**
+(`vertical|square|landscape|feed`) — that string is also the **composition id**
+and the **`titleStyleSpec` cascade key**. Returning a zone name from it would
+break the render and silently change every spec lookup. Safe-zone selection is
+a **separate** concern (below). Non-PMax behaviour is unchanged.
+
+`remotion/lib/safeZones.js` has `verticalYt {0.14/0.35/0.075/0.15}`,
+`landscapeYt {0.10/0.20/0.075/0.15}`, `squareYt {0.10 all}` — YouTube UI
+overlay bands (engagement rail right, player controls bottom, channel chip
+top).
+
+#### YouTube safe zones WIRED (Phase B — closes the Phase A gap)
+
+**WAS Phase A known gap; CLOSED Phase B.** Zones are now resolved per
+`platformFormat` and threaded to the composition:
+`pmax_video_9_16` → `verticalYt`, `pmax_video_16_9` → `landscapeYt`,
+`pmax_video_1_1` → `squareYt` (`brandScriptExecutor` / `remotionRenderService`
+/ `remotion/*`). Meta surfaces still use Meta zones.
+
+**Funnel presets — 10s re-time REVERTED (post-Phase-B adversarial review).**
+The three funnel titling presets (`canonical-awareness` /
+`canonical-consideration` / `canonical-conversion`) are **GENERIC** — any brand
+can select them via `brand.titleStylePreset` (`titleSpecService.resolveSpec`
+Tier 2) and `scripts/retitleDriver.js --preset=` can force them onto
+already-rendered ads. **Nothing scopes them to PMax.** They were authored for
+**8-second** plates. `remotion/lib/timing.js` `specTimeScale` only
+**compresses**; on a longer plate the authored pacing is kept and hold-to-end
+slots just hold — so a 10s master played 8s of pacing then held ~2s. Phase B
+re-authored them for 10s (preserving proportions), which dropped
+`specTimeScale` from **1.0 → 0.8** for every existing **8-second** render using
+those presets — silently re-timing the whole choreography 20% tighter, with no
+crash and no failing test (measured against the pre-change files). **Presets
+are back at their 8s extent.** If PMax wants 10s pacing it must be **separate
+preset files** selected explicitly for PMax video, built together with per-run
+preset selection (still open).
+
+**STILL OPEN — per-run funnel preset SELECTION is not built.** The render path
+already accepts `presetOverride` (`renderBrandScriptAndSave` →
+`renderWithRemotionAndSave` → `resolveSpec` TIER 0), but **no live caller
+supplies one** and no Ad/run field carries a funnel stage;
+`buildMetaForAd` hardcodes `presetOverride: null` and **must receive the SAME
+value as the render path** or the social-proof quote gate desyncs from the
+rendered bind list. Only brand-level `titleStylePreset` works today.
+
+#### PMax video directives profile (Phase B)
+
+`services/veoPromptBuilder.js` — new **`PMAX_DIRECTIVES`** profile, same key
+shape as `OMNI_DIRECTIVES`, selected only for PMax destinations via a new
+optional arg to `buildVeoPrompt` (absent → today's Meta behaviour **exactly**).
+Kill switch **`PMAX_VIDEO_DIRECTIVES`** (default **true**).
+
+Differences from the Meta profile, **and only these**:
+
+- **HOOK-FIRST** — product identifiable within the first 2 seconds (this
+  surface is skipped/scrolled in seconds; the opening frames carry the ad).
+- **Scene 1** reworded so the establishing move happens **with** the product
+  already legible — and is **aspect-aware** (post-Phase-B fix): vertical gets a
+  centred push-in; a hard-coded horizontal pan on 9:16 walked the subject into
+  the engagement rail that `cameraStyle` already says to avoid.
+- **Centre-safe composition** — product and focal detail away from the
+  top/bottom bands and the outer side margins where the platform overlays UI.
+- **Aspect-aware Frame line** — for 16:9: wider establishing framing,
+  horizontal rather than vertical camera travel, product in the central band
+  with headroom above and below. **`aspectRatio` had never been used in prompt
+  text before** — the PMax profile is the first consumer.
+
+Fidelity / noText / physicalAccuracy / productPreservation are **referenced
+from `OMNI_DIRECTIVES`** (not re-authored) so they cannot drift.
+
+**Corrections applied during review:**
+1. The draft profile told a LANDSCAPE master it was "swipe-away vertical" and
+   referenced the vertical right-edge rail — false and contradictory on the
+   16:9 master. Shared text is now **aspect-neutral**; all aspect specifics
+   live in the Frame line (and Scene 1 after the fix above).
+2. See also [*Phase B adversarial corrections*](#phase-b-adversarial-corrections-post-phase-b)
+   for the PLATFORM_NOTES / geometry contradiction and the blank-env threshold
+   parser.
+
+**The frozen Meta camera prompt is untouched**, confirmed two independent ways:
+`scripts/verifyPostPilotBatch.js` **B14** (rebuilds from the pre-PR#61 source
+out of git, byte-identity) still passes, **and** a direct build/byte-compare
+against `git show HEAD:` across both aspects × durations 8 and 10.
+
+#### Director: funnel spread + social-proof hierarchy (Phase B)
+
+`services/aiCreativeDirectorService.js` — PMax-only round-brief content.
+**Meta round prompt is MEASURED byte-identical** for every Meta surface (and
+for a null format). PMax round prompt gained ~**3.2k** chars.
+
+1. **Funnel spread.** Google delivers all creative for a product into ONE
+   asset group and picks per impression, so the 3 concepts must **SPAN** the
+   funnel — awareness / consideration / conversion, one each, each declaring
+   `routing.funnel_stage` (new **nullable** field, **PMax schema only**; read
+   via `conceptProjection` like every other routing field).
+2. **SOCIAL-PROOF HIERARCHY** (owner-supplied creative guidelines). One
+   dominant social-proof element per creative; supporting proof visually
+   secondary; never equal weight across quote/rating/count/price/name/CTA.
+   Per-SKU logic:
+   - strong rating + substantial count → **RATING-FIRST** (no quote)
+   - compelling short quote → **TESTIMONIAL-FIRST** (small optional stars)
+   - both + large canvas → **COMBINATION** with one still dominant
+   - weak count → **NEVER** print the count
+   - rating below threshold with high volume → **POPULARITY** framing instead
+     of the number
+   - strong photography → **PRODUCT-FIRST** with minimal proof (a legitimate
+     concept, not a failure)
+   - **CONCEPT DIVERSITY:** the dominant proof element must **DIFFER** across
+     the round's concepts — Google needs distinct approaches to test, not
+     cosmetic variants.
+3. **Thresholds are env-backed and INTERPOLATED into the prompt** so config and
+   prompt cannot disagree: `PMAX_PROOF_STRONG_RATING` (**4.5**),
+   `PMAX_PROOF_MIN_REVIEW_COUNT` (**100**). **Blank/whitespace/negative env
+   values fall back to the default** — `Number('')` is `0`, not NaN, so a
+   present-but-empty var (what clearing a Render dashboard value leaves) would
+   have put "strong rating ≥ 0" / "substantial count ≥ 0" into the prompt and
+   inverted the hierarchy (every SKU RATING-FIRST; weak-count suppression never
+   firing). Fixed post-Phase-B.
+4. **PRECEDENCE SENTENCE — load-bearing.** The shared DR block states
+   "≥4.5 from ≥50" for when a rating is credible to cite. That text is
+   **Meta-tuned and deliberately untouched**, so a PMax round shows the model
+   two different counts for a similar-looking decision. The hierarchy block
+   therefore states **explicitly that it wins for this destination on any
+   disagreement including thresholds**. Do **not** delete that sentence, and
+   do **not** "harmonise" the shared text — that would change the Meta prompt.
+5. **`ARCHETYPE_WEIGHTING`** entries added for the three PMax **STATIC**
+   surfaces (1.91:1 avoids dense multi-element layouts on that short wide
+   canvas; square and 4:5 have more room). Phase A already added VIDEO-format
+   weighting.
+6. **`DIRECTOR_SIGNALS_VERSION` bumped to `3.3.0`** — without it the new brief
+   is a no-op on every product that already has a `CreativeDirectionArtifact`
+   (cache-hit test is `cached.signalsVersion === DIRECTOR_SIGNALS_VERSION`).
+   Same trap class as the starved-brief 3.0→3.1 and social-proof-menu 3.1→3.2
+   bumps.
+
+#### Director scaffolding (Phase A; extended Phase B)
+
+`ARCHETYPE_WEIGHTING` entries for the three live PMax **VIDEO** formats
+(Phase A, modeled on the existing `pmax_16_9` entry) keep reserved-chrome
+surfaces out of the "no weighting → square Feed defaults" hole. Phase B adds
+the STATIC-surface entries + the funnel/proof hierarchy above.
+
+#### Harnesses
+
+- `scripts/verifyPmaxVideoExpansion.js` — **54 checks**, the money harness for
+  the expansion/derive path: masters exclude the derive-only surface; Meta
+  still resolves to exactly ONE master (submit count unchanged); duration
+  pinned to 10s for Google and left null for Meta; duration does **not** alter
+  any pre-existing format's digest but **does** for Google; the derive gate is
+  fail-closed and defined **once**; `renderDeriveOnlyVideoAd` contains **zero**
+  billable submit calls (comment-stripped so a money-ASSERT comment cannot
+  false-pass); the gate precedes the first submit; section F pins all six
+  defects above.
+- **NEW** `scripts/verifyPmaxPromptOverlay.js` — **314 checks**, Phase B
+  prompt harness: Meta byte-identity in **both** flag arms (require-cache
+  invalidation of both `staticAdIntents` and `platformFormats`); flag-off ⇒ no
+  platform notes anywhere; flag-on ⇒ notes present on every live pmax static
+  **after** the geometry block and never on Meta; `resolveDrawCta` truth table
+  both arms; video kill-switch equivalence; Meta camera-prompt baseline out of
+  git; PMax video content pins (hook-first, centre-safe, 16:9 Frame line,
+  correct 3-scene arithmetic at 10s). Revert-proven against **5** mutations.
+- `verifyStaticIntents.js` / `verifyStaticFidelityPrompt.js` — **re-pinned**
+  (not weakened) for pmax CTA suppression and section order (`PLATFORM
+  CONTEXT` last on pmax; `FORMAT` still last on Meta).
+- **NEW** `scripts/verifyVideoCostReconcile.js` — video ledger reconcile
+  (post-Phase-B; see below). Revert-proven, including `await` on the
+  render-path call site and dropping the `<= 0` price-parser guard.
+
+Suite is **78 scripts, 0 failing**.
+
+#### Phase B adversarial corrections (post-Phase-B)
+
+Defects found by adversarial review of Phase B and fixed. This repo documents
+its own reversals:
+
+| # | Defect | Fix |
+|---|---|---|
+| a | Funnel presets re-timed for 10s silently compressed every brand's 8s renders using those generic presets (`specTimeScale` 1.0→0.8) | **Reverted** to 8s extent; PMax 10s pacing needs separate presets + per-run selection |
+| b | `PLATFORM_NOTES` put the *product* inside the safe box, contradicting `geometryBlock()` photograph exemption | Reworded: box governs rendered elements; product survives centre crop uncut |
+| c | PMax Scene 1 hard-coded a horizontal pan on both aspects → 9:16 walks into the engagement rail | Scene 1 aspect-aware (vertical → centred push-in) |
+| d | `PMAX_PROOF_*` `Number('')` → `0` inverted the hierarchy | Blank/whitespace/negative → default |
+| e | `routing.funnel_stage` missing from `ROUTING_NESTED_FIELDS` (scanner blind) | Registered + **R0b** pins load-bearing names stay registered |
+| f | Density on 1.91:1 (`maxTextElements: 3`) drops supporting copy before CTA on `brand_led` | Documented against intent contract; not changed |
+
+#### Video cost reconciliation (post-Phase-B)
+
+**Owner rule** (CLAUDE.md §2): always read the actual price back from Atlas after
+generation; budget / margin / per-ad claims come from **reconciled** rows. That
+was implemented for **images only**. Video booked `estimateRenderCostUsd(...)`
+and never read the settled price back, so **every video row in the ledger was
+the formula estimate forever**.
+
+**MEASURED:** two live 10s/1080p/16:9 generations on
+`google/gemini-omni-flash/image-to-video-developer` (`BUILT_IN_DEFAULT_MODEL`)
+both settled at **$0.90**, while `MODEL_CAPS` `base 0.20 + 0.10/s` yields
+**$1.20**. The ledger therefore **overstated** video spend by ~33% on the
+default model. **Over-REPORTING, not overspending — no money was lost** — but
+margin and per-ad cost analysis were wrong, and PMax roughly doubles video
+volume.
+
+**Shipped in `services/atlasVideoService.js`:**
+
+- `pollPrediction` returns `{ url, price }` (not a bare url string). Not
+  exported; one value-returning path (every other exit throws); both internal
+  call sites unwrap. No external consumer.
+- `reconcileVideoCostFromTerminal(predictionId, terminalData)` — **fire-and-
+  forget** (never awaited; sits on the render path where Atlas is already
+  billed) right after the master lands. If the terminal poll **already**
+  carries a usable price it reconciles immediately and schedules nothing.
+  **Measured:** video publishes `price` at completion (unlike images, where it
+  usually appears later) — immediate path is the normal one; re-poll is the
+  exception.
+- `scheduleVideoCostReconcile(predictionId)` — fallback when the terminal
+  response has no price. Same backoff as the image path
+  (`[3s, 10s, 30s, 60s, 120s, 300s]`), `.unref()`ed, never throws into the
+  caller, gives up with a loud warning that the row stays estimated.
+- `parseAtlasSettledPrice` — Atlas returns price as a **string** (`"0.9"`).
+  Rejects null/undefined/empty/non-finite/zero/negative so an unusable value
+  leaves the estimate in place and can never zero a row.
+- Immediate path: `finalizeFlatCost({ providerRequestId, costUsd,
+  costSource: 'actual', status: 'ok' })`. Scheduled path:
+  `reconcileCost({ providerRequestId, costUsd })` with filter
+  `{ providerRequestId, costSource: 'estimated' }` — **idempotent**; never
+  clobbers an already-actual row or inserts a second one (a duplicate would
+  double-count the charge).
+- **`MODEL_CAPS` / `estimateRenderCostUsd` deliberately unchanged** — the
+  estimate is still the correct pre-settlement floor (a submit that dies
+  mid-poll must still book something). Reconciliation is the fix, not
+  re-guessing.
+
+**Consequence:** a video row with `costSource:'estimated'` means the price was
+**never published**, not that the estimate is authoritative. Do not quote the
+`base + per-second` formula as spend for the developer model.
 
 #### Concept / director path
 
@@ -840,6 +1357,8 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 - Atlas image-to-video (**default Gemini Omni**; Grok / Veo slugs in `MODEL_CAPS` as fallbacks) — Omni RPS **unpublished/unmeasured**. Same-model video submits paced by `pacedModelSubmit` (`ATLAS_SUBMIT_SPACING_MS` default 1200ms). Grok (aspect-fallback only) stays ≤1 RPS via `GROK_MAX_RPS` floor regardless of `VEO_CONCURRENCY`.
 - **Was false:** "429s if concurrency > 1 / keep VEO_CONCURRENCY=1". That justification belonged to retired direct Google Veo and to Grok’s documented 1 RPS — not the primary Omni path. Current default **`VEO_CONCURRENCY=4`** (2026-08-02 probe). Re-measure before raising further.
 - Resolution default **`ATLAS_VIDEO_RESOLUTION=1080p`** — same list price as 720p on Omni; matches Meta `deliveryDims` (all 1080-wide).
+- **Submit count (money):** Meta live presets = **1** Omni master per product. Google `google_video` = **2** Omni masters per product (9:16 + 16:9 at 10s); the 1:1 is free crop+retitle. **MEASURED unit costs (Phase B, settled prediction prices):** 10s Omni master on the **developer** model = **$0.90** (not the $1.20 `MODEL_CAPS` formula — that overstates developer by ~33%); 3-size PMax static fan-out ≈ **$0.199**/concept. Full kit (3 concepts × 3 statics + 2 masters) ≈ **$2.40** standalone / ≈ **$1.50** marginal beside a Meta run that already paid for 9:16. Earlier planning figure ≈$2.6 is **superseded**. No full end-to-end app run yet — see [*Measured PMax unit costs*](#measured-pmax-unit-costs-phase-b-live-submits-2026-08-1011) and `session.md`.
+- **Ledger reconcile (post-Phase-B):** video now upgrades `costSource:'estimated'` → `'actual'` from the settled prediction (images already did). Immediate reconcile when the terminal poll carries `price` (normal for video); scheduled re-poll otherwise. See [*Video cost reconciliation*](#video-cost-reconciliation-post-phase-b). A remaining `estimated` video row means **price never published**, not "trust the formula."
 - Per-ref generative reframe (nano-banana-2 class edit when enabled) — ladder is exact-fit skip → product-only $0 pad → outpaint → $0 pad fallback; outpaint billed at `REFRAME_COST_USD` per image (default `$0.08` @ `4k`), cached per media+aspect on first success. Product-only shots (`Media.classification.shotType`) never reach the billable POST.
 - LayoutInput derivation (Gemini / existing builder) when artifact missing — non-fatal.
 - GPT storyboard only on non-Atlas paths that still call it.
@@ -853,6 +1372,11 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 | `AI_VEO_REELS` | `true` | Enable video for 9:16 Reels |
 | `VEO_CONCURRENCY` | **`4`** | Self-imposed in-flight video ads per run (raised 1→4 2026-08-02; re-measure before higher) |
 | `VEO_ADS_PER_PRODUCT_CAP` | `1` | Cap on **concept** video variants only (not deterministic) |
+| `DERIVE_MASTER_WAIT_MS` | `720000` (12 min) | In-render wait ceiling for the derive-only path to see the master's plate (`routes/ads.js`). Do **not** "fix" by requeueing — see [Google PMax video](#google-performance-max-video-phase-a-2026-08-10) |
+| `DERIVE_MASTER_POLL_MS` | `10000` (10s) | Poll interval while waiting for the master plate |
+| `PMAX_VIDEO_DIRECTIVES` | **`true`** | Phase B: PMax destinations use `PMAX_DIRECTIVES` in `veoPromptBuilder` (hook-first, centre-safe, aspect-aware Frame). Meta camera prompt untouched. `false` → Omni/Grok canonical profile for PMax too |
+| `PMAX_PROOF_STRONG_RATING` | `4.5` | Phase B: interpolated into the PMax-only Director hierarchy (RATING-FIRST vs POPULARITY). Meta never sees it |
+| `PMAX_PROOF_MIN_REVIEW_COUNT` | `100` | Phase B: interpolated "substantial count" floor for the PMax hierarchy. Below this, omit the count |
 | `VEO_USE_GPT_STORYBOARD` | `true` | Storyboard on paths that still use it (not Atlas Ken Burns) |
 | `ATLAS_VIDEO_FORCE_CHROME` | `true` | Force chrome handling on Atlas path |
 | `ATLAS_POLL_INTERVAL_MS` | `15000` (`defaults.env`; code fallback `5000`) | Prediction poll interval (+ stage piggyback) |
@@ -981,6 +1505,7 @@ Versioned with the repo. Feature flags, tuning knobs, public IDs/URLs, Slack cha
 | Director seed window | `DIRECTOR_UNIVERSE_TOP_N=1` |
 | Static regenerate reseed | `REGEN_RESEED_CATALOG_FIRST=true` (default ON; kill switch for catalog-first reseed on regenerate — see §5) |
 | Static direct-image path | `AI_DIRECT_IMAGE_*` (edit model / quality / timeout). `AI_IMAGE_REFERENCE_*` kept **inert** (no live consumer) |
+| PMax Phase B creative knobs | `PMAX_STATIC_PLATFORM_NOTES=true`, `PMAX_VIDEO_DIRECTIVES=true`, `PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100` (prompt text only — not money knobs; Meta byte-identity when static/video flags on or off) |
 | Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=4`, `REPEAT_PRIMARY_REFERENCE=false` |
 | Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8` (**live since 2026-08-03** — see above), `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |
 | Slack alert channels (non-secret) | `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, `SLACK_ALERT_CHANNEL_STATUS` (per-run live feed via `runFeedService`) |
@@ -1100,7 +1625,8 @@ naming sites, because the campaigns mirror is exactly what a named-site-only har
 | Per-product expand reasons | `perProductReasons.js`, stamped on `CampaignRun.perProduct` |
 | Static ads (default direct-image) | `routes/ads.js`, `campaignAdsGenerationService.js`, `directImageRenderService.js`, `staticPipeline.js`, `renderService.js`, `atlasImageService.js`, `adStage.js` |
 | Static ads (legacy HTML only) | `aiCanvasHtmlGeneratorService.js`, Puppeteer arm of `renderService.js` — only `Brand.staticImagePipeline==='html'` |
-| Video (deterministic-first + director opt-in; Omni under `veo*`) | `campaignAdsGenerationService.js` (expand/select), `atlasVideoService.js`, `veoPromptBuilder.js`, `categoryChainService.js`, `titleSpecService.js`, `brandScriptExecutor.js`, `videoRouter.js`, `adStage.js`, `routes/ads.js` (`/preview`, `/generate`, `/runs` + `claimAdsForRun`, `/formats`, `/veo-prompt-scaffold`), `routes/catalog.js` (`PATCH .../categories/:id`) |
+| Video (deterministic-first + director opt-in; Omni under `veo*`) | `campaignAdsGenerationService.js` (expand/select + `resolveDeriveFromMaster` / `GOOGLE_VIDEO_MASTERS`), `atlasVideoService.js`, `veoPromptBuilder.js`, `categoryChainService.js`, `titleSpecService.js`, `brandScriptExecutor.js`, `videoRouter.js`, `adStage.js`, `routes/ads.js` (`/preview`, `/generate`, `/runs` + `claimAdsForRun`, `/formats`, `/veo-prompt-scaffold`, `renderDeriveOnlyVideoAd`), `adRegenerateService.js` (shared derive gate in preflight), `routes/catalog.js` (`PATCH .../categories/:id`) |
+| Google PMax surfaces (Phase A + B + post-B addendum) | `platformFormats.js` (`GOOGLE_*_FANOUT`, `GOOGLE_VIDEO_MASTERS`), `staticAdIntents.js` (`GEN_SIZES` + `SURFACE_EDGE_MARGIN_PCT` + `PLATFORM_NOTES` / `resolveDrawCta`), `veoPromptBuilder.js` (`PMAX_DIRECTIVES`), `aiCreativeDirectorService.js` (funnel + proof hierarchy; `DIRECTOR_SIGNALS_VERSION` 3.3.0), `brandScriptExecutor.js` / `remotionRenderService.js` / `remotion/lib/safeZones.js` (Yt zone wiring; funnel presets remain **8s** — 10s re-time reverted), `atlasVideoService.js` (video cost reconcile), `campaignAdsGenerationService.js`, `routes/ads.js` derive path, `scripts/verifyPmaxVideoExpansion.js`, `scripts/verifyPmaxPromptOverlay.js`, `scripts/verifyVideoCostReconcile.js` |
 | Concurrency table | `services/concurrency.js`, `config/defaults.env` |
 | Alerting | `alertService.js` (Slack), `processAlerts.js` (worker watchdog) |
 | Progress | `progressService.js`, `models/OperationRun.js`, `routes/progress.js`, `routes/salesDemos.js` (`/activity`) |

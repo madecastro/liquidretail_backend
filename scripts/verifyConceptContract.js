@@ -127,7 +127,10 @@ const V3_NESTED = {
     // above: "+ falsy nested ('' / 0 / false) wins under != null") extends to
     // this field too. A real proof_pick of 0 (the FIRST menu option) must
     // never be treated as absent.
-    proof_pick: 0
+    proof_pick: 0,
+    // PMax funnel spread (Phase B). Distinct value from V2_FLAT's so a
+    // wrong-tier read cannot pass both R checks coincidentally.
+    funnel_stage: 'awareness'
   },
   copy: {
     headline: 'WALK ALL DAY',
@@ -160,6 +163,8 @@ const V2_FLAT = {
   // Distinct from V3_NESTED's 0 so a bug that reads the wrong tier can't
   // coincidentally pass both R checks with the same value.
   proof_pick: 1,
+  // Distinct from V3_NESTED's 'awareness' for the same wrong-tier reason.
+  funnel_stage: 'conversion',
   copy_picks: {
     headline: 'FLAT HEADLINE',
     subheadline: null,
@@ -257,6 +262,29 @@ const NEITHER = {
     'C8 empty nested array wins (no fallthrough to flat)',
     conceptMediaPicks(emptyNested).length === 0
   );
+}
+
+// ── R0b: fields that MUST stay registered ────────────────────────────
+// The R loop below iterates ROUTING_NESTED_FIELDS, so deleting an entry
+// simply shrinks the loop and nothing fails — the registration itself is
+// unprotected. Anything the scanner has to cover is named explicitly here.
+// (Verified: removing 'funnel_stage' from the list left the whole suite
+// green until this check existed.) The scanner in section S is what stops a
+// consumer reading these flat off a concept; that protection only applies to
+// NAMES IN THE LIST, so an unregistered field silently loses it.
+{
+  const MUST_BE_REGISTERED = [
+    'media_picks',     // zero-ads root cause when read flat
+    'creative_style',  // picks the template
+    'output_shape',
+    'funnel_stage'     // PMax funnel spread (Phase B)
+  ];
+  for (const name of MUST_BE_REGISTERED) {
+    checkTrue(
+      `R0b "${name}" is registered in ROUTING_NESTED_FIELDS (else the flat-read scanner skips it)`,
+      ROUTING_NESTED_FIELDS.includes(name)
+    );
+  }
 }
 
 // ── R: every nested routing field dual-reads ─────────────────────────

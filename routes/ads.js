@@ -31,12 +31,36 @@ const CatalogProduct = require('../models/CatalogProduct');
 const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
-const { expandWizardJob, selectAdsForRun } = require('../services/campaignAdsGenerationService');
+const {
+  expandWizardJob,
+  selectAdsForRun,
+  // Google PMax derive-only constants (Phase A). Shared with expansion so
+  // the mint marker and the render gate cannot drift.
+  PMAX_VIDEO_DERIVE_ONLY,
+  PMAX_VIDEO_DERIVE_SOURCE,
+  DERIVE_FROM_MASTER_FIELD,
+  // THE shared derive-only gate (money) — one definition, imported by both
+  // this render loop and services/adRegenerateService. Do not re-implement.
+  resolveDeriveFromMaster
+} = require('../services/campaignAdsGenerationService');
 const { summarizeEmptyExpansion, REASON: PER_PRODUCT_REASON } = require('../services/perProductReasons');
-const { assertGeneratablePlatformFormat } = require('../services/platformFormats');
+const { assertGeneratablePlatformFormat, resolveExplicitFormats } = require('../services/platformFormats');
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
+const ugcVideoPipeline = require('../services/ugcVideoPipeline');
+
+// Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
+// Bound waits so a permanently-missing master cannot spin forever across
+// /runs claims. Each claim→wait→requeue cycle counts as one attempt
+// (renderAttempts). ~30 cycles is generous vs a ~2–4 min Omni master.
+const MAX_DERIVE_WAIT_ATTEMPTS = 30;
+// In-render wait for the sibling master's plate. An Omni master settles in
+// roughly 2 minutes; 12 minutes leaves generous headroom for a slow poll
+// or a queued master behind a busy pool, while still bounding the slot.
+// Waiting costs nothing — the derive path never submits.
+const DERIVE_MASTER_WAIT_MS = Number(process.env.DERIVE_MASTER_WAIT_MS || 12 * 60 * 1000);
+const DERIVE_MASTER_POLL_MS = Number(process.env.DERIVE_MASTER_POLL_MS || 10 * 1000);
 const { loadCategoryChainForProduct } = require('../services/categoryChainService');
 const { deleteFromCloudinary } = require('../services/cloudinaryService');
 const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
@@ -48,8 +72,34 @@ const { adStage } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 const {
-  generationGateDecision, normalizeProductIdList, pickSupersedingRun
+  generationGateDecision, normalizeProductIdList, pickSupersedingRun,
+  computeRequestFingerprint, renderClaimFingerprint
 } = require('../services/generationGate');
+
+// Operator-facing gate for a multi-select format list (preset 'explicit'),
+// shared by /preview + /generate.
+//
+// This mirrors the two-layer rule already in force for a single
+// platformFormat, and BOTH layers are load-bearing:
+//   * resolvePreset's filterLiveFormats is the MONEY BELT — a coming_soon key
+//     can never reach an Ad payload, whatever a caller sends.
+//   * this assert is the OPERATOR GATE — it says which surface is unavailable
+//     instead of silently queueing fewer sizes than were ticked, which would
+//     read as "generated" while quietly delivering less.
+// An UNKNOWN key deliberately falls through here (same as
+// assertGeneratablePlatformFormat) and is dropped by the belt.
+function assertGeneratableFormatList(list, field) {
+  if (list == null) return;
+  if (!Array.isArray(list)) {
+    const err = new Error(`${field} must be an array of platform format keys`);
+    err.status = 400;
+    throw err;
+  }
+  for (const raw of list) {
+    if (raw == null || String(raw).trim() === '') continue;
+    assertGeneratablePlatformFormat(String(raw).trim());
+  }
+}
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
 // Returns { ok:true, fields } or { ok:false, status, error }.
@@ -192,17 +242,23 @@ router.post('/preview', async (req, res) => {
       // "All static formats" wizard button. See expandWizardJob for what
       // this actually does — each additional format is a separate billable
       // image generation, not a crop. Ignored for named presets.
-      expandStaticFormats = false
+      expandStaticFormats = false,
+      // Operator multi-select surfaces — preset 'explicit' only.
+      staticFormats = [],
+      videoFormats  = []
     } = req.body || {};
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
     // Refuse an explicitly named coming_soon format with 400 (not empty/500).
     try {
       if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+      assertGeneratableFormatList(staticFormats, 'staticFormats');
+      assertGeneratableFormatList(videoFormats, 'videoFormats');
     } catch (e) {
       if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
         return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
       }
+      if (e.status === 400) return res.status(400).json({ error: e.message });
       throw e;
     }
 
@@ -231,6 +287,8 @@ router.post('/preview', async (req, res) => {
       includeBrandMatched,
       videoDurationSec,
       expandStaticFormats,
+      staticFormats,
+      videoFormats,
       directorVariants: phase3.fields.directorVariants,
       seedMediaIds: phase3.fields.seedMediaIds,
       seedPicks: phase3.fields.seedPicks,
@@ -286,7 +344,31 @@ router.post('/generate', async (req, res) => {
       // just platformFormat. EACH SIZE IS A SEPARATE BILLABLE GENERATION.
       // Default false: existing callers get exactly prior behavior.
       // Ignored for named presets (meta_static / meta_all already fan out).
-      expandStaticFormats = false
+      expandStaticFormats = false,
+      // Operator MULTI-SELECT surfaces — preset 'explicit' ONLY.
+      // MONEY: one billable image generation per staticFormats entry per
+      // concept. videoFormats is clamped to <=1 inside resolvePreset.
+      staticFormats = [],
+      videoFormats  = [],
+      // DUPLICATE OVERRIDE — owner 2026-08-10: an identical request is refused,
+      // but *"allow them if the user wants"*. The client re-POSTs the same body
+      // with confirmDuplicate:true plus the acknowledgedRunId it was handed in
+      // the 409. Both are required: the runId is what makes the override
+      // single-use, so a stray second click on "Generate anyway" is refused
+      // against the run the first click just minted instead of billing again.
+      confirmDuplicate = false,
+      acknowledgedRunId = null,
+      // UGC-ads Phase 3 — operator-picked UGC that MUST land at seed index 0.
+      // Explicit rather than inferring "mediaIds[0] must be a UGC" because
+      // mediaIds is the general operator-picked seed list (any Media, catalog
+      // or UGC); a Generate Ads wizard run picking a catalog image must NOT
+      // silently trip the UGC-first cascade. Passing an unrelated id here is
+      // harmless — buildSeededUniverse no-ops when the id isn't in the pool
+      // — but the field is the only signal that the CampaignRun should
+      // persist a seedUgcIds row so regenerate can replay the pick.
+      // Gated by UGC_FIRST_SEEDING inside seededUniverseService — that
+      // switch OFF makes this field a no-op end-to-end.
+      preferUgcMediaId = null
     } = req.body || {};
 
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
@@ -294,15 +376,49 @@ router.post('/generate', async (req, res) => {
     // Refuse coming_soon before minting a CampaignRun / returning 202.
     try {
       if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+      assertGeneratableFormatList(staticFormats, 'staticFormats');
+      assertGeneratableFormatList(videoFormats, 'videoFormats');
     } catch (e) {
       if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
         return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
       }
+      if (e.status === 400) return res.status(400).json({ error: e.message });
       throw e;
     }
 
     const phase3 = parsePhase3WizardFields(req.body || {});
     if (!phase3.ok) return res.status(phase3.status).json({ error: phase3.error });
+
+    // Normalise the multi-select lists through the SAME resolver the expansion
+    // will use, and hash/forward THOSE rather than the raw body arrays.
+    //
+    // This is a money guard, not hygiene. The duplicate gate exists to catch a
+    // repeat of the same request, and "the same request" has to mean the same
+    // BILLABLE SURFACE SET — not the same JSON. Two bodies that resolve
+    // identically (a video-only key sent in staticFormats and then dropped, a
+    // duplicate tick, two tick orders, junk lists left on a named preset) would
+    // otherwise fingerprint differently, so a genuine double-click would not
+    // register as one and the second click would bill a second full set of
+    // static generations. Static is the unprotected half: its identityDigest is
+    // scoped to generationRunId, so nothing downstream collides.
+    const isExplicitPreset = preset === 'explicit';
+    const resolvedExplicit = isExplicitPreset
+      ? resolveExplicitFormats({ staticFormats, videoFormats })
+      : { staticFormats: [], videoFormats: [], kinds: [] };
+
+    // An explicit selection that resolves to NOTHING must not mint a run. It
+    // would 202, expand to zero and settle as terminal `done` — a run that
+    // looks successful and produced no ads. Reachable whenever the client posts
+    // preset:'explicit' with an empty (or entirely coming_soon / unknown)
+    // selection, which is exactly what an un-ticked picker sends.
+    if (isExplicitPreset
+        && !resolvedExplicit.staticFormats.length
+        && !resolvedExplicit.videoFormats.length) {
+      return res.status(400).json({
+        error: 'Select at least one ad size that is available to generate.',
+        code:  'NO_GENERATABLE_FORMAT'
+      });
+    }
 
     // Per-ad video duration from the wizard. Optional; when present must
     // be an integer 1..15. null/''/absent → service default (standard 8s).
@@ -343,11 +459,12 @@ router.post('/generate', async (req, res) => {
     //      the run to status='running' with total set and start the render
     //      loop. Errors land the run as status='failed' with a single
     //      error entry so the UI can surface them.
-    // CONCURRENT GENERATIONS: allowed when their product sets are DISJOINT,
-    // blocked when they overlap. Checked in the DATABASE, not in memory:
-    // services/inFlight.js is per-process and this web service autoscales across
-    // several Render instances, so two clicks can land on two processes that
-    // cannot see each other.
+    // CONCURRENT GENERATIONS: allowed unless the request is IDENTICAL to one
+    // already in flight (or to one that recently finished, which is refused once
+    // and then allowed on explicit confirmation). Checked in the DATABASE, not
+    // in memory: services/inFlight.js is per-process and this web service
+    // autoscales across several Render instances, so two clicks can land on two
+    // processes that cannot see each other.
     //
     // This guard is load-bearing as of 2026-08-01. Until the identityDigest was
     // scoped to the run, a double-click was silently free — the second run's ads
@@ -359,36 +476,123 @@ router.post('/generate', async (req, res) => {
     // this case — each run claims the ads it just minted, so there is no race to
     // lose. Every generation POST is charged on submit (CLAUDE.md §2).
     //
-    // It was ONE run per campaign until 2026-08-03, which also blocked a second
-    // batch of different products — a parallel run the team legitimately wants.
-    // The overlap rule (services/generationGate.js) keeps the double-click
-    // protection exactly where the money is and nowhere else; that module owns
-    // the reasoning, including why format/preset is deliberately not part of it.
+    // It was ONE run per campaign until 2026-08-03, then PRODUCT OVERLAP until
+    // 2026-08-10. Both blocked runs the team legitimately wants: overlap refused
+    // a second, different request over the same product, and — because it failed
+    // CLOSED on an unreadable product scope — it refused MEDIA-LIBRARY runs
+    // outright, since those legitimately carry productIds:[]. The key is now the
+    // REQUEST FINGERPRINT. services/generationGate.js owns the reasoning,
+    // including the digest evidence that video cannot double-bill across runs at
+    // all (its identity digest is run-independent, so the unique index catches
+    // it) and that duplicate STATIC sets are owner-sanctioned creative rather
+    // than a double charge.
     //
     // Stale runs are not allowed to lock a campaign forever: a 'preparing' or
     // 'running' row older than the render ceiling is treated as dead. That bound
     // is REAP_STALE_MIN, the same one worker.js uses to reclaim stuck ads, so the
     // two cannot drift into disagreeing about what "stale" means.
     const staleMin = Number(process.env.REAP_STALE_MIN || 15);
+
+    // The fingerprint is built from the PARSED values, not raw req.body, so the
+    // hash sees exactly what the expansion will (parsedVideoDurationSec, the
+    // validated phase3 fields). Anything the handler does not read must stay out
+    // — see the trap note in services/generationGate.js.
+    const requestFingerprint = computeRequestFingerprint({
+      campaignId,
+      productIds,
+      mediaIds,
+      templateIds,
+      preset,
+      platformFormat,
+      // Under 'explicit' the resolver IGNORES both of these (verified: the only
+      // reads of requestedKinds / expandStaticFormats in expandWizardJob are the
+      // two arguments it hands to resolvePreset). Hashing a field the handler
+      // ignores is the false-ALLOW half of the trap in generationGate.js — it
+      // makes two identical-output requests look different and lets a real
+      // double-click through — so they are zeroed on that path.
+      kinds:               isExplicitPreset ? null  : kinds,
+      expandStaticFormats: isExplicitPreset ? false : expandStaticFormats,
+      // The RESOLVED surface sets — what will actually bill. See the
+      // normalisation note above for why the raw arrays must not be hashed.
+      // Empty for every non-explicit preset, which is correct: those presets
+      // ignore the lists entirely, so leftover client state cannot change the
+      // hash of an otherwise-identical request.
+      staticFormats: resolvedExplicit.staticFormats,
+      videoFormats:  resolvedExplicit.videoFormats,
+      includeCategoryMatched,
+      includeBrandMatched,
+      excludePairings,
+      cta,
+      urlParams,
+      videoDurationSec: parsedVideoDurationSec,
+      directorVariants:     phase3.fields.directorVariants,
+      seedPicks:            phase3.fields.seedPicks,
+      seedMediaIds:         phase3.fields.seedMediaIds,
+      videoPromptGuidance:  phase3.fields.videoPromptGuidance,
+      videoPromptRaw:       phase3.fields.videoPromptRaw
+      // `refresh` is intentionally not passed — it never reaches expandWizardJob,
+      // so it cannot change the output. computeRequestFingerprint documents why
+      // hashing a dead field would be a money bug, not a harmless extra.
+    });
+    const ackRunId = confirmDuplicate && acknowledgedRunId ? String(acknowledgedRunId) : null;
+
     const activeRuns = await CampaignRun.find({
       campaignId,
       status: { $in: ['preparing', 'running'] },
       createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
-    }).select('runId status createdAt requestedProductIds').lean();
-    const gate = generationGateDecision({ activeRuns, requestedProductIds: productIds });
+    }).select('runId status createdAt requestedProductIds requestFingerprint').lean();
+
+    // The most recent FINISHED run making this exact request, for the
+    // "you already ran this" notice. Bounded by DUPLICATE_LOOKBACK_MIN (default
+    // 24h) so the lookup stays indexed and a month-old run does not nag forever.
+    // Skipped entirely once the user has confirmed — no point querying for a
+    // conflict we have already been told to ignore.
+    //
+    // `total: { $gt: 0 }` is load-bearing, not a tidy-up. The notice exists to say
+    // "this already produced ads and cost money", so a run that minted nothing
+    // must not raise it. Two kinds of row would otherwise do exactly that, and
+    // both are rows THIS handler writes: the mint-then-verify loser (marked
+    // 'failed' at stage 'gate', total 0, nothing generated or charged) and a run
+    // that failed during expansion. Without this filter, losing a harmless
+    // double-click race would make the operator's next honest attempt demand a
+    // confirmation for work that never happened.
+    const dupLookbackMin = Number(process.env.DUPLICATE_LOOKBACK_MIN || 1440);
+    const priorRun = ackRunId ? null : await CampaignRun.findOne({
+      campaignId,
+      requestFingerprint,
+      status: { $in: ['done', 'failed'] },
+      total: { $gt: 0 },
+      createdAt: { $gte: new Date(Date.now() - dupLookbackMin * 60 * 1000) }
+    }).select('runId status createdAt requestFingerprint total').sort({ createdAt: -1 }).lean();
+
+    const gate = generationGateDecision({
+      activeRuns,
+      priorRun,
+      fingerprint: requestFingerprint,
+      requestedProductIds: productIds,
+      acknowledgedRunId: ackRunId
+    });
     if (gate.blocked) {
-      const conflict = activeRuns.find(r => String(r.runId) === String(gate.conflictRunId)) || activeRuns[0];
-      const error = gate.reason === 'product-overlap'
-        ? `A generation is already running for ${gate.overlap.length} of the selected product(s). ` +
-          'Wait for it to finish, or start a run for different products — those run in parallel.'
-        : 'A generation is already running for this campaign. Wait for it to finish, or reload to see its progress.';
+      const conflict =
+        activeRuns.find(r => String(r.runId) === String(gate.conflictRunId)) ||
+        (priorRun && String(priorRun.runId) === String(gate.conflictRunId) ? priorRun : null);
+      const error = gate.reason === 'duplicate-of-previous'
+        ? 'You already ran this exact request. Generating again will produce new creative ' +
+          'and will be billed again — confirm to run it anyway.'
+        : 'This exact request is already generating. Wait for it to finish, or confirm to ' +
+          'run it a second time — that produces new creative and is billed again.';
       return res.status(409).json({
         error,
         code: 'generation-already-running',
         reason: gate.reason,
-        runId: conflict?.runId,
-        startedAt: conflict?.createdAt,
-        overlappingProductIds: gate.overlap || []
+        // The client re-POSTs the same body with confirmDuplicate:true and this
+        // value as acknowledgedRunId to proceed. Single-use by construction: it
+        // names the run the user was shown, so a second stray confirm collides
+        // with the newly minted run instead and is refused again.
+        confirmable: gate.confirmable === true,
+        acknowledgeRunId: gate.acknowledgeRunId || null,
+        runId: conflict?.runId || gate.conflictRunId || null,
+        startedAt: conflict?.createdAt || null
       });
     }
 
@@ -427,34 +631,54 @@ router.post('/generate', async (req, res) => {
       startedAt:    new Date(),
       // Scope for the concurrency gate above. MUST be written here, at mint
       // time: the gate runs while sibling runs are still 'preparing', long
-      // before the expansion fills perProduct. An unstamped run reads as
-      // "scope unknown" and blocks every concurrent Generate on the campaign.
-      requestedProductIds: normalizeProductIdList(productIds)
+      // before the expansion fills perProduct.
+      requestedProductIds: normalizeProductIdList(productIds),
+      // What the gate actually compares now. MUST be written at mint time for
+      // the same reason, and an unstamped run is no longer safe-by-default in the
+      // other direction: a run with no fingerprint cannot be proven identical to
+      // anything, so it will NOT block a sibling (deliberate — see the fail-open
+      // note in services/generationGate.js). Dropping this write would silently
+      // disable double-click protection rather than over-block.
+      requestFingerprint,
+      // UGC-ads Phase 3. Persisted here (not at expansion time) so a run that
+      // gets superseded by the concurrency gate still records the operator's
+      // intent — matters for the wizard's "which UGC did this run seed?"
+      // diagnostics. adRegenerateService reads seedUgcIds[0] as the ref-1
+      // override; single-entry list is the Phase 2 wizard's MVP shape, array
+      // leaves room for Phase 7's batch (one seed per expanded product).
+      seedUgcIds: preferUgcMediaId ? [String(preferUgcMediaId)] : []
     });
 
     // MINT-THEN-VERIFY — closes the read-then-write race in the gate above.
     // Two clicks can both read activeRuns before either row exists, both see an
     // idle campaign, and both go on to expand and bill. Now that our own run IS
-    // inserted, re-read: if an EARLIER in-flight run already claimed any of these
-    // products, we are the loser and abort here — before expandWizardJob, so
+    // inserted, re-read: if an EARLIER in-flight run already made this exact
+    // request, we are the loser and abort here — before expandWizardJob, so
     // nothing has been minted or charged. services/generationGate.js owns the
     // ordering rule; both racers compute the same winner, so exactly one aborts.
+    //
+    // This is also what keeps the duplicate OVERRIDE from being a hole: two
+    // simultaneous "Generate anyway" clicks both carry the same
+    // acknowledgedRunId, so neither is excused from the other, and the later one
+    // still aborts here.
     const superseding = pickSupersedingRun({
       selfRun: { runId, createdAt: run.createdAt },
       activeRuns: await CampaignRun.find({
         campaignId,
         status: { $in: ['preparing', 'running'] },
         createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
-      }).select('runId status createdAt requestedProductIds').lean(),
-      requestedProductIds: productIds
+      }).select('runId status createdAt requestedProductIds requestFingerprint').lean(),
+      fingerprint: requestFingerprint,
+      requestedProductIds: productIds,
+      acknowledgedRunId: ackRunId
     });
     if (superseding) {
       console.warn(
         `⚠️  [campaignRun ${runId}] superseded by concurrent run ${superseding.runId} ` +
-        `on ${superseding.overlap.length || 'unscoped'} overlapping product(s) — aborting before expand`
+        `making the identical request — aborting before expand`
       );
       // Do NOT swallow this write. A loser left in 'preparing' is a zombie that
-      // blocks its own products for the whole stale window — the exact
+      // blocks its own request for the whole stale window — the exact
       // false-block this change exists to remove. If the update fails, drop the
       // row instead: it describes work that never happened, so there is nothing
       // worth keeping, and a lingering lock is the more expensive outcome.
@@ -472,16 +696,19 @@ router.post('/generate', async (req, res) => {
         );
         await CampaignRun.deleteOne({ _id: run._id }).catch(e =>
           console.error(`❌ [campaignRun ${runId}] delete also failed: ${e.message} — ` +
-            `row may block overlapping products until the stale window expires`));
+            `row may block an identical request until the stale window expires`));
       }
       return res.status(409).json({
-        error: 'Another generation for these products started at the same moment. ' +
-               'Nothing was generated or charged for this request — watch the other run.',
+        error: 'An identical generation started at the same moment. Nothing was generated ' +
+               'or charged for this request — watch the other run.',
         code: 'generation-already-running',
         reason: 'raced-concurrent-run',
+        // Deliberately NOT confirmable. The user already confirmed if they got
+        // here via the override; re-offering it on a photo-finish race would just
+        // invite the double-spend the race check exists to stop.
+        confirmable: false,
         runId: superseding.runId,
-        startedAt: superseding.createdAt,
-        overlappingProductIds: superseding.overlap || []
+        startedAt: superseding.createdAt
       });
     }
 
@@ -492,7 +719,12 @@ router.post('/generate', async (req, res) => {
       campaignKind:  campaignDoc.kind || 'product',
       total:         0,
       queuedRemaining: 0,
-      status:        'preparing'
+      status:        'preparing',
+      // Non-blocking information, not a verdict. Set when a DIFFERENT request is
+      // already running over some of the same products — allowed by owner
+      // direction, but the operator should still see that both will be billed.
+      // null on the common path.
+      notice: gate.notice || null
     });
 
     setImmediate(async () => {
@@ -531,6 +763,12 @@ router.post('/generate', async (req, res) => {
           includeBrandMatched,
           videoDurationSec: parsedVideoDurationSec,
           expandStaticFormats,
+          // The SAME resolved lists that were fingerprinted. resolveExplicitFormats
+          // is idempotent, so forwarding these rather than the raw arrays changes
+          // nothing about what is generated — it just makes it impossible for the
+          // hashed set and the generated set to drift apart.
+          staticFormats: isExplicitPreset ? resolvedExplicit.staticFormats : staticFormats,
+          videoFormats:  isExplicitPreset ? resolvedExplicit.videoFormats  : videoFormats,
           directorVariants: phase3.fields.directorVariants,
           seedMediaIds: phase3.fields.seedMediaIds,
           seedPicks: phase3.fields.seedPicks,
@@ -540,7 +778,11 @@ router.post('/generate', async (req, res) => {
           // the same campaign produces two sets of ads instead of the second one
           // colliding with the first and expanding to nothing.
           generationRunId: run.runId,
-          requestedBy: req.user?.userId || null
+          requestedBy: req.user?.userId || null,
+          // UGC-ads Phase 3. Threaded through so buildSeededUniverse can
+          // hoist this Media to seed index 0. Gated on UGC_FIRST_SEEDING
+          // inside the service — flag OFF is byte-identical to omitting it.
+          preferUgcMediaId
         });
 
         // `newlyQueued`, NOT `queuedCount`. queuedCount is
@@ -965,7 +1207,13 @@ router.post('/runs', express.json(), async (req, res) => {
       status:       'running',
       requestedBy:  req.user?.userId || null,
       startedAt:    new Date(),
-      requestedProductIds: claimedProductIds
+      requestedProductIds: claimedProductIds,
+      // A render claim is not a generation request — it mints no ads and bills no
+      // expansion, so it must never be mistaken for "the same request" as a
+      // /generate and block one. Namespaced + unique per run, which is what makes
+      // that true; leaving it null would fall into the product-set compat
+      // comparison and refuse legitimate generates indefinitely.
+      requestFingerprint: renderClaimFingerprint(runId)
     });
 
     res.status(202).json({
@@ -1267,6 +1515,323 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   }
 }
 
+/**
+ * Look up the sibling master Ad for a derive-only crop / funnel retitle.
+ * Prefer masters that share a campaignRunId with this ad (same run scope);
+ * fall back to the newest matching master on the campaign+product.
+ *
+ * MUST exclude other derive-only / funnel-variant ads: funnel variants of
+ * a 9:16 master share platformFormat with the master, so an unfiltered
+ * query can return a sibling variant that never holds its own plate —
+ * the waiter would then hang on a free surface that itself is waiting.
+ * A true master has no deriveFromMaster and no funnelStage.
+ */
+async function findSiblingMasterAd(ad, masterPlatformFormat) {
+  const base = {
+    campaignId: ad.campaignId,
+    productId: ad.productId,
+    platformFormat: masterPlatformFormat,
+    kind: 'video',
+    _id: { $ne: ad._id },
+    // True master only — no derive marker, no funnel retitle.
+    $and: [
+      { $or: [{ deriveFromMaster: null }, { deriveFromMaster: { $exists: false } }] },
+      { $or: [{ funnelStage: null }, { funnelStage: { $exists: false } }] }
+    ]
+  };
+  const runIds = Array.isArray(ad.campaignRunIds)
+    ? ad.campaignRunIds.map(String).filter(Boolean)
+    : [];
+  if (runIds.length) {
+    const inRun = await Ad.findOne({
+      ...base,
+      campaignRunIds: { $in: runIds }
+    }).sort({ generatedAt: -1 }).lean();
+    if (inRun) return inRun;
+  }
+  return Ad.findOne(base).sort({ generatedAt: -1 }).lean();
+}
+
+/**
+ * Google PMax derive-only / funnel-variant render.
+ *
+ * Covers:
+ *   - pmax_video_1_1 free crop of the settled 9:16 master
+ *   - funnel-stage retitles of any already-paid master plate (and of the
+ *     free 1:1 crop) — awareness / consideration / conversion
+ *
+ * MONEY: zero Omni / atlasVideoService submits in this function. The base
+ * plate is the sibling master's already-paid veoVideoUrl; face-safe crop
+ * (only when aspect differs) + Remotion titling run against that URL.
+ * Cost ledger: no video cost row for this ad (it spends nothing at Omni);
+ * face-detect costs stay whatever basePlateCropService already records.
+ *
+ * Sequencing: do NOT rely on FIFO claim order. Concurrent VEO_CONCURRENCY
+ * means the derive ad can start before the master. If master is still
+ * queued/rendering without a veoVideoUrl → polite requeue (status back
+ * to queued) with a bounded attempt counter. If master failed/absent →
+ * fail honestly. NEVER fall back to a local Omni submit.
+ *
+ * Funnel preset selection is owned by brandScriptExecutor
+ * (resolveFunnelPresetOverride from ad.funnelStage) so buildMetaForAd
+ * and resolveSpec receive the SAME override — do not pass a second path.
+ */
+async function renderDeriveOnlyVideoAd({
+  run, job, ad, adId, index, creative, deriveFromFmt
+}) {
+  // ASSERT (money): this function must not call veoGenerateForAd,
+  // veoPrepareStoryboard, atlasVideoService.generateForAd, or any
+  // billable video submit helper. Crop + titling only. Funnel variants
+  // share this function — a separate path is how a regenerate hole
+  // previously opened.
+  const funnelNote = ad.funnelStage ? ` funnel=${ad.funnelStage}` : '';
+  adStage(adId, `derive-only wait for master (${deriveFromFmt})${funnelNote}`);
+
+  // ── Wait IN-RENDER for the master, don't bounce straight to 'queued' ──
+  // The whole run is dispatched in one wave (VEO_CONCURRENCY defaults to
+  // 12), so on EVERY first Google run the master is still 'rendering' with
+  // no plate when the derive ad starts — an immediate requeue therefore
+  // fired every time. And nothing drains a 'queued' ad afterwards: the
+  // reaper and the stranded sweeper only look at 'rendering' ads / failed
+  // runs, and pressing Generate again short-circuits ("Nothing to render")
+  // because the deterministic video digest is run-independent by design.
+  // The 1:1 stranded, and both operator work-arounds cost money.
+  //
+  // So poll here instead. This burns no billable work — it holds a render
+  // slot while an already-paid master finishes (~2min typical) — and the
+  // requeue below survives as the safety valve for the pathological case.
+  let master = await findSiblingMasterAd(ad, deriveFromFmt);
+  if (!master?.veoVideoUrl && master
+      && (master.status === 'queued' || master.status === 'rendering')) {
+    const deadline = Date.now() + DERIVE_MASTER_WAIT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, DERIVE_MASTER_POLL_MS));
+      master = await findSiblingMasterAd(ad, deriveFromFmt);
+      if (master?.veoVideoUrl) break;
+      // Master reached a terminal state with no plate — stop waiting and
+      // let the honest-failure branch below report it.
+      if (!master || (master.status !== 'queued' && master.status !== 'rendering')) break;
+      adStage(adId, `derive-only: waiting for master ${deriveFromFmt} plate`);
+    }
+  }
+  const attempts = Number(ad.renderAttempts) || 0;
+
+  // Master settled = holds a paid plate URL. status may be draft (post-
+  // master, pre/post-titling), live, or even failed-after-titling with
+  // the master kept — any of those with veoVideoUrl is usable.
+  if (master?.veoVideoUrl) {
+    // fall through to derive below
+  } else if (
+    master &&
+    (master.status === 'queued' || master.status === 'rendering')
+  ) {
+    // Polite requeue — master still in flight. Bound attempts so a
+    // stuck master cannot spin forever across /runs claims.
+    if (attempts >= MAX_DERIVE_WAIT_ATTEMPTS) {
+      const msg =
+        `derive-only: master ${deriveFromFmt} still unsettled after ` +
+        `${attempts} wait(s); refusing Omni fallback`;
+      console.warn(`⚠️  [derive-only ad=${adId}] ${msg}`);
+      await Ad.updateOne(
+        { _id: adId },
+        {
+          $set: {
+            status: 'failed',
+            renderError: { message: msg, stage: 'derive-wait-exhausted', at: new Date() },
+            renderStage: 'derive-only: master wait exhausted (no Omni fallback)',
+            renderStageAt: new Date(),
+            updatedAt: new Date()
+          },
+          $inc: { renderAttempts: 1 }
+        }
+      );
+      await CampaignRun.updateOne(
+        { _id: run._id },
+        {
+          $inc: { failed: 1 },
+          $push: { errors: buildErrorEntry(creative, index, 'derive-wait', new Error(msg)) }
+        }
+      );
+      return;
+    }
+    const waitN = attempts + 1;
+    const stageNote =
+      `derive-only: waiting for master ${deriveFromFmt} ` +
+      `(attempt ${waitN}/${MAX_DERIVE_WAIT_ATTEMPTS})`;
+    console.log(`⏳ [derive-only ad=${adId}] ${stageNote} — requeue`);
+    // Release claim → queued so a later selectAdsForRun /runs claim can
+    // retry after the master lands. Do NOT leave status:'rendering' (reaper
+    // / stranded paths) and do NOT submit Omni.
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status: 'queued',
+          renderStage: stageNote.slice(0, 200),
+          renderStageAt: new Date(),
+          updatedAt: new Date()
+        },
+        $inc: { renderAttempts: 1 }
+      }
+    );
+    // Count as skipped for this run (will reappear on a subsequent claim).
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      {
+        $inc: { skipped: 1 },
+        $push: {
+          errors: {
+            index,
+            stage: 'derive-wait',
+            message: stageNote
+          }
+        }
+      }
+    );
+    return;
+  } else {
+    // Master absent, failed without a plate, or archived — fail honestly.
+    // WHY no Omni fallback: that would be a hidden billable submit the
+    // operator never asked for on a surface marketed as free derivation.
+    const why = !master
+      ? `no sibling master ad (${deriveFromFmt}) for product`
+      : `master status=${master.status} has no veoVideoUrl`;
+    const msg = `derive-only failed: ${why} — not submitting Omni`;
+    console.warn(`⚠️  [derive-only ad=${adId}] ${msg}`);
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status: 'failed',
+          renderError: { message: msg, stage: 'derive-no-master', at: new Date() },
+          renderStage: 'derive-only: master missing/failed (no Omni fallback)',
+          renderStageAt: new Date(),
+          updatedAt: new Date()
+        },
+        $inc: { renderAttempts: 1 }
+      }
+    );
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      {
+        $inc: { failed: 1 },
+        $push: { errors: buildErrorEntry(creative, index, 'derive-no-master', new Error(msg)) }
+      }
+    );
+    return;
+  }
+
+  // ── Derive from settled master plate ──────────────────────────────
+  // Copy the master's paid URL as THIS ad's base plate. Titling
+  // (brandScriptExecutor → basePlateCropService) face-crops 9:16 → 1:1
+  // because classifyFormat(pmax_video_1_1 / aspect 1:1) → 'square'.
+  const veoVideoUrl = master.veoVideoUrl;
+  const veoAspectRatio = master.veoAspectRatio || '9:16';
+  const fallbackPosterUrl = veoVideoUrl?.includes('/video/upload/')
+    ? veoVideoUrl
+        .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good/')
+        .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
+    : null;
+
+  // Load brand for titling (same projection as the master path).
+  const sourceMedia = await Media.findById(ad.mediaId)
+    .select('fileType fileUrl brandId').lean();
+  const brandDoc = sourceMedia?.brandId
+    ? await Brand.findById(sourceMedia.brandId)
+        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
+    : null;
+
+  // Stamp draft + plate BEFORE titling — same money discipline as the
+  // master path: untitled is not success; reaper must not requeue a
+  // mid-titling ad into a path that could bill (derive path still won't
+  // bill, but draft is the shared invariant).
+  await Ad.updateOne(
+    { _id: adId },
+    {
+      $set: {
+        status:             'draft',
+        kind:               'video',
+        veoVideoUrl,
+        veoAspectRatio,
+        // Audit: no model ran for this ad. Marker is explicit so cost
+        // reconcilers / inspectors never attribute an Omni charge here.
+        veoModel:           `derive-from:${deriveFromFmt}`,
+        veoPrompt:          null,
+        veoStoryboard:      null,
+        veoReferenceImages: [],
+        renderUrl:          veoVideoUrl,
+        posterUrl:          fallbackPosterUrl || veoVideoUrl,
+        sourceFileType:     'video',
+        renderedAt:         new Date(),
+        updatedAt:          new Date(),
+        renderStage:        `derive-only plate from ${deriveFromFmt}`,
+        renderStageAt:      new Date()
+      },
+      $inc: { renderAttempts: 1 }
+    }
+  );
+
+  const adFinal = await Ad.findById(adId).lean();
+  let titlingFailed = null;
+  if (brandDoc) {
+    try {
+      const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
+      const waitingFor = veoTitlingSemaphore.waiting;
+      if (waitingFor > 0 || veoTitlingSemaphore.available === 0) {
+        adStage(adId, `queued for titling (${waitingFor} ahead)`);
+      }
+      const chromeOut = await veoTitlingSemaphore.withPermit(async () => {
+        adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '1:1'} (derive-only)`);
+        return renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+      });
+      if (chromeOut?.skipped) {
+        adStage(adId, `no titling (${chromeOut.reason || 'no-chrome'}) — shipping derived plate`);
+      }
+    } catch (scriptErr) {
+      titlingFailed = scriptErr;
+      console.warn(
+        `⚠️ brandScript[ad=${adId}] derive-only: titling failed — plate kept, not counted as success: ${scriptErr.message}`
+      );
+    }
+  }
+
+  if (titlingFailed) {
+    const tmsg = `derived plate ready; titling failed: ${titlingFailed.message || titlingFailed}`;
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status: 'failed',
+          renderError: { message: tmsg, stage: 'titling', at: new Date() },
+          renderStage: 'derived plate ready; titling failed',
+          renderStageAt: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      {
+        $inc:  { failed: 1 },
+        $push: { errors: buildErrorEntry(creative, index, 'titling', titlingFailed) }
+      }
+    );
+  } else {
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status:     'draft',
+          renderedAt: new Date(),
+          updatedAt:  new Date()
+        }
+      }
+    );
+    await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
+    adStage(adId, 'done');
+  }
+}
+
 async function renderOne(run, job, adId, index, renderToken) {
   // HEARTBEAT — this is a money guard, not telemetry.
   //
@@ -1320,6 +1885,24 @@ async function renderOneInner(run, job, adId, index, renderToken) {
   // ── Veo render path ────────────────────────────────────────────────
   if (ad.renderRoute === 'veo') {
     try {
+      // ── DERIVE-ONLY (Google PMax 1:1) ────────────────────────────────
+      // MONEY-CRITICAL: this branch must NEVER call veoGenerateForAd /
+      // atlasVideoService.generateForAd / any Omni submit. A fall-through
+      // to the master path below is a hidden ~$0.75–$1.20 per product.
+      // ASSERT: zero atlasVideoService submit calls in this block.
+      //
+      // Detection (either is sufficient — belt and braces):
+      //   1. platformFormat === pmax_video_1_1 (always derive-only by design)
+      //   2. ad[deriveFromMaster] set at mint time (needs models/Ad.js field;
+      //      until then Mongoose strict may drop it — (1) is the fail-closed gate)
+      const deriveFromFmt = resolveDeriveFromMaster(ad);
+      if (deriveFromFmt) {
+        await renderDeriveOnlyVideoAd({
+          run, job, ad, adId, index, creative, deriveFromFmt
+        });
+        return;
+      }
+
       // Load brand + source media up front. The Grok-skip check needs
       // sourceMedia.fileType; the brand-script overlay needs brandDoc.
       const sourceMedia = await Media.findById(ad.mediaId)
@@ -1352,8 +1935,62 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       let veoVideoUrl, veoAspectRatio, veoPrompt = null, veoStoryboard = null, veoCloudinaryPublicId = null;
       let veoModel = null;   // stays null on the Cloudinary-segment path — no model ran
       let veoReferenceImages = [];
+      // UGC-ads Phase 5 — passthrough skip signal. Set when the ugcVideo
+      // pipeline determined the ad should be skipped (mirror failed,
+      // segment build failed). The dispatcher HANDLES the skip explicitly
+      // below rather than falling through to Omni, because a fall-through
+      // is exactly the surprise-$3-charge scenario the phase exists to
+      // close. Null when passthrough succeeded OR was declined for a
+      // non-fatal reason (flag off, not a UGC video, etc.) — the flag-off
+      // + not-eligible cases proceed to the existing branch below.
+      let ugcPassthroughSkip = null;
 
+      // UGC-ads Phase 5 — before the existing isVideoSeed branch, ask the
+      // ugcVideoPipeline whether this ad qualifies for the mirror-and-
+      // passthrough short-path. The service handles:
+      //   • kill switch check (UGC_VIDEO_PASSTHROUGH, default OFF)
+      //   • UGC-video eligibility (fileType='video' + UGC source or
+      //     operator/branding/promotional assignment)
+      //   • Cloudinary mirror if URL isn't already hosted there
+      //   • segment URL construction
+      // Only takes effect when passthrough succeeds; otherwise flow
+      // continues into the existing isVideoSeed / Grok branches below.
       if (isVideoSeed) {
+        const ugcResult = await ugcVideoPipeline.preparePassthroughMaster({
+          media:         sourceMedia,
+          aspectRatio:   ad.aspectRatio || '9:16',
+          durationSec:   8
+        });
+        if (ugcResult.passthrough) {
+          veoVideoUrl    = ugcResult.videoUrl;
+          veoAspectRatio = ugcResult.aspectRatio;
+          adStage(adId, ugcResult.mirrored
+            ? 'ugc-video mirrored + passthrough (no generation)'
+            : 'ugc-video passthrough (no generation)');
+          console.log(
+            `🎬 [ugc-video] ad=${adId} passthrough → skip Omni ` +
+            `(mirrored=${ugcResult.mirrored}, aspect=${veoAspectRatio})`
+          );
+        } else if (ugcResult.skip) {
+          // Mirror failed or segment build failed — do NOT silently fall
+          // through to Omni (would be a surprise ~$3 charge). Skip the
+          // ad, let the operator retry.
+          ugcPassthroughSkip = ugcResult;
+          console.warn(
+            `⚠️  [ugc-video] ad=${adId} passthrough SKIP: ${ugcResult.code} — ${ugcResult.reason}`
+          );
+        }
+        // else: not eligible / flag off — fall through to the existing
+        // Cloudinary-segment or Grok branch below.
+      }
+
+      // Existing Cloudinary-segment branch — kept as the second attempt
+      // when Phase 5 declined (flag off or not a UGC video). Fires for
+      // catalog-product videos and for any video-seed path that isn't
+      // routed through the ugcVideoPipeline. Non-Cloudinary URL still
+      // warns + falls through to Grok — that is the pre-Phase-5 behaviour
+      // for non-UGC video seeds and is not something Phase 5 rewrites.
+      if (!veoVideoUrl && !ugcPassthroughSkip && isVideoSeed) {
         const segmentUrl = buildVideoSegmentUrl(sourceMedia.fileUrl, ad.aspectRatio || '9:16', 8);
         if (!segmentUrl) {
           console.warn(
@@ -1369,6 +2006,28 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             `(aspect=${veoAspectRatio}) → ${segmentUrl.slice(0, 120)}…`
           );
         }
+      }
+
+      // UGC passthrough skip — terminal short-circuit. Mirrors the
+      // veoResult.skipped handling below (Omni provider disabled) so
+      // status/renderError/renderStage are all consistent and the poller
+      // sees the same shape.
+      if (ugcPassthroughSkip) {
+        const skipMsg = ugcPassthroughSkip.reason || 'ugc video passthrough skipped';
+        await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
+        await Ad.updateOne(
+          { _id: adId },
+          {
+            $set: {
+              status: 'failed',
+              renderError: { message: skipMsg, stage: 'ugc-passthrough-skipped', at: new Date() },
+              renderStage: `skipped: ${skipMsg}`.slice(0, 200),
+              renderStageAt: new Date(),
+              updatedAt: new Date()
+            }
+          }
+        );
+        return;
       }
 
       // Grok path — fires when the seed is an image OR when the video
@@ -1942,6 +2601,21 @@ router.get('/', async (req, res) => {
     // a capped/sorted page by a dedupe-reused ad's stale generatedAt.
     if (req.query.campaignRunId) filter.campaignRunIds = String(req.query.campaignRunId);
     if (req.query.status)        filter.status         = req.query.status;
+    // UGC-ads Phase 4 — ?mediaId=X returns the ads generated FROM this
+    // source Media (used by the UGC Ads page to render per-row "ads
+    // generated" groups + by the Product Ads UGC-badge deep-link).
+    // Ad.mediaId is ObjectId-typed; cast explicitly for the same reason
+    // brandId/campaignId are cast above ($match won't auto-cast).
+    if (req.query.mediaId) {
+      if (!mongoose.isValidObjectId(String(req.query.mediaId))) {
+        return res.status(400).json({ error: 'mediaId is not a valid ObjectId' });
+      }
+      filter.mediaId = new mongoose.Types.ObjectId(String(req.query.mediaId));
+    }
+    // UGC-ads Phase 4 — ?variantKind=ugc|product_image splits the Product
+    // Ads page into UGC vs product-shot buckets. Column typed as a string
+    // on Ad; direct equality is fine.
+    if (req.query.variantKind) filter.variantKind = String(req.query.variantKind);
     // ?rendered=true → only ads that have actually been rendered to
     // Cloudinary (status in draft|live|archived). Used by surfaces that
     // shouldn't surface the queue (campaign-detail Ads section, etc.).
@@ -2719,7 +3393,56 @@ router.delete('/:id', async (req, res) => {
     if (!ad) return res.status(404).json({ error: 'ad not found' });
     let cloudinary = null;
     if (ad.renderUrl) {
-      cloudinary = await deleteFromCloudinary(ad.renderUrl);
+      // ⚠️ A derive-only ad (Google PMax 1:1) does NOT own its asset. Until
+      // its own titled video is uploaded, its renderUrl IS the sibling 9:16
+      // master's plate URL — destroying it here would delete the video the
+      // master paid for and break that ad too. Only destroy the asset once
+      // this ad has its own upload (its renderUrl no longer points at the
+      // inherited plate). `veoModel` is stamped `derive-from:<fmt>` at mint
+      // and is the durable marker; renderUrl === veoVideoUrl means the
+      // inherited plate is still what is on the row.
+      const isDerived = typeof ad.veoModel === 'string'
+        && ad.veoModel.startsWith('derive-from:');
+      const stillInheritedPlate = isDerived && ad.renderUrl === ad.veoVideoUrl;
+
+      // …and the SAME relationship has to be honoured from the OTHER side.
+      // The check above only asks "is the ad being deleted the child?". A
+      // MASTER never carries the `derive-from:` marker, so deleting the
+      // master fell straight through and destroyed the very asset its
+      // derive-only sibling is still pointing at — the plate the master was
+      // paid for, and the sibling's only source. That sibling cannot heal
+      // itself either: regenerate is refused for derive-only ads by design.
+      // Reachable whenever the 1:1 is mid-titling, or is parked in a
+      // titling-failed state (that branch never rewrites renderUrl, so it
+      // holds the inherited URL indefinitely).
+      let masterOfLiveDerive = false;
+      if (!stillInheritedPlate && ad.platformFormat === PMAX_VIDEO_DERIVE_SOURCE) {
+        try {
+          const dependent = await Ad.findOne({
+            _id:            { $ne: ad._id },
+            brandId,
+            campaignId:     ad.campaignId,
+            productId:      ad.productId,
+            platformFormat: PMAX_VIDEO_DERIVE_ONLY,
+            // Still on the inherited plate: its renderUrl is this master's asset.
+            renderUrl:      ad.renderUrl
+          }).select('_id').lean();
+          masterOfLiveDerive = !!dependent;
+        } catch (err) {
+          // Cannot prove the asset is unused → keep it. An orphaned Cloudinary
+          // file is cheap; destroying a paid plate another ad depends on is not.
+          console.warn(`   ⚠️  ads DELETE: dependent-derive lookup failed (${err.message}) — keeping asset`);
+          masterOfLiveDerive = true;
+        }
+      }
+
+      if (stillInheritedPlate) {
+        cloudinary = { skipped: 'derive-only ad shares its master\'s plate — asset kept' };
+      } else if (masterOfLiveDerive) {
+        cloudinary = { skipped: 'a derive-only sibling still points at this plate — asset kept' };
+      } else {
+        cloudinary = await deleteFromCloudinary(ad.renderUrl);
+      }
     }
     res.json({ ok: true, id: String(ad._id), cloudinary });
   } catch (err) {
@@ -3230,3 +3953,9 @@ module.exports = router;
 module.exports.claimAdsForRun = claimAdsForRun;
 // Consumed by services/strandedRunSweeper via index.js — see requeueStrandedAds.
 module.exports.requeueStrandedAds = requeueStrandedAds;
+// MONEY-CRITICAL, exported for behavioural pinning by
+// scripts/verifyPmaxVideoExpansion.js. This is the gate that keeps a
+// derive-only PMax 1:1 ad out of the billable Omni path; a source-text
+// check alone would pass against a reimplementation that kept the name,
+// so the harness calls the real function.
+module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;

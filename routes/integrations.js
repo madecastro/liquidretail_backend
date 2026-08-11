@@ -14,7 +14,7 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('../services/metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 const IntegrationCredential = require('../models/IntegrationCredential');
@@ -499,7 +499,19 @@ router.patch('/instagram/:credentialId/selection', express.json(), async (req, r
         brandId, type: 'instagram', status: 'active', igUserId
       }).select('_id').lean();
       if (conflict) {
-        return res.status(409).json({ error: `Another active credential already binds @${matchedPage.igBusinessAccount?.username || igUserId}; disconnect it first.` });
+        // Structured, not just prose. The picker has to be able to RESOLVE this,
+        // not merely report it: without the conflicting credential's id the
+        // operator is told "disconnect it first" and left to go hunt for which
+        // one, which is a dead end in the one flow whose whole purpose is
+        // changing the account.
+        return res.status(409).json({
+          error: `Another connected account already uses @${matchedPage.igBusinessAccount?.username || igUserId}. ` +
+                 'Disconnect that one to move this Instagram account to this credential.',
+          code: 'ig-account-bound-elsewhere',
+          conflictCredentialId: String(conflict._id),
+          igUserId,
+          igUsername: matchedPage.igBusinessAccount?.username || null
+        });
       }
     }
 
@@ -870,6 +882,14 @@ router.get('/instagram/posts-status', async (req, res) => {
 // Pulls recent IG posts/reels, mirrors media to Cloudinary, creates
 // Media + DetectRun for each NEW post. Idempotent — already-ingested
 // posts skip. Foreground; capped at 50 posts per call.
+//
+// RE-SCAN: body `force:true` re-enters already-ingested posts instead of
+// skipping them — refreshing engagement stats and re-queueing detect on media
+// that already had a run. Without it, "Sync Now" on an account whose posts are
+// all known does nothing at all, which is why a re-scan was impossible to ask
+// for. It is opt-in because re-queued detect runs are BILLABLE; the daily detect
+// cap still applies (services/postSyncService.js), and `limit` bounds how many
+// posts can be touched in one call.
 router.post('/instagram/sync-posts', express.json(), async (req, res) => {
   try {
     const brandId = req.headers['x-brand-id'];
@@ -881,8 +901,10 @@ router.post('/instagram/sync-posts', express.json(), async (req, res) => {
     const cred = await IntegrationCredential.findOne(tenantFilter(req, credFilter)).select('_id').lean();
     if (!cred) return res.status(404).json({ error: 'no active Instagram credential for this brand' });
     const limit = Math.min(Number(req.body?.limit) || 25, 50);
+    const force = req.body?.force === true;
     const result = await syncPosts(brandId, {
       limit,
+      force,
       ...(credentialId ? { credentialId } : {})
     });
     if (!result.ok) return res.status(400).json(result);
@@ -1620,7 +1642,6 @@ router.get('/token-debug', async (req, res) => {
     const { decrypt } = require('../services/integrationCryptoService');
     const axios = require('axios');
 
-    const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
     const META_APP_ID      = process.env.META_APP_ID;
     const META_APP_SECRET  = process.env.META_APP_SECRET;
     const metaAppToken = (META_APP_ID && META_APP_SECRET) ? `${META_APP_ID}|${META_APP_SECRET}` : null;

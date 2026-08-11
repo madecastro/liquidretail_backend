@@ -52,7 +52,23 @@ export function resolveSlotContentCore(slot, meta) {
   if (slot.key === 'rating') {
     const rating = Number(meta?.rating);
     const hasRating = Number.isFinite(rating) && rating > 0;
-    const reviewsText = meta?.reviewsText || (meta?.reviewCount ? `${meta.reviewCount} reviews` : '');
+    // NO UNSCOPED FALLBACK. services/ratingDisplay.js builds reviewsText WITH
+    // its tier qualifier already attached — "15545 brand reviews" for a brand
+    // aggregate, "523 reviews" for this SKU's own — and it returns a string
+    // whenever reviewCount is non-null, so on the normal path this fallback was
+    // unreachable.
+    //
+    // It was still a live trap, and the exact one the qualifier exists to close:
+    // ANY producer that sets reviewCount without reviewsText (a tenant
+    // Brand.metaCascades entry, a hand-built meta, a future caller) would have
+    // typeset a BARE "15545 reviews" next to one product — asserting a
+    // catalog-wide total as that SKU's own review volume. ratingDisplay's own
+    // docstring claims "There is no such hole now"; this line was the hole,
+    // sitting in the renderer where that docstring could not see it.
+    //
+    // Fail closed: no qualifier, no count. The slot then hides unless a rating
+    // is present, which is the correct rendering of proof we cannot scope.
+    const reviewsText = meta?.reviewsText || '';
     // Owner's ">4.5 stars only" rule can suppress a real-but-low rating
     // upstream (services/ratingDisplay.js sends rating:null in that case)
     // while the brand still has review volume worth showing (e.g. GymShark:

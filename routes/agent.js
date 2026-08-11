@@ -68,7 +68,13 @@ const { streamChatCompletion } = require('../services/atlasLlmStreamService');
 
 const AGENT_MODEL = process.env.AGENT_MODEL || 'gemini-2.5-flash';
 const MAX_ITERATIONS = Math.max(1, Number(process.env.AGENT_MAX_ITERATIONS || 8));
-const MAX_MESSAGES = Math.max(2, Number(process.env.AGENT_MAX_MESSAGES || 40));
+// AGENT_MAX_MESSAGES=0 (or unset with default 0) disables the cap.
+// Any positive value enables it. When disabled, an unbounded history
+// is legal — cost defense falls entirely on AGENT_DAILY_CAP_USD /
+// spendGuard and AGENT_MAX_TOKENS per LLM call. Re-enable with a
+// numeric env override (e.g. 40) once client-side history compaction
+// exists in the chat drawer.
+const MAX_MESSAGES = Number(process.env.AGENT_MAX_MESSAGES || 0);
 const MAX_TOKENS_PER_CALL = Math.max(256, Number(process.env.AGENT_MAX_TOKENS || 2048));
 const TEMPERATURE = Number.isFinite(Number(process.env.AGENT_TEMPERATURE))
   ? Number(process.env.AGENT_TEMPERATURE)
@@ -127,6 +133,19 @@ function buildSystemPrompt(context = {}) {
       ? `CURRENT UI CONTEXT (the operator has these selected — capabilities that need one of these IDs will use it as a default):\n${contextLines}`
       : 'CURRENT UI CONTEXT: nothing selected.',
     '',
+    'ERROR RECOVERY:',
+    '- When a capability fails with an error message that NAMES ANOTHER CAPABILITY as the remedy (e.g. "invoke integrations.instagram.connectUrl", "use catalog.pullFromApify for more"), offer to chain into that capability as your next step — do not just stop at the error. Ask the operator whether to proceed.',
+    '- If the error result carries a sourceCounts field (from posts.syncFromInstagram / catalog.syncFromInstagram), it tells you which OTHER ingestion path this brand ALREADY has content from. Steer the operator to the capability matching the dominant source instead of insisting on the OAuth path.',
+    '',
+    'DECIDING BETWEEN INGESTION PATHS (media / catalog refresh):',
+    '- The AUTHORITATIVE signal for how existing media / catalog rows were ingested is the `source` field ON THE ROWS THEMSELVES, not the current IntegrationCredential state. Credentials can be revoked AFTER ingest, so a brand may have IG media with source=instagram or source=apify-ig even when integrations.instagram.listCredentials is empty.',
+    '- When the operator asks to refresh media / posts / comments and does not specify OAuth vs Apify, call media.sourceSummary FIRST (Tier 0, cheap). Its response includes `remedyBySource` telling you which refresh capability applies per source.',
+    '- Only fall back to asking the operator when media.sourceSummary is genuinely ambiguous (e.g. equal counts across sources with different remedies).',
+    '',
+    'KEYWORD SEARCH — use agent.searchAcrossBrands, NOT db.query:',
+    '- When the operator asks about anything by NAME, TITLE, SUBSTRING, PARTIAL WORD, or KEYWORD (e.g. "show my sectional couches", "which ads mention Q4", "products with hydration in the name"), USE agent.searchAcrossBrands. Pass brandId when the operator is scoped to a single brand.',
+    '- Do NOT use db.query for keyword searches — db.query intentionally excludes $regex (DoS risk on unindexed fields), and CatalogProduct.title / Ad.title / Campaign.name are not in its filterable allowlist. agent.searchAcrossBrands uses a bounded regex behind advertiser + brand tenant filters.',
+    '',
     'When you finish, produce a concise plain-text answer for the operator. Do not restate the raw JSON — summarise the finding. If a capability failed (ok:false), tell the operator what went wrong and what they can try.'
   ].join('\n');
 }
@@ -137,7 +156,9 @@ function validateBody(body) {
   if (!body || typeof body !== 'object') return 'body must be a JSON object';
   if (!Array.isArray(body.messages)) return 'messages[] required';
   if (body.messages.length === 0) return 'messages[] cannot be empty';
-  if (body.messages.length > MAX_MESSAGES) return `messages[] exceeds cap ${MAX_MESSAGES}`;
+  if (MAX_MESSAGES > 0 && body.messages.length > MAX_MESSAGES) {
+    return `messages[] exceeds cap ${MAX_MESSAGES}`;
+  }
   for (const [i, m] of body.messages.entries()) {
     if (!m || typeof m !== 'object') return `messages[${i}] not an object`;
     if (!['user', 'assistant', 'tool', 'system'].includes(m.role)) {
@@ -383,7 +404,11 @@ async function replayConfirmations({ working, confirmationsSet, explicitConfirma
     let result;
     if (cap?.execute?.workflow === true) {
       try {
-        const executor = require(cap.execute.service);
+        // Go through registry.resolveExecutorPath — passing the raw
+        // service string to node's require() resolves the
+        // './capabilityExecutors/...' path relative to THIS file
+        // (routes/) and blows up with MODULE_NOT_FOUND (Aug 6 outage).
+        const executor = require(registry.resolveExecutorPath(cap));
         if (typeof executor.execute !== 'function') {
           result = { ok: false, error: `workflow "${cap.id}" executor exports no execute()` };
         } else {
@@ -745,7 +770,9 @@ router.post('/chat', async (req, res) => {
 
         let plan;
         try {
-          const executor = require(cap.execute.service);
+          // See the T4-execute branch above — must funnel through
+          // registry.resolveExecutorPath, not raw require(service).
+          const executor = require(registry.resolveExecutorPath(cap));
           if (typeof executor.preview !== 'function') {
             plan = { ok: false, error: `workflow "${cap.id}" executor exports no preview()` };
           } else {
@@ -832,7 +859,9 @@ router.post('/chat', async (req, res) => {
         // workflow never throws — errors are structured.
         let result;
         try {
-          const executor = require(cap.execute.service);
+          // Same rule as the other T4 branches — must go through
+          // registry.resolveExecutorPath, not raw require(service).
+          const executor = require(registry.resolveExecutorPath(cap));
           if (typeof executor.execute !== 'function') {
             result = { ok: false, error: `workflow "${cap.id}" executor exports no execute()` };
           } else {
