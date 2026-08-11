@@ -42,7 +42,16 @@ const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinary
 const { recordFlatCost, finalizeFlatCost, reconcileCost } = require('./costTracker');
 const referenceDefaultsService  = require('./referenceDefaultsService');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
-const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
+const {
+  buildVeoPrompt,
+  aspectRatioForPlatformFormat,
+  promptProfileFor,
+  enforceRawByteCap,
+  shouldUseLifestyleVideoPrompt,
+  resolveLifestyleVideoRefCount,
+  resolveLifestyleVideoRefPlan,
+  lifestyleVideoGuidanceForIntent
+} = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
 
 // INPUT_SCHEMA_VERSION drives the staleness check in
@@ -283,6 +292,20 @@ function resolvePromptGuidance({ ad = null, product = null, categories = [], bra
       || (Array.isArray(categories) ? categories : []).map(c => pick(c?.videoSettings?.promptGuidance)).find(Boolean)
       || pick(brand?.videoSettings?.promptGuidance)
       || null;
+}
+
+/**
+ * Map Ad.template → one of the four REAL static intents for lifestyle video
+ * guidance selection. Mirrors directImageRenderService.intentForTemplate
+ * without requiring that module (avoids a heavy import on the video path).
+ * brand_led is only returned when STATIC_BRAND_LED_COPY is not 'false'.
+ */
+function lifestyleIntentFromTemplate(template) {
+  const t = String(template || '');
+  if (t === 'ai_social_proof_led') return 'social_proof_led';
+  if (t === 'ai_promotional') return 'objection_resolved';
+  if (t === 'ai_brand_led' && process.env.STATIC_BRAND_LED_COPY !== 'false') return 'brand_led';
+  return 'product_first_lifestyle';
 }
 
 const BASE_URL     = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
@@ -3483,11 +3506,37 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
       );
     }
   }
-  const referenceCount = resolveReferenceImageCount({ brand, product });
+  // Lifestyle video (VIDEO_LIFESTYLE_PROMPT): one seed reference only —
+  // multi-ref is a packshot fidelity device and melts people under motion.
+  // Trigger matches static preserve: lifestyle seed OR ugc variantKind.
+  // Flag-off / non-lifestyle product_image ⇒ today's resolveReferenceImageCount.
+  // Plan is the single source of effective ref count — do not re-derive.
+  const { resolveSeedStyle } = require('./imageShotHeuristicService');
+  const seedStyle = resolveSeedStyle(media);
+  const baseReferenceCount = resolveReferenceImageCount({ brand, product });
+  const lifestylePlan = resolveLifestyleVideoRefPlan({
+    baseReferenceCount,
+    seedStyle,
+    variantKind: ad.variantKind || null
+  });
+  const lifestyleVideo = lifestylePlan.lifestyleVideo;
+  const referenceCount = lifestylePlan.referenceCount;
+  // Operator ordered stacks on lifestyle still get capped to 1 distinct ref
+  // by buildReferenceImages(referenceCount=1); log when we discard extras.
+  if (lifestylePlan.forceSeedOnly && Array.isArray(orderedReferenceMedia) && orderedReferenceMedia.length > 1) {
+    console.warn(
+      `⚠️  atlasVideo[ad=${ad._id}]: lifestyle video path caps references to 1 ` +
+      `(seed only; ${orderedReferenceMedia.length} operator picks reduced)`
+    );
+  }
   adStage(ad._id, `reference reframe (${aspectRatio})`);
   const imageUrls = await buildReferenceImages({
-    media, product, catalogMedias, aspectRatio, caps, referenceCount, brand,
-    orderedReferenceMedia
+    media, product, catalogMedias, aspectRatio, caps,
+    // Effective count from the plan — never pass baseReferenceCount here.
+    referenceCount,
+    brand,
+    // Lifestyle: ignore multi-pick ordered stacks — seed only (media at pos 0).
+    orderedReferenceMedia: lifestylePlan.forceSeedOnly ? null : orderedReferenceMedia
   });
   if (!imageUrls.length) throw new Error(`atlasVideo[ad=${ad._id}]: no reference images available`);
 
@@ -3546,13 +3595,19 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     sourceMedia:  lpSrcMedia,
     aspectRatio,
     seedHasText,
-    hasProductReference: hasProductAnchor,
+    // Lifestyle path always ships 1 ref → seed-only fidelity wording.
+    hasProductReference: lifestylePlan.forceSeedOnly ? false : hasProductAnchor,
     storyboard,
     caps,
     durationSec,
     // Destination for prompt-profile selection (PMax → PMAX_DIRECTIVES).
     // Meta / absent → Omni/Grok path unchanged (byte-identical).
-    platformFormat: ad.platformFormat || null
+    platformFormat: ad.platformFormat || null,
+    // Lifestyle sibling directive set (VIDEO_LIFESTYLE_PROMPT). Absent /
+    // non-lifestyle leaves the packshot path byte-identical (B14).
+    // variantKind matches static preserve trigger (ugc OR lifestyle seed).
+    seedStyle,
+    variantKind: ad.variantKind || null
   };
   // Whitespace-only operatorPrompt must NOT count as an override — trim-gate
   // branch 1 so it falls through to raw/guidance like an empty refinement.
@@ -3564,7 +3619,15 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     prompt = enforceRawByteCap(ad.videoPromptRaw, caps);
     console.warn(`⚠️ atlasVideo[ad=${ad._id}]: RAW prompt override — canonical directives bypassed`);
   } else {
-    const effectiveGuidance = resolvePromptGuidance({ ad, product, categories, brand });
+    let effectiveGuidance = resolvePromptGuidance({ ad, product, categories, brand });
+    // Lifestyle Director creative room: when the cascade is empty, inject
+    // the intent×lifestyle snippet so mood/pacing can shape the animation
+    // without contradicting LIFESTYLE_DIRECTIVES. Never invents copy/offers
+    // (titling stays Remotion from ad.copy — untouched here).
+    if (!effectiveGuidance && lifestyleVideo) {
+      const intentKey = lifestyleIntentFromTemplate(ad.template);
+      effectiveGuidance = lifestyleVideoGuidanceForIntent(intentKey);
+    }
     prompt = buildVeoPrompt({ ...promptArgs, operatorPrompt: effectiveGuidance });
   }
 
@@ -3924,6 +3987,11 @@ module.exports = {
   resolveModelAndAspect,
   ASPECT_FALLBACK_MODEL,
   resolveReferenceImageCount,
+  // Lifestyle video ref-count gate — scripts/verifyLifestylePreserve.js.
+  resolveLifestyleVideoRefCount,
+  resolveLifestyleVideoRefPlan,
+  shouldUseLifestyleVideoPrompt,
+  lifestyleIntentFromTemplate,
   resolveDurationSec,
   estimateRenderCostUsd,
   // Cost reconcile — scripts/verifyVideoCostReconcile.js (offline).

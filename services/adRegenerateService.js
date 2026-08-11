@@ -780,6 +780,47 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
   }
 }
 
+/**
+ * Pure: build the renderDirectImage arg object from an Ad row + regen options.
+ * Exported so scripts/verifyLifestylePreserve.js can assert variantKind (and
+ * every other preserve-gate field) reaches the prompt builder without DB.
+ * Dropping variantKind here re-opens BLOCKER 3 — UGC preserve dead on regen.
+ */
+function buildDirectImageArgsFromAd(ad, {
+  adId = null,
+  referenceMediaIds = [],
+  referenceSource = 'operator',
+  prompt = null,
+  promptOverride = null
+} = {}) {
+  return {
+    layoutInputArtifactId: ad.layoutInputArtifactId || null,
+    aspectRatio:           ad.aspectRatio,
+    mediaId:               ad.mediaId,
+    productId:             ad.productId || null,
+    brandId:               ad.brandId || null,
+    adId:                  adId || (ad._id != null ? String(ad._id) : null),
+    // Prefer last run id on the ad for run-feed QC notices (regen has no
+    // live CampaignRun parameter).
+    campaignRunId:         Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null,
+    campaignId:            ad.campaignId || null,
+    adConceptArtifactId:   ad.conceptArtifactId || null,
+    adConceptId:           ad.conceptId || null,
+    template:              ad.template,
+    platformFormat:        ad.platformFormat || 'meta_feed_1_1',
+    referenceMediaIds,
+    referenceSource,
+    // Lifestyle/UGC scene-preserve — must match first-render path.
+    variantKind:           ad.variantKind || null,
+    // Refinement note (Product Ads modal) OR verbatim override
+    // (Generation Details). Override wins inside renderDirectImage.
+    operatorPrompt:        prompt || null,
+    rawPromptOverride:     promptOverride || null
+  };
+}
+
 // IMAGE regeneration via the live direct_image renderer.
 //
 // Re-derives everything renderDirectImage needs from the Ad row itself:
@@ -890,30 +931,18 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
 
   let output;
   try {
-    output = await directImage.renderDirectImage({
-      layoutInputArtifactId: ad.layoutInputArtifactId || null,
-      aspectRatio:           ad.aspectRatio,
-      mediaId:               ad.mediaId,
-      productId:             ad.productId || null,
-      brandId:               ad.brandId || null,
-      adId:                  adId || null,
-      // Prefer last run id on the ad for run-feed QC notices (regen has no
-      // live CampaignRun parameter).
-      campaignRunId:         Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
-        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
-        : null,
-      campaignId:            ad.campaignId || null,
-      adConceptArtifactId:   ad.conceptArtifactId || null,
-      adConceptId:           ad.conceptId || null,
-      template:              ad.template,
-      platformFormat:        ad.platformFormat || 'meta_feed_1_1',
-      referenceMediaIds,
-      referenceSource,
-      // Refinement note (Product Ads modal) OR verbatim override
-      // (Generation Details). Override wins inside renderDirectImage.
-      operatorPrompt:        prompt || null,
-      rawPromptOverride:     promptOverride || null
-    });
+    // Pure arg assembly is exported for the offline harness — if variantKind
+    // is dropped here the UGC half of STATIC_LIFESTYLE_PRESERVE is dead on
+    // every paid regen (BLOCKER 3).
+    output = await directImage.renderDirectImage(
+      buildDirectImageArgsFromAd(ad, {
+        adId,
+        referenceMediaIds,
+        referenceSource,
+        prompt,
+        promptOverride
+      })
+    );
   } catch (err) {
     // Carry charged/predictionId so a charged failure is visible in
     // logs and progress, and so no outer layer invents a second submit.
@@ -999,6 +1028,8 @@ module.exports = {
   // Exported so the offline harness can assert the direct-image path
   // (no aiCanvasArtifactId precondition) without invoking providers.
   runImage,
+  // Pure arg assembly — verifyLifestylePreserve asserts variantKind is threaded.
+  buildDirectImageArgsFromAd,
   DAILY_CAP,
   // Catalog-first reseed. The decision and the tier selection are pure so
   // scripts/verifyRegeneration.js can assert them with no DB, network or key.

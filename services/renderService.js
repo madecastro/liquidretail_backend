@@ -73,7 +73,9 @@ async function renderCreative(req) {
   // Load the queued Ad doc up front. identityDigest is needed for the
   // upload filename so re-renders of the same (campaign, identity)
   // overwrite the existing Cloudinary asset rather than orphaning.
-  const adDoc = req.adId ? await Ad.findById(req.adId).select('identityDigest referenceMediaIds mediaIds').lean() : null;
+  const adDoc = req.adId
+    ? await Ad.findById(req.adId).select('identityDigest referenceMediaIds mediaIds variantKind').lean()
+    : null;
   const identityDigest = adDoc?.identityDigest || null;
   const stages = {};
   const t0 = Date.now();
@@ -213,7 +215,10 @@ async function renderCreative(req) {
       referenceSource:
         (Array.isArray(adDoc?.referenceMediaIds) && adDoc.referenceMediaIds.length)
           ? 'operator'
-          : 'director'
+          : 'director',
+      // Lifestyle/UGC scene-preserve (STATIC_LIFESTYLE_PRESERVE) — trigger
+      // includes Ad.variantKind === 'ugc'. Threaded into renderDirectImage.
+      variantKind: adDoc?.variantKind || req.variantKind || null
     });
     stages.render = Date.now() - t;
     console.log(`   🖼️  ${tag} render ok in ${stages.render}ms (${renderOutput.width}×${renderOutput.height}, ${Math.round(renderOutput.bytes/1024)}KB, mode=static)`);

@@ -336,6 +336,152 @@ function directivesForProfile(profile) {
   return GROK_DIRECTIVES;
 }
 
+// ── LIFESTYLE video directives — SIBLING of OMNI_DIRECTIVES (flag-gated) ──
+// Selected only when VIDEO_LIFESTYLE_PROMPT=true AND the seed is lifestyle.
+// Does NOT alter a single byte of OMNI_DIRECTIVES / GROK_DIRECTIVES / the
+// existing packshot assembly path. B14 still pins the packshot path against
+// 134db56~1; lifestyle is a parallel branch on a new input (seedStyle).
+//
+// Owner 2026-08: lifestyle video brings a real captured moment to life with
+// the product as the star. Ambient life is wanted; product morph and fantasy
+// motion are still banned. Multi-reference stacks are packshot-only — lifestyle
+// ships ONE ref (the seed). See buildReferenceImages / resolveLifestyleVideoRefCount.
+// Plate wording note (Lane O / owner 2026-08): buildReferenceImages may already
+// have run reframeReferenceForAspect (generative fit) on the seed BEFORE this
+// prompt is submitted. The image AS HANDED TO THE MODEL is final — do not tell
+// the model the original capture is untouched, and do not licence further
+// extension. Upstream fit is not licence to continue extending.
+const LIFESTYLE_DIRECTIVES = {
+  role:
+    `Role: Lifestyle motion editor. Bring the lifestyle photograph to life as an authentic, lived-in moment — ` +
+    `do NOT rebuild, restyle, restage, recompose, or replace the scene. ` +
+    `The image as handed to you is the finished plate and source of truth — it may already have been fitted to this aspect upstream; ` +
+    `do NOT further extend, restyle, or recompose it. That upstream fit is not licence to continue extending.`,
+  objective:
+    `Objective: Animate the real captured moment so the product is the star. Authentic, editorial, documentary-adjacent — ` +
+    `not a staged luxury product commercial. Ambient life that was already implicit in the photograph may move. ` +
+    `Product fidelity means IDENTITY (form, construction, materials, surface, colour, branding) is absolute frame to frame — not immobility. ` +
+    `A worn garment may shift with breath or body motion as a real garment would; a rigid product (bottle, shoe sole, device) does not deform.`,
+  sourceImages: `Source images: Use only the image as handed to you. One lifestyle seed — do not invent additional views, and do not further extend or reframe it.`,
+  productPreservation:
+    `Product preservation (highest priority — never relaxes): The product's IDENTITY is absolute and unchanged frame to frame — ` +
+    `form, construction, materials, surface, colour, branding, logos, stitching, proportions, and any on-item graphics never change. ` +
+    `Do NOT recreate, redraw, regenerate, morph, warp, stretch, re-drape into a different shape or a different garment, re-pose, ` +
+    `enhance with generative fill, or AI-alter any part of the product. Do NOT invent alternate product geometry. ` +
+    `The product may move ONLY as the real physical item would, as a consequence of the wearer's or scene's motion — ` +
+    `a worn garment shifting with a breath or weight transfer, a strap settling. It is never independently animated, ` +
+    `never re-posed by the model, never regenerated. ` +
+    `For a rigid or hard-goods product (bottle, shoe, device, hard packaging) the practical effect is unchanged: it does not deform, bend, flex, or change shape — only whole-object camera-relative motion is allowed, never material deformation.`,
+  transitions: `Transitions: Prefer a single continuous shot. If a cut is unavoidable, smooth crossfades only, ~0.25s. No wipes, flashes, or animated transitions.`,
+  cameraStyle:
+    `Camera style: Gentle motion appropriate to a real scene — as a human-operated camera would move. Ease in/out. ` +
+    `The frame may drift, push, or settle to find and hold the product. ` +
+    `No whip pans, no simulated 3D, no parallax, no synthesized 2.5D depth pop, no orbit around the subject, no shake, no aggressive handheld. ` +
+    `A real camera drifting is fine; a fabricated multi-plane depth effect is not. ` +
+    `Camera finds and holds the product as the star; ambient life is context around it, never competing with it.`,
+  background:
+    `Background / scene identity: Preserve THAT scene exactly as handed to you. Do NOT replace, further extend, blur, recolour, or invent a second location. ` +
+    `No new environments, no environment replacement, no restaging. The plate may already include edge-fit from upstream; do not extend it further.`,
+  visualStyle:
+    `Visual style: Authentic, editorial, documentary-adjacent, photorealistic. Natural light as in the photograph. ` +
+    `No colour grading, bloom, lens flares, or luxury-ecommerce polish. Lived-in, not staged.`,
+  audio: `AUDIO: natural ambience matching the scene; no music, no dialogue, no voiceover.`,
+  noText:
+    `CRITICAL: Do NOT render any text, typography, logos, badges, watermarks, or captions that are not already part of the supplied photograph. ` +
+    `Text and logos physically present on the product in the source image are fine to show — do not generate any new text or graphics. ` +
+    `All ad copy is composited downstream. Any generated text in the video causes rejection.`,
+  physicalAccuracy:
+    `PHYSICAL ACCURACY (heightened — people in motion fail here first): Any person visible must remain anatomically correct — 5-fingered hands, symmetric matching eyes, ` +
+    `natural skin texture, real body proportions. No extra digits, warped features, or impossible angles. ` +
+    `Preserve face, hair, skin tone, and identity throughout with no mid-shot morphing. ` +
+    `Hands and faces are the highest-risk failure mode when motion is allowed — keep them correct every frame.`,
+  ambientLife:
+    `AMBIENT LIFE (the point of this path): hair moving in air, a subtle weight shift or breath, steam, water, foliage, and fabric motion ` +
+    `that a real garment or soft material would show as a consequence of the wearer's or scene's motion — never independent product animation, ` +
+    `never morphing the product into a different shape or garment. Ambient life is context around the product, never competing with it.`,
+  doNot:
+    `Do NOT: regenerate/morph/warp/stretch/re-drape the product, invent geometry, invent textures, change branding/logos/stitching/colors, ` +
+    `create fake shadows/reflections/depth or parallax, independently animate the product (motion only as a real item would move with the wearer/scene), ` +
+    `use generative fill, further extend the plate, or create new backgrounds. ` +
+    `No fantasy motion — no sparkles, particles, lens flares, floating props, morphing objects, or invented objects. ` +
+    `No second location. No wardrobe, prop, or environment changes beyond ambient motion already implicit in the plate. ` +
+    `Do not bend, flex, or deform rigid/hard-goods products.`
+};
+
+/**
+ * VIDEO_LIFESTYLE_PROMPT kill switch — default OFF.
+ * Exact string 'true' enables; unset/empty/false stay off so packshot
+ * prompts and reference counts stay byte-identical to today.
+ */
+function isVideoLifestylePromptEnabled() {
+  return process.env.VIDEO_LIFESTYLE_PROMPT === 'true';
+}
+
+/**
+ * Lifestyle video prompt branch is active only when the flag is on AND
+ * (seed is lifestyle OR variantKind is ugc). Matches static preserve trigger
+ * so a UGC video with an unclassified seed does not stay on packshot Ken Burns
+ * while its static sibling preserves. Packshot product_image never takes it.
+ */
+function shouldUseLifestyleVideoPrompt(seedStyle, variantKind = null) {
+  if (!isVideoLifestylePromptEnabled()) return false;
+  if (variantKind === 'ugc') return true;
+  if (seedStyle === 'lifestyle') return true;
+  return false;
+}
+
+/**
+ * Lifestyle video ships exactly ONE reference (the seed). Multi-ref is a
+ * packshot fidelity device; stacking lifestyle frames + motion melts hands.
+ * Pure: returns 1 when lifestyle path is active, else the provided base count.
+ */
+function resolveLifestyleVideoRefCount(baseCount, seedStyle, variantKind = null) {
+  if (shouldUseLifestyleVideoPrompt(seedStyle, variantKind)) return 1;
+  return baseCount;
+}
+
+/**
+ * Pure plan for lifestyle ref/submit wiring. generateForAd must use these
+ * fields (not re-derive a parallel count) so a discarded resolveLifestyleVideoRefCount
+ * call cannot leave the stack at 3 refs. Harness V6 asserts this plan.
+ */
+function resolveLifestyleVideoRefPlan({ baseReferenceCount, seedStyle, variantKind = null } = {}) {
+  const lifestyleVideo = shouldUseLifestyleVideoPrompt(seedStyle, variantKind);
+  const base = Number.isFinite(baseReferenceCount) && baseReferenceCount >= 1
+    ? baseReferenceCount
+    : 3;
+  return {
+    lifestyleVideo,
+    // Effective count actually passed to buildReferenceImages.
+    referenceCount: lifestyleVideo ? 1 : base,
+    // When true, ordered multi-pick stacks are cleared (seed only) and
+    // hasProductReference is forced false (seed-only fidelity wording).
+    forceSeedOnly: lifestyleVideo
+  };
+}
+
+/**
+ * Director creative room for lifestyle video — one snippet per real intent.
+ * Prepended as OPERATOR REFINEMENT via videoPromptGuidance when the cascade
+ * has no more-specific value. ≤600 chars; no copy, offers, or text instructions
+ * (titling is Remotion from ad.copy).
+ */
+const LIFESTYLE_VIDEO_GUIDANCE = {
+  product_first_lifestyle:
+    'Lifestyle seed: gentle authentic motion. Find and hold the product as the star; let fabric, hair, breath, or environment life already in the frame move softly as a real scene would. Mood: open, lived-in, unhurried. No hard sell energy. No fantasy motion. Product identity absolute — no morph, no re-drape, no independent product animation; worn fabric may shift with the wearer.',
+  social_proof_led:
+    'Lifestyle seed: calm, trustworthy motion. Camera settles on the product already in the real scene; ambient life stays secondary so the plate feels credible, not staged. Hold product readability. Soft editorial pacing. No fantasy particles. Product identity absolute — natural wearer/scene motion only, never morph or regenerate.',
+  objection_resolved:
+    'Lifestyle seed: clarifying, considered motion. Prefer a slow find of the product-in-use beat already visible in the photo; gentle hold on construction or fit detail the plate already shows. Mood: confident, not urgent. Ambient only. Product identity absolute — may move only as the real item would with the wearer/scene; never independently animated or morphed.',
+  brand_led:
+    'Lifestyle seed: brand-world mood without restyling the photo. Gentle camera that keeps the product star-readable while ambient life breathes. Editorial, on-brand restraint — not a staged luxury product-commercial pan. No fantasy motion. Product identity absolute — no morph, no re-drape; rigid goods stay undeformed.'
+};
+
+function lifestyleVideoGuidanceForIntent(intentKey) {
+  const key = String(intentKey || '');
+  return LIFESTYLE_VIDEO_GUIDANCE[key] || LIFESTYLE_VIDEO_GUIDANCE.product_first_lifestyle;
+}
+
 // Main export. Builds the camera-only "Ken Burns" video prompt for the
 // AI model. All text choreography is handled by the chrome compositor
 // downstream — the prompt MUST NOT contain any "render this text"
@@ -371,15 +517,29 @@ function buildVeoPrompt({
   durationSec = 8,        // per-ad render length (wizard format-selection stage)
   platformFormat = null,  // Ad.platformFormat — PMax destination selector
   destination = null,     // alias for platformFormat
-  promptProfile = null    // explicit profile override (harness / opt-in)
+  promptProfile = null,   // explicit profile override (harness / opt-in)
+  // Lifestyle seed style + variantKind — NEW inputs. Absent/null → packshot
+  // path unchanged (B14 matrix never passes these). Lifestyle/UGC +
+  // VIDEO_LIFESTYLE_PROMPT → LIFESTYLE_DIRECTIVES sibling branch; OMNI/GROK
+  // text is not edited. Lifestyle and PMax are ORTHOGONAL: a PMax destination
+  // keeps hook-first timing + centre-safe/Frame treatment while using lifestyle
+  // scene/motion directives.
+  seedStyle = null,
+  variantKind = null
 }) {
   const lines = [];
+  const lifestyle = shouldUseLifestyleVideoPrompt(seedStyle, variantKind);
   const profile = promptProfileFor(caps, {
     platformFormat: platformFormat || destination || null,
     destination: destination || null,
     promptProfile
   });
-  const d = directivesForProfile(profile);
+  // Lifestyle is a sibling directive set for scene/motion — it does NOT
+  // suppress the PMax destination profile. Packshot path still uses profile
+  // selection exactly as before (B14).
+  const d = lifestyle ? LIFESTYLE_DIRECTIVES : directivesForProfile(profile);
+  // Orthogonal: PMax destination treatment composes with lifestyle, never
+  // gets dropped because the seed is lifestyle.
   const isPmax = profile === 'pmax';
   // Used by the PMax timeline only. Meta's timeline is frozen and must not
   // become aspect-aware (see the PR #61 rollback note above).
@@ -387,6 +547,10 @@ function buildVeoPrompt({
 
   // Operator refinement (regeneration only). Leads the prompt so the
   // video model sees the requested change before the fixed spec below.
+  // Lifestyle guidance (intent × lifestyle) also arrives here via the
+  // videoPromptGuidance cascade — ambient motion is already permitted by
+  // LIFESTYLE_DIRECTIVES, so guidance can shape mood/pacing without
+  // contradicting the base.
   if (operatorPrompt && String(operatorPrompt).trim()) {
     lines.push(
       `OPERATOR REFINEMENT (HIGHEST PRIORITY — overrides conflicting guidance below): ` +
@@ -395,9 +559,21 @@ function buildVeoPrompt({
     );
   }
 
-  // ── Fixed Ken Burns product-commercial spec (per-profile directives) ─
+  // ── Directives (lifestyle sibling OR packshot Ken Burns per-profile) ─
   lines.push(d.role);
   lines.push(d.objective);
+  // PMax hook-first is destination treatment — compose onto lifestyle too.
+  // Packshot PMax already carries HOOK-FIRST inside PMAX_DIRECTIVES.objective;
+  // lifestyle uses LIFESTYLE_DIRECTIVES.objective, so inject the destination
+  // rule once when both are active. Not a contradiction with ambient life:
+  // the product must be readable early; ambient motion may still breathe.
+  if (lifestyle && isPmax) {
+    lines.push(
+      `HOOK-FIRST (PMax destination): this surface is skipped or scrolled past in seconds — ` +
+      `the product must be identifiable within the first 2 seconds; the opening frames carry the whole ad. ` +
+      `Ambient life may move, but never at the cost of early product readability.`
+    );
+  }
   lines.push(d.sourceImages);
   lines.push(d.productPreservation);
 
@@ -405,21 +581,42 @@ function buildVeoPrompt({
     lines.push(`Product: ${product.title}.`);
   }
 
-  // Fixed 3-scene timeline. Scene 2's "or most distinctive product
-  // detail" fallback covers logo-less products. Scene 3's zoom-out
-  // reveal is the closing beat — there is no endcard overlay
-  // downstream (removed deliberately; endcards, when desired, are
-  // prompted in a custom titling script instead).
-  // Scene marks scale proportionally with the requested duration so a
-  // 4s, 10s, or 15s render keeps the same pan → logo zoom → reveal arc
-  // (canonical 8.0s beats were 2.66 / 5.12 — ratios 1/3 and 0.64).
-  // Meta branch is FROZEN — do not reword (B14 byte-identity).
-  // PMax branch is hook-first: product legible from frame 1; establishing
-  // move happens WITH the product already reading, not before it.
+  // Timeline. Lifestyle branch is ambient-life + product-as-star.
+  // Packshot Meta branch is FROZEN — do not reword (B14).
+  // PMax packshot is hook-first Ken Burns.
+  // Lifestyle + PMax composes: lifestyle scene/motion language + PMax
+  // hook-first timing + centre-safe framing (not packshot Ken Burns pans —
+  // those would re-impose static product commercial moves on a real scene).
+  // Residual tension report (not silently dropped): packshot PMax cameraStyle
+  // says "product stays completely static"; lifestyle allows real-item motion.
+  // Composition keeps lifestyle product-preservation (identity ≠ immobility)
+  // and only takes PMax's hook-first + centre-safe + Frame — never the
+  // packshot-static product line.
   const dur = Number(durationSec || 8);
   const t1  = (dur / 3).toFixed(2);
   const t2  = (dur * 0.64).toFixed(2);
-  if (isPmax) {
+  if (lifestyle && isPmax) {
+    lines.push(
+      `Timeline (${dur.toFixed(1)}s): ` +
+      `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame in the real lifestyle plate; ` +
+      `gentle camera finds and holds the product already in the scene; ambient life may begin (fabric with the wearer, hair, breath, steam, water, foliage as present). ` +
+      (isVerticalAspect
+        ? `Product held on the vertical centre line — no lateral drift toward either side margin. `
+        : `Product held in the central band of the wide frame. `) +
+      `No whip, no orbit, no parallax. The product must be unmistakable within the first 2.0s. ` +
+      `Scene 2 (${t1}–${t2}s): hold the product as the star with centre-safe framing; soft ambient motion continues; optional gentle push or drift as a real camera would. ` +
+      `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
+      `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear and centre-safe; natural motion only, never fantasy.`
+    );
+  } else if (lifestyle) {
+    lines.push(
+      `Timeline (${dur.toFixed(1)}s): ` +
+      `Scene 1 (0.0–${t1}s): settle into the real moment — gentle camera finds the product already in the lifestyle plate; ambient life may begin (fabric with the wearer, hair, breath, steam, water, foliage as present). No whip, no orbit, no parallax. ` +
+      `Scene 2 (${t1}–${t2}s): hold the product as the star; soft ambient motion continues around it; optional gentle push or drift as a real camera would. ` +
+      `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
+      `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear; natural motion only, never fantasy.`
+    );
+  } else if (isPmax) {
     lines.push(
       `Timeline (${dur.toFixed(1)}s): ` +
       `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame; ` +
@@ -447,9 +644,18 @@ function buildVeoPrompt({
   }
   lines.push(d.transitions);
   lines.push(d.cameraStyle);
+  // Centre-safe is PMax destination treatment. Lifestyle cameraStyle does not
+  // carry it (would change Meta lifestyle); inject when both are active.
+  // Complementary with lifestyle motion — not a contradiction.
+  if (lifestyle && isPmax) {
+    lines.push(
+      `Centre-safe composition (PMax destination): keep the product and any focal detail within the central region of the frame — ` +
+      `away from the top and bottom bands and the outer side margins, where the platform overlays UI.`
+    );
+  }
 
-  // Aspect-aware framing — PMax profile only. Meta never emits Frame lines
-  // (aspectRatio was previously accepted and unused on that path).
+  // Aspect-aware framing — PMax destination (packshot AND lifestyle). Meta
+  // never emits Frame lines (Meta was previously aspect-unused on that path).
   if (isPmax) {
     const ar = String(aspectRatio || '');
     if (ar === '16:9') {
@@ -489,10 +695,16 @@ function buildVeoPrompt({
 
   lines.push(d.physicalAccuracy);
 
+  // Lifestyle ambient-life directive (only on the lifestyle branch).
+  if (lifestyle && d.ambientLife) {
+    lines.push(d.ambientLife);
+  }
+
   // Reference stack: position 0 is the seed (main image); subsequent
   // positions are the product hero + alternate views in stored order
   // (buildReferenceImages). hasProductReference is false only when the
   // stack is seed-only (no product imagery available, or a 1-ref model).
+  // Lifestyle path deliberately ships 1 ref → seed-only fidelity wording.
   if (hasProductReference) {
     lines.push(
       `PRODUCT FIDELITY: All supplied images show the exact catalog SKU — the first image is the primary scene, ` +
@@ -510,10 +722,18 @@ function buildVeoPrompt({
 
   lines.push(d.doNot);
 
-  lines.push(
-    `Output: ${Number(durationSec || 8).toFixed(1)}s duration. Camera movement only. Product unchanged. Luxury ecommerce aesthetic. ` +
-    `Final result should look like a professional camera moving over the original photographs, with no sign that AI touched the product.`
-  );
+  if (lifestyle) {
+    lines.push(
+      `Output: ${Number(durationSec || 8).toFixed(1)}s duration. Authentic lived-in moment brought to life. ` +
+      `Product identity absolute and unchanged — natural real-item motion with the wearer/scene only; never morph, re-drape, or independently animate. ` +
+      `Ambient life only — no fantasy motion. Final result should look like the original photograph breathing, with no sign that AI rebuilt the product or the scene.`
+    );
+  } else {
+    lines.push(
+      `Output: ${Number(durationSec || 8).toFixed(1)}s duration. Camera movement only. Product unchanged. Luxury ecommerce aesthetic. ` +
+      `Final result should look like a professional camera moving over the original photographs, with no sign that AI touched the product.`
+    );
+  }
 
   // Per-model size cap (caps.promptByteCap; Gemini Omni 20,000, Grok
   // 4,096). When over budget, drop optional context lines in defined
@@ -597,5 +817,13 @@ module.exports = {
   OMNI_DIRECTIVES,
   GROK_DIRECTIVES,
   PMAX_DIRECTIVES,
+  // Lifestyle video sibling path (VIDEO_LIFESTYLE_PROMPT) — harness + callers.
+  LIFESTYLE_DIRECTIVES,
+  LIFESTYLE_VIDEO_GUIDANCE,
+  isVideoLifestylePromptEnabled,
+  shouldUseLifestyleVideoPrompt,
+  resolveLifestyleVideoRefCount,
+  resolveLifestyleVideoRefPlan,
+  lifestyleVideoGuidanceForIntent,
 };
 

@@ -566,8 +566,13 @@ const INTENTS = {
     core: ['RATING'],
     /** Eligibility, from the owner brief: this intent IS the rating. */
     eligible: (d) => d.rating ? null : 'no rating — this intent is the rating',
-    emphasis: (d, kept) => [
-      'the product itself, shown large and desirable',
+    // Third arg `ctx` optional so flag-off / non-preserve callers stay
+    // byte-identical. Preserve-aware emphasis ranks type/chrome over the
+    // existing plate — never re-composition of the photograph.
+    emphasis: (d, kept, ctx = {}) => [
+      ctx.preserve
+        ? 'the product as the photograph already presents it — desirable as shown'
+        : 'the product itself, shown large and desirable',
       d.reviewCount ? 'the rating and how many people gave it' : 'the rating',
       kept('CUSTOMER QUOTE') ? "the customer's own words" : null,
       kept('BADGE') ? 'the badge, quietly' : null,
@@ -606,8 +611,15 @@ const INTENTS = {
     renders: { rendersQuote: false, rendersRating: true, rendersBadge: false },
     core: [],
     eligible: () => null, // always runs; it is the floor of the hierarchy
-    emphasis: (d, kept) => [
-      'the product in a scene someone wants to be in',
+    // Third arg `ctx` is optional so flag-off / non-preserve callers that only
+    // pass (d, kept) stay byte-identical. Preserve-aware emphasis points at the
+    // existing photograph; scene-build arm keeps the pre-change wording.
+    // text() is deliberately NOT preserve-aware — copy roles/order are owned
+    // by the Director intent (owner requirement).
+    emphasis: (d, kept, ctx = {}) => [
+      ctx.preserve
+        ? 'the product already in this photograph — the life the plate already implies'
+        : 'the product in a scene someone wants to be in',
       kept('BRAND LINE') ? "the brand's line" : null,
       kept('TRUST MARK') ? 'a quiet trust mark, secondary to everything above' : null,
       kept('CTA BUTTON') ? 'the CTA' : null
@@ -632,9 +644,15 @@ const INTENTS = {
     core: ['CUSTOMER QUOTE'],
     /** A generic compliment defeats the intent; it needs a real risk-reversal line. */
     eligible: (d) => d.quote ? null : 'no risk-reversal quote — a generic line defeats the intent',
-    emphasis: (d, kept) => [
-      "the customer's sentence, as the loudest thing in the frame",
-      'the product, clearly the thing being talked about',
+    // Preserve-aware: "loudest thing in the frame" reads as re-composition;
+    // under preserve it is type hierarchy over the existing plate.
+    emphasis: (d, kept, ctx = {}) => [
+      ctx.preserve
+        ? "the customer's sentence, as the loudest type treatment in the hierarchy"
+        : "the customer's sentence, as the loudest thing in the frame",
+      ctx.preserve
+        ? 'the product as the photograph already presents it — clearly the thing being talked about'
+        : 'the product, clearly the thing being talked about',
       kept('ATTRIBUTION') ? 'who said it' : null,
       kept('BADGE') ? 'the badge, quietly' : null,
       kept('CTA BUTTON') ? 'the CTA' : null
@@ -676,11 +694,19 @@ const INTENTS = {
     core: ['BRAND LINE'],
     /** Eligibility: without a line at all it degrades through FALLBACK_ORDER to product_first_lifestyle rather than shipping a hollow brand-led ad. */
     eligible: (d) => d.headline ? null : 'no brand line — brand_led is the brand line',
-    emphasis: (d, kept) => [
-      'the brand itself — colours, mark, visual identity dominating the frame',
+    // Preserve-aware: "dominating the frame" / supporting product position are
+    // re-composition cues under SCENE_PRESERVE. Under preserve, rank type and
+    // chrome hierarchy over the existing photograph (this is the live default
+    // via TEMPLATE_INTENT → ai_brand_led for unmapped Director styles).
+    emphasis: (d, kept, ctx = {}) => [
+      ctx.preserve
+        ? 'the brand treatment — colours, mark, visual identity dominating the type hierarchy over the existing photograph'
+        : 'the brand itself — colours, mark, visual identity dominating the frame',
       kept('BRAND LINE') ? "the brand's line, punchy and unmistakable" : null,
       kept('SUBHEAD') ? 'a supporting line beneath the brand line' : null,
-      'the product, clearly present but supporting',
+      ctx.preserve
+        ? 'the product as the photograph already presents it, supporting the brand treatment'
+        : 'the product, clearly present but supporting',
       kept('TRUST MARK') ? 'a quiet trust mark, secondary to the brand' : null,
       kept('CTA BUTTON') ? 'the CTA' : null
     ].filter(Boolean),
@@ -750,6 +776,18 @@ function applyDensity(text, spec, policy) {
  * without a deploy (see `PRODUCT_FIDELITY` below).
  */
 const FIDELITY_HARDENING = process.env.STATIC_PROMPT_FIDELITY_HARDENING !== 'false';
+
+/**
+ * LIFESTYLE / UGC SCENE PRESERVE — kill switch, default OFF.
+ *
+ * When on, lifestyle seeds (`resolveSeedStyle === 'lifestyle'`) and
+ * `variantKind === 'ugc'` swap the scene-building fidelity opening for
+ * SCENE_PRESERVE. Intent selection, copy roles, and copy order are untouched
+ * — only scene treatment changes. Flag-off ⇒ every existing prompt is
+ * **byte-identical** (no preserve branch runs). Exact string `'true'` enables;
+ * unset/empty/false stay off.
+ */
+const LIFESTYLE_PRESERVE = process.env.STATIC_LIFESTYLE_PRESERVE === 'true';
 
 /**
  * BRAND-LED COPY — kill switch, default ON.
@@ -846,7 +884,220 @@ ADVERTISING QUALITY. This has to read as work a premium creative agency shipped,
 
 BEFORE YOU FINISH, check three things. The product: a customer would recognise it as the identical physical item; nothing has been redesigned, added, removed, recoloured or reshaped; and colour, branding, materials and construction all match the reference. The framing: the item occupies roughly the same share of the frame as it does in the reference, and the whole image could pass as another photograph of that same item taken in a new commercial shoot. The copy: every string you were given below appears exactly once, spelled exactly as given, and no other text appears anywhere. If any check fails, correct it before finishing the advertisement.`;
 
-function buildPrompt({ intentKey, data, product, surface }) {
+/**
+ * SCENE PRESERVE — lifestyle / UGC static modifier (flag-gated).
+ *
+ * Replaces PRODUCT_FIDELITY / LEGACY when the seed is a lifestyle photograph or
+ * the ad is UGC. Those blocks open on "build an entirely new scene" — stacking
+ * preserve language on top would contradict them. This block carries every
+ * product-identity clause (form, construction, materials, surface, colour,
+ * on-item graphics, details, condition) while locking the photograph's subject
+ * and scene. Intent still owns all copy roles and their order.
+ *
+ * Owner 2026-08 (Lane O): edge extension to fit the surface aspect IS permitted
+ * when resolveAspectTreatment returns 'extend' — a lifestyle photo is rarely
+ * already the ad's aspect, so "don't change the scene" and geometryBlock's
+ * "fill the frame edge to edge" could not both hold without it. Everything
+ * else (subject, pose, crop of the subject, light, grade, wardrobe, props,
+ * environment) stays locked. Treatment 'native' omits the extension sentence.
+ * Treatment 'not-supported' (16:9 / PMax landscape) never reaches this block.
+ *
+ * Geometry (computeSurface / geometryBlock) is unchanged: the existing
+ * "photograph should still fill the whole frame edge to edge" language is
+ * now consistent with edge extension and is NOT reworded here.
+ */
+
+/** Edge-extension sentence — only when treatment === 'extend'. */
+const SCENE_PRESERVE_EDGE_EXTEND =
+  `EDGE EXTENSION: Edge extension to fit the surface aspect IS permitted — continuing the existing scene outward at the frame edges only. ` +
+  `Extension must be a plausible continuation of the same scene — never new subjects, new objects, new props, or a different place. ` +
+  `If you cannot extend the scene plausibly, letterbox rather than invent content. ` +
+  `This is the only permitted change to the photograph's canvas; it does not license restyling, restaging, inventing a second location, or changing the subject.`;
+
+/**
+ * Build the SCENE_PRESERVE block for a resolved treatment ('extend' | 'native').
+ * 'not-supported' never calls this — preserve falls through to scene-build.
+ */
+function buildScenePreserveBlock(treatment) {
+  const edgeBlock = treatment === 'extend'
+    ? `\n\n${SCENE_PRESERVE_EDGE_EXTEND}`
+    : '';
+  // native: no extension sentence (seed already matches surface aspect).
+  const mayChangeExtra = treatment === 'extend'
+    ? ' Edge extension of the existing scene to fit the surface aspect (frame edges only).'
+    : '';
+  const finishExtra = treatment === 'extend'
+    ? ' Edge extension to fit the frame, if any, continues the same scene at the edges only.'
+    : '';
+  return `SCENE PRESERVE — HIGHEST PRIORITY. The supplied photograph is the finished plate. Subject identity, pose, crop of the subject, lighting, shadows, colour grade, depth of field, camera angle, wardrobe, props and environment stay EXACTLY as the reference shows. Do not rebuild, restyle, re-light, recolour, blur or replace the background. Do not change wardrobe, props or environment. Do not restage the product. Do not invent a second location. Do not recompose, re-pose, or re-shoot the subject. Wherever scene preservation conflicts with a creative or styling instruction below, scene preservation wins. This does not relax the text instructions below, which are absolute in their own right, and it does not override the reserved-corner rule or the FORMAT block below.${edgeBlock}
+
+PRODUCT IDENTITY — ABSOLUTE. The item in the photograph is immutable. Reproduce this exact physical product; never redesign, reinterpret, simplify, modernise, improve, repair, stylise, approximate or substitute any part of it. Do not infer the product from its category or from brand priors — if the reference disagrees with what products of this type usually look like, the reference is correct.
+PRESERVE EXACTLY, as the reference shows the product:
+  — Form: shape, proportions, overall dimensions, silhouette, geometry, profile, contours, edges, thickness, volume and curvature.
+  — Construction: seams, stitching, panel layout, assembly, joints, fasteners, hardware, hinges, closures, buttons, buckles, snaps, zips, clasps, laces, eyelets, straps, handles.
+  — Materials: fabric, knit, mesh, leather, suede, rubber, plastic, metal, wood, glass, ceramic, gemstone, carbon fibre, foam, paper and packaging material — each the same material the reference shows.
+  — Surface: texture, weave, grain, gloss, matte, satin, brushed and polished finishes, transparency, opacity, reflectivity.
+  — Colour: the item's own colours exactly. Do not shift hue, recolour, bleach, tint, darken, brighten, saturate or desaturate the product.
+  — Graphics already on the item: logos, branding, icons, artwork, patterns, prints, typography, embroidery, embossing, debossing, engraving, decals, labels and tags — same wording, same lettering, same placement, same scale. Reproduce from the reference; never redraw from imagination; never add, remove or modify branding.
+  — Details, including but not limited to: pockets, collars, sleeves, cuffs, necklines, hems, soles, heels, eyelets, handles, bezels, displays, screens, lenses, caps, applicators, chains, gemstones, watch faces, grips, blades, wheels, buttons, ports, vents and sensors. Every feature visible in the reference must appear unchanged; no feature absent from the reference may be added.
+  — Condition: wrinkles, folds, creases, wear, polish, finish, surface imperfections, and the shadows the item casts on itself. Do not "improve" the item.
+
+COMPOSITING ONLY. Your job is to typeset the exact strings listed below into the safe box as advertisement chrome (type and optional soft scrim or panel behind type where legibility over a busy photograph demands it). A soft scrim or panel behind type IS permitted — that is chrome, not a change to the photograph. Inventiveness lives in typography and chrome treatment only, never in inventing a new scene. Do not invent a new photoshoot of a similar scene.
+
+WHAT MAY CHANGE: letterforms and any non-photo chrome required to set those strings (including a soft legibility scrim/panel).${mayChangeExtra} Nothing else about the photograph's pixels may change.
+
+BEFORE YOU FINISH: a side-by-side with the reference should read as the same photograph with copy overlaid — not a new photoshoot of a similar scene.${finishExtra} Product identity, subject, pose, light and crop of the subject all match the reference; every supplied string appears exactly once; no other text appears.`;
+}
+
+/** Default export: extend treatment (the common Meta path). */
+const SCENE_PRESERVE = buildScenePreserveBlock('extend');
+
+/**
+ * Wide landscape surfaces where "edge extension" would invent 55–68% of the
+ * frame (portrait lifestyle → 16:9 / ~1.91:1). Preserve is NOT supported there.
+ *
+ * 16:9 PMax composition under preserve is deliberately deferred, not missing —
+ * do not "fix" by enabling 'extend' here. Owner will choose a different
+ * composition for those surfaces later.
+ */
+function isWideLandscapeSurface(surfaceKey) {
+  if (!surfaceKey) return false;
+  const key = String(surfaceKey);
+  // Named keys first (no dependency on aspect table being loaded).
+  if (key === 'pmax_16_9' || key === 'pmax_landscape_1_91_1') return true;
+  try {
+    const a = aspectOf(key);
+    // ≥ ~3:2 landscape — Meta statics are 1:1 / 4:5 / 9:16 only, so this
+    // only hits true landscape PMax / future wide surfaces.
+    if (a && a.value >= 1.5) return true;
+  } catch (_) { /* unknown surface — not wide */ }
+  return false;
+}
+
+/**
+ * Parse a seed aspect (number ratio, "4:5", "1080x1350", etc.) to a value.
+ * Returns null when unknown — caller then cannot claim 'native'.
+ */
+function parseAspectValue(seedAspect) {
+  if (seedAspect == null || seedAspect === '') return null;
+  if (typeof seedAspect === 'number' && Number.isFinite(seedAspect) && seedAspect > 0) {
+    return seedAspect;
+  }
+  const s = String(seedAspect).trim();
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*[:xX/]\s*(\d+(?:\.\d+)?)$/);
+  if (m) {
+    const w = Number(m[1]);
+    const h = Number(m[2]);
+    if (w > 0 && h > 0) return w / h;
+  }
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * Named resolver seam: aspect treatment for lifestyle/UGC preserve, per
+ * (surface × seed kind). Owner 2026-08:
+ *
+ *   'extend'        — Meta 1:1 / 4:5 / 9:16 (and PMax square/portrait):
+ *                     edge extension permitted (~20–44% invented area is honest)
+ *   'native'        — seed already matches surface aspect; no extension sentence
+ *   'not-supported' — 16:9 / PMax landscape: preserve does NOT apply; fall
+ *                     through to today's scene-build for that surface
+ *   null            — subject is not lifestyle/ugc; preserve never applies
+ *
+ * UGC is its OWN branch even though it currently returns the same values as
+ * lifestyle. Owner expects to diverge later — change the UGC block alone.
+ * Do NOT collapse `variantKind === 'ugc'` and `seedStyle === 'lifestyle'` into
+ * a single boolean anywhere downstream of this resolver.
+ *
+ * 16:9 PMax composition is deliberately deferred, not missing.
+ */
+function resolveAspectTreatment({ surfaceKey = null, seedStyle = null, variantKind = null, seedAspect = null } = {}) {
+  const wide = isWideLandscapeSurface(surfaceKey);
+
+  function nativeOrExtend() {
+    if (wide) return 'not-supported';
+    const seedVal = parseAspectValue(seedAspect);
+    if (seedVal != null && surfaceKey) {
+      try {
+        const surf = aspectOf(surfaceKey);
+        if (surf && Math.abs(seedVal - surf.value) < 0.02) return 'native';
+      } catch (_) { /* fall through to extend */ }
+    }
+    return 'extend';
+  }
+
+  // ── UGC branch (own arm — currently mirrors lifestyle; diverge here) ──
+  // Changing ONLY this block must change only UGC output (harness pins the seam).
+  if (variantKind === 'ugc') {
+    // UGC → Meta 1:1/4:5/9:16 + PMax square/portrait → extend (or native).
+    // UGC → 16:9 / PMax landscape → not-supported (deferred composition).
+    return nativeOrExtend();
+  }
+
+  // ── lifestyle branch (independent of UGC) ──
+  if (seedStyle === 'lifestyle') {
+    // lifestyle → Meta 1:1/4:5/9:16 + PMax square/portrait → extend (or native).
+    // lifestyle → 16:9 / PMax landscape → not-supported (deferred composition).
+    return nativeOrExtend();
+  }
+
+  // packshot / flat_lay / detail / packaging / unknown — preserve never applies
+  return null;
+}
+
+/**
+ * Pure gate for the lifestyle/UGC scene-preserve subject trigger.
+ * Flag must be on; then lifestyle seed style OR ugc variantKind.
+ * Never packshot / flat_lay / detail / packaging / unknown / ambiguous.
+ *
+ * Surface treatment is a SEPARATE gate (resolveAspectTreatment) — this only
+ * answers "is this the kind of seed preserve can talk about?".
+ */
+function shouldPreserveScene({ seedStyle = null, variantKind = null } = {}) {
+  if (!LIFESTYLE_PRESERVE) return false;
+  if (variantKind === 'ugc') return true;
+  if (seedStyle === 'lifestyle') return true;
+  return false;
+}
+
+function buildPrompt({ intentKey, data, product, surface, seedStyle = null, variantKind = null, preserveScene = null, seedAspect = null }) {
+  // Explicit preserveScene=true is harness/test only and STILL requires a
+  // lifestyle-or-ugc subject — a packshot must never land on SCENE_PRESERVE
+  // even when a caller forces the override. preserveScene=false always wins
+  // (explicit opt-out). Otherwise derive from seedStyle + variantKind.
+  // Surface treatment may still veto (16:9 / PMax landscape → not-supported).
+  const subjectOk = seedStyle === 'lifestyle' || variantKind === 'ugc';
+  let preserve = preserveScene === true
+    ? (LIFESTYLE_PRESERVE && subjectOk)
+    : preserveScene === false
+      ? false
+      : shouldPreserveScene({ seedStyle, variantKind });
+
+  // Per-(surface × seed kind) treatment. 'not-supported' falls through to
+  // today's exact scene-build behaviour (byte-identical to preserve-OFF).
+  let aspectTreatment = null;
+  if (preserve) {
+    aspectTreatment = resolveAspectTreatment({
+      surfaceKey: surface,
+      seedStyle,
+      variantKind,
+      seedAspect
+    });
+    if (aspectTreatment === 'not-supported' || aspectTreatment == null) {
+      if (aspectTreatment === 'not-supported') {
+        // Clear, once-per-call: preserve skipped for this surface and why.
+        console.log(
+          `⚠️  SCENE_PRESERVE skipped: surface=${surface} treatment=not-supported ` +
+          `(16:9/PMax landscape — invented-frame area too large for honest preserve; ` +
+          `composition under preserve is deliberately deferred, not missing)`
+        );
+      }
+      preserve = false;
+      aspectTreatment = null;
+    }
+  }
+
   const policy = SURFACE_POLICY[surface];
   if (!policy) return { error: `unknown surface ${surface}` };
   if (!policy.static) return { skipped: policy.skipReason, surfaceKey: surface };
@@ -875,7 +1126,9 @@ function buildPrompt({ intentKey, data, product, surface }) {
 
   const keptRoles = new Set(kept.map(([r]) => r));
   const kept_ = (role) => keptRoles.has(role);
-  const emphasis = spec.emphasis(data, kept_);
+  // Pass preserve into emphasis so product_first_lifestyle can use a
+  // preserve-aware scene line without touching text() copy roles/order.
+  const emphasis = spec.emphasis(data, kept_, { preserve });
   const absent = absences(data, spec.renders, dropped, effectivePolicy);
   const s = computeSurface(surface);
 
@@ -962,9 +1215,26 @@ Set no other words, numerals or letterforms anywhere in the image — including 
     if (notes) platformNotesBlock = `\n\n${notes}`;
   }
 
+  // Fidelity / scene block. Preserve replaces the whole scene-building
+  // opening (PRODUCT_FIDELITY or LEGACY) — they cannot be stacked.
+  // Flag-off leaves this branch unreachable → byte-identical prompts.
+  // aspectTreatment is 'extend' | 'native' when preserve is true.
+  const fidelityBlock = preserve
+    ? buildScenePreserveBlock(aspectTreatment)
+    : (FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY);
+
+  // Creative-freedom paragraph. Preserve locks photography; inventiveness
+  // is typography/chrome only. Scene-build arm is the pre-existing text
+  // (byte-identical when preserve is false).
+  const decideBlock = preserve
+    ? (kept.length
+      ? `COMPOSITING ONLY — you decide typeface and weight, the scale and colour of every text element, whether copy sits on a soft scrim or panel for legibility or in clear space, and where each element goes inside the safe box. The photograph is finished: inventiveness belongs only in typography and chrome, never in the pixels of the scene.`
+      : `COMPOSITING ONLY — the photograph is finished and this ad carries no text. Inventiveness is not invited; leave the plate as the reference shows it.`)
+    : `YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, ${personClause}lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.`;
+
   const prompt = `${rolePreamble}Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
 
-${FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY}
+${fidelityBlock}
 
 PRODUCT: ${product.desc}
 
@@ -976,7 +1246,7 @@ That is an order of importance, not a layout, and not a checklist. Express it ho
 
 ${textBlock}
 
-YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, ${personClause}lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.
+${decideBlock}
 
 THIS PRODUCT HAS NONE OF THE FOLLOWING, so none of it may appear:
 ${absent.map(a => `  — ${a}`).join('\n')}
@@ -986,7 +1256,18 @@ Keep the ${product.logoCorner || 'bottom-right'} corner clear of text and graphi
 
 ${geometryBlock(s)}${platformNotesBlock}`;
 
-  return { prompt, resolved, absent, emphasis, text: kept, dropped, surface: s, policy: effectivePolicy };
+  return {
+    prompt,
+    resolved,
+    absent,
+    emphasis,
+    text: kept,
+    dropped,
+    surface: s,
+    policy: effectivePolicy,
+    preserveScene: preserve,
+    aspectTreatment: preserve ? aspectTreatment : null
+  };
 }
 
 module.exports = {
@@ -996,6 +1277,13 @@ module.exports = {
   FALLBACK_ORDER,
   buildPrompt,
   PRODUCT_FIDELITY,
+  SCENE_PRESERVE,
+  SCENE_PRESERVE_EDGE_EXTEND,
+  buildScenePreserveBlock,
+  LIFESTYLE_PRESERVE,
+  shouldPreserveScene,
+  resolveAspectTreatment,
+  isWideLandscapeSurface,
   resolveIntent,
   absences,
   applyDensity,
