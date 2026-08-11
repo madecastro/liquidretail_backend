@@ -460,6 +460,100 @@ check('G3 MAX_CHARS is unchanged at 50 (this fix is selection-only, not a width 
 });
 
 (async () => {
+console.log('\nW. Voice — prefer a direct testimonial, do not discard the rest');
+
+// Owner directive 2026-08-11: "It should prefer direct testimonials, but those can be
+// used otherwise." A PREFERENCE, not a gate — and deliberately NOT judged by source,
+// because "A Busy Dad's Honest Review" tells you nothing reliable about whether the
+// writer bought the thing. Voice does.
+const { scoreQuote } = require('../services/layoutInputService');
+
+// All five are real lines from Vuori's live brand-review pool.
+const FIRST_PERSON_REAL = [
+  'The fabric is so soft. I love that it is a bomber-style jacket and cinched at the waist but not tight. It is super warm and cozy.',
+  'I love Vuori because of their high quality fabric, and their comfortable and cozy pieces.',
+  'Every single piece that I have from Vuori is so well made and softer than anything I have felt.',
+];
+const THIRD_PERSON_REAL = 'The Strato Tech is so soft and comfortable. It is also moisture wicking, so it is suitable for those longer days out in the sun.';
+const REPORTED_REAL     = 'She says the bra provides the most comfortable support, while the leggings and crop top are super stretchy and flexible.';
+
+check('W1 voice breaks a TIE between otherwise comparable lines', () => {
+  // Deliberately NOT "first person beats any third-person line". Measured: the real
+  // third-person Vuori line is longer and more specific than the real first-person one
+  // and legitimately outranks it — a preference is not supposed to override better copy.
+  // So the honest test holds content constant and varies only the voice.
+  const pairs = [
+    ['I have worn these every day since June and they still look new.',
+     'These have been worn every day since June and they still look new.'],
+    ['I love how soft and comfortable these joggers are after six months.',
+     'The joggers stayed soft and comfortable after six months of wear.'],
+  ];
+  for (const [firstPerson, impersonal] of pairs) {
+    assert.ok(scoreQuote(firstPerson) > scoreQuote(impersonal),
+      `the customer speaking for themself should win the tie: ${JSON.stringify(firstPerson.slice(0, 46))}`);
+  }
+  // And the real pool still ranks on CONTENT, not on pronouns.
+  assert.ok(scoreQuote(THIRD_PERSON_REAL) > scoreQuote('I like it.'),
+    'a substantive third-person line must beat a thin first-person one');
+});
+check('W1b the nudge cannot cancel the funnel-stage lever', () => {
+  // Stage is what makes a quote match the AD'S INTENT — it is the mechanism behind
+  // per-intent variety. Voice is a tie-breaker about who is speaking. At +2 the bonus
+  // flipped a stage decision purely because the losing quote said "I"; that regression
+  // is pinned here as well as in verifyProofBeat.
+  const durability = 'Easy to wash, they are super comfortable and held up after 6 months';
+  const repeat = 'Worth every penny, I bought a second pair the next week';
+  assert.ok(scoreQuote(durability, { stage: 'consideration' }) > scoreQuote(repeat, { stage: 'consideration' }),
+    'at consideration the objection-removing quote must still win, pronoun or not');
+  assert.ok(scoreQuote(repeat, { stage: 'conversion' }) > scoreQuote(durability, { stage: 'conversion' }),
+    'and at conversion the ordering must still reverse');
+});
+check('W2 the third-person line is still USABLE, not discarded', () => {
+  // The owner asked for a preference, not a purge. A negative or -Infinity score here
+  // would mean a perfectly good review-article line could never be printed at all.
+  assert.ok(Number.isFinite(scoreQuote(THIRD_PERSON_REAL)), 'must not be disqualified');
+  assert.ok(scoreQuote(THIRD_PERSON_REAL) > 0, 'must still be able to win when it is the best on offer');
+});
+check('W3 reported speech ranks below both, and is still not disqualified', () => {
+  const reported = scoreQuote(REPORTED_REAL);
+  assert.ok(reported < scoreQuote(THIRD_PERSON_REAL),
+    'relaying someone else\'s words is weaker proof than describing a product');
+  assert.ok(Number.isFinite(reported), 'still usable as a last resort — this is a ranking, not a veto');
+});
+check('W4 "She says I would love it" is treated as a relay, not a testimonial', () => {
+  // Order matters: a line containing BOTH markers must not collect the first-person
+  // bonus just because it says "I" somewhere.
+  const both = 'She says I would love how soft and comfortable these joggers are.';
+  const plain = 'I would love how soft and comfortable these joggers are.';
+  assert.ok(scoreQuote(both) < scoreQuote(plain),
+    'the reported-speech penalty must win over the first-person bonus');
+});
+check('W5 the preference is bounded — it cannot outrank what the review says', () => {
+  // A first-person line that is otherwise empty must not beat a specific, substantive
+  // third-person one. The bonus breaks near-ties; it does not override content.
+  const thin = 'I like it.';
+  const rich = 'The Strato Tech held up through six months of daily wear and still looks new.';
+  assert.ok(scoreQuote(rich) > scoreQuote(thin),
+    'a substantive line must beat a thin first-person one');
+});
+check('W6 voice is judged on the TEXT, never on the source', () => {
+  // Guards the inference I got wrong: a blog or YouTube attribution must not by itself
+  // change a quote's rank. Same text, different provenance -> identical score.
+  const text = 'I have worn these every day since June and they still look new.';
+  assert.strictEqual(scoreQuote(text), scoreQuote(text),
+    'scoreQuote must be a pure function of the text');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'layoutInputService.js'), 'utf8');
+  // COMMENTS STRIPPED. The rationale for this rule necessarily NAMES the platforms it
+  // refuses to branch on, so a raw-source pin fails on its own explanation — the same
+  // trap that has bitten these harnesses before. Only executable code counts.
+  const region = src.slice(src.indexOf('function scoreQuote'), src.indexOf('function pickStrongestQuote'))
+    .split('\n')
+    .filter((l) => { const t = l.trim(); return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*'); })
+    .join('\n');
+  assert.ok(!/youtube|blog|instagram|tiktok|influencer/i.test(region),
+    'scoring must not branch on the publishing platform — provenance is not intent');
+});
+
   // Sequential, not Promise.all — several of these monkey-patch the shared
   // atlasLlmService module's exports and restore them in a finally block;
   // running them concurrently would race on that shared mutable state.

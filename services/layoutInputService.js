@@ -1377,6 +1377,63 @@ const EXPERIENCE_VERB = /\b(bought|purchas(ed|ing)|got|use[ds]?|using|wore|weari
 
 const DURATION_REF = /\b(week|weeks|month|months|day|days|hour|hours|year|years|minute|minutes|second|seconds|since|for months|for years|for weeks|all day|every day)\b/i;
 
+// PREFER A DIRECT TESTIMONIAL — owner directive 2026-08-11: *"It should prefer direct
+// testimonials, but those can be used otherwise."*
+//
+// A PREFERENCE, NOT A GATE, and the distinction is the whole point. The tempting
+// shortcut is to judge by SOURCE — treat a blog or a YouTube channel as "not a real
+// customer" — and that inference is simply not supported: "A Busy Dad's Honest Review"
+// is as likely to be someone writing up a purchase as it is to be sponsored content,
+// and a video review is very often just a customer with a camera. We cannot read intent
+// off a domain name.
+//
+// What we CAN read is VOICE. "I've worn these every day since June" is a person
+// describing their own experience; "She says the bra provides the most comfortable
+// support" is that person relaying someone else's. Only the first is a testimonial in
+// the sense an ad needs — the second attributes words to a third party who never
+// addressed us. So first-person voice earns a bonus and reported speech takes a
+// penalty, both bounded, and neither disqualifies: a well-written third-person line
+// still ranks and can still be used, it just loses to a customer speaking for themself.
+//
+// SIZED SMALL, AND HERE IS WHY. First-person pronouns are a WEAK PROXY: "Easy to wash,
+// they are super comfortable and held up after 6 months" is unmistakably a customer
+// describing their own experience and contains no pronoun at all. The absence of "I" is
+// not evidence of anything, so this signal must nudge and never decide.
+//
+// At +2 it was strong enough to cancel the funnel-stage lever — verifyProofBeat caught
+// it: at `stage: 'consideration'` a durability quote must outrank a repeat-purchase one,
+// and the bonus flipped that purely because the repeat-purchase line happened to say
+// "I". Stage is the mechanism that makes a quote match the AD'S INTENT; voice is a
+// tie-breaker about who is speaking. A tie-breaker must not outrank the intent.
+//
+// MEASURED, not guessed. Scoring the real fixtures across candidate values showed the
+// two constraints are in direct conflict for any single "big" number:
+//
+//   bonus   stage lever still works?   first-person beats a LONGER third-person line?
+//   0.5     yes (6.20 vs 6.00)         no  (5.50 vs 6.00)
+//   1.5     NO  (6.20 vs 7.00)         yes (6.50 vs 6.00)
+//
+// There is no value that does both — which is the answer, not a tuning problem. A
+// preference is not supposed to beat a third-person line that is simply better copy:
+// "The Strato Tech is so soft and comfortable, and it's moisture wicking…" is more
+// specific and longer than "Every single piece I have is well made", and it SHOULD
+// outrank it. What the preference has to do is win a near-tie between two otherwise
+// comparable lines. That is +0.5.
+//
+// The reported-speech penalty stays larger at -2: that one is not a proxy at all, it is
+// an explicit statement that the words belong to somebody who never addressed us.
+const FIRST_PERSON = /(?:^|[^a-z])(?:i|i'?m|i'?ve|i'?d|i'?ll|my|me|mine|we|we'?re|we'?ve|our|us)(?![a-z])/i;
+
+// Second-hand attribution. "She says…", "my wife says…", "the reviewer notes…" — the
+// speaker is reporting, not testifying. AGGREGATE_VOICE in quoteSnippetService covers
+// the plural summary register ("customers report…"); this covers the singular one,
+// which that pattern deliberately does not match.
+const REPORTED_SPEECH = /\b(?:he|she|they|my (?:wife|husband|partner|friend|mom|mum|dad|son|daughter|sister|brother)|the (?:reviewer|author|writer))\s+(?:\w+\s+){0,2}(?:says?|said|reports?|reported|notes?|noted|mentions?|mentioned|thinks?|thought|finds?|found|tells?|told)\b/i;
+
+const FIRST_PERSON_BONUS = Number(process.env.QUOTE_FIRST_PERSON_BONUS || 0.5);
+const REPORTED_SPEECH_PENALTY = Number(process.env.QUOTE_REPORTED_SPEECH_PENALTY || 2);
+
+
 // ── Sentiment gate ─────────────────────────────────────────────────
 // Any single hit here disqualifies the quote outright. False positives
 // are acceptable — losing a genuinely-positive quote that happens to
@@ -1466,6 +1523,12 @@ function scoreQuote(text, { stage = null, angleTerms = null } = {}) {
   if (/\d/.test(s))            score += 1;
   if (DURATION_REF.test(s))    score += 1;
   if (EXPERIENCE_VERB.test(s)) score += 1;
+
+  // VOICE — prefer a customer speaking for themself. See FIRST_PERSON above.
+  // Reported speech is checked first so a line that does both ("She says I would love
+  // it") is treated as the relay it is rather than earning the testimonial bonus.
+  if (REPORTED_SPEECH.test(s))   score -= REPORTED_SPEECH_PENALTY;
+  else if (FIRST_PERSON.test(s)) score += FIRST_PERSON_BONUS;
 
   // Penalties
   if (/^[A-Z\s!?.]{6,}$/.test(s))                       score -= 2;
@@ -3656,6 +3719,8 @@ module.exports = {
   // the same definition of praise, rather than each growing its own lexicon.
   hasPositiveSignal,
   hasHardLimiter,
+  // Exported so the harness ranks with the SHIPPED scorer rather than a copy.
+  scoreQuote,
   // Exported so scripts/verifyProofBeat.js can pin the R2 fix BEHAVIOURALLY
   // rather than by source scan. This is the function that decides ONE winning
   // tier for the rating/count pair and stamps `rating_source`; before it, two
