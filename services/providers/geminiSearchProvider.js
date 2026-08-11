@@ -211,6 +211,92 @@ function completeSentencesOnly(q, label) {
 }
 
 /**
+ * How many reviews an aggregate needs before its rating is allowed to WIN on merit.
+ * Env-tunable, validated, because a "5.0 stars" badge computed from three reviews is a
+ * number, not evidence.
+ */
+const RATING_MIN_CREDIBLE_REVIEWS = (() => {
+  const raw = process.env.RATING_MIN_CREDIBLE_REVIEWS;
+  const n = Number(raw);
+  if (raw != null && raw !== '' && Number.isInteger(n) && n >= 1 && n <= 100000) return n;
+  if (raw != null && raw !== '') {
+    console.warn(`   ⚠️  RATING_MIN_CREDIBLE_REVIEWS="${raw}" is not an integer in 1..100000 — using 50`);
+  }
+  return 50;
+})();
+
+/**
+ * pickBestRating(candidates) → { rating, reviewCount, ratingSource, ratingCandidates }
+ *
+ * A brand has SEVERAL public aggregates and they disagree violently. Measured on Vuori
+ * in one afternoon, three consecutive live refreshes stored three different ratings:
+ * 4.58★ / 15,626 (their own site), 3.8★ / 28, and 2.5★ / 126 (Trustpilot). Pass 2 was
+ * emitting whichever number the narrative happened to mention first, with no ranking
+ * and no record of the source — so whether a brand printed stars at all was luck of the
+ * draw per refresh, and a re-enrichment could silently take an ad format away.
+ *
+ * OWNER DECISION 2026-08-11, verbatim: *"prefer the highest number of stars with the
+ * most reviews, in this case 4.58 with 15K reviews should absolutely win"*.
+ *
+ * Ranked, in order:
+ *   1. CLEARS THE DISPLAY FLOOR and has a credible sample. Only a rating above
+ *      RATING_STAR_MIN can ever be typeset, so a 2.5 is not a candidate for the
+ *      decision the owner is actually making; and the sample floor is what stops
+ *      "5.0★ from 3 reviews" beating "4.58★ from 15,626", which the owner's rule read
+ *      literally would otherwise do.
+ *   2. MOST REVIEWS. Within the printable set, the biggest sample wins — that is the
+ *      "with the most reviews" half, and it is why 4.58/15,626 beats a thin 4.7.
+ *   3. HIGHEST RATING, as the tie-break.
+ * If nothing clears the floor, the largest sample is returned anyway: it is the honest
+ * summary of the brand, it is used as internal signal by the Director, and it prints no
+ * stars regardless.
+ *
+ * NOTE, PLAINLY: this can select a brand's SELF-REPORTED site aggregate over a lower
+ * third-party one. That is the owner's explicit call. `ratingSource` records which site
+ * won and `ratingCandidates` keeps the full set, so the choice is auditable rather than
+ * invisible — which is the part that was actually broken.
+ */
+function pickBestRating(candidates) {
+  const rows = (Array.isArray(candidates) ? candidates : [])
+    .map((c) => ({
+      rating: (typeof c?.rating === 'number' && Number.isFinite(c.rating) && c.rating > 0 && c.rating <= 5)
+        ? c.rating : null,
+      reviewCount: (typeof c?.reviewCount === 'number' && Number.isFinite(c.reviewCount) && c.reviewCount > 0)
+        ? Math.floor(c.reviewCount) : null,
+      source: (typeof c?.source === 'string' && c.source.trim()) ? c.source.trim() : null
+    }))
+    .filter((c) => c.rating != null);
+  if (!rows.length) return { rating: null, reviewCount: null, ratingSource: null, ratingCandidates: [] };
+
+  let starMin = 4.39;
+  try {
+    const { RATING_STAR_MIN } = require('../ratingDisplay');
+    if (typeof RATING_STAR_MIN === 'number') starMin = RATING_STAR_MIN;
+  } catch (_) { /* fall back to the documented default */ }
+
+  const printable = (c) => c.rating > starMin && (c.reviewCount || 0) >= RATING_MIN_CREDIBLE_REVIEWS;
+  const ranked = rows.slice().sort((a, b) => {
+    const pa = printable(a), pb = printable(b);
+    if (pa !== pb) return pa ? -1 : 1;
+    const ca = a.reviewCount || 0, cb = b.reviewCount || 0;
+    if (ca !== cb) return cb - ca;
+    return b.rating - a.rating;
+  });
+  const winner = ranked[0];
+  if (rows.length > 1) {
+    const others = ranked.slice(1)
+      .map((c) => `${c.rating}★/${c.reviewCount ?? '?'}${c.source ? ` ${c.source}` : ''}`).join(', ');
+    console.log(`   · rating source: chose ${winner.rating}★ / ${winner.reviewCount ?? '?'} reviews${winner.source ? ` (${winner.source})` : ''} over ${others}`);
+  }
+  return {
+    rating: winner.rating,
+    reviewCount: winner.reviewCount,
+    ratingSource: winner.source,
+    ratingCandidates: ranked
+  };
+}
+
+/**
  * NARRATIVE_ORDER_NOTE — why every pass-1 prompt asks for the NUMBERS FIRST.
  *
  * MEASURED 2026-08-11, and it cost a live regression. Pass 1 is a grounded call whose
@@ -629,9 +715,12 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
   const searchPrompt =
     `Use Google Search to research the BRAND ${brandName}` +
     (brandUrl ? ` (${brandUrl})` : '') + `.\n\n` +
-    `FIRST — and this part must stay HONEST, not flattering: report the overall average star rating ` +
-    `(0-5) and the approximate total review count, naming the source you read them from, plus a ` +
-    `one-sentence summary of the brand's real reputation INCLUDING any recurring complaints. The ` +
+    `FIRST — and this part must stay HONEST, not flattering: list EVERY public review aggregate you ` +
+    `can find for this brand, ONE PER LINE, each as "<source>: <average star rating out of 5> from ` +
+    `<total review count> reviews" — the brand's own site, Trustpilot, Sitejabber, BBB, Google, ` +
+    `wherever. Do NOT pick one for me and do NOT average them; report each separately with its ` +
+    `source named, and say so if a source has no visible rating. Then give a one-sentence summary ` +
+    `of the brand's real reputation INCLUDING any recurring complaints. The ` +
     `rating and summary are internal signal used to decide whether we can make a claim at all; they ` +
     `are never TYPESET as a customer quote — though the Director does read the summary to calibrate ` +
     `voice, so keep it factual rather than flattering. Write these BEFORE any quotes.\n\n` +
@@ -684,7 +773,8 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
     `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "rating":      <number 0-5 or null>,\n` +
+    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average\n` +
+    `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall brand sentiment"\n` +
     `}\n` +
@@ -730,6 +820,18 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
                   required: ['text']
                 }
               },
+              ratings: {
+                type: 'array',
+                nullable: true,
+                items: {
+                  type: 'object',
+                  properties: {
+                    source:      { type: 'string', nullable: true },
+                    rating:      { type: 'number', nullable: true },
+                    reviewCount: { type: 'number', nullable: true }
+                  }
+                }
+              },
               rating:      { type: 'number',  nullable: true },
               reviewCount: { type: 'integer', nullable: true },
               summary:     { type: 'string',  nullable: true }
@@ -764,12 +866,17 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     // stamped so nothing downstream can present them as first-party customer
     // reviews — see stampLlmQuotes().
     quotes:      stampLlmQuotes(keepVerbatimQuotes(parsed.quotes, narrative, 'brand-reviews'), 'brand'),
-    rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
-    reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
+    // ONE number is chosen from ALL the aggregates found, by an explicit rule, and the
+    // choice is recorded — see pickBestRating. The legacy single `rating` is folded in as
+    // just another candidate so an older-shaped response still works.
+    ...pickBestRating([
+      ...(Array.isArray(parsed.ratings) ? parsed.ratings : []),
+      { rating: parsed.rating, reviewCount: parsed.reviewCount, source: null }
+    ]),
     summary:     parsed.summary || null,
     source:      PROVIDER_NAME
   };
-  console.log(`   ✓ brand-reviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''}${result.reviewCount != null ? ` · ${result.reviewCount.toLocaleString()} reviews` : ''} (${Date.now() - t0}ms, two-pass)`);
+  console.log(`   ✓ brand-reviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''}${result.reviewCount != null ? ` · ${result.reviewCount.toLocaleString()} reviews` : ''}${result.ratingSource ? ` · via ${result.ratingSource}` : ''} (${Date.now() - t0}ms, two-pass)`);
   return result;
 }
 
@@ -791,9 +898,12 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
   const searchPrompt =
     `Use Google Search to research the PRODUCT ${productLabel}` +
     (productUrl ? ` (${productUrl})` : '') + `.\n\n` +
-    `FIRST — and this part must stay HONEST, not flattering: report the average star rating (0-5) ` +
-    `and the approximate review count, naming the source you read them from, plus a one-sentence ` +
-    `summary of how reviewers really feel about this product INCLUDING any recurring complaints. The ` +
+    `FIRST — and this part must stay HONEST, not flattering: list EVERY place this product has a ` +
+    `visible review aggregate, ONE PER LINE, each as "<source>: <average star rating out of 5> from ` +
+    `<total review count> reviews" — the brand's own product page, retailers, review sites. Do NOT ` +
+    `pick one for me and do NOT average them; report each separately with its source named. Then ` +
+    `give a one-sentence summary of how reviewers ` +
+    `really feel about this product INCLUDING any recurring complaints. The ` +
     `rating and summary are internal signal used to decide whether we can make a claim at all; they ` +
     `are never typeset as a customer quote. Write these BEFORE any quotes.\n\n` +
     `THEN surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in quotation ` +
@@ -844,7 +954,8 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
     `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "rating":      <number 0-5 or null>,\n` +
+    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average\n` +
+    `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall product sentiment"\n` +
     `}\n` +
@@ -891,6 +1002,18 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
                   required: ['text']
                 }
               },
+              ratings: {
+                type: 'array',
+                nullable: true,
+                items: {
+                  type: 'object',
+                  properties: {
+                    source:      { type: 'string', nullable: true },
+                    rating:      { type: 'number', nullable: true },
+                    reviewCount: { type: 'number', nullable: true }
+                  }
+                }
+              },
               rating:      { type: 'number',  nullable: true },
               reviewCount: { type: 'integer', nullable: true },
               summary:     { type: 'string',  nullable: true }
@@ -925,12 +1048,17 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
     // stamped so nothing downstream can present them as first-party customer
     // reviews — see stampLlmQuotes().
     quotes:      stampLlmQuotes(keepVerbatimQuotes(parsed.quotes, narrative, 'product-reviews'), 'product'),
-    rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
-    reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
+    // ONE number is chosen from ALL the aggregates found, by an explicit rule, and the
+    // choice is recorded — see pickBestRating. The legacy single `rating` is folded in as
+    // just another candidate so an older-shaped response still works.
+    ...pickBestRating([
+      ...(Array.isArray(parsed.ratings) ? parsed.ratings : []),
+      { rating: parsed.rating, reviewCount: parsed.reviewCount, source: null }
+    ]),
     summary:     parsed.summary || null,
     source:      PROVIDER_NAME
   };
-  console.log(`   ✓ product-reviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''}${result.reviewCount != null ? ` · ${result.reviewCount.toLocaleString()} reviews` : ''} (${Date.now() - t0}ms, two-pass)`);
+  console.log(`   ✓ product-reviews: ${result.quotes.length} quote(s)${result.rating != null ? ` · ${result.rating.toFixed(1)}★` : ''}${result.reviewCount != null ? ` · ${result.reviewCount.toLocaleString()} reviews` : ''}${result.ratingSource ? ` · via ${result.ratingSource}` : ''} (${Date.now() - t0}ms, two-pass)`);
   return result;
 }
 
@@ -951,6 +1079,8 @@ module.exports = {
   completeSentencesOnly,
   screenAdUsableSentiment,
   loadSentimentJudge,
+  pickBestRating,
+  RATING_MIN_CREDIBLE_REVIEWS,
   GROUNDED_PASS1_CONFIG,
   GROUNDED_PASS2_MAX_TOKENS,
   GROUNDED_CALL_TIMEOUT_MS,

@@ -579,7 +579,16 @@ function loadAdCopyJudge() {
   try {
     const { hasPositiveSignal, hasHardLimiter } = require('./layoutInputService');
     if (typeof hasPositiveSignal !== 'function' || typeof hasHardLimiter !== 'function') return null;
-    return (text) => hasPositiveSignal(text) && !hasHardLimiter(text);
+    return (text) => {
+      // SUBSTANCE, not just sentiment. Sensory adjectives now open the positivity gate
+      // (owner decision 2026-08-11), which is right for "the softest sweatpants I've
+      // ever put on" and would be wrong for a bare "Soft." reaching a frame as the
+      // testimonial. A curated snippet is deliberately short, so the floor is words,
+      // not characters — four is enough for a clause that says something.
+      const words = String(text || '').trim().split(/\s+/).filter(Boolean).length;
+      if (words < 4) return false;
+      return hasPositiveSignal(text) && !hasHardLimiter(text);
+    };
   } catch (err) {
     console.warn(`   ⚠️  static quote: ad-copy judge unavailable (${err.message}) — restricting to whole-sentence forms`);
     return null;

@@ -1331,13 +1331,26 @@ const STRONG_POSITIVE = /\b(love[ds]?|loving|adore[ds]?|adoring|obsess(ed|ion)|a
 
 const MODERATE_POSITIVE = /\b(great|excellent|high[- ]?quality|top[- ]?notch|first[- ]?rate|solid|dependable|reliable|sturdy|durable|comfortable|cozy|effective|efficient|recommend(ed|ing|ation)?|happy|satisfied|pleased|smooth|reliable|noticeable|convenient|handy|well[- ]?made|thoughtful|beautifully|nicely)\b/gi;
 
-// SCORING ONLY — deliberately NOT part of hasPositiveSignal.
-// "soft", "breathable", "true to size" are how apparel and bedding reviews
-// actually praise a product, so they belong in the RANKING. They must not open the
-// printability gate: hasPositiveSignal shares MODERATE_POSITIVE, and putting them
-// there made bare fragments like "True to size" or "Soft enough for light
-// activity" qualify as endorsements. Ranking and permission are different
-// questions, and adversarial review caught them being conflated.
+// SENSORY PRAISE COUNTS AS PRAISE (owner decision 2026-08-11).
+//
+// This list was previously SCORING-ONLY, on the reasoning that bare fragments like
+// "True to size" or "Soft enough for light activity" would otherwise qualify as
+// endorsements. That reasoning was sound about FRAGMENTS and wrong about sentences: it
+// meant *"These might be the softest sweatpants I've ever put on."* — real, specific,
+// enthusiastic apparel praise — was thrown away at intake, because "soft" was the only
+// positive word in it and this list did not open the gate. Measured on Vuori: 6 of 12
+// retrieved quotes dropped, several of them genuinely good copy.
+//
+// So the ADJECTIVES move into the positivity bar (below), and the two bare FIT
+// DESCRIPTORS stay scoring-only — "true to size" and "holds its shape" state a fact
+// about sizing rather than expressing praise, and they are exactly the fragments the
+// earlier review named. The other protection against bare fragments is unchanged and
+// does the real work: scoreQuote's SCORE_FLOOR rejects short generic filler, and the
+// static typeset judge additionally requires several words, so "Soft." cannot become a
+// testimonial on its own.
+const SENSORY_POSITIVE = /\b(soft|softer|softest|breathable|flattering|supportive|buttery|plush|cushion(ed|y)?|cool(ing)?|stretchy|weightless)\b/gi;
+
+// STILL SCORING ONLY: these state a fact about fit, they do not praise.
 const SCORING_POSITIVE = /\b(soft|softer|softest|breathable|flattering|supportive|true to size|holds? (?:its )?shape)\b/gi;
 
 const PHRASE_STRONG = /\b(worth every penny|worth the money|worth it|highly recommend|would recommend|five stars?|5[- ]?stars?|10\/10|hands down|blown away|blew me away|exceeded (my )?expectations|pleasantly surprised|fell in love|in love with|couldn't be happier|couldn'?t be more pleased|better than expected)\b/gi;
@@ -1694,13 +1707,14 @@ function hasPositiveSignal(text) {
   const hasPositive =
        STRONG_POSITIVE.test(s)
     || MODERATE_POSITIVE.test(s)
-    || PHRASE_STRONG.test(s);
-  // Reset the regex `lastIndex` state since STRONG_POSITIVE/MODERATE_POSITIVE
-  // use the global flag; leaving lastIndex non-zero would break subsequent
-  // matches on the next call.
+    || PHRASE_STRONG.test(s)
+    || SENSORY_POSITIVE.test(s);
+  // Reset the regex `lastIndex` state since these use the global flag; leaving
+  // lastIndex non-zero would break subsequent matches on the next call.
   STRONG_POSITIVE.lastIndex = 0;
   MODERATE_POSITIVE.lastIndex = 0;
   PHRASE_STRONG.lastIndex = 0;
+  SENSORY_POSITIVE.lastIndex = 0;
   if (!hasPositive) return false;
   return !NEGATED_POSITIVE.test(s) && !NEGATIVE_SENTIMENT.test(s);
 }
