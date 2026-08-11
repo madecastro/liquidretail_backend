@@ -384,8 +384,23 @@ router.get('/categories', async (req, res) => {
       .lean();
 
     // Product count per category (single aggregation; cheap).
+    //
+    // Mongoose .find() auto-casts string advertiserId → ObjectId based
+    // on the schema; aggregate() does NOT. tenantFilter writes
+    // req.advertiserId as a String, so passing its result straight into
+    // $match compares '<string>' to ObjectId docs and matches nothing —
+    // every category then shows productCount:0. Same class of bug
+    // CLAUDE.md §4 flags. Cast explicitly here (same pattern the main
+    // GET /api/catalog handler uses at aggFilter).
+    const aggAdvertiserId = mongoose.isValidObjectId(req.advertiserId)
+      ? new mongoose.Types.ObjectId(String(req.advertiserId))
+      : req.advertiserId;
     const counts = await CatalogProduct.aggregate([
-      { $match: tenantFilter(req, { brandId: brandObjectId, categoryRef: { $ne: null } }) },
+      { $match: {
+          advertiserId: aggAdvertiserId,
+          brandId:      brandObjectId,
+          categoryRef:  { $ne: null }
+      } },
       { $group: { _id: '$categoryRef', count: { $sum: 1 } } }
     ]);
     const countMap = new Map(counts.map(c => [String(c._id), c.count]));
