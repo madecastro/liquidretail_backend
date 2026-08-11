@@ -39,7 +39,7 @@ const Campaign                  = require('../models/Campaign');
 const CatalogProduct            = require('../models/CatalogProduct');
 const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
-const { recordFlatCost, finalizeFlatCost } = require('./costTracker');
+const { recordFlatCost, finalizeFlatCost, reconcileCost } = require('./costTracker');
 const referenceDefaultsService  = require('./referenceDefaultsService');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor, enforceRawByteCap } = require('./veoPromptBuilder');
@@ -1887,7 +1887,10 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
           // neither. NEVER cleared once true.
           billed = true;
 
-          const outUrl = await pollPrediction(id);
+          const pollOut = await pollPrediction(id);
+          // pollPrediction returns { url, price } (price is for video-master
+          // cost reconcile; reframe ledgers its own flat estimate and ignores it).
+          const outUrl = pollOut && typeof pollOut === 'object' ? pollOut.url : pollOut;
 
           // Retried (free, idempotent) — see fetchOutpaintOutput. A single blip
           // here used to discard a generation we had already paid for.
@@ -2736,6 +2739,134 @@ function confirmedCharge(data) {
 }
 
 /**
+ * Defensive parse of Atlas's settled prediction `price`.
+ *
+ * Atlas returns the figure as a STRING (measured: `"0.9"`, `"0.75"`). A bad
+ * value must NEVER overwrite a ledger estimate with 0 — an unusable price
+ * leaves the estimate in place for a later re-poll (or forever).
+ *
+ * Returns a finite positive number, or null when the value is unusable.
+ * Exported for scripts/verifyVideoCostReconcile.js.
+ */
+function parseAtlasSettledPrice(raw) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+/**
+ * Re-poll a settled prediction and upgrade its CostLog row from estimate →
+ * actual. Fire-and-forget: a finished video must never wait on telemetry.
+ *
+ * Mirrors atlasImageService.scheduleCostReconcile. Same delay budget — the
+ * GET is free, unref'd, and cannot delay or fail a render. Image path needs
+ * this often (price usually lands after the image returns); video path
+ * usually has the price on the terminal poll (measured 2026-08-11 on Omni
+ * developer) and only falls through here when that value is absent.
+ *
+ * Uses reconcileCost (not finalizeFlatCost) so a late/duplicate call cannot
+ * overwrite a row already marked actual, and a missing row is left missing
+ * rather than inventing spend.
+ */
+function scheduleVideoCostReconcile(predictionId, attempt = 0) {
+  if (!predictionId) return;
+  const delays = [3000, 10_000, 30_000, 60_000, 120_000, 300_000];
+  if (attempt >= delays.length) {
+    console.warn(
+      `   ⚠️  atlasVideo: cost for ${predictionId} never published after ${delays.length} reads — ` +
+      `row stays estimated (MODEL_CAPS formula; Omni developer 10s is ~33% HIGH vs settled $0.90 — do not treat as spend)`
+    );
+    return;
+  }
+  setTimeout(async () => {
+    try {
+      const res = await axios.get(`${BASE_URL}/model/prediction/${predictionId}`, {
+        headers: { Authorization: `Bearer ${apiKey()}` },
+        timeout: 15_000,
+        validateStatus: () => true
+      });
+      const price = parseAtlasSettledPrice(res.data?.data?.price);
+      if (price != null) {
+        await reconcileCost({ providerRequestId: predictionId, costUsd: price });
+        return;
+      }
+      scheduleVideoCostReconcile(predictionId, attempt + 1);
+    } catch (err) {
+      console.warn(`   ⚠️  atlasVideo: cost reconcile read failed for ${predictionId}: ${err.message}`);
+      scheduleVideoCostReconcile(predictionId, attempt + 1);
+    }
+  }, delays[attempt]).unref?.();
+}
+
+/**
+ * Upgrade the charge-point CostLog row to Atlas's settled price once the
+ * prediction is terminal-ok.
+ *
+ * IMPORTANT MEASURED DIFFERENCE vs images (2026-08-11): for VIDEO the price
+ * appears to be published AT completion — both live 10s 1080p 16:9 Omni
+ * developer predictions carried `price:"0.9"` on the terminal poll. Images
+ * usually publish later (7/38 had price at completion). So: if the terminal
+ * payload already carries a usable price, finalize IMMEDIATELY and do not
+ * schedule a re-poll. Only fall back to scheduleVideoCostReconcile when the
+ * terminal response has no usable price.
+ *
+ * Fire-and-forget by contract: callers MUST NOT await this. The helper never
+ * throws into the render path (finalize failures are swallowed).
+ *
+ * Uses finalizeFlatCost keyed on providerRequestId so the charge-point row is
+ * UPDATED in place — a second recordFlatCost would double-count spend.
+ * costSource:'actual' matches the image path's settled-price marking.
+ *
+ * deps is for offline harness injection only (no DB/network).
+ *
+ * Returns a small decision object for harnesses:
+ *   { action: 'immediate', costUsd, scheduled: false }
+ *   { action: 'scheduled', costUsd: null, scheduled: true }
+ */
+function reconcileVideoCostFromTerminal(predictionId, terminalData = {}, deps = {}) {
+  if (!predictionId) return { action: 'noop', costUsd: null, scheduled: false };
+  const costUsd = parseAtlasSettledPrice(terminalData?.price);
+  if (costUsd != null) {
+    // Immediate path — terminal poll already has the settled figure.
+    const finalize = deps.finalizeFlatCost || finalizeFlatCost;
+    try {
+      const ret = finalize({
+        providerRequestId: predictionId,
+        costUsd,
+        costSource: 'actual',
+        // Charge-point wrote status:'submitted'; a successful delivery is 'ok'
+        // (matches atlasImageService's completed branch).
+        status: deps.status || 'ok',
+      });
+      if (ret && typeof ret.then === 'function') {
+        ret.catch((err) => {
+          console.warn(
+            `   ⚠️  atlasVideo: cost finalize failed for ${predictionId}: ${err?.message || err}`
+          );
+        });
+      }
+    } catch (err) {
+      console.warn(
+        `   ⚠️  atlasVideo: cost finalize threw for ${predictionId}: ${err?.message || err}`
+      );
+    }
+    return { action: 'immediate', costUsd, scheduled: false };
+  }
+  // No usable price on the terminal payload — schedule the image-shaped
+  // re-poll. Leave the estimate untouched until a real figure lands.
+  const schedule = deps.schedule || scheduleVideoCostReconcile;
+  try {
+    schedule(predictionId);
+  } catch (err) {
+    console.warn(
+      `   ⚠️  atlasVideo: could not schedule cost reconcile for ${predictionId}: ${err?.message || err}`
+    );
+  }
+  return { action: 'scheduled', costUsd: null, scheduled: true };
+}
+
+/**
  * RESUME a video generation from its spend receipt (Ad.veoPredictionId).
  *
  * THIS FUNCTION MUST NEVER SUBMIT. That is its entire reason to exist: the
@@ -2868,7 +2999,12 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       if (!url) throw new Error(`atlasVideo: ${status} but no output url (predictionId=${predictionId})`);
       const elapsedSec = Math.round((Date.now() - t0) / 1000);
       console.log(`🎬 atlasVideo: ${predictionId} done after ${elapsedSec}s (${pollCount} polls)`);
-      return url;
+      // Return the settled `price` alongside the URL so the caller can
+      // reconcile the charge-point CostLog row WITHOUT a second GET when
+      // Atlas already published the figure (the common video case —
+      // measured 2026-08-11). Shape is { url, price }; price may be
+      // absent/null — reconcileVideoCostFromTerminal handles that.
+      return { url, price: data.price ?? null };
     }
     if (TERMINAL_FAILURE_STATUSES.has(status)) {
       // Classify before throwing. The image path has routed failures through
@@ -3392,7 +3528,10 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     hasProductReference: hasProductAnchor,
     storyboard,
     caps,
-    durationSec
+    durationSec,
+    // Destination for prompt-profile selection (PMax → PMAX_DIRECTIVES).
+    // Meta / absent → Omni/Grok path unchanged (byte-identical).
+    platformFormat: ad.platformFormat || null
   };
   // Whitespace-only operatorPrompt must NOT count as an override — trim-gate
   // branch 1 so it falls through to raw/guidance like an empty refinement.
@@ -3426,6 +3565,9 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   const stagePrefix = `master video generation (${aspectRatio})`;
   let predictionId;
   let remoteVideoUrl;
+  // Settled Atlas price from the terminal poll (string or null). Used to
+  // upgrade the charge-point estimate → actual without a re-poll when present.
+  let terminalSettledPrice = null;
 
   // ── PROVIDER-FAULT RETRY ──────────────────────────────────────────────────
   // Atlas's video model intermittently accepts a job and then fails it without
@@ -3513,10 +3655,14 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     }
 
     try {
-      remoteVideoUrl = await pollPrediction(predictionId, {
+      const pollOut = await pollPrediction(predictionId, {
         adId: ad._id,
         stagePrefix
       });
+      // pollPrediction returns { url, price } so we can reconcile from the
+      // terminal payload when Atlas already published the settled figure.
+      remoteVideoUrl = pollOut && typeof pollOut === 'object' ? pollOut.url : pollOut;
+      terminalSettledPrice = pollOut && typeof pollOut === 'object' ? pollOut.price : null;
       break;
     } catch (err) {
       const maxAttempts = err.policyMaxAttempts || 1;
@@ -3569,6 +3715,18 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
       await new Promise((r) => setTimeout(r, backoffMs));
     }
   }
+
+  // ── COST RECONCILE (fire-and-forget) ────────────────────────────────────
+  // Charge-point wrote an ESTIMATE from MODEL_CAPS (Omni developer 10s →
+  // $1.20). Measured settled price on that model is $0.90 — the estimate is
+  // ~33% HIGH, so every unreconciled video row over-reports spend.
+  //
+  // NEVER await. Telemetry must not delay download/upload or fail a render
+  // after payment. When the terminal poll already carries a usable price
+  // (common for video; measured 2026-08-11), finalize immediately; otherwise
+  // schedule a re-poll. See reconcileVideoCostFromTerminal.
+  reconcileVideoCostFromTerminal(predictionId, { price: terminalSettledPrice });
+
   adStage(ad._id, `downloading master video (${aspectRatio})`);
   const videoBuffer = await downloadToBuffer(remoteVideoUrl);
 
@@ -3677,7 +3835,10 @@ async function buildPromptScaffold({
     hasProductReference: true,
     operatorPrompt: null,
     caps,
-    durationSec: resolvedDuration
+    durationSec: resolvedDuration,
+    // Same destination selector as generateForAd — scaffold for a PMax
+    // format must preview the PMax profile, not the Meta/Omni default.
+    platformFormat: platformFormat || null
   });
   return {
     prompt,
@@ -3735,6 +3896,10 @@ module.exports = {
   resolveReferenceImageCount,
   resolveDurationSec,
   estimateRenderCostUsd,
+  // Cost reconcile — scripts/verifyVideoCostReconcile.js (offline).
+  parseAtlasSettledPrice,
+  reconcileVideoCostFromTerminal,
+  scheduleVideoCostReconcile,
   validateVideoSettings,
   buildSubmissionBody,
   imageDimsForAspect,
