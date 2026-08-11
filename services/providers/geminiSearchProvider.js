@@ -80,7 +80,85 @@ function keepVerbatimQuotes(quotes, narrative, label) {
   if (dropped > 0) {
     console.warn(`   ⚠️  ${label}: dropped ${dropped} quote(s) not verbatim in the grounded narrative (possible fabrication)`);
   }
-  return kept.map((q) => completeSentencesOnly(q, label)).filter(Boolean);
+  // THREE STAGES, ALL UNCONDITIONAL: verbatim (above) → complete sentence → ad-usable
+  // sentiment. The screen runs LAST, on the text that will actually be typeset, because
+  // trimming can change what a quote says.
+  const judge = loadSentimentJudge(label);
+  return kept
+    .map((q) => completeSentencesOnly(q, label))
+    .filter(Boolean)
+    .filter((q) => screenAdUsableSentiment(q, judge, label));
+}
+
+/**
+ * loadSentimentJudge(label) → fn|null
+ *
+ * The render path's own sentiment gate, resolved ONCE per retrieval rather than per
+ * quote. Required lazily so a provider module carries no load-order coupling to the
+ * render service (layoutInputService pulls in mongoose and a dozen models).
+ */
+function loadSentimentJudge(label) {
+  try {
+    // pickStrongestQuote, NOT hasPositiveSignal on its own. It is the render path's
+    // own primary-quote selector, and for a single candidate it applies the FULL bar:
+    //   · HARD_LIMITER          → -Infinity  ("low-support option best suited for
+    //                                          lighter activities" argues against the sale
+    //                                          yet contains "best", so hasPositiveSignal
+    //                                          alone lets it through)
+    //   · NEGATED_POSITIVE      → -Infinity  ("not as soft as I hoped")
+    //   · NEGATIVE_SENTIMENT    → -Infinity
+    //   · scoreQuote < SCORE_FLOOR → rejected (this is what catches MEDIOCRE: short
+    //                                generic filler scores below the floor even when it
+    //                                contains a positive lexeme)
+    //   · hasPositiveSignal(best.text) as the final word
+    // Reusing the selector means intake and selection cannot disagree: nothing is
+    // stored that the render path would refuse to print, and nothing is refused at
+    // print that intake thought was fine.
+    const { pickStrongestQuote } = require('../layoutInputService');
+    if (typeof pickStrongestQuote !== 'function') return null;
+    return (text) => pickStrongestQuote([{ text }]) !== null;
+  } catch (err) {
+    console.warn(`   ⚠️  ${label}: sentiment judge unavailable (${err.message}) — every quote will be dropped rather than shipped unjudged`);
+    return null;
+  }
+}
+
+/**
+ * screenAdUsableSentiment — MEDIOCRE AND NEGATIVE STOP HERE.
+ *
+ * OWNER DIRECTIVE 2026-08-11, verbatim: *"at no time should mediocre or negative
+ * sentiment pass any gate from initial screening to selection for use in an ad."*
+ *
+ * Before this, positivity was enforced by PROMPT TEXT at retrieval and by
+ * `hasPositiveSignal` at render — which meant an ungated middle: a complete, verbatim,
+ * thoroughly mediocre quote was STORED as ad-usable, counted toward the pool, shown in
+ * the brand UI, and reached a frame on any path whose render-side gate was weaker.
+ * Measured on real retrieved Vuori quotes, all of which passed retrieval:
+ * *"All clothes, including the workout shorts, have a slim, tailored fit."* (neutral
+ * description), *"The fit around the leg is just loose and casual enough to not feel
+ * oversized and baggy but not skin tight like a legging."* (hedged), *"They go on flash
+ * sale and/or 20% off."* (promotional). None of them sells anything.
+ *
+ * THE BAR IS THE RENDER PATH'S OWN SELECTOR — `pickStrongestQuote` — not a private
+ * notion of positive. See loadSentimentJudge for what that pulls in (hard limiters,
+ * negation, a score floor that is what actually catches mediocrity, and
+ * hasPositiveSignal as the final word). Reused, never reimplemented: one definition
+ * from intake to typesetting means the two cannot drift.
+ *
+ * FAILS CLOSED. No judge → drop. An unjudged quote is worth less than no quote: the
+ * pool being short costs an ad format, printing a mediocre or negative line costs the
+ * client. Measured cost of strictness on the live Vuori pool: 11 retrieved → the clear
+ * praise survives, the descriptive filler does not.
+ *
+ * @returns {boolean} true when the quote may proceed toward an ad
+ */
+function screenAdUsableSentiment(q, judge, label) {
+  const text = String(q?.text || '').trim();
+  if (!text) return false;
+  if (!judge) return false;                      // fail closed
+  if (judge(text)) return true;
+  console.warn(`   ⚠️  ${label}: dropped a quote that is not clearly positive — ${JSON.stringify(text.slice(0, 60))}`);
+  return false;
 }
 
 /**
@@ -123,33 +201,87 @@ function completeSentencesOnly(q, label) {
     console.warn(`   ⚠️  ${label}: dropped a quote that never completes a sentence`);
     return null;
   }
-  // A TRIM CAN INVERT THE MEANING, so the kept span is re-judged, not assumed.
-  // Adversarial review found the case: "I hated the old ones. These are great and
-  // soft" trims to "I hated the old ones." — a complete sentence, verbatim, and a
-  // fabricated NEGATIVE endorsement in a paid ad. Same for a hedge opener ("Not for
-  // everyone. I love them and wear"). The full quote was never judged as this
-  // shorter string, so the shorter string has to clear the bar on its own.
-  //
-  // hasPositiveSignal is the render path's own gate (requires praise AND no
-  // negative sentiment / negated positive), reused rather than reimplemented so the
-  // two cannot drift. Required lazily and only on this branch: the untouched path
-  // above — the overwhelming majority — pays nothing, and there is no load-order
-  // coupling between a provider and the render service. If it cannot be reached,
-  // DROP: an unjudged rewrite must never reach an ad.
-  let staysPositive = false;
-  try {
-    const { hasPositiveSignal } = require('../layoutInputService');
-    staysPositive = typeof hasPositiveSignal === 'function' && hasPositiveSignal(trimmed);
-  } catch (err) {
-    console.warn(`   ⚠️  ${label}: could not re-judge a trimmed quote (${err.message}) — dropping it`);
-    return null;
-  }
-  if (!staysPositive) {
-    console.warn(`   ⚠️  ${label}: dropped a trimmed quote that no longer reads as positive`);
-    return null;
-  }
+  // A TRIM CAN INVERT THE MEANING — "I hated the old ones. These are great and soft"
+  // trims to "I hated the old ones.", a complete, verbatim, fabricated NEGATIVE
+  // endorsement. That is caught by screenAdUsableSentiment, which runs AFTER this on
+  // the trimmed text for exactly this reason. Completeness is judged here; sentiment
+  // is judged in one place, on the final string, for every quote.
   console.warn(`   ⚠️  ${label}: trimmed a mid-sentence quote back to its last complete sentence`);
   return Object.assign({}, q, { text: trimmed });
+}
+
+/**
+ * NARRATIVE_ORDER_NOTE — why every pass-1 prompt asks for the NUMBERS FIRST.
+ *
+ * MEASURED 2026-08-11, and it cost a live regression. Pass 1 is a grounded call whose
+ * free-form narrative is the only thing pass 2 gets to read. Both pass-1 calls were
+ * hitting `finishReason: MAX_TOKENS` — the rating/summary request sat at the END of
+ * the prompt, so the model spent its entire budget enumerating quotes and never wrote
+ * the numbers at all. Pass 2 then correctly reported `rating: null`, the persist site
+ * replaced the stored aggregates wholesale, and brands silently lost their stars:
+ * Vuori went from 4.6★ / 15,545 to null, which makes `INTENTS.social_proof_led`
+ * ineligible outright.
+ *
+ * Two compounding causes, both fixed here:
+ *   1. ORDER. Widening the ask from "4-6 quotes" to `LLM_QUOTE_CAP` (12) with a
+ *      per-quote source + author + funnel stage made truncation certain rather than
+ *      unlikely. Anything the prompt asks for last is the first thing lost. The
+ *      numbers are cheap (two lines) and gate an ad format, so they go first.
+ *   2. THINKING TOKENS. gemini-2.5-flash bills hidden reasoning against
+ *      `maxOutputTokens`. The pass-2 calls already set `thinkingBudget: 0`; the
+ *      pass-1 calls never did, so a chunk of every budget went to thoughts nobody
+ *      reads. Pass 1 needs no reasoning — it reads search results and writes prose.
+ *
+ * Measured on Vuori, same 3000-token budget, quotes-last + thinking on → numbers-first
+ * + thinking off: `MAX_TOKENS`, 941 chars, 4 quotes, NO rating → `STOP`, 3026 chars,
+ * 12 quotes, rating AND count present. Same cost, ~3x the usable narrative.
+ */
+const GROUNDED_PASS1_CONFIG = {
+  temperature: 0.2,
+  // GENEROUSLY PADDED, ON PURPOSE (owner directive 2026-08-11). Output tokens are
+  // billed as USED, not as reserved, so a high ceiling costs nothing until it is
+  // needed — while a ceiling set close to the measured need is a silent data-loss
+  // bug the moment a brand has more reviews to talk about. Measured need with
+  // thinking off: ~750 output tokens for 12 quotes + numbers + summary. This is ~20x
+  // that. Do not "optimise" it back down; the tight budget IS what caused the
+  // regression this constant exists to prevent.
+  maxOutputTokens: 16000,
+  // Pass 1 summarises search results; it does not reason. Every thought token here is
+  // budget taken from the narrative pass 2 depends on.
+  thinkingConfig: { thinkingBudget: 0 }
+};
+
+/**
+ * Pass 2 reshapes the narrative into JSON. Same padding logic, same reason: the JSON
+ * for 12 quotes each carrying text + source + author + stage is several times larger
+ * than the 6-quote shape this was originally sized for, and a truncated response is
+ * unparseable — which returns an EMPTY quote pool and a null rating, i.e. exactly the
+ * failure mode as a silent success.
+ */
+const GROUNDED_PASS2_MAX_TOKENS = 12000;
+
+/** Grounded search with tools regularly lands at 30-40s under load, and a wider pool
+ *  writes more. A timeout here throws away a call that was already paid for, so this
+ *  is padded well past the 31.8s measured on a 12-quote brand run. */
+const GROUNDED_CALL_TIMEOUT_MS = 120000;
+
+/**
+ * Truncation must never be silent again.
+ *
+ * Nothing checked `finishReason`, so a narrative cut off mid-enumeration looked
+ * exactly like a complete one: the fetch "succeeded", quotes came back, and the only
+ * visible symptom was a missing star rating that read as "the web just didn't say".
+ * That is what made the regression above survive three live runs unnoticed.
+ *
+ * @returns {boolean} true when the response was truncated
+ */
+function warnIfTruncated(candidate, label) {
+  const reason = candidate && candidate.finishReason;
+  if (reason && reason !== 'STOP' && reason !== 'FINISH_REASON_STOP') {
+    console.warn(`   ⚠️  ${label}: grounded response ended with finishReason=${reason} — the narrative is INCOMPLETE, so the rating/summary may be missing rather than absent from the web`);
+    return true;
+  }
+  return false;
 }
 
 function stampLlmQuotes(rows, scope) {
@@ -348,9 +480,13 @@ async function match({ brand, category, caption, primarySubject, textDetected = 
     {
       contents: [{ role: 'user', parts }],
       tools: [{ google_search: {} }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 2400 }
+      // Padded like the review lookups (output tokens bill as used), but thinking is
+      // deliberately LEFT ON here: unlike a pass-1 summarisation, this call IDENTIFIES
+      // a product from an image + text, which is reasoning work. No measurement
+      // justifies turning it off, so it stays.
+      generationConfig: { temperature: 0.2, maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS }
     },
-    { timeout: 30000 }
+    { timeout: GROUNDED_CALL_TIMEOUT_MS }
   );
 
   const candidate = res.data?.candidates?.[0];
@@ -435,9 +571,13 @@ async function lookupBrandCategoryUrl({ brandUrl, brandName, label, category }) 
       {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 600 }
+        // Output here is four short lines, so 600 tokens LOOKED generous — but hidden
+        // thinking tokens bill against the same ceiling, which makes a 600-token
+        // grounded call a truncation waiting to happen. Padded rather than
+        // thinking-disabled: choosing the best collection page is judgement work.
+        generationConfig: { temperature: 0.1, maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS }
       },
-      { timeout: 30000 }
+      { timeout: GROUNDED_CALL_TIMEOUT_MS }
     );
   } catch (err) {
     console.warn(`   ⚠️  brand-category lookup failed: ${err.message}`);
@@ -485,21 +625,23 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
   const ledger = { brandId, cacheKey: brandName };
 
   // ── Pass 1: grounded narrative ──
+  // NUMBERS FIRST, QUOTES SECOND — the order is load-bearing, see NARRATIVE_ORDER_NOTE.
   const searchPrompt =
-    `Use Google Search to find what real customers say about the BRAND ${brandName}` +
-    (brandUrl ? ` (${brandUrl})` : '') +
-    `. Surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) ` +
-    `from review aggregators (Trustpilot, Sitejabber, BBB), Reddit threads, and brand-site ` +
+    `Use Google Search to research the BRAND ${brandName}` +
+    (brandUrl ? ` (${brandUrl})` : '') + `.\n\n` +
+    `FIRST — and this part must stay HONEST, not flattering: report the overall average star rating ` +
+    `(0-5) and the approximate total review count, naming the source you read them from, plus a ` +
+    `one-sentence summary of the brand's real reputation INCLUDING any recurring complaints. The ` +
+    `rating and summary are internal signal used to decide whether we can make a claim at all; they ` +
+    `are never TYPESET as a customer quote — though the Director does read the summary to calibrate ` +
+    `voice, so keep it factual rather than flattering. Write these BEFORE any quotes.\n\n` +
+    `THEN surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in quotation ` +
+    `marks) from review aggregators (Trustpilot, Sitejabber, BBB), Reddit threads, and brand-site ` +
     `testimonials. Prefer MORE quotes from a strong source over one-per-source variety — several ` +
     `excellent Reddit or Trustpilot quotes beat a token spread.\n\n` +
     `${AD_USABLE_QUOTE_DIRECTIVE}\n\n` +
     `For each quote, give the source platform and the author/handle if visible, and the funnel stage ` +
-    `it serves.\n\n` +
-    `SEPARATELY — and this part must stay HONEST, not flattering: report the overall average star ` +
-    `rating (0-5) and approximate total review count if visible, plus a one-sentence summary of the ` +
-    `brand's real reputation INCLUDING any recurring complaints. The rating and summary are internal ` +
-    `signal used to decide whether we can make a claim at all; they are never TYPESET as a customer quote — though the Director does read the summary to ` +
-    `calibrate voice, so keep it factual rather than flattering. Write naturally — do not format as JSON.`;
+    `it serves. Write naturally — do not format as JSON.`;
 
   let searchData;
   try {
@@ -508,8 +650,9 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 3000 }
-      }
+        generationConfig: GROUNDED_PASS1_CONFIG
+      },
+      GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
     console.warn(`   ⚠️  brand-reviews search failed: ${err.message}`);
@@ -517,6 +660,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
   }
 
   const searchCand = searchData?.candidates?.[0];
+  warnIfTruncated(searchCand, 'brand-reviews pass 1');
   const narrative = (searchCand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
   const sourceDomains = (searchCand?.groundingMetadata?.groundingChunks || [])
     .map(c => c.web?.uri && extractDomain(c.web.uri))
@@ -554,7 +698,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
         contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 2400,
+          maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS,
           responseMimeType: 'application/json',
           // gemini-2.5-flash burns hidden thinking tokens against the
           // visible budget; for a pure narrative → JSON shaping pass
@@ -593,7 +737,8 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
             required: ['quotes']
           }
         }
-      }
+      },
+      GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
     console.warn(`   ⚠️  brand-reviews structuring failed: ${err.message}`);
@@ -642,22 +787,23 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
   const ledger = { brandId, productId, cacheKey: productName };
 
   // ── Pass 1: grounded narrative ──
+  // NUMBERS FIRST, QUOTES SECOND — see NARRATIVE_ORDER_NOTE.
   const searchPrompt =
-    `Use Google Search to find what real customers say about the PRODUCT ${productLabel}` +
-    (productUrl ? ` (${productUrl})` : '') +
-    `. Surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) ` +
-    `about THIS EXACT product. Pull from retailer review sections, Reddit discussions, YouTube ` +
-    `review videos, and dedicated review sites. Prefer MORE quotes from a strong source over ` +
+    `Use Google Search to research the PRODUCT ${productLabel}` +
+    (productUrl ? ` (${productUrl})` : '') + `.\n\n` +
+    `FIRST — and this part must stay HONEST, not flattering: report the average star rating (0-5) ` +
+    `and the approximate review count, naming the source you read them from, plus a one-sentence ` +
+    `summary of how reviewers really feel about this product INCLUDING any recurring complaints. The ` +
+    `rating and summary are internal signal used to decide whether we can make a claim at all; they ` +
+    `are never typeset as a customer quote. Write these BEFORE any quotes.\n\n` +
+    `THEN surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in quotation ` +
+    `marks) about THIS EXACT product. Pull from retailer review sections, Reddit discussions, ` +
+    `YouTube review videos, and dedicated review sites. Prefer MORE quotes from a strong source over ` +
     `one-per-source variety.\n\n` +
     `${AD_USABLE_QUOTE_DIRECTIVE}\n\n` +
     `For each quote, give the source platform and the author/handle if visible, and the funnel stage ` +
     `it serves. A quote must be about this product, not the brand in general and not a different ` +
-    `item in the range.\n\n` +
-    `SEPARATELY — and this part must stay HONEST, not flattering: report the average star rating ` +
-    `(0-5) and approximate review count if visible, plus a one-sentence summary of how reviewers ` +
-    `really feel about this product INCLUDING any recurring complaints. The rating and summary are ` +
-    `internal signal used to decide whether we can make a claim at all; they are never typeset as a ` +
-    `customer quote. Write naturally — do not format as JSON.`;
+    `item in the range. Write naturally — do not format as JSON.`;
 
   let searchData;
   try {
@@ -666,8 +812,9 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 3000 }
-      }
+        generationConfig: GROUNDED_PASS1_CONFIG
+      },
+      GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
     console.warn(`   ⚠️  product-reviews search failed: ${err.message}`);
@@ -675,6 +822,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
   }
 
   const searchCand = searchData?.candidates?.[0];
+  warnIfTruncated(searchCand, 'product-reviews pass 1');
   const narrative = (searchCand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
   const sourceDomains = (searchCand?.groundingMetadata?.groundingChunks || [])
     .map(c => c.web?.uri && extractDomain(c.web.uri))
@@ -710,7 +858,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
         contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 2400,
+          maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS,
           responseMimeType: 'application/json',
           // Same as brand-reviews above — disable thinking so the 1200
           // token budget goes to the actual JSON instead of hidden
@@ -750,7 +898,8 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
             required: ['quotes']
           }
         }
-      }
+      },
+      GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
     console.warn(`   ⚠️  product-reviews structuring failed: ${err.message}`);
@@ -799,5 +948,11 @@ module.exports = {
   // Exported so the harness executes the SHIPPED anti-fabrication and
   // sentence-completeness logic rather than a copy of it.
   keepVerbatimQuotes,
-  completeSentencesOnly
+  completeSentencesOnly,
+  screenAdUsableSentiment,
+  loadSentimentJudge,
+  GROUNDED_PASS1_CONFIG,
+  GROUNDED_PASS2_MAX_TOKENS,
+  GROUNDED_CALL_TIMEOUT_MS,
+  warnIfTruncated
 };

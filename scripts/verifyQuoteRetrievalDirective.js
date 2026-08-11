@@ -38,7 +38,13 @@ const {
   // purpose: the same mirror-seam lesson as PR #120 — a harness that reimplements
   // the logic it is testing passes against a reimplementation and proves nothing.
   keepVerbatimQuotes,
-  completeSentencesOnly
+  completeSentencesOnly,
+  GROUNDED_PASS1_CONFIG,
+  GROUNDED_PASS2_MAX_TOKENS,
+  GROUNDED_CALL_TIMEOUT_MS,
+  warnIfTruncated,
+  screenAdUsableSentiment,
+  loadSentimentJudge
 } = require('../services/providers/geminiSearchProvider');
 const { preserveBrandReviewNumbers } = require('../services/brandEnrichmentService');
 
@@ -327,30 +333,20 @@ check('H8 the anti-fabrication check still runs FIRST and independently', () => 
   assert.strictEqual(out.length, 0, 'fabrication must still be rejected');
 });
 
-check('H9 a trim must not INVERT the sentiment (adversarial review, pre-ship)', () => {
-  // The nastiest failure this fix could have introduced: both of these trim to a
-  // complete, verbatim sentence that is a fabricated NEGATIVE endorsement.
+check('H9 a trim must not INVERT the sentiment (END-TO-END through the pipeline)', () => {
+  // The nastiest failure this fix could have introduced: each of these trims to a
+  // complete, VERBATIM sentence that is a fabricated NEGATIVE endorsement. Asserted
+  // through keepVerbatimQuotes rather than the sub-function, because sentiment is
+  // judged by one unconditional screen at the end of the pipeline — testing the stage
+  // in isolation would assert the wrong contract.
   for (const t of [
     'I hated the old ones. These are great and soft',
     'Not for everyone. I love them and wear',
     'The first pair was terrible. This one is perfect and I',
   ]) {
-    const out = quiet(() => completeSentencesOnly({ text: t }, 'h9'));
-    assert.strictEqual(out, null, `must be dropped, not trimmed: ${JSON.stringify(t)}`);
+    const out = quiet(() => keepVerbatimQuotes([{ text: t }], `narrative: ${t}`, 'h9'));
+    assert.strictEqual(out.length, 0, `must not reach an ad: ${JSON.stringify(t)}`);
   }
-});
-check('H10 the re-judge reuses the render gate rather than a private word list', () => {
-  // If a future edit swaps hasPositiveSignal for a local regex, the two drift and
-  // this fix silently stops matching what the render path will accept.
-  const region = provSrc.slice(
-    provSrc.indexOf('function completeSentencesOnly'),
-    provSrc.indexOf('function stampLlmQuotes'));
-  // The CALL, not just the import: a mutation that dropped the call while leaving
-  // the destructure in place slipped past the looser version of this pin.
-  assert.ok(/hasPositiveSignal\(trimmed\)/.test(region),
-    'the trimmed span itself must be passed to the render gate');
-  assert.ok(/require\('\.\.\/layoutInputService'\)/.test(region),
-    'the judgement must come from the render path, not a copy');
 });
 check('H11 an abbreviation is not a sentence end', () => {
   // "Absolutely love Dr." is the ad this guard exists to prevent.
@@ -515,6 +511,183 @@ check('I13 the SECOND write path is wired too (productMatchService)', () => {
   assert.ok(write !== -1 && call < write, 'the merge must run BEFORE the assignment');
   assert.ok(!/brandDoc\.brandReviews = Object\.assign\(\{\}, fresh/.test(pmCode),
     'the wholesale replace is still the live expression');
+});
+
+
+console.log('T. Pass 1 must not truncate away the numbers (LIVE REGRESSION 2026-08-11)');
+
+// WHAT HAPPENED. Both pass-1 grounded calls were ending with finishReason=MAX_TOKENS.
+// The rating/summary request sat at the END of each prompt, so the model spent its
+// whole budget enumerating up to 12 quotes (with source + author + stage each) and
+// never wrote the numbers. Pass 2 then honestly reported rating:null, the persist
+// site replaced the stored aggregates, and Vuori went from 4.6★/15,545 to null —
+// which makes social_proof_led ineligible outright. Measured on Vuori at the SAME
+// 3000-token budget: quotes-last + thinking on gave MAX_TOKENS / 941 chars / 4 quotes
+// / no rating; numbers-first + thinking off gave STOP / 3026 chars / 12 quotes /
+// rating AND count. Verified end to end through lookupBrandReviews against the live
+// API: "11 quote(s) · 4.6★ · 15,000 reviews".
+
+const pass1Region = (src, startNeedle, endNeedle) => {
+  const i = src.indexOf(startNeedle);
+  const j = src.indexOf(endNeedle, i);
+  assert.ok(i !== -1 && j > i, `could not bound the pass-1 prompt (${startNeedle})`);
+  return src.slice(i, j).split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+};
+
+check('T1 all three pass-1 prompts ask for the NUMBERS BEFORE the quotes', () => {
+  // Ordering, not presence: anything a prompt asks for last is the first thing a
+  // truncation eats, and presence alone was true throughout the regression.
+  const regions = [
+    ['brand',    pass1Region(provSrc, 'async function lookupBrandReviews',   'let searchData')],
+    ['product',  pass1Region(provSrc, 'async function lookupProductReviews', 'let searchData')],
+    ['category', pass1Region(catSrc,  'const searchPrompt =',                'let searchRes')],
+  ];
+  for (const [name, region] of regions) {
+    const numbers = region.search(/star rating/i);
+    const quotes  = region.search(/DIRECT customer quotes/i);
+    assert.ok(numbers !== -1, `${name}: the rating ask is gone entirely`);
+    assert.ok(quotes !== -1, `${name}: the quote ask is gone entirely`);
+    assert.ok(numbers < quotes,
+      `${name}: the rating is still requested AFTER the quotes — a MAX_TOKENS cut will eat it`);
+    assert.ok(/BEFORE any quotes/i.test(region),
+      `${name}: the prompt should state the order explicitly, not just imply it`);
+  }
+});
+check('T2 pass 1 spends no budget on hidden thinking', () => {
+  assert.strictEqual(GROUNDED_PASS1_CONFIG.thinkingConfig.thinkingBudget, 0,
+    'gemini-2.5-flash bills thoughts against maxOutputTokens; pass 1 does not reason');
+  assert.ok(GROUNDED_PASS1_CONFIG.maxOutputTokens >= 3000, 'pass 1 needs room for the wider pool');
+});
+check('T3 every pass-1 call site uses the ONE shared config', () => {
+  // Three inline copies is how the pass-2 calls got thinkingBudget:0 while the pass-1
+  // calls silently did not for months.
+  const uses = (provSrc.match(/generationConfig: GROUNDED_PASS1_CONFIG/g) || []).length
+             + (catSrc.match(/generationConfig: GROUNDED_PASS1_CONFIG/g) || []).length;
+  assert.strictEqual(uses, 3, `expected 3 pass-1 call sites on the shared config, found ${uses}`);
+  assert.ok(!/generationConfig: \{ temperature: 0\.2, maxOutputTokens: (3000|1500) \}/.test(provSrc + catSrc),
+    'an inline pass-1 config is back — it will drift from the shared one');
+});
+check('T4 truncation is detected, not silent (BEHAVIOURAL)', () => {
+  assert.strictEqual(quiet(() => warnIfTruncated({ finishReason: 'MAX_TOKENS' }, 't4')), true,
+    'a truncated narrative must be reported');
+  assert.strictEqual(quiet(() => warnIfTruncated({ finishReason: 'STOP' }, 't4')), false);
+  assert.strictEqual(quiet(() => warnIfTruncated({}, 't4')), false, 'no finishReason must not warn');
+  assert.strictEqual(quiet(() => warnIfTruncated(null, 't4')), false);
+  assert.strictEqual(quiet(() => warnIfTruncated({ finishReason: 'SAFETY' }, 't4')), true,
+    'any non-STOP reason means the narrative is incomplete');
+});
+check('T5 the truncation check is WIRED at all three pass-1 sites', () => {
+  const wired = (provSrc.match(/warnIfTruncated\(searchCand,/g) || []).length
+              + (catSrc.match(/warnIfTruncated\(cand,/g) || []).length;
+  assert.strictEqual(wired, 3, `expected 3 wired truncation checks, found ${wired}`);
+});
+check('T6 the measurement is recorded where the next session will read it', () => {
+  assert.ok(/NARRATIVE_ORDER_NOTE/.test(provSrc), 'keep the note explaining WHY the order matters');
+  assert.ok(/MAX_TOKENS/.test(provSrc), 'the note must name the failure mode it prevents');
+});
+
+
+console.log('S. Mediocre and negative stop at intake (OWNER DIRECTIVE 2026-08-11)');
+
+// *"at no time should mediocre or negative sentiment pass any gate from initial
+// screening to selection for use in an ad."*
+//
+// Before this there was an ungated middle: positivity was PROMPT TEXT at retrieval and
+// hasPositiveSignal at render, so a complete, verbatim, thoroughly mediocre quote was
+// stored as ad-usable, counted toward the pool, and shown in the brand UI. All four
+// strings below are REAL retrieved quotes that passed retrieval.
+const MEDIOCRE_REAL = [
+  'All clothes, including the workout shorts, have a slim, tailored fit.',
+  'The fit around the leg is just loose and casual enough to not feel oversized and baggy but not skin tight like a legging.',
+  'They go on flash sale and/or 20% off.',
+  'Ripstop Climber pants have a bold, stylish taper.',
+  // Short generic praise. These DO contain positive lexemes ("comfortable", "durable",
+  // "great") and so pass hasPositiveSignal — they are rejected because the intake bar is
+  // the render path's full selector, whose score floor is what actually catches
+  // mediocrity. They are the cases that prove the bar is more than a word list.
+  'Super comfortable and durable fabrics.',
+  'Great fit, and lightweight.',
+  // Contains "best", passes hasPositiveSignal, and argues against the sale. Caught by
+  // HARD_LIMITER inside scoreQuote — unreachable if the screen used the word list alone.
+  'This is a low-support option best suited for lighter activities.',
+];
+const CLEAR_PRAISE = [
+  'Awesome High Quality Hat! Recently purchased a couple of Offshore caps. The quality and fit are amazing!',
+  'These are literally my favorite pants ever. They are so soft and so lightweight it feels like wearing no pants.',
+  'The quality is amazing and the pair I have feel like second skin.',
+];
+
+check('S1 real mediocre quotes are dropped at intake (BEHAVIOURAL, shipped pipeline)', () => {
+  for (const t of MEDIOCRE_REAL) {
+    const out = quiet(() => keepVerbatimQuotes([{ text: t }], `narrative: ${t}`, 's1'));
+    assert.strictEqual(out.length, 0, `mediocre quote survived intake: ${JSON.stringify(t)}`);
+  }
+});
+check('S2 clear praise still gets through (the screen is not a wall)', () => {
+  for (const t of CLEAR_PRAISE) {
+    const out = quiet(() => keepVerbatimQuotes([{ text: t }], `narrative: ${t}`, 's2'));
+    assert.strictEqual(out.length, 1, `clear praise was wrongly dropped: ${JSON.stringify(t)}`);
+  }
+});
+check('S3 the screen is UNCONDITIONAL — no flag, no branch, every quote', () => {
+  const region = provSrc.slice(provSrc.indexOf('function keepVerbatimQuotes'),
+                              provSrc.indexOf('function loadSentimentJudge'));
+  const code = region.split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+  assert.ok(/\.filter\(\(q\) => screenAdUsableSentiment\(q, judge, label\)\)/.test(code),
+    'the sentiment screen must be applied to every quote the chokepoint returns');
+  assert.ok(!/process\.env\.[A-Z_]*SENTIMENT|if \(.*enabled.*\) *\{[^}]*screenAdUsable/i.test(code),
+    'the screen must not be behind a kill switch — the owner directive is absolute');
+});
+check('S4 the screen runs AFTER the trim, on the text that will be typeset', () => {
+  // Order is the whole point: a positive quote can trim to a neutral span, and a
+  // negative-then-positive quote trims to the negative half.
+  const region = provSrc.slice(provSrc.indexOf('function keepVerbatimQuotes'),
+                              provSrc.indexOf('function loadSentimentJudge'));
+  const trim = region.indexOf('completeSentencesOnly');
+  const screen = region.indexOf('screenAdUsableSentiment');
+  assert.ok(trim !== -1 && screen !== -1 && trim < screen,
+    'sentiment must be judged on the final string, not the original');
+});
+check('S5 it FAILS CLOSED — no judge means no quotes, never unjudged quotes', () => {
+  assert.strictEqual(screenAdUsableSentiment({ text: 'Absolutely wonderful and amazing!' }, null, 's5'), false,
+    'an unjudged quote must never proceed');
+  assert.strictEqual(quiet(() => screenAdUsableSentiment({ text: '' }, () => true, 's5')), false);
+  assert.strictEqual(quiet(() => screenAdUsableSentiment(null, () => true, 's5')), false);
+});
+check('S6 the bar IS the render path selector, reused not reimplemented', () => {
+  const judge = loadSentimentJudge('s6');
+  assert.strictEqual(typeof judge, 'function', 'the judge must resolve');
+  // Behavioural equivalence with the SHIPPED selector. A copy would drift, and drift
+  // means storing quotes the render path will refuse — or refusing ones it would take.
+  const { pickStrongestQuote } = require('../services/layoutInputService');
+  for (const t of MEDIOCRE_REAL.concat(CLEAR_PRAISE)) {
+    assert.strictEqual(judge(t), pickStrongestQuote([{ text: t }]) !== null,
+      `intake disagrees with selection on: ${JSON.stringify(t.slice(0, 50))}`);
+  }
+  const region = provSrc.slice(provSrc.indexOf('function loadSentimentJudge'),
+                               provSrc.indexOf('function screenAdUsableSentiment'));
+  assert.ok(/pickStrongestQuote/.test(region),
+    'the judge must be the render path selector, not a private notion of positive');
+  assert.ok(!/\/[^\n]*(love|great|amazing|soft)[^\n]*\/[gimsuy]*\.test/i.test(region),
+    'a local sentiment regex must not shadow the shared selector');
+});
+check('S7 grounded budgets are PADDED, not sized to the measured need', () => {
+  // Owner directive: "increase the token budget as needed, give it lots of padding".
+  // A ceiling near the measured need is a silent data-loss bug the moment a brand has
+  // more to say — which is precisely how the rating vanished.
+  assert.ok(GROUNDED_PASS1_CONFIG.maxOutputTokens >= 12000,
+    `pass 1 budget too tight for comfort: ${GROUNDED_PASS1_CONFIG.maxOutputTokens}`);
+  assert.ok(GROUNDED_PASS2_MAX_TOKENS >= 8000, `pass 2 budget too tight: ${GROUNDED_PASS2_MAX_TOKENS}`);
+  assert.ok(GROUNDED_CALL_TIMEOUT_MS >= 90000,
+    `timeout must not throw away a call already paid for: ${GROUNDED_CALL_TIMEOUT_MS}`);
+  // Every grounded call in these two modules must be on a padded constant. The
+  // product-MATCH search is included on purpose (same silent-truncation class) even
+  // though it is a different feature; only the tiny non-grounded classifier is exempt.
+  const budgets = (provSrc + catSrc).match(/maxOutputTokens: [^,\n]+/g) || [];
+  const unpadded = budgets.filter(b => /\b(1200|1500|2400|3000)\b/.test(b));
+  assert.deepStrictEqual(unpadded, [], `un-padded grounded budgets: ${unpadded.join(', ')}`);
+  assert.ok(!/timeout: (30000|45000)\b/.test(provSrc + catSrc),
+    'a grounded call still has a short timeout — it would throw away a paid call');
 });
 
 const total = pass + fail;

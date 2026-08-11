@@ -1700,6 +1700,24 @@ function hasPositiveSignal(text) {
   return !NEGATED_POSITIVE.test(s) && !NEGATIVE_SENTIMENT.test(s);
 }
 
+/**
+ * "Does this text argue against the purchase" — the HARD_LIMITER half of scoreQuote,
+ * exposed on its own.
+ *
+ * scoreQuote folds three different judgements into one number: hard limiters and
+ * negativity (absolute disqualifiers) and a length/specificity SCORE (a ranking device
+ * for choosing among candidates). A caller shortening an ALREADY-APPROVED quote needs
+ * the disqualifiers without the brevity penalty — a 40-character extract of a good
+ * quote is short on purpose, and scoring it as if it were competing for selection
+ * rejects nearly everything. Exported for exactly that use.
+ */
+function hasHardLimiter(text) {
+  const s = String(text || '');
+  const hit = HARD_LIMITER.test(s);
+  HARD_LIMITER.lastIndex = 0;
+  return hit;
+}
+
 // Social comments rendered as proof go through the SAME pipeline as review
 // quotes: positive-sentiment gate, then extractSnippet — the one place a
 // quote is shortened, which enforces a self-contained thought on a whole
@@ -3569,6 +3587,7 @@ module.exports = {
   // Shared so every surface that renders a social comment as proof applies
   // the same definition of praise, rather than each growing its own lexicon.
   hasPositiveSignal,
+  hasHardLimiter,
   // Exported so scripts/verifyProofBeat.js can pin the R2 fix BEHAVIOURALLY
   // rather than by source scan. This is the function that decides ONE winning
   // tier for the rating/count pair and stamps `rating_source`; before it, two

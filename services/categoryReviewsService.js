@@ -27,7 +27,11 @@ const { breadcrumbToKey } = require('../models/Category');
 const {
   AD_USABLE_QUOTE_DIRECTIVE,
   LLM_QUOTE_CAP,
-  keepVerbatimQuotes
+  keepVerbatimQuotes,
+  GROUNDED_PASS1_CONFIG,
+  GROUNDED_PASS2_MAX_TOKENS,
+  GROUNDED_CALL_TIMEOUT_MS,
+  warnIfTruncated
 } = require('./providers/geminiSearchProvider');
 
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
@@ -179,10 +183,18 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
   const t0 = Date.now();
 
   // Pass 1 — grounded narrative
+  // NUMBERS FIRST, QUOTES SECOND — see NARRATIVE_ORDER_NOTE in geminiSearchProvider.
+  // Anything this prompt asks for LAST is the first thing a MAX_TOKENS truncation eats,
+  // and that is exactly how the brand path silently lost its star ratings.
   const searchPrompt =
-    `Use Google Search to find what real customers say about ${brandName}'s ` +
-    `${breadcrumb} category${brandUrl ? ` (${brandUrl})` : ''}. ` +
-    `Surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in ` +
+    `Use Google Search to research ${brandName}'s ${breadcrumb} category` +
+    `${brandUrl ? ` (${brandUrl})` : ''}.\n\n` +
+    `FIRST — this part must stay HONEST, not flattering: note an approximate average ` +
+    `star rating (0-5) and review count if visible, naming the source, plus a ` +
+    `one-sentence summary of how reviewers really feel about this category INCLUDING ` +
+    `any recurring complaints. Rating and summary are internal signal, never ad copy. ` +
+    `Write these BEFORE any quotes.\n\n` +
+    `THEN surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in ` +
     // NO EXAMPLE PHRASINGS HERE, DELIBERATELY. This prompt used to illustrate a
     // "good" category quote with "best fishing shirt I've owned" and "their
     // performance shirts last forever" — a superlative and an absolute-durability
@@ -199,10 +211,6 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     `${AD_USABLE_QUOTE_DIRECTIVE}\n\n` +
     `For each quote, give the source platform, the author/handle if visible, and ` +
     `the funnel stage it serves.\n\n` +
-    `SEPARATELY — this part must stay HONEST, not flattering: note an approximate ` +
-    `average star rating (0-5) and review count if visible, plus a one-sentence ` +
-    `summary of how reviewers really feel about this category INCLUDING any ` +
-    `recurring complaints. Rating and summary are internal signal, never ad copy. ` +
     `Write naturally — do not format as JSON.`;
 
   let searchRes;
@@ -212,9 +220,9 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
+        generationConfig: GROUNDED_PASS1_CONFIG
       },
-      { timeout: 45000 }    // bumped from 30s — gemini grounded search w/ tools regularly lands at 30-40s under load
+      { timeout: GROUNDED_CALL_TIMEOUT_MS }   // padded: a timeout throws away a call already paid for
     );
   } catch (err) {
     console.warn(`   ⚠️  categoryReviews search failed: ${err.message}`);
@@ -222,6 +230,7 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
   }
 
   const cand = searchRes.data?.candidates?.[0];
+  warnIfTruncated(cand, `categoryReviews pass 1 "${breadcrumb}"`);
   const narrative = (cand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
   const sourceDomains = (cand?.groundingMetadata?.groundingChunks || [])
     .map(c => c.web?.uri && extractDomain(c.web.uri))
@@ -261,11 +270,11 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
         contents: [{ role: 'user', parts: [{ text: structPrompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 1200,
+          maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS,
           responseMimeType: 'application/json'
         }
       },
-      { timeout: 45000 }    // bumped from 30s — gemini grounded search w/ tools regularly lands at 30-40s under load
+      { timeout: GROUNDED_CALL_TIMEOUT_MS }   // padded: a timeout throws away a call already paid for
     );
   } catch (err) {
     console.warn(`   ⚠️  categoryReviews structuring failed: ${err.message}`);
