@@ -44,7 +44,9 @@ const {
   GROUNDED_CALL_TIMEOUT_MS,
   warnIfTruncated,
   screenAdUsableSentiment,
-  loadSentimentJudge
+  loadSentimentJudge,
+  pickBestRating,
+  RATING_MIN_CREDIBLE_REVIEWS
 } = require('../services/providers/geminiSearchProvider');
 const { preserveBrandReviewNumbers } = require('../services/brandEnrichmentService');
 
@@ -531,7 +533,13 @@ const pass1Region = (src, startNeedle, endNeedle) => {
   const i = src.indexOf(startNeedle);
   const j = src.indexOf(endNeedle, i);
   assert.ok(i !== -1 && j > i, `could not bound the pass-1 prompt (${startNeedle})`);
-  return src.slice(i, j).split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+  const code = src.slice(i, j).split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+  // FLATTEN the template-literal concatenation before matching phrases. These prompts are
+  // built as `...` + `...` across many lines, so a phrase the MODEL reads as one sentence
+  // ("Do NOT pick one for me") is split by "` +\n    `" in the source. A pin that matches
+  // raw source therefore fails on correct code — which is exactly what it did here. What
+  // matters is the assembled prompt, so reconstruct an approximation of it.
+  return code.replace(/`\s*\+\s*\n\s*`/g, '').replace(/\s+/g, ' ');
 };
 
 check('T1 all three pass-1 prompts ask for the NUMBERS BEFORE the quotes', () => {
@@ -688,6 +696,152 @@ check('S7 grounded budgets are PADDED, not sized to the measured need', () => {
   assert.deepStrictEqual(unpadded, [], `un-padded grounded budgets: ${unpadded.join(', ')}`);
   assert.ok(!/timeout: (30000|45000)\b/.test(provSrc + catSrc),
     'a grounded call still has a short timeout — it would throw away a paid call');
+});
+
+
+console.log('N. ONE rating is chosen from ALL aggregates, by rule (owner decision 2026-08-11)');
+
+// A brand's public aggregates disagree violently. Three consecutive live Vuori
+// refreshes in one afternoon stored 4.58★/15,626 (own site), 3.8★/28, and 2.5★/126
+// (Trustpilot) — pass 2 emitted whichever the narrative mentioned first, with no ranking
+// and no record of the source, so whether a brand printed stars was luck of the draw and
+// a re-enrichment could silently remove an ad format.
+const VUORI_REAL = [
+  { source: 'vuoriclothing.com', rating: 4.58, reviewCount: 15626 },
+  { source: 'trustpilot.com',    rating: 2.5,  reviewCount: 126 },
+  { source: 'sitejabber.com',    rating: 3.8,  reviewCount: 28 },
+];
+
+check('N1 the owner rule holds on the real measured set', () => {
+  // *"prefer the highest number of stars with the most reviews, in this case 4.58 with
+  // 15K reviews should absolutely win"*
+  const r = quiet(() => pickBestRating(VUORI_REAL));
+  assert.strictEqual(r.rating, 4.58, `got ${r.rating}`);
+  assert.strictEqual(r.reviewCount, 15626);
+  assert.strictEqual(r.ratingSource, 'vuoriclothing.com', 'the winning source must be recorded');
+});
+check('N2 order of the input cannot change the outcome', () => {
+  // The whole defect was order-dependence. Every permutation must agree.
+  const perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+  for (const idx of perms) {
+    const r = quiet(() => pickBestRating(idx.map(i => VUORI_REAL[i])));
+    assert.strictEqual(r.rating, 4.58, `permutation ${idx.join('')} picked ${r.rating}`);
+  }
+});
+check('N3 a thin high rating cannot beat a big one (the literal-rule trap)', () => {
+  // Read literally, "highest stars" would hand the ad to 5.0★ from 3 reviews. The sample
+  // floor is what stops that, and it is the reason this is not a one-line sort.
+  const r = quiet(() => pickBestRating([
+    { source: 'tiny.com', rating: 5.0, reviewCount: 3 },
+    { source: 'vuoriclothing.com', rating: 4.58, reviewCount: 15626 },
+  ]));
+  assert.strictEqual(r.rating, 4.58, `a 3-review 5.0 must not win, got ${r.rating}`);
+  assert.ok(RATING_MIN_CREDIBLE_REVIEWS >= 25, 'the sample floor must be meaningful');
+});
+check('N3b a thin 5.0 must not beat a big LOW rating either (what the floor is for)', () => {
+  // The case the previous version of N3 missed, and a mutation removing the sample floor
+  // slipped straight through it: when the thin candidate is the ONLY one above the star
+  // floor, count-descending cannot save us — without the sample floor, "5.0 stars" from
+  // three reviews becomes the printed rating for the whole brand.
+  const r = quiet(() => pickBestRating([
+    { source: 'tiny.com', rating: 5.0, reviewCount: 3 },
+    { source: 'big.com',  rating: 3.0, reviewCount: 20000 },
+  ]));
+  assert.strictEqual(r.rating, 3.0, `a 3-review 5.0 must not become the brand rating, got ${r.rating}`);
+  assert.strictEqual(r.reviewCount, 20000);
+});
+check('N5b the winner keeps ITS OWN count even when another source has more', () => {
+  // Atomicity, in the one shape that can actually catch a borrowed count: the chosen
+  // rating is NOT the largest sample. A mutation taking max(reviewCount) across all
+  // candidates was invisible to every fixture where the winner also had the most reviews.
+  const r = quiet(() => pickBestRating([
+    { source: 'good.com', rating: 4.6, reviewCount: 900 },
+    { source: 'huge.com', rating: 2.0, reviewCount: 50000 },
+  ]));
+  assert.strictEqual(r.rating, 4.6, 'the printable candidate must win');
+  assert.strictEqual(r.reviewCount, 900,
+    'the count must come from the 4.6 source, not be borrowed from the 50,000-review one');
+  assert.strictEqual(r.ratingSource, 'good.com');
+});
+check('N4 when nothing can print, the largest sample is still returned', () => {
+  // Not cosmetic: the Director reads the rating and summary as internal signal even when
+  // no stars are typeset, so returning null here would lose real information.
+  const r = quiet(() => pickBestRating(VUORI_REAL.slice(1)));
+  assert.strictEqual(r.rating, 2.5);
+  assert.strictEqual(r.reviewCount, 126, 'the biggest honest sample, not the flattering one');
+});
+check('N5 the pair stays atomic — rating and count from the SAME source', () => {
+  // The mirror of the preserveBrandReviewNumbers rule. Mixing a rating from one site
+  // with a count from another is the cross-snapshot bug in a new costume.
+  for (const set of [VUORI_REAL, VUORI_REAL.slice(1), [{ source: 'a', rating: 4.9, reviewCount: 80 }]]) {
+    const r = quiet(() => pickBestRating(set));
+    const match = set.find(c => c.rating === r.rating);
+    assert.ok(match, 'the chosen rating must come from a real candidate');
+    assert.strictEqual(r.reviewCount, match.reviewCount, 'count must come from that same candidate');
+    assert.strictEqual(r.ratingSource, match.source ?? null);
+  }
+});
+check('N6 malformed candidates are refused, not coerced', () => {
+  const r = quiet(() => pickBestRating([{ rating: 'x' }, { rating: 9 }, { rating: -1 }, { rating: NaN }, null, undefined]));
+  assert.strictEqual(r.rating, null, 'a 9-star rating is not data');
+  assert.strictEqual(r.reviewCount, null);
+  assert.deepStrictEqual(quiet(() => pickBestRating(null)).ratingCandidates, []);
+});
+check('N7 the full candidate set is kept for audit', () => {
+  const r = quiet(() => pickBestRating(VUORI_REAL));
+  assert.strictEqual(r.ratingCandidates.length, 3,
+    'every aggregate found must be stored — the choice has to be auditable, not invisible');
+  assert.ok(r.ratingCandidates.every(c => 'source' in c && 'rating' in c && 'reviewCount' in c));
+});
+check('N8 the picker is WIRED into both lookups, and nothing takes the raw value', () => {
+  const code = stripComments(provSrc);
+  assert.strictEqual((code.match(/\.\.\.pickBestRating\(/g) || []).length, 2,
+    'brand and product results must both come from the picker');
+  assert.ok(!/rating:\s+typeof parsed\.rating === 'number' \? parsed\.rating : null/.test(code),
+    'the un-ranked single value is back — order-dependence returns with it');
+});
+check('N9 pass 1 asks for EVERY aggregate and forbids pre-picking', () => {
+  for (const [name, region] of [
+    ['brand',   pass1Region(provSrc, 'async function lookupBrandReviews',   'let searchData')],
+    ['product', pass1Region(provSrc, 'async function lookupProductReviews', 'let searchData')],
+  ]) {
+    assert.ok(/EVERY (?:public review aggregate|place)/i.test(region), `${name}: must ask for every aggregate`);
+    assert.ok(/ONE PER LINE/.test(region), `${name}: must ask for them separately`);
+    assert.ok(/do NOT pick one for me/i.test(region), `${name}: the model must not choose`);
+    assert.ok(/do NOT average/i.test(region), `${name}: averaging hides the disagreement`);
+  }
+});
+
+console.log('X. Sensory praise counts as praise (owner decision 2026-08-11)');
+
+check('X1 the quote the owner named now survives intake', () => {
+  const t = "These might be the softest sweatpants I've ever put on.";
+  const out = quiet(() => keepVerbatimQuotes([{ text: t }], `narrative: ${t}`, 'x1'));
+  assert.strictEqual(out.length, 1, 'real, specific apparel praise must not be thrown away');
+});
+check('X2 bare FIT DESCRIPTORS still do not count as praise', () => {
+  // The protection the earlier adversarial review put in place, deliberately kept: these
+  // state a fact about sizing, they do not express praise.
+  const { hasPositiveSignal } = require('../services/layoutInputService');
+  for (const t of ['True to size', 'Holds its shape', 'true to size and holds its shape']) {
+    assert.strictEqual(hasPositiveSignal(t), false, `must not be an endorsement: ${t}`);
+  }
+});
+check('X3 a bare sensory word cannot become a testimonial', () => {
+  // "soft" now opens the positivity gate, so the substance floor is what stops a
+  // one-word fragment reaching a frame.
+  const direct = require('../services/directImageRenderService');
+  for (const snip of ['Soft.', 'so soft', 'very soft']) {
+    assert.strictEqual(
+      direct.selectStaticQuoteText({ text: 'q'.repeat(200), snippet: snip }, { cap: 140 }), '',
+      `a bare fragment must not be typeset: ${snip}`);
+  }
+});
+check('X4 mediocre and limiter cases are UNAFFECTED by the wider lexicon', () => {
+  for (const t of MEDIOCRE_REAL) {
+    const out = quiet(() => keepVerbatimQuotes([{ text: t }], `narrative: ${t}`, 'x4'));
+    assert.strictEqual(out.length, 0, `widening the lexicon must not open this: ${JSON.stringify(t.slice(0,48))}`);
+  }
 });
 
 const total = pass + fail;
