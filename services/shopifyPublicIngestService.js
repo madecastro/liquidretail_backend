@@ -550,6 +550,10 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
     if (!p?.handle && !hasStorefrontVideos) continue;
 
     let mediaArr;
+    // Only the <handle>.js rung carries a title; the storefront-GraphQL rung
+    // does not. Hoisted because the video loop below reads it as a fallback,
+    // and `ajax` itself goes out of scope at the end of that branch.
+    let ajaxTitle = null;
     if (hasStorefrontVideos) {
       // Storefront-GraphQL rung already returned hosted video sources —
       // use them directly, no extra <handle>.js round-trip.
@@ -577,6 +581,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         continue;
       }
       mediaArr = Array.isArray(ajax?.media) ? ajax.media : [];
+      ajaxTitle = ajax?.title || null;
     }
     // external_video → metadata-only note on the product rawData (no mirror).
     const externalVideos = mediaArr.filter(m => m && m.media_type === 'external_video');
@@ -667,7 +672,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
                   catalogProductId: null, // filled below if we can resolve
                   imageRole:        'video',
                   brand:            brand.name || null,
-                  productTitle:     p.title || ajax?.title || null,
+                  productTitle:     p.title || ajaxTitle || null,
                   durationMs:       media.duration ?? null,
                   aspectRatio:      media.aspect_ratio ?? null,
                   ingestedFrom:     'shopify-direct'

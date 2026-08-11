@@ -357,7 +357,7 @@ function directivesForProfile(profile) {
 // platformFormat / destination / promptProfile select the profile;
 // absent → today's Meta/Omni/Grok behaviour exactly.
 function buildVeoPrompt({
-  brand,          // eslint-disable-line no-unused-vars — kept for call-site stability
+  brand,          // eslint-disable-line no-unused-vars -- kept for call-site stability
   product,
   media,
   layoutInput = null,     // eslint-disable-line no-unused-vars
