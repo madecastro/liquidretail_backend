@@ -22,7 +22,7 @@ const AI_TEMPLATES = {
     label:       'AI: Brand-led',
     description: 'Brand colors + logo + hero media dominate; product is supporting.',
     creativeStyle: 'brand_led',
-    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9'], preferred: ['1:1'] },
+    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9', '1.91:1'], preferred: ['1:1'] },
     variants: ['ugc', 'product_image'],
     derivationTemplate: 'ugc_split_screen'
   },
@@ -31,7 +31,7 @@ const AI_TEMPLATES = {
     label:       'AI: UGC-led',
     description: 'Full-bleed creator photo carries the ad; minimal brand chrome, creator attribution visible.',
     creativeStyle: 'ugc_led',
-    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9'], preferred: ['1:1'] },
+    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9', '1.91:1'], preferred: ['1:1'] },
     variants: ['ugc', 'product_image'],
     derivationTemplate: 'ugc_split_screen'
   },
@@ -40,7 +40,7 @@ const AI_TEMPLATES = {
     label:       'AI: Social Proof',
     description: 'Real comments / ratings / engagement stats are the visual anchor; product is supporting.',
     creativeStyle: 'social_proof_led',
-    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9'], preferred: ['1:1'] },
+    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9', '1.91:1'], preferred: ['1:1'] },
     variants: ['ugc', 'product_image'],
     derivationTemplate: 'ugc_split_screen'
   },
@@ -49,7 +49,7 @@ const AI_TEMPLATES = {
     label:       'AI: Editorial',
     description: 'Magazine-spread aesthetic — typography hero, image inset, restrained palette, generous whitespace.',
     creativeStyle: 'editorial',
-    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9'], preferred: ['1:1'] },
+    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9', '1.91:1'], preferred: ['1:1'] },
     variants: ['ugc', 'product_image'],
     derivationTemplate: 'ugc_split_screen'
   },
@@ -58,7 +58,7 @@ const AI_TEMPLATES = {
     label:       'AI: Promotional',
     description: 'Offer-first — discount badge or sale callout dominates, urgency cues, attention-grabbing CTA.',
     creativeStyle: 'promotional',
-    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9'], preferred: ['1:1'] },
+    aspect_ratios: { supported: ['1:1', '4:5', '9:16', '16:9', '1.91:1'], preferred: ['1:1'] },
     variants: ['ugc', 'product_image'],
     derivationTemplate: 'ugc_split_screen'
   }
