@@ -800,6 +800,27 @@ check('N8 the picker is WIRED into both lookups, and nothing takes the raw value
   assert.ok(!/rating:\s+typeof parsed\.rating === 'number' \? parsed\.rating : null/.test(code),
     'the un-ranked single value is back — order-dependence returns with it');
 });
+check('N10 the ratings array is REQUIRED in the pass-2 schema, on both lookups', () => {
+  // THE BUG THIS PINS, measured live. Declared merely optional, Gemini structured
+  // output silently DID NOT EMIT `ratings` — pass 1 wrote all four aggregates
+  // ("Vuoriclothing.com: 4.58 from 15,626", "Trustpilot: 2.3 from 126", …), pass 2 read
+  // them, and the schema dropped every one. The brand came back with NO rating and the
+  // picker had nothing to rank, which looked exactly like "the web didn't say".
+  // Verified both ways against the live API: optional → none, required → all four.
+  const code = stripComments(provSrc);
+  const required = code.match(/required: \['quotes', 'ratings'\]/g) || [];
+  assert.strictEqual(required.length, 2,
+    'both the brand and product pass-2 schemas must REQUIRE ratings, or the model omits it');
+  // Optional-and-nullable is the exact shape that failed; make its return visible.
+  const blocks = code.match(/ratings: \{[\s\S]*?\n              \},/g) || [];
+  assert.strictEqual(blocks.length, 2, 'expected a ratings schema block in each lookup');
+  for (const b of blocks) {
+    assert.ok(!/nullable: true/.test(b.split('items:')[0]),
+      'the ratings ARRAY must not be nullable — an empty array is how "none found" is said');
+    assert.ok(/required: \['rating'\]/.test(b),
+      'each entry must require a numeric rating, so a non-numeric grade is omitted rather than emitted as null');
+  }
+});
 check('N9 pass 1 asks for EVERY aggregate and forbids pre-picking', () => {
   for (const [name, region] of [
     ['brand',   pass1Region(provSrc, 'async function lookupBrandReviews',   'let searchData')],
