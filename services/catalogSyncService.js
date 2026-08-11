@@ -322,25 +322,38 @@ async function syncCatalogForCred(cred, run = null) {
   // Post-loop classify pass — every product row is already persisted.
   // beginClassifyPhase arms the budget clock HERE (not at createSession)
   // so Graph pagination / upserts above cannot burn the ceiling.
+  // Batched across products so the concurrency cap is used; cooperative
+  // cancel via progress.checkpoint (same signal as the page loop) stops
+  // promptly and records outstanding URLs as skippedAbandoned.
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
     shotSession.beginClassifyPhase();
-    for (const item of pendingClassify) {
-      try {
-        const { entries, changed } = await shotSession.classifyProductImages({
-          imageUrl: item.imageUrl,
-          additionalImages: item.additionalImages,
-          existingStyles: item.existingStyles
-        });
-        if (changed) {
-          await CatalogProduct.updateOne(
-            { _id: item.productId },
-            { $set: { imageShotStyles: entries } }
-          );
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        try {
+          await progress.checkpoint();
+          return false;
+        } catch (err) {
+          // CancelledError (or any checkpoint throw) → stop classify.
+          if (!classifyAbandonReason) {
+            const name = err && (err.name || (err.constructor && err.constructor.name));
+            classifyAbandonReason =
+              name === 'CancelledError' || (err && err.constructor === CancelledError)
+                ? 'cancelled'
+                : 'error';
+          }
+          return true;
         }
-      } catch (shotErr) {
-        console.warn(`   ⚠️  shot-classify failed for ${item.productId}: ${shotErr.message}`);
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
       }
-    }
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  shot-classify batch failed: ${shotErr.message}`);
+    });
   }
 
   // Update credential last-used + last-catalog-sync so the scheduler

@@ -21,7 +21,14 @@
 
 'use strict';
 
-const sharp = require('sharp');
+// Lazy: requiring sharp at module load forces every consumer of this
+// module (including ingest writers that only check isEnabled()) to pay
+// the native-binary cost at boot. Load on first classifyShotStyle call.
+let _sharp = null;
+function getSharp() {
+  if (!_sharp) _sharp = require('sharp');
+  return _sharp;
+}
 
 // ── Thresholds ──────────────────────────────────────────────────────────────
 // INITIAL, UNTUNED starting points — not measured against production labels.
@@ -102,6 +109,7 @@ function isEnabled() {
 async function classifyShotStyle(buffer) {
   if (!buffer || !buffer.length) return null;
   try {
+    const sharp = getSharp();
     const T = SHOT_STYLE_THRESHOLDS;
     const base = sharp(buffer)
       .rotate() // honour EXIF orientation so border bands match visual edges

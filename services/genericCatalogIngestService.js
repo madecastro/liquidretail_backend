@@ -287,25 +287,36 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
 
   // Post-loop classify pass — products already persisted.
   // Budget clock starts here (beginClassifyPhase), not at createSession.
+  // Batched across products so the concurrency cap is used for 1-image
+  // SKUs; cooperative cancel stops the wave and abandonPending-counts
+  // remaining URLs (same signal the upsert loop honors).
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
     shotSession.beginClassifyPhase();
-    for (const item of pendingClassify) {
-      try {
-        const { entries, changed } = await shotSession.classifyProductImages({
-          imageUrl: item.imageUrl,
-          additionalImages: item.additionalImages,
-          existingStyles: item.existingStyles
-        });
-        if (changed) {
-          await CatalogProduct.updateOne(
-            { _id: item.productId },
-            { $set: { imageShotStyles: entries } }
-          );
-        }
-      } catch (shotErr) {
-        console.warn(`   ⚠️  ${LOG}  shot-classify failed for ${item.productId}: ${shotErr.message}`);
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        // Same cancel signal the upsert loop honors (resolver cancel or
+        // fresh mid-run abort). Re-read mutable `cancelled` each poll.
+        if (cancelled || resolverCancelled) return true;
+        try {
+          if (await abortCheck(brand._id, run)) {
+            cancelled = true;
+            return true;
+          }
+        } catch (_) { /* ignore */ }
+        return false;
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
       }
-    }
+    }).then((r) => {
+      if (r && r.cancelled) cancelled = true;
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  ${LOG}  shot-classify batch failed: ${shotErr.message}`);
+    });
   }
 
   // ── End-of-run trio (mirror shopifyPublicIngestService) ──

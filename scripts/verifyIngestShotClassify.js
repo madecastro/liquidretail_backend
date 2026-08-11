@@ -389,11 +389,22 @@ async function main() {
       `logs=${JSON.stringify(logs)}`);
     check('L6 logSummary distinguishes never-attempted',
       logs.some((l) => /never attempted|classify phase skipped/i.test(l)));
-    // After phase starts, abandonPending is a no-op.
+    // After phase starts, abandonPending still counts REMAINING items
+    // (mid-phase cancel). Already-counted abandoned is additive.
     session.beginClassifyPhase();
-    const n2 = session.abandonPending(pending, 'should_noop');
-    check('L7 abandonPending no-op after beginClassifyPhase',
-      n2 === 0 && session.getTotals().skippedAbandoned === 2);
+    const remaining = [
+      {
+        productId: 'p3',
+        imageUrl: 'https://cdn.example/new1.jpg',
+        additionalImages: ['https://cdn.example/new2.jpg'],
+        existingStyles: []
+      }
+    ];
+    const n2 = session.abandonPending(remaining, 'cancelled');
+    check('L7 abandonPending mid-phase counts remaining (cancel path)',
+      n2 === 2 && session.getTotals().skippedAbandoned === 4 &&
+      session.getTotals().abandonReason === 'cancelled',
+      `n2=${n2} abandoned=${session.getTotals().skippedAbandoned} reason=${session.getTotals().abandonReason}`);
     session.dispose();
   }
 
@@ -433,6 +444,9 @@ async function main() {
       t.cpuTimedOut >= 1 &&
       !ingest.storedStyleForUrl(r.entries, 'https://cdn.example/slow.jpg'),
       JSON.stringify({ cpuTimedOut: t.cpuTimedOut, entries: r && r.entries }));
+    check('M3b cpuTimedOut does NOT also increment failed (no double-count)',
+      t.cpuTimedOut >= 1 && t.failed === 0,
+      JSON.stringify({ cpuTimedOut: t.cpuTimedOut, failed: t.failed }));
     check('M4 logSummary reports cpuTimeout', (() => {
       const logs = [];
       const orig = console.log;
@@ -463,6 +477,32 @@ async function main() {
     await session.classifyUrls(['https://cdn.example/huge.jpg'], []);
     check('M5 metadata pre-check rejects oversize without classifyShotStyle',
       classifyCalls === 0 && session.getTotals().classified === 0);
+    session.dispose();
+  }
+  // M6: hung metadata() is inside the CPU guard (was unbounded).
+  {
+    const session = ingest.createSession({
+      lookup: publicLookupOk,
+      concurrency: 1,
+      budgetMs: 60_000,
+      cpuMs: 50,
+      maxDecodePixels: 1_000_000,
+      maxAnimatedPages: 24,
+      metadataFn: async () => {
+        await new Promise((r) => setTimeout(r, 500));
+        return { width: 100, height: 100, pages: 1 };
+      },
+      fetchBuffer: async () => ({ ok: true, buffer: whiteBuf, tooLarge: false }),
+      classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
+    });
+    session.beginClassifyPhase();
+    const t0 = Date.now();
+    await session.classifyUrls(['https://cdn.example/meta-hang.jpg'], []);
+    const elapsed = Date.now() - t0;
+    const t = session.getTotals();
+    check('M6 hung metadata() freed by CPU guard (not unbounded)',
+      elapsed < 300 && t.cpuTimedOut >= 1,
+      `elapsed=${elapsed} cpuTimedOut=${t.cpuTimedOut}`);
     session.dispose();
   }
 
@@ -638,57 +678,87 @@ async function main() {
         classifyCalls === 0 && !!tiOut && tiOut.shotStyle === 'lifestyle',
         `classifyCalls=${classifyCalls} ti=${JSON.stringify(tiOut)}`);
 
-      // F8 E11000 race path — source structure still requires backfill.
-      check('F8 E11000 race path applies storedShot backfill',
-        /err\.code === 11000/.test(detectSrc) &&
-        /shouldApplyStoredShot|storedShot/.test(
-          detectSrc.slice(detectSrc.indexOf('err.code === 11000'))
-        ) &&
-        /technicalInsights\.shotStyle/.test(
-          detectSrc.slice(detectSrc.indexOf('err.code === 11000'))
-        ));
+      // F8 E11000 race path — EXECUTE (not regex). Create throws 11000,
+      // re-find returns doc without shotStyle, backfill must apply.
+      {
+        let findCalls = 0;
+        const racedDoc = {
+          _id: '00000000000000000000f008',
+          brandId: product.brandId,
+          source: 'catalog-product',
+          externalId: 'cp_race',
+          technicalInsights: {},
+          metadata: {}
+        };
+        Media.findOne = async () => {
+          findCalls++;
+          // First call: no existing → take create path. After E11000: return raced.
+          return findCalls === 1 ? null : racedDoc;
+        };
+        Media.create = async () => {
+          const err = new Error('E11000 duplicate key');
+          err.code = 11000;
+          throw err;
+        };
+        let racePatched = null;
+        Media.updateOne = async (_q, upd) => {
+          racePatched = upd.$set;
+          Object.assign(racedDoc.technicalInsights, {
+            shotStyle: upd.$set['technicalInsights.shotStyle'],
+            shotStyleConfidence: upd.$set['technicalInsights.shotStyleConfidence'],
+            shotStyleMetrics: upd.$set['technicalInsights.shotStyleMetrics'],
+            updatedAt: upd.$set['technicalInsights.updatedAt']
+          });
+          return { acknowledged: true };
+        };
+        const raced = await detectSvc.materializeImage({
+          sourceUrl: 'https://cdn.example/h.jpg',
+          product,
+          imageRole: 'hero',
+          feedIndex: 0
+        });
+        check('F8 E11000 race path EXECUTES storedShot backfill',
+          !!raced &&
+          racePatched &&
+          racePatched['technicalInsights.shotStyle'] === 'lifestyle' &&
+          raced.technicalInsights.shotStyle === 'lifestyle',
+          JSON.stringify({ racePatched, ti: raced && raced.technicalInsights, findCalls }));
+      }
 
-      // Existing-doc backfill + newer-wins
-      const oldTi = ingest.technicalInsightsFromStored({
-        url: 'https://cdn.example/h.jpg',
-        style: 'packshot',
-        confidence: 0.5,
-        at: new Date('2026-01-01T00:00:00.000Z')
-      });
-      const existingDoc = {
+      // Existing-doc first-write backfill (no shotStyle yet → apply)
+      const bareDoc = {
         _id: '00000000000000000000f002',
         brandId: product.brandId,
         source: 'catalog-product',
         externalId: 'x',
-        technicalInsights: oldTi,
+        technicalInsights: {},
         metadata: {}
       };
-      Media.findOne = async () => existingDoc;
+      Media.findOne = async () => bareDoc;
       let patched = null;
       Media.updateOne = async (_q, upd) => {
         patched = upd.$set;
         return { acknowledged: true };
       };
-      // Product entry is newer (2026-08-01) than Media (2026-01-01).
+      Media.create = origCreate;
       const refreshed = await detectSvc.materializeImage({
         sourceUrl: 'https://cdn.example/h.jpg',
         product,
         imageRole: 'hero',
         feedIndex: 0
       });
-      check('F9 newer CatalogProduct shotStyle supersedes older Media value',
+      check('F9 existing Media without shotStyle gets first-write backfill',
         patched &&
         patched['technicalInsights.shotStyle'] === 'lifestyle' &&
         refreshed.technicalInsights.shotStyle === 'lifestyle',
         JSON.stringify(patched));
 
-      // Equal/older product stamp must NOT thrash.
-      product.imageShotStyles[0].at = new Date('2025-01-01T00:00:00.000Z');
-      existingDoc.technicalInsights = ingest.technicalInsightsFromStored({
+      // Media that already has shotStyle must NOT thrash (first-write only).
+      bareDoc.technicalInsights = ingest.technicalInsightsFromStored({
         url: 'https://cdn.example/h.jpg',
         style: 'packshot',
         confidence: 0.9,
-        at: new Date('2026-06-01T00:00:00.000Z')
+        at: new Date('2026-01-01T00:00:00.000Z')
       });
       patched = null;
       await detectSvc.materializeImage({
@@ -697,19 +767,23 @@ async function main() {
         imageRole: 'hero',
         feedIndex: 0
       });
-      check('F10 older product stamp does not thrash Media shotStyle',
+      check('F10 existing Media shotStyle is not overwritten (first-write only)',
         patched == null || patched['technicalInsights.shotStyle'] == null,
         JSON.stringify(patched));
 
-      // shouldApplyStoredShot pure contract
-      checkFn('F11 shouldApplyStoredShot newer-wins pure', () => {
+      // shouldApplyStoredShot pure contract — first-write only (retune deleted)
+      checkFn('F11 shouldApplyStoredShot first-write only (no dead retune branch)', () => {
         assert.strictEqual(
           ingest.shouldApplyStoredShot(null, ti),
           true
         );
         assert.strictEqual(
+          ingest.shouldApplyStoredShot({}, ti),
+          true
+        );
+        assert.strictEqual(
           ingest.shouldApplyStoredShot({ shotStyle: 'packshot' }, ti),
-          false // missing timestamps → conservative no
+          false
         );
         const older = ingest.technicalInsightsFromStored({
           url: 'u', style: 'packshot', confidence: 0.5, at: new Date('2020-01-01')
@@ -717,8 +791,8 @@ async function main() {
         const newer = ingest.technicalInsightsFromStored({
           url: 'u', style: 'lifestyle', confidence: 0.9, at: new Date('2026-08-01')
         });
-        assert.strictEqual(ingest.shouldApplyStoredShot(older, newer), true);
-        assert.strictEqual(ingest.shouldApplyStoredShot(newer, older), false);
+        // Even when product stamp is newer, do not thrash Media.
+        assert.strictEqual(ingest.shouldApplyStoredShot(older, newer), false);
       });
     } finally {
       Media.findOne = origFindOne;
@@ -847,11 +921,9 @@ async function main() {
     }
   }
 
-  // ── I. Writers: post-loop classify architecture (source structure) ───────
-  // Full writer execution needs Mongo + network. Offline we prove the
-  // architectural contract: upsert loop pushes to pendingClassify; classify
-  // runs only after the loop; try/finally logSummary; beginClassifyPhase
-  // before the post-loop pass (missing call fails loudly here).
+  // ── I. Writers: post-loop classify architecture ──────────────────────────
+  // I3 is BEHAVIOURAL (not source-regex): hung classify must not truncate
+  // the upsert set. Writer source checks still pin the batch wiring.
   {
     const writers = {
       generic: read('services/genericCatalogIngestService.js'),
@@ -865,34 +937,90 @@ async function main() {
       check(`I2 ${name} createSession + pendingClassify post-loop architecture`,
         /createSession\s*\(/.test(src) &&
         /pendingClassify/.test(src) &&
-        /classifyProductImages/.test(src));
-      // Upsert path must not await classify inside the product loop:
-      // after findOneAndUpdate, the next classify must be via pendingClassify push,
-      // not an inline await shotSession.classifyProductImages before the loop ends.
-      // Pattern: pendingClassify.push appears; and there is a post-loop
-      // `for (const item of pendingClassify)`.
-      check(`I3 ${name} post-loop pass over pendingClassify (upsert not blocked)`,
-        /for\s*\(\s*const\s+item\s+of\s+pendingClassify\s*\)/.test(src) &&
-        /pendingClassify\.push/.test(src));
+        /classifyPendingProducts/.test(src));
+      // Push during upsert; classifyPendingProducts ONLY after the product
+      // loop (source order: last pendingClassify.push before classifyPendingProducts).
+      {
+        const lastPush = src.lastIndexOf('pendingClassify.push');
+        const batchCall = src.indexOf('classifyPendingProducts');
+        // Also: no await classifyProductImages / classifyPendingProducts
+        // between the product for-loop body and the push — the batch call
+        // must come after every push site.
+        check(`I3 ${name} classifyPendingProducts AFTER pendingClassify.push (ordering)`,
+          lastPush !== -1 && batchCall !== -1 && lastPush < batchCall,
+          `lastPush=${lastPush} batchCall=${batchCall}`);
+      }
+      check(`I3b ${name} cancel-aware classify (isCancelled wired)`,
+        /isCancelled\s*:/.test(src) && /classifyPendingProducts/.test(src));
       check(`I4 ${name} try\/finally logSummary (unconditional summary)`,
         /finally\s*\{[\s\S]*logSummary/.test(src) ||
         /finally\s*\{[^}]*logSummary/.test(src.replace(/\n/g, ' ')));
       check(`I5 ${name} $set imageShotStyles on classify pass`,
         /imageShotStyles/.test(src));
-      // Blocker 1: every writer MUST call beginClassifyPhase before the pass.
-      // Missing this silently reverts to auto-start-on-first-classify which is
-      // fine for budget timing, but abandonPending cannot distinguish skip
-      // without the explicit call — fail loud if omitted.
       check(`I5b ${name} calls beginClassifyPhase before post-loop classify`,
         /beginClassifyPhase\s*\(/.test(src));
       check(`I5c ${name} abandonPending on skipped classify phase`,
         /abandonPending\s*\(/.test(src) && /hasClassifyPhaseStarted\s*\(/.test(src));
     }
 
-    // Behavioral proof: REAL writer ordering — createSession BEFORE upsert,
-    // clock advances during upsert (Graph/category work), then
-    // beginClassifyPhase + classify. Models catalogSyncService, not the
-    // old harness that created the session after upsert (which hid Blocker 1).
+    // I3 BEHAVIOURAL: hung classify cannot truncate upserts. The original
+    // data-loss bug was await-classify inside the product loop — a hung
+    // CDN left later SKUs unsaved. Prove all upserts finish before classify.
+    {
+      const upserted = [];
+      const products = Array.from({ length: 5 }, (_, i) => ({
+        id: `sku-${i}`,
+        imageUrl: `https://cdn.example/p${i}.jpg`
+      }));
+      let classifyStartedAt = null;
+      let lastUpsertAt = null;
+      let t = 0;
+
+      // Writer contract under test:
+      const session = ingest.createSession({
+        lookup: publicLookupOk,
+        concurrency: 2,
+        budgetMs: 60_000,
+        fetchBuffer: async () => {
+          if (classifyStartedAt == null) classifyStartedAt = t;
+          // Hang long enough that in-loop classify would block upserts.
+          await new Promise((r) => setTimeout(r, 30));
+          return { ok: true, buffer: whiteBuf, tooLarge: false };
+        },
+        classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} }),
+        now: () => t
+      });
+
+      // Upsert loop FIRST — never await classify here.
+      const pending = [];
+      for (const p of products) {
+        upserted.push(p.id);
+        lastUpsertAt = t;
+        t += 1;
+        pending.push({
+          productId: p.id,
+          imageUrl: p.imageUrl,
+          additionalImages: [],
+          existingStyles: []
+        });
+      }
+      check('I3_BEHAV upsert loop finished all products before classify',
+        upserted.length === 5 && classifyStartedAt == null,
+        `upserted=${upserted.length} classifyStartedAt=${classifyStartedAt}`);
+
+      session.beginClassifyPhase();
+      await session.classifyPendingProducts(pending, {
+        onProduct: async () => { /* persist noop */ }
+      });
+      check('I3_BEHAV classify ran only after every upsert',
+        classifyStartedAt != null && lastUpsertAt != null && classifyStartedAt >= lastUpsertAt,
+        `classifyStartedAt=${classifyStartedAt} lastUpsertAt=${lastUpsertAt}`);
+      check('I3_BEHAV all 5 products still in upsert set after hung-ish classify',
+        upserted.join(',') === 'sku-0,sku-1,sku-2,sku-3,sku-4');
+      session.dispose();
+    }
+
+    // Behavioral: budget clock + batch after pre-phase burn.
     {
       let t = 0;
       const upserted = [];
@@ -903,7 +1031,6 @@ async function main() {
         { id: '3', imageUrl: 'https://cdn.example/3.jpg' }
       ];
 
-      // Session created FIRST (as every writer does), budget NOT started.
       const session = ingest.createSession({
         lookup: publicLookupOk,
         fetchBuffer: async () => {
@@ -918,30 +1045,152 @@ async function main() {
       check('I6 session created before upsert; phase not started',
         session.hasClassifyPhaseStarted() === false);
 
-      // Upsert loop burns wall clock (Meta page timeouts, category trees…)
       for (const p of products) {
         upserted.push(p.id);
-        pending.push(p);
-        t += 500; // per-product pre-classify work
+        pending.push({
+          productId: p.id,
+          imageUrl: p.imageUrl,
+          additionalImages: [],
+          existingStyles: []
+        });
+        t += 500;
       }
       check('I7 upsert loop completed with clock past budgetMs',
         upserted.length === 3 && t > 1_000,
         `t=${t}`);
 
-      // Without beginClassifyPhase, a createSession-started budget would
-      // already be exhausted. Explicit start resets the window.
       session.beginClassifyPhase();
-      for (const item of pending) {
-        await session.classifyProductImages({
-          imageUrl: item.imageUrl,
-          additionalImages: [],
-          existingStyles: []
-        });
-      }
+      await session.classifyPendingProducts(pending);
       const totals = session.getTotals();
-      check('I8 post-loop classify still classifies after pre-phase burn',
+      check('I8 post-loop batch classify still classifies after pre-phase burn',
         totals.classified === 3 && totals.skippedBudget === 0,
         JSON.stringify(totals));
+      session.dispose();
+    }
+
+    // I9: batch uses concurrency across 1-image products (not serialised).
+    {
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const pending = Array.from({ length: 6 }, (_, i) => ({
+        productId: `p${i}`,
+        imageUrl: `https://cdn.example/batch${i}.jpg`,
+        additionalImages: [],
+        existingStyles: []
+      }));
+      const session = ingest.createSession({
+        lookup: publicLookupOk,
+        concurrency: 4,
+        budgetMs: 60_000,
+        fetchBuffer: async () => {
+          inFlight++;
+          if (inFlight > maxInFlight) maxInFlight = inFlight;
+          await new Promise((r) => setTimeout(r, 40));
+          inFlight--;
+          return { ok: true, buffer: whiteBuf, tooLarge: false };
+        },
+        classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
+      });
+      session.beginClassifyPhase();
+      await session.classifyPendingProducts(pending);
+      check('I9 batch classify reaches concurrency >1 across 1-image products',
+        maxInFlight >= 2 && session.getTotals().classified === 6,
+        `maxInFlight=${maxInFlight} classified=${session.getTotals().classified}`);
+      session.dispose();
+    }
+
+    // I10: session URL cache — shared CDN URL classified once.
+    {
+      let fetchCalls = 0;
+      const shared = 'https://cdn.example/shared-variant.jpg';
+      const pending = [
+        { productId: 'a', imageUrl: shared, additionalImages: [], existingStyles: [] },
+        { productId: 'b', imageUrl: shared, additionalImages: [], existingStyles: [] },
+        { productId: 'c', imageUrl: shared, additionalImages: [], existingStyles: [] }
+      ];
+      const session = ingest.createSession({
+        lookup: publicLookupOk,
+        concurrency: 3,
+        budgetMs: 60_000,
+        fetchBuffer: async () => {
+          fetchCalls++;
+          return { ok: true, buffer: whiteBuf, tooLarge: false };
+        },
+        classifyShotStyle: async () => ({ style: 'lifestyle', confidence: 0.8, metrics: {} })
+      });
+      session.beginClassifyPhase();
+      const { results } = await session.classifyPendingProducts(pending);
+      check('I10 session URL cache: shared URL fetched once across products',
+        fetchCalls === 1 && results.every((r) =>
+          ingest.storedStyleForUrl(r.entries, shared)?.style === 'lifestyle'
+        ),
+        `fetchCalls=${fetchCalls} results=${results.length}`);
+      session.dispose();
+    }
+
+    // I11: failed URL remembered for session — not retried per product.
+    {
+      let fetchCalls = 0;
+      const broken = 'https://cdn.example/broken.jpg';
+      const pending = [
+        { productId: 'a', imageUrl: broken, additionalImages: [], existingStyles: [] },
+        { productId: 'b', imageUrl: broken, additionalImages: [], existingStyles: [] },
+        { productId: 'c', imageUrl: broken, additionalImages: [], existingStyles: [] }
+      ];
+      const session = ingest.createSession({
+        lookup: publicLookupOk,
+        concurrency: 3,
+        budgetMs: 60_000,
+        fetchBuffer: async () => {
+          fetchCalls++;
+          return { ok: false, buffer: null, error: '404' };
+        },
+        classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
+      });
+      session.beginClassifyPhase();
+      await session.classifyPendingProducts(pending);
+      // First product fetches once; subsequent products hit sessionFailedUrls.
+      // With batch flattening, the URL appears once in allUrls → one fetch.
+      check('I11 failed URL fetched at most once per session (not per product)',
+        fetchCalls === 1,
+        `fetchCalls=${fetchCalls}`);
+      session.dispose();
+    }
+
+    // I12: mid-phase cancel → remaining abandoned with reason.
+    {
+      let calls = 0;
+      const pending = Array.from({ length: 4 }, (_, i) => ({
+        productId: `p${i}`,
+        imageUrl: `https://cdn.example/c${i}.jpg`,
+        additionalImages: [],
+        existingStyles: []
+      }));
+      const session = ingest.createSession({
+        lookup: publicLookupOk,
+        concurrency: 1,
+        budgetMs: 60_000,
+        fetchBuffer: async () => {
+          calls++;
+          return { ok: true, buffer: whiteBuf, tooLarge: false };
+        },
+        classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
+      });
+      session.beginClassifyPhase();
+      let cancelAfter = 1;
+      const { cancelled } = await session.classifyPendingProducts(pending, {
+        isCancelled: async () => {
+          // Cancel after first URL has been considered/claimed.
+          return session.getTotals().classified + session.getTotals().failed +
+            session.getTotals().fetchFailed + session.getTotals().cpuTimedOut >= cancelAfter ||
+            session.getTotals().classified >= cancelAfter;
+        }
+      });
+      const t = session.getTotals();
+      check('I12 mid-phase cancel stops and records abandoned',
+        cancelled === true && t.skippedAbandoned >= 1 &&
+        (t.abandonReason === 'cancelled' || t.classified < 4),
+        JSON.stringify(t));
       session.dispose();
     }
   }
@@ -1057,18 +1306,37 @@ async function main() {
       ['0.0.0.0', 'ipv4_this_network'],
       ['100.64.0.1', 'ipv4_cgnat'],
       ['::1', 'ipv6_loopback'],
+      ['::', 'ipv6_unspecified'],
       ['fc00::1', 'ipv6_ula_fc'],
       ['fd12:3456:789a::1', 'ipv6_ula_fd'],
       ['fe80::1', 'ipv6_link_local'],
+      // IPv4-mapped (already covered previously)
       ['::ffff:127.0.0.1', 'ipv4_mapped_loopback'],
       ['::ffff:10.0.0.1', 'ipv4_mapped_private'],
-      ['::ffff:169.254.169.254', 'ipv4_mapped_metadata']
+      ['::ffff:169.254.169.254', 'ipv4_mapped_metadata'],
+      // IPv4-compatible — VERIFIED BYPASS table (Round 4). Exact strings.
+      ['::7f00:1', 'ipv4_compat_loopback_hex'],
+      ['::a9fe:a9fe', 'ipv4_compat_metadata_hex'],
+      ['::169.254.169.254', 'ipv4_compat_metadata_dotted'],
+      ['::127.0.0.1', 'ipv4_compat_loopback_dotted'],
+      ['::0a00:1', 'ipv4_compat_rfc1918_10'],
+      // Sibling translation prefixes
+      ['64:ff9b::7f00:1', 'nat64_loopback'],
+      ['64:ff9b::a9fe:a9fe', 'nat64_metadata'],
+      ['64:ff9b::0a00:1', 'nat64_rfc1918_10'],
+      ['2002:7f00:1::1', '6to4_loopback'],
+      ['2002:a9fe:a9fe::1', '6to4_metadata'],
+      ['2002:0a00:1::', '6to4_rfc1918_10']
     ];
     for (const [ip, name] of blockedIps) {
       check(`S1 blocked IP ${name} (${ip})`, isBlockedIp(ip) === true);
     }
     check('S1b public IPv4 allowed by isBlockedIp', isBlockedIp('8.8.8.8') === false);
     check('S1c public IPv6 allowed by isBlockedIp', isBlockedIp('2001:4860:4860::8888') === false);
+    check('S1d 6to4 with public embedded IPv4 allowed',
+      isBlockedIp('2002:808:808::1') === false); // 8.8.8.8
+    check('S1e NAT64 with public embedded IPv4 allowed',
+      isBlockedIp('64:ff9b::808:808') === false);
 
     // S2 — scheme allowlist
     for (const [scheme, url] of [
@@ -1100,7 +1368,15 @@ async function main() {
       'http://192.168.0.2/img.jpg',
       'http://[::1]/img.jpg',
       'http://[fe80::1]/img.jpg',
-      'http://[::ffff:127.0.0.1]/img.jpg'
+      'http://[::ffff:127.0.0.1]/img.jpg',
+      // IPv4-compatible forms that previously BYPASSED (Round 4)
+      'http://[::7f00:1]/img.jpg',
+      'http://[::a9fe:a9fe]/img.jpg',
+      'http://[::169.254.169.254]/img.jpg',
+      'http://[::127.0.0.1]/img.jpg',
+      'http://[::0a00:1]/img.jpg',
+      'http://[64:ff9b::a9fe:a9fe]/img.jpg',
+      'http://[2002:a9fe:a9fe::1]/img.jpg'
     ]) {
       // eslint-disable-next-line no-await-in-loop
       const r = await assertUrlSafeForFetch(url, { lookup: publicLookupOk });
@@ -1425,6 +1701,70 @@ async function main() {
         check('S10d live post-DNS check still rejects resolves-to-private',
           r2.ok === false && /blocked_address:169\.254\.169\.254/.test(r2.reason),
           JSON.stringify(r2));
+      }
+    }
+
+    // S10e — REVERT-PROVE IPv4-compatible branch specifically.
+    // Strip the ::/96 re-check; the Round-4 bypass table must FAIL.
+    {
+      const liveSrc = read('services/ingestShotClassifyService.js');
+      // The compatible-form block (first 96 bits zero, re-check embedded v4).
+      const compatNeedle =
+        /\/\/ ::\/96 IPv4-compatible[\s\S]*?return isBlockedIpv4\(hextetsToV4\(h\[6\], h\[7\]\)\);\s*\}/;
+      check('S10e_pre IPv4-compatible ::/96 branch present for revert-prove',
+        compatNeedle.test(liveSrc));
+
+      if (compatNeedle.test(liveSrc)) {
+        let tmpPath = null;
+        try {
+          const { mod: mutatedIngest, tmp } = loadMutatedIngest((src) => {
+            const m = src.replace(compatNeedle, `
+  // REVERTED (temp): IPv4-compatible ::/96 branch removed — demonstrates hole.
+`);
+            assert.notStrictEqual(m, src, 'compat mutation must change source');
+            return m;
+          });
+          tmpPath = tmp;
+          // Exact bypass strings from the verified table — must now ALLOW.
+          const bypasses = [
+            '::7f00:1',
+            '::a9fe:a9fe',
+            '::169.254.169.254',
+            '::127.0.0.1',
+            '::0a00:1'
+          ];
+          let anyAllowed = false;
+          const results = {};
+          for (const ip of bypasses) {
+            const blocked = mutatedIngest.isBlockedIp(ip);
+            results[ip] = blocked ? 'blocked' : 'ALLOW';
+            if (!blocked) anyAllowed = true;
+          }
+          check('S10e REVERT-PROVE: without ::/96 branch, IPv4-compatible BYPASSES (table allows)',
+            anyAllowed === true &&
+            mutatedIngest.isBlockedIp('::7f00:1') === false &&
+            mutatedIngest.isBlockedIp('::a9fe:a9fe') === false,
+            JSON.stringify(results));
+          // Mapped form must still be blocked (different branch)
+          check('S10e2 REVERT-PROVE: IPv4-mapped still blocked after ::/96 removal',
+            mutatedIngest.isBlockedIp('::ffff:127.0.0.1') === true &&
+            mutatedIngest.isBlockedIp('::ffff:169.254.169.254') === true);
+          // :: and ::1 must still be blocked (explicit early returns)
+          check('S10e3 REVERT-PROVE: :: and ::1 still blocked after ::/96 removal',
+            mutatedIngest.isBlockedIp('::') === true &&
+            mutatedIngest.isBlockedIp('::1') === true);
+        } catch (e) {
+          check('S10e REVERT-PROVE: without ::/96 branch, IPv4-compatible BYPASSES (table allows)',
+            false, e.message);
+        } finally {
+          if (tmpPath) unloadTmp(tmpPath);
+        }
+        // Live still blocks every table entry
+        for (const ip of [
+          '::7f00:1', '::a9fe:a9fe', '::169.254.169.254', '::127.0.0.1', '::0a00:1'
+        ]) {
+          check(`S10e_live live still blocks ${ip}`, isBlockedIp(ip) === true);
+        }
       }
     }
 

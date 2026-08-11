@@ -395,25 +395,28 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   // Post-loop classify pass — products are already persisted. Failures
   // here cannot un-save a product or skip a sibling SKU's upsert.
   // Budget clock starts here (beginClassifyPhase), not at createSession.
+  // Batched across products so the concurrency cap is used; cooperative
+  // cancel (same abortCheck as the upsert loop) stops promptly and
+  // records outstanding URLs as skippedAbandoned.
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
     shotSession.beginClassifyPhase();
-    for (const item of pendingClassify) {
-      try {
-        const { entries, changed } = await shotSession.classifyProductImages({
-          imageUrl: item.imageUrl,
-          additionalImages: item.additionalImages,
-          existingStyles: item.existingStyles
-        });
-        if (changed) {
-          await CatalogProduct.updateOne(
-            { _id: item.productId },
-            { $set: { imageShotStyles: entries } }
-          );
-        }
-      } catch (shotErr) {
-        console.warn(`   ⚠️  🛍  shot-classify failed for ${item.productId}: ${shotErr.message}`);
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        if (midUpsertCancelled) return true;
+        try { return !!(await abortCheck(brand._id, run)); } catch (_) { return false; }
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
       }
-    }
+    }).then((r) => {
+      if (r && r.cancelled) midUpsertCancelled = true;
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  🛍  shot-classify batch failed: ${shotErr.message}`);
+    });
   }
 
   if (midUpsertCancelled) {

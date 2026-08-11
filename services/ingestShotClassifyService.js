@@ -42,9 +42,18 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 const { concurrency: CONC } = require('./concurrency');
-const {
-  classifyShotStyle: defaultClassifyShotStyle
-} = require('./imageShotHeuristicService');
+
+// Lazy load imageShotHeuristicService (and thus sharp) so writers that only
+// call isEnabled() / pure helpers when CATALOG_INGEST_SHOT_CLASSIFY_ENABLED=
+// false pay nothing at boot. Production classify path loads on first use.
+let _defaultClassifyShotStyle = null;
+function defaultClassifyShotStyle(buffer) {
+  if (!_defaultClassifyShotStyle) {
+    // eslint-disable-next-line global-require
+    _defaultClassifyShotStyle = require('./imageShotHeuristicService').classifyShotStyle;
+  }
+  return _defaultClassifyShotStyle(buffer);
+}
 
 // NOTE: we intentionally do NOT use services/httpScrapeClient.fetchBuffer for
 // this path. That client hardcodes `redirect: 'follow'` with no hop
@@ -150,7 +159,8 @@ function abortable(signal, promise) {
 
 /**
  * True when `ip` is a private, loopback, link-local, or otherwise reserved
- * address we must never fetch. Covers IPv4, IPv6, and IPv4-mapped IPv6.
+ * address we must never fetch. Covers IPv4, IPv6, IPv4-mapped IPv6, and
+ * well-known IPv4-translation prefixes (see isBlockedIpv6).
  *
  * Blocked ranges (exact contract pinned by the harness):
  *   IPv4:
@@ -172,11 +182,19 @@ function abortable(signal, promise) {
  *   IPv6:
  *     ::                unspecified
  *     ::1               loopback
- *     ::ffff:0:0/96     IPv4-mapped — embedded IPv4 re-checked via isBlockedIp
+ *     ::ffff:0:0/96     IPv4-mapped — embedded IPv4 re-checked
+ *     ::/96             IPv4-compatible (deprecated; Node normalises
+ *                       ::127.0.0.1 → ::7f00:1) — embedded IPv4 re-checked.
+ *                       :: and ::1 stay blocked (handled above / via 0.0.0.0/8).
+ *     64:ff9b::/96      NAT64 well-known prefix — embedded IPv4 re-checked
+ *     2002::/16         6to4 — embedded IPv4 (bits 16..47) re-checked
  *     fc00::/7          unique local
  *     fe80::/10         link-local
  *     2001:db8::/32     documentation
  *     ff00::/8          multicast
+ *
+ * Deliberately NOT covered (expand only with a harness case): Teredo
+ * (2001::/32), ISATAP, 6rd, and other transitional mechanisms.
  *
  * @param {string} ip
  * @returns {boolean}
@@ -289,23 +307,54 @@ function parseIpv6(ip) {
   return hextets;
 }
 
+/** Two hextets → dotted IPv4 (high hextet = first two octets). */
+function hextetsToV4(hi, lo) {
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
 function isBlockedIpv6(ip) {
   const h = parseIpv6(ip);
   if (!h) return true;
 
-  // :: unspecified
+  // :: unspecified — must stay blocked (do not fall through to "public" v4).
   if (h.every((x) => x === 0)) return true;
-  // ::1 loopback
+  // ::1 loopback — must stay blocked even though embedded form is 0.0.0.1.
   if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 &&
       h[4] === 0 && h[5] === 0 && h[6] === 0 && h[7] === 1) {
     return true;
   }
-  // ::ffff:0:0/96 IPv4-mapped — re-check embedded IPv4
+
+  // Embedded-IPv4 translation prefixes. Re-check the embedded v4 via
+  // isBlockedIpv4 so loopback / link-local / RFC1918 cannot hide behind a
+  // v6 wrapper. Covered well-known prefixes only:
+  //   ::ffff:0:0/96  IPv4-mapped     (e.g. ::ffff:127.0.0.1)
+  //   ::/96          IPv4-compatible (deprecated; e.g. ::7f00:1, ::169.254.169.254)
+  //   64:ff9b::/96   NAT64 well-known (e.g. 64:ff9b::a9fe:a9fe)
+  //   2002::/16      6to4            (embedded v4 in bits 16..47)
+  // Deliberately NOT covered: Teredo (2001::/32), ISATAP, 6rd — expand
+  // only with a new harness case, do not go infinite.
+
+  // ::ffff:0:0/96 IPv4-mapped
   if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 &&
       h[4] === 0 && h[5] === 0xffff) {
-    const v4 = `${(h[6] >> 8) & 0xff}.${h[6] & 0xff}.${(h[7] >> 8) & 0xff}.${h[7] & 0xff}`;
-    return isBlockedIpv4(v4);
+    return isBlockedIpv4(hextetsToV4(h[6], h[7]));
   }
+  // ::/96 IPv4-compatible (first 96 bits zero). :: and ::1 already returned.
+  // Node normalises dotted form (::127.0.0.1) to hex (::7f00:1).
+  if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 &&
+      h[4] === 0 && h[5] === 0) {
+    return isBlockedIpv4(hextetsToV4(h[6], h[7]));
+  }
+  // 64:ff9b::/96 NAT64 well-known prefix
+  if (h[0] === 0x64 && h[1] === 0xff9b &&
+      h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0) {
+    return isBlockedIpv4(hextetsToV4(h[6], h[7]));
+  }
+  // 2002::/16 6to4 — IPv4 lives in hextets 1 and 2 (bits 16..47)
+  if (h[0] === 0x2002) {
+    return isBlockedIpv4(hextetsToV4(h[1], h[2]));
+  }
+
   // fc00::/7 unique local (fc00..fdff)
   if ((h[0] & 0xfe00) === 0xfc00) return true;
   // fe80::/10 link-local
@@ -990,11 +1039,15 @@ function technicalInsightsTimestampMs(ti) {
 
 /**
  * Whether a CatalogProduct-derived storedShot should write onto Media.
- * Conservative newer-wins: apply when Media has no shotStyle, OR when the
- * product entry is strictly newer than Media's stored stamp. Equal/unknown
- * timestamps do NOT thrash (no refresh). Used by materializeImage so a
- * threshold retune / re-classify can supersede a stale Media value without
- * bouncing on every materialize.
+ * First-write only: apply when Media has no shotStyle yet. Once Media
+ * carries a shotStyle, leave it alone.
+ *
+ * WHY NOT "newer-wins / threshold retune": classifyUrls is idempotent per
+ * URL (already-stored styles are skipped), so a CatalogProduct entry's
+ * `at` never refreshes for a URL that already has a style. A newer-wins
+ * branch would be permanently unreachable dead code that pretends a
+ * retune path exists. If a real retune is ever needed, make re-classify
+ * reachable first, then restore timestamp comparison in the same change.
  *
  * @param {object|null|undefined} existingTi  Media.technicalInsights
  * @param {object|null|undefined} storedShot  technicalInsightsFromStored(...)
@@ -1003,11 +1056,7 @@ function technicalInsightsTimestampMs(ti) {
 function shouldApplyStoredShot(existingTi, storedShot) {
   if (!storedShot || !storedShot.shotStyle) return false;
   if (!existingTi || !existingTi.shotStyle) return true;
-  const existingMs = technicalInsightsTimestampMs(existingTi);
-  const storedMs = technicalInsightsTimestampMs(storedShot);
-  // Missing either stamp → leave Media alone (never thrash).
-  if (existingMs == null || storedMs == null) return false;
-  return storedMs > existingMs;
+  return false;
 }
 
 /**
@@ -1100,6 +1149,14 @@ function createSession(opts = {}) {
   const lookup = opts.lookup || defaultLookup;
   const metadataFn = opts.metadataFn || null;
 
+  // Session-scoped URL cache: a CDN URL shared by variant products is
+  // classified once per sync, not once per product. Idempotency on
+  // CatalogProduct.imageShotStyles is per-product only — this fills the gap.
+  // Failed URLs are remembered too so a permanently-broken image cannot
+  // monopolise the budget across every product that references it.
+  const sessionUrlCache = new Map(); // url → style entry
+  const sessionFailedUrls = new Set(); // url → do not re-fetch this session
+
   // Default path: safeFetchBuffer (DNS once + pin + single deadline).
   // Injected fetchBuffer (harnesses): gate SSRF once here, then call the
   // double — do NOT also run safeFetchBuffer (would double DNS).
@@ -1154,15 +1211,17 @@ function createSession(opts = {}) {
     considered: 0,
     classified: 0,
     skippedExisting: 0,
+    skippedSessionCache: 0, // URL already classified earlier this session
+    skippedFailedSession: 0, // URL failed earlier this session — not retried
     skippedBudget: 0,
-    skippedAbandoned: 0, // pendingClassify never attempted (cancel/fatal)
+    skippedAbandoned: 0, // pending never attempted or cancelled mid-phase
     skippedFlagOff: 0,
-    failed: 0,       // classify returned null / threw / cpu timeout
+    failed: 0,       // classify returned null / threw (NOT specific buckets)
     fetchFailed: 0,
     ssrfRejected: 0, // distinct from fetchFailed — hostile/private URL
     timedOut: 0,
     tooLarge: 0,
-    cpuTimedOut: 0,  // sharp/decode wall-clock exceeded
+    cpuTimedOut: 0,  // sharp/decode wall-clock exceeded (exclusive of failed)
     maxInFlight: 0,
     abandonReason: null
   };
@@ -1233,28 +1292,33 @@ function createSession(opts = {}) {
   }
 
   /**
-   * Count outstanding pendingClassify image URLs as abandoned when the
-   * classify phase never runs (Meta fatal early-return, CancelledError,
-   * or any exit that skips the post-loop pass). Distinguishes
-   * "0 images needed classifying" from "N images were never attempted".
+   * Count outstanding pendingClassify image URLs as abandoned.
    *
-   * No-op once beginClassifyPhase has been called (budget/skipBudget
-   * own that path). Safe to call from finally.
+   * Used when:
+   *   (a) the classify phase never runs (Meta fatal, cancel before phase)
+   *   (b) mid-phase cancel — pass the REMAINING items so they are not
+   *       silently dropped from accounting
+   *
+   * Skips URLs already stored on the product, already in the session
+   * cache, or already failed this session (those were / would be
+   * handled by other counters). Safe to call from finally when phase
+   * never started; writers call it with remaining items on cancel.
    *
    * @param {Array<{imageUrl?, additionalImages?, existingStyles?}>} pendingItems
    * @param {string} [reason]
    * @returns {number} URLs counted as abandoned
    */
   function abandonPending(pendingItems, reason = 'phase_skipped') {
-    if (phaseStarted) return 0;
     let n = 0;
     for (const item of pendingItems || []) {
       if (!item) continue;
       const urls = collectProductImageUrls(item.imageUrl, item.additionalImages);
       const existing = Array.isArray(item.existingStyles) ? item.existingStyles : [];
       for (const url of urls) {
-        // Already-stored styles would have been skippedExisting, not attempted.
+        // Already-stored / session-cached / already-failed would not be attempted.
         if (storedStyleForUrl(existing, url)) continue;
+        if (sessionUrlCache.has(url)) continue;
+        if (sessionFailedUrls.has(url)) continue;
         n++;
       }
     }
@@ -1270,49 +1334,16 @@ function createSession(opts = {}) {
   }
 
   /**
-   * Bound the sharp/decode step. HONEST LIMITATION: Promise.race frees
-   * this worker slot when the wall-clock fires, but the underlying
-   * libvips work started by sharp is NOT cancelled — it may continue on
-   * a background thread until it finishes or the process exits. We only
-   * guarantee the classify phase does not wait forever on one buffer.
+   * Bound the entire sharp decode path (metadata pre-check + classify).
+   * HONEST LIMITATION: Promise.race frees this worker slot when the
+   * wall-clock fires, but underlying libvips work is NOT cancelled —
+   * it may continue on a background thread. We only guarantee the
+   * classify phase does not wait forever on one buffer.
    *
-   * Optional cheap metadata pre-check (pages / pixel area) runs first
-   * when enabled; failures degrade to unclassified (same as timeout).
+   * `sharp.metadata()` is INSIDE the same race: a hung or pathological
+   * metadata() used to block a worker slot with no timeout (Blocker 2).
    */
   async function classifyWithCpuGuard(buffer) {
-    // Optional pre-check: refuse absurd animated/huge assets before the
-    // full rotate→resize→stats pipeline. Soft-fail on metadata errors.
-    if ((maxDecodePixels > 0 || maxAnimatedPages > 0) && buffer && buffer.length) {
-      try {
-        let meta;
-        if (typeof metadataFn === 'function') {
-          meta = await metadataFn(buffer);
-        } else {
-          // Lazy require so offline harnesses that inject classifyShotStyle
-          // and never touch this branch need no sharp binary. Production
-          // always has sharp (imageShotHeuristicService depends on it).
-          // eslint-disable-next-line global-require
-          const sharp = require('sharp');
-          meta = await sharp(buffer, { failOn: 'none' }).metadata();
-        }
-        if (meta) {
-          const pages = meta.pages || 1;
-          if (maxAnimatedPages > 0 && pages > maxAnimatedPages) {
-            return null;
-          }
-          const w = meta.width || 0;
-          const h = meta.height || 0;
-          if (maxDecodePixels > 0 && w > 0 && h > 0 && (w * h * pages) > maxDecodePixels) {
-            return null;
-          }
-        }
-      } catch (_) {
-        // metadata failed — fall through to full classify (may also fail)
-      }
-    }
-
-    // Wall-clock race. On timeout we return null (unclassified) and the
-    // slot is free; sharp may still be chewing the buffer in the background.
     let timer = null;
     const timeoutPromise = new Promise((resolve) => {
       timer = setTimeout(() => {
@@ -1320,21 +1351,58 @@ function createSession(opts = {}) {
       }, cpuMs);
       if (typeof timer.unref === 'function') timer.unref();
     });
+
+    async function decodeAndClassify() {
+      // Optional pre-check: refuse absurd animated/huge assets before the
+      // full rotate→resize→stats pipeline. Soft-fail on metadata errors.
+      if ((maxDecodePixels > 0 || maxAnimatedPages > 0) && buffer && buffer.length) {
+        try {
+          let meta;
+          if (typeof metadataFn === 'function') {
+            meta = await metadataFn(buffer);
+          } else {
+            // Lazy require so offline harnesses that inject classifyShotStyle
+            // and never touch this branch need no sharp binary.
+            // eslint-disable-next-line global-require
+            const sharp = require('sharp');
+            meta = await sharp(buffer, { failOn: 'none' }).metadata();
+          }
+          if (meta) {
+            const pages = meta.pages || 1;
+            if (maxAnimatedPages > 0 && pages > maxAnimatedPages) {
+              return null;
+            }
+            const w = meta.width || 0;
+            const h = meta.height || 0;
+            if (maxDecodePixels > 0 && w > 0 && h > 0 && (w * h * pages) > maxDecodePixels) {
+              return null;
+            }
+          }
+        } catch (_) {
+          // metadata failed — fall through to full classify (may also fail)
+        }
+      }
+      return classifyShotStyle(buffer);
+    }
+
     try {
       const raced = await Promise.race([
         Promise.resolve()
-          .then(() => classifyShotStyle(buffer))
+          .then(() => decodeAndClassify())
           .then((r) => ({ __result: r }))
           .catch(() => ({ __result: null })),
         timeoutPromise
       ]);
       if (raced && raced.__cpuTimeout) {
         totals.cpuTimedOut++;
-        return null;
+        return { __cpuTimedOut: true, result: null };
       }
-      return raced && Object.prototype.hasOwnProperty.call(raced, '__result')
-        ? raced.__result
-        : null;
+      return {
+        __cpuTimedOut: false,
+        result: raced && Object.prototype.hasOwnProperty.call(raced, '__result')
+          ? raced.__result
+          : null
+      };
     } finally {
       if (timer != null) clearTimeout(timer);
     }
@@ -1342,23 +1410,31 @@ function createSession(opts = {}) {
 
   /**
    * Classify a list of image URLs. Skips URLs already present in
-   * `existingEntries` (idempotent re-sync). Never throws.
+   * `existingEntries` (idempotent re-sync) and URLs already known to
+   * this session (cross-product cache). Never throws.
    *
    * @param {string[]} urls
    * @param {Array} [existingEntries] prior CatalogProduct.imageShotStyles
+   * @param {object} [opts]
+   * @param {function} [opts.isCancelled]  () => boolean | Promise<boolean>
    * @returns {Promise<{
    *   entries: Array,      // full merged list (existing + newly classified), pruned to urls
    *   fresh: Array,        // only newly classified this call
    *   changed: boolean,
+   *   cancelled: boolean,
    *   stats: object
    * }>}
    */
-  async function classifyUrls(urls, existingEntries = []) {
+  async function classifyUrls(urls, existingEntries = [], opts = {}) {
+    const isCancelled = typeof opts.isCancelled === 'function' ? opts.isCancelled : null;
     const callStats = {
       considered: 0,
       classified: 0,
       skippedExisting: 0,
+      skippedSessionCache: 0,
+      skippedFailedSession: 0,
       skippedBudget: 0,
+      skippedAbandoned: 0,
       failed: 0,
       fetchFailed: 0,
       ssrfRejected: 0,
@@ -1387,6 +1463,7 @@ function createSession(opts = {}) {
         entries: existing.slice(),
         fresh: [],
         changed: false,
+        cancelled: false,
         stats: { ...callStats, skippedFlagOff: list.length }
       };
     }
@@ -1396,7 +1473,12 @@ function createSession(opts = {}) {
     // of classifyUrls alone still get a correct per-call budget).
     if (!phaseStarted) beginClassifyPhase();
 
+    // Pull session-cache hits into the merge set so variant products share
+    // a single download. Collect URLs that still need network work.
+    const fromCache = [];
     const pending = [];
+    let cancelled = false;
+
     for (const url of list) {
       callStats.considered++;
       totals.considered++;
@@ -1404,6 +1486,42 @@ function createSession(opts = {}) {
         callStats.skippedExisting++;
         totals.skippedExisting++;
         continue;
+      }
+      if (sessionUrlCache.has(url)) {
+        fromCache.push(sessionUrlCache.get(url));
+        callStats.skippedSessionCache++;
+        totals.skippedSessionCache++;
+        continue;
+      }
+      if (sessionFailedUrls.has(url)) {
+        // Permanently broken for this session — do not re-fetch / re-burn budget.
+        callStats.skippedFailedSession++;
+        totals.skippedFailedSession++;
+        continue;
+      }
+      if (isCancelled) {
+        let stop = false;
+        try { stop = !!(await isCancelled()); } catch (_) { stop = false; }
+        if (stop) {
+          cancelled = true;
+          // Remaining URLs in list (this one + rest) that would have been
+          // attempted → abandoned. Count this url and drain the rest of the
+          // pre-pending scan as abandoned too.
+          callStats.skippedAbandoned++;
+          totals.skippedAbandoned++;
+          totals.abandonReason = totals.abandonReason || 'cancelled';
+          // Count subsequent not-yet-handled urls in `list` as abandoned.
+          const idx = list.indexOf(url);
+          for (let j = idx + 1; j < list.length; j++) {
+            const u2 = list[j];
+            if (existingByUrl.has(u2) || sessionUrlCache.has(u2) || sessionFailedUrls.has(u2)) {
+              continue;
+            }
+            callStats.skippedAbandoned++;
+            totals.skippedAbandoned++;
+          }
+          break;
+        }
       }
       if (!budgetOk()) {
         callStats.skippedBudget++;
@@ -1418,6 +1536,20 @@ function createSession(opts = {}) {
 
     async function worker() {
       while (cursor < pending.length) {
+        if (isCancelled) {
+          let stop = false;
+          try { stop = !!(await isCancelled()); } catch (_) { stop = false; }
+          if (stop) {
+            cancelled = true;
+            while (cursor < pending.length) {
+              cursor++;
+              callStats.skippedAbandoned++;
+              totals.skippedAbandoned++;
+            }
+            totals.abandonReason = totals.abandonReason || 'cancelled';
+            return;
+          }
+        }
         // Re-check budget before claiming the next URL so a long earlier
         // fetch doesn't let us start work after the deadline.
         if (!budgetOk()) {
@@ -1441,25 +1573,44 @@ function createSession(opts = {}) {
           try { budgetAc.abort(); } catch { /* ignore */ }
           callStats.skippedBudget++;
           totals.skippedBudget++;
-          // Put back? No — already claimed; count as budget skip.
           continue;
         }
         const urlTimeoutMs = Math.min(timeoutMs, Math.max(1, remaining));
 
         inFlight++;
         if (inFlight > totals.maxInFlight) totals.maxInFlight = inFlight;
+        // Snapshot specific-bucket counters so a null return is not also
+        // counted as generic `failed` (cpuTimedOut double-count fix).
+        const snap = {
+          cpuTimedOut: totals.cpuTimedOut,
+          fetchFailed: totals.fetchFailed,
+          ssrfRejected: totals.ssrfRejected,
+          timedOut: totals.timedOut,
+          tooLarge: totals.tooLarge
+        };
         try {
-          const result = await classifyOne(url, urlTimeoutMs);
+          const result = await classifyOne(url, urlTimeoutMs, callStats);
           if (result) {
             fresh.push(result);
+            sessionUrlCache.set(url, result);
             callStats.classified++;
             totals.classified++;
           } else {
-            callStats.failed++;
-            totals.failed++;
+            sessionFailedUrls.add(url);
+            const specific =
+              totals.cpuTimedOut > snap.cpuTimedOut ||
+              totals.fetchFailed > snap.fetchFailed ||
+              totals.ssrfRejected > snap.ssrfRejected ||
+              totals.timedOut > snap.timedOut ||
+              totals.tooLarge > snap.tooLarge;
+            if (!specific) {
+              callStats.failed++;
+              totals.failed++;
+            }
           }
         } catch (_) {
           // classifyOne is not supposed to throw; belt-and-braces.
+          sessionFailedUrls.add(url);
           callStats.failed++;
           totals.failed++;
         } finally {
@@ -1468,7 +1619,7 @@ function createSession(opts = {}) {
       }
     }
 
-    async function classifyOne(url, urlTimeoutMs) {
+    async function classifyOne(url, urlTimeoutMs, stats) {
       let fetched;
       try {
         fetched = await fetchBuffer(url, {
@@ -1480,24 +1631,24 @@ function createSession(opts = {}) {
       } catch (err) {
         const msg = err && err.message ? err.message : String(err);
         if (/aborted|timeout|Timeout|ABORT/i.test(msg) || (err && err.name === 'AbortError')) {
-          callStats.timedOut++;
+          stats.timedOut++;
           totals.timedOut++;
         } else {
-          callStats.fetchFailed++;
+          stats.fetchFailed++;
           totals.fetchFailed++;
         }
         return null;
       }
 
       if (!fetched) {
-        callStats.fetchFailed++;
+        stats.fetchFailed++;
         totals.fetchFailed++;
         return null;
       }
       // SSRF rejection: degrade to unclassified, count SEPARATELY from
       // fetch failures, log at warn, never throw.
       if (fetched.ssrfRejected) {
-        callStats.ssrfRejected++;
+        stats.ssrfRejected++;
         totals.ssrfRejected++;
         console.warn(
           `⚠️ ingest-shot-classify SSRF rejected: ${fetched.ssrfReason || fetched.error || 'blocked'} url=${url}`
@@ -1505,35 +1656,35 @@ function createSession(opts = {}) {
         return null;
       }
       if (fetched.tooLarge) {
-        callStats.tooLarge++;
+        stats.tooLarge++;
         totals.tooLarge++;
         return null;
       }
       if (!fetched.ok || !fetched.buffer || !fetched.buffer.length) {
         // Distinguish timeout-ish statuses if the client surfaces them.
         if (fetched.error && /aborted|timeout|Timeout/i.test(fetched.error)) {
-          callStats.timedOut++;
+          stats.timedOut++;
           totals.timedOut++;
         } else {
-          callStats.fetchFailed++;
+          stats.fetchFailed++;
           totals.fetchFailed++;
         }
         return null;
       }
 
-      // CPU/decode bound — see classifyWithCpuGuard (does NOT cancel libvips).
-      const cpuBefore = totals.cpuTimedOut;
-      let classified;
+      // CPU/decode bound — metadata() + classifyShotStyle share one wall clock.
+      let guarded;
       try {
-        classified = await classifyWithCpuGuard(fetched.buffer);
+        guarded = await classifyWithCpuGuard(fetched.buffer);
       } catch (_) {
         return null;
       }
-      if (totals.cpuTimedOut > cpuBefore) {
-        callStats.cpuTimedOut++;
-        // Treat as failed/unclassified (already counted in totals.cpuTimedOut).
+      if (guarded && guarded.__cpuTimedOut) {
+        stats.cpuTimedOut++;
+        // totals.cpuTimedOut already incremented inside classifyWithCpuGuard
         return null;
       }
+      const classified = guarded && guarded.result;
       if (!classified || !classified.style) return null;
 
       return {
@@ -1544,21 +1695,23 @@ function createSession(opts = {}) {
       };
     }
 
-    const workers = [];
-    const nWorkers = Math.min(concurrency, Math.max(pending.length, 0));
-    for (let i = 0; i < nWorkers; i++) workers.push(worker());
-    if (workers.length) {
-      try {
-        await Promise.all(workers);
-      } catch (_) {
-        // individual workers swallow; this is defensive
+    if (!cancelled) {
+      const workers = [];
+      const nWorkers = Math.min(concurrency, Math.max(pending.length, 0));
+      for (let i = 0; i < nWorkers; i++) workers.push(worker());
+      if (workers.length) {
+        try {
+          await Promise.all(workers);
+        } catch (_) {
+          // individual workers swallow; this is defensive
+        }
       }
     }
 
     // Prune to the product's current image set so rotated-out URLs do not
-    // accumulate forever across re-syncs.
-    const entries = mergeStyleEntries(existing, fresh, list);
-    // changed if we classified anything new OR pruned something
+    // accumulate forever across re-syncs. Include session-cache hits.
+    const entries = mergeStyleEntries(existing, [...fromCache, ...fresh], list);
+    // changed if we classified anything new, pulled from session cache, OR pruned
     const pruned =
       entries.length !== existing.length ||
       entries.some((e) => {
@@ -1570,7 +1723,8 @@ function createSession(opts = {}) {
     return {
       entries,
       fresh,
-      changed: fresh.length > 0 || pruned,
+      changed: fresh.length > 0 || fromCache.length > 0 || pruned,
+      cancelled,
       stats: callStats
     };
   }
@@ -1578,9 +1732,126 @@ function createSession(opts = {}) {
   /**
    * Convenience: hero + alts → merged style entries.
    */
-  async function classifyProductImages({ imageUrl, additionalImages, existingStyles } = {}) {
+  async function classifyProductImages({ imageUrl, additionalImages, existingStyles, isCancelled } = {}) {
     const urls = collectProductImageUrls(imageUrl, additionalImages);
-    return classifyUrls(urls, existingStyles || []);
+    return classifyUrls(urls, existingStyles || [], { isCancelled });
+  }
+
+  /**
+   * Project session-cache + existingStyles onto one product (no network).
+   * Used after a batch wave so each product row can be persisted.
+   */
+  function projectProductStyles(item) {
+    const urls = collectProductImageUrls(item && item.imageUrl, item && item.additionalImages);
+    const existing = Array.isArray(item && item.existingStyles) ? item.existingStyles : [];
+    const existingByUrl = new Map();
+    for (const e of existing) {
+      if (e && e.url && e.style) existingByUrl.set(e.url, e);
+    }
+    const fromCache = [];
+    for (const url of urls) {
+      if (existingByUrl.has(url)) continue;
+      if (sessionUrlCache.has(url)) fromCache.push(sessionUrlCache.get(url));
+    }
+    const entries = mergeStyleEntries(existing, fromCache, urls);
+    const pruned =
+      entries.length !== existing.length ||
+      entries.some((e) => {
+        const prev = existingByUrl.get(e.url);
+        return !prev || prev.style !== e.style || prev.confidence !== e.confidence;
+      }) ||
+      existing.some((e) => e && e.url && !entries.find((x) => x.url === e.url));
+    return {
+      entries,
+      fresh: fromCache,
+      changed: fromCache.length > 0 || pruned,
+      cancelled: false,
+      stats: { projected: true }
+    };
+  }
+
+  /**
+   * Batch-classify many products in ONE concurrent pool so the concurrency
+   * cap is actually used for typical 1-image products (per-product
+   * classifyProductImages serialises them). Honours cooperative cancel
+   * between claims; remaining items are abandonPending'd with reason
+   * 'cancelled'. Writes nothing — callers persist via onProduct.
+   *
+   * @param {Array<{productId?, imageUrl?, additionalImages?, existingStyles?}>} items
+   * @param {object} [opts]
+   * @param {function} [opts.isCancelled]  () => boolean | Promise<boolean>
+   * @param {function} [opts.onProduct]    async (item, {entries, changed, stats}) => void
+   * @returns {Promise<{cancelled:boolean, results:Array}>}
+   */
+  async function classifyPendingProducts(items, opts = {}) {
+    const isCancelled = typeof opts.isCancelled === 'function' ? opts.isCancelled : null;
+    const onProduct = typeof opts.onProduct === 'function' ? opts.onProduct : null;
+    const list = Array.isArray(items) ? items.filter(Boolean) : [];
+    if (!list.length) return { cancelled: false, results: [] };
+
+    if (!phaseStarted) beginClassifyPhase();
+
+    // Cooperative cancel before any network work — entire pending set
+    // becomes abandoned (same accounting as a pre-phase skip).
+    if (isCancelled) {
+      try {
+        if (await isCancelled()) {
+          abandonPending(list, 'cancelled');
+          return { cancelled: true, results: [] };
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    // Flatten unique URLs across all products so one worker pool covers
+    // the whole post-loop pass (fixes per-product serialisation).
+    const allUrls = [];
+    const seen = new Set();
+    for (const item of list) {
+      const urls = collectProductImageUrls(item.imageUrl, item.additionalImages);
+      for (const u of urls) {
+        if (seen.has(u)) continue;
+        seen.add(u);
+        allUrls.push(u);
+      }
+    }
+
+    // One concurrent wave. Session cache + failed-URL memory apply.
+    // Per-product existingStyles are NOT passed here (they differ per
+    // product); the batch still skips via session cache after the first
+    // product's URL is done, and projectProductStyles respects each
+    // product's existingStyles on the way out.
+    // Seed session cache from any product that already has styles so we
+    // don't re-fetch a URL another SKU already classified on a prior sync.
+    for (const item of list) {
+      const existing = Array.isArray(item.existingStyles) ? item.existingStyles : [];
+      for (const e of existing) {
+        if (e && e.url && e.style && !sessionUrlCache.has(e.url)) {
+          sessionUrlCache.set(e.url, e);
+        }
+      }
+    }
+
+    const batchResult = await classifyUrls(allUrls, [], { isCancelled });
+    const cancelled = !!batchResult.cancelled;
+
+    // Pure projection per product (no second network pass). Partials
+    // from a mid-batch cancel still get whatever landed in the cache.
+    const results = [];
+    for (const item of list) {
+      const r = projectProductStyles(item);
+      results.push({ item, ...r });
+      if (onProduct) {
+        try {
+          await onProduct(item, r);
+        } catch (err) {
+          console.warn(
+            `⚠️ ingest-shot-classify onProduct failed for ${item.productId || '?'}: ${err && err.message}`
+          );
+        }
+      }
+    }
+
+    return { cancelled, results };
   }
 
   function getTotals() {
@@ -1602,7 +1873,10 @@ function createSession(opts = {}) {
     const t = getTotals();
     console.log(
       `📷 ${label}: classified=${t.classified} ` +
-      `skipExisting=${t.skippedExisting} skipBudget=${t.skippedBudget} ` +
+      `skipExisting=${t.skippedExisting} ` +
+      `skipSessionCache=${t.skippedSessionCache || 0} ` +
+      `skipFailedSession=${t.skippedFailedSession || 0} ` +
+      `skipBudget=${t.skippedBudget} ` +
       `abandoned=${t.skippedAbandoned}` +
       (t.abandonReason ? `(${t.abandonReason})` : '') + ' ' +
       `fetchFail=${t.fetchFailed} ssrfReject=${t.ssrfRejected} ` +
@@ -1636,6 +1910,7 @@ function createSession(opts = {}) {
     abandonPending,
     classifyUrls,
     classifyProductImages,
+    classifyPendingProducts,
     getTotals,
     logSummary,
     dispose,

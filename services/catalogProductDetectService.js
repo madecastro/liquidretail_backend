@@ -595,10 +595,10 @@ async function materializeImage({ sourceUrl, product, imageRole, feedIndex = nul
       existing.metadata = existing.metadata || {};
       existing.metadata.feedIndex = feedIndex;
     }
-    // Backfill or newer-wins refresh of ingest shot style. Applies when
-    // Media has no shotStyle yet, OR when the CatalogProduct entry is
-    // strictly newer (threshold retune / re-classify). Equal/unknown
-    // timestamps never thrash — see shouldApplyStoredShot.
+    // First-write backfill of ingest shot style. Applies only when Media
+    // has no shotStyle yet — re-classify is not reachable for already-
+    // stored product URLs, so a "newer-wins / threshold retune" branch
+    // would be dead code (see shouldApplyStoredShot).
     if (shouldApplyStoredShot(existing.technicalInsights, storedShot)) {
       patch['technicalInsights.shotStyle'] = storedShot.shotStyle;
       patch['technicalInsights.shotStyleConfidence'] = storedShot.shotStyleConfidence;

@@ -372,25 +372,28 @@ async function syncBrandShopify(brand, run = null) {
 
   // Post-loop classify pass — products already persisted.
   // Budget clock starts here (beginClassifyPhase), not at createSession.
+  // Batched across products so the concurrency cap is used; cooperative
+  // cancel (same isBrandAborted as the upsert loop) stops promptly and
+  // records outstanding URLs as skippedAbandoned.
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
     shotSession.beginClassifyPhase();
-    for (const item of pendingClassify) {
-      try {
-        const { entries, changed } = await shotSession.classifyProductImages({
-          imageUrl: item.imageUrl,
-          additionalImages: item.additionalImages,
-          existingStyles: item.existingStyles
-        });
-        if (changed) {
-          await CatalogProduct.updateOne(
-            { _id: item.productId },
-            { $set: { imageShotStyles: entries } }
-          );
-        }
-      } catch (shotErr) {
-        console.warn(`   ⚠️  Apify shot-classify failed for ${item.productId}: ${shotErr.message}`);
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        if (summary.aborted) return true;
+        try { return !!(await isBrandAborted(brand._id, run)); } catch (_) { return false; }
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
       }
-    }
+    }).then((r) => {
+      if (r && r.cancelled) summary.aborted = true;
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  Apify shot-classify batch failed: ${shotErr.message}`);
+    });
   }
 
   // Fire product-path detect for any newly imported products with images.
