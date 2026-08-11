@@ -1132,7 +1132,16 @@ check('K6 ink is chosen for the band the type lands on, not the whole plate', ()
 
   // WIRING: the per-group decision must exist AND be what the slot consumes.
   assert.ok(/function inkForBand\(/.test(src), 'a per-band ink decision must exist');
-  assert.ok(/const bandInk = inkForBand\(bandLum\)/.test(src), 'each group must evaluate its own band');
+  // Per-group evaluation is the invariant; the exact expression is not. The
+  // PMax worst-case-across-time path now sits in front of this call, so the
+  // assertion pins that inkForBand(bandLum) still evaluates THIS group's band
+  // (as the Meta path and as the PMax fallback) rather than pinning one literal
+  // line that any correct refactor would break.
+  assert.ok(/inkForBand\(bandLum\)/.test(src), 'each group must evaluate its own band');
+  assert.ok(/worstCaseInkForBand\(\s*plateHints,/.test(src),
+    'PMax must score the band across the whole clip, not at the enter instant');
+  assert.ok(/usesWorstCaseInk\(platformFormat\)/.test(src),
+    'the worst-case path must stay gated on platformFormat so Meta output is unchanged');
   assert.ok(/const inkOnLight = bandInk \? bandInk\.onLight : inkOnLightGlobal/.test(src),
     'the per-band decision must win, with the global vote only as the fallback');
   assert.ok(/lum: Number\.isFinite\(band\.lum\) \? band\.lum : null/.test(src),
