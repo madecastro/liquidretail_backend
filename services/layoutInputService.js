@@ -1175,15 +1175,16 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     // defaults so the LLM doesn't backslide into product-specific copy.
     if (useSplitHeadline) {
       const hb = slotBudgets.headline;
-      lines.push(`- "copy.headline_lead" REQUIRED — the small first clause of a stacked display-script headline. MAX ${hb.lead.max_chars} characters, ${hb.lead.max_lines} line, ~${hb.lead.max_words} words. This clause renders at HALF the size of headline_main, so it can hold a setup phrase ("WHY ANGLERS LOVE", "BUILT FOR THE", "SAY HELLO TO").`);
-      lines.push(`- "copy.headline_main" REQUIRED — the large second clause that completes the headline. MAX ${hb.main.max_chars} characters across ${hb.main.max_lines} line(s), ~${hb.main.max_words} words. This is the punch ("THE OFFSHORE LIFE", "EVERY ADVENTURE", "CRISPY OIL"). Keep it BRAND-FOCUSED, not product-specific.`);
-      lines.push(`    Together they must read as ONE headline: lead + " " + main. Good: lead="WHY ANGLERS TRUST" / main="${(brandName || 'THIS BRAND').toUpperCase()}". Bad: a complete sentence in the lead.`);
+      lines.push(`- "copy.headline_lead" REQUIRED — the small first clause of a stacked display-script headline. MAX ${hb.lead.max_chars} characters, ${hb.lead.max_lines} line, ~${hb.lead.max_words} words. It renders at HALF the size of headline_main, so it carries the setup: an audience cue, a claim opener, or an invitation — written in THIS brand's register.`);
+      lines.push(`- "copy.headline_main" REQUIRED — the large second clause that completes the headline. MAX ${hb.main.max_chars} characters across ${hb.main.max_lines} line(s), ~${hb.main.max_words} words. This is the punch: the payoff the lead sets up. Keep it BRAND-FOCUSED, not product-specific.`);
+      lines.push(`    Together they must read as ONE headline: lead + " " + main. Bad: a complete sentence in the lead.`);
       lines.push(`- Also emit "copy.headline" as the joined "<headline_lead> <headline_main>" string for downstream compatibility.`);
     } else {
       lines.push(`- "copy.headline" REQUIRED, ≤ 8 words. Must be BRAND-FOCUSED, not product-specific.`);
-      lines.push(`    Good examples: "Built for the offshore life", "Why anglers trust ${brandName || 'us'}", "Made for every adventure", "${brandName || 'Brand'}: gear that lasts".`);
+      lines.push(`    Shapes that work (these describe STRUCTURE — do not reuse this wording): the audience and what they trust; what the brand is built for; a promise about how long it lasts. Write the actual words from THIS brand's voice and category.`);
       lines.push(`    Bad examples: "The best fishing shirt" (specific product), "Try the AquaTek Pro" (specific SKU), "50% off select items" (offer-specific).`);
     }
+
     if (slotBudgets.eyebrow) {
       const eb = slotBudgets.eyebrow;
       lines.push(`- "copy.subheadline" REQUIRED — renders as a centered all-caps phrase between two horizontal hairlines. MAX ${eb.max_chars} characters (the hairlines reserve ~30% of the slot width on each side, so the text stays readable; longer strings collapse the rules). ~${eb.max_words} words. Use punchy three-beat phrasing like "REAL HEAT. REAL FLAVOR. REAL RESULTS." or "CRAFTED. TESTED. LOVED.".`);
@@ -1195,8 +1196,8 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
   } else {
     if (useSplitHeadline) {
       const hb = slotBudgets.headline;
-      lines.push(`- "copy.headline_lead" REQUIRED — the small first clause of a stacked display-script headline. MAX ${hb.lead.max_chars} characters, ${hb.lead.max_lines} line, ~${hb.lead.max_words} words. Renders at HALF the size of headline_main, so it carries a setup phrase ("SAY HELLO TO", "MEET THE", "SOMETHING NEW IS").`);
-      lines.push(`- "copy.headline_main" REQUIRED — the large second clause. MAX ${hb.main.max_chars} characters across ${hb.main.max_lines} line(s), ~${hb.main.max_words} words. The punch ("HOT CRISPY OIL", "COMING IN HOT", "THE NEW ESSENTIAL").`);
+      lines.push(`- "copy.headline_lead" REQUIRED — the small first clause of a stacked display-script headline. MAX ${hb.lead.max_chars} characters, ${hb.lead.max_lines} line, ~${hb.lead.max_words} words. Renders at HALF the size of headline_main, so it carries the setup: the benefit, the objection it answers, the moment it is used, or the audience — in THIS brand's register.`);
+      lines.push(`- "copy.headline_main" REQUIRED — the large second clause. MAX ${hb.main.max_chars} characters across ${hb.main.max_lines} line(s), ~${hb.main.max_words} words. The punch the lead pays off.`);
       lines.push(`    Together: lead + " " + main reads as one headline. Bad: full sentence in lead, or a clause that doesn't grammatically chain into main.`);
       lines.push(`- Also emit "copy.headline" as the joined "<headline_lead> <headline_main>" string for downstream compatibility.`);
     } else {
@@ -1212,6 +1213,23 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
     lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
   }
+
+  // CASING — stated once, explicitly, because nothing else in this prompt
+  // said anything about it.
+  //
+  // There is no textTransform in the renderers and no title-case helper on
+  // this path: whatever the model returns is what a customer reads. With no
+  // rule, it guessed differently every run — the same product shipped
+  // "MEET THE STRATO BREATHE" on one ad and "Meet The New Softest Tee" on
+  // another, and naive title-case capitalised short prepositions
+  // ("Built To Move. Styled To Stay."). Owner, 2026-08-11: "I just don't
+  // want to see meet the, especially in all caps. I noticed it is sometimes
+  // capitalizing random words in titles also."
+  //
+  // The examples above used to be written in CAPS, which is where the model
+  // learned to shout; they are now abstract shapes, so this rule is what
+  // fills the vacuum they left.
+  lines.push(`- CASING: write copy in sentence case — capitalise the first word and proper nouns only. Do NOT Capitalise Every Word, and do not capitalise short words like "to", "the", "for", "and", "of" mid-phrase. Do NOT write in ALL CAPS: the layout applies its own emphasis, and caps in the copy itself cannot be undone downstream. The one exception is a word the brand itself always styles that way (a wordmark or an established brand phrase).`);
 
   // Overlay-template box-aware caps (testimonial_overlay, product_overlay).
   // The placement engine reserved boxes BEFORE derivation; tell the LLM
