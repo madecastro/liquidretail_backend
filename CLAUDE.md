@@ -10,7 +10,7 @@ security, money, or the render queue** — it carries verified P0s with `path:li
 
 Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
 `srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
-suite = **80 scripts, all green** (75 on `main` + the Google PMax
+suite = **85 scripts, all green** (75 on `main` + the Google PMax
 harnesses; re-run with
 `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
 no aggregate runner and no `npm test`). Claims written against pre-deploy
@@ -1182,7 +1182,7 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**80 scripts** as of the Google
+  relevant `scripts/verify*.js` harness (**85 scripts** as of the Google
   PMax merge). Add a harness for money/security-critical logic, and
   **revert-prove it** — back the fix out and confirm the test fails. A test that
   cannot fail is not a test.

@@ -1445,7 +1445,7 @@ costs* + §6 *YouTube safe zones* / *PMax video directives* / *Director funnel*
 
 ---
 
-### What shipped — offline suite **80/80 green** (merged with main)
+### What shipped — offline suite **85/85 green** (merged with main)
 
 **Phase B (unchanged substance):** static `PLATFORM_NOTES` + intent-aware CTA;
 `PMAX_DIRECTIVES` (hook-first, centre-safe, aspect-aware Frame); Director
