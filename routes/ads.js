@@ -31,12 +31,35 @@ const CatalogProduct = require('../models/CatalogProduct');
 const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
-const { expandWizardJob, selectAdsForRun } = require('../services/campaignAdsGenerationService');
+const {
+  expandWizardJob,
+  selectAdsForRun,
+  // Google PMax derive-only constants (Phase A). Shared with expansion so
+  // the mint marker and the render gate cannot drift.
+  PMAX_VIDEO_DERIVE_ONLY,
+  PMAX_VIDEO_DERIVE_SOURCE,
+  DERIVE_FROM_MASTER_FIELD,
+  // THE shared derive-only gate (money) — one definition, imported by both
+  // this render loop and services/adRegenerateService. Do not re-implement.
+  resolveDeriveFromMaster
+} = require('../services/campaignAdsGenerationService');
 const { summarizeEmptyExpansion, REASON: PER_PRODUCT_REASON } = require('../services/perProductReasons');
 const { assertGeneratablePlatformFormat } = require('../services/platformFormats');
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
+
+// Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
+// Bound waits so a permanently-missing master cannot spin forever across
+// /runs claims. Each claim→wait→requeue cycle counts as one attempt
+// (renderAttempts). ~30 cycles is generous vs a ~2–4 min Omni master.
+const MAX_DERIVE_WAIT_ATTEMPTS = 30;
+// In-render wait for the sibling master's plate. An Omni master settles in
+// roughly 2 minutes; 12 minutes leaves generous headroom for a slow poll
+// or a queued master behind a busy pool, while still bounding the slot.
+// Waiting costs nothing — the derive path never submits.
+const DERIVE_MASTER_WAIT_MS = Number(process.env.DERIVE_MASTER_WAIT_MS || 12 * 60 * 1000);
+const DERIVE_MASTER_POLL_MS = Number(process.env.DERIVE_MASTER_POLL_MS || 10 * 1000);
 const { loadCategoryChainForProduct } = require('../services/categoryChainService');
 const { deleteFromCloudinary } = require('../services/cloudinaryService');
 const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
@@ -1378,6 +1401,323 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   }
 }
 
+/**
+ * Look up the sibling master Ad for a derive-only crop / funnel retitle.
+ * Prefer masters that share a campaignRunId with this ad (same run scope);
+ * fall back to the newest matching master on the campaign+product.
+ *
+ * MUST exclude other derive-only / funnel-variant ads: funnel variants of
+ * a 9:16 master share platformFormat with the master, so an unfiltered
+ * query can return a sibling variant that never holds its own plate —
+ * the waiter would then hang on a free surface that itself is waiting.
+ * A true master has no deriveFromMaster and no funnelStage.
+ */
+async function findSiblingMasterAd(ad, masterPlatformFormat) {
+  const base = {
+    campaignId: ad.campaignId,
+    productId: ad.productId,
+    platformFormat: masterPlatformFormat,
+    kind: 'video',
+    _id: { $ne: ad._id },
+    // True master only — no derive marker, no funnel retitle.
+    $and: [
+      { $or: [{ deriveFromMaster: null }, { deriveFromMaster: { $exists: false } }] },
+      { $or: [{ funnelStage: null }, { funnelStage: { $exists: false } }] }
+    ]
+  };
+  const runIds = Array.isArray(ad.campaignRunIds)
+    ? ad.campaignRunIds.map(String).filter(Boolean)
+    : [];
+  if (runIds.length) {
+    const inRun = await Ad.findOne({
+      ...base,
+      campaignRunIds: { $in: runIds }
+    }).sort({ generatedAt: -1 }).lean();
+    if (inRun) return inRun;
+  }
+  return Ad.findOne(base).sort({ generatedAt: -1 }).lean();
+}
+
+/**
+ * Google PMax derive-only / funnel-variant render.
+ *
+ * Covers:
+ *   - pmax_video_1_1 free crop of the settled 9:16 master
+ *   - funnel-stage retitles of any already-paid master plate (and of the
+ *     free 1:1 crop) — awareness / consideration / conversion
+ *
+ * MONEY: zero Omni / atlasVideoService submits in this function. The base
+ * plate is the sibling master's already-paid veoVideoUrl; face-safe crop
+ * (only when aspect differs) + Remotion titling run against that URL.
+ * Cost ledger: no video cost row for this ad (it spends nothing at Omni);
+ * face-detect costs stay whatever basePlateCropService already records.
+ *
+ * Sequencing: do NOT rely on FIFO claim order. Concurrent VEO_CONCURRENCY
+ * means the derive ad can start before the master. If master is still
+ * queued/rendering without a veoVideoUrl → polite requeue (status back
+ * to queued) with a bounded attempt counter. If master failed/absent →
+ * fail honestly. NEVER fall back to a local Omni submit.
+ *
+ * Funnel preset selection is owned by brandScriptExecutor
+ * (resolveFunnelPresetOverride from ad.funnelStage) so buildMetaForAd
+ * and resolveSpec receive the SAME override — do not pass a second path.
+ */
+async function renderDeriveOnlyVideoAd({
+  run, job, ad, adId, index, creative, deriveFromFmt
+}) {
+  // ASSERT (money): this function must not call veoGenerateForAd,
+  // veoPrepareStoryboard, atlasVideoService.generateForAd, or any
+  // billable video submit helper. Crop + titling only. Funnel variants
+  // share this function — a separate path is how a regenerate hole
+  // previously opened.
+  const funnelNote = ad.funnelStage ? ` funnel=${ad.funnelStage}` : '';
+  adStage(adId, `derive-only wait for master (${deriveFromFmt})${funnelNote}`);
+
+  // ── Wait IN-RENDER for the master, don't bounce straight to 'queued' ──
+  // The whole run is dispatched in one wave (VEO_CONCURRENCY defaults to
+  // 12), so on EVERY first Google run the master is still 'rendering' with
+  // no plate when the derive ad starts — an immediate requeue therefore
+  // fired every time. And nothing drains a 'queued' ad afterwards: the
+  // reaper and the stranded sweeper only look at 'rendering' ads / failed
+  // runs, and pressing Generate again short-circuits ("Nothing to render")
+  // because the deterministic video digest is run-independent by design.
+  // The 1:1 stranded, and both operator work-arounds cost money.
+  //
+  // So poll here instead. This burns no billable work — it holds a render
+  // slot while an already-paid master finishes (~2min typical) — and the
+  // requeue below survives as the safety valve for the pathological case.
+  let master = await findSiblingMasterAd(ad, deriveFromFmt);
+  if (!master?.veoVideoUrl && master
+      && (master.status === 'queued' || master.status === 'rendering')) {
+    const deadline = Date.now() + DERIVE_MASTER_WAIT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, DERIVE_MASTER_POLL_MS));
+      master = await findSiblingMasterAd(ad, deriveFromFmt);
+      if (master?.veoVideoUrl) break;
+      // Master reached a terminal state with no plate — stop waiting and
+      // let the honest-failure branch below report it.
+      if (!master || (master.status !== 'queued' && master.status !== 'rendering')) break;
+      adStage(adId, `derive-only: waiting for master ${deriveFromFmt} plate`);
+    }
+  }
+  const attempts = Number(ad.renderAttempts) || 0;
+
+  // Master settled = holds a paid plate URL. status may be draft (post-
+  // master, pre/post-titling), live, or even failed-after-titling with
+  // the master kept — any of those with veoVideoUrl is usable.
+  if (master?.veoVideoUrl) {
+    // fall through to derive below
+  } else if (
+    master &&
+    (master.status === 'queued' || master.status === 'rendering')
+  ) {
+    // Polite requeue — master still in flight. Bound attempts so a
+    // stuck master cannot spin forever across /runs claims.
+    if (attempts >= MAX_DERIVE_WAIT_ATTEMPTS) {
+      const msg =
+        `derive-only: master ${deriveFromFmt} still unsettled after ` +
+        `${attempts} wait(s); refusing Omni fallback`;
+      console.warn(`⚠️  [derive-only ad=${adId}] ${msg}`);
+      await Ad.updateOne(
+        { _id: adId },
+        {
+          $set: {
+            status: 'failed',
+            renderError: { message: msg, stage: 'derive-wait-exhausted', at: new Date() },
+            renderStage: 'derive-only: master wait exhausted (no Omni fallback)',
+            renderStageAt: new Date(),
+            updatedAt: new Date()
+          },
+          $inc: { renderAttempts: 1 }
+        }
+      );
+      await CampaignRun.updateOne(
+        { _id: run._id },
+        {
+          $inc: { failed: 1 },
+          $push: { errors: buildErrorEntry(creative, index, 'derive-wait', new Error(msg)) }
+        }
+      );
+      return;
+    }
+    const waitN = attempts + 1;
+    const stageNote =
+      `derive-only: waiting for master ${deriveFromFmt} ` +
+      `(attempt ${waitN}/${MAX_DERIVE_WAIT_ATTEMPTS})`;
+    console.log(`⏳ [derive-only ad=${adId}] ${stageNote} — requeue`);
+    // Release claim → queued so a later selectAdsForRun /runs claim can
+    // retry after the master lands. Do NOT leave status:'rendering' (reaper
+    // / stranded paths) and do NOT submit Omni.
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status: 'queued',
+          renderStage: stageNote.slice(0, 200),
+          renderStageAt: new Date(),
+          updatedAt: new Date()
+        },
+        $inc: { renderAttempts: 1 }
+      }
+    );
+    // Count as skipped for this run (will reappear on a subsequent claim).
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      {
+        $inc: { skipped: 1 },
+        $push: {
+          errors: {
+            index,
+            stage: 'derive-wait',
+            message: stageNote
+          }
+        }
+      }
+    );
+    return;
+  } else {
+    // Master absent, failed without a plate, or archived — fail honestly.
+    // WHY no Omni fallback: that would be a hidden billable submit the
+    // operator never asked for on a surface marketed as free derivation.
+    const why = !master
+      ? `no sibling master ad (${deriveFromFmt}) for product`
+      : `master status=${master.status} has no veoVideoUrl`;
+    const msg = `derive-only failed: ${why} — not submitting Omni`;
+    console.warn(`⚠️  [derive-only ad=${adId}] ${msg}`);
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status: 'failed',
+          renderError: { message: msg, stage: 'derive-no-master', at: new Date() },
+          renderStage: 'derive-only: master missing/failed (no Omni fallback)',
+          renderStageAt: new Date(),
+          updatedAt: new Date()
+        },
+        $inc: { renderAttempts: 1 }
+      }
+    );
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      {
+        $inc: { failed: 1 },
+        $push: { errors: buildErrorEntry(creative, index, 'derive-no-master', new Error(msg)) }
+      }
+    );
+    return;
+  }
+
+  // ── Derive from settled master plate ──────────────────────────────
+  // Copy the master's paid URL as THIS ad's base plate. Titling
+  // (brandScriptExecutor → basePlateCropService) face-crops 9:16 → 1:1
+  // because classifyFormat(pmax_video_1_1 / aspect 1:1) → 'square'.
+  const veoVideoUrl = master.veoVideoUrl;
+  const veoAspectRatio = master.veoAspectRatio || '9:16';
+  const fallbackPosterUrl = veoVideoUrl?.includes('/video/upload/')
+    ? veoVideoUrl
+        .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good/')
+        .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
+    : null;
+
+  // Load brand for titling (same projection as the master path).
+  const sourceMedia = await Media.findById(ad.mediaId)
+    .select('fileType fileUrl brandId').lean();
+  const brandDoc = sourceMedia?.brandId
+    ? await Brand.findById(sourceMedia.brandId)
+        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
+    : null;
+
+  // Stamp draft + plate BEFORE titling — same money discipline as the
+  // master path: untitled is not success; reaper must not requeue a
+  // mid-titling ad into a path that could bill (derive path still won't
+  // bill, but draft is the shared invariant).
+  await Ad.updateOne(
+    { _id: adId },
+    {
+      $set: {
+        status:             'draft',
+        kind:               'video',
+        veoVideoUrl,
+        veoAspectRatio,
+        // Audit: no model ran for this ad. Marker is explicit so cost
+        // reconcilers / inspectors never attribute an Omni charge here.
+        veoModel:           `derive-from:${deriveFromFmt}`,
+        veoPrompt:          null,
+        veoStoryboard:      null,
+        veoReferenceImages: [],
+        renderUrl:          veoVideoUrl,
+        posterUrl:          fallbackPosterUrl || veoVideoUrl,
+        sourceFileType:     'video',
+        renderedAt:         new Date(),
+        updatedAt:          new Date(),
+        renderStage:        `derive-only plate from ${deriveFromFmt}`,
+        renderStageAt:      new Date()
+      },
+      $inc: { renderAttempts: 1 }
+    }
+  );
+
+  const adFinal = await Ad.findById(adId).lean();
+  let titlingFailed = null;
+  if (brandDoc) {
+    try {
+      const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
+      const waitingFor = veoTitlingSemaphore.waiting;
+      if (waitingFor > 0 || veoTitlingSemaphore.available === 0) {
+        adStage(adId, `queued for titling (${waitingFor} ahead)`);
+      }
+      const chromeOut = await veoTitlingSemaphore.withPermit(async () => {
+        adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '1:1'} (derive-only)`);
+        return renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+      });
+      if (chromeOut?.skipped) {
+        adStage(adId, `no titling (${chromeOut.reason || 'no-chrome'}) — shipping derived plate`);
+      }
+    } catch (scriptErr) {
+      titlingFailed = scriptErr;
+      console.warn(
+        `⚠️ brandScript[ad=${adId}] derive-only: titling failed — plate kept, not counted as success: ${scriptErr.message}`
+      );
+    }
+  }
+
+  if (titlingFailed) {
+    const tmsg = `derived plate ready; titling failed: ${titlingFailed.message || titlingFailed}`;
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status: 'failed',
+          renderError: { message: tmsg, stage: 'titling', at: new Date() },
+          renderStage: 'derived plate ready; titling failed',
+          renderStageAt: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+    await CampaignRun.updateOne(
+      { _id: run._id },
+      {
+        $inc:  { failed: 1 },
+        $push: { errors: buildErrorEntry(creative, index, 'titling', titlingFailed) }
+      }
+    );
+  } else {
+    await Ad.updateOne(
+      { _id: adId },
+      {
+        $set: {
+          status:     'draft',
+          renderedAt: new Date(),
+          updatedAt:  new Date()
+        }
+      }
+    );
+    await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
+    adStage(adId, 'done');
+  }
+}
+
 async function renderOne(run, job, adId, index, renderToken) {
   // HEARTBEAT — this is a money guard, not telemetry.
   //
@@ -1431,6 +1771,24 @@ async function renderOneInner(run, job, adId, index, renderToken) {
   // ── Veo render path ────────────────────────────────────────────────
   if (ad.renderRoute === 'veo') {
     try {
+      // ── DERIVE-ONLY (Google PMax 1:1) ────────────────────────────────
+      // MONEY-CRITICAL: this branch must NEVER call veoGenerateForAd /
+      // atlasVideoService.generateForAd / any Omni submit. A fall-through
+      // to the master path below is a hidden ~$0.75–$1.20 per product.
+      // ASSERT: zero atlasVideoService submit calls in this block.
+      //
+      // Detection (either is sufficient — belt and braces):
+      //   1. platformFormat === pmax_video_1_1 (always derive-only by design)
+      //   2. ad[deriveFromMaster] set at mint time (needs models/Ad.js field;
+      //      until then Mongoose strict may drop it — (1) is the fail-closed gate)
+      const deriveFromFmt = resolveDeriveFromMaster(ad);
+      if (deriveFromFmt) {
+        await renderDeriveOnlyVideoAd({
+          run, job, ad, adId, index, creative, deriveFromFmt
+        });
+        return;
+      }
+
       // Load brand + source media up front. The Grok-skip check needs
       // sourceMedia.fileType; the brand-script overlay needs brandDoc.
       const sourceMedia = await Media.findById(ad.mediaId)
@@ -2830,7 +3188,56 @@ router.delete('/:id', async (req, res) => {
     if (!ad) return res.status(404).json({ error: 'ad not found' });
     let cloudinary = null;
     if (ad.renderUrl) {
-      cloudinary = await deleteFromCloudinary(ad.renderUrl);
+      // ⚠️ A derive-only ad (Google PMax 1:1) does NOT own its asset. Until
+      // its own titled video is uploaded, its renderUrl IS the sibling 9:16
+      // master's plate URL — destroying it here would delete the video the
+      // master paid for and break that ad too. Only destroy the asset once
+      // this ad has its own upload (its renderUrl no longer points at the
+      // inherited plate). `veoModel` is stamped `derive-from:<fmt>` at mint
+      // and is the durable marker; renderUrl === veoVideoUrl means the
+      // inherited plate is still what is on the row.
+      const isDerived = typeof ad.veoModel === 'string'
+        && ad.veoModel.startsWith('derive-from:');
+      const stillInheritedPlate = isDerived && ad.renderUrl === ad.veoVideoUrl;
+
+      // …and the SAME relationship has to be honoured from the OTHER side.
+      // The check above only asks "is the ad being deleted the child?". A
+      // MASTER never carries the `derive-from:` marker, so deleting the
+      // master fell straight through and destroyed the very asset its
+      // derive-only sibling is still pointing at — the plate the master was
+      // paid for, and the sibling's only source. That sibling cannot heal
+      // itself either: regenerate is refused for derive-only ads by design.
+      // Reachable whenever the 1:1 is mid-titling, or is parked in a
+      // titling-failed state (that branch never rewrites renderUrl, so it
+      // holds the inherited URL indefinitely).
+      let masterOfLiveDerive = false;
+      if (!stillInheritedPlate && ad.platformFormat === PMAX_VIDEO_DERIVE_SOURCE) {
+        try {
+          const dependent = await Ad.findOne({
+            _id:            { $ne: ad._id },
+            brandId,
+            campaignId:     ad.campaignId,
+            productId:      ad.productId,
+            platformFormat: PMAX_VIDEO_DERIVE_ONLY,
+            // Still on the inherited plate: its renderUrl is this master's asset.
+            renderUrl:      ad.renderUrl
+          }).select('_id').lean();
+          masterOfLiveDerive = !!dependent;
+        } catch (err) {
+          // Cannot prove the asset is unused → keep it. An orphaned Cloudinary
+          // file is cheap; destroying a paid plate another ad depends on is not.
+          console.warn(`   ⚠️  ads DELETE: dependent-derive lookup failed (${err.message}) — keeping asset`);
+          masterOfLiveDerive = true;
+        }
+      }
+
+      if (stillInheritedPlate) {
+        cloudinary = { skipped: 'derive-only ad shares its master\'s plate — asset kept' };
+      } else if (masterOfLiveDerive) {
+        cloudinary = { skipped: 'a derive-only sibling still points at this plate — asset kept' };
+      } else {
+        cloudinary = await deleteFromCloudinary(ad.renderUrl);
+      }
     }
     res.json({ ok: true, id: String(ad._id), cloudinary });
   } catch (err) {
@@ -3329,3 +3736,9 @@ module.exports = router;
 module.exports.claimAdsForRun = claimAdsForRun;
 // Consumed by services/strandedRunSweeper via index.js — see requeueStrandedAds.
 module.exports.requeueStrandedAds = requeueStrandedAds;
+// MONEY-CRITICAL, exported for behavioural pinning by
+// scripts/verifyPmaxVideoExpansion.js. This is the gate that keeps a
+// derive-only PMax 1:1 ad out of the billable Omni path; a source-text
+// check alone would pass against a reimplementation that kept the name,
+// so the harness calls the real function.
+module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;

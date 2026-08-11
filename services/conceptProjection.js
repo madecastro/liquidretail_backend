@@ -51,7 +51,19 @@ const ROUTING_NESTED_FIELDS = Object.freeze([
   // the Director's free-text copy. Does not change which rating/quote a
   // dedicated proof slot actually renders (that stays governed elsewhere,
   // deterministically).
-  'proof_pick'
+  'proof_pick',
+  // Added with the Google PMax funnel spread (Phase B): 'awareness' |
+  // 'consideration' | 'conversion' | null. Emitted only on PMax rounds, where
+  // the three concepts must span the funnel because Google delivers all
+  // creative for a product into ONE asset group and picks per impression.
+  //
+  // Registering it here is not bookkeeping: `scripts/verifyConceptContract.js`
+  // scans services/ and routes/ for any file reading a name in THIS list off a
+  // concept without going through conceptField(), and an unregistered field is
+  // simply not covered — the flat-read trap that once zeroed every ad (see
+  // docs/PIPELINES.md §5 concept contract) would be reintroduced silently for
+  // this field.
+  'funnel_stage'
 ]);
 
 /**
@@ -195,6 +207,11 @@ function conceptForRender(concept) {
     media_picks:            conceptMediaPicks(concept),
     output_shape:           conceptField(concept, 'output_shape') ?? null,
     proof_pick:             conceptField(concept, 'proof_pick') ?? null,
+    // PMax funnel spread. Registering the name in ROUTING_NESTED_FIELDS only
+    // makes the flat-read SCANNER cover it; a consumer using the sanctioned
+    // projection still saw `undefined` until it was projected here, which is
+    // the quieter half of the same trap.
+    funnel_stage:           conceptField(concept, 'funnel_stage') ?? null,
     // Dual-compat: both names are the same projected object.
     copy,
     copy_picks:             copy,
