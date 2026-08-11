@@ -22,7 +22,9 @@
 // `_shopifyMoney` (its number-branch is Shopify-cents).
 //
 // All HTTP goes through services/httpScrapeClient.js (UA rotation,
-// per-host throttle, 429/Retry-After, CF detection). Never HEAD.
+// per-host throttle, 429/Retry-After, CF detection). Image-URL upgrade
+// may issue a HEAD (or ranged GET) via the same client to verify that a
+// stripped Shopify/WP size token is a real original — see imageUrlUpgrade.
 
 'use strict';
 
@@ -65,6 +67,15 @@ const { fingerprintSite } = require('./siteFingerprintService');
 // after the cheap path fails a browser-fixable block — most syncs never
 // touch Chrome. See scrapeSession.js for host keying (not eTLD+1).
 const scrapeSession = require('./scrapeSession');
+// Thumbnail → original image URL upgrade (defence in depth when JSON-LD/OG
+// emit a resized asset). Pure transform + HEAD-verified resolve. Flag-off
+// is byte-identical: no upgrades, no HEADs.
+const {
+  isCatalogImageUpgradeEnabled,
+  createImageUpgradeRun,
+  makeHttpScrapeFetchHead,
+  dedupeUrlsFirstSeen
+} = require('./imageUrlUpgrade');
 
 // ── constants ──────────────────────────────────────────────────────
 const LOG = '🗺';
@@ -600,8 +611,22 @@ function priceFromOffers(offers) {
   };
 }
 
-function imagesFromNode(node, pageUrl) {
-  const raw = node.image;
+/**
+ * imagesFromNode(node, pageUrl, opts?) → { imageUrl, additionalImages }
+ *
+ * Collects image URLs from a JSON-LD Product node, absolutizes them, then:
+ *   - CATALOG_IMAGE_UPGRADE_ENABLED + opts.upgradeRun → upgrade each URL
+ *     (HEAD-verified) and de-dupe AFTER upgrade (a `_small` and a
+ *     `_1024x1024` of the same photo collapse to one original; first-seen
+ *     order preserved because feedIndex is stamped from position).
+ *   - Flag-off OR no upgradeRun → exact-URL de-dupe only (byte-identical
+ *     prior path; no HEADs). Offline harnesses call without upgradeRun.
+ *
+ * Async so the HEAD path can run; always returns a Promise.
+ */
+async function imagesFromNode(node, pageUrl, opts = {}) {
+  opts = opts || {};
+  const raw = node && node.image;
   const list = [];
   const push = (v) => {
     if (v == null) return;
@@ -621,13 +646,20 @@ function imagesFromNode(node, pageUrl) {
   } else {
     push(raw);
   }
-  const uniq = [];
-  const seen = new Set();
-  for (const u of list) {
-    if (seen.has(u)) continue;
-    seen.add(u);
-    uniq.push(u);
+
+  let uniq;
+  if (
+    isCatalogImageUpgradeEnabled() &&
+    opts.upgradeRun &&
+    typeof opts.upgradeRun.upgradeList === 'function'
+  ) {
+    // Upgrade first, de-dupe second — collapse is the point.
+    uniq = await opts.upgradeRun.upgradeList(list);
+  } else {
+    // Exact-URL de-dupe only (flag-off / pure offline callers).
+    uniq = dedupeUrlsFirstSeen(list);
   }
+
   return {
     imageUrl: uniq[0] || null,
     // index 0 is the hero (imageUrl); slice starts at 1 so the hero is
@@ -673,11 +705,15 @@ function resolveFeedId(node, pageUrl) {
 }
 
 /**
- * mapJsonLdProduct(node, pageUrl, explicitId?) → flat product | null
+ * mapJsonLdProduct(node, pageUrl, explicitId?, opts?) → flat product | null
  * explicitId, when supplied, overrides id resolution (used by the
  * resolver's on-page feed-id recovery when the node lacks a structured id).
+ * opts.upgradeRun (from createImageUpgradeRun) enables HEAD-verified
+ * thumbnail→original upgrade on imageUrl + additionalImages.
+ * Async (awaits imagesFromNode).
  */
-function mapJsonLdProduct(node, pageUrl, explicitId = null) {
+async function mapJsonLdProduct(node, pageUrl, explicitId = null, opts = {}) {
+  opts = opts || {};
   if (!node || typeof node !== 'object') return null;
 
   const gtin = pickGtin(node);
@@ -698,7 +734,7 @@ function mapJsonLdProduct(node, pageUrl, explicitId = null) {
 
   const { price, currency, availability: offerAvail } = priceFromOffers(node.offers);
   const availability = offerAvail || mapAvailability(node.availability);
-  const { imageUrl, additionalImages } = imagesFromNode(node, pageUrl);
+  const { imageUrl, additionalImages } = await imagesFromNode(node, pageUrl, opts);
   const productUrl = absUrl(node.url || node['@id'] || pageUrl, pageUrl) || pageUrl || null;
   const category = categoryOf(node.category);
   const { rating, productReviews } = reviewsFromNode(node);
@@ -725,10 +761,13 @@ function mapJsonLdProduct(node, pageUrl, explicitId = null) {
 }
 
 /**
- * mapOgProduct(html, pageUrl) → partial flat product | null
+ * mapOgProduct(html, pageUrl, opts?) → partial flat product | null
  * Fallback when no Product JSON-LD. Requires og:title at minimum.
+ * opts.upgradeRun upgrades og:image the same way as JSON-LD images.
+ * Async when upgrade runs; always returns a Promise.
  */
-function mapOgProduct(html, pageUrl) {
+async function mapOgProduct(html, pageUrl, opts = {}) {
+  opts = opts || {};
   if (!html || typeof html !== 'string') return null;
 
   // Attribute-order agnostic, delimiter-aware, entity-decoded — see
@@ -750,7 +789,15 @@ function mapOgProduct(html, pageUrl) {
   const externalId = extractNumericIdFromUrl(ogUrl || pageUrl);
   if (!externalId) return null;
 
-  const imageUrl = absUrl(image, pageUrl);
+  let imageUrl = absUrl(image, pageUrl);
+  if (
+    imageUrl &&
+    isCatalogImageUpgradeEnabled() &&
+    opts.upgradeRun &&
+    typeof opts.upgradeRun.resolve === 'function'
+  ) {
+    imageUrl = await opts.upgradeRun.resolve(imageUrl);
+  }
   const productUrl = absUrl(ogUrl || pageUrl, pageUrl) || pageUrl;
 
   return {
@@ -1158,7 +1205,10 @@ async function tryBrowserSessionRungInner({
   setBudgetExpired,
   activeSessionRef,
   rescanWithSession = true,
-  attachCategoryFields = (o) => o
+  attachCategoryFields = (o) => o,
+  // Image-URL upgrade context (shared with the main PDP scan so memo +
+  // check-cap span the whole resolve). Optional — missing = no upgrades.
+  mapOpts = null
 }) {
   if (!shouldAttemptBrowserRung({ stats, disc, pageEntries, budget })) {
     return null;
@@ -1396,21 +1446,21 @@ async function tryBrowserSessionRungInner({
       if (nodes.length) {
         stats.jsonLdProductsFound += 1;
         for (const node of nodes) {
-          mapped = mapJsonLdProduct(node, loc);
+          mapped = await mapJsonLdProduct(node, loc, null, mapOpts);
           if (mapped) break;
         }
         if (!mapped) {
           const htmlId = extractProductIdFromHtml(html);
           if (htmlId) {
             for (const node of nodes) {
-              mapped = mapJsonLdProduct(node, loc, htmlId);
+              mapped = await mapJsonLdProduct(node, loc, htmlId, mapOpts);
               if (mapped) break;
             }
           }
         }
       }
       if (!mapped) {
-        mapped = mapOgProduct(html, loc);
+        mapped = await mapOgProduct(html, loc, mapOpts);
         if (mapped) stats.ogFallbackUsed += 1;
       }
     } catch {
@@ -1538,6 +1588,17 @@ async function resolveGenericCatalog(brand, {
   // budgetExpired is its OWN flag — do not overload aborted/cancelled.
   // aborted drives run.markCancelled(...); a timeout is not a cancellation.
   let budgetExpired = false;
+
+  // Image-URL upgrade run (one per resolve). Memoises HEAD answers and caps
+  // verification requests (CATALOG_IMAGE_UPGRADE_MAX_CHECKS). Flag-off →
+  // upgradeRun is null and map* paths are byte-identical to pre-change.
+  // fetchHead is built lazily so a flag-off resolve never even constructs it.
+  const imageUpgradeRun = isCatalogImageUpgradeEnabled()
+    ? createImageUpgradeRun({
+        fetchHead: makeHttpScrapeFetchHead(http, { timeoutMs: 8000 })
+      })
+    : null;
+  const mapOpts = imageUpgradeRun ? { upgradeRun: imageUpgradeRun } : null;
 
   // Wall-clock budget for the whole resolve (discovery + walk + PDP scan).
   // Unset / non-positive env → unbounded (createBudget safety property).
@@ -1740,7 +1801,8 @@ async function resolveGenericCatalog(brand, {
         setRateLimited: (v) => { rateLimited = v; },
         getBudgetExpired: () => budgetExpired,
         setBudgetExpired: (v) => { budgetExpired = v; },
-        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } }
+        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } },
+        mapOpts
       });
       if (browserEarly) return browserEarly;
     }
@@ -1872,7 +1934,8 @@ async function resolveGenericCatalog(brand, {
         setRateLimited: (v) => { rateLimited = v; },
         getBudgetExpired: () => budgetExpired,
         setBudgetExpired: (v) => { budgetExpired = v; },
-        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } }
+        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } },
+        mapOpts
       });
       if (browserNoUrls) return browserNoUrls;
     }
@@ -2047,18 +2110,27 @@ async function resolveGenericCatalog(brand, {
       const nodes = extractJsonLdProducts(html);
       if (nodes.length) {
         jsonLdFound = true;
-        for (const node of nodes) { mapped = mapJsonLdProduct(node, loc); if (mapped) break; }
+        for (const node of nodes) {
+          mapped = await mapJsonLdProduct(node, loc, null, mapOpts);
+          if (mapped) break;
+        }
         // Product node(s) present but no structured feed id → recover the
         // id from the page (canonical <meta itemprop=productID>) + re-map.
         if (!mapped) {
           const htmlId = extractProductIdFromHtml(html);
           if (htmlId) {
-            for (const node of nodes) { mapped = mapJsonLdProduct(node, loc, htmlId); if (mapped) break; }
+            for (const node of nodes) {
+              mapped = await mapJsonLdProduct(node, loc, htmlId, mapOpts);
+              if (mapped) break;
+            }
           }
           if (!mapped) idMiss = true;   // real id-resolution miss (counts as validationFailure)
         }
       }
-      if (!mapped) { mapped = mapOgProduct(html, loc); if (mapped) ogUsed = true; }
+      if (!mapped) {
+        mapped = await mapOgProduct(html, loc, mapOpts);
+        if (mapped) ogUsed = true;
+      }
     } catch (err) {
       console.warn(`   ⚠️  ${LOG}  extract failed ${loc}: ${err.message}`);
       return { jsonLdFound, skipped: true };
@@ -2243,7 +2315,8 @@ async function resolveGenericCatalog(brand, {
       activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } },
       // Re-scan PDP list with harvested session when products.json empty.
       rescanWithSession: true,
-      attachCategoryFields
+      attachCategoryFields,
+      mapOpts
     });
     if (browserFinal) return browserFinal;
 

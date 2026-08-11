@@ -64,6 +64,7 @@ function checkTrue(label, cond) {
 
 const root = path.join(__dirname, '..');
 
+async function main() {
 // ── A. Shared storage cap (default 20) ────────────────────────────────
 check('A shopify CATALOG_MAX_ADDITIONAL_IMAGES default', SHOPIFY_CAP, 20);
 check('A generic CATALOG_MAX_ADDITIONAL_IMAGES default', GENERIC_CAP, 20);
@@ -85,7 +86,10 @@ const genericNode = {
 };
 
 const shop25 = mapShopifyProductImages(shopifyImages);
-const gen25 = imagesFromNode(genericNode, 'https://example.com/p/1');
+// imagesFromNode is async (HEAD-verified upgrade path when upgradeRun is
+// supplied). Offline harnesses call without upgradeRun → exact-dedupe only,
+// same as pre-upgrade behaviour for non-Shopify fixture URLs.
+const gen25 = await imagesFromNode(genericNode, 'https://example.com/p/1');
 const expectedAlts = Math.min(N - 1, CAP);
 
 check('B shopify 25-image: imageUrl is first', shop25.imageUrl, 'https://cdn.example.com/img-1.jpg');
@@ -109,7 +113,7 @@ check(
 const shop15 = mapShopifyProductImages(
   Array.from({ length: 15 }, (_, i) => ({ src: `https://cdn.pb5.example/p-${i + 1}.jpg` }))
 );
-const gen15 = imagesFromNode(
+const gen15 = await imagesFromNode(
   { image: Array.from({ length: 15 }, (_, i) => `https://cdn.pb5.example/p-${i + 1}.jpg`) },
   'https://pb5star.com/products/x'
 );
@@ -144,9 +148,9 @@ check(
 // ── E. Edge cases: 0 / 1 image ────────────────────────────────────────
 const emptyShop = mapShopifyProductImages([]);
 const oneShop = mapShopifyProductImages([{ src: 'https://cdn.example.com/only.jpg' }]);
-const emptyGen = imagesFromNode({ image: null }, 'https://example.com/p');
-const oneGen = imagesFromNode({ image: 'https://cdn.example.com/only.jpg' }, 'https://example.com/p');
-const zeroGen = imagesFromNode({}, 'https://example.com/p');
+const emptyGen = await imagesFromNode({ image: null }, 'https://example.com/p');
+const oneGen = await imagesFromNode({ image: 'https://cdn.example.com/only.jpg' }, 'https://example.com/p');
+const zeroGen = await imagesFromNode({}, 'https://example.com/p');
 
 check('E shopify []: imageUrl null', emptyShop.imageUrl, null);
 check('E shopify []: additionalImages []', JSON.stringify(emptyShop.additionalImages), '[]');
@@ -157,7 +161,7 @@ check('E generic string image: additionalImages []', JSON.stringify(oneGen.addit
 check('E generic missing image: no throw + []', JSON.stringify(zeroGen.additionalImages), '[]');
 
 // ── F. Generic path still de-duplicates exact URLs ────────────────────
-const withDup = imagesFromNode({
+const withDup = await imagesFromNode({
   image: [
     'https://cdn.example.com/a.jpg',
     'https://cdn.example.com/b.jpg',
@@ -299,3 +303,9 @@ if (failures.length) {
 }
 console.log(`\n${pass}/${total} checks passed`);
 process.exit(0);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
