@@ -1051,6 +1051,24 @@ async function expandWizardJob({
     if (dryGoogle && isPmaxFunnelVariantsEnabled()) {
       dryDetPerProduct += PMAX_FUNNEL_STAGES.length * (dryMasterFormats.length + 1);
     }
+    // BILLABLE vs DELIVERED — they are not the same number, and only one of
+    // them costs money.
+    //
+    // A PMax video run delivers masters + a free 1:1 crop + 3 funnel re-titles
+    // per surface. Only the MASTERS reach Atlas: the crop and every funnel
+    // variant carry deriveFromMaster, which resolveDeriveFromMaster uses to
+    // keep them off the billable Omni path. So 4 products x PMax video reads
+    // as "48 creatives" while charging for 8.
+    //
+    // The wizard showed only the 48. On the ordinary flow an operator has just
+    // hand-picked everything and has context; on the express "use defaults"
+    // button they have not, and 48 is indistinguishable from a ~6x larger bill.
+    // Surfacing the billable split is what makes that button safe to press.
+    const billableVideoMastersPerProduct = dryMasterFormats.length;
+    const billableVideoMasters = deterministicVideo
+      ? estimateProducts.filter(Boolean).length * billableVideoMastersPerProduct
+      : 0;
+
     const byProduct = {};
     let detTotal = 0;
     let dirTotal = 0;
@@ -1096,6 +1114,17 @@ async function expandWizardJob({
       total,
       byProduct,
       byMode: { deterministic: detTotal, director: dirTotal },
+      // What this run actually CHARGES for. images = one Atlas submit each;
+      // videoMasters = one Omni submit each. freeDerived is everything the run
+      // delivers on top of that for nothing (the 1:1 crop and the funnel
+      // re-titles), so billable + freeDerived === the deterministic/image total
+      // the operator sees. Director variants are counted separately under
+      // byMode.director and are billable video in their own right.
+      billable: {
+        videoMasters: billableVideoMasters,
+        images:       imgTotal,
+        freeDerived:  Math.max(0, detTotal - billableVideoMasters)
+      },
       byVariantKind: { ugc: 0, product_image: 0 },
       seedCount:    0,
       productCount: estimateProducts.length
