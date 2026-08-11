@@ -287,9 +287,29 @@ function isGoogleVideoMasterRun(masterFormats) {
  * master. Meta leaves null (provider default 8s) unchanged in this phase.
  */
 function resolveVideoDurationForFormat(platformFormat, videoDurationSec) {
+  const isGooglePmaxVideo = GOOGLE_VIDEO_MASTER_SET.has(platformFormat)
+    || platformFormat === PMAX_VIDEO_DERIVE_ONLY;
+
   if (videoDurationSec != null && videoDurationSec !== '') {
     const n = Number(videoDurationSec);
-    if (Number.isFinite(n)) return n;
+    if (Number.isFinite(n)) {
+      // ⚠️ PMAX 10s IS A PLATFORM FLOOR, NOT A DEFAULT — an operator value may
+      // not go under it. Google rejects PMax video below 10 seconds, so an 8s
+      // master is a PAID render ($0.90) that cannot be used as an asset.
+      //
+      // This is reachable by the ordinary path, not an edge case: the wizard's
+      // Video Length control has no "auto" option and posts `8` on every run
+      // (its default is literally labelled "8s (standard)"), so BEFORE this
+      // clamp every PMax video generated through the UI would have been born
+      // unusable. Found by opening the real wizard, not by reading the code.
+      //
+      // Above the floor the operator still wins; Omni's own enum [4,6,8,10]
+      // clamps the top end downstream, so asking for 12 or 15 lands on 10.
+      if (isGooglePmaxVideo && n < GOOGLE_PMAX_VIDEO_DURATION_SEC) {
+        return GOOGLE_PMAX_VIDEO_DURATION_SEC;
+      }
+      return n;
+    }
   }
   if (GOOGLE_VIDEO_MASTER_SET.has(platformFormat) || platformFormat === PMAX_VIDEO_DERIVE_ONLY) {
     // PMAX floor per Google spec (also Omni ceiling).
