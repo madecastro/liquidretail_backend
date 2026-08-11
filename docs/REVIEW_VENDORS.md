@@ -582,7 +582,13 @@ used, which is not worth a typo case.
 cache write. Grounded search returns `rating` / `reviewCount` **independently** of
 `quotes`, so a refresh that found good quotes but no aggregates destroyed a stored
 rating — measured on Pelagic Gear, which held 3.2★ / 22 reviews and came back with
-neither. A null rating makes `INTENTS.social_proof_led` ineligible outright (its
+neither.
+
+> **Correction.** This section first attributed the missing aggregates to
+> grounded-search drift, because a run that looked pre-deploy also lacked them. It was
+> not drift: the deploy live at that moment already carried the retrieval rewrite, and
+> the real cause was pass-1 truncation — see §14. The merge rule below is still
+> required (a fetch genuinely can find no aggregates), but it was treating a symptom. A null rating makes `INTENTS.social_proof_led` ineligible outright (its
 `core` **is** the rating), so one unlucky refresh can remove a brand's ability to
 render social-proof ads.
 
@@ -608,3 +614,116 @@ and a merge must not defeat it.
 `fetchedAt` cannot (it stamps the quote fetch). **Open follow-up:** the 30-day TTL in
 `productMatchService` keys off `fetchedAt`, so carried numbers can ride along
 un-refetched. Bounding that needs an owner call on how stale an aggregate may get.
+
+
+---
+
+## 14. Pass 1 gets cut off, and nobody notices
+
+**The most expensive twenty minutes of this workstream**, and the lesson is not about
+prompts. Every grounded lookup is two calls: pass 1 asks Google-grounded Gemini for a
+free-form narrative, pass 2 reshapes that narrative into JSON. **Pass 2 can only see
+what pass 1 wrote.**
+
+Both pass-1 calls were ending with `finishReason: MAX_TOKENS`, and **nothing in the
+codebase read `finishReason`**. A narrative cut off mid-enumeration was therefore
+indistinguishable from a complete one: the fetch "succeeded", quotes came back, cost was
+ledgered, and the only visible symptom was a missing star rating — which reads as *"the
+web just didn't say"*.
+
+Two compounding causes:
+
+1. **The rating was asked for LAST.** Widening the ask from "4-6 quotes" to
+   `LLM_QUOTE_CAP` (12), each with a source, an author and a funnel stage, made
+   truncation certain rather than unlikely. Anything a prompt asks for last is the first
+   thing lost. The numbers are two lines and they gate an ad format, so they now go
+   **first** — in all three prompts.
+2. **Hidden thinking tokens.** `gemini-2.5-flash` bills reasoning against
+   `maxOutputTokens`. The pass-2 calls had set `thinkingBudget: 0` for exactly this
+   reason since April; the pass-1 calls never did. Pass 1 summarises search results — it
+   does not reason — so every thought token was budget stolen from the narrative.
+
+Measured on Vuori, **same 3000-token budget**:
+
+| prompt | finishReason | narrative | quotes | rating |
+|---|---|---|---|---|
+| quotes-last, thinking on | `MAX_TOKENS` | 941 chars | 4 | **none** |
+| numbers-first, thinking off | `STOP` | 3026 chars | 12 | **4.58 / 15,626** |
+
+Same cost, ~3× the usable narrative. Verified end to end through the shipped
+`lookupBrandReviews`: `✓ brand-reviews: 11 quote(s) · 4.6★ · 15,000 reviews`.
+
+### Budgets are padded on purpose
+
+Output tokens bill as **used**, not as reserved, so a high ceiling costs nothing until it
+is needed — while a ceiling sized to the measured need is a silent data-loss bug the
+moment a brand has more reviews to talk about. Pass 1 is 16000, pass 2 is 12000, grounded
+timeouts are 120s, and **every** grounded call in these modules is on those constants —
+including the breadcrumb resolver, whose 600-token ceiling looked generous until you
+count thinking tokens. Do not tune these back down.
+
+`warnIfTruncated` now runs on every pass-1 response. Silent truncation is what let this
+survive three live runs.
+
+---
+
+## 15. Mediocre and negative stop at intake
+
+Owner directive 2026-08-11: *"at no time should mediocre or negative sentiment pass any
+gate from initial screening to selection for use in an ad."*
+
+An audit of every hop from retrieval to typeset found the bar was enforced at the two
+**ends** and nowhere in the middle:
+
+| stage | before | now |
+|---|---|---|
+| retrieval | prompt text only | `screenAdUsableSentiment`, unconditional, no kill switch |
+| storage | ungated | same screen — nothing mediocre is stored at all |
+| primary selection | `pickStrongestQuote` | unchanged |
+| **typeset string** | **ungated** | every manufactured form judged |
+
+### The bar is the render path's own selector
+
+`screenAdUsableSentiment` calls `pickStrongestQuote` — not a private notion of
+"positive". That matters twice over: intake cannot drift from selection, and the selector
+catches what a word list cannot.
+
+- **`hasPositiveSignal` alone is too weak.** It is a lexeme allowlist, so
+  *"low-support option best suited for lighter activities"* **passes** it — the phrase
+  contains "best". `scoreQuote`'s `HARD_LIMITER` is what rejects it.
+- **The score floor is what actually catches mediocrity.** *"Super comfortable and
+  durable fabrics."* and *"Great fit, and lightweight."* both contain positive lexemes
+  and both fail the floor, because short generic filler does not sell anything.
+
+It **fails closed**: no judge, no quotes. An unjudged quote is worth less than no quote —
+a short pool costs one ad format, a mediocre line costs the client.
+
+### The typeset string is not the string that was judged
+
+The subtler half. `pickStrongestQuote` judges the **full** quote text at artifact build,
+and then the overflow path typesets a ≤50-char curated snippet that was judged **nowhere**.
+Measured: *"feel like second skin"*, *"true to size"* and *"awesome fit"* all **fail** the
+render bar while their parent quotes pass it. That is precisely how a subjectless fragment
+became the testimonial.
+
+`selectStaticQuoteText` now judges every candidate form before returning it, in preference
+order (whole quote → whole sentences → curated snippet → bounded truncation), and prints
+**nothing** if none clears the bar, leaving intent fallback to do its job.
+
+**The unabridged text stays trusted.** It was already judged twice upstream, and applying
+a lexeme allowlist to it would refuse *"The fabric held up through a whole season of
+training."* — specific, credible durability proof with no flattery word in it. The gap
+worth closing was strings we **invent**, not strings a reviewer wrote.
+
+### Known gaps, needing an owner decision
+
+- **Video** binds a ≤50-char snippet by design. A complete sentence rarely fits 50
+  characters, so "complete quotes" and the 50-char overlay are in genuine tension.
+- **Director copy** grounds on `product.reviews[0]` with no sentiment or star gate, and
+  that feeds headline/subhead — outside the quote slot entirely.
+- **Rating source is unranked and unrecorded.** Pass 2 emits one number, so Vuori's
+  self-reported **4.58** on its own site can outrank **Trustpilot's 2.5**, and nothing
+  stores which site it came from. Only the 4.39 star floor stands between those two
+  numbers and an ad.
+- `HARD_LIMITER` is a curated phrase list, not a classifier. It covers the cases seen so
+  far; a new limiter phrasing needs adding by hand.

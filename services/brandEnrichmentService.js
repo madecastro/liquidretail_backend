@@ -111,10 +111,19 @@ async function enrichBrandFromUrl(brandId) {
  * hole: a result with good quotes but `rating: null` wipes a previously-good rating.
  * Observed live — Pelagic Gear held 3.2★ / 22 reviews, one refresh returned 2 quotes
  * with null rating AND null reviewCount, and the brand came back with no numbers at
- * all. Measured on BOTH the old and the new retrieval prompt (the
- * `✓ brand-reviews: N quote(s)` log line omits its `· X★ · N reviews` suffix in
- * both), so the null is grounded-search drift, not a prompt regression. The data
- * loss is ours either way.
+ * all.
+ *
+ * CORRECTED 2026-08-11: this comment first blamed grounded-search drift, on the grounds
+ * that a run which looked pre-deploy also came back without numbers. That was WRONG —
+ * the deploy live at 09:05 already contained the retrieval rewrite, so every
+ * number-less run was on the new prompt. The real cause was pass-1 truncation
+ * (`finishReason: MAX_TOKENS`, with the rating asked for LAST), fixed in
+ * geminiSearchProvider — see NARRATIVE_ORDER_NOTE there. Kept as a note because the
+ * lesson generalises: "the upstream fetch returned nothing" is a claim to check against
+ * a deploy timeline, not one to assume.
+ *
+ * THIS FUNCTION IS STILL REQUIRED. A fetch can legitimately find no aggregates, and
+ * when it does, destroying the stored ones is our bug, not the web's.
  *
  * Why it matters beyond a cosmetic card: `INTENTS.social_proof_led`'s `core` IS the
  * rating, so a wiped rating removes a brand's ability to render social-proof ads —
