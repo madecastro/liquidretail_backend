@@ -1216,37 +1216,63 @@ function resolveImagePromptOverride(rawPromptOverride) {
   return user || system || null;
 }
 
-async function renderDirectImage({
-  layoutInputArtifactId, aspectRatio, mediaId, productId, brandId,
-  adId = null,
-  // Campaign run + campaign ids for run-feed QC notices and app deep links.
-  // Prefer a real parameter from renderService over reading Ad.campaignRunIds.
-  campaignRunId = null,
-  campaignId = null,
-  adConceptArtifactId, adConceptId, template, referenceMediaIds = [],
-  // Where referenceMediaIds came from, purely so the per-reference role labels
-  // and the inspector tell the truth. 'operator' = an explicit wizard stack;
-  // 'director' = the concept's own media_picks. Defaults to 'operator' because
-  // that was the only source when this argument was introduced.
-  referenceSource = 'operator',
-  // The surface drives the safe box and the generation size. renderStage already
-  // threads platformFormat through ...args and defaults it to meta_feed_1_1, so
-  // this is a rename at the boundary, not a new requirement on callers.
-  platformFormat = 'meta_feed_1_1',
-  // Lifestyle/UGC scene-preserve gate (STATIC_LIFESTYLE_PRESERVE). Threaded
-  // from Ad.variantKind; seed style is resolved from the media doc below.
-  variantKind = null,
-  // Regenerate hooks (adRegenerateService.runImage). Neither is charged until
-  // the single editImage submit below — they only rewrite the prompt string.
-  //   operatorPrompt     — refinement note appended to the auto-built prompt
-  //   rawPromptOverride  — verbatim replacement ({system,user} or string)
-  operatorPrompt = null,
-  rawPromptOverride = null,
-  // Post-render vision QC re-entry guard. The single allowed regeneration
-  // calls renderDirectImage again with skipVisionQc:true so the QC loop
-  // cannot nest (money: would otherwise allow unbounded regenerations).
-  skipVisionQc = false
-}) {
+/**
+ * Pure: args for the vision-QC corrective re-entry into renderDirectImage.
+ * Spreads the original call object so a future field (variantKind, seedStyle,
+ * …) cannot be silently dropped the way BLOCKER 3 was. Exported for the
+ * offline harness.
+ */
+function buildQcRetryArgs(originalCallArgs, { correctiveNote, overrideText } = {}) {
+  const base = originalCallArgs && typeof originalCallArgs === 'object'
+    ? { ...originalCallArgs }
+    : {};
+  return {
+    ...base,
+    // When the operator replaced the prompt, the corrective note has to
+    // ride INSIDE the override or it is discarded and this paid retry is a
+    // guaranteed repeat of the failure. See composeCorrectiveOverride.
+    operatorPrompt: overrideText ? null : correctiveNote,
+    rawPromptOverride: overrideText
+      ? composeCorrectiveOverride(overrideText, correctiveNote)
+      : base.rawPromptOverride,
+    skipVisionQc: true
+  };
+}
+
+async function renderDirectImage(callArgs = {}) {
+  // Accept a single object so QC re-entry can spread the original args
+  // (buildQcRetryArgs) and never re-list fields by hand.
+  const {
+    layoutInputArtifactId, aspectRatio, mediaId, productId, brandId,
+    adId = null,
+    // Campaign run + campaign ids for run-feed QC notices and app deep links.
+    // Prefer a real parameter from renderService over reading Ad.campaignRunIds.
+    campaignRunId = null,
+    campaignId = null,
+    adConceptArtifactId, adConceptId, template, referenceMediaIds = [],
+    // Where referenceMediaIds came from, purely so the per-reference role labels
+    // and the inspector tell the truth. 'operator' = an explicit wizard stack;
+    // 'director' = the concept's own media_picks. Defaults to 'operator' because
+    // that was the only source when this argument was introduced.
+    referenceSource = 'operator',
+    // The surface drives the safe box and the generation size. renderStage already
+    // threads platformFormat through ...args and defaults it to meta_feed_1_1, so
+    // this is a rename at the boundary, not a new requirement on callers.
+    platformFormat = 'meta_feed_1_1',
+    // Lifestyle/UGC scene-preserve gate (STATIC_LIFESTYLE_PRESERVE). Threaded
+    // from Ad.variantKind; seed style is resolved from the media doc below.
+    variantKind = null,
+    // Regenerate hooks (adRegenerateService.runImage). Neither is charged until
+    // the single editImage submit below — they only rewrite the prompt string.
+    //   operatorPrompt     — refinement note appended to the auto-built prompt
+    //   rawPromptOverride  — verbatim replacement ({system,user} or string)
+    operatorPrompt = null,
+    rawPromptOverride = null,
+    // Post-render vision QC re-entry guard. The single allowed regeneration
+    // calls renderDirectImage again with skipVisionQc:true so the QC loop
+    // cannot nest (money: would otherwise allow unbounded regenerations).
+    skipVisionQc = false
+  } = callArgs;
   const surface = platformFormat || 'meta_feed_1_1';
   // Credentials are checked further down, AFTER brand routing: a brand
   // deliberately on the HTML pipeline renders through gpt-4.1 + Puppeteer and
@@ -1620,30 +1646,12 @@ async function renderDirectImage({
     generate: async ({ attempt, correctiveNote }) => {
       if (attempt === 1) return firstOutput;
       adStage(adId, `vision QC regen (${surface})`);
-      return renderDirectImage({
-        layoutInputArtifactId,
-        aspectRatio,
-        mediaId,
-        productId,
-        brandId,
-        adId,
-        campaignRunId,
-        campaignId,
-        adConceptArtifactId,
-        adConceptId,
-        template,
-        referenceMediaIds,
-        referenceSource,
-        platformFormat,
-        // When the operator replaced the prompt, the corrective note has to
-        // ride INSIDE the override or it is discarded and this paid retry is a
-        // guaranteed repeat of the failure. See composeCorrectiveOverride.
-        operatorPrompt: overrideText ? null : correctiveNote,
-        rawPromptOverride: overrideText
-          ? composeCorrectiveOverride(overrideText, correctiveNote)
-          : rawPromptOverride,
-        skipVisionQc: true
-      });
+      // Spread original callArgs via buildQcRetryArgs so variantKind / any
+      // future field cannot be silently dropped on this paid re-submit.
+      return renderDirectImage(buildQcRetryArgs(callArgs, {
+        correctiveNote,
+        overrideText
+      }));
     },
     // Keep discarded (paid) renders durable — owner requirement.
     uploadAttempt: async ({ buffer: buf, attempt }) => {
@@ -1769,5 +1777,8 @@ module.exports = {
   // MONEY: pinned by scripts/verifyRegeneration.js (R5) — without it the one
   // allowed vision-QC retry re-submits an identical prompt for a second charge.
   composeCorrectiveOverride,
+  // QC re-entry arg assembly — verifyLifestylePreserve asserts variantKind
+  // survives the spread (BLOCKER 3).
+  buildQcRetryArgs,
   renderDirectImage
 };

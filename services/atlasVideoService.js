@@ -49,6 +49,7 @@ const {
   enforceRawByteCap,
   shouldUseLifestyleVideoPrompt,
   resolveLifestyleVideoRefCount,
+  resolveLifestyleVideoRefPlan,
   lifestyleVideoGuidanceForIntent
 } = require('./veoPromptBuilder');
 const { loadCategoryChainForProduct } = require('./categoryChainService');
@@ -3501,15 +3502,22 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   }
   // Lifestyle video (VIDEO_LIFESTYLE_PROMPT): one seed reference only —
   // multi-ref is a packshot fidelity device and melts people under motion.
-  // Flag-off / non-lifestyle ⇒ today's resolveReferenceImageCount path.
+  // Trigger matches static preserve: lifestyle seed OR ugc variantKind.
+  // Flag-off / non-lifestyle product_image ⇒ today's resolveReferenceImageCount.
+  // Plan is the single source of effective ref count — do not re-derive.
   const { resolveSeedStyle } = require('./imageShotHeuristicService');
   const seedStyle = resolveSeedStyle(media);
-  const lifestyleVideo = shouldUseLifestyleVideoPrompt(seedStyle);
   const baseReferenceCount = resolveReferenceImageCount({ brand, product });
-  const referenceCount = resolveLifestyleVideoRefCount(baseReferenceCount, seedStyle);
+  const lifestylePlan = resolveLifestyleVideoRefPlan({
+    baseReferenceCount,
+    seedStyle,
+    variantKind: ad.variantKind || null
+  });
+  const lifestyleVideo = lifestylePlan.lifestyleVideo;
+  const referenceCount = lifestylePlan.referenceCount;
   // Operator ordered stacks on lifestyle still get capped to 1 distinct ref
   // by buildReferenceImages(referenceCount=1); log when we discard extras.
-  if (lifestyleVideo && Array.isArray(orderedReferenceMedia) && orderedReferenceMedia.length > 1) {
+  if (lifestylePlan.forceSeedOnly && Array.isArray(orderedReferenceMedia) && orderedReferenceMedia.length > 1) {
     console.warn(
       `⚠️  atlasVideo[ad=${ad._id}]: lifestyle video path caps references to 1 ` +
       `(seed only; ${orderedReferenceMedia.length} operator picks reduced)`
@@ -3517,9 +3525,12 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   }
   adStage(ad._id, `reference reframe (${aspectRatio})`);
   const imageUrls = await buildReferenceImages({
-    media, product, catalogMedias, aspectRatio, caps, referenceCount, brand,
+    media, product, catalogMedias, aspectRatio, caps,
+    // Effective count from the plan — never pass baseReferenceCount here.
+    referenceCount,
+    brand,
     // Lifestyle: ignore multi-pick ordered stacks — seed only (media at pos 0).
-    orderedReferenceMedia: lifestyleVideo ? null : orderedReferenceMedia
+    orderedReferenceMedia: lifestylePlan.forceSeedOnly ? null : orderedReferenceMedia
   });
   if (!imageUrls.length) throw new Error(`atlasVideo[ad=${ad._id}]: no reference images available`);
 
@@ -3579,7 +3590,7 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     aspectRatio,
     seedHasText,
     // Lifestyle path always ships 1 ref → seed-only fidelity wording.
-    hasProductReference: lifestyleVideo ? false : hasProductAnchor,
+    hasProductReference: lifestylePlan.forceSeedOnly ? false : hasProductAnchor,
     storyboard,
     caps,
     durationSec,
@@ -3588,7 +3599,9 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
     platformFormat: ad.platformFormat || null,
     // Lifestyle sibling directive set (VIDEO_LIFESTYLE_PROMPT). Absent /
     // non-lifestyle leaves the packshot path byte-identical (B14).
-    seedStyle
+    // variantKind matches static preserve trigger (ugc OR lifestyle seed).
+    seedStyle,
+    variantKind: ad.variantKind || null
   };
   // Whitespace-only operatorPrompt must NOT count as an override — trim-gate
   // branch 1 so it falls through to raw/guidance like an empty refinement.
@@ -3961,6 +3974,7 @@ module.exports = {
   resolveReferenceImageCount,
   // Lifestyle video ref-count gate — scripts/verifyLifestylePreserve.js.
   resolveLifestyleVideoRefCount,
+  resolveLifestyleVideoRefPlan,
   shouldUseLifestyleVideoPrompt,
   lifestyleIntentFromTemplate,
   resolveDurationSec,

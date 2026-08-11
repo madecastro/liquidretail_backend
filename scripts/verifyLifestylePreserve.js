@@ -126,14 +126,7 @@ const PRODUCT_CLAUSES = [
   'Condition:'
 ];
 
-const PACKSHOT_ONLY_STRINGS = [
-  'high-end ecommerce',
-  'Ken Burns',
-  'product stays completely static',
-  'animate the product or any of its parts' // wait — lifestyle KEEPS the ban on product animation
-];
-// Corrected: lifestyle must KEEP "animate the product or any of its parts" as a ban.
-// Packshot-only strings that must NOT appear in lifestyle:
+// Packshot-only strings that must NOT appear in lifestyle directives:
 const PACKSHOT_STYLE_BANNED_IN_LIFESTYLE = [
   'high-end ecommerce',
   'Ken Burns',
@@ -157,6 +150,39 @@ const AMBIENT_PERMITS = [
   'water',
   'foliage'
 ];
+
+/**
+ * Fantasy-ban tokens must appear only inside a prohibition (not as a positive
+ * instruction). Matches "no X", "No fantasy motion — no sparkles…", "never X".
+ * A positive "add sparkles" / "include particles" fails even if "No fantasy
+ * motion" is co-present somewhere in the blob (the old vacuous V5).
+ */
+function isProhibitionOnly(blob, token) {
+  const lower = String(blob || '').toLowerCase();
+  const t = String(token).toLowerCase();
+  if (!lower.includes(t)) return false;
+  // Every occurrence of the token must sit inside a short window that has a
+  // negation ("no"/"not"/"never") before it, OR after "No fantasy motion".
+  const re = new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+  let m;
+  while ((m = re.exec(blob)) !== null) {
+    const start = Math.max(0, m.index - 48);
+    const window = blob.slice(start, m.index + token.length);
+    const windowLower = window.toLowerCase();
+    const hasNeg =
+      /\bno\b/.test(windowLower) ||
+      /\bnot\b/.test(windowLower) ||
+      /\bnever\b/.test(windowLower) ||
+      /no fantasy motion/i.test(blob.slice(Math.max(0, m.index - 200), m.index + token.length));
+    if (!hasNeg) return false;
+    // Positive instruction patterns anywhere in a wider window fail.
+    const wide = blob.slice(Math.max(0, m.index - 24), m.index + token.length + 16).toLowerCase();
+    if (new RegExp(`\\b(add|include|with|use)\\s+${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(wide)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // STATIC
@@ -218,7 +244,9 @@ console.log('\n=== STATIC lifestyle/UGC scene preserve ===\n');
 }
 
 // S2 — Director intent owns copy: roles AND order byte-identical on vs off
-// OWNER REQUIREMENT — named explicitly
+// OWNER REQUIREMENT — named explicitly. text() is never preserve-aware.
+// Emphasis ROLE COUNT/order stays identical; product_first_lifestyle may
+// change the FIRST emphasis string under preserve (preserve-aware variant).
 {
   const on = loadIntents({ preserve: 'true', hardening: 'true' });
   const off = loadIntents({ preserve: 'false', hardening: 'true' });
@@ -238,17 +266,66 @@ console.log('\n=== STATIC lifestyle/UGC scene preserve ===\n');
       JSON.stringify(rolesOn) === JSON.stringify(rolesOff),
       `on=${JSON.stringify(rolesOn)} off=${JSON.stringify(rolesOff)}`
     );
+    // text strings themselves must also be identical (not just roles)
+    check(
+      `S2 OWNER: text tuples byte-identical for ${intentKey}`,
+      JSON.stringify(rOn.text) === JSON.stringify(rOff.text)
+    );
     // Also the resolved intent key must match (intent selection untouched)
     check(
       `S2 intent key unchanged for ${intentKey}`,
       rOn.resolved?.key === rOff.resolved?.key && rOn.resolved?.key != null
     );
-    // Emphasis order (attention hierarchy) also identical
+    // Emphasis slot count identical; content may differ for product_first only
     check(
-      `S2 emphasis order identical for ${intentKey}`,
-      JSON.stringify(rOn.emphasis) === JSON.stringify(rOff.emphasis)
+      `S2 emphasis slot count identical for ${intentKey}`,
+      (rOn.emphasis || []).length === (rOff.emphasis || []).length
     );
+    if (intentKey === 'product_first_lifestyle') {
+      check(
+        'S2 product_first preserve-aware emphasis points at existing photograph',
+        /already in this photograph|plate already implies/i.test((rOn.emphasis || [])[0] || '')
+      );
+      check(
+        'S2 product_first flag-off emphasis keeps scene-build wording',
+        (rOff.emphasis || [])[0] === 'the product in a scene someone wants to be in'
+      );
+      check(
+        'S2 product_first preserve emphasis is NOT the restage cue',
+        !/scene someone wants to be in/i.test((rOn.emphasis || [])[0] || '')
+      );
+    } else {
+      check(
+        `S2 emphasis content identical for ${intentKey}`,
+        JSON.stringify(rOn.emphasis) === JSON.stringify(rOff.emphasis)
+      );
+    }
   }
+}
+
+// S2b — preserveScene=true override cannot force packshot onto SCENE_PRESERVE
+{
+  const mod = loadIntents({ preserve: 'true', hardening: 'true' });
+  const forcedPack = mod.buildPrompt({
+    intentKey: 'product_first_lifestyle', data: DATA, product: PRODUCT, surface: SURFACE,
+    seedStyle: 'packshot', variantKind: 'product_image', preserveScene: true
+  });
+  check('S2b preserveScene=true on packshot does NOT enable SCENE_PRESERVE',
+    forcedPack.preserveScene === false &&
+    !forcedPack.prompt.includes('SCENE PRESERVE — HIGHEST PRIORITY'));
+  const forcedLife = mod.buildPrompt({
+    intentKey: 'product_first_lifestyle', data: DATA, product: PRODUCT, surface: SURFACE,
+    seedStyle: 'lifestyle', preserveScene: true
+  });
+  check('S2b preserveScene=true on lifestyle still enables preserve',
+    forcedLife.preserveScene === true &&
+    forcedLife.prompt.includes('SCENE PRESERVE — HIGHEST PRIORITY'));
+  const forcedUgc = mod.buildPrompt({
+    intentKey: 'product_first_lifestyle', data: DATA, product: PRODUCT, surface: SURFACE,
+    seedStyle: 'packshot', variantKind: 'ugc', preserveScene: true
+  });
+  check('S2b preserveScene=true on ugc+packshot seed still enables preserve',
+    forcedUgc.preserveScene === true);
 }
 
 // S3 — preserve-on contains SCENE_PRESERVE, not scene-building opening
@@ -406,7 +483,7 @@ console.log('\n--- 4-way static flag matrix ---');
 // ═══════════════════════════════════════════════════════════════════════
 console.log('\n=== VIDEO lifestyle directives ===\n');
 
-// V1 — selection
+// V1 — selection (lifestyle seed OR ugc variantKind — matches static)
 {
   const on = loadVeo({ lifestyle: 'true' });
   const life = on.buildVeoPrompt({
@@ -429,6 +506,14 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     durationSec: 8,
     caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
   });
+  const ugcPack = on.buildVeoPrompt({
+    product: { title: 'Wool Runner' },
+    seedStyle: 'packshot',
+    variantKind: 'ugc',
+    hasProductReference: false,
+    durationSec: 8,
+    caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
+  });
   check('V1 lifestyle+flag → Lifestyle motion editor role',
     life.includes('Lifestyle motion editor'));
   check('V1 lifestyle+flag → ambient life',
@@ -437,10 +522,16 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     pack.includes('Professional product commercial editor') && pack.includes('Ken Burns'));
   check('V1 no seedStyle+flag → OMNI path (B14-compatible)',
     none.includes('Professional product commercial editor') && none.includes('Ken Burns'));
+  check('V1 ugc+packshot seed → lifestyle path (matches static trigger)',
+    ugcPack.includes('Lifestyle motion editor'));
   check('V1 shouldUseLifestyleVideoPrompt lifestyle true',
     on.shouldUseLifestyleVideoPrompt('lifestyle') === true);
   check('V1 shouldUseLifestyleVideoPrompt packshot false',
     on.shouldUseLifestyleVideoPrompt('packshot') === false);
+  check('V1 shouldUseLifestyleVideoPrompt ugc true even if packshot seed',
+    on.shouldUseLifestyleVideoPrompt('packshot', 'ugc') === true);
+  check('V1 shouldUseLifestyleVideoPrompt product_image+packshot false',
+    on.shouldUseLifestyleVideoPrompt('packshot', 'product_image') === false);
 }
 
 // V1 flag off
@@ -460,6 +551,10 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
 }
 
 // V2 — OMNI + GROK byte-unchanged vs 134db56~1
+// Baseline does NOT export OMNI_DIRECTIVES / GROK_DIRECTIVES, so iterating
+// Object.keys(oldMod.OMNI_DIRECTIVES || {}) ran ZERO comparisons (vacuous).
+// Fix: inject those names into the baseline module.exports (same consts are
+// in scope), then field-compare — plus the B14-style full prompt matrix.
 {
   const mod = loadVeo({ lifestyle: undefined });
   const BASELINE = '134db56~1:services/veoPromptBuilder.js';
@@ -473,14 +568,32 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     });
     if (!src.includes(REL_REQUIRE)) {
       skipReason = `baseline missing ${REL_REQUIRE}`;
+    } else if (!/\bconst OMNI_DIRECTIVES\b/.test(src) || !/\bconst GROK_DIRECTIVES\b/.test(src)) {
+      skipReason = 'baseline missing OMNI_DIRECTIVES or GROK_DIRECTIVES const';
     } else {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lifeVeoPin-'));
       const tmpFile = path.join(tmpDir, 'veoPromptBuilder.baseline.js');
-      fs.writeFileSync(tmpFile, src.replace(
+      // Relocate platformFormats require, then force-export the directive
+      // objects so field comparison is real (baseline never exported them).
+      let patched = src.replace(
         REL_REQUIRE,
         `require(${JSON.stringify(path.join(REPO, 'services', 'platformFormats'))})`
-      ));
+      );
+      if (/module\.exports\s*=\s*\{/.test(patched)) {
+        patched = patched.replace(
+          /module\.exports\s*=\s*\{/,
+          'module.exports = { OMNI_DIRECTIVES, GROK_DIRECTIVES, '
+        );
+      } else {
+        patched += '\nmodule.exports.OMNI_DIRECTIVES = OMNI_DIRECTIVES;\n' +
+          'module.exports.GROK_DIRECTIVES = GROK_DIRECTIVES;\n';
+      }
+      fs.writeFileSync(tmpFile, patched);
       oldMod = require(tmpFile);
+      if (!oldMod.OMNI_DIRECTIVES || !oldMod.GROK_DIRECTIVES) {
+        oldMod = null;
+        skipReason = 'baseline load succeeded but OMNI/GROK exports missing after inject';
+      }
     }
   } catch (e) {
     skipReason = e.message || String(e);
@@ -489,13 +602,21 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   if (!oldMod) {
     check('V2 SKIP: baseline unavailable (not a pass)', false, skipReason);
   } else {
-    // Directive object fields — stringify comparison for OMNI + GROK
-    for (const key of Object.keys(oldMod.OMNI_DIRECTIVES || {})) {
+    const omniKeys = Object.keys(oldMod.OMNI_DIRECTIVES);
+    const grokKeys = Object.keys(oldMod.GROK_DIRECTIVES);
+    // Non-vacuous: must compare a real field set (doNot alone is load-bearing).
+    check('V2 baseline OMNI_DIRECTIVES has ≥8 fields (non-vacuous)',
+      omniKeys.length >= 8, `keys=${omniKeys.length}`);
+    check('V2 baseline GROK_DIRECTIVES has ≥8 fields (non-vacuous)',
+      grokKeys.length >= 8, `keys=${grokKeys.length}`);
+    check('V2 baseline OMNI has doNot', omniKeys.includes('doNot'));
+    check('V2 baseline GROK has doNot', grokKeys.includes('doNot'));
+    for (const key of omniKeys) {
       check(`V2 OMNI_DIRECTIVES.${key} byte-identical to 134db56~1`,
         mod.OMNI_DIRECTIVES[key] === oldMod.OMNI_DIRECTIVES[key],
         key);
     }
-    for (const key of Object.keys(oldMod.GROK_DIRECTIVES || {})) {
+    for (const key of grokKeys) {
       check(`V2 GROK_DIRECTIVES.${key} byte-identical to 134db56~1`,
         mod.GROK_DIRECTIVES[key] === oldMod.GROK_DIRECTIVES[key],
         key);
@@ -527,7 +648,7 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   }
 }
 
-// V3 — lifestyle keeps hard constraints
+// V3 — lifestyle keeps hard constraints (identity ≠ immobility)
 {
   const mod = loadVeo({ lifestyle: 'true' });
   const d = mod.LIFESTYLE_DIRECTIVES;
@@ -542,8 +663,20 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     /composited downstream/i.test(d.noText) && /rejection/i.test(d.noText));
   check('V3 physicalAccuracy — 5-fingered hands + mid-shot morphing',
     /5-fingered hands/i.test(d.physicalAccuracy) && /morphing/i.test(d.physicalAccuracy));
-  check('V3 product must not animate',
-    /Do NOT animate the product or any of its parts/i.test(blob));
+  check('V3 identity absolute, not immobility (may move as real item)',
+    /IDENTITY is absolute|identity is absolute|Product fidelity means IDENTITY/i.test(blob) &&
+    /may move ONLY as the real physical item would|as a consequence of the wearer's/i.test(blob));
+  check('V3 no-morph / no-regenerate / no re-drape',
+    /morph/i.test(blob) && /regenerate/i.test(blob) && /re-drape|re-posed|independently animated/i.test(blob));
+  check('V3 rigid/hard-goods do not deform',
+    /rigid|hard-goods|hard goods/i.test(blob) && /does not deform|do not bend/i.test(blob));
+  check('V3 camera bans parallax / 2.5D depth',
+    /parallax/i.test(d.cameraStyle) && /2\.5D|synthesized/i.test(d.cameraStyle));
+  check('V3 guidance snippets do not end with frozen/does not animate immobility',
+    !Object.values(mod.LIFESTYLE_VIDEO_GUIDANCE).some(s =>
+      /Product does not animate\.?\s*$/i.test(s) ||
+      /Product geometry frozen\.?\s*$/i.test(s) ||
+      /Product frozen\.?\s*$/i.test(s)));
 }
 
 // V4 — no packshot-only style strings
@@ -565,10 +698,11 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   }
 }
 
-// V5 — ambient permitted, fantasy banned
+// V5 — ambient permitted; fantasy tokens only inside a prohibition
 {
   const mod = loadVeo({ lifestyle: 'true' });
-  const blob = Object.values(mod.LIFESTYLE_DIRECTIVES).join(' ') + ' ' +
+  const d = mod.LIFESTYLE_DIRECTIVES;
+  const blob = Object.values(d).join(' ') + ' ' +
     mod.buildVeoPrompt({
       product: { title: 'X' }, seedStyle: 'lifestyle', durationSec: 8,
       caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
@@ -577,16 +711,22 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     check(`V5 ambient permitted: ${a}`, new RegExp(a, 'i').test(blob));
   }
   for (const f of FANTASY_BANS) {
-    check(`V5 fantasy banned: ${f}`,
-      new RegExp(`no ${f}|No ${f}|fantasy motion[\\s\\S]*${f}`, 'i').test(blob) ||
-      blob.toLowerCase().includes(`no ${f}`) ||
-      (blob.includes('No fantasy motion') && blob.toLowerCase().includes(f)));
+    check(`V5 fantasy banned as prohibition only: ${f}`,
+      isProhibitionOnly(d.doNot, f) || isProhibitionOnly(blob, f));
   }
   check('V5 doNot lists fantasy motion ban explicitly',
-    /No fantasy motion/i.test(mod.LIFESTYLE_DIRECTIVES.doNot));
+    /No fantasy motion/i.test(d.doNot));
+  // Positive co-presence must NOT satisfy: inject a synthetic positive and
+  // prove isProhibitionOnly rejects it (sanity of the helper itself).
+  check('V5 helper rejects positive co-presence (add sparkles + No fantasy motion)',
+    isProhibitionOnly('No fantasy motion. Please add sparkles to the scene.', 'sparkles') === false);
+  check('V5 helper accepts ban list form',
+    isProhibitionOnly('No fantasy motion — no sparkles, particles, or flares.', 'sparkles') === true);
 }
 
-// V6 — reference count
+// V6 — reference count: effective count from the plan (behavioural)
+// A mutation that calls resolveLifestyleVideoRefCount for side effect but
+// still passes baseReferenceCount to buildReferenceImages must fail.
 {
   const on = loadVeo({ lifestyle: 'true' });
   check('V6 lifestyle+flag → ref count 1',
@@ -597,26 +737,103 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     on.resolveLifestyleVideoRefCount(3, 'unknown') === 3);
   check('V6 lifestyle+flag with base 5 → still 1',
     on.resolveLifestyleVideoRefCount(5, 'lifestyle') === 1);
+  check('V6 ugc+packshot seed → ref count 1',
+    on.resolveLifestyleVideoRefCount(3, 'packshot', 'ugc') === 1);
+
+  // Behavioural plan — this is what generateForAd must pass to buildReferenceImages.
+  const planLife = on.resolveLifestyleVideoRefPlan({
+    baseReferenceCount: 3, seedStyle: 'lifestyle'
+  });
+  const planPack = on.resolveLifestyleVideoRefPlan({
+    baseReferenceCount: 3, seedStyle: 'packshot'
+  });
+  const planUgc = on.resolveLifestyleVideoRefPlan({
+    baseReferenceCount: 5, seedStyle: 'unknown', variantKind: 'ugc'
+  });
+  check('V6 plan lifestyle: referenceCount===1 (effective)',
+    planLife.referenceCount === 1 && planLife.forceSeedOnly === true);
+  check('V6 plan packshot: referenceCount===base 3',
+    planPack.referenceCount === 3 && planPack.forceSeedOnly === false);
+  check('V6 plan ugc: referenceCount===1 even with base 5',
+    planUgc.referenceCount === 1 && planUgc.forceSeedOnly === true);
+  // Plan must not return base when lifestyle is active (catches side-effect-only call).
+  check('V6 plan lifestyle never returns baseReferenceCount as effective count',
+    planLife.referenceCount !== 3);
 
   const off = loadVeo({ lifestyle: 'false' });
   check('V6 flag off lifestyle → base 3',
     off.resolveLifestyleVideoRefCount(3, 'lifestyle') === 3);
+  check('V6 flag off plan ignores lifestyle',
+    off.resolveLifestyleVideoRefPlan({ baseReferenceCount: 3, seedStyle: 'lifestyle' })
+      .referenceCount === 3);
   check('V6 DEFAULT_REFERENCE_IMAGE_COUNT still 3 (packshot path)',
     (() => {
-      // Avoid loading atlasVideoService if sharp missing — pin via source
       const src = fs.readFileSync(path.join(REPO, 'services/atlasVideoService.js'), 'utf8');
       return /const DEFAULT_REFERENCE_IMAGE_COUNT = 3/.test(src);
     })());
-  // Source pin: generateForAd uses resolveLifestyleVideoRefCount
+  // generateForAd must wire the plan's effective count into buildReferenceImages
+  // — not call the helper and discard the result.
   {
     const src = fs.readFileSync(path.join(REPO, 'services/atlasVideoService.js'), 'utf8');
-    check('V6 generateForAd calls resolveLifestyleVideoRefCount',
-      src.includes('resolveLifestyleVideoRefCount'));
+    check('V6 generateForAd uses resolveLifestyleVideoRefPlan',
+      src.includes('resolveLifestyleVideoRefPlan'));
+    check('V6 generateForAd uses plan.referenceCount (effective)',
+      /lifestylePlan\.referenceCount/.test(src));
+    check('V6 generateForAd does NOT pass baseReferenceCount as referenceCount kwarg',
+      !/buildReferenceImages\(\{[\s\S]{0,400}referenceCount:\s*baseReferenceCount/.test(src));
     check('V6 generateForAd resolves seedStyle via resolveSeedStyle',
       src.includes('resolveSeedStyle(media)'));
-    check('V6 lifestyle clears orderedReferenceMedia (seed-only)',
-      /orderedReferenceMedia:\s*lifestyleVideo\s*\?\s*null/.test(src));
+    check('V6 lifestyle clears orderedReferenceMedia via plan.forceSeedOnly',
+      /orderedReferenceMedia:\s*lifestylePlan\.forceSeedOnly\s*\?\s*null/.test(src));
+    check('V6 generateForAd threads variantKind into plan',
+      /variantKind:\s*ad\.variantKind/.test(src));
   }
+}
+
+// V9 — lifestyle + PMax compose (orthogonal, not suppress)
+{
+  const on = loadVeo({ lifestyle: 'true' });
+  const pmaxLife = on.buildVeoPrompt({
+    product: { title: 'Wool Runner' },
+    seedStyle: 'lifestyle',
+    platformFormat: 'pmax_video_9_16',
+    aspectRatio: '9:16',
+    durationSec: 10,
+    hasProductReference: false,
+    caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
+  });
+  const pmaxPack = on.buildVeoPrompt({
+    product: { title: 'Wool Runner' },
+    seedStyle: 'packshot',
+    platformFormat: 'pmax_video_9_16',
+    aspectRatio: '9:16',
+    durationSec: 10,
+    hasProductReference: true,
+    caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
+  });
+  const metaLife = on.buildVeoPrompt({
+    product: { title: 'Wool Runner' },
+    seedStyle: 'lifestyle',
+    platformFormat: 'meta_reels_9_16',
+    aspectRatio: '9:16',
+    durationSec: 8,
+    hasProductReference: false,
+    caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
+  });
+  check('V9 lifestyle+PMax keeps lifestyle scene/motion role',
+    pmaxLife.includes('Lifestyle motion editor'));
+  check('V9 lifestyle+PMax keeps HOOK-FIRST',
+    /HOOK-FIRST|HOOK —/i.test(pmaxLife));
+  check('V9 lifestyle+PMax keeps centre-safe',
+    /Centre-safe|center-safe|central region/i.test(pmaxLife));
+  check('V9 lifestyle+PMax emits Frame (9:16)',
+    pmaxLife.includes('Frame (9:16 vertical)'));
+  check('V9 lifestyle+Meta does NOT emit Frame (9:16)',
+    !metaLife.includes('Frame (9:16 vertical)'));
+  check('V9 packshot+PMax still Ken Burns packshot path',
+    pmaxPack.includes('Ken Burns') || pmaxPack.includes('product commercial'));
+  check('V9 lifestyle+PMax does not re-impose product stays completely static',
+    !pmaxLife.includes('product stays completely static'));
 }
 
 // V7 — guidance snippets
@@ -680,6 +897,181 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// BLOCKER 3 — variantKind reaches the prompt builder on EVERY caller
+// Behavioural: pure arg builders → shouldPreserveScene / buildPrompt.
+// Complete caller list of renderDirectImage (production):
+//   1. renderService.renderStage (first render) — spreads args.variantKind
+//   2. adRegenerateService.runImage (paid regen) — buildDirectImageArgsFromAd
+//   3. directImageRenderService QC re-entry (paid retry) — buildQcRetryArgs
+// ═══════════════════════════════════════════════════════════════════════
+console.log('\n=== BLOCKER 3: variantKind on all renderDirectImage callers ===\n');
+{
+  const intentsOn = loadIntents({ preserve: 'true', hardening: 'true' });
+  const regen = require('../services/adRegenerateService');
+  const direct = require('../services/directImageRenderService');
+
+  // Caller 1 — renderService: args object built with adDoc.variantKind
+  // (renderStage spreads ...args into renderDirectImage). Simulate the
+  // same resolution used at renderService.js:221.
+  const renderServiceArgs = {
+    variantKind: ({ variantKind: 'ugc' }).variantKind || null,
+    template: 'ai_product_first_lifestyle',
+    platformFormat: 'meta_feed_1_1'
+  };
+  check('C1 renderService-shaped args carry variantKind=ugc',
+    renderServiceArgs.variantKind === 'ugc');
+  {
+    // Behavioural: packshot seed + ugc variantKind → preserve
+    const built = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: renderServiceArgs.variantKind
+    });
+    check('C1 renderService variantKind reaches preserve gate (ugc+packshot seed)',
+      built.preserveScene === true &&
+      built.prompt.includes('SCENE PRESERVE — HIGHEST PRIORITY'));
+  }
+  // Revert-prove shape: drop variantKind → no preserve on packshot seed
+  {
+    const dropped = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: null
+    });
+    check('C1 REVERT-PROVE: dropping variantKind kills ugc preserve on packshot seed',
+      dropped.preserveScene === false);
+  }
+
+  // Caller 2 — adRegenerateService paid regen
+  const fakeAd = {
+    _id: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+    layoutInputArtifactId: 'bbbbbbbbbbbbbbbbbbbbbbbb',
+    aspectRatio: '1:1',
+    mediaId: 'cccccccccccccccccccccccc',
+    productId: 'dddddddddddddddddddddddd',
+    brandId: 'eeeeeeeeeeeeeeeeeeeeeeee',
+    campaignId: 'ffffffffffffffffffffffff',
+    campaignRunIds: ['run_1'],
+    conceptArtifactId: null,
+    conceptId: null,
+    template: 'ai_product_first_lifestyle',
+    platformFormat: 'meta_feed_1_1',
+    variantKind: 'ugc'
+  };
+  const regenArgs = regen.buildDirectImageArgsFromAd(fakeAd, {
+    adId: fakeAd._id,
+    referenceMediaIds: [fakeAd.mediaId],
+    referenceSource: 'operator',
+    prompt: null,
+    promptOverride: null
+  });
+  check('C2 adRegenerateService args include variantKind=ugc',
+    regenArgs.variantKind === 'ugc');
+  {
+    const built = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: regenArgs.variantKind
+    });
+    check('C2 regen variantKind reaches preserve gate',
+      built.preserveScene === true);
+  }
+  // Revert-prove: omit variantKind from a mutated builder result
+  {
+    const { variantKind: _drop, ...without } = regenArgs;
+    void _drop;
+    check('C2 REVERT-PROVE: args without variantKind field',
+      !Object.prototype.hasOwnProperty.call(without, 'variantKind'));
+    const built = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: without.variantKind // undefined
+    });
+    check('C2 REVERT-PROVE: dropped variantKind → no preserve on packshot seed',
+      built.preserveScene === false);
+  }
+
+  // Caller 3 — vision QC corrective re-entry (spread original args)
+  const originalCall = {
+    layoutInputArtifactId: fakeAd.layoutInputArtifactId,
+    aspectRatio: '1:1',
+    mediaId: fakeAd.mediaId,
+    productId: fakeAd.productId,
+    brandId: fakeAd.brandId,
+    adId: fakeAd._id,
+    template: fakeAd.template,
+    platformFormat: 'meta_feed_1_1',
+    variantKind: 'ugc',
+    referenceMediaIds: [fakeAd.mediaId],
+    operatorPrompt: null,
+    rawPromptOverride: null
+  };
+  const qcArgs = direct.buildQcRetryArgs(originalCall, {
+    correctiveNote: 'fix the safe box',
+    overrideText: null
+  });
+  check('C3 QC retry spreads variantKind=ugc from original call',
+    qcArgs.variantKind === 'ugc');
+  check('C3 QC retry sets skipVisionQc true',
+    qcArgs.skipVisionQc === true);
+  {
+    const built = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: qcArgs.variantKind
+    });
+    check('C3 QC retry variantKind reaches preserve gate',
+      built.preserveScene === true);
+  }
+  // Revert-prove: buildQcRetryArgs from an original that omitted variantKind
+  {
+    const { variantKind: _d, ...noVk } = originalCall;
+    void _d;
+    const broken = direct.buildQcRetryArgs(noVk, {
+      correctiveNote: 'fix',
+      overrideText: null
+    });
+    check('C3 REVERT-PROVE: original without variantKind → retry also lacks it',
+      broken.variantKind == null);
+    const built = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: broken.variantKind
+    });
+    check('C3 REVERT-PROVE: missing variantKind on QC retry → no preserve',
+      built.preserveScene === false);
+  }
+
+  // Enumerate: only these three production call sites
+  {
+    const callers = [];
+    for (const rel of [
+      'services/renderService.js',
+      'services/adRegenerateService.js',
+      'services/directImageRenderService.js'
+    ]) {
+      const src = fs.readFileSync(path.join(REPO, rel), 'utf8');
+      const re = /renderDirectImage\s*\(/g;
+      let m;
+      while ((m = re.exec(src)) !== null) {
+        callers.push({ file: rel, at: m.index });
+      }
+    }
+    // directImageRenderService has the definition + the QC re-call
+    check('C* complete caller sweep: ≥3 renderDirectImage( sites in the three files',
+      callers.length >= 3, JSON.stringify(callers.map(c => c.file)));
+    console.log('  renderDirectImage call sites:',
+      callers.map(c => c.file).join(', '));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // REVERT-PROVE (document which check catches which mutation)
 // ═══════════════════════════════════════════════════════════════════════
 console.log('\n=== REVERT-PROVE map (documented) ===');
@@ -692,13 +1084,21 @@ const REVERT_MAP = [
   ['Change copy role order when preserve on', 'S2 OWNER: copy roles+order byte-identical'],
   ['Edit geometryBlock for preserve', 'S7 geometryBlock unchanged'],
   ['Flag default true', 'S1 default LIFESTYLE_PRESERVE is false / S6 flag-off byte-identical'],
-  ['Edit OMNI_DIRECTIVES string', 'V2 OMNI_DIRECTIVES.* byte-identical'],
+  ['preserveScene=true on packshot forces preserve', 'S2b preserveScene=true on packshot does NOT enable'],
+  ['product_first restage cue under preserve', 'S2 product_first preserve-aware emphasis'],
+  ['Edit OMNI_DIRECTIVES.doNot string', 'V2 OMNI_DIRECTIVES.doNot byte-identical (non-vacuous field loop)'],
   ['Edit GROK_DIRECTIVES string', 'V2 GROK_DIRECTIVES.* byte-identical'],
   ['Select lifestyle without flag', 'V1 flag off: lifestyle seed still gets OMNI'],
-  ['Drop product animate ban from lifestyle', 'V3 product must not animate'],
+  ['Drop ugc video trigger', 'V1 ugc+packshot seed → lifestyle path'],
+  ['Restore product immobility contradiction', 'V3 identity absolute, not immobility'],
+  ['Drop parallax ban from lifestyle camera', 'V3 camera bans parallax'],
   ['Drop physicalAccuracy hands', 'V3 physicalAccuracy'],
-  ['Allow sparkles in lifestyle doNot', 'V5 fantasy banned: sparkles'],
-  ['Lifestyle ref count stays 3', 'V6 lifestyle+flag → ref count 1'],
+  ['Positive "add sparkles" co-present with ban', 'V5 fantasy banned as prohibition only / V5 helper rejects positive'],
+  ['Lifestyle plan returns base count 3', 'V6 plan lifestyle: referenceCount===1 (effective)'],
+  ['Call resolveLifestyleVideoRefCount but pass baseReferenceCount', 'V6 generateForAd uses plan.referenceCount / does NOT pass baseReferenceCount'],
+  ['Lifestyle suppresses PMax (isPmax = !lifestyle && …)', 'V9 lifestyle+PMax keeps HOOK-FIRST / Frame'],
+  ['Drop variantKind on regen args', 'C2 REVERT-PROVE: dropped variantKind → no preserve'],
+  ['Drop variantKind on QC retry (hand-list fields)', 'C3 REVERT-PROVE: missing variantKind on QC retry'],
   ['Guidance >600 chars', 'V7 * ≤600 chars'],
   ['Guidance says Shop Now', 'V7 * no copy/offer/text instruction']
 ];
@@ -706,7 +1106,7 @@ for (const [mut, catcher] of REVERT_MAP) {
   console.log(`  · mutate: ${mut}`);
   console.log(`    caught by: ${catcher}`);
 }
-check('REVERT-PROVE table enumerated (≥15 mutations)', REVERT_MAP.length >= 15);
+check('REVERT-PROVE table enumerated (≥20 mutations)', REVERT_MAP.length >= 20);
 
 // ── summary ──────────────────────────────────────────────────────────
 restoreEnv();

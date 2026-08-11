@@ -606,8 +606,15 @@ const INTENTS = {
     renders: { rendersQuote: false, rendersRating: true, rendersBadge: false },
     core: [],
     eligible: () => null, // always runs; it is the floor of the hierarchy
-    emphasis: (d, kept) => [
-      'the product in a scene someone wants to be in',
+    // Third arg `ctx` is optional so flag-off / non-preserve callers that only
+    // pass (d, kept) stay byte-identical. Preserve-aware emphasis points at the
+    // existing photograph; scene-build arm keeps the pre-change wording.
+    // text() is deliberately NOT preserve-aware — copy roles/order are owned
+    // by the Director intent (owner requirement).
+    emphasis: (d, kept, ctx = {}) => [
+      ctx.preserve
+        ? 'the product already in this photograph — the life the plate already implies'
+        : 'the product in a scene someone wants to be in',
       kept('BRAND LINE') ? "the brand's line" : null,
       kept('TRUST MARK') ? 'a quiet trust mark, secondary to everything above' : null,
       kept('CTA BUTTON') ? 'the CTA' : null
@@ -904,10 +911,13 @@ function shouldPreserveScene({ seedStyle = null, variantKind = null } = {}) {
 }
 
 function buildPrompt({ intentKey, data, product, surface, seedStyle = null, variantKind = null, preserveScene = null }) {
-  // preserveScene boolean wins when explicitly passed (harness / callers);
-  // otherwise derive from seedStyle + variantKind under the flag.
+  // Explicit preserveScene=true is harness/test only and STILL requires a
+  // lifestyle-or-ugc subject — a packshot must never land on SCENE_PRESERVE
+  // even when a caller forces the override. preserveScene=false always wins
+  // (explicit opt-out). Otherwise derive from seedStyle + variantKind.
+  const subjectOk = seedStyle === 'lifestyle' || variantKind === 'ugc';
   const preserve = preserveScene === true
-    ? LIFESTYLE_PRESERVE
+    ? (LIFESTYLE_PRESERVE && subjectOk)
     : preserveScene === false
       ? false
       : shouldPreserveScene({ seedStyle, variantKind });
@@ -939,7 +949,9 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
 
   const keptRoles = new Set(kept.map(([r]) => r));
   const kept_ = (role) => keptRoles.has(role);
-  const emphasis = spec.emphasis(data, kept_);
+  // Pass preserve into emphasis so product_first_lifestyle can use a
+  // preserve-aware scene line without touching text() copy roles/order.
+  const emphasis = spec.emphasis(data, kept_, { preserve });
   const absent = absences(data, spec.renders, dropped, effectivePolicy);
   const s = computeSurface(surface);
 
