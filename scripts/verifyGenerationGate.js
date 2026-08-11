@@ -162,7 +162,11 @@ const SENSITIVE_FIELDS = [
   ['videoPromptRaw',         { videoPromptRaw: 'full replacement camera prompt' }],
   // Scalar shape, exactly as routes/ads.js sends it. Was a real defect — every
   // scalar value collapsed to '' so static-only and video-only hashed the same.
-  ['kinds (scalar)',         { kinds: 'video' }]
+  ['kinds (scalar)',         { kinds: 'video' }],
+  // Operator multi-select surfaces (preset 'explicit'). The route reads both and
+  // forwards them into resolvePreset, so both must reach the hash.
+  ['staticFormats',          { staticFormats: ['meta_feed_1_1'] }],
+  ['videoFormats',           { videoFormats: ['meta_stories_9_16'] }]
 ];
 for (const [name, override] of SENSITIVE_FIELDS) {
   check(`1.${name} changes the fingerprint`, fp(override) !== fp({}),
@@ -202,6 +206,121 @@ check('1.kinds array shape still works', fp({ kinds: ['video'] }) !== fp({ kinds
 check('1.kinds scalar and single-item array agree (one canonical form, not two)',
   fp({ kinds: 'video' }) === fp({ kinds: ['video'] }),
   'the two shapes must normalize to the same hash or the same request from two callers looks different');
+
+// staticFormats / videoFormats — the wizard's multi-select sizes (preset
+// 'explicit'). These are the SAME trap class as `kinds` above and the stakes are
+// higher, because the field maps directly onto how many billable image
+// generations the run produces: one per ticked static surface, per concept.
+// Leaving them out of the hash would make "1:1 only" (1x image spend) and
+// "1:1 + 4:5 + Stories" (3x) fingerprint IDENTICALLY, so an operator who
+// generated one size and then came back for all three would be refused as a
+// duplicate — a false block on an obviously-different request.
+const M3 = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16'];
+check('1.staticFormats size COUNT changes the hash (1 size vs 3 = 1x vs 3x image spend)',
+  fp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }) !==
+  fp({ preset: 'explicit', staticFormats: M3 }),
+  'a 1-size and a 3-size request must not collide — the second would be refused as a duplicate');
+check('1.staticFormats WHICH sizes changes the hash (same count, different surfaces)',
+  fp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }) !==
+  fp({ preset: 'explicit', staticFormats: ['meta_feed_4_5'] }));
+check('1.staticFormats is ORDER-INSENSITIVE (a set of surfaces, each expanded independently)',
+  fp({ preset: 'explicit', staticFormats: M3 }) ===
+  fp({ preset: 'explicit', staticFormats: [...M3].reverse() }),
+  'tick order cannot change what is generated, so it must not change the hash — same rule as productIds');
+check('1.staticFormats DEDUPES (a repeated tick is the same request)',
+  fp({ preset: 'explicit', staticFormats: ['meta_feed_1_1', 'meta_feed_1_1'] }) ===
+  fp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }));
+check('1.videoFormats is ORDER-INSENSITIVE',
+  fp({ preset: 'explicit', videoFormats: ['meta_feed_1_1', 'meta_stories_9_16'] }) ===
+  fp({ preset: 'explicit', videoFormats: ['meta_stories_9_16', 'meta_feed_1_1'] }));
+check('1.staticFormats and videoFormats are DISTINCT slots (same key, different side)',
+  fp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }) !==
+  fp({ preset: 'explicit', videoFormats: ['meta_feed_1_1'] }),
+  'ticking a surface for static must not hash the same as ticking it for video — different spend entirely');
+check('1.absent format lists equal empty lists (old callers keep one canonical hash)',
+  fp({ staticFormats: [] }) === fp({}) && fp({ videoFormats: [] }) === fp({}));
+check('1.static-only and static+video differ (adding a video master is added spend)',
+  fp({ preset: 'explicit', staticFormats: M3 }) !==
+  fp({ preset: 'explicit', staticFormats: M3, videoFormats: ['meta_stories_9_16'] }));
+
+// ── 1b. THE FALSE-ALLOW FIX — hash the RESOLVED billable set, not the body ──
+//
+// Found by adversarial review. The gate's job is to recognise a REPEAT of the
+// same request, and "same request" has to mean the same BILLABLE SURFACE SET,
+// not the same JSON. The route therefore normalises the multi-select lists
+// through resolveExplicitFormats (the same function the expansion uses) and
+// hashes THAT, zeroing the fields 'explicit' ignores.
+//
+// Without this, several pairs of bodies that generate byte-identical creative
+// hashed DIFFERENTLY — so a genuine double-click was not recognised and the
+// second click billed a second full set of static generations. Static is the
+// unprotected half: its identityDigest is scoped to generationRunId, so no
+// unique index catches the duplicate the way it does for video.
+//
+// These checks model the ROUTE's normalisation (resolve → hash) and assert the
+// collapse behaviourally, rather than trusting the route's source text.
+{
+  const pfmt = require('../services/platformFormats');
+  // Mirror of what routes/ads.js now builds for the fingerprint.
+  const routeFp = (body) => {
+    const isExplicit = body.preset === 'explicit';
+    const r = isExplicit
+      ? pfmt.resolveExplicitFormats({ staticFormats: body.staticFormats, videoFormats: body.videoFormats })
+      : { staticFormats: [], videoFormats: [] };
+    return computeRequestFingerprint({
+      ...BASE, ...body,
+      kinds:               isExplicit ? null  : body.kinds,
+      expandStaticFormats: isExplicit ? false : body.expandStaticFormats,
+      staticFormats: r.staticFormats,
+      videoFormats:  r.videoFormats
+    });
+  };
+
+  check('1b.a video-ONLY key sent in staticFormats collapses (Reels carries no static image)',
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1', 'meta_reels_9_16'] }) ===
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }),
+    'both bodies generate exactly one 1:1 image — hashing them differently lets a double-click bill twice');
+  check('1b.a duplicate tick collapses',
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1', 'meta_feed_1_1'] }) ===
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }));
+  check('1b.a coming_soon tick collapses (it is dropped before generation)',
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1', 'pmax_16_9'] }) ===
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }));
+  check('1b.an unknown key collapses',
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1', 'nope_not_real'] }) ===
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }));
+  check("1b.'kinds' is ignored under explicit, so it cannot change the hash",
+    routeFp({ preset: 'explicit', staticFormats: M3, kinds: 'video' }) ===
+    routeFp({ preset: 'explicit', staticFormats: M3 }),
+    'explicit derives kinds from the lists; hashing a field the resolver ignores hides real double-clicks');
+  check("1b.'expandStaticFormats' is ignored under explicit, so it cannot change the hash",
+    routeFp({ preset: 'explicit', staticFormats: M3, expandStaticFormats: true }) ===
+    routeFp({ preset: 'explicit', staticFormats: M3 }));
+  check('1b.leftover lists on a NAMED preset cannot change the hash (named presets ignore them)',
+    routeFp({ preset: 'meta_static', staticFormats: ['meta_feed_1_1'], videoFormats: M3 }) ===
+    routeFp({ preset: 'meta_static' }),
+    'stale checkbox state left on a named preset would otherwise unmask a genuine double-click');
+  check('1b.two video tick ORDERS that clamp to the same plate hash the same',
+    routeFp({ preset: 'explicit', videoFormats: ['meta_feed_1_1', 'meta_feed_4_5'] }) ===
+    routeFp({ preset: 'explicit', videoFormats: ['meta_feed_4_5', 'meta_feed_1_1'] }));
+
+  // And the inverse must still hold — genuinely different spend must still differ.
+  check('1b.STILL DISTINGUISHES 1 size from 3 sizes (1x vs 3x image spend)',
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }) !==
+    routeFp({ preset: 'explicit', staticFormats: M3 }));
+  check('1b.STILL DISTINGUISHES which size',
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_1_1'] }) !==
+    routeFp({ preset: 'explicit', staticFormats: ['meta_feed_4_5'] }));
+  check('1b.STILL DISTINGUISHES static-only from static+video',
+    routeFp({ preset: 'explicit', staticFormats: M3 }) !==
+    routeFp({ preset: 'explicit', staticFormats: M3, videoFormats: ['meta_stories_9_16'] }));
+  check('1b.STILL DISTINGUISHES explicit from the named preset covering the same sizes',
+    routeFp({ preset: 'explicit', staticFormats: M3 }) !== routeFp({ preset: 'meta_static' }),
+    'preset is hashed independently; these are different requests even where output matches');
+  check('1b.a caller sending NEITHER list is unaffected by all of this',
+    routeFp({ preset: 'single', kinds: 'image' }) ===
+    computeRequestFingerprint({ ...BASE, preset: 'single', kinds: 'image' }));
+}
 
 // ── 2. FINGERPRINT ORDER RULES — order-insensitive vs order-sensitive lists,
 //       dedupe, blank/null handling, non-array tolerance. Getting this
@@ -747,7 +866,10 @@ check('14.2b that fingerprint is passed into generationGateDecision',
   const fpCallBlock = fpCallIdx > 0 ? adsSrc.slice(fpCallIdx, fpCallEnd) : '';
   const forwardedPlain = ['campaignId', 'productIds', 'mediaIds', 'templateIds', 'preset',
     'platformFormat', 'kinds', 'expandStaticFormats', 'includeCategoryMatched',
-    'includeBrandMatched', 'excludePairings', 'cta', 'urlParams'];
+    'includeBrandMatched', 'excludePairings', 'cta', 'urlParams',
+    // Multi-select surfaces — read by the handler and forwarded into
+    // expandWizardJob, so they must be hashed too.
+    'staticFormats', 'videoFormats'];
   for (const key of forwardedPlain) {
     check(`14.2c route's fingerprint call forwards '${key}'`, hasObjectKey(fpCallBlock, key));
   }
@@ -770,6 +892,27 @@ check('14.2b that fingerprint is passed into generationGateDecision',
     'the gate catches cross-user duplicates too');
   check("14.2d route's fingerprint call uses the PARSED video duration, not the raw body value",
     /videoDurationSec:\s*parsedVideoDurationSec/.test(fpCallBlock));
+
+  // The false-allow fix, pinned at the route. Behavioural proof is section 1b;
+  // these assert the route really routes through it, since 1b models the route
+  // rather than calling it.
+  check('14.2f route resolves the multi-select lists BEFORE fingerprinting',
+    /resolveExplicitFormats\(\{\s*staticFormats,\s*videoFormats\s*\}\)/.test(adsSrc),
+    'the gate must hash the resolved billable set, not the raw body arrays');
+  check("14.2g route's fingerprint call hashes the RESOLVED lists, not the raw ones",
+    /staticFormats:\s*resolvedExplicit\.staticFormats/.test(fpCallBlock) &&
+    /videoFormats:\s*resolvedExplicit\.videoFormats/.test(fpCallBlock));
+  check("14.2h route ZEROES the fields 'explicit' ignores before hashing",
+    /kinds:\s*isExplicitPreset \? null\s*:\s*kinds/.test(fpCallBlock) &&
+    /expandStaticFormats:\s*isExplicitPreset \? false\s*:\s*expandStaticFormats/.test(fpCallBlock),
+    "hashing kinds/expandStaticFormats under explicit — which the resolver ignores — hides real double-clicks");
+  check('14.2i route forwards the SAME resolved lists to expandWizardJob (hash and generation cannot drift)',
+    /staticFormats:\s*isExplicitPreset \? resolvedExplicit\.staticFormats\s*:\s*staticFormats/.test(adsSrc) &&
+    /videoFormats:\s*isExplicitPreset \? resolvedExplicit\.videoFormats\s*:\s*videoFormats/.test(adsSrc));
+  check('14.2j route REFUSES an explicit selection that resolves to nothing (no phantom done run)',
+    /NO_GENERATABLE_FORMAT/.test(adsSrc) &&
+    /isExplicitPreset[\s\S]{0,200}!resolvedExplicit\.staticFormats\.length[\s\S]{0,80}!resolvedExplicit\.videoFormats\.length/.test(adsSrc),
+    'otherwise it 202s, expands to zero and settles as terminal `done` — a successful-looking no-op run');
   check('14.2e route forwards all five phase3 (video/director) fields into the fingerprint',
     /directorVariants:\s*phase3\.fields\.directorVariants/.test(fpCallBlock) &&
     /seedPicks:\s*phase3\.fields\.seedPicks/.test(fpCallBlock) &&

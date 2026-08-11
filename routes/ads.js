@@ -44,7 +44,7 @@ const {
   resolveDeriveFromMaster
 } = require('../services/campaignAdsGenerationService');
 const { summarizeEmptyExpansion, REASON: PER_PRODUCT_REASON } = require('../services/perProductReasons');
-const { assertGeneratablePlatformFormat } = require('../services/platformFormats');
+const { assertGeneratablePlatformFormat, resolveExplicitFormats } = require('../services/platformFormats');
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
@@ -74,6 +74,31 @@ const {
   generationGateDecision, normalizeProductIdList, pickSupersedingRun,
   computeRequestFingerprint, renderClaimFingerprint
 } = require('../services/generationGate');
+
+// Operator-facing gate for a multi-select format list (preset 'explicit'),
+// shared by /preview + /generate.
+//
+// This mirrors the two-layer rule already in force for a single
+// platformFormat, and BOTH layers are load-bearing:
+//   * resolvePreset's filterLiveFormats is the MONEY BELT — a coming_soon key
+//     can never reach an Ad payload, whatever a caller sends.
+//   * this assert is the OPERATOR GATE — it says which surface is unavailable
+//     instead of silently queueing fewer sizes than were ticked, which would
+//     read as "generated" while quietly delivering less.
+// An UNKNOWN key deliberately falls through here (same as
+// assertGeneratablePlatformFormat) and is dropped by the belt.
+function assertGeneratableFormatList(list, field) {
+  if (list == null) return;
+  if (!Array.isArray(list)) {
+    const err = new Error(`${field} must be an array of platform format keys`);
+    err.status = 400;
+    throw err;
+  }
+  for (const raw of list) {
+    if (raw == null || String(raw).trim() === '') continue;
+    assertGeneratablePlatformFormat(String(raw).trim());
+  }
+}
 
 // Shared body-field validation for /preview + /generate Phase 3 params.
 // Returns { ok:true, fields } or { ok:false, status, error }.
@@ -216,17 +241,23 @@ router.post('/preview', async (req, res) => {
       // "All static formats" wizard button. See expandWizardJob for what
       // this actually does — each additional format is a separate billable
       // image generation, not a crop. Ignored for named presets.
-      expandStaticFormats = false
+      expandStaticFormats = false,
+      // Operator multi-select surfaces — preset 'explicit' only.
+      staticFormats = [],
+      videoFormats  = []
     } = req.body || {};
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
     if (!templateIds.length) return res.status(400).json({ error: 'templateIds required (at least 1 template)' });
     // Refuse an explicitly named coming_soon format with 400 (not empty/500).
     try {
       if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+      assertGeneratableFormatList(staticFormats, 'staticFormats');
+      assertGeneratableFormatList(videoFormats, 'videoFormats');
     } catch (e) {
       if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
         return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
       }
+      if (e.status === 400) return res.status(400).json({ error: e.message });
       throw e;
     }
 
@@ -255,6 +286,8 @@ router.post('/preview', async (req, res) => {
       includeBrandMatched,
       videoDurationSec,
       expandStaticFormats,
+      staticFormats,
+      videoFormats,
       directorVariants: phase3.fields.directorVariants,
       seedMediaIds: phase3.fields.seedMediaIds,
       seedPicks: phase3.fields.seedPicks,
@@ -311,6 +344,11 @@ router.post('/generate', async (req, res) => {
       // Default false: existing callers get exactly prior behavior.
       // Ignored for named presets (meta_static / meta_all already fan out).
       expandStaticFormats = false,
+      // Operator MULTI-SELECT surfaces — preset 'explicit' ONLY.
+      // MONEY: one billable image generation per staticFormats entry per
+      // concept. videoFormats is clamped to <=1 inside resolvePreset.
+      staticFormats = [],
+      videoFormats  = [],
       // DUPLICATE OVERRIDE — owner 2026-08-10: an identical request is refused,
       // but *"allow them if the user wants"*. The client re-POSTs the same body
       // with confirmDuplicate:true plus the acknowledgedRunId it was handed in
@@ -326,15 +364,49 @@ router.post('/generate', async (req, res) => {
     // Refuse coming_soon before minting a CampaignRun / returning 202.
     try {
       if (platformFormat) assertGeneratablePlatformFormat(platformFormat);
+      assertGeneratableFormatList(staticFormats, 'staticFormats');
+      assertGeneratableFormatList(videoFormats, 'videoFormats');
     } catch (e) {
       if (e.code === 'PLATFORM_FORMAT_COMING_SOON') {
         return res.status(400).json({ error: e.message, code: e.code, platformFormat: e.platformFormat });
       }
+      if (e.status === 400) return res.status(400).json({ error: e.message });
       throw e;
     }
 
     const phase3 = parsePhase3WizardFields(req.body || {});
     if (!phase3.ok) return res.status(phase3.status).json({ error: phase3.error });
+
+    // Normalise the multi-select lists through the SAME resolver the expansion
+    // will use, and hash/forward THOSE rather than the raw body arrays.
+    //
+    // This is a money guard, not hygiene. The duplicate gate exists to catch a
+    // repeat of the same request, and "the same request" has to mean the same
+    // BILLABLE SURFACE SET — not the same JSON. Two bodies that resolve
+    // identically (a video-only key sent in staticFormats and then dropped, a
+    // duplicate tick, two tick orders, junk lists left on a named preset) would
+    // otherwise fingerprint differently, so a genuine double-click would not
+    // register as one and the second click would bill a second full set of
+    // static generations. Static is the unprotected half: its identityDigest is
+    // scoped to generationRunId, so nothing downstream collides.
+    const isExplicitPreset = preset === 'explicit';
+    const resolvedExplicit = isExplicitPreset
+      ? resolveExplicitFormats({ staticFormats, videoFormats })
+      : { staticFormats: [], videoFormats: [], kinds: [] };
+
+    // An explicit selection that resolves to NOTHING must not mint a run. It
+    // would 202, expand to zero and settle as terminal `done` — a run that
+    // looks successful and produced no ads. Reachable whenever the client posts
+    // preset:'explicit' with an empty (or entirely coming_soon / unknown)
+    // selection, which is exactly what an un-ticked picker sends.
+    if (isExplicitPreset
+        && !resolvedExplicit.staticFormats.length
+        && !resolvedExplicit.videoFormats.length) {
+      return res.status(400).json({
+        error: 'Select at least one ad size that is available to generate.',
+        code:  'NO_GENERATABLE_FORMAT'
+      });
+    }
 
     // Per-ad video duration from the wizard. Optional; when present must
     // be an integer 1..15. null/''/absent → service default (standard 8s).
@@ -420,8 +492,21 @@ router.post('/generate', async (req, res) => {
       templateIds,
       preset,
       platformFormat,
-      kinds,
-      expandStaticFormats,
+      // Under 'explicit' the resolver IGNORES both of these (verified: the only
+      // reads of requestedKinds / expandStaticFormats in expandWizardJob are the
+      // two arguments it hands to resolvePreset). Hashing a field the handler
+      // ignores is the false-ALLOW half of the trap in generationGate.js — it
+      // makes two identical-output requests look different and lets a real
+      // double-click through — so they are zeroed on that path.
+      kinds:               isExplicitPreset ? null  : kinds,
+      expandStaticFormats: isExplicitPreset ? false : expandStaticFormats,
+      // The RESOLVED surface sets — what will actually bill. See the
+      // normalisation note above for why the raw arrays must not be hashed.
+      // Empty for every non-explicit preset, which is correct: those presets
+      // ignore the lists entirely, so leftover client state cannot change the
+      // hash of an otherwise-identical request.
+      staticFormats: resolvedExplicit.staticFormats,
+      videoFormats:  resolvedExplicit.videoFormats,
       includeCategoryMatched,
       includeBrandMatched,
       excludePairings,
@@ -659,6 +744,12 @@ router.post('/generate', async (req, res) => {
           includeBrandMatched,
           videoDurationSec: parsedVideoDurationSec,
           expandStaticFormats,
+          // The SAME resolved lists that were fingerprinted. resolveExplicitFormats
+          // is idempotent, so forwarding these rather than the raw arrays changes
+          // nothing about what is generated — it just makes it impossible for the
+          // hashed set and the generated set to drift apart.
+          staticFormats: isExplicitPreset ? resolvedExplicit.staticFormats : staticFormats,
+          videoFormats:  isExplicitPreset ? resolvedExplicit.videoFormats  : videoFormats,
           directorVariants: phase3.fields.directorVariants,
           seedMediaIds: phase3.fields.seedMediaIds,
           seedPicks: phase3.fields.seedPicks,

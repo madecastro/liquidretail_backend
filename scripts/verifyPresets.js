@@ -585,6 +585,322 @@ console.log('\nformatCatalog() — UI catalog for greyed coming-soon cards');
     !(gVideo?.formats || []).some((f) => f.key === 'pmax_video_1_1'));
 }
 
+// ── 'explicit' — operator MULTI-SELECT ──────────────────────────────────
+//
+// The wizard's size cards are checkboxes, so a request names a SET of surfaces.
+// The money shapes of the two sides are deliberately asymmetric, and the video
+// side is asymmetric ACROSS PLATFORMS too. All three rules are pinned here:
+//   STATIC — one billable image generation per surviving surface, on either
+//     platform. Multi is the feature; the dedupe is what stops a repeated key
+//     billing twice.
+//   VIDEO / META — at most ONE master however many Meta aspects were ticked.
+//     CLAUDE.md §2 records multi-aspect Meta video queues as a MEASURED
+//     production money bug (2026-08-01); a multi-select UI is how it returns.
+//   VIDEO / GOOGLE — at most the TWO billable PMax masters (9:16 + 16:9), and
+//     NEVER the derive-only pmax_video_1_1, which is a free crop. Clamping
+//     Google to one would UNDER-generate it; honouring every tick would
+//     OVER-bill Meta. Both directions are money bugs.
+console.log('\nexplicit — operator multi-select');
+{
+  const ex = (staticFormats, videoFormats, opts = {}) =>
+    pf.resolvePreset('explicit', 'meta_feed_1_1', { staticFormats, videoFormats, ...opts });
+
+  check('  explicit is a known preset', pf.PRESET_KEYS.includes('explicit'));
+  check('  explicit is NOT offered as a named platform preset',
+    !Object.values(pf.PLATFORM_PRESET_KEYS).some((l) => l.includes('explicit')));
+
+  // — static: the new capability is an arbitrary SUBSET, incl. exactly two —
+  eq('  explicit 1 static', ex(['meta_feed_1_1'], []).staticFormats, ['meta_feed_1_1']);
+  eq('  explicit 2 static (the case no preset could express)',
+    ex(['meta_feed_1_1', 'meta_stories_9_16'], []).staticFormats,
+    ['meta_feed_1_1', 'meta_stories_9_16']);
+  setEq('  explicit 3 static == META_STATIC_FANOUT', ex(META3, []).staticFormats, META3);
+  eq('  explicit static kinds is [image]', ex(['meta_feed_1_1'], []).kinds, ['image']);
+  eq('  explicit static emits NO video', ex(META3, []).videoFormats, []);
+  // Cross-platform static multi-select — each PMax size is its own bill too.
+  setEq('  explicit can mix Meta + PMax static surfaces',
+    ex([...META3, ...LIVE_PMAX_STATIC], []).staticFormats, [...META3, ...LIVE_PMAX_STATIC]);
+  check('  explicit Meta+PMax static is 6 billable image surfaces',
+    ex([...META3, ...LIVE_PMAX_STATIC], []).staticFormats.length === 6);
+
+  // — static: capability + liveness filtering —
+  eq('  explicit drops a video-ONLY surface from staticFormats',
+    ex(['meta_feed_1_1', 'meta_reels_9_16'], []).staticFormats, ['meta_feed_1_1']);
+  eq('  explicit drops coming_soon from staticFormats',
+    ex(['meta_feed_1_1', 'pmax_16_9'], []).staticFormats, ['meta_feed_1_1']);
+  eq('  explicit drops an UNKNOWN key from staticFormats',
+    ex(['meta_feed_1_1', 'not_a_format'], []).staticFormats, ['meta_feed_1_1']);
+  for (const k of COMING) {
+    eq(`  explicit never emits coming_soon ${k} (static)`, ex([k], []).staticFormats, []);
+    eq(`  explicit never emits coming_soon ${k} (video)`, ex([], [k]).videoFormats, []);
+  }
+
+  // — MONEY: dedupe. A repeated key would be a repeated billable generation —
+  eq('  explicit DEDUPES a repeated static key (money guard)',
+    ex(['meta_feed_1_1', 'meta_feed_1_1'], []).staticFormats, ['meta_feed_1_1']);
+  eq('  explicit dedupes with whitespace/padding',
+    ex(['meta_feed_1_1', ' meta_feed_1_1 '], []).staticFormats, ['meta_feed_1_1']);
+  eq('  explicit drops blanks/nulls', ex(['', null, 'meta_feed_4_5'], []).staticFormats, ['meta_feed_4_5']);
+
+  // — MONEY: the META video clamp (one master) —
+  eq('  explicit 1 Meta video honoured (parity with single)',
+    ex([], ['meta_feed_1_1']).videoFormats, ['meta_feed_1_1']);
+  eq('  explicit 2 Meta video CLAMPED to the master',
+    ex([], ['meta_feed_1_1', 'meta_stories_9_16']).videoFormats, [pf.META_VIDEO_MASTER]);
+  eq('  explicit ALL Meta video CLAMPED to the master',
+    ex([], LIVE_META).videoFormats, [pf.META_VIDEO_MASTER]);
+  eq('  explicit 2 Meta video without the master still clamps to ONE',
+    ex([], ['meta_feed_1_1', 'meta_feed_4_5']).videoFormats, ['meta_feed_1_1']);
+  eq('  explicit drops an image-ONLY surface from videoFormats',
+    ex([], ['pmax_square_1_1', 'meta_feed_1_1']).videoFormats, ['meta_feed_1_1']);
+  eq('  explicit Meta video kinds is [video]', ex([], ['meta_stories_9_16']).kinds, ['video']);
+  eq('  explicit Meta video dedupe cannot defeat the clamp',
+    ex([], ['meta_feed_1_1', 'meta_feed_1_1']).videoFormats, ['meta_feed_1_1']);
+  check('  MONEY: no Meta video selection ever exceeds ONE master',
+    [['meta_feed_1_1'], ['meta_feed_4_5'], ['meta_reels_9_16'], ['meta_stories_9_16'], LIVE_META,
+      ['meta_reels_9_16', 'meta_feed_4_5']]
+      .every((sel) => ex([], sel).videoFormats.filter(
+        (k) => pf.platformForFormat(k) === 'meta').length <= 1));
+
+  // — MONEY: the GOOGLE video rule (two masters, never the derive-only 1:1) —
+  eq('  explicit ALL PMax video → the TWO billable masters, canonical order',
+    ex([], LIVE_PMAX_VIDEO).videoFormats, GOOGLE_VIDEO_MASTERS_EXPECTED);
+  eq('  explicit 1 PMax master honoured alone',
+    ex([], ['pmax_video_16_9']).videoFormats, ['pmax_video_16_9']);
+  eq('  explicit the OTHER PMax master honoured alone',
+    ex([], ['pmax_video_9_16']).videoFormats, ['pmax_video_9_16']);
+  eq('  MONEY: derive-only pmax_video_1_1 alone resolves to NOTHING (never a 3rd submit)',
+    ex([], ['pmax_video_1_1']).videoFormats, []);
+  eq('  MONEY: derive-only pmax_video_1_1 is stripped from a full PMax tick',
+    ex([], LIVE_PMAX_VIDEO).videoFormats.filter((k) => k === 'pmax_video_1_1'), []);
+  check('  MONEY: no Google video selection ever exceeds the TWO masters',
+    [['pmax_video_1_1'], ['pmax_video_9_16'], ['pmax_video_16_9'], LIVE_PMAX_VIDEO]
+      .every((sel) => {
+        const g = ex([], sel).videoFormats.filter((k) => pf.platformForFormat(k) === 'google');
+        return g.length <= 2 && g.every((k) => GOOGLE_VIDEO_MASTERS_EXPECTED.includes(k));
+      }));
+
+  // — cross-platform video: each platform's rule applies independently —
+  {
+    const r = ex([], [...LIVE_META, ...LIVE_PMAX_VIDEO]);
+    eq('  explicit Meta+PMax video → 1 Meta master + 2 Google masters',
+      r.videoFormats, [pf.META_VIDEO_MASTER, ...GOOGLE_VIDEO_MASTERS_EXPECTED]);
+    check('  that is exactly 3 billable video submits, not 7 ticks', r.videoFormats.length === 3);
+    check('  and it still excludes the derive-only key',
+      !r.videoFormats.includes('pmax_video_1_1'));
+  }
+
+  // — mixed + empty —
+  const mixed = ex(META3, LIVE_META);
+  setEq('  explicit mixed static list', mixed.staticFormats, META3);
+  eq('  explicit mixed video stays ONE (Meta only)', mixed.videoFormats, [pf.META_VIDEO_MASTER]);
+  eq('  explicit mixed kinds', mixed.kinds, ['image', 'video']);
+  eq('  explicit empty lists → no static', ex([], []).staticFormats, []);
+  eq('  explicit empty lists → no video', ex([], []).videoFormats, []);
+  eq('  explicit empty lists → no kinds (nothing queued)', ex([], []).kinds, []);
+  eq('  explicit non-array static → []', ex('meta_feed_1_1', []).staticFormats, []);
+  eq('  explicit non-array video → []', ex([], 'meta_feed_1_1').videoFormats, []);
+  eq('  explicit undefined lists → no kinds', pf.resolvePreset('explicit', 'meta_feed_1_1').kinds, []);
+
+  // — explicit must IGNORE the three-knob opts; the lists are the whole truth —
+  eq('  explicit ignores kinds:video on a static list',
+    ex(['meta_feed_1_1'], [], { kinds: 'video' }).staticFormats, ['meta_feed_1_1']);
+  eq('  explicit ignores kinds:image on a video list',
+    ex([], ['meta_stories_9_16'], { kinds: 'image' }).videoFormats, ['meta_stories_9_16']);
+  eq('  explicit ignores expandStaticFormats (no fan-out beyond the ticks)',
+    ex(['meta_feed_1_1'], [], { expandStaticFormats: true }).staticFormats, ['meta_feed_1_1']);
+
+  // — explicit must not perturb the OTHER presets (additive proof) —
+  eq('  passing explicit opts to meta_static changes nothing',
+    pf.resolvePreset('meta_static', 'meta_feed_1_1', { staticFormats: ['meta_feed_1_1'], videoFormats: LIVE_META }).staticFormats,
+    pf.resolvePreset('meta_static', 'meta_feed_1_1').staticFormats);
+  eq('  passing explicit opts to meta_video changes nothing',
+    pf.resolvePreset('meta_video', 'meta_feed_1_1', { staticFormats: META3, videoFormats: LIVE_META }).videoFormats,
+    pf.resolvePreset('meta_video', 'meta_feed_1_1').videoFormats);
+  eq('  passing explicit opts to google_video changes nothing',
+    pf.resolvePreset('google_video', 'meta_feed_1_1', { videoFormats: ['pmax_video_1_1'] }).videoFormats,
+    pf.resolvePreset('google_video', 'meta_feed_1_1').videoFormats);
+  eq('  passing explicit opts to single changes nothing',
+    pf.resolvePreset('single', 'meta_feed_1_1', { kinds: 'image', staticFormats: META3, videoFormats: LIVE_META }).staticFormats,
+    pf.resolvePreset('single', 'meta_feed_1_1', { kinds: 'image' }).staticFormats);
+}
+
+// ── explicit: ORDER-INSENSITIVITY of the video clamp ────────────────────
+// Found by adversarial review, and it was a REAL defect: the clamp used to be
+// first-ticked-wins, while the duplicate gate hashes the video list as a SET.
+// So ['a','b'] and ['b','a'] queued DIFFERENT video plates under ONE
+// fingerprint, and the second request was refused as a duplicate of a run that
+// had generated something else. Resolution must be a pure function of the SET.
+console.log('\nexplicit — video resolution is order-insensitive (gate hashes a set)');
+{
+  const vid = (list) => pf.resolvePreset('explicit', 'meta_feed_1_1', { videoFormats: list }).videoFormats;
+  const pairs = [
+    ['meta_feed_1_1', 'meta_feed_4_5'],
+    ['meta_feed_1_1', 'meta_reels_9_16'],
+    ['meta_feed_4_5', 'meta_reels_9_16'],
+    ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16'],
+    ['pmax_video_9_16', 'pmax_video_16_9'],
+    ['pmax_video_1_1', 'pmax_video_16_9'],
+    ['meta_feed_1_1', 'pmax_video_16_9']
+  ];
+  for (const p of pairs) {
+    eq(`  ${p.join('+')} same result in both tick orders`, vid(p), vid([...p].reverse()));
+  }
+  // With the Meta master ticked, the master always wins regardless of position.
+  for (const p of [
+    ['meta_stories_9_16', 'meta_feed_1_1'],
+    ['meta_feed_1_1', 'meta_stories_9_16'],
+    ['meta_feed_1_1', 'meta_stories_9_16', 'meta_reels_9_16']
+  ]) {
+    eq(`  Meta master wins in ${p.join('+')}`, vid(p), [pf.META_VIDEO_MASTER]);
+  }
+  // Full permutation sweep over every live video-capable surface: every
+  // permutation of every subset must resolve identically.
+  const liveVideo = pf.LIVE_PLATFORM_FORMAT_KEYS.filter(
+    (k) => pf.kindsForPlatformFormat(k).includes('video')
+  );
+  const perms = (arr) => arr.length <= 1 ? [arr]
+    : arr.flatMap((x, i) => perms([...arr.slice(0, i), ...arr.slice(i + 1)]).map((p) => [x, ...p]));
+  let orderBreak = null;
+  const subsetsOf = (arr) => arr.reduce((acc, x) => acc.concat(acc.map((s) => [...s, x])), [[]]);
+  for (const s of subsetsOf(liveVideo)) {
+    if (s.length < 2 || s.length > 4) continue; // 5!+ permutations adds cost, not coverage
+    const expected = JSON.stringify(vid(s));
+    for (const p of perms(s)) {
+      if (JSON.stringify(vid(p)) !== expected) orderBreak = p.join('+');
+    }
+  }
+  check(`  every permutation of every live video subset (size 2-4) resolves identically${orderBreak ? ` (broke on ${orderBreak})` : ''}`,
+    orderBreak === null);
+}
+
+// ── resolveExplicitFormats is the SHARED normaliser ─────────────────────
+// The route uses it to normalise a body before fingerprinting, so that two
+// bodies which resolve to the same billable set hash the same. If it stopped
+// agreeing with resolvePreset('explicit'), the gate would go back to hashing
+// something the expansion does not generate.
+console.log('\nresolveExplicitFormats — shared by route + resolver, idempotent');
+{
+  check('  exported', typeof pf.resolveExplicitFormats === 'function');
+  const cases = [
+    { staticFormats: ['meta_feed_1_1'], videoFormats: [] },
+    { staticFormats: ['meta_feed_1_1', 'meta_reels_9_16'], videoFormats: [] },
+    { staticFormats: META3, videoFormats: LIVE_META },
+    { staticFormats: [...META3, ...LIVE_PMAX_STATIC], videoFormats: [...LIVE_META, ...LIVE_PMAX_VIDEO] },
+    { staticFormats: ['meta_feed_1_1', 'meta_feed_1_1', 'pmax_16_9', 'nope'], videoFormats: ['meta_feed_4_5', 'meta_feed_1_1'] },
+    { staticFormats: [], videoFormats: ['pmax_video_1_1'] },
+    { staticFormats: [], videoFormats: [] }
+  ];
+  for (const c of cases) {
+    const viaHelper = pf.resolveExplicitFormats(c);
+    const viaPreset = pf.resolvePreset('explicit', 'meta_feed_1_1', c);
+    eq(`  helper == resolvePreset('explicit') static ${JSON.stringify(c.staticFormats)}`,
+      viaHelper.staticFormats, viaPreset.staticFormats);
+    eq(`  helper == resolvePreset('explicit') video ${JSON.stringify(c.videoFormats)}`,
+      viaHelper.videoFormats, viaPreset.videoFormats);
+    // IDEMPOTENT: feeding a resolved result back in must be a no-op, which is
+    // what lets the route forward the normalised lists to the expansion.
+    const again = pf.resolveExplicitFormats(viaHelper);
+    eq(`  idempotent static ${JSON.stringify(c.staticFormats)}`, again.staticFormats, viaHelper.staticFormats);
+    eq(`  idempotent video ${JSON.stringify(c.videoFormats)}`, again.videoFormats, viaHelper.videoFormats);
+  }
+  // The specific collapse the gate depends on: a video-only key sent in
+  // staticFormats is dropped, so these two bodies must normalise identically.
+  eq('  a dropped video-only static key normalises to the same set',
+    pf.resolveExplicitFormats({ staticFormats: ['meta_feed_1_1', 'meta_reels_9_16'] }).staticFormats,
+    pf.resolveExplicitFormats({ staticFormats: ['meta_feed_1_1'] }).staticFormats);
+  // And the derive-only video key, same reasoning.
+  eq('  a dropped derive-only video key normalises to the same set',
+    pf.resolveExplicitFormats({ videoFormats: ['pmax_video_16_9', 'pmax_video_1_1'] }).videoFormats,
+    pf.resolveExplicitFormats({ videoFormats: ['pmax_video_16_9'] }).videoFormats);
+}
+
+// ── THE VIDEO INVARIANT, PER PLATFORM ───────────────────────────────────
+// The rule is NOT a global count — Meta ships one master, PMax legitimately
+// ships two — so the sweep asserts each platform's own ceiling, plus the
+// absolute rules that hold everywhere: never a coming_soon key, and never the
+// derive-only pmax_video_1_1 (which would be a third billable Omni submit).
+console.log('\ninvariant — per-platform video ceilings on every preset, any input');
+{
+  const ALL_KEYS = [...pf.PLATFORM_FORMAT_KEYS, 'not_a_format'];
+  let metaBreak = null, googleBreak = null, deriveLeak = null, comingLeak = null;
+  // ⚠️ 'single' is EXCLUDED from the video ceilings below, and not because the
+  // ceilings do not apply to it — because it VIOLATES them on main today, and
+  // that is a PRE-EXISTING defect this change did not introduce:
+  //
+  //   resolvePreset('single', 'pmax_video_1_1', { kinds: 'video' })
+  //     → { videoFormats: ['pmax_video_1_1'] }
+  //
+  // pmax_video_1_1 is documented DERIVE-ONLY ("never an Omni submit",
+  // GOOGLE_VIDEO_FANOUT) and google_video / google_all correctly exclude it, but
+  // the 'single' branch emits any live video-capable platformFormat verbatim. It
+  // is REACHABLE: Phase A made the key live, and the wizard's format picker
+  // offers every live surface, so naming that surface bills a real Omni submit
+  // for what is meant to be a free crop of the 9:16 master. Verified against an
+  // UNMODIFIED origin/main, so it is not an artefact of this branch.
+  //
+  // Left unfixed here ON PURPOSE — it belongs to the PMax Phase A work, and
+  // silently changing another feature's money behaviour inside a formats-UI
+  // change is how a fix becomes invisible. Reported separately. The 'explicit'
+  // path (which this change owns) never emits it, and the frontend does not
+  // offer a video tick on it, both of which ARE asserted below.
+  const SINGLE_DERIVE_ONLY_BUG = 'single';
+  for (const preset of pf.PRESET_KEYS) {
+    for (const kinds of [null, 'image', 'video', 'both']) {
+      for (const expandStaticFormats of [false, true]) {
+        for (const platformFormat of pf.LIVE_PLATFORM_FORMAT_KEYS) {
+          if (preset === SINGLE_DERIVE_ONLY_BUG) continue;
+          const r = pf.resolvePreset(preset, platformFormat, {
+            kinds, expandStaticFormats,
+            staticFormats: ALL_KEYS, videoFormats: ALL_KEYS
+          });
+          const v = r.videoFormats || [];
+          const label = `${preset}/${platformFormat}/${kinds}/${expandStaticFormats}`;
+          if (v.filter((k) => pf.platformForFormat(k) === 'meta').length > 1) metaBreak = label;
+          const g = v.filter((k) => pf.platformForFormat(k) === 'google');
+          if (g.length > 2 || !g.every((k) => GOOGLE_VIDEO_MASTERS_EXPECTED.includes(k))) googleBreak = label;
+          if (v.includes('pmax_video_1_1')) deriveLeak = label;
+          for (const k of [...(r.staticFormats || []), ...v]) {
+            if (!pf.isLiveFormat(k)) comingLeak = `${label}:${k}`;
+          }
+        }
+      }
+    }
+  }
+  check(`  MONEY: no preset emits more than ONE Meta video master${metaBreak ? ` (broke on ${metaBreak})` : ''}`,
+    metaBreak === null);
+  check(`  MONEY: no preset emits more than the TWO billable Google masters${googleBreak ? ` (broke on ${googleBreak})` : ''}`,
+    googleBreak === null);
+  check(`  MONEY: no preset ever emits the derive-only pmax_video_1_1${deriveLeak ? ` (broke on ${deriveLeak})` : ''}`,
+    deriveLeak === null,
+    'a derive-only surface in videoFormats is a third billable Omni submit for a free crop');
+  check(`  no preset leaks a coming_soon key under any input${comingLeak ? ` (leaked ${comingLeak})` : ''}`,
+    comingLeak === null);
+
+  // The named Google presets are the reference for the ceiling above — pin them
+  // so a change there has to come here too.
+  eq('  google_video == the two billable masters',
+    pf.resolvePreset('google_video', 'meta_feed_1_1').videoFormats, GOOGLE_VIDEO_MASTERS_EXPECTED);
+  eq('  google_all == the two billable masters',
+    pf.resolvePreset('google_all', 'meta_feed_1_1').videoFormats, GOOGLE_VIDEO_MASTERS_EXPECTED);
+
+  // The excluded case, pinned EXPLICITLY so the pre-existing defect is recorded
+  // in the harness rather than only in a comment. This asserts what main DOES
+  // today, and is labelled so that whoever fixes it sees exactly what to delete.
+  // If it starts failing, the bug was fixed — remove this check and the
+  // SINGLE_DERIVE_ONLY_BUG exclusion above in the same commit.
+  check("  KNOWN PRE-EXISTING (PMax Phase A, not this change): preset 'single' on " +
+        'pmax_video_1_1 still emits the derive-only key as a billable video format',
+    pf.resolvePreset('single', 'pmax_video_1_1', { kinds: 'video' })
+      .videoFormats.includes('pmax_video_1_1'),
+    'if this now FAILS the defect is fixed — drop this check and the sweep exclusion');
+  // What this change DOES own: explicit never emits it, from any tick set.
+  check("  and 'explicit' never emits it, however it is ticked",
+    [['pmax_video_1_1'], LIVE_PMAX_VIDEO, [...LIVE_META, ...LIVE_PMAX_VIDEO]]
+      .every((sel) => !pf.resolveExplicitFormats({ videoFormats: sel })
+        .videoFormats.includes('pmax_video_1_1')));
+}
+
 // ── static fan-out still holds (regression guard) ───────────────────────
 console.log('\nstatic fan-out still money-safe');
 for (const k of META3) {
