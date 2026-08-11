@@ -1409,7 +1409,72 @@ to that entry's index instead of a parallel single-tile hack. `tsc -b --noEmit` 
 
 ## Next-session prompt
 
-**START HERE — 2026-08-11 post-Phase-B addendum on branch
+**NEWEST — 2026-08-11: the wizard format picker is MULTI-SELECT. SHIPPED,
+MERGED AND DEPLOYED to both services and to staging. Verified live.**
+
+Three owner-reported UI fixes. Backend PR #124 (`b8eab009`, live on web
+`srv-d1vuktqli9vc73ft07ng` + worker `srv-d8128c1o3t8c73e8kb30`); frontend
+`liquidretail` PR #41 (`1e9e404`, bundle `index-DXIQ6hIA.js` on
+staging.reach-social.io). **Backend was merged and confirmed live BEFORE the
+frontend** — mandatory ordering, because `resolvePreset` throws on an unknown
+preset and the wizard now posts `preset:'explicit'`.
+
+1. **`resolvePreset` gained `explicit`** — resolves exactly the surfaces named in
+   `staticFormats[]`/`videoFormats[]`. Static bills PER SURFACE (intended — the
+   image model typesets copy into the pixels, so a size is never a crop).
+   **Video is clamped PER PLATFORM, not to a global count:** at most ONE Meta
+   master, at most the TWO real PMax masters, and NEVER the derive-only
+   `pmax_video_1_1`. A global "clamp to one" would UNDER-generate PMax; honouring
+   every tick would OVER-bill Meta. `resolveExplicitFormats` owns the rule and is
+   exported so the route shares it.
+2. **The duplicate gate now hashes the RESOLVED set, not the request body.** This
+   was the money-critical finding of an adversarial review. Bodies that resolve
+   identically (a video-only key dropped from `staticFormats`, a duplicate tick,
+   two tick orders, junk lists on a named preset, `kinds` under a preset that
+   ignores it) used to fingerprint DIFFERENTLY, so a real double-click did not
+   register and the second click billed a second full set of statics. Static is
+   the unprotected half — its `identityDigest` is scoped to `generationRunId`, so
+   no unique index catches it. Route normalises through the same
+   `resolveExplicitFormats` the expansion uses and zeroes the fields `explicit`
+   ignores (verified: `requestedKinds`/`expandStaticFormats` are read nowhere but
+   the `resolvePreset` call). **`FINGERPRINT_VERSION` v1 → v2.**
+3. **`explicit` resolving to nothing is a 400 `NO_GENERATABLE_FORMAT`** instead of
+   a 202 that expands to zero and settles as terminal `done`.
+
+Verified live against staging (free `/preview`, plus a `/generate` that 400s
+before minting): multi-select body → **200**; empty selection → **400
+NO_GENERATABLE_FORMAT**; ticked `google_demandgen_1_1` → **400
+PLATFORM_FORMAT_COMING_SOON**. In the browser: two sizes stay lit together, both
+"All static formats (6 sizes)" and "All video formats (3 masters)" light up
+simultaneously, "PMax Video Square" shows **Included free** and stays unlit, and
+"+ New campaign" opens the Quick Campaign Builder. **Generate was never clicked —
+no billable run was made.**
+
+Harnesses: `verifyPresets` **585** (was 470), `verifyGenerationGate` **224** (was
+194); suite **85, 0 failing**; 11 revert-proven mutations.
+
+⚠️ **OPEN, and it is a real money bug someone else owns —
+`resolvePreset('single','pmax_video_1_1',{kinds:'video'})` returns the
+DERIVE-ONLY key as a billable videoFormat.** Confirmed against an UNMODIFIED
+`origin/main`, so it came in with PMax Phase A, not with this change. Phase A made
+that key **live** and the picker offers every live surface, so selecting "PMax
+Video Square" bills a real Omni submit for what is meant to be a free crop of the
+9:16. `verifyPresets` pins it as `KNOWN PRE-EXISTING` and excludes `single` from
+the new per-platform sweep (search `SINGLE_DERIVE_ONLY_BUG`) — **delete that
+exclusion and that check in the same commit that fixes it.** The `explicit` path
+never emits it and the frontend never offers it, both asserted. Decide whether a
+named derive-only surface should resolve to its platform's master or be refused
+like `coming_soon`; the latter is more honest but needs a frontend change.
+
+⚠️ **One product judgement to confirm with the owner:** "All static formats" /
+"All video formats" cover **all live surfaces on BOTH platforms**, which is the
+literal reading now that PMax is live — so All static is **6** image generations
+per concept (3 Meta + 3 PMax), not 3. The badge says `6 sizes` and the spend line
+says so before the click, but it may want scoping to Meta.
+
+---
+
+**2026-08-11 post-Phase-B addendum on branch
 `feat/pmax-surfaces-phase-a2`.** Phase A (surfaces/money shape) + Phase B
 (creative prompts / Yt zones / Director funnel) are documented; this block is
 the handoff **after** adversarial review + video cost reconcile. Full write-up:
