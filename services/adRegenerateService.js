@@ -116,10 +116,15 @@ function parseRegenVideoPromptFields(body = {}) {
     if (typeof rawIn !== 'string') {
       return { ok: false, error: 'videoPromptRaw must be a string' };
     }
-    if (rawIn.length > VIDEO_PROMPT_RAW_MAX) {
+    // BYTES, not .length (UTF-16 code units) — matches the fix in routes/ads.js
+    // parsePhase3WizardFields. This ceiling protects the tightest selectable model's byte
+    // policy; a char count under-protects non-ASCII overrides (4000 CJK characters can exceed
+    // 4096 bytes on their own). The numeric value (4000) is unchanged — only the unit was wrong.
+    const rawBytes = Buffer.byteLength(rawIn, 'utf8');
+    if (rawBytes > VIDEO_PROMPT_RAW_MAX) {
       return {
         ok: false,
-        error: `videoPromptRaw must be a string ≤${VIDEO_PROMPT_RAW_MAX} characters`
+        error: `videoPromptRaw must be at most ${VIDEO_PROMPT_RAW_MAX} bytes (got ${rawBytes})`
       };
     }
     const t = rawIn.trim();

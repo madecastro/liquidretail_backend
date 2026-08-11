@@ -71,6 +71,14 @@ const inFlight = require('../services/inFlight');
 const { adStage } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
+// Only the two constants — not a model-resolution import. This validator runs before any
+// product/brand/model is known (a single wizard run can resolve DIFFERENT models per ad), so it
+// cannot enforce a real per-model cap. It can enforce a shared FLOOR under the tightest model
+// policy, which is what these two numbers already encode; see the comment at
+// parsePhase3WizardFields for why the real money gate lives elsewhere
+// (atlasVideoService.promptCapViolation, called at submit time once a model is resolved).
+const { DEFAULT_BYTE_CAP: PROMPT_POLICY_BYTE_CAP, BYTE_CAP_MARGIN: PROMPT_POLICY_BYTE_MARGIN } =
+  require('../services/veoPromptBuilder');
 const {
   generationGateDecision, normalizeProductIdList, pickSupersedingRun,
   computeRequestFingerprint, renderClaimFingerprint
@@ -125,8 +133,20 @@ function parsePhase3WizardFields(body = {}) {
     }
   }
   if (videoPromptRaw != null && videoPromptRaw !== '') {
-    if (typeof videoPromptRaw !== 'string' || videoPromptRaw.length > 4000) {
-      return { ok: false, status: 400, error: 'videoPromptRaw must be a string ≤4000 characters' };
+    // BYTES, not .length (UTF-16 code units) — the model-side caps this protects against are all
+    // byte caps (Grok-class: 4096 bytes product policy; Omni: 20,000 CHARS, which this floor sits
+    // safely under regardless). A char-based check under-protected non-ASCII overrides: 4000 CJK
+    // characters can exceed 4096 bytes on their own. Floor = the tightest model policy minus the
+    // same safety margin veoPromptBuilder applies before a real submit — not a per-model check
+    // (no model is resolved here), just a shared pre-resolution ceiling.
+    const rawBytes = typeof videoPromptRaw === 'string' ? Buffer.byteLength(videoPromptRaw, 'utf8') : Infinity;
+    const rawCap = PROMPT_POLICY_BYTE_CAP - PROMPT_POLICY_BYTE_MARGIN;
+    if (typeof videoPromptRaw !== 'string' || rawBytes > rawCap) {
+      return {
+        ok: false, status: 400,
+        error: `videoPromptRaw must be a string of at most ${rawCap} bytes (got ${Number.isFinite(rawBytes) ? rawBytes : 'n/a'}) — ` +
+          `this is a shared floor under every selectable model's policy, not any one model's real limit`
+      };
     }
   }
   if (seedMediaIds != null && seedMediaIds !== undefined) {
@@ -3959,3 +3979,6 @@ module.exports.requeueStrandedAds = requeueStrandedAds;
 // check alone would pass against a reimplementation that kept the name,
 // so the harness calls the real function.
 module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;
+// Pure body validator, exported for scripts/verifyPromptCapGuard.js so the byte-vs-char
+// boundary can be driven directly rather than reimplemented in the harness.
+module.exports.parsePhase3WizardFields = parsePhase3WizardFields;

@@ -3164,7 +3164,39 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
   }
 }
 
+// THE MONEY FIREWALL for prompt size. veoPromptBuilder's enforceByteCap (composed prompts) and
+// enforceRawByteCap (operator raw-prompt override) both fail OPEN on purpose when they can't get
+// under cap after dropping optional sections — enforceByteCap logs "Atlas will reject" and returns
+// the over-cap string anyway; nothing before this point throws. routes/ads.js's 4000-char check is
+// a pure body validator with no model context (a wizard run can resolve DIFFERENT models per ad),
+// so it cannot be the real gate either — it is a loose, model-agnostic floor, not a cap.
+//
+// This is therefore the one place a model IS resolved and the actual bytes that would be POSTed
+// are known, so it is the only correct place to refuse. Pure and exported so
+// scripts/verifyPromptCapGuard.js can assert the boundary directly, without touching axios or
+// BASE_URL — submitGeneration itself is not exported, on purpose, to keep the network path out of
+// the harness's reach.
+function promptCapViolation(prompt, caps) {
+  const cap = caps?.promptByteCap;
+  if (!Number.isFinite(cap)) return null;   // no known cap for this model — nothing to enforce
+  const bytes = Buffer.byteLength(String(prompt ?? ''), 'utf8');
+  return bytes > cap ? { bytes, cap } : null;
+}
+
 async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null }) {
+  // Refuse BEFORE the billable POST. Every submit-once/never-auto-retry guarantee downstream
+  // (pacedModelSubmit, isDefinite429, maxRedirects:0) exists to protect a call that is worth
+  // making — a prompt already known to exceed the model's cap is not, and submitting it anyway
+  // donates a billable Atlas call to a request the builder already predicted would be rejected.
+  const violation = promptCapViolation(prompt, caps);
+  if (violation) {
+    throw new Error(
+      `atlasVideo: prompt is ${violation.bytes} bytes, over ${model}'s ${violation.cap}-byte cap — ` +
+      `refusing to submit a call Atlas will reject. Shorten the raw prompt or pin this product to ` +
+      `a model with more headroom (Omni: 20,000 chars).`
+    );
+  }
+
   const body = buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
 
   // refs= reports what the model RECEIVES, and names the assembled count too
@@ -3954,5 +3986,8 @@ module.exports = {
   // Resume-from-receipt. Exported for scripts/verifyVideoResume.js, which pins
   // that neither of these can ever submit.
   peekPrediction,
-  resumeForAd
+  resumeForAd,
+  // Prompt-size money firewall — exported for scripts/verifyPromptCapGuard.js.
+  // submitGeneration itself stays unexported so the harness cannot reach axios.
+  promptCapViolation
 };

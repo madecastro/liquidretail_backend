@@ -590,6 +590,10 @@ module.exports = {
   PROMPT_PROFILES,
   enforceRawByteCap,
   enforceByteCap,
+  // routes/ads.js's pre-model-resolution validator derives its floor from these — see the
+  // comment at parsePhase3WizardFields. Exported rather than restated so the two stay in sync.
+  DEFAULT_BYTE_CAP,
+  BYTE_CAP_MARGIN,
   isPmaxVideoDestination,
   isPmaxVideoDirectivesEnabled,
   directivesForProfile,
