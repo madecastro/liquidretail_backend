@@ -48,6 +48,7 @@ const directImage           = require('./directImageRenderService');
 // see its doc comment in campaignAdsGenerationService.
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
+const ugcVideoPipeline             = require('./ugcVideoPipeline');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
@@ -678,35 +679,82 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
   if (path === 'raw') {
     console.log(`🔁 regenerate[ad=${adId}]: videoPromptRaw active — canonical directives will be bypassed`);
   }
-  const { storyboard } = await veoService.prepareStoryboard({
-    ad: adForGen,
-    operatorPrompt,
-    modelOverride: videoModel
-  });
 
-  if (storyboard) {
-    await Ad.updateOne({ _id: adId }, { $set: { veoStoryboard: storyboard, updatedAt: new Date() } });
+  // UGC-ads Phase 5 — same passthrough gate as the mint-time render path.
+  // Regenerate is the money-critical case: a UGC video ad that ships to
+  // production and is regenerated once looks like TWO Omni submits (~$6)
+  // without this branch. The wizard's regenerate button is one click away
+  // from Ad.mediaId already being a UGC video, so this is not theoretical.
+  //
+  // A passthrough success writes veoVideoUrl directly and skips the
+  // veoService calls entirely; skip writes a terminal failed state so
+  // the regen UI shows the reason instead of a hung "Re-rolling video…".
+  const ugcSourceMedia = ad1?.mediaId
+    ? await Media.findById(ad1.mediaId).select('_id fileType fileUrl source matchedProducts matchedCategories brandingAssignment promotionalAssignment').lean()
+    : null;
+  const ugcPass = ugcSourceMedia
+    ? await ugcVideoPipeline.preparePassthroughMaster({
+        media:       ugcSourceMedia,
+        aspectRatio: ad1?.aspectRatio || '9:16',
+        durationSec: 8
+      })
+    : { passthrough: false, reason: 'no source Media' };
+
+  let veoResult;
+  if (ugcPass.passthrough) {
+    console.log(
+      `🔁 regenerate[ad=${adId}]: ugc-video passthrough → skip Omni ` +
+      `(mirrored=${ugcPass.mirrored}, aspect=${ugcPass.aspectRatio})`
+    );
+    veoResult = {
+      videoUrl:        ugcPass.videoUrl,
+      aspectRatio:     ugcPass.aspectRatio,
+      prompt:          null,
+      storyboard:      null,
+      model:           null,
+      referenceImages: []
+    };
+  } else if (ugcPass.skip) {
+    // Skip is terminal for this regenerate — do NOT fall through to Omni
+    // (would be a silent double-charge on a mirror failure). Throw so the
+    // outer regenerate handler flips status to failed with the message,
+    // matching how a `veoResult.skipped` throw is handled at :700 below.
+    throw new Error(`Ugc video passthrough skipped: ${ugcPass.reason}`);
+  } else {
+    // Passthrough declined (flag off, not eligible, etc.) — proceed with
+    // the existing Omni submit path.
+    const { storyboard } = await veoService.prepareStoryboard({
+      ad: adForGen,
+      operatorPrompt,
+      modelOverride: videoModel
+    });
+
+    if (storyboard) {
+      await Ad.updateOne({ _id: adId }, { $set: { veoStoryboard: storyboard, updatedAt: new Date() } });
+    }
+
+    // Stage 2 — new base video (model per override → settings → default).
+    // ONE billable submit inside generateForAd; prompt overrides do not
+    // add or remove submits.
+    veoResult = await veoService.generateForAd({
+      ad: adForGen,
+      operatorPrompt,
+      storyboard,
+      modelOverride: videoModel
+    });
+    if (veoResult.skipped) throw new Error(`Veo skipped: ${veoResult.reason}`);
+    veoResult.storyboard = veoResult.storyboard || storyboard || null;
   }
 
-  // Stage 2 — new base video (model per override → settings → default).
-  // ONE billable submit inside generateForAd; prompt overrides do not
-  // add or remove submits.
-  const veoResult = await veoService.generateForAd({
-    ad: adForGen,
-    operatorPrompt,
-    storyboard,
-    modelOverride: videoModel
-  });
-  if (veoResult.skipped) throw new Error(`Veo skipped: ${veoResult.reason}`);
-
   // Stamp the raw render before chrome so a chrome failure still
-  // leaves a viewable fallback (the bare Grok video).
+  // leaves a viewable fallback (the bare Grok video, or the raw UGC
+  // segment on the passthrough path).
   await Ad.updateOne({ _id: adId }, {
     $set: {
       veoVideoUrl:    veoResult.videoUrl,
       veoAspectRatio: veoResult.aspectRatio || null,
       veoPrompt:      veoResult.prompt || null,
-      veoStoryboard:  veoResult.storyboard || storyboard || null,
+      veoStoryboard:  veoResult.storyboard || null,
       veoModel:       veoResult.model || null,
       veoReferenceImages: veoResult.referenceImages || [],
       renderUrl:      veoResult.videoUrl,

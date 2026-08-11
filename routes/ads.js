@@ -48,6 +48,7 @@ const { assertGeneratablePlatformFormat, resolveExplicitFormats } = require('../
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
+const ugcVideoPipeline = require('../services/ugcVideoPipeline');
 
 // Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
 // Bound waits so a permanently-missing master cannot spin forever across
@@ -1934,8 +1935,62 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       let veoVideoUrl, veoAspectRatio, veoPrompt = null, veoStoryboard = null, veoCloudinaryPublicId = null;
       let veoModel = null;   // stays null on the Cloudinary-segment path — no model ran
       let veoReferenceImages = [];
+      // UGC-ads Phase 5 — passthrough skip signal. Set when the ugcVideo
+      // pipeline determined the ad should be skipped (mirror failed,
+      // segment build failed). The dispatcher HANDLES the skip explicitly
+      // below rather than falling through to Omni, because a fall-through
+      // is exactly the surprise-$3-charge scenario the phase exists to
+      // close. Null when passthrough succeeded OR was declined for a
+      // non-fatal reason (flag off, not a UGC video, etc.) — the flag-off
+      // + not-eligible cases proceed to the existing branch below.
+      let ugcPassthroughSkip = null;
 
+      // UGC-ads Phase 5 — before the existing isVideoSeed branch, ask the
+      // ugcVideoPipeline whether this ad qualifies for the mirror-and-
+      // passthrough short-path. The service handles:
+      //   • kill switch check (UGC_VIDEO_PASSTHROUGH, default OFF)
+      //   • UGC-video eligibility (fileType='video' + UGC source or
+      //     operator/branding/promotional assignment)
+      //   • Cloudinary mirror if URL isn't already hosted there
+      //   • segment URL construction
+      // Only takes effect when passthrough succeeds; otherwise flow
+      // continues into the existing isVideoSeed / Grok branches below.
       if (isVideoSeed) {
+        const ugcResult = await ugcVideoPipeline.preparePassthroughMaster({
+          media:         sourceMedia,
+          aspectRatio:   ad.aspectRatio || '9:16',
+          durationSec:   8
+        });
+        if (ugcResult.passthrough) {
+          veoVideoUrl    = ugcResult.videoUrl;
+          veoAspectRatio = ugcResult.aspectRatio;
+          adStage(adId, ugcResult.mirrored
+            ? 'ugc-video mirrored + passthrough (no generation)'
+            : 'ugc-video passthrough (no generation)');
+          console.log(
+            `🎬 [ugc-video] ad=${adId} passthrough → skip Omni ` +
+            `(mirrored=${ugcResult.mirrored}, aspect=${veoAspectRatio})`
+          );
+        } else if (ugcResult.skip) {
+          // Mirror failed or segment build failed — do NOT silently fall
+          // through to Omni (would be a surprise ~$3 charge). Skip the
+          // ad, let the operator retry.
+          ugcPassthroughSkip = ugcResult;
+          console.warn(
+            `⚠️  [ugc-video] ad=${adId} passthrough SKIP: ${ugcResult.code} — ${ugcResult.reason}`
+          );
+        }
+        // else: not eligible / flag off — fall through to the existing
+        // Cloudinary-segment or Grok branch below.
+      }
+
+      // Existing Cloudinary-segment branch — kept as the second attempt
+      // when Phase 5 declined (flag off or not a UGC video). Fires for
+      // catalog-product videos and for any video-seed path that isn't
+      // routed through the ugcVideoPipeline. Non-Cloudinary URL still
+      // warns + falls through to Grok — that is the pre-Phase-5 behaviour
+      // for non-UGC video seeds and is not something Phase 5 rewrites.
+      if (!veoVideoUrl && !ugcPassthroughSkip && isVideoSeed) {
         const segmentUrl = buildVideoSegmentUrl(sourceMedia.fileUrl, ad.aspectRatio || '9:16', 8);
         if (!segmentUrl) {
           console.warn(
@@ -1951,6 +2006,28 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             `(aspect=${veoAspectRatio}) → ${segmentUrl.slice(0, 120)}…`
           );
         }
+      }
+
+      // UGC passthrough skip — terminal short-circuit. Mirrors the
+      // veoResult.skipped handling below (Omni provider disabled) so
+      // status/renderError/renderStage are all consistent and the poller
+      // sees the same shape.
+      if (ugcPassthroughSkip) {
+        const skipMsg = ugcPassthroughSkip.reason || 'ugc video passthrough skipped';
+        await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
+        await Ad.updateOne(
+          { _id: adId },
+          {
+            $set: {
+              status: 'failed',
+              renderError: { message: skipMsg, stage: 'ugc-passthrough-skipped', at: new Date() },
+              renderStage: `skipped: ${skipMsg}`.slice(0, 200),
+              renderStageAt: new Date(),
+              updatedAt: new Date()
+            }
+          }
+        );
+        return;
       }
 
       // Grok path — fires when the seed is an image OR when the video
