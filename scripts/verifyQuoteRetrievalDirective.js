@@ -738,6 +738,31 @@ check('N3 a thin high rating cannot beat a big one (the literal-rule trap)', () 
   assert.strictEqual(r.rating, 4.58, `a 3-review 5.0 must not win, got ${r.rating}`);
   assert.ok(RATING_MIN_CREDIBLE_REVIEWS >= 25, 'the sample floor must be meaningful');
 });
+check('N3b a thin 5.0 must not beat a big LOW rating either (what the floor is for)', () => {
+  // The case the previous version of N3 missed, and a mutation removing the sample floor
+  // slipped straight through it: when the thin candidate is the ONLY one above the star
+  // floor, count-descending cannot save us — without the sample floor, "5.0 stars" from
+  // three reviews becomes the printed rating for the whole brand.
+  const r = quiet(() => pickBestRating([
+    { source: 'tiny.com', rating: 5.0, reviewCount: 3 },
+    { source: 'big.com',  rating: 3.0, reviewCount: 20000 },
+  ]));
+  assert.strictEqual(r.rating, 3.0, `a 3-review 5.0 must not become the brand rating, got ${r.rating}`);
+  assert.strictEqual(r.reviewCount, 20000);
+});
+check('N5b the winner keeps ITS OWN count even when another source has more', () => {
+  // Atomicity, in the one shape that can actually catch a borrowed count: the chosen
+  // rating is NOT the largest sample. A mutation taking max(reviewCount) across all
+  // candidates was invisible to every fixture where the winner also had the most reviews.
+  const r = quiet(() => pickBestRating([
+    { source: 'good.com', rating: 4.6, reviewCount: 900 },
+    { source: 'huge.com', rating: 2.0, reviewCount: 50000 },
+  ]));
+  assert.strictEqual(r.rating, 4.6, 'the printable candidate must win');
+  assert.strictEqual(r.reviewCount, 900,
+    'the count must come from the 4.6 source, not be borrowed from the 50,000-review one');
+  assert.strictEqual(r.ratingSource, 'good.com');
+});
 check('N4 when nothing can print, the largest sample is still returned', () => {
   // Not cosmetic: the Director reads the rating and summary as internal signal even when
   // no stars are typeset, so returning null here would lose real information.
