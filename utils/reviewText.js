@@ -169,4 +169,12 @@ function shortenReview(text, maxLen) {
     .join(' ');
 }
 
-module.exports = { shortenReview, scoreSentence, splitSentences };
+// OFF_PRODUCT and NOISE are exported so callers can DISQUALIFY a line on
+// content rather than inferring it from a low score. The two are different
+// questions: scoreSentence RANKS (generic praise is penalised so a specific
+// line outranks it), while these two DISQUALIFY (a shipping complaint must
+// never print at all). Conflating them rejected generic praise outright,
+// which is stricter than intended — "generic praise is absolutely fine if
+// something is more specific" (owner, 2026-08-11): it should lose to a better
+// line, not be banned.
+module.exports = { shortenReview, scoreSentence, splitSentences, OFF_PRODUCT, NOISE };

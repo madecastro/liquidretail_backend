@@ -16,7 +16,7 @@ const { chatCompletion, isConfigured: atlasConfigured } = require('./atlasLlmSer
 const alerts = require('./alertService');
 const Comment = require('../models/Comment');
 // Conversion-weighted sentence ranking, shared with the review-storage path.
-const { scoreSentence } = require('../utils/reviewText');
+const { scoreSentence, OFF_PRODUCT, NOISE } = require('../utils/reviewText');
 const { splitSentences } = require('../utils/htmlEntities');
 
 // The 'review-text' role, not a bare model id: every review-text task in the
@@ -31,6 +31,16 @@ const { splitSentences } = require('../utils/htmlEntities');
 // atlasModelMap — do not resurrect it.
 // QUOTE_SNIPPET_MODEL_ID still overrides this one call site.
 const MODEL_ID  = process.env.QUOTE_SNIPPET_MODEL_ID || 'review-text';
+// KEPT AT 50 (2026-08-11 review, not widened). The defect that prompted that
+// review — "often recommending it for casual wear and…" — was a SELECTION
+// problem (the fallback ladder chose a mid-sentence fragment), not a width
+// problem: the fix is bestFallbackSnippet's ordering below, not a bigger
+// budget. Widening this would (a) stop matching the 2-line landscape overlay
+// it was measured against — a longer string can re-introduce the CSS clamp
+// on that box — and (b) break scripts/verifyQuoteSurfaceLength.js's V1 check,
+// which pins this exact line to assert the video cap is untouched by the
+// separate static-surface change. Reconsider only alongside a measurement of
+// the actual overlay box, not as a side effect of this fix.
 const MAX_CHARS = 50;
 
 const RESPONSE_SCHEMA = {
@@ -125,6 +135,55 @@ const NEGATION_LOOKBACK = 3;
  * in both directions ("Not worth it at first, but honestly worth it now"
  * legitimately contains a clean second occurrence).
  */
+/**
+ * The exact SOURCE text for an approved span — the verbatim guarantee.
+ *
+ * isExtractive answers "are these the customer's WORDS" by comparing tokens:
+ * it lowercases and strips punctuation, so it deliberately tolerates the model
+ * re-rendering what it found. That is right for judging meaning and wrong for
+ * deciding what to PRINT. Adversarial review found the hole: the LLM path
+ * returned the MODEL's string once isExtractive approved it, so a review
+ * reading `fits true to size` could ship as `Fits true to size?` or
+ * `FITS TRUE TO SIZE!!!` — every word the customer's, no character theirs. A
+ * fabricated `?` turns a confident claim into a doubtful one and invented `!!!`
+ * manufactures enthusiasm, both under a real person's testimonial.
+ *
+ * So the model chooses a SPAN and we print the SOURCE, never the model's echo.
+ * Returns the original substring (original case, original punctuation) or null
+ * when the span cannot be located verbatim — in which case the caller falls
+ * back mechanically rather than printing anything the source does not contain.
+ */
+function verbatimSpan(snippet, source) {
+  const src = String(source || '');
+  const sn = tokens(snippet);
+  if (!sn.length) return null;
+
+  // Re-tokenise the source WITH character offsets so an approved token window
+  // maps back to real character positions in the untouched original.
+  const marks = [];
+  const re = /[\w'’]+/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    marks.push({ tok: tokens(m[0])[0], start: m.index, end: m.index + m[0].length });
+  }
+  const srcToks = marks.map((x) => x.tok);
+
+  for (let i = 0; i + sn.length <= srcToks.length; i++) {
+    let match = true;
+    for (let j = 0; j < sn.length; j++) {
+      if (srcToks[i + j] !== sn[j]) { match = false; break; }
+    }
+    if (!match) continue;
+    let negated = false;
+    for (let k = Math.max(0, i - NEGATION_LOOKBACK); k < i; k++) {
+      if (NEGATORS.has(srcToks[k])) { negated = true; break; }
+    }
+    if (negated) continue;
+    return src.slice(marks[i].start, marks[i + sn.length - 1].end).trim() || null;
+  }
+  return null;
+}
+
 function isExtractive(snippet, source) {
   const sn = tokens(snippet);
   const src = tokens(source);
@@ -177,17 +236,206 @@ function strongestSentence(text) {
 
 /**
  * bestClause(text, maxChars) → string | null
- * A whole comma/semicolon/dash-delimited clause that fits, highest-scoring
- * first. Used before falling back to an ellipsis cut so the overlay reads as
- * something the reviewer actually said rather than a sentence chopped in half.
+ * A whole comma/semicolon/dash-delimited clause that fits. Used before
+ * falling back to an ellipsis cut so the overlay reads as something the
+ * reviewer actually said rather than a sentence chopped in half.
+ *
+ * RANKED BY POSITION FIRST, SCORE SECOND (2026-08-11 fix). The clause that
+ * opens the sentence (`startsAtOpen`) is preferred over any clause that opens
+ * mid-sentence, even when the continuation scores higher on content —
+ * "The cushions are firm, often recommend it daily for casual comfort" used
+ * to return "often recommend it daily for casual comfort" purely because
+ * DURATION/POSITIVE keywords outscored the plain opening clause. That reads
+ * as a fragment ripped out of the middle: lowercase, no antecedent for "it".
+ * Position beats score; score only breaks ties WITHIN the same tier.
  */
 function bestClause(text, maxChars = MAX_CHARS) {
-  const clauses = String(text || '')
-    .split(/\s*[,;—–]\s*|\s+[-]\s+/)
-    .map(s => s.trim().replace(/[.!?]+$/, ''))
-    .filter(c => c && c.length <= maxChars && c.split(/\s+/).length >= 3);
+  const pieces = String(text || '').split(/\s*[,;—–]\s*|\s+[-]\s+/);
+  const clauses = pieces
+    .map((s, i) => ({ text: s.trim().replace(/[.!?]+$/, ''), startsAtOpen: i === 0 }))
+    .filter(c => c.text && c.text.length <= maxChars && c.text.split(/\s+/).length >= 3);
   if (!clauses.length) return null;
-  return clauses.reduce((best, c) => (scoreSentence(c) > scoreSentence(best) ? c : best));
+  // Position is a BONUS, never an override.
+  //
+  // The first cut of this fix returned the opening clause whenever one existed,
+  // ranking position ahead of content unconditionally. Adversarial review broke
+  // it with the single most common real review shape — hedge, then redeem:
+  //
+  //   "Shipping was slow and disappointing, but the shirt is fantastic"
+  //
+  // The opening clause is the COMPLAINT, so a position-first rule prints
+  // "Shipping was slow and disappointing" as the testimonial on the ad. That is
+  // strictly worse than the mid-sentence fragment this function exists to avoid:
+  // a fragment reads awkwardly, a complaint actively sells against the product.
+  //
+  // OPEN_BONUS is sized to beat a modest keyword edge (a plain opening clause
+  // over a slightly punchier continuation) while still losing to a clause that
+  // is genuinely better copy — POSITIVE alone is +5, RISK_REVERSAL +6. It can
+  // never rescue a clause scoreSentence actively penalises (OFF_PRODUCT -6,
+  // NOISE -8), which is what keeps shipping/delivery complaints off the ad.
+  const OPEN_BONUS = 3;
+  const rank = (c) => scoreSentence(c.text) + (c.startsAtOpen ? OPEN_BONUS : 0);
+  return clauses.reduce((best, c) => (rank(c) > rank(best) ? c : best)).text;
+}
+
+/**
+ * bestWholeSentence(fullText, exclude, maxChars) → string | null
+ *
+ * A DIFFERENT complete sentence elsewhere in the same review that already
+ * fits whole and ends on its own terminator (. ! ?) — tried before any cut
+ * of the chosen `source` sentence. A short, complete, lower-scoring line
+ * reads as something the reviewer actually said; a truncated high-scoring
+ * one reads as a fragment. This is the fix for the 2026-08-11 defect: a
+ * delivered ad rendered
+ *   "often recommending it for casual wear and…"
+ * — lowercase, mid-sentence, ellipsis-terminated. That sentence had no comma
+ * and no early period to cut on, so the old ladder (bestClause then
+ * truncateAtWordBoundary) fell straight to a lowercase hard-slice. Preferring
+ * a shorter, complete, self-contained sentence from the SAME review — when
+ * one exists — avoids manufacturing a fragment at all.
+ *
+ * Gated at score > 0, the same positivity bar strongestSentence applies, so
+ * this can never resurrect a short negative line (e.g. a shipping complaint)
+ * purely because it happens to be brief enough to fit.
+ */
+function bestWholeSentence(fullText, exclude, maxChars = MAX_CHARS) {
+  const parts = splitSentences(String(fullText || '')).map(s => s.trim()).filter(Boolean);
+  const candidates = parts.filter(s =>
+    s !== exclude &&
+    s.length > 0 && s.length <= maxChars &&
+    /[.!?]$/.test(s) &&
+    s.split(/\s+/).length >= 3 &&
+    scoreSentence(s) > 0
+  );
+  if (!candidates.length) return null;
+  return candidates.reduce((best, s) => (scoreSentence(s) > scoreSentence(best) ? s : best));
+}
+
+/**
+ * bestFallbackSnippet(fullText, source, maxChars) → string
+ *
+ * The mechanical ladder used whenever the LLM is unavailable, fails, returns
+ * something oversized, or returns something non-extractive. Ordered so a
+ * self-contained excerpt always beats a mid-sentence fragment:
+ *
+ *   1. A different WHOLE sentence elsewhere in the review that fits and ends
+ *      on a real terminator (bestWholeSentence). "A complete short sentence
+ *      beats a truncated long one."
+ *   2. The strongest sub-clause of `source` itself, preferring the clause
+ *      that opens the sentence over one that opens mid-sentence (bestClause).
+ *      "If nothing self-contained fits, prefer a clause that at least BEGINS
+ *      at a sentence start."
+ *   3. LAST RESORT: an ellipsis-marked cut of `source` (truncateAtWordBoundary).
+ *
+ * Every tier operates on VERBATIM substrings only — this reorders which
+ * verbatim candidate wins, it never generates or edits text.
+ */
+/**
+ * PROOF_BAR — the standard a printed quote has to clear, applied to the
+ * MECHANICAL path so it matches what the LLM path is already told to do.
+ *
+ * OWNER FRAMING (2026-08-11): "the question isn't provenance, it's whether it
+ * is helping or hurting our advertisement."
+ *
+ * buildSystemPrompt already encodes that standard for the model — conversion
+ * first, COMPLETE THOUGHT, "never rely on an ellipsis", positive and about THIS
+ * product, no shipping/delivery/service lines, no generic praise. The mechanical
+ * fallback enforced NONE of it: it cut whatever fit and shipped it. That is how
+ * "often recommending it for casual wear and…" reached a live ad — a
+ * third-person fragment, opening lowercase, ending in an ellipsis. Nobody chose
+ * it; the fallback simply had no bar.
+ *
+ * So the fallback now applies the same bar, and returns null when nothing
+ * clears it. A missing quote is fine — the rating carries the proof, which is
+ * the Rating-First case in the social-proof guidelines. A bad quote is not: it
+ * spends impressions arguing against the product.
+ */
+const LEADING_CONNECTIVE = /^(?:but|and|so|yet|or|though|although|however|plus|also|then|because|since|while|which|that)\b[\s,]*/i;
+
+// Third-person AGGREGATE register — "customers report…", "reviewers often
+// recommend…", "shoppers say…". This is review-SUMMARY prose, not a person
+// speaking, and printing it inside quotation marks presents a synthesis as a
+// testimonial. It is also what the reported defect actually was: the line
+// "…often recommending it for casual wear and moderate activity" reads as a
+// summary of many reviews, which is why no attribution could ever be honest
+// for it. A testimonial is one customer's voice; this never is.
+const AGGREGATE_VOICE = /\b(?:customers?|reviewers?|shoppers?|buyers?|users?|people|many|most|everyone)\s+(?:\w+\s+){0,2}(?:report|reports|reported|say|says|said|recommend|recommends|recommending|note|notes|noted|mention|mentions|agree|agrees|find|finds|love|loves|praise|praises)\b/i;
+
+// DISQUALIFY, don't rank. These are the two different jobs:
+//   - meetsProofBar answers "could this ever be printed?" (content veto)
+//   - scoreSentence answers "which of these is best?" (ranking)
+// The first cut of this bar conflated them by requiring scoreSentence > 0,
+// which banned generic praise outright. That is stricter than intended —
+// "Generic praise is absolutely fine if something is more specific" (owner,
+// 2026-08-11): a specific line should WIN, but "Love it, great fit" is a
+// perfectly shippable overlay when it is the best the review offers. Ranking
+// already prefers specificity (GENERIC_PRAISE is -5 inside scoreSentence), so
+// the bar only has to stop the things that actively hurt the ad.
+function meetsProofBar(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  // Review-summary prose, not a person speaking — see AGGREGATE_VOICE.
+  if (AGGREGATE_VOICE.test(t)) return false;
+  // An ellipsis means we never found a finished thought — the system prompt's
+  // "never rely on an ellipsis to imply the rest", enforced rather than asked.
+  if (/[…]|\.\.\./.test(t)) return false;
+  // A trailing question is a doubt, not a testimonial.
+  if (/\?\s*$/.test(t)) return false;
+  if (t.split(/\s+/).filter(Boolean).length < 3) return false;
+  // Retailer complaints (shipping, delivery, returns, customer service) and
+  // pure noise never print, at any score. A negative line on a paid ad argues
+  // against the product with our own money.
+  if (OFF_PRODUCT.test(t)) return false;
+  if (NOISE.test(t)) return false;
+  return true;
+}
+
+/** Drop a dangling connective left behind by splitting on a comma. */
+function trimConnective(text) {
+  const t = String(text || '').trim();
+  // "Shipping was slow, but the shirt is fantastic" -> clause "but the shirt is
+  // fantastic". The "but" is an artifact of the split and a tell that something
+  // preceded it; the quote is "the shirt is fantastic". Removing leading words
+  // keeps the result a contiguous substring of the source, so it stays verbatim.
+  const cut = t.replace(LEADING_CONNECTIVE, '').trim();
+  return cut.length >= 3 ? cut : t;
+}
+
+/**
+ * Highest-scoring sentence that FITS, with no score floor.
+ *
+ * bestWholeSentence requires scoreSentence > 0, which is the right filter when
+ * we are looking for a standout line but wrong as the last word: it means a
+ * review whose only content is generic praise yields nothing at all. Owner:
+ * "Generic praise is absolutely fine if something is more specific" — so a
+ * generic line is allowed to win once the specific tiers have had their turn.
+ * Still ranked by score, so anything more specific beats it.
+ */
+function anyFittingSentence(fullText, maxChars = MAX_CHARS) {
+  const parts = splitSentences(String(fullText || '')).map(s => s.trim()).filter(Boolean);
+  const fits = parts.filter(s => s.length <= maxChars && meetsProofBar(trimConnective(s)));
+  if (!fits.length) return null;
+  return trimConnective(fits.reduce((best, s) => (scoreSentence(s) > scoreSentence(best) ? s : best)));
+}
+
+function bestFallbackSnippet(fullText, source, maxChars = MAX_CHARS) {
+  const candidates = [
+    bestWholeSentence(fullText, source, maxChars),
+    bestClause(source, maxChars),
+    // Last: a fitting sentence with no score floor, so generic praise can carry
+    // the overlay when the review simply has nothing more specific to offer.
+    anyFittingSentence(fullText, maxChars),
+  ];
+  for (const raw of candidates) {
+    if (!raw) continue;
+    const cleaned = trimConnective(raw);
+    if (cleaned.length <= maxChars && meetsProofBar(cleaned)) return cleaned;
+  }
+  // truncateAtWordBoundary is reached only when nothing self-contained exists.
+  // Its output ends in an ellipsis BY CONSTRUCTION, so it can never clear the
+  // bar — which is the point. Returning null here is what stops an unfinished
+  // fragment from being printed as a customer testimonial.
+  return null;
 }
 
 // Word-boundary truncation with a trailing ellipsis. LAST-RESORT fallback only
@@ -235,7 +483,12 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   // and no minimum length. A short specific line ("Awesome shirt with awesome
   // fit") is a perfectly good overlay — often better than a trimmed long one —
   // so brevity is never a reason to reject a quote or to pad it.
-  if (clean.length <= MAX_CHARS) return clean;
+  // …but "already fits" is not the same as "worth printing". This short-circuit
+  // used to return ANY short review verbatim, which let exactly the lines the
+  // system prompt tells the model to skip walk straight onto an ad:
+  // "Love it. Great product. Amazing." is 32 characters and says nothing.
+  // Fitting the box was never the standard — helping the ad is.
+  if (clean.length <= MAX_CHARS) return meetsProofBar(clean) ? clean : null;
 
   // Narrow to the single strongest sentence BEFORE the model sees it. See
   // strongestSentence() — without this, every model tested picked a customer
@@ -245,8 +498,9 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   if (source.length <= MAX_CHARS) return source;
 
   // Fallback ladder, best-first, used whenever the model is unavailable or
-  // returns something unusable: whole clause → marked excerpt.
-  const mechanical = () => bestClause(source) || truncateAtWordBoundary(source);
+  // returns something unusable: a different whole sentence → whole clause →
+  // marked excerpt. See bestFallbackSnippet's docstring.
+  const mechanical = () => bestFallbackSnippet(clean, source, MAX_CHARS);
 
   // atlasConfigured(), not a bare OPENAI_API_KEY check: Atlas is the primary
   // route and OpenAI only the direct fallback, so gating on OPENAI_API_KEY
@@ -299,9 +553,28 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
       return mechanical();
     }
 
+    // PRINT THE SOURCE, NOT THE MODEL'S ECHO. isExtractive compares tokens
+    // (lowercased, punctuation stripped), so it approves the customer's WORDS
+    // while tolerating the model re-rendering their punctuation and case. What
+    // ships must be the reviewer's actual characters, so re-cut the approved
+    // span out of the original text. A span that cannot be located verbatim
+    // falls back mechanically rather than printing the model's version.
+    const verbatim = verbatimSpan(snippet, clean);
+    if (!verbatim) {
+      console.warn(`quoteSnippet: approved span not locatable verbatim "${snippet}" — mechanical fallback`);
+      return mechanical();
+    }
+    if (verbatim !== snippet) {
+      console.log(`💬 quoteSnippet: re-cut from source — model="${snippet}" source="${verbatim}"`);
+    }
+    if (verbatim.length > MAX_CHARS) {
+      console.warn(`quoteSnippet: verbatim span ${verbatim.length} chars (>${MAX_CHARS}) — mechanical fallback`);
+      return mechanical();
+    }
+
     const elapsedMs = Date.now() - t0;
-    console.log(`💬 quoteSnippet: "${snippet}" (${snippet.length}c) from ${clean.length}c in ${elapsedMs}ms`);
-    return snippet;
+    console.log(`💬 quoteSnippet: "${verbatim}" (${verbatim.length}c) from ${clean.length}c in ${elapsedMs}ms`);
+    return verbatim;
   } catch (err) {
     const elapsedMs = Date.now() - t0;
     console.warn(`quoteSnippet: failed after ${elapsedMs}ms (${err.message}) — mechanical fallback`);
@@ -618,6 +891,8 @@ module.exports = {
   isExtractive,
   strongestSentence,
   bestClause,
+  bestWholeSentence,
+  bestFallbackSnippet,
   shortenProofLine,
   judgeProofLines,
   ensureCommentsJudged,

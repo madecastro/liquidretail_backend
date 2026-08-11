@@ -395,11 +395,34 @@ for (const name of GENERIC8) {
   const ts8 = specTimeScale(spec, 8 * 24, 24);
   check(`P8 generic '${name}' timeScale=1.0 at 8s plate`,
     Math.abs(ts8 - 1.0) < 1e-9, `got ${ts8}`);
-  // On a 10s plate the 8s generic compresses? No — timeScale only compresses
-  // when clip < extent; longer plates keep authored pacing (timeScale 1.0).
+  // P9 CHANGED 2026-08-11 — deliberately, with the reason recorded.
+  //
+  // This used to assert timeScale STAYS 1.0 on a longer plate ("no stretch"),
+  // which was correct while specTimeScale only ever compressed. It is now wrong,
+  // and it is wrong in a way that matters the moment Meta video moves 8s -> 10s:
+  // the Omni camera cuts are placed at dur/3 and 0.64*dur (services/veoPromptBuilder.js)
+  // and therefore MOVE with clip length, while these presets author their text
+  // cuts on an 8s grid. Freezing text at the 8s marks on a 10s plate desyncs the
+  // choreography from the shot — text cutting at 2.67/5.12 against camera cuts
+  // at 3.33/6.40.
+  //
+  // Scaling proportionally keeps every authored beat at the same extent-relative
+  // position, so an 8s-authored preset keeps landing on the camera beats at ANY
+  // length. P7/P8 above still pin the thing this check was really protecting:
+  // the presets are NOT re-timed (extent stays 8) and an 8s plate still scales
+  // to exactly 1.0, so existing Meta 8s renders are untouched.
   const ts10 = specTimeScale(spec, 10 * 24, 24);
-  check(`P9 generic '${name}' timeScale stays 1.0 on a longer 10s plate (no stretch)`,
-    Math.abs(ts10 - 1.0) < 1e-9, `got ${ts10}`);
+  check(`P9 generic '${name}' STRETCHES to 1.25 on a 10s plate (beats track the camera cuts)`,
+    Math.abs(ts10 - 1.25) < 1e-9, `got ${ts10}`);
+  // And the scaled cuts must actually land on veoPromptBuilder's marks.
+  for (const dur of [10, 12, 15]) {
+    const ts = specTimeScale(spec, dur * 24, 24);
+    const scaledCut1 = (8 / 3) * ts;
+    const scaledCut2 = (8 * 0.64) * ts;
+    check(`P9 generic '${name}' scaled beats match camera cuts at ${dur}s`,
+      Math.abs(scaledCut1 - dur / 3) < 0.01 && Math.abs(scaledCut2 - dur * 0.64) < 0.01,
+      `got ${scaledCut1.toFixed(3)}/${scaledCut2.toFixed(3)} want ${(dur / 3).toFixed(3)}/${(dur * 0.64).toFixed(3)}`);
+  }
 }
 
 // ── T. Preset threading: buildMetaForAd + render get the SAME override ─
