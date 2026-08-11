@@ -514,18 +514,12 @@ function resolveVideoModel({ brand = null, product = null, categories = [], canv
 // reference images at the resolved aspect so the seed composition and
 // the model output are consistent — preventing the "seed framed for 4:5,
 // output rendered at 3:4" mismatch that would otherwise crop content.
-// Cloudinary ar_ param mapping for the eager transform on upload.
-// The downstream brand-script composite requests this derivative URL;
-// pre-generating it at upload time saves a transcode round-trip on the
-// first read.
-function arParamForAspect(aspectRatio) {
-  const a = String(aspectRatio || '').trim();
-  if (a === '9:16')   return 'ar_9:16';
-  if (a === '16:9')   return 'ar_16:9';
-  if (a === '4:5')    return 'ar_4:5';
-  if (a === '1.91:1') return 'ar_191:100';
-  return 'ar_1:1';
-}
+//
+// arParamForAspect used to live here too, building the ar_ param for an upload-time eager
+// Cloudinary transform. Removed along with that transform (see the "Mirror to Cloudinary" comment
+// further down): its premise — "the downstream brand-script composite requests this derivative
+// URL" — was already false. The composite is gated off and the live cropper
+// (services/videoCropUrl.js) emits an explicit c_scale/c_crop chain with no ar_ param at all.
 
 function aspectToNumeric(ar) {
   const m = String(ar || '').match(/^([\d.]+)\s*:\s*([\d.]+)$/);
@@ -3751,32 +3745,32 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   adStage(ad._id, `downloading master video (${aspectRatio})`);
   const videoBuffer = await downloadToBuffer(remoteVideoUrl);
 
-  // Mirror to Cloudinary. The eager transform pre-generates the
-  // canvas-aspect saliency-crop derivative at upload time — but ONLY
-  // when the model's rendered aspect differs from the canvas (i.e. we
-  // had to remap because the model didn't support the canvas aspect
-  // natively — common on the Gemini Omni default, which only renders
-  // 16:9/9:16). When they match, the composite skips the transform
-  // entirely, so pre-generating it would be pointless work that
-  // triggers a transcode 423 race for no reason.
-  const aspectsMatch = (() => {
-    const parse = (s) => {
-      const m = String(s || '').match(/^([\d.]+)\s*:\s*([\d.]+)$/);
-      return m ? parseFloat(m[1]) / parseFloat(m[2]) : null;
-    };
-    const a = parse(aspectRatio); const b = parse(platformAspect);
-    return a != null && b != null && Math.abs(a - b) < 0.01;
-  })();
-  const uploadOpts = {
+  // Mirror to Cloudinary. NO eager transform.
+  //
+  // There used to be one here, pre-generating a `c_fill,<ar>,g_auto` derivative whenever the
+  // model's rendered aspect differed from the canvas aspect. Nothing fetches it. The only
+  // emitter of a c_fill/g_auto video URL is videoCompositeService.js:145, whose sole in-repo
+  // caller is aiOverlayPolishService.js:196 — gated off by AI_OVERLAY_POLISH_ENABLED=false
+  // (config/defaults.env) and additionally hard-nulled at renderService.js:207. The LIVE
+  // cropper is services/videoCropUrl.js, which builds an explicit c_scale/c_crop chain with no
+  // gravity at all, so it never touches this derivative.
+  //
+  // So it was a real transcode of a 1080x1920 clip, billed in Cloudinary transformation
+  // credits, for an asset nobody requests — on every render where the model's rendered aspect
+  // differed from the canvas aspect, which the square-flip work made a strictly larger share
+  // of production (Omni now renders 9:16 for platform 1:1 AND 4:5).
+  //
+  // Accepted trade-off: the eager also warmed the per-asset g_auto tracking-crop analysis that
+  // the composite would have shared (docs/CLOUDINARY-VIDEO.md). An operator who later flips
+  // AI_OVERLAY_POLISH_ENABLED=true therefore gets a colder first request — acceptable, because
+  // that path is dead twice over (renderService.js:252 fires only for ad.kind === 'video', and
+  // video ads return at routes/ads.js:830 without ever reaching renderCreative).
+  adStage(ad._id, `mirror upload (${aspectRatio})`);
+  const uploaded = await uploadBufferToCloudinary(videoBuffer, {
     folder:       `liquidretail/atlas_renders/${model.replace(/\//g, '_')}`,
     resourceType: 'video',
     format:       'mp4'
-  };
-  if (!aspectsMatch) {
-    uploadOpts.eager = [{ raw_transformation: `c_fill,${arParamForAspect(platformAspect)},g_auto` }];
-  }
-  adStage(ad._id, `mirror upload (${aspectRatio})`);
-  const uploaded = await uploadBufferToCloudinary(videoBuffer, uploadOpts);
+  });
 
   const elapsedMs = Date.now() - t0;
 
