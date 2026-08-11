@@ -356,7 +356,18 @@ router.post('/generate', async (req, res) => {
       // single-use, so a stray second click on "Generate anyway" is refused
       // against the run the first click just minted instead of billing again.
       confirmDuplicate = false,
-      acknowledgedRunId = null
+      acknowledgedRunId = null,
+      // UGC-ads Phase 3 — operator-picked UGC that MUST land at seed index 0.
+      // Explicit rather than inferring "mediaIds[0] must be a UGC" because
+      // mediaIds is the general operator-picked seed list (any Media, catalog
+      // or UGC); a Generate Ads wizard run picking a catalog image must NOT
+      // silently trip the UGC-first cascade. Passing an unrelated id here is
+      // harmless — buildSeededUniverse no-ops when the id isn't in the pool
+      // — but the field is the only signal that the CampaignRun should
+      // persist a seedUgcIds row so regenerate can replay the pick.
+      // Gated by UGC_FIRST_SEEDING inside seededUniverseService — that
+      // switch OFF makes this field a no-op end-to-end.
+      preferUgcMediaId = null
     } = req.body || {};
 
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
@@ -627,7 +638,14 @@ router.post('/generate', async (req, res) => {
       // anything, so it will NOT block a sibling (deliberate — see the fail-open
       // note in services/generationGate.js). Dropping this write would silently
       // disable double-click protection rather than over-block.
-      requestFingerprint
+      requestFingerprint,
+      // UGC-ads Phase 3. Persisted here (not at expansion time) so a run that
+      // gets superseded by the concurrency gate still records the operator's
+      // intent — matters for the wizard's "which UGC did this run seed?"
+      // diagnostics. adRegenerateService reads seedUgcIds[0] as the ref-1
+      // override; single-entry list is the Phase 2 wizard's MVP shape, array
+      // leaves room for Phase 7's batch (one seed per expanded product).
+      seedUgcIds: preferUgcMediaId ? [String(preferUgcMediaId)] : []
     });
 
     // MINT-THEN-VERIFY — closes the read-then-write race in the gate above.
@@ -759,7 +777,11 @@ router.post('/generate', async (req, res) => {
           // the same campaign produces two sets of ads instead of the second one
           // colliding with the first and expanding to nothing.
           generationRunId: run.runId,
-          requestedBy: req.user?.userId || null
+          requestedBy: req.user?.userId || null,
+          // UGC-ads Phase 3. Threaded through so buildSeededUniverse can
+          // hoist this Media to seed index 0. Gated on UGC_FIRST_SEEDING
+          // inside the service — flag OFF is byte-identical to omitting it.
+          preferUgcMediaId
         });
 
         // `newlyQueued`, NOT `queuedCount`. queuedCount is

@@ -645,7 +645,12 @@ async function expandWizardJob({
   // grouped by productId so the wizard can show "this will produce N
   // ads" before the operator hits Generate. Use sparingly — still
   // costs LLM-free DB reads (matchedMedia, ProductMatchArtifact, etc.).
-  dryRun = false
+  dryRun = false,
+  // UGC-ads Phase 3. Wizard-picked UGC that must land at seed index 0.
+  // Threaded straight through to buildSeededUniverse; the service handles
+  // both the pool-hoist and the kill switch. Absent / null = byte-identical
+  // to the pre-Phase-3 call for every other caller.
+  preferUgcMediaId = null
 }) {
   if (!campaignId) throw new Error('campaignId required');
 
@@ -3147,7 +3152,14 @@ async function runConceptDrivenExpansion({
           // a burned-text catalog image is still promoted there, which is the
           // intended precedence (owner rule over the wantsVideo burned-text
           // tiebreak).
-          preferFirstCatalogImage: !operatorPickedMedia && resolvedKinds.includes('image')
+          preferFirstCatalogImage: !operatorPickedMedia && resolvedKinds.includes('image'),
+          // UGC-ads Phase 3 — hoists the wizard-picked UGC to seed index 0.
+          // Threaded to every product iteration so a multi-product wizard run
+          // (Phase 7 batch, or the current Phase 2 wizard with N products
+          // attached to one UGC) plants the same UGC across all of them.
+          // Kill-switch-gated inside buildSeededUniverse; null / flag OFF is
+          // byte-identical to the pre-Phase-3 call.
+          preferUgcMediaId
         });
       const filtered = filterUniverseForProduct(productId, universe);
       if (!filtered.length) {

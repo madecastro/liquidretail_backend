@@ -49,6 +49,17 @@ const campaignRunSchema = new mongoose.Schema({
   // silently disables double-click protection instead of over-blocking.
   requestFingerprint: { type: String, default: null, index: true },
 
+  // UGC-ads Phase 3 — operator-picked UGCs the run was seeded with. Populated
+  // by /api/ads/generate when preferUgcMediaId is present. adRegenerateService
+  // reads this so regenerate re-applies the same UGC at ref 1 — without
+  // persistence the regen path can only replay Ad.mediaIds, which points at
+  // the wizard's UGC but does not distinguish "operator-picked seed" from
+  // "director-picked supporting media" for the catalog-first reseed rule
+  // (§ REGEN_RESEED_CATALOG_FIRST). Array (not scalar) because Phase 7's
+  // batch wizard will dispatch one CampaignRun with multiple UGCs, one per
+  // expanded product.
+  seedUgcIds:          { type: [String], default: [] },
+
   total:        { type: Number, default: 0 },
   succeeded:    { type: Number, default: 0 },
   skipped:      { type: Number, default: 0 },

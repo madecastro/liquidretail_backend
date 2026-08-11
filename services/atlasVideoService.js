@@ -2184,25 +2184,46 @@ function isCatalogFeedOrderSeedingEnabled() {
 // Through, 2026-08-05) disproved that: the hero doc was created ~1h41m and
 // ~8s AFTER its alts on two separate SKUs, so createdAt order routinely put
 // alts ahead of the hero. That gap is exactly why this function exists now.
-function sortCatalogMediasForReferenceStack(docs) {
+// opts.preferUgcMediaId — UGC-ads Phase 3. When set (and the UGC-first kill
+// switch is on), hoists the given Media id to index 0 of the sorted stack
+// AFTER the existing feedIndex-first cascade runs on the rest. For the video
+// rail this is largely defensive: `generateForAd` already places `Ad.mediaId`
+// at reference position 0 directly, and this sort feeds positions 1..N off
+// catalog-only docs. But when the UGC-ads wizard eventually opts a UGC into
+// the catalog-scoped stack (or a follow-up call composes catalog+UGC docs
+// before sort), the same rule applies: operator-picked UGC owns index 0.
+// Unset / no-match / flag-off → byte-identical to the pre-Phase-3 sort.
+function sortCatalogMediasForReferenceStack(docs, opts = {}) {
   const list = Array.isArray(docs) ? docs.slice() : [];
   const byCreatedAtAsc = (a, b) =>
     (a.createdAt ? new Date(a.createdAt).getTime() : 0) -
     (b.createdAt ? new Date(b.createdAt).getTime() : 0);
 
-  if (!isCatalogFeedOrderSeedingEnabled()) {
-    return list.sort(byCreatedAtAsc);
-  }
+  const sorted = !isCatalogFeedOrderSeedingEnabled()
+    ? list.sort(byCreatedAtAsc)
+    : list.sort((a, b) => {
+        const fa = a.metadata?.feedIndex;
+        const fb = b.metadata?.feedIndex;
+        const ha = Number.isFinite(fa);
+        const hb = Number.isFinite(fb);
+        if (ha && hb) return fa - fb;
+        if (ha !== hb) return ha ? -1 : 1; // stamped entries sort before unstamped
+        return byCreatedAtAsc(a, b);
+      });
 
-  return list.sort((a, b) => {
-    const fa = a.metadata?.feedIndex;
-    const fb = b.metadata?.feedIndex;
-    const ha = Number.isFinite(fa);
-    const hb = Number.isFinite(fb);
-    if (ha && hb) return fa - fb;
-    if (ha !== hb) return ha ? -1 : 1; // stamped entries sort before unstamped
-    return byCreatedAtAsc(a, b);
-  });
+  // Deliberately imported lazily inside the function body — atlasVideoService
+  // and seededUniverseService both live in services/ but neither requires the
+  // other today, and forcing a top-of-file require would create a cycle-risk
+  // window during startup. The lookup happens once per sort call, and the
+  // require cache means it is free after the first hit.
+  const { promoteUgcFirst, isUgcFirstSeedingEnabled } = require('./seededUniverseService');
+  if (!opts.preferUgcMediaId || !isUgcFirstSeedingEnabled()) return sorted;
+  // promoteUgcFirst expects entries wrapped { media }; sortCatalogMedias-
+  // ForReferenceStack works on bare docs. Wrap+unwrap so the helper stays a
+  // single source of truth for the "hoist by id, no-op if missing" contract.
+  const wrapped = sorted.map(m => ({ media: m }));
+  const promoted = promoteUgcFirst(wrapped, opts.preferUgcMediaId);
+  return promoted.map(w => w.media);
 }
 
 async function buildReferenceImages({

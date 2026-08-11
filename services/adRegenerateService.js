@@ -39,6 +39,7 @@ const mongoose              = require('mongoose');
 const Ad                    = require('../models/Ad');
 const Media                 = require('../models/Media');
 const Brand                 = require('../models/Brand');
+const CampaignRun           = require('../models/CampaignRun');
 const veoService            = require('./videoRouter');
 const brandScriptExecutor   = require('./brandScriptExecutor');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
@@ -46,6 +47,7 @@ const directImage           = require('./directImageRenderService');
 // THE shared derive-only gate (money). Imported, never re-implemented —
 // see its doc comment in campaignAdsGenerationService.
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
+const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
@@ -758,11 +760,66 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
     : (Array.isArray(ad.mediaIds) ? ad.mediaIds : []);
   let referenceSource = hasOperatorRefs ? 'operator' : 'director';
 
+  // UGC-ADS PHASE 3 RESEED. Runs BEFORE the catalog-first reseed because a
+  // UGC seed is a stronger operator signal than the catalog-first fallback —
+  // if the ad was generated from an operator-picked UGC (persisted on the
+  // CampaignRun that produced it), keep that UGC at ref 1 across every regen.
+  //
+  // Gate order matches the seededUniverseService cascade: the operator-picked
+  // path wins over the catalog-first rule (§ preferFirstCatalogImage in
+  // seededUniverseService.js — "explicit pick IS the override of the owner
+  // rule"). The kill switch UGC_FIRST_SEEDING=false disables this entirely so
+  // regen falls back to the catalog reseed byte-for-byte.
+  //
+  // Structural safety: variantKind gate mirrors reseedDecision — a UGC seed
+  // only makes sense for product_image ads (the pipeline the wizard emits).
+  // Nothing is written back to Ad.mediaIds; the derived seed rides through
+  // the render call only, so a future kill-switch flip actually reverts.
+  let ugcReseeded = false;
+  if (
+    !hasOperatorRefs
+    && isUgcFirstSeedingEnabled()
+    && (ad?.variantKind === 'product_image')
+    && Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+  ) {
+    // Latest run wins — an ad regenerated after being pulled into a NEW run
+    // should honour the newer run's UGC context, not the original mint.
+    const latestRunId = ad.campaignRunIds[ad.campaignRunIds.length - 1];
+    const run = await CampaignRun.findOne({ runId: latestRunId })
+      .select('seedUgcIds')
+      .lean();
+    const ugcId = run?.seedUgcIds?.length ? String(run.seedUgcIds[0]) : null;
+    if (ugcId) {
+      // Confirm the UGC still exists + belongs to this brand before seeding —
+      // a stale run whose UGC was hard-deleted must not crash the render.
+      const stillThere = await Media.exists({ _id: ugcId, brandId: ad.brandId });
+      if (stillThere) {
+        console.log(
+          `🔁 regenerate[ad=${adId}]: UGC reseed — stack ${referenceMediaIds.length} ref(s) → ` +
+          `1 (ugc-first ${ugcId} from run ${latestRunId})`
+        );
+        referenceMediaIds = [ugcId];
+        referenceSource   = 'ugc-first';
+        ugcReseeded = true;
+      } else {
+        console.log(
+          `🔁 regenerate[ad=${adId}]: UGC reseed skipped — seed ${ugcId} no longer exists on brand ${ad.brandId}`
+        );
+      }
+    }
+  }
+
   // CATALOG-FIRST RESEED. Replaces the replayed Director stack with the ad's
   // first catalog image (see the block header above). Nothing is written back to
   // the Ad — the derived stack goes into this render call only. Still exactly
   // one billable submit either way.
-  const reseed = reseedDecision({ ad, flagEnabled: isRegenReseedCatalogFirstEnabled() });
+  //
+  // SKIPPED when UGC-first already reseeded — see the block above for why the
+  // operator-picked UGC outranks catalog-first on regen (same rationale as
+  // seededUniverseService's cascade ordering at generate time).
+  const reseed = ugcReseeded
+    ? { reseed: false, reason: 'ugc-first reseed already applied' }
+    : reseedDecision({ ad, flagEnabled: isRegenReseedCatalogFirstEnabled() });
   if (!reseed.reseed) {
     console.log(`🔁 regenerate[ad=${adId}]: catalog reseed skipped — ${reseed.reason}`);
   } else {
