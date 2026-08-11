@@ -250,6 +250,27 @@ check('S12 the sentence preference is in the SHIPPED selector, ahead of the snip
     'every manufactured candidate must be judged before it can be typeset');
 });
 
+check('S13 a hard limiter can never be typeset, even as a curated snippet', () => {
+  // hasPositiveSignal is a word list and "best suited for lighter activities" contains
+  // "best", so the limiter check is the only thing standing between that phrase and an
+  // ad. It is a SEPARATE predicate from the positivity one, so it needs its own case:
+  // a mutation making hasHardLimiter always-false is invisible otherwise.
+  const limiter = 'love it, best suited for lighter activities';
+  assert.ok(limiter.length <= 140);
+  assert.strictEqual(pickQuoteText({ text: 'q'.repeat(200), snippet: limiter }), '',
+    'a snippet that argues against the purchase must not be typeset');
+});
+check('S14 a neutral-but-real full quote is NOT refused (the gate is targeted)', () => {
+  // The opposite failure to S13, and just as damaging. hasPositiveSignal is a LEXEME
+  // allowlist: this is specific, credible durability proof with no flattery word in it.
+  // The unabridged text is trusted because it was already judged upstream — twice — so
+  // over-applying the typeset gate to it would silently delete good testimonials.
+  const real = 'The fabric held up through a whole season of training.';
+  assert.ok(real.length <= 140);
+  assert.strictEqual(pickQuoteText({ text: real, snippet: 'held up' }), real,
+    'the unabridged, already-judged text must still print');
+});
+
 console.log('V. The video snippet cap is untouched');
 
 check('V1 quoteSnippetService still caps at 50 for the 3s overlay', () => {
