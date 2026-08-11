@@ -23,7 +23,8 @@ const { normalizeBrandName } = require('../models/Brand');
 const progressService = require('./progressService');
 const {
   storedStyleForUrl,
-  technicalInsightsFromStored
+  technicalInsightsFromStored,
+  shouldApplyStoredShot
 } = require('./ingestShotClassifyService');
 
 const MAX_ALT_IMAGES = 12;
@@ -594,9 +595,11 @@ async function materializeImage({ sourceUrl, product, imageRole, feedIndex = nul
       existing.metadata = existing.metadata || {};
       existing.metadata.feedIndex = feedIndex;
     }
-    // Backfill ingest shot style when Media was created before the
-    // product had imageShotStyles (or before this copy path existed).
-    if (storedShot && !existing.technicalInsights?.shotStyle) {
+    // Backfill or newer-wins refresh of ingest shot style. Applies when
+    // Media has no shotStyle yet, OR when the CatalogProduct entry is
+    // strictly newer (threshold retune / re-classify). Equal/unknown
+    // timestamps never thrash — see shouldApplyStoredShot.
+    if (shouldApplyStoredShot(existing.technicalInsights, storedShot)) {
       patch['technicalInsights.shotStyle'] = storedShot.shotStyle;
       patch['technicalInsights.shotStyleConfidence'] = storedShot.shotStyleConfidence;
       patch['technicalInsights.shotStyleMetrics'] = storedShot.shotStyleMetrics;
@@ -666,7 +669,7 @@ async function materializeImage({ sourceUrl, product, imageRole, feedIndex = nul
     if (err.code === 11000) {
       const raced = await Media.findOne({ brandId: product.brandId, source: 'catalog-product', externalId });
       if (!raced) return raced;
-      if (storedShot && !raced.technicalInsights?.shotStyle) {
+      if (shouldApplyStoredShot(raced.technicalInsights, storedShot)) {
         const patch = {
           'technicalInsights.shotStyle': storedShot.shotStyle,
           'technicalInsights.shotStyleConfidence': storedShot.shotStyleConfidence,

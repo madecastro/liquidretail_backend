@@ -74,12 +74,32 @@ const DEFAULTS = Object.freeze({
     64_000,
     parseInt(process.env.CATALOG_INGEST_SHOT_CLASSIFY_MAX_BYTES, 10) || 5_000_000
   ),
-  // Per-session (per-sync) wall-clock budget. After this, STOP and let the
-  // detect-time fallback cover the rest. No silent caps: skipped count is
-  // always logged via session.logSummary().
+  // Per-session (per-sync) wall-clock budget for the CLASSIFY PHASE only.
+  // Clock starts at beginClassifyPhase() — NOT createSession() — so Graph
+  // pagination / product upserts cannot burn the budget before any image
+  // work runs. After this, STOP and let the detect-time fallback cover
+  // the rest. No silent caps: skipped count is always logged via
+  // session.logSummary().
   budgetMs: Math.max(
     1_000,
     parseInt(process.env.CATALOG_INGEST_SHOT_CLASSIFY_BUDGET_MS, 10) || 120_000
+  ),
+  // Wall-clock cap on the sharp decode / stats step AFTER bytes are in
+  // hand. Fetch has its own timeout; without this, a pathological buffer
+  // can pin a worker slot forever (libvips block). See classifyWithCpuGuard.
+  cpuMs: Math.max(
+    100,
+    parseInt(process.env.CATALOG_INGEST_SHOT_CLASSIFY_CPU_MS, 10) || 8_000
+  ),
+  // Optional cheap gate before full decode (0 disables). Refuse huge or
+  // long-animated assets that are not worth a sharp pipeline.
+  maxDecodePixels: Math.max(
+    0,
+    parseInt(process.env.CATALOG_INGEST_SHOT_CLASSIFY_MAX_DECODE_PIXELS, 10) || 40_000_000
+  ),
+  maxAnimatedPages: Math.max(
+    0,
+    parseInt(process.env.CATALOG_INGEST_SHOT_CLASSIFY_MAX_ANIMATED_PAGES, 10) || 24
   ),
   // Max 3xx hops after each hop's destination is re-validated. Zero would
   // also be safe; a small budget keeps ordinary CDN http→https / edge hops
@@ -957,6 +977,40 @@ function technicalInsightsFromStored(entry) {
 }
 
 /**
+ * Timestamp ms from a technicalInsights-shaped object (or null).
+ * Prefers updatedAt, falls back to shotStyleMetrics.at.
+ */
+function technicalInsightsTimestampMs(ti) {
+  if (!ti || typeof ti !== 'object') return null;
+  const raw = ti.updatedAt || (ti.shotStyleMetrics && ti.shotStyleMetrics.at) || null;
+  if (!raw) return null;
+  const t = raw instanceof Date ? raw.getTime() : new Date(raw).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * Whether a CatalogProduct-derived storedShot should write onto Media.
+ * Conservative newer-wins: apply when Media has no shotStyle, OR when the
+ * product entry is strictly newer than Media's stored stamp. Equal/unknown
+ * timestamps do NOT thrash (no refresh). Used by materializeImage so a
+ * threshold retune / re-classify can supersede a stale Media value without
+ * bouncing on every materialize.
+ *
+ * @param {object|null|undefined} existingTi  Media.technicalInsights
+ * @param {object|null|undefined} storedShot  technicalInsightsFromStored(...)
+ * @returns {boolean}
+ */
+function shouldApplyStoredShot(existingTi, storedShot) {
+  if (!storedShot || !storedShot.shotStyle) return false;
+  if (!existingTi || !existingTi.shotStyle) return true;
+  const existingMs = technicalInsightsTimestampMs(existingTi);
+  const storedMs = technicalInsightsTimestampMs(storedShot);
+  // Missing either stamp → leave Media alone (never thrash).
+  if (existingMs == null || storedMs == null) return false;
+  return storedMs > existingMs;
+}
+
+/**
  * Merge URL-keyed style arrays. Later entries with the same URL replace
  * earlier ones.
  *
@@ -1014,25 +1068,37 @@ function collectProductImageUrls(imageUrl, additionalImages) {
  * use a post-loop pass (see each writer's pendingClassify pattern) so a
  * hung image fetch can never truncate a catalog.
  *
+ * BUDGET CLOCK: createSession does NOT start the budget. Writers call
+ * beginClassifyPhase() immediately before the post-loop classify pass.
+ * That is what arms startedAt + the AbortController timer. Graph
+ * pagination / category stamping / upserts that precede classification
+ * must not burn the ceiling (Blocker 1).
+ *
  * @param {object} [opts]
  * @param {number} [opts.concurrency]
  * @param {number} [opts.timeoutMs]
  * @param {number} [opts.maxBytes]
  * @param {number} [opts.budgetMs]
+ * @param {number} [opts.cpuMs]          sharp/decode wall-clock cap
  * @param {function} [opts.fetchBuffer]   test double for safeFetchBuffer
  * @param {function} [opts.classifyShotStyle] test double for imageShotHeuristicService
  * @param {function} [opts.lookup]        DNS stub (tests)
  * @param {function} [opts.fetchImpl]     injectable low-level fetch (tests)
  * @param {function} [opts.now]           () => ms epoch (tests)
+ * @param {function} [opts.metadataFn]    (buf) => Promise<meta> optional sharp.metadata stub
  */
 function createSession(opts = {}) {
   const concurrency = Math.max(1, opts.concurrency ?? DEFAULTS.concurrency);
   const timeoutMs = opts.timeoutMs ?? DEFAULTS.timeoutMs;
   const maxBytes = opts.maxBytes ?? DEFAULTS.maxBytes;
   const budgetMs = opts.budgetMs ?? DEFAULTS.budgetMs;
+  const cpuMs = opts.cpuMs ?? DEFAULTS.cpuMs;
+  const maxDecodePixels = opts.maxDecodePixels ?? DEFAULTS.maxDecodePixels;
+  const maxAnimatedPages = opts.maxAnimatedPages ?? DEFAULTS.maxAnimatedPages;
   const classifyShotStyle = opts.classifyShotStyle || defaultClassifyShotStyle;
   const now = opts.now || Date.now;
   const lookup = opts.lookup || defaultLookup;
+  const metadataFn = opts.metadataFn || null;
 
   // Default path: safeFetchBuffer (DNS once + pin + single deadline).
   // Injected fetchBuffer (harnesses): gate SSRF once here, then call the
@@ -1080,19 +1146,25 @@ function createSession(opts = {}) {
     });
   }
 
-  const startedAt = now();
+  // startedAt is null until beginClassifyPhase(). DO NOT set it here —
+  // that was the Blocker 1 silent no-op (budget burned by Graph/upserts).
+  let startedAt = null;
+  let phaseStarted = false;
   const totals = {
     considered: 0,
     classified: 0,
     skippedExisting: 0,
     skippedBudget: 0,
+    skippedAbandoned: 0, // pendingClassify never attempted (cancel/fatal)
     skippedFlagOff: 0,
-    failed: 0,       // classify returned null / threw
+    failed: 0,       // classify returned null / threw / cpu timeout
     fetchFailed: 0,
     ssrfRejected: 0, // distinct from fetchFailed — hostile/private URL
     timedOut: 0,
     tooLarge: 0,
-    maxInFlight: 0
+    cpuTimedOut: 0,  // sharp/decode wall-clock exceeded
+    maxInFlight: 0,
+    abandonReason: null
   };
   let inFlight = 0;
   let budgetExhausted = false;
@@ -1100,10 +1172,13 @@ function createSession(opts = {}) {
   // Session-level abort: when wall-clock budget expires, in-flight workers
   // observe it (not only the "claim next URL" check). Prevents a wave of
   // concurrency workers from overrunning by concurrency × worst-case.
+  // Armed ONLY in beginClassifyPhase — not at createSession.
   const budgetAc = new AbortController();
   let budgetTimer = null;
+
   function armBudgetTimer() {
     if (budgetTimer != null) return;
+    if (!phaseStarted || startedAt == null) return;
     // If now() is injectable (tests), poll rather than trusting setTimeout
     // wall clock — harnesses advance a fake clock without real delays.
     if (opts.now) {
@@ -1117,13 +1192,37 @@ function createSession(opts = {}) {
     }, left);
     if (typeof budgetTimer.unref === 'function') budgetTimer.unref();
   }
-  armBudgetTimer();
+
+  /**
+   * Start the classify-phase budget clock. Call this immediately before
+   * the post-loop classify pass — never at session creation.
+   * Idempotent: a second call is a no-op (one ceiling per sync).
+   */
+  function beginClassifyPhase() {
+    if (phaseStarted) return false;
+    phaseStarted = true;
+    startedAt = now();
+    armBudgetTimer();
+    return true;
+  }
+
+  function hasClassifyPhaseStarted() {
+    return phaseStarted;
+  }
 
   function budgetLeft() {
+    if (!phaseStarted || startedAt == null) return budgetMs;
     return budgetMs - (now() - startedAt);
   }
 
   function budgetOk() {
+    if (!phaseStarted || startedAt == null) {
+      // classifyUrls auto-starts the phase (belt-and-braces for unit
+      // tests). Writers MUST still call beginClassifyPhase explicitly
+      // so abandonPending can tell "never attempted" from "ran" — the
+      // harness fails any writer that omits the call.
+      beginClassifyPhase();
+    }
     if (budgetExhausted) return false;
     if (budgetLeft() <= 0) {
       budgetExhausted = true;
@@ -1131,6 +1230,114 @@ function createSession(opts = {}) {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Count outstanding pendingClassify image URLs as abandoned when the
+   * classify phase never runs (Meta fatal early-return, CancelledError,
+   * or any exit that skips the post-loop pass). Distinguishes
+   * "0 images needed classifying" from "N images were never attempted".
+   *
+   * No-op once beginClassifyPhase has been called (budget/skipBudget
+   * own that path). Safe to call from finally.
+   *
+   * @param {Array<{imageUrl?, additionalImages?, existingStyles?}>} pendingItems
+   * @param {string} [reason]
+   * @returns {number} URLs counted as abandoned
+   */
+  function abandonPending(pendingItems, reason = 'phase_skipped') {
+    if (phaseStarted) return 0;
+    let n = 0;
+    for (const item of pendingItems || []) {
+      if (!item) continue;
+      const urls = collectProductImageUrls(item.imageUrl, item.additionalImages);
+      const existing = Array.isArray(item.existingStyles) ? item.existingStyles : [];
+      for (const url of urls) {
+        // Already-stored styles would have been skippedExisting, not attempted.
+        if (storedStyleForUrl(existing, url)) continue;
+        n++;
+      }
+    }
+    if (n > 0) {
+      totals.skippedAbandoned += n;
+      totals.abandonReason = reason || 'phase_skipped';
+    } else if (!totals.abandonReason && reason) {
+      // Record reason even when zero outstanding (empty pending) so the
+      // summary can still show why the phase was skipped if useful.
+      totals.abandonReason = reason;
+    }
+    return n;
+  }
+
+  /**
+   * Bound the sharp/decode step. HONEST LIMITATION: Promise.race frees
+   * this worker slot when the wall-clock fires, but the underlying
+   * libvips work started by sharp is NOT cancelled — it may continue on
+   * a background thread until it finishes or the process exits. We only
+   * guarantee the classify phase does not wait forever on one buffer.
+   *
+   * Optional cheap metadata pre-check (pages / pixel area) runs first
+   * when enabled; failures degrade to unclassified (same as timeout).
+   */
+  async function classifyWithCpuGuard(buffer) {
+    // Optional pre-check: refuse absurd animated/huge assets before the
+    // full rotate→resize→stats pipeline. Soft-fail on metadata errors.
+    if ((maxDecodePixels > 0 || maxAnimatedPages > 0) && buffer && buffer.length) {
+      try {
+        let meta;
+        if (typeof metadataFn === 'function') {
+          meta = await metadataFn(buffer);
+        } else {
+          // Lazy require so offline harnesses that inject classifyShotStyle
+          // and never touch this branch need no sharp binary. Production
+          // always has sharp (imageShotHeuristicService depends on it).
+          // eslint-disable-next-line global-require
+          const sharp = require('sharp');
+          meta = await sharp(buffer, { failOn: 'none' }).metadata();
+        }
+        if (meta) {
+          const pages = meta.pages || 1;
+          if (maxAnimatedPages > 0 && pages > maxAnimatedPages) {
+            return null;
+          }
+          const w = meta.width || 0;
+          const h = meta.height || 0;
+          if (maxDecodePixels > 0 && w > 0 && h > 0 && (w * h * pages) > maxDecodePixels) {
+            return null;
+          }
+        }
+      } catch (_) {
+        // metadata failed — fall through to full classify (may also fail)
+      }
+    }
+
+    // Wall-clock race. On timeout we return null (unclassified) and the
+    // slot is free; sharp may still be chewing the buffer in the background.
+    let timer = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        resolve({ __cpuTimeout: true });
+      }, cpuMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    try {
+      const raced = await Promise.race([
+        Promise.resolve()
+          .then(() => classifyShotStyle(buffer))
+          .then((r) => ({ __result: r }))
+          .catch(() => ({ __result: null })),
+        timeoutPromise
+      ]);
+      if (raced && raced.__cpuTimeout) {
+        totals.cpuTimedOut++;
+        return null;
+      }
+      return raced && Object.prototype.hasOwnProperty.call(raced, '__result')
+        ? raced.__result
+        : null;
+    } finally {
+      if (timer != null) clearTimeout(timer);
+    }
   }
 
   /**
@@ -1156,7 +1363,8 @@ function createSession(opts = {}) {
       fetchFailed: 0,
       ssrfRejected: 0,
       timedOut: 0,
-      tooLarge: 0
+      tooLarge: 0,
+      cpuTimedOut: 0
     };
 
     const existing = Array.isArray(existingEntries) ? existingEntries : [];
@@ -1182,6 +1390,11 @@ function createSession(opts = {}) {
         stats: { ...callStats, skippedFlagOff: list.length }
       };
     }
+
+    // Ensure phase clock is running (writers should have called
+    // beginClassifyPhase already; this is the safety net so unit tests
+    // of classifyUrls alone still get a correct per-call budget).
+    if (!phaseStarted) beginClassifyPhase();
 
     const pending = [];
     for (const url of list) {
@@ -1308,10 +1521,17 @@ function createSession(opts = {}) {
         return null;
       }
 
+      // CPU/decode bound — see classifyWithCpuGuard (does NOT cancel libvips).
+      const cpuBefore = totals.cpuTimedOut;
       let classified;
       try {
-        classified = await classifyShotStyle(fetched.buffer);
+        classified = await classifyWithCpuGuard(fetched.buffer);
       } catch (_) {
+        return null;
+      }
+      if (totals.cpuTimedOut > cpuBefore) {
+        callStats.cpuTimedOut++;
+        // Treat as failed/unclassified (already counted in totals.cpuTimedOut).
         return null;
       }
       if (!classified || !classified.style) return null;
@@ -1367,8 +1587,11 @@ function createSession(opts = {}) {
     return {
       ...totals,
       budgetMs,
-      elapsedMs: now() - startedAt,
+      cpuMs,
+      // elapsed is relative to classify-phase start; 0 if phase never began
+      elapsedMs: phaseStarted && startedAt != null ? now() - startedAt : 0,
       budgetExhausted,
+      phaseStarted,
       concurrency,
       timeoutMs,
       maxBytes
@@ -1380,12 +1603,18 @@ function createSession(opts = {}) {
     console.log(
       `📷 ${label}: classified=${t.classified} ` +
       `skipExisting=${t.skippedExisting} skipBudget=${t.skippedBudget} ` +
+      `abandoned=${t.skippedAbandoned}` +
+      (t.abandonReason ? `(${t.abandonReason})` : '') + ' ' +
       `fetchFail=${t.fetchFailed} ssrfReject=${t.ssrfRejected} ` +
       `timeout=${t.timedOut} tooLarge=${t.tooLarge} ` +
+      `cpuTimeout=${t.cpuTimedOut} ` +
       `classifyFail=${t.failed} considered=${t.considered} ` +
       `maxInFlight=${t.maxInFlight}/${concurrency} ` +
       `elapsedMs=${t.elapsedMs} budgetMs=${t.budgetMs}` +
       (t.budgetExhausted ? ' BUDGET_EXHAUSTED' : '') +
+      (!t.phaseStarted && t.skippedAbandoned > 0
+        ? ` — ${t.skippedAbandoned} URL(s) never attempted (classify phase skipped)`
+        : '') +
       (t.skippedBudget > 0
         ? ` — ${t.skippedBudget} URL(s) deferred to detect-time fallback`
         : '')
@@ -1402,13 +1631,16 @@ function createSession(opts = {}) {
   }
 
   return {
+    beginClassifyPhase,
+    hasClassifyPhaseStarted,
+    abandonPending,
     classifyUrls,
     classifyProductImages,
     getTotals,
     logSummary,
     dispose,
     // exposed for harnesses
-    _config: { concurrency, timeoutMs, maxBytes, budgetMs }
+    _config: { concurrency, timeoutMs, maxBytes, budgetMs, cpuMs }
   };
 }
 
@@ -1417,6 +1649,8 @@ module.exports = {
   createSession,
   storedStyleForUrl,
   technicalInsightsFromStored,
+  technicalInsightsTimestampMs,
+  shouldApplyStoredShot,
   mergeStyleEntries,
   collectProductImageUrls,
   // SSRF surface (exported for harness + reuse)

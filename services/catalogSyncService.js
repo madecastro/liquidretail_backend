@@ -180,6 +180,10 @@ async function syncCatalogForCred(cred, run = null) {
   // Graph errors that return early).
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  // Reason for abandonPending when the post-loop classify never runs
+  // (Meta fatal early-return or CancelledError). Distinct from
+  // skipBudget (phase ran, ceiling hit).
+  let classifyAbandonReason = null;
   try {
 
   while (url && fetched < MAX_ITEMS) {
@@ -196,7 +200,8 @@ async function syncCatalogForCred(cred, run = null) {
       // Auth / catalog-not-found is fatal; transient is recoverable.
       const code = err.response?.data?.error?.code;
       if (code === 190 || code === 200 || code === 100) {
-        // finally still runs logSummary — no silent truncation.
+        // finally still runs abandonPending + logSummary — no silent truncation.
+        classifyAbandonReason = 'meta_fatal';
         return { ok: false, reason: `Meta error: ${detail}`, added, updated, errors, fetched };
       }
       errors++;
@@ -315,7 +320,10 @@ async function syncCatalogForCred(cred, run = null) {
   }
 
   // Post-loop classify pass — every product row is already persisted.
+  // beginClassifyPhase arms the budget clock HERE (not at createSession)
+  // so Graph pagination / upserts above cannot burn the ceiling.
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
     for (const item of pendingClassify) {
       try {
         const { entries, changed } = await shotSession.classifyProductImages({
@@ -413,9 +421,30 @@ async function syncCatalogForCred(cred, run = null) {
     cappedAt: fetched >= MAX_ITEMS ? MAX_ITEMS : null,
     durationMs: Date.now() - t0
   };
+  } catch (err) {
+    // CancelledError (and any other throw) skips the post-loop pass —
+    // mark so finally can count outstanding pending as abandoned.
+    if (!classifyAbandonReason) {
+      const name = err && (err.name || (err.constructor && err.constructor.name));
+      classifyAbandonReason =
+        name === 'CancelledError' || (err && err.constructor === CancelledError)
+          ? 'cancelled'
+          : 'error';
+    }
+    throw err;
   } finally {
     // Unconditional summary — fatal Graph early-return, cancel throw, and
     // success all report budget truncation (never silent partial classify).
+    // If the classify phase never started, outstanding pendingClassify
+    // URLs are abandoned (not considered=0 "nothing to do").
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          classifyAbandonReason || 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
     try { shotSession.logSummary('📦 shot-classify'); } catch (_) { /* ignore */ }
     try { shotSession.dispose(); } catch (_) { /* ignore */ }
   }

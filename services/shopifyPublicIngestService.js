@@ -394,7 +394,9 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
 
   // Post-loop classify pass — products are already persisted. Failures
   // here cannot un-save a product or skip a sibling SKU's upsert.
+  // Budget clock starts here (beginClassifyPhase), not at createSession.
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
     for (const item of pendingClassify) {
       try {
         const { entries, changed } = await shotSession.classifyProductImages({
@@ -760,10 +762,21 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
     out.reason = 'store rate-limited this server — partials kept; try the Apify method';
   }
   return out;
+  } catch (err) {
+    throw err;
   } finally {
     // Unconditional summary — every exit path (mid-upsert abort, rate-limit
     // return, media/reviews cancel, success, throw) must report budget
     // truncation so a partial classify never looks like "classified everything".
+    // Outstanding pending when classify never ran → abandoned (not considered=0).
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          midUpsertCancelled ? 'cancelled' : 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
     try { shotSession.logSummary('🛍 shot-classify'); } catch (_) { /* ignore */ }
     try { shotSession.dispose(); } catch (_) { /* ignore */ }
   }

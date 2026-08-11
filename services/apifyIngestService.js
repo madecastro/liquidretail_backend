@@ -371,7 +371,9 @@ async function syncBrandShopify(brand, run = null) {
   }
 
   // Post-loop classify pass — products already persisted.
+  // Budget clock starts here (beginClassifyPhase), not at createSession.
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
     for (const item of pendingClassify) {
       try {
         const { entries, changed } = await shotSession.classifyProductImages({
@@ -423,8 +425,19 @@ async function syncBrandShopify(brand, run = null) {
   summary.durationMs = Date.now() - t0;
   console.log(`🛍  Apify Shopify sync done: brand=${brand._id} fetched=${summary.fetched} added=${summary.added} updated=${summary.updated} errors=${summary.errors} in ${summary.durationMs}ms`);
   return summary;
+  } catch (err) {
+    throw err;
   } finally {
     // Unconditional summary — abort, throw, and success all report.
+    // Outstanding pending when classify never ran → abandoned (not considered=0).
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          summary.aborted ? 'cancelled' : 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
     try { shotSession.logSummary('🛍 apify shot-classify'); } catch (_) { /* ignore */ }
     try { shotSession.dispose(); } catch (_) { /* ignore */ }
   }

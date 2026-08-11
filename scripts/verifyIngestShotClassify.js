@@ -27,14 +27,17 @@
  *   (b) idempotency skip removed → B* fails
  *   (c) concurrency left unbounded → C* fails
  *   (d) budget skip silent / not counted → D* fails
+ *   (d1) budget starts at createSession again → D_REGRESSION (Blocker 1) fails
  *   (e) fetch failure throws out of classifyUrls → E* fails
  *   (f) technicalInsightsFromStored removed from materializeImage → F* fails
  *   (g) resolveSeedStyle product form ignores LLM on media → G* fails
  *   (h) detect always recomputes → H* fails
  *   (i) post-DNS private-address check replaced with hostname string match
  *       → S_RESOLVES_PRIVATE fails (the check a naive implementation misses)
- *   (j) hung DNS with no timeout → K1 fails (Blocker 1 regression)
+ *   (j) hung DNS with no timeout → K1 fails
  *   (k) connection not pinned (hostname re-resolve) → S_PIN fails
+ *   (l) abandonPending removed → L* fails (Blocker 2)
+ *   (m) cpu guard removed → M* fails (Blocker 3)
  */
 
 const fs = require('fs');
@@ -276,6 +279,8 @@ async function main() {
       },
       classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
     });
+    // Explicit phase start (writers do this before the post-loop pass).
+    session.beginClassifyPhase();
     const urls = Array.from({ length: 20 }, (_, i) => `https://cdn.example/d${i}.jpg`);
     const r = await session.classifyUrls(urls, []);
     const totals = session.getTotals();
@@ -297,6 +302,167 @@ async function main() {
       `logs=${JSON.stringify(logs)}`);
     check('D5 logSummary names deferred fallback',
       logs.some((l) => /deferred to detect-time|BUDGET_EXHAUSTED/.test(l)));
+    session.dispose();
+  }
+
+  // ── D_REGRESSION (Blocker 1) — MOST IMPORTANT TEST ───────────────────────
+  // Graph/upsert work burns wall clock BETWEEN createSession and the
+  // classify pass. Budget must start at beginClassifyPhase, not createSession.
+  // If the clock is moved back to createSession, this test FAILS (classified=0).
+  {
+    let t = 0;
+    const session = ingest.createSession({
+      lookup: publicLookupOk,
+      concurrency: 2,
+      budgetMs: 1_000,
+      now: () => t,
+      fetchBuffer: async () => {
+        t += 10;
+        return { ok: true, buffer: whiteBuf, tooLarge: false };
+      },
+      classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
+    });
+    // Simulate minutes of Meta Graph pagination + upsert BEFORE classify.
+    t = 5 * 60 * 1000; // 5 minutes of pre-classify work
+    check('D_REGRESSION_0 phase not started at createSession',
+      session.hasClassifyPhaseStarted() === false);
+    // Start budget NOW — the real writers' contract.
+    session.beginClassifyPhase();
+    check('D_REGRESSION_1 beginClassifyPhase arms the clock',
+      session.hasClassifyPhaseStarted() === true);
+    const urls = Array.from({ length: 8 }, (_, i) => `https://cdn.example/dreg${i}.jpg`);
+    const r = await session.classifyUrls(urls, []);
+    const totals = session.getTotals();
+    check('D_REGRESSION_2 pre-phase clock burn does NOT exhaust budget',
+      totals.classified === 8 && totals.skippedBudget === 0,
+      `classified=${totals.classified} skippedBudget=${totals.skippedBudget} ` +
+      `budgetExhausted=${totals.budgetExhausted} considered=${totals.considered}`);
+    check('D_REGRESSION_3 all URLs present in entries',
+      r.entries.length === 8);
+    session.dispose();
+  }
+
+  // ── L. Abandoned pending (Blocker 2) ─────────────────────────────────────
+  {
+    const session = ingest.createSession({
+      lookup: publicLookupOk,
+      budgetMs: 60_000,
+      fetchBuffer: async () => ({ ok: true, buffer: whiteBuf, tooLarge: false }),
+      classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} })
+    });
+    const pending = [
+      {
+        productId: 'p1',
+        imageUrl: 'https://cdn.example/a.jpg',
+        additionalImages: ['https://cdn.example/b.jpg'],
+        existingStyles: []
+      },
+      {
+        productId: 'p2',
+        imageUrl: 'https://cdn.example/c.jpg',
+        additionalImages: [],
+        // c already classified — should NOT count as abandoned attempt
+        existingStyles: [
+          { url: 'https://cdn.example/c.jpg', style: 'lifestyle', confidence: 0.5 }
+        ]
+      }
+    ];
+    // Phase never started (fatal early-return / cancel path).
+    const n = session.abandonPending(pending, 'meta_fatal');
+    const t = session.getTotals();
+    check('L1 abandonPending counts outstanding image URLs',
+      n === 2 && t.skippedAbandoned === 2,
+      `n=${n} abandoned=${t.skippedAbandoned}`);
+    check('L2 already-stored URL not counted as abandoned',
+      t.skippedAbandoned === 2); // c excluded
+    check('L3 abandonReason recorded',
+      t.abandonReason === 'meta_fatal');
+    check('L4 considered stays 0 (never attempted ≠ nothing to do)',
+      t.considered === 0 && t.classified === 0);
+    const logs = [];
+    const orig = console.log;
+    console.log = (...a) => logs.push(a.join(' '));
+    try { session.logSummary('test-abandon'); }
+    finally { console.log = orig; }
+    check('L5 logSummary reports abandoned count and reason',
+      logs.some((l) => /abandoned=2/.test(l) && /meta_fatal/.test(l)),
+      `logs=${JSON.stringify(logs)}`);
+    check('L6 logSummary distinguishes never-attempted',
+      logs.some((l) => /never attempted|classify phase skipped/i.test(l)));
+    // After phase starts, abandonPending is a no-op.
+    session.beginClassifyPhase();
+    const n2 = session.abandonPending(pending, 'should_noop');
+    check('L7 abandonPending no-op after beginClassifyPhase',
+      n2 === 0 && session.getTotals().skippedAbandoned === 2);
+    session.dispose();
+  }
+
+  // ── M. CPU / decode wall-clock guard (Blocker 3) ─────────────────────────
+  {
+    const session = ingest.createSession({
+      lookup: publicLookupOk,
+      concurrency: 1,
+      budgetMs: 60_000,
+      cpuMs: 50,
+      // Skip metadata precheck path so we exercise the race only.
+      maxDecodePixels: 0,
+      maxAnimatedPages: 0,
+      fetchBuffer: async () => ({ ok: true, buffer: whiteBuf, tooLarge: false }),
+      classifyShotStyle: async () => {
+        // Hang longer than cpuMs — Promise.race must free the slot.
+        await new Promise((r) => setTimeout(r, 500));
+        return { style: 'packshot', confidence: 1, metrics: {} };
+      }
+    });
+    session.beginClassifyPhase();
+    const t0 = Date.now();
+    let threw = false;
+    let r;
+    try {
+      r = await session.classifyUrls(['https://cdn.example/slow.jpg'], []);
+    } catch (e) {
+      threw = true;
+    }
+    const elapsed = Date.now() - t0;
+    const t = session.getTotals();
+    check('M1 hung classifyShotStyle does not throw', !threw);
+    check('M2 CPU guard frees slot well under hang duration',
+      elapsed < 300,
+      `elapsed=${elapsed}ms`);
+    check('M3 CPU timeout counted; URL unclassified',
+      t.cpuTimedOut >= 1 &&
+      !ingest.storedStyleForUrl(r.entries, 'https://cdn.example/slow.jpg'),
+      JSON.stringify({ cpuTimedOut: t.cpuTimedOut, entries: r && r.entries }));
+    check('M4 logSummary reports cpuTimeout', (() => {
+      const logs = [];
+      const orig = console.log;
+      console.log = (...a) => logs.push(a.join(' '));
+      try { session.logSummary('test-cpu'); }
+      finally { console.log = orig; }
+      return logs.some((l) => /cpuTimeout=\d+/.test(l) && !/cpuTimeout=0/.test(l));
+    })());
+    session.dispose();
+  }
+  // Optional metadata pre-check rejects huge/animated without full classify.
+  {
+    let classifyCalls = 0;
+    const session = ingest.createSession({
+      lookup: publicLookupOk,
+      budgetMs: 60_000,
+      cpuMs: 5_000,
+      maxDecodePixels: 1_000, // tiny
+      maxAnimatedPages: 2,
+      metadataFn: async () => ({ width: 4000, height: 4000, pages: 1 }),
+      fetchBuffer: async () => ({ ok: true, buffer: whiteBuf, tooLarge: false }),
+      classifyShotStyle: async () => {
+        classifyCalls++;
+        return { style: 'packshot', confidence: 1, metrics: {} };
+      }
+    });
+    session.beginClassifyPhase();
+    await session.classifyUrls(['https://cdn.example/huge.jpg'], []);
+    check('M5 metadata pre-check rejects oversize without classifyShotStyle',
+      classifyCalls === 0 && session.getTotals().classified === 0);
     session.dispose();
   }
 
@@ -371,7 +537,7 @@ async function main() {
     }
   }
 
-  // ── F. materializeImage hand-forward (real helpers; Mongo path offline-noted)
+  // ── F. materializeImage hand-forward — EXECUTE real function (stub Mongo) ─
   {
     // Pure helper — real execution
     const entry = { url: 'https://cdn.example/h.jpg', style: 'lifestyle', confidence: 0.77, at: new Date('2026-08-01') };
@@ -381,22 +547,10 @@ async function main() {
     check('F2 metrics.source is ingest (no full metrics blob)',
       ti.shotStyleMetrics && ti.shotStyleMetrics.source === 'ingest');
 
-    // materializeImage requires Mongo (Media.findOne / Media.create). Cannot
-    // execute offline without a DB. Prove the hand-forward contract via the
-    // pure helpers it calls, and that classifyShotStyle is not in that file.
     const detectSrc = read('services/catalogProductDetectService.js');
-    check('F3 materializeImage uses storedStyleForUrl + technicalInsightsFromStored (imported)',
+    check('F3b materializeImage imports storedStyleForUrl + technicalInsightsFromStored',
       /storedStyleForUrl/.test(detectSrc) && /technicalInsightsFromStored/.test(detectSrc));
-    // Real call path that materializeImage uses:
-    const storedShot = ingest.technicalInsightsFromStored(
-      ingest.storedStyleForUrl(
-        [{ url: 'https://cdn.example/h.jpg', style: 'lifestyle', confidence: 0.5, at: new Date() }],
-        'https://cdn.example/h.jpg'
-      )
-    );
-    check('F4 hand-forward produces technicalInsights patch materialize would assign',
-      !!storedShot && storedShot.shotStyle === 'lifestyle');
-    check('F5 catalogProductDetectService does not call classifyShotStyle',
+    check('F5b catalogProductDetectService source does not reference classifyShotStyle',
       !/classifyShotStyle/.test(detectSrc));
 
     // Media schema paths declared
@@ -405,17 +559,174 @@ async function main() {
     check('F6 Media.technicalInsights declares shotStyle fields',
       tiBlock && /shotStyle\s*:/.test(tiBlock[1]) && /shotStyleConfidence\s*:/.test(tiBlock[1]));
 
-    let sharpCalls = 0;
-    const spyClassify = async () => { sharpCalls++; return { style: 'packshot', confidence: 1, metrics: {} }; };
-    check('F7 hand-forward does not invoke classifyShotStyle',
-      sharpCalls === 0 && storedShot && storedShot.shotStyle === 'lifestyle');
-    void spyClassify;
+    // EXECUTE materializeImage with stubbed Mongo + Cloudinary. Deleting
+    // `if (storedShot) doc.technicalInsights = storedShot` must fail F3/F5.
+    const Media = require('../models/Media');
+    const cloudinaryService = require('../services/cloudinaryService');
+    const heuristic = require('../services/imageShotHeuristicService');
+    const detectSvc = require('../services/catalogProductDetectService');
 
-    // E11000 race path must apply storedShot backfill (source + shape)
-    check('F8 E11000 race path applies storedShot backfill',
-      /err\.code === 11000/.test(detectSrc) &&
-      /storedShot/.test(detectSrc.slice(detectSrc.indexOf('err.code === 11000'))) &&
-      /technicalInsights\.shotStyle/.test(detectSrc.slice(detectSrc.indexOf('err.code === 11000'))));
+    const origFindOne = Media.findOne;
+    const origCreate = Media.create;
+    const origUpdateOne = Media.updateOne;
+    const origUpload = cloudinaryService.uploadUrlToCloudinary;
+    const origClassify = heuristic.classifyShotStyle;
+
+    let classifyCalls = 0;
+    let createdDoc = null;
+    Media.findOne = async () => null; // force create path
+    Media.create = async (doc) => {
+      createdDoc = {
+        _id: '00000000000000000000f001',
+        ...doc,
+        technicalInsights: doc.technicalInsights
+          ? { ...doc.technicalInsights }
+          : undefined
+      };
+      return createdDoc;
+    };
+    Media.updateOne = async () => ({ acknowledged: true });
+    cloudinaryService.uploadUrlToCloudinary = async () => ({
+      secure_url: 'https://res.cloudinary.com/demo/image/upload/x.jpg',
+      width: 100,
+      height: 100
+    });
+    heuristic.classifyShotStyle = async (...args) => {
+      classifyCalls++;
+      return origClassify.apply(heuristic, args);
+    };
+
+    try {
+      const product = {
+        _id: '00000000000000000000p001',
+        brandId: '00000000000000000000b001',
+        advertiserId: '00000000000000000000a001',
+        brand: 'TestBrand',
+        category: null,
+        title: 'Test Shoe',
+        imageShotStyles: [
+          {
+            url: 'https://cdn.example/h.jpg',
+            style: 'lifestyle',
+            confidence: 0.77,
+            at: new Date('2026-08-01T00:00:00.000Z')
+          }
+        ]
+      };
+      const media = await detectSvc.materializeImage({
+        sourceUrl: 'https://cdn.example/h.jpg',
+        product,
+        imageRole: 'hero',
+        feedIndex: 0
+      });
+      // F3: real create-path doc must carry shotStyle from product.
+      // Soft-read technicalInsights so a missing hand-forward fails these
+      // checks (not an uncaught TypeError that aborts the harness).
+      const tiOut = media && media.technicalInsights;
+      check('F3 materializeImage create path stamps technicalInsights.shotStyle',
+        !!media && !!tiOut && tiOut.shotStyle === 'lifestyle',
+        JSON.stringify(tiOut));
+      check('F4 materializeImage create path stamps confidence',
+        !!tiOut && tiOut.shotStyleConfidence === 0.77,
+        JSON.stringify(tiOut));
+      check('F5 materializeImage create path source=ingest marker',
+        !!tiOut && tiOut.shotStyleMetrics && tiOut.shotStyleMetrics.source === 'ingest',
+        JSON.stringify(tiOut));
+      // F7: spy is WIRED into imageShotHeuristicService — must stay 0.
+      // (Previously a tautology: void spyClassify never invoked anything.)
+      check('F7 hand-forward does not invoke classifyShotStyle',
+        classifyCalls === 0 && !!tiOut && tiOut.shotStyle === 'lifestyle',
+        `classifyCalls=${classifyCalls} ti=${JSON.stringify(tiOut)}`);
+
+      // F8 E11000 race path — source structure still requires backfill.
+      check('F8 E11000 race path applies storedShot backfill',
+        /err\.code === 11000/.test(detectSrc) &&
+        /shouldApplyStoredShot|storedShot/.test(
+          detectSrc.slice(detectSrc.indexOf('err.code === 11000'))
+        ) &&
+        /technicalInsights\.shotStyle/.test(
+          detectSrc.slice(detectSrc.indexOf('err.code === 11000'))
+        ));
+
+      // Existing-doc backfill + newer-wins
+      const oldTi = ingest.technicalInsightsFromStored({
+        url: 'https://cdn.example/h.jpg',
+        style: 'packshot',
+        confidence: 0.5,
+        at: new Date('2026-01-01T00:00:00.000Z')
+      });
+      const existingDoc = {
+        _id: '00000000000000000000f002',
+        brandId: product.brandId,
+        source: 'catalog-product',
+        externalId: 'x',
+        technicalInsights: oldTi,
+        metadata: {}
+      };
+      Media.findOne = async () => existingDoc;
+      let patched = null;
+      Media.updateOne = async (_q, upd) => {
+        patched = upd.$set;
+        return { acknowledged: true };
+      };
+      // Product entry is newer (2026-08-01) than Media (2026-01-01).
+      const refreshed = await detectSvc.materializeImage({
+        sourceUrl: 'https://cdn.example/h.jpg',
+        product,
+        imageRole: 'hero',
+        feedIndex: 0
+      });
+      check('F9 newer CatalogProduct shotStyle supersedes older Media value',
+        patched &&
+        patched['technicalInsights.shotStyle'] === 'lifestyle' &&
+        refreshed.technicalInsights.shotStyle === 'lifestyle',
+        JSON.stringify(patched));
+
+      // Equal/older product stamp must NOT thrash.
+      product.imageShotStyles[0].at = new Date('2025-01-01T00:00:00.000Z');
+      existingDoc.technicalInsights = ingest.technicalInsightsFromStored({
+        url: 'https://cdn.example/h.jpg',
+        style: 'packshot',
+        confidence: 0.9,
+        at: new Date('2026-06-01T00:00:00.000Z')
+      });
+      patched = null;
+      await detectSvc.materializeImage({
+        sourceUrl: 'https://cdn.example/h.jpg',
+        product,
+        imageRole: 'hero',
+        feedIndex: 0
+      });
+      check('F10 older product stamp does not thrash Media shotStyle',
+        patched == null || patched['technicalInsights.shotStyle'] == null,
+        JSON.stringify(patched));
+
+      // shouldApplyStoredShot pure contract
+      checkFn('F11 shouldApplyStoredShot newer-wins pure', () => {
+        assert.strictEqual(
+          ingest.shouldApplyStoredShot(null, ti),
+          true
+        );
+        assert.strictEqual(
+          ingest.shouldApplyStoredShot({ shotStyle: 'packshot' }, ti),
+          false // missing timestamps → conservative no
+        );
+        const older = ingest.technicalInsightsFromStored({
+          url: 'u', style: 'packshot', confidence: 0.5, at: new Date('2020-01-01')
+        });
+        const newer = ingest.technicalInsightsFromStored({
+          url: 'u', style: 'lifestyle', confidence: 0.9, at: new Date('2026-08-01')
+        });
+        assert.strictEqual(ingest.shouldApplyStoredShot(older, newer), true);
+        assert.strictEqual(ingest.shouldApplyStoredShot(newer, older), false);
+      });
+    } finally {
+      Media.findOne = origFindOne;
+      Media.create = origCreate;
+      Media.updateOne = origUpdateOne;
+      cloudinaryService.uploadUrlToCloudinary = origUpload;
+      heuristic.classifyShotStyle = origClassify;
+    }
   }
 
   // ── G. resolveSeedStyle precedence (Media + CatalogProduct forms) ────────
@@ -539,7 +850,8 @@ async function main() {
   // ── I. Writers: post-loop classify architecture (source structure) ───────
   // Full writer execution needs Mongo + network. Offline we prove the
   // architectural contract: upsert loop pushes to pendingClassify; classify
-  // runs only after the loop; try/finally logSummary.
+  // runs only after the loop; try/finally logSummary; beginClassifyPhase
+  // before the post-loop pass (missing call fails loudly here).
   {
     const writers = {
       generic: read('services/genericCatalogIngestService.js'),
@@ -567,10 +879,22 @@ async function main() {
         /finally\s*\{[^}]*logSummary/.test(src.replace(/\n/g, ' ')));
       check(`I5 ${name} $set imageShotStyles on classify pass`,
         /imageShotStyles/.test(src));
+      // Blocker 1: every writer MUST call beginClassifyPhase before the pass.
+      // Missing this silently reverts to auto-start-on-first-classify which is
+      // fine for budget timing, but abandonPending cannot distinguish skip
+      // without the explicit call — fail loud if omitted.
+      check(`I5b ${name} calls beginClassifyPhase before post-loop classify`,
+        /beginClassifyPhase\s*\(/.test(src));
+      check(`I5c ${name} abandonPending on skipped classify phase`,
+        /abandonPending\s*\(/.test(src) && /hasClassifyPhaseStarted\s*\(/.test(src));
     }
 
-    // Behavioral proof of the architecture: simulate the writer contract offline.
+    // Behavioral proof: REAL writer ordering — createSession BEFORE upsert,
+    // clock advances during upsert (Graph/category work), then
+    // beginClassifyPhase + classify. Models catalogSyncService, not the
+    // old harness that created the session after upsert (which hid Blocker 1).
     {
+      let t = 0;
       const upserted = [];
       const pending = [];
       const products = [
@@ -578,33 +902,35 @@ async function main() {
         { id: '2', imageUrl: 'https://cdn.example/2.jpg' },
         { id: '3', imageUrl: 'https://cdn.example/3.jpg' }
       ];
-      // Upsert loop — never awaits classify
-      for (const p of products) {
-        upserted.push(p.id);
-        pending.push(p);
-      }
-      check('I6 simulated upsert loop completes all products before any classify',
-        upserted.length === 3);
 
-      let classifyStarted = false;
-      let dnsDuringUpsert = false;
-      // Mark upsert phase complete before any classify work.
-      const upsertComplete = upserted.length === 3;
+      // Session created FIRST (as every writer does), budget NOT started.
       const session = ingest.createSession({
-        lookup: async () => {
-          if (!upsertComplete) dnsDuringUpsert = true;
-          return publicLookupOk();
-        },
+        lookup: publicLookupOk,
         fetchBuffer: async () => {
-          classifyStarted = true;
-          // Prove upserts already finished
-          assert.strictEqual(upserted.length, 3);
+          t += 5;
           return { ok: true, buffer: whiteBuf, tooLarge: false };
         },
         classifyShotStyle: async () => ({ style: 'packshot', confidence: 1, metrics: {} }),
         concurrency: 2,
-        budgetMs: 60_000
+        budgetMs: 1_000,
+        now: () => t
       });
+      check('I6 session created before upsert; phase not started',
+        session.hasClassifyPhaseStarted() === false);
+
+      // Upsert loop burns wall clock (Meta page timeouts, category trees…)
+      for (const p of products) {
+        upserted.push(p.id);
+        pending.push(p);
+        t += 500; // per-product pre-classify work
+      }
+      check('I7 upsert loop completed with clock past budgetMs',
+        upserted.length === 3 && t > 1_000,
+        `t=${t}`);
+
+      // Without beginClassifyPhase, a createSession-started budget would
+      // already be exhausted. Explicit start resets the window.
+      session.beginClassifyPhase();
       for (const item of pending) {
         await session.classifyProductImages({
           imageUrl: item.imageUrl,
@@ -612,10 +938,10 @@ async function main() {
           existingStyles: []
         });
       }
-      check('I7 classify DNS never ran during upsert phase',
-        dnsDuringUpsert === false && upsertComplete === true);
-      check('I8 post-loop classify ran after full upsert set',
-        classifyStarted === true && upserted.length === 3);
+      const totals = session.getTotals();
+      check('I8 post-loop classify still classifies after pre-phase burn',
+        totals.classified === 3 && totals.skippedBudget === 0,
+        JSON.stringify(totals));
       session.dispose();
     }
   }

@@ -286,7 +286,9 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
   }
 
   // Post-loop classify pass — products already persisted.
+  // Budget clock starts here (beginClassifyPhase), not at createSession.
   if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
     for (const item of pendingClassify) {
       try {
         const { entries, changed } = await shotSession.classifyProductImages({
@@ -399,8 +401,20 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
     out.reason = access.reason || `rate-limited while scanning ${origin}`;
   }
   return out;
+  } catch (err) {
+    // Re-throw after finally marks abandoned pending when phase never started.
+    throw err;
   } finally {
     // Unconditional summary — cancel, throw, and success all report.
+    // Outstanding pending when classify never ran → abandoned (not considered=0).
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          cancelled ? 'cancelled' : 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
     try { shotSession.logSummary(`${LOG} shot-classify`); } catch (_) { /* ignore */ }
     try { shotSession.dispose(); } catch (_) { /* ignore */ }
   }
