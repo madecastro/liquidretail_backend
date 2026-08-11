@@ -15,6 +15,7 @@
 const mongoose = require('mongoose');
 const Brand = require('../../models/Brand');
 const CatalogProduct = require('../../models/CatalogProduct');
+const { resolveStoreOrigin } = require('../shopifyAccessResolver');
 
 async function resolveScope({ req, args }) {
   if (!req?.advertiserId) {
@@ -25,8 +26,15 @@ async function resolveScope({ req, args }) {
   if (!mongoose.isValidObjectId(rawBrandId)) {
     return { ok: false, error: `brandId "${rawBrandId}" is not a valid ObjectId` };
   }
+  // `apifyDemo.shopifyUrl`, NOT a bare `shopifyUrl` — there is no top-level
+  // shopifyUrl on brandSchema (models/Brand.js declares it only inside
+  // apifyDemo). This projection is load-bearing twice over: resolveStoreOrigin
+  // leads with brand.apifyDemo?.shopifyUrl, and THIS doc is what gets handed to
+  // syncBrandGenericCatalog — so a missing path here silently starves the
+  // service too, and it resolves the store from websiteUrl instead. See the
+  // .select() trap in CLAUDE.md §4: Mongoose neither throws nor warns.
   const brand = await Brand.findOne({ _id: rawBrandId, advertiserId: req.advertiserId })
-    .select('_id name websiteUrl shopifyUrl');
+    .select('_id name websiteUrl apifyDemo.shopifyUrl');
   if (!brand) return { ok: false, error: `brand ${rawBrandId} not found` };
   return { ok: true, brand };
 }
@@ -36,9 +44,12 @@ async function preview({ req, args }) {
   if (!scope.ok) return scope;
   const { brand } = scope;
 
-  const origin = brand.shopifyUrl || brand.websiteUrl;
+  // The SHARED resolver, not a local cascade. syncBrandGenericCatalog resolves
+  // the origin with resolveStoreOrigin(brand), so anything else here can show
+  // the operator one store in the preview and then scrape a different one.
+  const origin = resolveStoreOrigin(brand);
   if (!origin) {
-    return { ok: false, error: 'brand has neither shopifyUrl nor websiteUrl configured — set one via brand.patch first' };
+    return { ok: false, error: 'brand has no catalog URL configured (apifyDemo.shopifyUrl or websiteUrl) — set one via brand.patch first' };
   }
   if (process.env.GENERIC_CATALOG_ENABLED === 'false') {
     return { ok: false, error: 'generic-sitemap method disabled on this deployment (GENERIC_CATALOG_ENABLED=false)' };

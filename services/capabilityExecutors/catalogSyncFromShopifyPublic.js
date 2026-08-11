@@ -2,7 +2,10 @@
 //
 // Two-phase workflow that runs shopifyPublicIngestService.syncBrandShopifyDirect
 // — the public-storefront path (products.json → Storefront GraphQL →
-// sitemap fallback, cf. shopifyAccessResolver). Requires Brand.shopifyUrl.
+// sitemap fallback, cf. shopifyAccessResolver). Needs a store origin, which
+// resolveStoreOrigin derives from `Brand.apifyDemo.shopifyUrl` falling back to
+// `Brand.websiteUrl`. (This header used to say "Requires Brand.shopifyUrl" —
+// there is no such top-level field; it lives under apifyDemo.)
 //
 // Heavy sync: the SSE stream stays open for the whole run
 // (potentially minutes at high catalog sizes). MAX_STEPS is capped
@@ -16,6 +19,7 @@ const mongoose = require('mongoose');
 const Brand = require('../../models/Brand');
 const CatalogProduct = require('../../models/CatalogProduct');
 const { syncBrandShopifyDirect } = require('../shopifyPublicIngestService');
+const { resolveStoreOrigin } = require('../shopifyAccessResolver');
 
 async function resolveScope({ req, args }) {
   if (!req?.advertiserId) {
@@ -26,8 +30,15 @@ async function resolveScope({ req, args }) {
   if (!mongoose.isValidObjectId(rawBrandId)) {
     return { ok: false, error: `brandId "${rawBrandId}" is not a valid ObjectId` };
   }
+  // `apifyDemo.shopifyUrl`, NOT a bare `shopifyUrl` — there is no top-level
+  // shopifyUrl on brandSchema (models/Brand.js declares it only inside
+  // apifyDemo). This projection is load-bearing twice over: resolveStoreOrigin
+  // leads with brand.apifyDemo?.shopifyUrl, and THIS doc is what gets handed to
+  // syncBrandShopifyDirect — so a missing path here silently starves the service
+  // too, and it resolves the store from websiteUrl instead. See the .select()
+  // trap in CLAUDE.md §4: Mongoose neither throws nor warns.
   const brand = await Brand.findOne({ _id: rawBrandId, advertiserId: req.advertiserId })
-    .select('_id name shopifyUrl websiteUrl');
+    .select('_id name websiteUrl apifyDemo.shopifyUrl');
   if (!brand) return { ok: false, error: `brand ${rawBrandId} not found` };
   return { ok: true, brand };
 }
@@ -37,10 +48,13 @@ async function preview({ req, args }) {
   if (!scope.ok) return scope;
   const { brand } = scope;
 
-  if (!brand.shopifyUrl && !brand.websiteUrl) {
-    return { ok: false, error: 'brand has neither shopifyUrl nor websiteUrl — nothing to sync from' };
+  // The SHARED resolver, not a local cascade. syncBrandShopifyDirect resolves the
+  // origin with resolveStoreOrigin(brand), so anything else here can show the
+  // operator one store in the preview and then scrape a different one.
+  const store = resolveStoreOrigin(brand);
+  if (!store) {
+    return { ok: false, error: 'brand has no store origin configured (apifyDemo.shopifyUrl or websiteUrl) — nothing to sync from' };
   }
-  const store = brand.shopifyUrl || brand.websiteUrl;
 
   const existing = await CatalogProduct.countDocuments({ brandId: brand._id });
   const cap = Math.max(1, parseInt(process.env.SHOPIFY_DIRECT_LIMIT, 10) || 200);

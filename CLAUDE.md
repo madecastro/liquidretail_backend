@@ -639,6 +639,26 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `models/Brand.js` (58 today) and asserts every `Brand.find*().select(…)` path in
   `services/` + `routes/` is one of them — it is the general form of this trap, so
   prefer extending it over adding a one-off string check.
+  **SECOND LIVE INSTANCE, caught by Group A and fixed 2026-08-10 — the harness
+  paid for itself.** `catalogSyncFromShopifyPublic` and
+  `catalogSyncFromGenericSitemap` both did `.select('… shopifyUrl')`. **There is
+  no top-level `shopifyUrl` on brandSchema** — it exists only as
+  `apifyDemo.shopifyUrl`, and it is a *separate field from `websiteUrl`* exactly
+  because a brand's catalog can live on a different host from its marketing site.
+  Two compounding faults: the projection named a nonexistent path AND never
+  selected `apifyDemo`, and that projected doc is handed straight to
+  `syncBrandShopifyDirect` / `syncBrandGenericCatalog` — whose own
+  `resolveStoreOrigin(brand)` (`brand?.apifyDemo?.shopifyUrl || …`) then fell
+  through to `websiteUrl`. **So the bad projection propagated past the executor
+  into the real scrape: the wrong host was pulled, silently.** Both executors also
+  re-implemented the cascade locally as `brand.shopifyUrl || brand.websiteUrl`
+  (two tiers, missing the one that matters); they now call the shared
+  `resolveStoreOrigin`, so a preview cannot advertise one store and scrape
+  another. A brand with a catalog URL but no `websiteUrl` was also falsely
+  refused. **Lesson generalised: when an executor projects a doc it then PASSES
+  DOWN, the projection must satisfy the callee's field reads, not just its own** —
+  and prefer the shared resolver over a re-implemented cascade. The stale header
+  claiming "Requires Brand.shopifyUrl" is why this looked right to three readers.
 - **Gate a provider tier on the PRIMARY key, never the fallback.** `wantGpt`
   (`brandEnrichmentService.js`) gated on `OPENAI_API_KEY` while the call itself goes
   through `atlasLlmService.chatCompletion`, whose primary is Atlas and whose direct
