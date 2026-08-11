@@ -353,6 +353,32 @@ function safeAreaForPlatformFormat(platformFormat) {
   return PLATFORM_FORMATS[platformFormat]?.safeArea || { top: 0, bottom: 0 };
 }
 
+/**
+ * `safeArea` expressed as FRACTIONS of frame height (0..1).
+ *
+ * The raw bands are CANVAS pixels (canvas is width-normalized at 1000 — see
+ * the header comment), so dividing them by `deliveryDims.height` silently
+ * under-reports: pmax_video_16_9's 113 is 20% of its 563-high canvas but only
+ * 10.5% of its 1080-high delivery. Any consumer holding pixels without the
+ * canvas has to guess, so this is the one place the space is resolved.
+ *
+ * Pure and total: an unknown key, a missing canvas, or a non-positive height
+ * yields zeros rather than NaN/Infinity — a guardrail drawn from NaN paints
+ * over the whole frame, which is a worse lie than drawing nothing.
+ */
+function safeAreaFractions(platformFormat) {
+  const caps = PLATFORM_FORMATS[platformFormat];
+  const band = safeAreaForPlatformFormat(platformFormat);
+  const height = Number(caps?.canvas?.height);
+  if (!Number.isFinite(height) || height <= 0) return { top: 0, bottom: 0 };
+  const clamp = (px) => {
+    const n = Number(px);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.min(1, n / height);
+  };
+  return { top: clamp(band.top), bottom: clamp(band.bottom) };
+}
+
 function chromeStyleHintsForPlatformFormat(platformFormat) {
   return PLATFORM_FORMATS[platformFormat]?.chromeStyleHints
     || ['ig_reels', 'tiktok', 'yt_shorts', 'editorial'];
@@ -945,7 +971,25 @@ function formatCatalog() {
       aspectRatio: caps.aspectRatio,
       deliveryDims: { ...caps.deliveryDims },
       kinds: [...caps.kinds],
-      status: caps.status
+      status: caps.status,
+      // Reserved bands the PLACEMENT's own native UI covers, as FRACTIONS of
+      // frame height (0..1) — the same clamp the renderer applies to titling.
+      // Exposed so the ad-preview chrome can draw its clear-zone guardrail
+      // from the real clamp instead of frontend-side approximations, which is
+      // the only way the guardrail and the render can agree.
+      //
+      // ⚠️ NORMALISED ON PURPOSE, and it is not tidiness. `safeArea` is in
+      // CANVAS pixels (canvas is width-normalized at 1000 — see the header
+      // comment), NOT deliveryDims pixels, and the two differ: pmax_video_16_9
+      // is 113/563 = 20% of the canvas but would read as 113/1080 = 10.5%
+      // against delivery. Publishing raw pixels without also publishing
+      // `canvas` hands every consumer that trap; a preview guardrail that
+      // picks the wrong divisor understates the reserved band by half and
+      // tells the operator their title is safe when the renderer will clamp
+      // it. Normalising here is the only place the space is unambiguous.
+      //
+      // Display-only: nothing about generation reads this from the catalog.
+      safeAreaPct: safeAreaFractions(key)
     };
   }
 
