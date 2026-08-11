@@ -346,16 +346,23 @@ function directivesForProfile(profile) {
 // the product as the star. Ambient life is wanted; product morph and fantasy
 // motion are still banned. Multi-reference stacks are packshot-only — lifestyle
 // ships ONE ref (the seed). See buildReferenceImages / resolveLifestyleVideoRefCount.
+// Plate wording note (Lane O / owner 2026-08): buildReferenceImages may already
+// have run reframeReferenceForAspect (generative fit) on the seed BEFORE this
+// prompt is submitted. The image AS HANDED TO THE MODEL is final — do not tell
+// the model the original capture is untouched, and do not licence further
+// extension. Upstream fit is not licence to continue extending.
 const LIFESTYLE_DIRECTIVES = {
   role:
-    `Role: Lifestyle motion editor. Bring the supplied lifestyle photograph to life as an authentic, lived-in moment — ` +
-    `do NOT rebuild, restyle, restage, or replace the scene. The supplied image is the finished plate and source of truth.`,
+    `Role: Lifestyle motion editor. Bring the lifestyle photograph to life as an authentic, lived-in moment — ` +
+    `do NOT rebuild, restyle, restage, recompose, or replace the scene. ` +
+    `The image as handed to you is the finished plate and source of truth — it may already have been fitted to this aspect upstream; ` +
+    `do NOT further extend, restyle, or recompose it. That upstream fit is not licence to continue extending.`,
   objective:
     `Objective: Animate the real captured moment so the product is the star. Authentic, editorial, documentary-adjacent — ` +
     `not a staged luxury product commercial. Ambient life that was already implicit in the photograph may move. ` +
     `Product fidelity means IDENTITY (form, construction, materials, surface, colour, branding) is absolute frame to frame — not immobility. ` +
     `A worn garment may shift with breath or body motion as a real garment would; a rigid product (bottle, shoe sole, device) does not deform.`,
-  sourceImages: `Source images: Use only the supplied image as provided. One lifestyle seed — do not invent additional views.`,
+  sourceImages: `Source images: Use only the image as handed to you. One lifestyle seed — do not invent additional views, and do not further extend or reframe it.`,
   productPreservation:
     `Product preservation (highest priority — never relaxes): The product's IDENTITY is absolute and unchanged frame to frame — ` +
     `form, construction, materials, surface, colour, branding, logos, stitching, proportions, and any on-item graphics never change. ` +
@@ -373,8 +380,8 @@ const LIFESTYLE_DIRECTIVES = {
     `A real camera drifting is fine; a fabricated multi-plane depth effect is not. ` +
     `Camera finds and holds the product as the star; ambient life is context around it, never competing with it.`,
   background:
-    `Background / scene identity: Preserve THAT scene exactly. Do NOT replace, extend, blur, recolour, or invent a second location. ` +
-    `No new environments, no environment replacement, no restaging.`,
+    `Background / scene identity: Preserve THAT scene exactly as handed to you. Do NOT replace, further extend, blur, recolour, or invent a second location. ` +
+    `No new environments, no environment replacement, no restaging. The plate may already include edge-fit from upstream; do not extend it further.`,
   visualStyle:
     `Visual style: Authentic, editorial, documentary-adjacent, photorealistic. Natural light as in the photograph. ` +
     `No colour grading, bloom, lens flares, or luxury-ecommerce polish. Lived-in, not staged.`,
@@ -395,7 +402,7 @@ const LIFESTYLE_DIRECTIVES = {
   doNot:
     `Do NOT: regenerate/morph/warp/stretch/re-drape the product, invent geometry, invent textures, change branding/logos/stitching/colors, ` +
     `create fake shadows/reflections/depth or parallax, independently animate the product (motion only as a real item would move with the wearer/scene), ` +
-    `use generative fill, or create new backgrounds. ` +
+    `use generative fill, further extend the plate, or create new backgrounds. ` +
     `No fantasy motion — no sparkles, particles, lens flares, floating props, morphing objects, or invented objects. ` +
     `No second location. No wardrobe, prop, or environment changes beyond ambient motion already implicit in the plate. ` +
     `Do not bend, flex, or deform rigid/hard-goods products.`
