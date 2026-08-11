@@ -1222,11 +1222,20 @@ check('Q3 a limitation is not a testimonial, and stage/angle re-rank honestly', 
   const stageTerms = src.match(/const STAGE_TERMS = \{[\s\S]*?\n\};/);
   assert.ok(stageTerms, 'STAGE_TERMS must exist — funnel stage is an owner requirement');
   parts.push(stageTerms[0]);
-  const nrm = src.match(/function normalizeStage\(v\)[\s\S]*?\n}/);
-  const fn = src.match(/function scoreQuote\(text[\s\S]*?\n}/);
-  assert.ok(nrm && fn, 'normalizeStage and scoreQuote must be extractable');
-  // eslint-disable-next-line no-new-func
-  const score = new Function(`${parts.join('\n')}\n${nrm[0]}\n${fn[0]}\nreturn scoreQuote;`)();
+  // THE SHIPPED FUNCTION, not a reconstruction of it.
+  //
+  // This block used to regex the source of scoreQuote out of the module and eval it
+  // inside a hand-assembled scope (`parts`). That is a MIRROR: it re-creates the
+  // function outside the module, so it only keeps working while somebody remembers to
+  // add every new constant the real function references. Adding a first-person/reported
+  // -speech signal broke it instantly with "REPORTED_SPEECH is not defined" — a
+  // ReferenceError from the harness's own copy, not a defect in the code under test.
+  //
+  // scoreQuote is now exported, so this asserts on the real thing and cannot drift.
+  // The source-level pins ABOVE are still worth keeping: they check the shape of the
+  // inputs (anchoring, no control bytes), which behaviour alone cannot see.
+  const { scoreQuote: score } = require('../services/layoutInputService');
+  assert.strictEqual(typeof score, 'function', 'scoreQuote must be exported for behavioural testing');
 
   // NO CONTROL CHARACTERS. A heredoc turned every \b in these regexes into a
   // literal backspace byte, silently stripping the word boundaries and making the

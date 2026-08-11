@@ -1395,9 +1395,33 @@ const DURATION_REF = /\b(week|weeks|month|months|day|days|hour|hours|year|years|
 // penalty, both bounded, and neither disqualifies: a well-written third-person line
 // still ranks and can still be used, it just loses to a customer speaking for themself.
 //
-// Sized against the neighbours deliberately: the specificity signals below are +1 each
-// and the stage/angle bias is capped at 3, so ±2 moves a quote past a near-tie without
-// being able to outrank what the review actually says.
+// SIZED SMALL, AND HERE IS WHY. First-person pronouns are a WEAK PROXY: "Easy to wash,
+// they are super comfortable and held up after 6 months" is unmistakably a customer
+// describing their own experience and contains no pronoun at all. The absence of "I" is
+// not evidence of anything, so this signal must nudge and never decide.
+//
+// At +2 it was strong enough to cancel the funnel-stage lever — verifyProofBeat caught
+// it: at `stage: 'consideration'` a durability quote must outrank a repeat-purchase one,
+// and the bonus flipped that purely because the repeat-purchase line happened to say
+// "I". Stage is the mechanism that makes a quote match the AD'S INTENT; voice is a
+// tie-breaker about who is speaking. A tie-breaker must not outrank the intent.
+//
+// MEASURED, not guessed. Scoring the real fixtures across candidate values showed the
+// two constraints are in direct conflict for any single "big" number:
+//
+//   bonus   stage lever still works?   first-person beats a LONGER third-person line?
+//   0.5     yes (6.20 vs 6.00)         no  (5.50 vs 6.00)
+//   1.5     NO  (6.20 vs 7.00)         yes (6.50 vs 6.00)
+//
+// There is no value that does both — which is the answer, not a tuning problem. A
+// preference is not supposed to beat a third-person line that is simply better copy:
+// "The Strato Tech is so soft and comfortable, and it's moisture wicking…" is more
+// specific and longer than "Every single piece I have is well made", and it SHOULD
+// outrank it. What the preference has to do is win a near-tie between two otherwise
+// comparable lines. That is +0.5.
+//
+// The reported-speech penalty stays larger at -2: that one is not a proxy at all, it is
+// an explicit statement that the words belong to somebody who never addressed us.
 const FIRST_PERSON = /(?:^|[^a-z])(?:i|i'?m|i'?ve|i'?d|i'?ll|my|me|mine|we|we'?re|we'?ve|our|us)(?![a-z])/i;
 
 // Second-hand attribution. "She says…", "my wife says…", "the reviewer notes…" — the
@@ -1406,7 +1430,7 @@ const FIRST_PERSON = /(?:^|[^a-z])(?:i|i'?m|i'?ve|i'?d|i'?ll|my|me|mine|we|we'?r
 // which that pattern deliberately does not match.
 const REPORTED_SPEECH = /\b(?:he|she|they|my (?:wife|husband|partner|friend|mom|mum|dad|son|daughter|sister|brother)|the (?:reviewer|author|writer))\s+(?:\w+\s+){0,2}(?:says?|said|reports?|reported|notes?|noted|mentions?|mentioned|thinks?|thought|finds?|found|tells?|told)\b/i;
 
-const FIRST_PERSON_BONUS = Number(process.env.QUOTE_FIRST_PERSON_BONUS || 2);
+const FIRST_PERSON_BONUS = Number(process.env.QUOTE_FIRST_PERSON_BONUS || 0.5);
 const REPORTED_SPEECH_PENALTY = Number(process.env.QUOTE_REPORTED_SPEECH_PENALTY || 2);
 
 
