@@ -21,7 +21,14 @@
 
 'use strict';
 
-const sharp = require('sharp');
+// Lazy: requiring sharp at module load forces every consumer of this
+// module (including ingest writers that only check isEnabled()) to pay
+// the native-binary cost at boot. Load on first classifyShotStyle call.
+let _sharp = null;
+function getSharp() {
+  if (!_sharp) _sharp = require('sharp');
+  return _sharp;
+}
 
 // ── Thresholds ──────────────────────────────────────────────────────────────
 // INITIAL, UNTUNED starting points — not measured against production labels.
@@ -102,6 +109,7 @@ function isEnabled() {
 async function classifyShotStyle(buffer) {
   if (!buffer || !buffer.length) return null;
   try {
+    const sharp = getSharp();
     const T = SHOT_STYLE_THRESHOLDS;
     const base = sharp(buffer)
       .rotate() // honour EXIF orientation so border bands match visual edges
@@ -264,22 +272,76 @@ async function classifyShotStyle(buffer) {
 /**
  * Single source of truth for seed-style consumers.
  *
- * Precedence (documented, load-bearing for calibration):
+ * Precedence (documented, load-bearing for calibration) — UNCHANGED for
+ * the Media form; product form only adds a pre-Media fallback:
  *   1. LLM classification.shotType wins when present and not 'unknown'
  *      (semantic signal already trusted by shotTypeRank / Director).
  *      Map: lifestyle|on_model → 'lifestyle';
  *           product_only|flat_lay|detail|packaging → 'packshot'.
- *   2. Else heuristic technicalInsights.shotStyle when present.
- *   3. Else 'unknown'.
+ *   2. Else heuristic Media.technicalInsights.shotStyle when present.
+ *   3. Else CatalogProduct.imageShotStyles entry for the given URL
+ *      (ingest-time sharp; URL-keyed — see ingestShotClassifyService).
+ *   4. Else 'unknown'.
+ *
+ * Overloads:
+ *   resolveSeedStyle(media)
+ *   resolveSeedStyle(product, imageUrl)
+ *   resolveSeedStyle({ media, product, url })
  *
  * The heuristic's job is to cover gaps (Media that never got a DetectRun /
  * subject-text classification) and to be calibrated AGAINST the LLM label —
  * not to override it.
  *
- * @param {object|null|undefined} media
  * @returns {'lifestyle'|'packshot'|'ambiguous'|'unknown'}
  */
-function resolveSeedStyle(media) {
+function resolveSeedStyle(arg, maybeUrl) {
+  let media = null;
+  let product = null;
+  let url = null;
+
+  if (arg != null && typeof arg === 'object' && !Array.isArray(arg)) {
+    // Named-object form: { media, product, url }
+    if (
+      Object.prototype.hasOwnProperty.call(arg, 'media') ||
+      (Object.prototype.hasOwnProperty.call(arg, 'product') &&
+        Object.prototype.hasOwnProperty.call(arg, 'url'))
+    ) {
+      media = arg.media || null;
+      product = arg.product || null;
+      url = arg.url || maybeUrl || null;
+    } else if (typeof maybeUrl === 'string') {
+      // product + url form (CatalogProduct has imageShotStyles / imageUrl)
+      product = arg;
+      url = maybeUrl;
+      // Defensive: if the first arg is actually a Media doc, still honour LLM.
+      media = arg;
+    } else {
+      // Media form (legacy)
+      media = arg;
+    }
+  }
+
+  // 1–2. Media path (LLM → technicalInsights heuristic)
+  const fromMedia = resolveFromMedia(media);
+  if (fromMedia !== 'unknown') return fromMedia;
+
+  // 3. CatalogProduct URL-keyed ingest styles (pre-Media seed selection)
+  if (product && url) {
+    const entries = product.imageShotStyles;
+    if (Array.isArray(entries)) {
+      for (const e of entries) {
+        if (e && e.url === url && (e.style === 'packshot' || e.style === 'lifestyle' || e.style === 'ambiguous')) {
+          return e.style;
+        }
+      }
+    }
+  }
+
+  return 'unknown';
+}
+
+function resolveFromMedia(media) {
+  if (!media) return 'unknown';
   const shotType = media?.classification?.shotType;
   if (typeof shotType === 'string' && shotType && shotType !== 'unknown') {
     if (LLM_LIFESTYLE.has(shotType)) return 'lifestyle';

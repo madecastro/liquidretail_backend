@@ -104,6 +104,17 @@ const SPEC = Object.freeze({
     ceiling: 'SELF-IMPOSED',
     why: 'Parallel products in catalog enrichment (reviews/details). Bounds SerpAPI/Gemini spend rate.'
   },
+  // Free sharp packshot/lifestyle classify at catalog ingest
+  // (services/ingestShotClassifyService). Same default as enrichment — bounds
+  // concurrent HTTP GETs of product images during a sync, not billable LLM.
+  CATALOG_INGEST_SHOT_CLASSIFY_CONCURRENCY: {
+    env: 'CATALOG_INGEST_SHOT_CLASSIFY_CONCURRENCY',
+    default: 6,
+    min: 1,
+    max: 32,
+    ceiling: 'SELF-IMPOSED',
+    why: 'Concurrent image fetches for zero-cost ingest-time shot-style classification. Per-sync wall-clock budget is separate (CATALOG_INGEST_SHOT_CLASSIFY_BUDGET_MS).'
+  },
 
   // ── Hardcoded literals moved here (current behaviour as defaults) ───
   CAMPAIGN_BRIEF_CONCURRENCY: {

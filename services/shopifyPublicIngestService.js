@@ -41,6 +41,8 @@ const reviewsEngine = require('./productReviewsScrapeService');
 // Zero-dep shared alt-image cap. Safe at top level — no cycle with the
 // resolver (that cycle only existed when the constant lived there).
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+// Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
+const ingestShotClassify = require('./ingestShotClassifyService');
 
 // ── constants ──────────────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -296,19 +298,20 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   console.log(`🛍  resolved ${products.length} products via ${access.mode || 'none'} (origin=${origin}${access.discoveredMyshopify ? `, backend=${access.discoveredMyshopify}` : ''})`);
 
   // ── Upsert each product ──────────────────────────────────────────
+  // ARCHITECTURE: product upsert NEVER awaits image classification.
+  // A hung DNS / slow CDN must not truncate the catalog on first sync.
+  // Collect classify work during the loop; run it as a post-loop pass.
+  const shotSession = ingestShotClassify.createSession();
+  const pendingClassify = [];
+  let midUpsertCancelled = false;
+  try {
   let idx = 0;
   for (const p of products) {
     idx += 1;
     if (await abortCheck(brand._id, run)) {
       console.log(`   · 🛍  aborted mid-upsert for brand=${brand._id}`);
-      return {
-        productsUpserted,
-        videosIngested,
-        reviewsCaptured,
-        errors,
-        cancelled: true,
-        durationMs: Date.now() - t0
-      };
+      midUpsertCancelled = true;
+      break;
     }
     if (run?.checkpoint) await run.checkpoint();
 
@@ -335,7 +338,8 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
       const productUrl = `${origin}/products/${p.handle}`;
       const description = stripHtml(p.body_html, 2000);
 
-      await CatalogProduct.findOneAndUpdate(
+      // Upsert only — no await on classify (image network work).
+      const doc = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
         {
           $set: {
@@ -367,6 +371,15 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         { upsert: true, new: true }
       );
       productsUpserted += 1;
+      // Defer classify to post-loop pass — never block remaining upserts.
+      if (doc && ingestShotClassify.isEnabled()) {
+        pendingClassify.push({
+          productId: doc._id,
+          imageUrl: doc.imageUrl,
+          additionalImages: doc.additionalImages,
+          existingStyles: doc.imageShotStyles
+        });
+      }
     } catch (err) {
       console.warn(`   ⚠️  🛍  upsert failed for ${p?.id}: ${err.message}`);
       errors.push(`upsert ${p?.id}: ${err.message}`);
@@ -377,6 +390,44 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
       totalPlanned,
       `products ${idx}/${totalPlanned} · ${videosIngested} videos · ${reviewsCaptured} reviews`
     );
+  }
+
+  // Post-loop classify pass — products are already persisted. Failures
+  // here cannot un-save a product or skip a sibling SKU's upsert.
+  // Budget clock starts here (beginClassifyPhase), not at createSession.
+  // Batched across products so the concurrency cap is used; cooperative
+  // cancel (same abortCheck as the upsert loop) stops promptly and
+  // records outstanding URLs as skippedAbandoned.
+  if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        if (midUpsertCancelled) return true;
+        try { return !!(await abortCheck(brand._id, run)); } catch (_) { return false; }
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
+      }
+    }).then((r) => {
+      if (r && r.cancelled) midUpsertCancelled = true;
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  🛍  shot-classify batch failed: ${shotErr.message}`);
+    });
+  }
+
+  if (midUpsertCancelled) {
+    return {
+      productsUpserted,
+      videosIngested,
+      reviewsCaptured,
+      errors,
+      cancelled: true,
+      durationMs: Date.now() - t0
+    };
   }
 
   if (hitRateLimit && !products.length) {
@@ -714,6 +765,24 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
     out.reason = 'store rate-limited this server — partials kept; try the Apify method';
   }
   return out;
+  } catch (err) {
+    throw err;
+  } finally {
+    // Unconditional summary — every exit path (mid-upsert abort, rate-limit
+    // return, media/reviews cancel, success, throw) must report budget
+    // truncation so a partial classify never looks like "classified everything".
+    // Outstanding pending when classify never ran → abandoned (not considered=0).
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          midUpsertCancelled ? 'cancelled' : 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
+    try { shotSession.logSummary('🛍 shot-classify'); } catch (_) { /* ignore */ }
+    try { shotSession.dispose(); } catch (_) { /* ignore */ }
+  }
 }
 
 // ── review helpers ─────────────────────────────────────────────────

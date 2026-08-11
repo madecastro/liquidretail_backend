@@ -30,6 +30,9 @@ const {
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 const ingestHelpers = require('./shopifyPublicIngestService');
 const { concurrency: CONC } = require('./concurrency');
+// Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
+// Bounded session per sync — never fails the upsert.
+const ingestShotClassify = require('./ingestShotClassifyService');
 
 const LOG = '🗺';
 
@@ -158,8 +161,14 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
   // fetched (network cost already paid) — matching the "partial ingest
   // kept" contract — and skip the per-item abort re-check (the run handle
   // is already closed). Only a FRESH mid-upsert cancel breaks the loop.
+  //
+  // ARCHITECTURE: product upsert NEVER awaits image classification.
+  // Collect work; post-loop pass classifies. Hung DNS cannot truncate.
+  const shotSession = ingestShotClassify.createSession();
+  const pendingClassify = [];
   let idx = 0;
   let cancelled = resolverCancelled;
+  try {
   for (const p of products) {
     idx += 1;
     if (!resolverCancelled) {
@@ -240,7 +249,8 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
         if (categoryRefId) set.categoryRef = categoryRefId;
       }
 
-      await CatalogProduct.findOneAndUpdate(
+      // Upsert only — no await on classify (image network work).
+      const doc = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
         {
           $set: set,
@@ -251,6 +261,15 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
       productsUpserted += 1;
       if (p.productReviews && (p.productReviews.quotes?.length || p.productReviews.rating != null)) {
         reviewsCaptured += 1;
+      }
+      // Defer classify to post-loop pass — never block remaining upserts.
+      if (doc && ingestShotClassify.isEnabled()) {
+        pendingClassify.push({
+          productId: doc._id,
+          imageUrl: doc.imageUrl,
+          additionalImages: doc.additionalImages,
+          existingStyles: doc.imageShotStyles
+        });
       }
     } catch (err) {
       console.warn(`   ⚠️  ${LOG}  upsert failed for ${p?.externalId}: ${err.message}`);
@@ -266,7 +285,41 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
     );
   }
 
-  // ── End-of-run trio (mirror shopifyPublicIngestService:632-674) ──
+  // Post-loop classify pass — products already persisted.
+  // Budget clock starts here (beginClassifyPhase), not at createSession.
+  // Batched across products so the concurrency cap is used for 1-image
+  // SKUs; cooperative cancel stops the wave and abandonPending-counts
+  // remaining URLs (same signal the upsert loop honors).
+  if (pendingClassify.length && ingestShotClassify.isEnabled()) {
+    shotSession.beginClassifyPhase();
+    await shotSession.classifyPendingProducts(pendingClassify, {
+      isCancelled: async () => {
+        // Same cancel signal the upsert loop honors (resolver cancel or
+        // fresh mid-run abort). Re-read mutable `cancelled` each poll.
+        if (cancelled || resolverCancelled) return true;
+        try {
+          if (await abortCheck(brand._id, run)) {
+            cancelled = true;
+            return true;
+          }
+        } catch (_) { /* ignore */ }
+        return false;
+      },
+      onProduct: async (item, { entries, changed }) => {
+        if (!changed) return;
+        await CatalogProduct.updateOne(
+          { _id: item.productId },
+          { $set: { imageShotStyles: entries } }
+        );
+      }
+    }).then((r) => {
+      if (r && r.cancelled) cancelled = true;
+    }).catch((shotErr) => {
+      console.warn(`   ⚠️  ${LOG}  shot-classify batch failed: ${shotErr.message}`);
+    });
+  }
+
+  // ── End-of-run trio (mirror shopifyPublicIngestService) ──
   // Use the cancel state established above (resolver signal or a fresh
   // mid-upsert cancel) — re-polling abortCheck here is unreliable once the
   // run handle has been closed by an earlier checkpoint().
@@ -359,6 +412,23 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
     out.reason = access.reason || `rate-limited while scanning ${origin}`;
   }
   return out;
+  } catch (err) {
+    // Re-throw after finally marks abandoned pending when phase never started.
+    throw err;
+  } finally {
+    // Unconditional summary — cancel, throw, and success all report.
+    // Outstanding pending when classify never ran → abandoned (not considered=0).
+    try {
+      if (!shotSession.hasClassifyPhaseStarted() && pendingClassify.length) {
+        shotSession.abandonPending(
+          pendingClassify,
+          cancelled ? 'cancelled' : 'phase_skipped'
+        );
+      }
+    } catch (_) { /* ignore */ }
+    try { shotSession.logSummary(`${LOG} shot-classify`); } catch (_) { /* ignore */ }
+    try { shotSession.dispose(); } catch (_) { /* ignore */ }
+  }
 }
 
 module.exports = {

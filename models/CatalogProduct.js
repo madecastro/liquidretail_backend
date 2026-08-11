@@ -100,10 +100,29 @@ const catalogProductSchema = new mongoose.Schema({
 
   // Imagery
   imageUrl:        String,    // primary image (hero)
-  additionalImages: [String], // alt views — capped at 4 by the
-                              // product-path detect trigger so a
-                              // long-tail of look-alike alts doesn't
-                              // multiply pipeline cost without value.
+  additionalImages: [String], // alt views — capped by MAX_ADDITIONAL_IMAGES
+                              // (services/catalogImageLimits); detect
+                              // materializes up to MAX_ALT_IMAGES.
+
+  // Zero-cost packshot/lifestyle styles from ingest-time sharp heuristic
+  // (services/ingestShotClassifyService). KEYED BY URL, not array index —
+  // additionalImages can be reordered or re-capped by a later sync, and
+  // an index-keyed store would silently mislabel images. Media rows do
+  // not exist at ingest, so this is the pre-Media home for the signal;
+  // materializeImage copies matching entries onto
+  // Media.technicalInsights.shotStyle* without re-fetching. MUST stay
+  // declared — Mongoose strict mode silently drops undeclared $set paths.
+  imageShotStyles: [{
+    url:        { type: String, required: true },
+    style:      { type: String, enum: ['packshot', 'lifestyle', 'ambiguous'], required: true },
+    confidence: Number,
+    at:         { type: Date, default: Date.now },
+    // Numeric signals from classifyShotStyle (borderStdev, packshotScore, …).
+    // MUST be declared — nested subdocs are strict; an undeclared path is
+    // silently dropped and calibrateShotHeuristic never sees ingest metrics.
+    metrics:    mongoose.Schema.Types.Mixed,
+    _id: false
+  }],
 
   // Wrapper Media docs created by catalogProductDetectService when
   // the catalog sync triggers the product-path detect pipeline.
