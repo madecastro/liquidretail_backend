@@ -97,6 +97,101 @@ function isCloudflareChallenge(status, bodyText) {
   return false;
 }
 
+// Split products.json images[] into hero + alts. Feed order is load-bearing
+// (metadata.feedIndex / CATALOG_FEED_ORDER_SEEDING) — do not sort or reverse.
+// Pure; exported for the offline cap harness.
+function mapShopifyProductImages(images) {
+  const list = Array.isArray(images) ? images : [];
+  const imageUrl = list[0]?.src || null;
+  // end-exclusive: slice(1, 1+cap) keeps up to `cap` additional URLs.
+  const additionalImages = list
+    .slice(1, 1 + MAX_ADDITIONAL_IMAGES)
+    .map(i => i && i.src)
+    .filter(Boolean);
+  return { imageUrl, additionalImages };
+}
+
+/**
+ * mapShopifyNormalizedToFlat(normalizedProduct, origin, brand?) → flat fields
+ *
+ * Pure adapter: products.json-shaped item (or storefront/sitemap normalized
+ * equivalent from shopifyAccessResolver) → the flat catalog fields both
+ * syncBrandShopifyDirect and the generic auto-detect path upsert.
+ *
+ * MUST stay the single mapping — a second copy is how the three-different-
+ * image-caps bug happened. Reuses mapShopifyProductImages so the storage
+ * cap (MAX_ADDITIONAL_IMAGES, catalogImageLimits) is shared.
+ *
+ * brand is optional; used only as a vendor fallback (brand.name).
+ */
+// CatalogProduct.rawData storage cap. MUST equal genericCatalogResolver's
+// RAW_DATA_CAP_BYTES — duplicated rather than imported because that module
+// already requires THIS one (ingestHelpers), so importing back would be a
+// circular dependency. Pinned equal by verifyCatalogImageCap group R.
+//
+// Why this matters: an un-capped products.json entry MEASURES ~14.7KB
+// (pb5star.com, 2026-08-10) — 1.8x the cap. The generic path capped rawData at
+// 8KB before Shopify auto-detect existed; without this, a Shopify-detected
+// brand on that path would silently write ~1.8x per product (~147MB extra at a
+// 10k-product catalog). Nothing reads structured rawData fields — the only
+// consumer $sets the dotted path 'rawData._externalVideos', which works on the
+// truncated shape too — so truncating is safe.
+const RAW_DATA_CAP_BYTES = 8000;
+
+function capRawDataForFlat(node) {
+  try {
+    const s = JSON.stringify(node);
+    if (s.length <= RAW_DATA_CAP_BYTES) return node;
+    return { _truncated: s.slice(0, RAW_DATA_CAP_BYTES) };
+  } catch {
+    return { _truncated: String(node).slice(0, RAW_DATA_CAP_BYTES) };
+  }
+}
+
+function mapShopifyNormalizedToFlat(p, origin, brand = null) {
+  if (!p || typeof p !== 'object') return null;
+  if (p.id == null && p.id !== 0) return null;
+
+  const externalId = String(p.id);
+  const variants = Array.isArray(p.variants) ? p.variants : [];
+  const images   = Array.isArray(p.images)   ? p.images   : [];
+  const v0 = variants[0] || {};
+
+  const price = v0.price != null && v0.price !== ''
+    ? Number(v0.price)
+    : null;
+  const availability = variants.some(v => v && v.available)
+    ? 'in stock'
+    : 'out of stock';
+  const { imageUrl, additionalImages } = mapShopifyProductImages(images);
+  const handle = p.handle ? String(p.handle) : null;
+  let productUrl = null;
+  if (handle && origin) {
+    const base = String(origin).replace(/\/+$/, '');
+    productUrl = `${base}/products/${handle}`;
+  }
+  const description = stripHtml(p.body_html, 2000);
+
+  return {
+    externalId,
+    title:            cleanScrapedText(p.title) || '(untitled)',
+    description,
+    brand:            cleanScrapedText(p.vendor) || (brand && brand.name) || null,
+    price:            Number.isFinite(price) ? price : null,
+    currency:         null,
+    availability,
+    imageUrl,
+    additionalImages,
+    productUrl,
+    gtin:             normalizeGtin(v0.barcode),
+    mpn:              v0.sku || null,
+    category:         cleanScrapedText(p.product_type) || null,
+    rating:           null,
+    productReviews:   null,
+    rawData:          capRawDataForFlat(p)
+  };
+}
+
 // Resolve the store origin from brand.apifyDemo.shopifyUrl (or similar).
 // Accepts "https://foo.com", "foo.com", "https://foo.com/", etc.
 function resolveStoreOrigin(brand) {
@@ -316,27 +411,14 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
     if (run?.checkpoint) await run.checkpoint();
 
     try {
-      const externalId = String(p.id);
-      const variants = Array.isArray(p.variants) ? p.variants : [];
-      const images   = Array.isArray(p.images)   ? p.images   : [];
-      const v0 = variants[0] || {};
-
-      const price = v0.price != null && v0.price !== ''
-        ? Number(v0.price)
-        : null;
-      const availability = variants.some(v => v && v.available)
-        ? 'in stock'
-        : 'out of stock';
-      const imageUrl = images[0]?.src || null;
-      // index 0 is the hero (imageUrl); slice starts at 1 so the hero is
-      // never also stored as an alt. Cap = MAX_ADDITIONAL_IMAGES alts
-      // (end exclusive → 1 + N). Shared const from catalogImageLimits.
-      const additionalImages = images
-        .slice(1, 1 + MAX_ADDITIONAL_IMAGES)
-        .map(i => i.src)
-        .filter(Boolean);
-      const productUrl = `${origin}/products/${p.handle}`;
-      const description = stripHtml(p.body_html, 2000);
+      // Shared pure mapper — same function the generic auto-detect path uses
+      // so image caps / price / availability cannot diverge again.
+      const flat = mapShopifyNormalizedToFlat(p, origin, brand);
+      if (!flat) {
+        errors.push(`upsert ${p?.id}: unmappable product shape`);
+        continue;
+      }
+      const externalId = flat.externalId;
 
       // Upsert only — no await on classify (image network work).
       const doc = await CatalogProduct.findOneAndUpdate(
@@ -351,19 +433,19 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
             // Decoded for the same reason as the generic path: the headless
             // fallback feeds this shape from JSON-LD, and merchants
             // sometimes type entities straight into a Shopify title.
-            title:            cleanScrapedText(p.title) || '(untitled)',
-            description,
-            brand:            cleanScrapedText(p.vendor) || brand.name || null,
-            price:            Number.isFinite(price) ? price : null,
-            currency:         null,
-            availability,
-            imageUrl,
-            additionalImages,
-            productUrl,
-            gtin:             normalizeGtin(v0.barcode),
-            mpn:              v0.sku || null,
-            category:         cleanScrapedText(p.product_type),
-            rawData:          p,
+            title:            flat.title || '(untitled)',
+            description:      flat.description,
+            brand:            flat.brand || brand.name || null,
+            price:            flat.price,
+            currency:         flat.currency,
+            availability:     flat.availability,
+            imageUrl:         flat.imageUrl,
+            additionalImages: flat.additionalImages,
+            productUrl:       flat.productUrl,
+            gtin:             flat.gtin,
+            mpn:              flat.mpn,
+            category:         flat.category,
+            rawData:          flat.rawData || p,
             lastSyncedAt:     new Date()
           },
           $setOnInsert: { firstSeenAt: new Date() }
@@ -809,5 +891,8 @@ module.exports = {
   stripHtml,
   detectReviewApp,
   extractReviewsFromHtml,
-  resolveStoreOrigin
+  resolveStoreOrigin,
+  mapShopifyProductImages,
+  mapShopifyNormalizedToFlat,
+  RAW_DATA_CAP_BYTES
 };

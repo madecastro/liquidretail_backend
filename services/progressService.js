@@ -213,13 +213,16 @@ function makeHandle(doc) {
       return flush(update, { force: true }).catch(() => {});
     },
 
-    fail(err) {
+    // Optional second `meta` arg mirrors succeed(summary): object →
+    // OperationRun.meta (Mixed — no schema change). Single-arg callers
+    // behave exactly as before. Needed so a *failed* run can still carry
+    // per-source diagnostics (the case operators most need them).
+    fail(err, meta) {
       closeTimers();
       const message = err && err.message ? err.message : String(err || 'failed');
-      return flush(
-        { status: 'failed', endedAt: new Date(), error: message, note: message },
-        { force: true }
-      ).catch(() => {});
+      const update = { status: 'failed', endedAt: new Date(), error: message, note: message };
+      if (meta != null && typeof meta === 'object') update.meta = meta;
+      return flush(update, { force: true }).catch(() => {});
     },
 
     // Refresh cancelRequested from Mongo at most 1/s (cached in between).

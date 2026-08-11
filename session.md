@@ -243,6 +243,86 @@ failed body only later, a "no price" read would retry a real charge. Nothing in 
 suggests it (5/5 failed rows never gained a price across repeated reads); closing it needs a
 delayed second peek or a refund API. **Tripwire: if the video bill ever exceeds delivered
 videos, this is the cause.**
+## 2026-08-11 — Stop storing THUMBNAILS as catalog hero images (branch `harden/catalog-scraper`)
+
+**Defect (measured live, marinelayer.com):** same product photo two ingest paths —
+products.json → 757,341-byte original; JSON-LD PDP → `_small` thumbnail **3,820 bytes**
+(198× smaller). Hero is the DEFAULT AD SEED (`CATALOG_FEED_ORDER_SEEDING`), so the
+thumbnail was feeding **billable** gpt-image-2 gens.
+
+**Fix (UNCOMMITTED on this worktree):** pure `services/imageUrlUpgrade.js` —
+`upgradeImageUrl` (Shopify size tokens + WP `-{W}x{H}` + resize query params;
+preserves `?v=`) + `resolveUpgradedImageUrl` (injected `fetchHead`, fail-safe to
+original on non-2xx / error / no verifier — a file named `photo_large.jpg` must
+not become a 404). Wired into `genericCatalogResolver.imagesFromNode` /
+`mapJsonLdProduct` / `mapOgProduct`: upgrade then de-dupe (collapse `_small` +
+`_1024x1024` → one original; feed order preserved). Run-scoped memo +
+`CATALOG_IMAGE_UPGRADE_MAX_CHECKS` (default 500). Flags default ON;
+flag-off = no upgrades, no HEADs. Does NOT touch shopifyPublicIngestService
+(products.json already originals).
+
+**Harness:** `scripts/verifyImageUrlUpgrade.js` **49/49**. Revert-proof:
+(i) drop HEAD verification → **42/49** (F1 false-positive fails);
+(ii) de-dupe before upgrade → **46/49** (G1/G2/K2 collapse fails).
+Full gate **80 pass / 0 fail** (79 baseline + new harness).
+
+**NOT run live:** marinelayer catalog resolve — reviewer should.
+
+## 2026-08-10 — Browser session rung (branch `harden/catalog-scraper`)
+
+**Defect (measured live):** ubeauty.com yields **0 products**. Shopify behind a
+Cloudflare managed challenge — `/robots.txt` 200, but `/products.json`,
+`/collections/all`, `/sitemap.xml` all **403** with `cf-mitigated: challenge`.
+Auto-detect correctly fingerprints `shopify`, ladder + sitemap walk all blocked.
+Proven remedy: real browser clears challenge → in-page
+`fetch('/products.json?limit=250')` → HTTP 200, **all 103 products** (page=2 empty).
+
+**Fix (UNCOMMITTED on this worktree):**
+1. `services/headlessBrowserClient.js` — singleton Chrome + mutex + stealth +
+   `gotoWithCf` (extracted from headlessScrapeService; one browser for the process).
+2. `services/scrapeSession.js` — per-**host** session cache (scheme+host+port, NOT
+   eTLD+1; www vs portal fanatics are different). TTL 10 min (CF clearance
+   undocumented). `refreshInFlight` de-dupes; `refreshCount` cap 3.
+3. **Harvest via `page.cookies(origin)` ONLY** — never `document.cookie` (HttpOnly
+   `cf_clearance`/`__cf_bm` invisible to JS; trap harnessed).
+4. `httpScrapeClient` optional `session` — pins UA verbatim, merges Cookie;
+   flag-off `SCRAPE_SESSION_REUSE_ENABLED=false` = session never applied.
+5. Paginated in-page products.json (was single page of 250).
+6. `genericCatalogResolver` last rung: launch Chrome only when
+   `browser-session` block seen / shopifyFallthrough / zero candidates with
+   robots reachable; products still 0; budget left. Order: harvest → Shopify
+   products.json → re-run cheap HTTP with session → honest failure.
+7. Env: `RENDER_GENERIC_ENABLED`, `HEADLESS_STEALTH_ENABLED`,
+   `SCRAPE_SESSION_*` (defaults true / 600000 / 3). Independent of
+   `SHOPIFY_HEADLESS_RENDER` (still default off).
+
+**stats keys:** `browserAttempted`, `browserMode`, `sessionHarvested`,
+`sessionReused`, `browserProductCount`, plus `lastBlockVendor` /
+`browserSessionBlockSeen`. `source` stays enum: `shopify-direct` |
+`sitemap-jsonld`.
+
+**Harness:** `scripts/verifyScrapeSession.js` **31/31**. Revert-proof:
+(i) `page.cookies` → `document.cookie` → **30/31** (F1 fails);
+(ii) remove UA pin → **30/31** (H1 fails). Full gate **79 pass / 0 fail**
+(78 baseline + new harness).
+
+**NOT run live:** ubeauty / PB5Star / Living Spaces catalog resolves — reviewer
+should.
+
+## 2026-08-10 — Generic catalog auto-detects Shopify (branch `harden/catalog-scraper`)
+
+**Defect (prod sweep):** brands on `apifyDemo.method=generic-sitemap` that are actually
+Shopify stored **zero alt images** (PB5Star 100/0, Fellow 9/0). Shopify JSON-LD
+`Product.image` is a single featured image; `/products.json` has the full gallery
+(pb5star mean 7.91). Living Spaces (not Shopify) was fine on sitemap+JSON-LD.
+
+**Fix (UNCOMMITTED on this worktree):** pure `siteFingerprintService` +
+`GENERIC_CATALOG_AUTODETECT` (default true) inside `resolveGenericCatalog` delegates
+to existing `shopifyAccessResolver` ladder; shared `mapShopifyNormalizedToFlat`;
+`CatalogProduct.source` stamped `'shopify-direct'` when the ladder wins. Flag-off =
+byte-identical prior path. Harness `scripts/verifySiteFingerprint.js` 29/29;
+full gate was **78 pass / 0 fail** (now 79 with browser-session harness). Live
+PB5Star / Living Spaces re-runs NOT done here — reviewer should sync those brands.
 
 ## 2026-08-10 — `ai_social_proof_led` had all but vanished. TWO causes, both fixed. UNCOMMITTED→branch `fix/restore-social-proof-led`
 

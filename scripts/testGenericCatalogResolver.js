@@ -19,7 +19,10 @@ const {
   validateProduct,
   extractNumericIdFromUrl,
   looksLikeSlug,
-  extractProductIdFromHtml
+  extractProductIdFromHtml,
+  rankLoc,
+  isProductish,
+  scoreProductish
 } = require('../services/genericCatalogResolver');
 // Breadcrumb capture reuses the pure breadcrumbParser — the resolver
 // calls this on each PDP's HTML to stamp inferredBreadcrumb in-scan
@@ -197,8 +200,11 @@ check('mapJsonLdProduct: image string vs array; protocol-relative absolutized', 
     offers: { price: '1.00' }
   }, 'https://example.com/p/2');
   assert.equal(many.imageUrl, 'https://cdn.example.com/1.jpg');
-  assert.equal(many.additionalImages.length, 4);
+  // 6 images → hero + 5 alts under CATALOG_MAX_ADDITIONAL_IMAGES (default 20).
+  // Was hard-capped at 4 alts (slice(1,5)) before the storage-cap unify.
+  assert.equal(many.additionalImages.length, 5);
   assert.equal(many.additionalImages[3], 'https://cdn.example.com/5.jpg');
+  assert.equal(many.additionalImages[4], 'https://cdn.example.com/6.jpg');
 });
 
 check('mapJsonLdProduct: availability URL variants', () => {
@@ -636,6 +642,121 @@ check('breadcrumb: falls back to Product.category "A > B > C" string', () => {
 });
 check('breadcrumb: no structured data → null (resolver leaves it to inference)', () => {
   assert.equal(extractBreadcrumb('<html><body>no schema here</body></html>'), null);
+});
+
+// ── productish scoring (sitemap ranking heuristic) ─────────────────
+
+check('productish: fanatics +p-<digits> scores > 0 (regression)', () => {
+  // Full measured shape (8-digit p-id).
+  const full = 'https://www.fanatics.com/nfl/tom-brady-tampa-bay-buccaneers/tom-brady-tampa-bay-buccaneers-nike-game-jersey-pewter/o-2422+t-09479237+p-12345678';
+  assert.ok(scoreProductish(full) > 0, `expected > 0, got ${scoreProductish(full)}`);
+  assert.equal(isProductish(full), true);
+  // Short +p-123 (3 digits): product-id branch only — trailing-numeric needs ≥5
+  // digits, so removing p-\d{3,} must make this fail (revert-prove target).
+  const short = 'https://www.fanatics.com/nfl/jersey/o-2422+t-09479237+p-123';
+  assert.ok(scoreProductish(short) > 0, `fanatics short +p-123 expected > 0, got ${scoreProductish(short)}`);
+});
+
+check('productish: Shopify /products/foo-bar scores > 0', () => {
+  const loc = 'https://example.com/products/foo-bar';
+  assert.ok(scoreProductish(loc) > 0);
+  assert.equal(isProductish(loc), true);
+});
+
+check('productish: /p123 and /p-123 still score > 0', () => {
+  assert.ok(scoreProductish('https://example.com/p123') > 0);
+  assert.ok(scoreProductish('https://example.com/p-12345') > 0);
+});
+
+check('productish: listing/nav URLs score ≤ 0', () => {
+  assert.ok(scoreProductish('https://example.com/collections/all') <= 0);
+  assert.ok(scoreProductish('https://example.com/cart') <= 0);
+  assert.ok(scoreProductish('https://example.com/blogs/news') <= 0);
+  assert.ok(scoreProductish('https://example.com/search?q=x') <= 0);
+});
+
+check('productish: product URL outranks collection URL via rankLoc', () => {
+  const product = 'https://example.com/products/foo-bar';
+  const collection = 'https://example.com/collections/all';
+  assert.ok(rankLoc(product) < rankLoc(collection),
+    `rankLoc(product)=${rankLoc(product)} should be < rankLoc(collection)=${rankLoc(collection)}`);
+});
+
+// REGRESSION GUARD: Shopify serves collection-scoped PDPs at
+// /collections/<c>/products/<handle>. Those carry BOTH a listing segment and a
+// product segment. The old boolean PRODUCTISH_RE ranked them product-ish; an
+// ungated −3 listing demotion scored them −1, which would sort real PDPs to the
+// BACK of the queue and drop them on any store that hits MAX_SITEMAP_URLS or the
+// product cap. The listing demotion must stay suppressed when a strong product
+// signal is present.
+check('productish: collection-scoped Shopify PDP stays product-ish', () => {
+  for (const loc of [
+    'https://example.com/collections/all/products/blue-serum',
+    'https://example.com/collections/skincare/products/retinol-24'
+  ]) {
+    assert.ok(scoreProductish(loc) > 0,
+      `collection-scoped PDP ${loc} expected > 0, got ${scoreProductish(loc)}`);
+  }
+  // …while the bare collection listing itself is still demoted.
+  assert.ok(scoreProductish('https://example.com/collections/skincare') < 0);
+  // …and the PDP must outrank the listing it lives under.
+  assert.ok(
+    rankLoc('https://example.com/collections/skincare/products/retinol-24') <
+    rankLoc('https://example.com/collections/skincare')
+  );
+});
+
+// No URL that the OLD boolean heuristic called product-ish may become
+// non-product-ish — ranking regressions only bite at cap, so they are silent.
+check('productish: no regression vs the old PRODUCTISH_RE boolean', () => {
+  const OLD_PRODUCTISH_RE = /product|pdp|item|catalog|\/p\d/i;
+  const corpus = [
+    'https://example.com/products/blue-serum',
+    'https://example.com/collections/all/products/blue-serum',
+    'https://example.com/collections/skincare/products/retinol-24',
+    'https://example.com/shop/item/12345',
+    'https://example.com/catalog/sku-9',
+    'https://example.com/pdp/12345',
+    'https://example.com/p123'
+  ];
+  for (const loc of corpus) {
+    if (!OLD_PRODUCTISH_RE.test(loc)) continue;
+    assert.ok(isProductish(loc),
+      `${loc} was product-ish under the old regex but scores ${scoreProductish(loc)} now`);
+  }
+});
+
+check('productish: null / empty / non-string do not throw', () => {
+  assert.equal(scoreProductish(null), 0);
+  assert.equal(scoreProductish(''), 0);
+  assert.equal(scoreProductish(undefined), 0);
+  assert.equal(scoreProductish(42), 0); // String(42) has no product signal
+  assert.equal(isProductish(null), false);
+  assert.equal(isProductish(''), false);
+});
+
+check('productish: ordering-stability — every positive-score loc precedes non-positive', () => {
+  const locs = [
+    'https://example.com/collections/all',
+    'https://example.com/products/alpha',
+    'https://example.com/cart',
+    'https://www.fanatics.com/x/o-1+t-2+p-99887766',
+    'https://example.com/about',
+    'https://example.com/pdp/sofa-108724',
+    'https://example.com/search?q=shoes',
+    'https://example.com/item/widget'
+  ];
+  const sorted = locs.slice().sort((a, b) => rankLoc(a) - rankLoc(b));
+  let sawNonPositive = false;
+  for (const loc of sorted) {
+    const pos = scoreProductish(loc) > 0;
+    if (!pos) sawNonPositive = true;
+    else assert.equal(sawNonPositive, false,
+      `positive-scoring ${loc} appeared after a non-positive loc in: ${sorted.join(' | ')}`);
+  }
+  // Sanity: the fixture actually mixes both classes
+  assert.ok(sorted.some(l => scoreProductish(l) > 0));
+  assert.ok(sorted.some(l => scoreProductish(l) <= 0));
 });
 
 // ── summary ────────────────────────────────────────────────────────

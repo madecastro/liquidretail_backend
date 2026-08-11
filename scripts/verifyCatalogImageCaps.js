@@ -84,13 +84,13 @@ check(
 
 check(
   'A3 default is 12 (|| 12) and clamped with Math.max(1, …)',
-  /Math\.max\s*\(\s*1\s*,\s*parseInt\s*\(\s*process\.env\.CATALOG_MAX_ADDITIONAL_IMAGES\s*,\s*10\s*\)\s*\|\|\s*12\s*\)/.test(
+  /Math\.max\s*\(\s*1\s*,\s*parseInt\s*\(\s*process\.env\.CATALOG_MAX_ADDITIONAL_IMAGES\s*,\s*10\s*\)\s*\|\|\s*20\s*\)/.test(
     limitsSrc.replace(/\s+/g, ' ')
   ) || (
     /Math\.max\s*\(\s*1\s*,/.test(limitsSrc) &&
-    /parseInt\s*\(\s*process\.env\.CATALOG_MAX_ADDITIONAL_IMAGES\s*,\s*10\s*\)\s*\|\|\s*12/.test(limitsSrc)
+    /parseInt\s*\(\s*process\.env\.CATALOG_MAX_ADDITIONAL_IMAGES\s*,\s*10\s*\)\s*\|\|\s*20/.test(limitsSrc)
   ),
-  'expected Math.max(1, parseInt(process.env.CATALOG_MAX_ADDITIONAL_IMAGES, 10) || 12)'
+  'expected Math.max(1, parseInt(process.env.CATALOG_MAX_ADDITIONAL_IMAGES, 10) || 20)'
 );
 
 check(
@@ -119,7 +119,7 @@ try {
   exported = undefined;
   failures.push(`A5 require failed: ${err.message}`);
 }
-check('A5 exported default is 12', exported === 12, `got ${exported}`);
+check('A5 exported default is 12', exported === 20, `got ${exported}`);
 
 // Env override.
 process.env.CATALOG_MAX_ADDITIONAL_IMAGES = '7';
@@ -143,7 +143,7 @@ try {
   clampedZero = undefined;
   failures.push(`A7 re-require failed: ${err.message}`);
 }
-// parseInt('0',10) || 12 → 12 (0 is falsy), then Math.max(1, 12) → 12.
+// parseInt('0',10) || 12 → 12 (0 is falsy), then Math.max(1, 20) → 12.
 // Either 12 (|| short-circuit) or 1 (if someone rewrote to nullish) is fine;
 // zero/negative is not.
 check(
@@ -355,16 +355,22 @@ for (const filePath of serviceFiles) {
 
 // ── D. default agrees with detect's MAX_ALT_IMAGES ──────────────────
 const detectSrc = read(DETECT);
-const m = detectSrc.match(/const\s+MAX_ALT_IMAGES\s*=\s*(\d+)\s*;/);
+// MAX_ALT_IMAGES is env-tunable (CATALOG_MAX_ALT_IMAGES) since the mirroring
+// gate became a separate knob from the storage cap. Accept BOTH the bare
+// integer and the Math.max(0, parseInt(env) || N) form, reading N as the
+// declared default. The lockstep invariant below is unchanged.
+const m = detectSrc.match(/const\s+MAX_ALT_IMAGES\s*=\s*(\d+)\s*;/)
+  || detectSrc.match(/const\s+MAX_ALT_IMAGES\s*=\s*Math\.max\([^)]*?\|\|\s*(\d+)\s*\)/s)
+  || detectSrc.match(/CATALOG_MAX_ALT_IMAGES[^)]*\)\s*\|\|\s*(\d+)/s);
 const detectCap = m ? Number(m[1]) : null;
 check(
-  'D1 catalogProductDetectService declares MAX_ALT_IMAGES as an integer',
+  'D1 catalogProductDetectService declares MAX_ALT_IMAGES (literal or env-defaulted)',
   Number.isInteger(detectCap),
   `could not parse MAX_ALT_IMAGES from detect service (got ${m && m[0]})`
 );
 check(
-  'D2 ingest default (12) agrees with MAX_ALT_IMAGES',
-  detectCap === 12,
+  'D2 ingest default (20) agrees with MAX_ALT_IMAGES',
+  detectCap === 20,
   `detect MAX_ALT_IMAGES=${detectCap}, ingest default must match`
 );
 // Cross-check the live export too.

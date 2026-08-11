@@ -22,7 +22,9 @@
 // `_shopifyMoney` (its number-branch is Shopify-cents).
 //
 // All HTTP goes through services/httpScrapeClient.js (UA rotation,
-// per-host throttle, 429/Retry-After, CF detection). Never HEAD.
+// per-host throttle, 429/Retry-After, CF detection). Image-URL upgrade
+// may issue a HEAD (or ranged GET) via the same client to verify that a
+// stripped Shopify/WP size token is a real original — see imageUrlUpgrade.
 
 'use strict';
 
@@ -45,9 +47,57 @@ const { extractBreadcrumb } = require('./breadcrumbParser');
 // a local binding so the JSON-LD mapper's slice stays readable; the
 // constant itself is owned (and env-resolved) in that module only.
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+// Scored product-URL heuristic — ranking only (non-matches still scanned later).
+const { scoreProductish, isProductish } = require('./genericCatalogDiscovery/productish');
+// Category options from sitemap URL path segments — pure, no PDP fetches.
+// Used for discover-only previews and selective import filters on large catalogs.
+const {
+  deriveCategoryOptions,
+  matchesAnyCategory
+} = require('./genericCatalogDiscovery/categoryOptions');
+// Wall-clock budget — pure, clock-injectable. Bounds the scan so a large
+// or hostile site cannot grind for ~83 min while the UI shows a dead run.
+// Distinct from abort (user cancel) and from progressService.MAX_RUN_MS
+// (dead-process safety net for the heartbeat only).
+const { createBudget } = require('./genericCatalogDiscovery/budget');
+// Platform fingerprint (pure) — senses Shopify etc. from pre-fetched
+// homepage + robots so the generic path can climb the right ladder.
+const { fingerprintSite } = require('./siteFingerprintService');
+// Per-host browser-cleared session cache (Cookie + pinned UA). Used only
+// after the cheap path fails a browser-fixable block — most syncs never
+// touch Chrome. See scrapeSession.js for host keying (not eTLD+1).
+const scrapeSession = require('./scrapeSession');
+// Thumbnail → original image URL upgrade (defence in depth when JSON-LD/OG
+// emit a resized asset). Pure transform + HEAD-verified resolve. Flag-off
+// is byte-identical: no upgrades, no HEADs.
+const {
+  isCatalogImageUpgradeEnabled,
+  createImageUpgradeRun,
+  makeHttpScrapeFetchHead,
+  dedupeUrlsFirstSeen
+} = require('./imageUrlUpgrade');
 
 // ── constants ──────────────────────────────────────────────────────
 const LOG = '🗺';
+// Auto-detect Shopify (and other platforms for telemetry) before the
+// sitemap+JSON-LD walk. Default ON: brands on method=generic-sitemap that
+// are actually Shopify were storing ZERO alt images (Shopify JSON-LD only
+// ships the featured image; products.json has the full gallery — measured
+// on pb5star.com 2026-08-10: 100 products, 0 alts via JSON-LD; products.json
+// mean 7.91 images). Flag-off restores byte-identical prior behaviour:
+// no homepage fetch, no fingerprint, no new result keys.
+const AUTODETECT_ENABLED = process.env.GENERIC_CATALOG_AUTODETECT !== 'false';
+// Last-rung browser + session reuse. Default ON, but Chrome launches ONLY
+// when the cheap HTTP path already failed for a reason a browser can fix
+// (CF / PX / DataDome browser-session remedy, Shopify ladder fallthrough,
+// or zero sitemap candidates while robots was reachable). WHY (measured
+// 2026-08-10): ubeauty.com yields 0 products — Shopify behind Cloudflare
+// managed challenge; /products.json + sitemaps all 403 with
+// cf-mitigated:challenge; a real browser clears the interstitial and an
+// in-page same-origin fetch('/products.json?limit=250') returns all 103
+// products. Flag-off = no browser launch, no session replay.
+const RENDER_GENERIC_ENABLED =
+  String(process.env.RENDER_GENERIC_ENABLED || 'true').toLowerCase() !== 'false';
 // Full-catalog by default — do NOT cap at a small demo number. 10k covers
 // essentially any real catalog; override via GENERIC_CATALOG_LIMIT.
 // NOTE: crawl throughput is ~1 page / HTTP_SCRAPE_MIN_GAP_MS (≈4/s at the
@@ -67,14 +117,53 @@ const MAX_SITEMAP_FETCHES = Math.max(
   10,
   parseInt(process.env.GENERIC_CATALOG_MAX_SITEMAP_FETCHES, 10) || 200
 );
+// Wall-clock budgets (ms). Non-finite / ≤0 → unbounded (createBudget safety).
+const TOTAL_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_TOTAL_BUDGET_MS, 10);
+const SITEMAP_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_SITEMAP_BUDGET_MS, 10);
 const GZIP_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;  // decompressed sitemap cap
 const MAX_ROBOTS_SITEMAPS = 50;                  // cap root sitemaps from robots.txt
 const RAW_DATA_CAP_BYTES = 8000;
-const PRODUCTISH_RE = /product|pdp|item|catalog|\/p\d/i;
+// How many category keys to name in an operator-facing reason string. Log
+// cosmetics only — deliberately NOT a bare slice(0, 8), because
+// verifyCatalogImageCaps greps this file for hardcoded image-cap slices and a
+// literal here is indistinguishable from the bug that guard exists to catch.
+const MAX_LOGGED_CATEGORY_KEYS = 8;
 const FALLBACK_SITEMAP_PATHS = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'];
+// Category options from sitemap URLs (no PDP fetches). Flag-off restores a
+// byte-identical resolver result (no new keys). Defaults match owner request
+// for selective import of large catalogs (fanatics-scale ~800k products).
+const CATEGORY_OPTIONS_ENABLED = process.env.GENERIC_CATALOG_CATEGORY_OPTIONS !== 'false';
+const CATEGORY_PROMPT_MIN = Math.max(
+  1,
+  parseInt(process.env.GENERIC_CATALOG_CATEGORY_PROMPT_MIN, 10) || 500
+);
+const CATEGORY_MIN_COUNT = Math.max(
+  1,
+  parseInt(process.env.GENERIC_CATALOG_CATEGORY_MIN_COUNT, 10) || 25
+);
+const CATEGORY_MAX_OPTIONS = Math.max(
+  1,
+  parseInt(process.env.GENERIC_CATALOG_CATEGORY_MAX_OPTIONS, 10) || 40
+);
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+/** True when classifyBlock says a browser-cleared session can help. */
+function isBrowserSessionRemedy(block) {
+  if (!block || block.remedy == null) return false;
+  return String(block.remedy).startsWith('browser-session');
+}
+
+/** Record vendor/remedy on stats; flip browserSessionBlockSeen when applicable. */
+function noteBlock(stats, block) {
+  if (!stats || !block) return;
+  stats.lastBlockVendor = block.vendor || stats.lastBlockVendor || null;
+  stats.lastBlockRemedy = block.remedy || stats.lastBlockRemedy || null;
+  if (isBrowserSessionRemedy(block)) {
+    stats.browserSessionBlockSeen = true;
+  }
 }
 
 // ── robots.txt (Sitemap: + Crawl-delay — httpScrapeClient ignores both) ─
@@ -194,12 +283,9 @@ function parseSitemapXml(xml) {
   return { type, entries };
 }
 
-function isProductish(loc) {
-  return PRODUCTISH_RE.test(String(loc || ''));
-}
-
+// Lower rank sorts first — negate score so product-ish (high score) leads.
 function rankLoc(loc) {
-  return isProductish(loc) ? 0 : 1;
+  return -scoreProductish(loc);
 }
 
 function lastmodMs(lastmod) {
@@ -530,8 +616,22 @@ function priceFromOffers(offers) {
   };
 }
 
-function imagesFromNode(node, pageUrl) {
-  const raw = node.image;
+/**
+ * imagesFromNode(node, pageUrl, opts?) → { imageUrl, additionalImages }
+ *
+ * Collects image URLs from a JSON-LD Product node, absolutizes them, then:
+ *   - CATALOG_IMAGE_UPGRADE_ENABLED + opts.upgradeRun → upgrade each URL
+ *     (HEAD-verified) and de-dupe AFTER upgrade (a `_small` and a
+ *     `_1024x1024` of the same photo collapse to one original; first-seen
+ *     order preserved because feedIndex is stamped from position).
+ *   - Flag-off OR no upgradeRun → exact-URL de-dupe only (byte-identical
+ *     prior path; no HEADs). Offline harnesses call without upgradeRun.
+ *
+ * Async so the HEAD path can run; always returns a Promise.
+ */
+async function imagesFromNode(node, pageUrl, opts = {}) {
+  opts = opts || {};
+  const raw = node && node.image;
   const list = [];
   const push = (v) => {
     if (v == null) return;
@@ -551,13 +651,20 @@ function imagesFromNode(node, pageUrl) {
   } else {
     push(raw);
   }
-  const uniq = [];
-  const seen = new Set();
-  for (const u of list) {
-    if (seen.has(u)) continue;
-    seen.add(u);
-    uniq.push(u);
+
+  let uniq;
+  if (
+    isCatalogImageUpgradeEnabled() &&
+    opts.upgradeRun &&
+    typeof opts.upgradeRun.upgradeList === 'function'
+  ) {
+    // Upgrade first, de-dupe second — collapse is the point.
+    uniq = await opts.upgradeRun.upgradeList(list);
+  } else {
+    // Exact-URL de-dupe only (flag-off / pure offline callers).
+    uniq = dedupeUrlsFirstSeen(list);
   }
+
   return {
     imageUrl: uniq[0] || null,
     // index 0 is the hero (imageUrl); slice starts at 1 so the hero is
@@ -603,11 +710,15 @@ function resolveFeedId(node, pageUrl) {
 }
 
 /**
- * mapJsonLdProduct(node, pageUrl, explicitId?) → flat product | null
+ * mapJsonLdProduct(node, pageUrl, explicitId?, opts?) → flat product | null
  * explicitId, when supplied, overrides id resolution (used by the
  * resolver's on-page feed-id recovery when the node lacks a structured id).
+ * opts.upgradeRun (from createImageUpgradeRun) enables HEAD-verified
+ * thumbnail→original upgrade on imageUrl + additionalImages.
+ * Async (awaits imagesFromNode).
  */
-function mapJsonLdProduct(node, pageUrl, explicitId = null) {
+async function mapJsonLdProduct(node, pageUrl, explicitId = null, opts = {}) {
+  opts = opts || {};
   if (!node || typeof node !== 'object') return null;
 
   const gtin = pickGtin(node);
@@ -628,7 +739,7 @@ function mapJsonLdProduct(node, pageUrl, explicitId = null) {
 
   const { price, currency, availability: offerAvail } = priceFromOffers(node.offers);
   const availability = offerAvail || mapAvailability(node.availability);
-  const { imageUrl, additionalImages } = imagesFromNode(node, pageUrl);
+  const { imageUrl, additionalImages } = await imagesFromNode(node, pageUrl, opts);
   const productUrl = absUrl(node.url || node['@id'] || pageUrl, pageUrl) || pageUrl || null;
   const category = categoryOf(node.category);
   const { rating, productReviews } = reviewsFromNode(node);
@@ -655,10 +766,13 @@ function mapJsonLdProduct(node, pageUrl, explicitId = null) {
 }
 
 /**
- * mapOgProduct(html, pageUrl) → partial flat product | null
+ * mapOgProduct(html, pageUrl, opts?) → partial flat product | null
  * Fallback when no Product JSON-LD. Requires og:title at minimum.
+ * opts.upgradeRun upgrades og:image the same way as JSON-LD images.
+ * Async when upgrade runs; always returns a Promise.
  */
-function mapOgProduct(html, pageUrl) {
+async function mapOgProduct(html, pageUrl, opts = {}) {
+  opts = opts || {};
   if (!html || typeof html !== 'string') return null;
 
   // Attribute-order agnostic, delimiter-aware, entity-decoded — see
@@ -680,7 +794,15 @@ function mapOgProduct(html, pageUrl) {
   const externalId = extractNumericIdFromUrl(ogUrl || pageUrl);
   if (!externalId) return null;
 
-  const imageUrl = absUrl(image, pageUrl);
+  let imageUrl = absUrl(image, pageUrl);
+  if (
+    imageUrl &&
+    isCatalogImageUpgradeEnabled() &&
+    opts.upgradeRun &&
+    typeof opts.upgradeRun.resolve === 'function'
+  ) {
+    imageUrl = await opts.upgradeRun.resolve(imageUrl);
+  }
   const productUrl = absUrl(ogUrl || pageUrl, pageUrl) || pageUrl;
 
   return {
@@ -728,52 +850,92 @@ function validateProduct(p) {
 
 // ── sitemap fetch helpers ──────────────────────────────────────────
 
-async function fetchXmlText(url) {
+async function fetchXmlText(url, { session = null } = {}) {
   const isGz = /\.gz($|\?)/i.test(url);
   if (isGz) {
-    const res = await http.fetchBuffer(url, { maxBytes: 20_000_000 });
-    if (res.cfChallenged) return { ok: false, cfChallenged: true, rateLimited: false, text: null };
-    if (res.rateLimited) return { ok: false, cfChallenged: false, rateLimited: true, text: null };
+    const res = await http.fetchBuffer(url, { maxBytes: 20_000_000, session });
+    const block = res.block || null;
+    if (res.cfChallenged) {
+      return { ok: false, cfChallenged: true, rateLimited: false, text: null, block };
+    }
+    if (res.rateLimited) {
+      return { ok: false, cfChallenged: false, rateLimited: true, text: null, block };
+    }
     if (!res.ok || !res.buffer) {
-      return { ok: false, cfChallenged: false, rateLimited: false, text: null, error: res.error };
+      return {
+        ok: false,
+        cfChallenged: false,
+        rateLimited: false,
+        text: null,
+        error: res.error,
+        block
+      };
     }
     try {
       // Cap DECOMPRESSED size (gzip-bomb guard): a small .gz can inflate to
       // GBs. maxOutputLength makes gunzipSync throw once the cap is hit.
       const text = zlib.gunzipSync(res.buffer, { maxOutputLength: GZIP_MAX_OUTPUT_BYTES }).toString('utf8');
-      return { ok: true, text, cfChallenged: false, rateLimited: false };
+      return { ok: true, text, cfChallenged: false, rateLimited: false, block: null };
     } catch (err) {
-      return { ok: false, cfChallenged: false, rateLimited: false, text: null, error: err.message };
+      return {
+        ok: false,
+        cfChallenged: false,
+        rateLimited: false,
+        text: null,
+        error: err.message,
+        block: null
+      };
     }
   }
 
-  const res = await http.fetchText(url, { maxBytes: 8_000_000 });
-  if (res.cfChallenged) return { ok: false, cfChallenged: true, rateLimited: false, text: null };
-  if (res.rateLimited) return { ok: false, cfChallenged: false, rateLimited: true, text: null };
-  if (!res.ok || !res.text) {
-    return { ok: false, cfChallenged: false, rateLimited: false, text: null, error: res.error };
+  const res = await http.fetchText(url, { maxBytes: 8_000_000, session });
+  const block = res.block || null;
+  if (res.cfChallenged) {
+    return { ok: false, cfChallenged: true, rateLimited: false, text: null, block };
   }
-  return { ok: true, text: res.text, cfChallenged: false, rateLimited: false };
+  if (res.rateLimited) {
+    return { ok: false, cfChallenged: false, rateLimited: true, text: null, block };
+  }
+  if (!res.ok || !res.text) {
+    return {
+      ok: false,
+      cfChallenged: false,
+      rateLimited: false,
+      text: null,
+      error: res.error,
+      block
+    };
+  }
+  return { ok: true, text: res.text, cfChallenged: false, rateLimited: false, block: null };
 }
 
-async function discoverSitemapUrls(origin, abortCheck = async () => false) {
+async function discoverSitemapUrls(origin, abortCheck = async () => false, { session = null, stats = null } = {}) {
   const discovered = [];
   const seen = new Set();               // O(1) dedup (not .includes O(n^2))
   const add = (u) => { if (u && !seen.has(u)) { seen.add(u); discovered.push(u); } };
   let crawlDelayMs = 0;
   let cfChallenges = 0;
   let rateLimited = false;
+  // robots body is free once fetched — hand to fingerprintSite so
+  // Shopify's canonical robots signature can fire without a re-fetch.
+  let robotsText = null;
+  let robotsReachable = false;
 
   // 1. robots.txt
   try {
     const robotsUrl = `${origin}/robots.txt`;
-    const res = await http.fetchText(robotsUrl, { timeoutMs: 15000 });
+    const res = await http.fetchText(robotsUrl, { timeoutMs: 15000, session });
     if (res.cfChallenged) cfChallenges += 1;
     if (res.rateLimited) rateLimited = true;
+    if (res.block) noteBlock(stats, res.block);
     if (res.ok && res.text) {
+      robotsText = res.text;
+      robotsReachable = true;
       const parsed = parseRobotsForSitemaps(res.text, '*');
       crawlDelayMs = parsed.crawlDelayMs || 0;
       for (const u of parsed.sitemaps) add(u);
+    } else if (res.ok) {
+      robotsReachable = true;
     }
   } catch (err) {
     console.warn(`   ⚠️  ${LOG}  robots.txt fetch error: ${err.message}`);
@@ -785,9 +947,10 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
       if (await abortCheck()) break;
       const url = `${origin}${path}`;
       try {
-        const got = await fetchXmlText(url);
+        const got = await fetchXmlText(url, { session });
         if (got.cfChallenged) cfChallenges += 1;
         if (got.rateLimited) rateLimited = true;
+        if (got.block) noteBlock(stats, got.block);
         if (got.ok && got.text && /<loc[\s>]/i.test(got.text)) add(url);
       } catch (err) {
         console.warn(`   ⚠️  ${LOG}  fallback sitemap ${url}: ${err.message}`);
@@ -795,15 +958,32 @@ async function discoverSitemapUrls(origin, abortCheck = async () => false) {
     }
   }
 
-  return { sitemaps: discovered, crawlDelayMs, cfChallenges, rateLimited };
+  return {
+    sitemaps: discovered,
+    crawlDelayMs,
+    cfChallenges,
+    rateLimited,
+    robotsText,
+    robotsReachable
+  };
 }
 
 /**
  * Walk sitemap indexes → urlsets (depth ≤ 2). Streams product-page
  * candidates ranked product-ish first, lastmod desc.
- * Returns { pageEntries:[{loc,lastmod}], sitemapsWalked, cfChallenges, rateLimited }.
+ * Returns { pageEntries:[{loc,lastmod}], sitemapsWalked, cfChallenges,
+ *   rateLimited, aborted, budgetExpired }.
+ * `budget` is an optional RungBudget from createBudget().enterRung — checked
+ * alongside abortCheck so a large index cannot burn the whole wall-clock
+ * allotment before any PDP is scanned.
  */
-async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
+async function walkSitemaps(rootSitemaps, {
+  abortCheck,
+  maxUrls,
+  budget = null,
+  session = null,
+  stats = null
+} = {}) {
   const pageEntries = [];
   const seenLoc = new Set();
   const seenSitemaps = new Set();   // dedup index/sub-sitemap URLs (loop + DoS guard)
@@ -812,6 +992,7 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
   let cfChallenges = 0;
   let rateLimited = false;
   let aborted = false;
+  let budgetExpired = false;
 
   // Fetch a sitemap document at most once, bounded by MAX_SITEMAP_FETCHES.
   // Prevents a self-referential / diamond index graph from forcing an
@@ -822,7 +1003,9 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
     seenSitemaps.add(url);
     sitemapFetches += 1;
     try {
-      return await fetchXmlText(url);
+      const got = await fetchXmlText(url, { session });
+      if (got && got.block) noteBlock(stats, got.block);
+      return got;
     } catch (err) {
       console.warn(`   ⚠️  ${LOG}  sitemap fetch ${url}: ${err.message}`);
       return null;
@@ -836,6 +1019,7 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
   // Pass 1: expand indexes, rank sub-sitemaps
   while (queue.length) {
     if (await abortCheck()) { aborted = true; break; }
+    if (budget && budget.expired()) { budgetExpired = true; break; }
     if (sitemapFetches >= MAX_SITEMAP_FETCHES) break;
     const { url, depth } = queue.shift();
     if (!url || depth > MAX_SITEMAP_DEPTH) continue;
@@ -853,7 +1037,8 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
       const entries = parsed.entries.slice().sort((a, b) => rankLoc(a.loc) - rankLoc(b.loc));
       for (const e of entries) {
         if (!e.loc || seenSitemaps.has(e.loc)) continue;
-        if (rankLoc(e.loc) === 0) rankedSubs.push({ url: e.loc, depth: depth + 1 });
+        // Product-ish first (rankLoc < 0 ⇔ scoreProductish > 0).
+        if (rankLoc(e.loc) < 0) rankedSubs.push({ url: e.loc, depth: depth + 1 });
         else otherSubs.push({ url: e.loc, depth: depth + 1 });
       }
     } else {
@@ -878,6 +1063,7 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
     if (pageEntries.length >= maxUrls) break;
     if (sitemapFetches >= MAX_SITEMAP_FETCHES) break;
     if (await abortCheck()) { aborted = true; break; }
+    if (budget && budget.expired()) { budgetExpired = true; break; }
     if (item.depth > MAX_SITEMAP_DEPTH) continue;
 
     const got = await fetchSitemapOnce(item.url);
@@ -913,16 +1099,483 @@ async function walkSitemaps(rootSitemaps, { abortCheck, maxUrls }) {
     return lastmodMs(b.lastmod) - lastmodMs(a.lastmod);
   });
 
-  return { pageEntries, sitemapsWalked, cfChallenges, rateLimited, aborted };
+  return { pageEntries, sitemapsWalked, cfChallenges, rateLimited, aborted, budgetExpired };
+}
+
+// ── browser session last rung ──────────────────────────────────────
+
+/**
+ * Should we launch Chrome? Only when the cheap path already failed for a
+ * reason a browser can fix, products are still empty, and budget remains.
+ * Most syncs never enter this function's body past the gate.
+ */
+function shouldAttemptBrowserRung({ stats, disc, pageEntries, budget }) {
+  if (!RENDER_GENERIC_ENABLED) return false;
+  if (stats && stats.browserAttempted) return false; // once per resolve
+  if (budget && typeof budget.expired === 'function' && budget.expired()) return false;
+
+  const browserBlock = !!(stats && stats.browserSessionBlockSeen);
+  const shopifyFall = !!(stats && stats.shopifyFallthrough);
+  // Zero candidates while robots was reachable (ubeauty: robots 200,
+  // every sitemap/products.json 403 with cf-mitigated:challenge).
+  const robotsOk = !!(disc && (disc.robotsReachable || disc.robotsText));
+  const zeroCandidates = !pageEntries || pageEntries.length === 0;
+  const zeroUrlsWithRobots = robotsOk && zeroCandidates;
+
+  return browserBlock || shopifyFall || zeroUrlsWithRobots;
+}
+
+/**
+ * tryBrowserSessionRung(...) → success result object | null
+ *
+ * null = did not run, or ran and still has zero products (caller emits
+ * the existing honest failure). On success returns a full resolveGenericCatalog
+ * result with source 'shopify-direct' | 'sitemap-jsonld'.
+ *
+ * Order once Chrome is up:
+ *   1. gotoWithCf(origin) + harvestSession (HttpOnly cookies via page.cookies)
+ *   2. if Shopify: in-page paginated products.json
+ *   3. else/additionally: re-run cheap rungs with the harvested session
+ *   4. still nothing → null (honest failure with vendor named)
+ */
+// Hard ceiling on the WHOLE browser rung, mirroring the protection the older
+// headless path already has (headlessScrapeService SHOPIFY_HEADLESS_TIMEOUT_MS +
+// its Promise.race). Env-tunable.
+//
+// WHY A RACE AND NOT JUST THE BUDGET: the wall-clock budget is CHECKED BETWEEN
+// steps — it cannot interrupt an in-flight await. Measured 2026-08-10 against
+// ubeauty.com, a wedged Chrome launch outlived a 300s total budget by more than
+// 300s and the resolver never returned. Per-step timeouts (45s goto, 15s
+// challenge wait) do not cover launch, page teardown, or an in-page evaluate
+// that never settles. This is the same defect class Phase 1 fixed for the HTTP
+// path, so the new rung gets the same guarantee.
+//
+// Note the race does not CANCEL the inner work (Promise.race cannot) — it lets
+// the resolver return honestly while the orphaned attempt unwinds. That matches
+// the existing headless path's semantics; the singleton browser is reused or
+// closed on shutdown rather than leaked per-run.
+const BROWSER_RUNG_TIMEOUT_MS = Math.max(
+  10000,
+  parseInt(process.env.HEADLESS_RUNG_TIMEOUT_MS, 10) || 120000
+);
+
+async function tryBrowserSessionRung(args) {
+  const { stats, warnings, budget } = args;
+  // Never allow the rung more time than the run has left.
+  const remaining = budget && typeof budget.remainingMs === 'function'
+    ? budget.remainingMs()
+    : Infinity;
+  const capMs = Math.max(1000, Math.min(BROWSER_RUNG_TIMEOUT_MS, remaining));
+
+  let timer = null;
+  const TIMED_OUT = Symbol('browser-rung-timeout');
+  try {
+    const result = await Promise.race([
+      tryBrowserSessionRungInner(args),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), capMs);
+      })
+    ]);
+    if (result === TIMED_OUT) {
+      const msg = `browser rung timed out after ${capMs}ms`;
+      console.warn(`   ⚠️  ${LOG}  ${msg}`);
+      if (stats) {
+        stats.browserTimedOut = true;
+        stats.browserTimeoutMs = capMs;
+      }
+      if (warnings) warnings.push(msg);
+      return null;   // fall through honestly rather than hang the run
+    }
+    return result;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function tryBrowserSessionRungInner({
+  brand,
+  origin,
+  stats,
+  warnings,
+  effectiveCap,
+  budget,
+  abortCheck,
+  run,
+  isShopify,
+  pageEntries,
+  disc,
+  getRateLimited,
+  setRateLimited,
+  getBudgetExpired,
+  setBudgetExpired,
+  activeSessionRef,
+  rescanWithSession = true,
+  attachCategoryFields = (o) => o,
+  // Image-URL upgrade context (shared with the main PDP scan so memo +
+  // check-cap span the whole resolve). Optional — missing = no upgrades.
+  mapOpts = null
+}) {
+  if (!shouldAttemptBrowserRung({ stats, disc, pageEntries, budget })) {
+    return null;
+  }
+  if (await abortCheck()) return null;
+
+  stats.browserAttempted = true;
+  stats.browserMode = null;
+  stats.sessionHarvested = false;
+  stats.sessionReused = false;
+  stats.browserProductCount = 0;
+
+  let headless;
+  try {
+    headless = require('./headlessScrapeService');
+  } catch (err) {
+    warnings.push(`browser rung unavailable: ${err.message}`);
+    stats.browserError = err.message;
+    return null;
+  }
+  if (typeof headless.clearChallengeAndHarvest !== 'function') {
+    warnings.push('browser rung unavailable: clearChallengeAndHarvest missing');
+    return null;
+  }
+
+  console.log(
+    `   · ${LOG}  browser session rung — ` +
+    `shopify=${!!isShopify} blockSeen=${!!stats.browserSessionBlockSeen} ` +
+    `fallthrough=${!!stats.shopifyFallthrough}`
+  );
+  try { run?.stage?.('browser session (challenge clear)'); } catch { /* */ }
+  try {
+    run?.note?.(
+      `launching headless Chrome to clear bot challenge @ ${origin}`
+    );
+  } catch { /* */ }
+
+  const wrappedAbort = async () => {
+    try {
+      if (await abortCheck()) return true;
+    } catch { /* */ }
+    if (budget && typeof budget.expired === 'function' && budget.expired()) {
+      if (typeof setBudgetExpired === 'function') setBudgetExpired(true);
+      return true;
+    }
+    return false;
+  };
+
+  let harvest;
+  try {
+    harvest = await headless.clearChallengeAndHarvest(origin, {
+      abortCheck: wrappedAbort,
+      run,
+      tryProductsJson: !!isShopify,
+      cap: effectiveCap
+    });
+  } catch (err) {
+    console.warn(`   ⚠️  ${LOG}  browser harvest threw: ${err.message}`);
+    stats.browserError = err.message;
+    warnings.push(`browser harvest failed: ${err.message}`);
+    return null;
+  }
+
+  if (!harvest || !harvest.ok || !harvest.session) {
+    const why = (harvest && harvest.reason) || 'challenge not cleared';
+    stats.browserError = why;
+    warnings.push(`browser session failed: ${why}`);
+    console.log(`   · ${LOG}  browser harvest failed: ${why}`);
+    return null;
+  }
+
+  // Cache only if clearance cookies are present (document.cookie trap).
+  const cached = scrapeSession.putSession({
+    origin,
+    cookieHeader: harvest.session.cookieHeader,
+    userAgent: harvest.session.userAgent,
+    acceptLanguage: harvest.session.acceptLanguage,
+    vendor: harvest.session.vendor || 'cloudflare'
+  });
+  stats.sessionHarvested = !!cached;
+  if (cached && activeSessionRef) activeSessionRef.set(cached);
+  if (!cached) {
+    // Harvest returned cookies but they failed the clearance gate —
+    // still usable for in-page products already collected; HTTP reuse no.
+    warnings.push(
+      'browser harvest missing cf_clearance/__cf_bm — session not cached for HTTP reuse'
+    );
+  }
+
+  // ── 2. Shopify in-page products.json ─────────────────────────────
+  const rawProducts = Array.isArray(harvest.products) ? harvest.products : [];
+  if (rawProducts.length) {
+    stats.browserMode = 'products-json';
+    stats.browserProductCount = rawProducts.length;
+    const mapFlat = ingestHelpers.mapShopifyNormalizedToFlat;
+    const flat = [];
+    for (const p of rawProducts) {
+      try {
+        const m = mapFlat(p, origin, brand);
+        if (m && m.externalId) flat.push(m);
+      } catch (err) {
+        warnings.push(`browser shopify map failed for ${p && p.id}: ${err.message}`);
+      }
+    }
+    if (flat.length) {
+      console.log(
+        `${LOG}  resolveGenericCatalog ok via browser products.json: n=${flat.length}`
+      );
+      const out = {
+        ok: true,
+        mode: 'products-json',
+        // CatalogProduct.source enum — must stay a valid member.
+        source: 'shopify-direct',
+        origin,
+        products: flat.slice(0, effectiveCap),
+        stats,
+        rateLimited: typeof getRateLimited === 'function' ? getRateLimited() : false
+      };
+      if (warnings.length) out.warnings = warnings;
+      if (typeof getBudgetExpired === 'function' && getBudgetExpired()) {
+        out.budgetExpired = true;
+        out.partial = true;
+        out.partialReason = 'budget-exceeded';
+      }
+      return attachCategoryFields(out);
+    }
+  }
+
+  // ── 3. Re-run cheap rungs with harvested session ─────────────────
+  const session = cached || (activeSessionRef && activeSessionRef.get());
+  if (!rescanWithSession || !session || !session.isValid()) {
+    return null;
+  }
+
+  stats.sessionReused = true;
+  stats.browserMode = stats.browserMode || 'session-http';
+  try { run?.stage?.('re-scan with browser session'); } catch { /* */ }
+  try {
+    run?.note?.('replaying cleared session on HTTP path (sitemap + PDPs)');
+  } catch { /* */ }
+
+  // Re-discover + walk with session (sitemaps may have been CF-blocked).
+  let sessionEntries = Array.isArray(pageEntries) ? pageEntries.slice() : [];
+  if (!sessionEntries.length) {
+    try {
+      const disc2 = await discoverSitemapUrls(origin, abortCheck, {
+        session,
+        stats
+      });
+      if (disc2.rateLimited && typeof setRateLimited === 'function') {
+        setRateLimited(true);
+      }
+      stats.cfChallenges += disc2.cfChallenges || 0;
+      if (disc2.sitemaps && disc2.sitemaps.length) {
+        const walked2 = await walkSitemaps(disc2.sitemaps, {
+          abortCheck: wrappedAbort,
+          maxUrls: MAX_SITEMAP_URLS,
+          budget:
+            budget && typeof budget.enterRung === 'function'
+              ? budget.enterRung('sitemap-session', budget.remainingMs())
+              : null,
+          session,
+          stats
+        });
+        stats.sitemapsWalked += walked2.sitemapsWalked || 0;
+        stats.cfChallenges += walked2.cfChallenges || 0;
+        if (walked2.rateLimited && typeof setRateLimited === 'function') {
+          setRateLimited(true);
+        }
+        if (walked2.budgetExpired && typeof setBudgetExpired === 'function') {
+          setBudgetExpired(true);
+        }
+        sessionEntries = walked2.pageEntries || [];
+      }
+    } catch (err) {
+      warnings.push(`session re-discover failed: ${err.message}`);
+    }
+  }
+
+  if (!sessionEntries.length) {
+    // Optional: renderKnownUrls is available but we have no URLs — done.
+    return null;
+  }
+
+  // Bounded PDP re-scan with session (same validation as the main loop).
+  const sessionProducts = [];
+  const seenIds = new Set();
+  const pdpBudget =
+    budget && typeof budget.enterRung === 'function'
+      ? budget.enterRung('pdp-session', budget.remainingMs())
+      : null;
+  const scanCap = Math.min(sessionEntries.length, MAX_SITEMAP_URLS);
+
+  for (let i = 0; i < scanCap && sessionProducts.length < effectiveCap; i++) {
+    if (await abortCheck()) break;
+    if (pdpBudget && pdpBudget.expired()) {
+      if (typeof setBudgetExpired === 'function') setBudgetExpired(true);
+      break;
+    }
+    if (budget && budget.expired()) {
+      if (typeof setBudgetExpired === 'function') setBudgetExpired(true);
+      break;
+    }
+
+    const entry = sessionEntries[i];
+    const loc = entry && entry.loc;
+    if (!loc) continue;
+
+    let html = null;
+    try {
+      const res = await http.fetchText(loc, {
+        timeoutMs: 15000,
+        maxBytes: 4_000_000,
+        session
+      });
+      if (res.block) noteBlock(stats, res.block);
+      if (res.cfChallenged) {
+        stats.cfChallenges += 1;
+        continue;
+      }
+      if (res.rateLimited) {
+        if (typeof setRateLimited === 'function') setRateLimited(true);
+        break;
+      }
+      if (!res.ok || !res.text) continue;
+      html = res.text;
+    } catch {
+      continue;
+    }
+
+    stats.urlsScanned += 1;
+    let mapped = null;
+    try {
+      const nodes = extractJsonLdProducts(html);
+      if (nodes.length) {
+        stats.jsonLdProductsFound += 1;
+        for (const node of nodes) {
+          mapped = await mapJsonLdProduct(node, loc, null, mapOpts);
+          if (mapped) break;
+        }
+        if (!mapped) {
+          const htmlId = extractProductIdFromHtml(html);
+          if (htmlId) {
+            for (const node of nodes) {
+              mapped = await mapJsonLdProduct(node, loc, htmlId, mapOpts);
+              if (mapped) break;
+            }
+          }
+        }
+      }
+      if (!mapped) {
+        mapped = await mapOgProduct(html, loc, mapOpts);
+        if (mapped) stats.ogFallbackUsed += 1;
+      }
+    } catch {
+      continue;
+    }
+    if (!mapped) continue;
+
+    if (entry.lastmod) mapped._lastmod = entry.lastmod;
+    try {
+      const bc = extractBreadcrumb(html);
+      if (bc && Array.isArray(bc.breadcrumb) && bc.breadcrumb.length) {
+        mapped.breadcrumb = bc.breadcrumb;
+        mapped.breadcrumbSource = bc.source;
+      }
+    } catch { /* best-effort */ }
+    if (mapped.rating == null || !mapped.productReviews) {
+      try {
+        const rev = reviewsEngine.extractOnPageReviews(html);
+        if (rev.rating != null && mapped.rating == null) mapped.rating = rev.rating;
+        if (!mapped.productReviews) {
+          mapped.productReviews = reviewsEngine.buildProductReviews(rev);
+        } else if (rev.platform && !mapped.productReviews.platform) {
+          mapped.productReviews.platform = rev.platform;
+        }
+      } catch { /* best-effort */ }
+    }
+
+    if (!validateProduct(mapped).valid) {
+      stats.validationFailures += 1;
+      continue;
+    }
+    const idKey = String(mapped.externalId);
+    if (seenIds.has(idKey)) {
+      stats.duplicatesSkipped += 1;
+      continue;
+    }
+    seenIds.add(idKey);
+    sessionProducts.push(mapped);
+    try {
+      run?.tick?.(
+        sessionProducts.length,
+        effectiveCap,
+        `session scan ${sessionProducts.length}/${effectiveCap}`
+      );
+    } catch { /* */ }
+  }
+
+  stats.browserProductCount = sessionProducts.length;
+  if (!sessionProducts.length) return null;
+
+  console.log(
+    `${LOG}  resolveGenericCatalog ok via browser session HTTP: n=${sessionProducts.length}`
+  );
+  const out = {
+    ok: true,
+    mode: 'sitemap-jsonld',
+    source: 'sitemap-jsonld',
+    origin,
+    products: sessionProducts.slice(0, effectiveCap),
+    stats,
+    rateLimited: typeof getRateLimited === 'function' ? getRateLimited() : false
+  };
+  if (warnings.length) out.warnings = warnings;
+  if (typeof getBudgetExpired === 'function' && getBudgetExpired()) {
+    out.budgetExpired = true;
+    out.partial = true;
+    out.partialReason = 'budget-exceeded';
+  }
+  return attachCategoryFields(out);
 }
 
 // ── main resolve ───────────────────────────────────────────────────
 
 /**
- * resolveGenericCatalog(brand, { run, abortCheck, cap })
- * → { ok, mode:'sitemap-jsonld', origin, products:[flat], stats, rateLimited?, reason?, warnings? }
+ * resolveGenericCatalog(brand, { run, abortCheck, cap, discoverOnly, categories })
+ * → { ok, mode, source?, origin, products:[flat], stats, rateLimited?, reason?, warnings?,
+ *     categoryOptions?, categoryPromptSuggested?, discoverOnly?, totalCandidates? }
+ *
+ * mode: 'sitemap-jsonld' | shopify ladder mode ('products-json'|'storefront-graphql'|'sitemap')
+ * source: CatalogProduct.source enum value when AUTODETECT ran
+ *   ('shopify-direct' | 'sitemap-jsonld'). Flag-off omits it (byte-identical).
+ *
+ * discoverOnly:true — walk sitemaps, derive category options, return WITHOUT
+ *   scanning a single PDP (products:[]). Used by the capability preview so an
+ *   operator can pick categories before spending wall-clock on pages.
+ * categories:['buffalo-bills',…] — filter pageEntries through
+ *   matchesAnyCategory BEFORE the PDP scan. Segment-exact match only.
+ * Both are gated on GENERIC_CATALOG_CATEGORY_OPTIONS (default true); when
+ * false the result is byte-identical to the pre-feature shape (no new keys).
+ *
+ * AUTODETECT (GENERIC_CATALOG_AUTODETECT, default true): after robots/sitemap
+ * discovery, fingerprint the homepage. Shopify high/medium → climb the
+ * existing shopifyAccessResolver ladder (products.json first). Zero products
+ * (e.g. CF-blocked) falls through to sitemap+JSON-LD so coverage is never
+ * lost. Living Spaces (non-Shopify) stays on the JSON-LD path.
+ *
+ * BROWSER SESSION (RENDER_GENERIC_ENABLED, default true): last rung only —
+ * launches Chrome when a browser-session block was seen, the Shopify ladder
+ * fell through, or sitemaps yielded zero URLs while robots was reachable.
+ * Harvests HttpOnly cookies (page.cookies — NEVER document.cookie), then
+ * either pulls products.json in-page (Shopify) or re-runs cheap HTTP rungs
+ * with the pinned session. Most syncs never start a browser.
  */
-async function resolveGenericCatalog(brand, { run = null, abortCheck = async () => false, cap = DEFAULT_CAP } = {}) {
+async function resolveGenericCatalog(brand, {
+  run = null,
+  abortCheck = async () => false,
+  cap = DEFAULT_CAP,
+  discoverOnly = false,
+  categories = null
+} = {}) {
   const stats = {
     sitemapsDiscovered: 0,
     sitemapsWalked: 0,
@@ -937,6 +1590,28 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
   const products = [];
   const seenIds = new Set();
   let rateLimited = false;
+  // budgetExpired is its OWN flag — do not overload aborted/cancelled.
+  // aborted drives run.markCancelled(...); a timeout is not a cancellation.
+  let budgetExpired = false;
+
+  // Image-URL upgrade run (one per resolve). Memoises HEAD answers and caps
+  // verification requests (CATALOG_IMAGE_UPGRADE_MAX_CHECKS). Flag-off →
+  // upgradeRun is null and map* paths are byte-identical to pre-change.
+  // fetchHead is built lazily so a flag-off resolve never even constructs it.
+  const imageUpgradeRun = isCatalogImageUpgradeEnabled()
+    ? createImageUpgradeRun({
+        fetchHead: makeHttpScrapeFetchHead(http, { timeoutMs: 8000 })
+      })
+    : null;
+  const mapOpts = imageUpgradeRun ? { upgradeRun: imageUpgradeRun } : null;
+
+  // Wall-clock budget for the whole resolve (discovery + walk + PDP scan).
+  // Unset / non-positive env → unbounded (createBudget safety property).
+  const budget = createBudget({ totalMs: TOTAL_BUDGET_MS });
+  const budgetReason = (detail) => {
+    const sec = Math.round(budget.spentMs() / 1000);
+    return `stopped after ${sec}s (budget)${detail ? ` — ${detail}` : ''}`;
+  };
 
   const origin = ingestHelpers.resolveStoreOrigin(brand);
   if (!origin) {
@@ -956,17 +1631,193 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
   run?.note?.(`generic catalog discovery @ ${origin}`);
 
   // ── Discover sitemaps ────────────────────────────────────────────
-  const disc = await discoverSitemapUrls(origin, abortCheck);
+  // Counts against the TOTAL budget (sitemap rung opens after discovery
+  // so a slow robots.txt cannot starve the walk allotment entirely —
+  // discovery is a handful of requests; the walk is the expensive part).
+  // `activeSession` is null until the browser rung harvests one; cheap
+  // path first, always.
+  let activeSession = null;
+  const disc = await discoverSitemapUrls(origin, abortCheck, { stats });
   stats.sitemapsDiscovered = disc.sitemaps.length;
   stats.cfChallenges += disc.cfChallenges || 0;
   if (disc.rateLimited) rateLimited = true;
   const crawlDelayMs = disc.crawlDelayMs || 0;
   const pdpGapMs = Math.max(crawlDelayMs - 250, 0);
 
+  // ── Platform auto-detect (Shopify → access ladder) ───────────────
+  // One homepage fetch + pure fingerprint on already-fetched robots.
+  // Flag-off: skip entirely (no new stats keys, no homepage fetch).
+  // discoverOnly: skip delegation — category options still need the
+  // sitemap walk; fingerprint alone is not useful without product import.
+  if (AUTODETECT_ENABLED && !discoverOnly && !(await abortCheck()) && !budget.expired()) {
+    let homepageHtml = null;
+    let homepageHeaders = null;
+    try {
+      run?.stage?.('fingerprinting store platform');
+      const homeRes = await http.fetchText(`${origin}/`, { timeoutMs: 15000, maxBytes: 2_000_000 });
+      if (homeRes.cfChallenged) stats.cfChallenges += 1;
+      if (homeRes.rateLimited) rateLimited = true;
+      if (homeRes.block) noteBlock(stats, homeRes.block);
+      if (homeRes.ok && homeRes.text) {
+        homepageHtml = homeRes.text;
+        homepageHeaders = homeRes.headers || null;
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  ${LOG}  homepage fetch for fingerprint: ${err.message}`);
+    }
+
+    const fp = fingerprintSite({
+      homepageHtml,
+      homepageHeaders,
+      robotsText: disc.robotsText || null
+    });
+    stats.platform = fp.platform;
+    stats.confidence = fp.confidence;
+    stats.fingerprintSignals = fp.signals;
+
+    console.log(
+      `   · ${LOG}  fingerprint: platform=${fp.platform} confidence=${fp.confidence}` +
+      (fp.signals.length ? ` signals=[${fp.signals.join(', ')}]` : '')
+    );
+    try { run?.note?.(`platform=${fp.platform} (${fp.confidence})`); } catch { /* optional */ }
+
+    const shopifyEligible =
+      fp.platform === 'shopify' &&
+      (fp.confidence === 'high' || fp.confidence === 'medium');
+
+    if (shopifyEligible && !(await abortCheck()) && !budget.expired()) {
+      stats.shopifyAttempted = true;
+      run?.stage?.('shopify access ladder (auto-detect)');
+      console.log(`   · ${LOG}  Shopify detected — delegating to shopifyAccessResolver`);
+
+      let shopifyAccess = null;
+      try {
+        const { resolveShopifyAccess } = require('./shopifyAccessResolver');
+        // Honour budget via abort wrapper: when the wall-clock expires the
+        // ladder stops climbing; partials already collected are still used.
+        const shopifyAbort = async () => {
+          if (await abortCheck()) return true;
+          if (budget.expired()) {
+            budgetExpired = true;
+            return true;
+          }
+          return false;
+        };
+        shopifyAccess = await resolveShopifyAccess(brand, {
+          run,
+          abortCheck: shopifyAbort,
+          cap: effectiveCap
+        });
+      } catch (err) {
+        console.warn(`   ⚠️  ${LOG}  shopifyAccessResolver threw: ${err.message}`);
+        stats.shopifyError = err.message;
+        shopifyAccess = null;
+      }
+
+      if (shopifyAccess) {
+        if (shopifyAccess.rateLimited) rateLimited = true;
+        stats.shopifyMode = shopifyAccess.mode || null;
+        stats.shopifyProductCount = (shopifyAccess.products || []).length;
+        if (shopifyAccess.discoveredMyshopify) {
+          stats.discoveredMyshopify = shopifyAccess.discoveredMyshopify;
+        }
+        if (shopifyAccess.reason) stats.shopifyReason = shopifyAccess.reason;
+
+        const rawProducts = Array.isArray(shopifyAccess.products)
+          ? shopifyAccess.products.slice(0, effectiveCap)
+          : [];
+
+        if (rawProducts.length) {
+          // Adapt products.json shape → flat generic fields via the SHARED
+          // mapper (mapShopifyNormalizedToFlat) — never a second copy.
+          const mapFlat = ingestHelpers.mapShopifyNormalizedToFlat;
+          const effectiveOrigin = shopifyAccess.origin || origin;
+          const flat = [];
+          for (const p of rawProducts) {
+            try {
+              const m = mapFlat(p, effectiveOrigin, brand);
+              if (m && m.externalId) flat.push(m);
+            } catch (err) {
+              warnings.push(`shopify map failed for ${p && p.id}: ${err.message}`);
+            }
+          }
+
+          if (flat.length) {
+            console.log(
+              `${LOG}  resolveGenericCatalog ok via Shopify auto-detect: ` +
+              `n=${flat.length} mode=${shopifyAccess.mode} origin=${effectiveOrigin}`
+            );
+            const out = {
+              ok: true,
+              mode: shopifyAccess.mode || 'products-json',
+              // CatalogProduct.source enum — honest stamp of the ladder used.
+              source: 'shopify-direct',
+              origin: effectiveOrigin,
+              products: flat,
+              stats,
+              rateLimited
+            };
+            if (warnings.length) out.warnings = warnings;
+            if (budgetExpired) {
+              out.budgetExpired = true;
+              out.partial = true;
+              out.partialReason = 'budget-exceeded';
+              out.reason = budgetReason(`kept ${flat.length} product(s) via Shopify ladder`);
+            }
+            return out;
+          }
+        }
+
+        // Zero products (or all unmappable) — fall through to sitemap+JSON-LD.
+        // Never let the new branch lose coverage the old path had
+        // (e.g. ubeauty.com CF-blocked on every Shopify rung).
+        const fallReason = shopifyAccess.reason ||
+          `Shopify ladder returned 0 products (mode=${shopifyAccess.mode || 'none'})`;
+        stats.shopifyFallthrough = true;
+        stats.shopifyFallthroughReason = fallReason;
+        warnings.push(`Shopify auto-detect fell through: ${fallReason}`);
+        console.log(`   · ${LOG}  Shopify ladder empty — falling through to sitemap+JSON-LD`);
+      }
+    }
+  }
+
+  // Track Shopify eligibility for the browser rung (products.json in-page).
+  let shopifyEligibleForBrowser = stats.platform === 'shopify' &&
+    (stats.confidence === 'high' || stats.confidence === 'medium');
+
   if (!disc.sitemaps.length) {
-    const reason = `no sitemaps found at ${origin} — site does not expose XML sitemaps`;
+    // Last rung: browser may still recover Shopify products.json (ubeauty)
+    // even when no Sitemap: lines / fallbacks are reachable over HTTP.
+    // Never launch Chrome on discoverOnly (category-options preview).
+    if (!discoverOnly) {
+      const browserEarly = await tryBrowserSessionRung({
+        brand,
+        origin,
+        stats,
+        warnings,
+        effectiveCap,
+        budget,
+        abortCheck,
+        run,
+        isShopify: shopifyEligibleForBrowser || !!stats.shopifyFallthrough,
+        pageEntries: [],
+        disc,
+        getRateLimited: () => rateLimited,
+        setRateLimited: (v) => { rateLimited = v; },
+        getBudgetExpired: () => budgetExpired,
+        setBudgetExpired: (v) => { budgetExpired = v; },
+        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } },
+        mapOpts
+      });
+      if (browserEarly) return browserEarly;
+    }
+
+    const reason = stats.lastBlockVendor
+      ? `no sitemaps found at ${origin} — blocked by ${stats.lastBlockVendor}` +
+        (stats.browserAttempted ? ' (browser session also failed)' : '')
+      : `no sitemaps found at ${origin} — site does not expose XML sitemaps`;
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
-    return {
+    const emptyOut = {
       ok: false,
       mode: 'sitemap-jsonld',
       origin,
@@ -975,12 +1826,15 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       rateLimited,
       reason
     };
+    if (AUTODETECT_ENABLED) emptyOut.source = 'sitemap-jsonld';
+    if (warnings.length) emptyOut.warnings = warnings;
+    return emptyOut;
   }
 
   console.log(`   · ${LOG}  discovered ${disc.sitemaps.length} sitemap(s), crawlDelayMs=${crawlDelayMs}`);
 
   if (await abortCheck()) {
-    return {
+    const abortOut = {
       ok: false,
       mode: 'sitemap-jsonld',
       origin,
@@ -989,18 +1843,47 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       reason: 'aborted during sitemap discovery',
       cancelled: true
     };
+    if (AUTODETECT_ENABLED) abortOut.source = 'sitemap-jsonld';
+    return abortOut;
+  }
+  if (budget.expired()) {
+    const budOut = {
+      ok: false,
+      mode: 'sitemap-jsonld',
+      origin,
+      products: [],
+      stats,
+      rateLimited,
+      budgetExpired: true,
+      partial: true,
+      partialReason: 'budget-exceeded',
+      reason: budgetReason('timed out during sitemap discovery')
+    };
+    if (AUTODETECT_ENABLED) budOut.source = 'sitemap-jsonld';
+    return budOut;
   }
 
   // ── Walk sitemaps → ranked page URLs ─────────────────────────────
+  // Sitemap rung: clamped to min(SITEMAP_BUDGET_MS, total remaining).
+  const sitemapBudget = budget.enterRung('sitemap', SITEMAP_BUDGET_MS);
   const walked = await walkSitemaps(disc.sitemaps, {
     abortCheck,
-    maxUrls: MAX_SITEMAP_URLS
+    maxUrls: MAX_SITEMAP_URLS,
+    budget: sitemapBudget,
+    session: activeSession,
+    stats
   });
   stats.sitemapsWalked = walked.sitemapsWalked;
   stats.cfChallenges += walked.cfChallenges || 0;
   if (walked.rateLimited) rateLimited = true;
+  if (walked.budgetExpired) budgetExpired = true;
 
   // Cancel during the walk must read as cancelled, not "no product URLs".
+  // User-cancel DISCARDS the partial URL list: the operator said stop, so
+  // we refuse further network spend on PDPs. Budget expiry is different —
+  // the discovery clock ran out, but URLs already collected are free to
+  // scan under whatever TOTAL budget remains (PDP rung). Keeping them
+  // maximises products recovered from sitemap-fetch time already spent.
   if (walked.aborted) {
     return {
       ok: false,
@@ -1014,9 +1897,58 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
     };
   }
 
-  const pageEntries = walked.pageEntries || [];
+  // let — may be reassigned by the category filter below (selective import).
+  let pageEntries = walked.pageEntries || [];
   if (!pageEntries.length) {
-    const reason = 'sitemaps found but contained no product page URLs';
+    // Prefer a budget reason over the generic "no product URLs" message
+    // when the walk was cut short before any locs landed.
+    if (budgetExpired) {
+      const reason = budgetReason('no product URLs collected before the wall-clock limit');
+      console.warn(`   ⚠️  ${LOG}  ${reason}`);
+      return {
+        ok: false,
+        mode: 'sitemap-jsonld',
+        origin,
+        products: [],
+        stats,
+        rateLimited,
+        budgetExpired: true,
+        partial: true,
+        partialReason: 'budget-exceeded',
+        reason
+      };
+    }
+
+    // ubeauty-class: robots + Sitemap: lines present, every sitemap doc
+    // CF-blocked → zero candidates. Browser clears + products.json.
+    // Skip on discoverOnly — preview must stay network-cheap.
+    if (!discoverOnly) {
+      const browserNoUrls = await tryBrowserSessionRung({
+        brand,
+        origin,
+        stats,
+        warnings,
+        effectiveCap,
+        budget,
+        abortCheck,
+        run,
+        isShopify: shopifyEligibleForBrowser || !!stats.shopifyFallthrough,
+        pageEntries: [],
+        disc,
+        getRateLimited: () => rateLimited,
+        setRateLimited: (v) => { rateLimited = v; },
+        getBudgetExpired: () => budgetExpired,
+        setBudgetExpired: (v) => { budgetExpired = v; },
+        activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } },
+        mapOpts
+      });
+      if (browserNoUrls) return browserNoUrls;
+    }
+
+    const reason = stats.lastBlockVendor
+      ? `sitemaps found but blocked by ${stats.lastBlockVendor}` +
+        (stats.browserAttempted ? ' (browser session also failed)' : '')
+      : 'sitemaps found but contained no product page URLs';
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
     return {
       ok: false,
@@ -1027,6 +1959,109 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       rateLimited,
       reason
     };
+  }
+
+  // ── Category options (pure string work on already-collected locs) ──
+  // Zero extra network. Gated so flag-off is byte-identical (no new keys).
+  // Cheap on MAX_SITEMAP_URLS (default 20k); still skip if the total budget
+  // already expired so derivation cannot become a hang after a slow walk.
+  let categoryOptions = null;
+  let categoryPromptSuggested = false;
+  const categoryKeys = CATEGORY_OPTIONS_ENABLED && Array.isArray(categories)
+    ? categories.map(k => String(k || '').trim()).filter(Boolean)
+    : [];
+  const wantCategoryWork = CATEGORY_OPTIONS_ENABLED && (
+    discoverOnly ||
+    categoryKeys.length > 0 ||
+    pageEntries.length >= CATEGORY_PROMPT_MIN
+  );
+
+  if (wantCategoryWork && !budget.expired()) {
+    try {
+      const urls = pageEntries.map(e => e && e.loc).filter(Boolean);
+      categoryOptions = deriveCategoryOptions(urls, {
+        minCount: CATEGORY_MIN_COUNT,
+        maxOptions: CATEGORY_MAX_OPTIONS,
+        maxDepth: 2
+      });
+    } catch (err) {
+      console.warn(`   ⚠️  ${LOG}  category option derivation failed: ${err.message}`);
+      categoryOptions = [];
+    }
+  }
+
+  // Discover-only: return the options without spending a single PDP fetch.
+  if (CATEGORY_OPTIONS_ENABLED && discoverOnly) {
+    const totalCandidates = pageEntries.length;
+    console.log(
+      `   · ${LOG}  discoverOnly: ${totalCandidates} candidates, ` +
+      `${(categoryOptions || []).length} category option(s) — no PDP scan`
+    );
+    run?.stage?.('category options ready');
+    const discOut = {
+      ok: true,
+      mode: 'sitemap-jsonld',
+      origin,
+      discoverOnly: true,
+      totalCandidates,
+      categoryOptions: categoryOptions || [],
+      products: [],
+      stats,
+      rateLimited
+    };
+    // discoverOnly skips Shopify delegation; stamp stays sitemap-jsonld
+    // when auto-detect is on (flag-off: no new key).
+    if (AUTODETECT_ENABLED) discOut.source = 'sitemap-jsonld';
+    return discOut;
+  }
+
+  // Selective import: filter candidates by operator-chosen category keys
+  // BEFORE the PDP scan (segment-exact match — see matchesAnyCategory).
+  // Reassign pageEntries in place so the PDP loop shape
+  // (`for (…; i < pageEntries.length; …)`) stays intact for the budget
+  // harness and for readers of the scan.
+  if (categoryKeys.length) {
+    const before = pageEntries.length;
+    pageEntries = pageEntries.filter(e => e && matchesAnyCategory(e.loc, categoryKeys));
+    stats.candidatesFilteredByCategory = before - pageEntries.length;
+    console.log(
+      `   · ${LOG}  category filter: ${pageEntries.length}/${before} candidates kept ` +
+      `(keys=${categoryKeys.length}, dropped=${stats.candidatesFilteredByCategory})`
+    );
+    if (!pageEntries.length) {
+      const reason =
+        `category filter matched 0 of ${before} candidate URLs ` +
+        `(keys: ${categoryKeys.slice(0, MAX_LOGGED_CATEGORY_KEYS).join(', ')}` +
+        `${categoryKeys.length > MAX_LOGGED_CATEGORY_KEYS ? '…' : ''})`;
+      console.warn(`   ⚠️  ${LOG}  ${reason}`);
+      const emptyOut = {
+        ok: false,
+        mode: 'sitemap-jsonld',
+        origin,
+        products: [],
+        stats,
+        rateLimited,
+        reason
+      };
+      if (categoryOptions) emptyOut.categoryOptions = categoryOptions;
+      return emptyOut;
+    }
+  }
+
+  // Large catalog, no categories supplied — still run normally (do NOT
+  // refuse), but surface options so the caller can suggest narrowing.
+  // Use pre-filter size via stats when filtered; otherwise pageEntries.
+  const candidateCountForPrompt = categoryKeys.length
+    ? (pageEntries.length + (stats.candidatesFilteredByCategory || 0))
+    : pageEntries.length;
+  if (
+    CATEGORY_OPTIONS_ENABLED &&
+    !categoryKeys.length &&
+    candidateCountForPrompt >= CATEGORY_PROMPT_MIN &&
+    categoryOptions &&
+    categoryOptions.length
+  ) {
+    categoryPromptSuggested = true;
   }
 
   console.log(`   · ${LOG}  ${pageEntries.length} candidate URLs (scanning up to cap=${effectiveCap})`);
@@ -1049,6 +2084,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
 
   // Fetch + parse ONE page. Pure w.r.t. scan state — returns an outcome
   // the reduce step applies; never touches stats/products/seenIds.
+  // `activeSession` (when harvested) pins Cookie + UA on every PDP.
   const scanOnePdp = async ({ loc, lastmod }) => {
     let allowed = true;
     try { allowed = await http.isAllowedByRobots(loc); } catch { allowed = true; }
@@ -1059,8 +2095,13 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
 
     let html = null;
     try {
-      const res = await http.fetchText(loc, { timeoutMs: 15000, maxBytes: 4_000_000 });
-      if (res.cfChallenged) return { cfChallenged: true };
+      const res = await http.fetchText(loc, {
+        timeoutMs: 15000,
+        maxBytes: 4_000_000,
+        session: activeSession
+      });
+      if (res.block) noteBlock(stats, res.block);
+      if (res.cfChallenged) return { cfChallenged: true, block: res.block || null };
       if (res.rateLimited)  return { rateLimited: true, loc };
       if (!res.ok || !res.text) return { skipped: true };
       html = res.text;
@@ -1075,18 +2116,27 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       const nodes = extractJsonLdProducts(html);
       if (nodes.length) {
         jsonLdFound = true;
-        for (const node of nodes) { mapped = mapJsonLdProduct(node, loc); if (mapped) break; }
+        for (const node of nodes) {
+          mapped = await mapJsonLdProduct(node, loc, null, mapOpts);
+          if (mapped) break;
+        }
         // Product node(s) present but no structured feed id → recover the
         // id from the page (canonical <meta itemprop=productID>) + re-map.
         if (!mapped) {
           const htmlId = extractProductIdFromHtml(html);
           if (htmlId) {
-            for (const node of nodes) { mapped = mapJsonLdProduct(node, loc, htmlId); if (mapped) break; }
+            for (const node of nodes) {
+              mapped = await mapJsonLdProduct(node, loc, htmlId, mapOpts);
+              if (mapped) break;
+            }
           }
           if (!mapped) idMiss = true;   // real id-resolution miss (counts as validationFailure)
         }
       }
-      if (!mapped) { mapped = mapOgProduct(html, loc); if (mapped) ogUsed = true; }
+      if (!mapped) {
+        mapped = await mapOgProduct(html, loc, mapOpts);
+        if (mapped) ogUsed = true;
+      }
     } catch (err) {
       console.warn(`   ⚠️  ${LOG}  extract failed ${loc}: ${err.message}`);
       return { jsonLdFound, skipped: true };
@@ -1128,10 +2178,15 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
 
   let aborted = false;
   let stop = false;
+  // PDP rung gets whatever TOTAL budget remains after the sitemap walk.
+  // Separate from the sitemap rung so a slow walk cannot silently steal
+  // the whole allotment without the operator seeing a budget reason.
+  const pdpBudget = budget.enterRung('pdp', budget.remainingMs());
   for (let i = 0; i < pageEntries.length && !stop; i += pdpConcurrency) {
     if (products.length >= effectiveCap) break;
     if (stats.urlsScanned >= MAX_SITEMAP_URLS) break;
     if (await abortCheck()) { aborted = true; break; }
+    if (pdpBudget.expired() || budget.expired()) { budgetExpired = true; break; }
     // Respect a site-declared crawl-delay between (serial) chunks.
     if (i > 0 && pdpGapMs > 0) await sleep(pdpGapMs);
 
@@ -1167,10 +2222,27 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
     }
   }
 
+  // Attach category fields only when the feature flag is on AND we have
+  // something to say — keeps flag-off results byte-identical (no new keys).
+  // source is similarly gated on AUTODETECT (flag-off = no new key).
+  const attachCategoryFields = (out) => {
+    if (AUTODETECT_ENABLED && out.source == null) {
+      out.source = 'sitemap-jsonld';
+    }
+    if (!CATEGORY_OPTIONS_ENABLED) return out;
+    if (categoryOptions && categoryOptions.length) {
+      out.categoryOptions = categoryOptions;
+    }
+    if (categoryPromptSuggested) {
+      out.categoryPromptSuggested = true;
+    }
+    return out;
+  };
+
   // Aborted mid-scan — return truthfully as cancelled (keeping any
   // partials) rather than misclassifying it as an unscrapeable site.
   if (aborted) {
-    return {
+    return attachCategoryFields({
       ok: products.length > 0,
       mode: 'sitemap-jsonld',
       origin,
@@ -1179,14 +2251,88 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       rateLimited,
       cancelled: true,
       reason: 'aborted during product scan'
+    });
+  }
+
+  // Budget expiry mid-scan — keep products already collected (same partial-
+  // keeping contract as abort-mid-scan) but flag budgetExpired, NOT cancelled.
+  if (budgetExpired) {
+    if (!products.length) {
+      const reason = budgetReason(
+        `scanned ${stats.urlsScanned} pages but no products extracted before the wall-clock limit`
+      );
+      console.warn(`   ⚠️  ${LOG}  ${reason}`);
+      return attachCategoryFields({
+        ok: false,
+        mode: 'sitemap-jsonld',
+        origin,
+        products: [],
+        stats,
+        rateLimited,
+        budgetExpired: true,
+        partial: true,
+        partialReason: 'budget-exceeded',
+        reason
+      });
+    }
+    if (stats.validationFailures > 0) {
+      warnings.push(`${stats.validationFailures} product pages failed validation (skipped)`);
+    }
+    if (stats.cfChallenges > 0) {
+      warnings.push(`${stats.cfChallenges} Cloudflare challenge(s) encountered`);
+    }
+    const reason = budgetReason(`kept ${products.length} product(s)`);
+    console.log(`${LOG}  resolveGenericCatalog partial (budget): n=${products.length} ${reason}`);
+    const out = {
+      ok: true,
+      mode: 'sitemap-jsonld',
+      origin,
+      products,
+      stats,
+      rateLimited,
+      budgetExpired: true,
+      partial: true,
+      partialReason: 'budget-exceeded',
+      reason
     };
+    if (warnings.length) out.warnings = warnings;
+    return attachCategoryFields(out);
   }
 
   // ── Decisive unscrapeable / partial outcomes ─────────────────────
   if (!products.length) {
+    // Last rung: cheap path scanned (or blocked) to zero products.
+    const browserFinal = await tryBrowserSessionRung({
+      brand,
+      origin,
+      stats,
+      warnings,
+      effectiveCap,
+      budget,
+      abortCheck,
+      run,
+      isShopify: shopifyEligibleForBrowser || !!stats.shopifyFallthrough,
+      pageEntries,
+      disc,
+      getRateLimited: () => rateLimited,
+      setRateLimited: (v) => { rateLimited = v; },
+      getBudgetExpired: () => budgetExpired,
+      setBudgetExpired: (v) => { budgetExpired = v; },
+      activeSessionRef: { get: () => activeSession, set: (s) => { activeSession = s; } },
+      // Re-scan PDP list with harvested session when products.json empty.
+      rescanWithSession: true,
+      attachCategoryFields,
+      mapOpts
+    });
+    if (browserFinal) return browserFinal;
+
     let reason;
     if (stats.cfChallenges > 0 && stats.jsonLdProductsFound === 0 && stats.ogFallbackUsed === 0) {
       reason = `blocked by Cloudflare challenge on ${origin}`;
+      if (stats.lastBlockVendor && stats.lastBlockVendor !== 'cloudflare') {
+        reason = `blocked by ${stats.lastBlockVendor} on ${origin}`;
+      }
+      if (stats.browserAttempted) reason += ' (browser session also failed)';
     } else if (stats.jsonLdProductsFound === 0 && stats.ogFallbackUsed === 0) {
       // No product structured data found on any scanned page.
       reason =
@@ -1206,7 +2352,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
         `via the sitemap+JSON-LD method`;
     }
     console.warn(`   ⚠️  ${LOG}  ${reason}`);
-    return {
+    return attachCategoryFields({
       ok: false,
       mode: 'sitemap-jsonld',
       origin,
@@ -1214,7 +2360,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
       stats,
       rateLimited,
       reason
-    };
+    });
   }
 
   if (stats.validationFailures > 0) {
@@ -1239,7 +2385,7 @@ async function resolveGenericCatalog(brand, { run = null, abortCheck = async () 
     rateLimited
   };
   if (warnings.length) out.warnings = warnings;
-  return out;
+  return attachCategoryFields(out);
 }
 
 module.exports = {
@@ -1255,6 +2401,13 @@ module.exports = {
   looksLikeSlug,
   extractProductIdFromHtml,
   parseMajorPrice,
+  rankLoc,
+  isProductish,
+  scoreProductish,
+  imagesFromNode,
+  deriveCategoryOptions,
+  matchesAnyCategory,
   DEFAULT_CAP,
-  MAX_SITEMAP_URLS
+  MAX_SITEMAP_URLS,
+  AUTODETECT_ENABLED
 };

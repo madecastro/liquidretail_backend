@@ -7,6 +7,14 @@
 // consolidation of shopifyPublicIngestService /
 // productCategoryInferenceService).
 //
+// Optional `session` (scrapeSession.ScrapeSession): when valid and
+// SCRAPE_SESSION_REUSE_ENABLED (default true), merges Cookie +
+// Accept-Language and pins User-Agent to the UA that cleared the
+// challenge — Cloudflare partly binds clearance to UA, so rotation
+// MUST be suppressed for sessioned requests. This file stays
+// Puppeteer-free; it only REPORTS res.block. The caller decides
+// whether to session.refresh(harvestFn).
+//
 // Node 18+ global fetch — no extra deps.
 //
 // Assumptions:
@@ -15,6 +23,13 @@
 // - env HTTP_SCRAPE_MIN_GAP_MS (default 250)
 
 'use strict';
+
+const { classifyBlock, CF_BODY_RE } = require('./blockClassifier');
+
+function sessionReuseEnabled() {
+  // Default ON. Flag-off → session never applied (byte-identical prior path).
+  return String(process.env.SCRAPE_SESSION_REUSE_ENABLED || 'true').toLowerCase() !== 'false';
+}
 
 const FROM_HEADER = 'crawler@reach-social.io';
 
@@ -284,14 +299,32 @@ async function isAllowedByRobots(url, { userAgent = '*' } = {}) {
 }
 
 // ── CF / rate-limit helpers ──────────────────────────────────────────
-
-const CF_BODY_RE =
-  /just a moment|__cf_chl|cdn-cgi\/challenge|cf-browser-verification|Attention Required/i;
+// CF_BODY_RE lives in blockClassifier (single source of truth).
+// cfChallenged back-compat: status 403/503 + body markers ONLY — header/
+// cookie CF signals are exposed on `block` but must not flip cfChallenged.
 
 function _isCfChallenged(status, bodyText) {
   if (status !== 403 && status !== 503) return false;
   if (!bodyText) return false;
   return CF_BODY_RE.test(bodyText);
+}
+
+function _setCookieList(headers) {
+  if (!headers) return undefined;
+  try {
+    if (typeof headers.getSetCookie === 'function') {
+      const list = headers.getSetCookie();
+      return Array.isArray(list) && list.length ? list : undefined;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const raw = headers.get ? headers.get('set-cookie') : headers['set-cookie'];
+    return raw == null || raw === '' ? undefined : raw;
+  } catch {
+    return undefined;
+  }
 }
 
 function _parseRetryAfter(h) {
@@ -314,12 +347,41 @@ function _headerPick(h, name) {
   return v == null || v === '' ? null : String(v);
 }
 
+// Full lowercase header map for platform fingerprinting (siteFingerprintService).
+// The projection fields below stay for existing callers; `raw` is additive.
+function _rawHeaderMap(h) {
+  const out = Object.create(null);
+  if (!h) return out;
+  try {
+    if (typeof h.forEach === 'function') {
+      h.forEach((value, key) => {
+        if (key == null) return;
+        out[String(key).toLowerCase()] = value == null ? '' : String(value);
+      });
+      return out;
+    }
+  } catch { /* fall through */ }
+  try {
+    if (typeof h === 'object') {
+      for (const k of Object.keys(h)) {
+        const v = h[k];
+        if (v == null || typeof v === 'object') continue;
+        out[String(k).toLowerCase()] = String(v);
+      }
+    }
+  } catch { /* empty */ }
+  return out;
+}
+
 function _resultHeaders(h) {
   return {
     etag: _headerPick(h, 'etag'),
     lastModified: _headerPick(h, 'last-modified'),
     retryAfter: _parseRetryAfter(h),
-    contentType: _headerPick(h, 'content-type')
+    contentType: _headerPick(h, 'content-type'),
+    // Additive: full map so generic-catalog auto-detect can read
+    // powered-by / x-shopid / x-shopify-stage without a second request.
+    raw: _rawHeaderMap(h)
   };
 }
 
@@ -386,7 +448,8 @@ async function _doFetch(url, {
   maxBytes,
   asBuffer,
   method = 'GET',
-  body = null
+  body = null,
+  session = null
 }) {
   let parsed;
   try {
@@ -397,7 +460,26 @@ async function _doFetch(url, {
   // silence unused in non-throw path
   void parsed;
 
-  const ua = headers['User-Agent'] || headers['user-agent'] || pickUA();
+  // Session pin: when reuse is on and the session is valid, Cookie +
+  // Accept-Language come from the harvest and User-Agent is the EXACT
+  // string that cleared the challenge (no pickUA rotation). Flag-off or
+  // invalid session → prior behaviour, byte-identical request shape.
+  const useSession =
+    sessionReuseEnabled() &&
+    session &&
+    typeof session.isValid === 'function' &&
+    session.isValid();
+
+  let ua;
+  let sessionHeaders = null;
+  if (useSession) {
+    ua = session.userAgent;
+    sessionHeaders =
+      typeof session.toHeaders === 'function' ? session.toHeaders() : null;
+  } else {
+    ua = headers['User-Agent'] || headers['user-agent'] || pickUA();
+  }
+
   const reqHeaders = {
     Accept: asBuffer
       ? '*/*'
@@ -405,6 +487,9 @@ async function _doFetch(url, {
     'Accept-Language': 'en-US,en;q=0.9',
     From: FROM_HEADER,
     ...headers,
+    // session headers (Cookie, Accept-Language) win over defaults/caller
+    // so a harvested clearance is not clobbered by a stale Cookie.
+    ...(sessionHeaders || {}),
     'User-Agent': ua
   };
 
@@ -446,12 +531,14 @@ async function _doFetch(url, {
         cfChallenged: false,
         rateLimited: false,
         tooLarge: false,
+        block: null,
         error: msg
       };
     }
 
     const status = res.status;
     const outHeaders = _resultHeaders(res.headers);
+    const setCookies = _setCookieList(res.headers);
 
     // 304 conditional GET
     if (status === 304) {
@@ -464,7 +551,8 @@ async function _doFetch(url, {
         notModified: true,
         cfChallenged: false,
         rateLimited: false,
-        tooLarge: false
+        tooLarge: false,
+        block: null
       };
     }
 
@@ -475,6 +563,12 @@ async function _doFetch(url, {
       if (Number.isFinite(cl) && cl > maxBytes) {
         // Consume/cancel body so the socket can close.
         try { res.body && res.body.cancel && res.body.cancel(); } catch { /* ignore */ }
+        const block = classifyBlock({
+          status,
+          headers: res.headers,
+          bodyText: '',
+          cookies: setCookies
+        });
         return {
           status,
           ok: false,
@@ -485,6 +579,7 @@ async function _doFetch(url, {
           cfChallenged: false,
           rateLimited: false,
           tooLarge: true,
+          block,
           error: `content-length ${cl} exceeds maxBytes ${maxBytes}`
         };
       }
@@ -496,6 +591,12 @@ async function _doFetch(url, {
     try {
       const capped = await _readBodyCapped(res, maxBytes, ac);
       if (capped.tooLarge) {
+        const block = classifyBlock({
+          status,
+          headers: res.headers,
+          bodyText: '',
+          cookies: setCookies
+        });
         return {
           status,
           ok: false,
@@ -506,6 +607,7 @@ async function _doFetch(url, {
           cfChallenged: false,
           rateLimited: false,
           tooLarge: true,
+          block,
           error: `body exceeds maxBytes ${maxBytes}`
         };
       }
@@ -521,11 +623,23 @@ async function _doFetch(url, {
         cfChallenged: false,
         rateLimited: false,
         tooLarge: false,
+        block: null,
         error: err && err.message ? err.message : String(err)
       };
     }
 
     const text = bodyBuf.toString('utf8');
+    // Full vendor classification (CF header/cookies, Akamai, PX, …).
+    // Pass raw res.headers so cf-mitigated / x-akamai-* / server are visible
+    // — outHeaders is the reduced etag/retryAfter projection only.
+    const block = classifyBlock({
+      status,
+      headers: res.headers,
+      bodyText: text,
+      cookies: setCookies
+    });
+    // Back-compat: cfChallenged === old _isCfChallenged (body+403/503 only).
+    // Header/cookie CF signals surface on `block` but do not flip this flag.
     const cfChallenged = _isCfChallenged(status, text);
     const rateLimited =
       status === 429 ||
@@ -543,6 +657,7 @@ async function _doFetch(url, {
         cfChallenged,
         rateLimited,
         tooLarge: false,
+        block,
         ...(ok ? {} : { error: cfChallenged ? 'cloudflare challenge' : `HTTP ${status}` })
       };
     }
@@ -556,6 +671,7 @@ async function _doFetch(url, {
       cfChallenged,
       rateLimited,
       tooLarge: false,
+      block,
       ...(ok ? {} : { error: cfChallenged ? 'cloudflare challenge' : `HTTP ${status}` })
     };
   } finally {
@@ -573,7 +689,8 @@ async function fetchText(url, {
   lastModified = null,
   maxBytes = 4_000_000,
   method = 'GET',
-  body = null
+  body = null,
+  session = null
 } = {}) {
   const maxAttempts = 3; // 1 initial + 2 retries
   let attempt = 0;
@@ -588,7 +705,8 @@ async function fetchText(url, {
       maxBytes,
       asBuffer: false,
       method,
-      body
+      body,
+      session
     });
 
     if (!last.rateLimited) return last;
@@ -617,7 +735,8 @@ async function fetchJson(url, opts = {}) {
       headers: r.headers,
       notModified: true,
       cfChallenged: false,
-      rateLimited: false
+      rateLimited: false,
+      block: r.block || null
     };
   }
   if (!r.ok) {
@@ -629,6 +748,7 @@ async function fetchJson(url, opts = {}) {
       notModified: false,
       cfChallenged: r.cfChallenged,
       rateLimited: r.rateLimited,
+      block: r.block || null,
       error: r.error
     };
   }
@@ -641,7 +761,8 @@ async function fetchJson(url, opts = {}) {
       headers: r.headers,
       notModified: false,
       cfChallenged: false,
-      rateLimited: false
+      rateLimited: false,
+      block: r.block || null
     };
   } catch (err) {
     return {
@@ -652,6 +773,7 @@ async function fetchJson(url, opts = {}) {
       notModified: false,
       cfChallenged: false,
       rateLimited: false,
+      block: r.block || null,
       error: err && err.message ? err.message : 'JSON parse failed'
     };
   }
@@ -660,7 +782,8 @@ async function fetchJson(url, opts = {}) {
 async function fetchBuffer(url, {
   timeoutMs = 20000,
   maxBytes = 20_000_000,
-  headers = {}
+  headers = {},
+  session = null
 } = {}) {
   // No auto-retry for buffers.
   const r = await _doFetch(url, {
@@ -669,7 +792,8 @@ async function fetchBuffer(url, {
     etag: null,
     lastModified: null,
     maxBytes,
-    asBuffer: true
+    asBuffer: true,
+    session
   });
 
   return {
@@ -679,6 +803,7 @@ async function fetchBuffer(url, {
     tooLarge: !!r.tooLarge,
     cfChallenged: !!r.cfChallenged,
     rateLimited: !!r.rateLimited,
+    block: r.block || null,
     ...(r.error ? { error: r.error } : {})
   };
 }
@@ -690,5 +815,6 @@ module.exports = {
   fetchJson,
   fetchBuffer,
   isAllowedByRobots,
-  respectsRobots
+  respectsRobots,
+  sessionReuseEnabled
 };

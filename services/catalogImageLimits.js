@@ -14,14 +14,17 @@
 // / Apify ingest paths can require it at top level without a circular load.
 //
 // MUST stay in numeric lockstep with
-// catalogProductDetectService.MAX_ALT_IMAGES. Env-overridable via
+// catalogProductDetectService.MAX_ALT_IMAGES (also 20).
+//
+// RAISED 12 -> 20 (owner, 2026-08-11). Measured: marinelayer.com products carry
+// up to 15 images, so 12 truncated 3 per product on the richest SKUs. Env-overridable via
 // CATALOG_MAX_ADDITIONAL_IMAGES; clamp never allows 0/negative
 // (Math.max(1, …)). Hero / imageUrl is SEPARATE — total images per
 // product = 1 + this.
 
 const MAX_ADDITIONAL_IMAGES = Math.max(
   1,
-  parseInt(process.env.CATALOG_MAX_ADDITIONAL_IMAGES, 10) || 12
+  parseInt(process.env.CATALOG_MAX_ADDITIONAL_IMAGES, 10) || 20
 );
 
 module.exports = {

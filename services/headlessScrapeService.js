@@ -4,34 +4,51 @@
 // rendered / non-standard storefronts (Cloudflare-challenged, Shopify Hydrogen,
 // custom Next.js/Remix/Nuxt) when all HTTP-only rungs fail.
 //
-// Gate: SHOPIFY_HEADLESS_RENDER=true (default OFF — memory/latency-heavy).
-// Reuses puppeteer's bundled Chrome (headless:'new'); NO executablePath.
-// Resource-blocking: aborts image/media/font to keep dyno memory down
-// (image URLs still come from DOM/hydration JSON, not loaded bytes).
+// Gates:
+//   SHOPIFY_HEADLESS_RENDER=true  — Shopify syncViaHeadless (default OFF)
+//   RENDER_GENERIC_ENABLED=true   — generic catalog browser+session rung
+//                                   (default ON; Chrome launches ONLY after
+//                                   the cheap HTTP path already failed with
+//                                   a browser-fixable block)
+//
+// Browser lifecycle lives in headlessBrowserClient.js (ONE singleton Chrome
+// + ONE mutex shared with reviewHeadlessCapture etc.). This file keeps
+// product extraction + harvestSession + renderKnownUrls.
 //
 // Hydration formats understood:
 //   window.__NEXT_DATA__, window.__remixContext, window.__NUXT__,
 //   window.__APOLLO_STATE__, Next.js flight self.__next_f.push chunks,
-//   JSON-LD Product nodes, same-origin /products.json after real render.
+//   JSON-LD Product nodes, same-origin /products.json after real render
+//   (paginated — Shopify's 250/page cap used to truncate larger catalogs).
 //
 // NODE 18+, puppeteer ^24 already installed. No new deps.
 
-const puppeteer = require('puppeteer');
 // JSON-LD read via script.textContent keeps its character references
 // encoded (a <script> is a raw-text element) — decode human-readable
 // fields so `74&quot;` lands as `74"`.
 const { cleanScrapedText } = require('../utils/htmlEntities');
+const {
+  getBrowser,
+  closeBrowser,
+  withMutex,
+  setupPage,
+  gotoWithCf,
+  detectCfChallenge,
+  DESKTOP_UA,
+  DEFAULT_ACCEPT_LANGUAGE,
+  NAV_TIMEOUT
+} = require('./headlessBrowserClient');
 
 // ── constants ──────────────────────────────────────────────────────
 const DEFAULT_CAP     = 200;
 const DEFAULT_TIMEOUT = 120000;
-const NAV_TIMEOUT     = 45000;
 const LOG             = '🕷';
 
-const DESKTOP_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-const CF_RE = /just a moment|checking your browser|attention required/i;
+// Shopify products.json page size (platform hard cap).
+const PRODUCTS_JSON_PAGE = 250;
+// Bound in-page pagination so a pathological store cannot loop forever
+// inside page.evaluate. 10k products / 250 = 40 pages; +2 slack.
+const PRODUCTS_JSON_MAX_PAGES = 42;
 
 // ── flag gate ──────────────────────────────────────────────────────
 
@@ -39,64 +56,15 @@ function enabled() {
   return String(process.env.SHOPIFY_HEADLESS_RENDER || '').toLowerCase() === 'true';
 }
 
+function renderGenericEnabled() {
+  // Default ON — Chrome still only launches when the cheap path failed
+  // with a browser-fixable block (see genericCatalogResolver).
+  return String(process.env.RENDER_GENERIC_ENABLED || 'true').toLowerCase() !== 'false';
+}
+
 function resolveTimeoutMs() {
   const n = parseInt(process.env.SHOPIFY_HEADLESS_TIMEOUT_MS, 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT;
-}
-
-// ── browser lifecycle (lazy singleton) ─────────────────────────────
-
-let _browser = null;
-let _browserLaunching = null;
-
-async function getBrowser() {
-  if (_browser && _browser.connected) return _browser;
-  if (_browserLaunching) return _browserLaunching;
-
-  _browserLaunching = (async () => {
-    console.log(`   · ${LOG}  launching headless Chrome (bundled)`);
-    const browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-    _browser = browser;
-    _browserLaunching = null;
-    browser.on('disconnected', () => {
-      if (_browser === browser) _browser = null;
-    });
-    return browser;
-  })();
-
-  try {
-    return await _browserLaunching;
-  } catch (err) {
-    _browserLaunching = null;
-    throw err;
-  }
-}
-
-async function closeBrowser() {
-  const b = _browser;
-  _browser = null;
-  _browserLaunching = null;
-  if (!b) return;
-  try {
-    await b.close();
-  } catch (err) {
-    console.warn(`   ⚠️  ${LOG}  closeBrowser: ${err.message}`);
-  }
-}
-
-// ── simple promise-chain mutex (serialize page work on small dynos) ─
-
-let _mutexTail = Promise.resolve();
-
-function withMutex(fn) {
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  const prev = _mutexTail;
-  _mutexTail = prev.then(() => gate, () => gate);
-  return prev.then(fn, fn).finally(() => { release(); });
 }
 
 // ── origin helper ──────────────────────────────────────────────────
@@ -502,62 +470,97 @@ function extractHydrationProducts(payloadObj) {
   return Array.from(byHandle.values());
 }
 
-// ── page helpers ───────────────────────────────────────────────────
+// ── session harvest (HttpOnly-safe) ────────────────────────────────
+//
+// CRITICAL: use page.cookies(origin) → CDP Network.getCookies.
+// NEVER document.cookie — Cloudflare's cf_clearance and __cf_bm are
+// HttpOnly. Measured on ubeauty.com: document.cookie returned 78 names
+// and NEITHER of the two that matter. The in-page fetch succeeds only
+// because the *browser* attaches HttpOnly cookies itself.
 
-async function setupPage(page) {
-  await page.setUserAgent(DESKTOP_UA);
-  await page.setViewport({ width: 1366, height: 900 });
-  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-  page.setDefaultNavigationTimeout(NAV_TIMEOUT);
+/**
+ * harvestSession(page, origin) → { cookieHeader, userAgent, acceptLanguage, vendor }
+ *
+ * Call immediately after gotoWithCf confirms the challenge cleared.
+ * cookieHeader is suitable for a Cookie request header on httpScrapeClient.
+ */
+async function harvestSession(page, origin) {
+  // page.cookies(...urls) filters to cookies that would be sent to those
+  // URLs — includes HttpOnly. Do NOT use page.evaluate(() => document.cookie).
+  const cookies = await page.cookies(origin);
+  const cookieHeader = (cookies || [])
+    .filter(c => c && c.name)
+    .map(c => `${c.name}=${c.value == null ? '' : c.value}`)
+    .join('; ');
 
-  await page.setRequestInterception(true);
-  page.on('request', (req) => {
-    const t = req.resourceType();
-    if (t === 'image' || t === 'media' || t === 'font') {
-      req.abort().catch(() => {});
-    } else {
-      req.continue().catch(() => {});
-    }
-  });
-}
-
-async function detectCfChallenge(page) {
+  // Prefer the UA we set on the page (pinned for CF clearance binding);
+  // fall back to the live navigator value if setUserAgent was skipped.
+  let userAgent = DESKTOP_UA;
   try {
-    const info = await page.evaluate(() => {
-      const title = document.title || '';
-      const body = document.body ? (document.body.innerText || '').slice(0, 2000) : '';
-      return { title, body };
-    });
-    const blob = `${info.title}\n${info.body}`;
-    return CF_RE.test(blob);
+    const live = await page.evaluate(() => navigator.userAgent);
+    if (live && typeof live === 'string' && live.trim()) userAgent = live.trim();
   } catch {
-    return false;
-  }
-}
-
-async function gotoWithCf(page, url, errors) {
-  try {
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: NAV_TIMEOUT });
-  } catch (err) {
-    // tolerate navigation timeout — page may still be usable
-    if (!/timeout/i.test(err.message)) {
-      errors.push(`goto ${url}: ${err.message}`);
-    }
+    // keep DESKTOP_UA
   }
 
-  if (await detectCfChallenge(page)) {
-    try {
-      await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 });
-    } catch {
-      // one wait only
-    }
-    if (await detectCfChallenge(page)) {
-      errors.push(`CF challenge still present after wait: ${url}`);
-      return false;
-    }
-  }
-  return true;
+  return {
+    cookieHeader,
+    userAgent,
+    acceptLanguage: DEFAULT_ACCEPT_LANGUAGE,
+    vendor: 'cloudflare'
+  };
 }
+
+/**
+ * In-page paginated /products.json fetch (same-origin, browser cookies).
+ * Bounded loop inside ONE page.evaluate — stops on !ok, empty batch,
+ * short batch (< 250), or cap. Caps iteration count so a pathological
+ * site cannot loop forever in the page context.
+ *
+ * Fixes the prior single-page truncation (only page 1 / 250 products).
+ */
+async function fetchProductsJsonInPage(page, cap) {
+  const limit = Math.max(1, Math.min(parseInt(cap, 10) || DEFAULT_CAP, 10000));
+  return page.evaluate(
+    async ({ pageSize, maxPages, hardCap }) => {
+      /* eslint-disable no-undef */
+      const all = [];
+      for (let p = 1; p <= maxPages && all.length < hardCap; p++) {
+        let res;
+        try {
+          res = await fetch(`/products.json?limit=${pageSize}&page=${p}`);
+        } catch {
+          break;
+        }
+        if (!res || !res.ok) break;
+        let data;
+        try {
+          data = await res.json();
+        } catch {
+          break;
+        }
+        const batch = data && Array.isArray(data.products) ? data.products : [];
+        if (!batch.length) break;
+        for (const item of batch) {
+          if (all.length >= hardCap) break;
+          all.push(item);
+        }
+        // Short batch (< pageSize) means the catalog is exhausted —
+        // this is exactly how ubeauty's 103 products was confirmed complete.
+        if (batch.length < pageSize) break;
+      }
+      return all;
+      /* eslint-enable no-undef */
+    },
+    {
+      pageSize: PRODUCTS_JSON_PAGE,
+      maxPages: PRODUCTS_JSON_MAX_PAGES,
+      hardCap: limit
+    }
+  );
+}
+
+// ── page extraction helpers ────────────────────────────────────────
 
 async function extractHydrationPayload(page) {
   return page.evaluate(() => {
@@ -683,20 +686,14 @@ async function scrapeBrand(brand, { run, abortCheck, cap, origin }) {
     note(`goto ${origin}/collections/all`);
     await gotoWithCf(page, `${origin}/collections/all`, errors);
 
+    // Paginated same-origin products.json (Shopify hard-caps 250/page —
+    // the old single fetch silently truncated larger catalogs).
     try {
-      const json = await page.evaluate(async () => {
-        try {
-          const r = await fetch('/products.json?limit=250');
-          if (!r.ok) return null;
-          return await r.json();
-        } catch {
-          return null;
-        }
-      });
-      if (json && Array.isArray(json.products) && json.products.length) {
-        mergeProducts(collected, json.products, cap);
+      const batch = await fetchProductsJsonInPage(page, cap);
+      if (Array.isArray(batch) && batch.length) {
+        mergeProducts(collected, batch, cap);
         mode = 'render';
-        note(`same-origin products.json → ${json.products.length} (kept=${collected.size})`);
+        note(`same-origin products.json (paginated) → ${batch.length} (kept=${collected.size})`);
         try { run?.tick?.(collected.size, cap, 'products.json via render'); } catch { /* */ }
       }
     } catch (err) {
@@ -918,11 +915,305 @@ async function syncViaHeadless(brand, { run = null, abortCheck = async () => fal
   });
 }
 
+/**
+ * renderKnownUrls(origin, urlList, { cap, budget, abortCheck, run, session })
+ *
+ * Visit an EXPLICIT list of product URLs in the shared browser (after
+ * clearing CF on the origin). Does NOT rediscover links via
+ * a[href*="/products/"] — sitemap discovery already found the URLs;
+ * rediscovering would waste that fetch and reimport a Shopify-only
+ * assumption.
+ *
+ * Always closes the page in finally. Holds the process-wide mutex.
+ *
+ * @returns {{
+ *   ok: boolean,
+ *   origin: string,
+ *   products: object[],
+ *   session: object|null,
+ *   errors: string[],
+ *   mode: string|null,
+ *   reason?: string
+ * }}
+ */
+async function renderKnownUrls(
+  origin,
+  urlList,
+  { cap = DEFAULT_CAP, budget = null, abortCheck = async () => false, run = null, session = null } = {}
+) {
+  const CAP = Math.max(1, parseInt(cap, 10) || DEFAULT_CAP);
+  const urls = Array.isArray(urlList)
+    ? urlList.map(u => (typeof u === 'string' ? u : u && u.loc)).filter(Boolean)
+    : [];
+  const collected = new Map();
+  const errors = [];
+  let harvested = session || null;
+  let mode = null;
+
+  const note = (msg) => {
+    console.log(`   · ${LOG}  ${msg}`);
+    try { run?.note?.(msg); } catch { /* optional */ }
+  };
+
+  if (!origin) {
+    return {
+      ok: false,
+      origin: '',
+      products: [],
+      session: null,
+      errors: ['no origin'],
+      mode: null,
+      reason: 'no origin'
+    };
+  }
+
+  return withMutex(async () => {
+    const browser = await getBrowser();
+    let page = null;
+    try {
+      page = await browser.newPage();
+      await setupPage(page);
+
+      if (await abortCheck()) {
+        return {
+          ok: false,
+          origin,
+          products: [],
+          session: harvested,
+          errors,
+          mode: null,
+          reason: 'aborted'
+        };
+      }
+      if (budget && typeof budget.expired === 'function' && budget.expired()) {
+        return {
+          ok: false,
+          origin,
+          products: [],
+          session: harvested,
+          errors,
+          mode: null,
+          reason: 'budget expired'
+        };
+      }
+
+      note(`renderKnownUrls: clear challenge @ ${origin}`);
+      const cleared = await gotoWithCf(page, origin, errors);
+      if (cleared) {
+        try {
+          harvested = await harvestSession(page, origin);
+        } catch (err) {
+          errors.push(`harvestSession: ${err.message}`);
+        }
+      } else {
+        errors.push(`challenge not cleared at ${origin}`);
+      }
+
+      for (const url of urls) {
+        if (collected.size >= CAP) break;
+        if (await abortCheck()) break;
+        if (budget && typeof budget.expired === 'function' && budget.expired()) break;
+
+        try {
+          await gotoWithCf(page, url, errors);
+
+          try {
+            const payload = await extractHydrationPayload(page);
+            const fromHydra = extractHydrationProducts(payload);
+            mergeProducts(collected, fromHydra, CAP);
+          } catch (err) {
+            errors.push(`hydration ${url}: ${err.message}`);
+          }
+
+          if (collected.size < CAP) {
+            try {
+              const ld = await extractJsonLd(page);
+              mergeProducts(collected, ld, CAP);
+            } catch (err) {
+              errors.push(`json-ld ${url}: ${err.message}`);
+            }
+          }
+
+          if (collected.size) mode = mode || 'render';
+          try { run?.tick?.(collected.size, CAP, url); } catch { /* */ }
+        } catch (err) {
+          errors.push(`render ${url}: ${err.message}`);
+        }
+      }
+    } finally {
+      if (page) {
+        try { await page.close(); } catch { /* ignore */ }
+      }
+    }
+
+    const products = Array.from(collected.values()).slice(0, CAP);
+    return {
+      ok: products.length > 0,
+      origin,
+      products,
+      session: harvested,
+      errors,
+      mode: products.length ? (mode || 'render') : null,
+      reason: products.length ? undefined : (errors[0] || 'renderKnownUrls yielded 0 products')
+    };
+  });
+}
+
+/**
+ * clearChallengeAndHarvest(origin, { abortCheck, run, tryProductsJson, cap })
+ *
+ * Open origin in the shared browser, wait out CF, harvest HttpOnly
+ * cookies + pinned UA. Optionally pull paginated /products.json while
+ * the cleared session is live (the ubeauty fix: 103 products in-page
+ * after HTTP 403 on every cheap rung).
+ *
+ * Always closes the page in finally. Holds the process-wide mutex.
+ */
+async function clearChallengeAndHarvest(
+  origin,
+  {
+    abortCheck = async () => false,
+    run = null,
+    tryProductsJson = false,
+    cap = DEFAULT_CAP
+  } = {}
+) {
+  const errors = [];
+  const note = (msg) => {
+    console.log(`   · ${LOG}  ${msg}`);
+    try { run?.note?.(msg); } catch { /* optional */ }
+  };
+
+  if (!origin) {
+    return {
+      ok: false,
+      origin: '',
+      session: null,
+      products: [],
+      errors: ['no origin'],
+      reason: 'no origin'
+    };
+  }
+
+  return withMutex(async () => {
+    const browser = await getBrowser();
+    let page = null;
+    let harvested = null;
+    const products = [];
+    try {
+      page = await browser.newPage();
+      await setupPage(page);
+
+      if (await abortCheck()) {
+        return {
+          ok: false,
+          origin,
+          session: null,
+          products: [],
+          errors,
+          reason: 'aborted'
+        };
+      }
+
+      // Prefer collections/all for Shopify (products.json is same-origin
+      // from there); fall back to bare origin for non-Shopify.
+      const startUrl = tryProductsJson
+        ? `${origin}/collections/all`
+        : origin;
+      note(`clearChallengeAndHarvest: goto ${startUrl}`);
+      const cleared = await gotoWithCf(page, startUrl, errors);
+      if (!cleared) {
+        // Retry bare origin once if collections path failed challenge.
+        if (tryProductsJson) {
+          const cleared2 = await gotoWithCf(page, origin, errors);
+          if (!cleared2) {
+            return {
+              ok: false,
+              origin,
+              session: null,
+              products: [],
+              errors,
+              reason: errors[0] || 'CF challenge not cleared'
+            };
+          }
+        } else {
+          return {
+            ok: false,
+            origin,
+            session: null,
+            products: [],
+            errors,
+            reason: errors[0] || 'CF challenge not cleared'
+          };
+        }
+      }
+
+      try {
+        harvested = await harvestSession(page, origin);
+        note(
+          `harvested session cookies=${(harvested.cookieHeader || '').split(';').filter(Boolean).length}` +
+          ` ua=${(harvested.userAgent || '').slice(0, 40)}…`
+        );
+      } catch (err) {
+        errors.push(`harvestSession: ${err.message}`);
+        return {
+          ok: false,
+          origin,
+          session: null,
+          products: [],
+          errors,
+          reason: err.message
+        };
+      }
+
+      if (tryProductsJson) {
+        try {
+          const batch = await fetchProductsJsonInPage(page, cap);
+          if (Array.isArray(batch) && batch.length) {
+            for (const p of batch) products.push(p);
+            note(`in-page products.json (paginated) → ${batch.length}`);
+          }
+        } catch (err) {
+          errors.push(`products.json in-page: ${err.message}`);
+        }
+      }
+    } finally {
+      if (page) {
+        try { await page.close(); } catch { /* ignore */ }
+      }
+    }
+
+    return {
+      ok: !!harvested,
+      origin,
+      session: harvested,
+      products,
+      errors,
+      reason: harvested ? undefined : (errors[0] || 'harvest failed')
+    };
+  });
+}
+
 module.exports = {
   syncViaHeadless,
+  // re-export singleton browser API so existing callers
+  // (reviewHeadlessCapture, etc.) keep working unchanged
   getBrowser,
   closeBrowser,
+  withMutex,
+  setupPage,
+  gotoWithCf,
+  detectCfChallenge,
+  // generalised render rung
+  harvestSession,
+  renderKnownUrls,
+  clearChallengeAndHarvest,
+  fetchProductsJsonInPage,
+  renderGenericEnabled,
   // pure helpers for unit tests
   extractHydrationProducts,
-  mapLdProduct
+  mapLdProduct,
+  DESKTOP_UA,
+  PRODUCTS_JSON_PAGE,
+  PRODUCTS_JSON_MAX_PAGES
 };
