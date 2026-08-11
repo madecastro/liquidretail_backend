@@ -203,12 +203,33 @@ function resolveDeterministicVideoMasterFormats(presetVideoFormats, fallbackForm
   const list = Array.isArray(presetVideoFormats) && presetVideoFormats.length
     ? presetVideoFormats.slice()
     : (fallbackFormat ? [fallbackFormat] : []);
-  // If any entry is a known Google master, treat as a Google run and keep
-  // only masters — never queue derive-only or Shorts as billable masters.
-  const googleMasters = list.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
-  if (googleMasters.length) return googleMasters;
-  // Meta / single: return the list as-is (typically length 1).
-  return list.filter((f) => f && f !== PMAX_VIDEO_DERIVE_ONLY);
+
+  // PARTITION BY PLATFORM — never collapse across platforms.
+  //
+  // This used to read: if ANY Google master is present, return only the
+  // Google masters. That silently DISCARDED the Meta master on every mixed
+  // run. The wizard offers "All video" per platform and they are designed to
+  // be combinable, so ticking both produced two PMax videos, zero Meta
+  // videos, and a spend line quoting three — the operator paid for what they
+  // asked for minus the Meta ad, with nothing anywhere saying so.
+  //
+  // resolveExplicitFormats (services/platformFormats.js) has ALREADY applied
+  // each platform's own clamp before this runs — Meta collapsed to its single
+  // master, Google reduced to its billable masters — so the only job left
+  // here is to strip what must never bill, per platform:
+  //   Google — only the two real masters may queue. A derive-only surface
+  //     (pmax_video_1_1) is a free crop and would be a ~$0.90 double charge;
+  //     any other Google video key (e.g. a future live google_shorts_9_16)
+  //     is not a master and must not become one by arriving in this list.
+  //   Meta   — pass through; the clamp upstream already guarantees one entry,
+  //     and re-clamping here would silently drop an operator's selection
+  //     exactly the way the Google branch used to.
+  return list.filter((f) => {
+    if (!f || f === PMAX_VIDEO_DERIVE_ONLY) return false;
+    if (GOOGLE_VIDEO_MASTER_SET.has(f)) return true;
+    // Unknown/other Google video surfaces are not billable masters.
+    return !String(f).startsWith('pmax_') && !String(f).startsWith('google_');
+  });
 }
 
 /**
@@ -274,9 +295,22 @@ function isGooglePmaxVideoFormat(platformFormat) {
  * scripts/verifyPmaxVideoExpansion.js.
  */
 function isGoogleVideoMasterRun(masterFormats) {
+  // The ONLY thing that makes the free PMax square derivable is that the
+  // master it is cropped from is actually being generated in this run.
+  //
+  // This used to additionally require that EVERY master be a Google master.
+  // That was coupled to the old cross-platform collapse above (which
+  // guaranteed a Google-only list whenever any Google master appeared) and
+  // became wrong the moment mixed runs started queueing both platforms:
+  // a Meta master riding along would have made `every` false and silently
+  // dropped the free 1:1 — a surface the product sells as included, lost for
+  // no reason other than an unrelated Meta ad being in the same run.
+  //
+  // Deriving costs NOTHING (routes/ads.js's derive path never calls
+  // atlasVideoService.generateForAd), so widening this cannot add spend; the
+  // guard that matters is the presence of the source master, which is exactly
+  // what is checked.
   return Array.isArray(masterFormats)
-    && masterFormats.length > 0
-    && masterFormats.every((f) => GOOGLE_VIDEO_MASTER_SET.has(f))
     && masterFormats.includes(PMAX_VIDEO_DERIVE_SOURCE);
 }
 
@@ -932,7 +966,26 @@ async function expandWizardJob({
         // Ad-count ON: 2 masters + 6 master-variants + 1 base 1:1 + 3
         // 1:1-variants = 12 video ads/product; still 2 billable submits.
         if (isPmaxFunnelVariantsEnabled()) {
-          for (const fmt of masterFormats) {
+          // ⚠️ GOOGLE MASTERS ONLY — never every master in the run.
+          //
+          // This block is reached whenever isGoogleVideoMasterRun() is true,
+          // and that gate now also passes on MIXED runs (a Meta master
+          // alongside the PMax ones). Iterating `masterFormats` directly
+          // would mint Meta funnel rows, and funnelStage is deliberately NOT
+          // part of a Meta identity digest (computeDeterministicVideoDigest
+          // appends the stage only for Google PMax video), so all three
+          // collapse onto the Meta master's own digest and are swallowed by
+          // the (campaignId, identityDigest) unique index.
+          //
+          // Today that makes them merely wasteful. It is a LATENT MONEY HOLE
+          // rather than a cosmetic one: resolveDeriveFromMaster() returns
+          // null for a Meta platformFormat even when funnelStage is set —
+          // Google masters are fail-closed there, Meta is not — so any such
+          // row that DID insert would take the billable veoGenerateForAd
+          // path instead of the free retitle. Funnel variants are a PMax
+          // feature; scope the loop to PMax.
+          const funnelMasters = masterFormats.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
+          for (const fmt of funnelMasters) {
             for (const stage of PMAX_FUNNEL_STAGES) {
               detParts.push(await expandDeterministicVideo({
                 campaignId, brandId, campaignKind, productIds,
@@ -1048,8 +1101,20 @@ async function expandWizardJob({
     // base: masters + (1 derive-only 1:1 when Google)
     // variants ON: + 3 per master + 3 for the 1:1 = +3*(masters+1)
     let dryDetPerProduct = dryMasterFormats.length + (dryGoogle ? 1 : 0);
+    // Funnel variants are counted against the GOOGLE masters only, mirroring
+    // the live mint's `funnelMasters` filter. On a mixed Meta+PMax run
+    // `dryMasterFormats.length` includes the Meta master, and using it here
+    // quoted three delivered ads per product that the live path (correctly)
+    // never mints — a dry run that over-promises delivery is the same class of
+    // lie as one that under-quotes spend, just pointed the other way.
+    //
+    // NB the filter and the multiply are kept adjacent to the flag check on
+    // purpose: verifyPmaxFunnelVariants M1 pins that PMAX_FUNNEL_STAGES.length
+    // appears within a short window of isPmaxFunnelVariantsEnabled(), so a
+    // comment wedged between them fails an unrelated harness.
+    const dryFunnelMasters = dryMasterFormats.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
     if (dryGoogle && isPmaxFunnelVariantsEnabled()) {
-      dryDetPerProduct += PMAX_FUNNEL_STAGES.length * (dryMasterFormats.length + 1);
+      dryDetPerProduct += PMAX_FUNNEL_STAGES.length * (dryFunnelMasters.length + 1);
     }
     // BILLABLE vs DELIVERED — they are not the same number, and only one of
     // them costs money.
