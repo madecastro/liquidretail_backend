@@ -27,14 +27,143 @@ const { trackLlmCall } = require('../costTracker');
  * next to. Carrying 'brand' vs 'product' lets a consumer prefer the tighter
  * one instead of treating the pool as interchangeable.
  */
+// Was a hardcoded slice(0, 6). Raised because the retrieval directive below now
+// asks for a WIDER pool on purpose: with only 6 stored and (measured on Vuori)
+// 2 of them negative and 3 about a different product category, the ad path had
+// effectively one usable quote and printed it on every creative. A bigger pool is
+// the input the funnel-stage selection needs to have anything to choose between.
+// VALIDATED, and bounded at BOTH ends. `Number(env) > 0` alone accepts values that
+// break the slice in silent ways an adversarial pass enumerated: `Infinity` stores
+// an unbounded pool, `0.1` makes slice(0, 0.1) return [] forever (an empty quote
+// pool with no error anywhere), and `12.7` gives a nonsense slice end. Must be a
+// positive integer inside a sane band.
+const LLM_QUOTE_CAP = (() => {
+  const raw = process.env.LLM_QUOTE_CAP;
+  const n = Number(raw);
+  if (raw != null && raw !== '' && Number.isInteger(n) && n >= 1 && n <= 40) return n;
+  if (raw != null && raw !== '') {
+    console.warn(`   ⚠️  LLM_QUOTE_CAP="${raw}" is not an integer in 1..40 — using 12`);
+  }
+  return 12;
+})();
+
+/**
+ * Drop any quote the narrative does not literally contain.
+ *
+ * THIS IS THE ONLY ANTI-FABRICATION GUARANTEE THAT IS CODE AND NOT PROMPT TEXT, and
+ * it is what makes the positivity directive safe to ask for. Pass 2 is a separate
+ * generation that receives the pass-1 narrative and reshapes it to JSON; nothing
+ * stopped it from smoothing a fragment into a quotable sentence, or emitting a
+ * plausible line that appeared nowhere. Both adversarial passes independently
+ * identified that hole and noted it was already closed on the CATEGORY path
+ * (categoryReviewsService) and open on brand + product — so this is that same
+ * check, lifted to one shared implementation and applied to all three.
+ *
+ * Whitespace-insensitive and case-insensitive because pass 2 legitimately
+ * re-wraps lines; anything beyond that is a rewrite and gets dropped. The 15-char
+ * floor rejects clause-fragments chopped out of a summary.
+ *
+ * @param {any[]} quotes  pass-2 output
+ * @param {string} narrative  the pass-1 grounded text they must come from
+ * @param {string} label  for the log line
+ * @returns {any[]}
+ */
+function keepVerbatimQuotes(quotes, narrative, label) {
+  if (!Array.isArray(quotes)) return [];
+  const narrNorm = String(narrative || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!narrNorm) return [];
+  const kept = quotes.filter((q) => {
+    const qNorm = String(q?.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    return qNorm.length >= 15 && narrNorm.includes(qNorm);
+  });
+  const dropped = quotes.length - kept.length;
+  if (dropped > 0) {
+    console.warn(`   ⚠️  ${label}: dropped ${dropped} quote(s) not verbatim in the grounded narrative (possible fabrication)`);
+  }
+  return kept;
+}
 function stampLlmQuotes(rows, scope) {
   if (!Array.isArray(rows)) return [];
-  return rows.slice(0, 6).filter(q => q && q.text).map(q => Object.assign({}, q, {
+  return rows.slice(0, LLM_QUOTE_CAP).filter(q => q && q.text).map(q => Object.assign({}, q, {
     origin: 'llm-web',
     verbatim: false,
     scope: scope || 'product'
   }));
 }
+
+/**
+ * ONE retrieval directive, shared by every grounded quote lookup (brand, product,
+ * category). Owner directive 2026-08-10, verbatim: *"The goal is to find positive
+ * statements that help us achieve our goals at different stages of the funnel as
+ * well as retention and conquest. Negative statements are not wanted, nor are
+ * neutral statements."* And: *"statements should be complimentary and
+ * complementary to the brand in every sense of the word."*
+ *
+ * WHY THIS EXISTS AS A CONSTANT: the three lookups previously each carried their
+ * own neutral phrasing ("what real customers say", "how reviewers feel"), which is
+ * reputation research, not ad sourcing. Three copies would drift; this is the
+ * single source of truth.
+ *
+ * THE FABRICATION RISK, AND WHY THE LAST PARAGRAPH IS LOAD-BEARING. Asking a model
+ * for only-flattering quotes creates direct pressure to embellish, stitch fragments
+ * together, or invent a plausible reviewer. Every quote retrieved here is stamped
+ * `origin:'llm-web'` and can be printed verbatim into a PAID ad, so an invented
+ * quote is a fabricated endorsement. The instruction to return FEWER — or none —
+ * is not politeness; it is the counterweight to the positivity ask, and it must
+ * survive any future edit to this block. The render-side gates (scoreQuote's
+ * NEGATIVE_SENTIMENT/HARD_LIMITER disqualifiers, hasPositiveSignal, and
+ * quoteProvenance) stay in place as defence in depth — this directive improves the
+ * pool, it does not replace those gates.
+ */
+const AD_USABLE_QUOTE_DIRECTIVE =
+  `WHICH QUOTES TO RETURN — these become ad copy, so the bar is ad-usability, not representativeness.\n` +
+  `\n` +
+  `RULE 0 — VERBATIM, OR NOTHING. This outranks every other rule below. Copy each quote exactly as ` +
+  `published, character for character. Do NOT paraphrase, tidy, punctuate, translate, merge two ` +
+  `reviews, extend a sentence, or complete a fragment to make it read better, and NEVER invent a ` +
+  `reviewer or a line. A quote you had to repair is a quote you must discard, not fix. If fewer ` +
+  `quotes survive these rules, RETURN FEWER — an empty list is the correct, expected answer when the ` +
+  `open web has nothing usable. Quantity, stage coverage, and variety are NEVER reasons to relax ` +
+  `this rule.\n` +
+  `\n` +
+  `- ONLY genuinely COMPLIMENTARY statements: clear, unqualified praise. Reject negative, mixed, ` +
+  `back-handed, and merely NEUTRAL/factual statements ("it arrived Tuesday", "it is grey") — a quote ` +
+  `that does not actively help a sale does not belong here.\n` +
+  `- Also COMPLEMENTARY to the brand: consistent with how the brand positions itself, reinforcing ` +
+  `its quality and character. Nothing that quietly undercuts it.\n` +
+  `- Each quote must already READ AS COMPLETE on its own, exactly as published — it is typeset with ` +
+  `no surrounding context. Skip anything that only makes sense after the sentence before it. This is ` +
+  `a SELECTION test, not permission to complete or clean up a fragment (see RULE 0).\n` +
+  `- EXCLUDE, even when the statement is positive:\n` +
+  `    · price, discounts, sales, coupons, promo codes, "worth the money"-style price framing\n` +
+  `    · shipping, delivery, returns, exchanges, customer service\n` +
+  `    · sizing caveats ("runs small", "size up")\n` +
+  `    · named competitors, and any conditional praise ("great, BUT…", "best suited for…")\n` +
+  `    · HEALTH / MEDICAL / BODY claims — cured, healed, cleared my skin, fixed my back pain, ` +
+  `doctor or dermatologist recommended, hypoallergenic, therapeutic\n` +
+  `    · SUPERLATIVES and market-superiority — "the best on the market", "nothing else compares", ` +
+  `"unbeatable", "#1"\n` +
+  `    · ABSOLUTE or open-ended performance — "lasts forever", "never wears out", "never pills", ` +
+  `"indestructible", "waterproof in any conditions"\n` +
+  `    · GUARANTEES and warranties — "lifetime guarantee", "they'll replace it free"\n` +
+  `    · SAFETY claims — "non-toxic", "safe for babies", "chemical-free"\n` +
+  `    · SUSTAINABILITY / ETHICS claims — "carbon neutral", "100% recycled", "ethically made"\n` +
+  `    · EARNINGS or outcome claims, and anything about or spoken by a CHILD\n` +
+  `  Every one of these becomes an advertising claim the brand has not substantiated the moment it ` +
+  `is typeset, even though a customer said it. Praise about how something looks, feels, fits, wears ` +
+  `and how much the owner enjoys it is what we want.\n` +
+  `- Label each quote with the ONE stage it best serves. Cover as many stages as the REAL quotes ` +
+  `happen to cover — this is a labelling task, never a quota. Returning three quotes that are all ` +
+  `"consideration" is correct if that is what exists; inventing a "conquest" line to fill a slot is ` +
+  `a serious error:\n` +
+  `    awareness     — sensory/emotional discovery, "people noticed", desirability\n` +
+  `    consideration — removes a specific doubt: fit, feel, how it held up in real use\n` +
+  `    conversion    — decision confidence and satisfaction: no regrets, would buy again\n` +
+  `    retention     — repeat use and loyalty: bought more, wear it constantly, reach for it daily\n` +
+  `    conquest      — switched to this from something else and is happier. Describe only what THIS ` +
+  `product does well. Reject any switch quote that disparages what it replaced, even unnamed — ` +
+  `"finally something that doesn't fall apart", "everything else pills", "the big brands are junk" ` +
+  `are comparative attacks on an unnamed rival and are NOT usable.`;
 function summarySnippet(s, maxLen = 200) {
   const t = String(s || '').replace(/\s+/g, ' ').trim();
   if (!t) return null;
@@ -149,7 +278,7 @@ async function match({ brand, category, caption, primarySubject, textDetected = 
     {
       contents: [{ role: 'user', parts }],
       tools: [{ google_search: {} }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 1200 }
+      generationConfig: { temperature: 0.2, maxOutputTokens: 2400 }
     },
     { timeout: 30000 }
   );
@@ -289,11 +418,18 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
   const searchPrompt =
     `Use Google Search to find what real customers say about the BRAND ${brandName}` +
     (brandUrl ? ` (${brandUrl})` : '') +
-    `. Surface 4-6 SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) from review ` +
-    `aggregators (Trustpilot, Sitejabber, BBB), Reddit threads, and brand-site testimonials. ` +
-    `For each quote, name the source platform and the author/handle if visible. Also note the ` +
-    `overall average star rating (0-5) and approximate total review count if you can see them, ` +
-    `plus a one-sentence summary of the brand's reputation. Write naturally — do not format as JSON.`;
+    `. Surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) ` +
+    `from review aggregators (Trustpilot, Sitejabber, BBB), Reddit threads, and brand-site ` +
+    `testimonials. Prefer MORE quotes from a strong source over one-per-source variety — several ` +
+    `excellent Reddit or Trustpilot quotes beat a token spread.\n\n` +
+    `${AD_USABLE_QUOTE_DIRECTIVE}\n\n` +
+    `For each quote, give the source platform and the author/handle if visible, and the funnel stage ` +
+    `it serves.\n\n` +
+    `SEPARATELY — and this part must stay HONEST, not flattering: report the overall average star ` +
+    `rating (0-5) and approximate total review count if visible, plus a one-sentence summary of the ` +
+    `brand's real reputation INCLUDING any recurring complaints. The rating and summary are internal ` +
+    `signal used to decide whether we can make a claim at all; they are never TYPESET as a customer quote — though the Director does read the summary to ` +
+    `calibrate voice, so keep it factual rather than flattering. Write naturally — do not format as JSON.`;
 
   let searchData;
   try {
@@ -302,7 +438,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
+        generationConfig: { temperature: 0.2, maxOutputTokens: 3000 }
       }
     );
   } catch (err) {
@@ -333,12 +469,12 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
-    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null" }, 3-6 entries ],\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
     `  "rating":      <number 0-5 or null>,\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall brand sentiment"\n` +
     `}\n` +
-    `Use direct quotes verbatim from the narrative; do NOT paraphrase or invent quotes that aren't present.`;
+    `QUOTE RULES (strict): each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative contains no verbatim customer quotes (e.g. it only summarises sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments, do NOT paraphrase, do NOT invent, do NOT complete a fragment into a sentence. Quotes failing this are dropped in code, so inventing one only loses it.`;
 
   let structData;
   try {
@@ -348,7 +484,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
         contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 1200,
+          maxOutputTokens: 2400,
           responseMimeType: 'application/json',
           // gemini-2.5-flash burns hidden thinking tokens against the
           // visible budget; for a pure narrative → JSON shaping pass
@@ -369,7 +505,13 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
                   properties: {
                     text:   { type: 'string' },
                     author: { type: 'string', nullable: true },
-                    source: { type: 'string', nullable: true }
+                    source: { type: 'string', nullable: true },
+                    // Funnel stage the quote serves, per AD_USABLE_QUOTE_DIRECTIVE.
+                    // Carried through so selection can match a quote to the ad's
+                    // intent instead of always printing the same top-scored line.
+                    // Nullable: an unlabelled quote is still usable, it just
+                    // cannot win a stage-biased pick.
+                    stage: { type: 'string', nullable: true }
                   },
                   required: ['text']
                 }
@@ -406,7 +548,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     // open web, not scraped verbatim from the merchant's review app. They are
     // stamped so nothing downstream can present them as first-party customer
     // reviews — see stampLlmQuotes().
-    quotes:      stampLlmQuotes(parsed.quotes, 'brand'),
+    quotes:      stampLlmQuotes(keepVerbatimQuotes(parsed.quotes, narrative, 'brand-reviews'), 'brand'),
     rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
     reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
     summary:     parsed.summary || null,
@@ -433,12 +575,19 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
   const searchPrompt =
     `Use Google Search to find what real customers say about the PRODUCT ${productLabel}` +
     (productUrl ? ` (${productUrl})` : '') +
-    `. Surface 4-6 SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) — what reviewers ` +
-    `consistently call out about this exact product. Pull from retailer review sections, Reddit ` +
-    `discussions, YouTube review videos, and dedicated review sites. For each quote, name the ` +
-    `source platform and the author/handle if visible. Also note the average star rating (0-5) ` +
-    `and approximate review count if visible, plus a one-sentence summary of how reviewers feel ` +
-    `about this specific product. Write naturally — do not format as JSON.`;
+    `. Surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) ` +
+    `about THIS EXACT product. Pull from retailer review sections, Reddit discussions, YouTube ` +
+    `review videos, and dedicated review sites. Prefer MORE quotes from a strong source over ` +
+    `one-per-source variety.\n\n` +
+    `${AD_USABLE_QUOTE_DIRECTIVE}\n\n` +
+    `For each quote, give the source platform and the author/handle if visible, and the funnel stage ` +
+    `it serves. A quote must be about this product, not the brand in general and not a different ` +
+    `item in the range.\n\n` +
+    `SEPARATELY — and this part must stay HONEST, not flattering: report the average star rating ` +
+    `(0-5) and approximate review count if visible, plus a one-sentence summary of how reviewers ` +
+    `really feel about this product INCLUDING any recurring complaints. The rating and summary are ` +
+    `internal signal used to decide whether we can make a claim at all; they are never typeset as a ` +
+    `customer quote. Write naturally — do not format as JSON.`;
 
   let searchData;
   try {
@@ -447,7 +596,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 1500 }
+        generationConfig: { temperature: 0.2, maxOutputTokens: 3000 }
       }
     );
   } catch (err) {
@@ -476,12 +625,12 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
     `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
-    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null" }, 3-6 entries ],\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
     `  "rating":      <number 0-5 or null>,\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall product sentiment"\n` +
     `}\n` +
-    `Use direct quotes verbatim from the narrative; do NOT paraphrase or invent quotes that aren't present.`;
+    `QUOTE RULES (strict): each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative contains no verbatim customer quotes (e.g. it only summarises sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments, do NOT paraphrase, do NOT invent, do NOT complete a fragment into a sentence. Quotes failing this are dropped in code, so inventing one only loses it.`;
 
   let structData;
   try {
@@ -491,7 +640,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
         contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 1200,
+          maxOutputTokens: 2400,
           responseMimeType: 'application/json',
           // Same as brand-reviews above — disable thinking so the 1200
           // token budget goes to the actual JSON instead of hidden
@@ -513,7 +662,13 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
                   properties: {
                     text:   { type: 'string' },
                     author: { type: 'string', nullable: true },
-                    source: { type: 'string', nullable: true }
+                    source: { type: 'string', nullable: true },
+                    // Funnel stage the quote serves, per AD_USABLE_QUOTE_DIRECTIVE.
+                    // Carried through so selection can match a quote to the ad's
+                    // intent instead of always printing the same top-scored line.
+                    // Nullable: an unlabelled quote is still usable, it just
+                    // cannot win a stage-biased pick.
+                    stage: { type: 'string', nullable: true }
                   },
                   required: ['text']
                 }
@@ -550,7 +705,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
     // open web, not scraped verbatim from the merchant's review app. They are
     // stamped so nothing downstream can present them as first-party customer
     // reviews — see stampLlmQuotes().
-    quotes:      stampLlmQuotes(parsed.quotes, 'product'),
+    quotes:      stampLlmQuotes(keepVerbatimQuotes(parsed.quotes, narrative, 'product-reviews'), 'product'),
     rating:      typeof parsed.rating === 'number' ? parsed.rating : null,
     reviewCount: typeof parsed.reviewCount === 'number' ? parsed.reviewCount : null,
     summary:     parsed.summary || null,
@@ -566,5 +721,9 @@ module.exports = {
   PROVIDER_NAME,
   lookupBrandCategoryUrl,
   lookupBrandReviews,
-  lookupProductReviews
+  lookupProductReviews,
+  // Exported so categoryReviewsService uses the SAME directive rather than a
+  // fourth copy of the wording, and so the harness can assert on it directly.
+  AD_USABLE_QUOTE_DIRECTIVE,
+  LLM_QUOTE_CAP
 };

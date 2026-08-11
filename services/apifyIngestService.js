@@ -16,6 +16,10 @@ const CatalogProduct = require('../models/CatalogProduct');
 
 const { pullInstagramPosts, pullShopifyProducts } = require('./apifyPullService');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
+// Zero-dep shared cap — see services/catalogImageLimits.js. Kept here as
+// a top-level require (module has no deps) so this path never hard-codes
+// a lower truncating ceiling than detect's MAX_ALT_IMAGES.
+const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 
 const APIFY_TRIGGER = 'apify-sync';
 
@@ -326,7 +330,14 @@ async function syncBrandShopify(brand, run = null) {
             currency:        p.currency,
             availability:    p.availability,
             imageUrl:        p.imageUrl || null,
-            additionalImages: Array.isArray(p.additionalImageUrls) ? p.additionalImageUrls.slice(0, 8) : [],
+            // p.additionalImageUrls is ALREADY the alt list (hero is
+            // p.imageUrl), so slice from 0 — not the hero-offset form used
+            // on Shopify/JSON-LD combined arrays. Cap = MAX_ADDITIONAL_IMAGES
+            // (shared; see catalogImageLimits). Upstream apifyPullService
+            // returns images.slice(1) uncapped; this writer is the bound.
+            additionalImages: Array.isArray(p.additionalImageUrls)
+              ? p.additionalImageUrls.slice(0, MAX_ADDITIONAL_IMAGES)
+              : [],
             productUrl:      p.productUrl || null,
             rawData:         p,
             lastSyncedAt:    new Date()

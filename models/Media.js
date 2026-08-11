@@ -164,6 +164,15 @@ const mediaSchema = new mongoose.Schema({
     densityAvg:     Number,                                                    // 0..1, mean of overlay-zone density grid
     focusScore:     Number,                                                    // raw Laplacian variance
     focusBucket:    String,                                                    // 'Soft' | 'Acceptable' | 'Sharp'
+    // Zero-cost sharp heuristic (services/imageShotHeuristicService) —
+    // packshot vs lifestyle vs ambiguous. Independent of
+    // classification.shotType (LLM-written by subjectTextService). MUST
+    // stay declared: Mongoose strict mode silently drops $set writes to
+    // undeclared technicalInsights.* paths (same trap as the
+    // classification.* warning below).
+    shotStyle:           { type: String, enum: ['packshot', 'lifestyle', 'ambiguous'], default: undefined },
+    shotStyleConfidence: Number,                                               // 0..1
+    shotStyleMetrics:    mongoose.Schema.Types.Mixed,                          // raw numbers for threshold tuning
     updatedAt:      Date
   },
 

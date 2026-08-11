@@ -21,6 +21,10 @@ const axios = require('axios');
 const Brand    = require('../models/Brand');
 const Category = require('../models/Category');
 const { breadcrumbToKey } = require('../models/Category');
+// The ad-usable quote directive and pool cap live in ONE place
+// (providers/geminiSearchProvider) so the brand, product and category retrieval
+// prompts cannot drift apart. Imported, never restated.
+const { AD_USABLE_QUOTE_DIRECTIVE, LLM_QUOTE_CAP } = require('./providers/geminiSearchProvider');
 
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
 const ENDPOINT     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -161,7 +165,9 @@ async function fetchAndCache({ brandId, brandName, brandUrl, breadcrumb, categor
 }
 
 // Two-pass Gemini fetch (grounded search → JSON structuring).
-// Same pattern as geminiSearchProvider.lookupBrandReviews / lookupProductReviews.
+// Same pattern as geminiSearchProvider.lookupBrandReviews / lookupProductReviews —
+// including the SHARED ad-usable quote directive, imported rather than restated so
+// the three retrieval prompts cannot drift apart.
 async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
   if (!isEnabled()) return null;
   if (!brandName || !breadcrumb) return null;
@@ -172,15 +178,28 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
   const searchPrompt =
     `Use Google Search to find what real customers say about ${brandName}'s ` +
     `${breadcrumb} category${brandUrl ? ` (${brandUrl})` : ''}. ` +
-    `Surface 4-6 SPECIFIC, DIRECT customer quotes (verbatim, in quotation marks) ` +
-    `that mention the category broadly — phrases like "best fishing shirt I've ` +
-    `owned" or "their performance shirts last forever" — NOT specific SKU names. ` +
-    `Pull from review aggregators (Trustpilot, Sitejabber), Reddit threads, ` +
-    `YouTube category-overview reviews, and the brand's own collection page. ` +
-    `For each quote, name the source platform and author/handle if visible. ` +
-    `Also note an approximate average star rating (0-5) and review count if you ` +
-    `can see them, plus a one-sentence summary of how reviewers feel about this ` +
-    `category specifically. Write naturally — do not format as JSON.`;
+    `Surface up to ${LLM_QUOTE_CAP} SPECIFIC, DIRECT customer quotes (verbatim, in ` +
+    // NO EXAMPLE PHRASINGS HERE, DELIBERATELY. This prompt used to illustrate a
+    // "good" category quote with "best fishing shirt I've owned" and "their
+    // performance shirts last forever" — a superlative and an absolute-durability
+    // claim, i.e. exactly two of the classes AD_USABLE_QUOTE_DIRECTIVE (injected a
+    // few lines below) tells the model to REJECT. A few-shot example outranks a rule
+    // list in practice, so the prompt was teaching the model to break its own rules.
+    // Keep this rationale in the comment: putting it in the prompt string re-seeds
+    // the very phrases it removes.
+    `quotation marks) that describe the category broadly rather than naming a ` +
+    `specific SKU — describe how the category feels to wear or how it performed in ` +
+    `real use. Pull from review aggregators (Trustpilot, Sitejabber), ` +
+    `Reddit threads, YouTube category-overview reviews, and the brand's own ` +
+    `collection page.\n\n` +
+    `${AD_USABLE_QUOTE_DIRECTIVE}\n\n` +
+    `For each quote, give the source platform, the author/handle if visible, and ` +
+    `the funnel stage it serves.\n\n` +
+    `SEPARATELY — this part must stay HONEST, not flattering: note an approximate ` +
+    `average star rating (0-5) and review count if visible, plus a one-sentence ` +
+    `summary of how reviewers really feel about this category INCLUDING any ` +
+    `recurring complaints. Rating and summary are internal signal, never ad copy. ` +
+    `Write naturally — do not format as JSON.`;
 
   let searchRes;
   try {
@@ -220,7 +239,7 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
-    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null" } ],\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" } ],\n` +
     `  "rating":      <number 0-5 or null>,\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall sentiment about this category"\n` +
@@ -272,7 +291,7 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
       // clause-fragments ("comfort", "sun protection") get filtered out.
       return qNorm.length >= 15 && narrNorm.includes(qNorm);
     })
-    .slice(0, 6)
+    .slice(0, LLM_QUOTE_CAP)
     // PROVENANCE. These clear the substring check above, so the text is a
     // verbatim slice of the narrative — but the NARRATIVE is LLM-written from
     // grounded web search, so the quote is not a customer's own words reaching

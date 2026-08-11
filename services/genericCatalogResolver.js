@@ -41,6 +41,10 @@ const reviewsEngine = require('./productReviewsScrapeService');
 // PDP's BreadcrumbList from the SAME HTML the scan already fetched —
 // avoids a second full per-product crawl by the post-sync inference pass.
 const { extractBreadcrumb } = require('./breadcrumbParser');
+// Zero-dep shared cap — see services/catalogImageLimits.js. Kept here as
+// a local binding so the JSON-LD mapper's slice stays readable; the
+// constant itself is owned (and env-resolved) in that module only.
+const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 
 // ── constants ──────────────────────────────────────────────────────
 const LOG = '🗺';
@@ -556,7 +560,10 @@ function imagesFromNode(node, pageUrl) {
   }
   return {
     imageUrl: uniq[0] || null,
-    additionalImages: uniq.slice(1, 5) // cap 4 additional
+    // index 0 is the hero (imageUrl); slice starts at 1 so the hero is
+    // never also stored as an alt. Cap = MAX_ADDITIONAL_IMAGES alts
+    // (end exclusive → 1 + N). Shared const — see top of file.
+    additionalImages: uniq.slice(1, 1 + MAX_ADDITIONAL_IMAGES)
   };
 }
 

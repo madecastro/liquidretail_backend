@@ -21,7 +21,13 @@
 
 const CatalogProduct = require('../models/CatalogProduct');
 const Category = require('../models/Category');
-const { resolveGenericCatalog, DEFAULT_CAP } = require('./genericCatalogResolver');
+const {
+  resolveGenericCatalog,
+  DEFAULT_CAP
+} = require('./genericCatalogResolver');
+// Shared per-product alt-image cap (hero is separate). Zero-dep module
+// so this path never re-exports the constant through the resolver.
+const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 const ingestHelpers = require('./shopifyPublicIngestService');
 const { concurrency: CONC } = require('./concurrency');
 
@@ -209,7 +215,12 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted } = {}) {
         currency:         p.currency || null,
         availability:     p.availability || null,
         imageUrl:         p.imageUrl || null,
-        additionalImages: Array.isArray(p.additionalImages) ? p.additionalImages.slice(0, 4) : [],
+        // p.additionalImages is ALREADY the alt list (hero is p.imageUrl),
+        // so slice from 0 — not the hero-offset form used in the resolver.
+        // Cap = MAX_ADDITIONAL_IMAGES (shared; see catalogImageLimits).
+        additionalImages: Array.isArray(p.additionalImages)
+          ? p.additionalImages.slice(0, MAX_ADDITIONAL_IMAGES)
+          : [],
         productUrl:       p.productUrl || null,
         gtin:             p.gtin || null,
         mpn:              p.mpn || null,

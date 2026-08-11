@@ -19,6 +19,11 @@ const { concurrency: CONC } = require('./concurrency');
 const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
+// Shared per-product alt-image cap (hero is separate). Zero-dep module —
+// Meta catalog sync has nothing to do with web scraping and must not
+// pull the scraper stack just to read an integer. See catalogImageLimits.
+const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
+
 // Hard cap so a runaway catalog doesn't spin forever inside an HTTP
 // request. Brands with > 500 SKUs need V2 background sync; typical
 // IG Commerce catalogs are well under this. Env-overridable
@@ -213,8 +218,13 @@ async function syncCatalogForCred(cred, run = null) {
         currency:        parseCurrency(item.price, item.currency),
         availability:    item.availability || null,
         imageUrl:        item.image_url || null,
+        // Meta's additional_image_urls is ALREADY the alt list (hero is
+        // image_url), so slice from 0 — not the hero-offset form used on
+        // Shopify/JSON-LD combined arrays. Cap = MAX_ADDITIONAL_IMAGES
+        // (shared; see catalogImageLimits).
         additionalImages: Array.isArray(item.additional_image_urls)
-                          ? item.additional_image_urls.slice(0, 8) : [],
+                          ? item.additional_image_urls.slice(0, MAX_ADDITIONAL_IMAGES)
+                          : [],
         productUrl:      item.url || null,
         rawData:         item,
         lastSyncedAt:    new Date()
