@@ -507,6 +507,22 @@ function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = 140 } = {
   const full = quote ? String(quote.text || '').trim() : '';
   const snippet = quote ? String(quote.snippet || '').trim() : '';
   if (full && full.length <= cap) return full;
+  // OVER THE CAP. Before reaching for the curated snippet, try the longest run of
+  // WHOLE SENTENCES that fits — the snippet is ≤50 chars and optimised to be punchy,
+  // which is how a subjectless fragment ("feel like second skin") ends up typeset as
+  // the testimonial. That is the defect the owner reported, and retrieval-side
+  // completeness cannot fix it because the cut happens here.
+  //
+  // Only preferred when it says at least as much as the snippet would: a complete
+  // sentence that carries the snippet's whole length is strictly better ad copy,
+  // while a 12-character first sentence is not worth losing a 50-character curated
+  // line over. completeSentencePrefix returns a literal prefix of `full`, so this is
+  // still selection, never repair.
+  if (full) {
+    const { completeSentencePrefix } = require('../utils/htmlEntities');
+    const whole = completeSentencePrefix(full, cap);
+    if (whole && whole.length >= snippet.length) return whole;
+  }
   if (snippet) return snippet;
   if (!full) return '';
   // No snippet and over the cap: shorten rather than ship unbounded text.

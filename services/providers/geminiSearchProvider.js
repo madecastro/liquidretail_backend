@@ -11,7 +11,7 @@ const axios = require('axios');
 
 // Narrative summaries were cut with slice(0, 200), which ends mid-word. Prefer
 // whole sentences and fall back to a word-boundary cut.
-const { truncateWords } = require('../../utils/htmlEntities');
+const { truncateWords, endsOnSentenceStop, completeSentencePrefix } = require('../../utils/htmlEntities');
 const { trackLlmCall } = require('../costTracker');
 
 /**
@@ -80,8 +80,78 @@ function keepVerbatimQuotes(quotes, narrative, label) {
   if (dropped > 0) {
     console.warn(`   ⚠️  ${label}: dropped ${dropped} quote(s) not verbatim in the grounded narrative (possible fabrication)`);
   }
-  return kept;
+  return kept.map((q) => completeSentencesOnly(q, label)).filter(Boolean);
 }
+
+/**
+ * Guarantee the quote ENDS somewhere, in code.
+ *
+ * OBSERVED LIVE (Pelagic Gear, first post-deploy enrichment): the retrieval
+ * returned "Love these new T's. These new T's Pelagic has are so freaking soft.
+ * Here in San Diego, we've had screaming high temps the last few weeks and these
+ * have been keeping me cool in my" — ending mid-clause on a preposition. It passed
+ * keepVerbatimQuotes because it genuinely IS a substring of the narrative, and the
+ * directive's "must read as complete on its own" is only prose an LLM may ignore.
+ * Typeset on an ad that is the same broken-sentence defect the owner reported for
+ * "feel like second skin".
+ *
+ * SELECTION, NOT REPAIR — this is the line the rest of this module draws and it is
+ * respected here: we only ever TRIM BACK to the last sentence-ending punctuation the
+ * reviewer themself wrote. No word is added, reordered, or invented, so the result
+ * is still a verbatim span of the source. A quote with no terminal punctuation
+ * anywhere cannot be trimmed to anything honest, so it is dropped.
+ *
+ * TWO THINGS A NAIVE "trim to the last period" GETS WRONG, both found by adversarial
+ * review before this shipped, both now covered by the harness:
+ *   · an abbreviation is not a sentence end — "Absolutely love Dr. Bronners products
+ *     and the scent is" must NOT become "Absolutely love Dr." (handled by
+ *     endsOnSentenceStop / completeSentencePrefix in utils/htmlEntities);
+ *   · a trim can invert the sentiment — "I hated the old ones. These are great and
+ *     soft" must NOT become "I hated the old ones.", which is a complete, verbatim,
+ *     fabricated NEGATIVE endorsement (handled by the re-judge below).
+ *
+ * @returns {object|null} the quote with `text` trimmed to whole sentences, or null
+ */
+function completeSentencesOnly(q, label) {
+  const text = String(q?.text || '').trim();
+  if (!text) return null;
+  // Already finishes a sentence the reviewer finished — untouched, same object.
+  if (endsOnSentenceStop(text)) return q;
+  // Trim to the last stop THEY wrote. Always a literal prefix of `text`.
+  const trimmed = completeSentencePrefix(text);
+  if (!trimmed || trimmed.split(/\s+/).filter(Boolean).length < 2 || trimmed.length < 8) {
+    console.warn(`   ⚠️  ${label}: dropped a quote that never completes a sentence`);
+    return null;
+  }
+  // A TRIM CAN INVERT THE MEANING, so the kept span is re-judged, not assumed.
+  // Adversarial review found the case: "I hated the old ones. These are great and
+  // soft" trims to "I hated the old ones." — a complete sentence, verbatim, and a
+  // fabricated NEGATIVE endorsement in a paid ad. Same for a hedge opener ("Not for
+  // everyone. I love them and wear"). The full quote was never judged as this
+  // shorter string, so the shorter string has to clear the bar on its own.
+  //
+  // hasPositiveSignal is the render path's own gate (requires praise AND no
+  // negative sentiment / negated positive), reused rather than reimplemented so the
+  // two cannot drift. Required lazily and only on this branch: the untouched path
+  // above — the overwhelming majority — pays nothing, and there is no load-order
+  // coupling between a provider and the render service. If it cannot be reached,
+  // DROP: an unjudged rewrite must never reach an ad.
+  let staysPositive = false;
+  try {
+    const { hasPositiveSignal } = require('../layoutInputService');
+    staysPositive = typeof hasPositiveSignal === 'function' && hasPositiveSignal(trimmed);
+  } catch (err) {
+    console.warn(`   ⚠️  ${label}: could not re-judge a trimmed quote (${err.message}) — dropping it`);
+    return null;
+  }
+  if (!staysPositive) {
+    console.warn(`   ⚠️  ${label}: dropped a trimmed quote that no longer reads as positive`);
+    return null;
+  }
+  console.warn(`   ⚠️  ${label}: trimmed a mid-sentence quote back to its last complete sentence`);
+  return Object.assign({}, q, { text: trimmed });
+}
+
 function stampLlmQuotes(rows, scope) {
   if (!Array.isArray(rows)) return [];
   return rows.slice(0, LLM_QUOTE_CAP).filter(q => q && q.text).map(q => Object.assign({}, q, {
@@ -725,5 +795,9 @@ module.exports = {
   // Exported so categoryReviewsService uses the SAME directive rather than a
   // fourth copy of the wording, and so the harness can assert on it directly.
   AD_USABLE_QUOTE_DIRECTIVE,
-  LLM_QUOTE_CAP
+  LLM_QUOTE_CAP,
+  // Exported so the harness executes the SHIPPED anti-fabrication and
+  // sentence-completeness logic rather than a copy of it.
+  keepVerbatimQuotes,
+  completeSentencesOnly
 };

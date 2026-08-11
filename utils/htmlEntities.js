@@ -211,6 +211,78 @@ function truncateSentences(s, maxLen) {
 }
 
 /**
+ * A terminator that does NOT end a sentence: a title, an initial, or a common
+ * abbreviation. `splitSentences` disambiguates by requiring a capital/digit after
+ * the stop, which is right for "5.5 in. wide" but WRONG whenever the next word is
+ * a proper noun: "Absolutely love Dr. Bronners products" splits at "Dr.", and a
+ * caller that keeps whole sentences would then print "Absolutely love Dr." on an ad.
+ *
+ * Deliberately NOT case-insensitive. With /i this also matches ordinary words that
+ * legitimately end sentences — "The answer is no.", "I use the pro." — and every
+ * false positive here costs a usable quote. Titles are capitalized in real prose.
+ * The single-initial alternative excludes apostrophes from its left boundary on
+ * purpose: with `'` allowed, "these new T's." reads as the initial "s".
+ */
+const NOT_A_SENTENCE_END = new RegExp(
+  '(?:^|[\\s("“])' +
+  '(?:' +
+    '[A-Za-z]' +                                                   // "J. Crew", "size L."
+    '|Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St|Ave|Inc|Ltd|Co|Corp|Dept|Fig|Vol|Rev|vs|etc|approx|est|al' +
+    '|[ap]\\.m|e\\.g|i\\.e|a\\.k\\.a' +                            // "6 a.m.", "e.g."
+    '|[A-Z](?:\\.[A-Z])+' +                                        // "U.S.", "U.K."
+  ')\\.$'
+);
+
+/**
+ * endsOnSentenceStop(s) → boolean
+ * Whether the string finishes a sentence the writer actually finished. Trailing
+ * quotes/brackets are allowed to sit after the stop ("These are amazing.").
+ */
+function endsOnSentenceStop(s) {
+  const bare = String(s == null ? '' : s).trim().replace(/["'”’)\]]+$/, '');
+  if (!/[.!?…]$/.test(bare)) return false;
+  // Only the tail can carry an abbreviation, and slicing keeps this O(1) per
+  // candidate instead of O(n) — completeSentencePrefix calls it per sentence.
+  return !NOT_A_SENTENCE_END.test(bare.slice(-24));
+}
+
+/**
+ * completeSentencePrefix(s, maxLen) → string
+ *
+ * The longest leading run of WHOLE sentences, optionally within maxLen. Returns
+ * '' when the string does not complete a single sentence inside the budget.
+ *
+ * SELECTION, NOT REPAIR. Built on `splitSentences`, whose parts concatenate back
+ * to the input exactly, so the result is always a literal prefix of `s` — no
+ * character is added, reordered, or invented. That property is what makes this
+ * safe to use on a verbatim customer quote destined for a paid ad: the trimmed
+ * text is still something the reviewer wrote. Precisely:
+ * `String(s).trim().startsWith(completeSentencePrefix(s, n))` always holds.
+ *
+ * Known conservative gap: `splitSentences` requires whitespace after a
+ * terminator, so a missing space ("amazing.Really soft") is seen as one
+ * unfinished sentence and yields ''. Callers drop rather than guess. Widening the
+ * split regex would change stored-review truncation everywhere it is used, which
+ * is not worth a typo case.
+ */
+function completeSentencePrefix(s, maxLen = Infinity) {
+  // Trimmed up front so the contract is exact: the result is always a literal
+  // PREFIX of the trimmed input. Without this, leading whitespace makes the
+  // returned span a substring-but-not-prefix, which a fuzz check caught.
+  const str = String(s == null ? '' : s).trim();
+  if (!str) return '';
+  let acc = '';
+  let best = '';
+  for (const part of splitSentences(str)) {
+    acc += part;
+    const candidate = acc.trim();
+    if (candidate.length > maxLen) break;
+    if (endsOnSentenceStop(candidate)) best = candidate;
+  }
+  return best;
+}
+
+/**
  * truncateWords(s, maxLen) → string
  * Cut at a WORD boundary and mark it. A hard slice produced stored reviews
  * ending "…would buy again but the new one is horrible. Pl" — 10 of 50 Ulta
@@ -243,6 +315,8 @@ function hasHtmlEntity(s) {
 }
 
 module.exports = {
+  endsOnSentenceStop,
+  completeSentencePrefix,
   decodeHtmlEntities,
   cleanScrapedText,
   tidyText,

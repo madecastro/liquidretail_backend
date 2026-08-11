@@ -176,6 +176,52 @@ check('S7 exactly-at-cap prints full; one over falls back', () => {
   assert.strictEqual(pickQuoteText({ text: over, snippet: SNIPPET }), SNIPPET, 'one char over must fall back');
 });
 
+check('S9 over-cap WITH sentences prints whole sentences, not the fragment snippet', () => {
+  // The owner's actual complaint, one layer down from retrieval: a long quote used
+  // to fall straight through to the ≤50-char curated snippet, which is optimised to
+  // be punchy and is therefore often subjectless ("feel like second skin").
+  const long = 'These fit like a second skin and I never want to take them off. '
+    + 'I have now bought four pairs in different colours because they hold up wash '
+    + 'after wash and still look new after a year of constant wear.';
+  assert.ok(long.length > 140, 'fixture must be over the cap');
+  const got = pickQuoteText({ text: long, snippet: SNIPPET });
+  assert.notStrictEqual(got, SNIPPET, 'still preferring the subjectless fragment');
+  assert.strictEqual(got, 'These fit like a second skin and I never want to take them off.',
+    `expected the first whole sentence, got ${JSON.stringify(got)}`);
+  assert.ok(got.length <= 140, 'must still respect the cap');
+  assert.ok(long.startsWith(got), 'must be a literal prefix of the reviewer\'s words — selection, not repair');
+  assert.ok(/[.!?…]$/.test(got), 'must end on a sentence stop');
+});
+check('S10 a scrap of a first sentence does NOT beat a longer curated snippet', () => {
+  // Guards the other direction: "Nice." is a complete sentence and terrible copy.
+  const got = pickQuoteText({ text: `Nice. ${'x'.repeat(200)}`, snippet: 'a much better curated line' });
+  assert.strictEqual(got, 'a much better curated line',
+    'a 5-char sentence must not win over a 26-char curated snippet');
+});
+check('S11 flag-off still reproduces snippet-first on a multi-sentence over-cap quote', () => {
+  const long = 'These are wonderful and I wear them daily. '
+    + 'Bought four more pairs because they hold up wash after wash and still look brand new after a full year.';
+  assert.ok(long.length > 140);
+  assert.strictEqual(pickQuoteText({ text: long, snippet: SNIPPET }, { fullQuoteEnabled: false }), SNIPPET,
+    'the kill switch must restore the prior expression exactly');
+});
+check('S12 the sentence preference is in the SHIPPED selector, ahead of the snippet', () => {
+  // Source pin with ordering, comments stripped (CLAUDE.md §0.29998): a preference
+  // that runs AFTER the snippet fallback can never fire.
+  const selRegion = (() => {
+    const i = staticSrc.indexOf('function selectStaticQuoteText');
+    const j = staticSrc.indexOf('/** The product sentence', i);
+    assert.ok(i !== -1 && j > i, 'could not bound selectStaticQuoteText');
+    return staticSrc.slice(i, j).split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+  })();
+  const pref = selRegion.indexOf('completeSentencePrefix');
+  const snip = selRegion.indexOf('if (snippet) return snippet;');
+  assert.ok(pref !== -1, 'selectStaticQuoteText no longer prefers whole sentences');
+  assert.ok(snip !== -1 && pref < snip, 'the sentence preference must run BEFORE the snippet fallback');
+  assert.ok(/completeSentencePrefix\(full, cap\)/.test(selRegion),
+    'the sentence prefix must be bounded by the cap');
+});
+
 console.log('V. The video snippet cap is untouched');
 
 check('V1 quoteSnippetService still caps at 50 for the 3s overlay', () => {

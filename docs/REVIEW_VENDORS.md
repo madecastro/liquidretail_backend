@@ -515,3 +515,96 @@ schema, per-axis average and 0-1 normalisation all derive from `CONCEPT_AXES`.
 
 Neither change relaxes the honesty rule: an unsupported claim converts once and
 costs the client afterwards.
+
+---
+
+## 13. A grounded quote must END, and a refresh must not erase the numbers
+
+Two live defects on 2026-08-11, both on the `llm-web` path, both fixed in code
+rather than in prompt text.
+
+### 13.1 Sentence completeness
+
+The first post-deploy Pelagic Gear enrichment returned:
+
+> Love these new T's. These new T's Pelagic has are so freaking soft. Here in San
+> Diego, we've had screaming high temps the last few weeks and these have been
+> keeping me cool in my
+
+It ends mid-clause on a preposition, and it passed `keepVerbatimQuotes` because it
+genuinely **is** a substring of the grounded narrative. The retrieval directive's
+"must read as complete on its own" is prose an LLM may ignore, so the guarantee
+moved into code: `completeSentencesOnly` (`services/providers/geminiSearchProvider.js`)
+trims back to the last sentence stop **the reviewer themself wrote**, or drops the
+quote.
+
+**Selection, not repair.** It is built on `completeSentencePrefix`
+(`utils/htmlEntities.js`), whose result is always a literal prefix of the trimmed
+input — `String(s).trim().startsWith(completeSentencePrefix(s, n))` always holds —
+so the kept text is still verbatim. Nothing is added, reordered, or invented.
+
+Two non-obvious traps, both found by adversarial review before ship and both pinned
+by `scripts/verifyQuoteRetrievalDirective.js` §H:
+
+- **An abbreviation is not a sentence end.** `splitSentences` disambiguates by
+  requiring a capital after the stop, which is right for "5.5 in. wide" and wrong
+  whenever the next word is a proper noun: "Absolutely love Dr. Bronners products
+  and the scent is" would become **"Absolutely love Dr."**. `NOT_A_SENTENCE_END`
+  rejects titles, initials and common abbreviations, deliberately case-sensitively
+  (with `/i`, "The answer is no." reads as the abbreviation `No.`).
+- **A trim can invert the sentiment.** "I hated the old ones. These are great and
+  soft" trims to a complete, verbatim, fabricated **negative** endorsement. The kept
+  span is therefore re-judged with `layoutInputService.hasPositiveSignal` — the
+  render path's own gate, reused so the two cannot drift — and dropped if it no
+  longer reads as positive. The full quote was never judged as this shorter string.
+
+Applies to all three lookups: brand, product, and (since this change) category,
+which previously carried its own substring-only copy.
+
+**Retrieval completeness is not sufficient on its own**, because the last cut
+happens at render. `selectStaticQuoteText` (`services/directImageRenderService.js`)
+used to fall straight through to the ≤50-char curated snippet whenever a quote
+exceeded `STATIC_QUOTE_MAX_CHARS`, and that snippet is optimised to be punchy — which
+is how the subjectless "feel like second skin" got typeset as a testimonial. It now
+prefers the longest run of **whole sentences** that fits the cap, and only falls back
+to the snippet when that run would say less than the snippet does. The video overlay
+still uses the 50-char `extractSnippet` by design (owner decision 2026-08-10).
+
+Known conservative gap: a missing space after a period ("amazing.Really soft") is
+seen as one unfinished sentence and the quote is dropped rather than guessed at.
+Widening `splitSentences` would change stored-review truncation everywhere it is
+used, which is not worth a typo case.
+
+### 13.2 `brandReviews` merge rule
+
+`Brand.brandReviews` is written from two places, and both replaced it wholesale:
+`brandEnrichmentService.runEnrichment` and `productMatchService`'s
+cache write. Grounded search returns `rating` / `reviewCount` **independently** of
+`quotes`, so a refresh that found good quotes but no aggregates destroyed a stored
+rating — measured on Pelagic Gear, which held 3.2★ / 22 reviews and came back with
+neither. A null rating makes `INTENTS.social_proof_led` ineligible outright (its
+`core` **is** the rating), so one unlucky refresh can remove a brand's ability to
+render social-proof ads.
+
+`preserveBrandReviewNumbers` (exported from `brandEnrichmentService`, called from
+both sites) carries the numbers forward. The rule:
+
+| | behaviour |
+|---|---|
+| `quotes` | **always replaced wholesale** — a refresh should adopt the newly-filtered pool |
+| `rating` + `reviewCount` | carried **together, as one atom**, and only when the fetch supplies neither |
+| `summary` | carried on its own — prose about the reviews, never typeset as a quote |
+| a fresh number | always wins, **including when it is lower** — this preserves data, it does not flatter it |
+| `NaN` | not data (`typeof NaN === 'number'`), treated as absent |
+
+**The pair is one atom** because a per-field carry manufactures a cross-snapshot
+pair: prior `{4.3, 22}` + fresh `{null, 6000}` would store a rating measured on 22
+reviews next to a count of 6000, and `brandStarFloorForCount` lowers the star floor
+from 4.39 to 4.19 once the count clears 5000 — so a stale rating can print stars the
+real snapshot never earned. `resolveAtomicRatingPair` exists to prevent exactly that,
+and a merge must not defeat it.
+
+`numbersFetchedAt` records when the stored aggregates were actually measured, which
+`fetchedAt` cannot (it stamps the quote fetch). **Open follow-up:** the 30-day TTL in
+`productMatchService` keys off `fetchedAt`, so carried numbers can ride along
+un-refetched. Bounding that needs an owner call on how stale an aggregate may get.
