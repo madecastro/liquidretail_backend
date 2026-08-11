@@ -355,16 +355,28 @@ function logoPlace(surface, dims, logoW, logoH) {
     // generated 1024), which is the only place a gen-frame basis is observable
     // at all — so this loop must run over every declared key, not just the
     // live image ones. Per-surface % comes from the same map the code uses.
-    const marginPct = Object.prototype.hasOwnProperty.call(surfaceMarginMap, key)
-      ? surfaceMarginMap[key]
-      : defaultMarginPct;
-    const margin = (marginPct / 100) * Math.min(keptW, keptH);
+    const hasOverride = Object.prototype.hasOwnProperty.call(surfaceMarginMap, key);
+    const marginPct = hasOverride ? surfaceMarginMap[key] : defaultMarginPct;
+
+    // Two different rules, deliberately. Short-side (a uniform pixel border) for
+    // every surface that inherits the default; PER-AXIS for the surfaces that
+    // carry an explicit override, because Google states its safe area per
+    // dimension — central 80% of width AND of height. On 1200x628 the short-side
+    // rule yielded only 5.2% of the width, which is what put real ad copy in
+    // Google's crop band. S2e pins the resulting boxes directly.
+    const marginX = hasOverride
+      ? (marginPct / 100) * keptW
+      : (marginPct / 100) * Math.min(keptW, keptH);
+    const marginY = hasOverride
+      ? (marginPct / 100) * keptH
+      : (marginPct / 100) * Math.min(keptW, keptH);
+    const margin = Math.min(marginX, marginY); // for the degenerate-inversion report below
 
     const exact = {
-      left:   s.cropPx.left + margin,
-      right:  s.cropPx.left + keptW - margin,
-      top:    s.cropPx.top + topReserve + margin,
-      bottom: s.cropPx.top + keptH - botReserve - margin
+      left:   s.cropPx.left + marginX,
+      right:  s.cropPx.left + keptW - marginX,
+      top:    s.cropPx.top + topReserve + marginY,
+      bottom: s.cropPx.top + keptH - botReserve - marginY
     };
 
     // Skip the degenerate-fallback surfaces: when margin would invert the box
@@ -817,6 +829,32 @@ function logoPlace(surface, dims, logoW, logoH) {
 }
 
 // ── summary ─────────────────────────────────────────────────────────────
+// ── S2e. Google's central-80% rule, in the units Google writes it in ────
+//
+// The three live PMax statics must keep the safe box inside the central 80%
+// of BOTH axes. This is the check that would have caught the 1200x628 box
+// emitting x 5..95: a short-side margin looks correct in pixels and is wrong
+// in the only units the policy is stated in, so real ad copy landed in the
+// band Google crops. Verified against a delivered render — ink began at x=60px
+// against a box edge of 62.8px, i.e. the model obeyed a box that was itself wrong.
+//
+// Asserted on the EMITTED box, so it is independent of how the margin is
+// computed: any future refactor that reintroduces a uniform-pixel border on
+// these surfaces fails here whatever its internal arithmetic looks like.
+{
+  const PMAX_STATICS = ['pmax_landscape_1_91_1', 'pmax_square_1_1', 'pmax_portrait_4_5'];
+  const LO = EXPECTED_PMAX_EDGE_MARGIN_PCT;
+  const HI = 100 - EXPECTED_PMAX_EDGE_MARGIN_PCT;
+  const EPS = 0.01;
+  for (const key of PMAX_STATICS) {
+    const b = intents.computeSurface(key).box;
+    check(`S2e ${key} box.left inside central 80%`,   b.left   >= LO - EPS, `left=${b.left}% must be >= ${LO}%`);
+    check(`S2e ${key} box.right inside central 80%`,  b.right  <= HI + EPS, `right=${b.right}% must be <= ${HI}%`);
+    check(`S2e ${key} box.top inside central 80%`,    b.top    >= LO - EPS, `top=${b.top}% must be >= ${LO}%`);
+    check(`S2e ${key} box.bottom inside central 80%`, b.bottom <= HI + EPS, `bottom=${b.bottom}% must be <= ${HI}%`);
+  }
+}
+
 const liveKeys = liveImageSurfaces();
 const scope = [
   `${liveKeys.length} live image surfaces`,

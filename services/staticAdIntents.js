@@ -228,15 +228,32 @@ function computeSurface(key) {
   // deleted because they are still load-bearing for the frozen 16:9 surface, and
   // because extractFor remains the defence against a model that returns an
   // off-size frame. A future surface with an awkward aspect will crop again.
-  const marginPct = Object.prototype.hasOwnProperty.call(SURFACE_EDGE_MARGIN_PCT, key)
-    ? SURFACE_EDGE_MARGIN_PCT[key]
-    : EDGE_MARGIN_PCT;
-  const marginPx = (marginPct / 100) * Math.min(keptW, keptH);
+  const hasOverride = Object.prototype.hasOwnProperty.call(SURFACE_EDGE_MARGIN_PCT, key);
+  const marginPct = hasOverride ? SURFACE_EDGE_MARGIN_PCT[key] : EDGE_MARGIN_PCT;
 
-  let x0 = cropLeftPx + marginPx;
-  let x1 = cropLeftPx + keptW - marginPx;
-  let y0 = cropTopPx + topReservePx + marginPx;
-  let y1 = cropTopPx + keptH - botReservePx - marginPx;
+  // Short-side margin gives a visually uniform border, which is the right
+  // typographic default and is what every Meta surface has always used. It is
+  // the WRONG rule for Google, whose requirement is stated per axis: keep
+  // everything inside the central 80% of EACH dimension, because responsive
+  // placements crop the outer band of either edge independently.
+  //
+  // On a wide canvas the two rules diverge badly. At 1200x628, a 10% short-side
+  // margin is 62.8px — 10% of the height but only 5.2% of the width, so the box
+  // came out x 5..95 and the model (correctly obeying it) typeset the quote and
+  // CTA into the band Google is most likely to crop. Measured on a real render:
+  // ink began at x=60px against a box edge of 62.8px. The model was right; the
+  // box was wrong. 4:5 had the mirror-image problem on its vertical axis (y 8..92).
+  //
+  // So: per-axis for the surfaces that carry an explicit override (the PMax
+  // statics), short-side for everyone else. Meta keeps byte-identical geometry —
+  // no Meta surface has an override, so it cannot reach this branch.
+  const marginX = hasOverride ? (marginPct / 100) * keptW : (marginPct / 100) * Math.min(keptW, keptH);
+  const marginY = hasOverride ? (marginPct / 100) * keptH : (marginPct / 100) * Math.min(keptW, keptH);
+
+  let x0 = cropLeftPx + marginX;
+  let x1 = cropLeftPx + keptW - marginX;
+  let y0 = cropTopPx + topReservePx + marginY;
+  let y1 = cropTopPx + keptH - botReservePx - marginY;
 
   // Degenerate guard. A tiny kept region, or a platform reserve larger than the
   // kept band, can invert the box once the margin is applied. Drop the margin
