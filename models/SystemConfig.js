@@ -34,6 +34,16 @@ const systemConfigSchema = new mongoose.Schema({
   // so the video breathes through the remaining two-thirds of the frame.
   canonicalScriptLandscape: { type: String, default: null },
 
+  // Post-render vision QC master switch (adVisionQcService).
+  // Tri-state on purpose:
+  //   true  → force QC on  (wins over process.env.AD_VISION_QC_ENABLED)
+  //   false → force QC off (wins over env — explicit kill-switch)
+  //   null  → not set; fall through to env, then default false
+  // Lives here so an operator can flip it live without a Render restart
+  // (dashboard env changes restart both services). Access only via
+  // systemConfigService.getAdVisionQcEnabled / setAdVisionQcEnabled.
+  adVisionQcEnabled: { type: Boolean, default: null },
+
   updatedAt: { type: Date, default: Date.now },
   updatedBy: { type: String, default: null }  // email of the last editor
 });

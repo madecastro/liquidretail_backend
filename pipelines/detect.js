@@ -40,6 +40,10 @@ const { extractEntities } = require('../services/nerService');
 const { findProductMatches, findPerProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { computeFocus } = require('../services/imageQualityService');
+const {
+  classifyShotStyle,
+  isEnabled: isShotHeuristicEnabled
+} = require('../services/imageShotHeuristicService');
 const { scoreMedia } = require('../services/adSuitabilityService');
 const { identifyYoloDetections } = require('../services/yoloIdentifyService');
 const { identifyYoloDetectionsGemini, isEnabled: isGeminiIdentifyEnabled } = require('../services/geminiIdentifyService');
@@ -1379,13 +1383,16 @@ function resolvePrimarySubjectDesc(subjects, judge) {
 }
 
 // Phase A-0 — finalize-stage Media Library derivations. Cheap, runs at
-// detect end. Pulls focus from the source-image buffer (when available),
-// pulls brightness/density averages from the overlay-zone grids,
-// composites the ad-readiness score + bullets via adSuitabilityService,
-// and writes everything onto Media.{technicalInsights, adSuitability}.
+// detect end. Pulls focus + packshot/lifestyle heuristic from the source-
+// image buffer (when available), pulls brightness/density averages from
+// the overlay-zone grids, composites the ad-readiness score + bullets
+// via adSuitabilityService, and writes everything onto
+// Media.{technicalInsights, adSuitability}. The shot-style heuristic
+// never writes classification.shotType (LLM owns that field).
 //
-// All sub-steps are best-effort — a missing buffer or missing overlay
-// artifact only suppresses the dependent metric, never fails the run.
+// All sub-steps are best-effort — a missing buffer, missing overlay
+// artifact, or heuristic failure only suppresses the dependent metric,
+// never fails the run.
 async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, productMatches) {
   try {
     // 1. Focus — Laplacian variance on the source buffer
@@ -1393,6 +1400,15 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
     if (sourceBuffer) {
       try { focus = await computeFocus(sourceBuffer); }
       catch (err) { console.warn(`   ⚠️  focus derivation failed: ${err.message}`); }
+    }
+
+    // 1b. Packshot/lifestyle heuristic — same buffer, zero-cost sharp only.
+    //     Independent of classification.shotType (LLM). Best-effort: a null
+    //     or throw never fails the DetectRun (mirrors computeFocus).
+    let shotStyle = null;
+    if (sourceBuffer && isShotHeuristicEnabled()) {
+      try { shotStyle = await classifyShotStyle(sourceBuffer); }
+      catch (err) { console.warn(`   ⚠️  shot-style heuristic failed: ${err.message}`); }
     }
 
     // 2. Brightness + density averages — from the OverlayZoneArtifact's
@@ -1404,11 +1420,16 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
     const densityAvg    = averageGrid(overlayZones?.densityGrid);
 
     const technicalInsights = {
-      brightnessAvg: brightnessAvg ?? null,
-      densityAvg:    densityAvg    ?? null,
-      focusScore:    focus?.focusScore ?? null,
-      focusBucket:   focus?.focusBucket || null,
-      updatedAt:     new Date()
+      brightnessAvg:        brightnessAvg ?? null,
+      densityAvg:           densityAvg    ?? null,
+      focusScore:           focus?.focusScore ?? null,
+      focusBucket:          focus?.focusBucket || null,
+      // Dot-notation-ready fields under technicalInsights — declared on
+      // Media schema. Do NOT write classification.shotType here.
+      shotStyle:            shotStyle?.style ?? null,
+      shotStyleConfidence:  shotStyle?.confidence ?? null,
+      shotStyleMetrics:     shotStyle?.metrics ?? null,
+      updatedAt:            new Date()
     };
     media.technicalInsights = technicalInsights;
 
