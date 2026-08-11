@@ -506,35 +506,100 @@ function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = 140 } = {
   }
   const full = quote ? String(quote.text || '').trim() : '';
   const snippet = quote ? String(quote.snippet || '').trim() : '';
-  if (full && full.length <= cap) return full;
-  // OVER THE CAP. Before reaching for the curated snippet, try the longest run of
-  // WHOLE SENTENCES that fits — the snippet is ≤50 chars and optimised to be punchy,
-  // which is how a subjectless fragment ("feel like second skin") ends up typeset as
-  // the testimonial. That is the defect the owner reported, and retrieval-side
-  // completeness cannot fix it because the cut happens here.
+  if (!full && !snippet) return '';
+
+  const { completeSentencePrefix } = require('../utils/htmlEntities');
+  // The longest run of WHOLE SENTENCES that fits. A literal prefix of `full`, so this
+  // is selection, never repair.
+  const whole = full ? completeSentencePrefix(full, cap) : '';
+
+  // THE STRING WE TYPESET IS NOT THE STRING THAT WAS JUDGED.
   //
-  // Only preferred when it says at least as much as the snippet would: a complete
-  // sentence that carries the snippet's whole length is strictly better ad copy,
-  // while a 12-character first sentence is not worth losing a 50-character curated
-  // line over. completeSentencePrefix returns a literal prefix of `full`, so this is
-  // still selection, never repair.
-  if (full) {
-    const { completeSentencePrefix } = require('../utils/htmlEntities');
-    const whole = completeSentencePrefix(full, cap);
-    if (whole && whole.length >= snippet.length) return whole;
+  // Owner directive 2026-08-11: *"at no time should mediocre or negative sentiment
+  // pass any gate from initial screening to selection for use in an ad."* An audit of
+  // every hop found this one: `pickStrongestQuote` judges the FULL quote text at
+  // artifact build, and then the overflow path here typesets a ≤50-char curated
+  // snippet that was never judged on its own. Measured: "feel like second skin",
+  // "true to size", "awesome fit" all FAIL the render path's own bar while their
+  // parent quote passes it. That is how a subjectless fragment became the testimonial.
+  //
+  // So every candidate form is judged before it can be returned, in preference order,
+  // and if none of them clears the bar we print NO quote and let intent fallback do
+  // its job. A missing testimonial costs one ad format; a mediocre one costs the client.
+  const judge = loadAdCopyJudge();
+  const usable = (text) => {
+    if (!text) return false;
+    if (text.length > cap) return false;
+    // THE UNABRIDGED TEXT IS TRUSTED; EVERY STRING WE MANUFACTURE IS NOT.
+    //
+    // `full` was already judged upstream — twice now: screenAdUsableSentiment at
+    // retrieval, and pickStrongestQuote when layoutInputService chose it as the primary
+    // (layoutInputService.js `return hasPositiveSignal(best.text) ? best : null`).
+    // Re-judging it here adds no safety and costs real quotes, because
+    // hasPositiveSignal is a LEXEME allowlist: "The fabric held up through a whole
+    // season of training." is specific, credible, durability proof — and contains no
+    // flattery word, so a veto here would refuse it. The gap the audit actually found
+    // is narrower than that: strings this function INVENTS (a curated snippet, a
+    // clause-prefix, a truncation) were judged NOWHERE. Those are what get judged.
+    if (text === full) return true;
+    // NO JUDGE → allow only complete-sentence forms of that already-judged text.
+    // Fails SAFE rather than closed: refusing every quote on every ad because a require
+    // failed would be a worse outcome than trusting the two upstream gates.
+    if (!judge) return text === whole;
+    return judge(text);
+  };
+
+  const candidates = [
+    full.length <= cap ? full : '',                            // the whole thing, best case
+    (whole && whole.length >= snippet.length) ? whole : '',     // complete, and says at least as much
+    snippet,                                                    // curated but unjudged — now judged
+    whole,                                                      // complete, even if shorter than the snippet
+    shortenToCap(full, cap)                                     // last resort, still extractive
+  ];
+  for (const c of candidates) if (usable(c)) return c;
+  return '';
+}
+
+/**
+ * The bar for a SHORTENED form of an already-approved quote: it must still read as
+ * praise, and it must not argue against the purchase.
+ *
+ * DELIBERATELY NOT `pickStrongestQuote` — that is the intake/selection bar, and it
+ * folds in a length/specificity score floor whose job is to rank candidates against
+ * each other. Measured: applying it here rejected "absolutely love these, so
+ * comfortable" purely for being short, which would empty the quote slot on most ads
+ * whose full text exceeds the cap. Shortening cannot ADD merit, so the question here
+ * is only whether the shortened string INTRODUCES a problem the parent did not have —
+ * a lost subject ("feel like second skin"), a lost negation, a surviving limiter.
+ *
+ * Lazily required so this module carries no load-order coupling to layoutInputService;
+ * the require cache makes per-call resolution free.
+ */
+function loadAdCopyJudge() {
+  try {
+    const { hasPositiveSignal, hasHardLimiter } = require('./layoutInputService');
+    if (typeof hasPositiveSignal !== 'function' || typeof hasHardLimiter !== 'function') return null;
+    return (text) => hasPositiveSignal(text) && !hasHardLimiter(text);
+  } catch (err) {
+    console.warn(`   ⚠️  static quote: ad-copy judge unavailable (${err.message}) — restricting to whole-sentence forms`);
+    return null;
   }
-  if (snippet) return snippet;
+}
+
+/**
+ * Bounded, extractive shortening — unchanged behaviour, lifted out so the candidate
+ * list above stays readable.
+ *
+ * truncateAtWordBoundary is reused (one shortening implementation, not two that can
+ * drift), but its contract is NOT ours and the difference is load-bearing: for a single
+ * unbroken token longer than the budget it returns the token WHOLE by design —
+ * "oversized beats unreadable" — which is right for a 3s video overlay and wrong here,
+ * where the cap is the whole point. Measured: a 400-char spaceless token came back 401
+ * chars. Real prose always has spaces so this is a pathological input (a long URL, a
+ * pasted blob), but "bounded" has to actually be bounded, so clamp after truncating.
+ */
+function shortenToCap(full, cap) {
   if (!full) return '';
-  // No snippet and over the cap: shorten rather than ship unbounded text.
-  //
-  // truncateAtWordBoundary is reused (one shortening implementation, not two
-  // that can drift), but its contract is NOT ours and the difference is
-  // load-bearing: for a single unbroken token longer than the budget it returns
-  // the token WHOLE by design — "oversized beats unreadable" — which is right
-  // for a 3s video overlay and wrong here, where the cap is the whole point.
-  // Measured: a 400-char spaceless token came back 401 chars. Real prose always
-  // has spaces so this is a pathological input (a long URL, a pasted blob), but
-  // "bounded" has to actually be bounded, so clamp after truncating.
   const { truncateAtWordBoundary } = require('./quoteSnippetService');
   const shortened = truncateAtWordBoundary(full, cap) || '';
   if (shortened && shortened.length <= cap) return shortened;

@@ -76,16 +76,28 @@ check('S2 source no longer prefers snippet unconditionally', () => {
     'the unconditional snippet-first expression is still the live one');
   assert.ok(/STATIC_FULL_QUOTE/.test(staticSrc), 'flag missing');
 });
-check('S3 a quote OVER the cap still falls back to the snippet', () => {
+check('S3 an over-cap quote uses the snippet ONLY IF the snippet is ad-usable', () => {
+  // POLICY CHANGED 2026-08-11 (owner: mediocre/negative must not pass any gate). This
+  // check used to assert the snippet is taken unconditionally on overflow. That is what
+  // typeset "feel like second skin" — a subjectless fragment that FAILS the render
+  // path's own positivity bar while its parent quote passes it. Both halves are pinned
+  // below so the cap is still proven to apply.
   const long = 'x'.repeat(260);
-  assert.strictEqual(pickQuoteText({ text: long, snippet: SNIPPET }), SNIPPET,
-    'an unreadably long quote must still shorten — the cap is the point, only its value changed');
+  assert.strictEqual(pickQuoteText({ text: long, snippet: SNIPPET }), '',
+    'a fragment snippet must NOT be typeset just because the parent was long');
+  const good = 'absolutely love these, so comfortable';
+  assert.strictEqual(pickQuoteText({ text: long, snippet: good }), good,
+    'an ad-usable snippet is still the right fallback — this is a gate, not a wall');
+  assert.ok(good.length <= 140, 'and it still respects the cap');
 });
 check('S4 over-cap with NO snippet is SHORTENED, never shipped unbounded', () => {
   // This check previously asserted the OPPOSITE — that the full 260-char text
   // shipped — which pinned the hole an adversarial pass then found: the cap
   // silently did not apply on the one path with no snippet to fall back to.
-  const long = `${'word '.repeat(80)}end`;            // ~405 chars, real word breaks
+  // Fixture must read like praise a customer wrote: the typeset string is now judged,
+  // and lexically neutral filler is refused by design. The check's purpose is unchanged
+  // — prove the cap applies and the result stays extractive.
+  const long = `I absolutely love this and wear it constantly. ${'it is wonderful and soft '.repeat(20)}`;
   const got = pickQuoteText({ text: long, snippet: '' });
   assert.ok(got.length > 0, 'must still print something, not blank');
   assert.ok(got.length <= 140, `expected <=140 chars, got ${got.length}`);
@@ -96,7 +108,7 @@ check('S4b pathological unbroken token is still clamped to the cap', () => {
   // truncateAtWordBoundary deliberately returns a single over-long token WHOLE
   // ("oversized beats unreadable" — correct for a 3s video overlay, wrong here).
   // Measured 401 chars for a 400-char spaceless input before the clamp.
-  const blob = 'w'.repeat(400);
+  const blob = `I love it. ${'w'.repeat(400)}`;
   const got = pickQuoteText({ text: blob, snippet: '' });
   assert.ok(got.length <= 140, `unbroken token not clamped: ${got.length} chars`);
 });
@@ -162,31 +174,41 @@ check('S8 the OVERFLOW COMPARISON exists in the real source, not just the mirror
   })();
   assert.ok(/full\.length\s*<=\s*cap/.test(selRegion),
     'the length-vs-cap comparison is gone — an over-long quote would print in full');
-  assert.ok(/if \(snippet\) return snippet;/.test(selRegion),
-    'the snippet overflow fallback is gone');
-  assert.ok(/truncateAtWordBoundary/.test(selRegion),
+  assert.ok(/text\.length > cap/.test(selRegion),
+    'every candidate must be length-checked, not just the full text');
+  assert.ok(/snippet,/.test(selRegion),
+    'the snippet must still be a candidate — it is gated now, not removed');
+  assert.ok(/shortenToCap\(full, cap\)/.test(selRegion),
+    'the bounded last-resort shortening is gone');
+  const shortener = staticSrc.slice(staticSrc.indexOf('function shortenToCap'));
+  assert.ok(/truncateAtWordBoundary/.test(shortener),
     'overflow must reuse the shared shortener rather than ship unbounded text');
-  assert.ok(/shortened\.length\s*<=\s*cap/.test(selRegion),
+  assert.ok(/shortened\.length\s*<=\s*cap/.test(shortener),
     'the post-truncation clamp is gone — a single over-long token would exceed the cap');
 });
 check('S7 exactly-at-cap prints full; one over falls back', () => {
-  const at   = 'z'.repeat(140);
-  const over = 'z'.repeat(141);
+  // The UNABRIDGED text is trusted (already judged upstream by pickStrongestQuote), so
+  // the boundary can be probed with any real quote padded to length.
+  const base = 'I absolutely love these and they are wonderfully soft. ';
+  const at   = base + 'z'.repeat(140 - base.length);
+  const over = base + 'z'.repeat(141 - base.length);
+  assert.strictEqual(at.length, 140);
   assert.strictEqual(pickQuoteText({ text: at, snippet: SNIPPET }), at, 'boundary is inclusive');
-  assert.strictEqual(pickQuoteText({ text: over, snippet: SNIPPET }), SNIPPET, 'one char over must fall back');
+  assert.notStrictEqual(pickQuoteText({ text: over, snippet: SNIPPET }), over,
+    'one char over must not print in full');
 });
 
 check('S9 over-cap WITH sentences prints whole sentences, not the fragment snippet', () => {
   // The owner's actual complaint, one layer down from retrieval: a long quote used
   // to fall straight through to the ≤50-char curated snippet, which is optimised to
   // be punchy and is therefore often subjectless ("feel like second skin").
-  const long = 'These fit like a second skin and I never want to take them off. '
-    + 'I have now bought four pairs in different colours because they hold up wash '
-    + 'after wash and still look new after a year of constant wear.';
+  const long = 'I absolutely love these shorts and wear them constantly. '
+    + 'I have now bought four more pairs in different colours because they hold up wash '
+    + 'after wash and still look brand new after a year.';
   assert.ok(long.length > 140, 'fixture must be over the cap');
   const got = pickQuoteText({ text: long, snippet: SNIPPET });
   assert.notStrictEqual(got, SNIPPET, 'still preferring the subjectless fragment');
-  assert.strictEqual(got, 'These fit like a second skin and I never want to take them off.',
+  assert.strictEqual(got, 'I absolutely love these shorts and wear them constantly.',
     `expected the first whole sentence, got ${JSON.stringify(got)}`);
   assert.ok(got.length <= 140, 'must still respect the cap');
   assert.ok(long.startsWith(got), 'must be a literal prefix of the reviewer\'s words — selection, not repair');
@@ -194,9 +216,10 @@ check('S9 over-cap WITH sentences prints whole sentences, not the fragment snipp
 });
 check('S10 a scrap of a first sentence does NOT beat a longer curated snippet', () => {
   // Guards the other direction: "Nice." is a complete sentence and terrible copy.
-  const got = pickQuoteText({ text: `Nice. ${'x'.repeat(200)}`, snippet: 'a much better curated line' });
-  assert.strictEqual(got, 'a much better curated line',
-    'a 5-char sentence must not win over a 26-char curated snippet');
+  const snippet = 'love the comfortable fit';     // ad-usable, so it can win
+  const got = pickQuoteText({ text: `Nice. ${'x'.repeat(200)}`, snippet });
+  assert.strictEqual(got, snippet,
+    'a 5-char sentence must not win over a longer curated snippet');
 });
 check('S11 flag-off still reproduces snippet-first on a multi-sentence over-cap quote', () => {
   const long = 'These are wonderful and I wear them daily. '
@@ -214,12 +237,17 @@ check('S12 the sentence preference is in the SHIPPED selector, ahead of the snip
     assert.ok(i !== -1 && j > i, 'could not bound selectStaticQuoteText');
     return staticSrc.slice(i, j).split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
   })();
-  const pref = selRegion.indexOf('completeSentencePrefix');
-  const snip = selRegion.indexOf('if (snippet) return snippet;');
-  assert.ok(pref !== -1, 'selectStaticQuoteText no longer prefers whole sentences');
-  assert.ok(snip !== -1 && pref < snip, 'the sentence preference must run BEFORE the snippet fallback');
+  // The candidate list IS the preference order, so pin the order of its entries.
+  const wholeFirst = selRegion.indexOf('whole.length >= snippet.length');
+  const snip = selRegion.indexOf('snippet,');
+  assert.ok(wholeFirst !== -1, 'selectStaticQuoteText no longer prefers whole sentences');
+  assert.ok(snip !== -1 && wholeFirst < snip,
+    'the whole-sentence preference must be ranked ABOVE the curated snippet');
   assert.ok(/completeSentencePrefix\(full, cap\)/.test(selRegion),
     'the sentence prefix must be bounded by the cap');
+  // And the judge must actually be consulted, or the gate is decoration.
+  assert.ok(/loadAdCopyJudge\(\)/.test(selRegion) && /judge\(text\)/.test(selRegion),
+    'every manufactured candidate must be judged before it can be typeset');
 });
 
 console.log('V. The video snippet cap is untouched');

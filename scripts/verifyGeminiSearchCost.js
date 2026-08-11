@@ -238,16 +238,20 @@ await checkAsync('C7 a failed call writes a row, and ledgers $0 — a KNOWN, del
 });
 
 // ── D. End to end through the real provider functions. ──────────────────────
-const NARRATIVE = 'Customers consistently praise the fit and the fabric weight. '.repeat(4);
-// The quote text MUST be a literal substring of NARRATIVE above. This harness
-// tests COST LEDGERING, not provenance, so the two were originally unrelated —
-// 'The athletic fit is perfect.' appears nowhere in NARRATIVE. Since
-// geminiSearchProvider.keepVerbatimQuotes now drops any quote the grounded
-// narrative does not contain (the anti-fabrication guarantee), that fixture was
-// modelling a FABRICATED quote and the provider correctly returned zero. Fixed by
-// making the fixture honest rather than by relaxing the check.
+const NARRATIVE = 'These are incredibly comfortable and the quality is amazing. '.repeat(4);
+// The quote text MUST satisfy EVERY intake gate, because this harness drives the real
+// provider. Twice now a tightened gate broke this fixture, and both times the fix was
+// to make the FIXTURE honest rather than to relax the gate:
+//   1. keepVerbatimQuotes requires the quote to be a literal substring of the
+//      narrative. 'The athletic fit is perfect.' appeared nowhere in NARRATIVE, so the
+//      fixture was modelling a FABRICATED quote and the provider correctly returned 0.
+//   2. screenAdUsableSentiment requires clear praise (owner directive: mediocre and
+//      negative never pass any gate). 'Customers consistently praise the fit and the
+//      fabric weight.' is a NARRATOR sentence about reviews, not customer praise, so
+//      it was correctly dropped. The fixture now reads like something a customer wrote.
+// If this fixture breaks again, check which gate tightened before touching the check.
 const STRUCTURED = JSON.stringify({
-  quotes: [{ text: 'Customers consistently praise the fit and the fabric weight.', author: 'Alex R.', source: 'trustpilot.com' }],
+  quotes: [{ text: 'These are incredibly comfortable and the quality is amazing.', author: 'Alex R.', source: 'trustpilot.com' }],
   rating: 4.6, reviewCount: 1200, summary: 'Broadly positive.'
 });
 const PASS1_USAGE = { promptTokenCount: 1000, toolUsePromptTokenCount: 500, candidatesTokenCount: 800, thoughtsTokenCount: 200 };
