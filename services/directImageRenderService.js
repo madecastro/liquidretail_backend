@@ -321,13 +321,61 @@ function monochromeInkFor(meanLum) {
  *     and white-artwork-on-black both resolve correctly instead of one of them
  *     inverting into a solid block.
  */
+/**
+ * Does this asset's alpha channel actually encode the mark's coverage?
+ *
+ * True only when a meaningful share of pixels is essentially fully transparent
+ * — the signature of a real cut-out. An asset whose alpha is uniformly (or
+ * nearly uniformly) opaque carries no shape information there, and using it as
+ * coverage fills the whole logo box with ink.
+ *
+ * Threshold rationale: 2% of pixels below alpha 16. A cut-out logo is mostly
+ * empty space (the measured Vuori asset yields 58% transparent once read via
+ * luminance), so a real one clears this by an order of magnitude, while the
+ * broken case measured 0%. Deliberately generous — a false "discriminates"
+ * merely keeps today's behaviour, whereas a false negative would send a
+ * correctly-cut-out logo down the luminance path.
+ *
+ * Exported for scripts/verifyLogoSilhouette.js.
+ */
+async function alphaChannelDiscriminates(logoPng) {
+  try {
+    const alpha = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
+    if (!alpha || !alpha.length) return false;
+    let transparent = 0;
+    for (let i = 0; i < alpha.length; i++) if (alpha[i] <= 16) transparent++;
+    return (transparent / alpha.length) >= 0.02;
+  } catch {
+    // Unreadable alpha → fall back to luminance, which needs no alpha at all.
+    return false;
+  }
+}
+
 async function monochromeLogoBuffer(logoPng, ink) {
   const meta = await sharp(logoPng).metadata();
   const w = meta.width, h = meta.height;
   if (!(w > 0 && h > 0)) return null;
 
   let coverage;
-  if (meta.hasAlpha) {
+  // ⚠️ `hasAlpha` is NOT the same question as "does the alpha channel encode the
+  // mark". MEASURED on a live brand logo (Vuori, 1108x179 RGBA): the asset has
+  // an alpha channel in which **100% of pixels sit in the 204-254 band** — its
+  // "transparent" background is ~80-100% opaque. Trusting `hasAlpha` therefore
+  // took the alpha branch, produced coverage that was opaque EVERYWHERE, and
+  // painted a SOLID INK RECTANGLE over the artwork — reproduced exactly against
+  // the real asset, and visible on delivered ads as a black bar on light plates
+  // and a white bar on dark ones.
+  //
+  // So require the channel to actually DISCRIMINATE before believing it: a real
+  // cut-out logo has a substantial fully-transparent region around the mark. A
+  // solid-shape logo on a genuine transparent background still passes, because
+  // the area OUTSIDE the shape is alpha 0. When it does not discriminate the
+  // asset is effectively opaque, and luminance — the branch below, which renders
+  // this same logo's wordmark correctly — is the right reader.
+  const alphaDiscriminates = meta.hasAlpha
+    ? await alphaChannelDiscriminates(logoPng)
+    : false;
+  if (alphaDiscriminates) {
     coverage = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
   } else {
     // Sample the outer border to learn the asset's own background polarity.
@@ -1619,6 +1667,7 @@ module.exports = {
   logoPlacementFor,
   monochromeInkFor,
   monochromeLogoBuffer,
+  alphaChannelDiscriminates,
   intentForTemplate,
   buildIntentData,
   describeProductForPrompt,
