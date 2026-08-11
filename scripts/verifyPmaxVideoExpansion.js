@@ -142,9 +142,25 @@ check('B2b [KILL SWITCH] META_VIDEO_DURATION_SEC=0 restores the provider default
   })(),
   'a duration change that cannot be reverted without a deploy is not acceptable');
 
-check('B3 an explicit operator duration always wins',
-  svc.resolveVideoDurationForFormat(MASTER_9_16, 6) === 6
-    && svc.resolveVideoDurationForFormat('meta_stories_9_16', 6) === 6);
+// B3 previously asserted "an explicit operator duration ALWAYS wins". That was
+// wrong for PMax and shipped a real defect: the wizard's Video Length control
+// has no "auto" option and posts 8 on every run, so every PMax video generated
+// through the UI would have been born at 8s — under Google's 10s minimum, i.e.
+// a $0.90 render that cannot be used as an asset. 10s is a platform FLOOR.
+check('B3 [MONEY] a PMax video can never render below the 10s Google floor',
+  [4, 6, 8].every((d) =>
+    svc.resolveVideoDurationForFormat(MASTER_9_16, d) === 10
+      && svc.resolveVideoDurationForFormat(MASTER_16_9, d) === 10
+      && svc.resolveVideoDurationForFormat(DERIVE_1_1, d) === 10),
+  'the wizard posts 8 by default — under the floor this is a paid, unusable master');
+
+check('B3b above the floor the operator still wins on PMax',
+  svc.resolveVideoDurationForFormat(MASTER_16_9, 15) === 15);
+
+check('B3c Meta keeps the operator value exactly (no floor applies)',
+  svc.resolveVideoDurationForFormat('meta_stories_9_16', 6) === 6
+    && svc.resolveVideoDurationForFormat('meta_feed_1_1', 4) === 4,
+  'clamping Meta here would silently change every Meta video render');
 
 // ── C. Digest: duration is identity for Google ONLY ────────────────────
 // C1 is the pin for the regression found (and fixed) during Phase A: an
