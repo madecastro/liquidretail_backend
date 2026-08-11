@@ -110,15 +110,28 @@ const PLATFORM_FORMATS = {
       'personal. Native creative is overlay-heavy (text, stickers, polls). Drive curiosity or ' +
       'urgency rather than direct sell. Top 250 + bottom 250 reserved for the creator chip and reply input.'
   },
-  // ── Google — ALL coming_soon (owner deferred 2026-08-02) ─────────────
-  // Visible in the UI so operators see the roadmap. NEVER generatable:
-  // filtered out of every fan-out, every resolvePreset path, and refused
-  // by assertGeneratablePlatformFormat when named on a generate request.
+  // ── Google ───────────────────────────────────────────────────────────
+  // Phase A (2026-08-10): six dedicated PMax surfaces are live. Demand Gen
+  // and YouTube Shorts keys stay coming_soon (identical deliveryDims to the
+  // live PMax set — they reuse those files rather than double-spending).
+  // Visible-but-blocked stubs remain filterable via isComingSoonFormat /
+  // assertGeneratablePlatformFormat.
   //
   // pmax_16_9 is FROZEN (was live). 45 existing Ads keep this key for
-  // read paths (labels, geometry, render-activity board); they become
-  // non-regenerable. Do NOT delete the key. kinds/canvas/deliveryDims/
-  // safeArea stay byte-identical so lookups still resolve.
+  // read paths (labels, geometry, render-activity board). Do NOT delete the
+  // key. kinds/canvas/deliveryDims/safeArea stay byte-identical so lookups
+  // still resolve.
+  //
+  // ⚠️ CORRECTED 2026-08-11: "they become non-regenerable" was WRONG.
+  // `assertGeneratablePlatformFormat` only blocks a coming_soon format at
+  // GENERATE time; `adRegenerateService.preflight()` has no format gate, so
+  // Regenerate on any of those 45 legacy Ads still runs. And its geometry
+  // MOVED with the Phase A `GEN_SIZES` addition: `chooseGenSize('16:9')` now
+  // picks the exact 2048x1152 instead of 1536x1024, so a regenerated legacy
+  // ad renders zero-crop where the original lost 15.6% top and bottom. That
+  // is a better frame, not a regression — but it is a real output change on a
+  // surface this comment calls frozen, so it is recorded rather than assumed
+  // harmless. Freezing here means "not generatable", never "immutable".
   pmax_16_9: {
     platform:    'google',
     status:      'coming_soon',
@@ -141,9 +154,11 @@ const PLATFORM_FORMATS = {
   // Recommended Google Performance Max marketing-image sizes (static).
   // deliveryDims = Google's published recommended asset sizes. No logo
   // asset sizes — logos are uploaded brand assets, not generated ads.
+  // safeArea 0/0: statics use the EDGE margin mechanism in staticAdIntents,
+  // not a platform UI reserve (host chrome is preview-only for stills).
   pmax_landscape_1_91_1: {
     platform:    'google',
-    status:      'coming_soon',
+    status:      'live',
     aspectRatio: '1.91:1',
     surface:     'pmax',
     label:       'PMax Landscape',
@@ -152,11 +167,11 @@ const PLATFORM_FORMATS = {
     deliveryDims: { width: 1200, height: 628 },
     safeArea:     { top: 0, bottom: 0 },
     chromeStyleHints: ['editorial'],
-    creativeBrief: 'Google Performance Max landscape marketing image (1.91:1) — coming soon.'
+    creativeBrief: 'Google Performance Max landscape marketing image (1.91:1).'
   },
   pmax_square_1_1: {
     platform:    'google',
-    status:      'coming_soon',
+    status:      'live',
     aspectRatio: '1:1',
     surface:     'pmax',
     label:       'PMax Square',
@@ -165,11 +180,11 @@ const PLATFORM_FORMATS = {
     deliveryDims: { width: 1200, height: 1200 },
     safeArea:     { top: 0, bottom: 0 },
     chromeStyleHints: ['editorial'],
-    creativeBrief: 'Google Performance Max square marketing image — coming soon.'
+    creativeBrief: 'Google Performance Max square marketing image.'
   },
   pmax_portrait_4_5: {
     platform:    'google',
-    status:      'coming_soon',
+    status:      'live',
     aspectRatio: '4:5',
     surface:     'pmax',
     label:       'PMax Portrait',
@@ -178,53 +193,58 @@ const PLATFORM_FORMATS = {
     deliveryDims: { width: 960, height: 1200 },
     safeArea:     { top: 0, bottom: 0 },
     chromeStyleHints: ['editorial'],
-    creativeBrief: 'Google Performance Max portrait marketing image (4:5) — coming soon.'
+    creativeBrief: 'Google Performance Max portrait marketing image (4:5).'
   },
 
   // Recommended Google Performance Max video sizes (separate from static —
   // one click must never double-spend static + video the way google_pmax did).
+  // safeArea is canvas-pixel bands (canvas is width-normalized at 1000).
   pmax_video_16_9: {
     platform:    'google',
-    status:      'coming_soon',
+    status:      'live',
     aspectRatio: '16:9',
     surface:     'pmax',
     label:       'PMax Video Landscape',
     kinds:       ['video'],
     canvas:       { width: 1000, height: 563 },
     deliveryDims: { width: 1920, height: 1080 },
-    safeArea:     { top: 0, bottom: 0 },
+    // 10% top / 20% bottom of 563h — YouTube landscape player chrome
+    safeArea:     { top: 56, bottom: 113 },
     chromeStyleHints: ['editorial', 'yt_shorts'],
-    creativeBrief: 'Google Performance Max landscape video (16:9) — coming soon.'
+    creativeBrief: 'Google Performance Max landscape video (16:9).'
   },
   pmax_video_1_1: {
     platform:    'google',
-    status:      'coming_soon',
+    status:      'live',
     aspectRatio: '1:1',
     surface:     'pmax',
     label:       'PMax Video Square',
     kinds:       ['video'],
     canvas:       { width: 1000, height: 1000 },
     deliveryDims: { width: 1080, height: 1080 },
-    safeArea:     { top: 0, bottom: 0 },
+    // 10% top / 10% bottom of 1000h — square Discovery / Shorts-adjacent
+    safeArea:     { top: 100, bottom: 100 },
     chromeStyleHints: ['editorial'],
-    creativeBrief: 'Google Performance Max square video — coming soon.'
+    creativeBrief: 'Google Performance Max square video.'
   },
   pmax_video_9_16: {
     platform:    'google',
-    status:      'coming_soon',
+    status:      'live',
     aspectRatio: '9:16',
     surface:     'pmax',
     label:       'PMax Video Portrait',
     kinds:       ['video'],
     canvas:       { width: 1000, height: 1778 },
     deliveryDims: { width: 1080, height: 1920 },
-    safeArea:     { top: 0, bottom: 0 },
+    // 14% top / 35% bottom of 1778h — YouTube Shorts official ~top-10%/
+    // bottom-25% with margin; top band aligned to Meta vertical (249≈250)
+    safeArea:     { top: 249, bottom: 622 },
     chromeStyleHints: ['yt_shorts', 'editorial'],
-    creativeBrief: 'Google Performance Max vertical video (9:16) — coming soon.'
+    creativeBrief: 'Google Performance Max vertical video (9:16).'
   },
 
-  // Demand Gen / Shorts — also Google, also coming soon. Both PMax and
-  // Demand Gen are legitimate Google surfaces.
+  // Demand Gen / Shorts — also Google, still coming soon. Identical
+  // deliveryDims to the live PMax set; generation reuses those files.
   google_demandgen_1_1: {
     platform:    'google',
     status:      'coming_soon',
@@ -454,31 +474,43 @@ function videoFanoutForPlatformFormat(platformFormat) {
     : [];
 }
 
-// ── Google format sets (intent for when Google goes live) ────────────────
+// ── Google format sets ───────────────────────────────────────────────────
 // Split static vs video so one click never double-spends both (the bug
-// google_pmax had with pmax_16_9 kinds:['image','video']). Today every
-// entry is coming_soon, so filterLiveFormats returns [] and the three
-// Google presets resolve empty — no second mechanism needed.
+// google_pmax had with pmax_16_9 kinds:['image','video']).
 //
-// Static: PMax marketing images + Demand Gen images. pmax_16_9 (legacy
-// dual-kind key) is intentionally omitted from the static fan-out; the
-// dedicated pmax_landscape / square / portrait stubs replace it.
-// Video: dedicated PMax video sizes + YouTube Shorts. Logo asset sizes
-// are never listed — logos are uploaded brand assets, not generated ads.
+// Static: PMax marketing images only. pmax_16_9 (legacy dual-kind key) is
+// intentionally omitted; the dedicated landscape / square / portrait keys
+// replace it. Demand Gen reuses the identical PMax files (same deliveryDims).
+// Video: dedicated PMax video sizes. google_shorts_9_16 is omitted — identical
+// dims to pmax_video_9_16. Logo asset sizes are never listed — logos are
+// uploaded brand assets, not generated ads.
 const GOOGLE_STATIC_FANOUT = [
   'pmax_landscape_1_91_1',
   'pmax_square_1_1',
-  'pmax_portrait_4_5',
-  'google_demandgen_1_1',
-  'google_demandgen_4_5',
-  'google_demandgen_1_91_1'
+  'pmax_portrait_4_5'
+  // Demand Gen reuses the identical PMax files (same deliveryDims) — not listed.
 ];
+// ⚠️ DELIVERY INTENT ONLY — NOT a queue list, and NOT what resolvePreset
+// returns. It names the three surfaces a Google video run ultimately DELIVERS.
+// Only two of them are billable Omni masters (GOOGLE_VIDEO_MASTERS below); the
+// 1:1 is derived free from the settled 9:16 plate by the expansion layer.
+//
+// It therefore has no runtime consumer today — deliberately kept, and named
+// this way, for the same reason META_VIDEO_FANOUT is: the delivered set is
+// worth stating in one place. **Wiring this list into a preset's videoFormats
+// would mint a THIRD billable master per product (~$0.90 each) for a surface
+// the product sells as free.** `scripts/verifyPresets.js` pins that no named
+// preset ever returns the derive-only key.
 const GOOGLE_VIDEO_FANOUT = [
   'pmax_video_16_9',
-  'pmax_video_1_1',
-  'pmax_video_9_16',
-  'google_shorts_9_16'
+  'pmax_video_1_1',   // derive-only — never an Omni submit
+  'pmax_video_9_16'
 ];
+
+// Two billable Omni masters for google runs (9:16 shared with Meta
+// creative-wise, 16:9 net-new). pmax_video_1_1 is NOT a master; it derives
+// from the settled 9:16 master (no Omni submit).
+const GOOGLE_VIDEO_MASTERS = ['pmax_video_9_16', 'pmax_video_16_9'];
 
 // ── PRESETS ─────────────────────────────────────────────────────────────
 // Operator-facing choices that replace platformFormat + kinds + expandStaticFormats.
@@ -487,9 +519,9 @@ const GOOGLE_VIDEO_FANOUT = [
 //   meta_static   — 3 billable image gens per concept (one per Meta static size)
 //   meta_video    — 1 billable Veo submit per product (9:16 master only)
 //   meta_all      — both of the above
-//   google_static — Google static sizes (all coming_soon today → empty)
-//   google_video  — Google video sizes (all coming_soon today → empty)
-//   google_all    — both Google static + video (empty today)
+//   google_static — 3 billable PMax static sizes per concept
+//   google_video  — 2 billable Omni masters per product (9:16 + 16:9); 1:1 is derive-only
+//   google_all    — both of the above
 //   single        — back-compat: reproduce prior three-knob behaviour exactly
 //
 // coming_soon formats never appear in any resolved list.
@@ -512,17 +544,17 @@ const PRESETS = {
   google_static: {
     platform:    'google',
     label:       'Google Static',
-    description: 'Google Performance Max + Demand Gen marketing images. Coming soon.'
+    description: 'One generation per concept per PMax static size (1.91:1, 1:1, 4:5).'
   },
   google_video: {
     platform:    'google',
     label:       'Google Video',
-    description: 'Google Performance Max video + YouTube Shorts. Coming soon.'
+    description: 'Two Omni masters per product (9:16 + 16:9); square 1:1 is derived, not generated.'
   },
   google_all: {
     platform:    'google',
     label:       'Google All',
-    description: 'Google static + video sizes. Coming soon.'
+    description: 'PMax static fan-out + two PMax video masters per product.'
   },
   single: {
     platform:    null,
@@ -550,10 +582,12 @@ const PLATFORM_PRESET_KEYS = {
  * @returns {{ staticFormats: string[], videoFormats: string[], kinds: string[] }}
  *
  * MONEY:
- *   meta_static → 3 billable image submits per concept
- *   meta_video  → 1 billable Veo submit per product (videoFormats length === 1)
- *   meta_all    → both
- *   google_*    → empty while every Google format is coming_soon
+ *   meta_static   → 3 billable image submits per concept
+ *   meta_video    → 1 billable Omni submit per product (videoFormats length === 1)
+ *   meta_all      → both
+ *   google_static → 3 billable image submits per concept
+ *   google_video  → 2 billable Omni masters per product (9:16 + 16:9; not the 1:1)
+ *   google_all    → both Google static + video masters
  * Never emit a coming_soon key.
  */
 function resolvePreset(preset, platformFormat, opts = {}) {
@@ -607,8 +641,7 @@ function resolvePreset(preset, platformFormat, opts = {}) {
   }
 
   if (name === 'google_static') {
-    // Intended list is GOOGLE_STATIC_FANOUT; filterLiveFormats drops every
-    // coming_soon key so today this is always empty. No special-case.
+    // 3 billable image generations per concept — one per live PMax static size.
     const staticFormats = filterLiveFormats([...GOOGLE_STATIC_FANOUT]);
     return {
       staticFormats,
@@ -618,7 +651,10 @@ function resolvePreset(preset, platformFormat, opts = {}) {
   }
 
   if (name === 'google_video') {
-    const videoFormats = filterLiveFormats([...GOOGLE_VIDEO_FANOUT]);
+    // Billable Omni masters only — mirrors meta_video → META_VIDEO_MASTER.
+    // Do NOT return GOOGLE_VIDEO_FANOUT here; pmax_video_1_1 is a derive-only
+    // surface queued by the expansion layer, not a second Omni submit.
+    const videoFormats = filterLiveFormats([...GOOGLE_VIDEO_MASTERS]);
     return {
       staticFormats: [],
       videoFormats,
@@ -628,7 +664,8 @@ function resolvePreset(preset, platformFormat, opts = {}) {
 
   if (name === 'google_all') {
     const staticFormats = filterLiveFormats([...GOOGLE_STATIC_FANOUT]);
-    const videoFormats = filterLiveFormats([...GOOGLE_VIDEO_FANOUT]);
+    // Masters only — same money shape as google_video (see above).
+    const videoFormats = filterLiveFormats([...GOOGLE_VIDEO_MASTERS]);
     const kindsOut = [];
     if (staticFormats.length) kindsOut.push('image');
     if (videoFormats.length) kindsOut.push('video');
@@ -750,14 +787,15 @@ function formatCatalog() {
   }
 
   // Intent lists per named preset (unfiltered — catalog shows stubs).
-  // meta_video shows only the billable master (not the Phase 3 derivation set).
+  // meta_video / google_video show only the billable master(s), not derive-only
+  // surfaces (mirrors resolvePreset money shape).
   const presetFormatKeys = {
     meta_static:   [...META_STATIC_FANOUT],
     meta_video:    [META_VIDEO_MASTER],
     meta_all:      [...META_STATIC_FANOUT, META_VIDEO_MASTER],
     google_static: [...GOOGLE_STATIC_FANOUT],
-    google_video:  [...GOOGLE_VIDEO_FANOUT],
-    google_all:    [...GOOGLE_STATIC_FANOUT, ...GOOGLE_VIDEO_FANOUT]
+    google_video:  [...GOOGLE_VIDEO_MASTERS],
+    google_all:    [...GOOGLE_STATIC_FANOUT, ...GOOGLE_VIDEO_MASTERS]
   };
 
   const platformOrder = ['meta', 'google'];
@@ -822,6 +860,7 @@ module.exports = {
   META_VIDEO_MASTER,
   GOOGLE_STATIC_FANOUT,
   GOOGLE_VIDEO_FANOUT,
+  GOOGLE_VIDEO_MASTERS,
   staticFanoutForPlatformFormat,
   videoFanoutForPlatformFormat,
   PRESETS,

@@ -33,6 +33,11 @@ const DEFAULTS = {
   fps: FALLBACK.fps,
   durationInFrames: FALLBACK.durationInFrames,
   debugLayout: false,
+  // Safe-zone variant (null → canvas format zones). PMax video sets
+  // verticalYt / landscapeYt / squareYt via remotionRenderService; Meta and
+  // non-video ads leave this null so stackContainerStyle keeps today's zones.
+  safeZoneKey: null,
+  platformFormat: null,
 };
 
 export const RemotionRoot = () => (

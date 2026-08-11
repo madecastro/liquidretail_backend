@@ -92,15 +92,32 @@ const pf = require('./platformFormats');
 // ORDER IS LOAD-BEARING. chooseGenSize keeps the first entry on a loss tie
 // (`loss < best.loss`, strict — not `<=`), so the legacy sizes stay ahead of any
 // later equal-loss entry. Do not reorder casually.
+//
+// 2048x1152 is the schema-enum exact 16:9 (see scripts/verifyStaticSafeBox.js).
+// Placed after the three legacy sizes and beside its 9:16 twin so no equal-loss
+// tie flips an existing surface: 1:1 / 4:5 / 9:16 still win on strict lower loss
+// at their exact sizes. Only true landscape targets (pmax_16_9, pmax_landscape_*)
+// switch from 1536x1024 (3:2, 15.6% crop) to zero-crop 16:9 — intended.
 const GEN_SIZES = [
   { w: 1024, h: 1024 },
   { w: 1024, h: 1536 },
   { w: 1536, h: 1024 },
   { w: 1152, h: 2048 }, // enum member, exact 9:16; absent before → 15.6% side crop
+  { w: 2048, h: 1152 }, // enum member, exact 16:9; absent before → 15.6% T/B crop on landscape
   { w: 1088, h: 1360 }  // PROBED non-enum, exact 4:5; absent before → 16.7% top/bottom crop
 ];
 
 const EDGE_MARGIN_PCT = 6; // convention, ours — not a platform reserve
+
+// Per-surface edge-margin override (percent of kept short side). Absent key →
+// EDGE_MARGIN_PCT. Only the three Phase A PMax statics use 10%; every other
+// surface (incl. frozen pmax_16_9) stays at 6 so existing geometry is
+// byte-identical.
+const SURFACE_EDGE_MARGIN_PCT = {
+  pmax_landscape_1_91_1: 10,
+  pmax_square_1_1:       10,
+  pmax_portrait_4_5:     10
+};
 
 /** Pick the generation size needing the least crop to reach a target aspect. */
 function chooseGenSize(targetAspect) {
@@ -211,7 +228,10 @@ function computeSurface(key) {
   // deleted because they are still load-bearing for the frozen 16:9 surface, and
   // because extractFor remains the defence against a model that returns an
   // off-size frame. A future surface with an awkward aspect will crop again.
-  const marginPx = (EDGE_MARGIN_PCT / 100) * Math.min(keptW, keptH);
+  const marginPct = Object.prototype.hasOwnProperty.call(SURFACE_EDGE_MARGIN_PCT, key)
+    ? SURFACE_EDGE_MARGIN_PCT[key]
+    : EDGE_MARGIN_PCT;
+  const marginPx = (marginPct / 100) * Math.min(keptW, keptH);
 
   let x0 = cropLeftPx + marginPx;
   let x1 = cropLeftPx + keptW - marginPx;
@@ -344,7 +364,11 @@ function describeSurfaces() {
  * CONFIDENCE, stated so it can be corrected rather than inherited:
  *   - reels video-only ....... from platformFormats.kinds (authoritative here)
  *   - stories link sticker ... owner-stated; bottom 250px is the reply bar
- *   - pmax draws its own ..... from this repo's brief: "prominent CTA"
+ *   - pmax platform CTA ...... the platform draws its own CTA on most
+ *     placements; the SURFACE_POLICY.drawCta:true values below are the
+ *     Phase A / flag-off baseline. With PMAX_STATIC_PLATFORM_NOTES on,
+ *     resolveDrawCta rewrites pmax_* to intent-dependent (true only for
+ *     objection_resolved / conversion). Meta is never rewritten.
  *   - feed draws its own ..... INFERRED. Meta renders a CTA button beneath the
  *     image, so an in-image button is arguably duplicative, but the repo brief
  *     says "CTA should land within the first frame". Left as draws-own-CTA
@@ -361,8 +385,84 @@ const SURFACE_POLICY = {
   meta_reels_9_16:   { static: false, skipReason: 'kinds:["video"] — Reels takes no static image' },
   meta_stories_9_16: { static: true,  drawCta: false, maxTextElements: 3,
                        ctaNote: 'the platform supplies the link affordance' },
-  pmax_16_9:         { static: true,  drawCta: true,  maxTextElements: 4 }
+  pmax_16_9:         { static: true,  drawCta: true,  maxTextElements: 4 },
+  // Phase A live PMax statics. drawCta:true is the SURFACE default and the
+  // flag-off baseline; with PMAX_STATIC_PLATFORM_NOTES on, resolveDrawCta
+  // rewrites it intent-by-intent (true only for objection_resolved).
+  // maxTextElements 3 on the small 1.91:1 canvas — dense text hurts there.
+  pmax_landscape_1_91_1: { static: true, drawCta: true, maxTextElements: 3 },
+  pmax_square_1_1:       { static: true, drawCta: true, maxTextElements: 4 },
+  pmax_portrait_4_5:     { static: true, drawCta: true, maxTextElements: 4 }
 };
+
+/**
+ * Destination family for a surface key. `pmax_*` → 'pmax'; everything else
+ * (including Meta live + frozen surfaces) → 'meta'. Used to gate PLATFORM_NOTES
+ * and the PMax intent-aware CTA — Meta must never take either path.
+ */
+function destinationForSurface(surfaceKey) {
+  return String(surfaceKey || '').startsWith('pmax_') ? 'pmax' : 'meta';
+}
+
+/**
+ * PLATFORM_NOTES — per-destination delivery context injected into buildPrompt
+ * AFTER the FORMAT/geometry block (the geometry block already establishes the
+ * safe box these notes refer to). Model-facing text never names the platform
+ * brand; existing prompts say "the platform" and these keep that convention.
+ *
+ * Only 'pmax' has a block today. Meta has none — an empty/missing entry is what
+ * keeps Meta prompts byte-identical when the flag is on.
+ */
+const PLATFORM_NOTES = {
+  pmax: [
+    // ⚠️ Do NOT put the product back in the "must fit inside the box" list.
+    // geometryBlock() says, two lines earlier: "EVERY element you render other
+    // than the photograph itself must sit inside the box … The photograph
+    // should still fill the whole frame edge to edge." Naming the product here
+    // revokes that exemption and tells the model to shrink the subject into the
+    // text box — wasting the frame on the exact surface where a small,
+    // thumbnail-legible subject matters most. The box governs RENDERED
+    // elements; the product only needs to survive a centre crop.
+    'PLATFORM CONTEXT. The platform may crop the outer edges of this image on some placements. Every element you render — logo, and any text — must sit inside the safe box already specified above; nothing rendered in the outer margin. The photograph itself still fills the frame edge to edge, but compose it so the product reads as complete and uncut when the frame is cropped toward its centre: keep the product away from the extreme edges and never let a crop slice through it.',
+    'This image may be shown WITHOUT any accompanying text. It has to communicate the product and the brand on its own.',
+    'It may also be shown small, in a feed of unrelated content: one dominant subject, strong figure/ground contrast, no fine detail that dies at thumbnail size, no clutter.',
+    'Keep the whole composition legible when the frame is cropped toward its centre.'
+  ].join(' ')
+};
+
+/**
+ * PMax STATIC PLATFORM NOTES + intent-aware CTA — kill switch, default ON.
+ *
+ * Same pattern as STATIC_PROMPT_FIDELITY_HARDENING / STATIC_BRAND_LED_COPY:
+ * `false` restores a **byte-identical** pre-Phase-B prompt for every surface
+ * (no notes block; pmax drawCta stays the per-surface SURFACE_POLICY boolean).
+ * With the flag on, Meta surfaces remain byte-identical — only `pmax_*` is
+ * allowed to diverge.
+ */
+const PMAX_STATIC_PLATFORM_NOTES = process.env.PMAX_STATIC_PLATFORM_NOTES !== 'false';
+
+/**
+ * Effective drawCta for a surface + resolved intent.
+ *
+ * Meta keeps SURFACE_POLICY.drawCta exactly — Stories already stamps false with
+ * ctaNote 'the platform supplies the link affordance', and the absences /
+ * density path keys on that boolean. Do not rewrite Meta.
+ *
+ * PMax, flag ON only: the platform supplies the CTA affordance on most
+ * placements, so a burned-in button is usually redundant — same reasoning as
+ * meta_stories_9_16. Exception: conversion-flavoured creatives
+ * (objection_resolved, what ai_promotional maps to) still want the in-image
+ * CTA. Flag OFF restores the Phase A per-surface boolean (all pmax_* true).
+ */
+function resolveDrawCta({ surfaceKey, policy, intentKey }) {
+  if (!policy) return true;
+  // Flag off → every surface uses the raw SURFACE_POLICY boolean (byte-identity).
+  if (!PMAX_STATIC_PLATFORM_NOTES) return policy.drawCta;
+  // Meta (and any non-pmax) → never rewrite.
+  if (destinationForSurface(surfaceKey) !== 'pmax') return policy.drawCta;
+  // PMax + flag on: intent-dependent. TRUE only for the conversion intent.
+  return intentKey === 'objection_resolved';
+}
 
 /**
  * Which element goes first when over the density budget. Earlier = sacrificed
@@ -738,14 +838,28 @@ function buildPrompt({ intentKey, data, product, surface }) {
   if (!resolved.key) return { error: resolved.why };
   const spec = resolved.spec;
 
+  // Intent-aware CTA for pmax only (flag on). Meta and flag-off keep the
+  // SURFACE_POLICY object as-is so absences / density / returned policy stay
+  // byte-identical to today. When suppressed, reuse the Stories path:
+  // strip CTA before applyDensity + absence line with ctaNote.
+  const drawCta = resolveDrawCta({ surfaceKey: surface, policy, intentKey: resolved.key });
+  const effectivePolicy = drawCta === policy.drawCta
+    ? policy
+    : {
+        ...policy,
+        drawCta,
+        // Same note Stories uses — the platform supplies the CTA affordance.
+        ctaNote: policy.ctaNote || 'the platform supplies the link affordance'
+      };
+
   let text = spec.text({ ...data, cta: data.cta });
-  if (!policy.drawCta) text = text.filter(([r]) => r !== 'CTA BUTTON');
-  const { kept, dropped } = applyDensity(text, spec, policy);
+  if (!effectivePolicy.drawCta) text = text.filter(([r]) => r !== 'CTA BUTTON');
+  const { kept, dropped } = applyDensity(text, spec, effectivePolicy);
 
   const keptRoles = new Set(kept.map(([r]) => r));
   const kept_ = (role) => keptRoles.has(role);
   const emphasis = spec.emphasis(data, kept_);
-  const absent = absences(data, spec.renders, dropped, policy);
+  const absent = absences(data, spec.renders, dropped, effectivePolicy);
   const s = computeSurface(surface);
 
   /**
@@ -819,6 +933,18 @@ Set no other words, numerals or letterforms anywhere in the image — including 
    */
   const personClause = FIDELITY_HARDENING ? '' : 'whether a person appears, ';
 
+  /**
+   * Platform delivery context — AFTER geometry, because the notes refer to the
+   * safe box the geometry block just established. Flag off → empty for every
+   * surface (byte-identity). Flag on → pmax only; Meta has no PLATFORM_NOTES
+   * entry so its prompt stays byte-identical.
+   */
+  let platformNotesBlock = '';
+  if (PMAX_STATIC_PLATFORM_NOTES) {
+    const notes = PLATFORM_NOTES[destinationForSurface(surface)];
+    if (notes) platformNotesBlock = `\n\n${notes}`;
+  }
+
   const prompt = `${rolePreamble}Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
 
 ${FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY}
@@ -841,9 +967,9 @@ If an element is not listed in the text above, it does not exist, and its absenc
 
 Keep the ${product.logoCorner || 'bottom-right'} corner clear of text and graphics — the corner of the SAFE BOX described below, not of the frame you are generating. The real logo is composited into that space afterwards, inside the safe box, because anything outside it is either cut away by the delivery crop or covered by the platform's own interface.
 
-${geometryBlock(s)}`;
+${geometryBlock(s)}${platformNotesBlock}`;
 
-  return { prompt, resolved, absent, emphasis, text: kept, dropped, surface: s, policy };
+  return { prompt, resolved, absent, emphasis, text: kept, dropped, surface: s, policy: effectivePolicy };
 }
 
 module.exports = {
@@ -859,6 +985,12 @@ module.exports = {
   computeSurface,
   geometryBlock,
   EDGE_MARGIN_PCT,
+  SURFACE_EDGE_MARGIN_PCT,
   describeSurfaces,
-  BRAND_LED_COPY
+  BRAND_LED_COPY,
+  // Phase B PMax static overlay — harnesses call these directly.
+  PMAX_STATIC_PLATFORM_NOTES,
+  PLATFORM_NOTES,
+  destinationForSurface,
+  resolveDrawCta
 };

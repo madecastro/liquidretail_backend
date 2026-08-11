@@ -16,7 +16,7 @@ import { BasePlate } from '../components/BasePlate.jsx';
 import { useBrandFonts } from '../components/FontLoader.jsx';
 import { SLOT_RENDERERS } from '../components/slotRenderers.jsx';
 import { slotEnvelope, slotProgress, specTimeScale } from '../lib/timing.js';
-import { stackContainerStyle, SAFE_ZONES } from '../lib/safeZones.js';
+import { stackContainerStyle, resolveSafeZone, resolveSafeZoneKey } from '../lib/safeZones.js';
 import { contrastToken } from '../lib/tokens.js';
 import { resolveSlotContent } from '../lib/slotContent.js';
 import { decideInkOnLight } from '../lib/plateHints.js';
@@ -272,10 +272,13 @@ function foldRows(items) {
 
 const ALIGN_TO_FLEX = { left: 'flex-start', center: 'center', right: 'flex-end' };
 
-export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec, plateHints = null, debugLayout = false }) => {
+export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat = null, plate, meta = {}, tokens = {}, spec, plateHints = null, debugLayout = false }) => {
   const frame = useCurrentFrame();
   const { width, height, fps, durationInFrames } = useVideoConfig();
   useBrandFonts(tokens?.fonts);
+  // Canvas format stays the composition id; YT zones only via safeZoneKey /
+  // platformFormat (PMax video). Resolved once so every group + overlay agree.
+  const zoneKey = safeZoneKey || resolveSafeZoneKey({ format, platformFormat });
 
   // Spec color overrides win over resolved brand tokens (font overrides are
   // resolved server-side because they may need new font files).
@@ -340,6 +343,7 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
         );
         const container = stackContainerStyle({
           format,
+          safeZoneKey: zoneKey,
           anchor: effectiveAnchor,
           offsetX: first.position.offsetX,
           offsetY: first.position.offsetY,
@@ -415,13 +419,13 @@ export const Canonical = ({ format = 'feed', plate, meta = {}, tokens = {}, spec
           </div>
         );
       })}
-      {debugLayout ? <SafeZoneOverlay format={format} width={width} height={height} /> : null}
+      {debugLayout ? <SafeZoneOverlay safeZoneKey={zoneKey} width={width} height={height} /> : null}
     </AbsoluteFill>
   );
 };
 
-const SafeZoneOverlay = ({ format, width, height }) => {
-  const safe = SAFE_ZONES[format] || SAFE_ZONES.feed;
+const SafeZoneOverlay = ({ safeZoneKey, width, height }) => {
+  const safe = resolveSafeZone({ safeZoneKey });
   return (
     <div
       style={{
