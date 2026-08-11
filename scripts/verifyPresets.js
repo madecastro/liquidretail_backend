@@ -4,18 +4,21 @@
  * verifyPresets — offline checks for the format PRESET API.
  *
  * The preset table replaces the three-knob wizard API (platformFormat + kinds +
- * expandStaticFormats) with one operator choice. Two money-shaped invariants
+ * expandStaticFormats) with one operator choice. Money-shaped invariants that
  * are load-bearing:
  *
  *   1. meta_video queues exactly ONE video format (the 9:16 master). Returning
  *      the full META_VIDEO_FANOUT would queue four billable Veo submits per
  *      product; the other three sizes are Phase 3 derivations, not generations.
- *   2. coming_soon formats never appear in any resolved list, fan-out, or
+ *   2. google_video queues exactly TWO video masters (9:16 + 16:9).
+ *      pmax_video_1_1 is DERIVE-ONLY — it must never appear in resolvePreset
+ *      videoFormats (that would make it a third billable Omni submit).
+ *   3. coming_soon formats never appear in any resolved list, fan-out, or
  *      generatable allowlist. They are UI chrome only until they go live.
  *
- * Google is fully frozen (all coming_soon). google_static / google_video /
- * google_all resolve empty via filterLiveFormats — not a second special case.
- * google_pmax is gone (it double-spent static+video on pmax_16_9).
+ * Phase A (2026-08): six PMax keys are live (3 static + 3 video). Demand Gen +
+ * google_shorts_9_16 + frozen pmax_16_9 stay coming_soon. google_pmax is gone
+ * (it double-spent static+video on pmax_16_9).
  *
  * 'single' must reproduce today's three-knob behaviour exhaustively for LIVE
  * formats — that is the backwards-compat proof so old callers stay
@@ -30,9 +33,12 @@ const pf = require(path.join(__dirname, '..', 'services', 'platformFormats.js'))
 
 let pass = 0;
 const failures = [];
-function check(label, cond) {
+function check(label, cond, detail) {
   if (cond) { pass++; console.log(`  ✓ ${label}`); }
-  else { failures.push(label); console.log(`  ✗ ${label}`); }
+  else {
+    failures.push(detail ? `${label} — ${detail}` : label);
+    console.log(`  ✗ ${label}${detail ? ` — ${detail}` : ''}`);
+  }
 }
 function eq(label, actual, expected) {
   check(`${label} → ${JSON.stringify(expected)}`, JSON.stringify(actual) === JSON.stringify(expected));
@@ -44,21 +50,29 @@ function setEq(label, actual, expected) {
 }
 
 const META3 = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16'];
-// Live Meta surfaces only — pmax_16_9 is frozen (coming_soon).
-const LIVE4 = [
+// Live Meta surfaces (unchanged).
+const LIVE_META = [
   'meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16', 'meta_stories_9_16'
 ];
-const GOOGLE_PMAX_STUBS = [
-  'pmax_landscape_1_91_1', 'pmax_square_1_1', 'pmax_portrait_4_5',
+// Phase A live PMax surfaces.
+const LIVE_PMAX_STATIC = [
+  'pmax_landscape_1_91_1', 'pmax_square_1_1', 'pmax_portrait_4_5'
+];
+const LIVE_PMAX_VIDEO = [
   'pmax_video_16_9', 'pmax_video_1_1', 'pmax_video_9_16'
 ];
+const LIVE_PMAX = [...LIVE_PMAX_STATIC, ...LIVE_PMAX_VIDEO];
+const LIVE_ALL = [...LIVE_META, ...LIVE_PMAX];
+// Google keys that remain coming_soon after Phase A (Demand Gen + Shorts +
+// frozen legacy dual-kind pmax_16_9). Not the six live PMax keys above.
 const COMING = [
   'pmax_16_9',
-  ...GOOGLE_PMAX_STUBS,
   'google_demandgen_1_1', 'google_demandgen_4_5',
   'google_demandgen_1_91_1', 'google_shorts_9_16'
 ];
 const GOOGLE_PRESETS = ['google_static', 'google_video', 'google_all'];
+// Billable Omni masters only — pmax_video_1_1 is intentionally absent.
+const GOOGLE_VIDEO_MASTERS_EXPECTED = ['pmax_video_9_16', 'pmax_video_16_9'];
 
 // ── table shape ─────────────────────────────────────────────────────────
 console.log('\nPLATFORM_FORMATS — every entry has platform + status');
@@ -76,7 +90,7 @@ function parseAr(s) {
   const [a, b] = String(s).split(':').map(Number);
   return a / b;
 }
-for (const k of LIVE4) {
+for (const k of LIVE_ALL) {
   const caps = pf.PLATFORM_FORMATS[k];
   const want = parseAr(caps.aspectRatio);
   const got = caps.deliveryDims.width / caps.deliveryDims.height;
@@ -84,14 +98,14 @@ for (const k of LIVE4) {
     Math.abs(want - got) < 0.02);
   check(`  ${k}: status is live`, caps.status === 'live');
 }
-console.log('\nevery Google format is coming_soon');
+console.log('\ncoming_soon Google keys (Demand Gen + Shorts + frozen pmax_16_9)');
 for (const k of COMING) {
   check(`  ${k}: declared`, !!pf.PLATFORM_FORMATS[k]);
   check(`  ${k}: status is coming_soon`, pf.PLATFORM_FORMATS[k]?.status === 'coming_soon');
   check(`  ${k}: isComingSoonFormat`, pf.isComingSoonFormat(k) === true);
   check(`  ${k}: isLiveFormat is false`, pf.isLiveFormat(k) === false);
 }
-// PMax stubs have the published delivery dims
+// PMax live keys have the published delivery dims
 eq('  pmax_landscape_1_91_1 deliveryDims', pf.PLATFORM_FORMATS.pmax_landscape_1_91_1?.deliveryDims,
   { width: 1200, height: 628 });
 eq('  pmax_square_1_1 deliveryDims', pf.PLATFORM_FORMATS.pmax_square_1_1?.deliveryDims,
@@ -104,6 +118,10 @@ eq('  pmax_video_1_1 deliveryDims', pf.PLATFORM_FORMATS.pmax_video_1_1?.delivery
   { width: 1080, height: 1080 });
 eq('  pmax_video_9_16 deliveryDims', pf.PLATFORM_FORMATS.pmax_video_9_16?.deliveryDims,
   { width: 1080, height: 1920 });
+// Live PMax status pin
+for (const k of LIVE_PMAX) {
+  check(`  ${k}: is live (Phase A)`, pf.isLiveFormat(k) === true);
+}
 // Frozen pmax_16_9 keeps prior geometry for read paths
 eq('  pmax_16_9 deliveryDims unchanged', pf.PLATFORM_FORMATS.pmax_16_9?.deliveryDims,
   { width: 1920, height: 1080 });
@@ -112,14 +130,16 @@ eq('  pmax_16_9 canvas unchanged', pf.PLATFORM_FORMATS.pmax_16_9?.canvas,
 eq('  pmax_16_9 kinds unchanged', pf.PLATFORM_FORMATS.pmax_16_9?.kinds, ['image', 'video']);
 eq('  pmax_16_9 safeArea unchanged', pf.PLATFORM_FORMATS.pmax_16_9?.safeArea, { top: 0, bottom: 0 });
 
-check('  LIVE_PLATFORM_FORMAT_KEYS is exactly the 4 live Meta surfaces',
-  JSON.stringify([...pf.LIVE_PLATFORM_FORMAT_KEYS].sort()) === JSON.stringify([...LIVE4].sort()));
+check('  LIVE_PLATFORM_FORMAT_KEYS is exactly Meta4 + live PMax6',
+  JSON.stringify([...pf.LIVE_PLATFORM_FORMAT_KEYS].sort()) === JSON.stringify([...LIVE_ALL].sort()));
 check('  no coming_soon key is in LIVE_PLATFORM_FORMAT_KEYS',
   COMING.every((k) => !pf.LIVE_PLATFORM_FORMAT_KEYS.includes(k)));
-check('  every Google-platform entry is coming_soon',
-  pf.PLATFORM_FORMAT_KEYS
-    .filter((k) => pf.PLATFORM_FORMATS[k].platform === 'google')
-    .every((k) => pf.PLATFORM_FORMATS[k].status === 'coming_soon'));
+check('  every live PMax key is Google-platform',
+  LIVE_PMAX.every((k) => pf.PLATFORM_FORMATS[k]?.platform === 'google'));
+check('  Demand Gen + Shorts + frozen pmax_16_9 remain coming_soon on Google',
+  COMING.every((k) =>
+    pf.PLATFORM_FORMATS[k]?.platform === 'google' &&
+    pf.PLATFORM_FORMATS[k]?.status === 'coming_soon'));
 
 // ── named presets ───────────────────────────────────────────────────────
 console.log('\nresolvePreset — named presets');
@@ -151,15 +171,80 @@ console.log('\nresolvePreset — named presets');
   setEq('  meta_all kinds', r.kinds, ['image', 'video']);
   check('  meta_all still only ONE video format to queue', r.videoFormats.length === 1);
 }
-console.log('\nGoogle presets — all resolve empty (every Google format is coming_soon)');
-for (const g of GOOGLE_PRESETS) {
-  const r = pf.resolvePreset(g, 'meta_feed_1_1');
-  eq(`  ${g} staticFormats`, r.staticFormats, []);
-  eq(`  ${g} videoFormats`, r.videoFormats, []);
-  eq(`  ${g} kinds`, r.kinds, []);
+console.log('\nGoogle presets — Phase A money shape (live PMax, not empty)');
+{
+  const r = pf.resolvePreset('google_static', 'meta_feed_1_1');
+  eq('  google_static staticFormats (3 billable image submits/concept)', r.staticFormats, LIVE_PMAX_STATIC);
+  eq('  google_static videoFormats', r.videoFormats, []);
+  eq('  google_static kinds', r.kinds, ['image']);
+  check('  google_static is 3 billable image surfaces', r.staticFormats.length === 3);
+}
+{
+  const r = pf.resolvePreset('google_video', 'meta_feed_1_1');
+  eq('  google_video videoFormats is the TWO Omni masters (order)', r.videoFormats, GOOGLE_VIDEO_MASTERS_EXPECTED);
+  eq('  google_video staticFormats', r.staticFormats, []);
+  eq('  google_video kinds', r.kinds, ['video']);
+  check('  MONEY: google_video queues exactly TWO video masters (not three)',
+    r.videoFormats.length === 2);
+  check('  MONEY: pmax_video_1_1 is NOT a master in google_video',
+    !r.videoFormats.includes('pmax_video_1_1'));
+}
+{
+  const r = pf.resolvePreset('google_all', 'meta_feed_1_1');
+  eq('  google_all staticFormats', r.staticFormats, LIVE_PMAX_STATIC);
+  eq('  google_all videoFormats is the TWO masters (order)', r.videoFormats, GOOGLE_VIDEO_MASTERS_EXPECTED);
+  setEq('  google_all kinds', r.kinds, ['image', 'video']);
+  check('  google_all still only TWO video masters to queue', r.videoFormats.length === 2);
+  check('  MONEY: pmax_video_1_1 is NOT a master in google_all',
+    !r.videoFormats.includes('pmax_video_1_1'));
+}
+// MONEY PIN: derive-only square must never be queued by a multi-surface preset.
+// If it appears in google_video / google_all / meta_* videoFormats it becomes a
+// third billable Omni submit. single with seed===pmax_video_1_1 is the one
+// legitimate case (operator explicitly named that surface); every other
+// (preset, seed) pair must keep it out of videoFormats.
+{
+  const seeds = [...LIVE_ALL, ...COMING, null, 'bogus', 'meta_feed_1_1'];
+  const kindOpts = [null, 'image', 'video', 'both'];
+  const expandOpts = [false, true];
+  const namedPresets = pf.PRESET_KEYS.filter((k) => k !== 'single');
+  let leakNamed = null;
+  let leakSingleOtherSeed = null;
+  for (const preset of namedPresets) {
+    for (const seed of seeds) {
+      for (const kinds of kindOpts) {
+        for (const expand of expandOpts) {
+          const r = pf.resolvePreset(preset, seed, { kinds, expandStaticFormats: expand });
+          if ((r.videoFormats || []).includes('pmax_video_1_1')) {
+            leakNamed = { preset, seed, kinds, expand, videoFormats: r.videoFormats };
+          }
+        }
+      }
+    }
+  }
+  for (const seed of seeds) {
+    if (seed === 'pmax_video_1_1') continue;
+    for (const kinds of kindOpts) {
+      for (const expand of expandOpts) {
+        const r = pf.resolvePreset('single', seed, { kinds, expandStaticFormats: expand });
+        if ((r.videoFormats || []).includes('pmax_video_1_1')) {
+          leakSingleOtherSeed = { seed, kinds, expand, videoFormats: r.videoFormats };
+        }
+      }
+    }
+  }
+  check('  MONEY: pmax_video_1_1 never in named-preset videoFormats (derive-only; would be 3rd Omni)',
+    !leakNamed, leakNamed ? JSON.stringify(leakNamed) : '');
+  check('  MONEY: pmax_video_1_1 never sneaks into single for any other seed',
+    !leakSingleOtherSeed, leakSingleOtherSeed ? JSON.stringify(leakSingleOtherSeed) : '');
+  // Also pin the export itself: masters list excludes 1:1.
+  eq('  GOOGLE_VIDEO_MASTERS export is 9:16 + 16:9 only',
+    pf.GOOGLE_VIDEO_MASTERS, GOOGLE_VIDEO_MASTERS_EXPECTED);
+  check('  GOOGLE_VIDEO_MASTERS excludes pmax_video_1_1',
+    !pf.GOOGLE_VIDEO_MASTERS.includes('pmax_video_1_1'));
 }
 check('  google_pmax no longer exists', !pf.PRESETS.google_pmax && !pf.PRESET_KEYS.includes('google_pmax'));
-// Intent lists exist so when Google goes live the filter flips on without a rewrite
+// Intent lists exist so Demand Gen can flip on without a rewrite
 check('  GOOGLE_STATIC_FANOUT non-empty intent', pf.GOOGLE_STATIC_FANOUT.length > 0);
 check('  GOOGLE_VIDEO_FANOUT non-empty intent', pf.GOOGLE_VIDEO_FANOUT.length > 0);
 check('  GOOGLE_STATIC_FANOUT every entry is image-capable Google',
@@ -173,12 +258,18 @@ check('  GOOGLE_VIDEO_FANOUT every entry is video-capable Google',
 // Static and video lists must not share keys (split-by-kind invariant)
 check('  Google static/video lists are disjoint (no double-spend key)',
   pf.GOOGLE_STATIC_FANOUT.every((k) => !pf.GOOGLE_VIDEO_FANOUT.includes(k)));
+// Demand Gen + Shorts never appear in any resolved list
+for (const k of COMING) {
+  // checked again in the global coming_soon sweep below; pin here for money docs
+  check(`  coming_soon ${k} not in GOOGLE_STATIC_FANOUT`, !pf.GOOGLE_STATIC_FANOUT.includes(k));
+  check(`  coming_soon ${k} not in GOOGLE_VIDEO_MASTERS`, !(pf.GOOGLE_VIDEO_MASTERS || []).includes(k));
+}
 
 // ── single: exhaustive backwards-compat for LIVE formats ────────────────
-console.log('\nresolvePreset single — exhaustive three-knob back-compat (live Meta)');
+console.log('\nresolvePreset single — exhaustive three-knob back-compat (live Meta + live PMax)');
 const KIND_OPTS = [null, 'image', 'video', 'both'];
 const EXPAND_OPTS = [false, true];
-const PF_OPTS = [...LIVE4, 'meta_feed_1_1', null, 'not_a_format', ...COMING];
+const PF_OPTS = [...LIVE_ALL, 'meta_feed_1_1', null, 'not_a_format', ...COMING];
 
 // Reproduce pre-preset expandWizardJob format resolution in pure form.
 // This is the oracle: single must match it for every combination.
@@ -247,10 +338,17 @@ eq('  single reels image → nothing (no invert to video)',
 eq('  single reels video',
   pf.resolvePreset('single', 'meta_reels_9_16', { kinds: 'video' }),
   { staticFormats: [], videoFormats: ['meta_reels_9_16'], kinds: ['video'] });
-// pmax is frozen: single resolves empty (money belt); generate also refuses.
-eq('  single pmax both → empty (coming_soon)',
+// Frozen pmax_16_9: single resolves empty (money belt); generate also refuses.
+eq('  single pmax_16_9 both → empty (coming_soon)',
   pf.resolvePreset('single', 'pmax_16_9', { kinds: 'both', expandStaticFormats: false }),
   { staticFormats: [], videoFormats: [], kinds: [] });
+// Live PMax static single path
+eq('  single pmax_landscape image no-expand',
+  pf.resolvePreset('single', 'pmax_landscape_1_91_1', { kinds: 'image', expandStaticFormats: false }),
+  { staticFormats: ['pmax_landscape_1_91_1'], videoFormats: [], kinds: ['image'] });
+eq('  single pmax_video_9_16 video',
+  pf.resolvePreset('single', 'pmax_video_9_16', { kinds: 'video' }),
+  { staticFormats: [], videoFormats: ['pmax_video_9_16'], kinds: ['video'] });
 eq('  single coming_soon demandgen → empty',
   pf.resolvePreset('single', 'google_demandgen_1_1', { kinds: 'image' }),
   { staticFormats: [], videoFormats: [], kinds: [] });
@@ -295,6 +393,15 @@ console.log('\nassertGeneratablePlatformFormat — coming_soon is refused');
 {
   let threw = false;
   try {
+    pf.assertGeneratablePlatformFormat('pmax_landscape_1_91_1');
+  } catch (e) {
+    threw = true;
+  }
+  check('  live PMax static is allowed (no throw)', !threw);
+}
+{
+  let threw = false;
+  try {
     pf.assertGeneratablePlatformFormat(null);
     pf.assertGeneratablePlatformFormat(undefined);
     pf.assertGeneratablePlatformFormat('');
@@ -317,7 +424,7 @@ console.log('\nassertGeneratablePlatformFormat — coming_soon is refused');
 console.log('\ncoming_soon never appears in any resolved list or fan-out');
 const allResolved = [];
 for (const preset of pf.PRESET_KEYS) {
-  for (const seed of [...LIVE4, ...COMING, null, 'bogus']) {
+  for (const seed of [...LIVE_ALL, ...COMING, null, 'bogus']) {
     for (const kinds of KIND_OPTS) {
       for (const expand of EXPAND_OPTS) {
         const r = pf.resolvePreset(preset, seed, { kinds, expandStaticFormats: expand });
@@ -336,9 +443,14 @@ check('  no coming_soon in META_STATIC_FANOUT',
   COMING.every((k) => !pf.META_STATIC_FANOUT.includes(k)));
 check('  no coming_soon in META_VIDEO_FANOUT',
   COMING.every((k) => !pf.META_VIDEO_FANOUT.includes(k)));
+// Live PMax statics DO appear in google_static resolve results (already pinned);
+// Demand Gen keys must not.
+check('  Demand Gen + Shorts absent from every resolvePreset result',
+  ['google_demandgen_1_1', 'google_demandgen_4_5', 'google_demandgen_1_91_1', 'google_shorts_9_16']
+    .every((k) => !allResolved.includes(k)));
 
 // Fan-outs themselves only ever return live keys
-for (const k of LIVE4) {
+for (const k of LIVE_ALL) {
   const sf = pf.staticFanoutForPlatformFormat(k);
   const vf = pf.videoFanoutForPlatformFormat(k);
   check(`  staticFanout(${k}) every entry live`, sf.every((x) => pf.isLiveFormat(x)));
@@ -361,7 +473,7 @@ setEq('  videoFanout(stories) is full set',
   pf.videoFanoutForPlatformFormat('meta_stories_9_16'), pf.META_VIDEO_FANOUT);
 setEq('  videoFanout(reels) is full set',
   pf.videoFanoutForPlatformFormat('meta_reels_9_16'), pf.META_VIDEO_FANOUT);
-eq('  videoFanout(pmax) is [] (coming_soon)',
+eq('  videoFanout(pmax_16_9) is [] (coming_soon)',
   pf.videoFanoutForPlatformFormat('pmax_16_9'), []);
 eq('  videoFanout(null) is []', pf.videoFanoutForPlatformFormat(null), []);
 
@@ -437,29 +549,40 @@ console.log('\nformatCatalog() — UI catalog for greyed coming-soon cards');
     }
   }
 
-  // Google formats in the catalog are all coming_soon (stubs for grey cards).
-  check('  every google platform format is coming_soon in catalog',
-    (google?.formats || []).every((f) => f.status === 'coming_soon'));
-  check('  every google preset format is coming_soon in catalog',
-    (google?.presets || []).every((p) =>
-      (p.formats || []).every((f) => f.status === 'coming_soon')));
+  // Phase A: six PMax keys are live in the catalog; Demand Gen + Shorts +
+  // frozen pmax_16_9 stay coming_soon.
+  const gFormats = google?.formats || [];
+  for (const k of LIVE_PMAX) {
+    check(`  catalog ${k} is live`,
+      gFormats.some((f) => f.key === k && f.status === 'live'));
+  }
+  for (const k of COMING) {
+    check(`  catalog ${k} is coming_soon`,
+      gFormats.some((f) => f.key === k && f.status === 'coming_soon'));
+  }
 
   // Meta live formats still live in catalog
   check('  meta catalog has live formats',
     (meta?.formats || []).some((f) => f.status === 'live'));
 
-  // Catalog includes the new PMax stubs and frozen pmax_16_9
-  const gKeys = (google?.formats || []).map((f) => f.key);
-  for (const k of ['pmax_16_9', ...GOOGLE_PMAX_STUBS, 'google_demandgen_1_1', 'google_shorts_9_16']) {
+  // Catalog includes the live PMax set and frozen pmax_16_9
+  const gKeys = gFormats.map((f) => f.key);
+  for (const k of ['pmax_16_9', ...LIVE_PMAX, 'google_demandgen_1_1', 'google_shorts_9_16']) {
     check(`  catalog lists ${k}`, gKeys.includes(k));
   }
 
-  // Preset format lists in catalog are INTENT (unfiltered) so UI can show stubs
+  // Preset format lists in catalog are INTENT (unfiltered) so UI can show cards
   const gStatic = google?.presets.find((p) => p.key === 'google_static');
   check('  google_static catalog shows intended formats (not empty)',
     (gStatic?.formats || []).length > 0);
-  check('  google_static catalog formats are all coming_soon',
-    (gStatic?.formats || []).every((f) => f.status === 'coming_soon'));
+  check('  google_static catalog formats are the three live PMax statics',
+    (gStatic?.formats || []).every((f) => LIVE_PMAX_STATIC.includes(f.key) && f.status === 'live') &&
+    (gStatic?.formats || []).length === 3);
+  const gVideo = google?.presets.find((p) => p.key === 'google_video');
+  check('  google_video catalog shows the two masters (not derive-only 1:1)',
+    (gVideo?.formats || []).every((f) => GOOGLE_VIDEO_MASTERS_EXPECTED.includes(f.key)) &&
+    (gVideo?.formats || []).length === 2 &&
+    !(gVideo?.formats || []).some((f) => f.key === 'pmax_video_1_1'));
 }
 
 // ── static fan-out still holds (regression guard) ───────────────────────
@@ -467,8 +590,13 @@ console.log('\nstatic fan-out still money-safe');
 for (const k of META3) {
   setEq(`  staticFanout(${k})`, pf.staticFanoutForPlatformFormat(k), META3);
 }
-eq('  staticFanout(pmax) empty (coming_soon)', pf.staticFanoutForPlatformFormat('pmax_16_9'), []);
+eq('  staticFanout(pmax_16_9) empty (coming_soon)', pf.staticFanoutForPlatformFormat('pmax_16_9'), []);
 eq('  staticFanout(reels) empty', pf.staticFanoutForPlatformFormat('meta_reels_9_16'), []);
+// Live PMax static single-key: staticFanout returns [that key] only (not the
+// Meta-style three-way fan-out). Multi-surface Google statics come from the
+// google_static *preset*, not from staticFanoutForPlatformFormat.
+eq('  staticFanout(pmax_landscape) is singleton (preset owns the 3-way fan-out)',
+  pf.staticFanoutForPlatformFormat('pmax_landscape_1_91_1'), ['pmax_landscape_1_91_1']);
 check('  META_STATIC_FANOUT returns a copy',
   pf.staticFanoutForPlatformFormat('meta_feed_1_1') !== pf.META_STATIC_FANOUT);
 check('  META_VIDEO_FANOUT returns a copy from videoFanout',

@@ -53,11 +53,29 @@ const meta = cat.platforms.find((p) => p.id === 'meta');
 const google = cat.platforms.find((p) => p.id === 'google');
 check('meta has live formats the SPA can offer',
   (meta?.formats || []).some((f) => f.status === 'live'));
-check('every google platform format is coming_soon (incl. pmax)',
-  (google?.formats || []).length > 0 &&
-  (google.formats || []).every((f) => f.status === 'coming_soon'));
+// Phase A: six PMax keys are live; Demand Gen + Shorts + frozen pmax_16_9
+// remain coming_soon. Do NOT re-assert "every google format is coming_soon".
+const LIVE_PMAX = [
+  'pmax_landscape_1_91_1', 'pmax_square_1_1', 'pmax_portrait_4_5',
+  'pmax_video_16_9', 'pmax_video_1_1', 'pmax_video_9_16'
+];
+const COMING_GOOGLE = [
+  'pmax_16_9',
+  'google_demandgen_1_1', 'google_demandgen_4_5',
+  'google_demandgen_1_91_1', 'google_shorts_9_16'
+];
+const gFormats = google?.formats || [];
+check('google platform formats list is non-empty', gFormats.length > 0);
+for (const k of LIVE_PMAX) {
+  check(`Phase A live PMax key ${k} is live in catalog`,
+    gFormats.some((f) => f.key === k && f.status === 'live'));
+}
+for (const k of COMING_GOOGLE) {
+  check(`still-coming_soon Google key ${k}`,
+    gFormats.some((f) => f.key === k && f.status === 'coming_soon'));
+}
 check('pmax_16_9 is present and coming_soon (the bug the SPA was hardcoding live)',
-  (google?.formats || []).some((f) => f.key === 'pmax_16_9' && f.status === 'coming_soon'));
+  gFormats.some((f) => f.key === 'pmax_16_9' && f.status === 'coming_soon'));
 
 // ── 4. Brand-agnostic / no tenant surface ───────────────────────────
 // formatCatalog is pure in-memory PLATFORM_FORMATS data — no brandId
