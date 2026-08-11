@@ -5,6 +5,82 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-11 (later) — QUOTE QUALITY: retrieval rewritten, then TWO live defects fixed. PRs #120, #121, #133 MERGED
+
+The chain, in order, all merged: **#120** per-surface quote length + two unscoped review-count
+paths; **#121** the retrieval prompt rewritten to the owner's directive; **#133** the two defects
+the first post-deploy run exposed.
+
+### The owner directive that started it (2026-08-10)
+> *"The goal is to find positive statements that help us achieve our goals at different stages of
+> the funnel as well as retention and conquest. Negative statements are not wanted, nor are neutral
+> statements."* … *"statements should be complimentary and complementary to the brand in every sense
+> of the word."*
+
+Measured on Vuori beforehand: of 6 stored brand quotes, **2 were openly negative**, 3 were about a
+different product category, and the one that printed carried a promotional claim nobody chose to
+make. The ad path effectively had **one** usable quote and printed it on every creative. That is
+why "feel like second skin" appeared on everything. `LLM_QUOTE_CAP` (12, validated 1..40) replaced
+the hardcoded `slice(0, 6)`; the cap, not the prompt, was the real ceiling.
+
+### The counterweight that makes a positivity ask safe
+Asking a model for only-flattering quotes creates direct pressure to embellish or invent a
+reviewer, and these are stamped `origin:'llm-web'` and can be typeset verbatim into a PAID ad.
+`keepVerbatimQuotes` — **code, not prompt text** — drops anything the grounded narrative does not
+literally contain. It existed on the category path only; it is now one shared implementation across
+brand, product and category.
+
+### #133 — the two defects, both found by looking at delivered output
+1. **A quote reached an ad mid-sentence.** Pelagic returned *"…these have been keeping me cool in
+   my"*. It passed the verbatim check because it genuinely **is** a substring of the narrative.
+   `completeSentencesOnly` trims back to the last sentence stop the reviewer wrote, or drops it —
+   **selection, not repair**: `completeSentencePrefix` always returns a literal prefix of the input.
+2. **A refresh destroyed stored brand numbers.** Pelagic held 3.2★ / 22 reviews and came back with
+   both null. Grounded search returns the aggregates **independently** of the quotes, so this is
+   drift, not a prompt regression — confirmed by comparing the pre-deploy 09:05 and post-deploy
+   16:45 runs (both logged `✓ brand-reviews: N quote(s)` with no `· X★ · N reviews` suffix).
+
+### The four things adversarial review caught before #133 shipped — worth internalising
+- **An abbreviation is not a sentence end.** A naive trim turns *"Absolutely love Dr. Bronners
+  products and the scent is"* into **"Absolutely love Dr."**
+- **A trim can INVERT the sentiment.** *"I hated the old ones. These are great and soft"* trims to
+  a complete, verbatim, fabricated **negative** endorsement. The kept span is now re-judged with
+  `layoutInputService.hasPositiveSignal` — the render path's own gate, reused so they cannot drift.
+- **The rating/count pair is ONE ATOM.** A per-field carry manufactures a cross-snapshot pair:
+  prior `{4.3, 22}` + fresh `{null, 6000}` stores a 22-review rating beside a 6000 count, and
+  `brandStarFloorForCount` lowers the floor 4.39 → 4.19 above 5000 reviews — printing stars the
+  real snapshot never earned. `resolveAtomicRatingPair` exists to prevent exactly that.
+- **There was a SECOND wholesale-replace write path** (`productMatchService`'s cache write) with the
+  identical bug. Fixing only the enrichment site would have left it fully reachable.
+
+### Retrieval completeness is NOT sufficient — the last cut happens at render
+`selectStaticQuoteText` fell straight through to the ≤50-char curated snippet on overflow, which is
+optimised to be punchy and is therefore often subjectless — that is how *"feel like second skin"*
+got typeset. It now prefers the longest run of whole sentences that fits the cap. `STATIC_FULL_QUOTE=false`
+stays byte-identical. **Video's 50-char overlay is unchanged by owner decision**; the open item there
+is attribution font sizing (*"be mindful of the font sizing for the attribution especially in videos"*).
+
+### Harness lessons repeated three times this session
+- A harness that reimplements the logic it tests passes against the reimplementation. #120 and #133
+  both had to **export the real function** first. §H/§I of `verifyQuoteRetrievalDirective` are
+  behavioural against shipped exports for this reason.
+- **A mutation that does not apply looks like a passing test.** Every mutation run now asserts an
+  exact single match before it counts. One mutation this session (`let staysPositive = false` → `true`)
+  was a no-op against a dead initializer and read as "not caught" until re-aimed at the real gate.
+- Source pins must strip comments **and** assert ordering: a preference that runs after the fallback
+  it is meant to pre-empt can never fire, and a pin that matches its own explanation cannot fail.
+- 17 mutations revert-proven on #133; full suite **90/90**.
+
+### Still open on quote quality
+- `funnelStage` / `conceptAngle` selection is **built but unwired** — `STAGE_TERMS`, `STAGE_WEIGHT`,
+  `ANGLE_WEIGHT`, `BIAS_CAP` exist and **zero callers pass them**. `STAGE_TERMS` also has no
+  retention/conquest terms, which the owner's directive explicitly asks for.
+- Platform-level attribution ("via Reddit") needs **its own sized slot**; appending it to the count
+  line measured 3.35:1 contrast, below the bar.
+- Carried brand numbers ride along un-refetched: the 30-day TTL in `productMatchService` keys off
+  `fetchedAt`, and `numbersFetchedAt` now records the real age but nothing reads it. Bounding that
+  needs an owner call on how stale an aggregate may get.
+
 ## 2026-08-11 — PMAX PHASE A/B LIVE + 3 DEFECTS FOUND BY END-TO-END RENDERING
 
 All merged and deployed. **The offline suite was green for every one of these** — each was found
@@ -324,7 +400,7 @@ byte-identical prior path. Harness `scripts/verifySiteFingerprint.js` 29/29;
 full gate was **78 pass / 0 fail** (now 79 with browser-session harness). Live
 PB5Star / Living Spaces re-runs NOT done here — reviewer should sync those brands.
 
-## 2026-08-10 — `ai_social_proof_led` had all but vanished. TWO causes, both fixed. UNCOMMITTED→branch `fix/restore-social-proof-led`
+## 2026-08-10 — `ai_social_proof_led` had all but vanished. TWO causes, both fixed. MERGED + DEPLOYED + VERIFIED LIVE (PR #110, main `00c991d4`)
 
 Owner: *"I am not seeing AI social proof led static ads being generated, why is that? I was
 seeing them before."* Correct, and **measured** rather than inferred — Render logs
@@ -445,15 +521,94 @@ main, not mine.** It correctly flags
 field, so that read is permanently `undefined` (the silent-`.select()` trap, CLAUDE.md §4).
 Verbatim on `origin/main`; spun out as its own task.
 
+### DEPLOYED AND VERIFIED LIVE — 2026-08-10 (PR #110, main `00c991d4`)
+
+Merged and deployed; web + worker both `live` on `00c991d4` (`dep-d9t1k63l550s73eocn4g`, 18:37:37Z).
+End-to-end run driven through the real wizard on staging (Vuori Clothing → *Tech Waffle Shirt
+Jacket | Dark Salt*, `productId=6a6625155f5af85a46562ec5`, 1:1 image-only, 3 submits ≈ $0.22).
+Run `run_1786388743942_0938c664`.
+
+**RESULT — the headline defect is fixed:**
+
+```
+19:12:04  ai_promotional/1:1       intent=objection_resolved        concept=performance_knit_claim
+19:12:11  ai_editorial/1:1         intent=product_first_lifestyle   concept=versatile_layer_editorial
+19:12:12  ai_social_proof_led/1:1  intent=social_proof_led          concept=brandwide_rating_trust
+FELL BACK count: 0 / 3
+```
+
+Three **distinct** creative styles, **no `ai_brand_led` at all** (it was 200+ vs 18 before), and the
+social-proof ad resolved to `intent=social_proof_led` with **no `fell back from`**. Delivered image
+reads **`4.6 ★ · (15545 BRAND REVIEWS) · "feel like second skin"`** — the scope label rendered
+on-frame by gpt-image-2, verified by eye at full res.
+
+**The MECHANISM is confirmed, not just the outcome.** The product has no rating of its own, and
+`🔒 director scope — 6 brand review(s) withheld from a product concept` fired, so
+`social_proof_signal.rating` was null. `hasUsableProof` therefore could only have been satisfied by
+`optionHasRating` — i.e. **the proof-menu flip is what supplied the proof**, and the reserved slot is
+what consumed it. The Director even named the concept `brandwide_rating_trust`, using the
+brand-scoped framing the menu instructs rather than claiming the number as the SKU's own.
+
+**⚠️ CHANGE C WAS NOT EXERCISED — do not record it as live-proven.** The quote resolved to BRAND
+tier (`quote pool: product=0 category=0 brand=6 comment=0 → winner=brand`,
+`quoteTier=brand`), which pairs with brand numbers through the **pre-existing** coherent path, not
+through the new exception. The exception needs a **comment/product-tier** quote. It remains covered
+by `verifySocialProofRestoration.js` (35 checks) and direct probes only.
+
+**And no brand in this workspace can currently exercise it:** the exception needs a brand rating over
+the 4.39 floor AND a comment-tier quote. GymShark 3.3, Pelagic 3.2, BabyBoo 4.3 are all under the
+floor; Vuori clears it (4.58/15,545) but has only **2** UGC-matched products and both carry their own
+product ratings, so product numbers win. Ubeauty (4.8) has zero catalog products. That is an argument
+for the `brandReviews` backfill already queued elsewhere in this file.
+
 ### Still to do
 
-1. **No live render yet.** Nothing here has produced a real ad.
-2. **Size the re-derive** before deploying (count `CreativeDirectionArtifact` rows).
-3. **First live check:** one `meta_static` run on a brand whose `brandReviews.rating` clears
-   4.39, on a product with **no** product rating but a comment-tier quote — the exact shape
-   that failed. Expect `intent=social_proof_led` with **no** `fell back from`, and stars
-   labelled "brand reviews" beside the quote. 3 billable submits (~$0.22).
-4. Re-run the template-mix log query afterwards to confirm the ratio actually moves.
+1. **Size the re-derive** — still not measured (counting `CreativeDirectionArtifact` rows needs prod
+   DB access). Lower risk than first written: the shadow re-derive is **lazy**, one extra call the
+   first time each product is generated after deploy, not a deploy-time bulk charge.
+2. **Exercise Change C for real** once a brand has both a >4.39 brand rating and comment-tier quotes.
+3. **Re-run the template-mix log query** over a few days to confirm the ratio moves in aggregate —
+   one run with 3 distinct styles is consistent with the fix but is not statistics.
+
+### "Nothing running in Slack" — INVESTIGATED, and the first two diagnoses were WRONG
+
+Owner, during the live run: *"I am not seeing anything running in slack?"* Unrelated to this change
+either way. **Two hypotheses were raised and both are refuted — recorded so nobody re-chases them:**
+
+- ❌ *"WEB boot never logs `🔔 alerts: Slack configured`, so the token is missing."* **Invalid
+  evidence.** That line is emitted **only** by `worker.js:138`. `index.js` never logs it at all, so
+  its absence on WEB says nothing about `SLACK_BOT_TOKEN`. The apparent web/worker asymmetry is an
+  artifact of which file logs, not of configuration.
+- ❌ *"runFeedService fails silently, so a missing token leaves no trace."* **False.**
+  `runFeedService.slackApi` (`:286-335`) logs **every** failure mode with a `📡 runFeed:` prefix —
+  429 + Retry-After, non-2xx, exception/timeout, and the HTTP-200-plus-`{ok:false}` trap CLAUDE.md
+  warns about. `warnUnconfiguredOnce` (`:145`) additionally logs once per process when unconfigured.
+
+**What is actually established.** Both non-secret gates are committed and correct:
+`RUN_FEED_ENABLED=true` (`config/defaults.env:325`) and
+`SLACK_ALERT_CHANNEL_STATUS=C0BMMD5AN84` (`:316`). `isConfigured()` is
+`ENABLED && BOT_TOKEN && CHANNEL`, so the only unverified term is the dashboard secret
+`SLACK_BOT_TOKEN` — **not read** (that env read is blocked; never print it).
+
+**RESOLVED — THERE WAS NO DEFECT. The feed is working; the owner confirmed receiving the status feed.**
+The decisive observation was **zero `📡 runFeed:` lines of any kind on WEB since the 18:37:30
+restart** — no "feed disabled", no 429, no `ok=false`, no `not_in_channel`. A **successful** post logs
+nothing (only failures do), so that silence was evidence *for* the feed working, not against it.
+`SLACK_BOT_TOKEN` on WEB is fine and needs no change.
+
+**METHOD NOTE worth keeping, because this cost real time.** Absence-of-a-log is only evidence if you
+have first confirmed that the code emits that log on the path you are testing. Both wrong hypotheses
+came from skipping that step: one assumed `index.js` logs a line only `worker.js` contains, the other
+assumed silence meant swallowed errors when the code logs every failure and stays quiet on success.
+Grep the emitter before drawing a conclusion from a missing line.
+
+Still fair as a small hardening idea, independent of all the above: have the WEB process log its Slack
+configuration state at boot the way `worker.js:138` does, so this is answerable from a boot log
+instead of by inference.
+
+Also re-observed in the same WEB boot log, both already known-open above and neither addressed here:
+`RENDER_AUTH_TOKEN` is **EXPIRED** (`exp=2026-05-07`), and `FRONTEND_URL` still points at
+`https://liquidretail.netlify.app`, the **stale** pre-transfer Netlify site.
 
 ### Also corrected here — the `wantGpt` hypothesis (carried over from `fix/brand-led-static-copy`)
 
