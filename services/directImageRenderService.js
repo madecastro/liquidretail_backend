@@ -1233,6 +1233,9 @@ async function renderDirectImage({
   // threads platformFormat through ...args and defaults it to meta_feed_1_1, so
   // this is a rename at the boundary, not a new requirement on callers.
   platformFormat = 'meta_feed_1_1',
+  // Lifestyle/UGC scene-preserve gate (STATIC_LIFESTYLE_PRESERVE). Threaded
+  // from Ad.variantKind; seed style is resolved from the media doc below.
+  variantKind = null,
   // Regenerate hooks (adRegenerateService.runImage). Neither is charged until
   // the single editImage submit below — they only rewrite the prompt string.
   //   operatorPrompt     — refinement note appended to the auto-built prompt
@@ -1256,7 +1259,9 @@ async function renderDirectImage({
     resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
     brandId ? Brand.findById(brandId).lean() : null,
     productId ? CatalogProduct.findById(productId).select('title imageUrl rating productReviews').lean() : null,
-    mediaId ? Media.findById(mediaId).select('fileUrl').lean() : null
+    // classification + technicalInsights feed resolveSeedStyle for the
+    // lifestyle scene-preserve branch (STATIC_LIFESTYLE_PRESERVE).
+    mediaId ? Media.findById(mediaId).select('fileUrl classification technicalInsights').lean() : null
   ]);
   // A missing layout artifact is recoverable: everything it supplies has a
   // source of its own. brand/product come from the explicit args, and themeFor
@@ -1401,6 +1406,10 @@ async function renderDirectImage({
     product: resolvedProduct,
     cta: effectiveLayout.input?.cta?.text
   });
+  // Lifestyle/UGC scene preserve — intent still owns copy; only the scene
+  // fidelity opening swaps when the flag is on (staticAdIntents).
+  const { resolveSeedStyle } = require('./imageShotHeuristicService');
+  const seedStyle = resolveSeedStyle(media);
   const built = intents.buildPrompt({
     intentKey,
     data: intentData,
@@ -1409,7 +1418,9 @@ async function renderDirectImage({
       look: conceptLook(concept),
       logoCorner: 'bottom-right'
     },
-    surface
+    surface,
+    seedStyle,
+    variantKind
   });
   // A surface that takes no static image is a routing fact, not a failure —
   // meta_reels_9_16 is declared kinds:['video'] in platformFormats.

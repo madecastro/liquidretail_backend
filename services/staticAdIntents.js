@@ -752,6 +752,18 @@ function applyDensity(text, spec, policy) {
 const FIDELITY_HARDENING = process.env.STATIC_PROMPT_FIDELITY_HARDENING !== 'false';
 
 /**
+ * LIFESTYLE / UGC SCENE PRESERVE — kill switch, default OFF.
+ *
+ * When on, lifestyle seeds (`resolveSeedStyle === 'lifestyle'`) and
+ * `variantKind === 'ugc'` swap the scene-building fidelity opening for
+ * SCENE_PRESERVE. Intent selection, copy roles, and copy order are untouched
+ * — only scene treatment changes. Flag-off ⇒ every existing prompt is
+ * **byte-identical** (no preserve branch runs). Exact string `'true'` enables;
+ * unset/empty/false stay off.
+ */
+const LIFESTYLE_PRESERVE = process.env.STATIC_LIFESTYLE_PRESERVE === 'true';
+
+/**
  * BRAND-LED COPY — kill switch, default ON.
  *
  * `false` restores a **byte-identical** pre-change prompt because the
@@ -846,7 +858,59 @@ ADVERTISING QUALITY. This has to read as work a premium creative agency shipped,
 
 BEFORE YOU FINISH, check three things. The product: a customer would recognise it as the identical physical item; nothing has been redesigned, added, removed, recoloured or reshaped; and colour, branding, materials and construction all match the reference. The framing: the item occupies roughly the same share of the frame as it does in the reference, and the whole image could pass as another photograph of that same item taken in a new commercial shoot. The copy: every string you were given below appears exactly once, spelled exactly as given, and no other text appears anywhere. If any check fails, correct it before finishing the advertisement.`;
 
-function buildPrompt({ intentKey, data, product, surface }) {
+/**
+ * SCENE PRESERVE — lifestyle / UGC static modifier (flag-gated).
+ *
+ * Replaces PRODUCT_FIDELITY / LEGACY when the seed is a lifestyle photograph or
+ * the ad is UGC. Those blocks open on "build an entirely new scene" — stacking
+ * preserve language on top would contradict them. This block carries every
+ * product-identity clause (form, construction, materials, surface, colour,
+ * on-item graphics, details, condition) while forbidding any change to the
+ * photograph's pixels. Intent still owns all copy roles and their order.
+ *
+ * Geometry (computeSurface / geometryBlock) is unchanged: the existing
+ * "photograph should still fill the whole frame edge to edge" language is
+ * compatible with preserve and is NOT reworded here.
+ */
+const SCENE_PRESERVE = `SCENE PRESERVE — HIGHEST PRIORITY. The supplied photograph is the finished plate. Scene, subject identity, pose, crop, lighting, shadows, colour grade, depth of field and camera angle stay EXACTLY as the reference shows. Do not rebuild, restyle, re-light, recolour, extend, blur or replace the background. Do not change wardrobe, props or environment. Do not restage the product. Do not invent a second location. Do not recompose, re-crop, re-pose, or re-shoot. Wherever scene preservation conflicts with a creative or styling instruction below, scene preservation wins. This does not relax the text instructions below, which are absolute in their own right, and it does not override the reserved-corner rule or the FORMAT block below.
+
+PRODUCT IDENTITY — ABSOLUTE. The item in the photograph is immutable. Reproduce this exact physical product; never redesign, reinterpret, simplify, modernise, improve, repair, stylise, approximate or substitute any part of it. Do not infer the product from its category or from brand priors — if the reference disagrees with what products of this type usually look like, the reference is correct.
+PRESERVE EXACTLY, as the reference shows the product:
+  — Form: shape, proportions, overall dimensions, silhouette, geometry, profile, contours, edges, thickness, volume and curvature.
+  — Construction: seams, stitching, panel layout, assembly, joints, fasteners, hardware, hinges, closures, buttons, buckles, snaps, zips, clasps, laces, eyelets, straps, handles.
+  — Materials: fabric, knit, mesh, leather, suede, rubber, plastic, metal, wood, glass, ceramic, gemstone, carbon fibre, foam, paper and packaging material — each the same material the reference shows.
+  — Surface: texture, weave, grain, gloss, matte, satin, brushed and polished finishes, transparency, opacity, reflectivity.
+  — Colour: the item's own colours exactly. Do not shift hue, recolour, bleach, tint, darken, brighten, saturate or desaturate the product.
+  — Graphics already on the item: logos, branding, icons, artwork, patterns, prints, typography, embroidery, embossing, debossing, engraving, decals, labels and tags — same wording, same lettering, same placement, same scale. Reproduce from the reference; never redraw from imagination; never add, remove or modify branding.
+  — Details, including but not limited to: pockets, collars, sleeves, cuffs, necklines, hems, soles, heels, eyelets, handles, bezels, displays, screens, lenses, caps, applicators, chains, gemstones, watch faces, grips, blades, wheels, buttons, ports, vents and sensors. Every feature visible in the reference must appear unchanged; no feature absent from the reference may be added.
+  — Condition: wrinkles, folds, creases, wear, polish, finish, surface imperfections, and the shadows the item casts on itself. Do not "improve" the item.
+
+COMPOSITING ONLY. Your job is to typeset the exact strings listed below into the safe box as advertisement chrome (type and optional soft scrim or panel behind type where legibility over a busy photograph demands it). A soft scrim or panel behind type IS permitted — that is chrome, not a change to the photograph. Inventiveness lives in typography and chrome treatment only, never in the pixels of the scene. Do not invent a new photoshoot of a similar scene.
+
+WHAT MAY CHANGE: letterforms and any non-photo chrome required to set those strings (including a soft legibility scrim/panel). Nothing else about the photograph's pixels may change.
+
+BEFORE YOU FINISH: a side-by-side with the reference should read as the same photograph with copy overlaid — not a new photoshoot of a similar scene. Product identity, scene, pose, light and crop all match the reference; every supplied string appears exactly once; no other text appears.`;
+
+/**
+ * Pure gate for the lifestyle/UGC scene-preserve branch.
+ * Flag must be on; then lifestyle seed style OR ugc variantKind.
+ * Never packshot / flat_lay / detail / packaging / unknown / ambiguous.
+ */
+function shouldPreserveScene({ seedStyle = null, variantKind = null } = {}) {
+  if (!LIFESTYLE_PRESERVE) return false;
+  if (variantKind === 'ugc') return true;
+  if (seedStyle === 'lifestyle') return true;
+  return false;
+}
+
+function buildPrompt({ intentKey, data, product, surface, seedStyle = null, variantKind = null, preserveScene = null }) {
+  // preserveScene boolean wins when explicitly passed (harness / callers);
+  // otherwise derive from seedStyle + variantKind under the flag.
+  const preserve = preserveScene === true
+    ? LIFESTYLE_PRESERVE
+    : preserveScene === false
+      ? false
+      : shouldPreserveScene({ seedStyle, variantKind });
   const policy = SURFACE_POLICY[surface];
   if (!policy) return { error: `unknown surface ${surface}` };
   if (!policy.static) return { skipped: policy.skipReason, surfaceKey: surface };
@@ -962,9 +1026,25 @@ Set no other words, numerals or letterforms anywhere in the image — including 
     if (notes) platformNotesBlock = `\n\n${notes}`;
   }
 
+  // Fidelity / scene block. Preserve replaces the whole scene-building
+  // opening (PRODUCT_FIDELITY or LEGACY) — they cannot be stacked.
+  // Flag-off leaves this branch unreachable → byte-identical prompts.
+  const fidelityBlock = preserve
+    ? SCENE_PRESERVE
+    : (FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY);
+
+  // Creative-freedom paragraph. Preserve locks photography; inventiveness
+  // is typography/chrome only. Scene-build arm is the pre-existing text
+  // (byte-identical when preserve is false).
+  const decideBlock = preserve
+    ? (kept.length
+      ? `COMPOSITING ONLY — you decide typeface and weight, the scale and colour of every text element, whether copy sits on a soft scrim or panel for legibility or in clear space, and where each element goes inside the safe box. The photograph is finished: inventiveness belongs only in typography and chrome, never in the pixels of the scene.`
+      : `COMPOSITING ONLY — the photograph is finished and this ad carries no text. Inventiveness is not invited; leave the plate as the reference shows it.`)
+    : `YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, ${personClause}lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.`;
+
   const prompt = `${rolePreamble}Produce a finished, ready-to-publish direct-response advertisement for ${s.label}.
 
-${FIDELITY_HARDENING ? PRODUCT_FIDELITY : LEGACY_PRODUCT_FIDELITY}
+${fidelityBlock}
 
 PRODUCT: ${product.desc}
 
@@ -976,7 +1056,7 @@ That is an order of importance, not a layout, and not a checklist. Express it ho
 
 ${textBlock}
 
-YOU DECIDE EVERYTHING ELSE: composition and crop, camera angle and distance, ${personClause}lighting and mood${kept.length ? ', typeface and weight, the scale and colour of every text element, whether copy sits on a panel or in clear space, and where each element goes' : ''}. ${product.look ? `The brand's world is: ${product.look}. Work within it, and beyond that use your own judgement — ` : 'Use your own judgement — '}make it look like a campaign a good agency shipped, not a template that was filled in. Inventiveness belongs in the photography, the light and the typography — never in the claims.
+${decideBlock}
 
 THIS PRODUCT HAS NONE OF THE FOLLOWING, so none of it may appear:
 ${absent.map(a => `  — ${a}`).join('\n')}
@@ -986,7 +1066,17 @@ Keep the ${product.logoCorner || 'bottom-right'} corner clear of text and graphi
 
 ${geometryBlock(s)}${platformNotesBlock}`;
 
-  return { prompt, resolved, absent, emphasis, text: kept, dropped, surface: s, policy: effectivePolicy };
+  return {
+    prompt,
+    resolved,
+    absent,
+    emphasis,
+    text: kept,
+    dropped,
+    surface: s,
+    policy: effectivePolicy,
+    preserveScene: preserve
+  };
 }
 
 module.exports = {
@@ -996,6 +1086,9 @@ module.exports = {
   FALLBACK_ORDER,
   buildPrompt,
   PRODUCT_FIDELITY,
+  SCENE_PRESERVE,
+  LIFESTYLE_PRESERVE,
+  shouldPreserveScene,
   resolveIntent,
   absences,
   applyDensity,
