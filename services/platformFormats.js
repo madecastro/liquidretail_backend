@@ -401,6 +401,29 @@ function filterLiveFormats(keys) {
   return (keys || []).filter((k) => isLiveFormat(k));
 }
 
+// Canonical form for an operator-supplied list of format keys (preset
+// 'explicit'). Strings, trimmed, blanks dropped, ORDER PRESERVED.
+//
+// THE DEDUPE IS A MONEY GUARD, not tidiness. Every entry surviving into
+// staticFormats becomes its own billable image generation per concept, so a
+// client that sent ['meta_feed_1_1','meta_feed_1_1'] — trivially reachable from
+// a checkbox bug or a double-appended state update — would be charged twice for
+// one surface and deliver two identical ads. Non-array input yields [] so a
+// malformed body queues nothing rather than falling back to a wider set.
+function canonicalFormatList(keys) {
+  if (!Array.isArray(keys)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of keys) {
+    if (raw == null) continue;
+    const s = String(raw).trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
 // The Meta static surfaces that ONE "static ads" selection fans out to, so an
 // operator picking static gets every size they actually run, not just the one
 // they happened to click. Owner-set 2026-07-31.
@@ -522,6 +545,10 @@ const GOOGLE_VIDEO_MASTERS = ['pmax_video_9_16', 'pmax_video_16_9'];
 //   google_static — 3 billable PMax static sizes per concept
 //   google_video  — 2 billable Omni masters per product (9:16 + 16:9); 1:1 is derive-only
 //   google_all    — both of the above
+//   explicit      — operator MULTI-SELECT: exactly the surfaces named in
+//                   opts.staticFormats / opts.videoFormats. Static bills per
+//                   surface; VIDEO is clamped PER PLATFORM to that platform's
+//                   billable master(s) — see resolveExplicitFormats.
 //   single        — back-compat: reproduce prior three-knob behaviour exactly
 //
 // coming_soon formats never appear in any resolved list.
@@ -556,6 +583,11 @@ const PRESETS = {
     label:       'Google All',
     description: 'PMax static fan-out + two PMax video masters per product.'
   },
+  explicit: {
+    platform:    null,
+    label:       'Selected sizes',
+    description: 'Exactly the sizes the operator ticked. Each static size is its own generation; video stays one master.'
+  },
   single: {
     platform:    null,
     label:       'Single format',
@@ -572,6 +604,94 @@ const PLATFORM_PRESET_KEYS = {
 };
 
 /**
+ * Resolve an operator MULTI-SELECT (preset 'explicit') into the concrete format
+ * lists the expansion will queue. Pure, total, and safe on hostile input.
+ *
+ * Exported ON PURPOSE, and the reason is a money bug rather than tidiness: the
+ * /generate duplicate gate must fingerprint the surfaces a request will actually
+ * BILL FOR, not the raw arrays the client happened to send. Hashing the raw body
+ * means two bodies that resolve to the identical billable set — e.g.
+ * ['meta_feed_1_1'] vs ['meta_feed_1_1','meta_reels_9_16'], where Reels carries
+ * no static image and is dropped — fingerprint differently, so a real
+ * double-click is not recognised as one and the second click bills a second full
+ * set of static generations. Static has no cross-run collision protection
+ * (its identityDigest is scoped to generationRunId), so that is real money.
+ * Route and resolver therefore share THIS function; a second copy of the
+ * filtering rules would re-open the gap the first time the two drifted.
+ *
+ * @param {object} [opts]
+ * @param {string[]} [opts.staticFormats] ticked static surfaces
+ * @param {string[]} [opts.videoFormats]  ticked video surfaces
+ * @returns {{ staticFormats: string[], videoFormats: string[], kinds: string[] }}
+ */
+function resolveExplicitFormats(opts = {}) {
+  // STATIC — one billable image generation PER SURFACE, per concept. Dedupe
+  // (canonicalFormatList) is the money guard; the capability filter drops a
+  // surface that ships no static image at all (Reels); filterLiveFormats drops
+  // coming_soon. ORDER PRESERVED — it does not affect output, and preserving it
+  // keeps the resolved list readable in logs.
+  const staticFormats = filterLiveFormats(canonicalFormatList(opts.staticFormats))
+    .filter((k) => kindsForPlatformFormat(k).includes('image'));
+
+  // VIDEO — CLAMPED TO AT MOST ONE ENTRY, however many aspects were ticked.
+  // Video is clamped PER PLATFORM to that platform's BILLABLE MASTERS, because
+  // the two platforms genuinely differ and collapsing them is a money bug in
+  // one direction or the other:
+  //
+  //   META  — ONE 9:16 master per product; 1:1, 4:5 and Reels are cropped from
+  //     it at titling. One video Ad per ticked aspect is the money bug CLAUDE.md
+  //     §2 records as MEASURED in production on 2026-08-01.
+  //   GOOGLE PMax — TWO masters (9:16 + 16:9). This is NOT a regression of the
+  //     Meta rule: a 16:9 landscape cannot be cropped out of a 9:16 vertical
+  //     without losing the subject, so it is a second real submit. Its 1:1 IS a
+  //     free crop, which is why pmax_video_1_1 is DERIVE-ONLY and must never
+  //     appear here — emitting it would be a third billable Omni submit.
+  //
+  // So a global "clamp to one" would under-generate PMax, and "honour every
+  // tick" would over-bill Meta. Partition, then apply each platform's rule.
+  //
+  // ORDER-INSENSITIVE by construction, and that is load-bearing rather than
+  // stylistic: the duplicate gate hashes this list as a SET, so if resolution
+  // were order-sensitive (first-ticked wins) then ['a','b'] and ['b','a'] would
+  // queue DIFFERENT plates while sharing one fingerprint — and the second
+  // request would be refused as a duplicate of a run that generated something
+  // else. Meta ties break to the master then alphabetically; Google emits its
+  // masters in canonical GOOGLE_VIDEO_MASTERS order.
+  const videoWanted = filterLiveFormats(canonicalFormatList(opts.videoFormats))
+    .filter((k) => kindsForPlatformFormat(k).includes('video'));
+
+  const metaWanted = videoWanted.filter((k) => platformForFormat(k) === 'meta');
+  let videoFormats = [];
+  if (metaWanted.length === 1) {
+    // Byte-identical to what preset 'single' would have queued for that surface.
+    videoFormats.push(metaWanted[0]);
+  } else if (metaWanted.length > 1) {
+    videoFormats.push(
+      metaWanted.includes(META_VIDEO_MASTER)
+        ? META_VIDEO_MASTER
+        : [...metaWanted].sort()[0]
+    );
+  }
+
+  // Google: only the billable masters survive, in canonical order. A ticked
+  // derive-only surface (pmax_video_1_1) resolves to NOTHING on its own rather
+  // than silently promoting a master the operator never asked to pay for — the
+  // wizard does not offer a video tick on it, so this is the hand-rolled-request
+  // path, and an honest empty is better than implicit spend.
+  const googleWanted = new Set(
+    videoWanted.filter((k) => platformForFormat(k) === 'google')
+  );
+  for (const master of GOOGLE_VIDEO_MASTERS) {
+    if (googleWanted.has(master) && isLiveFormat(master)) videoFormats.push(master);
+  }
+
+  const kinds = [];
+  if (staticFormats.length) kinds.push('image');
+  if (videoFormats.length) kinds.push('video');
+  return { staticFormats, videoFormats, kinds };
+}
+
+/**
  * Resolve a wizard preset into the concrete format lists expandWizardJob queues.
  *
  * @param {string} preset            one of PRESET_KEYS; unknown → treated as 'single'
@@ -579,6 +699,8 @@ const PLATFORM_PRESET_KEYS = {
  * @param {object} [opts]
  * @param {string|null} [opts.kinds]              'image'|'video'|'both'|null — 'single' only
  * @param {boolean} [opts.expandStaticFormats]    'single' only; default false
+ * @param {string[]} [opts.staticFormats]         'explicit' only — ticked static surfaces
+ * @param {string[]} [opts.videoFormats]          'explicit' only — ticked video surfaces
  * @returns {{ staticFormats: string[], videoFormats: string[], kinds: string[] }}
  *
  * MONEY:
@@ -588,7 +710,19 @@ const PLATFORM_PRESET_KEYS = {
  *   google_static → 3 billable image submits per concept
  *   google_video  → 2 billable Omni masters per product (9:16 + 16:9; not the 1:1)
  *   google_all    → both Google static + video masters
- * Never emit a coming_soon key.
+ *   explicit      → one billable image submit per ticked static surface per
+ *                   concept; video clamped PER PLATFORM to that platform's
+ *                   billable master(s) — at most 1 Meta + at most the 2 Google
+ *                   masters, and NEVER the derive-only pmax_video_1_1
+ * Never emit a coming_soon key, and never emit a derive-only key.
+ *
+ * THE VIDEO RULE IS PER-PLATFORM, not a global count. Meta ships ONE 9:16
+ * master and crops the rest; PMax legitimately needs TWO (9:16 + 16:9) because
+ * a 16:9 landscape cannot be cropped from a 9:16 vertical without losing the
+ * subject, while its 1:1 IS a free crop. So "clamp video to one entry" — true
+ * for Meta — would UNDER-generate PMax, and "one submit per ticked aspect" would
+ * OVER-bill Meta. Both directions are money bugs; the partition in
+ * resolveExplicitFormats is what keeps each platform honest.
  */
 function resolvePreset(preset, platformFormat, opts = {}) {
   const { kinds = null, expandStaticFormats = false } = opts;
@@ -670,6 +804,35 @@ function resolvePreset(preset, platformFormat, opts = {}) {
     if (staticFormats.length) kindsOut.push('image');
     if (videoFormats.length) kindsOut.push('video');
     return { staticFormats, videoFormats, kinds: kindsOut };
+  }
+
+  if (name === 'explicit') {
+    // OPERATOR MULTI-SELECT. The wizard's size cards are checkboxes, so the
+    // request names a SET of surfaces rather than one platformFormat. The two
+    // sides of that set have completely different money shapes and are
+    // deliberately NOT symmetrical:
+    //
+    // STATIC — one billable image generation PER SURFACE, per concept. That is
+    //   the same cost shape as meta_static and it is intended: the image model
+    //   typesets the copy into the pixels, so each size must be generated for
+    //   its own safe box (see META_STATIC_FANOUT above). Ticking three static
+    //   sizes really does mean 3x the image spend.
+    //
+    // VIDEO — CLAMPED TO AT MOST ONE ENTRY, no matter how many video surfaces
+    //   were ticked. The pipeline ships ONE Omni 9:16 master per product and
+    //   derives the other aspects by cropping at titling time; queueing one
+    //   video Ad per ticked aspect is the money bug CLAUDE.md §2 records as
+    //   MEASURED IN PRODUCTION on 2026-08-01 ("1:1 + 4:5 + 9:16 = three
+    //   separate video submits ... is a money bug if reintroduced"). A
+    //   multi-select UI is exactly how that would come back, so the clamp
+    //   lives here in the resolver — not in the route and not in the client,
+    //   either of which a future caller could bypass.
+    //
+    // Clamp rule — see resolveExplicitFormats, which owns it so the duplicate-
+    // request gate can normalise a body through the SAME code the expansion
+    // uses. Two implementations of "which surfaces will this bill for" is how
+    // the gate ends up hashing something the expansion does not generate.
+    return resolveExplicitFormats(opts);
   }
 
   // ── 'single' — exact reproduction of pre-preset three-knob behaviour ──
@@ -867,6 +1030,7 @@ module.exports = {
   PRESET_KEYS,
   PLATFORM_PRESET_KEYS,
   resolvePreset,
+  resolveExplicitFormats,
   assertGeneratablePlatformFormat,
   formatCatalog
 };

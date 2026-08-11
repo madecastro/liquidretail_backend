@@ -556,6 +556,17 @@ async function expandWizardJob({
   //   meta_all      — both
   //   google_static / google_video / google_all — empty while Google is coming_soon
   preset = 'single',
+  // Operator MULTI-SELECT surfaces — preset 'explicit' ONLY (ignored by every
+  // named preset and by 'single'). The wizard's size cards are checkboxes, so
+  // the request names a set of surfaces instead of one platformFormat.
+  //
+  // MONEY: each surviving staticFormats entry is its own billable image
+  // generation per concept. videoFormats is CLAMPED to at most one entry inside
+  // resolvePreset — one video Ad per ticked aspect is a measured money bug
+  // (CLAUDE.md §2), and the clamp deliberately lives in the resolver so no
+  // caller can route around it.
+  staticFormats = [],
+  videoFormats = [],
   // Operator opted into "All static formats" in the wizard. When true, every
   // image concept is emitted once per Meta static surface
   // (staticFanoutForPlatformFormat) instead of once for platformFormat alone.
@@ -744,7 +755,9 @@ async function expandWizardJob({
   // master lands.
   const resolvedPreset = resolvePreset(preset || 'single', effectivePlatformFormat, {
     kinds: requestedKinds,
-    expandStaticFormats: !!expandStaticFormats
+    expandStaticFormats: !!expandStaticFormats,
+    staticFormats,
+    videoFormats
   });
   let resolvedKinds = [...resolvedPreset.kinds];
   // Static surfaces each image concept is emitted for. Empty means "use the

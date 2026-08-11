@@ -135,7 +135,20 @@ function normalizeProductIdList(list) {
 //     campaignAdsGenerationService.js:1728-1730), so re-ordering picks really is
 //     a different request.
 
-const FINGERPRINT_VERSION = 'req:v1';
+// Bump whenever the FIELD SET below changes. Adding a part to `parts` already
+// changes every hash, so the version is not what breaks continuity — it is what
+// makes the break legible instead of looking like a hash collision bug.
+//
+// v2 (2026-08-11) added staticFormats / videoFormats for the wizard's
+// multi-select sizes. TWO one-time transients on the deploy that ships it, both
+// accepted:
+//   * an in-flight run minted under v1 no longer matches a v1-identical repeat,
+//     so a double-click inside the ~REAP_STALE_MIN (15 min) window can bill
+//     twice. Bounded by that window and by the (campaignId, identityDigest)
+//     unique index, which protects VIDEO regardless of this gate.
+//   * the "you already ran this" notice stops matching pre-deploy runs for
+//     DUPLICATE_LOOKBACK_MIN (24h). Cosmetic — it is a notice, not a block.
+const FINGERPRINT_VERSION = 'req:v2';
 
 /** Faithful canonical id list: stringified, trimmed, blanks dropped, deduped. */
 function canonicalIdList(list, { sort = false } = {}) {
@@ -210,6 +223,14 @@ function computeRequestFingerprint(request = {}) {
     // Scalar-or-array — see canonicalScalarOrList. The route sends a scalar.
     canonicalScalarOrList(r.kinds).join(','),
     r.expandStaticFormats ? '1' : '0',
+    // Operator multi-select surfaces (preset 'explicit'). SORTED: these name a
+    // SET of surfaces, and each expands independently, so tick order cannot
+    // change the output — the same reasoning as productIds / templateIds. They
+    // ARE read by the handler (forwarded into resolvePreset), so leaving them
+    // out would collapse a 1-size and a 3-size request — a 1x and a 3x image
+    // bill — onto one hash and refuse the second as a duplicate.
+    canonicalIdList(r.staticFormats, { sort: true }).join(','),
+    canonicalIdList(r.videoFormats, { sort: true }).join(','),
     // ── the media pool the expansion draws from
     r.includeCategoryMatched ? '1' : '0',
     r.includeBrandMatched ? '1' : '0',
