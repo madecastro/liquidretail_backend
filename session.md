@@ -1964,6 +1964,46 @@ to that entry's index instead of a parallel single-tile hack. `tsc -b --noEmit` 
 
 ## Next-session prompt
 
+**2026-08-11 — mixed Meta+PMax video was silently dropping the Meta master. FIXED, MERGED (#145), on `main`.**
+
+The wizard offers "All video" per platform and they are combinable, so ticking both is the
+advertised flow. `resolveDeterministicVideoMasterFormats` did
+`if (googleMasters.length) return googleMasters` — so ANY Google master discarded the Meta one.
+A mixed run billed 2 Omni submits, produced **zero Meta video**, and the wizard quoted 3.
+Now partitions per platform. Behaviour: Meta-only 1 master; PMax-only 2 + free 1:1;
+mixed 3 + free 1:1; PMax-16:9-only 1 and NO free square (the crop needs the 9:16).
+
+**Three things worth knowing before touching this again:**
+
+1. **`isGoogleVideoMasterRun` no longer requires every master to be Google** — only that the
+   crop's source (`pmax_video_9_16`) is present. Widening it is safe (deriving never calls
+   Omni) but it opened a second hole: the funnel-variant mint looped over ALL `masterFormats`
+   inside the googleRun branch and began minting Meta funnel rows. Those are not merely
+   wasteful — `funnelStage` is not part of a Meta identity digest so they collapse onto the
+   Meta master and get swallowed, BUT `resolveDeriveFromMaster` returns null for a Meta
+   platformFormat even with a stage set, so any that DID insert would take the **billable**
+   path. Loop and dry-run count are both scoped to Google masters now.
+2. **The whole 103-script suite passed both before and after the original bug.** Nothing pinned
+   the mixed case. `scripts/verifyMixedPlatformVideo.js` (24 checks) now does, revert-proven
+   against six mutations. Note mutation 3 (removing ONE of the two overlapping derive-only
+   guards) passes by design — that is recorded in the harness header rather than hidden.
+3. **`verifyPmaxFunnelVariants` M1 is a source-PROXIMITY check** (200 chars between
+   `isPmaxFunnelVariantsEnabled()` and `PMAX_FUNNEL_STAGES.length`). A comment wedged between
+   them fails it. Keep explanatory prose above the gate, not inside it.
+
+**`formatEntry()` now publishes `safeAreaPct`** (fractions of frame height) so the ad-preview
+chrome draws its guardrail from the real clamp. NORMALISED on purpose: raw `safeArea` is
+CANVAS-space (width-normalised to 1000), not `deliveryDims` — `pmax_video_16_9` is 20% of its
+canvas vs 10.5% of delivery. Publishing raw pixels without `canvas` hands every consumer that
+trap. Frontend counterpart merged as `liquidretail#44`.
+
+Full suite **106/106** on merged `main` (composes with the lifestyle-preserve work in #144,
+which landed in the same window).
+
+---
+
+## Next-session prompt
+
 **NEWEST — 2026-08-11: the wizard format picker is MULTI-SELECT. SHIPPED,
 MERGED AND DEPLOYED to both services and to staging. Verified live.**
 
