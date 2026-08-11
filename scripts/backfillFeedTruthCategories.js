@@ -62,8 +62,15 @@ async function main() {
 
   // Only rows with a non-empty feed category — no feed string, no
   // feed truth. The inferred path stays authoritative for those.
+  //
+  // Uses $type:'string' + $ne:'' rather than the naive
+  // { $ne: null, $ne: '' } — the latter is a JS object-literal trap
+  // (the second $ne key overwrites the first at construction) and
+  // silently lets null values through. Symptom in the first dry-run:
+  // 35 rows reported "resolver returned empty" because null category
+  // passed the filter and then bailed inside resolveFeedCategoryRef.
   const filter = {
-    category: { $exists: true, $ne: null, $ne: '' }
+    category: { $type: 'string', $ne: '' }
   };
   if (args.brand) {
     const brand = await Brand.findOne({ name: new RegExp(`^${escapeRegex(args.brand)}$`, 'i') }).lean();
@@ -89,6 +96,11 @@ async function main() {
     resolverEmpty:     0,   // feedCategory resolved to no id (shouldn't happen for non-empty strings)
     errors:            0
   };
+  // Sample of feed strings that resolver returned null for — helps
+  // catch shape edge-cases (whitespace-only, ">>>", non-string). Cap
+  // so a large brand doesn't flood the log.
+  const resolverEmptySamples = [];
+  const RESOLVER_EMPTY_SAMPLE_CAP = 10;
   let processed = 0;
 
   const cursor = CatalogProduct.find(filter)
@@ -107,8 +119,13 @@ async function main() {
 
       if (!feedRef?.categoryId) {
         // resolveFeedCategoryRef returns null on empty/invalid input;
-        // shouldn't happen with the filter above but count for accuracy.
+        // shouldn't happen with the filter above but count for
+        // accuracy AND log a sample so a real shape edge-case (e.g.
+        // ">>>", whitespace-only) doesn't stay invisible.
         counts.resolverEmpty++;
+        if (resolverEmptySamples.length < RESOLVER_EMPTY_SAMPLE_CAP) {
+          resolverEmptySamples.push({ id: String(product._id), category: product.category });
+        }
         continue;
       }
 
@@ -158,7 +175,15 @@ async function main() {
   console.log(`\nDone. ${processed}/${total} products processed.`);
   console.log(`   backfilled to feed truth: ${counts.backfilled}${args.dryRun ? ' (would be)' : ''}`);
   console.log(`   already feed truth:       ${counts.alreadyFeedTruth}`);
-  if (counts.resolverEmpty) console.log(`   resolver returned empty:  ${counts.resolverEmpty}`);
+  if (counts.resolverEmpty) {
+    console.log(`   resolver returned empty:  ${counts.resolverEmpty}`);
+    if (resolverEmptySamples.length) {
+      console.log(`   sample offending values (up to ${RESOLVER_EMPTY_SAMPLE_CAP}):`);
+      for (const s of resolverEmptySamples) {
+        console.log(`     - ${s.id}  category=${JSON.stringify(s.category)}`);
+      }
+    }
+  }
   if (counts.errors)        console.log(`   errors:                   ${counts.errors}`);
 
   await mongoose.disconnect();
