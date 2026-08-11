@@ -820,23 +820,40 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
                   required: ['text']
                 }
               },
+              // REQUIRED, and NOT nullable — this is the whole fix.
+              //
+              // Declared optional, Gemini structured output simply DID NOT EMIT IT.
+              // Measured: the identical prompt against the same model returns all four
+              // aggregates when no responseSchema constrains the call, and returns none
+              // when this property is optional. So pass 1 wrote
+              // "Vuoriclothing.com: 4.58 out of 5 from 15,626 reviews / Trustpilot: 2.3
+              // from 126 / WorthEPenny: 3.8 from 28 / Thingtesting: 4 from 137", pass 2
+              // read it, and the schema dropped every one on the floor — the brand came
+              // back with no rating at all and the picker had nothing to rank.
+              //
+              // An empty array is how "no aggregates found" is expressed; that is a
+              // different statement from "the field is absent", and only the required
+              // form makes the model commit to one of them.
               ratings: {
                 type: 'array',
-                nullable: true,
                 items: {
                   type: 'object',
                   properties: {
                     source:      { type: 'string', nullable: true },
-                    rating:      { type: 'number', nullable: true },
+                    // Non-nullable: an entry with no number is not an aggregate. A
+                    // source with a non-numeric grade (BBB's "A+") is correctly omitted
+                    // rather than emitted as a null the picker has to filter out.
+                    rating:      { type: 'number' },
                     reviewCount: { type: 'number', nullable: true }
-                  }
+                  },
+                  required: ['rating']
                 }
               },
               rating:      { type: 'number',  nullable: true },
               reviewCount: { type: 'integer', nullable: true },
               summary:     { type: 'string',  nullable: true }
             },
-            required: ['quotes']
+            required: ['quotes', 'ratings']
           }
         }
       },
@@ -1002,23 +1019,40 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
                   required: ['text']
                 }
               },
+              // REQUIRED, and NOT nullable — this is the whole fix.
+              //
+              // Declared optional, Gemini structured output simply DID NOT EMIT IT.
+              // Measured: the identical prompt against the same model returns all four
+              // aggregates when no responseSchema constrains the call, and returns none
+              // when this property is optional. So pass 1 wrote
+              // "Vuoriclothing.com: 4.58 out of 5 from 15,626 reviews / Trustpilot: 2.3
+              // from 126 / WorthEPenny: 3.8 from 28 / Thingtesting: 4 from 137", pass 2
+              // read it, and the schema dropped every one on the floor — the brand came
+              // back with no rating at all and the picker had nothing to rank.
+              //
+              // An empty array is how "no aggregates found" is expressed; that is a
+              // different statement from "the field is absent", and only the required
+              // form makes the model commit to one of them.
               ratings: {
                 type: 'array',
-                nullable: true,
                 items: {
                   type: 'object',
                   properties: {
                     source:      { type: 'string', nullable: true },
-                    rating:      { type: 'number', nullable: true },
+                    // Non-nullable: an entry with no number is not an aggregate. A
+                    // source with a non-numeric grade (BBB's "A+") is correctly omitted
+                    // rather than emitted as a null the picker has to filter out.
+                    rating:      { type: 'number' },
                     reviewCount: { type: 'number', nullable: true }
-                  }
+                  },
+                  required: ['rating']
                 }
               },
               rating:      { type: 'number',  nullable: true },
               reviewCount: { type: 'integer', nullable: true },
               summary:     { type: 'string',  nullable: true }
             },
-            required: ['quotes']
+            required: ['quotes', 'ratings']
           }
         }
       },
