@@ -819,6 +819,12 @@ check('N10 the ratings array is REQUIRED in the pass-2 schema, on both lookups',
       'the ratings ARRAY must not be nullable — an empty array is how "none found" is said');
     assert.ok(/required: \['rating'\]/.test(b),
       'each entry must require a numeric rating, so a non-numeric grade is omitted rather than emitted as null');
+    // REQUIRED and NON-NULLABLE are different guarantees, and only asserting the first
+    // let a mutation adding `nullable: true` here pass: the model would then satisfy
+    // the schema with {source:'BBB', rating:null}, which is not an aggregate at all and
+    // which the picker has to filter out downstream. Say it at the schema instead.
+    assert.ok(/rating:\s*\{ type: 'number' \}/.test(b),
+      "the entry's rating must be a plain non-nullable number");
   }
 });
 check('N9 pass 1 asks for EVERY aggregate and forbids pre-picking', () => {
