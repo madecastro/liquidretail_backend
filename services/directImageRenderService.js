@@ -1296,7 +1296,9 @@ async function renderDirectImage(callArgs = {}) {
     productId ? CatalogProduct.findById(productId).select('title imageUrl rating productReviews').lean() : null,
     // classification + technicalInsights feed resolveSeedStyle for the
     // lifestyle scene-preserve branch (STATIC_LIFESTYLE_PRESERVE).
-    mediaId ? Media.findById(mediaId).select('fileUrl classification technicalInsights').lean() : null
+    // width + height feed seedAspectFromDims → resolveAspectTreatment's
+    // 'native' arm (without them every preserve submit falls to 'extend').
+    mediaId ? Media.findById(mediaId).select('fileUrl classification technicalInsights width height').lean() : null
   ]);
   // A missing layout artifact is recoverable: everything it supplies has a
   // source of its own. brand/product come from the explicit args, and themeFor
@@ -1445,6 +1447,13 @@ async function renderDirectImage(callArgs = {}) {
   // fidelity opening swaps when the flag is on (staticAdIntents).
   const { resolveSeedStyle } = require('./imageShotHeuristicService');
   const seedStyle = resolveSeedStyle(media);
+  // Seed aspect from Media.width/height — the ONLY production path into
+  // resolveAspectTreatment's 'native' arm. Missing/zero dims → null →
+  // 'extend' (today's behaviour). First render, regen, and QC re-entry all
+  // funnel through this single buildPrompt call, so one thread covers all
+  // three (same cause-fix class as variantKind: never hand-list fields
+  // per caller when one chokepoint can compute them).
+  const seedAspect = intents.seedAspectFromDims(media?.width, media?.height);
   const built = intents.buildPrompt({
     intentKey,
     data: intentData,
@@ -1455,7 +1464,8 @@ async function renderDirectImage(callArgs = {}) {
     },
     surface,
     seedStyle,
-    variantKind
+    variantKind,
+    seedAspect
   });
   // A surface that takes no static image is a routing fact, not a failure —
   // meta_reels_9_16 is declared kinds:['video'] in platformFormats.
