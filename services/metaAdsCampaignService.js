@@ -15,7 +15,7 @@ const axios = require('axios');
 const { decrypt } = require('./integrationCryptoService');
 const { matchCampaignCreatives, deriveCampaignKind } = require('./metaAdsCreativeMatcher');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 // Caps to keep a single sync bounded. A brand with > 200 campaigns

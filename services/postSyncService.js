@@ -24,7 +24,7 @@ const DetectRun = require('../models/DetectRun');
 const { decrypt } = require('./integrationCryptoService');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 // Default page size + cap. IG Business returns ~25 by default; we ask

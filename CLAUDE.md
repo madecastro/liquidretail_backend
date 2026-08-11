@@ -8,12 +8,15 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 **Read `session.md` for live state. Read `ARCHITECTURE_REVIEW.md` before touching
 security, money, or the render queue** — it carries verified P0s with `path:line`.
 
-Live prod (2026-08-03) = `13cf679` (both services). Offline verify suite = **78
-scripts, all green** on branch `feat/pmax-surfaces-phase-a2` (was 77 after
-Phase B PMax, 76 after Phase A, 42 as of 2026-08-03; re-run with
+Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
+`srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
+suite = **80 scripts, all green** (75 on `main` + the Google PMax
+harnesses; re-run with
 `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
 no aggregate runner and no `npm test`). Claims written against pre-deploy
-binaries are suspect.
+binaries are suspect. **A red harness in a local checkout is not necessarily red
+on `main`** — this tree carries other sessions' uncommitted work, so confirm
+against a clean worktree off `origin/main` before believing a failure (or a pass).
 
 ---
 
@@ -1179,10 +1182,10 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**78 scripts** as of post-Phase-B
-  addendum — video cost reconcile + adversarial corrections). Add a harness for
-  money/security-critical logic, and **revert-prove it** — back the fix out and
-  confirm the test fails. A test that cannot fail is not a test.
+  relevant `scripts/verify*.js` harness (**80 scripts** as of the Google
+  PMax merge). Add a harness for money/security-critical logic, and
+  **revert-prove it** — back the fix out and confirm the test fails. A test that
+  cannot fail is not a test.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
   change (bugs, bypasses, money holes) before committing. It caught two real regex
   bugs in the submit guard that review-by-reading missed.

@@ -23,7 +23,7 @@ const IntegrationCredential = require('../models/IntegrationCredential');
 const { decrypt }           = require('./integrationCryptoService');
 const { concurrency: CONC } = require('./concurrency');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 // Per-batch concurrency cap. Meta's per-app rate limit is generous

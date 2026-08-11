@@ -1419,7 +1419,33 @@ costs* + §6 *YouTube safe zones* / *PMax video directives* / *Director funnel*
 `CLAUDE.md` §2; traps (shared funnel presets, `ROUTING_NESTED_FIELDS`, blank
 `PMAX_PROOF_*`, precedence sentence, `classifyFormat`) in §4.
 
-### What shipped — offline suite **78/78 green**
+### Production status carried forward from `main` (do not lose this)
+
+0aa. **NEWEST — 2026-08-10: the `/generate` gate is now REQUEST-FINGERPRINT keyed, and IG
+   re-scan/rebind is unblocked. MERGED AND LIVE IN PRODUCTION — but NOT exercised against a
+   real run, which is the top priority below.**
+   - Backend PR **#116** (gate + IG) and PR **#115** (the catalog-executor `.select()` fix that
+     had `verifyBrandFieldNames` red on `main`) both merged. Live commit **`5d02debe`** on WEB
+     `srv-d1vuktqli9vc73ft07ng` and WORKER `srv-d8128c1o3t8c73e8kb30`, both `live`, builds
+     finished 05:02Z. Boot logs clean — the only error-shaped lines are two
+     `SIGTERM … 0 ad(s) in flight`, i.e. the graceful handoffs as each deploy replaced the last.
+   - Frontend PR **#40** merged; Netlify live on `c110d5c`. Verified by asset hash:
+     `staging.reach-social.io` serves `index-DBoabGBs.js`, identical to a local build of merged
+     `master`.
+   - Suite on **merged `main`: 75 harnesses, 0 failing** (the first fully-green state this
+     session; `verifyFontFallback` had been red only in a dirty local checkout, and
+     `verifyBrandFieldNames` was fixed by #115).
+   - ⚠️ **Deployed ≠ verified.** No real campaign has run through the new gate. The three cases
+     in item 1 below are still the first thing to do.
+   Owner asks, verbatim: *"make sure the user is able to generate an ad from the media library or
+   the product image library, don't block ads that are concurrent based on the product alone, but
+   based on the actual request. So block identical requests and note requests that are identical to
+   previous requests but allow them if the user wants."* and *"also while we are doing this, let's
+   allow the user to re-scan and change the instagram ID also"*.
+
+---
+
+### What shipped — offline suite **80/80 green** (merged with main)
 
 **Phase B (unchanged substance):** static `PLATFORM_NOTES` + intent-aware CTA;
 `PMAX_DIRECTIVES` (hook-first, centre-safe, aspect-aware Frame); Director

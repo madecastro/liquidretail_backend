@@ -14,7 +14,7 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 
-const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
+const { META_API_VERSION } = require('../services/metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
 
 const IntegrationCredential = require('../models/IntegrationCredential');
@@ -1642,7 +1642,6 @@ router.get('/token-debug', async (req, res) => {
     const { decrypt } = require('../services/integrationCryptoService');
     const axios = require('axios');
 
-    const META_API_VERSION = process.env.META_API_VERSION || 'v19.0';
     const META_APP_ID      = process.env.META_APP_ID;
     const META_APP_SECRET  = process.env.META_APP_SECRET;
     const metaAppToken = (META_APP_ID && META_APP_SECRET) ? `${META_APP_ID}|${META_APP_SECRET}` : null;
