@@ -8,11 +8,14 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 **Read `session.md` for live state. Read `ARCHITECTURE_REVIEW.md` before touching
 security, money, or the render queue** — it carries verified P0s with `path:line`.
 
-Live prod (2026-08-03) = `13cf679` (both services). Offline verify suite = **42
-scripts, all green** (re-run 2026-08-03 with
+Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
+`srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
+suite = **75 scripts, all green** (re-run 2026-08-11 on merged `main` with
 `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
 no aggregate runner and no `npm test`). Claims written against pre-deploy
-binaries are suspect.
+binaries are suspect. **A red harness in a local checkout is not necessarily red
+on `main`** — this tree carries other sessions' uncommitted work, so confirm
+against a clean worktree off `origin/main` before believing a failure (or a pass).
 
 ---
 
@@ -1041,7 +1044,7 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**42 scripts** as of 2026-08-03). Add a
+  relevant `scripts/verify*.js` harness (**75 scripts** as of 2026-08-11). Add a
   harness for money/security-critical logic, and **revert-prove it** — back the
   fix out and confirm the test fails. A test that cannot fail is not a test.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
