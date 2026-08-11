@@ -71,7 +71,7 @@ const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
 const { computeSlotBudgets } = require('./slotBudget');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
-const { extractSnippet, PROOF_LINE_MAX_CHARS } = require('./quoteSnippetService');
+const { extractSnippet, PROOF_LINE_MAX_CHARS, usableProofCommentsOrNone } = require('./quoteSnippetService');
 // Video-headline SELECTION for fallbackDerivation — reuses an EXISTING
 // CreativeDirectionArtifact round (never calls the Director LLM) and picks
 // the best-fitting copy string instead of a templated headline. See

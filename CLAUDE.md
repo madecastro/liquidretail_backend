@@ -10,11 +10,15 @@ security, money, or the render queue** — it carries verified P0s with `path:li
 
 Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
 `srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
-suite = **85 scripts, all green** (75 on `main` + the Google PMax
-harnesses; re-run with
+suite = **101 scripts, all green**. Re-run with
 `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
-no aggregate runner and no `npm test`). Claims written against pre-deploy
-binaries are suspect. **A red harness in a local checkout is not necessarily red
+no aggregate runner and no `npm test`. Two worktree gotchas that cost real time:
+the committed `node_modules` subset is incomplete (no native `sharp`, so
+`verifyLogoSilhouette.js` fails until you run `npm install` in the worktree —
+`NODE_PATH` alone will not fix it, since Node resolves the local `node_modules`
+first), and **macOS has no `timeout` binary**, so a loop wrapping each script in
+`timeout` reports all 101 as failed. Claims written against pre-deploy binaries
+are suspect. **A red harness in a local checkout is not necessarily red
 on `main`** — this tree carries other sessions' uncommitted work, so confirm
 against a clean worktree off `origin/main` before believing a failure (or a pass).
 
@@ -1181,11 +1185,17 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit message trailer: `Co-Authored-By: Claude <noreply@anthropic.com>`.
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
-- Before pushing non-trivial changes: `node --check` the touched files and run the
-  relevant `scripts/verify*.js` harness (**85 scripts** as of the Google
-  PMax merge). Add a harness for money/security-critical logic, and
-  **revert-prove it** — back the fix out and confirm the test fails. A test that
-  cannot fail is not a test.
+- Before pushing non-trivial changes: run **`npm run lint`**, `node --check` the
+  touched files, and run the relevant `scripts/verify*.js` harness (**101 scripts**
+  as of the concept-expansion binding fix). Add a harness for money/security-critical
+  logic, and **revert-prove it** — back the fix out and confirm the test fails. A test
+  that cannot fail is not a test.
+- **`npm run lint` is not optional, and it is not a style check.** It enables exactly
+  one rule, `no-undef`, because that is the one thing every harness here is blind to:
+  they assert over source text, and a regex cannot see an unbound identifier —
+  neither can `node --check`, since a `ReferenceError` is a runtime error. This has
+  now shipped to production three times (`receiptFree`, `preferUgcMediaId`,
+  `usableProofCommentsOrNone`). If you add a rule, add it deliberately and say why.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
   change (bugs, bypasses, money holes) before committing. It caught two real regex
   bugs in the submit guard that review-by-reading missed.

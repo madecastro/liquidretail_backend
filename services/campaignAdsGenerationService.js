@@ -1007,7 +1007,8 @@ async function expandWizardJob({
         excludePairings, creativeIntent: null,
         videoDurationSec,
         videoPromptGuidance, videoPromptRaw,
-        generationRunId
+        generationRunId,
+        preferUgcMediaId
       });
     }
 
@@ -3060,7 +3061,12 @@ async function runConceptDrivenExpansion({
   // The CampaignRun this expansion belongs to. Mixed into the STATIC V2 digest
   // so a repeat Generate makes new ads rather than colliding with the previous
   // run's. Optional: omitting it reproduces the pre-2026-08-01 digest exactly.
-  generationRunId = null
+  generationRunId = null,
+  // UGC-ads Phase 3. Read unconditionally at the buildSeededUniverse call below,
+  // so it must be bound here even when no caller supplies it. Default null is
+  // byte-identical to the pre-Phase-3 call — buildSeededUniverse coerces it and
+  // gates it behind isUgcFirstSeedingEnabled().
+  preferUgcMediaId = null
 }) {
   const { resolveKinds, renderRouteForKind } = require('./platformFormats');
   const resolvedKinds = (Array.isArray(kinds) && kinds.length)

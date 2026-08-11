@@ -10,7 +10,11 @@
     "worker": "node worker.js",
     "postinstall": "node scripts/ensurePuppeteerChrome.js && node scripts/ensureRemotionBrowser.js",
     "video:dryrun": "node scripts/dryRunVideoSubmit.js",
-    "titles:test": "node scripts/testRemotionTitles.js"
+    "titles:test": "node scripts/testRemotionTitles.js",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "eslint": "^9.39.5"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
