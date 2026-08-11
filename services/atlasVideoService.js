@@ -2735,7 +2735,7 @@ async function peekPrediction(predictionId) {
  *   chargeConfirmed === false  Atlas's settled record confirms NO price. Strict
  *                              `=== false`: `null` means we could not read the
  *                              record, and unknown is treated as CHARGED.
- *   attempt < maxAttempts      the policy's own ceiling (predictionFailed: 2).
+ *   attempt < maxAttempts      the policy's own ceiling (predictionFailed: 3).
  */
 function mayRetryAfterFailure({ policyRetryable, chargeConfirmed, attempt, maxAttempts }) {
   return policyRetryable === true
@@ -3050,6 +3050,12 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       err.predictionId    = predictionId;
       err.policyRetryable = policy.retryable === true;
       err.policyMaxAttempts = policy.maxAttempts || 1;
+      // The policy owns the wait between attempts. Carried here because
+      // generateForAd is the only place that can act on it, and re-classifying
+      // there would rebuild the policy from an error shape it no longer has.
+      // `n` is 0-BASED, matching backoffFor's contract and the image path's
+      // call convention — generateForAd's loop is 1-based and converts.
+      err.policyBackoffFor = (n) => policy.backoffFor(n);
       const charge = confirmedCharge(data);
       err.chargeConfirmed = charge.charged;   // true | false | null(unknown)
       err.chargePriceUsd  = charge.priceUsd;
@@ -3590,7 +3596,7 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
   // Measured 2026-08-10 — 6 failures across ~23 submits in one day, ~26%.
   //
   // The `predictionFailed` policy has ALWAYS said `action:'retry'`,
-  // `maxAttempts:2`, `charged:false` ("reservation refunded, so a reattempt
+  // `charged:false` ("reservation refunded, so a reattempt
   // costs nothing extra"). Nothing on the video path ever read it — the poll
   // classified the failure and threw — so each of those became a dead ad and
   // ~$0.75 of value the operator asked for and never got.
@@ -3722,10 +3728,19 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
         errorMessage: err.message || null
       }).catch((e) => console.warn(`   ⚠️  atlasVideo: could not zero the unbilled cost row for ${predictionId} — ${e.message}`));
 
-      const backoffMs = 1000 * attempt;
+      // The POLICY owns this wait, not a constant here. Until 2026-08-11 this
+      // was a hardcoded `1000 * attempt`, so predictionFailed resubmitted an
+      // identical payload to the same model one second later — measured 3 of 3
+      // retries firing and 0 of 3 rescuing an ad. `policyBackoffFor` is stamped
+      // by pollPrediction and also honours a Retry-After header.
+      // attempt is 1-based here; backoffFor is 0-based. Off by one and the
+      // first wait silently becomes the second step of the curve.
+      const backoffMs = typeof err.policyBackoffFor === 'function'
+        ? err.policyBackoffFor(attempt - 1)
+        : 1000 * attempt;
       console.warn(
         `   ↻ atlasVideo[ad=${ad._id}]: ${err.atlasPolicy} on ${predictionId} and Atlas confirms NO charge ` +
-        `— resubmitting (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms`
+        `— resubmitting (attempt ${attempt + 1}/${maxAttempts}) after ${Math.round(backoffMs / 1000)}s`
       );
       await new Promise((r) => setTimeout(r, backoffMs));
     }

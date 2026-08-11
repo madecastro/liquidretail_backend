@@ -171,7 +171,7 @@ check('B6 a settled row priced 0 is a non-charge; any positive price is a charge
 
 console.log('\nC. the live policy and the gate must agree');
 
-check('C1 generation_failed classifies as retryable, maxAttempts 2, unbilled', () => {
+check('C1 generation_failed classifies as retryable, maxAttempts 3, unbilled', () => {
   const p = classify({
     predictionStatus: 'failed',
     msg: 'Generation failed: task processing failed (code: generation_failed)',
@@ -180,13 +180,57 @@ check('C1 generation_failed classifies as retryable, maxAttempts 2, unbilled', (
   assert.strictEqual(p.name, 'predictionFailed', `classified as ${p.name}`);
   assert.strictEqual(p.retryable, true);
   assert.strictEqual(p.charged, false);
-  assert.strictEqual(p.maxAttempts, 2);
-  // End to end: this is the production failure, and it must retry exactly once.
+  assert.strictEqual(p.maxAttempts, 3);
+  // End to end: this is the production failure, and it must retry.
   assert.strictEqual(mayRetryAfterFailure({
     policyRetryable: p.retryable,
     chargeConfirmed: confirmedCharge(FAILED_BODY).charged,
     attempt: 1, maxAttempts: p.maxAttempts
   }), true);
+  // ...and the ceiling must still bind, so a permanently-broken payload cannot
+  // resubmit forever. Attempt N of N is the last one.
+  assert.strictEqual(mayRetryAfterFailure({
+    policyRetryable: p.retryable,
+    chargeConfirmed: confirmedCharge(FAILED_BODY).charged,
+    attempt: p.maxAttempts, maxAttempts: p.maxAttempts
+  }), false, 'the attempt ceiling must still terminate the loop');
+});
+
+check('C1b the backoff between attempts is seconds, not a token 1s gap', () => {
+  const p = classify({
+    predictionStatus: 'failed',
+    msg: 'Generation failed: task processing failed (code: generation_failed)',
+    nsfw: null
+  });
+  // Regression guard. This was `() => 1000` while the retry site ignored it
+  // entirely and used its own `1000 * attempt`: 3 of 3 retries fired one second
+  // after the failure, and 0 of 3 rescued an ad. A retry that reuses the same
+  // payload against the same model needs real separation to be a new roll.
+  //
+  // n is 0-BASED per backoffFor's contract.
+  const first  = p.backoffFor(0);
+  const second = p.backoffFor(1);
+  assert.ok(first >= 10_000, `first backoff ${first}ms is too short to matter`);
+  assert.ok(second > first, 'backoff must grow between attempts');
+  assert.ok(p.backoffFor(5) <= 120_000, 'backoff must stay under the 120s cap');
+});
+
+check('C1c both call sites index the curve the same way (0-based)', () => {
+  const p = classify({
+    predictionStatus: 'failed',
+    msg: 'Generation failed: task processing failed (code: generation_failed)',
+    nsfw: null
+  });
+  // predictionFailed is SHARED. atlasImageService's loop is 0-based
+  // (`let attempt = 0` → backoffFor(attempt)); atlasVideoService's is 1-based
+  // (`let attempt = 1`) and must convert. If video ever passes `attempt` raw
+  // again, its FIRST wait silently becomes the curve's SECOND step.
+  assert.ok(
+    /err\.policyBackoffFor\(attempt - 1\)/.test(SRC),
+    'the video retry site must convert its 1-based attempt to 0-based'
+  );
+  // A negative index must not fall off the curve into a sub-second wait.
+  assert.strictEqual(p.backoffFor(-1), p.backoffFor(0), 'negative n must clamp, not shrink');
 });
 
 check('C2 a real moderation block is NOT retried (deterministic — would re-block)', () => {
@@ -257,6 +301,60 @@ check('D4 peekPrediction reads the body BEFORE bailing on a non-200', () => {
   const dataRead = SRC.indexOf('const data = res.data?.data || {};');
   assert.ok(dataRead > 0 && dataRead < guard, 'the body must be parsed before the non-200 bail');
 });
+
+console.log('\nF. the retry site must USE the policy backoff, not its own constant');
+
+// These are SOURCE-SLICE assertions, following the W1/W2/W3 precedent in
+// verifyBasePlateCrop.js. There is no runtime seam on the retry loop's
+// setTimeout short of driving a billable submit, so this is what is provable
+// offline. F3 records what that cannot prove.
+
+check('F1 pollPrediction carries the policy backoff to the caller', () => {
+  assert.ok(
+    /err\.policyBackoffFor\s*=/.test(SRC),
+    'pollPrediction must stamp policyBackoffFor — generateForAd is the only place that can act on it'
+  );
+});
+
+check('F2 the retry site consults it instead of hardcoding the wait', () => {
+  const i = SRC.indexOf('resubmitting (attempt');
+  assert.ok(i > 0, 'retry log line not found — did the retry loop move?');
+  const window = SRC.slice(Math.max(0, i - 900), i + 200);
+  assert.ok(
+    /err\.policyBackoffFor\(/.test(window),
+    'the wait before a resubmit must come from the policy'
+  );
+  // The exact regression: a bare `1000 * attempt` as the operative value.
+  // It survives only as the defensive fallback when the stamp is absent.
+  assert.ok(
+    !/const backoffMs = 1000 \* attempt;/.test(SRC),
+    'the hardcoded 1s-per-attempt backoff is back — this is the 0-of-3-rescues bug'
+  );
+});
+
+check('F3 the shared image path keeps its own money gate', () => {
+  // predictionFailed also governs atlasImageService.submitAndPollWithRetry, so
+  // raising maxAttempts widened STATIC generation too. That is intended, but the
+  // image path is gated by mayResubmit (was a billable task ever created?), NOT
+  // by confirmedCharge — a different question. Pin that it is still the gate, so
+  // a future policy edit cannot quietly hand the image path a charge-blind retry.
+  const IMG = fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'atlasImageService.js'), 'utf8'
+  );
+  const i = IMG.indexOf('const safeToResubmit = mayResubmit(');
+  assert.ok(i > 0, 'image retry gate mayResubmit() not found');
+  const window = IMG.slice(i, i + 400);
+  assert.ok(
+    /if \(!safeToResubmit \|\| !attemptsLeft\) throw err;/.test(window),
+    'the image path must refuse when either the gate or the ceiling says no'
+  );
+});
+
+// NOT PROVABLE OFFLINE, recorded deliberately: F1/F2 show the wiring exists,
+// not that the delay is honoured at runtime, and nothing here shows a longer
+// backoff actually raises the rescue rate. That is a provider-behaviour
+// question — answer it from production logs by comparing `↻ atlasVideo`
+// resubmits against the successes that follow them.
 
 console.log('\nE. the ledger correction');
 
