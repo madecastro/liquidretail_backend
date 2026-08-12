@@ -823,10 +823,26 @@ function selectRotatedQuote(proof, campaignRunId, opts = {}) {
   });
 }
 
-function buildIntentData({ concept, layoutInput, brand, product = null, cta, campaignRunId = null, media = null }) {
+function buildIntentData({ concept, layoutInput, brand, product = null, cta, campaignRunId = null, media = null, funnelStage = null }) {
   // Dual-read v3 copy / v2 copy_picks. Never invent a headline from product name.
   const copy = renderableCopy(concept);
-  const proof = layoutInput?.social_proof || {};
+  let proof = layoutInput?.social_proof || {};
+  // QUOTE_STAGE_AWARE: re-pick from the stored pool using this Ad's
+  // stage. Flag-off / no stage is an identity, so rotation below still
+  // runs as today. When a stage is live, stage wins — rotation among
+  // same-tier quotes would undo the funnel pick.
+  let stageLive = false;
+  try {
+    const { quoteStageAwareEnabled, applyStagedQuotePick, conceptAngleTerms, normalizeStage } = require('./layoutInputService');
+    stageLive = quoteStageAwareEnabled() && !!normalizeStage(funnelStage);
+    if (quoteStageAwareEnabled() && (funnelStage || concept)) {
+      const staged = applyStagedQuotePick(
+        { social_proof: proof },
+        { funnelStage, conceptAngle: conceptAngleTerms(concept) }
+      );
+      if (staged?.social_proof) proof = staged.social_proof;
+    }
+  } catch { /* pick is an enhancement; keep stored primary */ }
   // ALLOWLIST via toPrintableCustomerQuote — returns a sanitized copy or null.
   // Using the return value (not a boolean + original object) is load-bearing:
   // llm-web quotes arrive with author/source fields that must never print, and
@@ -846,16 +862,29 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
     media,
     extraText: layoutInput?.product?.name || null
   };
-  const rotated = selectRotatedQuote(proof, campaignRunId, {
-    recentKeys: product?.recentQuoteKeys,
-    lastRunId: product?.lastQuoteRunId,
-    lastFingerprint: product?.lastQuoteFingerprint,
-    scope: strictScope
-  });
+  // QUOTE_STAGE_AWARE (#196) vs VIDEO_QUOTE_ROTATION (#195): a LIVE funnel
+  // stage skips rotation outright — the stage pick IS the quote. Rotation
+  // exists to stop siblings repeating one line; a stage-matched line is a
+  // deliberate choice, not a repeat, so it must not be rotated away.
+  const rotated = stageLive
+    ? (proof.primary_quote || null)
+    : selectRotatedQuote(proof, campaignRunId, {
+      recentKeys: product?.recentQuoteKeys,
+      lastRunId: product?.lastQuoteRunId,
+      lastFingerprint: product?.lastQuoteFingerprint,
+      scope: strictScope
+    });
   // Memory persist is fire-and-forget: a missed write repeats a quote, it
   // does not fail a billed render. Flag-off is a no-op inside persistQuoteChoice.
   // Skip when lockedSameRun — this size is agreeing with a sibling that already wrote.
-  if (product && (product._id || product.id) && campaignRunId) {
+  //
+  // SKIPPED ENTIRELY WHEN stageLive, and that is load-bearing: the block below
+  // re-runs rotateQuote to obtain the fingerprint, but under a live stage that
+  // rotation choice is NOT what we printed. Persisting it would record a quote
+  // this render never used, so rotation memory would steer future runs away
+  // from a line nobody has seen. Accepted consequence: staged renders do not
+  // contribute to rotation memory (follow-up: persist the staged quote's own key).
+  if (!stageLive && product && (product._id || product.id) && campaignRunId) {
     const rot = require('./quoteRotationService');
     if (rot.memoryEnabled()) {
       const rotation = rot.rotateQuote(proof, campaignRunId, {
@@ -1445,7 +1474,10 @@ async function renderDirectImage(callArgs = {}) {
     // Post-render vision QC re-entry guard. The single allowed regeneration
     // calls renderDirectImage again with skipVisionQc:true so the QC loop
     // cannot nest (money: would otherwise allow unbounded regenerations).
-    skipVisionQc = false
+    skipVisionQc = false,
+    // QUOTE_STAGE_AWARE: Ad.funnelStage from renderCreative. Flag-off
+    // buildIntentData ignores it.
+    funnelStage = null
   } = callArgs;
   const surface = platformFormat || 'meta_feed_1_1';
   // Credentials are checked further down, AFTER brand routing: a brand
@@ -1609,7 +1641,8 @@ async function renderDirectImage(callArgs = {}) {
     cta: effectiveLayout.input?.cta?.text,
     // Same quote on every size of this run, a different one next run.
     campaignRunId,
-    media
+    media,
+    funnelStage
   });
   // Lifestyle/UGC scene preserve — intent still owns copy; only the scene
   // fidelity opening swaps when the flag is on (staticAdIntents).

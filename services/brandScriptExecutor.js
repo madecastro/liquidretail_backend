@@ -769,6 +769,11 @@ async function buildMetaForAd(ad, brand, opts = {}) {
     // and log which we served so a thin proof beat is diagnosable from Render
     // logs without a DB query.
     const productIdKey = ad.productId || null;
+    // Stage is NOT a lookup dimension. Funnel retitles share the
+    // master's {mediaId, productId} artifact (they never call
+    // buildLayoutInput). A hash-aware find would miss and fall back
+    // to this same unstaged row. applyStagedQuotePick reseats the
+    // quote from the stored pool after load.
     const scope = { mediaId: ad.mediaId, productId: productIdKey };
     layoutInput = await LayoutInputArtifact.findOne({
       ...scope,
@@ -801,6 +806,35 @@ async function buildMetaForAd(ad, brand, opts = {}) {
       const { loadQuoteScopeMedia } = require('./quoteProvenance');
       scopeMedia = await loadQuoteScopeMedia(ad.mediaId);
     } catch { /* seed labels optional; gate still has product name */ }
+  }
+  // QUOTE_STAGE_AWARE: re-pick primary_quote from the stored pool
+  // BEFORE the provenance gate so the gate still has the final word.
+  // Flag-off / no stage is an identity. Funnel retitles (the only
+  // rows that historically carried Ad.funnelStage) land here and
+  // never call buildLayoutInput.
+  //
+  // ORDER vs VIDEO_QUOTE_ROTATION (#195, the rotation block below):
+  // the stage pick runs FIRST, then rotation may move off it if a
+  // sibling in the same run already used that line. Rotation refuses
+  // anything the gate would drop, so neither flag can lose a
+  // testimonial the other would have printed. The single
+  // gateLayoutInputQuotes call still sits after both.
+  if (layoutInput?.input) {
+    try {
+      const { applyStagedQuotePick, resolveQuoteAssemblyOptions } = require('./layoutInputService');
+      const quoteAssembly = await resolveQuoteAssemblyOptions(ad);
+      const stagedInput = applyStagedQuotePick(layoutInput.input, quoteAssembly);
+      if (stagedInput !== layoutInput.input) {
+        layoutInput = { ...layoutInput, input: stagedInput };
+        console.log(
+          `📐 buildMetaForAd[ad=${ad._id}]: staged quote pick ` +
+          `funnel=${quoteAssembly.funnelStage || '-'} ` +
+          `"${String(stagedInput.social_proof?.primary_quote?.text || '').slice(0, 48)}"`
+        );
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  buildMetaForAd[ad=${ad?._id}]: staged quote pick failed (${err.message}) — keeping stored primary`);
+    }
   }
 
   let catalogProduct = null;
