@@ -247,6 +247,42 @@ function endsOnSentenceStop(s) {
 }
 
 /**
+ * finishesThought(s) → boolean
+ *
+ * Does this string STOP somewhere a reader would stop, rather than break off?
+ *
+ * Owner report 2026-08-11: ads were printing quotes "cut off right after a word and a
+ * comma" — *"I love this shirt, so great with…"*. The obvious rule, "require terminal
+ * punctuation", is WRONG here and the harness caught it: a curated extract like
+ * *"absolutely love these, so comfortable"* is a finished thought that simply has no
+ * period, and demanding one would delete the entire curated-snippet path.
+ *
+ * So this tests for the actual defect — a string that ends MID-CLAUSE:
+ *   · a trailing ellipsis, which by construction means "there was more";
+ *   · a trailing comma, semicolon or dash, i.e. the sentence was still going;
+ *   · a dangling function word (and, with, in, my, the …) — the Pelagic shape,
+ *     "…keeping me cool in my", where the next word is the one that mattered.
+ * Anything else is treated as finished, including a bare clause that ends on a real
+ * word. This is deliberately permissive: it is a stop-loss on mangled text, not a
+ * grammar checker.
+ */
+const DANGLING_TAIL = /\b(?:and|or|but|so|with|without|for|from|in|into|on|at|to|of|by|as|than|that|which|because|since|my|our|your|their|his|her|its|the|a|an|is|are|was|were|it|they)$/i;
+
+function finishesThought(s) {
+  const t = String(s == null ? '' : s).trim();
+  if (!t) return false;
+  // ELLIPSIS FIRST. `…` is itself in the sentence-stop character class, so asking
+  // endsOnSentenceStop first would wave "so great with…" straight through — the exact
+  // string this function exists to reject.
+  if (/(?:…|\.\.\.)["'”’)\]]*\s*$/.test(t)) return false;   // "there was more"
+  if (endsOnSentenceStop(t)) return true;
+  if (/[,;:\-–—]\s*$/.test(t)) return false;               // the sentence was still going
+  const bare = t.replace(/["'”’)\]]+$/, '').trim();
+  if (DANGLING_TAIL.test(bare)) return false;              // "…cool in my"
+  return true;
+}
+
+/**
  * completeSentencePrefix(s, maxLen) → string
  *
  * The longest leading run of WHOLE sentences, optionally within maxLen. Returns
@@ -316,6 +352,7 @@ function hasHtmlEntity(s) {
 
 module.exports = {
   endsOnSentenceStop,
+  finishesThought,
   completeSentencePrefix,
   decodeHtmlEntities,
   cleanScrapedText,

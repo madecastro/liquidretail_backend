@@ -465,10 +465,22 @@ function resolveStaticQuoteCap(rawEnv) {
   const supplied = rawEnv != null && rawEnv !== '';
   if (supplied && Number.isFinite(parsed) && parsed > 0) return parsed;
   if (supplied) {
-    console.warn(`   ⚠️  STATIC_QUOTE_MAX_CHARS="${rawEnv}" is not a positive number — using 140`);
+    console.warn(`   ⚠️  STATIC_QUOTE_MAX_CHARS="${rawEnv}" is not a positive number — using ${STATIC_QUOTE_DEFAULT_CAP}`);
   }
-  return 140;
+  return STATIC_QUOTE_DEFAULT_CAP;
 }
+
+/**
+ * 100, down from 140 (owner, 2026-08-11: *"quotes have suddenly become much longer,
+ * maybe too long… I liked the length we were at before"*).
+ *
+ * The 140 was chosen when the alternative was a ≤50-char curated snippet, and the
+ * complaint then was that the snippet was a subjectless fragment. Both bars are real:
+ * the quote must FINISH ITS THOUGHT, and it must not turn into a paragraph on a feed
+ * card. 100 is the widest that reliably holds one complete sentence, which is the shape
+ * that satisfies both — the video overlay keeps its own 50 and is untouched.
+ */
+const STATIC_QUOTE_DEFAULT_CAP = Number(process.env.STATIC_QUOTE_DEFAULT_CAP || 100);
 
 /**
  * Pick the quote string a STATIC ad typesets.
@@ -499,7 +511,7 @@ function resolveStaticQuoteCap(rawEnv) {
  * @param {{fullQuoteEnabled?:boolean, cap?:number}} [opts]
  * @returns {string}
  */
-function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = 140 } = {}) {
+function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = STATIC_QUOTE_DEFAULT_CAP } = {}) {
   // Flag-off restores the exact pre-change expression, byte for byte.
   if (!fullQuoteEnabled) {
     return quote ? String(quote.snippet || quote.text || '').trim() : '';
@@ -508,7 +520,7 @@ function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = 140 } = {
   const snippet = quote ? String(quote.snippet || '').trim() : '';
   if (!full && !snippet) return '';
 
-  const { completeSentencePrefix } = require('../utils/htmlEntities');
+  const { completeSentencePrefix, finishesThought } = require('../utils/htmlEntities');
   // The longest run of WHOLE SENTENCES that fits. A literal prefix of `full`, so this
   // is selection, never repair.
   const whole = full ? completeSentencePrefix(full, cap) : '';
@@ -541,6 +553,19 @@ function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = 140 } = {
     // flattery word, so a veto here would refuse it. The gap the audit actually found
     // is narrower than that: strings this function INVENTS (a curated snippet, a
     // clause-prefix, a truncation) were judged NOWHERE. Those are what get judged.
+    // A TYPESET QUOTE MUST FINISH ITS THOUGHT. Owner, 2026-08-11: quotes were coming
+    // out "cut off right after a word and a comma" — "I love this shirt, so great
+    // with…". That was the last-resort truncation below reaching a frame: it is a
+    // word-boundary cut with an ellipsis glued on, which reads as corrupted text rather
+    // than as something a customer said. #135 encoded the same rule for the video
+    // overlay ("never rely on an ellipsis to imply the rest"); static never applied it.
+    //
+    // Checked BEFORE the full-text exemption, because a stored quote can itself have
+    // been captured mid-sentence — that is the Pelagic defect, and this is the last
+    // place to catch it. NOT "must end in a period": a curated extract is a finished
+    // thought without one, and requiring terminal punctuation deleted the whole snippet
+    // path when I first tried it. See finishesThought.
+    if (!finishesThought(text)) return false;
     if (text === full) return true;
     // NO JUDGE → allow only complete-sentence forms of that already-judged text.
     // Fails SAFE rather than closed: refusing every quote on every ad because a require
@@ -553,8 +578,12 @@ function selectStaticQuoteText(quote, { fullQuoteEnabled = true, cap = 140 } = {
     full.length <= cap ? full : '',                            // the whole thing, best case
     (whole && whole.length >= snippet.length) ? whole : '',     // complete, and says at least as much
     snippet,                                                    // curated but unjudged — now judged
-    whole,                                                      // complete, even if shorter than the snippet
-    shortenToCap(full, cap)                                     // last resort, still extractive
+    whole                                                       // complete, even if shorter than the snippet
+    // NO TRUNCATION CANDIDATE. shortenToCap's output ends in an ellipsis by
+    // construction, so it can never finish a thought — it is retained below only for
+    // callers that want a bounded string, and is deliberately not offered here. When
+    // nothing complete fits, the ad prints NO quote and intent fallback takes over: a
+    // missing testimonial costs one format, a mangled one costs the client.
   ];
   for (const c of candidates) if (usable(c)) return c;
   return '';
