@@ -312,12 +312,35 @@ check('I4 a Meta derivative routes FREE when it carries deriveFromMaster', () =>
   );
 });
 
-check('I5 a Meta derivative WITHOUT the marker is billable — why the field is load-bearing', () => {
-  const derive = svc.resolveDeriveFromMaster({ platformFormat: 'meta_feed_1_1', renderRoute: 'veo' });
+check('I5 a marker-less Meta derivative FAIL-CLOSES to its master (no receipt)', () => {
+  // Re-derived 2026-08-11. This previously asserted the opposite — that a bare
+  // Meta feed format stayed billable — which was true when the Meta fan-out
+  // shipped and is why models/Ad.js claimed Meta "has no second gate, and
+  // cannot". PR #173 found the discriminator that makes one possible:
+  // `veoPredictionId` is the spend RECEIPT, set only when that ad itself
+  // submitted to Omni. A derivation never submits, so its absence identifies a
+  // derivative even with the marker gone.
+  const derive = svc.resolveDeriveFromMaster({
+    platformFormat: 'meta_feed_1_1', renderRoute: 'veo'
+  });
+  assert.strictEqual(
+    derive, 'meta_stories_9_16',
+    'a marker-less Meta derivative no longer fail-closes — it would take the BILLABLE Omni path'
+  );
+});
+
+check('I6 a LEGACY paid Meta row keeps its billable path (receipt present)', () => {
+  // The other half of the same discriminator, and the reason it is not simply
+  // "this format ⇒ free": meta_feed_1_1 / 4_5 / reels WERE their own paid
+  // masters before 919627a0, so rows exist that bought their own plate. If
+  // those were treated as derivations, a regenerate would 409 on an ad that
+  // paid, and a re-render would wait for a Stories sibling that never existed.
+  const derive = svc.resolveDeriveFromMaster({
+    platformFormat: 'meta_feed_1_1', renderRoute: 'veo', veoPredictionId: 'pred_legacy_123'
+  });
   assert.strictEqual(
     derive, null,
-    'bare Meta feed formats now self-derive; if intentional, the fan-out no longer needs '
-    + 'deriveFromMaster and this check should be re-derived rather than deleted'
+    'a legacy Meta row that holds a spend receipt was reclassified as a derivation'
   );
 });
 
@@ -351,41 +374,58 @@ check('H1 funnel mint iterates a Google-filtered master list, not masterFormats'
 });
 
 check('H3 [MONEY] every Meta derivative is minted WITH deriveFromMaster', () => {
-  // The single most expensive line in this change. The Meta derivatives are
-  // free ONLY because they carry deriveFromMaster, which routes them through
-  // renderDeriveOnlyVideoAd; without it resolveDeriveFromMaster returns null
-  // (pinned by I5) and all three take the billable Omni path — three extra
-  // ~$0.90 submits per product, on the default "All Meta video" flow.
+  // The single most expensive line in the Meta fan-out. These rows are free
+  // ONLY because they carry deriveFromMaster, which routes them through
+  // renderDeriveOnlyVideoAd. Verified by mutation that the behavioural checks
+  // above CANNOT see this — the mint is inside expandWizardJob's async
+  // expansion — hence a source pin.
   //
-  // Verified by mutation that the behavioural checks above CANNOT see this:
-  // the mint is inside expandWizardJob's async expansion, so deleting the
-  // field leaves 29/29 green. Hence a source pin.
+  // Re-pointed 2026-08-11 at the surviving mint. TWO blocks used to do this:
+  // one ungated (PR #181) and one flag-gated (PR #173), each pinned by a
+  // different harness, which is exactly why neither caught the other. The
+  // ungated copy is gone; this now pins the flag-gated one.
   assert.ok(
-    /const\s+metaDeriveSource\s*=\s*masterFormats\.find\(\s*\(f\)\s*=>\s*f\s*===\s*META_VIDEO_DERIVE_SOURCE\s*\)/.test(SRC),
-    'the Meta derive source lookup is gone'
+    /if\s*\(isMetaVideoMasterRun\(masterFormats\)\s*&&\s*isMetaVideoDerivativesEnabled\(\)\)/.test(SRC),
+    'the Meta derivative mint is no longer gated on (source master present AND flag on)'
   );
   assert.ok(
-    /for\s*\(const\s+fmt\s+of\s+META_VIDEO_DERIVATIVES\)/.test(SRC),
+    /for\s*\(const\s+fmt\s+of\s+META_VIDEO_DERIVE_KEYS\)/.test(SRC),
     'the Meta derivative loop is gone'
   );
   assert.ok(
-    /deriveFromMaster:\s*metaDeriveSource/.test(SRC),
-    'MONEY: Meta derivatives are minted without deriveFromMaster — each one is now a '
+    /deriveFromMaster:\s*META_VIDEO_DERIVE_MAP\[fmt\]/.test(SRC),
+    'MONEY: Meta derivatives are minted without deriveFromMaster — each one becomes a '
     + 'billable Omni submit instead of a free crop'
   );
 });
 
-check('H4 Meta derivatives are gated on the 9:16 master being in the run', () => {
-  // Deriving 1:1/4:5 from a non-portrait master would be cropping up. The
-  // gate is the `.find(f => f === META_VIDEO_DERIVE_SOURCE)` above plus the
-  // truthiness check on it; assert the constant still names the 9:16 master.
+check('H3b there is exactly ONE Meta derivative mint block', () => {
+  // The duplicate cost nothing (identical digests collided on the unique
+  // index) but it broke the META_VIDEO_DERIVATIVES kill switch — the ungated
+  // copy minted regardless — and double-counted the dry run, so a Meta run
+  // quoted 7 delivered creatives against 4 real ones.
+  const mints = SRC.match(/deriveFromMaster:\s*META_VIDEO_DERIVE_MAP\[fmt\]/g) || [];
   assert.strictEqual(
-    pf.aspectRatioForPlatformFormat('meta_stories_9_16'), '9:16',
-    'META_VIDEO_DERIVE_SOURCE no longer names a 9:16 surface'
+    mints.length, 1,
+    `expected exactly one Meta derivative mint, found ${mints.length} — a second one silently `
+    + 'bypasses the kill switch and inflates the dry-run estimate'
   );
   assert.ok(
-    /if\s*\(metaDeriveSource\)\s*\{/.test(SRC),
-    'the Meta derivative mint is no longer gated on the 9:16 master being present'
+    !/const\s+metaDeriveSource\s*=/.test(SRC),
+    'the removed ungated Meta mint block is back'
+  );
+});
+
+check('H4 the Meta dry-run count is added ONCE, behind the same flag as the mint', () => {
+  const terms = SRC.match(/dryDetPerProduct\s*\+=\s*META_VIDEO_DERIVE_KEYS\.length/g) || [];
+  assert.strictEqual(
+    terms.length, 1,
+    `Meta derivatives counted ${terms.length}x in the dry run — the operator's delivered `
+    + 'estimate drifts from what the mint actually produces'
+  );
+  assert.ok(
+    !/dryMetaDerives/.test(SRC),
+    'the duplicate dry-run Meta term is back'
   );
 });
 
