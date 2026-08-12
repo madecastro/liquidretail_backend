@@ -92,6 +92,35 @@ function enabled() {
 }
 
 /**
+ * The sweep predicate, as a PURE function of the stale cutoff.
+ *
+ * Extracted so a harness can evaluate the real filter against real document
+ * shapes instead of regexing this file. A source-text assertion cannot tell a
+ * working query from one that merely still contains the right words, and this
+ * particular query is the only thing standing between a paid master and a
+ * permanent untitled orphan — so it is worth being able to actually run it.
+ *
+ * @param {Date} staleCutoff  claims older than this may be taken over
+ */
+function buildResumeFilter(staleCutoff) {
+  return {
+    status: 'draft',
+    $or: [
+      // 1. Recovery marked it; titling has not started.
+      { titlingResumeState: STATE_PENDING },
+      // 2. A render was killed mid-flight — reclaim rather than leak the ad.
+      //    Covers BOTH this sweeper's own claims and, since the render path now
+      //    stamps the same state before titling, a normal-path process death.
+      { titlingResumeState: STATE_CLAIMED, updatedAt: { $lt: staleCutoff } },
+      // 3. MIGRATION arm — ads stranded by code that wrote veoVideoUrl +
+      //    status:'draft' and NOTHING else. Self-limiting: handling one gives it
+      //    a renderUrl, after which it can never re-match.
+      { veoVideoUrl: { $ne: null }, renderUrl: null }
+    ]
+  };
+}
+
+/**
  * Claim and title recovered masters. NEVER throws — one bad ad must not kill
  * the pass or the interval. Returns { titled, failed, skipped }.
  */
@@ -114,14 +143,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
     //      signature of that bug, and it is SELF-LIMITING: once handled, the ad
     //      has a renderUrl and can never re-match. Not gated on `kind` because
     //      the old write did not set it.
-    ads = await Ad.find({
-      status: 'draft',
-      $or: [
-        { titlingResumeState: STATE_PENDING },
-        { titlingResumeState: STATE_CLAIMED, updatedAt: { $lt: staleCutoff } },
-        { veoVideoUrl: { $ne: null }, renderUrl: null }
-      ]
-    })
+    ads = await Ad.find(buildResumeFilter(staleCutoff))
       .sort({ updatedAt: 1 })
       .limit(limit)
       .lean();
@@ -341,6 +363,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
 
 module.exports = {
   resumeUntitledMasters,
+  buildResumeFilter,
   enabled,
   fallbackPosterUrl,
   STATE_PENDING,
