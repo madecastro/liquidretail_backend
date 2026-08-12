@@ -84,15 +84,69 @@ const SHOT_STYLE_THRESHOLDS = {
   W_RATIO: 0.20
 };
 
-// LLM shotType → coarse seed style. Used only by resolveSeedStyle.
+// LLM shotType → coarse seed style. Used by resolveSeedStyle AND resolveSeedClass
+// (same families; the new classifier then splits lifestyle|on_model by scene).
 const LLM_LIFESTYLE = new Set(['lifestyle', 'on_model']);
 const LLM_PACKSHOT  = new Set(['product_only', 'flat_lay', 'detail', 'packaging']);
+
+// Production survey of Media.background.sceneType (free-text LLM label, 1-3
+// words, nested under Media.background — a Mixed field):
+//   on_model|Studio = 1316 (dominant), plus Fashion Studio / Studio Portrait /
+//     Apparel Studio / Studio Still Life / Close-Up / Comparison / Minimal /
+//     Beauty / Interior / Floral — a tight photography-studio vocabulary.
+//   lifestyle|Studio = 80 — the lifestyle LABEL sits on studio scenes too.
+//   real environments look like: Urban Street, Open Ocean, Beach, Living Room,
+//     Outdoor Patio, Boat Deck, Desert Dunes, Gym Interior, Home Interior, …
+//
+// ANCHORED on purpose (adversarial review finding): a bare substring match
+// classified "Yoga Studio", "Studio Apartment" and "mountain backdrop" as
+// photography studios — but those are real venues/scenery, exactly the shots
+// an activewear brand wants animated. The pattern below matches the survey's
+// studio vocabulary as WHOLE LABELS (optional fashion/apparel/beauty/photo
+// prefix, optional portrait/still-life/… suffix). "Yoga Studio" has a
+// non-photography prefix → environment. "Studio Apartment" has a suffix
+// outside the set → environment. Unseen studio phrasings therefore default
+// to environment (benefit of the doubt) — extend the suffix/prefix sets from
+// future surveys rather than loosening the anchor.
+const STUDIO_SCENE_RE = new RegExp(
+  '^\\s*(?:(?:fashion|apparel|beauty|photo(?:graphy)?)\\s+)?studio' +
+  '(?:\\s+(?:portrait|still\\s*life|close-?ups?|comparison|minimal|beauty|interior|floral|shots?|scenes?|sets?))?\\s*$',
+  'i'
+);
+// Seamless/cyclorama are unambiguous studio equipment; a bare "Backdrop"
+// label (or explicit "studio backdrop") is studio. "mountain backdrop" is
+// scenery and must NOT match.
+const STUDIO_EQUIPMENT_RE = /\b(?:seamless|cyclorama)\b|^\s*backdrop\s*$|\bstudio\s+backdrop\b/i;
+
+function isStudioSceneLabel(label) {
+  const s = String(label || '').trim();
+  if (!s) return false;
+  return STUDIO_SCENE_RE.test(s) || STUDIO_EQUIPMENT_RE.test(s);
+}
+
+// background.setting is a CLOSED ENUM (subjectTextService prompt):
+//   "studio" | "indoor" | "outdoor" | "lifestyle" | "abstract" |
+//   "product-shot-on-solid" | "other"
+// Enum → verdict map, not a regex (adversarial review: the old substring
+// pass let "product-shot-on-solid" through as an environment).
+const SETTING_PLAIN = new Set(['studio', 'product-shot-on-solid', 'abstract']);
+const SETTING_SCENE = new Set(['outdoor', 'lifestyle', 'indoor']);
+// 'other' / unknown enum values are treated as ABSENT (fall to the
+// per-shotType fallback) rather than guessed.
 
 // Default ON: free, non-billable sharp work. Only an explicit string 'false'
 // (case-insensitive) disables — strict-string convention used across the repo
 // for default-true flags (see titlingResumeService / metaAdsFontService).
 function isEnabled() {
   return String(process.env.CATALOG_SHOT_HEURISTIC_ENABLED ?? 'true').toLowerCase() !== 'false';
+}
+
+// Default OFF. resolveSeedClass ALWAYS computes the scene-based class;
+// seedClassForVideo (and any future call site) gates on this flag. Strict
+// `=== 'true'` so a dashboard string "false" cannot opt in (same convention
+// as DIRECTOR_PROOF_MENU_ENABLED).
+function isSeedClassSceneBased() {
+  return String(process.env.SEED_CLASS_SCENE_BASED ?? 'false').toLowerCase() === 'true';
 }
 
 /**
@@ -353,6 +407,115 @@ function resolveFromMedia(media) {
   return 'unknown';
 }
 
+/**
+ * Scene-based seed class. PURE — never throws, never reads env, never I/O.
+ *
+ * Owner: lifestyle means A REAL ENVIRONMENT. The LLM shotType label is too
+ * coarse: lifestyle|on_model both map to resolveSeedStyle 'lifestyle', and
+ * the lifestyle LABEL sits on studio scenes too (survey). This function
+ * splits that bucket using background.sceneType || background.setting.
+ *
+ * Returns one of:
+ *   'lifestyle_scene'  — real environment (Urban Street, Beach, …)
+ *   'on_figure_plain'  — on-figure / lifestyle LABEL against a studio scene
+ *   'packshot'         — product_only | flat_lay | detail | packaging
+ *   'unknown'
+ *
+ * Rules (order is load-bearing):
+ *   1. shotType ∈ {product_only, flat_lay, detail, packaging} → 'packshot'
+ *      (scene is irrelevant; a product_only Beach still packshot).
+ *   2. shotType ∈ {lifestyle, on_model}:
+ *        scene = background.sceneType || background.setting (strings)
+ *        STUDIO_SCENE_RE match → 'on_figure_plain'
+ *        any other non-empty scene string → 'lifestyle_scene'
+ *        scene ABSENT → fallback:
+ *          shotType === 'lifestyle' → 'lifestyle_scene'
+ *            (its prompt definition already requires scene/props/context)
+ *          shotType === 'on_model'  → 'on_figure_plain'
+ *            (survey: studio dominates on_model)
+ *   3. no usable shotType → technicalInsights.shotStyle:
+ *        'lifestyle' → 'lifestyle_scene'
+ *        'packshot'  → 'packshot'
+ *        else        → 'unknown'   (incl. 'ambiguous')
+ *
+ * Always computes. Do NOT gate this function on SEED_CLASS_SCENE_BASED —
+ * call sites that must stay dark until the flag flips go through
+ * seedClassForVideo (or their own `if (isSeedClassSceneBased())`).
+ *
+ * @returns {'lifestyle_scene'|'on_figure_plain'|'packshot'|'unknown'}
+ */
+function resolveSeedClass(media) {
+  try {
+    if (!media || typeof media !== 'object' || Array.isArray(media)) return 'unknown';
+
+    const shotType = readShotType(media);
+    if (shotType) {
+      if (LLM_PACKSHOT.has(shotType)) return 'packshot';
+      if (LLM_LIFESTYLE.has(shotType)) {
+        const verdict = sceneVerdict(media);
+        if (verdict === 'plain') return 'on_figure_plain';
+        if (verdict === 'scene') return 'lifestyle_scene';
+        // Scene absent/undecidable → per-shotType fallback (do not flip these arms).
+        return shotType === 'lifestyle' ? 'lifestyle_scene' : 'on_figure_plain';
+      }
+      // Unrecognised non-unknown: fall through to heuristic, same as resolveFromMedia.
+    }
+
+    const hs = readHeuristicStyle(media);
+    if (hs === 'lifestyle') return 'lifestyle_scene';
+    if (hs === 'packshot') return 'packshot';
+    return 'unknown';
+  } catch (_) {
+    return 'unknown';
+  }
+}
+
+/**
+ * REMOVED (adversarial review finding): an earlier seedClassForVideo helper
+ * emulated the broad legacy mapping when SEED_CLASS_SCENE_BASED was off —
+ * returning 'lifestyle_scene' for EVERY on_model seed. Same token, opposite
+ * meaning across the flag: any future `=== 'lifestyle_scene'` caller would
+ * have re-opened the PR #152 regression with the flag still off.
+ *
+ * Contract instead: resolveSeedClass ALWAYS computes the scene-based class;
+ * call sites that act on it MUST gate themselves:
+ *
+ *   if (isSeedClassSceneBased() && resolveSeedClass(media) === 'lifestyle_scene') { ... }
+ *
+ * Flag off ⇒ the call site takes today's behaviour, and no dual-meaning
+ * token exists to misuse.
+ */
+
+function readShotType(media) {
+  const cls = media && media.classification;
+  if (!cls || typeof cls !== 'object' || Array.isArray(cls)) return '';
+  const shotType = cls.shotType;
+  if (typeof shotType !== 'string' || !shotType || shotType === 'unknown') return '';
+  return shotType;
+}
+
+function readHeuristicStyle(media) {
+  const ti = media && media.technicalInsights;
+  if (!ti || typeof ti !== 'object' || Array.isArray(ti)) return '';
+  return ti.shotStyle;
+}
+
+// Mixed-field guard. Media.background is Schema.Types.Mixed — production
+// rows are objects, but a string / array / number must never throw.
+// sceneType (free text) wins and is tested with the anchored studio pattern;
+// setting (closed enum) is the fallback and goes through the enum map.
+// Returns 'plain' | 'scene' | 'absent'.
+function sceneVerdict(media) {
+  const bg = media && media.background;
+  if (!bg || typeof bg !== 'object' || Array.isArray(bg)) return 'absent';
+  const sceneType = typeof bg.sceneType === 'string' ? bg.sceneType.trim() : '';
+  if (sceneType) return isStudioSceneLabel(sceneType) ? 'plain' : 'scene';
+  const setting = typeof bg.setting === 'string' ? bg.setting.trim().toLowerCase() : '';
+  if (SETTING_PLAIN.has(setting)) return 'plain';
+  if (SETTING_SCENE.has(setting)) return 'scene';
+  return 'absent';
+}
+
 function clamp01(n) {
   if (!Number.isFinite(n)) return 0;
   if (n <= 0) return 0;
@@ -367,6 +530,10 @@ function round4(n) {
 module.exports = {
   classifyShotStyle,
   resolveSeedStyle,
+  resolveSeedClass,
+  isSeedClassSceneBased,
+  isStudioSceneLabel,
   isEnabled,
+  STUDIO_SCENE_RE,
   SHOT_STYLE_THRESHOLDS
 };
