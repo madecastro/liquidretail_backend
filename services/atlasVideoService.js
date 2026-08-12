@@ -1111,9 +1111,81 @@ function reframePromptContext(media) {
 }
 
 function reframeOutpaintPrompt(aspectRatio, ctx = {}) {
+  // SPLIT-STAGE (PMax 16:9, 2026-08-12). A subject side means the caller has
+  // pre-composed the source onto one half of the target canvas and wants the
+  // model to fill the OTHER half. That is a different instruction from "grow
+  // this image symmetrically", so it gets its own prompt rather than a flag
+  // inside the existing one — and it deliberately ignores REFRAME_PROMPT_STYLE,
+  // because the 'uncrop' style's "continue the subject (reveal more of the
+  // body/product/clothing)" clause is the documented fabrication mechanism and
+  // is exactly wrong when the empty half must stay empty.
+  if (ctx.subjectSide === 'east' || ctx.subjectSide === 'west') {
+    return reframePromptForSplitAspect(aspectRatio, ctx.subjectSide, ctx);
+  }
   return REFRAME_PROMPT_STYLE() === 'uncrop'
     ? uncropPromptForAspect(aspectRatio)
     : reframePromptForAspect(aspectRatio, ctx);
+}
+
+/**
+ * Directional outfill prompt for the split-stage unit.
+ *
+ * THE MODEL HAS NO MASK. `submitImageGeneration` posts
+ * { model, images, prompt, aspect_ratio, resolution } — there is no region or
+ * mask parameter anywhere in the Atlas image API. So direction is steered by
+ * exactly two levers, and this is only one of them: the caller ALSO pre-composes
+ * the subject onto its half of the canvas, so the model is handed an already
+ * asymmetric frame whose empty side is the obvious thing to fill. Prompt alone
+ * is a request; prompt + pre-composed canvas is the standard maskless steer.
+ *
+ * WHY "CALM" AND NEVER "ROOM FOR TEXT". The same billable submit carries a hard
+ * noText directive, and any wording that invites the model to think about copy
+ * is a way to get letterforms rendered into the pixels — which fails review and
+ * wastes the master. The extended region's purpose is described purely in
+ * visual terms; the fact that copy lands there later is the renderer's business,
+ * not the model's.
+ *
+ * Hardening clauses are shared verbatim with reframePromptForAspect so the
+ * person guards (anatomy, source-edge) and SUBJECT IDENTITY protections cannot
+ * drift apart between the two prompts.
+ */
+function reframePromptForSplitAspect(aspectRatio, subjectSide, ctx = {}) {
+  const [wr, hr] = String(aspectRatio).split(':').map(Number);
+  // subjectSide is where the SUBJECT sits; the model extends the opposite side.
+  const keepSide   = subjectSide === 'east' ? 'right' : 'left';
+  const extendSide = subjectSide === 'east' ? 'left'  : 'right';
+
+  const clauses = [
+    `Extend this image into a horizontal ${wr}:${hr} composition. ` +
+    `The subject is already positioned on the ${keepSide} side of the frame: keep it EXACTLY where it is, ` +
+    `at its current size and scale, fully visible and uncropped. Do NOT move, re-centre, rescale or duplicate it. ` +
+    `Build out ONLY the ${extendSide} side of the frame by naturally continuing the existing background, ` +
+    `surface, lighting and palette. The ${extendSide} side must stay calm, open and uncluttered — ` +
+    `plain continued background with no new objects, props, people, patterns or text of any kind. ` +
+    `Seamless and photorealistic, with no visible seam, border, band or colour step where the original ` +
+    `image ends and the extension begins.`
+  ];
+
+  // Shared hardening — same conditions and same wording as reframePromptForAspect.
+  const title = typeof ctx.productTitle === 'string' && ctx.productTitle.trim()
+    ? ctx.productTitle.trim() : null;
+  if (title) {
+    clauses.push(
+      `SUBJECT IDENTITY: The primary subject is "${title}". Preserve its shape, colors, materials, stitching, label text, and every logo or badge exactly as they appear in the source. Do NOT invent alternate garment styles, invent product text, or add branding that isn't in the source.`
+    );
+  }
+  clauses.push(
+    `PHYSICAL ACCURACY: If people are visible, keep hands anatomically correct (5 fingers per hand), keep faces symmetric with paired eyes, and preserve body proportions. Do NOT invent extra digits, mismatched eyes, warped features, or impossible poses. Do NOT alter the identity, hair, skin tone, or facial features of any person from the source.`
+  );
+  // Unconditional here, unlike reframePromptForAspect where it is gated on
+  // hasEdgeClippedSubjects. On a split the subject is deliberately pushed hard
+  // against one edge, so it is ALWAYS edge-adjacent by construction — the very
+  // condition that makes a model invent unseen anatomy sideways.
+  clauses.push(
+    `SOURCE-EDGE PROTECTION: Do NOT invent unseen anatomy, garment or product beyond the visible portions of the subject. Extend the background and setting only into the newly-created region; leave the subject's boundaries exactly where the source ends.`
+  );
+
+  return clauses.join(' ');
 }
 
 // Verbatim uncrop prompt from ReachSocialLLMExpander media.ts:uncropPrompt.
@@ -1384,14 +1456,24 @@ function cloudinaryPadUrl(sourceUrl, aspectRatio, hex) {
 // Cloudinary and so can't be transformed by URL. Same geometry as
 // padToRatioBuffer but a flat fill instead of a blurred cover — on a uniform
 // studio background the blurred version smears product colour into the bands.
-async function padSolidBuffer(srcBuffer, W, H, hex) {
+// GRAVITY (added 2026-08-12 for the PMax 16:9 split-stage unit). Defaults to
+// 'center', which is byte-for-byte the previous behaviour — every existing
+// caller is unchanged.
+//
+// 'east' / 'west' anchor the subject to one side and leave the opposite side as
+// flat fill. That asymmetry is the whole point of the split unit: the empty side
+// becomes the region the outfill model extends into, and later the region ad
+// copy is composited onto. It is ALSO why this must stay a solid sampled fill —
+// a half-frame of blurred smear would be the most visible band this codebase has
+// ever shipped (see seedPadDecision above).
+async function padSolidBuffer(srcBuffer, W, H, hex, gravity = 'center') {
   try {
     const fg = await sharp(srcBuffer).rotate().resize(W, H, { fit: 'inside' }).toBuffer();
     const r = parseInt(hex.slice(0, 2), 16);
     const g = parseInt(hex.slice(2, 4), 16);
     const b = parseInt(hex.slice(4, 6), 16);
     return await sharp({ create: { width: W, height: H, channels: 3, background: { r, g, b } } })
-      .composite([{ input: fg, gravity: 'center' }])
+      .composite([{ input: fg, gravity }])
       .jpeg({ quality: 92 })
       .toBuffer();
   } catch (err) {
@@ -1687,7 +1769,7 @@ async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
 // skip / $0 pad). NEVER throws — any failure degrades to deterministic Cloudinary
 // crop so the ad pipeline keeps moving. Successful reframes (incl. exact / pad)
 // are persisted on Media.metadata.reframes[aspectKey] for reuse.
-async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand }) {
+async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand, subjectSide = null }) {
   const cropUrl = () => cropImageUrlForAspect(sourceUrl, aspectRatio, brand);
   // Set when we find a cached asset from an OLDER ladder. We re-derive it, but
   // it stays the last resort: an old reframe is a real, correctly-shaped image,
@@ -1702,7 +1784,19 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
     // 2. Mongo-safe aspect key: alphanumeric+underscore only, so ':' AND
     //    '.' are removed ('9:16'→'9_16', '1.91:1'→'1_91_1'). A raw dot would
     //    make the $set path nest and permanently miss the flat-key read.
-    const aspectKey = String(aspectRatio).replace(/[^a-z0-9]+/gi, '_');
+    //
+    //    SPLIT DIMENSION (2026-08-12). A split-stage seed is NOT interchangeable
+    //    with a plain reframe of the same media at the same aspect: the subject
+    //    is anchored to one side and half the frame is generated. Two different
+    //    split sides are not interchangeable with each other either. Without
+    //    this suffix the aspect-only key would hand a 16:9 video run a
+    //    subject-hard-right seed (or the reverse), silently, from cache — the
+    //    kind of failure that costs a billable master and looks like a model
+    //    problem. Plain reframes keep the exact key they have today, so no
+    //    existing cache entry is invalidated or shadowed.
+    const splitSide = (subjectSide === 'east' || subjectSide === 'west') ? subjectSide : null;
+    const aspectKey = String(aspectRatio).replace(/[^a-z0-9]+/gi, '_')
+      + (splitSide ? `_split_${splitSide}` : '');
 
     // 3. PERSISTENT CACHE HIT — no spend, no submit (survives restarts).
     //    Only `.url` counts: a claim-only entry ({ claim: { at, by } }) is NOT
@@ -1940,7 +2034,10 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
           const id = await submitImageGeneration({
             model: REFRAME_OUTPAINT_MODEL(),
             images: [srcNorm.url],
-            prompt: reframeOutpaintPrompt(aspectRatio, reframePromptContext(media)),
+            // splitSide rides in the prompt context so reframeOutpaintPrompt can
+            // switch to the directional instruction. null for every existing
+            // caller, which keeps their prompt byte-identical.
+            prompt: reframeOutpaintPrompt(aspectRatio, { ...reframePromptContext(media), subjectSide: splitSide }),
             aspectRatio,
             resolution: REFRAME_RESOLUTION()
           });
@@ -2031,7 +2128,20 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
             const fill = srcRatio
               ? await detectBorderFill(srcNorm.buffer, srcRatio, wr / hr)
               : { uniform: false, hex: null };
-            const padDec = seedPadDecision(fill);
+            // SPLIT SEEDS NEVER PAD (2026-08-12). On a split the source has been
+            // pre-composed hard against one edge, so "pad the rest" means
+            // shipping a frame that is literally half flat fill — the single
+            // most visible band this pipeline could produce, and the exact
+            // defect class PR #155 removed, just at 50% scale instead of a
+            // letterbox strip. detectBorderFill would often even call that fill
+            // uniform (it IS uniform — it's our own fill), so seedPadDecision
+            // cannot be trusted to refuse it here. Crop instead: the caller
+            // reads a null/cropped result as "outfill unavailable" and falls
+            // back to the deterministic brand_panel treatment, which is a
+            // designed flat panel rather than an accident.
+            const padDec = splitSide
+              ? { action: 'crop', reason: 'split-seed-never-pads' }
+              : seedPadDecision(fill);
             if (padDec.action !== 'pad-solid') {
               console.warn(
                 `⚠️  reframeReferenceForAspect[${aspectKey}]: ${padDec.reason} — ` +
@@ -4064,6 +4174,10 @@ module.exports = {
   resolveReferenceImageCount,
   // Seed pad-vs-crop rule — scripts/verifyNoVisibleSeedPad.js.
   seedPadDecision,
+  // Split-stage seed prep — scripts/verifyPmaxSplitSeedPad.js.
+  reframeOutpaintPrompt,
+  reframePromptForSplitAspect,
+  padSolidBuffer,
   // Lifestyle video ref-count gate — scripts/verifyLifestylePreserve.js.
   resolveLifestyleVideoRefCount,
   resolveLifestyleVideoRefPlan,
