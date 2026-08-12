@@ -37,7 +37,10 @@ const {
 const {
   isVideoProductAnchorEnabled,
   productRegionForAd,
-  buildProductAnchorBlock
+  buildProductAnchorBlock,
+  videoSubjectHoldEnabled,
+  subjectHoldRegionForMedia,
+  buildSubjectHoldBlock
 } = require('./videoProductAnchor');
 const PLATFORM_FORMAT_ASPECT = Object.fromEntries(
   Object.entries(PLATFORM_FORMATS).map(([k, v]) => [k, v.aspectRatio])
@@ -638,17 +641,40 @@ function buildVeoPrompt({
   // caps.promptByteCap in BYTES. Over-cap → silent no-anchor. The block
   // is NOT in DROP_PRIORITY, so pushing it over budget would squeeze
   // optional lines (and must never displace noText). Skip instead.
+  // SUBJECT HOLD (VIDEO_SUBJECT_HOLD): set when no product is confidently
+  // called out, so the timeline below drops its product-hunting language too.
+  // Declared here because the anchor attempt is what determines it.
+  let subjectHold = false;
   if (lifestyle && isVideoProductAnchorEnabled()) {
     const hit = productRegionForAd({ product, media });
-    if (hit) {
-      const block = buildProductAnchorBlock(hit);
-      if (block) {
-        const cap = (caps && Number(caps.promptByteCap) > 0)
-          ? Number(caps.promptByteCap)
-          : 4096;
-        const next = [...lines, block].join(' ');
-        if (Buffer.byteLength(next, 'utf8') <= cap) lines.push(block);
+    let block = hit ? buildProductAnchorBlock(hit) : null;
+    // No confident product → hold the person instead of letting the camera
+    // hunt for one. Owner 2026-08-12. Only ever a FALLBACK: a resolved product
+    // anchor always wins, so this can never displace product focus.
+    if (!hit && videoSubjectHoldEnabled()) {
+      const held = subjectHoldRegionForMedia(media);
+      const holdBlock = held ? buildSubjectHoldBlock(held) : null;
+      if (holdBlock) {
+        block = holdBlock;
+        subjectHold = true;
       }
+    }
+    if (block) {
+      const cap = (caps && Number(caps.promptByteCap) > 0)
+        ? Number(caps.promptByteCap)
+        : 4096;
+      const next = [...lines, block].join(' ');
+      if (Buffer.byteLength(next, 'utf8') <= cap) lines.push(block);
+      // Over cap → the block was dropped, so the hold timeline must NOT run
+      // either. Shipping "hold the composition" pacing with no block saying
+      // what to hold, while the scene lines still chase a product, is the
+      // self-contradictory-prompt class that forced the PR #61 rollback.
+      //
+      // Written as a SEPARATE statement testing the outcome, deliberately: an
+      // `else` here would leave a dangling clause when verifyVideoProductAnchor
+      // P6 rewrites the line above to an unconditional push, turning that
+      // revert-proof into a syntax error instead of a real mutation.
+      if (subjectHold && !lines.includes(block)) subjectHold = false;
     }
   }
 
@@ -690,6 +716,22 @@ function buildVeoPrompt({
         : `Scene 2 (${t1}–${t2}s): hold the product as the star with centre-safe framing; soft ambient motion continues; optional gentle push or drift as a real camera would. ` +
           `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
           `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear and centre-safe; natural motion only, never fantasy.`)
+    );
+  } else if (lifestyle && subjectHold) {
+    // SUBJECT-HOLD timeline. The stock lifestyle timeline opens with "gentle
+    // camera finds the product already in the lifestyle plate" — and that
+    // instruction is precisely the defect when no product is identified: it
+    // sends the model hunting, and it picks something. So the product-hunting
+    // language is REPLACED here, not merely softened, and the beat times
+    // (t1/t2) stay identical so Remotion's brand-script still lines up via
+    // specTimeScale. Reachable only with VIDEO_SUBJECT_HOLD on AND a hold
+    // block actually in the prompt, so flag-off is byte-identical (B14).
+    lines.push(
+      `Timeline (${dur.toFixed(1)}s): ` +
+      `Scene 1 (0.0–${t1}s): settle into the real moment exactly as framed — do not search for or single out a product; ambient life may begin (fabric with the wearer, hair, breath, steam, water, foliage as present). No whip, no orbit, no parallax. ` +
+      `Scene 2 (${t1}–${t2}s): hold the framing. The person stays in frame with the face readable throughout; soft ambient motion continues around them; no push-in, no drift, no reframing. ` +
+      `Everything visible keeps its real identity — items may move only as the real thing would with the wearer/scene; never morph or independently animate. ` +
+      `Scene 3 (${t2}–${dur.toFixed(1)}s): end on essentially the opening composition, face still readable; natural motion only, never fantasy.`
     );
   } else if (lifestyle) {
     lines.push(
