@@ -6,7 +6,8 @@
 //
 //   1. An Ad wedged in 'rendering' — alerted BEFORE the 15-minute reap so
 //      a dead web instance is visible while the evidence is still fresh.
-//   2. A CampaignRun 'running' far longer than a batch should take.
+//   2. A CampaignRun 'running' that has gone SILENT — age is only a
+//      noise filter (see arm 2 below). Never key this on startedAt alone.
 //   3. The DetectRun queue growing — the one queue the worker actually
 //      drains, so a real backlog there means the worker is wedged.
 //   4. Spend in the trailing hour above a ceiling. Video is the expensive
@@ -38,10 +39,20 @@ const N = (name, dflt) => {
 // 12 min sits under worker.js's REAP_STALE_MIN (15) on purpose — we want the
 // warning before the reaper rewrites the evidence.
 const RENDERING_STALE_MIN = () => N('ALERT_RENDERING_STALE_MIN', 12);
-// A 20-ad veo batch at VEO_CONCURRENCY=4 is ~1 min/ad wall-clock per slot
-// (~5 min for 20 if each takes ~1 min). 45 is "this is not progressing".
-// (Historical: at VEO_CONCURRENCY=1 a 20-ad batch was ~20–35 min.)
+// AGE is a noise filter only — a 20-ad veo batch at VEO_CONCURRENCY=4 is
+// ~1 min/ad wall-clock per slot (~5 min for 20 if each takes ~1 min).
+// 45 still clears a legitimately long batch. (Historical: at
+// VEO_CONCURRENCY=1 a 20-ad video batch was ~20–35 min.)
 const RUN_STALE_MIN       = () => N('ALERT_RUN_STALE_MIN', 45);
+// SILENCE is the trigger. MUST stay strictly below worker.js's
+// REAP_STALE_MIN (default 15). The reaper mutates
+//   { status:'running', updatedAt: { $lt: 15m } } → failed
+// every REAP_INTERVAL_MIN (5), so a silence threshold >= 15 is a
+// structurally empty set (the reaper rewrites the evidence first).
+// 12 sits under 15 the same way RENDERING_STALE_MIN does — we want
+// the warning before that rewrite. Do NOT "fix" this by dropping
+// startedAt and raising updatedAt to 45: that is the empty set.
+const RUN_SILENCE_MIN     = () => N('ALERT_RUN_SILENCE_MIN', 12);
 const DETECT_BACKLOG_MIN  = () => N('ALERT_DETECT_BACKLOG_MIN', 20);
 const DETECT_BACKLOG_N    = () => N('ALERT_DETECT_BACKLOG_COUNT', 25);
 const HOURLY_SPEND_USD    = () => {
@@ -92,21 +103,34 @@ async function runWatchdog() {
     console.warn(`🔔 watchdog[ads-rendering] failed: ${err.message}`);
   }
 
-  // ── 2. CampaignRuns running too long ──
+  // ── 2. CampaignRuns that have gone silent ──
+  // AGE ∧ SILENCE. startedAt is a noise filter (a brand-new run whose
+  // first $inc has not landed yet must not trip this). SILENCE is the
+  // trigger, and it sits under REAP_STALE_MIN on purpose — see
+  // RUN_SILENCE_MIN. The rejected alternative (swap startedAt for
+  // updatedAt at the 45m age threshold) is a structurally empty set:
+  // the reaper already flips that row to failed at 15m.
   try {
-    const cutoff = ago(RUN_STALE_MIN());
-    const runs = await CampaignRun.find({ status: 'running', startedAt: { $lt: cutoff } })
+    const ageMin     = RUN_STALE_MIN();
+    const silenceMin = RUN_SILENCE_MIN();
+    const runs = await CampaignRun.find(buildStalledRunFilter({ now, ageMin, silenceMin }))
       .sort({ startedAt: 1 }).limit(20)
-      .select('runId brandId total succeeded failed skipped startedAt').lean();
+      .select('runId brandId total succeeded failed skipped startedAt updatedAt').lean();
     if (runs.length) {
       await alerts.notify({
         level: 'error',
         title: `${runs.length} campaign run(s) not progressing`,
         key:   'watchdog:runs-stalled',
-        fields: { 'running past': `${RUN_STALE_MIN()}m`, 'queued ads': queuedAds ?? undefined },
+        fields: {
+          'running past': `${ageMin}m`,
+          'silent past':  `${silenceMin}m`,
+          'queued ads':   queuedAds ?? undefined
+        },
         detail: runs.map((r) =>
           `${r.runId} ${r.succeeded || 0}✓/${r.failed || 0}✗/${r.skipped || 0}⊘ of ${r.total || 0} ` +
-          `age=${Math.round((now - new Date(r.startedAt).getTime()) / 60000)}m brand=${r.brandId || '-'}`
+          `age=${Math.round((now - new Date(r.startedAt).getTime()) / 60000)}m ` +
+          `idle=${Math.round((now - new Date(r.updatedAt).getTime()) / 60000)}m ` +
+          `brand=${r.brandId || '-'}`
         ).join('\n')
       });
     }
@@ -160,4 +184,50 @@ async function runWatchdog() {
   }
 }
 
-module.exports = { runWatchdog };
+/**
+ * Arm-2 predicate as a PURE function of now + the two thresholds.
+ *
+ * AGE  (startedAt  < now - ageMin)     — noise filter; default 45m.
+ * SILENCE (updatedAt < now - silenceMin) — the trigger; default 12m.
+ *
+ * Extracted so a harness can evaluate the REAL filter against REAL
+ * document shapes. The live query MUST call this; a copy in the
+ * harness would drift.
+ *
+ * `now` is a Date or epoch-ms. Thresholds are minutes; omitted
+ * values fall through to the env-configurable defaults.
+ */
+function buildStalledRunFilter({ now, ageMin, silenceMin } = {}) {
+  const t = now instanceof Date ? now.getTime() : (Number(now) || Date.now());
+  const age = ageMin != null ? Number(ageMin) : RUN_STALE_MIN();
+  const silence = silenceMin != null ? Number(silenceMin) : RUN_SILENCE_MIN();
+  return {
+    // 'preparing' IS INCLUDED, and it is the arm that was actually missing.
+    //
+    // The reaper only matches status:'running', so a run that dies during
+    // EXPANSION — the Director round, the mint — never leaves 'preparing'.
+    // Nothing reaps it and, until this line, nothing alerted on it either:
+    // this filter was 'running'-only, so the one state with no reaper was also
+    // the one state with no warning.
+    //
+    // MEASURED 2026-08-13: eight such runs in production, the oldest 8.3 days
+    // old, every one with total=0 / succeeded=0 / failed=0 and updatedAt never
+    // moved off startedAt. Eight generations that silently did nothing and
+    // reported nothing.
+    //
+    // They are also the SAFE half of the pair to alert on: 'preparing' means
+    // expansion never finished, so the run holds no claimed ads and no spend —
+    // the alert is about a silent no-op, not about stranded money.
+    status: { $in: ['preparing', 'running'] },
+    startedAt: { $lt: new Date(t - age * 60 * 1000) },
+    updatedAt: { $lt: new Date(t - silence * 60 * 1000) }
+  };
+}
+
+module.exports = {
+  runWatchdog,
+  buildStalledRunFilter,
+  RUN_STALE_MIN,
+  RUN_SILENCE_MIN,
+  RENDERING_STALE_MIN
+};
