@@ -5,6 +5,42 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-12 — rating provenance (Gemini must commit; sourced wins when flagged)
+
+Owner: *"Let's ask gemini to always get provenance, and yes scraped is better
+than something unsourced."* Hole: `pickBestRating` could print a `source: null`
+number because both pass-2 schemas made `source` optional and both assemblies
+fold the legacy single rating in as unsourced.
+
+Always-on (not flagged): both `ratings.items` now `required: ['rating', 'source']`
+with `source` still **nullable** (a forced string would make the model invent a
+site). Both structure prompts demand a real site/domain and ban guessing.
+
+Opt-in ranking: `RATING_REQUIRE_PROVENANCE` (default **false**). Flag-off is
+today's ranking. Flag-on: a sourced candidate beats an unsourced one; if
+nothing is sourced the unsourced number still wins (fail-safe). Two-tier
+owner ranking is unchanged and runs over the chosen pool. `ratingCandidates`
+keeps every row. Legacy `{... source: null}` fold-ins were left as-is.
+
+Harness: `scripts/verifyRatingProvenance.js` (17 checks). Existing N10 pin
+updated to the new required list (strictly stronger — it now demands both keys).
+
+Verified beyond the harness: flag-off was measured equivalent to
+`origin/main`'s `pickBestRating` across **400 candidate sets** (a matrix over
+ratings incl. 0/negative/>5, counts incl. null/0, and sources incl. null and
+whitespace-only) — 0 differences, throw-for-throw included. Revert-proven on
+four mutations: drop the partition → B1/B2/B3/D3 red; drop the fail-safe →
+C1/C2/E3 red **and `winner` becomes undefined, i.e. an all-unsourced brand
+would THROW, not merely lose its stars**; `anyTier1` back to all rows → D3
+red; `ratingCandidates: ranked` → E2 red.
+
+⚠️ **NOT yet measured live:** that Gemini accepts `required` + `nullable: true`
+on `source` and answers with a real site rather than more nulls. The
+`ratings`-array-required change above it WAS measured; this one is inferred
+from the same schema semantics. First live enrichment should be checked for a
+rise in `source: null` — if the model starts refusing to attribute, the prompt
+demand is what to tune, not the nullability (which exists to stop invention).
+
 ## 2026-08-12 — static CTA + ratings (branch `fix/static-cta-and-ratings`)
 
 Two creative-quality defects on the delivered AllBirds Cruiser statics

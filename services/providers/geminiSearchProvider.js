@@ -260,6 +260,13 @@ const RATING_MIN_CREDIBLE_REVIEWS = (() => {
   return 50;
 })();
 
+// Opt-in: a sourced aggregate always beats an unsourced one. Default OFF so
+// today's ranking is byte-identical until the flag is flipped. Read at call
+// time (not module load) so a harness can toggle it per check.
+function ratingRequireProvenanceEnabled() {
+  return String(process.env.RATING_REQUIRE_PROVENANCE || 'false').toLowerCase() === 'true';
+}
+
 /**
  * pickBestRating(candidates) → { rating, reviewCount, ratingSource, ratingCandidates }
  *
@@ -314,6 +321,23 @@ function pickBestRating(candidates) {
     .filter((c) => c.reviewCount == null || c.reviewCount >= RATING_MIN_SAMPLE_ANY);
   if (!rows.length) return { rating: null, reviewCount: null, ratingSource: null, ratingCandidates: [] };
 
+  // Provenance gate sits ABOVE the two-tier ranking, never instead of it.
+  // Flag OFF: pool is every row (byte-identical to today). Flag ON: a sourced
+  // candidate always beats an unsourced one. FAIL-SAFE: when NOTHING is sourced,
+  // rank every row — this can never take a brand's rating away; it can only
+  // change WHICH number wins when both a sourced and an unsourced candidate exist.
+  // Owner 2026-08-12: "ask gemini to always get provenance, and yes scraped is
+  // better than something unsourced."
+  let pool = rows;
+  let excluded = [];
+  if (ratingRequireProvenanceEnabled()) {
+    const sourced = rows.filter((r) => r.source != null);
+    if (sourced.length) {
+      excluded = rows.filter((r) => r.source == null);
+      pool = sourced;
+    }
+  }
+
   let starMin = 4.39;
   try {
     const { RATING_STAR_MIN } = require('../ratingDisplay');
@@ -321,8 +345,8 @@ function pickBestRating(candidates) {
   } catch (_) { /* fall back to the documented default */ }
 
   const credible = (c) => c.rating > starMin && (c.reviewCount || 0) >= RATING_MIN_CREDIBLE_REVIEWS;
-  const anyTier1 = rows.some(credible);
-  const ranked = rows.slice().sort((a, b) => {
+  const anyTier1 = pool.some(credible);
+  const ranked = pool.slice().sort((a, b) => {
     const pa = credible(a), pb = credible(b);
     if (pa !== pb) return pa ? -1 : 1;
     const ca = a.reviewCount || 0, cb = b.reviewCount || 0;
@@ -336,7 +360,10 @@ function pickBestRating(candidates) {
     return cb - ca;
   });
   const winner = ranked[0];
-  if (rows.length > 1) {
+  if (excluded.length) {
+    console.log(`   · rating source: set aside ${excluded.length} unsourced candidate(s); chose ${winner.rating}★ / ${winner.reviewCount ?? '?'} reviews${winner.source ? ` (${winner.source})` : ''}`);
+  }
+  if (pool.length > 1) {
     const others = ranked.slice(1)
       .map((c) => `${c.rating}★/${c.reviewCount ?? '?'}${c.source ? ` ${c.source}` : ''}`).join(', ');
     console.log(`   · rating source: chose ${winner.rating}★ / ${winner.reviewCount ?? '?'} reviews${winner.source ? ` (${winner.source})` : ''} over ${others}`);
@@ -345,7 +372,9 @@ function pickBestRating(candidates) {
     rating: winner.rating,
     reviewCount: winner.reviewCount,
     ratingSource: winner.source,
-    ratingCandidates: ranked
+    // Audit trail: ranked pool first, then any unsourced rows the flag set
+    // aside. Nothing is silently dropped.
+    ratingCandidates: ranked.concat(excluded)
   };
 }
 
@@ -826,7 +855,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
     `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average\n` +
+    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average. Every entry MUST carry the source site/domain it came from; use null ONLY when the narrative genuinely does not attribute the number; NEVER guess or invent a source.\n` +
     `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall brand sentiment"\n` +
@@ -899,7 +928,19 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
                     rating:      { type: 'number' },
                     reviewCount: { type: 'number', nullable: true }
                   },
-                  required: ['rating']
+                  // source is REQUIRED but stays NULLABLE.
+                  //
+                  // Declared optional, Gemini simply omits it, and pickBestRating
+                  // then treats the number as unsourced — so an unattributable 5.0
+                  // can beat a sourced 4.5. Required+nullable forces the model to
+                  // COMMIT to either a real site name or an explicit null, instead
+                  // of silently omitting the field.
+                  //
+                  // Do NOT make source non-nullable. Forcing a non-null string
+                  // makes the model INVENT a source name when it cannot identify
+                  // one, and a fabricated provenance is worse than an absent one
+                  // because it looks auditable and is not.
+                  required: ['rating', 'source']
                 }
               },
               rating:      { type: 'number',  nullable: true },
@@ -1024,7 +1065,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
     `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average\n` +
+    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average. Every entry MUST carry the source site/domain it came from; use null ONLY when the narrative genuinely does not attribute the number; NEVER guess or invent a source.\n` +
     `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall product sentiment"\n` +
@@ -1098,7 +1139,19 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
                     rating:      { type: 'number' },
                     reviewCount: { type: 'number', nullable: true }
                   },
-                  required: ['rating']
+                  // source is REQUIRED but stays NULLABLE.
+                  //
+                  // Declared optional, Gemini simply omits it, and pickBestRating
+                  // then treats the number as unsourced — so an unattributable 5.0
+                  // can beat a sourced 4.5. Required+nullable forces the model to
+                  // COMMIT to either a real site name or an explicit null, instead
+                  // of silently omitting the field.
+                  //
+                  // Do NOT make source non-nullable. Forcing a non-null string
+                  // makes the model INVENT a source name when it cannot identify
+                  // one, and a fabricated provenance is worse than an absent one
+                  // because it looks auditable and is not.
+                  required: ['rating', 'source']
                 }
               },
               rating:      { type: 'number',  nullable: true },

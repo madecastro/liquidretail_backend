@@ -874,8 +874,8 @@ check('N10 the ratings array is REQUIRED in the pass-2 schema, on both lookups',
   for (const b of blocks) {
     assert.ok(!/nullable: true/.test(b.split('items:')[0]),
       'the ratings ARRAY must not be nullable — an empty array is how "none found" is said');
-    assert.ok(/required: \['rating'\]/.test(b),
-      'each entry must require a numeric rating, so a non-numeric grade is omitted rather than emitted as null');
+    assert.ok(/required: \['rating', 'source'\]/.test(b),
+      'each entry must require a numeric rating AND a source (nullable) so Gemini commits to provenance');
     // REQUIRED and NON-NULLABLE are different guarantees, and only asserting the first
     // let a mutation adding `nullable: true` here pass: the model would then satisfy
     // the schema with {source:'BBB', rating:null}, which is not an aggregate at all and
