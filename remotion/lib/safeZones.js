@@ -116,11 +116,40 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
     flexDirection: 'column',
   };
   const topFor = (frac) => clampFrac(frac + offsetY, safe.top, 1 - safe.bottom - 0.05) * height;
+
+  // THE FLOOR (2026-08-12). A top-anchored stack used to set `top` and NOTHING
+  // ELSE, so the box had no bottom edge and the flex column simply grew
+  // downward — straight through the platform's blocked band.
+  //
+  // MEASURED on a delivered PMax landscape ad (Marine Layer, run
+  // run_1786526271150_7d498862): landscapeYt blocks the bottom 36%, i.e.
+  // everything below y=691 of 1080. The quote landed at y=647..684 — safe —
+  // and the rating/review lines beneath it at y=774..795, a full 100px INSIDE
+  // the band that YouTube paints its player chrome over.
+  //
+  // topFor() looks like it protects this and does not: it clamps where the
+  // stack STARTS (never below 1 - bottom - 0.05), which says nothing about how
+  // far the stack EXTENDS. A three-line group starting at the last legal top
+  // clears the floor easily.
+  //
+  // So the file's own documented invariant — "no spec offset can push content
+  // under platform UI" — held for exactly two of five anchors: `bottom` and
+  // `center` set a bottom inset, the three top-anchored ones did not.
+  //
+  // overflow:hidden is deliberate and is a trade, not an oversight. Given a
+  // group too tall for its band the choices are: paint under the chrome
+  // (illegible AND against platform guidance), or clip at the boundary. Clipping
+  // is the lesser harm, and it is now unlikely rather than routine — the
+  // format-aware character caps (slotContent.js deriveCharCap) size copy to the
+  // box it actually renders into, so the overflow this guards against should be
+  // the exception it was always assumed to be.
+  const floor = { bottom: safe.bottom * height, overflow: 'hidden' };
+
   switch (anchor) {
     case 'top':
-      return { ...base, top: topFor(safe.top) };
+      return { ...base, ...floor, top: topFor(safe.top) };
     case 'upperThird':
-      return { ...base, top: topFor(ANCHOR_TOP.upperThird) };
+      return { ...base, ...floor, top: topFor(ANCHOR_TOP.upperThird) };
     case 'center':
       return {
         ...base,
@@ -131,7 +160,17 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
         justifyContent: 'center',
       };
     case 'lowerThird':
-      return { ...base, top: topFor(ANCHOR_TOP.lowerThird) };
+      // lowerThird is the worst offender and gets the strongest treatment: it
+      // is MEANT to sit low, so it grows UPWARD from the safe floor instead of
+      // downward from a line near it. Anchoring it by `top` is what let the
+      // measured rating/review overflow happen — starting low and growing
+      // down has nowhere to go but under the chrome.
+      return {
+        ...base,
+        ...floor,
+        top: topFor(ANCHOR_TOP.lowerThird),
+        justifyContent: 'flex-end',
+      };
     case 'bottom':
     default:
       return {
