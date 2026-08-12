@@ -425,9 +425,30 @@ function isVideoLifestylePromptEnabled() {
  */
 function shouldUseLifestyleVideoPrompt(seedStyle, variantKind = null) {
   if (!isVideoLifestylePromptEnabled()) return false;
-  if (variantKind === 'ugc') return true;
-  if (seedStyle === 'lifestyle') return true;
-  return false;
+  // MEDIA PATH ONLY (owner, 2026-08-11): "make sure that the only things going
+  // into it right now are images through the media path not through the
+  // product images path."
+  //
+  // Ad.variantKind is a required enum of exactly ['product_image','ugc'], so
+  // 'ugc' IS the media path and 'product_image' IS the product images path.
+  // Testing for 'ugc' therefore expresses the rule exactly, with no third
+  // state to reason about in production.
+  //
+  // WHAT WAS REMOVED, and why it mattered: `seedStyle === 'lifestyle'` used to
+  // also open this branch. resolveSeedStyle maps BOTH 'lifestyle' AND
+  // 'on_model' into the lifestyle bucket (imageShotHeuristicService
+  // LLM_LIFESTYLE), and an on-model catalog packshot — activewear photographed
+  // on a person, i.e. most of an apparel catalogue — is a PRODUCT shot. So for
+  // brands like GymShark essentially every product-path seed took this branch
+  // without anyone selecting it. Because the branch caps references to 1, the
+  // operator's three picks were then discarded. Observed live:
+  //   "lifestyle video path caps references to 1 (seed only; 3 operator picks reduced)"
+  //
+  // The classification itself is intentionally NOT touched: LLM_LIFESTYLE is
+  // shared with the STATIC preserve path, and re-bucketing on_model there
+  // would change static behaviour nobody asked to change. That work — plus an
+  // operator-facing control — is tracked separately.
+  return variantKind === 'ugc';
 }
 
 /**
