@@ -256,12 +256,90 @@ async function stampFeedTruthCategoryRef({ brandId, advertiserId = null, feedCat
   return null;
 }
 
+// Apply a resolved feed-truth stamp to a CatalogProduct row. Handles
+// three cases in one call so the ingest paths don't have to reimplement
+// rename detection:
+//
+//   INSERT   — product.categoryRef is null/missing → stamp
+//   NOOP     — product.categoryRef already points at feed truth OR at
+//              a Category whose breadcrumbKey matches (no change needed)
+//   RENAME   — product.categoryRef points at a DIFFERENT Category from
+//              the current feed-truth resolution → overwrite with the
+//              new leaf id
+//
+// The rename case is what makes re-sync propagate a merchant's rename
+// (e.g. "Shirts" → "Tops") without a separate backfill: the ingest
+// loop already calls stampFeedTruthCategoryRef every pass, and this
+// helper now diverts to overwrite when the current ref has drifted.
+//
+// Callers pass the product row (already loaded post-upsert) so we
+// don't re-read it. If the caller has only the id, they can pass
+// { _id, categoryRef } and it still works.
+//
+// Best-effort like the surrounding stamping code — never throws.
+// Returns { action, from?, to?, categoryId? } for the caller to log.
+async function applyFeedTruthStamp(product, stamp) {
+  if (!product || !stamp?.categoryId) return { action: 'no-stamp' };
+  const CatalogProduct = require('../models/CatalogProduct');
+  const Category = require('../models/Category');
+
+  // INSERT — no existing ref. Guarded write in case a concurrent
+  // process set the ref between load and update.
+  if (!product.categoryRef) {
+    try {
+      await CatalogProduct.updateOne(
+        { _id: product._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+        { $set: { categoryRef: stamp.categoryId } }
+      );
+      return { action: 'inserted', to: String(stamp.categoryId) };
+    } catch (err) {
+      return { action: 'error', error: err.message };
+    }
+  }
+
+  // Fast NOOP path — same id, no read needed.
+  if (String(product.categoryRef) === String(stamp.categoryId)) {
+    return { action: 'noop', reason: 'ref-matches' };
+  }
+
+  // Rename detection — compare breadcrumbKeys. Two ids can point at
+  // the SAME normalized path in rare race cases (e.g. cascade-delete
+  // + re-insert while the sync is running); treat those as noop too.
+  try {
+    const [currentCat, newCat] = await Promise.all([
+      Category.findById(product.categoryRef).select('breadcrumbKey deletedAt').lean(),
+      Category.findById(stamp.categoryId).select('breadcrumbKey').lean()
+    ]);
+    if (!newCat) return { action: 'noop', reason: 'new-category-missing' };
+    // If the current ref is tombstoned OR the keys differ, overwrite.
+    // Same-key + non-tombstoned = true noop.
+    const isTombstoned = !!currentCat?.deletedAt;
+    const keysDiffer   = currentCat?.breadcrumbKey !== newCat.breadcrumbKey;
+    if (!isTombstoned && !keysDiffer) {
+      return { action: 'noop', reason: 'key-matches' };
+    }
+    await CatalogProduct.updateOne(
+      { _id: product._id },
+      { $set: { categoryRef: stamp.categoryId } }
+    );
+    return {
+      action: isTombstoned ? 'rehomed-from-tombstone' : 'renamed',
+      from:   currentCat?.breadcrumbKey || null,
+      to:     newCat.breadcrumbKey,
+      categoryId: String(stamp.categoryId)
+    };
+  } catch (err) {
+    return { action: 'error', error: err.message };
+  }
+}
+
 module.exports = {
   ENUM_TO_COARSE_BREADCRUMB,
   inferCoarseEnum,
   resolveCoarseCategoryRef,
   resolveFeedCategoryRef,
   stampFeedTruthCategoryRef,
+  applyFeedTruthStamp,
   isFeedTruthCategoriesEnabled,
   getCoarseBreadcrumb,
   getCoarseSubtreeIds

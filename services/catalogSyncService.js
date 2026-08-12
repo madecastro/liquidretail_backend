@@ -12,7 +12,7 @@ const axios = require('axios');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const CatalogProduct = require('../models/CatalogProduct');
 const { decrypt } = require('./integrationCryptoService');
-const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
+const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('./categoryClassifier');
 const { startRun, CancelledError } = require('./progressService');
 const { concurrency: CONC } = require('./concurrency');
 
@@ -259,13 +259,15 @@ async function syncCatalogForCred(cred, run = null) {
         if (result?.lastErrorObject?.updatedExisting) updated++;
         else                                          added++;
 
-        // Stamp a Category leaf on rows that don't already have a
-        // categoryRef. Uses the shared stampFeedTruthCategoryRef helper
-        // which applies the owner rule (feed truth first, coarse enum
-        // fallback) across every ingest path. Best-effort — a stamp
-        // failure never breaks a sync.
+        // Stamp / restamp the Category leaf. applyFeedTruthStamp
+        // handles the three cases uniformly:
+        //   - null ref                → insert
+        //   - ref matches feed truth  → noop
+        //   - ref points elsewhere    → RENAME (overwrite with new leaf)
+        // Rename is what makes a merchant category rename propagate
+        // through re-sync without a separate backfill.
         const row = result.value || result;
-        if (row && !row.categoryRef) {
+        if (row) {
           try {
             const stamp = await stampFeedTruthCategoryRef({
               brandId:      cred.brandId,
@@ -273,14 +275,13 @@ async function syncCatalogForCred(cred, run = null) {
               feedCategory: item.category,
               title:        item.name
             });
-            if (stamp) {
-              await CatalogProduct.updateOne(
-                { _id: row._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
-                { $set: { categoryRef: stamp.categoryId } }
-              );
-              if (stamp.source !== 'coarse-enum') {
-                console.log(`   ✓ feed-truth category stamped for ${externalId} (${stamp.source})`);
-              }
+            const outcome = await applyFeedTruthStamp(row, stamp);
+            if (outcome.action === 'inserted' && stamp?.source !== 'coarse-enum') {
+              console.log(`   ✓ feed-truth category stamped for ${externalId} (${stamp.source})`);
+            } else if (outcome.action === 'renamed') {
+              console.log(`   ↺ category rename for ${externalId}: ${outcome.from} → ${outcome.to}`);
+            } else if (outcome.action === 'rehomed-from-tombstone') {
+              console.log(`   ↺ category rehomed from tombstone for ${externalId}: ${outcome.from} → ${outcome.to}`);
             }
           } catch (err) {
             console.warn(`   ⚠️  category stamp failed for ${externalId}: ${err.message}`);

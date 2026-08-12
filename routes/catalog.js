@@ -383,7 +383,10 @@ router.get('/categories', async (req, res) => {
     if (!brandObjectId) return res.status(400).json({ error: 'brandId is not a valid ObjectId' });
 
     const Category = require('../models/Category');
-    const categories = await Category.find(tenantFilter(req, { brandId: brandObjectId }))
+    // Soft-delete guard — hide tombstoned categories from picker
+    // surfaces. Direct-id fetches at :442 and product-detail hydration
+    // at :910 stay unguarded so historical rows can still resolve.
+    const categories = await Category.find(tenantFilter(req, { brandId: brandObjectId, deletedAt: null }))
       .select('_id name breadcrumb depth url')
       .sort({ breadcrumb: 1 })
       .lean();

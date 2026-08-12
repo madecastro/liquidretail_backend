@@ -47,7 +47,7 @@ const ingestShotClassify = require('./ingestShotClassifyService');
 // feed). Fills categoryRef from p.product_type (Shopify's merchant-
 // authored category field) on upsert so Shopify-only brands don't
 // have to wait for a UGC match / JSON-LD scrape to get a real leaf.
-const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
+const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('./categoryClassifier');
 
 // ── constants ──────────────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -459,14 +459,11 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
       );
       productsUpserted += 1;
 
-      // Stamp categoryRef on rows that don't have one (feed truth
-      // first, coarse enum fallback). Same helper catalogSyncService
-      // uses so every ingest path applies the identical policy. The
-      // null-guard on the updateOne means an inferred stamp that
-      // landed between syncs (JSON-LD scrape, GPT-4.1 brand-nav) stays
-      // authoritative. Best-effort — a stamp failure never breaks the
-      // sync.
-      if (doc && !doc.categoryRef) {
+      // Stamp / restamp categoryRef via applyFeedTruthStamp. Handles
+      // insert (fresh row), noop (ref already matches), and rename
+      // (merchant renamed the product_type — overwrite with new leaf).
+      // Best-effort — never breaks the sync.
+      if (doc) {
         try {
           const stamp = await stampFeedTruthCategoryRef({
             brandId:      brand._id,
@@ -474,11 +471,9 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
             feedCategory: flat.category,
             title:        flat.title
           });
-          if (stamp) {
-            await CatalogProduct.updateOne(
-              { _id: doc._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
-              { $set: { categoryRef: stamp.categoryId } }
-            );
+          const outcome = await applyFeedTruthStamp(doc, stamp);
+          if (outcome.action === 'renamed' || outcome.action === 'rehomed-from-tombstone') {
+            console.log(`   ↺ 🛍  category ${outcome.action} for ${flat.externalId}: ${outcome.from} → ${outcome.to}`);
           }
         } catch (err) {
           console.warn(`   ⚠️  🛍  category stamp failed for ${flat.externalId}: ${err.message}`);

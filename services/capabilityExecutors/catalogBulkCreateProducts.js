@@ -30,7 +30,7 @@ const mongoose = require('mongoose');
 const Brand = require('../../models/Brand');
 const CatalogProduct = require('../../models/CatalogProduct');
 const { uploadUrlToCloudinary } = require('../cloudinaryService');
-const { stampFeedTruthCategoryRef } = require('../categoryClassifier');
+const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('../categoryClassifier');
 const { MAX_BULK_PRODUCTS } = require('../catalogBulkOps');
 
 function slugify(s) {
@@ -191,9 +191,9 @@ async function run({ req, args }) {
     succeeded++;
     if (isNew) created++; else updated++;
 
-    // Category stamp — same helper the ingest paths use. Only stamps
-    // when categoryRef is currently null (idempotent). Never fatal.
-    if (product && !product.categoryRef) {
+    // Category stamp — applyFeedTruthStamp handles insert / noop /
+    // rename uniformly. Never fatal.
+    if (product) {
       try {
         const stamp = await stampFeedTruthCategoryRef({
           brandId:      brand._id,
@@ -201,12 +201,7 @@ async function run({ req, args }) {
           feedCategory: row.category,
           title:        row.title
         });
-        if (stamp) {
-          await CatalogProduct.updateOne(
-            { _id: product._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
-            { $set: { categoryRef: stamp.categoryId } }
-          );
-        }
+        await applyFeedTruthStamp(product, stamp);
       } catch (err) {
         console.warn(`   ⚠️  bulkCreateProducts: category stamp failed for row ${i}: ${err.message}`);
       }

@@ -97,7 +97,21 @@ const categorySchema = new mongoose.Schema({
   lastSeenAt:       Date,
 
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+  updatedAt: { type: Date, default: Date.now },
+
+  // Soft-delete tombstone. Set by catalog.deleteCategory /
+  // catalog.bulkDeleteCategories; NEVER cleared automatically. Every
+  // UI-facing Category read filters { deletedAt: null } — same
+  // pattern CatalogProduct + Media use. Historical
+  // Media.matchedCategories / CatalogProduct.categoryRef entries still
+  // resolve by _id when they need to (renderer joins direct); the
+  // tombstone only hides the row from picker / browser surfaces.
+  //
+  // The cascade cleanup (services/categoryBulkOps.cascadeCleanupOnDelete)
+  // unsets CatalogProduct.categoryRef and pulls Media.matchedCategories
+  // entries for the id, so downstream refs stop pointing at the hidden
+  // row on the delete path.
+  deletedAt: { type: Date, default: null, index: true }
 });
 
 // One Category row per breadcrumbKey per brand.

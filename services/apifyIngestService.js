@@ -22,7 +22,7 @@ const { uploadUrlToCloudinary } = require('./cloudinaryService');
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 // Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
 const ingestShotClassify = require('./ingestShotClassifyService');
-const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
+const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('./categoryClassifier');
 
 const APIFY_TRIGGER = 'apify-sync';
 
@@ -404,12 +404,10 @@ async function syncBrandShopify(brand, run = null) {
       // Defer classify to post-loop pass — never block remaining upserts.
       const row = result?.value || result;
 
-      // Stamp categoryRef on rows that don't have one — same shared
-      // helper the other ingest paths use. Apify Shopify rows typically
-      // carry the merchant's product_type as p.category; feed truth
-      // handles that as a depth-0 leaf, falling back to the coarse
-      // enum on empty strings. Best-effort — never breaks the sync.
-      if (row && !row.categoryRef) {
+      // Stamp / restamp categoryRef via applyFeedTruthStamp — handles
+      // insert (fresh row), noop (ref matches), and rename (merchant
+      // renamed product_type between syncs). Best-effort.
+      if (row) {
         try {
           const stamp = await stampFeedTruthCategoryRef({
             brandId:      brand._id,
@@ -417,11 +415,9 @@ async function syncBrandShopify(brand, run = null) {
             feedCategory: p.category,
             title:        p.title
           });
-          if (stamp) {
-            await CatalogProduct.updateOne(
-              { _id: row._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
-              { $set: { categoryRef: stamp.categoryId } }
-            );
+          const outcome = await applyFeedTruthStamp(row, stamp);
+          if (outcome.action === 'renamed' || outcome.action === 'rehomed-from-tombstone') {
+            console.log(`   ↺ Apify Shopify category ${outcome.action} for ${p.externalId}: ${outcome.from} → ${outcome.to}`);
           }
         } catch (err) {
           console.warn(`   ⚠️  Apify Shopify category stamp failed for ${p.externalId}: ${err.message}`);

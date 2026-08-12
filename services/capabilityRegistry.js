@@ -1141,6 +1141,95 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Category CRUD parity with CatalogProduct (2026-08-12) ────────
+
+  {
+    id:       'catalog.deleteCategory',
+    title:    'Delete a category',
+    describe: 'Single-row delete. Soft by default (sets deletedAt=now — historical Media.matchedCategories entries still resolve by _id; wizard + browser filter out); hardDelete=true runs Mongo deleteOne after cascade. Cascade in both modes: CatalogProduct.categoryRef → null, Media.matchedCategories pull. REFUSE-IF-HAS-CHILDREN safety net: a Category with live descendants refuses deletion unless cascade=true (which soft/hard-deletes the whole subtree). Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['categoryId'],
+      properties: {
+        categoryId: { type: 'string', description: 'Category ObjectId.' },
+        hardDelete: { type: 'boolean', description: 'False (default) = soft delete via deletedAt tombstone. True = irreversible Mongo delete after cascade.' },
+        cascade:    { type: 'boolean', description: 'False (default) = refuse if the category has descendants. True = delete the whole subtree.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogDeleteCategory',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'catalog.bulkCreateCategories',
+    title:    'Create multiple categories',
+    describe: 'Batch create N Category trees. breadcrumbs[] takes strings — single terms ("Sneakers") land as depth-0 leaves; rich paths ("Apparel > Tops > Shirts") upsert every segment. Idempotent on (brandId, breadcrumbKey) — a re-run reuses existing nodes. Cap: 500 breadcrumbs per call. Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'breadcrumbs'],
+      properties: {
+        brandId:     { type: 'string', description: 'Brand ObjectId.' },
+        breadcrumbs: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 500,
+          items: { type: 'string', minLength: 1, maxLength: 2000 },
+          description: 'Array of breadcrumb strings. Use ">" as the segment separator ("Apparel > Tops > Shirts"). Single terms without ">" become depth-0 leaves.'
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogBulkCreateCategories',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'catalog.bulkDeleteCategories',
+    title:    'Delete multiple categories',
+    describe: 'Two shapes: categoryIds:[...] explicit OR filter DSL {categoryIds, breadcrumbKeys, depth, hasProducts, hasNoProducts}. hasNoProducts is the "stale category cleanup" filter — matches categories with no live products pointing at them. cascade=true expands each target to its subtree; without it, targets with children are REFUSED (reported in response, not fatal — the safe ones still delete). hardDelete=true runs Mongo deleteMany after cascade. Cap: 500 rows per call (post-expansion). T4 — bulk delete can nuke the whole picker, requires operator confirmation.',
+    tier:     4,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:     { type: 'string', description: 'Brand ObjectId.' },
+        categoryIds: { type: 'array', items: { type: 'string' }, maxItems: 500, description: 'Explicit category ids. Mutually exclusive with filter.' },
+        filter: {
+          type: 'object',
+          description: 'Filter DSL for mass delete. Mutually exclusive with categoryIds.',
+          properties: {
+            categoryIds:    { type: 'array', items: { type: 'string' } },
+            breadcrumbKeys: { type: 'array', items: { type: 'string' }, description: 'Normalized keys, e.g. "apparel>shirts".' },
+            depth:          { type: 'integer', minimum: 0, description: '0 = top-level roots, 1 = second-level, ...' },
+            hasProducts:    { type: 'boolean', description: 'Only categories with at least one live CatalogProduct.' },
+            hasNoProducts:  { type: 'boolean', description: 'Only categories with ZERO live CatalogProducts — the stale-cleanup filter.' }
+          },
+          additionalProperties: false
+        },
+        hardDelete: { type: 'boolean', description: 'False (default) = soft delete via deletedAt. True = irreversible Mongo delete.' },
+        cascade:    { type: 'boolean', description: 'False (default) = skip targets with children (reported in refused[]). True = expand every target to its full subtree.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogBulkDeleteCategories',
+      method:  'run'
+    }
+  },
+
   // ── Phase 6: Detection + layouts — T0 read ───────────────────────
 
   {

@@ -40,7 +40,7 @@ const ingestShotClassify = require('./ingestShotClassifyService');
 // path) through resolveFeedCategoryRef first, coarse enum second, so
 // non-breadcrumb rows still land a real categoryRef at ingest instead
 // of waiting for a match / re-scrape.
-const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
+const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('./categoryClassifier');
 // Upsert loop gets its OWN wall-clock budget (DB-bound) — must not share
 // the network scan budget's clock, or a slow scan would leave no time to
 // persist products already paid for in network cost.
@@ -316,10 +316,12 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         set.inferredBreadcrumb = inferredBreadcrumb;
         set.inferredCategoryAt = new Date();
       }
-      // categoryRef stamps for both the JSON-LD path AND the feed-truth
-      // fallback — the outer `if (inferredBreadcrumb)` used to gate this
-      // so a fallback-derived ref was silently discarded on the upsert.
-      if (categoryRefId) set.categoryRef = categoryRefId;
+      // categoryRef stamping is DELIBERATELY not part of the upsert
+      // $set — applyFeedTruthStamp below handles insert/noop/rename
+      // uniformly across every ingest path, with the null-guard that
+      // preserves later inferred stamps (GPT-4.1 brand-nav) from
+      // productMatchService. Setting it here would clobber those on
+      // every re-sync.
 
       // Upsert only — no await on classify (image network work).
       const doc = await CatalogProduct.findOneAndUpdate(
@@ -331,6 +333,35 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         { upsert: true, new: true }
       );
       productsUpserted += 1;
+
+      // Post-upsert category stamp. Two candidate stamps: the JSON-LD
+      // scanner-derived leaf (categoryRefId, set at line 254) or the
+      // feed-truth fallback from p.category. Prefer the scanner leaf
+      // because it typically carries a richer breadcrumb than a
+      // single-term product_type; fall back on the feed-truth stamp.
+      // Either way, applyFeedTruthStamp handles the insert/rename/noop
+      // decision.
+      if (doc) {
+        try {
+          let stamp = categoryRefId
+            ? { categoryId: categoryRefId, source: 'jsonld-scanner' }
+            : (p.category
+                ? await stampFeedTruthCategoryRef({
+                    brandId:      brand._id,
+                    advertiserId: brand.advertiserId || null,
+                    feedCategory: p.category,
+                    title:        p.title
+                  })
+                : null);
+          const outcome = await applyFeedTruthStamp(doc, stamp);
+          if (outcome.action === 'renamed' || outcome.action === 'rehomed-from-tombstone') {
+            console.log(`   ↺ ${LOG}  category ${outcome.action} for ${externalId}: ${outcome.from} → ${outcome.to}`);
+          }
+        } catch (err) {
+          console.warn(`   ⚠️  ${LOG}  category stamp failed for ${externalId}: ${err.message}`);
+        }
+      }
+
       if (p.productReviews && (p.productReviews.quotes?.length || p.productReviews.rating != null)) {
         reviewsCaptured += 1;
       }
