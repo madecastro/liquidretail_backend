@@ -913,6 +913,18 @@ check('X7 the last resort never admits negative or limiter content', () => {
   ];
   assert.strictEqual(quiet(() => pickStrongestQuote(bad)), null,
     'relaxing the floor must not reopen the disqualifiers');
+
+  // NEUTRAL-BUT-SCOREABLE is the case that actually exercises the praise requirement.
+  // Everything above sits at -Infinity, and -Infinity can never win a `>` comparison,
+  // so those three would be excluded even with the guards removed — they prove the
+  // disqualifiers hold, not that the last-resort tier checks anything. A line that
+  // scores a real number while reading as pure description is what distinguishes them.
+  const neutral = [
+    { text: 'The shorts have a mesh liner and a zip pocket on the back right side.' },
+    { text: 'Shipping was quick and the box arrived on a Tuesday afternoon.' },
+  ];
+  assert.strictEqual(quiet(() => pickStrongestQuote(neutral)), null,
+    'the last resort is for unspecific PRAISE — description with no praise is not proof');
 });
 
 const total = pass + fail;
