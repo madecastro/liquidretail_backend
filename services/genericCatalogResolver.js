@@ -2124,8 +2124,37 @@ async function resolveGenericCatalog(brand, {
           `Shopify ladder returned 0 products (mode=${shopifyAccess.mode || 'none'})`;
         stats.shopifyFallthrough = true;
         stats.shopifyFallthroughReason = fallReason;
+        // A BLOCK is not an empty store. Recording it distinctly is the whole
+        // point: "0 products" invites the conclusion that the merchant has no
+        // catalog, when in fact products.json was never allowed to answer and
+        // the full-resolution gallery is still sitting there. The JSON-LD walk
+        // below yields ~1 featured image per product, so a silent downgrade
+        // here is what puts thumbnails into ad seeds.
+        if (shopifyAccess.blocked) {
+          stats.shopifyBlocked = shopifyAccess.blocked;
+          // Route through the SHARED helper, not just a private stat. It sets
+          // lastBlockVendor/lastBlockRemedy and — when the remedy is
+          // browser-session — flips browserSessionBlockSeen, which is what
+          // gates the browser rung (shouldAttemptBrowserRung). Without this
+          // the ladder's own blocks were invisible to the one mechanism that
+          // can actually RECOVER the products.json gallery in-page, so a
+          // CF-blocked Shopify store reported its block and then degraded
+          // anyway. This is the difference between naming the problem and
+          // fixing it.
+          noteBlock(stats, shopifyAccess.blocked);
+          warnings.push(
+            `Shopify ladder BLOCKED by ${shopifyAccess.blocked.vendor} ` +
+            `(${shopifyAccess.blocked.confidence} confidence, remedy=${shopifyAccess.blocked.remedy}) — ` +
+            'degraded to JSON-LD; this is a block, not an empty catalog'
+          );
+          console.warn(
+            `   ⚠️  ${LOG}  Shopify ladder BLOCKED by ${shopifyAccess.blocked.vendor} ` +
+            `— degrading to sitemap+JSON-LD (expect ~1 image/product)`
+          );
+        } else {
+          console.log(`   · ${LOG}  Shopify ladder empty — falling through to sitemap+JSON-LD`);
+        }
         warnings.push(`Shopify auto-detect fell through: ${fallReason}`);
-        console.log(`   · ${LOG}  Shopify ladder empty — falling through to sitemap+JSON-LD`);
       }
     }
   }
