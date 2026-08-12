@@ -135,16 +135,21 @@ console.log('\nD. identity digests');
     const all = [MASTER, ...DERIVES].map((f) => digest({ ...base, platformFormat: f }));
     check('D1 the four Meta video rows have four DISTINCT digests',
       new Set(all).size === 4, JSON.stringify(all.map((d) => d.slice(0, 8))));
-    // Scoping guard: duration / funnelStage are Google-only parts. If either
-    // ever fires for Meta, every stored Meta digest shifts and the next
-    // Generate re-bills an Omni master per product.
+    // Duration stays Google-only (Meta rows have history at every length).
+    // funnelStage joins when — and only when — it is set: a null-stage
+    // master stays byte-identical; a set stage MUST differ or the three
+    // intent variants collapse onto the master on the unique index.
     for (const f of [MASTER, ...DERIVES]) {
       check(`D2 [MONEY] duration does not alter the digest for ${f}`,
         digest({ ...base, platformFormat: f })
           === digest({ ...base, platformFormat: f, videoDurationSec: 10 }));
-      check(`D3 [MONEY] funnelStage does not alter the digest for ${f}`,
+      check(`D3 [MONEY] funnelStage:null does not alter the digest for ${f}`,
         digest({ ...base, platformFormat: f })
-          === digest({ ...base, platformFormat: f, funnelStage: 'awareness' }));
+          === digest({ ...base, platformFormat: f, funnelStage: null }));
+      check(`D3b [MONEY] a SET funnelStage DOES alter the digest for ${f}`,
+        digest({ ...base, platformFormat: f })
+          !== digest({ ...base, platformFormat: f, funnelStage: 'consideration' }),
+        'Meta intent variants collide with the unstaged row and insertMany drops them');
     }
   } else {
     check('D0 computeDeterministicVideoDigest is exported', false,
@@ -153,42 +158,50 @@ console.log('\nD. identity digests');
 }
 
 // ── E. The expansion mints them, gated on the SOURCE master ─────────────
-// Source-level: this asserts the SHAPE of a queueing block, which no pure
-// function call can reach without a DB.
-console.log('\nE. expansion block (source)');
+// Behavioural: planDeterministicVideoAds is what expandWizardJob iterates.
+// Source pins remain for the kill switch + the master-list strip, which
+// no planner call can see.
+console.log('\nE. expansion block');
 {
   const src = fs.readFileSync(
     path.join(ROOT, 'services', 'campaignAdsGenerationService.js'), 'utf8');
+  const planFn = gen.planDeterministicVideoAds;
+  check('E0 planDeterministicVideoAds is exported', typeof planFn === 'function');
 
-  check('E1 there is a Meta derivation mint block',
-    /isMetaVideoMasterRun\(masterFormats\)\s*&&\s*isMetaVideoDerivativesEnabled\(\)/.test(src),
-    'the derivations are never queued without it');
+  const prevFunnel = process.env.PMAX_FUNNEL_VARIANTS;
+  process.env.PMAX_FUNNEL_VARIANTS = 'false';
+  delete require.cache[require.resolve(path.join(ROOT, 'services', 'campaignAdsGenerationService.js'))];
+  const offFunnel = require(path.join(ROOT, 'services', 'campaignAdsGenerationService.js'));
+  const metaOnly = offFunnel.planDeterministicVideoAds(['meta_stories_9_16']);
+  check('E1 Meta-only plan (funnel off) is 1 master + 3 unstaged derives',
+    metaOnly.length === 4
+      && metaOnly.filter((p) => p.billable).length === 1
+      && metaOnly.filter((p) => !p.billable).length === 3,
+    JSON.stringify(metaOnly.map((p) => `${p.platformFormat}:${p.funnelStage}`)));
+  check('E3 [MONEY] every minted derivative carries deriveFromMaster',
+    metaOnly.filter((p) => !p.billable).every((p) => p.deriveFromMaster === MASTER));
+  check('E4 it iterates the shared derive list, not a local literal',
+    DERIVES.every((d) => metaOnly.some((p) => p.platformFormat === d && !p.funnelStage)));
+  check('E7 unstaged derives sit AFTER the master in the plan',
+    metaOnly[0].platformFormat === MASTER && metaOnly[0].billable === true
+      && metaOnly.slice(1).every((p) => !p.billable),
+    'a derivative minted before its master has nothing to crop from');
+  if (prevFunnel == null) delete process.env.PMAX_FUNNEL_VARIANTS;
+  else process.env.PMAX_FUNNEL_VARIANTS = prevFunnel;
+  delete require.cache[require.resolve(path.join(ROOT, 'services', 'campaignAdsGenerationService.js'))];
+
   check('E2 [MONEY] it is gated on the SOURCE master being in the run',
     /function isMetaVideoMasterRun[\s\S]{0,400}includes\(META_VIDEO_MASTER_KEY\)/.test(src),
     'a derivative whose master is not generated can only wait, retry and fail');
-  check('E3 every minted derivative carries deriveFromMaster',
-    /platformFormat: fmt,[\s\S]{0,600}deriveFromMaster: META_VIDEO_DERIVE_MAP\[fmt\]/.test(src));
-  check('E4 it iterates the shared derive list, not a local literal',
-    /for \(const fmt of META_VIDEO_DERIVE_KEYS\)/.test(src));
   check('E5 a kill switch exists and defaults ON',
     /function isMetaVideoDerivativesEnabled\(\)[\s\S]{0,260}META_VIDEO_DERIVATIVES/.test(src)
       && /if \(v == null \|\| v === ''\) return true;/.test(src));
   check('E6 [MONEY] the master-format filter strips Meta derive surfaces',
     /META_VIDEO_DERIVE_SET\.has\(f\)\) return false;/.test(src),
     'a derive surface reaching the master list would queue a paid Omni submit');
-
-  // The derive block must sit AFTER the master loop — a derivative minted
-  // before its master has nothing to crop from.
-  // Match the CALL SITE, not the function definition — the definition sits
-  // near the top of the file and would make this check pass trivially in the
-  // wrong direction (and fail in the right one).
-  const masterLoop = src.indexOf('for (const fmt of masterFormats)');
-  const metaBlock  = src.indexOf(
-    'if (isMetaVideoMasterRun(masterFormats) && isMetaVideoDerivativesEnabled())');
-  check('E7 the derive block runs after the master loop',
-    masterLoop > 0 && metaBlock > masterLoop,
-    `masterLoop=${masterLoop} metaBlock=${metaBlock} — a derivative minted before `
-      + 'its master has nothing to crop from');
+  check('E8 expandWizardJob iterates the planner (one mint path)',
+    /const videoPlan = planDeterministicVideoAds\(masterFormats\)/.test(src)
+      && /for \(const item of videoPlan\)/.test(src));
 }
 
 // ── F. Flag off ⇒ byte-identical to the pre-change mint ─────────────────

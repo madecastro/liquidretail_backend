@@ -1650,7 +1650,8 @@ async function findSiblingMasterAd(ad, masterPlatformFormat) {
  * Covers:
  *   - pmax_video_1_1 free crop of the settled 9:16 master
  *   - funnel-stage retitles of any already-paid master plate (and of the
- *     free 1:1 crop) — awareness / consideration / conversion
+ *     free crops) — consideration / conversion; the unstaged master IS
+ *     awareness. Covers PMax and Meta.
  *
  * MONEY: zero Omni / atlasVideoService submits in this function. The base
  * plate is the sibling master's already-paid veoVideoUrl; face-safe crop

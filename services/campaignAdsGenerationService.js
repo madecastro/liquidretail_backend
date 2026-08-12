@@ -266,11 +266,22 @@ const DERIVE_FROM_MASTER_FIELD = 'deriveFromMaster';
 const FUNNEL_STAGE_FIELD = 'funnelStage';
 const PMAX_FUNNEL_STAGES = Object.freeze(['awareness', 'consideration', 'conversion']);
 const PMAX_FUNNEL_STAGE_SET = new Set(PMAX_FUNNEL_STAGES);
+// Minted as FREE retitles. Awareness is the unstaged master / unstaged
+// derive-only base — it never carries funnelStage, so its digest stays
+// byte-identical to every pre-existing row. Minting a separate
+// funnelStage:'awareness' row is what produced the measured 4-per-surface
+// PMax pile (unstaged + three stages).
+const FUNNEL_VARIANT_STAGES = Object.freeze(
+  PMAX_FUNNEL_STAGES.filter((s) => s !== 'awareness')
+);
 
 /**
- * Kill switch for free funnel-titled variants on Google PMax video.
- * Default ON (owner chose 3 variants). Flag off ⇒ no variant ads minted,
- * byte-identical to pre-change (2 masters + 1 derive-only 1:1).
+ * Kill switch for free funnel-titled variants (PMax AND Meta video).
+ * The env name is a leftover — the machinery is platform-agnostic; Meta
+ * was previously gated out because funnelStage was not part of a Meta
+ * digest (variants collapsed onto the master). Default ON. Flag off ⇒
+ * no variant ads minted, byte-identical to pre-variant mint
+ * (PMax: 2 masters + 1 derive-only 1:1; Meta: 1 master + 3 derivatives).
  */
 function isPmaxFunnelVariantsEnabled() {
   const v = process.env.PMAX_FUNNEL_VARIANTS;
@@ -279,15 +290,36 @@ function isPmaxFunnelVariantsEnabled() {
 }
 
 /**
- * Map Ad.funnelStage → remotion preset name for PMax video, or null.
- * Absent/unknown stage or non-PMax format → null (today's cascade).
+ * Master plate a funnel-variant ad retitles from, or null if this
+ * platformFormat is not a known video surface. Used by the derive gate
+ * (fail-closed) and by expandDeterministicVideo when the explicit
+ * deriveFromMaster arg is missing.
+ *
+ * Google masters retitle themselves (same format). The PMax 1:1 and
+ * every Meta surface (including the Stories master, when it carries a
+ * stage) crop/retitle from their platform's 9:16 paid plate.
+ */
+function funnelDeriveSource(platformFormat) {
+  if (GOOGLE_VIDEO_MASTER_SET.has(platformFormat)) return platformFormat;
+  if (platformFormat === PMAX_VIDEO_DERIVE_ONLY) return PMAX_VIDEO_DERIVE_SOURCE;
+  if (platformFormat === META_VIDEO_MASTER_KEY) return META_VIDEO_MASTER_KEY;
+  if (META_VIDEO_DERIVE_MAP[platformFormat]) return META_VIDEO_DERIVE_MAP[platformFormat];
+  return null;
+}
+
+/**
+ * Map Ad.funnelStage → remotion preset name, or null.
+ * PMax video → canonical-<stage>-pmax10 (10s extent).
+ * Meta video → canonical-<stage> (8s generic; stretches on a 10s plate).
+ * Absent/unknown stage or a non-video format → null (today's cascade).
  */
 function resolveFunnelPresetOverride(ad) {
   if (!ad) return null;
   const stage = ad[FUNNEL_STAGE_FIELD] || ad.funnelStage;
   if (!stage || !PMAX_FUNNEL_STAGE_SET.has(String(stage))) return null;
-  if (!isGooglePmaxVideoFormat(ad.platformFormat)) return null;
-  return `canonical-${stage}-pmax10`;
+  if (isGooglePmaxVideoFormat(ad.platformFormat)) return `canonical-${stage}-pmax10`;
+  if (isMetaVideoFormat(ad.platformFormat)) return `canonical-${stage}`;
+  return null;
 }
 
 /**
@@ -391,13 +423,15 @@ function resolveDeriveFromMaster(ad) {
   if (META_VIDEO_DERIVE_MAP[ad.platformFormat] && !ad.veoPredictionId) {
     return META_VIDEO_DERIVE_MAP[ad.platformFormat];
   }
-  // Funnel-variant fail-closed: retitle of the same-format master plate.
-  // Without this, a dropped deriveFromMaster on a 9:16/16:9 funnel ad
-  // would fall through to the billable Omni path.
+  // Funnel-variant fail-closed: ANY known video surface carrying a stage
+  // is a free retitle. Without this, a dropped deriveFromMaster on a
+  // 9:16/16:9 (or Meta Stories) funnel ad falls through to the billable
+  // Omni path. Meta used to be excluded here — that was the money hole
+  // that kept Meta intent variants gated off (a Meta+stage row would
+  // have billed a second Omni master).
   const stage = ad[FUNNEL_STAGE_FIELD] || ad.funnelStage;
   if (stage && PMAX_FUNNEL_STAGE_SET.has(String(stage))) {
-    if (GOOGLE_VIDEO_MASTER_SET.has(ad.platformFormat)) return ad.platformFormat;
-    if (ad.platformFormat === PMAX_VIDEO_DERIVE_ONLY) return PMAX_VIDEO_DERIVE_SOURCE;
+    return funnelDeriveSource(ad.platformFormat);
   }
   return null;
 }
@@ -444,6 +478,125 @@ function isGoogleVideoMasterRun(masterFormats) {
   // what is checked.
   return Array.isArray(masterFormats)
     && masterFormats.includes(PMAX_VIDEO_DERIVE_SOURCE);
+}
+
+/**
+ * Pure plan of deterministic video Ads this run will mint, one entry
+ * per (platformFormat, funnelStage) row. expandWizardJob iterates this;
+ * the harness asserts counts + the money flags without a DB.
+ *
+ * Shape of each entry:
+ *   { platformFormat, funnelStage, deriveFromMaster, billable }
+ *
+ * MONEY invariants encoded here, not in the caller:
+ *   - billable === true ONLY for unstaged masters (funnelStage null,
+ *     deriveFromMaster null). Those are the Omni submits.
+ *   - Every funnel variant and every derive-only surface is billable
+ *     false and carries deriveFromMaster.
+ *   - Awareness is the unstaged row. FUNNEL_VARIANT_STAGES is
+ *     consideration + conversion only, so PMax is 9/product (3
+ *     surfaces × 3 stages) not 12 (unstaged + 3).
+ *   - Meta stays one billable Omni master. Variants are free retitles.
+ *
+ * Flag off (PMAX_FUNNEL_VARIANTS=false) drops every staged row and
+ * restores the pre-variant mint: PMax 2+1, Meta 1+3.
+ */
+function planDeterministicVideoAds(masterFormats) {
+  const masters = Array.isArray(masterFormats)
+    ? masterFormats.filter(Boolean)
+    : [];
+  const plan = [];
+
+  for (const fmt of masters) {
+    // Derive-only surfaces are not masters. The resolver already strips
+    // them; if one still leaked in, skip it here rather than minting a
+    // waiter whose source plate was never queued. googleRun / metaRun
+    // add them below, and only when the source master is in this run.
+    if (fmt === PMAX_VIDEO_DERIVE_ONLY || META_VIDEO_DERIVE_SET.has(fmt)) continue;
+    plan.push({
+      platformFormat: fmt,
+      funnelStage: null,
+      deriveFromMaster: null,
+      billable: true
+    });
+  }
+
+  const googleRun = isGoogleVideoMasterRun(masters);
+  const metaRun = isMetaVideoMasterRun(masters);
+  const funnelOn = isPmaxFunnelVariantsEnabled();
+  const metaDerivesOn = isMetaVideoDerivativesEnabled();
+
+  if (googleRun) {
+    // Unstaged 1:1 IS awareness (no stage). Flag-off still mints it.
+    plan.push({
+      platformFormat: PMAX_VIDEO_DERIVE_ONLY,
+      funnelStage: null,
+      deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE,
+      billable: false
+    });
+    if (funnelOn) {
+      // ⚠️ GOOGLE MASTERS ONLY — never every master in the run.
+      // A mixed Meta+PMax run has the Meta master in `masters`; iterating
+      // that list would mint Meta rows here AND again in the Meta block.
+      const funnelMasters = masters.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
+      for (const fmt of funnelMasters) {
+        for (const stage of FUNNEL_VARIANT_STAGES) {
+          plan.push({
+            platformFormat: fmt,
+            funnelStage: stage,
+            deriveFromMaster: fmt,
+            billable: false
+          });
+        }
+      }
+      for (const stage of FUNNEL_VARIANT_STAGES) {
+        plan.push({
+          platformFormat: PMAX_VIDEO_DERIVE_ONLY,
+          funnelStage: stage,
+          deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE,
+          billable: false
+        });
+      }
+    }
+  }
+
+  if (metaRun && metaDerivesOn) {
+    for (const fmt of META_VIDEO_DERIVE_KEYS) {
+      plan.push({
+        platformFormat: fmt,
+        funnelStage: null,
+        deriveFromMaster: META_VIDEO_DERIVE_MAP[fmt],
+        billable: false
+      });
+    }
+  }
+
+  if (metaRun && funnelOn) {
+    // Master consideration + conversion — FREE retitles of the paid
+    // 9:16 plate. The unstaged master above IS awareness.
+    for (const stage of FUNNEL_VARIANT_STAGES) {
+      plan.push({
+        platformFormat: META_VIDEO_MASTER_KEY,
+        funnelStage: stage,
+        deriveFromMaster: META_VIDEO_MASTER_KEY,
+        billable: false
+      });
+    }
+    if (metaDerivesOn) {
+      for (const fmt of META_VIDEO_DERIVE_KEYS) {
+        for (const stage of FUNNEL_VARIANT_STAGES) {
+          plan.push({
+            platformFormat: fmt,
+            funnelStage: stage,
+            deriveFromMaster: META_VIDEO_DERIVE_MAP[fmt],
+            billable: false
+          });
+        }
+      }
+    }
+  }
+
+  return plan;
 }
 
 /**
@@ -1074,148 +1227,31 @@ async function expandWizardJob({
       const masterFormats = detVideoMasterFormats.length
         ? detVideoMasterFormats
         : [videoPlatformFormat].filter((f) => f && f !== PMAX_VIDEO_DERIVE_ONLY);
-      const googleRun = isGoogleVideoMasterRun(masterFormats);
+      // ONE planner, iterated here and counted on the dry-run path.
+      // Counts, billable-vs-free, and "awareness is the unstaged row"
+      // live in planDeterministicVideoAds — do not re-derive them here.
+      const videoPlan = planDeterministicVideoAds(masterFormats);
       const detParts = [];
-      for (const fmt of masterFormats) {
-        // WHY this is billable: each master format is a distinct Omni
-        // native aspect (9:16 or 16:9). Cannot free-crop one from the
-        // other without losing the full frame the placement requires.
+      for (const item of videoPlan) {
+        // WHY a plan entry is (or is not) billable: unstaged masters
+        // are distinct Omni-native aspects. Everything else is a
+        // crop/retitle of an already-paid plate (deriveFromMaster set)
+        // and renderDeriveOnlyVideoAd never calls veoGenerateForAd.
         detParts.push(await expandDeterministicVideo({
           campaignId, brandId, campaignKind, productIds,
           seedMediaIds,
           seedPicks,
           ctaText, ctaUrl, ctaUrlParams,
-          platformFormat: fmt,
-          // PMax floor 10s when wizard left duration unset; Meta unchanged.
-          videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
-          videoPromptGuidance, videoPromptRaw,
-          excludePairings,
-          generationRunId
-        }));
-      }
-      if (googleRun) {
-        // WHY this is NOT billable: pmax_video_1_1 is face-safe crop +
-        // Remotion retitle of the paid 9:16 master. Hidden Omni submit
-        // here would be a ~$0.75–$1.20 double charge per product.
-        detParts.push(await expandDeterministicVideo({
-          campaignId, brandId, campaignKind, productIds,
-          seedMediaIds,
-          seedPicks,
-          ctaText, ctaUrl, ctaUrlParams,
-          platformFormat: PMAX_VIDEO_DERIVE_ONLY,
+          platformFormat: item.platformFormat,
           videoDurationSec: resolveVideoDurationForFormat(
-            PMAX_VIDEO_DERIVE_ONLY, videoDurationSec
+            item.platformFormat, videoDurationSec
           ),
           videoPromptGuidance, videoPromptRaw,
           excludePairings,
           generationRunId,
-          // Marker: source master format. Render path also keys on
-          // platformFormat === PMAX_VIDEO_DERIVE_ONLY (fail-closed).
-          deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE
+          deriveFromMaster: item.deriveFromMaster,
+          funnelStage: item.funnelStage
         }));
-
-        // ── FREE funnel-titled variants (PMAX_FUNNEL_VARIANTS) ────────
-        // Remotion is self-hosted and free. For each already-paid master
-        // plate (and the free 1:1 crop, for surface consistency) mint 3
-        // titling-only Ads — awareness / consideration / conversion —
-        // each carrying deriveFromMaster + funnelStage so they route
-        // through renderDeriveOnlyVideoAd and NEVER reach Omni.
-        // Flag off ⇒ skip entirely (byte-identical to pre-change mint).
-        // Ad-count ON: 2 masters + 6 master-variants + 1 base 1:1 + 3
-        // 1:1-variants = 12 video ads/product; still 2 billable submits.
-        if (isPmaxFunnelVariantsEnabled()) {
-          // ⚠️ GOOGLE MASTERS ONLY — never every master in the run.
-          //
-          // This block is reached whenever isGoogleVideoMasterRun() is true,
-          // and that gate now also passes on MIXED runs (a Meta master
-          // alongside the PMax ones). Iterating `masterFormats` directly
-          // would mint Meta funnel rows, and funnelStage is deliberately NOT
-          // part of a Meta identity digest (computeDeterministicVideoDigest
-          // appends the stage only for Google PMax video), so all three
-          // collapse onto the Meta master's own digest and are swallowed by
-          // the (campaignId, identityDigest) unique index.
-          //
-          // Today that makes them merely wasteful. It is a LATENT MONEY HOLE
-          // rather than a cosmetic one: resolveDeriveFromMaster() returns
-          // null for a Meta platformFormat even when funnelStage is set —
-          // Google masters are fail-closed there, Meta is not — so any such
-          // row that DID insert would take the billable veoGenerateForAd
-          // path instead of the free retitle. Funnel variants are a PMax
-          // feature; scope the loop to PMax.
-          const funnelMasters = masterFormats.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
-          for (const fmt of funnelMasters) {
-            for (const stage of PMAX_FUNNEL_STAGES) {
-              detParts.push(await expandDeterministicVideo({
-                campaignId, brandId, campaignKind, productIds,
-                seedMediaIds,
-                seedPicks,
-                ctaText, ctaUrl, ctaUrlParams,
-                platformFormat: fmt,
-                videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
-                videoPromptGuidance, videoPromptRaw,
-                excludePairings,
-                generationRunId,
-                // Same-format retitle of the paid master plate.
-                deriveFromMaster: fmt,
-                funnelStage: stage
-              }));
-            }
-          }
-          // 1:1 also gets 3 funnel variants (consistency: Google benefits
-          // from variants on every surface). Still free — crop+retitle of
-          // the 9:16 master, never Omni.
-          for (const stage of PMAX_FUNNEL_STAGES) {
-            detParts.push(await expandDeterministicVideo({
-              campaignId, brandId, campaignKind, productIds,
-              seedMediaIds,
-              seedPicks,
-              ctaText, ctaUrl, ctaUrlParams,
-              platformFormat: PMAX_VIDEO_DERIVE_ONLY,
-              videoDurationSec: resolveVideoDurationForFormat(
-                PMAX_VIDEO_DERIVE_ONLY, videoDurationSec
-              ),
-              videoPromptGuidance, videoPromptRaw,
-              excludePairings,
-              generationRunId,
-              deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE,
-              funnelStage: stage
-            }));
-          }
-        }
-      }
-
-      // ── FREE Meta derivations (META_VIDEO_DERIVATIVES) ────────────
-      // Restores the "Phase 3" half of commit 919627a0. The 9:16 Stories
-      // master above is the ONE paid Omni submit; 1:1 and 4:5 are head-safe
-      // crops of that same plate and Reels is a retitle of it, so this block
-      // adds THREE creatives per product and ZERO billable submits.
-      //
-      // Gated on the SOURCE master being in this run (isMetaVideoMasterRun),
-      // not merely "some Meta video ran": a derivative whose master is never
-      // generated can only wait, exhaust its bounded retries and fail. Same
-      // reasoning as isGoogleVideoMasterRun — see the note there.
-      //
-      // Each row carries deriveFromMaster, and resolveDeriveFromMaster also
-      // fail-closes on platformFormat alone, so neither the render loop nor
-      // adRegenerateService can route one of these to Omni.
-      if (isMetaVideoMasterRun(masterFormats) && isMetaVideoDerivativesEnabled()) {
-        for (const fmt of META_VIDEO_DERIVE_KEYS) {
-          detParts.push(await expandDeterministicVideo({
-            campaignId, brandId, campaignKind, productIds,
-            seedMediaIds,
-            seedPicks,
-            ctaText, ctaUrl, ctaUrlParams,
-            platformFormat: fmt,
-            // Same duration as the master — these are the master's own frames,
-            // cropped or retitled. A different duration here would be a lie
-            // about a plate we are not regenerating.
-            videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
-            videoPromptGuidance, videoPromptRaw,
-            excludePairings,
-            generationRunId,
-            deriveFromMaster: META_VIDEO_DERIVE_MAP[fmt]
-          }));
-        }
       }
       detResult = detParts.reduce(
         (acc, part) => mergeExpansionResults(acc, part),
@@ -1276,11 +1312,14 @@ async function expandWizardJob({
   }
 
   // Dry-run estimate for deterministic + concept paths (no Director LLM).
-  // Deterministic:
-  //   Meta  → 9:16 master + 3 free derivatives (1:1, 4:5, Reels retitle)
-  //           = 4 ads/product, of which 1 is a billable Omni submit
-  //   Google → masters (2) + derive-only 1:1 (1) = 3 ads/product
-  //            of which 2 are billable Omni submits
+  // Deterministic counts come from planDeterministicVideoAds — the same
+  // planner the live mint iterates — so the operator's delivered / billable
+  // split cannot drift from what actually queues.
+  //   Meta  → 4 surfaces × 3 stages = 12 ads/product, 1 billable Omni
+  //           (unstaged master IS awareness; 3 unstaged derives + 8 free
+  //           consideration/conversion retitles). Flag off → 4 / 1.
+  //   Google → 3 surfaces × 3 stages = 9 ads/product, 2 billable Omni.
+  //            Flag off → 3 / 2.
   // Director: VEO_ADS_PER_PRODUCT_CAP when on.
   // Image: conceptImage → min(3, ADS_PER_PRODUCT_CAP); else fall through
   // to legacy cartesian below.
@@ -1293,64 +1332,23 @@ async function expandWizardJob({
     const staticFanoutCount = conceptImage
       ? Math.max(1, presetStaticFormats.length || 1)
       : 1;
-    // Deterministic ads per product: one per master format, plus one
-    // derive-only 1:1 on Google multi-master runs, plus 3 funnel variants
-    // per surface (masters + 1:1) when PMAX_FUNNEL_VARIANTS is on. Meta
-    // stays 1. Same derive-only strip as the live path above, so the
-    // dry-run count can never advertise a billable master the live path
-    // refuses to queue.
+    // Same derive-only strip as the live path above, then the SAME planner
+    // — so the dry-run count can never advertise a billable master the live
+    // path refuses to queue, or a delivered count the mint does not produce.
     const dryMasterFormats = detVideoMasterFormats.length
       ? detVideoMasterFormats
       : [videoPlatformFormat].filter((f) => f && f !== PMAX_VIDEO_DERIVE_ONLY);
-    const dryGoogle = isGoogleVideoMasterRun(dryMasterFormats);
-    // base: masters + (1 derive-only 1:1 when Google)
-    // variants ON: + 3 per master + 3 for the 1:1 = +3*(masters+1)
-    // Meta's free derivatives are added further down, ONCE, behind the same
-    // flag as the live mint. They were briefly counted here as well — two
-    // independently-merged PRs each added a Meta derivative mint and each
-    // added its own dry-run term, so a Meta run quoted 7 delivered creatives
-    // against 4 actually minted (mixed: 19 against 13). The duplicate rows
-    // collided on the unique index so nothing over-billed, but the estimate
-    // the operator reads was wrong by the whole fan-out.
-    let dryDetPerProduct = dryMasterFormats.length + (dryGoogle ? 1 : 0);
-    // Funnel variants are counted against the GOOGLE masters only, mirroring
-    // the live mint's `funnelMasters` filter. On a mixed Meta+PMax run
-    // `dryMasterFormats.length` includes the Meta master, and using it here
-    // quoted three delivered ads per product that the live path (correctly)
-    // never mints — a dry run that over-promises delivery is the same class of
-    // lie as one that under-quotes spend, just pointed the other way.
-    //
-    // NB the filter and the multiply are kept adjacent to the flag check on
-    // purpose: verifyPmaxFunnelVariants M1 pins that PMAX_FUNNEL_STAGES.length
-    // appears within a short window of isPmaxFunnelVariantsEnabled(), so a
-    // comment wedged between them fails an unrelated harness.
-    const dryFunnelMasters = dryMasterFormats.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
-    if (dryGoogle && isPmaxFunnelVariantsEnabled()) {
-      dryDetPerProduct += PMAX_FUNNEL_STAGES.length * (dryFunnelMasters.length + 1);
-    }
-    // Meta's free derivations count toward DELIVERY the same way the PMax
-    // square does. Omitting them made the estimate say "1 video per product"
-    // while the live mint produced four — under-promising delivery is the same
-    // class of lie as over-quoting spend, and it is the number the operator
-    // reads to decide whether the run did what they asked. Mirrors the live
-    // gate exactly (source master present AND flag on) so the two cannot drift.
-    if (isMetaVideoMasterRun(dryMasterFormats) && isMetaVideoDerivativesEnabled()) {
-      dryDetPerProduct += META_VIDEO_DERIVE_KEYS.length;
-    }
+    const dryPlan = planDeterministicVideoAds(dryMasterFormats);
+    const dryDetPerProduct = dryPlan.length;
     // BILLABLE vs DELIVERED — they are not the same number, and only one of
-    // them costs money.
+    // them costs money. Only plan entries with billable:true reach Atlas.
+    // A 4-product PMax video run reads as "36 creatives" while charging for 8.
     //
-    // A PMax video run delivers masters + a free 1:1 crop + 3 funnel re-titles
-    // per surface. Only the MASTERS reach Atlas: the crop and every funnel
-    // variant carry deriveFromMaster, which resolveDeriveFromMaster uses to
-    // keep them off the billable Omni path. So 4 products x PMax video reads
-    // as "48 creatives" while charging for 8.
-    //
-    // The wizard showed only the 48. On the ordinary flow an operator has just
-    // hand-picked everything and has context; on the express "use defaults"
-    // button they have not, and 48 is indistinguishable from a ~6x larger bill.
-    // Surfacing the billable split is what makes that button safe to press.
-    const billableVideoMastersPerProduct = dryMasterFormats.length;
+    // The wizard used to show only the delivered count. On the express
+    // "use defaults" button that is indistinguishable from a several-x
+    // larger bill. Surfacing the billable split is what makes that button
+    // safe to press.
+    const billableVideoMastersPerProduct = dryPlan.filter((p) => p.billable).length;
     const billableVideoMasters = deterministicVideo
       ? estimateProducts.filter(Boolean).length * billableVideoMastersPerProduct
       : 0;
@@ -2510,9 +2508,11 @@ function computeDeterministicVideoDigest({
   videoPromptGuidance, videoPromptRaw,
   videoDurationSec,
   // Funnel-stage retitle only. ONLY appended when non-empty so master /
-  // derive-only digests (and every Meta digest) stay byte-identical to
-  // pre-funnel-variant code. Three variants of the same surface MUST
-  // carry distinct stages or the unique index collapses them to one.
+  // derive-only digests stay byte-identical to every pre-existing row.
+  // Three variants of the same surface MUST carry distinct stages or
+  // the unique index collapses them to one. Format-UNSCOPED on purpose:
+  // Meta intent variants need the same identity split, and a null-stage
+  // master still hashes exactly as it did when this part was Google-only.
   funnelStage = null
 }) {
   const refKey = (Array.isArray(referenceMediaIds) && referenceMediaIds.length
@@ -2541,21 +2541,22 @@ function computeDeterministicVideoDigest({
       ? ''
       : String(videoDurationSec));
   }
-  // Funnel stage joins ONLY for Google PMax video formats, and only when
-  // present. A master / base 1:1 (no stage) keeps the exact pre-funnel part
-  // list, so an empty string is never pushed — that alone would shift every
-  // existing Google digest and re-mint.
+  // Funnel stage joins when — and only when — it is non-empty. A master
+  // / unstaged derive (funnelStage null/''/absent) keeps the exact pre-
+  // variant part list, so an empty string is never pushed — that alone
+  // would shift every existing digest and re-bill Omni on the next
+  // Generate.
   //
-  // ⚠️ THE FORMAT SCOPE IS THE MONEY GUARD, not decoration. Without it, ANY
-  // ad carrying a funnelStage hashes differently — and the Director already
-  // emits `routing.funnel_stage` on PMax rounds, so the field is one wiring
-  // change away from reaching a Meta video ad. The moment it did, every
-  // stored Meta digest would stop matching, the (campaignId, identityDigest)
-  // unique index would stop colliding, and the next Generate would re-bill an
-  // Omni master for every product on the campaign. Same failure this function
-  // already survived once with videoDurationSec above; scoped identically.
-  if (isGooglePmaxVideoFormat(platformFormat)
-      && funnelStage != null && String(funnelStage) !== '') {
+  // ⚠️ THE NULL-ONLY GUARD IS THE MONEY GUARD, not a format scope.
+  // Duration stays Google-only because Meta rows have history at every
+  // duration. FunnelStage is different: every pre-existing Meta and
+  // PMax master stores funnelStage=null, so appending the part only
+  // when set cannot change a stored master digest. Scoping it to Google
+  // is what made Meta's three intent variants collide with each other
+  // AND with the master on the unique index — insertMany swallowed
+  // them, and the operator got one untitled Stories ad.
+  // Do NOT bump the prefix. Do NOT push an empty placeholder.
+  if (funnelStage != null && String(funnelStage) !== '') {
     parts.push(String(funnelStage));
   }
   return crypto.createHash('sha256').update(parts.join('|')).digest('hex');
@@ -3095,9 +3096,7 @@ async function expandDeterministicVideo({
     : null;
   const deriveFrom = deriveFromMaster
     || (platformFormat === PMAX_VIDEO_DERIVE_ONLY ? PMAX_VIDEO_DERIVE_SOURCE : null)
-    || (normalizedFunnelStage && GOOGLE_VIDEO_MASTER_SET.has(platformFormat)
-      ? platformFormat
-      : null);
+    || (normalizedFunnelStage ? funnelDeriveSource(platformFormat) : null);
   const payloads = [];
   const perProduct = [];
 
@@ -3956,11 +3955,19 @@ module.exports = {
   DERIVE_FROM_MASTER_FIELD,
   FUNNEL_STAGE_FIELD,
   PMAX_FUNNEL_STAGES,
+  FUNNEL_VARIANT_STAGES,
   GOOGLE_PMAX_VIDEO_DURATION_SEC,
+  META_VIDEO_MASTER_KEY,
+  META_VIDEO_DERIVE_KEYS,
+  META_VIDEO_DERIVE_MAP,
   resolveDeterministicVideoMasterFormats,
   resolveVideoDurationForFormat,
   isGoogleVideoMasterRun,
+  isMetaVideoMasterRun,
+  isMetaVideoDerivativesEnabled,
   isPmaxFunnelVariantsEnabled,
+  planDeterministicVideoAds,
+  funnelDeriveSource,
   resolveFunnelPresetOverride,
   // THE shared derive-only gate — every path that can reach a billable
   // video submit imports this one (render loop + regenerate). See its

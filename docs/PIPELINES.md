@@ -986,13 +986,15 @@ are back at their 8s extent.** If PMax wants 10s pacing it must be **separate
 preset files** selected explicitly for PMax video, built together with per-run
 preset selection (still open).
 
-**STILL OPEN — per-run funnel preset SELECTION is not built.** The render path
-already accepts `presetOverride` (`renderBrandScriptAndSave` →
-`renderWithRemotionAndSave` → `resolveSpec` TIER 0), but **no live caller
-supplies one** and no Ad/run field carries a funnel stage;
-`buildMetaForAd` hardcodes `presetOverride: null` and **must receive the SAME
-value as the render path** or the social-proof quote gate desyncs from the
-rendered bind list. Only brand-level `titleStylePreset` works today.
+**Funnel preset selection is built.** `Ad.funnelStage` drives
+`resolveFunnelPresetOverride` (PMax → `canonical-<stage>-pmax10`, Meta →
+generic 8s `canonical-<stage>`). `renderWithRemotionAndSave` resolves the
+preset **once** and threads the same binding into `buildMetaForAd` and
+`resolveSpec` — do not pass a second path or the quote gate desyncs from
+the composition. The unstaged master (stage null) still uses today's
+cascade; it IS awareness. Separate 10s PMax *pacing* files selected via
+per-run `presetOverride` (still open — see the reverted 8s→10s re-time
+above) is a different question from stage selection.
 
 #### PMax video directives profile (Phase B)
 

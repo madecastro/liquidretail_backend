@@ -376,12 +376,15 @@ Video never launches a browser.
   `resolvePreset('meta_static')` / `META_STATIC_FANOUT` = three Meta sizes =
   three image submits (`platformFormats.js:405`, `:576-583`). Cannot crop one
   static plate cheaply — text is burned in-model (`:400-403`).
-- **Video (Meta): ONE Omni 9:16 master per product — and FOUR Ads.**
+- **Video (Meta): ONE Omni 9:16 master per product — and TWELVE Ads
+  (4 surfaces × 3 intent stages).**
   `resolvePreset('meta_video'|'meta_all')` returns
   `videoFormats: [META_VIDEO_MASTER]` only (`platformFormats.js`) — that is the
   billable list and must stay length 1. `expandWizardJob` then mints three FREE
-  derivative Ads (`META_VIDEO_DERIVATIVES`: feed 1:1, feed 4:5, Reels retitle),
-  each carrying `deriveFromMaster: 'meta_stories_9_16'` so they route through
+  derivative Ads (`META_VIDEO_DERIVATIVES`: feed 1:1, feed 4:5, Reels retitle)
+  plus consideration/conversion retitles of every surface (the unstaged row
+  IS awareness — masters never carry `funnelStage`). Every free row carries
+  `deriveFromMaster: 'meta_stories_9_16'` so they route through
   `renderDeriveOnlyVideoAd` and never reach Omni. Gated on the 9:16 master
   actually being in the run — a 1:1 or 4:5 window fits inside a portrait frame,
   so those crops are honest, but deriving them from a squarer master would be
@@ -390,15 +393,19 @@ Video never launches a browser.
   claim in this file — that `identityDigest` made 1:1 + 4:5 + 9:16 = three
   separate video submits — was true for non-preset multi-aspect video queues
   (measured in prod 2026-08-01) and is a money bug if reintroduced; it is not
-  the `meta_video` path.**
+  the `meta_video` path.** Flag-off (`PMAX_FUNNEL_VARIANTS=false`) restores
+  the pre-variant mint of 4 (1 master + 3 derivatives).
 - **Video (Google PMax, Phase A 2026-08-10): TWO billable Omni masters per
-  product — 9:16 + 16:9 — not one, and not three.**
+  product — 9:16 + 16:9 — not one, and not three. Delivered: NINE Ads
+  (3 surfaces × 3 intent stages), not 12.**
   `resolvePreset('google_video'|'google_all')` returns
   `videoFormats: GOOGLE_VIDEO_MASTERS` only (`['pmax_video_9_16','pmax_video_16_9']`);
   do **not** return the full `GOOGLE_VIDEO_FANOUT`. `pmax_video_1_1` is
   **derive-only**: face-safe crop of the settled 9:16 master's already-paid
-  plate + its own Remotion titling — **never** an Omni submit. One extra Ad is
-  minted with `deriveFromMaster: 'pmax_video_9_16'`. Full write-up:
+  plate + its own Remotion titling — **never** an Omni submit. The unstaged
+  master IS awareness; consideration + conversion are free retitles. Do
+  **not** also mint a staged `funnelStage:'awareness'` row — that is the
+  measured 4-per-surface pile (unstaged + three stages). Full write-up:
   `docs/PIPELINES.md` §6 *Google Performance Max video*.
 - **`pmax_video_1_1` must never reach a billable submit.** Gate is
   `resolveDeriveFromMaster(ad)` in `services/campaignAdsGenerationService.js` —
@@ -410,7 +417,8 @@ Video never launches a browser.
   `DERIVE_MASTER_POLL_MS`); do not requeue (stranded `queued` never auto-drains
   and a second Generate short-circuits as "Nothing to render"). Pinned by
   `scripts/verifyPmaxVideoExpansion.js` (54 checks).
-- **Duration on the video identity digest is Google-only.**
+- **Duration on the video identity digest is Google-only.
+  `funnelStage` is not.**
   `computeDeterministicVideoDigest` keeps prefix `det-video:v1` and appends
   `videoDurationSec` **only** for Google PMax video formats (zero history). An
   earlier draft appended duration unconditionally and bumped `v1`→`v2` —
@@ -421,6 +429,16 @@ Video never launches a browser.
   product again. Pre-existing Meta digests stay byte-identical. **Meta 8s→10s
   duration identity is a deliberate one-time re-mint that must be costed and
   flagged, never folded in silently.**
+  `funnelStage` is the other digest part, and the guard is **null-only, not
+  format-scoped**: append the stage when — and only when — it is non-null.
+  Every stored master has `funnelStage:null`, so a null-stage hash is
+  byte-identical to the pre-variant digest (pinned by
+  `scripts/verifyVideoIntentVariants.js` M1/M2 against an inline
+  reconstruction of the pre-change function). Scoping the part to Google
+  is what made Meta's three intent variants collide with the master on
+  the unique index — `insertMany` swallowed them and the operator got one
+  untitled Stories ad (measured run_1786555875841_2ddf9739). Do NOT bump
+  the prefix. Do NOT push an empty placeholder.
 - **Static (Google): `google_static` = 3 billable image submits**
   (`GOOGLE_STATIC_FANOUT` — landscape 1.91:1, square, portrait 4:5). Demand Gen
   + Shorts keys stay `coming_soon` (identical `deliveryDims` to live PMax —

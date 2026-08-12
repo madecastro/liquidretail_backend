@@ -257,15 +257,18 @@ for (const fmt of [MASTER_9_16, MASTER_16_9, 'meta_stories_9_16', 'pmax_16_9']) 
   check(`D4 billable format ${fmt} without funnelStage is NOT routed to derive`,
     resolveDeriveFromMaster({ platformFormat: fmt }) === null);
 }
-// Funnel variants remain a PMax-only feature (T10): a Meta format carrying a
-// stage must NOT gain a stage-driven derive. It derives on its own account
-// (it is a Meta derivative), which is a different reason — assert the value,
-// not merely non-null, so the two mechanisms cannot be confused.
-check('D4d Meta derivative + stage still derives from the Meta master (not the stage rule)',
+// Meta derivative + stage still derives from the Stories master.
+// Meta MASTER + stage MUST also derive — that is the fail-closed that
+// makes Meta intent variants free. The previous pin (D4e = billable)
+// was the money hole that kept Meta variants gated off.
+check('D4d Meta derivative + stage still derives from the Meta master',
   resolveDeriveFromMaster({ platformFormat: 'meta_feed_1_1', funnelStage: 'awareness' })
     === 'meta_stories_9_16');
-check('D4e Meta MASTER + stage stays billable (funnel variants are PMax-only)',
-  resolveDeriveFromMaster({ platformFormat: 'meta_stories_9_16', funnelStage: 'awareness' }) === null);
+check('D4e [MONEY] Meta MASTER + stage fail-closes to the Stories plate (never Omni)',
+  resolveDeriveFromMaster({ platformFormat: 'meta_stories_9_16', funnelStage: 'awareness' })
+    === 'meta_stories_9_16');
+check('D4f Meta MASTER without a stage stays billable',
+  resolveDeriveFromMaster({ platformFormat: 'meta_stories_9_16' }) === null);
 
 // ── E. Derive render path: ZERO billable submits (source, comments stripped) ─
 const adsSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
@@ -338,37 +341,48 @@ check('F3 [MONEY] gate defined once in campaignAdsGenerationService, imported el
     && (adsSrc.match(/function\s+resolveDeriveFromMaster\s*\(/g) || []).length === 0
     && (regenSrc.match(/function\s+resolveDeriveFromMaster\s*\(/g) || []).length === 0);
 
-// ── G. Minting loop (source) — flag-gated, covers masters + 1:1 ────────
-check('G1 minting loop stamps funnelStage for variants',
-  /funnelStage:\s*stage/.test(svcSrc) || /funnelStage:\s*s\b/.test(svcSrc));
+// ── G. Minting plan (behavioural) — flag-gated, covers masters + 1:1 ──
+// expandWizardJob iterates planDeterministicVideoAds; pin the PLAN, not
+// a regex over the loops it used to contain.
+const planFn = svc.planDeterministicVideoAds;
+check('G0 planDeterministicVideoAds is exported', typeof planFn === 'function');
+
+{
+  const prev = process.env.PMAX_FUNNEL_VARIANTS;
+  process.env.PMAX_FUNNEL_VARIANTS = 'true';
+  const pmax = planFn(['pmax_video_9_16', 'pmax_video_16_9']);
+  check('G1 PMax plan stamps funnelStage on variants only (not the master)',
+    pmax.filter((p) => p.funnelStage).length === 6
+      && pmax.filter((p) => p.funnelStage === 'awareness').length === 0
+      && pmax.filter((p) => !p.funnelStage && p.billable).length === 2);
+  check('G3 every PMax variant deriveFromMaster is a known PMax plate',
+    pmax.filter((p) => p.funnelStage).every((p) =>
+      p.deriveFromMaster === p.platformFormat
+      || (p.platformFormat === DERIVE_1_1 && p.deriveFromMaster === MASTER_9_16)));
+  check('G4 minting also covers the 1:1 surface',
+    pmax.some((p) => p.platformFormat === DERIVE_1_1 && p.funnelStage === 'consideration')
+      && pmax.some((p) => p.platformFormat === DERIVE_1_1 && p.funnelStage === 'conversion'));
+  check('G6 [MONEY] PMax plan is 9 ads / 2 billable (stages replace the extra awareness)',
+    pmax.length === 9 && pmax.filter((p) => p.billable).length === 2,
+    JSON.stringify(pmax.map((p) => `${p.platformFormat}:${p.funnelStage || 'base'}:${p.billable ? 'BILL' : 'free'}`)));
+
+  process.env.PMAX_FUNNEL_VARIANTS = 'false';
+  const off = planFn(['pmax_video_9_16', 'pmax_video_16_9']);
+  check('G5 [MONEY] flag-off PMax plan is the pre-variant mint (2 masters + 1:1)',
+    off.length === 3
+      && off.filter((p) => p.billable).length === 2
+      && off.every((p) => !p.funnelStage));
+  if (prev === undefined) delete process.env.PMAX_FUNNEL_VARIANTS;
+  else process.env.PMAX_FUNNEL_VARIANTS = prev;
+}
+
 check('G2 minting is gated on isPmaxFunnelVariantsEnabled',
-  /isPmaxFunnelVariantsEnabled\s*\(/.test(svcSrc)
-    && /if\s*\(\s*isPmaxFunnelVariantsEnabled\s*\(\s*\)\s*\)/.test(svcSrc));
-check('G3 minting covers each master format (deriveFromMaster: fmt)',
-  /deriveFromMaster:\s*fmt/.test(svcSrc));
-check('G4 minting also covers the 1:1 surface (consistency decision)',
-  // After the base 1:1 push, a loop over stages with DERIVE_ONLY + funnelStage
-  /PMAX_VIDEO_DERIVE_ONLY[\s\S]{0,400}funnelStage:\s*stage/.test(svcSrc)
-    || /funnelStage:\s*stage[\s\S]{0,400}PMAX_VIDEO_DERIVE_ONLY/.test(svcSrc)
-    || (svcSrc.includes('funnelStage: stage')
-      && (svcSrc.match(/platformFormat:\s*PMAX_VIDEO_DERIVE_ONLY/g) || []).length >= 2),
-  '1:1 variants were chosen for surface consistency — pin the mint');
+  /isPmaxFunnelVariantsEnabled\s*\(/.test(svcSrc));
 
-// Flag-off: when disabled, the minting block is skipped (source structure).
-// Behavioural pin of the flag itself is B5; source pin that minting is
-// inside the flag check:
-const flagBlock = svcSrc.match(
-  /if\s*\(\s*isPmaxFunnelVariantsEnabled\s*\(\s*\)\s*\)\s*\{[\s\S]{0,2500}?funnelStage/
-);
-check('G5 [MONEY] funnel-variant minting lives inside the flag-on block',
-  !!flagBlock,
-  'flag-off must mint nothing — variants must not be outside the gate');
-
-// ── M. Flag-off minting contract (dry-run count shape via source + helper) ─
-// The dry-run path multiplies by PMAX_FUNNEL_STAGES only when flag on.
-check('M1 dry-run count multiplies by funnel stages only when flag enabled',
-  /isPmaxFunnelVariantsEnabled\s*\(\s*\)[\s\S]{0,200}PMAX_FUNNEL_STAGES\.length/.test(svcSrc)
-    || /PMAX_FUNNEL_STAGES\.length[\s\S]{0,120}isPmaxFunnelVariantsEnabled/.test(svcSrc));
+// ── M. Dry-run uses the same planner the live mint iterates ──────────
+check('M1 dry-run count comes from planDeterministicVideoAds (cannot drift from mint)',
+  /const dryPlan = planDeterministicVideoAds\(dryMasterFormats\)/.test(svcSrc)
+    && /const dryDetPerProduct = dryPlan\.length/.test(svcSrc));
 
 // ── P. Preset files: load, validate, timeScale ─────────────────────────
 clearPresetCache();
@@ -481,10 +495,10 @@ check('T8 resolveFunnelPresetOverride maps conversion on 1:1',
 check('T9 absent funnelStage → null (today cascade)',
   svc.resolveFunnelPresetOverride({ platformFormat: MASTER_9_16 }) === null
     && svc.resolveFunnelPresetOverride({ platformFormat: MASTER_9_16, funnelStage: null }) === null);
-check('T10 Meta format with a stage still → null (PMax-only presets)',
+check('T10 Meta format with a stage maps to the generic 8s preset (not pmax10)',
   svc.resolveFunnelPresetOverride({
     platformFormat: 'meta_stories_9_16', funnelStage: 'awareness'
-  }) === null);
+  }) === 'canonical-awareness');
 check('T11 unknown stage → null',
   svc.resolveFunnelPresetOverride({
     platformFormat: MASTER_9_16, funnelStage: 'retargeting'
