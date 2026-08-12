@@ -34,6 +34,8 @@
  *                          never from upload metadata — upload space is the v1 black-bar bug. Must
  *                          be integers and within the delivery cap.
  *   full-frame no-op       a 9:16 target on a 9:16 master needs no crop: return null, zero cost.
+ *                          The orchestrator evaluates this via cropCouldBeNeeded AFTER measuring
+ *                          dims and BEFORE detectClipBoxes — vision is not spent to learn it.
  *   face quorum            heads must be found in >= FACE_MIN_FRAMES sampled frames
  *                          (consensusFaceBox). No quorum -> null.
  *   face anchor            the rect's anchorY must be a face anchor. anchorY 'center' is NOT
@@ -42,9 +44,12 @@
  *                          centre crop. Only a face-verified rect may replace the plate.
  *   liveness               range-GET on the derived URL must return 200/206 before it is trusted.
  *
- * COST: ~4 vision calls per newly generated portrait ad (~$0.02, ledgered automatically via
- * chatCompletion -> trackLlmCall), $0 for cached re-titles (Ad.basePlate), $0 for every gated-out
- * ad. No ffmpeg, no video download — frames are Cloudinary so_<sec> stills at the CDN edge.
+ * COST: ~4 vision calls per ad that ACTUALLY NEEDS a crop (~$0.02, ledgered automatically via
+ * chatCompletion -> trackLlmCall). $0 for cached re-titles (Ad.basePlate). $0 for every gated-out
+ * ad. $0 on the crop path when cropCouldBeNeeded is false (full-frame 9:16→9:16 / 16:9→16:9).
+ * Title keep-out may still pay detectClipBoxes ONCE if facesComputed is not already on the ad —
+ * that answers "where are the heads", not "do we need a crop", and is not a second crop-decision
+ * submit. No ffmpeg, no video download — frames are Cloudinary so_<sec> stills at the CDN edge.
  */
 
 const axios = require('axios');
@@ -163,6 +168,27 @@ function decideBasePlateCrop({ format, platformFormat, sourceUrl, sourceW, sourc
   return { action: 'crop', target, rect };
 }
 
+/**
+ * Cheap predicate: could a crop possibly be needed? Pure — no I/O, no vision.
+ *
+ * Reuses decideBasePlateCrop with head=null so the cheap gates (preGate, dims,
+ * full-frame window) fire first and the face check is never consulted. The only
+ * skip that means "we still need vision to decide" is `no-face-quorum` — we got
+ * past full-frame. Any other skip is a crop that is provably unnecessary.
+ *
+ * Evaluable as soon as delivery dims are known. Target aspect comes from
+ * TARGET_BY_FORMAT[format]; master aspect comes from the measured sourceW/H
+ * via windowFor — the same comparison decideBasePlateCrop uses, so this cannot
+ * disagree with it.
+ */
+function cropCouldBeNeeded({ format, platformFormat, sourceUrl, sourceW, sourceH }) {
+  const d = decideBasePlateCrop({
+    format, platformFormat, sourceUrl, sourceW, sourceH,
+    subject: null, head: null,
+  });
+  return d.reason === 'no-face-quorum';
+}
+
 // ── split-panel drift (PMax 16:9 split-stage; PMAX_SPLIT_VIDEO) ─────────────────────────────────
 //
 // decideBasePlateCrop (above) answers "crop a master TO an aspect" — a different question from
@@ -174,8 +200,11 @@ function decideBasePlateCrop({ format, platformFormat, sourceUrl, sourceW, sourc
 // than a new parameter bolted onto decideBasePlateCrop (which would make that function answer two
 // unrelated questions depending on which caller invoked it).
 //
-// COST: zero NEW vision calls. detectClipBoxes(...) is already run — and billed (~$0.02) — on the
-// titling path for every ad (see detectionExtras below, and resolveBasePlateVideoUrl's `det` call).
+// COST: zero NEW vision calls WHEN a crop was already needed — detectClipBoxes is billed on that
+// path (~$0.02) and the per-frame subject boxes are sitting in that already-paid output. A
+// full-frame ad (16:9→16:9 split master, 9:16→9:16) no longer runs detectClipBoxes in
+// resolveBasePlateVideoUrl; a future split-drift caller cannot assume boxes are already paid for
+// on that path (keep-out may have paid, via ensureFaceDetectionForKeepOut, or nothing has).
 // Its per-frame subject boxes carry the FULL box (left/top/right/bottom), but every consumer today
 // — decideBasePlateCrop, computeGravityCropRect, the face keep-out path — reduces them to their
 // VERTICAL extent only (head/subject top-bottom) because every existing target is a portrait or
@@ -477,6 +506,17 @@ async function probeUrlLive(url) {
   }
 }
 
+// Mutable slot so harnesses can spy detectClipBoxes / cropCouldBeNeeded without
+// proxyquire. resolveBasePlateVideoUrl and ensureFaceDetectionForKeepOut MUST
+// call through this object (not the local bindings) or a stub of _internal is
+// a no-op — verifyFaceKeepOut B2/B3 already stub this way.
+const internals = {
+  detectClipBoxes,
+  measureDeliveryDims,
+  probeUrlLive,
+  cropCouldBeNeeded,
+};
+
 // ── orchestrator ───────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -507,11 +547,41 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
       return { ...raw, reason: preGate.reason };
     }
 
-    const dims = await measureDeliveryDims(ad.veoVideoUrl);
+    const dims = await internals.measureDeliveryDims(ad.veoVideoUrl);
     if (!dims) { await persistSkip(ad, format, 'dims-unmeasurable'); return { ...raw, reason: 'dims-unmeasurable' }; }
 
+    // Full-frame / cheap skip: we already know no crop is possible (target
+    // aspect equals the measured master, or another decideBasePlateCrop cheap
+    // gate). Do NOT call detectClipBoxes here — that was the measured waste
+    // (48 billed vision calls answering "no crop needed").
+    //
+    // Keep-out still needs faces. ensureFaceDetectionForKeepOut (same request,
+    // brandScriptExecutor.js after this returns) will:
+    //   - reuse Ad.basePlate.facesComputed if a sibling/master already paid
+    //     (inherited plate, or a prior crop-needed pass on this source);
+    //   - otherwise run detectClipBoxes ONCE and persist.
+    // persistSkip below writes no face extras, so we cannot double-bill:
+    // this function does not pay, keep-out pays at most once.
+    if (!internals.cropCouldBeNeeded({
+      format, platformFormat: ad.platformFormat, sourceUrl: ad.veoVideoUrl,
+      sourceW: dims.sourceW, sourceH: dims.sourceH,
+    })) {
+      const cheap = decideBasePlateCrop({
+        format, platformFormat: ad.platformFormat, sourceUrl: ad.veoVideoUrl,
+        sourceW: dims.sourceW, sourceH: dims.sourceH,
+        subject: null, head: null,
+      });
+      // Fail-open: cropCouldBeNeeded is decideBasePlateCrop(head=null).reason
+      // === 'no-face-quorum'. If the two ever disagree (stub, future edit),
+      // do NOT persist a face-dependent skip and drop through to vision.
+      if (cheap.reason !== 'no-face-quorum') {
+        await persistSkip(ad, format, cheap.reason);
+        return { ...raw, reason: cheap.reason };
+      }
+    }
+
     const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
-    const det = await detectClipBoxes(ad.veoVideoUrl, durationSec, {
+    const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
     });
 
@@ -537,7 +607,8 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
 
     // Detection already paid — always stash faceSamples/envelope so titling
     // keep-out can reuse them free of charge, even when the crop itself skips
-    // (full-frame 9:16, no-face-quorum, …).
+    // (no-face-quorum, face-rejected, …). Full-frame never reaches here:
+    // cropCouldBeNeeded short-circuited before this call.
     const faceExtras = detectionExtras(det, dims);
 
     if (decision.action !== 'crop') {
@@ -557,7 +628,7 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
       return { ...raw, reason: 'full-frame' };
     }
 
-    if (!(await probeUrlLive(url))) {
+    if (!(await internals.probeUrlLive(url))) {
       // Not persisted as a permanent skip: a cold-cache 423-ish failure may succeed on the next
       // render. Fall back for THIS render only. Face extras ride on a faces-only write so
       // keep-out can reuse them without locking the crop decision to "skip".
@@ -654,6 +725,18 @@ async function persistFaceExtrasOnly(ad, format, extras = {}) {
 /**
  * Face boxes for titling keep-out (plateHints band `avoid` flags).
  *
+ * WHICH VISION CALLS REMAIN, AND WHY (2026-08-12 crop-order):
+ *   resolveBasePlateVideoUrl no longer calls detectClipBoxes when
+ *   cropCouldBeNeeded is false (full-frame 9:16→9:16, 16:9→16:9, …).
+ *   That skip is the money fix. THIS function is the remaining caller:
+ *   keep-out still needs face boxes even when no crop is needed, so a
+ *   full-frame ad with no cached facesComputed still pays detectClipBoxes
+ *   here — once. It is not paid twice: the crop path wrote no extras.
+ *
+ *   Crop-needed path: resolve pays detectClipBoxes, persist stamps
+ *   facesComputed, and the cache branch below returns fromCache without
+ *   a second submit.
+ *
  * Cache key: veoVideoUrl + format + version (same binding as base-plate crop).
  * Reuses Ad.basePlate faceSamples/envelope when present for this source;
  * otherwise runs detectClipBoxes ONCE and persists (ledgered via chatCompletion).
@@ -714,8 +797,8 @@ async function ensureFaceDetectionForKeepOut({ ad, format }) {
 
   try {
     const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
-    const dims = await measureDeliveryDims(ad.veoVideoUrl);
-    const det = await detectClipBoxes(ad.veoVideoUrl, durationSec, {
+    const dims = await internals.measureDeliveryDims(ad.veoVideoUrl);
+    const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
     });
     const extras = detectionExtras(det, dims);
@@ -771,11 +854,12 @@ module.exports = {
   ensureFaceDetectionForKeepOut,
   decideBasePlateCrop,       // pure — for the harness
   preGateBasePlateCrop,      // pure — for the harness
+  cropCouldBeNeeded,         // pure — cheap skip before vision
   decideSplitPanelDrift,     // pure — PMax 16:9 split-stage post-render containment check
   SPLIT_PANEL_SIDES,         // for the harness
   DEFAULT_DRIFT_TOLERANCE_FRAC, // for the harness
   TARGET_BY_FORMAT,
   DETECT_SYSTEM_PROMPT,      // for the harness (headwear sentence asserted)
   FACE_KEEPOUT_ENABLED,      // for the harness
-  _internal: { parseBox, measureDeliveryDims, probeUrlLive, detectClipBoxes, faceSamplesFromCache, detectionExtras },
+  _internal: Object.assign(internals, { parseBox, faceSamplesFromCache, detectionExtras }),
 };
