@@ -2481,6 +2481,9 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       // to the existing path.
       adConceptArtifactId: ad.conceptArtifactId ? String(ad.conceptArtifactId) : null,
       adConceptId:         ad.conceptId || null,
+      // QUOTE_STAGE_AWARE: Ad.funnelStage reaches assembleInput via
+      // deriveStage → quoteOpts. Flag-off the scorer ignores it.
+      funnelStage:         ad.funnelStage || null,
       creative,
       cta:           { text: ad.ctaText, url: ad.ctaUrl, params: ad.ctaUrlParams },
       authToken:     renderToken,

@@ -51,6 +51,105 @@ function directorProofMenuEnabled() {
   return String(process.env.DIRECTOR_PROOF_MENU_ENABLED ?? 'false').toLowerCase() === 'true';
 }
 
+// DIRECTOR_QUOTE_POOL_ALIGNED (default false). Independent of
+// QUOTE_STAGE_AWARE so the two levers can flip separately.
+// Flag-off: primary_quote is product.reviews[0] (SerpAPI arrival
+// order) — today's assembleSignals source.
+// Flag-on: productReviews.quotes through the SAME pipeline render
+// uses (stamp → printable → star gate → pickStrongestQuote).
+function directorQuotePoolAlignedEnabled() {
+  return String(process.env.DIRECTOR_QUOTE_POOL_ALIGNED || 'false').toLowerCase() === 'true';
+}
+
+// DIRECTOR_FUNNEL_STAGE_ALL (default false). PMax already asks for
+// routing.funnel_stage (one of each across the round). Flag-on extends
+// the schema + a lighter declare-the-stage prompt to EVERY destination
+// so Meta concept-driven statics can carry Ad.funnelStage too.
+// Flag-off Meta prompt/schema stay byte-identical.
+function directorFunnelStageAllEnabled() {
+  return String(process.env.DIRECTOR_FUNNEL_STAGE_ALL || 'false').toLowerCase() === 'true';
+}
+
+function shouldEmitFunnelStage(platformFormat) {
+  return isPmaxPlatformFormat(platformFormat) || directorFunnelStageAllEnabled();
+}
+
+function mapArrivalReview(r) {
+  return {
+    text:   r.text || r.body || r.content,
+    author: r.author || r.reviewer || r.user_name
+  };
+}
+
+/**
+ * Pure flag-fork for assembleSignals' primary_quote source.
+ * Exported so the harness can assert flag-off === reviews[0] and
+ * flag-on === pickStrongestQuote(productReviews.quotes) without Mongo.
+ *
+ * `opts` is forwarded to pickPrimaryProductQuote (stage / angleTerms).
+ * assembleSignals has no per-concept stage yet (stage is a Director
+ * OUTPUT), so the single primary_quote field stays the unstaged
+ * strongest. When QUOTE_STAGE_AWARE is on, assembleSignals also
+ * fills quotes_by_stage by calling this with each stage.
+ *
+ * @param {object|null} product  CatalogProduct-shaped doc
+ * @param {object} [opts]
+ * @returns {{text:string, author?:string}|null}
+ */
+function pickDirectorPrimaryQuote(product, opts) {
+  if (!directorQuotePoolAlignedEnabled()) {
+    const reviews = Array.isArray(product?.reviews) ? product.reviews : [];
+    const mapped = reviews
+      .map(mapArrivalReview)
+      .filter((r) => typeof r.text === 'string' && r.text.trim().length > 30);
+    return mapped[0] || null;
+  }
+  let pickPrimaryProductQuote;
+  try {
+    pickPrimaryProductQuote = require('./layoutInputService').pickPrimaryProductQuote;
+  } catch {
+    pickPrimaryProductQuote = null;
+  }
+  if (typeof pickPrimaryProductQuote !== 'function') return null;
+  const picked = pickPrimaryProductQuote(product?.productReviews, opts || {});
+  if (!picked || !picked.text) return null;
+  return {
+    text:   picked.text,
+    author: picked.author_name || picked.author || null
+  };
+}
+
+/**
+ * Product-tier quotes for the Director signal.
+ * Flag-off: Immersive product.reviews (arrival order, length > 30).
+ * Flag-on: the SAME prepareQuotePool render uses (stamp → printable
+ * → star gate). proof_options and primary_quote must not diverge.
+ */
+function productQuotesForDirector(product) {
+  if (!directorQuotePoolAlignedEnabled()) {
+    return (Array.isArray(product?.reviews) ? product.reviews : [])
+      .map(mapArrivalReview)
+      .filter((r) => typeof r.text === 'string' && r.text.trim().length > 30);
+  }
+  let prepareQuotePool;
+  try {
+    prepareQuotePool = require('./layoutInputService').prepareQuotePool;
+  } catch {
+    prepareQuotePool = null;
+  }
+  if (typeof prepareQuotePool !== 'function') return [];
+  return prepareQuotePool(
+    product?.productReviews,
+    product?.productReviews?.quotes,
+    'product'
+  ).map((q) => ({
+    text:   q.text,
+    author: q.author_name || q.author || null,
+    rating: q.rating,
+    origin: q.origin
+  })).filter((q) => typeof q.text === 'string' && q.text.trim().length > 30);
+}
+
 /**
  * Pure brand-quote → Director primary_quote shape. brandReviews is the
  * llm-web pool; route through the gate so the Director never sees a byline
@@ -265,7 +364,7 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '3.3.0';   // BUMPED 2026-08-10: PMax funnel-spread + social-proof hierarchy in round brief.
+const DIRECTOR_SIGNALS_VERSION = '3.4.0';   // BUMPED 2026-08-12: aligned proof_options pool + quotes_by_stage (QUOTE_STAGE_AWARE).
 // 3.3: PMax-only round brief adds FUNNEL SPREAD (one concept each of awareness /
 // consideration / conversion via routing.funnel_stage) and SOCIAL-PROOF HIERARCHY
 // (one dominant proof element; env-backed rating/count thresholds). Meta prompts
@@ -668,9 +767,7 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   const productRatingPair = resolveDirectorProductRatingPair(product);
   const productRatingValue = productRatingPair.rating;
   const productRatingCount = productRatingPair.reviewCount;
-  const productReviewQuotes = (Array.isArray(product?.reviews) ? product.reviews : [])
-    .map(r => ({ text: r.text || r.body || r.content, author: r.author || r.reviewer || r.user_name }))
-    .filter(r => typeof r.text === 'string' && r.text.trim().length > 30);
+  const productReviewQuotes = productQuotesForDirector(product);
 
   // Brand-level — only consulted to fill in what product-level missed.
   // brandReviews.quotes is the llm-web pool (geminiSearchProvider.stampLlmQuotes
@@ -740,9 +837,32 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   const scopedBrandQuotes = selectBrandQuotesForScope(brandReviewQuotes, brandQuoteScope);
   const scopedCategoryQuotes = selectBrandQuotesForScope(categoryReviewQuotes, brandQuoteScope);
   const scopedProductQuotes = selectBrandQuotesForScope(productReviewQuotes, brandQuoteScope);
-  const primaryQuoteObj = scopedProductQuotes[0]
-    || (isProductScoped ? null : scopedBrandQuotes[0])
-    || null;
+  // Flag-off: scopedProductQuotes[0] === product.reviews[0] after the
+  // arrival-order map + noun-scope filter (today). Flag-on: BOTH
+  // primary_quote AND proof_options.product.quotes come from
+  // prepareQuotePool(product.productReviews) — same stamp / printable /
+  // star gates. assembleSignals has no per-concept stage (stage is a
+  // Director OUTPUT); primary_quote is the unstaged strongest.
+  // quotes_by_stage (flag-on only) is how stage reaches
+  // pickDirectorPrimaryQuote at signal time.
+  let primaryFromBrand = false;
+  let primaryQuoteObj;
+  if (directorQuotePoolAlignedEnabled()) {
+    const aligned = pickDirectorPrimaryQuote(product, {});
+    if (aligned) {
+      primaryQuoteObj = aligned;
+    } else if (!isProductScoped && scopedBrandQuotes[0]) {
+      primaryQuoteObj = scopedBrandQuotes[0];
+      primaryFromBrand = true;
+    } else {
+      primaryQuoteObj = null;
+    }
+  } else {
+    primaryQuoteObj = scopedProductQuotes[0]
+      || (isProductScoped ? null : scopedBrandQuotes[0])
+      || null;
+    primaryFromBrand = !!(primaryQuoteObj && !productReviewQuotes.length);
+  }
   if (isProductScoped && !productReviewQuotes.length && brandReviewQuotes.length) {
     console.log(`🔒 director scope — ${brandReviewQuotes.length} brand review(s) withheld from a product concept (cross-product copy risk)`);
   }
@@ -754,7 +874,9 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   // product concept now withholds brand quotes, and attributing a
   // brand-scrape source to a quote that was never included would label a
   // null.
-  const primaryQuoteSource = (!productReviewQuotes.length && primaryQuoteObj)
+  const primaryQuoteSource = (directorQuotePoolAlignedEnabled()
+    ? primaryFromBrand
+    : (!productReviewQuotes.length && primaryQuoteObj))
     ? brandReviewSource
     : null;
 
@@ -793,6 +915,21 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
     // proof-led archetype it cannot ground.
     proof_density:    scopedProductQuotes.length + (isProductScoped ? 0 : scopedBrandQuotes.length) + topComments.length
   };
+  // QUOTE_STAGE_AWARE: per-stage winners from the SAME gated pool as
+  // primary_quote. assembleSignals runs before concepts exist, so a
+  // single primary cannot be staged; this is how the model sees the
+  // staged picks. Flag-off: field absent (signal byte-identical).
+  if (String(process.env.QUOTE_STAGE_AWARE || 'false').toLowerCase() === 'true'
+      && directorQuotePoolAlignedEnabled()) {
+    const byStage = {};
+    for (const s of PMAX_FUNNEL_STAGES) {
+      const p = pickDirectorPrimaryQuote(product, { funnelStage: s });
+      byStage[s] = p
+        ? { text: snippetText(p.text, 200), author: p.author || null }
+        : null;
+    }
+    socialProofSignal.quotes_by_stage = byStage;
+  }
 
   // ── PROOF MENU — behind DIRECTOR_PROOF_MENU_ENABLED, additive only. ──
   //
@@ -2528,6 +2665,19 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       buildPmaxSocialProofHierarchyBlock(),
       ``
     ] : []),
+    // Meta (and any non-PMax destination) only when DIRECTOR_FUNNEL_STAGE_ALL.
+    // Lighter than the PMax block: declare a stage, do NOT require one-of-each
+    // (Meta does not deliver three concepts into one Google asset group).
+    ...(!isPmax && directorFunnelStageAllEnabled() ? [
+      [
+        `FUNNEL STAGE:`,
+        `Each concept MUST declare routing.funnel_stage as one of awareness|consideration|conversion, matching the purchase-journey stage the concept serves.`,
+        `  awareness     — brand story / lifestyle / emotional hook; no hard sell.`,
+        `  consideration — benefit + proof / objection handling.`,
+        `  conversion    — offer / urgency / explicit action.`
+      ].join('\n'),
+      ``
+    ] : []),
     // Split-stage panel treatment — PMax VIDEO only (see isPmaxSplitVideo
     // above), so this never touches a Meta or PMax-image prompt.
     ...(isPmaxSplitVideo ? [
@@ -2708,11 +2858,13 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     platformFormat === 'meta_reels_9_16'
       ? `    output_shape      — { format: 'reels_storyboard', duration_sec, storyboard_beats: [{t_start, t_end, role, position, emphasis}] }`
       : `    output_shape      — { format, tile_count }`,
-    // PMax only — funnel_stage is not a Meta field. Declaring it here on a
-    // Meta prompt would break Meta byte-identity; the schema addition below
-    // is gated the same way.
-    ...(isPmax ? [
-      `    funnel_stage     — awareness | consideration | conversion (declare which stage this concept serves; one of each across the round)`
+    // PMax always; Meta only when DIRECTOR_FUNNEL_STAGE_ALL. Flag-off
+    // Meta prompt stays byte-identical. PMax keeps the one-of-each
+    // wording; Meta (flag-on) just asks the concept to declare a stage.
+    ...(shouldEmitFunnelStage(platformFormat) ? [
+      isPmax
+        ? `    funnel_stage     — awareness | consideration | conversion (declare which stage this concept serves; one of each across the round)`
+        : `    funnel_stage     — awareness | consideration | conversion (declare which purchase-journey stage this concept serves)`
     ] : []),
     // PMax split-stage VIDEO only — see isPmaxSplitVideo above. Absent from
     // both the PMax-image and Meta per-concept listings.
@@ -2986,10 +3138,10 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
       // parse failure. A Director run from before this shipped, or with the
       // menu flag off, never emits this key at all; that must keep working.
       proof_pick: { type: ['integer', 'null'] },
-      // PMax only — nullable, not required (same soft-validator posture as
-      // proof_pick). Meta schemas omit this key entirely so Meta stays
-      // byte-identical on the schema side too.
-      ...(isPmax ? {
+      // PMax always; Meta only when DIRECTOR_FUNNEL_STAGE_ALL. Nullable,
+      // not required (same soft-validator posture as proof_pick). Flag-off
+      // Meta schemas omit this key so Meta stays byte-identical.
+      ...(shouldEmitFunnelStage(platformFormat) ? {
         funnel_stage: { type: ['string', 'null'], enum: [...PMAX_FUNNEL_STAGES, null] }
       } : {}),
       // PMax split-stage VIDEO only — see isPmaxSplitVideo above. Nullable
@@ -3201,6 +3353,11 @@ module.exports = {
   directConcepts,
   directConceptsRound,
   assembleSignals,
+  directorQuotePoolAlignedEnabled,
+  directorFunnelStageAllEnabled,
+  shouldEmitFunnelStage,
+  pickDirectorPrimaryQuote,
+  productQuotesForDirector,
   AVAILABLE_ARCHETYPES,
   CREATIVE_RULES,
   CREATIVE_STYLES_ENUM,

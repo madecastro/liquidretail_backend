@@ -58,7 +58,7 @@ const { loadCategoryChainForProduct } = require('./categoryChainService');
 // refreshStaleLayoutInput() below (see that function's comment) — it is
 // layoutInputService's own constant, imported rather than hardcoded so the
 // two files can't drift on what "current schema" means.
-const { buildLayoutInput, INPUT_SCHEMA_VERSION } = require('./layoutInputService');
+const { buildLayoutInput, INPUT_SCHEMA_VERSION, resolveQuoteAssemblyOptions } = require('./layoutInputService');
 
 // Generative reframe (video reference path only). Outpaint every ref to
 // the target aspect so the product stays fully visible; store labeled
@@ -3618,6 +3618,7 @@ async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product,
     try {
       console.log(`📐 layoutInput[ad=${ad._id}]: deriving (template=${tmpl}, aspect=${targetAspect}, product=${ad.productId})...`);
       const t0 = Date.now();
+      const quoteAssembly = await resolveQuoteAssemblyOptions(ad);
       await buildLayoutInput({
         mediaId:     media._id,
         template:    tmpl,
@@ -3626,7 +3627,11 @@ async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product,
           campaignKind:  campaign?.kind || 'product',
           variantKind:   'product_image',
           productId:     ad.productId,
-          paletteSource: 'media'
+          paletteSource: 'media',
+          // QUOTE_STAGE_AWARE: same funnelStage + concept-angle
+          // threading as the static derive path. Flag-off ignored.
+          funnelStage:   quoteAssembly.funnelStage,
+          conceptAngle:  quoteAssembly.conceptAngle
         }
       });
       console.log(`📐 layoutInput[ad=${ad._id}]: derived in ${Date.now() - t0}ms`);
@@ -3640,6 +3645,22 @@ async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product,
         stage: 'layoutInput'
       });
     }
+  }
+  // QUOTE_STAGE_AWARE: re-pick from the stored pool. Video masters
+  // historically have funnelStage=null, so this is a no-op there.
+  // Concept-driven statics that share this helper (none today) and
+  // any future staged master would honour the stage without a
+  // cache-key partition. Titling (buildMetaForAd) is the path that
+  // actually prints a quote on funnel retitles.
+  if (layoutInput?.input) {
+    try {
+      const { applyStagedQuotePick } = require('./layoutInputService');
+      const quoteAssembly = await resolveQuoteAssemblyOptions(ad);
+      const staged = applyStagedQuotePick(layoutInput.input, quoteAssembly);
+      if (staged !== layoutInput.input) {
+        layoutInput = { ...layoutInput, input: staged };
+      }
+    } catch { /* pick is an enhancement */ }
   }
   return layoutInput;
 }

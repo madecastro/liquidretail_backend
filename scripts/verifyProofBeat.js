@@ -1307,11 +1307,21 @@ check('Q3 a limitation is not a testimonial, and stage/angle re-rank honestly', 
   // 7. Director angle lifts an on-hook quote, bounded so it cannot dominate.
   const withAngle = score(durability, { angleTerms: ['wash', 'durable'] });
   assert.ok(withAngle > score(durability), 'a quote matching the concept hook must score higher');
-  // ONE cap over stage AND angle together. Bounded separately they still summed to
-  // 5.4, rivalling the entire sentiment band (capped at 5).
+  // Stage has reserved headroom (STAGE_HEADROOM, default 2.4); angle still
+  // uses BIAS_CAP. Combined they can exceed 3 — a shared cap made stage a
+  // no-op whenever two angle tokens saturated it. The remaining honest
+  // no-op is a base-score lead larger than STAGE_HEADROOM.
+  const { STAGE_HEADROOM, BIAS_CAP } = require('../services/layoutInputService');
   const capped = score(durability, { stage: 'consideration', angleTerms: ['wash', 'comfortable'] });
-  assert.ok(capped - score(durability) <= Number(process.env.QUOTE_BIAS_CAP || 3) + 0.001,
-    'stage and angle together must not exceed the single bias cap');
+  const lift = capped - score(durability);
+  assert.ok(lift > 0, 'stage+angle must still lift a matching quote');
+  assert.ok(lift <= STAGE_HEADROOM + BIAS_CAP + 0.001,
+    `stage+angle lift ${lift} exceeds STAGE_HEADROOM+BIAS_CAP`);
+  // Reserved headroom: angle saturation must not zero the stage nudge.
+  const angleOnly = score(durability, { angleTerms: ['wash', 'comfortable'] });
+  const stageAndAngle = score(durability, { stage: 'consideration', angleTerms: ['wash', 'comfortable'] });
+  assert.ok(stageAndAngle > angleOnly,
+    'stage must still lift after angle has applied — reserved headroom');
   // 8. Aliases the campaign brief actually uses.
   assert.ok(score(repeat, { stage: 'bottom' }) > score(repeat), 'bottom-of-funnel alias must resolve');
   assert.ok(score(durability, { stage: 'mofu' }) > score(durability), 'mofu alias must resolve');

@@ -276,6 +276,24 @@ const FUNNEL_VARIANT_STAGES = Object.freeze(
 );
 
 /**
+ * Director routing.funnel_stage → Ad.funnelStage, or null.
+ * Dual-read via conceptField so a flat v2 leftover is not dropped.
+ * Unknown / empty / whitespace → null (do not stamp garbage).
+ *
+ * Consumed ONLY for kind === 'image'. #197 made staged VIDEO rows a
+ * first-class thing (free funnel-titled variants carrying deriveFromMaster),
+ * and its own rule is that `billable === true` only for UNSTAGED masters — so
+ * a concept-minted video master must still never carry this field, or
+ * resolveDeriveFromMaster reads it as a free re-title and the master is never
+ * generated. The two changes agree; see the stamp site's comment.
+ */
+function conceptFunnelStage(concept) {
+  const raw = conceptField(concept, 'funnel_stage');
+  const s = String(raw || '').toLowerCase().trim();
+  return PMAX_FUNNEL_STAGE_SET.has(s) ? s : null;
+}
+
+/**
  * Kill switch for free funnel-titled variants (PMax AND Meta video).
  * The env name is a leftover — the machinery is platform-agnostic; Meta
  * was previously gated out because funnelStage was not part of a Meta
@@ -3301,6 +3319,11 @@ async function expandDeterministicVideo({
       payload[DERIVE_FROM_MASTER_FIELD] = deriveFrom;
     }
     if (normalizedFunnelStage) {
+      // Funnel retitles never call buildLayoutInput. Titling
+      // (buildMetaForAd) re-picks the quote from the stored pool
+      // via applyStagedQuotePick when QUOTE_STAGE_AWARE is on.
+      // Stamping the field on the Ad is the hand-off; this service
+      // does not call assembleInput.
       payload[FUNNEL_STAGE_FIELD] = normalizedFunnelStage;
     }
     payloads.push(payload);
@@ -3622,6 +3645,14 @@ async function runConceptDrivenExpansion({
         const creativeStyle = conceptField(concept, 'creative_style');
         const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || 'ai_brand_led';
         const role = primaryUniverseEntry.role;
+        // Director already emits routing.funnel_stage on PMax rounds
+        // (and on every destination when DIRECTOR_FUNNEL_STAGE_ALL is
+        // on). Stamp it onto IMAGE ads so render/titling can be
+        // stage-aware. NEVER stamp on VIDEO: resolveDeriveFromMaster
+        // fail-closes "funnelStage set + Google master format" to
+        // derive-only, which would skip Omni on a paid concept-driven
+        // PMax video master.
+        const conceptStage = conceptFunnelStage(concept);
 
         // One payload per requested kind — and, for image, per STATIC SURFACE.
         //
@@ -3694,7 +3725,12 @@ async function runConceptDrivenExpansion({
               }),
               ctaText, ctaUrl, ctaUrlParams,
               queuedAt:          new Date(),
-              generatedAt:       new Date()
+              generatedAt:       new Date(),
+              // IMAGE only — see conceptStage comment above. A video
+              // payload with this field set is a money/product bug.
+              ...(kind === 'image' && conceptStage
+                ? { [FUNNEL_STAGE_FIELD]: conceptStage }
+                : {})
             });
           }
         }
@@ -3956,6 +3992,7 @@ module.exports = {
   FUNNEL_STAGE_FIELD,
   PMAX_FUNNEL_STAGES,
   FUNNEL_VARIANT_STAGES,
+  conceptFunnelStage,
   GOOGLE_PMAX_VIDEO_DURATION_SEC,
   META_VIDEO_MASTER_KEY,
   META_VIDEO_DERIVE_KEYS,

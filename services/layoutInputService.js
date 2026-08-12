@@ -196,6 +196,25 @@ const INPUT_SCHEMA_VERSION = '4.1';   // 4.1: quote provenance (origin + tier) s
 // bound, not a Director-prompt change.
 const MAX_LAYOUT_SECONDARY_QUOTES = 16;
 
+// QUOTE_STAGE_AWARE (default false). When on, Ad.funnelStage + concept
+// angle reach pickStrongestQuote via the already-built STAGE_TERMS
+// scorer. The printed quote is re-picked at RENDER / TITLING time from
+// the artifact's stored pool (primary_quote + secondary_quotes) — NOT
+// by partitioning LayoutInputArtifact.campaignContextHash.
+//
+// WHY NO CACHE-KEY PARTITION. The ads that actually carry Ad.funnelStage
+// (PMax funnel retitles) never call buildLayoutInput. Titling loads
+// {mediaId, productId} newest. A hash no paid reader honours is worse
+// than no hash: logs would claim funnel=awareness while pixels stayed
+// the unstaged winner. Freshness is stage-aware via applyStagedQuotePick,
+// so we do NOT bump INPUT_SCHEMA_VERSION (a global bump would rebuild
+// every artifact while the flag is off and the pick is unchanged).
+// Flag-off is byte-identical: quoteOpts stay empty and the cache key
+// is HEAD-identical (product → null; brand/promo → kind/promo/raffle).
+function quoteStageAwareEnabled() {
+  return String(process.env.QUOTE_STAGE_AWARE || 'false').toLowerCase() === 'true';
+}
+
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
 const OVERLAY_MODE_TEMPLATES = new Set(['testimonial_overlay', 'product_overlay']);
@@ -293,6 +312,10 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
   // kind='product' campaign on the same (mediaId, template, ratio,
   // productId, variantKind). Edits to promotionalDetails change the
   // hash, forcing a re-derivation.
+  //
+  // Funnel stage is NOT a cache-key dimension. Staged quote selection
+  // happens at render/titling via applyStagedQuotePick against the
+  // stored pool. See the QUOTE_STAGE_AWARE comment on INPUT_SCHEMA_VERSION.
   const cacheKeyProductId     = options.productId   || null;
   const cacheKeyVariantKind   = options.variantKind || null;
   const cacheKeyPaletteSource = options.paletteSource || 'media';
@@ -1534,16 +1557,21 @@ function scoreQuote(text, { stage = null, angleTerms = null } = {}) {
   // enthusiasm; they read as product copy, not as a customer speaking.
   if (positiveSignals === 0) score -= 2;
 
-  // STAGE AFFINITY — a bounded nudge, never a gate.
-  let bias = 0;
+  // STAGE AFFINITY — reserved headroom, never a gate.
+  // Applied BEFORE angle and independently capped so two angle hits
+  // cannot zero the stage nudge. A shared BIAS_CAP=3 made stage a
+  // no-op whenever conceptAngle already saturated the cap (two ≥4-
+  // letter hook tokens → bias=3 before stage was added).
+  let stageBias = 0;
   const stageKey = normalizeStage(stage);
   if (stageKey && STAGE_TERMS[stageKey]) {
     const hits = (s.match(STAGE_TERMS[stageKey]) || []).length;
-    bias += Math.min(hits, 2) * STAGE_WEIGHT;
+    stageBias = Math.min(hits, 2) * STAGE_WEIGHT;
   }
 
   // DIRECTOR ANGLE AFFINITY — when a concept is driving the ad, a quote that
   // speaks to the same hook is worth more than a generically strong one.
+  let angleBias = 0;
   if (Array.isArray(angleTerms) && angleTerms.length) {
     // WORD-BOUNDED, and short terms ignored: a substring test let ['soft'] match
     // "Microsoft" and a one-letter term match every quote ever written.
@@ -1552,9 +1580,14 @@ function scoreQuote(text, { stage = null, angleTerms = null } = {}) {
       if (term.length < 4) return false;
       return new RegExp(`(?:^|[^a-z])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z])`, 'i').test(s);
     }).length;
-    bias += Math.min(hits, 2) * ANGLE_WEIGHT;
+    angleBias = Math.min(hits, 2) * ANGLE_WEIGHT;
   }
-  score += Math.min(bias, BIAS_CAP);
+  // Stage reserved; angle still uses BIAS_CAP. Combined they can exceed 3.
+  // The remaining honest no-op: a base-score lead larger than STAGE_HEADROOM
+  // cannot be flipped by stage (thin SKU, single quote, or an 80–140 char
+  // rave vs a 12-word closer). The harness pins that boundary.
+  score += Math.min(stageBias, STAGE_HEADROOM);
+  score += Math.min(angleBias, BIAS_CAP);
 
   // Specificity signals
   if (/\d/.test(s))            score += 1;
@@ -1708,12 +1741,117 @@ function normalizeStage(v) {
   const k = String(v || '').toLowerCase().replace(/[^a-z]/g, '');
   return STAGE_ALIASES[k] || null;
 }
+
+// Flag-off: empty opts so pickStrongestQuote is today's scorer (no
+// STAGE_TERMS / angle nudge). Flag-on: stage + conceptAngle from the
+// caller. Callers may always pass the fields; this function is the
+// single gate that keeps flag-off byte-identical.
+function quoteOptsFromOptions(options) {
+  if (!quoteStageAwareEnabled()) return { stage: null, angleTerms: null };
+  return {
+    stage: normalizeStage(options?.funnelStage || options?.stage || null),
+    angleTerms: Array.isArray(options?.conceptAngle) ? options.conceptAngle.slice(0, 8) : null
+  };
+}
+
+// Director emotional_hook → word list for scoreQuote's angleTerms.
+// Dual-read via conceptField so a v3 nested hook is not silently dropped.
+function conceptAngleTerms(concept) {
+  if (!concept) return null;
+  const { conceptField } = require('./conceptProjection');
+  const hook = conceptField(concept, 'emotional_hook');
+  if (typeof hook !== 'string' || !hook.trim()) return null;
+  const terms = hook.split(/[^a-zA-Z]+/).map((t) => t.trim()).filter((t) => t.length >= 4);
+  return terms.length ? terms.slice(0, 8) : null;
+}
+
+// Best-effort angle resolution for render callers. Flag-off skips the
+// concept fetch so the default path pays no extra query.
+async function resolveQuoteAssemblyOptions(ad) {
+  const funnelStage = ad?.funnelStage || null;
+  if (!quoteStageAwareEnabled()) {
+    return { funnelStage, conceptAngle: null };
+  }
+  let conceptAngle = Array.isArray(ad?.conceptAngle) ? ad.conceptAngle.slice(0, 8) : null;
+  const artifactId = ad?.conceptArtifactId || ad?.adConceptArtifactId || null;
+  const conceptId  = ad?.conceptId || ad?.adConceptId || null;
+  if (!conceptAngle && artifactId && conceptId) {
+    try {
+      const CreativeDirectionArtifact = require('../models/CreativeDirectionArtifact');
+      const art = await CreativeDirectionArtifact.findById(artifactId).select('concepts').lean();
+      const concept = (art?.concepts || []).find((c) => c.concept_id === conceptId);
+      conceptAngle = conceptAngleTerms(concept);
+    } catch {
+      /* angle is a nudge, never a hard dep */
+    }
+  }
+  return { funnelStage, conceptAngle };
+}
+
+/**
+ * Re-pick social_proof.primary_quote from the artifact's stored pool
+ * (primary + secondary_quotes) using the Ad's stage / concept angle.
+ *
+ * This is the paid-path contract for QUOTE_STAGE_AWARE. PMax funnel
+ * retitles never write their own LayoutInputArtifact; they share the
+ * master's {mediaId, productId} newest 4.1 row. Hash-partitioning that
+ * row would miss, fall back to the unstaged winner, and log
+ * funnel=awareness while burning the unstaged quote. Re-scoring the
+ * already-gated pool at render/titling time is the only pick those
+ * rows can honour.
+ *
+ * Flag-off / no stage / single-quote pool: identity (returns `input`
+ * unchanged, same object). Stays inside the winning tier so a
+ * conversion-flavoured brand quote cannot outrank a product-tier
+ * primary — same cascade rotation already obeys.
+ *
+ * Does not mutate `input`. Does not persist. Callers (buildMetaForAd,
+ * buildIntentData, deriveStage) apply this to the in-memory object
+ * they are about to print.
+ */
+function applyStagedQuotePick(input, options = {}) {
+  if (!input || typeof input !== 'object') return input;
+  if (!quoteStageAwareEnabled()) return input;
+  const quoteOpts = quoteOptsFromOptions(options);
+  if (!quoteOpts.stage && !quoteOpts.angleTerms) return input;
+  const proof = input.social_proof;
+  if (!proof || !proof.primary_quote || !proof.primary_quote.text) return input;
+
+  const primary = proof.primary_quote;
+  const rest = Array.isArray(proof.secondary_quotes) ? proof.secondary_quotes : [];
+  const pool = [primary, ...rest].filter((q) => q && String(q.text || '').trim());
+  if (pool.length < 2) return input;
+
+  const tier = primary.tier || null;
+  const candidates = tier
+    ? pool.filter((q) => (q.tier || null) === tier)
+    : pool;
+  if (candidates.length < 2) return input;
+
+  const picked = pickStrongestQuote(candidates, quoteOpts);
+  if (!picked || picked.text === primary.text) return input;
+
+  const secondary = pool.filter((q) => q.text !== picked.text);
+  return {
+    ...input,
+    social_proof: {
+      ...proof,
+      primary_quote: picked,
+      secondary_quotes: secondary.length ? secondary : undefined
+    }
+  };
+}
+
 const STAGE_WEIGHT = Number(process.env.QUOTE_STAGE_WEIGHT || 1.2);
-// ONE cap over stage AND angle combined: separately bounded they still summed to
-// 5.4, rivalling the whole sentiment band (capped at 5). A bias that can outrank
-// what the review actually says is not a bias, it is an override.
+// Angle still uses this cap. Stage has its own reserved headroom
+// (STAGE_HEADROOM) so a saturated angle cannot make the stage a no-op.
+// Combined they can exceed 3 — that is deliberate; the remaining no-op
+// is a base-score lead larger than STAGE_HEADROOM, which the harness pins.
 const BIAS_CAP = Number(process.env.QUOTE_BIAS_CAP || 3);
 const ANGLE_WEIGHT = Number(process.env.QUOTE_ANGLE_WEIGHT || 1.5);
+// Default = max stage nudge (2 hits × STAGE_WEIGHT 1.2). Env-tunable
+// without a deploy; not in defaults.env (this lane does not edit that file).
+const STAGE_HEADROOM = Number(process.env.QUOTE_STAGE_HEADROOM || 2.4);
 // NO SECOND FLOOR HERE. SCORE_FLOOR (=1) plus hasPositiveSignal already decide
 // whether a candidate may take the primary slot, and this file records what
 // happens when a filter brings its own lower threshold along: it is a no-op until
@@ -1990,6 +2128,66 @@ function normalizeQuote(q) {
     verbatim:    q.verbatim !== undefined ? q.verbatim : undefined,
     scope:       q.scope || undefined
   };
+}
+
+// Shared with assembleInput AND the Director-aligned primary_quote
+// pick (pickPrimaryProductQuote). Same origin rules as the closure
+// that used to live inside assembleInput — a per-quote stamp wins,
+// then container source, then store-import, else unknown.
+function stampQuoteOrigins(container, quotes) {
+  const containerSource = container?.source || null;
+  return (quotes || []).map((q) => {
+    let origin = q?.origin || null;
+    if (!origin) {
+      if (containerSource === 'gemini-search') origin = 'llm-web';
+      else if (q?.source === 'store') origin = 'store-import';
+      else origin = 'unknown';
+    }
+    return normalizeQuote({ ...q, origin });
+  });
+}
+
+function printableQuotes(quotes, tierName) {
+  const kept = (quotes || []).filter(Boolean).map(toPrintableCustomerQuote).filter(Boolean);
+  const dropped = (quotes || []).filter(Boolean).length - kept.length;
+  if (dropped) {
+    console.log(`🔒 quote provenance[${tierName}] — ${dropped} quote(s) withheld: origin not printable as a customer testimonial`);
+  }
+  return kept;
+}
+
+// Stamp the tier a quote came from, without overwriting one already set.
+// Module scope (was a closure inside buildQuotePool) so the stage-aware pick
+// below ranks quotes carrying the SAME tier the renderer will read.
+function stampTier(quotes, tierName) {
+  return (quotes || []).filter(Boolean).map((q) => (q.tier ? q : { ...q, tier: tierName }));
+}
+// Tier pool prep, in ONE place, so pickPrimaryProductQuote ranks exactly the
+// pool the renderer prints from. Composition is identical to the nested calls
+// this replaced — stampTier ∘ gateQuotesByRating ∘ printableQuotes ∘
+// stampQuoteOrigins — for product and category.
+//
+// BRAND also routes through here, which stamps tier one step earlier than
+// before; that is neutral and verified, not incidental. selectBrandQuotesForScope
+// is tier-blind, and the only .tier reader (applyStrictQuoteScope) treats
+// unstamped and 'brand' identically, so the later stampTier(…, 'brand') is an
+// idempotent no-op. COMMENT tier does not use this: it skips stampQuoteOrigins.
+function prepareQuotePool(container, quotes, tierName) {
+  return stampTier(
+    gateQuotesByRating(printableQuotes(stampQuoteOrigins(container, quotes), tierName), tierName),
+    tierName
+  );
+}
+
+// Render's product-tier winner: productReviews.quotes → stamp →
+// printable → star gate → pickStrongestQuote. Director alignment
+// (DIRECTOR_QUOTE_POOL_ALIGNED) calls this so both paths rank the
+// same pool. opts is the same shape assembleInput hands the scorer.
+function pickPrimaryProductQuote(productReviews, opts = {}) {
+  if (!productReviews || !Array.isArray(productReviews.quotes) || !productReviews.quotes.length) {
+    return null;
+  }
+  return pickStrongestQuote(prepareQuotePool(productReviews, productReviews.quotes, 'product'), opts);
 }
 
 // Load brand-scoped Instagram/TikTok comments as quote-pool candidates.
@@ -2374,48 +2572,15 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // So: name what a thing IS, and call everything else unknown. An unknown
   // origin is not printable, which is the correct answer for provenance we
   // cannot establish.
-  const stampOrigin = (container, quotes) => {
-    const containerSource = container?.source || null;
-    return (quotes || []).map((q) => {
-      // A per-quote stamp from the capture layer always wins — mapReviewNode and
-      // reviewHeadlessCapture write 'scraped', geminiSearchProvider and
-      // categoryReviewsService write 'llm-web'.
-      let origin = q?.origin || null;
-      if (!origin) {
-        if (containerSource === 'gemini-search') origin = 'llm-web';
-        // The merchant's own storefront. Verified against production: the 190
-        // product docs with a null container source carry per-quote
-        // source:'store' (748 quotes), written by the JSON-LD/Shopify importers
-        // before the shared scrape engine started labelling the container.
-        else if (q?.source === 'store') origin = 'store-import';
-        else origin = 'unknown';
-      }
-      return normalizeQuote({ ...q, origin });
-    });
-  };
-  // The allowlist is applied HERE, at the producer, not only at the renderer.
-  // A consumer-side gate fixes one renderer: the HTML/Puppeteer path and the
-  // video overlays read the same artifact and would have carried on typesetting
-  // whatever it held. Filtering at assembly means primary_quote AND
-  // secondary_quotes are clean for every consumer, present and future.
-  // Map through toPrintableCustomerQuote (not a boolean filter): llm-web
-  // quotes come back with byline fields structurally removed, so every
-  // downstream consumer — primary_quote, secondary_quotes, any renderer —
-  // inherits anonymity without a separate "don't print author" convention.
-  const printableOnly = (quotes, tierName) => {
-    const kept = (quotes || []).filter(Boolean).map(toPrintableCustomerQuote).filter(Boolean);
-    const dropped = (quotes || []).filter(Boolean).length - kept.length;
-    if (dropped) {
-      console.log(`🔒 quote provenance[${tierName}] — ${dropped} quote(s) withheld: origin not printable as a customer testimonial`);
-    }
-    return kept;
-  };
-  const stampTier = (quotes, tierName) =>
-    (quotes || []).filter(Boolean).map((q) => (q.tier ? q : { ...q, tier: tierName }));
+  // stampQuoteOrigins / printableQuotes / stampTier / prepareQuotePool live at
+  // MODULE scope (they were closures here) so the Director-aligned pick
+  // (pickPrimaryProductQuote) ranks the SAME product-tier pool the renderer
+  // prints from. One definition each — two copies of the provenance stamp is
+  // how the pick and the print silently disagree about which quote won.
   const productReviewsForMatch = productReviewsOf(ctx.match);
-  const tierProduct = stampTier(gateQuotesByRating(printableOnly(stampOrigin(productReviewsForMatch, productReviewsForMatch?.quotes), 'product'), 'product'), 'product');
+  const tierProduct = prepareQuotePool(productReviewsForMatch, productReviewsForMatch?.quotes, 'product');
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
-  const tierCategory = stampTier(gateQuotesByRating(printableOnly(stampOrigin(catReviewsForMatch, catReviewsForMatch?.quotes), 'category'), 'category'), 'category');
+  const tierCategory = prepareQuotePool(catReviewsForMatch, catReviewsForMatch?.quotes, 'category');
   // Brand-tier reviews are catalog-wide: they are about whatever the reviewer
   // bought, which on a multi-SKU brand is usually NOT this product. Rendering
   // one under this product's photo presents another item's praise as if it
@@ -2439,8 +2604,8 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   const brandQuotesRaw = (brandReviewsContainer?.quotes || []);
   // Withhold entirely only when this IS a product ad AND the fallback flag is
   // off (the old behavior, kept as the revert path). Otherwise brand quotes
-  // go through the SAME gates as every other tier — stampOrigin →
-  // printableOnly (toPrintableCustomerQuote) → gateQuotesByRating — no second
+  // go through the SAME gates as every other tier — stampQuoteOrigins →
+  // printableQuotes (toPrintableCustomerQuote) → gateQuotesByRating — no second
   // allowlist. Ranking (last-resort on product ads vs. legitimate top-tier
   // proof on brand ads) is enforced below, at pick time, not by hiding the
   // pool here.
@@ -2449,7 +2614,7 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   const withholdBrandOnProductAd = isProductScoped && !QUOTE_BRAND_TIER_FALLBACK;
   const tierBrandUnscoped = withholdBrandOnProductAd
     ? []
-    : gateQuotesByRating(printableOnly(stampOrigin(brandReviewsContainer, brandQuotesRaw), 'brand'), 'brand');
+    : prepareQuotePool(brandReviewsContainer, brandQuotesRaw, 'brand');
   // Noun-scope the brand pool ONLY when this run has no CatalogProduct
   // attached (options.productId). A PMA catalogProductId is not that —
   // media-driven ads often carry a product_match PMA (the Vuori case)
@@ -2470,7 +2635,7 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       `that named a product type missing from the seed labels (${tierBrand.length} remain)`
     );
   }
-  const tierComment  = stampTier(printableOnly(await loadBrandCommentsForQuotePool(ctx), 'comment'), 'comment');
+  const tierComment  = stampTier(printableQuotes(await loadBrandCommentsForQuotePool(ctx), 'comment'), 'comment');
 
   // TIERS 5 AND 6 ARE GONE, and they are not coming back behind a flag.
   //
@@ -2493,14 +2658,15 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
     console.log(`🔒 quote pool — ${llmQuoteCount} LLM-authored quote(s) withheld: notional personas are not customer proof`);
   }
 
-  // Funnel stage and Director angle come from the caller (options), so this is
-  // inert unless something supplies them — every existing caller keeps today's
-  // behaviour exactly. Owner: "the quote selection should be influenced by the
-  // director and the position in the funnel".
-  const quoteOpts = {
-    stage: normalizeStage(options?.funnelStage || options?.stage || null),
-    angleTerms: Array.isArray(options?.conceptAngle) ? options.conceptAngle.slice(0, 8) : null,
-  };
+  // Funnel stage and Director angle come from the caller (options).
+  // QUOTE_STAGE_AWARE (default false) is the gate: flag-off quoteOpts
+  // are empty so STAGE_TERMS stay inert even if a caller threads
+  // funnelStage. Flag-on applies the already-built scorer on a FRESH
+  // assemble. Cached artifacts still share one primary_quote; the
+  // paid printers re-pick via applyStagedQuotePick. Owner: "the quote
+  // selection should be influenced by the director and the position
+  // in the funnel".
+  const quoteOpts = quoteOptsFromOptions(options);
   if (quoteOpts.stage || quoteOpts.angleTerms) {
     console.log(`📐 quote bias[media=${media._id}] stage=${quoteOpts.stage || '-'} ` +
       `angle=${quoteOpts.angleTerms ? quoteOpts.angleTerms.join('|') : '-'}`);
@@ -3853,6 +4019,30 @@ module.exports = {
   // broken once by a merge with nothing to catch it.
   gateQuotesByRating,
   pickStrongestQuote,
+  // Exported so verifyQuoteRotation A8 can pin tier stamping BEHAVIOURALLY.
+  // The old form asserted /const stampTier\s*=/ plus a call count, which
+  // hoisting these out of buildQuotePool broke while behaviour was unchanged —
+  // a name scan cannot tell a refactor from a regression. Same reasoning as
+  // deriveSocialProofNumbers above.
+  stampTier,
+  prepareQuotePool,
+  // Stage-aware quote wiring (QUOTE_STAGE_AWARE) + Director pool
+  // alignment (pickPrimaryProductQuote). Exported so the harness and
+  // aiCreativeDirectorService call the shipped functions, not copies.
+  quoteStageAwareEnabled,
+  quoteOptsFromOptions,
+  computeCampaignContextHash,
+  normalizeStage,
+  conceptAngleTerms,
+  resolveQuoteAssemblyOptions,
+  applyStagedQuotePick,
+  STAGE_HEADROOM,
+  BIAS_CAP,
+  STAGE_WEIGHT,
+  stampQuoteOrigins,
+  printableQuotes,
+  prepareQuotePool,
+  pickPrimaryProductQuote,
   // Exported for scripts/verifyQuoteProvenance.js, which pins the rule that a
   // byline is a real person's name or nothing — this function used to substitute
   // the quote's SOURCE (a website) when no name was known.

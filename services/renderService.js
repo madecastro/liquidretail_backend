@@ -25,7 +25,7 @@ const CatalogProduct        = require('../models/CatalogProduct');
 const CropArtifact          = require('../models/CropArtifact');
 const LayoutInputArtifact   = require('../models/LayoutInputArtifact');
 const registry              = require('./templateRegistry');
-const { buildLayoutInput }  = require('./layoutInputService');
+const { buildLayoutInput, resolveQuoteAssemblyOptions, applyStagedQuotePick }  = require('./layoutInputService');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const { buildVideoCompositeUrl } = require('./videoCompositeService');
 const { adStage } = require('./adStage');
@@ -336,6 +336,12 @@ async function deriveStage(req) {
   // assembly: variantKind='product_image' uses the catalog product
   // directly as the source of product info AND silences UGC-only
   // slots (creator, ugc, engagement).
+  const quoteAssembly = await resolveQuoteAssemblyOptions({
+    funnelStage:         req.funnelStage || null,
+    conceptArtifactId:   req.adConceptArtifactId || req.conceptArtifactId || null,
+    conceptId:           req.adConceptId || req.conceptId || null,
+    conceptAngle:        req.conceptAngle || null
+  });
   const input = await buildLayoutInput({
     mediaId,
     template,
@@ -353,13 +359,26 @@ async function deriveStage(req) {
       // media, this stamps which one this specific render should use
       // as the hero. Threaded into the cache key via campaignContextHash
       // so each prize variant gets its own LayoutInputArtifact.
-      rafflePrizeMediaId: req.rafflePrizeMediaId   || null
+      rafflePrizeMediaId: req.rafflePrizeMediaId   || null,
+      // QUOTE_STAGE_AWARE: Ad.funnelStage + concept angle reach
+      // assembleInput on a cache MISS. Flag-off ignored. The cache
+      // key does NOT partition by stage (see applyStagedQuotePick);
+      // the printed quote is re-picked below from the stored pool
+      // so a cache hit written by another stage cannot leak.
+      funnelStage:        quoteAssembly.funnelStage,
+      conceptAngle:       quoteAssembly.conceptAngle
     }
   });
 
   // Look up the artifact id so the Ad doc can FK back to it without
   // having to re-find it later. The cache key now includes
   // productId + variantKind to partition the cache properly.
+  //
+  // GEN-9 (promo/palette hash omitted here) is a pre-existing
+  // promotional-campaign bug. Stage is NOT in the hash — we deleted
+  // that partition — so this 5-field findOne cannot serve the wrong
+  // STAGE. The printed quote is re-picked from the stored pool
+  // regardless of which artifact this FK lands on.
   const artifact = await LayoutInputArtifact
     .findOne({
       mediaId, template, aspectRatio,
@@ -369,7 +388,11 @@ async function deriveStage(req) {
     .select('_id')
     .lean();
 
-  return { input, layoutInputArtifactId: artifact?._id || null };
+  const staged = applyStagedQuotePick(input, {
+    funnelStage:  quoteAssembly.funnelStage,
+    conceptAngle: quoteAssembly.conceptAngle
+  });
+  return { input: staged, layoutInputArtifactId: artifact?._id || null };
 }
 
 // Spin up Puppeteer, navigate to /ads.html?media=X&template=Y&ratio=Z
@@ -1496,4 +1519,4 @@ function buildPosterFromComposite(compositeUrl) {
     .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2');
 }
 
-module.exports = { renderCreative, composeVideoOutput };
+module.exports = { renderCreative, composeVideoOutput, deriveStage };
