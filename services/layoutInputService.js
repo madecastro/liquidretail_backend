@@ -181,7 +181,8 @@ const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 // One definition of printable provenance, shared with every renderer.
 const {
   toPrintableCustomerQuote,
-  ANONYMOUS_PRINT_ORIGINS
+  ANONYMOUS_PRINT_ORIGINS,
+  selectBrandQuotesForScope
 } = require('./quoteProvenance');
 
 const INPUT_SCHEMA_VERSION = '4.1';   // 4.1: quote provenance (origin + tier) stamped on primary_quote; LLM tiers removed
@@ -2432,14 +2433,31 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // allowlist. Ranking (last-resort on product ads vs. legitimate top-tier
   // proof on brand ads) is enforced below, at pick time, not by hiding the
   // pool here.
+  // STRICT is media-driven only (owner 2026-08-12). Product-attached ads
+  // keep QUOTE_BRAND_TIER_FALLBACK last-resort — do not empty the pool.
   const withholdBrandOnProductAd = isProductScoped && !QUOTE_BRAND_TIER_FALLBACK;
-  const tierBrand = withholdBrandOnProductAd
+  const tierBrandUnscoped = withholdBrandOnProductAd
     ? []
     : gateQuotesByRating(printableOnly(stampOrigin(brandReviewsContainer, brandQuotesRaw), 'brand'), 'brand');
+  // Noun-scope the brand pool ONLY when this run has no CatalogProduct
+  // attached (options.productId). A PMA catalogProductId is not that —
+  // media-driven ads often carry a product_match PMA (the Vuori case)
+  // and must still be noun-checked. Flag-off is an identity.
+  const tierBrand = selectBrandQuotesForScope(tierBrandUnscoped, {
+    productAttached: !!(options && options.productId),
+    productTitle: details.title || ident.productName || null,
+    media,
+    match: ctx.match
+  });
   if (withholdBrandOnProductAd && brandQuotesRaw.length) {
     console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk; QUOTE_BRAND_TIER_FALLBACK=false)`);
   } else if (isProductScoped && brandQuotesRaw.length) {
     console.log(`🔓 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) demoted to last-resort on a product ad (cross-product risk; wins only if product/category/comment tiers are empty)`);
+  } else if (!isProductScoped && tierBrandUnscoped.length !== tierBrand.length) {
+    console.log(
+      `🔒 quote provenance[strict] — withheld ${tierBrandUnscoped.length - tierBrand.length} brand-tier quote(s) ` +
+      `that named a product type missing from the seed labels (${tierBrand.length} remain)`
+    );
   }
   const tierComment  = printableOnly(await loadBrandCommentsForQuotePool(ctx), 'comment');
 

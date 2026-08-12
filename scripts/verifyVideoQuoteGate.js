@@ -249,8 +249,14 @@ for (const raw of NO_THROW) {
 const bseSrc = fs.readFileSync(
   path.join(__dirname, '../services/brandScriptExecutor.js'), 'utf8'
 );
+// Accept the optional scope arg (STRICT seed labels) but still require
+// the live assignment: layoutInput = gateLayoutInputQuotes(layoutInput…).
+// A one-arg call and a two-arg call both pass; a missing assignment or
+// a call that does not reseat layoutInput still fails.
 check('F buildMetaForAd calls gateLayoutInputQuotes',
-  /layoutInput\s*=\s*gateLayoutInputQuotes\s*\(\s*layoutInput\s*\)/.test(bseSrc));
+  /layoutInput\s*=\s*gateLayoutInputQuotes\s*\(\s*layoutInput\b/.test(bseSrc));
+check('F buildMetaForAd passes seed media into the quote gate',
+  /gateLayoutInputQuotes\s*\(\s*layoutInput[\s\S]{0,400}?\bmedia\s*:/.test(bseSrc));
 check('F gate uses toPrintableCustomerQuote from quoteProvenance (one allowlist + strip)',
   /require\(['"]\.\/quoteProvenance['"]\)/.test(bseSrc) &&
   /toPrintableCustomerQuote/.test(bseSrc));

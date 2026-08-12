@@ -36,7 +36,7 @@ const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // Defence in depth. layoutInputService already withholds these at pool
 // assembly, so this gate should never fire — it exists because an artifact
 // cached before the producer-side filter landed can still carry one.
-const { toPrintableCustomerQuote } = require('./quoteProvenance');
+const { toPrintableCustomerQuote, applyStrictQuoteScope } = require('./quoteProvenance');
 const { formatDisplayRating, resolveCoherentSocialProof, brandAttributionLabel } = require('./ratingDisplay');
 // THE sanctioned concept reader. Direct reads of concept.rationale on this
 // path are how private Director reasoning became art direction on 2026-08-01.
@@ -842,7 +842,7 @@ function selectRotatedQuote(proof, campaignRunId) {
   return picked;
 }
 
-function buildIntentData({ concept, layoutInput, brand, product = null, cta, campaignRunId = null }) {
+function buildIntentData({ concept, layoutInput, brand, product = null, cta, campaignRunId = null, media = null }) {
   // Dual-read v3 copy / v2 copy_picks. Never invent a headline from product name.
   const copy = renderableCopy(concept);
   const proof = layoutInput?.social_proof || {};
@@ -854,12 +854,48 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
   // Rotate BEFORE the provenance gate so the gate still has the final word on whatever
   // rotation chose — a rotated quote is not exempt from anything the primary faced.
   const rotated = selectRotatedQuote(proof, campaignRunId);
-  const quote = toPrintableCustomerQuote(rotated);
+  let quote = toPrintableCustomerQuote(rotated);
   if (rotated && !quote) {
     console.log(
       `🔒 direct-image: quote withheld (tier=${rotated.tier || 'unstamped'} ` +
       `origin=${rotated.origin || 'unstamped'}) — rendering this ad with no testimonial`
     );
+  }
+  // QUOTE_PROVENANCE_STRICT — selection only, flag-off is identity.
+  // Cached artifacts can still carry a brand-pool jacket quote over a
+  // pants seed; drop it here and try the next same-tier printable.
+  const strictScope = {
+    productAttached: !!(product && (product._id || product.title)),
+    productTitle: product?.title || layoutInput?.product?.name || null,
+    media,
+    extraText: layoutInput?.product?.name || null
+  };
+  if (quote) {
+    const scoped = applyStrictQuoteScope(quote, strictScope);
+    if (!scoped) {
+      const tier = quote.tier || null;
+      const rest = [rotated, ...(Array.isArray(proof.secondary_quotes) ? proof.secondary_quotes : [])]
+        .filter((q) => q && q !== rotated && String(q.text || '').trim())
+        .filter((q) => (q.tier || null) === tier);
+      let rescued = null;
+      for (const cand of rest) {
+        const printable = toPrintableCustomerQuote(cand);
+        const next = applyStrictQuoteScope(printable, strictScope);
+        if (next) { rescued = next; break; }
+      }
+      if (rescued) {
+        console.log(
+          `🔒 direct-image: brand-pool quote failed product-scope — using next allowed candidate`
+        );
+        quote = rescued;
+      } else {
+        console.log(
+          `🔒 direct-image: quote withheld (QUOTE_PROVENANCE_STRICT ` +
+          `tier=${tier || 'unstamped'}) — rendering this ad with no testimonial`
+        );
+        quote = null;
+      }
+    }
   }
 
   // QUOTE LENGTH IS PER-SURFACE (owner, 2026-08-10).
@@ -1413,7 +1449,7 @@ async function renderDirectImage(callArgs = {}) {
     // lifestyle scene-preserve branch (STATIC_LIFESTYLE_PRESERVE).
     // width + height feed seedAspectFromDims → resolveAspectTreatment's
     // 'native' arm (without them every preserve submit falls to 'extend').
-    mediaId ? Media.findById(mediaId).select('fileUrl classification technicalInsights width height').lean() : null
+    mediaId ? Media.findById(mediaId).select('fileUrl classification technicalInsights width height subjects refinedProducts primarySubjectLabel primarySubjectDesc').lean() : null
   ]);
   // A missing layout artifact is recoverable: everything it supplies has a
   // source of its own. brand/product come from the explicit args, and themeFor
@@ -1558,7 +1594,8 @@ async function renderDirectImage(callArgs = {}) {
     product: resolvedProduct,
     cta: effectiveLayout.input?.cta?.text,
     // Same quote on every size of this run, a different one next run.
-    campaignRunId
+    campaignRunId,
+    media
   });
   // Lifestyle/UGC scene preserve — intent still owns copy; only the scene
   // fidelity opening swaps when the flag is on (staticAdIntents).

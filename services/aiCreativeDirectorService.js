@@ -32,7 +32,12 @@ const { conceptField, conceptMediaPicks } = require('./conceptProjection');
 
 const { chatCompletion } = require('./atlasLlmService');
 const { usableProofCommentsOrNone } = require('./quoteSnippetService');
-const { toPrintableCustomerQuote } = require('./quoteProvenance');
+const {
+  toPrintableCustomerQuote,
+  selectBrandQuotesForScope,
+  quoteProvenanceStrictEnabled,
+  loadQuoteScopeMediaByIds
+} = require('./quoteProvenance');
 const { formatBrandReviewsText, formatProductReviewsText } = require('./ratingDisplay');
 
 // Master switch for the proof MENU (category tier + social_proof_signal.
@@ -468,7 +473,7 @@ async function directConcepts({
 // the input_summary block. Deterministic (no LLM) — just bucket counts
 // into high/medium/low strength labels.
 
-async function assembleSignals({ brandId, productId, campaignKind }) {
+async function assembleSignals({ brandId, productId, campaignKind, seededUniverse } = {}) {
   const [brand, product] = await Promise.all([
     Brand.findById(brandId).lean(),
     productId ? CatalogProduct.findById(productId).lean() : null
@@ -704,7 +709,36 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   const isProductScoped = !!product;
   const ratingValue    = productRatingValue ?? (isProductScoped ? null : brandRatingValue);
   const ratingCount    = productRatingCount ?? (isProductScoped ? null : brandRatingCount);
-  const primaryQuoteObj = productReviewQuotes[0] || (isProductScoped ? null : brandReviewQuotes[0]) || null;
+  // QUOTE_PROVENANCE_STRICT is media-driven only. Product-attached keeps
+  // the brand pool (identity) so last-resort / proof_options brand
+  // quotes stay. Media-driven noun-checks against THIS seed — not the
+  // brand PMA union of 10, which would let a jacket anywhere in those
+  // rows unblock every jacket quote. Flag-off is an identity.
+  let quoteScopeMedia = [];
+  if (!isProductScoped && quoteProvenanceStrictEnabled()) {
+    const seedIds = (Array.isArray(seededUniverse) ? seededUniverse : [])
+      .map((e) => e && (e.mediaId || e._id))
+      .filter(Boolean);
+    if (seedIds.length) {
+      try {
+        quoteScopeMedia = await loadQuoteScopeMediaByIds(seedIds);
+      } catch { quoteScopeMedia = []; }
+    }
+  }
+  const brandQuoteScope = {
+    productAttached: isProductScoped,
+    productTitle: product?.title || null,
+    media: quoteScopeMedia
+  };
+  // Apply the same scoped filter to every quotes array the Director
+  // prompt can echo into copy.headline (primary_quote + proof_options
+  // tiers). Do NOT touch brand_reviews_summary / review_summary prose.
+  const scopedBrandQuotes = selectBrandQuotesForScope(brandReviewQuotes, brandQuoteScope);
+  const scopedCategoryQuotes = selectBrandQuotesForScope(categoryReviewQuotes, brandQuoteScope);
+  const scopedProductQuotes = selectBrandQuotesForScope(productReviewQuotes, brandQuoteScope);
+  const primaryQuoteObj = scopedProductQuotes[0]
+    || (isProductScoped ? null : scopedBrandQuotes[0])
+    || null;
   if (isProductScoped && !productReviewQuotes.length && brandReviewQuotes.length) {
     console.log(`🔒 director scope — ${brandReviewQuotes.length} brand review(s) withheld from a product concept (cross-product copy risk)`);
   }
@@ -753,7 +787,7 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     // the brand quotes are withheld, so including them here would advertise a
     // richness that is not in the payload and push the model toward a
     // proof-led archetype it cannot ground.
-    proof_density:    productReviewQuotes.length + (isProductScoped ? 0 : brandReviewQuotes.length) + topComments.length
+    proof_density:    scopedProductQuotes.length + (isProductScoped ? 0 : scopedBrandQuotes.length) + topComments.length
   };
 
   // ── PROOF MENU — behind DIRECTOR_PROOF_MENU_ENABLED, additive only. ──
@@ -798,9 +832,10 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
   // Director's free-text copy, for consistency and audit.
   if (directorProofMenuEnabled()) {
     socialProofSignal.proof_options = buildDirectorProofOptions({
-      product:  { rating: productRatingValue,  reviewCount: productRatingCount,  quotes: productReviewQuotes },
-      category: { rating: categoryRatingValue, reviewCount: categoryRatingCount, quotes: categoryReviewQuotes },
-      brand:    { rating: brandRatingValue,     reviewCount: brandRatingCount,    quotes: brandReviewQuotes }
+      product:  { rating: productRatingValue,  reviewCount: productRatingCount,  quotes: scopedProductQuotes },
+      category: { rating: categoryRatingValue, reviewCount: categoryRatingCount, quotes: scopedCategoryQuotes },
+      // Flag-off: scoped*Quotes are the same arrays as the unscoped pools.
+      brand:    { rating: brandRatingValue,     reviewCount: brandRatingCount,    quotes: scopedBrandQuotes }
     });
   }
 
@@ -2009,7 +2044,9 @@ async function directConceptsRound({
   // Build the V1-style signal package — Director still benefits from
   // the brand/product/proof/performance context regardless of whether
   // it's emitting strategy-only (V1) or full concept rows (V2).
-  const signals = await assembleSignals({ brandId, productId, campaignKind });
+  // seededUniverse is THIS run's seed — quote-scope must use it, not
+  // the brand PMA union of 10.
+  const signals = await assembleSignals({ brandId, productId, campaignKind, seededUniverse });
   const inputSummary = { ...signals, platform_format: platformFormat };
 
   // Phase 2 — load derived brand voice + campaign brief if present.

@@ -30,6 +30,10 @@
  *   P6  Grounded llm-web is printable TEXT ONLY — attribution stripped
  *       structurally by toPrintableCustomerQuote, not by caller convention.
  *       Revert-prove: blank the strip and author fields reappear in intent.
+ *   P8  QUOTE_PROVENANCE_STRICT (default off). A brand-pool quote that
+ *       names a product type the seed does not show must not print.
+ *       Canonical failing input: Vuori bomber-jacket review over a
+ *       track-pants + sneakers scene. Flag-off is byte-identical.
  *
  * Run: node scripts/verifyQuoteProvenance.js
  */
@@ -38,7 +42,8 @@ const intents = require('../services/staticAdIntents');
 const layout = require('../services/layoutInputService');
 const provenance = require('../services/quoteProvenance');
 const {
-  gateLayoutInputQuotes
+  gateLayoutInputQuotes,
+  buildMetaForAd
 } = require('../services/brandScriptExecutor');
 const {
   resolveMeta, mergeCascades, buildContext, DEFAULT_META_CASCADES
@@ -578,7 +583,7 @@ const GROUNDED = {
   // (`proof.primary_quote`), which broke the moment the argument legitimately became the
   // rotation's choice. Pin the assignment, which is the thing that actually matters.
   check('P6-revert surface: directImage uses toPrintable return value',
-    /const\s+quote\s*=\s*toPrintableCustomerQuote\s*\(/.test(
+    /(?:const|let)\s+quote\s*=\s*toPrintableCustomerQuote\s*\(/.test(
       fs.readFileSync(path.join(__dirname, '../services/directImageRenderService.js'), 'utf8')
     ));
   check('P6-revert surface: layout pool maps toPrintable (not boolean filter alone)',
@@ -737,9 +742,649 @@ const GROUNDED = {
     /function brandQuoteForDirectorSignal[\s\S]*?toPrintableCustomerQuote/.test(dirSrc));
 }
 
-if (failures.length) {
-  console.error(`\n❌ quote provenance: ${failures.length} FAILED, ${pass} passed\n`);
-  failures.forEach((f) => console.error(`   • ${f}`));
-  process.exit(1);
+// ── P8: QUOTE_PROVENANCE_STRICT — no wrong-product review quotes ─────
+// Live defect 2026-08-12: a Vuori media-driven ad (no CatalogProduct)
+// composited a bomber-jacket review over track-pants + sneakers, and
+// video titling quoted a fragment of the SAME review. Mechanism: brand-
+// pool fallback with no product-type noun check.
+//
+// Selection only — quote TEXT is never edited. Flag default false;
+// every check above ran with the flag unset and must stay green.
+const {
+  PRODUCT_NOUNS,
+  QUOTE_SCOPE_MEDIA_SELECT,
+  quoteProvenanceStrictEnabled,
+  productNounsIn,
+  collectScopeLabelText,
+  quoteAllowedForScope,
+  isBrandQuoteAllowedForSeed,
+  selectBrandQuotesForScope,
+  pickScopedBrandQuote,
+  applyStrictQuoteScope
+} = provenance;
+
+const BOMBER_JACKET_QUOTE =
+  "The fabric is so soft. I love that it's a bomber-style jacket and cinched at the waist but not tight...";
+const GENERIC_QUOTE = 'The fabric is so soft and I wear it every day.';
+const PANTS_SNEAKER_MEDIA = {
+  subjects: [
+    { label: 'track pants' },
+    { description: 'sneakers' }
+  ],
+  refinedProducts: [{ label: 'pants' }],
+  primarySubjectLabel: 'Track pants',
+  classification: {
+    detectSummary: {
+      matchedProducts: [{ name: 'Performance jogger' }]
+    }
+  }
+};
+const JACKET_MEDIA = {
+  subjects: [{ label: 'bomber jacket' }],
+  refinedProducts: [{ label: 'jacket' }],
+  primarySubjectLabel: 'Jacket'
+};
+const BOMBER_Q = {
+  text: BOMBER_JACKET_QUOTE, origin: 'llm-web', verbatim: false, tier: 'brand'
+};
+const GENERIC_Q = {
+  text: GENERIC_QUOTE, origin: 'scraped', verbatim: true, tier: 'brand'
+};
+
+function withStrictFlag(on, fn) {
+  const prev = process.env.QUOTE_PROVENANCE_STRICT;
+  if (on) process.env.QUOTE_PROVENANCE_STRICT = 'true';
+  else delete process.env.QUOTE_PROVENANCE_STRICT;
+  const restore = () => {
+    if (prev === undefined) delete process.env.QUOTE_PROVENANCE_STRICT;
+    else process.env.QUOTE_PROVENANCE_STRICT = prev;
+  };
+  try {
+    const out = fn();
+    if (out && typeof out.then === 'function') return Promise.resolve(out).finally(restore);
+    restore();
+    return out;
+  } catch (e) {
+    restore();
+    throw e;
+  }
 }
-console.log(`✅ quote provenance: ${pass} checks passed`);
+
+// Listed nouns — the conservative set the owner named, plus the
+// garments the first matcher omitted (crewneck / pullover / sweatshirt
+// / flip-flop / top). 'short' is deliberately NOT listed (adjective).
+for (const noun of [
+  'jacket', 'hoodie', 'dress', 'pants', 'jogger', 'shirt', 'tee',
+  'shoe', 'sneaker', 'sandal', 'shorts', 'legging', 'bra',
+  'hat', 'scarf', 'bag', 'sock', 'sweater', 'coat', 'vest', 'skirt',
+  'swimsuit', 'bikini', 'crewneck', 'pullover', 'sweatshirt',
+  'flip-flop', 'top'
+]) {
+  check(`P8 PRODUCT_NOUNS includes ${noun}`, PRODUCT_NOUNS.includes(noun));
+}
+check('P8 PRODUCT_NOUNS does not list adjective short', !PRODUCT_NOUNS.includes('short'));
+check('P8 PRODUCT_NOUNS is frozen', Object.isFrozen(PRODUCT_NOUNS));
+
+// Flag default is off, and reading the env helper agrees.
+check('P8 flag defaults off', quoteProvenanceStrictEnabled() === false);
+check('P8 flag-off: the string "false" is off',
+  withStrictFlag(false, () => {
+    process.env.QUOTE_PROVENANCE_STRICT = 'false';
+    return quoteProvenanceStrictEnabled() === false;
+  }));
+check('P8 flag-on: the string "true" is on',
+  withStrictFlag(true, () => quoteProvenanceStrictEnabled() === true));
+
+// Canonical bomber-jacket case.
+check('P8 bomber quote names jacket',
+  productNounsIn(BOMBER_JACKET_QUOTE).includes('jacket'));
+check('P8 pants/sneaker labels do not name jacket',
+  !productNounsIn(collectScopeLabelText({ media: PANTS_SNEAKER_MEDIA })).includes('jacket'));
+check('P8 pants/sneaker labels name pants and sneaker',
+  productNounsIn(collectScopeLabelText({ media: PANTS_SNEAKER_MEDIA })).includes('pants')
+  && productNounsIn(collectScopeLabelText({ media: PANTS_SNEAKER_MEDIA })).includes('sneaker'));
+
+check('P8 bomber + pants/sneaker labels → rejected',
+  quoteAllowedForScope(BOMBER_JACKET_QUOTE, collectScopeLabelText({ media: PANTS_SNEAKER_MEDIA })) === false);
+check('P8 bomber + jacket product title → accepted',
+  quoteAllowedForScope(BOMBER_JACKET_QUOTE, collectScopeLabelText({
+    productTitle: 'Vuori Ripstop Bomber Jacket'
+  })) === true);
+check('P8 bomber + jacket subject label → accepted',
+  isBrandQuoteAllowedForSeed(BOMBER_Q, { media: JACKET_MEDIA }) === true);
+check('P8 bomber + productMatch title "Bomber Jacket" → accepted',
+  isBrandQuoteAllowedForSeed(BOMBER_Q, {
+    match: { identification: { productName: 'Ripstop Bomber Jacket' } }
+  }) === true);
+check('P8 jackets plural in a jacket title still matches',
+  quoteAllowedForScope('I love these jackets', 'Sunday Performance Jackets') === true);
+check('P8 generic quote names no product noun',
+  productNounsIn(GENERIC_QUOTE).length === 0);
+check('P8 generic quote passes with no product / no labels',
+  isBrandQuoteAllowedForSeed(GENERIC_Q, {}) === true);
+check('P8 generic quote passes against pants/sneaker labels',
+  isBrandQuoteAllowedForSeed(GENERIC_Q, { media: PANTS_SNEAKER_MEDIA }) === true);
+
+// Matcher holes the first pass shipped: adjective "short", tee/shirt,
+// shoe/sneaker, and omitted garment types (crewneck / sweatshirt / top).
+check('P8 adjective "short delivery" is not a product noun',
+  productNounsIn('short delivery time').length === 0);
+check('P8 "in short, I love it" is not a product noun',
+  productNounsIn('in short, I love it').length === 0);
+check('P8 "came up short" is not a product noun',
+  productNounsIn('came up short').length === 0);
+check('P8 "these shorts dry fast" names shorts',
+  productNounsIn('these shorts dry fast').includes('shorts'));
+check('P8 Kore Short title unlocks a shorts quote (label-side short)',
+  quoteAllowedForScope('these shorts dry fast', collectScopeLabelText({
+    productTitle: 'Kore Short'
+  })) === true);
+check('P8 tee and t-shirt canonicalize to the same type',
+  productNounsIn('love this tee')[0] === productNounsIn('this t-shirt is great')[0]
+  && productNounsIn('love this tee')[0] === productNounsIn('tshirt is great')[0]);
+check('P8 Everyday Tee title accepts a t-shirt quote',
+  quoteAllowedForScope('this t-shirt is great', collectScopeLabelText({
+    productTitle: 'Everyday Tee'
+  })) === true);
+check('P8 Classic T-Shirt title accepts a tee quote',
+  quoteAllowedForScope('love this tee', collectScopeLabelText({
+    productTitle: 'Classic T-Shirt'
+  })) === true);
+check('P8 shoes quote is allowed over sneakers labels',
+  quoteAllowedForScope('love these shoes', collectScopeLabelText({
+    media: PANTS_SNEAKER_MEDIA
+  })) === true);
+check('P8 crewneck quote is rejected over pants/sneaker seed',
+  quoteAllowedForScope('crewneck is perfect', collectScopeLabelText({
+    media: PANTS_SNEAKER_MEDIA
+  })) === false);
+check('P8 sweatshirt quote is rejected over pants/sneaker seed',
+  quoteAllowedForScope('pullover fleece sweatshirt', collectScopeLabelText({
+    media: PANTS_SNEAKER_MEDIA
+  })) === false);
+check('P8 "love this top" is rejected over pants/sneaker seed',
+  quoteAllowedForScope('love this top', collectScopeLabelText({
+    media: PANTS_SNEAKER_MEDIA
+  })) === false);
+check('P8 "top quality" is GENERIC (adjective top is not a product type)',
+  productNounsIn('top quality fabric').length === 0);
+check('P8 flip-flops quote is rejected over pants/sneaker seed',
+  quoteAllowedForScope('flip-flops last forever', collectScopeLabelText({
+    media: PANTS_SNEAKER_MEDIA
+  })) === false);
+
+// Selection: flag-off is an identity (same array reference).
+{
+  const pool = [BOMBER_Q, GENERIC_Q];
+  const out = withStrictFlag(false, () => selectBrandQuotesForScope(pool, {
+    productAttached: false, media: PANTS_SNEAKER_MEDIA
+  }));
+  check('P8 flag-off selectBrandQuotesForScope returns the same array', out === pool);
+  check('P8 flag-off keeps the bomber quote (identity)', out[0] === BOMBER_Q);
+}
+
+// Flag-on selection rules.
+withStrictFlag(true, () => {
+  const pantsPool = [BOMBER_Q, GENERIC_Q];
+  const kept = selectBrandQuotesForScope(pantsPool, {
+    productAttached: false, media: PANTS_SNEAKER_MEDIA
+  });
+  check('P8 flag-on bomber+pants: bomber dropped, generic kept',
+    kept.length === 1 && kept[0] === GENERIC_Q && kept[0].text === GENERIC_QUOTE);
+  check('P8 never edits quote TEXT (same object, same string)',
+    kept[0] === GENERIC_Q && kept[0].text === GENERIC_QUOTE);
+
+  const jacketKept = selectBrandQuotesForScope(pantsPool, {
+    productAttached: false, media: JACKET_MEDIA
+  });
+  check('P8 flag-on bomber+jacket media: bomber kept',
+    jacketKept.length === 2 && jacketKept[0] === BOMBER_Q);
+
+  const titleKept = selectBrandQuotesForScope([BOMBER_Q], {
+    productAttached: false, productTitle: 'Vuori Ripstop Bomber Jacket'
+  });
+  check('P8 flag-on bomber+jacket title: bomber kept',
+    titleKept.length === 1 && titleKept[0] === BOMBER_Q);
+
+  const none = selectBrandQuotesForScope([BOMBER_Q], {
+    productAttached: false, media: PANTS_SNEAKER_MEDIA
+  });
+  check('P8 flag-on bomber-only + pants labels: pool empty (DROP)',
+    none.length === 0);
+
+  const picked = pickScopedBrandQuote([BOMBER_Q, GENERIC_Q], {
+    productAttached: false, media: PANTS_SNEAKER_MEDIA
+  });
+  check('P8 pick next candidate: generic wins after bomber is rejected',
+    picked === GENERIC_Q);
+
+  const dropped = pickScopedBrandQuote([BOMBER_Q], {
+    productAttached: false, media: PANTS_SNEAKER_MEDIA
+  });
+  check('P8 pick next candidate: none pass → null', dropped === null);
+
+  // Owner 2026-08-12: product-attached keeps last-resort brand pool.
+  // Noun-scope does not run. Identity — same array, same objects.
+  const attachedPool = [BOMBER_Q, GENERIC_Q];
+  const attached = selectBrandQuotesForScope(attachedPool, {
+    productAttached: true, productTitle: 'Vuori Ripstop Bomber Jacket'
+  });
+  check('P8 product-attached keeps the brand pool (last-resort, no noun-scope)',
+    attached === attachedPool && attached.length === 2 && attached[0] === BOMBER_Q);
+  check('P8 product-attached pick is the first brand-pool quote',
+    pickScopedBrandQuote([GENERIC_Q], { productAttached: true }) === GENERIC_Q);
+});
+
+// Render-time defence: buildIntentData + gateLayoutInputQuotes.
+withStrictFlag(true, () => {
+  // MEDIA-ONLY fixtures — do not encode the noun in product.name. The
+  // live static caller often has no CatalogProduct on a media-driven ad;
+  // the seed labels are the entire rule.
+  const dReject = direct.buildIntentData({
+    concept: { copy_picks: { headline: 'Move freely' } },
+    layoutInput: {
+      social_proof: { primary_quote: BOMBER_Q }
+    },
+    brand: {}, cta: 'SHOP NOW',
+    media: PANTS_SNEAKER_MEDIA
+  });
+  check('P8 static intent DROPS bomber quote over pants/sneaker seed (media only)',
+    dReject.quote === undefined, `got ${JSON.stringify(dReject.quote)}`);
+
+  const dAccept = direct.buildIntentData({
+    concept: { copy_picks: { headline: 'Move freely' } },
+    layoutInput: {
+      social_proof: { primary_quote: BOMBER_Q }
+    },
+    brand: {}, cta: 'SHOP NOW',
+    media: JACKET_MEDIA
+  });
+  check('P8 static intent KEEPS bomber quote over a jacket seed (media only)',
+    !!dAccept.quote && BOMBER_JACKET_QUOTE.includes(String(dAccept.quote).replace(/[….]+\s*$/, '')),
+    `got ${JSON.stringify(dAccept.quote)}`);
+
+  const dGeneric = direct.buildIntentData({
+    concept: { copy_picks: { headline: 'Move freely' } },
+    layoutInput: { social_proof: { primary_quote: GENERIC_Q } },
+    brand: {}, cta: 'SHOP NOW'
+  });
+  check('P8 static intent KEEPS a generic quote with no product',
+    dGeneric.quote === GENERIC_QUOTE, `got ${JSON.stringify(dGeneric.quote)}`);
+
+  const dAttached = direct.buildIntentData({
+    concept: { copy_picks: { headline: 'Move freely' } },
+    layoutInput: { social_proof: { primary_quote: { ...GENERIC_Q, tier: 'brand' } } },
+    brand: {},
+    product: { _id: 'sku1', title: 'Kore Short' },
+    cta: 'SHOP NOW'
+  });
+  check('P8 static intent KEEPS a brand-tier quote when a product is attached (last-resort)',
+    dAttached.quote === GENERIC_QUOTE, `got ${JSON.stringify(dAttached.quote)}`);
+
+  // Next-candidate rescue: bomber primary, generic secondary. Media only.
+  const dRescue = direct.buildIntentData({
+    concept: { copy_picks: { headline: 'Move freely' } },
+    layoutInput: {
+      social_proof: { primary_quote: BOMBER_Q, secondary_quotes: [GENERIC_Q] }
+    },
+    brand: {}, cta: 'SHOP NOW',
+    media: PANTS_SNEAKER_MEDIA
+  });
+  check('P8 static intent rescues the next allowed brand-pool quote',
+    dRescue.quote === GENERIC_QUOTE, `got ${JSON.stringify(dRescue.quote)}`);
+
+  // Absence handling: dropped quote degrades like a missing one.
+  const built = intents.buildPrompt({
+    intentKey: 'social_proof_led',
+    data: dReject,
+    product: {},
+    surface: 'meta_feed_1_1'
+  });
+  const prompt = (built && built.prompt) || '';
+  check('P8 absence: social_proof_led prompt states no customer quote when quote is null',
+    /no customer quote/i.test(prompt),
+    `prompt excerpt: ${JSON.stringify(prompt.slice(0, 240))}`);
+
+  const gated = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: BOMBER_Q } }
+  }, { productAttached: false, media: PANTS_SNEAKER_MEDIA });
+  check('P8 video gate nulls bomber primary_quote over pants/sneaker seed (media only)',
+    gated?.input?.social_proof?.primary_quote === null);
+
+  const gatedOk = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: BOMBER_Q } }
+  }, { productAttached: false, media: JACKET_MEDIA });
+  check('P8 video gate keeps bomber quote over a jacket seed (media only)',
+    !!gatedOk?.input?.social_proof?.primary_quote
+    && gatedOk.input.social_proof.primary_quote.text === BOMBER_JACKET_QUOTE);
+
+  const gatedGeneric = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: GENERIC_Q } }
+  }, { productAttached: false });
+  check('P8 video gate keeps a generic quote with no product',
+    gatedGeneric?.input?.social_proof?.primary_quote?.text === GENERIC_QUOTE);
+
+  const gatedAttached = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: { ...GENERIC_Q, tier: 'brand' } } }
+  }, { productAttached: true, productTitle: 'Kore Short' });
+  check('P8 video gate KEEPS a brand-tier quote when a product is attached (last-resort)',
+    gatedAttached?.input?.social_proof?.primary_quote?.text === GENERIC_QUOTE);
+
+  const gatedRescue = gateLayoutInputQuotes({
+    input: {
+      social_proof: { primary_quote: BOMBER_Q, secondary_quotes: [GENERIC_Q] }
+    }
+  }, { productAttached: false, media: PANTS_SNEAKER_MEDIA });
+  check('P8 video gate rescues the next allowed brand-pool quote',
+    gatedRescue?.input?.social_proof?.primary_quote?.text === GENERIC_QUOTE);
+});
+
+// Flag-off byte-identity of the EXISTING fixtures (re-run P1 legitimate
+// quote + P6 scraped path with the flag explicitly off AND on — generic
+// REAL_TEXT names no product noun, so both arms must agree).
+{
+  const prev = process.env.QUOTE_PROVENANCE_STRICT;
+  delete process.env.QUOTE_PROVENANCE_STRICT;
+  const off = intentFor({ text: REAL_TEXT, origin: 'scraped', verbatim: true, author_name: 'Jessica L.' });
+  process.env.QUOTE_PROVENANCE_STRICT = 'true';
+  const on = intentFor({ text: REAL_TEXT, origin: 'scraped', verbatim: true, author_name: 'Jessica L.' });
+  check('P8 flag-on does not change a generic existing P1 quote',
+    off.quote === REAL_TEXT && on.quote === REAL_TEXT && off.attribution === on.attribution);
+  if (prev === undefined) delete process.env.QUOTE_PROVENANCE_STRICT;
+  else process.env.QUOTE_PROVENANCE_STRICT = prev;
+}
+
+// ── P8-revert-prove ─────────────────────────────────────────────────
+// Each rule is pinned two ways: a behavioural check above that fails if
+// the shipped function is loosened, and a source pin so a caller can
+// not silently stop asking.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const provSrc = fs.readFileSync(
+    path.join(__dirname, '../services/quoteProvenance.js'), 'utf8'
+  );
+  const layoutSrc = fs.readFileSync(
+    path.join(__dirname, '../services/layoutInputService.js'), 'utf8'
+  );
+  const dirSrc = fs.readFileSync(
+    path.join(__dirname, '../services/aiCreativeDirectorService.js'), 'utf8'
+  );
+  const directSrc = fs.readFileSync(
+    path.join(__dirname, '../services/directImageRenderService.js'), 'utf8'
+  );
+  const bseSrc = fs.readFileSync(
+    path.join(__dirname, '../services/brandScriptExecutor.js'), 'utf8'
+  );
+
+  check('P8-revert: selectBrandQuotesForScope is identity when productAttached',
+    /if\s*\(\s*opts\.productAttached\s*\)\s*return\s*list/.test(provSrc));
+  check('P8-revert: selectBrandQuotesForScope is gated on quoteProvenanceStrictEnabled',
+    /function selectBrandQuotesForScope[\s\S]*?quoteProvenanceStrictEnabled/.test(provSrc));
+  check('P8-revert: applyStrictQuoteScope is identity when productAttached',
+    /if\s*\(\s*opts\.productAttached\s*\)\s*return\s*quote/.test(provSrc));
+  check('P8-revert: adjective short is not generated from shorts',
+    /do not add 'short'/.test(provSrc) && !/n === 'pants' \|\| n === 'shorts'/.test(provSrc));
+  check('P8-revert: layoutInputService calls selectBrandQuotesForScope',
+    /selectBrandQuotesForScope\s*\(/.test(layoutSrc));
+  check('P8-revert: layout productAttached is options.productId (not PMA catalogProductId)',
+    /productAttached:\s*!!(?:options\.productId|\(options\s*&&\s*options\.productId\))/.test(layoutSrc));
+  check('P8-revert: layout STRICT no longer empties the brand pool on product ads',
+    !/QUOTE_BRAND_TIER_FALLBACK \|\| quoteProvenanceStrictEnabled/.test(layoutSrc));
+  check('P8-revert: assembleSignals calls selectBrandQuotesForScope',
+    /selectBrandQuotesForScope\s*\(/.test(dirSrc));
+  check('P8-revert: assembleSignals feeds scopedBrandQuotes to proof_options brand tier',
+    /quotes:\s*scopedBrandQuotes/.test(dirSrc));
+  check('P8-revert: assembleSignals scopes category quotes the same way',
+    /quotes:\s*scopedCategoryQuotes/.test(dirSrc));
+  check('P8-revert: assembleSignals scopes product quotes the same way',
+    /quotes:\s*scopedProductQuotes/.test(dirSrc));
+  check('P8-revert: assembleSignals does not filter brand_reviews_summary',
+    /brand_reviews_summary:\s*snippetText\(brand\?\.brandReviews\?\.summary/.test(dirSrc));
+  check('P8-revert: assembleSignals quote scope uses seed media, not the PMA union',
+    /quoteScopeMedia/.test(dirSrc) && /loadQuoteScopeMediaByIds/.test(dirSrc)
+    && /seededUniverse/.test(dirSrc));
+  check('P8-revert: assembleSignals live caller threads seededUniverse',
+    /assembleSignals\(\s*\{\s*brandId,\s*productId,\s*campaignKind,\s*seededUniverse\s*\}/.test(dirSrc));
+  check('P8-revert: buildIntentData calls applyStrictQuoteScope',
+    /applyStrictQuoteScope\s*\(/.test(directSrc));
+  check('P8-revert: live static Media.select includes seed label fields',
+    /Media\.findById\(mediaId\)\.select\('[^']*\bsubjects\b[^']*\brefinedProducts\b[^']*\bprimarySubjectLabel\b[^']*\bprimarySubjectDesc\b[^']*'\)/.test(directSrc)
+    || /Media\.findById\(mediaId\)\.select\('[^']*\bprimarySubjectLabel\b[^']*\bprimarySubjectDesc\b[^']*\bsubjects\b[^']*\brefinedProducts\b[^']*'\)/.test(directSrc)
+    || (/Media\.findById\(mediaId\)\.select\('([^']+)'\)/.test(directSrc)
+      && ['subjects', 'refinedProducts', 'primarySubjectLabel', 'primarySubjectDesc']
+        .every((f) => new RegExp(`Media\\.findById\\(mediaId\\)\\.select\\('[^']*\\b${f}\\b`).test(directSrc))));
+  check('P8-revert: gateLayoutInputQuotes calls applyStrictQuoteScope',
+    /applyStrictQuoteScope\s*\(/.test(bseSrc));
+  check('P8-revert: buildMetaForAd loads seed media and passes it as scope.media',
+    /loadQuoteScopeMedia/.test(bseSrc)
+    && /gateLayoutInputQuotes\s*\(\s*layoutInput[\s\S]{0,400}?\bmedia\s*:/.test(bseSrc));
+  check('P8-revert: quote TEXT is never rewritten (no .text assignment in the new helpers)',
+    !/function selectBrandQuotesForScope[\s\S]*?\.text\s*=/.test(provSrc)
+    && !/function applyStrictQuoteScope[\s\S]*?\.text\s*=/.test(provSrc));
+
+  // Simulated reverts — the broken selectors that would re-open the defect.
+  const brokenNoNounFilter = (quotes, opts) => {
+    if (!quoteProvenanceStrictEnabled()) return quotes;
+    if (opts.productAttached) return quotes;
+    return quotes; // THE LIVE DEFECT: keep bomber over pants
+  };
+  const brokenEmptiesOnProduct = (quotes, opts) => {
+    if (!quoteProvenanceStrictEnabled()) return quotes;
+    if (opts.productAttached) return []; // the rule the owner reversed
+    return quotes.filter((q) => isBrandQuoteAllowedForSeed(q, opts));
+  };
+  withStrictFlag(true, () => {
+    const leaked = brokenNoNounFilter([BOMBER_Q], { productAttached: false });
+    check('P8-revert-prove noun rule: skipping the noun filter KEEPS the bomber+pants pair',
+      leaked.length === 1 && leaked[0] === BOMBER_Q);
+    check('P8-revert-prove noun rule: shipped selector REJECTS that pair',
+      selectBrandQuotesForScope([BOMBER_Q], {
+        productAttached: false, media: PANTS_SNEAKER_MEDIA
+      }).length === 0);
+
+    const emptied = brokenEmptiesOnProduct([GENERIC_Q], { productAttached: true });
+    check('P8-revert-prove product-attached: emptying the pool is the OLD (rejected) rule',
+      emptied.length === 0);
+    check('P8-revert-prove product-attached: shipped selector KEEPS the last-resort pool',
+      selectBrandQuotesForScope([GENERIC_Q], { productAttached: true }).length === 1);
+
+    check('P8-revert-prove adjective short: a matcher that listed short would fire',
+      productNounsIn('short delivery time').length === 0);
+    check('P8-revert-prove tee/shirt: unaliased tee would reject a t-shirt title',
+      quoteAllowedForScope('love this tee', 'Classic T-Shirt') === true);
+  });
+}
+
+// Live static projection: take the REAL Media.findById select string from
+// renderDirectImage, project the pants seed through it, and prove the
+// bomber drops with NO product.name crutch.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const directSrc = fs.readFileSync(
+    path.join(__dirname, '../services/directImageRenderService.js'), 'utf8'
+  );
+  const sel = (directSrc.match(/Media\.findById\(mediaId\)\.select\('([^']+)'\)/) || [])[1] || '';
+  check('P8 live static select string includes seed labels',
+    /\bsubjects\b/.test(sel) && /\brefinedProducts\b/.test(sel)
+    && /\bprimarySubjectLabel\b/.test(sel) && /\bprimarySubjectDesc\b/.test(sel),
+    `select=${JSON.stringify(sel)}`);
+  check('P8 QUOTE_SCOPE_MEDIA_SELECT lists the same label fields',
+    /\bsubjects\b/.test(QUOTE_SCOPE_MEDIA_SELECT)
+    && /\brefinedProducts\b/.test(QUOTE_SCOPE_MEDIA_SELECT)
+    && /\bprimarySubjectLabel\b/.test(QUOTE_SCOPE_MEDIA_SELECT)
+    && /\bprimarySubjectDesc\b/.test(QUOTE_SCOPE_MEDIA_SELECT));
+  const projected = {};
+  for (const f of sel.split(/\s+/).filter(Boolean)) {
+    const top = f.split('.')[0];
+    if (PANTS_SNEAKER_MEDIA[top] !== undefined) projected[top] = PANTS_SNEAKER_MEDIA[top];
+  }
+  check('P8 live static projection has subjects and no product name to lean on',
+    Array.isArray(projected.subjects) && projected.product == null);
+  withStrictFlag(true, () => {
+    const d = direct.buildIntentData({
+      concept: { copy_picks: { headline: 'Move freely' } },
+      layoutInput: { social_proof: { primary_quote: BOMBER_Q } },
+      brand: {}, cta: 'SHOP NOW',
+      media: projected
+    });
+    check('P8 live static projection DROPS bomber with no product.name',
+      d.quote === undefined, `got ${JSON.stringify(d.quote)}`);
+  });
+}
+
+// ── P8 live callers (module stubs, same shape as verifyShopifyLadderBlocks)
+function stubQuery(result) {
+  const q = {
+    sort() { return this; },
+    limit() { return this; },
+    select() { return this; },
+    lean() { return Promise.resolve(result); },
+    then(res, rej) { return Promise.resolve(result).then(res, rej); }
+  };
+  return q;
+}
+
+(async () => {
+  const Media = require('../models/Media');
+  const LayoutInputArtifact = require('../models/LayoutInputArtifact');
+  const Brand = require('../models/Brand');
+  const CatalogProduct = require('../models/CatalogProduct');
+  const ProductMatchArtifact = require('../models/ProductMatchArtifact');
+  const director = require('../services/aiCreativeDirectorService');
+
+  const orig = {
+    mediaFindById: Media.findById,
+    mediaFind: Media.find,
+    liaFindOne: LayoutInputArtifact.findOne,
+    brandFindById: Brand.findById,
+    cpFindById: CatalogProduct.findById,
+    pmaFind: ProductMatchArtifact.find
+  };
+
+  function restore() {
+    Media.findById = orig.mediaFindById;
+    Media.find = orig.mediaFind;
+    LayoutInputArtifact.findOne = orig.liaFindOne;
+    Brand.findById = orig.brandFindById;
+    CatalogProduct.findById = orig.cpFindById;
+    ProductMatchArtifact.find = orig.pmaFind;
+  }
+
+  // Live video caller: buildMetaForAd loads seed Media and hands it to
+  // the gate. Bomber over pants seed, no product attached, no product.name.
+  try {
+    const artifact = {
+      input: { social_proof: { primary_quote: BOMBER_Q } },
+      schemaVersion: '4.1'
+    };
+    LayoutInputArtifact.findOne = () => stubQuery(artifact);
+    Media.findById = () => stubQuery(PANTS_SNEAKER_MEDIA);
+    await withStrictFlag(true, async () => {
+      const meta = await buildMetaForAd(
+        { _id: 'ad-live', mediaId: 'seed-pants', productId: null },
+        { name: 'Vuori' }
+      );
+      check('P8 live buildMetaForAd DROPS bomber over stubbed pants seed (no product)',
+        !meta.quote || !String(meta.quote).toLowerCase().includes('jacket'),
+        `got ${JSON.stringify(meta && meta.quote)}`);
+    });
+  } catch (err) {
+    check('P8 live buildMetaForAd DROPS bomber over stubbed pants seed (no product)',
+      false, err.message);
+  } finally {
+    restore();
+  }
+
+  // Live Director caller: assembleSignals with a media-driven seed.
+  // Jacket review must not reach primary_quote OR proof_options quotes.
+  try {
+    const brandDoc = {
+      name: 'Vuori',
+      summary: 'Performance apparel',
+      logoUrl: 'http://x',
+      brandReviews: {
+        summary: 'Customers love the line.',
+        rating: 4.8,
+        reviewCount: 120,
+        quotes: [BOMBER_Q, GENERIC_Q]
+      }
+    };
+    Brand.findById = () => stubQuery(brandDoc);
+    CatalogProduct.findById = () => stubQuery(null);
+    ProductMatchArtifact.find = () => stubQuery([]);
+    Media.find = () => stubQuery([{ _id: 'seed-pants', ...PANTS_SNEAKER_MEDIA }]);
+    const prevMenu = process.env.DIRECTOR_PROOF_MENU_ENABLED;
+    process.env.DIRECTOR_PROOF_MENU_ENABLED = 'true';
+    await withStrictFlag(true, async () => {
+      const signals = await director.assembleSignals({
+        brandId: 'b1',
+        productId: null,
+        campaignKind: 'brand',
+        seededUniverse: [{ mediaId: 'seed-pants' }]
+      });
+      const pq = signals?.social_proof_signal?.primary_quote;
+      check('P8 live assembleSignals primary_quote is not the bomber',
+        !pq || !String(pq.text || '').toLowerCase().includes('jacket'),
+        `got ${JSON.stringify(pq)}`);
+      check('P8 live assembleSignals primary_quote keeps the generic',
+        pq && pq.text === GENERIC_QUOTE, `got ${JSON.stringify(pq)}`);
+      const opts = signals?.social_proof_signal?.proof_options || [];
+      const brandOpt = opts.find((o) => o.tier === 'brand');
+      const brandTexts = (brandOpt?.quotes || []).map((q) => q && q.text);
+      check('P8 live assembleSignals proof_options brand quotes drop the bomber',
+        brandTexts.every((t) => !String(t || '').toLowerCase().includes('jacket')),
+        `got ${JSON.stringify(brandTexts)}`);
+      check('P8 live assembleSignals proof_options brand quotes keep the generic',
+        brandTexts.includes(GENERIC_QUOTE), `got ${JSON.stringify(brandTexts)}`);
+      check('P8 live assembleSignals does not rewrite brand_reviews_summary',
+        signals?.brand_signal?.brand_reviews_summary
+        && String(signals.brand_signal.brand_reviews_summary).includes('Customers love the line'));
+    });
+    if (prevMenu === undefined) delete process.env.DIRECTOR_PROOF_MENU_ENABLED;
+    else process.env.DIRECTOR_PROOF_MENU_ENABLED = prevMenu;
+  } catch (err) {
+    check('P8 live assembleSignals', false, err.message);
+  } finally {
+    restore();
+  }
+
+  // Flag-off live Director: bomber stays (identity).
+  try {
+    const brandDoc = {
+      name: 'Vuori',
+      brandReviews: { quotes: [BOMBER_Q, GENERIC_Q], summary: 'Customers love the line.' }
+    };
+    Brand.findById = () => stubQuery(brandDoc);
+    CatalogProduct.findById = () => stubQuery(null);
+    ProductMatchArtifact.find = () => stubQuery([]);
+    Media.find = () => stubQuery([{ _id: 'seed-pants', ...PANTS_SNEAKER_MEDIA }]);
+    await withStrictFlag(false, async () => {
+      const signals = await director.assembleSignals({
+        brandId: 'b1', productId: null, campaignKind: 'brand',
+        seededUniverse: [{ mediaId: 'seed-pants' }]
+      });
+      const pq = signals?.social_proof_signal?.primary_quote;
+      check('P8 flag-off live assembleSignals keeps the bomber (identity)',
+        pq && String(pq.text || '').includes('bomber-style jacket'),
+        `got ${JSON.stringify(pq)}`);
+    });
+  } catch (err) {
+    check('P8 flag-off live assembleSignals keeps the bomber (identity)',
+      false, err.message);
+  } finally {
+    restore();
+  }
+
+  if (failures.length) {
+    console.error(`\n❌ quote provenance: ${failures.length} FAILED, ${pass} passed\n`);
+    failures.forEach((f) => console.error(`   • ${f}`));
+    process.exit(1);
+  }
+  console.log(`✅ quote provenance: ${pass} checks passed`);
+})().catch((err) => {
+  console.error(`\n❌ quote provenance: live-caller harness crashed: ${err.message}`);
+  console.error(err.stack);
+  process.exit(1);
+});
