@@ -812,8 +812,8 @@ async function expandWizardJob({
   // Brand-only runs (productIds.length === 0) stay legacy — the
   // concept-driven path is product-scoped.
   // Resolve operator-requested kinds against the format's allowed kinds.
-  // Wizard input (kinds param) wins over campaign.adKinds; falls back to
-  // 'image' so legacy callers get the previous behavior.
+  // Wizard input (kinds param) wins; absent input falls back to 'image'.
+  //
   // Defaults to STATIC, not 'both'. The product has two separate presets and
   // the operator always picks one, so an unset value means "the wizard didn't
   // say", never "make me one of each" — and 'both' made every static run also
@@ -821,7 +821,31 @@ async function expandWizardJob({
   // 27 of 127 campaigns have adKinds unset and so took this path, and campaign
   // 6a6a52cd carries 23 video drafts alongside its 63 image drafts as a result.
   // A caller that genuinely wants both still passes 'both' explicitly.
-  const requestedKinds = kinds || campaign.adKinds || 'image';
+  //
+  // ⚠️ MONEY — `campaign.adKinds` IS DELIBERATELY NOT CONSULTED, and removing it
+  // is the fix, not a simplification. The intent above ("unset means static")
+  // was never reachable: models/Campaign.js declares
+  // `adKinds: { default: 'both' }`, and NO route ever writes the field —
+  // Campaign.create() omits it so Mongoose bakes 'both' into every document at
+  // creation, and PATCH /api/campaigns/:id does not accept it. So every campaign
+  // in the database stores 'both' permanently, the `|| 'image'` arm was dead
+  // code, and a static-only request that did not pass its own `kinds` resolved
+  // to ['image','video'] — because all three live Meta static surfaces are
+  // dual-kind — and queued a billable Omni video (~$0.90–1.20) nobody asked for.
+  // That is the owner-reported "I selected static ads for Meta and got a video".
+  //
+  // A field that no code path ever sets cannot express operator intent; reading
+  // it is reading the schema default and calling it a choice. The wizard sends
+  // `kinds` explicitly, and every named preset resolves its own kinds inside
+  // resolvePreset (which ignores this value entirely), so dropping it changes
+  // behaviour ONLY for a caller that supplies neither — which is exactly the
+  // case the comment above says should be static.
+  //
+  // Leaving the stored field in place on purpose: it is harmless once unread,
+  // and migrating ~127 documents to fix a value nothing consults would be
+  // motion without effect. If it ever becomes operator-settable, re-introduce
+  // it HERE and pin the precedence with a test.
+  const requestedKinds = kinds || 'image';
 
   // PRESET resolution. 'single' (default) is byte-identical to the old
   // three-knob path. Named presets own their format lists and kinds.
@@ -1123,7 +1147,17 @@ async function expandWizardJob({
     }
 
     if (detResult || conceptResult) {
-      return mergeExpansionResults(detResult, conceptResult);
+      // Report the kinds this run actually resolved to, so the render-claim step
+      // can restrict itself to them. The caller must NOT re-derive this: the
+      // route does not know campaign.platformFormat and resolveKinds intersects
+      // with the surface's capabilities, so a second derivation would drift from
+      // the one that decided what got queued — the same class of bug as the
+      // request-fingerprint traps in generationGate.js.
+      {
+        const merged = mergeExpansionResults(detResult, conceptResult);
+        if (merged) merged.resolvedKinds = [...resolvedKinds];
+        return merged;
+      }
     }
     // Both returned null/empty — fall through to legacy image path.
   }
@@ -1604,7 +1638,39 @@ async function expandWizardJob({
 // Selection — "next N queued ads for this campaign, ranked by
 // readinessScore desc (videos with null score sort last, FIFO by
 // queuedAt as tiebreaker)." Returns Ad IDs (strings).
-async function selectAdsForRun({ campaignId, limit, productIds = null }) {
+async function selectAdsForRun({ campaignId, limit, productIds = null, kinds = null }) {
+  // `kinds` (optional, e.g. ['image']) RESTRICTS the claim to those kinds.
+  //
+  // ⚠️ MONEY. This function is kind-BLIND without it, and tier 0 below drains
+  // renderRoute:'veo' FIRST by design. So a static-only Generate would claim and
+  // render whatever video ads happened to be sitting in 'queued' for the same
+  // product from an earlier session — ahead of the statics the operator just
+  // asked for, and billing an Omni submit per row. Kind scoping existed at
+  // EXPANSION time and nowhere at SELECTION time, so "what this request asked
+  // for" and "what this run renders" were two independently-scoped questions.
+  //
+  // OPT-IN on purpose. Omitting it preserves today's behaviour exactly, which is
+  // what POST /api/ads/runs ("render more from this campaign") wants — that
+  // endpoint deliberately drains every queued ad regardless of kind, and
+  // narrowing it would strand rows with nothing left to claim them.
+  //
+  // Mapped through renderRoute rather than `kind` because renderRoute is what
+  // tier 0 already discriminates on and what the render dispatcher switches on:
+  // 'veo' for video, 'html_gen' for every image ad (see renderRouteForKind —
+  // 'html_gen' means "static", not "the retired HTML renderer").
+  const wantKinds = Array.isArray(kinds)
+    ? kinds.filter(k => k === 'image' || k === 'video')
+    : null;
+  const routeScope = (() => {
+    if (!wantKinds || !wantKinds.length) return {};              // no restriction
+    const routes = [];
+    if (wantKinds.includes('video')) routes.push('veo');
+    if (wantKinds.includes('image')) routes.push('html_gen');
+    // Both kinds wanted → no restriction, so the query plan stays identical to
+    // the unrestricted case rather than adding a redundant $in over every value.
+    if (routes.length === 2) return {};
+    return { renderRoute: { $in: routes } };
+  })();
   // productIds (optional) SCOPES the selection to those products.
   //
   // Without it this selects on { campaignId, status:'queued' } alone, and tier
@@ -1640,15 +1706,23 @@ async function selectAdsForRun({ campaignId, limit, productIds = null }) {
   // Concept video carries a conceptId; the legacy image cartesian is
   // renderRoute 'html_gen' — so this set is exactly the deterministic videos
   // (plus any pre-Phase-3 legacy veo ads, which rendering first is harmless).
-  const det = await Ad.find({
-    campaignId, status: 'queued',
-    conceptId: null, judgeRank: null, renderRoute: 'veo',
-    ...productScope
-  })
-    .sort({ queuedAt: 1 })
-    .limit(limit)
-    .select('_id')
-    .lean();
+  // GATED, not filtered. This query hardcodes renderRoute:'veo', so spreading
+  // routeScope into it would OVERWRITE that key and turn the video tier into a
+  // second static tier — selecting image ads under a comment that says video,
+  // and double-claiming rows tier v1 also returns. When video is not wanted the
+  // correct result is an empty tier, so skip the query outright.
+  const wantsVideoClaim = !wantKinds || !wantKinds.length || wantKinds.includes('video');
+  const det = wantsVideoClaim
+    ? await Ad.find({
+        campaignId, status: 'queued',
+        conceptId: null, judgeRank: null, renderRoute: 'veo',
+        ...productScope
+      })
+        .sort({ queuedAt: 1 })
+        .limit(limit)
+        .select('_id')
+        .lean()
+    : [];
   const detIds = det.map(r => String(r._id));
   if (detIds.length >= limit) return detIds;
 
@@ -1657,7 +1731,7 @@ async function selectAdsForRun({ campaignId, limit, productIds = null }) {
   // remaining slots by readinessScore. Separate queries because MongoDB
   // sorts nulls before non-nulls in ASC order.
   const afterDet = limit - detIds.length;
-  const v2 = await Ad.find({ campaignId, status: 'queued', judgeRank: { $ne: null }, ...productScope })
+  const v2 = await Ad.find({ campaignId, status: 'queued', judgeRank: { $ne: null }, ...productScope, ...routeScope })
     .sort({ judgeRank: 1, queuedAt: 1 })
     .limit(afterDet)
     .select('_id')
@@ -1672,7 +1746,8 @@ async function selectAdsForRun({ campaignId, limit, productIds = null }) {
   const v1 = await Ad.find({
     campaignId, status: 'queued', judgeRank: null,
     _id: { $nin: detOids },
-    ...productScope
+    ...productScope,
+    ...routeScope
   })
     .sort({ readinessScore: -1, queuedAt: 1 })
     .limit(remaining)
