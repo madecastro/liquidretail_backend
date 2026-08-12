@@ -693,9 +693,12 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
 // V1 — selection (lifestyle seed OR ugc variantKind — matches static)
 {
   const on = loadVeo({ lifestyle: 'true' });
+  // Entry to the lifestyle path is now the MEDIA path (variantKind 'ugc'),
+  // not an inferred seed style — see shouldUseLifestyleVideoPrompt.
   const life = on.buildVeoPrompt({
     product: { title: 'Wool Runner' },
     seedStyle: 'lifestyle',
+    variantKind: 'ugc',
     hasProductReference: false,
     durationSec: 8,
     caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
@@ -731,8 +734,17 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     none.includes('Professional product commercial editor') && none.includes('Ken Burns'));
   check('V1 ugc+packshot seed → lifestyle path (matches static trigger)',
     ugcPack.includes('Lifestyle motion editor'));
-  check('V1 shouldUseLifestyleVideoPrompt lifestyle true',
-    on.shouldUseLifestyleVideoPrompt('lifestyle') === true);
+  check('V1 shouldUseLifestyleVideoPrompt ugc (media path) true',
+    on.shouldUseLifestyleVideoPrompt('lifestyle', 'ugc') === true);
+  // THE OWNER RULE: only the media path enters. A product-images ad must NOT,
+  // whatever its seed was classified as. This is the check that would have
+  // caught the GymShark regression — on_model maps to the lifestyle bucket, so
+  // before this every apparel product ad silently took the path and had its
+  // 3 operator picks capped to 1.
+  check('V1 product_image + lifestyle seed does NOT enter (media path only)',
+    on.shouldUseLifestyleVideoPrompt('lifestyle', 'product_image') === false);
+  check('V1 seed style alone no longer opens the path',
+    on.shouldUseLifestyleVideoPrompt('lifestyle') === false);
   check('V1 shouldUseLifestyleVideoPrompt packshot false',
     on.shouldUseLifestyleVideoPrompt('packshot') === false);
   check('V1 shouldUseLifestyleVideoPrompt ugc true even if packshot seed',
@@ -749,6 +761,7 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   const life = off.buildVeoPrompt({
     product: { title: 'Wool Runner' },
     seedStyle: 'lifestyle',
+    variantKind: 'ugc',
     hasProductReference: true,
     durationSec: 8,
     caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
@@ -903,6 +916,7 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   const prompt = mod.buildVeoPrompt({
     product: { title: 'Wool Runner' },
     seedStyle: 'lifestyle',
+    variantKind: 'ugc',
     durationSec: 8,
     caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
   });
@@ -917,7 +931,8 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   const d = mod.LIFESTYLE_DIRECTIVES;
   const blob = Object.values(d).join(' ') + ' ' +
     mod.buildVeoPrompt({
-      product: { title: 'X' }, seedStyle: 'lifestyle', durationSec: 8,
+      product: { title: 'X' }, seedStyle: 'lifestyle',
+    variantKind: 'ugc', durationSec: 8,
       caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
     });
   for (const a of AMBIENT_PERMITS) {
@@ -942,20 +957,25 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
 // still passes baseReferenceCount to buildReferenceImages must fail.
 {
   const on = loadVeo({ lifestyle: 'true' });
-  check('V6 lifestyle+flag → ref count 1',
-    on.resolveLifestyleVideoRefCount(3, 'lifestyle') === 1);
+  check('V6 ugc (media path) → ref count 1',
+    on.resolveLifestyleVideoRefCount(3, 'lifestyle', 'ugc') === 1);
+  check('V6 product_image keeps the full stack (regression guard)',
+    on.resolveLifestyleVideoRefCount(3, 'lifestyle', 'product_image') === 3);
   check('V6 packshot+flag → base 3 unchanged',
     on.resolveLifestyleVideoRefCount(3, 'packshot') === 3);
   check('V6 unknown+flag → base 3',
     on.resolveLifestyleVideoRefCount(3, 'unknown') === 3);
-  check('V6 lifestyle+flag with base 5 → still 1',
-    on.resolveLifestyleVideoRefCount(5, 'lifestyle') === 1);
+  check('V6 ugc with base 5 → still 1',
+    on.resolveLifestyleVideoRefCount(5, 'lifestyle', 'ugc') === 1);
   check('V6 ugc+packshot seed → ref count 1',
     on.resolveLifestyleVideoRefCount(3, 'packshot', 'ugc') === 1);
 
   // Behavioural plan — this is what generateForAd must pass to buildReferenceImages.
   const planLife = on.resolveLifestyleVideoRefPlan({
-    baseReferenceCount: 3, seedStyle: 'lifestyle'
+    baseReferenceCount: 3, seedStyle: 'lifestyle', variantKind: 'ugc'
+  });
+  const planProductPath = on.resolveLifestyleVideoRefPlan({
+    baseReferenceCount: 3, seedStyle: 'lifestyle', variantKind: 'product_image'
   });
   const planPack = on.resolveLifestyleVideoRefPlan({
     baseReferenceCount: 3, seedStyle: 'packshot'
@@ -972,6 +992,8 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   // Plan must not return base when lifestyle is active (catches side-effect-only call).
   check('V6 plan lifestyle never returns baseReferenceCount as effective count',
     planLife.referenceCount !== 3);
+  check('V6 plan product_image: full stack, never seed-only',
+    planProductPath.referenceCount === 3 && planProductPath.forceSeedOnly === false);
 
   const off = loadVeo({ lifestyle: 'false' });
   check('V6 flag off lifestyle → base 3',
@@ -1009,6 +1031,7 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   const pmaxLife = on.buildVeoPrompt({
     product: { title: 'Wool Runner' },
     seedStyle: 'lifestyle',
+    variantKind: 'ugc',
     platformFormat: 'pmax_video_9_16',
     aspectRatio: '9:16',
     durationSec: 10,
@@ -1027,6 +1050,7 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   const metaLife = on.buildVeoPrompt({
     product: { title: 'Wool Runner' },
     seedStyle: 'lifestyle',
+    variantKind: 'ugc',
     platformFormat: 'meta_reels_9_16',
     aspectRatio: '9:16',
     durationSec: 8,
@@ -1087,7 +1111,8 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
   };
   const a = off.buildVeoPrompt(args);
-  const b = off.buildVeoPrompt({ ...args, seedStyle: 'lifestyle' });
+  const b = off.buildVeoPrompt({ ...args, seedStyle: 'lifestyle',
+    variantKind: 'ugc' });
   const c = off.buildVeoPrompt({ ...args, seedStyle: 'packshot' });
   check('V8 flag off: lifestyle seedStyle does not change prompt', a === b);
   check('V8 flag off: packshot seedStyle does not change prompt', a === c);
