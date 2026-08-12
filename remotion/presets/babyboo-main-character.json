@@ -61,7 +61,7 @@
             "enterAtSec": 0.35,
             "exitAtSec": 2.3,
             "enterDurationSec": 0.25,
-            "exitDurationSec": 0.25
+            "exitDurationSec": 0.15
           },
           "transition": {
             "type": "pop",
@@ -93,7 +93,7 @@
             "enterAtSec": 0.1,
             "exitAtSec": 2.3,
             "enterDurationSec": 0.25,
-            "exitDurationSec": 0.25
+            "exitDurationSec": 0.15
           },
           "transition": {
             "type": "pop",

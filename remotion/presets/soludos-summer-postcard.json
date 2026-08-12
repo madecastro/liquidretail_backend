@@ -82,7 +82,7 @@
             "enterAtSec": 0.6,
             "exitAtSec": 3.6,
             "enterDurationSec": 0.6,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -110,7 +110,7 @@
             "enterAtSec": 0.2,
             "exitAtSec": 3.6,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
