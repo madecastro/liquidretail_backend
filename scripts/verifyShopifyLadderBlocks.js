@@ -63,6 +63,10 @@ const AKAMAI_BLOCK = {
 
 const BRAND = { shopifyUrl: 'https://blocked.example' };
 
+// Captured so E4 can compare the two outcomes for real instead of
+// asserting a literal true.
+const observed = { blockedReason: null, emptyReason: null };
+
 // Every response shape the ladder can see, with no products anywhere.
 const emptyOk = { ok: true, status: 200, json: { products: [] }, text: '', block: null };
 const blocked403 = { ok: false, status: 403, json: null, text: '', block: AKAMAI_BLOCK };
@@ -73,6 +77,7 @@ async function main() {
     const { resolveShopifyAccess } = installHttp(() => blocked403);
     const out = await resolveShopifyAccess(BRAND, { cap: 10 });
 
+    observed.blockedReason = out.reason;
     check('B1 blocked store does not report ok', out.ok === false, `ok=${out.ok}`);
     check(
       'B2 blocked store surfaces out.blocked with the vendor',
@@ -103,6 +108,7 @@ async function main() {
     const { resolveShopifyAccess } = installHttp(() => emptyOk);
     const out = await resolveShopifyAccess(BRAND, { cap: 10 });
 
+    observed.emptyReason = out.reason;
     check('E1 empty store does not report ok', out.ok === false, `ok=${out.ok}`);
     check(
       'E2 empty store has NO blocked field (no false positives)',
@@ -114,10 +120,16 @@ async function main() {
       /all access rungs empty/i.test(out.reason || ''),
       `reason=${out.reason}`
     );
+    // The entire premise of this change: a blocked store and an empty store
+    // must not produce the same operator-facing answer. Asserting a literal
+    // `true` here would have passed against the ORIGINAL bug, where both
+    // produced "all access rungs empty" — so compare the real strings.
     check(
-      'E4 the two outcomes are DISTINGUISHABLE — the whole point',
-      true, // asserted by B3 + E3 differing; kept as a named anchor
-      'see B3/E3'
+      'E4 blocked and empty produce DIFFERENT reasons — the whole point',
+      typeof observed.blockedReason === 'string' &&
+        typeof observed.emptyReason === 'string' &&
+        observed.blockedReason !== observed.emptyReason,
+      `blocked="${observed.blockedReason}" empty="${observed.emptyReason}"`
     );
   }
 
@@ -156,6 +168,49 @@ async function main() {
       'P3 sitemap alone blocked → still surfaced (pins THAT rung)',
       out.blocked && out.blocked.vendor === 'akamai',
       `blocked=${JSON.stringify(out.blocked)} reason=${out.reason}`
+    );
+  }
+
+  // ── 2c. FALSE-POSITIVE guards. classifyBlock is not "bot walls only":
+  // a bare 401/403 is generic-403/low, which is exactly what a
+  // PASSWORD-PROTECTED Shopify store returns, and a 429 is vendor
+  // 'rate-limited'. Neither may be asserted as "the catalog was never
+  // readable, get an unblocker".
+  {
+    const denied403 = {
+      ok: false, status: 403, json: null, text: '',
+      block: { vendor: 'generic-403', confidence: 'low', remedy: 'needs-unblocker', signals: ['status:403'] }
+    };
+    const { resolveShopifyAccess } = installHttp(() => denied403);
+    const out = await resolveShopifyAccess(BRAND, { cap: 10 });
+    check(
+      'F1 a bare 403 (password-protected store) does NOT claim a named bot vendor',
+      !/blocked by generic-403/i.test(out.reason || ''),
+      `reason=${out.reason}`
+    );
+    check(
+      'F2 a bare 403 hedges instead of asserting "never readable"',
+      /access denied/i.test(out.reason || '') &&
+        /password-protected/i.test(out.reason || ''),
+      `reason=${out.reason}`
+    );
+  }
+  {
+    const tooMany = {
+      ok: false, status: 429, json: null, text: '', rateLimited: true,
+      block: { vendor: 'rate-limited', confidence: 'high', remedy: 'backoff-retry', signals: ['status:429'] }
+    };
+    const { resolveShopifyAccess } = installHttp(() => tooMany);
+    const out = await resolveShopifyAccess(BRAND, { cap: 10 });
+    check(
+      'F3 a 429 keeps the rate-limited reason (block must not override it)',
+      /rate-limited this server/i.test(out.reason || ''),
+      `reason=${out.reason}`
+    );
+    check(
+      'F4 a 429 is not recorded as a ladder block',
+      out.blocked == null,
+      `blocked=${JSON.stringify(out.blocked)}`
     );
   }
 

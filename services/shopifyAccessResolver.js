@@ -291,6 +291,15 @@ function mapSitemapProduct(json) {
 
 // ── rung implementations ───────────────────────────────────────────
 
+// A classified `block` is not automatically a bot wall. classifyBlock also
+// emits vendor:'rate-limited' for a 429 — that has a dedicated reason and a
+// backoff-retry remedy, so recording it as a "block" would both override the
+// rate-limit reason and tell an operator to buy an unblocker for what is
+// really "slow down".
+function isLadderBlock(b) {
+  return !!(b && b.vendor && b.vendor !== 'rate-limited');
+}
+
 async function fetchProductsJson(origin, { cap, abortCheck, run }) {
   const products = [];
   let page = 1;
@@ -309,22 +318,20 @@ async function fetchProductsJson(origin, { cap, abortCheck, run }) {
       break;
     }
 
-    if (res.rateLimited || res.cfChallenged) {
-      rateLimited = true;
-      console.warn(`   ⚠️  ${LOG}  products.json rate-limited/CF at page ${page}`);
-      break;
-    }
-    // A non-Cloudflare bot block (Akamai / PerimeterX / DataDome / Incapsula)
-    // is already classified by httpScrapeClient. Ignoring it made a blocked
-    // store indistinguishable from an EMPTY one, so the ladder reported
-    // "all access rungs empty" and the caller silently degraded to the
-    // JSON-LD walk — one thumbnail per product instead of the full gallery.
-    if (!blocked && res.block) {
+    // Read the classified block BEFORE the rate-limit break: a CF challenge
+    // sets cfChallenged AND carries a block, and breaking first threw the
+    // vendor away. Sitemap/homepage already ordered it this way.
+    if (!blocked && isLadderBlock(res.block)) {
       blocked = res.block;
       console.warn(
         `   ⚠️  ${LOG}  products.json BLOCKED at page ${page} ` +
         `vendor=${res.block.vendor} confidence=${res.block.confidence} remedy=${res.block.remedy}`
       );
+    }
+    if (res.rateLimited || res.cfChallenged) {
+      rateLimited = true;
+      console.warn(`   ⚠️  ${LOG}  products.json rate-limited/CF at page ${page}`);
+      break;
     }
     if (!res.ok) break;
 
@@ -412,17 +419,17 @@ async function fetchStorefrontGraphql(origin, { cap, abortCheck, run }) {
       break;
     }
 
-    if (res.rateLimited || res.cfChallenged) {
-      rateLimited = true;
-      console.warn(`   ⚠️  ${LOG}  storefront graphql rate-limited/CF`);
-      break;
-    }
-    if (!blocked && res.block) {
+    if (!blocked && isLadderBlock(res.block)) {
       blocked = res.block;
       console.warn(
         `   ⚠️  ${LOG}  storefront graphql BLOCKED vendor=${res.block.vendor} ` +
         `confidence=${res.block.confidence} remedy=${res.block.remedy}`
       );
+    }
+    if (res.rateLimited || res.cfChallenged) {
+      rateLimited = true;
+      console.warn(`   ⚠️  ${LOG}  storefront graphql rate-limited/CF`);
+      break;
     }
     // GraphQL errors array or non-200 → skip rung
     if (!res.ok || !res.json) break;
@@ -463,7 +470,7 @@ async function fetchViaSitemap(origin, { cap, abortCheck, run }) {
   // First block wins — the vendor is the same across a store, and the first
   // one is the earliest point the ladder was actually stopped.
   const noteBlock = (res, where) => {
-    if (blocked || !res || !res.block) return;
+    if (blocked || !isLadderBlock(res && res.block)) return;
     blocked = res.block;
     console.warn(
       `   ⚠️  ${LOG}  sitemap ${where} BLOCKED vendor=${res.block.vendor} ` +
@@ -671,7 +678,7 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   {
     const { products, rateLimited, blocked } = await fetchProductsJson(customOrigin, { cap: CAP, abortCheck, run });
     if (rateLimited) anyRateLimited = true;
-    if (blocked && !anyBlocked) anyBlocked = blocked;
+    if (isLadderBlock(blocked) && !anyBlocked) anyBlocked = blocked;
     if (products.length) {
       console.log(`${LOG}  resolveShopifyAccess: mode=products-json origin=${customOrigin} n=${products.length}`);
       return {
@@ -693,7 +700,7 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
 
   try {
     const homeRes = await http.fetchText(customOrigin + '/');
-    if (homeRes.block && !anyBlocked) anyBlocked = homeRes.block;
+    if (isLadderBlock(homeRes.block) && !anyBlocked) anyBlocked = homeRes.block;
     if (homeRes.rateLimited || homeRes.cfChallenged) {
       anyRateLimited = true;
       note('homepage rate-limited/CF during myshopify discovery');
@@ -718,7 +725,7 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
           note(`rung 2b: products.json @ ${effectiveOrigin}`);
           const { products, rateLimited, blocked } = await fetchProductsJson(effectiveOrigin, { cap: CAP, abortCheck, run });
           if (rateLimited) anyRateLimited = true;
-          if (blocked && !anyBlocked) anyBlocked = blocked;
+          if (isLadderBlock(blocked) && !anyBlocked) anyBlocked = blocked;
           if (products.length) {
             console.log(`${LOG}  resolveShopifyAccess: mode=products-json origin=${effectiveOrigin} n=${products.length} (via myshopify discovery)`);
             return {
@@ -759,7 +766,7 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   {
     const { products, rateLimited, blocked } = await fetchStorefrontGraphql(gqlOrigin, { cap: CAP, abortCheck, run });
     if (rateLimited) anyRateLimited = true;
-    if (blocked && !anyBlocked) anyBlocked = blocked;
+    if (isLadderBlock(blocked) && !anyBlocked) anyBlocked = blocked;
     if (products.length) {
       console.log(`${LOG}  resolveShopifyAccess: mode=storefront-graphql origin=${gqlOrigin} n=${products.length}`);
       return {
@@ -785,7 +792,7 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   {
     const { products, rateLimited, blocked } = await fetchViaSitemap(gqlOrigin, { cap: CAP, abortCheck, run });
     if (rateLimited) anyRateLimited = true;
-    if (blocked && !anyBlocked) anyBlocked = blocked;
+    if (isLadderBlock(blocked) && !anyBlocked) anyBlocked = blocked;
     if (products.length) {
       console.log(`${LOG}  resolveShopifyAccess: mode=sitemap origin=${gqlOrigin} n=${products.length}`);
       return {
@@ -799,12 +806,26 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   }
 
   // ── total failure ────────────────────────────────────────────────
-  const reason = anyBlocked
-    ? `blocked by ${anyBlocked.vendor} (${anyBlocked.confidence} confidence, remedy=${anyBlocked.remedy}) — ` +
-      'NOT an empty store; the catalog was never readable'
-    : anyRateLimited
-      ? 'store rate-limited this server — all access rungs empty'
-      : 'all access rungs empty (products.json, storefront-graphql, sitemap)';
+  // Rate limiting keeps its own dedicated reason — classifyBlock also emits a
+  // vendor:'rate-limited' block for a 429, and letting that win here would
+  // relabel a backoff-retry situation as a bot wall.
+  //
+  // A NAMED vendor at high/medium confidence is worth asserting on. A bare
+  // 401/403 is not: classifyBlock reports it as generic-403/low, and that is
+  // exactly what a PASSWORD-PROTECTED Shopify store returns. Telling an
+  // operator "the catalog was never readable, get an unblocker" when the real
+  // answer is "the store is password-protected" sends them down the wrong
+  // path, so that case gets its own honestly-hedged wording.
+  const namedBlock = anyBlocked && anyBlocked.vendor !== 'generic-403' && anyBlocked.confidence !== 'low';
+  const reason = anyRateLimited
+    ? 'store rate-limited this server — all access rungs empty'
+    : namedBlock
+      ? `blocked by ${anyBlocked.vendor} (${anyBlocked.confidence} confidence, remedy=${anyBlocked.remedy}) — ` +
+        'NOT an empty store; the catalog was never readable'
+      : anyBlocked
+        ? `access denied (${(anyBlocked.signals || []).join(', ') || anyBlocked.vendor}) — ` +
+          'could be a password-protected store or an unidentified bot wall; NOT confirmed empty'
+        : 'all access rungs empty (products.json, storefront-graphql, sitemap)';
 
   console.warn(`${LOG}  resolveShopifyAccess FAILED origin=${customOrigin} reason=${reason}`);
 
