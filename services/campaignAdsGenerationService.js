@@ -68,6 +68,16 @@ function toObjectId(id) {
   return mongoose.isValidObjectId(id) ? new mongoose.Types.ObjectId(String(id)) : null;
 }
 
+// Ownership stamp for the leftover-archive sweeper. Ads used to mint with
+// campaignRunIds:[] and only gained a runId when CLAIMED — so the 14 of 34
+// that selectAdsForRun never picked were invisible to "whose run finished?"
+// and sat queued forever. Stamping the minting run at insert does not change
+// the claim (claim $addToSet's the same id). Preview / dry-run / callers
+// that omit generationRunId still mint with [].
+function mintedCampaignRunIds(generationRunId) {
+  return generationRunId ? [String(generationRunId)] : [];
+}
+
 // Queueable templates ONLY. Stage 1 (2026-08-02): the 7 non-ai_* legacy
 // templates (creator_endorsement, product_overlay, results_proof,
 // review_collage, testimonial_overlay, testimonial_spotlight,
@@ -1079,7 +1089,8 @@ async function expandWizardJob({
           // PMax floor 10s when wizard left duration unset; Meta unchanged.
           videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
           videoPromptGuidance, videoPromptRaw,
-          excludePairings
+          excludePairings,
+          generationRunId
         }));
       }
       if (googleRun) {
@@ -1097,6 +1108,7 @@ async function expandWizardJob({
           ),
           videoPromptGuidance, videoPromptRaw,
           excludePairings,
+          generationRunId,
           // Marker: source master format. Render path also keys on
           // platformFormat === PMAX_VIDEO_DERIVE_ONLY (fail-closed).
           deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE
@@ -1142,6 +1154,7 @@ async function expandWizardJob({
                 videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
                 videoPromptGuidance, videoPromptRaw,
                 excludePairings,
+                generationRunId,
                 // Same-format retitle of the paid master plate.
                 deriveFromMaster: fmt,
                 funnelStage: stage
@@ -1163,6 +1176,7 @@ async function expandWizardJob({
               ),
               videoPromptGuidance, videoPromptRaw,
               excludePairings,
+              generationRunId,
               deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE,
               funnelStage: stage
             }));
@@ -1198,6 +1212,7 @@ async function expandWizardJob({
             videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
             videoPromptGuidance, videoPromptRaw,
             excludePairings,
+            generationRunId,
             deriveFromMaster: META_VIDEO_DERIVE_MAP[fmt]
           }));
         }
@@ -1558,7 +1573,7 @@ async function expandWizardJob({
             payloads.push({
               brandId,
               campaignId,
-              campaignRunIds: [],
+              campaignRunIds: mintedCampaignRunIds(generationRunId),
               mediaId:        seed.mediaId,
               productId:      seed.productId,
               template:       cell.templateId,
@@ -2875,7 +2890,11 @@ async function expandDeterministicVideo({
   videoPromptRaw = null,
   excludePairings = [],
   deriveFromMaster = null,
-  funnelStage = null
+  funnelStage = null,
+  // Mint-ownership only — NOT mixed into the video identity digest (that
+  // omission is load-bearing; see computeDeterministicVideoDigest). Needed
+  // so leftover video rows can be archived after this run goes terminal.
+  generationRunId = null
 }) {
   if (!productIds || !productIds.length) {
     return {
@@ -3230,7 +3249,7 @@ async function expandDeterministicVideo({
     const payload = {
       brandId,
       campaignId,
-      campaignRunIds: [],
+      campaignRunIds: mintedCampaignRunIds(generationRunId),
       mediaId:             mediaIdOid,
       productId:           productOid,
       // No concept — deterministic path.
@@ -3629,7 +3648,7 @@ async function runConceptDrivenExpansion({
             payloads.push({
               brandId,
               campaignId,
-              campaignRunIds: [],
+              campaignRunIds: mintedCampaignRunIds(generationRunId),
               mediaId:        new mongoose.Types.ObjectId(primaryId),
               productId:      toObjectId(productId),
               // Concept-driven fields (A1 schema)

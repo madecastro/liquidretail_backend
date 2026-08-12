@@ -131,6 +131,25 @@ mongoose.connect(process.env.MONGODB_URI, {
   const watchdogTick = () => runWatchdog().catch(err => console.warn(`⚠️  watchdog failed: ${err.message}`));
   setTimeout(watchdogTick, 90 * 1000);
   setInterval(watchdogTick, WATCHDOG_INTERVAL_MIN * 60 * 1000);
+
+  // QUEUED-LEFTOVER ARCHIVE — park mint leftovers so a later Generate cannot
+  // claim and bill them. WORKER, not web: this sweep never renders (no
+  // Remotion, no runRenderLoop, no Atlas submit). strandedRunSweeper lives
+  // on web because its requeue half needs the render loop; this is the
+  // opposite job. Worker stays up across web deploys, which is when leftover
+  // inventory is most likely sitting unclaimed. Never throw — same contract
+  // as the watchdog above.
+  const { sweepQueuedLeftovers, ENABLED: ARCHIVE_ENABLED } = require('./services/queuedArchiveSweeper');
+  if (!ARCHIVE_ENABLED()) {
+    console.log('🗃️  queued archive: disabled (QUEUED_ARCHIVE_ENABLED=false)');
+  } else {
+    const archiveIntervalMin = Math.max(1, parseInt(process.env.QUEUED_ARCHIVE_INTERVAL_MIN, 10) || 15);
+    const archiveTick = () => sweepQueuedLeftovers()
+      .catch(err => console.warn(`⚠️  queued archive failed: ${err.message}`));
+    setTimeout(archiveTick, 90 * 1000);
+    setInterval(archiveTick, archiveIntervalMin * 60 * 1000);
+    console.log(`🗃️  queued archive: every ${archiveIntervalMin}m (after ${process.env.QUEUED_ARCHIVE_AFTER_H || 24}h, max ${process.env.QUEUED_ARCHIVE_MAX_ADS || 200}/pass)`);
+  }
   // Name the vars the code ACTUALLY reads. This line said "Telegram … set
   // TELEGRAM_BOT_TOKEN" for the whole of the Slack cutover, so the one place
   // an operator looks to find out why alerts are silent told them to set two

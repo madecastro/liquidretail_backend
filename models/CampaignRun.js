@@ -61,6 +61,21 @@ const campaignRunSchema = new mongoose.Schema({
   seedUgcIds:          { type: [String], default: [] },
 
   total:        { type: Number, default: 0 },
+  // Ads THIS run minted (expandWizardJob newlyQueued). Distinct from `total`,
+  // which stays the CLAIM count — that is the progress-bar denominator
+  // (succeeded+failed+skipped / total). If we stuffed minted into `total`, a
+  // 34-mint / 20-claim run would hang the bar at 20/34 forever, because the
+  // leftovers are not in this run and will never increment those counters.
+  // The operator still needs to see the gap: GET /runs returns both fields,
+  // and `notice` names the unclaimed count when it is > 0.
+  mintedTotal:      { type: Number, default: 0 },
+  unclaimedAtStart: { type: Number, default: 0 },
+  // Non-blocking notice, SAME SHAPE as the 202's `notice`
+  // ({ code, message, ... }). Overlap is written at mint (known then);
+  // the unclaimed-overflow notice overwrites it after claim (the 202
+  // already delivered overlap; the poller is where post-expand facts land,
+  // same as perProduct / total).
+  notice: { type: mongoose.Schema.Types.Mixed, default: null },
   succeeded:    { type: Number, default: 0 },
   skipped:      { type: Number, default: 0 },
   failed:       { type: Number, default: 0 },

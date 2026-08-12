@@ -73,7 +73,8 @@ const runFeed  = require('../services/runFeedService');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 const {
   generationGateDecision, normalizeProductIdList, pickSupersedingRun,
-  computeRequestFingerprint, renderClaimFingerprint
+  computeRequestFingerprint, renderClaimFingerprint,
+  buildUnclaimedNotice
 } = require('../services/generationGate');
 
 // Operator-facing gate for a multi-select format list (preset 'explicit'),
@@ -667,7 +668,11 @@ router.post('/generate', async (req, res) => {
       // diagnostics. adRegenerateService reads seedUgcIds[0] as the ref-1
       // override; single-entry list is the Phase 2 wizard's MVP shape, array
       // leaves room for Phase 7's batch (one seed per expanded product).
-      seedUgcIds: preferUgcMediaId ? [String(preferUgcMediaId)] : []
+      seedUgcIds: preferUgcMediaId ? [String(preferUgcMediaId)] : [],
+      // Overlap notice is known at mint time (same object the 202 returns).
+      // The unclaimed-overflow notice is stamped after claim — see the
+      // $set below. Both use the { code, message, ... } shape.
+      notice: gate.notice || null
     });
 
     // MINT-THEN-VERIFY — closes the read-then-write race in the gate above.
@@ -741,10 +746,13 @@ router.post('/generate', async (req, res) => {
       total:         0,
       queuedRemaining: 0,
       status:        'preparing',
-      // Non-blocking information, not a verdict. Set when a DIFFERENT request is
-      // already running over some of the same products — allowed by owner
-      // direction, but the operator should still see that both will be billed.
-      // null on the common path.
+      // Non-blocking information, not a verdict. Same shape as every other
+      // generate notice: { code, message, ... }. Overlap is the only entry
+      // known at 202 time — expand+claim have not run yet (Director can take
+      // ~28s; this 202 exists so Render's edge does not cut the request).
+      // Unclaimed-overflow (minted N, claimed 20) is stamped on the run after
+      // claim and returned by GET /runs/:runId in this same `notice` field,
+      // matching how `total` / `perProduct` already work.
       notice: gate.notice || null
     });
 
@@ -917,9 +925,18 @@ router.post('/generate', async (req, res) => {
           kinds: Array.isArray(job?.resolvedKinds) ? job.resolvedKinds : null
         });
         if (!adIds.length) {
+          const mintedIds = Array.isArray(job.newAdIds) ? job.newAdIds.map(String) : [];
+          const unclaimedNotice = buildUnclaimedNotice({
+            minted: mintedIds.length, claimed: 0, unclaimed: mintedIds.length
+          });
           await CampaignRun.updateOne(
             { _id: run._id },
             { status: 'done', completedAt: new Date(),
+              $set: {
+                mintedTotal: mintedIds.length,
+                unclaimedAtStart: mintedIds.length,
+                ...(unclaimedNotice ? { notice: unclaimedNotice } : {})
+              },
               $push: { errors: { index: 0, stage: 'select', message: 'Selection returned empty' } } }
           );
           return;
@@ -961,17 +978,46 @@ router.post('/generate', async (req, res) => {
         }
         adIds = claimedIds;
         if (!adIds.length) {
+          const mintedIds = Array.isArray(job.newAdIds) ? job.newAdIds.map(String) : [];
+          const unclaimedNotice = buildUnclaimedNotice({
+            minted: mintedIds.length, claimed: 0, unclaimed: mintedIds.length
+          });
           await CampaignRun.updateOne(
             { _id: run._id },
             { status: 'done', completedAt: new Date(),
+              $set: {
+                mintedTotal: mintedIds.length,
+                unclaimedAtStart: mintedIds.length,
+                ...(unclaimedNotice ? { notice: unclaimedNotice } : {})
+              },
               $push: { errors: { index: 0, stage: 'select', message: 'All selected ads were claimed by a concurrent run' } } }
           );
           return;
         }
 
+        // `total` stays the CLAIM count (progress-bar denominator). Minted
+        // leftovers are recorded separately so the bar does not hang at
+        // 20/34 — leftovers are not in this run and will never increment
+        // succeeded/failed/skipped. See models/CampaignRun.js.
+        const mintedIds = Array.isArray(job.newAdIds) ? job.newAdIds.map(String) : [];
+        const claimedSet = new Set(adIds.map(String));
+        const mintedTotal = mintedIds.length;
+        const unclaimedAtStart = mintedIds.filter((id) => !claimedSet.has(id)).length;
+        const unclaimedNotice = buildUnclaimedNotice({
+          minted: mintedTotal,
+          claimed: mintedTotal - unclaimedAtStart,
+          unclaimed: unclaimedAtStart
+        });
+
         await CampaignRun.updateOne(
           { _id: run._id },
-          { $set: { total: adIds.length, status: 'running' } }
+          { $set: {
+            total: adIds.length,
+            status: 'running',
+            mintedTotal,
+            unclaimedAtStart,
+            ...(unclaimedNotice ? { notice: unclaimedNotice } : {})
+          } }
         );
 
         await runRenderLoop(run, { ...job, platformFormat }, adIds, renderToken);
@@ -2584,6 +2630,12 @@ router.get('/runs/:runId', async (req, res) => {
       campaignId:      String(run.campaignId),
       campaignKind:    run.campaignKind,
       total:           run.total,
+      mintedTotal:     run.mintedTotal || 0,
+      unclaimedAtStart: run.unclaimedAtStart || 0,
+      // Same field / same { code, message } shape as the 202. After claim
+      // this is the unclaimed-overflow notice when leftovers exist; otherwise
+      // the mint-time overlap notice (or null).
+      notice:          run.notice || null,
       succeeded:       run.succeeded,
       skipped:         run.skipped,
       failed:          run.failed,
