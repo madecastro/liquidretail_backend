@@ -43,6 +43,11 @@ const reviewsEngine = require('./productReviewsScrapeService');
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 // Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
 const ingestShotClassify = require('./ingestShotClassifyService');
+// Shared feed-truth stamper — same policy as catalogSyncService (Meta
+// feed). Fills categoryRef from p.product_type (Shopify's merchant-
+// authored category field) on upsert so Shopify-only brands don't
+// have to wait for a UGC match / JSON-LD scrape to get a real leaf.
+const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
 
 // ── constants ──────────────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -453,6 +458,33 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         { upsert: true, new: true }
       );
       productsUpserted += 1;
+
+      // Stamp categoryRef on rows that don't have one (feed truth
+      // first, coarse enum fallback). Same helper catalogSyncService
+      // uses so every ingest path applies the identical policy. The
+      // null-guard on the updateOne means an inferred stamp that
+      // landed between syncs (JSON-LD scrape, GPT-4.1 brand-nav) stays
+      // authoritative. Best-effort — a stamp failure never breaks the
+      // sync.
+      if (doc && !doc.categoryRef) {
+        try {
+          const stamp = await stampFeedTruthCategoryRef({
+            brandId:      brand._id,
+            advertiserId: brand.advertiserId,
+            feedCategory: flat.category,
+            title:        flat.title
+          });
+          if (stamp) {
+            await CatalogProduct.updateOne(
+              { _id: doc._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+              { $set: { categoryRef: stamp.categoryId } }
+            );
+          }
+        } catch (err) {
+          console.warn(`   ⚠️  🛍  category stamp failed for ${flat.externalId}: ${err.message}`);
+        }
+      }
+
       // Defer classify to post-loop pass — never block remaining upserts.
       if (doc && ingestShotClassify.isEnabled()) {
         pendingClassify.push({

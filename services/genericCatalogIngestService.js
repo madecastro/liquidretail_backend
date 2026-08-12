@@ -35,6 +35,12 @@ const { concurrency: CONC } = require('./concurrency');
 // Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
 // Bounded session per sync — never fails the upsert.
 const ingestShotClassify = require('./ingestShotClassifyService');
+// Shared feed-truth stamper — used as a FALLBACK when the scanner did
+// not capture a JSON-LD breadcrumb. Feeds row.category (single term or
+// path) through resolveFeedCategoryRef first, coarse enum second, so
+// non-breadcrumb rows still land a real categoryRef at ingest instead
+// of waiting for a match / re-scrape.
+const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
 // Upsert loop gets its OWN wall-clock budget (DB-bound) — must not share
 // the network scan budget's clock, or a slow scan would leave no time to
 // persist products already paid for in network cost.
@@ -254,6 +260,23 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
           console.warn(`   ⚠️  ${LOG}  category tree build failed for ${externalId}: ${err.message}`);
         }
       }
+      // FALLBACK — scanner didn't capture a JSON-LD breadcrumb but the
+      // row still carries a merchant-authored category string. Feed
+      // truth first (breadcrumb-as-path or single term), coarse enum
+      // second. Same helper the Meta / Shopify / Apify paths use.
+      if (!categoryRefId && p.category) {
+        try {
+          const stamp = await stampFeedTruthCategoryRef({
+            brandId:      brand._id,
+            advertiserId: brand.advertiserId || null,
+            feedCategory: p.category,
+            title:        p.title
+          });
+          if (stamp) categoryRefId = stamp.categoryId;
+        } catch (err) {
+          console.warn(`   ⚠️  ${LOG}  feed-truth category stamp failed for ${externalId}: ${err.message}`);
+        }
+      }
 
       const set = {
         advertiserId:     brand.advertiserId,
@@ -292,8 +315,11 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
       if (inferredBreadcrumb) {
         set.inferredBreadcrumb = inferredBreadcrumb;
         set.inferredCategoryAt = new Date();
-        if (categoryRefId) set.categoryRef = categoryRefId;
       }
+      // categoryRef stamps for both the JSON-LD path AND the feed-truth
+      // fallback — the outer `if (inferredBreadcrumb)` used to gate this
+      // so a fallback-derived ref was silently discarded on the upsert.
+      if (categoryRefId) set.categoryRef = categoryRefId;
 
       // Upsert only — no await on classify (image network work).
       const doc = await CatalogProduct.findOneAndUpdate(

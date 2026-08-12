@@ -22,6 +22,7 @@ const { uploadUrlToCloudinary } = require('./cloudinaryService');
 const { MAX_ADDITIONAL_IMAGES } = require('./catalogImageLimits');
 // Free packshot/lifestyle classify at ingest (URL-keyed on CatalogProduct).
 const ingestShotClassify = require('./ingestShotClassifyService');
+const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
 
 const APIFY_TRIGGER = 'apify-sync';
 
@@ -386,6 +387,11 @@ async function syncBrandShopify(brand, run = null) {
               ? p.additionalImageUrls.slice(0, MAX_ADDITIONAL_IMAGES)
               : [],
             productUrl:      p.productUrl || null,
+            // Merchant-authored category string (Shopify product_type)
+            // captured by the Apify normalizer. Feeds the categoryRef
+            // stamp below and drives the /api/catalog list's raw-string
+            // filter dropdown.
+            category:        p.category || null,
             rawData:         p,
             lastSyncedAt:    new Date()
           },
@@ -397,6 +403,31 @@ async function syncBrandShopify(brand, run = null) {
       else                                           summary.added++;
       // Defer classify to post-loop pass — never block remaining upserts.
       const row = result?.value || result;
+
+      // Stamp categoryRef on rows that don't have one — same shared
+      // helper the other ingest paths use. Apify Shopify rows typically
+      // carry the merchant's product_type as p.category; feed truth
+      // handles that as a depth-0 leaf, falling back to the coarse
+      // enum on empty strings. Best-effort — never breaks the sync.
+      if (row && !row.categoryRef) {
+        try {
+          const stamp = await stampFeedTruthCategoryRef({
+            brandId:      brand._id,
+            advertiserId: brand.advertiserId,
+            feedCategory: p.category,
+            title:        p.title
+          });
+          if (stamp) {
+            await CatalogProduct.updateOne(
+              { _id: row._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+              { $set: { categoryRef: stamp.categoryId } }
+            );
+          }
+        } catch (err) {
+          console.warn(`   ⚠️  Apify Shopify category stamp failed for ${p.externalId}: ${err.message}`);
+        }
+      }
+
       if (row && ingestShotClassify.isEnabled()) {
         pendingClassify.push({
           productId: row._id,

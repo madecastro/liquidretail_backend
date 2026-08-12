@@ -12,7 +12,7 @@ const axios = require('axios');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const CatalogProduct = require('../models/CatalogProduct');
 const { decrypt } = require('./integrationCryptoService');
-const { inferCoarseEnum, resolveCoarseCategoryRef, resolveFeedCategoryRef, isFeedTruthCategoriesEnabled } = require('./categoryClassifier');
+const { stampFeedTruthCategoryRef } = require('./categoryClassifier');
 const { startRun, CancelledError } = require('./progressService');
 const { concurrency: CONC } = require('./concurrency');
 
@@ -260,56 +260,29 @@ async function syncCatalogForCred(cred, run = null) {
         else                                          added++;
 
         // Stamp a Category leaf on rows that don't already have a
-        // categoryRef. Owner rule 2026-08-11: FEED TRUTH is the default.
-        // Try the raw feed string first (rich breadcrumb → tree, single
-        // term → depth-0 leaf), so the merchant's own taxonomy becomes
-        // the leaf. Only if feed category is missing/empty do we fall
-        // back to the 9-bucket coarse-enum heuristic. Downstream inferred
-        // paths (JSON-LD scrape, GPT-4.1 brand-nav) now guard on
-        // categoryRef=null so this feed stamp stays authoritative.
-        // Gated by FEED_TRUTH_CATEGORIES — OFF restores the pre-change
-        // path (inferCoarseEnum first, no feed-truth attempt).
+        // categoryRef. Uses the shared stampFeedTruthCategoryRef helper
+        // which applies the owner rule (feed truth first, coarse enum
+        // fallback) across every ingest path. Best-effort — a stamp
+        // failure never breaks a sync.
         const row = result.value || result;
         if (row && !row.categoryRef) {
           try {
-            let stampedRef = null;
-            let stampedSource = null;
-            if (isFeedTruthCategoriesEnabled()) {
-              const feedRef = await resolveFeedCategoryRef({
-                brandId:      cred.brandId,
-                advertiserId: cred.advertiserId,
-                feedCategory: item.category
-              });
-              if (feedRef) {
-                stampedRef    = feedRef.categoryId;
-                stampedSource = feedRef.source;
-              }
-            }
-            if (!stampedRef) {
-              const enumCategory = inferCoarseEnum(item.category, item.name);
-              if (enumCategory) {
-                const coarseRef = await resolveCoarseCategoryRef({
-                  brandId:      cred.brandId,
-                  advertiserId: cred.advertiserId,
-                  enumCategory
-                });
-                if (coarseRef) {
-                  stampedRef    = coarseRef;
-                  stampedSource = 'coarse-enum';
-                }
-              }
-            }
-            if (stampedRef) {
+            const stamp = await stampFeedTruthCategoryRef({
+              brandId:      cred.brandId,
+              advertiserId: cred.advertiserId,
+              feedCategory: item.category,
+              title:        item.name
+            });
+            if (stamp) {
               await CatalogProduct.updateOne(
                 { _id: row._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
-                { $set: { categoryRef: stampedRef } }
+                { $set: { categoryRef: stamp.categoryId } }
               );
-              if (stampedSource !== 'coarse-enum') {
-                console.log(`   ✓ feed-truth category stamped for ${externalId} (${stampedSource})`);
+              if (stamp.source !== 'coarse-enum') {
+                console.log(`   ✓ feed-truth category stamped for ${externalId} (${stamp.source})`);
               }
             }
           } catch (err) {
-            // Best-effort — never let category stamping break a sync.
             console.warn(`   ⚠️  category stamp failed for ${externalId}: ${err.message}`);
           }
         }

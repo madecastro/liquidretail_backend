@@ -229,6 +229,11 @@ function normalizeShopifyProduct(raw) {
     currency:      raw.currency || raw.priceRange?.currency || null,
     availability:  raw.available === false ? 'out of stock' : 'in stock',
     brand:         cleanScrapedText(raw.vendor || raw.brand),
+    // Merchant-authored category string. Apify's Shopify actor mirrors
+    // Shopify's product_type field (same source shopifyPublicIngest-
+    // Service reads). Passed through so apifyIngestService can stamp
+    // categoryRef via stampFeedTruthCategoryRef on upsert.
+    category:      cleanScrapedText(raw.product_type || raw.productType || raw.category) || null,
     handle:        raw.handle || null
   };
 }

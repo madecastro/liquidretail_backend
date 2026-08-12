@@ -16,6 +16,7 @@ const mongoose = require('mongoose');
 const Brand = require('../../models/Brand');
 const CatalogProduct = require('../../models/CatalogProduct');
 const { uploadUrlToCloudinary } = require('../cloudinaryService');
+const { stampFeedTruthCategoryRef } = require('../categoryClassifier');
 
 function slugify(s) {
   return String(s || '')
@@ -127,6 +128,31 @@ async function run({ req, args }) {
 
   const product = result.value;
   const isNew = !result.lastErrorObject?.updatedExisting;
+
+  // Stamp categoryRef via the shared feed-truth helper — same policy
+  // every ingest path applies. Manual creates typically include a
+  // free-form category string (from the agent's args); if empty, the
+  // helper falls back to the coarse enum via title heuristics.
+  if (product && !product.categoryRef) {
+    try {
+      const stamp = await stampFeedTruthCategoryRef({
+        brandId:      brand._id,
+        advertiserId: req.advertiserId,
+        feedCategory: category,
+        title:        title
+      });
+      if (stamp) {
+        await CatalogProduct.updateOne(
+          { _id: product._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+          { $set: { categoryRef: stamp.categoryId } }
+        );
+      }
+    } catch (err) {
+      // Non-fatal — the row is already saved; missing categoryRef
+      // just leaves the row uncategorized until a later stamp / match.
+      console.warn(`   ⚠️  catalog.createProduct category stamp failed: ${err.message}`);
+    }
+  }
 
   return {
     ok: true,

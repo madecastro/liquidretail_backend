@@ -213,11 +213,55 @@ function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Unified categoryRef stamper — same policy every ingest path applies
+// on upsert: feed truth first when enabled, coarse enum as fallback.
+// Returns { categoryId, source } on success or null when neither path
+// resolves. Never throws — a stamp failure at any tier returns null
+// and the caller logs + moves on (matches the historical best-effort
+// pattern in catalogSyncService).
+//
+// USAGE:
+//   const ref = await stampFeedTruthCategoryRef({
+//     brandId, advertiserId, feedCategory: row.category, title: row.title
+//   });
+//   if (ref) {
+//     await CatalogProduct.updateOne(
+//       { _id: doc._id, $or: [{ categoryRef: null }, { categoryRef: { $exists: false } }] },
+//       { $set: { categoryRef: ref.categoryId } }
+//     );
+//   }
+//
+// The null-guard on the update is what makes this idempotent across
+// re-syncs — an inferred stamp (JSON-LD scrape, GPT-4.1 brand-nav)
+// that landed between syncs stays authoritative, matching the owner
+// rule that feed truth is the DEFAULT but doesn't clobber a later
+// higher-signal inference. If you WANT to overwrite (e.g. a
+// dedicated backfill), skip the null-guard.
+async function stampFeedTruthCategoryRef({ brandId, advertiserId = null, feedCategory, title }) {
+  if (!brandId) return null;
+  // Tier 1 — feed truth from the raw feed string (rich breadcrumb or
+  // single term). Gated by FEED_TRUTH_CATEGORIES so ops can revert.
+  if (isFeedTruthCategoriesEnabled()) {
+    const feedRef = await resolveFeedCategoryRef({ brandId, advertiserId, feedCategory });
+    if (feedRef) return feedRef;
+  }
+  // Tier 2 — 9-bucket coarse enum. Historic behaviour when the feed
+  // string doesn't parse into anything; still useful for search + the
+  // pre-match filter's subtree scan.
+  const enumCategory = inferCoarseEnum(feedCategory, title);
+  if (enumCategory) {
+    const coarseRef = await resolveCoarseCategoryRef({ brandId, advertiserId, enumCategory });
+    if (coarseRef) return { categoryId: coarseRef, source: 'coarse-enum' };
+  }
+  return null;
+}
+
 module.exports = {
   ENUM_TO_COARSE_BREADCRUMB,
   inferCoarseEnum,
   resolveCoarseCategoryRef,
   resolveFeedCategoryRef,
+  stampFeedTruthCategoryRef,
   isFeedTruthCategoriesEnabled,
   getCoarseBreadcrumb,
   getCoarseSubtreeIds
