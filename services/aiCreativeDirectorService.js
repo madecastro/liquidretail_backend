@@ -889,6 +889,45 @@ function isPmaxPlatformFormat(platformFormat) {
   return typeof platformFormat === 'string' && platformFormat.startsWith('pmax_');
 }
 
+// PMAX_SPLIT_VIDEO — Stage 1 kill switch (default OFF) for the split-stage
+// 16:9 PMax video unit: product anchored to one side of frame, the OTHER
+// side generatively extended to carry copy (side geometry lives in the pure
+// services/pmaxSplitStrategy.js, not here). Stage 1 only adds the
+// Director's routing.panelTreatment field to the PMax-VIDEO prompt/schema —
+// gating that addition on this flag means every existing PMax video round's
+// prompt + schema text stay BYTE-IDENTICAL until the flag is deliberately
+// flipped on, the same "ship dark, cost nothing by default" posture
+// DIRECTOR_PROOF_MENU_ENABLED already established above for the proof menu.
+function pmaxSplitVideoEnabled() {
+  return String(process.env.PMAX_SPLIT_VIDEO ?? 'false').toLowerCase() === 'true';
+}
+
+// scene_extend — the seed is a real environment worth continuing sideways.
+// brand_panel  — the seed is a clean studio backdrop with no scene to
+//                continue, so a solid brand-colour panel reads more premium
+//                than an invented continuation of nothing.
+// Legibility of the copy is deliberately NOT part of this decision: the
+// renderer places and sizes text on the panel deterministically regardless
+// of which treatment wins, so asking the Director to weigh it would only
+// be asking it to guess at layout math it cannot see and does not control.
+const PANEL_TREATMENT_VALUES = Object.freeze(['scene_extend', 'brand_panel']);
+
+/**
+ * Director's panelTreatment choice for the PMax split-stage video panel, or
+ * null. Dual-reads via conceptField (routing.panelTreatment first, flat
+ * fallback) so a Director round recorded BEFORE this field existed — every
+ * round before this stage shipped, and every Meta/non-video round, which
+ * never asks for it (see isPmaxSplitVideo in buildResponseSchemaRound) —
+ * degrades to null instead of surfacing an undefined/garbage value.
+ *
+ * @param {object|null|undefined} concept
+ * @returns {'scene_extend'|'brand_panel'|null}
+ */
+function panelTreatmentFromConcept(concept) {
+  const v = conceptField(concept, 'panelTreatment');
+  return PANEL_TREATMENT_VALUES.includes(v) ? v : null;
+}
+
 /**
  * Read a numeric threshold from the environment, falling back to the default
  * when it is unset, blank, or unparseable.
@@ -927,6 +966,21 @@ function buildPmaxFunnelSpreadBlock() {
     `  consideration — benefit + proof (reviews, ratings, differentiators, objection handling). Set routing.funnel_stage="consideration".`,
     `  conversion    — offer / urgency / explicit action; product hero and clean. Set routing.funnel_stage="conversion".`,
     `Each concept MUST declare routing.funnel_stage as one of ${PMAX_FUNNEL_STAGES.join('|')}. Across the round, the three stages must each appear exactly once so Google has distinct approaches to test — not cosmetic variations of one ad.`
+  ].join('\n');
+}
+
+// PMax split-stage 16:9 video only (isPmaxSplitVideo — narrower than the
+// isPmax gate above, which also covers PMax IMAGE formats where there is no
+// panel to choose a treatment for). Spliced only when PMAX_SPLIT_VIDEO is on
+// AND the destination is a pmax_video_* key, same double-gate as the schema
+// property below, so this contributes zero characters everywhere else.
+function buildPmaxPanelTreatmentBlock() {
+  return [
+    `PMAX SPLIT-STAGE VIDEO PANEL (this destination anchors the product to one side of a 16:9 frame and generatively extends the OTHER side to carry copy):`,
+    `Set routing.panelTreatment to the ONE treatment that fits the seed imagery:`,
+    `  scene_extend — the seed is a rich/lifestyle scene (real environment, props, depth) that could plausibly continue sideways without inventing an implausible new setting.`,
+    `  brand_panel  — the product sits on a clean flat studio backdrop (seamless paper, plain colour, no environment) with no real scene to extend — a solid brand-colour panel reads more premium than an invented continuation.`,
+    `Do NOT weigh legibility when choosing — the renderer places and sizes the panel's copy deterministically regardless of which treatment you pick; your only job is judging which treatment fits what the seed actually shows.`
   ].join('\n');
 }
 
@@ -2189,6 +2243,18 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
   // never match, so Meta system/user prompts stay byte-identical.
   const isPmax = isPmaxPlatformFormat(platformFormat);
 
+  // Narrower than isPmax: also requires (a) a pmax_video_* destination, not
+  // a PMax image format, since there is no split-stage panel outside video,
+  // and (b) PMAX_SPLIT_VIDEO=true, so Stage 1 landing this file does not by
+  // itself change a single byte of any live PMax video round's prompt.
+  // isPmaxVideoDestination lives in veoPromptBuilder (the video prompt
+  // builder already owns "is this a PMax video destination"); required
+  // inline rather than hoisted so a Meta-only prompt build never pays for
+  // the require.
+  const isPmaxSplitVideo = isPmax &&
+    require('./veoPromptBuilder').isPmaxVideoDestination(platformFormat) &&
+    pmaxSplitVideoEnabled();
+
   const system = [
     `You are a senior creative director planning social-media ad creative.`,
     ``,
@@ -2206,6 +2272,12 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       buildPmaxFunnelSpreadBlock(),
       ``,
       buildPmaxSocialProofHierarchyBlock(),
+      ``
+    ] : []),
+    // Split-stage panel treatment — PMax VIDEO only (see isPmaxSplitVideo
+    // above), so this never touches a Meta or PMax-image prompt.
+    ...(isPmaxSplitVideo ? [
+      buildPmaxPanelTreatmentBlock(),
       ``
     ] : []),
     `STRUCTURAL RULES (absolute — violating these ships broken ads):`,
@@ -2338,6 +2410,11 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     // is gated the same way.
     ...(isPmax ? [
       `    funnel_stage     — awareness | consideration | conversion (declare which stage this concept serves; one of each across the round)`
+    ] : []),
+    // PMax split-stage VIDEO only — see isPmaxSplitVideo above. Absent from
+    // both the PMax-image and Meta per-concept listings.
+    ...(isPmaxSplitVideo ? [
+      `    panelTreatment   — ${PANEL_TREATMENT_VALUES.join(' | ')} (which treatment the generatively-extended copy panel should use; see PMAX SPLIT-STAGE VIDEO PANEL above)`
     ] : []),
     `  copy                — { headline, subheadline, eyebrow, cta } final strings (nullable per role) — ONLY letterforms`,
     `  art_direction       — null OR { look, palette_hint, typography_hint } visual prose only; null if no visual brief`,
@@ -2536,6 +2613,13 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
   // reads any name — listing it in ROUTING_NESTED_FIELDS is documentation-only
   // for that module and is out of scope for this change).
   const isPmax = isPmaxPlatformFormat(platformFormat);
+  // panelTreatment is narrower still — PMax VIDEO only, and only once
+  // PMAX_SPLIT_VIDEO is on (see pmaxSplitVideoEnabled's comment). Required
+  // inline (not hoisted) for the same reason buildPromptRound does it inline:
+  // a Meta/PMax-image schema build never pays for the require.
+  const isPmaxSplitVideo = isPmax &&
+    require('./veoPromptBuilder').isPmaxVideoDestination(platformFormat) &&
+    pmaxSplitVideoEnabled();
   const routingSchema = {
     type: 'object',
     additionalProperties: false,
@@ -2543,7 +2627,19 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
       'archetype', 'layout_family', 'emotional_hook', 'social_proof_type',
       'product_priority', 'ugc_priority', 'comment_priority', 'stat_priority',
       'cta_emphasis', 'creative_style', 'recommended_components',
-      'media_picks', 'output_shape'
+      'media_picks', 'output_shape',
+      // panelTreatment is nullable (see property def below) but — unlike
+      // proof_pick / funnel_stage above — IS listed in `required` whenever
+      // the property itself is offered. That matches real OpenAI strict-mode
+      // semantics (every declared property must be required; nullability is
+      // how "optional" is expressed) rather than this file's older
+      // soft-validator convention of omitting optional-nullable fields from
+      // `required`. Both conditions must travel together: a property present
+      // in `properties` without a matching `required` entry — or vice versa —
+      // makes schemaErrors() either silently accept a missing field with no
+      // nullable escape hatch, or flag every Meta/PMax-image round as missing
+      // a field it was never asked to emit.
+      ...(isPmaxSplitVideo ? ['panelTreatment'] : [])
     ],
     properties: {
       archetype:         { type: 'string', enum: AVAILABLE_ARCHETYPES },
@@ -2592,6 +2688,13 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
       // byte-identical on the schema side too.
       ...(isPmax ? {
         funnel_stage: { type: ['string', 'null'], enum: [...PMAX_FUNNEL_STAGES, null] }
+      } : {}),
+      // PMax split-stage VIDEO only — see isPmaxSplitVideo above. Nullable
+      // AND listed in `required` (unlike funnel_stage/proof_pick) — see the
+      // comment on `required` above for why this field intentionally follows
+      // the stricter convention.
+      ...(isPmaxSplitVideo ? {
+        panelTreatment: { type: ['string', 'null'], enum: [...PANEL_TREATMENT_VALUES, null] }
       } : {})
     }
   };
@@ -2821,6 +2924,11 @@ module.exports = {
   directorProofMenuEnabled,
   safeParseDirectorJSON,
   extractFirstBalancedObject,
+  // PMax split-stage video (Stage 1 — Director field only, see
+  // services/pmaxSplitStrategy.js for the side-choice geometry)
+  pmaxSplitVideoEnabled,
+  panelTreatmentFromConcept,
+  PANEL_TREATMENT_VALUES,
   // money: roundIndex insert-race helpers (verifyDirectorRoundPersist)
   ROUND_ARTIFACT_INSERT_MAX_ATTEMPTS,
   isRoundIndexDuplicateKeyError,

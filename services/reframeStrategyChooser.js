@@ -215,6 +215,14 @@ function chooseStrategy({ media, aspectRatio, sourceUrl }) {
 module.exports = {
   chooseStrategy,
   isCropFirstEnabled,
+  // Promoted from __test-only to a real consumer-facing export: the PMax
+  // split-stage video decision layer (services/pmaxSplitStrategy.js) needs
+  // the same YOLO subject-union math to decide which side of the frame the
+  // product occupies, and re-deriving it there would let the two paths
+  // silently disagree about what counts as "the subject" on the same Media
+  // doc. __test.subjectUnionBbox below is left in place, unchanged, so
+  // scripts/verifyReframeStrategy.js keeps working without modification.
+  subjectUnionBbox,
   // Exported for scripts/verifyReframeStrategy.js — pure helpers so the
   // harness can drive them with fixtures rather than mock Mongoose.
   __test: {
