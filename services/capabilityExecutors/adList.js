@@ -12,6 +12,11 @@
 const mongoose = require('mongoose');
 const Ad = require('../../models/Ad');
 const Brand = require('../../models/Brand');
+// Same joins the /api/ads endpoint uses to hydrate photorealUrl (the
+// gpt-image-1 polish) + the campaign-level useImageRefAsProduction
+// flag. Copying those into the agent's ad.list response keeps the
+// AdThumbnail render logic identical across every surface.
+const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../adDisplayUrlService');
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -52,8 +57,22 @@ async function run({ req, args }) {
     Ad.find(filter)
       .sort({ createdAt: -1 })
       .limit(limit)
-      .select('_id kind template aspectRatio platformFormat status renderUrl productId campaignId createdAt updatedAt renderedAt metaSyncStatus')
+      // Wider projection so the agent's ad list can render with the
+      // same AdThumbnail + AdDetailModal the Product Ads / UGC Ads /
+      // Campaign Detail pages use. Kind/template/status/renderUrl were
+      // the original set; the rest (posterUrl, copy, ctaText, variant-
+      // Kind, mediaId, approved*, regeneration*, meta*, sourceFileType)
+      // are what the shared frontend components read.
+      .select('_id kind template aspectRatio platformFormat status renderUrl posterUrl copy ctaText productId campaignId createdAt updatedAt renderedAt metaSyncStatus metaAdId metaAdsetId variantKind mediaId sourceFileType approved approvedAt regenerating regenerationStage regenerationHistory aiCanvasArtifactId')
       .lean()
+  ]);
+
+  // Same photorealUrl / useImageRefAsProduction join /api/ads does so
+  // the frontend picks the right display URL for image ads (Phase B
+  // polish is preferred when populated).
+  const [photorealMap, useImageRefMap] = await Promise.all([
+    loadPhotorealUrlMap(ads),
+    loadUseImageRefMap(ads)
   ]);
 
   return {
@@ -73,11 +92,29 @@ async function run({ req, args }) {
         platformFormat: a.platformFormat,
         status:         a.status,
         renderUrl:      a.renderUrl || null,
+        posterUrl:      a.posterUrl || null,
+        photorealUrl:   photorealMap.get(String(a._id)) || null,
+        useImageRefAsProduction: a.campaignId
+          ? !!useImageRefMap.get(String(a.campaignId))
+          : false,
+        copy:           a.copy || {},
+        ctaText:        a.ctaText || null,
         productId:      a.productId ? String(a.productId) : null,
         campaignId:     a.campaignId ? String(a.campaignId) : null,
+        variantKind:    a.variantKind || null,
+        mediaId:        a.mediaId ? String(a.mediaId) : null,
+        sourceFileType: a.sourceFileType || null,
+        approved:       !!a.approved,
+        approvedAt:     a.approvedAt || null,
+        regenerating:   !!a.regenerating,
+        regenerationStage: a.regenerationStage || null,
+        regenerationHistory: Array.isArray(a.regenerationHistory) ? a.regenerationHistory : [],
         createdAt:      a.createdAt,
         renderedAt:     a.renderedAt || null,
         updatedAt:      a.updatedAt || null,
+        metaSyncStatus: a.metaSyncStatus || null,
+        metaAdId:       a.metaAdId || null,
+        metaAdsetId:    a.metaAdsetId || null,
         metaSynced:     a.metaSyncStatus === 'synced'
       }))
     }
