@@ -114,9 +114,26 @@ function loadSentimentJudge(label) {
     // Reusing the selector means intake and selection cannot disagree: nothing is
     // stored that the render path would refuse to print, and nothing is refused at
     // print that intake thought was fine.
-    const { pickStrongestQuote } = require('../layoutInputService');
-    if (typeof pickStrongestQuote !== 'function') return null;
-    return (text) => pickStrongestQuote([{ text }]) !== null;
+    // INTAKE STORES, SELECTION CHOOSES — two different questions, and using the
+    // selector for both was wrong.
+    //
+    // This called pickStrongestQuote, which applies SCORE_FLOOR. That floor exists to
+    // stop a weak quote WINNING WHEN A BETTER ONE EXISTS — a ranking question. Used as
+    // an intake gate it meant generic praise was never STORED at all, so a brand whose
+    // reviews are all "Love it, great product." ended up with an empty pool and no
+    // testimonial anywhere. Owner, 2026-08-11: *"in the absence of any other social
+    // proof, generic praise is better than nothing, but hopefully we have many many
+    // more choices than that."*
+    //
+    // So intake keeps anything that genuinely reads as PRAISE and is not disqualified,
+    // and pickStrongestQuote does the ranking at selection time with its own last-resort
+    // tier. Mediocre and negative are still refused here, by the same two mechanisms as
+    // before: hasPositiveSignal rejects neutral description and promotional lines, and a
+    // non-finite scoreQuote rejects hard limiters, negated positives and negative
+    // sentiment. Nothing that could hurt an ad is admitted; unspecific praise is.
+    const { hasPositiveSignal, scoreQuote } = require('../layoutInputService');
+    if (typeof hasPositiveSignal !== 'function' || typeof scoreQuote !== 'function') return null;
+    return (text) => hasPositiveSignal(text) && Number.isFinite(scoreQuote(text));
   } catch (err) {
     console.warn(`   ⚠️  ${label}: sentiment judge unavailable (${err.message}) — every quote will be dropped rather than shipped unjudged`);
     return null;

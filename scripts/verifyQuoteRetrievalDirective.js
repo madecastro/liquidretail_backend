@@ -605,21 +605,24 @@ console.log('S. Mediocre and negative stop at intake (OWNER DIRECTIVE 2026-08-11
 // stored as ad-usable, counted toward the pool, and shown in the brand UI. All four
 // strings below are REAL retrieved quotes that passed retrieval.
 const MEDIOCRE_REAL = [
-  'All clothes, including the workout shorts, have a slim, tailored fit.',
+  // RECLASSIFIED 2026-08-11 — "All clothes, including the workout shorts, have a slim,
+  // tailored fit." was in this list and the owner corrected it: *"'slim tailored fit'
+  // is a positive not neutral."* In apparel that sentence IS the compliment. It moved
+  // to CLEAR_PRAISE below; the lexicon gained the fit-craft words to match.
   'The fit around the leg is just loose and casual enough to not feel oversized and baggy but not skin tight like a legging.',
   'They go on flash sale and/or 20% off.',
   'Ripstop Climber pants have a bold, stylish taper.',
-  // Short generic praise. These DO contain positive lexemes ("comfortable", "durable",
-  // "great") and so pass hasPositiveSignal — they are rejected because the intake bar is
-  // the render path's full selector, whose score floor is what actually catches
-  // mediocrity. They are the cases that prove the bar is more than a word list.
-  'Super comfortable and durable fabrics.',
-  'Great fit, and lightweight.',
+  // NOTE: short generic praise ("Super comfortable and durable fabrics.", "Great fit,
+  // and lightweight.") used to sit in this list and is deliberately NOT here any more.
+  // Owner 2026-08-11: generic praise beats an empty slot. It is now STORED and simply
+  // ranked last — see X6, which pins that it can never beat a specific quote.
   // Contains "best", passes hasPositiveSignal, and argues against the sale. Caught by
   // HARD_LIMITER inside scoreQuote — unreachable if the screen used the word list alone.
   'This is a low-support option best suited for lighter activities.',
 ];
 const CLEAR_PRAISE = [
+  // Owner-corrected: fit CRAFT is praise, not description.
+  'All clothes, including the workout shorts, have a slim, tailored fit.',
   'Awesome High Quality Hat! Recently purchased a couple of Offshore caps. The quality and fit are amazing!',
   'These are literally my favorite pants ever. They are so soft and so lightweight it feels like wearing no pants.',
   'The quality is amazing and the pair I have feel like second skin.',
@@ -665,17 +668,20 @@ check('S5 it FAILS CLOSED — no judge means no quotes, never unjudged quotes', 
 check('S6 the bar IS the render path selector, reused not reimplemented', () => {
   const judge = loadSentimentJudge('s6');
   assert.strictEqual(typeof judge, 'function', 'the judge must resolve');
-  // Behavioural equivalence with the SHIPPED selector. A copy would drift, and drift
-  // means storing quotes the render path will refuse — or refusing ones it would take.
-  const { pickStrongestQuote } = require('../services/layoutInputService');
+  // INTAKE IS NOT THE SELECTOR, deliberately. Intake decides what to STORE; selection
+  // decides what to PRINT. Equating them meant generic praise was never stored, leaving
+  // brands with an empty pool. What must hold is that intake reuses the render path's
+  // OWN definitions — never a private copy — so the two cannot disagree about what is
+  // positive or what is disqualified.
+  const { hasPositiveSignal, scoreQuote } = require('../services/layoutInputService');
   for (const t of MEDIOCRE_REAL.concat(CLEAR_PRAISE)) {
-    assert.strictEqual(judge(t), pickStrongestQuote([{ text: t }]) !== null,
-      `intake disagrees with selection on: ${JSON.stringify(t.slice(0, 50))}`);
+    assert.strictEqual(judge(t), hasPositiveSignal(t) && Number.isFinite(scoreQuote(t)),
+      `intake must equal "praise AND not disqualified" on: ${JSON.stringify(t.slice(0, 50))}`);
   }
   const region = provSrc.slice(provSrc.indexOf('function loadSentimentJudge'),
                                provSrc.indexOf('function screenAdUsableSentiment'));
-  assert.ok(/pickStrongestQuote/.test(region),
-    'the judge must be the render path selector, not a private notion of positive');
+  assert.ok(/hasPositiveSignal/.test(region) && /scoreQuote/.test(region),
+    'the judge must come from the render path, not a private notion of positive');
   assert.ok(!/\/[^\n]*(love|great|amazing|soft)[^\n]*\/[gimsuy]*\.test/i.test(region),
     'a local sentiment regex must not shadow the shared selector');
 });
@@ -869,6 +875,56 @@ check('X4 mediocre and limiter cases are UNAFFECTED by the wider lexicon', () =>
     const out = quiet(() => keepVerbatimQuotes([{ text: t }], `narrative: ${t}`, 'x4'));
     assert.strictEqual(out.length, 0, `widening the lexicon must not open this: ${JSON.stringify(t.slice(0,48))}`);
   }
+});
+
+
+check('X5 fit CRAFT counts as praise, bare fit FACTS still do not', () => {
+  const { hasPositiveSignal } = require('../services/layoutInputService');
+  // The owner's correction: how a garment is CUT is a compliment.
+  for (const t of ['a slim, tailored fit', 'beautifully tailored and well fitting', 'streamlined cut']) {
+    assert.strictEqual(hasPositiveSignal(t), true, `fit craft should read as praise: ${t}`);
+  }
+  // But the words that describe SIZING rather than craft stay out — "runs slim" and
+  // "too fitted" are complaints, and HARD_LIMITER already owns "runs small|narrow|tight".
+  for (const t of ['True to size', 'Holds its shape', 'the shorts run slim']) {
+    assert.strictEqual(hasPositiveSignal(t), false, `a sizing fact is not praise: ${t}`);
+  }
+});
+check('X6 generic praise is a LAST RESORT, never a first choice', () => {
+  // Owner: "in the absence of any other social proof, generic praise is better than
+  // nothing, but hopefully we have many many more choices than that."
+  const { pickStrongestQuote } = require('../services/layoutInputService');
+  const generic  = { text: 'Love it, great product.' };
+  const specific = { text: 'I bought these in March and have worn them weekly since — still soft.' };
+  // Alone, it prints rather than leaving the slot empty.
+  assert.ok(quiet(() => pickStrongestQuote([generic])), 'generic praise must beat an empty slot');
+  // Beside anything specific, it loses.
+  assert.strictEqual(quiet(() => pickStrongestQuote([generic, specific])).text, specific.text,
+    'a specific quote must always outrank generic praise');
+});
+check('X7 the last resort never admits negative or limiter content', () => {
+  // The floor was relaxed for UNSPECIFIC praise only. Everything scoreQuote disqualifies
+  // outright stays at -Infinity and must remain unreachable.
+  const { pickStrongestQuote } = require('../services/layoutInputService');
+  const bad = [
+    { text: 'The fabric pilled after two washes and I returned it.' },
+    { text: 'This is a low-support option best suited for lighter activities.' },
+    { text: 'Not as soft as I had hoped for the price.' },
+  ];
+  assert.strictEqual(quiet(() => pickStrongestQuote(bad)), null,
+    'relaxing the floor must not reopen the disqualifiers');
+
+  // NEUTRAL-BUT-SCOREABLE is the case that actually exercises the praise requirement.
+  // Everything above sits at -Infinity, and -Infinity can never win a `>` comparison,
+  // so those three would be excluded even with the guards removed — they prove the
+  // disqualifiers hold, not that the last-resort tier checks anything. A line that
+  // scores a real number while reading as pure description is what distinguishes them.
+  const neutral = [
+    { text: 'The shorts have a mesh liner and a zip pocket on the back right side.' },
+    { text: 'Shipping was quick and the box arrived on a Tuesday afternoon.' },
+  ];
+  assert.strictEqual(quiet(() => pickStrongestQuote(neutral)), null,
+    'the last resort is for unspecific PRAISE — description with no praise is not proof');
 });
 
 const total = pass + fail;
