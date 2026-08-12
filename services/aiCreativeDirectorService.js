@@ -148,7 +148,15 @@ function scoreQuoteSafe(text) {
   if (!_scoreQuote) return 0;
   try {
     const n = _scoreQuote(String(text || ''));
-    return Number.isFinite(n) ? n : 0;
+    if (Number.isFinite(n)) return n;
+    // -Infinity IS A VERDICT, NOT A MISSING VALUE. The scorer returns it for
+    // hard limiters and negative sentiment ("broke after one day"). Collapsing
+    // it to 0 ranked those level with merely-generic praise and ABOVE anything
+    // scoring -1 or -2 — so the ranking meant to demote junk was promoting the
+    // worst class of it into the Director's top-4. Map it to a floor that keeps
+    // it last instead. Any other non-finite result is a scorer malfunction, not
+    // a judgement, so it degrades to neutral.
+    return n === -Infinity ? Number.NEGATIVE_INFINITY : 0;
   } catch {
     return 0;
   }
@@ -884,9 +892,17 @@ function normalizeProductSpecs(raw) {
     // A value that is itself an object/array is a nesting level we do not
     // understand — skip rather than stringify it into noise.
     if (value != null && typeof value === 'object') return;
+    // Same rule for the LABEL, which was the asymmetry: the value was guarded
+    // and the label was not, so a localised label — `{ label: { en: 'Material' },
+    // value: 'Cotton' }`, a real Immersive shape — reached the brief as
+    // "[object Object]: Cotton". A label we cannot read is better dropped than
+    // shown: the value alone is still usable copy material.
+    const labelIsUnusable = label != null && typeof label === 'object';
     const v = snippetText(value == null ? null : String(value), MAX_SPEC_VALUE);
     if (!v) return;
-    const l = snippetText(label == null ? null : String(label), MAX_SPEC_LABEL);
+    const l = labelIsUnusable
+      ? null
+      : snippetText(label == null ? null : String(label), MAX_SPEC_LABEL);
     // A bare string spec (no label) is still useful — keep it label-less.
     rows.push(l ? { label: l, value: v } : { label: null, value: v });
   };
@@ -2506,7 +2522,18 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     // Immersive specification data that until now reached nothing in the ad
     // pipeline despite being loaded on every call.
     `- GROUNDING — write each concept's copy FROM a named source, chosen to suit its creative_style:`,
-    `    social_proof_led  → a specific quote from social_proof_signal.proof_options[].quotes, or a scoped number. Paraphrase or excerpt honestly; keep the reviewer's own concrete detail rather than flattening it to "great quality".`,
+    // TIER MATTERS FOR QUOTES, NOT JUST FOR NUMBERS — and the existing scope
+    // rule only covered numbers. proof_options deliberately surfaces category
+    // and brand tiers even on a product-scoped run, and brand quotes are
+    // withheld from primary_quote precisely because they may describe a
+    // DIFFERENT SKU. Telling the model to "write from the quote pool" without
+    // saying which tier is safe to quote AS this product re-opens that by the
+    // front door, and the pool is now twice the size. A brand-tier line about
+    // another garment, repeated verbatim as this product's testimonial, is a
+    // false claim about a real product — the one failure here that is worse
+    // than a repeated slogan.
+    `    social_proof_led  → a specific quote, PRODUCT TIER FIRST. Only proof_options[] entries with tier="product" describe THIS item and may be quoted or paraphrased as its testimonial. Paraphrase or excerpt honestly; keep the reviewer's own concrete detail rather than flattening it to "great quality".`,
+    `    social_proof_led (no product-tier quote available) → do NOT promote a category or brand quote into this product's voice: those may describe a different item in the catalogue. Use the tier's scoped NUMBER instead (proof_options[].reviews_text, already phrased for its tier), or switch this concept to a spec or brand-voice angle. Never attribute another SKU's words to this one.`,
     `    ugc_led           → a quote or a top_comment, in the reviewer's/creator's own register — first person, casual, unpolished. Not marketing voice.`,
     `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold.`,
     `    brand_led         → brand_signal (tone, summary, tagline). This is the ONLY style that should lean on brand voice — it is the fallback of last resort for every other style, not their first move.`,
