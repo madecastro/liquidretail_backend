@@ -1366,7 +1366,26 @@ const MODERATE_POSITIVE = /\b(great|excellent|high[- ]?quality|top[- ]?notch|fir
 // does the real work: scoreQuote's SCORE_FLOOR rejects short generic filler, and the
 // static typeset judge additionally requires several words, so "Soft." cannot become a
 // testimonial on its own.
-const SENSORY_POSITIVE = /\b(soft|softer|softest|breathable|flattering|supportive|buttery|plush|cushion(ed|y)?|cool(ing)?|stretchy|weightless)\b/gi;
+// FIT-QUALITY DESCRIPTORS ARE PRAISE TOO (owner, 2026-08-11: *"'slim tailored fit'
+// is a positive not neutral"*). The lexicon had sensory words but nothing for how a
+// garment is CUT, so "All clothes, including the workout shorts, have a slim, tailored
+// fit." read as a neutral description and was dropped at intake. In apparel that
+// sentence is the compliment.
+//
+// "slim" and "fitted" are deliberately NOT here on their own — "runs slim" / "too
+// fitted" are complaints, and HARD_LIMITER already owns the "runs small|narrow|tight"
+// family. It is the CRAFT words that carry the praise.
+// ONE list, used by BOTH the positivity lexicon and the negation guard below.
+//
+// It was two, and that was a live defect: #150 added these words to the positivity
+// side without touching NEGATED_POSITIVE, so "Not as soft as I had hoped for the
+// price." scored +1 and read as PRAISE — a complaint eligible for a paid ad. Any word
+// that can make a line positive must also be a word that a negator can invert, so the
+// two are now derived from the same string and cannot drift apart again.
+const SENSORY_WORDS = 'soft|softer|softest|breathable|flattering|supportive|buttery|plush'
+  + '|cushion(?:ed|y)?|cool(?:ing)?|stretchy|weightless|tailored|well[- ]?fitting'
+  + '|well[- ]?cut|streamlined|sculpted';
+const SENSORY_POSITIVE = new RegExp(`\\b(?:${SENSORY_WORDS})\\b`, 'gi');
 
 // STILL SCORING ONLY: these state a fact about fit, they do not praise.
 const SCORING_POSITIVE = /\b(soft|softer|softest|breathable|flattering|supportive|true to size|holds? (?:its )?shape)\b/gi;
@@ -1447,7 +1466,15 @@ const REPORTED_SPEECH_PENALTY = Number(process.env.QUOTE_REPORTED_SPEECH_PENALTY
 // lexeme list here is broader than the scoring regexes above so mild
 // negations ("not the best", "not great") still trip the gate — a
 // review that leads with any negation of praise shouldn't headline an ad.
-const NEGATED_POSITIVE = /\b(not|no|never|hardly|barely|isn'?t|wasn'?t|aren'?t|weren'?t|don'?t|doesn'?t|didn'?t|won'?t|wouldn'?t|couldn'?t|shouldn'?t|can'?t|cannot|nothing)\s+(\w+\s+){0,3}?(love[ds]?|worth|recommend|great|amazing|good|perfect|impressed|impressive|happy|satisfied|pleased|worth it|best|excellent|comfortable|nice|beautiful|quality|fit|impressed|wow|thrilled|delighted|enough)\b/i;
+// SENSORY_WORDS is spliced in on purpose — see the note there. A negator in front of
+// any word that can carry praise has to invert it, or the praise lexicon becomes a way
+// for complaints to score.
+const NEGATED_POSITIVE = new RegExp(
+  "\\b(not|no|never|hardly|barely|isn'?t|wasn'?t|aren'?t|weren'?t|don'?t|doesn'?t|didn'?t"
+  + "|won'?t|wouldn'?t|couldn'?t|shouldn'?t|can'?t|cannot|nothing)\\s+(\\w+\\s+){0,3}?"
+  + "(love[ds]?|worth|recommend|great|amazing|good|perfect|impressed|impressive|happy"
+  + "|satisfied|pleased|worth it|best|excellent|comfortable|nice|beautiful|quality|fit"
+  + "|wow|thrilled|delighted|enough|" + SENSORY_WORDS + ")\\b", 'i');
 
 // Complaint / product-defect / disappointment lexicon. Structural
 // (not brand-specific): mentions of returns, refunds, defects,
@@ -1764,8 +1791,35 @@ function pickStrongestQuote(candidates, opts = {}) {
       best = q;
     }
   }
-  if (!best || bestScore < SCORE_FLOOR) return null;
-  return hasPositiveSignal(best.text) ? best : null;
+  // PREFERRED TIER: cleared the floor AND reads as praise.
+  if (best && bestScore >= SCORE_FLOOR && hasPositiveSignal(best.text)) return best;
+
+  // LAST RESORT — "in the absence of any other social proof, generic praise is better
+  // than nothing" (owner, 2026-08-11).
+  //
+  // SCORE_FLOOR's job is to stop a weak quote winning WHEN A BETTER ONE EXISTS. It was
+  // also, silently, deciding that a brand whose pool is nothing but "Love it, great
+  // product." gets NO testimonial at all — that line scores -5.5 because generic praise
+  // is penalised for being generic, which is correct RANKING and wrong as a veto.
+  //
+  // This does not reopen the mediocre/negative gate. The candidate must still clear
+  // hasPositiveSignal, and everything scoreQuote disqualifies outright stays at
+  // -Infinity and is unreachable here: hard limiters, negated positives, and negative
+  // sentiment. What gets through is praise that is merely unspecific — which is exactly
+  // what the owner said beats an empty slot.
+  let fallback = null;
+  let fallbackScore = -Infinity;
+  for (const q of pool) {
+    if (!q?.text) continue;
+    const score = scoreQuote(q.text, opts);
+    if (!Number.isFinite(score)) continue;          // disqualified stays disqualified
+    if (!hasPositiveSignal(q.text)) continue;       // still has to read as praise
+    if (score > fallbackScore) { fallbackScore = score; fallback = q; }
+  }
+  if (fallback) {
+    console.log(`   · quote: nothing cleared the quality floor — falling back to the best available praise (score ${fallbackScore.toFixed(1)})`);
+  }
+  return fallback;
 }
 
 // "Does this text express praise" — NOT "does it contain a positive word".
