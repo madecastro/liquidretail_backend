@@ -16,7 +16,7 @@ import { BasePlate } from '../components/BasePlate.jsx';
 import { useBrandFonts } from '../components/FontLoader.jsx';
 import { SLOT_RENDERERS } from '../components/slotRenderers.jsx';
 import { slotEnvelope, slotProgress, specTimeScale } from '../lib/timing.js';
-import { stackContainerStyle, resolveSafeZone, resolveSafeZoneKey } from '../lib/safeZones.js';
+import { stackContainerStyle, panelColumnStyle, resolveSafeZone, resolveSafeZoneKey } from '../lib/safeZones.js';
 import { contrastToken } from '../lib/tokens.js';
 import { resolveSlotContent } from '../lib/slotContent.js';
 import { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
@@ -272,7 +272,12 @@ function foldRows(items) {
 
 const ALIGN_TO_FLEX = { left: 'flex-start', center: 'center', right: 'flex-end' };
 
-export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat = null, plate, meta = {}, tokens = {}, spec, plateHints = null, debugLayout = false }) => {
+// panelSide: optional 'west'|'east' for PMax 16:9 split-stage. When ABSENT the
+// stack is byte-identical to the pre-split path (full-width vertical band).
+// When present AND format==='landscape', each group renders inside the reserved
+// panel column (panelColumnStyle) — WHERE the stack sits, not WHEN slots beat.
+// Do NOT register a new Composition; CanonicalLandscape already hosts this.
+export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat = null, plate, meta = {}, tokens = {}, spec, plateHints = null, debugLayout = false, panelSide = null }) => {
   const frame = useCurrentFrame();
   const { width, height, fps, durationInFrames } = useVideoConfig();
   useBrandFonts(tokens?.fonts);
@@ -282,6 +287,11 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
   // Worst-case ink applies to the Google video surfaces only. Meta keeps the
   // single-instant reading, so its rendered output is unchanged.
   const isPmaxSurface = usesWorstCaseInk(platformFormat);
+  // Horizontal column only on landscape + explicit panelSide. Other formats
+  // ignore the prop so a stray value cannot narrow a 9:16 stack.
+  const panelBox = (panelSide && format === 'landscape')
+    ? panelColumnStyle({ zoneKey, panelSide, dims: { width, height } })
+    : null;
 
   // Spec color overrides win over resolved brand tokens (font overrides are
   // resolved server-side because they may need new font files).
@@ -362,8 +372,14 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
           width,
           height,
         });
+        // Split-stage: override only the horizontal span. Vertical anchors /
+        // beat timing (slotEnvelope) stay on the existing path. No scrim —
+        // panelColumnStyle deliberately carries none (owner 2026-08-12).
+        const placed = panelBox
+          ? { ...container, left: panelBox.left, right: panelBox.right }
+          : container;
         return (
-          <div key={`${group.phase}|${group.anchor}`} style={{ ...container, gap: Math.round((spec.stack?.rowGapPct ?? 0.018) * height) }}>
+          <div key={`${group.phase}|${group.anchor}`} style={{ ...placed, gap: Math.round((spec.stack?.rowGapPct ?? 0.018) * height) }}>
             {rows.map((row, ri) => {
               const rendered = row.slots.map((rawSlot, si) => {
                 // Same-anchor same-phase slots stack as a flex column (container

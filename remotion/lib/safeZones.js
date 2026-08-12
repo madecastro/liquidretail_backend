@@ -143,3 +143,115 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
       };
   }
 }
+
+// ── PMax 16:9 split-stage reserved copy column ─────────────────────────────
+//
+// THE PROBLEM (2026-08-12). titleSpecValidator ANCHORS are purely vertical
+// (top/upperThird/center/lowerThird/bottom); ALIGNS is text-align INSIDE a
+// box, not a reserved column. stackContainerStyle always spans full width
+// between left/right safe insets. The landscape preset's align:'left' +
+// maxWidthPct:0.46 is a STATIC hint with no coupling to where the subject
+// actually is — it is NOT a solved column. Split-stage needs a real
+// horizontal placement axis: product anchored in one half, copy in the
+// other (generatively extended) half.
+//
+// WIDTH FRACTION. Landscape maxWidthPct:0.46 is the max TEXT width inside a
+// full-width stack, not a column width. A column of 0.46 of frame on the
+// west side would end at 0.075+0.46=0.535 and cross the midline into the
+// subject half. So the cap is min(0.46, half − gutter/2 − outer safe inset).
+// At landscapeYt (left 0.075, gutter 0.04): west = 0.5−0.02−0.075 = **0.405**
+// of frame. East is tighter (~0.33) because right chrome is 0.15 — that is
+// correct, not a bug. PANEL_COLUMN_WIDTH_CAP_FRAC keeps the 0.46 precedent
+// as the hard ceiling when a zone has a smaller outer inset.
+//
+// MEASURED CHROME (same Google horizontal template as landscapeYt.bottom,
+// 2026-08-12, 1920×1080 PNG): mid-row clear span x=38..1758; upper-row
+// (y≈100) clear only x≈496..1444 (title treatment left, skip/ad chrome
+// right). A column that runs to the TOP of the safe zone therefore collides
+// with chrome on BOTH sides. panelColumnStyle still exposes the full safe
+// vertical box so stackContainerStyle anchors keep working; the copy STACK
+// must prefer mid-band anchors — do not "fix" upper collision by widening
+// the column or raising top past the safe inset.
+//
+// NO SCRIM. Owner reaffirmed 2026-08-12: legibility is worst-case ink +
+// upstream gates, never a shade behind the type. This style has no
+// background / backdrop-filter by construction.
+//
+// TOTAL / PURE. Unknown zoneKey, missing dims, or a bad panelSide → null
+// (caller falls back to full-width stack). Never throw, never emit NaN —
+// a NaN in a style paints over the whole frame.
+
+/** Center gutter between subject half and copy column (fraction of W). ~77px @1920. */
+export const PANEL_CENTER_GUTTER_FRAC = 0.04;
+/** Hard ceiling on column width — landscape maxWidthPct precedent (see block above). */
+export const PANEL_COLUMN_WIDTH_CAP_FRAC = 0.46;
+/** Valid panelSide values: 'west' = copy LEFT, 'east' = copy RIGHT. */
+export const PANEL_SIDES = ['west', 'east'];
+
+/**
+ * CSS box for a reserved copy column on one half of a landscape frame,
+ * intersected with the platform safe zone on all four sides.
+ *
+ * @param {{ zoneKey?: string, panelSide?: string, dims?: { width: number, height: number } }} opts
+ * @returns {{ position: string, left: number, right: number, top: number, bottom: number }|null}
+ */
+export function panelColumnStyle({ zoneKey, panelSide, dims } = {}) {
+  if (!dims || typeof dims !== 'object') return null;
+  const W = dims.width;
+  const H = dims.height;
+  if (!Number.isFinite(W) || !Number.isFinite(H) || W <= 0 || H <= 0) return null;
+  if (panelSide !== 'west' && panelSide !== 'east') return null;
+  if (!zoneKey || typeof zoneKey !== 'string' || !SAFE_ZONES[zoneKey]) return null;
+
+  const safe = SAFE_ZONES[zoneKey];
+  const st = safe.top;
+  const sb = safe.bottom;
+  const sl = safe.left;
+  const sr = safe.right;
+  if (![st, sb, sl, sr].every((n) => typeof n === 'number' && Number.isFinite(n))) return null;
+
+  // Vertical: full safe band. Content ends at y = (1-sb)*H — never into bottom chrome.
+  const top = st * H;
+  const bottom = sb * H;
+
+  const mid = 0.5;
+  const halfGutter = PANEL_CENTER_GUTTER_FRAC / 2;
+  let leftFrac;
+  let rightEdgeFrac; // x of column's right edge as fraction of W (from left)
+
+  if (panelSide === 'west') {
+    leftFrac = sl;
+    const maxRight = mid - halfGutter;
+    const widthFrac = Math.min(PANEL_COLUMN_WIDTH_CAP_FRAC, maxRight - leftFrac);
+    if (!(widthFrac > 0) || !Number.isFinite(widthFrac)) return null;
+    rightEdgeFrac = leftFrac + widthFrac;
+  } else {
+    // east — hug the right safe edge; width may shrink under the heavier right chrome
+    rightEdgeFrac = 1 - sr;
+    const minLeft = mid + halfGutter;
+    const widthFrac = Math.min(PANEL_COLUMN_WIDTH_CAP_FRAC, rightEdgeFrac - minLeft);
+    if (!(widthFrac > 0) || !Number.isFinite(widthFrac)) return null;
+    leftFrac = rightEdgeFrac - widthFrac;
+    // Fail closed if half+gutter still cannot fit (should not happen on shipped zones)
+    if (leftFrac < minLeft - 1e-9) return null;
+  }
+
+  const left = leftFrac * W;
+  const right = (1 - rightEdgeFrac) * W; // CSS right inset from frame's right edge
+
+  // Reject any non-finite so a bad zone cannot paint NaN styles.
+  if (![left, right, top, bottom].every((n) => Number.isFinite(n))) return null;
+  if (left < 0 || right < 0 || top < 0 || bottom < 0) return null;
+  // Column must have positive interior
+  if (left + right >= W || top + bottom >= H) return null;
+
+  return {
+    position: 'absolute',
+    left,
+    right,
+    top,
+    bottom,
+    // Deliberately no background / backgroundColor / backdropFilter —
+    // standing no-scrim rule (owner 2026-08-12).
+  };
+}
