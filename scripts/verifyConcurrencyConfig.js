@@ -86,9 +86,17 @@ check('A RENDER_CONCURRENCY exceeds MAX_CREATIVES_PER_RUN, so a full run fires a
 // Kept <= MAX_CREATIVES_PER_RUN unlike RENDER_CONCURRENCY: going non-binding
 // here is a separate, measured decision. See scripts/verifyTitlingPermit.js.
 check('A defaults.env VEO_CONCURRENCY is 12', fromDefaults.VEO_CONCURRENCY, 12);
-check('A defaults.env VEO_TITLING_CONCURRENCY is 4', fromDefaults.VEO_TITLING_CONCURRENCY, 4);
-check('A the veo split holds: submit+poll runs wider than in-process titling',
-  fromDefaults.VEO_CONCURRENCY > fromDefaults.VEO_TITLING_CONCURRENCY, true);
+// Re-pointed 2026-08-13, not relaxed. VEO_TITLING_CONCURRENCY never bounded
+// Remotion renders — remotionRenderService ran a concurrency-1 promise chain, so
+// exactly one render happened whatever this said. The permit is now wide (48) and
+// bounds only cheap prep; REMOTION_QUEUE_CONCURRENCY is the memory guard, so the
+// safety assertion follows it.
+check('A defaults.env VEO_TITLING_CONCURRENCY is 48', fromDefaults.VEO_TITLING_CONCURRENCY, 48);
+check('A defaults.env REMOTION_QUEUE_CONCURRENCY is 4 (the real memory guard)',
+  fromDefaults.REMOTION_QUEUE_CONCURRENCY, 4);
+check('A the memory-bound render pool is the narrowest video knob',
+  fromDefaults.REMOTION_QUEUE_CONCURRENCY <= fromDefaults.VEO_CONCURRENCY
+  && fromDefaults.REMOTION_QUEUE_CONCURRENCY <= fromDefaults.VEO_TITLING_CONCURRENCY, true);
 check('A defaults.env ATLAS_SUBMIT_SPACING_MS is 1200', fromDefaults.ATLAS_SUBMIT_SPACING_MS, 1200);
 check('A defaults.env GROK_MAX_RPS is 1', fromDefaults.GROK_MAX_RPS, 1);
 

@@ -1,9 +1,10 @@
 // Remotion SSR render service for the video titling engine.
 //
 // Lifecycle: bundle() the remotion/ island once per process (warmed at boot,
-// lazily on first render otherwise), keep a single headless browser, and
-// run renders through a concurrency-1 promise queue (renders are memory-
-// heavy — same spirit as VEO_CONCURRENCY).
+// lazily on first render otherwise), keep a single headless browser, and run
+// renders through a bounded pool (REMOTION_QUEUE_CONCURRENCY, default 4).
+// Renders are memory-heavy, so the pool — not the caller's permit — is the real
+// limit; see the note above `enqueue`.
 //
 // Asset delivery: the render browser must fetch the plate video and font
 // files. Instead of relying on egress from headless Chrome, everything is
@@ -251,14 +252,64 @@ function getAssetServer() {
   return assetServerPromise;
 }
 
-// ── render queue (concurrency 1) ───────────────────────────────────────────
+// ── render queue ───────────────────────────────────────────────────────────
+//
+// THIS IS THE REAL TITLING BOTTLENECK, and for a long time it was invisible.
+//
+// The queue was a promise CHAIN — `queueTail.then(task)` — which is
+// concurrency 1 by construction. Meanwhile routes/ads.js wrapped every titling
+// call in a VEO_TITLING_CONCURRENCY permit (4), whose own config note described
+// it as "simultaneous Remotion titling renders". It was not: four permit
+// holders arrived here and three of them waited. Raising the permit changed
+// nothing, which is why the measured tail on a 20-ad run was 926s and 83% idle
+// — 13 renders running strictly back to back at ~70s each.
+//
+// So the permit bounded the CHEAP half (Mongo reads, the copy cascade) and the
+// expensive half was serial. This makes the queue a real bounded pool, so the
+// concurrency number finally means what it says.
+//
+// MEMORY IS THE CONSTRAINT AND IT IS NOT MEASURED. Each slot is a headless
+// Chrome page plus an ffmpeg 1080p encode inside the web process. The documented
+// failure mode is not a provider 429 — it is RSS exhaustion, Render replacing
+// the instance, and a paid Omni master stranded mid-titling. Default is
+// therefore deliberately modest and the ceiling is env-driven: raise
+// REMOTION_QUEUE_CONCURRENCY only against an observed RSS number, one step at a
+// time, watching the web service's memory graph across a full run.
+const QUEUE_CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.REMOTION_QUEUE_CONCURRENCY, 10) || 4
+);
 
-let queueTail = Promise.resolve();
+let activeRenders = 0;
+const waiting = [];
+
+function pump() {
+  while (activeRenders < QUEUE_CONCURRENCY && waiting.length) {
+    const job = waiting.shift();
+    activeRenders += 1;
+    // settle() runs in a finally so a THROWN task still frees its slot. The old
+    // chain got this free (`.then(task, task)` kept the chain alive after a
+    // failure); a pool has to do it explicitly or one bad render permanently
+    // shrinks the pool until nothing renders at all.
+    Promise.resolve()
+      .then(job.taskFn)
+      .then(job.resolve, job.reject)
+      .finally(() => { activeRenders -= 1; pump(); });
+  }
+}
 
 function enqueue(taskFn) {
-  const run = queueTail.then(taskFn, taskFn); // keep queue alive after failures
-  queueTail = run.catch(() => {});
-  return run;
+  return new Promise((resolve, reject) => {
+    waiting.push({ taskFn, resolve, reject });
+    pump();
+  });
+}
+
+// Exposed for the harness and for operator telemetry — "how many are actually
+// rendering vs waiting" is the number that explains a slow run, and it was not
+// observable before.
+function renderQueueStats() {
+  return { concurrency: QUEUE_CONCURRENCY, active: activeRenders, waiting: waiting.length };
 }
 
 // Fast lane for stills-only previews (the operator refinement loop):
@@ -728,4 +779,9 @@ module.exports = {
   assetPathFor,
   fontRouteForLocalPath,
   fontsToUrls,
+  // Pool internals — exported so scripts/verifyTitlingQueueParallel.js can
+  // prove the pool actually overlaps work instead of regexing for the word
+  // "concurrency". A serial queue and a parallel one look identical in source.
+  enqueue,
+  renderQueueStats,
 };
