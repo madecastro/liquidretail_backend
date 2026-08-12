@@ -874,8 +874,16 @@ check('N10 the ratings array is REQUIRED in the pass-2 schema, on both lookups',
   for (const b of blocks) {
     assert.ok(!/nullable: true/.test(b.split('items:')[0]),
       'the ratings ARRAY must not be nullable — an empty array is how "none found" is said');
-    assert.ok(/required: \['rating'\]/.test(b),
-      'each entry must require a numeric rating, so a non-numeric grade is omitted rather than emitted as null');
+    // RATING_REQUIRE_PROVENANCE (2026-08-12): whether `source` joins `rating`
+    // in the entry's required keys is now FLAG-GATED via a shared builder —
+    // ratingsItemRequiredKeys() — not a source-text literal, precisely so
+    // flag-off asks Gemini for nothing new (see verifyRatingProvenance.js F1/F3,
+    // the harness that owns the flag's on/off behaviour). This file only pins
+    // that BOTH schema items delegate to the same builder rather than each
+    // re-implementing its own required array (that drift is what let the two
+    // pass-2 prompts disagree before).
+    assert.ok(/required:\s*requiredRatingItemKeys/.test(b),
+      'each ratings item must require rating via the shared, flag-gated builder — see ratingsItemRequiredKeys()');
     // REQUIRED and NON-NULLABLE are different guarantees, and only asserting the first
     // let a mutation adding `nullable: true` here pass: the model would then satisfy
     // the schema with {source:'BBB', rating:null}, which is not an aggregate at all and
