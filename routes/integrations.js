@@ -26,6 +26,7 @@ const ig = require('../services/instagramOAuthService');
 const { syncCatalog, getCatalogStatus } = require('../services/catalogSyncService');
 const { syncPosts, getPostsStatus } = require('../services/postSyncService');
 const geminiSearch = require('../services/providers/geminiSearchProvider');
+const { isScrapedProductReviews } = require('../services/ratingPairAtomic');
 const { verifySignature, processWebhookPayload } = require('../services/instagramWebhookService');
 const metaAds = require('../services/metaAdsOAuthService');
 const googleAds = require('../services/googleAdsOAuthService');
@@ -844,7 +845,22 @@ router.post('/instagram/catalog/:productId/refresh-reviews', async (req, res) =>
       return res.status(502).json({ error: 'review lookup returned no result' });
     }
 
-    const reviews = Object.assign({}, fresh, { fetchedAt: new Date() });
+    // GUARD: Gemini is web-wide sentiment. It must never replace a
+    // snapshot scraped from the merchant's own review app — same rule
+    // as productMatchService's $ne: 'scraped' filter. refreshOne now
+    // stamps quotesOrigin: 'scraped'; older rows still carry
+    // source: 'productReviewsScrape'.
+    if (isScrapedProductReviews(product.productReviews)) {
+      return res.status(409).json({
+        error: 'scraped productReviews exist; refusing llm-web overwrite',
+        productReviews: product.productReviews
+      });
+    }
+
+    const reviews = Object.assign({}, fresh, {
+      fetchedAt: new Date(),
+      quotesOrigin: 'llm-web'
+    });
     product.productReviews = reviews;
     await product.save();
 

@@ -9,7 +9,10 @@
 // Per-review star ratings ARE captured by that engine (see the header
 // comment on productReviewsScrapeService.js) — the whole reason this
 // workflow exists is to move products off the gemini-search fallback
-// path (which drops ratings) onto the scraper (which keeps them).
+// path onto the scraper. Gemini does NOT drop ratings: pickBestRating
+// writes productReviews.rating (quotesOrigin 'llm-web'), including a
+// documented tier-2 "5.0 from 3 reviews" override. The scrape is the
+// first-party store aggregate; the LLM pick is a winning web source.
 //
 // Cache invalidation: refreshing a product's reviews shifts the
 // downstream social_proof signals the LayoutInputArtifact reads. This
@@ -92,6 +95,7 @@ async function refreshOne({ productId, allowHeadless = null }) {
     $set: {
       productReviews: {
         source:            'productReviewsScrape',
+        quotesOrigin:      'scraped',
         rating:            result.rating ?? null,
         reviewCount:       result.reviewCount ?? null,
         quotes,
