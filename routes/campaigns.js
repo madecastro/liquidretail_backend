@@ -403,7 +403,9 @@ router.get('/:id/ads-detail', async (req, res) => {
           generatedAt: 1, renderedAt: 1, metaSyncStatus: 1, metaAdId: 1, metaAdsetId: 1,
           platformFormat: 1, aiCanvasArtifactId: 1, mediaId: 1, productId: 1, variantKind: 1,
           paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
-          regenerationHistory: 1
+          regenerationHistory: 1,
+          // Same gap as catalog.js ads-detail — see the note there.
+          renderStage: 1, renderStageAt: 1
       } }
     ], { allowDiskUse: true });
 

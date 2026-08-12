@@ -3905,6 +3905,12 @@ function projectAd(ad, full = false, extras = {}) {
     // instead) — so `renderStage && renderStage !== 'done'` is the exact
     // "still actively processing" signal, with no extra timestamp needed.
     renderStage:        ad.renderStage || null,
+    // WHEN that stage was entered. Without it the gallery can say WHAT an ad is
+    // doing but not whether it has been doing it for 8 seconds or 40 minutes —
+    // and "Titling" that never moves is the failure the operator most needs to
+    // see. /render-activity already derives its stageAgeSec from this field;
+    // omitting it here is why the honest view existed on exactly one page.
+    renderStageAt:      ad.renderStageAt || null,
     queuedAt:           ad.queuedAt,
     renderedAt:         ad.renderedAt,
     generatedAt:        ad.generatedAt,
@@ -4053,3 +4059,8 @@ module.exports.requeueStrandedAds = requeueStrandedAds;
 // check alone would pass against a reimplementation that kept the name,
 // so the harness calls the real function.
 module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;
+// Exported so scripts/verifyStageVisibility.js can assert the SERIALISED SHAPE
+// by calling it, rather than regexing the object literal. The gallery can only
+// show a stage it is actually sent, so "does the payload carry it" is the whole
+// contract and deserves a real call.
+module.exports.projectAd = projectAd;
