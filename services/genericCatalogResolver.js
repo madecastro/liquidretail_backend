@@ -74,7 +74,9 @@ const {
   isCatalogImageUpgradeEnabled,
   createImageUpgradeRun,
   makeHttpScrapeFetchHead,
-  dedupeUrlsFirstSeen
+  dedupeUrlsFirstSeen,
+  upgradeImageUrl,
+  isShopifyCdnUrl
 } = require('./imageUrlUpgrade');
 
 // ── constants ──────────────────────────────────────────────────────
@@ -87,6 +89,19 @@ const LOG = '🗺';
 // mean 7.91 images). Flag-off restores byte-identical prior behaviour:
 // no homepage fetch, no fingerprint, no new result keys.
 const AUTODETECT_ENABLED = process.env.GENERIC_CATALOG_AUTODETECT !== 'false';
+// Per-PDP Shopify gallery enrichment on the JSON-LD fallthrough path.
+// Shopify JSON-LD Product.image is a 1-element `_small` array — so even
+// with size-suffix stripping the hero upgrades, additionalImages stays
+// empty and the 12/20-image cap is a no-op. When the PDP URL is
+// /products/{handle}, fetch the same `{origin}/products/{handle}.js`
+// endpoint shopifyPublicIngestService already uses (full-resolution
+// multi-image list). Default ON. Flag-off = no extra request, JSON-LD
+// images only (still upgraded by imageUrlUpgrade). Safe: any miss/error
+// keeps the JSON-LD seed. "Never worse" is enforced by count in
+// preferShopifyGallery, not merely by the miss/error paths — a SUCCESSFUL
+// but thinner gallery must not replace a richer JSON-LD list.
+const SHOPIFY_GALLERY_ENRICH_ENABLED =
+  String(process.env.GENERIC_CATALOG_SHOPIFY_GALLERY || 'true').toLowerCase() !== 'false';
 // Last-rung browser + session reuse. Default ON, but Chrome launches ONLY
 // when the cheap HTTP path already failed for a reason a browser can fix
 // (CF / PX / DataDome browser-session remedy, Shopify ladder fallthrough,
@@ -674,6 +689,253 @@ async function imagesFromNode(node, pageUrl, opts = {}) {
   };
 }
 
+/**
+ * extractShopifyProductHandle(pageUrl) → handle | null
+ *
+ * Pure. Matches `/products/{handle}` and `/collections/{c}/products/{handle}`.
+ * Rejects handles that look like API suffixes (`products.json`, `products.js`)
+ * so we never fetch `/products/products.js.js`. Non-Shopify hosts with a
+ * coincidental path shape still return a handle — the subsequent fetch is
+ * fail-soft (404 → keep JSON-LD images).
+ */
+function extractShopifyProductHandle(pageUrl) {
+  if (!pageUrl || typeof pageUrl !== 'string') return null;
+  try {
+    const u = new URL(pageUrl);
+    const m = (u.pathname || '').match(/\/products\/([^/]+)\/?$/i);
+    if (!m) return null;
+    let handle;
+    try {
+      handle = decodeURIComponent(m[1]).trim();
+    } catch {
+      handle = String(m[1]).trim();
+    }
+    if (!handle) return null;
+    // Reject API-ish suffixes and empty / `.` names.
+    if (/\.(?:js|json|xml|html?)$/i.test(handle)) return null;
+    if (handle === '.' || handle === '..') return null;
+    return handle;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Absolutize a Shopify asset URL. products.json returns absolute https CDN
+ * urls; the AJAX /products/<handle>.js endpoint often returns protocol-
+ * relative (`//cdn.shopify.com/…`) strings.
+ *
+ * Returning the string unchanged when it is neither was a hole: a relative
+ * `/cdn/shop/files/x.jpg` was stored as-is (an unfetchable seed), and a
+ * `data:` / `javascript:` src was stored verbatim. These become catalog
+ * image URLs and then ad seeds, so only http(s) may survive. Relative paths
+ * resolve against the PDP url via the same absUrl() the JSON-LD path uses;
+ * anything else is dropped.
+ */
+function absShopifyAssetUrl(u, pageUrl = null) {
+  if (!u || typeof u !== 'string') return null;
+  const s = u.trim();
+  if (!s) return null;
+  if (s.startsWith('//')) return 'https:' + s;
+  if (/^https?:\/\//i.test(s)) return s;
+  // Any other scheme (data:, javascript:, blob:, file:) is never a product
+  // photo — drop rather than store. absUrl only resolves relative refs.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return null;
+  const abs = pageUrl ? absUrl(s, pageUrl) : null;
+  return abs && /^https?:\/\//i.test(abs) ? abs : null;
+}
+
+/**
+ * imagesFromShopifyProductPayload(payload) → { imageUrl, additionalImages }
+ *
+ * Pure. Accepts either the bare products/{handle}.js object OR the
+ * `{ product: {...} }` wrapper from products/{handle}.json. Image list
+ * order is feed order (do not sort). Cap via shared mapShopifyProductImages
+ * → MAX_ADDITIONAL_IMAGES from catalogImageLimits (never hardcode).
+ *
+ * pageUrl is used only to resolve relative asset paths; without it a
+ * relative src is dropped rather than stored unfetchable.
+ */
+function imagesFromShopifyProductPayload(payload, pageUrl = null) {
+  const empty = { imageUrl: null, additionalImages: [] };
+  if (!payload || typeof payload !== 'object') return empty;
+  const p =
+    payload.product && typeof payload.product === 'object'
+      ? payload.product
+      : payload;
+
+  const list = [];
+  const push = (src) => {
+    const a = absShopifyAssetUrl(src, pageUrl);
+    if (a) list.push({ src: a });
+  };
+
+  if (Array.isArray(p.images) && p.images.length) {
+    for (const img of p.images) {
+      if (typeof img === 'string') push(img);
+      else if (img && typeof img === 'object') push(img.src || img.url || null);
+    }
+  } else if (Array.isArray(p.media) && p.media.length) {
+    // .js media[] mixes image / video / external_video — keep images only,
+    // preserve order (feedIndex load-bearing).
+    for (const m of p.media) {
+      if (!m) continue;
+      if (typeof m === 'string') {
+        push(m);
+        continue;
+      }
+      const t = m.media_type || m.mediaType || null;
+      if (t && t !== 'image') continue;
+      push(m.src || m.url || (m.preview_image && m.preview_image.src) || null);
+    }
+  }
+
+  if (!list.length && p.featured_image) {
+    if (typeof p.featured_image === 'string') push(p.featured_image);
+    else if (typeof p.featured_image === 'object') {
+      push(p.featured_image.src || p.featured_image.url || null);
+    }
+  }
+
+  if (!list.length) return empty;
+  // Shared cap + feed-order split (hero = [0], alts = [1..cap]).
+  return ingestHelpers.mapShopifyProductImages(list);
+}
+
+/**
+ * preferShopifyGallery(jsonLd, shopify) → winning { imageUrl, additionalImages }
+ *
+ * Prefer the products.js gallery when it is at least as rich as the JSON-LD
+ * result — that endpoint is the full-resolution multi-image source of truth
+ * on Shopify (measured: marinelayer JSON-LD 1×_small vs .js 6 full-res).
+ * Never drop a working JSON-LD seed, whether the gallery is empty, missing,
+ * OR successful-but-thinner.
+ */
+function preferShopifyGallery(jsonLd, shopify) {
+  const empty = { imageUrl: null, additionalImages: [] };
+  const a = jsonLd && typeof jsonLd === 'object' ? jsonLd : empty;
+  const b = shopify && typeof shopify === 'object' ? shopify : empty;
+  const aAlts = Array.isArray(a.additionalImages) ? a.additionalImages : [];
+  const bAlts = Array.isArray(b.additionalImages) ? b.additionalImages : [];
+  const aCount = (a.imageUrl ? 1 : 0) + aAlts.length;
+  const bCount = (b.imageUrl ? 1 : 0) + bAlts.length;
+  // NEVER trade N images for fewer. Preferring any non-empty gallery
+  // outright silently discarded JSON-LD alts whenever the gallery came back
+  // thinner — reachable in production via a variant-scoped .js payload, a
+  // media[] list that is mostly video, or a featured_image-only fallback.
+  // The enrichment gate fires on a Shopify-CDN hero even when JSON-LD
+  // already produced several alts, so this was a live regression for sites
+  // that work today, not a theoretical one. Count is the tie-break: on a
+  // real Shopify PDP the gallery is richer and still wins.
+  if (b.imageUrl && bCount >= aCount) {
+    return { imageUrl: b.imageUrl, additionalImages: bAlts };
+  }
+  return {
+    imageUrl: a.imageUrl || null,
+    additionalImages: aAlts
+  };
+}
+
+/**
+ * Should we spend a request on products/{handle}.js?
+ *
+ * TWO gates, and both must pass.
+ *
+ * 1. EVIDENCE the site is actually Shopify. A `/products/{handle}` path is
+ *    NOT evidence — BigCommerce, headless and custom stores use it too, and
+ *    the first production target of this resolver is a non-Shopify retailer.
+ *    Treating the path shape as sufficient meant every single-image PDP on
+ *    a non-Shopify host paid two 404s (.js then .json). At ~300 thin PDPs
+ *    that is ~600 wasted requests against a domain-throttled crawl, inside
+ *    a bounded total budget — it steals scan time from the actual walk.
+ *    Accept either an explicit Shopify platform fingerprint, or a hero that
+ *    lives on the Shopify image CDN / carries a strippable size suffix.
+ *
+ * 2. Something to GAIN: a thin gallery (no alts) or a hero that is still a
+ *    sized thumbnail. A full-res hero that already has alts is left alone.
+ */
+function shouldEnrichShopifyGallery(pageUrl, current, opts = {}) {
+  if (!SHOPIFY_GALLERY_ENRICH_ENABLED) return false;
+  if (!extractShopifyProductHandle(pageUrl)) return false;
+  const cur = current || {};
+  const alts = Array.isArray(cur.additionalImages) ? cur.additionalImages : [];
+
+  // ── gate 1: positive Shopify evidence ──
+  let heroOnShopifyCdn = false;
+  let heroIsSizedThumb = false;
+  if (cur.imageUrl) {
+    try {
+      const upgraded = upgradeImageUrl(cur.imageUrl);
+      if (upgraded && upgraded.upgraded) heroIsSizedThumb = true;
+    } catch { /* not upgradeable */ }
+    try {
+      if (isShopifyCdnUrl(new URL(cur.imageUrl))) heroOnShopifyCdn = true;
+    } catch { /* unparseable hero */ }
+  }
+  const isShopify = opts.platformIsShopify === true || heroOnShopifyCdn || heroIsSizedThumb;
+  if (!isShopify) return false;
+
+  // ── gate 2: something to gain ──
+  return !cur.imageUrl || alts.length === 0 || heroIsSizedThumb;
+}
+
+/**
+ * tryShopifyProductGallery(pageUrl, current, opts) → { imageUrl, additionalImages }
+ *
+ * opts.fetchShopifyProduct(handle, pageUrl) → payload | null (injected;
+ * never throws from the caller's perspective — we catch). On any failure
+ * returns `current` unchanged. Pure w.r.t. network when fetch is mocked.
+ */
+async function tryShopifyProductGallery(pageUrl, current, opts = {}) {
+  const cur = current || { imageUrl: null, additionalImages: [] };
+  if (typeof opts.fetchShopifyProduct !== 'function') return cur;
+  if (!shouldEnrichShopifyGallery(pageUrl, cur, opts)) return cur;
+
+  const handle = extractShopifyProductHandle(pageUrl);
+  if (!handle) return cur;
+
+  let payload = null;
+  try {
+    payload = await opts.fetchShopifyProduct(handle, pageUrl);
+  } catch {
+    return cur;
+  }
+  if (!payload) return cur;
+
+  let gallery;
+  try {
+    gallery = imagesFromShopifyProductPayload(payload, pageUrl);
+  } catch (err) {
+    // A throw here means the payload→images contract broke (e.g. a future
+    // mapShopifyProductImages change). Swallowing it silently would leave
+    // the feature looking enabled while never enriching anything, so say so.
+    console.warn(`${LOG} shopify gallery map failed for ${pageUrl}: ${err && err.message}`);
+    return cur;
+  }
+  if (!gallery || !gallery.imageUrl) return cur;
+
+  // Defence in depth: run the same size-suffix upgrade over the gallery
+  // (products.js is usually already full-res; no-op then).
+  if (
+    isCatalogImageUpgradeEnabled() &&
+    opts.upgradeRun &&
+    typeof opts.upgradeRun.upgradeList === 'function'
+  ) {
+    try {
+      const all = [gallery.imageUrl].concat(gallery.additionalImages || []);
+      const uniq = await opts.upgradeRun.upgradeList(all);
+      gallery = {
+        imageUrl: uniq[0] || gallery.imageUrl,
+        additionalImages: uniq.slice(1, 1 + MAX_ADDITIONAL_IMAGES)
+      };
+    } catch {
+      // keep un-upgraded gallery
+    }
+  }
+
+  return preferShopifyGallery(cur, gallery);
+}
+
 // Reviews come from the shared engine (services/productReviewsScrapeService)
 // so this path, the Shopify path and the Meta-catalog path all capture the
 // same fields: per-review STARS + headline + date, positive-ranked, scale-
@@ -715,7 +977,10 @@ function resolveFeedId(node, pageUrl) {
  * resolver's on-page feed-id recovery when the node lacks a structured id).
  * opts.upgradeRun (from createImageUpgradeRun) enables HEAD-verified
  * thumbnail→original upgrade on imageUrl + additionalImages.
- * Async (awaits imagesFromNode).
+ * opts.fetchShopifyProduct(handle, pageUrl) — when set, may replace a thin
+ * Shopify JSON-LD image list with the full products/{handle}.js gallery
+ * (full-res multi-image; shared MAX_ADDITIONAL_IMAGES cap). Fail-soft.
+ * Async (awaits imagesFromNode / optional gallery fetch).
  */
 async function mapJsonLdProduct(node, pageUrl, explicitId = null, opts = {}) {
   opts = opts || {};
@@ -739,7 +1004,14 @@ async function mapJsonLdProduct(node, pageUrl, explicitId = null, opts = {}) {
 
   const { price, currency, availability: offerAvail } = priceFromOffers(node.offers);
   const availability = offerAvail || mapAvailability(node.availability);
-  const { imageUrl, additionalImages } = await imagesFromNode(node, pageUrl, opts);
+  // JSON-LD first (size-suffix upgrade when upgradeRun present), then
+  // optional products/{handle}.js gallery for multi-image full-res.
+  let { imageUrl, additionalImages } = await imagesFromNode(node, pageUrl, opts);
+  ({ imageUrl, additionalImages } = await tryShopifyProductGallery(
+    pageUrl,
+    { imageUrl, additionalImages },
+    opts
+  ));
   const productUrl = absUrl(node.url || node['@id'] || pageUrl, pageUrl) || pageUrl || null;
   const category = categoryOf(node.category);
   const { rating, productReviews } = reviewsFromNode(node);
@@ -803,6 +1075,14 @@ async function mapOgProduct(html, pageUrl, opts = {}) {
   ) {
     imageUrl = await opts.upgradeRun.resolve(imageUrl);
   }
+  // Same gallery enrichment as JSON-LD: OG only ever has one image, so a
+  // Shopify /products/{handle} PDP still needs products.js for alts.
+  let additionalImages = [];
+  ({ imageUrl, additionalImages } = await tryShopifyProductGallery(
+    pageUrl,
+    { imageUrl, additionalImages },
+    opts
+  ));
   const productUrl = absUrl(ogUrl || pageUrl, pageUrl) || pageUrl;
 
   return {
@@ -814,7 +1094,7 @@ async function mapOgProduct(html, pageUrl, opts = {}) {
     currency: currency || null,
     availability: null,
     imageUrl,
-    additionalImages: [],
+    additionalImages,
     productUrl,
     gtin: null,
     mpn: null,
@@ -1593,17 +1873,81 @@ async function resolveGenericCatalog(brand, {
   // budgetExpired is its OWN flag — do not overload aborted/cancelled.
   // aborted drives run.markCancelled(...); a timeout is not a cancellation.
   let budgetExpired = false;
+  // `activeSession` is null until the browser rung harvests one; cheap
+  // path first, always. Declared early so fetchShopifyProduct can close
+  // over the binding (TDZ-safe: only read at call time, after init).
+  let activeSession = null;
 
   // Image-URL upgrade run (one per resolve). Memoises HEAD answers and caps
   // verification requests (CATALOG_IMAGE_UPGRADE_MAX_CHECKS). Flag-off →
-  // upgradeRun is null and map* paths are byte-identical to pre-change.
-  // fetchHead is built lazily so a flag-off resolve never even constructs it.
+  // upgradeRun is null and map* paths skip HEADs. fetchHead is built
+  // lazily so a flag-off resolve never even constructs it.
   const imageUpgradeRun = isCatalogImageUpgradeEnabled()
     ? createImageUpgradeRun({
         fetchHead: makeHttpScrapeFetchHead(http, { timeoutMs: 8000 })
       })
     : null;
-  const mapOpts = imageUpgradeRun ? { upgradeRun: imageUpgradeRun } : null;
+
+  // Per-PDP products/{handle}.js gallery fetch (same endpoint
+  // shopifyPublicIngestService uses). Tries .js first, then .json.
+  // Memoised per handle so a re-map (explicitId recovery) does not double-
+  // bill the host. Never throws — returns null on any miss so the caller
+  // keeps the JSON-LD seed.
+  const shopifyGalleryMemo = new Map();
+  const fetchShopifyProduct = SHOPIFY_GALLERY_ENRICH_ENABLED
+    ? async function fetchShopifyProduct(handle, pageUrl) {
+        if (!handle) return null;
+        let origin;
+        try {
+          origin = new URL(pageUrl).origin;
+        } catch {
+          return null;
+        }
+        // Key on origin+handle, NOT handle alone. A resolve walks sitemap
+        // locs with no same-origin filter, so two hosts (us./eu. storefronts)
+        // can carry the same handle for different products — a handle-only
+        // memo would serve the first host's gallery as the second product's
+        // ad seeds. Wrong-product imagery is worse than a second request.
+        const key = `${origin}::${handle}`;
+        if (shopifyGalleryMemo.has(key)) return shopifyGalleryMemo.get(key);
+        const candidates = [
+          `${origin}/products/${encodeURIComponent(handle)}.js`,
+          `${origin}/products/${encodeURIComponent(handle)}.json`
+        ];
+        for (const url of candidates) {
+          try {
+            const res = await http.fetchText(url, {
+              timeoutMs: 10000,
+              maxBytes: 2_000_000,
+              session: activeSession
+            });
+            if (!res || !res.ok || !res.text) continue;
+            // Both endpoints return JSON (the .js AJAX payload is a JSON
+            // object with application/javascript content-type).
+            let parsed;
+            try {
+              parsed = JSON.parse(res.text);
+            } catch {
+              continue;
+            }
+            if (parsed && typeof parsed === 'object') {
+              shopifyGalleryMemo.set(key, parsed);
+              return parsed;
+            }
+          } catch {
+            // try next candidate
+          }
+        }
+        shopifyGalleryMemo.set(key, null);
+        return null;
+      }
+    : null;
+
+  // Always an object (may be empty when both upgrade + gallery enrich are
+  // flag-off). Offline pure callers of mapJsonLdProduct omit opts entirely.
+  const mapOpts = {};
+  if (imageUpgradeRun) mapOpts.upgradeRun = imageUpgradeRun;
+  if (fetchShopifyProduct) mapOpts.fetchShopifyProduct = fetchShopifyProduct;
 
   // Wall-clock budget for the whole resolve (discovery + walk + PDP scan).
   // Unset / non-positive env → unbounded (createBudget safety property).
@@ -1634,9 +1978,6 @@ async function resolveGenericCatalog(brand, {
   // Counts against the TOTAL budget (sitemap rung opens after discovery
   // so a slow robots.txt cannot starve the walk allotment entirely —
   // discovery is a handful of requests; the walk is the expensive part).
-  // `activeSession` is null until the browser rung harvests one; cheap
-  // path first, always.
-  let activeSession = null;
   const disc = await discoverSitemapUrls(origin, abortCheck, { stats });
   stats.sitemapsDiscovered = disc.sitemaps.length;
   stats.cfChallenges += disc.cfChallenges || 0;
@@ -1674,6 +2015,14 @@ async function resolveGenericCatalog(brand, {
     stats.platform = fp.platform;
     stats.confidence = fp.confidence;
     stats.fingerprintSignals = fp.signals;
+    // Feed the gallery-enrichment gate real platform evidence. mapOpts is
+    // built before this point but consumed later (during the walk), so the
+    // assignment lands before any map* call reads it. Without this the gate
+    // falls back to hero-URL evidence alone, which misses a Shopify store
+    // serving images from a non-Shopify CDN.
+    if (String(fp.platform || '').toLowerCase() === 'shopify') {
+      mapOpts.platformIsShopify = true;
+    }
 
     console.log(
       `   · ${LOG}  fingerprint: platform=${fp.platform} confidence=${fp.confidence}` +
@@ -2405,6 +2754,13 @@ module.exports = {
   isProductish,
   scoreProductish,
   imagesFromNode,
+  // Shopify gallery enrichment (Lane Q — full-res multi-image on JSON-LD path)
+  extractShopifyProductHandle,
+  imagesFromShopifyProductPayload,
+  preferShopifyGallery,
+  shouldEnrichShopifyGallery,
+  tryShopifyProductGallery,
+  SHOPIFY_GALLERY_ENRICH_ENABLED,
   deriveCategoryOptions,
   matchesAnyCategory,
   DEFAULT_CAP,
