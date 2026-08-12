@@ -777,6 +777,22 @@ check('N3c the real Pelagic set — 4.5/11 beats 3.2/22 and becomes printable', 
   assert.strictEqual(formatDisplayRating(r.rating, { starMin: RATING_STAR_MIN }), '4.5',
     'the whole point of the directive: this brand can now print stars');
 });
+check('N3e two sub-50 candidates: MORE STARS wins even with fewer reviews', () => {
+  // The shape that actually distinguishes the two tiers, and the only one that fails when
+  // the credible-sample floor is removed. Every other fixture gives the same answer either
+  // way, because a thin candidate rarely also has the most reviews — so a mutation
+  // deleting the floor passed the whole section untouched until this case existed.
+  //
+  // 4.9 from 40 vs 4.5 from 45: both under 50, and the higher rating has FEWER reviews.
+  // Stars-first (the directive) picks 4.9. Largest-sample picks 4.5.
+  const r = quiet(() => pickBestRating([
+    { source: 'fewer.com', rating: 4.9, reviewCount: 40 },
+    { source: 'more.com',  rating: 4.5, reviewCount: 45 },
+  ]));
+  assert.strictEqual(r.rating, 4.9, `stars must win under 50 reviews, got ${r.rating}`);
+  assert.strictEqual(r.reviewCount, 40, 'and the count travels with it');
+  assert.strictEqual(r.ratingSource, 'fewer.com');
+});
 check('N3d a CREDIBLE sample still beats a thinner higher one (tier 1 intact)', () => {
   // The directive is scoped to "under 50". Above it, the owner's original rule stands:
   // most reviews wins, so a 4.9 from 60 must not displace a 4.58 from 15,626.
