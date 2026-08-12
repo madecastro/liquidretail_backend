@@ -108,6 +108,60 @@ function brandQuoteForDirectorSignal(q) {
  * @param {{rating:number|null, reviewCount:number|null, quotes:Array}} tiers.brand
  * @returns {Array<{tier:string, rating:number|null, review_count:number|null, reviews_text:string|null, quotes:Array}>}
  */
+// Stand-in for "this concept nulled its headline" in the duplicate-line check.
+// See validateDirectorPayload for why nulls have to participate in that
+// comparison at all.
+//
+// A SYMBOL, not a string, and that is the point: it must collide with other
+// nulls and with NOTHING else. Any string sentinel is a headline the model
+// could in principle emit, so the guard would then mis-report a real duplicate
+// as "concepts left the headline null". A fresh Symbol is unequal to every
+// string by construction, so the two failure modes stay distinguishable.
+const NULL_HEADLINE_SENTINEL = Symbol('null-headline');
+
+// How many quotes each proof tier offers the Director. Three concepts per round
+// need at least three distinct lines to ground on before they start repeating;
+// 4 leaves headroom without bloating a prompt that already carries three tiers.
+const MAX_QUOTES_PER_TIER = 4;
+
+// Lazily-bound, fail-open wrapper around layoutInputService.scoreQuote.
+//
+// LAZY: layoutInputService is a heavy module (it pulls templateRegistry and
+// videoHeadlineService) and this file is required by the generation service on
+// every run. The require chain is layoutInputService → videoHeadlineService →
+// CreativeDirectionArtifact, with no path back here, so a top-level import
+// would not be circular — but deferring it keeps module load flat and matches
+// how snippetText already inlines its htmlEntities require.
+//
+// FAIL-OPEN: a scorer that throws or goes missing must not take down a paid
+// Director call over the ORDER of a quote list. Returning 0 for everything
+// degrades ranking to arrival order, which is exactly the pre-change behaviour.
+let _scoreQuote = null;
+function scoreQuoteSafe(text) {
+  if (_scoreQuote === null) {
+    try {
+      _scoreQuote = require('./layoutInputService').scoreQuote || false;
+    } catch {
+      _scoreQuote = false;
+    }
+  }
+  if (!_scoreQuote) return 0;
+  try {
+    const n = _scoreQuote(String(text || ''));
+    if (Number.isFinite(n)) return n;
+    // -Infinity IS A VERDICT, NOT A MISSING VALUE. The scorer returns it for
+    // hard limiters and negative sentiment ("broke after one day"). Collapsing
+    // it to 0 ranked those level with merely-generic praise and ABOVE anything
+    // scoring -1 or -2 — so the ranking meant to demote junk was promoting the
+    // worst class of it into the Director's top-4. Map it to a floor that keeps
+    // it last instead. Any other non-finite result is a scorer malfunction, not
+    // a judgement, so it degrades to neutral.
+    return n === -Infinity ? Number.NEGATIVE_INFINITY : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function buildDirectorProofOptions({ product, category, brand }) {
   // A SECOND adversarial pass (independent of the one that led to the count
   // fix above) caught a second, separate gap: this only ever scoped the
@@ -139,7 +193,52 @@ function buildDirectorProofOptions({ product, category, brand }) {
       rating: rating != null ? Number(rating.toFixed(1)) : null,
       review_count: reviewCount ?? null,
       reviews_text: scopedNumbers(rating, reviewCount, tier),  // pre-scoped — use verbatim or paraphrase honestly, never as the product's own
-      quotes: safeQuotes.slice(0, 2).map(q => ({ text: snippetText(q.text, 200), author: q.author || null }))
+      // WIDENED 2 → MAX_QUOTES_PER_TIER, and RANKED rather than sliced in
+      // arrival order. Two quotes per tier could not ground three distinct
+      // proof-led concepts, so the third had nothing new to say and fell back
+      // to the shared tagline — one reason a round of three read as one slogan
+      // repeated. `product.reviews` holds Immersive's top 10, so the pool was
+      // always there; only the exposure was narrow.
+      //
+      // RANKING IS LOAD-BEARING, not tidiness. As of #157 the intake screen
+      // deliberately STORES generic praise instead of discarding it ("in the
+      // absence of any other social proof, generic praise is better than
+      // nothing"), so `brandReviews.quotes` now carries lines it never used to.
+      // Measured against the live scorer: "High quality, functional and
+      // fashionable products." is 50 chars — it sails through the >30 length
+      // filter these arrays already apply — and scores 0. Widening a
+      // first-N slice would have handed the Director more filler, not more
+      // material. Ranking puts the specific quotes first and lets the generic
+      // ones fall off the end of the slice on their own.
+      //
+      // WHY scoreQuote AND NOT clearsQualityFloor, which is the obvious
+      // candidate and is what the render-time rotation uses. Two reasons, and
+      // the second is a hard constraint rather than a preference:
+      //
+      // (a) It is the wrong question. That predicate also requires the
+      //     positive-praise lexicon screen, which wants an explicit praise
+      //     token. Checked against the real function: "I wore these on a
+      //     12-hour offshore trip and they dried in minutes" scores 4.5 and
+      //     still returns FALSE, because its endorsement is implicit. That is
+      //     precisely the concrete line an editorial or objection-resolved
+      //     concept should write from. Rotation asks "would this win the
+      //     primary slot"; the Director asks "what is the best material
+      //     available" — different questions, different predicate.
+      // (b) That lexicon screen was DELIBERATELY REMOVED from this file's
+      //     decision path, and scripts/verifyQuoteGate.js pins its absence
+      //     here (it survives only inside layoutInputService). Filtering with a
+      //     predicate that calls it would put the lexicon back into the
+      //     Director's decision path — the exact thing that harness exists to
+      //     prevent. Ranking by score keeps the decision numeric.
+      //
+      // No hard score threshold: a brand whose entire pool is generic still
+      // gets its best-of, which is the same call #157 made at intake.
+      quotes: [...safeQuotes]
+        .map(q => ({ q, score: scoreQuoteSafe(q.text) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, MAX_QUOTES_PER_TIER)
+        .map(({ q }) => ({ text: snippetText(q.text, 200), author: q.author || null }))
+        .filter(q => q.text)
     };
   };
   return [
@@ -468,6 +567,14 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
     availability:   product?.availability || null,
     // shortBenefits is not on CatalogProduct schema (always sent []); benefits would have to come from the layout derivation artifact instead.
     review_summary: snippetText(product?.reviewSummary?.summary || product?.productReviews?.summary, 240),
+    // REAL PRODUCT FACTS — fabric, fit, construction, care, dimensions.
+    // `product` is loaded with a bare findById().lean() (no projection), so
+    // `specs` was already in memory on every Director call and simply never
+    // forwarded. This is the concrete material an editorial or brand-led
+    // concept needs in order to say something specific instead of falling
+    // through to the brand tagline. Empty array when absent — never null, so
+    // the prompt can test `.length` without a null guard.
+    specs: normalizeProductSpecs(product?.specs),
     priority:       !productId ? 'absent' :
                     campaignKind === 'product' ? 'high' :
                     campaignKind === 'brand'   ? 'medium' :
@@ -755,6 +862,86 @@ async function assembleSignals({ brandId, productId, campaignKind }) {
 // horrible. Pl" invites the model to complete a sentence the reviewer never
 // wrote. utils/htmlEntities.truncateWords backs off to the last space and marks
 // the cut.
+// ── Product specs → Director brief ──────────────────────────────────────
+//
+// `CatalogProduct.specs` is Immersive's `product_results.specifications`. It is
+// populated for a large share of the catalog and, until now, reached NOTHING in
+// the ad pipeline — only the retired canvas path ever read it. That is why
+// "editorial" and "brand-led" concepts had nothing concrete to write about and
+// fell back to the brand tagline: the one field holding real product facts was
+// never in the brief.
+//
+// SHAPE IS UNTRUSTED. The field is `Mixed`, and Immersive returns it
+// inconsistently — sometimes an object of label→value, sometimes an array of
+// {name,value} / {label,value} / {key,value} rows, sometimes an array of bare
+// strings, sometimes nested one level under a group heading. Normalise all of
+// those to a flat [{label, value}] and drop anything that does not survive,
+// rather than letting a shape surprise reach the prompt as "[object Object]".
+//
+// Caps are deliberate: this rides in every Director call, so it is bounded to
+// MAX_SPEC_ROWS rows at MAX_SPEC_VALUE chars. Specs are a grounding aid, not a
+// datasheet — the model needs a few concrete, quotable facts, not all of them.
+const MAX_SPEC_ROWS = 8;
+const MAX_SPEC_LABEL = 40;
+const MAX_SPEC_VALUE = 90;
+
+function normalizeProductSpecs(raw) {
+  const rows = [];
+  const pushRow = (label, value) => {
+    if (rows.length >= MAX_SPEC_ROWS) return;
+    // A value that is itself an object/array is a nesting level we do not
+    // understand — skip rather than stringify it into noise.
+    if (value != null && typeof value === 'object') return;
+    // Same rule for the LABEL, which was the asymmetry: the value was guarded
+    // and the label was not, so a localised label — `{ label: { en: 'Material' },
+    // value: 'Cotton' }`, a real Immersive shape — reached the brief as
+    // "[object Object]: Cotton". A label we cannot read is better dropped than
+    // shown: the value alone is still usable copy material.
+    const labelIsUnusable = label != null && typeof label === 'object';
+    const v = snippetText(value == null ? null : String(value), MAX_SPEC_VALUE);
+    if (!v) return;
+    const l = labelIsUnusable
+      ? null
+      : snippetText(label == null ? null : String(label), MAX_SPEC_LABEL);
+    // A bare string spec (no label) is still useful — keep it label-less.
+    rows.push(l ? { label: l, value: v } : { label: null, value: v });
+  };
+
+  const consume = (node, depth) => {
+    if (node == null || rows.length >= MAX_SPEC_ROWS) return;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        if (rows.length >= MAX_SPEC_ROWS) return;
+        if (item == null) continue;
+        if (typeof item === 'string' || typeof item === 'number') { pushRow(null, item); continue; }
+        if (typeof item === 'object') {
+          const label = item.label ?? item.name ?? item.key ?? item.title ?? null;
+          const value = item.value ?? item.text ?? item.detail ?? null;
+          if (label != null || value != null) { pushRow(label, value); continue; }
+          // A row that is itself a group — descend once, not forever.
+          if (depth < 2) consume(item, depth + 1);
+        }
+      }
+      return;
+    }
+    if (typeof node === 'object') {
+      for (const [k, v] of Object.entries(node)) {
+        if (rows.length >= MAX_SPEC_ROWS) return;
+        if (v != null && typeof v === 'object') {
+          if (depth < 2) consume(v, depth + 1);   // grouped specs
+          continue;
+        }
+        pushRow(k, v);
+      }
+      return;
+    }
+    if (typeof node === 'string' || typeof node === 'number') pushRow(null, node);
+  };
+
+  consume(raw, 0);
+  return rows;
+}
+
 function snippetText(s, maxLen) {
   if (!s || typeof s !== 'string') return null;
   const trimmed = s.replace(/\s+/g, ' ').trim();
@@ -1393,8 +1580,27 @@ function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbidd
     // copy.headline (v3) / copy_picks.headline (v2) is the contract field; older
     // flat shapes kept so a contract change does not silently disable the
     // duplicate check.
+    // A NULL HEADLINE IS A COLLIDING HEADLINE, and missing that is why this
+    // guard never caught the reported bug.
+    //
+    // The check below compares populated lines against each other. A null was
+    // simply not pushed, so it could never collide with anything — and a round
+    // of three nulls passed clean. But null does not mean "no line": every
+    // nulled headline cascades downstream to the SAME string
+    // (directImageRenderService buildIntentData → layoutInput.copy.headline →
+    // brand.tagline; metaCascadeConfig.headline does the same for video). So
+    // three nulls render as one slogan three times — exactly the "same slogan in
+    // 3 different intent profiles" the owner rejected — while this validator
+    // reported the round as distinct.
+    //
+    // Nulls are therefore folded in under a sentinel. They collide with each
+    // other (two nulls = two ads with the identical fallback line) but never
+    // with a real headline, since no genuine line can equal the sentinel. One
+    // null is still allowed: it is a legitimate last resort for a single
+    // concept, and only becomes a repeat when a second concept does the same.
     const primary = c.copy?.headline ?? c.copy_picks?.headline ?? c.headline ?? c.primary_line ?? null;
-    if (primary && String(primary).trim()) primaries.push(String(primary).trim().toLowerCase());
+    const primaryText = primary == null ? '' : String(primary).trim();
+    primaries.push(primaryText ? primaryText.toLowerCase() : NULL_HEADLINE_SENTINEL);
 
     const copy = copyOf(c).join('  ');
     for (const bad of checkable) {
@@ -1409,9 +1615,16 @@ function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbidd
 
   const dupes = primaries.filter((p, i) => primaries.indexOf(p) !== i);
   if (dupes.length) {
-    reasons.push(
-      `two concepts share the same primary line (${JSON.stringify(dupes[0])}). ` +
-      `Each concept must lead with a DIFFERENT headline — reusing one makes the concepts identical to a viewer.`
+    // Two different failures, so say which one it is — "share the same primary
+    // line (null)" would read as a bug in the validator rather than a real
+    // finding, and the re-ask needs to know that the fix is to WRITE a
+    // headline, not to change one.
+    reasons.push(dupes[0] === NULL_HEADLINE_SENTINEL
+      ? `${dupes.length + 1} concepts left copy.headline null. A nulled headline is not "no line" — every one of them ` +
+        `falls back to the SAME brand tagline at render time, so the ads ship as one slogan repeated. ` +
+        `Write a distinct grounded headline for each: use a different review quote, or a product spec.`
+      : `two concepts share the same primary line (${JSON.stringify(dupes[0])}). ` +
+        `Each concept must lead with a DIFFERENT headline — reusing one makes the concepts identical to a viewer.`
     );
   }
   return reasons;
@@ -2288,7 +2501,51 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     ``,
     `RULES:`,
     `- DO NOT generate coordinates, rects, or pixel positions. The Layout stage materializes pixels from your strategy + media_picks + output_shape declaration.`,
-    `- The ${N_CONCEPTS_ROUND} concepts MUST be meaningfully different — different archetype OR different creative_style OR different media-pick combination OR different output_shape OR different copy angle.`,
+    // VARIETY, TIGHTENED FROM AN "OR" TO A REQUIREMENT ON COPY.
+    //
+    // The old rule let a round satisfy "meaningfully different" on archetype /
+    // style / media / output_shape ALONE, so three concepts could legally ship
+    // the same headline — or, with DIRECTOR_UNIVERSE_TOP_N=1 (the default),
+    // could only differ on archetype and style at all, because the media-pick
+    // and output_shape axes are both structurally single-valued at universe 1.
+    // Copy is the axis the operator actually reads, so it is now mandatory
+    // rather than one of five interchangeable options.
+    `- The ${N_CONCEPTS_ROUND} concepts MUST be meaningfully different — different archetype, different creative_style, different media-pick combination, or different output_shape — AND, separately and non-negotiably, each MUST carry its own copy angle grounded in a DIFFERENT piece of source material. Copy is not one of the interchangeable axes; it is a requirement on every concept. Two concepts whose headlines could be swapped without a viewer noticing is a failed round.`,
+    // GROUNDING — which source each style writes FROM.
+    //
+    // This is the fix for "three intent profiles, one repeated slogan". The
+    // Director was told nulling copy on thin data was fine, and every null then
+    // cascaded downstream to the same brand.tagline — so a round of three read
+    // as one line three times. It now has a per-style source to reach for, and
+    // two sources it never had at all: a RANKED multi-quote pool per proof tier
+    // (was 2 per tier, arrival-ordered) and product_signal.specs, which is real
+    // Immersive specification data that until now reached nothing in the ad
+    // pipeline despite being loaded on every call.
+    `- GROUNDING — write each concept's copy FROM a named source, chosen to suit its creative_style:`,
+    // TIER MATTERS FOR QUOTES, NOT JUST FOR NUMBERS — and the existing scope
+    // rule only covered numbers. proof_options deliberately surfaces category
+    // and brand tiers even on a product-scoped run, and brand quotes are
+    // withheld from primary_quote precisely because they may describe a
+    // DIFFERENT SKU. Telling the model to "write from the quote pool" without
+    // saying which tier is safe to quote AS this product re-opens that by the
+    // front door, and the pool is now twice the size. A brand-tier line about
+    // another garment, repeated verbatim as this product's testimonial, is a
+    // false claim about a real product — the one failure here that is worse
+    // than a repeated slogan.
+    `    social_proof_led  → a specific quote, PRODUCT TIER FIRST. Only proof_options[] entries with tier="product" describe THIS item and may be quoted or paraphrased as its testimonial. Paraphrase or excerpt honestly; keep the reviewer's own concrete detail rather than flattening it to "great quality".`,
+    `    social_proof_led (no product-tier quote available) → do NOT promote a category or brand quote into this product's voice: those may describe a different item in the catalogue. Use the tier's scoped NUMBER instead (proof_options[].reviews_text, already phrased for its tier), or switch this concept to a spec or brand-voice angle. Never attribute another SKU's words to this one.`,
+    `    ugc_led           → a quote or a top_comment, in the reviewer's/creator's own register — first person, casual, unpolished. Not marketing voice.`,
+    `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold.`,
+    `    brand_led         → brand_signal (tone, summary, tagline). This is the ONLY style that should lean on brand voice — it is the fallback of last resort for every other style, not their first move.`,
+    `    promotional       → the offer plus one hard fact: price / availability from product_signal, or a spec. Verbs first, numbers visible.`,
+    `- DO NOT ground two concepts in the SAME item. If two concepts are both proof-led, they must quote DIFFERENT reviews from the pool. If the pool has only one usable quote, the second concept must switch source — a spec, or brand voice — rather than restate the same quote.`,
+    // Counterweight to "THIN DATA IS NOT A STOP" below, which correctly tells
+    // the model it may null an UNGROUNDED role. Read alone, that instruction
+    // permitted nulling headline on all three concepts, which is the exact
+    // input that collapsed them onto one tagline. Specs are the escape hatch:
+    // they are product facts, so a headline built on one is grounded by
+    // definition and needs no proof to exist.
+    `- A NULLED HEADLINE IS A LAST RESORT, NOT A DEFAULT. If you have no quote and no rating, you almost certainly still have product_signal.specs or a product description — write from those. Only null copy.headline when the concept genuinely has no grounded thing to say, and never on all ${N_CONCEPTS_ROUND} concepts at once: that hands every ad the same fallback line and is indistinguishable from having written nothing.`,
     `- Lead with the STRONGEST signal in the data.`,
     // HONESTY RULE. The flag-ON variant adds the proof_options clause so the rule
     // cannot fire while the PROOF MENU is simultaneously offering usable,
@@ -2351,7 +2608,12 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
             : '';
           return `- OUTPUT SHAPE (Feed): routing.output_shape.format ∈ ${offered.join(' | ')}${multiNote}; tile_count matches media_picks.length.`;
         })(),
-    `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, and social_proof_signal.primary_quote when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`,
+    // `product_signal.specs` and the multi-quote pool added to this list so the
+    // authoritative COPY instruction sanctions the same sources the GROUNDING
+    // rules above tell each style to reach for. Leaving them out here would
+    // have the two blocks disagree, and this is the one the model treats as the
+    // definition of "allowed to ground on".
+    `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, product_signal.specs (real specification facts for THIS product — fabric, construction, weight, dimensions, care), social_proof_signal.primary_quote, and the wider quote pool in social_proof_signal.proof_options[].quotes when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`,
     `- ONE PRODUCT ONLY: every string you write describes product_signal.name and nothing else. brand_signal.* and brand_reviews_summary cover the WHOLE catalog — they are there for voice and tone, never for product facts. Never name, describe, or borrow the attributes of another item (a different garment, cut, fabric, or use case) even when the brand material talks about it. If the brand voice material is about a different product, take only its register and write fresh copy about THIS one. Concretely: a t-shirt ad never mentions leggings, joggers, or their fit.`,
     // CREATIVE STYLE. This was a bare enum listing with no selection criteria,
     // and routing.creative_style is what mints Ad.template downstream
@@ -2920,6 +3182,14 @@ module.exports = {
   validateConceptsRound,
   loadAvoidList,
   brandQuoteForDirectorSignal,
+  // Exported so the diversity harness can call the REAL validator rather than
+  // assert on its source text — a source check passes against any
+  // reimplementation that keeps the name, which is not what needs pinning here.
+  validateDirectorPayload,
+  // Exported for the same reason: the harness ranks/normalises with the shipped
+  // functions, so it cannot drift from what the Director actually receives.
+  normalizeProductSpecs,
+  scoreQuoteSafe,
   buildDirectorProofOptions,
   directorProofMenuEnabled,
   safeParseDirectorJSON,

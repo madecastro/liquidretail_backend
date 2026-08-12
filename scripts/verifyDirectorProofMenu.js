@@ -184,7 +184,36 @@ function check(name, cond, detail) {
   const opts = buildDirectorProofOptions({
     product: { rating: null, reviewCount: null, quotes: many }, category: null, brand: null
   });
-  check('A7 quotes capped at 2 per tier', opts[0]?.quotes?.length === 2, JSON.stringify(opts[0]));
+  // Cap raised 2 → 4 (MAX_QUOTES_PER_TIER). Two quotes per tier could not
+  // ground three distinct proof-led concepts, so the third had nothing new to
+  // say and fell back to the shared brand tagline — the "same slogan in three
+  // intent profiles" defect. The cap still matters (this rides in every
+  // Director prompt, across three tiers), it is just no longer 2.
+  check('A7 quotes capped at 4 per tier', opts[0]?.quotes?.length === 4, JSON.stringify(opts[0]));
+}
+// A7b — the property that actually matters, and which A7's count alone never
+// checked: the pool is RANKED, so the Director sees the best material first.
+// As of #157 the intake screen deliberately STORES generic praise instead of
+// discarding it, so `brandReviews.quotes` now carries lines that clear the >30
+// length filter and score 0. A first-N slice would hand the Director more
+// filler; ranking lets the filler fall off the end of the slice by itself.
+{
+  const generic  = 'High quality, functional and fashionable products.';
+  const specific = 'I wore these on a 12-hour offshore trip and they dried in minutes.';
+  // Generic arrives FIRST, so arrival order would surface it first.
+  const opts = buildDirectorProofOptions({
+    product: { rating: null, reviewCount: null, quotes: [
+      { text: generic, author: 'G' }, { text: specific, author: 'S' }
+    ] },
+    category: null, brand: null
+  });
+  const first = opts[0]?.quotes?.[0]?.text || '';
+  check('A7b the ranked pool puts the SPECIFIC quote ahead of generic praise',
+    first.startsWith('I wore these'),
+    `first quote was ${JSON.stringify(first)} — arrival order would have given the generic one`);
+  check('A7b-2 the generic quote is still offered (not discarded)',
+    (opts[0]?.quotes || []).some(q => q.text === generic),
+    'ranking must reorder, not filter — a brand whose whole pool is generic still needs its best-of');
 }
 {
   const opts = buildDirectorProofOptions({
