@@ -1865,6 +1865,23 @@ function hasPositiveSignal(text) {
  * quote is short on purpose, and scoring it as if it were competing for selection
  * rejects nearly everything. Exported for exactly that use.
  */
+/**
+ * clearsQualityFloor(text, opts) → boolean
+ *
+ * "Would this quote win the primary slot on its own merits?" — i.e. the PREFERRED tier
+ * of pickStrongestQuote, without its last-resort fallback.
+ *
+ * Exported for the render-time rotation, which must never rotate a good quote out in
+ * favour of a weaker one. pickStrongestQuote itself is the wrong predicate there: it now
+ * answers "is anything printable at all", so it says yes to generic praise, which is
+ * correct as a floor and wrong as a rotation candidate.
+ */
+function clearsQualityFloor(text, opts = {}) {
+  const s = String(text || '').trim();
+  if (!s) return false;
+  return scoreQuote(s, opts) >= SCORE_FLOOR && hasPositiveSignal(s);
+}
+
 function hasHardLimiter(text) {
   const s = String(text || '');
   const hit = HARD_LIMITER.test(s);
@@ -3773,6 +3790,7 @@ module.exports = {
   // the same definition of praise, rather than each growing its own lexicon.
   hasPositiveSignal,
   hasHardLimiter,
+  clearsQualityFloor,
   // Exported so the harness ranks with the SHIPPED scorer rather than a copy.
   scoreQuote,
   // Exported so scripts/verifyProofBeat.js can pin the R2 fix BEHAVIOURALLY
