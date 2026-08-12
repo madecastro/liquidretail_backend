@@ -838,6 +838,47 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   const merged  = mergeCascades(DEFAULT_META_CASCADES, brand?.metaCascades || null);
   const cascaded = resolveMeta(merged, context);
 
+  // ── PMax funnel variants must not be cosmetic re-skins ────────────────
+  // The three free retitles (awareness / consideration / conversion) all
+  // resolve against the SAME LayoutInputArtifact, because buildMetaForAd
+  // scopes that lookup by {mediaId, productId} with no stage dimension. So
+  // every variant printed the same headline and differed only in preset
+  // styling — precisely what the Director prompt forbids in as many words:
+  // "the three stages must each appear exactly once so Google has distinct
+  // approaches to test — not cosmetic variations of one ad."
+  //
+  // The distinct copy already existed. A PMax round is REQUIRED to spread
+  // the three stages across its three concepts, each with its own copy
+  // block; nothing ever asked for it by stage. This asks.
+  //
+  // Read-only and best-effort by construction: videoHeadlineService never
+  // calls the Director LLM, so this cannot bill. It only overrides when a
+  // stage-specific headline actually resolves — no candidates means the
+  // cascade's own answer stands, never a template and never an empty slot.
+  if (ad?.funnelStage && cascaded) {
+    try {
+      const { resolveVideoHeadline } = require('./videoHeadlineService');
+      const staged = await resolveVideoHeadline({
+        brandId:      brand?._id || ad.brandId || null,
+        productId:    ad.productId || null,
+        campaignKind: ad.campaignKind || null,
+        aspectRatio:  ad.aspectRatio || null,
+        funnelStage:  ad.funnelStage
+      });
+      if (typeof staged === 'string' && staged.trim() && staged !== cascaded.headline) {
+        console.log(
+          `   🎯 funnelCopy[ad=${ad._id}] stage=${ad.funnelStage}: ` +
+          `headline differentiated ("${String(cascaded.headline || '').slice(0, 28)}" → "${staged.slice(0, 28)}")`
+        );
+        cascaded.headline = staged;
+      }
+    } catch (err) {
+      // Differentiation is an enhancement, not a render gate — the video is
+      // already billed by the time titling runs.
+      console.warn(`   ⚠️  funnelCopy[ad=${ad?._id}]: stage headline failed (${err.message}) — keeping cascade headline`);
+    }
+  }
+
   // Derived fields — not cascadeable because they depend on other
   // resolved meta or on ad-level state that isn't a data source.
   // endcardMode routes the canonical scripts' brand vs product endcard

@@ -215,8 +215,58 @@ function selectVideoHeadline({ candidates, format, budgetChars } = {}) {
 //
 // Never throws: null/non-array input, non-object entries, and missing/
 // null copy fields all just contribute nothing.
-function candidatesFromConcepts(concepts) {
+/**
+ * The funnel stage a concept declares, or null. PMax rounds are REQUIRED to
+ * spread awareness / consideration / conversion across their three concepts —
+ * the Director prompt says so in as many words: "the three stages must each
+ * appear exactly once so Google has distinct approaches to test — not cosmetic
+ * variations of one ad."
+ *
+ * Dual-read v3 `routing.funnel_stage` / a flat `funnel_stage`, the same shape
+ * tolerance candidatesFromConcepts already applies to copy vs copy_picks.
+ */
+function conceptFunnelStage(c) {
+  const r = c && typeof c === 'object' ? c : {};
+  const routed = r.routing && typeof r.routing === 'object' ? r.routing.funnel_stage : null;
+  const flat = typeof r.funnel_stage === 'string' ? r.funnel_stage : null;
+  const stage = typeof routed === 'string' ? routed : flat;
+  return typeof stage === 'string' && stage.trim() ? stage.trim().toLowerCase() : null;
+}
+
+/**
+ * @param {Array} concepts
+ * @param {string|null} funnelStage  when set, THIS stage's concept supplies the
+ *   candidates first; every other concept follows as fallback.
+ *
+ * WHY THE STAGE ARGUMENT EXISTS (owner, 2026-08-12). This flattened every
+ * concept's copy into one pool and ignored funnel_stage entirely. Downstream,
+ * selectVideoHeadline picks the best FITTING candidate from that pool — which
+ * is deterministically the same string for all three PMax funnel variants. So
+ * awareness, consideration and conversion shipped identical headlines, differing
+ * only in preset styling: exactly the "cosmetic variations of one ad" the
+ * Director is instructed to avoid. The distinct copy was always there; nothing
+ * asked for it by stage.
+ *
+ * Ordering, not filtering: a stage whose concept carried no usable copy still
+ * falls back to the rest of the round rather than going empty. A thinner but
+ * present headline beats no headline, and the caller's contract is "null means
+ * no Director copy", never a template.
+ */
+function candidatesFromConcepts(concepts, funnelStage = null) {
   if (!Array.isArray(concepts)) return [];
+  const want = typeof funnelStage === 'string' && funnelStage.trim()
+    ? funnelStage.trim().toLowerCase()
+    : null;
+  if (want) {
+    const matching = concepts.filter(c => conceptFunnelStage(c) === want);
+    if (matching.length) {
+      const others = concepts.filter(c => conceptFunnelStage(c) !== want);
+      return [
+        ...candidatesFromConcepts(matching, null),
+        ...candidatesFromConcepts(others, null)
+      ];
+    }
+  }
   const headlines = [];
   const subheadlines = [];
   const eyebrows = [];
@@ -274,6 +324,7 @@ async function resolveVideoHeadlineCandidates({
   productId      = null,
   campaignKind   = null,
   creativeIntent = null,
+  funnelStage    = null,
   fetchRounds    = defaultFetchRounds
 } = {}) {
   if (!brandId) return [];
@@ -311,7 +362,7 @@ async function resolveVideoHeadlineCandidates({
   if (!Array.isArray(rows) || !rows.length) return [];
 
   for (const row of rows) {
-    const candidates = candidatesFromConcepts(row && row.concepts);
+    const candidates = candidatesFromConcepts(row && row.concepts, funnelStage);
     if (candidates.length) return candidates;
   }
   return [];
@@ -327,12 +378,13 @@ async function resolveVideoHeadline({
   campaignKind   = null,
   creativeIntent = null,
   aspectRatio    = null,
+  funnelStage    = null,
   fetchRounds    = defaultFetchRounds
 } = {}) {
   try {
     const format = classifyHeadlineFormat(aspectRatio);
     const candidates = await resolveVideoHeadlineCandidates({
-      brandId, productId, campaignKind, creativeIntent, fetchRounds
+      brandId, productId, campaignKind, creativeIntent, funnelStage, fetchRounds
     });
     return selectVideoHeadline({ candidates, format });
   } catch (err) {
@@ -345,6 +397,7 @@ module.exports = {
   // Pure — offline-testable, no DB
   selectVideoHeadline,
   candidatesFromConcepts,
+  conceptFunnelStage,
   classifyHeadlineFormat,
   budgetForFormat,
   HEADLINE_CHAR_BUDGET,
