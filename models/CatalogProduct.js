@@ -69,6 +69,16 @@ const catalogProductSchema = new mongoose.Schema({
   // the missing fields.
   draft:        { type: Boolean, default: false, index: true },
 
+  // Soft-delete tombstone. Set by catalog.deleteProduct /
+  // catalog.bulkDeleteProducts; NEVER cleared automatically. Every
+  // /api/catalog* read filters { deletedAt: null } (mirrors the
+  // Media schema pattern). Historical ads / campaigns still resolve
+  // the row when they need to (renderer joins by _id, not by list
+  // scan) — the soft delete only hides it from picker + browser
+  // surfaces. Hard delete goes through cascadeCleanupOnDelete +
+  // deleteOne — for that path, the row goes away entirely.
+  deletedAt:    { type: Date, default: null, index: true },
+
   // Back-pointer to the Media that triggered detect-identified
   // creation. Lets the drafts UI deep-link "see this product in the
   // detect view." Null for ig-catalog and manual-upload rows.

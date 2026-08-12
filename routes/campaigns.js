@@ -79,7 +79,11 @@ router.get('/', async (req, res) => {
       if (catOids.length) {
         const prods = await CatalogProduct.find({
           brandId,
-          categoryRef: { $in: catOids }
+          categoryRef: { $in: catOids },
+          // Soft-deleted products don't count toward campaign
+          // intersection — the wizard shouldn't route via a tombstoned
+          // SKU.
+          deletedAt:   null
         }).select('_id').lean();
         // Merge with any explicit product ids (both params can coexist
         // for a future path that wants both category + specific SKUs).

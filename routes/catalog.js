@@ -226,6 +226,11 @@ router.get('/', async (req, res) => {
     }
     if (req.query.inStock === '1') filter.availability = /in stock/i;
     if (req.query.hasReviews === '1') filter['productReviews.quotes.0'] = { $exists: true };
+    // Soft-delete guard — hide tombstoned rows from every list surface
+    // (catalog browser, wizard pickers). Direct-id reads (findById on
+    // the detail / renderer paths) intentionally stay unguarded so
+    // historical ads still resolve their source product row.
+    filter.deletedAt = null;
 
     // Sort by matchCount desc → lastSyncedAt desc so products with
     // UGC matches stack at the top. Done as a single aggregation so
@@ -296,7 +301,7 @@ router.get('/', async (req, res) => {
       ]),
       CatalogProduct.countDocuments(filter),
       CatalogProduct.distinct('category', { brandId }),
-      CatalogProduct.countDocuments(tenantFilter(req, { brandId, draft: true }))
+      CatalogProduct.countDocuments(tenantFilter(req, { brandId, draft: true, deletedAt: null }))
     ]);
 
     res.json({
@@ -399,7 +404,10 @@ router.get('/categories', async (req, res) => {
       { $match: {
           advertiserId: aggAdvertiserId,
           brandId:      brandObjectId,
-          categoryRef:  { $ne: null }
+          categoryRef:  { $ne: null },
+          // Soft-delete guard — tombstoned products don't contribute
+          // to the "N products" label per category in the picker.
+          deletedAt:    null
       } },
       { $group: { _id: '$categoryRef', count: { $sum: 1 } } }
     ]);
@@ -550,6 +558,8 @@ router.get('/ads-summary', async (req, res) => {
     const filter = tenantFilter(req, { brandId });
     // Exclude draft (review-queue) products — they're not ad-targetable yet.
     filter.draft = { $ne: true };
+    // Soft-delete guard — Product Ads doesn't surface tombstoned rows.
+    filter.deletedAt = null;
 
     // Optional category filter (?categoryId=X). Powers the Product Ads
     // page Category dropdown. Empty string or 'all' = no filter.

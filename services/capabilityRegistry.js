@@ -970,6 +970,177 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Catalog bulk ops (2026-08-12) — insert / patch / delete ──────
+
+  {
+    id:       'catalog.deleteProduct',
+    title:    'Delete a catalog product',
+    describe: 'Single-row delete. Soft by default (sets deletedAt=now — historical ads still resolve the row by _id, catalog + wizard surfaces filter it out); pass hardDelete=true to Mongo-delete the row after cascade cleanup. Cascade runs in BOTH modes: pulls the productId from Campaign.matchedProductIds + Media.matchedProducts, and unsets Ad.productId (Ad rows keep for history). Reversible from soft — unset deletedAt to restore. Requires operator confirmation.',
+    tier:     1,
+    scope:    'product',
+    args: {
+      type: 'object',
+      required: ['productId'],
+      properties: {
+        productId:  { type: 'string', description: 'CatalogProduct ObjectId.' },
+        hardDelete: { type: 'boolean', description: 'False (default) = soft delete via deletedAt tombstone. True = irreversible Mongo delete after cascade.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogDeleteProduct',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'catalog.bulkCreateProducts',
+    title:    'Create multiple catalog products',
+    describe: 'Bulk single-brand insert. Each row in products[] follows the catalog.createProduct shape (title, imageUrl, price?, currency?, productUrl?, gtin?, mpn?, category?, description?). Idempotent on (brandId, externalId=\'manual:<slug>\') — an existing row with the same title-slug is updated in place, not duplicated. Per-row failures are non-fatal and reported in response.errors[]. Cap: 500 products per call. mirrorImages:true (default) mirrors each imageUrl into Cloudinary; false skips (fast but the row\'s imageUrl expires if the source does). Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId', 'products'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        mirrorImages: { type: 'boolean', description: 'True (default) = mirror each imageUrl into Cloudinary. False = accept the raw URL as-is (fast but source-dependent).' },
+        products: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 500,
+          description: 'Array of product rows to upsert. Each row follows the catalog.createProduct shape.',
+          items: {
+            type: 'object',
+            required: ['title', 'imageUrl'],
+            properties: {
+              title:       { type: 'string', minLength: 1, maxLength: 500 },
+              imageUrl:    { type: 'string', maxLength: 2000, description: 'Remote image URL — must be http:// or https://.' },
+              price:       { type: ['number', 'null'] },
+              currency:    { type: ['string', 'null'], maxLength: 3 },
+              productUrl:  { type: ['string', 'null'], maxLength: 2000 },
+              gtin:        { type: ['string', 'null'], maxLength: 20 },
+              mpn:         { type: ['string', 'null'], maxLength: 200 },
+              category:    { type: ['string', 'null'], maxLength: 500 },
+              description: { type: ['string', 'null'], maxLength: 4000 }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogBulkCreateProducts',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'catalog.bulkPatchProducts',
+    title:    'Patch multiple catalog products',
+    describe: 'Two shapes, one wins per call. (1) patches:[{productId, patch}] — per-row explicit patches, different rows can have different patches. (2) filter+patch — every product matching the filter gets the SAME patch applied. Field allowlist matches catalog.patchProduct: title, brand, category, price, currency, productUrl, imageUrl, description, draft. Cap: 500 rows per call — the filter branch COUNTS first and refuses if the resolved set would exceed the cap (no partial writes on filter typos). Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId: { type: 'string', description: 'Brand ObjectId.' },
+        // Branch A — explicit
+        patches: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 500,
+          description: 'Explicit per-row patches. Use for varied-per-row updates (e.g. bulk price adjustment). Mutually exclusive with filter+patch.',
+          items: {
+            type: 'object',
+            required: ['productId', 'patch'],
+            properties: {
+              productId: { type: 'string' },
+              patch:     { type: 'object', additionalProperties: true }
+            },
+            additionalProperties: false
+          }
+        },
+        // Branch B — filter
+        filter: {
+          type: 'object',
+          description: 'Filter DSL for mass update. Use for uniform updates across a subset. Mutually exclusive with patches[].',
+          properties: {
+            category:         { type: 'string', description: 'Raw feed category string exact-match.' },
+            categoryRefs:     { type: 'array', items: { type: 'string' }, description: 'Category ObjectIds — union.' },
+            source:           { type: 'string', description: 'CatalogProduct.source enum value.' },
+            draft:            { type: 'boolean' },
+            lastSyncedBefore: { type: 'string', description: 'ISO date; matches rows with lastSyncedAt < this.' },
+            productIds:       { type: 'array', items: { type: 'string' }, description: 'Explicit ids — trumps the other filter keys.' }
+          },
+          additionalProperties: false
+        },
+        patch: {
+          type: 'object',
+          description: 'Fields to apply — same shape as catalog.patchProduct updates.',
+          properties: {
+            title:       { type: ['string', 'null'], maxLength: 2000 },
+            brand:       { type: ['string', 'null'], maxLength: 2000 },
+            category:    { type: ['string', 'null'], maxLength: 2000 },
+            price:       { type: ['number', 'null'] },
+            currency:    { type: ['string', 'null'], maxLength: 2000 },
+            productUrl:  { type: ['string', 'null'], maxLength: 2000 },
+            imageUrl:    { type: ['string', 'null'], maxLength: 2000 },
+            description: { type: ['string', 'null'], maxLength: 2000 },
+            draft:       { type: 'boolean' }
+          },
+          additionalProperties: false
+        }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogBulkPatchProducts',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'catalog.bulkDeleteProducts',
+    title:    'Delete multiple catalog products',
+    describe: 'Two shapes: (1) productIds:[...] — explicit ids for surgical removal; (2) filter — every product matching the DSL. hardDelete:true runs cascade cleanup + Mongo deleteMany (irreversible). Default is soft — sets deletedAt=now on every match. Cascade runs in BOTH modes (Campaign.matchedProductIds pull, Media.matchedProducts pull, Ad.productId unset). Cap: 500 rows per call — the filter branch COUNTS first and refuses if the resolved set exceeds the cap (no partial deletes on filter typos). TIER 4 — bulk delete can nuke thousands of rows on a typo, so operator must confirm with the phrase gate.',
+    tier:     4,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:    { type: 'string', description: 'Brand ObjectId.' },
+        productIds: { type: 'array', items: { type: 'string' }, maxItems: 500, description: 'Explicit product ids to delete. Mutually exclusive with filter.' },
+        filter: {
+          type: 'object',
+          description: 'Filter DSL for mass delete. Mutually exclusive with productIds.',
+          properties: {
+            category:         { type: 'string' },
+            categoryRefs:     { type: 'array', items: { type: 'string' } },
+            source:           { type: 'string' },
+            draft:            { type: 'boolean' },
+            lastSyncedBefore: { type: 'string', description: 'ISO date; useful for stale-cleanup ("everything not synced in 90 days").' },
+            productIds:       { type: 'array', items: { type: 'string' } }
+          },
+          additionalProperties: false
+        },
+        hardDelete: { type: 'boolean', description: 'False (default) = soft delete via deletedAt tombstone. True = irreversible Mongo delete after cascade.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogBulkDeleteProducts',
+      method:  'run'
+    }
+  },
+
   // ── Phase 6: Detection + layouts — T0 read ───────────────────────
 
   {
