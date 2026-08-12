@@ -240,14 +240,35 @@ check('A7 LayoutInputArtifact secondary_quotes is capped (10→30 must not 3× t
 });
 
 check('A8 assemble stamps .tier on every surviving quote (not just primary)', () => {
+  // BEHAVIOURAL, deliberately. The previous form asserted the helper's
+  // DECLARATION SHAPE (/const stampTier\s*=/) plus a raw call count >= 4.
+  // Hoisting the closures to module scope so the stage-aware pick ranks the
+  // same pool the renderer prints from broke that regex with behaviour
+  // unchanged — a name scan cannot distinguish a refactor from a regression,
+  // and one that fires on the wrong thing gets "fixed" by contorting the code.
+  const { stampTier } = require(path.join(ROOT, 'services/layoutInputService.js'));
+
+  // Stamps an unstamped quote with the tier it was given...
+  const out = stampTier([{ text: 'unstamped' }, { text: 'already', tier: 'product' }], 'brand');
+  assert.equal(out.length, 2, 'stampTier dropped a quote');
+  assert.equal(out[0].tier, 'brand', 'stampTier did not stamp an unstamped quote');
+  // ...and never overwrites one already set (product must survive a brand pass).
+  assert.equal(out[1].tier, 'product', 'stampTier overwrote an existing tier');
+  assert.deepEqual(stampTier(null, 'brand'), [], 'stampTier must tolerate null');
+
+  // Every one of the four tiers must still be produced by a stamping helper.
+  // Structural, but tolerant of WHICH helper and of its declaration form.
   const src = read(SRC_LAYOUT);
-  assert.ok(/const stampTier\s*=/.test(src), 'stampTier helper missing');
-  const calls = (src.match(/stampTier\(/g) || []).length;
-  assert.ok(calls >= 4, `expected stampTier on all four tiers, got ${calls} calls`);
-  assert.ok(/,\s*'product'\s*\)/.test(src));
-  assert.ok(/,\s*'category'\s*\)/.test(src));
-  assert.ok(/,\s*'brand'\s*\)/.test(src));
-  assert.ok(/,\s*'comment'\s*\)/.test(src));
+  for (const [name, tier] of [
+    ['tierProduct', 'product'], ['tierCategory', 'category'],
+    ['tierBrand', 'brand'], ['tierComment', 'comment']
+  ]) {
+    const m = src.match(new RegExp(`const ${name}\\s*=[\\s\\S]{0,500}?;`));
+    assert.ok(m, `${name} assignment not found`);
+    assert.ok(/stampTier\(|prepareQuotePool\(/.test(m[0]),
+      `${name} is not routed through a tier-stamping helper`);
+    assert.ok(m[0].includes(`'${tier}'`), `${name} does not carry the '${tier}' tier name`);
+  }
 });
 
 // ── B. fingerprint reuse ────────────────────────────────────────────────

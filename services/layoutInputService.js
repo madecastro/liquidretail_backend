@@ -2162,11 +2162,16 @@ function printableQuotes(quotes, tierName) {
 function stampTier(quotes, tierName) {
   return (quotes || []).filter(Boolean).map((q) => (q.tier ? q : { ...q, tier: tierName }));
 }
-// Product- and category-tier prep, in ONE place, so pickPrimaryProductQuote
-// ranks exactly the pool the renderer prints from. Composition is identical to
-// the four nested calls this replaced — stampTier ∘ gateQuotesByRating ∘
-// printableQuotes ∘ stampQuoteOrigins. Brand and comment tiers deliberately do
-// NOT use this: brand skips stampTier and comment skips stampQuoteOrigins.
+// Tier pool prep, in ONE place, so pickPrimaryProductQuote ranks exactly the
+// pool the renderer prints from. Composition is identical to the nested calls
+// this replaced — stampTier ∘ gateQuotesByRating ∘ printableQuotes ∘
+// stampQuoteOrigins — for product and category.
+//
+// BRAND also routes through here, which stamps tier one step earlier than
+// before; that is neutral and verified, not incidental. selectBrandQuotesForScope
+// is tier-blind, and the only .tier reader (applyStrictQuoteScope) treats
+// unstamped and 'brand' identically, so the later stampTier(…, 'brand') is an
+// idempotent no-op. COMMENT tier does not use this: it skips stampQuoteOrigins.
 function prepareQuotePool(container, quotes, tierName) {
   return stampTier(
     gateQuotesByRating(printableQuotes(stampQuoteOrigins(container, quotes), tierName), tierName),
@@ -4014,6 +4019,13 @@ module.exports = {
   // broken once by a merge with nothing to catch it.
   gateQuotesByRating,
   pickStrongestQuote,
+  // Exported so verifyQuoteRotation A8 can pin tier stamping BEHAVIOURALLY.
+  // The old form asserted /const stampTier\s*=/ plus a call count, which
+  // hoisting these out of buildQuotePool broke while behaviour was unchanged —
+  // a name scan cannot tell a refactor from a regression. Same reasoning as
+  // deriveSocialProofNumbers above.
+  stampTier,
+  prepareQuotePool,
   // Stage-aware quote wiring (QUOTE_STAGE_AWARE) + Director pool
   // alignment (pickPrimaryProductQuote). Exported so the harness and
   // aiCreativeDirectorService call the shipped functions, not copies.
