@@ -546,7 +546,18 @@ function buildVeoPrompt({
   // keeps hook-first timing + centre-safe/Frame treatment while using lifestyle
   // scene/motion directives.
   seedStyle = null,
-  variantKind = null
+  variantKind = null,
+  // PMax 16:9 split-stage (2026-08). Absent/null → byte-identical to pre-
+  // split output (same contract as REFRAME_PROMPT_HARDENING flag-off).
+  // Active ONLY when subjectSide is 'east'|'west' AND aspect is 16:9 —
+  // any other combo must not touch a single character of today's prompt.
+  // east = subject on the RIGHT (copy panel left); west = mirror.
+  // panelTreatment 'brand_panel' = opposite side is a flat brand-colour
+  // backdrop; 'scene_extend' / null = continued calm scene. Callers gate
+  // on PMAX_SPLIT_VIDEO; this builder never reads that env itself so a
+  // forgotten flag cannot still leak split language via residual args.
+  subjectSide = null,
+  panelTreatment = null
 }) {
   const lines = [];
   const lifestyle = shouldUseLifestyleVideoPrompt(seedStyle, variantKind);
@@ -565,6 +576,18 @@ function buildVeoPrompt({
   // Used by the PMax timeline only. Meta's timeline is frozen and must not
   // become aspect-aware (see the PR #61 rollback note above).
   const isVerticalAspect = String(aspectRatio || '') === '9:16';
+  // Split-stage gate. 16:9-only: a 9:16 ad with subjectSide set must stay
+  // on today's centre-safe path (vertical already has no lateral pan, and
+  // a side-anchored subject on portrait would fight the engagement rail).
+  // Strict string match — truthy non-enum values must not activate split
+  // (same fail-closed pattern as force === true on IG re-scan).
+  const isSplit = (subjectSide === 'east' || subjectSide === 'west')
+    && String(aspectRatio || '') === '16:9';
+  // Human-readable side labels for the directives. east→right / west→left
+  // is the owner convention (subject band vs opposite calm panel).
+  const sideLabel = isSplit ? (subjectSide === 'east' ? 'right' : 'left') : null;
+  const oppositeLabel = isSplit ? (subjectSide === 'east' ? 'left' : 'right') : null;
+  const isBrandPanel = isSplit && panelTreatment === 'brand_panel';
 
   // Operator refinement (regeneration only). Leads the prompt so the
   // video model sees the requested change before the fixed spec below.
@@ -617,17 +640,29 @@ function buildVeoPrompt({
   const t1  = (dur / 3).toFixed(2);
   const t2  = (dur * 0.64).toFixed(2);
   if (lifestyle && isPmax) {
+    // Split-stage (16:9 + subjectSide): the stock lifestyle+PMax path holds
+    // the product in the "central band" and later injects centre-safe that
+    // bans outer side margins — both actively forbid anchoring the subject
+    // to one side for the calm opposite panel. Under split, hold the product
+    // in the subject-side band for the whole clip; beat times (t1/t2) stay
+    // identical so Remotion's brand-script still lines up via specTimeScale.
     lines.push(
       `Timeline (${dur.toFixed(1)}s): ` +
       `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame in the real lifestyle plate; ` +
       `gentle camera finds and holds the product already in the scene; ambient life may begin (fabric with the wearer, hair, breath, steam, water, foliage as present). ` +
       (isVerticalAspect
         ? `Product held on the vertical centre line — no lateral drift toward either side margin. `
-        : `Product held in the central band of the wide frame. `) +
+        : isSplit
+          ? `Product held in the ${sideLabel} vertical band of the wide frame for the whole clip — no lateral drift, pan, or travel toward the ${oppositeLabel}. `
+          : `Product held in the central band of the wide frame. `) +
       `No whip, no orbit, no parallax. The product must be unmistakable within the first 2.0s. ` +
-      `Scene 2 (${t1}–${t2}s): hold the product as the star with centre-safe framing; soft ambient motion continues; optional gentle push or drift as a real camera would. ` +
-      `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
-      `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear and centre-safe; natural motion only, never fantasy.`
+      (isSplit
+        ? `Scene 2 (${t1}–${t2}s): hold the product as the star, subject-anchored in the ${sideLabel} band; soft ambient motion continues; optional gentle push on the product itself (~8–12%) as a real camera would. ` +
+          `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
+          `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable end state with the product still clear in the ${sideLabel} band; never drift toward the ${oppositeLabel}; natural motion only, never fantasy.`
+        : `Scene 2 (${t1}–${t2}s): hold the product as the star with centre-safe framing; soft ambient motion continues; optional gentle push or drift as a real camera would. ` +
+          `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
+          `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear and centre-safe; natural motion only, never fantasy.`)
     );
   } else if (lifestyle) {
     lines.push(
@@ -648,12 +683,30 @@ function buildVeoPrompt({
       // centre-safe rule stated in cameraStyle two lines later. The Frame line
       // is already aspect-aware; the timeline has to be too, or the two halves
       // of the same prompt disagree.
+      //
+      // Split-stage (2026-08, 16:9 + subjectSide east|west): a left→right pan
+      // drags the subject straight through the opposite-side region reserved
+      // for brand-script chrome (pill → headline → quote → CTA). Replace the
+      // pan with a product-anchored push-in; keep t1/t2 beat times identical
+      // so titling's specTimeScale still lands on the same grid.
       (isVerticalAspect
         ? `Very slow push-in toward the product, ~8–12% movement, product held on the vertical centre line. No lateral drift toward either side margin. No rotation or perspective shift. `
-        : `Slow horizontal pan left→right across the product, ~10–15% movement. No zoom, rotation, or perspective shift. `) +
+        : isSplit
+          ? `Product anchored in the ${sideLabel} vertical band of the wide frame for the entire clip — no lateral pan, drift, or travel toward the ${oppositeLabel}. Subtle push-in on the product itself only, ~8–12% movement. No rotation or perspective shift. `
+          : `Slow horizontal pan left→right across the product, ~10–15% movement. No zoom, rotation, or perspective shift. `) +
       `The product must be unmistakable within the first 2.0s. ` +
-      `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
-      `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain centre-safe framing.`
+      // Scene 2 "centered" under split: the stock word means "zoom centered
+      // on the logo/detail", but models (and prompt readers) also take it as
+      // frame-centre composition — which re-pulls a side-anchored product
+      // toward the middle and undoes the split. Keep the SAME product-detail
+      // zoom intent (~8–10%) but reword to subject-anchored in the side band.
+      // Decision (2026-08): YES, rewrite under split; leave "centered" alone
+      // on the non-split path (byte-identity).
+      (isSplit
+        ? `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), subject-anchored in the ${sideLabel} band — do not re-centre the product in the frame. No rotation or distortion. ` +
+          `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Hold the product in the ${sideLabel} band throughout; never drift toward the ${oppositeLabel}.`
+        : `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
+          `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain centre-safe framing.`)
     );
   } else {
     lines.push(
@@ -664,15 +717,58 @@ function buildVeoPrompt({
     );
   }
   lines.push(d.transitions);
-  lines.push(d.cameraStyle);
+  // Packshot PMax cameraStyle (PMAX_DIRECTIVES) embeds the same centre-safe
+  // "central region / outer side margins" clause that the lifestyle inject
+  // below carries. Under split that clause FORBIDS side-anchoring — the twin
+  // of the lifestyle trap that was nearly missed in review. Emit a split-
+  // safe camera line for packshot+split only; every other path keeps the
+  // stock directive so non-split prompts stay byte-identical.
+  if (isSplit && isPmax && !lifestyle) {
+    // DERIVED, NOT REWRITTEN. An earlier draft hardcoded a replacement camera
+    // style; that copy both drifted from the canonical directive and permitted
+    // "parallax" while still asserting "The product stays completely static" —
+    // a self-contradicting instruction on a billable submit. Substituting only
+    // the centre-safe sentence keeps the shared prohibition list (incl.
+    // parallax) and every future edit to PMAX_DIRECTIVES.cameraStyle verbatim.
+    // The harness pins that the prohibition survives.
+    const splitComposition =
+      `Split-stage composition: hold the product in the ${sideLabel} vertical band of the wide frame, ` +
+      `away from the top and bottom bands where the platform overlays UI; ` +
+      `never drift, pan or travel toward the ${oppositeLabel}. `;
+    const centreSafeSentence =
+      `Centre-safe composition: keep the product and any focal detail within the central region of the frame — ` +
+      `away from the top and bottom bands and the outer side margins, where the platform overlays UI. `;
+    lines.push(
+      d.cameraStyle.includes(centreSafeSentence)
+        ? d.cameraStyle.replace(centreSafeSentence, splitComposition)
+        // Directive changed shape — append rather than silently ship a
+        // centre-safe instruction that forbids the anchoring we just asked for.
+        : `${d.cameraStyle} ${splitComposition}`
+    );
+  } else {
+    lines.push(d.cameraStyle);
+  }
   // Centre-safe is PMax destination treatment. Lifestyle cameraStyle does not
   // carry it (would change Meta lifestyle); inject when both are active.
   // Complementary with lifestyle motion — not a contradiction.
+  //
+  // Split-stage exception (2026-08): centre-safe says "away from … the outer
+  // side margins", which directly forbids anchoring the subject to one side.
+  // That combination (lifestyle + PMax + split) was the one nearly missed in
+  // review because the inject only fires on lifestyle+PMax. Under split emit
+  // the side-anchored composition instead — never both.
   if (lifestyle && isPmax) {
-    lines.push(
-      `Centre-safe composition (PMax destination): keep the product and any focal detail within the central region of the frame — ` +
-      `away from the top and bottom bands and the outer side margins, where the platform overlays UI.`
-    );
+    if (isSplit) {
+      lines.push(
+        `Split-stage composition (PMax destination): keep the product and any focal detail in the ${sideLabel} vertical band of the wide frame for the whole clip — ` +
+        `do not centre it or drift it toward the ${oppositeLabel} side. Keep the ${oppositeLabel} side calm, uncluttered, and unobstructed.`
+      );
+    } else {
+      lines.push(
+        `Centre-safe composition (PMax destination): keep the product and any focal detail within the central region of the frame — ` +
+        `away from the top and bottom bands and the outer side margins, where the platform overlays UI.`
+      );
+    }
   }
 
   // Aspect-aware framing — PMax destination (packshot AND lifestyle). Meta
@@ -680,10 +776,40 @@ function buildVeoPrompt({
   if (isPmax) {
     const ar = String(aspectRatio || '');
     if (ar === '16:9') {
-      lines.push(
-        `Frame (16:9 landscape): use wider establishing framing; prefer horizontal camera travel rather than vertical. ` +
-        `Hold the product in the central band of the wide frame with generous headroom above and below the product.`
-      );
+      if (isSplit) {
+        // Opposite-side calm language deliberately avoids the words "text",
+        // "copy", "caption" as things the model should leave room for — the
+        // prompt already carries noText ("Do NOT render any text… causes
+        // rejection"). "Leave room for text" induces letterforms; "keep that
+        // region calm and unobstructed" does not. Chrome is composited
+        // downstream (brand pill ≤1s → headline 0–3s → quote 3–7s → CTA 7–10s).
+        lines.push(
+          `Frame (16:9 landscape, split-stage): anchor the product in a vertical band on the ${sideLabel} side of the wide frame for the entire clip. ` +
+          // "push-in" ONLY — never "parallax". The shared camera prohibition
+          // list in PMAX_DIRECTIVES.cameraStyle forbids parallax outright, and
+          // an earlier draft prescribed it here while that ban was still in the
+          // same prompt: a self-contradicting instruction on a billable submit.
+          // A push-in is a zoom, which the list permits.
+          `Camera motion is limited to a subtle push-in on the product itself (~8–12%); do not pan, drift, or travel the product toward the ${oppositeLabel} side. ` +
+          `Keep the ${oppositeLabel} side visually calm, uncluttered, and free of new objects or competing focal detail so that region stays unobstructed.`
+        );
+        if (isBrandPanel) {
+          lines.push(
+            `Opposite-side treatment: the ${oppositeLabel} side is a plain uniform brand-colour backdrop — keep it clean, flat, and unmodified; do not invent scene content or new objects there.`
+          );
+        } else {
+          // scene_extend (default / explicit). Seed may already carry the
+          // extended plate; either way the opposite band must stay calm.
+          lines.push(
+            `Opposite-side treatment: the ${oppositeLabel} side continues the existing scene as a calm extension — no new objects, people, or busy detail introduced there.`
+          );
+        }
+      } else {
+        lines.push(
+          `Frame (16:9 landscape): use wider establishing framing; prefer horizontal camera travel rather than vertical. ` +
+          `Hold the product in the central band of the wide frame with generous headroom above and below the product.`
+        );
+      }
     } else if (ar === '9:16') {
       lines.push(
         `Frame (9:16 vertical): vertical-appropriate framing with the product readable upright in portrait. ` +
