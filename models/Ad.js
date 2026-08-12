@@ -255,19 +255,25 @@ const adSchema = new mongoose.Schema({
   //   - Meta `meta_feed_1_1` / `meta_feed_4_5` / `meta_reels_9_16`
   //     (source `meta_stories_9_16`) — added 2026-08-11
   //
-  // ⚠️ MONEY, AND THE TWO FAMILIES DIFFER — do not read one rule for both.
-  // The render gate additionally fail-closes on
-  // `platformFormat === 'pmax_video_1_1'` and on `funnelStage` being set, so
-  // for THOSE a dropped value here still cannot turn a free derivation into a
-  // paid master. **The Meta surfaces have no such second gate**, and cannot:
-  // `meta_feed_1_1` / `meta_feed_4_5` / `meta_reels_9_16` are ALSO legitimate
-  // standalone billable formats (an operator picking a lone 4:5 in Advanced is
-  // buying one real Omni master at that aspect), so fail-closing on those ids
-  // would turn every hand-picked single-surface Meta run into a derive with no
-  // master. For Meta this field is therefore the ONLY thing between three free
-  // crops and three ~$0.90 submits per product. Pinned by
-  // scripts/verifyMixedPlatformVideo.js H3 (mint carries it) and I5 (a bare
-  // Meta feed format does NOT self-derive — that is deliberate, not a gap).
+  // ⚠️ MONEY. Every family has a second gate, but they discriminate differently
+  // — do not read one rule for all three.
+  //   PMax square   — `platformFormat === 'pmax_video_1_1'` is enough: that
+  //                   surface was NEVER a legitimate billable master.
+  //   Funnel rows   — `funnelStage` set is enough, same reasoning.
+  //   Meta crops    — the format ALONE is not enough, because
+  //                   meta_feed_1_1 / 4_5 / reels WERE their own paid masters
+  //                   before 919627a0, so historical rows exist that bought
+  //                   their own plate. The discriminator is `veoPredictionId`,
+  //                   the spend RECEIPT: it is set only when THIS ad submitted
+  //                   to Omni, and a derivation never submits. Absent receipt
+  //                   ⇒ derivation (free); receipt present ⇒ legacy master,
+  //                   keep the billable path.
+  //
+  // An earlier version of this comment asserted the Meta surfaces "have no
+  // such second gate, and cannot". That was wrong — it assumed the format was
+  // the only available signal. Pinned by scripts/verifyMixedPlatformVideo.js
+  // H3 (the mint carries the marker), I5 (a marker-less crop fail-closes) and
+  // I6 (a receipted legacy row does not).
   // Declared so Mongoose strict mode persists the marker.
   deriveFromMaster:   { type: String, default: null },
   // Funnel-stage retitle (Google PMax). When set, this Ad is a FREE
