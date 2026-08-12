@@ -289,7 +289,25 @@ function oracleSingle(platformFormat, kinds, expandStaticFormats) {
   }
   let videoFormats = [];
   if (wantsVideo && pf.isLiveFormat(platformFormat) && pf.kindsForPlatformFormat(platformFormat).includes('video')) {
-    videoFormats = [platformFormat];
+    // DELIBERATE DIVERGENCE FROM THE PRE-PRESET BEHAVIOUR, and the only one.
+    //
+    // The old three-knob path emitted the named format verbatim as the video
+    // master. That was correct while every Meta aspect was its own billable
+    // Omni submit. It is wrong now: 1:1 / 4:5 / Reels are produced by cropping
+    // or retitling the 9:16 Stories plate, so naming one has to resolve to THE
+    // MASTER — otherwise the run queues an Ad that fail-closes to the derive
+    // path and then waits for a master plate nobody generated.
+    //
+    // The oracle encodes the CURRENT contract rather than the historical one
+    // because the historical one is the defect. The PMax square is refused
+    // outright (no master to promote to that the caller asked for).
+    if ((pf.META_VIDEO_DERIVE_ONLY || []).includes(platformFormat)) {
+      videoFormats = pf.isLiveFormat(pf.META_VIDEO_MASTER) ? [pf.META_VIDEO_MASTER] : [];
+    } else if (platformFormat === pf.PMAX_VIDEO_DERIVE_ONLY_KEY) {
+      videoFormats = [];
+    } else {
+      videoFormats = [platformFormat];
+    }
   }
   staticFormats = pf.filterLiveFormats(staticFormats);
   videoFormats = pf.filterLiveFormats(videoFormats);
@@ -335,9 +353,20 @@ eq('  single stories both no-expand',
 eq('  single reels image → nothing (no invert to video)',
   pf.resolvePreset('single', 'meta_reels_9_16', { kinds: 'image' }),
   { staticFormats: [], videoFormats: [], kinds: [] });
-eq('  single reels video',
+// Reels resolves to the MASTER, not to itself: it is a retitle of the 9:16
+// Stories plate, so it is delivered by derivation. Naming it still gets you a
+// Reels ad — the expansion mints it free once the master is queued — but the
+// billable master is Stories. Asserting ['meta_reels_9_16'] here would pin the
+// pre-restoration behaviour, in which that ad was its own Omni submit.
+eq('  single reels video → the Stories master (Reels is a free retitle of it)',
   pf.resolvePreset('single', 'meta_reels_9_16', { kinds: 'video' }),
-  { staticFormats: [], videoFormats: ['meta_reels_9_16'], kinds: ['video'] });
+  { staticFormats: [], videoFormats: ['meta_stories_9_16'], kinds: ['video'] });
+eq('  single meta 1:1 video → the Stories master (free crop)',
+  pf.resolvePreset('single', 'meta_feed_1_1', { kinds: 'video' }),
+  { staticFormats: [], videoFormats: ['meta_stories_9_16'], kinds: ['video'] });
+eq('  single pmax square video → nothing (no master the caller asked for)',
+  pf.resolvePreset('single', 'pmax_video_1_1', { kinds: 'video' }),
+  { staticFormats: [], videoFormats: [], kinds: [] });
 // Frozen pmax_16_9: single resolves empty (money belt); generate also refuses.
 eq('  single pmax_16_9 both → empty (coming_soon)',
   pf.resolvePreset('single', 'pmax_16_9', { kinds: 'both', expandStaticFormats: false }),
@@ -643,19 +672,21 @@ console.log('\nexplicit — operator multi-select');
   eq('  explicit drops blanks/nulls', ex(['', null, 'meta_feed_4_5'], []).staticFormats, ['meta_feed_4_5']);
 
   // — MONEY: the META video clamp (one master) —
-  eq('  explicit 1 Meta video honoured (parity with single)',
-    ex([], ['meta_feed_1_1']).videoFormats, ['meta_feed_1_1']);
+  // Any Meta video tick resolves to the MASTER — 1:1 / 4:5 / Reels are free
+  // crops or retitles of the 9:16 Stories plate, never masters themselves.
+  eq('  explicit 1 Meta video tick -> the Stories master',
+    ex([], ['meta_feed_1_1']).videoFormats, [pf.META_VIDEO_MASTER]);
   eq('  explicit 2 Meta video CLAMPED to the master',
     ex([], ['meta_feed_1_1', 'meta_stories_9_16']).videoFormats, [pf.META_VIDEO_MASTER]);
   eq('  explicit ALL Meta video CLAMPED to the master',
     ex([], LIVE_META).videoFormats, [pf.META_VIDEO_MASTER]);
-  eq('  explicit 2 Meta video without the master still clamps to ONE',
-    ex([], ['meta_feed_1_1', 'meta_feed_4_5']).videoFormats, ['meta_feed_1_1']);
+  eq('  explicit 2 Meta video without the master still resolves to the master',
+    ex([], ['meta_feed_1_1', 'meta_feed_4_5']).videoFormats, [pf.META_VIDEO_MASTER]);
   eq('  explicit drops an image-ONLY surface from videoFormats',
-    ex([], ['pmax_square_1_1', 'meta_feed_1_1']).videoFormats, ['meta_feed_1_1']);
+    ex([], ['pmax_square_1_1', 'meta_feed_1_1']).videoFormats, [pf.META_VIDEO_MASTER]);
   eq('  explicit Meta video kinds is [video]', ex([], ['meta_stories_9_16']).kinds, ['video']);
   eq('  explicit Meta video dedupe cannot defeat the clamp',
-    ex([], ['meta_feed_1_1', 'meta_feed_1_1']).videoFormats, ['meta_feed_1_1']);
+    ex([], ['meta_feed_1_1', 'meta_feed_1_1']).videoFormats, [pf.META_VIDEO_MASTER]);
   check('  MONEY: no Meta video selection ever exceeds ONE master',
     [['meta_feed_1_1'], ['meta_feed_4_5'], ['meta_reels_9_16'], ['meta_stories_9_16'], LIVE_META,
       ['meta_reels_9_16', 'meta_feed_4_5']]
@@ -844,12 +875,10 @@ console.log('\ninvariant — per-platform video ceilings on every preset, any in
   // change is how a fix becomes invisible. Reported separately. The 'explicit'
   // path (which this change owns) never emits it, and the frontend does not
   // offer a video tick on it, both of which ARE asserted below.
-  const SINGLE_DERIVE_ONLY_BUG = 'single';
   for (const preset of pf.PRESET_KEYS) {
     for (const kinds of [null, 'image', 'video', 'both']) {
       for (const expandStaticFormats of [false, true]) {
         for (const platformFormat of pf.LIVE_PLATFORM_FORMAT_KEYS) {
-          if (preset === SINGLE_DERIVE_ONLY_BUG) continue;
           const r = pf.resolvePreset(preset, platformFormat, {
             kinds, expandStaticFormats,
             staticFormats: ALL_KEYS, videoFormats: ALL_KEYS
@@ -884,16 +913,13 @@ console.log('\ninvariant — per-platform video ceilings on every preset, any in
   eq('  google_all == the two billable masters',
     pf.resolvePreset('google_all', 'meta_feed_1_1').videoFormats, GOOGLE_VIDEO_MASTERS_EXPECTED);
 
-  // The excluded case, pinned EXPLICITLY so the pre-existing defect is recorded
-  // in the harness rather than only in a comment. This asserts what main DOES
-  // today, and is labelled so that whoever fixes it sees exactly what to delete.
-  // If it starts failing, the bug was fixed — remove this check and the
-  // SINGLE_DERIVE_ONLY_BUG exclusion above in the same commit.
-  check("  KNOWN PRE-EXISTING (PMax Phase A, not this change): preset 'single' on " +
-        'pmax_video_1_1 still emits the derive-only key as a billable video format',
-    pf.resolvePreset('single', 'pmax_video_1_1', { kinds: 'video' })
-      .videoFormats.includes('pmax_video_1_1'),
-    'if this now FAILS the defect is fixed — drop this check and the sweep exclusion');
+  // FIXED — was pinned here as KNOWN PRE-EXISTING while preset 'single' still
+  // emitted pmax_video_1_1 as a billable video format. The `single` branch now
+  // refuses derive-only surfaces, so the sweep exclusion that skipped 'single'
+  // is gone too and the invariant below holds for EVERY preset.
+  check("  preset 'single' no longer emits the derive-only PMax square as a master",
+    pf.resolvePreset('single', 'pmax_video_1_1', { kinds: 'video' }).videoFormats.length === 0,
+    'a derive-only surface named directly must resolve to nothing, not to a paid submit');
   // What this change DOES own: explicit never emits it, from any tick set.
   check("  and 'explicit' never emits it, however it is ticked",
     [['pmax_video_1_1'], LIVE_PMAX_VIDEO, [...LIVE_META, ...LIVE_PMAX_VIDEO]]

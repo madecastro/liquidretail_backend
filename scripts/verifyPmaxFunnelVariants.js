@@ -247,10 +247,25 @@ check('D3 explicit deriveFromMaster on a funnel variant is honoured',
   }) === MASTER_9_16);
 
 // Masters WITHOUT funnelStage remain billable (gate returns null).
-for (const fmt of [MASTER_9_16, MASTER_16_9, ...PRE_EXISTING_FORMATS]) {
+//
+// ⚠️ Scoped to the formats that are STILL masters. The three Meta surfaces in
+// PRE_EXISTING_FORMATS (1:1 / 4:5 / Reels) became free derivations of the
+// Stories master, so they now route to derive by design — see D4b in
+// verifyPmaxVideoExpansion. They stay in PRE_EXISTING_FORMATS because that
+// list is about DIGEST scoping, which is unchanged.
+for (const fmt of [MASTER_9_16, MASTER_16_9, 'meta_stories_9_16', 'pmax_16_9']) {
   check(`D4 billable format ${fmt} without funnelStage is NOT routed to derive`,
     resolveDeriveFromMaster({ platformFormat: fmt }) === null);
 }
+// Funnel variants remain a PMax-only feature (T10): a Meta format carrying a
+// stage must NOT gain a stage-driven derive. It derives on its own account
+// (it is a Meta derivative), which is a different reason — assert the value,
+// not merely non-null, so the two mechanisms cannot be confused.
+check('D4d Meta derivative + stage still derives from the Meta master (not the stage rule)',
+  resolveDeriveFromMaster({ platformFormat: 'meta_feed_1_1', funnelStage: 'awareness' })
+    === 'meta_stories_9_16');
+check('D4e Meta MASTER + stage stays billable (funnel variants are PMax-only)',
+  resolveDeriveFromMaster({ platformFormat: 'meta_stories_9_16', funnelStage: 'awareness' }) === null);
 
 // ── E. Derive render path: ZERO billable submits (source, comments stripped) ─
 const adsSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');

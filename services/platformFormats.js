@@ -560,6 +560,20 @@ const GOOGLE_VIDEO_FANOUT = [
 // creative-wise, 16:9 net-new). pmax_video_1_1 is NOT a master; it derives
 // from the settled 9:16 master (no Omni submit).
 const GOOGLE_VIDEO_MASTERS = ['pmax_video_9_16', 'pmax_video_16_9'];
+// The PMax square, named here so the resolvers can refuse to treat it as a
+// master without importing the generation service (which imports THIS file).
+const PMAX_VIDEO_DERIVE_ONLY_KEY = 'pmax_video_1_1';
+
+// Meta VIDEO surfaces that are produced BY DERIVATION from META_VIDEO_MASTER,
+// never by their own Omni submit: 1:1 and 4:5 are head-safe crops of the 9:16
+// Stories plate, Reels is a retitle of it. This is the list META_VIDEO_FANOUT
+// always described as "derivation (Phase 3)"; it is now load-bearing rather
+// than intent, because the generation service mints these rows for free and
+// the render path fail-closes them onto the master by platformFormat alone.
+//
+// Kept here, next to META_VIDEO_MASTER, so "which Meta video surfaces are
+// free" has ONE definition that both the resolvers and the expansion agree on.
+const META_VIDEO_DERIVE_ONLY = META_VIDEO_FANOUT.filter((k) => k !== META_VIDEO_MASTER);
 
 // ── PRESETS ─────────────────────────────────────────────────────────────
 // Operator-facing choices that replace platformFormat + kinds + expandStaticFormats.
@@ -686,16 +700,24 @@ function resolveExplicitFormats(opts = {}) {
   const videoWanted = filterLiveFormats(canonicalFormatList(opts.videoFormats))
     .filter((k) => kindsForPlatformFormat(k).includes('video'));
 
+  // ANY Meta video tick resolves to THE MASTER, not to the ticked surface.
+  //
+  // This changed when the Meta derivations were restored. 1:1, 4:5 and Reels
+  // are no longer independently generatable — they are produced by cropping /
+  // retitling the 9:16 Stories plate (META_VIDEO_DERIVE_MAP in
+  // campaignAdsGenerationService), and the render path fail-closes them onto
+  // that master by platformFormat alone. So emitting a ticked 1:1 as the run's
+  // master would queue an ad that immediately looks for a Stories plate nobody
+  // generated, wait out its bounded retries and fail.
+  //
+  // Previously this honoured a lone tick verbatim ("byte-identical to preset
+  // 'single'"), which was right while every Meta aspect was its own billable
+  // submit. It is exactly wrong now.
   const metaWanted = videoWanted.filter((k) => platformForFormat(k) === 'meta');
   let videoFormats = [];
-  if (metaWanted.length === 1) {
-    // Byte-identical to what preset 'single' would have queued for that surface.
-    videoFormats.push(metaWanted[0]);
-  } else if (metaWanted.length > 1) {
+  if (metaWanted.length) {
     videoFormats.push(
-      metaWanted.includes(META_VIDEO_MASTER)
-        ? META_VIDEO_MASTER
-        : [...metaWanted].sort()[0]
+      isLiveFormat(META_VIDEO_MASTER) ? META_VIDEO_MASTER : metaWanted[0]
     );
   }
 
@@ -897,7 +919,32 @@ function resolvePreset(preset, platformFormat, opts = {}) {
 
   let videoFormats = [];
   if (wantsVideo && isLiveFormat(platformFormat) && kindsForPlatformFormat(platformFormat).includes('video')) {
-    videoFormats = [platformFormat];
+    // DERIVE-ONLY SURFACES ARE NOT MASTERS, even when named directly here.
+    //
+    // Two different corrections, for two different reasons:
+    //
+    // META (1:1 / 4:5 / Reels) — these are produced by cropping/retitling the
+    //   9:16 Stories plate, so naming one here must resolve to THE MASTER. It
+    //   still delivers the surface the caller asked for (the derivation mints
+    //   it), and it closes a digest collision the derive design cannot survive:
+    //   computeDeterministicVideoDigest has no master-vs-derive discriminator,
+    //   so a standalone billable `meta_reels_9_16` and a free derived
+    //   `meta_reels_9_16` for the same campaign/product/media hash IDENTICALLY
+    //   and collide on the (campaignId, identityDigest) unique index — one of
+    //   them silently never inserts, decided by insert order. Unlike PMax's
+    //   square, these keys really can appear on both sides, so the ambiguity
+    //   has to be removed at the source rather than discriminated later.
+    //
+    // PMAX 1:1 — genuinely has no master to promote to (its source is the 9:16
+    //   master, which the caller did not ask for), so it resolves to NOTHING
+    //   rather than implying spend the operator never requested.
+    if (META_VIDEO_DERIVE_ONLY.includes(platformFormat)) {
+      videoFormats = isLiveFormat(META_VIDEO_MASTER) ? [META_VIDEO_MASTER] : [];
+    } else if (platformFormat === PMAX_VIDEO_DERIVE_ONLY_KEY) {
+      videoFormats = [];
+    } else {
+      videoFormats = [platformFormat];
+    }
   }
 
   // Final belt-and-braces: never let a coming_soon key through.
@@ -1065,6 +1112,8 @@ module.exports = {
   META_STATIC_FANOUT,
   META_VIDEO_FANOUT,
   META_VIDEO_MASTER,
+  META_VIDEO_DERIVE_ONLY,
+  PMAX_VIDEO_DERIVE_ONLY_KEY,
   GOOGLE_STATIC_FANOUT,
   GOOGLE_VIDEO_FANOUT,
   GOOGLE_VIDEO_MASTERS,

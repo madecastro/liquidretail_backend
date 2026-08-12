@@ -94,10 +94,19 @@ check('A3 mixed run bills exactly three masters — not two, not four', () => {
   assert.strictEqual(m.length, 3, `expected 3 billable masters, got ${JSON.stringify(m)}`);
 });
 
-check('A4 one Meta tick + one Google master keeps both', () => {
+check('A4 one Meta tick + one Google master keeps both platforms', () => {
   const m = queuedMasters(['meta_feed_1_1', 'pmax_video_16_9']);
   assert.strictEqual(m.length, 2, `expected 2, got ${JSON.stringify(m)}`);
-  assert.ok(m.includes('meta_feed_1_1'), `Meta tick dropped: ${JSON.stringify(m)}`);
+  // The Meta side is PRESERVED but PROMOTED to its master. meta_feed_1_1 is a
+  // free crop of the 9:16 Stories plate, so it can never be the run's master —
+  // resolveExplicitFormats substitutes the master, and the crop is then minted
+  // for free by the expansion. The invariant this check exists to protect is
+  // "the Meta side is not silently dropped on a mixed run", which still holds;
+  // asserting the literal ticked key would now be asserting the bug.
+  assert.ok(m.includes('meta_stories_9_16'), `Meta side dropped: ${JSON.stringify(m)}`);
+  assert.ok(!m.includes('meta_feed_1_1'),
+    `a derive-only surface must never queue as a billable master: ${JSON.stringify(m)}`);
+  assert.ok(m.includes('pmax_video_16_9'), `Google master dropped: ${JSON.stringify(m)}`);
 });
 
 // ── 2. Single-platform runs are UNCHANGED ────────────────────────────────

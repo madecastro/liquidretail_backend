@@ -46,24 +46,65 @@ export const SAFE_ZONES = {
   // squareYt: square Discovery / in-feed YouTube — balanced inset; bottom
   // clears compact player controls, sides clear card chrome.
   squareYt:    { top: 0.10, bottom: 0.10, left: 0.10,  right: 0.10 },
+
+  // ── Meta 9:16, split per surface (2026-08-11) ────────────────────────
+  // `vertical` above is, by its own header comment, the META REELS clear
+  // zone — bottom 35% for the caption + action rail. Stories was riding on it
+  // too, which was wrong in two ways at once:
+  //
+  //   1. Stories reserves ~250/1778 = 14% top and bottom (PLATFORM_FORMATS
+  //      meta_stories_9_16.safeArea), not 35% at the bottom. A measured
+  //      Stories render put its lowest text at 0.3875 of frame height against
+  //      an allowed 0.65 — 26% of the frame unusable for no reason.
+  //   2. It made Stories and Reels render IDENTICALLY. Once Reels is minted as
+  //      a free retitle of the Stories master, "identical" means a duplicate
+  //      ad — the derivation would add a row and no creative.
+  //
+  // So Stories gets its own, looser band and Reels keeps the tighter one it
+  // always needed. Both are stated as fractions of frame height, converted
+  // from the canvas-pixel safeArea already declared in platformFormats.
+  //
+  // ⚠️ These are OUR recorded spec, not a fresh reading of Meta's published
+  // guidance, which is qualitative plus an on-canvas guardrail in Ads Manager.
+  // Sides stay at the existing 7.5% for both. If Meta publishes hard numbers,
+  // reconcile HERE and in PLATFORM_FORMATS together — they are two encodings
+  // of one fact and drifting them is how the duplicate above happened.
+  //
+  // stories: 250/1778 top and bottom. Profile row + close button at the top,
+  // the reply/CTA rail at the bottom.
+  stories: { top: 0.14, bottom: 0.14, left: 0.075, right: 0.075 },
 };
 
-// PMax VIDEO platformFormat → YT safe-zone key. Canvas formats (Meta +
-// static PMax image keys) intentionally absent — they keep Meta/canvas
-// zones via the format fallback below. Exported so harnesses can pin the
+// platformFormat → safe-zone key, for any surface whose reserved bands are NOT
+// simply its canvas format's. Anything absent keeps the canvas-format zone via
+// the fallback in resolveSafeZoneKey — still the common case (every static
+// surface, Meta Reels, Meta feed/square). Exported so harnesses can pin the
 // surface → zone wiring without re-parsing source text.
+//
+// ⚠️ THE NAME IS NOW NARROWER THAN THE CONTENTS — Meta Stories has an entry
+// below, so this is no longer PMax-only. Deliberately NOT renamed: it is an
+// exported symbol that harnesses and the landscapeYt BLAST note both reference
+// by name, and it is owned by the in-flight PMax safe-zone work. Renaming it
+// from here would break a symbol another change is actively building on, for a
+// cosmetic gain. Rename it there, if at all.
 export const PMAX_VIDEO_SAFE_ZONE_KEY = {
   pmax_video_9_16: 'verticalYt',
   pmax_video_16_9: 'landscapeYt',
   pmax_video_1_1: 'squareYt',
+  // Meta Stories takes its own band; Reels keeps `vertical` (which IS the
+  // Reels zone) via the canvas-format fallback below. Without this entry both
+  // 9:16 Meta surfaces resolve to the same zone and render identically — which
+  // is only visible once Reels is minted as a derivation of Stories.
+  meta_stories_9_16: 'stories',
 };
 
 /**
  * Resolve which SAFE_ZONES key to use for layout clamps.
  * Canvas `format` (vertical|feed|square|landscape) stays the composition
  * id and titleStyleSpec cascade key; only the safe-zone lookup may switch
- * to a YT variant when platformFormat is a Google PMax VIDEO surface.
- * Unknown/absent platformFormat → SAFE_ZONES[format] || feed (today).
+ * to a surface-specific variant (PMax YouTube zones, Meta Stories) when the
+ * platformFormat has its own entry. Unknown/absent platformFormat →
+ * SAFE_ZONES[format] || feed (today).
  */
 export function resolveSafeZoneKey({ format, platformFormat } = {}) {
   const pf = String(platformFormat || '').toLowerCase().trim();

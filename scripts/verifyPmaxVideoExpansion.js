@@ -236,10 +236,33 @@ if (typeof resolveDeriveFromMaster === 'function') {
     resolveDeriveFromMaster({ platformFormat: DERIVE_1_1, deriveFromMaster: MASTER_9_16 })
       === MASTER_9_16);
 
-  for (const fmt of [...PRE_EXISTING_FORMATS, MASTER_9_16, MASTER_16_9]) {
+  // ⚠️ PRE_EXISTING_FORMATS is NOT the billable list any more — it is the
+  // DIGEST-SCOPING list (C1/C1b), and the two diverged when the Meta
+  // derivations were restored. meta_feed_1_1 / meta_feed_4_5 /
+  // meta_reels_9_16 are now produced by cropping or retitling the Stories
+  // master, so they MUST route to the derive path; they still belong in
+  // PRE_EXISTING_FORMATS because their digests must stay unaffected by
+  // duration/funnelStage. Conflating the two lists is what made this check
+  // fail, and it would have been the wrong fix to widen the gate instead.
+  const STILL_BILLABLE_FORMATS = ['meta_stories_9_16', 'pmax_16_9', MASTER_9_16, MASTER_16_9];
+  for (const fmt of STILL_BILLABLE_FORMATS) {
     check(`D4 billable master format ${fmt} is NOT routed to the derive path`,
       resolveDeriveFromMaster({ platformFormat: fmt }) === null,
       'routing a real master to the derive path would skip the render it paid for');
+  }
+
+  // D4b — the inverse, and the point of the Meta restoration: every Meta
+  // derive surface routes to the master on platformFormat ALONE (marker
+  // dropped), exactly like the PMax square in D2. Without this the row takes
+  // the billable Omni path and re-creates the 3-paid-masters waste that
+  // commit 919627a0 removed.
+  const META_MASTER = 'meta_stories_9_16';
+  for (const fmt of ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16']) {
+    check(`D4b [MONEY] Meta derive surface ${fmt} routes to the master (fail-closed, no marker)`,
+      resolveDeriveFromMaster({ platformFormat: fmt }) === META_MASTER,
+      'a Meta derivative on the billable path is a full Omni submit for a free crop');
+    check(`D4c Meta derive surface ${fmt} honours an explicit marker too`,
+      resolveDeriveFromMaster({ platformFormat: fmt, deriveFromMaster: META_MASTER }) === META_MASTER);
   }
 
   check('D5 a missing/!null ad object is handled without throwing',

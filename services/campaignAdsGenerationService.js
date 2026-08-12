@@ -121,7 +121,13 @@ const {
   // Interface contract (platformFormats lane): masters for google_video /
   // google_all. Fall back to the contracted list when the export has not
   // landed yet so this file can merge independently.
-  GOOGLE_VIDEO_MASTERS: _GOOGLE_VIDEO_MASTERS_EXPORT
+  GOOGLE_VIDEO_MASTERS: _GOOGLE_VIDEO_MASTERS_EXPORT,
+  // Meta master + the surfaces derived from it. Imported rather than
+  // re-declared so "which Meta video surfaces are free" has exactly ONE
+  // definition — the resolvers in platformFormats and the expansion here must
+  // never be able to disagree about that.
+  META_VIDEO_MASTER: _META_VIDEO_MASTER_EXPORT,
+  META_VIDEO_DERIVE_ONLY: _META_VIDEO_DERIVE_ONLY_EXPORT
 } = require('./platformFormats');
 // Only live surfaces contribute shipping ratios — coming_soon aspects (e.g.
 // 1.91:1 Demand Gen) must not unlock billable legacy-cartesian work.
@@ -171,6 +177,72 @@ const META_VIDEO_DERIVATIVES = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_
 // default of 8s). See resolveVideoDurationForFormat for why this is NOT a
 // re-mint and how to revert it without a deploy.
 const DEFAULT_META_VIDEO_DURATION_SEC = 10;
+// ── Meta video master / derive-only (restores the Phase 3 intent) ─────
+// BILLABLE: META_VIDEO_MASTER_KEY only — ONE Omni submit per product.
+// FREE:     every key in META_VIDEO_DERIVE_MAP is crop+retitle from that
+//           master — NEVER an Omni submit (same path as the PMax square).
+//
+// WHY THIS EXISTS. Commit 919627a0 (2026-08-01) collapsed Meta video from
+// one Ad per aspect to a single 9:16 master, because each aspect was minting
+// its OWN Omni submit — three paid masters per product where one would do.
+// That was a correct money fix, and its commit message states the intended
+// end state: "The other Meta video sizes are derivations of that master
+// (Phase 3), not separate Veo submits." The fix landed; the derivation half
+// never did, so for ten days a Meta video run delivered ONE ad instead of
+// three or four. This restores the missing half.
+//
+// Everything downstream already exists and is exercised by the PMax square:
+// basePlateCropService does the head-safe crop (its own comment records the
+// problem — "the centre crop cuts 131px of head at 4:5 and 266px at 1:1"),
+// Remotion carries CanonicalSquare / CanonicalFeed / CanonicalVertical, and
+// renderDeriveOnlyVideoAd is aspect-agnostic. Only the queueing was missing.
+const META_VIDEO_MASTER_KEY = _META_VIDEO_MASTER_EXPORT || 'meta_stories_9_16';
+// Derived surfaces, imported from platformFormats (the single definition).
+// Fall back to the contracted list so this file still loads if the export has
+// not landed — same defensive shape as the GOOGLE_VIDEO_MASTERS import above.
+//
+// 1:1 and 4:5 are head-safe CROPS of the 9:16 plate. meta_reels_9_16 is the
+// SAME aspect as the master, so it is a RETITLE, not a crop —
+// basePlateCropService returns a full-frame no-op for a 9:16 target on a 9:16
+// master, so it costs nothing extra and still gets its own titling pass.
+const META_VIDEO_DERIVE_KEYS = Array.isArray(_META_VIDEO_DERIVE_ONLY_EXPORT)
+  && _META_VIDEO_DERIVE_ONLY_EXPORT.length
+  ? _META_VIDEO_DERIVE_ONLY_EXPORT.slice()
+  : ['meta_reels_9_16', 'meta_feed_1_1', 'meta_feed_4_5'];
+const META_VIDEO_DERIVE_SET = new Set(META_VIDEO_DERIVE_KEYS);
+// Derived surface → the master it is produced FROM. Values must be the master,
+// never another derivative: a derivative of a derivative would wait on a plate
+// that is itself still waiting.
+const META_VIDEO_DERIVE_MAP = Object.freeze(
+  Object.fromEntries(META_VIDEO_DERIVE_KEYS.map((k) => [k, META_VIDEO_MASTER_KEY]))
+);
+
+/**
+ * Kill switch for the free Meta video derivations.
+ * Default ON. Flag off ⇒ no derivative ads minted, byte-identical to the
+ * pre-change mint (one 9:16 master per product and nothing else).
+ */
+function isMetaVideoDerivativesEnabled() {
+  const v = process.env.META_VIDEO_DERIVATIVES;
+  if (v == null || v === '') return true;
+  return !['0', 'false', 'no', 'off'].includes(String(v).toLowerCase());
+}
+
+/**
+ * True only when this run generates the Meta derive SOURCE master, so the
+ * free crops have a plate to crop from.
+ *
+ * Mirrors isGoogleVideoMasterRun deliberately: the gate is the PRESENCE OF
+ * THE SOURCE, not "every entry is a Meta master". A mixed Meta+PMax run must
+ * still derive Meta's crops, and a run whose only Meta entry is something
+ * other than the master must not mint crops that can never resolve — they
+ * would wait, exhaust their bounded retries and fail.
+ */
+function isMetaVideoMasterRun(masterFormats) {
+  return Array.isArray(masterFormats)
+    && masterFormats.includes(META_VIDEO_MASTER_KEY);
+}
+
 // Schema field name for the derive-only marker.
 // Declared on models/Ad.js (deriveFromMaster). The render path ALSO keys
 // on platformFormat === PMAX_VIDEO_DERIVE_ONLY and on funnelStage set, so
@@ -243,6 +315,13 @@ function resolveDeterministicVideoMasterFormats(presetVideoFormats, fallbackForm
   //     exactly the way the Google branch used to.
   return list.filter((f) => {
     if (!f || f === PMAX_VIDEO_DERIVE_ONLY) return false;
+    // Meta derive-only surfaces (1:1 / 4:5 / Reels) are crops or retitles of
+    // the 9:16 master and must never queue as masters themselves. The
+    // resolvers already substitute the master for them, so reaching this line
+    // means a caller bypassed resolvePreset — strip it here too rather than
+    // letting it mint an Ad that fail-closes to the derive path and then waits
+    // for a master plate nobody generated.
+    if (META_VIDEO_DERIVE_SET.has(f)) return false;
     if (GOOGLE_VIDEO_MASTER_SET.has(f)) return true;
     // Unknown/other Google video surfaces are not billable masters.
     return !String(f).startsWith('pmax_') && !String(f).startsWith('google_');
@@ -276,6 +355,29 @@ function resolveDeriveFromMaster(ad) {
   const explicit = ad[DERIVE_FROM_MASTER_FIELD];
   if (typeof explicit === 'string' && explicit) return explicit;
   if (ad.platformFormat === PMAX_VIDEO_DERIVE_ONLY) return PMAX_VIDEO_DERIVE_SOURCE;
+  // Meta derivations (1:1 / 4:5 / Reels) — same fail-closed idea as the PMax
+  // square above, keyed on platformFormat so a dropped `deriveFromMaster`
+  // marker cannot route a free surface down the billable Omni path.
+  //
+  // ⚠️ BUT NOT UNCONDITIONALLY, and this is where Meta genuinely differs from
+  // the PMax square. pmax_video_1_1 was NEVER a legitimate billable master, so
+  // "this format ⇒ free, always" is safe there. Meta's 1:1 / 4:5 / Reels WERE
+  // their own paid Omni masters before commit 919627a0 (that is precisely the
+  // waste it removed), so historical Ad rows exist that paid for their own
+  // plate and carry no marker. Treating those as derivations would:
+  //   • 409 a regenerate ("derived from its master") on an ad that paid, and
+  //   • send a re-render into the derive path to wait for a Stories sibling
+  //     that was never generated, until it exhausts its retries and fails.
+  //
+  // `veoPredictionId` is the spend receipt and the right discriminator: it is
+  // set only when THIS ad submitted to Omni. A derivation never submits (the
+  // derive render path is asserted submit-free), so a row carrying one is a
+  // legacy master and must keep the billable path. New derivative rows always
+  // carry the explicit marker handled above, so this format-only branch is
+  // reached almost exclusively by legacy inventory.
+  if (META_VIDEO_DERIVE_MAP[ad.platformFormat] && !ad.veoPredictionId) {
+    return META_VIDEO_DERIVE_MAP[ad.platformFormat];
+  }
   // Funnel-variant fail-closed: retitle of the same-format master plate.
   // Without this, a dropped deriveFromMaster on a 9:16/16:9 funnel ad
   // would fall through to the billable Omni path.
@@ -1104,6 +1206,39 @@ async function expandWizardJob({
           }
         }
       }
+
+      // ── FREE Meta derivations (META_VIDEO_DERIVATIVES) ────────────
+      // Restores the "Phase 3" half of commit 919627a0. The 9:16 Stories
+      // master above is the ONE paid Omni submit; 1:1 and 4:5 are head-safe
+      // crops of that same plate and Reels is a retitle of it, so this block
+      // adds THREE creatives per product and ZERO billable submits.
+      //
+      // Gated on the SOURCE master being in this run (isMetaVideoMasterRun),
+      // not merely "some Meta video ran": a derivative whose master is never
+      // generated can only wait, exhaust its bounded retries and fail. Same
+      // reasoning as isGoogleVideoMasterRun — see the note there.
+      //
+      // Each row carries deriveFromMaster, and resolveDeriveFromMaster also
+      // fail-closes on platformFormat alone, so neither the render loop nor
+      // adRegenerateService can route one of these to Omni.
+      if (isMetaVideoMasterRun(masterFormats) && isMetaVideoDerivativesEnabled()) {
+        for (const fmt of META_VIDEO_DERIVE_KEYS) {
+          detParts.push(await expandDeterministicVideo({
+            campaignId, brandId, campaignKind, productIds,
+            seedMediaIds,
+            seedPicks,
+            ctaText, ctaUrl, ctaUrlParams,
+            platformFormat: fmt,
+            // Same duration as the master — these are the master's own frames,
+            // cropped or retitled. A different duration here would be a lie
+            // about a plate we are not regenerating.
+            videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
+            videoPromptGuidance, videoPromptRaw,
+            excludePairings,
+            deriveFromMaster: META_VIDEO_DERIVE_MAP[fmt]
+          }));
+        }
+      }
       detResult = detParts.reduce(
         (acc, part) => mergeExpansionResults(acc, part),
         null
@@ -1214,6 +1349,15 @@ async function expandWizardJob({
     const dryFunnelMasters = dryMasterFormats.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
     if (dryGoogle && isPmaxFunnelVariantsEnabled()) {
       dryDetPerProduct += PMAX_FUNNEL_STAGES.length * (dryFunnelMasters.length + 1);
+    }
+    // Meta's free derivations count toward DELIVERY the same way the PMax
+    // square does. Omitting them made the estimate say "1 video per product"
+    // while the live mint produced four — under-promising delivery is the same
+    // class of lie as over-quoting spend, and it is the number the operator
+    // reads to decide whether the run did what they asked. Mirrors the live
+    // gate exactly (source master present AND flag on) so the two cannot drift.
+    if (isMetaVideoMasterRun(dryMasterFormats) && isMetaVideoDerivativesEnabled()) {
+      dryDetPerProduct += META_VIDEO_DERIVE_KEYS.length;
     }
     // BILLABLE vs DELIVERED — they are not the same number, and only one of
     // them costs money.
