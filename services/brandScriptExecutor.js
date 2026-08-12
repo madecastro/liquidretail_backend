@@ -611,16 +611,41 @@ function hexToRgb(hex) {
 //
 // Pure + exported so the offline harness can drive the real production
 // path without Mongo. Call site in buildMetaForAd is the live wire.
-function gateLayoutInputQuotes(layoutInput) {
+function gateLayoutInputQuotes(layoutInput, scope = {}) {
   try {
     const pq = layoutInput?.input?.social_proof?.primary_quote;
     if (!pq) return layoutInput;
-    const { toPrintableCustomerQuote } = require('./quoteProvenance');
-    const printable = toPrintableCustomerQuote(pq);
+    const { toPrintableCustomerQuote, applyStrictQuoteScope } = require('./quoteProvenance');
+    let printable = toPrintableCustomerQuote(pq);
+    let withheldByStrict = false;
+    if (printable) {
+      const scoped = applyStrictQuoteScope(printable, scope);
+      if (!scoped) {
+        const rest = Array.isArray(layoutInput?.input?.social_proof?.secondary_quotes)
+          ? layoutInput.input.social_proof.secondary_quotes : [];
+        let rescued = null;
+        for (const cand of rest) {
+          const next = applyStrictQuoteScope(toPrintableCustomerQuote(cand), scope);
+          if (next) { rescued = next; break; }
+        }
+        if (rescued) {
+          console.log(
+            `🔒 brandScript: brand-pool quote failed product-scope — using next allowed candidate`
+          );
+          printable = rescued;
+        } else {
+          withheldByStrict = true;
+          printable = null;
+        }
+      }
+    }
     if (!printable) {
       console.log(
-        `🔒 brandScript: quote withheld (tier=${pq.tier || 'unstamped'} ` +
-        `origin=${pq.origin || 'unstamped'}) — titling with no testimonial`
+        withheldByStrict
+          ? `🔒 brandScript: quote withheld (QUOTE_PROVENANCE_STRICT ` +
+            `tier=${pq.tier || 'unstamped'}) — titling with no testimonial`
+          : `🔒 brandScript: quote withheld (tier=${pq.tier || 'unstamped'} ` +
+            `origin=${pq.origin || 'unstamped'}) — titling with no testimonial`
       );
       return {
         ...layoutInput,
@@ -766,7 +791,23 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   }
 
   // Video dual-gate: strip non-printable primary_quote before cascade.
-  layoutInput = gateLayoutInputQuotes(layoutInput);
+  // QUOTE_PROVENANCE_STRICT (flag-off identity) noun-checks a brand-pool
+  // quote against THIS ad's seed Media labels when no product is attached.
+  // Load the label fields only — same inexpensive select the static
+  // renderer uses for scope.
+  let scopeMedia = null;
+  if (ad.mediaId) {
+    try {
+      const { loadQuoteScopeMedia } = require('./quoteProvenance');
+      scopeMedia = await loadQuoteScopeMedia(ad.mediaId);
+    } catch { /* seed labels optional; gate still has product name */ }
+  }
+  layoutInput = gateLayoutInputQuotes(layoutInput, {
+    productAttached: !!ad.productId,
+    productTitle: layoutInput?.input?.product?.name || null,
+    extraText: layoutInput?.input?.product?.name || null,
+    media: scopeMedia
+  });
 
   let catalogProduct = null;
   if (ad.productId) {
