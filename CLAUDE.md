@@ -712,8 +712,15 @@ Video never launches a browser.
   because it was probed; the risk being guarded is silent coercion to the
   `1024x1024` default, which would square a 4:5 surface and then crop it.
   `2048x1152` needed no probe — it is an enum member.
-- **`queued` ads never auto-drain** — still require an explicit `/runs` (or
-  equivalent) claim.
+- **`queued` leftovers no longer sit forever.** Same-day drain is still an
+  explicit `/runs` ("Generate more") claim. After `QUEUED_ARCHIVE_AFTER_H`
+  (default 24) a leftover whose minting run is terminal moves to
+  `status:'archived'` so a later Generate cannot claim and bill it.
+  Receipt-holding / `renderUrl` / `renderAttempts > 0` rows are refused.
+  `CampaignRun.total` stays the claim count (progress denominator);
+  `mintedTotal` / `unclaimedAtStart` / `notice.code='minted-ads-unclaimed'`
+  are how the operator sees the gap. Pinned by
+  `scripts/verifyNoStrandedQueued.js`.
 - ~~**`veoPredictionId` is a spend receipt that is never resumed**~~ — **CLOSED
   2026-08-04** (PRs #70-#72 + the titling resume). The receipt is now polled for
   free and the paid master collected: `services/bootRecoveryService.js` sweeps

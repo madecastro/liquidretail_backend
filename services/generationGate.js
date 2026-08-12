@@ -359,6 +359,34 @@ function buildOverlapNotice({ activeRuns = [], requestedProductIds = [] } = {}) 
   };
 }
 
+// Same shape as buildOverlapNotice: { code, message, ...extra }. Non-blocking.
+// The 202 fires BEFORE expand+claim (Director can take ~28s; Render's edge
+// cuts the request), so the overflow count cannot live on the HTTP 202 body
+// any more than `total` can — both are 0 on the 202 and become real on the
+// poller. GET /api/ads/runs/:runId returns this object in the same `notice`
+// field the 202 uses, once claim has run.
+const UNCLAIMED_NOTICE_CODE = 'minted-ads-unclaimed';
+
+function buildUnclaimedNotice({ minted = 0, claimed = 0, unclaimed = null } = {}) {
+  const m = Number(minted);
+  const c = Number(claimed);
+  const mintedN = Number.isFinite(m) && m > 0 ? m : 0;
+  const claimedN = Number.isFinite(c) && c > 0 ? c : 0;
+  const rawU = unclaimed == null ? mintedN - claimedN : Number(unclaimed);
+  const unclaimedN = Number.isFinite(rawU) && rawU > 0 ? rawU : 0;
+  if (unclaimedN <= 0) return null;
+  return {
+    code: UNCLAIMED_NOTICE_CODE,
+    minted: mintedN,
+    claimed: claimedN,
+    unclaimed: unclaimedN,
+    message:
+      `${unclaimedN} ad(s) were queued but will not render on their own ` +
+      `(this run minted ${mintedN} and claimed ${claimedN} of them). ` +
+      'They stay queued until you generate more from this campaign, or they age out and are archived.'
+  };
+}
+
 /**
  * @param {{
  *   activeRuns?: Array<{ runId?: string, requestFingerprint?: string, requestedProductIds?: any[], createdAt?: any }>,
@@ -510,6 +538,8 @@ module.exports = {
   computeRequestFingerprint,
   renderClaimFingerprint,
   buildOverlapNotice,
+  buildUnclaimedNotice,
+  UNCLAIMED_NOTICE_CODE,
   isSameRequest,
   sameProductSet,
   pickSupersedingRun,
