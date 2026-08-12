@@ -39,6 +39,7 @@ const {
   loadQuoteScopeMediaByIds
 } = require('./quoteProvenance');
 const { formatBrandReviewsText, formatProductReviewsText } = require('./ratingDisplay');
+const { resolveDirectorProductRatingPair } = require('./ratingPairAtomic');
 
 // Master switch for the proof MENU (category tier + social_proof_signal.
 // proof_options[] + routing.proof_pick). Default OFF: assembleSignals'
@@ -661,9 +662,12 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   // sites. The Director's HONESTY RULE checks primary_quote / rating
   // / top_comments — without this fallback brand-mode runs always
   // tripped it and emitted social_proof_type="none" on every concept.
-  const productRatingValue = typeof product?.rating === 'number' && product.rating > 0 ? product.rating : null;
-  const productRatingCount = product?.productReviews?.reviewCount
-                          ?? (Array.isArray(product?.reviews) ? product.reviews.length : null);
+  // RATING_PAIR_ATOMIC (default off): productReviews {rating, reviewCount}
+  // as one pair, never immersive product.rating + store reviewCount.
+  // Flag-off is the two expressions this replaced, verbatim.
+  const productRatingPair = resolveDirectorProductRatingPair(product);
+  const productRatingValue = productRatingPair.rating;
+  const productRatingCount = productRatingPair.reviewCount;
   const productReviewQuotes = (Array.isArray(product?.reviews) ? product.reviews : [])
     .map(r => ({ text: r.text || r.body || r.content, author: r.author || r.reviewer || r.user_name }))
     .filter(r => typeof r.text === 'string' && r.text.trim().length > 30);
@@ -3219,6 +3223,7 @@ module.exports = {
   validateConceptsRound,
   loadAvoidList,
   brandQuoteForDirectorSignal,
+  resolveDirectorProductRatingPair,
   // Exported so the diversity harness can call the REAL validator rather than
   // assert on its source text — a source check passes against any
   // reimplementation that keeps the name, which is not what needs pinning here.

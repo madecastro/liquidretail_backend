@@ -20,6 +20,7 @@
 const CatalogProduct = require('../models/CatalogProduct');
 const Category       = require('../models/Category');
 const Brand          = require('../models/Brand');
+const { ratingPairAtomicEnabled, applyHydratedRatingPair } = require('./ratingPairAtomic');
 
 async function hydrateMatch(match) {
   if (!match) return null;
@@ -44,24 +45,7 @@ async function hydrateMatch(match) {
     const snapDetails = match.identification?.details || {};
     view.identification = {
       ...match.identification,
-      details: {
-        ...snapDetails,
-        // Canonical commerce fields override snapshot when present.
-        url:                catalog.productUrl       || snapDetails.url       || null,
-        imageUrl:           catalog.imageUrl         || snapDetails.imageUrl  || null,
-        description:        catalog.description      || snapDetails.description || null,
-        category:           catalog.category         || snapDetails.category  || null,
-        categoryRef:        catalog.categoryRef      || snapDetails.categoryRef || null,
-        rating:             catalog.rating         ?? snapDetails.rating      ?? null,
-        ratingDistribution: (catalog.ratingDistribution?.length ? catalog.ratingDistribution : snapDetails.ratingDistribution) || [],
-        reviews:            (catalog.reviews?.length            ? catalog.reviews            : snapDetails.reviews)            || [],
-        specs:              catalog.specs            || snapDetails.specs    || null,
-        sellers:            (catalog.sellers?.length            ? catalog.sellers            : snapDetails.sellers)            || [],
-        reviewSummary:      catalog.reviewSummary    || snapDetails.reviewSummary || null,
-        price:              snapDetails.price ?? (catalog.price != null
-          ? { value: catalog.price, currency: catalog.currency || null, display: formatPrice(catalog.price, catalog.currency) }
-          : null)
-      }
+      details: applyCatalogDetails(snapDetails, catalog)
     };
     if (catalog.productReviews) view.productReviews = catalog.productReviews;
   }
@@ -91,4 +75,39 @@ function formatPrice(value, currency) {
   return sym ? `${sym}${num.toFixed(2)}` : `${num.toFixed(2)}`;
 }
 
-module.exports = { hydrateMatch };
+/**
+ * Pure details merge used by hydrateMatch. Flag-off is the pre-change
+ * object (no reviewCount write). Flag-on applies the atomic rating pair
+ * (same-snapshot rating + count) so badges / trusted_by / the derivation
+ * prompt cannot see immersive stars beside a store count.
+ */
+function applyCatalogDetails(snapDetails, catalog) {
+  const details = {
+    ...snapDetails,
+    // Canonical commerce fields override snapshot when present.
+    url:                catalog.productUrl       || snapDetails.url       || null,
+    imageUrl:           catalog.imageUrl         || snapDetails.imageUrl  || null,
+    description:        catalog.description      || snapDetails.description || null,
+    category:           catalog.category         || snapDetails.category  || null,
+    categoryRef:        catalog.categoryRef      || snapDetails.categoryRef || null,
+    rating:             catalog.rating         ?? snapDetails.rating      ?? null,
+    ratingDistribution: (catalog.ratingDistribution?.length ? catalog.ratingDistribution : snapDetails.ratingDistribution) || [],
+    reviews:            (catalog.reviews?.length            ? catalog.reviews            : snapDetails.reviews)            || [],
+    specs:              catalog.specs            || snapDetails.specs    || null,
+    sellers:            (catalog.sellers?.length            ? catalog.sellers            : snapDetails.sellers)            || [],
+    reviewSummary:      catalog.reviewSummary    || snapDetails.reviewSummary || null,
+    price:              snapDetails.price ?? (catalog.price != null
+      ? { value: catalog.price, currency: catalog.currency || null, display: formatPrice(catalog.price, catalog.currency) }
+      : null)
+  };
+  // RATING_PAIR_ATOMIC: do NOT assign reviewCount when the flag is off —
+  // a spread snapshot that never had the key must stay key-identical.
+  // Flag-on writes rating + count from ONE snapshot (never immersive
+  // rating beside a store / web-source count).
+  if (ratingPairAtomicEnabled()) {
+    applyHydratedRatingPair(details, catalog, snapDetails);
+  }
+  return details;
+}
+
+module.exports = { hydrateMatch, applyCatalogDetails, formatPrice };

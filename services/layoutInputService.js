@@ -69,6 +69,7 @@ const { findBrandByName }    = require('./brandCatalogService');
 const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
+const { resolveDeriveProductPair } = require('./ratingPairAtomic');
 const { computeSlotBudgets } = require('./slotBudget');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
 const { extractSnippet, PROOF_LINE_MAX_CHARS, usableProofCommentsOrNone } = require('./quoteSnippetService');
@@ -3657,14 +3658,20 @@ function buildPerformanceMetrics(media, match) {
  * @returns {{ rating_value: number|undefined, review_count: number|undefined, rating_source: 'product'|'brand'|null }}
  */
 function deriveSocialProofNumbers(details, ctx) {
-  const hasProductNumber = typeof details.rating === 'number' || typeof details.reviewCount === 'number';
-  if (hasProductNumber) {
-    return {
-      rating_value:  details.rating,
-      review_count:  details.reviewCount,
-      rating_source: 'product',
-    };
-  }
+  // RATING_PAIR_ATOMIC (default off): productReviews pair first, then a
+  // single-source fallback. Flag-off is the independent details.rating /
+  // details.reviewCount read this replaced — including the mixed case.
+  // Flag-on: pass EVERY candidate snapshot. `details.productReviews ||
+  // match.productReviews` preferred a stale details object over a
+  // fresher catalog pair. resolveDeriveProductPair selects by provenance
+  // (scraped > llm-web > unknown) then fetchedAt. Flag-off ignores the
+  // second argument.
+  const productPair = resolveDeriveProductPair(details, [
+    details?.productReviews,
+    ctx?.match?.productReviews,
+    ctx?.match ? productReviewsOf(ctx.match) : null
+  ]);
+  if (productPair) return productPair;
   // For 'branding' outcome (no SKU) fall back to brand-level rating /
   // review_count from Gemini brand-reviews lookup so the proof bar isn't
   // blank when only brand sentiment is available — atomic, both fields
