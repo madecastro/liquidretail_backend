@@ -267,6 +267,32 @@ function ratingRequireProvenanceEnabled() {
   return String(process.env.RATING_REQUIRE_PROVENANCE || 'false').toLowerCase() === 'true';
 }
 
+// A source string that names nothing is not provenance. Adversarial review,
+// 2026-08-12: the model (or a malformed upstream row) can satisfy "source is a
+// non-empty string" with a placeholder — 'unknown', 'n/a', or literally the
+// word 'null' — and that string then out-ranks a genuinely unsourced
+// candidate under RATING_REQUIRE_PROVENANCE. Denylist, not a format check:
+// a real domain or site name never collides with these tokens.
+const NON_PROVENANCE_SOURCE_RE = /^(?:unknown|n\/?a|null|none|undefined|unspecified|not[\s_-]?(?:specified|available|found|attributed)|no[\s_-]?source|web|internet|various|multiple(?:[\s_-]?sources)?)$/i;
+function isRealSource(s) {
+  return typeof s === 'string' && s.trim().length > 0 && !NON_PROVENANCE_SOURCE_RE.test(s.trim());
+}
+
+// Pulled out to pure, exported functions — used by BOTH pass-2 call sites
+// (brand + product reviews) so they cannot drift apart, and so the harness
+// can pin the flag-gating BEHAVIOURALLY (call the function under each flag
+// state) instead of regexing a literal that stopped being one once the value
+// depends on an env read. "Harness never calls Gemini" (adversarial review)
+// stays true — these are pure string/array builders, no network.
+function ratingsItemRequiredKeys() {
+  return ratingRequireProvenanceEnabled() ? ['rating', 'source'] : ['rating'];
+}
+function ratingsProvenanceAskSentence() {
+  return ratingRequireProvenanceEnabled()
+    ? ' Every entry MUST carry the source site/domain it came from; use null ONLY when the narrative genuinely does not attribute the number; NEVER guess or invent a source.'
+    : '';
+}
+
 /**
  * pickBestRating(candidates) → { rating, reviewCount, ratingSource, ratingCandidates }
  *
@@ -321,45 +347,88 @@ function pickBestRating(candidates) {
     .filter((c) => c.reviewCount == null || c.reviewCount >= RATING_MIN_SAMPLE_ANY);
   if (!rows.length) return { rating: null, reviewCount: null, ratingSource: null, ratingCandidates: [] };
 
-  // Provenance gate sits ABOVE the two-tier ranking, never instead of it.
-  // Flag OFF: pool is every row (byte-identical to today). Flag ON: a sourced
-  // candidate always beats an unsourced one. FAIL-SAFE: when NOTHING is sourced,
-  // rank every row — this can never take a brand's rating away; it can only
-  // change WHICH number wins when both a sourced and an unsourced candidate exist.
-  // Owner 2026-08-12: "ask gemini to always get provenance, and yes scraped is
-  // better than something unsourced."
-  let pool = rows;
-  let excluded = [];
-  if (ratingRequireProvenanceEnabled()) {
-    const sourced = rows.filter((r) => r.source != null);
-    if (sourced.length) {
-      excluded = rows.filter((r) => r.source == null);
-      pool = sourced;
-    }
-  }
-
   let starMin = 4.39;
+  let wouldPrint = (c) => c.rating > starMin;
   try {
-    const { RATING_STAR_MIN } = require('../ratingDisplay');
-    if (typeof RATING_STAR_MIN === 'number') starMin = RATING_STAR_MIN;
+    const rd = require('../ratingDisplay');
+    if (typeof rd.RATING_STAR_MIN === 'number') starMin = rd.RATING_STAR_MIN;
+    if (typeof rd.formatDisplayRating === 'function') {
+      // The SHIPPED display oracle, not a re-derived floor. "Printable" has to
+      // mean what the renderer actually does, including the .toFixed(1) rounding
+      // that makes 4.44 print and 4.39 not.
+      wouldPrint = (c) => {
+        if (rd.formatDisplayRating(c.rating, { starMin }) !== undefined) return true;
+        // Volume exception: a slightly lower rating on a very large sample is
+        // printable where the same number on 20 reviews is not.
+        const volMin = rd.RATING_STAR_VOLUME_MIN;
+        const volCount = rd.RATING_STAR_VOLUME_COUNT_MIN;
+        return rd.BRAND_VOLUME_EXCEPTION_ENABLED === true
+          && typeof volMin === 'number' && typeof volCount === 'number'
+          && (c.reviewCount || 0) >= volCount
+          && rd.formatDisplayRating(c.rating, { starMin: volMin }) !== undefined;
+      };
+    }
   } catch (_) { /* fall back to the documented default */ }
 
   const credible = (c) => c.rating > starMin && (c.reviewCount || 0) >= RATING_MIN_CREDIBLE_REVIEWS;
-  const anyTier1 = pool.some(credible);
-  const ranked = pool.slice().sort((a, b) => {
-    const pa = credible(a), pb = credible(b);
-    if (pa !== pb) return pa ? -1 : 1;
-    const ca = a.reviewCount || 0, cb = b.reviewCount || 0;
-    if (anyTier1) {
-      // TIER 1 present: biggest credible sample wins, rating breaks ties.
-      if (ca !== cb) return cb - ca;
-      return b.rating - a.rating;
+  const rank = (list) => {
+    const anyTier1 = list.some(credible);
+    return list.slice().sort((a, b) => {
+      const pa = credible(a), pb = credible(b);
+      if (pa !== pb) return pa ? -1 : 1;
+      const ca = a.reviewCount || 0, cb = b.reviewCount || 0;
+      if (anyTier1) {
+        // TIER 1 present: biggest credible sample wins, rating breaks ties.
+        if (ca !== cb) return cb - ca;
+        return b.rating - a.rating;
+      }
+      // TIER 2 only: MORE STARS WINS, count merely breaks ties. Owner directive.
+      if (a.rating !== b.rating) return b.rating - a.rating;
+      return cb - ca;
+    });
+  };
+
+  // Provenance gate sits ABOVE the two-tier ranking, never instead of it.
+  // Owner 2026-08-12: "ask gemini to always get provenance, and yes scraped is
+  // better than something unsourced."
+  //
+  // THE FAIL-SAFE IS A REAL COMPARISON, not "did anything have a source". An
+  // earlier draft partitioned to the sourced rows whenever ANY row carried a
+  // source, and claimed that "can never take a brand's rating away". That was
+  // FALSE and adversarial review produced the case: ratings[] = Trustpilot
+  // 2.5/126 + WorthEPenny 3.2/22, with the legacy fold-in (ALWAYS unsourced —
+  // see the call sites) carrying 4.58/15,626. Flag off prints '4.6'; the naive
+  // gate picked 3.2, which is under the display floor, so the ad printed NO
+  // STARS AT ALL. Preferring provenance must never cost the brand its rating.
+  //
+  // So the gate stands down when it would trade a printable number for an
+  // unprintable one. Provenance decides between candidates we would actually
+  // print; it does not get to silence the rating line.
+  let pool = rows;
+  let excluded = [];
+  let stoodDown = false;
+  if (ratingRequireProvenanceEnabled()) {
+    // isRealSource, not a bare non-null check: a placeholder string ('unknown',
+    // 'null', 'n/a' — the literal word, not the JS value) is not provenance and
+    // must not out-rank a genuinely unsourced candidate.
+    const sourced = rows.filter((r) => isRealSource(r.source));
+    if (sourced.length && sourced.length < rows.length) {
+      const sourcedWinner = rank(sourced)[0];
+      const openWinner = rank(rows)[0];
+      if (!wouldPrint(sourcedWinner) && wouldPrint(openWinner)) {
+        stoodDown = true;
+      } else {
+        excluded = rows.filter((r) => !isRealSource(r.source));
+        pool = sourced;
+      }
     }
-    // TIER 2 only: MORE STARS WINS, count merely breaks ties. Owner directive.
-    if (a.rating !== b.rating) return b.rating - a.rating;
-    return cb - ca;
-  });
+  }
+
+  const ranked = rank(pool);
   const winner = ranked[0];
+  if (stoodDown) {
+    console.log(`   · rating source: provenance gate STOOD DOWN — the best sourced aggregate (${rank(rows.filter((r) => isRealSource(r.source)))[0].rating}★) is below the display floor, so preferring it would have printed no stars at all; kept ${winner.rating}★ / ${winner.reviewCount ?? '?'} (unsourced)`);
+  }
   if (excluded.length) {
     console.log(`   · rating source: set aside ${excluded.length} unsourced candidate(s); chose ${winner.rating}★ / ${winner.reviewCount ?? '?'} reviews${winner.source ? ` (${winner.source})` : ''}`);
   }
@@ -847,6 +916,23 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
   // ── Pass 2: structure as JSON ──
   // Plain Gemini call (no tools) with JSON mime — reliably honors
   // formatting when there's no google_search tool muddying things.
+  //
+  // RATING_REQUIRE_PROVENANCE gates the PROMPT AND SCHEMA too, not only the
+  // picker ranking. Adversarial review, 2026-08-12: an earlier draft made
+  // `source` a required schema key unconditionally. That is an always-on I/O
+  // change with three unmeasured live outcomes — the model attaches a name
+  // (fine), emits null (fine, ranking unaffected), or DROPS the unattributed
+  // aggregate outright (easier than satisfying a required field with nothing
+  // to put in it) — and the third one is not idle: it is documented right
+  // above as measured behaviour for a REQUIRED field with nothing to fill.
+  // A dropped aggregate reaches pickBestRating as if it never existed, with
+  // the ranking flag never consulted, so "flag off" would not mean "today's
+  // behaviour" for the schema/prompt half of this change. Gating both on the
+  // same flag makes flag-off byte-identical prompt + schema to origin/main —
+  // the guarantee this file's other flags all make — and confines the
+  // unmeasured risk to opt-in.
+  const provenanceAsk = ratingsProvenanceAskSentence();
+  const requiredRatingItemKeys = ratingsItemRequiredKeys();
   const structurePrompt =
     `Convert the following brand-review narrative into structured JSON.\n\n` +
     `Brand: ${brandName}\n` +
@@ -855,7 +941,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
     `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average. Every entry MUST carry the source site/domain it came from; use null ONLY when the narrative genuinely does not attribute the number; NEVER guess or invent a source.\n` +
+    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average.${provenanceAsk}\n` +
     `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall brand sentiment"\n` +
@@ -940,7 +1026,7 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
                   // makes the model INVENT a source name when it cannot identify
                   // one, and a fabricated provenance is worse than an absent one
                   // because it looks auditable and is not.
-                  required: ['rating', 'source']
+                  required: requiredRatingItemKeys
                 }
               },
               rating:      { type: 'number',  nullable: true },
@@ -1057,6 +1143,11 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
   }
 
   // ── Pass 2: structure as JSON ──
+  // RATING_REQUIRE_PROVENANCE gates the prompt AND schema here too — see the
+  // matching comment in lookupBrandReviews above for why an always-on
+  // required-schema-key change is a real, unmeasured, flag-off risk.
+  const provenanceAsk = ratingsProvenanceAskSentence();
+  const requiredRatingItemKeys = ratingsItemRequiredKeys();
   const structurePrompt =
     `Convert the following product-review narrative into structured JSON.\n\n` +
     `Product: ${productName}${brandName ? ` (brand: ${brandName})` : ''}\n` +
@@ -1065,7 +1156,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
     `Return EXACTLY this shape (no commentary, no markdown):\n` +
     `{\n` +
     `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average. Every entry MUST carry the source site/domain it came from; use null ONLY when the narrative genuinely does not attribute the number; NEVER guess or invent a source.\n` +
+    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average.${provenanceAsk}\n` +
     `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
     `  "reviewCount": <integer or null>,\n` +
     `  "summary":     "one sentence on overall product sentiment"\n` +
@@ -1151,7 +1242,7 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
                   // makes the model INVENT a source name when it cannot identify
                   // one, and a fabricated provenance is worse than an absent one
                   // because it looks auditable and is not.
-                  required: ['rating', 'source']
+                  required: requiredRatingItemKeys
                 }
               },
               rating:      { type: 'number',  nullable: true },
@@ -1222,6 +1313,14 @@ module.exports = {
   pickBestRating,
   RATING_MIN_CREDIBLE_REVIEWS,
   RATING_MIN_SAMPLE_ANY,
+  // Exported so the harness pins the flag-gated schema/prompt behaviourally —
+  // call the builder under each RATING_REQUIRE_PROVENANCE state — rather than
+  // regexing a value that stopped being a source-text literal once it moved
+  // behind the flag. See the functions' own comments for why they exist.
+  ratingRequireProvenanceEnabled,
+  ratingsItemRequiredKeys,
+  ratingsProvenanceAskSentence,
+  isRealSource,
   GROUNDED_PASS1_CONFIG,
   GROUNDED_PASS2_MAX_TOKENS,
   GROUNDED_CALL_TIMEOUT_MS,

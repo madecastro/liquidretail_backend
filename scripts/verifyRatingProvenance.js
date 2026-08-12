@@ -4,15 +4,27 @@
 /**
  * verifyRatingProvenance — offline pins for the rating provenance gate.
  *
- * Flag RATING_REQUIRE_PROVENANCE (env, default FALSE). Flag-off is today's
- * exact ranking, including an unsourced 5.0 beating a sourced 4.5. Flag-on
- * prefers a sourced candidate when one exists; when NOTHING is sourced the
- * unsourced number still wins (fail-safe — a brand cannot lose its rating).
+ * Owner 2026-08-12: "Let's ask gemini to always get provenance, and yes
+ * scraped is better than something unsourced."
  *
- * The two-tier owner ranking is unchanged. This gate sits ABOVE it.
+ * ONE flag, RATING_REQUIRE_PROVENANCE (env, default FALSE), gates BOTH halves
+ * of this change:
+ *   1. The pass-2 prompt/schema (does Gemini have to name a source at all)
+ *   2. pickBestRating's ranking (does a named source outrank an unnamed one)
+ * Flag-off must be indistinguishable from origin/main on BOTH halves — this
+ * was NOT true of the first draft, which gated only the ranking while making
+ * the schema's `source` key unconditionally required. Adversarial review
+ * caught it: a required field the model cannot fill is a live incentive to
+ * DROP the aggregate rather than emit null, which loses a printable rating
+ * with the flag off and the ranking gate never consulted. See REGRESSION §F.
  *
- * Also pins both pass-2 responseSchemas (`source` required AND nullable)
- * and both structure prompts (never invent a source).
+ * Flag-on is NOT "sourced always wins" — that was the second thing adversarial
+ * review disproved. It is "sourced wins UNLESS that would trade a printable
+ * rating for an unprintable one" — see FAIL-SAFE §C. The two-tier owner
+ * ranking (biggest-credible-sample / more-stars) is unchanged and runs over
+ * whichever pool the gate lands on.
+ *
+ * A source string is not "real" just because it is non-empty — see GARBAGE §G.
  *
  * Offline: no DB, no network, no API key.
  *   node scripts/verifyRatingProvenance.js
@@ -22,7 +34,13 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const { pickBestRating } = require('../services/providers/geminiSearchProvider');
+const provider = require('../services/providers/geminiSearchProvider');
+const {
+  pickBestRating,
+  ratingsItemRequiredKeys,
+  ratingsProvenanceAskSentence,
+  isRealSource
+} = provider;
 
 const SRC_PATH = path.join(__dirname, '..', 'services', 'providers', 'geminiSearchProvider.js');
 const src = fs.readFileSync(SRC_PATH, 'utf8');
@@ -37,7 +55,7 @@ function check(name, fn) {
     fn();
     pass += 1;
   } catch (err) {
-    failures.push(`${name}: ${err.message.split('\n')[0].slice(0, 240)}`);
+    failures.push(`${name}: ${err.message.split('\n')[0].slice(0, 260)}`);
   }
 }
 
@@ -71,6 +89,7 @@ function stripComments(text) {
     .replace(/^[ \t]*\/\/.*$/gm, '')
     .replace(/([^:])\/\/.*$/gm, '$1');
 }
+const codeOnly = stripComments(src);
 
 // Same pair for OFF vs ON: unsourced 5.0/100 is tier-1 with the bigger
 // sample, so TODAY it wins. 4.5/60 is also tier-1. The flag is what
@@ -101,8 +120,8 @@ check('A2 explicit false: same winner as unset', () => {
   });
 });
 
-// ═══════════════ B. flag ON — the fix ═══════════════
-console.log('\nB. flag ON — sourced beats unsourced');
+// ═══════════════ B. flag ON — the fix, when it does not conflict with print-safety ═══════════════
+console.log('\nB. flag ON — sourced beats unsourced (when both would print)');
 
 check('B1 sourced 4.5/60 beats unsourced 5.0/100', () => {
   withFlag('true', () => {
@@ -130,8 +149,8 @@ check('B3 set-aside log names the count and the winner', () => {
   });
 });
 
-// ═══════════════ C. fail-safe — no rating lost ═══════════════
-console.log('\nC. flag ON, nothing sourced — unsourced still wins');
+// ═══════════════ C. FAIL-SAFE — the real one, not "did anything have a source" ═══════════════
+console.log('\nC. flag ON — provenance must never cost a brand its printable rating');
 
 check('C1 unsourced 5.0 still wins when every candidate is unsourced', () => {
   withFlag('true', () => {
@@ -151,6 +170,56 @@ check('C2 fail-safe does not emit a set-aside log', () => {
       { rating: 5.0, source: null }
     ]));
     assert.ok(!lines.some((l) => /set aside/.test(l)), 'nothing was excluded');
+  });
+});
+
+// REGRESSION CASE — the exact one adversarial review produced against the
+// first draft. A named-but-thin sourced pair (Trustpilot 2.5/126, WorthEPenny
+// 3.2/22) alongside an unsourced-but-large one (the legacy fold-in shape,
+// 4.58/15626). A gate keyed on "does ANY row have a source" partitions to the
+// two sourced rows and prints 3.2 — UNDER the 4.39 display floor, so the ad
+// shows literally NO STARS where flag-off showed 4.6. This is not a worse
+// number, it is the rating disappearing.
+check('C3 REGRESSION — sourced-but-unprintable must not displace a printable unsourced winner', () => {
+  withFlag('true', () => {
+    const input = [
+      { source: 'trustpilot.com', rating: 2.5, reviewCount: 126 },
+      { source: 'WorthEPenny', rating: 3.2, reviewCount: 22 },
+      { rating: 4.58, reviewCount: 15626, source: null } // legacy fold-in shape
+    ];
+    const r = quiet(() => pickBestRating(input)).result;
+    assert.strictEqual(r.rating, 4.58,
+      `provenance gate traded a printable 4.58 for an unprintable sourced number (got ${r.rating})`);
+    assert.strictEqual(r.reviewCount, 15626);
+  });
+});
+
+check('C4 the stand-down is logged, distinct from the ordinary set-aside line', () => {
+  withFlag('true', () => {
+    const input = [
+      { source: 'trustpilot.com', rating: 2.5, reviewCount: 126 },
+      { source: 'WorthEPenny', rating: 3.2, reviewCount: 22 },
+      { rating: 4.58, reviewCount: 15626, source: null }
+    ];
+    const { lines } = quiet(() => pickBestRating(input));
+    assert.ok(lines.some((l) => /STOOD DOWN/.test(l)), 'expected a stood-down log line');
+    assert.ok(!lines.some((l) => /set aside/.test(l)), 'must not ALSO claim rows were set aside');
+  });
+});
+
+check('C5 when the sourced winner IS printable, the gate still prefers it over an unsourced one', () => {
+  // Sanity: C3's fix must not have swallowed the whole feature. A genuinely
+  // printable sourced candidate still wins over an unsourced one even when a
+  // third, unprintable, sourced row also exists.
+  withFlag('true', () => {
+    const input = [
+      { source: 'trustpilot.com', rating: 2.5, reviewCount: 126 }, // sourced, unprintable
+      { source: 'vuoriclothing.com', rating: 4.58, reviewCount: 15626 }, // sourced, printable, tier 1
+      { rating: 4.8, reviewCount: 5, source: null } // unsourced, thin tier-2
+    ];
+    const r = quiet(() => pickBestRating(input)).result;
+    assert.strictEqual(r.rating, 4.58, `got ${r.rating}`);
+    assert.strictEqual(r.ratingSource, 'vuoriclothing.com');
   });
 });
 
@@ -220,7 +289,9 @@ check('E2 flag ON: excluded unsourced still present, after the ranked pool', () 
   });
 });
 
-check('E3 flag ON, nothing sourced: every row still present', () => {
+check('E3 flag ON, nothing sourced: every row still present, and NOT collapsed to duplicates', () => {
+  // Original E3 only checked .length === 2, which a [5.0, 5.0] duplicate bug
+  // would also satisfy. Assert the actual distinct ratings survive.
   withFlag('true', () => {
     const input = [
       { rating: 5.0, reviewCount: 10, source: null },
@@ -228,20 +299,69 @@ check('E3 flag ON, nothing sourced: every row still present', () => {
     ];
     const r = quiet(() => pickBestRating(input)).result;
     assert.strictEqual(r.ratingCandidates.length, 2);
+    const ratings = r.ratingCandidates.map((c) => c.rating).sort();
+    assert.deepStrictEqual(ratings, [4.5, 5.0]);
   });
 });
 
-// ═══════════════ F. both schemas + both prompts ═══════════════
-console.log('\nF. both pass-2 schemas require source; both prompts forbid inventing one');
-
-check('F1 both responseSchemas list source in required', () => {
-  const code = stripComments(src);
-  const required = code.match(/required: \['rating', 'source'\]/g) || [];
-  assert.strictEqual(required.length, 2,
-    `expected source in required on both ratings items, got ${required.length}`);
+check('E4 stand-down: audit trail still lists every row, not just the winner', () => {
+  withFlag('true', () => {
+    const input = [
+      { source: 'trustpilot.com', rating: 2.5, reviewCount: 126 },
+      { source: 'WorthEPenny', rating: 3.2, reviewCount: 22 },
+      { rating: 4.58, reviewCount: 15626, source: null }
+    ];
+    const r = quiet(() => pickBestRating(input)).result;
+    assert.strictEqual(r.ratingCandidates.length, 3, 'a stand-down must not drop rows either');
+  });
 });
 
-check('F2 source stays nullable on both ratings items (do not force a name)', () => {
+// ═══════════════ F. schema/prompt are gated on the SAME flag — behavioural ═══════════════
+console.log('\nF. schema/prompt builders — flag-gated, tested by calling them (not regexed)');
+
+check('F1 flag OFF: source is NOT in the required keys (byte-identical to pre-change)', () => {
+  withFlag(undefined, () => {
+    assert.deepStrictEqual(ratingsItemRequiredKeys(), ['rating'],
+      'flag-off must ask for exactly what origin/main asked for');
+  });
+});
+
+check('F2 flag ON: source IS required', () => {
+  withFlag('true', () => {
+    assert.deepStrictEqual(ratingsItemRequiredKeys(), ['rating', 'source']);
+  });
+});
+
+check('F3 flag OFF: the prompt carries no provenance demand at all', () => {
+  withFlag(undefined, () => {
+    const ask = ratingsProvenanceAskSentence();
+    assert.strictEqual(ask, '', 'flag-off must add nothing to the prompt — this IS the always-on-I/O fix');
+  });
+});
+
+check('F4 flag ON: the prompt demands a source and bans inventing one', () => {
+  withFlag('true', () => {
+    const ask = ratingsProvenanceAskSentence();
+    assert.ok(/MUST carry the source/.test(ask), ask);
+    assert.ok(/NEVER guess or invent a source/.test(ask), ask);
+  });
+});
+
+check('F5 BOTH pass-2 call sites use the SHARED builders, not a re-implemented literal', () => {
+  // stripComments so a mutation that deletes the real call but leaves a
+  // matching comment cannot pass this by accident. Exclude the `function
+  // name() {` declaration line itself — it also matches `name()` textually.
+  const calls = (codeOnly.match(/(?<!function )ratingsItemRequiredKeys\(\)/g) || []).length;
+  const asks = (codeOnly.match(/(?<!function )ratingsProvenanceAskSentence\(\)/g) || []).length;
+  assert.strictEqual(calls, 2, `expected 2 call sites (brand + product reviews), got ${calls}`);
+  assert.strictEqual(asks, 2, `expected 2 call sites (brand + product reviews), got ${asks}`);
+  // And no site re-implements its own inline required array or ask sentence —
+  // that duplication is exactly what let the two prompts drift before.
+  assert.ok(!/required:\s*\['rating',\s*'source'\]/.test(codeOnly),
+    'a call site still hardcodes the required array instead of using the builder');
+});
+
+check('F6 source stays nullable in BOTH ratings schema blocks (do not force a name)', () => {
   const blocks = src.match(/ratings: \{[\s\S]*?\n              \},/g) || [];
   assert.strictEqual(blocks.length, 2, `expected 2 ratings schema blocks, got ${blocks.length}`);
   for (const b of blocks) {
@@ -249,24 +369,61 @@ check('F2 source stays nullable on both ratings items (do not force a name)', ()
       'source must stay nullable — a forced string makes the model invent a site');
     assert.ok(!/source:\s*\{ type: 'string' \}/.test(b),
       'a non-nullable source slipped in');
+    assert.ok(/required:\s*requiredRatingItemKeys/.test(b),
+      'the schema item must use the shared builder, not a literal');
   }
 });
 
-check('F3 both prompts say never invent a source', () => {
-  const hits = src.match(/NEVER guess or invent a source/g) || [];
-  assert.strictEqual(hits.length, 2,
-    `expected the invent-ban in both structurePrompts, got ${hits.length}`);
-  const must = src.match(/MUST carry the source site\/domain/g) || [];
-  assert.strictEqual(must.length, 2, 'both prompts must demand a source on every entry');
-  const keep = src.match(/EVERY aggregate found, one entry each; do NOT pick or average/g) || [];
-  assert.strictEqual(keep.length, 2, 'the existing do-not-pick guidance must stay');
+check('F7 helper defaults OFF and is read at call time (not module load)', () => {
+  assert.ok(/RATING_REQUIRE_PROVENANCE \|\| 'false'/.test(codeOnly),
+    'flag must default false so today is preserved');
+  assert.ok(/function ratingRequireProvenanceEnabled\(/.test(codeOnly),
+    'expected the env helper next to the other rating knobs');
 });
 
-check('F4 helper defaults OFF and is read at call time', () => {
-  assert.ok(/RATING_REQUIRE_PROVENANCE \|\| 'false'/.test(src),
-    'flag must default false so today is preserved');
-  assert.ok(/function ratingRequireProvenanceEnabled\(/.test(src),
-    'expected the env helper next to the other rating knobs');
+// ═══════════════ G. GARBAGE — a placeholder string is not provenance ═══════════════
+console.log('\nG. a non-empty source string that names nothing must not out-rank a real unsourced row');
+
+check('G1 isRealSource rejects common placeholders', () => {
+  for (const bad of ['unknown', 'Unknown', 'N/A', 'n/a', 'null', 'NULL', 'none', 'undefined', 'not specified', 'no source', 'web', 'various', 'multiple sources']) {
+    assert.strictEqual(isRealSource(bad), false, `expected "${bad}" to be rejected as non-provenance`);
+  }
+});
+
+check('G2 isRealSource accepts a real site/domain', () => {
+  for (const good of ['trustpilot.com', 'Vuoriclothing.com', 'Google Shopping', 'Nordstrom']) {
+    assert.strictEqual(isRealSource(good), true, `expected "${good}" to be accepted`);
+  }
+});
+
+check('G3 isRealSource rejects null / empty / non-string', () => {
+  assert.strictEqual(isRealSource(null), false);
+  assert.strictEqual(isRealSource(''), false);
+  assert.strictEqual(isRealSource('   '), false);
+  assert.strictEqual(isRealSource(undefined), false);
+  assert.strictEqual(isRealSource(42), false);
+});
+
+check("G4 a candidate whose source is the literal word 'unknown' does not out-rank a real unsourced one", () => {
+  withFlag('true', () => {
+    const r = quiet(() => pickBestRating([
+      { source: 'unknown', rating: 3.1, reviewCount: 8 },
+      { rating: 4.8, reviewCount: 900, source: null }
+    ])).result;
+    assert.strictEqual(r.rating, 4.8, `a placeholder source displaced the real winner, got ${r.rating}`);
+    assert.strictEqual(r.ratingSource, null);
+  });
+});
+
+check("G5 the literal string 'null' as a source is treated as unsourced, not as provenance", () => {
+  withFlag('true', () => {
+    const r = quiet(() => pickBestRating([
+      { source: 'null', rating: 3.0, reviewCount: 5 },
+      { source: 'trustpilot.com', rating: 4.5, reviewCount: 60 }
+    ])).result;
+    assert.strictEqual(r.rating, 4.5);
+    assert.strictEqual(r.ratingSource, 'trustpilot.com');
+  });
 });
 
 // ── report ────────────────────────────────────────────────────────────
