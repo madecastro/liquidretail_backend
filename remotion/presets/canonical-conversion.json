@@ -1,6 +1,6 @@
 {
   "name": "canonical-conversion",
-  "description": "Funnel variant \u2014 CONVERSION (static social_proof_led twin). productName + rating + deliveryLine + CTA from ~1.5s, CTA persistent to end. Quote/reviewer proof mid-clip. Social proof led, clear shop intent. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
+  "description": "Funnel variant — CONVERSION (static social_proof_led twin). productName + rating + deliveryLine + CTA from ~1.5s, CTA persistent to end. Quote/reviewer proof mid-clip. Social proof led, clear shop intent. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -64,7 +64,7 @@
             "enterAtSec": 0.4,
             "exitAtSec": 2.2,
             "enterDurationSec": 0.5,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -92,7 +92,7 @@
             "enterAtSec": 0.2,
             "exitAtSec": 2.2,
             "enterDurationSec": 0.5,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -225,7 +225,7 @@
             "enterAtSec": 2.7,
             "exitAtSec": 4.8,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -252,7 +252,7 @@
             "enterAtSec": 2.7,
             "exitAtSec": 4.8,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -270,7 +270,7 @@
             "headline"
           ],
           "visibleWhenEmpty": "quote",
-          "_note": "Proof claim restatement when quote is gated empty \u2014 sits above rating lockup (owner 2026-08-05)."
+          "_note": "Proof claim restatement when quote is gated empty — sits above rating lockup (owner 2026-08-05)."
         },
         {
           "key": "reviewer",
@@ -284,7 +284,7 @@
             "enterAtSec": 3.0,
             "exitAtSec": 4.8,
             "enterDurationSec": 0.6,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"

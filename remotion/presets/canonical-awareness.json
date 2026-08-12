@@ -1,6 +1,6 @@
 {
   "name": "canonical-awareness",
-  "description": "Funnel variant \u2014 AWARENESS (static product_first_lifestyle twin). Headline-dominant, long hook (~0\u20134s), brandPill on, rating only in proof, soft late CTA in close only. No deliveryLine. Aspirational lifestyle framing.",
+  "description": "Funnel variant — AWARENESS (static product_first_lifestyle twin). Headline-dominant, long hook (~0–4s), brandPill on, rating only in proof, soft late CTA in close only. No deliveryLine. Aspirational lifestyle framing.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -64,7 +64,7 @@
             "enterAtSec": 0.5,
             "exitAtSec": 3.6,
             "enterDurationSec": 0.6,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -92,7 +92,7 @@
             "enterAtSec": 0.15,
             "exitAtSec": 3.7,
             "enterDurationSec": 0.8,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -119,7 +119,7 @@
             "enterAtSec": 4,
             "exitAtSec": 6.3,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -146,7 +146,7 @@
             "enterAtSec": 4,
             "exitAtSec": 6.3,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -164,7 +164,7 @@
             "headline"
           ],
           "visibleWhenEmpty": "quote",
-          "_note": "Proof claim restatement when quote is gated empty \u2014 sits above rating lockup (owner 2026-08-05)."
+          "_note": "Proof claim restatement when quote is gated empty — sits above rating lockup (owner 2026-08-05)."
         },
         {
           "key": "reviewer",
@@ -178,7 +178,7 @@
             "enterAtSec": 4.3,
             "exitAtSec": 6.3,
             "enterDurationSec": 0.6,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -206,7 +206,7 @@
             "enterAtSec": 4.5,
             "exitAtSec": 6.3,
             "enterDurationSec": 0.6,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"

@@ -1,6 +1,6 @@
 {
   "name": "proto-bottom-editorial",
-  "description": "EXPERIMENTAL scoring prototype \u2014 inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
+  "description": "EXPERIMENTAL scoring prototype — inverse-layout hypothesis. All copy in the lower half so the product stays unobstructed up-frame. Hook/proof at lowerThird sequenced in time across phases; close productName+delivery+CTA at bottom. Tests whether the hook needs the top at all. Scrim none; CTA visible all formats; brand-neutral tokens. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -37,7 +37,7 @@
             "enterAtSec": 0.2,
             "exitAtSec": 2.4,
             "enterDurationSec": 0.6,
-            "exitDurationSec": 0.45
+            "exitDurationSec": 0.3
           },
           "transition": {
             "type": "slide",
@@ -65,7 +65,7 @@
             "enterAtSec": 2.75,
             "exitAtSec": 4.8,
             "enterDurationSec": 0.55,
-            "exitDurationSec": 0.4
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -92,7 +92,7 @@
             "enterAtSec": 2.75,
             "exitAtSec": 4.8,
             "enterDurationSec": 0.55,
-            "exitDurationSec": 0.4
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -110,7 +110,7 @@
             "headline"
           ],
           "visibleWhenEmpty": "quote",
-          "_note": "Proof claim restatement when quote is gated empty \u2014 sits above rating lockup (owner 2026-08-05)."
+          "_note": "Proof claim restatement when quote is gated empty — sits above rating lockup (owner 2026-08-05)."
         },
         {
           "key": "reviewer",
@@ -124,7 +124,7 @@
             "enterAtSec": 3.1,
             "exitAtSec": 4.8,
             "enterDurationSec": 0.5,
-            "exitDurationSec": 0.4
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -153,7 +153,7 @@
             "enterAtSec": 3.3,
             "exitAtSec": 4.8,
             "enterDurationSec": 0.45,
-            "exitDurationSec": 0.4
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"

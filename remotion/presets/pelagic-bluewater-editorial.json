@@ -87,7 +87,7 @@
             "enterAtSec": 0.4,
             "exitAtSec": 2.8,
             "enterDurationSec": 0.6,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.15
           },
           "transition": {
             "type": "fade"
@@ -114,7 +114,7 @@
             "enterAtSec": 0.1,
             "exitAtSec": 2.8,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.15
           },
           "transition": {
             "type": "fade"
@@ -145,7 +145,7 @@
             "enterAtSec": 3,
             "exitAtSec": 6.3,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -171,7 +171,7 @@
             "enterAtSec": 3.3,
             "exitAtSec": 6.3,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"
@@ -199,7 +199,7 @@
             "enterAtSec": 3.5,
             "exitAtSec": 6.3,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.5
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "fade"

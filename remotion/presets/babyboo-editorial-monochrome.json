@@ -89,7 +89,7 @@
             "enterAtSec": 0.2,
             "exitAtSec": 2.7,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "slide",
@@ -117,7 +117,7 @@
             "enterAtSec": 0.4,
             "exitAtSec": 2.8,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "slide",
@@ -144,7 +144,7 @@
             "enterAtSec": 3.1,
             "exitAtSec": 5.7,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "slide",
@@ -170,7 +170,7 @@
             "enterAtSec": 3.4,
             "exitAtSec": 5.7,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "slide",
@@ -199,7 +199,7 @@
             "enterAtSec": 3.6,
             "exitAtSec": 5.7,
             "enterDurationSec": 0.7,
-            "exitDurationSec": 0.6
+            "exitDurationSec": 0.25
           },
           "transition": {
             "type": "slide",
