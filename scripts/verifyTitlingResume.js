@@ -98,16 +98,25 @@ checkTrue('T3b bootRecoveryService writes titlingResumeState via the constant, n
 // ── G: STATE MUST NOT LIVE IN renderStage (the clobbered design) ──────
 // THE REGRESSION GUARD. adStage owns renderStage and overwrites it during titling.
 {
-  // Isolate the find() query object.
-  const qAt  = RESUME_CODE.indexOf('Ad.find(');
-  const qEnd = qAt >= 0 ? RESUME_CODE.indexOf('.sort(', qAt) : -1;
-  const queryBlock = (qAt >= 0 && qEnd > qAt) ? RESUME_CODE.slice(qAt, qEnd) : '';
+  // The query is now built by the exported pure `buildResumeFilter`, so these
+  // assert the REAL FILTER OBJECT rather than a source slice. That is strictly
+  // stronger: the old form sliced between `Ad.find(` and `.sort(` and would
+  // have gone quietly green on any refactor that moved the arms out of that
+  // window — passing while asserting nothing.
+  const SWEEP_CUTOFF = new Date('2026-08-12T17:45:00Z');
+  const SWEEP_FILTER = svc.buildResumeFilter(SWEEP_CUTOFF);
+  const filterJson = JSON.stringify(SWEEP_FILTER);
+  const arms = Array.isArray(SWEEP_FILTER.$or) ? SWEEP_FILTER.$or : [];
+
   checkTrue('G1 the sweep QUERY keys on titlingResumeState, never on renderStage',
-    queryBlock.length > 0
-    && /titlingResumeState:/.test(queryBlock)
-    && !/renderStage/.test(queryBlock),
-    queryBlock ? 'renderStage is clobbered by adStage — a crashed render would leak'
-               : 'could not isolate the query block');
+    arms.length > 0
+    && arms.some(a => 'titlingResumeState' in a)
+    && !/renderStage/.test(filterJson),
+    'renderStage is clobbered by adStage — a crashed render would leak');
+
+  checkTrue('G1b the sweep is scoped to draft (never races bootRecovery for a paid master)',
+    SWEEP_FILTER.status === 'draft',
+    'two recovery systems claiming one paid master is a double-render');
 
   // No CLAIM FILTER may key on renderStage either.
   //
@@ -244,11 +253,18 @@ checkTrue('T11b index.js guards against overlapping sweeper passes',
 
 // ── T13: a STALE claim is re-swept (mid-render crash is recoverable) ──
 {
-  const qAt  = RESUME_CODE.indexOf('Ad.find(');
-  const qEnd = qAt >= 0 ? RESUME_CODE.indexOf('.sort(', qAt) : -1;
-  const queryBlock = (qAt >= 0 && qEnd > qAt) ? RESUME_CODE.slice(qAt, qEnd) : '';
+  // Asserted against the real filter. The stale-claim arm is now ALSO what
+  // recovers a normal-path render killed mid-titling — routes/ads.js stamps
+  // 'claimed' with the master — so this arm carries more weight than when it
+  // was written. See scripts/verifyTitlingOrphanResume.js.
+  const cutoff = new Date('2026-08-12T17:45:00Z');
+  const arms = svc.buildResumeFilter(cutoff).$or || [];
+  const staleArm = arms.find(a => a.titlingResumeState === svc.STATE_CLAIMED);
   checkTrue('T13 QUERY re-sweeps a stale claim (crash mid-titling is recoverable)',
-    /titlingResumeState:\s*STATE_CLAIMED\s*,\s*updatedAt:\s*\{\s*\$lt:\s*staleCutoff\s*\}/.test(queryBlock),
+    !!staleArm
+    && !!staleArm.updatedAt
+    && staleArm.updatedAt.$lt instanceof Date
+    && staleArm.updatedAt.$lt.getTime() === cutoff.getTime(),
     'without this a render killed mid-flight leaks the ad permanently');
 }
 
@@ -274,11 +290,15 @@ checkTrue('T15 success branch clears titlingResumeState so the ad leaves the swe
 // ads carry no state and no renderUrl. Without this arm the very ad that prompted
 // the work stays broken after the deploy.
 {
-  const qAt  = RESUME_CODE.indexOf('Ad.find(');
-  const qEnd = qAt >= 0 ? RESUME_CODE.indexOf('.sort(', qAt) : -1;
-  const queryBlock = (qAt >= 0 && qEnd > qAt) ? RESUME_CODE.slice(qAt, qEnd) : '';
+  const arms = svc.buildResumeFilter(new Date('2026-08-12T17:45:00Z')).$or || [];
+  const migrationArm = arms.find(a => a.veoVideoUrl && !('titlingResumeState' in a));
   checkTrue('T16 QUERY has the migration arm (veoVideoUrl set + renderUrl null)',
-    /veoVideoUrl:\s*\{\s*\$ne:\s*null\s*\}\s*,\s*renderUrl:\s*null/.test(queryBlock),
+    !!migrationArm
+    && migrationArm.veoVideoUrl.$ne === null
+    // renderUrl:null is the SELF-LIMIT — handling an ad gives it a renderUrl so
+    // it can never re-match. Dropping it makes the arm match every no-chrome ad
+    // that legitimately ships its bare master, forever.
+    && migrationArm.renderUrl === null,
     'ads already recovered by the deployed code would never be picked up');
   checkTrue('T16b the claim backfills renderUrl/posterUrl/kind for migration-arm ads',
     /claimSet\.renderUrl\s*=\s*ad\.veoVideoUrl/.test(RESUME_CODE)

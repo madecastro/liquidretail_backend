@@ -1805,6 +1805,11 @@ async function renderDeriveOnlyVideoAd({
         updatedAt:          new Date(),
         renderStage:        `derive-only plate from ${deriveFromFmt}`,
         renderStageAt:      new Date(),
+        // Same titling debt as the master path. This ad is FREE (no Omni), so
+        // the risk it closes is not double-spend but a silent untitled ship:
+        // a derived plate stranded mid-titling is indistinguishable from a
+        // finished one without this marker.
+        titlingResumeState: 'claimed',
         // Only written when the master's entry is bound to this same URL; a
         // spread of {} leaves the field untouched (null) and titling detects
         // exactly as it does today.
@@ -1848,7 +1853,8 @@ async function renderDeriveOnlyVideoAd({
           renderError: { message: tmsg, stage: 'titling', at: new Date() },
           renderStage: 'derived plate ready; titling failed',
           renderStageAt: new Date(),
-          updatedAt: new Date()
+          updatedAt: new Date(),
+          titlingResumeState: null
         }
       }
     );
@@ -1866,7 +1872,8 @@ async function renderDeriveOnlyVideoAd({
         $set: {
           status:     'draft',
           renderedAt: new Date(),
-          updatedAt:  new Date()
+          updatedAt:  new Date(),
+          titlingResumeState: null
         }
       }
     );
@@ -1892,9 +1899,31 @@ async function renderOne(run, job, adId, index, renderToken) {
   //
   // Touching updatedAt every 60s makes the reaper's "hasn't moved in 15
   // minutes" mean what it says: still claimed, still alive.
+  // The 'draft' + titlingResumeState:'claimed' arm is NOT symmetry for its own
+  // sake — without it this fix would cause the bug it is meant to prevent.
+  //
+  // The instant the paid master lands the ad flips to 'draft', so the
+  // rendering-only filter above went dead for the entire titling phase. Titling
+  // then queues behind VEO_TITLING_CONCURRENCY (4), and the MEASURED drain on a
+  // 20-ad run was 926s — longer than titlingResumeService's CLAIM_STALE_MIN
+  // (15 min). So an ad that is merely WAITING ITS TURN would look abandoned,
+  // and the sweeper would start a second Remotion render of an ad already being
+  // titled. Beating here makes "hasn't moved in 15 minutes" mean the process is
+  // gone, which is the only thing the sweeper should act on.
+  //
+  // Costs nothing when there is no debt: once titling settles, the terminal
+  // writes clear titlingResumeState and this filter stops matching.
   const heartbeat = setInterval(() => {
-    Ad.updateOne({ _id: adId, status: 'rendering' }, { $set: { updatedAt: new Date() } })
-      .catch(() => {});   // a missed beat is survivable; the next one lands
+    Ad.updateOne(
+      {
+        _id: adId,
+        $or: [
+          { status: 'rendering' },
+          { status: 'draft', titlingResumeState: 'claimed' }
+        ]
+      },
+      { $set: { updatedAt: new Date() } }
+    ).catch(() => {});   // a missed beat is survivable; the next one lands
   }, 60_000);
   if (typeof heartbeat.unref === 'function') heartbeat.unref();
   try {
@@ -2165,7 +2194,20 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             cloudinaryPublicId: veoCloudinaryPublicId,
             sourceFileType:     'video',
             renderedAt:         new Date(),
-            updatedAt:          new Date()
+            updatedAt:          new Date(),
+            // TITLING DEBT — the ad now owes a title, and this is what makes
+            // that debt VISIBLE to a sweeper. Without it a process death here
+            // leaves {status:'draft', renderUrl === veoVideoUrl} and NOTHING
+            // reclaims it: six sweepers key on 'rendering'/'queued', and
+            // titlingResumeService's three arms need this field set or
+            // renderUrl null — and the write above sets renderUrl.
+            //
+            // 'claimed' rather than 'pending' on purpose. 'pending' has no
+            // staleness bound in the sweeper, so a concurrent tick would grab
+            // an ad THIS process is actively titling. 'claimed' routes to the
+            // arm that also requires updatedAt older than CLAIM_STALE_MIN, so
+            // a live render is protected and only a dead one is reclaimed.
+            titlingResumeState: 'claimed'
           },
           $inc: { renderAttempts: 1 }
         }
@@ -2235,7 +2277,11 @@ async function renderOneInner(run, job, adId, index, renderToken) {
               renderError: { message: tmsg, stage: 'titling', at: new Date() },
               renderStage: 'master rendered; titling failed',
               renderStageAt: new Date(),
-              updatedAt: new Date()
+              updatedAt: new Date(),
+              // Debt settled: titling ran and lost. This is a TERMINAL verdict,
+              // so clearing is what stops the sweeper retrying a render that
+              // already failed on its merits rather than from a process death.
+              titlingResumeState: null
             }
           }
         );
@@ -2256,7 +2302,12 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             $set: {
               status:     'draft',
               renderedAt: new Date(),
-              updatedAt:  new Date()
+              updatedAt:  new Date(),
+              // Debt settled: titled, or deliberately shipped bare (no-chrome /
+              // no-brand). Clearing here is what keeps the no-chrome ad — whose
+              // renderUrl legitimately stays equal to veoVideoUrl forever — from
+              // being re-titled on every sweep for the rest of its life.
+              titlingResumeState: null
             }
           }
         );
