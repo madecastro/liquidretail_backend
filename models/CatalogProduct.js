@@ -178,6 +178,19 @@ const catalogProductSchema = new mongoose.Schema({
   //     fetchedAt: Date }
   productReviews: mongoose.Schema.Types.Mixed,
 
+  // Last N quote fingerprints chosen for this SKU (reviewKey convention:
+  // first-160-lowercased). QUOTE_ROTATION_MEMORY (default false) skips these
+  // on the next Generate until the eligible pool is exhausted, then wraps.
+  // Per (product, brand) because CatalogProduct is already brand-scoped.
+  // MUST be declared — Mongoose strict mode silently drops undeclared $set paths.
+  recentQuoteKeys: { type: [String], default: undefined },
+  // Same-run latch for the array above. Every size of one generation shares
+  // campaignRunId; siblings REPLAY lastQuoteFingerprint rather than re-hashing
+  // a different-length pool (that inversion printed different testimonials
+  // on 1:1 vs 4:5 once any prior memory existed).
+  lastQuoteRunId: { type: String, default: undefined },
+  lastQuoteFingerprint: { type: String, default: undefined },
+
   // ── Phase 2f — Immersive Product fields owned here (was on match artifact) ──
   //
   // CatalogProduct is the canonical home for product-page data. The

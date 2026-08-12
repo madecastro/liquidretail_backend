@@ -791,55 +791,36 @@ function intentForTemplate(template) {
  * Ordered by score before indexing, so index 0 is exactly today's behaviour and a
  * single-candidate pool is unchanged. The index is a hash, not a counter, which means
  * consecutive runs can land on the same quote with probability 1/N — with a 9-quote pool
- * that is ~11%. Stated rather than hidden: eliminating it entirely needs persisted
- * per-brand state, which is not worth a write on every generation.
+ * that is ~11%. QUOTE_ROTATION_MEMORY (default false) closes that hole by skipping
+ * last-N fingerprints on CatalogProduct.recentQuoteKeys; flag-off is the hash-only
+ * path, byte-identical. Implementation lives in quoteRotationService — this file
+ * keeps the wrappers so verifyQuoteSurfaceLength's source-region pins still resolve.
  */
 function rotationEnabled() {
-  return process.env.STATIC_QUOTE_ROTATION !== 'false';
+  return require('./quoteRotationService').staticRotationEnabled();
 }
 
 /** Stable non-negative 32-bit hash. Deterministic across processes — Math.random and
  *  Date are deliberately absent so the same run always resolves the same quote, which
  *  is what keeps the sizes in agreement. */
 function rotationHash(key) {
-  const s = String(key || '');
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0);
+  return require('./quoteRotationService').rotationHash(key);
 }
 
-function selectRotatedQuote(proof, campaignRunId) {
-  const primary = proof?.primary_quote || null;
-  if (!primary || !primary.text) return primary;
-  if (!rotationEnabled() || !campaignRunId) return primary;
-
-  const { clearsQualityFloor } = require('./layoutInputService');
-  const tier = primary.tier || null;
-  const seen = new Set();
-  const pool = [primary, ...(Array.isArray(proof.secondary_quotes) ? proof.secondary_quotes : [])]
-    .filter((q) => q && String(q.text || '').trim())
-    .filter((q) => (q.tier || null) === tier)          // guard 1: stay in the winning tier
-    .filter((q) => {
-      const k = String(q.text).trim();
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    })
-    .filter((q) => clearsQualityFloor(q.text));        // guard 2: never rotate downhill
-
-  if (pool.length < 2) return primary;
-  // Stable order so the index means the same thing on every size and every run.
-  const { scoreQuote } = require('./layoutInputService');
-  pool.sort((a, b) => (scoreQuote(b.text) - scoreQuote(a.text)) || (a.text < b.text ? -1 : 1));
-  const idx = rotationHash(campaignRunId) % pool.length;
-  const picked = pool[idx];
-  if (picked !== primary) {
-    console.log(`   · quote rotation: run ${campaignRunId} → candidate ${idx + 1}/${pool.length} (tier=${tier || 'unstamped'})`);
-  }
-  return picked;
+function selectRotatedQuote(proof, campaignRunId, opts = {}) {
+  const rot = require('./quoteRotationService');
+  const enabled = opts.enabled != null ? !!opts.enabled : rotationEnabled();
+  return rot.selectRotatedQuote(proof, campaignRunId, {
+    enabled,
+    recentKeys: opts.recentKeys,
+    lastRunId: opts.lastRunId,
+    lastFingerprint: opts.lastFingerprint,
+    memoryEnabled: opts.memoryEnabled,
+    memoryN: opts.memoryN,
+    scope: opts.scope,
+    stage: opts.stage,
+    angleTerms: opts.angleTerms
+  });
 }
 
 function buildIntentData({ concept, layoutInput, brand, product = null, cta, campaignRunId = null, media = null }) {
@@ -851,9 +832,48 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
   // llm-web quotes arrive with author/source fields that must never print, and
   // the gate strips them structurally so this path cannot re-surface a byline
   // by forgetting to clear author_name.
-  // Rotate BEFORE the provenance gate so the gate still has the final word on whatever
-  // rotation chose — a rotated quote is not exempt from anything the primary faced.
-  const rotated = selectRotatedQuote(proof, campaignRunId);
+  // Rotate BEFORE the provenance gate so the gate still has the final word on
+  // whatever rotation chose — a rotated quote is not exempt from anything the
+  // primary faced. Shared helper (quoteRotationService); video uses the same
+  // one. The call MUST stay named selectRotatedQuote: verifyQuoteSurfaceLength
+  // R7 pins that token before toPrintableCustomerQuote in this function.
+  // Scope is built BEFORE rotation so the shared helper can refuse a
+  // line STRICT / toPrintable will later drop. Rotating first and
+  // gating second is how flag-on lost a testimonial flag-off printed.
+  const strictScope = {
+    productAttached: !!(product && (product._id || product.title)),
+    productTitle: product?.title || layoutInput?.product?.name || null,
+    media,
+    extraText: layoutInput?.product?.name || null
+  };
+  const rotated = selectRotatedQuote(proof, campaignRunId, {
+    recentKeys: product?.recentQuoteKeys,
+    lastRunId: product?.lastQuoteRunId,
+    lastFingerprint: product?.lastQuoteFingerprint,
+    scope: strictScope
+  });
+  // Memory persist is fire-and-forget: a missed write repeats a quote, it
+  // does not fail a billed render. Flag-off is a no-op inside persistQuoteChoice.
+  // Skip when lockedSameRun — this size is agreeing with a sibling that already wrote.
+  if (product && (product._id || product.id) && campaignRunId) {
+    const rot = require('./quoteRotationService');
+    if (rot.memoryEnabled()) {
+      const rotation = rot.rotateQuote(proof, campaignRunId, {
+        enabled: rotationEnabled(),
+        recentKeys: product.recentQuoteKeys,
+        lastRunId: product.lastQuoteRunId,
+        lastFingerprint: product.lastQuoteFingerprint,
+        scope: strictScope
+      });
+      if (rotation.poolSize >= 2 && rotation.fingerprint && !rotation.lockedSameRun) {
+        rot.persistQuoteChoice(product._id || product.id, {
+          fingerprint: rotation.fingerprint,
+          campaignRunId,
+          wrapped: rotation.wrapped
+        });
+      }
+    }
+  }
   let quote = toPrintableCustomerQuote(rotated);
   if (rotated && !quote) {
     console.log(
@@ -864,12 +884,6 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
   // QUOTE_PROVENANCE_STRICT — selection only, flag-off is identity.
   // Cached artifacts can still carry a brand-pool jacket quote over a
   // pants seed; drop it here and try the next same-tier printable.
-  const strictScope = {
-    productAttached: !!(product && (product._id || product.title)),
-    productTitle: product?.title || layoutInput?.product?.name || null,
-    media,
-    extraText: layoutInput?.product?.name || null
-  };
   if (quote) {
     const scoped = applyStrictQuoteScope(quote, strictScope);
     if (!scoped) {
@@ -934,7 +948,7 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
   // headline only; subhead undefined). Flag-on: cascade through layoutInput
   // then brand.tagline so ai_brand_led still has a brand line when Director
   // nulls the headline. Do NOT cascade product name/title or description —
-  // resolvedProduct is .select('title imageUrl rating productReviews') so description is not loaded,
+  // resolvedProduct is .select('title imageUrl rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint') so description is not loaded,
   // and the product name is forbidden as ad copy by owner directive and
   // fenced in absences.
   //
@@ -1444,7 +1458,7 @@ async function renderDirectImage(callArgs = {}) {
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
     resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
     brandId ? Brand.findById(brandId).lean() : null,
-    productId ? CatalogProduct.findById(productId).select('title imageUrl rating productReviews').lean() : null,
+    productId ? CatalogProduct.findById(productId).select('title imageUrl rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null,
     // classification + technicalInsights feed resolveSeedStyle for the
     // lifestyle scene-preserve branch (STATIC_LIFESTYLE_PRESERVE).
     // width + height feed seedAspectFromDims → resolveAspectTreatment's
@@ -1501,7 +1515,7 @@ async function renderDirectImage(callArgs = {}) {
       { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
     );
   }
-  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl rating productReviews').lean() : null);
+  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null);
   // Delivery dims are NOT derived here any more: they come from the surface the
   // prompt is built from, a few lines below, so the size Sharp writes and the
   // size the geometry block promised the model cannot disagree.

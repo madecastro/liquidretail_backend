@@ -188,6 +188,14 @@ const {
 
 const INPUT_SCHEMA_VERSION = '4.1';   // 4.1: quote provenance (origin + tier) stamped on primary_quote; LLM tiers removed
 
+// productReviews storage went 10 → 30 so rotation has a deeper pool.
+// The cached LayoutInputArtifact must NOT inherit that 3× dump:
+// secondary_quotes is written onto every artifact and is the render-time
+// rotation pool. Cap it (same-tier first) so the document stays bounded.
+// Director already slices to MAX_QUOTES_PER_TIER=4; this is the artifact
+// bound, not a Director-prompt change.
+const MAX_LAYOUT_SECONDARY_QUOTES = 16;
+
 // Templates that render via the overlay-on-image placement algorithm
 // instead of the canonical canvas-zone composition.
 const OVERLAY_MODE_TEMPLATES = new Set(['testimonial_overlay', 'product_overlay']);
@@ -2402,10 +2410,12 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
     }
     return kept;
   };
+  const stampTier = (quotes, tierName) =>
+    (quotes || []).filter(Boolean).map((q) => (q.tier ? q : { ...q, tier: tierName }));
   const productReviewsForMatch = productReviewsOf(ctx.match);
-  const tierProduct = gateQuotesByRating(printableOnly(stampOrigin(productReviewsForMatch, productReviewsForMatch?.quotes), 'product'), 'product');
+  const tierProduct = stampTier(gateQuotesByRating(printableOnly(stampOrigin(productReviewsForMatch, productReviewsForMatch?.quotes), 'product'), 'product'), 'product');
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
-  const tierCategory = gateQuotesByRating(printableOnly(stampOrigin(catReviewsForMatch, catReviewsForMatch?.quotes), 'category'), 'category');
+  const tierCategory = stampTier(gateQuotesByRating(printableOnly(stampOrigin(catReviewsForMatch, catReviewsForMatch?.quotes), 'category'), 'category'), 'category');
   // Brand-tier reviews are catalog-wide: they are about whatever the reviewer
   // bought, which on a multi-SKU brand is usually NOT this product. Rendering
   // one under this product's photo presents another item's praise as if it
@@ -2444,12 +2454,12 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // attached (options.productId). A PMA catalogProductId is not that —
   // media-driven ads often carry a product_match PMA (the Vuori case)
   // and must still be noun-checked. Flag-off is an identity.
-  const tierBrand = selectBrandQuotesForScope(tierBrandUnscoped, {
+  const tierBrand = stampTier(selectBrandQuotesForScope(tierBrandUnscoped, {
     productAttached: !!(options && options.productId),
     productTitle: details.title || ident.productName || null,
     media,
     match: ctx.match
-  });
+  }), 'brand');
   if (withholdBrandOnProductAd && brandQuotesRaw.length) {
     console.log(`🔒 quote scope — ${brandQuotesRaw.length} brand-tier quote(s) withheld from a product ad (cross-product risk; QUOTE_BRAND_TIER_FALLBACK=false)`);
   } else if (isProductScoped && brandQuotesRaw.length) {
@@ -2460,7 +2470,7 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       `that named a product type missing from the seed labels (${tierBrand.length} remain)`
     );
   }
-  const tierComment  = printableOnly(await loadBrandCommentsForQuotePool(ctx), 'comment');
+  const tierComment  = stampTier(printableOnly(await loadBrandCommentsForQuotePool(ctx), 'comment'), 'comment');
 
   // TIERS 5 AND 6 ARE GONE, and they are not coming back behind a flag.
   //
@@ -2580,9 +2590,21 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // either. Excluding it from the primary slot while leaving it in the rotation
   // pool would have moved the fabricated quote rather than removed it.
   const allQuotes = [...tierProduct, ...tierCategory, ...tierBrand, ...tierComment];
-  const secondaryQuotes = primaryQuote
-    ? allQuotes.filter(q => q.text !== primaryQuote.text).map(q => ({ ...q }))
-    : allQuotes.map(q => ({ ...q }));
+  const others = primaryQuote
+    ? allQuotes.filter(q => q.text !== primaryQuote.text)
+    : allQuotes;
+  // Same-tier first so the 16-cap cannot evict the rotation pool in
+  // favour of a high-scoring other-tier line. Mixed-tier dump is what
+  // turned the 10→30 storage raise into a 3× artifact.
+  const sameTier = primaryQuote
+    ? others.filter(q => (q.tier || null) === (primaryQuote.tier || quoteTier || null))
+    : others;
+  const otherTier = primaryQuote
+    ? others.filter(q => (q.tier || null) !== (primaryQuote.tier || quoteTier || null))
+    : [];
+  const secondaryQuotes = [...sameTier, ...otherTier]
+    .slice(0, MAX_LAYOUT_SECONDARY_QUOTES)
+    .map(q => ({ ...q }));
 
   const rightsApproved = !!media.rights?.approved;
   const brandName = ident.brand || media.metadata?.brand || brand?.name || null;
@@ -3846,5 +3868,6 @@ module.exports = {
   // fresh-schema artifact instead of hardcoding '4.1' — a stale artifact
   // carries pre-provenance UNSTAMPED quotes that the printability gate
   // then withholds wholesale.
-  INPUT_SCHEMA_VERSION
+  INPUT_SCHEMA_VERSION,
+  MAX_LAYOUT_SECONDARY_QUOTES
 };
