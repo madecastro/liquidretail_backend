@@ -30,10 +30,19 @@ export const SAFE_ZONES = {
   // bottom clears player scrubber + title; right clears the engagement rail
   // (like / comment / share / subscribe).
   verticalYt:  { top: 0.14, bottom: 0.35, left: 0.075, right: 0.15 },
-  // landscapeYt: YouTube landscape / pre-roll — top clears title + channel;
-  // bottom clears player controls + progress bar; right clears end-screen /
-  // next-up chrome margin.
-  landscapeYt: { top: 0.10, bottom: 0.20, left: 0.075, right: 0.15 },
+  // landscapeYt: YouTube landscape / in-stream. Measured 2026-08-12 from
+  // Google's official horizontal template
+  // https://services.google.com/fh/files/blogs/ytsafezoneoverlay-horizontal.png
+  // (1920×1080 PNG): fully blocked above y=39 and below y=692 → bottom band
+  // 1080−692 = 388px = 35.9% (ship 0.36). Mid-row clear span x=38..1758
+  // (left≈2.0%, right≈8.4%); right stays 0.15 (more conservative). Upper-row
+  // title/skip intrusions (clear only x≈496..1444 at y≈100) are a separate
+  // concern — do not widen left/right for them here. WHY: text in the old 20%
+  // bottom band sits under player/ad chrome and is partially or fully
+  // occluded. BLAST: PMAX_VIDEO_SAFE_ZONE_KEY maps every pmax_video_16_9
+  // render here — unconditional prod landscape titling change, shipped alone
+  // (no feature flag) so the clamp can be A/B'd without bundling other work.
+  landscapeYt: { top: 0.10, bottom: 0.36, left: 0.075, right: 0.15 },
   // squareYt: square Discovery / in-feed YouTube — balanced inset; bottom
   // clears compact player controls, sides clear card chrome.
   squareYt:    { top: 0.10, bottom: 0.10, left: 0.10,  right: 0.10 },
@@ -41,8 +50,9 @@ export const SAFE_ZONES = {
 
 // PMax VIDEO platformFormat → YT safe-zone key. Canvas formats (Meta +
 // static PMax image keys) intentionally absent — they keep Meta/canvas
-// zones via the format fallback below.
-const PMAX_VIDEO_SAFE_ZONE_KEY = {
+// zones via the format fallback below. Exported so harnesses can pin the
+// surface → zone wiring without re-parsing source text.
+export const PMAX_VIDEO_SAFE_ZONE_KEY = {
   pmax_video_9_16: 'verticalYt',
   pmax_video_16_9: 'landscapeYt',
   pmax_video_1_1: 'squareYt',
