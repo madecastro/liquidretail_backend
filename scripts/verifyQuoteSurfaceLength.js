@@ -85,6 +85,8 @@ check('S3 an over-cap quote uses the snippet ONLY IF the snippet is ad-usable', 
   const long = 'x'.repeat(260);
   assert.strictEqual(pickQuoteText({ text: long, snippet: SNIPPET }), '',
     'a fragment snippet must NOT be typeset just because the parent was long');
+  // Finishes a thought without terminal punctuation — the case that proved
+  // "require a period" was the wrong rule. See utils/htmlEntities.finishesThought.
   const good = 'absolutely love these, so comfortable';
   assert.strictEqual(pickQuoteText({ text: long, snippet: good }), good,
     'an ad-usable snippet is still the right fallback — this is a gate, not a wall');
@@ -99,10 +101,20 @@ check('S4 over-cap with NO snippet is SHORTENED, never shipped unbounded', () =>
   // — prove the cap applies and the result stays extractive.
   const long = `I absolutely love this and wear it constantly. ${'it is wonderful and soft '.repeat(20)}`;
   const got = pickQuoteText({ text: long, snippet: '' });
-  assert.ok(got.length > 0, 'must still print something, not blank');
+  // POLICY CHANGED 2026-08-11. This used to assert the overflow path shortens with an
+  // ellipsis. That truncation is exactly what the owner saw on an ad — "cut off right
+  // after a word and a comma" — so the ellipsis candidate was removed entirely: when
+  // nothing FINISHES A THOUGHT inside the cap, the ad prints no quote and intent
+  // fallback takes over. The cap guarantee is unchanged and still asserted.
   assert.ok(got.length <= 140, `expected <=140 chars, got ${got.length}`);
-  assert.ok(long.startsWith(got.replace(/…$/, '').trimEnd()),
-    'shortening must stay extractive — a prefix of the reviewer\'s own words');
+  if (got) {
+    assert.ok(long.startsWith(got), 'anything printed must still be a literal prefix of the source');
+    assert.ok(!/…$/.test(got), 'an ellipsis cut must never be typeset on static');
+  }
+  // The complete-sentence form of the same review still prints, so this is not a wall.
+  const withSentence = `I absolutely love this. ${long}`;
+  assert.strictEqual(pickQuoteText({ text: withSentence, snippet: '' }), 'I absolutely love this.',
+    'a finished sentence inside the cap must still be found');
 });
 check('S4b pathological unbroken token is still clamped to the cap', () => {
   // truncateAtWordBoundary deliberately returns a single over-long token WHOLE
@@ -125,13 +137,17 @@ check('S5 flag-off is byte-identical to the pre-change expression', () => {
 // Real resolver, not a mirror.
 const resolveCap = (raw) => resolveStaticQuoteCap(raw);
 
-check('S6 cap default is 140, env-tunable, and MALFORMED values are rejected', () => {
+check('S6 cap default is 100, env-tunable, and MALFORMED values are rejected', () => {
   // contract, not syntax
-  assert.strictEqual(resolveCap(undefined), 140, 'unset must default to 140');
-  assert.strictEqual(resolveCap(''), 140, 'empty must default to 140');
+  // 140 -> 100 (owner 2026-08-11: "quotes have suddenly become much longer, maybe too
+  // long… I liked the length we were at before"). 100 is the widest that reliably holds
+  // ONE complete sentence, which is the shape that satisfies both bars — finish the
+  // thought, and don't turn a feed card into a paragraph.
+  assert.strictEqual(resolveCap(undefined), 100, 'unset must default to 100');
+  assert.strictEqual(resolveCap(''), 100, 'empty must default to 100');
   assert.strictEqual(resolveCap('200'), 200, 'a valid override must be honoured');
   for (const bad of ['abc', '0', '-5', 'NaN', 'Infinity', '1e999']) {
-    assert.strictEqual(resolveCap(bad), 140, `${JSON.stringify(bad)} must fall back to 140, not disable the cap`);
+    assert.strictEqual(resolveCap(bad), 100, `${JSON.stringify(bad)} must fall back to 100, not disable the cap`);
   }
   // SOURCE PINS, SCOPED BY PROXIMITY. A bare file-wide /Number\.isFinite\(/ pin
   // passed while the guard was mutated away, because that string occurs
@@ -153,7 +169,7 @@ check('S6 cap default is 140, env-tunable, and MALFORMED values are rejected', (
   assert.ok(/Number\.isFinite\(/.test(capRegion),
     'cap must be VALIDATED inside its own resolution block, not bare-coerced');
   assert.ok(/>\s*0/.test(capRegion), 'cap must reject zero/negative values');
-  assert.ok(/140/.test(capRegion), '140 default missing from the cap resolution');
+  assert.ok(/STATIC_QUOTE_DEFAULT_CAP/.test(capRegion), 'the cap default must come from the named constant');
 });
 check('S8 the OVERFLOW COMPARISON exists in the real source, not just the mirror', () => {
   // Added after revert-proofing caught this exact hole: mutating the real
@@ -189,9 +205,11 @@ check('S8 the OVERFLOW COMPARISON exists in the real source, not just the mirror
 check('S7 exactly-at-cap prints full; one over falls back', () => {
   // The UNABRIDGED text is trusted (already judged upstream by pickStrongestQuote), so
   // the boundary can be probed with any real quote padded to length.
-  const base = 'I absolutely love these and they are wonderfully soft. ';
-  const at   = base + 'z'.repeat(140 - base.length);
-  const over = base + 'z'.repeat(141 - base.length);
+  // Padding must keep the string a FINISHED THOUGHT, so the filler sits before the
+  // final stop rather than dangling after it.
+  const base = 'I absolutely love these and they are wonderfully soft';
+  const at   = `${base}${'z'.repeat(140 - base.length - 1)}.`;
+  const over = `${base}${'z'.repeat(141 - base.length - 1)}.`;
   assert.strictEqual(at.length, 140);
   assert.strictEqual(pickQuoteText({ text: at, snippet: SNIPPET }), at, 'boundary is inclusive');
   assert.notStrictEqual(pickQuoteText({ text: over, snippet: SNIPPET }), over,
@@ -216,7 +234,7 @@ check('S9 over-cap WITH sentences prints whole sentences, not the fragment snipp
 });
 check('S10 a scrap of a first sentence does NOT beat a longer curated snippet', () => {
   // Guards the other direction: "Nice." is a complete sentence and terrible copy.
-  const snippet = 'love the comfortable fit';     // ad-usable, so it can win
+  const snippet = 'love the comfortable fit';     // ad-usable AND finishes a thought
   const got = pickQuoteText({ text: `Nice. ${'x'.repeat(200)}`, snippet });
   assert.strictEqual(got, snippet,
     'a 5-char sentence must not win over a longer curated snippet');
