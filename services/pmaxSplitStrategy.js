@@ -160,10 +160,284 @@ function chooseSubjectSide(opts) {
   }
 }
 
+
+// ── Density gate (Stage 3) ───────────────────────────────────────────────────
+// Lives in this module, not its own file, because it is the same decision
+// layer: chooseSubjectSide picks WHICH half carries copy, isCopyHalfCalm
+// judges whether that half is fit to. Both are pure, both are consumed by the
+// same split orchestrator, and keeping the panel-rect convention (east =>
+// product right => panel left) in ONE place is what stops the two halves
+// drifting into opposite definitions of a side.
+
+
+// ── Thresholds (exported so the harness pins them, never re-literals) ──
+//
+// Density is 0 = empty/calm, 1 = busy (overlayZoneService densityGrid).
+// Calm continued background from a well-behaved outfill sits ~0.0–0.2;
+// clutter, a second product, or high-frequency detail push cells up.
+//
+// MEAN alone is not enough: a panel can average calm while one dense
+// corner wrecks a line of type (the adversarial case the harness pins).
+// PEAK (max cell in the panel) closes that hole. p90 was considered and
+// rejected — on a ~24-cell half-panel a single 1.0 cell leaves p90 at the
+// calm floor, so percentile-only would silently pass the adversarial case.
+const COPY_HALF_MEAN_MAX = 0.32;
+const COPY_HALF_PEAK_MAX = 0.55;
+
+// Restriction overlap. rectPct is fractional over the whole frame; 0.005
+// ≈ 0.5% of frame area. A product/face peeking into the copy half at that
+// size is already enough to collide with type; smaller is noise/rounding.
+const RESTRICTION_OVERLAP_MIN_AREA = 0.005;
+// Non-hard classifications only fire above this strictness. product/face
+// are hard regardless (they are the subjects type must never cover).
+const RESTRICTION_STRICTNESS_MIN = 0.5;
+const HARD_RESTRICTION_CLASSES = Object.freeze(['product', 'face']);
+
+const DEFAULT_THRESHOLDS = Object.freeze({
+  COPY_HALF_MEAN_MAX,
+  COPY_HALF_PEAK_MAX,
+  RESTRICTION_OVERLAP_MIN_AREA,
+  RESTRICTION_STRICTNESS_MIN
+});
+
+/**
+ * Copy-panel rect for a given subject side, in the same fractional
+ * coordinate space as densityGrid / rectPct ((0,0) top-left → (1,1)
+ * bottom-right — see overlayZoneService prompt contract).
+ *
+ * subjectSide is where the PRODUCT sits; the copy half is the opposite.
+ * east → product right → panel left; west → product left → panel right.
+ */
+function copyPanelRectForSubjectSide(subjectSide) {
+  if (subjectSide === 'east') return { x1: 0, y1: 0, x2: 0.5, y2: 1 };
+  if (subjectSide === 'west') return { x1: 0.5, y1: 0, x2: 1, y2: 1 };
+  return null;
+}
+
+/**
+ * Is the panel half calm enough to carry composited copy without a scrim?
+ *
+ * Returns:
+ *   { calm: true, mean, peak }
+ *   { calm: false, reason, worstCell | offendingClassification, ... }
+ *   { calm: null, reason }  — undecidable; caller degrades to the safe
+ *                             brand_panel. NEVER silently "calm".
+ *
+ * Asymmetry (load-bearing): a false "calm" ships unreadable copy on a
+ * ~$1 master; a false "not calm" only downgrades to the deterministic
+ * brand-colour panel. Prefer the safe direction on any ambiguity.
+ *
+ * Total function: never throws.
+ */
+function isCopyHalfCalm(input) {
+  try {
+    // Default-param `= {}` does not catch an explicit null — destructuring
+    // null throws, which would violate the total-function contract the
+    // call site relies on (a $0.01 advisory must never kill the run).
+    if (input == null || typeof input !== 'object') {
+      return { calm: null, reason: 'malformed-input' };
+    }
+    const { densityGrid, restrictions, panelRectPct, thresholds } = input;
+    const t = resolveThresholds(thresholds);
+    const panel = normalizeRect(panelRectPct);
+    // No usable panel geometry → cannot judge. Undecidable, not calm:
+    // inventing a full-frame default would average the (busy, correct)
+    // product half into the verdict — the exact bug this gate exists to
+    // prevent.
+    if (!panel) return { calm: null, reason: 'malformed-panel-rect' };
+
+    // Restrictions first: a product/face rect in the copy half is a hard
+    // no even when the density grid happens to look calm around it.
+    const restrictionHit = findOffendingRestriction(restrictions, panel, t);
+    if (restrictionHit) return restrictionHit;
+
+    const sampled = samplePanelCellValues(densityGrid, panel);
+    if (sampled == null) return { calm: null, reason: 'no-usable-grid' };
+    if (sampled.length === 0) return { calm: null, reason: 'panel-covers-no-cells' };
+
+    let sum = 0;
+    let peak = 0;
+    let peakRow = 0;
+    let peakCol = 0;
+    for (const cell of sampled) {
+      if (!Number.isFinite(cell.value)) {
+        // Non-finite density is not "0" and not "calm" — refuse to invent.
+        return { calm: null, reason: 'non-finite-density' };
+      }
+      sum += cell.value;
+      if (cell.value > peak) {
+        peak = cell.value;
+        peakRow = cell.row;
+        peakCol = cell.col;
+      }
+    }
+    const mean = sum / sampled.length;
+
+    // Peak before mean: the adversarial "averages calm, locally busy"
+    // case must fail even when mean is well under the mean cap.
+    if (peak > t.COPY_HALF_PEAK_MAX) {
+      return {
+        calm: false,
+        reason: 'peak-density',
+        worstCell: { row: peakRow, col: peakCol, value: peak },
+        mean,
+        peak
+      };
+    }
+    if (mean > t.COPY_HALF_MEAN_MAX) {
+      return {
+        calm: false,
+        reason: 'mean-density',
+        worstCell: { row: peakRow, col: peakCol, value: peak },
+        mean,
+        peak
+      };
+    }
+    return { calm: true, mean, peak };
+  } catch {
+    return { calm: null, reason: 'decision-threw' };
+  }
+}
+
+function resolveThresholds(overrides) {
+  if (!overrides || typeof overrides !== 'object') return DEFAULT_THRESHOLDS;
+  return {
+    COPY_HALF_MEAN_MAX: numOr(overrides.COPY_HALF_MEAN_MAX, COPY_HALF_MEAN_MAX),
+    COPY_HALF_PEAK_MAX: numOr(overrides.COPY_HALF_PEAK_MAX, COPY_HALF_PEAK_MAX),
+    RESTRICTION_OVERLAP_MIN_AREA: numOr(
+      overrides.RESTRICTION_OVERLAP_MIN_AREA, RESTRICTION_OVERLAP_MIN_AREA
+    ),
+    RESTRICTION_STRICTNESS_MIN: numOr(
+      overrides.RESTRICTION_STRICTNESS_MIN, RESTRICTION_STRICTNESS_MIN
+    )
+  };
+}
+
+function numOr(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeRect(r) {
+  if (!r || typeof r !== 'object') return null;
+  const x1 = Number(r.x1);
+  const y1 = Number(r.y1);
+  const x2 = Number(r.x2);
+  const y2 = Number(r.y2);
+  if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+  // Inverted / zero-area rects are malformed, not empty-calm.
+  if (!(x2 > x1) || !(y2 > y1)) return null;
+  return { x1, y1, x2, y2 };
+}
+
+function overlapArea(a, b) {
+  const x1 = Math.max(a.x1, b.x1);
+  const y1 = Math.max(a.y1, b.y1);
+  const x2 = Math.min(a.x2, b.x2);
+  const y2 = Math.min(a.y2, b.y2);
+  if (!(x2 > x1) || !(y2 > y1)) return 0;
+  return (x2 - x1) * (y2 - y1);
+}
+
+/**
+ * Sample density cells that intersect the panel.
+ *
+ * Grid orientation (must match overlayZoneService / computeBrightnessGrid):
+ *   cells[row][col] — row 0 = top, col 0 = left
+ *   cell (r,c) covers x∈[c/cols,(c+1)/cols], y∈[r/rows,(r+1)/rows]
+ * Getting rows/cols backwards silently inverts the whole gate (a right
+ * panel would read the left half's density).
+ *
+ * Returns null when the grid is unusable; [] when usable but no overlap.
+ */
+function samplePanelCellValues(densityGrid, panel) {
+  if (!densityGrid || typeof densityGrid !== 'object') return null;
+  const cells = densityGrid.cells;
+  if (!Array.isArray(cells) || cells.length === 0) return null;
+
+  // Prefer declared dims; fall back to the nested-array shape the service
+  // actually emits. A mismatch is undecidable, not "trust the longer one".
+  const rows = Number(densityGrid.rows) || cells.length;
+  const cols = Number(densityGrid.cols) || (Array.isArray(cells[0]) ? cells[0].length : 0);
+  if (!(rows > 0) || !(cols > 0)) return null;
+  if (cells.length < rows) return null;
+
+  const nested = Array.isArray(cells[0]);
+  const out = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const cellRect = {
+        x1: c / cols,
+        y1: r / rows,
+        x2: (c + 1) / cols,
+        y2: (r + 1) / rows
+      };
+      // Any positive overlap counts the cell — edge cells that only
+      // graze the panel midline still contribute density under type.
+      if (overlapArea(panel, cellRect) <= 0) continue;
+      let value;
+      if (nested) {
+        if (!Array.isArray(cells[r]) || cells[r].length < cols) return null;
+        value = Number(cells[r][c]);
+      } else {
+        // Flat row-major fallback — same layout as brightness raw buffer.
+        value = Number(cells[r * cols + c]);
+      }
+      out.push({ row: r, col: c, value });
+    }
+  }
+  return out;
+}
+
+function findOffendingRestriction(restrictions, panel, t) {
+  if (restrictions == null) return null;
+  if (!Array.isArray(restrictions)) {
+    // Malformed container — undecidable rather than "no restrictions".
+    // Caller of isCopyHalfCalm will only see this if we return a calm:null
+    // shape; surface it that way.
+    return { calm: null, reason: 'malformed-restrictions' };
+  }
+  for (const r of restrictions) {
+    if (!r || typeof r !== 'object') continue;
+    const rr = normalizeRect(r.rectPct);
+    if (!rr) continue; // skip one bad rect; do not fail the whole list
+    const area = overlapArea(panel, rr);
+    if (area < t.RESTRICTION_OVERLAP_MIN_AREA) continue;
+
+    const cls = typeof r.classification === 'string' ? r.classification : 'other';
+    const hard = HARD_RESTRICTION_CLASSES.includes(cls);
+    if (hard) {
+      return {
+        calm: false,
+        reason: 'restriction-overlap',
+        offendingClassification: cls
+      };
+    }
+    const strict = Number(r.strictness);
+    if (Number.isFinite(strict) && strict >= t.RESTRICTION_STRICTNESS_MIN) {
+      return {
+        calm: false,
+        reason: 'restriction-overlap',
+        offendingClassification: cls
+      };
+    }
+  }
+  return null;
+}
+
 module.exports = {
   chooseSubjectSide,
   // Exported so the harness asserts against the same constants this module
   // actually uses, rather than hardcoding a duplicate that can drift.
   DEAD_ZONE_WIDTH,
-  MAX_SUBJECT_WIDTH_FRACTION
+  MAX_SUBJECT_WIDTH_FRACTION,
+  // Density gate — scripts/verifyPmaxSplitDensityGate.js
+  isCopyHalfCalm,
+  copyPanelRectForSubjectSide,
+  COPY_HALF_MEAN_MAX,
+  COPY_HALF_PEAK_MAX,
+  RESTRICTION_OVERLAP_MIN_AREA,
+  RESTRICTION_STRICTNESS_MIN,
+  HARD_RESTRICTION_CLASSES,
+  DEFAULT_THRESHOLDS
 };
