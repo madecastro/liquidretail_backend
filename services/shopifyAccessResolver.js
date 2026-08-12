@@ -295,6 +295,7 @@ async function fetchProductsJson(origin, { cap, abortCheck, run }) {
   const products = [];
   let page = 1;
   let rateLimited = false;
+  let blocked = null;
 
   while (products.length < cap) {
     if (await abortCheck()) break;
@@ -313,6 +314,18 @@ async function fetchProductsJson(origin, { cap, abortCheck, run }) {
       console.warn(`   ⚠️  ${LOG}  products.json rate-limited/CF at page ${page}`);
       break;
     }
+    // A non-Cloudflare bot block (Akamai / PerimeterX / DataDome / Incapsula)
+    // is already classified by httpScrapeClient. Ignoring it made a blocked
+    // store indistinguishable from an EMPTY one, so the ladder reported
+    // "all access rungs empty" and the caller silently degraded to the
+    // JSON-LD walk — one thumbnail per product instead of the full gallery.
+    if (!blocked && res.block) {
+      blocked = res.block;
+      console.warn(
+        `   ⚠️  ${LOG}  products.json BLOCKED at page ${page} ` +
+        `vendor=${res.block.vendor} confidence=${res.block.confidence} remedy=${res.block.remedy}`
+      );
+    }
     if (!res.ok) break;
 
     const batch = Array.isArray(res.json?.products) ? res.json.products : [];
@@ -327,7 +340,7 @@ async function fetchProductsJson(origin, { cap, abortCheck, run }) {
     page += 1;
   }
 
-  return { products, rateLimited };
+  return { products, rateLimited, blocked };
 }
 
 const STOREFRONT_PRODUCTS_QUERY = `
@@ -374,6 +387,7 @@ async function fetchStorefrontGraphql(origin, { cap, abortCheck, run }) {
   const products = [];
   let after = null;
   let rateLimited = false;
+  let blocked = null;
   const endpoint = `${origin}/api/${GQL_API_VERSION}/graphql.json`;
 
   while (products.length < cap) {
@@ -402,6 +416,13 @@ async function fetchStorefrontGraphql(origin, { cap, abortCheck, run }) {
       rateLimited = true;
       console.warn(`   ⚠️  ${LOG}  storefront graphql rate-limited/CF`);
       break;
+    }
+    if (!blocked && res.block) {
+      blocked = res.block;
+      console.warn(
+        `   ⚠️  ${LOG}  storefront graphql BLOCKED vendor=${res.block.vendor} ` +
+        `confidence=${res.block.confidence} remedy=${res.block.remedy}`
+      );
     }
     // GraphQL errors array or non-200 → skip rung
     if (!res.ok || !res.json) break;
@@ -432,14 +453,25 @@ async function fetchStorefrontGraphql(origin, { cap, abortCheck, run }) {
     after = pageInfo.endCursor;
   }
 
-  return { products, rateLimited };
+  return { products, rateLimited, blocked };
 }
 
 async function fetchViaSitemap(origin, { cap, abortCheck, run }) {
   const products = [];
   let rateLimited = false;
+  let blocked = null;
+  // First block wins — the vendor is the same across a store, and the first
+  // one is the earliest point the ladder was actually stopped.
+  const noteBlock = (res, where) => {
+    if (blocked || !res || !res.block) return;
+    blocked = res.block;
+    console.warn(
+      `   ⚠️  ${LOG}  sitemap ${where} BLOCKED vendor=${res.block.vendor} ` +
+      `confidence=${res.block.confidence} remedy=${res.block.remedy}`
+    );
+  };
 
-  if (await abortCheck()) return { products, rateLimited };
+  if (await abortCheck()) return { products, rateLimited, blocked };
 
   const sitemapUrl = `${origin}/sitemap.xml`;
   let rootRes;
@@ -447,13 +479,14 @@ async function fetchViaSitemap(origin, { cap, abortCheck, run }) {
     rootRes = await http.fetchText(sitemapUrl);
   } catch (err) {
     console.warn(`   ⚠️  ${LOG}  sitemap.xml fetch error: ${err.message}`);
-    return { products, rateLimited };
+    return { products, rateLimited, blocked };
   }
 
-  if (rootRes.rateLimited || rootRes.cfChallenged) {
-    return { products, rateLimited: true };
+  noteBlock(rootRes, 'sitemap.xml');
+      if (rootRes.rateLimited || rootRes.cfChallenged) {
+    return { products, rateLimited: true, blocked };
   }
-  if (!rootRes.ok || !rootRes.text) return { products, rateLimited };
+  if (!rootRes.ok || !rootRes.text) return { products, rateLimited, blocked };
 
   const rootXml = rootRes.text;
 
@@ -499,6 +532,7 @@ async function fetchViaSitemap(origin, { cap, abortCheck, run }) {
         console.warn(`   ⚠️  ${LOG}  product sitemap fetch error ${smUrl}: ${err.message}`);
         continue;
       }
+      noteBlock(smRes, 'child-sitemap');
       if (smRes.rateLimited || smRes.cfChallenged) {
         rateLimited = true;
         break;
@@ -535,6 +569,7 @@ async function fetchViaSitemap(origin, { cap, abortCheck, run }) {
     const jsonUrl = loc.endsWith('.json') ? loc : `${loc}.json`;
     try {
       const jRes = await http.fetchJson(jsonUrl);
+      noteBlock(jRes, 'product .json');
       if (jRes.rateLimited || jRes.cfChallenged) {
         rateLimited = true;
         break;
@@ -551,7 +586,8 @@ async function fetchViaSitemap(origin, { cap, abortCheck, run }) {
       const jsUrl = loc.endsWith('.js') ? loc : `${loc}.js`;
       try {
         const tRes = await http.fetchText(jsUrl);
-        if (tRes.rateLimited || tRes.cfChallenged) {
+        noteBlock(tRes, 'product .js');
+      if (tRes.rateLimited || tRes.cfChallenged) {
           rateLimited = true;
           break;
         }
@@ -571,7 +607,7 @@ async function fetchViaSitemap(origin, { cap, abortCheck, run }) {
     if (mapped) products.push(mapped);
   }
 
-  return { products, rateLimited };
+  return { products, rateLimited, blocked };
 }
 
 // ── main export ────────────────────────────────────────────────────
@@ -610,6 +646,12 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   let discoveredMyshopify = null;
   let effectiveOrigin = customOrigin;
   let anyRateLimited = false;
+  // First bot-block seen across the whole ladder. Without this a blocked
+  // store and an empty store both produced "all access rungs empty", and the
+  // caller degraded to the JSON-LD walk as if the store simply had no
+  // products — silently trading the full products.json gallery for a single
+  // featured thumbnail per product.
+  let anyBlocked = null;
 
   const note = (msg) => {
     console.log(`   · ${LOG}  ${msg}`);
@@ -627,8 +669,9 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   }
 
   {
-    const { products, rateLimited } = await fetchProductsJson(customOrigin, { cap: CAP, abortCheck, run });
+    const { products, rateLimited, blocked } = await fetchProductsJson(customOrigin, { cap: CAP, abortCheck, run });
     if (rateLimited) anyRateLimited = true;
+    if (blocked && !anyBlocked) anyBlocked = blocked;
     if (products.length) {
       console.log(`${LOG}  resolveShopifyAccess: mode=products-json origin=${customOrigin} n=${products.length}`);
       return {
@@ -650,6 +693,7 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
 
   try {
     const homeRes = await http.fetchText(customOrigin + '/');
+    if (homeRes.block && !anyBlocked) anyBlocked = homeRes.block;
     if (homeRes.rateLimited || homeRes.cfChallenged) {
       anyRateLimited = true;
       note('homepage rate-limited/CF during myshopify discovery');
@@ -672,8 +716,9 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
 
           stage('access: products-json (myshopify)');
           note(`rung 2b: products.json @ ${effectiveOrigin}`);
-          const { products, rateLimited } = await fetchProductsJson(effectiveOrigin, { cap: CAP, abortCheck, run });
+          const { products, rateLimited, blocked } = await fetchProductsJson(effectiveOrigin, { cap: CAP, abortCheck, run });
           if (rateLimited) anyRateLimited = true;
+          if (blocked && !anyBlocked) anyBlocked = blocked;
           if (products.length) {
             console.log(`${LOG}  resolveShopifyAccess: mode=products-json origin=${effectiveOrigin} n=${products.length} (via myshopify discovery)`);
             return {
@@ -712,8 +757,9 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   }
 
   {
-    const { products, rateLimited } = await fetchStorefrontGraphql(gqlOrigin, { cap: CAP, abortCheck, run });
+    const { products, rateLimited, blocked } = await fetchStorefrontGraphql(gqlOrigin, { cap: CAP, abortCheck, run });
     if (rateLimited) anyRateLimited = true;
+    if (blocked && !anyBlocked) anyBlocked = blocked;
     if (products.length) {
       console.log(`${LOG}  resolveShopifyAccess: mode=storefront-graphql origin=${gqlOrigin} n=${products.length}`);
       return {
@@ -737,8 +783,9 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   }
 
   {
-    const { products, rateLimited } = await fetchViaSitemap(gqlOrigin, { cap: CAP, abortCheck, run });
+    const { products, rateLimited, blocked } = await fetchViaSitemap(gqlOrigin, { cap: CAP, abortCheck, run });
     if (rateLimited) anyRateLimited = true;
+    if (blocked && !anyBlocked) anyBlocked = blocked;
     if (products.length) {
       console.log(`${LOG}  resolveShopifyAccess: mode=sitemap origin=${gqlOrigin} n=${products.length}`);
       return {
@@ -752,9 +799,12 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
   }
 
   // ── total failure ────────────────────────────────────────────────
-  const reason = anyRateLimited
-    ? 'store rate-limited this server — all access rungs empty'
-    : 'all access rungs empty (products.json, storefront-graphql, sitemap)';
+  const reason = anyBlocked
+    ? `blocked by ${anyBlocked.vendor} (${anyBlocked.confidence} confidence, remedy=${anyBlocked.remedy}) — ` +
+      'NOT an empty store; the catalog was never readable'
+    : anyRateLimited
+      ? 'store rate-limited this server — all access rungs empty'
+      : 'all access rungs empty (products.json, storefront-graphql, sitemap)';
 
   console.warn(`${LOG}  resolveShopifyAccess FAILED origin=${customOrigin} reason=${reason}`);
 
@@ -767,6 +817,9 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
     reason
   };
   if (anyRateLimited) out.rateLimited = true;
+  // Surfaced so the caller can tell "blocked" from "this store is empty" and
+  // avoid recording a bot-block as a legitimate zero-product Shopify store.
+  if (anyBlocked) out.blocked = anyBlocked;
   return out;
 }
 
