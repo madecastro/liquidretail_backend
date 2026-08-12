@@ -873,10 +873,27 @@ router.post('/generate', async (req, res) => {
         // renders the campaign's OLDEST queued ads (see selectAdsForRun), so a
         // Generate for one product filled most of its 20 slots with leftovers
         // from earlier sessions for OTHER products — and billed for them.
+        // ⚠️ MONEY — scope the claim to the kinds THIS request resolved to.
+        //
+        // selectAdsForRun is kind-blind by default and its tier 0 drains
+        // renderRoute:'veo' FIRST, so a static-only Generate used to claim and
+        // render leftover queued VIDEO for the same product from an earlier
+        // session — ahead of the statics just asked for, and billing an Omni
+        // submit per row. That is half of the owner-reported "I selected static
+        // ads for Meta and got a video"; the other half was campaign.adKinds
+        // defaulting to 'both' (see requestedKinds in expandWizardJob).
+        //
+        // resolvedKinds comes back FROM the expansion rather than being
+        // re-derived here: the route does not know campaign.platformFormat, and
+        // resolveKinds intersects the request against the surface's
+        // capabilities, so a second derivation would drift from the one that
+        // decided what got queued. Absent (older shape / legacy path) → omit the
+        // filter and keep today's behaviour rather than guessing.
         adIds = await selectAdsForRun({
           campaignId,
           limit: MAX_CREATIVES_PER_RUN,
-          productIds
+          productIds,
+          kinds: Array.isArray(job?.resolvedKinds) ? job.resolvedKinds : null
         });
         if (!adIds.length) {
           await CampaignRun.updateOne(
