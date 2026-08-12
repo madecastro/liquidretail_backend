@@ -34,6 +34,11 @@ const {
   PLATFORM_FORMATS,
   aspectRatioForPlatformFormat
 } = require('./platformFormats');
+const {
+  isVideoProductAnchorEnabled,
+  productRegionForAd,
+  buildProductAnchorBlock
+} = require('./videoProductAnchor');
 const PLATFORM_FORMAT_ASPECT = Object.fromEntries(
   Object.entries(PLATFORM_FORMATS).map(([k, v]) => [k, v.aspectRatio])
 );
@@ -625,6 +630,28 @@ function buildVeoPrompt({
     lines.push(`Product: ${product.title}.`);
   }
 
+  // Lifestyle product-region anchor (VIDEO_PRODUCT_ANCHOR). Spatial
+  // grounding so a push-in finds the product box, not the face. Flag-off,
+  // packshot, or no matched region → not a single extra character (B14).
+  // Named region only — never raw pixel coords. ≤400 chars.
+  // MODEL-cap gate: only push when (assembled join + block) still fits
+  // caps.promptByteCap in BYTES. Over-cap → silent no-anchor. The block
+  // is NOT in DROP_PRIORITY, so pushing it over budget would squeeze
+  // optional lines (and must never displace noText). Skip instead.
+  if (lifestyle && isVideoProductAnchorEnabled()) {
+    const hit = productRegionForAd({ product, media });
+    if (hit) {
+      const block = buildProductAnchorBlock(hit);
+      if (block) {
+        const cap = (caps && Number(caps.promptByteCap) > 0)
+          ? Number(caps.promptByteCap)
+          : 4096;
+        const next = [...lines, block].join(' ');
+        if (Buffer.byteLength(next, 'utf8') <= cap) lines.push(block);
+      }
+    }
+  }
+
   // Timeline. Lifestyle branch is ambient-life + product-as-star.
   // Packshot Meta branch is FROZEN — do not reword (B14).
   // PMax packshot is hook-first Ken Burns.
@@ -972,5 +999,10 @@ module.exports = {
   resolveLifestyleVideoRefCount,
   resolveLifestyleVideoRefPlan,
   lifestyleVideoGuidanceForIntent,
+  // Lifestyle product-region anchor (VIDEO_PRODUCT_ANCHOR) — re-export
+  // so harnesses can drive the same helpers the prompt builder uses.
+  isVideoProductAnchorEnabled,
+  productRegionForAd,
+  buildProductAnchorBlock,
 };
 
