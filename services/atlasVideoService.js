@@ -1220,7 +1220,14 @@ async function normalizeReframeSource(sourceUrl) {
     // display matrix automatically, so the reference never needed this.
     const needsOrient = Number(md.orientation || 1) > 1;
 
-    if (!hasAlpha && !needsOrient) {
+    // Atlas refuses a non-https reference URL ("remote media URL must use
+    // https"), and that refusal surfaces as a 500 AFTER the POST is charged —
+    // so an http source would be billed and then thrown away. Mirroring costs
+    // one Cloudinary upload and always yields https. Cheap insurance: this is
+    // NOT confirmed to be the cause of the 2026-08-11 outpaint failures (the
+    // prod key could not be reproduced against), it just removes one whole
+    // class of them.
+    if (!hasAlpha && !needsOrient && /^https:\/\//i.test(sourceUrl)) {
       return { buffer: raw, url: sourceUrl, mirrored: false };
     }
 
@@ -1255,6 +1262,33 @@ async function padToRatioBuffer(srcBuffer, W, H) {
     console.warn(`⚠️  padToRatioBuffer: ${err.message}`);
     return null;
   }
+}
+
+/**
+ * Pad-vs-crop for a VIDEO SEED reference. Pure; the single source of truth for
+ * both pad sites in reframeReferenceForAspect. Covered by
+ * scripts/verifyNoVisibleSeedPad.js.
+ *
+ * WHY A SEED IS DIFFERENT FROM A DELIVERABLE (owner, 2026-08-12). This image is
+ * reference input to an image-to-video model. The model reproduces what it is
+ * shown, so any band in the seed is BAKED INTO THE VIDEO — downstream c_crop
+ * cannot remove content that is already inside the pixels. A visible band here
+ * is a permanent defect in a billable render, not a cosmetic fallback.
+ *
+ * So the ONLY acceptable pad is a solid fill sampled from a genuinely flat
+ * border: it is indistinguishable from the backdrop, there is no band to see,
+ * and the whole subject stays visible. Everything else — blurred cover of the
+ * frame, Cloudinary's b_auto gradient — is a visible smear and must crop
+ * instead. A crop loses framing at the edges, which the owner has explicitly
+ * called the better trade.
+ */
+function seedPadDecision(fill) {
+  const uniform = !!fill?.uniform;
+  const hex = fill?.hex || null;
+  // A "uniform" verdict with no sampled colour cannot produce a matching fill,
+  // so it is not an invisible pad either — crop rather than guess a colour.
+  if (uniform && hex) return { action: 'pad-solid', hex };
+  return { action: 'crop', reason: uniform ? 'no-sampled-hex' : 'border-not-flat' };
 }
 
 // Is this Media a flat-lay / studio product shot? LLM-judged by
@@ -1755,9 +1789,25 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         const fill     = sample && srcRatio
           ? await detectBorderFill(sample, srcRatio, wr / hr)
           : { uniform: false, hex: null };
-        // Only claim an exact colour match when the edges really are flat;
-        // otherwise let Cloudinary derive a gradient from the border itself.
-        const hex = fill.uniform ? fill.hex : null;
+        // FLAT BORDERS ONLY (owner, 2026-08-12). This used to fall back to
+        // Cloudinary's b_auto:predominant_gradient when the edges were not flat,
+        // which paints a VISIBLE band — and because this seed is reference input
+        // to an image-to-video model, that band is reproduced in the delivered
+        // video where no crop can reach it. See the note at 6b.
+        //
+        // A non-flat product shot goes straight to the deterministic crop rather
+        // than falling through to the generative ladder: this branch exists
+        // BECAUSE outpaint fabricates merchandise on product-only shots, so
+        // "not paddable" must not become "pay to have a garment invented". The
+        // crop is free, ships the real product, and has no bands.
+        const padDec = seedPadDecision(fill);
+        if (padDec.action !== 'pad-solid') {
+          console.log(
+            `   ✂️  reframe[${aspectKey}]: product_only but ${padDec.reason} → $0 crop (no band, no spend)`
+          );
+          return fallback();
+        }
+        const hex = padDec.hex;
 
         let padUrl = cloudinaryPadUrl(sourceUrl, aspectRatio, hex);
         if (!padUrl && sample) {
@@ -1951,21 +2001,46 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand 
         if (srcNorm.mirrored) await deleteFromCloudinary(srcNorm.url);
 
         // 6b. Rejected or failed → $0 deterministic pad from the normalized
-        //     source. Nothing is cropped or lost; the whole subject stays visible.
+        //     source, but ONLY when that pad is INVISIBLE.
+        //
+        //     WHY THIS NO LONGER BLUR-PADS (owner, 2026-08-12). This seed is fed
+        //     to an image-to-video model as reference. The model reproduces what
+        //     it is shown, so a letterboxed seed BAKES THE BANDS INTO THE VIDEO —
+        //     and no downstream crop can remove content that is already inside
+        //     the pixels. That is the "shaded bars around the video" the owner
+        //     reported on PMax, and it reproduced on seeds that started at 4:5.
+        //
+        //     It went unnoticed because this path only runs when the outpaint
+        //     fails, and the outpaint had been dormant since 2026-08-07. When it
+        //     was switched back on it failed 14/14 (Atlas 500 "failed to upload
+        //     output 0 to OSS"), so EVERY video seed landed here.
+        //
+        //     A solid fill sampled from a genuinely flat backdrop is still fine:
+        //     it is indistinguishable from the backdrop, so there is no band to
+        //     see and the whole subject stays visible. A blurred cover is not —
+        //     it is a visible smear of the frame's own colours.
+        //
+        //     When the border is NOT flat we build nothing and leave resultUrl
+        //     null. Step 8 then settles to staleUrl || cropUrl() and persists it
+        //     as 'crop-after-bill'. A crop loses framing at the edges; the owner
+        //     has been explicit that a clean crop beats bars. The ledger at step
+        //     7 is upstream of this and still records the spend either way.
         if (!resultUrl) {
           try {
-            // Prefer a sampled SOLID fill when the extended edges are flat. The
-            // blurred cover is a scaled-up copy of the frame, so on a uniform
-            // studio background it smears product colour (and hair) into the
-            // bands — visibly worse than matching the backdrop exactly. Blur is
-            // the right call only when the background genuinely has content.
             const srcRatio = media.width > 0 && media.height > 0 ? media.width / media.height : null;
             const fill = srcRatio
               ? await detectBorderFill(srcNorm.buffer, srcRatio, wr / hr)
               : { uniform: false, hex: null };
-            const padBuf = fill.uniform
-              ? (await padSolidBuffer(srcNorm.buffer, W, H, fill.hex)) || (await padToRatioBuffer(srcNorm.buffer, W, H))
-              : await padToRatioBuffer(srcNorm.buffer, W, H);
+            const padDec = seedPadDecision(fill);
+            if (padDec.action !== 'pad-solid') {
+              console.warn(
+                `⚠️  reframeReferenceForAspect[${aspectKey}]: ${padDec.reason} — ` +
+                `refusing a visible pad on a video seed, cropping instead`
+              );
+            }
+            const padBuf = padDec.action === 'pad-solid'
+              ? await padSolidBuffer(srcNorm.buffer, W, H, padDec.hex)
+              : null;
             // Same ceiling applies here — a pad built from a 4K source is just
             // as capable of exceeding 20 MiB as the outpaint was. This tier is
             // free, so a refit failure is not a money loss, but an unguarded
@@ -3987,6 +4062,8 @@ module.exports = {
   resolveModelAndAspect,
   ASPECT_FALLBACK_MODEL,
   resolveReferenceImageCount,
+  // Seed pad-vs-crop rule — scripts/verifyNoVisibleSeedPad.js.
+  seedPadDecision,
   // Lifestyle video ref-count gate — scripts/verifyLifestylePreserve.js.
   resolveLifestyleVideoRefCount,
   resolveLifestyleVideoRefPlan,
